@@ -62,7 +62,7 @@ systemd unit of the <a href="install.html#tarball">portable tarball</a>.</p>
 <tr><td><code>--request-threads N</code></td><td>all</td><td>the most threads one request may use, so a few large requests leave room for the others</td></tr>
 <tr><td><code>--max-connections N</code></td><td>10000</td><td>open connections at most</td></tr>
 <tr><td><code>--max-request-memory MB</code></td><td>an eighth of the RAM, at least 1 GB</td><td>memory for requests received and not yet run</td></tr>
-<tr><td><code>--send-timeout S</code>, <code>--frame-timeout S</code></td><td>60</td><td>drops a client that stops reading its answer, or stops halfway through sending a request</td></tr>
+<tr><td><code>--send-timeout S</code>, <code>--frame-timeout S</code></td><td>60</td><td>drops a client that has read nothing of its answer for S seconds (one that reads slowly keeps going), or stops halfway through sending a request</td></tr>
 <tr><td><code>--lttb-max-threshold N</code></td><td>16777216</td><td>the most points one downsampled (LTTB) answer has; a client asking for more gets this many</td></tr>
 <tr><td><code>--merge-idle-s S</code></td><td>300</td><td>a partition with no new data for this long is merged into one part; <code>-1</code> never</td></tr>
 <tr><td><code>--flush-interval-ms MS</code></td><td>5000</td><td>how old the newest rows in memory may get before they are written into parts</td></tr>

@@ -81,7 +81,8 @@
  * connection, and the replies waiting for a client that does not read them (two buffers per connection, the one
  * being sent and the one its worker fills, each up to OUT_CAP + OUT_PIECE: a larger reply goes in pieces, its
  * worker waiting between them; a connection whose output has not moved for --send-timeout seconds is closed, whether
- * a worker waits on it or the whole reply already fits). A connection with more than PIPE_CAP of requests (or MULTI_QUEUED
+ * a worker waits on it or the whole reply already fits; a client that keeps reading, however slowly, keeps it, and
+ * time the server itself was stopped does not count). A connection with more than PIPE_CAP of requests (or MULTI_QUEUED
  * multi-series queries) waiting reads no more until they run, so a CANCEL behind them waits too, and one whose
  * frame has been started but not completed for --frame-timeout seconds
  * (default 60) while the server waits for its bytes is closed (slow senders); time the server itself held the
@@ -128,8 +129,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <linux/sockios.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -229,7 +232,8 @@ typedef struct conn {
     bool eof;           /* the client sent everything it will: reply to it, then close */
     buf sending;
     size_t sent;
-    int64_t tx_t0;      /* when the send in flight was started, so when the output last moved (monotonic s) */
+    int64_t tx_t0;      /* when the output last moved (monotonic s): a send started, or the socket's queue changed */
+    int tx_outq;        /* the socket's unsent and unacknowledged bytes (SIOCOUTQ) at the last tick */
     size_t in_charged;  /* of in.cap, counted in req_held (a buffer grown for a large frame) */
     size_t q_bytes;     /* REQ_COST of the requests in q */
     int64_t frame_t0;   /* when the partial frame in `in` was started (monotonic s), 0: none */
@@ -421,20 +425,16 @@ static inline void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
 #ifndef OUT_WAIT /* tests/fuzz/fuzz_frames.c drains the output instead of waiting for a send */
 #define OUT_WAIT out_wait
-/* Waits, under c->lock, while c's output is over OUT_CAP; a client that reads nothing for send_timeout_s loses
- * the connection. */
+/* Waits, under c->lock, while c's output is over OUT_CAP. It has no deadline of its own: the cv is broadcast only
+ * when a whole `sending` buffer (up to OUT_CAP + OUT_PIECE) has gone out, so a deadline here would cut a client
+ * that keeps reading, only slower than that buffer per --send-timeout. The tick alone decides (on_tick: output
+ * that has not moved for --send-timeout), and conn_close, like the shutdown, sets `closing` and wakes this. While
+ * a worker waits here the main thread has a send in flight on the connection, which the tick watches. */
 static void out_wait(conn *c)
 {
     worker_waits(1);
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += send_timeout_s;
-    while (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
-        if (pthread_cond_timedwait(&c->cv, &c->lock, &deadline) == ETIMEDOUT) {
-            atomic_store(&c->closing, true); /* the client reads nothing: give the worker back */
-            shutdown(c->fd, SHUT_RDWR);
-        }
-    }
+    while (c->out.len > OUT_CAP && !atomic_load(&c->closing))
+        pthread_cond_wait(&c->cv, &c->lock);
     worker_waits(-1);
 }
 #endif
@@ -2351,7 +2351,7 @@ static void unpark_some(void)
 
 /* Once a second: closes connections whose frame was started frame_timeout_s ago and is still incomplete while
  * the server waits for its bytes (not one parked or held back by its own pipeline), and those whose output has
- * waited send_timeout_s for the client to read any of it. */
+ * not moved for send_timeout_s. Run after the events that came with it (ep_loop, uring_loop). */
 static void on_tick(void)
 {
     uint64_t v;
@@ -2361,6 +2361,14 @@ static void on_tick(void)
     static int64_t logged;
     static int64_t login_logged;
     static int64_t send_logged;
+    /* Ticks come every second. A longer gap means the server itself did not run (SIGSTOP, a frozen cgroup such as
+     * `podman pause`, a stalled host): that time is not the client's, so every deadline moves on by it, as time
+     * the server held a connection unread does not count against its frame. Otherwise the first tick after a
+     * stall longer than a timeout would close every connection in mid-reply or mid-frame, before the loop has
+     * even seen what their clients did meanwhile. */
+    static int64_t last_tick;
+    int64_t stall = last_tick && now - last_tick > 2 ? now - last_tick - 1 : 0;
+    last_tick = now;
     if (start_ppid && getppid() != start_ppid && !stopping) { /* reparented: the parent is gone */
         fprintf(stderr, "tsdbd: --exit-with-parent: parent %d exited, stopping\n", (int)start_ppid);
         stopping = 1; /* as SIGTERM: the loop ends, requests in progress finish, the memtable is flushed */
@@ -2370,6 +2378,12 @@ static void on_tick(void)
     }
     for (conn *c = conns, *next; c; c = next) {
         next = c->next;
+        if (stall) {
+            c->t_open += stall;
+            c->tx_t0 += stall;
+            if (c->frame_t0)
+                c->frame_t0 += stall;
+        }
         if (!c->closed && !atomic_load(&c->authed) && now - c->t_open >= login_timeout_s) {
             if (login_logged != now) {
                 login_logged = now;
@@ -2387,10 +2401,21 @@ static void on_tick(void)
             conn_close(c);
             continue;
         }
-        /* Output that has not moved for --send-timeout: the client reads nothing. A worker waiting for output
-         * space gives up after that long (out_wait); this ends the connections whose whole reply fit in its two
-         * buffers, which nothing waits on, so they do not hold up to 2 x (OUT_CAP + OUT_PIECE) each for as long
-         * as the client keeps the socket open. */
+        /* Output that has not moved for --send-timeout: the client reads nothing. This is the one place that
+         * decides, for a worker waiting for output space (out_wait, which this wakes through conn_close) and for
+         * a reply that fit whole in the two buffers alike (which would otherwise hold up to 2 x (OUT_CAP +
+         * OUT_PIECE) for as long as the client keeps the socket open). A send completes (io_uring) or the socket
+         * turns writable (epoll) only once about a third of its send buffer is free, over a megabyte when the
+         * kernel has grown it, so a client reading slowly but steadily moves no send for long: the socket's queue
+         * (SIOCOUTQ: sent but unacknowledged, and not yet sent) is asked as well, and any change in it is
+         * progress. */
+        if (c->send_inflight && !c->closed) {
+            int q;
+            if (ioctl(c->fd, SIOCOUTQ, &q) == 0 && q != c->tx_outq) {
+                c->tx_outq = q;
+                c->tx_t0 = now;
+            }
+        }
         if (c->send_inflight && !c->closed && now - c->tx_t0 > send_timeout_s) {
             if (send_logged != now) {
                 send_logged = now;
@@ -2577,6 +2602,7 @@ static void uring_loop(void)
         io_uring_submit_and_wait(&ring, 1);
         struct io_uring_cqe *cqe;
         unsigned head, seen = 0;
+        bool tick = false;
         io_uring_for_each_cqe(&ring, head, cqe)
         {
             seen++;
@@ -2591,7 +2617,7 @@ static void uring_loop(void)
                 }
                 break;
             case EV_TICK:
-                on_tick();
+                tick = true;
                 if (!(cqe->flags & IORING_CQE_F_MORE)) {
                     struct io_uring_sqe *s2 = sqe_get();
                     io_uring_prep_poll_multishot(s2, tick_fd, POLLIN);
@@ -2603,6 +2629,8 @@ static void uring_loop(void)
             }
         }
         io_uring_cq_advance(&ring, seen);
+        if (tick) /* after the batch, as in ep_loop: sends and recvs completed with it count */
+            on_tick();
         notes_pending();
     }
 }
@@ -2652,6 +2680,7 @@ static void ep_loop(void)
     struct epoll_event evs[256];
     while (!stopping) {
         int n = epoll_wait(epfd, evs, 256, ready_head ? 0 : -1);
+        bool tick = false;
         if (n < 0) {
             if (errno != EINTR) {
                 perror("tsdbd: epoll_wait");
@@ -2666,7 +2695,7 @@ static void ep_loop(void)
                 continue;
             }
             if (fd == tick_fd) {
-                on_tick();
+                tick = true;
                 continue;
             }
             conn *c = (size_t)fd < fd_conn_cap ? fd_conn[fd] : NULL;
@@ -2682,6 +2711,9 @@ static void ep_loop(void)
             ep_want(c);
         }
         ep_round();
+        /* the deadlines after the round: what this epoll_wait reported (a socket drained, a frame's bytes) counts */
+        if (tick)
+            on_tick();
         notes_pending();
     }
 }

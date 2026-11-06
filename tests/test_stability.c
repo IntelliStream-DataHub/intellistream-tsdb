@@ -784,6 +784,197 @@ static void test_stuck_reader_whole_reply(void)
     remove_dir(dir);
 }
 
+/* A connection whose reads give up after 30 s, so that a server that stops sending fails the test, not hangs it. */
+static int raw_connect_patient(int port)
+{
+    int fd = raw_connect(port);
+    struct timeval tv = {30, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    return fd;
+}
+
+/* The size in bytes of the whole QUERY_RAW reply for series id, read as fast as it comes. */
+static size_t reply_size(int port, tsdb_sid id)
+{
+    int fd = raw_connect_patient(port);
+    send_query_raw(fd, id);
+    size_t total = 0;
+    uint8_t *body = malloc(1u << 22);
+    for (;;) {
+        uint8_t h[18]; /* length, id, op, status, last, n */
+        uint32_t len;
+        if (!read_full(fd, h, sizeof h))
+            break;
+        memcpy(&len, h, 4);
+        if (len < 14 || len - 14 > (1u << 22) || !read_full(fd, body, len - 14))
+            break;
+        total += (size_t)len + 4;
+        if (h[13])
+            break;
+    }
+    free(body);
+    close(fd);
+    return total;
+}
+
+/* Reads from fd at about rate bytes a second (0: as fast as it comes) until limit bytes, the end of the stream or
+ * an error, or for at most secs seconds when secs > 0. Returns the bytes read; *end is 0 when it stopped at the
+ * limit or the time, 1 at the end of the stream, -errno on an error. */
+static size_t read_at_rate(int fd, double rate, size_t limit, double secs, int *end)
+{
+    enum { CAP = 1 << 20 };
+    uint8_t *b = malloc(CAP);
+    size_t got = 0;
+    double t0 = now();
+    *end = 0;
+    while (got < limit && (secs <= 0 || now() - t0 < secs)) {
+        size_t want = CAP;
+        if (rate > 0) {
+            double allowed = (now() - t0) * rate - (double)got;
+            if (allowed < 4096) {
+                sleep_ms(10);
+                continue;
+            }
+            if (allowed < (double)want)
+                want = (size_t)allowed;
+        }
+        if (want > limit - got)
+            want = limit - got;
+        ssize_t r = read(fd, b, want);
+        if (r > 0) {
+            got += (size_t)r;
+            continue;
+        }
+        if (r < 0 && errno == EINTR)
+            continue;
+        *end = r == 0 ? 1 : -errno;
+        break;
+    }
+    free(b);
+    return got;
+}
+
+/* Regression (release review M1, older than 0.9.0): a client that reads a reply larger than OUT_CAP steadily, but
+ * slower than OUT_CAP + OUT_PIECE (9 MB) per --send-timeout, gets all of it. A worker waiting for output space gave
+ * up --send-timeout after its wait began, whether the output moved meanwhile or not: its cv is woken only when the
+ * whole buffer being sent has gone out, so at 4 MB/s and a timeout of 1 s the reply was cut. The reply has to be
+ * larger than what fits the socket buffers and both output buffers (about 22 MB) for the worker to wait on a full
+ * buffer being sent. */
+static void test_steady_reader_large_reply(void)
+{
+    current = "steady slow reader of a reply over OUT_CAP";
+    alarm(90);
+    char dir[512];
+    make_dir(dir, sizeof dir, "steady");
+    int port = 0;
+    pid_t pid = start(dir, &port, "--send-timeout=1", NULL);
+    enum { N = 2500000 }; /* 30 MB of reply */
+    CHECK(insert(port, "big", 0, N) == 0);
+    tsdbc *c;
+    tsdb_sid id = 0;
+    CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "big", 0, &id) == 0);
+    tsdbc_close(c);
+    size_t total = reply_size(port, id);
+    CHECK(total > (size_t)N * 12);
+    int fd = raw_connect_patient(port);
+    send_query_raw(fd, id);
+    int end;
+    size_t got = read_at_rate(fd, 4 << 20, total, 0, &end);
+    if (got != total)
+        printf("  steady reader at 4 MB/s: %zu of %zu bytes, end %d\n", got, total, end);
+    CHECK(got == total); /* before the fix the connection was cut part way */
+    close(fd);
+    signal_pid(pid, SIGTERM);
+    CHECK(clean_exit(wait_exit(pid, 10)));
+    remove_dir(dir);
+}
+
+/* Regression (release review L1): progress is not only a completed send. A send completes (io_uring), or the socket
+ * turns writable again (epoll), only once about a third of the socket's send buffer is free, which the kernel grows
+ * to megabytes; a client reading 100 KB/s takes longer than --send-timeout for that, and lost a reply that fit the
+ * server's buffers whole (7.2 MB), which before the send timeout on such replies it always got. Reads slowly for
+ * 10 s, then fast. */
+static void test_slow_reader_whole_reply(void)
+{
+    current = "slow steady reader of a reply that fits the buffers";
+    alarm(90);
+    char dir[512];
+    make_dir(dir, sizeof dir, "slowwhole");
+    int port = 0;
+    pid_t pid = start(dir, &port, "--send-timeout=2", NULL);
+    enum { N = 600000 }; /* 7.2 MB: under OUT_CAP */
+    CHECK(insert(port, "big", 0, N) == 0);
+    tsdbc *c;
+    tsdb_sid id = 0;
+    CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "big", 0, &id) == 0);
+    tsdbc_close(c);
+    size_t total = reply_size(port, id);
+    int fd = raw_connect_patient(port);
+    send_query_raw(fd, id);
+    int end;
+    size_t got = read_at_rate(fd, 100 << 10, total, 10, &end);
+    if (end == 0)
+        got += read_at_rate(fd, 0, total - got, 0, &end);
+    if (got != total)
+        printf("  slow reader at 100 KB/s: %zu of %zu bytes, end %d\n", got, total, end);
+    CHECK(got == total); /* before the fix: cut at about 4 MB */
+    close(fd);
+    signal_pid(pid, SIGTERM);
+    CHECK(clean_exit(wait_exit(pid, 10)));
+    remove_dir(dir);
+}
+
+typedef struct {
+    int port;
+    tsdb_sid id;
+    size_t total, got;
+    int end;
+} paused_reader;
+
+static void *paused_reader_main(void *arg)
+{
+    paused_reader *r = arg;
+    int fd = raw_connect_patient(r->port);
+    send_query_raw(fd, r->id);
+    r->got = read_at_rate(fd, 2 << 20, r->total, 0, &r->end);
+    close(fd);
+    return NULL;
+}
+
+/* Regression (release review L2): time the server itself was stopped (SIGSTOP, a frozen cgroup) is not the
+ * client's. A client reading a reply at 2 MB/s while tsdbd was stopped for 3 s with --send-timeout=2 lost the
+ * connection on epoll: the first tick after the stop ran before the loop sent to the sockets that the same
+ * epoll_wait reported writable, and found the output unmoved for 3 s. */
+static void test_reader_while_stopped(void)
+{
+    current = "a reader while the server is stopped";
+    alarm(90);
+    char dir[512];
+    make_dir(dir, sizeof dir, "paused");
+    int port = 0;
+    pid_t pid = start(dir, &port, "--send-timeout=2", NULL);
+    enum { N = 600000 };
+    CHECK(insert(port, "big", 0, N) == 0);
+    tsdbc *c;
+    tsdb_sid id = 0;
+    CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "big", 0, &id) == 0);
+    tsdbc_close(c);
+    paused_reader r = {port, id, reply_size(port, id), 0, 0};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, paused_reader_main, &r) == 0);
+    sleep_ms(1000); /* the reply is under way */
+    signal_pid(pid, SIGSTOP);
+    sleep_ms(3000);
+    signal_pid(pid, SIGCONT);
+    pthread_join(th, NULL);
+    if (r.got != r.total)
+        printf("  reader across a 3 s stop: %zu of %zu bytes, end %d\n", r.got, r.total, r.end);
+    CHECK(r.got == r.total); /* before the fix (epoll): cut after the stop */
+    signal_pid(pid, SIGTERM);
+    CHECK(clean_exit(wait_exit(pid, 10)));
+    remove_dir(dir);
+}
+
 /* Regression: a client that stops reading must cost the event loop nothing
  * while its send waits. An epoll loop that keeps such a socket marked writable
  * after EAGAIN tries the send again on every round and burns a core per stuck
@@ -1032,6 +1223,9 @@ int main(int argc, char **argv)
     test_slow_readers();
     test_stuck_reader_idle();
     test_stuck_reader_whole_reply();
+    test_steady_reader_large_reply();
+    test_slow_reader_whole_reply();
+    test_reader_while_stopped();
     test_connection_limit();
     test_half_close_while_stopped();
     test_io_fallback();

@@ -576,6 +576,7 @@ int tsdb_query_twa_bounds(tsdb *db, tsdb_sid series, int64_t start, int64_t end,
  *  - trim (with bounds): TSDB_MULTI_TRIM_LO starts series i's bounds at the last one at or before its first row
  *    in range, TSDB_MULTI_TRIM_HI ends them at the last one at or before its last row (a series without rows then
  *    has no buckets). That is what a client does for local periods, so one union of bounds serves every series.
+ *    The whole bounds must strictly increase, trimmed or not; if they do not, every series answers TSDB_ERR_INVALID.
  * Calls to fn: VALUES and LTTB send rows (ts, values in the API widths, valid as in tsdb_values) in one or more
  * calls with last = 0 and then one with n = 0 and last = 1, or all of them in one call with last = 1; the other
  * kinds send one call with `buckets` pointing at n tsdb_bucket, tsdb_spread_bucket or tsdb_twa_bucket. status is

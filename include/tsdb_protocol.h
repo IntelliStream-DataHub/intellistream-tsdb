@@ -137,6 +137,7 @@
  *               PER_INTERVAL: only the interval form of QUERY_BUCKETS and QUERY_TWA; TRIM_LO / TRIM_HI (bounds
  *               of QUERY_BOUNDS or QUERY_TWA only): series i's bounds start at the last one at or before its first
  *               row in range / end at the last one at or before its last row, as a client trims local periods.
+ *               Bounds that do not strictly increase answer TSDB_ERR_INVALID for every series, trimmed or not.
  *               Other flag bits are reserved. Duplicate series are answered each time.
  *               -> for each series in index order, exactly the frames the inner op sends for it, each with
  *                  u32 index after the status (TSDB_MULTI_PREFIX; frames up to TSDB_MAX_FRAME + 4); a series'

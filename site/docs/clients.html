@@ -631,7 +631,7 @@ ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);</code></
 <p><code>tsdb_query_multi</code> calls your function once per series as the answers come;
 <code>tsdb_query_multi_collect</code> returns them all at once. The C client has <code>tsdbc_query_multi</code> and
 <code>tsdbc_query_multi_collect</code>.</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L640-L645">int (*cancelled)(void *ctx);
+<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">int (*cancelled)(void *ctx);
 void (*on_wait)(void *ctx, int delta);
 int (*budget_take)(void *ctx, size_t bytes);
 void (*budget_give)(void *ctx, size_t bytes);

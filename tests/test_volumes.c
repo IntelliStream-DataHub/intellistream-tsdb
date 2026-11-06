@@ -489,7 +489,8 @@ static void test_user_files_in_volume(const char *base)
 
 /* Regression (release review L2): an add refuses a directory holding a file with a name the volume's engine takes
  * for its own (its first open would cut a STATES, RETENTION or CLASSES of the user's as a torn tail, replay a WAL
- * segment, run an intent, open a part, delete a part's temporary), and the file is left as it was. */
+ * segment, run an intent, open a part, delete a part's temporary or a META.tmp), and the file is left as it was.
+ * An add's own META temporary (META.tmp.HOST.PID.TID, left by a crashed or concurrent add) does not stop it. */
 static void test_engine_names_in_volume(const char *base)
 {
     char top[600], root[700], vol[800], p[1000];
@@ -498,7 +499,7 @@ static void test_engine_names_in_volume(const char *base)
     CHECK(mkdir(vol, 0755) == 0);
     static const char *const names[] = {"STATES", "RETENTION", "CLASSES", "wal_0000000000000001.log",
                                         "p1_2_3_0.part", "p-1_2_3_0.part", "tmp_1_2.part", "txn_1_2.intent",
-                                        "retired_p1_2_3_0.part"};
+                                        "retired_p1_2_3_0.part", "META.tmp"};
     for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
         snprintf(p, sizeof p, "%s/%s", vol, names[i]);
         write_file(p, "the user's\n");
@@ -517,7 +518,9 @@ static void test_engine_names_in_volume(const char *base)
     tsdb_options_init(&o);
     o.fsync = 0;
     uint32_t v;
-    OK(tsdb_volume_add_dir(root, vol, &v)); /* the names gone, the same directory is added */
+    snprintf(p, sizeof p, "%s/META.tmp.otherhost.1.2", vol);
+    write_file(p, "an add's\n");
+    OK(tsdb_volume_add_dir(root, vol, &v)); /* the names gone (an add's temporary is not one), it is added */
     tsdb *db;
     tsdb_sid id;
     OK(tsdb_open(root, &o, &db));

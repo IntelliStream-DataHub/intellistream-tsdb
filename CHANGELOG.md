@@ -17,17 +17,24 @@ disk format and the wire protocol.
 ### Changed
 - An operator's `volume add` (and `import --create-volumes`) refuses a directory that holds a file with a name the
   volume would take for one of its own: `STATES`, `RETENTION`, `CLASSES`, a WAL segment (`wal_<16 hex>.log`), a
-  part, a part's temporary, a retired part or an intent. The first open would otherwise have cut such a file of the
+  part, a part's temporary, a retired part, an intent or `META.tmp`. The first open would otherwise have cut such a file of the
   user's as a torn tail, replayed it, run it or deleted it. The message names the file; nothing is written.
 
 ### Fixed
 - tsdbd closes a connection whose output has not moved for `--send-timeout` seconds even when its whole reply fit in
   the server's buffers (so no worker waited on it): before, a client that sent a query and never read the answer held
   up to about 17 MB per connection for as long as it kept the socket open, outside `--max-request-memory`.
+- tsdbd no longer cuts a client that keeps reading its reply, only slowly. A reply larger than 8 MB was lost by a
+  client that read less than about 9 MB per `--send-timeout` (150 KB/s at the default of 60 s): a worker waiting for
+  output space gave up that long after its wait began, whether the output moved or not. Progress is now any change
+  in the socket's queue, checked every second, so the floor is gone for replies of any size. Time the server itself
+  was stopped (SIGSTOP, a frozen container) no longer counts against `--send-timeout`, `--frame-timeout` or
+  `--login-timeout`.
 - `tsdb_query_multi` (QUERY_MULTI) checks the bounds of a bounds query once per call instead of once per series:
   65,536 series over the 33 million bounds of one frame took about 250 s of comparisons. Bounds that do not
-  increase answer `TSDB_ERR_INVALID` for every series, trimmed or not (a trimmed series without rows answered an
-  empty result before).
+  strictly increase now answer `TSDB_ERR_INVALID` for every series, trimmed or not, as the single-series call does
+  on the whole bounds. Before, a trimmed series was answered from its own part of the bounds: buckets when that
+  part increased, empty when the series had no rows. No client sends such bounds.
 - `tsdb_query_multi` claims the first series for the caller before it wakes its helpers. A helper that ran first
   took it as a series ahead: collected and held, or, over 65,536 rows, computed, thrown away and run again at its
   turn. Measured with `tsdbc-bench query --multi 100 --conns 1` (100 series x 1 M rows, optimized; 0.9.0 and this
