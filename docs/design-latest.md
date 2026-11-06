@@ -1,7 +1,8 @@
 # The latest point of every series, from a sharded in-memory table
 
-Status: design, not implemented. Branch `latest-design`, written on 2026-11-06 from main at ea89968. Code references
-are `file:line` at that commit.
+Status: design, not implemented. Branch `latest-design`, written on 2026-11-06 from main at ea89968, revised the
+same day after a correctness review and a performance review (what changed: "Changes after review", at the end).
+Code references are `file:line` at ea89968.
 
 Decided by the user on 2026-11-06:
 - tsdb serves the **latest datapoint per series**. This reverses the line "Latest-value lookups ... not planned" of
@@ -15,32 +16,38 @@ change).
 
 ## Summary
 
-- **One question, answered in under a microsecond per series**: "what is the newest point of these series?", for
-  1 to a million ids in one request (`QUERY_LATEST`, protocol 13; `tsdb_latest` in C).
+- **One question, answered in well under a microsecond per series**: "what is the newest point of these series?",
+  for 1 to a million ids in one request (`QUERY_LATEST`, protocol 13; `tsdb_latest` in C).
 - **"Newest" means the greatest timestamp** among the series' live rows, with the value that last-write-wins gives
   at that timestamp. It is exactly what a descending raw query with limit 1 answers today; that query is the
   reference, and the tests compare against it.
 - **The cache is sharded by volume** and lives inside each volume's engine: no separate cache service. Every series
   id names its volume, so a lookup routes like any request. In the cluster the volume's leader answers, and its
   replicas keep the same table warm because they apply the same commits.
-- **Two layers.** A per-volume **latest table** holds, for each series, the newest live row *in the parts* (16
-  bytes: timestamp and value). The **memtables** already hold the newer rows; a one-field addition (`top`, free in
-  the struct's padding) finds a series' newest memtable row in O(1). A lookup takes the newer of the two.
-- **The table changes only where the parts list changes**: when parts are listed (flush, large insert, delete,
-  replace, WAL replay at open), under a lock that lookups share. A lookup therefore never sees a row before
-  queries do, nor misses one that queries see. Merges, class switches and the retention clock never touch it.
-- **Deletes that remove the newest row** mark the entry *unknown*; the next lookup (or the deleting thread) finds
-  the next one with a descending read of one granule per source and fills it in.
-- **Cost on the insert path**: a compare and a 4-byte store per memtable row, on a cache line the insert already
-  writes; per published part, one table store per series it holds. No new lock on the insert path.
-- **Memory**: 16 bytes per series per copy: 16 MB for a million series, 1.6 GB for 10^8, 16 GB for 10^9 (48 GB
-  for 10^9 in a cluster of three copies, 6 GB on each of 8 servers).
+- **Two layers.** A per-volume **latest table** holds, for each series, the newest row *in the parts* (16 bytes).
+  The **memtables** already hold the newer rows; a one-field addition (`top`, free in the struct's padding) finds a
+  series' newest memtable row in O(1). A lookup takes the newer of the two.
+- **Entries are read and written only under one per-volume lock, `latest_rw`**: publishers (flush, large insert,
+  delete, replace, WAL replay) change them in the same write section that lists their parts; fills, retention
+  changes and drops write them under it too. A lookup therefore never sees a row before queries do, nor misses one
+  that queries see.
+- **An entry can be *unknown*** (after a delete of the newest row, a retention limit lowered, a drop, or an open
+  that could not read the value exactly). An unknown entry carries a timestamp bound, so the next publish of a newer
+  row settles it, and a per-entry generation, so a fill (a one-granule read of the parts) stores its answer only if
+  nothing changed that series since the fill's snapshot.
+- **Cost on the insert path**: a compare and sometimes a 4-byte store per memtable row, on a cache line the insert
+  already writes; per published part, one compare and store per series it holds, under the write lock. Lookups
+  hold the small-insert lock (`buf_lock`) only in sub-holds of 128 ids, about 2 µs each.
+- **Memory**: 16 bytes per series per copy, within a byte budget (`latest_cache`, default RAM/16); series beyond the
+  budget are answered exactly by the slow path. 16 MB for a million series, 1.6 GB for 10^8, 6 GB per server for
+  10^9 in a cluster of three copies on 8 servers.
 - **Rebuilt at open** from the granule index (each granule's last value and timestamp, already stored), inside a
-  loop the open already runs; a few cases the index cannot give exactly (state series, int64 beyond 2^53, NaN)
-  start unknown and are filled in the background. No new file, no format change.
+  loop the open already runs, with no transient memory beyond the table. What the index cannot give exactly (state
+  series, int64 beyond 2^53, NaN payloads) starts unknown with its timestamp known; the next flush of the series
+  settles it, and a warmer at the scheduler's full width fills the rest within seconds. No format change.
 - **As of a time, skipping nulls**: the same op with an end bound or a flag; those go the slow way (one granule per
-  source, read backwards), not through the table, unless the bound is above the cached row.
-- **Rights**: `read` on each series; denied and missing look alike, as everywhere.
+  source, newest partitions first), not through the table, unless the bound is above the cached row.
+- **Rights**: `read` on each series; denied and missing look alike, as everywhere; a missing id is `NOTFOUND`.
 
 ## Assumptions (decisions the user may change)
 
@@ -48,33 +55,34 @@ change).
 |---|---|---|
 | A1 | **Latest = the row with the greatest timestamp** among the series' live rows; at that timestamp, the value last-write-wins keeps. Not the most recently *written* row. | "Most recently written" needs a write sequence per row in parts, which tsdb does not keep, and would disagree with every query. It would be a different feature (closer to the change feed of design-cdc.md). |
 | A2 | **A null at the greatest timestamp is returned as a null** (with its timestamp). A flag `SKIP_NULLS` asks for the newest non-null row instead (§5.2). | Returning the newest non-null by default would hide that a sensor reports "no value" now; the cost is the same either way (the flag is the slow path). Open question 1. |
-| A3 | **Sharded by volume, inside the engine.** Each volume keeps its series' newest points; in the cluster the volume's leader answers and its replicas keep the table warm. No cache service of its own. | A separate cache tier is rejected in L2; it cannot be exact without being on the write path anyway. |
+| A3 | **Sharded by volume, inside the engine.** Each volume keeps its series' newest points; in the cluster the volume's leader answers and its replicas keep the table warm. No cache service of its own. | A separate cache tier is rejected in L2 and §7.3; it cannot be exact without being on the write path anyway. |
 | A4 | **Exact and fresh.** A lookup reflects every acknowledged write and delete, and never a write that queries do not show yet, by the same snapshot rules as a query. | A "fast but maybe stale" mode would need no lock at all, but every client would have to guess how stale. Not offered. |
-| A5 | **One instant per chunk of up to 4096 series of one volume**, not per request: a request for 100,000 series may see an insert in some series and not yet in others of the same insert. Each series' answer is exact (A4). | One instant per volume per request needs a lock held across the whole request, which would hold up every publish. Open question 4. QUERY_MULTI with `VALUES`, descending, limit 1 keeps its one cut per volume for those who need it. |
-| A6 | **On by default** (`tsdb_options.latest_cache = 1`, tsdbd `--latest-cache on`). Off: no table, no memory, and `QUERY_LATEST` still answers, exactly, through the slow path. | Off by default saves 16 bytes per series for users who never ask. Open question 2. |
+| A5 | **One instant per series, not per request**: each series' answer is the state at one instant during the request; two series of one request may be read at different instants (a request for 100,000 series may see an insert in some series and not yet in others). | One instant per volume per request needs a lock held across the whole request, which would hold up every publish. Open question 4. QUERY_MULTI with `VALUES`, descending, limit 1 keeps its one cut per volume for those who need it. |
+| A6 | **On by default**, as a byte budget: `tsdb_options.latest_cache` (default RAM/16 for the process, shared by its volumes; tsdbd `--latest-cache BYTES`, `0` off). Series beyond the budget, and every series when it is 0, are answered exactly through the slow path. | Off by default saves 16 bytes per series for users who never ask. Open question 2. |
 
 ## Decisions
 
 | # | Decision | Rejected | Why |
 |---|---|---|---|
 | L1 | **Latest is defined by the existing query**: `tsdb_query_values(series, cutoff, end, DESC, limit 1)` is the reference answer, bit for bit (value bits included, NaN payloads too). | A definition of its own | One meaning in the whole database; the tests have an oracle that is already tested; deletes, retention, LWW and memtable visibility come for free. |
-| L2 | **The cache is part of each volume's engine** (`src/latest.c`), sharded by volume like everything else. | A cache service in front (Redis or a tsdb tier); a cache per tsdbd keyed by name | A separate copy must be kept in step with LWW, deletes, replaces, retention and failover; that is the engine's job and it already does it. A cache beside the engine is either on the write path (then it is this design, one hop further) or stale. |
+| L2 | **The cache is part of each volume's engine** (`src/latest.c`), sharded by volume like everything else. | A cache service in front (Redis or a tsdb tier); a cache per tsdbd keyed by name | A separate copy must be kept in step with LWW, deletes, replaces, retention and failover; that is the engine's job and it already does it. A cache beside the engine is either on the write path (then it is this design, one hop further) or stale. §7.3 compares the two in full. |
 | L3 | **Two layers: a table for the parts, the memtables for newer rows.** | One table updated by every row | Rows in the memtable become visible only when synced (sync mode) or committed (cluster), not when appended; a single table would need a WAL position per entry and an update pass after every group commit, on the commit's critical path. The memtables already hold those rows in series order with their positions. |
-| L4 | **Table entry: 16 bytes**, `i64 ts`, `u64 slot` (the series' value slot zero-extended, nulls as the type's null slot, as in the memtable). `ts = TSDB_TS_MAX` (never a row's timestamp) marks the two non-row states: slot 0 **empty** (no rows in parts), slot 1 **unknown**. | 24 bytes with the part's block number; a type tag per entry; a table of doubles (`GF_LAST`) | A writer folds parts in block order (publish_lock), so it never needs the block; the type is per series (SERIES). Doubles are inexact for int64 above 2^53 and absent for state series. |
-| L5 | **The table is paged**: 65,536 entries (1 MiB) per page, a page table sized for 2^31 local ids (256 KiB), pages added as SERIES grows, never moved. | One array, reallocated | Growing a 1.6 GB array copies it under the lock. Pages make growth O(1) and keep entries in place. |
+| L4 | **Table entry: 16 bytes plus one bit**: `u64 t` = the timestamp XOR `INT64_MAX`, `u64 x`, and an *unknown* bit in a per-page bitmap. All-zero memory is **empty** (`t = 0` is `TSDB_TS_MAX`, which is never a row's timestamp). **Known**: bit clear, a row's timestamp, `x` = its value slot. **Unknown**: bit set, the timestamp field holds a **bound `u`** (every live row of the series in parts has `ts <= u`; `TSDB_TS_MAX`: no bound) and `x` holds the **touch generation** (§2.1). | `ts = TSDB_TS_MAX` with slot codes for the states; 24 bytes with the block number; a type tag per entry; a table of doubles (`GF_LAST`) | Zeroed pages must mean "empty", not a row at 1970 with value 0 (timestamp 0 and negative ones are valid, tsdb.h:80-82). The bound lets a later publish settle an unknown entry without a read; the touch generation makes fills safe per series. The type is per series (SERIES). Doubles are inexact for int64 above 2^53 and absent for state series. |
+| L5 | **The table is paged**: 65,536 entries (1 MiB, plus an 8 KiB bitmap) per page, a page table sized for 2^31 local ids (256 KiB), pages made in id order and never moved or given back, within the byte budget (A6). The first page the budget refuses caps the volume: ids from there on have no entry and are answered by the slow path. | One array, reallocated; eviction of cold pages | Growing a 1.6 GB array copies it under the lock. Pages made in id order by the first fold that needs them start empty correctly (no earlier listing held a row of their ids, since that listing would have made them). Eviction would need "unknown" pages and a policy; a cap is exact and simple. |
 | L6 | **Memtable layer: `top`**, a u32 in `mt_series` (the index of the row with the greatest timestamp, the later one on ties), set by `mt_add`. It fits in the struct's padding (40 bytes stay 40). | A copy of the newest row in each `mt_series` (64 bytes) | Same answer with one more cache miss per lookup; 24 more bytes per series slot in every memtable, which is dense by local id. |
-| L7 | **The table changes only where the parts list changes**, after the commit point (intent and renames durable, `parts_commit` returned 0) and before the listing, under a per-volume **`latest_rw`** held for writing until the listing is done. Lookups hold it for reading per chunk. | Changing it after the listing; a seqlock | After the listing, a lookup could see a query's answer missing for a moment (and the reverse order, before the commit point, could show a write that then fails). A seqlock retries forever under steady large inserts; a writer-preferring rwlock bounds both waits. |
-| L8 | **Merges, class switches and the retention clock never change the table.** Lookups apply the cutoff (`eng_cutoff`) at read time, as queries do. | Updating it on merges | A merge keeps every live row; it only drops rows below the cutoff and rows tombstones hid, which the table never holds as live. |
-| L9 | **Deletes and replaces fold by a rule** (§3.4): the entry stays, moves to the replace's newest row, or becomes unknown. | Recomputing every touched series at once under the lock | The rule is exact in every case it decides; only "the newest row was deleted and nothing replaced it" needs a read, and that read must not run under the lock. |
-| L10 | **Unknown entries are filled by a read** of the parts only, the newest row found by walking back one granule per source (§3.8), stored only if no publish happened since the read began (`lgen`). Filled by the next lookup, by a delete for its own series, and by a background warmer after open. | Filling under the lock; filling from the index alone | A read under the lock stalls publishes for the time of a decode. A granule touched by a tombstone must be decoded (snapshot windows), so the index alone cannot answer. |
-| L11 | **Rebuilt at open**, inside `cls_check_parts` (classes.c:1095), which already walks every run of every part: per run, the last entry's timestamp, last value and null flag (`GF_TSMIN + GF_SPAN`, `GF_LAST`, `GF_FLAGS`), folded by (ts, block); then every tombstone checked against the result. No file of its own. | A LATEST file written at close; a lazy build on first use | A file is one more durable thing with fail-stop and torn-tail rules, and is wrong after a crash anyway. The index already holds what the build needs. A lazy build delays the first answers by minutes on a big volume. |
-| L12 | **What the index cannot give exactly starts unknown**: state series (no time-weighted statistics, twa.c:126-131), int64 whose last value as a double is at or beyond 2^53 in magnitude (twa.c:70-73), NaN last values (the payload). | Decoding their last granule during the open | A million state series would add 10 to 50 s to the open. Unknown entries answer exactly through the slow path until the warmer fills them. |
-| L13 | **NFS followers keep the block number too** (24-byte entries) and fold each refresh's new parts by (ts, block), with the tombstone rule against `min_block`. | Rebuilding at every refresh | A follower sees merge outputs as new parts; without the block, a merge output could overwrite a newer row at an equal timestamp. A rebuild per refresh costs the whole index walk. |
+| L7 | **Entries are read and written only under `latest_rw`** (a per-volume writer-preferring rwlock). Writers, each in a write section: publishers (between `parts_commit` returning 0 and the end of their listing, which happens in the same section), fills, a retention limit lowered, `drop_before` and its page sweeper, a merge listed after a retention change, a follower's refresh. Lookups hold it for reading per chunk. Publishers compute outside the lock only what does not depend on the table (each series' newest row of their parts); compare and store happen inside. | Computing the fold before the write lock; changing entries after the listing; a seqlock | The first review found that a fold computed outside the lock races fills (a stale row stored for good). After the listing, a lookup could see a query's answer missing for a moment; before the commit point, a write that then fails. A seqlock retries forever under steady large inserts; a writer-preferring rwlock bounds both waits. §3.2 has a measured exception for flushes. |
+| L8 | **Merges, class switches and the retention clock never change the table**, with one exception: a merge during which a retention limit changed (§3.5). Lookups apply the cutoff (`eng_cutoff`) at read time, as queries do. | Updating it on every merge | A merge keeps every live row; it drops rows below the cutoff, which lookups clamp, and rows tombstones hid, which the table never holds as live. |
+| L9 | **Publishes fold by rules** (§3.3, §3.4): a new newest row replaces an older known one or settles an unknown one whose bound it reaches; a tombstone over the known newest row makes the entry unknown with the bound just below the tombstone. | Recomputing every touched series at once under the lock | The rules are exact in every case they decide; only "the newest row was deleted and nothing replaced it" needs a read, and that read must not run under the lock. |
+| L10 | **Unknown entries are filled by a read** of the parts only (§3.8), with no cutoff, from a snapshot taken with the read lock held; the fill stores only if the entry is still unknown and its touch generation is not newer than the snapshot. Filled by the lookup that met it (from work it does anyway), by a delete for its own series, and by a warmer after open. | Filling under the lock; one generation per volume; filling from the index alone | A read under the lock stalls publishes for the time of a decode. A per-volume generation drops every fill on a busy volume (the reviews' liveness finding). A granule touched by a tombstone must be decoded (snapshot windows), so the index alone cannot answer. |
+| L11 | **Rebuilt at open**, inside `cls_check_parts` (classes.c:1095), which already walks every run of every part in (partition, block) order: the table itself holds the walk's state (timestamp, part and granule of the newest run so far), tombstones are applied as the walk meets them, and one pass after the walk reads `GF_LAST` and the null flag once per series, split by id range over threads. | A LATEST file written at close; a lazy build on first use; a transient array per series | A file is one more durable thing with fail-stop and torn-tail rules, and is wrong after a crash anyway. A lazy build delays the first answers by minutes on a big volume. Reading `GF_LAST` per run would cost series x partitions field reads (the performance review); per series it is one. |
+| L12 | **What the index cannot give exactly starts unknown with its timestamp as the bound**: state series (no time-weighted statistics, twa.c:126-131), int64 whose last value as a double is at or beyond 2^53 in magnitude (twa.c:70-73), NaN last values (the payload). The next flush or insert of the series settles it (its row is at or past the bound); a warmer fills the rest at the scheduler's full width right after the open. | Decoding their last granule during the open | The warmer does the same decoding in parallel and does not delay the open; series that are still written are settled by their next flush without any read. `GF_LASTV` in the first format bump removes the case (L18). |
+| L13 | **NFS followers keep the block number too** (24-byte entries), fold each refresh's new parts by `(ts, block)` with a shadow check against tombstones of higher blocks, and re-derive every entry whose row lay in a part that left the list (§3.10). | Rebuilding at every refresh; folding only the new parts | A follower sees merge outputs as new parts and can miss a tombstone that was written and merged away between two refreshes (the correctness review); only the parts that leave say which entries may have lost their row. |
 | L14 | **One op, `QUERY_LATEST`**, protocol 13: ids (1 to 1,048,576), an optional end bound (one, or one per id), a `SKIP_NULLS` flag; replies of fixed 24-byte records in index order. The floor stays 12. | Names in the request; a QUERY_MULTI kind | Clients already resolve and cache ids (insert paths need them). A QUERY_MULTI kind would carry a template and a frame per series: 30 bytes of framing for 24 of answer. |
-| L15 | **Rights: `read` on each series**, checked per id in the op's case as QUERY_MULTI does; a denied id answers `TSDB_ERR_DENIED` in its own record, whether or not it exists. | Refusing the whole request | The same rule as QUERY_MULTI: a dashboard with one revoked series still shows the rest. |
+| L15 | **Rights: `read` on each series**, checked per id in the op's case as QUERY_MULTI does; a denied id answers `TSDB_ERR_DENIED` in its own record, whether or not it exists; a missing id is `TSDB_ERR_NOTFOUND` for a user with `read` on `all` (and with `--no-auth`). | Refusing the whole request; "none" for a missing id | The same rule as QUERY_MULTI and as lookups by id elsewhere (AGENTS.md, "Series ids"; design-auth A16). |
 | L16 | **The cluster changes nothing in the table**: replicas apply `COMMIT` markers through the same listing path and see memtable rows up to the commit point, so their tables match the leader's at every commit point. Clients split by leader as QUERY_MULTI does (cluster C16); `REPLICA_OK` and `min_pos` as for queries. | A cluster-wide latest service | It would be a second replicated state to fence at failover. Here a new leader's table is already warm. |
-| L17 | **The slow path gets a real "limit 1"**: a descending read that starts with one granule per source, not 65,536 rows (`desc_window_rows`, query.c:1926). | Using raw_desc as it is | raw_desc decodes about 8 granules to return one row; the slow path is the as-of, skip-nulls and unknown path, so it should cost one granule. |
-| L18 | **No format change.** The index already stores what the build needs (format 8). An exact last slot in the index (`GF_LASTV`) would make the build exact for every type; it goes into format 9 if and when the change feed and the cluster bump it, not on its own. | A format bump now | A format change costs every user an export and import (compatibility.md); a few unknown entries filled in the background do not justify it. Open question 5. |
+| L17 | **The slow path gets a real "limit 1"** (`latest_at`, §5.1): partitions newest first, a part's snapshot window computed only when it is visited, one granule per source, stopping as soon as no older partition can hold a newer row. | Using raw_desc as it is | raw_desc decodes about 8 granules to return one row and enumerates every granule of the series in every part (query.c:1930-1953): O(parts) per series. |
+| L18 | **No format change.** The index already stores what the build needs (format 8). An exact last slot in the index (`GF_LASTV`, state codes included) goes into the first format bump that happens for any reason. | A format bump now | A format change costs every user an export and import (compatibility.md); with the warmer at full width and settling by the next flush, a few unknown entries after an open do not justify it. Open question 5. |
+| L19 | **Lookups touch the volume's locks in O(1) holds**: `db->lock` only to reference the memtables and read `visible`; `buf_lock` in sub-holds of at most 128 ids, with the lines they need prefetched. | Holding `db->lock` and `buf_lock` across a 4096-id chunk | The performance review: those are the volume's query and small-insert mutexes; long holds stall inserts and make lookups of one volume run one at a time. |
 
 ## 1. What "latest" means
 
@@ -83,9 +91,11 @@ For a series s, a lookup with end bound `end` (default `TSDB_TS_MAX`, "no bound"
 - the row with the greatest timestamp `t` such that `cutoff(s) <= t < end` among s's live rows (rows a tombstone
   hides and expired rows are not live; memtable rows count once they are visible, the same rule as queries);
 - its value, as the last write at `t` left it (last-write-wins, so a later null at `t` makes it a null);
-- a kind: **value**, **null** (the row is a null), or **none** (no live row before `end`; also for an unknown id).
+- a kind: **value**, **null** (the row is a null), or **none** (no live row before `end`).
 
-With `SKIP_NULLS` the row is the greatest `t` whose value is not null (A2). The answer equals
+An id that names no series is not "none": its record has status `TSDB_ERR_NOTFOUND` (or `TSDB_ERR_DENIED`, §6.3).
+
+With `SKIP_NULLS` the row is the greatest `t` whose last-write-wins value is not null (A2). The answer equals
 `tsdb_query_values(s, cutoff, end, {DESC, 1})` (L1) with a null mapped to kind null; the tests check exactly this.
 
 Two consequences worth saying:
@@ -97,23 +107,24 @@ Two consequences worth saying:
 
 ### 2.1 The latest table (parts)
 
-Per volume (engine), indexed by local id: `ts` and `slot` (L4), in pages of 65,536 entries (L5). A new series gets
-an empty entry (its page is created, zeroed to "empty", when SERIES grows past the last page; the series' first
-rows reach parts only through a listing, which folds them in).
+Per volume (engine), indexed by local id, in pages of 65,536 entries (L4, L5). States and what they promise:
+
+| state | encoding | promise |
+|---|---|---|
+| empty | all zero | no row of the series in the parts |
+| known `(ts, slot)` | bit clear, `t = ts ^ INT64_MAX`, `x = slot` | the newest live row in the parts is this one (the cutoff aside: lookups clamp) |
+| unknown `(u, touch)` | bit set, `t = u ^ INT64_MAX`, `x = touch` | every live row in the parts has `ts <= u`; nothing more is known |
+
+A page made when ids first need it is zeroed: empty, which is right because no listing before held a row of those
+ids (L5). A page made by the build at open follows the same order.
 
 `latest_rw` (a `pthread_rwlock_t`, writer-preferring: `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`) guards the
-entries and `lgen`, a counter that every change bumps (it tells a fill whether anything changed, §3.8).
-
-Memory, 16 bytes per series per copy (page table 256 KiB per volume besides):
-
-| series | one copy | three copies (cluster) | per server, 8 servers |
-|---:|---:|---:|---:|
-| 10^6 | 16 MB | 48 MB | 6 MB |
-| 10^8 | 1.6 GB | 4.8 GB | 600 MB |
-| 10^9 | 16 GB | 48 GB | 6 GB |
-
-The production servers have 256 GB; 6 GB for a billion series is within the sizing rule of design-cluster.md §10.2.
-NFS followers add 8 bytes (L13).
+entries, the bitmaps, the page table, `lgen` and the drop mark (§3.6). **`lgen`** counts the changes that can make a
+fill wrong: every publish, retention change, drop and follower refresh bumps it in its write section (fills do not).
+A writer that leaves or makes an entry unknown sets its **touch** to the new `lgen`; a fill whose snapshot was taken
+at `lgen = g` (with the read lock held, so the snapshot holds every change up to `g`) may store only into an entry
+that is still unknown with `touch <= g` (§3.8). So a fill is refused only when *its own* series changed, which keeps
+fills converging on a volume that publishes every few milliseconds.
 
 ### 2.2 The memtable layer
 
@@ -123,41 +134,92 @@ every row that is newer than the parts, indexed by local id (`mt_series`, intern
 The `mt_series` line is already in cache there (it just wrote `n` and checked `sorted`).
 
 A memtable's newest *visible* row of s: if `lsn[top] <= visible` (always, outside sync mode and the cluster), it
-is row `top`. Otherwise the newest row is still in flight (its group commit has not synced); then, for a sorted
-series, binary search the visible prefix by `lsn` (as `mt_collect` does, memtable.c:226) and take its last row; for
-an unsorted one, scan the visible prefix. On equal timestamps within one memtable the later row wins, as
+is row `top`. Otherwise the newest row is in flight (its group commit has not synced yet). Rows are appended in
+`lsn` order, so the visible prefix is found by binary search on `lsn`; for a sorted series its last row is the
+answer. For an unsorted series the lookup does not scan under the lock: it notes `lsn[top]`, sets the id aside,
+and after the chunk waits until `wal_durable` passes it (one group commit, which the row's own writer is waiting
+for; on a failed engine it stops waiting) and looks the id up again. Should `top` be in flight again (a series
+written out of order without pause), it scans the visible prefix in pieces of at most 4,096 rows, taking
+`buf_lock` again for each (rows are only appended, so the prefix does not change). A metric counts both
+(`tsdb_latest_inflight_total{how="wait"|"scan"}`). On equal timestamps within one memtable the later row wins, as
 `keep_last` does in queries.
 
 ### 2.3 A lookup
 
-For the ids of one volume, in chunks of up to 4096 (A5):
+For the ids of one volume, in chunks of up to 4096 (sorted by local id, each keeping its index for the reply):
 
-1. Take `latest_rw` for reading.
-2. Take `db->lock`, then `buf_lock`, as `snapshot_take` does (query.c:215-246): read `visible` (in sync mode
-   `wal_durable`, in the cluster the commit point, else no limit), and for each id the newest visible row of the
-   active memtable and of each follower tail. Release `buf_lock`. Reference the flushing memtables and release
-   `db->lock`; they are immutable and read without a lock.
-3. For each id: the candidates are, newest source first, the active memtable, the flushing memtables (newest
-   first), the table entry. The answer is the candidate with the greatest timestamp; on equal timestamps the newer
-   source wins (memtables rank above parts, as in queries). An unknown entry sends the id to the slow path
-   (§3.8): the parts may hold a row newer than any memtable row.
-4. Release `latest_rw`. Apply the cutoff: a newest row below `eng_cutoff(s)` means no live row (every other row
-   is older still). Apply the end bound and `SKIP_NULLS` (§5).
+1. Take `latest_rw` for reading. Read `lgen` as `g`.
+2. Take `db->lock`: reference the active and flushing memtables (and a follower's tails), read `visible` (in sync
+   mode `wal_durable`, in the cluster the commit point, else no limit). Release it. That is O(1). It is consistent
+   with the table: no publish can fold or list while this chunk holds the read lock.
+3. Read the table entries (no other lock) and the flushing memtables (immutable, no lock).
+4. Read the active memtable and the tails in sub-holds of `buf_lock` of at most 128 ids. Before each hold, prefetch
+   the ids' `mt_series` lines (outside the lock: a prefetch of memory that a realloc has just freed is harmless).
+   Inside it, read `top` and `lsn[top]` for the 128 ids and prefetch their row lines, then read the rows: two
+   passes, so the misses overlap. About 15 ns per id under the lock (U1).
+5. For each id the candidates are, newest source first: the active memtable, the flushing memtables (newest
+   first), on a follower the WAL tails (newest segment first), then the table entry. The answer is the candidate
+   with the greatest timestamp; on equal timestamps the newer source wins (memtables rank above parts, as in
+   queries; query.c:240-277). An empty entry has no candidate. An unknown entry, an as-of bound below the found
+   row, or `SKIP_NULLS` with a null found, sends the id to the slow path (§5) in this same read hold: it takes the
+   chunk's cut (the parts list, `cut_take`, query.c:93) once, under `db->lock`, the first time an id needs it.
+   That cut agrees with the memtables referenced in step 2, because only merges can change the list meanwhile
+   and they keep the same live rows.
+6. Release `latest_rw`. Apply the cutoff: a newest row below `eng_cutoff(s)` means no live row (every other row is
+   older still). Ids set aside in step 4 (§2.2) are looked up again.
+7. Send the chunk's records; then store the chunk's fills (§3.8).
 
-Cost, estimated (U1): an id costs a table read (one cache miss at large sizes, none when the ids come in order) and
-one `mt_series` read per memtable holding the series (one miss, plus about two for the row). About 0.2 to 0.4 µs
-per id on one thread; 100,000 ids in 20 to 40 ms on one thread, split over the request's threads (the query
-scheduler, `request_threads`) by chunk. `buf_lock` is held for at most a chunk's memtable reads (about 4096 x 0.1
-µs = 0.4 ms worst case; chunks of 1024 if the measurements say inserts notice).
+Cost, estimated (U1): an id costs a table read (one miss at large sizes, fewer when ids are dense) and about two
+overlapped misses per memtable that holds the series. About 0.1 to 0.2 µs per id on one thread; 100,000 ids in 10
+to 20 ms on one thread, split over the request's threads (the query scheduler, `request_threads`) by chunk. Lookups
+of one volume run in parallel (the read lock is shared); what they share is `buf_lock`, about 15 ns per id, so 32
+connections at 20 M ids/s keep it about 30% busy in holds of 2 µs. The benchmark gate of step 2 (§10) checks that
+inserts do not notice; if they do (above 5% on throughput or p99), the fallback is a paged `mt_series` array that
+never moves and row storage freed only with its memtable, so lookups read the active memtable without `buf_lock`.
+
+### 2.4 Memory per series
+
+| what | bytes | status |
+|---|---|---|
+| latest table, writer and cluster replica | 16 per series per copy, plus 1/8 (bitmap); 256 KiB page table per volume | this design, within `latest_cache` |
+| latest table, NFS follower | 24 per series, plus 1/8 | this design |
+| open build | nothing beyond the table (L11) | this design |
+| a request's slow path | one cut per chunk that needs it (a pointer and a reference per part) | this design |
+| memtable `mt_series` | 40 per local id up to the highest id written, per memtable (the active one and up to 4 flushing), arrays doubling (memtable.c:94) | today; `top` fits in its padding |
+| rights maps | 1 per id per logged-in user with grants, at most 64 MiB per user and RAM/16 in all (auth.c:27, 47) | today |
+
+| series in the database | table, one copy | three copies | per server, 8 servers |
+|---:|---:|---:|---:|
+| 10^6 | 16 MB | 48 MB | 6 MB |
+| 10^8 | 1.6 GB | 4.8 GB | 600 MB |
+| 10^9 | 16 GB | 48 GB | 6 GB (2.3% of 256 GB) |
+
+The table is not what dominates: at 10^9 series with three copies on 8 servers, each server holds 3.75 x 10^8
+series copies, and memtables whose series are all written within a memtable's life take 40 bytes each, 15 GB for
+the active memtables alone and up to 75 GB with four flushing. design-cluster.md §10.2 now counts memory with this
+line. The default budget (RAM/16, 16 GB on a 256 GB server) holds a table of 10^9 entries.
 
 ## 3. Keeping it exact under every write
 
+The rules below share one fold. When a publish brings `R`, the newest row of series s among its rows (for a part,
+the series' last row; for several parts of one commit, folded in block order so that the later part wins equal
+timestamps, insert.c:611), the entry becomes:
+
+| entry before | after |
+|---|---|
+| empty | `R` |
+| known `k` | `R` if `R.ts >= k.ts` (the publish has a higher block than every listed part, so it wins ties), else `k` |
+| unknown `(u, touch)` | `R` if `R.ts >= u` (every live row is at or below `u`, and `R` wins a tie), else unknown `(u, lgen')` |
+
+`lgen'` is the generation this write section sets. On the writer every publish has higher blocks than every listed
+part (publish_lock, `parts_publish`), which is what makes the ties come out right without blocks in the entries.
+
 ### 3.1 Small inserts (the WAL and memtable path)
 
-Nothing but `top` (§2.2). A row appended to the active memtable is found by step 2 of a lookup exactly when
-`mt_collect` would show it to a query: the same `visible` bound. **Sync mode** (`wal_sync_ms = 0`): a row is
-returned only once the WAL is synced up to it; the row that is still in flight costs a binary search, not a wrong
-answer. **Periodic sync**: visible at once, as for queries. **Cluster**: visible at the commit point (cluster C7).
+Nothing but `top` (§2.2). A row appended to the active memtable is found by a lookup exactly when `mt_collect`
+would show it to a query: the same `visible` bound. **Sync mode** (`wal_sync_ms = 0`): a row is returned only once
+the WAL is synced up to it. **Periodic sync**: visible at once, as for queries. **Cluster**: visible at the commit
+point (cluster C7).
 
 A small write waiting on a large write's fence (`lw_fence`, internal.h:1490-1514) has appended nothing, so no
 lookup can see it before the large write is listed: the fence order holds for lookups as it holds for queries.
@@ -165,169 +227,265 @@ lookup can see it before the large write is listed: the fence order holds for lo
 ### 3.2 Flushes
 
 `flush_waiting` (memtable.c:777) commits a memtable's parts, then lists them and removes the memtable from
-`flushing` in one `db->lock` section (memtable.c:801-810). The table changes between `parts_commit` and that
-section, under `latest_rw` for writing, released after the section:
+`flushing` in one `db->lock` section (memtable.c:801-810).
 
-- `mt_write` already sorts each series and keeps the last write per timestamp; it records each series' newest row
-  `(ts, slot)` in a list (one entry per series in the memtable) handed to the publish.
-- Fold, per series: if the entry is empty, or known with `ts <= new.ts`, store the new row (the flushed part has a
-  higher block number than every listed part, so it wins ties). An unknown entry stays unknown.
+- Before taking the lock, `mt_write`, which already sorts each series and keeps the last write per timestamp,
+  hands the publish a list of each series' newest row `(id, ts, slot)`, in id order. That list does not depend on
+  the table.
+- After `parts_commit` returned 0, the publisher takes `latest_rw` for writing, folds the list (the table of §3),
+  bumps `lgen`, lists the parts and removes the memtable from `flushing`, and releases it.
 
-A lookup sees either the memtable in `flushing` (and maybe also the updated entry: the same row twice, harmless)
-or the listed parts and the updated entry; never neither, because both changes happen under the write lock.
+A lookup sees either the memtable in `flushing` (and the old entry) or the listed parts and the new entry, never a
+mix.
 
-To keep the write lock short, the publisher computes the new entries before taking it (only publishers change
-entries, and they are serialised by `publish_lock`, so the table is stable for it), then stores them. Stores go in
-id order: a flush of a million series writes about 16 MB in page order, 2 to 5 ms (U2); lookups of that volume
-wait that long, queries do not.
+**Hold time and its measured exception.** A flush holds `buffer_rows` rows (1 M by default, db.c:48); at 10^8
+series written once a second that is about a million distinct series, stored sparsely in the table: about a million
+cache misses, 5 to 15 ms of write hold about once a second per volume (U2), during which that volume's lookups wait
+(queries do not). Step 2 measures lookup p99 under steady flushes of 10^6 series. If the hold exceeds 2 ms there,
+flushes (and only flushes) store outside the write section:
 
-### 3.3 Large inserts
+1. Under the write lock, set the volume's `publish_pending` and release it.
+2. Compare and store each entry with relaxed 8-byte atomic loads and stores (lookups then read entries with relaxed
+   atomic loads too: free on x86).
+3. Under the write lock: list, remove the memtable from `flushing`, bump `lgen`, clear `publish_pending`.
+
+This is exact because every stored row is still in the flushing memtable, which every lookup in that window reads,
+and which ranks above the table on equal timestamps. A torn read (new timestamp with the old slot, or the old
+timestamp with the new one, or the bit and the fields out of step) always shows a timestamp at or below the
+memtable's row for that series, so the memtable's row wins; and a flush never turns an entry unknown. While
+`publish_pending` is set, the other writers (fills, retention, drops, merge marking) do not touch entries: they
+release the write lock and wait on a condition variable until it clears. Large inserts, deletes and replaces keep
+their stores inside the write section, since no memtable holds their rows.
+
+### 3.3 Large inserts and the WAL replay
 
 `insert_rows` (insert.c:640) writes parts, then `parts_publish` (insert.c:626) commits and lists them under
 `publish_lock`. The part writer notes each series' last row as it closes the series' run (one compare per series
-boundary); the fold is that of a flush, at the same place (after `parts_commit`, before `db_add_parts`,
-db.c:149). The replay at open publishes through `parts_publish` too (memtable.c:1209) and folds the same way.
+boundary). A large unsorted insert is written in chunks whose later part wins duplicates (insert.c:611), so the
+parts of one commit are folded in block order: the later part's row wins an equal timestamp. The fold runs at the
+same place as a flush's (after `parts_commit`, in the write section that ends after `db_add_parts`, db.c:149). The
+replay at open publishes through `parts_publish` too (memtable.c:1209) and folds the same way.
 
-The fence is untouched: the large write's parts are listed and folded under one write lock, then `lw_leave` lets
+The fence is untouched: the large write's parts are listed and folded in one write section, then `lw_leave` lets
 the small writes behind it in. A small write that waited therefore lands in a memtable after the fold; a lookup
 ranks it above the large write's row at an equal timestamp, which is last-write-wins in real time (jepsen check 5).
 
 ### 3.4 Deletes and replaces
 
 delete.c:150-170 commits tombstone parts (and, for a replace, the rows' parts) and lists them under `publish_lock`.
-Under the write lock, per series s of the commit, with `D` the union of its tombstone ranges and `R` its newest row
-among the commit's rows (none for a delete):
+In the write section of that listing, per series s of the commit, with `D` its tombstone ranges and `R` its newest
+row among the commit's rows (none for a delete):
 
 | entry before | rule | why |
 |---|---|---|
-| empty | `R` if any, else stays empty | nothing older to hide |
-| unknown | stays unknown | nothing known to compare |
-| known, `ts` not in `D` | the newer of entry and `R` (`R` wins ties) | the tombstones did not touch the newest row |
-| known, `ts` in `[a, b)` of `D`, `R` exists and `R.ts >= a` | `R` | every older row that survives is below `a`, so below `R` |
-| known, `ts` in `D`, otherwise | **unknown** | the next live row is somewhere below; only a read can say where |
+| empty | the fold with `R`, if any | nothing older to hide |
+| known `k`, `k.ts` in no range of `D` | the fold with `R` | the tombstones did not touch the newest row |
+| known `k`, `k.ts` in `[a, b)` of `D` | unknown `(a - 1, lgen')`, then the fold with `R`; if `a = INT64_MIN`, empty, then the fold | every row at or above `a` in a lower block is hidden, and `k` was the newest, so every live row is below `a` |
+| unknown `(u, touch)` | the fold with `R` (touch set to `lgen'` if it stays unknown) | tombstones only remove rows, so the bound still holds |
 
 Tombstones hide only rows of lower blocks (design.md, "Tombstones live in parts"), and every listed part has a
-lower block than the commit, so the rule never asks about blocks. Memtable rows are never hidden; a delete
-flushes the memtable before it writes its tombstones, so any row a lookup still finds in a memtable is newer than
-the delete.
+lower block than the commit, so the rule never asks about blocks. A tombstone in another partition key than the
+row's does not hide it; the rule treats it as hiding (unknown), which is safe and costs a fill. Memtable rows are
+never hidden; a delete flushes the memtable before it writes its tombstones, so any row a lookup still finds in a
+memtable is newer than the delete.
 
-After its publish, a delete fills the entries it made unknown (§3.8) before it returns: a delete names one series,
-so that is one read, and the next lookup is fast again.
+After its publish, and after `lw_leave`, `cls_thaw` and `publish_lock` are released (delete.c:172-174), a delete
+fills the entry it made unknown (§3.8): a delete names one series, so that is one read, and small writes into the
+range do not wait for it.
 
 ### 3.5 Retention
 
-Lookups clamp to `eng_cutoff(s)` at read time (L8), as `eng_query_raw_ex` does (query.c:2024). The entry keeps the
-newest row in parts whatever its age; if it is below the cutoff, every row of the series is, and the answer is
-none. The cutoff only rises (`eng_now_ms` never goes back), with one exception: `tsdb_set_retention` with a
-longer limit lowers it, and rows a merge already dropped do not come back while the entry may name one. So a
-retention change that lowers a series' cutoff marks its entry unknown when the entry's `ts` lies below the old
-cutoff (under the write lock, after the RETENTION record is synced). The merge thread's partition drops remove
-only expired rows: no change.
+Lookups clamp to `eng_cutoff(s)` at read time (L8), as `eng_query_raw_ex` does (query.c:2024). An entry holds the
+newest row in parts whatever its age (fills and the build search with no cutoff, so **empty means "no row in
+parts"**, not "no live row"). If the entry's row is below the cutoff, every row of the series is, and the answer is
+none.
+
+The cutoff only rises (`eng_now_ms` never goes back), except when `tsdb_set_retention` gives a series a longer
+limit (it is per series, tsdb.h:280). Rows below the old cutoff may already be gone (merged away) while the entry
+names one, so:
+
+- `tsdb_set_retention` writes and syncs its RETENTION record under `ret_lock` as today, then takes `latest_rw` for
+  writing and, in one section, applies the limit in memory (`ret_put_locked`, retention.c:43, which bumps
+  `ret_gen`) and, if the cutoff went down, turns a known entry with `ts` below the old cutoff into unknown
+  `(ts, lgen')` (an unknown one gets touch `lgen'`). No lookup can see the new limit with the old entry. One series:
+  O(1). Lock order: `ret_lock` > `latest_rw`.
+- Merges read the limit as they go (merge.c:241, 271, 334). A merge that started before a change can drop rows the
+  new limit keeps, after a fill stored one. So a merge records `ret_gen` when it starts; if it differs at its
+  listing, the merge takes `latest_rw` for writing (after `publish_lock`, as publishers do) and, with its listing,
+  turns into unknown `(ts, lgen')` every known entry of a series in its sources whose `ts` lies in the merge's
+  time range. Rare (a retention change during a merge), O(series of the merge).
+
+The merge thread's partition drops remove only expired rows: no change.
 
 ### 3.6 `tsdb_drop_before`, class switches, merges
 
-- `tsdb_drop_before(t)` removes whole partitions below `t`: every entry with `ts < t` becomes unknown (refilled
-  lazily; most such series have nothing left and become empty).
+- **`tsdb_drop_before(t)`** retires every partition that ends at or before `t` (db.c:979-992, today under
+  `db->lock` only). It takes `latest_rw` for writing, then `db->lock`, and in that one section retires the parts,
+  bumps `lgen` and sets the volume's **drop mark**: `bound = max(bound, t)`, `epoch + 1`, `mark_gen = lgen`. O(1)
+  besides the retiring. A known entry with `ts < bound` on a page whose `swept` epoch is older reads as unknown
+  `(ts, mark_gen)`, to lookups, publishers and fills alike. A **sweeper** job then walks the pages, one per write
+  section (1 MiB, about 50 µs), turns such entries into real unknown ones and sets the page's `swept`. Entries
+  with `ts >= t` are untouched: their partition ends after `t`, so it was not dropped. No 1.6 GB scan under the
+  lock (the performance review's L1). Lock order: `latest_rw` > `db->lock`, as for lookups.
 - Class switches move no row (AGENTS.md, "Partition classes"): no change. One (series, ts) is never in two keys,
   so ties between parts of different keys cannot happen.
-- Merges (merge.c:463) list their output and retire the sources with the same live rows: no change (L8).
+- Merges (merge.c:463) list their output and retire the sources with the same live rows: no change (L8), apart
+  from §3.5's retention case.
+
+Considered in review: the performance review asked for the same mark "for a retention lowering that applies to
+every series". Retention limits are per series (`tsdb_set_retention(db, series, limit)`, tsdb.h:280), so a lowering
+marks one entry; a client that lowers a million series sends a million calls, each O(1) under the lock.
 
 ### 3.7 Fail-stop
 
-The table changes only after `parts_commit` succeeded (the commit point) and only together with a listing, so a
+The table changes only after `parts_commit` succeeded (the commit point) and only in the section of a listing, so a
 publish that fails (and the engine with it) leaves the table as the parts list: as queries see it. After
-`eng_fail` no new file is named and nothing is listed, so the table stops changing; memtable rows stay invisible
-above `wal_durable` in sync mode. Lookups answer what queries answer on a failed engine, until tsdbd exits.
+`eng_fail` no new file is named and nothing is listed, so publishes stop changing it; memtable rows stay invisible
+above `wal_durable` in sync mode (a lookup waiting for an in-flight row stops waiting, §2.2). Lookups answer what
+queries answer on a failed engine, until tsdbd exits.
 
 ### 3.8 Unknown entries and the fill
 
-A fill computes the newest live row of s **in the parts only** (memtables are the other layer):
+A fill computes the newest row of s **in the parts only**, with **no cutoff** (§3.5): `latest_at` (§5.1) over the
+parts of a cut, with `g` the `lgen` read in the same read hold in which the cut was taken. Then:
 
-1. Read `lgen` (under the read lock) as `g`.
-2. Take a parts-only snapshot of s over `[cutoff, TSDB_TS_MAX)` (a `snapshot_take` variant that skips memtables;
-   inside a `QUERY_LATEST` request, from the request's cut, `cur_cuts`, so that 100,000 fills do not each copy the
-   parts list).
-3. `latest_at` (§5.1): one granule per source, read backwards.
-4. Take the write lock; if `lgen == g` and the entry is still unknown, store the result (or empty) and bump `lgen`.
-   Otherwise drop it (a publish came in between; the lookup answers from the slow path anyway).
+1. Take the write lock (or, during a `publish_pending` window, wait for it to close).
+2. Store the result (a row, or empty) if the entry still reads unknown and its touch is at or below `g` (for an
+   entry unknown by the drop mark, `mark_gen <= g`). Otherwise drop it: something that touched s since the cut
+   was taken, and that the cut may lack, has changed the entry or will be read by the next fill.
+3. Fills do not bump `lgen`.
 
-The lookup that found the entry unknown answers through the full slow path (memtables included) at once, exact by
-construction, and leaves the fill to run after its answer is sent. A **background warmer** per volume (one low
-priority job of the query scheduler) fills entries left unknown by the open (§3.9), in id order, a few thousand a
-second per volume so it never competes with queries; `tsdb_latest_unknown` (a metric) says how many remain.
+Why this is safe: every change that could make the fill's answer wrong (a publish of s, a delete of s, a retention
+change of s, a drop, a merge after a retention change) either settled the entry (it is no longer unknown) or set
+its touch above `g`. A change listed before `g` is in the cut, because the cut and `g` were read in one read hold
+and every such change bumps `lgen` in a write section.
+
+Where fills come from:
+- **The lookup that met an unknown entry** answers through the slow path at once (§2.3 step 5). That path
+  computes the parts' newest row without the cutoff anyway (the cutoff is applied to the answer afterwards), so
+  the fill value costs nothing more; the chunk stores its fills in one write section after its records are sent.
+- **A delete** fills its own series (§3.4).
+- **The warmer**: right after an open (and after a drop's sweep), one job per volume walks the unknown entries in
+  id order, in batches of 1,024 ids, each batch a scheduler job with its own cut, at the scheduler's full width;
+  between batches it yields to any waiting query. `tsdb_latest_unknown` (a metric, per volume) says how many
+  remain.
 
 ### 3.9 Open, crash recovery
 
-At open, after `load_parts` and before the WAL replay (db.c:646), `cls_check_parts` walks every run of every part
-and already reads each entry's timestamps. It also builds the table, with a temporary block array:
+At open, after `load_parts` and before the WAL replay (db.c:646), `cls_check_parts` (classes.c:1095) walks every run
+of every part. `db->parts` is in (partition, min_block) order (manifest.c:283), so within one partition key a part
+visited later has higher blocks, and across keys a series never has two rows at one timestamp. The walk builds the
+table in place:
 
-- per run (series s in part p): the last entry's `ts_max`; if it is greater than the entry's `ts`, or equal and
-  `p`'s block is higher, read `GF_LAST` and the `GT_LAST_NULL` flag (two field reads, only when it wins) and store
-  it, unless the value is not exact (L12), in which case store the timestamp and block with "value unknown";
-- then every part's tombstones: a range of s that holds the entry's `ts`, in a part whose `min_block` is above the
-  entry's block, makes the entry unknown (the row is hidden; what survives below is not known from the index);
-- entries never touched: empty; entries "value unknown": unknown.
+1. Per run (series s in part p): the run's last granule gives `ts_max`. If the entry is empty, or known with
+   `ts_max >= ts`, or unknown with `ts_max >= u`, the entry becomes `(ts_max, p, granule)`: the part and granule
+   indexes held for now in `x`. Nothing else is read.
+2. Per tombstone range `[a, b)` of s in p, before p's runs fold: if the entry is known, came from a part of p's
+   partition visited before p, and its `ts` lies in the range, it becomes unknown `(a - 1)` (empty if `a` is
+   `INT64_MIN`), as in §3.4.
+3. After the walk, one pass over the known entries, split by id range over the open's threads: read `GF_LAST` and
+   the `GT_LAST_NULL` flag of the noted granule once per series, and store the slot. Where the value is not exact
+   (L12), the entry becomes unknown `(ts)`: its timestamp is known, its value is not.
 
-The WAL replay then publishes its rows through `parts_publish`, which folds them (§3.3). A crash leaves nothing to
-repair: the table is memory only, rebuilt from parts that are themselves crash-consistent (intent files).
+No transient array: the table holds the walk's state. The WAL replay then publishes its rows through
+`parts_publish`, which folds them (§3.3). A crash leaves nothing to repair: the table is memory only, rebuilt from
+parts that are themselves crash-consistent (intent files).
 
-Time: the walk is the open's own; the build adds a compare per run and two field reads per winning run (U3:
-below 10% of `cls_check_parts`, to be measured). Unknown entries after the open: every state series, int64 series
-with huge last values, NaN last values, and series whose newest rows were deleted but not yet merged. They answer
-through the slow path (exact) until the warmer reaches them. Estimate for 10^8 series in a cluster (about 3.75 x
-10^7 series copies per server): the build is seconds per server, run per volume in parallel as volumes open; the
-warmer, at 20 µs per fill and a few thousand fills per second per volume, takes minutes for a million state series
-per server, with exact answers meanwhile.
+Cost (U3): the walk is the open's own; step 1 adds a compare per run (about series x partitions compares, no field
+reads), step 3 two field reads per series. Volumes open one after another today (volumes.c:1054); opening them in
+parallel is a separate change and not assumed here.
+
+Unknown entries after the open: every state series, int64 series with huge last values, NaN last values, and series
+whose newest rows were deleted but not yet merged. The first three have a bound equal to their newest timestamp, so
+**the next flush or insert of the series settles them** (§3, the fold); only series that are no longer written need
+a fill. The warmer does those at the scheduler's full width: at about 10 to 20 µs per fill (U4), 2.5 million
+unknown series (a quarter of 10^7 series being state series) take 1 to 2 s on 32 threads, with exact answers from
+the slow path meanwhile (U5).
 
 ### 3.10 NFS followers
 
-A follower lists parts from MANIFEST and tails the writer's WAL (`db->tails`). Its table keeps the block number
-(L13). At each refresh, under the write lock, before the new list is installed: every newly listed part (new
-publishes and merge outputs alike) folds by the open's rule (`(ts, block)` from the index, tombstones against
-`min_block`); a partition dropped (retention, `drop_before`) makes the entries with `ts` below its end unknown.
-Merge outputs fold to the rows they already had, and a merge output can never overwrite a newer row at an equal
-timestamp, because its block range is below that row's block. WAL tail rows are the memtable layer (visible
-always, as `snapshot_take` reads them with no bound, query.c:240).
+A follower lists parts from MANIFEST and tails the writer's WAL (`db->tails`). `follow_refresh` installs the
+writer's whole list at once (manifest.c:572-596), so a follower can skip states: a delete's tombstone part can be
+written and merged away between two of its refreshes, together with the row it hid (merge.c:249-280 keeps
+tombstones only while an older part remains). Folding only new parts would keep that row (the correctness review's
+H3). Its table therefore keeps each known entry's block number (24-byte entries), and every refresh does this:
+
+1. **Outside the lock** (the parts' indexes are mapped files, on NFS): compare the old list with the new. For each
+   new part q and series s in it, note s's newest row in q `(ts, slot, block = q.max_block)` and whether a
+   tombstone of s in a part of q's partition with a higher `min_block` (old or new) covers that `ts` ("shadowed").
+   For each part leaving the list, note its block range and partition.
+2. **Under the write lock**, bump `lgen`, then:
+   - **Leaving parts**: every known entry whose block lies in a leaving part's range is re-derived from the new
+     part of that partition whose block range covers it (a merge output), if any. If that part's newest row of s,
+     not shadowed, has a timestamp at or above the entry's, the entry becomes that row (the merge output holds the
+     last-write-wins result at that timestamp, a merged replace included). Otherwise (the row was deleted by a
+     tombstone that was merged away, or dropped by retention, or the partition was dropped) the entry becomes
+     unknown `(ts, lgen)`.
+   - **New parts**, in block order: the writer's fold, with blocks: a row `R` that is not shadowed replaces a known
+     entry if `R.ts > k.ts`, or equal with a higher block; it settles an unknown entry only if `R.ts > u` (strictly:
+     on a follower a new merge output can have lower blocks than a listed row at `u`). A shadowed `R` at or above a
+     known entry's `ts` makes it unknown `(R.ts, lgen)`. Tombstones of the new parts apply to entries of lower
+     blocks by §3.4's rule.
+   - Install the list.
+3. Fills and the warmer run as on the writer.
+
+WAL tail rows are the memtable layer (visible always, as `snapshot_take` reads them with no bound, query.c:240),
+ranked newest segment first, above the parts. A follower's open builds the table as the writer's does, keeping the
+block of each entry's part. A follower that should not spend the memory runs with `latest_cache = 0`.
 
 ## 4. Cost on the insert path
 
 | path | per row | per batch or part | lock |
 |---|---|---|---|
-| small insert (memtable) | one compare, sometimes a u32 store, on the `mt_series` line `mt_add` writes anyway | none | `buf_lock`, already held |
-| flush | none | one `(ts, slot)` per series in the memtable, from `mt_write`'s sorted runs; one 16-byte store per series | `latest_rw` for writing, for the stores only (§3.2) |
-| large insert | none (the part writer compares at each series boundary) | as a flush, per series of the batch | same |
-| delete, replace | none | the §3.4 rule per series of the commit, and one fill per entry made unknown | same |
-| merge | none | none | none |
+| small insert (memtable) | one compare, sometimes a u32 store, on the `mt_series` line `mt_add` writes anyway | none | `buf_lock`, already held; lookups take it in 2 µs sub-holds (§2.3) |
+| flush | none | one `(ts, slot)` per series from `mt_write`'s sorted runs; one compare and store per series | `latest_rw` for writing, for the fold and the listing (§3.2; outside it if measured necessary) |
+| large insert | none (the part writer compares at each series boundary) | as a flush, per series of the batch | `latest_rw` for writing, with the listing |
+| delete, replace | none | the §3.4 rule per series of the commit, and one fill afterwards | same |
+| merge | none | none, unless a retention limit changed during it (§3.5) | none (or the write lock, rarely) |
 
-No new lock on the insert path. Writer threads do not contend more than today: memtable appends are serialised by
-`buf_lock` already, publishes by `publish_lock`. What is new is that a publish waits for lookups holding the read
-lock (at most a chunk, about 0.4 ms), and lookups wait for a publish's stores (a few ms for a million-series
-flush). The benchmark plan (§9) measures insert throughput with the table on and off.
+Writer threads do not contend more than today: memtable appends are serialised by `buf_lock` already, publishes by
+`publish_lock`. What is new is that a publish waits for lookups holding the read lock (at most a chunk, about 1 ms
+for 4096 ids), that inserts share `buf_lock` with lookups in 2 µs holds, and that lookups wait for a publish's write
+section (§3.2). The benchmark gate of step 2 (§10) measures all three.
 
 ## 5. Queries beyond "the newest"
 
-### 5.1 As of a time (an end bound)
+### 5.1 `latest_at`, the slow path (as of a time, fills, unknown entries)
 
-`end` below the timestamp a lookup found in step 3 means the answer lies below; the table cannot help. The id goes
-to `latest_at(snapshot, s, end)`, the slow path, also used by fills and `SKIP_NULLS`:
+`end` below the timestamp a lookup found means the answer lies below; the table cannot help. The id goes to
+`latest_at(cut, s, end, flags)`, which also serves fills (parts only, no cutoff), unknown entries, `SKIP_NULLS` and
+`latest_cache = 0`:
 
-- per source of the snapshot (parts through their snapshot windows, `snap_find`; memtable runs): the last granule
-  whose `ts_min < end`. If its `ts_max < end` and it is a plain granule (not moved to a mem run by a tombstone,
-  not a state series, not an int64 beyond 2^53 or a NaN, L12), its candidate is `(ts_max, GF_LAST)` from the index
-  without decoding; otherwise decode that one granule and take its last row below `end`;
-- the candidate with the greatest timestamp wins, the higher source priority (`mem_prio`) on ties; candidates from
-  the index whose timestamp ties another source's are decoded first only if they would lose the tie, which the
-  priority says without decoding.
+- **Memtable sources** (active, flushing, tails): the newest visible row of s below `end` (a binary search in a
+  sorted run; `mt_collect`'s sort otherwise).
+- **Parts, newest partitions first**: the cut's distinct partitions, ordered by their end (`partition_range`; one
+  sort per cut, shared by every id of the chunk). For each partition in turn, skipping those that start at or after
+  `end`: compute s's snapshot windows in that partition's parts only (`snap_find`, with the partition's tombstones
+  applied as `snapshot_take` does, so granules a tombstone touched are read from their mem runs); a part with no run
+  of s costs one binary search in its run list. Per source, take the last granule with `ts_min < end`: if its
+  `ts_max < end` and it is a plain granule (not moved to a mem run, not a state series, not an int64 beyond 2^53 or
+  a NaN, L12), its candidate is `(ts_max, GF_LAST)` from the index without decoding; otherwise decode that one
+  granule and take its last row below `end`.
+- **Stop** as soon as the best candidate's timestamp is at or above the next partition's end: no row of an older
+  partition can be newer, and no timestamp is in two keys.
+- The candidate with the greatest timestamp wins, the higher source priority (`mem_prio`) on ties.
 
-That is at most one granule decoded per source, and usually none. It replaces raw_desc for `limit = 1` (L17);
-raw_desc keeps its windows for larger limits. Inside one `QUERY_LATEST` the snapshots come from one cut per volume
-(as QUERY_MULTI's), so an as-of request for 100,000 series reads one parts list per volume, not 100,000.
+A series usually needs one partition (up to four keys overlap in time with partition classes). Cost (U4): about 5
+to 20 µs with one granule decoded, independent of the number of parts in the volume, to be measured at 10, 100 and
+1,000 partitions. A series whose newest row is far back walks the partitions in between at one binary search per
+part each, once: its fill then answers from the table. It replaces raw_desc for `limit = 1` (L17); raw_desc keeps
+its windows for larger limits. Inside one `QUERY_LATEST` the cuts come one per chunk (§2.3), not one per series.
 
 ### 5.2 Skipping nulls
 
-When the newest row is a null and `SKIP_NULLS` is set: `latest_at` again with `end` = that row's timestamp, and per
-source granules whose null count equals their row count are stepped over from the index; others are decoded. A
-series that has been null for weeks walks back that far (the cost of a descending query to its last value).
+`SKIP_NULLS` asks for the newest timestamp whose **last-write-wins** value is not null. Per source, `latest_at`
+finds the newest non-null row below the bound, stepping over granules whose null count equals their row count (from
+the index) and decoding the others. A source's candidate at `T` is accepted only if **no higher-priority source has
+a row at `T`**: a newer source's null at `T` overwrote it (its non-null at `T` would itself have been a candidate
+and won the tie). The check reads the higher-priority sources' granules that span `T` (their `[ts_min, ts_max]`,
+stepped-over null granules included) and decodes one where `T` falls inside it; memtable runs are searched
+directly. A rejected candidate moves that source's bound below `T` and the search goes on. A series that has been
+null for weeks walks back that far (the cost of a descending query to its last value).
 
 ### 5.3 Statistics
 
@@ -342,11 +500,11 @@ many series the table answered and how many went the slow way (also as metrics, 
 typedef enum { TSDB_LATEST_VALUE = 0, TSDB_LATEST_NULL = 1, TSDB_LATEST_NONE = 2 } tsdb_latest_kind;
 
 typedef struct tsdb_latest {
-    int32_t status;   /* 0, or this series' error: TSDB_ERR_INVALID for a malformed id */
-    uint8_t kind;     /* tsdb_latest_kind; NONE for an unknown id */
-    uint8_t type;     /* the series' tsdb_type (0 with an unknown id) */
-    int64_t ts;       /* with VALUE and NULL */
-    union { float f32; double f64; int64_t i64; uint8_t b; uint32_t state; } v; /* with VALUE */
+    int32_t status;   /* 0, TSDB_ERR_NOTFOUND (no such series) or TSDB_ERR_DENIED (tsdbd) */
+    uint8_t kind;     /* tsdb_latest_kind; NONE whenever status != 0 */
+    uint8_t type;     /* the series' tsdb_type; 0 whenever status != 0 */
+    int64_t ts;       /* with VALUE and NULL; 0 otherwise */
+    union { float f32; double f64; int64_t i64; uint8_t b; uint32_t state; } v; /* with VALUE; 0 otherwise */
 } tsdb_latest;
 
 typedef struct tsdb_latest_opts {
@@ -361,9 +519,15 @@ typedef struct tsdb_latest_opts {
 int tsdb_latest(tsdb *db, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *opts, tsdb_latest *out);
 ```
 
-`tsdb_options.latest_cache` (default 1, A6). Ids are 64-bit (`tsdb_sid`), never narrowed (AGENTS.md, "Series
-ids"); the call splits them by volume and runs each volume's chunks on the query scheduler. The CLI gets
-`tsdb DIR latest NAME...`. `tsdb_abi_version` goes up (new struct and call used by the bindings).
+An id that names no series (zero volume field, bits 48-63 set, a volume or local number that does not exist) is
+`TSDB_ERR_NOTFOUND` in its record, as for every lookup by id (AGENTS.md, "Series ids"). A follower, or a cluster
+replica answering with `REPLICA_OK`, that meets a local number beyond its SERIES reads SERIES again once per
+request (`series_reload`, as the replay does, memtable.c:1157-1160) before it answers NOTFOUND, so a series the
+writer has just created is not reported missing.
+
+`tsdb_options.latest_cache` is a byte budget (A6). Ids are 64-bit (`tsdb_sid`), never narrowed; the call splits
+them by volume and runs each volume's chunks on the query scheduler. The CLI gets `tsdb DIR latest NAME...`.
+`tsdb_abi_version` goes up (new struct and call used by the bindings).
 
 ### 6.2 Wire (protocol 13)
 
@@ -375,6 +539,7 @@ QUERY_LATEST (39)  u8 flags, u8 0, u16 threads, u32 n (1..1048576), i64 end, [i6
                    i32 status, u8 kind, u8 type, u16 0, i64 ts, u64 value (the series' slot zero-extended:
                    float32 bits in the low 4 bytes, bool 0/1, state code; 0 with NULL and NONE)
                    records in index order, at most 65,536 per frame; the frame with last = 1 ends the reply.
+                   A record with status NOTFOUND or DENIED has kind NONE, type 0, ts 0, value 0.
                    A bad header gets one frame with INVALID, m = 0, last = 1.
 ```
 
@@ -388,10 +553,13 @@ QUERY_LATEST (39)  u8 flags, u8 0, u16 threads, u32 n (1..1048576), i64 end, [i6
 ### 6.3 Rights
 
 `auth_ops` gets a row for QUERY_LATEST: any login, right `read`, series "the ids of a list, checked in the case"
-(as QUERY_MULTI, design-auth.md A14). In the case, each id goes through the user's rights map (A15); a denied id,
-and a missing id for a user without `read` on `all`, gets `status = TSDB_ERR_DENIED` in its record and the rest
-are answered. A missing id for a user with `read` on `all` (and with `--no-auth`) is kind NONE, status 0, as an
-unknown id is for queries. `tests/test_auth_ops.c` fails until the row exists.
+(as QUERY_MULTI, design-auth.md A14). In the case, each id goes through the user's rights map (A15):
+- a user without `read` on the id's series gets `TSDB_ERR_DENIED`, and so does a missing id for a user without
+  `read` on `all` (denied and missing look alike);
+- a missing id for a user with `read` on `all`, and with `--no-auth`, gets `TSDB_ERR_NOTFOUND` (A16);
+- both carry kind NONE, type 0, ts 0 and value 0, so nothing in the record tells whether a denied series exists.
+
+`tests/test_auth_ops.c` fails until the row exists.
 
 ### 6.4 Clients and bindings (same commit, `make test-clients`)
 
@@ -399,21 +567,24 @@ unknown id is for queries. `tests/test_auth_ops.c` fails until the row exists.
 - Rust: `Client::latest(&[Sid], &LatestOpts) -> Result<Vec<Latest>>`, `Latest { status, kind, ts, value: Value }`;
   the embedded `Db::latest` the same.
 - Python (PyO3 over the crate): `latest(ids, end=None, ends=None, skip_nulls=False)` returning a list of
-  `(ts, value)` tuples, `None` for NONE, a `DeniedError` instance in place for a denied id (or raising, by a flag);
-  embedded `Db.latest` the same.
+  `(ts, value)` tuples, `None` for NONE, a `NotFoundError` or `DeniedError` instance in place for a missing or
+  denied id (or raising, by a flag); embedded `Db.latest` the same.
 - Java: `long[]` ids (never `int`), `Latest[] latest(long[] ids, LatestOptions o)`; `EmbeddedDb.latest` the same.
 - The Pulsar sink does not use it.
 
 Each client's tests compare its answers with the embedded binding's and with tsdbd's for the same data, nulls,
-denied ids and unknown ids included.
+denied ids and missing ids included.
 
 ### 6.5 Metrics (`docs/metrics.md`)
 
 `tsdb_latest_requests_total`, `tsdb_latest_series_total{path="table"|"slow"}`, `tsdb_latest_unknown` (entries left
-to fill, per volume), `tsdb_latest_table_bytes`, `tsdb_latest_wait_seconds_total` (time lookups waited for a
-publish's write lock).
+to fill, per volume), `tsdb_latest_table_bytes`, `tsdb_latest_budget_capped` (volumes whose pages the budget
+refused), `tsdb_latest_wait_seconds_total` (time lookups waited for a write section),
+`tsdb_latest_inflight_total{how}` (§2.2), `tsdb_latest_fills_total{result="stored"|"dropped"}`.
 
 ## 7. The cluster
+
+### 7.1 How it fits
 
 The design follows design-cluster.md without additions to its log or its Raft state:
 
@@ -423,42 +594,77 @@ The design follows design-cluster.md without additions to its log or its Raft st
   entry server does it. This is cluster C16 for QUERY_MULTI, with no budget to split.
 - **Replicas keep the table warm.** A replica applies a `COMMIT` marker by `parts_commit` and listing (cluster
   §5.2): the same fold. Its memtable rows are visible up to the commit point (C7), the same `visible` that
-  lookups use. `NOW` markers move the cutoff, which lookups read; a `RETENTION` marker that lowers a cutoff and a
-  `DROP` marker make entries unknown as in §3.5 and §3.6; `CLASS` changes nothing. So every in-sync replica's
-  table, read at a commit point, answers what the leader's answers at that point.
+  lookups use. `NOW` markers move the cutoff, which lookups read; a `RETENTION` marker goes through §3.5 and a
+  `DROP` marker through §3.6; `CLASS` changes nothing. So every in-sync replica's table, read at a commit point,
+  answers what the leader's answers at that point.
 - **Failover**: the new leader was an in-sync replica, so its table is already complete; nothing is rebuilt. A
   returning replica that cuts a divergent WAL tail (C14) never listed parts above the commit point, so its table
   holds nothing uncommitted; its memtables are cut with the WAL.
 - **A new replica** (learner, cluster §8.1) opens its snapshot like any open (§3.9) and then applies the log.
-- **Reads on replicas**: `REPLICA_OK` per request, and `min_pos` for read-your-writes (cluster §7.2), apply to
-  `QUERY_LATEST` as to queries; a leader answers only within its lease (§7.1).
 - **Cold tier**: every replica keeps the index of cold partitions locally (cluster §9), so the open's build is
   unchanged; a fill or an as-of read that needs a cold granule's rows reads them from the cold tier (rare: only a
   series whose newest rows are cold and were deleted, or an as-of bound in cold time).
 
-Memory in the cluster: three copies (A3), so 48 GB for a billion series spread over the servers (§2.1). A
+Memory in the cluster: three copies (A3), so 48 GB for a billion series spread over the servers (§2.4). A
 replication factor of 4 (cluster D1) adds a copy.
+
+### 7.2 Hot volumes and reads on replicas
+
+Hash placement (cluster §3.3) spreads lookups over volumes on average, but a dashboard on one site's series, or
+series created in a named volume, can make one volume hot. All of its lookups go to its leader, or with
+`REPLICA_OK` to at most its three (four) in-sync copies (cluster §7.2), and adding servers does not split a volume.
+With L19 a volume's lookups run in parallel on its server's cores, sharing only `buf_lock` in short holds; the
+ceiling of one volume is then its server's cores. **`REPLICA_OK` with `min_pos`** (read-your-writes after the
+client's own insert) is the documented knob for read-heavy dashboards: it multiplies one volume's lookup capacity
+by the replication factor, with exact answers at the replica's commit point.
+
+The gate (step 2, §10): one volume, 1 to 32 connections of 100,000-id requests, while it takes 1 M rows/s of
+inserts. If it serves 20 M ids/s or more with insert throughput and p99 within 5% of the table-off run, no cache
+tier is needed; if not, the `buf_lock`-free memtable read of §2.3 comes first.
+
+### 7.3 Considered: a Redis-style cache beside the database
+
+What such a cache wins: reads scale out with any number of replicas; it is isolated from the database's insert
+locks; it survives a tsdb restart; operators know it.
+
+What it loses: it is not exact (dual writes race last-write-wins; it never sees deletes, replaces, retention or
+sync-mode visibility; a failure between the insert and the SET leaves it wrong); it goes cold when it restarts; it
+is a second system to run and to fence at failover; it takes 60 to 100 bytes per key as strings (20 to 30 in packed
+hashes) against 16 here; and it has its own authentication, apart from tsdb's grants.
+
+The in-engine table wins exactness, memory, one hop and the grants. It loses read scale-out beyond the replication
+factor, which §7.2's gate measures.
 
 ## 8. Tests
 
 - **`tests/test_latest.c`, an oracle test.** Random sequences on a few hundred series of every type, ids above
-  2^32 and in several volumes: small and large inserts (in and out of order, duplicate timestamps, nulls, NaN with
-  payloads, int64 near `INT64_MIN`/`INT64_MAX` and beyond 2^53), deletes of the newest rows and of other ranges,
-  replaces with and without rows, retention set, raised and lowered with a test clock, `drop_before`, class
-  switches (partition classes on), flushes, merges and `tsdb_optimize`, close and reopen, reopen after a simulated
-  crash (fork, kill), sync and periodic WAL modes. After every step, for every series: `tsdb_latest` equals
+  2^32 and in several volumes: small and large inserts (in and out of order, duplicate timestamps, keys duplicated
+  across `SORT_CHUNK_ROWS` chunks of one insert, nulls, NaN with payloads, int64 near `INT64_MIN`/`INT64_MAX` and
+  beyond 2^53, timestamp 0 and negative timestamps), never-written series, deletes of the newest rows and of other
+  ranges (from `INT64_MIN` too), replaces with and without rows, retention set, raised and lowered with a test
+  clock (also during a merge), `drop_before`, class switches (partition classes on), flushes, merges and
+  `tsdb_optimize`, close and reopen, reopen after a simulated crash (fork, kill), sync and periodic WAL modes, a
+  budget that caps the table mid-volume. Nulls written over values across sources (a memtable over a part, a later
+  part over an earlier one) for `SKIP_NULLS`. After every step, for every series: `tsdb_latest` equals
   `tsdb_query_values` ascending over everything, last row (the oracle is a full scan, not the descending path),
   bit for bit; with random end bounds and with `SKIP_NULLS` too. Also with `latest_cache = 0` (the slow path alone)
-  and with `desc_window_rows` small.
+  and with `desc_window_rows` small. A check after each step that every entry keeps its promise (§2.1) against a
+  parts-only scan.
 - **Concurrency** (in the same file, run under `make tsan`): writer threads doing small and large inserts and
   deletes, lookup threads checking that each answer is one the history allows (its row was written by a write that
   had begun; no acknowledged newer row is missed; a series' answers never go back in time without a delete in
-  between). Test hooks pause a publisher between its stores and its listing, and a fill between its read and its
-  store, to force the races of §3.2 and §3.8.
-- **Followers**: a writer and a follower on one directory, lookups compared after each refresh, merges running.
-- **tsdbd** (`tests/test_server.c`, uring and epoll): the frame, chunks across frames, unknown, malformed and
-  denied ids, `PER_END`, CANCEL, a 12 client against a 13 server and the reverse.
-- **Rights**: `test_auth_ops` row; denied and missing alike for a user without `read` on `all`.
+  between). Test hooks force the races the reviews found: a fill that took its cut before a flush, a delete or a
+  retention change of its series, and stores after it (must be dropped); a cut taken in a QUERY_LATEST chunk before
+  a publish, with the fill after; a publisher paused between its precomputed list and its write section while a
+  fill stores; a merge running across a retention lowering; a drop between a lookup's entry read and its sweep; an
+  in-flight top row in sync mode. With the §3.2 window built, a lookup paused inside a flush's stores.
+- **Followers**: a writer and a follower on one directory, lookups compared after each refresh, merges running;
+  and a delete followed by a full merge of the partition between two refreshes (the deleted row must not come
+  back), and a retention drop of rows between two refreshes.
+- **tsdbd** (`tests/test_server.c`, uring and epoll): the frame, chunks across frames, missing, malformed and
+  denied ids (NOTFOUND and DENIED records with type 0), `PER_END`, CANCEL, a 12 client against a 13 server and the
+  reverse.
+- **Rights**: `test_auth_ops` row; denied and missing alike for a user without `read` on `all`, NOTFOUND with it.
 - **Fuzzing**: QUERY_LATEST seeds in `tests/fuzz/frames/` and `make fuzz-frames FUZZ_SECONDS=600`.
 - **Jepsen** (kv and classes workloads, every nemesis, `--auth` too): clients also send `QUERY_LATEST`. A latest
   answer `(t, id)` for series s is checked as two reads of the existing model: a read of key `t` that returned
@@ -474,13 +680,21 @@ replication factor of 4 (cluster D1) adds a copy.
 - **Insert cost**: `build/insert-bench` (1 to 10,000 rows per call through the memtable, 1 M rows straight to
   parts, 1 and 64 threads) with `latest_cache` on and off. Expected: within noise on the memtable path, below 2%
   on large inserts.
-- **Lookups**: `build/tsdbc-bench latest --ids 1|100000 --conns 1|32` against tsdbd on the 100 M-row data set
-  (100 series) and on 10^6 and 10^7 series (scale-bench data); the same embedded (`build/tsdb-bench`, a latest
-  class). Requests per second and series per second; with steady inserts running alongside, and with the slow
-  path forced (`latest_cache` off) to show what the table buys.
-- **As of and skip nulls**: the same, with an end bound a day back.
-- **Rebuild**: open time of a scale-bench database with the table on and off; time until `tsdb_latest_unknown`
-  reaches 0 with a quarter of the series of type state.
+- **Inserts under lookups** (the gate of step 2): insert rows/s and p99 at 1 and 64 writer threads while 32
+  connections send 100,000-id lookups to the same volume, table on and off; and one volume's ids/s at 1 to 32
+  connections while it takes 1 M rows/s (§7.2).
+- **Lookups**: `build/tsdbc-bench latest --ids 1|4096|100000 --conns 1|32`, ids sorted and random, against tsdbd
+  on the 100 M-row data set (100 series) and on 10^6, 10^7 and 10^8 series per volume (scale-bench data); the same
+  embedded (`build/tsdb-bench`, a latest class). With steady inserts running alongside, and with the slow path
+  forced (`latest_cache` 0) to show what the table buys. Compared with what exists today: one id against a
+  descending limit-1 query, 100,000 ids against QUERY_MULTI (values, descending, limit 1).
+- **Flush holds**: lookup p99 under steady flushes of 10^6 series, stores inside the write section and (if built)
+  in the §3.2 window (U2).
+- **Slow path**: as of a day back, `SKIP_NULLS`, and fills, at 10, 100 and 1,000 partitions per volume (U4).
+- **Open and warm-up**: open time with the build on and off at 10^7 and 10^8 series x 30 and 365 partitions,
+  page cache warm and cold (U3); the time until `tsdb_latest_unknown` reaches 0 with a quarter of 10^7 series of
+  type state, written and not written after the open (U5).
+- **Memory**: resident bytes per series at 10^7: the table, memtables, rights maps, the open's peak.
 
 `tools/bench-tsdb.sh` gets the latest classes, and AGENTS.md's benchmark section the numbers.
 
@@ -490,19 +704,21 @@ Each step is a track (tsdb-tracks): build, adversarial review, fix, gates, merge
 
 | step | what | gates | effort |
 |---|---|---|---|
-| 1 | `latest_at` (the one-granule descending read, §5.1) and `tsdb_latest` on the slow path alone (no table), C API, `tests/test_latest.c` with the oracle | `make test`, `make asan` | 2 days |
-| 2 | The table: `src/latest.c`, pages, `latest_rw`, the folds at every listing (flush, insert, replay, delete, replace), retention and `drop_before`, the build in `cls_check_parts`, fills and the warmer, `top` in `mt_add`, followers; concurrency tests and hooks | `make test`, `asan`, `tsan`, `make jepsen` (it touches the publish path) | 4 to 5 days |
+| 1 | `latest_at` (§5.1: partitions newest first, one granule per source, `SKIP_NULLS` with the shadow check) and `tsdb_latest` on the slow path alone (no table), C API, `tests/test_latest.c` with the oracle | `make test`, `make asan`; slow-path numbers at 10, 100, 1,000 partitions | 3 days |
+| 2 | The table: `src/latest.c`, pages and budget, `latest_rw`, touch generations, the folds at every listing (flush, insert, replay, delete, replace), retention and the merge marking, `drop_before` with the mark and sweeper, the build in `cls_check_parts`, fills and the warmer, `top` in `mt_add`, the lookup with sub-holds, followers; concurrency tests and hooks | `make test`, `asan`, `tsan`, `make jepsen` (it touches the publish path); the benchmark gates: inserts under lookups within 5%, flush holds (the §3.2 window only if above 2 ms) | 6 to 7 days |
 | 3 | Protocol 13: QUERY_LATEST in tsdbd, `auth_ops`, the C, Rust, Python and Java clients and embedded bindings, the CLI, metrics, fuzz seeds; jepsen's latest check | `make test`, `test-clients`, `integration-tests`, `fuzz-frames` 600 s, `make jepsen` with the new check | 4 days |
-| 4 | Benchmarks (§9), README and docs (protocol comment, metrics.md, CHANGELOG, roadmap: the "not planned" line goes), AGENTS.md (the invariant below) | numbers on a quiet machine | 1 to 2 days |
+| 4 | Benchmarks (§9), README and docs (protocol comment, metrics.md, CHANGELOG, roadmap: the "not planned" line goes), AGENTS.md (the invariant below) | numbers on a quiet machine | 2 days |
 | 5 | Cluster: the client split per leader, REPLICA_OK and `min_pos` for the op; with the cluster's own steps | cluster simulators and `make jepsen-cluster` | part of the cluster work |
 
-About two weeks for steps 1 to 4.
+About three weeks for steps 1 to 4.
 
-**AGENTS.md gains one invariant**: *The latest table changes only together with the parts list* (after
-`parts_commit`, under `latest_rw` for writing, released after the listing); a new listing point must fold there,
-and anything that removes live rows other than tombstones of a later block (a retention limit lowered, a drop)
-must make the entries it may affect unknown. Lock order: `publish_lock` > `latest_rw` > `db->lock`; lookups take
-`latest_rw` (read) > `db->lock` > `buf_lock`; never held across I/O.
+**AGENTS.md gains one invariant**: *The latest table is read and written only under `latest_rw`.* Its writers are
+publishers (in the write section that lists their parts, after `parts_commit`), fills (only into an unknown entry
+whose touch is not newer than the fill's snapshot), retention changes, drops and their sweeper, merges that ran
+across a retention change, and a follower's refresh. A new listing point must fold there; anything that removes live
+rows other than tombstones of a later block must make the entries it may affect unknown and set their touch. Lock
+order: `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` > `buf_lock`; `ret_lock` > `latest_rw`; lookups
+take `latest_rw` (read) > `db->lock`, then `buf_lock` in sub-holds; `latest_rw` is never held across I/O.
 
 **What lands in a 0.9.x**: protocol 13 (one new op; floor still 12, so no client breaks) and the C API
 (`tsdb_abi_version` up). No disk format change: nothing to migrate. The changelog says under "Added": the op, the
@@ -512,23 +728,49 @@ call, the option, the metrics; under "Changed": protocol 13, the ABI version.
 
 1. **A null at the newest timestamp: return the null, or the newest non-null?** Recommended: return the null by
    default (it is what the series says now), `SKIP_NULLS` for the newest known value (A2).
-2. **On by default?** Recommended: on, for tsdbd and embedded (16 bytes per series; a few seconds at open on big
-   volumes); off is one option for users who never ask (A6).
+2. **On by default, and with what budget?** Recommended: on, for tsdbd and embedded, with a budget of RAM/16 per
+   process (16 GB on the production servers: 10^9 entries); 0 turns it off for users who never ask (A6).
 3. **Names in the request?** Recommended: ids only on the wire; the clients resolve names (and cache the ids) in
    a `latest_by_name` helper. A "latest of every series under a selector" op (prefix or glob, for dashboards) can
    follow if asked; it needs a name listing per volume, which is its own design.
-4. **One instant per request, or per chunk of 4096 series?** Recommended: per chunk (A5), documented; QUERY_MULTI
-   (values, descending, limit 1) remains for the rare caller that needs one cut per volume.
-5. **An exact last value in the granule index (`GF_LASTV`)?** Recommended: yes, but only inside format 9 when the
-   change feed and the cluster bump the format; until then state series and huge int64 values start unknown after
-   an open and are filled in the background (L12, L18).
+4. **One instant per request, or per series?** Recommended: per series (A5), documented; QUERY_MULTI (values,
+   descending, limit 1) remains for the rare caller that needs one cut per volume.
+5. **An exact last value in the granule index (`GF_LASTV`, state codes included)?** Recommended: yes, in the first
+   format bump that happens for any reason; until then state series and huge int64 values start unknown after an
+   open, are settled by their next flush or filled by the warmer within seconds (L12, L18).
 6. **Future timestamps**: should "latest" default to `end = now + 1` so a device with a wrong clock does not stick?
    Recommended: no; the default is the greatest timestamp (A1), and callers that distrust clocks pass the bound
    (the slow path). A metric of series whose latest is more than an hour ahead of the clock would help operators.
 
 ## Unverified assumptions
 
-- U1: lookup cost of 0.2 to 0.4 µs per id on one thread; to be measured (§9).
-- U2: 2 to 5 ms of stores for a million-series flush, during which lookups of that volume wait.
-- U3: the build adds below 10% to `cls_check_parts` at open.
-- U4: a fill (parts-only snapshot from the request's cut, one granule per source) costs about 20 µs.
+- U1: lookup cost of 0.1 to 0.2 µs per id on one thread, about 15 ns of it under `buf_lock`; to be measured (§9).
+- U2: 5 to 15 ms of write hold for the stores of a million-series flush, during which lookups of that volume wait.
+- U3: the build adds below 10% to `cls_check_parts` at open (a compare per run, two field reads per series).
+- U4: a slow-path read (a fill, an as-of bound) costs 5 to 20 µs, whatever the number of partitions.
+- U5: with a quarter of 10^7 series of type state, the warmer reaches `tsdb_latest_unknown = 0` within 2 s of the
+  open on 32 threads.
+- U6: one volume serves 20 M ids/s with its inserts within 5% (§7.2).
+
+## Changes after review (2026-11-06)
+
+| finding | where it is now |
+|---|---|
+| Correctness H1, performance H2(a): the publisher's fold was computed outside the lock and raced fills | L7, §3.2: only the per-series newest rows are computed outside; compare and store inside the write section. The invariant names every writer. |
+| Correctness H2, performance H2(b): a fill read `lgen` after the request's cut | §2.3 step 5, §3.8: the cut and `g` are read in one read hold; per-entry touch generations (§2.1) |
+| Correctness H3: a follower missed tombstones merged away between refreshes | §3.10: leaving parts re-derive their entries; new parts fold with blocks and a shadow check |
+| Correctness M1: retention lowered | §3.5: fills search without a cutoff (empty = no row in parts); limit and marking in one section; merges across a retention change mark their range |
+| Correctness M2: `drop_before` outside the lock order | §3.6: `latest_rw` then `db->lock`, retire and mark in one section |
+| Correctness M3: `SKIP_NULLS` lost the shadow of a newer null | §5.2: a candidate is accepted only if no higher-priority source has a row at its timestamp |
+| Correctness M4: zeroed pages read as rows at 1970 | L4, §2.1: the timestamp is stored XOR `INT64_MAX`; all-zero is empty |
+| Correctness M5: unknown ids answered "none" | L15, §6.1-6.3: NOTFOUND per record after one SERIES reload on followers and replicas; DENIED and NOTFOUND records carry type 0 |
+| Correctness low: liveness of one `lgen`; tails missing from the ranking; chunked large inserts; the delete's fill under locks | §2.1 (touch), §2.3 step 5, §3.3, §3.4 |
+| Performance H1: lookups held `db->lock` and `buf_lock` for a whole chunk | L19, §2.3: O(1) under `db->lock`, 128-id sub-holds of `buf_lock` with prefetch; gate and fallback |
+| Performance M1: the slow path was O(parts) | L17, §5.1: partitions newest first, windows per visited partition, early stop |
+| Performance M2: the rebuild read `GF_LAST` per run; volumes do not open in parallel | L11, §3.9: one read per series after the walk, in parallel; the claim about volumes is dropped |
+| Performance M3: the warmer was too slow | L12, §3.8, §3.9: bounds let the next flush settle live series; the warmer runs at full width; `GF_LASTV` in the first format bump |
+| Performance M4: flush stores held the write lock for milliseconds | §3.2: measured; a publish-pending window for flushes if the hold exceeds 2 ms |
+| Performance M5: memory had no budget and the doc counted only the table | A6, L5, §2.4: a byte budget; the per-series memory line; design-cluster.md §10.2 counts memory |
+| Performance M6: hot volumes | §7.2, §7.3: the gate, `REPLICA_OK` with `min_pos` as the read knob, the comparison with a cache beside the database |
+| Performance L1: whole-table scans on drops and retention | §3.6: the drop mark and a sweeper; retention is per series (refuted for retention, §3.6) |
+| Performance L2: the in-flight scan under `buf_lock` | §2.2: wait for the group commit and look again; a scan in pieces only as a last resort |
