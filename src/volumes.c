@@ -1968,6 +1968,138 @@ int tsdb_query_values(tsdb *t, tsdb_sid series, int64_t start, int64_t end, cons
     return rc;
 }
 
+/* ---- the latest row (latest.c) ----
+ * The ids are routed, sorted by (engine, local id) and cut into chunks of one engine: a chunk is answered from one
+ * cut of its engine, on the query scheduler's threads. */
+#define LATEST_CHUNK 4096
+typedef struct latest_item {
+    eng *e;
+    uint32_t local;
+    uint32_t idx; /* position in the caller's arrays */
+} latest_item;
+
+typedef struct latest_job {
+    const latest_item *it;
+    size_t nchunks;
+    const size_t *cstart; /* chunk c: items [cstart[c], cstart[c + 1]) */
+    const int64_t *ends;
+    int64_t end;
+    bool with_nulls;
+    tsdb_latest_result *out;
+    atomic_size_t next;
+    atomic_int rc;
+} latest_job;
+
+static int cmp_latest_item(const void *a, const void *b)
+{
+    const latest_item *x = a, *y = b;
+    if (x->e != y->e)
+        return (uintptr_t)x->e < (uintptr_t)y->e ? -1 : 1;
+    return (x->local > y->local) - (x->local < y->local);
+}
+
+static void latest_fill(tsdb_latest_result *o, const latest_row *r)
+{
+    memset(o, 0, sizeof *o);
+    o->status = r->status;
+    o->kind = r->kind;
+    o->type = r->status ? 0 : r->type;
+    if (r->status || r->kind == TSDB_LATEST_NONE)
+        return;
+    o->ts = r->ts;
+    if (r->kind != TSDB_LATEST_VALUE)
+        return;
+    switch (r->type) {
+    case TSDB_FLOAT32: { uint32_t b = (uint32_t)r->slot; memcpy(&o->v.f32, &b, 4); break; }
+    case TSDB_FLOAT64: memcpy(&o->v.f64, &r->slot, 8); break;
+    case TSDB_INT64: o->v.i64 = (int64_t)r->slot; break;
+    case TSDB_BOOL: o->v.b = (uint8_t)(r->slot == 1); break;
+    default: o->v.state = (uint32_t)r->slot; break;
+    }
+}
+
+static void latest_worker(void *arg, int idx)
+{
+    (void)idx;
+    latest_job *j = arg;
+    size_t c;
+    while ((c = atomic_fetch_add(&j->next, 1)) < j->nchunks) {
+        if (atomic_load(&j->rc))
+            return;
+        size_t a = j->cstart[c], n = j->cstart[c + 1] - a;
+        uint32_t *local = malloc(n * sizeof *local);
+        int64_t *ends = j->ends ? malloc(n * sizeof *ends) : NULL;
+        latest_row *rows = malloc(n * sizeof *rows);
+        int rc = !local || !rows || (j->ends && !ends) ? TSDB_ERR_NOMEM : 0;
+        for (size_t i = 0; rc == 0 && i < n; i++) {
+            local[i] = j->it[a + i].local;
+            if (ends)
+                ends[i] = j->ends[j->it[a + i].idx];
+        }
+        if (rc == 0)
+            rc = eng_latest(j->it[a].e, local, n, ends, j->end, j->with_nulls, rows);
+        for (size_t i = 0; rc == 0 && i < n; i++)
+            latest_fill(&j->out[j->it[a + i].idx], &rows[i]);
+        free(local);
+        free(ends);
+        free(rows);
+        if (rc)
+            atomic_store(&j->rc, rc);
+    }
+}
+
+int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *opts, tsdb_latest_result *out)
+{
+    if (n > (size_t)1 << 20)
+        return TSDB_ERR_INVALID;
+    for (size_t i = 0; i < n; i++) {
+        memset(&out[i], 0, sizeof out[i]);
+        out[i].status = TSDB_ERR_NOTFOUND;
+        out[i].kind = TSDB_LATEST_NONE;
+    }
+    if (n == 0)
+        return 0;
+    latest_item *it = malloc(n * sizeof *it);
+    size_t *cstart = malloc((n + 2) * sizeof *cstart);
+    if (!it || !cstart) {
+        free(it);
+        free(cstart);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t m = 0;
+    for (size_t i = 0; i < n; i++) {
+        eng *e;
+        uint32_t local;
+        if (!sid_malformed(ids[i]) && route(t, ids[i], &e, &local))
+            it[m++] = (latest_item){e, local, (uint32_t)i};
+    }
+    qsort(it, m, sizeof *it, cmp_latest_item);
+    size_t nc = 0;
+    for (size_t i = 0; i < m; i++)
+        if (i == 0 || it[i].e != it[i - 1].e || (i - cstart[nc - 1]) >= LATEST_CHUNK)
+            cstart[nc++] = i;
+    cstart[nc] = m;
+    int rc = 0;
+    if (nc) {
+        latest_job j = {.it = it, .nchunks = nc, .cstart = cstart, .ends = opts ? opts->ends : NULL,
+                        .end = opts && !opts->ends ? opts->end : TSDB_TS_MAX, .with_nulls = opts && opts->with_nulls,
+                        .out = out};
+        atomic_init(&j.next, 0);
+        atomic_init(&j.rc, 0);
+        qrun qr;
+        qs_begin(t, &qr);
+        int want = opts && opts->threads > 0 ? opts->threads : 1 << 20; /* the group's cap clamps it */
+        if ((size_t)want > nc)
+            want = (int)nc;
+        sched_run(t->sched, want, latest_worker, &j);
+        rc = atomic_load(&j.rc);
+        qs_end(&qr, -1, m);
+    }
+    free(it);
+    free(cstart);
+    return rc;
+}
+
 /* LTTB's points newest first, or only the first `limit` of them: the engine sends them in the order asked for
  * (newest first is a backwards read when every point is kept, else a ring of at most min(limit, threshold)
  * chosen points), and this cuts them to the limit. */

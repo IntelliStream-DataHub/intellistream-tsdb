@@ -651,6 +651,37 @@ int tsdb_query_multi_collect(tsdb *db, const tsdb_multi_query *q, const tsdb_sid
                              const tsdb_multi_opts *mo, tsdb_series_result **out);
 void tsdb_series_results_free(tsdb_series_result *r, size_t n);
 
+/* ---- the latest row of a series ----
+ * tsdb_latest answers, for each id, the newest value of the series: the row with the greatest timestamp (below
+ * opts->end) whose last-write-wins value is not null. It is exactly the last non-null row of
+ * tsdb_query_values(series, TSDB_TS_MIN, end, ascending): rows a tombstone hides and expired rows do not count,
+ * memtable rows count once queries see them, and a null written at a timestamp over an older value hides it (then
+ * the answer is the next non-null row below). A null at a newer timestamp than the answer does not matter. With
+ * with_nulls the answer is the last row of that query, a null included (kind NULL). A series with no such row
+ * answers kind NONE; an id that names no series has status TSDB_ERR_NOTFOUND (and kind NONE).
+ * Each series is read at one instant during the call; two series of one call may be read at different instants
+ * (a concurrent insert may be seen in some of them and not in others). */
+typedef enum { TSDB_LATEST_VALUE = 0, TSDB_LATEST_NULL = 1, TSDB_LATEST_NONE = 2 } tsdb_latest_kind;
+
+typedef struct tsdb_latest_result {
+    int32_t status;   /* 0, or TSDB_ERR_NOTFOUND (no such series) */
+    uint8_t kind;     /* tsdb_latest_kind (NULL only with with_nulls); NONE whenever status != 0 */
+    uint8_t type;     /* the series' tsdb_type; 0 whenever status != 0 */
+    int64_t ts;       /* with VALUE and NULL; 0 otherwise */
+    union { float f32; double f64; int64_t i64; uint8_t b; uint32_t state; } v; /* with VALUE; 0 otherwise */
+} tsdb_latest_result;
+
+typedef struct tsdb_latest_opts {
+    int64_t end;          /* only rows before it; TSDB_TS_MAX: no bound */
+    const int64_t *ends;  /* per series instead of end, or NULL */
+    int with_nulls;       /* nonzero: the newest row, which may be a null */
+    int threads;          /* 0: tsdb_options.request_threads; more is clamped to it */
+} tsdb_latest_opts;
+
+/* out[i] for ids[i], in index order; n up to 1 << 20. opts NULL: no bound, the newest non-null value. Returns 0,
+ * TSDB_ERR_INVALID (n out of range) or TSDB_ERR_NOMEM; per-series problems are in out[i].status. */
+int tsdb_latest(tsdb *db, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *opts, tsdb_latest_result *out);
+
 /* ---- query statistics ----
  * What the calling thread's last query did, like ClickHouse's "Processed N
  * rows, M MB": rows it covered (decoded, answered from granule statistics, or
@@ -784,6 +815,8 @@ typedef enum tsdb_struct_kind {
     TSDB_STRUCT_MULTI_QUERY = 12,
     TSDB_STRUCT_SERIES_RESULT = 13,
     TSDB_STRUCT_MULTI_OPTS = 14,
+    TSDB_STRUCT_LATEST = 15,
+    TSDB_STRUCT_LATEST_OPTS = 16,
 } tsdb_struct_kind;
 size_t tsdb_struct_size(int kind);
 

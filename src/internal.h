@@ -1585,6 +1585,9 @@ typedef struct qcuts {
     qcut **c; /* each cut on its own: a pointer handed out stays valid while the array grows */
     size_t n, cap;
 } qcuts;
+/* One engine's cut on its own (latest.c): taken, then released, by the caller; the qcut is not heap-allocated. */
+int cut_take(struct eng *db, qcut *c);
+void cut_release(qcut *c);
 extern __thread qcuts *cur_cuts; /* the multi-series request this thread works for; NULL elsewhere */
 void qcuts_init(qcuts *cs);
 void qcuts_free(qcuts *cs);
@@ -1617,6 +1620,18 @@ typedef int (*slot_fn)(void *ctx, const int64_t *ts, const void *v, size_t n);
 int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx);
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
                      slot_fn fn, void *ctx);
+/* The newest row of each of n series of one engine, at one cut of it (latest.c; design-latest.md section 5). `ends`
+ * (per series) or `end`: only rows before it. Default: the newest row whose last-write-wins value is not null;
+ * with_nulls: the newest row. out[i].status is TSDB_ERR_NOTFOUND for a local id that names no series. */
+typedef struct latest_row {
+    int32_t status;
+    uint8_t kind; /* tsdb_latest_kind */
+    uint8_t type;
+    int64_t ts;
+    uint64_t slot; /* the value, zero-extended slot bits of the series' type */
+} latest_row;
+int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
+               latest_row *out);
 /* LTTB downsampling to `threshold` points (>= 3) of the known, finite values; state series: TSDB_ERR_INVALID.
  * desc: the same points newest first; `keep` (0: all) is how many of them the caller takes at most, which bounds
  * what newest first holds in memory (fn still decides when to stop). */

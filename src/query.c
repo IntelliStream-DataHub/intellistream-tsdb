@@ -73,7 +73,7 @@ void qcuts_init(qcuts *cs)
     pthread_mutex_init(&cs->lock, NULL);
 }
 
-static void cut_release(qcut *c)
+void cut_release(qcut *c)
 {
     db_release(c->parts, c->np); /* frees the array */
     for (size_t i = 0; i < c->nms; i++)
@@ -95,7 +95,7 @@ void qcuts_free(qcuts *cs)
 
 /* The engine as snapshot_take sees it, for every series and time (TWA reads before its start): what a later
  * snapshot_take would add is a newer part, a new memtable, or rows with a higher lsn. */
-static int cut_take(eng *db, qcut *c)
+int cut_take(eng *db, qcut *c)
 {
     memset(c, 0, sizeof *c);
     c->db = db;
@@ -2585,6 +2585,8 @@ size_t tsdb_struct_size(int kind)
     case TSDB_STRUCT_MULTI_QUERY: return sizeof(tsdb_multi_query);
     case TSDB_STRUCT_SERIES_RESULT: return sizeof(tsdb_series_result);
     case TSDB_STRUCT_MULTI_OPTS: return sizeof(tsdb_multi_opts);
+    case TSDB_STRUCT_LATEST: return sizeof(tsdb_latest_result);
+    case TSDB_STRUCT_LATEST_OPTS: return sizeof(tsdb_latest_opts);
     default: return 0;
     }
 }

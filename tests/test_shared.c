@@ -62,7 +62,9 @@ int main(int argc, char **argv)
     CHECK(tsdb_struct_size(TSDB_STRUCT_MULTI_QUERY) == sizeof(tsdb_multi_query));
     CHECK(tsdb_struct_size(TSDB_STRUCT_SERIES_RESULT) == sizeof(tsdb_series_result));
     CHECK(tsdb_struct_size(TSDB_STRUCT_MULTI_OPTS) == sizeof(tsdb_multi_opts));
-    CHECK(tsdb_struct_size(-1) == 0 && tsdb_struct_size(TSDB_STRUCT_MULTI_OPTS + 1) == 0);
+    CHECK(tsdb_struct_size(TSDB_STRUCT_LATEST) == sizeof(tsdb_latest_result));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_LATEST_OPTS) == sizeof(tsdb_latest_opts));
+    CHECK(tsdb_struct_size(-1) == 0 && tsdb_struct_size(TSDB_STRUCT_LATEST_OPTS + 1) == 0);
 
     tsdb *db;
     OK(tsdb_open(dir, NULL, &db));
