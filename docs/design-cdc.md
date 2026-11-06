@@ -3,7 +3,8 @@
 Status: design, not implemented. First written on 2026-11-02 (branch `cdc-design`, 94cf56c, from main at 87eb49e);
 revised on 2026-11-06 on branch `cdc-design2` from main at 0683460, with the user's answers to the first version's
 ten questions (F1-F10) and everything merged since: 64-bit ids, login and rights, the 0.9.0 release, the
-last-write-wins fence, the two HA modes and the latest-value design. Line numbers are at 0683460 unless marked.
+last-write-wins fence, the two HA modes and the latest-value design. Revised again the same day after an adversarial
+review (H1-H5, M1-M5; the low findings L1-L3 and L5 too): F16-F21 below. Line numbers are at 0683460 unless marked.
 
 The user decided on 2026-11-02 to have a Pulsar **source** that forwards every new write of selected series live
 (one, several, all, or by name prefix; tenants are name prefixes), shortly after tsdb acknowledges it, and resumes
@@ -44,6 +45,12 @@ Decisions of this revision (the user may change them):
 | F13 | **An event is delivered only up to the position its volume could acknowledge**: `wal_durable` on a single server, the ack gate in shared mode (ha M16), the commit point in replicated mode. | Delivering what is written | A delivered event must never be taken back, by a crash, a fence or a failover that cuts uncommitted records. |
 | F14 | **One `COMMIT` payload** for the feed's marker, shared mode's ledger record and the cluster's `COMMIT` marker (M15). The feed's marker carries the whole payload, so the per-commit file (`fcommit_`) lives only until the marker is durable. | A kept `fcommit_` file per commit for the retention (the first version) | One encoder; no file per commit for 24 h; in replicated mode the cluster's marker *is* the feed's. |
 | F15 | **The Pulsar source keeps its positions in its slot**, not in Pulsar's state store. | `SourceContext.putState` (the first version) | One store fewer, and putState on a Pulsar 5 function worker was unverified; the slot is durable, fenced and moves with the volume. |
+| F16 | **`FEEDSLOTS` never overwrites its newest durable checkpoint** (an anchor half and a scratch half that swap only after an fdatasync), and a failed write or fdatasync of it is fail-stop (§2.7). | Alternating halves written without a sync (the revision before; review H1); retrying the fdatasync and going on | Alternating unsynced writes could overwrite the only durable checkpoint and revert slots silently after a power loss. A retried fdatasync proves nothing (AGENTS.md "Fail-stop"), and a cleaner that cannot checkpoint holds every segment until the disk fills. |
+| F17 | **`drop_before` is a direct commit without parts** when the feed is on: a fence over every series below the boundary, a block number, an intent that becomes `fcommit_`, the marker under `publish_lock` before `lw_leave`. `RETENTION` markers are rebuilt at open from the `RETENTION` file (§2.3, §2.4). | A marker appended after the retire, outside `publish_lock` (review H2) | Without the fence a small write after the drop's flush survives in tsdb but sits before `DROP` in the feed, so a mirror deletes it; a crash after the retire lost the event for good. The commit machinery already solves both. |
+| F18 | **Free space beats the feed's own retention**: below `feed_min_free_pct` the cleaner invalidates slots and then removes base-retention segments too, oldest first; it runs on its own thread (§2.6). | Free space trimming only what slots hold; the cleaner on the merge threads (review H3) | The feed must never be why the WAL hits ENOSPC (fail-stop); N volumes on one pool can each hold 64 GiB. A consumer below the oldest gets `FEED_GONE`, never a gap. |
+| F19 | **Numbers are never knowingly reused, and a consumer can prove its high-water**: in shared mode a claim continues `fno` above the reported high-water and a DIVERGED volume gets a new `feed_id`; a restore runs `feed new-id`; a cursor may carry `seen` (the consumer's newest event), which a rolled-back history fails (§1.2, §2.9). | Checking only the record at the resume position (review H4) | A rollback below what a consumer holds, with the resume point below the rollback, passed the check, and new writes took numbers the consumer had with other content: lost writes and phantoms after deduplication. |
+| F20 | **A resync resets the slot first, then snapshots**, and a snapshot is a replace of the series over all time that resets the key's deduplication (§2.6, §4.3). The slot stays `resyncing` until the source says the snapshot is in Pulsar. | RESET as the last step; snapshots as upserts (review H5) | Writes between the snapshot and the reset were in neither, and rows deleted during the gap stayed in the mirror. |
+| F21 | **On Pulsar, deduplicate per key only** (§1.4, §4.6). Per-volume deduplication is valid only on tsdb's own stream. | One rule for both (review M1) | Pulsar orders messages only per key on scalable and partitioned topics and Key_Shared, and not across the topics of `topics`. |
 
 ## Summary
 
@@ -55,12 +62,14 @@ Decisions of this revision (the user may change them):
      part), kept as `fcommit_<block>` until its marker is durable.
   3. a **marker** record appended to the WAL right after each direct commit, under `publish_lock` and before the
      commit's fence is lifted: it fixes the commit's place among the small writes and carries the `COMMIT` payload.
-     Markers also record `set_retention`, `drop_before` and slot changes.
+     Markers also record `set_retention`, `drop_before` (itself a direct commit without parts, with a fence, F17) and
+     slot changes; every marker that records a change of tsdb's state is rebuilt at open if a crash lost it.
 - **Positions.** Every WAL record carries `fno`, a 64-bit **feed number** per volume that never goes back; in
   replicated mode it is the cluster's position. An event's number is unique in its volume; **`(volume, event)` is the
-  dedup key**. A **cursor** per volume is `(feed_id, event, check)`; `check` (32 bits of the record's hash) refuses a
-  cursor from another history (a restored backup, a storage rollback, a stale copy): `FEED_RESET`, never a silent
-  resume.
+  dedup key** on tsdb's stream (on Pulsar: per key, F21). A **cursor** per volume is `(feed_id, event, check)`, and
+  optionally the consumer's newest event `(seen, seen_check)`; the checks (32 bits of the record's hash) refuse a cursor
+  from another history (a restored backup, a storage rollback, a stale copy): `FEED_RESET`, never a silent resume. A
+  restore or a detected rollback gets a new `feed_id` (F19).
 - **Order.** Per volume, events arrive in strictly increasing number. Since 0.9.0's fence, applying a series' events
   in that order gives exactly tsdb's state for it; the reader checks this and repairs and counts a violation (F2).
   No order across volumes.
@@ -71,7 +80,8 @@ Decisions of this revision (the user may change them):
 - **Retention and slots.** Per volume by age (24 h) and size (64 GiB), oldest segment first, except what a **slot**
   holds: a named, durable consumer position (owner, per-volume positions) that holds retention back up to a cap (7
   days, 256 GiB per volume, 10% free space). At the cap the slot is invalidated: its consumer gets `FEED_GONE` and
-  resyncs; writes never wait and the disk never fills. Slots survive restarts, takeovers and failovers.
+  resyncs; writes never wait. Below the free-space floor the base retention gives way too (F18), so the feed never
+  fills the disk. Slots survive restarts, power loss (F16), takeovers and failovers.
 - **Protocol 14.** `FEED_SUBSCRIBE` (selectors, volumes, a slot, cursors) answered by a stream (`HEAD`, `SERIES`,
   `STATE`, `ROWS`, `DELETE`, `RETENTION`, `DROP`, `POS`, `VOLUME_END`, `END`), `FEED_ADVANCE` (on the stream),
   `FEED_INFO`, `FEED_SLOT_CREATE`, `_DROP`, `_LIST`; each with a row in `auth_ops`. tsdbd runs streams on feed pump
@@ -100,6 +110,9 @@ Decisions of this revision (the user may change them):
 | A flush commits its parts, sets `wal_flushed`, publishes MANIFEST, then unlinks the segments (`wal_unlink_upto`); at open every leftover segment is replayed and unlinked; `wal_close` unlinks too | memtable.c:754, 816, 828, 1082, 1233 |
 | `test_precommit` fires before the publish of a large insert and of a delete or replace | insert.c:661, delete.c:139 |
 | `tsdb_drop_before` is public but not in the protocol | tsdb.h:681; no op in tsdb_protocol.h |
+| `eng_drop_before` flushes, then retires the parts below under `db->lock`, with no fence and outside `publish_lock`; then a directory fsync and MANIFEST | db.c:972-995 |
+| `set_retention` appends its record to `RETENTION` and fdatasyncs it before it changes the limit in memory | retention.c:240-262 |
+| Merge threads: 2 per engine by default | db.c:45 |
 | Ops go up to `USER_LIST` (38); protocol 12, floor 12; design-latest.md takes 39 (`QUERY_LATEST`) and protocol 13 | tsdb_protocol.h:192-193, 228-239 |
 | Status codes: -10 to -15 kept for HA, -16 `DENIED`, -17 `AUTH` | tsdb.h:74-76 |
 | `FORMAT_VERSION` 8 | internal.h:41 |
@@ -157,21 +170,33 @@ events with the same numbers. **`(volume, event)` is the dedup key** (F6).
 **Position frames.** `POS (volume, feed_id, event, check)` says "every event of this volume up to `event` has been
 sent". The server sends one after each WAL record, between chunks of a large commit, and when idle.
 
-**Cursor** (per volume, 24 bytes): `u64 feed_id, u64 event, u32 check, u32 volume`. `feed_id` is a random 64-bit
-value made when the feed is enabled on the volume (§2.13), so a cursor of another volume, another database or an
-earlier enablement is refused. `check` is the low 32 bits of the `xxh64` of the record that holds `event`. On
-subscribe the server finds that record and compares:
+**Cursor** (per volume, 40 bytes): `u64 feed_id, u64 event, u64 seen, u32 check, u32 seen_check, u32 volume, u32 0`.
+`feed_id` is a random 64-bit value made when the feed is enabled on the volume (§2.13) and made again whenever its
+history is known to have been replaced (F19: a restore, a detected rollback), so a cursor of another volume, another
+database, an earlier enablement or a lost history is refused. `check` is the low 32 bits of the `xxh64` of the record
+that holds `event`. `seen` (0: none) is the newest event the consumer holds, which may be beyond `event` (the Pulsar
+source has published more than its slot acknowledges, §4.5), and `seen_check` its record's check. On subscribe the
+server finds those records and compares:
 
 | cursor | answer |
 |---|---|
 | `feed_id` unknown on this volume | `FEED_RESET` |
-| `event` beyond the volume's next number | `FEED_RESET` (this history is behind the consumer's: rollback, restore) |
-| the record holding `event` has another hash | `FEED_RESET` (another history reused the numbers) |
-| `event` older than the oldest event kept | `FEED_GONE`, with the oldest number |
+| `event` or `seen` beyond the volume's last number | `FEED_RESET` (this history is behind the consumer's: rollback, restore) |
+| the record holding `event`, or the one holding `seen`, has another hash | `FEED_RESET` (another history reused the numbers) |
+| `event` is the volume's **floor** (the last record the cleaner removed, §2.6) with its check | the stream starts after `event`: nothing after it was removed |
+| the record holding `event` is no longer kept | `FEED_GONE`, with the oldest number |
 | otherwise | the stream starts after `event` |
 
+`seen` is what catches a rollback below what the consumer holds when the resume point lies below the rollback (review
+H4): the record at `event` is unchanged, but the one at `seen` is gone or different. Without `seen`, only `feed_id`
+does (F19); a consumer that keeps its own high-water should send it.
+
 A volume without a cursor starts at its slot's position (§2.7) if the subscription names a slot, else at its head
-(`FROM_HEAD`, the default) or its oldest event (`FROM_OLDEST`).
+(`FROM_HEAD`, the default) or its oldest event (`FROM_OLDEST`). With a slot, a volume that has no entry of the slot (it
+was rolled back; a volume added later gets its `ALL_VOLUMES` entries before its first write, §2.7) gets
+`VOLUME_END FEED_GONE` with the flag `SLOT_MISSING`, never its head. A volume that appears after the subscription
+began (`ALL_VOLUMES`) starts at its slot's position or, without a slot, at its **oldest** event, never at its head:
+the writes made before the stream noticed it are delivered too (review M3).
 
 ### 1.3 Order a consumer can rely on
 
@@ -189,9 +214,16 @@ A volume without a cursor starts at its slot's position (§2.7) if the subscript
 ### 1.4 Delivery semantics
 
 **At least once, with exact deduplication** (F6): after a resume from a cursor or a slot, everything after it is sent
-again, identical (same numbers, same content: the history is immutable). A consumer drops an event whose number is not
-above the last it applied for that volume (or for that series: the same test per key). Every duplicate is exactly one
-earlier event.
+again, identical (same numbers, same content: the history is immutable). A consumer of tsdb's stream (the embedded
+feed, a client subscription) drops an event whose number is not above the last it applied for that volume, or for
+that series: the same test per key. Every duplicate is exactly one earlier event.
+
+**Per volume only on tsdb's stream** (F21). The per-volume test relies on receiving a volume's events in number
+order, which only tsdb's stream gives. Once events pass through Pulsar they are ordered per key only (scalable and
+partitioned topics, Key_Shared subscriptions, the several topics of `topics`), so a Pulsar consumer deduplicates per
+key (§4.6); the per-volume test there would drop real messages that arrived after a higher-numbered one of another
+key. A snapshot resets a key's deduplication state (§4.3, F20); a `FEED_RESET` with a new `feed_id` resets every key
+of the volume.
 
 A consumer that applies events as upserts and range deletes in order needs no deduplication at all for its final
 state: re-applying a suffix of a key's events after the whole sequence leaves every key as the suffix's last event
@@ -213,6 +245,11 @@ consumer to store its position atomically with its effect.
 A record that was written but whose fsync failed (fail-stop) is never delivered by that process; if the restart finds
 it intact, tsdb has it and the feed delivers it then: the feed can carry a write whose client got `TSDB_ERR_IO`,
 exactly as tsdb's queries can show it.
+
+One engine path breaks "a definitely failed write is never delivered" today, feed or not (review L4): `mem_insert`
+buffers the WAL rows and then `mt_add` can fail with NOMEM halfway (memtable.c:731-733), so the client gets an error
+while the WAL holds the whole batch and a replay applies it. Step F2 fixes it first: reserve the memtable room before
+`wal_buffer`, so nothing can fail after the rows are in the WAL buffer.
 
 ### 1.6 Position order is last-write-wins order (F2)
 
@@ -269,9 +306,9 @@ Marker types (S0 defines the payloads once, design-ha-modes.md §2.1, M15):
 | type | payload | written by | used by |
 |---|---|---|---|
 | `COMMIT` | op (insert, replace, delete), the files (final name, size, xxh64, header checksum), `F`, the logical range (delete, replace) or the keys in the fence's form (one range, or the 4096-bucket table), rows, events, `reserve` | the feed (single server, shared mode); the cluster (replicated) | the feed's events, replica apply (cluster) |
-| `DROP` | `wm_gen`, `dropped_before` | `tsdb_drop_before` | the feed; cluster apply |
-| `RETENTION` | series, limit | `tsdb_set_retention` | the feed; cluster apply |
-| `FEED_SLOT` | action (create, advance, invalidate, reset, drop), slot number, per action: name, owner, caps, `(event, check)` | slot ops (§2.7) | slots on every reader |
+| `DROP` | `wm_gen`, `dropped_before`, the drop's block number (F17) | `tsdb_drop_before` | the feed; cluster apply |
+| `RETENTION` | series, limit, the offset of its record in `RETENTION` (§2.4) | `tsdb_set_retention` | the feed; cluster apply |
+| `FEED_SLOT` | action (create, advance, invalidate, reset, resynced, drop; in the root volume also the registry's `ready`), slot number, per action: name, owner, caps, `(event, check)` | slot ops (§2.7) | slots on every reader |
 | `EPOCH`, `CLASS`, `SERIES`, `STATE`, `SLOT`, `NOW`, `COLD` | design-cluster.md §4.1 | the cluster | replicated mode only; the feed skips them |
 
 `fno` is assigned in `wal_buffer` under `buf_lock`, like `wal_appended`; no new lock on the hot path. With the feed
@@ -293,8 +330,12 @@ them (empty merge outputs, `db->wtail` for class switches) keep their meaning. A
 failed unlink today: the segment stays and `wal_removed` does not pass it.
 
 A sealed `fwal_` segment is entirely durable: `mt_flush` writes and fsyncs the rest of the old segment before the
-flush, and the flush's parts are synced before the rename. In replicated mode a segment's name already carries the
-epoch (`(E << 40) | n`); the rename keeps it.
+flush, and the flush's parts are synced before the rename. **A segment replayed at open** may end in a torn tail (the
+process died mid-write); before its rename the open truncates it to its last valid record (`ftruncate`, fdatasync),
+as AGENTS.md cuts the torn tails of other append-only files, so a sealed segment never holds bytes a reader would
+take for damage (review L1). The truncation is the open's, before anything is renamed or delivered.
+
+In replicated mode a segment's name already carries the epoch (`(E << 40) | n`); the rename keeps it.
 
 ### 2.3 Direct commits: links, intents, markers
 
@@ -323,10 +364,34 @@ ones of §2.4. With the feed on, on a single server:
 7. `fcommit_<block>` is removed once `wal_durable` passes its marker (by the next flush; the marker carries the whole
    payload, F14).
 
-Operations without parts: a delete that finds no rows, `tsdb_set_retention`, `tsdb_drop_before`. They append a marker
-only and, in sync mode, wait for it (`wal_commit`) before returning, since nothing else would bring it back after a
-crash. The retention marker is appended after the `RETENTION` append is synced; the drop marker after the partitions
-are retired.
+**Operations without parts** (F17). Each must sit at the right place among the writes, and each that changes tsdb's
+state must come back after a crash that lost its marker:
+
+- **A delete that finds no rows** keeps its fence (it registered one like every delete) until its marker is in the
+  buffer under `publish_lock`, so a small write into its range lands after it, as for a delete with rows. In sync mode
+  it waits for the marker (`wal_commit`). A crash that loses it loses nothing: tsdb had no rows in the range, so
+  neither has a mirror.
+- **`tsdb_drop_before`** is a direct commit without parts. It registers a fence over every series for
+  `[INT64_MIN, ts)` (the fence's 4096-bucket form with every bucket set), flushes the memtable when `lw_enter` reports
+  rows, and then, under `publish_lock`: takes the next block number (part numbers already have gaps, since one
+  counter serves every partition), writes an intent (`tsdb-intent 4`: no rename lines, a `feed` line with the `DROP`
+  payload and the block) with its fdatasync and directory fsync, retires the parts below the boundary (under
+  `db->lock`, as today, db.c:979-990), fsyncs the directory, publishes MANIFEST, renames the intent to
+  `fcommit_<block>` and appends the `DROP` marker; then it leaves `publish_lock` and the fence. Order follows:
+  - a small write into the dropped range either was in the memtable at `lw_enter` (flushed, retired, before the
+    marker) or waits on the fence and appends after the marker; it survives in tsdb and in a mirror (review H2);
+  - a large insert into the range published before the drop's block is retired by it, and its marker comes first; one
+    published after keeps its parts in tsdb, and its marker comes after `DROP`. A merge in flight discards its output
+    as today (`p->dropped`).
+
+  The intent is the commit point: `intents_recover` rolls a drop intent forward (retires whatever is still below the
+  boundary, idempotent) and turns it into `fcommit_`, and §2.4 rebuilds a lost `DROP` marker in block order among
+  the commits' markers. In shared mode the ledger's `DROP` record is the commit point instead (ha.md D33), with the
+  same fence and marker; replicated mode has the cluster's `DROP` marker. The caller does not wait for the marker.
+- **`tsdb_set_retention`** appends its `RETENTION` record (synced, retention.c:255), then a marker that carries the
+  record's file offset; in sync mode it waits for the marker. A lost marker is rebuilt at open from the file (§2.4).
+  A retention limit changes no row (expiry is not forwarded, §1.1), so its place among the writes needs no fence: a
+  rebuilt marker after later writes gives a mirror the same state.
 
 A merge never calls this path. Flushes call `parts_commit` with a flag that skips it.
 
@@ -345,6 +410,10 @@ After `intents_recover` (which now also turns complete version-4 intents into `f
   `S_c + 1` is at or after the first segment the replay found unflushed, the open looks for its marker in those two
   segments; the missing ones form a suffix in block order and are appended, in that order, at the start of the new
   segment, with `F` and the payload from the `fcommit_` file. Then the `fcommit_` files are removed (step 7).
+  A drop's `fcommit_` (F17) takes part in this like any other: its marker is rebuilt in block order with the rest.
+- **Lost `RETENTION` markers are rebuilt.** `FEEDSLOTS`'s checkpoint keeps `ret_fed`, the end of the `RETENTION`
+  records whose markers it covers; the retained markers after the checkpoint carry their records' offsets. Records of
+  the file beyond the newest of these are appended as markers, in file order, at the start of the new segment.
 - **Orphans go.** `f*.part` links that no retained marker or `fcommit_` names are removed (their insert was rolled
   back), as `tmp_*` files are now.
 - **Slots** are loaded from `FEEDSLOTS` and the `FEED_SLOT` markers after its checkpoint (§2.7).
@@ -372,25 +441,55 @@ on one hot volume would share one scan; that is a later optimization (L2), not n
 
 ### 2.6 Retention of the feed, and the lag bound
 
-Each volume's merge thread removes, oldest first, sealed segments whose last record's `commit_ms` is older than
-`feed_retention_s` (default 24 h) or that lie beyond `feed_max_bytes` (default 64 GiB: the retained segments, the
-`fcommit_` files and the bytes links alone keep alive, together), with four exceptions:
+**The cleaner** is one thread per `tsdb` handle (not the merge threads, which a long merge holds for minutes: review
+H3), woken by every flush and once a second. It does its I/O (unlinks, the `FEEDSLOTS` fdatasync, directory fsyncs)
+with no engine lock held. Per volume it removes, oldest first, sealed segments whose last record's `commit_ms` is
+older than `feed_retention_s` (default 24 h) or that lie beyond `feed_max_bytes` (default 64 GiB: the retained
+segments, the `fcommit_` files and the bytes links alone keep alive, together), with four exceptions:
 
 - never the newest segment;
 - never a segment the §1.6 check of a retained marker needs (one below the smallest `F + 1` of the markers after it,
   usually one or two segments);
-- never a segment holding events after a valid slot's durable position (§2.7);
+- never the segment that holds a valid slot's durable position, nor any after it (§2.7). The position's own segment
+  is kept too, so a caught-up slot whose position is the last event of a segment stays resumable and advanceable
+  (review M2);
 - in replicated mode, never above the saved commit floor, and the cluster's catch-up retention (`repl_retain_mb`)
   is the same mechanism (design-cluster.md §8.3): a segment goes when no rule keeps it.
 
-Removing a segment removes the links of the markers in it, after the segment (a crash in between leaves orphans that
-§2.4 removes). The oldest kept event is the first `fno` of the oldest segment.
+**Free space comes first** (F18). When the volume's filesystem has less than `feed_min_free_pct` (default 10%) free
+(`statvfs`), the cleaner first invalidates slots (§2.7, cap rule 3) and, once no valid slot holds anything, removes
+segments of the base retention too, oldest first, down to the newest segment, ignoring age, size and the §1.6
+exception (a marker whose check segments are gone is delivered unchecked and counted in
+`tsdb_feed_lww_unchecked_total`). Every volume on a full pool does the same, so N volumes cannot hold N × 64 GiB
+against the WAL. A consumer then below the oldest gets `FEED_GONE`, never a gap; tsdb's own writes keep being
+acknowledged. ENOSPC that the parts or the WAL themselves cause stays the engine's fail-stop, as today.
+
+Removing segments: the cleaner first writes the new **floor** (the `(event, check)` of the last record of the newest
+segment it removes) into a `FEEDSLOTS` checkpoint and makes it the anchor (§2.7), then unlinks the segments, then the
+links of the markers in them (a crash in between leaves orphans that §2.4 removes), then fsyncs the directory. The
+oldest kept event is the first `fno` of the oldest segment; a cursor exactly at the floor still resumes (§1.2), so a
+consumer that read everything before a quiet period loses nothing to the age rule.
 
 A consumer learns that it fell behind in three ways: `HEAD` and every `POS` frame carry the oldest kept event;
-`FEED_INFO` reports it; and a subscribe or resume below it gets `FEED_GONE` with that number. The remedy is a resync:
-`FEED_INFO` (the heads), a snapshot query of the selected series (`QUERY_MULTI`), then a subscription from those
-heads; rows written in between are delivered twice, which upserts absorb. tsdb never blocks, slows or fails a write
-because of a consumer.
+`FEED_INFO` reports it; and a subscribe or resume below it gets `FEED_GONE` with that number. tsdb never blocks, slows
+or fails a write because of a consumer.
+
+**The resync** (F20), the remedy for `FEED_GONE` and `FEED_RESET`, in this order:
+1. **Fix the start positions first.** Without a slot: `FEED_INFO`, whose `next` per volume gives cursors H. With a
+   slot: `FEED_SLOT_CREATE` with `RESET`, which puts the slot at the heads H, durably, in the state `resyncing`, and
+   returns H (§2.7). From now on retention keeps everything after H (with a slot, up to its cap).
+2. **Then the snapshot**: `QUERY_MULTI` of the selected series, one cut S of every volume (`cur_cuts`), taken after
+   step 1, so S includes everything up to H. Each series' snapshot is a **replace over all time** (`[INT64_MIN,
+   INT64_MAX)`), not upserts: rows deleted while the consumer was away go too (review H5).
+3. **Then the stream from H.** Events after H that S already shows are applied again; per key, re-applying a suffix
+   of its events on top of a state that already includes them ends where the suffix ends (§1.4), so the result is
+   tsdb's state. Nothing written after H is missed, since H was fixed before S.
+4. With a slot: once the snapshot is safely with the consumer (for the source: acknowledged by Pulsar), a
+   `FEED_ADVANCE` with the flag `RESYNCED` turns the slot `active`. A consumer that restarts while its slot is
+   `resyncing` (`HEAD` carries the flag `SLOT_RESYNCING`) starts the resync again from step 1.
+
+If retention passes H before step 3 (a snapshot slower than the retention or the cap), step 3 gets `FEED_GONE` and
+the resync starts over; `FEED_INFO` and the slot metrics show that the retention is too short for a snapshot.
 
 ### 2.7 Slots (F1, F11)
 
@@ -404,30 +503,56 @@ covers.
 | owner | a user (tsdbd with login) who may subscribe with it and advance it; without login, none |
 | volumes | all (`ALL_VOLUMES`: volumes added later too) or a list |
 | caps | `max_age_s` (default 7 days), `max_bytes` per volume (default 256 GiB), both settable per slot |
-| state | `active` or `invalid` (and why: age, bytes, free space) |
+| state | `active`, `resyncing` (reset, the snapshot not yet confirmed: §2.6) or `invalid` (and why: age, bytes, free space) |
 | per volume | the position `(event, check)`: every event up to it is consumed |
 
 **Where it lives.** Changes are `FEED_SLOT` markers in each covered volume's WAL (create, advance, invalidate, reset,
-drop), durable with the group commit they ride on. Each volume's engine applies them to its slot table and
-checkpoints the table into `FEEDSLOTS` (two checksummed 4 KiB slots written alternately, in place like MANIFEST, never
-renamed; the slot holding the higher `fno` wins): at most once per flush when a slot changed, without a sync, and with
-an `fdatasync` before the cleaner removes a segment, so a checkpoint is durable before any marker it replaces can
-go. At open, slots = the checkpoint + the `FEED_SLOT` markers after its `fno`. Followers do the same from the files.
+resynced, drop), durable with the group commit they ride on. Each volume's engine applies them to its slot table and
+checkpoints the table into `FEEDSLOTS`, with the cleaner's floor (§2.6) and `ret_fed` (§2.4). A checkpoint covers
+the markers up to an `fno` at or below `wal_durable`, so it never claims a marker a crash could still take back.
 
-The **registry** (name to number, owner, caps, volumes) is in the root volume's slot table on a single server: a
-volume added later gets a create marker, at its head, for every `ALL_VOLUMES` slot (the add writes it before the
-volume serves). In both HA modes the registry is in the metadata group, beside users (design-ha-modes.md M2): the
-owner of each volume writes the create marker when it sees a registry entry (watch, or at claim).
+`FEEDSLOTS` (F16) is 8 KiB, preallocated and synced when the feed is enabled, so a write never needs space: two
+checksummed 4 KiB halves written in place like MANIFEST and never renamed. One half is the **anchor**, the newest
+checkpoint known durable; the other is the **scratch**. A checkpoint is written only into the scratch, at most once
+per flush when something changed, without a sync. Before the cleaner removes a segment it fdatasyncs `FEEDSLOTS`;
+once that returns the scratch is the anchor and the old anchor becomes the scratch. So the anchor is never
+overwritten, and every marker after the anchor's `fno` is still in a retained segment: after a power loss the anchor
+is intact and the scratch either intact (with a higher `fno`) or failing its checksum (review H1). At open: the valid
+half with the higher `fno`, plus the `FEED_SLOT` markers after it; the open fdatasyncs the file and makes that half
+the anchor. Both halves bad is damage and fails the open, as for MANIFEST. **A failed write or fdatasync of
+`FEEDSLOTS` is fail-stop** (`eng_fail`): a retried fdatasync proves nothing, and a cleaner that cannot checkpoint
+could never remove a segment again. Followers read the files the same way and write none.
 
-**Create** (`FEED_SLOT_CREATE`): writes the registry entry, then a create marker in every covered volume at its head,
-and in sync mode waits for them to be durable. The reply carries the start cursor per volume. Create is idempotent by
-name with the same spec; a volume that is UNAVAILABLE (HA) makes the reply UNAVAILABLE with its number, and a retry
-completes it. `RESET` (a flag of create) puts an existing slot back to `active` at the heads: a consumer's last step
-of a resync.
+The **registry** (name to number, owner, caps, volumes, and `creating` or `ready`) is in the root volume's slot table
+on a single server, as markers like the rest. In both HA modes it is in the metadata group, beside users
+(design-ha-modes.md M2): the owner of each volume writes the create marker when it sees a registry entry (watch, or at
+claim).
 
-**Advance** (`FEED_ADVANCE`, on the stream or on its own): per volume, a cursor that must be above the slot's position
-and at or below the deliverable position, with a matching `check`; otherwise the advance is refused for that volume
-(`FEED_RESET`) and the slot keeps its position. The engine keeps the newest advance per slot in memory and writes at
+**A volume added later** (review M3). `tsdb <dir> volume add` runs beside the writer and cannot append to its WAL, so
+the add writes only the files (META, and `FEED` with `seeded = 0` when the feed is on). The writer, when it first
+opens a volume whose `FEED` says `seeded = 0` (`volume_resolve` or `volume_at`), appends a create marker for every
+`ALL_VOLUMES` slot at the volume's head, waits for them to be durable, rewrites `FEED` with `seeded = 1` and only then
+admits the volume's first write, so the slots hold everything the volume ever had. A crash before `seeded = 1` seeds
+again at the next open; markers for a slot that already has an entry are skipped.
+
+**Create** (`FEED_SLOT_CREATE`): writes the registry entry as `creating`, then a create marker in every covered volume
+at its head, **waits for all of them to be durable** (`wal_commit`, whatever `wal_sync_ms` is: a lost create with
+`createSlot` would otherwise come back at a later head), then marks the entry `ready` (a durable root marker) and
+replies with the start cursor per volume. A subscribe with a `creating` slot is `TSDB_ERR_INVALID` ("create not
+finished"); a create retried on a `creating` entry finishes it, writing markers only in the volumes that have none
+(nothing was ever delivered under the slot, so their heads are its start). Once `ready`, a volume without the slot's
+entry gives `FEED_GONE` with `SLOT_MISSING` (§1.2). Create is idempotent by name with the same spec; a volume that is
+UNAVAILABLE (HA) makes the reply UNAVAILABLE with its number, and a retry completes it. **`RESET`** (a flag of create)
+puts an existing slot at the heads in the state `resyncing`, waits for the markers to be durable, and returns the
+heads: the **first** step of a resync (§2.6, F20), so nothing written after the returned heads can be missed. The
+`resynced` marker (from a `FEED_ADVANCE` with `RESYNCED`) makes it `active` again.
+
+**Advance** (`FEED_ADVANCE`, on the stream or on its own): per volume, a cursor at or below the deliverable position,
+with a matching `check`. A cursor above the slot's position moves it; one equal to it or below it (a repeated advance,
+an idle volume, a rebalanced source instance) is a no-op answered OK whatever its `check` (its record may be gone),
+never `FEED_RESET` (review L2). A cursor of another `feed_id`, one above the slot with a wrong `check`, or one beyond
+the deliverable position is refused for that volume (`FEED_RESET`) and the slot keeps its
+position. The engine keeps the newest advance per slot in memory and writes at
 most one marker per slot per `feed_slot_sync_ms` (1 s) per volume, and none when the advance passes nothing but slot
 markers (so an idle volume does not log a marker a second because the consumer acknowledges the previous marker).
 A crash loses at most the last second of advances: the slot goes back a little, which only holds more and redelivers
@@ -437,12 +562,15 @@ duplicates (F6). The cleaner uses only positions whose markers are durable.
 1. its position is older than `max_age_s` (by `commit_ms`), or
 2. the volume's retained feed is above the slot's `max_bytes` and the slot is what keeps it there, or
 3. the volume's filesystem has less than `feed_min_free_pct` (10%) free (`statvfs`), slots holding the most first,
-   until the feed's own retention is all that is left.
+   until the feed's own retention is all that is left; below the floor that goes too (§2.6, F18).
+
+Ages are measured by `commit_ms` against the volume's clock: the wall clock on a single server and in shared mode,
+the last applied `NOW` marker in replicated mode (design-cluster.md §5.4), so every replica judges a slot alike.
 
 Invalidation is an `invalidate` marker (with the reason) in that volume, a log line, and a metric; retention then
 ignores the slot in that volume, and the next resume through it there gets `VOLUME_END FEED_GONE` with the flag
-`SLOT_INVALID` and the oldest kept event. The consumer resyncs and resets the slot. Writes never wait for a slot, and
-the disk never fills because of one: at worst a consumer resyncs.
+`SLOT_INVALID` and the oldest kept event. The consumer resyncs, resetting the slot first (§2.6). Writes never wait for
+a slot, and the disk never fills because of one or because of the feed's own retention: at worst a consumer resyncs.
 
 **A stuck slot is visible before the cap.** Per slot and volume: `tsdb_feed_slot_lag_events`,
 `tsdb_feed_slot_lag_seconds` (now minus the `commit_ms` at its position), `tsdb_feed_slot_held_bytes` (what retention
@@ -460,7 +588,10 @@ A consumer that reads from a follower advances its slot on the writer (the sourc
 **HA.** A takeover (shared mode) or a failover (replicated mode) keeps every slot: the markers and `FEEDSLOTS` are in
 the volume (shared mode: on the shared storage, the WAL and `FEEDSLOTS` written through chained fds; replicated mode:
 the markers replicate with the log, and every replica applies them and retains what they hold). A storage rollback can
-take back advances (safe: the slot holds more) or a reset (the consumer resyncs on `FEED_RESET` anyway).
+take back advances (safe: the slot holds more), a reset (the consumer resyncs on `FEED_RESET` anyway: F19 gives the
+rolled-back volume a new `feed_id` when the rollback is known) or a create (`SLOT_MISSING`, never the head). The slot
+keeps no copy of the consumer's `seen` (review H4 suggested one): it would roll back with the volume and prove
+nothing; the consumer's own high-water does (§1.2, §4.5).
 
 ### 2.8 NFS followers (F5)
 
@@ -486,9 +617,17 @@ follower reads it gives that volume's stream `FEED_GONE` (ESTALE), never a gap. 
   `COMMIT` until its marker is durable** (a rule for N3/N4).
 - The renames to `fwal_` and the cleaner's removals are namespace effects, recorded through the journal hook (M15's
   `SEG`, `PURGE`) at the call sites N4 builds.
-- Delivery stops at the ack gate (F13). After M17's cold open the feed continues from what storage holds; a pool
-  rollback that took back delivered records makes the `check` of a consumer's cursor fail: `FEED_RESET`, never reused
-  numbers.
+- Delivery stops at the ack gate (F13). After M17's cold open the feed continues from what storage holds.
+- **Numbers are not reused across a rollback** (F19, review H4). A pool rollback (M17 admits it can remove fdatasynced
+  records) can take back events a consumer already holds, and the record at the consumer's resume position may be
+  unchanged, so `check` alone does not see it. Three layers:
+  1. Heartbeats report the WAL's durable `fno` beside its position (design-ha-modes.md §5.4), the grant entries commit
+     it with the rest, and a claim continues `fno` above the larger of storage's and the committed one, so new writes
+     never take a number that was delivered before the rollback (N7 adds `fno` to the reported positions).
+  2. A claim that marks the volume DIVERGED (§5.4 there, also through `tsdb cluster domain rolled-back`) gives it a
+     new `feed_id`, written to the metadata record before the volume admits writes: every cursor and slot position
+     gets `FEED_RESET`, and consumers resync.
+  3. What §5.4 there cannot see (a rollback within the last heartbeat) a consumer's `seen` catches (§1.2).
 - `feed_id` and the feed setting are in the volume's metadata record; the owner writes `FEED` from it at claim.
 - A stream on a volume that moves ends with `VOLUME_END MOVED`; the consumer resubscribes at the new owner (TOPOLOGY)
   with its cursors or slot, and nothing else changes.
@@ -501,6 +640,13 @@ follower reads it gives that volume's stream `FEED_GONE` (ESTALE), never a gap. 
 - Every replica keeps `fwal_` segments under the feed's retention and the slots' holds, so a promoted replica has the
   history and the slots. With the feed on, a replica's disk holds the retained feed three times; `feed_max_bytes`
   is per replica.
+- **A replica's disk is protected too** (review M4). Invalidations are markers, which only the leader appends, so the
+  leader decides with the **lowest** free space among the ISR: replicas report their filesystem's free percentage in
+  their ACKs, and cap rule 3 (§2.7) and the free-space rule of §2.6 use the minimum. Ages use the `NOW` clock (§2.7).
+  As a last resort, a replica below half of `feed_min_free_pct` (one the leader has not yet heard, or one that holds
+  other leaders' volumes and filled faster) removes held segments of its own, oldest first, never above the commit
+  floor; it records the new floor in its `FEEDSLOTS`, so after a failover to it a slot whose position is below it gets
+  `FEED_GONE`, never a gap.
 - Replicas serve the feed to requests with `REPLICA_OK` (D5 there); a leader change ends a stream on the old leader
   with `VOLUME_END MOVED`, and the consumer resubscribes anywhere.
 
@@ -509,13 +655,16 @@ follower reads it gives that volume's stream `FEED_GONE` (ESTALE), never a gap. 
 - Appending a marker can fail only for memory (the buffer); the WAL write that follows is fail-stop as today.
 - A failed `linkat` or intent write before the commit point fails the call (nothing committed, as for `tmp_*` parts);
   the directory fsync after the intent is fail-stop already. The rename to `fcommit_` is not relied on (§2.3).
-- A failed `FEEDSLOTS` write or fdatasync stops the cleaner's pass (nothing removed) and is retried; it is not
-  fail-stop, since the markers it checkpoints are still in the retained segments.
+- A failed `FEEDSLOTS` write or fdatasync is fail-stop (F16, review H1). The revision before retried it and went on,
+  which trusts a retried fdatasync (AGENTS.md "Fail-stop") and, if the failure persisted, stopped every cleaner pass
+  until the disk filled. The anchor half is never written, so the reopen that follows finds a consistent slot state.
+  The file is preallocated, so ENOSPC cannot be its cause.
 - After `eng_fail` the feed delivers up to the last deliverable position and then ends every stream with
   `TSDB_ERR_IO`; tsdbd exits as today.
 - A damaged retained segment or `fcommit_` (bad hash with a valid record after it, a read error) ends the volume's
   stream with `TSDB_ERR_CORRUPT` or `TSDB_ERR_IO` and a log line; it is never skipped. A torn tail exists only in the
-  active segment and lies beyond the deliverable position, which the reader never passes. Granule payloads of linked
+  active segment (the open truncates replayed segments before it renames them, §2.2) and lies beyond the deliverable
+  position, which the reader never passes. Granule payloads of linked
   parts are verified when `verify_checksums` is on, as for queries.
 - The open does not fail on feed files except `FEED` and `FEEDSLOTS` (damage to both slots of the file fails the
   open, as damage to MANIFEST does): a damaged retained segment is the feed's problem (the stream reports it), not
@@ -523,8 +672,10 @@ follower reads it gives that volume's stream `FEED_GONE` (ESTALE), never a gap. 
 
 ### 2.11 Lock order
 
-New: the marker append takes `buf_lock` inside `publish_lock` (already allowed). `feed_lock` (the reader's segment
-index, the slot table and the cleaner) is a leaf, never held while an engine lock is taken; the cleaner takes
+New: the marker append takes `buf_lock` inside `publish_lock` (already allowed). A drop (F17) holds `publish_lock`
+across its intent's fdatasync, the retire (`db->lock`) and `eng_sync_dir` (`dir_sync_lock`), all below it in the
+order; it blocks other publishes for a few milliseconds of a rare call. `feed_lock` (the reader's segment
+index, the slot table and the cleaner) is a leaf, never held while an engine lock is taken; the cleaner thread takes
 `dir_sync_lock` through `eng_sync_dir` only after releasing it. The reader takes no engine lock except to read
 `wal_flushed` and the deliverable position (atomics) and the series dictionary (its own lock). A slot op appends its
 marker like a small write (`buf_lock`, then the writer role for the sync), holding no other engine lock.
@@ -537,8 +688,9 @@ marker like a small write (`buf_lock`, then the writer role for the sync), holdi
 | small write latency | 0 | 0 (no extra fsync; an eventfd write per group commit only while someone subscribes) |
 | large insert or delete of one part | 0 | +1 fdatasync of the intent + 1 directory fsync (~1.4 ms on the SN720, against 13.8 ms for 100,000 rows); none in HA modes, which commit through the ledger or the marker anyway |
 | large insert of several parts | 0 | `linkat` per part (no extra fsync) |
-| no-op delete, `set_retention`, `drop_before` | 0 | one WAL group commit |
-| slots | 0 | one marker of about 64 B per slot per volume per second while it advances; a 4 KiB `FEEDSLOTS` write per flush when a slot changed |
+| no-op delete, `set_retention` | 0 | one WAL group commit |
+| `drop_before` | 0 | a fence, an intent with its fdatasync and directory fsync (~1.4 ms) |
+| slots | 0 | one marker of about 64 B per slot per volume per second while it advances; a 4 KiB `FEEDSLOTS` write per flush when a slot changed, an fdatasync per cleaner pass that removes something |
 | disk | 0 | retained WAL: 20 B/row + 32 B/record; links: the bytes of direct parts a merge replaced, for the retention; what slots hold, up to their caps |
 | memory, engine | 0 | the segment index (16 B per retained segment), the slot table |
 | memory, per subscription | | ≤ 1 MiB read buffer + 1 decoded granule + two bitmaps over the volume's series (announced, selected: 256 KiB at 1 M series) + the check's summaries (256 KiB) |
@@ -558,6 +710,20 @@ checksummed, synced with its directory); a volume added later gets both. `tsdb <
 HA modes: `tsdb cluster feed enable`, which sets it in the metadata group (§2.9). The CLI also has `tsdb <dir> feed
 info` and `tsdb <dir> feed slot add|drop|reset|list`.
 
+Enable also creates `FEEDSLOTS` (both halves, synced) with `ret_fed` at the end of `RETENTION`, so only later limits
+are forwarded. **Beside a running writer** (review L5): enable and disable change what the writer does at every flush
+and open, so the CLI refuses while another process holds the database's writer lock and tells the operator to stop
+tsdbd or use the embedded call in it (an admin op over the protocol can come later). **Across a crash:** `requires=feed`
+without `FEED` in a volume is a disable in progress, and the open finishes it (removes what is left, then the word);
+`FEED` without `requires=feed` cannot happen (the word is written first and removed last).
+
+**A restore needs a new identity** (F19). A database restored from a backup or a file system rolled back (a ZFS
+`rollback`, `zpool import -F`, a lost SLOG) holds an older history under the same `feed_id`, and its next writes would
+take numbers that consumers already hold with other content. `tsdb <dir> feed new-id`, run before tsdbd starts, gives
+every volume a new `feed_id`, so consumers get `FEED_RESET` and resync, and raises its `fno` floor by 2^40 (a belt for
+consumers that compare numbers without the `feed_id`). docs/feed.md puts it in the restore steps;
+a consumer that sends `seen` (§1.2) is protected when the operator forgets it.
+
 ## 3. Protocol 14, server and clients
 
 ### 3.1 Ops
@@ -569,7 +735,7 @@ server whose HELLO says 14 or more, and an older server answers them `TSDB_ERR_I
 ```
 FEED_SUBSCRIBE (40)  u8 flags, u8 0, u16 nsel, u32 nvol, u32 ncur, u16 slot_len, u16 0,
                      u32 volumes[nvol], [u32 0 to a multiple of 8],
-                     cursors[ncur] x {u64 feed_id, u64 event, u32 check, u32 volume},
+                     cursors[ncur] x {u64 feed_id, u64 event, u64 seen, u32 check, u32 seen_check, u32 volume, u32 0},
                      slot name, nsel x {u8 kind (0 all, 1 prefix, 2 name, 3 glob, 4 id), u8 0, u16 len, bytes or u64 id}
      flags: FROM_OLDEST 1 (volumes with neither a cursor nor a slot start at their oldest event; else at their head),
             ALL_VOLUMES 2 (also volumes added later), PACKED 8 (ROWS may use TSDB_PACKED). Other bits reserved.
@@ -577,7 +743,8 @@ FEED_SUBSCRIBE (40)  u8 flags, u8 0, u16 nsel, u32 nvol, u32 ncur, u16 slot_len,
      Volumes: those of the id selectors, cursors, the slot and `volumes`, all with ALL_VOLUMES. A cursor overrides the
      slot's position for its volume.
   -> a stream of REPLY frames with the request's id, each: i32 status, u8 kind, u8 flags, u16 0, u32 volume, ...
-     HEAD (1)      u64 feed_id, u64 oldest, u64 next, u64 start, u16 plen, path         one per volume, first
+     HEAD (1)      u64 feed_id, u64 oldest, u64 next, u64 start, u16 plen, path         one per volume, first;
+                   flags: SLOT_RESYNCING 1 (the slot is `resyncing` on this volume: redo the resync, §2.6)
      SERIES (2)    u64 id, u8 type, u8 sflags, u16 len, name, i64 retention_ms           sflags: GRANTED 1, REVOKED 2
      STATE (3)     u64 id, u32 code, u16 len, name
      ROWS (4)      u64 event, u64 group_last, i64 commit_ms, u64 id, u8 type, u8 vflags, u8 origin, u8 0,
@@ -587,14 +754,15 @@ FEED_SUBSCRIBE (40)  u8 flags, u8 0, u16 nsel, u32 nvol, u32 ncur, u16 slot_len,
      RETENTION (6) u64 event, i64 commit_ms, u64 id, i64 limit_ms
      DROP (7)      u64 event, i64 commit_ms, i64 before
      POS (8)       u64 feed_id, u64 event, u32 check, u32 0, u64 next, u64 oldest
-     VOLUME_END (9) the volume's stream ended with `status`: FEED_GONE (+ oldest; flag SLOT_INVALID), FEED_RESET,
-                   CORRUPT, IO, MOVED, UNAVAILABLE; the other volumes go on
+     VOLUME_END (9) the volume's stream ended with `status`: FEED_GONE (+ oldest; flags SLOT_INVALID, SLOT_MISSING),
+                   FEED_RESET, CORRUPT, IO, MOVED, UNAVAILABLE; the other volumes go on
      END (10)      the subscription ended: STOPPED after CANCEL, IO after fail-stop, AUTH when the user was dropped,
                    READONLY when a follower stops following; last frame
      ADVANCED (11) u32 n, n x {u32 volume, i32 status}: the answer to a FEED_ADVANCE sent on the stream
 FEED_INFO (41)       u32 volume (0xffffffff: all) -> u32 n, n x {u32 volume, u64 feed_id, u64 oldest, u64 next,
                      u64 bytes, i64 retention_s, u64 max_bytes}
-FEED_ADVANCE (42)    u16 slot_len, u16 0, u32 n, n x cursor, slot name
+FEED_ADVANCE (42)    u16 slot_len, u16 flags (RESYNCED 1: the snapshot of a resync is safe, the slot goes `active`),
+                     u32 n, n x cursor (`seen` ignored), slot name
      On a stream connection: answered by ADVANCED in the stream. On its own connection: an ordinary reply.
 FEED_SLOT_CREATE (43) u8 flags (RESET 1, ALL_VOLUMES 2), u8 0, u16 name_len, u16 owner_len, u16 0, u32 nvol,
                      i64 max_age_s, u64 max_bytes (0: the defaults), u32 volumes[nvol], name, owner
@@ -633,6 +801,11 @@ Rows of `auth_ops` (design-auth.md §5; `tests/test_auth_ops.c` fails without th
   frame with `REVOKED` and nothing more, one that gained it a `SERIES` frame with `GRANTED` and its events from then
   on (no history: a consumer that wants it queries). A dropped user's streams end with `END AUTH` and the connection
   closes.
+- **A rights change is a gap for that series, and is reported as one** (review M5). Positions and the slot move past
+  a revoked series' events, so a later re-grant leaves a hole, and a granted series starts mid-history. The frames are
+  the report: `REVOKED` means "no events of this series from here", `GRANTED` "none before here". "No gaps" (§1.3,
+  §4.6) holds per series only while its rights are unchanged; docs/feed.md says so. The Pulsar source never drops
+  either frame silently (§4.2 `onRightsChange`).
 - `--no-auth`: everything passes; slot owners are not checked; slot admin ops are allowed (they are not user admin).
 
 ### 3.3 tsdbd
@@ -643,8 +816,11 @@ Rows of `auth_ops` (design-auth.md §5; `tests/test_auth_ops.c` fails without th
   (output drained) signal.
 - **Backpressure without waiting.** A pump appends frames to the connection's output while it is under `OUT_CAP` and
   then **parks** the stream (it never calls `out_wait`); the loop's drain below `OUT_CAP / 2` wakes it. A parked
-  stream costs its buffers and its position; when it resumes behind the head it reads from the files. A client that
-  reads nothing for `send_timeout_s` is closed, as today. Writers never wait for a pump; pumps never take engine
+  stream costs its buffers and its position; when it resumes behind the head it reads from the files. A parked feed
+  stream is **exempt from `send_timeout_s`** (review L2): it holds no worker and no more than `OUT_CAP`, and a source
+  that stops reading during a Pulsar outage would otherwise be closed and reconnect every minute. A dead peer is found
+  instead by TCP keepalive on feed connections (`SO_KEEPALIVE` with `TCP_KEEPIDLE` 60 s, `TCP_KEEPCNT` 5, and
+  `TCP_USER_TIMEOUT` 5 min; tsdbd sets none of these today). Writers never wait for a pump; pumps never take engine
   locks a writer waits on (§2.11).
 - **Admission.** `--feed-max-subscriptions` (default 256): the next gets `TSDB_ERR_NOMEM`. The request frame counts
   against `--max-request-memory` while parsed, as every request.
@@ -699,7 +875,10 @@ run the rights cases of §3.2 with login on.
 ### 3.7 Embedded API (`tsdb.h`)
 
 ```c
-typedef struct tsdb_feed_cursor { uint64_t feed_id; uint64_t event; uint32_t check; uint32_t volume; } tsdb_feed_cursor;
+typedef struct tsdb_feed_cursor {
+    uint64_t feed_id, event, seen;               /* seen: the consumer's newest event, 0: none (§1.2) */
+    uint32_t check, seen_check, volume, reserved;
+} tsdb_feed_cursor;
 typedef struct tsdb_feed_sel {
     const tsdb_sid *ids; size_t nids;            /* no ids and no selectors: every series */
     const char *const *selectors; size_t nselectors;   /* "all", "prefix:P", "name:N", "glob:G" */
@@ -762,8 +941,9 @@ The source refuses any processing guarantee but `ATLEAST_ONCE` (F6), with the si
 | `topics` | empty | `{"acme.": "topic://acme/tsdb/points", ...}`: the longest matching prefix picks the topic |
 | `format` | `avro` | `avro` (§4.3) or `json` (§4.4) |
 | `start` | `head` | where a volume starts when the slot is new: `head` or `oldest`; afterwards always at the slot |
-| `onGone` | `fail` | on `FEED_GONE` (also an invalidated slot): `fail` (stop the instance and alert) or `resync` (a `resync` message per volume, a snapshot of the selected series as `snapshot` messages, a slot `RESET`, then on from the heads) |
+| `onGone` | `fail` | on `FEED_GONE` (also an invalidated or missing slot): `fail` (stop the instance and alert) or `resync`: the order of §2.6 (F20): the slot `RESET` first (its heads H), a `resync` message per volume, a snapshot group per selected series (§4.3), the stream from H, and the advance with `RESYNCED` once Pulsar acknowledged every snapshot message. A restart while the slot is `resyncing` redoes it |
 | `onReset` | `fail` | the same for `FEED_RESET` (a different history: an operator decides) |
+| `onRightsChange` | `fail` | on a `SERIES` frame with `REVOKED` or `GRANTED` (§3.2): `fail` (stop and alert: the mirror would be silently partial), `resync` (the series alone: its events are held back in the source, counted as in flight so the slot cannot pass them, while a snapshot group of it at a cut after the frame is published, then the held events follow; a revoked series gets a `delete` over all time, so the mirror holds nothing it may no longer read), or `ignore` (logged, `tsdb_source_rights_changes` counts it) |
 | `maxInFlightRecords`, `maxInFlightBytes` | `50000`, `64 MiB` | records handed to Pulsar and not yet acknowledged; above, the source stops reading the socket, and tsdbd parks the stream |
 | `advanceMs` | `1000` | how often the acknowledged positions are sent to the slot |
 
@@ -775,11 +955,11 @@ scalable topics and Key_Shared). The record (`ai.intellistream.tsdb.feed.Event`,
 
 | field | Avro type | meaning |
 |---|---|---|
-| `op` | enum `Op` {`UNKNOWN`, `rows`, `delete`, `replace`, `retention`, `drop`, `resync`, `snapshot`}, default `UNKNOWN` | what the record does |
+| `op` | enum `Op` {`UNKNOWN`, `rows`, `delete`, `replace`, `retention`, `drop`, `resync`, `snapshot`}, default `UNKNOWN` | what the record does; `snapshot` is the range record of a snapshot group (below) |
 | `series` | `["null", "string"]` | the name (null for `drop`, `resync`) |
 | `type` | `["null", enum Type {UNKNOWN, float64, float32, int64, bool, state}]`, enum default `UNKNOWN` | the series' type, in the sink's type names |
 | `ts` | array of `long` (`timestamp-millis`) | `rows`, `snapshot`, the rows of a `replace` |
-| `value` | array of `["null", "double", "float", "long", "boolean", "string"]` | one per `ts`; state values as names; the sink's `value` |
+| `value` | array of `["null", "double", "float", "long", "boolean", "string", "bytes"]` | one per `ts`; state values as names; the sink's `value`. `bytes` is reserved now for a later value type (review L3: a union branch cannot be added under the rules below), unused in v1 |
 | `start`, `end` | `["null", "long"]` | `delete`, `replace` |
 | `limitMs`, `before` | `["null", "long"]` | `retention`, `drop` |
 | `volume` | `int` | the dedup key, with `event` |
@@ -791,6 +971,24 @@ scalable topics and Key_Shared). The record (`ai.intellistream.tsdb.feed.Event`,
 A replace is its `replace` record followed by `rows` records with origin `REPLACE`, the last one at `groupLast`.
 `retention` goes to the series' topic with its key; `drop` and `resync` to the default topic, keyed `tsdb:<volume>`.
 Properties repeat the dedup key for consumers that do not decode: `tsdb-volume`, `tsdb-event`, `tsdb-feed-id`.
+
+**A snapshot group** (F20) has the shape of a replace: a `snapshot` record with `start` = `INT64_MIN` and `end` =
+`INT64_MAX` (the whole time range), then `rows` records with origin `SNAPSHOT`, all with the series' key and topic, so
+they are ordered with the series' other messages. Every record of the group carries as `event` and `groupLast` the
+volume's reset head H (§2.6) and the new `feedId`. It means "the series is exactly these rows as of H or later";
+a consumer applies it as a replace over all time, whatever it applied before, and its deduplication state for the key
+becomes `(feedId, H)`: events after H then pass the per-key test, duplicates of earlier ones do not. The `resync`
+record is informational (logged by the sink); correctness does not depend on where it lands relative to the series
+topics, which is why the snapshot carries the reset itself.
+
+**Old consumers** (review L3). An old sink reading `format: json` would apply a `replace`'s or snapshot's `rows`
+records as upserts and skip the range record: a silent divergence. Every record that is not a plain write of rows
+(`delete`, `replace`, `snapshot`, `retention`, `drop`, `resync`, and the `rows` records of a replace or snapshot group)
+therefore puts its fields under a top-level `change` object in JSON, with no top-level `series`, which the sink of
+today refuses as poison ("missing field series", PointParser.java:70-71): dead-lettered, loudly, never applied in
+part. The source's documentation names the first sink version that mirrors (the one of F9). In Avro an old consumer
+sees `op` and a new `origin` symbol; enum symbols appended under `FULL_TRANSITIVE` read as `UNKNOWN` there, which P0
+verifies.
 
 **Schema in Pulsar.** Each record's `getSchema()` is `Schema.AVRO` of the class generated from `Event.avsc`, so the
 broker registers it on the topic at the first publish and rejects producers with an incompatible one. The operator
@@ -813,11 +1011,20 @@ The same fields as JSON objects, in the sink's input shape for rows (`{"series":
   in event order and moves the cursor to a `POS` once every record before it is acknowledged; every `advanceMs` it
   sends `FEED_ADVANCE` with those cursors on the stream (or to `slotHosts`). The slot is the only store (F15).
 - **tsdbd restarts or a connection breaks:** the source reconnects with backoff and resubscribes from the last `POS`
-  it **received** (its in-memory position, since everything before it is already with the producer), so nothing is
-  sent twice.
+  it **received** (its in-memory position, since everything before it is already with the producer), with `seen` =
+  the newest event it handed to the producer. Events after that `POS` which it had already handed on (a chunk run cut
+  by the break) are sent again: duplicates, identical (review L2 corrected "nothing is sent twice").
 - **The source restarts** (crash, upgrade, rescheduling): it subscribes with the slot. Events between the slot's
   durable position and what Pulsar already has are sent again, identical (F6). After a tsdbd crash the slot may also
   be up to a second behind.
+- **Its high-water** (F19). Before subscribing after a restart, the source learns per volume the newest event Pulsar
+  holds: on each topic (and partition) it publishes to, a reader seeks to the publish time of the slot's position
+  minus a minute (`commit_ms` precedes every publish of the event) and reads to the end, keeping per volume the
+  highest `tsdb-event` of the slot's `tsdb-feed-id`. That read is bounded by what the slot had not yet acknowledged
+  (about `advanceMs` plus the in-flight window). It sends the result as `seen`, so a tsdb history rolled back below
+  what Pulsar holds gives `FEED_RESET` even when the slot's own record survived (§1.2). Seeking by publish time on
+  scalable topics is probed in P0; where it is not available the source logs that it runs without the check and
+  relies on `feed_id` (§2.13).
 - **`Record.fail()`**: the source stops (an exception from `read()`), the runtime restarts it, and it resumes from the
   slot; order is kept because nothing after the failed record was advanced.
 - **Takeover or failover (HA):** `VOLUME_END MOVED` or a broken connection; the source resubscribes through TOPOLOGY
@@ -826,23 +1033,30 @@ The same fields as JSON objects, in the sink's input shape for rows (`{"series":
 
 ### 4.6 Delivery semantics end to end
 
-- **At least once** (F6). Duplicates come only after a restart of the source or of tsdbd, each an identical copy of
-  an earlier message with the same `(volume, event)`; a consumer drops a message whose `event` is not above the last
-  it applied for that volume (or key). Order per key holds: a key's messages go through one producer, in order.
+- **At least once** (F6). Duplicates come only after a restart of the source, of tsdbd or of the connection, each an
+  identical copy of an earlier message with the same `(volume, event)`. **A Pulsar consumer deduplicates per key**
+  (F21): it drops a message whose `event` is not above the last it applied for that key under the same `feedId`. Order
+  per key holds (a key's messages go through one producer, in order); order across keys does not, so the per-volume
+  test of §1.4 would drop real messages here. A snapshot group resets the key's state (§4.3).
 - **No gaps:** the slot never passes an unacknowledged record; retention keeps what the slot holds up to its cap; a
-  `FEED_GONE` stops the source (or resyncs, explicitly, with control messages in the topic), never skips.
+  `FEED_GONE` stops the source (or resyncs, explicitly, in the order of §2.6), never skips. Per series, this holds
+  while the source's rights on it are unchanged: a `REVOKED` or `GRANTED` frame stops the source by default
+  (`onRightsChange`, §3.2).
 - **Ordering across topics** (two prefixes to two topics): none, as across volumes.
 
 ### 4.7 The sink as the mirror's other half
 
 The sink learns the `Event` record (step F9), in Avro and JSON, keeping its existing point shapes:
-- `rows` and `snapshot`: its existing "one series with arrays" path; `type` creates the series as today.
+- `rows`: its existing "one series with arrays" path; `type` creates the series as today.
+- `snapshot`: like `replace` over the whole time range (F20): the group up to `groupLast` as one `REPLACE_RANGE`, or
+  above `maxReplaceRows` a delete over all time and inserts, not atomically (the mirror shows the series partly
+  filled for the duration), with a log line and a counter. Never as upserts: rows deleted in tsdb must go.
 - `delete`: flushes the series' pending points, then `DELETE_RANGE` (the sink's user needs `delete`).
 - `replace`: buffers the group up to `groupLast` and sends one `REPLACE_RANGE`; a group above `maxReplaceRows`
   (default 10 M rows) is applied as a delete and inserts, not atomically, with a log line and a counter.
 - `retention`: `SET_RETENTION`.
 - `drop`: counted and skipped (no wire op applies it; a mirror keeps the rows, as with expiry), with a log line.
-- `resync`: logged; the snapshot that follows is applied as upserts.
+- `resync`: logged; the snapshot groups carry the reset (§4.3).
 - `UNKNOWN` (a newer source): dead-lettered.
 
 The sink needs no deduplication: applying a key's events in order, duplicates included, ends in the same state
@@ -853,7 +1067,8 @@ The sink needs no deduplication: applying a key's events in order, duplicates in
 Through the source context: `tsdb_source_events`, `tsdb_source_rows`, `tsdb_source_bytes`, `tsdb_source_lag_events`
 (head minus the received position, from `POS`), `tsdb_source_lag_ms` (now minus the `commit_ms` of the last event),
 `tsdb_source_retention_margin_events` (received position minus the oldest kept), `tsdb_source_inflight`,
-`tsdb_source_reconnects`, `tsdb_source_resyncs`, `tsdb_source_advance_age_ms`. The slot's own metrics are tsdbd's
+`tsdb_source_reconnects`, `tsdb_source_resyncs`, `tsdb_source_rights_changes`, `tsdb_source_advance_age_ms`,
+`tsdb_source_seen_unchecked` (1 while the high-water read of §4.5 is unavailable). The slot's own metrics are tsdbd's
 (§2.7).
 
 ### 4.9 Build and tests
@@ -862,7 +1077,10 @@ As the sink: `mvn package` builds the one NAR; `mvn test` runs unit tests (a fak
 out-of-order acks, chunk-to-record mapping, the Avro schema against `Event.avsc` and the evolution rules (a test that
 reads records of the previous schema version), topic choice, selection parity with the sink) and tests against
 `build/tsdbd` started with `--port 0 --port-file` and login on: kill -9 of tsdbd during a stream, resume from the slot
-without gap; `FEED_GONE` with a tiny `max_bytes`; deletes and replaces as `op` records.
+without gap; `FEED_GONE` with a tiny `max_bytes`, then `onGone=resync` with writes and deletes running during the
+snapshot, and the mirror equal afterwards; a source killed while its slot is `resyncing`; a revoke and a grant
+under each `onRightsChange`; a copy of tsdbd's directory restored under a running source (`seen` gives `FEED_RESET`);
+deletes and replaces as `op` records.
 `connectors/pulsar/test/integration.sh` gains a source mode (`MODE=source`, Podman, Pulsar 5.0.0 pinned by digest,
 bound to 127.0.0.1): writers into tsdbd A, the source into a scalable topic with an Avro schema, the sink from it into
 tsdbd B, faults (kill -9 of tsdbd A, of the source, of the sink; tsdbd A stopped for `STOP_S`; a broker restart), then
@@ -887,15 +1105,18 @@ through markers and does not read it), the wire bodies (MOVED, UNAVAILABLE, TOPO
 cluster's other marker kinds. The feed's own pieces come later and change no format: `tsdb-intent 4`, `fwal_`,
 `fcommit_`, links, `FEED`, `FEEDSLOTS`, `FEEDPOS`, all behind `requires=feed`.
 
-Two points for S0 to settle with design-cluster.md: §4.1 there says every marker takes one number, where the `COMMIT`
-of §2.1 takes `span` (the events it expands into: the cluster only needs the first); and MANIFEST's `fno_next` is new
-to both designs.
+Points for S0 to settle with design-cluster.md and design-ha-modes.md: §4.1 there says every marker takes one number,
+where the `COMMIT` of §2.1 takes `span` (the events it expands into: the cluster only needs the first); MANIFEST's
+`fno_next` is new to both designs; the `DROP` payload carries the drop's block number and the `RETENTION` payload its
+record's offset in `RETENTION` (F17); and the HA heartbeats' positions (design-ha-modes.md §5.4) gain the durable
+`fno` (F19, built in N7).
 
 **Migration note** (S0's to write; 0.9.0's rules, compatibility.md): format 9 changes the WAL record, MANIFEST and the
 part header. A format-8 database is refused with the message that names both versions; the way over is the export
 and import of `docs/export-format.md`, which always works. If S0 keeps format-8 part headers readable (a version in
 the header), an in-place `tsdb <dir> upgrade` is cheap: it refuses unless the database was closed cleanly with no WAL
-segment left, then writes MANIFEST and META version 9 (open question 5).
+segment left, then writes MANIFEST and META version 9. Recommended, and S0's to decide with the HA work (it was this
+design's open question 5 before the review).
 
 ## 6. Test plan
 
@@ -915,14 +1136,37 @@ segment left, then writes MANIFEST and META version 9 (open question 5).
   learns `linkat`.
 - **Cursors:** resume at every `POS` of a run gives the same suffix; a cursor of another `feed_id`, past the head, or
   with a wrong `check` (a copy of the directory that took other writes) is `FEED_RESET`; below the oldest is
-  `FEED_GONE`.
+  `FEED_GONE`; a cursor at the floor (the last event of a removed segment) resumes. **Rollback** (F19): take a copy
+  of the directory at event 950, write on to 1000, consume to 1000 with a cursor saved at 900; restore the copy and
+  write on: a resume from 900 with `seen = 1000` is `FEED_RESET`, before and after the new writes pass 1000; without
+  `seen` it resumes (the test documents the gap `seen` closes); after `feed new-id` both are `FEED_RESET`.
 - **Retention:** by age and size, never the newest segment, never one the §1.6 check needs; orphans after a crash
-  between segment and link removal.
+  between segment and link removal. **Free space** (F18): with the `statvfs` hook below the floor, the feed on and no
+  slots, the cleaner removes base retention down to the newest segment and writes keep being acknowledged; a merge
+  held by a hook does not delay the cleaner. A replayed segment with a torn tail is truncated before its rename, and a
+  reader ends cleanly at its last record.
+- **Drop and retention** (F17): the `test_precommit` hook writes small rows into the dropped range during a
+  `drop_before`, and a large insert into it publishes on either side of the drop; the feed applied to a model equals
+  the database. crashfs power loss at every step of a drop (intent, its fsyncs, the retire, MANIFEST, the rename to
+  `fcommit_`, the marker) and of a `set_retention` (record synced, marker lost): after reopen the feed has the drop
+  and the limit iff the database does, once, the drop in block order among the commits around it.
+- **Engine fix of §1.5:** a `mem_insert` whose memtable allocation fails (a hook) leaves nothing in the WAL buffer.
 - **Slots:** a slot holds retention past age and size; its cap by age, by bytes and by free space (a hook for
   `statvfs`) invalidates it, retention then catches up, and the resume gets `FEED_GONE` with `SLOT_INVALID`; reset;
-  drop; advances coalesced and the idle-volume case writes no marker; power loss at every step (create, advance,
-  checkpoint, cleaner) never loses a durable create and never lets retention pass a durable position; a volume added
-  later gets `ALL_VOLUMES` slots; a follower reads slots and refuses changes.
+  drop; advances coalesced and the idle-volume case writes no marker; an equal or lower advance is a no-op; power
+  loss at every step (create, advance, checkpoint, cleaner) never loses a durable create and never lets retention
+  pass a durable position. **`FEEDSLOTS`** (F16): crashfs power loss between two unsynced checkpoint writes that
+  follow a synced one and a removal (the review's C1, C2, C3 sequence), with `CRASHFS_TEAR`: the open finds the
+  anchor and the markers after it, and the slot state equals the model's; an injected EIO on its write or fdatasync
+  fails the engine. A slot created with `wal_sync_ms = 50` and a crash right after the reply survives. A create cut
+  after its registry entry stays `creating`, a subscribe on it is refused, a retry finishes it; a volume without the
+  entry of a `ready` slot gives `SLOT_MISSING`. A caught-up slot whose position ends a segment survives age removal
+  and still advances. A volume added by the CLI beside a running writer gets its `ALL_VOLUMES` entries before its
+  first write (and again after a crash before `seeded = 1`); an `ALL_VOLUMES` subscription without a slot gets the
+  new volume from its oldest event. A follower reads slots and refuses changes.
+- **Resync** (F20): with the slot reset and writes, deletes and replaces running, the snapshot applied as a replace
+  over all time and then the stream from the reset heads give a model equal to the database; a restart while
+  `resyncing` shows `SLOT_RESYNCING`.
 - **Invariants that must not move:** `wal_removed_synced` with renames (empty merge outputs still go, test_merge),
   class switch `wtail` (test_classes), WAL replay skips markers (test_wal), followers skip markers, `fno` never goes
   back across opens with the feed off and on.
@@ -938,8 +1182,8 @@ segment left, then writes MANIFEST and META version 9 (open question 5).
   `DENIED`; a revoke mid-stream stops a series (`REVOKED`), a grant starts one (`GRANTED`), a user drop ends the stream
   (`END AUTH`); slot ops by owner, tenant admin, other users and superusers per §3.2; `test_auth_ops` covers the six
   ops.
-- A consumer that never reads: writers' latency unchanged, tsdbd's memory flat, the connection closed after
-  `send_timeout_s`. `FEED_ADVANCE` and `CANCEL` on a parked stream.
+- A consumer that never reads: writers' latency unchanged, tsdbd's memory flat, the parked stream kept past
+  `send_timeout_s` (and a dead peer found by keepalive). `FEED_ADVANCE` and `CANCEL` on a parked stream.
 - `make fuzz-frames` gets FEED_SUBSCRIBE, FEED_ADVANCE and slot inputs (selectors, cursors, slot names, CANCEL).
 
 ### 6.3 Jepsen: workload `feed` (`make jepsen JEPSEN_WORKLOADS=feed`)
@@ -962,13 +1206,21 @@ partitions, flushes every 500 ms, idle merges after 1 s, `wal_sync_ms` 0 and, in
    `tsdb_feed_lww_violations_total` is 0.
 7. **Lag bound:** with a tiny `feed_max_bytes`, a stopped consumer without a slot gets `FEED_GONE`, never a silent
    gap; the slot consumer never gets `FEED_GONE` below its cap and always gets it (never a gap) above.
+8. **Resync** (F20): each consumer that gets `FEED_GONE` resyncs in the order of §2.6 while the writers go on (deletes
+   and replaces included); at the end its model equals the database's state, as in check 4. A fourth consumer
+   deduplicates per key over a copy of its events shuffled across keys, as a Pulsar consumer sees them (F21), and
+   must equal the model too.
+9. **Drops:** the workload calls `drop_before` during the writes; checks 1 to 4 hold with it (F17).
 
 ### 6.4 HA (with design-ha-modes.md's jepsen-ha and design-cluster.md's jepsen-cluster)
 
 The `feed` workload runs under `make jepsen-ha` (owner kill, takeover, pool rollback) and `make jepsen-cluster`
 (leader kill, partition, promotion): a slot consumer resumes on the new owner or leader without a gap; nothing
-delivered is taken back by a failover (no uncommitted record delivered in replicated mode); a storage rollback gives
-`FEED_RESET`, never reused numbers.
+delivered is taken back by a failover (no uncommitted record delivered in replicated mode); a storage rollback below
+what a consumer holds gives `FEED_RESET` (a new `feed_id` from DIVERGED, or `seen` when the rollback hid inside the
+last heartbeat), never a resume onto reused numbers (F19). In replicated mode, one replica's disk held near the floor
+(the `statvfs` hook) makes the leader invalidate slots (M4); below half the floor the replica trims locally, and a
+failover to it gives the slot `FEED_GONE`, never a gap.
 
 ## 7. Alternatives considered and rejected
 
@@ -988,6 +1240,11 @@ delivered is taken back by a failover (no uncommitted record delivered in replic
 | Forward expiry | §1.1. |
 | Markers synced under `publish_lock` before the commit | Takes the WAL writer role inside `publish_lock`, against the lock order (ha.md D3). The intent (or ledger record) is already a durable record of the commit; the marker only places it. |
 | A tee in the Pulsar sink (publish what it writes) | Misses every write that does not come through the sink, and deletes; no order with other writers. |
+| `FEEDSLOTS` written alternately without a sync (the revision before F16) | A third unsynced write overwrites the only durable checkpoint; a power loss then reverts slots silently. |
+| A FEEDSLOTS failure that only pauses the cleaner | A retried fdatasync proves nothing, and a persistent failure holds every segment until the WAL hits ENOSPC (F16). |
+| `drop_before` as a marker after the retire (the revision before F17) | No fence: a small write after the flush survives in tsdb but is deleted by a mirror; a crash loses the drop event. |
+| Resync with the slot reset last and the snapshot as upserts (before F20) | Loses the writes between snapshot and reset and keeps rows deleted meanwhile. |
+| The consumer's high-water kept in the slot | It rolls back with the volume, so it cannot detect the rollback (F19). |
 | A sidecar process tailing the files | Cannot know what is durable; with `FEEDPOS` it is what a follower does. |
 
 ## 8. Build plan
@@ -998,45 +1255,55 @@ disk, `make test-clients` and `make integration-tests` for client changes. Track
 
 | step | content | gates beyond `make test`, asan, tsan | track-days |
 |---|---|---|---:|
-| P0 | **Pulsar 5 probe** (Podman, Pulsar 5.0.0): a source publishing `Schema.AVRO` records on a scalable topic registers the schema; `FULL_TRANSITIVE` refuses an incompatible change and accepts an added field with a default; the sink reads the records as `GenericRecord` (arrays of unions included); ZSTD batches. Hard links and `statvfs` on the production NFS mount go into N0's probe | none (a report) | 0.5 |
+| P0 | **Pulsar 5 probe** (Podman, Pulsar 5.0.0): a source publishing `Schema.AVRO` records on a scalable topic registers the schema; `FULL_TRANSITIVE` refuses an incompatible change and accepts an added field with a default; the sink reads the records as `GenericRecord` (arrays of unions included); ZSTD batches; an enum symbol appended under `FULL_TRANSITIVE` reads as the default in an old reader; a reader seeks by publish time on a scalable topic and its partitions and reads to the end (the high-water of §4.5). Hard links and `statvfs` on the production NFS mount go into N0's probe | none (a report) | 0.5 |
 | S0 | **Format 9** (design-ha-modes.md §7), with the feed's pieces of §5 and the migration note; shared with HA | jepsen (all workloads), check-version | (HA's 2-3) |
-| F1 | `FEED` file, `requires=feed`, enable and disable (CLI, embedded), retained segments (rename at flush, open, close), the retention cleaner without slots; the `wal_removed` and `wtail` regression tests | jepsen kill, power | 1-2 |
-| F2 | Direct commits: intent v4 always, links, `COMMIT` markers before `lw_leave`, `fcommit_` lifetime, markers for no-op deletes, retention and drop; recovery and orphans at open; crashfs `linkat` | jepsen power, eio | 2-3 |
+| F1 | `FEED` file, `requires=feed`, enable and disable (CLI, embedded, refused beside a writer, a disable finished at open), `feed new-id`, retained segments (rename at flush, open, close; torn tails truncated first), the cleaner thread without slots, with the floor and the free-space rule; the `wal_removed` and `wtail` regression tests | jepsen kill, power | 1.5-2 |
+| F2 | First the engine fix of §1.5 (memtable room before `wal_buffer`). Direct commits: intent v4 always, links, `COMMIT` markers before `lw_leave`, `fcommit_` lifetime; no-op deletes under their fence; `drop_before` as a direct commit (fence, block, intent, marker, F17); retention markers with their offsets; recovery at open (markers of commits and drops in block order, retention from `ret_fed`) and orphans; crashfs `linkat` | jepsen power, eio | 2.5-3.5 |
 | F3 | Reader `src/feed.c`, the embedded API, the deliverable-position hook, the §1.6 check with its counter and hooks; `tests/test_feed.c` | jepsen kill (a feed smoke check) | 2-3 |
-| F4 | Slots: markers, `FEEDSLOTS`, registry in the root volume, caps and invalidation, coalesced advances, the cleaner's holds, slot metrics hooks, CLI | jepsen power, eio | 2-3 |
+| F4 | Slots: markers, `FEEDSLOTS` with anchor and scratch (F16), registry in the root volume (`creating`, `ready`), durable create and reset, `resyncing`, seeding of added volumes, caps and invalidation, coalesced and no-op advances, the cleaner's holds, slot metrics hooks, CLI | jepsen power, eio | 2.5-3.5 |
 | F5 | NFS followers: `FEEDPOS` writer and follower reading, slots read-only | follower tests | 1 |
 | F6 | Protocol 14 and tsdbd: the six ops, `auth_ops` rows and the rights of §3.2, pumps, admission, `CANCEL` and `FEED_ADVANCE` in `parse()`, metrics, `docs/metrics.md`; server and auth tests, fuzz seeds | `fuzz-frames` 600 s, `test_auth_ops` | 2-3 |
 | F7 | Clients: C, Rust, Python, Java and the embedded bindings, one commit | `test-clients`, `integration-tests` | 2 |
 | F8 | Jepsen `feed` workload and checker (§6.3), with `--auth` | `make jepsen JEPSEN_WORKLOADS=feed`, 300 s per nemesis | 2 |
-| F9 | Pulsar source (Avro and JSON), the sink's `Event` reader (§4.7), `mvn test`, `integration.sh MODE=source` (the mirror check) | `mvn test`, `integration.sh MODE=source` | 3 |
-| F10 | Docs: `docs/feed.md` (operators: enabling, retention, slots, alerts, the Avro schema and its evolution), `CHANGELOG.md` (protocol 14, `requires=feed`), AGENTS.md invariants (retained segments are not WAL; markers in block order and before `lw_leave`; delivery only up to the deliverable position; links; slot caps), the connector README | none | 1 |
-| H1 | Shared mode (after N4 and N7): the feed's call sites in the journal hook, `COMMIT` from the ledger, the compaction rule, chained `FEED`/`FEEDSLOTS`/`FEEDPOS`, delivery at the ack gate, registry in the metadata group, `MOVED` on takeover | `make jepsen-ha` with the feed workload | 2-3 |
-| H2 | Replicated mode (after R3): the cluster's `COMMIT` as the feed's marker, delivery at the commit point, retention on every replica, `REPLICA_OK` streams | `make jepsen-cluster` with the feed workload | 2 |
+| F9 | Pulsar source (Avro and JSON), the high-water read, the resync in the order of §2.6, `onRightsChange`; the sink's `Event` reader (§4.7, snapshots as replaces); `mvn test`, `integration.sh MODE=source` (the mirror check, with a resync) | `mvn test`, `integration.sh MODE=source` | 3.5 |
+| F10 | Docs: `docs/feed.md` (operators: enabling, retention, slots, alerts, the Avro schema and its evolution), `CHANGELOG.md` (protocol 14, `requires=feed`), AGENTS.md invariants (retained segments are not WAL; markers in block order and before `lw_leave`, the drop's too; delivery only up to the deliverable position; links; slot caps; the `FEEDSLOTS` anchor is never written), the restore steps with `feed new-id`, "no gaps only while rights are unchanged", per-key deduplication on Pulsar, the connector README | none | 1 |
+| H1 | Shared mode (after N4 and N7): the feed's call sites in the journal hook, `COMMIT` from the ledger, the compaction rule, chained `FEED`/`FEEDSLOTS`/`FEEDPOS`, delivery at the ack gate, registry in the metadata group, `MOVED` on takeover, `fno` above the reported high-water and a new `feed_id` on DIVERGED (F19) | `make jepsen-ha` with the feed workload | 2-3 |
+| H2 | Replicated mode (after R3): the cluster's `COMMIT` as the feed's marker, delivery at the commit point, retention on every replica, the ISR's lowest free space and the `NOW` clock for caps, a replica's local trim (M4), `REPLICA_OK` streams | `make jepsen-cluster` with the feed workload | 2-2.5 |
 | L1 | Later, by measurement (F10): compressed sealed segments, once the production ingest rate is known and a benchmark shows what 64 GiB holds | benchmarks on a quiet machine, several runs, the mean | 2 |
 | L2 | Later: one shared scan per hot volume for many streams | tsdbc-bench with 64 streams | 2 |
 
 Order: S0 lands with the HA work before 1.0; P0 any time before F9; F1-F10 follow S0 on one track (F5 and F7 can run
-beside F6 and F8); H1 and H2 after their HA steps. F1-F10 sum to about 18-23 track-days.
+beside F6 and F8); H1 and H2 after their HA steps. F1-F10 sum to about 20-25 track-days (two more than before the
+review: the drop as a commit, the slot registry's two phases, the resync and the high-water read).
 
-**Size, by area (estimate, lines):** engine (WAL, commits, recovery, retention, slots) 2,000 + reader 1,200 + tests
-2,000; tsdbd and rights 1,100 + tests 600; protocol header 200; clients C 500, Rust 600, Python 300, Java 700,
-embedded bindings 500; Pulsar source 1,300 + sink reader 300 + tests 1,000 + script 250; Jepsen workload and checker
-900. About 13,500 in all, half of it tests.
+**Size, by area (estimate, lines):** engine (WAL, commits, recovery, retention, slots) 2,300 + reader 1,200 + tests
+2,300; tsdbd and rights 1,100 + tests 600; protocol header 200; clients C 500, Rust 600, Python 300, Java 700,
+embedded bindings 500; Pulsar source 1,500 + sink reader 350 + tests 1,100 + script 250; Jepsen workload and checker
+1,000. About 14,500 in all, half of it tests.
 
 ## Open questions for the user
 
-1. **Slot caps by default: 7 days, 256 GiB per volume, and invalidation below 10% free space?** Recommended: yes;
-   each slot can set its own age and bytes, and the free-space floor is a database setting.
+Six at most; each has a recommendation, and the design is written to it. The format upgrade question of the
+revision before moved to S0 (§5), and the review's findings that needed no choice are decided as F16-F21.
+
+1. **Slot caps and free space: 7 days, 256 GiB per volume, and below 10% free space first invalidate slots, then trim
+   the feed's own 24 h / 64 GiB retention too (F18)?** Recommended: yes; each slot sets its own age and bytes, the
+   floor is a database setting, and the feed never pushes the WAL toward ENOSPC. The alternative keeps the base
+   retention whole and accepts that N volumes on a pool can hold N × 64 GiB.
 2. **Who may create slots:** superusers and tenant admins for slot names under their prefix (§3.2, as for user
    names), or superusers only? Recommended: both, so a tenant runs its own source without a superuser.
 3. **When the last-write-wins check fails** (§1.6): repair with `REASSERT` events and alert (recommended: a mirror
    stays right while the engine bug is found), or end the volume's stream with `CORRUPT`?
 4. **`drop_before` in mirrors:** the sink skips `drop` (recommended: no wire op for it in protocol 14; mirrors keep
    the rows, as with expiry), or add a superuser `DROP_BEFORE` op so the sink can apply it?
-5. **Format 8 to 9:** export and import only, or also an in-place `tsdb <dir> upgrade` for a cleanly closed
-   database (recommended, if S0 keeps format-8 part headers readable: production data then needs no export)?
-6. **Rights changes on a running stream:** applied at once with `GRANTED`/`REVOKED` (recommended: a revoke must reach
-   a stream that lives for days), or only at the next subscribe?
+5. **Rollback detection on a single server** (F19): the operator's `feed new-id` in the restore steps **and** the
+   source's high-water read from Pulsar sent as `seen` (recommended: the read costs a seek and a few seconds of
+   messages at each source start, and catches the rollback an operator does not notice, such as a lost SLOG), or the
+   operator's step alone?
+6. **Rights changes on a running stream:** applied at once with `GRANTED`/`REVOKED`, and the source's default
+   `onRightsChange = fail` (recommended: a revoke must reach a stream that lives for days, and a mirror that silently
+   lacks a series is worse than a stopped source), or `resync` of the series by default, or rights checked only at
+   subscribe?
 
 ## Unverified assumptions
 
@@ -1048,5 +1315,9 @@ embedded bindings 500; Pulsar source 1,300 + sink reader 300 + tests 1,000 + scr
 - `statvfs` on the production NFS mounts reports the ZFS dataset's free space and quota, so the free-space cap sees
   what the pool sees. (N0's probe.)
 - The production ingest rate decides whether the uncompressed retained WAL fits 64 GiB for 24 h; not measured (F10).
+- Pulsar readers can seek by publish time on scalable topics, and a source can open them through its context's
+  client, for the high-water read of §4.5. (Step P0.)
+- An old sink refuses a JSON record without a top-level `series` (PointParser.java:70-71, checked) and does the same
+  for Avro records of the `Event` schema without one; F9 checks the Avro side.
 - The rotation argument of §2.4 (a second rotation waits for the first flush, which needs `publish_lock`) was checked
   at 87eb49e; F2 re-checks it against memtable.c at 0683460.
