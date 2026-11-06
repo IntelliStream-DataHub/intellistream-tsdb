@@ -30,7 +30,21 @@ disk format and the wire protocol.
   empty result before).
 - `tsdb_query_multi` claims the first series for the caller before it wakes its helpers. A helper that ran first
   took it as a series ahead: collected and held, or, over 65,536 rows, computed, thrown away and run again at its
-  turn.
+  turn. Measured with `tsdbc-bench query --multi 100 --conns 1` (100 series x 1 M rows, optimized; 0.9.0 and this
+  change interleaved, 5 runs each; series per second, mean +- sd, lowest-highest):
+
+  | query | 0.9.0 | this change |
+  |---|---:|---:|
+  | raw, 3600 samples | 79,247 +- 1,699 (77,153-81,053) | 79,511 +- 1,084 (77,652-80,413) |
+  | 86,400 samples in 288 buckets | 70,629 +- 1,967 (68,029-72,463) | 70,889 +- 1,363 (68,679-71,847) |
+  | 604,800 samples in 168 buckets | 40,522 +- 967 (39,116-41,286) | 37,939 +- 5,485 (28,190-41,001) |
+  | TWA, 604,800 samples in 168 buckets | 11,073 +- 184 (10,746-11,188) | 10,963 +- 240 (10,692-11,237) |
+  | the whole range in one bucket | 86,061 +- 705 (85,121-86,737) | 84,584 +- 675 (83,664-85,296) |
+
+  The same within the noise, but for the whole range in one bucket (about 12 us a series, from granule statistics):
+  1.7% fewer, in each of the five pairs of runs. The 168-bucket column has one slow run (28,190); the other four
+  average 40,376. Every answer here is far below 65,536 rows, so the change has nothing to save in this benchmark;
+  it saves where the first series' answer is larger.
 
 ## [0.9.0] - 2026-11-05
 
