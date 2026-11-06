@@ -66,8 +66,9 @@ quick)
     # Seeds of the first 1M-seed soak where a replica still following a deposed leader cut records the next
     # epoch had committed (legitimate: the checker was too strict; see the TRUNCATE check in sim_repl.c; the
     # schedules have changed since). 75881 3865 25133: a leader that went back to a position its follower had, and
-    # had trimmed, sent snapshot notices for ever (the follower now ACKs where it is).
-    for s in 43308 200636 294653 478816 570201 653518 756115 903046 75881 3865 25133; do
+    # had trimmed, sent snapshot notices for ever (the follower now ACKs where it is). 299557 436347: a leader's
+    # shrink to itself applied in the tick it lost its disk, then promoted again (D1; the checker took it for P-F1).
+    for s in 43308 200636 294653 478816 570201 653518 756115 903046 75881 3865 25133 299557 436347; do
         "$B"/sim_repl --seed $s > /dev/null || exit 1
     done
     mutants 200 "$quick"

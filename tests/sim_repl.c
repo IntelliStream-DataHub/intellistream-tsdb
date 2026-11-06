@@ -96,7 +96,7 @@ static struct sim {
      * SYNC was issued for, not what is durable now after a cut (a driver the core must survive); replicas trim their
      * logs below the floor (segments into parts), so a lagging one needs a snapshot. */
     int fence_all, naive_sync, trim;
-    int shrunk;               /* the metadata's ISR last changed by a leader's shrink, not by a promotion (D1) */
+    int shrunk;               /* a leader's shrink cut the ISR last; no promotion dropped an intact member since */
     struct node node[NM];
     struct smsg *q;
     size_t nq, cq;
@@ -734,7 +734,13 @@ static void meta_tick(void)
     int rc = repl_meta_promote(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep);
     if (rc == REPL_OK) {
         S.fo = 0;
-        S.shrunk = 0;
+        /* The D1 excuse goes only with a promotion that drops an intact member (one still on the disk the old ISR
+         * named: P-F1's bug). A promotion that keeps a leader's shrunk set, or drops only lost disks, keeps it: the
+         * leader shrank to itself, lost its disk, the metadata applied the shrink in that tick and promoted the set
+         * on a fence reply the old instance sent before the loss (seeds 299557 and 436347). */
+        for (int i = 0; i < S.nn; i++)
+            if ((old & ~S.vm.isr & (1u << i)) && S.node[i].rid == oldrid[i])
+                S.shrunk = 0;
         S.st.promotions++;
         S.last_hb[S.vm.leader] = S.now;
         trace("meta: epoch %" PRIu64 " leader %d isr %#x", S.vm.epoch, S.vm.leader, S.vm.isr);
@@ -1157,7 +1163,7 @@ static int run(uint64_t seed, uint64_t ticks)
         }
         if (holder >= 0 && !S.shrunk) {
             violation("liveness: the volume waits for an operator although node %d holds every acknowledged write "
-                      "(metadata isr %#x names only lost disks, set by a promotion)", holder, S.vm.isr);
+                      "(metadata isr %#x names only lost disks, not left so by a leader's shrink)", holder, S.vm.isr);
             fprintf(stderr, "seed %" PRIu64 ": %s\n", seed, S.why);
             describe();
             return 1;
