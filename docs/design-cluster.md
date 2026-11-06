@@ -2,7 +2,12 @@
 
 Status: design, not implemented. Branch `cluster-design`, written on 2026-11-05 from main at 9b00186. Code references
 are `file:line` at that commit. Builds after the 0.9.0 tag; what must be in 1.0 so that the cluster is an addition and
-not a break is §11. Revised on 2026-11-06 with the user's answers to its open questions (D1-D6 below).
+not a break is §11. Revised on 2026-11-06 with the user's answers to its open questions (D1-D6 below), and again on
+2026-11-06 when the user kept the NFS failover as a second HA mode (D3 replaced; [design-ha-modes.md](design-ha-modes.md)).
+This design is the *replicated mode* of tsdb's two HA modes; ha.md is the *shared mode*. Corrected on 2026-11-06 with
+the fifteen gaps that build step 2's replication simulator found (branch `cluster-s2`, 44b352b, 13081cc and 9f2cf49;
+"Corrections from step 2's simulator" below, each with its mutant or seed, and marked *Corrected 2026-11-06 (gap N)*
+in the section it changes).
 
 Decided by the user on 2026-11-05 and not reopened here:
 1. A cluster (for example 8 servers) stays up, and keeps almost all of its performance, when one or two servers go
@@ -18,9 +23,14 @@ Decided by the user on 2026-11-06 (the open questions of the first draft):
   copying its `src/raft` (core, log, wire, simulator) into tsdb under Apache 2.0, with Apache headers and a sync
   script (C3, §2.3). intellistream-objects should get a LICENSE (or a grant file naming Apache 2.0) as well, and
   tsdb's [licenses.md](licenses.md) lists the copied files when they land (build plan step 1).
-- **D3. The cluster replaces ha.md for new work.** ha.md's client rules, streams, forwarding and drop watermark are
-  part of this design now; its NFS lock, ledger and SUSPECT state are dropped. NFS followers stay for single-server
-  use. ha.md carries a note at its top saying so.
+- **D3. Replaced on 2026-11-06.** It read: "The cluster replaces ha.md for new work; its NFS lock, ledger and SUSPECT
+  state are dropped." The user then decided: "I have been thinking, I still want to keep the NFS implementation."
+  So ha.md's NFS failover stays **as a second HA mode** (shared mode) beside this one (replicated mode), for
+  production's nodes without local data disks on NFS/ZFS. [design-ha-modes.md](design-ha-modes.md) is the overview:
+  both modes run on this design's metadata group (§2), which in shared mode names each volume's owner and epoch; the
+  NFS lock, the chained fds, the ledger and the ack gate stay there as the fence on the storage; the client rules,
+  streams, forwarding, drop watermark, users and name slots are shared. Everything else here (D1, D2, D4-D6, C1-C25)
+  stands for replicated mode.
 - **D4. Name slots**: names stay unique in the whole cluster, which keeps the decision of 2026-11-02 (C18, §3.3).
 - **D5. Reads from leaders by default**; `REPLICA_OK` per query or per client (C15, §7). The user did not answer this
   one: the recommendation is the default, and the user may change it.
@@ -33,8 +43,10 @@ fencing, reads, rebuild, the two-servers-down case, room in the 1.0 format and p
 **Not here**: erasure coding, shard placement, ISA-L, degraded reads. §9 says only what the hot tier hands to a
 cold tier and what it needs from one.
 
-Related designs: [ha.md](ha.md) (failover over shared NFS storage, superseded by this design for new work (D3); its client rules, streams, forwarding and drop
-watermark carry over, its NFS lock arbiter does not), [design-series64.md](design-series64.md) (ids
+Related designs: [design-ha-modes.md](design-ha-modes.md) (the two HA modes, what they share, one control plane, the
+combined build plan), [ha.md](ha.md) (shared mode: failover over shared NFS storage, the other HA mode (D3); its
+client rules, streams, forwarding and drop watermark are shared with this design, its NFS lock and ledger are shared
+mode's fence, its lock arbitration is replaced by this design's metadata group), [design-series64.md](design-series64.md) (ids
 `(volume + 1) << 32 | local`; names unique in the whole database), design-cdc.md on branch `cdc-design` (WAL record
 version 2 with a per-volume number for every row: the cluster uses the same number), [design-auth.md](design-auth.md)
 (users and grants; in a cluster they move into the metadata group).
@@ -74,7 +86,7 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 
 | # | Assumption | What changes if it does not hold |
 |---|---|---|
-| A1 | **Shared-nothing.** Each server has its own disks; the cluster does not use the NFS/ZFS servers. | With shared storage, ha.md (one copy, failover by lock) is cheaper; this design and ha.md are alternatives for the same need; the user chose this one for new work (D3). |
+| A1 | **Shared-nothing.** Each server has its own disks; the cluster does not use the NFS/ZFS servers. | With shared storage, ha.md (one copy, failover by lock) is cheaper. Since 2026-11-06 both are kept as the two HA modes, one per deployment, on the same metadata group design (D3, [design-ha-modes.md](design-ha-modes.md)). |
 | A2 | **Writes go on with two servers down, and no acknowledged write is lost** when up to two servers and their disks are lost. Hence: replication factor 3, acknowledge only after every in-sync replica has the write durable, and an in-sync set that shrinks on failure (Kafka's ISR). | A minimum in-sync size of 2 (a per-volume option, D1) or a replication factor of 4 trades availability or disk for safety against a third loss. |
 | A3 | **Design now, build after the 0.9.0 tag**; the 1.0 format and protocol leave room (§11), so the cluster arrives in a 1.x without a break. | If the cluster must be in 1.0, the build plan (§14) moves before the freeze. |
 | A4 | The servers are in one data center, 25 GbE or faster between them, round trip below 100 µs, NVMe with `fdatasync` around 0.7 ms (the README's drive). | Across sites, every small insert pays a WAN round trip. |
@@ -110,6 +122,39 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 | C24 | **The cluster is a tsdbd mode** (`--cluster`). The embedded library, a standalone tsdbd and NFS followers stay as they are; a cluster volume refuses a non-cluster open (§12). | A cluster mode in the embedded library | Replication needs peer links, an event loop and timers, which tsdbd has and an application embedding tsdb should not get. |
 | C25 | **Two kinds of peer link per pair of servers**: log streams (small, latency bound, zstd-1 compressed) and bulk transfers (part files, snapshots; throttled). | One link for both | A 100 MB part on the same link would hold up every small insert behind it (ha.md D37 for the same reason). |
 
+## Corrections from step 2's simulator (2026-11-06)
+
+Build step 2 (`src/repl.c` and `tests/sim_repl.c`, branch `cluster-s2`) runs the replication rules of this design
+against a fake disk that loses unsynced writes, a network that delays, drops, duplicates, reorders and partitions,
+and a fake metadata group. Each rule below was found missing or wrong there; the evidence is a mutant (bit n of
+`MUT(n)` in repl.c, `build/sim_repl_mut --mutant N`) that plants the old rule and the seed that first kills it, or a
+seed of the clean simulator that failed. `build/sim_repl --seed S --trace` replays a seed. At this revision the core
+is at 9f2cf49, which kills every planted mutant; its 1,000,000-seed soak found gap 15. The sections named carry the
+change.
+
+| Gap | Section | Correction | Evidence |
+|---|---|---|---|
+| 1 | §8.1 step 5 | While an ISR expansion is in flight, the leader counts the joining replica from the moment it asks the metadata group ("maximal ISR"), so the ISR never lists a member that lacks a position committed in between. | mutant 6, seed 1 |
+| 2 | §8.1 step 5 | A learner joins only when its log has reached the commit point **and** the start of the leader's current epoch (its `EPOCH` marker; Kafka's leaderEpochStartOffset rule), not only the commit point right after a failover. | mutant 12, seed 18 |
+| 3 | §2.1, §4.3, §6.2, §8.5 | **Replica instances.** Every fresh replica directory gets a new instance id (`rid`); the ISR names each member's rid; fence replies and ACKs carry it; only a member whose rid matches is promoted or counted, and a server never leads an epoch the record gave another instance of it. Otherwise a wiped disk answering a fence (log end 0) could be promoted, or take over its predecessor's epoch. | mutants 13 and 11+13, seed 1 |
+| 4 | §6.1, §6.2, §4.3 | **A restarted leader never resumes the epoch it led**: REPL records `led`, and a replica that led epoch e before a restart resigns (`REPL_M_RESIGN`); the metadata group promotes again at e+1. Its sends of e may have outlived its own unsynced log, so a second incarnation would write other records at the same (position, epoch). | mutant 5, seed 1 (seed 2 in the 20,000-seed run) |
+| 5 | §6.2 step 2 | The ISR after a promotion is not "the members that answered": slow replies would shrink it to one copy. Superseded by gap 11's rule. | seed 183 (an earlier configuration); mutant 14, the old rule, killed at seed 25 since 9f2cf49 |
+| 6 | §6.3 | Reworded: what makes acknowledged writes safe is that the new leader keeps every record it has and was in the old leader's ISR. The fence (refusing epoch e's records once fenced) keeps the followers of e+1 from mixing in the deposed leader's records; it is not what makes acks safe. | mutant 2 (no epoch check at all), caught only at seed 1905, through a cut below the applied end |
+| 7 | §2.1, §4.3 | The epoch history reaches back to the oldest epoch a returning replica may still hold, bounded by the retained segments, not "the last 64 epochs". | the core's QUERY/ANSWER needs it; no mutant (the core keeps the whole history, 16 bytes per epoch) |
+| 8 | §6.2, §6.3 | The promotion's metadata commit is conditional on the **ISR version** as well as the epoch (the basis the fences were sent for); else an ISR change the deposed leader got committed after the fences went out is undone by the promotion. | mutant 10, seed 1103 (seed 2092 in the final simulator) |
+| 9 | §4.2 | Driver contracts: `repl_synced` reports what is durable now; a cut, and a SAVE of the REPL state (a fence, `led`, the commit floor), are durable before the next action. | mutant 22 (a raised fence not saved), seed 1, caught by the simulator's check that nothing is sent before an outstanding SAVE |
+| 10 | §8.2, §13.1 | What a cut may remove: a replica that has not heard of epoch e+1 and still follows e's deposed leader may cut records that e+1 committed (its leader came from e's ISR without the old leader's tail). Harmless, since it is not in e+1's ISR and cuts again by e+1's history; the property is "a cut never removes an acknowledged record, nor one committed in the cutter's epoch or earlier". | 8 seeds of the 1M-seed soak on 44b352b (43308, 200636, 294653, 478816, 570201, 653518, 756115, 903046), all "node X cuts committed record"; the checker was too strict, fixed in 13081cc (repl.c unchanged), and the 8 seeds run in `sim_repl.sh quick` |
+| 11 | §6.2 step 2 | The promoted ISR keeps **every fenced member that did not answer, the old leader included** (it holds every committed position), marked `unanswered`; the new leader drops one that has not acknowledged within a few round trips (`unanswered_ms`), not after `isr_lag_ms`. Dropping the old leader stranded the volume when the promoted member then lost its disk although the old leader held every acknowledged write. D1's operator wait is then reached only after a leader's own shrink. | review of cluster-s2, seed 76; mutant 34 (the old promotion), seed 35; mutant 37 (no drop) in `test_repl unanswered`; stranded in 1.1% of runs, about 4% with slow syncs |
+| 12 | §4.2 | The core does not trust the driver's sync end: a sync issued before a cut that finishes after the replica wrote those positions again (from a new leader) does not cover them. The core keeps the written end at issue, lowered by cuts; durable = min(end, sync end, written). | mutant 35, seed 10 (naive driver); `test_repl sync_cut` |
+| 13 | §8.1 steps 3-4, §8.3 | **The snapshot path is part of the core**: the log is [start, end]; a position below start is "not retained" (never an error); the leader tells such a replica to install a snapshot (repeated until it catches up; a replica that already has the position answers with an ACK); a replica installs the leader's applied state P only if P is above its log end and reopens with start P+1. Segments are deleted only at or below the saved commit floor. Without it one returning replica fail-stopped every leader in turn. | mutant 36, seed 1; seeds 75881, 3865, 25133 (a stale notice that stalled); `test_repl trim`, `cut_applied` |
+| 14 | §4.3, §8.5 | **Restored directories.** A replica directory restored from a backup or a ZFS snapshot keeps its rid but rolls back `led`, its log and its fence: it could lead an epoch a second time, be promoted with fewer records, or have the leader count ACKs it no longer holds. Decided: a restore is a lost disk (the operator rule), enforced where the system can see it by an open generation registered with the metadata group (§8.5). | review of cluster-s2, seed 6 (the double lead); the rest is reasoning, not yet simulated; the core now fails a follower that sees two records of one epoch at a position |
+| 15 | §6.2, D1 | The wait for an operator after a leader's own shrink: the metadata group cannot tell whether the lone leader acknowledged anything after the shrink, so promoting the dropped member is an unclean election (D1 holds). Stated in §6.2, with the safe case (nothing acknowledged after the last shrink); a shrink's `ISR_CHANGE` carries the leader's commit point so `force-leader` can show which replicas hold everything up to it. | 1M-seed soak of 9f2cf49, seeds 299557 and 436347; about 0.5% of simulated runs end in this wait, all after a shrink |
+
+What these ask of build step 1's metadata state machine (rids in the ISR, `unanswered`, promotions conditional on the
+ISR version, an uncapped epoch history, replica open generations, resignations, the commit point in a shrink) is
+listed with the other amendments of the running cluster-s1 track in [design-ha-modes.md](design-ha-modes.md) §7.1,
+items 15-22.
+
 ## 1. Words and roles
 
 - **Server** (node): one `tsdbd --cluster` with its own disks, a node id and an advertised address.
@@ -133,8 +178,8 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 | Item | Content | Size |
 |---|---|---|
 | Cluster | uuid, format version, settings (replication factor, minimum ISR, timeouts, throttles) | < 1 KB |
-| Members | node id, advertised address, peer address, rack, disks, state (up, down, draining, out), incarnation | about 200 bytes a server |
-| Volumes | number, name, uuid, replicas (node, disk, state: learner or member), preferred leader, current leader, epoch, ISR, ISR version, epoch history (epoch → first position) | about 100 bytes plus 16 per epoch; 128 volumes: about 20 KB |
+| Members | node id, advertised address, peer address, rack, power feed (M20 of design-ha-modes.md), disks, state (up, down, draining, out), incarnation | about 200 bytes a server |
+| Volumes | number, name, uuid, replicas (node, disk, instance id `rid`, open generation, state: learner or member), preferred leader, current leader, epoch, ISR as (node, rid) pairs with an `unanswered` mark per member, ISR version, epoch history (epoch → first position, every epoch back to the oldest a replica may still hold; *corrected 2026-11-06, gaps 3, 7, 11, 14*) | about 150 bytes plus 16 per epoch; 128 volumes: about 25 KB |
 | Name slots | 65,536 entries: home volume, and the earlier homes of a slot that moved | 128 KB plus history |
 | Users | design-auth.md's records (verifiers, grants) | about 200 bytes a user |
 | Cold tier | its kind and settings (§9) | < 1 KB |
@@ -146,11 +191,13 @@ and one entry with every affected volume's new leader and ISR. An ISR change, a 
 one entry each. Tens of entries a minute at worst, against a core that commits thousands a second.
 
 **What it does not store**: rows, positions, commit points, part lists, series. Those change a million times a second
-and stay with the volumes.
+and stay with the volumes. (Two positions do go in, each written only with a rare entry: an epoch's first position
+in the epoch history, and the leader's commit point in a shrink of the ISR, gap 15, §6.2.)
 
 ### 2.2 How it runs
 
-- Voters: the first 5 servers by default, on 5 different racks when there are 5. If a voter is down for
+- Voters: the first 5 servers by default, on 5 different racks and power feeds when there are 5 (power feeds since
+  2026-11-06, design-ha-modes.md M20; a member records both, `--rack` and `--power-feed`). If a voter is down for
   `voter_replace_s` (10 min), the Raft leader replaces it with a healthy server: added as a Raft learner, promoted
   when caught up, then the old voter removed (the core's `raft_change`). So the group survives losses one after
   another, not just two at once.
@@ -169,7 +216,9 @@ The core (intellistream-objects `src/raft`, read at c9c938e9) is a fit:
 
 - **Sans-IO.** `raft_step`, `raft_tick`, `raft_propose` go in; `raft_next_action` hands out what to do, in a safe
   order: save the hard state, sync the log, send, apply, restore a snapshot. tsdbd's peer event loop drives it; the
-  log syncs run on a worker, as isod does (`raft_log_sync_prepare` / `raft_log_sync_run`).
+  log syncs run on a worker, as isod does (`raft_log_sync_prepare` / `raft_log_sync_run`), so heartbeats and the
+  watch never wait for a disk; a leader whose own sync is outstanding for 2 s hands leadership on. In shared mode
+  (design-ha-modes.md M11) the log is on a local disk only, never NFS, and a log fault ends only the voter role.
 - **The log store** (`raft_log.c`): 64 MiB segments in `<data>/meta/raft/`, checksummed records, a two-slot hard
   state, and the durable floor that tells a torn tail from rot in an acknowledged record. That matches tsdb's own rule
   "damage is never silent" (AGENTS.md).
@@ -241,8 +290,16 @@ is cut.
   - **Lookup by name**: one request to the home volume's leader; it answers from SERIES or the slot index, and asks the
     earlier homes of a slot only if the slot moved.
   - **Slot moves**: when volumes are added, the Raft leader moves some slots to them so new series spread there too.
-    During a move, creations in that slot pause for one metadata commit; existing series stay where they are, and the
-    new home asks the old one for names it does not know.
+    Existing series stay where they are, and the new home asks the old one for names it does not know. A move is
+    two-phase (design-ha-modes.md M19, verification of 2026-11-06): the old home's leader stops creating in the slot
+    under its creation lock and commits `SLOT_FREEZE(s, A, e_A)`, conditional on its epoch; only then does the Raft
+    leader commit `SLOT_MOVE(s, B)`, and a frozen slot answers creations with MOVED. The first form ("creations pause
+    for one metadata commit") needed the old home to have seen that commit: a leader of A with a lagging watch could
+    finish a creation after B had asked A and created the same name.
+- **Shared mode differs** (design-ha-modes.md M14, §5.7): its volumes sit on NFS pools that can roll back and be away
+  for hours, so it keeps no slot index of other volumes' series. A series is created only in its slot's current home,
+  a slot's earlier homes are a chain in the metadata, and a lookup asks them in turn. Everything below holds for
+  replicated mode.
 - A creation in V and its slot record are two commits in two volumes. The home leader records the name first (a
   reservation with `id = 0`), creates in V, then records the id; a crash in between leaves a reservation that the next
   creation of that name resolves by asking V. The name never exists in two volumes.
@@ -299,12 +356,35 @@ Consequences:
 - In sync mode today, a row is visible once the WAL is synced up to it. The cluster replaces "synced" by
   "committed": the same `visible` boundary in `mt_collect`, fed by the commit point instead of `wal_durable`.
 
+**Driver contracts** (*corrected 2026-11-06, gaps 9 and 12*). The replication core is sans-IO; the engine (step 3)
+and tsdbd (step 4) that drive it must keep three rules, which the simulator's naive driver breaks on purpose:
+- `repl_synced` reports what is durable **now**, after any cut since the sync was issued, never what the sync covered
+  when it started.
+- A cut (the WAL `ftruncate` and its directory sync) and a SAVE of the REPL state (a raised fence, `led`, the commit
+  floor) are durable before the driver carries out the next action the core hands it (mutant 22, seed 1).
+- The core does not trust the driver's sync end anyway: a sync issued before a cut that finishes after the replica
+  wrote those positions again (from a new leader) does not cover the new records. The core keeps the written end at
+  the time the sync was issued, lowers it at each cut, and counts as durable min(log end, that end, written end). A
+  slow `fdatasync` and a fast round trip make it real (mutant 35, seed 10; `test_repl sync_cut`).
+
 ### 4.3 The REPL file
 
 One per replica directory, two checksummed 4 KiB slots written alternately (like the Raft hard state): the volume
-uuid, the cluster uuid, this replica's node id and incarnation, the **epoch history** (epoch → first position, the
-last 64 epochs), the commit floor, and the highest epoch this replica has seen (its fence, §6.3). Written with
-`fdatasync` before the replica acts on a new epoch.
+uuid, the cluster uuid, this replica's node id and incarnation, its **instance id** (`rid`), its **open generation**,
+the **epoch history** (epoch → first position), the log start (the first retained position, §8.3), the commit
+floor, the highest epoch this replica has seen (its fence, §6.3), and `led`, the highest epoch it has led. Written
+with `fdatasync` before the replica acts on a new epoch.
+
+*Corrected 2026-11-06* (gaps 3, 4, 7, 13, 14):
+- **`rid`**: 64 bits, never 0, drawn when a directory is made fresh (a new replica, a replaced or wiped disk, a
+  rebuild); it never changes for the life of the directory. The ISR names it (§2.1); fence replies and ACKs carry it.
+- **`led`**: a replica that finds it led the current epoch before a restart never resumes it (§6.1).
+- **The epoch history** reaches back to the oldest epoch whose records this replica still holds (its log start), not
+  a fixed count: the leader answers a returning replica's last epoch from its own history (§8.2), and that replica
+  may hold any epoch back to its oldest retained segment. Where the history outgrows a slot, the oldest entries below
+  the log start are dropped (16 bytes per epoch: a 4 KiB slot holds about 200).
+- **The open generation** is raised at every open and registered with the metadata group before the replica takes
+  part (§8.5).
 
 ## 5. The write path
 
@@ -425,14 +505,36 @@ at once; the Raft leader sees the volume reported failed in the next heartbeat a
 - A tsdbd that hangs but keeps its sockets open stops heartbeating (heartbeats come from the event loop, which also
   serves the volumes), so it is treated as down. A slow disk shows as a replica falling behind: ISR removal, not
   failover.
+- **A leader that restarts never resumes the epoch it led** (*corrected 2026-11-06, gap 4*; mutant 5, seed 1). The
+  records it sent in epoch e may have outlived its own unsynced log, so a second incarnation leading e would write
+  other records at the same (position, epoch) as copies its followers already hold. Its REPL says `led = e`; on
+  open it **resigns** (`RESIGN(v, e)` to the metadata group) and follows; the metadata group promotes as for a dead
+  leader (§6.2), at e+1, and the restarted server may be chosen again under the new epoch. It happens before the
+  node timeout would, so a quick restart costs one promotion, not 3 s.
 
 ### 6.2 Promotion
 
 For a volume whose leader is down:
-1. The Raft leader sends `FENCE(volume, epoch e+1)` to every ISR member it can reach. Each writes e+1 as its fence in
-   REPL (fdatasync), refuses every record of epoch e from then on, and answers its log end.
-2. It picks the member with the highest log end (ties: the preferred leader) and commits `(leader, epoch e+1, ISR =
-   the members that answered)` to Raft.
+1. The Raft leader sends `FENCE(volume, epoch e+1)` to every ISR member it can reach, noting the record's epoch e
+   and ISR version as the basis. Each writes e+1 as its fence in REPL (fdatasync), refuses every record of epoch e
+   from then on, and answers its log end, its last epoch and its `rid`.
+2. Among the replies whose `rid` matches the ISR's entry for that node, it picks the member with the highest log end
+   (ties: the preferred leader) and commits `(leader, epoch e+1, ISR)` to Raft, **conditional on the record still
+   having epoch e and the basis ISR version**. The new ISR is the members that answered **and every fenced member
+   that did not, the old leader included**, the latter marked `unanswered`: each of them holds every committed
+   position. The new leader drops an `unanswered` member that has not acknowledged within a few round trips
+   (`unanswered_ms`, a few round trips: milliseconds), by an ordinary ISR change, so a dead old leader holds the
+   commit point that long and not `isr_lag_ms`.
+
+   *Corrected 2026-11-06* (gaps 3, 5, 8 and 11). The first form, "ISR = the members that answered", let slow replies
+   shrink the ISR to one copy (seed 183 of an early configuration; mutant 14, the old rule, killed at seed 25), and
+   dropping the old leader stranded a volume whose promoted member then lost its disk although the old leader held
+   every acknowledged write (review seed 76; mutant 34, seed 35; 1.1% of simulated runs, about 4% with slow syncs).
+   Without the ISR version in the condition, an ISR change the deposed leader got committed after the fences went
+   out (dropping a fenced member, then committing without it) was undone by the promotion (mutant 10, seed 1103).
+   Without the `rid` check, a wiped disk that answered the fence with log end 0 could be promoted (mutants 13 and
+   11+13, seed 1). With these rules D1's wait for an operator ("all ISR members down") is reached only after a
+   leader's own shrink of the ISR, never after a promotion.
 3. The new leader writes an `EPOCH` marker as its first record (a new segment `(e+1) << 40 | 0`), keeps every record
    it has (the old epoch's tail included, as Raft does), and sends it all to the other ISR members. When they have it,
    the commit point passes the old tail and the tail is committed.
@@ -441,6 +543,17 @@ For a volume whose leader is down:
 If no ISR member answers (all down), the volume waits: UNAVAILABLE(NO_OWNER) to clients, an alert, and a promotion
 as soon as an ISR member returns. An operator can force an unclean promotion of a non-ISR replica
 (`tsdb cluster volume force-leader`), which may lose acknowledged writes and says so.
+
+*Corrected 2026-11-06 (gap 15; the 1M-seed soak of 9f2cf49, seeds 299557 and 436347: about 0.5% of simulated runs
+end in this wait, all after a shrink).* The wait is reached after a leader's own shrink: the leader asks to shrink the
+ISR to itself, loses its disk, and the metadata group applies the shrink (or applies it and then promotes the same
+one-member set on a fence reply the old instance sent before the loss). The former member that was dropped may still
+hold every acknowledged write, but the metadata group cannot tell whether the leader acknowledged anything alone
+after the shrink, so promoting it is an unclean election and D1's wait holds. An unclean promotion is safe exactly
+when no write was acknowledged after the last shrink. To let the operator judge that, **a shrink's `ISR_CHANGE`
+carries the leader's commit point when it asked**, and `force-leader` (and `tsdb cluster status`) shows, per
+remaining replica, whether its log end reaches that point: a replica that does holds everything acknowledged before
+the shrink, and only writes acknowledged by the lone leader afterwards can be lost.
 
 Time to writes again: 3 s detection + about 10 ms for fencing, a Raft commit and the first record + the clients'
 TOPOLOGY refresh. About 4 s in total for the volumes the server led. Other volumes see only the ISR shrink (§6.1,
@@ -451,8 +564,17 @@ under 1 s of waiting).
 Claim: a write is acknowledged only if every member of the volume's ISR, as Raft records it when the leader computes
 the commit point, has it durable; and every new leader is chosen from that ISR.
 
-- A leader L of epoch e acknowledges a record only when every ISR member it knows has acknowledged it, or after
-  Raft committed a smaller ISR. Raft accepts an ISR change only if it names the volume's current epoch and ISR version.
+*Corrected 2026-11-06 (gap 6; mutant 2, which drops the epoch check altogether, was caught only at seed 1905, through
+a cut below the applied end).* What makes acknowledged writes safe is the second and third bullets below: the new
+leader was in L's ISR, and it **keeps every record it has**. The fence (a fenced replica refusing epoch e's records)
+is not what keeps acks safe; it keeps the followers of epoch e+1 from taking records of the deposed leader into a log
+that the new epoch's commit point then counts, which would corrupt them. Both are needed; only the first is the
+argument for acknowledged writes.
+
+- A leader L of epoch e acknowledges a record only when every ISR member it knows has acknowledged it (an ACK names
+  the member's `rid`, which must match the ISR's, gap 3), or after Raft committed a smaller ISR. Raft accepts an ISR
+  change only if it names the volume's current epoch and ISR version, and a promotion only if it names the epoch and
+  ISR version its fences were sent for (gap 8).
 - After the Raft leader decided epoch e+1, (a) any ISR change L asks for names e and is refused, and (b) the new
   leader N was in L's ISR, so L needs N's acknowledgement. N stops accepting epoch e records the moment it is fenced
   (step 1), before its log end is taken as the start of e+1. Whatever N acknowledged to L is in N's log, and N keeps
@@ -516,7 +638,7 @@ client's final value.
 | Leader partitioned from its replicas only | Leadership moves to a replica (§6.1) | about 1 s | the move is a Raft commit and a fence |
 | Replica partitioned from its leader only | ISR shrink; it rejoins when the partition heals | up to 1 s | §8.2 |
 | Raft leader lost | The voters elect a new one (election timeout 1-2 s); it waits one lease before declaring anyone down | none for writes; failovers delayed by about 3 s | Raft |
-| Three metadata voters lost | No failovers, no ISR changes; writes go on while ISRs answer | only for volumes that need an ISR change | nothing can be decided without a quorum |
+| Three metadata voters lost | No failovers, no ISR changes; writes go on while ISRs answer; **leader reads stop** within `lease_ms` (§7.1: only the Raft leader's heartbeat answers extend the read lease), `REPLICA_OK` reads go on | only for volumes that need an ISR change | nothing can be decided without a quorum |
 | A paused leader resumes | Its records of the old epoch are refused | none | §6.3 |
 | Clock jumps or drifts beyond A5 | A deposed leader may serve reads past its lease | none | writes do not use clocks (C13) |
 | Disk full on a replica | Fail-stop for that replica (ENOSPC on the WAL is fail-stop); ISR shrink | up to 1 s | §5.7 |
@@ -530,7 +652,9 @@ A leader serves reads while it holds a **lease**: each heartbeat answer from the
 `send time + lease_ms × (1 − drift)` on the leader's monotonic clock (`lease_ms` 2 s, drift from A5). The Raft leader
 does not promote another leader for the volume before `lease_ms × (1 + drift)` after the last answer it gave, and
 `node_timeout` (3 s) is longer than the lease anyway. A leader whose lease ran out answers reads with UNAVAILABLE and
-retry, and the client refreshes TOPOLOGY.
+retry, and the client refreshes TOPOLOGY. So while the Raft majority is lost, no leader reads are served after
+`lease_ms`, though writes go on (§6.7); clients that accept it read with `REPLICA_OK` (§7.2). A read lease granted by
+the ISR instead, which would keep leader reads going, is under "Later".
 
 Leader reads see every acknowledged write (C7): read-your-writes, and monotonic reads within a session as long as
 the leader does not change. After a failover the new leader has every acknowledged write, so it stays so.
@@ -567,11 +691,27 @@ copies; the Pulsar sink and anything that reads after writing stay on leaders.
 2. **Transfer** on the bulk link, throttled by a token bucket per server for sending and for receiving
    (`rebuild_mb_s`, 200 MB/s by default; 2 rebuilds at once per server), checked with xxh64 per file and each part's
    own checksums.
-3. **Open** the copy as a replica at P (META with this replica's identity, REPL with the epoch history up to P).
+3. **Open** the copy as a replica at P (META with this replica's identity and a fresh `rid`, REPL with the epoch
+   history up to P and log start P+1).
 4. **Catch up** from the leader: the log from P+1, from retained segments (§8.3). If the leader no longer has P+1, take
    a new snapshot: only parts not yet copied travel (by name and checksum).
-5. **Join**: when the learner's log end has reached the commit point and stays within `isr_lag_ms`, the leader asks
-   Raft to add it to the ISR (conditional on epoch and ISR version, like a removal).
+5. **Join**: when the learner's log end has reached the commit point **and the start of the leader's current epoch**
+   (its `EPOCH` marker), and stays within `isr_lag_ms`, the leader asks Raft to add it to the ISR (conditional on
+   epoch and ISR version, like a removal), and **counts it as an ISR member from the moment it asks**: its commit
+   point waits for the learner from then on, whether or not the change has committed yet.
+
+*Corrected 2026-11-06.* Step 5 (gaps 1 and 2): right after a failover the new leader's commit point starts at what it
+had applied, below its predecessor's, so "reached the commit point" let a learner join that lacked positions the old
+epoch had committed (mutant 12, seed 18; Kafka's leaderEpochStartOffset rule); and a leader that kept counting
+without the joining replica until the change committed could commit positions in between that the new ISR member
+lacks, so the metadata recorded an ISR member missing a committed position (mutant 6, seed 1: "ISR member 1 lacks
+committed position 1518"). Steps 3-4 (gap 13): the snapshot path is part of the replication core, not only of
+rebuild. A replica's log is [start, end]; a position below start is "not retained", never an error; a leader that
+finds a replica's next position not retained tells it to install a snapshot (a message, repeated until the replica
+catches up; a replica that already has the position answers with an ACK, so a stale notice cannot stall it); the
+replica installs the leader's applied state P only if P is above its own log end, and reopens with start P+1.
+Without it one returning replica fail-stopped every leader in turn (mutant 36, seed 1; seeds 75881, 3865 and 25133
+for the stale notice; `test_repl trim`, `cut_applied`).
 
 ### 8.2 A returning replica
 
@@ -582,7 +722,19 @@ A replica back after an outage or a restart:
    deleted), deletes pending files that only cut markers named, and syncs. Nothing listed is ever cut (C7).
 3. Catches up as a learner from there (§8.1 step 4), and rejoins the ISR.
 
-A former leader goes through the same steps; its unacknowledged tail is what gets cut.
+A former leader goes through the same steps; its unacknowledged tail is what gets cut. The cut asks again until
+nothing more is cut (the leader answers with the largest epoch of its history not above the replica's last epoch and
+that epoch's last position; the replica cuts after the smaller of that and the end of the same epoch in its own log,
+KIP-279), and a cut below the applied end is never made: the core fails instead (damage or a bug, never silently).
+
+**What a cut may remove** (*corrected 2026-11-06, gap 10*; 8 seeds of the first 1M-seed soak, 200636 among them).
+A replica that has not yet heard of epoch e+1 and still follows epoch e's deposed leader cuts by that leader's history,
+and can remove records that e+1 committed: e+1's leader came from e's ISR without the old leader's tail, so e's
+records at those positions differ from e+1's. That is harmless: such a replica is not in e+1's ISR, and cuts again by
+e+1's history when it learns of it. So the property is **a cut never removes an acknowledged record, nor one committed
+in the cutter's epoch or earlier**; "a cut never removes a committed record" is false. The engine (step 3) must
+therefore not treat such a cut as damage, and a replica's commit floor never covers what it cuts (the core refuses a
+cut below the applied end).
 
 ### 8.3 Retained segments
 
@@ -590,6 +742,11 @@ The leader keeps sealed WAL segments of each volume after they are in parts, for
 `repl_retain_mb` per server (4 GB by default, split over its volumes by write rate) and at most 30 min. The change feed
 of design-cdc.md retains segments the same way (`fwal_` names); one mechanism serves both. A replica away for longer
 than that, or than the budget, gets a snapshot.
+
+*Corrected 2026-11-06 (gap 13).* Every replica, the leader included, deletes a segment only at or below its **saved**
+commit floor (the one in REPL, not the one in memory), and records its new log start in REPL; a replica whose next
+position the leader no longer retains is told to install a snapshot (§8.1). A segment deleted above the saved floor
+could leave a replica that restarts unable to rebuild what it had applied.
 
 ### 8.4 Priorities
 
@@ -606,6 +763,24 @@ Time: a server's hot replicas are rebuilt on all the others at once. With 2 TB o
   rebuild the partition: the source sends its parts of that partition key as of a position, and the replica swaps
   them in under `publish_lock` (the cold move of §9 uses the same swap).
 - A replaced disk: the replicas on it are learners again and are rebuilt (§8.1), on the same server or elsewhere.
+  Each gets a new `rid` (gap 3): its old entry in the ISR does not match it, so it is neither counted nor promoted
+  until it has caught up and joined again.
+- **A restored replica directory** (*decided 2026-11-06 in this revision, gap 14; the user may change it*; review
+  seed 6 of cluster-s2, the rest reasoning).
+  A directory restored from a backup or a ZFS snapshot keeps its `rid` but rolls back `led`, its log and its fence:
+  it could lead an epoch a second time, be promoted with fewer records than it acknowledged, or let a leader count
+  ACKs it no longer holds. The rule: **a restore is a lost disk**. The operator gives a restored directory a new rid
+  (`tsdb cluster replica reset V`, which makes it a learner) or, better, lets the replica be rebuilt. Where the
+  system can see a restore, it enforces the rule: REPL holds an **open generation**, raised (and synced) at every
+  open and registered with the metadata group (`REPLICA_OPEN(v, node, rid, gen)`, conditional on gen being above the
+  recorded one) before the replica answers a fence, sends an ACK or leads; a directory whose generation is below the
+  record's is refused at open with a message that names both. That catches a restore of any copy taken before the
+  replica's last open. It cannot catch a copy of the running directory restored before the next open (the copy then
+  carries the current generation), which is why the rule is the operator's: replica directories are never restored
+  in place; backups serve disaster recovery of the whole cluster (`tsdb cluster restore`, design-ha-modes.md §8.1).
+  The core fails a follower that sees two records of one epoch at one position, so a double lead is never silent.
+  Rejected: fencing only "epoch e was started" in the metadata group, which stops the double lead but neither the
+  promotion of a rolled-back copy nor ACKs it no longer holds. The simulator gains a restore fault in R1's next round.
 
 ## 9. The boundary to a cold tier
 
@@ -754,6 +929,14 @@ applies to memory as to the rest.
   Checks after every event: every acknowledged position is durable on every ISR member; no replica applies past the
   commit point; replicas' applied logs are prefixes of one another; a cut never removes an acknowledged position.
   Thousands of seeds in `make test`, millions in a soak.
+  *As built (step 2, 9f2cf49; corrected 2026-11-06, gap 10):* the cut check is "a cut never removes an acknowledged
+  record, nor one committed in the cutter's epoch or earlier" (a stronger "never a committed one" is false, §8.2);
+  added are: at every OK, at least `min_isr` durable copies; no wait for an operator while some replica holds every
+  acknowledged write and the ISR was last set by a promotion (gap 11); nothing sent while a SAVE is outstanding; an
+  intact ISR member checked after every cut. Faults include disk wipes, slow syncs, a naive sync driver (gap 12) and
+  trimming with snapshots (gap 13). Every planted mutant is killed (`make sim-repl-mutants`); the soak runs 1,000,000
+  seeds, and the waits for an operator it ends in (about 0.5% of runs, all after a leader's shrink) are gap 15's.
+  Still to add: a restored directory (gap 14).
 
 ### 13.2 Jepsen, extended (`make jepsen-cluster`)
 
@@ -808,6 +991,41 @@ Each step is a track (build, adversarial review, fixes) with the gates of AGENTS
 
 About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, which brings it to about 5 months.
 
+**With two HA modes (2026-11-06, D3).** The plan above is replicated mode's. The combined plan of both modes, with
+estimates, is [design-ha-modes.md](design-ha-modes.md) §7; how this plan's steps map into it:
+
+- **A deployment runs one mode** (`tsdb cluster init --mode`, design-ha-modes.md M7); there is no mixed step.
+- **Shared by both modes** (built once): step 0 (S0, which also defines every wire body the HA work needs before the
+  1.0 freeze, and the namespace-event payloads shared by the ledger and this design's markers, design-ha-modes.md
+  §2.1), step 1 (S1, extended with shared volumes, §7.1 there), the part of step 4 that is peer links, TOPOLOGY and
+  forwarding, and users in the metadata group from step 5 (S2; per-volume admission is built once, in ha.md's N1,
+  which does not wait for the N0 probe), the rest of step 5 (S4, name slots with two-phase moves), step 6 (S3, clients
+  and the Pulsar sink), step 8 (X1, the cold boundary) and step 9 (X3).
+- **Replicated mode only**: step 2 (R1), step 3 (R2: the engine's replica mode, and the marker backend of the journal
+  hook that N4 builds), the rest of step 4 (R3: replication, ISR, promotion, leases), step 7 (R4, rebuild).
+- **Order: shared mode ships first**, because production runs on NFS today: the N0 probe on the production NFS
+  servers, then the shared-mode engine and HA manager on the metadata group; replicated mode's R2-R4 after it. R1
+  (step 2) continues in parallel: it is sans-IO and blocks nothing. The estimates there are in track-days, gate hours
+  and external dependencies, calibrated on the first checkpoints of steps 1 and 2.
+- **What steps 1 and 2 already give shared mode.** Step 1 (`cluster-s1`, 35e1456 and ede84e5: the Raft core,
+  `server/meta.c` with members, volumes, leader, epoch, ISR, epoch history, name slots and users, epoch-conditional
+  operations, snapshots, the step checker, the simulator, tsdbd's peer thread and the CLI) serves shared mode as it is:
+  an owner change is `META_OP_VOLUME_LEADER`, with the candidates as the ISR. It must change before its formats settle
+  (design-ha-modes.md §7.1): an extensible heartbeat body, heartbeats on a thread with no Raft log I/O and syncs on a
+  worker (as §2.3 above already says), step-down on a stalled sync, the state directory on a local disk, a voter-role
+  fault instead of `_exit` in a shared-mode deployment, the shared-volume operations, and (from the verification of
+  2026-11-06) voter eligibility flags with replacement by Raft progress rather than heartbeats heard, `--witness`,
+  metadata copies persisted on every member, reserved epochs and slot freezes. Slot freezes and the progress-based
+  voter replacement apply to replicated mode as well. Step 2 (`cluster-s2`,
+  44b352b: the replication core) gives shared mode nothing it needs, only the method of a sans-IO core under a
+  simulator, which the shared-mode HA manager copies.
+- **Amendments the running cluster-s1 track must take** are kept in one list, design-ha-modes.md §7.1 (items 1-22):
+  those of the HA modes' review and verification, those from the user's answers of 2026-11-06 (power feeds for voter
+  placement, the `failover` and `read_barrier` settings), and those from step 2's simulator ("Corrections from step
+  2's simulator" above: replica instance ids in the ISR, `unanswered` members, promotions conditional on the ISR
+  version, an uncapped epoch history, replica open generations, resignations of a restarted leader, the commit point
+  in a shrink). Steps 3 and 4 take the driver contracts of §4.2 and the join, snapshot and cut rules of §8.
+
 ## Later
 
 - **The cold tier itself.** intellistream-objects (`isod`, at c9c938e9) is the user's distributed, erasure-coded
@@ -820,12 +1038,21 @@ About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, whic
 - Rebuilding a returning replica partially, from the part position ranges, when its absence outlived the retained WAL.
 - A rolling upgrade protocol for the peer links.
 - A local cache of cold granules on replicas.
+- A read lease from the ISR rather than the Raft leader, so that leader reads go on while the Raft majority is lost:
+  each ISR member promises the leader not to answer a FENCE for a higher epoch until `lease_ms × (1 + drift)` after its
+  last ack, and a promotion waits those promises out. It changes §6.2's promotion and is worth it only if quorum loss
+  turns out to happen (verification of 2026-11-06, design-ha-modes.md).
 - Reads across volumes at one instant, if a user needs them.
 
 ## Open questions
 
-None. The six questions of the first draft were answered on 2026-11-06 and are decisions D1-D6 at the top of this
-document.
+None for this mode. The six questions of the first draft were answered on 2026-11-06 and are decisions D1-D6 at the
+top of this document. The questions about the two modes together (voters and witnesses on nodes without data disks,
+the order, the N0 window, placement of names in shared mode, the read barrier, escalation of a stuck release) are in
+[design-ha-modes.md](design-ha-modes.md); they were answered on 2026-11-06 (M20-M25 there). Of those, two touch this
+mode: voters go on servers in different racks and power feeds (M20; here every server has its own disks, so §2.2's
+rule gains the power feed), and prefix groups of names (M23) are built in S4 for both modes, with hash over all
+volumes staying the default of §3.3.
 
 ## Unverified assumptions
 
