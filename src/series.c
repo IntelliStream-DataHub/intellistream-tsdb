@@ -308,7 +308,7 @@ int series_reload(series_dict *d, int dirfd)
 void series_close(series_dict *d)
 {
     uint32_t n = atomic_load(&d->count);
-    for (uint32_t i = 0; i < n; i++)
+    for (uint32_t i = 0; !d->keep_names && i < n; i++)
         free(d->names[i]);
     free(d->names);
     free(d->types);

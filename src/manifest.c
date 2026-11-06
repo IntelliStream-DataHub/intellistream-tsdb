@@ -36,8 +36,6 @@
 #define MANIFEST_FILE "MANIFEST"
 #define RETIRED_PREFIX "retired_"
 
-static int64_t now_s(void) { return (int64_t)time(NULL); }
-
 static int64_t mono_ms(void) { return eng_mono_ms(); }
 
 /* How long a follower lets something look damaged before it reports it: a
@@ -143,19 +141,20 @@ void db_retire_locked(eng *db, part *p)
         if (db->ngraveyard < db->graveyard_cap) {
             graveyard_entry *e = &db->graveyard[db->ngraveyard++];
             snprintf(e->name, sizeof e->name, "%s", retired);
-            e->deadline = now_s() + db->opt.obsolete_part_lifetime_s;
+            e->deadline = mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000;
         }
         /* an unrecorded one is collected at the next open */
     }
     db_parts_remove_locked(db, p);
 }
 
-/* Deletes retired parts whose lifetime is over (or all of them). */
+/* Deletes retired parts whose lifetime is over (or all of them). The lifetime runs on the monotonic clock: a step of
+ * the wall clock must not delete a part early that a follower on another host still reads (docs/ha.md, B6). */
 void graveyard_purge(eng *db, bool all)
 {
     if (eng_check(db))
         return; /* a failed engine writes nothing more; the next open collects them */
-    int64_t now = now_s();
+    int64_t now = mono_ms();
     pthread_mutex_lock(&db->lock);
     size_t kept = 0;
     for (size_t i = 0; i < db->ngraveyard; i++) {

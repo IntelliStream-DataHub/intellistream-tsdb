@@ -1036,7 +1036,9 @@ int intents_recover(eng *db)
     struct dirent *e;
     bool any = false;
     int rc = 0;
-    while (rc == 0 && (e = readdir(d))) {
+    /* readdir returning NULL with errno set is a read error, never the end: an intent skipped would leave a
+     * half-committed insert (ha.md 15.5, "damage is never silent") */
+    for (errno = 0; rc == 0 && (e = readdir(d)); errno = 0) {
         if (!intent_file_name(e->d_name))
             continue; /* only the names parts_commit writes: a user's txn_* file in a volume is not read, nor deleted */
         int fd = openat(db->dirfd, e->d_name, O_RDONLY | O_CLOEXEC);
@@ -1088,6 +1090,10 @@ int intents_recover(eng *db)
                 rc = TSDB_ERR_IO;
             any = true;
         }
+    }
+    if (rc == 0 && errno != 0) {
+        fprintf(stderr, "tsdb: reading the directory failed: %s: the open fails\n", strerror(errno));
+        rc = TSDB_ERR_IO;
     }
     closedir(d);
     if (rc == 0 && any && db->opt.fsync && tsdb_fsync(db->dirfd) != 0)
