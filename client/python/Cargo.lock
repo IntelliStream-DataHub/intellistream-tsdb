@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "intellistream-tsdb-client"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "hmac",
  "intellistream-tsdb-sys",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "intellistream-tsdb-sys"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "cc",
  "zstd-sys",
@@ -424,7 +424,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tsdb-client-python"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "intellistream-tsdb-client",
  "numpy",

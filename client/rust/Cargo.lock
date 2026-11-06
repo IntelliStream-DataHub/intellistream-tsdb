@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "intellistream-tsdb-client"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "hmac",
  "intellistream-tsdb-client",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "intellistream-tsdb-sys"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "cc",
  "zstd-sys",

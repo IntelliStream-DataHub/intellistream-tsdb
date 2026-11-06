@@ -251,7 +251,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `TSDB_ERR_NOTFOUND` for lookups). A 32-bit variable, `%u`, Java `int`, Rust `as u32` or Python `"I"` that holds an
   id is a bug that tests with ids above 2^32 find; row files of the benchmarks keep a u32 series NUMBER that indexes
   the bench's table of ids, never an id. Ids are never reused and mean nothing in another database (export and
-  import name series, not ids). `tsdb_abi_version` (3 in 0.9.0) changes when the C structs or signatures the bindings use change.
+  import name series, not ids). `tsdb_abi_version` (3 in 0.9.0 and 0.9.1) changes when the C structs or signatures the bindings use change.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
   only into partitions without a part from that segment.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
@@ -386,7 +386,7 @@ cgroup, so `nice` does not keep your work out of its way.
   lock is taken under either; a user's rights index is built before it is shared and read without a lock.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
-- **Versions.** The release version is the file `VERSION` (0.9.0); `tools/check-version.sh` compares it with
+- **Versions.** The release version is the file `VERSION` (0.9.1); `tools/check-version.sh` compares it with
   `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.

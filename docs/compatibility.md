@@ -6,13 +6,17 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 
 | | where | now |
 |---|---|---|
-| release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.9.0 |
+| release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.9.1 |
 | disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 8 |
 | wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 12 |
 | oldest protocol spoken (the floor) | `TSDB_PROTOCOL_MIN` in `include/tsdb_protocol.h` | 12 |
 | embedded C ABI version | `TSDB_ABI_VERSION` in `include/tsdb.h`, `tsdb_abi_version()` | 3 |
 
-0.9.0 reads databases of disk format 8 only, and speaks to clients and servers of protocol 12 only.
+0.9.1 reads databases of disk format 8 only (so did 0.9.0), and speaks to clients and servers of protocol 12 only.
+
+0.9.1 changed neither the disk format nor the protocol, and the C ABI is still 3: it only added functions and structs
+(`tsdb_latest`, the volume and health calls) and the status codes `TSDB_ERR_UNAVAILABLE` (-11) and
+`TSDB_ERR_ABANDONED` (-14); no existing struct or signature changed. A database of 0.9.0 opens in 0.9.1.
 
 ## Disk format versions
 
@@ -41,7 +45,7 @@ volume path, for example, changes both). So:
   `tsdb_open` returns `TSDB_ERR_CORRUPT` and writes one line to stderr:
 
   ```
-  tsdb: the database has disk format version 7; tsdb 0.9.0 reads version 8 only. Export the data with the
+  tsdb: the database has disk format version 7; tsdb 0.9.1 reads version 8 only. Export the data with the
   release that wrote it and import it here (docs/compatibility.md)
   ```
 
