@@ -725,6 +725,11 @@ int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
  * low by the number of large writes in flight. The hook must not block or call the database. Every -1 goes to the
  * hook (and ctx) that got its +1, so it may be changed or cleared (NULL: none) at any time; waits already counted
  * end on the old one. Volumes added later get it too. */
+/* The calling thread runs a request that may be abandoned (ha.md 15.3): once *flag is nonzero the next write step of
+ * this thread that is not yet acknowledged or published returns TSDB_ERR_ABANDONED and discards its work (a small
+ * write before its WAL append, a large write, delete or replace before its commit). A step past its check completes.
+ * NULL clears it. The flag must outlive the call; only this thread's own request steps look at it. */
+void tsdb_set_abandon_flag(const volatile int *flag);
 void tsdb_set_write_wait_hook(tsdb *db, void (*on_wait)(void *ctx, int delta), void *ctx);
 
 /* Fail-stop. A storage error after which it is unknown what reached the disk

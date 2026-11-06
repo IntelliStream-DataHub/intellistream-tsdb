@@ -1449,6 +1449,18 @@ static inline int eng_check(struct eng *db)
 {
     return atomic_load_explicit(&db->failed, memory_order_acquire) ? TSDB_ERR_IO : 0;
 }
+/* The abandon flag of the request this thread runs (tsdb_set_abandon_flag; ha.md 15.3): a request parked on a stuck
+ * volume is told to discard its work. Checked at the two places where a request's effects become visible or
+ * durable: in mem_insert before the WAL append, and under publish_lock before block numbers are given out. A step
+ * already past its check completes. The pointer is thread-local, which is right only because every such step runs
+ * on the request thread (scheduler helpers never publish): a path that publishes from a helper thread has to pass the
+ * flag on explicitly. Embedded use never sets it, so nothing is abandoned there. */
+extern __thread const volatile int *cur_abandon;
+static inline int eng_abandoned(void)
+{
+    const volatile int *f = cur_abandon;
+    return f && __atomic_load_n(f, __ATOMIC_ACQUIRE) ? TSDB_ERR_ABANDONED : 0;
+}
 /* 0 while healthy; TSDB_ERR_IO with the message (directory, what failed, errno) once failed. */
 int eng_failed_msg(struct eng *db, char *msg, size_t len);
 

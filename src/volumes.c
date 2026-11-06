@@ -1389,6 +1389,11 @@ uint64_t tsdb_test_fence_wakeups(tsdb *t)
     return n;
 }
 
+void tsdb_set_abandon_flag(const volatile int *flag)
+{
+    cur_abandon = flag;
+}
+
 void tsdb_set_write_wait_hook(tsdb *t, void (*on_wait)(void *ctx, int delta), void *ctx)
 {
     pthread_rwlock_wrlock(&t->lock); /* volume_open copies it under the same lock as it lists a volume */

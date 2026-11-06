@@ -693,6 +693,8 @@ static lw_fence *lw_overlaps(const eng *db, const uint32_t *series, uint32_t cs,
     return NULL;
 }
 
+__thread const volatile int *cur_abandon;
+
 int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n)
 {
     pthread_mutex_lock(&db->buf_lock);
@@ -727,11 +729,21 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         rc = db->bg_error;
         db->bg_error = 0;
     }
-    if (rc == 0 && db->wal_enabled)
+    /* before the WAL append, never after: an abandoned batch in the WAL would replay after a crash, and a refused
+     * write would become visible. After the fence wait, so a request parked behind a large write sees the flag. */
+    if (rc == 0)
+        rc = eng_abandoned();
+    /* wal_appended counts rows the WAL holds: a refusal before the append adds none, or a flush would wait for
+     * rows that never come (wal_durable never reaches them) */
+    bool counted = rc == 0;
+    if (rc == 0 && db->wal_enabled) {
         rc = wal_buffer(db, series, cs, ts, v, w, n); /* first: it can fail without side effects */
+        counted = rc == 0;
+    }
     if (rc == 0)
         rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_appended + 1);
-    db->wal_appended += n;
+    if (counted)
+        db->wal_appended += n;
     uint64_t lsn = db->wal_appended;
     size_t rows = db->active->rows;
     if (rows >= db->opt.buffer_rows)
