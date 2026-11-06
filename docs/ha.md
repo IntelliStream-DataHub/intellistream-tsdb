@@ -736,8 +736,9 @@ Backends: `ha_local.c` (`flock`, no fencing), `ha_nfs.c`, `ha_fake.c` (tests).
 - B6: a wall-clock step purges the graveyard early (manifest.c:37, 104), tested with a fake time source.
 
 Status (2026-11-06, step N2): B1 (8797742), B2 and B3 (0e217a8, f373bb5), B4 (7312f98) and B5 (39fe9d7) were fixed
-by the fail-stop work and are guarded by `test_failstop` (`test_manifest`, `test_flush_retry`, `test_partial_insert`,
-`test_fsync_results`) and `test_follow` (`test_writer_restart`). B6 was open: the graveyard deadline is now monotonic
+by the fail-stop work and are guarded by `test_failstop` (`test_manifest`, `test_flush_retry`, `test_partial_insert`
+and `test_intent`'s rename case for B2, `test_fsync_results`, and for the B3 sites the sweep does not reach
+`test_drop_before` and `test_wal_segment`) and `test_follow` (`test_writer_restart`). B6 was open: the graveyard deadline is now monotonic
 (`tests/test_graveyard.c`, a fake `time()`).
 
 **Unit tests** (`tests/test_ledger.c`, `ha_fake`):

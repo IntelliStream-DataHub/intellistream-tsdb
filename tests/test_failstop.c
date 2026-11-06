@@ -1545,6 +1545,7 @@ static void test_partial_insert(const char *base)
         {F_FDATASYNC, "tmp_", 0, "sync of the first part"},   {F_FDATASYNC, "tmp_", 1, "sync of the second part"},
         {F_WRITE, "tmp_", 0, "write of the first part"},      {F_WRITE, "tmp_", 1, "write of the second part"},
         {F_FDATASYNC, "txn_", 0, "sync of the intent"},       {F_WRITE, "txn_", 0, "write of the intent"},
+        {F_RENAME, "p0_", 0, "rename of the first part"},    {F_RENAME, "p1_", 0, "rename of the second part"},
     };
     for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
         tsdb *db = open_fresh(name, opts_days());
@@ -1580,7 +1581,7 @@ static void test_partial_insert(const char *base)
             failures++;
         }
         tsdb_close(db);
-        if (rc != 0 && n != 0) {
+        if (rc != 0 && n != 0 && cases[c].op != F_RENAME) { /* a rename fails after the intent's commit point */
             fprintf(stderr, "partial insert, %s: a failed insert came back after a reopen\n", cases[c].what);
             failures++;
         }

@@ -104,10 +104,11 @@ static int64_t wait_gone(void)
     return -1;
 }
 
-/* A wall clock stepped a day ahead (and back) while the retired parts wait: they stay, then go after the lifetime. */
-static void check_step(const char *what, int want)
+/* A wall clock stepped a day ahead (and back) while the retired parts wait: they stay, then go after the lifetime.
+ * t0 is taken by the caller before the call that sets the deadline (the merge, the open), so the time measured is at
+ * least the parts' real age and a slow open cannot fail correct code. */
+static void check_step(const char *what, int want, int64_t t0)
 {
-    int64_t t0 = mono_ms();
     atomic_store(&wall_step_s, 86400);
     sleep_ms(700); /* several flusher cycles */
     if (retired_files() != want) {
@@ -159,11 +160,12 @@ int main(int argc, char **argv)
 #else
     tsdb_options o = opts();
     tsdb *db = NULL;
+    int64_t t0 = mono_ms();
     OK(tsdb_open(dir, &o, &db));
     make_retired(db);
     int n = retired_files();
     CHECK(n > 0);
-    check_step("retired by a merge", n);
+    check_step("retired by a merge", n, t0);
     tsdb_close(db);
     printf("  parts retired by a merge outlive a step of the wall clock\n");
 
@@ -176,8 +178,9 @@ int main(int argc, char **argv)
     tsdb_close(db); /* the lifetime has not passed: they stay for the next open */
     n = retired_files();
     CHECK(n > 0);
+    t0 = mono_ms();
     OK(tsdb_open(dir, &o, &db));
-    check_step("found at open", n);
+    check_step("found at open", n, t0);
     tsdb_close(db);
     printf("  retired parts found at open too\n");
 
