@@ -463,7 +463,7 @@ static int load_parts(eng *db, bool read_only)
                 }
                 graveyard_entry *e = &db->graveyard[db->ngraveyard++];
                 snprintf(e->name, sizeof e->name, "%s", name);
-                e->deadline = (int64_t)time(NULL) + db->opt.obsolete_part_lifetime_s;
+                e->deadline = eng_mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000;
             }
             continue;
         }

@@ -1509,6 +1509,253 @@ static void test_drop_before(const char *base)
     printf("  failed directory fsync after dropping partitions\n");
 }
 
+/* ------------------------------------------------ ha.md section 13: B2, B3 */
+
+static void set_dir(const char *path)
+{
+    char real[PATH_MAX];
+    snprintf(dir, sizeof dir, "%.500s", path);
+    pthread_mutex_lock(&f_lock);
+    free(f_dir);
+    f_dir = strdup(realpath(dir, real) ? real : dir);
+    pthread_mutex_unlock(&f_lock);
+}
+
+static void rm_tree(const char *path)
+{
+    char cmd[700];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", path);
+    if (system(cmd) != 0)
+        failures++;
+}
+
+/* B2: a failure while the parts of one insert are written, synced or named is never a success, and the insert
+ * leaves nothing: not a part in the live database, not one after a reopen, not a tmp or intent file. Failures at
+ * each write and sync of the first and of the second partition's part. */
+static void test_partial_insert(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-partial", base);
+    static const struct {
+        int op;
+        const char *match;
+        int skip;
+        const char *what;
+    } cases[] = {
+        {F_FDATASYNC, "tmp_", 0, "sync of the first part"},   {F_FDATASYNC, "tmp_", 1, "sync of the second part"},
+        {F_WRITE, "tmp_", 0, "write of the first part"},      {F_WRITE, "tmp_", 1, "write of the second part"},
+        {F_FDATASYNC, "txn_", 0, "sync of the intent"},       {F_WRITE, "txn_", 0, "write of the intent"},
+        {F_RENAME, "p0_", 0, "rename of the first part"},    {F_RENAME, "p1_", 0, "rename of the second part"},
+    };
+    for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
+        tsdb *db = open_fresh(name, opts_days());
+        tsdb_sid id;
+        OK(tsdb_series(db, "s", &id));
+        arm_after(cases[c].skip, cases[c].op, cases[c].match);
+        int rc = insert_n(db, id, 0, 100, true);
+        int hit = fired();
+        if (hit != 1) {
+            fprintf(stderr, "partial insert, %s: the fault did not fire (%d)\n", cases[c].what, hit);
+            failures++;
+            tsdb_close(db);
+            continue;
+        }
+        if (rc == 0) {
+            fprintf(stderr, "partial insert, %s: reported as success\n", cases[c].what);
+            failures++;
+        }
+        int64_t live = count_rows(db, "s");
+        if (live != 0 && live != 100) {
+            fprintf(stderr, "partial insert, %s: %lld rows live\n", cases[c].what, (long long)live);
+            failures++;
+        }
+        if (rc != 0 && live != 0) {
+            fprintf(stderr, "partial insert, %s: failed but %lld rows are live\n", cases[c].what, (long long)live);
+            failures++;
+        }
+        db = reopen(db);
+        int64_t n = count_rows(db, "s");
+        if (n != 0 && n != 100) {
+            fprintf(stderr, "partial insert, %s: %lld rows after a reopen (half an insert)\n", cases[c].what,
+                    (long long)n);
+            failures++;
+        }
+        tsdb_close(db);
+        if (rc != 0 && n != 0 && cases[c].op != F_RENAME) { /* a rename fails after the intent's commit point */
+            fprintf(stderr, "partial insert, %s: a failed insert came back after a reopen\n", cases[c].what);
+            failures++;
+        }
+        if (n == 0 && (count_files("^tmp_") || count_files("^txn_"))) {
+            fprintf(stderr, "partial insert, %s: files left behind\n", cases[c].what);
+            failures++;
+        }
+    }
+    printf("  an insert whose part or intent fails to write, sync or name is not a success and not half there\n");
+}
+
+/* B3: no fsync result is ignored. Every fsync and fdatasync of a scenario fails in turn (the n-th one, n = 0, 1,
+ * ...; the sweep ends when the scenario makes fewer): the call that made it must return an error, an open must
+ * fail rather than succeed on a directory it could not make durable. */
+typedef int (*sweep_fn)(const char *name, int round, bool *fired_out);
+
+static int sweep_insert(const char *name, int round, bool *fired_out)
+{
+    tsdb *db = open_fresh(name, opts_days());
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    OK(tsdb_append(db, id, 5, 5));
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    int rc = insert_n(db, id, 1000, 100, true);
+    *fired_out = fired() > 0;
+    tsdb_close(db);
+    return rc;
+}
+
+static int sweep_flush(const char *name, int round, bool *fired_out)
+{
+    tsdb *db = open_fresh(name, opts_days());
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    for (int i = 0; i < 20; i++)
+        OK(tsdb_append(db, id, 100 + i, i));
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    int rc = tsdb_flush(db);
+    *fired_out = fired() > 0;
+    tsdb_close(db);
+    return rc;
+}
+
+static int sweep_merge(const char *name, int round, bool *fired_out)
+{
+    tsdb *db = two_parts(name);
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    int rc = tsdb_optimize(db);
+    *fired_out = fired() > 0;
+    tsdb_close(db);
+    return rc;
+}
+
+static int sweep_delete(const char *name, int round, bool *fired_out)
+{
+    tsdb *db = two_parts(name);
+    tsdb_sid id;
+    OK(tsdb_series_lookup(db, "s", &id));
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    int rc = tsdb_delete_range(db, id, 10, 50);
+    *fired_out = fired() > 0;
+    tsdb_close(db);
+    return rc;
+}
+
+static void run_sweep(const char *what, sweep_fn fn, const char *name)
+{
+    for (int kind = 0; kind < 2; kind++) {
+        for (int n = 0; n < 60; n++) {
+            bool hit = false;
+            int rc = fn(name, (kind << 8) | n, &hit);
+            if (!hit)
+                break;
+            if (rc == 0) {
+                fprintf(stderr, "%s: the %s number %d failed and the call returned success\n", what,
+                        kind ? "fdatasync" : "fsync", n);
+                failures++;
+            }
+        }
+    }
+}
+
+/* An open that finds work to redo (an intent to roll forward, a WAL segment to replay, tmp files to remove) makes
+ * the result durable before it goes on; if that fails the open fails. `prepare` leaves such a directory in `src`. */
+static void run_open_sweep(const char *what, const char *src, const char *work)
+{
+    for (int kind = 0; kind < 2; kind++) {
+        for (int n = 0; n < 60; n++) {
+            char cmd[1400];
+            rm_tree(work);
+            snprintf(cmd, sizeof cmd, "cp -a '%s' '%s'", src, work);
+            if (system(cmd) != 0) {
+                failures++;
+                return;
+            }
+            set_dir(work);
+            arm_after(n, kind ? F_FDATASYNC : F_FSYNC, "");
+            tsdb_options o = opts_days();
+            tsdb *db = NULL;
+            int rc = tsdb_open(work, &o, &db);
+            bool hit = fired() > 0;
+            if (db)
+                tsdb_close(db);
+            if (!hit)
+                break;
+            if (rc == 0) {
+                fprintf(stderr, "%s: open: the %s number %d failed and the open succeeded\n", what,
+                        kind ? "fdatasync" : "fsync", n);
+                failures++;
+            }
+        }
+    }
+}
+
+static void test_fsync_results(const char *base)
+{
+    char name[600], src[600], work[600];
+    snprintf(name, sizeof name, "%s/failstop-sweep", base);
+    run_sweep("insert", sweep_insert, name);
+    run_sweep("flush", sweep_flush, name);
+    run_sweep("merge", sweep_merge, name);
+    run_sweep("delete", sweep_delete, name);
+    printf("  every failed fsync of an insert, a flush, a merge and a delete reaches the caller\n");
+
+    /* creating a database */
+    for (int kind = 0; kind < 2; kind++) {
+        for (int n = 0; n < 20; n++) {
+            rm_tree(name);
+            mkdir(name, 0755);
+            set_dir(name);
+            arm_after(n, kind ? F_FDATASYNC : F_FSYNC, "");
+            tsdb_options o = opts_days();
+            tsdb *db = NULL;
+            int rc = tsdb_open(name, &o, &db);
+            bool hit = fired() > 0;
+            if (db)
+                tsdb_close(db);
+            if (!hit)
+                break;
+            if (rc == 0) {
+                fprintf(stderr, "create: the %s number %d failed and the open succeeded\n",
+                        kind ? "fdatasync" : "fsync", n);
+                failures++;
+            }
+        }
+    }
+
+    /* a leftover intent, rolled forward at the open */
+    snprintf(src, sizeof src, "%s/failstop-sweep-src", base);
+    snprintf(work, sizeof work, "%s/failstop-sweep-work", base);
+    intent_left(src);
+    run_open_sweep("intent roll forward", src, work);
+
+    /* a WAL segment to replay: the directory copied while the database is open (a crash) */
+    rm_tree(src);
+    tsdb *db = open_fresh(src, opts_days());
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    for (int i = 0; i < 20; i++)
+        OK(tsdb_append(db, id, 100 + i, i));
+    {
+        char cmd[1400];
+        snprintf(cmd, sizeof cmd, "cp -a '%s' '%s.crash'", src, src);
+        if (system(cmd) != 0)
+            failures++;
+    }
+    tsdb_close(db);
+    char crash[620];
+    snprintf(crash, sizeof crash, "%s.crash", src);
+    run_open_sweep("WAL replay", crash, work);
+    rm_tree(crash);
+    printf("  every failed fsync while a database is created or opened reaches the open\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -1537,6 +1784,8 @@ int main(int argc, char **argv)
     test_wal_unlink(root);
     test_drop_before(root);
     test_dir_fsync_race(root);
+    test_partial_insert(root);
+    test_fsync_results(root);
     if (!failures) {
         char cmd[512];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
