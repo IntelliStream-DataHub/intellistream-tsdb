@@ -150,7 +150,7 @@ $(B)/test_buckets: tests/test_buckets.c src/internal.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/test_meta
 	./$(B)/test_tsdb
 	./$(B)/test_sched
 	./$(B)/test_multi
@@ -187,6 +187,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
+	./$(B)/test_meta /tmp --seeds 12 --seconds 15
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
@@ -451,6 +452,27 @@ $(B)/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 # TSDB_VERSION is the build id shown next to it by `tsdbd --version`, `tsdb --version` and tsdb_build_info.
 RELEASE_VERSION := $(shell cat VERSION)
 TSDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
+
+# The cluster (docs/design-cluster.md): the Raft core copied from intellistream-objects (src/raft/UPSTREAM, built as
+# upstream wrote it, with -Isrc -Isrc/raft/compat for what it includes from isod) and the metadata state machine
+# (server/meta.c). Not part of libtsdb: the cluster is a tsdbd mode (C24). raft_sim is the tests' only.
+RAFT_HDR := $(wildcard src/raft/*.h) $(wildcard src/raft/compat/*/*.h)
+RAFT_OBJ := $(B)/raft_raft.o $(B)/raft_raft_log.o $(B)/raft_raft_wire.o $(B)/raft_compat.o
+# -Wno-stringop-overflow: at -O3 GCC 15 warns about raft.c's vote tally (`r->votes[i]` for i below config.n, which
+# raft_config_decode bounds by RAFT_MEMBERS_MAX); the copy is not edited, so the false positive is silenced here.
+$(B)/raft_%.o: src/raft/%.c $(RAFT_HDR) | $(B)
+	$(CC) $(CFLAGS) -Wno-stringop-overflow -Isrc -Isrc/raft/compat -c -o $@ $<
+$(B)/meta.o: server/meta.c server/meta.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(B)/test_meta: tests/test_meta.c server/meta.h $(B)/meta.o $(RAFT_OBJ) $(B)/raft_raft_sim.o
+	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -o $@ $< $(B)/meta.o $(RAFT_OBJ) $(B)/raft_raft_sim.o -lm
+# The Raft simulators for long: the copied core's own chaos runs and the metadata state machine under real cores,
+# META_SOAK_SEEDS seeds of META_SOAK_SECONDS virtual seconds from META_SOAK_FIRST (a failure names its seed).
+META_SOAK_SEEDS   ?= 5000
+META_SOAK_SECONDS ?= 30
+META_SOAK_FIRST   ?= 1000
+meta-soak: $(B)/test_meta
+	./$(B)/test_meta /tmp --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
 TSDBD_SRC := server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/users.h \
              include/tsdb_protocol.h client/tsdb_pack.h client/tsdb_crypto.h

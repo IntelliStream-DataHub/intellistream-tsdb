@@ -1,0 +1,8 @@
+repository: intellistream-objects (git@repo.intellistream.ai:olavgg/intellistream-objects.git), directory src/raft
+commit: c9c938e9d93523956704b4a42f4b10703a3df0a3
+files: raft.h raft.c raft_log.h raft_log.c raft_wire.h raft_wire.c raft_sim.h raft_sim.c
+license: Apache License 2.0. The owner of intellistream-objects (IntelliStream AS, Olav Gjerde) granted copying
+  these files into tsdb under Apache 2.0 on 2026-11-06 (docs/design-cluster.md, decision D2).
+local: compat.h and compat.c (what the files include from isod's src/common and src/proto), and the one-line
+  headers under compat/ that point there; tsdb's own, not synced.
+sync: tools/sync-raft.sh [--repo DIR] COMMIT
