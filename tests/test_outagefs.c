@@ -187,30 +187,11 @@ static void run(void)
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
-    if (!getenv("OUTAGEFS_CTL")) {
-        /* start again under the shim */
-        snprintf(dir_a, sizeof dir_a, "%s/outagefs.%d/a", base, (int)getpid());
-        snprintf(dir_b, sizeof dir_b, "%s/outagefs.%d/b", base, (int)getpid());
-        char top[300], roots[600];
-        snprintf(top, sizeof top, "%s/outagefs.%d", base, (int)getpid());
-        mkdir(top, 0755);
-        mkdir(dir_a, 0755);
-        mkdir(dir_b, 0755);
-        snprintf(roots, sizeof roots, "%s:%s", dir_a, dir_b);
-        snprintf(ctl, sizeof ctl, "%s/ctl", top);
-        setenv("OUTAGEFS_ROOTS", roots, 1);
-        setenv("OUTAGEFS_CTL", ctl, 1);
-        setenv("OUTAGEFS_DIR_A", dir_a, 1);
-        setenv("OUTAGEFS_DIR_B", dir_b, 1);
-        const char *so2 = getenv("OUTAGEFS_LIB");
-        setenv("LD_PRELOAD", so2 ? so2 : "build/liboutagefs.so", 1);
-        execv("/proc/self/exe", argv);
-        perror("exec");
+    if (outagefs_reexec(argv, base, (const char *const[]){"a", "b"}, 2))
         return 1;
-    }
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
-    snprintf(dir_a, sizeof dir_a, "%s", getenv("OUTAGEFS_DIR_A"));
-    snprintf(dir_b, sizeof dir_b, "%s", getenv("OUTAGEFS_DIR_B"));
+    snprintf(dir_a, sizeof dir_a, "%s", outagefs_dir("a"));
+    snprintf(dir_b, sizeof dir_b, "%s", outagefs_dir("b"));
     run();
     if (failures)
         fprintf(stderr, "test_outagefs: %d failures\n", failures);

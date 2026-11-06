@@ -718,6 +718,9 @@ $(B)/liboutagefs.so: tests/jepsen/outagefs.c | $(B)
 $(B)/test_outagefs: tests/test_outagefs.c tests/outagefs_ctl.h | $(B)
 	$(CC) $(CFLAGS) -o $@ $< -lpthread
 
+$(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
@@ -790,8 +793,9 @@ test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 # The outage shim's own test (Linux only: LD_PRELOAD)
 ifneq ($(UNAME_S),Darwin)
 test: test-outagefs
-test-outagefs: $(B)/test_outagefs $(B)/liboutagefs.so
+test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/liboutagefs.so
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs /tmp
+	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_health /tmp
 endif
 
 # The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.
