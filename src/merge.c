@@ -206,6 +206,8 @@ static int cur_skip(eng *db, codec_ctx *cc, cursor *c)
     return 0;
 }
 
+void (*_Atomic merge_hook)(int at);
+
 int merge_parts(eng *db, part **src, size_t k, part **out)
 {
     *out = NULL;
@@ -433,7 +435,12 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         pw_abort(&w);
         return rc;
     }
+    void (*hook)(int) = atomic_load(&merge_hook);
+    if (hook)
+        hook(0);
     rc = pw_finish(&w, min_block, max_block, level + 1, out);
+    if (hook)
+        hook(1);
     if (rc == 0 && *out) {
         time_t written = 0;
         for (size_t i = 0; i < k; i++)
@@ -464,7 +471,11 @@ void merge_commit_locked(eng *db, part **src, size_t k, part *out)
         for (size_t i = 0; i < k; i++)
             db_retire_locked(db, src[i]);
     } else if (out) {
-        /* a source was dropped meanwhile: the merged data must not come back */
+        /* A source was dropped meanwhile: the merged data must not come back. Neither eng_drop_before nor the
+         * retention drop lets this happen (they wait for, or leave, a partition with a merging part), so this is a
+         * backstop. The output already has its listed name, durable (pw_finish): it goes by rename and a directory
+         * fsync, as a dropped part does, never by an unlink a power loss can undo. */
+        db_retire_unlisted_locked(db, out);
         atomic_store(&out->obsolete, true);
         part_unref(out);
     }
@@ -548,8 +559,10 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
     size_t k = 0;
     for (size_t a = 0, b; a < db->nparts; a = b) {
         int64_t all = INT64_MIN;
+        bool busy = false;
         for (b = a; b < db->nparts && db->parts[b]->partition == db->parts[a]->partition; b++) {
             part *p = db->parts[b];
+            busy |= p->merging;
             if (!p->ng && !p->nt) {
                 if (p->wal_seq > db->wal_removed_synced) {
                     all = INT64_MAX;
@@ -565,6 +578,8 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
                 ttl_compute_locked(db, p, gen);
             all = MAX(all, p->ttl_all);
         }
+        if (busy) /* a merge of it is in flight: its output would be named after the drop (merge_commit_locked) */
+            continue;
         if (now >= all && !eng_check(db) && partition_expired_checked_locked(db, a, b, gen, now)) {
             /* every series in the partition has expired past its end, or nothing is left in it: drop it like
              * tsdb_drop_before. Memtable rows of it are hidden by the same cutoffs; flushed later, they go the

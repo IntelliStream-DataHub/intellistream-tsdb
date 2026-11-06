@@ -1074,6 +1074,20 @@ int eng_drop_before(eng *db, int64_t ts)
     if (rc)
         return rc;
     pthread_mutex_lock(&db->lock);
+    /* A merge of a partition being dropped names its output (durably) before it takes db->lock to list it. Dropped
+     * meanwhile, its sources are gone and the output is the only part with their rows: a crash after the
+     * acknowledgement would list it alone. So wait until the merge has listed it (the loop below retires it with
+     * the rest, by rename, before the fsync) and look again: the wait released db->lock. */
+    for (bool busy = true; busy && !eng_check(db);) {
+        busy = false;
+        for (size_t i = 0; i < db->nparts && !busy; i++) {
+            int64_t lo, end;
+            partition_range(db, db->parts[i]->partition, &lo, &end);
+            busy = end <= ts && db->parts[i]->merging;
+        }
+        if (busy)
+            pthread_cond_wait(&db->merged_cv, &db->lock);
+    }
     for (size_t i = 0; i < db->nparts;) {
         part *p = db->parts[i];
         int64_t lo, end;

@@ -61,6 +61,12 @@ disk format and the wire protocol.
   then made the open list the part again, and the dropped rows came back (nothing covers a dropped part). Replaced
   and dropped parts are now renamed to `retired_<name>` at every lifetime, before that fsync; at a lifetime of 0 or
   less the last reference deletes the retired name, and the open deletes any left by a crash.
+- `tsdb_drop_before` came back after a crash (kill -9 or power loss) when a merge of a dropped partition was in
+  flight, at every `obsolete_part_lifetime_s`: the merge had named its output (durably) before it found its sources
+  dropped, and only unlinked it, so the open listed that output alone, with every dropped row. The drop now waits
+  for a merge of the partitions it drops and retires the output with the rest; retention leaves a partition with a
+  merge in flight to its next pass. The merge's own discard of such an output (a backstop) renames it to `retired_`
+  and syncs the directory.
 - tsdbd closes a connection whose output has not moved for `--send-timeout` seconds even when its whole reply fit in
   the server's buffers (so no worker waited on it): before, a client that sent a query and never read the answer held
   up to about 17 MB per connection for as long as it kept the socket open, outside `--max-request-memory`.

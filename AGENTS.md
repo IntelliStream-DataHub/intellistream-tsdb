@@ -185,6 +185,10 @@ cgroup, so `nice` does not keep your work out of its way.
   stale WAL segment from replaying deleted rows back. It goes (with a partition
   left with nothing else) only once every segment up to its `wal_seq` is
   unlinked and the directory synced (`wal_removed_synced`).
+  A drop never overlaps a merge of its partition: `eng_drop_before` waits on `merged_cv` while a part of a partition
+  it drops is `merging` (the merge names its output before it takes `db->lock`, so a drop between the two would
+  acknowledge with the output still to be listed), and `ttl_select_locked` skips a partition with a merging part.
+  `merge_commit_locked`'s dropped branch is a backstop: it retires the output by rename and directory fsync.
 - **Retention** limits live in the append-only `RETENTION` file (beside
   `SERIES`). Retention "now" (`eng_now_ms`) never goes back; queries clamp to
   the cutoff, merges drop expired rows, the merge thread drops whole expired

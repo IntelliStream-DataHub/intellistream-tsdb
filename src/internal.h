@@ -1035,6 +1035,9 @@ extern size_t multi_max_bounds;
 /* test hook: runs in tsdb_query_multi once the helpers were woken, before the caller conducts (a caller preempted
  * there, which tests make certain) */
 extern void (*_Atomic multi_open_hook)(void);
+/* test hook: runs in a merge with no lock held, at 0 just before its output is named (pw_finish) and at 1 just
+ * after (named, the directory synced), before merge_commit_locked */
+extern void (*_Atomic merge_hook)(int at);
 
 /* Threads for a query step that decodes `rows` rows in `items` independent pieces (granules): one per
  * query_rows_per_thread rows, at most one per item and query_threads. Small reads are fastest on the calling
@@ -1225,6 +1228,7 @@ int follow_refresh(struct eng *db);
 int manifest_synced_counts(struct eng *db, uint32_t *series, uint32_t *states);
 void *follower_main(void *arg);
 void db_retire_locked(struct eng *db, part *p);
+void db_retire_unlisted_locked(struct eng *db, part *p);
 void graveyard_purge(struct eng *db, bool all);
 
 /* ---- partition classes (classes.c) ----

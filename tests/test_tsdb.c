@@ -3,6 +3,8 @@
 #include "samekeys.h"
 
 #include <dirent.h>
+#include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #ifdef __APPLE__
 #include <malloc/malloc.h>
@@ -957,13 +959,25 @@ static void hold_point(int which)
     pthread_mutex_unlock(&hold_lock);
 }
 
+#ifndef __APPLE__
+/* set in the child of drop_vs_merge_power: the calls go to the next fsync in the lookup order, the crashfs shim's,
+ * which a direct system call would bypass */
+static bool sync_via_shim;
+
+static int next_sync(int fd, const char *name)
+{
+    int (*f)(int) = (int (*)(int))dlsym(RTLD_NEXT, name);
+    return f(fd);
+}
+#endif
+
 int fsync(int fd)
 {
     hold_point(HOLD_FSYNC);
 #ifdef __APPLE__
     return REAL(fsync)(fd);
 #else
-    return (int)syscall(SYS_fsync, fd);
+    return sync_via_shim ? next_sync(fd, "fsync") : (int)syscall(SYS_fsync, fd);
 #endif
 }
 
@@ -973,7 +987,7 @@ int fdatasync(int fd)
 #ifdef __APPLE__
     return REAL(fdatasync)(fd);
 #else
-    return (int)syscall(SYS_fdatasync, fd);
+    return sync_via_shim ? next_sync(fd, "fdatasync") : (int)syscall(SYS_fdatasync, fd);
 #endif
 }
 
@@ -2262,6 +2276,288 @@ static void test_drop_stays_dropped(const char *base)
     printf("  a dropped part keeps no listed name, with a reader and obsolete_part_lifetime_s = 0\n");
 }
 
+/* ---------------------------------- a drop and a merge of the same partition (review of retire-drop, F1) */
+
+/* The merge hook holds the first merge it sees (any thread, or only mh_thread's when set) at point mh_point:
+ * mh_state 0 idle, 1 held, 2 released. */
+static atomic_int mh_state, mh_point;
+static pthread_t mh_thread;
+static atomic_bool mh_only_thread;
+
+static void mh_hook(int at)
+{
+    if (at != atomic_load(&mh_point) || (atomic_load(&mh_only_thread) && !pthread_equal(pthread_self(), mh_thread)))
+        return;
+    int idle = 0;
+    if (!atomic_compare_exchange_strong(&mh_state, &idle, 1))
+        return;
+    while (atomic_load(&mh_state) != 2)
+        usleep(1000);
+}
+
+static void mh_wait_held(void)
+{
+    for (int i = 0; i < 20000 && atomic_load(&mh_state) != 1; i++)
+        usleep(1000);
+    CHECK(atomic_load(&mh_state) == 1);
+}
+
+typedef struct drop_job {
+    tsdb *db;
+    const char *dir, *copy;
+    int64_t ts;
+    atomic_bool done;
+    int rc;
+} drop_job;
+
+static void *mh_optimize_thread(void *arg)
+{
+    mh_thread = pthread_self();
+    (void)tsdb_optimize(arg);
+    return NULL;
+}
+
+/* the drop is acknowledged, and the directory is copied as a kill -9 would leave it at that moment */
+static void *drop_thread(void *arg)
+{
+    drop_job *j = arg;
+    j->rc = tsdb_drop_before(j->db, j->ts);
+    if (j->copy)
+        crash_copy(j->dir, j->copy);
+    atomic_store(&j->done, true);
+    return NULL;
+}
+
+static void two_parts_one_partition(tsdb *db, tsdb_sid id, int64_t t0)
+{
+    enum { N = 1000 };
+    int64_t ts[N];
+    float v[N];
+    for (int k = 0; k < 2; k++) {
+        for (int i = 0; i < N; i++) {
+            ts[i] = t0 + (2 * i + k) * 100;
+            v[i] = (float)i;
+        }
+        OK(tsdb_insert_series(db, id, ts, v, N));
+    }
+}
+
+/* tsdb_drop_before while tsdb_optimize merges the partition, held at `point` of the merge: before its output is
+ * named (0) or after (1: named, durable, not yet listed). Regression: the drop did not wait for the merge; the
+ * merge then found a source dropped and only unlinked its output, which had its listed name since pw_finish: a
+ * crash after the acknowledgement listed it alone, with every dropped row (and a power loss after the unlink,
+ * which nothing synced, did the same). */
+static void drop_vs_merge(const char *base, int point, int lifetime)
+{
+    char dir[512], copy[540];
+    snprintf(dir, sizeof dir, "%s/tsdb-dropmerge-%d", base, (int)getpid());
+    snprintf(copy, sizeof copy, "%s.crash", dir);
+    rm_rf(dir);
+    tsdb_options o = test_opts(0);
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 100; /* each insert becomes a part */
+    o.obsolete_part_lifetime_s = lifetime;
+    o.fsync = 1;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    const int64_t t0 = 1700000000000LL;
+    two_parts_one_partition(db, id, t0);
+    CHECK(rows_in(db, id) == 2000);
+    atomic_store(&mh_state, 0);
+    atomic_store(&mh_point, point);
+    atomic_store(&mh_only_thread, true);
+    atomic_store(&merge_hook, mh_hook);
+    pthread_t opt, dropper;
+    pthread_create(&opt, NULL, mh_optimize_thread, db);
+    mh_wait_held();
+    drop_job j = {db, dir, copy, t0 + 30LL * 86400000, false, -1};
+    pthread_create(&dropper, NULL, drop_thread, &j);
+    usleep(300000); /* the old code acknowledged within this time, with the merge still held */
+    atomic_store(&mh_state, 2);
+    pthread_join(opt, NULL);
+    pthread_join(dropper, NULL);
+    atomic_store(&merge_hook, NULL);
+    CHECK(j.rc == 0);
+    CHECK(rows_in(db, id) == 0);
+    CHECK(count_listed_parts(copy) == 0); /* what a crash at the acknowledgement lists */
+    tsdb_options o2 = test_opts(0);
+    o2.partition_classes = 0;
+    o2.obsolete_part_lifetime_s = lifetime;
+    tsdb *c;
+    OK(tsdb_open(copy, &o2, &c));
+    tsdb_sid cid;
+    OK(tsdb_series(c, "s", &cid));
+    CHECK(rows_in(c, cid) == 0);
+    OK(tsdb_close(c));
+    OK(tsdb_close(db));
+    CHECK(count_listed_parts(dir) == 0);
+    rm_rf(dir);
+    rm_rf(copy);
+}
+
+/* The same under a simulated power loss (the crashfs shim; this binary runs itself again with it, "dropmerge-child"):
+ * the child merges and drops as above, reports the acknowledged drop in a marker file, and exits without closing;
+ * the shim then rolls back every directory change not made durable. The old code unlinked the merge output after
+ * the acknowledgement with no directory fsync, so the open listed it again. */
+static const char *self_path;
+
+static void drop_vs_merge_child(const char *dir, int point, int lifetime, const char *mark)
+{
+#ifndef __APPLE__
+    sync_via_shim = true;
+#endif
+    tsdb_options o = test_opts(0);
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 100;
+    o.obsolete_part_lifetime_s = lifetime;
+    o.fsync = 1;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    const int64_t t0 = 1700000000000LL;
+    two_parts_one_partition(db, id, t0);
+    atomic_store(&mh_state, 0);
+    atomic_store(&mh_point, point);
+    atomic_store(&mh_only_thread, true);
+    atomic_store(&merge_hook, mh_hook);
+    pthread_t opt, dropper;
+    pthread_create(&opt, NULL, mh_optimize_thread, db);
+    mh_wait_held();
+    drop_job j = {db, dir, NULL, t0 + 30LL * 86400000, false, -1};
+    pthread_create(&dropper, NULL, drop_thread, &j);
+    usleep(300000);
+    atomic_store(&mh_state, 2);
+    pthread_join(opt, NULL);
+    pthread_join(dropper, NULL);
+    if (j.rc == 0 && failures == 0) {
+        FILE *f = fopen(mark, "w");
+        if (f)
+            fclose(f);
+    }
+    exit(0); /* not closed: the power fails here */
+}
+
+static void drop_vs_merge_power(const char *base, int point, int lifetime)
+{
+    char shim[1024], top[512], dir[560], mark[600];
+    snprintf(shim, sizeof shim, "%.*s/libcrashfs.so", (int)(strrchr(self_path, '/') ? strrchr(self_path, '/') - self_path : 1),
+             strrchr(self_path, '/') ? self_path : ".");
+    char shim_abs[PATH_MAX];
+    if (!realpath(shim, shim_abs)) {
+        printf("  (power loss during a drop and a merge: skipped, no %s)\n", shim);
+        return;
+    }
+    /* the shim's root holds the database directory (it does not track the root's own entries) */
+    snprintf(top, sizeof top, "%s/tsdb-dropmerge-pl-%d", base, (int)getpid());
+    snprintf(dir, sizeof dir, "%s/db", top);
+    snprintf(mark, sizeof mark, "%s.acked", top);
+    rm_rf(top);
+    unlink(mark);
+    /* made before the child starts: the open does not sync the parent of a new directory, so the shim would
+     * roll the whole database back */
+    CHECK(mkdir(top, 0755) == 0 && mkdir(dir, 0755) == 0);
+    char pt[16], lt[16];
+    snprintf(pt, sizeof pt, "%d", point);
+    snprintf(lt, sizeof lt, "%d", lifetime);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512];
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        setenv("LD_PRELOAD", shim_abs, 1);
+        setenv("CRASHFS_ROOT", top, 1);
+        setenv("CRASHFS_PROB", "0", 1);
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        execl(self_path, self_path, base, "dropmerge-child", dir, pt, lt, mark, (char *)NULL);
+        _exit(127);
+    }
+    int st = -1;
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st));
+    CHECK(access(mark, F_OK) == 0); /* the drop was acknowledged */
+    tsdb_options o = test_opts(0);
+    o.partition_classes = 0;
+    o.obsolete_part_lifetime_s = lifetime;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    CHECK(rows_in(db, id) == 0); /* after the power loss */
+    OK(tsdb_close(db));
+    rm_rf(top);
+    unlink(mark);
+}
+
+/* Retention drops an expired partition: not while a merge of it is in flight (its output is named after the
+ * drop otherwise, and only unlinked). The partition goes on the pass after the merge has listed its output. */
+static void retention_vs_merge(const char *base)
+{
+    char dir[512], copy[540];
+    snprintf(dir, sizeof dir, "%s/tsdb-retmerge-%d", base, (int)getpid());
+    snprintf(copy, sizeof copy, "%s.crash", dir);
+    rm_rf(dir);
+    tsdb_options o = test_opts(2); /* one thread holds the merge, the other runs the retention pass */
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 100;
+    o.merge_idle_s = 1; /* the background merge starts a second after the inserts */
+    o.fsync = 1;
+    atomic_llong off = 0;
+    o.clock_ms = drop_clock;
+    o.clock_arg = &off;
+    atomic_store(&mh_state, 0);
+    atomic_store(&mh_point, 1);
+    atomic_store(&mh_only_thread, false);
+    atomic_store(&merge_hook, mh_hook);
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    const int64_t t0 = (int64_t)now.tv_sec * 1000 - 600000;
+    OK(tsdb_set_retention(db, id, 3600000));
+    two_parts_one_partition(db, id, t0);
+    mh_wait_held(); /* a background merge named its output */
+    atomic_store(&off, 10 * 3600000LL); /* every row is past the limit: the partition expires */
+    usleep(2500000); /* two retention passes */
+    part_count pc = {0, 0, 0};
+    tsdb_foreach_part(db, count_parts, &pc);
+    CHECK(pc.n > 0); /* not dropped under the merge */
+    atomic_store(&mh_state, 2);
+    for (int tries = 0; tries < 150; tries++) {
+        pc = (part_count){0, 0, 0};
+        tsdb_foreach_part(db, count_parts, &pc);
+        if (pc.n == 0)
+            break;
+        usleep(100000);
+    }
+    CHECK(pc.n == 0);
+    usleep(300000);
+    atomic_store(&merge_hook, NULL);
+    crash_copy(dir, copy);
+    CHECK(count_listed_parts(copy) == 0);
+    OK(tsdb_close(db));
+    rm_rf(dir);
+    rm_rf(copy);
+}
+
+static void test_drop_vs_merge(const char *base)
+{
+    for (int point = 0; point < 2; point++) {
+        drop_vs_merge(base, point, 0);
+        drop_vs_merge(base, point, 480);
+    }
+    for (int point = 0; point < 2; point++) {
+        drop_vs_merge_power(base, point, 0);
+        drop_vs_merge_power(base, point, 480);
+    }
+    printf("  tsdb_drop_before waits for a merge of its partition: the output is never named after the drop\n");
+    retention_vs_merge(base);
+    printf("  retention leaves a partition with a merge in flight to the next pass\n");
+}
+
 typedef struct level_info {
     int n, level0;
 } level_info;
@@ -2530,7 +2826,10 @@ int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
     char dir[256];
+    self_path = argv[0];
     simd_init();
+    if (argc > 6 && strcmp(argv[2], "dropmerge-child") == 0) /* under crashfs, from drop_vs_merge_power */
+        drop_vs_merge_child(argv[3], atoi(argv[4]), atoi(argv[5]), argv[6]);
     if (argc > 2 && strcmp(argv[2], "samekeys") == 0) { /* just these, e.g. under a sanitizer */
         test_same_keys(base);
         printf(failures ? "FAILED: %d checks\n" : "all tests passed\n", failures);
@@ -2567,6 +2866,7 @@ int main(int argc, char **argv)
     test_solo_after_retention(base);
     test_optimize_waits_for_solo(base);
     test_drop_stays_dropped(base);
+    test_drop_vs_merge(base);
     printf("volume statistics\n");
     test_volume_stats(base);
     test_merging_parts(base);

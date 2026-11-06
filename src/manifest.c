@@ -148,6 +148,21 @@ void db_retire_locked(eng *db, part *p)
     db_parts_remove_locked(db, p);
 }
 
+/* Takes a part that was named but never listed (a merge output whose sources were dropped meanwhile) out of
+ * service: renamed to retired_<name> and the directory synced, so no crash lists it again; the last reference
+ * deletes it. Caller holds db->lock. */
+void db_retire_unlisted_locked(eng *db, part *p)
+{
+    char retired[sizeof p->name + sizeof RETIRED_PREFIX];
+    snprintf(retired, sizeof retired, RETIRED_PREFIX "%s", p->name);
+    if (renameat(db->dirfd, p->name, db->dirfd, retired) != 0) {
+        eng_fail(db, "rename of an unlisted part to retired_", errno);
+    } else {
+        p->retired = true;
+        eng_sync_dir(db, "fsync of the directory after retiring an unlisted part"); /* fail-stop inside */
+    }
+}
+
 /* Deletes retired parts whose lifetime is over (or all of them). The lifetime runs on the monotonic clock: a step of
  * the wall clock must not delete a part early that a follower on another host still reads (docs/ha.md, B6). */
 void graveyard_purge(eng *db, bool all)
