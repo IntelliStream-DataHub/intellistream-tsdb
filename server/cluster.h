@@ -73,8 +73,18 @@ int cluster_admin(const char *addr, const uint8_t *secret, size_t secret_len, in
                   size_t req_len, int timeout_ms, int *rc, uint8_t **reply, size_t *reply_len, char *err,
                   size_t errn);
 
-/* The secret file: its bytes, without one trailing newline; CLUSTER_SECRET_MIN bytes at least. 0 or -1 with err. */
+/* The secret file: its bytes, without one trailing newline; CLUSTER_SECRET_MIN bytes at least. A regular file that
+ * neither its group nor others may read or write (it is full control of the metadata), else refused. 0 or -1 with
+ * err. */
 int cluster_read_secret(const char *path, uint8_t *out, size_t cap, size_t *len, char *err, size_t errn);
+
+/* `tsdb cluster secret FILE`: a new secret (32 random bytes, hex) in a new file of mode 0600, synced. 0 or -1 with
+ * err; an existing file is never overwritten. */
+int cluster_make_secret(const char *path, char *err, size_t errn);
+
+/* HMAC-SHA256 over the concatenation of n parts (the handshake and the frame tags use it; exported for the tests). */
+void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *const *part, const size_t *len,
+                        uint8_t out[32]);
 
 /* The INIT body for `s` (36 bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, uint8_t *out);

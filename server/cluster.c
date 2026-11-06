@@ -41,12 +41,23 @@
  * learner (another rack first); else remove a voter unheard for voter_replace_s while there are more voters than the
  * target; a learner unheard that long goes too. Never itself.
  *
- * Frames: [u32 len][u8 type][payload], len counting the type and the payload, at most FRAME_MAX. Little endian.
- * The dialer sends HELLO{magic, version, its node id (0: the CLI or a server in no cluster), cluster uuid (zero when
- * none), nonce_c[32], its peer address}; the acceptor answers HELLO_ACK{id, uuid, nonce_s[32],
- * HMAC(secret, "tsdb-cluster-s" | nonce_c | nonce_s)}, the dialer checks it and sends AUTH{HMAC(secret,
- * "tsdb-cluster-c" | nonce_c | nonce_s)}. Two known uuids that differ end the connection. Nothing else passes before
- * AUTH. The secret is the cluster's (--cluster-secret-file); it is never sent.
+ * Frames: [u32 len][u8 type][payload], len counting the type and the payload, at most FRAME_MAX (HS_FRAME_MAX before
+ * AUTH). Little endian. The dialer sends HELLO{magic, version, its node id (0: the CLI or a server in no cluster),
+ * cluster uuid (zero when none), its identity (meta/IDENT; zero for the CLI), nonce_c[32], its peer address}; the
+ * acceptor answers HELLO_ACK{id, uuid, identity, nonce_s[32], HMAC(secret, "tsdb-cluster-s" | transcript)}, the
+ * transcript being HELLO's body and HELLO_ACK's fields before the MAC; the dialer checks it and sends
+ * AUTH{HMAC(secret, "tsdb-cluster-c" | transcript | that MAC)}. Every claim of either side is under the MACs, so a
+ * relay that alters one fails. From AUTH on, every frame carries a tag: HMAC(key, sequence | type | payload) after
+ * its payload (len counts it), with a key per direction from the secret and the transcript ("tsdb-cluster-k>" from
+ * the dialer, "tsdb-cluster-k<" to it) and a sequence number per direction from 0: a relay that passed the
+ * handshake on unchanged can read the link but not write, reorder or replay into it. Two known uuids that differ end
+ * the connection, and so does a server that claims a member id whose record names another identity (claim_ok).
+ * The secret is the cluster's (--cluster-secret-file, a file only its owner may read; `tsdb cluster secret` makes
+ * one); it is never sent.
+ *
+ * NODE_ADD (admin_node_add): PROBE to the new server (its identity), MEMBER_ADD committed with the next id and that
+ * identity, then JOIN{uuid, id, identity}, on which the new server writes NODE. An id exists in the log before any
+ * server holds it, so a leader that fails part way never lets the next one hand the same id to another server.
  */
 #define _GNU_SOURCE
 #include "cluster.h"
@@ -87,6 +98,11 @@
 #define NOLEADER_PROBE_NS (10000 * MS)
 #define NOTMEMBER_DROP_NS (10000 * MS)
 #define MAX_CONNS 4096
+#define TAG 32 /* HMAC-SHA256 under the link's key, on every frame after AUTH */
+/* before AUTH only HELLO, HELLO_ACK and AUTH pass, all short: a longer frame ends the connection before it is
+ * buffered (a peer without the secret must not make this server hold 16 MiB per connection) */
+#define HS_FRAME_MAX 512
+#define HS_TR_MAX (HS_FRAME_MAX + 128) /* the handshake's transcript: HELLO's body, HELLO_ACK's fields, its MAC */
 #define READ_ROUND (4u << 20) /* bytes read from one peer per loop round, for fairness */
 
 enum {
@@ -103,6 +119,8 @@ enum {
     F_ADMIN_REPLY,
     F_JOIN,
     F_JOIN_REPLY,
+    F_PROBE,
+    F_PROBE_REPLY,
 };
 
 /* ------------------------------------------------------------------ bytes */
@@ -261,14 +279,64 @@ static void frame_end(struct buf *b)
     b->p[3] = (uint8_t)(n >> 24);
 }
 
-static void mac(const uint8_t *secret, size_t slen, const char *label, const uint8_t nc[32], const uint8_t ns[32],
-                uint8_t out[32])
+void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *const *part, const size_t *len,
+                        uint8_t out[32])
 {
-    uint8_t msg[14 + 64];
-    memcpy(msg, label, 14);
-    memcpy(msg + 14, nc, 32);
-    memcpy(msg + 46, ns, 32);
-    tsdb_hmac_sha256(secret, slen, msg, sizeof msg, out);
+    uint8_t k[64] = {0}, pad[64], ih[32];
+    if (klen > 64)
+        tsdb_sha256_buf(key, klen, k);
+    else if (klen)
+        memcpy(k, key, klen);
+    tsdb_sha256 c;
+    for (int i = 0; i < 64; i++)
+        pad[i] = k[i] ^ 0x36;
+    tsdb_sha256_init(&c);
+    tsdb_sha256_update(&c, pad, 64);
+    for (int i = 0; i < n; i++)
+        tsdb_sha256_update(&c, part[i], len[i]);
+    tsdb_sha256_final(&c, ih);
+    for (int i = 0; i < 64; i++)
+        pad[i] = k[i] ^ 0x5c;
+    tsdb_sha256_init(&c);
+    tsdb_sha256_update(&c, pad, 64);
+    tsdb_sha256_update(&c, ih, 32);
+    tsdb_sha256_final(&c, out);
+    explicit_bzero(k, sizeof k);
+    explicit_bzero(pad, sizeof pad);
+    explicit_bzero(&c, sizeof c);
+}
+
+/* A handshake MAC or a link key: HMAC(secret, label | transcript). The transcript is the dialer's HELLO body, then
+ * HELLO_ACK's fields before its MAC (and, for AUTH and the keys, that MAC): every claim either side made (ids, uuid,
+ * identity, peer address, both nonces) is covered, so a relay that changes one of them is caught, and one that
+ * changes nothing gets a link it cannot write into (the keys are the secret's, the frames are tagged). */
+static void hs_mac(const uint8_t *secret, size_t slen, const char *label, const uint8_t *tr, size_t trlen,
+                   uint8_t out[32])
+{
+    const void *part[2] = {label, tr};
+    size_t len[2] = {strlen(label), trlen};
+    cluster_hmac_parts(secret, slen, 2, part, len, out);
+}
+
+/* the tag of one frame after AUTH: its sequence number in that direction, its type and its payload */
+static void frame_tag(const uint8_t key[32], uint64_t seq, const uint8_t *body, size_t n, uint8_t out[32])
+{
+    uint8_t s[8];
+    for (int i = 0; i < 8; i++)
+        s[i] = (uint8_t)(seq >> (8 * i));
+    const void *part[2] = {s, body};
+    size_t len[2] = {8, n};
+    cluster_hmac_parts(key, 32, 2, part, len, out);
+}
+
+/* an untagged frame ([len][type][payload]) appended to `to` with its tag */
+static void put_tagged(struct buf *to, const uint8_t key[32], uint64_t *seq, const uint8_t *frame, size_t flen)
+{
+    uint8_t t[TAG];
+    frame_tag(key, (*seq)++, frame + 4, flen - 4, t);
+    put32(to, (uint32_t)(flen - 4 + TAG));
+    put(to, frame + 4, flen - 4);
+    put(to, t, TAG);
 }
 
 static int zero16(const uint8_t *u)
@@ -391,9 +459,24 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
 
 int cluster_read_secret(const char *path, uint8_t *out, size_t cap, size_t *len, char *err, size_t errn)
 {
-    FILE *f = fopen(path, "rb");
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        snprintf(err, errn, "cannot open the secret file %s: %s", path, strerror(errno));
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode) || (st.st_mode & 077)) {
+        snprintf(err, errn, "the secret file %s is %s: refused (chmod 600 %s; `tsdb cluster secret FILE` makes one)",
+                 path, S_ISREG(st.st_mode) ? "open to its group or to others" : "not a regular file", path);
+        close(fd);
+        return -1;
+    }
+    FILE *f = fdopen(fd, "rb");
     if (!f) {
         snprintf(err, errn, "cannot open the secret file %s: %s", path, strerror(errno));
+        close(fd);
         return -1;
     }
     size_t n = fread(out, 1, cap, f);
@@ -416,6 +499,54 @@ int cluster_read_secret(const char *path, uint8_t *out, size_t cap, size_t *len,
         return -1;
     }
     *len = n;
+    return 0;
+}
+
+int cluster_make_secret(const char *path, char *err, size_t errn)
+{
+    uint8_t raw[32];
+    char text[2 * sizeof raw + 2];
+    if (tsdb_random(raw, sizeof raw) != 0) {
+        snprintf(err, errn, "no random bytes: %s", strerror(errno));
+        return -1;
+    }
+    for (size_t i = 0; i < sizeof raw; i++)
+        sprintf(text + 2 * i, "%02x", raw[i]);
+    explicit_bzero(raw, sizeof raw);
+    text[2 * sizeof raw] = '\n';
+    size_t n = 2 * sizeof raw + 1;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        snprintf(err, errn, "cannot make %s: %s", path, strerror(errno));
+        return -1;
+    }
+    int ok = fchmod(fd, 0600) == 0 && write(fd, text, n) == (ssize_t)n && fsync(fd) == 0;
+    int e = errno;
+    explicit_bzero(text, sizeof text);
+    if (close(fd) != 0 && ok) {
+        ok = 0;
+        e = errno;
+    }
+    if (!ok) {
+        unlink(path);
+        snprintf(err, errn, "cannot write %s: %s", path, strerror(e));
+        return -1;
+    }
+    char dir[4096];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash)
+        *(slash == dir ? slash + 1 : slash) = 0;
+    else
+        snprintf(dir, sizeof dir, ".");
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0 || fsync(dfd) != 0) {
+        snprintf(err, errn, "cannot sync the directory of %s: %s", path, strerror(errno));
+        if (dfd >= 0)
+            close(dfd);
+        return -1;
+    }
+    close(dfd);
     return 0;
 }
 
@@ -490,9 +621,10 @@ int cluster_admin(const char *addr, const uint8_t *secret, size_t secret_len, in
         return -1;
     }
     struct buf b = {0};
-    uint8_t nc[32], ns[32], m[32], want[32], *p = NULL;
+    uint8_t nc[32], m[32], want[32], kout[32], kin[32], tr[HS_TR_MAX], *p = NULL;
+    uint64_t seq_in = 0, seq_out = 0;
     uint8_t type;
-    size_t n;
+    size_t n, trlen;
     int ret = -1;
     tsdb_random(nc, sizeof nc);
     uint8_t zero[16] = {0};
@@ -501,30 +633,38 @@ int cluster_admin(const char *addr, const uint8_t *secret, size_t secret_len, in
     put8(&b, CL_VERSION);
     put32(&b, 0);
     put(&b, zero, 16);
+    put(&b, zero, 16); /* no identity: not a server */
     put(&b, nc, 32);
     putstr(&b, "");
     frame_end(&b);
+    trlen = b.len - 5;
+    memcpy(tr, b.p + 5, trlen);
     if (write_all(fd, b.p, b.len, deadline) != 0 || read_frame(fd, deadline, &type, &p, &n) != 0) {
         snprintf(err, errn, "%s did not answer as a tsdbd cluster peer port", addr);
         goto out;
     }
-    struct rd r = {p, n, 0, 0};
-    get32(&r);
-    getn(&r, zero, 16);
-    getn(&r, ns, 32);
-    getn(&r, m, 32);
-    mac(secret, secret_len, "tsdb-cluster-s", nc, ns, want);
-    if (type != F_HELLO_ACK || r.bad || !tsdb_ct_equal(m, want, 32)) {
+    /* HELLO_ACK: id, uuid, identity, nonce, then the MAC over the transcript so far */
+    if (type != F_HELLO_ACK || n != 4 + 16 + 16 + 32 + 32) {
         snprintf(err, errn, "%s is not a cluster peer port with this secret", addr);
         goto out;
     }
+    memcpy(tr + trlen, p, n - 32);
+    trlen += n - 32;
+    hs_mac(secret, secret_len, "tsdb-cluster-s", tr, trlen, want);
+    if (!tsdb_ct_equal(p + n - 32, want, 32)) {
+        snprintf(err, errn, "%s is not a cluster peer port with this secret", addr);
+        goto out;
+    }
+    memcpy(tr + trlen, p + n - 32, 32);
+    trlen += 32;
     free(p);
     p = NULL;
-    mac(secret, secret_len, "tsdb-cluster-c", nc, ns, m);
+    hs_mac(secret, secret_len, "tsdb-cluster-c", tr, trlen, m);
+    hs_mac(secret, secret_len, "tsdb-cluster-k>", tr, trlen, kout);
+    hs_mac(secret, secret_len, "tsdb-cluster-k<", tr, trlen, kin);
     frame_begin(&b, F_AUTH);
     put(&b, m, 32);
     frame_end(&b);
-    size_t auth_len = b.len;
     uint32_t reqid = 1;
     struct buf a = {0};
     frame_begin(&a, F_ADMIN);
@@ -532,7 +672,8 @@ int cluster_admin(const char *addr, const uint8_t *secret, size_t secret_len, in
     put32(&a, reqid);
     put(&a, req, req_len);
     frame_end(&a);
-    int wr = write_all(fd, b.p, auth_len, deadline) || write_all(fd, a.p, a.len, deadline);
+    put_tagged(&b, kout, &seq_out, a.p, a.len);
+    int wr = write_all(fd, b.p, b.len, deadline);
     buf_free(&a);
     if (wr) {
         snprintf(err, errn, "%s closed the connection (a wrong secret?)", addr);
@@ -544,6 +685,25 @@ int cluster_admin(const char *addr, const uint8_t *secret, size_t secret_len, in
                      timeout_ms);
             goto out;
         }
+        uint8_t t[TAG];
+        if (n < TAG) {
+            snprintf(err, errn, "a frame from %s is too short", addr);
+            goto out;
+        }
+        /* the tag covers the type and the payload: rebuild them in one piece */
+        uint8_t *body = malloc(n + 1);
+        if (!body)
+            goto out;
+        body[0] = type;
+        memcpy(body + 1, p, n);
+        frame_tag(kin, seq_in++, body, n + 1 - TAG, t);
+        int good = tsdb_ct_equal(t, body + n + 1 - TAG, TAG);
+        free(body);
+        if (!good) {
+            snprintf(err, errn, "a frame from %s does not authenticate", addr);
+            goto out;
+        }
+        n -= TAG;
         if (type == F_ADMIN_REPLY) {
             struct rd q = {p, n, 0, 0};
             uint32_t id = get32(&q);
@@ -570,6 +730,8 @@ out:
     free(p);
     buf_free(&b);
     close(fd);
+    explicit_bzero(kin, sizeof kin);
+    explicit_bzero(kout, sizeof kout);
     return ret;
 }
 
@@ -583,11 +745,16 @@ struct conn {
     uint32_t id;      /* the remote node id (0: the CLI, or a server in no cluster) */
     uint32_t want_id; /* dialed to reach this node id (0: dialed by address) */
     char peer[META_ADDR_MAX];
-    uint8_t nc[32], ns[32];
-    struct buf rb, wb, q; /* q: frames queued before AUTH */
+    uint8_t ident[16]; /* the remote server's identity, as its HELLO or HELLO_ACK claimed it */
+    uint8_t nc[32];
+    uint8_t tr[HS_TR_MAX]; /* the handshake's transcript (hs_mac) */
+    size_t trlen;
+    uint8_t kin[32], kout[32]; /* the link's keys, from AUTH on */
+    uint64_t seq_in, seq_out;
+    struct buf rb, wb, q; /* q: frames queued before AUTH (untagged; tagged as they move to wb) */
     int watch_served;     /* it watches this server */
     int watch_ours;       /* this server's watch stream */
-    int join;             /* a JOIN sent for a NODE_ADD, not yet answered */
+    int join;             /* NODE_ADD: 1 a PROBE sent, 2 a JOIN sent, not yet answered */
     uint64_t join_cli;
     uint32_t join_reqid, join_id;
 };
@@ -617,10 +784,11 @@ struct pend {
     uint64_t conn; /* 0: no reply */
     uint32_t reqid, member;
     uint64_t index, term;
+    uint64_t join; /* a NODE_ADD's MEMBER_ADD: the link to the new server, which gets JOIN once it applied */
 };
 
 static struct {
-    char dir[1024], metadir[1040], logdir[1060], nodefile[1060], snapfile[1060];
+    char dir[1024], metadir[1040], logdir[1060], nodefile[1060], snapfile[1060], identfile[1060];
     char adv[META_ADDR_MAX], padv[META_ADDR_MAX], rack[META_RACK_MAX];
     uint8_t secret[CLUSTER_SECRET_MAX];
     size_t secret_len;
@@ -630,6 +798,7 @@ static struct {
     atomic_int stop;
 
     int have_node;
+    uint8_t ident[16]; /* this server's own identity (meta/IDENT), made at its first start, never changed */
     uint8_t uuid[16];
     uint32_t id;
     uint64_t incarnation;
@@ -664,11 +833,17 @@ static struct {
     uint32_t init_reqid;
     struct meta_settings init_set;
     uint32_t reserved_id;
+    uint64_t pend_join; /* set around propose() by a NODE_ADD: the new server's link (struct pend) */
 
     uint64_t next_hb, next_manage, next_duty, watch_conn, watch_next_try;
     unsigned watch_rot;
     uint32_t hint_leader;
     uint64_t hint_term, hint_commit;
+    uint64_t watch_behind_since; /* when the watch stream first stayed behind hint_commit; 0: it does not */
+
+    /* TSDB_CLUSTER_TEST (tests only): snap_every=N, snap_retain=N, seg_bytes=N, fail_snap_dirsync=1 */
+    uint64_t snap_every, snap_retain, seg_bytes;
+    int fail_snap_dirsync;
 
     struct buf fb; /* the frame being built; never held across a call that builds another */
     raft_entry ents[RAFT_WIRE_MAX_ENTRIES];
@@ -721,7 +896,8 @@ static int fsync_dir(const char *d)
     return rc;
 }
 
-/* tmp, fsync, rename, directory fsync */
+/* tmp, fsync, rename, directory fsync. 0; -1 when nothing was renamed; -2 when the new name is in place and the
+ * directory fsync failed: the caller must stop (a later fsync on another descriptor does not report that error) */
 static int write_durable(const char *path, const void *data, size_t len)
 {
     char tmp[1100];
@@ -753,7 +929,7 @@ static int write_durable(const char *path, const void *data, size_t len)
         unlink(tmp);
         return -1;
     }
-    return fsync_dir(C.metadir);
+    return fsync_dir(C.metadir) == 0 ? 0 : -2;
 }
 
 static void hex16(const uint8_t *u, char *out)
@@ -817,6 +993,60 @@ static int node_load(char *err, size_t errn)
     return 1;
 }
 
+/* meta/IDENT: this server's identity, made once. A server whose meta/ is gone is a new server (the member record of
+ * the old one keeps refusing it, claim_ok). 0, or -1 with err. */
+static int ident_load(char *err, size_t errn)
+{
+    FILE *f = fopen(C.identfile, "r");
+    if (f) {
+        char line[128] = "";
+        int ok = fgets(line, sizeof line, f) != NULL && !strncmp(line, "ident=", 6);
+        int bad = ferror(f);
+        fclose(f);
+        line[strcspn(line, "\n")] = 0;
+        if (bad || !ok || unhex16(line + 6, C.ident) != 0 || zero16(C.ident)) {
+            snprintf(err, errn, "%s is damaged (it needs ident=<32 hex digits>)", C.identfile);
+            return -1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT) {
+        snprintf(err, errn, "cannot open %s: %s", C.identfile, strerror(errno));
+        return -1;
+    }
+    do
+        tsdb_random(C.ident, sizeof C.ident);
+    while (zero16(C.ident));
+    char u[33], text[64];
+    hex16(C.ident, u);
+    int n = snprintf(text, sizeof text, "ident=%s\n", u);
+    if (write_durable(C.identfile, text, (size_t)n) != 0) {
+        snprintf(err, errn, "cannot write %s: %s", C.identfile, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void test_knobs(void)
+{
+    const char *t = getenv("TSDB_CLUSTER_TEST");
+    C.snap_every = SNAP_EVERY;
+    for (const char *p = t; p && *p;) {
+        unsigned long long v = 0;
+        if (sscanf(p, "snap_every=%llu", &v) == 1 && v)
+            C.snap_every = v;
+        else if (sscanf(p, "snap_retain=%llu", &v) == 1)
+            C.snap_retain = v;
+        else if (sscanf(p, "seg_bytes=%llu", &v) == 1)
+            C.seg_bytes = v;
+        else if (sscanf(p, "fail_snap_dirsync=%llu", &v) == 1)
+            C.fail_snap_dirsync = v != 0;
+        p = strchr(p, ',');
+        if (p)
+            p++;
+    }
+}
+
 static int exists(const char *p)
 {
     struct stat st;
@@ -857,18 +1087,36 @@ static struct conn *conn_by_serial(uint64_t s)
     return NULL;
 }
 
-/* the frame in C.fb to `c`: before AUTH into its queue unless `hs` (a handshake frame) */
+/* the frame in C.fb to `c`: before AUTH into its queue unless `hs` (a handshake frame); after it tagged */
 static void conn_send_buf(struct conn *c, const struct buf *f, int hs)
 {
     if (c->dead)
         return;
     struct buf *to = hs || c->state == CS_READY ? &c->wb : &c->q;
-    if (to->len - to->off + f->len > WB_MAX) {
+    if (to->len - to->off + f->len + TAG > WB_MAX) {
         say("the link to node %" PRIu32 " (%s) has %u MiB queued; dropping it", c->id, c->peer, WB_MAX >> 20);
         c->dead = 1;
         return;
     }
-    put(to, f->p, f->len);
+    if (!hs && c->state == CS_READY)
+        put_tagged(to, c->kout, &c->seq_out, f->p, f->len);
+    else
+        put(to, f->p, f->len);
+}
+
+/* AUTH passed: the link's keys from the transcript, and what was queued goes out tagged */
+static void conn_ready(struct conn *c)
+{
+    const char *kd = c->out ? "tsdb-cluster-k>" : "tsdb-cluster-k<", *ku = c->out ? "tsdb-cluster-k<" : "tsdb-cluster-k>";
+    hs_mac(C.secret, C.secret_len, kd, c->tr, c->trlen, c->kout);
+    hs_mac(C.secret, C.secret_len, ku, c->tr, c->trlen, c->kin);
+    c->state = CS_READY;
+    for (size_t off = c->q.off; off + 4 <= c->q.len;) {
+        size_t fl = 4 + (size_t)le32(c->q.p + off);
+        put_tagged(&c->wb, c->kout, &c->seq_out, c->q.p + off, fl);
+        off += fl;
+    }
+    buf_free(&c->q);
 }
 
 static void conn_send(struct conn *c, int hs) { conn_send_buf(c, &C.fb, hs); }
@@ -970,9 +1218,12 @@ static void send_hello(struct conn *c)
     put8(&C.fb, CL_VERSION);
     put32(&C.fb, C.have_node ? C.id : 0);
     put(&C.fb, C.have_node ? C.uuid : zero, 16);
+    put(&C.fb, C.ident, 16);
     put(&C.fb, c->nc, 32);
     putstr(&C.fb, C.padv);
     frame_end(&C.fb);
+    c->trlen = C.fb.len - 5;
+    memcpy(c->tr, C.fb.p + 5, c->trlen);
     conn_send(c, 1);
     c->state = CS_HELLO_SENT;
 }
@@ -1042,8 +1293,10 @@ static void pend_add(uint64_t conn, uint32_t reqid, uint32_t member, uint64_t in
         if (!C.pend)
             oom();
     }
-    C.pend[C.npend++] = (struct pend){conn, reqid, member, index, term};
+    C.pend[C.npend++] = (struct pend){conn, reqid, member, index, term, C.pend_join};
 }
+
+static void send_join(struct conn *d, uint32_t id);
 
 /* entry `index` (`term`) applied with the first operation's result rc0: answer whoever waited for it */
 static void pend_applied(uint64_t index, uint64_t term, int rc0)
@@ -1052,8 +1305,13 @@ static void pend_applied(uint64_t index, uint64_t term, int rc0)
         struct pend *p = &C.pend[i];
         if (p->index <= index) {
             int rc = p->index == index && p->term == term ? rc0 : CLUSTER_ERR_RETRY;
-            if (p->conn)
-                admin_reply(p->conn, p->reqid, rc, NULL, 0);
+            struct conn *d = p->join ? conn_by_serial(p->join) : NULL;
+            if (d && rc == 0)
+                send_join(d, p->member); /* committed: now the server may learn its id; it answers the CLI */
+            else if (p->conn)
+                admin_reply(p->conn, p->reqid, p->join && rc == 0 ? CLUSTER_ERR_UNREACHABLE : rc, NULL, 0);
+            if (d && rc != 0)
+                d->dead = 1;
             C.pend[i] = C.pend[--C.npend];
         } else {
             i++;
@@ -1217,11 +1475,18 @@ static void take_snapshot(void)
     size_t len;
     if (meta_snapshot_encode(&C.sm, &img, &len) != META_OK)
         oom();
-    if (write_durable(C.snapfile, img, len) != 0) {
+    int rc = write_durable(C.snapfile, img, len);
+    if (rc == 0 && C.fail_snap_dirsync) {
+        rc = -2;
+        errno = EIO;
+    }
+    if (rc == -2) /* the new snapshot is named, maybe not durably: compacting on it could lose the log's base */
+        fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.snapfile, strerror(errno));
+    if (rc != 0) {
         say("cannot write %s: %s (the log is kept until a later snapshot is written)", C.snapfile,
             strerror(errno));
         free(img);
-        C.snap_index = C.sm.applied; /* try again SNAP_EVERY entries later, not on every one */
+        C.snap_index = C.sm.applied; /* try again snap_every entries later, not on every one */
         return;
     }
     free(C.snap);
@@ -1257,7 +1522,7 @@ static void send_raft(const raft_msg *m)
         fail_stop("cannot encode a Raft %s", raft_msg_type_name(m->type));
     C.fb.len += wl;
     put(&C.fb, img, il);
-    if (C.fb.len - 4 > FRAME_MAX) {
+    if (C.fb.len - 4 + TAG > FRAME_MAX) {
         say("a Raft %s to node %" PRIu32 " is larger than a frame; not sent", raft_msg_type_name(m->type), m->to);
         if (m->type == RAFT_MSG_SNAPSHOT)
             raft_snapshot_failed(C.r, m->to);
@@ -1337,7 +1602,7 @@ static void pump(void)
     if (!C.r)
         return;
     check_fault();
-    if (C.sm.applied >= C.snap_index + SNAP_EVERY)
+    if (C.sm.applied >= C.snap_index + C.snap_every)
         take_snapshot();
 }
 
@@ -1347,6 +1612,41 @@ static void close_watches(void)
         if (C.conns[i]->watch_served || C.conns[i]->watch_ours)
             C.conns[i]->dead = 1;
     C.watch_conn = 0;
+}
+
+/* The log begins after the snapshot's index: an install stopped between the core's reset of the log and the image
+ * reaching meta/snapshot (a crash or power loss in restore()). Entries between the two are in neither, so this
+ * server could never apply again. It fences its vote at what its log holds (the log forgot what it acknowledged;
+ * the fence lifts once it holds that entry again or a snapshot covers it), drops the old snapshot and empties the
+ * log, so the leader sends it an image again. Each step is durable before the next, and a crash part way leaves
+ * the same condition, which the next start repairs the same way. 0, or -1 with err. */
+static int reseed_self(raft_hard_state *hs, char *err, size_t errn)
+{
+    const raft_log_ops *ops = &raft_log_file_ops;
+    raft_index first = ops->first(C.log), last = ops->last(C.log);
+    raft_index fi = last;
+    raft_term ft = ops->term_at(C.log, last);
+    say("the Raft log in %s begins at %" PRIu64 ", after the snapshot's %" PRIu64 " (an install that did not finish):"
+        " fencing the vote at %" PRIu64 " and emptying the log, for a new image from the leader",
+        C.logdir, (uint64_t)(first - 1), C.sm.applied, (uint64_t)fi);
+    if (hs->fence_index > fi) { /* a fence from an earlier try of this, on more than the log holds now */
+        fi = hs->fence_index;
+        ft = hs->fence_term;
+    }
+    if (raft_log_hard_fence(C.log, hs->term, fi, ft, hs, err, errn) != ISO_OK)
+        return -1;
+    if (exists(C.snapfile) && (unlink(C.snapfile) != 0 || fsync_dir(C.metadir) != 0)) {
+        snprintf(err, errn, "cannot remove %s: %s", C.snapfile, strerror(errno));
+        return -1;
+    }
+    if (raft_log_discard(C.log, err, errn) != ISO_OK)
+        return -1;
+    meta_free(&C.sm);
+    meta_init(&C.sm);
+    free(C.snap);
+    C.snap = NULL;
+    C.snaplen = C.snap_index = 0;
+    return 0;
 }
 
 /* The core from the files: the snapshot (or none), the log on it, the hard state. 0, or -1 with err. */
@@ -1378,7 +1678,7 @@ static int core_boot(char *err, size_t errn)
         C.snaplen = (size_t)n;
         C.snap_index = C.sm.applied;
     }
-    raft_log_opts lo = {0};
+    raft_log_opts lo = {.segment_bytes = C.seg_bytes};
     if (raft_log_open(C.logdir, &lo, C.sm.applied, C.sm.applied_term, &C.log, err, errn) != ISO_OK)
         return -1;
     raft_hard_state hs = {0};
@@ -1390,10 +1690,18 @@ static int core_boot(char *err, size_t errn)
     }
     if (e == ISO_ERR_NOTFOUND)
         hs = (raft_hard_state){0};
+    raft_index first = raft_log_file_ops.first(C.log);
+    if (first > 1 && first - 1 > C.sm.applied && reseed_self(&hs, err, errn) != 0) {
+        raft_log_close(C.log);
+        C.log = NULL;
+        return -1;
+    }
     raft_boot b = {.hard = hs, .applied = C.sm.applied, .applied_term = C.sm.applied_term};
     config_of(&C.sm, &b.config);
     raft_opts o;
     raft_opts_defaults(&o);
+    if (C.snap_retain)
+        o.snapshot_retain = C.snap_retain;
     tsdb_random(&o.seed, sizeof o.seed);
     C.r = raft_new(C.id, &o, &raft_log_file_ops, C.log, &b, err, errn);
     if (!C.r) {
@@ -1519,9 +1827,12 @@ static void on_hb_ack(struct rd *r)
     uint64_t term = get64(r), commit = get64(r);
     if (r->bad || term < C.hint_term)
         return;
-    C.hint_leader = leader;
+    if (term > C.hint_term || leader)
+        C.hint_leader = leader;
+    /* the highest commit any voter reported in this term: what the watch stream must reach (watch_duty) */
+    if (term > C.hint_term || commit > C.hint_commit)
+        C.hint_commit = commit;
     C.hint_term = term;
-    C.hint_commit = commit;
 }
 
 /* after the probe state moved: removed while away? */
@@ -1622,11 +1933,16 @@ static void admin_init(struct conn *c, uint32_t reqid, struct rd *r)
         admin_reply(c->serial, reqid, META_ERR_FORMAT, NULL, 0);
         return;
     }
-    if (C.have_node && (C.sm.initialised || !C.r || C.id != 1 || C.init_pending)) {
+    /* NODE is written first; a crash before the snapshot left NODE of id 1 and nothing else: an init to finish */
+    int unfinished = C.have_node && C.id == 1 && !C.r && !C.sm.initialised && !exists(C.snapfile) &&
+                     !exists(C.logdir);
+    if (C.have_node && !unfinished && (C.sm.initialised || !C.r || C.id != 1 || C.init_pending)) {
         admin_reply(c->serial, reqid, CLUSTER_ERR_EXISTS, NULL, 0);
         return;
     }
-    if (!C.have_node) {
+    if (unfinished)
+        say("finishing an init that stopped before its first snapshot");
+    if (!C.have_node || unfinished) {
         /* the first server: id 1, a configuration of itself, written before the core starts on it */
         tsdb_random(C.uuid, sizeof C.uuid);
         C.id = 1;
@@ -1662,6 +1978,11 @@ static void admin_init(struct conn *c, uint32_t reqid, struct rd *r)
     C.init_set = s;
 }
 
+/* NODE_ADD (§2.2), on the leader. The new server's id comes from the log, never from this leader's memory: PROBE asks
+ * the server for its identity; MEMBER_ADD commits the next id with that identity; only then does JOIN tell the
+ * server its id, which it writes to NODE. A leader that loses its office part way leaves either nothing or a
+ * committed member the server has not heard of yet; `node add` again finds that member by the identity and sends
+ * the JOIN. So one id is never handed to two servers, and claim_ok refuses a server that claims another's. */
 static void admin_node_add(struct conn *c, uint32_t reqid, struct rd *r)
 {
     char addr[META_ADDR_MAX];
@@ -1676,19 +1997,23 @@ static void admin_node_add(struct conn *c, uint32_t reqid, struct rd *r)
                     lp, strlen(lp));
         return;
     }
-    uint32_t id = C.sm.next_member > C.reserved_id ? C.sm.next_member : C.reserved_id;
-    if (!id)
-        id = 1;
     struct conn *d = dial_conn(addr, 0);
     if (!d) {
         admin_reply(c->serial, reqid, CLUSTER_ERR_UNREACHABLE, NULL, 0);
         return;
     }
-    C.reserved_id = id + 1;
     d->join = 1;
     d->join_cli = c->serial;
     d->join_reqid = reqid;
-    d->join_id = id;
+    frame_begin(&C.fb, F_PROBE);
+    put(&C.fb, C.uuid, 16);
+    frame_end(&C.fb);
+    conn_send(d, 0);
+}
+
+/* the leader's JOIN: the committed id, and the identity it was committed with */
+static void send_join(struct conn *d, uint32_t id)
+{
     /* the seeds: the voters' peer addresses, where the new server finds a watch stream */
     char seeds[1024] = "";
     raft_config cfg;
@@ -1701,12 +2026,94 @@ static void admin_node_add(struct conn *c, uint32_t reqid, struct rd *r)
             strcat(seeds, m->peer);
         }
     }
-    frame_begin(&C.fb, F_JOIN);
-    put(&C.fb, C.uuid, 16);
-    put32(&C.fb, id);
-    putstr(&C.fb, seeds);
+    d->join = 2;
+    d->join_id = id;
+    struct buf b = {0}; /* not C.fb: this runs inside an apply */
+    frame_begin(&b, F_JOIN);
+    put(&b, C.uuid, 16);
+    put32(&b, id);
+    put(&b, d->ident, 16);
+    putstr(&b, seeds);
+    frame_end(&b);
+    conn_send_buf(d, &b, 0);
+    buf_free(&b);
+}
+
+/* on the new server: who it is, and whether it is free to join this cluster */
+static void on_probe(struct conn *c, struct rd *r)
+{
+    uint8_t uuid[16];
+    getn(r, uuid, 16);
+    if (r->bad || zero16(uuid)) {
+        c->dead = 1;
+        return;
+    }
+    int32_t rc = C.have_node && memcmp(uuid, C.uuid, 16) != 0 ? CLUSTER_ERR_REFUSED : 0;
+    frame_begin(&C.fb, F_PROBE_REPLY);
+    put32(&C.fb, (uint32_t)rc);
+    put32(&C.fb, C.have_node ? C.id : 0);
+    put64(&C.fb, C.have_node ? C.incarnation : 1);
+    putstr(&C.fb, C.adv);
+    putstr(&C.fb, C.padv);
+    putstr(&C.fb, C.rack);
     frame_end(&C.fb);
-    conn_send(d, 0);
+    conn_send(c, 0);
+}
+
+static const struct meta_member *member_by_ident(const uint8_t ident[16])
+{
+    for (uint32_t i = 0; i < C.sm.nmembers; i++)
+        if (C.sm.members[i].state != META_OUT && !memcmp(C.sm.members[i].ident, ident, 16))
+            return &C.sm.members[i];
+    return NULL;
+}
+
+static void on_probe_reply(struct conn *c, struct rd *r)
+{
+    if (c->join != 1)
+        return;
+    struct meta_member mb = {0};
+    int32_t rc = (int32_t)get32(r);
+    uint32_t has = get32(r);
+    mb.incarnation = get64(r);
+    getstr(r, mb.addr, sizeof mb.addr);
+    getstr(r, mb.peer, sizeof mb.peer);
+    getstr(r, mb.rack, sizeof mb.rack);
+    c->join = 0;
+    if (r->bad)
+        rc = CLUSTER_ERR_UNREACHABLE;
+    if (!rc && (!C.r || raft_get_role(C.r) != RAFT_LEADER)) {
+        const char *lp = leader_peer();
+        admin_reply(c->join_cli, c->join_reqid, CLUSTER_ERR_NOTLEADER, lp, strlen(lp));
+        c->dead = 1;
+        return;
+    }
+    const struct meta_member *known = rc ? NULL : member_by_ident(c->ident);
+    if (!rc && known && (!has || has == known->id)) {
+        send_join(c, known->id); /* committed before, its JOIN never arrived: the same id again */
+        return;
+    }
+    if (!rc && has)
+        rc = CLUSTER_ERR_REFUSED; /* it holds an id that no live member of this cluster has with its identity */
+    if (rc) {
+        admin_reply(c->join_cli, c->join_reqid, rc, NULL, 0);
+        c->dead = 1;
+        return;
+    }
+    mb.id = C.sm.next_member > C.reserved_id ? C.sm.next_member : C.reserved_id;
+    if (!mb.id)
+        mb.id = 1;
+    C.reserved_id = mb.id + 1; /* two adds in flight: the second asks for the next id (the log decides either way) */
+    mb.state = META_UP;
+    memcpy(mb.ident, c->ident, 16);
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_member_add(&e, &mb);
+    heard_set(mb.id, iso_now_ns(), mb.incarnation, 0, NULL, NULL); /* not down before it heard its JOIN */
+    C.pend_join = c->serial;
+    if (propose(&e, c->join_cli, c->join_reqid, mb.id) != ISO_OK)
+        c->dead = 1;
+    C.pend_join = 0;
 }
 
 static void on_admin(struct conn *c, struct rd *r)
@@ -1733,9 +2140,10 @@ static void on_admin(struct conn *c, struct rd *r)
 
 static void on_join(struct conn *c, struct rd *r)
 {
-    uint8_t uuid[16];
+    uint8_t uuid[16], ident[16];
     getn(r, uuid, 16);
     uint32_t id = get32(r);
+    getn(r, ident, 16);
     char seeds[1024];
     getstr(r, seeds, sizeof seeds);
     int32_t rc = 0;
@@ -1743,7 +2151,9 @@ static void on_join(struct conn *c, struct rd *r)
         c->dead = 1;
         return;
     }
-    if (!C.have_node) {
+    if (memcmp(ident, C.ident, 16) != 0) {
+        rc = CLUSTER_ERR_REFUSED; /* the id was committed for another server */
+    } else if (!C.have_node) {
         memcpy(C.uuid, uuid, 16);
         C.id = id;
         C.incarnation = 1;
@@ -1757,55 +2167,53 @@ static void on_join(struct conn *c, struct rd *r)
     }
     frame_begin(&C.fb, F_JOIN_REPLY);
     put32(&C.fb, (uint32_t)rc);
-    put64(&C.fb, C.incarnation);
-    putstr(&C.fb, C.adv);
-    putstr(&C.fb, C.padv);
-    putstr(&C.fb, C.rack);
     frame_end(&C.fb);
     conn_send(c, 0);
 }
 
 static void on_join_reply(struct conn *c, struct rd *r)
 {
-    if (!c->join)
+    if (c->join != 2)
         return;
-    struct meta_member mb = {0};
     int32_t rc = (int32_t)get32(r);
-    mb.incarnation = get64(r);
-    getstr(r, mb.addr, sizeof mb.addr);
-    getstr(r, mb.peer, sizeof mb.peer);
-    getstr(r, mb.rack, sizeof mb.rack);
     c->join = 0;
     c->dead = 1; /* it knew no id when it answered the handshake; the members link again by id */
     if (r->bad)
         rc = CLUSTER_ERR_UNREACHABLE;
-    if (rc) {
-        admin_reply(c->join_cli, c->join_reqid, rc, NULL, 0);
-        return;
-    }
-    if (!C.r || raft_get_role(C.r) != RAFT_LEADER) {
-        const char *lp = leader_peer();
-        admin_reply(c->join_cli, c->join_reqid, CLUSTER_ERR_NOTLEADER, lp, strlen(lp));
-        return;
-    }
-    mb.id = c->join_id;
-    mb.state = META_UP;
-    struct meta_entry e;
-    meta_entry_init(&e);
-    meta_op_member_add(&e, &mb);
-    heard_set(mb.id, iso_now_ns(), mb.incarnation, 0, NULL, NULL); /* it heartbeats once its watch stream has the member list */
-    propose(&e, c->join_cli, c->join_reqid, 0);
+    if (!rc)
+        heard_set(c->join_id, iso_now_ns(), 1, 0, NULL, NULL);
+    admin_reply(c->join_cli, c->join_reqid, rc, NULL, 0);
 }
 
+/* A server that claims member `id` with identity `ident` (HELLO, HELLO_ACK): refused when it is this server itself
+ * (a handshake reflected back) or when the member record names another server. Two servers must never act as one
+ * member: each would hold its own log and vote. A record this server does not know yet passes (the id was committed
+ * with the identity before JOIN named it, so a server that knows the record checks it). */
+static int claim_ok(uint32_t id, const uint8_t ident[16])
+{
+    if (!memcmp(ident, C.ident, 16))
+        return 0;
+    if (!id)
+        return 1;
+    if (zero16(ident))
+        return 0;
+    const struct meta_member *m = meta_member(&C.sm, id);
+    if (!m && C.wsm_on)
+        m = meta_member(&C.wsm, id);
+    return !m || zero16(m->ident) || !memcmp(m->ident, ident, 16);
+}
 
 static void handshake(struct conn *c, uint8_t type, struct rd *r)
 {
-    uint8_t uuid[16], m[32], want[32];
+    uint8_t uuid[16], ident[16], m[32], want[32], ns[32];
     if (c->state == CS_WAIT_HELLO && type == F_HELLO) {
+        memcpy(c->tr, r->p, r->len); /* r->len <= HS_FRAME_MAX (conn_read) */
+        c->trlen = r->len;
         uint32_t magic = get32(r);
         uint8_t ver = get8(r);
         uint32_t id = get32(r);
         getn(r, uuid, 16);
+        getn(r, ident, 16);
         getn(r, c->nc, 32);
         getstr(r, c->peer, sizeof c->peer);
         if (r->bad || magic != CL_MAGIC || ver != CL_VERSION) {
@@ -1817,24 +2225,43 @@ static void handshake(struct conn *c, uint8_t type, struct rd *r)
             c->dead = 1;
             return;
         }
+        if (!claim_ok(id, ident)) {
+            say("refused a server at %s that claims node %" PRIu32 " but is not the server that member is", c->peer,
+                id);
+            c->dead = 1;
+            return;
+        }
         c->id = id;
-        tsdb_random(c->ns, sizeof c->ns);
-        mac(C.secret, C.secret_len, "tsdb-cluster-s", c->nc, c->ns, m);
+        memcpy(c->ident, ident, 16);
+        tsdb_random(ns, sizeof ns);
         uint8_t zero[16] = {0};
         frame_begin(&C.fb, F_HELLO_ACK);
         put32(&C.fb, C.have_node ? C.id : 0);
         put(&C.fb, C.have_node ? C.uuid : zero, 16);
-        put(&C.fb, c->ns, 32);
+        put(&C.fb, C.ident, 16);
+        put(&C.fb, ns, 32);
+        memcpy(c->tr + c->trlen, C.fb.p + 5, C.fb.len - 5);
+        c->trlen += C.fb.len - 5;
+        hs_mac(C.secret, C.secret_len, "tsdb-cluster-s", c->tr, c->trlen, m);
         put(&C.fb, m, 32);
         frame_end(&C.fb);
+        memcpy(c->tr + c->trlen, m, 32);
+        c->trlen += 32;
         conn_send(c, 1);
         c->state = CS_WAIT_AUTH;
     } else if (c->state == CS_HELLO_SENT && type == F_HELLO_ACK) {
+        if (r->len != 4 + 16 + 16 + 32 + 32) {
+            c->dead = 1;
+            return;
+        }
+        memcpy(c->tr + c->trlen, r->p, r->len - 32);
+        c->trlen += r->len - 32;
         uint32_t id = get32(r);
         getn(r, uuid, 16);
-        getn(r, c->ns, 32);
+        getn(r, ident, 16);
+        getn(r, ns, 32);
         getn(r, m, 32);
-        mac(C.secret, C.secret_len, "tsdb-cluster-s", c->nc, c->ns, want);
+        hs_mac(C.secret, C.secret_len, "tsdb-cluster-s", c->tr, c->trlen, want);
         if (r->bad || !tsdb_ct_equal(m, want, 32)) {
             say("%s does not hold this cluster's secret; dropping the link", c->peer);
             c->dead = 1;
@@ -1846,24 +2273,30 @@ static void handshake(struct conn *c, uint8_t type, struct rd *r)
             c->dead = 1;
             return;
         }
+        if (!claim_ok(id, ident)) {
+            say("%s claims node %" PRIu32 " but is not the server that member is; dropping the link", c->peer, id);
+            c->dead = 1;
+            return;
+        }
         c->id = id;
-        mac(C.secret, C.secret_len, "tsdb-cluster-c", c->nc, c->ns, m);
+        memcpy(c->ident, ident, 16);
+        memcpy(c->tr + c->trlen, m, 32);
+        c->trlen += 32;
+        hs_mac(C.secret, C.secret_len, "tsdb-cluster-c", c->tr, c->trlen, m);
         frame_begin(&C.fb, F_AUTH);
         put(&C.fb, m, 32);
         frame_end(&C.fb);
         conn_send(c, 1);
-        c->state = CS_READY;
-        put(&c->wb, c->q.p ? c->q.p + c->q.off : NULL, c->q.len - c->q.off);
-        buf_free(&c->q);
+        conn_ready(c);
     } else if (c->state == CS_WAIT_AUTH && type == F_AUTH) {
         getn(r, m, 32);
-        mac(C.secret, C.secret_len, "tsdb-cluster-c", c->nc, c->ns, want);
+        hs_mac(C.secret, C.secret_len, "tsdb-cluster-c", c->tr, c->trlen, want);
         if (r->bad || !tsdb_ct_equal(m, want, 32)) {
             say("a peer at %s does not hold this cluster's secret; dropping it", c->peer[0] ? c->peer : "?");
             c->dead = 1;
             return;
         }
-        c->state = CS_READY;
+        conn_ready(c);
         addr_learn(c->id, c->peer);
     } else {
         c->dead = 1;
@@ -1894,6 +2327,8 @@ static void on_frame(struct conn *c, uint8_t type, const uint8_t *p, size_t n)
     case F_ADMIN: on_admin(c, &r); break;
     case F_JOIN: on_join(c, &r); break;
     case F_JOIN_REPLY: on_join_reply(c, &r); break;
+    case F_PROBE: on_probe(c, &r); break;
+    case F_PROBE_REPLY: on_probe_reply(c, &r); break;
     default: c->dead = 1; break;
     }
 }
@@ -1902,8 +2337,12 @@ static void conn_read(struct conn *c)
 {
     size_t got_round = 0;
     for (;;) {
-        buf_reserve(&c->rb, 65536);
-        ssize_t got = read(c->fd, c->rb.p + c->rb.len, c->rb.cap - c->rb.len);
+        int ready = c->state == CS_READY;
+        buf_reserve(&c->rb, ready ? 65536 : 2 * HS_FRAME_MAX);
+        size_t room = c->rb.cap - c->rb.len;
+        if (!ready && room > 2 * HS_FRAME_MAX)
+            room = 2 * HS_FRAME_MAX;
+        ssize_t got = read(c->fd, c->rb.p + c->rb.len, room);
         if (got < 0 && errno == EINTR)
             continue;
         if (got < 0 && errno == EAGAIN)
@@ -1914,19 +2353,32 @@ static void conn_read(struct conn *c)
         }
         c->rb.len += (size_t)got;
         got_round += (size_t)got;
-        if (got_round >= READ_ROUND)
-            break;
+        if (got_round >= READ_ROUND || c->state != CS_READY)
+            break; /* before AUTH one read a round: the frames are checked before more is taken in */
     }
     while (!c->dead && c->rb.len - c->rb.off >= 4) {
         uint32_t n = le32(c->rb.p + c->rb.off);
-        if (n == 0 || n > FRAME_MAX) {
+        int ready = c->state == CS_READY;
+        if (n == 0 || n > (ready ? FRAME_MAX : HS_FRAME_MAX) || (ready && n < 1 + TAG)) {
             c->dead = 1;
             break;
         }
         if (c->rb.len - c->rb.off - 4 < n)
             break;
         const uint8_t *f = c->rb.p + c->rb.off + 4;
-        on_frame(c, f[0], f + 1, n - 1);
+        if (ready) {
+            uint8_t t[TAG];
+            frame_tag(c->kin, c->seq_in++, f, n - TAG, t);
+            if (!tsdb_ct_equal(t, f + n - TAG, TAG)) {
+                say("a frame from node %" PRIu32 " (%s) does not authenticate; dropping the link", c->id,
+                    c->peer[0] ? c->peer : "?");
+                c->dead = 1;
+                break;
+            }
+            on_frame(c, f[0], f + 1, n - 1 - TAG);
+        } else {
+            on_frame(c, f[0], f + 1, n - 1);
+        }
         c->rb.off += 4 + (size_t)n;
     }
 }
@@ -2144,6 +2596,7 @@ static void leader_duties(uint64_t now)
         snprintf(first.addr, sizeof first.addr, "%s", C.adv);
         snprintf(first.peer, sizeof first.peer, "%s", C.padv);
         snprintf(first.rack, sizeof first.rack, "%s", C.rack);
+        memcpy(first.ident, C.ident, 16);
         struct meta_entry e;
         meta_entry_init(&e);
         meta_op_init(&e, C.uuid, &C.init_set, &first);
@@ -2189,9 +2642,28 @@ static void watch_duty(uint64_t now)
         }
         return;
     }
-    if (w || now < C.watch_next_try)
+    if (w) {
+        /* a voter that hangs, or is cut off from the group but not from this server, keeps its link open and sends
+         * nothing new: once another voter's commit stays ahead of the stream for a node timeout, watch another */
+        const struct meta_state *ws = C.r ? &C.wsm : &C.sm;
+        if (C.hint_commit <= ws->applied) {
+            C.watch_behind_since = 0;
+        } else if (!C.watch_behind_since) {
+            C.watch_behind_since = now;
+        } else if (since(now, C.watch_behind_since) >= (uint64_t)settings()->node_timeout_ms * MS) {
+            say("the watch stream from %s stays at %" PRIu64 " while a voter reports commit %" PRIu64
+                "; watching another voter", w->peer, ws->applied, C.hint_commit);
+            w->dead = 1;
+            C.watch_conn = 0;
+            C.watch_behind_since = 0;
+            C.watch_next_try = 0;
+        }
+        return;
+    }
+    if (now < C.watch_next_try)
         return;
     C.watch_next_try = now + 1000 * MS;
+    C.watch_behind_since = 0;
     if (C.r && !C.wsm_on) {
         meta_free(&C.wsm); /* the empty state cluster_start made, or a freed one */
         meta_init(&C.wsm);
@@ -2396,6 +2868,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.logdir, sizeof C.logdir, "%s/raft", C.metadir);
     snprintf(C.nodefile, sizeof C.nodefile, "%s/NODE", C.metadir);
     snprintf(C.snapfile, sizeof C.snapfile, "%s/snapshot", C.metadir);
+    snprintf(C.identfile, sizeof C.identfile, "%s/IDENT", C.metadir);
+    test_knobs();
     meta_init(&C.sm);
     meta_init(&C.wsm);
     if (mkdir(C.metadir, 0755) == 0) {
@@ -2409,6 +2883,10 @@ int cluster_start(const struct cluster_cfg *cfg)
     }
     iso_log_quiet = getenv("TSDB_CLUSTER_RAFT_LOG") == NULL; /* the core's INFO and WARN lines, on request */
     char err[2048];
+    if (ident_load(err, sizeof err) != 0) {
+        fprintf(stderr, "tsdbd: cluster: %s\n", err);
+        return -1;
+    }
     int got = node_load(err, sizeof err);
     if (got < 0) {
         fprintf(stderr, "tsdbd: cluster: %s\n", err);

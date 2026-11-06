@@ -366,6 +366,7 @@ static void put_member(struct wr *w, const struct meta_member *mb)
     putstr(w, mb->addr, META_ADDR_MAX);
     putstr(w, mb->peer, META_ADDR_MAX);
     putstr(w, mb->rack, META_RACK_MAX);
+    put(w, mb->ident, 16);
 }
 
 static void get_member(struct rd *r, struct meta_member *mb)
@@ -377,6 +378,7 @@ static void get_member(struct rd *r, struct meta_member *mb)
     getstr(r, mb->addr, META_ADDR_MAX);
     getstr(r, mb->peer, META_ADDR_MAX);
     getstr(r, mb->rack, META_RACK_MAX);
+    get(r, mb->ident, 16);
     if (mb->state > META_OUT)
         r->bad = 1;
 }
@@ -576,13 +578,24 @@ static int addr_taken(const struct meta_state *m, const char *peer)
     return 0;
 }
 
+static int ident_taken(const struct meta_state *m, const uint8_t ident[16])
+{
+    static const uint8_t zero[16];
+    if (!memcmp(ident, zero, 16))
+        return 0;
+    for (uint32_t i = 0; i < m->nmembers; i++)
+        if (m->members[i].state != META_OUT && !memcmp(m->members[i].ident, ident, 16))
+            return 1;
+    return 0;
+}
+
 static int insert_member(struct meta_state *m, const struct meta_member *mb)
 {
     if (mb->id == 0 || mb->id == META_NONE || !mb->peer[0])
         return META_ERR_INVALID;
     int32_t at = member_at(m, mb->id);
-    if (at >= 0 || mb->id < m->next_member || addr_taken(m, mb->peer))
-        return META_ERR_EXISTS; /* ids are never reused, nor a live peer address shared */
+    if (at >= 0 || mb->id < m->next_member || addr_taken(m, mb->peer) || ident_taken(m, mb->ident))
+        return META_ERR_EXISTS; /* ids are never reused, nor a live server or peer address under two ids */
     uint32_t pos = (uint32_t)(-1 - at);
     m->members = grow(m->members, &m->members_cap, m->nmembers + 1, sizeof *m->members);
     memmove(&m->members[pos + 1], &m->members[pos], (m->nmembers - pos) * sizeof *m->members);

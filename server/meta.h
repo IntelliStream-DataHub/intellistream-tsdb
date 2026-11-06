@@ -72,6 +72,7 @@ struct meta_member {
     char addr[META_ADDR_MAX]; /* the client address, host:port */
     char peer[META_ADDR_MAX]; /* the peer address, host:port */
     char rack[META_RACK_MAX];
+    uint8_t ident[16]; /* the server's own random identity (meta/IDENT): one id is one server; zero: not known */
 };
 
 struct meta_replica {

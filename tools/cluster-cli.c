@@ -8,6 +8,7 @@
  *        [--volumes-per-server 16]
  *   tsdb cluster node add PEER NEW_PEER --secret-file F      (PEER: any member; the CLI follows to the leader once)
  *   tsdb cluster status PEER --secret-file F                 (one line per fact, for people and scripts)
+ *   tsdb cluster secret FILE                                 (a new secret: 32 random bytes as hex, mode 0600)
  */
 #include "cluster.h"
 #include "meta.h"
@@ -28,6 +29,7 @@ static int cl_usage(void)
             "            [--voters 5] [--volumes-per-server 16]\n"
             "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
             "       tsdb cluster status PEER --secret-file F\n"
+            "       tsdb cluster secret FILE    (makes a new secret file, mode 0600; never overwrites one)\n"
             "  PEER is a server's peer address, host:port (tsdbd --cluster --peer-port)\n");
     return 2;
 }
@@ -110,6 +112,17 @@ int cluster_cli(int argc, char **argv)
     /* argv[0] is "cluster" */
     if (argc < 3)
         return cl_usage();
+    if (!strcmp(argv[1], "secret")) {
+        char err[1024];
+        if (argc != 3)
+            return cl_usage();
+        if (cluster_make_secret(argv[2], err, sizeof err) != 0) {
+            fprintf(stderr, "tsdb cluster: %s\n", err);
+            return 1;
+        }
+        printf("wrote a new cluster secret to %s (copy it to every server; tsdbd --cluster-secret-file)\n", argv[2]);
+        return 0;
+    }
     const char *verb = argv[1], *addr = NULL, *newpeer = NULL, *secret_file = NULL;
     int i = 2;
     if (!strcmp(verb, "node")) {
