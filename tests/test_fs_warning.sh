@@ -37,6 +37,7 @@ run() { # NAME [FLAGS]: starts tsdbd on $base/NAME, waits until it serves, stops
 run off
 run on --verify-checksums
 got=$(grep -c "keeps no checksums of its data" "$base/off.log")
-[ "$got" -eq "$want" ] || fail "$(fstype "$base"): $got warnings without --verify-checksums, want $want: $(cat "$base/off.log")"
+[ "$got" -eq "$want" ] ||
+    fail "$(fstype "$base"): $got warnings without --verify-checksums, want $want: $(cat "$base/off.log")"
 grep -q "keeps no checksums" "$base/on.log" && fail "a warning with --verify-checksums: $(cat "$base/on.log")"
 echo "test_fs_warning: ok ($(fstype "$base"), warning $([ "$want" = 1 ] && echo shown || echo not needed))"

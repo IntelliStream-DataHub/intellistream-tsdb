@@ -16,7 +16,11 @@ u() { "$B/tsdb" "$dir/db" user "$@"; }
 fsize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; } # GNU, then BSD (macOS) stat
 fmode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 nosid() { # runs a command in a new session, without a controlling terminal (macOS has no setsid command)
-    if command -v setsid >/dev/null; then setsid "$@"; else perl -MPOSIX -e 'POSIX::setsid() >= 0 or die; exec @ARGV' "$@"; fi
+    if command -v setsid >/dev/null; then
+        setsid "$@"
+    else
+        perl -MPOSIX -e 'POSIX::setsid() >= 0 or die; exec @ARGV' "$@"
+    fi
 }
 refused() { # refused <what> <args...>: the command must fail and leave USERS as it was
     local what=$1

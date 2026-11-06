@@ -2097,13 +2097,23 @@ static void test_large_insert_reuses_buffers(const char *base)
 #endif
 }
 
+/* The hung-file-system tests park a reader on a FIFO, which blocks differently on macOS. */
+#ifdef __APPLE__
+#define HUNG_FS_TEST(fn, base)                                                                                      \
+    (printf("  (" #fn ": skipped on macOS, it simulates a hung file system with a FIFO, which blocks differently " \
+            "there)\n"),                                                                                            \
+     (void)fn, (void)(base))
+#else
+#define HUNG_FS_TEST(fn, base) fn(base)
+#endif
+
 int main(int argc, char **argv)
 {
     tp_raise_nofile();
     const char *base = argc > 1 ? argv[1] : "/tmp";
-    char *canon = realpath(base, NULL); /* canonical, as VOLUMES keeps paths (/tmp is /private/tmp on macOS) */
-    if (canon)
-        base = canon; /* kept to the end */
+    static char canon[PATH_MAX]; /* static: nothing for LeakSanitizer to report at exit */
+    if (realpath(base, canon))   /* canonical, as VOLUMES keeps paths (/tmp is /private/tmp on macOS) */
+        base = canon;
     char root[512], va[512], vb[512], other[512], cmd[2200];
     snprintf(root, sizeof root, "%s/tsdb-vol-%d/root", base, (int)getpid());
     snprintf(va, sizeof va, "%s/tsdb-vol-%d/mount_a/sensors", base, (int)getpid());
@@ -2365,38 +2375,13 @@ int main(int argc, char **argv)
     test_concurrent_adds(base);
     test_open_waits_for_add(base);
     test_readd_other_path(base);
-#ifdef __APPLE__
-    printf("  (test_new_meta_write: skipped on macOS, it simulates a hung file system with a FIFO, which blocks differently there)\n");
-    (void)test_new_meta_write;
-#else
-    test_new_meta_write(base);
-#endif
-#ifdef __APPLE__
-    printf("  (test_hung_volume: skipped on macOS, it simulates a hung file system with a FIFO, which blocks differently there)\n");
-    (void)test_hung_volume;
-#else
-    test_hung_volume(base);
-#endif
+    HUNG_FS_TEST(test_new_meta_write, base);
+    HUNG_FS_TEST(test_hung_volume, base);
     test_volumes_same_size(base);
     test_volumes_damaged_lines(base);
-#ifdef __APPLE__
-    printf("  (test_hung_reload: skipped on macOS, it simulates a hung file system with a FIFO, which blocks differently there)\n");
-    (void)test_hung_reload;
-#else
-    test_hung_reload(base);
-#endif
-#ifdef __APPLE__
-    printf("  (test_hung_new_volume: skipped on macOS, it simulates a hung file system with a FIFO, which blocks differently there)\n");
-    (void)test_hung_new_volume;
-#else
-    test_hung_new_volume(base);
-#endif
-#ifdef __APPLE__
-    printf("  (test_follower_hung_new_volume: skipped on macOS, it simulates a hung file system with a FIFO, which blocks differently there)\n");
-    (void)test_follower_hung_new_volume;
-#else
-    test_follower_hung_new_volume(base);
-#endif
+    HUNG_FS_TEST(test_hung_reload, base);
+    HUNG_FS_TEST(test_hung_new_volume, base);
+    HUNG_FS_TEST(test_follower_hung_new_volume, base);
     test_follower_open_race(base);
     test_meta_passing_mismatch(base);
     test_route_past_failed_record(base);

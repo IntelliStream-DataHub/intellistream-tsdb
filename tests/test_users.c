@@ -2066,7 +2066,8 @@ int main(int argc, char **argv)
     permissions();
     links();
 #ifdef __APPLE__
-    printf("  (power loss in the CLI's add, revoke and compact: skipped on macOS, it needs the crashfs LD_PRELOAD shim)\n");
+    printf("  (power loss in the CLI's add, revoke and compact: skipped on macOS, it needs the crashfs "
+           "LD_PRELOAD shim)\n");
     (void)power_loss;
 #else
     power_loss();

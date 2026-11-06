@@ -35,7 +35,8 @@ CFLAGS  ?= -O3 -g
 # -march=native build and a portable one would round differently; codec choices (and the
 # bytes they write) must not depend on the CPU the code was built for, nor on the CPU
 # level of `make dist` in use (src/levels.h).
-override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off $(ARCH) $(PLAT_CFLAGS) -Iinclude -fPIC
+override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off $(ARCH) -Iinclude -fPIC
+override CFLAGS += $(PLAT_CFLAGS)
 # `make dist` links these statically (-l:libzstd.a); glibc stays dynamic.
 ZSTD_LIB  ?= -lzstd
 URING_LIB ?= -luring
