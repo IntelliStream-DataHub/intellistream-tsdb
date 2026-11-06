@@ -670,6 +670,46 @@ static void test_partial_dropped(void)
     fake_stop(&f);
 }
 
+/* ------------------------------------------------------------ QUERY_MULTI refused */
+
+/* A refused QUERY_MULTI ends with an END frame whose status is the HA status: u32 index (END), u32 answered, then the
+ * body. The client must read the status, not call the longer frame corrupt. */
+static void script_multi_refused(struct fake *f, int fd)
+{
+    uint8_t body[512], op, eb[128];
+    size_t n;
+    uint32_t id;
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        note_req(f, id);
+        uint32_t end = TSDB_MULTI_END, answered = 0;
+        memcpy(eb, &end, 4);
+        memcpy(eb + 4, &answered, 4);
+        tsdb_unavail e = {.vol = 3, .reason = TSDB_WHY_NFS_DOWN, .epoch = 7, .since_ms = 1000, .retry_after_ms = 5,
+                          .outage_id = 42};
+        size_t k = tsdb_wire_put_unavail(eb + 8, sizeof eb - 8, &e, 1);
+        reply(fd, id, TSDB_ERR_UNAVAILABLE, eb, 8 + k);
+    }
+}
+
+static void test_multi_refused(void)
+{
+    struct fake f;
+    tsdbc *c;
+    tsdb_sid sid = TSDB_SID(1, 9);
+    tsdbc_err_info ei;
+    fake_start(&f, 1, script_multi_refused);
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = 0, .end = 1000};
+    tsdb_series_result *out = NULL;
+    int rc = tsdbc_query_multi_collect(c, &q, &sid, 1, NULL, &out);
+    CHECK(rc == TSDB_ERR_UNAVAILABLE);
+    CHECK(tsdbc_last_error(c, &ei) == TSDB_ERR_UNAVAILABLE && ei.has_body && ei.nunavail == 1 &&
+          ei.unavail[0].vol == 3 && ei.unavail[0].retry_after_ms == 5);
+    CHECK(atomic_load(&f.nreq) == 1); /* QUERY_MULTI is not resent: its rows may have been delivered */
+    tsdbc_close(c);
+    fake_stop(&f);
+}
+
 /* ------------------------------------------------------------ pipelined inserts */
 
 /* Frames are told apart by a hash of their payload (the client packs inserts, so the rows are not at a fixed
@@ -817,6 +857,7 @@ int main(int argc, char **argv)
     test_unavailable();
     test_moved();
     test_partial_dropped();
+    test_multi_refused();
     test_pipeline();
     test_nodes();
     test_topology();

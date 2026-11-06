@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tsdb_client::{Client, ConnectOptions, Error, QueryOpts, Status};
+use tsdb_client::{Client, ConnectOptions, Error, MultiOpts, QueryOpts, Status};
 
 const WHY_NFS_DOWN: u8 = 1;
 const OP_FLUSH: u8 = 8;
@@ -232,6 +232,28 @@ fn streamed_reply_refused_before_it_begins_is_retried() {
     assert_eq!(p.len(), 0);
     assert_eq!(f.seen(5).len(), 2);
     assert!(c.last_error().has_body);
+}
+
+#[test]
+fn a_refused_query_multi_ends_with_its_status_and_body_and_is_not_resent() {
+    // the END frame: u32 index (END), u32 answered, then the body
+    let f = Fake::start(|_| {
+        let mut b = u32::MAX.to_le_bytes().to_vec();
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend(unavailable_body(3, 5));
+        Reply(-11, b)
+    });
+    let mut c = Client::connect(f.addr).unwrap();
+    let r = c.query_rows_multi(&[0x1_0000_0001], .., QueryOpts::default(), MultiOpts::default());
+    assert!(matches!(r, Err(Error::Server(Status::Unavailable))), "{r:?}");
+    let e = c.last_error();
+    assert!(e.has_body);
+    assert_eq!(e.unavailable.len(), 1);
+    assert_eq!(e.unavailable[0].vol, 3);
+    assert_eq!(f.seen(23).len(), 1, "rows may have been delivered: not sent again");
+    // the connection is still in step
+    let r = c.query_rows_multi(&[0x1_0000_0001], .., QueryOpts::default(), MultiOpts::default());
+    assert!(matches!(r, Err(Error::Server(Status::Unavailable))), "{r:?}");
 }
 
 #[test]
