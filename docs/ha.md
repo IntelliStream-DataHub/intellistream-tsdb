@@ -1,5 +1,10 @@
 # tsdb HA: one writer per volume, with failover over NFSv4
 
+> **Superseded for new work (decided on 2026-11-06)** by [design-cluster.md](design-cluster.md), a shared-nothing
+> cluster with replicated volumes. That design keeps this one's client rules (§9), streams (D13, D31), forwarding
+> (§9.1) and drop watermark (D33); the NFS lock arbiter, the ledger and the SUSPECT state are not built. NFS followers
+> stay for single-server deployments. This document is kept for those parts and for the history of the reasoning.
+
 Status: design, not implemented. Scope: shared storage on NFSv4.1/4.2 over RDMA. An object-store backend (intellistream-objects) is planned for later, behind the interface in §12, and is not built now.
 
 Code references are `file:line` at HEAD `d52afaa`. A `~` before a line number means it comes from the research map at `d2c2767` and may be a few lines off.
