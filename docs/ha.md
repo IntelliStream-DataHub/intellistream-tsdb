@@ -1314,6 +1314,70 @@ Each step lands with `make test` and `make asan`. Steps that touch the disk path
 - **O9.** jepsen `outage` nemesis; manual runs (a)-(g).
 - **O10.** HA: watchdog exemptions, the §2.7 same-filesystem rule, `--nfs-grace-s` and the standby hold-back with its early end, the takeover cap per server group, no back-off for losses from a server restart, removal of `reboot-force`, the escalation helper reading `/run/tsdbd/health`. This goes into §14 steps 5 and 8.
 
+#### 15.9.1 What N1 built (2026-11-06) and where it differs
+
+Built: O1 (the shim is `tests/jepsen/outagefs.c`, an LD_PRELOAD library with its own control socket, not a crashfs
+extension; no userfaultfd, so mmap faults are not gated and a rolled-back part gives SIGBUS), O2 without mountinfo
+discovery (`--health-domain PREFIX`, `TSDBD_TEST_HEALTH` scales the thresholds for tests), O3 (abandon flag, WAL
+taint as before), O6 as far as admission by id (see below), O7 (references,
+quiesce, revalidation, re-log, in-place reopen, DIVERGED as "quiesced after reopen", sticky), O9 (the `outage`
+nemesis, kv workload, no rollback kind).
+
+Review fixes of 2026-11-06 (the adversarial review of N1):
+- **The cap of 4 applies only while the domain is not UP.** While it is UP nothing is refused: a busy volume queues its
+  callers in the worker pool (with 16 workers on one volume the old cap refused over 98 % of the requests). Once the
+  domain leaves UP, at most 4 requests are inside a volume and the rest get UNAVAILABLE. The bounded FIFO queue per
+  volume of §15.3 is still not built.
+- **Every request is accounted for.** A packed or many-series insert enters every domain volume its rows name (all or
+  nothing, UNAVAILABLE if one is full or quiesced), and a request that names no volume (QUERY_MULTI, COMMIT, FLUSH,
+  OPTIMIZE, STATS, a series created by name) counts as a waiting worker while any domain is not UP, so the pool starts
+  extra workers. A request that is already inside a hung call keeps its worker until the heal; COMMIT and FLUSH are not
+  split into per-volume subtasks, so one that reaches a hung volume first is not answered before the heal.
+- **Revalidation is stricter.** A part that is gone counts as found only if a present part of its partition covers its
+  block range (a merge that finished while the engine was stopped). A merge the storage took back is *lost* (DIVERGED,
+  an operator decides): its sources are there, but an overwrite, delete or expiry merged into its output is not, and
+  counting rows cannot tell the two apart. RETENTION and CLASSES are compared by the bytes the open applied
+  (`lost_log_bytes`); a rolled-back limit is DIVERGED. The MANIFEST and the part payloads are still not compared.
+- **DIVERGED is sticky.** A later outage of the domain does not recover the volume again (the new engine never knew
+  what was lost); `tsdbd` is restarted to accept the loss. The other volumes of the domain go on and the domain
+  returns to UP.
+- **Async WAL (`wal_sync_ms > 0`)**: every reopen re-logs all memtable rows, whether or not the log tail matches.
+- **A failed reopen can be repeated**: the re-log segment is truncated and written again (it was `O_EXCL`).
+- `dom_failwatch` ends the server for a failure no volume reports only after five looks (20 ms apart), so a recovery
+  that swaps in the new engine between two calls cannot end tsdbd (found by reading, not reproduced).
+- `outagefs eiodrop` models fsyncgate (writes thrown away, the first fsync per descriptor fails, later ones return 0);
+  `test_outage` runs it, kills tsdbd and reads back. A mutation that retries the WAL fdatasync fails it.
+- Limits of this step, now stated: a tsdbd that is restarted while a domain is down serves no volume until the heal
+  (parallel open with a deadline per domain, O5, is not built), and SIGTERM during a hang does not exit until the
+  heal. Under systemd the stop timeout ends it with SIGKILL, and the restart then waits in `tsdb_open`. Do not run
+  `--health-domain` where a restart during an outage is acceptable to wait out.
+- The healthy volume's pace in `make jepsen --nemesis outage` seed 2 falls to 62 to 68 % (the gate runs seed 1). In
+  the verbose run the healthy volume's writes stop altogether 1.5 s into one 8 s hang (about the DOWN moment) while
+  the other hang of the run is fine. The cause is not found; it is not the clients' retry rate (they sleep).
+
+Where it differs from the text above:
+- **References live in the engine** (`refs`, `quiesced`), not in a per-volume slot; `t->vols[v]` stays a bare `eng *`.
+  Recovery swaps the pointer under the wrlock after `tsdb_volume_idle`.
+  Cost, measured 2026-11-06 (`tsdbc-bench query`, 100 series x 1 M points, 5 runs each, main 478c33d and ha-n1 run
+  alternately): within the noise (sd 2 to 5 %) on 1 and 32 connections (raw, agg300, agg3600, twa3600, full0: -2.6 % to
+  +2.0 %), so the counter is not sharded. tsdbd's one event loop caps that test; an embedded run on 32+ threads on one
+  volume has not been measured.
+- **Recovery is a cold reopen first, a re-log only when the disk disagrees.** The reopen replays the WAL from disk. When
+  the WAL tail does not match what the engine wrote (xxh64 of the last record, read with `O_DIRECT`), the memtable rows
+  are written into a new segment before the reopen. In async WAL mode (`wal_sync_ms > 0`) every memtable row is
+  relogged, because those rows were acknowledged before the sync; §15.5 step 4's "rows past `wal_durable` were never
+  acknowledged" holds only in sync mode.
+- **The abandon check runs before the WAL append** in `mem_insert` (after the fence wait), and under `publish_lock`
+  before `parts_commit` in `parts_publish` and `delete.c`, not inside `parts_commit`.
+- **Revalidation compares files and sizes, not payloads.** A server rollback that keeps sizes is found only by the
+  header and index checksums at reopen; damaged granule payloads only with `verify_checksums`.
+- `readdir()` errors fail the open (`load_parts`, `wal_open`, `intents_recover`); before, they ended the scan.
+
+Not built (left for the next steps): mountinfo discovery and the mount identity check (D26), parking with tombstones
+and BUSY, per-volume FIFO queues bounded in bytes, splitting COMMIT and FLUSH per volume, SIGTERM while a call is
+stuck, parallel open and no implicit creation, metrics, the DIVERGED operator command and `volume abandon`, the local
+high-water cache, the rollback nemesis.
+
 ### 15.10 Open questions
 
 1. Hard mounts with tsdb's own detection, as proposed? Is any node mounted `soft`?

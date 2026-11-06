@@ -103,6 +103,9 @@ struct tsdb {
     pthread_mutex_t name_mu;
     pthread_cond_t name_cv;
     const char **names_held;
+    char **kept_names; /* name strings of retired engines: tsdb_series_name pointers outlive a reopen */
+    size_t nkept, capkept;
+    pthread_mutex_t kept_mu; /* a leaf: guards the three above */
     size_t nheld, held_cap;
     atomic_bool dup_logged; /* a name found in two volumes (damage, or a hand-made copy) is reported once */
     void (*wait_fn)(void *ctx, int delta); /* tsdb_set_write_wait_hook (lock), copied to every volume */
@@ -845,6 +848,7 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
     pthread_mutex_init(&t->create_lock, NULL);
     pthread_mutex_init(&t->layout_lock, NULL);
     pthread_mutex_init(&t->name_mu, NULL);
+    pthread_mutex_init(&t->kept_mu, NULL);
     pthread_cond_init(&t->name_cv, NULL);
     t->dirfd = -1;
     t->sched = sched_new(t->opt.query_threads, t->opt.request_threads);
@@ -941,8 +945,12 @@ int tsdb_close(tsdb *t)
     pthread_mutex_destroy(&t->create_lock);
     pthread_mutex_destroy(&t->layout_lock);
     pthread_mutex_destroy(&t->name_mu);
+    pthread_mutex_destroy(&t->kept_mu);
     pthread_cond_destroy(&t->name_cv);
     free(t->names_held);
+    for (size_t i = 0; i < t->nkept; i++)
+        free(t->kept_names[i]);
+    free(t->kept_names);
     free(t);
     return rc;
 }
@@ -952,15 +960,53 @@ int tsdb_close(tsdb *t)
 /* The volume field of an id: -1 when no volume can have it (bits 48-63 set, or a zero field: a truncated id). */
 static int64_t sid_volume(tsdb_sid id) { return id >> 48 || !(id >> 32) ? -1 : (int64_t)(id >> 32) - 1; }
 
-static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
+/* References on an engine (ha.md 15.5 step 2). A caller that holds an `eng` outside t->lock holds a reference, so a
+ * volume that is recovered (its engine replaced by a fresh open of the directory) is replaced only after every call
+ * inside the old engine has returned: a late write of a stuck request lands before anything new is admitted. A
+ * reference is taken under the read lock and refused once the engine is quiesced, which is set under the write lock:
+ * so after tsdb_volume_quiesce returns, the count only falls. `route` and the loops over the volumes give theirs
+ * back with EREF (a cleanup) or eng_unref. */
+static pthread_mutex_t idle_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t idle_cv = PTHREAD_COND_INITIALIZER;
+
+static eng *eng_ref(eng *e)
+{
+    atomic_fetch_add_explicit(&e->refs, 1, memory_order_acq_rel);
+    return e;
+}
+
+static void eng_unref(eng **ep)
+{
+    eng *e = *ep;
+    if (e && atomic_fetch_sub_explicit(&e->refs, 1, memory_order_acq_rel) == 1 &&
+        atomic_load_explicit(&e->quiesced, memory_order_acquire)) {
+        pthread_mutex_lock(&idle_mu); /* a recovery waits for the count to reach 0 */
+        pthread_cond_broadcast(&idle_cv);
+        pthread_mutex_unlock(&idle_mu);
+    }
+    *ep = NULL;
+}
+#define EREF __attribute__((cleanup(eng_unref)))
+
+/* Why the last route of this thread failed, when it was not that the id does not exist: 0 or TSDB_ERR_UNAVAILABLE */
+static __thread int route_rc;
+static int route_fail(int dflt) { return route_rc ? route_rc : dflt; }
+
+static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
 {
     int64_t v = sid_volume(id);
     if (v < 0)
         return false;
     pthread_rwlock_rdlock(&t->lock);
-    bool ok = (size_t)v < t->nvols && TSDB_SID_LOCAL(id) < eng_series_count(t->vols[v]);
+    bool ok = (size_t)v < t->nvols;
+    if (ok && live && atomic_load_explicit(&t->vols[v]->quiesced, memory_order_acquire)) {
+        route_rc = TSDB_ERR_UNAVAILABLE;
+        ok = false;
+    } else if (ok) {
+        ok = TSDB_SID_LOCAL(id) < eng_series_count(t->vols[v]);
+    }
     if (ok) {
-        *e = t->vols[v];
+        *e = eng_ref(t->vols[v]);
         *local = TSDB_SID_LOCAL(id);
     }
     pthread_rwlock_unlock(&t->lock);
@@ -1000,9 +1046,10 @@ static eng *volume_at(tsdb *t, size_t v, bool reload)
 /* Routes an id: its volume and local id, by its bits. A follower may be asked about a series or a volume its
  * writer created a moment ago, with no rows yet (nothing in MANIFEST or the WAL names it): it reads VOLUMES or
  * that volume's SERIES again when the file grew, and then the volume's parts, which may hold the series' rows. */
-static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
+static bool route_opt(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
 {
-    if (route_now(t, id, e, local))
+    route_rc = 0;
+    if (route_now(t, id, e, local, live))
         return true;
     int64_t v = sid_volume(id);
     if (!t->opt.read_only || v < 0)
@@ -1013,10 +1060,23 @@ static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
     /* An error is for the refresh to report (follow_refresh): the records before the one that failed are loaded,
      * and the id may be among them. */
     (void)eng_series_reload(ve);
-    if (!route_now(t, id, e, local))
+    if (!route_now(t, id, e, local, live))
         return false;
     eng_refresh(ve);
     return true;
+}
+
+/* The engine of a series for a call that reads or writes (refused while the volume is quiesced), `route_meta` for
+ * the dictionaries (names, types, classes: stay available, from the engine in place), `route_q` for the queries,
+ * which answer an unknown series with nothing but must not answer a quiesced one that way. */
+static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local) { return route_opt(t, id, e, local, true); }
+static bool route_meta(tsdb *t, tsdb_sid id, eng **e, uint32_t *local) { return route_opt(t, id, e, local, false); }
+static bool route_q(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, int *rc)
+{
+    bool ok = route_opt(t, id, e, local, true);
+    if (!ok && route_rc)
+        *rc = route_rc;
+    return ok;
 }
 
 /* A follower asked for a name its writer may have created a moment ago: SERIES of the volumes from `from` on,
@@ -1314,10 +1374,11 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ts
     }
     uint32_t local = 0;
     if (rc == 0) {
-        pthread_rwlock_rdlock(&t->lock); /* an add may move the array; the engine stays until the close */
-        eng *e = t->vols[vol];
+        pthread_rwlock_rdlock(&t->lock); /* an add may move the array */
+        eng *e EREF = atomic_load_explicit(&t->vols[vol]->quiesced, memory_order_acquire) ? NULL : eng_ref(t->vols[vol]);
         pthread_rwlock_unlock(&t->lock);
-        rc = eng_series(e, name, type < 0 ? TSDB_FLOAT32 : type, &local); /* one append, in the volume */
+        rc = e ? eng_series(e, name, type < 0 ? TSDB_FLOAT32 : type, &local) /* one append, in the volume */
+               : TSDB_ERR_UNAVAILABLE;
     }
     if (rc == 0)
         *id = TSDB_SID(vol, local);
@@ -1375,16 +1436,16 @@ int tsdb_abi_version(void) { return TSDB_ABI_VERSION; }
 
 const char *tsdb_series_name(tsdb *t, tsdb_sid id)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
-    return route(t, id, &e, &local) ? eng_series_name(e, local) : NULL;
+    return route_meta(t, id, &e, &local) ? eng_series_name(e, local) : NULL;
 }
 
 int tsdb_series_type(tsdb *t, tsdb_sid id, tsdb_type *type)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
-    int ty = route(t, id, &e, &local) ? eng_series_type(e, local) : -1;
+    int ty = route_meta(t, id, &e, &local) ? eng_series_type(e, local) : -1;
     if (ty < 0)
         return TSDB_ERR_NOTFOUND;
     *type = (tsdb_type)ty;
@@ -1393,9 +1454,9 @@ int tsdb_series_type(tsdb *t, tsdb_sid id, tsdb_type *type)
 
 int tsdb_series_class(tsdb *t, tsdb_sid id, int *cls)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
-    return route(t, id, &e, &local) ? eng_series_class(e, local, cls) : TSDB_ERR_NOTFOUND;
+    return route_meta(t, id, &e, &local) ? eng_series_class(e, local, cls) : TSDB_ERR_NOTFOUND;
 }
 
 /* tests/test_damage.c: cls_observe on every part of the root volume, as the merge thread does on an idle partition */
@@ -1412,9 +1473,9 @@ int tsdb_test_observe(tsdb *t)
 
 int tsdb_test_class_switch(tsdb *t, tsdb_sid id, int cls, const int64_t *at)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
-    return route(t, id, &e, &local) ? eng_class_switch(e, local, cls, at) : TSDB_ERR_NOTFOUND;
+    return route(t, id, &e, &local) ? eng_class_switch(e, local, cls, at) : route_fail(TSDB_ERR_NOTFOUND);
 }
 
 void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg)
@@ -1440,6 +1501,119 @@ uint64_t tsdb_test_fence_wakeups(tsdb *t)
     }
     pthread_rwlock_unlock(&t->lock);
     return n;
+}
+
+/* ------------------------------------------------------- volume recovery */
+
+int tsdb_volume_quiesce(tsdb *t, size_t vol)
+{
+    pthread_rwlock_wrlock(&t->lock); /* after this no reader of the lock can still be about to take a reference */
+    int rc = vol < t->nvols ? 0 : TSDB_ERR_INVALID;
+    if (rc == 0)
+        atomic_store_explicit(&t->vols[vol]->quiesced, true, memory_order_release);
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
+
+int tsdb_volume_resume(tsdb *t, size_t vol)
+{
+    pthread_rwlock_wrlock(&t->lock);
+    int rc = vol < t->nvols ? 0 : TSDB_ERR_INVALID;
+    if (rc == 0)
+        atomic_store_explicit(&t->vols[vol]->quiesced, false, memory_order_release);
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
+
+int tsdb_volume_idle(tsdb *t, size_t vol, int timeout_ms)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    eng *e = vol < t->nvols ? t->vols[vol] : NULL;
+    pthread_rwlock_unlock(&t->lock);
+    if (!e)
+        return TSDB_ERR_INVALID;
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += timeout_ms / 1000;
+    until.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (until.tv_nsec >= 1000000000L)
+        until.tv_sec++, until.tv_nsec -= 1000000000L;
+    int rc = 0;
+    pthread_mutex_lock(&idle_mu);
+    while (rc == 0 && atomic_load_explicit(&e->refs, memory_order_acquire) > 0) {
+        if (timeout_ms < 0)
+            pthread_cond_wait(&idle_cv, &idle_mu);
+        else if (pthread_cond_timedwait(&idle_cv, &idle_mu, &until) == ETIMEDOUT &&
+                 atomic_load_explicit(&e->refs, memory_order_acquire) > 0)
+            rc = 1;
+    }
+    pthread_mutex_unlock(&idle_mu);
+    return rc;
+}
+
+int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
+{
+    tsdb_volume_report none, *rep = report ? report : &none;
+    memset(rep, 0, sizeof *rep);
+    if (vol == 0 || t->opt.read_only)
+        return TSDB_ERR_INVALID; /* the root is not recovered in the process: tsdbd exits */
+    pthread_rwlock_rdlock(&t->lock);
+    eng *old = vol < t->nvols ? t->vols[vol] : NULL;
+    char *path = old ? strdup(t->paths[vol]) : NULL;
+    pthread_rwlock_unlock(&t->lock);
+    if (!old || !path) {
+        free(path);
+        return old ? TSDB_ERR_NOMEM : TSDB_ERR_INVALID;
+    }
+    if (!atomic_load_explicit(&old->quiesced, memory_order_acquire) ||
+        atomic_load_explicit(&old->refs, memory_order_acquire) != 0) {
+        free(path);
+        return TSDB_ERR_INVALID; /* quiesce, then wait until idle: no call is inside the old engine */
+    }
+    eng_halt(old);
+    /* ha.md 15.5 step 3 and 4: compare the memory of the halted engine with the storage, before the open reads it.
+     * Nothing here changes what the old engine knows, so a failed attempt can be repeated. */
+    reval_part *exp = NULL;
+    size_t nexp = 0;
+    int rc = reval_capture(old, &exp, &nexp);
+    if (rc == 0 && (rc = wal_verify_tail(old, path)) == 1) {
+        rep->wal_mismatch = 1;
+        rc = wal_relog(old, path, &rep->relogged_rows);
+    } else if (rc == 0 && old->wal_enabled && old->opt.wal_sync_ms > 0) {
+        /* async WAL: rows past wal_durable were acknowledged and exist only in memory, and the tail of the log
+         * matches whatever the storage did: the open would drop them. Always carry them over. */
+        rc = wal_relog(old, path, &rep->relogged_rows);
+    }
+    if (rc == 0)
+        rc = reval_dicts(old, path, &rep->series_repaired, &rep->states_repaired);
+    eng *e = NULL;
+    if (rc == 0)
+        rc = eng_reopen(old, path, &t->opt, t->sched, &e);
+    free(path);
+    if (rc) {
+        free(exp);
+        return rc; /* the old engine stays, halted and quiesced: try again */
+    }
+    reval_parts(e, exp, nexp, &rep->lost_parts, &rep->lost_part_rows);
+    reval_logs(old, e, &rep->lost_log_bytes);
+    free(exp);
+    rep->diverged = rep->lost_parts != 0 || rep->lost_log_bytes != 0;
+    if (rep->diverged) /* refused until an operator accepts the loss (tsdb_volume_resume) */
+        atomic_store_explicit(&e->quiesced, true, memory_order_release);
+    pthread_rwlock_wrlock(&t->lock);
+    e->wait_fn = t->wait_fn; /* before anyone can write to it */
+    e->wait_ctx = t->wait_ctx;
+    e->test_precommit = t->test_precommit;
+    e->test_precommit_arg = t->test_precommit_arg;
+    t->vols[vol] = e;
+    pthread_rwlock_unlock(&t->lock);
+    eng_retire(old, &t->kept_mu, &t->kept_names, &t->nkept, &t->capkept); /* names stay valid until tsdb_close */
+    return 0;
+}
+
+void tsdb_set_abandon_flag(const volatile int *flag)
+{
+    cur_abandon = flag;
 }
 
 void tsdb_set_write_wait_hook(tsdb *t, void (*on_wait)(void *ctx, int delta), void *ctx)
@@ -1509,12 +1683,12 @@ void tsdb_test_granules(tsdb *t, void (*fn)(void *ctx, int cls, uint32_t i, cons
 
 static int state_get(tsdb *t, tsdb_sid series, const char *name, bool create, uint32_t *code)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     if (!name || !*name)
         return TSDB_ERR_INVALID;
     if (!route(t, series, &e, &local))
-        return TSDB_ERR_NOTFOUND;
+        return route_fail(TSDB_ERR_NOTFOUND);
     if (create && t->opt.read_only)
         create = false;
     return eng_state(e, name, create, code);
@@ -1532,16 +1706,16 @@ int tsdb_state_lookup(tsdb *t, tsdb_sid series, const char *name, uint32_t *code
 
 const char *tsdb_state_name(tsdb *t, tsdb_sid series, uint32_t code)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
-    return route(t, series, &e, &local) ? eng_state_name(e, code) : NULL;
+    return route_meta(t, series, &e, &local) ? eng_state_name(e, code) : NULL;
 }
 
 const char *tsdb_series_path(tsdb *t, tsdb_sid id)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
-    if (!route(t, id, &e, &local))
+    if (!route_meta(t, id, &e, &local))
         return NULL;
     pthread_rwlock_rdlock(&t->lock);
     const char *p = t->paths[TSDB_SID_VOLUME(id)];
@@ -1580,11 +1754,11 @@ static int vals_import(const tsdb_values *in, size_t n, const void **slots, void
 
 static int insert_series_slots(tsdb *t, int type, tsdb_sid series, const int64_t *ts, const void *v, size_t n)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
-    return route(t, series, &e, &local) ? eng_insert_series(e, type, local, ts, v, n) : TSDB_ERR_INVALID;
+    return route(t, series, &e, &local) ? eng_insert_series(e, type, local, ts, v, n) : route_fail(TSDB_ERR_INVALID);
 }
 
 /* Rows of several series: split by volume, local ids, each volume written on
@@ -1640,9 +1814,13 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
         }
     }
     if (one) {
-        eng *e = t->vols[n ? TSDB_SID_VOLUME(series[0]) : 0];
+        eng *e EREF = t->vols[n ? TSDB_SID_VOLUME(series[0]) : 0];
+        if (atomic_load_explicit(&e->quiesced, memory_order_acquire))
+            e = NULL, route_rc = TSDB_ERR_UNAVAILABLE;
+        else
+            eng_ref(e);
         pthread_rwlock_unlock(&t->lock);
-        return eng_insert(e, type, ls, ts, values, n);
+        return e ? eng_insert(e, type, ls, ts, values, n) : TSDB_ERR_UNAVAILABLE;
     }
     size_t *cnt = calloc(nv + 1, sizeof *cnt);
     int64_t *lt = eng_insert_scratch(1, n * sizeof *lt);
@@ -1668,14 +1846,30 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
         }
     }
     eng **vols = malloc(nv * sizeof *vols);
-    if (vols)
+    bool *refd = calloc(nv, sizeof *refd);
+    if (vols && refd)
         memcpy(vols, t->vols, nv * sizeof *vols);
+    /* a reference on every volume that has rows; one quiesced refuses the call before any volume is written */
+    for (size_t v = 0; vols && refd && v < nv; v++) {
+        if (cnt[v + 1] == cnt[v])
+            continue;
+        if (atomic_load_explicit(&vols[v]->quiesced, memory_order_acquire))
+            rc = rc ? rc : TSDB_ERR_UNAVAILABLE;
+        else
+            eng_ref(vols[v]), refd[v] = true;
+    }
+    if (!refd)
+        free(vols), vols = NULL;
     pthread_rwlock_unlock(&t->lock);
     for (size_t v = 0; rc == 0 && vols && v < nv; v++)
-        if (cnt[v + 1] > cnt[v])
+        if (refd[v])
             rc = eng_insert(vols[v], type, ls + cnt[v], lt + cnt[v], lv + cnt[v] * w, cnt[v + 1] - cnt[v]);
     if (!vols && rc == 0)
         rc = TSDB_ERR_NOMEM;
+    for (size_t v = 0; vols && v < nv; v++)
+        if (refd[v])
+            eng_unref(&vols[v]);
+    free(refd);
     free(vols);
     free(cnt);
     return rc;
@@ -1722,22 +1916,22 @@ int tsdb_insert_series_values(tsdb *t, tsdb_sid series, const int64_t *ts, const
 
 int tsdb_delete_range(tsdb *t, tsdb_sid series, int64_t start, int64_t end)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
-    return route(t, series, &e, &local) ? eng_delete_range(e, local, start, end) : TSDB_ERR_INVALID;
+    return route(t, series, &e, &local) ? eng_delete_range(e, local, start, end) : route_fail(TSDB_ERR_INVALID);
 }
 
 int tsdb_replace_range(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const int64_t *ts,
                        const tsdb_values *values, size_t n)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
     if (!route(t, series, &e, &local))
-        return TSDB_ERR_INVALID;
+        return route_fail(TSDB_ERR_INVALID);
     if (n == 0)
         return eng_delete_range(e, local, start, end);
     const void *slots;
@@ -1751,19 +1945,19 @@ int tsdb_replace_range(tsdb *t, tsdb_sid series, int64_t start, int64_t end, con
 
 int tsdb_set_retention(tsdb *t, tsdb_sid series, int64_t limit_ms)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
-    return route(t, series, &e, &local) ? eng_set_retention(e, local, limit_ms) : TSDB_ERR_NOTFOUND;
+    return route(t, series, &e, &local) ? eng_set_retention(e, local, limit_ms) : route_fail(TSDB_ERR_NOTFOUND);
 }
 
 int tsdb_get_retention(tsdb *t, tsdb_sid series, int64_t *limit_ms)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     if (!route(t, series, &e, &local) || eng_series_type(e, local) < 0)
-        return TSDB_ERR_NOTFOUND;
+        return route_fail(TSDB_ERR_NOTFOUND);
     *limit_ms = eng_retention(e, local);
     return 0;
 }
@@ -1774,17 +1968,28 @@ static int each(tsdb *t, int (*fn)(eng *))
     pthread_rwlock_rdlock(&t->lock);
     size_t n = t->nvols;
     eng **v = malloc(n * sizeof *v);
-    if (v)
+    bool *live = malloc(n * sizeof *live);
+    if (v && live) {
         memcpy(v, t->vols, n * sizeof *v);
+        for (size_t i = 0; i < n; i++)
+            if ((live[i] = !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
+                eng_ref(v[i]);
+    }
     pthread_rwlock_unlock(&t->lock);
-    if (!v)
+    if (!v || !live) {
+        free(v);
+        free(live);
         return TSDB_ERR_NOMEM;
+    }
     int rc = 0;
     for (size_t i = 0; i < n; i++) {
-        int r = fn(v[i]);
+        int r = live[i] ? fn(v[i]) : TSDB_ERR_UNAVAILABLE; /* a volume in recovery is not flushed or merged now */
         rc = rc ? rc : r;
+        if (live[i])
+            eng_unref(&v[i]);
     }
     free(v);
+    free(live);
     return rc;
 }
 
@@ -1900,13 +2105,13 @@ static int f32_cb(void *arg, const int64_t *ts, const void *v, size_t n)
 int tsdb_query_raw_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_raw_fn fn, void *ctx)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
     f32_out o = {fn, ctx, 0};
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
-    if (rc == 0 && route(t, series, &e, &local)) {
+    if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
         if (eng_series_type(e, local) != TSDB_FLOAT32)
             rc = TSDB_ERR_INVALID; /* tsdb_query_values reads every type */
         else
@@ -2006,13 +2211,13 @@ static int vals_cb(void *arg, const int64_t *ts, const void *v, size_t n)
 int tsdb_query_values(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_values_fn fn, void *ctx)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
     vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
-    if (rc == 0 && route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0)
+    if (rc == 0 && route_q(t, series, &e, &local, &rc) && (o.type = eng_series_type(e, local)) >= 0)
         rc = eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, vals_cb,
                               &o);
     qs_end(&qr, o.type, o.rows);
@@ -2179,7 +2384,7 @@ int tsdb_query_lttb_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, siz
 {
     if (threshold < 3)
         return TSDB_ERR_INVALID;
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
@@ -2187,7 +2392,7 @@ int tsdb_query_lttb_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, siz
     lttb_limit l = {.o = &o, .limit = opts ? opts->limit : 0};
     bool desc = opts && opts->order == TSDB_DESC;
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
-    if (rc == 0 && route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0) {
+    if (rc == 0 && route_q(t, series, &e, &local, &rc) && (o.type = eng_series_type(e, local)) >= 0) {
         rc = eng_query_lttb(e, local, start, end, threshold, desc, l.limit, l.limit ? lttb_limit_cb : vals_cb,
                             l.limit ? (void *)&l : &o);
         if (rc == TSDB_ERR_STOPPED && l.limit && l.sent >= l.limit && !l.stopped)
@@ -2210,12 +2415,12 @@ int tsdb_query_lttb(tsdb *t, tsdb_sid series, int64_t start, int64_t end, size_t
 static int query_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const bucketer *bk,
                        const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
-    if (rc == 0 && route(t, series, &e, &local)) {
+    if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
         type = eng_series_type(e, local);
         rc = eng_query_group(e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
                              out, nout);
@@ -2261,7 +2466,7 @@ int tsdb_query_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const
 static int query_twa(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const bucketer *bk,
                      const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     tsdb_twa_opts def = {0};
     if (!opts)
@@ -2269,7 +2474,7 @@ static int query_twa(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const
     qrun qr;
     qs_begin(t, &qr);
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
-    if (rc == 0 && route(t, series, &e, &local)) {
+    if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
         type = eng_series_type(e, local);
         rc = eng_query_twa(e, local, start, end, bk, opts, out, nout);
     }
@@ -2320,12 +2525,12 @@ int tsdb_query_bounds(tsdb *t, tsdb_sid series, int64_t start, int64_t end, cons
 static int query_spread(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const bucketer *bk,
                         const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
 {
-    eng *e;
+    eng *e EREF = NULL;
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
-    if (rc == 0 && route(t, series, &e, &local)) {
+    if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
         type = eng_series_type(e, local);
         rc = eng_query_spread(e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
                               out, nout);

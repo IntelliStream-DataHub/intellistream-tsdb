@@ -21,7 +21,7 @@ endif
 CRASHFS_SO :=
 else
 SOEXT   := so
-CRASHFS_SO = $(B)/libcrashfs.so
+CRASHFS_SO = $(B)/libcrashfs.so $(B)/liboutagefs.so
 endif
 # -march=native gives the codecs BMI/LZCNT; the aggregation kernels pick
 # AVX-512/AVX2/scalar at runtime either way. `make PORTABLE=1` for a generic build.
@@ -81,7 +81,7 @@ endif
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench
+all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench
 
 $(B)/%.o: src/%.c src/internal.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -221,7 +221,13 @@ $(B)/test_failstop: tests/test_failstop.c $(LIB)
 $(B)/test_graveyard: tests/test_graveyard.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
+$(B)/test_abandon: tests/test_abandon.c $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+$(B)/test_recover: tests/test_recover.c $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -234,6 +240,8 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	TSDB_FAST_FSYNC=1 ./$(B)/test_compat
 	./$(B)/test_failstop
 	./$(B)/test_graveyard
+	./$(B)/test_abandon
+	./$(B)/test_recover
 	./$(B)/test_damage
 	./$(B)/test_crafted
 	./$(B)/test_gindex
@@ -615,6 +623,9 @@ $(CLIB): $(B)/tsdb_client.o $(B)/tsdb_pack.o $(B)/tsdb_calendar.o $(B)/tsdb_cryp
 $(B)/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h tools/cbench.h $(CLIB)
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
+$(B)/outage-load: tools/outage-load.c client/tsdb_client.h $(CLIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+
 $(B)/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
@@ -720,6 +731,19 @@ $(B)/test_classes: tests/test_classes.c tools/datasets.h $(LIB)
 $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)
 	$(CC) -O2 -g -std=gnu11 -Wall $(ARCH) -fPIC -shared -o $@ $< -ldl -lpthread
 
+# the storage-outage shim (hang, error, slow, full and rollback faults per prefix; stacks with crashfs)
+$(B)/liboutagefs.so: tests/jepsen/outagefs.c | $(B)
+	$(CC) -O2 -g -std=gnu11 -Wall $(ARCH) -fPIC -shared -o $@ $< -ldl -lpthread
+
+$(B)/test_outagefs: tests/test_outagefs.c tests/outagefs_ctl.h | $(B)
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
+
+$(B)/test_outage: tests/test_outage.c tests/harness.h tests/outagefs_ctl.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+
+$(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
@@ -732,14 +756,16 @@ JEPSEN_DIR ?= /tmp/tsdb-jepsen-$(shell printf %s "$(CURDIR)" | cksum | cut -d' '
 # large inserts, replaces and deletes race the switches; see tests/jepsen/jepsen.c).
 JEPSEN_SEEDS ?= 1 2 3
 JEPSEN_WORKLOADS ?= kv classes
-# Misdirected I/O (with verify_checksums and without) and damage at rest run on the kv workload only: they test the
+# Storage outages (outage: one volume of two hung, failing or slow, or the server killed; no write lost or refused-yet-
+# visible, the other volume keeps its pace) and misdirected I/O (with verify_checksums and without) and damage at rest
+# run on the kv workload only: they test the
 # engine's checks, which do not depend on the workload. JEPSEN_SECONDS, when set, is the length of every run (the
 # weekly CI run sets it, with one power seed); otherwise each nemesis has its own short default.
 JEPSEN_SECONDS ?=
 # Then kv once more with login (--auth: USERS made by $(B)/tsdb, every client logs in at every reconnect) under kill
 # and one power seed, per backend.
 jsec = $(if $(JEPSEN_SECONDS),$(JEPSEN_SECONDS),$(1))
-jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so jepsen-selftest
+jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so jepsen-selftest
 	for io in $(IO); do for wl in $(JEPSEN_WORKLOADS); do echo "== tsdbd --io $$io, workload $$wl"; \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis kill  --seconds $(call jsec,20) && \
 	    for seed in $(JEPSEN_SEEDS); do \
@@ -749,6 +775,9 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so jepsen-selftest
 	        --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis pause --seconds $(call jsec,10) && \
 	    if [ $$wl = kv ]; then \
+	        for seed in 1 2; do \
+	            TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis outage --seconds $(call jsec,40) \
+	                --seed $$seed --outagefs $(B)/liboutagefs.so || exit 1; done && \
 	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
 	            --crashfs $(B)/libcrashfs.so --verify-checksums && \
 	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
@@ -788,6 +817,16 @@ all: $(B)/embedded-example $(B)/client-example
 test: test-quickstart
 test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 	B=$(B) tests/test_quickstart.sh
+
+# The outage shim's own test (Linux only: LD_PRELOAD)
+ifneq ($(UNAME_S),Darwin)
+test: test-outagefs
+test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/liboutagefs.so $(B)/tsdbd
+	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs /tmp
+	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_health /tmp
+	for io in $(IO); do echo "== outage, tsdbd --io $$io"; \
+	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage /tmp || exit 1; done
+endif
 
 # The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.
 test: check-version

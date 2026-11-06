@@ -71,7 +71,9 @@ enum {
     TSDB_ERR_TOO_MANY_BUCKETS = -7,
     TSDB_ERR_STOPPED = -8, /* a query callback returned non-zero, or the db is closing */
     TSDB_ERR_READONLY = -9,
-    /* -10 to -15 are kept for the HA track (docs/ha.md) */
+    /* -10 to -15 are kept for the HA track (docs/ha.md); the wire bodies of these are step S0's */
+    TSDB_ERR_UNAVAILABLE = -11, /* tsdbd: the volume's storage is unavailable; definitely not applied (ha.md 15.4) */
+    TSDB_ERR_ABANDONED = -14,   /* a request that was parked on a stuck volume and discarded its work (ha.md 15.3) */
     TSDB_ERR_DENIED = -16, /* tsdbd: the user holds no right for this (or the series does not exist) */
     TSDB_ERR_AUTH = -17,   /* tsdbd: login failed or is required first */
 };
@@ -757,6 +759,37 @@ int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
  * low by the number of large writes in flight. The hook must not block or call the database. Every -1 goes to the
  * hook (and ctx) that got its +1, so it may be changed or cleared (NULL: none) at any time; waits already counted
  * end on the old one. Volumes added later get it too. */
+/* The calling thread runs a request that may be abandoned (ha.md 15.3): once *flag is nonzero the next write step of
+ * this thread that is not yet acknowledged or published returns TSDB_ERR_ABANDONED and discards its work (a small
+ * write before its WAL append, a large write, delete or replace before its commit). A step past its check completes.
+ * NULL clears it. The flag must outlive the call; only this thread's own request steps look at it. */
+void tsdb_set_abandon_flag(const volatile int *flag);
+
+/* Recovery of one volume in the running process (ha.md 15.5; tsdbd, not embedded use). `vol` is the volume number
+ * (0 is the root, which is not recovered here). tsdb_volume_quiesce: new calls on the volume's series that read or
+ * write return TSDB_ERR_UNAVAILABLE (names and types still answer). tsdb_volume_idle: waits until no call is inside
+ * the volume's engine any more (timeout_ms < 0: no deadline; a call stuck in a hung system call keeps this waiting):
+ * 0 idle, 1 not within the time. tsdb_volume_reopen: on a quiesced, idle volume stops the engine's threads, checks
+ * the storage against its memory (below), opens the directory again (the WAL is replayed, the lock is kept) and swaps
+ * the new engine in, with the volume no longer quiesced unless it is diverged; on an error the old engine stays quiesced and the call can be repeated. tsdb_volume_resume ends a
+ * quiesce without a reopen. */
+int tsdb_volume_quiesce(tsdb *db, size_t vol);
+int tsdb_volume_idle(tsdb *db, size_t vol, int timeout_ms);
+/* What tsdb_volume_reopen found when it compared the memory of the stopped engine with the storage (ha.md 15.5 step 3,
+ * 4): wal_mismatch: the last durable WAL record was not on the storage as written (a rolled-back server), so the
+ * rows memory held (relogged_rows) went into a new segment first; series_repaired, states_repaired: entries of SERIES
+ * and STATES the storage had lost, appended again from memory; lost_parts, lost_part_rows: parts that were listed and
+ * are gone, and not merged into others (their rows are lost; a merge the storage took back counts as lost: its
+ * sources are there, but an overwrite or delete merged into its output is not); lost_log_bytes: bytes of RETENTION and
+ * CLASSES records the storage lost; diverged: lost_parts != 0 or lost_log_bytes != 0, and the new engine stays
+ * quiesced until the caller accepts it with tsdb_volume_resume. With wal_sync_ms > 0 every row the memory holds is
+ * written again (relogged_rows) on every reopen, since acknowledged rows past the last sync exist only there. */
+typedef struct tsdb_volume_report {
+    int wal_mismatch, diverged;
+    uint64_t relogged_rows, series_repaired, states_repaired, lost_parts, lost_part_rows, lost_log_bytes;
+} tsdb_volume_report;
+int tsdb_volume_reopen(tsdb *db, size_t vol, tsdb_volume_report *report /* may be NULL */);
+int tsdb_volume_resume(tsdb *db, size_t vol);
 void tsdb_set_write_wait_hook(tsdb *db, void (*on_wait)(void *ctx, int delta), void *ctx);
 
 /* Fail-stop. A storage error after which it is unknown what reached the disk
@@ -826,7 +859,54 @@ size_t tsdb_struct_size(int kind);
 /* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
  * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
  * number they were written for when they load the library and refuse another. */
-#define TSDB_ABI_VERSION 3 /* 3: tsdb_options.insert_zstd_level (the struct grows by 8); 2: pin_index (in what was padding) */
+#define TSDB_ABI_VERSION 3 /* Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
+ * expected topology one export of one pool). tsdb_health_open starts a monitor thread; every domain added gets a
+ * probe thread that reads 4 KiB with O_DIRECT from <dir>/PROBE every second and writes and fdatasyncs 4 KiB to
+ * <dir>/PROBE.<node> every 5 s. Probes may hang for as long as the server is away; nothing else of the process
+ * waits for them. States: UP, DEGRADED (slow, nothing refused), DOWN (a probe outstanding for down_ms, or three
+ * failures in a row), RECOVERING (write probes good for recover_ms). ENOSPC or EDQUOT sets `full` and does not
+ * take the domain down. Zero fields of the options take the defaults named below. */
+enum { TSDB_DOM_UP = 0, TSDB_DOM_DEGRADED = 1, TSDB_DOM_DOWN = 2, TSDB_DOM_RECOVERING = 3 };
+typedef struct tsdb_health tsdb_health;
+typedef struct tsdb_health_options {
+    int down_ms;          /* 10000: a probe outstanding this long takes the domain DOWN */
+    int read_every_ms;    /* 1000 */
+    int write_every_ms;   /* 5000 */
+    int recover_ms;       /* 10000: write probes good for this long leave DOWN (60000 when it flaps) */
+    int fast_ms;          /* 1000: a good write probe takes at most this */
+    int spawn_ms;         /* 60000: a stuck probe thread gets a second one beside it after this */
+    int degraded_min_ms;  /* 500: the floor of the DEGRADED threshold (10 x the baseline above it) */
+    int degraded_window_ms; /* 60000: the window of write probes whose slowest decides */
+    int degraded_exit_ms; /* 120000: under the threshold this long leaves DEGRADED */
+    int read_only;        /* nonzero: no write probe (a follower), and nothing is created */
+    int auto_up;          /* nonzero: RECOVERING goes to UP at once; else the owner calls tsdb_health_set_up */
+    const char *node;     /* names PROBE.<node>; default host-pid */
+    /* Called from the monitor or a probe thread after every state change, with no lock held; it must not block. */
+    void (*on_change)(void *ctx, int domain, int old_state, int new_state);
+    void *ctx;
+} tsdb_health_options;
+typedef struct tsdb_domain_info {
+    const char *name, *dir; /* valid until tsdb_health_close */
+    int state;
+    int64_t since_ms; /* Unix ms of the last state change */
+    int64_t age_ms;   /* time in this state */
+    uint64_t outage_id; /* counts the outages (times the domain went DOWN from UP or DEGRADED) */
+    int full;         /* the last write probe met ENOSPC or EDQUOT */
+    int read_ms, write_ms; /* the last probes' latencies */
+    uint64_t probes_ok, probes_err;
+    int threads;      /* probe threads alive (2 while one is stuck for long) */
+    int64_t stuck_ms; /* age of the oldest probe in flight, 0 if none */
+} tsdb_domain_info;
+tsdb_health *tsdb_health_open(const tsdb_health_options *opts);
+int tsdb_health_add_domain(tsdb_health *h, const char *name, const char *dir); /* its index, or an error */
+int tsdb_health_domains(tsdb_health *h);
+int tsdb_health_info(tsdb_health *h, int domain, tsdb_domain_info *out);
+int tsdb_health_state(tsdb_health *h, int domain); /* TSDB_DOM_*, -1 for an unknown domain */
+void tsdb_health_probe_now(tsdb_health *h, int domain); /* after an EIO or ETIMEDOUT from the engine */
+void tsdb_health_set_up(tsdb_health *h, int domain);    /* RECOVERING -> UP: every volume of it is recovered */
+void tsdb_health_close(tsdb_health *h);
+
+/* 3: tsdb_options.insert_zstd_level (the struct grows by 8); 2: pin_index (in what was padding) */
 int tsdb_abi_version(void);
 
 #ifdef __cplusplus
