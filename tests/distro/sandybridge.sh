@@ -20,8 +20,14 @@ run() {
     echo "=== $*"
     "$@" >"$scratch/out" 2>&1
     local r=$?
-    tail -n 3 "$scratch/out"
-    if [ $r -ne 0 ]; then echo "=== FAILED (exit $r): $*"; fail=1; fi
+    # a failure shows all its output: the release workflow runs this, and its log is all there is to go on
+    if [ $r -ne 0 ]; then
+        cat "$scratch/out"
+        echo "=== FAILED (exit $r): $*"
+        fail=1
+    else
+        tail -n 3 "$scratch/out"
+    fi
 }
 export TSDBD=$b/tsdbd
 for t in test_levels test_tsdb test_types codec-bench type-bench; do
@@ -46,7 +52,7 @@ else
     for cpu in Westmere SandyBridge; do
         run "$qemu" -cpu $cpu "$b/tsdb" "$scratch/cli-$cpu" insert s <"$scratch/rows"
         run "$qemu" -cpu $cpu "$b/tsdb" "$scratch/cli-$cpu" query s min max all
-        grep -qP '^min\t1000\t500000\t' "$scratch/out" || { echo "=== FAILED: $cpu: count/sum of the CLI query"; fail=1; }
+        grep -qP '^min\t1000\t500000\t' "$scratch/out" || { cat "$scratch/out"; echo "=== FAILED: $cpu: count/sum of the CLI query"; fail=1; }
         run "$qemu" -cpu $cpu "$b/tsdb" "$scratch/cli-$cpu" stats
         grep -q 'codecs x86-64-v2' "$scratch/out" || { echo "=== FAILED: $cpu: the CLI did not pick the v2 codecs"; fail=1; }
         # the aggregation kernels: SSE4.2 on Westmere, AVX (no AVX2) on Sandy Bridge

@@ -125,8 +125,10 @@ cgroup, so `nice` does not keep your work out of its way.
   `.claude/settings.local.json`. `.githooks/commit-msg`: the commit rules for everyone (`make hooks`).
 - `.github/workflows/release.yml`: a pushed tag `vX.Y.Z` (or Actions -> release -> Run workflow with an existing tag)
   builds the tarball from exactly the tag (`.github/scripts/release-build.sh`: make dist, dist-test,
-  dist-check-sandybridge), attests its provenance and attaches it and its `.sha256` to the GitHub release
-  (`.github/scripts/release-publish.sh`: curl and GITHUB_TOKEN, never gh; a draft until the assets are up). The
+  dist-check-sandybridge, dist-check-almalinux10), attests its provenance (only in a run from the tag: the
+  attestation names the run's ref) and attaches it and its `.sha256` to the GitHub release
+  (`.github/scripts/release-publish.sh`: curl and GITHUB_TOKEN, never gh; a draft until the assets are up, and left
+  a draft when the runner had no AVX-512; a published release's files are replaced only with `replace`). The
   text is `docs/releases/vX.Y.Z.md`, else the CHANGELOG section (`tools/release-notes.sh`). `make test` runs
   `tests/test_release_notes.sh` and `tests/test_release_publish.py` (the API calls against a local mock).
 - `tools/dump.c`: `tsdb export` / `import` (public API only), the stream of `docs/export-format.md`, which every

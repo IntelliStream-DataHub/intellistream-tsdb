@@ -25,6 +25,7 @@ TOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.environ.get("RELEASE_PUBLISH_SCRIPT") or os.path.join(TOP, ".github", "scripts", "release-publish.sh")
 REPO = "acme/tsdb"
 TOKEN = "ghs_mocktoken0123456789"
+COMMIT = "9496076dcd01051786432dcb044920ea896eeeeb"
 
 
 class MockGitHub:
@@ -164,6 +165,19 @@ class MockGitHub:
             rel["assets"].append(a)
             return 201, {k: v for k, v in a.items() if k != "data"}
         m = re.fullmatch(base + r"/releases/assets/(\d+)", path)
+        if method == "PATCH" and m:  # rename; GitHub refuses a name the release already has
+            aid = int(m.group(1))
+            for r in self.releases:
+                for a in r["assets"]:
+                    if a["id"] == aid:
+                        if self.immutable and not r["draft"]:
+                            return 422, {"message": "Cannot update assets of an immutable release."}
+                        name = entry["json"].get("name", a["name"])
+                        if any(b["name"] == name and b is not a for b in r["assets"]):
+                            return 422, {"message": "Validation Failed", "errors": [{"code": "already_exists"}]}
+                        a["name"] = name
+                        return 200, {k: v for k, v in a.items() if k != "data"}
+            return 404, {"message": "Not Found"}
         if method == "DELETE" and m:
             aid = int(m.group(1))
             for r in self.releases:
@@ -234,16 +248,17 @@ def scenarios(tmp):
     base = "/repos/" + REPO
     mock = MockGitHub()
     try:
-        # 1. A new tag: no release yet. Draft, both assets, then published.
+        # 1. A new tag: no release yet. Draft (aimed at the commit built), both assets, then published.
         assets = mkassets("1.2.3", os.urandom(300000))
-        p = run(mock, "v1.2.3", notes, assets)
+        p = run(mock, "v1.2.3", notes, assets, {"RELEASE_COMMIT": COMMIT})
         check(p.returncode == 0, "fresh release: exit %d\n%s%s" % (p.returncode, p.stdout, p.stderr))
         c = calls(mock)
         want = [("GET", base + "/releases/tags/v1.2.3"), ("GET", base + "/releases"), ("POST", base + "/releases")]
         check(c[:3] == want, "fresh release: first calls %s" % c[:3])
         create = mock.log[2].get("json", {})
         check(create == {"tag_name": "v1.2.3", "name": "tsdb 1.2.3", "body": text, "draft": True,
-                         "prerelease": False}, "fresh release: create body %s" % create)
+                         "prerelease": False, "target_commitish": COMMIT}, "fresh release: create body %s" % create)
+        check("::warning::" not in p.stdout, "fresh release: a warning: %s" % p.stdout)
         rel = mock.releases[0]
         ups = [e for e in mock.log if e["method"] == "POST" and e["path"].endswith("/assets")]
         check([e["query"] for e in ups] == ["name=" + os.path.basename(a) for a in assets],
@@ -260,23 +275,83 @@ def scenarios(tmp):
         check(not rel["draft"] and len(rel["assets"]) == 2, "fresh release: final state %s" % rel)
         check(TOKEN not in p.stdout + p.stderr, "fresh release: the token was printed")
 
-        # 2. A rerun with a rebuilt tarball: the old assets are deleted and replaced; the published release's text,
-        #    name and flags are left alone (no PATCH, no POST of a release).
-        old_ids = sorted(a["id"] for a in rel["assets"])
+        # 2. A rerun with a rebuilt tarball on the published release: refused without REPLACE_ASSETS (whoever
+        #    downloaded it holds the old checksum), nothing changed.
+        old = sorted((a["id"], a["name"], a["data"]) for a in rel["assets"])
         rel["body"] = "edited by hand on the release page"
         assets = mkassets("1.2.3", os.urandom(1000))
         p = run(mock, "v1.2.3", notes, assets)
+        check(p.returncode != 0 and "replaced only on request" in p.stderr, "rerun, no replace: %r" % p.stderr)
+        check(not any(m in ("POST", "DELETE", "PATCH") for m, _ in calls(mock)), "rerun, no replace: %s" % calls(mock))
+        check(sorted((a["id"], a["name"], a["data"]) for a in rel["assets"]) == old, "rerun, no replace: assets")
+
+        # 2b. With REPLACE_ASSETS=1: both new files are stored (as NAME.new) before any old one is deleted, then
+        #     renamed; the published release's text, name and flags are left alone (no PATCH of the release, no
+        #     POST of one), with a warning that its text is not ours.
+        p = run(mock, "v1.2.3", notes, assets, {"REPLACE_ASSETS": "1"})
         check(p.returncode == 0, "rerun: exit %d\n%s%s" % (p.returncode, p.stdout, p.stderr))
         c = calls(mock)
         check(c[0] == ("GET", base + "/releases/tags/v1.2.3") and ("GET", base + "/releases") not in c,
               "rerun: lookup %s" % c)
         dels = sorted(int(path.rsplit("/", 1)[1]) for m, path in c if m == "DELETE")
-        check(dels == old_ids, "rerun: deleted %s, want %s" % (dels, old_ids))
-        check(not any(m in ("PATCH",) or path == base + "/releases" and m == "POST" for m, path in c),
-              "rerun: changed the release itself: %s" % c)
+        check(dels == sorted(i for i, _, _ in old), "rerun: deleted %s, want %s" % (dels, old))
+        ups = [i for i, e in enumerate(mock.log) if e["method"] == "POST" and e["path"].endswith("/assets")]
+        first_del = min(i for i, e in enumerate(mock.log) if e["method"] == "DELETE")
+        check(len(ups) == 2 and max(ups) < first_del, "rerun: an old file was deleted before both new ones were up")
+        check([mock.log[i]["query"] for i in ups] == ["name=%s.new" % os.path.basename(a) for a in assets],
+              "rerun: uploads %s" % [mock.log[i]["query"] for i in ups])
+        check(not any(path == base + "/releases/%d" % rel["id"] or path == base + "/releases" and m == "POST"
+                      for m, path in c), "rerun: changed the release itself: %s" % c)
         check(len(mock.releases) == 1 and rel["body"] == "edited by hand on the release page", "rerun: release text")
-        check(sorted(a["data"] for a in rel["assets"]) == sorted(contents(a) for a in assets),
-              "rerun: assets are not the new files")
+        check("::warning::the release of v1.2.3 keeps its text" in p.stdout, "rerun: no warning about the text")
+        check(sorted((a["name"], a["data"]) for a in rel["assets"])
+              == sorted((os.path.basename(a), contents(a)) for a in assets), "rerun: assets are not the new files")
+
+        # 2c. A replace whose upload fails: the old files stay as they were (nothing deleted).
+        old = sorted((a["id"], a["name"], a["data"]) for a in rel["assets"])
+        mock.fail[("POST", base + r"/releases/\d+/assets")] = 502
+        p = run(mock, "v1.2.3", notes, mkassets("1.2.3", b"never stored"), {"REPLACE_ASSETS": "1"})
+        check(p.returncode != 0 and not any(m == "DELETE" for m, _ in calls(mock)), "replace, failed upload: %s"
+              % calls(mock))
+        check(sorted((a["id"], a["name"], a["data"]) for a in rel["assets"]) == old, "replace, failed upload: assets")
+
+        # 2d. A replace whose rename fails: the run fails with NAME.new left; the next run clears it and finishes.
+        mock.fail[("PATCH", base + r"/releases/assets/\d+")] = 422
+        assets = mkassets("1.2.3", b"third build")
+        p = run(mock, "v1.2.3", notes, assets, {"REPLACE_ASSETS": "1"})
+        check(p.returncode != 0 and "renaming" in p.stderr, "replace, failed rename: %r" % p.stderr)
+        check(any(a["name"].endswith(".new") for a in rel["assets"]), "replace, failed rename: %s"
+              % [a["name"] for a in rel["assets"]])
+        p = run(mock, "v1.2.3", notes, assets, {"REPLACE_ASSETS": "1"})
+        check(p.returncode == 0, "after a failed rename: exit %d\n%s%s" % (p.returncode, p.stdout, p.stderr))
+        check(sorted((a["name"], a["data"]) for a in rel["assets"])
+              == sorted((os.path.basename(a), contents(a)) for a in assets), "after a failed rename: %s"
+              % [a["name"] for a in rel["assets"]])
+
+        # 2e. A published release made by hand, without our files: they are added without REPLACE_ASSETS.
+        hand = mock.add_release("v1.2.4", draft=False, body=text)
+        assets = mkassets("1.2.4", b"tarball 1.2.4")
+        p = run(mock, "v1.2.4", notes, assets)
+        check(p.returncode == 0, "hand-made release: exit %d\n%s%s" % (p.returncode, p.stdout, p.stderr))
+        check(sorted(a["name"] for a in hand["assets"]) == sorted(os.path.basename(a) for a in assets)
+              and "::warning::" not in p.stdout, "hand-made release: %s %s" % (hand["assets"], p.stdout))
+
+        # 2f. KEEP_DRAFT (the v4 code did not run): uploaded, left a draft, with a warning; a later run without it
+        #     replaces the draft's files (no REPLACE_ASSETS needed: nobody has seen a draft) and publishes.
+        assets = mkassets("1.2.5", b"tarball 1.2.5")
+        p = run(mock, "v1.2.5", notes, assets, {"KEEP_DRAFT": "1"})
+        r125 = [r for r in mock.releases if r["tag_name"] == "v1.2.5"]
+        check(p.returncode == 0 and len(r125) == 1 and r125[0]["draft"] and len(r125[0]["assets"]) == 2
+              and "stays a draft" in p.stdout, "keep draft: %d %s\n%s%s" % (p.returncode, r125, p.stdout, p.stderr))
+        check(not any(m == "PATCH" for m, _ in calls(mock)), "keep draft: published")
+        assets = mkassets("1.2.5", b"tarball 1.2.5, again")
+        p = run(mock, "v1.2.5", notes, assets)
+        check(p.returncode == 0 and not r125[0]["draft"] and sorted((a["name"], a["data"]) for a in r125[0]["assets"])
+              == sorted((os.path.basename(a), contents(a)) for a in assets), "keep draft, then publish: %s\n%s%s"
+              % (r125, p.stdout, p.stderr))
+        p = run(mock, "v1.2.6", notes, mkassets("1.2.6", b"x"), {"RELEASE_COMMIT": "main"})
+        check(p.returncode != 0 and not mock.log, "bad RELEASE_COMMIT: exit %d, %d requests" % (p.returncode,
+                                                                                             len(mock.log)))
 
         # 3. A prerelease tag: prerelease true, never "latest".
         assets = mkassets("2.0.0-rc.1", b"rc tarball")
@@ -338,11 +413,14 @@ def scenarios(tmp):
         p = run(mock, "v1.7.0", notes, mkassets("1.7.0", b"x"), {"GITHUB_TOKEN": "wrong"})
         check(p.returncode != 0 and "Bad credentials" in p.stderr, "wrong token: %r" % p.stderr)
 
-        # 9. Immutable releases: a published release's assets cannot be replaced; the rerun says why and fails.
+        # 9. Immutable releases: a published release's assets cannot be replaced; the rerun says why and fails, and
+        #    the files stay.
         mock.immutable = True
-        p = run(mock, "v1.2.3", notes, mkassets("1.2.3", b"again"))
+        old = sorted((a["id"], a["name"]) for a in rel["assets"])
+        p = run(mock, "v1.2.3", notes, mkassets("1.2.3", b"again"), {"REPLACE_ASSETS": "1"})
         mock.immutable = False
         check(p.returncode != 0 and "immutable" in p.stderr, "immutable: %r" % p.stderr)
+        check(sorted((a["id"], a["name"]) for a in rel["assets"]) == old, "immutable: assets changed")
     finally:
         mock.stop()
 

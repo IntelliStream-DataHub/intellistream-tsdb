@@ -93,8 +93,8 @@ When a job fails, its logs are attached to the run as an artifact for two weeks.
 A pushed tag `vX.Y.Z` runs `.github/workflows/release.yml` instead: the tarball is built and tested from the tag
 and attached to the GitHub release (docs/release.md, step 6).
 
-CI does not run the AlmaLinux 10 container check (`make dist-check-almalinux10`, it needs Podman), the long fuzz
-runs, the benchmarks or the Podman-based Pulsar connector test. A test that passes here on a 32-thread machine can
+CI does not run the AlmaLinux 10 container check (`make dist-check-almalinux10`) on pushes (the release workflow
+does, on the tarball it releases), the long fuzz runs, the benchmarks or the Podman-based Pulsar connector test. A test that passes here on a 32-thread machine can
 still be slow or timing-sensitive on a 4-CPU runner: if a CI run fails once and passes when you run it again,
 tell us in the pull request, so that we can fix the test.
 
