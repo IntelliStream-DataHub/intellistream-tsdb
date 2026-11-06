@@ -83,6 +83,8 @@ const auth_op auth_ops[256] = {
     [TSDB_OP_FLUSH] = {P_SUPER, W_NONE, S_STATUS, 0, 0},
     [TSDB_OP_OPTIMIZE] = {P_SUPER, W_NONE, S_STATUS, 0, 0},
     [TSDB_OP_STATS] = {P_STATS, W_NONE, S_STATUS, 0, 0},
+    [TSDB_OP_TOPOLOGY] = {P_LOGIN, W_NONE, S_STATUS, 0, 0}, /* ids and health for every client; paths go to a superuser */
+    [TSDB_OP_STATUS] = {P_SUPER, W_NONE, S_STATUS, 0, 0},
     [TSDB_OP_USER_CREATE] = {P_ADMIN, W_NONE, S_STATUS, 0, 0},
     [TSDB_OP_USER_DROP] = {P_ADMIN, W_NONE, S_STATUS, 0, 0},
     [TSDB_OP_USER_ALTER] = {P_ADMIN, W_NONE, S_STATUS, 0, 0},
@@ -869,6 +871,8 @@ static inline __attribute__((always_inline)) int ids_check(auth_user *au, const 
     }
     return 0;
 }
+
+bool auth_conn_super(const auth_conn *a) { return !a->au || a->au->superuser; }
 
 int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need)
 {
