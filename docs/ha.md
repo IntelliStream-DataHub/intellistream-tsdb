@@ -1320,6 +1320,10 @@ workload, no rollback kind).
 Where it differs from the text above:
 - **References live in the engine** (`refs`, `quiesced`), not in a per-volume slot; `t->vols[v]` stays a bare `eng *`.
   Recovery swaps the pointer under the wrlock after `tsdb_volume_idle`.
+  Cost, measured 2026-11-06 (`tsdbc-bench query`, 100 series x 1 M points, 5 runs each, main 478c33d and ha-n1 run
+  alternately): within the noise (sd 2 to 5 %) on 1 and 32 connections (raw, agg300, agg3600, twa3600, full0: -2.6 % to
+  +2.0 %), so the counter is not sharded. tsdbd's one event loop caps that test; an embedded run on 32+ threads on one
+  volume has not been measured.
 - **Recovery is a cold reopen first, a re-log only when the disk disagrees.** The reopen replays the WAL from disk. When
   the WAL tail does not match what the engine wrote (xxh64 of the last record, read with `O_DIRECT`), the memtable rows
   are written into a new segment before the reopen. In async WAL mode (`wal_sync_ms > 0`) every memtable row is
