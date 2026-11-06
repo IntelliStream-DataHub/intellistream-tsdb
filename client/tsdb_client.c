@@ -698,10 +698,16 @@ static int handshake(tsdbc *c, int connect_ms)
 }
 
 /* Moves the connection to host:port (the requests kept stay kept: the caller sends them again). On failure the
- * old connection is as it was. */
-static int reconnect_to(tsdbc *c, const char *host, int port)
+ * old connection is as it was. The connect and the handshake take at most the time left of the retry budget
+ * (deadline, a mono_ms value), so a followed MOVED cannot spend a connect timeout per node past it. */
+static int reconnect_to(tsdbc *c, const char *host, int port, int64_t deadline)
 {
     int connect_ms = c->connect_ms == 0 ? TSDBC_CONNECT_TIMEOUT_MS : c->connect_ms < 0 ? 0 : c->connect_ms;
+    int64_t left = deadline - mono_ms();
+    if (left <= 0)
+        return TSDB_ERR_IO;
+    if (connect_ms == 0 || left < connect_ms)
+        connect_ms = (int)left;
     int fd = open_socket(host, port, connect_ms);
     if (fd < 0)
         return TSDB_ERR_IO;
@@ -746,18 +752,19 @@ static int reconnect_to(tsdbc *c, const char *host, int port)
 
 /* After MOVED: to the address it names, else to another node of the connect string. 0 when connected somewhere
  * new; nonzero when there is nowhere to go (the status stands). */
-static int follow_moved(tsdbc *c, const tsdbc_err_info *e)
+static int follow_moved(tsdbc *c, const tsdbc_err_info *e, int64_t deadline)
 {
     char host[256];
     int port;
     for (unsigned i = 0; i < e->nmoved; i++) {
         if (e->moved[i].addr[0] && parse_node(e->moved[i].addr, host, sizeof host, &port) == 0 &&
-            reconnect_to(c, host, port) == 0)
+            reconnect_to(c, host, port, deadline) == 0)
             return 0;
     }
     for (size_t k = 1; k < c->nnodes; k++) {
         size_t i = (c->node_at + k) % c->nnodes;
-        if (parse_node(c->nodes[i], host, sizeof host, &port) == 0 && reconnect_to(c, host, port) == 0) {
+        if (parse_node(c->nodes[i], host, sizeof host, &port) == 0 &&
+            reconnect_to(c, host, port, deadline) == 0) {
             c->node_at = i;
             return 0;
         }
@@ -791,7 +798,7 @@ static int retry_step(tsdbc *c, const tsdbc_err_info *e, int64_t *deadline, unsi
         return 0;
     sleep_ms(delay);
     (*tries)++;
-    if (e->status == TSDB_ERR_MOVED && follow_moved(c, e) != 0)
+    if (e->status == TSDB_ERR_MOVED && follow_moved(c, e, *deadline) != 0)
         return 0;
     return 1;
 }

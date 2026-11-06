@@ -208,8 +208,10 @@
  *   TOPOLOGY    [u64 since_gen]  ->  u64 gen, u32 nn, nn x {u32 node_id, u8 alive, u16 len, addr},
  *               u32 n, n x {u16 vol, u8 role (TSDB_ROLE_*), u8 health (TSDB_HEALTH_*), u32 epoch, u8 reason, u8 0,
  *               u16 domain, i64 since_ms, u32 owner (a node_id), u16 server, u16 len, addr, u16 plen, path}
- *               An empty request is since_gen 0. gen changes whenever anything in the reply does (clients poll;
- *               there is no push). domain and server are 0xffff when unknown. addr is the owner's address for clients;
+ *               An empty request is since_gen 0. since_gen is reserved: version 13 answers in full whatever it is
+ *               (the clients send none), so no client may rely on a short reply; a version that answers an
+ *               unchanged gen shortly will say so by its number. gen changes whenever anything in the reply does
+ *               (clients poll; there is no push). domain and server are 0xffff when unknown. addr is the owner's address for clients;
  *               empty means "the node you are connected to". path is the volume's directory, sent only to a superuser
  *               (a client needs ids, not paths). tsdbd without a cluster answers itself as node 1, every volume
  *               as OWNER (FOLLOWER under --follow), with the health of its storage domain.

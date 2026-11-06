@@ -305,6 +305,22 @@ fn moved_is_followed_to_the_node_it_names() {
 }
 
 #[test]
+fn following_a_moved_takes_at_most_the_time_left_of_the_budget() {
+    // B accepts the connection (the kernel does) and never answers the handshake: without the cap this call waits
+    // the 10 s connect timeout
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let baddr = silent.local_addr().unwrap().to_string();
+    let a = Fake::start(move |_| Reply(-10, moved_body(&baddr)));
+    let mut c = Client::connect(a.addr).unwrap();
+    c.set_retry(Some(Duration::from_millis(1000)));
+    let t0 = Instant::now();
+    let e = c.flush().unwrap_err();
+    assert_eq!(e.status(), Some(Status::Moved), "{e}");
+    assert!(t0.elapsed() < Duration::from_millis(2000), "{:?}", t0.elapsed());
+    drop(silent);
+}
+
+#[test]
 fn moved_without_an_address_goes_to_the_next_node() {
     let b = Fake::start(|_| ok());
     let a = Fake::start(|_| Reply(-10, moved_body("")));
@@ -405,8 +421,33 @@ fn topology_of_a_single_server() {
     let g = t.generation;
     assert_eq!(c.topology().unwrap().generation, g, "the generation names the answer");
     // --no-auth: STATUS is a superuser's, and --no-auth has none
-    let st = c.server_status();
-    assert!(st.is_ok() || st.unwrap_err().status() == Some(Status::Denied));
+    match c.server_status() {
+        Ok(text) => assert!(text.starts_with("node.id="), "the length prefix is not part of the text: {text:?}"),
+        Err(e) => assert_eq!(e.status(), Some(Status::Denied)),
+    }
+}
+
+fn status_reply(len_delta: i64, text: &str) -> Reply {
+    let n = (text.len() as i64 + len_delta) as u32;
+    let mut b = n.to_le_bytes().to_vec();
+    b.extend_from_slice(text.as_bytes());
+    Reply(0, b)
+}
+
+#[test]
+fn the_status_text_comes_without_its_length() {
+    let f = Fake::start(|_| status_reply(0, "node.id=1\nvolumes=2\n"));
+    let mut c = Client::connect(f.addr).unwrap();
+    assert_eq!(c.server_status().unwrap(), "node.id=1\nvolumes=2\n");
+}
+
+#[test]
+fn a_status_whose_length_is_wrong_is_corrupt() {
+    for delta in [-1, 1] {
+        let f = Fake::start(move |_| status_reply(delta, "node.id=1\n"));
+        let mut c = Client::connect(f.addr).unwrap();
+        assert!(matches!(c.server_status(), Err(Error::Protocol(_))), "delta {delta}");
+    }
 }
 
 /// tests/outage_server.c: tsdbd with volume A on a domain that outagefs can take away.
@@ -501,6 +542,15 @@ fn an_outage_gives_unavailable_with_its_body_and_the_client_retries_then_succeed
     assert!(info.unavailable[0].reason != 0 && info.unavailable[0].retry_after_ms > 0 && info.unavailable[0].since_ms > 0);
     // the root answers while A is away
     c.insert_series(o.sid_root, &[2001], &[2.0]).unwrap();
+    // QUERY_MULTI over both: the down series is refused in its own (bare) frame, the other is answered, and the
+    // connection stays usable
+    let r = c
+        .query_rows_multi(&[o.sid_a, o.sid_root], .., QueryOpts::default(), MultiOpts::default())
+        .expect("the call itself succeeds"); // mutation "body on per-series frames": Protocol error
+    assert_eq!(r.len(), 2);
+    assert!(matches!(&r[0], Err(Error::Server(Status::Unavailable))), "{:?}", r[0]);
+    assert_eq!(r[1].as_ref().unwrap().ts.len(), 1);
+    c.insert_series(o.sid_root, &[2002], &[2.0]).unwrap();
     let t = c.topology().unwrap();
     let a = t.volumes.iter().find(|v| v.vol == o.vol_a).unwrap();
     assert_eq!((a.health, a.reason != 0), (2, true));

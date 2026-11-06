@@ -219,6 +219,11 @@ class HaTest {
         assertTrue(e.hasBody());
         assertEquals(5, e.droppedVol());
         assertEquals(1_700_000_000_999L, e.droppedBefore());
+        /* exactly 10 bytes, as the C codec reads it: a byte more is malformed */
+        byte[] d = new byte[vector("dropped").remaining()];
+        vector("dropped").get(d);
+        assertEquals(10, d.length);
+        assertFalse(ErrorInfo.of(-13, ByteBuffer.wrap(cat(d, new byte[1])), Protocol.OP_INSERT).hasBody());
         Topology t = Topology.decode(vector("topology"));
         assertNotNull(t);
         assertEquals(0xDEADBEEFL, t.generation());
@@ -390,7 +395,45 @@ class HaTest {
         }
     }
 
+    static Reply statusReply(int lenDelta, String text) {
+        byte[] t = text.getBytes(StandardCharsets.UTF_8);
+        return new Reply(0, cat(buf(4).putInt(t.length + lenDelta).array(), t));
+    }
+
+    @Test
+    void theStatusTextComesWithoutItsLength() throws Exception {
+        try (Fake f = new Fake(r -> statusReply(0, "node.id=1\nvolumes=2\n"));
+                TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
+            assertEquals("node.id=1\nvolumes=2\n", c.serverStatus());
+        }
+    }
+
+    @Test
+    void aStatusWhoseLengthIsWrongIsCorrupt() throws Exception {
+        for (int delta : new int[] {-1, 1}) {
+            try (Fake f = new Fake(r -> statusReply(delta, "node.id=1\n"));
+                    TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
+                TsdbException e = assertThrows(TsdbException.class, c::serverStatus);
+                assertEquals(Status.ERR_CORRUPT, e.status());
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ MOVED, nodes
+
+    @Test
+    void followingAMovedTakesAtMostTheTimeLeftOfTheBudget() throws Exception {
+        /* B accepts the connection (the kernel does) and never answers the handshake: without the cap this call
+         * waits the connect timeout */
+        try (ServerSocket silent = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+                Fake a = new Fake(r -> new Reply(-10, movedBody("127.0.0.1:" + silent.getLocalPort())));
+                TsdbClient c = TsdbClient.connect("127.0.0.1", a.port())) {
+            c.setRetry(Duration.ofMillis(1000));
+            long t0 = System.nanoTime();
+            assertThrows(MovedException.class, c::flush);
+            assertTrue((System.nanoTime() - t0) / 1_000_000 < 2000, "took " + (System.nanoTime() - t0) / 1_000_000);
+        }
+    }
 
     @Test
     void movedIsFollowedToTheNodeItNames() throws Exception {
@@ -501,7 +544,8 @@ class HaTest {
             assertEquals(t.generation(), c.topology().generation(), "the generation names the answer");
             /* --no-auth: STATUS is a superuser's, and --no-auth has none */
             try {
-                c.serverStatus();
+                String text = c.serverStatus();
+                assertTrue(text.startsWith("node.id="), "the length prefix is not part of the text: " + text);
             } catch (TsdbException e) {
                 assertEquals(Status.ERR_DENIED, e.status());
             }
@@ -591,6 +635,14 @@ class HaTest {
             assertEquals(o.volA, u.vol());
             assertTrue(u.reason() != 0 && u.retryAfterMs() > 0 && u.sinceMs() > 0, u.toString());
             c.insert(o.sidRoot, new long[] {2001}, new float[] {2}); /* the root answers while A is away */
+            /* QUERY_MULTI over both: the down series is refused in its own (bare) frame, the other is answered, and
+             * the connection stays usable */
+            List<SeriesResult<ValuePoints>> m = c.queryValuesMulti(new long[] {o.sidA, o.sidRoot}, 0, Long.MAX_VALUE);
+            assertEquals(2, m.size()); /* mutation "body on per-series frames": the connection is lost */
+            assertFalse(m.get(0).ok());
+            assertEquals(Status.ERR_UNAVAILABLE, m.get(0).status());
+            assertTrue(m.get(1).ok());
+            c.insert(o.sidRoot, new long[] {2002}, new float[] {2});
             Topology t = c.topology();
             Topology.Vol a = t.volumes().stream().filter(v -> v.vol() == o.volA).findFirst().orElseThrow();
             assertEquals(Topology.HEALTH_UNAVAILABLE, a.health());

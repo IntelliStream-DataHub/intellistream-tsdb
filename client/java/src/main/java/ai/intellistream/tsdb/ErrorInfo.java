@@ -251,6 +251,8 @@ public final class ErrorInfo {
             case Status.ERR_DROPPED:
                 e.droppedVol = u16(b);
                 e.droppedBefore = b.getLong();
+                if (b.hasRemaining())
+                    return bare(status); /* exactly 10 bytes, as the C codec reads it */
                 break;
             default:
                 return bare(status);

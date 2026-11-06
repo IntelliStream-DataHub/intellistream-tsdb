@@ -584,7 +584,11 @@ public final class TsdbClient implements AutoCloseable {
         int st = frame();
         String text = null;
         if (st == 0) {
-            byte[] b = new byte[bodyLen];
+            /* u32 length of the text, then the text: the length must be exactly what follows it */
+            if (bodyLen < 4 || Integer.toUnsignedLong(in.getInt(in.position())) != bodyLen - 4L)
+                throw lost(Status.ERR_CORRUPT, "STATUS reply of " + bodyLen + " bytes");
+            in.getInt();
+            byte[] b = new byte[bodyLen - 4];
             in.get(b);
             text = new String(b, StandardCharsets.UTF_8);
         }
@@ -3750,19 +3754,19 @@ public final class TsdbClient implements AutoCloseable {
             return false;
         }
         r.tries++;
-        return !moved || followMoved(e);
+        return !moved || followMoved(e, r.deadline);
     }
 
     /** After MOVED: to the address it names, else to another node of the connect string. */
-    private boolean followMoved(ErrorInfo e) {
+    private boolean followMoved(ErrorInfo e, long deadline) {
         for (ErrorInfo.Moved m : e.moved()) {
             String a = m.addr().isEmpty() ? null : ErrorInfo.parseNode(m.addr());
-            if (a != null && reconnectTo(a))
+            if (a != null && reconnectTo(a, deadline))
                 return true;
         }
         for (int k = 1; k < nodes.size(); k++) {
             int i = (nodeAt + k) % nodes.size();
-            if (reconnectTo(nodes.get(i))) {
+            if (reconnectTo(nodes.get(i), deadline)) {
                 nodeAt = i;
                 return true;
             }
@@ -3772,9 +3776,14 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * Moves the connection to {@code hostPort}: connects, says HELLO and logs in there (with its own request ids; the
-     * kept frames stay kept, the caller sends them again). On failure the old connection is as it was.
+     * kept frames stay kept, the caller sends them again). On failure the old connection is as it was. The connect and
+     * the handshake take at most the time left until {@code deadline} (System.nanoTime, the retry budget), so
+     * following a MOVED cannot spend a connect timeout per node past it.
      */
-    private boolean reconnectTo(String hostPort) {
+    private boolean reconnectTo(String hostPort, long deadline) {
+        long leftMs = (deadline - System.nanoTime()) / 1_000_000L;
+        if (leftMs <= 0)
+            return false;
         int colon = hostPort.lastIndexOf(':');
         String host = hostPort.substring(0, colon);
         if (host.startsWith("["))
@@ -3784,8 +3793,13 @@ public final class TsdbClient implements AutoCloseable {
         try {
             pw = opts.user() != null ? opts.passwordBytes() : null;
             Duration handshake = opts.connectTimeout().isZero() ? opts.requestTimeout() : opts.connectTimeout();
-            t = connectEach(host, Integer.parseInt(hostPort.substring(colon + 1)), millis(opts.connectTimeout()),
-                    handshake, opts, pw);
+            Duration cap = Duration.ofMillis(leftMs);
+            if (handshake.isZero() || handshake.compareTo(cap) > 0)
+                handshake = cap;
+            int connectMs = millis(opts.connectTimeout());
+            if (connectMs == 0 || connectMs > leftMs)
+                connectMs = (int) Math.min(leftMs, Integer.MAX_VALUE);
+            t = connectEach(host, Integer.parseInt(hostPort.substring(colon + 1)), connectMs, handshake, opts, pw);
         } catch (IOException | RuntimeException x) {
             return false;
         } finally {

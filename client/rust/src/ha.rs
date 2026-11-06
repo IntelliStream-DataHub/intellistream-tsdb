@@ -189,6 +189,9 @@ fn decode(status: i32, body: &[u8]) -> Result<ErrorInfo> {
         -13 => {
             e.dropped_vol = r.u16()?;
             e.dropped_before = r.i64()?;
+            if r.remaining() != 0 {
+                return Err(bad()); // exactly 10 bytes, as the C codec reads it
+            }
         }
         _ => return Ok(e),
     }
@@ -411,5 +414,15 @@ mod tests {
         // trailing bytes that are not a resend_from
         ok.push(1);
         assert!(!error_info(-11, &ok, 4).has_body);
+    }
+
+    #[test]
+    fn a_dropped_body_is_exactly_ten_bytes() {
+        let d = vector("dropped");
+        assert_eq!(d.len(), 10);
+        assert!(error_info(-13, &d, 4).has_body);
+        let mut longer = d.clone();
+        longer.push(0); // the C codec refuses it too
+        assert!(!error_info(-13, &longer, 4).has_body);
     }
 }

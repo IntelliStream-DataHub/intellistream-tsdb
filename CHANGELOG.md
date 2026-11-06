@@ -58,8 +58,9 @@ disk format and the wire protocol.
   `setRetry`), follow MOVED, and connect to a list of nodes (`tsdbc_connect_nodes`, `connect_nodes`,
   `connectNodes`); new exceptions `TsdbUnavailable`, `TsdbMoved`, `TsdbPartial`, `TsdbDropped` (Python) and
   `UnavailableException` and its siblings (Java), `Status::{Moved, Unavailable, Partial, Dropped}` (Rust). The
-  C client keeps a copy of each request until its reply (one more memcpy). The Pulsar sink works as before (its tests
-  pass). **Protocol numbers moved:** `QUERY_LATEST` is protocol 14, the change feed 15, statistics 16.
+  C client keeps a copy of each request until its reply (one more memcpy). A connection gets the bodies only if its
+  HELLO said 13 (a client of 12 reads the bare status, as before), and in QUERY_MULTI only the END frame carries the
+  body. The Pulsar sink works as before (its tests pass), and treats DROPPED as final (dead letter). **Protocol numbers moved:** `QUERY_LATEST` is protocol 14, the change feed 15, statistics 16.
 - tsdbd `--lttb-max-threshold N` (default 16,777,216): the largest LTTB threshold the server computes, for
   QUERY_LTTB and QUERY_MULTI; a larger one is taken as this. A range of no more rows than that still answers every
   point. Newest-first LTTB holds its chosen points until the last is chosen, so before this a threshold near the

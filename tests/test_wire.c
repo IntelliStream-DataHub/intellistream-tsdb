@@ -573,6 +573,29 @@ static void script_moved(struct fake *f, int fd)
     }
 }
 
+/* A MOVED naming a node that accepts the connection and never answers the handshake: following it takes at most the
+ * time left of the budget, not the connect timeout (10 s) of the handshake. */
+static void test_moved_budget(void)
+{
+    struct fake a, silent;
+    tsdbc *c;
+    tsdb_sid sid = 0;
+    fake_start(&silent, 0, script_ok); /* listens, never accepts */
+    fake_start(&a, 1, script_moved);
+    moved_port = silent.port;
+    moved_mode = 0;
+    CHECK(tsdbc_connect("127.0.0.1", a.port, &c) == 0);
+    tsdbc_set_retry(c, 1000);
+    double t0 = now_ms();
+    int rc = tsdbc_series(c, "pump1.flow", 1, &sid);
+    double dt = now_ms() - t0;
+    CHECK(rc == TSDB_ERR_MOVED);
+    CHECK(dt < 2000); /* mutation: about 10 s, the connect timeout */
+    tsdbc_close(c);
+    fake_stop(&a);
+    fake_stop(&silent);
+}
+
 static void test_moved(void)
 {
     struct fake a, b;
@@ -956,6 +979,7 @@ int main(int argc, char **argv)
     check_vectors_file(argc > 1 ? argv[1] : "tests/data/wire13-vectors.txt");
     test_unavailable();
     test_moved();
+    test_moved_budget();
     test_partial_dropped();
     test_multi_refused();
     test_pipeline();

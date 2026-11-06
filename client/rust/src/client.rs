@@ -2468,7 +2468,13 @@ impl Client {
     pub fn server_status(&mut self) -> Result<String> {
         self.run(|c| {
             c.request(Op::Status, |_| {})?;
-            Ok(String::from_utf8_lossy(&c.body).into_owned())
+            // u32 length of the text, then the text: the length must be exactly what follows it
+            match c.body.split_first_chunk::<4>() {
+                Some((n, text)) if u32::from_le_bytes(*n) as usize == text.len() => {
+                    Ok(String::from_utf8_lossy(text).into_owned())
+                }
+                _ => Err(Error::Protocol(format!("STATUS body of {} bytes does not match its length", c.body.len()))),
+            }
         })
     }
 
@@ -2519,9 +2525,14 @@ impl Client {
     }
 
     /// Moves the connection to `addr` (the requests kept stay kept: the caller sends them again). On failure the
-    /// old connection is as it was.
-    fn reconnect_to(&mut self, addr: &str) -> Result<()> {
-        let connect_t = self.opts.timeout.unwrap_or(CONNECT_TIMEOUT);
+    /// old connection is as it was. The connect and the handshake take at most the time left until `deadline`
+    /// (the retry budget), so following a MOVED cannot spend a connect timeout per node past it.
+    fn reconnect_to(&mut self, addr: &str, deadline: Instant) -> Result<()> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::from(io::ErrorKind::TimedOut).into());
+        }
+        let connect_t = self.opts.timeout.unwrap_or(CONNECT_TIMEOUT).min(left);
         let stream = connect_each(addr, connect_t)?;
         stream.set_nodelay(true)?;
         let _ = keepalive::apply(&stream, Some(KeepAlive::default()));
@@ -2560,10 +2571,10 @@ impl Client {
 
     /// After MOVED: to the address it names, else to another node of the connect string. True when connected
     /// somewhere new; false when there is nowhere to go (the status stands).
-    fn follow_moved(&mut self, e: &ErrorInfo) -> bool {
+    fn follow_moved(&mut self, e: &ErrorInfo, deadline: Instant) -> bool {
         for m in &e.moved {
             if let Some(a) = (!m.addr.is_empty()).then(|| ha::parse_node(&m.addr)).flatten()
-                && self.reconnect_to(&a).is_ok()
+                && self.reconnect_to(&a, deadline).is_ok()
             {
                 return true;
             }
@@ -2571,7 +2582,7 @@ impl Client {
         for k in 1..self.nodes.len() {
             let i = (self.node_at + k) % self.nodes.len();
             let a = self.nodes[i].clone();
-            if self.reconnect_to(&a).is_ok() {
+            if self.reconnect_to(&a, deadline).is_ok() {
                 self.node_at = i;
                 return true;
             }
@@ -2606,7 +2617,7 @@ impl Client {
         }
         std::thread::sleep(Duration::from_millis(delay));
         *tries += 1;
-        !(e.status == -10 && !self.follow_moved(e))
+        !(e.status == -10 && !self.follow_moved(e, dl))
     }
 
     /// `read_frame_raw`, and a request the server refused before doing anything (UNAVAILABLE, MOVED) is sent

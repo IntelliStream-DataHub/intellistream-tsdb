@@ -1143,7 +1143,12 @@ The row numbers refer to the stall map (rows 1-16).
 >   name, no frame that spans owners and no drop watermark: the cluster (S1/S2) and the drop (D33) send them.
 > - **TOPOLOGY (48)** answers a single server: node 1, every volume as OWNER (FOLLOWER under `--follow`), the health of
 >   its domain, and `gen`, a hash of the reply. Paths go to a superuser only. Any logged-in user may ask. **STATUS (49)**
->   is `key=value` lines for a superuser (`vol.<n>.health`, `vol.<n>.reason`, `domain.<d>.state`, ...).
+>   is `u32 len` and then `len` bytes of `key=value` lines for a superuser (`node.id=...` first, `vol.<n>.health`,
+>   `vol.<n>.reason`, `domain.<d>.state`, ...); every client returns the text without the length. `since_gen` of
+>   TOPOLOGY is reserved: 13 answers in full whatever it is and the clients send none.
+> - **Who sees the bodies.** A connection reads the HA bodies only if its HELLO said 13: tsdbd keeps the negotiated
+>   version per connection and sends a 12 client the bare status of every op (protocol 12 reads a longer error reply as
+>   corrupt). In QUERY_MULTI only the END frame carries the body; a per-series frame with status UNAVAILABLE is bare.
 > - **Not in 13:** sessions, streams, `seq` and `attempt` on inserts, forwarding between nodes and direct mode (S2, S3),
 >   so `resend_from` is never sent. Without a `seq` a retry is safe because UNAVAILABLE and MOVED mean "not applied":
 >   a client resends in order from the first refused frame, also the frames acknowledged after it.

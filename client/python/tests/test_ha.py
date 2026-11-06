@@ -229,14 +229,15 @@ def test_topology_of_a_single_server(server):
         for v in t["volumes"]:
             assert (v["role"], v["health"]) == (1, 0)  # owner, available
         assert c.topology()["generation"] == t["generation"], "the generation names the answer"
-        assert "=" in c.status()  # --no-auth checks nothing: every connection is a superuser's
+        # --no-auth checks nothing: every connection is a superuser's; the text has no length prefix
+        assert c.status().startswith("node.id=")
 
 
 def test_status_for_a_superuser(auth_server):
     from conftest import ROOT_PASSWORD
 
     with Client("127.0.0.1", auth_server.port, user="root", password=ROOT_PASSWORD) as c:
-        assert "=" in c.status()
+        assert c.status().startswith("node.id=")
         assert c.topology()["volumes"][0]["path"] != ""
 
 
@@ -296,6 +297,12 @@ def test_an_outage_gives_unavailable_with_its_body_and_the_client_retries_then_s
         u = x.entries[0]
         assert u["volume"] == outage.vol_a and u["reason"] != 0 and u["retry_after"] > 0 and u["since_ms"] > 0
         c.insert_series(outage.sid_root, [2001], [2.0])  # the root answers while A is away
+        # QUERY_MULTI over both: the down series is refused in its own (bare) frame, the other is answered, and the
+        # connection stays usable (mutation "body on per-series frames": the connection is lost)
+        m = c.query_values_multi([outage.sid_a, outage.sid_root], errors="status", numpy=False)
+        assert list(m.status) == [-11, 0]
+        assert m[1][0] == [2001]
+        c.insert_series(outage.sid_root, [2002], [2.0])
         t = c.topology()
         a = next(v for v in t["volumes"] if v["volume"] == outage.vol_a)
         assert (a["health"], a["reason"] != 0) == (2, True)
