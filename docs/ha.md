@@ -15,19 +15,19 @@
 | Goals | Stay. "No consensus protocol" now means none on the insert path: ownership is decided by the metadata group (M2), which no row goes through. |
 | Decisions | Kept; rows changed by the modes design start with *Changed 2026-11-06*. |
 | §1 Roles | Roles and slots stay; `NODES` and `--volumes` candidate filters become metadata members and candidate lists (design-ha-modes.md §5.4). |
-| §2 Arbiter and fencing | **Shared-mode only, kept as the fence** (M3, design-ha-modes.md §6). The lock no longer decides who should own a volume; only a node the metadata group granted the volume asks for it (M4). §2.4's epoch claim takes the granted epoch (design-ha-modes.md §5.5). |
+| §2 Arbiter and fencing | **Shared-mode only, kept as the fence** (M3, design-ha-modes.md §6). The lock no longer decides who should own a volume; only a node the metadata group granted the volume asks for it (M4). §2.4's epoch claim takes the granted epoch (design-ha-modes.md §5.5). Revised after review (2026-11-06): `CLASSES` and `RETENTION` are chained like `SERIES` (§2.2, §2.5, §2.6); a volume leaves SUSPECT through RECHECK, and owner reads wait for the read barrier (§2.7, M16). |
 | §3 The proof | Shared-mode only, kept; L2 now rests on the metadata grant plus the storage check (design-ha-modes.md §6.4, G2). |
 | §4 Takeover | Steps 2-8 shared-mode only, kept (step 4 changed); step 1 is triggered by a metadata grant, and `ha init` becomes `tsdb cluster adopt`. |
-| §5 Addressing | Ids built (design-series64.md). Names are unique in the whole database with name slots (shared, design-cluster.md C18), not per volume. `VOLUMES` and `volumes.cache` become the metadata group's volume records. |
+| §5 Addressing | Ids built (design-series64.md). Names are unique in the whole database with name slots (shared, design-cluster.md C18), not per volume; in shared mode a series lives in its slot's home and no volume records other volumes' series (design-ha-modes.md M14, §5.7). Ids are handed out only below a reservation committed in the metadata group (M12). `VOLUMES` becomes the metadata group's volume records; `volumes.cache` stays only as each node's record of the highest epoch it has seen per volume (M4). |
 | §6 Placement, polling, handoff | **Replaced** by the metadata group: grants, moves, rebalancing; `CLAIM` replaces `WANT` and `handoff_to` (design-ha-modes.md §5.3, §5.5). |
-| §7 Followers and reads | Shared-mode only, kept; owner reads are gated like acks (design-ha-modes.md §5.5). |
-| §8 Server | Admission shared (D19); systemd, watchdog and escalation shared-mode only. |
+| §7 Followers and reads | Shared-mode only, kept; owner reads wait for the read barrier, a fenced write issued after they arrived (design-ha-modes.md §5.5, M16). |
+| §8 Server | Admission shared (D19), built once in N1; systemd, watchdog and escalation shared-mode only. A release stuck on a wedged domain whose server is healthy escalates too (design-ha-modes.md §5.5, §15.2 below). |
 | §9 Protocol, §9.1 Forwarding | **Shared by both modes.** `OWNERS` gossip of owners and epochs is replaced by the metadata watch stream; health still travels with the owner's reports. Version numbers: the protocol is at 12 now; this lands as a later version. |
 | §10 Failure modes | Shared-mode only; rows about polling, ranks and D38 read as design-ha-modes.md §5.2. |
 | §11 Configuration | NFS server and mount settings stay; tsdbd flags move to `tsdb cluster` settings. |
 | §12 Backend interface, §13 Tests | Shared-mode only, kept; `jepsen-ha` adds the metadata group's faults. |
 | §14 Implementation plan | **Replaced** by the combined plan, design-ha-modes.md §7 (its steps N0-N8 take this plan's steps 0-10). |
-| §15 NFS server outages | Shared-mode only, kept; ships first, on single servers (N1). Standby hold-back after grace (§15.2) is not needed under the metadata group. |
+| §15 NFS server outages | Shared-mode only, kept; ships first, on single servers (N1, after the N0 probe). Standby hold-back after grace (§15.2) is not needed under the metadata group. The wire bodies of §15.4 are defined in S0, before the 1.0 protocol freeze; N1 keeps only the single-server parts of §15.9 (no volumes-follower thread, no cross-node root repair). Operator commands become `tsdb cluster domain ...` and `volume ...` (design-ha-modes.md §8). |
 
 Status: design, not implemented. Scope: shared storage on NFSv4.1/4.2 over RDMA. An object-store backend (intellistream-objects) is planned for later, behind the interface in §12, and is not built now.
 
@@ -61,7 +61,7 @@ Code references are `file:line` at HEAD `d52afaa`. A `~` before a line number me
 | D6 | **Edit discipline.** Each ledger edit is validated, appended, fdatasynced, folded into the in-memory ledger state (`lstate`) and applied in memory, all under `ledger_lock`. A checkpoint is always a serialization of `lstate` taken under `ledger_lock`. | Checkpoints built from `db->parts`; merges outside the ordering | Concurrent MERGE, DROP and PURGE would otherwise drop records or contradict each other (findings 4, 9, 10). |
 | D7 | **fd lifecycle.** Commit fds belong to a *grant* object owned by the HA slot. Abandon and release poison them with `dup2`, never with `close`, until every engine thread has drained. | Closing fds in `eng_abandon` | A reused fd number would carry a stale thread's write into a live lock, possibly another volume's (findings 1, 8, 19). |
 | D8 | Promotion in version 1 is a cold open of a writer `eng` next to the existing one. | In-place role flip | It has the smallest surface for half-promoted states. Node faults are bounded below by the 10 s lease anyway. |
-| D9 | *Changed: the ids are built (design-series64.md, format 8); names are unique in the whole database (decision of 2026-11-02), through the name slots shared with the cluster (design-cluster.md C18); a series is found by name, its volume by the slot's home.* **A series is addressed by `(volume path, name)`.** Its id is `(vol, local)`: the volume's number in VOLUMES (below `0xffff`) and its index in that volume's SERIES, a `u64` on the wire (`(vol + 1) << 32 | local`, built: [design-series64.md](design-series64.md)). Names are unique per volume only. A local id is never reused, even after a storage rollback (D36). There is no global CATALOG: a node-local `volumes.cache` maps paths to volumes (§5). | Dense global CATALOG ids under a cluster-wide OFD lock; per-volume hashed ids | The path already says where the series lives, so routing and creation need no global state, no cluster-wide lock and no root I/O. A root or CATALOG outage can no longer block creation, and a CATALOG rollback can no longer give two series one id. A series cannot move without changing its address. |
+| D9 | *Changed: the ids are built (design-series64.md, format 8); names are unique in the whole database (decision of 2026-11-02), through the name slots shared with the cluster (design-cluster.md C18); a series is found by name, its volume by the slot's home; in shared mode a series is created only in its slot's home, so no volume holds names of another volume's series (design-ha-modes.md M14, §5.7).* **A series is addressed by `(volume path, name)`.** Its id is `(vol, local)`: the volume's number in VOLUMES (below `0xffff`) and its index in that volume's SERIES, a `u64` on the wire (`(vol + 1) << 32 | local`, built: [design-series64.md](design-series64.md)). Names are unique per volume only. A local id is never reused, even after a storage rollback (D36). There is no global CATALOG: a node-local `volumes.cache` maps paths to volumes (§5). | Dense global CATALOG ids under a cluster-wide OFD lock; per-volume hashed ids | The path already says where the series lives, so routing and creation need no global state, no cluster-wide lock and no root I/O. A root or CATALOG outage can no longer block creation, and a CATALOG rollback can no longer give two series one id. A series cannot move without changing its address. |
 | D10 | MANIFEST is a hint for followers only. There is **one file per epoch** (`MANIFEST.<E>`), rewritten with O_DIRECT and no `ftruncate`, and it lists live segments explicitly. | One MANIFEST rewritten in place; an fsynced checkpoint on every publish | A killed owner's in-flight O_DIRECT write can only hit a file nobody reads any more (finding 5). Listing segments explicitly fixes the follower gaps at epoch boundaries (findings 14, 16). |
 | D11 | The safety argument uses no clock. The ack gate and a resumable SUSPECT state are defense in depth. Every runtime deadline uses `CLOCK_MONOTONIC`. | A clock-based fence; wall-clock deadlines | Safety must not depend on clocks (finding 6). |
 | D12 | *Changed 2026-11-06: only the node the metadata group granted the volume polls, every 250 ms; no ranks, no polling by everyone (design-ha-modes.md §5.5). The rule against `F_GETLK` stays.* Standbys poll with a non-blocking `F_OFD_SETLK` on dedicated HA threads, ranked over candidates only, and fall back to polling by everyone when the owner's heartbeat goes stale. They never call `F_GETLK`. | `F_OFD_SETLKW`; `F_GETLK` probes | A LOCKT expires a courtesy holder. CB_NOTIFY_LOCK over RDMA is unverified. |
@@ -78,7 +78,7 @@ Code references are `file:line` at HEAD `d52afaa`. A `~` before a line number me
 | D32 | *Superseded in substance: the protocol is at 12 with a HELLO floor (AGENTS.md); these changes land as a later version, without legacy paths, by the same rule.* **No compatibility paths for protocol versions 1-4.** Version 5 is the only version. HELLO is mandatory. | Keeping versions 1-4 working (whole-frame refusal for old frames, `legacy_*` options, tarpits) | There is no release yet. Every legacy path is code and tests for clients nobody runs. |
 | D33 | **A per-volume drop watermark.** `drop_before(ts)` durably raises the volume's `dropped_before` to the partition boundary at or below ts. Insert and replay rows below it are rejected with `TSDB_ERR_DROPPED`, which is final (§9). A drop newer than `now − max(partition_ms, min_retention_ms)` needs a FORCE flag, and only `tsdb-cli volume lower-watermark` lowers the watermark. | Today's behaviour: later inserts and replays recreate dropped partitions (db.c:624-646); a watermark without a guard | A late resend, a Pulsar retry after an outage or a WAL replay would otherwise bring dropped data back. It also removes the `drop_before` caveat from resend idempotence. Without the guard, one mistaken timestamp would make a volume refuse all new data for good. |
 | D35 | *Kept, shared by both modes; the secret is written by `tsdb cluster init`, and peers are named by metadata members, not `NODES`.* **Peer links are authenticated.** Peers connect to a separate port and prove a cluster secret (HMAC challenge-response) that `ha init` writes outside the exports. Peer messages name nodes by `node_id`; addresses come only from NODES, and OWNERS speaks only for the sender's own volumes (§9.1). | The database id as the only check | Every HELLO reply returns the database id. A client posing as a peer could poison ownership caches, fence other sessions with forged attempts, and redirect forwarded inserts to an address it controls. |
-| D36 | *Changed 2026-11-06: epochs come from the metadata group, whose log is off the pool, so no gossip is needed for them; the dictionary lengths and the watermark travel in heartbeats and are committed with each ownership change (design-ha-modes.md §5.4, §6.4 G2).* **High-water marks never go backwards.** Every node keeps, per volume, the highest epoch, SERIES and STATES lengths and `(wm_gen, dropped_before)` it has seen, with the volume's uuid, persisted in `volumes.cache` and exchanged in OWNERS. A claim takes an epoch above all of them; recovery fills lost ids with LOST entries and re-applies the highest watermark. The slot still decides ownership, in both directions. | Trusting the pool alone; caches that accept only higher epochs; an incarnation field in every id | LOCK, SERIES and the ledger live on one pool and roll back together (`zpool import -F`, SLOG loss). A reused epoch would reuse block numbers and pin stale routing; a reused local id would silently send a cached id's writes into another series. LOST entries avoid widening every id and every frame. |
+| D36 | *Changed 2026-11-06 (revised after review the same day): epochs come from the metadata group, whose Raft logs live only on local disks (design-ha-modes.md M11), so no gossip is needed for them; series and state ids are handed out only below a reservation committed in the metadata group, and a watermark raise is committed there before it is applied (M12), so a claim fills LOST entries up to the reservation and re-applies the committed watermark. The dictionary lengths travel in heartbeats only to detect a rollback (DIVERGED). `volumes.cache` keeps only the highest epoch each node has seen, a belt that does not depend on Raft (M4) (§5.4, §6.4 G2).* **High-water marks never go backwards.** Every node keeps, per volume, the highest epoch, SERIES and STATES lengths and `(wm_gen, dropped_before)` it has seen, with the volume's uuid, persisted in `volumes.cache` and exchanged in OWNERS. A claim takes an epoch above all of them; recovery fills lost ids with LOST entries and re-applies the highest watermark. The slot still decides ownership, in both directions. | Trusting the pool alone; caches that accept only higher epochs; an incarnation field in every id | LOCK, SERIES and the ledger live on one pool and roll back together (`zpool import -F`, SLOG loss). A reused epoch would reuse block numbers and pin stale routing; a reused local id would silently send a cached id's writes into another series. LOST entries avoid widening every id and every frame. |
 | D37 | **Reply order and back-pressure per volume.** Replies carry the frame id and leave out of order across volumes; windows are per `(connection, volume)` and per `(peer, volume)`; streamed query replies use separate links with per-request credit (§9.1). | Replies in request order per connection; one window per peer; query chunks on the insert links | One slow owner, stuck volume or slow query reader would otherwise stall every other volume behind the same connection or link, which undoes D19 for forwarded traffic. |
 | D38 | *Replaced 2026-11-06 (design-ha-modes.md M5): the metadata group's majority decides who is cut off; an owner releases when it learns of a higher epoch (watch, MOVED, or the `CLAIM` file on its storage), never just for losing the metadata group.* **An owner cut off from its peers releases its volumes** when better-connected nodes are alive on NFS (§9.1). | Keeping them, as D14 does for client partitions | With forwarding, simple-mode clients reach a volume only through the peer network. The release is voluntary, so fencing is unchanged; a symmetric split changes nothing. |
 | D39 | *Kept, shared by both modes; TOPOLOGY comes from the metadata copy.* **Direct mode is the default for every client** (decided on 2026-10-24). A client fetches TOPOLOGY from any node of its list and sends each volume's requests straight to that volume's owner. Forwarding through any node (D29) stays as the fallback: before the first TOPOLOGY, after a MOVED until TOPOLOGY is refreshed, while the owner cannot be reached, and in **simple mode**, which a tool or ad-hoc client must choose explicitly (§9). A stream changes path only when none of its frames is unanswered, or as a resend with a new attempt. | Simple mode by default, direct mode only for the Pulsar sink and bulk loaders | Through forwarding alone, a fraction (N−1)/N of insert bytes crosses the cluster network twice (95% at 20 nodes) and pays a hop of latency and CPU on the entry node (§9.1, Cost). Direct mode costs a TOPOLOGY call and a cache per client, and one connection per owner node it writes to. Switching path with frames in flight would let a frame on one path overtake a frame on the other. |
@@ -130,6 +130,9 @@ At writer open, `statfs` on the volume picks the backend.
 
 **Chained fds.** These files are OFD-locked (uncontested) on the fd the owner writes through:
 - SERIES and STATES;
+- CLASSES and RETENTION (append-only, fail-stop files added after this plan was first written: a late class switch or
+  retention limit of a deposed owner would otherwise land after its successor loaded the file, and put rows in two
+  keys or drop acknowledged rows at the next takeover; review of 2026-11-06);
 - every WAL segment.
 
 The root's files (ID, VOLUMES, NODES) are not chained: only `tsdb-cli` appends to them, under an OFD lock on the file (§5), and no ack depends on them.
@@ -141,7 +144,8 @@ A conflicting LOCK request expires the old client's entire state (`nfsd4_lm_lock
 **One mutex per fenced description.** Every `pwrite`, `fdatasync` and `ftruncate` on a fenced description is done under the single mutex that owns that description:
 - LOCK: `ledger_lock`. The heartbeat is a `ledger_lock` client.
 - Segment: the WAL writer role.
-- SERIES and STATES: the dictionary lock.
+- SERIES and STATES: the dictionary lock (`append_lock`).
+- CLASSES: `class_lock`. RETENTION: `ret_lock`.
 
 Linux reports a writeback error once per `struct file` (`file_check_and_advance_wb_err`), so two independent syncers on one description could swallow each other's error (findings 11, 25). Each description also has a `fence_gen` counter, bumped on any error. An append counts as durable only if `fence_gen` did not change across its `pwrite` and `fdatasync`.
 
@@ -222,7 +226,8 @@ Records follow the checkpoint: `{u32 len, u32 gen, u32 epoch, u8 kind, payload, 
 | Merge (merge.c:313-334) | Output renamed directly (part.c:~406); sources retired under `db->lock` | The output stays tmp until `ledger_edit(MERGE)`. `merge_commit_locked`'s "dropped" path (merge.c:305-308) can then only meet an unrecorded tmp. |
 | `eng_drop_before` (db.c:624) | Flush, then retire; later inserts may recreate the partitions | `ledger_edit(DROP predicate)`, then raise the watermark `dropped_before` (D33, §9) and retire. The watermark is the largest DROP predicate in `lstate`, so it survives in the checkpoint. Replay applies the predicate to every part of the matching partitions, merge outputs recorded later included, and skips WAL rows below the watermark. |
 | `graveyard_purge` (manifest.c:104) | `unlinkat` once the wall-clock deadline (manifest.c:37) passes | `ledger_edit(PURGE)` with monotonic deadlines, then unlink. |
-| Series or state id (series.c:231) | `O_APPEND` write + `fdatasync` | `pwrite` at an explicit offset on the chained fd, then `fdatasync`. The id is assigned after success (series.c:235). |
+| Series or state id (series.c:231) | `O_APPEND` write + `fdatasync` | `pwrite` at an explicit offset on the chained fd, then `fdatasync`. The id is assigned after success (series.c:235), and only below the reservation committed in the metadata group (design-ha-modes.md M12). |
+| Class switch (`CLASSES`), retention limit (`RETENTION`) | Append + `fdatasync`, fail-stop | `pwrite` at an explicit offset on the chained fd under `class_lock` / `ret_lock`, then `fdatasync`; an error is FENCED (§2.6), not just `eng_fail`. |
 | MANIFEST (manifest.c:67) | Shared file: `pwrite` + `ftruncate`, no fsync | `MANIFEST.<E>`, created with `O_EXCL`. O_DIRECT `pwrite` at 0 with `{len, E, version, xxh64}`; no `ftruncate`. It lists live segments. |
 
 **Rules that follow from this.**
@@ -237,12 +242,15 @@ large insert: one COMMIT edit, nothing new to replay. Tombstones only hide rows
 of lower block numbers in their partition, so the ledger's block order is all
 they need. A retention drop of a whole partition is a DROP predicate for that
 one partition and does not raise the drop watermark (D33): a later insert into
-it is a valid write. `RETENTION` is a dictionary like `SERIES`: append-only,
-its length goes into the OWNERS high-water mark with the others.
+it is a valid write. `RETENTION` and `CLASSES` are append-only files like
+`SERIES`, chained like it (§2.2). Their records are not ids, so a rollback
+needs no LOST entries for them: recovery cuts a torn tail only (§4 step 5),
+and their lengths travel in heartbeats only to detect a rollback
+(design-ha-modes.md §5.4).
 
 ### 2.6 fd lifecycle, abandon and the abort rule
 
-**The grant.** The grant object holds the LOCK fd, the chained fds, `dirfd`, a generation `gen` and the engine's thread handles. Queries never use grant fds: they use mmaps and separate unlocked read fds. Pinned `eng`s therefore keep working after the grant is released (finding 19).
+**The grant.** The grant object holds the LOCK fd, the chained fds (SERIES, STATES, CLASSES, RETENTION and every live segment), `dirfd`, a generation `gen` and the engine's thread handles. Queries never use grant fds: they use mmaps and separate unlocked read fds. Pinned `eng`s therefore keep working after the grant is released (finding 19).
 
 **`eng_abandon(grant)`.** It runs on FENCED, on a gate timeout, and on SIGTERM after a failed drain.
 1. Set role FENCED and bump `grant->gen` (atomic).
@@ -282,7 +290,16 @@ ack iff role == OWNER(frame.epoch) && sync returned 0 && fence_gen unchanged
 
 **Refusals.**
 - A refusal after engine work replies `TSDB_ERR_IO` (indeterminate). A refusal before engine work replies UNAVAILABLE or MOVED (definitely not applied).
-- When the deadline passes the volume goes SUSPECT. A later successful probe proves the lock was never lost, because LOST is sticky, so the volume returns to OWNER. This rides out an NFS server restart or a stall shorter than the lease.
+- When the deadline passes the volume goes SUSPECT. A later successful probe proves the lock was never lost, because LOST is sticky, *provided the server never grants a reclaim to a client it already expired (U4)*. So the volume does not return to OWNER on the probe; it goes to RECHECK (below). This rides out an NFS server restart or a stall shorter than the lease.
+
+**RECHECK** (revised after review, 2026-11-06; design-ha-modes.md M16, F6). The belt for U4 is the epoch read-back, and it must run *after* anything that may have let the kernel reclaim a lock the server should have refused. Triggers:
+- leaving SUSPECT;
+- a change of the domain's RDMA transport `connect_count` in `/proc/self/mountstats`, read by the health monitor (§15.2) at every probe (a server restart forces a reconnect; design-ha-modes.md V5);
+- a fenced call that took longer than `lease/5`.
+
+In RECHECK the volume acknowledges nothing, makes no ledger edit (`ledger_edit` waits), renames and unlinks nothing, and answers no read. It leaves RECHECK only after an O_DIRECT read-back, issued after the trigger, of both slots, the active ledger region's checkpoint generation and `CLAIM`, and, where the node's metadata copy is fresh, the copy still naming (v, self, E). Any higher epoch or generation, or a `CLAIM` above E, means FENCED. The remaining window (no trigger seen: a pause with a frozen monotonic clock across a lease expiry, a takeover and a server reboot, with the reconnect between two monitor samples, *and* U4 broken) is closed by the periodic read-back within `lease/5`; design-ha-modes.md §6.4 explains why a read-back before every ack is not used.
+
+**Read barrier** (design-ha-modes.md M16). The owner answers a read only after a fenced write issued after the read arrived has succeeded: a WAL group commit or ledger append (sync returned 0, `fence_gen` unchanged), or a heartbeat slot write that the first waiting read starts when nothing is in flight. One barrier serves all reads waiting for it. The clock-based gate no longer decides reads: a frozen monotonic clock in a VM pause would let it pass, and stale reads were ruled out (D23).
 - **Stuck I/O.** If a fenced write on one volume has been outstanding for more than 3×lease while probes on other volumes (or a node probe file) succeed, the file is stuck and the server is not. The node stops feeding the watchdog (§8).
 
 ## 3. Why there is never more than one committing writer, and no acked write is lost
@@ -326,8 +343,10 @@ Unlinks of adopted names happen only after a PURGE record, which a fenced writer
 ## 4. Takeover (standby S, volume v)
 
 > Under the metadata group (2026-11-06): S starts only after a grant `(v, S, E)`, and step 4 writes the granted E
-> after checking that every epoch on storage is below it ([design-ha-modes.md](design-ha-modes.md) §5.5). The cap
-> below is applied by the metadata leader when it grants. Steps 2-8 are otherwise unchanged.
+> after checking that every epoch on storage, and in the node's own `volumes.cache`, is below it; a refusal is
+> reported as `CLAIM_REFUSED` and the next grant goes above it ([design-ha-modes.md](design-ha-modes.md) §5.4, §5.5).
+> Step 5 fills LOST entries up to the id reservations committed in the metadata group and applies its committed
+> watermark (M12). The cap below is applied by the metadata leader when it grants. Steps 2-8 are otherwise unchanged.
 
 A node runs at most 4 takeovers per NFS server group at once, each started after 0-5 s of jitter, as for recoveries (§15.5). Further volumes wait before their poll, so an NFS server restart that fences many owners does not bring tens of cold opens onto one cold server at once.
 
@@ -336,12 +355,12 @@ A node runs at most 4 takeovers per NFS server group at once, each started after
    - Verify the uuid.
    - Duplicate client id: if `nfs_client_id` equals ours under another `node_id`, refuse and alarm.
    - Handoff rule: honour a given `(epoch, handoff_to ≠ self)` at most once, for 2 s plus one poll interval measured on S's monotonic clock from first sight. Then ignore it (finding 18).
-3. **Lock the chained files.** SERIES, STATES and every live segment, polling `F_OFD_SETLK` every 20 ms for up to 30 s, because a local dying process may still be flushing. On timeout: unlock everything, back off, and log the holder from the slot.
+3. **Lock the chained files.** SERIES, STATES, CLASSES, RETENTION and every live segment, polling `F_OFD_SETLK` every 20 ms for up to 30 s, because a local dying process may still be flushing. On timeout: unlock everything, back off, and log the holder from the slot.
 4. **Root write.** Claim E (§2.4): write the inactive slot `{E, RECOVERING}` and fdatasync it, then append an `EPOCH E` record. This proves every lock from step 3. On failure, abandon.
 5. **Recover.**
-   - `fdatasync` SERIES and STATES through the new fds, so the server has stable copies.
-   - Compare the SERIES and STATES lengths and the drop watermark with the highest values any node has seen (D36). Storage behind them was rolled back: append LOST entries up to the highest lengths, apply the highest watermark, and mark the volume DIVERGED (§15.5 step 4).
-   - Truncate torn tails (series.c:147).
+   - `fdatasync` SERIES, STATES, CLASSES and RETENTION through the new fds, so the server has stable copies.
+   - Truncate torn tails (series.c:147) of all four. For CLASSES and RETENTION that is all: their records are not ids and fill no LOST entries.
+   - Append LOST entries to SERIES and STATES up to the reservations committed in the metadata group (D36, design-ha-modes.md M12), and, once `lstate` is folded (next item), apply the committed drop watermark when it is above `lstate`'s. If storage is behind the lengths last committed with an ownership change, it was rolled back: mark the volume DIVERGED (§15.5 step 4).
    - Fold the checkpoint and the records into `lstate`.
    - Roll forward renames whose tmp exists and whose final name does not.
    - Open adopted parts by name (no readdir trust). Missing as both: CORRUPT.
@@ -617,12 +636,13 @@ There is no release yet, so version 5 replaces versions 1-4 (D32). The server re
 | Process in D state | SIGKILL does not complete. Escalation reboots the node (§8), which becomes power loss. | watchdog + 10 s + reboot + 11.5 s | The lock is held throughout, so there is never a second writer. |
 | SIGSTOP of the process | The same as a hang. | ≈ 6.5 s | L1(a). |
 | VM pause (renewals stop) | Expiry; EIO on resume. The monotonic clock may be frozen, so the lock alone carries safety. | ≈ 11.5 s | L1(b), L3. The gate is only a belt. |
-| NFS server stall shorter than the lease | SUSPECT, no acks, back to OWNER after the stall. No kill, because the watchdog does not wait for NFS. | none | LOST is sticky, so a successful probe proves continuity. |
-| NFS server restart | Grace starts when nfsd starts, after the reboot. The owner reclaims within grace (nfs4proc.c:L10422) and is SUSPECT meanwhile. Standbys get NFS4ERR_GRACE and wait. An owner whose RDMA reconnect backoff outlasts grace becomes LOST, FENCED, then fails over by cold open; no acked write is lost (§15.1, D34). Takeovers are capped at 4 per server group per node (§4), and such a loss gets no back-off (§6). | 0, or grace + poll + open | U4. The epoch read-back catches a reclaim that should have been refused. |
+| NFS server stall shorter than the lease | SUSPECT, no acks, then RECHECK and back to OWNER after the read-back (§2.7). No kill, because the watchdog does not wait for NFS. | none | LOST is sticky, so a successful probe proves continuity if U4 holds; the read-back after it covers a broken U4. |
+| NFS server restart | Grace starts when nfsd starts, after the reboot. The owner reclaims within grace (nfs4proc.c:L10422) and is SUSPECT meanwhile; the transport reconnect and the end of SUSPECT both put it in RECHECK, so it acks again only after a read-back issued after the reclaim (§2.7). Standbys get NFS4ERR_GRACE and wait. An owner whose RDMA reconnect backoff outlasts grace becomes LOST, FENCED, then fails over by cold open; no acked write is lost (§15.1, D34). Takeovers are capped at 4 per server group per node (§4), and such a loss gets no back-off (§6). | 0, or grace + poll + open | U4. The read-back in RECHECK catches a reclaim that should have been refused before any ack, ledger edit or rename. |
 | NFS server crash during a slot write | The torn slot is never the newest (strict alternation). E is also recovered from the checkpoint and EPOCH records. | — | L2. |
 | Transient EIO or ENOSPC on a fenced fd | FENCED and abandon (poison, no close), then a fresh claim by any candidate. This node does not claim again until it has drained. | poll + open | §2.6. The fd number cannot be reused. |
 | EIO or ENOSPC on a tmp part (unfenced) | The flush or merge fails and the tmp is unrecorded, so it is retried. The active memtable is rotated before any direct insert (bug fix B5). | none | Unrecorded tmps are never adopted. |
 | One file stuck, server healthy | No progress for 3×lease while other probes succeed: kill, then escalation. | ≈ 30 s + kill | The lock is held until the process exits. |
+| One domain wedged on the owner, its lease alive (a stuck superblock or bdi) | Under the metadata group: M6 grants the volume away, the claimant is refused, the owner's release blocks. After `release_stuck_s` (3×lease) with another candidate reporting the domain UP, the owner stops feeding the watchdog: kill, then escalation (design-ha-modes.md §5.5, §15.2 below). | ≈ 30 s + kill | The lock is held until the process exits. |
 | One volume stuck | Its frames queue per volume. Other volumes and reads keep their workers. | — | §8 admission. |
 | Handoff target dies | The `handoff_to` hint is honoured once for 2 s, then ignored. | 2 s + poll | §4 step 2. |
 | Rank 1 and rank 2 both down | The heartbeat is stale for `lease/2`, so every candidate polls. | lease/2 + poll | §6. |
@@ -739,6 +759,9 @@ Backends: `ha_local.c` (`flock`, no fencing), `ha_nfs.c`, `ha_fake.c` (tests).
 - kill handover;
 - SIGUSR1 lease loss;
 - a late WAL append, rotation, rename, purge, `parts_discard` and MANIFEST write after takeover, each of which must change nothing;
+- a late CLASSES append (a class switch) and a late RETENTION append from the deposed owner after the successor loaded them: both fail (EIO through the chained fd), and the next open passes `cls_check_parts`;
+- SUSPECT, then a successful probe while the slot already shows a higher epoch: RECHECK, then FENCED, with no ack, ledger edit or rename in between;
+- a read on the owner after a SIGSTOP/SIGCONT with a frozen fake clock: answered only after the read barrier, or refused once FENCED;
 - node pause, then SIGCONT: no ack;
 - SIGSTOP with renewals still running: the watchdog kills;
 - standby race: exactly one EPOCH;
@@ -761,7 +784,10 @@ Every case also runs with `FENCE=none`, to show which belt holds on its own.
 - 8: every node converges, and the restart comparison stays;
 - 9: client-measured failover (fault to first client-visible ack) under 3L;
 - 10: clients in simple mode through random entry nodes, with an `entry-kill` nemesis (kill -9 and pause of entry nodes only, also while a failover runs) and a `peer-partition` nemesis (links between nodes cut, NFS fine): checks 1-9 hold, and no write lands after a newer write of the same session;
-- 11: a rollback of one volume's SERIES and LOCK, then a cold open on another node: no local id gets a second name, no epoch is reused, and caches follow the new owner.
+- 11: a rollback of one volume's SERIES and LOCK, then a cold open on another node: no local id gets a second name, no epoch is reused, and caches follow the new owner; also with the owner and the Raft leader killed at the moment of the rollback, and with creations of names whose slot moved away from the rolled-back volume (design-ha-modes.md M12, M14);
+- 12: `u4-broken`: the arbiter of `CRASHFS_LEASE` grants an expired client's reclaim after a simulated server restart (a fake nfsd that violates U4): no acknowledged write is lost, no adopted part is renamed away (design-ha-modes.md F6);
+- 13: `wedged-domain`: one volume's files hang on the owner while its lease is renewed: the volume moves within `release_stuck_s` plus the kill;
+- 14: metadata faults: a Raft leader killed during grants, a claimant partitioned from the metadata group (it stops polling), a metadata group restored from an old snapshot (`CLAIM_REFUSED` lifts the grants).
 
 **Manual: `tests/ha/nfs-check.sh` and `tests/ha/lockprobe.c`** on two hosts over RDMA.
 - Partition with `ip link set <rdma netdev> down`, because netfilter does not see RoCE. On one host, use two network namespaces with NFS over TCP.
@@ -958,6 +984,12 @@ Section 15 can ship **before** the rest of HA, on today's engine (O0-O9).
   - the volume is not FULL.
 
   A stall of a server, a pool or a dataset never escalates.
+
+  Under the metadata group (design-ha-modes.md §5.5, M6; review of 2026-11-06): when the domain is wedged on this node
+  only (its own probe hangs too, while its NFS lease to the server is renewed), the first two conditions cannot be met
+  from this node's view. So an **UP report for the same domain from another candidate, through the metadata group**,
+  counts as both, but only for a volume whose grant has gone to another node and whose release has not finished
+  within `release_stuck_s` (3×lease). A domain every node reports DOWN still never escalates.
 - **§8 watchdog.**
   - A thread registered as "in I/O on domain d" is exempt from the progress condition while d is not UP or its volume is STUCK. These are parked workers, read-pool threads, the opener, probe, recovery and HA threads.
   - The per-volume "HA thread issued a probe" condition is waived for volumes whose domain is not UP. Issuing is otherwise impossible: the previous synchronous probe is still stuck.
@@ -1074,6 +1106,10 @@ The row numbers refer to the stall map (rows 1-16).
 
 ### 15.4 Client-facing behaviour (protocol v5, extending §9)
 
+> "Protocol v5" is this document's old numbering; the protocol is at 12 (AGENTS.md). These bodies (UNAVAILABLE with
+> reasons and `retry_after`, PARTIAL, DROPPED) and TOPOLOGY with per-volume role and health are defined once, in step
+> S0 of [design-ha-modes.md](design-ha-modes.md) §7, in the four clients, before the 1.0 protocol freeze. N1 uses them.
+
 **`TSDB_ERR_UNAVAILABLE = -11`** is sent only before engine work, by the owner or by an entry node (§9.1).
 - Body: `u16 n, n × {u16 vol, u8 reason, u8 flags, u32 epoch, i64 since_ms, u32 retry_after_ms, u64 outage_id}`, then `[u64 resend_from]` when the frame carried a seq.
 - `retry_after_ms = clamp(outage_age/10, 1 s, 60 s)` with ±20% jitter. For BUSY it comes from the drain rate; for MAINTENANCE it is the operator's `--until`.
@@ -1169,7 +1205,10 @@ tsdb does not accept writes it cannot make durable on the volume's own storage. 
 
 **Logs.** Every transition is logged. Refusals are logged once per volume per minute.
 
-**Commands.**
+**Commands.** On a single server these are `tsdb-cli` commands, as below. In a shared-mode deployment they are
+`tsdb cluster domain maint|probe|abandon` and `tsdb cluster volume maint|abandon|relocate|ack-divergence|lower-watermark`,
+and MAINTENANCE is a domain state in the metadata group, so M6 never moves a volume during planned maintenance
+([design-ha-modes.md](design-ha-modes.md) §8, which also has the runbooks).
 - `tsdb-cli ha status`, grouped by server and domain.
 - `domain maint <d> on|off [--until]` drains: stop writes, flush, stop merges, `fdatasync`, then MAINTENANCE.
 - `volume maint`, `domain probe`, `volume abandon` and `domain abandon`.
@@ -1224,6 +1263,12 @@ tsdb does not accept writes it cannot make durable on the volume's own storage. 
 Each run records: time to UNAVAILABLE, healthy-volume bench numbers, `df`/`sync` hangs, bdi dirty bytes, wchan of every tsdbd thread (looking for `nfs_commit_inode` in reclaim), time to recovery, reclaim, and parked threads.
 
 ### 15.9 Implementation plan
+
+> Under the combined plan ([design-ha-modes.md](design-ha-modes.md) §7, revised 2026-11-06): O0 is part of N0, which
+> gates the rest. N1 takes O1-O3, O5-O7 and O9 in their **single-server** form: O4 keeps only a local high-water cache
+> (no volumes-follower thread, no `VOLUMES_GEN` push; routing comes from the metadata group later), O6 is the only
+> admission step (S2 builds none), O7 has no cross-node root repair. O8's bodies and TOPOLOGY move to S0. O10 goes to
+> N6 and N7.
 
 Each step lands with `make test` and `make asan`. Steps that touch the disk path also need `make jepsen`.
 - **O0.** Measure on AlmaLinux 10 over RDMA: the timeouts, the dirty coupling and bdi sums, reclaim stalls under memory pressure, an mmap GETATTR, nfsd grace and reconnect (and whether a reconnect can be forced, U41), ZFS EIO over NFS, and the `nfs_commit_bytes` cost (U30-U39).

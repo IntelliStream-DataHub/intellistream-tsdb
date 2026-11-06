@@ -83,7 +83,7 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 
 | # | Assumption | What changes if it does not hold |
 |---|---|---|
-| A1 | **Shared-nothing.** Each server has its own disks; the cluster does not use the NFS/ZFS servers. | With shared storage, ha.md (one copy, failover by lock) is cheaper. Since 2026-11-06 both are kept as the two HA modes, per volume, on one metadata group (D3, [design-ha-modes.md](design-ha-modes.md)). |
+| A1 | **Shared-nothing.** Each server has its own disks; the cluster does not use the NFS/ZFS servers. | With shared storage, ha.md (one copy, failover by lock) is cheaper. Since 2026-11-06 both are kept as the two HA modes, one per deployment, on the same metadata group design (D3, [design-ha-modes.md](design-ha-modes.md)). |
 | A2 | **Writes go on with two servers down, and no acknowledged write is lost** when up to two servers and their disks are lost. Hence: replication factor 3, acknowledge only after every in-sync replica has the write durable, and an in-sync set that shrinks on failure (Kafka's ISR). | A minimum in-sync size of 2 (a per-volume option, D1) or a replication factor of 4 trades availability or disk for safety against a third loss. |
 | A3 | **Design now, build after the 0.9.0 tag**; the 1.0 format and protocol leave room (§11), so the cluster arrives in a 1.x without a break. | If the cluster must be in 1.0, the build plan (§14) moves before the freeze. |
 | A4 | The servers are in one data center, 25 GbE or faster between them, round trip below 100 µs, NVMe with `fdatasync` around 0.7 ms (the README's drive). | Across sites, every small insert pays a WAN round trip. |
@@ -178,7 +178,9 @@ The core (intellistream-objects `src/raft`, read at c9c938e9) is a fit:
 
 - **Sans-IO.** `raft_step`, `raft_tick`, `raft_propose` go in; `raft_next_action` hands out what to do, in a safe
   order: save the hard state, sync the log, send, apply, restore a snapshot. tsdbd's peer event loop drives it; the
-  log syncs run on a worker, as isod does (`raft_log_sync_prepare` / `raft_log_sync_run`).
+  log syncs run on a worker, as isod does (`raft_log_sync_prepare` / `raft_log_sync_run`), so heartbeats and the
+  watch never wait for a disk; a leader whose own sync is outstanding for 2 s hands leadership on. In shared mode
+  (design-ha-modes.md M11) the log is on a local disk only, never NFS, and a log fault ends only the voter role.
 - **The log store** (`raft_log.c`): 64 MiB segments in `<data>/meta/raft/`, checksummed records, a two-slot hard
   state, and the durable floor that tells a torn tail from rot in an acknowledged record. That matches tsdb's own rule
   "damage is never silent" (AGENTS.md).
@@ -252,6 +254,10 @@ is cut.
   - **Slot moves**: when volumes are added, the Raft leader moves some slots to them so new series spread there too.
     During a move, creations in that slot pause for one metadata commit; existing series stay where they are, and the
     new home asks the old one for names it does not know.
+- **Shared mode differs** (design-ha-modes.md M14, §5.7): its volumes sit on NFS pools that can roll back and be away
+  for hours, so it keeps no slot index of other volumes' series. A series is created only in its slot's current home,
+  a slot's earlier homes are a chain in the metadata, and a lookup asks them in turn. Everything below holds for
+  replicated mode.
 - A creation in V and its slot record are two commits in two volumes. The home leader records the name first (a
   reservation with `id = 0`), creates in V, then records the id; a crash in between leaves a reservation that the next
   creation of that name resolves by asking V. The name never exists in two volumes.
@@ -813,20 +819,27 @@ About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, whic
 **With two HA modes (2026-11-06, D3).** The plan above is replicated mode's. The combined plan of both modes, with
 estimates, is [design-ha-modes.md](design-ha-modes.md) §7; how this plan's steps map into it:
 
-- **Shared by both modes** (built once): step 0 (S0), step 1 (S1, extended with shared volumes: a volume kind, a
-  storage record, candidates as the ISR, high-water marks, domain health in heartbeats), the part of step 4 that is
-  peer links, TOPOLOGY, forwarding and admission (S2), step 5 (S4, name slots and users), step 6 (S3, clients and the
-  Pulsar sink), step 8 (X1, the cold boundary) and step 9 (X3).
-- **Replicated mode only**: step 2 (R1), step 3 (R2), the rest of step 4 (R3: replication, ISR, promotion, leases),
-  step 7 (R4, rebuild).
-- **Order: shared mode ships first**, because production runs on NFS today: its single-server outage handling (ha.md
-  §15) now, then the shared-mode engine and HA manager on the metadata group; replicated mode's R2-R4 after it. R1
-  (step 2) continues in parallel: it is sans-IO and blocks nothing.
-- **What steps 1 and 2 already give shared mode.** Step 1 (`cluster-s1`, 35e1456: the Raft core, `server/meta.c` with
-  members, volumes, leader, epoch, ISR, epoch history, name slots and users, epoch-conditional operations, snapshots,
-  the step checker and the simulator) serves shared mode as it is: an owner change is `META_OP_VOLUME_LEADER`, with
-  the candidates as the ISR. Step 2 (`cluster-s2`, in progress: the replication core) gives shared mode nothing it
-  needs, only the method of a sans-IO core under a simulator, which the shared-mode HA manager copies.
+- **A deployment runs one mode** (`tsdb cluster init --mode`, design-ha-modes.md M7); there is no mixed step.
+- **Shared by both modes** (built once): step 0 (S0, which also defines every wire body the HA work needs before the
+  1.0 freeze, and the namespace-event payloads shared by the ledger and this design's markers, design-ha-modes.md
+  §2.1), step 1 (S1, extended with shared volumes, §7.1 there), the part of step 4 that is peer links, TOPOLOGY and
+  forwarding (S2; per-volume admission is built once, in ha.md's N1), step 5 (S4, name slots and users), step 6 (S3,
+  clients and the Pulsar sink), step 8 (X1, the cold boundary) and step 9 (X3).
+- **Replicated mode only**: step 2 (R1), step 3 (R2: the engine's replica mode, and the marker backend of the journal
+  hook that N4 builds), the rest of step 4 (R3: replication, ISR, promotion, leases), step 7 (R4, rebuild).
+- **Order: shared mode ships first**, because production runs on NFS today: the N0 probe on the production NFS
+  servers, then the shared-mode engine and HA manager on the metadata group; replicated mode's R2-R4 after it. R1
+  (step 2) continues in parallel: it is sans-IO and blocks nothing. The estimates there are in track-days, gate hours
+  and external dependencies, calibrated on the first checkpoints of steps 1 and 2.
+- **What steps 1 and 2 already give shared mode.** Step 1 (`cluster-s1`, 35e1456 and ede84e5: the Raft core,
+  `server/meta.c` with members, volumes, leader, epoch, ISR, epoch history, name slots and users, epoch-conditional
+  operations, snapshots, the step checker, the simulator, tsdbd's peer thread and the CLI) serves shared mode as it is:
+  an owner change is `META_OP_VOLUME_LEADER`, with the candidates as the ISR. It must change before its formats settle
+  (design-ha-modes.md §7.1): an extensible heartbeat body, heartbeats on a thread with no Raft log I/O and syncs on a
+  worker (as §2.3 above already says), step-down on a stalled sync, the state directory on a local disk, a voter-role
+  fault instead of `_exit` in a shared-mode deployment, and the shared-volume operations. Step 2 (`cluster-s2`,
+  44b352b: the replication core) gives shared mode nothing it needs, only the method of a sans-IO core under a
+  simulator, which the shared-mode HA manager copies.
 
 ## Later
 
@@ -845,8 +858,9 @@ estimates, is [design-ha-modes.md](design-ha-modes.md) §7; how this plan's step
 ## Open questions
 
 None for this mode. The six questions of the first draft were answered on 2026-11-06 and are decisions D1-D6 at the
-top of this document. The questions about the two modes together (a witness voter, where voters keep their log on
-nodes without data disks, mixing modes, the order) are in [design-ha-modes.md](design-ha-modes.md).
+top of this document. The questions about the two modes together (voters and witnesses on nodes without data disks,
+the order, the N0 window, placement of names in shared mode, the read barrier, escalation of a stuck release) are in
+[design-ha-modes.md](design-ha-modes.md).
 
 ## Unverified assumptions
 
