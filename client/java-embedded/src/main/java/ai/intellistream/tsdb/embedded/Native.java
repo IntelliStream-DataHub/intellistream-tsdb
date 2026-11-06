@@ -349,7 +349,10 @@ final class Native {
         return SymbolLookup.libraryLookup(name, global);
     }
 
-    /** {@code linux-x86_64}, {@code linux-aarch64}, {@code macos-aarch64}, ...: the directory of the bundled library. */
+    /**
+     * {@code linux-x86_64}, {@code linux-aarch64}, {@code macos-aarch64}, ...: the directory of the bundled
+     * library.
+     */
     static String platform() {
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);

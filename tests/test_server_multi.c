@@ -799,7 +799,8 @@ static void test_stall_buckets(pid_t pid)
         fprintf(stderr, "stalled reader, a full frame of buckets (%s, io %s): server anonymous memory grew %ld KiB, "
                         "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS",
                 getenv("TSDBD_IO") ? getenv("TSDBD_IO") : "default", grown, peak, result_kb);
-#ifdef __APPLE__ /* the footprint keeps freed pages and compresses others: the slack still catches a second copy (256 MiB) */
+#ifdef __APPLE__
+        /* the footprint keeps freed pages and compresses others: the slack still catches a second copy (256 MiB) */
         CHECK(SANITIZED || grown <= result_kb + 192 * 1024L);
 #else
         CHECK(SANITIZED || grown <= result_kb + 48 * 1024L);

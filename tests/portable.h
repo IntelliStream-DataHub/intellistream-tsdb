@@ -18,7 +18,8 @@
 
 #include "../src/compat.h"
 
-/* A shell command prefix that limits a command to s seconds (GNU timeout is not on macOS; perl's alarm survives exec) */
+/* A shell command prefix that limits a command to s seconds (GNU timeout is not on macOS; perl's alarm survives
+   exec) */
 #ifdef __APPLE__
 #define TIMEOUT_KILL_CMD(s) "perl -e 'alarm " #s "; exec @ARGV' --"
 #define TIMEOUT_TERM_CMD(s) "perl -e 'alarm " #s "; exec @ARGV' --"

@@ -40,7 +40,7 @@ read and write everything, so keep it on 127.0.0.1).
 |---|---|---|
 | `tsdbd` event loop | io_uring or epoll | epoll emulated over kqueue (`server/epoll_compat.h`); only `--io epoll` |
 | `tsdbd` wake-ups, timer | eventfd, timerfd | a pipe, a kqueue timer |
-| aggregation kernels | AVX-512 / AVX2 / SSE, chosen at startup | Apple silicon: the scalar ones; Intel Macs: as Linux (not yet tried) |
+| aggregation kernels | AVX-512 / AVX2 / SSE, chosen at startup | Apple silicon: scalar; Intel Macs: as Linux (untried) |
 | `make dist` CPU levels | yes | no (one build for the machine) |
 | bytes on disk | | the same: a database moves between the two |
 | durability | `fsync`, `fdatasync` | the same, then `fcntl(F_FULLFSYNC)` (see below) |
