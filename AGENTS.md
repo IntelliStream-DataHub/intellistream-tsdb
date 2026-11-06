@@ -344,7 +344,9 @@ cgroup, so `nice` does not keep your work out of its way.
   old engine (`eng_halt`: joins the flusher and merges, no flush), checks what is on disk against what it remembers
   (`tsdb_volume_report`: WAL tail by checksum through a fresh `O_DIRECT` read, then a re-log of the memtable into a new
   segment when it does not match; SERIES and STATES repaired from memory; parts gone and not merged into others are
-  `lost_parts`, which leaves the volume quiesced, DIVERGED, until `tsdb_volume_resume`), opens a new engine on a dup of
+  `lost_parts`, as is a RETENTION or CLASSES shorter than the engine's, `lost_log_bytes`; a merge the storage took back
+  counts as lost too; the volume is left quiesced, DIVERGED, until `tsdb_volume_resume`, and tsdbd keeps it so until a
+  restart), opens a new engine on a dup of
   the old lock fd (the flock is never released) and swaps it under the wrlock; the old engine is retired, never
   freed with its name strings (`kept_names`). Never retry the failed fsync of the old fds: only a reopen that replays
   from disk is trusted. The re-log writes rows up to `wal_durable` in sync mode (rows past it were never acknowledged)

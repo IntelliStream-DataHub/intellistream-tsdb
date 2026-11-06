@@ -13,7 +13,10 @@ disk format and the wire protocol.
 - **Storage outages on NFS: the single-server parts of docs/ha.md section 15** (step N1). `tsdbd --health-domain PREFIX`
   (once per NFS server or filesystem) probes each domain with `O_DIRECT` reads and writes and tracks UP, DEGRADED,
   DOWN and RECOVERING (`tsdb_health_*` in `tsdb.h`). Requests for a volume of a DOWN domain answer
-  `TSDB_ERR_UNAVAILABLE` (new, -11) at once, at most 4 inside the volume, and the other volumes go on. A write or sync
+  `TSDB_ERR_UNAVAILABLE` (new, -11) at once, at most 4 inside the volume (the cap applies only while the domain is not
+  UP), and the other volumes go on. A volume whose reopen finds acknowledged parts, RETENTION or CLASSES records gone
+  stays refused (DIVERGED) until tsdbd is restarted, also through a later outage. A tsdbd restarted during an outage
+  serves nothing until the heal, and SIGTERM during a hang waits for the heal. A write or sync
   error on such a volume no longer ends tsdbd: the volume is stopped, reopened in place from what is on disk (the WAL
   is replayed, a retried fsync is never trusted), checked against what the engine remembers (WAL tail, SERIES, STATES,
   parts) and resumed; a volume that lost acknowledged parts stays stopped and says which. The root, USERS and volumes

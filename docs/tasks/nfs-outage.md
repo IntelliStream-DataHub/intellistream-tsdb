@@ -24,7 +24,10 @@ One run takes 1 hour; the long variant 3 hours. Do (a) first, it needs no change
 
 Not in N1 (do not look for it): the mountinfo discovery of domains, parking of requests with a deadline and BUSY, a
 bounded per-volume queue, SIGTERM while a call is stuck, the DIVERGED operator command, the high-water cache, the
-metrics. A SIGTERM to a tsdbd with a stuck call can hang: stop it with SIGKILL and note how long it took.
+metrics. A SIGTERM to a tsdbd with a stuck call can hang: stop it with SIGKILL and note how long it took. A tsdbd that
+is *started* while a domain is down (a restart during the outage, a systemd restart after the stop timeout) serves no
+volume until the heal: tsdb_open waits on the hung directory. Run (d) once with a restart in the middle and note the
+time to the first answer after the heal. A DIVERGED volume is accepted by restarting tsdbd; it does not resume by itself.
 
 ## Set up
 
