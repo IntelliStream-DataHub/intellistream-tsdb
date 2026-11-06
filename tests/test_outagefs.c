@@ -10,7 +10,10 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -190,6 +193,56 @@ static void run(void)
     close(fd);
 }
 
+/* A hang nobody ends does not outlive its harness: a process that holds a call in a hang gets EIO soon after the
+ * process that started it is killed. (A server whose test died sat in the shim for an hour, deaf to SIGTERM.) */
+static void orphan(void)
+{
+    char p[300];
+    snprintf(p, sizeof p, "%s/orphan", dir_a);
+    put(p, "x");
+    CHECK(cmd("hang", dir_a, NULL) == 0);
+    int pfd[2];
+    CHECK(pipe(pfd) == 0);
+    pid_t h = fork(); /* the harness */
+    if (h == 0) {
+        pid_t w = fork(); /* the server: its own copy of the shim state says "hung" */
+        if (w == 0) {
+            pid_t me = getpid();
+            if (write(pfd[1], &me, sizeof me) != (ssize_t)sizeof me)
+                _exit(2);
+            errno = 0;
+            int fd = open(p, O_RDONLY);
+            int e = errno;
+            if (write(pfd[1], &fd, sizeof fd) != (ssize_t)sizeof fd || write(pfd[1], &e, sizeof e) != (ssize_t)sizeof e)
+                _exit(2);
+            _exit(0);
+        }
+        pause();
+        _exit(0);
+    }
+    CHECK(h > 0);
+    pid_t w = 0;
+    CHECK(read(pfd[0], &w, sizeof w) == (ssize_t)sizeof w);
+    sleep_ms(300); /* it is inside the call */
+    kill(h, SIGKILL);
+    waitpid(h, NULL, 0);
+    double t0 = now_ms();
+    int fd = 0, e = 0;
+    struct pollfd pf = {.fd = pfd[0], .events = POLLIN};
+    bool got = poll(&pf, 1, 5000) == 1;
+    CHECK(got);
+    if (got) {
+        CHECK(read(pfd[0], &fd, sizeof fd) == (ssize_t)sizeof fd && read(pfd[0], &e, sizeof e) == (ssize_t)sizeof e);
+        CHECK(fd == -1 && e == EIO);
+        CHECK(now_ms() - t0 < 3000);
+    } else if (w > 1) {
+        kill(w, SIGKILL);
+    }
+    close(pfd[0]);
+    close(pfd[1]);
+    CHECK(cmd("heal", dir_a, NULL) == 0);
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -199,6 +252,7 @@ int main(int argc, char **argv)
     snprintf(dir_a, sizeof dir_a, "%s", outagefs_dir("a"));
     snprintf(dir_b, sizeof dir_b, "%s", outagefs_dir("b"));
     run();
+    orphan();
     if (failures)
         fprintf(stderr, "test_outagefs: %d failures\n", failures);
     else

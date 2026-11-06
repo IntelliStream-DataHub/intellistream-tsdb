@@ -1029,9 +1029,14 @@ static void outage_tick(uint64_t r)
         long long ok0 = atomic_load(&vol_ok[h]);
         usleep(3000000);
         double dt = (double)(now_ns() - t0) / 1e9;
-        healthy_ops += (double)(atomic_load(&vol_ok[h]) - ok0);
-        healthy_secs += dt;
-        healthy_base_ops += base * dt;
+        /* an outage that began shortly before the run's end lasts past it: the clients are gone by then (stop is set
+         * and stays set), and the volume that "wrote nothing" was measured with nobody writing. Only a window in
+         * which they ran all through counts (seed 2 of the gate failed at 67% for exactly this). */
+        if (!atomic_load(&stop)) {
+            healthy_ops += (double)(atomic_load(&vol_ok[h]) - ok0);
+            healthy_secs += dt;
+            healthy_base_ops += base * dt;
+        }
     } else if (kind == 2) {
         outage_ctl("hang", v, NULL);
         usleep(1200000);

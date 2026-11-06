@@ -26,6 +26,11 @@
  * ("hang /mnt/a\n") and reads lines back, the last "ok\n" or "err why\n", once the fault is in force. "state"
  * answers with one line per prefix first. `outagefs_cmd` in tests/outagefs_ctl.h sends one.
  *
+ * A hang that nobody ends does not outlive its harness: a held call returns EIO once the parent process of the
+ * process that loaded the shim is gone (getppid() changed), once the control socket's file is gone, or after
+ * $OUTAGEFS_HOLD_MAX_S seconds (default 900). Without that a server whose test was killed sits in the shim
+ * forever, deaf to --exit-with-parent and SIGTERM (its event loop is inside the held call).
+ *
  * Not covered: page faults on mapped files (ha.md §15.8's userfaultfd handler); a mapping of a hung prefix is not
  * stopped, and an mmap call is not gated. Rollback is the way to get a SIGBUS.
  */
@@ -43,6 +48,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -67,6 +73,10 @@ static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static signed char fdroot[MAX_FDS]; /* 0: not ours, else index + 1 */
 static bool fdpoison[MAX_FDS];      /* eiodrop: this descriptor's failure was reported */
 static __thread bool bypass;        /* the control thread's own file work */
+static pid_t parent0;               /* getppid() when the shim loaded: the harness */
+static char ctl_path[PATH_MAX];     /* the control socket's file, "" without one */
+static int hold_max_ms = 900 * 1000;
+static volatile bool abandoned;     /* the harness is gone: a hang is over, as an error */
 
 /* The real functions, found on first use: a call can come before the constructor (the dynamic loader's own). */
 #define REAL(ret, name, args) static ret(*real_##name) args
@@ -171,12 +181,28 @@ static int gate(int r, bool grows)
         return 0;
     int i = r - 1, rc = 0, slow;
     pthread_mutex_lock(&mu);
-    while (roots[i].fault == F_HANG) {
+    int waited_ms = 0;
+    while (roots[i].fault == F_HANG && !abandoned) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100 * 1000 * 1000;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
         roots[i].hung++;
-        pthread_cond_wait(&cv, &mu);
+        int w = pthread_cond_timedwait(&cv, &mu, &ts);
         roots[i].hung--;
+        if (w == ETIMEDOUT) {
+            waited_ms += 100;
+            struct stat st;
+            if ((parent0 > 1 && getppid() != parent0) || waited_ms >= hold_max_ms ||
+                (ctl_path[0] && real_stat(ctl_path, &st) != 0 && errno == ENOENT))
+                abandoned = true;
+        }
     }
     switch (roots[i].fault) {
+    case F_HANG: rc = -EIO; break; /* abandoned */
     case F_EIO: rc = -EIO; break;
     case F_ESTALE: rc = -ESTALE; break;
     case F_ETIMEDOUT: rc = -ETIMEDOUT; break;
@@ -755,12 +781,19 @@ static void *control_main(void *arg)
     return NULL;
 }
 
+static void new_parent(void) { parent0 = getppid(); }
+
 __attribute__((constructor)) static void init(void)
 {
     resolve();
+    parent0 = getppid();
+    pthread_atfork(NULL, NULL, new_parent); /* a forked child's harness is the process that forked it */
     const char *rs = getenv("OUTAGEFS_ROOTS"), *ctl = getenv("OUTAGEFS_CTL");
     if (!rs || !ctl)
         return;
+    if (getenv("OUTAGEFS_HOLD_MAX_S"))
+        hold_max_ms = atoi(getenv("OUTAGEFS_HOLD_MAX_S")) * 1000;
+    snprintf(ctl_path, sizeof ctl_path, "%s", ctl);
     char *copy = strdup(rs);
     for (char *p = strtok(copy, ":"); p && nroots < MAX_ROOTS; p = strtok(NULL, ":")) {
         if (!realpath(p, roots[nroots].path))
