@@ -778,6 +778,11 @@ static int cmd_seeds(const char *dir)
     SEED("series-path", TSDB_OP_SERIES, (p8(&p, 1), pstr16(&p, "vol"), pstr16(&p, "vol1")));
     SEED("hello-10", TSDB_OP_HELLO, p32(&p, 10)); /* refused: the connection reads nothing more */
     SEED("series-name", TSDB_OP_SERIES_NAME, psid(&p, 2));
+    SEED("topology", TSDB_OP_TOPOLOGY, (void)0);
+    SEED("topology-since", TSDB_OP_TOPOLOGY, p64(&p, 1)); /* since_gen */
+    SEED("topology-bad-len", TSDB_OP_TOPOLOGY, p32(&p, 1)); /* neither empty nor a u64: INVALID */
+    SEED("status", TSDB_OP_STATUS, (void)0);
+    SEED("status-junk", TSDB_OP_STATUS, p32(&p, 7));
     SEED("series-name-id64", TSDB_OP_SERIES_NAME, psid(&p, 0x100000002ull)); /* unknown, not series 2 */
     SEED("insert", TSDB_OP_INSERT, ({
              p32(&p, 3);
