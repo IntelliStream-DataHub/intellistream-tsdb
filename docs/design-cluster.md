@@ -2,7 +2,9 @@
 
 Status: design, not implemented. Branch `cluster-design`, written on 2026-11-05 from main at 9b00186. Code references
 are `file:line` at that commit. Builds after the 0.9.0 tag; what must be in 1.0 so that the cluster is an addition and
-not a break is §11. Revised on 2026-11-06 with the user's answers to its open questions (D1-D6 below).
+not a break is §11. Revised on 2026-11-06 with the user's answers to its open questions (D1-D6 below), and again on
+2026-11-06 when the user kept the NFS failover as a second HA mode (D3 replaced; [design-ha-modes.md](design-ha-modes.md)).
+This design is the *replicated mode* of tsdb's two HA modes; ha.md is the *shared mode*.
 
 Decided by the user on 2026-11-05 and not reopened here:
 1. A cluster (for example 8 servers) stays up, and keeps almost all of its performance, when one or two servers go
@@ -18,9 +20,14 @@ Decided by the user on 2026-11-06 (the open questions of the first draft):
   copying its `src/raft` (core, log, wire, simulator) into tsdb under Apache 2.0, with Apache headers and a sync
   script (C3, §2.3). intellistream-objects should get a LICENSE (or a grant file naming Apache 2.0) as well, and
   tsdb's [licenses.md](licenses.md) lists the copied files when they land (build plan step 1).
-- **D3. The cluster replaces ha.md for new work.** ha.md's client rules, streams, forwarding and drop watermark are
-  part of this design now; its NFS lock, ledger and SUSPECT state are dropped. NFS followers stay for single-server
-  use. ha.md carries a note at its top saying so.
+- **D3. Replaced on 2026-11-06.** It read: "The cluster replaces ha.md for new work; its NFS lock, ledger and SUSPECT
+  state are dropped." The user then decided: "I have been thinking, I still want to keep the NFS implementation."
+  So ha.md's NFS failover stays **as a second HA mode** (shared mode) beside this one (replicated mode), for
+  production's nodes without local data disks on NFS/ZFS. [design-ha-modes.md](design-ha-modes.md) is the overview:
+  both modes run on this design's metadata group (§2), which in shared mode names each volume's owner and epoch; the
+  NFS lock, the chained fds, the ledger and the ack gate stay there as the fence on the storage; the client rules,
+  streams, forwarding, drop watermark, users and name slots are shared. Everything else here (D1, D2, D4-D6, C1-C25)
+  stands for replicated mode.
 - **D4. Name slots**: names stay unique in the whole cluster, which keeps the decision of 2026-11-02 (C18, §3.3).
 - **D5. Reads from leaders by default**; `REPLICA_OK` per query or per client (C15, §7). The user did not answer this
   one: the recommendation is the default, and the user may change it.
@@ -33,8 +40,10 @@ fencing, reads, rebuild, the two-servers-down case, room in the 1.0 format and p
 **Not here**: erasure coding, shard placement, ISA-L, degraded reads. §9 says only what the hot tier hands to a
 cold tier and what it needs from one.
 
-Related designs: [ha.md](ha.md) (failover over shared NFS storage, superseded by this design for new work (D3); its client rules, streams, forwarding and drop
-watermark carry over, its NFS lock arbiter does not), [design-series64.md](design-series64.md) (ids
+Related designs: [design-ha-modes.md](design-ha-modes.md) (the two HA modes, what they share, one control plane, the
+combined build plan), [ha.md](ha.md) (shared mode: failover over shared NFS storage, the other HA mode (D3); its
+client rules, streams, forwarding and drop watermark are shared with this design, its NFS lock and ledger are shared
+mode's fence, its lock arbitration is replaced by this design's metadata group), [design-series64.md](design-series64.md) (ids
 `(volume + 1) << 32 | local`; names unique in the whole database), design-cdc.md on branch `cdc-design` (WAL record
 version 2 with a per-volume number for every row: the cluster uses the same number), [design-auth.md](design-auth.md)
 (users and grants; in a cluster they move into the metadata group).
@@ -74,7 +83,7 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 
 | # | Assumption | What changes if it does not hold |
 |---|---|---|
-| A1 | **Shared-nothing.** Each server has its own disks; the cluster does not use the NFS/ZFS servers. | With shared storage, ha.md (one copy, failover by lock) is cheaper; this design and ha.md are alternatives for the same need; the user chose this one for new work (D3). |
+| A1 | **Shared-nothing.** Each server has its own disks; the cluster does not use the NFS/ZFS servers. | With shared storage, ha.md (one copy, failover by lock) is cheaper. Since 2026-11-06 both are kept as the two HA modes, per volume, on one metadata group (D3, [design-ha-modes.md](design-ha-modes.md)). |
 | A2 | **Writes go on with two servers down, and no acknowledged write is lost** when up to two servers and their disks are lost. Hence: replication factor 3, acknowledge only after every in-sync replica has the write durable, and an in-sync set that shrinks on failure (Kafka's ISR). | A minimum in-sync size of 2 (a per-volume option, D1) or a replication factor of 4 trades availability or disk for safety against a third loss. |
 | A3 | **Design now, build after the 0.9.0 tag**; the 1.0 format and protocol leave room (§11), so the cluster arrives in a 1.x without a break. | If the cluster must be in 1.0, the build plan (§14) moves before the freeze. |
 | A4 | The servers are in one data center, 25 GbE or faster between them, round trip below 100 µs, NVMe with `fdatasync` around 0.7 ms (the README's drive). | Across sites, every small insert pays a WAN round trip. |
@@ -801,6 +810,24 @@ Each step is a track (build, adversarial review, fixes) with the gates of AGENTS
 
 About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, which brings it to about 5 months.
 
+**With two HA modes (2026-11-06, D3).** The plan above is replicated mode's. The combined plan of both modes, with
+estimates, is [design-ha-modes.md](design-ha-modes.md) §7; how this plan's steps map into it:
+
+- **Shared by both modes** (built once): step 0 (S0), step 1 (S1, extended with shared volumes: a volume kind, a
+  storage record, candidates as the ISR, high-water marks, domain health in heartbeats), the part of step 4 that is
+  peer links, TOPOLOGY, forwarding and admission (S2), step 5 (S4, name slots and users), step 6 (S3, clients and the
+  Pulsar sink), step 8 (X1, the cold boundary) and step 9 (X3).
+- **Replicated mode only**: step 2 (R1), step 3 (R2), the rest of step 4 (R3: replication, ISR, promotion, leases),
+  step 7 (R4, rebuild).
+- **Order: shared mode ships first**, because production runs on NFS today: its single-server outage handling (ha.md
+  §15) now, then the shared-mode engine and HA manager on the metadata group; replicated mode's R2-R4 after it. R1
+  (step 2) continues in parallel: it is sans-IO and blocks nothing.
+- **What steps 1 and 2 already give shared mode.** Step 1 (`cluster-s1`, 35e1456: the Raft core, `server/meta.c` with
+  members, volumes, leader, epoch, ISR, epoch history, name slots and users, epoch-conditional operations, snapshots,
+  the step checker and the simulator) serves shared mode as it is: an owner change is `META_OP_VOLUME_LEADER`, with
+  the candidates as the ISR. Step 2 (`cluster-s2`, in progress: the replication core) gives shared mode nothing it
+  needs, only the method of a sans-IO core under a simulator, which the shared-mode HA manager copies.
+
 ## Later
 
 - **The cold tier itself.** intellistream-objects (`isod`, at c9c938e9) is the user's distributed, erasure-coded
@@ -817,8 +844,9 @@ About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, whic
 
 ## Open questions
 
-None. The six questions of the first draft were answered on 2026-11-06 and are decisions D1-D6 at the top of this
-document.
+None for this mode. The six questions of the first draft were answered on 2026-11-06 and are decisions D1-D6 at the
+top of this document. The questions about the two modes together (a witness voter, where voters keep their log on
+nodes without data disks, mixing modes, the order) are in [design-ha-modes.md](design-ha-modes.md).
 
 ## Unverified assumptions
 
