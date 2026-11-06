@@ -763,4 +763,11 @@ test: check-site
 check-site:
 	python3 tests/check_site.py
 
-.PHONY: test-quickstart check-site
+# The release workflow's scripts (.github/workflows/release.yml): the release text (tools/release-notes.sh), and the
+# GitHub API calls of .github/scripts/release-publish.sh against a local mock of the API (needs curl and jq).
+test: test-release
+test-release:
+	tests/test_release_notes.sh
+	python3 -I tests/test_release_publish.py
+
+.PHONY: test-quickstart check-site test-release
