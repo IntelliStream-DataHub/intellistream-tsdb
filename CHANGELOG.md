@@ -10,6 +10,20 @@ disk format and the wire protocol.
 
 ### Added
 
+- **Storage outages on NFS: the single-server parts of docs/ha.md section 15** (step N1). `tsdbd --health-domain PREFIX`
+  (once per NFS server or filesystem) probes each domain with `O_DIRECT` reads and writes and tracks UP, DEGRADED,
+  DOWN and RECOVERING (`tsdb_health_*` in `tsdb.h`). Requests for a volume of a DOWN domain answer
+  `TSDB_ERR_UNAVAILABLE` (new, -11) at once, at most 4 inside the volume, and the other volumes go on. A write or sync
+  error on such a volume no longer ends tsdbd: the volume is stopped, reopened in place from what is on disk (the WAL
+  is replayed, a retried fsync is never trusted), checked against what the engine remembers (WAL tail, SERIES, STATES,
+  parts) and resumed; a volume that lost acknowledged parts stays stopped and says which. The root, USERS and volumes
+  outside a domain still exit with status 1. New API: `tsdb_volume_quiesce`, `_idle`, `_reopen`, `_resume`,
+  `tsdb_set_abandon_flag` and `TSDB_ERR_ABANDONED` (-14). An error while reading a directory now fails the open
+  instead of ending the scan. New tests: `outagefs` (a fault shim: hang, EIO, ESTALE, ENOSPC, slow, rollback per path
+  prefix), `test_health`, `test_abandon`, `test_recover`, `test_outage`, and an `outage` nemesis in `make jepsen`;
+  [docs/tasks/nfs-outage.md](docs/tasks/nfs-outage.md) has the runs for a real NFS server (with
+  `build/outage-load`). Not yet: mountinfo discovery of domains, parked requests with a deadline, a bounded queue per
+  volume, SIGTERM while a call is stuck, metrics, a local high-water cache.
 - **macOS (Apple silicon and Intel) as a developer platform** ([docs/macos.md](docs/macos.md)), not for
   production. `make` (zstd from Homebrew), `make test IO=epoll` and `make test-clients` work there; `tsdbd` runs its
   epoll loop over kqueue (no io_uring), and the embedded Rust, Python and Java builds carry `libtsdb.dylib`. Every

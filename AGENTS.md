@@ -209,7 +209,10 @@ cgroup, so `nice` does not keep your work out of its way.
   became visible, MANIFEST, SERIES, STATES) calls `eng_fail`: after it
   the engine acknowledges nothing, names no new file (a merge in flight drops
   its output), and `tsdb_failed` reports it;
-  tsdbd exits with status 1. A retried fsync can return 0 after the kernel
+  tsdbd exits with status 1, except for a volume under a `--health-domain` (ha.md 15; the root, USERS and every
+  volume outside a domain still end the process): that volume is quiesced, answers `TSDB_ERR_UNAVAILABLE`, and
+  `dom_recover` reopens it in the process once its domain is not DOWN (the section on **Storage outages** below).
+  A retried fsync can return 0 after the kernel
   dropped the dirty pages, so it proves nothing; only a reopen, which replays
   from what is on disk, is safe. Every directory fsync goes through
   `eng_sync_dir`: they share one fd, which reports a writeback error once, so
@@ -332,6 +335,27 @@ cgroup, so `nice` does not keep your work out of its way.
   other append-only files (checksummed records, OFD write lock, torn tail cut, damage fails the open), and a failed
   write or fdatasync of it is fail-stop (tsdbd exits with status 1 before acknowledging): an acknowledged revoke
   must not come back after a power loss. `--no-auth` checks nothing and refuses the user admin ops.
+- **Storage outages** (ha.md 15, N1; `src/health.c`, `server/domains.h`, `src/revalidate.c`). A volume on NFS that is
+  down must refuse fast while the other volumes go on, and come back without losing or resurrecting anything.
+  `tsdb_health_*` (probe threads with `O_DIRECT`, no engine call) gives each domain UP, DEGRADED, DOWN, RECOVERING.
+  Every `route()`-family lookup in `volumes.c` takes a reference on the engine (`refs`, the `EREF` cleanup attribute)
+  and refuses a quiesced volume with `TSDB_ERR_UNAVAILABLE`; `tsdb_volume_quiesce`, `_idle` (waits for refs to reach
+  0, with no deadline when asked: a call stuck in NFS cannot be interrupted), `_reopen`, `_resume`. A reopen halts the
+  old engine (`eng_halt`: joins the flusher and merges, no flush), checks what is on disk against what it remembers
+  (`tsdb_volume_report`: WAL tail by checksum through a fresh `O_DIRECT` read, then a re-log of the memtable into a new
+  segment when it does not match; SERIES and STATES repaired from memory; parts gone and not merged into others are
+  `lost_parts`, which leaves the volume quiesced, DIVERGED, until `tsdb_volume_resume`), opens a new engine on a dup of
+  the old lock fd (the flock is never released) and swaps it under the wrlock; the old engine is retired, never
+  freed with its name strings (`kept_names`). Never retry the failed fsync of the old fds: only a reopen that replays
+  from disk is trusted. The re-log writes rows up to `wal_durable` in sync mode (rows past it were never acknowledged)
+  and every memtable row with `wal_sync_ms > 0` (acknowledged by contract). A request parked on a stuck volume is
+  abandoned through `tsdb_set_abandon_flag` (a thread-local pointer set by the request's thread): `mem_insert` checks it
+  before the WAL append (after the fence wait), `parts_publish` and `delete.c` check it under `publish_lock` before
+  `parts_commit` (never inside `parts_commit`: a flush carries other writers' acknowledged rows); a helper thread that
+  one day publishes must be given the flag explicitly. `tests/jepsen/outagefs.c` (`liboutagefs.so`, stacks with
+  crashfs) is the fault shim; `test_outage` and jepsen's `outage` nemesis use it. mmap page faults are not gated by
+  the shim. Not built yet: mountinfo discovery, parking and BUSY, a per-volume bounded queue, SIGTERM with a stuck call,
+  metrics, the volumes cache, parallel open.
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has

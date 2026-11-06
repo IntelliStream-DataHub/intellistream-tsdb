@@ -1308,6 +1308,34 @@ Each step lands with `make test` and `make asan`. Steps that touch the disk path
 - **O9.** jepsen `outage` nemesis; manual runs (a)-(g).
 - **O10.** HA: watchdog exemptions, the §2.7 same-filesystem rule, `--nfs-grace-s` and the standby hold-back with its early end, the takeover cap per server group, no back-off for losses from a server restart, removal of `reboot-force`, the escalation helper reading `/run/tsdbd/health`. This goes into §14 steps 5 and 8.
 
+#### 15.9.1 What N1 built (2026-11-06) and where it differs
+
+Built: O1 (the shim is `tests/jepsen/outagefs.c`, an LD_PRELOAD library with its own control socket, not a crashfs
+extension; no userfaultfd, so mmap faults are not gated and a rolled-back part gives SIGBUS), O2 without mountinfo
+discovery (`--health-domain PREFIX`, `TSDBD_TEST_HEALTH` scales the thresholds for tests), O3 (abandon flag, WAL
+taint as before), O6 as far as a cap of 4 requests per domain volume with UNAVAILABLE above it, O7 (references,
+quiesce, revalidation, re-log, in-place reopen, DIVERGED as "quiesced after reopen"), O9 (the `outage` nemesis, kv
+workload, no rollback kind).
+
+Where it differs from the text above:
+- **References live in the engine** (`refs`, `quiesced`), not in a per-volume slot; `t->vols[v]` stays a bare `eng *`.
+  Recovery swaps the pointer under the wrlock after `tsdb_volume_idle`.
+- **Recovery is a cold reopen first, a re-log only when the disk disagrees.** The reopen replays the WAL from disk. When
+  the WAL tail does not match what the engine wrote (xxh64 of the last record, read with `O_DIRECT`), the memtable rows
+  are written into a new segment before the reopen. In async WAL mode (`wal_sync_ms > 0`) every memtable row is
+  relogged, because those rows were acknowledged before the sync; §15.5 step 4's "rows past `wal_durable` were never
+  acknowledged" holds only in sync mode.
+- **The abandon check runs before the WAL append** in `mem_insert` (after the fence wait), and under `publish_lock`
+  before `parts_commit` in `parts_publish` and `delete.c`, not inside `parts_commit`.
+- **Revalidation compares files and sizes, not payloads.** A server rollback that keeps sizes is found only by the
+  header and index checksums at reopen; damaged granule payloads only with `verify_checksums`.
+- `readdir()` errors fail the open (`load_parts`, `wal_open`, `intents_recover`); before, they ended the scan.
+
+Not built (left for the next steps): mountinfo discovery and the mount identity check (D26), parking with tombstones
+and BUSY, per-volume FIFO queues bounded in bytes, name-addressed requests under admission, SIGTERM while a call is
+stuck, parallel open and no implicit creation, metrics, the DIVERGED operator command and `volume abandon`, the local
+high-water cache, the rollback nemesis.
+
 ### 15.10 Open questions
 
 1. Hard mounts with tsdb's own detection, as proposed? Is any node mounted `soft`?
