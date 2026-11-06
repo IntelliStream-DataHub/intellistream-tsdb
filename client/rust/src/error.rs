@@ -27,6 +27,17 @@ pub enum Status {
     Stopped,
     /// `TSDB_ERR_READONLY` (-9): the server serves a read-only database.
     ReadOnly,
+    /// `TSDB_ERR_MOVED` (-10): another node owns the volume; definitely not applied. The body is in
+    /// [`Client::last_error`](crate::Client::last_error); the client follows it by itself unless retries are off.
+    Moved,
+    /// `TSDB_ERR_UNAVAILABLE` (-11): the volume's storage is unavailable; definitely not applied. The client
+    /// retries it after the server's `retry_after` within its time budget; this is what is left when the budget
+    /// ran out. The body is in [`Client::last_error`](crate::Client::last_error).
+    Unavailable,
+    /// `TSDB_ERR_PARTIAL` (-12): a frame spanning volumes was applied for some of them only.
+    Partial,
+    /// `TSDB_ERR_DROPPED` (-13): below the volume's drop watermark; never applied, never to be sent again.
+    Dropped,
     /// `TSDB_ERR_DENIED` (-16): the user holds no right for this, or the series does not exist (tsdbd answers
     /// both alike, so no user learns what other tenants hold).
     Denied,
@@ -50,6 +61,10 @@ impl Status {
             -7 => Status::TooManyBuckets,
             -8 => Status::Stopped,
             -9 => Status::ReadOnly,
+            -10 => Status::Moved,
+            -11 => Status::Unavailable,
+            -12 => Status::Partial,
+            -13 => Status::Dropped,
             -16 => Status::Denied,
             -17 => Status::Auth,
             c => Status::Unknown(c),
@@ -68,6 +83,10 @@ impl Status {
             Status::TooManyBuckets => -7,
             Status::Stopped => -8,
             Status::ReadOnly => -9,
+            Status::Moved => -10,
+            Status::Unavailable => -11,
+            Status::Partial => -12,
+            Status::Dropped => -13,
             Status::Denied => -16,
             Status::Auth => -17,
             Status::Unknown(c) => c,
@@ -99,6 +118,10 @@ pub fn strerror(code: i32) -> &'static str {
         -7 => "too many buckets",
         -8 => "stopped",
         -9 => "database is read only",
+        -10 => "the volume is owned by another node",
+        -11 => "the volume is unavailable (storage down or recovering); not applied",
+        -12 => "applied for some volumes only",
+        -13 => "below the volume's drop watermark; never applied",
         -16 => "permission denied",
         -17 => "login failed or required",
         _ => "unknown error",

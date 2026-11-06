@@ -79,6 +79,7 @@ mod database;
 #[cfg(feature = "embedded")]
 mod embedded;
 mod error;
+mod ha;
 mod keepalive;
 mod pack;
 mod protocol;
@@ -96,6 +97,9 @@ pub use database::Database;
 #[cfg(feature = "embedded")]
 pub use embedded::{ChunkRef, Db, Options, PartInfo, RawValues, ValueCodec};
 pub use error::{Error, Result, Status, strerror};
+pub use ha::{
+    DEFAULT_RETRY_BUDGET, ErrorInfo, MOVED_HANDOFF, Moved, PartialVol, TopoNode, TopoVol, Topology, Unavailable, VOL_ANY,
+};
 pub use keepalive::KeepAlive;
 pub use protocol::{DEFAULT_PORT, PROTOCOL_VERSION};
 pub use types::{

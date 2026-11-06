@@ -12,16 +12,18 @@
 //! is on (level 1 by default); otherwise as plain arrays. float32
 //! inserts too: the packed form is the smaller one.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::ops::{Bound, ControlFlow, RangeBounds};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::SeriesId;
 use crate::auth::{self, PASSWORD_MAX, Rights, Scram, Selector, User};
 use crate::calendar;
 use crate::error::{Error, Result, Status};
+use crate::ha::{self, DEFAULT_RETRY_BUDGET, ErrorInfo, MOVED_HANDOFF, Topology};
 use crate::keepalive::{self, KeepAlive};
 use crate::pack;
 use crate::protocol::extend_i64s;
@@ -102,6 +104,8 @@ pub struct Client {
     pending: usize,
     /// The first error status among the acknowledgements read so far.
     pending_status: i32,
+    /// The body of the refusal `refused` names.
+    refused_err: ErrorInfo,
     broken: bool,
     /// zstd level of packed inserts; 0 sends plain arrays.
     level: i32,
@@ -112,7 +116,36 @@ pub struct Client {
     scram: bool,
     packer: Option<Packer>,
     bytes_sent: u64,
+    /// Protocol 13: the time budget of one request's retries (UNAVAILABLE, MOVED); `None`: no retry.
+    retry: Option<Duration>,
+    /// The frames of the requests whose reply has not been read (whole, header included), oldest first: UNAVAILABLE
+    /// and MOVED mean "not applied", and the request goes again from here.
+    kept: VecDeque<Kept>,
+    kept_bytes: usize,
+    /// The op of the request sent last (where an error reply's body starts).
+    last_op: u8,
+    /// The body of the latest UNAVAILABLE, MOVED, PARTIAL or DROPPED reply.
+    err: ErrorInfo,
+    /// The first refused insert among the acknowledgements read since the last drain.
+    refused: Option<u32>,
+    /// The id of the request a frame of whose reply has been handed to its reader: it cannot be sent again.
+    delivered: Option<u32>,
+    /// The connect string's nodes, shuffled once, for the reconnect after MOVED; `node_at` is the one in use.
+    nodes: Vec<String>,
+    node_at: usize,
+    /// The login, for the reconnects.
+    opts: ConnectOptions,
 }
+
+/// A request kept for a resend.
+struct Kept {
+    id: u32,
+    frame: Vec<u8>,
+}
+
+/// Requests in flight (with their frames kept) before the next insert collects acknowledgements, and their bytes.
+const KEEP_FRAMES: usize = 1024;
+const KEEP_BYTES: usize = 128 << 20;
 
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -330,6 +363,7 @@ impl Client {
         let mut c = Client::new(connect_each(addr, t)?)?;
         c.set_timeout(Some(t))?;
         c.handshake(&ConnectOptions::default())?;
+        c.opts.timeout = Some(t);
         Ok(c)
     }
 
@@ -362,6 +396,7 @@ impl Client {
         c.set_timeout(Some(t))?;
         c.handshake(opts)?;
         c.set_timeout(opts.timeout)?;
+        c.opts = opts.clone();
         Ok(c)
     }
 
@@ -396,6 +431,7 @@ impl Client {
         opts.check()?;
         let mut c = Client::new(stream)?;
         c.handshake(opts)?;
+        c.opts = opts.clone();
         Ok(c)
     }
 
@@ -418,6 +454,7 @@ impl Client {
             reply_id: 0,
             pending: 0,
             pending_status: 0,
+            refused_err: ErrorInfo::default(),
             broken: false,
             level: DEFAULT_COMPRESSION,
             server_version: None,
@@ -425,6 +462,16 @@ impl Client {
             scram: false,
             packer: None,
             bytes_sent: 0,
+            retry: Some(DEFAULT_RETRY_BUDGET),
+            kept: VecDeque::new(),
+            kept_bytes: 0,
+            last_op: 0,
+            err: ErrorInfo::default(),
+            refused: None,
+            delivered: None,
+            nodes: Vec::new(),
+            node_at: 0,
+            opts: ConnectOptions::default(),
         })
     }
 
@@ -1061,20 +1108,54 @@ impl Client {
         Ok(())
     }
 
+    /// Reads one pipelined acknowledgement. A refused one (UNAVAILABLE, MOVED) that can go again is remembered
+    /// (`drain` sends it and everything after it again, in order); any other error status is kept for `wait`.
     fn collect_ack(&mut self) -> Result<()> {
-        let st = self.read_frame()?;
+        let id = self.reply_id;
+        let st = self.read_frame_raw()?;
         self.reply_id = self.reply_id.wrapping_add(1);
         self.pending -= 1;
-        if st != 0 && self.pending_status == 0 {
+        if retryable(st) && self.retry.is_some() && self.kept.iter().any(|k| k.id == id) {
+            if self.refused.is_none() {
+                self.refused = Some(id);
+                self.refused_err = self.err.clone();
+            }
+        } else if st != 0 && self.pending_status == 0 {
             self.pending_status = st;
         }
         Ok(())
     }
 
-    fn wait_inner(&mut self) -> Result<()> {
-        while self.pending > 0 {
-            self.collect_ack()?;
+    /// Reads every pending acknowledgement; frames the server refused before doing anything are sent again, in
+    /// order from the first refused one (also those acknowledged after it: a later frame of the same series must
+    /// not be overtaken by the earlier one's resend), after what the refusal says, within the time budget.
+    fn drain(&mut self) -> Result<()> {
+        let (mut deadline, mut tries) = (None, 0u32);
+        loop {
+            while self.pending > 0 {
+                self.collect_ack()?;
+            }
+            let Some(first) = self.refused.take() else { break };
+            let e = std::mem::take(&mut self.refused_err);
+            if !self.retry_step(&e, &mut deadline, &mut tries) {
+                if self.pending_status == 0 {
+                    self.pending_status = e.status;
+                }
+                break;
+            }
+            self.reply_id = first;
+            let from = self.kept.iter().position(|k| k.id == first).unwrap_or(0);
+            for i in from..self.kept.len() {
+                self.write_kept(i)?;
+                self.pending += 1;
+            }
         }
+        self.trim();
+        Ok(())
+    }
+
+    fn wait_inner(&mut self) -> Result<()> {
+        self.drain()?;
         status_result(std::mem::take(&mut self.pending_status))
     }
 
@@ -2290,14 +2371,26 @@ impl Client {
         self.send()?;
         let st = self.read_frame()?;
         self.reply_id = self.reply_id.wrapping_add(1);
+        self.trim();
         status_result(st)
     }
 
     fn send(&mut self) -> Result<()> {
-        let frame = self.req.finish();
-        if frame.len() - 4 > MAX_FRAME {
-            return Err(Error::InvalidArgument(format!("request of {} bytes is too large", frame.len())));
+        if self.req.len() - 4 > MAX_FRAME {
+            return Err(Error::InvalidArgument(format!("request of {} bytes is too large", self.req.len())));
         }
+        self.last_op = self.req.op();
+        if self.retry.is_some() && retained_op(self.last_op) {
+            // the window: past it the acknowledgements are collected (and refused frames sent again) first
+            if self.pending > 0 && (self.kept.len() >= KEEP_FRAMES || self.kept_bytes >= KEEP_BYTES) {
+                self.drain()?;
+            }
+            self.trim();
+            let frame = self.req.finish();
+            self.kept_bytes += frame.len();
+            self.kept.push_back(Kept { id: self.next_id, frame: frame.to_vec() });
+        }
+        let frame = self.req.finish();
         let mut s: &TcpStream = self.stream.get_ref();
         s.write_all(frame)?;
         self.bytes_sent += frame.len() as u64;
@@ -2305,9 +2398,248 @@ impl Client {
         Ok(())
     }
 
-    /// Reads the next reply frame, which must answer request `reply_id`, into
-    /// `body`, and returns its status.
+    /// Drops the kept frames of requests whose reply has been read.
+    fn trim(&mut self) {
+        while let Some(k) = self.kept.front() {
+            // a refused insert stays, with everything after it, until `drain` has sent it again
+            if (k.id.wrapping_sub(self.reply_id) as i32) >= 0 || self.refused == Some(k.id) {
+                break;
+            }
+            self.kept_bytes -= k.frame.len();
+            self.kept.pop_front();
+        }
+        if self.kept.is_empty() {
+            self.kept_bytes = 0;
+        }
+    }
+
+    /// Sends the kept frame number `i` again (same id).
+    fn write_kept(&mut self, i: usize) -> Result<()> {
+        let mut s: &TcpStream = self.stream.get_ref();
+        let frame = &self.kept[i].frame;
+        s.write_all(frame)?;
+        self.bytes_sent += frame.len() as u64;
+        Ok(())
+    }
+
+    // ------------------------------------------------- HA: retry, other nodes
+
+    /// How long [`Client::set_retry`] allows one request's retries; the default is [`DEFAULT_RETRY_BUDGET`] (30 s).
+    pub fn retry(&self) -> Option<Duration> {
+        self.retry
+    }
+
+    /// Sets the time budget of one request's retries. The server answers UNAVAILABLE when a volume's storage is
+    /// down and MOVED when another node owns it: both mean the request was not applied, so the client waits what the
+    /// reply asks for (`retry_after`), follows a MOVED to the node it names (or the next node of the connect
+    /// string) and sends the request again, until the budget is spent; then the call fails with
+    /// [`Status::Unavailable`] or [`Status::Moved`] and [`last_error`](Client::last_error) says why. `None` turns
+    /// retries off: the first refusal is the answer.
+    pub fn set_retry(&mut self, budget: Option<Duration>) {
+        self.retry = budget;
+        if budget.is_none() {
+            self.kept.clear();
+            self.kept_bytes = 0;
+        }
+    }
+
+    /// The body of the latest UNAVAILABLE, MOVED, PARTIAL or DROPPED reply (status 0 before any).
+    pub fn last_error(&self) -> &ErrorInfo {
+        &self.err
+    }
+
+    /// The nodes and volumes the server lists (TOPOLOGY, protocol 13). A single server lists itself.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] from a server older than 13; otherwise as every call.
+    pub fn topology(&mut self) -> Result<Topology> {
+        self.run(|c| {
+            c.request(Op::Topology, |_| {})?;
+            ha::decode_topology(&c.body)
+        })
+    }
+
+    /// The server's status as `key=value` lines (STATUS, a superuser, protocol 13).
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Denied`] for a user who is no superuser; [`Status::Invalid`] from a server older than 13.
+    pub fn server_status(&mut self) -> Result<String> {
+        self.run(|c| {
+            c.request(Op::Status, |_| {})?;
+            Ok(String::from_utf8_lossy(&c.body).into_owned())
+        })
+    }
+
+    /// Connects to the first of the nodes `"host:port,host:port,..."` that answers (IPv6 as `[::1]:7070`, a node
+    /// without a port is on 7070). The list is shuffled once, so a fleet of clients spreads over the nodes. A MOVED
+    /// without an address, or one whose address cannot be reached, goes on to the next node of the list.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for an empty list or a node that makes no sense; the last connect error when no
+    /// node answers; [`Error::Auth`] as [`connect_opts`](Client::connect_opts).
+    pub fn connect_nodes(nodes: &str, opts: &ConnectOptions) -> Result<Client> {
+        let mut list = Vec::new();
+        for n in nodes.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            list.push(
+                ha::parse_node(n).ok_or_else(|| Error::InvalidArgument(format!("{n:?} is not a host:port")))?,
+            );
+        }
+        if list.is_empty() {
+            return Err(Error::InvalidArgument("no nodes".into()));
+        }
+        // Fisher-Yates with the hasher's per-process random keys
+        let mut x = {
+            use std::hash::{BuildHasher, Hasher};
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_usize(list.len());
+            h.finish() | 1
+        };
+        for i in (1..list.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            list.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        let mut last = Error::InvalidArgument("no nodes".into());
+        for (i, a) in list.iter().enumerate() {
+            match Client::connect_opts(a.as_str(), opts) {
+                Ok(mut c) => {
+                    c.nodes = list;
+                    c.node_at = i;
+                    return Ok(c);
+                }
+                Err(e @ Error::Auth(_)) => return Err(e),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// Moves the connection to `addr` (the requests kept stay kept: the caller sends them again). On failure the
+    /// old connection is as it was.
+    fn reconnect_to(&mut self, addr: &str) -> Result<()> {
+        let connect_t = self.opts.timeout.unwrap_or(CONNECT_TIMEOUT);
+        let stream = connect_each(addr, connect_t)?;
+        stream.set_nodelay(true)?;
+        let _ = keepalive::apply(&stream, Some(KeepAlive::default()));
+        let old_timeout = self.timeout();
+        let old = std::mem::replace(&mut self.stream, BufReader::with_capacity(READ_BUF, stream));
+        // the handshake's own ids: the server only echoes them; its calls trim the kept frames: hide them meanwhile
+        let (saved_reply, saved_pending, saved_next) = (self.reply_id, self.pending, self.next_id);
+        let kept = std::mem::take(&mut self.kept);
+        let kept_bytes = std::mem::take(&mut self.kept_bytes);
+        let (saved_err, saved_last) = (self.err.clone(), self.last_op);
+        self.reply_id = self.next_id;
+        self.pending = 0;
+        let opts = self.opts.clone();
+        let r = self.set_timeout(Some(connect_t)).and_then(|()| {
+            self.hello()?;
+            self.login(&opts)
+        });
+        self.kept = kept;
+        self.kept_bytes = kept_bytes;
+        self.reply_id = saved_reply;
+        self.next_id = saved_next;
+        self.pending = saved_pending;
+        self.err = saved_err;
+        self.last_op = saved_last;
+        match r {
+            Ok(()) => {
+                let _ = self.set_timeout(old_timeout);
+                Ok(())
+            }
+            Err(e) => {
+                self.stream = old;
+                Err(e)
+            }
+        }
+    }
+
+    /// After MOVED: to the address it names, else to another node of the connect string. True when connected
+    /// somewhere new; false when there is nowhere to go (the status stands).
+    fn follow_moved(&mut self, e: &ErrorInfo) -> bool {
+        for m in &e.moved {
+            if let Some(a) = (!m.addr.is_empty()).then(|| ha::parse_node(&m.addr)).flatten()
+                && self.reconnect_to(&a).is_ok()
+            {
+                return true;
+            }
+        }
+        for k in 1..self.nodes.len() {
+            let i = (self.node_at + k) % self.nodes.len();
+            let a = self.nodes[i].clone();
+            if self.reconnect_to(&a).is_ok() {
+                self.node_at = i;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// One step of retrying a request whose reply was UNAVAILABLE or MOVED (`e` describes it): waits what the reply
+    /// asks for and follows a MOVED. True: send the request again; false: give up, the status stands (the budget
+    /// would be over, or a MOVED with nowhere to go). `deadline` is None until the request's first refusal.
+    fn retry_step(&mut self, e: &ErrorInfo, deadline: &mut Option<Instant>, tries: &mut u32) -> bool {
+        let Some(budget) = self.retry else { return false };
+        let now = Instant::now();
+        let dl = *deadline.get_or_insert(now + budget);
+        let mut delay = match e.status {
+            -10 => {
+                if e.moved.first().is_some_and(|m| m.flags & MOVED_HANDOFF != 0) {
+                    200
+                } else {
+                    0
+                }
+            }
+            _ if !e.has_body || e.unavailable.is_empty() => 1000, // a server without the body (protocol 12)
+            _ => u64::from(e.retry_after_ms().clamp(1, 60_000)),
+        };
+        if e.status == -10 && *tries > 0 {
+            // a MOVED that keeps coming: not a tight loop
+            delay = delay.max((50 * u64::from(*tries)).min(1000));
+        }
+        if now + Duration::from_millis(delay) > dl {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(delay));
+        *tries += 1;
+        !(e.status == -10 && !self.follow_moved(e))
+    }
+
+    /// `read_frame_raw`, and a request the server refused before doing anything (UNAVAILABLE, MOVED) is sent
+    /// again, after what the reply says, while it is the only one in flight and no frame of its reply has been
+    /// handed to a reader (a request, or a streamed reply that has not begun). Past the time budget
+    /// ([`set_retry`](Client::set_retry)) the status is returned and [`last_error`](Client::last_error) says why.
     fn read_frame(&mut self) -> Result<i32> {
+        let (mut deadline, mut tries) = (None, 0u32);
+        loop {
+            let id = self.reply_id;
+            let st = self.read_frame_raw()?;
+            let alone = self.kept.iter().all(|k| k.id == id || (k.id.wrapping_sub(id) as i32) < 0);
+            if !retryable(st) || self.retry.is_none() || !alone || self.delivered == Some(id) {
+                self.delivered = Some(id);
+                return Ok(st);
+            }
+            let Some(at) = self.kept.iter().position(|k| k.id == id) else {
+                self.delivered = Some(id);
+                return Ok(st);
+            };
+            let e = self.err.clone();
+            if !self.retry_step(&e, &mut deadline, &mut tries) {
+                self.delivered = Some(id);
+                return Ok(st);
+            }
+            self.write_kept(at)?;
+        }
+    }
+
+    /// Reads the next reply frame, which must answer request `reply_id`, into
+    /// `body`, and returns its status. The body of an UNAVAILABLE, MOVED, PARTIAL or DROPPED reply goes to
+    /// `err`, and is cut from `body` (a streamed op's reader sees the empty chunk it expects).
+    fn read_frame_raw(&mut self) -> Result<i32> {
         let mut h = [0u8; REPLY_HEADER];
         self.stream.read_exact(&mut h)?;
         let word = |i: usize| u32::from_le_bytes(h[i..i + 4].try_into().expect("4 bytes"));
@@ -2322,7 +2654,16 @@ impl Client {
         self.body.clear();
         self.body.resize(len - 9, 0);
         self.stream.read_exact(&mut self.body)?;
-        Ok(word(9) as i32)
+        let st = word(9) as i32;
+        if (-13..=-10).contains(&st) {
+            let op = self.kept.iter().find(|k| k.id == id).map_or(self.last_op, |k| k.frame[8]);
+            self.err = ha::error_info(st, &self.body, op);
+            let shape = ha::error_shape(op);
+            if op != Op::QueryMulti as u8 && shape > 0 && self.body.len() >= shape {
+                self.body.truncate(shape);
+            }
+        }
+        Ok(st)
     }
 }
 
@@ -2516,4 +2857,15 @@ mod tests {
         assert_eq!(QueryOpts::desc().limit(3).wire_limit(), Some(3));
         assert_eq!(QueryOpts::asc().limit(0).wire_limit(), None);
     }
+}
+
+/// Statuses that mean "not applied, ask again" (and, for MOVED, elsewhere).
+fn retryable(st: i32) -> bool {
+    st == Status::Unavailable.code() || st == Status::Moved.code()
+}
+
+/// Requests that are sent again after a refusal: not the handshake, the login, QUERY_MULTI (its replies are
+/// delivered as they come) or CANCEL.
+fn retained_op(op: u8) -> bool {
+    ![Op::Hello, Op::AuthStart, Op::AuthContinue, Op::QueryMulti, Op::Cancel].iter().any(|o| *o as u8 == op)
 }

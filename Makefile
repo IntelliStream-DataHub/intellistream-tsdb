@@ -19,9 +19,12 @@ ifeq ($(shell uname -m),arm64)
 ARCH    ?= -mcpu=native
 endif
 CRASHFS_SO :=
+OUTAGE_SERVER :=
 else
 SOEXT   := so
 CRASHFS_SO = $(B)/libcrashfs.so $(B)/liboutagefs.so
+# tests/outage_server.c: tsdbd on a storage domain that can be taken away, for the Rust, Python and Java client tests
+OUTAGE_SERVER = $(B)/outage_server $(B)/liboutagefs.so
 endif
 # -march=native gives the codecs BMI/LZCNT; the aggregation kernels pick
 # AVX-512/AVX2/scalar at runtime either way. `make PORTABLE=1` for a generic build.
@@ -462,7 +465,7 @@ dist-check-sandybridge: dist
 # cargo, Python or JDK. Each runs its tests against build/tsdbd.
 PYVENV ?= build/pyvenv
 
-test-rust: $(B)/tsdbd $(B)/tsdb
+test-rust: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	cd client/rust && cargo test --features embedded
 	cd client/rust && cargo build --all-targets  # the TCP-only crate (no features) must still build
 	cd client/rust-sys && cargo test
@@ -470,7 +473,7 @@ test-rust: $(B)/tsdbd $(B)/tsdb
 # numpy is an optional extra of the package, but the tests use it (numpy results, batch calls); a venv made before
 # it was needed gets it too. The test build has the test hooks (feature test-hooks: a fixed client nonce, the
 # PBKDF2 count), which wheels never have.
-test-python: $(B)/tsdbd $(B)/tsdb
+test-python: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	$(PYVENV)/bin/python -c 'import numpy' 2>/dev/null || $(PYVENV)/bin/pip install -q numpy
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
@@ -495,7 +498,7 @@ test-python-sdist: python-sdist
 	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_client-*.tar.gz
 	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_client-*.whl
 
-test-java: $(B)/tsdbd $(B)/tsdb
+test-java: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	cd client/java && mvn -q test
 
 # The embedded Java binding (Java 22+, FFM) needs the TCP client's jar for the shared types. It is installed into a
@@ -747,6 +750,9 @@ $(B)/test_outage: tests/test_outage.c tests/harness.h tests/outagefs_ctl.h $(CLI
 
 $(B)/test_unavailable: tests/test_unavailable.c tests/harness.h tests/outagefs_ctl.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+
+$(B)/outage_server: tests/outage_server.c tests/harness.h tests/outagefs_ctl.h $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
