@@ -143,8 +143,19 @@ Run them in order, in the same shell, from the checkout. Each writes a log into 
 8. **An Intel Mac**, if you have one: steps 1 to 5 again into another directory (`~/tsdb-mac-report-intel`). There
    the AVX kernels are chosen at startup as on Linux, which has never run on macOS.
 
+9. **The send timeout on macOS** (added in 0.9.1 after this port: the server reads the socket's unsent bytes with
+   `SO_NWRITE` where Linux uses `SIOCOUTQ`, and a portable monotonic clock): step 3's `make test IO=epoll` runs it
+   in test_stability. Check that its slow-reader cases passed:
+
+   ```sh
+   grep -n -E 'steady_reader|slow_reader|reader_while_stopped|stuck_reader|stability tests passed' \
+       ~/tsdb-mac-report/test.log | tee ~/tsdb-mac-report/sendtimeout.txt
+   ```
+
+   A failure there means a client that reads slowly is cut off (or one that stopped reading is kept) on macOS.
+
 ## Send back
 
 The whole `~/tsdb-mac-report` directory (`tar czf tsdb-mac-report.tgz -C ~ tsdb-mac-report`), or if that is too
 much: `machine.txt`, the last 30 lines of `test.log` and `clients.log`, the output of the `grep` in step 3,
-`multi.txt`, `server.txt`, `import.txt`, and `hang.txt` if there is one. Also say how long steps 3 and 5 took.
+`multi.txt`, `server.txt`, `import.txt`, `sendtimeout.txt`, and `hang.txt` if there is one. Also say how long steps 3 and 5 took.
