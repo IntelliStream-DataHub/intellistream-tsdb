@@ -4,7 +4,8 @@ Status: design, not implemented. First written on 2026-11-02 (branch `cdc-design
 revised on 2026-11-06 on branch `cdc-design2` from main at 0683460, with the user's answers to the first version's
 ten questions (F1-F10) and everything merged since: 64-bit ids, login and rights, the 0.9.0 release, the
 last-write-wins fence, the two HA modes and the latest-value design. Revised again the same day after an adversarial
-review (H1-H5, M1-M5; the low findings L1-L3 and L5 too): F16-F21 below. Line numbers are at 0683460 unless marked.
+review (H1-H5, M1-M5; the low findings L1-L3 and L5 too): F16-F21 below. The six open questions of that revision are
+answered and closed (F22-F27, user, 2026-11-06). Line numbers are at 0683460 unless marked.
 
 The user decided on 2026-11-02 to have a Pulsar **source** that forwards every new write of selected series live
 (one, several, all, or by name prefix; tenants are name prefixes), shortly after tsdb acknowledges it, and resumes
@@ -51,6 +52,18 @@ Decisions of this revision (the user may change them):
 | F19 | **Numbers are never knowingly reused, and a consumer can prove its high-water**: in shared mode a claim continues `fno` above the reported high-water and a DIVERGED volume gets a new `feed_id`; a restore runs `feed new-id`; a cursor may carry `seen` (the consumer's newest event), which a rolled-back history fails (§1.2, §2.9). | Checking only the record at the resume position (review H4) | A rollback below what a consumer holds, with the resume point below the rollback, passed the check, and new writes took numbers the consumer had with other content: lost writes and phantoms after deduplication. |
 | F20 | **A resync resets the slot first, then snapshots**, and a snapshot is a replace of the series over all time that resets the key's deduplication (§2.6, §4.3). The slot stays `resyncing` until the source says the snapshot is in Pulsar. | RESET as the last step; snapshots as upserts (review H5) | Writes between the snapshot and the reset were in neither, and rows deleted during the gap stayed in the mirror. |
 | F21 | **On Pulsar, deduplicate per key only** (§1.4, §4.6). Per-volume deduplication is valid only on tsdb's own stream. | One rule for both (review M1) | Pulsar orders messages only per key on scalable and partitioned topics and Key_Shared, and not across the topics of `topics`. |
+
+The user's answers of 2026-11-06 to this revision's six open questions (closed; the design was already written to the
+recommendations). Two were taken as defaults and the user may still change them (F24, F26):
+
+| # | Decision | Rejected | Why |
+|---|---|---|---|
+| F22 | **Slot caps and free space** (user, 2026-11-06, question 1): a slot holds back at most 7 days and 256 GiB per volume; below 10% free space (`feed_min_free_pct`) slots are invalidated first, then the feed's own 24 h / 64 GiB retention is trimmed too (F18). Each slot sets its own age and bytes, the floor is a database setting. | Keeping the base retention whole under pressure | The feed never pushes the WAL toward ENOSPC; N volumes on one pool could otherwise hold N x 64 GiB (§2.6, §2.7). |
+| F23 | **Who creates slots** (user, 2026-11-06, question 2): superusers, and tenant admins for slot names under their own prefix (§3.2, A9's rule for user names). | Superusers only | A tenant runs its own source without a superuser. |
+| F24 | **When the last-write-wins check fails: repair and alert** (default taken, 2026-11-06, question 3; the user may change it): the reader sends `REASSERT` events, logs once and counts `tsdb_feed_lww_violations_total` (§1.6). | Ending the volume's stream with `CORRUPT` | A mirror stays right while the engine bug is found; the counter and the jepsen checker still fail on any violation. |
+| F25 | **The Pulsar sink skips `drop_before` in mirrors** (user, 2026-11-06, question 4): it counts and logs the `drop` event; mirrors keep the rows, as with expiry. **No new wire op** in protocol 14 (§4.7). | A superuser `DROP_BEFORE` op so the sink can apply it | A mirror's retention is its own business (the sink can `SET_RETENTION`); a volume-wide destructive op in the protocol for this one case is not worth its rights surface. |
+| F26 | **Rollback detection on a single server uses both** (default taken, 2026-11-06, question 5; the user may change it): the operator's `feed new-id` in the restore steps and the source's `seen` high-water read from Pulsar at each source start (F19, §4.5). | The operator's step alone | The read costs a seek and a few seconds of messages at each start, and catches a rollback the operator does not notice, such as a lost SLOG. |
+| F27 | **Rights changes on a running stream apply at once and the source stops by default** (user, 2026-11-06, question 6): `GRANTED` / `REVOKED` frames on the stream (§3.2), and the source's `onRightsChange` defaults to `fail` (§4.2). `resync` stays an option. | `resync` as the default; rights checked only at subscribe | A revoke must reach a stream that lives for days, and a mirror that silently lacks a series is worse than a stopped source. |
 
 ## Summary
 
@@ -269,7 +282,7 @@ with `REASSERT` events. **0.9.0 fixed the anomaly in the engine** (`lw_fence`, A
 The same argument holds per replica in replicated mode (design-cluster.md §5.2: rows before the `COMMIT` marker in
 the keys are flushed through `F` first, rows after it were held by the fence).
 
-**The check.** The reader verifies the property for every direct commit it delivers: no row in the commit's keys lies
+**The check** (repair and alert, F24). The reader verifies the property for every direct commit it delivers: no row in the commit's keys lies
 between segment `F + 1` (the marker's `F`, §2.3) and the marker. Per subscription it keeps a summary of the rows it
 read in the last four segments, in the fence's own shape (4096 buckets of series with a timestamp range each, 64 KiB a
 segment); a commit's keys are tested against the summaries of the segments after `F`, and only a bucket hit (a real
@@ -456,7 +469,7 @@ segments, the `fcommit_` files and the bytes links alone keep alive, together), 
 - in replicated mode, never above the saved commit floor, and the cluster's catch-up retention (`repl_retain_mb`)
   is the same mechanism (design-cluster.md §8.3): a segment goes when no rule keeps it.
 
-**Free space comes first** (F18). When the volume's filesystem has less than `feed_min_free_pct` (default 10%) free
+**Free space comes first** (F18, F22). When the volume's filesystem has less than `feed_min_free_pct` (default 10%) free
 (`statvfs`), the cleaner first invalidates slots (§2.7, cap rule 3) and, once no valid slot holds anything, removes
 segments of the base retention too, oldest first, down to the newest segment, ignoring age, size and the §1.6
 exception (a marker whose check segments are gone is delivered unchecked and counted in
@@ -491,7 +504,7 @@ or fails a write because of a consumer.
 If retention passes H before step 3 (a snapshot slower than the retention or the cap), step 3 gets `FEED_GONE` and
 the resync starts over; `FEED_INFO` and the slot metrics show that the retention is too short for a snapshot.
 
-### 2.7 Slots (F1, F11)
+### 2.7 Slots (F1, F11, F22)
 
 A **slot** is a named, durable consumer position. It holds the feed's retention back, up to a cap, on every volume it
 covers.
@@ -779,7 +792,7 @@ New status codes: `TSDB_ERR_FEED_GONE = -18`, `TSDB_ERR_FEED_RESET = -19` (after
 A connection that sent `FEED_SUBSCRIBE` carries that stream only; a later frame other than `CANCEL` and `FEED_ADVANCE`
 closes it (a client bug). Lookups go on another connection; the stream itself announces names.
 
-### 3.2 Rights (F12)
+### 3.2 Rights (F12, F23, F27)
 
 Rows of `auth_ops` (design-auth.md §5; `tests/test_auth_ops.c` fails without them):
 
@@ -943,7 +956,7 @@ The source refuses any processing guarantee but `ATLEAST_ONCE` (F6), with the si
 | `start` | `head` | where a volume starts when the slot is new: `head` or `oldest`; afterwards always at the slot |
 | `onGone` | `fail` | on `FEED_GONE` (also an invalidated or missing slot): `fail` (stop the instance and alert) or `resync`: the order of §2.6 (F20): the slot `RESET` first (its heads H), a `resync` message per volume, a snapshot group per selected series (§4.3), the stream from H, and the advance with `RESYNCED` once Pulsar acknowledged every snapshot message. A restart while the slot is `resyncing` redoes it |
 | `onReset` | `fail` | the same for `FEED_RESET` (a different history: an operator decides) |
-| `onRightsChange` | `fail` | on a `SERIES` frame with `REVOKED` or `GRANTED` (§3.2): `fail` (stop and alert: the mirror would be silently partial), `resync` (the series alone: its events are held back in the source, counted as in flight so the slot cannot pass them, while a snapshot group of it at a cut after the frame is published, then the held events follow; a revoked series gets a `delete` over all time, so the mirror holds nothing it may no longer read), or `ignore` (logged, `tsdb_source_rights_changes` counts it) |
+| `onRightsChange` | `fail` (F27) | on a `SERIES` frame with `REVOKED` or `GRANTED` (§3.2): `fail` (stop and alert: the mirror would be silently partial), `resync` (the series alone: its events are held back in the source, counted as in flight so the slot cannot pass them, while a snapshot group of it at a cut after the frame is published, then the held events follow; a revoked series gets a `delete` over all time, so the mirror holds nothing it may no longer read), or `ignore` (logged, `tsdb_source_rights_changes` counts it) |
 | `maxInFlightRecords`, `maxInFlightBytes` | `50000`, `64 MiB` | records handed to Pulsar and not yet acknowledged; above, the source stops reading the socket, and tsdbd parks the stream |
 | `advanceMs` | `1000` | how often the acknowledged positions are sent to the slot |
 
@@ -1017,7 +1030,7 @@ The same fields as JSON objects, in the sink's input shape for rows (`{"series":
 - **The source restarts** (crash, upgrade, rescheduling): it subscribes with the slot. Events between the slot's
   durable position and what Pulsar already has are sent again, identical (F6). After a tsdbd crash the slot may also
   be up to a second behind.
-- **Its high-water** (F19). Before subscribing after a restart, the source learns per volume the newest event Pulsar
+- **Its high-water** (F19, F26: used together with the operator's `feed new-id`). Before subscribing after a restart, the source learns per volume the newest event Pulsar
   holds: on each topic (and partition) it publishes to, a reader seeks to the publish time of the slot's position
   minus a minute (`commit_ms` precedes every publish of the event) and reads to the end, keeping per volume the
   highest `tsdb-event` of the slot's `tsdb-feed-id`. That read is bounded by what the slot had not yet acknowledged
@@ -1055,7 +1068,7 @@ The sink learns the `Event` record (step F9), in Avro and JSON, keeping its exis
 - `replace`: buffers the group up to `groupLast` and sends one `REPLACE_RANGE`; a group above `maxReplaceRows`
   (default 10 M rows) is applied as a delete and inserts, not atomically, with a log line and a counter.
 - `retention`: `SET_RETENTION`.
-- `drop`: counted and skipped (no wire op applies it; a mirror keeps the rows, as with expiry), with a log line.
+- `drop`: counted and skipped (no wire op applies it; a mirror keeps the rows, as with expiry; F25), with a log line.
 - `resync`: logged; the snapshot groups carry the reset (§4.3).
 - `UNKNOWN` (a newer source): dead-lettered.
 
@@ -1283,27 +1296,9 @@ embedded bindings 500; Pulsar source 1,500 + sink reader 350 + tests 1,100 + scr
 
 ## Open questions for the user
 
-Six at most; each has a recommendation, and the design is written to it. The format upgrade question of the
-revision before moved to S0 (§5), and the review's findings that needed no choice are decided as F16-F21.
-
-1. **Slot caps and free space: 7 days, 256 GiB per volume, and below 10% free space first invalidate slots, then trim
-   the feed's own 24 h / 64 GiB retention too (F18)?** Recommended: yes; each slot sets its own age and bytes, the
-   floor is a database setting, and the feed never pushes the WAL toward ENOSPC. The alternative keeps the base
-   retention whole and accepts that N volumes on a pool can hold N × 64 GiB.
-2. **Who may create slots:** superusers and tenant admins for slot names under their prefix (§3.2, as for user
-   names), or superusers only? Recommended: both, so a tenant runs its own source without a superuser.
-3. **When the last-write-wins check fails** (§1.6): repair with `REASSERT` events and alert (recommended: a mirror
-   stays right while the engine bug is found), or end the volume's stream with `CORRUPT`?
-4. **`drop_before` in mirrors:** the sink skips `drop` (recommended: no wire op for it in protocol 14; mirrors keep
-   the rows, as with expiry), or add a superuser `DROP_BEFORE` op so the sink can apply it?
-5. **Rollback detection on a single server** (F19): the operator's `feed new-id` in the restore steps **and** the
-   source's high-water read from Pulsar sent as `seen` (recommended: the read costs a seek and a few seconds of
-   messages at each source start, and catches the rollback an operator does not notice, such as a lost SLOG), or the
-   operator's step alone?
-6. **Rights changes on a running stream:** applied at once with `GRANTED`/`REVOKED`, and the source's default
-   `onRightsChange = fail` (recommended: a revoke must reach a stream that lives for days, and a mirror that silently
-   lacks a series is worse than a stopped source), or `resync` of the series by default, or rights checked only at
-   subscribe?
+None. The six questions of the revision before were answered on 2026-11-06 and are decided as F22-F27 (two of them,
+F24 and F26, as defaults the user may still change). The format upgrade question of the revision before moved to S0
+(§5), and the review's findings that needed no choice are decided as F16-F21.
 
 ## Unverified assumptions
 
