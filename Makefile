@@ -270,13 +270,16 @@ FORCE:
 # UBSan only prints by default and the run still exits 0: halt_on_error makes the first report fail
 # it. `ubsan-check` proves that with a program that overflows on purpose, then runs the CLI's parsers on
 # out-of-range input with float-cast-overflow added (GCC's `undefined` leaves it out).
-# ASAN_ARCH=-march=x86-64-v4 (or -v3) runs `make asan` at that CPU level (default: generic, see above)
+# ASAN_ARCH=-march=x86-64-v4 (or -v3) runs `make asan` at that CPU level (default: generic, see above). At v4 GCC
+# copies 64-byte structs (the part footer) with aligned zmm moves, which fault in ASan's fake stack (frames aligned
+# to 32 bytes: part.c part_index_intact), so use-after-return detection is off for those runs.
 ASAN_ARCH  ?=
 ASAN_FLAGS := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 UBSAN_RUN  := halt_on_error=1:print_stacktrace=1
+ASAN_RUN   := $(if $(ASAN_ARCH),detect_stack_use_after_return=0:)
 asan: ubsan-check
 	$(MAKE) clean
-	UBSAN_OPTIONS="$(UBSAN_RUN) $$UBSAN_OPTIONS" \
+	ASAN_OPTIONS="$(ASAN_RUN)$$ASAN_OPTIONS" UBSAN_OPTIONS="$(UBSAN_RUN) $$UBSAN_OPTIONS" \
 	$(MAKE) ARCH="$(ASAN_ARCH)" CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" test
 
 ubsan-check:
