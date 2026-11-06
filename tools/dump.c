@@ -943,7 +943,7 @@ static bool is_volume(tsdb *db, const char *path)
  * before anything is written. NULL if it can, else why not. */
 static const char *vpath_creatable(importer *im, const char *path, char *canon, bool *existed)
 {
-    static const char *const tsdb_files[] = {"ID", "VOLUMES", "ROOT_ID", "MANIFEST", "SERIES", "LOCK", "META"};
+    static const char *const tsdb_files[] = {"ID", "VOLUMES", "ROOT_ID", "MANIFEST", "SERIES", "LOCK", "META", "FNO"};
     struct stat st;
     *existed = false;
     /* a new database is not there yet (it is built beside its name): a volume inside it would block the rename */

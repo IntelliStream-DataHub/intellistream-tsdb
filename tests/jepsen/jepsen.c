@@ -886,7 +886,7 @@ static void scan_cuts(void)
 static void rot_damage(uint64_t r)
 {
     static const char *const kinds[] = {"wal_", ".part", "MANIFEST", "SERIES", "STATES", "CLASSES", "VOLUMES",
-                                        "RETENTION", "txn_", "META"};
+                                        "RETENTION", "txn_", "META", "FNO"};
     char pick[PATH_MAX] = "";
     for (int tries = 0; tries < 8 && !pick[0]; tries++) {
         const char *kind = kinds[(r = mix(r)) % (sizeof kinds / sizeof *kinds)];
