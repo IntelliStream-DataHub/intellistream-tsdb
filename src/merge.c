@@ -470,6 +470,7 @@ void merge_commit_locked(eng *db, part **src, size_t k, part *out)
         db_parts_insert_locked(db, out);
         for (size_t i = 0; i < k; i++)
             db_retire_locked(db, src[i]);
+        jr_commit(db, JR_MERGE, out);
     } else if (out) {
         /* a source was dropped meanwhile: the merged data must not come back */
         atomic_store(&out->obsolete, true);

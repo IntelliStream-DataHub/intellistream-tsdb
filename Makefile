@@ -44,7 +44,7 @@ LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 TSDBD   ?= $(B)/tsdbd

@@ -796,7 +796,12 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     }
     f.index_hash = part_hash(&h, sizeof h, index, ilen, trailer, tlen, &f);
     memcpy(f.magic, PART_END_MAGIC, 8);
-    if ((rc = pw_flush(w)) != 0 || (rc = write_all(w->fd, index, ilen)) != 0 ||
+    /* the range and the write time may be set after pw_begin wrote the header (a merge knows its sources only then):
+       the header on disk is the one hashed */
+    rc = pw_flush(w);
+    if (rc == 0 && pwrite(w->fd, &h, sizeof h, 0) != (ssize_t)sizeof h)
+        rc = TSDB_ERR_IO;
+    if (rc != 0 || (rc = write_all(w->fd, index, ilen)) != 0 ||
         (tlen && (rc = write_all(w->fd, trailer, tlen)) != 0) || (rc = write_all(w->fd, &f, sizeof f)) != 0) {
         free(trailer);
         free(index);

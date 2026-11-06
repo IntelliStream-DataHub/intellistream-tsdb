@@ -580,6 +580,20 @@ int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void
     return rc ? rc : wal_commit(db, lsn);
 }
 
+int wal_marker_mk(eng *db, const mk *m, uint64_t *fno)
+{
+    uint8_t *p;
+    size_t n;
+    int rc = mk_encode(m, &p, &n);
+    if (rc != 0)
+        return rc;
+    uint32_t span;
+    memcpy(&span, p + 4, 4);
+    rc = wal_marker(db, m->type, m->flags, span, p + MK_HDR, n - MK_HDR, fno);
+    free(p);
+    return rc;
+}
+
 /* Takes the single WAL writer role; waits while someone else holds it. */
 static void wal_writer_enter(eng *db)
 {
@@ -939,6 +953,8 @@ static int flush_waiting(eng *db)
             rc = parts_commit(db, pl.p, pl.n);
             if (rc)
                 pthread_mutex_unlock(&db->publish_lock);
+            else
+                jr_commit(db, JR_FLUSHED, &pl);
         }
         if (rc) {
             cls_thaw(db);

@@ -161,6 +161,8 @@ void graveyard_purge(eng *db, bool all)
         else
             db->graveyard[kept++] = *e;
     }
+    if (kept != db->ngraveyard)
+        jr_commit(db, JR_PURGE, NULL);
     db->ngraveyard = kept;
     pthread_mutex_unlock(&db->lock);
 }

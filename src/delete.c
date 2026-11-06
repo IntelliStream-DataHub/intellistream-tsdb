@@ -138,6 +138,8 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         rc = add_tomb_part(db, series, before[i], start, end, &all);
     if (rc == 0 && db->test_precommit)
         db->test_precommit(db->test_precommit_arg);
+    if (rc == 0)
+        rc = jr_intent(db, JR_COMMIT, &all);
     pthread_mutex_lock(&db->publish_lock);
     if (rc == 0)
         rc = range_partitions(db, series, start, end, &now, &nn);
@@ -163,6 +165,8 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         rc = eng_abandoned(); /* see cur_abandon: before any block number is taken */
         if (rc == 0)
             rc = parts_commit(db, all.p, all.n);
+        if (rc == 0)
+            jr_commit(db, JR_COMMIT, &all);
     }
     if (rc == 0) {
         pthread_mutex_lock(&db->lock);

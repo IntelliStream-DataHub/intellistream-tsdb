@@ -21,6 +21,7 @@ typedef struct eng eng;
 #include <zstd.h>
 
 #include "compat.h" /* macOS shims; nothing on Linux */
+#include "marker.h" /* WAL marker payloads (format 9) */
 
 #include "levels.h" /* before the declarations: renames them in a per-CPU-level compile */
 
@@ -1233,6 +1234,33 @@ bool wal_valid_after(const uint8_t *p, size_t len, size_t from, uint64_t seq, ui
  * come later). *fno gets its first number. Durable when it returns, where the WAL syncs per write. */
 int wal_marker(struct eng *db, uint16_t type, uint16_t flags, uint32_t span, const void *body, size_t body_len,
                uint64_t *fno);
+/* Encodes `m` (marker.h) and appends it as one record (wal_marker); *fno gets its first number. */
+int wal_marker_mk(struct eng *db, const mk *m, uint64_t *fno);
+
+/* The namespace-event hook (docs/design-ha-modes.md 2.1, M15): one call at each place a name or a file becomes
+ * visible, in two phases. jr_intent runs before publish_lock is taken (a replicated backend appends the marker and
+ * waits for its commit point there), jr_commit under publish_lock once block numbers are assigned (the ledger
+ * backend of shared mode edits its ledger there). S0 has no backend: both do nothing and compile away, the call
+ * sites are in place. `arg` is the event's payload (an `mk` or a part list), unused until a backend reads it. */
+enum jr_kind {
+    JR_COMMIT = 1, /* an insert, replace or delete committed its parts */
+    JR_FLUSHED,    /* a memtable's parts were listed and its segment may go */
+    JR_MERGE,      /* a merge replaced parts */
+    JR_PURGE,      /* retired parts were deleted */
+    JR_DROP,       /* tsdb_drop_before */
+    JR_RETENTION,  /* a retention limit was appended */
+    JR_DICT,       /* a SERIES, STATE or CLASSES record was appended */
+};
+static inline int jr_intent(struct eng *db, enum jr_kind kind, const void *arg)
+{
+    (void)db, (void)kind, (void)arg;
+    return 0;
+}
+static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
+{
+    (void)db, (void)kind, (void)arg;
+}
+
 #define FNO_FILE "FNO"
 int fno_create(int dirfd, uint64_t next, bool sync);
 int fno_load(struct eng *db, uint64_t *next, uint64_t *gen, int *slot, bool *torn);

@@ -76,6 +76,10 @@ enum {
     TSDB_ERR_ABANDONED = -14,   /* a request that was parked on a stuck volume and discarded its work (ha.md 15.3) */
     TSDB_ERR_DENIED = -16, /* tsdbd: the user holds no right for this (or the series does not exist) */
     TSDB_ERR_AUTH = -17,   /* tsdbd: login failed or is required first */
+    /* -18 and -19 are reserved for the change feed (docs/design-cdc.md): nothing returns them yet; the wire and the
+       clients name them when the feed is built */
+    TSDB_ERR_FEED_GONE = -18,  /* reserved: the feed position asked for is older than the retained log */
+    TSDB_ERR_FEED_RESET = -19, /* reserved: the feed's history was rewritten; the consumer must start again */
 };
 
 /* The ends of the time axis, for query ranges. Ranges are half-open, [start, end), so no range reaches a row at

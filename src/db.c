@@ -1099,7 +1099,9 @@ int eng_drop_before(eng *db, int64_t ts)
     if (db->opt.read_only)
         return TSDB_ERR_READONLY;
     /* memtable rows become parts first, so they are dropped with them */
-    int rc = eng_flush(db);
+    int rc = jr_intent(db, JR_DROP, &ts);
+    if (rc == 0)
+        rc = eng_flush(db);
     if (rc)
         return rc;
     pthread_mutex_lock(&db->lock);
@@ -1116,6 +1118,7 @@ int eng_drop_before(eng *db, int64_t ts)
             i++;
         }
     }
+    jr_commit(db, JR_DROP, &ts);
     pthread_mutex_unlock(&db->lock);
     if ((rc = eng_sync_dir(db, "fsync of the directory after retiring dropped parts")) != 0)
         return rc; /* failed since the flush, here or elsewhere */
