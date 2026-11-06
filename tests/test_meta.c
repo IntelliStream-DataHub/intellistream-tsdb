@@ -732,7 +732,11 @@ static void drain(struct msim *s, struct snode *nd)
                 last = a.u.apply.entries[i].index;
             }
             raft_applied(nd->r, last);
-            if (nd->sm.applied - nd->snap_index >= 50)
+            /* Only over a durable log, as cluster.c does (its syncs run inline, before it snapshots): a follower
+             * applies what the leader committed before its own copy is synced, and an image kept past the synced
+             * log boots a core whose commit is above its last entry, which then skips the entry it lacks and never
+             * appends again (soak seed 4305: stuck at 5200 with a log ending at 5199). */
+            if (nd->sm.applied - nd->snap_index >= 50 && nd->sm.applied <= nd->log.durable)
                 take_snapshot(nd);
             break;
         }
