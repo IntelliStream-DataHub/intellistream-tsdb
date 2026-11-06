@@ -21,7 +21,7 @@ endif
 CRASHFS_SO :=
 else
 SOEXT   := so
-CRASHFS_SO = $(B)/libcrashfs.so
+CRASHFS_SO = $(B)/libcrashfs.so $(B)/liboutagefs.so
 endif
 # -march=native gives the codecs BMI/LZCNT; the aggregation kernels pick
 # AVX-512/AVX2/scalar at runtime either way. `make PORTABLE=1` for a generic build.
@@ -711,6 +711,13 @@ $(B)/test_classes: tests/test_classes.c tools/datasets.h $(LIB)
 $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)
 	$(CC) -O2 -g -std=gnu11 -Wall $(ARCH) -fPIC -shared -o $@ $< -ldl -lpthread
 
+# the storage-outage shim (hang, error, slow, full and rollback faults per prefix; stacks with crashfs)
+$(B)/liboutagefs.so: tests/jepsen/outagefs.c | $(B)
+	$(CC) -O2 -g -std=gnu11 -Wall $(ARCH) -fPIC -shared -o $@ $< -ldl -lpthread
+
+$(B)/test_outagefs: tests/test_outagefs.c tests/outagefs_ctl.h | $(B)
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
+
 $(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
@@ -779,6 +786,13 @@ all: $(B)/embedded-example $(B)/client-example
 test: test-quickstart
 test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 	B=$(B) tests/test_quickstart.sh
+
+# The outage shim's own test (Linux only: LD_PRELOAD)
+ifneq ($(UNAME_S),Darwin)
+test: test-outagefs
+test-outagefs: $(B)/test_outagefs $(B)/liboutagefs.so
+	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs /tmp
+endif
 
 # The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.
 test: check-version
