@@ -286,6 +286,8 @@ existing sessions (as in PostgreSQL); dropping the user does.
 |---|---|---|
 | HELLO, AUTH_START, AUTH_CONTINUE | nothing (before login only) | |
 | CANCEL, LAST_STATS, WHOAMI | a login | (own connection only, as today) |
+| TOPOLOGY | a login | (nodes, volume ids and health for every client; the volume paths only to a superuser) |
+| STATUS | superuser | (the server's own state) |
 | SERIES, create 0 | any right | name |
 | SERIES, create 1; SERIES_CREATE | insert | name (any volume the operator added) |
 | SERIES_NAME, SERIES_TYPE, GET_RETENTION | any right | id |

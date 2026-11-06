@@ -36,6 +36,8 @@ static const spec specs[] = {
     {TSDB_OP_CANCEL, K_LOGIN, 0, BY_NONE, 0},
     {TSDB_OP_LAST_STATS, K_LOGIN, 0, BY_NONE, 0},
     {TSDB_OP_WHOAMI, K_LOGIN, 0, BY_NONE, 0},
+    {TSDB_OP_TOPOLOGY, K_LOGIN, 0, BY_NONE, 0},
+    {TSDB_OP_STATUS, K_SUPER, 0, BY_NONE, 0},
     {TSDB_OP_SERIES, K_SERIES, N_ANY, BY_NAME, 0},
     {TSDB_OP_SERIES, K_SERIES, N_I, BY_NAME, 1},
     {TSDB_OP_SERIES_CREATE, K_SERIES, N_I, BY_NAME, 0},
@@ -132,7 +134,7 @@ static size_t build(const spec *s, tsdb_sid id, const char *name, uint8_t *b)
     case TSDB_OP_QUERY_MULTI: /* QUERY_VALUES over one series: header, the id, the template */
         b[0] = TSDB_OP_QUERY_VALUES; put32(b + 4, 1); put32(b + 16, 24); put64(b + 24, id);
         put64(b + 32, TSDB_MANY_SERIES); put64(b + 40, t0); put64(b + 48, t1); return 56;
-    default: return 0; /* no payload: LAST_STATS, WHOAMI, COMMIT, FLUSH, OPTIMIZE, STATS, USER_LIST */
+    default: return 0; /* no payload: LAST_STATS, WHOAMI, TOPOLOGY, STATUS, COMMIT, FLUSH, OPTIMIZE, STATS, USER_LIST */
     }
 }
 
