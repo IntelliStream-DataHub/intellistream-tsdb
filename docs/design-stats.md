@@ -35,10 +35,10 @@ Related designs: [design-auth.md](design-auth.md) (tenants are name prefixes, te
   moves only the series whose tenant changes.
 - **Exposure:** two new ops, `STATS_SERIES` (46) and `STATS_TENANTS` (47), in their own protocol version (the next one
   free on main when they merge, 15 if 13 and 14 are in by then); `tsdb DIR stats series|tenants|hot` in the CLI; C
-  API calls; the four clients and the embedded bindings in one commit; new server-wide and per-volume metrics, and
-  per-tenant metrics only when asked for (`--metrics-tenants N`, capped). Never a label per series.
+  API calls; the four clients and the embedded bindings in one commit; new server-wide and per-volume metrics. Per-tenant
+  numbers are never on the metrics port (it has no login): only the STATS ops give them. Never a label per series.
 - **Format 9 (S0):** one optional 8-byte field in the part header (when the part's newest rows were written), so the
-  last write time survives a reopen. Nothing else is persisted: counters start at zero with each process, and storage
+  last write time survives a reopen. Step S0 of design-ha-modes.md §7 carries it (decided 2026-11-06). Nothing else is persisted: counters start at zero with each process, and storage
   numbers are rebuilt from the indexes, following the open.
 - **Budget, as a rule:** stats on against stats off moves insert throughput, query throughput and query p99 by less
   than 1%. The sweeper is capped by its throttle (at most about 6% of one core at the default, under 1% at the
@@ -95,10 +95,10 @@ Related designs: [design-auth.md](design-auth.md) (tenants are name prefixes, te
 | ST10 | **Hot series, three lists.** *Reads*: sampled weighted space-saving, k = 256 per thread block. A query is sampled with probability 1/8 by a per-thread xorshift geometric skip, not 1 in 8 by a counter, which a round-robin client would alias (weight 8). *Writes*: space-saving over the series of level-0 parts, weighted by rows, fed by the sweeper, not sampled. *Bytes per row*: not a frequency top-k, but a min-heap of the k worst series by bytes per row over runs with at least one full granule in parts of level > 0, deduplicated by id. Each list has two windows, the current and the previous 60 s; the owner rotates them at its next update, and readers ignore a window by its timestamp once it is older than two periods (an idle thread never rotates). A seqlock per window keeps a reader from seeing a torn (id, estimate, error) triple. The hot-list memory of a block is allocated on the thread's first sample. | Exact counters per series; count-min sketch | Exact counters cost 16 bytes x 10^9. Count-min answers "how much for this series" but cannot list the top without a candidate set. Space-saving lists them with a known error. Lists of several threads are combined by the mergeable-summaries rule: an id missing from one thread's list counts that thread's minimum. Then every series above W / k appears, and each estimate is high by at most W / k plus the sampling error (§7 tests both). |
 | ST11 | **Active series per tenant: HyperLogLog**, 1,024 registers (about 3% standard error), one per tenant per window (the current and the previous hour), fed by level-0 ADD walks. The number of series per tenant is exact (from the tenant map). | A bit per series per window | 10^9 bits x 2 windows = 250 MB for a number nobody needs to the last series. |
 | ST12 | **Cache hit rates are reported for the caches tsdb has**: granule statistics (granules and rows answered from the index against decoded), memtable rows, the page cache (major faults of the process from `getrusage(RUSAGE_SELF).ru_majflt`, which macOS has too, against bytes decoded; residency of a series or a tenant by `mincore`, on request or sampled, through a shim in src/compat.h because macOS takes `char *`), the latest-value table (design-latest.md §6.5), the rights map (counted per request, never per row). There is no decoded-granule cache to report. | A user-space block cache to make a hit rate measurable; `/proc/self/stat` | Parts are `mmap`'d (src/part.c:174), so the page cache is the cache. Adding a cache just to measure it would cost memory and a copy on every read. `getrusage` is one portable call. |
-| ST13 | **Nothing is persisted, except one optional field in format 9.** Counters count from the start of the process. Storage numbers are rebuilt after an open: the sweeper follows the open (§3.1). Format 9 (step S0) adds `written_ms` to the part header (not the 64-byte footer): when the part's newest rows were inserted, and for a merge output the newest of its inputs. Until then, after a reopen a series' last write falls back to the part file's mtime (src/part.c:182), which a merge moves, and the reply flags it. | A STATS file updated on every flush; totals in the 64-byte footer | A file written on the flush path is new fail-stop surface and new jepsen work, for numbers that can be rebuilt. The footer's size is fixed by a static assert (src/internal.h:596). Without a written time, "last write" is wrong after every reopen for a series that a merge rewrote (L1). |
+| ST13 | **Nothing is persisted, except one optional field in format 9.** Counters count from the start of the process. Storage numbers are rebuilt after an open: the sweeper follows the open (§3.1). Format 9 (step S0 of design-ha-modes.md §7, which carries the field; decided 2026-11-06) adds `written_ms` to the part header (not the 64-byte footer): when the part's newest rows were inserted, and for a merge output the newest of its inputs. For a part written before format 9 (no field), after a reopen a series' last write falls back to the part file's mtime (src/part.c:182), which a merge moves, and the reply flags it. | A STATS file updated on every flush; totals in the 64-byte footer | A file written on the flush path is new fail-stop surface and new jepsen work, for numbers that can be rebuilt. The footer's size is fixed by a static assert (src/internal.h:596). Without a written time, "last write" would be wrong after every reopen for a series that a merge rewrote (L1). |
 | ST14 | **Two ops**: `STATS_SERIES` (46: ids in, fixed records out) and `STATS_TENANTS` (47: tenants, with optional per-volume rows, per-caller blocks and hot lists, and a resume cursor). Rights: read on each series for the first (DENIED per series, like QUERY_MULTI); for the second, as §4 "Rights". | An op per statistic; a free-prefix op that scans names | Fewer ops, fewer rows in `auth_ops`. A free prefix would scan 10^9 names per request. |
 | ST15 | **Protocol: its own version**, the next one free on main when the stats ops merge (15 if 13 and 14 are in by then), never a ride-along with another unreleased version. New ops only, floor stays 12; the CHANGELOG of the release names the version and the floor. Op numbers 46 and 47 unless taken by then. | Riding along with 13 or 14 while unreleased | With a ride-along, one version number on main would mean different sets of ops over time, and a client built in between could not tell (L10). A version number costs nothing. |
-| ST16 | **Metrics port**: new server-wide and per-volume metrics. Per-tenant metrics only with `--metrics-tenants N` (N at most 1,000). The exported set is sticky: a tenant joins when it is among the N largest by bytes on disk while there is room, and stays until restart; the cap counts every tenant ever exported. `tenant="(other)"` accumulates the increments of tenants never exported, so it never goes down. Per-tenant request counters are kept per tenant number (§3.4), never recomputed from users, so they are monotonic across user removals and list changes. No `volume` label on per-tenant metrics. Never a label per series or per user. | Per-tenant metrics by default; a fresh top N at every scrape | A21: the port has no login, and its labels must not name tenants unless the operator asks. A changing top N moves counts into and out of `(other)`, which Prometheus reads as counter resets (M7). A `volume` label would multiply the series by the volumes. |
+| ST16 | **Metrics port**: new server-wide and per-volume metrics only. **No per-tenant metric of any kind, and no `--metrics-tenants` option** (decided 2026-11-06). The port has no login (A21), so per-tenant numbers (and so the names of tenants) are reachable only through the STATS ops, which require login and the rights of §4. Per-tenant request counters are still kept per tenant number (§3.4) for the by-caller blocks of `STATS_TENANTS`. No label per series or per user. | Per-tenant metrics on the port, by default or as an opt-in with a capped, sticky top N | A21: labels on a port without login must not name tenants. The opt-in was offered and not taken. Per-volume gauges carry the path, as before (docs/metrics.md). |
 | ST17 | **Stats never block, write or fail-stop.** The ring push is two stores under the `db->lock` the list change already holds. The sweeper takes `db->lock` only to copy one partition's parts with references (as `db_snapshot` does), and the dictionary's `lock` only for a batch of names. A per-series call reads the parts and the flushing and tail memtables under one `db->lock` hold, and the active memtable under `buf_lock` in batches of at most 256 ids (§3.2). `stats_mu` and the registry's mutex are leaves. Stats never write a file, never call `eng_fail`, and keep answering after the engine failed (as queries do). | Exact numbers under `publish_lock`; one `buf_lock` hold for a whole request | Numbers a few seconds old are fine; a stats call that delays a publish is not. Holding `buf_lock` across 65,536 ids would stall the append path. |
 | ST18 | **Three settings**, `tsdb_options.stats`: -1 off (no ring, no sweeper, no blocks: hooks stop at one predictable branch); 0, the engine default, *lazy* (query counters on; the sweeper starts at the first tenant or volume stats call, and per-series calls work at once); 1, start with the open (tsdbd's default; `tsdbd --no-stats` sets -1). | On for every open; off by default | The CLI, `tsdb export`, the embedded bindings, tests and benchmarks should not start a thread that reads the whole index (M3). An operator should not have to restart tsdbd to find out which tenant fills the disk. |
 | ST19 | **Fix first: a dropped part must not come back after a crash.** With `obsolete_part_lifetime_s <= 0`, `db_retire_locked` renames a `dropped` part to `retired_*` too, as it does with a positive lifetime (the open deletes `retired_*` files, src/db.c:451), and the unlink still waits for the last reference. This is a separate fix with its own regression test and a jepsen run, before step 1. | Leaving it, since only queries hold parts long today | A query running across `drop_before` already opens the window today. The event ring holds an ADD reference for up to a second, so it would widen the window (H4). |
@@ -408,10 +408,8 @@ ST5): `TSDB_ABI_VERSION` goes up (include/tsdb.h:796), shared with design-latest
   `tenant_stats(prefixes, flags)` (looping on the cursor); the embedded bindings (Rust `Db`, Python `Db`, Java
   `EmbeddedDb`) the same, compared with tsdbd's answers in their tests. All in one commit with the server ops,
   `make test-clients` green (AGENTS.md "Protocol").
-- Metrics (docs/metrics.md): §2.3, and with `--metrics-tenants N` the by-data and by-caller blocks per tenant
-  (`tsdb_tenant_disk_bytes{tenant,column}`, `tsdb_tenant_rows`, `tsdb_tenant_series`, `tsdb_tenant_requests_total
-  {tenant,group}`, `tsdb_tenant_denied_total{tenant}`, ...), with the sticky set and the accumulating `(other)` of
-  ST16. No `volume` label on them; never a label per series.
+- Metrics (docs/metrics.md): §2.3 only, server-wide and per volume. No per-tenant metric (ST16): per-tenant numbers
+  come through the STATS ops, which need login. Never a label per series.
 
 ### 5.4 Cluster and HA
 
@@ -498,7 +496,8 @@ design-cluster.md:79, so the walk is unchanged).
   64 MB cap; the rights of §4 (a tenant admin sees its tenants and gets NOTFOUND for a missing one under its prefix,
   DENIED elsewhere; per-series DENIED; no thresholds or global fields for a tenant admin); a user named under a
   tenant but with grants outside it counts under `(none)`; `--no-auth`; `test_auth_ops` gets its rows; metrics names
-  for the new ops; `--metrics-tenants`: the cap, the sticky set, `(other)` never going down. Clients:
+  for the new ops; the metrics port carries no tenant name and no per-tenant number (scrape it with tenants present
+  and check the text). Clients:
   `make test-clients`; `make integration-tests` gets a stats case per client.
 - **Jepsen**: only for ST19, which changes how a drop reaches the disk. The statistics themselves change nothing
   there.
@@ -528,51 +527,45 @@ standard deviations reported (benchmark policy):
 | 2 | Event ring, sweeper, part records, volume column totals, catch-up following the open, `tsdb_series_stats` with its cost bound, CLI `stats series` and the fixed `stats` | make test, asan, tsan; oracle; insert benchmarks | 4 |
 | 3 | Tenants: list in options, map, partition vectors and recomputes, drops, ingest, merges, retention, HLL, incremental list changes, `tsdb_set_tenants`, CLI `stats tenants` | make test, asan, tsan; oracle on every list change; drift tests | 5 |
 | 4 | Hot lists (reads, writes, bytes per row) and residency | make test; bound tests | 2 |
-| 5 | One commit: tsdbd's per-tenant counters, `--tenants` and the default from `admin` grants, ops 46-47 with `auth_ops` rows, `--metrics-tenants`; the C, Rust, Python and Java clients and embedded bindings; CLI `--server` | make test (both backends), tsan, `test_auth_ops`, make test-clients, integration-tests | 5 |
+| 5 | One commit: tsdbd's per-tenant counters, `--tenants` and the default from `admin` grants, ops 46-47 with `auth_ops` rows; the C, Rust, Python and Java clients and embedded bindings; CLI `--server` | make test (both backends), tsan, `test_auth_ops`, make test-clients, integration-tests | 5 |
 | 6 | Benchmarks (§8), docs: metrics.md, protocol comment, CHANGELOG (version and floor), AGENTS.md invariant and layout line | numbers on a quiet machine | 2 |
 
 About 21 days. Step 0 stands alone and should go first whatever happens to the rest. Steps 1-2 are useful without
-tenants; 3 needs 2; 5 needs 3 and 4. Format 9 (S0): `written_ms` in the part header, about half a day inside S0 if
-open question 5 is answered yes; this design does not wait for it.
+tenants; 3 needs 2; 5 needs 3 and 4. Format 9 (S0): `written_ms` in the part header, about half a day inside S0 of
+design-ha-modes.md §7 (decided 2026-11-06, §10); this design does not wait for it.
 
-## 10. Open questions (with recommended answers)
+## 10. Decisions on the open questions (user, 2026-11-06)
 
-1. **Without `--tenants`, should the tenants default to the `prefix:` selectors of `admin` grants?** Recommended:
-   yes for small deployments, so tenant admins get numbers without configuration; past 10^7 series, configure
-   `--tenants`, because every change of the default list costs a background name scan of the moving tenant.
-2. **Per-tenant metrics on the unauthenticated metrics port: opt-in?** Recommended: yes, `--metrics-tenants N`, off
-   by default (A21), N at most 1,000, sticky.
-3. **A droppable stats cache file**, so a 10^9-series database does not walk its whole index after every open?
-   Recommended: not in the first build. Following the open reads the index from disk once; what remains is about 75 s
-   of one background core per 10^10 entries. Add one (not a format change: a missing or mismatched cache means a
-   rebuild) if the measured catch-up on production-sized data exceeds 10 minutes.
-4. **Exact live rows on request (`EXACT_ROWS`)?** Recommended: yes, as a flag limited to 1,024 ids; the default
-   stays physical.
-5. **Format 9: add `written_ms` (8 bytes) to the part header?** Recommended: yes; without it a series' last write
-   after a reopen is the part file's mtime, which merges move.
-6. **May a user with read rights see a series' hot-list estimates**, which reveal how much others query it?
-   Recommended: yes, for series the user may read, without error bounds or thresholds; those and tenant-level
-   numbers stay with tenant admins (their tenants) and superusers.
+The six questions of the first draft were answered on 2026-11-06. Open questions: none open.
+
+| # | Question | Decision (2026-11-06) |
+|---|---|---|
+| 1 | Tenant source without `--tenants` | **As recommended** (ST5). Without a `--tenants` file, the tenants are the `prefix:` grants that tenant admins hold `admin` on. Past about 10^7 series, operators configure `--tenants FILE`, because every change of the default list costs a background name scan of the moving tenant. |
+| 2 | Per-tenant numbers on the metrics port | **Never.** The recommended opt-in (`--metrics-tenants N`) was not taken. Per-tenant numbers are only available through the STATS ops, which require login. The option and every per-tenant metric are gone from the design (ST16, §5.3, §7, §9). Per-volume and server-wide metrics stay. |
+| 3 | A droppable stats cache file | **As recommended.** Not in the first build; following the open reads the index from disk once (§3.1). Add one (not a format change: a missing or mismatched cache means a rebuild) if the measured catch-up after an open on production-sized data exceeds 10 minutes. |
+| 4 | Exact live rows on request | **As recommended** (ST1). `EXACT_ROWS` is a flag, limited to 1,024 ids per request; the default stays physical. |
+| 5 | Format 9: `written_ms` in the part header | **Yes.** An 8-byte write time goes into the part header in step S0 of design-ha-modes.md §7, which carries it (one line added to the S0 list there). ST13 describes the field; a part written before format 9 has none and falls back to the file's mtime. |
+| 6 | Hot-list estimates for users with read rights | **As recommended** (ST10). Any user with read rights on a series sees its estimates, without error bounds or thresholds. Tenant-level numbers stay with tenant admins (their tenants) and superusers. |
 
 ## 11. After the review
 
 | Finding | Answer | Where |
 |---|---|---|
 | H1 no cost bound on `STATS_SERIES` | fixed: sorted ids, part pruning, binary search or merge pass by cost, 10^8-probe budget with `done`, `RESIDENT`/`EXACT_ROWS` at most 1,024 ids, CANCEL, a 10^7-run benchmark | ST2, §3.2, §5.1, §7, §8 |
-| H2 tenant-list change rebuilds everything | fixed: list in `tsdb_options` (one sweep at start), applied only when the prefix set changes and after 30 s, incremental move of the affected series, old numbers served under the old generation; open question 1 says configure `--tenants` past 10^7 series | ST5, §4, §10 |
+| H2 tenant-list change rebuilds everything | fixed: list in `tsdb_options` (one sweep at start), applied only when the prefix set changes and after 30 s, incremental move of the affected series, old numbers served under the old generation; decision 1 (§10) says configure `--tenants` past 10^7 series | ST5, §4, §10 |
 | H3 add and subtract can attribute differently | fixed: per-partition vectors replaced wholesale, records tagged with the map generation, map extended before a walk, follower parts put off, split checked against the part's totals, clamp and log, drift tests | ST4, ST7, §3.1 invariant, §7 |
 | H4 sweeper references keep dropped parts | fixed: no long-lived references (ADD until the next tick, dropped released at once, recompute only while walking); the existing hazard gets its own fix and crash test (ST19, step 0) | ST3, ST19, §6, §7, §9 |
 | M1 retention re-reads cold indexes | fixed: per-(partition, tenant) vectors; a drop subtracts with no walk | ST4, §3.1 |
 | M2 ingest misses fast merges, double-counts replay | fixed: list events instead of sampling; replay flushes flagged and excluded; follower reports no ingest; overflow flag | ST3, ST8, §2.2 |
-| M3 second full index pass; on for every open | fixed: the sweeper follows the open while pages are hot; `stats = 0` is lazy, tsdbd uses 1. Open question 3 keeps "not in the first build", because following the open removes the second disk read | ST18, §3.1, §10 |
+| M3 second full index pass; on for every open | fixed: the sweeper follows the open while pages are hot; `stats = 0` is lazy, tsdbd uses 1. Decision 3 (§10) keeps "not in the first build", because following the open removes the second disk read | ST18, §3.1, §10 |
 | M4 1% budget fails with sparse granules | fixed: the throttle is a hard cap (about 6% of a core at most); the steady target is stated against merge CPU and measured with 10^8 sparse series. Inline per-tenant deltas are not needed: drops no longer walk | §3.1, §8 |
 | M5 memtable reads without `buf_lock` | fixed: parts, flushing and tail memtables under one `db->lock` hold; active memtable under `buf_lock` in batches of 256; retry on a flush, `MEM_APPROX` | ST17, §3.2, §6 |
 | M6 per-thread blocks with two handles or after close | fixed: blocks keyed by a never-reused handle number, refcounted registry, 128-byte alignment, seqlock, no counting on allocation failure, lazy hot lists | ST9, ST10 |
-| M7 per-tenant metrics not monotonic | fixed: sticky export set, accumulating `(other)`, counters kept per tenant number, no `volume` label | ST16, §3.4 |
+| M7 per-tenant metrics not monotonic | moot: the metrics design that answered it (sticky export set, accumulating `(other)`, no `volume` label) is gone, because per-tenant metrics are never on the metrics port (decision 2, §10). Counters kept per tenant number (§3.4) still make the STATS by-caller blocks grow only | ST16, §3.4, §10 |
 | M8 wire layout inconsistent, frame overflow | fixed: offset table (176 bytes), fixed block orders, `nhot`, cursor, 64 MB cap, `count` counts rows | §5.1 |
 | M9 protocol split over two steps | fixed: one step and one commit | §9 step 5 |
 | M10 "~0" map memory | fixed: 2 GB (1 GB with a 1-byte map) per 10^9 is the planning number. Filling the map during the SERIES load is rejected: it would add 10-20 s to a failover open; it fills in the background instead | ST7, §3.6 |
-| L1 last write wrong after reopen | fixed: `written_ms` in the format 9 part header (open question 5); until then flagged `WRITE_FROM_MTIME` | ST13, §2.1 |
+| L1 last write wrong after reopen | fixed: `written_ms` in the format 9 part header (decision 5, §10; step S0 of design-ha-modes.md); parts from before it are flagged `WRITE_FROM_MTIME` | ST13, §2.1 |
 | L2 wrong statements | fixed: `db_snapshot` copies with references, `tsdb_get_volume_stats` does not; followers tail the WAL; existing `merges`/`merged_rows` and how the per-tenant split relates | §0, §2.2, §6 |
 | L3 `live_rows` leaves out nulls | fixed: nulls included, run quietly | ST1, §2.1 |
 | L4 unknown tenant always DENIED | fixed: NOTFOUND per A16 | §4 |
