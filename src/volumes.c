@@ -1490,8 +1490,10 @@ int tsdb_volume_idle(tsdb *t, size_t vol, int timeout_ms)
     return rc;
 }
 
-int tsdb_volume_reopen(tsdb *t, size_t vol)
+int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
 {
+    tsdb_volume_report none, *rep = report ? report : &none;
+    memset(rep, 0, sizeof *rep);
     if (vol == 0 || t->opt.read_only)
         return TSDB_ERR_INVALID; /* the root is not recovered in the process: tsdbd exits */
     pthread_rwlock_rdlock(&t->lock);
@@ -1508,11 +1510,30 @@ int tsdb_volume_reopen(tsdb *t, size_t vol)
         return TSDB_ERR_INVALID; /* quiesce, then wait until idle: no call is inside the old engine */
     }
     eng_halt(old);
-    eng *e;
-    int rc = eng_reopen(old, path, &t->opt, t->sched, &e);
+    /* ha.md 15.5 step 3 and 4: compare the memory of the halted engine with the storage, before the open reads it.
+     * Nothing here changes what the old engine knows, so a failed attempt can be repeated. */
+    reval_part *exp = NULL;
+    size_t nexp = 0;
+    int rc = reval_capture(old, &exp, &nexp);
+    if (rc == 0 && (rc = wal_verify_tail(old, path)) == 1) {
+        rep->wal_mismatch = 1;
+        rc = wal_relog(old, path, &rep->relogged_rows);
+    }
+    if (rc == 0)
+        rc = reval_dicts(old, path, &rep->series_repaired, &rep->states_repaired);
+    eng *e = NULL;
+    if (rc == 0)
+        rc = eng_reopen(old, path, &t->opt, t->sched, &e);
     free(path);
-    if (rc)
+    if (rc) {
+        free(exp);
         return rc; /* the old engine stays, halted and quiesced: try again */
+    }
+    reval_parts(e, exp, nexp, &rep->lost_parts, &rep->lost_part_rows);
+    free(exp);
+    rep->diverged = rep->lost_parts != 0;
+    if (rep->diverged) /* refused until an operator accepts the loss (tsdb_volume_resume) */
+        atomic_store_explicit(&e->quiesced, true, memory_order_release);
     pthread_rwlock_wrlock(&t->lock);
     e->wait_fn = t->wait_fn; /* before anyone can write to it */
     e->wait_ctx = t->wait_ctx;

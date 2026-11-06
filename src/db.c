@@ -439,7 +439,9 @@ static int load_parts(eng *db, bool read_only)
     rewinddir(d); /* the dup shares its offset with dirfd, which an earlier scan moved */
     struct dirent *e;
     int rc = 0;
-    while ((e = readdir(d)) != NULL) {
+    /* errno is cleared before every readdir: NULL with errno set is a read error, never the end (a hung or failing
+     * NFS server must not look like a directory with fewer parts) */
+    for (errno = 0; (e = readdir(d)) != NULL; errno = 0) {
         const char *name = e->d_name;
         /* Only names the engine writes: a volume may be a directory with the user's own files in it
          * (tsdb_volume_add_dir), and their tmp_notes.txt or retired_old.csv is not ours to delete. */
@@ -505,6 +507,10 @@ static int load_parts(eng *db, bool read_only)
             db->parts_cap = cap;
         }
         db->parts[db->nparts++] = p;
+    }
+    if (rc == 0 && errno != 0) {
+        fprintf(stderr, "tsdb: reading the directory failed: %s: the open fails\n", strerror(errno));
+        rc = TSDB_ERR_IO;
     }
     closedir(d);
     if (rc)

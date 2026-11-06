@@ -1365,6 +1365,9 @@ struct eng {
     int wal_fd;
     uint64_t wal_seq;
     uint64_t wal_off; /* bytes in segment wal_seq (the WAL writer role) */
+    /* the last record whose write and sync succeeded, in any segment (the WAL writer role; read once the engine is
+     * halted): revalidation after an outage finds it again, byte for byte, before it trusts the log (ha.md 15.5) */
+    uint64_t wal_last_seq, wal_last_off, wal_last_len, wal_last_hash;
     uint8_t *wal_buf, *wal_spare;
     size_t wal_len, wal_cap, wal_spare_cap;
     uint64_t wal_appended;            /* rows appended (buf_lock) */
@@ -1548,6 +1551,18 @@ int eng_close(eng *db);
 /* As eng_close, for an engine replaced by a fresh open of its directory (ha.md 15.5): the name strings stay, for the
  * `tsdb_series_name` pointers callers hold until tsdb_close. */
 int eng_retire(eng *db);
+/* Recovery of a halted engine (revalidate.c, ha.md 15.5 step 3 and 4); see tsdb_volume_reopen. */
+int wal_verify_tail(eng *db, const char *dir); /* 0 intact, 1 the storage lost what was durable, <0 error */
+int wal_relog(eng *db, const char *dir, uint64_t *rows); /* the rows memory holds into a new segment */
+typedef struct reval_part {
+    char name[96];
+    int64_t partition;
+    uint64_t min_block, max_block, rows;
+    uint32_t nt;
+} reval_part;
+int reval_dicts(eng *old, const char *dir, uint64_t *series_added, uint64_t *states_added);
+int reval_capture(eng *old, reval_part **out, size_t *n);
+void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost, uint64_t *lost_rows);
 void eng_halt(eng *db);
 /* A new engine for the directory of `old` (halted, closed afterwards by eng_retire) that takes over its lock. */
 int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, struct sched *qs, eng **out);

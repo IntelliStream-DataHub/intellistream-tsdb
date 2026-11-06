@@ -735,13 +735,23 @@ void tsdb_set_abandon_flag(const volatile int *flag);
  * (0 is the root, which is not recovered here). tsdb_volume_quiesce: new calls on the volume's series that read or
  * write return TSDB_ERR_UNAVAILABLE (names and types still answer). tsdb_volume_idle: waits until no call is inside
  * the volume's engine any more (timeout_ms < 0: no deadline; a call stuck in a hung system call keeps this waiting):
- * 0 idle, 1 not within the time. tsdb_volume_reopen: on a quiesced, idle volume stops the engine's threads, opens
- * the directory again (the WAL is replayed, the lock is kept) and swaps the new engine in, with the volume no longer
- * quiesced; on an error the old engine stays quiesced and the call can be repeated. tsdb_volume_resume ends a
+ * 0 idle, 1 not within the time. tsdb_volume_reopen: on a quiesced, idle volume stops the engine's threads, checks
+ * the storage against its memory (below), opens the directory again (the WAL is replayed, the lock is kept) and swaps
+ * the new engine in, with the volume no longer quiesced unless it is diverged; on an error the old engine stays quiesced and the call can be repeated. tsdb_volume_resume ends a
  * quiesce without a reopen. */
 int tsdb_volume_quiesce(tsdb *db, size_t vol);
 int tsdb_volume_idle(tsdb *db, size_t vol, int timeout_ms);
-int tsdb_volume_reopen(tsdb *db, size_t vol);
+/* What tsdb_volume_reopen found when it compared the memory of the stopped engine with the storage (ha.md 15.5 step 3,
+ * 4): wal_mismatch: the last durable WAL record was not on the storage as written (a rolled-back server), so the
+ * rows memory held (relogged_rows) went into a new segment first; series_repaired, states_repaired: entries of SERIES
+ * and STATES the storage had lost, appended again from memory; lost_parts, lost_part_rows: parts that were listed and
+ * are gone, and not merged into or replaced by others (their rows are lost); diverged: lost_parts != 0, and the new
+ * engine stays quiesced until the caller accepts it with tsdb_volume_resume. */
+typedef struct tsdb_volume_report {
+    int wal_mismatch, diverged;
+    uint64_t relogged_rows, series_repaired, states_repaired, lost_parts, lost_part_rows;
+} tsdb_volume_report;
+int tsdb_volume_reopen(tsdb *db, size_t vol, tsdb_volume_report *report /* may be NULL */);
 int tsdb_volume_resume(tsdb *db, size_t vol);
 void tsdb_set_write_wait_hook(tsdb *db, void (*on_wait)(void *ctx, int delta), void *ctx);
 

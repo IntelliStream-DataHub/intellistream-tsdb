@@ -48,6 +48,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef O_DIRECT /* macOS: no direct reads; a fresh open is what there is */
+#define O_DIRECT 0
+#endif
 
 static int64_t mono_ms(void)
 {
@@ -490,6 +493,8 @@ static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t 
         atomic_fetch_add_explicit(&db->st_wal_syncs, 1, memory_order_relaxed);
     }
     atomic_fetch_add_explicit(&db->st_wal_bytes, len, memory_order_relaxed);
+    db->wal_last_seq = seq, db->wal_last_off = *off, db->wal_last_len = len;
+    memcpy(&db->wal_last_hash, buf + 8, 8);
     *off += len;
     return 0;
 }
@@ -1093,7 +1098,7 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         return TSDB_ERR_IO;
     rewinddir(d); /* the dup shares its offset with dirfd, which an earlier scan moved */
     struct dirent *e;
-    while ((e = readdir(d))) {
+    for (errno = 0; (e = readdir(d)); errno = 0) { /* NULL with errno set is a read error, not the end */
         uint64_t seq;
         int consumed = 0;
         /* exactly what wal_name writes (16 lowercase hex digits): a user's wal_x.log in a volume directory is
@@ -1115,6 +1120,12 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         segs[nseg].seq = seq;
         snprintf(segs[nseg].name, sizeof segs[nseg].name, "%s", e->d_name);
         nseg++;
+    }
+    if (errno != 0) {
+        fprintf(stderr, "tsdb: reading the directory failed: %s: the open fails\n", strerror(errno));
+        closedir(d);
+        free(segs);
+        return TSDB_ERR_IO;
     }
     closedir(d);
     if (nseg)
@@ -1256,4 +1267,168 @@ void wal_close(eng *db)
     free(db->wal_buf);
     free(db->wal_spare);
     db->wal_buf = db->wal_spare = NULL;
+}
+
+/* ------------------------------------------- recovery of a halted engine */
+
+/* Reads [off, off + len) of a file through O_DIRECT where the file system has it (the client's page cache and the
+ * server's cache then cannot answer for what is on disk), else through a fresh open. 0, 1 if the file is shorter,
+ * <0 on an error (nothing about the file is known then). */
+static int read_fresh(int dirfd, const char *name, uint64_t off, size_t len, uint8_t *out)
+{
+    const size_t A = 4096;
+    int fd = openat(dirfd, name, O_RDONLY | O_DIRECT | O_CLOEXEC);
+    bool direct = fd >= 0;
+    if (fd < 0 && errno == EINVAL)
+        fd = openat(dirfd, name, O_RDONLY | O_CLOEXEC); /* tmpfs: the cache is all there is */
+    if (fd < 0)
+        return errno == ENOENT ? 2 : TSDB_ERR_IO;
+    uint64_t from = off & ~(uint64_t)(A - 1);
+    size_t span = (size_t)((off + len - from + A - 1) & ~(uint64_t)(A - 1));
+    void *buf = NULL;
+    int rc = 0;
+    if (posix_memalign(&buf, A, span) != 0) {
+        close(fd);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t got = 0;
+    while (got < span) {
+        ssize_t r = pread(fd, (uint8_t *)buf + got, span - got, (off_t)(from + got));
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r < 0 && errno == EINVAL && direct) { /* O_DIRECT refused at the read: the same through the cache */
+            close(fd);
+            fd = openat(dirfd, name, O_RDONLY | O_CLOEXEC);
+            direct = false;
+            if (fd < 0) {
+                rc = TSDB_ERR_IO;
+                goto out;
+            }
+            got = 0;
+            continue;
+        }
+        if (r < 0) {
+            rc = TSDB_ERR_IO;
+            goto out;
+        }
+        if (r == 0)
+            break;
+        got += (size_t)r;
+    }
+    if (from + got < off + len)
+        rc = 1;
+    else
+        memcpy(out, (uint8_t *)buf + (off - from), len);
+out:
+    free(buf);
+    if (fd >= 0)
+        close(fd);
+    return rc;
+}
+
+/* The last record that was durable (wal_last_*) must be on the storage as the engine wrote it: same bytes, same
+ * place. A server that lost its newest state (a rolled-back pool, an export restored from a snapshot) has a shorter
+ * segment or other bytes there, and every row acknowledged after that point is gone from the log. The engine is
+ * halted: nothing writes. A segment that is gone is fine only if the engine itself removed it. */
+int wal_verify_tail(eng *db, const char *dir)
+{
+    if (!db->wal_enabled || db->wal_last_len == 0)
+        return 0;
+    int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirfd < 0)
+        return TSDB_ERR_IO;
+    char name[64];
+    wal_name(name, sizeof name, db->wal_last_seq);
+    size_t len = (size_t)db->wal_last_len;
+    uint8_t *rec = malloc(len);
+    int rc = rec ? read_fresh(dirfd, name, db->wal_last_off, len, rec) : TSDB_ERR_NOMEM;
+    close(dirfd);
+    if (rc == 2) /* ENOENT */
+        rc = db->wal_last_seq <= atomic_load(&db->wal_removed) ? 0 : 1;
+    else if (rc == 0) {
+        uint32_t n = load32(rec);
+        uint64_t hash;
+        memcpy(&hash, rec + 8, 8);
+        bool ok = len > WAL_HDR && n == (len - WAL_HDR) / WAL_ROW && hash == db->wal_last_hash &&
+                  wal_head_check(n, hash, db->wal_last_seq, db->wal_last_off) == load32(rec + 4) &&
+                  xxh64(rec + WAL_HDR, (size_t)n * WAL_ROW, 0) == hash;
+        rc = ok ? 0 : 1;
+    }
+    free(rec);
+    if (rc == 1)
+        fprintf(stderr, "tsdb: %s: the WAL record at offset %llu of segment %llu is not what was written: "
+                        "the storage lost acknowledged data\n",
+                dir, (unsigned long long)db->wal_last_off, (unsigned long long)db->wal_last_seq);
+    return rc;
+}
+
+/* Writes the rows the halted engine holds in memory (its flushing memtables, oldest first, then the active one;
+ * rows past what was durable only where the WAL is not synced per write: those were not acknowledged) into a new
+ * segment after the last one, on new descriptors, and syncs it and the directory. The open that follows replays it
+ * after every older segment, so a row it holds wins over an older copy and nothing the memory knew is missing.
+ * The failed descriptors are never used: what they report proves nothing (ha.md 15.5 step 4).
+ * A row at timestamp INT64_MAX is not carried (a memtable range is half open). */
+int wal_relog(eng *db, const char *dir, uint64_t *rows_out)
+{
+    *rows_out = 0;
+    if (!db->wal_enabled)
+        return 0;
+    uint64_t visible = db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
+    int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirfd < 0)
+        return TSDB_ERR_IO;
+    char name[64];
+    uint64_t seq = db->wal_seq + 1;
+    wal_name(name, sizeof name, seq);
+    int fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        close(dirfd);
+        return TSDB_ERR_IO;
+    }
+    const size_t CH = 4096; /* rows per record */
+    uint8_t *buf = malloc(WAL_HDR + CH * WAL_ROW);
+    int rc = buf ? 0 : TSDB_ERR_NOMEM;
+    uint64_t off = 0, total = 0;
+    pthread_mutex_lock(&db->lock);
+    pthread_mutex_lock(&db->buf_lock);
+    for (size_t k = 0; rc == 0 && k <= db->nflushing; k++) {
+        memtable *m = k < db->nflushing ? db->flushing[k] : db->active;
+        if (!m || m->rows == 0)
+            continue;
+        int64_t end = m->max_ts == INT64_MAX ? INT64_MAX : m->max_ts + 1;
+        for (uint32_t i = 0; rc == 0 && i < m->nids; i++) {
+            mem_run r;
+            if ((rc = mt_collect(m, m->ids[i], 8, m->min_ts, end, visible, &r)) != 0)
+                break;
+            for (size_t a = 0; rc == 0 && a < r.n;) {
+                size_t n = r.n - a < CH ? r.n - a : CH;
+                uint8_t *p = buf + WAL_HDR;
+                for (size_t j = 0; j < n; j++, p += WAL_ROW) {
+                    uint32_t id = m->ids[i];
+                    uint64_t x = slot_get(r.v, 8, a + j);
+                    memcpy(p, &id, 4);
+                    memcpy(p + 4, &r.ts[a + j], 8);
+                    memcpy(p + 12, &x, 8);
+                }
+                if ((rc = wal_write_record(fd, seq, off, buf, n)) == 0) {
+                    off += WAL_HDR + n * WAL_ROW;
+                    total += n;
+                }
+                a += n;
+            }
+            mem_run_free(&r);
+        }
+    }
+    pthread_mutex_unlock(&db->buf_lock);
+    pthread_mutex_unlock(&db->lock);
+    free(buf);
+    if (rc == 0 && fsync(fd) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && fsync(dirfd) != 0)
+        rc = TSDB_ERR_IO;
+    close(fd);
+    close(dirfd);
+    if (rc == 0)
+        *rows_out = total;
+    return rc;
 }

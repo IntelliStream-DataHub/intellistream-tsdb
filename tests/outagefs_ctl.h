@@ -76,6 +76,11 @@ static inline int outagefs_reexec(char **argv, const char *base, const char *con
     setenv("OUTAGEFS_ROOTS", roots, 1);
     setenv("OUTAGEFS_CTL", ctl, 1);
     setenv("LD_PRELOAD", getenv("OUTAGEFS_LIB") ? getenv("OUTAGEFS_LIB") : "build/liboutagefs.so", 1);
+    /* make asan: the sanitizer runtime is no longer first in the library list once the shim is preloaded */
+    char asan[512];
+    snprintf(asan, sizeof asan, "verify_asan_link_order=0%s%.400s", getenv("ASAN_OPTIONS") ? ":" : "",
+             getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+    setenv("ASAN_OPTIONS", asan, 1);
     execv("/proc/self/exe", argv);
     perror("exec");
     return -1;
