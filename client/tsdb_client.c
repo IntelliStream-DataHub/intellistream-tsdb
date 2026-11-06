@@ -2500,7 +2500,10 @@ static int multi_read(mrun *m, uint32_t id, uint8_t op, uint8_t fields, const ts
         b += 4;
         len -= 4;
         if (ix == TSDB_MULTI_END) {
-            if (len != 4 || open)
+            /* an error END carries the HA body after its u32 answered (tsdb_wire_error_shape) */
+            bool ha = st == TSDB_ERR_MOVED || st == TSDB_ERR_UNAVAILABLE || st == TSDB_ERR_PARTIAL ||
+                      st == TSDB_ERR_DROPPED;
+            if (len < 4 || (len != 4 && !ha) || open)
                 goto corrupt;
             return st ? st : m->stopped ? TSDB_ERR_STOPPED : 0;
         }

@@ -28,6 +28,20 @@ public final class Status {
     /** The server serves a read-only database (or follows another writer). */
     public static final int ERR_READONLY = -9;
     /**
+     * Another node owns the volume (protocol 13). The client follows it within its retry budget
+     * ({@link TsdbClient#setRetry}); see {@link TsdbException#info()}.
+     */
+    public static final int ERR_MOVED = -10;
+    /**
+     * A volume the request needs is not available (protocol 13): a storage outage, for one. Nothing was applied;
+     * the client retries within its budget first. See {@link TsdbException#info()}.
+     */
+    public static final int ERR_UNAVAILABLE = -11;
+    /** A frame spanning volumes was applied in part (protocol 13); {@link TsdbException#info()} says which rows. */
+    public static final int ERR_PARTIAL = -12;
+    /** The rows are older than the volume's drop watermark (protocol 13). */
+    public static final int ERR_DROPPED = -13;
+    /**
      * The user holds no right for this, or the series does not exist (only a user with the right on every series is
      * told {@link #ERR_NOTFOUND}).
      */
@@ -59,6 +73,10 @@ public final class Status {
         case ERR_TOO_MANY_BUCKETS: return "too many buckets";
         case ERR_STOPPED: return "stopped";
         case ERR_READONLY: return "database is read only";
+        case ERR_MOVED: return "volume owned by another node";
+        case ERR_UNAVAILABLE: return "volume unavailable";
+        case ERR_PARTIAL: return "applied in part";
+        case ERR_DROPPED: return "rows older than the drop watermark";
         case ERR_DENIED: return "permission denied";
         case ERR_AUTH: return "login failed or required";
         default: return "unknown error";

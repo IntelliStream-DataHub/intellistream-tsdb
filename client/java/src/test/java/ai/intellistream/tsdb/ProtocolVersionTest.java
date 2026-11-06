@@ -11,7 +11,7 @@ import org.junit.jupiter.api.Test;
 import ai.intellistream.tsdb.CompressionTest.FakeServer;
 
 /**
- * Protocol 12 brought the login, so a server that answers HELLO with a lower version (and its 4-byte reply) cannot
+ * Protocol 12 brought the login (13, the HA bodies, keeps it as the floor), so a server that answers HELLO with a lower version (and its 4-byte reply) cannot
  * be spoken to: the connect fails before any request is sent, and says why.
  */
 class ProtocolVersionTest {
@@ -39,10 +39,17 @@ class ProtocolVersionTest {
     }
 
     @Test
-    void aNewerServerIsAccepted() throws Exception {
-        /* tsdbd answers the lower of both versions, so this is only a server that lies; the client does not mind */
+    void version13IsAccepted() throws Exception {
         try (FakeServer f = new FakeServer(13); TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
             assertEquals(13, c.hello());
+        }
+    }
+
+    @Test
+    void aNewerServerIsAccepted() throws Exception {
+        /* tsdbd answers the lower of both versions, so this is only a server that lies; the client does not mind */
+        try (FakeServer f = new FakeServer(14); TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
+            assertEquals(14, c.hello());
         }
     }
 }

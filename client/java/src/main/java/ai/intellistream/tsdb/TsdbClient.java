@@ -12,6 +12,7 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -99,10 +100,10 @@ public final class TsdbClient implements AutoCloseable {
     private static final Duration KEEPALIVE_INTERVAL = Duration.ofSeconds(10);
     private static final int KEEPALIVE_COUNT = 3;
 
-    private final SocketChannel ch;
+    private SocketChannel ch;                    /* replaced when a MOVED sends the client to another node */
     /* waits for the socket with a timeout; the channel is non-blocking (Selector here is the grant's) */
-    private final java.nio.channels.Selector selector;
-    private final SelectionKey key;
+    private java.nio.channels.Selector selector;
+    private SelectionKey key;
     private long timeoutNanos;                   /* of each wait for the server; 0: forever */
     private final ByteBuffer out = direct(BUF);  /* write mode; empty between requests */
     private ByteBuffer in = direct(BUF).flip();  /* read mode: [position, limit) is received, unread data */
@@ -123,6 +124,48 @@ public final class TsdbClient implements AutoCloseable {
     private boolean noZstd;                      /* zstd-jni could not be loaded: send plain arrays */
     private byte[] raw = new byte[0];            /* the reshaped body of a packed frame */
     private long bytesSent;
+
+    /* protocol 13: retry after UNAVAILABLE and MOVED. Every request frame is kept (copied as it is sent) until its
+     * reply is read, so that a refused one can go again, with the same id. */
+    private static final int KEEP_FRAMES = 1024;
+    private static final int KEEP_BYTES = 128 << 20;
+    private static final Duration DEFAULT_RETRY = Duration.ofSeconds(30);
+    private final ArrayDeque<Kept> kept = new ArrayDeque<>();
+    private long keptBytes;
+    private Kept cur;                            /* the frame being sent; null: not kept */
+    private byte lastOp;
+    private long retryNanos = DEFAULT_RETRY.toNanos(); /* the time budget of one request's retries; 0: no retries */
+    private ErrorInfo err = ErrorInfo.bare(0);   /* the body of the latest UNAVAILABLE, MOVED, PARTIAL or DROPPED */
+    private boolean refused;                     /* an acknowledgement was UNAVAILABLE or MOVED: drain() resends */
+    private int refusedId;
+    private ErrorInfo refusedErr;
+    private ErrorInfo pendingInfo;               /* the body of pendingStatus */
+    private boolean delivered;                   /* a frame of the reply to request deliveredId has been handed on */
+    private int deliveredId;
+    private ConnectOptions opts = ConnectOptions.defaults();
+    private List<String> nodes = List.of();
+    private int nodeAt;
+
+    /** A request frame kept for a resend. */
+    private static final class Kept {
+        final int id;
+        final byte op;
+        byte[] buf = new byte[256];
+        int len;
+
+        Kept(int id, byte op) {
+            this.id = id;
+            this.op = op;
+        }
+
+        void append(ByteBuffer flipped) {
+            int n = flipped.remaining();
+            if (len + n > buf.length)
+                buf = Arrays.copyOf(buf, (int) Math.min(Integer.MAX_VALUE - 8, Math.max((long) len + n, buf.length * 2L)));
+            flipped.duplicate().get(buf, len, n);
+            len += n;
+        }
+    }
 
     private TsdbClient(SocketChannel ch, Duration requestTimeout) throws IOException {
         this.ch = ch;
@@ -279,6 +322,7 @@ public final class TsdbClient implements AutoCloseable {
                     c.hello(); /* before any request: a server older than protocol 12 reads the new frames wrongly */
                     c.login(options, pw);
                     c.setRequestTimeout(options.requestTimeout());
+                    c.opts = options;
                 } catch (TsdbException | RuntimeException e) {
                     closeQuietly(c.ch);
                     closeQuietly(c.selector);
@@ -408,6 +452,145 @@ public final class TsdbClient implements AutoCloseable {
             zstd.close();
         if (err != null)
             throw err;
+    }
+
+    /**
+     * Connects to the first of the nodes {@code "host:port,host:port,..."} that answers (IPv6 as {@code [::1]:7070},
+     * a node without a port is on 7070) and logs in there as {@link #connect(String, int, ConnectOptions)} does. The
+     * list is shuffled once, so a fleet of clients spreads over the nodes. A MOVED without an address, or one whose
+     * address cannot be reached, goes on to the next node of the list.
+     *
+     * @param nodes the nodes, comma separated
+     * @param options the user, password and timeouts
+     * @return the connected client
+     * @throws TsdbException with {@link Status#ERR_INVALID} for an empty list or a node that makes no sense, with
+     *     {@link Status#ERR_AUTH} if the login fails, otherwise the last connect error when no node answers
+     */
+    public static TsdbClient connectNodes(String nodes, ConnectOptions options) throws TsdbException {
+        Objects.requireNonNull(nodes, "nodes");
+        Objects.requireNonNull(options, "options");
+        List<String> list = new ArrayList<>();
+        for (String n : nodes.split(",")) {
+            if (n.isBlank())
+                continue;
+            String a = ErrorInfo.parseNode(n);
+            if (a == null)
+                throw new TsdbException(Status.ERR_INVALID, "\"" + n.trim() + "\" is not a host:port", null);
+            list.add(a);
+        }
+        if (list.isEmpty())
+            throw new TsdbException(Status.ERR_INVALID, "no nodes", null);
+        Collections.shuffle(list);
+        TsdbException last = null;
+        for (int i = 0; i < list.size(); i++) {
+            String a = list.get(i);
+            int colon = a.lastIndexOf(':');
+            String host = a.substring(0, colon);
+            if (host.startsWith("["))
+                host = host.substring(1, host.length() - 1);
+            try {
+                TsdbClient c = connect(host, Integer.parseInt(a.substring(colon + 1)), options);
+                c.nodes = List.copyOf(list);
+                c.nodeAt = i;
+                return c;
+            } catch (TsdbException e) {
+                if (e.status() == Status.ERR_AUTH || e.status() == Status.ERR_INVALID)
+                    throw e;
+                last = e;
+            }
+        }
+        throw last;
+    }
+
+    /**
+     * Connects to the nodes of a connect string with default options; see
+     * {@link #connectNodes(String, ConnectOptions)}.
+     *
+     * @param nodes the nodes, comma separated
+     * @return the connected client
+     * @throws TsdbException as {@link #connectNodes(String, ConnectOptions)}
+     */
+    public static TsdbClient connectNodes(String nodes) throws TsdbException {
+        return connectNodes(nodes, ConnectOptions.defaults());
+    }
+
+    /**
+     * How long one request's retries may take; the default is 30 seconds.
+     *
+     * @return the time budget, zero if retries are off
+     */
+    public Duration retry() {
+        return Duration.ofNanos(retryNanos);
+    }
+
+    /**
+     * Sets the time budget of one request's retries. The server answers UNAVAILABLE when a volume's storage is down
+     * and MOVED when another node owns it: both mean the request was not applied, so the client waits what the reply
+     * asks for ({@code retry_after}), follows a MOVED to the node it names (or the next node of the connect string)
+     * and sends the request again, until the budget is spent; then the call fails with {@link UnavailableException}
+     * or {@link MovedException}. Zero turns retries off: the first refusal is the answer.
+     *
+     * @param budget the time budget; zero for none
+     * @throws IllegalArgumentException if {@code budget} is negative
+     */
+    public void setRetry(Duration budget) {
+        long n = nanos(budget);
+        if (n == 0) {
+            kept.clear();
+            keptBytes = 0;
+            cur = null;
+        }
+        retryNanos = n;
+    }
+
+    /**
+     * The body of the latest UNAVAILABLE, MOVED, PARTIAL or DROPPED reply this client read.
+     *
+     * @return the body; its {@link ErrorInfo#status()} is 0 before any such reply
+     */
+    public ErrorInfo lastError() {
+        return err;
+    }
+
+    /**
+     * The nodes and volumes the server lists (TOPOLOGY, protocol 13). A single server lists itself.
+     *
+     * @return the topology
+     * @throws TsdbException with {@link Status#ERR_INVALID} from a server older than 13
+     */
+    public Topology topology() throws TsdbException {
+        request();
+        begin(Protocol.OP_TOPOLOGY, 0);
+        send();
+        int st = frame();
+        Topology t = null;
+        if (st == 0 && (t = Topology.decode(in.slice(in.position(), bodyLen))) == null)
+            throw lost(Status.ERR_CORRUPT, "TOPOLOGY reply of " + bodyLen + " bytes");
+        endReply();
+        check(st);
+        return t;
+    }
+
+    /**
+     * The server's status as {@code key=value} lines (STATUS, a superuser, protocol 13).
+     *
+     * @return the text
+     * @throws TsdbException with {@link Status#ERR_DENIED} for a user who is no superuser
+     */
+    public String serverStatus() throws TsdbException {
+        request();
+        begin(Protocol.OP_STATUS, 0);
+        send();
+        int st = frame();
+        String text = null;
+        if (st == 0) {
+            byte[] b = new byte[bodyLen];
+            in.get(b);
+            text = new String(b, StandardCharsets.UTF_8);
+        }
+        endReply();
+        check(st);
+        return text;
     }
 
     /**
@@ -753,11 +936,13 @@ public final class TsdbClient implements AutoCloseable {
      */
     public void await() throws TsdbException {
         ready();
-        while (pending > 0)
-            collectOne();
+        drain();
         int st = pendingStatus;
+        ErrorInfo info = pendingInfo;
         pendingStatus = 0;
-        check(st);
+        pendingInfo = null;
+        if (st != 0)
+            throw error(st, info);
     }
 
     /**
@@ -784,8 +969,7 @@ public final class TsdbClient implements AutoCloseable {
         int sent = 0;
         do { /* one frame even for zero rows, as the C client */
             int m = Math.min(n - sent, INSERT_FRAME_ROWS);
-            while (pending >= MAX_IN_FLIGHT)
-                collectOne();
+            room();
             long end = 16 + (long) m * (Long.BYTES + Values.BYTES);
             int pad = many != null ? (int) (-end & 7) : 0;
             begin(Protocol.OP_INSERT, end + pad + (many != null ? (long) m * Long.BYTES : 0));
@@ -802,12 +986,69 @@ public final class TsdbClient implements AutoCloseable {
         } while (sent < n);
     }
 
+    /**
+     * Reads one pipelined acknowledgement. A refused one (UNAVAILABLE, MOVED) that can go again is remembered
+     * ({@link #drain} sends it and everything after it again, in order); any other error status is kept for
+     * {@link #await()}.
+     */
     private void collectOne() throws TsdbException {
-        int st = frame();
+        int id = ackId;
+        int st = frameRaw(Protocol.MAX_FRAME);
         endReply();
         pending--;
-        if (st != 0 && pendingStatus == 0)
+        if (retryable(st) && retryNanos > 0 && findKept(id) != null) {
+            if (!refused) {
+                refused = true;
+                refusedId = id;
+                refusedErr = err;
+            }
+        } else if (st != 0 && pendingStatus == 0) {
             pendingStatus = st;
+            pendingInfo = isHa(st) ? err : null;
+        }
+    }
+
+    /**
+     * Reads every pending acknowledgement; frames the server refused before doing anything are sent again, in order
+     * from the first refused one (also those acknowledged after it: a later frame of the same series must not be
+     * overtaken by the earlier one's resend), after what the refusal says, within the time budget.
+     */
+    private void drain() throws TsdbException {
+        Retry r = new Retry();
+        for (;;) {
+            while (pending > 0)
+                collectOne();
+            if (!refused)
+                break;
+            refused = false;
+            ErrorInfo e = refusedErr;
+            refusedErr = null;
+            if (!retryStep(e, r)) {
+                if (pendingStatus == 0) {
+                    pendingStatus = e.status();
+                    pendingInfo = e;
+                }
+                break;
+            }
+            ackId = refusedId;
+            boolean from = false;
+            for (Kept k : kept) {
+                from |= k.id == refusedId;
+                if (from) {
+                    resend(k);
+                    pending++;
+                }
+            }
+        }
+        trim();
+    }
+
+    /** Before a frame is added to a window of pipelined inserts: collects while the window is full. */
+    private void room() throws TsdbException {
+        while (pending >= MAX_IN_FLIGHT)
+            collectOne();
+        if (retryNanos > 0 && pending > 0 && (kept.size() >= KEEP_FRAMES || keptBytes >= KEEP_BYTES))
+            drain();
     }
 
     // ----------------------------------------------------------------- queries
@@ -943,7 +1184,7 @@ public final class TsdbClient implements AutoCloseable {
             int st = frame();
             if (bodyLen == 0 && st != 0) { /* refused before streaming: a bare status */
                 endReply();
-                throw new TsdbException(st);
+                throw error(st);
             }
             int n = bodyLen >= 5 ? in.getInt(in.position() + 1) : -1;
             if (n < 0 || bodyLen != 5 + (long) n * (Long.BYTES + Values.BYTES))
@@ -1181,7 +1422,7 @@ public final class TsdbClient implements AutoCloseable {
         int st = frame();
         if (st != 0) {
             endReply();
-            throw new TsdbException(st);
+            throw error(st);
         }
         int n = bodyLen >= 4 ? in.getInt() : -1;
         if (n < 0 || bodyLen != 4 + (long) n * Protocol.BUCKET_ROW)
@@ -1203,7 +1444,7 @@ public final class TsdbClient implements AutoCloseable {
         int st = frame();
         if (st != 0) {
             endReply();
-            throw new TsdbException(st);
+            throw error(st);
         }
         int n = bodyLen >= 4 ? in.getInt() : -1;
         if (n < 0 || bodyLen != 4 + (long) n * Protocol.SPREAD_ROW)
@@ -1387,7 +1628,7 @@ public final class TsdbClient implements AutoCloseable {
         int st = frame();
         if (st != 0) {
             endReply();
-            throw new TsdbException(st);
+            throw error(st);
         }
         int n = bodyLen >= 4 ? in.getInt() : -1;
         if (n < 0 || bodyLen != 4 + (long) n * Protocol.TWA_ROW)
@@ -1733,8 +1974,7 @@ public final class TsdbClient implements AutoCloseable {
         if (n > 0 && packing()) {
             for (int sent = 0; sent < n;) {
                 int m = Math.min(n - sent, INSERT_FRAME_ROWS);
-                while (pending >= MAX_IN_FLIGHT)
-                    collectOne();
+                room();
                 sendPacked(one, many, ts, col, off + sent, m);
                 pending++;
                 sent += m;
@@ -1749,8 +1989,7 @@ public final class TsdbClient implements AutoCloseable {
             long end = Protocol.VALUES_HEADER + (long) m * (Long.BYTES + type.width)
                     + (valid != null ? valid.length : 0);
             int pad = many != null ? (int) (-end & 7) : 0;
-            while (pending >= MAX_IN_FLIGHT)
-                collectOne();
+            room();
             begin(Protocol.OP_INSERT_VALUES, end + pad + (many != null ? (long) m * Long.BYTES : 0));
             out.putInt(m).put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0)
                     .putLong(one);
@@ -1962,7 +2201,7 @@ public final class TsdbClient implements AutoCloseable {
             int st = frame();
             if (bodyLen == 0 && st != 0) { /* not produced by tsdbd today, but cheap to accept */
                 endReply();
-                throw new TsdbException(st);
+                throw error(st);
             }
             int p = in.position();
             ValueType type = bodyLen >= 8 ? ValueType.of(in.get(p + 1)) : null;
@@ -2607,7 +2846,7 @@ public final class TsdbClient implements AutoCloseable {
                 }
                 if (stopped && st == Status.ERR_STOPPED)
                     return true;
-                throw new TsdbException(st);
+                throw error(st);
             }
             if (ix != next || ix >= n)
                 throw lost(Status.ERR_CORRUPT, "QUERY_MULTI series " + Integer.toUnsignedString(ix) + " out of order"
@@ -2910,7 +3149,7 @@ public final class TsdbClient implements AutoCloseable {
             int st = frame();
             if (st != 0) {
                 endReply();
-                throw new TsdbException(st);
+                throw error(st);
             }
             if (bodyLen < 5)
                 throw lost(Status.ERR_CORRUPT, "USER_LIST chunk of " + bodyLen + " bytes");
@@ -3129,9 +3368,35 @@ public final class TsdbClient implements AutoCloseable {
         return ByteBuffer.allocateDirect(n).order(ByteOrder.LITTLE_ENDIAN);
     }
 
-    private static void check(int status) throws TsdbException {
+    private void check(int status) throws TsdbException {
         if (status != 0)
-            throw new TsdbException(status);
+            throw error(status);
+    }
+
+    /** The exception for a status: with the body the server sent for UNAVAILABLE, MOVED, PARTIAL and DROPPED. */
+    private TsdbException error(int status) {
+        return error(status, err);
+    }
+
+    private static TsdbException error(int status, ErrorInfo info) {
+        if (info == null || info.status() != status)
+            info = ErrorInfo.bare(status);
+        switch (status) {
+        case Status.ERR_UNAVAILABLE: return new UnavailableException(info);
+        case Status.ERR_MOVED: return new MovedException(info);
+        case Status.ERR_PARTIAL: return new PartialException(info);
+        case Status.ERR_DROPPED: return new DroppedException(info);
+        default: return new TsdbException(status);
+        }
+    }
+
+    private static boolean isHa(int status) {
+        return status <= Status.ERR_MOVED && status >= Status.ERR_DROPPED;
+    }
+
+    /** Statuses that mean "not applied, ask again" (and, for MOVED, elsewhere). */
+    private static boolean retryable(int status) {
+        return status == Status.ERR_UNAVAILABLE || status == Status.ERR_MOVED;
     }
 
     private static void closeQuietly(java.io.Closeable ch) {
@@ -3172,7 +3437,43 @@ public final class TsdbClient implements AutoCloseable {
     private void begin(byte op, long payload) {
         if (payload > Protocol.MAX_FRAME - 5)
             throw new IllegalArgumentException("request of " + payload + " bytes exceeds the frame limit");
+        lastOp = op;
+        if (retryNanos > 0 && retained(op)) {
+            trim();
+            cur = new Kept(nextId, op);
+            kept.add(cur);
+        } else {
+            cur = null;
+        }
         out.putInt((int) (5 + payload)).putInt(nextId++).put(op);
+    }
+
+    /** Requests that are sent again after a refusal: not the handshake, the login, QUERY_MULTI (its replies are
+     * delivered as they come) or CANCEL. */
+    private static boolean retained(byte op) {
+        return op != Protocol.OP_HELLO && op != Protocol.OP_AUTH_START && op != Protocol.OP_AUTH_CONTINUE
+                && op != Protocol.OP_QUERY_MULTI && op != Protocol.OP_CANCEL;
+    }
+
+    /** Drops the kept frames of requests whose reply has been read. */
+    private void trim() {
+        for (Kept k; (k = kept.peekFirst()) != null;) {
+            /* a refused insert stays, with everything after it, until drain() has sent it again */
+            if (k.id - ackId >= 0 || (refused && refusedId == k.id))
+                break;
+            kept.removeFirst();
+            keptBytes -= k.len;
+        }
+        if (kept.isEmpty())
+            keptBytes = 0;
+    }
+
+    private Kept findKept(int id) {
+        for (Kept k : kept) {
+            if (k.id == id)
+                return k;
+        }
+        return null;
     }
 
     /**
@@ -3207,6 +3508,10 @@ public final class TsdbClient implements AutoCloseable {
     /** Writes the send buffer out, completely. */
     private void send() throws TsdbException {
         out.flip();
+        if (cur != null) {
+            cur.append(out);
+            keptBytes += out.remaining();
+        }
         try {
             while (out.hasRemaining()) {
                 int w = ch.write(out);
@@ -3354,6 +3659,31 @@ public final class TsdbClient implements AutoCloseable {
 
     /** Reads the header of the next reply frame, of at most {@code max} bytes (a QUERY_MULTI frame: 4 more). */
     private int frame(int max) throws TsdbException {
+        Retry r = new Retry();
+        for (;;) {
+            int st = frameRaw(max);
+            /* a request the server refused before doing anything is sent again, after what the reply says, while
+             * it is the only one in flight and no frame of its reply has been handed on */
+            if (!retryable(st) || retryNanos <= 0 || nextId - ackId != 1 || (delivered && deliveredId == ackId)) {
+                delivered = true;
+                deliveredId = ackId;
+                return st;
+            }
+            Kept k = findKept(ackId);
+            if (k == null || !retryStep(err, r)) {
+                delivered = true;
+                deliveredId = ackId;
+                return st;
+            }
+            /* a MOVED went to another connection, whose buffer is empty; an UNAVAILABLE's body is still here */
+            if (st == Status.ERR_UNAVAILABLE)
+                in.position(bodyEnd);
+            resend(k);
+        }
+    }
+
+    /** Reads the header of the next reply frame of at most {@code max} bytes; no retry. */
+    private int frameRaw(int max) throws TsdbException {
         fill(Protocol.REPLY_HEADER);
         int len = in.getInt(), id = in.getInt();
         byte op = in.get();
@@ -3366,7 +3696,127 @@ public final class TsdbClient implements AutoCloseable {
         bodyLen = len - 9;
         fill(bodyLen);
         bodyEnd = in.position() + bodyLen;
+        if (isHa(status)) {
+            /* the body after the op's own error reply goes to err and is cut from the reply: a streamed op's reader
+             * sees the empty chunk it expects */
+            Kept k = findKept(id);
+            byte rop = k != null ? k.op : lastOp;
+            err = ErrorInfo.of(status, in.slice(in.position(), bodyLen), rop);
+            int shape = ErrorInfo.shape(rop);
+            if (shape > 0 && bodyLen >= shape
+                    && (rop != Protocol.OP_QUERY_MULTI || in.getInt(in.position()) == Protocol.MULTI_END))
+                bodyLen = shape;
+        }
         return status;
+    }
+
+    /** What one request's retries have used so far. */
+    private static final class Retry {
+        long deadline;
+        boolean started;
+        int tries;
+    }
+
+    /**
+     * One step of retrying a request whose reply was UNAVAILABLE or MOVED ({@code e} describes it): waits what the
+     * reply asks for and follows a MOVED. True: send the request again; false: give up, the status stands (the
+     * budget would be over, or a MOVED with nowhere to go).
+     */
+    private boolean retryStep(ErrorInfo e, Retry r) {
+        if (retryNanos <= 0)
+            return false;
+        long now = System.nanoTime();
+        if (!r.started) {
+            r.deadline = now + retryNanos;
+            r.started = true;
+        }
+        boolean moved = e.status() == Status.ERR_MOVED;
+        long delay;
+        if (moved)
+            delay = !e.moved().isEmpty() && (e.moved().get(0).flags() & ErrorInfo.MOVED_HANDOFF) != 0 ? 200 : 0;
+        else if (!e.hasBody() || e.unavailable().isEmpty())
+            delay = 1000; /* a server without the body (protocol 12) */
+        else
+            delay = Math.max(1, Math.min(60_000, e.retryAfterMs()));
+        if (moved && r.tries > 0)
+            delay = Math.max(delay, Math.min(50L * r.tries, 1000)); /* a MOVED that keeps coming: not a tight loop */
+        if (r.deadline - now < delay * 1_000_000L)
+            return false;
+        try {
+            if (delay > 0)
+                Thread.sleep(delay);
+        } catch (InterruptedException x) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        r.tries++;
+        return !moved || followMoved(e);
+    }
+
+    /** After MOVED: to the address it names, else to another node of the connect string. */
+    private boolean followMoved(ErrorInfo e) {
+        for (ErrorInfo.Moved m : e.moved()) {
+            String a = m.addr().isEmpty() ? null : ErrorInfo.parseNode(m.addr());
+            if (a != null && reconnectTo(a))
+                return true;
+        }
+        for (int k = 1; k < nodes.size(); k++) {
+            int i = (nodeAt + k) % nodes.size();
+            if (reconnectTo(nodes.get(i))) {
+                nodeAt = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Moves the connection to {@code hostPort}: connects, says HELLO and logs in there (with its own request ids; the
+     * kept frames stay kept, the caller sends them again). On failure the old connection is as it was.
+     */
+    private boolean reconnectTo(String hostPort) {
+        int colon = hostPort.lastIndexOf(':');
+        String host = hostPort.substring(0, colon);
+        if (host.startsWith("["))
+            host = host.substring(1, host.length() - 1);
+        byte[] pw = null;
+        TsdbClient t;
+        try {
+            pw = opts.user() != null ? opts.passwordBytes() : null;
+            Duration handshake = opts.connectTimeout().isZero() ? opts.requestTimeout() : opts.connectTimeout();
+            t = connectEach(host, Integer.parseInt(hostPort.substring(colon + 1)), millis(opts.connectTimeout()),
+                    handshake, opts, pw);
+        } catch (IOException | RuntimeException x) {
+            return false;
+        } finally {
+            if (pw != null)
+                Arrays.fill(pw, (byte) 0);
+        }
+        SocketChannel oldCh = ch;
+        java.nio.channels.Selector oldSel = selector;
+        ch = t.ch;
+        selector = t.selector;
+        key = t.key;
+        t.closed = true; /* its channel is ours now */
+        in = direct(BUF).flip();
+        serverVersion = t.serverVersion;
+        loginRequired = t.loginRequired;
+        scram = t.scram;
+        closeQuietly(oldCh);
+        closeQuietly(oldSel);
+        return true;
+    }
+
+    /** Sends a kept frame again (same id). */
+    private void resend(Kept k) throws TsdbException {
+        Kept saved = cur;
+        cur = null; /* it is kept already */
+        try {
+            putBytes(k.buf, k.len);
+            send();
+        } finally {
+            cur = saved;
+        }
     }
 
     /** Finishes the last reply frame of a request. */
