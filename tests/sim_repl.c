@@ -7,7 +7,10 @@
  * linearizable record of the volume, failure detection by heartbeats, promotion by FENCE and the core's
  * repl_meta_promote(), ISR changes by repl_meta_isr_change(). Faults: crashes (with quick restarts, so a leader
  * comes back before anyone noticed), wiped disks (a new replica instance), partitions, pauses (a leader that
- * resumes after it was deposed), leadership moves. Clients write to whoever thinks it leads.
+ * resumes after it was deposed), leadership moves. Clients write to whoever thinks it leads. Per run, at random: the
+ * metadata group fences every replica rather than the ISR; the driver reports the end a SYNC was issued for rather
+ * than what is durable now (wrong after a cut; the core must not believe it); slow syncs (up to 30 ticks, so they span
+ * cuts); replicas trim their logs at the saved floor, so a lagging one gets a snapshot from its leader.
  *
  * The checker (after every event, incrementally):
  *  1. Every position any replica applies is the same record everywhere (applied logs are prefixes of one history),
@@ -19,7 +22,13 @@
  *  3. No two replicas acknowledge in one epoch.
  *  4. A cut never removes a committed record, nor goes below what the replica applied; the core never fails.
  *  5. At the end every fault heals: a leader must take a write, every replica must rejoin the ISR, and every log must
- *     equal the leader's (a returning replica cut its divergent tail), applied to its end.
+ *     equal the leader's (a returning replica cut its divergent tail), applied to its end. A run may instead end
+ *     waiting for an operator (every ISR disk lost) only after a leader's shrink of the ISR (D1), or when no replica
+ *     holds every acknowledged write: a promotion never strands the volume while one does (A2).
+ *  6. A replica sends in its saved fence's epoch only, and answers a fence only once it saved it (§6.2/§6.3).
+ *  7. An acknowledged write is durable on at least min_isr replicas when the writer hears OK.
+ *  8. Then every replica but the leader goes down for good: at min ISR 1 a write is still acknowledged (the lag
+ *     rule shrinks the ISR to the leader, A2); at a higher min ISR it is not.
  *
  * `sim_repl --seeds N [--first S] [--ticks T]`; a failure prints the seed, `--seed S --trace` replays it. Built with
  * -DREPL_MUTANTS (build/sim_repl_mut), `--mutant M` plants bug M of repl.c and runs seeds until the checker
@@ -50,13 +59,16 @@ struct srec {
 struct node {
     struct repl *r;           /* NULL while down */
     struct repl_config cfg;
-    uint64_t down_until, pause_until;
+    uint64_t down_until, pause_until, wiped_at;
     struct srec *log;
     size_t n, cap, ndur;      /* records; the first ndur are durable */
     uint64_t wseq;
     uint64_t rid, fence, led, floor;   /* the REPL file */
     int sync_busy;
-    uint64_t sync_at, sync_wseq;
+    uint64_t sync_at, sync_wseq, sync_target;
+    uint64_t start;           /* first retained position: the records below went into "parts" (still in log[]) */
+    int snap_src;             /* a snapshot from this node is due at snap_at (0: none asked) */
+    uint64_t snap_at;
     uint64_t applied, last_epoch;
     size_t *pend;             /* indexes into ops of writes waiting for their reply */
     size_t npend, cpend;
@@ -72,14 +84,19 @@ struct smsg {
 enum { OP_PENDING, OP_OK, OP_UNKNOWN };
 
 struct op {
-    uint64_t id, pos;
+    uint64_t id, pos, at;
     uint32_t n;
     int node, status;
 };
 
 static struct sim {
     uint64_t seed, now, rng;
-    int nn, trace, chaos, writes;
+    int nn, trace, chaos, writes, min_isr;
+    /* Per run: the metadata group fences every replica, not only the ISR (both legal); the driver reports the end a
+     * SYNC was issued for, not what is durable now after a cut (a driver the core must survive); replicas trim their
+     * logs below the floor (segments into parts), so a lagging one needs a snapshot. */
+    int fence_all, naive_sync, trim;
+    int shrunk;               /* the metadata's ISR last changed by a leader's shrink, not by a promotion (D1) */
     struct node node[NM];
     struct smsg *q;
     size_t nq, cq;
@@ -113,7 +130,8 @@ static struct sim {
     char why[512];
     struct {
         uint64_t acked, refused, unknown, promotions, stale, none, resigns, cuts, isr, crashes, wipes, parts, pauses,
-            moves, msgs, applied, waits;
+            moves, msgs, applied, waits, refuses, xcuts, ack_isr1, ack_isrn, wiped_acked, wipe_leader,
+            fence_rep_out, deg_runs, deg_ok, trims, snaps, lies;
     } st, tot;
 } S;
 
@@ -217,6 +235,8 @@ static uint64_t dur_end(const struct node *nd)
 static int rec_find(void *ctx, uint64_t pos, uint64_t *start, uint32_t *n)
 {
     const struct node *nd = ctx;
+    if (pos < nd->start)
+        return 1;
     long i = log_find(nd, pos);
     if (i < 0)
         return -1;
@@ -327,6 +347,21 @@ static int addr(int x)
 static void send_from(int i, const struct repl_action *a)
 {
     const struct node *nd = &S.node[i];
+    int t = a->msg.type;
+    if (t == REPL_M_REFUSE)
+        S.st.refuses++;
+    /* Check 6 (§6.2/§6.3): a replica saves a higher epoch as its fence (durably) before it acts on it, and never
+     * acts in an epoch below its saved fence. Without it a crash right after the raise forgets the fence. */
+    if ((t == REPL_M_APPEND || t == REPL_M_ACK || t == REPL_M_QUERY || t == REPL_M_ANSWER ||
+         t == REPL_M_SNAPSHOT) && a->msg.epoch != nd->fence)
+        violation("node %d sends type %d in epoch %" PRIu64 ", its saved fence is %" PRIu64, i, t, a->msg.epoch,
+                  nd->fence);
+    if ((t == REPL_M_FENCE_REPLY || t == REPL_M_RESIGN) && a->msg.epoch > nd->fence)
+        violation("node %d answers fence %" PRIu64 " before saving it (saved %" PRIu64 ")", i, a->msg.epoch,
+                  nd->fence);
+    if (t == REPL_M_APPEND && a->upto > a->msg.prev_pos && a->msg.prev_pos + 1 < nd->start)
+        violation("node %d sends from %" PRIu64 ", below its log start %" PRIu64, i, a->msg.prev_pos + 1,
+                  nd->start);
     struct smsg m = {.m = a->msg};
     m.m.rec = NULL;
     m.m.nrec = 0;
@@ -401,6 +436,23 @@ static void reply(int i, const struct repl_action *a)
                           o->id, p, i);
             else
                 S.cacked[p] = 1;
+        if (popcount32(S.vm.isr) > 1)
+            S.st.ack_isrn++;
+        else
+            S.st.ack_isr1++;
+        /* Check 7 (min ISR): an acknowledged write is durable on at least min_isr replicas. A disk lost since the
+         * write may have held a copy when the leader counted it (its ACK was in flight): it counts. */
+        for (uint64_t p = o->pos; p <= a->pos && !S.bad; p++) {
+            int copies = 0;
+            for (int j = 0; j < S.nn; j++) {
+                long k = log_find(&S.node[j], p);
+                copies += (k >= 0 && (size_t)k < S.node[j].ndur && S.node[j].log[k].id == o->id) ||
+                          (S.node[j].wiped_at && S.node[j].wiped_at >= o->at);
+            }
+            if (copies < S.min_isr)
+                violation("write %" PRIu64 " acknowledged at %" PRIu64 " with %d durable copies, min ISR %d", o->id,
+                          p, copies, S.min_isr);
+        }
         uint64_t e = repl_epoch(nd->r);
         S.acker = grow(S.acker, &S.cacker, e + 1, sizeof *S.acker);
         if (S.acker[e] && S.acker[e] != i + 1)
@@ -446,6 +498,7 @@ static void drive(int i, const struct smsg *cur)
                 nd->sync_busy = 1;
                 nd->sync_at = S.now + 1 + rn(S.maxsync);
                 nd->sync_wseq = nd->wseq;
+                nd->sync_target = log_end(nd);
             }
             break;
         case REPL_A_TRUNCATE: {
@@ -466,6 +519,8 @@ static void drive(int i, const struct smsg *cur)
             uint64_t e = repl_epoch(nd->r);
             for (size_t j = keep; j < nd->n; j++) {
                 uint64_t p = nd->log[j].pos;
+                if (p <= S.cmax && S.committed[p] == nd->log[j].id && !(S.cacked[p] || S.cepoch[p] <= e))
+                    S.st.xcuts++;
                 if (p <= S.cmax && S.committed[p] == nd->log[j].id && (S.cacked[p] || S.cepoch[p] <= e))
                     violation("node %d (epoch %" PRIu64 ") cuts %s record %" PRIu64 " at %" PRIu64
                               " (committed by epoch %" PRIu64 ")", i, e, S.cacked[p] ? "acknowledged" : "committed",
@@ -475,6 +530,9 @@ static void drive(int i, const struct smsg *cur)
             nd->n = keep;
             if (nd->ndur > keep)
                 nd->ndur = keep;
+            /* The excuse above holds only outside the current ISR: an intact member keeps every committed record. */
+            if (intact(i))
+                check_node(i, 1, S.cmax);
             break;
         }
         case REPL_A_SAVE:
@@ -501,6 +559,17 @@ static void drive(int i, const struct smsg *cur)
         case REPL_A_FAIL:
             violation("node %d: the core failed: %s", i, a.reason);
             return;
+        case REPL_A_SNAPSHOT:
+            if (a.pos >= (uint64_t)S.nn || (int)a.pos == i) {
+                violation("node %d asks for a snapshot from node %" PRIu64, i, a.pos);
+                return;
+            }
+            if (!nd->snap_src) { /* a repeat while a copy is in progress is ignored */
+                nd->snap_src = (int)a.pos + 1;
+                nd->snap_at = S.now + 1 + rn(10);
+            }
+            trace("node %d: snapshot from node %" PRIu64 " asked", i, a.pos);
+            break;
         }
         if (S.bad)
             return;
@@ -514,6 +583,8 @@ static void drive(int i, const struct smsg *cur)
         violation("node %d went back from epoch %" PRIu64 " to %" PRIu64, i, nd->last_epoch, repl_epoch(nd->r));
     nd->last_epoch = repl_epoch(nd->r);
 }
+
+static int alive(int i);
 
 static void node_open(int i)
 {
@@ -530,7 +601,7 @@ static void node_open(int i)
             h[nh++] = (struct repl_epoch){.epoch = nd->log[k].epoch, .start = nd->log[k].pos};
     }
     struct repl_durable d = {.rid = nd->rid, .fence = nd->fence, .led = nd->led, .floor = nd->floor,
-                             .log_end = log_end(nd), .hist = h, .nhist = nh};
+                             .log_start = nd->start, .log_end = log_end(nd), .hist = h, .nhist = nh};
     nd->r = repl_open(&nd->cfg, &d);
     free(h);
     if (!nd->r) {
@@ -554,6 +625,7 @@ static void node_crash(int i, int wipe)
         nd->r = NULL;
     }
     nd->sync_busy = 0;
+    nd->snap_src = 0;
     size_t keep = nd->ndur + rn((uint32_t)(nd->n - nd->ndur + 1));
     nd->n = nd->ndur = keep;
     for (size_t k = 0; k < nd->npend; k++) {
@@ -562,7 +634,15 @@ static void node_crash(int i, int wipe)
     }
     nd->npend = 0;
     if (wipe) {
+        for (size_t k = 0; k < nd->n; k++)
+            for (uint64_t p = nd->log[k].pos; p < nd->log[k].pos + nd->log[k].n; p++)
+                if (p <= S.cmax && S.cacked[p] && S.committed[p] == nd->log[k].id)
+                    S.st.wiped_acked++;
+        if (S.vm.leader == i)
+            S.st.wipe_leader++;
         nd->n = nd->ndur = 0;
+        nd->start = 0;
+        nd->wiped_at = S.now;
         nd->rid = ++S.next_rid;
         nd->fence = nd->led = nd->floor = 0;
         S.st.wipes++;
@@ -573,6 +653,46 @@ static void node_crash(int i, int wipe)
     }
     nd->down_until = S.now + 5 + rn(80);
     trace("node %d: %s, log end now %" PRIu64, i, wipe ? "WIPED" : "crash", log_end(nd));
+}
+
+/* A replica whose next record its leader no longer retains copies the source's applied state P (its parts: the
+ * committed records up to P) and reopens on it with log start P + 1. The driver installs only a snapshot that covers
+ * its whole log and more (P above its log end), and only from a source it reaches (the source may have restarted or
+ * lost its disk since it asked: then P is low and nothing is installed). */
+static void node_snapshot(int i)
+{
+    struct node *nd = &S.node[i];
+    int s = nd->snap_src - 1;
+    nd->snap_src = 0;
+    const struct node *src = &S.node[s];
+    if (!src->r || !alive(s) || link_down(s, i) || link_down(i, s) || src->applied <= log_end(nd))
+        return; /* the leader tells it again */
+    uint64_t p = src->applied;
+    size_t k = 0;
+    while (k < src->n && src->log[k].pos + src->log[k].n - 1 <= p)
+        k++;
+    if (!k || src->log[k - 1].pos + src->log[k - 1].n - 1 != p) {
+        violation("node %d's applied end %" PRIu64 " is not a record end of its log", s, p);
+        return;
+    }
+    repl_free(nd->r);
+    nd->r = NULL;
+    for (size_t j = 0; j < nd->npend; j++) {
+        S.ops[nd->pend[j]].status = OP_UNKNOWN;
+        S.st.unknown++;
+    }
+    nd->npend = 0;
+    nd->log = grow(nd->log, &nd->cap, k + 1, sizeof *nd->log);
+    memcpy(nd->log, src->log, k * sizeof *nd->log);
+    nd->n = nd->ndur = k;
+    for (size_t j = 0; j < k; j++)
+        nd->log[j].wseq = 0;
+    nd->wseq = 0;
+    nd->start = p + 1;
+    nd->floor = p;
+    S.st.snaps++;
+    trace("node %d: snapshot from node %d at %" PRIu64, i, s, p);
+    node_open(i);
 }
 
 /* ------------------------------------------------------------------ the metadata group */
@@ -589,7 +709,7 @@ static void fo_begin(const char *why)
     S.nrep = 0;
     trace("meta: failover of epoch %" PRIu64 " (%s), fencing isr %#x", S.vm.epoch, why, S.vm.isr);
     for (int i = 0; i < S.nn; i++)
-        if (S.fo_fenced & (1u << i))
+        if ((S.fo_fenced & (1u << i)) || S.fence_all)
             meta_send(i, REPL_M_FENCE, S.fo_epoch + 1);
 }
 
@@ -614,6 +734,7 @@ static void meta_tick(void)
     int rc = repl_meta_promote(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep);
     if (rc == REPL_OK) {
         S.fo = 0;
+        S.shrunk = 0;
         S.st.promotions++;
         S.last_hb[S.vm.leader] = S.now;
         trace("meta: epoch %" PRIu64 " leader %d isr %#x", S.vm.epoch, S.vm.leader, S.vm.isr);
@@ -629,7 +750,7 @@ static void meta_tick(void)
         S.nrep = 0;
         S.fo_start = S.now;
         for (int i = 0; i < S.nn; i++)
-            if (S.fo_fenced & (1u << i))
+            if ((S.fo_fenced & (1u << i)) || S.fence_all)
                 meta_send(i, REPL_M_FENCE, S.fo_epoch + 1);
     }
 }
@@ -645,6 +766,8 @@ static void meta_recv(const struct repl_msg *m)
     case REPL_M_FENCE_REPLY:
         if (!S.fo || m->epoch != S.fo_epoch + 1)
             break;
+        if (!(S.fo_fenced & (1u << m->from)))
+            S.st.fence_rep_out++;
         for (int k = 0; k < S.nrep; k++)
             if (S.rep[k].node == m->from) {
                 S.rep[k] = S.rep[--S.nrep];
@@ -659,6 +782,7 @@ static void meta_recv(const struct repl_msg *m)
         memcpy(oldrid, S.vm.rid, sizeof oldrid);
         if (repl_meta_isr_change(&S.vm, &m->meta) == REPL_OK) {
             S.st.isr++;
+            S.shrunk = (old & ~S.vm.isr) != 0;
             trace("meta: isr %#x -> %#x (epoch %" PRIu64 ", by %d)", old, S.vm.isr, S.vm.epoch, m->from);
             meta_isr_changed(old, oldrid);
         }
@@ -711,7 +835,7 @@ static void client_write(void)
     struct node *nd = &S.node[i];
     S.ops = grow(S.ops, &S.cops, S.nops + 1, sizeof *S.ops);
     struct op *o = &S.ops[S.nops];
-    *o = (struct op){.id = S.nops + 1, .n = 1 + rn(4), .node = i, .status = OP_PENDING};
+    *o = (struct op){.id = S.nops + 1, .n = 1 + rn(4), .node = i, .status = OP_PENDING, .at = S.now};
     S.cur_op = o->id;
     if (repl_write(nd->r, o->n, &o->pos) != REPL_OK) {
         S.st.refused++;
@@ -841,8 +965,21 @@ static void step(void)
             if (lo > n->ndur)
                 n->ndur = lo;
             n->sync_busy = 0;
-            repl_synced(n->r, dur_end(n));
+            /* A naive driver reports the end it issued the sync for: more than is durable when the log was cut and
+             * written again meanwhile (the core must not believe it). */
+            if (n->sync_target > dur_end(n))
+                S.st.lies++;
+            repl_synced(n->r, S.naive_sync ? n->sync_target : dur_end(n));
             drive(i, NULL);
+        }
+        if (n->snap_src && n->snap_at <= S.now) {
+            node_snapshot(i);
+            if (S.bad || !n->r)
+                continue;
+        }
+        if (S.trim && chance(50) && n->floor + 1 > n->start && n->floor <= dur_end(n)) {
+            n->start = n->floor + 1; /* segments at or below the saved floor went into parts and are deleted */
+            S.st.trims++;
         }
         repl_tick(n->r);
         drive(i, NULL);
@@ -929,6 +1066,7 @@ static int run(uint64_t seed, uint64_t ticks)
     uint32_t k = rn(100);
     S.nn = k < 70 ? 3 : k < 88 ? 4 : 5;
     int min_isr = chance(200) ? 2 : 1;
+    S.min_isr = min_isr;
     S.loss = rn(60);
     S.dup = rn(40);
     S.maxdelay = 1 + rn(6);
@@ -936,6 +1074,11 @@ static int run(uint64_t seed, uint64_t ticks)
     S.nemesis = 5 + rn(30);
     S.wrate = 100 + rn(600);
     uint32_t batch = 1 + rn(16);
+    S.fence_all = chance(500);
+    S.naive_sync = chance(300);
+    S.trim = chance(500);
+    if (chance(200))
+        S.maxsync = 1 + rn(30); /* a slow fdatasync against a fast round trip: syncs span cuts */
     S.vm = (struct repl_vmeta){.epoch = 1, .isr_version = 1, .leader = 0, .isr = (1u << S.nn) - 1};
     for (int i = 0; i < S.nn; i++) {
         struct node *nd = &S.node[i];
@@ -943,7 +1086,7 @@ static int run(uint64_t seed, uint64_t ticks)
         S.vm.rid[i] = nd->rid;
         nd->cfg = (struct repl_config){.self = i, .nnodes = S.nn, .min_isr = min_isr, .isr_lag_ticks = 30,
                                        .resend_ticks = 10, .heartbeat_ticks = 3, .floor_ticks = 20,
-                                       .max_batch = batch, .window = 32 * batch, .rec_find = rec_find, .ctx = nd};
+                                       .unanswered_ticks = 20, .max_batch = batch, .window = 32 * batch, .rec_find = rec_find, .ctx = nd};
         node_open(i);
     }
     meta_broadcast();
@@ -996,7 +1139,29 @@ static int run(uint64_t seed, uint64_t ticks)
         any |= intact(i);
     if (!S.bad && phase != 3 && !any && S.st.wipes) {
         /* Every ISR member the metadata names lost its disk: the volume waits for an operator (§6.2, no unclean
-         * election). With min ISR 1 that follows from one wipe after the leader shrank the ISR to itself (D1). */
+         * election). With min ISR 1 that follows from one wipe after the leader shrank the ISR to itself (D1): the
+         * leader's shrink, applied by the metadata group before or just after the loss, is the only excuse. A wait
+         * after a promotion while a replica still holds every acknowledged write is a liveness failure (A2: the
+         * promotion dropped a member it could have kept; seed 76 before the old leader stayed in the ISR). */
+        int holder = -1;
+        for (int i = 0; i < S.nn && holder < 0 && S.st.acked; i++) {
+            int all = 1;
+            for (size_t j = 0; j < S.nops && all; j++) {
+                const struct op *o = &S.ops[j];
+                long r = log_find(&S.node[i], o->pos);
+                if (o->status == OP_OK && (r < 0 || (size_t)r >= S.node[i].ndur || S.node[i].log[r].id != o->id))
+                    all = 0;
+            }
+            if (all)
+                holder = i;
+        }
+        if (holder >= 0 && !S.shrunk) {
+            violation("liveness: the volume waits for an operator although node %d holds every acknowledged write "
+                      "(metadata isr %#x names only lost disks, set by a promotion)", holder, S.vm.isr);
+            fprintf(stderr, "seed %" PRIu64 ": %s\n", seed, S.why);
+            describe();
+            return 1;
+        }
         S.tot.waits++;
         uint64_t *a = (uint64_t *)&S.st, *b = (uint64_t *)&S.tot;
         for (size_t j = 0; j < sizeof S.st / sizeof(uint64_t); j++)
@@ -1022,6 +1187,35 @@ static int run(uint64_t seed, uint64_t ticks)
             long r = log_find(L, o->pos);
             if (o->status == OP_OK && (r < 0 || L->log[r].id != o->id))
                 violation("acknowledged write %" PRIu64 " at %" PRIu64 " is lost", o->id, o->pos);
+        }
+    }
+    if (!S.bad && phase == 3) {
+        /* Check 8, availability (A2) with every replica but the leader down: min ISR 1 must acknowledge (the lag
+         * rule shrinks the ISR to the leader); a higher min ISR must not. */
+        int l = S.vm.leader;
+        S.st.deg_runs++;
+        for (int i = 0; i < S.nn; i++)
+            if (i != l) {
+                node_crash(i, 0);
+                S.node[i].down_until = UINT64_MAX;
+            }
+        S.ops = grow(S.ops, &S.cops, S.nops + 1, sizeof *S.ops);
+        size_t w = S.nops;
+        S.ops[w] = (struct op){.id = S.nops + 1, .n = 1, .node = l, .status = OP_PENDING, .at = S.now};
+        S.cur_op = S.ops[w].id;
+        if (repl_write(S.node[l].r, 1, &S.ops[w].pos) == REPL_OK) {
+            S.node[l].pend = grow(S.node[l].pend, &S.node[l].cpend, S.node[l].npend + 1, sizeof *S.node[l].pend);
+            S.node[l].pend[S.node[l].npend++] = S.nops++;
+        }
+        drive(l, NULL);
+        for (int t = 0; t < 1000 && !S.bad && S.ops[w].status == OP_PENDING; t++)
+            step();
+        if (!S.bad && S.ops[w].status == OP_OK) {
+            S.st.deg_ok++;
+            if (S.min_isr > 1)
+                violation("degraded: acknowledged with only the leader up at min ISR %d", S.min_isr);
+        } else if (!S.bad && S.min_isr == 1) {
+            violation("degraded: no acknowledgement with only the leader up at min ISR 1 (isr %#x)", S.vm.isr);
         }
     }
     if (S.bad) {
@@ -1107,5 +1301,12 @@ int main(int argc, char **argv)
                seeds, ticks, S.tot.acked, S.tot.refused, S.tot.unknown, S.tot.promotions, S.tot.stale, S.tot.none,
                S.tot.resigns, S.tot.isr, S.tot.cuts, S.tot.crashes, S.tot.wipes, S.tot.parts, S.tot.pauses,
                S.tot.moves, S.tot.msgs, S.tot.waits);
+    if (!quiet)
+        printf("coverage: %" PRIu64 " refusals, %" PRIu64 " excused cuts of committed records, acks with isr 1 / >1: %"
+               PRIu64 " / %" PRIu64 ", %" PRIu64 " acked copies wiped, %" PRIu64 " wipes of the leader, %" PRIu64
+               " fence replies from outside the fenced set, degraded runs %" PRIu64 " (ok %" PRIu64 "), %" PRIu64
+               " trims, %" PRIu64 " snapshots, %" PRIu64 " syncs that span a cut\n",
+               S.tot.refuses, S.tot.xcuts, S.tot.ack_isr1, S.tot.ack_isrn, S.tot.wiped_acked, S.tot.wipe_leader,
+               S.tot.fence_rep_out, S.tot.deg_runs, S.tot.deg_ok, S.tot.trims, S.tot.snaps, S.tot.lies);
     return 0;
 }

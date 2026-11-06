@@ -72,6 +72,9 @@ struct repl_vmeta {
     int leader;
     uint32_t isr;                 /* bitmask of node indexes */
     uint64_t rid[REPL_MAX_NODES]; /* the replica instance of each ISR member */
+    uint32_t unanswered;          /* ISR members the last promotion kept without a fence reply (the old leader
+                                     among them): the new leader drops those that do not ACK within its
+                                     unanswered_ticks, so a dead one does not hold the commit point for isr_lag */
 };
 
 enum repl_msg_type {
@@ -88,6 +91,8 @@ enum repl_msg_type {
     REPL_M_META,                  /* metadata -> replica: the volume's record (meta) */
     REPL_M_ISR_REQ,               /* leader -> metadata: meta = the requested record (epoch, isr_version: the basis) */
     REPL_M_RESIGN,                /* replica -> metadata: I cannot lead `epoch` (I led it before a restart) */
+    REPL_M_SNAPSHOT,              /* leader -> replica: my log no longer has position `written` + 1 that you need
+                                     (it went into parts, §8.3): install a snapshot from me (§8.1 step 3) */
 };
 
 struct repl_msg {
@@ -114,6 +119,9 @@ enum repl_action_type {
     REPL_A_APPLY,                 /* apply every record up to `pos` (a record end) */
     REPL_A_REPLY,                 /* answer the writer of positions first .. pos with status */
     REPL_A_FAIL,                  /* the core refuses to go on (reason); treat as fail-stop */
+    REPL_A_SNAPSHOT,              /* the leader (`pos`: its node index) no longer has the records this replica needs:
+                                     copy its applied state P (parts) and reopen with log_start P + 1, log_end and
+                                     floor P; until then the replica goes on as it is */
 };
 
 enum repl_src {
@@ -147,8 +155,13 @@ struct repl_config {
     uint32_t floor_ticks;         /* save the commit floor at most this often (§4.2: once a second) */
     uint32_t max_batch;           /* positions per APPEND */
     uint32_t window;              /* positions in flight per replica */
+    uint32_t unanswered_ticks;    /* a member a promotion kept without a fence reply (meta.unanswered) is removed if
+                                     it has not acknowledged this many ticks after the new leader took over; 0: only
+                                     the lag rule (a few round trips is right: a live member answers by then) */
     /* The record of this replica's log that contains `pos` (1 <= pos <= written end): its first position and its
-     * length. A read of the driver's own index (the WAL), never a write. Returns 0, or -1 if there is none. */
+     * length. A read of the driver's own index (the WAL), never a write. Returns 0; 1 if the position is no longer
+     * retained (below the log's start: its segment went into parts and was deleted, §8.3; the driver trims only
+     * positions at or below the saved commit floor); -1 if there is no such record (damage: the core fails). */
     int (*rec_find)(void *ctx, uint64_t pos, uint64_t *start, uint32_t *n);
     void *ctx;
 };
@@ -159,6 +172,9 @@ struct repl_durable {
     uint64_t fence;               /* the highest epoch this replica has saved */
     uint64_t led;                 /* the highest epoch it has led */
     uint64_t floor;               /* the commit floor: applied end */
+    uint64_t log_start;           /* first position the log still has (0 or 1: all of it); everything below is
+                                     applied (in parts): log_start - 1 <= floor. A replica opened from a snapshot at P
+                                     has log_start P + 1, log_end P, floor P, and the epoch of P in hist */
     uint64_t log_end;             /* last position of the durable log (0: empty) */
     const struct repl_epoch *hist;
     uint32_t nhist;
@@ -172,7 +188,9 @@ void repl_free(struct repl *r);
 /* Leader: append a record of n positions written by a client; *pos gets its first position. REPL_OK, or
  * REPL_E_NOTLEADER / REPL_E_ISR / REPL_E_FAILED with nothing written. The REPLY for it comes later. */
 int repl_write(struct repl *r, uint32_t n, uint64_t *pos);
-/* The last SYNC finished: every position up to `end` is durable (what is durable now, after any cut since). */
+/* The last SYNC finished: every position up to `end` is durable. The core takes no more than the written end the
+ * SYNC was issued for, lowered by every cut since: a sync issued before a cut does not cover records written again
+ * after it (a driver that reports the end it asked for is right). */
 void repl_synced(struct repl *r, uint64_t end);
 void repl_recv(struct repl *r, const struct repl_msg *m);
 void repl_tick(struct repl *r);
@@ -191,9 +209,11 @@ int repl_failed(const struct repl *r);
 /* The metadata group's rules. An ISR change applies only if it names the current epoch, ISR version and leader, and
  * keeps the leader (C11). A promotion applies only if the record still is the one the fences were sent for
  * (basis_epoch, basis_version; `fenced` the ISR they went to), and picks among the replies of ISR members whose rid
- * matches the one with the highest durable end (ties: the lowest node index); the new ISR is those replies, the
- * epoch basis_epoch + 1. Without the version check, an ISR change that the deposed leader got committed after the
- * fences went out (dropping a fenced member, then committing without it) would be undone by the promotion. */
+ * matches the one with the highest durable end (ties: the lowest node index); the new ISR is those replies and the
+ * fenced members that did not answer, the old leader included (`unanswered`: each holds every committed position;
+ * the new leader drops the dead ones), the epoch basis_epoch + 1. Without the version check, an ISR change that the
+ * deposed leader got committed after the fences went out (dropping a fenced member, then committing without it)
+ * would be undone by the promotion. */
 struct repl_fence_reply {
     int node;
     uint64_t durable, last_epoch, rid;

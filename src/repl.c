@@ -36,6 +36,7 @@ struct peer {
     uint64_t acked;     /* written end it last reported */
     uint64_t rid;       /* the instance its ACKs came from; 0: none yet in this epoch */
     uint64_t last_send, last_ack;
+    uint64_t snap_sent; /* when it was last told to install a snapshot (its next position is not retained) */
 };
 
 struct pending {
@@ -48,8 +49,9 @@ struct repl {
     struct repl_epoch *hist;
     uint32_t nhist, chist;
     uint64_t written, durable, applied, commit, verified;
-    uint64_t tail;      /* first position of the last record, when the core wrote it; 0: ask the driver */
+    uint64_t tail;      /* first position of the last record while its WRITE is still queued; 0: ask the driver */
     int sync_busy;
+    uint64_t sync_end;  /* the written end the SYNC in flight was issued for, lowered by every cut since */
     uint64_t now;
 
     uint64_t epoch;
@@ -59,6 +61,7 @@ struct repl {
     uint64_t qseq, last_query;
     int resigning;
     uint64_t last_resign;
+    uint32_t unans;     /* leader: members the promotion kept without a fence reply (meta.unanswered) */
 
     struct peer peer[REPL_MAX_NODES];
     uint64_t lead_tick;
@@ -178,7 +181,7 @@ static uint64_t end_of_epoch(const struct repl *r, uint64_t e)
 {
     for (uint32_t i = 0; i < r->nhist; i++)
         if (r->hist[i].epoch > e)
-            return r->hist[i].start - 1;
+            return MUT(16) ? r->hist[i].start : r->hist[i].start - 1;
     return r->written;
 }
 
@@ -198,18 +201,22 @@ static void raise_fence(struct repl *r, uint64_t e)
 {
     if (e > r->fence) {
         r->fence = e;
-        save(r);
+        if (!MUT(22))
+            save(r);
     }
 }
 
 static void sync_maybe(struct repl *r)
 {
-    if (!r->sync_busy && r->written > r->durable && push(r, REPL_A_SYNC))
+    if (!r->sync_busy && r->written > r->durable && push(r, REPL_A_SYNC)) {
         r->sync_busy = 1;
+        r->sync_end = r->written;
+    }
 }
 
-/* The record holding `pos`. The last record the core wrote itself is answered here: its WRITE may still wait in the
- * action queue (repl_write ships it in the same call), so the driver's index does not have it yet. */
+/* The record holding `pos`: 0; 1 if the log no longer retains it (in parts, below the log's start). The last record
+ * the core wrote itself is answered here: its WRITE may still wait in the action queue (repl_write ships it in the
+ * same call), so the driver's index does not have it yet. */
 static int find_rec(struct repl *r, uint64_t pos, uint64_t *s, uint32_t *n)
 {
     if (r->tail && pos >= r->tail && pos <= r->written) {
@@ -217,25 +224,37 @@ static int find_rec(struct repl *r, uint64_t pos, uint64_t *s, uint32_t *n)
         *n = (uint32_t)(r->written - r->tail + 1);
         return 0;
     }
-    if (r->cfg.rec_find(r->cfg.ctx, pos, s, n) < 0 || *s > pos || *s + *n - 1 < pos) {
+    int rc = r->cfg.rec_find(r->cfg.ctx, pos, s, n);
+    if (rc == 1 && !MUT(36))
+        return 1;
+    if (rc != 0 || *s > pos || *s + *n - 1 < pos) {
         fail(r, "the log has no record at a position below its end");
         return -1;
     }
     return 0;
 }
 
-/* Keep positions 1..end (rounded down to a record end); never below the applied end. 1 if something was cut. */
+/* Keep positions 1..end (rounded down to a record end); never below the applied end. 1 if something was cut.
+ * The applied end is a record end, and the log may no longer retain it (the driver trims at or below the floor):
+ * no lookup there. Rounding happens: a replica whose last epoch the leader lacks cuts at the end of the leader's
+ * epoch before it, which may fall inside a record of an older epoch that only the replica has (tests/test_repl.c);
+ * the next question cuts further. */
 static int cut(struct repl *r, uint64_t end)
 {
     if (end >= r->written)
         return 0;
-    if (end > 0) {
+    if (end > r->applied || (MUT(36) && end > 0)) {
         uint64_t s;
         uint32_t n;
-        if (find_rec(r, end, &s, &n) < 0)
+        int rc = find_rec(r, end, &s, &n);
+        if (rc < 0)
             return -1;
+        if (rc > 0) {
+            fail(r, "the log does not retain a position above its applied end");
+            return -1;
+        }
         if (s + n - 1 != end)
-            end = s - 1;
+            end = MUT(24) ? s + n - 1 : s - 1;
     }
     if (end < r->applied) {
         fail(r, "a cut below the applied end");
@@ -248,6 +267,7 @@ static int cut(struct repl *r, uint64_t end)
     r->written = end;
     r->tail = 0;
     r->durable = min64(r->durable, end);
+    r->sync_end = min64(r->sync_end, end);
     r->verified = min64(r->verified, end);
     while (r->nhist && r->hist[r->nhist - 1].start > end)
         r->nhist--;
@@ -276,6 +296,8 @@ static void ack(struct repl *r, int resync)
     if (!m)
         return;
     m->durable = MUT(9) ? r->verified : min64(r->durable, r->verified);
+    if (MUT(17) && m->durable && m->durable < r->verified)
+        m->durable++;
     m->written = r->verified;
     m->rid = r->rid;
     m->resync = resync;
@@ -294,7 +316,7 @@ static void apply_to(struct repl *r, uint64_t t)
 
 static void apply_follower(struct repl *r)
 {
-    uint64_t t = min64(r->commit, r->durable);
+    uint64_t t = MUT(21) ? r->commit : min64(r->commit, r->durable);
     if (!MUT(3))
         t = min64(t, r->fstate == F_FOLLOW ? r->verified : r->applied);
     apply_to(r, t);
@@ -340,7 +362,7 @@ static void deposed(struct repl *r, uint64_t e)
 
 static void on_append(struct repl *r, const struct repl_msg *m)
 {
-    if (!MUT(2) && (m->epoch < r->epoch || m->epoch < r->fence)) {
+    if (!MUT(2) && (m->epoch < r->epoch || (m->epoch < r->fence && !MUT(26)))) {
         struct repl_msg *s = send(r, REPL_M_REFUSE, m->from);
         if (s) {
             s->epoch = r->epoch > r->fence ? r->epoch : r->fence;
@@ -365,10 +387,12 @@ static void on_append(struct repl *r, const struct repl_msg *m)
         ack(r, 1);
         return;
     }
-    if (m->prev_pos && epoch_at(r, m->prev_pos) != m->prev_epoch) {
-        r->fstate = F_TRUNC;
-        r->verified = r->applied;
-        query(r);
+    /* While following, the log is a prefix of the leader's (verified by QUERY / ANSWER, then grown only from the
+     * leader), and a leader never rewrites its epoch's log (one instance per epoch: `led`, rid). So another epoch at
+     * a position both logs have is damage or a second instance leading one epoch (a restored directory, a gap of the
+     * design): never silent, never repaired by a cut. The simulator never reaches these two (MUT(30)). */
+    if (!MUT(30) && m->prev_pos && epoch_at(r, m->prev_pos) != m->prev_epoch) {
+        fail(r, "the log differs from the leader's below the verified end");
         return;
     }
     int wrote = 0;
@@ -378,8 +402,8 @@ static void on_append(struct repl *r, const struct repl_msg *m)
             /* One leader per epoch writes each position once: the same epoch here is the same record. */
             if (epoch_at(r, rec->pos) == rec->epoch)
                 continue;
-            if (cut(r, rec->pos - 1) < 0)
-                return;
+            fail(r, "the log differs from the leader's below the verified end");
+            return;
         }
         if (rec->pos != r->written + 1 || rec->n == 0)
             break;
@@ -410,7 +434,7 @@ static void on_append(struct repl *r, const struct repl_msg *m)
 
 static void on_answer(struct repl *r, const struct repl_msg *m)
 {
-    if (r->leading || m->epoch != r->epoch || m->from != r->leader || r->fstate != F_TRUNC)
+    if (r->leading || ((m->epoch != r->epoch || m->from != r->leader) && !MUT(20)) || r->fstate != F_TRUNC)
         return;
     /* Only an answer about the log as it is now: one to an earlier query (a query number restarts with the
      * process) may be about a log that has grown or been cut since, and its end would cut what matches. For the
@@ -445,6 +469,8 @@ static void advance(struct repl *r)
     uint32_t set = r->meta.isr;
     if (r->isr_busy && !MUT(6))
         set |= r->isr_req.isr;
+    if (r->isr_busy && MUT(18))
+        set = r->isr_req.isr;
     uint64_t c = r->durable;
     for (int i = 0; i < r->cfg.nnodes; i++) {
         if (i == r->cfg.self || !(set & (1u << i)))
@@ -458,7 +484,7 @@ static void advance(struct repl *r)
     if (c > r->commit)
         r->commit = c;
     apply_to(r, min64(r->commit, r->durable));
-    if (popcount32(r->meta.isr) < r->cfg.min_isr)
+    if (popcount32(r->meta.isr) < r->cfg.min_isr && !MUT(31))
         return;
     uint64_t done = MUT(7) ? r->durable : r->applied;
     while (r->hpend < r->npend && r->pend[r->hpend].last <= done) {
@@ -479,10 +505,25 @@ static void send_append(struct repl *r, int to, int heartbeat)
     struct peer *p = &r->peer[to];
     uint64_t from = p->next ? p->next : r->written + 1, upto = from - 1;
     if (p->next && from <= r->written && from - 1 <= p->acked + r->cfg.window) {
+        uint64_t s;
+        uint32_t n;
+        int rc = find_rec(r, from, &s, &n);
+        if (rc < 0)
+            return;
+        if (rc > 0) {
+            /* Its next record went into parts and its segment is gone (§8.3): the replica needs a snapshot (§8.1
+             * step 3). Never a fail-stop: every next leader would meet the same replica. */
+            if (!p->snap_sent || r->now - p->snap_sent >= r->cfg.resend_ticks) {
+                struct repl_msg *m = send(r, REPL_M_SNAPSHOT, to);
+                if (m)
+                    m->written = from - 1;
+                p->snap_sent = r->now;
+                p->last_send = r->now;
+            }
+            return;
+        }
         upto = r->written;
         if (upto - from + 1 > r->cfg.max_batch) {
-            uint64_t s;
-            uint32_t n;
             upto = from + r->cfg.max_batch - 1;
             if (find_rec(r, upto, &s, &n) < 0)
                 return;
@@ -539,11 +580,16 @@ static void isr_check(struct repl *r)
     uint32_t isr = r->meta.isr;
     int lagged = r->now - r->lead_tick >= r->cfg.isr_lag_ticks;
     uint64_t old = lagged ? wend_at(r, r->now - r->cfg.isr_lag_ticks) : 0;
+    /* A member the promotion kept without a fence reply (most often the old leader, dead) that has not acknowledged
+     * soon after the takeover goes at once, not after isr_lag: until then it holds the commit point. */
+    int grace = r->cfg.unanswered_ticks && r->now - r->lead_tick >= r->cfg.unanswered_ticks && !MUT(37);
     for (int i = 0; i < r->cfg.nnodes; i++) {
         if (i == r->cfg.self || !(isr & (1u << i)))
             continue;
         const struct peer *p = &r->peer[i];
-        if ((p->rid && p->rid != r->meta.rid[i]) || (lagged && (p->rid != r->meta.rid[i] || p->match < old))) {
+        if ((p->rid && p->rid != r->meta.rid[i]) ||
+            (lagged && !MUT(29) && (p->rid != r->meta.rid[i] || p->match < old)) ||
+            (grace && (r->unans & (1u << i)) && !p->rid)) {
             isr_request(r, isr & ~(1u << i), -1, 0);
             return;
         }
@@ -569,11 +615,17 @@ static void lead(struct repl *r, const struct repl_vmeta *v)
     r->leader = r->cfg.self;
     if (r->fence < v->epoch)
         r->fence = v->epoch;
-    r->led = v->epoch;
-    save(r);
+    if (MUT(23)) {
+        save(r);
+        r->led = v->epoch;
+    } else {
+        r->led = v->epoch;
+        save(r);
+    }
     r->leading = 1;
     r->fstate = F_IDLE;
     r->resigning = 0;
+    r->unans = v->unanswered & ~(1u << r->cfg.self);
     r->isr_busy = 0;
     r->npend = r->hpend = 0;
     memset(r->peer, 0, sizeof r->peer);
@@ -623,7 +675,7 @@ static void adopt_meta(struct repl *r, const struct repl_vmeta *v)
         }
         return;
     }
-    if (v->epoch < r->fence)
+    if (v->epoch < r->fence && !MUT(26))
         return; /* a promotion past this record is under way */
     raise_fence(r, v->epoch);
     r->meta = *v;
@@ -657,7 +709,8 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
     struct peer *p = &r->peer[m->from];
     if (m->rid != p->rid) {
         p->rid = m->rid;
-        p->match = 0;
+        if (!MUT(19))
+            p->match = 0;
     }
     if (m->durable > p->match)
         p->match = m->durable;
@@ -741,6 +794,21 @@ void repl_recv(struct repl *r, const struct repl_msg *m)
     case REPL_M_META:
         adopt_meta(r, &m->meta);
         break;
+    case REPL_M_SNAPSHOT:
+        /* The driver copies the leader's applied state and reopens this replica on it. The leader repeats the notice
+         * (resend_ticks) until the replica's ACKs show it no longer needs one: a driver ignores a repeat while a copy
+         * is in progress, and a copy that failed is asked for again. */
+        if (!r->leading && m->epoch == r->epoch && m->from == r->leader && r->fstate == F_FOLLOW) {
+            if (m->written < r->verified) {
+                /* The leader went back to a position we have (it lost an ACK): tell it where we are instead. */
+                ack(r, 1);
+                break;
+            }
+            struct repl_action *a = push(r, REPL_A_SNAPSHOT);
+            if (a)
+                a->pos = (uint64_t)m->from;
+        }
+        break;
     default:
         break;
     }
@@ -752,7 +820,7 @@ int repl_write(struct repl *r, uint32_t n, uint64_t *pos)
         return REPL_E_FAILED;
     if (!r->leading)
         return REPL_E_NOTLEADER;
-    if (popcount32(r->meta.isr) < r->cfg.min_isr)
+    if (popcount32(r->meta.isr) < r->cfg.min_isr && !MUT(31))
         return REPL_E_ISR;
     if (n == 0)
         n = 1;
@@ -787,7 +855,9 @@ void repl_synced(struct repl *r, uint64_t end)
     if (r->failed)
         return;
     r->sync_busy = 0;
-    r->durable = min64(end, r->written);
+    /* A sync covers no more than was written when it was issued, and nothing a cut removed since (rewritten after
+     * the cut, the positions are new records the sync never saw). */
+    r->durable = min64(MUT(35) ? end : min64(end, r->sync_end), r->written);
     sync_maybe(r);
     if (r->leading) {
         advance(r);
@@ -808,7 +878,7 @@ void repl_tick(struct repl *r)
             if (i == r->cfg.self)
                 continue;
             struct peer *p = &r->peer[i];
-            if (p->next && p->next > p->acked + 1 && r->now - p->last_ack >= r->cfg.resend_ticks) {
+            if (!MUT(27) && p->next && p->next > p->acked + 1 && r->now - p->last_ack >= r->cfg.resend_ticks) {
                 p->next = p->acked + 1; /* go back: something was lost */
                 p->last_ack = r->now;
             }
@@ -824,7 +894,7 @@ void repl_tick(struct repl *r)
                 m->meta = r->isr_req;
         }
         isr_check(r);
-    } else if (r->fstate == F_TRUNC && r->now - r->last_query >= r->cfg.resend_ticks) {
+    } else if (r->fstate == F_TRUNC && r->now - r->last_query >= r->cfg.resend_ticks && !MUT(28)) {
         query(r);
     } else if (r->resigning && r->now - r->last_resign >= r->cfg.resend_ticks) {
         resign(r);
@@ -844,7 +914,9 @@ int repl_next_action(struct repl *r, struct repl_action *a)
         return 1;
     }
     if (r->hact == r->nact) {
+        /* Every WRITE is carried out: the driver's index has the tail now (and may trim it once it is applied). */
         r->nact = r->hact = 0;
+        r->tail = 0;
         return 0;
     }
     *a = r->act[r->hact++];
@@ -888,6 +960,12 @@ struct repl *repl_open(const struct repl_config *cfg, const struct repl_durable 
         fail(r, "the commit floor is above the durable log end");
         return r;
     }
+    if (d->log_start > 1 && d->log_start - 1 > d->floor) {
+        /* Only applied positions leave the log (into parts): a start above the floor lost records. */
+        fail(r, "the log starts above the commit floor");
+        return r;
+    }
+    r->sync_end = r->written;
     r->floor_saved = d->floor;
     apply_to(r, d->floor);
     r->commit = r->applied;
@@ -928,6 +1006,7 @@ int repl_meta_isr_change(struct repl_vmeta *m, const struct repl_vmeta *req)
             m->rid[i] = req->rid[i];
     }
     m->isr = req->isr;
+    m->unanswered &= req->isr;
     m->isr_version++;
     return REPL_OK;
 }
@@ -943,7 +1022,7 @@ int repl_meta_promote(struct repl_vmeta *m, uint64_t basis_epoch, uint64_t basis
     uint32_t isr = 0, answered = 0;
     for (int i = 0; i < n; i++) {
         int node = r[i].node;
-        if (node < 0 || node >= REPL_MAX_NODES || !(from & (1u << node)) || (isr & (1u << node)))
+        if (node < 0 || node >= REPL_MAX_NODES || (!(from & (1u << node)) && !MUT(25)) || (isr & (1u << node)))
             continue;
         answered |= 1u << node;
         if (r[i].rid != m->rid[node] && !MUT(11))
@@ -954,12 +1033,17 @@ int repl_meta_promote(struct repl_vmeta *m, uint64_t basis_epoch, uint64_t basis
     }
     if (best < 0)
         return REPL_E_NONE;
-    /* Members that did not answer stay in the ISR, but the old leader: they hold every committed position, the new
-     * leader counts them until its lag rule drops the dead ones. Keeping only the replies (§6.2) shrinks the ISR to
-     * one copy whenever replies are slow, and a loss of that copy then stops the volume although others hold
-     * everything (tests/sim_repl.c found it). A reply with another rid is a new disk: out. */
-    if (m->leader >= 0 && !MUT(14))
-        isr |= from & ~answered & ~(1u << m->leader);
+    /* Members that did not answer stay in the ISR, the old leader too: they hold every committed position (the old
+     * leader's durable end was in every commit point it made), and the new leader drops those that do not ACK soon
+     * (`unanswered`). Keeping only the replies (§6.2) shrinks the ISR to one copy whenever replies are slow, and a
+     * loss of that copy then stops the volume although others hold everything (tests/sim_repl.c found it: an earlier
+     * seed 183 for slow replies; seed 76 for the old leader, paused through the failover while the promoted member
+     * lost its disk). A reply with another rid is a new disk: out. */
+    uint32_t keep = MUT(14) ? 0 : from & ~answered;
+    if (MUT(34) && m->leader >= 0)
+        keep &= ~(1u << m->leader);
+    isr |= keep;
+    m->unanswered = keep;
     for (int i = 0; i < REPL_MAX_NODES; i++)
         if (!(isr & (1u << i)))
             m->rid[i] = 0;
