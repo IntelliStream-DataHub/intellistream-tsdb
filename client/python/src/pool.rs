@@ -33,6 +33,8 @@ use crate::{closed, connect, connect_options, multi, opts, retry_budget, to_pyer
 ///     keepalive: TCP keepalive, as in Client.
 ///     user, password, password_file, require_auth: The login, as in Client;
 ///         every connection logs in, a replacement too.
+///     retry: Seconds one request may be retried on UNAVAILABLE or MOVED, as in Client (30 by default; 0 for
+///         none). The exceptions of a Pool's batch calls carry their class but not the reply's body.
 ///
 /// A connection that breaks (an I/O error or a timeout) is replaced by a new
 /// one before its next query, and so is every other connection made before

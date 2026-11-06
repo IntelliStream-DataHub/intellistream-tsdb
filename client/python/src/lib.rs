@@ -102,7 +102,7 @@ fn to_pyerr_info(py: Python<'_>, e: tc::Error, info: Option<&tc::ErrorInfo>) -> 
         match status {
             Some(tc::Status::Unavailable) => {
                 v.setattr("has_body", own.is_some_and(|i| i.has_body))?;
-                v.setattr("retry_after", (f64::from(i.retry_after_ms()) / 1000.0))?;
+                v.setattr("retry_after", f64::from(i.retry_after_ms()) / 1000.0)?;
                 let l = PyList::empty(py);
                 for u in &i.unavailable {
                     let d = PyDict::new(py);
@@ -851,6 +851,10 @@ impl Inner {
 ///         instead, without the LF or CR LF that ends it, at every login.
 ///     require_auth: Refuse (ERR_AUTH) a server that does not ask for a
 ///         login (--no-auth). Otherwise such a server is used without one.
+///     retry: Seconds one request may be retried: tsdbd answers UNAVAILABLE when a volume's storage is down
+///         and MOVED when another node owns it, both meaning the request was not applied, so the client waits what
+///         the reply asks for, follows a MOVED and sends the request again until this budget is spent; then the call
+///         raises TsdbUnavailable or TsdbMoved. 30 by default; 0 turns retries off.
 ///
 /// Raises:
 ///     TsdbError: The connection failed; ERR_AUTH when the login failed (an
