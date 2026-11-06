@@ -25,6 +25,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __APPLE__ /* no SOCK_CLOEXEC, SOCK_NONBLOCK or TCP_KEEPIDLE */
+#define SOCK_CLOEXEC 0
+#define SOCK_NONBLOCK 0
+#define TCP_KEEPIDLE TCP_KEEPALIVE
+#endif
+
 static int failures;
 #define CHECK(c)                                                                                                       \
     do {                                                                                                               \
@@ -680,7 +686,7 @@ static void test_keepalive_args(void)
     CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
     int fd = client_fd(f.port); /* keepalive on by default: 30 s idle, every 10 s, 3 probes (as Rust and Java) */
     CHECK(fd >= 0);
-    CHECK(sockopt(fd, SOL_SOCKET, SO_KEEPALIVE) == 1);
+    CHECK(sockopt(fd, SOL_SOCKET, SO_KEEPALIVE) > 0); /* macOS returns the option bit, not 1 */
     CHECK(sockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE) == 30);
     CHECK(sockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL) == 10);
     CHECK(sockopt(fd, IPPROTO_TCP, TCP_KEEPCNT) == 3);
@@ -778,7 +784,12 @@ int main(void)
     test_values_stream_in_step();
     test_type_switch();
     test_peer_closed();
+#ifdef __APPLE__
+    fprintf(stderr, "test_connect_timeout: skipped on macOS (a full accept queue answers differently)\n");
+    (void)test_connect_timeout;
+#else
     test_connect_timeout();
+#endif
     test_keepalive_args();
     if (failures) {
         fprintf(stderr, "test_client: %d failures\n", failures);

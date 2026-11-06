@@ -56,6 +56,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include "portable.h"
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -600,7 +601,11 @@ int unlinkat(int dirfd, const char *path, int flags)
         errno = EIO;
         return -1;
     }
+#ifdef __APPLE__
+    return REAL(unlinkat)(dirfd, path, flags);
+#else
     return (int)syscall(SYS_unlinkat, dirfd, path, flags);
+#endif
 }
 
 /* The child writes day D-2 (flushed), then day D through the WAL, and hard-links the WAL segments. Day D is

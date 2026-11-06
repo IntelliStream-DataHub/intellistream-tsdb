@@ -33,6 +33,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 static int failures;
 
 #ifdef OLD_CODE /* to show the tests fail on code from before fail-stop, which lacks tsdb_failed */
@@ -89,10 +91,9 @@ static size_t nsynced;
 
 static void path_of(int fd, char *buf, size_t len)
 {
-    char link[64];
-    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
-    ssize_t n = readlink(link, buf, len - 1);
-    buf[n > 0 ? n : 0] = '\0';
+    ssize_t n = fd_path(fd, buf, len);
+    if (n <= 0)
+        buf[0] = '\0';
 }
 
 /* Decides, once per matching call, whether it fails; holds it first if asked. */
@@ -145,6 +146,16 @@ static off_t *synced_slot(int fd)
     return &synced[nsynced++].size;
 }
 
+/* the real fsync or fdatasync (Linux: the system call, macOS: the next definition of the name) */
+static int real_sync(long sysno, int fd)
+{
+#ifdef __APPLE__
+    return sysno == SYS_fsync ? REAL(fsync)(fd) : REAL(fdatasync)(fd);
+#else
+    return (int)syscall(sysno, fd);
+#endif
+}
+
 static int sync_call(int op, long sysno, int fd)
 {
     if (inject(op, fd, NULL)) {
@@ -156,7 +167,7 @@ static int sync_call(int op, long sysno, int fd)
         errno = EIO;
         return -1;
     }
-    int r = (int)syscall(sysno, fd);
+    int r = real_sync(sysno, fd);
     if (r == 0) {
         pthread_mutex_lock(&f_lock);
         struct stat st;
@@ -171,15 +182,24 @@ static int sync_call(int op, long sysno, int fd)
 int fsync(int fd) { return sync_call(F_FSYNC, SYS_fsync, fd); }
 int fdatasync(int fd) { return sync_call(F_FDATASYNC, SYS_fdatasync, fd); }
 
+static ssize_t real_write(int fd, const void *buf, size_t n)
+{
+#ifdef __APPLE__
+    return REAL(write)(fd, buf, n);
+#else
+    return syscall(SYS_write, fd, buf, n);
+#endif
+}
+
 ssize_t write(int fd, const void *buf, size_t n)
 {
     if (fd > 2 && inject(F_WRITE, fd, NULL)) {
         if (f_partial && n > 1)
-            syscall(SYS_write, fd, buf, n / 2);
+            real_write(fd, buf, n / 2);
         errno = EIO;
         return -1;
     }
-    return syscall(SYS_write, fd, buf, n);
+    return real_write(fd, buf, n);
 }
 
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
@@ -188,7 +208,11 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
         errno = EIO;
         return -1;
     }
+#ifdef __APPLE__
+    return REAL(pwrite)(fd, buf, n, off);
+#else
     return syscall(SYS_pwrite64, fd, buf, n, off);
+#endif
 }
 
 int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
@@ -197,7 +221,11 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
         errno = EIO;
         return -1;
     }
+#ifdef __APPLE__
+    return REAL(renameat)(olddirfd, oldpath, newdirfd, newpath);
+#else
     return (int)syscall(SYS_renameat, olddirfd, oldpath, newdirfd, newpath);
+#endif
 }
 
 int unlinkat(int dirfd, const char *path, int flags)
@@ -206,7 +234,11 @@ int unlinkat(int dirfd, const char *path, int flags)
         errno = EIO;
         return -1;
     }
+#ifdef __APPLE__
+    return REAL(unlinkat)(dirfd, path, flags);
+#else
     return (int)syscall(SYS_unlinkat, dirfd, path, flags);
+#endif
 }
 
 static void arm(int op, const char *match, bool partial, bool drop)

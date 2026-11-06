@@ -362,7 +362,7 @@ static int dict_append(series_dict *d, const char *name, size_t len, int type, u
     store32(rec, check);
     int err = 0;
     ssize_t wr = write(d->fd, rec, size);
-    if (wr != (ssize_t)size || (d->fsync && fdatasync(d->fd) != 0)) {
+    if (wr != (ssize_t)size || (d->fsync && tsdb_fdatasync(d->fd) != 0)) {
         rc = TSDB_ERR_IO; /* the caller fails the engine (dict_get): see eng_fail */
         err = wr >= 0 && wr != (ssize_t)size ? ENOSPC : errno;
     }

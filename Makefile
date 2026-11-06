@@ -1,4 +1,28 @@
 CC      ?= cc
+UNAME_S := $(shell uname -s)
+# macOS is a developer platform (see docs/macos.md): no io_uring, no CPU levels, the portable scalar kernels on
+# arm64, zstd from Homebrew. The jepsen, crashfs, dist and distro targets are Linux only.
+ifeq ($(UNAME_S),Darwin)
+NO_URING ?= 1
+SOEXT   := dylib
+BREW_ZSTD := $(shell brew --prefix zstd 2>/dev/null)
+PLAT_CFLAGS :=
+ifneq ($(BREW_ZSTD),)
+PLAT_CFLAGS += -I$(BREW_ZSTD)/include
+ZSTD_LIB ?= -L$(BREW_ZSTD)/lib -lzstd
+endif
+# clang, unlike GCC, warns on every designated initializer that leaves a field out
+PLAT_CFLAGS += -Wno-missing-field-initializers
+# the fuzz driver's weak reference to the sanitizer runtime, absent in the plain replay build
+PLAT_FUZZ_LDFLAGS := -Wl,-U,___sanitizer_set_death_callback
+ifeq ($(shell uname -m),arm64)
+ARCH    ?= -mcpu=native
+endif
+CRASHFS_SO :=
+else
+SOEXT   := so
+CRASHFS_SO = $(B)/libcrashfs.so
+endif
 # -march=native gives the codecs BMI/LZCNT; the aggregation kernels pick
 # AVX-512/AVX2/scalar at runtime either way. `make PORTABLE=1` for a generic build.
 ifeq ($(PORTABLE),1)
@@ -12,6 +36,7 @@ CFLAGS  ?= -O3 -g
 # bytes they write) must not depend on the CPU the code was built for, nor on the CPU
 # level of `make dist` in use (src/levels.h).
 override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off $(ARCH) -Iinclude -fPIC
+override CFLAGS += $(PLAT_CFLAGS)
 # `make dist` links these statically (-l:libzstd.a); glibc stays dynamic.
 ZSTD_LIB  ?= -lzstd
 URING_LIB ?= -luring
@@ -36,6 +61,8 @@ URING_FLAGS :=
 URING_LIBS   = $(URING_LIB)  # -l:liburing.a in make dist
 endif
 
+comma := ,
+
 SRC  := $(wildcard src/*.c)
 OBJ  := $(SRC:src/%.c=$(B)/%.o)
 
@@ -54,9 +81,9 @@ endif
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/libtsdb.so $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench
+all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench
 
-$(B)/%.o: src/%.c src/internal.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
+$(B)/%.o: src/%.c src/internal.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 # simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
 $(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
@@ -67,7 +94,7 @@ MEMSET_FLAG := $(shell $(CC) -mmemset-strategy=vector_loop:512:noalign,libcall:-
                  >/dev/null 2>&1 && echo -mmemset-strategy=vector_loop:512:noalign,libcall:-1:noalign)
 $(B)/simd.o: override CFLAGS += $(MEMSET_FLAG)
 
-$(B)/%.base.o: src/%.c src/internal.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
+$(B)/%.base.o: src/%.c src/internal.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -DTSDB_LV=base -c -o $@ $<
 
 $(B)/%.v3.o: src/%.c src/internal.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
@@ -83,9 +110,17 @@ $(LIB): $(OBJ) $(B)/tsdb_calendar.o
 # The engine as a shared library for the embedded bindings (Rust, Python, Java FFM).
 # Only the public tsdb_* API is exported (tools/libtsdb.map); zstd is linked in
 # statically when ZSTD_LIB says so (make dist), else dynamically.
+ifeq ($(UNAME_S),Darwin)
+# no version script: the exported names are the public tsdb_* prefix, as in tools/libtsdb.map
+$(B)/libtsdb.$(SOEXT): $(OBJ) $(B)/tsdb_calendar.o tools/libtsdb.map
+	printf '_tsdb_*\n' > $(B)/libtsdb.exports
+	$(CC) $(CFLAGS) -dynamiclib -Wl,-exported_symbols_list,$(B)/libtsdb.exports -install_name @rpath/libtsdb.dylib -o $@ \
+	    $(OBJ) $(B)/tsdb_calendar.o $(LDLIBS)
+else
 $(B)/libtsdb.so: $(OBJ) $(B)/tsdb_calendar.o tools/libtsdb.map
 	$(CC) $(CFLAGS) -shared -Wl,--version-script=tools/libtsdb.map -Wl,-soname,libtsdb.so -o $@ \
 	    $(OBJ) $(B)/tsdb_calendar.o $(LDLIBS)
+endif
 
 $(B)/tsdb_calendar.o: client/tsdb_calendar.c include/tsdb_calendar.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -152,13 +187,15 @@ $(B)/test_buckets: tests/test_buckets.c src/internal.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send
 	./$(B)/test_tsdb
 	./$(B)/test_sched
 	./$(B)/test_multi
 	./$(B)/test_threads
 	./$(B)/test_buckets
-	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
+	LD_LIBRARY_PATH=$(B) DYLD_LIBRARY_PATH=$(B) ./$(B)/test_shared
+	./$(B)/test_compat
+	TSDB_FAST_FSYNC=1 ./$(B)/test_compat
 	./$(B)/test_failstop
 	./$(B)/test_damage
 	./$(B)/test_crafted
@@ -185,7 +222,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	./$(B)/test_crypto
 	./$(B)/test_users
 	B=$(B) tests/test_cli_users.sh
-	! nm $(CLIB) | grep -w 'tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only
+	! nm $(CLIB) | grep -wE '_?tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only (_: Mach-O)
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
@@ -197,6 +234,12 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth_ops && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stability || exit 1; done
+
+# the portability headers (macOS shims) are part of these tests and of the server
+$(B)/test_classes $(B)/test_damage $(B)/test_export $(B)/test_failstop $(B)/test_follow $(B)/test_group $(B)/test_sched \
+$(B)/test_server_multi $(B)/test_server $(B)/test_spread $(B)/test_stability $(B)/test_tsdb $(B)/test_volumes \
+$(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_ports $(B)/test_out_send $(B)/fuzz_frames $(B)/tsdbd $(B)/users.o $(B)/tsdb: \
+    tests/portable.h src/compat.h server/epoll_compat.h
 
 # ------------------------------------------------------------------ fuzzing
 # tests/fuzz/: one harness per decoder or loader of what lies on disk (driver.c has the details).
@@ -228,7 +271,8 @@ FUZZ_DRV  := tests/fuzz/driver.c
 endif
 
 $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuzz/template.h src/internal.h $(LIB)
-	$(CC) $(CFLAGS) -Isrc -Iclient -Iserver -o $@ $< tests/fuzz/driver.c $(FUZZ_OBJS_$*:%=$(B)/%) $(LIB) $(LDLIBS)
+	$(CC) $(CFLAGS) -Isrc -Iclient -Iserver -o $@ $< tests/fuzz/driver.c $(FUZZ_OBJS_$*:%=$(B)/%) $(LIB) $(LDLIBS) \
+	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
@@ -411,7 +455,7 @@ test-java: $(B)/tsdbd $(B)/tsdb
 # The embedded Java binding (Java 22+, FFM) needs the TCP client's jar for the shared types. It is installed into a
 # local repository of this tree's build (read through to ~/.m2), never into the ~/.m2 that other trees share.
 JAVA_M2 := -Dmaven.repo.local=$(abspath $(B))/m2 -Dmaven.repo.local.tail=$(HOME)/.m2/repository
-test-java-embedded: $(B)/tsdbd $(B)/libtsdb.so
+test-java-embedded: $(B)/tsdbd $(B)/libtsdb.$(SOEXT)
 	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
 	cd client/java-embedded && mvn -q $(JAVA_M2) test
 
@@ -501,7 +545,7 @@ $(B)/tsdbd: $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
 # is always set).
 $(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c $(B)/tsdb_pack.o \
-	    $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+	    $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
 # build-fuzz-frames/ (its own tree: `make fuzz` builds build-fuzz/ with other flags); new inputs go to
@@ -606,8 +650,11 @@ $(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # links against libtsdb.so, as the embedded bindings do; run with LD_LIBRARY_PATH=$(B)
-$(B)/test_shared: tests/test_shared.c $(B)/libtsdb.so
-	$(CC) $(CFLAGS) -o $@ $< -L$(B) -ltsdb -ldl
+$(B)/test_compat: tests/test_compat.c src/compat.h tests/portable.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(B)/test_shared: tests/test_shared.c $(B)/libtsdb.$(SOEXT)
+	$(CC) $(CFLAGS) -o $@ $< -L$(B) -ltsdb -ldl $(if $(filter Darwin,$(UNAME_S)),-Wl$(comma)-rpath$(comma)@loader_path)
 
 $(B)/test_lttb: tests/test_lttb.c tests/lttb_ref.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
@@ -618,7 +665,7 @@ $(B)/test_group: tests/test_group.c $(LIB)
 $(B)/test_twa: tests/test_twa.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/test_spread: tests/test_spread.c src/internal.h $(LIB)
+$(B)/test_spread: tests/test_spread.c src/internal.h src/ext80.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/test_limits: tests/test_limits.c $(LIB)

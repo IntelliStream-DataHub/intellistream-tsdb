@@ -10,6 +10,9 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <stdlib.h> /* arc4random_buf */
+#endif
 #include <sys/random.h>
 
 static const uint32_t K[64] = {
@@ -255,6 +258,9 @@ int tsdb_ct_equal(const void *a, const void *b, size_t n)
 
 int tsdb_random(void *buf, size_t n)
 {
+#ifdef __APPLE__ /* no getrandom: arc4random_buf, from the kernel's generator, never blocks and never fails */
+    arc4random_buf(buf, n);
+#else
     uint8_t *p = buf;
     while (n) {
         ssize_t r = getrandom(p, n, 0);
@@ -264,6 +270,7 @@ int tsdb_random(void *buf, size_t n)
             return -1;
         p += r, n -= (size_t)r;
     }
+#endif
     return 0;
 }
 

@@ -786,7 +786,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
             rc = TSDB_ERR_IO;
             goto fail;
         }
-    } else if (db->opt.fsync && fdatasync(w->fd) != 0) {
+    } else if (db->opt.fsync && tsdb_fdatasync(w->fd) != 0) {
         rc = TSDB_ERR_IO;
         goto fail;
     }
@@ -913,7 +913,7 @@ int parts_commit(eng *db, part **ps, size_t n)
         snprintf(intent, sizeof intent, INTENT_PREFIX "%d_%u.intent", (int)getpid(),
                  atomic_fetch_add(&db->tmp_counter, 1));
         int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        int rc = fd < 0 || write_all(fd, buf, len) != 0 || (db->opt.fsync && fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+        int rc = fd < 0 || write_all(fd, buf, len) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
         if (fd >= 0)
             close(fd);
         free(buf);
@@ -1086,7 +1086,7 @@ int intents_recover(eng *db)
         }
     }
     closedir(d);
-    if (rc == 0 && any && db->opt.fsync && fsync(db->dirfd) != 0)
+    if (rc == 0 && any && db->opt.fsync && tsdb_fsync(db->dirfd) != 0)
         return TSDB_ERR_IO; /* at open: the open fails */
     return rc;
 }

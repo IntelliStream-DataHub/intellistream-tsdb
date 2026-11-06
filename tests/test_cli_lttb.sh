@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 B=${B:-build}
 dir=$(mktemp -d "${TMPDIR:-/tmp}/tsdb-cli-lttb.XXXXXX")
 trap 'rm -rf "$dir"' EXIT
+command -v tac >/dev/null 2>&1 || tac() { tail -r; } # macOS has no tac
 fail() { echo "test_cli_lttb: FAIL: $*" >&2; exit 1; }
 
 "$B/tsdb" "$dir/db" create s --type float64 >/dev/null || fail "create"

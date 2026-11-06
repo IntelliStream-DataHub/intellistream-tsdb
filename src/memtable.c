@@ -483,7 +483,7 @@ static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t 
         return TSDB_ERR_IO;
     }
     if (db->opt.fsync) {
-        if (fdatasync(fd) != 0) {
+        if (tsdb_fdatasync(fd) != 0) {
             eng_fail(db, "WAL fdatasync", errno);
             return TSDB_ERR_IO;
         }
@@ -893,7 +893,7 @@ int mt_flush(eng *db)
 void *flusher_main(void *arg)
 {
     eng *db = arg;
-    pthread_setname_np(pthread_self(), "tsdb-flush");
+    tsdb_thread_name("tsdb-flush");
     pthread_mutex_lock(&db->buf_lock);
     while (!db->flusher_stop) {
         int64_t interval = db->opt.flush_interval_ms > 0 ? db->opt.flush_interval_ms : 1000;
@@ -1217,7 +1217,7 @@ int wal_open(eng *db, int (*before_replay)(eng *))
             unlinkat(db->dirfd, segs[k].name, 0);
     }
     free(segs);
-    if (rc == 0 && !ro && db->opt.fsync && fsync(db->dirfd) != 0)
+    if (rc == 0 && !ro && db->opt.fsync && tsdb_fsync(db->dirfd) != 0)
         rc = TSDB_ERR_IO; /* at open: the open fails */
     if (rc == 0 && db->wal_enabled)
         rc = wal_open_segment(db, db->wal_seq, &db->wal_fd);

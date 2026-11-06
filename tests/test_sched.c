@@ -12,6 +12,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 #define CHECK(cond)                                                                  \
     do {                                                                             \
         if (!(cond)) {                                                               \
@@ -486,6 +488,26 @@ static void test_reopen(void)
  * before the task leaves /proc/self/task, and under load a joined thread stayed listed through a whole tsdb_open
  * (7 threads started and 3 for 8 and 3). So the test counts by name, waits for the threads of an earlier open to
  * leave, and waits for new ones to name themselves (a thread sets its name when it first runs). */
+#ifdef __APPLE__ /* no /proc: the task's threads from mach, each name from its extended info */
+#include <mach/mach.h>
+static int count_threads(const char *name)
+{
+    thread_act_array_t list;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS)
+        return 0;
+    int found = 0;
+    for (mach_msg_type_number_t i = 0; i < n; i++) {
+        thread_extended_info_data_t info;
+        mach_msg_type_number_t cnt = THREAD_EXTENDED_INFO_COUNT;
+        if (thread_info(list[i], THREAD_EXTENDED_INFO, (thread_info_t)&info, &cnt) == KERN_SUCCESS)
+            found += strncmp(info.pth_name, name, strlen(name)) == 0;
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof *list);
+    return found;
+}
+#else
 static int count_threads(const char *name)
 {
     DIR *d = opendir("/proc/self/task");
@@ -506,6 +528,7 @@ static int count_threads(const char *name)
         closedir(d);
     return n;
 }
+#endif
 
 /* Waits up to 10 s for the count of `name` threads to reach `want` from either side, and returns it. */
 static int await_threads(const char *name, int want)

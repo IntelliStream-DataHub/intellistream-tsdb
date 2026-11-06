@@ -103,15 +103,27 @@ fn main() {
 /// Links the engine's objects into one and keeps only the `tsdb_*` symbols global, as
 /// tools/libtsdb.map does for libtsdb.so. Otherwise every internal name (pool_new, wal_open,
 /// xxh64, ...) lands in the user's binary, where another library defining the same name breaks
-/// the link or, through an archive, silently takes tsdb's calls. ELF targets only (`cc -r` and
-/// objcopy); elsewhere the objects are archived as they are.
+/// the link or, through an archive, silently takes tsdb's calls. ELF targets (`cc -r` and
+/// objcopy), and Apple targets (`ld -r` with an exported-symbols list); elsewhere the objects are archived as they are.
 fn hide_internal_symbols(out: &Path, objects: Vec<PathBuf>) -> Vec<PathBuf> {
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
-    if !matches!(os.as_str(), "linux" | "android" | "freebsd" | "netbsd" | "openbsd" | "dragonfly") {
+    let apple = matches!(os.as_str(), "macos" | "ios");
+    if !apple && !matches!(os.as_str(), "linux" | "android" | "freebsd" | "netbsd" | "openbsd" | "dragonfly") {
         return objects;
     }
     let merged = out.join("tsdb_engine.o");
     let cc = cc::Build::new().get_compiler();
+    if apple {
+        // Mach-O: `ld -r` with an exported-symbols list turns every other global into a local symbol
+        // (they are private externs, which -r makes local unless -keep_private_externs is given)
+        let list = out.join("tsdb_exports.txt");
+        std::fs::write(&list, "_tsdb_*\n").expect("write the exported symbols list");
+        let mut cmd = cc.to_command();
+        cmd.args(["-r", "-nostdlib", "-Wl,-exported_symbols_list"]).arg(format!("-Wl,{}", list.display()));
+        let status = cmd.arg("-o").arg(&merged).args(&objects).status();
+        assert!(status.is_ok_and(|s| s.success()), "{:?} -r failed to link the engine's objects", cc.path());
+        return vec![merged];
+    }
     let status = cc.to_command().args(["-r", "-nostdlib", "-o"]).arg(&merged).args(&objects).status();
     assert!(status.is_ok_and(|s| s.success()), "{:?} -r failed to link the engine's objects", cc.path());
     println!("cargo:rerun-if-env-changed=OBJCOPY");

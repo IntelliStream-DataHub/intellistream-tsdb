@@ -16,6 +16,7 @@
  * checks the granule-statistics fast path against the decoding fold.
  */
 #define _GNU_SOURCE
+#include "ext80.h"
 #include "internal.h"
 #include "tsdb.h"
 
@@ -28,6 +29,8 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <unistd.h>
+
+#include "portable.h"
 
 static int failures;
 #define CHECK(cond)                                                                  \
@@ -1157,7 +1160,7 @@ static long maxrss_mb(void)
 {
     struct rusage u;
     getrusage(RUSAGE_SELF, &u);
-    return u.ru_maxrss / 1024;
+    return RU_MAXRSS_KB(u) / 1024;
 }
 
 /* The buckets of a series bit for bit the same with one dense array and in chunks of `dense` buckets: aggregates
@@ -1310,8 +1313,120 @@ static void test_sparse_span(void)
     tsdb_close(db);
 }
 
+/* int_variance as query.c does it on x86: the exact numerator through x87 long double */
+#if LDBL_MANT_DIG == 64
+static void x87_variance(const uint64_t d[4], uint64_t n, double *vp, double *vs)
+{
+    long double num = 0;
+    for (int i = 3; i >= 0; i--)
+        num = num * 0x1p64L + (long double)d[i];
+    long double ln = (long double)n;
+    *vp = (double)(num / (ln * ln));
+    *vs = n > 1 ? (double)(num / (ln * (long double)(n - 1))) : 0;
+}
+
+/* a numerator that puts a tie, or a value just off one, where one of the roundings looks */
+static void ext80_numerator(uint64_t d[4])
+{
+    memset(d, 0, 4 * sizeof d[0]);
+    int len = 1 + (int)rndr(256), kind = (int)rndr(5);
+    for (int b = 0; b < len; b++) {
+        bool bit = kind == 0 ? rndr(2) : kind == 1 ? true : kind == 2 ? rndr(40) == 0 : rndr(2);
+        if (kind >= 3 && b < len - 64 && b > len - 64 - 3) /* the guard bits of a rounding to 64 */
+            bit = b == len - 65;
+        if (kind == 4 && b < len - 66)
+            bit = false; /* an exact tie */
+        if (bit || b == len - 1)
+            d[b / 64] |= UINT64_C(1) << (b % 64);
+    }
+}
+#endif
+
+/* Integer variances (int64, bool) must have the same bits on every platform: parts move between machines, and
+ * tests and clients compare answers. On x86 int_variance rounds the exact 256-bit numerator through x87 long double;
+ * elsewhere (arm64: long double is a double on macOS, binary128 on Linux) src/ext80.h emulates that in integers. The
+ * known answers below are x87's, checked through agg_spread on every platform; on x86 the emulation is compared with
+ * the x87 arithmetic itself on many numerators, ties included. */
+static void test_int_variance_bits(void)
+{
+    static const struct {
+        int64_t first, step;
+        uint64_t mod, n;
+        uint64_t vp, vs; /* the bits x87 gives */
+    } cases[] = {
+        {4000000000000000000LL - 1000, 7919, 2001, 1000, 0x411467ba6c22680a, 0x41146cf509124bf4},
+        {INT64_MAX - 4, 1, 5, 4, 0x3ff4000000000000, 0x3ffaaaaaaaaaaaab},
+        /* with a double for the long double (arm64 macOS before ext80.h): ...757 was ...758, ...71c was ...71d */
+        {-500000, 104729, 1000001, 999, 0x4233693617c19d70, 0x42336e30c29e2757},
+        {INT64_MIN + 1, INT64_MAX / 3, UINT64_MAX, 7, 0x47bc71c71c71c71c, 0x47c097b425ed097b},
+        {1, 1, 100, 3, 0x3fe5555555555555, 0x3ff0000000000000},
+    };
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        agg_state a;
+        agg_dev x;
+        agg_init(&a, TSDB_INT64);
+        agg_dev_init(&x);
+        for (uint64_t i = 0; i < cases[c].n; i++) {
+            /* first + (step * i mod `mod`), wrapping in two's complement */
+            int64_t xi = (int64_t)((uint64_t)cases[c].first + ((uint64_t)cases[c].step * i) % cases[c].mod);
+            a.count++;
+            a.isum += xi;
+            unsigned __int128 m = xi < 0 ? -(unsigned __int128)(__int128)xi : (unsigned __int128)xi;
+            isq_add(&x, m * m, 0);
+        }
+        tsdb_spread_bucket b;
+        agg_spread(TSDB_INT64, &a, &x, &b);
+        uint64_t vp, vs;
+        memcpy(&vp, &b.var_pop, sizeof vp);
+        memcpy(&vs, &b.var_samp, sizeof vs);
+        if (vp != cases[c].vp || vs != cases[c].vs) {
+            fprintf(stderr, "int variance, case %zu: var_pop %016" PRIx64 " (%.17g), var_samp %016" PRIx64
+                    " (%.17g); x87 gives %016" PRIx64 " and %016" PRIx64 "\n", c, vp, b.var_pop, vs, b.var_samp,
+                    cases[c].vp, cases[c].vs);
+            failures++;
+        }
+    }
+#if LDBL_MANT_DIG == 64
+    int bad = 0, runs = 2000000;
+    for (int r = 0; r < runs; r++) {
+        uint64_t d[4], n;
+        ext80_numerator(d);
+        switch (rndr(4)) {
+        case 0: n = 1 + (uint64_t)rndr(1000); break;
+        case 1: n = (UINT64_C(1) << rndr(64)) + (uint64_t)rndr(3) - 1; break;
+        case 2: n = rnd(); break;
+        default: n = rnd() >> rndr(64); break;
+        }
+        if (!n)
+            n = 1;
+        double p0, s0 = 0, p1, s1 = 0;
+        x87_variance(d, n, &p0, &s0);
+        ext80_variance(d, n, &p1, &s1);
+        if (memcmp(&p0, &p1, sizeof p0) != 0 || memcmp(&s0, &s1, sizeof s0) != 0) {
+            if (bad++ < 5)
+                fprintf(stderr, "ext80: d %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " n %" PRIu64
+                        ": %a %a, x87 %a %a\n", d[3], d[2], d[1], d[0], n, p1, s1, p0, s0);
+        }
+    }
+    failures += bad != 0;
+    printf("int variances: %zu known answers; the emulation as x87 on %d numerators, %d differ\n",
+           sizeof cases / sizeof cases[0], runs, bad);
+#else
+    printf("int variances: %zu known answers (x87's, through src/ext80.h here)\n", sizeof cases / sizeof cases[0]);
+#endif
+}
+
 int main(int argc, char **argv)
 {
+    test_int_variance_bits();
+#if LDBL_MANT_DIG < 64
+    /* the reference below is computed in long double and needs the x87 one (64-bit mantissa); where it is a plain
+     * double (arm64: macOS) it cannot even hold an int64, and the comparison would test the reference */
+    (void)argc, (void)argv;
+    printf("test_spread: the rest skipped, long double has %d mantissa bits here (the reference needs 64)\n",
+           LDBL_MANT_DIG);
+    return failures != 0;
+#endif
     snprintf(base, sizeof base, "%s/tsdb_spread_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     rmrf(base);
     char cmd[600];

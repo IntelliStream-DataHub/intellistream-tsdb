@@ -337,7 +337,9 @@ int cls_open(eng *db, bool read_only)
     pthread_mutex_init(&db->cls_mu, NULL);
     pthread_rwlockattr_t ra; /* a waiting switch holds new placements back: it is not starved by a stream of them */
     pthread_rwlockattr_init(&ra);
+#ifndef __APPLE__ /* macOS has no such kind (and no timed wait: compat.h polls) */
     pthread_rwlockattr_setkind_np(&ra, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
     pthread_rwlock_init(&db->cls_rw, &ra);
     pthread_rwlockattr_destroy(&ra);
     db->cls_fd = -1;
@@ -468,7 +470,7 @@ static int append_locked(eng *db, const cls_rec *r, size_t n)
         done += (size_t)w;
     }
     free(buf);
-    if (!err && db->opt.fsync && fdatasync(db->cls_fd) != 0)
+    if (!err && db->opt.fsync && tsdb_fdatasync(db->cls_fd) != 0)
         err = errno;
     if (err) {
         db->cls_broken = true; /* the file may end in a torn record: append no more */

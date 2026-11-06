@@ -17,6 +17,7 @@
 #include "auth_harness.h"
 #include "rfc7677.h"
 #include "client_hooks.h"
+#include "portable.h" /* pthread_barrier_t on macOS */
 
 #include <pthread.h>
 

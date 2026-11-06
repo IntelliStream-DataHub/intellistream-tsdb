@@ -22,6 +22,11 @@
 #include <unistd.h>
 #include <zstd.h>
 
+#ifdef __APPLE__ /* no SOCK_CLOEXEC, MSG_NOSIGNAL or TCP_KEEPIDLE: fcntl, SO_NOSIGPIPE and TCP_KEEPALIVE instead */
+#define SOCK_CLOEXEC 0
+#define TCP_KEEPIDLE TCP_KEEPALIVE
+#endif
+
 #define INSERT_FRAME_ROWS (8u << 20)
 /* the largest frame: f64 values, a bitmap and an id per row (unpacked), or their packed bound with zstd's margin */
 _Static_assert(TSDB_VALUES_HEADER + (uint64_t)INSERT_FRAME_ROWS * 24 + INSERT_FRAME_ROWS / 8 + 8 <= TSDB_MAX_FRAME &&
@@ -138,6 +143,13 @@ int tsdbc_connect_opts(const char *host, int port, const tsdbc_options *o, tsdbc
     int fd = -1;
     for (struct addrinfo *a = ai; a; a = a->ai_next) {
         fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
+#ifdef __APPLE__
+        if (fd >= 0) {
+            int one = 1;
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one); /* the library must not ignore SIGPIPE itself */
+        }
+#endif
         if (fd >= 0 && connect_within(fd, a->ai_addr, a->ai_addrlen, connect_ms) == 0)
             break;
         if (fd >= 0)

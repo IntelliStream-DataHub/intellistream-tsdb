@@ -597,7 +597,7 @@ void *merge_thread_main(void *arg)
 {
     eng *db = arg;
     part *sel[MAX_MERGE_PARTS];
-    pthread_setname_np(pthread_self(), "tsdb-merge");
+    tsdb_thread_name("tsdb-merge");
     pthread_mutex_lock(&db->lock);
     while (!atomic_load(&db->stop)) {
         size_t k = eng_check(db) ? 0 : select_merge_locked(db, sel, false); /* a failed engine writes nothing more */

@@ -18,7 +18,17 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#ifdef __linux__
 #include <sys/prctl.h>
+#else /* macOS has no subreaper: orphan and launcher_race, which need one, are skipped there */
+#define PR_SET_CHILD_SUBREAPER 0
+static int prctl(int op, long arg)
+{
+    (void)op, (void)arg;
+    errno = ENOSYS;
+    return -1;
+}
+#endif
 #include <sys/socket.h>
 
 static int failures;
@@ -530,10 +540,15 @@ int main(int argc, char **argv)
         rmrf(d4);
     }
 
+#ifdef __APPLE__
+    printf("  (orphan and launcher_race: skipped on macOS, which has no subreaper to adopt and reap the orphan)\n");
+    (void)orphan, (void)launcher_race;
+#else
     orphan(FOLLOW_PID);
     orphan(FOLLOW_PLAIN);
     orphan(FOLLOW_NONE);
     launcher_race();
+#endif
 
     stop(s1);
     stop(s2);

@@ -37,6 +37,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 static int failures;
 
 #define CHECK(cond)                                                                          \
@@ -172,11 +174,9 @@ ssize_t pread(int fd, void *buf, size_t n, off_t off)
 {
     int mode = atomic_load(&fault_mode);
     if (mode != FAULT_NONE) {
-        char link[64], target[PATH_MAX];
-        snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
-        ssize_t l = readlink(link, target, sizeof target - 1);
+        char target[PATH_MAX];
+        ssize_t l = fd_path(fd, target, sizeof target);
         if (l > 0) {
-            target[l] = '\0';
             const char *base = strrchr(target, '/');
             base = base ? base + 1 : target;
             if (strncmp(base, fault_name, strlen(fault_name)) == 0) {
@@ -198,9 +198,14 @@ ssize_t pread(int fd, void *buf, size_t n, off_t off)
             }
         }
     }
+#ifdef __APPLE__
+    return REAL(pread)(fd, buf, n, off);
+#else
     return syscall(SYS_pread64, fd, buf, n, off);
+#endif
 }
 
+#ifndef __APPLE__
 /* the fortified variant, which _FORTIFY_SOURCE builds call where the buffer's size is known */
 ssize_t __pread_chk(int fd, void *buf, size_t n, off_t off, size_t buflen);
 ssize_t __pread_chk(int fd, void *buf, size_t n, off_t off, size_t buflen)
@@ -209,6 +214,7 @@ ssize_t __pread_chk(int fd, void *buf, size_t n, off_t off, size_t buflen)
         abort();
     return pread(fd, buf, n, off);
 }
+#endif
 
 /* ------------------------------------------------------------- database */
 

@@ -8,6 +8,19 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+### Added
+
+- **macOS (Apple silicon and Intel) as a developer platform** ([docs/macos.md](docs/macos.md)), not for
+  production. `make` (zstd from Homebrew), `make test IO=epoll` and `make test-clients` work there; `tsdbd` runs its
+  epoll loop over kqueue (no io_uring), and the embedded Rust, Python and Java builds carry `libtsdb.dylib`. Every
+  `fsync` and `fdatasync` is followed by `fcntl(F_FULLFSYNC)`, because a plain `fsync` on macOS leaves the data in
+  the drive's cache (`TSDB_FAST_FSYNC=1` gives that up for throwaway data, and says so on stderr). A `tsdb import`
+  into a new directory syncs every file there, for want of `syncfs`. Integer variances have the same bits as on x86:
+  on Apple silicon `src/ext80.h` does in integers what x86 does in x87 `long double`. The crashfs power-loss runs, the
+  hung-volume tests, `make jepsen`, `make dist` and the sanitizers stay Linux only. The Linux build is unchanged:
+  the macOS code is behind `__APPLE__` or in inline `tsdb_*` wrappers that are the plain call on Linux, and the
+  Linux objects are the same machine code as before.
+
 ## [0.9.0] - 2026-11-05
 
 The first release. **Disk format version 8, wire protocol version 12** (the server and the clients refuse a peer

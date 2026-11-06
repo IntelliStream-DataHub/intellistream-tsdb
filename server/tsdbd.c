@@ -36,7 +36,7 @@
  *
  * --verify-checksums checks each granule's checksum before a query decodes it
  * (off by default: meant for storage without checksums of its own). Without it, a directory on ext2/3/4 or
- * XFS, which keep no checksums of the data, gets a line at startup that says so (fs_warn).
+ * XFS (macOS: APFS or HFS+), which keep no checksums of the data, gets a line at startup that says so (fs_warn).
  * --pin-index keeps each part's granule index and tombstones in memory as the open checked them (about 32 to 51
  * bytes per granule; the tsdb_pinned_index_bytes metric), so damage that reaches a part file later cannot change
  * which granules a query reads or the statistics it answers from. Off by default: then they are read in place.
@@ -109,6 +109,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
+#if defined(__APPLE__) && !defined(TSDBD_NO_URING) /* macOS: kqueue behind epoll_compat.h, no io_uring */
+#define TSDBD_NO_URING
+#endif
 #ifndef TSDBD_NO_URING /* make NO_URING=1: epoll only, no liburing needed at run time */
 #include <liburing.h>
 #endif
@@ -127,16 +130,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#ifdef __APPLE__
+#include "epoll_compat.h"
+#else
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
+#endif
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef __APPLE__ /* statfs, with the file system's name in f_fstypename (fs_warn) */
+#include <sys/mount.h>
+#else
 #include <sys/vfs.h>
+#endif
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "../src/compat.h" /* macOS: accept4, SOCK_CLOEXEC, thread stacks; nothing on Linux */
 
 #define RECV_MIN_FREE (16u << 10) /* per connection; grows for large frames */
 #define BUF_KEEP (256u << 10)      /* buffers grown past this shrink back when idle */
@@ -270,6 +283,51 @@ static tsdb *db;
 static struct io_uring ring;
 #endif
 static int wake_fd = -1;
+/* How the loop is woken from other threads and from the signal handler: an eventfd (an 8-byte counter) on Linux,
+ * the write end of a pipe on macOS (a byte each; a full pipe means a wakeup is already pending). */
+#ifdef __APPLE__
+static int wake_wr = -1;
+static void wake_signal(void)
+{
+    char b = 1;
+    if (write(wake_wr, &b, 1) != 1) {
+        /* EAGAIN: full, so the loop will wake anyway */
+    }
+}
+static void wake_drain(void)
+{
+    char b[256];
+    while (read(wake_fd, b, sizeof b) == (ssize_t)sizeof b)
+        ;
+}
+static int wake_open(void)
+{
+    int p[2];
+    if (pipe(p) != 0)
+        return -1;
+    for (int i = 0; i < 2; i++) {
+        fcntl(p[i], F_SETFD, FD_CLOEXEC);
+        fcntl(p[i], F_SETFL, fcntl(p[i], F_GETFL) | O_NONBLOCK);
+    }
+    wake_wr = p[1];
+    return p[0];
+}
+#else
+static void wake_signal(void)
+{
+    uint64_t one = 1;
+    if (write(wake_fd, &one, 8) != 8) {
+        /* the counter cannot overflow in practice; the main thread will see the note */
+    }
+}
+static void wake_drain(void)
+{
+    uint64_t v;
+    if (read(wake_fd, &v, 8) < 0 && errno != EAGAIN)
+        perror("tsdbd: eventfd");
+}
+static int wake_open(void) { return eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC); }
+#endif
 static atomic_int stopping; /* lock-free, so the signal handler may store it; read by failwatch too */
 #ifndef TSDBD_NO_URING
 static ev wake_ev = {EV_WAKE, NULL}, tick_ev = {EV_TICK, NULL};
@@ -351,6 +409,9 @@ static void worker_waits(int delta)
         pthread_attr_t at;
         pthread_attr_init(&at);
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+#ifdef __APPLE__
+        pthread_attr_setstacksize(&at, TSDB_THREAD_STACK);
+#endif
         pthread_t t;
         if (pthread_create(&t, &at, worker_main, (void *)1) == 0)
             running_workers++;
@@ -407,10 +468,8 @@ static void notify(conn *c, bool done)
     /* Whoever pushes onto an empty stack writes the eventfd; the main thread reads the eventfd before it takes the
      * stack, so a note pushed onto one not yet taken is seen without a write (a syscall saved per reply while the
      * main thread is busy). */
-    uint64_t one = 1;
-    if (!top && write(wake_fd, &one, 8) != 8) {
-        /* the counter cannot overflow in practice; the main thread will see the note */
-    }
+    if (!top)
+        wake_signal();
 }
 
 /* ------------------------------------------------------- reply writing */
@@ -1851,11 +1910,56 @@ static conn *ready_head, *ready_tail; /* epoll: connections that can make progre
 static size_t nready;
 static conn *park_head, *park_tail; /* not read from until request memory frees */
 static int tick_fd = -1;           /* a timerfd: once a second, the frame deadlines */
+#ifdef __APPLE__ /* no timerfd: a kqueue holding a one second timer, which the main kqueue can watch for reading */
+#define TICK_WHAT "kqueue timer"
+static int tick_open(void)
+{
+    int kq = kqueue();
+    struct kevent t;
+    EV_SET(&t, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE, 0, 1000 /* ms */, NULL);
+    if (kq < 0 || kevent(kq, &t, 1, NULL, 0, NULL) < 0) {
+        if (kq >= 0)
+            close(kq);
+        return -1;
+    }
+    fcntl(kq, F_SETFD, FD_CLOEXEC);
+    return kq;
+}
+static void tick_drain(void)
+{
+    struct kevent ev[4];
+    struct timespec zero = {0, 0};
+    kevent(tick_fd, NULL, 0, ev, 4, &zero);
+}
+#else
+#define TICK_WHAT "timerfd"
+static int tick_open(void)
+{
+    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    struct itimerspec second = {{1, 0}, {1, 0}};
+    if (fd < 0 || timerfd_settime(fd, 0, &second, NULL) != 0) {
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    return fd;
+}
+static void tick_drain(void)
+{
+    uint64_t v;
+    if (read(tick_fd, &v, 8) < 0 && errno != EAGAIN)
+        perror("tsdbd: timerfd");
+}
+#endif
 
 static int64_t mono_s(void)
 {
     struct timespec t;
+#ifdef CLOCK_MONOTONIC_COARSE /* whole seconds only: the coarse clock is enough, and cheaper */
     clock_gettime(CLOCK_MONOTONIC_COARSE, &t);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &t);
+#endif
     return (int64_t)t.tv_sec;
 }
 
@@ -2342,18 +2446,14 @@ static void unpark_some(void)
  * the server waits for its bytes (not one parked or held back by its own pipeline). */
 static void on_tick(void)
 {
-    uint64_t v;
-    if (read(tick_fd, &v, 8) < 0 && errno != EAGAIN)
-        perror("tsdbd: timerfd");
+    tick_drain();
     int64_t now = mono_s();
     static int64_t logged;
     static int64_t login_logged;
     if (start_ppid && getppid() != start_ppid && !stopping) { /* reparented: the parent is gone */
         fprintf(stderr, "tsdbd: --exit-with-parent: parent %d exited, stopping\n", (int)start_ppid);
         stopping = 1; /* as SIGTERM: the loop ends, requests in progress finish, the memtable is flushed */
-        uint64_t one = 1;
-        if (write(wake_fd, &one, 8) != 8) {
-        }
+        wake_signal();
     }
     for (conn *c = conns, *next; c; c = next) {
         next = c->next;
@@ -2523,9 +2623,7 @@ static void take_notes(void)
 
 static void on_wake(void)
 {
-    uint64_t v;
-    if (read(wake_fd, &v, 8) < 0 && errno != EAGAIN)
-        perror("tsdbd: eventfd");
+    wake_drain();
     take_notes();
 }
 
@@ -2673,11 +2771,35 @@ static size_t workers_now(void)
 static void *accept_main(void *arg)
 {
     int lfd = *(int *)arg;
+#ifdef __APPLE__ /* shutdown() does not wake an accept() there: poll, and look at `stopping` between the waits */
+    fcntl(lfd, F_SETFL, fcntl(lfd, F_GETFL) | O_NONBLOCK);
+#endif
     for (;;) {
+#ifdef __APPLE__
+        struct pollfd pf = {.fd = lfd, .events = POLLIN};
+        if (stopping)
+            return NULL;
+        int pr = poll(&pf, 1, 100);
+        if (pr < 0 && errno != EINTR)
+            return NULL;
+        if (pr <= 0)
+            continue;
+        if (pf.revents & (POLLHUP | POLLERR | POLLNVAL))
+            return NULL;
+#endif
+#ifdef __APPLE__ /* MSG_DONTWAIT does not stop a send on a blocking socket there: the event loop would wait for a client
+                  * that does not read. The sockets themselves must be non-blocking. */
+        int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+#else
         int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+#endif
         if (fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED)
                 continue;
+#ifdef __APPLE__
+            if (errno == EAGAIN)
+                continue;
+#endif
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
                 struct timespec d = {0, 10000000}; /* out of descriptors: let some close */
                 nanosleep(&d, NULL);
@@ -2694,9 +2816,7 @@ static void *accept_main(void *arg)
         }
         new_fds[nnew++] = fd;
         pthread_mutex_unlock(&note_lock);
-        uint64_t one = 1;
-        if (write(wake_fd, &one, 8) != 8) {
-        }
+        wake_signal();
     }
 }
 
@@ -2716,9 +2836,7 @@ static void *failwatch_main(void *arg)
             struct timespec grace = {0, 200000000}; /* replies in flight (TSDB_ERR_IO for writes) go out */
             nanosleep(&grace, NULL);
             stopping = 1;
-            uint64_t one = 1;
-            if (write(wake_fd, &one, 8) != 8) {
-            }
+            wake_signal();
             return NULL;
         }
         struct timespec d = {0, 20000000};
@@ -2731,23 +2849,21 @@ static void on_signal(int sig)
 {
     (void)sig;
     stopping = 1;
-    uint64_t one = 1;
-    if (write(wake_fd, &one, 8) != 8) {
-    }
+    wake_signal();
 }
 
 /* Binds and listens; *port_p is updated to the port actually bound, which is the kernel's choice for port 0. */
 static int listen_on(const char *addr, int *port_p)
 {
     int port = *port_p;
-    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = tsdb_socket_cloexec(AF_INET6, SOCK_STREAM, 0);
     struct sockaddr_in6 sa6 = {.sin6_family = AF_INET6, .sin6_port = htons((uint16_t)port)};
     struct sockaddr_in sa4 = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
     struct sockaddr *sa;
     socklen_t salen;
     if (inet_pton(AF_INET, addr, &sa4.sin_addr) == 1) {
         close(fd);
-        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        fd = tsdb_socket_cloexec(AF_INET, SOCK_STREAM, 0);
         sa = (struct sockaddr *)&sa4;
         salen = sizeof sa4;
     } else if (inet_pton(AF_INET6, addr, &sa6.sin6_addr) == 1) {
@@ -2781,7 +2897,13 @@ static int write_port_file(const char *path, int port, int mport)
     char tmp[4096];
     if (snprintf(tmp, sizeof tmp, "%s.tmp.XXXXXX", path) >= (int)sizeof tmp)
         return -1;
+#ifdef __APPLE__
+    int fd = mkstemp(tmp);
+    if (fd >= 0)
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+#else
     int fd = mkostemp(tmp, O_CLOEXEC);
+#endif
     if (fd >= 0 && fchmod(fd, 0644) != 0) {
         close(fd);
         unlink(tmp);
@@ -2833,7 +2955,11 @@ static void fs_warn(tsdb *t, int verify)
         struct statfs sf;
         if (!p || statfs(p, &sf) != 0)
             continue;
+#ifdef __APPLE__ /* f_type is only an index there; the name says it, and neither APFS nor HFS+ checksums data */
+        const char *fs = !strcmp(sf.f_fstypename, "apfs") ? "APFS" : !strcmp(sf.f_fstypename, "hfs") ? "HFS+" : NULL;
+#else
         const char *fs = sf.f_type == 0xEF53 ? "ext4" : sf.f_type == 0x58465342 ? "XFS" : NULL;
+#endif
         if (fs)
             fprintf(stderr, "tsdbd: %s is on %s, which keeps no checksums of its data, and --verify-checksums is off: "
                             "a damaged or misdirected data block would be read as wrong values. Turn on "
@@ -2996,6 +3122,10 @@ int main(int argc, char **argv)
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
         rl.rlim_cur = rl.rlim_max; /* one descriptor per connection */
+#ifdef __APPLE__ /* the hard limit is "infinity", which setrlimit refuses: the kernel's own cap */
+        if (rl.rlim_cur > OPEN_MAX)
+            rl.rlim_cur = OPEN_MAX;
+#endif
         setrlimit(RLIMIT_NOFILE, &rl);
     }
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && max_conns + 64 > rl.rlim_cur) {
@@ -3014,7 +3144,11 @@ int main(int argc, char **argv)
         metrics_enable(); /* before any connection: the hooks count from the start */
     if (metrics_on && (mfd = listen_on(metrics_addr ? metrics_addr : addr, &metrics_port)) < 0)
         return 1;
-    wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    wake_fd = wake_open();
+    if (wake_fd < 0) {
+        fprintf(stderr, "tsdbd: wake-up descriptor: %s\n", strerror(errno));
+        return 1;
+    }
 #ifdef TSDBD_NO_URING
     if (io == IO_URING) {
         fprintf(stderr, "tsdbd: io_uring: not in this build (NO_URING=1)\n");
@@ -3042,10 +3176,9 @@ int main(int argc, char **argv)
         io = rc < 0 ? IO_EPOLL : IO_URING;
     }
 #endif
-    tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    struct itimerspec second = {{1, 0}, {1, 0}};
-    if (tick_fd < 0 || timerfd_settime(tick_fd, 0, &second, NULL) != 0) {
-        fprintf(stderr, "tsdbd: timerfd: %s\n", strerror(errno));
+    tick_fd = tick_open();
+    if (tick_fd < 0) {
+        fprintf(stderr, "tsdbd: " TICK_WHAT ": %s\n", strerror(errno));
         return 1;
     }
     if (io == IO_EPOLL) {
@@ -3080,13 +3213,13 @@ int main(int argc, char **argv)
     }
     pthread_t acceptor, failwatch;
     for (int i = 0; i < nworkers; i++) {
-        if ((rc = pthread_create(&workers[i], NULL, worker_main, NULL)) != 0) {
+        if ((rc = tsdb_thread_create(&workers[i], worker_main, NULL)) != 0) {
             fprintf(stderr, "tsdbd: cannot start worker %d: %s\n", i + 1, strerror(rc));
             return 1;
         }
     }
-    if ((rc = pthread_create(&acceptor, NULL, accept_main, &lfd)) != 0 ||
-        (rc = pthread_create(&failwatch, NULL, failwatch_main, &lfd)) != 0) {
+    if ((rc = tsdb_thread_create(&acceptor, accept_main, &lfd)) != 0 ||
+        (rc = tsdb_thread_create(&failwatch, failwatch_main, &lfd)) != 0) {
         fprintf(stderr, "tsdbd: cannot start a thread: %s\n", strerror(rc));
         return 1;
     }

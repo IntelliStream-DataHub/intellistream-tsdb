@@ -246,7 +246,7 @@ static void check_series(tsdb *db, tsdb *truth, const model *md, tsdb_sid s, con
     free(all.p);
 }
 
-enum { WALK, STEPS, SPIKES, CONSTANT, MONOTONIC, NANINF, HUGE, NSHAPES };
+enum { WALK, STEPS, SPIKES, CONSTANT, MONOTONIC, NANINF, HUGE_SHAPE, NSHAPES };
 static const char *shape_name[] = {"walk", "steps", "spikes", "constant", "monotonic", "nan-inf", "huge"};
 
 /* one value of a shape as a double (the caller converts); *special: 1 NaN, 2 +inf, 3 -inf */
@@ -281,13 +281,13 @@ static void fill(int type, int shape, size_t n, int64_t *ts, void *vals, uint8_t
         switch (type) {
         case TSDB_FLOAT32:
             ((float *)vals)[i] = special == 1 ? NAN : special == 2 ? INFINITY : special == 3 ? -INFINITY
-                               : shape == HUGE ? (float)(v / 1e270) : (float)v;
+                               : shape == HUGE_SHAPE ? (float)(v / 1e270) : (float)v;
             break;
         case TSDB_FLOAT64:
             ((double *)vals)[i] = special == 1 ? NAN : special == 2 ? INFINITY : special == 3 ? -INFINITY : v;
             break;
         case TSDB_INT64:
-            ((int64_t *)vals)[i] = shape == HUGE ? (int64_t)(v / 1e290) : (int64_t)llround(v * 1000);
+            ((int64_t *)vals)[i] = shape == HUGE_SHAPE ? (int64_t)(v / 1e290) : (int64_t)llround(v * 1000);
             break;
         default:
             ((uint8_t *)vals)[i] = shape == CONSTANT ? 1 : v > 0 ? (uint8_t)(rnd() % 4 != 0) : (uint8_t)(rnd() % 4 == 0);

@@ -42,6 +42,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../src/compat.h" /* macOS: accept4, thread stacks; nothing on Linux */
+
 #ifndef TSDB_BUILD_VERSION
 #define TSDB_BUILD_VERSION "dev"
 #endif
@@ -625,7 +627,7 @@ int metrics_start(const metrics_cfg *c)
     if (fl < 0 || fcntl(cfg.listen_fd, F_SETFL, fl | O_NONBLOCK) != 0) /* accept_some loops until EAGAIN */
         return -errno;
     atomic_store(&stop_flag, false);
-    int rc = pthread_create(&thread, NULL, metrics_main, NULL);
+    int rc = tsdb_thread_create(&thread, metrics_main, NULL);
     if (rc)
         return -rc;
     started = true;

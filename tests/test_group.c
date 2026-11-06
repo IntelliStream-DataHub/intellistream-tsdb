@@ -17,6 +17,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 static int failures;
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -121,7 +123,7 @@ static long maxrss_mb(void)
 {
     struct rusage u;
     getrusage(RUSAGE_SELF, &u);
-    return u.ru_maxrss / 1024;
+    return RU_MAXRSS_KB(u) / 1024;
 }
 
 /* Local grouping a few periods at a time gives the buckets of one window over every bound, bit for bit,

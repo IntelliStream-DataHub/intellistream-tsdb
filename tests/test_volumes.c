@@ -18,6 +18,8 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 static int failures;
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -703,7 +705,7 @@ static void *add_thread(void *arg)
             if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '-' ||
                   *c == '_'))
                 *c = '_';
-        snprintf(x->fifo, sizeof x->fifo, "%s/META.tmp.%s.%ld.%ld", x->path, host, (long)getpid(), (long)gettid());
+        snprintf(x->fifo, sizeof x->fifo, "%s/META.tmp.%s.%ld.%ld", x->path, host, (long)getpid(), tsdb_gettid());
         CHECK(mkfifo(x->fifo, 0644) == 0);
         __atomic_store_n(&x->planted, 1, __ATOMIC_RELEASE);
     }
@@ -2095,9 +2097,31 @@ static void test_large_insert_reuses_buffers(const char *base)
 #endif
 }
 
+/* The hung-file-system tests park a reader on a FIFO, which blocks differently on macOS. */
+#ifdef __APPLE__
+#define HUNG_FS_TEST(fn, base)                                                                                      \
+    (printf("  (" #fn ": skipped on macOS, it simulates a hung file system with a FIFO, which blocks differently " \
+            "there)\n"),                                                                                            \
+     (void)fn, (void)(base))
+#else
+#define HUNG_FS_TEST(fn, base) fn(base)
+#endif
+
 int main(int argc, char **argv)
 {
+    tp_raise_nofile();
     const char *base = argc > 1 ? argv[1] : "/tmp";
+    /* canonical, as VOLUMES keeps paths (/tmp is /private/tmp on macOS); static: nothing for LeakSanitizer at exit.
+     * Kept in 400 bytes, a longer base refused: every path below is built in a fixed buffer and must fit whole. */
+    static char canon[PATH_MAX], base_buf[400];
+    if (realpath(base, canon))
+        base = canon;
+    if (strlen(base) >= sizeof base_buf) {
+        fprintf(stderr, "test_volumes: scratch directory longer than %zu bytes: %s\n", sizeof base_buf - 1, base);
+        return 1;
+    }
+    memcpy(base_buf, base, strlen(base) + 1);
+    base = base_buf;
     char root[512], va[512], vb[512], other[512], cmd[2200];
     snprintf(root, sizeof root, "%s/tsdb-vol-%d/root", base, (int)getpid());
     snprintf(va, sizeof va, "%s/tsdb-vol-%d/mount_a/sensors", base, (int)getpid());
@@ -2316,7 +2340,7 @@ int main(int argc, char **argv)
     /* an add that crashed after the volume's META and before its VOLUMES line: the directory holds our ROOT_ID and
      * a META with a number no line gives it; the open ignores it, and the retried add completes it, under the
      * number it gets then (the second one's was taken by another add in between) */
-    char crashed[2][600], rid[700], ridtext[64];
+    char crashed[2][600], rid[1300], ridtext[64]; /* rid: GCC sizes crashed[k] as both rows */
     snprintf(rid, sizeof rid, "%s/ROOT_ID", va);
     read_text(rid, ridtext, sizeof ridtext);
     for (int k = 0; k < 2; k++) {
@@ -2359,18 +2383,23 @@ int main(int argc, char **argv)
     test_concurrent_adds(base);
     test_open_waits_for_add(base);
     test_readd_other_path(base);
-    test_new_meta_write(base);
-    test_hung_volume(base);
+    HUNG_FS_TEST(test_new_meta_write, base);
+    HUNG_FS_TEST(test_hung_volume, base);
     test_volumes_same_size(base);
     test_volumes_damaged_lines(base);
-    test_hung_reload(base);
-    test_hung_new_volume(base);
-    test_follower_hung_new_volume(base);
+    HUNG_FS_TEST(test_hung_reload, base);
+    HUNG_FS_TEST(test_hung_new_volume, base);
+    HUNG_FS_TEST(test_follower_hung_new_volume, base);
     test_follower_open_race(base);
     test_meta_passing_mismatch(base);
     test_route_past_failed_record(base);
     test_reload_states_fails(base);
+#ifdef __APPLE__
+    printf("  (test_add_power_loss: skipped on macOS, it needs the crashfs LD_PRELOAD shim)\n");
+    (void)test_add_power_loss;
+#else
     test_add_power_loss(base, argv[0]);
+#endif
     test_series_ids(base);
     test_unique_names(base);
     test_duplicate_name(base);

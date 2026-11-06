@@ -27,8 +27,12 @@
  */
 #include "internal.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdlib.h>
+#if LDBL_MANT_DIG != 64
+#include "ext80.h"
+#endif
 
 /* The buckets one query may compute (TSDB_ERR_TOO_MANY_BUCKETS beyond), counted from the first to the last
  * reading in range: two readings far apart in 1 ms buckets ask for one per millisecond between them. 64 Mi let a
@@ -791,8 +795,9 @@ static void mul_add256(uint64_t u[4], int k, uint64_t x, uint64_t y)
 
 /* Integer variances from the exact sums: n^2 var_pop = n sum(x^2) - sum(x)^2,
  * a 256-bit integer, exact; converted once to long double (64-bit mantissa on
- * x86, so two roundings at most before the final one to double). Depends on
- * the multiset of values only: the same bits whatever the order. */
+ * x86, so two roundings at most before the final one to double; src/ext80.h
+ * does the same where long double is another format). Depends on the multiset
+ * of values only: the same bits whatever the order. */
 static void int_variance(const agg_state *a, const agg_dev *x, double *vp, double *vs)
 {
     uint64_t n = a->count, A[4] = {0}, B[4] = {0}, D[4];
@@ -811,12 +816,18 @@ static void int_variance(const agg_state *a, const agg_dev *x, double *vp, doubl
         D[i] = (uint64_t)d;
         borrow = (d >> 64) ? 1 : 0;
     }
+#if LDBL_MANT_DIG == 64
     long double num = 0;
     for (int i = 3; i >= 0; i--)
         num = num * 0x1p64L + (long double)D[i];
     long double ln = (long double)n;
     *vp = (double)(num / (ln * ln));
     *vs = n > 1 ? (double)(num / (ln * (long double)(n - 1))) : nan_canonical();
+#else
+    /* long double is not the x87 format here (arm64): the same arithmetic in integers, for the same bits */
+    *vs = nan_canonical();
+    ext80_variance(D, n, vp, vs);
+#endif
 }
 
 void agg_spread(int type, const agg_state *a, const agg_dev *x, tsdb_spread_bucket *b)

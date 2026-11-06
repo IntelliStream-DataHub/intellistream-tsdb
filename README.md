@@ -221,6 +221,9 @@ On RHEL or AlmaLinux, if `liburing-devel` is not found, enable the CRB repositor
 (`sudo dnf config-manager --set-enabled crb`), or leave liburing out and build with `make NO_URING=1`: io_uring is
 disabled by default there anyway, and tsdbd then uses epoll.
 
+On macOS (Apple silicon or Intel; a developer instance, not for production data) install `zstd` with Homebrew and run
+`make`; see [docs/macos.md](docs/macos.md) for what differs.
+
 The Rust, Python and Java clients need their own tools on top (`cargo`, `python3`, `mvn`); their READMEs say which.
 
 ### Quick start (5 minutes, one machine)

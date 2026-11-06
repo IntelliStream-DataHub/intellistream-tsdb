@@ -9,6 +9,7 @@
 #include "../server/users.h"
 #include "../client/tsdb_client.h"
 #include "../client/tsdb_crypto.h"
+#include "../src/compat.h" /* tsdb_fsync (macOS: with the drive's cache flush) */
 #include "tsdb.h"
 
 #include <errno.h>
@@ -227,7 +228,7 @@ static int ensure_dir(const char *dir)
     else
         snprintf(parent, sizeof parent, "%s", slash ? "/" : ".");
     int fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    int rc = fd < 0 || fsync(fd) != 0 ? -1 : 0;
+    int rc = fd < 0 || tsdb_fsync(fd) != 0 ? -1 : 0;
     if (fd >= 0)
         close(fd);
     if (rc)

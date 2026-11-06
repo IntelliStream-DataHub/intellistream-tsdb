@@ -70,6 +70,16 @@
       <activation><os><family>unix</family><name>Linux</name><arch>aarch64</arch></os></activation>
       <properties><tsdb.native.platform>linux-aarch64</tsdb.native.platform></properties>
     </profile>
+    <profile>
+      <id>macos-aarch64</id>
+      <activation><os><family>mac</family><arch>aarch64</arch></os></activation>
+      <properties><tsdb.native.platform>macos-aarch64</tsdb.native.platform></properties>
+    </profile>
+    <profile>
+      <id>macos-x86_64</id>
+      <activation><os><family>mac</family><arch>x86_64</arch></os></activation>
+      <properties><tsdb.native.platform>macos-x86_64</tsdb.native.platform></properties>
+    </profile>
   </profiles>
 
   <build>
@@ -87,6 +97,7 @@
         <directory>${tsdb.native.dir}</directory>
         <includes>
           <include>libtsdb.so</include>
+          <include>libtsdb.dylib</include>
         </includes>
         <targetPath>ai/intellistream/tsdb/embedded/native/${tsdb.native.platform}</targetPath>
       </resource>

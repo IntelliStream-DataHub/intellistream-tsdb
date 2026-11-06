@@ -13,6 +13,15 @@ trap 'rm -rf "$dir"' EXIT
 errors=0
 fail() { echo "test_cli_users: FAIL: $*" >&2; errors=$((errors + 1)); }
 u() { "$B/tsdb" "$dir/db" user "$@"; }
+fsize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; } # GNU, then BSD (macOS) stat
+fmode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+nosid() { # runs a command in a new session, without a controlling terminal (macOS has no setsid command)
+    if command -v setsid >/dev/null; then
+        setsid "$@"
+    else
+        perl -MPOSIX -e 'POSIX::setsid() >= 0 or die; exec @ARGV' "$@"
+    fi
+}
 refused() { # refused <what> <args...>: the command must fail and leave USERS as it was
     local what=$1
     shift
@@ -24,7 +33,7 @@ refused() { # refused <what> <args...>: the command must fail and leave USERS as
 
 # the first superuser, before the database exists (the quick start's order)
 TSDB_PASSWORD=pencil u add root --superuser >/dev/null || fail "add root"
-[ "$(stat -c %a "$dir/db/USERS")" = 600 ] || fail "USERS is not mode 600"
+[ "$(fmode "$dir/db/USERS")" = 600 ] || fail "USERS is not mode 600"
 printf 'hunter2\nignored\n' > "$dir/pw"
 u add acme/bob --password-file "$dir/pw" >/dev/null || fail "add with --password-file"
 u list | grep -q $'^root\tuid 1\tsuperuser$' || fail "list root"
@@ -34,7 +43,7 @@ u list | grep -q $'^acme/bob\tuid 2$' || fail "list bob"
 refused "--password on the command line" add x --password secret
 refused "--password=... on the command line" add x --password=secret
 TSDB_PASSWORD= refused "an empty password" add x
-env -u TSDB_PASSWORD setsid "$B/tsdb" "$dir/db" user add y </dev/null >/dev/null 2>&1 \
+env -u TSDB_PASSWORD nosid "$B/tsdb" "$dir/db" user add y </dev/null >/dev/null 2>&1 \
     && fail "a password with no terminal and no file was accepted"
 TSDB_PASSWORD=x refused "an existing user" add acme/bob
 TSDB_PASSWORD=x refused "a bad user name" add /root
@@ -94,10 +103,10 @@ TSDB_PASSWORD=pencil u add root --superuser >/dev/null || fail "add root again"
 
 # compact keeps every fact
 u list > "$dir/before"
-s0=$(stat -c %s "$dir/db/USERS")
+s0=$(fsize "$dir/db/USERS")
 u compact || fail "compact"
 u list | diff - "$dir/before" >/dev/null || fail "compact changed the users"
-[ "$(stat -c %s "$dir/db/USERS")" -lt "$s0" ] || fail "compact did not shrink USERS"
+[ "$(fsize "$dir/db/USERS")" -lt "$s0" ] || fail "compact did not shrink USERS"
 refused "an unknown verb" frobnicate
 "$B/tsdb" "$dir/nowhere" user list >/dev/null 2>&1 && fail "list of a missing directory"
 
@@ -156,7 +165,7 @@ for r in $(seq 1 15); do
     u grant rt/a "$text" "name:rt/$r" || fail "grant $text"
 done
 u list | awk -F'\t' '$3 ~ /^name:rt\// {print $2 "\t" $3}' > "$dir/printed"
-[ "$(wc -l < "$dir/printed")" = 15 ] || fail "rights round trip: $(wc -l < "$dir/printed") grants listed, not 15"
+[ "$(wc -l < "$dir/printed")" -eq 15 ] || fail "rights round trip: $(wc -l < "$dir/printed") grants listed, not 15"
 while IFS=$'\t' read -r text sel; do u grant rt/b "$text" "$sel" || fail "printed rights $text do not parse"; done \
     < "$dir/printed"
 u list | awk -F'\t' '$3 ~ /^name:rt\// {print $2 "\t" $3}' | sort | uniq -c | awk '$1 != 2' | grep -q . \
