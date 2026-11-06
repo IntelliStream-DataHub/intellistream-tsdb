@@ -287,6 +287,38 @@ static void revalidation(void)
     tsdb_close(db);
 }
 
+/* tsdb_latest (merged from latest-s1) routes like the other calls: it holds a reference on the engine of every id
+ * until it returns (else a quiesce never gets idle), and an id on a quiesced volume is UNAVAILABLE, not NOTFOUND. */
+static void latest_quiesced(void)
+{
+    char root[1024], vol[1024];
+    snprintf(root, sizeof root, "%s/latest_q_root", scratch);
+    snprintf(vol, sizeof vol, "%s/latest_q_vol", scratch);
+    sh("rm -rf '%s' '%s'", root, vol);
+    tsdb_sid s, r;
+    tsdb *db = reval_open(root, vol, &s, "lat");
+    OK(tsdb_series_at(db, "rootlat", root, &r));
+    int64_t ts[10];
+    float v[10];
+    for (int i = 0; i < 10; i++)
+        ts[i] = i, v[i] = (float)i;
+    OK(tsdb_insert_series(db, s, ts, v, 10));
+    OK(tsdb_insert_series(db, r, ts, v, 10));
+    tsdb_sid ids[2] = {s, r};
+    tsdb_latest_result out[2];
+    OK(tsdb_latest(db, ids, 2, NULL, out));
+    CHECK(out[0].status == 0 && out[0].ts == 9 && out[1].status == 0 && out[1].ts == 9);
+    CHECK(tsdb_volume_quiesce(db, 1) == 0);
+    CHECK(tsdb_volume_idle(db, 1, 2000) == 0); /* a leaked reference of the call above keeps it busy */
+    OK(tsdb_latest(db, ids, 2, NULL, out));
+    CHECK(out[0].status == TSDB_ERR_UNAVAILABLE);
+    CHECK(out[1].status == 0 && out[1].ts == 9); /* the other volume goes on */
+    OK(tsdb_volume_resume(db, 1));
+    OK(tsdb_latest(db, ids, 2, NULL, out));
+    CHECK(out[0].status == 0 && out[0].ts == 9);
+    tsdb_close(db);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1)
@@ -366,6 +398,7 @@ int main(int argc, char **argv)
     CHECK(count(db, b) == 52);
     tsdb_close(db);
     revalidation();
+    latest_quiesced();
     if (failures) {
         fprintf(stderr, "test_recover: %d failures\n", failures);
         return 1;

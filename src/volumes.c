@@ -2328,8 +2328,13 @@ int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *
     for (size_t i = 0; i < n; i++) {
         eng *e;
         uint32_t local;
-        if (!sid_malformed(ids[i]) && route(t, ids[i], &e, &local))
-            it[m++] = (latest_item){e, local, (uint32_t)i};
+        int rrc = 0;
+        if (sid_malformed(ids[i]))
+            continue;
+        if (route_q(t, ids[i], &e, &local, &rrc))
+            it[m++] = (latest_item){e, local, (uint32_t)i}; /* holds the engine's reference until the end */
+        else if (rrc)
+            out[i].status = rrc; /* a quiesced volume: UNAVAILABLE, not NOTFOUND (ha.md 15.5) */
     }
     qsort(it, m, sizeof *it, cmp_latest_item);
     size_t nc = 0;
@@ -2353,6 +2358,8 @@ int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *
         rc = atomic_load(&j.rc);
         qs_end(&qr, -1, m);
     }
+    for (size_t i = 0; i < m; i++)
+        eng_unref(&it[i].e);
     free(it);
     free(cstart);
     return rc;
