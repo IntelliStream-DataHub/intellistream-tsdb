@@ -75,6 +75,12 @@ int fno_create(int dirfd, uint64_t next, bool sync)
     return !sync || tsdb_fsync(dirfd) == 0 ? 0 : TSDB_ERR_IO;
 }
 
+/* One page of FNO as the file holds it (tests build files with a chosen slot, torn or not). */
+void fno_slot_page(uint8_t *page, uint64_t next, uint64_t gen)
+{
+    slot_fill(page, next, gen);
+}
+
 /* Whether the directory has an FNO file whose two slots are both valid (an upgrade that died after making it, and
  * runs again, keeps it; any other file is made anew). */
 bool fno_file_intact(int dirfd)
@@ -130,7 +136,8 @@ int fno_load(eng *db, uint64_t *next, uint64_t *gen, int *slot, bool *torn)
 /* FNO holds at least `v` once this returns 0. A failure fails the engine. */
 int fno_require(eng *db, uint64_t v)
 {
-    if (db->fno_fd < 0 || v <= atomic_load_explicit(&db->fno_durable, memory_order_acquire))
+    if (db->fno_fd < 0 || v <= atomic_load_explicit(&db->fno_durable, memory_order_acquire) ||
+        eng_test_mutant == MUT_FNO_NOSYNC) /* planted: a segment goes without FNO holding its end (tests/test_fno.c) */
         return 0;
     pthread_mutex_lock(&db->fno_lock);
     int rc = 0;

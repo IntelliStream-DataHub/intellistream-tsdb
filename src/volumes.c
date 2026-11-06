@@ -322,14 +322,14 @@ static void paths_free(char **p, size_t n)
 }
 
 /* A name the engine of a volume would take for a file of its own beyond MANIFEST, SERIES and LOCK (an engine's,
- * checked apart) and META (an add's too): its open replays a WAL segment, cuts what it reads as the torn tail of
+ * checked apart) and META and FNO (an add's too: it makes FNO before META): its open replays a WAL segment, cuts what it reads as the torn tail of
  * STATES, RETENTION or CLASSES, runs an intent, opens a part, deletes a part's temporary, a retired part or
  * META.tmp. That exact name is written only by an engine making its own META (meta_write), never into a directory
  * before it is added, so it is a user's file; an add's own temporaries (META.tmp.HOST.PID.TID, which a concurrent
  * or crashed add of the same directory leaves) stay allowed. */
 static bool engine_file_name(const char *name)
 {
-    static const char *const fixed[] = {"STATES", "RETENTION", "CLASSES", "META.tmp", "FNO", "FNO.tmp"};
+    static const char *const fixed[] = {"STATES", "RETENTION", "CLASSES", "META.tmp"};
     for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++)
         if (strcmp(name, fixed[i]) == 0)
             return true;
@@ -377,7 +377,7 @@ static int volume_dir_prepare(const char *canon, uint64_t id, bool sync)
         return TSDB_ERR_IO;
     }
     static const char *const root_files[] = {ID_FILE, VOLUMES_FILE};
-    static const char *const eng_files[] = {"MANIFEST", "SERIES", "LOCK", "FNO"};
+    static const char *const eng_files[] = {"MANIFEST", "SERIES", "LOCK"};
     const char *why = NULL;
     for (size_t i = 0; !why && i < sizeof root_files / sizeof *root_files; i++)
         if (faccessat(fd, root_files[i], F_OK, AT_SYMLINK_NOFOLLOW) == 0)
@@ -503,7 +503,7 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     meta_tmp_make(tmp, sizeof tmp); /* our own: another add of this directory may be writing META right now */
     int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     /* the volume's FNO (fno.c), made and synced with its directory before META says the volume is there */
-    if (fd >= 0 && faccessat(fd, FNO_FILE, F_OK, 0) != 0 && errno == ENOENT && fno_create(fd, 1, sync) != 0) {
+    if (fd >= 0 && !fno_file_intact(fd) && fno_create(fd, 1, sync) != 0) {
         int e = errno;
         close(fd);
         free(buf);

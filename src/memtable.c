@@ -1296,6 +1296,28 @@ static int wal_open_numbers(eng *db, const seg *segs, size_t nseg)
     db->fno_gen = gen;
     atomic_store(&db->fno_durable, fno);
     db->fno_next = MAX(next, fno);
+    if (eng_test_mutant == MUT_FNO_REUSE) { /* planted: numbers restart from what parts hold (tests/test_fno.c) */
+        db->fno_next = 1;
+        for (size_t i = 0; i < db->nparts; i++)
+            if (db->parts[i]->fno_hi)
+                db->fno_next = MAX(db->fno_next, db->parts[i]->fno_hi + 1);
+    } else if (eng_test_mutant == MUT_FNO_MANIFEST_ONLY) { /* planted: MANIFEST's number is the bound, not FNO's */
+        uint64_t m = 0;
+        int mfd = openat(db->dirfd, "MANIFEST", O_RDONLY | O_CLOEXEC);
+        FILE *f = mfd >= 0 ? fdopen(mfd, "r") : NULL;
+        char line[128];
+        while (f && fgets(line, sizeof line, f))
+            if (sscanf(line, "fno_next %" SCNu64, &m) == 1)
+                break;
+        if (f)
+            fclose(f);
+        db->fno_next = MAX(m, 1);
+        for (size_t i = 0; i < db->nparts; i++)
+            if (db->parts[i]->fno_hi)
+                db->fno_next = MAX(db->fno_next, db->parts[i]->fno_hi + 1);
+        for (size_t k = 0; k < nseg; k++)
+            db->fno_next = MAX(db->fno_next, segs[k].fno_end);
+    }
     return 0;
 }
 
@@ -1384,6 +1406,8 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         while (rc == 0 && (rec = wal_record(buf + pos, len - pos, segs[k].seq, pos, &wr)) != 0) {
             const uint8_t *r = wr.payload;
             size_t n = wr.kind == WAL_KIND_ROWS ? wr.n : 0; /* a marker is skipped; its numbers are counted */
+            if (eng_test_mutant == MUT_MARKER_ROWS && wr.kind == WAL_KIND_MARKER)
+                n = wr.n / WAL_ROW; /* planted: a marker's payload replayed as rows (tests/test_fno.c) */
             for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
                 uint32_t id;
                 int64_t ts;
