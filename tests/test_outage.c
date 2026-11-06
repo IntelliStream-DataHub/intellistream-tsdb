@@ -189,6 +189,10 @@ static void verify(const char *what, side *s)
     CHECK(tsdbc_connect_timeout("127.0.0.1", port, 3000, &c) == 0);
     if (!c)
         return;
+    /* The writers go on while this runs: judge only what was acknowledged or refused before the read began (a row
+     * acknowledged after the query started is not expected in its answer). */
+    int64_t nacked = s->nacked, nrefused = s->nrefused;
+    atomic_thread_fence(memory_order_seq_cst);
     seen got = {0};
     int rc = -1;
     for (int i = 0; i < 300 && rc != 0; i++) {
@@ -202,14 +206,14 @@ static void verify(const char *what, side *s)
         failures++;
     }
     int64_t lost = 0, ghost = 0;
-    for (int64_t i = 0; i < s->nacked; i++)
+    for (int64_t i = 0; i < nacked; i++)
         if (!has(&got, s->acked[i]))
             lost++;
-    for (int64_t i = 0; i < s->nrefused; i++)
+    for (int64_t i = 0; i < nrefused; i++)
         if (has(&got, s->refused[i]))
             ghost++;
     fprintf(stderr, "%s: %s: %lld acknowledged, %lld refused, %lld indeterminate, %zu rows; lost %lld, refused but visible %lld\n",
-            what, s->name, (long long)s->nacked, (long long)s->nrefused, (long long)s->maybe, got.n, (long long)lost,
+            what, s->name, (long long)nacked, (long long)nrefused, (long long)s->maybe, got.n, (long long)lost,
             (long long)ghost);
     CHECK(lost == 0);
     CHECK(ghost == 0);
