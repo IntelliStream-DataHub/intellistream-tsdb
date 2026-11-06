@@ -1062,6 +1062,28 @@ static void install_crash(int drop_kept)
 static void scen_install(void) { install_crash(0); }
 static void scen_reseed(void) { install_crash(1); }
 
+/* An install that takes longer than voter_replace_s (here: the new servers drop the leader's images for 6 s). A core
+ * booted by the leader's first APPEND has an empty configuration until the image arrives; it must keep sending
+ * heartbeats, or the leader marks it down, removes it as a learner, and never adds it again (seen once under TSan on a
+ * loaded machine: a learner at applied 0, "not heard" for 30 s). */
+static void scen_slowinstall(void)
+{
+    scenario("slowinstall");
+    envs[0] = "snap_every=2,snap_retain=1,seg_bytes=200";
+    envs[1] = envs[2] = "snap_every=2,snap_retain=1,seg_bytes=200,hold_install_ms=6000";
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_fast(0);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters after installs slower than voter_replace_s");
+    check_all_agree(0, 3);
+    if (log_has(0, "removes learner"))
+        die("the leader removed a learner whose install was on its way");
+    printf("  installs slower than voter_replace_s: the learners stay heard, are kept, and become voters\n");
+}
+
 /* the leader stopped while a node add is in flight; the next leader adds another server; the first again */
 static void scen_ids(void)
 {
@@ -1239,6 +1261,7 @@ int main(int argc, char **argv)
         void (*fn)(void);
     } all[] = {{"secret", scen_secret},     {"relay", scen_relay},     {"initcrash", scen_initcrash},
                {"dirsync", scen_dirsync},   {"install", scen_install}, {"reseed", scen_reseed},
+               {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"life", scen_life}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {

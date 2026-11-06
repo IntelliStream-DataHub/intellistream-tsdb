@@ -842,9 +842,11 @@ static struct {
     uint64_t hint_term, hint_commit;
     uint64_t watch_behind_since; /* when the watch stream first stayed behind hint_commit; 0: it does not */
 
-    /* TSDB_CLUSTER_TEST (tests only): snap_every=N, snap_retain=N, seg_bytes=N, fail_snap_dirsync=1 */
+    /* TSDB_CLUSTER_TEST (tests only): snap_every=N, snap_retain=N, seg_bytes=N, fail_snap_dirsync=1,
+     * hold_install_ms=N (installs dropped until N ms after the first arrived: a slow one) */
     uint64_t snap_every, snap_retain, seg_bytes;
     int fail_snap_dirsync;
+    uint64_t hold_install_ns, hold_from;
 
     struct buf fb; /* the frame being built; never held across a call that builds another */
     raft_entry ents[RAFT_WIRE_MAX_ENTRIES];
@@ -1042,6 +1044,8 @@ static void test_knobs(void)
             C.seg_bytes = v;
         else if (sscanf(p, "fail_snap_dirsync=%llu", &v) == 1)
             C.fail_snap_dirsync = v != 0;
+        else if (sscanf(p, "hold_install_ms=%llu", &v) == 1)
+            C.hold_install_ns = v * 1000000ull;
         p = strchr(p, ',');
         if (p)
             p++;
@@ -1868,6 +1872,13 @@ static void on_raft(struct conn *c, struct rd *r)
     }
     if (m.to != C.id || m.from != c->id)
         return;
+    if (m.type == RAFT_MSG_SNAPSHOT && C.hold_install_ns) {
+        uint64_t now = iso_now_ns();
+        if (!C.hold_from)
+            C.hold_from = now;
+        if (since(now, C.hold_from) < C.hold_install_ns)
+            return; /* lost on the way, as far as the leader knows: it sends the image again */
+    }
     if (m.type == RAFT_MSG_SNAPSHOT) {
         m.u.snapshot.data = r->p + r->off + wl;
         m.u.snapshot.len = r->len - r->off - wl;
@@ -2515,13 +2526,22 @@ static void heartbeat(uint64_t now)
     putstr(&C.fb, C.adv);
     putstr(&C.fb, C.padv); /* a restart may have moved it (another port, another host) */
     frame_end(&C.fb);
+    /* A core booted by a leader's message holds an empty configuration until its first install arrives; it must
+     * still be heard, or the leader marks it down and removes it as a learner before the image reaches it, and a
+     * member never heard is never added again. So the leader the core knows gets the heartbeat too. */
+    uint32_t lead = C.r ? (uint32_t)raft_get_leader(C.r) : 0;
     for (unsigned i = 0; i < cfg.n; i++) {
+        if (cfg.m[i].id == lead)
+            lead = 0;
         if (cfg.m[i].learner || cfg.m[i].id == C.id)
             continue;
         struct conn *c = conn_to(cfg.m[i].id); /* builds no frame */
         if (c)
             conn_send(c, 0);
     }
+    struct conn *c = lead && lead != C.id ? conn_to(lead) : NULL;
+    if (c)
+        conn_send(c, 0);
 }
 
 /* MEMBER_ADDR when `h` names other addresses than the record (h NULL: none), then MEMBER_STATE when state >= 0 */

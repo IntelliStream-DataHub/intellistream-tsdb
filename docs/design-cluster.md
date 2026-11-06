@@ -164,6 +164,8 @@ and stay with the volumes.
   host), the Raft leader records the new ones (MEMBER_ADDR, with the up of the new incarnation; never another live
   member's peer address, never an earlier run's). Every server keeps the voters' peer addresses in its `meta/NODE`
   as seeds, rewritten when they change, so that a restarted server can find the group before anyone reaches it.
+  A learner whose core a leader's message started has no configuration until its first image arrives; it sends its
+  heartbeats to that leader meanwhile, or a slow install would get it marked down and removed, never to be heard again.
 - **Peer links** (`server/cluster.c`, step 1) prove the cluster secret both ways in a handshake whose MACs cover
   everything either side claims (HELLO's body with the node id, uuid, identity, nonce and peer address, and
   HELLO_ACK's fields): a relay that changes a claim fails. Every frame after it carries an HMAC tag under a key per
@@ -787,7 +789,7 @@ performance; above them, the cluster stays correct and slows down.
   every run with a quiet stretch in which everyone is a voter again and every server must catch up.
   `tests/test_cluster.c` runs real tsdbd servers through named scenarios (a wrong secret and oversized
   pre-handshake frames, a relayed handshake, crashes during init and during an install (the kept image, and the
-  reseed without it), a failed snapshot directory fsync, ids under a leader change and an impostor, a watcher on a
+  reseed without it), a failed snapshot directory fsync, an install slower than `voter_replace_s`, ids under a leader change and an impostor, a watcher on a
   paused voter, and the life cycle: growth to 5 voters, a killed leader, replacement, restart).
 - **The replication core** (`src/repl.c`, sans-IO like the Raft core: records, ACKs, fences, commit points and ISR
   changes go in; sends, syncs, applies and cuts come out) under its own simulator: a fake disk that loses what was not
