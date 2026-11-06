@@ -100,9 +100,12 @@ typedef struct side {
     tsdb_sid id;
     const char *name;
     int64_t next;                   /* the next ts to write */
-    int64_t acked[20000], nacked;   /* the server said ok */
-    int64_t refused[20000], nrefused; /* UNAVAILABLE: not applied */
-    int64_t maybe, worst_ok_ms;     /* indeterminate answers; the slowest acknowledged call */
+    /* the counts are read by the main thread while the writer runs: an entry is stored before its count grows */
+    int64_t acked[20000];
+    _Atomic int64_t nacked;         /* the server said ok */
+    int64_t refused[20000];
+    _Atomic int64_t nrefused;       /* UNAVAILABLE: not applied */
+    _Atomic int64_t maybe, worst_ok_ms; /* indeterminate answers; the slowest acknowledged call */
     int refused_fast;               /* UNAVAILABLE answers that came in under 500 ms */
 } side;
 
@@ -122,18 +125,24 @@ static void *writer(void *arg)
         int rc = tsdbc_insert_series(c, s->id, &ts, &v, 1);
         double dt = now_ms() - t0;
         if (rc == 0) {
-            if (s->nacked < 20000)
-                s->acked[s->nacked++] = ts;
-            if (dt > s->worst_ok_ms)
-                s->worst_ok_ms = (int64_t)dt;
+            int64_t n = atomic_load(&s->nacked);
+            if (n < 20000) {
+                s->acked[n] = ts;
+                atomic_store(&s->nacked, n + 1);
+            }
+            if (dt > atomic_load(&s->worst_ok_ms))
+                atomic_store(&s->worst_ok_ms, (int64_t)dt);
         } else if (rc == TSDB_ERR_UNAVAILABLE) {
-            if (s->nrefused < 20000)
-                s->refused[s->nrefused++] = ts;
+            int64_t n = atomic_load(&s->nrefused);
+            if (n < 20000) {
+                s->refused[n] = ts;
+                atomic_store(&s->nrefused, n + 1);
+            }
             if (dt < 500)
                 s->refused_fast++;
             msleep(20);
         } else {
-            s->maybe++;
+            atomic_fetch_add(&s->maybe, 1);
             msleep(20);
             if (rc == TSDB_ERR_IO) { /* the connection may be gone */
                 tsdbc_close(c);

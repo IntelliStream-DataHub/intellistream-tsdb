@@ -744,14 +744,16 @@ JEPSEN_DIR ?= /tmp/tsdb-jepsen-$(shell printf %s "$(CURDIR)" | cksum | cut -d' '
 # large inserts, replaces and deletes race the switches; see tests/jepsen/jepsen.c).
 JEPSEN_SEEDS ?= 1 2 3
 JEPSEN_WORKLOADS ?= kv classes
-# Misdirected I/O (with verify_checksums and without) and damage at rest run on the kv workload only: they test the
+# Storage outages (outage: one volume of two hung, failing or slow, or the server killed; no write lost or refused-yet-
+# visible, the other volume keeps its pace) and misdirected I/O (with verify_checksums and without) and damage at rest
+# run on the kv workload only: they test the
 # engine's checks, which do not depend on the workload. JEPSEN_SECONDS, when set, is the length of every run (the
 # weekly CI run sets it, with one power seed); otherwise each nemesis has its own short default.
 JEPSEN_SECONDS ?=
 # Then kv once more with login (--auth: USERS made by $(B)/tsdb, every client logs in at every reconnect) under kill
 # and one power seed, per backend.
 jsec = $(if $(JEPSEN_SECONDS),$(JEPSEN_SECONDS),$(1))
-jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so jepsen-selftest
+jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so jepsen-selftest
 	for io in $(IO); do for wl in $(JEPSEN_WORKLOADS); do echo "== tsdbd --io $$io, workload $$wl"; \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis kill  --seconds $(call jsec,20) && \
 	    for seed in $(JEPSEN_SEEDS); do \
@@ -761,6 +763,8 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so jepsen-selftest
 	        --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis pause --seconds $(call jsec,10) && \
 	    if [ $$wl = kv ]; then \
+	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis outage --seconds $(call jsec,40) \
+	            --outagefs $(B)/liboutagefs.so && \
 	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
 	            --crashfs $(B)/libcrashfs.so --verify-checksums && \
 	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \

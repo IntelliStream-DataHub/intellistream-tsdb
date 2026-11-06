@@ -2,7 +2,7 @@
  * A Jepsen-style test of tsdbd: clients write and read through the network
  * while a nemesis crashes the server, and a checker verifies the history.
  *
- *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|none] [--seconds 20]
+ *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|none] [--seconds 20]
  *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]
  *          [--verify-checksums] [--auth]
  *
@@ -31,6 +31,16 @@
  * may stop or carry on, and then loses power (or, if idle, is stopped with
  * SIGTERM).
  * After each fault the server is restarted.
+ *
+ * Outage (--outagefs build/liboutagefs.so; workload kv, no login): the series live in two volumes (series s in volume
+ * s % 2), each a storage domain of tsdbd (--health-domain) under the outagefs shim, and a client works the series of
+ * one volume only. The nemesis hangs one volume (past the DOWN threshold, which TSDBD_TEST_HEALTH scales to seconds,
+ * or for a stall shorter than it), fails it with EIO, slows it, or kills the server (also while a volume hangs). The
+ * claim (ha.md 15): the volume refuses with TSDB_ERR_UNAVAILABLE ("not applied": check 2 sees every such write as a
+ * definite failure) while the server goes on, the other volume keeps at least 80% of its pace, the volume takes
+ * writes again within 30 s of the heal by a recovery in place, and nothing acknowledged is lost (checks 1, 3, 4, 5
+ * after each recovery and at the end). A server that ends by itself is a violation. Not covered yet: rollback (a
+ * server that lost acknowledged writes: the model has no way to say which), a hung volume at open (no deadline, O5).
  *
  * Damage: misdirect and rot. The claim: tsdb answers correctly or reports the damage (a query or write fails with
  * TSDB_ERR_CORRUPT, the open is refused, or the server stops), and never gives a silent wrong answer or loses an
@@ -118,6 +128,7 @@
 #include <unistd.h>
 
 #include "../harness.h"
+#include "../outagefs_ctl.h"
 
 #define NSERIES 4        /* kv */
 #define NKEYS 6000
@@ -225,6 +236,14 @@ static bool damaged;                /* the database is refused or unreadable: fi
 static int refused_faulty, refused_clean, md_failstops, md_crashes, tail_cuts;
 static atomic_int read_damage, write_damage; /* requests that failed with TSDB_ERR_CORRUPT or TSDB_ERR_IO */
 static int loss_violations;         /* of the violations, those of checks 1, 3 and 4 (a write lost or not seen) */
+/* outage: series s lives in volume s % 2; each volume is a storage domain of tsdbd (--health-domain) under the
+ * outagefs shim (build/liboutagefs.so), which the nemesis hangs, fails and slows one volume at a time (ha.md 15.8) */
+static bool outage;                 /* --nemesis outage */
+static const char *outagefs_lib;    /* --outagefs */
+static char vol_dir[2][PATH_MAX], octl[PATH_MAX]; /* the two volume directories; the shim's control socket */
+static atomic_llong vol_ok[2], vol_last_ok[2];    /* acknowledged writes per volume; ns of the latest */
+static int outage_problems, outage_faults, outage_kills;
+static double healthy_ops, healthy_secs, healthy_base_ops; /* B's writes during A's outage, and what B did before */
 
 #define CL_STR_(x) #x
 #define CL_STR(x) CL_STR_(x)
@@ -348,6 +367,13 @@ static void start_server(bool faulty)
         th_follow_me(follow, sizeof follow);
         pid_t pid = fork();
         if (pid == 0) {
+            if (outage && faulty && outagefs_lib) { /* the shim: the nemesis takes a volume's directory away */
+                char roots[2 * PATH_MAX + 2];
+                snprintf(roots, sizeof roots, "%s:%s", vol_dir[0], vol_dir[1]);
+                setenv("LD_PRELOAD", outagefs_lib, 1);
+                setenv("OUTAGEFS_ROOTS", roots, 1);
+                setenv("OUTAGEFS_CTL", octl, 1);
+            }
             if (faulty && crashfs && attempt == 0) {
                 char sd[32];
                 snprintf(sd, sizeof sd, "%llu", (unsigned long long)mix(seed + (uint64_t)restarts));
@@ -372,6 +398,8 @@ static void start_server(bool faulty)
                         setenv("CRASHFS_EIO_ONLY", "wal_", 1);
                 }
             }
+            if (outage) /* thresholds of seconds, not tens of them: an outage of a few seconds is one */
+                setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=400,spawn=60000", 1);
             if (!getenv("JEPSEN_VERBOSE")) { /* kept for a server that does not come up */
                 int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot ? O_APPEND : O_TRUNC), 0644);
                 if (lfd < 0)
@@ -379,7 +407,7 @@ static void start_server(bool faulty)
                 if (lfd >= 0)
                     dup2(lfd, 2);
             }
-            const char *av[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
+            const char *av[40] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
                                   "--wal-max-batch-rows", "500", "--partition-ms", pms};
             int ac = 13;
             av[ac++] = follow; /* a killed run leaves no server behind */
@@ -389,6 +417,10 @@ static void start_server(bool faulty)
                 av[ac++] = "--granule-rows", av[ac++] = CL_STR(CL_GRANULE_ROWS);
                 av[ac++] = "--merge-idle-s", av[ac++] = "1";
                 av[ac++] = "--flush-interval-ms", av[ac++] = "500";
+            }
+            if (outage) {
+                av[ac++] = "--health-domain", av[ac++] = vol_dir[0];
+                av[ac++] = "--health-domain", av[ac++] = vol_dir[1];
             }
             if (getenv("TSDBD_IO"))
                 av[ac++] = "--io", av[ac++] = getenv("TSDBD_IO");
@@ -599,6 +631,19 @@ static void *follower_reader(void *arg)
 
 /* ------------------------------------------------------------ clients */
 
+/* outage: what a write to series s came to. UNAVAILABLE is "not applied" (a definite failure, checked by 2); a
+ * client that gets it does not spin. */
+static void outage_note(int s, int rc)
+{
+    if (!outage)
+        return;
+    if (rc == 0) {
+        atomic_fetch_add(&vol_ok[s % 2], 1);
+        atomic_store(&vol_last_ok[s % 2], now_ns());
+    } else if (rc == TSDB_ERR_UNAVAILABLE)
+        usleep(2000);
+}
+
 static tsdbc *connect_retry(void)
 {
     for (;;) {
@@ -618,6 +663,8 @@ static void *client(void *arg)
     while (c && !atomic_load(&stop)) {
         r = mix(r);
         int s = (int)(r % (uint64_t)nseries);
+        if (outage) /* a client works one volume only: one stuck in a hung volume's calls must not hold back the rest */
+            s = (s & ~1) | (int)((intptr_t)arg % 2);
         if ((r >> 8) % 100 < 6) { /* a delete or a replace of a key range */
             uint32_t id = atomic_fetch_add(&nwrites, 1);
             if (id >= MAX_OPS)
@@ -646,6 +693,7 @@ static void *client(void *arg)
                                           : tsdbc_delete_range(c, ids[s], a, b);
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
+            outage_note(s, rc);
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
@@ -689,6 +737,7 @@ static void *client(void *arg)
             int rc = tsdbc_insert_series(c, ids[s], ts, v, m);
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
+            outage_note(s, rc);
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
@@ -727,8 +776,12 @@ static void *client(void *arg)
                 q->st = ST_FAIL;
                 if (rc == TSDB_ERR_CORRUPT)
                     atomic_fetch_add(&read_damage, 1);
-                tsdbc_close(c);
-                c = connect_retry();
+                if (rc == TSDB_ERR_UNAVAILABLE) { /* a volume is away: the connection is fine */
+                    usleep(2000);
+                } else {
+                    tsdbc_close(c);
+                    c = connect_retry();
+                }
             }
         }
     }
@@ -880,6 +933,119 @@ static void rot_damage(uint64_t r)
     }
 }
 
+/* ---- outage: one volume's directory goes away (hang, EIO, slow) and comes back, or the server is killed.
+ *
+ * What it checks beyond the model (the checker's 1-5 judge the history: an acknowledged write is never lost, a write
+ * refused with UNAVAILABLE is never seen):
+ *  - the server never ends by itself: a volume in a storage domain recovers in place (the root and a volume outside
+ *    a domain still fail-stop, but this run has none of those faults);
+ *  - within OUTAGE_RECOVER_S of the heal a write to the volume is acknowledged again;
+ *  - while one volume is hung and DOWN, the other keeps at least 80% of the writes per second it did before (all
+ *    the faults together, so that one slow second does not decide).
+ * A hang is also ended by kill -9 now and then (the shim lives in the server: the next one opens a healthy
+ * directory; opening a volume that is hung has no deadline of its own yet, O5). */
+#define OUTAGE_RECOVER_S 30
+#define OUTAGE_DOWN_S 5.0 /* DOWN is declared 2.5 s (the threshold here) plus a probe period or two after the hang
+                           * starts, and the calls stuck before it are released then; the healthy volume is measured from here */
+
+static void outage_ctl(const char *cmd, int v, const char *arg)
+{
+    char line[PATH_MAX + 64], out[256];
+    snprintf(line, sizeof line, "%s %s%s%s", cmd, vol_dir[v], arg ? " " : "", arg ? arg : "");
+    if (outagefs_cmd(octl, line, out, sizeof out)) {
+        outage_problems++;
+        fprintf(stderr, "  the shim refused '%s': %s\n", line, out);
+    }
+}
+
+/* Waits until a write to volume v is acknowledged after `since` (ns). */
+static void outage_await_recovery(int v, int64_t since, const char *what)
+{
+    int64_t t0 = now_ns();
+    while (!atomic_load(&stop)) {
+        if (atomic_load(&vol_last_ok[v]) > since)
+            return;
+        if (now_ns() - t0 > OUTAGE_RECOVER_S * 1000000000LL) {
+            outage_problems++;
+            fprintf(stderr, "  volume %d: no write acknowledged in %d s after the heal (%s)\n", v, OUTAGE_RECOVER_S,
+                    what);
+            return;
+        }
+        usleep(20000);
+    }
+}
+
+static void outage_tick(uint64_t r)
+{
+    pid_t pid = atomic_load(&server_pid);
+    int st = 0;
+    if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid) {
+        outage_problems++;
+        fprintf(stderr, "  the server ended by itself (status %#x): a volume in a storage domain must not stop it\n",
+                st);
+        server_gone();
+        start_server(true);
+        restarts++;
+        return;
+    }
+    int v = (int)((r >> 3) % 2), h = 1 - v, kind = (int)((r >> 8) % 7);
+    char what[64];
+    static const char *names[] = {"hang 8 s", "hang 8 s", "hang 1.2 s", "eio 2 s", "slow 40 ms 3 s",
+                                  "hang 2 s and kill -9", "kill -9"};
+    snprintf(what, sizeof what, "%s on volume %d", names[kind], v);
+    if (getenv("JEPSEN_VERBOSE"))
+        fprintf(stderr, "jepsen: outage: %s\n", what);
+    int64_t b_t = now_ns();
+    long long b_ok = atomic_load(&vol_ok[h]);
+    if (kind < 5)
+        usleep(800000); /* the healthy volume's pace before the fault */
+    double base = (double)(atomic_load(&vol_ok[h]) - b_ok) * 1e9 / (double)(now_ns() - b_t);
+    if (kind == 6 || kind == 5) {
+        if (kind == 5) {
+            outage_ctl("hang", v, NULL);
+            usleep(2000000);
+        }
+        stop_server(SIGKILL); /* the shim lives in the server: the hang ends with it, the next server opens a healthy directory */
+        server_gone();
+        start_server(true);
+        restarts++;
+        outage_kills++;
+        return;
+    }
+    outage_faults++;
+    if (kind <= 1) { /* past DOWN: the volume answers UNAVAILABLE, the other goes on at its pace */
+        outage_ctl("hang", v, NULL);
+        for (int i = 0; getenv("JEPSEN_VERBOSE") && i < 16; i++) { /* the pace of both volumes, per half second */
+            long long a = atomic_load(&vol_ok[v]), b = atomic_load(&vol_ok[h]);
+            usleep(500000);
+            fprintf(stderr, "jepsen:   +%.1f s: hung volume %lld, healthy %lld writes\n", (i + 1) * 0.5,
+                    (long long)atomic_load(&vol_ok[v]) - a, (long long)atomic_load(&vol_ok[h]) - b);
+            if (i == 9)
+                break;
+        }
+        if (!getenv("JEPSEN_VERBOSE"))
+            usleep((useconds_t)(OUTAGE_DOWN_S * 1e6));
+        int64_t t0 = now_ns();
+        long long ok0 = atomic_load(&vol_ok[h]);
+        usleep(3000000);
+        double dt = (double)(now_ns() - t0) / 1e9;
+        healthy_ops += (double)(atomic_load(&vol_ok[h]) - ok0);
+        healthy_secs += dt;
+        healthy_base_ops += base * dt;
+    } else if (kind == 2) {
+        outage_ctl("hang", v, NULL);
+        usleep(1200000);
+    } else if (kind == 3) {
+        outage_ctl("eio", v, NULL);
+        usleep(2000000);
+    } else {
+        outage_ctl("slow", v, "40");
+        usleep(3000000);
+    }
+    outage_ctl("heal", v, NULL);
+    outage_await_recovery(v, now_ns(), what);
+}
+
 static void *nemesis_thread(void *arg)
 {
     (void)arg;
@@ -965,6 +1131,8 @@ static void *nemesis_thread(void *arg)
                 start_server(true);
                 restarts++;
             }
+        } else if (outage) {
+            outage_tick(r);
         } else if (md || rot) { /* a restart (SIGKILL or SIGTERM), over damage the shim or rot put on disk */
             pid_t pid = atomic_load(&server_pid);
             int st = 0, sig = (r >> 20) % 2 ? SIGKILL : SIGTERM;
@@ -1639,6 +1807,39 @@ static int make_users(void)
            users_cli("grant", KV_USER, "read,write", "prefix:jepsen.", NULL);
 }
 
+/* outage: the two volumes, and each series made in its own (series s in volume s % 2) before the server starts:
+ * tsdbd never makes a volume or a directory by itself, and the clients' tsdbc_series then finds the series. */
+static int make_volumes(void)
+{
+    tsdb *db;
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.create_volumes = 1;
+    for (int i = 0; i < 2; i++) {
+        char rp[PATH_MAX];
+        if ((mkdir(vol_dir[i], 0755) != 0 && errno != EEXIST) || !realpath(vol_dir[i], rp)) {
+            fprintf(stderr, "jepsen: cannot make %s: %s\n", vol_dir[i], strerror(errno));
+            return 1;
+        }
+        snprintf(vol_dir[i], sizeof vol_dir[i], "%s", rp);
+    }
+    uint32_t vi;
+    int rc = tsdb_open(dir, &o, &db);
+    if (rc == 0) {
+        rc = tsdb_volume_add(db, vol_dir[0], &vi) || tsdb_volume_add(db, vol_dir[1], &vi);
+        for (int s = 0; !rc && s < nseries; s++) {
+            char name[32];
+            tsdb_sid id;
+            snprintf(name, sizeof name, "jepsen.%d", s);
+            rc = tsdb_series_at(db, name, vol_dir[s % 2], &id);
+        }
+        tsdb_close(db);
+    }
+    if (rc)
+        fprintf(stderr, "jepsen: cannot make the volumes (%d)\n", rc);
+    return rc != 0;
+}
+
 static int create_series(int from, int to)
 {
     tsdbc *c = connect_retry();
@@ -1814,7 +2015,8 @@ int main(int argc, char **argv)
                                    {"seconds", required_argument, 0, 't'}, {"clients", required_argument, 0, 'c'},
                                    {"seed", required_argument, 0, 's'},    {"crashfs", required_argument, 0, 'f'},
                                    {"workload", required_argument, 0, 'w'}, {"verify-checksums", no_argument, 0, 'V'},
-                                   {"auth", no_argument, 0, 'A'},           {0, 0, 0, 0}};
+                                   {"auth", no_argument, 0, 'A'},           {"outagefs", required_argument, 0, 'o'},
+                                   {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
@@ -1831,16 +2033,20 @@ int main(int argc, char **argv)
             break;
         case 'V': verify = true; break;
         case 'A': auth = true; break;
+        case 'o': outagefs_lib = optarg; break;
         default: return 2;
         }
     }
     md = !strcmp(nemesis, "misdirect");
     rot = !strcmp(nemesis, "rot");
-    bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || md;
-    if (!dir || (shim && !crashfs) || ((md || rot) && classes)) {
-        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|none] [--seconds S]\n"
+    outage = !strcmp(nemesis, "outage");
+    bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || md || outage;
+    if (!dir || (shim && !outage && !crashfs) || (outage && (!outagefs_lib || classes || auth)) ||
+        ((md || rot) && classes)) {
+        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|none] [--seconds S]\n"
                         "              [--clients N] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]\n"
-                        "              [--verify-checksums]   (misdirect and rot: workload kv) [--auth]\n");
+                        "              [--verify-checksums]   (misdirect and rot: workload kv) [--auth]\n"
+                        "              [--outagefs build/liboutagefs.so]   (outage: workload kv, no login)\n");
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
@@ -1861,8 +2067,15 @@ int main(int argc, char **argv)
                 dir, strerror(errno));
         return 2;
     }
-    char cmd[1200];
+    char cmd[6 * PATH_MAX + 256];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (outage) { /* the volumes and the shim's socket beside the directory */
+        for (int i = 0; i < 2; i++)
+            snprintf(vol_dir[i], sizeof vol_dir[i], "%s.vol%c", dir, 'a' + i);
+        snprintf(octl, sizeof octl, "%s.outagefs", dir);
+        snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s' '%s' '%s' '%s.snap0' '%s.snap1'", dir, vol_dir[0], vol_dir[1],
+                 octl, octl, octl);
+    }
     if (system(cmd) != 0)
         return 2;
     snprintf(markpath, sizeof markpath, "%s.eio", dir);
@@ -1876,6 +2089,8 @@ int main(int argc, char **argv)
     nseries = classes ? CL_SERIES : NSERIES;
     make_keys();
     if (auth && make_users())
+        return 2;
+    if (outage && make_volumes())
         return 2;
 
     start_server(false); /* the series exist before any fault */
@@ -1973,6 +2188,21 @@ int main(int argc, char **argv)
     if (!strcmp(nemesis, "eio")) {
         printf("eio: %d fail-stops\n", failstops);
         v += eio_problems;
+    }
+    if (outage) {
+        double rate = healthy_secs > 0 ? healthy_ops / healthy_secs : 0, base = healthy_secs > 0 ? healthy_base_ops / healthy_secs : 0;
+        printf("outage: %d volume faults and %d kills; the other volume wrote %.0f/s during outages (%.0f/s before)\n",
+               outage_faults, outage_kills, rate, base);
+        if (healthy_secs > 5 && rate < 0.8 * base) {
+            fprintf(stderr, "  the healthy volume kept %.0f%% of its writes per second during outages (at least 80%% expected)\n",
+                    base > 0 ? 100 * rate / base : 0);
+            v++;
+        }
+        if (seconds >= 30 && outage_faults < 2) {
+            fprintf(stderr, "  only %d volume faults in %.0f s: the nemesis was idle\n", outage_faults, seconds);
+            v++;
+        }
+        v += outage_problems;
     }
     if (!strcmp(nemesis, "power")) {
         v += death_problems;
