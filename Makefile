@@ -178,7 +178,7 @@ $(B)/test_sched: tests/test_sched.c src/internal.h $(LIB)
 $(B)/test_multi: tests/test_multi.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
 
-$(B)/test_latest: tests/test_latest.c $(LIB)
+$(B)/test_latest: tests/test_latest.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/test_threads: tests/test_threads.c src/internal.h $(LIB)

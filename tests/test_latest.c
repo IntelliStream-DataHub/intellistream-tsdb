@@ -8,12 +8,17 @@
  * unmerged parts, no WAL, partition classes on and off), with ids above 2^32 in two volumes, never-written series,
  * series that hold only nulls, and random end bounds. Directed cases with expectations written by hand come first
  * (a null over the newest value, a null at a newer timestamp, a delete of the newest row, retention, missing ids);
- * a concurrency case (writers, mergers, lookups; the thread sanitizer runs it) follows.
+ * a partial merge that leaves a part with rows and its own tombstones, a lookup while a flush holds a flushing memtable
+ * under a newer active one (and a follower with two tails), and a follower against its own scan; a concurrency case
+ * (writers, mergers, lookups; the thread sanitizer runs it) follows. The random option set "latest_r4" merges idle
+ * partitions in pieces (max_part_bytes) and fails if no part with rows and tombstones ever existed.
  *
  * `test_latest DIR bench` measures the slow path at 10, 100 and 1,000 partitions (docs/design-latest.md, U4). */
 #define _GNU_SOURCE
-#include "tsdb.h"
+#include "internal.h" /* part_footer, tsdb_test_midplace */
 
+#include <dirent.h>
+#include <fcntl.h>
 #include <ftw.h>
 #include <pthread.h>
 #include <signal.h>
@@ -44,7 +49,6 @@
         }                                                                                                 \
     } while (0)
 
-int tsdb_test_class_switch(tsdb *t, tsdb_sid series, int cls, const int64_t *at); /* internal test hook */
 
 static char root[600];
 
@@ -176,6 +180,36 @@ static void same(const tsdb_latest_result *o, const expect *e, tsdb_sid id, cons
 
 /* ------------------------------------------------------------------ the world */
 
+/* Parts in dir that hold both granules and tombstones: what a merge writes that left an older part of the partition
+ * out (it keeps the tombstones, which still hide that part's rows and must not hide its own). The state where
+ * "a part's tombstones never hide its own rows" matters (a replace's parts merged without the old part below). */
+static int mixed_parts(const char *dir)
+{
+    DIR *d = opendir(dir);
+    int n = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        size_t l = strlen(e->d_name);
+        if (l < 6 || strcmp(e->d_name + l - 5, ".part") != 0 || strncmp(e->d_name, "retired_", 8) == 0)
+            continue;
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        struct stat st;
+        part_footer f;
+        if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= (off_t)sizeof f &&
+            pread(fd, &f, sizeof f, st.st_size - (off_t)sizeof f) == (ssize_t)sizeof f && f.ngranules > 0 &&
+            f.index_off + f.index_len + sizeof f < (uint64_t)st.st_size) /* a trailer: tombstones */
+            n++;
+        if (fd >= 0)
+            close(fd);
+    }
+    if (d)
+        closedir(d);
+    return n;
+}
+
+
 #define MAXS 24
 typedef struct world {
     tsdb *db;
@@ -189,6 +223,7 @@ typedef struct world {
     tsdb_sid onlynull;      /* only nulls written */
     int step;
     bool classes;
+    int mixed_steps; /* steps that saw a part with rows and tombstones (partial merges; see mixed_parts) */
 } world;
 
 static void make_series(world *w)
@@ -479,6 +514,9 @@ static void world_open(world *w, const char *name, tsdb_options opt, bool classe
     make_series(w);
 }
 
+/* the option set of the partial-merge run: parts idle for a second merge, in pieces of max_part_bytes */
+#define PARTIAL(o) ((o).merge_idle_s > 0 && (o).merge_idle_s < 60)
+
 static void random_run(const char *name, tsdb_options opt, bool classes, int steps, uint64_t seed)
 {
     world w;
@@ -519,8 +557,8 @@ static void random_run(const char *name, tsdb_options opt, bool classes, int ste
             OK(tsdb_flush(w.db));
         else if (r < 76)
             OK(tsdb_commit(w.db));
-        else if (r < 80)
-            OK(tsdb_optimize(w.db));
+        else if (r < 80) /* a partial-merge run lets parts pile up: optimize would merge whole partitions */
+            OK(PARTIAL(opt) ? tsdb_flush(w.db) : tsdb_optimize(w.db));
         else if (r < 82 && w.classes)
             (void)tsdb_test_class_switch(w.db, w.id[si], (int)(rnd() % 4), NULL);
         else if (r < 83 && rnd() % 3 == 0)
@@ -533,8 +571,20 @@ static void random_run(const char *name, tsdb_options opt, bool classes, int ste
             check_world(&w);
         else
             check_series(&w, w.id[si], "step");
+        if (PARTIAL(opt)) { /* partial merges: give the idle merges time, and see whether they left mixed parts */
+            if (w.step % 12 == 11) {
+                struct timespec d = {0, 120000000};
+                nanosleep(&d, NULL);
+            }
+            if (mixed_parts(w.dir) + mixed_parts(w.vol2) > 0)
+                w.mixed_steps++;
+        }
     }
     check_world(&w);
+    if (PARTIAL(opt)) {
+        printf("  %d of %d steps had a part with rows and tombstones\n", w.mixed_steps, steps);
+        CHECK(w.mixed_steps > 0 || steps < 100); /* else the run did not reach the state it is for */
+    }
     OK(tsdb_close(w.db));
 }
 
@@ -984,6 +1034,249 @@ static void bench_one(int parts, int run, const char *dir_root)
     OK(tsdb_close(db));
 }
 
+/* ------------------------------------------------------------------ partial merges (M1) */
+
+/* test_delete's partial merge: 100k rows, then a replace of [0, N/2) with 100 rows. A background merge of the
+ * replace's parts that leaves the big old part out (max_part_bytes) writes a part with its own rows and the
+ * tombstones next to them; those tombstones hide the old part's rows and never the part's own. The newest rows
+ * below the small bounds lie in that mixed part. */
+static void test_partial_merge(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.partition_ms = 1000000000;
+    o.merge_threads = 1;
+    o.merge_idle_s = 1;
+    o.max_part_bytes = 200000;
+    tsdb *db = open_plain("latest_partial", &o);
+    char dir[700];
+    snprintf(dir, sizeof dir, "%s/latest_partial", root);
+    tsdb_sid s;
+    OK(tsdb_series_create(db, "pm.a", TSDB_INT64, NULL, &s));
+    enum { N = 100000 };
+    static int64_t ts[N], v[N];
+    uint64_t r = 88172645463325252ull;
+    for (int i = 0; i < N; i++) {
+        r ^= r << 13, r ^= r >> 7, r ^= r << 17;
+        ts[i] = i, v[i] = 1 | (int64_t)(r & 0xffffff) << 1;
+    }
+    tsdb_values tv = {TSDB_INT64, v, NULL};
+    OK(tsdb_insert_series_values(db, s, ts, &tv, N));
+    OK(tsdb_flush(db));
+    int64_t rts[100], rv[100];
+    for (int i = 0; i < 100; i++)
+        rts[i] = i, rv[i] = 7;
+    tsdb_values rtv = {TSDB_INT64, rv, NULL};
+    OK(tsdb_replace_range(db, s, 0, N / 2, rts, &rtv, 100));
+    tsdb_stats st;
+    for (int i = 0; i < 100; i++) {
+        tsdb_get_stats(db, &st);
+        if (st.parts == 2 && mixed_parts(dir) == 1)
+            break;
+        struct timespec d = {0, 100000000};
+        nanosleep(&d, NULL);
+    }
+    CHECK(mixed_parts(dir) == 1); /* the merge happened, and left the old part out */
+    struct { int64_t end; int64_t ts, v; } want[] = {
+        {100, 99, 7}, {50, 49, 7}, {1, 0, 7}, {N / 2, 99, 7}, {N / 2 + 1, N / 2, v[N / 2]}, {TSDB_TS_MAX, N - 1, v[N - 1]},
+    };
+    for (size_t k = 0; k < sizeof want / sizeof *want; k++)
+        for (int wn = 0; wn < 2; wn++) {
+            tsdb_latest_result x = one(db, s, want[k].end, wn);
+            if (x.kind != TSDB_LATEST_VALUE || x.ts != want[k].ts || x.v.i64 != want[k].v) {
+                fprintf(stderr, "partial merge: end %lld: kind %d ts %lld v %lld, want ts %lld v %lld\n",
+                        (long long)want[k].end, x.kind, (long long)x.ts, (long long)x.v.i64, (long long)want[k].ts,
+                        (long long)want[k].v);
+                exit(1);
+            }
+        }
+    rowset rr = {0};
+    scan(db, s, &rr);
+    CHECK(rr.n == N / 2 + 100);
+    for (int64_t end = 0; end < 130; end += 13) { /* and against the scan */
+        expect e = oracle(&rr, end, false);
+        tsdb_latest_opts eo = {.end = end};
+        tsdb_latest_result x;
+        OK(tsdb_latest(db, &s, 1, &eo, &x));
+        same(&x, &e, s, "partial merge scan", 0);
+    }
+    rs_free(&rr);
+    OK(tsdb_close(db));
+}
+
+/* ------------------------------------------------------------------ memtables against each other (L1) */
+
+/* A lookup while a flush holds a flushing memtable, and the active one writes over the flushing rows' timestamps
+ * (design 8, N1): newer memtable wins ties, a null in it hides the older value (and does not stop at the
+ * flushing memtable's row), the flushing one wins over the parts. A follower refreshes in the same window, so it
+ * reads two WAL tails and the parts. Each answer is also compared with a full scan of the same handle. */
+typedef struct fw {
+    tsdb *w, *f;
+    tsdb_sid id;
+    bool armed;
+    int fired;
+} fw;
+
+static void check_vs_scan(tsdb *db, tsdb_sid id, const char *what)
+{
+    rowset rr = {0};
+    scan(db, id, &rr);
+    static const int64_t ends[] = {TSDB_TS_MAX, 45, 40, 35, 30, 25, 20, 15, 10, 5, TSDB_TS_MIN};
+    for (size_t k = 0; k < sizeof ends / sizeof *ends; k++)
+        for (int wn = 0; wn < 2; wn++) {
+            expect e = oracle(&rr, ends[k], wn);
+            tsdb_latest_opts eo = {.end = ends[k], .with_nulls = wn};
+            tsdb_latest_result x;
+            OK(tsdb_latest(db, &id, 1, &eo, &x));
+            same(&x, &e, id, what, (int)k);
+        }
+    rs_free(&rr);
+}
+
+static void fw_hook(void *arg)
+{
+    fw *x = arg;
+    if (!x->armed)
+        return;
+    x->armed = false;
+    x->fired++;
+    /* the flushing memtable holds ts 10 -> 7.0, 20 -> null, 30 -> 8.0; the parts 10 -> 5.0, 20 -> 6.0 */
+    tsdb_latest_result r = one(x->w, x->id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 30 && r.v.f64 == 8.0);
+    r = one(x->w, x->id, 25, 0); /* its null at 20 hides the part's 6.0: the answer is its own 10 -> 7.0 */
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 10 && r.v.f64 == 7.0);
+    /* the active memtable: 10 -> null, 20 -> 9.0, 30 -> null, 40 -> 1.0 */
+    put_f64(x->w, x->id, 10, 0, true);
+    put_f64(x->w, x->id, 20, 9.0, false);
+    put_f64(x->w, x->id, 30, 0, true);
+    put_f64(x->w, x->id, 40, 1.0, false);
+    r = one(x->w, x->id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 40 && r.v.f64 == 1.0);
+    r = one(x->w, x->id, 40, 0); /* 30: null (active) over 8.0 (flushing): the answer is 20 -> 9.0 */
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 20 && r.v.f64 == 9.0);
+    r = one(x->w, x->id, 40, 1);
+    CHECK(r.kind == TSDB_LATEST_NULL && r.ts == 30);
+    r = one(x->w, x->id, 20, 0); /* 10: null (active) over 7.0 (flushing) over 5.0 (part): nothing below */
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    r = one(x->w, x->id, 20, 1);
+    CHECK(r.kind == TSDB_LATEST_NULL && r.ts == 10);
+    r = one(x->w, x->id, 21, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 20 && r.v.f64 == 9.0);
+    check_vs_scan(x->w, x->id, "writer, flushing + active");
+    OK(tsdb_refresh(x->f));
+    check_vs_scan(x->f, x->id, "follower, two tails");
+    r = one(x->f, x->id, 20, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE);
+}
+
+static void test_flush_window(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    tsdb *w = open_plain("latest_flushwin", &o);
+    char dir[700];
+    snprintf(dir, sizeof dir, "%s/latest_flushwin", root);
+    tsdb_options ro;
+    tsdb_options_init(&ro);
+    ro.read_only = 1;
+    tsdb *f;
+    OK(tsdb_open(dir, &ro, &f));
+    fw x = {.w = w, .f = f};
+    OK(tsdb_series_create(w, "fw.a", TSDB_FLOAT64, NULL, &x.id));
+    put_f64(w, x.id, 10, 5.0, false);
+    put_f64(w, x.id, 20, 6.0, false);
+    OK(tsdb_flush(w)); /* the parts */
+    put_f64(w, x.id, 10, 7.0, false);
+    put_f64(w, x.id, 20, 0, true);
+    put_f64(w, x.id, 30, 8.0, false);
+    tsdb_test_midplace(w, fw_hook, &x);
+    x.armed = true;
+    OK(tsdb_flush(w));
+    tsdb_test_midplace(w, NULL, NULL);
+    CHECK(x.fired == 1); /* the hook ran while the memtable was flushing */
+    check_vs_scan(w, x.id, "writer, after the flush");
+    tsdb_latest_result r = one(w, x.id, 20, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    r = one(w, x.id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 40 && r.v.f64 == 1.0);
+    OK(tsdb_refresh(f));
+    check_vs_scan(f, x.id, "follower, after the flush");
+    OK(tsdb_close(f));
+    OK(tsdb_close(w));
+}
+
+/* ------------------------------------------------------------------ a follower */
+
+/* A read-only follower (WAL tails, flushing memtables, parts, deletes, optimize) against its own full scan, with
+ * nulls over values at the same timestamps across the writer's memtable segments and parts. The follower's path is
+ * this slow path for good (design D5). */
+static void test_follower(int steps)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.wal_max_batch_rows = 8;
+    o.granule_rows = 16;
+    tsdb *w = open_plain("latest_follow", &o);
+    char dir[700];
+    snprintf(dir, sizeof dir, "%s/latest_follow", root);
+    enum { NS = 4 };
+    tsdb_sid id[NS];
+    for (int i = 0; i < NS; i++) {
+        char n[16];
+        snprintf(n, sizeof n, "fo.s%d", i);
+        OK(tsdb_series_create(w, n, TSDB_FLOAT64, NULL, &id[i]));
+    }
+    tsdb_options ro;
+    tsdb_options_init(&ro);
+    ro.read_only = 1;
+    tsdb *f;
+    OK(tsdb_open(dir, &ro, &f));
+    rs = 12345;
+    rowset rr = {0};
+    long checks = 0;
+    for (int step = 0; step < steps; step++) {
+        int s = (int)(rnd() % NS);
+        uint64_t r = rnd() % 100;
+        if (r < 80) {
+            int64_t ts = (int64_t)(rnd() % 300);
+            double v = (double)(rnd() % 1000);
+            uint8_t valid = rnd() % 3 != 0;
+            tsdb_values vals = {TSDB_FLOAT64, &v, &valid};
+            OK(tsdb_insert_series_values(w, id[s], &ts, &vals, 1));
+        } else if (r < 85) {
+            int64_t a = (int64_t)(rnd() % 300);
+            OK(tsdb_delete_range(w, id[s], a, a + (int64_t)(rnd() % 40)));
+        } else if (r < 90) {
+            OK(tsdb_flush(w));
+        } else if (r < 92) {
+            OK(tsdb_optimize(w));
+        }
+        if (step % 7)
+            continue;
+        OK(tsdb_refresh(f));
+        for (int k = 0; k < NS; k++) {
+            scan(f, id[k], &rr);
+            for (int e = 0; e < 4; e++) {
+                int64_t end = e == 0 ? TSDB_TS_MAX : (int64_t)(rnd() % 320);
+                for (int wn = 0; wn < 2; wn++) {
+                    expect ex = oracle(&rr, end, wn);
+                    tsdb_latest_opts lo = {.end = end, .with_nulls = wn};
+                    tsdb_latest_result x;
+                    OK(tsdb_latest(f, &id[k], 1, &lo, &x));
+                    same(&x, &ex, id[k], "follower", step);
+                    checks++;
+                }
+            }
+        }
+    }
+    CHECK(checks > 1000);
+    rs_free(&rr);
+    OK(tsdb_close(f));
+    OK(tsdb_close(w));
+}
+
 /* ------------------------------------------------------------------ main */
 
 int main(int argc, char **argv)
@@ -1002,6 +1295,12 @@ int main(int argc, char **argv)
     int steps = argc > 2 ? atoi(argv[2]) : 260;
     test_directed();
     printf("directed ok\n");
+    test_partial_merge();
+    printf("partial merge ok\n");
+    test_flush_window();
+    printf("flushing + active memtables, follower tails ok\n");
+    test_follower(1500);
+    printf("follower ok\n");
 
     tsdb_options o;
     tsdb_options_init(&o);
@@ -1037,6 +1336,16 @@ int main(int argc, char **argv)
     o.merge_threads = 2;
     random_run("latest_r3", o, true, steps, 44);
     printf("periodic WAL ok\n");
+
+    /* partial merges (merge_idle_s, a small max_part_bytes): parts with rows and their own tombstones */
+    tsdb_options_init(&o);
+    o.wal_max_batch_rows = 64;
+    o.granule_rows = 32;
+    o.merge_threads = 1;
+    o.merge_idle_s = 1;
+    o.max_part_bytes = 4000;
+    random_run("latest_r4", o, false, steps, 55);
+    printf("partial merges ok\n");
 
     test_crash();
     printf("crash ok\n");
