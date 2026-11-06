@@ -488,10 +488,10 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
         return TSDB_ERR_NOMEM;
     }
     size_t n = 0;
-    for (char *l = txt, *next; *l; l = next) { /* every line but the root's volume number */
+    for (char *l = txt, *next; *l; l = next) { /* every line but the root's volume number and its old parts */
         next = strchr(l, '\n');
         next = next ? next + 1 : l + strlen(l);
-        if (strncmp(l, "volume=", 7) != 0) {
+        if (strncmp(l, "volume=", 7) != 0 && strncmp(l, "parts_v8=", 9) != 0) {
             memcpy(buf + n, l, (size_t)(next - l));
             n += (size_t)(next - l);
         }
@@ -501,6 +501,14 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     char tmp[128];
     meta_tmp_make(tmp, sizeof tmp); /* our own: another add of this directory may be writing META right now */
     int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    /* the volume's FNO (fno.c), made and synced with its directory before META says the volume is there */
+    if (fd >= 0 && faccessat(fd, FNO_FILE, F_OK, 0) != 0 && errno == ENOENT && fno_create(fd, 1, sync) != 0) {
+        int e = errno;
+        close(fd);
+        free(buf);
+        errno = e;
+        return TSDB_ERR_IO;
+    }
     int mfd = fd < 0 ? -1 : openat(fd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     ssize_t wr = mfd < 0 ? -1 : write(mfd, buf, n);
     bool ok = wr == (ssize_t)n && (!sync || tsdb_fsync(mfd) == 0);

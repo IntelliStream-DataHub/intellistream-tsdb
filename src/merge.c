@@ -230,11 +230,17 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         max_block = MAX(max_block, src[i]->max_block);
         level = MAX(level, src[i]->level);
     }
-    uint64_t wal_seq = 0;
+    uint64_t wal_seq = 0, fno_lo = 0, fno_hi = 0;
+    int64_t written_ms = 0;
     bool tombs = false;
     int64_t min_ts = INT64_MAX;
     for (size_t i = 0; i < k; i++) {
         wal_seq = MAX(wal_seq, src[i]->wal_seq);
+        if (src[i]->fno_hi) { /* a source without numbers (0, 0) adds none to the range */
+            fno_lo = fno_lo ? MIN(fno_lo, src[i]->fno_lo) : src[i]->fno_lo;
+            fno_hi = MAX(fno_hi, src[i]->fno_hi);
+        }
+        written_ms = MAX(written_ms, src[i]->written_ms);
         tombs |= src[i]->nt > 0;
         min_ts = MIN(min_ts, src[i]->min_ts);
     }
@@ -246,6 +252,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         free(cur);
         return rc;
     }
+    w.fno_lo = fno_lo, w.fno_hi = fno_hi, w.written_ms = written_ms;
     w.keep_empty = true; /* replaces its sources even when nothing is left */
     w.effort = CODEC_MERGE;
     w.zstd_level = db->opt.zstd_level; /* pw_begin chose the insert level */

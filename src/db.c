@@ -208,6 +208,9 @@ static int meta_write(eng *db)
     int len = snprintf(buf, sizeof buf,
                        "version=%d\npartition_ms=%" PRId64 "\ngranule_rows=%u\npartition_classes=%d\nvolume=0\n",
                        FORMAT_VERSION, db->partition_ms, db->granule_rows, db->cls_on ? 1 : 0);
+    /* FNO first, synced with the directory: META is what says the database exists (fno.c) */
+    if (fno_create(db->dirfd, 1, db->opt.fsync) != 0)
+        return TSDB_ERR_IO;
     int fd = openat(db->dirfd, META_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0)
         return TSDB_ERR_IO;
@@ -286,12 +289,35 @@ static int meta_load_or_create(eng *db, bool read_only)
         if (version != FORMAT_VERSION) {
             /* the format may change in a 0.9.x release (docs/compatibility.md): another version is refused, never
              * read as if it were ours */
-            fprintf(stderr,
-                    "tsdb: the database has disk format version %d; tsdb %s reads version %d only. Export the data "
-                    "with the release that wrote it and import it here (docs/compatibility.md)\n",
-                    version, TSDB_VERSION, FORMAT_VERSION);
+            if (version == PREV_FORMAT_VERSION)
+                fprintf(stderr,
+                        "tsdb: the database has disk format version %d; tsdb %s reads version %d only. Close it "
+                        "cleanly with the release that wrote it and run `tsdb DIR upgrade` here, or export the data "
+                        "with that release and import it here (docs/compatibility.md)\n",
+                        version, TSDB_VERSION, FORMAT_VERSION);
+            else
+                fprintf(stderr,
+                        "tsdb: the database has disk format version %d; tsdb %s reads version %d only. Export the "
+                        "data with the release that wrote it and import it here (docs/compatibility.md)\n",
+                        version, TSDB_VERSION, FORMAT_VERSION);
             return TSDB_ERR_CORRUPT;
         }
+        if ((line = strstr(buf, "requires="))) {
+            /* a feature this binary does not know changes what the files mean (markers to apply, links to keep):
+             * the open refuses and names it. None is known in this release. */
+            char feat[96];
+            size_t k = 0;
+            for (const char *c = line + 9; *c && *c != '\n' && k < sizeof feat - 1; c++)
+                feat[k++] = *c;
+            feat[k] = '\0';
+            if (k) {
+                fprintf(stderr,
+                        "tsdb: META requires the feature(s) \"%s\", which tsdb %s does not know: the open "
+                        "refuses (use a release that does)\n", feat, TSDB_VERSION);
+                return TSDB_ERR_INVALID;
+            }
+        }
+        db->parts_v8 = (line = strstr(buf, "parts_v8=")) && atoi(line + 9) == 1;
         if (pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS || classes < 0 || classes > 1)
             return TSDB_ERR_CORRUPT;
         db->partition_ms = pms;
@@ -472,7 +498,7 @@ static int load_parts(eng *db, bool read_only)
         if (!part_file_name(name))
             continue;
         part *p;
-        int r = part_open(db->dirfd, name, db->opt.pin_index, &p);
+        int r = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, &p);
         if (r == TSDB_ERR_NOTFOUND)
             continue; /* removed while we listed the directory */
         if (r == 0 && p->grows != db->granule_rows) {
@@ -595,7 +621,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         db->opt.retention_merge_s = 3600;
     if (db->opt.merge_idle_s == 0) /* a zeroed struct: merging everything all the time is never meant */
         db->opt.merge_idle_s = 300;
-    db->dirfd = db->lockfd = db->wal_fd = -1;
+    db->dirfd = db->lockfd = db->wal_fd = db->fno_fd = -1;
+    db->fno_next = 1;
     db->series.fd = -1;
     db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0;
     pthread_mutex_init(&db->lock, NULL);
@@ -607,6 +634,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->publish_lock, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
+    pthread_mutex_init(&db->fno_lock, NULL);
     pthread_mutex_init(&db->dir_sync_lock, NULL);
     pthread_cond_init(&db->wal_cv, NULL);
     pthread_cond_init(&db->merge_cv, NULL);
@@ -840,6 +868,8 @@ int eng_close(eng *db)
         db->cc_free = c->next;
         codec_free(c);
     }
+    if (db->fno_fd >= 0)
+        close(db->fno_fd);
     if (db->lockfd >= 0)
         close(db->lockfd);
     if (db->dirfd >= 0)
@@ -853,6 +883,7 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->publish_lock);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);
+    pthread_mutex_destroy(&db->fno_lock);
     pthread_mutex_destroy(&db->dir_sync_lock);
     pthread_cond_destroy(&db->wal_cv);
     pthread_cond_destroy(&db->merge_cv);
