@@ -1911,6 +1911,7 @@ static size_t nready;
 static conn *park_head, *park_tail; /* not read from until request memory frees */
 static int tick_fd = -1;           /* a timerfd: once a second, the frame deadlines */
 #ifdef __APPLE__ /* no timerfd: a kqueue holding a one second timer, which the main kqueue can watch for reading */
+#define TICK_WHAT "kqueue timer"
 static int tick_open(void)
 {
     int kq = kqueue();
@@ -1931,6 +1932,7 @@ static void tick_drain(void)
     kevent(tick_fd, NULL, 0, ev, 4, &zero);
 }
 #else
+#define TICK_WHAT "timerfd"
 static int tick_open(void)
 {
     int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -3172,7 +3174,7 @@ int main(int argc, char **argv)
 #endif
     tick_fd = tick_open();
     if (tick_fd < 0) {
-        fprintf(stderr, "tsdbd: timer: %s\n", strerror(errno));
+        fprintf(stderr, "tsdbd: " TICK_WHAT ": %s\n", strerror(errno));
         return 1;
     }
     if (io == IO_EPOLL) {

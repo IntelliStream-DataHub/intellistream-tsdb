@@ -699,7 +699,8 @@ static X86_ONLY void i64_finish(agg_state *a, __int128 s, uint64_t c, int64_t mn
 /* The squares of values beyond int32: |x| = h 2^32 + l, so x^2 = l^2 + hl 2^33 + h^2 2^64, each product from
  * a 32x32 multiply and summed in its 32-bit halves: a0, a1 (l^2), b0, b1 (hl), c0, c1 (h^2), reduced over the
  * lanes, below 2^60 each, into the 192-bit sum */
-static X86_ONLY void i64_sq_wide(agg_dev *dx, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1, uint64_t c0, uint64_t c1)
+static X86_ONLY void i64_sq_wide(agg_dev *dx, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1, uint64_t c0,
+                                 uint64_t c1)
 {
     unsigned __int128 t = (unsigned __int128)a0 + ((unsigned __int128)a1 << 32) + ((unsigned __int128)b0 << 33);
     unsigned __int128 h = (unsigned __int128)c0 + ((unsigned __int128)b1 << 1) + ((unsigned __int128)c1 << 32);
@@ -943,8 +944,8 @@ static X86_ONLY void u32_tail(const uint32_t *v, size_t i, size_t n, uint32_t nu
     }
 }
 
-static X86_ONLY void u32_finish(agg_state *a, agg_dev *dx, unsigned __int128 s, uint64_t c, unsigned __int128 q, uint32_t mn,
-                       uint32_t mx)
+static X86_ONLY void u32_finish(agg_state *a, agg_dev *dx, unsigned __int128 s, uint64_t c, unsigned __int128 q,
+                                uint32_t mn, uint32_t mx)
 {
     if (!c)
         return;
