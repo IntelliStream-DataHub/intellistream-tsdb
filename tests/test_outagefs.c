@@ -57,6 +57,9 @@ static void put(const char *path, const char *text)
     }
 }
 
+extern ssize_t __pread_chk(int, void *, size_t, off_t, size_t);
+extern ssize_t __read_chk(int, void *, size_t, size_t);
+
 static void get(const char *path, char *buf, size_t n)
 {
     int fd = open(path, O_RDONLY);
@@ -90,6 +93,9 @@ static void run(void)
     CHECK(fd >= 0);
     CHECK(cmd("eio", dir_a, NULL) == 0);
     CHECK(pread(fd, buf, 5, 0) == -1 && errno == EIO);
+    /* the fortified entry points glibc's headers pick when the buffer size is known (make asan builds with them) */
+    CHECK(__pread_chk(fd, buf, 5, 0, sizeof buf) == -1 && errno == EIO);
+    CHECK(__read_chk(fd, buf, 5, sizeof buf) == -1 && errno == EIO);
     CHECK(fsync(fd) == -1 && errno == EIO);
     CHECK(open(p, O_RDONLY) == -1 && errno == EIO);
     char pb[512];

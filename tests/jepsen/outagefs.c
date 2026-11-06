@@ -242,6 +242,11 @@ int openat64(int dirfd, const char *name, int flags, ...)
     OPEN_MODE(flags, mode)
     return do_open(dirfd, name, flags, mode, true);
 }
+/* the fortified forms (open without a mode argument) */
+int __open_2(const char *name, int flags) { return do_open(AT_FDCWD, name, flags, 0, false); }
+int __open64_2(const char *name, int flags) { return do_open(AT_FDCWD, name, flags, 0, false); }
+int __openat_2(int dirfd, const char *name, int flags) { return do_open(dirfd, name, flags, 0, true); }
+int __openat64_2(int dirfd, const char *name, int flags) { return do_open(dirfd, name, flags, 0, true); }
 int creat(const char *name, mode_t mode) { return do_open(AT_FDCWD, name, O_CREAT | O_WRONLY | O_TRUNC, mode, false); }
 int creat64(const char *name, mode_t mode) { return creat(name, mode); }
 
@@ -326,6 +331,26 @@ ssize_t pread(int fd, void *buf, size_t n, off_t off)
     return real_pread(fd, buf, n, off);
 }
 ssize_t pread64(int fd, void *buf, size_t n, off_t off) { return pread(fd, buf, n, off); }
+/* glibc's fortified headers (Ubuntu builds at -O1 and up) turn read and pread into these when the buffer's size is
+ * known: without them such calls would bypass the gate. The check itself is the real function's business. */
+ssize_t __read_chk(int fd, void *buf, size_t n, size_t buflen)
+{
+    if (n > buflen)
+        abort();
+    return read(fd, buf, n);
+}
+ssize_t __pread_chk(int fd, void *buf, size_t n, off_t off, size_t buflen)
+{
+    if (n > buflen)
+        abort();
+    return pread(fd, buf, n, off);
+}
+ssize_t __pread64_chk(int fd, void *buf, size_t n, off_t off, size_t buflen)
+{
+    if (n > buflen)
+        abort();
+    return pread(fd, buf, n, off);
+}
 ssize_t write(int fd, const void *buf, size_t n)
 {
     resolve();
