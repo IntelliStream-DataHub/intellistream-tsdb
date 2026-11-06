@@ -123,6 +123,12 @@ cgroup, so `nice` does not keep your work out of its way.
   review of durability, recovery and failover code in the Jepsen style (claims, faults, histories, a checker,
   evidence); `skills/job-watchdog/` (with `agents/job-watchdog.md` and `subagent-economy/scripts/watchdog.sh`) checks the detached jobs hourly for ones that died or hang, stops a hung one by its own process group, fixes harness causes and reruns it; `agents/iso-waiter.md` waits on detached runs. Personal settings go in the ignored
   `.claude/settings.local.json`. `.githooks/commit-msg`: the commit rules for everyone (`make hooks`).
+- `.github/workflows/release.yml`: a pushed tag `vX.Y.Z` (or Actions -> release -> Run workflow with an existing tag)
+  builds the tarball from exactly the tag (`.github/scripts/release-build.sh`: make dist, dist-test,
+  dist-check-sandybridge), attests its provenance and attaches it and its `.sha256` to the GitHub release
+  (`.github/scripts/release-publish.sh`: curl and GITHUB_TOKEN, never gh; a draft until the assets are up). The
+  text is `docs/releases/vX.Y.Z.md`, else the CHANGELOG section (`tools/release-notes.sh`). `make test` runs
+  `tests/test_release_notes.sh` and `tests/test_release_publish.py` (the API calls against a local mock).
 - `tools/dump.c`: `tsdb export` / `import` (public API only), the stream of `docs/export-format.md`, which every
   later version must keep reading (`tests/data/export-v1.tsdbdump`, `tests/test_export.c`).
 - `tools/`: CLI and benchmarks. `tests/`: tests; `tests/jepsen/`: the

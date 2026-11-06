@@ -88,9 +88,30 @@ git tag -s vX.Y.Z -m "tsdb X.Y.Z"       # an annotated tag; -s signs it if you h
 git push origin main vX.Y.Z
 ```
 
-Then attach `build-dist/tsdb-X.Y.Z-x86_64-linux.tar.gz` (and its `sha256sum`) to the release, with the
-changelog entry as the release notes. `make dist` after the tag names the build `vX.Y.Z` in BUILDINFO and
-`--version`; the tarball you publish is the one made from the tagged commit, which the gates above ran on.
+Write the release text first, if the changelog section alone is not what the release page should say:
+`docs/releases/vX.Y.Z.md` (`tools/release-notes.sh vX.Y.Z` prints what the page will get).
+
+The push of the tag starts the release workflow on GitHub (`.github/workflows/release.yml`); nothing else is
+done by hand, and `gh` is not needed. It:
+
+1. checks out exactly the tag, checks that `VERSION` is the tag without its `v`, and runs `make dist`,
+   `make dist-test` and `make dist-check-sandybridge` there (`.github/scripts/release-build.sh`; the build id in
+   BUILDINFO and `--version` is the tag);
+2. writes `tsdb-X.Y.Z-x86_64-linux.tar.gz.sha256` beside the tarball and attests the tarball's build provenance;
+3. creates the GitHub release "tsdb X.Y.Z" as a draft, uploads the two files and only then publishes it. The text
+   is `docs/releases/vX.Y.Z.md` as it is at the tag, else as it is on the branch the workflow ran from, else the
+   tag's CHANGELOG section. A tag with a suffix (`v1.0.0-rc.1`) becomes a prerelease and never "latest".
+
+The tarball on the release page is CI's build (Ubuntu 24.04's compiler), so its checksum differs from a local
+`make dist`; the release text points to the attached `.sha256` file instead of quoting one.
+
+To run it again for a tag that exists (a failed run, or a tag pushed before the workflow existed, as v0.9.0):
+GitHub -> Actions -> release -> Run workflow, branch `main`, tag `vX.Y.Z`. It builds the tag again and replaces
+the two files on the release (it deletes the old ones first); a release that is already published keeps its text,
+which you edit on the release page. A draft that a failed run left is completed and published. If the tag moves
+while a run is going, the run fails rather than attach a build of another commit.
+
+`make dist-check-almalinux10` needs Podman and is not part of the workflow: run it by hand (step 4).
 
 Publishing the clients (crates, the Python wheel, Maven) is not set up yet; when it is, add the steps here.
 

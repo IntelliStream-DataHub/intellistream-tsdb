@@ -1,0 +1,184 @@
+# Builds the release tarball of a tag and attaches it to the tag's GitHub release (docs/release.md, step 6).
+#
+#   a pushed tag vX.Y.Z (or vX.Y.Z-rc.N): builds it and releases it
+#   by hand: Actions -> release -> Run workflow, tag = vX.Y.Z, for a tag that already exists (a rerun, or a tag
+#            pushed before this workflow existed: v0.9.0)
+#
+# Jobs: `tag` checks the tag name; `build` checks out exactly the tag, checks VERSION against it, runs make dist,
+# make dist-test and make dist-check-sandybridge (qemu-user from apt) with read-only rights and keeps the tarball and
+# its .sha256 as a run artifact; `publish` checks the tarball against that .sha256, attests its build provenance,
+# makes or finds the release and uploads both files, replacing those of a rerun.
+#
+# Rules this file follows (as ci.yml):
+#   - The code is always built from the tag. The scripts and the release text come from the workflow's own checkout
+#     (the tag itself on a push; the branch it was started from on a manual run): docs/releases/TAG.md at the tag
+#     first, then in that checkout, then the tag's CHANGELOG section (tools/release-notes.sh).
+#   - No gh: the API is called with curl and the job's GITHUB_TOKEN (.github/scripts/release-publish.sh, tested
+#     against a mock of the API by tests/test_release_publish.py). No other secret.
+#   - Values from the event (the tag) reach scripts through env:, never written into a run: script, and only after
+#     the `tag` job checked them.
+#   - Rights: none by default; contents: read to build; contents: write, id-token: write and attestations: write
+#     only in `publish`, which runs no code from the tag.
+#   - Third-party actions are pinned to a full commit SHA with the version in a comment, at least two weeks old.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing tag to build and release, e.g. v0.9.0"
+        required: true
+        type: string
+
+permissions: {}
+
+# One run per tag at a time; a second run waits rather than cancelling one that may be halfway through an upload.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ------------------------------------------------------------------------------------------------------ tag
+  tag:
+    name: check the tag name
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: vX.Y.Z or vX.Y.Z-prerelease, and a push of a tag or a manual run
+        id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          PUSHED: ${{ github.ref_name }}
+          GIVEN: ${{ inputs.tag }}
+        run: |
+          set -eu
+          case $EVENT in
+          push) [ "$REF_TYPE" = tag ] || { echo "::error::not a tag push"; exit 1; }; tag=$PUSHED ;;
+          workflow_dispatch) tag=$GIVEN ;;
+          *) echo "::error::unexpected event"; exit 1 ;;
+          esac
+          if ! [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+              echo "::error::the tag is not vX.Y.Z or vX.Y.Z-prerelease"
+              exit 1
+          fi
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "release tag: $tag"
+
+  # ---------------------------------------------------------------------------------------------------- build
+  build:
+    name: build and test the tarball
+    needs: tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.tag.outputs.tag }}
+    outputs:
+      commit: ${{ steps.build.outputs.commit }}
+    steps:
+      - name: Check out the workflow (its scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: wf
+          persist-credentials: false
+      - name: Check out the tag (the code to build)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.tag.outputs.tag }}
+          path: src
+          fetch-depth: 0 # every tag, so the build script can see what else points at the commit
+          persist-credentials: false
+      - name: Install packages (and qemu-user for the emulated Westmere and Sandy Bridge)
+        run: |
+          wf/.github/scripts/install-deps.sh
+          sudo apt-get install -y -q --no-install-recommends qemu-user
+      - name: make dist, make dist-test, make dist-check-sandybridge, sha256sum
+        id: build
+        working-directory: src
+        env:
+          # a pushed tag must still be the commit that was pushed; a manual run takes the tag as it is
+          EXPECT_COMMIT: ${{ github.event_name == 'push' && github.sha || '' }}
+        run: |
+          mkdir -p ../ci-logs
+          ../wf/.github/scripts/release-build.sh "$TAG" ../out 2>&1 | tee ../ci-logs/release-build.log
+          echo "commit=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+      - name: Keep the tarball and its checksum for the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-tarball
+          path: out
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-release-build
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # -------------------------------------------------------------------------------------------------- publish
+  publish:
+    name: attest and attach to the release
+    needs: [tag, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the release, upload its assets
+      id-token: write # the Sigstore certificate of the attestation
+      attestations: write # store the attestation
+    env:
+      TAG: ${{ needs.tag.outputs.tag }}
+      COMMIT: ${{ needs.build.outputs.commit }}
+    steps:
+      - name: Check out the workflow (its scripts, docs/releases)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the tags, for the release text at the tag
+          persist-credentials: false
+      - name: The tag is still the commit that was built
+        run: |
+          set -eu
+          now=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}") || { echo "::error::no tag $TAG"; exit 1; }
+          if [ "$now" != "$COMMIT" ]; then
+              echo "::error::the tag $TAG moved from $COMMIT to $now during the run"
+              exit 1
+          fi
+      - name: Fetch the tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-tarball
+          path: out
+      - name: Check it against its checksum
+        run: |
+          set -eu
+          version=${TAG#v}
+          cd out
+          ls -l
+          [ "$(ls | sort | tr '\n' ' ')" = "tsdb-$version-x86_64-linux.tar.gz tsdb-$version-x86_64-linux.tar.gz.sha256 " ]
+          sha256sum -c "tsdb-$version-x86_64-linux.tar.gz.sha256"
+      - name: Attest the build provenance of the tarball
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/*.tar.gz
+      - name: Release text
+        run: tools/release-notes.sh "$TAG" "refs/tags/$TAG" >"$RUNNER_TEMP/notes.md"
+      - name: Create or find the release, upload the tarball and its checksum
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version=${TAG#v}
+          .github/scripts/release-publish.sh "$TAG" "$RUNNER_TEMP/notes.md" \
+              "out/tsdb-$version-x86_64-linux.tar.gz" "out/tsdb-$version-x86_64-linux.tar.gz.sha256"
