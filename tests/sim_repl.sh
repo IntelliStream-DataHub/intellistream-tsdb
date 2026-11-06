@@ -38,6 +38,11 @@ mutants() {
 case $mode in
 quick)
     "$B"/sim_repl --seeds 300 || exit 1
+    # Seeds of the first 1M-seed soak where a replica still following a deposed leader cut records the next
+    # epoch had committed (legitimate: the checker was too strict; see the TRUNCATE check in sim_repl.c).
+    for s in 43308 200636 294653 478816 570201 653518 756115 903046; do
+        "$B"/sim_repl --seed $s > /dev/null || exit 1
+    done
     mutants 200 "$quick"
     ;;
 mutants)

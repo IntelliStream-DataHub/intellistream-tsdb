@@ -101,6 +101,12 @@ static struct sim {
     uint64_t *committed;
     size_t ccap;
     uint64_t cmax;
+    /* Per committed position: the epoch of the first replica to apply it (no lower than the epoch that committed
+     * it), and whether a writer got OK for it. */
+    uint64_t *cepoch;
+    size_t cecap;
+    unsigned char *cacked;
+    size_t cacap;
     int *acker;
     size_t cacker;
     int bad;
@@ -267,6 +273,10 @@ static void check_apply(int i, uint64_t from, uint64_t to)
         } else if (p == S.cmax + 1) {
             S.committed = grow(S.committed, &S.ccap, p + 1, sizeof *S.committed);
             S.committed[p] = nd->log[k].id;
+            S.cepoch = grow(S.cepoch, &S.cecap, p + 1, sizeof *S.cepoch);
+            S.cepoch[p] = repl_epoch(nd->r);
+            S.cacked = grow(S.cacked, &S.cacap, p + 1, sizeof *S.cacked);
+            S.cacked[p] = 0;
             S.cmax = p;
         } else {
             violation("node %d applied %" PRIu64 " past the committed history (%" PRIu64 ")", i, p, S.cmax);
@@ -389,6 +399,8 @@ static void reply(int i, const struct repl_action *a)
             if (p > S.cmax || S.committed[p] != o->id)
                 violation("write %" PRIu64 " acknowledged at %" PRIu64 " by node %d is not the committed record",
                           o->id, p, i);
+            else
+                S.cacked[p] = 1;
         uint64_t e = repl_epoch(nd->r);
         S.acker = grow(S.acker, &S.cacker, e + 1, sizeof *S.acker);
         if (S.acker[e] && S.acker[e] != i + 1)
@@ -445,11 +457,20 @@ static void drive(int i, const struct smsg *cur)
             }
             if (a.pos < nd->applied)
                 violation("node %d cuts at %" PRIu64 " below its applied end %" PRIu64, i, a.pos, nd->applied);
+            /* An acknowledged record is never cut. A committed one is never cut by a replica of the epoch that
+             * committed it or a later one (every leader from then on has it). A replica that still follows an
+             * older epoch's leader cuts by that leader's history, which may lack a record a later epoch committed
+             * (the next leader came from the old ISR without the old leader's tail); it is outside the later ISR,
+             * and catches up from that epoch's leader when it learns of it (seed 200636). */
             size_t keep = a.pos ? (size_t)k + 1 : 0;
-            for (size_t j = keep; j < nd->n; j++)
-                if (nd->log[j].pos <= S.cmax && S.committed[nd->log[j].pos] == nd->log[j].id)
-                    violation("node %d cuts committed record %" PRIu64 " at %" PRIu64, i, nd->log[j].id,
-                              nd->log[j].pos);
+            uint64_t e = repl_epoch(nd->r);
+            for (size_t j = keep; j < nd->n; j++) {
+                uint64_t p = nd->log[j].pos;
+                if (p <= S.cmax && S.committed[p] == nd->log[j].id && (S.cacked[p] || S.cepoch[p] <= e))
+                    violation("node %d (epoch %" PRIu64 ") cuts %s record %" PRIu64 " at %" PRIu64
+                              " (committed by epoch %" PRIu64 ")", i, e, S.cacked[p] ? "acknowledged" : "committed",
+                              nd->log[j].id, p, S.cepoch[p]);
+            }
             trace("node %d: cut after %" PRIu64 " (end was %" PRIu64 ")", i, a.pos, log_end(nd));
             nd->n = keep;
             if (nd->ndur > keep)
@@ -855,6 +876,8 @@ static void reset(void)
     free(S.q);
     free(S.ops);
     free(S.committed);
+    free(S.cepoch);
+    free(S.cacked);
     free(S.acker);
     int trace_on = S.trace;
     __typeof__(S.tot) tot = S.tot;
