@@ -692,7 +692,10 @@ static int relay(int target, int mode, const struct view *v, uint32_t cid)
         if (req && reql == sizeof own)
             memcpy(own + 10, req + 10, 32);
         frame_len(own, sizeof own);
-        send_all(srv, own, sizeof own);
+        if (mode == RELAY_CLAIM && req)
+            send_all(srv, req, reql); /* the CLI took the forged handshake: what its own request gets shows it */
+        else
+            send_all(srv, own, sizeof own);
         free(auth);
         free(req);
         int r = closes_without_reply(srv, 3000);

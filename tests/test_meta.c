@@ -14,7 +14,9 @@
  *   - every server that applies index i reaches the same state (hash) as the first one that did;
  *   - each step obeys meta_check_step: epochs rise one at a time, a new leader was in the old ISR, the ISR changes
  *     only with a new version and always holds the leader;
- *   - (volume, epoch) names one leader in the whole run.
+ *   - (volume, epoch) names one leader in the whole run;
+ *   - an operation applied only if what it named held in the state it met (check_named: the epoch of VOLUME_LEADER,
+ *     the epoch and ISR version of ISR_CHANGE, the incarnation of MEMBER_STATE).
  * A failure prints the seed; `--first SEED --seeds 1` replays it.
  */
 #include "../server/meta.h"
@@ -461,6 +463,7 @@ struct snode {
     double rate;
     uint64_t restart_at;
     int group; /* partitions: nodes talk within one group */
+    unsigned reseeds;
 };
 
 enum { EV_MSG, EV_SYNC, EV_HARD };
@@ -494,7 +497,8 @@ struct msim {
     struct vleader *vl; /* (volume, epoch) -> leader, every pair seen */
     size_t nvl, vlcap;
     char fail[512];
-    uint64_t applied_max, proposals, ops_ok, leader_changes, crashes, partitions, installs;
+    uint64_t applied_max, proposals, ops_ok, leader_changes, crashes, partitions, installs, cut_installs, reseeds;
+    uint64_t quiet; /* no faults and no workload from here on */
     raft_config boot;
     int heal_pending;
     uint64_t heal_at;
@@ -569,6 +573,67 @@ static void record(struct msim *s, struct snode *nd, const struct meta_state *be
     }
 }
 
+static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+
+/* The conditions each operation names, against the state it met: an applied VOLUME_LEADER named the volume's epoch,
+ * an applied ISR_CHANGE its epoch and ISR version, an applied MEMBER_STATE an incarnation no older than the member's
+ * (of a member not out). The state each op met is rebuilt by applying, one op at a time on a copy of the state before
+ * the entry, the ops the real apply took (res[k] == META_OK): what meta_check_step cannot see (it compares states,
+ * not what an op asked for). */
+static void check_named(struct msim *s, struct snode *nd, const struct meta_state *before, const raft_entry *e,
+                        const int *res, unsigned nres)
+{
+    const uint8_t *d = e->data;
+    if (e->len < 8)
+        return;
+    uint32_t nops = rd32(d + 4);
+    size_t off = 8;
+    struct meta_state at;
+    meta_copy(&at, before);
+    for (uint32_t k = 0; k < nops && k < nres && off + 5 <= e->len; k++) {
+        uint8_t kind = d[off];
+        uint32_t n = rd32(d + off + 1);
+        const uint8_t *b = d + off + 5;
+        if (off + 5 + n > e->len)
+            break;
+        int ok = res[k] == META_OK;
+        if ((kind == META_OP_VOLUME_LEADER || kind == META_OP_ISR_CHANGE) && n >= 12 && ok) {
+            const struct meta_volume *v = meta_volume(&at, rd32(b));
+            uint64_t epoch = rd64(b + 4);
+            if (!v || v->epoch != epoch)
+                sim_fail(s, "node %u, index %" PRIu64 ": op %u (%s) named epoch %" PRIu64 " of volume %u at epoch %"
+                         PRIu64 " and was applied", nd->id, e->index, k,
+                         kind == META_OP_VOLUME_LEADER ? "VOLUME_LEADER" : "ISR_CHANGE", epoch, rd32(b),
+                         v ? v->epoch : 0);
+            else if (kind == META_OP_ISR_CHANGE && n >= 20 && rd64(b + 12) != v->isr_version)
+                sim_fail(s, "node %u, index %" PRIu64 ": ISR_CHANGE named ISR version %" PRIu64 " of volume %u at %"
+                         PRIu64 " and was applied", nd->id, e->index, rd64(b + 12), rd32(b), v->isr_version);
+        }
+        if (kind == META_OP_MEMBER_STATE && n >= 13 && ok) {
+            const struct meta_member *mb = meta_member(&at, rd32(b));
+            uint64_t inc = rd64(b + 5);
+            if (!mb || mb->state == META_OUT || inc < mb->incarnation)
+                sim_fail(s, "node %u, index %" PRIu64 ": MEMBER_STATE of member %u named incarnation %" PRIu64
+                         " (the member's: %" PRIu64 ", state %d) and was applied", nd->id, e->index, rd32(b), inc,
+                         mb ? mb->incarnation : 0, mb ? mb->state : -1);
+        }
+        if (ok) { /* the state the next op meets */
+            uint8_t one[8 + 5 + 4096];
+            if (5 + (size_t)n <= sizeof one - 8) {
+                uint32_t n1 = 1;
+                memcpy(one, d, 4);
+                memcpy(one + 4, &n1, 4);
+                memcpy(one + 8, d + off, 5 + (size_t)n);
+                int r1 = META_ERR_INVALID;
+                meta_apply(&at, e->index, e->term, one, 13 + (size_t)n, &r1, 1);
+            }
+        }
+        off += 5 + (size_t)n;
+    }
+    meta_free(&at);
+}
+
 static void apply_entry(struct msim *s, struct snode *nd, const raft_entry *e)
 {
     if (e->index != nd->sm.applied + 1) {
@@ -586,6 +651,7 @@ static void apply_entry(struct msim *s, struct snode *nd, const raft_entry *e)
         else
             for (unsigned i = 0; i < 16; i++)
                 s->ops_ok += res[i] == META_OK;
+        check_named(s, nd, &before, e, res, 16);
         record(s, nd, &before);
         meta_free(&before);
     } else {
@@ -643,6 +709,8 @@ static void send_msg(struct msim *s, struct snode *from, const raft_msg *m)
     }
 }
 
+static void crash(struct msim *s, struct snode *nd);
+
 static void drain(struct msim *s, struct snode *nd)
 {
     raft_action a;
@@ -669,6 +737,13 @@ static void drain(struct msim *s, struct snode *nd)
             break;
         }
         case RAFT_ACT_RESTORE: {
+            if (s->now < s->quiet && rnd(s, 0, 3) == 0) {
+                /* the crash cluster.c's restore can meet: the core has reset the log to the image's index, the image
+                 * is not kept yet (the boot finds a log based past its snapshot: reseed) */
+                s->cut_installs++;
+                crash(s, nd);
+                break;
+            }
             struct meta_state t;
             meta_init(&t);
             if (meta_snapshot_decode(&t, a.u.snapshot.data, a.u.snapshot.len) != META_OK ||
@@ -705,7 +780,27 @@ static void boot(struct msim *s, struct snode *nd)
     if (nd->snap) {
         if (meta_snapshot_decode(&nd->sm, nd->snap, nd->snaplen) != META_OK)
             abort();
-    } else {
+    }
+    if (nd->log.base > nd->sm.applied) {
+        /* an install cut short (above): what cluster.c's core_boot does (reseed_self). The vote is fenced at the
+         * log's last entry, the snapshot and the log go, and the leader sends a new image. */
+        raft_index li = nd->log.base + nd->log.n;
+        raft_term lt = ml_term_at(&nd->log, li);
+        if (nd->hard.fence_index < li) {
+            nd->hard.fence_index = li;
+            nd->hard.fence_term = lt;
+        }
+        ml_reset(&nd->log, 0, 0);
+        ml_release(&nd->log);
+        free(nd->snap);
+        nd->snap = NULL;
+        nd->snaplen = nd->snap_index = 0;
+        meta_free(&nd->sm);
+        meta_init(&nd->sm);
+        s->reseeds++;
+        nd->reseeds++;
+    }
+    if (!nd->snap) {
         uint8_t c[META_CONFIG_MAX];
         size_t cl = raft_config_encode(&s->boot, c, sizeof c);
         meta_apply_other(&nd->sm, 0, 0, c, cl);
@@ -858,7 +953,10 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
     }
     for (unsigned i = 1; i <= s->n; i++)
         boot(s, &s->nd[i]);
-    uint64_t end = (uint64_t)(seconds * 1e9), step = 1000000, next_tick = 0;
+    /* the faults and the workload stop at `quiet`; every server must then catch up (a reseed included) */
+    /* 12 s: a restart (up to 2 s) and the leader's snapshot resend (5 s) fit */
+    uint64_t quiet = (uint64_t)(seconds * 1e9), end = quiet + 12000000000ull, step = 1000000, next_tick = 0;
+    s->quiet = quiet;
     while (s->now < end && !s->fail[0]) {
         s->now += step;
         /* due events, in time order among those due */
@@ -918,25 +1016,25 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
                 drain(s, nd);
             }
             /* faults: crashes keep a majority up most of the time, partitions heal */
-            if (rnd(s, 0, 999) < 3) {
+            if (s->now < quiet && rnd(s, 0, 999) < 3) {
                 struct snode *nd = &s->nd[rnd(s, 1, s->n)];
                 if (nd->up)
                     crash(s, nd);
             }
-            if (!s->heal_pending && rnd(s, 0, 999) < 3) {
+            if (s->now < quiet && !s->heal_pending && rnd(s, 0, 999) < 3) {
                 for (unsigned i = 1; i <= s->n; i++)
                     s->nd[i].group = (int)rnd(s, 0, 1);
                 s->heal_pending = 1;
                 s->heal_at = s->now + rnd(s, 200000000, 3000000000ull);
                 s->partitions++;
-            } else if (s->heal_pending && s->now >= s->heal_at) {
+            } else if (s->heal_pending && (s->now >= s->heal_at || s->now >= quiet)) {
                 for (unsigned i = 1; i <= s->n; i++)
                     s->nd[i].group = 0;
                 s->heal_pending = 0;
             }
         }
         /* the workload: a proposal at whoever leads, about 200 a second */
-        if (rnd(s, 0, 4) == 0)
+        if (s->now < quiet && rnd(s, 0, 4) == 0)
             for (unsigned i = 1; i <= s->n; i++) {
                 struct snode *nd = &s->nd[i];
                 if (nd->up && raft_get_role(nd->r) == RAFT_LEADER) {
@@ -947,6 +1045,24 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
             }
     }
     int ok = !s->fail[0];
+    for (unsigned i = 1; ok && i <= s->n; i++) {
+        const struct snode *nd = &s->nd[i];
+        if (!nd->up || nd->sm.applied != s->applied_max) {
+            raft_progress pr = {0};
+            for (unsigned j = 1; j <= s->n; j++)
+                if (s->nd[j].up && raft_get_role(s->nd[j].r) == RAFT_LEADER)
+                    raft_get_progress(s->nd[j].r, nd->id, &pr);
+            snprintf(s->fail, sizeof s->fail,
+                     "node %u ended %s at %" PRIu64 " of %" PRIu64 " after %.0f quiet seconds (log %" PRIu64 "..%" PRIu64
+                     ", commit %" PRIu64 ", leader %u, %u reseeds; the leader's progress: match %" PRIu64
+                     " next %" PRIu64 " snapshotting %d)",
+                     nd->id, nd->up ? "up" : "down", nd->sm.applied, s->applied_max, (end - quiet) / 1e9,
+                     (uint64_t)nd->log.base, (uint64_t)(nd->log.base + nd->log.n),
+                     nd->up ? (uint64_t)raft_get_commit(nd->r) : 0, nd->up ? (unsigned)raft_get_leader(nd->r) : 0,
+                     nd->reseeds, (uint64_t)pr.match, (uint64_t)pr.next, (int)pr.snapshotting);
+            ok = 0;
+        }
+    }
     if (ok && s->applied_max < 100)
         snprintf(s->fail, sizeof s->fail, "only %" PRIu64 " entries applied", s->applied_max), ok = 0;
     if (!ok)
@@ -954,9 +1070,9 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
     else if (verbose)
         printf("seed %" PRIu64 ": %u servers, %" PRIu64 " applied, %" PRIu64 " proposals, %" PRIu64
                " operations took effect, %" PRIu64 " leaders, %" PRIu64 " crashes, %" PRIu64 " partitions, %" PRIu64
-               " snapshot installs\n",
+               " snapshot installs (%" PRIu64 " cut short, %" PRIu64 " reseeds)\n",
                seed, s->n, s->applied_max, s->proposals, s->ops_ok, s->leader_changes, s->crashes, s->partitions,
-               s->installs);
+               s->installs, s->cut_installs, s->reseeds);
     for (unsigned i = 1; i <= s->n; i++) {
         struct snode *nd = &s->nd[i];
         if (nd->r)
