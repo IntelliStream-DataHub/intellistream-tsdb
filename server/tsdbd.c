@@ -232,7 +232,7 @@ typedef struct conn {
     bool eof;           /* the client sent everything it will: reply to it, then close */
     buf sending;
     size_t sent;
-    int64_t tx_t0;      /* when the output last moved (monotonic s): a send started, or the socket's queue changed */
+    int64_t tx_t0;      /* when the output last moved (monotonic ms): a send started, or the socket's queue changed */
     int tx_outq;        /* the socket's unsent and unacknowledged bytes (SIOCOUTQ) at the last tick */
     size_t in_charged;  /* of in.cap, counted in req_held (a buffer grown for a large frame) */
     size_t q_bytes;     /* REQ_COST of the requests in q */
@@ -1869,6 +1869,15 @@ static int64_t mono_s(void)
     return (int64_t)t.tv_sec;
 }
 
+/* The send timeout counts in ms: whole seconds would close a connection anywhere from T to T + 2 s after its
+ * output stopped (a send started late in one second, the tick early in another); this way T to T + 1 s. */
+static int64_t mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
 /* What c's receive buffer counts in req_held: all of it once grown past IN_KEEP. */
 static void in_account(conn *c)
 {
@@ -2027,7 +2036,7 @@ static void submit_send(conn *c)
         }
     }
     c->send_inflight = true;
-    c->tx_t0 = mono_s(); /* a send is started only after the last one moved bytes (on_send) */
+    c->tx_t0 = mono_ms(); /* a send is started only after the last one moved bytes (on_send) */
     c->tx_outq = -1;     /* the next tick's reading is the baseline, not progress: it would add a second */
     if (io == IO_EPOLL) {
         ep_want(c);
@@ -2358,7 +2367,7 @@ static void on_tick(void)
     uint64_t v;
     if (read(tick_fd, &v, 8) < 0 && errno != EAGAIN)
         perror("tsdbd: timerfd");
-    int64_t now = mono_s();
+    int64_t now = mono_s(), now_ms = mono_ms();
     static int64_t logged;
     static int64_t login_logged;
     static int64_t send_logged;
@@ -2381,7 +2390,7 @@ static void on_tick(void)
         next = c->next;
         if (stall) {
             c->t_open += stall;
-            c->tx_t0 += stall;
+            c->tx_t0 += stall * 1000;
             if (c->frame_t0)
                 c->frame_t0 += stall;
         }
@@ -2414,11 +2423,11 @@ static void on_tick(void)
             int q;
             if (ioctl(c->fd, SIOCOUTQ, &q) == 0 && q != c->tx_outq) {
                 if (c->tx_outq >= 0)
-                    c->tx_t0 = now;
+                    c->tx_t0 = now_ms;
                 c->tx_outq = q;
             }
         }
-        if (c->send_inflight && !c->closed && now - c->tx_t0 > send_timeout_s) {
+        if (c->send_inflight && !c->closed && now_ms - c->tx_t0 >= send_timeout_s * 1000LL) {
             if (send_logged != now) {
                 send_logged = now;
                 fprintf(stderr, "tsdbd: connection closed: its output did not move for %d s\n", send_timeout_s);
