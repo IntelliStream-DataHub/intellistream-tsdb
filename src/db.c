@@ -540,6 +540,24 @@ static int load_parts(eng *db, bool read_only)
 
 int eng_open(const char *dir, const tsdb_options *opts, eng **out) { return eng_open_sched(dir, opts, NULL, out); }
 
+static __thread int adopt_lockfd = -1;
+
+int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, eng **out)
+{
+    if (old->lockfd < 0)
+        return eng_open_sched(dir, opts, qs, out);
+    int fd = fcntl(old->lockfd, F_DUPFD_CLOEXEC, 3); /* the new engine owns this copy; the old one keeps its own */
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    adopt_lockfd = fd;
+    int rc = eng_open_sched(dir, opts, qs, out);
+    if (adopt_lockfd >= 0) { /* the open failed before it took the fd */
+        close(adopt_lockfd);
+        adopt_lockfd = -1;
+    }
+    return rc;
+}
+
 int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **out)
 {
     *out = NULL;
@@ -599,14 +617,21 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         goto fail;
     }
     if (!ro) {
-        db->lockfd = openat(db->dirfd, "LOCK", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-        if (db->lockfd < 0) {
-            rc = TSDB_ERR_IO;
-            goto fail;
-        }
-        if (flock(db->lockfd, LOCK_EX | LOCK_NB) != 0) {
-            rc = TSDB_ERR_LOCKED;
-            goto fail;
+        if (adopt_lockfd >= 0) {
+            /* a reopen of this directory by the process that holds its lock (eng_reopen_lockfd): the same open
+             * file description, so the lock is never released between the old engine and the new one */
+            db->lockfd = adopt_lockfd;
+            adopt_lockfd = -1;
+        } else {
+            db->lockfd = openat(db->dirfd, "LOCK", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+            if (db->lockfd < 0) {
+                rc = TSDB_ERR_IO;
+                goto fail;
+            }
+            if (flock(db->lockfd, LOCK_EX | LOCK_NB) != 0) {
+                rc = TSDB_ERR_LOCKED;
+                goto fail;
+            }
         }
     }
     if ((rc = meta_load_or_create(db, ro)) != 0)
@@ -690,6 +715,44 @@ fail:
     return rc;
 }
 
+/* Stops and joins the threads of the engine, which then does nothing on its own: for a volume that is about to be
+ * opened again (ha.md 15.5), so no thread of the old engine writes beside the new one. No flush: what was durable
+ * is in the WAL, which the new open replays. A thread inside a hung call keeps this waiting: no deadline. */
+void eng_halt(eng *db)
+{
+    if (db->has_flusher) {
+        pthread_mutex_lock(&db->buf_lock);
+        db->flusher_stop = true;
+        pthread_cond_broadcast(&db->flush_cv);
+        pthread_mutex_unlock(&db->buf_lock);
+        pthread_join(db->flusher, NULL);
+        db->has_flusher = false;
+    }
+    if (db->has_follower) {
+        pthread_mutex_lock(&db->buf_lock);
+        db->follower_stop = true;
+        pthread_cond_broadcast(&db->flush_cv);
+        pthread_mutex_unlock(&db->buf_lock);
+        pthread_join(db->follower, NULL);
+        db->has_follower = false;
+    }
+    pthread_mutex_lock(&db->lock);
+    atomic_store(&db->stop, true);
+    pthread_cond_broadcast(&db->merge_cv);
+    pthread_cond_broadcast(&db->merged_cv);
+    pthread_mutex_unlock(&db->lock);
+    for (int i = 0; i < db->nmergers; i++)
+        pthread_join(db->mergers[i], NULL);
+    db->nmergers = 0;
+}
+
+int eng_retire(eng *db)
+{
+    if (db)
+        db->retiring = true;
+    return eng_close(db);
+}
+
 int eng_close(eng *db)
 {
     if (!db)
@@ -709,7 +772,8 @@ int eng_close(eng *db)
         pthread_mutex_unlock(&db->buf_lock);
         pthread_join(db->follower, NULL);
     }
-    if (!db->opt.read_only && db->active)
+    /* a retired engine writes nothing: its replacement owns the directory */
+    if (!db->opt.read_only && db->active && !db->retiring)
         rc = eng_flush(db);
 
     pthread_mutex_lock(&db->lock);
@@ -726,13 +790,14 @@ int eng_close(eng *db)
     for (size_t i = 0; i < db->ntails; i++)
         mt_unref(db->tails[i].m);
     db->ntails = 0;
-    if (db->dirfd >= 0 && !db->opt.read_only)
+    if (db->dirfd >= 0 && !db->opt.read_only && !db->retiring)
         graveyard_purge(db, false); /* the rest is collected at the next open */
     free(db->graveyard);
 
     for (size_t i = 0; i < db->nparts; i++)
         part_unref(db->parts[i]);
     free(db->parts);
+    db->series.keep_names = db->states.keep_names = db->retiring;
     if (db->series.file)
         series_close(&db->series);
     if (db->states.file)

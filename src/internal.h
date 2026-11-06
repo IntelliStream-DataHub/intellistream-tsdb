@@ -997,6 +997,7 @@ typedef struct series_dict {
      * fails that add as if memory ran out */
     int (*test_fault)(void *arg, int point, const char *name);
     void *test_fault_arg;
+    bool keep_names;   /* series_close leaves the name strings: tsdb_series_name pointers outlive a retired engine */
 } series_dict;
 enum { DICT_AT_ADD = 1, DICT_AT_FAILED = 2, DICT_AT_RELOAD = 3 };
 
@@ -1419,6 +1420,9 @@ struct eng {
     /* fail-stop (eng_fail): set once, never cleared; fail_msg is written under
      * fail_lock before `failed` is stored, so whoever sees `failed` can read it */
     atomic_bool failed;
+    atomic_int refs;       /* callers inside this engine through the tsdb handle (volumes.c, ha.md 15.5 step 2) */
+    atomic_bool quiesced;  /* no new caller: the volume is being recovered */
+    bool retiring;         /* eng_close keeps the names of the dictionaries (eng_retire) */
     pthread_mutex_t fail_lock; /* innermost; held only to fill fail_msg */
     pthread_mutex_t dir_sync_lock; /* eng_sync_dir; inside every lock but fail_lock */
     char fail_msg[256];
@@ -1541,6 +1545,12 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out);
 /* the same with the scheduler of the tsdb that owns the engine */
 int eng_open_sched(const char *dir, const tsdb_options *opts, sched *s, eng **out);
 int eng_close(eng *db);
+/* As eng_close, for an engine replaced by a fresh open of its directory (ha.md 15.5): the name strings stay, for the
+ * `tsdb_series_name` pointers callers hold until tsdb_close. */
+int eng_retire(eng *db);
+void eng_halt(eng *db);
+/* A new engine for the directory of `old` (halted, closed afterwards by eng_retire) that takes over its lock. */
+int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, struct sched *qs, eng **out);
 int eng_series(eng *db, const char *name, int type, uint32_t *id);
 int eng_series_lookup(eng *db, const char *name, uint32_t *id);
 uint32_t eng_series_count(eng *db);

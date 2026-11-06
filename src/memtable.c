@@ -1242,7 +1242,7 @@ void wal_close(eng *db)
     if (db->wal_fd >= 0) {
         close(db->wal_fd);
         db->wal_fd = -1;
-        if (db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db)) {
+        if (db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db) && !db->retiring) {
             char name[64];
             wal_name(name, sizeof name, db->wal_seq);
             unlinkat(db->dirfd, name, 0);

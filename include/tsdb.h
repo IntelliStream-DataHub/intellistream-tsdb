@@ -730,6 +730,19 @@ int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
  * write before its WAL append, a large write, delete or replace before its commit). A step past its check completes.
  * NULL clears it. The flag must outlive the call; only this thread's own request steps look at it. */
 void tsdb_set_abandon_flag(const volatile int *flag);
+
+/* Recovery of one volume in the running process (ha.md 15.5; tsdbd, not embedded use). `vol` is the volume number
+ * (0 is the root, which is not recovered here). tsdb_volume_quiesce: new calls on the volume's series that read or
+ * write return TSDB_ERR_UNAVAILABLE (names and types still answer). tsdb_volume_idle: waits until no call is inside
+ * the volume's engine any more (timeout_ms < 0: no deadline; a call stuck in a hung system call keeps this waiting):
+ * 0 idle, 1 not within the time. tsdb_volume_reopen: on a quiesced, idle volume stops the engine's threads, opens
+ * the directory again (the WAL is replayed, the lock is kept) and swaps the new engine in, with the volume no longer
+ * quiesced; on an error the old engine stays quiesced and the call can be repeated. tsdb_volume_resume ends a
+ * quiesce without a reopen. */
+int tsdb_volume_quiesce(tsdb *db, size_t vol);
+int tsdb_volume_idle(tsdb *db, size_t vol, int timeout_ms);
+int tsdb_volume_reopen(tsdb *db, size_t vol);
+int tsdb_volume_resume(tsdb *db, size_t vol);
 void tsdb_set_write_wait_hook(tsdb *db, void (*on_wait)(void *ctx, int delta), void *ctx);
 
 /* Fail-stop. A storage error after which it is unknown what reached the disk
