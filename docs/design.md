@@ -907,6 +907,26 @@ damage into silently missing or shifted data:
   `TSDB_ERR_CORRUPT`), and refused by the next open. Every retention change
   does not hash every index: that would hold the part list's lock for a pass
   over all of them, and only a drop needs it.
+
+  Damage in a granule's payload is not seen by the open, which hashes the
+  header, index and footer only. A merge decodes with the granule checksum
+  always checked, so it is the first to fail on it (`TSDB_ERR_CORRUPT` from
+  `cur_load` or `pw_copy_fits`; never from `pw_add`, which refuses rows out of
+  order, a bug of the merge and not damage in a source). The source part whose
+  decode failed is marked in memory only (`part_mark_payload`): logged once,
+  counted once in `broken_parts`, left out of merges with its partition. It is
+  not marked for the next open, which will not refuse it: a misdirected read can
+  damage one mapping of a healthy part, and a restart reads it again; real
+  damage marks it again at the first merge. Without the mark the merge was
+  retried every second and the partition's part count never fell. An insert
+  waits for merges while its partition has more than `PARTS_TO_DELAY_INSERT`
+  parts, after its rows are published, so that wait never fails the insert
+  (`db_wait_merges`): it ends at once for a partition with a marked part or
+  after a failed engine, and after `wait_stall_ms` (30 s) in which the count did
+  not fall and no merge of the partition ran. A damaged partition's part count
+  then grows until an operator restores the part; refusing inserts instead
+  would report a visible write as failed, and flushes of the memtable add
+  parts without waiting anyway. A cap is future work.
 - **Series in parts.** Every series a part holds is in SERIES: its record is
   synced (`dict_append`) before its id is handed out, and so before any row of
   it can reach a part. A part that names a series beyond the end of SERIES

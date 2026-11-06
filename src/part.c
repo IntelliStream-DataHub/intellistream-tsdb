@@ -134,6 +134,23 @@ bool part_checked(eng *db, part *p, const char *what)
     return false;
 }
 
+/* A merge could not decode a granule of p (its checksum, always checked by a merge, or its codec said so): the
+ * payload is damaged, which the open does not see (it hashes the header, index and footer only) and a query without
+ * verify_checksums does not either. Marked like part_checked marks index damage, so that the merge is not retried
+ * every second (the part count would never fall, and inserts into the partition would wait for it: db_wait_merges),
+ * logged and counted once in st_broken_parts. The mark is kept in memory only: a misdirected read can damage one
+ * mapping of a healthy part, and a restart reads it again; if the damage is real, the merge marks it again. */
+void part_mark_payload(eng *db, part *p, const char *what)
+{
+    if (atomic_exchange(&p->damaged, true))
+        return;
+    fprintf(stderr, "tsdb: %s: a granule of part %s cannot be decoded (its payload is damaged, or its index no longer "
+                    "matches the part): the part and its partition are left out of merges and retention drops; "
+                    "queries that decode that granule fail with TSDB_ERR_CORRUPT (or, without verify_checksums, may "
+                    "return wrong values); restore the part from a backup or snapshot\n", what, p->name);
+    atomic_fetch_add(&db->st_broken_parts, 1);
+}
+
 /* Opens the file `file` as the part called `name` (a follower may find a part
  * under its retired_ name). pin: read the index and tombstones from a checked copy (pin_index). */
 int part_open_as(int dirfd, const char *file, const char *name, bool pin, part **out)
@@ -492,7 +509,7 @@ static uint64_t hc_gap(const part *src, uint32_t i, uint32_t count)
     return gap >= UINT32_MAX ? 0 : gap;                              /* saturated: not a bound */
 }
 
-int pw_copy_fits(part_writer *w, const part *src, uint32_t i, const granule *g, bool want_end, int64_t *end)
+int pw_copy_fits(part_writer *w, part *src, uint32_t i, const granule *g, bool want_end, int64_t *end)
 {
     *end = INT64_MAX;
     w->hk_dsrc = NULL;
@@ -539,11 +556,16 @@ int pw_copy_fits(part_writer *w, const part *src, uint32_t i, const granule *g, 
     IX_HOOK(src, i, IX_FITS);
     gx_load(src, i, GW_TIME | GW_LOC, &gl);
     /* the count bounds the loop below: another than the caller's (the index changed in the mapping) is damage */
-    if (gl.count != c)
+    if (gl.count != c) {
+        part_mark_payload(w->db, src, "merge");
         return TSDB_ERR_CORRUPT;
+    }
     int rc = granule_read(w->cc, src, &gl, 0, w->hk_buf, NULL, MAX_GRANULE_ROWS, true);
-    if (rc)
+    if (rc) {
+        if (rc == TSDB_ERR_CORRUPT)
+            part_mark_payload(w->db, src, "merge");
         return rc;
+    }
     const int64_t *ts = w->hk_buf;
     *end = INT64_MAX;
     for (size_t j = 0; j < c;) {

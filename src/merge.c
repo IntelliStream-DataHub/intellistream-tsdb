@@ -185,8 +185,12 @@ static int cur_load(eng *db, codec_ctx *cc, cursor *c)
     if (c->type < 0)
         return TSDB_ERR_CORRUPT; /* a granule of a series the dictionary does not have */
     int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, c->p->grows, true);
-    if (rc)
+    if (rc) {
+        /* only the source's own bytes: not NOMEM or IO, and not the part writer's refusals (pw_add) */
+        if (rc == TSDB_ERR_CORRUPT)
+            part_mark_payload(db, c->p, "merge");
         return rc;
+    }
     c->loaded = true;
     c->pos = 0;
     c->n = g->count;

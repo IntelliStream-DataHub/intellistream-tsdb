@@ -158,13 +158,71 @@ void db_add_parts(eng *db, part **ps, size_t n)
     manifest_publish(db);
 }
 
-/* Waits while a partition has too many parts (parts_to_delay_insert). */
+atomic_int wait_stall_ms = 30000;
+
+static int64_t wait_mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* Backpressure, not a safety rule: the rows are published and visible when an insert gets here, so the wait never
+ * fails the insert; it only ends early. It ends at once when merges of the partition cannot make progress:
+ *  - a part of it is damaged (marked by part_checked or part_mark_payload): select_merge_locked leaves the whole
+ *    partition out, so the count would never fall. Said once per damaged part; the damage itself was logged and
+ *    counted (st_broken_parts) when it was marked;
+ *  - the engine failed (eng_fail): nothing is merged any more.
+ * and after wait_stall_ms in which the count did not fall and no merge of the partition ran, for every other
+ * cause (parts that can never pair under max_part_bytes, merges failing for another reason): a rate-limited line.
+ * A long merge in flight is never cut short: its time does not count. Without this a partition whose merges
+ * kept failing held every writer of the process for ever (jepsen --nemesis misdirect, verify_checksums off). */
 void db_wait_merges(eng *db, int64_t partition)
 {
     if (db->nmergers == 0)
         return;
     pthread_mutex_lock(&db->lock);
-    while (!atomic_load(&db->stop) && partition_part_count_locked(db, partition) > PARTS_TO_DELAY_INSERT) {
+    int64_t idle_ms = 0, last = wait_mono_ms();
+    size_t prev = SIZE_MAX;
+    while (!atomic_load(&db->stop)) {
+        size_t n = 0;
+        bool merging = false;
+        part *bad = NULL;
+        for (size_t i = 0; i < db->nparts; i++) {
+            part *p = db->parts[i];
+            if (p->partition != partition)
+                continue;
+            n++;
+            merging |= p->merging;
+            if (!bad && atomic_load(&p->damaged))
+                bad = p;
+        }
+        if (n <= PARTS_TO_DELAY_INSERT || eng_check(db))
+            break;
+        if (bad) {
+            if (!atomic_exchange(&bad->wait_logged, true))
+                fprintf(stderr, "tsdb: partition %" PRId64 " has %zu parts and part %s is damaged, so its merges "
+                                "are left out: inserts into it no longer wait for merges (its part count grows "
+                                "until the part is restored)\n", partition, n, bad->name);
+            break;
+        }
+        int64_t now = wait_mono_ms();
+        if (n < prev) /* progress */
+            idle_ms = 0;
+        else if (!merging)
+            idle_ms += now - last;
+        prev = n;
+        last = now;
+        if (idle_ms >= atomic_load(&wait_stall_ms)) {
+            if (!db->stall_log_ms || now - db->stall_log_ms >= 60000) {
+                db->stall_log_ms = now ? now : 1;
+                fprintf(stderr, "tsdb: partition %" PRId64 " has %zu parts and its merges made no progress for "
+                                "%" PRId64 " ms (no merge of it can run: parts that cannot pair under "
+                                "max_part_bytes, or merges that keep failing, see the log): the insert goes on\n",
+                        partition, n, idle_ms);
+            }
+            break;
+        }
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += 1;

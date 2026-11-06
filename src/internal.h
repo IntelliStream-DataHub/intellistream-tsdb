@@ -749,7 +749,9 @@ typedef struct part {
     /* protected by tsdb.lock */
     bool merging;
     bool dropped;
-    atomic_bool damaged; /* its index no longer matches the open's checksum: out of merges and drops (part_checked) */
+    atomic_bool damaged; /* its index no longer matches the open's checksum, or a merge could not decode one of its
+                          * granules: out of merges and drops (part_checked, part_mark_payload) */
+    atomic_bool wait_logged; /* db_wait_merges said once that inserts no longer wait for this damaged part's partition */
     uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
     int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
     atomic_bool obsolete; /* delete the file when the last reference goes */
@@ -858,6 +860,8 @@ int part_open_as(int dirfd, const char *file, const char *name, bool pin, part *
 bool part_index_intact(const part *p);
 /* part_index_intact; a part that fails it is marked damaged, logged and counted once (st_broken_parts) */
 bool part_checked(struct eng *db, part *p, const char *what);
+/* A merge could not decode a granule of p: marks it damaged, logs and counts it once (in memory only) */
+void part_mark_payload(struct eng *db, part *p, const char *what);
 void part_ref(part *p);
 void part_unref(part *p);
 /* Decodes a granule: timestamps, and values (if v) as slots of `type`, into buffers of room for cap rows; checks
@@ -944,7 +948,7 @@ int pw_copy_granule(part_writer *w, const part *src, uint32_t i);
  * after it where the writer cuts (INT64_MAX: none; then only a day cut or the end of the series' rows ends it, which
  * the caller checks). 1 yes, 0 no, < 0 an error. Decides from the count, window and longest gap between rows where
  * they suffice, else from the timestamps, decoded (and kept for pw_copy_granule's count of the hour). */
-int pw_copy_fits(part_writer *w, const struct part *src, uint32_t i, const granule *g, bool want_end, int64_t *end);
+int pw_copy_fits(part_writer *w, struct part *src, uint32_t i, const granule *g, bool want_end, int64_t *end);
 /* whether w ends its pending rows at an hour edge at or before t (a cut before a granule of their series) */
 bool pw_hcut_before(const part_writer *w, int64_t t);
 /* Tombstones for the trailer, sorted by (series, start) and disjoint per series; copied. */
@@ -1293,6 +1297,7 @@ struct eng {
 
     pthread_t *mergers;
     int nmergers;
+    int64_t stall_log_ms; /* when db_wait_merges last said that merges of a partition made no progress (db->lock) */
 
     pthread_mutex_t cc_lock;
     codec_ctx *cc_free;
@@ -1490,6 +1495,9 @@ int partition_class(const struct eng *db, int64_t key);
  * be discarded; a MANIFEST failure fails the engine by itself (eng_fail). */
 void db_add_parts(struct eng *db, part **ps, size_t n);
 void db_wait_merges(struct eng *db, int64_t partition);
+/* How long (ms) db_wait_merges lets a partition's part count stand while no merge of it runs, before an insert goes on;
+ * a variable so that tests can shorten it. */
+extern atomic_int wait_stall_ms;
 size_t partition_part_count_locked(struct eng *db, int64_t partition);
 void db_parts_insert_locked(struct eng *db, part *p);
 void db_parts_remove_locked(struct eng *db, part *p);
