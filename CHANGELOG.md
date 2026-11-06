@@ -10,6 +10,23 @@ disk format and the wire protocol.
 
 ### Fixed
 
+- **Inserts no longer wait for ever on a partition whose merges keep failing.** An insert that leaves a partition with
+  more than 300 parts waits for merges (like `parts_to_delay_insert`), and the wait had no end: a merge that failed
+  on a granule with damaged payload (the merge checks each granule's hash, the open does not) was retried every
+  second, the count never fell, and every insert into the partition, so every worker of `tsdbd`, waited for ever (found
+  by `make jepsen`, nemesis `misdirect`, with `verify_checksums` off; the same with it on). Now a merge that cannot
+  decode a granule of a source part marks that part, like an index that no longer matches its checksum: logged once,
+  counted once in `tsdb_broken_parts`, and left out of merges and drops with its partition (`tsdb_optimize` merges the
+  rest and returns `TSDB_ERR_CORRUPT`). The mark is kept in memory only, and the log says to restore the part: queries
+  that decode the granule fail with `TSDB_ERR_CORRUPT`, or without `verify_checksums` may return wrong values. The wait
+  ends at once for a partition with a marked part and when the engine has failed, and after 30 s in which the count did
+  not fall and no merge of the partition ran (for example parts that cannot pair under `max_part_bytes`), or after
+  30 s from the first merge of the partition that failed during the wait (a full disk, EIO on the merge output: a
+  merge that takes minutes would otherwise stretch the 30 s to hours). The first wait that runs out remembers the
+  partition as stalled, so later inserts into it, and the other parts of the same insert, go on at once until its
+  count falls or a merge of it commits, instead of each paying 30 s. The rows are published before the wait, so the
+  insert still succeeds; the partition's part count grows until the part is restored. `tests/test_damage.c`
+  (`test_wait_merges_damaged`, `test_wait_merges_stalled`, `test_wait_merges_failing`).
 - **A step of the wall clock no longer deletes retired parts early.** The `obsolete_part_lifetime_s` of a part a
   merge replaced (`retired_*`, which a follower on another host may still have mapped) is now counted on the monotonic
   clock, also for the retired files a restart finds. A clock set forward (NTP, an operator, a resumed VM) used to
