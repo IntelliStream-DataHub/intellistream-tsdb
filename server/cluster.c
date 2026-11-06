@@ -602,6 +602,8 @@ struct ring_e {
 struct heard {
     uint32_t id;
     uint64_t ns, inc, applied;
+    char addr[META_ADDR_MAX], peer[META_ADDR_MAX]; /* as the member's heartbeat advertises them */
+    uint64_t moved_ns; /* when the leader last proposed these addresses for the record */
 };
 
 struct addr_e {
@@ -906,6 +908,12 @@ static const char *peer_of(uint32_t id)
         addr_learn(id, m->peer); /* keeps the dial clock in one place */
         return m->peer;
     }
+    /* a core that restarted applies nothing until a leader reaches it; its probe's watch stream knows the others */
+    m = C.wsm_on ? meta_member(&C.wsm, id) : NULL;
+    if (m && m->peer[0]) {
+        addr_learn(id, m->peer);
+        return m->peer;
+    }
     struct addr_e *a = addr_entry(id);
     return a ? a->peer : NULL;
 }
@@ -994,7 +1002,8 @@ static struct heard *heard_get(uint32_t id)
     return NULL;
 }
 
-static void heard_set(uint32_t id, uint64_t now, uint64_t inc, uint64_t applied)
+/* addr, peer: what the member advertises now (NULL: not said here, keep what was heard) */
+static void heard_set(uint32_t id, uint64_t now, uint64_t inc, uint64_t applied, const char *addr, const char *peer)
 {
     struct heard *h = heard_get(id);
     if (!h) {
@@ -1005,11 +1014,15 @@ static void heard_set(uint32_t id, uint64_t now, uint64_t inc, uint64_t applied)
                 oom();
         }
         h = &C.heard[C.nheard++];
-        h->id = id;
+        *h = (struct heard){.id = id};
     }
     h->ns = now;
     h->inc = inc;
     h->applied = applied;
+    if (addr && peer) {
+        snprintf(h->addr, sizeof h->addr, "%s", addr);
+        snprintf(h->peer, sizeof h->peer, "%s", peer);
+    }
 }
 
 /* when this server last heard `id` (now for itself), 0 never */
@@ -1484,11 +1497,14 @@ static void on_hb(struct conn *c, struct rd *r)
 {
     uint32_t node = get32(r);
     uint64_t inc = get64(r), applied = get64(r);
+    char addr[META_ADDR_MAX], peer[META_ADDR_MAX];
+    getstr(r, addr, sizeof addr);
+    getstr(r, peer, sizeof peer);
     if (r->bad || !node || node != c->id) {
         c->dead = r->bad;
         return;
     }
-    heard_set(node, iso_now_ns(), inc, applied);
+    heard_set(node, iso_now_ns(), inc, applied, addr, peer);
     frame_begin(&C.fb, F_HB_ACK);
     put32(&C.fb, C.r ? raft_get_leader(C.r) : 0);
     put64(&C.fb, C.r ? raft_get_term(C.r) : 0);
@@ -1777,7 +1793,7 @@ static void on_join_reply(struct conn *c, struct rd *r)
     struct meta_entry e;
     meta_entry_init(&e);
     meta_op_member_add(&e, &mb);
-    heard_set(mb.id, iso_now_ns(), mb.incarnation, 0); /* it heartbeats once its watch stream has the member list */
+    heard_set(mb.id, iso_now_ns(), mb.incarnation, 0, NULL, NULL); /* it heartbeats once its watch stream has the member list */
     propose(&e, c->join_cli, c->join_reqid, 0);
 }
 
@@ -1954,11 +1970,13 @@ static void heartbeat(uint64_t now)
         cfg = *raft_get_config(C.r);
     else if (!config_of(&C.sm, &cfg))
         return;
-    heard_set(C.id, now, C.incarnation, C.sm.applied);
+    heard_set(C.id, now, C.incarnation, C.sm.applied, C.adv, C.padv);
     frame_begin(&C.fb, F_HB);
     put32(&C.fb, C.id);
     put64(&C.fb, C.incarnation);
     put64(&C.fb, C.sm.applied);
+    putstr(&C.fb, C.adv);
+    putstr(&C.fb, C.padv); /* a restart may have moved it (another port, another host) */
     frame_end(&C.fb);
     for (unsigned i = 0; i < cfg.n; i++) {
         if (cfg.m[i].learner || cfg.m[i].id == C.id)
@@ -1969,13 +1987,26 @@ static void heartbeat(uint64_t now)
     }
 }
 
-static void propose_state(uint32_t id, int state, uint64_t inc)
+/* MEMBER_ADDR when `h` names other addresses than the record (h NULL: none), then MEMBER_STATE when state >= 0 */
+static void propose_member(uint32_t id, int state, uint64_t inc, struct heard *h, uint64_t now)
 {
     struct meta_entry e;
     meta_entry_init(&e);
-    meta_op_member_state(&e, id, state, inc);
+    char addr[META_ADDR_MAX] = "", peer[META_ADDR_MAX] = "";
+    if (h) {
+        /* once per node timeout: a refusal (another live member holds that peer address) is not retried hot */
+        h->moved_ns = now;
+        snprintf(addr, sizeof addr, "%s", h->addr);
+        snprintf(peer, sizeof peer, "%s", h->peer);
+        meta_op_member_addr(&e, id, inc, addr, peer);
+    }
+    if (state >= 0)
+        meta_op_member_state(&e, id, state, inc);
     if (propose(&e, 0, 0, id) == ISO_OK) {
-        say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ")", id, meta_member_state_name(state), inc);
+        if (h)
+            say("proposes node %" PRIu32 " at %s, peer %s (incarnation %" PRIu64 ")", id, addr, peer, inc);
+        if (state >= 0)
+            say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ")", id, meta_member_state_name(state), inc);
     }
 }
 
@@ -1996,10 +2027,19 @@ static void member_states(uint64_t now)
         uint32_t id = m->id;
         uint64_t minc = m->incarnation;
         int st = m->state;
+        /* a member that came back elsewhere (with --port 0, or on another host) is recorded there, or nobody
+         * reaches it: only addresses its own heartbeat carried, of the run the record is about or a later one */
+        struct heard *moved = fresh && h && inc >= minc && h->peer[0] && h->addr[0] &&
+                                      (strcmp(h->peer, m->peer) != 0 || strcmp(h->addr, m->addr) != 0) &&
+                                      (!h->moved_ns || since(now, h->moved_ns) >= to)
+                                  ? h
+                                  : NULL;
         if (st == META_UP && !fresh)
-            propose_state(id, META_DOWN, minc);
+            propose_member(id, META_DOWN, minc, NULL, now);
         else if (fresh && inc >= minc && (st == META_DOWN || inc > minc))
-            propose_state(id, META_UP, inc);
+            propose_member(id, META_UP, inc, moved, now);
+        else if (moved)
+            propose_member(id, -1, inc, moved, now);
     }
 }
 
@@ -2186,6 +2226,41 @@ static void watch_duty(uint64_t now)
     conn_send(c, 0);
 }
 
+/* NODE's seeds follow the voters' peer addresses as the applied state names them. A server that restarts knows the
+ * others only from NODE until a leader reaches it (a core applies nothing before that, a watcher has no stream yet):
+ * the seeds a JOIN wrote (or none, on the server that ran INIT) go stale as the group changes, and a server that
+ * finds none of them is cut off for good. Hints only: a failed write keeps the old file and is tried again later. */
+static void seeds_refresh(uint64_t now)
+{
+    static uint64_t retry_ns;
+    if (!C.have_node || !C.sm.initialised || (retry_ns && now < retry_ns))
+        return;
+    raft_config cfg;
+    if (!config_of(&C.sm, &cfg))
+        return;
+    char seeds[sizeof C.seeds] = "";
+    for (unsigned i = 0; i < cfg.n; i++) {
+        const struct meta_member *m = meta_member(&C.sm, cfg.m[i].id);
+        if (!m || cfg.m[i].learner || !m->peer[0] || strlen(seeds) + strlen(m->peer) + 2 >= sizeof seeds)
+            continue;
+        if (seeds[0])
+            strcat(seeds, ",");
+        strcat(seeds, m->peer);
+    }
+    if (!seeds[0] || !strcmp(seeds, C.seeds))
+        return;
+    char old[sizeof C.seeds];
+    snprintf(old, sizeof old, "%s", C.seeds);
+    snprintf(C.seeds, sizeof C.seeds, "%s", seeds);
+    if (node_save() != 0) {
+        say("cannot write %s (the seeds stay as they were; tried again in 10 s)", C.nodefile);
+        snprintf(C.seeds, sizeof C.seeds, "%s", old);
+        retry_ns = now + 10000 * MS;
+        return;
+    }
+    retry_ns = 0;
+}
+
 /* ------------------------------------------------------------------ the loop */
 
 static void *cluster_main(void *arg)
@@ -2210,6 +2285,7 @@ static void *cluster_main(void *arg)
             C.next_duty = now + 100 * MS;
             leader_duties(now);
             watch_duty(now);
+            seeds_refresh(now);
             for (size_t i = 0; i < C.nconns; i++) {
                 struct conn *c = C.conns[i];
                 if ((c->state != CS_READY && since(now, c->opened_ns) > HANDSHAKE_NS) ||

@@ -422,6 +422,18 @@ void meta_op_member_state(struct meta_entry *e, uint32_t id, int state, uint64_t
     op_end(e, st);
 }
 
+void meta_op_member_addr(struct meta_entry *e, uint32_t id, uint64_t incarnation, const char *addr,
+                         const char *peer)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_MEMBER_ADDR);
+    put32(&w, id);
+    put64(&w, incarnation);
+    putstr(&w, addr, META_ADDR_MAX);
+    putstr(&w, peer, META_ADDR_MAX);
+    op_end(e, st);
+}
+
 void meta_op_settings(struct meta_entry *e, const struct meta_settings *s)
 {
     struct wr w;
@@ -825,6 +837,30 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         m->nusers--;
         return META_OK;
     }
+    case META_OP_MEMBER_ADDR: {
+        uint32_t id = get32(r);
+        uint64_t inc = get64(r);
+        char addr[META_ADDR_MAX], peer[META_ADDR_MAX];
+        getstr(r, addr, sizeof addr);
+        getstr(r, peer, sizeof peer);
+        if (r->bad)
+            return META_ERR_FORMAT;
+        int32_t at = member_at(m, id);
+        if (at < 0)
+            return META_ERR_NOTFOUND;
+        struct meta_member *mb = &m->members[at];
+        if (!peer[0] || !addr[0])
+            return META_ERR_INVALID;
+        if (mb->state == META_OUT)
+            return META_ERR_STATE;
+        if (inc < mb->incarnation)
+            return META_ERR_STALE; /* addresses of an earlier run */
+        if (strcmp(mb->peer, peer) != 0 && addr_taken(m, peer))
+            return META_ERR_EXISTS;
+        snprintf(mb->addr, sizeof mb->addr, "%s", addr);
+        snprintf(mb->peer, sizeof mb->peer, "%s", peer);
+        return META_OK;
+    }
     }
     return META_ERR_FORMAT; /* an operation this build does not know (head comment of meta.h) */
 }
@@ -842,7 +878,7 @@ static int entry_valid(const uint8_t *p, size_t len, uint32_t *nops)
     for (uint32_t i = 0; i < *nops; i++) {
         uint8_t kind = get8(&r);
         uint32_t n = get32(&r);
-        if (r.bad || kind < META_OP_INIT || kind > META_OP_USER_DEL || n > len - r.off)
+        if (r.bad || kind < META_OP_INIT || kind > META_OP_LAST || n > len - r.off)
             return 0;
         r.off += n;
     }

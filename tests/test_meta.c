@@ -173,6 +173,23 @@ static void test_state_machine(void)
     meta_op_member_state(&e, 3, META_UP, 8);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_STATE);
 
+    /* a member's addresses move with its current or a later run (the leader pairs them with MEMBER_STATE up);
+     * never those of an earlier run, nor onto another live member's peer address */
+    uint64_t inc2 = meta_member(&m, 2)->incarnation;
+    meta_op_member_addr(&e, 2, inc2 + 1, "10.0.1.2:5555", "10.0.1.2:5556");
+    meta_op_member_state(&e, 2, META_UP, inc2 + 1);
+    meta_op_member_addr(&e, 2, inc2, "10.0.0.2:5555", "10.0.0.2:5556"); /* the earlier run's */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_ERR_STALE);
+    CHECK(!strcmp(meta_member(&m, 2)->peer, "10.0.1.2:5556") && !strcmp(meta_member(&m, 2)->addr, "10.0.1.2:5555"));
+    meta_op_member_addr(&e, 2, inc2 + 1, "x:1", "10.0.0.4:5556"); /* member 4's */
+    meta_op_member_addr(&e, 2, inc2 + 1, "x:1", "10.0.0.3:5556"); /* member 3's, but 3 is out */
+    meta_op_member_addr(&e, 3, 99, "x:1", "10.0.0.9:5556");       /* out is final */
+    meta_op_member_addr(&e, 77, 1, "x:1", "10.0.0.9:5556");
+    meta_op_member_addr(&e, 2, inc2 + 1, "", "10.0.0.9:5556");
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS && res[1] == META_OK &&
+          res[2] == META_ERR_STATE && res[3] == META_ERR_NOTFOUND && res[4] == META_ERR_INVALID);
+    CHECK(!strcmp(meta_member(&m, 2)->peer, "10.0.0.3:5556"));
+
     /* slots and their earlier homes; users */
     uint32_t n5[3] = {2, 4, 5};
     meta_op_volume_add(&e, 1, "v1", uuid, 2, n5, 3);
@@ -798,7 +815,13 @@ static void propose(struct msim *s, struct snode *nd)
                 meta_op_replica_remove(&e, v->number, v->epoch, node);
         } else if (what == 6) {
             uint32_t id = m->members[rnd(s, 0, m->nmembers - 1)].id;
-            meta_op_member_state(&e, id, (int)rnd(s, 0, 2), meta_member(m, id)->incarnation + rnd(s, 0, 1));
+            uint64_t inc = meta_member(m, id)->incarnation + rnd(s, 0, 1);
+            if (rnd(s, 0, 3) == 0) { /* moved: to a fresh address, or onto another member's (refused) */
+                char peer[32];
+                snprintf(peer, sizeof peer, "10.0.%u.%u:5556", (unsigned)rnd(s, 0, 1), (unsigned)rnd(s, 1, 9));
+                meta_op_member_addr(&e, id, inc, "10.9.9.9:5555", peer);
+            }
+            meta_op_member_state(&e, id, (int)rnd(s, 0, 2), inc);
         } else if (what == 7 && m->nvolumes) {
             uint32_t first = (uint32_t)rnd(s, 0, META_SLOTS - 1);
             meta_op_slot_home(&e, first, (uint32_t)rnd(s, 1, first + 64 <= META_SLOTS ? 64 : META_SLOTS - first),

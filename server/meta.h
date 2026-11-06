@@ -155,6 +155,8 @@ enum meta_op_kind {
     META_OP_SLOT_HOME,        /* slots [first, first + count) get home volume V */
     META_OP_USER_PUT,         /* a user's record, by name */
     META_OP_USER_DEL,         /* a user, by name */
+    META_OP_MEMBER_ADDR,      /* a server's addresses as its run `incarnation` advertises them (a restart moved it) */
+    META_OP_LAST = META_OP_MEMBER_ADDR,
 };
 
 struct meta_entry {
@@ -172,6 +174,9 @@ void meta_op_init(struct meta_entry *e, const uint8_t uuid[16], const struct met
                   const struct meta_member *first);
 void meta_op_member_add(struct meta_entry *e, const struct meta_member *mb);
 void meta_op_member_state(struct meta_entry *e, uint32_t id, int state, uint64_t incarnation);
+/* Refused as STALE for an incarnation below the member's, EXISTS for a peer address another live member has. */
+void meta_op_member_addr(struct meta_entry *e, uint32_t id, uint64_t incarnation, const char *addr,
+                         const char *peer);
 void meta_op_settings(struct meta_entry *e, const struct meta_settings *s);
 void meta_op_volume_add(struct meta_entry *e, uint32_t number, const char *name, const uint8_t uuid[16],
                         uint32_t min_isr, const uint32_t *nodes, uint32_t n);

@@ -160,6 +160,10 @@ and stay with the volumes.
   replica checks epochs (§6.3).
 - **Heartbeats** go from every server to the Raft leader every 500 ms (in memory, not entries): node id, incarnation,
   the volumes it leads with their epochs, and a summary of what it cannot reach. The answer carries the lease (§7.1).
+  A heartbeat also names the server's advertised and peer addresses: when a restart moved them (another port or
+  host), the Raft leader records the new ones (MEMBER_ADDR, with the up of the new incarnation; never another live
+  member's peer address, never an earlier run's). Every server keeps the voters' peer addresses in its `meta/NODE`
+  as seeds, rewritten when they change, so that a restarted server can find the group before anyone reaches it.
 - **Failure detection** is the Raft leader's job (§6.1). A new Raft leader first waits one lease length before it
   declares anyone down, since it does not know when leases were last granted.
 

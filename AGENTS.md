@@ -24,6 +24,7 @@ make dist                 # portable tarball (x86-64-v2 + v3/v4 codecs) in build
 make dist-test            # the tarball's own test suite, at every CPU level (TSDB_CPU=v2|v3|v4)
 make dist-check-almalinux10   # that suite in an AlmaLinux 10 container (Podman)
 make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu Westmere/SandyBridge if installed
+make meta-soak            # the metadata simulator (tests/test_meta.c) over META_SOAK_SEEDS=5000 seeds of 30 virtual s
 make check-version        # VERSION, tsdb.h, tsdbd/tsdb --version and the client manifests agree (make test runs it)
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
@@ -113,6 +114,14 @@ cgroup, so `nice` does not keep your work out of its way.
   `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
   A protocol change has to reach all four; `make test-clients` runs their tests.
+- The cluster (`docs/design-cluster.md`; step 1 of its §14 so far: the metadata group only, nothing on the insert
+  path). `src/raft/`: the Raft core copied from intellistream-objects (`UPSTREAM`; `tools/sync-raft.sh` copies it
+  again, never edit the copies; `compat.[ch]` is tsdb's shim for what they include). `server/meta.c`: the metadata
+  state machine (members, volumes, replicas, epochs, ISR, slots, users; entries of ops, snapshots, the §13.1
+  invariants as `meta_check_step`). `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
+  the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
+  add|status`). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  for thousands of seeds); `tests/test_cluster.c`: five tsdbd end to end (init, node add, leader killed, restart).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
