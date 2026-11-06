@@ -66,6 +66,10 @@ static int64_t test_clock(void *arg)
     return __atomic_load_n(&clock_now, __ATOMIC_SEQ_CST);
 }
 
+/* Background merge threads read the clock (retention's now): every write is atomic too. */
+static void set_clock(int64_t v) { __atomic_store_n(&clock_now, v, __ATOMIC_SEQ_CST); }
+static void step_clock(int64_t d) { set_clock(__atomic_load_n(&clock_now, __ATOMIC_SEQ_CST) + d); }
+
 static uint64_t rs = 0x9e3779b97f4a7c15ull;
 static uint64_t rnd(void)
 {
@@ -521,7 +525,7 @@ static void random_run(const char *name, tsdb_options opt, bool classes, int ste
 {
     world w;
     rs = seed;
-    clock_now = 20 * DAY;
+    set_clock(20 * DAY);
     world_open(&w, name, opt, classes);
     /* only nulls into onlynull */
     {
@@ -548,9 +552,9 @@ static void random_run(const char *name, tsdb_options opt, bool classes, int ste
         else if (r < 65)
             do_replace(&w, si, nullp);
         else if (r < 70) {
-            clock_now += (int64_t)(rnd() % 3) * DAY;
+            step_clock((int64_t)(rnd() % 3) * DAY);
             if (rnd() % 8 == 0)
-                clock_now -= DAY; /* the clock steps back: retention's now never does */
+                step_clock(-DAY); /* the clock steps back: retention's now never does */
             int64_t lim = rnd() % 3 == 0 ? 0 : (int64_t)(5 + rnd() % 25) * DAY;
             OK(tsdb_set_retention(w.db, w.id[si], lim));
         } else if (r < 73)
@@ -623,7 +627,7 @@ static void test_directed(void)
     o.merge_threads = 0;
     o.clock_ms = test_clock;
     o.wal_max_batch_rows = 4;
-    clock_now = 100 * DAY;
+    set_clock(100 * DAY);
     tsdb *db = open_plain("latest_directed", &o);
     tsdb_sid s, empty, nulls;
     OK(tsdb_series_create(db, "d.s", TSDB_FLOAT64, NULL, &s));
@@ -702,11 +706,11 @@ static void test_directed(void)
     OK(tsdb_set_retention(db, s, 3 * DAY)); /* now 100 d: keeps >= 97 d */
     r = one(db, s, TSDB_TS_MAX, 0);
     CHECK(r.kind == TSDB_LATEST_NONE);
-    clock_now = 99 * DAY;
+    set_clock(99 * DAY);
     OK(tsdb_set_retention(db, s, 5 * DAY)); /* the clock does not go back: still 100 d - 5 d = 95 d */
     r = one(db, s, TSDB_TS_MAX, 0);
     CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 95 * DAY);
-    clock_now = 100 * DAY;
+    set_clock(100 * DAY);
 
     /* int64 beyond 2^53 and the bits of a NaN payload come back exactly */
     tsdb_sid si, sf;
@@ -750,7 +754,7 @@ static void test_crash(void)
     o.clock_ms = test_clock;
     o.wal_max_batch_rows = 50;
     o.buffer_rows = 500;
-    clock_now = 20 * DAY;
+    set_clock(20 * DAY);
     char dir[700];
     snprintf(dir, sizeof dir, "%s/latest_crash", root);
     rmrf(dir);
@@ -947,7 +951,7 @@ static void bench_one(int parts, int run, const char *dir_root)
     o.wal_sync_ms = -1;
     o.partition_classes = 0;
     o.clock_ms = test_clock;
-    clock_now = (int64_t)(parts + 5) * DAY;
+    set_clock((int64_t)(parts + 5) * DAY);
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
     tsdb_sid ids[BS], expired;
