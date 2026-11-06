@@ -8,6 +8,13 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A step of the wall clock no longer deletes retired parts early.** The `obsolete_part_lifetime_s` of a part a
+  merge replaced (`retired_*`, which a follower on another host may still have mapped) is now counted on the monotonic
+  clock, also for the retired files a restart finds. A clock set forward (NTP, an operator, a resumed VM) used to
+  delete them at once. `tests/test_graveyard.c` steps a fake wall clock.
+
 ### Added
 
 - **macOS (Apple silicon and Intel) as a developer platform** ([docs/macos.md](docs/macos.md)), not for

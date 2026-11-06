@@ -1208,7 +1208,7 @@ typedef struct wal_tail {
 
 typedef struct graveyard_entry {
     char name[256];   /* retired_<part name> */
-    int64_t deadline; /* realtime seconds */
+    int64_t deadline; /* monotonic ms (eng_mono_ms): a wall clock step must not purge early */
 } graveyard_entry;
 
 int manifest_publish(struct eng *db);
