@@ -752,6 +752,7 @@ typedef struct part {
     atomic_bool damaged; /* its index no longer matches the open's checksum, or a merge could not decode one of its
                           * granules: out of merges and drops (part_checked, part_mark_payload) */
     atomic_bool wait_logged; /* db_wait_merges said once that inserts no longer wait for this damaged part's partition */
+    uint64_t fail_seq;       /* db->merge_fail_seq when a merge that took it as a source last failed (db->lock) */
     uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
     int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
     atomic_bool obsolete; /* delete the file when the last reference goes */
@@ -1297,6 +1298,11 @@ struct eng {
 
     pthread_t *mergers;
     int nmergers;
+    uint64_t merge_fail_seq; /* counts failed merges (merge_commit_locked); parts remember it (part.fail_seq) (db->lock) */
+    struct { int64_t partition; size_t n; bool used; } stalled[8]; /* partitions db_wait_merges declared stalled, with
+                                                                    * the count then: later waiters do not wait again
+                                                                    * until it falls or a merge of it commits (db->lock) */
+    unsigned stalled_next;
     int64_t stall_log_ms; /* when db_wait_merges last said that merges of a partition made no progress (db->lock) */
 
     pthread_mutex_t cc_lock;
@@ -1495,9 +1501,13 @@ int partition_class(const struct eng *db, int64_t key);
  * be discarded; a MANIFEST failure fails the engine by itself (eng_fail). */
 void db_add_parts(struct eng *db, part **ps, size_t n);
 void db_wait_merges(struct eng *db, int64_t partition);
+void db_stall_clear_locked(struct eng *db, int64_t partition); /* a merge of the partition committed */
 /* How long (ms) db_wait_merges lets a partition's part count stand while no merge of it runs, before an insert goes on;
  * a variable so that tests can shorten it. */
 extern atomic_int wait_stall_ms;
+/* test hook: the merge thread's merges sleep this many ms (0: off) and then fail with TSDB_ERR_IO, like a merge
+ * output that cannot be written (ENOSPC, EIO before it has a name): nothing is marked, the sources stay */
+extern atomic_int merge_fault_ms;
 size_t partition_part_count_locked(struct eng *db, int64_t partition);
 void db_parts_insert_locked(struct eng *db, part *p);
 void db_parts_remove_locked(struct eng *db, part *p);
@@ -1507,7 +1517,7 @@ void db_release(part **parts, size_t n);
 /* merge.c */
 void *merge_thread_main(void *arg);
 int merge_parts(struct eng *db, part **src, size_t k, part **out);
-void merge_commit_locked(struct eng *db, part **src, size_t k, part *out);
+void merge_commit_locked(struct eng *db, part **src, size_t k, part *out, int rc);
 
 /* insert.c: sorts (stably), keeps the last row per (series, ts), writes one
  * part per partition. Parts are published, or handed back in `collect`. With `refuse` (rows from a caller, not

@@ -2338,11 +2338,57 @@ static void test_wait_merges_stalled(const char *scratch)
     mw_insert_returns(db, id, 30, "parts that cannot pair");
     clock_gettime(CLOCK_MONOTONIC, &t1);
     CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 >= 1400); /* it did wait */
+    /* and the stall is remembered: the next insert into the partition goes on at once, instead of paying
+     * wait_stall_ms again (it was paid by every call, and k times by an insert that wrote k parts of it) */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    mw_insert_returns(db, id, 30, "a partition declared stalled");
+    mw_insert_returns(db, id, 30, "a partition declared stalled, again");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 700);
     atomic_store(&wait_stall_ms, was);
     int rc;
     CHECK(count_rows(db, id, &rc) == (long)(MW_PARTS + 1) * MW_ROWS && rc == 0); /* and the rows are all there */
     tsdb_close(db);
-    printf("  an insert stops waiting for merges that cannot run (parts that cannot pair), after wait_stall_ms\n");
+    printf("  an insert stops waiting for merges that cannot run (parts that cannot pair), after wait_stall_ms,"
+           " and the next ones do not wait again\n");
+    rm_rf(dir);
+}
+
+/* Merges that fail without marking a part (a full disk, EIO on the merge output before it has a name: the test hook
+ * merge_fault_ms sleeps, then fails) are retried every second. The wait counted only the time between merges, so
+ * with merges that take long it ended after about wait_stall_ms times the length of a merge (tens of minutes at
+ * 4 GiB outputs): a failed merge now counts as no progress, and the wait ends near wait_stall_ms after it. */
+static void test_wait_merges_failing(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-merge-failing", scratch);
+    tsdb_sid id;
+    mw_build(dir, &id);
+    tsdb_options o = opts();
+    o.merge_threads = 1;
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 100;
+    o.merge_idle_s = 1000000;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    int was = atomic_load(&wait_stall_ms);
+    atomic_store(&wait_stall_ms, 2500);
+    atomic_store(&merge_fault_ms, 5000); /* every merge runs 5 s, then fails; 1 s back-off between them */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* first failure after 5 s, then 2.5 s: about 8 s. The old clock gained at most 1 s per 6 s cycle: 15 s or more */
+    mw_insert_returns(db, id, 12, "merges that keep failing");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    CHECK(ms >= 4000); /* it did wait for the first merge */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    mw_insert_returns(db, id, 30, "merges that keep failing, the next insert");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 700);
+    atomic_store(&merge_fault_ms, 0);
+    atomic_store(&wait_stall_ms, was);
+    tsdb_close(db);
+    printf("  an insert stops waiting for merges that keep failing, near wait_stall_ms\n");
     rm_rf(dir);
 }
 
@@ -2668,6 +2714,7 @@ int main(int argc, char **argv)
     test_damaged_part_no_starvation(base);
     test_wait_merges_damaged(base);
     test_wait_merges_stalled(base);
+    test_wait_merges_failing(base);
     test_follower_steady_creation(base);
     test_wal_torn_before_later(base);
     test_follower_series_rewritten(base);

@@ -923,7 +923,11 @@ damage into silently missing or shifted data:
   parts, after its rows are published, so that wait never fails the insert
   (`db_wait_merges`): it ends at once for a partition with a marked part or
   after a failed engine, and after `wait_stall_ms` (30 s) in which the count did
-  not fall and no merge of the partition ran. A damaged partition's part count
+  not fall and no merge of the partition ran, or in which a merge of it failed
+  (`merge_commit_locked` stamps the sources, so the time of a long failing
+  merge counts too). The first wait that runs out records the partition in
+  `stalled[]` with its count: later waiters go on at once until the count falls
+  or a merge of it commits, so the bound is paid once, not per call and part. A damaged partition's part count
   then grows until an operator restores the part; refusing inserts instead
   would report a visible write as failed, and flushes of the memtable add
   parts without waiting anyway. A cap is future work.

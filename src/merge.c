@@ -454,17 +454,25 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
 
 /* Replaces src with out in the parts list. Caller holds db->lock and still
  * owns one reference to each source part (dropped later by the caller). */
-void merge_commit_locked(eng *db, part **src, size_t k, part *out)
+void merge_commit_locked(eng *db, part **src, size_t k, part *out, int rc)
 {
     bool dropped = false;
     for (size_t i = 0; i < k; i++) {
         src[i]->merging = false;
         dropped |= src[i]->dropped;
     }
+    if (!out && rc != 0 && rc != TSDB_ERR_STOPPED && !dropped) {
+        /* a failed merge is no progress, whatever the reason (a full disk, EIO on the output, NOMEM): db_wait_merges
+         * counts the time of its partition's merges as idle once one has failed since its wait began */
+        db->merge_fail_seq++;
+        for (size_t i = 0; i < k; i++)
+            src[i]->fail_seq = db->merge_fail_seq;
+    }
     if (out && !dropped && eng_check(db)) {
         part_unref(out); /* failed engine: no renames; the next open sees what a crash here leaves */
     } else if (out && !dropped) {
         db_parts_insert_locked(db, out);
+        db_stall_clear_locked(db, out->partition);
         for (size_t i = 0; i < k; i++)
             db_retire_locked(db, src[i]);
     } else if (out) {
@@ -629,12 +637,19 @@ void *merge_thread_main(void *arg)
         }
         pthread_mutex_unlock(&db->lock);
         part *out = NULL;
-        int rc = merge_parts(db, sel, k, &out);
+        int fault_ms = atomic_load(&merge_fault_ms);
+        int rc = 0;
+        for (int slept = 0; slept < fault_ms && !atomic_load(&db->stop); slept += 50)
+            usleep(50000);
+        if (fault_ms > 0)
+            rc = TSDB_ERR_IO;
+        else
+            rc = merge_parts(db, sel, k, &out);
         if (rc != 0 && rc != TSDB_ERR_STOPPED)
             fprintf(stderr, "tsdb: merge of %s..%s failed: %s\n", sel[0]->name, sel[k - 1]->name,
                     tsdb_strerror(rc));
         pthread_mutex_lock(&db->lock);
-        merge_commit_locked(db, sel, k, out);
+        merge_commit_locked(db, sel, k, out, rc);
         part *watch = NULL; /* an idle partition merged down to one part: its series' rates are measured */
         if (out && !atomic_load(&out->obsolete) && db->opt.merge_idle_s >= 0 &&
             time(NULL) - out->written >= db->opt.merge_idle_s && partition_part_count_locked(db, out->partition) == 1) {
@@ -716,7 +731,7 @@ int eng_optimize(eng *db)
         part *out = NULL;
         rc = merge_parts(db, sel, k, &out);
         pthread_mutex_lock(&db->lock);
-        merge_commit_locked(db, sel, k, out);
+        merge_commit_locked(db, sel, k, out, rc);
         pthread_mutex_unlock(&db->lock);
         if (out) {
             int mrc = manifest_publish(db);
