@@ -2105,6 +2105,163 @@ static void test_solo_after_retention(const char *base)
     rm_rf(dir);
 }
 
+/* ---------------------------------------------- a dropped part stays dropped */
+
+/* A copy of a database directory as a crash leaves it: files, names, nothing in memory. */
+static void crash_copy(const char *dir, const char *copy)
+{
+    char cmd[1300];
+    rm_rf(copy);
+    snprintf(cmd, sizeof cmd, "cp -a '%s' '%s'", dir, copy);
+    CHECK(system(cmd) == 0);
+}
+
+/* names an open lists as parts: p<N>_..._0.part, never retired_p... */
+static size_t count_listed_parts(const char *dir)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    size_t n = 0;
+    while ((e = readdir(d))) {
+        size_t l = strlen(e->d_name);
+        n += e->d_name[0] == 'p' && l > 5 && strcmp(e->d_name + l - 5, ".part") == 0;
+    }
+    closedir(d);
+    return n;
+}
+
+static size_t count_retired(const char *dir)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    size_t n = 0;
+    while ((e = readdir(d)))
+        n += strncmp(e->d_name, "retired_", 8) == 0;
+    closedir(d);
+    return n;
+}
+
+static size_t rows_in(tsdb *db, tsdb_sid id)
+{
+    tsdb_points pts;
+    memset(&pts, 0, sizeof pts);
+    OK(tsdb_query_points(db, id, INT64_MIN / 2, INT64_MAX / 2, &pts));
+    size_t n = pts.n;
+    tsdb_points_free(&pts);
+    return n;
+}
+
+typedef struct drop_hold {
+    tsdb *db;
+    const char *dir, *copy;
+    int64_t drop_ts; /* tsdb_drop_before(drop_ts) when > 0, else wait for retention to drop the parts */
+    atomic_llong *now_off;
+    bool done;
+    size_t listed_in_copy, retired_in_copy;
+} drop_hold;
+
+static int64_t drop_clock(void *arg)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + atomic_load((atomic_llong *)arg);
+}
+
+/* In the callback of a query, which holds its parts: the drop is acknowledged (or the merge thread has dropped
+ * the partition), then the directory is copied as a kill -9 would leave it. */
+static int drop_while_reading(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    drop_hold *h = ctx;
+    (void)ts;
+    (void)v;
+    (void)n;
+    if (h->done)
+        return 0;
+    h->done = true;
+    if (h->drop_ts > 0) {
+        OK(tsdb_drop_before(h->db, h->drop_ts));
+    } else {
+        atomic_store(h->now_off, 10 * 3600000LL); /* every row is past its series' limit */
+        for (int tries = 0; tries < 100; tries++) {
+            part_count pc = {0, 0, 0};
+            tsdb_foreach_part(h->db, count_parts, &pc);
+            if (pc.n == 0)
+                break;
+            usleep(100000);
+        }
+        usleep(300000); /* the directory fsync after the drop, before any later step */
+    }
+    crash_copy(h->dir, h->copy);
+    h->listed_in_copy = count_listed_parts(h->copy);
+    h->retired_in_copy = count_retired(h->copy);
+    return 0;
+}
+
+/* Regression (review of the statistics design, H4): with obsolete_part_lifetime_s <= 0 a replaced or dropped part
+ * was only marked, and kept its name until the last reference went. A query reading it while tsdb_drop_before was
+ * acknowledged, or while the merge thread dropped an expired partition, and a crash then: the open listed it
+ * again, nothing covers it, and the dropped rows came back. */
+static void drop_then_crash(const char *base, bool retention)
+{
+    char dir[512], copy[540];
+    snprintf(dir, sizeof dir, "%s/tsdb-dropref-%d", base, (int)getpid());
+    snprintf(copy, sizeof copy, "%s.crash", dir);
+    rm_rf(dir);
+    tsdb_options o = test_opts(retention ? 1 : 0);
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 100; /* the insert becomes a part */
+    o.obsolete_part_lifetime_s = 0;
+    o.fsync = 1;
+    atomic_llong off = 0;
+    if (retention) {
+        o.clock_ms = drop_clock;
+        o.clock_arg = &off;
+    }
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    const int64_t t0 = (int64_t)now.tv_sec * 1000 - 600000;
+    enum { N = 1000 };
+    int64_t ts[N];
+    float v[N];
+    for (int i = 0; i < N; i++) {
+        ts[i] = t0 + i * 100;
+        v[i] = (float)i;
+    }
+    OK(tsdb_insert_series(db, id, ts, v, N));
+    if (retention)
+        OK(tsdb_set_retention(db, id, 3600000));
+    CHECK(rows_in(db, id) == N);
+    drop_hold h = {db, dir, copy, retention ? 0 : t0 + 100 * 3600000LL, &off, false, 0, 0};
+    OK(tsdb_query_raw(db, id, t0, t0 + N * 100, drop_while_reading, &h));
+    CHECK(h.done);
+    CHECK(rows_in(db, id) == 0);
+    CHECK(h.listed_in_copy == 0); /* nothing the open would list: that is the whole point */
+    CHECK(h.retired_in_copy <= 1);
+    OK(tsdb_close(db));
+    CHECK(count_listed_parts(dir) == 0 && count_retired(dir) == 0);
+    tsdb_options o2 = test_opts(0);
+    o2.partition_classes = 0;
+    o2.obsolete_part_lifetime_s = 0;
+    OK(tsdb_open(copy, &o2, &db));
+    OK(tsdb_series(db, "s", &id));
+    CHECK(rows_in(db, id) == 0);
+    CHECK(count_retired(copy) == 0); /* no lifetime: the open deletes what a crash left */
+    OK(tsdb_close(db));
+    rm_rf(dir);
+    rm_rf(copy);
+}
+
+static void test_drop_stays_dropped(const char *base)
+{
+    drop_then_crash(base, false);
+    drop_then_crash(base, true);
+    printf("  a dropped part keeps no listed name, with a reader and obsolete_part_lifetime_s = 0\n");
+}
+
 typedef struct level_info {
     int n, level0;
 } level_info;
@@ -2409,6 +2566,7 @@ int main(int argc, char **argv)
     test_insert_nozstd(base);
     test_solo_after_retention(base);
     test_optimize_waits_for_solo(base);
+    test_drop_stays_dropped(base);
     printf("volume statistics\n");
     test_volume_stats(base);
     test_merging_parts(base);

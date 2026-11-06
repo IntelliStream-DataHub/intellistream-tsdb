@@ -753,6 +753,7 @@ typedef struct part {
     uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
     int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
     atomic_bool obsolete; /* delete the file when the last reference goes */
+    bool retired; /* set before obsolete: the file is retired_<name> (db_retire_locked), not <name> */
     char pending[64];     /* tmp file name while the part awaits parts_commit, else "" */
 } part;
 

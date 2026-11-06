@@ -248,8 +248,12 @@ void part_unref(part *p)
         return;
     munmap((void *)p->map, p->map_len);
     free(p->icopy);
-    if (atomic_load(&p->obsolete))
-        unlinkat(p->dirfd, p->name, 0);
+    if (atomic_load(&p->obsolete)) {
+        char retired[sizeof p->name + 8];
+        if (p->retired)
+            snprintf(retired, sizeof retired, "retired_%s", p->name);
+        unlinkat(p->dirfd, p->retired ? retired : p->name, 0);
+    }
     free(p);
 }
 

@@ -18,7 +18,9 @@
  *  - A file deleted on the server is gone for every other host, mmap'd or not
  *    (reading it raises SIGBUS). Parts replaced by a merge are therefore
  *    renamed to retired_<name> at once and deleted obsolete_part_lifetime_s
- *    later; renaming does not disturb hosts that have them open.
+ *    later (at a lifetime of 0 or less: by the last reader, the open deletes
+ *    leftovers); renaming does not disturb hosts that have them open. The
+ *    rename is also what makes a drop durable: an open lists parts by name.
  *  - Followers find new files by name; mount them with lookupcache=positive so
  *    a recently created part or segment is not hidden by a cached "not found".
  */
@@ -120,11 +122,15 @@ void db_retire_locked(eng *db, part *p)
         partition_range(db, p->partition, &lo, &end);
         db->cls_dropped_end = MAX(db->cls_dropped_end, end);
     }
-    if (db->opt.obsolete_part_lifetime_s <= 0) {
-        atomic_store(&p->obsolete, true); /* deleted when the last reference goes */
-    } else if (renameat(db->dirfd, p->name, db->dirfd, retired) != 0) {
+    if (renameat(db->dirfd, p->name, db->dirfd, retired) != 0) {
         /* still listed after a reopen: a dropped part would come back */
         eng_fail(db, "rename of a replaced part to retired_", errno);
+    } else if (db->opt.obsolete_part_lifetime_s <= 0) {
+        /* The name goes at once, even where a query still maps the file: a crash while that reference is held
+         * must not list a dropped part again (nothing covers it). The file itself is deleted when the last
+         * reference goes, under its retired name, which an open never lists. */
+        p->retired = true;
+        atomic_store(&p->obsolete, true);
     } else {
         if (db->ngraveyard == db->graveyard_cap) {
             size_t cap = db->graveyard_cap ? db->graveyard_cap * 2 : 64;

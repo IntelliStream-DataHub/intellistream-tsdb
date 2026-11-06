@@ -450,7 +450,9 @@ static int load_parts(eng *db, bool read_only)
         }
         if (strncmp(name, "retired_", 8) == 0 && part_file_name(name + 8)) {
             /* replaced before the last shutdown: followers may still read it */
-            if (!read_only && db->ngraveyard < 1u << 20) {
+            if (!read_only && db->opt.obsolete_part_lifetime_s <= 0) {
+                unlinkat(db->dirfd, name, 0); /* no lifetime: nobody is promised the file */
+            } else if (!read_only && db->ngraveyard < 1u << 20) {
                 if (db->ngraveyard == db->graveyard_cap) {
                     size_t cap = db->graveyard_cap ? db->graveyard_cap * 2 : 64;
                     graveyard_entry *g = realloc(db->graveyard, cap * sizeof *g);

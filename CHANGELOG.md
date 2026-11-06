@@ -32,6 +32,11 @@ disk format and the wire protocol.
   user's as a torn tail, replayed it, run it or deleted it. The message names the file; nothing is written.
 
 ### Fixed
+- With `obsolete_part_lifetime_s <= 0` a dropped part kept its listed name while any query held a reference to it.
+  `tsdb_drop_before` (or retention dropping an expired partition) acknowledged after the directory fsync, a crash
+  then made the open list the part again, and the dropped rows came back (nothing covers a dropped part). Replaced
+  and dropped parts are now renamed to `retired_<name>` at every lifetime, before that fsync; at a lifetime of 0 or
+  less the last reference deletes the retired name, and the open deletes any left by a crash.
 - tsdbd closes a connection whose output has not moved for `--send-timeout` seconds even when its whole reply fit in
   the server's buffers (so no worker waited on it): before, a client that sent a query and never read the answer held
   up to about 17 MB per connection for as long as it kept the socket open, outside `--max-request-memory`.
