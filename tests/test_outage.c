@@ -8,6 +8,12 @@
  *
  *   hang   A hangs for a few seconds longer than the DOWN threshold, then heals: B's writes keep their latency, A's
  *          answer UNAVAILABLE quickly once it is DOWN, the call that hung finishes, A recovers by itself.
+ *   busy   (no fault) 16 connections read one volume: a busy volume is not an unavailable one, nothing is refused.
+ *   packed (during the hang) 16 connections send packed multi-series inserts to A: B keeps its pace anyway.
+ *   diverged  a part of A is removed while A is down: A comes back DIVERGED (refused, the server stays), and a second
+ *          outage of its domain does not recover it again.
+ *   eiodrop  writes on A are dropped and the first fsync of each descriptor fails (fsyncgate), then the server is
+ *          killed and restarted: everything acknowledged is still there (an engine that retried its fsync fails this).
  *   eio    every call on A fails: the engine fails stop, the server does not exit (the volume is in a domain), A
  *          recovers after the heal by a reopen, and what was acknowledged before is there.
  *
@@ -74,7 +80,7 @@ static pid_t start_server(const char *dir_a, const char *dir_b)
     setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=400,spawn=60000", 1);
     pid_t pid = fork();
     if (pid == 0) {
-        const char *argv[32] = {"tsdbd", "--dir", root, "--port", "0", "--port-file", pf, "--workers", "4", "--no-auth",
+        const char *argv[32] = {"tsdbd", "--dir", root, "--port", "0", "--port-file", pf, "--workers", "8", "--no-auth",
                                 follow, "--health-domain", da, "--health-domain", db_};
         int n = 15;
         if (getenv("TSDBD_IO")) {
@@ -110,7 +116,53 @@ typedef struct side {
 } side;
 
 static side sa, sb;
-static atomic_bool stop_writers;
+static atomic_bool stop_writers, stop_extra;
+static _Atomic int64_t extra_ok, extra_unavail, extra_other;
+
+typedef struct seen {
+    int64_t *ts;
+    size_t n, cap;
+} seen;
+static int collect_extra(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ctx, (void)ts, (void)v, (void)n;
+    return 0;
+}
+
+/* 16 of these read A (busy) or send packed multi-series inserts to A (packed) */
+static void *extra_main(void *arg)
+{
+    intptr_t k = (intptr_t)arg, packed = k >= 1000;
+    tsdbc *c;
+    if (tsdbc_connect_timeout("127.0.0.1", port, 3000, &c))
+        return NULL;
+    int64_t base = 3000000000LL + k * 1000000LL;
+    while (!atomic_load(&stop_extra)) {
+        int rc;
+        if (packed) {
+            tsdb_sid ids[2] = {sa.id, sa.id};
+            int64_t ts[2] = {base, base + 1};
+            float v[2] = {1, 2};
+            base += 2;
+            rc = tsdbc_insert(c, ids, ts, v, 2);
+        } else {
+            seen got = {0};
+            rc = tsdbc_query_raw(c, sa.id, 0, 100, collect_extra, &got);
+            free(got.ts);
+        }
+        if (rc == 0)
+            atomic_fetch_add(&extra_ok, 1);
+        else if (rc == TSDB_ERR_UNAVAILABLE) {
+            atomic_fetch_add(&extra_unavail, 1);
+            msleep(20);
+        } else {
+            atomic_fetch_add(&extra_other, 1);
+            msleep(20);
+        }
+    }
+    tsdbc_close(c);
+    return NULL;
+}
 
 static void *writer(void *arg)
 {
@@ -160,10 +212,6 @@ static void *writer(void *arg)
     return NULL;
 }
 
-typedef struct seen {
-    int64_t *ts;
-    size_t n, cap;
-} seen;
 static int collect(void *ctx, const int64_t *ts, const float *v, size_t n)
 {
     seen *s = ctx;
@@ -285,9 +333,26 @@ int main(int argc, char **argv)
     msleep(1500);
     CHECK(sa.nacked > 10 && sb.nacked > 10);
 
+    /* 0. a busy volume with its domain UP refuses nothing (more callers than the four a hung one may hold) */
+    pthread_t xs[16];
+    for (int i = 0; i < 16; i++)
+        pthread_create(&xs[i], NULL, extra_main, (void *)(intptr_t)i);
+    msleep(2000);
+    atomic_store(&stop_extra, true);
+    for (int i = 0; i < 16; i++)
+        pthread_join(xs[i], NULL);
+    fprintf(stderr, "busy: %lld ok, %lld unavailable, %lld other\n", (long long)extra_ok, (long long)extra_unavail,
+            (long long)extra_other);
+    CHECK(extra_ok > 100);
+    CHECK(extra_unavail == 0);
+    atomic_store(&stop_extra, false);
+    extra_ok = extra_unavail = extra_other = 0;
+
     /* 1. hang A: B goes on at its pace; A's callers get UNAVAILABLE once the domain is DOWN; heal; A is back */
     int64_t b_before = sb.nacked, a_before = sa.nacked;
     CHECK(fault("hang", dir_a, NULL) == 0);
+    for (int i = 0; i < 16; i++) /* packed inserts to A: they hang inside it, and must not take every worker */
+        pthread_create(&xs[i], NULL, extra_main, (void *)(intptr_t)(1000 + i));
     msleep(4500); /* past the DOWN threshold (2.5 s here); A's own writer is inside a hung call until the heal */
     /* a request that arrives now is refused at once: DOWN quiesces the volume, and at most four wait inside it */
     tsdbc *pc;
@@ -304,10 +369,15 @@ int main(int argc, char **argv)
         tsdbc_close(pc);
     msleep(2500);
     CHECK(sb.nacked - b_before > 100);          /* B kept writing */
-    CHECK(sb.worst_ok_ms < 1000);               /* and at its latency */
+    /* and at its latency: the packed inserts of A may hold every worker until the domain is seen to be in trouble
+     * (about a second), but not the whole outage (6 s here, as it was when they were not counted) */
+    CHECK(sb.worst_ok_ms < 3000);
     CHECK(sa.nacked - a_before <= 1);           /* nothing on A was acknowledged while it hung */
     CHECK(alive());
+    atomic_store(&stop_extra, true);
     CHECK(fault("heal", dir_a, NULL) == 0);
+    for (int i = 0; i < 16; i++)
+        pthread_join(xs[i], NULL);
     CHECK(await_writes(&sa, 30000) == 0);
     msleep(1000);
     CHECK(alive());
@@ -328,11 +398,67 @@ int main(int argc, char **argv)
     msleep(1500);
     CHECK(sa.nacked > a_after); /* writes go on */
 
+    /* 2b. the kernel drops the pages of a failed writeback (fsyncgate): writes on A are thrown away, the first fsync
+     * of each descriptor fails and later ones succeed. A volume that retried its fsync would acknowledge rows that
+     * are not on the storage; the server is killed afterwards, so only what reached the disk is left to read */
+    int64_t a_drop = sa.nacked;
+    CHECK(fault("eiodrop", dir_a, NULL) == 0);
+    msleep(3000);
+    CHECK(alive());
+    CHECK(sa.nacked - a_drop <= 1);
+    CHECK(fault("heal", dir_a, NULL) == 0);
+    CHECK(await_writes(&sa, 40000) == 0);
+    msleep(1500);
+
     atomic_store(&stop_writers, true);
     pthread_join(ta, NULL);
     pthread_join(tb, NULL);
     verify("eio", &sa);
     verify("eio", &sb);
+    CHECK(alive());
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+    server = start_server(dir_a, dir_b);
+    verify("restart", &sa);
+    verify("restart", &sb);
+
+    /* 3. a part of A lost while A is down: DIVERGED, and a second outage does not resume it */
+    {
+        tsdbc *c;
+        CHECK(tsdbc_connect_timeout("127.0.0.1", port, 3000, &c) == 0);
+        CHECK(c && tsdbc_flush(c) == 0); /* the rows so far are in parts */
+        CHECK(fault("hang", dir_a, NULL) == 0);
+        msleep(3500); /* DOWN */
+        /* without the shim in the child: its init would take over the control socket */
+        char cmd[PATH_MAX + 64];
+        snprintf(cmd, sizeof cmd, "rm -f '%s'/p*.part", dir_a);
+        pid_t rm = fork();
+        if (rm == 0) {
+            unsetenv("LD_PRELOAD");
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(127);
+        }
+        int rst = -1;
+        CHECK(rm > 0 && waitpid(rm, &rst, 0) == rm && WIFEXITED(rst) && WEXITSTATUS(rst) == 0);
+        CHECK(fault("heal", dir_a, NULL) == 0);
+        msleep(6000); /* RECOVERING, the reopen, the report */
+        int64_t ts = 4000000000LL;
+        float v = 1;
+        int rc = c ? tsdbc_insert_series(c, sa.id, &ts, &v, 1) : -1;
+        CHECK(rc == TSDB_ERR_UNAVAILABLE);
+        CHECK(fault("hang", dir_a, NULL) == 0);
+        msleep(3500);
+        CHECK(fault("heal", dir_a, NULL) == 0);
+        msleep(8000); /* long enough for a second recovery to have resumed it, as it once did */
+        ts++;
+        rc = c ? tsdbc_insert_series(c, sa.id, &ts, &v, 1) : -1;
+        CHECK(rc == TSDB_ERR_UNAVAILABLE);
+        ts = 4000000100LL; /* B is untouched */
+        rc = c ? tsdbc_insert_series(c, sb.id, &ts, &v, 1) : -1;
+        CHECK(rc == 0);
+        if (c)
+            tsdbc_close(c);
+    }
     CHECK(alive());
     kill(server, SIGTERM);
     int st;

@@ -853,7 +853,13 @@ static int insert_packed(auth_conn *a, const uint8_t *p, size_t len, uint32_t n,
             /* one row of a series the user may not insert into refuses the whole frame (A16) */
         } else {
             tsdb_values col = {(tsdb_type)type, vals, valid ? bits : NULL};
-            rc = many ? tsdb_insert_values(db, series, ts, &col, n) : tsdb_insert_series_values(db, s, ts, &col, n);
+            uint16_t list[DOM_MAX_VOLS];
+            size_t nl = 0;
+            rc = many ? dom_enter_ids(series, n, list, &nl) : 0; /* a volume of a domain: handle() entered the one */
+            if (rc == 0) {
+                rc = many ? tsdb_insert_values(db, series, ts, &col, n) : tsdb_insert_series_values(db, s, ts, &col, n);
+                dom_exit_all(list, nl);
+            }
         }
     }
     free(raw);
@@ -1391,6 +1397,43 @@ static void handle(req *r)
         }
         handle_op(r);
         dom_exit(dv);
+        return;
+    }
+    /* An insert of many series admits itself by the volumes its rows name (a packed one inside insert_packed, once
+     * its rows are unpacked); everything else that names no volume counts as a waiting worker while a domain is not
+     * UP (a stuck call in a hung volume must not take every worker). */
+    if (dom.ndoms > 0 && (r->op == TSDB_OP_INSERT || r->op == TSDB_OP_INSERT_VALUES) && len >= TSDB_VALUES_HEADER) {
+        uint32_t n;
+        tsdb_sid s;
+        memcpy(&n, p, 4);
+        memcpy(&s, p + 8, 8);
+        if (s == TSDB_MANY_SERIES) {
+            if (r->op == TSDB_OP_INSERT_VALUES && (p[5] & TSDB_PACKED)) {
+                handle_op(r);
+                return;
+            }
+            size_t end = r->op == TSDB_OP_INSERT
+                             ? 16 + (size_t)n * 12
+                             : TSDB_VALUES_HEADER + (size_t)n * 8 + (size_t)n * tsdb_wire_width(p[4]) +
+                                   ((p[5] & TSDB_VALID) ? ((size_t)n + 7) / 8 : 0);
+            const tsdb_sid *ids = p[4] <= TSDB_STATE || r->op == TSDB_OP_INSERT ? frame_ids(p, len, end, n) : NULL;
+            if (ids) {
+                uint16_t list[DOM_MAX_VOLS];
+                size_t nl;
+                if ((rc = dom_enter_ids(ids, n, list, &nl)) != 0) {
+                    reply_error(c, r->id, r->op, rc);
+                    return;
+                }
+                handle_op(r);
+                dom_exit_all(list, nl);
+                return;
+            }
+        }
+    }
+    if (dom.ndoms > 0) {
+        dom_any_enter();
+        handle_op(r);
+        dom_any_exit();
         return;
     }
     handle_op(r);

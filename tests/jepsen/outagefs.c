@@ -9,6 +9,10 @@
  *   hang        the call blocks until the prefix is healed (a hard NFS mount that lost its server). A thread inside
  *               the call is lost, as it is in the kernel, until heal.
  *   eio         every call fails with EIO (a degraded pool); estale, etimedout likewise.
+ *   eiodrop     the kernel's writeback failure (fsyncgate): a write succeeds and is thrown away; the first fsync of
+ *               a descriptor fails with EIO, every later one returns 0 (the dirty pages are gone, the error was
+ *               reported once). Everything else works. Data an engine acknowledges after retrying such an fsync
+ *               is not on the storage.
  *   enospc      calls that add data or names fail with ENOSPC; reads and fsync of what exists work (a full pool).
  *   slow MS     every call takes MS milliseconds more.
  *   heal        no fault.
@@ -47,7 +51,7 @@
 #define MAX_FDS 65536
 #define MAX_ROOTS 16
 
-enum fault { F_NONE, F_HANG, F_EIO, F_ESTALE, F_ETIMEDOUT, F_ENOSPC };
+enum fault { F_NONE, F_HANG, F_EIO, F_ESTALE, F_ETIMEDOUT, F_ENOSPC, F_EIODROP };
 
 static struct {
     char path[PATH_MAX];
@@ -61,6 +65,7 @@ static int nroots;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static signed char fdroot[MAX_FDS]; /* 0: not ours, else index + 1 */
+static bool fdpoison[MAX_FDS];      /* eiodrop: this descriptor's failure was reported */
 static __thread bool bypass;        /* the control thread's own file work */
 
 /* The real functions, found on first use: a call can come before the constructor (the dynamic loader's own). */
@@ -185,6 +190,33 @@ static int gate(int r, bool grows)
     return rc;
 }
 
+/* eiodrop: is the root's fault one that throws writes away? */
+static bool dropping(int r)
+{
+    if (!r || bypass)
+        return false;
+    pthread_mutex_lock(&mu);
+    bool d = roots[r - 1].fault == F_EIODROP;
+    pthread_mutex_unlock(&mu);
+    return d;
+}
+
+/* fsync of a descriptor: under eiodrop the first one fails, the rest succeed. 0: go on to the real call. */
+static int sync_gate(int fd)
+{
+    int r = root_of_fd(fd), g = gate(r, false);
+    if (g)
+        return g;
+    if (dropping(r) && fd >= 0 && fd < MAX_FDS) {
+        if (!fdpoison[fd]) {
+            fdpoison[fd] = true;
+            return -EIO;
+        }
+        return 1; /* reported once: success without syncing anything */
+    }
+    return 0;
+}
+
 #define GATE(r, grows)           \
     do {                         \
         int g_ = gate(r, grows); \
@@ -198,8 +230,10 @@ static int gate(int r, bool grows)
 
 static void track(int fd, int r)
 {
-    if (fd >= 0 && fd < MAX_FDS)
+    if (fd >= 0 && fd < MAX_FDS) {
         fdroot[fd] = (signed char)r;
+        fdpoison[fd] = false;
+    }
 }
 
 static int do_open(int dirfd, const char *name, int flags, mode_t mode, bool at)
@@ -355,12 +389,16 @@ ssize_t write(int fd, const void *buf, size_t n)
 {
     resolve();
     GATE(root_of_fd(fd), true);
+    if (dropping(root_of_fd(fd)))
+        return (ssize_t)n;
     return real_write(fd, buf, n);
 }
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
 {
     resolve();
     GATE(root_of_fd(fd), true);
+    if (dropping(root_of_fd(fd)))
+        return (ssize_t)n;
     return real_pwrite(fd, buf, n, off);
 }
 ssize_t pwrite64(int fd, const void *buf, size_t n, off_t off) { return pwrite(fd, buf, n, off); }
@@ -368,13 +406,27 @@ ssize_t pwrite64(int fd, const void *buf, size_t n, off_t off) { return pwrite(f
 int fsync(int fd)
 {
     resolve();
-    GATE(root_of_fd(fd), false);
+    int g = sync_gate(fd);
+    if (g) {
+        if (g < 0) {
+            errno = -g;
+            return -1;
+        }
+        return 0;
+    }
     return real_fsync(fd);
 }
 int fdatasync(int fd)
 {
     resolve();
-    GATE(root_of_fd(fd), false);
+    int g = sync_gate(fd);
+    if (g) {
+        if (g < 0) {
+            errno = -g;
+            return -1;
+        }
+        return 0;
+    }
     return real_fdatasync(fd);
 }
 int syncfs(int fd)
@@ -387,6 +439,8 @@ int ftruncate(int fd, off_t len)
 {
     resolve();
     GATE(root_of_fd(fd), true);
+    if (dropping(root_of_fd(fd)))
+        return 0;
     return real_ftruncate(fd, len);
 }
 int ftruncate64(int fd, off_t len) { return ftruncate(fd, len); }
@@ -592,7 +646,7 @@ static int sync_tree(const char *from, const char *to)
 
 static const char *fault_name(enum fault f)
 {
-    static const char *n[] = {"none", "hang", "eio", "estale", "etimedout", "enospc"};
+    static const char *n[] = {"none", "hang", "eio", "estale", "etimedout", "enospc", "eiodrop"};
     return n[f];
 }
 
@@ -641,6 +695,8 @@ static void control_line(int c, char *line)
         f = F_ETIMEDOUT;
     else if (!strcmp(cmd, "enospc"))
         f = F_ENOSPC;
+    else if (!strcmp(cmd, "eiodrop"))
+        f = F_EIODROP;
     else if (!strcmp(cmd, "heal"))
         f = F_NONE;
     else
