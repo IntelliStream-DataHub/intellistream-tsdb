@@ -18,7 +18,8 @@
  *   HELLO fails the transcript MAC, and a relayed handshake gives no write access (frames are tagged).
  * initcrash: an init cut short after NODE and before its first snapshot can be run again.
  * dirsync: a failed directory fsync after a snapshot is named is fail-stop.
- * install: a crash inside a snapshot install (log reset, snapshot not written) comes back and catches up.
+ * install: a crash inside a snapshot install (log reset, snapshot not written) comes back from the image it kept
+ *   before the reset, and catches up. reseed: the same with that image gone: it empties its log for a new image.
  * ids: one member id is never on two servers: a leader stopped in the middle of a node add, the add of another
  *   server through the next leader, the first again (the same id, idempotent); a copy of a member's NODE in another
  *   directory (another identity) is refused and does not move the member's address.
@@ -1017,10 +1018,11 @@ static void scen_dirsync(void)
 
 /* a crash inside a snapshot install: the log is reset to the image's index, the snapshot not written (a directory in
  * the way of its temporary file makes restore() stop there). The restarted server must catch up, not sit at applied
- * 0 over a log based past its snapshot. */
-static void scen_install(void)
+ * 0 over a log based past its snapshot: from the image it kept before the reset (install), or, that image gone too
+ * (damage; reseed), by emptying its log for a new image. */
+static void install_crash(int drop_kept)
 {
-    scenario("install");
+    scenario(drop_kept ? "reseed" : "install");
     for (int i = 0; i < 3; i++)
         envs[i] = "snap_every=2,snap_retain=1,seg_bytes=200"; /* small segments: compaction drops whole ones */
     for (int i = 0; i < 3; i++)
@@ -1033,14 +1035,32 @@ static void scen_install(void)
     if (st != 1 || !log_has(2, "cannot write"))
         die("the learner whose snapshot cannot be written ended with status %d", st);
     meta_tmp(2, 0);
+    char kept[PATH_MAX + 128];
+    snprintf(kept, sizeof kept, "%s/n2/meta/snapshot.install", base);
+    if (access(kept, F_OK) != 0)
+        die("server 2 stopped inside an install without the image kept in %s", kept);
+    if (drop_kept && unlink(kept) != 0)
+        die("cannot remove %s: %s", kept, strerror(errno));
     start(2);
     unsigned want = 3;
     await_view(0, p_voters, &want, "three voters");
     check_all_agree(0, 3);
-    if (!log_has(2, "an install that did not finish"))
-        die("server 2 did not take the path of an unfinished install (the test proves nothing)");
-    printf("  a crash inside an install: the server empties its log, gets a new image and catches up\n");
+    if (drop_kept) {
+        if (!log_has(2, "fencing the vote"))
+            die("server 2 did not take the path of an unfinished install (the test proves nothing)");
+        printf("  a crash inside an install, the kept image gone: the server empties its log, gets a new image and "
+               "catches up\n");
+        return;
+    }
+    if (!log_has(2, "taking the image kept for it"))
+        die("server 2 did not take the image it kept for the unfinished install (the test proves nothing)");
+    if (log_has(2, "fencing the vote"))
+        die("server 2 emptied its log although it had kept the image");
+    printf("  a crash inside an install: the server takes the image it kept, and catches up\n");
 }
+
+static void scen_install(void) { install_crash(0); }
+static void scen_reseed(void) { install_crash(1); }
 
 /* the leader stopped while a node add is in flight; the next leader adds another server; the first again */
 static void scen_ids(void)
@@ -1218,8 +1238,8 @@ int main(int argc, char **argv)
         const char *name;
         void (*fn)(void);
     } all[] = {{"secret", scen_secret},     {"relay", scen_relay},     {"initcrash", scen_initcrash},
-               {"dirsync", scen_dirsync},   {"install", scen_install}, {"ids", scen_ids},
-               {"watch", scen_watch},       {"life", scen_life}};
+               {"dirsync", scen_dirsync},   {"install", scen_install}, {"reseed", scen_reseed},
+               {"ids", scen_ids},           {"watch", scen_watch},     {"life", scen_life}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;

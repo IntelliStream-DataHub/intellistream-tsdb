@@ -464,6 +464,11 @@ struct snode {
     uint64_t restart_at;
     int group; /* partitions: nodes talk within one group */
     unsigned reseeds;
+    int blank; /* reseeded and no image since: boots with an empty configuration, as cluster.c's core_boot does */
+    uint8_t *pend; /* durable: an install image kept before the core sees it (cluster.c's keep_install) */
+    size_t pendlen;
+    raft_index pend_index;
+    raft_term pend_term;
 };
 
 enum { EV_MSG, EV_SYNC, EV_HARD };
@@ -496,8 +501,10 @@ struct msim {
     size_t ref_cap;
     struct vleader *vl; /* (volume, epoch) -> leader, every pair seen */
     size_t nvl, vlcap;
-    char fail[512];
+    char fail[1024];
     uint64_t applied_max, proposals, ops_ok, leader_changes, crashes, partitions, installs, cut_installs, reseeds;
+    uint64_t changes; /* membership changes the leaders started */
+    uint64_t adopts;  /* installs cut short and finished from the kept image */
     uint64_t quiet; /* no faults and no workload from here on */
     raft_config boot;
     int heal_pending;
@@ -764,6 +771,10 @@ static void drain(struct msim *s, struct snode *nd)
             memcpy(nd->snap, a.u.snapshot.data, a.u.snapshot.len);
             nd->snaplen = a.u.snapshot.len;
             nd->snap_index = a.u.snapshot.index;
+            nd->blank = 0;
+            free(nd->pend); /* restore() removes the kept copy */
+            nd->pend = NULL;
+            nd->pend_index = 0;
             s->installs++;
             record(s, nd, NULL);
             break;
@@ -785,9 +796,27 @@ static void boot(struct msim *s, struct snode *nd)
         if (meta_snapshot_decode(&nd->sm, nd->snap, nd->snaplen) != META_OK)
             abort();
     }
+    if (nd->log.base > nd->sm.applied && nd->pend && nd->pend_index == nd->log.base &&
+        nd->pend_term == nd->log.base_term) {
+        /* an install cut short (drain's RESTORE): cluster.c's adopt_install, the image kept before the reset */
+        free(nd->snap);
+        nd->snap = nd->pend;
+        nd->snaplen = nd->pendlen;
+        nd->snap_index = nd->pend_index;
+        nd->pend = NULL;
+        if (meta_snapshot_decode(&nd->sm, nd->snap, nd->snaplen) != META_OK)
+            abort();
+        s->adopts++;
+    }
+    free(nd->pend); /* cluster.c drops a kept image the log never moved to */
+    nd->pend = NULL;
+    nd->pend_index = 0;
     if (nd->log.base > nd->sm.applied) {
-        /* an install cut short (above): what cluster.c's core_boot does (reseed_self). The vote is fenced at the
-         * log's last entry, the snapshot and the log go, and the leader sends a new image. */
+        /* keep_install's copy is durable before the reset, so only damage, which this simulator does not make, could
+         * get here; cluster.c would then reseed (below): fence the vote at the log's last entry, drop the snapshot
+         * and the log, and wait for a new image. A fenced voter counts as missing until then. */
+        sim_fail(s, "node %u: its log begins after %" PRIu64 ", past its snapshot's %" PRIu64 ", with no image kept",
+                 nd->id, (uint64_t)nd->log.base, nd->sm.applied);
         raft_index li = nd->log.base + nd->log.n;
         raft_term lt = ml_term_at(&nd->log, li);
         if (nd->hard.fence_index < li) {
@@ -803,15 +832,16 @@ static void boot(struct msim *s, struct snode *nd)
         meta_init(&nd->sm);
         s->reseeds++;
         nd->reseeds++;
+        nd->blank = 1;
     }
-    if (!nd->snap) {
+    if (!nd->snap && !nd->blank) {
         uint8_t c[META_CONFIG_MAX];
         size_t cl = raft_config_encode(&s->boot, c, sizeof c);
         meta_apply_other(&nd->sm, 0, 0, c, cl);
     }
     raft_boot b = {.hard = nd->hard, .applied = nd->sm.applied, .applied_term = nd->sm.applied_term};
-    if (!raft_config_decode(nd->sm.config, nd->sm.config_len, &b.config))
-        abort();
+    if (nd->sm.config_len && !raft_config_decode(nd->sm.config, nd->sm.config_len, &b.config))
+        abort(); /* a blank server boots with no configuration until an image arrives */
     raft_opts o;
     raft_opts_defaults(&o);
     o.seed = s->seed * 31 + nd->id * 7 + nd->incarnation;
@@ -941,6 +971,42 @@ static void propose(struct msim *s, struct snode *nd)
     meta_entry_free(&e);
 }
 
+/* Membership changes at the leader of the moment, as cluster.c's voter management makes them: promote a learner that
+ * has caught up, add a server that is not a member as a learner, or (before the quiet tail only) remove or demote a
+ * voter other than itself, down to 3 voters of 5 or 2 of 3. In the quiet tail everyone comes back as a voter, so the
+ * final check covers every server. The core refuses a change while another is pending; that is part of the test. */
+static void membership(struct msim *s, struct snode *ld, int quiet)
+{
+    const raft_config *c = raft_get_config(ld->r);
+    raft_id learner = 0, absent = 0, voter = 0;
+    unsigned voters = raft_config_voters(c), nv = 0, nl = 0, na = 0;
+    for (unsigned i = 1; i <= s->n; i++) {
+        const raft_member *m = raft_config_find(c, i);
+        raft_progress pr;
+        if (!m) {
+            if (rnd(s, 0, na++) == 0)
+                absent = i;
+        } else if (m->learner) {
+            if (raft_get_progress(ld->r, i, &pr) && pr.match >= raft_get_commit(ld->r) && rnd(s, 0, nl++) == 0)
+                learner = i;
+        } else if (i != ld->id && rnd(s, 0, nv++) == 0) {
+            voter = i;
+        }
+    }
+    raft_change_kind kind;
+    raft_id id;
+    if (learner)
+        kind = RAFT_ADD_VOTER, id = learner;
+    else if (absent && (quiet || rnd(s, 0, 1)))
+        kind = RAFT_ADD_LEARNER, id = absent;
+    else if (!quiet && voter && voters > (s->n == 5 ? 3u : 2u))
+        kind = rnd(s, 0, 1) ? RAFT_REMOVE : RAFT_DEMOTE, id = voter;
+    else
+        return;
+    if (raft_change(ld->r, kind, id, NULL) == ISO_OK)
+        s->changes++;
+}
+
 static int msim_run(uint64_t seed, double seconds, int verbose)
 {
     struct msim *s = calloc(1, sizeof *s);
@@ -994,6 +1060,14 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
                 if (m.type == RAFT_MSG_SNAPSHOT) {
                     m.u.snapshot.data = ev.bytes + ev.wire_len;
                     m.u.snapshot.len = ev.len - ev.wire_len;
+                    if (m.u.snapshot.index > nd->pend_index && m.u.snapshot.index > nd->sm.applied) {
+                        free(nd->pend); /* keep_install: durable before the core resets the log */
+                        nd->pend = malloc(m.u.snapshot.len + 1);
+                        memcpy(nd->pend, m.u.snapshot.data, m.u.snapshot.len);
+                        nd->pendlen = m.u.snapshot.len;
+                        nd->pend_index = m.u.snapshot.index;
+                        nd->pend_term = m.u.snapshot.term;
+                    }
                 }
                 raft_step(nd->r, &m);
             } else if (ev.kind == EV_SYNC) {
@@ -1025,6 +1099,16 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
                 if (nd->up)
                     crash(s, nd);
             }
+            /* membership: now and then before the quiet tail, every 100 ms in it */
+            if (s->now >= quiet ? s->now % 100000000 < 10000000 : rnd(s, 0, 999) < 4)
+                for (unsigned i = 1; i <= s->n; i++) {
+                    struct snode *nd = &s->nd[i];
+                    if (nd->up && raft_get_role(nd->r) == RAFT_LEADER) {
+                        raft_clock(nd->r, local_now(s, nd));
+                        membership(s, nd, s->now >= quiet);
+                        drain(s, nd);
+                    }
+                }
             if (s->now < quiet && !s->heal_pending && rnd(s, 0, 999) < 3) {
                 for (unsigned i = 1; i <= s->n; i++)
                     s->nd[i].group = (int)rnd(s, 0, 1);
@@ -1067,16 +1151,40 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
             ok = 0;
         }
     }
+    /* the quiet tail brings every server back as a voter: a change that never completes would show here */
+    for (unsigned i = 1; ok && i <= s->n; i++)
+        if (raft_get_role(s->nd[i].r) == RAFT_LEADER && raft_config_voters(raft_get_config(s->nd[i].r)) != s->n &&
+            raft_get_config(s->nd[i].r)->n >= 1) {
+            snprintf(s->fail, sizeof s->fail, "leader %u ended with %u voters of %u servers", i,
+                     raft_config_voters(raft_get_config(s->nd[i].r)), s->n);
+            ok = 0;
+        }
     if (ok && s->applied_max < 100)
         snprintf(s->fail, sizeof s->fail, "only %" PRIu64 " entries applied", s->applied_max), ok = 0;
+    for (unsigned i = 1; !ok && i <= s->n; i++) { /* every server's role, term and configuration, for the diagnosis */
+        const struct snode *nd = &s->nd[i];
+        size_t at = strlen(s->fail);
+        if (!nd->up) {
+            snprintf(s->fail + at, sizeof s->fail - at, "; %u down", i);
+            continue;
+        }
+        const raft_config *c = raft_get_config(nd->r);
+        at += (size_t)snprintf(s->fail + at, sizeof s->fail - at, "; %u %s term %" PRIu64 " config", i,
+                               (const char *[]){"follower", "precandidate", "candidate",
+                                                "leader"}[raft_get_role(nd->r) & 3],
+                               (uint64_t)raft_get_term(nd->r));
+        for (uint32_t k = 0; k < c->n && at < sizeof s->fail; k++)
+            at += (size_t)snprintf(s->fail + at, sizeof s->fail - at, " %u%s", c->m[k].id, c->m[k].learner ? "L" : "");
+    }
     if (!ok)
         fprintf(stderr, "FAIL metadata simulator seed %" PRIu64 ": %s\n", seed, s->fail);
     else if (verbose)
         printf("seed %" PRIu64 ": %u servers, %" PRIu64 " applied, %" PRIu64 " proposals, %" PRIu64
                " operations took effect, %" PRIu64 " leaders, %" PRIu64 " crashes, %" PRIu64 " partitions, %" PRIu64
-               " snapshot installs (%" PRIu64 " cut short, %" PRIu64 " reseeds)\n",
+               " snapshot installs (%" PRIu64 " cut short, %" PRIu64 " finished from the kept image), %" PRIu64
+               " membership changes\n",
                seed, s->n, s->applied_max, s->proposals, s->ops_ok, s->leader_changes, s->crashes, s->partitions,
-               s->installs, s->cut_installs, s->reseeds);
+               s->installs, s->cut_installs, s->adopts, s->changes);
     for (unsigned i = 1; i <= s->n; i++) {
         struct snode *nd = &s->nd[i];
         if (nd->r)
@@ -1088,6 +1196,7 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
         free(nd->log.grave);
         meta_free(&nd->sm);
         free(nd->snap);
+        free(nd->pend);
     }
     for (size_t i = 0; i < s->nev; i++)
         free(s->ev[i].bytes);

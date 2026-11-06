@@ -788,7 +788,8 @@ struct pend {
 };
 
 static struct {
-    char dir[1024], metadir[1040], logdir[1060], nodefile[1060], snapfile[1060], identfile[1060];
+    char dir[1024], metadir[1040], logdir[1060], nodefile[1060], snapfile[1060], identfile[1060], pendfile[1060];
+    uint64_t pend_index; /* the install image kept in pendfile (keep_install), 0 for none */
     char adv[META_ADDR_MAX], padv[META_ADDR_MAX], rack[META_RACK_MAX];
     uint8_t secret[CLUSTER_SECRET_MAX];
     size_t secret_len;
@@ -1542,6 +1543,10 @@ static void restore(const raft_action *a)
                   a->u.snapshot.index);
     if (write_durable(C.snapfile, a->u.snapshot.data, a->u.snapshot.len) != 0)
         fail_stop("cannot write %s: %s", C.snapfile, strerror(errno));
+    if (C.pend_index) { /* the kept copy has done its work; one left behind is ignored at the next start */
+        unlink(C.pendfile);
+        C.pend_index = 0;
+    }
     meta_free(&C.sm);
     C.sm = t;
     free(C.snap);
@@ -1614,8 +1619,8 @@ static void close_watches(void)
     C.watch_conn = 0;
 }
 
-/* The log begins after the snapshot's index: an install stopped between the core's reset of the log and the image
- * reaching meta/snapshot (a crash or power loss in restore()). Entries between the two are in neither, so this
+/* The log begins after the snapshot's index and no kept image fits (adopt_install; only damage gets here, as
+ * keep_install's copy is durable before the core resets the log). Entries between the two are in neither, so this
  * server could never apply again. It fences its vote at what its log holds (the log forgot what it acknowledged;
  * the fence lifts once it holds that entry again or a snapshot covers it), drops the old snapshot and empties the
  * log, so the leader sends it an image again. Each step is durable before the next, and a crash part way leaves
@@ -1649,6 +1654,93 @@ static int reseed_self(raft_hard_state *hs, char *err, size_t errn)
     return 0;
 }
 
+/* An install image, kept durably in meta/snapshot.install before the core sees the message. The core resets the log
+ * to the image's index inside raft_step, before it hands out RESTORE, so a crash between that reset and restore()'s
+ * write of meta/snapshot would leave a log based past the snapshot; with the image kept first, the next start takes it
+ * (adopt_install) and nothing is lost. An image that does not verify goes to the core as it is (restore() stops on
+ * it). 1 when the core may take the message, 0 when it must not (nothing kept; the leader sends it again). */
+static int keep_install(const raft_msg *m)
+{
+    if (m->u.snapshot.index <= C.pend_index || m->u.snapshot.index <= C.sm.applied)
+        return 1; /* kept already, or the core refuses it as old */
+    struct meta_state t;
+    meta_init(&t);
+    int ok = meta_snapshot_decode(&t, m->u.snapshot.data, m->u.snapshot.len) == META_OK &&
+             t.applied == m->u.snapshot.index && t.applied_term == m->u.snapshot.term;
+    meta_free(&t);
+    if (!ok)
+        return 1;
+    int rc = write_durable(C.pendfile, m->u.snapshot.data, m->u.snapshot.len);
+    if (rc == -2)
+        fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.pendfile, strerror(errno));
+    if (rc != 0) {
+        say("cannot write %s: %s (the install waits for the leader's next try)", C.pendfile, strerror(errno));
+        return 0;
+    }
+    C.pend_index = m->u.snapshot.index;
+    return 1;
+}
+
+/* A whole image file decoded into *m (img and n keep its bytes). 0, or -1 with err. */
+static int load_image(const char *path, struct meta_state *m, uint8_t **img_out, size_t *n_out, char *err,
+                      size_t errn)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(err, errn, "cannot open %s: %s", path, strerror(errno));
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *img = n > 0 ? malloc((size_t)n) : NULL;
+    int ok = img && fread(img, 1, (size_t)n, f) == (size_t)n && !ferror(f);
+    fclose(f);
+    if (!ok || meta_snapshot_decode(m, img, (size_t)n) != META_OK) {
+        free(img);
+        snprintf(err, errn, "%s is damaged (it does not verify): this server's metadata cannot be read", path);
+        return -1;
+    }
+    *img_out = img;
+    *n_out = (size_t)n;
+    return 0;
+}
+
+/* The log begins after the snapshot, at base (index, term): an install stopped between the core's reset of the log
+ * and restore(). The image keep_install kept for exactly that base becomes the snapshot. 1 taken, 0 none that fits
+ * (the caller reseeds), -1 with err. */
+static int adopt_install(raft_index index, raft_term term, char *err, size_t errn)
+{
+    if (!exists(C.pendfile))
+        return 0;
+    struct meta_state t;
+    meta_init(&t);
+    uint8_t *img = NULL;
+    size_t n = 0;
+    if (load_image(C.pendfile, &t, &img, &n, err, errn) != 0 || t.applied != index || t.applied_term != term) {
+        say("%s does not hold the image for the log's base %" PRIu64 " (term %" PRIu64 ")", C.pendfile,
+            (uint64_t)index, (uint64_t)term);
+        meta_free(&t);
+        free(img);
+        return 0;
+    }
+    if (rename(C.pendfile, C.snapfile) != 0 || fsync_dir(C.metadir) != 0) {
+        snprintf(err, errn, "cannot make %s the snapshot: %s", C.pendfile, strerror(errno));
+        meta_free(&t);
+        free(img);
+        return -1;
+    }
+    say("the Raft log in %s begins at %" PRIu64 ", after the snapshot's %" PRIu64 " (an install that did not finish):"
+        " taking the image kept for it", C.logdir, (uint64_t)index, C.sm.applied);
+    meta_free(&C.sm);
+    C.sm = t;
+    free(C.snap);
+    C.snap = img;
+    C.snaplen = n;
+    C.snap_index = index;
+    return 1;
+}
+
 /* The core from the files: the snapshot (or none), the log on it, the hard state. 0, or -1 with err. */
 static int core_boot(char *err, size_t errn)
 {
@@ -1658,26 +1750,11 @@ static int core_boot(char *err, size_t errn)
     C.snap = NULL;
     C.snaplen = C.snap_index = 0;
     if (exists(C.snapfile)) {
-        FILE *f = fopen(C.snapfile, "rb");
-        if (!f) {
-            snprintf(err, errn, "cannot open %s: %s", C.snapfile, strerror(errno));
+        if (load_image(C.snapfile, &C.sm, &C.snap, &C.snaplen, err, errn) != 0)
             return -1;
-        }
-        fseek(f, 0, SEEK_END);
-        long n = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        uint8_t *img = n > 0 ? malloc((size_t)n) : NULL;
-        int ok = img && fread(img, 1, (size_t)n, f) == (size_t)n && !ferror(f);
-        fclose(f);
-        if (!ok || meta_snapshot_decode(&C.sm, img, (size_t)n) != META_OK) {
-            free(img);
-            snprintf(err, errn, "%s is damaged (it does not verify): this server's metadata cannot be read", C.snapfile);
-            return -1;
-        }
-        C.snap = img;
-        C.snaplen = (size_t)n;
         C.snap_index = C.sm.applied;
     }
+    C.pend_index = 0;
     raft_log_opts lo = {.segment_bytes = C.seg_bytes};
     if (raft_log_open(C.logdir, &lo, C.sm.applied, C.sm.applied_term, &C.log, err, errn) != ISO_OK)
         return -1;
@@ -1691,11 +1768,17 @@ static int core_boot(char *err, size_t errn)
     if (e == ISO_ERR_NOTFOUND)
         hs = (raft_hard_state){0};
     raft_index first = raft_log_file_ops.first(C.log);
-    if (first > 1 && first - 1 > C.sm.applied && reseed_self(&hs, err, errn) != 0) {
+    int adopted = 0;
+    if (first > 1 && first - 1 > C.sm.applied)
+        adopted = adopt_install(first - 1, raft_log_file_ops.term_at(C.log, first - 1), err, errn);
+    if (adopted < 0 ||
+        (!adopted && first > 1 && first - 1 > C.sm.applied && reseed_self(&hs, err, errn) != 0)) {
         raft_log_close(C.log);
         C.log = NULL;
         return -1;
     }
+    if (exists(C.pendfile))
+        unlink(C.pendfile); /* an image the log never moved to: no longer needed */
     raft_boot b = {.hard = hs, .applied = C.sm.applied, .applied_term = C.sm.applied_term};
     config_of(&C.sm, &b.config);
     raft_opts o;
@@ -1788,6 +1871,8 @@ static void on_raft(struct conn *c, struct rd *r)
     if (m.type == RAFT_MSG_SNAPSHOT) {
         m.u.snapshot.data = r->p + r->off + wl;
         m.u.snapshot.len = r->len - r->off - wl;
+        if (!keep_install(&m))
+            return; /* not kept: the core must not reset the log for it; the leader sends it again */
     }
     if (!C.r) {
         char err[2048];
@@ -2869,6 +2954,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.nodefile, sizeof C.nodefile, "%s/NODE", C.metadir);
     snprintf(C.snapfile, sizeof C.snapfile, "%s/snapshot", C.metadir);
     snprintf(C.identfile, sizeof C.identfile, "%s/IDENT", C.metadir);
+    snprintf(C.pendfile, sizeof C.pendfile, "%s/snapshot.install", C.metadir);
     test_knobs();
     meta_init(&C.sm);
     meta_init(&C.wsm);
