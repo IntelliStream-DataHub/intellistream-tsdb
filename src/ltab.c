@@ -133,36 +133,49 @@ static bool lt_load(const ltab *t, uint32_t id, lt_ent *e)
         return true;
     }
     const lt_page *p = t->pg[pi];
-    uint64_t w = p->e[2 * i];
-    if ((p->unk[i >> 6] >> (i & 63)) & 1)
+    /* relaxed atomic loads: a large flush's window (3.2) stores without the lock; a torn entry only ever shows a
+     * timestamp at or below the flush's own row, which the flushing memtable outranks */
+    uint64_t w = __atomic_load_n(&p->e[2 * i], __ATOMIC_RELAXED);
+    uint64_t u = __atomic_load_n(&p->unk[i >> 6], __ATOMIC_RELAXED);
+    if ((u >> (i & 63)) & 1)
         *e = (lt_ent){LE_UNKNOWN, lt_dec(w), 0};
     else if (w == 0)
         *e = (lt_ent){LE_EMPTY, INT64_MAX, 0};
     else
-        *e = (lt_ent){LE_KNOWN, lt_dec(w), p->e[2 * i + 1]};
+        *e = (lt_ent){LE_KNOWN, lt_dec(w), __atomic_load_n(&p->e[2 * i + 1], __ATOMIC_RELAXED)};
     return true;
 }
 
-/* Stores the entry of id; its page must exist. */
+/* Stores the entry of id; its page must exist. Relaxed atomic stores (see lt_load); a writer is alone (the write lock,
+ * or the window's owner), so the bitmap word's load and store pair is not racing another writer. The slot goes first:
+ * a lookup that sees the new timestamp with the old slot is the case 3.2 argues about. */
+static void lt_set_unk(lt_page *p, uint32_t i, bool on)
+{
+    uint64_t bit = 1ull << (i & 63);
+    uint64_t u = __atomic_load_n(&p->unk[i >> 6], __ATOMIC_RELAXED);
+    u = on ? u | bit : u & ~bit;
+    __atomic_store_n(&p->unk[i >> 6], u, __ATOMIC_RELAXED);
+}
+
 static void lt_store(ltab *t, uint32_t id, const lt_ent *e)
 {
     lt_page *p = t->pg[id >> LT_PAGE_BITS];
     uint32_t i = id & (LT_PAGE - 1);
-    uint64_t bit = 1ull << (i & 63);
     switch (e->st) {
     case LE_EMPTY:
-        p->e[2 * i] = p->e[2 * i + 1] = 0;
-        p->unk[i >> 6] &= ~bit;
+        __atomic_store_n(&p->e[2 * i + 1], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&p->e[2 * i], 0, __ATOMIC_RELAXED);
+        lt_set_unk(p, i, false);
         break;
     case LE_KNOWN:
-        p->e[2 * i] = lt_enc(e->ts);
-        p->e[2 * i + 1] = e->x;
-        p->unk[i >> 6] &= ~bit;
+        __atomic_store_n(&p->e[2 * i + 1], e->x, __ATOMIC_RELAXED);
+        __atomic_store_n(&p->e[2 * i], lt_enc(e->ts), __ATOMIC_RELAXED);
+        lt_set_unk(p, i, false);
         break;
     default:
-        p->e[2 * i] = lt_enc(e->ts);
-        p->e[2 * i + 1] = 0;
-        p->unk[i >> 6] |= bit;
+        __atomic_store_n(&p->e[2 * i + 1], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&p->e[2 * i], lt_enc(e->ts), __ATOMIC_RELAXED);
+        lt_set_unk(p, i, true);
     }
 }
 
@@ -207,12 +220,8 @@ static void hints_push(eng *db, const uint32_t *id, size_t n, bool rescan)
 
 /* The entry of f->series after a publish that brought f (design-latest.md 3). A known entry below the drop floor
  * reads as unknown (ts) (L20). Stores only a change; ids made unknown go to h. */
-static void fold_one(eng *db, ltab *t, const lfold *f, lt_sec *h)
+static lt_ent fold_next(const ltab *t, const lfold *f, lt_ent e)
 {
-    uint32_t id = f->series;
-    lt_ent e;
-    if (!lt_load(t, id, &e)) /* capped: no entry */
-        return;
     bool floor = e.st == LE_KNOWN && e.ts < t->drop_floor;
     bool hasr = f->flags & LF_R;
     lt_ent n = e;
@@ -224,15 +233,25 @@ static void fold_one(eng *db, ltab *t, const lfold *f, lt_sec *h)
     case LE_KNOWN:
         if (hasr && f->r_ts >= e.ts)
             n = (lt_ent){LE_KNOWN, f->r_ts, f->r_slot};
-        else if (!floor && (f->flags & LF_N) && e.ts >= f->n_lo && e.ts <= f->n_hi) {
+        else if (!floor && (f->flags & LF_N) && e.ts >= f->n_lo && e.ts <= f->n_hi)
             n = (lt_ent){LE_UNKNOWN, e.ts, 0}; /* the null may have overwritten the row (never known at an older one) */
-            hints_add(h, id);
-        }
         break;
     default:
         if (hasr && f->r_ts >= e.ts)
             n = (lt_ent){LE_KNOWN, f->r_ts, f->r_slot};
     }
+    return n;
+}
+
+static void fold_one(eng *db, ltab *t, const lfold *f, lt_sec *h)
+{
+    uint32_t id = f->series;
+    lt_ent e;
+    if (!lt_load(t, id, &e)) /* capped: no entry */
+        return;
+    lt_ent n = fold_next(t, f, e);
+    if (n.st == LE_UNKNOWN && e.st == LE_KNOWN)
+        hints_add(h, id);
     if (n.st == e.st && n.ts == e.ts && n.x == e.x)
         return;
     if (!lt_make_pages(db, t, id >> LT_PAGE_BITS)) /* capped (only an empty entry has no page yet) */
@@ -260,20 +279,127 @@ static void fold_tomb(eng *db, ltab *t, const tomb *tb, lt_sec *h)
     lt_store(t, id, &n);
 }
 
+/* Waits until no large flush's window is open (3.2). The caller holds no engine lock a flush needs after its window
+ * (a window waits for nothing: its stores, then its write section). */
+static void lt_wait_window(ltab *t)
+{
+    pthread_mutex_lock(&t->pmu);
+    while (atomic_load(&t->pending))
+        pthread_cond_wait(&t->pcv, &t->pmu);
+    pthread_mutex_unlock(&t->pmu);
+}
+
+/* The write lock, once no window is open: every writer but the window's owner (retention, drops, the warmer) comes
+ * through here. */
+static void lt_wrlock(ltab *t)
+{
+    for (;;) {
+        pthread_rwlock_wrlock(&t->rw);
+        if (!atomic_load(&t->pending))
+            return;
+        pthread_rwlock_unlock(&t->rw);
+        lt_wait_window(t);
+    }
+}
+
 void lt_begin(eng *db, lt_sec *sec)
 {
     memset(sec, 0, sizeof *sec);
     ltab *t = db->lt;
     if (t)
-        pthread_rwlock_wrlock(&t->rw);
+        lt_wrlock(t);
+}
+
+/* Flushes with at least this many series in their fold lists store their rows in a window (3.2). A variable for the
+ * tests; 50,000 stores take about a millisecond, which is what a write hold may cost. */
+static int lt_window_min = 50000;
+
+void tsdb_test_latest_window(int min)
+{
+    lt_window_min = min;
+}
+
+/* A flush's write section (3.2). A short fold list: lt_begin. A long one: the window. 1. Under the write lock, make the
+ * pages, set `pending`, bump lgen. 2. Without the lock, store only the flush's own row of each series (an empty entry
+ * to R, a known k to R with R.ts >= k.ts, an unknown u to R with R.ts >= u): the flushing memtable, which every
+ * lookup of the window reads and which outranks the table on equal timestamps, holds R, so a torn entry (a timestamp
+ * at or below R.ts) loses to it. A change that would make an entry unknown is noted for step 3. 3. Take the write
+ * lock again (the caller then lists the parts, lt_fold applies the noted folds, lt_end clears `pending`). The
+ * caller holds publish_lock and flush_lock, so no other publisher is here. */
+void lt_begin_flush(eng *db, lt_sec *sec, part **ps, size_t n)
+{
+    ltab *t = db->lt;
+    size_t cnt = 0;
+    bool tomb = false;
+    uint32_t maxid = 0;
+    for (size_t i = 0; t && i < n; i++) {
+        cnt += ps[i]->nlf;
+        tomb |= ps[i]->nt != 0; /* a flush has none; a window is for rows only */
+        for (size_t k = 0; k < ps[i]->nlf; k++)
+            maxid = MAX(maxid, ps[i]->lf[k].series);
+    }
+    if (!t || tomb || cnt < (size_t)lt_window_min) {
+        lt_begin(db, sec);
+        return;
+    }
+    memset(sec, 0, sizeof *sec);
+    lt_wrlock(t);
+    lt_make_pages(db, t, maxid >> LT_PAGE_BITS); /* capped: the ids beyond have no entry, and are skipped below */
+    atomic_store(&t->pending, true);
+    t->lgen++;
+    pthread_rwlock_unlock(&t->rw);
+    size_t seen = 0;
+    for (size_t i = 0; i < n; i++) {
+        part *p = ps[i];
+        for (size_t k = 0; k < p->nlf; k++, seen++) {
+            const lfold *f = &p->lf[k];
+            lt_ent e;
+            if (seen == cnt / 2 && db->lt_hook) /* tests: lookups run with half the stores made */
+                db->lt_hook(db->lt_hook_arg, LH_WINDOW_MID);
+            if ((f->series >> LT_PAGE_BITS) >= t->npg || !lt_load(t, f->series, &e))
+                continue;
+            lt_ent nx = fold_next(t, f, e);
+            if (nx.st == LE_UNKNOWN && e.st == LE_KNOWN) { /* a null may have overwritten the row: step 3 */
+                if (sec->nnote == sec->capnote) {
+                    size_t c = sec->capnote ? 2 * sec->capnote : 64;
+                    const lfold **x = realloc(sec->note, c * sizeof *x);
+                    if (!x) { /* no room to note it: lt_fold folds everything again under the lock */
+                        sec->noteoom = true;
+                        continue;
+                    }
+                    sec->note = x;
+                    sec->capnote = c;
+                }
+                sec->note[sec->nnote++] = f;
+                continue;
+            }
+            if (nx.st != e.st || nx.ts != e.ts || nx.x != e.x)
+                lt_store(t, f->series, &nx);
+        }
+    }
+    if (db->lt_hook)
+        db->lt_hook(db->lt_hook_arg, LH_FOLD_BEFORE_LIST);
+    pthread_rwlock_wrlock(&t->rw);
+    sec->win = true;
 }
 
 /* Folds the pending parts (tombstones, then rows, part by part in block order) and frees their fold lists. Before
- * the parts are listed: once listed, a merge may free them. */
+ * the parts are listed: once listed, a merge may free them. After a window only the noted folds are left. */
 void lt_fold(eng *db, lt_sec *sec, part **ps, size_t n)
 {
     ltab *t = db->lt;
-    for (size_t i = 0; t && i < n; i++) {
+    if (t && sec->win) {
+        for (size_t i = 0; i < sec->nnote; i++)
+            fold_one(db, t, sec->note[i], sec);
+        if (sec->noteoom) { /* the notes did not fit: fold everything again (the folds are idempotent, 3.2) */
+            for (size_t i = 0; i < n; i++)
+                for (size_t k = 0; k < ps[i]->nlf; k++)
+                    fold_one(db, t, &ps[i]->lf[k], sec);
+        }
+        free(sec->note);
+        sec->note = NULL;
+    }
+    for (size_t i = 0; t && !sec->win && i < n; i++) {
         part *p = ps[i];
         for (uint32_t k = 0; k < p->nt; k++)
             fold_tomb(db, t, &p->t[k], sec);
@@ -293,6 +419,12 @@ void lt_end(eng *db, lt_sec *sec)
     if (!t)
         return;
     t->lgen++;
+    if (sec->win) { /* under the write lock: no lookup sees the window closed and the flushing memtable gone apart */
+        pthread_mutex_lock(&t->pmu);
+        atomic_store(&t->pending, false);
+        pthread_cond_broadcast(&t->pcv);
+        pthread_mutex_unlock(&t->pmu);
+    }
     pthread_rwlock_unlock(&t->rw);
     hints_push(db, sec->id, sec->n, sec->oom);
     free(sec->id);
@@ -899,6 +1031,7 @@ static int warm_batch(eng *db, ltab *t, uint32_t *ids, size_t n, bool floor_mode
         return WS_OK;
     if (pend) {
         warm_requeue(db, ids, n, floor_mode);
+        lt_wait_window(t); /* a large flush's window is open (3.2): the cut would be of a state half stored */
         return WS_REFUSED;
     }
     if (rc)
@@ -958,7 +1091,7 @@ static size_t warm_collect(ltab *t, bool floor_mode, uint32_t *cur, uint32_t *id
         const lt_page *p = t->pg[id >> LT_PAGE_BITS];
         uint32_t i = (uint32_t)id & (LT_PAGE - 1);
         if (!floor_mode) {
-            uint64_t w = p->unk[i >> 6] >> (i & 63);
+            uint64_t w = __atomic_load_n(&p->unk[i >> 6], __ATOMIC_RELAXED) >> (i & 63);
             if (!w) {
                 id += 64 - (i & 63);
                 continue;
@@ -1080,7 +1213,7 @@ bool latest_stats(eng *db, uint64_t out[6])
     pthread_rwlock_rdlock(&t->rw);
     for (uint32_t i = 0; i < t->npg; i++)
         for (size_t w = 0; w < LT_PAGE / 64; w++)
-            unk += (uint64_t)__builtin_popcountll(t->pg[i]->unk[w]);
+            unk += (uint64_t)__builtin_popcountll(__atomic_load_n(&t->pg[i]->unk[w], __ATOMIC_RELAXED));
     pthread_rwlock_unlock(&t->rw);
     out[5] = unk;
     return true;

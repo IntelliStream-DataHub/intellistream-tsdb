@@ -1320,6 +1320,82 @@ static void test_flush_window(void)
     OK(tsdb_close(w));
 }
 
+/* ------------------------------------------------------------------ the large-flush window (3.2) */
+
+enum { WS_N = 7 };
+typedef struct {
+    tsdb *db;
+    tsdb_sid id[WS_N];
+    int mid, before_list;
+} ww;
+
+/* Runs on the flusher's thread, in the window: some of the stores are made, no lock is held, the flushing memtable is
+ * listed. Every lookup must still give the full scan's answer. */
+static void ww_hook(void *arg, int at)
+{
+    ww *x = arg;
+    if (at != LH_WINDOW_MID && at != LH_FOLD_BEFORE_LIST)
+        return;
+    if (at == LH_WINDOW_MID)
+        x->mid++;
+    else
+        x->before_list++;
+    for (int i = 0; i < WS_N; i++)
+        check_vs_scan(x->db, x->id[i], at == LH_WINDOW_MID ? "window, half stored" : "window, all stored");
+}
+
+static void test_window(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    ww x = {0};
+    x.db = open_plain("latest_window", &o);
+    for (int i = 0; i < WS_N; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ww.%d", i);
+        OK(tsdb_series_create(x.db, nm, TSDB_FLOAT64, NULL, &x.id[i]));
+    }
+    /* the parts: s0 10, s1 30, s2 20, s4 40 (deleted below: unknown), s5 20, s6 20 */
+    put_f64(x.db, x.id[0], 10, 1.0, false);
+    put_f64(x.db, x.id[1], 30, 2.0, false);
+    put_f64(x.db, x.id[2], 20, 3.0, false);
+    put_f64(x.db, x.id[4], 40, 4.0, false);
+    put_f64(x.db, x.id[4], 5, 4.5, false);
+    put_f64(x.db, x.id[5], 20, 5.0, false);
+    put_f64(x.db, x.id[6], 20, 6.0, false);
+    OK(tsdb_flush(x.db));
+    OK(tsdb_delete_range(x.db, x.id[4], 40, TSDB_TS_MAX)); /* s4: unknown (39) until the warmer fills it */
+    /* the flush: s0 a newer row (known to R), s1 an older one (the entry stays), s2 a null over its row (noted for
+     * the write section), s3 a first row (empty to R), s4 a row above the bound (unknown to R), s5 the same
+     * timestamp (R.ts >= k.ts), s6 a newer row and then a null beyond it (R below the null) */
+    put_f64(x.db, x.id[0], 25, 7.0, false);
+    put_f64(x.db, x.id[1], 20, 8.0, false);
+    put_f64(x.db, x.id[2], 20, 0, true);
+    put_f64(x.db, x.id[3], 10, 9.0, false);
+    put_f64(x.db, x.id[4], 42, 10.0, false);
+    put_f64(x.db, x.id[5], 20, 11.0, false);
+    put_f64(x.db, x.id[6], 25, 12.0, false);
+    put_f64(x.db, x.id[6], 28, 0, true);
+    tsdb_test_latest_window(2);
+    tsdb_test_latest_hook(x.db, ww_hook, &x);
+    OK(tsdb_flush(x.db));
+    tsdb_test_latest_hook(x.db, NULL, NULL);
+    tsdb_test_latest_window(50000);
+    CHECK(x.mid == 1 && x.before_list == 1); /* the window ran */
+    for (int i = 0; i < WS_N; i++)
+        check_vs_scan(x.db, x.id[i], "window, after");
+    tsdb_latest_result r = one(x.db, x.id[2], TSDB_TS_MAX, 0); /* the null took 20: nothing below */
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    r = one(x.db, x.id[6], TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 25 && r.v.f64 == 12.0);
+    /* the warmer settles the unknown entry the null made */
+    CHECK(wm_wait(x.db, no_unknown, 0));
+    for (int i = 0; i < WS_N; i++)
+        check_vs_scan(x.db, x.id[i], "window, warmed");
+    OK(tsdb_close(x.db));
+}
+
 /* ------------------------------------------------------------------ a follower */
 
 /* A read-only follower (WAL tails, flushing memtables, parts, deletes, optimize) against its own full scan, with
@@ -1415,6 +1491,8 @@ int main(int argc, char **argv)
     printf("warmer ok\n");
     test_flush_window();
     printf("flushing + active memtables, follower tails ok\n");
+    test_window();
+    printf("large-flush window ok\n");
     test_follower(1500);
     printf("follower ok\n");
 
@@ -1432,7 +1510,9 @@ int main(int argc, char **argv)
     o.wal_max_batch_rows = 64;
     o.granule_rows = 16;
     o.merge_threads = 0;
+    tsdb_test_latest_window(1); /* every flush through the 3.2 window */
     random_run("latest_r1", o, false, steps, 22);
+    tsdb_test_latest_window(50000);
     printf("many unmerged parts ok\n");
 
     tsdb_options_init(&o);
@@ -1450,7 +1530,9 @@ int main(int argc, char **argv)
     o.granule_rows = 64;
     o.wal_max_batch_rows = 90;
     o.merge_threads = 2;
+    tsdb_test_latest_window(2);
     random_run("latest_r3", o, true, steps, 44);
+    tsdb_test_latest_window(50000);
     printf("periodic WAL ok\n");
 
     /* partial merges (merge_idle_s, a small max_part_bytes): parts with rows and their own tombstones */
@@ -1467,6 +1549,10 @@ int main(int argc, char **argv)
     printf("crash ok\n");
     test_concurrent();
     printf("concurrent ok\n");
+    tsdb_test_latest_window(1); /* writers, merges and lookups with every flush a window */
+    test_concurrent();
+    tsdb_test_latest_window(50000);
+    printf("concurrent with windows ok\n");
     rmrf(root);
     printf("test_latest ok\n");
     return 0;

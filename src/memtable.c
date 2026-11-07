@@ -832,7 +832,7 @@ static int flush_waiting(eng *db)
             break;
         }
         lt_sec lsec; /* the latest table folds the flush in the section that lists it and drops the memtable */
-        lt_begin(db, &lsec);
+        lt_begin_flush(db, &lsec, pl.p, pl.n);
         lt_fold(db, &lsec, pl.p, pl.n);
         pthread_mutex_lock(&db->lock);
         for (size_t k = 0; k < pl.n; k++)

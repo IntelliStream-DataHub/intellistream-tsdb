@@ -1343,7 +1343,8 @@ typedef struct ltab {
 
 /* a lookup that waits for a publisher's window or the warmer: test hooks (tests/test_latest.c) */
 typedef void (*latest_hook_fn)(void *arg, int at);
-enum { LH_FOLD_BEFORE_LIST = 1, LH_WARM_BEFORE_STORE = 2, LH_LOOKUP_AFTER_ENTRY = 3, LH_WARM_AFTER_CUT = 4 };
+enum { LH_FOLD_BEFORE_LIST = 1, LH_WARM_BEFORE_STORE = 2, LH_LOOKUP_AFTER_ENTRY = 3, LH_WARM_AFTER_CUT = 4,
+       LH_WINDOW_MID = 5 };
 
 struct eng {
     char *dir;
@@ -1809,8 +1810,14 @@ typedef struct lt_sec {
     uint32_t *id;
     size_t n, cap;
     bool oom;
+    bool win;           /* a large flush's window (3.2) is open: lt_end closes it */
+    const lfold **note; /* the window's folds left for the write section (a null over a known row) */
+    size_t nnote, capnote;
+    bool noteoom;       /* a note did not fit: the write section folds every list */
 } lt_sec;
 void lt_begin(eng *db, lt_sec *sec);
+/* lt_begin for a flush's parts: a long fold list is stored in a window without the lock (3.2) */
+void lt_begin_flush(eng *db, lt_sec *sec, part **ps, size_t n);
 void lt_fold(eng *db, lt_sec *sec, part **ps, size_t n);
 void lt_end(eng *db, lt_sec *sec);
 /* in a write section of lt_begin: */
@@ -1933,6 +1940,7 @@ uint64_t tsdb_test_fence_wakeups(struct tsdb *t);
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
 bool tsdb_test_latest_stats(struct tsdb *t, uint64_t out[6]);
 void tsdb_test_latest_hook(struct tsdb *t, void (*fn)(void *, int), void *arg);
+void tsdb_test_latest_window(int min); /* flushes with this many series or more use the 3.2 window (process-wide) */
 /* tests: fn(arg, 0) runs in tsdb_volume_reopen before it halts the old engine, fn(arg, 1) once the new engine is
  * open and its threads run; a reference on a series' engine as a
  * name or type lookup holds it between its route and its use (tsdb_test_meta_use reads the type through it) */
