@@ -1615,7 +1615,7 @@ int wal_open(eng *db, int (*before_replay)(eng *))
              * (a torn tail or page-cache bytes of a killed process must not become a "sealed" segment that a power
              * loss cuts); one without a record is unlinked. */
             bool keep = atomic_load(&db->feed_on) && pos > 0;
-            if (keep && !stuck)
+            if (keep) /* also after a rename that failed: the next flush renames this one too, as it is */
                 rc = wal_seal_replayed(db, segs[k].name, pos, len);
             /* the numbers of the segment stay used once it is gone, markers included: FNO holds them first */
             if (rc == 0 && segs[k].fno_end)

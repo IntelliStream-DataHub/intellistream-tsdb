@@ -798,6 +798,24 @@ static int volume_dir_check(tsdb *t, const char *path, uint32_t index, bool *met
     return rc;
 }
 
+/* A volume is brought to the root's state by its writer's open, before its WAL replay (feed.c): the wish for the
+ * next eng_open_sched on this thread, which takes it as its first statement. */
+static void volume_feed_want(tsdb *t)
+{
+    feed_opts fo;
+    memset(&fo, 0, sizeof fo);
+    pthread_rwlock_rdlock(&t->lock);
+    eng *root = t->vols[0];
+    bool on = atomic_load(&root->feed_on);
+    if (on) {
+        pthread_mutex_lock(&root->feed_lock);
+        fo = (feed_opts){root->feed.retention_s, root->feed.max_bytes, root->feed.min_free_pct};
+        pthread_mutex_unlock(&root->feed_lock);
+    }
+    pthread_rwlock_unlock(&t->lock);
+    eng_set_open_feed_want(on ? 1 : 0, on ? &fo : NULL);
+}
+
 /* Opens volume `index` (line `index` of VOLUMES) at `path` (canonical, with our ROOT_ID) and lists it. Called
  * without t->lock: the open reads the volume's files, and a volume on a file system that hangs must not hold up
  * the lookups and creations in the volumes already open, which take the lock for reading. Callers open in line
@@ -817,21 +835,8 @@ static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad
     if (rc)
         return rc;
     eng *e;
-    if (!t->opt.read_only) {
-        /* a volume is brought to the root's state by its writer's open, before its WAL replay (feed.c) */
-        feed_opts fo;
-        memset(&fo, 0, sizeof fo);
-        pthread_rwlock_rdlock(&t->lock);
-        eng *root = t->vols[0];
-        bool on = atomic_load(&root->feed_on);
-        if (on) {
-            pthread_mutex_lock(&root->feed_lock);
-            fo = (feed_opts){root->feed.retention_s, root->feed.max_bytes, root->feed.min_free_pct};
-            pthread_mutex_unlock(&root->feed_lock);
-        }
-        pthread_rwlock_unlock(&t->lock);
-        eng_set_open_feed_want(on ? 1 : 0, on ? &fo : NULL);
-    }
+    if (!t->opt.read_only)
+        volume_feed_want(t);
     if ((rc = eng_open_sched(path, &t->opt, t->sched, &e)) != 0)
         return rc;
     char *p = strdup(path);
@@ -1888,8 +1893,10 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
         rc = reval_dicts(old, path, &rep->series_repaired, &rep->states_repaired);
     eng *e = NULL;
     reval_check chk = {.x = exp, .nx = nexp};
-    if (rc == 0) /* the parts are compared inside the open, before the new engine's merge threads start */
+    if (rc == 0) { /* the parts are compared inside the open, before the new engine's merge threads start */
+        volume_feed_want(t); /* the root's state, as at the first open of the volume */
         rc = eng_reopen(old, path, &t->opt, t->sched, &e, reval_check_open, &chk);
+    }
     free(path);
     if (rc) {
         free(exp);

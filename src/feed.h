@@ -117,11 +117,14 @@ void feed_cleaner_wake(struct eng *db);
 void feed_index_add(struct eng *db, uint64_t seq, const fseg *info);
 void feed_index_free(struct eng *db);
 /* Test hook: free space of the volume's file system as a percent (process-wide; NULL: statvfs). */
+void feed_test_unlink_hook(void (*fn)(void)); /* tests: after the cleaner's first unlink of a pass */
+extern int feed_test_cleaner_fail; /* tests: the next n cleaner starts fail */
+extern uint64_t feed_test_fills; /* tests: segment files walked by seg_fill */
 void feed_test_free_hook(int (*fn)(void *ctx, const char *dir, uint32_t *pct), void *ctx);
 
 /* The open: bring the volume to the state the database wants (want: 1 on, 0 off, -1 as its own files say, the root's
  * rule), and the engine's feed fields. Called by the writer's open, after META is read and the LOCK is held. */
-int feed_open_reconcile(struct eng *db, int want);
+int feed_open_reconcile(struct eng *db, int want, const feed_opts *wanted);
 /* After the open's numbers are known (wal_open): enable or renew FEED before the first FNO store. */
 int feed_open_numbers(struct eng *db);
 /* Live enable and disable, embedded (tsdb.h through volumes.c). */
@@ -130,6 +133,6 @@ int eng_feed_disable(struct eng *db);
 int eng_feed_new_id(struct eng *db); /* a new feed_id first, then the numbers 2^40 higher (F19) */
 /* The thread-local wish for the next eng_open_sched of a volume: 1 on, 0 off, -1 as its own files say. */
 void eng_set_open_feed_want(int want, const feed_opts *o);
-int eng_take_open_feed_want(void);
+int eng_take_open_feed_want(feed_opts *o); /* also clears it; the first statement of eng_open_sched */
 
 #endif

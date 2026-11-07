@@ -802,6 +802,8 @@ int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, e
 int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **out)
 {
     *out = NULL;
+    feed_opts feed_wanted; /* taken before any failure point: see eng_take_open_feed_want */
+    int feed_want = eng_take_open_feed_want(&feed_wanted);
     simd_init();
     eng *db = calloc(1, sizeof *db);
     if (!db)
@@ -886,7 +888,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     }
     if ((rc = meta_load_or_create(db, ro)) != 0)
         goto fail;
-    if ((rc = feed_open_reconcile(db, eng_take_open_feed_want())) != 0)
+    if ((rc = feed_open_reconcile(db, feed_want, &feed_wanted)) != 0)
         goto fail;
     if ((rc = series_open(&db->series, db->dirfd, "SERIES", ro, db->opt.fsync)) != 0 ||
         (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0 ||

@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -906,6 +907,7 @@ static void check_feed_dir(const char *dir, const char *what, int k, uint64_t wh
 /* The offline check jepsen runs (tests/jepsen/feedcheck.c) must see a lost segment, a torn retained segment, numbers that
  * go back and a floor above the oldest kept number: a check that passes everything proves nothing. */
 int feedcheck_dir(const char *dir, bool crashed, char *why, size_t cap);
+void feedcheck_forget(void);
 
 static void test_feedcheck(void)
 {
@@ -925,32 +927,78 @@ static void test_feedcheck(void)
     CHECK(feedcheck_dir(dir, false, why, sizeof why) == 0);
     CHECK(feedcheck_dir(dir, true, why, sizeof why) == 0);
     fresh("feedcheck-bad", bad, sizeof bad);
-    sh("rm -rf '%s' && cp -a '%s' '%s' && rm '%s/fwal_0000000000000002.log'", bad, dir, bad, bad);
-    CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "contiguous"));
+    /* a segment that was there at the last check and is gone above the floor: what a cleaner that unlinks before its
+     * floor is durable leaves (a seq gap alone is not it: see below) */
+    sh("rm -rf '%s' && cp -a '%s' '%s'", bad, dir, bad);
+    feedcheck_forget();
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) == 0);
+    sh("rm '%s/fwal_0000000000000002.log'", bad);
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "vanished"));
     sh("rm -rf '%s' && cp -a '%s' '%s' && truncate -s -3 '%s/fwal_0000000000000003.log'", bad, dir, bad, bad);
     CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "torn"));
     sh("rm -rf '%s' && cp -a '%s' '%s' && cp '%s/fwal_0000000000000002.log' '%s/fwal_0000000000000003.log'", bad, dir,
        bad, bad, bad);
     CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0); /* a segment bound to another seq is not whole either */
-    /* a floor at or above the first number kept */
+    /* a floor inside a segment that the cleaner set (floor_check != 0): a violation */
     sh("rm -rf '%s' && cp -a '%s' '%s'", bad, dir, bad);
+    feedcheck_forget();
     CHECK(open_eng(bad, &db) == 0 && fslots_set_floor(db, 60, 1) == 0 && eng_close(db) == 0);
     CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "floor"));
     /* the floor at the end of segment 1 with segment 1 still there: a cleaner that died before its unlinks; fine */
     uint64_t f1, l1;
     CHECK(seg_walk(dir, "fwal_0000000000000001.log", 1, &f1, &l1) > 0);
     sh("rm -rf '%s' && cp -a '%s' '%s'", bad, dir, bad);
+    feedcheck_forget();
     CHECK(open_eng(bad, &db) == 0 && fslots_set_floor(db, l1, 1) == 0 && eng_close(db) == 0);
     CHECK(feedcheck_dir(bad, false, why, sizeof why) == 0);
-    /* a gap above the floor still counts */
+    sh("rm '%s/fwal_0000000000000001.log'", bad); /* the leftover goes: at the floor, so nothing is lost */
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) == 0);
+    /* but one above it going is */
     sh("rm '%s/fwal_0000000000000003.log'", bad);
-    CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "contiguous"));
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "vanished"));
     /* a torn newest wal_ is what a crash leaves: fine before the open, never in a retained one */
     sh("rm -rf '%s' && cp -a '%s' '%s' && cp '%s/fwal_0000000000000004.log' '%s/wal_0000000000000005.log' && "
        "truncate -s -3 '%s/wal_0000000000000005.log'", bad, dir, bad, bad, bad, bad);
+    feedcheck_forget();
     CHECK(feedcheck_dir(bad, true, why, sizeof why) == 0);
     CHECK(feedcheck_dir(bad, false, why, sizeof why) == 0); /* not counted as a name when none is expected */
-    printf("  feedcheck: sees a lost segment, a torn one, a damaged one and a floor too high\n");
+
+    /* (a) a seq gap the engine makes: an empty newest wal_N found at the open is unlinked and the next segment is
+     * N+1; no event is lost, so the checker accepts it (the reader goes by log numbers) */
+    fresh("fc-gap", bad, sizeof bad);
+    CHECK(open_eng(bad, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0 && eng_feed_enable(db, &fo) == 0);
+    rows(db, s, T0, 20);
+    CHECK(eng_flush(db) == 0 && eng_close(db) == 0);
+    pid_t pid = fork();
+    if (pid == 0) { /* opens, writes nothing, dies: an empty active segment is left */
+        eng *c;
+        _exit(open_eng(bad, &c) == 0 ? 0 : 2);
+    }
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(open_eng(bad, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0 + 1000, 20);
+    CHECK(eng_flush(db) == 0 && eng_close(db) == 0);
+    CHECK(exists(bad, "fwal_0000000000000001.log") && !exists(bad, "fwal_0000000000000002.log") &&
+          count_prefix(bad, "fwal_") == 2); /* the gap is really there */
+    feedcheck_forget();
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) == 0);
+    if (why[0] && strstr(why, "contiguous"))
+        fprintf(stderr, "  feedcheck: %s\n", why);
+    /* (b) a live enable with rows in the active segment: its floor lies inside that segment, which is then retained
+     * whole (floor_check 0: not the cleaner's) */
+    fresh("fc-straddle", bad, sizeof bad);
+    CHECK(open_eng(bad, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 10);
+    CHECK(eng_feed_enable(db, &fo) == 0);
+    rows(db, s, T0 + 1000, 10);
+    CHECK(eng_flush(db) == 0 && eng_close(db) == 0);
+    uint64_t fs1, ls1;
+    CHECK(seg_walk(bad, "fwal_0000000000000001.log", 1, &fs1, &ls1) > 0 && fs1 <= 10 && ls1 > 10);
+    feedcheck_forget();
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) == 0);
+    printf("  feedcheck: sees a segment that vanished above the floor, a torn one, a damaged one and a floor too high; "
+           "accepts a seq gap and a live enable's straddle\n");
 }
 
 /* `feed info` of a handle without a cleaner (read-only): the floor from FEEDSLOTS, the segments from the files. */
@@ -978,6 +1026,189 @@ static void test_info(void)
     CHECK(fi.on && fi.floor_event == 7 && fi.retained_segments == 3 && fi.retained_bytes > 0 && fi.retention_s == 100000);
     tsdb_close(t);
     printf("  info: a read-only handle reports the floor and the retained segments\n");
+}
+
+/* H1 of the review: the open's wish (on or off, from the root) is a thread-local that a volume open set before the
+ * engine's open; a volume open that failed early (its LOCK held) left it set, and the next engine open on the thread,
+ * of another database, obeyed it: turned the feed off and deleted its segments, or turned it on in a database that
+ * never had it. */
+static void test_want_leak(void)
+{
+    char a[PATH_MAX + 32], v[PATH_MAX + 32], b[PATH_MAX + 32];
+    for (int a_on = 0; a_on < 2; a_on++) {
+        fresh("leakA", a, sizeof a);
+        snprintf(v, sizeof v, "%s/leakAv", S);
+        sh("rm -rf '%s'; mkdir -p '%s'", v, v);
+        tsdb *t;
+        uint32_t idx;
+        CHECK(open_tsdb(a, &t) == 0 && tsdb_close(t) == 0);
+        CHECK(tsdb_volume_add_dir(a, v, &idx) == 0);
+        if (a_on)
+            CHECK(open_tsdb(a, &t) == 0 && tsdb_feed_enable(t, NULL) == 0 && tsdb_close(t) == 0);
+        /* B has the opposite: on when A is off (and retains a segment), off when A is on */
+        fresh("leakB", b, sizeof b);
+        eng *db;
+        uint32_t s;
+        CHECK(open_eng(b, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+        if (!a_on) {
+            CHECK(eng_feed_enable(db, NULL) == 0);
+            rows(db, s, T0, 20);
+            CHECK(eng_flush(db) == 0);
+        }
+        CHECK(eng_close(db) == 0);
+        char lp[PATH_MAX + 64];
+        snprintf(lp, sizeof lp, "%s/LOCK", v);
+        int lfd = open(lp, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        CHECK(lfd >= 0 && flock(lfd, LOCK_EX | LOCK_NB) == 0);
+        CHECK(open_tsdb(a, &t) != 0); /* the volume's open fails at its LOCK, after it set its wish */
+        close(lfd);
+        CHECK(open_tsdb(b, &t) == 0); /* the same thread */
+        CHECK(tsdb_close(t) == 0);
+        if (a_on) {
+            CHECK(vol_clean(b)); /* never turned on */
+        } else {
+            CHECK(vol_on(b) && count_prefix(b, "fwal_") >= 1); /* never turned off, its history kept */
+        }
+    }
+    printf("  open: a volume open that failed early does not leave its feed wish to the next open on the thread\n");
+}
+
+/* M1 of the review: a cleaner that failed to start (EMFILE) left the feed on without one, and a retry answered 0. */
+static void test_enable_cleaner_fail(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("encleaner", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    feed_opts fo = {.retention_s = 100000, .max_bytes = 600};
+    feed_test_cleaner_fail = 1;
+    CHECK(eng_feed_enable(db, &fo) != 0);
+    CHECK(!atomic_load(&db->feed_on) && !db->has_cleaner && vol_clean(dir)); /* all or nothing */
+    rows(db, s, T0, 10);
+    CHECK(eng_flush(db) == 0 && count_prefix(dir, "fwal_") == 0); /* off again: unlinked, not retained */
+    CHECK(eng_feed_enable(db, &fo) == 0 && atomic_load(&db->feed_on) && db->has_cleaner); /* the retry works */
+    make_segs(db, s, 10, T0 + 100000);
+    wait_segs(dir, 3, 5000);
+    CHECK(count_prefix(dir, "fwal_") <= 5); /* the size bound is kept: a cleaner runs */
+    CHECK(eng_close(db) == 0);
+    printf("  enable: a failed cleaner start rolls the enable back; the retry starts a cleaner\n");
+}
+
+/* M3 of the review: the cleaner read the oldest kept segment header by header at every pass. */
+static void test_fill_once(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("fillonce", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    feed_opts fo = {.retention_s = 100000};
+    CHECK(eng_feed_enable(db, &fo) == 0);
+    make_segs(db, s, 4, T0);
+    usleep(300000);
+    uint64_t f0 = __atomic_load_n(&feed_test_fills, __ATOMIC_RELAXED);
+    for (int i = 0; i < 6; i++) { /* six passes, nothing to remove */
+        feed_cleaner_wake(db);
+        usleep(150000);
+    }
+    uint64_t f1 = __atomic_load_n(&feed_test_fills, __ATOMIC_RELAXED);
+    CHECK(f1 - f0 == 0); /* it was read once (6 before the fix) */
+    CHECK(count_prefix(dir, "fwal_") == 4);
+    CHECK(eng_close(db) == 0);
+    printf("  cleaner: the oldest segment is read once, not at every pass\n");
+}
+
+/* M2 of the review: the floor is durable before any unlink. A cleaner killed right after its first unlink must have
+ * left a floor at or above the end of every segment that is gone (the checker compares with the last check). The
+ * planted mutant MUT_FEED_LATEFLOOR sets the floor after the unlinks and must fail this. */
+static bool mutant_latefloor;
+static void die_hook(void) { _exit(0); }
+
+static void test_floor_order(void)
+{
+    char dir[PATH_MAX + 32], why[512];
+    fresh("floororder", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    feed_opts fo = {.retention_s = 100000};
+    CHECK(eng_feed_enable(db, &fo) == 0);
+    make_segs(db, s, 6, T0);
+    CHECK(eng_close(db) == 0 && count_prefix(dir, "fwal_") == 6);
+    feedcheck_forget();
+    CHECK(feedcheck_dir(dir, false, why, sizeof why) == 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        __atomic_store_n(&free_pct_now, 5, __ATOMIC_RELAXED); /* pressure: all but the newest go, from the oldest */
+        if (mutant_latefloor)
+            eng_test_mutant = MUT_FEED_LATEFLOOR;
+        feed_test_unlink_hook(die_hook);
+        eng *c;
+        if (open_eng(dir, &c) != 0)
+            _exit(2);
+        sleep(10);
+        _exit(3);
+    }
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(count_prefix(dir, "fwal_") == 5 && !exists(dir, "fwal_0000000000000001.log")); /* died after the first */
+    int rc = feedcheck_dir(dir, false, why, sizeof why);
+    if (rc)
+        fprintf(stderr, "  floor order: %s\n", why);
+    CHECK(rc == 0);
+    fslots fs;
+    int fd = open(dir, O_RDONLY | O_DIRECTORY);
+    uint64_t f, l;
+    CHECK(fd >= 0 && fslots_read(fd, &fs) == 0 && seg_walk(dir, "fwal_0000000000000002.log", 2, &f, &l) > 0);
+    CHECK(fs.floor_event >= f - 1 && fs.floor_event >= 10); /* segment 1's 10 numbers are below it */
+    if (fd >= 0)
+        close(fd);
+    printf("  cleaner: killed after its first unlink, the floor already covers what is gone\n");
+}
+
+/* L2 of the review: a rename that failed at the open (wal_1) left the later replayed segment (wal_2) unsealed; the next
+ * flush renamed it into the feed with its torn tail. */
+static void test_stuck_seals_later(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("stuckseal", dir, sizeof dir);
+    eng *db;
+    CHECK(open_eng(dir, &db) == 0 && eng_feed_enable(db, NULL) == 0 && eng_close(db) == 0);
+    crash_writer(dir, 100, 0); /* wal_1 */
+    pid_t pid = fork();
+    if (pid == 0) { /* its open cannot rename wal_1: it stays, wal_2 is active; rows go to wal_2, then a kill */
+        fail_name = "wal_0000000000000001.log";
+        eng_test_retire_fail = fail_hook;
+        eng *c;
+        uint32_t s;
+        if (open_eng(dir, &c) != 0 || eng_series(c, "s", TSDB_FLOAT32, &s) != 0)
+            _exit(2);
+        rows(c, s, T0 + 500000, 30);
+        _exit(0);
+    }
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(exists(dir, "wal_0000000000000001.log") && exists(dir, "wal_0000000000000002.log"));
+    char p[PATH_MAX + 64];
+    snprintf(p, sizeof p, "%s/wal_0000000000000002.log", dir);
+    FILE *f = fopen(p, "ab"); /* a torn tail: the start of a record that never completed */
+    fwrite("\x07\x00\x00\x00garbage-of-a-torn-write", 1, 25, f);
+    fclose(f);
+    fail_name = "wal_0000000000000001.log";
+    eng_test_retire_fail = fail_hook;
+    CHECK(open_eng(dir, &db) == 0); /* wal_1 stuck again; wal_2 is replayed behind it */
+    eng_test_retire_fail = NULL;
+    fail_name = NULL;
+    uint32_t s;
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0 + 900000, 5);
+    CHECK(eng_flush(db) == 0); /* the flush renames both */
+    CHECK(exists(dir, "fwal_0000000000000001.log") && exists(dir, "fwal_0000000000000002.log"));
+    uint64_t a, b;
+    CHECK(seg_walk(dir, "fwal_0000000000000002.log", 2, &a, &b) > 0); /* whole: -1 with the garbage */
+    CHECK(eng_close(db) == 0);
+    printf("  open: a replayed segment behind a failed rename is sealed too\n");
 }
 
 static void test_power_replay(void)
@@ -1030,11 +1261,17 @@ int main(int argc, char **argv)
         child_replay(argv[3]);
         return 6;
     }
-    bool mutant = argc > 1 && strcmp(argv[1], "--mutant") == 0; /* a planted bug that the power-loss sweep must see */
+    /* `--mutant noseal|latefloor DIR`: a planted bug that one test must see (the Makefile expects the run to fail) */
+    const char *mutant = argc > 2 && strcmp(argv[1], "--mutant") == 0 ? argv[2] : NULL;
     const char *self = argv[0];
     if (mutant) {
-        argv++, argc--;
-        setenv("FEEDSTORE_MUTANT", "noseal", 1);
+        argv += 2, argc -= 2;
+        if (strcmp(mutant, "noseal") == 0)
+            setenv("FEEDSTORE_MUTANT", "noseal", 1);
+        else if (strcmp(mutant, "latefloor") == 0)
+            mutant_latefloor = true;
+        else
+            return 2;
     }
     snprintf(S, sizeof S, "%s", argc > 1 ? argv[1] : "/tmp");
     if (!realpath(self, SELF))
@@ -1042,8 +1279,11 @@ int main(int argc, char **argv)
     char *slash = strrchr(SELF, '/');
     snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
     feed_test_free_hook(free_hook, NULL); /* the machine's own free space must not decide (the rule is tested alone) */
-    if (mutant) { /* the replayed segment renamed without its fdatasync: only a power loss sees it */
-        test_power_replay();
+    if (mutant) {
+        if (mutant_latefloor)
+            test_floor_order(); /* the floor set after the unlinks */
+        else
+            test_power_replay(); /* the replayed segment renamed without its fdatasync: only a power loss sees it */
         printf(failures ? "FAILED: %d\n" : "all ok\n", failures);
         return failures != 0;
     }
@@ -1052,11 +1292,16 @@ int main(int argc, char **argv)
     test_replay();
     test_marker_close();
     test_open_stuck();
+    test_stuck_seals_later();
     test_collision();
     test_refusals();
     test_enable_disable();
+    test_enable_cleaner_fail();
     test_cleaner();
+    test_fill_once();
+    test_floor_order();
     test_two_volumes();
+    test_want_leak();
     test_new_id();
     test_slot_halves();
     test_feedcheck();

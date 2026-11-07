@@ -39,6 +39,11 @@
 
 static int (*free_hook)(void *, const char *, uint32_t *);
 static void *free_hook_ctx;
+static void (*unlink_hook)(void); /* tests: runs right after the cleaner's first unlink of a pass (it may _exit) */
+int feed_test_cleaner_fail;       /* tests: the next this-many cleaner starts fail (EMFILE in the field) */
+uint64_t feed_test_fills;         /* tests: how many segment files seg_fill has walked */
+
+void feed_test_unlink_hook(void (*fn)(void)) { unlink_hook = fn; }
 
 void feed_test_free_hook(int (*fn)(void *ctx, const char *dir, uint32_t *pct), void *ctx)
 {
@@ -91,6 +96,18 @@ void feed_index_add(eng *db, uint64_t seq, const fseg *info)
     pthread_mutex_unlock(&db->feed_lock);
 }
 
+/* Stores what a pass learned about a segment (size, and with `known` its first/last/hash), so that the next pass does
+ * not read the file again: the oldest kept segment is looked at by every pass for as long as it is the oldest. */
+static void index_update(eng *db, const fseg *s)
+{
+    pthread_mutex_lock(&db->feed_lock);
+    bool found;
+    size_t at = index_find_locked(db, s->seq, &found);
+    if (found)
+        db->fidx[at] = *s;
+    pthread_mutex_unlock(&db->feed_lock);
+}
+
 void feed_index_free(eng *db)
 {
     pthread_mutex_lock(&db->feed_lock);
@@ -134,6 +151,7 @@ static int seg_fill(eng *db, fseg *s)
         close(fd);
         return TSDB_ERR_IO;
     }
+    __atomic_fetch_add(&feed_test_fills, 1, __ATOMIC_RELAXED);
     uint8_t h[WAL_HDR];
     uint64_t off = 0, last_off = 0;
     bool any = false;
@@ -246,6 +264,7 @@ static int clean_pass(eng *db)
                 snap[i].seq = 0;
             } else {
                 snap[i].size = (uint64_t)sb.st_size;
+                index_update(db, &snap[i]);
             }
         }
         total += snap[i].size;
@@ -264,9 +283,12 @@ static int clean_pass(eng *db)
         if (pressure && k < CLEAN_BATCH) {
             why = true; /* free space beats age and size */
         } else {
-            if (!s->known && seg_fill(db, s) != 0) {
-                stop = true;
-                break;
+            if (!s->known) {
+                if (seg_fill(db, s) != 0) {
+                    stop = true;
+                    break;
+                }
+                index_update(db, s);
             }
             if (s->last <= floor || s->last_ms < now - ret_ms || bytes > cfg.max_bytes)
                 why = true;
@@ -283,14 +305,22 @@ static int clean_pass(eng *db)
         free(snap);
         return 0;
     }
-    if (!snap[last - 1].known && seg_fill(db, &snap[last - 1]) != 0) {
-        free(snap);
-        return 0;
+    if (!snap[last - 1].known) {
+        if (seg_fill(db, &snap[last - 1]) != 0) {
+            free(snap);
+            return 0;
+        }
+        index_update(db, &snap[last - 1]);
     }
-    rc = fslots_set_floor(db, snap[last - 1].last, (uint32_t)snap[last - 1].last_hash);
-    if (rc) {
-        free(snap);
-        return rc;
+    /* The floor is durable before any unlink: a consumer below it is told it fell behind, and never resumes across
+     * a segment that is gone. (MUT_FEED_LATEFLOOR plants the reverse order: tests/test_feedstore.c.) */
+    bool late_floor = eng_test_mutant == MUT_FEED_LATEFLOOR;
+    if (!late_floor) {
+        rc = fslots_set_floor(db, snap[last - 1].last, (uint32_t)snap[last - 1].last_hash);
+        if (rc) {
+            free(snap);
+            return rc;
+        }
     }
     size_t done = 0, gone = 0; /* the first `done` of [0, k) were handled; `gone` of them unlinked here */
     uint64_t gone_bytes = 0;
@@ -306,6 +336,12 @@ static int clean_pass(eng *db)
         }
         gone++;
         gone_bytes += snap[done].size;
+        if (unlink_hook && gone == 1)
+            unlink_hook();
+    }
+    if (late_floor && (rc = fslots_set_floor(db, snap[last - 1].last, (uint32_t)snap[last - 1].last_hash)) != 0) {
+        free(snap);
+        return rc;
     }
     /* forget what is gone, then make the unlinks durable with no feed_lock held */
     pthread_mutex_lock(&db->feed_lock);
@@ -354,9 +390,11 @@ int feed_cleaner_start(eng *db)
 {
     if (db->has_cleaner || db->opt.read_only)
         return 0;
-    int rc = index_scan(db);
-    if (rc)
+    int rc = feed_test_cleaner_fail > 0 ? (feed_test_cleaner_fail--, TSDB_ERR_IO) : index_scan(db);
+    if (rc) {
+        feed_index_free(db); /* a partial scan */
         return rc;
+    }
     db->cleaner_stop = false;
     if (tsdb_thread_create(&db->cleaner, cleaner_main, db) != 0)
         return TSDB_ERR_NOMEM;

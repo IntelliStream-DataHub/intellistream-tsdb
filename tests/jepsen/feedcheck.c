@@ -4,12 +4,19 @@
  * reader relies on:
  *   - every fwal_ segment is whole: valid to its last byte (a segment is sealed only after its data is synced, and a
  *     torn tail is cut first), so a reader never meets a record that was acknowledged to nobody;
- *   - the seqs above the floor are contiguous: the cleaner removes from the oldest, a rename keeps the order, so a gap is a lost
- *     segment. After a crash the check counts wal_ names too (the open renames them);
- *   - log numbers only increase across segments;
- *   - the floor (FEEDSLOTS) lies below the first number of the oldest segment above it: an event at or below it is
- *     gone and must not be claimed to be retained. Segments wholly below it are leftovers of a cleaner that died
- *     between making the floor durable and unlinking; they are ignored (the next pass removes them).
+ *   - log numbers only increase across segments. Seqs need not be contiguous: an empty newest wal_N that the open
+ *     unlinks leaves a gap (the next segment is N+1), and no event is lost by it. The reader (F3) relies on the log
+ *     numbers, not on seqs;
+ *   - nothing above the floor vanishes: the checker keeps, per directory, the last number of every segment it saw,
+ *     and a segment that was there at the previous check and is gone now must end at or below the floor (the
+ *     FEEDSLOTS floor is made durable before any unlink; a cleaner that unlinks first loses events silently, and a
+ *     consumer below the floor would resume across the gap). After a crash the check counts wal_ names too (the
+ *     open renames them: same seq);
+ *   - the floor (FEEDSLOTS) lies below the first number of the oldest segment above it. A segment that straddles it
+ *     is a violation when the cleaner moved the floor (it sets floor_check; its floor is the last number of a whole
+ *     segment) and fine when the floor is the one a live enable gave (floor_check 0: the active segment then holds
+ *     numbers on both sides, all of them intact). Segments wholly below the floor are leftovers of a cleaner that
+ *     died between making the floor durable and unlinking; they are ignored (the next pass removes them).
  * It reads files only, never opens the database.
  */
 #define _GNU_SOURCE
@@ -18,6 +25,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +33,22 @@
 #include <unistd.h>
 
 #define FC_MAX 4096
+
+/* What the previous check saw: (directory, seq, last number) of every segment with records. */
+struct fc_prev {
+    char dir[PATH_MAX];
+    uint64_t seq, last;
+};
+static struct fc_prev *fc_prevs;
+static size_t fc_nprev, fc_capprev;
+
+/* Forget what earlier checks saw (a test that rebuilds a directory by hand). */
+void feedcheck_forget(void)
+{
+    free(fc_prevs);
+    fc_prevs = NULL;
+    fc_nprev = fc_capprev = 0;
+}
 
 struct fc_seg {
     uint64_t seq;
@@ -113,8 +137,8 @@ int feedcheck_dir(const char *dir, bool crashed, char *why, size_t cap)
      * must be contiguous and whole in order. A segment that straddles the floor is a violation: the floor is the last
      * number of a whole segment. */
     uint64_t prev_last = 0;
-    int prev_i = -1;
     bool seen_records = false;
+    uint64_t *lasts = calloc((size_t)(n ? n : 1), sizeof *lasts); /* per segment, 0 without records */
     for (int i = 0; i < n && !rc; i++) {
         char name[64];
         uint64_t f, l;
@@ -123,6 +147,8 @@ int feedcheck_dir(const char *dir, bool crashed, char *why, size_t cap)
         else
             snprintf(name, sizeof name, "wal_%016" PRIx64 ".log", s[i].seq);
         int recs = fc_walk(dirfd, name, s[i].seq, &f, &l);
+        if (recs > 0 && lasts)
+            lasts[i] = l;
         if (recs == -2) { /* nothing runs a cleaner on a directory we check */
             snprintf(why, cap, "%s vanished during the check", name);
             rc = 1;
@@ -132,22 +158,15 @@ int feedcheck_dir(const char *dir, bool crashed, char *why, size_t cap)
                 snprintf(why, cap, "%s is torn or damaged", name);
                 rc = 1;
             }
-            prev_i = i;
         } else if (recs == 0 && s[i].retained) {
             snprintf(why, cap, "%s is retained but holds no record", name);
             rc = 1;
         } else if (recs > 0 && have_floor && l <= fs.floor_event) {
             continue; /* a leftover below the floor: not part of the history */
         } else {
-            if (recs > 0 && have_floor && f <= fs.floor_event) {
+            if (recs > 0 && have_floor && f <= fs.floor_event && fs.floor_check != 0) {
                 snprintf(why, cap, "%s (%" PRIu64 "..%" PRIu64 ") straddles the floor %" PRIu64, name, f, l,
                          fs.floor_event);
-                rc = 1;
-                break;
-            }
-            if (prev_i >= 0 && s[i].seq != s[prev_i].seq + 1) {
-                snprintf(why, cap, "segment seqs not contiguous above the floor: %s follows seq %" PRIu64, name,
-                         s[prev_i].seq);
                 rc = 1;
                 break;
             }
@@ -159,9 +178,47 @@ int feedcheck_dir(const char *dir, bool crashed, char *why, size_t cap)
                 seen_records = true;
                 prev_last = l;
             }
-            prev_i = i;
         }
     }
+    if (!rc && have_floor) { /* what the last check saw, that is gone now, must lie at or below the floor */
+        for (size_t j = 0; j < fc_nprev && !rc; j++) {
+            struct fc_prev *p = &fc_prevs[j];
+            if (strcmp(p->dir, dir) != 0 || p->last <= fs.floor_event)
+                continue;
+            bool there = false;
+            for (int i = 0; i < n; i++)
+                there = there || s[i].seq == p->seq;
+            if (!there) {
+                snprintf(why, cap, "segment %" PRIu64 " (ending at %" PRIu64 ") vanished above the floor %" PRIu64
+                         ": removed before the floor was durable", p->seq, p->last, fs.floor_event);
+                rc = 1;
+            }
+        }
+    }
+    if (!rc && have_floor && lasts) { /* remember this directory's segments for the next check */
+        size_t w = 0;
+        for (size_t j = 0; j < fc_nprev; j++)
+            if (strcmp(fc_prevs[j].dir, dir) != 0)
+                fc_prevs[w++] = fc_prevs[j];
+        fc_nprev = w;
+        for (int i = 0; i < n; i++) {
+            if (!lasts[i])
+                continue;
+            if (fc_nprev == fc_capprev) {
+                size_t cap2 = fc_capprev ? fc_capprev * 2 : 64;
+                struct fc_prev *np = realloc(fc_prevs, cap2 * sizeof *np);
+                if (!np)
+                    break;
+                fc_prevs = np;
+                fc_capprev = cap2;
+            }
+            struct fc_prev *p = &fc_prevs[fc_nprev++];
+            snprintf(p->dir, sizeof p->dir, "%s", dir);
+            p->seq = s[i].seq;
+            p->last = lasts[i];
+        }
+    }
+    free(lasts);
     if (!rc && have_floor) /* what it saw, for the run's report */
         snprintf(why, cap, "%d segments, %" PRIu64 " numbers kept, floor %" PRIu64 ", %" PRIu64 " floor generation", n,
                  seen_records ? prev_last - fs.floor_event : 0, fs.floor_event, fs.gen);

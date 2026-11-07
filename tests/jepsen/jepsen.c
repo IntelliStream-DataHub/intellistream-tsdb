@@ -9,8 +9,8 @@
  * Change feed (--feed; docs/design-cdc.md, step F1): before the first server the CLI (`tsdb DIR feed enable`) turns the
  * feed on, so every WAL segment the engine is done with is kept as fwal_<seq>.log instead of being unlinked. Before every
  * server start (the directory as the crash or the power loss left it) and after the final clean stop, tests/jepsen/
- * feedcheck.c checks what F2's reader relies on: every retained segment whole, seqs contiguous, numbers increasing, the
- * floor below the oldest kept number. The writes and reads are checked as without the flag: the feed adds no behaviour.
+ * feedcheck.c checks what F2's reader relies on: every retained segment whole, numbers increasing, nothing above the floor
+ * vanishing (a segment of the last check that is gone ends at or below the floor), the floor below the oldest kept number. The writes and reads are checked as without the flag: the feed adds no behaviour.
  *
  * Login (--auth): before the first server, the CLI (JEPSEN_TSDB, default ./build/tsdb) makes USERS in DIR: a
  * superuser, which tsdbd needs to start, and the user `kv` with read and write on prefix:jepsen., as which every
@@ -2294,7 +2294,7 @@ int main(int argc, char **argv)
                nemesis, seconds, nclients, restarts, ok, info, fail, rok, dels, reps);
     }
     if (feed)
-        printf("feed: %d directory checks (retained segments whole and contiguous, numbers increasing, floor below)\n",
+        printf("feed: %d directory checks (retained segments whole, numbers increasing, nothing lost above the floor)\n",
                feed_checks);
     if (crashfs && !md)
         printf("servers under the shim: %d faulty, %d clean (fallback after a failed start), %d died while starting\n",

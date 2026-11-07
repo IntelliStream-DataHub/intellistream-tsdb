@@ -1360,7 +1360,19 @@ docs/feed.md.
   the newest at once). A segment found at the open is read lazily (record header to record header, the last record's hash);
   the flush path does not yet pass its own numbers in (an optimisation, not a rule).
 - **Segments wholly below the floor** (a crash between the durable floor and the unlinks) are removed first, whatever
-  their age or size; `tests/jepsen/feedcheck.c` therefore ignores them and requires contiguity only above the floor.
+  their age or size; `tests/jepsen/feedcheck.c` therefore ignores them.
+- **What F3's reader relies on is the log number, not seq contiguity, and not "the floor is the end of a segment".** The
+  engine makes seq gaps without losing an event (an empty newest `wal_N` found at the open is unlinked and the next
+  segment is N+1, because `max_seq` counted it), and a live enable's floor (`fno_next - 1`, `floor_check` 0) lies inside
+  the active segment, which is later retained whole. So `feedcheck` accepts both, and instead requires that a segment seen at
+  the previous check and gone now ends at or below the floor (the floor is durable before any unlink; a cleaner that
+  unlinks first fails this, `test_feedstore --mutant latefloor`). A straddle is a violation only when the cleaner set the
+  floor (`floor_check != 0`). A lost segment that was created and lost between two checks is not seen.
+- **The open's wish** (on or off, from the root) for a volume's engine is a thread-local that `eng_open_sched` takes as its
+  first statement, before any step that can fail (a volume open that failed at its LOCK left it for the next open on the
+  thread, of any database). `tsdb_volume_reopen` sets it from the root too. **A failed cleaner start** rolls an enable back
+  (a feed that is on without a cleaner fills the disk, F18), and a repeated enable starts a missing cleaner. **The cleaner
+  stores what it learned** about a segment (size, last record) in the index, so the oldest kept segment is read once.
 - **Enable order** is per volume: the word in META, then FEEDSLOTS, then FEED, with a directory fsync between each (all
   through `eng_sync_dir` in a live engine); disable is the reverse (FEED first). Across volumes the root decides, in both
   directions: a writer's open brings every volume to the root's state (root on, volume without FEED: enable before its WAL

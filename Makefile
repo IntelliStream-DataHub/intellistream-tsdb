@@ -266,7 +266,8 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_fno $(or $(TMPDIR),/tmp)
 	for m in reuse manifest markers nosync; do ! ./$(B)/test_fno --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_feedstore $(or $(TMPDIR),/tmp)
-	! ./$(B)/test_feedstore --mutant $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # a replayed segment renamed without its fdatasync must fail it
+	! ./$(B)/test_feedstore --mutant noseal $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # a replayed segment renamed without its fdatasync must fail it
+	! ./$(B)/test_feedstore --mutant latefloor $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # the cleaner's floor set after its unlinks must fail it
 	./$(B)/test_crafted
 	./$(B)/test_gindex
 	./$(B)/test_stats

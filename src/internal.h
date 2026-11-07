@@ -48,7 +48,7 @@ typedef struct eng eng;
 #define PART_HDR_V8 24 /* the header of a part written at format 8 */
 /* Planted mutations: a test sets eng_test_mutant (tests link the engine) and must then fail, to show that it
  * catches the bug; nothing in the library or the server ever sets it. */
-enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL };
+enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536

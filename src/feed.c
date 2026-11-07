@@ -31,10 +31,14 @@ void eng_set_open_feed_want(int want, const feed_opts *o)
         open_opts = *o;
 }
 
-int eng_take_open_feed_want(void)
+/* The first thing an open does, before any step that can fail: a want left set by an open that failed early would
+ * be obeyed by the next open on this thread, whichever database that is. */
+int eng_take_open_feed_want(feed_opts *o)
 {
     int w = open_want;
     open_want = -1;
+    *o = open_opts;
+    memset(&open_opts, 0, sizeof open_opts);
     return w;
 }
 
@@ -43,14 +47,12 @@ static void feed_fail_log(eng *db, const char *what, int rc)
     fprintf(stderr, "tsdb: %s: the change feed: %s failed (%d)\n", db->dir, what, rc);
 }
 
-int feed_open_reconcile(eng *db, int want)
+int feed_open_reconcile(eng *db, int want, const feed_opts *wanted)
 {
     feed_state st;
     int rc = feed_dir_state(db->dirfd, &st);
     if (rc)
         return rc;
-    feed_opts wanted = open_opts;
-    memset(&open_opts, 0, sizeof open_opts);
     if (db->opt.read_only) { /* judged by its own files; a reader writes nothing */
         if (st.feed && st.word) {
             if ((rc = feed_cfg_read(db->dirfd, &db->feed)) != 0) {
@@ -106,7 +108,7 @@ int feed_open_reconcile(eng *db, int want)
     /* the database has it on and this volume does not yet: made once the volume's numbers are known (feed_open_numbers),
      * before its WAL replay, with a fresh feed_id (nobody holds a cursor of it) */
     db->feed_enable_pending = true;
-    db->feed_new_opts = wanted;
+    db->feed_new_opts = *wanted;
     return 0;
 }
 
@@ -162,13 +164,17 @@ int eng_feed_enable(eng *db, const feed_opts *o)
         if ((rc = feed_dir_enable(&fd, &cfg, floor)) == 0 && (rc = feed_cfg_read(db->dirfd, &db->feed)) == 0 &&
             (rc = fslots_open(db)) == 0) {
             atomic_store(&db->feed_on, true); /* after FEED is durable: from here a flush renames, not unlinks */
-            rc = feed_cleaner_start(db);
+            if ((rc = feed_cleaner_start(db)) != 0)
+                atomic_store(&db->feed_on, false); /* on without a cleaner fills the disk (F18): all or nothing */
         }
         if (rc && !atomic_load(&db->feed_on)) { /* a partial enable must not be found as "on" at a later open */
             fslots_close(db);
+            feed_index_free(db);
             if (eng_check(db) == 0 && feed_dir_disable(&fd) != 0)
                 eng_fail(db, "rolling back a failed enable of the change feed", EIO);
         }
+    } else if (rc == 0) {
+        rc = feed_cleaner_start(db); /* already on: a cleaner that is missing is started (a no-op when it runs) */
     }
     pthread_mutex_unlock(&db->flush_lock);
     return rc;
