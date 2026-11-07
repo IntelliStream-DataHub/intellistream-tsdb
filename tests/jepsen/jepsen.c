@@ -96,6 +96,14 @@
  *     w although the two overlap in time; 1 and 4 hold for those pairs too (a
  *     small write acknowledged while a large write was between its memtable
  *     flush and its publish once kept winning over it).
+ * Nulls and QUERY_LATEST (kv, except under misdirect, rot and outage): a null write puts nulls at every key of a
+ * range near the top of a series; for checks 1-5 it is a delete (reads show no value there). Clients also ask for
+ * the newest row of every series (with or without nulls, sometimes before an end), and check_latest tests every
+ * answer against what is certain: it is a row some write wrote and not a stale one (L1, L2), and no key above it,
+ * before the end, holds a row an acknowledged write put there that nothing could have removed (L3). The final reads
+ * then fix every series' rows, and the final server must answer the latest of each exactly (final_latest, also after
+ * the clean restart, which builds the table anew). tests/jepsen/mutant-latest.sh plants stale table entries in
+ * tsdbd: the check must fail them.
  * Deletes and replaces clear a key range of one series (a replace writes its
  * keys in that range in the same step). A key may then be absent where the
  * checks above want a value, if a delete covering it that did not definitely
@@ -113,6 +121,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -152,17 +161,32 @@
 
 typedef enum { ST_PENDING, ST_OK, ST_FAIL, ST_INFO } status;
 
-enum { W_INSERT, W_DELETE, W_REPLACE };
+/* W_NULL: nulls at every key of [lo, hi) (the keys list stays empty). For the checks it is a delete (reads show no
+ * value there, and everything older in the range is hidden); the latest check tells it apart (a null is a row). */
+enum { W_INSERT, W_DELETE, W_REPLACE, W_NULL };
 
 typedef struct wop {
     int series;
-    int kind;       /* W_*: a delete or replace also clears [lo, hi) of the series */
+    int kind;       /* W_*: a delete, replace or null write also clears [lo, hi) of the series */
     uint32_t lo, hi;
     uint32_t *keys;
     uint32_t nkeys;
     int64_t invoke, complete; /* ns */
     status st;
 } wop;
+
+/* QUERY_LATEST: the newest row of one series (a request asks for all of them: one lop each, the same times) */
+typedef struct lop {
+    int series;
+    bool with_nulls;
+    int64_t end;       /* rows before it: a key's timestamp, or INT64_MAX */
+    int64_t invoke, complete;
+    status st;
+    int kind;          /* tsdb_latest_kind of the answer */
+    int64_t ts;
+    uint32_t val;      /* the write id the value names (kind VALUE) */
+    int rstatus;       /* the record's status */
+} lop;
 
 typedef struct rop {
     int series;
@@ -193,6 +217,10 @@ static wop *writes; /* indexed by write id; id 0 unused */
 static atomic_uint nwrites = 1;
 static rop *reads;
 static atomic_uint nreads;
+#define MAX_LATEST 1000000
+static lop *lats;               /* kv without damage or outage: QUERY_LATEST answers, checked by check_latest */
+static atomic_uint nlats;
+static bool latest_on;
 static atomic_bool stop;
 static atomic_int server_pid;
 static pthread_mutex_t server_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -609,7 +637,7 @@ static void *follower_reader(void *arg)
                 for (size_t i = 0; i < p.n; i++) {
                     int64_t k = ts_key(q->series, p.ts[i]);
                     if (k >= q->lo && k < q->hi)
-                        q->seen[k - q->lo] = (uint32_t)p.values[i];
+                        q->seen[k - q->lo] = isnan(p.values[i]) ? 0 : (uint32_t)p.values[i]; /* a null shows as absent */
                     else
                         q->stray = true;
                 }
@@ -715,6 +743,76 @@ static void *client(void *arg)
                 tsdbc_close(c);
                 c = connect_retry();
             }
+        } else if (latest_on && (r >> 8) % 100 < 12) { /* nulls over a key range, near the top: the newest row's null */
+            uint32_t id = atomic_fetch_add(&nwrites, 1);
+            if (id >= MAX_OPS)
+                break;
+            wop *w = &writes[id];
+            w->series = s;
+            w->kind = W_NULL;
+            uint32_t top = (r >> 20) % 100 < 70 ? 40 : nkeys[s];
+            w->hi = nkeys[s] - (uint32_t)(mix(r + 3) % top);
+            uint32_t len = 1 + (uint32_t)(mix(r + 4) % ((r >> 30) % 4 ? 6 : 120));
+            w->lo = w->hi > len ? w->hi - len : 0;
+            w->keys = malloc(sizeof *w->keys);
+            w->nkeys = 0;
+            uint32_t n = w->hi - w->lo;
+            int64_t *ts = malloc(n * sizeof *ts);
+            float *v = malloc(n * sizeof *v);
+            for (uint32_t k = w->lo; k < w->hi; k++) {
+                ts[k - w->lo] = key_ts(s, k);
+                uint32_t nb = TSDB_NULL_F32_BITS;
+                memcpy(&v[k - w->lo], &nb, sizeof nb);
+            }
+            w->invoke = now_ns();
+            int rc = tsdbc_insert_series(c, ids[s], ts, v, n);
+            w->complete = now_ns();
+            w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
+            outage_note(s, rc);
+            free(ts);
+            free(v);
+            if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
+                if (rc == TSDB_ERR_CORRUPT)
+                    atomic_fetch_add(&write_damage, 1);
+                tsdbc_close(c);
+                c = connect_retry();
+            }
+        } else if (latest_on && (r >> 8) % 100 < 20) { /* the newest row of every series, in one request */
+            uint32_t base = atomic_fetch_add(&nlats, (uint32_t)nseries);
+            if (base + (uint32_t)nseries > MAX_LATEST)
+                break;
+            bool wn = (r >> 14) % 2;
+            int64_t end = (r >> 15) % 3 ? INT64_MAX : key_ts(s, (uint32_t)(mix(r + 9) % nkeys[s]));
+            tsdb_latest_result out[MAX_SERIES];
+            tsdb_latest_opts o = {.end = end, .ends = NULL, .with_nulls = wn, .threads = 0};
+            int64_t t0 = now_ns();
+            int rc = tsdbc_latest(c, ids, (size_t)nseries, &o, out);
+            int64_t t1 = now_ns();
+            for (int i = 0; i < nseries; i++) {
+                lop *l = &lats[base + (uint32_t)i];
+                l->series = i;
+                l->with_nulls = wn;
+                l->end = end;
+                l->invoke = t0;
+                l->complete = t1;
+                l->st = rc == 0 ? ST_OK : ST_FAIL;
+                if (rc == 0) {
+                    l->rstatus = out[i].status;
+                    l->kind = out[i].kind;
+                    l->ts = out[i].ts;
+                    l->val = out[i].kind == TSDB_LATEST_VALUE ? (uint32_t)out[i].v.f32 : 0;
+                }
+            }
+            if (rc != 0) {
+                if (rc == TSDB_ERR_CORRUPT)
+                    atomic_fetch_add(&read_damage, 1);
+                if (rc == TSDB_ERR_UNAVAILABLE) {
+                    usleep(2000);
+                } else {
+                    tsdbc_close(c);
+                    c = connect_retry();
+                }
+            }
         } else if ((r >> 8) % 100 < 60) { /* a write */
             uint32_t n = (r >> 16) % 100 < 85 ? 1 + (uint32_t)((r >> 24) % 20) : 400 + (uint32_t)((r >> 24) % 2600);
             uint32_t id = atomic_fetch_add(&nwrites, 1);
@@ -728,6 +826,8 @@ static void *client(void *arg)
             /* distinct keys: a random start and stride */
             uint32_t lim = key_limit(s), stride = 1 + (uint32_t)(mix(r + 2) % 7);
             uint32_t start = pick_key(s, mix(r + 1), mix(r + 7), near_pct(s)), m = 0;
+            if (latest_on && (mix(r + 8) % 100) < 25) /* the newest rows are what latest answers: write there often */
+                start = lim - 1 - (uint32_t)(mix(r + 10) % 60);
             if (classes && n > 20 && (mix(r + 7) % 100) < (uint64_t)near_pct(s)) /* large: ending at the frontier */
             {
                 uint32_t span = n * stride, jitter = (uint32_t)(mix(r + 1) % CL_NEAR);
@@ -779,7 +879,7 @@ static void *client(void *arg)
                 for (size_t i = 0; i < p.n; i++) {
                     int64_t k = ts_key(s, p.ts[i]);
                     if (k >= q->lo && k < q->hi)
-                        q->seen[k - q->lo] = (uint32_t)p.values[i];
+                        q->seen[k - q->lo] = isnan(p.values[i]) ? 0 : (uint32_t)p.values[i]; /* a null shows as absent */
                     else
                         q->stray = true; /* a row at no key: invalid */
                 }
@@ -1261,6 +1361,162 @@ static bool absent_ok(int series, uint32_t k, int64_t after, int64_t before)
     return false;
 }
 
+/* QUERY_LATEST answers (lats), against the writes. The model: a key holds a value row (an insert, or a replace that
+ * wrote it), a null row (a null write), or nothing (a delete, or a replace that did not write it); the newest row of
+ * a series is the highest key before `end` that holds a value (or, with nulls, any row). Per answer (series s,
+ * invoked at I, completed at C), all of it only from what is certain:
+ *  L1 the answer is real: a value is that of a write that wrote the key it names, began before C and did not
+ *     definitely fail; a null names a key some null write covers (same conditions); the key is before `end`;
+ *  L2 not stale at its own key: no write that was acknowledged before I and began after the value's write
+ *     completed covers the key (it would have replaced the value, hidden or removed it); a null likewise against
+ *     the null writes that could be its row;
+ *  L3 nothing newer: no key between the answer and `end` (all keys below it when the answer is none) holds a row
+ *     that an acknowledged write (completed before I) put there, unless a write that could be ordered after it and
+ *     began before C removes it: deletes and replaces always; null writes too when the answer skips nulls. */
+static bool latest_removes(int series, uint32_t k, int64_t after, int64_t before, bool nulls_remove)
+{
+    size_t slot = koff[series] + k;
+    for (uint32_t i = dcnt[slot]; i < dcnt[slot + 1]; i++) {
+        const wop *d = &writes[dlist[i]];
+        if ((nulls_remove || d->kind != W_NULL) && d->st != ST_FAIL && d->complete >= after && d->invoke <= before)
+            return true;
+    }
+    return false;
+}
+
+/* What write w leaves at key k: 1 a value, 2 a null, 0 nothing. incover: w is in the cover list of k (an insert
+ * there wrote it: no search of its keys, which a large insert has thousands of). */
+static int row_of(const wop *w, uint32_t k, bool incover)
+{
+    if (w->kind == W_NULL)
+        return k >= w->lo && k < w->hi ? 2 : 0;
+    if (w->kind == W_DELETE)
+        return 0;
+    if (w->kind == W_INSERT && incover)
+        return 1;
+    for (uint32_t i = 0; i < w->nkeys; i++)
+        if (w->keys[i] == k)
+            return 1;
+    return 0;
+}
+
+static int latest_ok_answers, latest_violations;
+
+static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
+{
+    uint32_t nl = atomic_load(&nlats);
+    if (nl > MAX_LATEST)
+        nl = MAX_LATEST;
+    for (uint32_t i = 0; i < nl; i++) {
+        const lop *l = &lats[i];
+        if (l->st != ST_OK)
+            continue;
+        int s = l->series;
+        latest_ok_answers++;
+        int before = violations;
+#define LVIOL(...)                                                                                                    \
+    do {                                                                                                              \
+        char lm_[400];                                                                                                \
+        snprintf(lm_, sizeof lm_, __VA_ARGS__);                                                                       \
+        VIOLATION("latest %u (series %d, with_nulls %d, end %lld, %lld..%lld): %s", i, s, l->with_nulls,              \
+                  (long long)(l->end == INT64_MAX ? -1 : l->end), (long long)l->invoke, (long long)l->complete, lm_); \
+    } while (0)
+        if (l->rstatus != 0) {
+            LVIOL("status %d for a series that exists and that the user may read\n", l->rstatus);
+            goto next;
+        }
+        int64_t ak = -1; /* the answer's key */
+        if (l->kind == TSDB_LATEST_NONE) {
+            /* nothing: L3 below with every key */
+        } else if (l->kind != TSDB_LATEST_VALUE && l->kind != TSDB_LATEST_NULL) {
+            LVIOL("kind %d\n", l->kind);
+            goto next;
+        } else if (l->kind == TSDB_LATEST_NULL && !l->with_nulls) {
+            LVIOL("a null without asking for nulls\n");
+            goto next;
+        } else if ((ak = ts_key(s, l->ts)) < 0 || l->ts >= l->end) {
+            LVIOL("a row at %lld, which is no key or not before the end\n", (long long)l->ts);
+            goto next;
+        } else {
+            uint32_t k = (uint32_t)ak;
+            size_t slot = koff[s] + k, n = wc[slot + 1] - wc[slot];
+            const uint32_t *cov = wl + wc[slot];
+            if (l->kind == TSDB_LATEST_VALUE) {
+                uint32_t v = l->val;
+                if (v == 0 || v >= nw || writes[v].series != s || row_of(&writes[v], k, false) != 1 ||
+                    writes[v].st == ST_FAIL || writes[v].invoke > l->complete) {
+                    LVIOL("value %u at key %u: no such write, or it did not write that key, failed or began later\n", v,
+                          k);
+                    goto next;
+                }
+                for (size_t j = 0; j < n; j++) {
+                    const wop *w = &writes[cov[j]];
+                    if (cov[j] != v && w->st == ST_OK && w->complete < l->invoke && older(v, cov[j])) {
+                        LVIOL("value %u at key %u, but write %u (%s) was acknowledged before the request and began "
+                              "after %u completed: stale\n",
+                              v, k, cov[j], w->kind == W_INSERT ? "insert" : w->kind == W_NULL ? "null" : "delete or replace", v);
+                        break;
+                    }
+                }
+            } else {
+                bool any = false;
+                for (size_t j = 0; j < n; j++)
+                    if (row_of(&writes[cov[j]], k, true) == 2 && writes[cov[j]].st != ST_FAIL &&
+                        writes[cov[j]].invoke <= l->complete)
+                        any = true;
+                if (!any) {
+                    LVIOL("a null at key %u, which no null write could have put there\n", k);
+                    goto next;
+                }
+                for (size_t j = 0; j < n; j++) {
+                    const wop *w = &writes[cov[j]];
+                    if (w->st != ST_OK || w->complete >= l->invoke)
+                        continue;
+                    bool all_older = true; /* every null write that could be the row is older than w */
+                    for (size_t x = 0; x < n && all_older; x++)
+                        if (row_of(&writes[cov[x]], k, true) == 2 && writes[cov[x]].st != ST_FAIL &&
+                            writes[cov[x]].invoke <= l->complete && !older(cov[x], cov[j]))
+                            all_older = false;
+                    if (all_older && row_of(w, k, true) != 2) {
+                        LVIOL("a null at key %u, but write %u was acknowledged before the request and began after "
+                              "every null write of the key completed: stale\n", k, cov[j]);
+                        break;
+                    }
+                }
+            }
+        }
+        if (violations > before)
+            goto next;
+        /* L3: a row above the answer that must exist */
+        uint32_t top = nkeys[s];
+        while (top > 0 && key_ts(s, top - 1) >= l->end)
+            top--;
+        for (int64_t k = (int64_t)top - 1; k > ak; k--) {
+            size_t slot = koff[s] + (size_t)k, n = wc[slot + 1] - wc[slot];
+            const uint32_t *cov = wl + wc[slot];
+            for (size_t j = 0; j < n; j++) {
+                const wop *w = &writes[cov[j]];
+                int row = row_of(w, (uint32_t)k, true);
+                if (w->st != ST_OK || w->complete >= l->invoke || row == 0 || (row == 2 && !l->with_nulls))
+                    continue;
+                if (latest_removes(s, (uint32_t)k, w->invoke, l->complete, !l->with_nulls))
+                    continue;
+                LVIOL("%s at key %lld (write %u, acknowledged before the request), newer than the answer (%s%s key "
+                      "%lld): stale or missing\n", row == 1 ? "a value" : "a null", (long long)k, cov[j],
+                      l->kind == TSDB_LATEST_NONE ? "none" : l->kind == TSDB_LATEST_NULL ? "null at" : "value at",
+                      "", (long long)ak);
+                break;
+            }
+            if (violations > before)
+                break;
+        }
+#undef LVIOL
+    next:
+        if (violations > before)
+            latest_violations++;
+    }
+}
+
 static int check(const uint32_t *final)
 {
     uint32_t nw = atomic_load(&nwrites), nr = atomic_load(&nreads);
@@ -1332,9 +1588,10 @@ static int check(const uint32_t *final)
     lb = malloc(nw * sizeof *lb);
     for (uint32_t w = 0; w < nw; w++)
         lb[w] = w ? writes[w].invoke : INT64_MIN;
+    uint32_t *wc, *wl; /* per key, the writes that cover it (not failed), by start time: check_latest reads them too */
     {
-        /* per key, the writes that cover it, by start time */
-        uint32_t *wc = calloc(koff[nseries] + 1, sizeof *wc), *wf = calloc(koff[nseries], sizeof *wf);
+        wc = calloc(koff[nseries] + 1, sizeof *wc);
+        uint32_t *wf = calloc(koff[nseries], sizeof *wf);
         size_t nwk = 0;
         for (uint32_t w = 1; w < nw; w++) {
             const wop *o = &writes[w];
@@ -1349,7 +1606,7 @@ static int check(const uint32_t *final)
         }
         for (size_t x = 1; x <= koff[nseries]; x++)
             wc[x] += wc[x - 1];
-        uint32_t *wl = malloc((nwk + 1) * sizeof *wl);
+        wl = malloc((nwk + 1) * sizeof *wl);
         for (uint32_t w = 1; w < nw; w++) {
             const wop *o = &writes[w];
             if (o->st == ST_FAIL)
@@ -1400,9 +1657,7 @@ static int check(const uint32_t *final)
                         lb[a[j]] = q->invoke;
             }
         }
-        free(wl);
         free(wf);
-        free(wc);
     }
     /* 1. durability and order */
     int before_loss = violations;
@@ -1569,6 +1824,10 @@ static int check(const uint32_t *final)
     free(fill);
     free(cnt);
     loss_violations = violations - before_loss;
+    if (latest_on)
+        check_latest(nw, wc, wl);
+    free(wl);
+    free(wc);
     free(applied);
     free(dcnt);
     free(dlist);
@@ -1592,7 +1851,7 @@ static int follower_state(uint32_t *out)
         for (size_t i = 0; i < p.n; i++) {
             int64_t k = ts_key(s, p.ts[i]);
             if (k >= 0)
-                out[koff[s] + k] = (uint32_t)p.values[i];
+                out[koff[s] + k] = isnan(p.values[i]) ? 0 : (uint32_t)p.values[i];
             else
                 out[koff[s]] = UINT32_MAX; /* a row at no key: never the writer's state */
         }
@@ -1676,6 +1935,47 @@ static int check_follower(const uint32_t *final)
 }
 
 static int stray_rows; /* rows at no key in a final read */
+static uint8_t *fnull; /* final_state: the keys that hold a null row */
+static int latest_final_checked, latest_final_problems; /* the final latest answers against the final rows */
+
+/* The final state, quiet: what QUERY_LATEST must say for every series, with and without nulls, and as of a few ends,
+ * is worked out from the rows just read. The first server since the open's table build and the warmer. */
+static void final_latest(tsdbc *c, const uint32_t *final)
+{
+    for (int variant = 0; variant < 8; variant++) {
+        bool wn = variant & 1;
+        int64_t end = variant < 4 ? INT64_MAX : key_ts(0, (uint32_t)(nkeys[0] * (uint32_t)(variant - 3) / 5));
+        tsdb_latest_result out[MAX_SERIES];
+        tsdb_latest_opts o = {.end = end, .ends = NULL, .with_nulls = wn, .threads = 0};
+        int rc = tsdbc_latest(c, ids, (size_t)nseries, &o, out);
+        if (rc != 0) {
+            VIOLATION("final latest request failed: %s\n", tsdbc_strerror(rc));
+            latest_final_problems++;
+            return;
+        }
+        for (int s = 0; s < nseries; s++) {
+            int64_t want_k = -1;
+            for (int64_t k = (int64_t)nkeys[s] - 1; k >= 0 && want_k < 0; k--)
+                if (key_ts(s, (uint32_t)k) < end && (final[koff[s] + k] || (wn && fnull[koff[s] + k])))
+                    want_k = k;
+            int want_kind = want_k < 0 ? TSDB_LATEST_NONE : final[koff[s] + want_k] ? TSDB_LATEST_VALUE : TSDB_LATEST_NULL;
+            const tsdb_latest_result *a = &out[s];
+            latest_final_checked++;
+            bool bad = a->status != 0 || a->kind != want_kind ||
+                       (want_k >= 0 && (a->ts != key_ts(s, (uint32_t)want_k) ||
+                                        (want_kind == TSDB_LATEST_VALUE &&
+                                         (uint32_t)a->v.f32 != final[koff[s] + want_k])));
+            if (bad) {
+                latest_final_problems++;
+                VIOLATION("final latest of series %d (with_nulls %d, end %lld): status %d kind %d ts %lld value %u, "
+                          "the rows say kind %d at key %lld (ts %lld, value %u)\n",
+                          s, wn, (long long)end, a->status, a->kind, (long long)a->ts, (uint32_t)a->v.f32, want_kind,
+                          (long long)want_k, want_k >= 0 ? (long long)key_ts(s, (uint32_t)want_k) : 0LL,
+                          want_k >= 0 ? final[koff[s] + want_k] : 0);
+            }
+        }
+    }
+}
 
 static int final_state(uint32_t *final)
 {
@@ -1689,6 +1989,7 @@ static int final_state(uint32_t *final)
         exit(2);
     }
     memset(final, 0, koff[nseries] * sizeof *final);
+    memset(fnull, 0, koff[nseries]);
     for (int s = 0; s < nseries; s++) {
         tsdb_points p;
         int rc = tsdbc_query_points(c, ids[s], INT64_MIN, INT64_MAX, &p);
@@ -1716,14 +2017,18 @@ static int final_state(uint32_t *final)
         }
         for (size_t i = 0; i < p.n; i++) {
             int64_t k = ts_key(s, p.ts[i]);
-            if (k >= 0)
-                final[koff[s] + k] = (uint32_t)p.values[i];
+            if (k >= 0) {
+                final[koff[s] + k] = isnan(p.values[i]) ? 0 : (uint32_t)p.values[i];
+                fnull[koff[s] + k] = isnan(p.values[i]);
+            }
             else if (stray_rows++ < 5)
                 fprintf(stderr, "  final: series %d has a row at %lld, which no write used\n", s, (long long)p.ts[i]);
         }
         free(p.ts);
         free(p.values);
     }
+    if (latest_on)
+        final_latest(c, final);
     tsdbc_close(c);
     return 0;
 }
@@ -2143,8 +2448,15 @@ int main(int argc, char **argv)
     unlink(slogpath);
     writes = calloc(MAX_OPS, sizeof *writes);
     reads = calloc(MAX_OPS, sizeof *reads);
+    /* QUERY_LATEST: with nulls written and every answer checked against the acknowledged writes. Not where damage is
+     * injected (a damaged part may decode to wrong rows, which the reads count as known) nor under outage (a volume is
+     * away for seconds: its series answer UNAVAILABLE, which only the volume's own calls expect) nor in classes. */
+    latest_on = !classes && !md && !rot && !outage;
+    if (latest_on)
+        lats = calloc(MAX_LATEST, sizeof *lats);
     nseries = classes ? CL_SERIES : NSERIES;
     make_keys();
+    fnull = calloc(koff[nseries] + 1, 1);
     if (auth && make_users())
         return 2;
     if (outage && make_volumes())
@@ -2223,11 +2535,12 @@ int main(int argc, char **argv)
     pthread_mutex_unlock(&server_lock);
 
     uint32_t nw = atomic_load(&nwrites) - 1, nr = atomic_load(&nreads);
-    unsigned ok = 0, info = 0, fail = 0, rok = 0, dels = 0, reps = 0;
+    unsigned ok = 0, info = 0, fail = 0, rok = 0, dels = 0, reps = 0, nulls_ok = 0;
     for (uint32_t w = 1; w <= nw && w < MAX_OPS; w++) {
         ok += writes[w].st == ST_OK, info += writes[w].st == ST_INFO, fail += writes[w].st == ST_FAIL;
         dels += writes[w].kind == W_DELETE && writes[w].st == ST_OK;
         reps += writes[w].kind == W_REPLACE && writes[w].st == ST_OK;
+        nulls_ok += writes[w].kind == W_NULL && writes[w].st == ST_OK;
     }
     for (uint32_t i = 0; i < nr && i < MAX_OPS; i++)
         rok += reads[i].st == ST_OK;
@@ -2244,6 +2557,14 @@ int main(int argc, char **argv)
     if (stray_rows)
         VIOLATION("%d rows at timestamps no write used in the final reads\n", stray_rows);
     int v = check(damaged ? NULL : final); /* counts the follower's violations too */
+    if (latest_on) {
+        printf("latest: %u null writes ok, %d answers checked, %d final answers checked, %d answers wrong\n", nulls_ok,
+               latest_ok_answers, latest_final_checked, latest_violations + latest_final_problems);
+        if (seconds >= 10 && latest_ok_answers == 0) {
+            fprintf(stderr, "  no latest request was answered in %.0f s: the check tested nothing\n", seconds);
+            v++;
+        }
+    }
     if (md || rot)
         v = epoch_report(v, ok);
     if (classes)

@@ -866,7 +866,8 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 	        --seconds $(call jsec,20) --seed 1 --crashfs $(B)/libcrashfs.so || exit 1; done
 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
-# power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too.
+# power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too. A tsdbd with a stale
+# entry in its latest table (three mutants, built from a copy of the tree) fails the kv run's latest check.
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
@@ -880,6 +881,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --mutant-longnap 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'restarts in .* it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 
 # Build and test on AlmaLinux 10 (the main target OS) in Podman; takes minutes, logs in $LOGDIR.

@@ -16,6 +16,8 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # kv also with login on (jepsen --auth) under kill and power, on each backend;
                           # JEPSEN_SECONDS=300 makes every run that long (the weekly CI run)
                           # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
+                          # (kv also writes nulls and checks every QUERY_LATEST answer, and the final ones; tests/jepsen/mutant-latest.sh
+                          # plants stale latest-table entries in tsdbd, which the check must fail: jepsen-selftest runs it)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
