@@ -713,6 +713,110 @@ static void test_residency(const char *base)
     tsdb_close(db);
 }
 
+/* ------------------------------------------------------------------------ lazy start and races */
+
+typedef struct race_ctx {
+    tsdb *db;
+    const tsdb_sid *ids;
+    int n;
+    atomic_bool stop;
+    atomic_int errs;
+} race_ctx;
+
+static void *race_reader(void *arg)
+{
+    race_ctx *c = arg;
+    uint64_t x = (uint64_t)(uintptr_t)&x | 1;
+    while (!atomic_load(&c->stop)) {
+        x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+        if (tsdb_query_values(c->db, c->ids[x % (uint64_t)c->n], INT64_MIN, INT64_MAX, NULL, q_cb, NULL) != 0)
+            atomic_fetch_add(&c->errs, 1);
+        tsdb_hot start[1];
+        size_t n;
+        uint64_t thr;
+        if ((x & 63) == 0 && tsdb_hot_series(c->db, TSDB_HOT_READS, start, 1, &n, &thr) != 0)
+            atomic_fetch_add(&c->errs, 1);
+    }
+    return NULL;
+}
+
+static void *race_writer(void *arg)
+{
+    race_ctx *c = arg;
+    for (int round = 0; !atomic_load(&c->stop); round++) {
+        for (int i = 0; i < c->n && !atomic_load(&c->stop); i++) {
+            int64_t ts[200];
+            double v[200];
+            for (int k = 0; k < 200; k++) {
+                ts[k] = T0 + ((int64_t)round * 200 + k) * 1000;
+                v[k] = (double)k;
+            }
+            tsdb_values col = {TSDB_FLOAT64, v, NULL};
+            if (tsdb_insert_series_values(c->db, c->ids[i], ts, &col, 200) != 0)
+                atomic_fetch_add(&c->errs, 1);
+        }
+    }
+    return NULL;
+}
+
+/* stats = 0: the first tenant call starts the sweeper and the numbers are right; then readers, a writer and a stream of
+ * list changes run together (TSan), and once they stop the numbers are the oracle's for the last list */
+static void test_lazy_and_races(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/race", base);
+    OK(mkdir(dir, 0755));
+    tsdb_options o = base_opts();
+    o.stats = 0;
+    o.stats_recompute_s = 1;
+    const char *l0[] = {"a/"};
+    o.tenants = l0;
+    o.ntenants = 1;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    enum { NS = 12 };
+    ser sv[NS];
+    size_t ns = 0;
+    tsdb_sid ids[NS];
+    for (int i = 0; i < NS; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "%c/s%02d", "abcd"[i % 4], i);
+        add_series(db, sv, &ns, name, TSDB_FLOAT64, dir);
+        ids[i] = sv[i].id;
+    }
+    load_series(db, sv, ns, 3000, 0);
+    OK(tsdb_flush(db));
+    tsdb_tenant_stats ts;
+    OK(tsdb_tenant_stats_get(db, "a/", TSDB_TENANT_VOLUME_SUM, &ts)); /* starts the sweeper; may be partial */
+    check_tenants(db, sv, ns, l0, 1, "lazy start");
+    OK(tsdb_tenant_stats_get(db, "a/", TSDB_TENANT_VOLUME_SUM, &ts));
+    CHECK(ts.series == 3 && ts.rows == 9000);
+
+    race_ctx c = {.db = db, .ids = ids, .n = NS};
+    pthread_t th[5];
+    for (int i = 0; i < 4; i++)
+        pthread_create(&th[i], NULL, race_reader, &c);
+    pthread_create(&th[4], NULL, race_writer, &c);
+    const char *ls[][3] = {{"a/", "b/", "c/"}, {"b/", "d/", NULL}, {"a/", "c/s02", "d/"}, {"c/", NULL, NULL}};
+    const size_t lsn[] = {3, 2, 3, 1};
+    for (int r = 0; r < 24; r++) {
+        OK(tsdb_set_tenants(db, ls[r % 4], lsn[r % 4]));
+        struct timespec ms = {0, 20 * 1000 * 1000};
+        nanosleep(&ms, NULL);
+        tsdb_tenant_stats t;
+        OK(tsdb_tenant_stats_get(db, NULL, TSDB_TENANT_VOLUME_SUM, &t)); /* never fails, never goes negative */
+        CHECK(t.rows < (uint64_t)1 << 40 && t.series <= NS);
+    }
+    atomic_store(&c.stop, true);
+    for (int i = 0; i < 5; i++)
+        pthread_join(th[i], NULL);
+    CHECK(atomic_load(&c.errs) == 0);
+    OK(tsdb_set_tenants(db, ls[2], lsn[2]));
+    /* the writer put rows into the series too: the oracle is the series' own numbers (check_tenants reads them) */
+    check_tenants(db, sv, ns, ls[2], lsn[2], "after the race");
+    tsdb_close(db);
+}
+
 /* ------------------------------------------------------------------------ the map's memory */
 
 static void map_bench(const char *base, size_t n)
@@ -739,7 +843,7 @@ static void map_bench(const char *base, size_t n)
         struct timespec a, b;
         clock_gettime(CLOCK_MONOTONIC, &a);
         for (size_t i = 0; i < n; i++) {
-            char name[40];
+            char name[64];
             size_t t = layout == 0 ? i % 16 : i / ((n + 15) / 16);
             snprintf(name, sizeof name, "t%02zu/s%zu", t, i);
             tsdb_sid id;
@@ -787,6 +891,7 @@ int main(int argc, char **argv)
     test_hll(base);
     test_hot(base);
     test_residency(base);
+    test_lazy_and_races(base);
     rm_rf(base);
     if (failures) {
         fprintf(stderr, "test_tenants: %d failures\n", failures);
