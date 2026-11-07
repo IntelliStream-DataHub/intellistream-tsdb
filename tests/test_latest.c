@@ -810,6 +810,15 @@ typedef struct conc {
     atomic_int_fast64_t written[CS]; /* newest timestamp acknowledged */
 } conc;
 
+static int conc_flush_every = 50;
+static atomic_int conc_windows; /* flushes that went through the 3.2 window */
+static void conc_hook(void *arg, int at)
+{
+    (void)arg;
+    if (at == LH_FOLD_BEFORE_LIST)
+        atomic_fetch_add(&conc_windows, 1);
+}
+
 static double conc_val(int64_t ts) { return (double)(ts * 3 + 1); }
 
 typedef struct cwr {
@@ -839,7 +848,7 @@ static void *conc_writer(void *arg)
             OK(tsdb_insert_series_values(c->db, c->id[s], ts, &vals, n));
             atomic_store(&c->written[s], ts[n - 1]);
         }
-        if (i % 50 == 0)
+        if (i % conc_flush_every == 0)
             OK(tsdb_flush(c->db));
     }
     return NULL;
@@ -898,6 +907,8 @@ static void test_concurrent(void)
         OK(tsdb_series_create(c.db, name, TSDB_FLOAT64, NULL, &c.id[i]));
     }
     pthread_t wt[2], mt, rt[3];
+    atomic_store(&conc_windows, 0);
+    tsdb_test_latest_hook(c.db, conc_hook, NULL);
     cwr wa[2] = {{&c, 0}, {&c, 1}};
     for (int i = 0; i < 2; i++)
         CHECK(pthread_create(&wt[i], NULL, conc_writer, &wa[i]) == 0);
@@ -920,6 +931,8 @@ static void test_concurrent(void)
         CHECK(out.ts == atomic_load(&c.written[s]));
         rs_free(&rr);
     }
+    tsdb_test_latest_hook(c.db, NULL, NULL);
+    CHECK(conc_flush_every == 50 || atomic_load(&conc_windows) > 20); /* the windows ran under the lookups */
     OK(tsdb_close(c.db));
 }
 
@@ -1283,6 +1296,57 @@ static void test_warmer(void)
     OK(tsdb_close(db));
 }
 
+/* Between the warmer's cut and its store: a retention limit (any write section bumps lgen), then a drop. Each must
+ * refuse the batch; the entry stays an exact bound until the next fill. */
+typedef struct {
+    tsdb *db;
+    tsdb_sid id;
+    int action; /* 0 none, 1 set a retention, 2 drop before */
+    int fired;
+} wr;
+
+static void wr_hook(void *arg, int at)
+{
+    wr *x = arg;
+    if (at != LH_WARM_BEFORE_STORE || !x->action)
+        return;
+    int a = x->action;
+    x->action = 0;
+    if (a == 1)
+        OK(tsdb_set_retention(x->db, x->id, 100000 * DAY));
+    else
+        OK(tsdb_drop_before(x->db, 15));
+    __atomic_add_fetch(&x->fired, 1, __ATOMIC_SEQ_CST);
+}
+
+static void test_warmer_other_writers(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    wr x = {0};
+    x.db = open_plain("latest_warmer2", &o);
+    OK(tsdb_series_create(x.db, "wr.a", TSDB_FLOAT64, NULL, &x.id));
+    put_f64(x.db, x.id, 10, 1.0, false);
+    put_f64(x.db, x.id, 20, 2.0, false);
+    OK(tsdb_flush(x.db));
+    for (int a = 1; a <= 2; a++) {
+        uint64_t s0[6];
+        wm_stats(x.db, s0);
+        tsdb_test_latest_hook(x.db, wr_hook, &x);
+        x.action = a;
+        OK(tsdb_delete_range(x.db, x.id, 20, TSDB_TS_MAX)); /* unknown: the warmer cuts and fills */
+        CHECK(wm_wait(x.db, refused_at_least, s0[4] + 1));
+        CHECK(__atomic_load_n(&x.fired, __ATOMIC_SEQ_CST) == a);
+        CHECK(wm_wait(x.db, no_unknown, 0));
+        tsdb_test_latest_hook(x.db, NULL, NULL);
+        check_vs_scan(x.db, x.id, a == 1 ? "warmer, refused by a retention" : "warmer, refused by a drop");
+        put_f64(x.db, x.id, 20, 2.0, false); /* the row is back for the next round */
+        OK(tsdb_flush(x.db));
+    }
+    OK(tsdb_close(x.db));
+}
+
 static void test_flush_window(void)
 {
     tsdb_options o;
@@ -1489,6 +1553,8 @@ int main(int argc, char **argv)
     printf("partial merge ok\n");
     test_warmer();
     printf("warmer ok\n");
+    test_warmer_other_writers();
+    printf("warmer refused by retention and drop ok\n");
     test_flush_window();
     printf("flushing + active memtables, follower tails ok\n");
     test_window();
@@ -1545,12 +1611,23 @@ int main(int argc, char **argv)
     random_run("latest_r4", o, false, steps, 55);
     printf("partial merges ok\n");
 
+    /* no table at all: the slow path alone answers the same */
+    tsdb_options_init(&o);
+    o.latest_cache = 0;
+    o.wal_max_batch_rows = 64;
+    o.granule_rows = 32;
+    o.merge_threads = 1;
+    random_run("latest_r5", o, true, steps / 2, 66);
+    printf("latest_cache = 0 ok\n");
+
     test_crash();
     printf("crash ok\n");
     test_concurrent();
     printf("concurrent ok\n");
     tsdb_test_latest_window(1); /* writers, merges and lookups with every flush a window */
+    conc_flush_every = 4;
     test_concurrent();
+    conc_flush_every = 50;
     tsdb_test_latest_window(50000);
     printf("concurrent with windows ok\n");
     rmrf(root);
