@@ -429,7 +429,7 @@ static int meta_word(const feed_dir *d, bool on)
     }
     char unknown[96];
     meta_requires_parse((const char *)txt, NULL, unknown, sizeof unknown);
-    char *out = malloc(len + 64);
+    char *out = malloc(len + 64 + sizeof unknown);
     if (!out) {
         free(txt);
         return TSDB_ERR_NOMEM;
