@@ -158,13 +158,124 @@ void db_add_parts(eng *db, part **ps, size_t n)
     manifest_publish(db);
 }
 
-/* Waits while a partition has too many parts (parts_to_delay_insert). */
+atomic_int wait_stall_ms = 30000;
+atomic_int merge_fault_ms = 0;
+
+/* The remembered stalls (db->lock). A partition is declared stalled once, by the first waiter whose wait ran out:
+ * every later waiter (the next insert, the next part of the same insert) goes on at once, as long as the count has
+ * not fallen below the count then and no merge of the partition has committed. Otherwise every call would pay
+ * wait_stall_ms again, and an insert that wrote k parts of the partition k times. */
+static size_t stall_find_locked(eng *db, int64_t partition)
+{
+    size_t m = sizeof db->stalled / sizeof db->stalled[0];
+    for (size_t i = 0; i < m; i++)
+        if (db->stalled[i].used && db->stalled[i].partition == partition)
+            return i;
+    return m;
+}
+
+void db_stall_clear_locked(eng *db, int64_t partition)
+{
+    size_t i = stall_find_locked(db, partition);
+    if (i < sizeof db->stalled / sizeof db->stalled[0])
+        db->stalled[i].used = false;
+}
+
+static void stall_set_locked(eng *db, int64_t partition, size_t n)
+{
+    size_t m = sizeof db->stalled / sizeof db->stalled[0];
+    size_t i = stall_find_locked(db, partition);
+    if (i == m) { /* a free slot, else the oldest (round robin): forgetting one costs that partition one more wait */
+        for (size_t j = 0; j < m && i == m; j++)
+            if (!db->stalled[j].used)
+                i = j;
+        if (i == m)
+            i = db->stalled_next++ % m;
+    }
+    db->stalled[i].partition = partition;
+    db->stalled[i].n = n;
+    db->stalled[i].used = true;
+}
+
+static int64_t wait_mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* Backpressure, not a safety rule: the rows are published and visible when an insert gets here, so the wait never
+ * fails the insert; it only ends early. It ends at once when merges of the partition cannot make progress:
+ *  - a part of it is damaged (marked by part_checked or part_mark_payload): select_merge_locked leaves the whole
+ *    partition out, so the count would never fall. Said once per damaged part; the damage itself was logged and
+ *    counted (st_broken_parts) when it was marked;
+ *  - the engine failed (eng_fail): nothing is merged any more.
+ * and after wait_stall_ms in which the count did not fall and no merge of the partition ran, for every other
+ * cause (parts that can never pair under max_part_bytes): a rate-limited line. A merge in flight is not cut short:
+ * its time does not count, unless a merge of the partition has failed since the wait began (merge_commit_locked
+ * marks the sources: a full disk or EIO on the output fails the same merge every second and marks no part, and
+ * counting only the time between merges would stretch the bound to wait_stall_ms times the length of a merge).
+ * Then the partition is remembered as stalled (stalled[]): the next waiters go on at once until its count falls or
+ * a merge of it commits, so the bound is paid once, not per call and per part. Without this a partition whose merges
+ * kept failing held every writer of the process for ever (jepsen --nemesis misdirect, verify_checksums off). */
 void db_wait_merges(eng *db, int64_t partition)
 {
     if (db->nmergers == 0)
         return;
     pthread_mutex_lock(&db->lock);
-    while (!atomic_load(&db->stop) && partition_part_count_locked(db, partition) > PARTS_TO_DELAY_INSERT) {
+    int64_t idle_ms = 0, last = wait_mono_ms();
+    size_t prev = SIZE_MAX;
+    uint64_t start_seq = db->merge_fail_seq;
+    while (!atomic_load(&db->stop)) {
+        size_t n = 0;
+        bool merging = false, failed = false;
+        part *bad = NULL;
+        for (size_t i = 0; i < db->nparts; i++) {
+            part *p = db->parts[i];
+            if (p->partition != partition)
+                continue;
+            n++;
+            merging |= p->merging;
+            failed |= p->fail_seq > start_seq;
+            if (!bad && atomic_load(&p->damaged))
+                bad = p;
+        }
+        if (n <= PARTS_TO_DELAY_INSERT || eng_check(db)) {
+            if (n <= PARTS_TO_DELAY_INSERT)
+                db_stall_clear_locked(db, partition);
+            break;
+        }
+        if (bad) {
+            if (!atomic_exchange(&bad->wait_logged, true))
+                fprintf(stderr, "tsdb: partition %" PRId64 " has %zu parts and part %s is damaged, so its merges "
+                                "are left out: inserts into it no longer wait for merges (its part count grows "
+                                "until the part is restored)\n", partition, n, bad->name);
+            break;
+        }
+        size_t si = stall_find_locked(db, partition);
+        if (si < sizeof db->stalled / sizeof db->stalled[0]) {
+            if (n >= db->stalled[si].n)
+                break; /* declared stalled, and nothing has moved since */
+            db->stalled[si].used = false; /* the count fell: look again */
+        }
+        int64_t now = wait_mono_ms();
+        if (n < prev) /* progress */
+            idle_ms = 0;
+        else if (!merging || failed)
+            idle_ms += now - last;
+        prev = n;
+        last = now;
+        if (idle_ms >= atomic_load(&wait_stall_ms)) {
+            stall_set_locked(db, partition, n);
+            if (!db->stall_log_ms || now - db->stall_log_ms >= 60000) {
+                db->stall_log_ms = now ? now : 1;
+                fprintf(stderr, "tsdb: partition %" PRId64 " has %zu parts and its merges made no progress for "
+                                "%" PRId64 " ms (no merge of it can run: parts that cannot pair under "
+                                "max_part_bytes, or merges that keep failing, see the log): the insert goes on\n",
+                        partition, n, idle_ms);
+            }
+            break;
+        }
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += 1;
@@ -549,20 +660,33 @@ static int load_parts(eng *db, bool read_only)
 int eng_open(const char *dir, const tsdb_options *opts, eng **out) { return eng_open_sched(dir, opts, NULL, out); }
 
 static __thread int adopt_lockfd = -1;
+/* A check of the opened engine (eng_reopen), run by the open once nothing can fail any more and before the engine's
+ * own threads start: they change the parts list (a merge, a flush), which the check reads without a lock. */
+static __thread void (*open_check)(const eng *, void *);
+static __thread void *open_check_arg;
 
-int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, eng **out)
+int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, eng **out,
+               void (*check)(const eng *neu, void *arg), void *arg)
 {
-    if (old->lockfd < 0)
-        return eng_open_sched(dir, opts, qs, out);
-    int fd = fcntl(old->lockfd, F_DUPFD_CLOEXEC, 3); /* the new engine owns this copy; the old one keeps its own */
-    if (fd < 0)
-        return TSDB_ERR_IO;
-    adopt_lockfd = fd;
-    int rc = eng_open_sched(dir, opts, qs, out);
-    if (adopt_lockfd >= 0) { /* the open failed before it took the fd */
-        close(adopt_lockfd);
-        adopt_lockfd = -1;
+    open_check = check; /* taken by the open; cleared below when it failed before that */
+    open_check_arg = arg;
+    int rc;
+    if (old->lockfd < 0) {
+        rc = eng_open_sched(dir, opts, qs, out);
+    } else {
+        int fd = fcntl(old->lockfd, F_DUPFD_CLOEXEC, 3); /* the new engine owns this copy; the old one keeps its own */
+        if (fd < 0) {
+            open_check = NULL;
+            return TSDB_ERR_IO;
+        }
+        adopt_lockfd = fd;
+        rc = eng_open_sched(dir, opts, qs, out);
+        if (adopt_lockfd >= 0) { /* the open failed before it took the fd */
+            close(adopt_lockfd);
+            adopt_lockfd = -1;
+        }
     }
+    open_check = NULL;
     return rc;
 }
 
@@ -704,6 +828,11 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             rc = TSDB_ERR_NOMEM;
             goto fail;
         }
+    }
+    if (open_check) { /* a reopen's comparison with the engine it replaces: before any thread changes the parts */
+        void (*check)(const eng *, void *) = open_check;
+        open_check = NULL;
+        check(db, open_check_arg);
     }
     if (!ro && db->opt.merge_threads > 0) {
         db->mergers = calloc((size_t)db->opt.merge_threads, sizeof *db->mergers);

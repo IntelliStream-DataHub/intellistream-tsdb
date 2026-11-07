@@ -2215,7 +2215,7 @@ static int drop_while_reading(void *ctx, const int64_t *ts, const float *v, size
  * was only marked, and kept its name until the last reference went. A query reading it while tsdb_drop_before was
  * acknowledged, or while the merge thread dropped an expired partition, and a crash then: the open listed it
  * again, nothing covers it, and the dropped rows came back. */
-static void drop_then_crash(const char *base, bool retention)
+static void drop_then_crash(const char *base, bool retention, bool straddle)
 {
     char dir[512], copy[540];
     snprintf(dir, sizeof dir, "%s/tsdb-dropref-%d", base, (int)getpid());
@@ -2223,7 +2223,7 @@ static void drop_then_crash(const char *base, bool retention)
     rm_rf(dir);
     tsdb_options o = test_opts(retention ? 1 : 0);
     o.partition_classes = 0;
-    o.wal_max_batch_rows = 100; /* the insert becomes a part */
+    o.wal_max_batch_rows = 100; /* the insert becomes a part, or two */
     o.obsolete_part_lifetime_s = 0;
     o.fsync = 1;
     atomic_llong off = 0;
@@ -2237,7 +2237,12 @@ static void drop_then_crash(const char *base, bool retention)
     OK(tsdb_series(db, "s", &id));
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
-    const int64_t t0 = (int64_t)now.tv_sec * 1000 - 600000;
+    /* The rows are 100 s long and the partitions an hour (test_opts): where they lie against an hour edge is chosen,
+     * not left to the time of day (a run that began 10 to 12 minutes past the hour once had its rows in two
+     * partitions, so in two parts, and two retired_ files in the copy). Straddling: both partitions get a part. */
+    const int64_t hour = test_opts(0).partition_ms;
+    const int64_t t0 = ((int64_t)now.tv_sec * 1000) / hour * hour - (straddle ? 50000 : 200000);
+    const size_t nparts = straddle ? 2 : 1;
     enum { N = 1000 };
     int64_t ts[N];
     float v[N];
@@ -2247,14 +2252,15 @@ static void drop_then_crash(const char *base, bool retention)
     }
     OK(tsdb_insert_series(db, id, ts, v, N));
     if (retention)
-        OK(tsdb_set_retention(db, id, 3600000));
+        OK(tsdb_set_retention(db, id, 2 * hour)); /* the rows are at most an hour and 200 s old */
     CHECK(rows_in(db, id) == N);
+    CHECK(count_listed_parts(dir) == nparts);
     drop_hold h = {db, dir, copy, retention ? 0 : t0 + 100 * 3600000LL, &off, false, 0, 0};
     OK(tsdb_query_raw(db, id, t0, t0 + N * 100, drop_while_reading, &h));
     CHECK(h.done);
     CHECK(rows_in(db, id) == 0);
     CHECK(h.listed_in_copy == 0); /* nothing the open would list: that is the whole point */
-    CHECK(h.retired_in_copy <= 1);
+    CHECK(h.retired_in_copy <= nparts); /* a dropped part is renamed, at most once each */
     OK(tsdb_close(db));
     CHECK(count_listed_parts(dir) == 0 && count_retired(dir) == 0);
     tsdb_options o2 = test_opts(0);
@@ -2271,8 +2277,10 @@ static void drop_then_crash(const char *base, bool retention)
 
 static void test_drop_stays_dropped(const char *base)
 {
-    drop_then_crash(base, false);
-    drop_then_crash(base, true);
+    for (int straddle = 0; straddle < 2; straddle++) {
+        drop_then_crash(base, false, straddle);
+        drop_then_crash(base, true, straddle);
+    }
     printf("  a dropped part keeps no listed name, with a reader and obsolete_part_lifetime_s = 0\n");
 }
 

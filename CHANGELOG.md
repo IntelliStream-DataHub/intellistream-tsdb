@@ -6,14 +6,94 @@ All notable changes to tsdb are listed here, newest first. The format follows
 [docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.9.x release may still change the
 disk format and the wire protocol.
 
-## [Unreleased]
+## [0.9.1] - 2026-11-07
+
+A patch release: **two data fixes**, storage outage handling for NFS, macOS as a developer platform, and smaller
+fixes to the server. **Disk format version 8 and wire protocol version 12, as in 0.9.0**, and the embedded C ABI is
+still version 3 (it only gained functions and structs). A database of 0.9.0 opens as it is. The wire protocol did
+not change (the new status `TSDB_ERR_UNAVAILABLE` only appears for volumes that an operator put in a
+`--health-domain`); use the same release on the server and its clients all the same.
 
 ### Fixed
 
+- **A deleted partition no longer comes back after a crash while a merge of it was running.**
+  `tsdb_drop_before` (and retention dropping an expired partition) acknowledged the drop, but a merge of that
+  partition that was already running had named its output (durably) before it found its sources dropped, and only
+  unlinked the output. After a kill -9 or a power loss the open listed that output alone, with every dropped row.
+  The drop now waits for a merge of the partitions it drops, no new merge starts in them while it waits (a stream
+  of merges could otherwise keep it waiting), and retention leaves a partition with a merge in flight to its next
+  pass. The merge's own discard of such an output (a backstop) renames it to `retired_` and syncs the directory.
+  Tests in `tests/test_tsdb.c` (the drop held against a merge on both sides of the naming, at lifetimes 0 and 480,
+  under kill -9 and a simulated power loss; `drop_blocks_new_merges`).
+
+- **A dropped partition no longer comes back after a crash when `obsolete_part_lifetime_s` is 0 or less.** A dropped
+  part kept its listed name while any query held a reference to it; `tsdb_drop_before` (or retention) acknowledged
+  after the directory fsync, a crash then made the open list the part again, and the dropped rows came back (nothing
+  covers a dropped part). Replaced and dropped parts are now renamed to `retired_<name>` at every lifetime, before
+  that fsync; at a lifetime of 0 or less the last reference deletes the retired name, and the open deletes any left
+  by a crash.
+- **Inserts no longer wait for ever on a partition whose merges keep failing.** An insert that leaves a partition with
+  more than 300 parts waits for merges (like `parts_to_delay_insert`), and the wait had no end: a merge that failed
+  on a granule with damaged payload (the merge checks each granule's hash, the open does not) was retried every
+  second, the count never fell, and every insert into the partition, so every worker of `tsdbd`, waited for ever (found
+  by `make jepsen`, nemesis `misdirect`, with `verify_checksums` off; the same with it on). Now a merge that cannot
+  decode a granule of a source part marks that part, like an index that no longer matches its checksum: logged once,
+  counted once in `tsdb_broken_parts`, and left out of merges and drops with its partition (`tsdb_optimize` merges the
+  rest and returns `TSDB_ERR_CORRUPT`). The mark is kept in memory only, and the log says to restore the part: queries
+  that decode the granule fail with `TSDB_ERR_CORRUPT`, or without `verify_checksums` may return wrong values. The wait
+  ends at once for a partition with a marked part and when the engine has failed, and after 30 s in which the count did
+  not fall and no merge of the partition ran (for example parts that cannot pair under `max_part_bytes`), or after
+  30 s from the first merge of the partition that failed during the wait (a full disk, EIO on the merge output: a
+  merge that takes minutes would otherwise stretch the 30 s to hours). The first wait that runs out remembers the
+  partition as stalled, so later inserts into it, and the other parts of the same insert, go on at once until its
+  count falls or a merge of it commits, instead of each paying 30 s. The rows are published before the wait, so the
+  insert still succeeds; the partition's part count grows until the part is restored. `tests/test_damage.c`
+  (`test_wait_merges_damaged`, `test_wait_merges_stalled`, `test_wait_merges_failing`).
+- **A volume recovery in `tsdbd` no longer frees an engine that a name or type lookup still holds.** While a volume
+  is quiesced the server still answers names and types, each holding a reference on the engine, and
+  `tsdb_volume_reopen` freed the old engine after swapping it without waiting for a reference taken after its own
+  check (a use after free under ASan). It now waits for them to give theirs back before it frees the engine.
+- **The loss of a part after a storage outage is no longer hidden by the new engine's merges.** `tsdb_volume_reopen`
+  compared the parts the halted engine had with the new engine's list after the new engine's merge and flush threads
+  had started: a merge across the gap of a lost part made it look covered (the loss was not reported, no DIVERGED),
+  healthy parts being merged were reported lost, and the loop read part pointers a merge freed. The comparison now
+  runs inside the open, before those threads start. Tests in `tests/test_recover.c`
+  (`meta_reference_at_reopen`, `merge_clears_loss`).
 - **A step of the wall clock no longer deletes retired parts early.** The `obsolete_part_lifetime_s` of a part a
   merge replaced (`retired_*`, which a follower on another host may still have mapped) is now counted on the monotonic
   clock, also for the retired files a restart finds. A clock set forward (NTP, an operator, a resumed VM) used to
   delete them at once. `tests/test_graveyard.c` steps a fake wall clock.
+- tsdbd closes a connection whose output has not moved for `--send-timeout` seconds even when its whole reply fit in
+  the server's buffers (so no worker waited on it): before, a client that sent a query and never read the answer held
+  up to about 17 MB per connection for as long as it kept the socket open, outside `--max-request-memory`.
+- tsdbd no longer cuts a client that keeps reading its reply, only slowly. A reply larger than 8 MB was lost by a
+  client that read less than about 9 MB per `--send-timeout` (150 KB/s at the default of 60 s): a worker waiting for
+  output space gave up that long after its wait began, whether the output moved or not. Progress is now any change
+  in the socket's queue, checked every second, so the floor is gone for replies of any size. Time the server itself
+  was stopped (SIGSTOP, a frozen container) no longer counts against `--send-timeout`, `--frame-timeout` or
+  `--login-timeout`.
+- `tsdb_query_multi` (QUERY_MULTI) checks the bounds of a bounds query once per call instead of once per series:
+  65,536 series over the 33 million bounds of one frame took about 250 s of comparisons. Bounds that do not
+  strictly increase now answer `TSDB_ERR_INVALID` for every series, trimmed or not, as the single-series call does
+  on the whole bounds. Before, a trimmed series was answered from its own part of the bounds: buckets when that
+  part increased, empty when the series had no rows. No client sends such bounds.
+- `tsdb_query_multi` claims the first series for the caller before it wakes its helpers. A helper that ran first
+  took it as a series ahead: collected and held, or, over 65,536 rows, computed, thrown away and run again at its
+  turn. Measured with `tsdbc-bench query --multi 100 --conns 1` (100 series x 1 M rows, optimized; 0.9.0 and this
+  change interleaved, 5 runs each; series per second, mean +- sd, lowest-highest):
+
+  | query | 0.9.0 | this change |
+  |---|---:|---:|
+  | raw, 3600 samples | 79,247 +- 1,699 (77,153-81,053) | 79,511 +- 1,084 (77,652-80,413) |
+  | 86,400 samples in 288 buckets | 70,629 +- 1,967 (68,029-72,463) | 70,889 +- 1,363 (68,679-71,847) |
+  | 604,800 samples in 168 buckets | 40,522 +- 967 (39,116-41,286) | 37,939 +- 5,485 (28,190-41,001) |
+  | TWA, 604,800 samples in 168 buckets | 11,073 +- 184 (10,746-11,188) | 10,963 +- 240 (10,692-11,237) |
+  | the whole range in one bucket | 86,061 +- 705 (85,121-86,737) | 84,584 +- 675 (83,664-85,296) |
+
+  The same within the noise, but for the whole range in one bucket (about 12 us a series, from granule statistics):
+  1.7% fewer, in each of the five pairs of runs. The 168-bucket column has one slow run (28,190); the other four
+  average 40,376. Every answer here is far below 65,536 rows, so the change has nothing to save in this benchmark;
+  it saves where the first series' answer is larger.
 
 ### Added
 
@@ -48,56 +128,38 @@ disk format and the wire protocol.
   QUERY_LTTB and QUERY_MULTI; a larger one is taken as this. A range of no more rows than that still answers every
   point. Newest-first LTTB holds its chosen points until the last is chosen, so before this a threshold near the
   rows of a series of billions held gigabytes for one request, outside `--max-request-memory`.
+- **`tsdb_latest`** (embedded API in `tsdb.h`, with `tsdb_latest_opts` and `tsdb_latest_result`): the newest row of
+  each of many series, optionally before a bound per series and optionally the newest row even when it is a null,
+  with last-write-wins, tombstones, retention and partition classes honoured. It searches the partitions newest
+  first and stops as soon as no older part can hold a newer row, so it needs no snapshot and no table. Not yet in
+  `tsdbd`, the clients or the protocol. `tests/test_latest.c` compares every answer with a full scan after random
+  sequences of inserts, deletes, replaces, retention, drops, class switches, flushes, merges, a reopen and a crash.
+- Development tooling that does not change a running tsdb: fuzz harnesses `codecx`, `import`, `users` and `classes`
+  next to the existing ones, `make fuzz FUZZ_ARCH=...` and `make asan ASAN_ARCH=...` to run them at a CPU level;
+  `.github/workflows/release.yml`, which builds the tarball of a pushed tag `vX.Y.Z`, tests it and attaches it to the
+  GitHub release (`docs/release.md`, `tools/release-notes.sh`); and a sans-IO replication core (`src/repl.c`) with
+  its simulator (`tests/sim_repl.c`), which `make test` runs but the library does not contain. New designs, not
+  built yet: `docs/design-cluster.md`, `docs/design-ha-modes.md`, `docs/design-cdc.md`, `docs/design-stats.md`,
+  `docs/design-latest.md`.
 
 ### Changed
+
 - An operator's `volume add` (and `import --create-volumes`) refuses a directory that holds a file with a name the
   volume would take for one of its own: `STATES`, `RETENTION`, `CLASSES`, a WAL segment (`wal_<16 hex>.log`), a
   part, a part's temporary, a retired part, an intent or `META.tmp`. The first open would otherwise have cut such a file of the
   user's as a torn tail, replayed it, run it or deleted it. The message names the file; nothing is written.
 
-### Fixed
-- With `obsolete_part_lifetime_s <= 0` a dropped part kept its listed name while any query held a reference to it.
-  `tsdb_drop_before` (or retention dropping an expired partition) acknowledged after the directory fsync, a crash
-  then made the open list the part again, and the dropped rows came back (nothing covers a dropped part). Replaced
-  and dropped parts are now renamed to `retired_<name>` at every lifetime, before that fsync; at a lifetime of 0 or
-  less the last reference deletes the retired name, and the open deletes any left by a crash.
-- `tsdb_drop_before` came back after a crash (kill -9 or power loss) when a merge of a dropped partition was in
-  flight, at every `obsolete_part_lifetime_s`: the merge had named its output (durably) before it found its sources
-  dropped, and only unlinked it, so the open listed that output alone, with every dropped row. The drop now waits
-  for a merge of the partitions it drops and retires the output with the rest; retention leaves a partition with a
-  merge in flight to its next pass. The merge's own discard of such an output (a backstop) renames it to `retired_`
-  and syncs the directory.
-- tsdbd closes a connection whose output has not moved for `--send-timeout` seconds even when its whole reply fit in
-  the server's buffers (so no worker waited on it): before, a client that sent a query and never read the answer held
-  up to about 17 MB per connection for as long as it kept the socket open, outside `--max-request-memory`.
-- tsdbd no longer cuts a client that keeps reading its reply, only slowly. A reply larger than 8 MB was lost by a
-  client that read less than about 9 MB per `--send-timeout` (150 KB/s at the default of 60 s): a worker waiting for
-  output space gave up that long after its wait began, whether the output moved or not. Progress is now any change
-  in the socket's queue, checked every second, so the floor is gone for replies of any size. Time the server itself
-  was stopped (SIGSTOP, a frozen container) no longer counts against `--send-timeout`, `--frame-timeout` or
-  `--login-timeout`.
-- `tsdb_query_multi` (QUERY_MULTI) checks the bounds of a bounds query once per call instead of once per series:
-  65,536 series over the 33 million bounds of one frame took about 250 s of comparisons. Bounds that do not
-  strictly increase now answer `TSDB_ERR_INVALID` for every series, trimmed or not, as the single-series call does
-  on the whole bounds. Before, a trimmed series was answered from its own part of the bounds: buckets when that
-  part increased, empty when the series had no rows. No client sends such bounds.
-- `tsdb_query_multi` claims the first series for the caller before it wakes its helpers. A helper that ran first
-  took it as a series ahead: collected and held, or, over 65,536 rows, computed, thrown away and run again at its
-  turn. Measured with `tsdbc-bench query --multi 100 --conns 1` (100 series x 1 M rows, optimized; 0.9.0 and this
-  change interleaved, 5 runs each; series per second, mean +- sd, lowest-highest):
+### Known limitations
 
-  | query | 0.9.0 | this change |
-  |---|---:|---:|
-  | raw, 3600 samples | 79,247 +- 1,699 (77,153-81,053) | 79,511 +- 1,084 (77,652-80,413) |
-  | 86,400 samples in 288 buckets | 70,629 +- 1,967 (68,029-72,463) | 70,889 +- 1,363 (68,679-71,847) |
-  | 604,800 samples in 168 buckets | 40,522 +- 967 (39,116-41,286) | 37,939 +- 5,485 (28,190-41,001) |
-  | TWA, 604,800 samples in 168 buckets | 11,073 +- 184 (10,746-11,188) | 10,963 +- 240 (10,692-11,237) |
-  | the whole range in one bucket | 86,061 +- 705 (85,121-86,737) | 84,584 +- 675 (83,664-85,296) |
+The list of 0.9.0 below still holds, with these changes:
 
-  The same within the noise, but for the whole range in one bucket (about 12 us a series, from granule statistics):
-  1.7% fewer, in each of the five pairs of runs. The 168-bucket column has one slow run (28,190); the other four
-  average 40,376. Every answer here is far below 65,536 rows, so the change has nothing to save in this benchmark;
-  it saves where the first series' answer is larger.
+- `TSDB_ERR_UNAVAILABLE` (-11) and `TSDB_ERR_ABANDONED` (-14) are known to the engine and to `tsdbd`, but the C, Rust,
+  Python and Java clients show them as "unknown error" with the code (-11 means: not applied, try again later).
+- Latest-value lookups exist in the embedded API (`tsdb_latest`) only; there is none in `tsdbd` or the clients yet.
+- Storage outage handling (`--health-domain`) is the first step: no discovery of domains from the mounts, no
+  deadline for a parked request, no queue bound per volume, no metrics yet (see `docs/tasks/nfs-outage.md`).
+- Merges do not retry a part with a damaged granule, and an insert into its partition goes on (the part count of the
+  partition grows) until the part is restored from a backup.
 
 ## [0.9.0] - 2026-11-05
 

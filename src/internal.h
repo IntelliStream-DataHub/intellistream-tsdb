@@ -749,7 +749,10 @@ typedef struct part {
     /* protected by tsdb.lock */
     bool merging;
     bool dropped;
-    atomic_bool damaged; /* its index no longer matches the open's checksum: out of merges and drops (part_checked) */
+    atomic_bool damaged; /* its index no longer matches the open's checksum, or a merge could not decode one of its
+                          * granules: out of merges and drops (part_checked, part_mark_payload) */
+    atomic_bool wait_logged; /* db_wait_merges said once that inserts no longer wait for this damaged part's partition */
+    uint64_t fail_seq;       /* db->merge_fail_seq when a merge that took it as a source last failed (db->lock) */
     uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
     int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
     atomic_bool obsolete; /* delete the file when the last reference goes */
@@ -859,6 +862,8 @@ int part_open_as(int dirfd, const char *file, const char *name, bool pin, part *
 bool part_index_intact(const part *p);
 /* part_index_intact; a part that fails it is marked damaged, logged and counted once (st_broken_parts) */
 bool part_checked(struct eng *db, part *p, const char *what);
+/* A merge could not decode a granule of p: marks it damaged, logs and counts it once (in memory only) */
+void part_mark_payload(struct eng *db, part *p, const char *what);
 void part_ref(part *p);
 void part_unref(part *p);
 /* Decodes a granule: timestamps, and values (if v) as slots of `type`, into buffers of room for cap rows; checks
@@ -945,7 +950,7 @@ int pw_copy_granule(part_writer *w, const part *src, uint32_t i);
  * after it where the writer cuts (INT64_MAX: none; then only a day cut or the end of the series' rows ends it, which
  * the caller checks). 1 yes, 0 no, < 0 an error. Decides from the count, window and longest gap between rows where
  * they suffice, else from the timestamps, decoded (and kept for pw_copy_granule's count of the hour). */
-int pw_copy_fits(part_writer *w, const struct part *src, uint32_t i, const granule *g, bool want_end, int64_t *end);
+int pw_copy_fits(part_writer *w, struct part *src, uint32_t i, const granule *g, bool want_end, int64_t *end);
 /* whether w ends its pending rows at an hour edge at or before t (a cut before a granule of their series) */
 bool pw_hcut_before(const part_writer *w, int64_t t);
 /* Tombstones for the trailer, sorted by (series, start) and disjoint per series; copied. */
@@ -1298,6 +1303,12 @@ struct eng {
 
     pthread_t *mergers;
     int nmergers;
+    uint64_t merge_fail_seq; /* counts failed merges (merge_commit_locked); parts remember it (part.fail_seq) (db->lock) */
+    struct { int64_t partition; size_t n; bool used; } stalled[8]; /* partitions db_wait_merges declared stalled, with
+                                                                    * the count then: later waiters do not wait again
+                                                                    * until it falls or a merge of it commits (db->lock) */
+    unsigned stalled_next;
+    int64_t stall_log_ms; /* when db_wait_merges last said that merges of a partition made no progress (db->lock) */
 
     pthread_mutex_t cc_lock;
     codec_ctx *cc_free;
@@ -1500,6 +1511,13 @@ int partition_class(const struct eng *db, int64_t key);
  * be discarded; a MANIFEST failure fails the engine by itself (eng_fail). */
 void db_add_parts(struct eng *db, part **ps, size_t n);
 void db_wait_merges(struct eng *db, int64_t partition);
+void db_stall_clear_locked(struct eng *db, int64_t partition); /* a merge of the partition committed */
+/* How long (ms) db_wait_merges lets a partition's part count stand while no merge of it runs, before an insert goes on;
+ * a variable so that tests can shorten it. */
+extern atomic_int wait_stall_ms;
+/* test hook: the merge thread's merges sleep this many ms (0: off) and then fail with TSDB_ERR_IO, like a merge
+ * output that cannot be written (ENOSPC, EIO before it has a name): nothing is marked, the sources stay */
+extern atomic_int merge_fault_ms;
 size_t partition_part_count_locked(struct eng *db, int64_t partition);
 void db_parts_insert_locked(struct eng *db, part *p);
 void db_parts_remove_locked(struct eng *db, part *p);
@@ -1509,7 +1527,7 @@ void db_release(part **parts, size_t n);
 /* merge.c */
 void *merge_thread_main(void *arg);
 int merge_parts(struct eng *db, part **src, size_t k, part **out);
-void merge_commit_locked(struct eng *db, part **src, size_t k, part *out);
+void merge_commit_locked(struct eng *db, part **src, size_t k, part *out, int rc);
 
 /* insert.c: sorts (stably), keeps the last row per (series, ts), writes one
  * part per partition. Parts are published, or handed back in `collect`. With `refuse` (rows from a caller, not
@@ -1578,10 +1596,20 @@ typedef struct reval_part {
 int reval_dicts(eng *old, const char *dir, uint64_t *series_added, uint64_t *states_added);
 int reval_capture(eng *old, reval_part **out, size_t *n);
 void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost, uint64_t *lost_rows);
+/* reval_parts as the `check` of eng_reopen: it runs before the new engine's threads start (see there). */
+typedef struct reval_check {
+    const reval_part *x;
+    size_t nx;
+    uint64_t lost, lost_rows; /* out */
+} reval_check;
+void reval_check_open(const eng *neu, void *arg);
 void reval_logs(const eng *old, const eng *neu, uint64_t *lost_bytes);
 void eng_halt(eng *db);
-/* A new engine for the directory of `old` (halted, closed afterwards by eng_retire) that takes over its lock. */
-int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, struct sched *qs, eng **out);
+/* A new engine for the directory of `old` (halted, closed afterwards by eng_retire) that takes over its lock.
+ * `check(neu, arg)`, when given, runs on the opened engine before its merge and flush threads start: the only moment
+ * its parts list is read without a lock and still the one the storage held. */
+int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, struct sched *qs, eng **out,
+               void (*check)(const eng *neu, void *arg), void *arg);
 int eng_series(eng *db, const char *name, int type, uint32_t *id);
 int eng_series_lookup(eng *db, const char *name, uint32_t *id);
 uint32_t eng_series_count(eng *db);
@@ -1797,6 +1825,13 @@ void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
 uint64_t tsdb_test_fence_wakeups(struct tsdb *t);
 /* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
+/* tests: fn(arg, 0) runs in tsdb_volume_reopen before it halts the old engine, fn(arg, 1) once the new engine is
+ * open and its threads run; a reference on a series' engine as a
+ * name or type lookup holds it between its route and its use (tsdb_test_meta_use reads the type through it) */
+void tsdb_test_reopen_hook(void (*fn)(void *, int phase), void *arg);
+void *tsdb_test_meta_hold(struct tsdb *t, tsdb_sid id);
+int tsdb_test_meta_use(void *hold);
+void tsdb_test_meta_release(void *hold);
 /* test hook: the WAL tail kept for switches, and how far segments are unlinked (durably) */
 void tsdb_test_wal_state(struct tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced);
 /* test hook: every granule of the first volume, with its partition's class (tests/test_classes.c) */

@@ -2199,6 +2199,199 @@ static void test_retention_damaged_index(const char *scratch)
     rm_rf(dir);
 }
 
+/* merge-wait (found by jepsen --nemesis misdirect without verify_checksums, 0.9.0). An insert waits while its
+ * partition has more than PARTS_TO_DELAY_INSERT parts (db_wait_merges), and the wait had no end: merges that fail
+ * on a granule whose payload is damaged (the merge checks every granule's hash; the open does not) were retried
+ * every second, the count never fell, and every insert into the partition, so every worker of tsdbd, waited for
+ * ever. Now a merge that cannot decode a granule marks its part (once, counted in broken_parts, left out of
+ * merges), the wait ends for a partition with a marked part, and for any other partition whose merges make no
+ * progress it ends after wait_stall_ms. The rows are published before the wait: the insert still succeeds. */
+#define MW_PARTS (PARTS_TO_DELAY_INSERT + 5)
+#define MW_ROWS 200
+#define MW_T0 ((T0 / DAY_MS + 1) * DAY_MS) /* a day start: all the parts, 61,000 s of rows, in one partition */
+
+static void mw_build(const char *dir, tsdb_sid *id)
+{
+    rm_rf(dir);
+    tsdb_options o = opts(); /* no merge threads: no wait, and nothing merges while the parts pile up */
+    o.wal_max_batch_rows = 100; /* straight to parts */
+    o.partition_classes = 0;    /* one base partition */
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "mw.series", id));
+    int64_t ts[MW_ROWS];
+    float v[MW_ROWS];
+    for (int k = 0; k < MW_PARTS; k++) {
+        for (int i = 0; i < MW_ROWS; i++)
+            ts[i] = MW_T0 + ((int64_t)k * MW_ROWS + i) * 1000, v[i] = (float)(i % 37);
+        OK(tsdb_insert_series(db, *id, ts, v, MW_ROWS));
+    }
+    OK(tsdb_close(db));
+}
+
+struct mw_insert {
+    tsdb *db;
+    tsdb_sid id;
+    int rc;
+    atomic_int done;
+};
+
+static void *mw_insert_main(void *arg)
+{
+    struct mw_insert *m = arg;
+    int64_t ts[MW_ROWS];
+    float v[MW_ROWS];
+    for (int i = 0; i < MW_ROWS; i++)
+        ts[i] = MW_T0 + ((int64_t)MW_PARTS * MW_ROWS + i) * 1000, v[i] = 1.0f;
+    m->rc = tsdb_insert_series(m->db, m->id, ts, v, MW_ROWS);
+    atomic_store(&m->done, 1);
+    return NULL;
+}
+
+/* One more insert into the full partition; it must return within `limit_s`, with success. The old code never
+ * returned: the test says so and leaves (a hung call cannot be cancelled, and tsdb_close would wait for it). */
+static void mw_insert_returns(tsdb *db, tsdb_sid id, int limit_s, const char *what)
+{
+    struct mw_insert m = {.db = db, .id = id};
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, mw_insert_main, &m) == 0);
+    for (int i = 0; i < limit_s * 10 && !atomic_load(&m.done); i++)
+        usleep(100000);
+    if (!atomic_load(&m.done)) {
+        fprintf(stderr, "%s:%d: %s: the insert still waits for merges after %d s\n", __FILE__, __LINE__, what,
+                limit_s);
+        _exit(1);
+    }
+    pthread_join(t, NULL);
+    OK(m.rc);
+}
+
+static void test_wait_merges_damaged(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-merge-wait", scratch);
+    for (int verify = 0; verify <= 1; verify++) {
+        tsdb_sid id;
+        mw_build(dir, &id);
+        /* the payload of every part: a flipped byte in the middle of its data (the same place in each: they are
+         * alike). Every merge fails, whichever parts it picks. */
+        DIR *d = opendir(dir);
+        CHECK(d != NULL);
+        int n = 0;
+        struct dirent *e;
+        while (d && (e = readdir(d)) != NULL) {
+            size_t l = strlen(e->d_name);
+            if (e->d_name[0] != 'p' || l < 5 || strcmp(e->d_name + l - 5, ".part") != 0)
+                continue;
+            part_footer ft = read_footer(dir, e->d_name);
+            flip(dir, e->d_name, (off_t)(sizeof(part_header) + ft.index_off) / 2);
+            n++;
+        }
+        if (d)
+            closedir(d);
+        CHECK(n == MW_PARTS);
+        tsdb_options o = opts();
+        o.merge_threads = 1;
+        o.partition_classes = 0;
+        o.wal_max_batch_rows = 100; /* the insert goes to a part, and waits */
+        o.verify_checksums = verify; /* the merge checks granule hashes in either case */
+        tsdb *db;
+        OK(tsdb_open(dir, &o, &db));
+        mw_insert_returns(db, id, 30, verify ? "verify_checksums on" : "verify_checksums off");
+        tsdb_stats st = {0};
+        for (int i = 0; i < 50 && st.broken_parts == 0; i++) { /* the merge thread marks it on its first try */
+            usleep(100000);
+            OK(tsdb_get_stats(db, &st));
+        }
+        CHECK(st.broken_parts >= 1);
+        usleep(2500000); /* retried every second before: counted once per part now, and never more than the parts */
+        tsdb_stats st2 = {0};
+        OK(tsdb_get_stats(db, &st2));
+        CHECK(st2.broken_parts <= MW_PARTS + 1);
+        RC(tsdb_optimize(db), TSDB_ERR_CORRUPT); /* reports the partition it left alone */
+        tsdb_close(db);
+    }
+    printf("  an insert into a partition whose merges fail on a damaged payload does not wait for ever\n");
+    rm_rf(dir);
+}
+
+/* The other half: no part is damaged, but no pair can merge (max_part_bytes), so the count never falls. The wait
+ * ends after wait_stall_ms (shortened here) with no merge running, and the insert succeeds. */
+static void test_wait_merges_stalled(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-merge-stall", scratch);
+    tsdb_sid id;
+    mw_build(dir, &id);
+    tsdb_options o = opts();
+    o.merge_threads = 1;
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 100; /* the insert goes to a part, and waits */
+    o.max_part_bytes = 1;       /* no range of two parts fits */
+    o.merge_idle_s = 1000000;   /* and no solo rewrite */
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    int was = atomic_load(&wait_stall_ms);
+    atomic_store(&wait_stall_ms, 1500);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    mw_insert_returns(db, id, 30, "parts that cannot pair");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 >= 1400); /* it did wait */
+    /* and the stall is remembered: the next insert into the partition goes on at once, instead of paying
+     * wait_stall_ms again (it was paid by every call, and k times by an insert that wrote k parts of it) */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    mw_insert_returns(db, id, 30, "a partition declared stalled");
+    mw_insert_returns(db, id, 30, "a partition declared stalled, again");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 700);
+    atomic_store(&wait_stall_ms, was);
+    int rc;
+    CHECK(count_rows(db, id, &rc) == (long)(MW_PARTS + 1) * MW_ROWS && rc == 0); /* and the rows are all there */
+    tsdb_close(db);
+    printf("  an insert stops waiting for merges that cannot run (parts that cannot pair), after wait_stall_ms,"
+           " and the next ones do not wait again\n");
+    rm_rf(dir);
+}
+
+/* Merges that fail without marking a part (a full disk, EIO on the merge output before it has a name: the test hook
+ * merge_fault_ms sleeps, then fails) are retried every second. The wait counted only the time between merges, so
+ * with merges that take long it ended after about wait_stall_ms times the length of a merge (tens of minutes at
+ * 4 GiB outputs): a failed merge now counts as no progress, and the wait ends near wait_stall_ms after it. */
+static void test_wait_merges_failing(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-merge-failing", scratch);
+    tsdb_sid id;
+    mw_build(dir, &id);
+    tsdb_options o = opts();
+    o.merge_threads = 1;
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 100;
+    o.merge_idle_s = 1000000;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    int was = atomic_load(&wait_stall_ms);
+    atomic_store(&wait_stall_ms, 2500);
+    atomic_store(&merge_fault_ms, 5000); /* every merge runs 5 s, then fails; 1 s back-off between them */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* first failure after 5 s, then 2.5 s: about 8 s. The old clock gained at most 1 s per 6 s cycle: 15 s or more */
+    mw_insert_returns(db, id, 12, "merges that keep failing");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    CHECK(ms >= 4000); /* it did wait for the first merge */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    mw_insert_returns(db, id, 30, "merges that keep failing, the next insert");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 700);
+    atomic_store(&merge_fault_ms, 0);
+    atomic_store(&wait_stall_ms, was);
+    tsdb_close(db);
+    printf("  an insert stops waiting for merges that keep failing, near wait_stall_ms\n");
+    rm_rf(dir);
+}
+
 struct part_count {
     int64_t partition;
     int n;
@@ -2519,6 +2712,9 @@ int main(int argc, char **argv)
     test_records_huge_id(base);
     test_retention_damaged_index(base);
     test_damaged_part_no_starvation(base);
+    test_wait_merges_damaged(base);
+    test_wait_merges_stalled(base);
+    test_wait_merges_failing(base);
     test_follower_steady_creation(base);
     test_wal_torn_before_later(base);
     test_follower_series_rewritten(base);

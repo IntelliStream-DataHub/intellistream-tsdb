@@ -28,6 +28,15 @@ toml() { sed -n 's/^version = "\(.*\)"$/\1/p' "$1" | head -n 1; }
 for f in client/rust/Cargo.toml client/rust-sys/Cargo.toml client/python/Cargo.toml; do
     want "$f" "$(toml $f)"
 done
+# every Cargo.lock in the tree that names one of our crates (a lock file of a test crate that depends on the client
+# too): cargo build --locked refuses a lock file that still names the previous version
+for f in $(git ls-files '*Cargo.lock' 2>/dev/null || find . -name Cargo.lock -not -path '*/target/*'); do
+    for c in intellistream-tsdb-client intellistream-tsdb-sys; do
+        for lv in $(sed -n "/^name = \"$c\"\$/{n;s/^version = \"\(.*\)\"\$/\1/p;}" "$f"); do
+            want "$f ($c)" "$lv"
+        done
+    done
+done
 # the first <version> after the project's own artifactId, and the dependencies on the Java client
 pom() { sed -n 's/^  <version>\(.*\)<\/version>$/\1/p' "$1" | head -n 1; }
 for f in client/java/pom.xml client/java-embedded/pom.xml connectors/pulsar/pom.xml; do
