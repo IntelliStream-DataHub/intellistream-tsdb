@@ -1,7 +1,9 @@
 # Statistics per series and per tenant
 
-Status: steps 1 and 2 (§9) built on branch `stats-s1` (query counters, event ring, sweeper, `tsdb_series_stats`, the
-metrics and `tsdb DIR stats [series]`); steps 3-5 are not. Design as written: Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
+Status: steps 1 and 2 (§9) are on main (query counters, event ring, sweeper, `tsdb_series_stats`, the metrics and
+`tsdb DIR stats [series]`); steps 3 and 4 are built on branch `stats-s34` (tenants, hot lists, residency, the C API
+and `tsdb DIR stats tenants|hot`; "Steps 3 and 4 as built" in §8 lists where they differ from the text below); step 5
+(the server ops and the clients) is not. Design as written: Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
 same day after an adversarial review (findings H1-H4, M1-M10, L1-L10; §11 says where each one is answered).
 Code references are `file:line` at e33d87f.
 
@@ -543,6 +545,26 @@ rounds of 10 s; mean inserts/s). The single-row lookup class and the two-handle 
 
 No difference outside run-to-run noise (in both directions, so the cost is not measurable here). Not yet run: the
 sweeper's catch-up time on the 100 M-row set, `tsdbc-bench`, and the settle time after a load.
+
+### Steps 3 and 4 as built (`src/stats_tenant.c`, `src/stats_hot.c`, `tests/test_tenants.c`)
+
+Where the code differs from the text above:
+
+- **Hot lists** are guarded by one mutex per list, taken by the owner once per sample (1 query in 8), not a seqlock:
+  TSan-clean and a few nanoseconds per query. The sample is a Bernoulli draw per query (xorshift), not a geometric
+  skip: the same distribution, and no aliasing with a client that sends its queries round-robin.
+- **The tenant map** is 2 bytes a series always (no 1-byte form under 256 tenants); a page of 65,536 ids that all
+  belong to one tenant is a number in the page table and allocates nothing.
+- **No A0** (a pending sum of level-0 parts): a part's split is added to the partition's vector at once; the recount
+  after a merge or a delete replaces the vector wholesale.
+- **A list change** keeps (from, to, id) triples of the moved series in memory until every partition has moved (8
+  bytes a moved series).
+- **Not built**: the per-series EXACT_ROWS flag (`tsdb_series_stats` flags 2 stays invalid), the wire flag for
+  approximate ingest (the ring overflow is counted in `stats_ring_overflows`; the struct has only PARTIAL), and
+  reading USERS beside the database in the CLI (`stats tenants` takes the prefixes as arguments and `--tenants FILE`).
+- **Tenant numbers are process-wide** and never reused (`tenant_intern`); `tsdb_tenant_stats_get` is named so because
+  the struct has the design's name. `TSDB_ABI_VERSION` is 6; the bindings carry the new `tsdb_options` fields (the
+  tenant list itself is not offered in them before step 5).
 
 ## 9. Build plan
 

@@ -103,6 +103,9 @@ cgroup, so `nice` does not keep your work out of its way.
 - `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable. `src/fno.c`: the `FNO` file (the
   durable bound of the WAL's log numbers). `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
   decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
+- `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
+  per-partition vectors, the HyperLogLogs of active series, the hot lists (reads, writes, bytes per row) and the
+  sampled page-cache residency; `tests/test_tenants.c` is their oracle, `tests/test_cli_stats.sh` the CLI's test.
 - `src/stats.c`: statistics (`docs/design-stats.md`, steps 1-2): the per-thread query counters
   (`tsdb_query_totals`), the event ring and sweeper thread behind `tsdb_volume_stats`' column totals, and the
   per-series walk of `tsdb_series_stats`. `tests/test_stats.c` is its oracle (`stats_ring_cap`, `stats_pause` and
@@ -409,7 +412,11 @@ cgroup, so `nice` does not keep your work out of its way.
   query or write. Query counters are one block per (thread, handle), written without a read-modify-write
   (`qs_end`, about 10 ns); a thread that outlives `tsdb_close` holds a reference on the registry, not on the handle.
   A new number that is kept per part goes into `part_walk` and must make the four byte columns add up to the part's
-  file (`test_stats`: `bytes == sum of tsdb_foreach_part`).
+  file (`test_stats`: `bytes == sum of tsdb_foreach_part`). **Tenant totals are the sum of the partition vectors**
+  (`src/stats_tenant.c`): a total changes only together with the vector it comes from, under `es->mu`, so it cannot
+  drift or go negative; a merge or a delete marks its partition stale and the recount replaces the vector whole; a
+  list change moves only the series whose tenant changed. Per-tenant numbers are never put on the metrics port (no
+  login there; design-stats.md section 10).
 - **The latest table** (`src/ltab.c`, `docs/design-latest.md`). Per series it holds the newest non-null row in the
   parts, or a bound on it (unknown); it is read and written only under `latest_rw` (`lt->rw`), and every write section
   bumps the volume's `lgen`. Writers: publishers (in the write section that lists their parts, after `parts_commit`,
