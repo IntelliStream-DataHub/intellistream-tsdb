@@ -1389,6 +1389,8 @@ class Db:
             database is created).
         insert_zstd_level: zstd level of the parts inserts write (default 0:
             none; merges compress them at zstd_level); -1: zstd_level.
+        stats, stats_sweep_mb_s: statistics of what is stored (-1 off, 0 lazy,
+            1 from the open; the sweeper's MB/s cap), as tsdb_options.
         The other keywords are the engine's tsdb_options fields of the same
         name; None keeps the engine's default. partition_ms and granule_rows
         are fixed when the database is created. value_codec is "auto",
@@ -1427,6 +1429,8 @@ class Db:
         partition_classes: bool | None = None,
         pin_index: bool | None = None,
         insert_zstd_level: int | None = None,
+        stats: int | None = None,
+        stats_sweep_mb_s: int | None = None,
     ) -> Db: ...
     def close(self) -> None:
         """Flushes the memtable and closes the database.
