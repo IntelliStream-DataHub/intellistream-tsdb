@@ -23,7 +23,7 @@ use crate::arrays::{BucketsMany, SidCol, agg_queries, inserts, many_cols, points
 use tc::ValueType;
 
 use crate::{
-    Buckets, QueryStats, Stats, TwaBuckets, buckets, closed, column_to_py, f32_column, group, multi, numpy_module,
+    Buckets, QueryStats, Stats, TwaBuckets, buckets, closed, column_to_py, f32_column, group, latest, multi, numpy_module,
     opts, points_to_py, py_column, range, rows_to_py, series_column, to_pyerr, ts_column, ts_to_py, twa_opts,
     value_type, values_column,
 };
@@ -992,6 +992,40 @@ impl Db {
     /// reached the disk, what failed (writes then fail until reopened).
     fn failed(&self, py: Python<'_>) -> PyResult<Option<String>> {
         self.with(py, |d| Ok(d.failed()))
+    }
+
+    /// As Client.latest(), in this process.
+    #[pyo3(signature = (series, end = None, *, with_nulls = false, threads = 0, errors = "raise", numpy = None))]
+    fn latest(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        end: Option<&Bound<'_, PyAny>>,
+        with_nulls: bool,
+        threads: u16,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<latest::LatestMany>> {
+        let q = latest::LatestReq::new(series, false, end, with_nulls, threads, errors, numpy)?;
+        let a = self.query(py, |d| q.run(d))?;
+        q.finish(py, a)
+    }
+
+    /// As Client.latest_by_name(), in this process.
+    #[pyo3(signature = (names, end = None, *, with_nulls = false, threads = 0, errors = "raise", numpy = None))]
+    fn latest_by_name(
+        &self,
+        py: Python<'_>,
+        names: &Bound<'_, PyAny>,
+        end: Option<&Bound<'_, PyAny>>,
+        with_nulls: bool,
+        threads: u16,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<latest::LatestMany>> {
+        let q = latest::LatestReq::new(names, true, end, with_nulls, threads, errors, numpy)?;
+        let a = self.query(py, |d| q.run(d))?;
+        q.finish(py, a)
     }
 
     /// As Client.query_values_multi(), in this process.

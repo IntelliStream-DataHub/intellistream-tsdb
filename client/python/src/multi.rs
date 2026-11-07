@@ -49,12 +49,12 @@ enum BSpec {
 }
 
 /// A scalar for every series or one value each.
-enum PerSeries {
+pub(crate) enum PerSeries {
     All(Option<i64>),
     Each(Vec<i64>),
 }
 
-fn per_series(obj: Option<&Bound<'_, PyAny>>, n: usize, what: &str) -> PyResult<PerSeries> {
+pub(crate) fn per_series(obj: Option<&Bound<'_, PyAny>>, n: usize, what: &str) -> PyResult<PerSeries> {
     let Some(obj) = obj.filter(|o| !o.is_none()) else { return Ok(PerSeries::All(None)) };
     if let Ok(v) = obj.extract::<i64>() {
         return Ok(PerSeries::All(Some(v)));

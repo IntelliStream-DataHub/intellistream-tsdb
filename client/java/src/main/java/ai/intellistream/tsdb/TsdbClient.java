@@ -119,6 +119,7 @@ public final class TsdbClient implements AutoCloseable {
     private final BitSet chunkNulls = new BitSet();
     private int zlevel = 1;                      /* zstd level of packed inserts; 0: plain arrays */
     private int serverVersion;                   /* from HELLO at connect */
+    private final java.util.HashMap<String, Long> latestNames = new java.util.HashMap<>(); /* name -> id, latestByName */
     private boolean loginRequired, scram;        /* from HELLO: the server asks for a login, and offers SCRAM */
     private Compressor zstd;                     /* created at the first packed insert */
     private boolean noZstd;                      /* zstd-jni could not be loaded: send plain arrays */
@@ -3435,6 +3436,176 @@ public final class TsdbClient implements AutoCloseable {
         closeQuietly(ch);
         closeQuietly(selector);
         return new TsdbException(status, detail, cause);
+    }
+
+    // ------------------------------------------------------------------ latest
+
+    /**
+     * The newest row of each of many series in one request (protocol 14): the row with the greatest timestamp whose
+     * value is not null, answered from a table the server keeps, so the cost does not grow with the history. A series
+     * without such a row answers {@link Latest.Kind#NONE}; an id the server does not know, or a user may not read,
+     * fails in its own entry ({@link Status#ERR_NOTFOUND}, {@link Status#ERR_DENIED}: a denied id looks like a
+     * missing one) and does not fail the others.
+     *
+     * @param ids series ids, up to 1,048,576
+     * @param o the bound, nulls and threads
+     * @return one result per id, in order
+     * @throws TsdbException the request failed; {@link Status#ERR_INVALID} also when the server speaks less than
+     *     protocol 14 (nothing was sent)
+     */
+    public List<SeriesResult<Latest>> latest(long[] ids, LatestOptions o) throws TsdbException {
+        Objects.requireNonNull(ids, "ids");
+        Objects.requireNonNull(o, "options");
+        int n = ids.length;
+        checkLatest(n, o);
+        if (n == 0)
+            return List.of();
+        latestVersion();
+        return latestRequest(ids, o);
+    }
+
+    /**
+     * {@link #latest(long[], LatestOptions)} with no bound: the newest non-null row of each series.
+     *
+     * @param ids series ids
+     * @return one result per id, in order
+     * @throws TsdbException as {@link #latest(long[], LatestOptions)}
+     */
+    public List<SeriesResult<Latest>> latest(long... ids) throws TsdbException {
+        return latest(ids, LatestOptions.defaults());
+    }
+
+    /**
+     * {@link #latest(long[], LatestOptions)} by name. A name is looked up once per connection and its id kept; a name
+     * that does not resolve fails in its own entry ({@link Status#ERR_NOTFOUND}, or {@link Status#ERR_DENIED} outside
+     * the user's grants, whether or not it exists).
+     *
+     * @param names series names
+     * @param o the bound, nulls and threads
+     * @return one result per name, in order
+     * @throws TsdbException as {@link #latest(long[], LatestOptions)}
+     */
+    public List<SeriesResult<Latest>> latestByName(String[] names, LatestOptions o) throws TsdbException {
+        Objects.requireNonNull(names, "names");
+        Objects.requireNonNull(o, "options");
+        int n = names.length;
+        checkLatest(n, o);
+        if (n == 0)
+            return List.of();
+        latestVersion();
+        SeriesResult<Latest>[] res = newResults(n);
+        long[] ids = new long[n];
+        int[] at = new int[n];
+        int k = 0;
+        for (int i = 0; i < n; i++) {
+            String name = Objects.requireNonNull(names[i], "name");
+            if (name.isEmpty()) {
+                res[i] = SeriesResult.failed(Status.ERR_INVALID, "empty series name");
+                continue;
+            }
+            Long id = latestNames.get(name);
+            if (id == null) {
+                try {
+                    id = seriesRequest(name, false, null);
+                } catch (TsdbException e) {
+                    int st = e.status();
+                    if (st != Status.ERR_NOTFOUND && st != Status.ERR_DENIED && st != Status.ERR_INVALID)
+                        throw e;
+                    res[i] = SeriesResult.failed(st, e.getMessage());
+                    continue;
+                }
+                if (latestNames.size() < Protocol.LATEST_MAX_IDS)
+                    latestNames.put(name, id);
+            }
+            ids[k] = id;
+            at[k++] = i;
+        }
+        if (k > 0) {
+            long[] ends = o.ends();
+            LatestOptions q = o;
+            if (ends != null) {
+                long[] e = new long[k];
+                for (int j = 0; j < k; j++)
+                    e[j] = ends[at[j]];
+                q = o.ends(e);
+            }
+            List<SeriesResult<Latest>> got = latestRequest(k == n ? ids : Arrays.copyOf(ids, k), q);
+            for (int j = 0; j < k; j++)
+                res[at[j]] = got.get(j);
+        }
+        return Collections.unmodifiableList(Arrays.asList(res));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static SeriesResult<Latest>[] newResults(int n) {
+        return (SeriesResult<Latest>[]) new SeriesResult<?>[n];
+    }
+
+    private static void checkLatest(int n, LatestOptions o) {
+        if (n > Protocol.LATEST_MAX_IDS)
+            throw new IllegalArgumentException(n + " series (at most " + Protocol.LATEST_MAX_IDS + ")");
+        if (o.ends() != null && o.ends().length != n)
+            throw new IllegalArgumentException(o.ends().length + " ends for " + n + " series");
+    }
+
+    /** The server must speak 14: an older one does not know the op, and nothing is sent to it. */
+    private void latestVersion() throws TsdbException {
+        if (serverVersion < 14)
+            throw new TsdbException(Status.ERR_INVALID, "QUERY_LATEST needs protocol 14; the server speaks "
+                    + serverVersion, null);
+    }
+
+    private List<SeriesResult<Latest>> latestRequest(long[] ids, LatestOptions o) throws TsdbException {
+        int n = ids.length;
+        int flags = (o.withNulls() ? Protocol.LATEST_WITH_NULLS : 0) | (o.ends() != null ? Protocol.LATEST_PER_END : 0);
+        request();
+        begin(Protocol.OP_QUERY_LATEST,
+                Protocol.LATEST_HEADER + (o.ends() != null ? (long) n * Long.BYTES : 0) + (long) n * Long.BYTES);
+        out.put((byte) flags).put((byte) 0).putShort((short) o.threads()).putInt(n)
+                .putLong(o.ends() != null ? 0 : o.end());
+        if (o.ends() != null)
+            putLongs(o.ends(), 0, n);
+        putLongs(ids, 0, n);
+        send();
+        SeriesResult<Latest>[] res = newResults(n);
+        int got = 0;
+        for (;;) {
+            int st = frame();
+            int p = in.position(), blen = bodyLen;
+            if (blen < Protocol.LATEST_PREFIX)
+                throw lost(Status.ERR_CORRUPT, "QUERY_LATEST reply frame of " + blen + " bytes");
+            int first = in.getInt(p), m = in.getInt(p + 4);
+            int last = in.get(p + 8) & 0xff;
+            if (in.get(p + 9) != 0 || in.getShort(p + 10) != 0 || last > 1)
+                throw lost(Status.ERR_CORRUPT, "QUERY_LATEST frame with a reserved byte set");
+            if (st != Status.OK) {
+                /* the request's own status: an empty closing frame (an HA status's body went to err) */
+                if (m != 0 || last != 1)
+                    throw lost(Status.ERR_CORRUPT, "QUERY_LATEST error frame with records");
+                endReply();
+                throw error(st);
+            }
+            if (first != got || m < 0 || m > Protocol.LATEST_FRAME_IDS || m > n - got
+                    || blen != Protocol.LATEST_PREFIX + (long) m * Protocol.LATEST_REC
+                    || (last == 1) != (got + m == n) || (last == 0 && m == 0))
+                throw lost(Status.ERR_CORRUPT, "QUERY_LATEST frame: first " + Integer.toUnsignedString(first) + ", "
+                        + Integer.toUnsignedString(m) + " records, last " + last);
+            int q = p + Protocol.LATEST_PREFIX;
+            for (int i = 0; i < m; i++, q += Protocol.LATEST_REC) {
+                int rs = in.getInt(q), kind = in.get(q + 4) & 0xff, ty = in.get(q + 5) & 0xff;
+                long ts = in.getLong(q + 8), bits = in.getLong(q + 16);
+                Latest l = in.getShort(q + 6) == 0 ? Latest.of(kind, ty, ts, bits) : null;
+                if (l == null || (rs != 0 && kind != 2) || (kind == 1 && !o.withNulls()))
+                    throw lost(Status.ERR_CORRUPT, "QUERY_LATEST record out of shape");
+                res[got++] = rs == 0 ? SeriesResult.of(l) : SeriesResult.failed(rs, null);
+            }
+            if (last == 1) {
+                endReply();
+                break;
+            }
+            in.position(bodyEnd); /* the reply goes on: the same id until the last frame */
+        }
+        return Collections.unmodifiableList(Arrays.asList(res));
     }
 
     /** Starts a request frame in the (empty) send buffer. */

@@ -374,6 +374,41 @@ class Many(Sequence[Any]):
     def __getitem__(self, i: slice) -> list[Any]: ...
 
 @final
+class LatestMany(Sequence[Any]):
+    """The answers of one latest call, in the order asked. `r[i]` is `(ts, value)` for series i's newest value,
+    `(ts, None)` for a null (with_nulls=True), `None` when the series has no row, and raises TsdbError when
+    its status is not 0 (NOTFOUND or DENIED).
+    """
+    @property
+    def series(self) -> list[int]:
+        """The series ids, in the order asked (empty for latest_by_name())."""
+    @property
+    def names(self) -> list[str] | None:
+        """The names asked (latest_by_name()), else None."""
+    @property
+    def status(self) -> Any:
+        """Each answer's status: 0, or a TSDB_ERR_* code (NOTFOUND, DENIED, INVALID)."""
+    @property
+    def kind(self) -> Any:
+        """Each answer's kind: 0 a value, 1 a null (with_nulls=True), 2 no row (or a status)."""
+    @property
+    def ts(self) -> Any:
+        """Each row's timestamp (ms); 0 where kind is 2."""
+    @property
+    def values(self) -> list[Any]:
+        """Each value as a Python object (float, int or bool; a state is its code); None where kind is not 0."""
+    @property
+    def ok(self) -> bool:
+        """True when every series was answered (no NOTFOUND or DENIED)."""
+    def error_of(self, i: int) -> TsdbError | None:
+        """The error of series i (a TsdbError, not raised), or None when it was answered."""
+    def __len__(self) -> int: ...
+    @overload
+    def __getitem__(self, i: int) -> tuple[int, Any] | None: ...
+    @overload
+    def __getitem__(self, i: slice) -> list[tuple[int, Any] | None]: ...
+
+@final
 class TwaBucket:
     """One bucket of a time-weighted average (query_twa*()).
 
@@ -1300,6 +1335,75 @@ class Client:
             ValueError: A selector or rights it cannot read.
             TsdbError: As grant().
         """
+    def latest(
+        self,
+        series: _SeriesIds,
+        end: int | _Timestamps | None = None,
+        *,
+        with_nulls: bool = False,
+        threads: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> LatestMany:
+        """The newest row of many series in one request (tsdbd protocol 14).
+
+        The server answers a series from an in-memory table of each series' newest value, so the cost does
+        not grow with the history; lists of more than 65,536 series go as several frames.
+
+        Args:
+            series: Series ids: a list of ints, or a uint64 or int64 array.
+            end: Only rows before this timestamp (ms): one for every series, or a list or int64 array with
+                one per series; None for no bound.
+            with_nulls: Answer the newest row even when it is a null (then r[i] is (ts, None)); slower.
+            threads: Threads the request uses at most; 0 for the server's --request-threads.
+            errors: "raise" raises TsdbError (with .index and .result, the LatestMany) for the first series
+                that was NOTFOUND or DENIED (a denied series looks like a missing one); "status" returns the
+                LatestMany, whose .status tells which failed.
+            numpy: As for query_values().
+
+        Returns:
+            LatestMany: r[i] is (ts, value), (ts, None) for a null, or None for a series without a row.
+            r.ts, r.kind and r.status are columns; r.values a list.
+
+        Raises:
+            TsdbError: A series failed (errors="raise"), or the whole request failed (a server below
+                protocol 14 answers INVALID).
+        """
+
+    def latest_by_name(
+        self,
+        names: Sequence[str],
+        end: int | _Timestamps | None = None,
+        *,
+        with_nulls: bool = False,
+        threads: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> LatestMany:
+        """As latest(), by name: the newest row of many series, asked by name (tsdbd protocol 14).
+
+        The server answers a series from an in-memory table of each series' newest value, so the cost does
+        not grow with the history; lists of more than 65,536 series go as several frames.
+
+        Args:
+            names: Series names: a list of str. A name is looked up once per connection.
+            end: Only rows before this timestamp (ms): one for every series, or a list or int64 array with
+                one per series; None for no bound.
+            with_nulls: Answer the newest row even when it is a null (then r[i] is (ts, None)); slower.
+            threads: Threads the request uses at most; 0 for the server's --request-threads.
+            errors: "raise" raises TsdbError (with .index and .result, the LatestMany) for the first series
+                that was NOTFOUND or DENIED (a denied series looks like a missing one); "status" returns the
+                LatestMany, whose .status tells which failed.
+            numpy: As for query_values().
+
+        Returns:
+            LatestMany: r[i] is (ts, value), (ts, None) for a null, or None for a series without a row.
+            r.ts, r.kind and r.status are columns; r.values a list.
+
+        Raises:
+            TsdbError: A series failed (errors="raise"), or the whole request failed (a server below
+                protocol 14 answers INVALID).
+        """
     def query_values_multi(
         self,
         series: _SeriesIds,
@@ -1993,6 +2097,29 @@ class Db:
         """A read-only database: picks up what the writer published since the last refresh."""
     def stats(self) -> Stats:
         """Returns the storage statistics."""
+    def latest(
+        self,
+        series: _SeriesIds,
+        end: int | _Timestamps | None = None,
+        *,
+        with_nulls: bool = False,
+        threads: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> LatestMany:
+        """As Client.latest(), in this process."""
+
+    def latest_by_name(
+        self,
+        names: Sequence[str],
+        end: int | _Timestamps | None = None,
+        *,
+        with_nulls: bool = False,
+        threads: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> LatestMany:
+        """As Client.latest_by_name(), in this process."""
     def query_values_multi(
         self,
         series: _SeriesIds,
@@ -2210,6 +2337,29 @@ class Pool:
                 found before inserting, as in Db.insert_many(), insert nothing).
                 An insert whose connection broke is not retried.
         """
+    def latest(
+        self,
+        series: _SeriesIds,
+        end: int | _Timestamps | None = None,
+        *,
+        with_nulls: bool = False,
+        threads: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> LatestMany:
+        """As Client.latest() (on one of the connections)."""
+
+    def latest_by_name(
+        self,
+        names: Sequence[str],
+        end: int | _Timestamps | None = None,
+        *,
+        with_nulls: bool = False,
+        threads: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> LatestMany:
+        """As Client.latest_by_name() (on one of the connections)."""
     def query_values_multi(
         self,
         series: _SeriesIds,
