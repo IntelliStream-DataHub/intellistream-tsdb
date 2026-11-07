@@ -524,6 +524,24 @@ requests for you. `query_chunks_multi` streams raw rows to a closure as
 they arrive; returning `ControlFlow::Break` stops the request on the server
 too.
 
+## The newest value of many series
+
+`Client::latest(&ids, &LatestOpts::default())` and `latest_by_name(&names, &opts)` answer the newest row of every
+series in one request (protocol 14; `Db` and `Pool` have the same). Each answer is a `Latest { status, kind, ts, value }`;
+`point()` gives `Some((ts, LatestValue))` for a row that is not null. `LatestOpts::default().with_nulls()` asks for
+the newest row whether null or not, `.end(t)` for rows before `t`, `.ends(&[..])` for one bound per series.
+
+```rust
+let ans = c.latest_by_name(&["pump0.flow", "pump1.flow"], &LatestOpts::default())?;
+for l in &ans {
+    match (l.status, l.point()) {
+        (Some(st), _) => println!("not answered: {st:?}"), // NotFound; Denied looks the same for a missing series
+        (None, Some((ts, v))) => println!("{ts} {v:?}"),
+        (None, None) => println!("no row"),
+    }
+}
+```
+
 ## API documentation
 
 ```sh
