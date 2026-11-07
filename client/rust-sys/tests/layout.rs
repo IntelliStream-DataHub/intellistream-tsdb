@@ -20,7 +20,7 @@ fn structs_match_the_c_header() {
             buffer_rows, flush_interval_ms, wal_sync_ms, wal_max_batch_rows, max_part_bytes, read_only, follow,
             refresh_ms, merge_idle_s, obsolete_part_lifetime_s, verify_checksums, retention_merge_s, clock_ms,
             clock_arg, create_volumes, request_threads, partition_classes, pin_index, insert_zstd_level,
-            stats, stats_sweep_mb_s }
+            stats, stats_sweep_mb_s, latest_cache }
         tsdb_values { type_, values, valid }
         tsdb_points { ts, values, n, cap }
         tsdb_bucket { start, count, sum, min, max, isum, imin, imax }

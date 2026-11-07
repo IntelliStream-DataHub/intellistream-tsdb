@@ -44,8 +44,9 @@ disk format and the wire protocol.
   C client keeps a copy of each request until its reply (one more memcpy). A connection gets the bodies only if its
   HELLO said 13 (a client of 12 reads the bare status, as before), and in QUERY_MULTI only the END frame carries the
   body. The Pulsar sink works as before (its tests pass), and treats DROPPED as final (dead letter). **Protocol numbers moved:** `QUERY_LATEST` is protocol 14, the change feed 15, statistics 16.
-- The embedded C ABI is version 4: `tsdb_options` gained `stats` and `stats_sweep_mb_s` (the Rust, Python and Java
-  bindings carry them). The statistics change neither the wire protocol nor the disk format.
+- The embedded C ABI is version 5: `tsdb_options` gained `stats` and `stats_sweep_mb_s` (4) and `latest_cache` (5); the
+  Rust, Python and Java bindings carry them. The statistics and the latest table change neither the wire protocol
+  nor the disk format.
 
 ### Added
 
@@ -66,6 +67,12 @@ disk format and the wire protocol.
   `tsdb_query_*_total` counters and `tsdb_major_faults_total` (docs/metrics.md); there are no per-tenant metrics.
   `tsdb DIR stats` now reports the bytes by type and where they go (it used to assume 12 bytes a row for every
   type), and `tsdb DIR stats series NAME...` prints the numbers of single series.
+- **The latest table** (engine, `docs/design-latest.md` step 2): per volume, the newest non-null row of every series in
+  the parts (or a bound on it), kept exact by every listing of parts (flush, insert, replay, delete, replace), by
+  retention and by `tsdb_drop_before`, and filled by a background warmer. `tsdb_latest` answers from it in O(1) and
+  falls back to the slow path for an entry that is unknown. New option `latest_cache` (bytes; `tsdb_options_init` sets
+  RAM/16, 0 turns the table off; followers have none). Large flushes (50,000 series or more) store their rows in a
+  window that lookups can read.
 
 Hardening from the 0.9.1 security review (the minor findings). No format or protocol change.
 

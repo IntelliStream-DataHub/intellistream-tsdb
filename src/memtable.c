@@ -138,8 +138,9 @@ static int mt_reserve(memtable *m, uint32_t id)
 
 /* Adds rows to a memtable the caller may modify (the active one, under buf_lock). */
 int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n,
-           uint64_t lsn0)
+           uint64_t lsn0, int type)
 {
+    const uint64_t null = type >= 0 ? type_null(type) : 0;
     for (size_t i = 0; i < n; i++) {
         uint32_t id = series ? series[i] : cs;
         int rc = mt_reserve(m, id);
@@ -148,8 +149,22 @@ int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         mt_series *s = &m->s[id];
         if (s->n && ts[i] < s->ts[s->n - 1])
             s->sorted = false;
+        uint64_t slot = slot_get(v, w, i);
+        if (type >= 0) { /* the latest table's memtable layer (design-latest.md 2.2), on the line just touched */
+            s->type = (uint8_t)type;
+            if (slot != null) { /* a newer (or equal-time) non-null row is the series' newest; an older one is not */
+                if (!(s->fl & MTF_HAS_NN) || ts[i] >= s->ts[s->top_nn]) {
+                    s->top_nn = s->n;
+                    s->fl = (uint8_t)((s->fl | MTF_HAS_NN) & ~MTF_NN_STALE);
+                }
+            } else {
+                s->fl |= MTF_HAS_NULL;
+                if ((s->fl & MTF_HAS_NN) && ts[i] == s->ts[s->top_nn])
+                    s->fl |= MTF_NN_STALE; /* last write at the newest non-null timestamp is a null now */
+            }
+        }
         s->ts[s->n] = ts[i];
-        s->v[s->n] = slot_get(v, w, i);
+        s->v[s->n] = slot;
         s->lsn[s->n] = lsn0 ? lsn0 + i : 0;
         s->n++;
         m->rows++;
@@ -870,7 +885,8 @@ static lw_fence *lw_overlaps(const eng *db, const uint32_t *series, uint32_t cs,
 
 __thread const volatile int *cur_abandon;
 
-int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n)
+int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n,
+               int type)
 {
     pthread_mutex_lock(&db->buf_lock);
     /* after the large write's publish this batch is the newer one, and wins as a memtable row (lw_fence) */
@@ -917,7 +933,7 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         counted = rc == 0;
     }
     if (rc == 0)
-        rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_appended + 1);
+        rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_appended + 1, type);
     if (rc == 0 && fno0)
         mt_note_fno(db->active, fno0, n);
     if (counted)
@@ -990,6 +1006,9 @@ static int flush_waiting(eng *db)
             free(pl.p);
             break;
         }
+        lt_sec lsec; /* the latest table folds the flush in the section that lists it and drops the memtable */
+        lt_begin_flush(db, &lsec, pl.p, pl.n);
+        lt_fold(db, &lsec, pl.p, pl.n);
         pthread_mutex_lock(&db->lock);
         for (size_t k = 0; k < pl.n; k++)
             db_parts_insert_locked(db, pl.p[k]);
@@ -1000,6 +1019,7 @@ static int flush_waiting(eng *db)
             cls_wal_tail_locked(db, wt, m->wal_seq, m->max_ts);
         pthread_cond_signal(&db->merge_cv);
         pthread_mutex_unlock(&db->lock);
+        lt_end(db, &lsec);
         pthread_mutex_unlock(&db->publish_lock);
         cls_thaw(db);
         int mrc = manifest_publish(db); /* fails the engine on error */
@@ -1497,7 +1517,7 @@ int wal_open(eng *db, int (*before_replay)(eng *))
                 }
                 if (cached_seq >= segs[k].seq)
                     continue; /* already in a part */
-                rc = mt_add(m, NULL, id, &ts, &slot, 8, 1, 0);
+                rc = mt_add(m, NULL, id, &ts, &slot, 8, 1, 0, -1);
                 if (rc == 0)
                     mt_note_fno(m, wr.fno + i, 1);
             }

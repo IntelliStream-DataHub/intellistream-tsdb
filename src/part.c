@@ -282,6 +282,7 @@ void part_unref(part *p)
         return;
     munmap((void *)p->map, p->map_len);
     free(p->icopy);
+    free(p->lf);
     if (atomic_load(&p->obsolete)) {
         char retired[sizeof p->name + 8];
         if (p->retired)
@@ -358,6 +359,7 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     /* inserts and flushes (CODEC_FAST) may skip zstd: a merge re-encodes every part no merge wrote (merge.c) */
     w->zstd_level = db->opt.insert_zstd_level < 0 ? db->opt.zstd_level : db->opt.insert_zstd_level;
     w->value_codec = db->opt.value_codec;
+    w->lf_on = db->lt != NULL;
     w->min_ts = INT64_MAX;
     w->max_ts = INT64_MIN;
     w->cap = PW_FLUSH_BYTES + 2 * block_bound(w->grows) + sizeof(part_header) + 8;
@@ -442,6 +444,8 @@ static int pw_emit(part_writer *w, uint32_t series, int type, const int64_t *ts,
         return TSDB_ERR_NOMEM;
     granule_stats(type, v, n, &g);
     granule_twa(type, ts, v, n, &g);
+    if (w->lf_on && lf_granule(&w->lf, &w->nlf, &w->lfcap, series, type, ts, v, n, g.nulls) != 0)
+        return TSDB_ERR_NOMEM;
     g.series = series;
     g.count = (uint32_t)n;
     g.ts_min = ts[0];
@@ -769,6 +773,7 @@ void pw_abort(part_writer *w)
     free(w->pend_v);
     free(w->tombs);
     free(w->hk_buf);
+    free(w->lf);
     memset(w, 0, sizeof *w);
     w->fd = -1;
 }
@@ -859,9 +864,12 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         rc = part_open_as(db->dirfd, w->tmp_name, name, db->opt.pin_index, db->parts_v8, out);
         if (rc == 0)
             (*out)->verify = db->opt.verify_checksums;
-        if (rc == 0)
+        if (rc == 0) {
             snprintf((*out)->pending, sizeof (*out)->pending, "%s", w->tmp_name);
-        else
+            (*out)->lf = w->lf; /* the publisher folds it into the latest table and frees it */
+            (*out)->nlf = w->nlf;
+            w->lf = NULL;
+        } else
             unlinkat(db->dirfd, w->tmp_name, 0);
         pw_abort(w);
         return rc;

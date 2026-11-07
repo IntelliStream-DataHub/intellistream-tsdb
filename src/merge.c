@@ -128,6 +128,7 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
     for (size_t k = 0; k < best_n; k++) {
         sel[k] = db->parts[best_i + k];
         sel[k]->merging = true;
+        sel[k]->merge_len_gen = atomic_load(&db->ret_len_gen);
         part_ref(sel[k]);
     }
     return best_n;
@@ -263,6 +264,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
     }
     w.fno_lo = fno_lo, w.fno_hi = fno_hi, w.written_ms = written_ms;
     w.keep_empty = true; /* replaces its sources even when nothing is left */
+    w.lf_on = false;     /* a merge keeps every live last-write-wins value: the latest table is not told (L8) */
     w.effort = CODEC_MERGE;
     w.zstd_level = db->opt.zstd_level; /* pw_begin chose the insert level */
     w.empty_ts = min_ts;
@@ -470,14 +472,33 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
 }
 
 /* Replaces src with out in the parts list. Caller holds db->lock and still
- * owns one reference to each source part (dropped later by the caller). */
-void merge_commit_locked(eng *db, part **src, size_t k, part *out, int rc)
+ * owns one reference to each source part (dropped later by the caller). Returns true when out was listed: only
+ * then is the caller's out still a live part (otherwise this dropped the last reference to it). */
+bool merge_commit_locked(eng *db, part **src, size_t k, part *out, int rc)
 {
     bool dropped = false;
+    /* A limit lengthened since this merge's sources were selected (db->ret_len_gen, bumped under db->lock): the
+     * merge may have dropped rows the new limit keeps, and the latest table may name one of them. It lists across the
+     * change (design-latest.md 3.5): in a write section of the table, which comes before db->lock, it marks the
+     * entries that may name a row it dropped (lt_merge_marks) and lists. The sources are still `merging`, so no
+     * drop or other merge takes them while db->lock is let go. */
+    bool lengthened = false;
+    for (size_t i = 0; i < k; i++)
+        lengthened |= src[i]->merge_len_gen != atomic_load(&db->ret_len_gen);
+    lt_sec lsec;
+    bool in_sec = false;
+    if (lengthened && out && db->lt) {
+        pthread_mutex_unlock(&db->lock);
+        lt_begin(db, &lsec);
+        pthread_mutex_lock(&db->lock);
+        in_sec = true;
+    }
     for (size_t i = 0; i < k; i++) {
         src[i]->merging = false;
         dropped |= src[i]->dropped;
     }
+    if (in_sec && out && !dropped)
+        lt_merge_marks(db, &lsec, src, k);
     if (!out && rc != 0 && rc != TSDB_ERR_STOPPED && !dropped) {
         /* a failed merge is no progress, whatever the reason (a full disk, EIO on the output, NOMEM): db_wait_merges
          * counts the time of its partition's merges as idle once one has failed since its wait began */
@@ -485,6 +506,7 @@ void merge_commit_locked(eng *db, part **src, size_t k, part *out, int rc)
         for (size_t i = 0; i < k; i++)
             src[i]->fail_seq = db->merge_fail_seq;
     }
+    bool listed = false;
     if (out && !dropped && eng_check(db)) {
         part_unref(out); /* failed engine: no renames; the next open sees what a crash here leaves */
     } else if (out && !dropped) {
@@ -492,6 +514,7 @@ void merge_commit_locked(eng *db, part **src, size_t k, part *out, int rc)
         db_stall_clear_locked(db, out->partition);
         for (size_t i = 0; i < k; i++)
             db_retire_locked(db, src[i]);
+        listed = true;
         jr_commit(db, JR_MERGE, out);
     } else if (out) {
         /* A source was dropped meanwhile: the merged data must not come back. Neither eng_drop_before nor the
@@ -506,7 +529,10 @@ void merge_commit_locked(eng *db, part **src, size_t k, part *out, int rc)
         }
         part_unref(out);
     }
+    if (in_sec)
+        lt_end(db, &lsec);
     pthread_cond_broadcast(&db->merged_cv);
+    return listed;
 }
 
 /* ------------------------------------------------------------ retention */
@@ -626,6 +652,7 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
                 wall - p->created < db->opt.retention_merge_s)
                 continue;
             p->merging = true;
+            p->merge_len_gen = atomic_load(&db->ret_len_gen);
             part_ref(p);
             sel[k++] = p;
         }
@@ -679,9 +706,9 @@ void *merge_thread_main(void *arg)
             fprintf(stderr, "tsdb: merge of %s..%s failed: %s\n", sel[0]->name, sel[k - 1]->name,
                     tsdb_strerror(rc));
         pthread_mutex_lock(&db->lock);
-        merge_commit_locked(db, sel, k, out, rc);
+        bool listed = merge_commit_locked(db, sel, k, out, rc);
         part *watch = NULL; /* an idle partition merged down to one part: its series' rates are measured */
-        if (out && !atomic_load(&out->obsolete) && db->opt.merge_idle_s >= 0 &&
+        if (listed && db->opt.merge_idle_s >= 0 &&
             time(NULL) - out->written >= db->opt.merge_idle_s && partition_part_count_locked(db, out->partition) == 1) {
             watch = out;
             part_ref(watch);
@@ -764,6 +791,7 @@ int eng_optimize(eng *db)
         for (size_t i = a; i < e && k < MAX_MERGE_PARTS; i++) {
             sel[k] = db->parts[i];
             sel[k]->merging = true;
+            sel[k]->merge_len_gen = atomic_load(&db->ret_len_gen);
             part_ref(sel[k]);
             k++;
         }

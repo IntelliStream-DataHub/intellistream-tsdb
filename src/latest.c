@@ -366,28 +366,15 @@ static int latest_at(lctx *x, uint32_t series, int64_t lo, int64_t end, bool wit
     return rc;
 }
 
-int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
-               latest_row *out)
+/* The search of n ids on the cut `c` (which the caller owns and releases), with the lower bounds lo[] (the cutoffs,
+ * read before the cut). out[i].status/type are set by the caller; ids with a status are skipped. */
+static int search_on_cut(eng *db, const qcut *c, const uint32_t *local, size_t n, const int64_t *lo,
+                         const int64_t *ends, int64_t end, bool with_nulls, latest_row *out)
 {
-    int64_t *lo = malloc((n ? n : 1) * sizeof *lo);
-    if (!lo)
-        return TSDB_ERR_NOMEM;
-    for (size_t i = 0; i < n; i++) {
-        out[i] = (latest_row){.kind = LK_NONE};
-        int ty = eng_series_type(db, local[i]);
-        if (ty < 0)
-            out[i].status = TSDB_ERR_NOTFOUND;
-        else
-            out[i].type = (uint8_t)ty;
-        lo[i] = ty < 0 ? 0 : eng_cutoff(db, local[i]); /* before the cut, as a query reads it */
-    }
     lctx x = {0};
     x.db = db;
-    int rc = cut_take(db, &x.c);
-    if (rc) {
-        free(lo);
-        return rc;
-    }
+    x.c = *c;
+    int rc = 0;
     x.np = x.c.np;
     x.ord = malloc((x.np ? x.np : 1) * sizeof *x.ord);
     x.tp = malloc((x.np ? x.np : 1) * sizeof *x.tp);
@@ -430,7 +417,54 @@ int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, in
     free(x.ord);
     free(x.tp);
     free(x.runs);
-    cut_release(&x.c);
+    return rc;
+}
+
+/* The slow path for n ids on one cut of the engine: no table, every id searched (also the table path's searches). */
+int eng_latest_search(eng *db, const uint32_t *local, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
+                      latest_row *out)
+{
+    int64_t *lo = malloc((n ? n : 1) * sizeof *lo);
+    if (!lo)
+        return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = (latest_row){.kind = LK_NONE};
+        int ty = eng_series_type(db, local[i]);
+        if (ty < 0)
+            out[i].status = TSDB_ERR_NOTFOUND;
+        else
+            out[i].type = (uint8_t)ty;
+        lo[i] = ty < 0 ? 0 : eng_cutoff(db, local[i]); /* before the cut, as a query reads it */
+    }
+    qcut c;
+    int rc = cut_take(db, &c);
+    if (rc) {
+        free(lo);
+        return rc;
+    }
+    rc = search_on_cut(db, &c, local, n, lo, ends, end, with_nulls, out);
+    cut_release(&c);
+    free(lo);
+    return rc;
+}
+
+/* The warmer's fill (ltab.c, 3.8): for each id the newest non-null row in the PARTS of the cut, whatever the cutoff
+ * (the table keeps what the parts hold; lookups apply the cutoff). The caller's cut has no memtable sources. */
+int eng_latest_fill(eng *db, const qcut *c, const uint32_t *local, size_t n, latest_row *out)
+{
+    int64_t *lo = malloc((n ? n : 1) * sizeof *lo);
+    if (!lo)
+        return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = (latest_row){.kind = LK_NONE};
+        int ty = eng_series_type(db, local[i]);
+        if (ty < 0)
+            out[i].status = TSDB_ERR_NOTFOUND;
+        else
+            out[i].type = (uint8_t)ty;
+        lo[i] = INT64_MIN;
+    }
+    int rc = search_on_cut(db, c, local, n, lo, NULL, INT64_MAX, false, out);
     free(lo);
     return rc;
 }

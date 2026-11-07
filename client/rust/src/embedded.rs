@@ -69,6 +69,9 @@ pub struct Options {
     /// zstd level of the parts inserts and memtable flushes write; default 0: none (faster to write, larger
     /// until a background merge re-encodes them at `zstd_level`). -1: `zstd_level`, as merges.
     pub insert_zstd_level: i32,
+    /// Bytes of memory for the latest tables of the whole process (16 bytes a series); default RAM / 16; 0: no
+    /// table, `latest` is answered from the parts and memtables (the same answers, much slower per series).
+    pub latest_cache: usize,
     /// Value encoding.
     pub value_codec: ValueCodec,
     /// fsync parts before publishing them. Default true.
@@ -132,6 +135,7 @@ impl Default for Options {
             insert_zstd_level: o.insert_zstd_level,
             stats: o.stats,
             stats_sweep_mb_s: o.stats_sweep_mb_s,
+            latest_cache: o.latest_cache,
             value_codec: match o.value_codec {
                 sys::TSDB_VALUES_GORILLA => ValueCodec::Gorilla,
                 sys::TSDB_VALUES_CHIMP => ValueCodec::Chimp,
@@ -195,6 +199,7 @@ impl Options {
             insert_zstd_level: self.insert_zstd_level,
             stats: self.stats,
             stats_sweep_mb_s: self.stats_sweep_mb_s,
+            latest_cache: self.latest_cache,
         }
     }
 }
@@ -389,7 +394,7 @@ impl Drop for Db {
 
 /// The `TSDB_ABI_VERSION` this crate was written for. A struct can keep its size while its fields move
 /// (`tsdb_series_result` did when ids became 64 bits), so the engine's number is compared, not sizes.
-const ABI_VERSION: c_int = 4;
+const ABI_VERSION: c_int = 5;
 
 fn check_abi(found: c_int) -> Result<()> {
     if found != ABI_VERSION {

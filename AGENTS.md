@@ -410,10 +410,29 @@ cgroup, so `nice` does not keep your work out of its way.
   (`qs_end`, about 10 ns); a thread that outlives `tsdb_close` holds a reference on the registry, not on the handle.
   A new number that is kept per part goes into `part_walk` and must make the four byte columns add up to the part's
   file (`test_stats`: `bytes == sum of tsdb_foreach_part`).
+- **The latest table** (`src/ltab.c`, `docs/design-latest.md`). Per series it holds the newest non-null row in the
+  parts, or a bound on it (unknown); it is read and written only under `latest_rw` (`lt->rw`), and every write section
+  bumps the volume's `lgen`. Writers: publishers (in the write section that lists their parts, after `parts_commit`,
+  folding each part's newest non-null row and null range; a flush of 50,000 series or more goes through the window:
+  its unlocked stores only ever store the flush's own row, the rest is noted and applied in the closing section while
+  `pending` makes every other writer wait), retention lengthening, `tsdb_drop_before` (the floor), a merge that lists
+  across a retention change (`ret_gen`), and the warmer, the only filler, which stores a parts-only search only if
+  `lgen` is unchanged since its cut and no window is open. Lookups never write it. Whoever makes an entry unknown gives
+  it a correct bound and hints its id to the warmer. A new listing point must fold there, nulls included; anything else
+  that removes live rows (other than rows hidden by a tombstone of a later block, rows a later write overwrote or rows
+  already expired) must bump `lgen` in a write section and make the entries it may affect unknown. The table must
+  always give the slow path's answer (`tests/test_latest.c` compares both after every random step). Entry words are
+  loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
+  `latest_rw` is held across no I/O but `tsdb_drop_before`'s renames of the partitions it retires (`db_retire_locked`,
+  in its write section; `db->lock` was held across them already), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf, and so is the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
-  sweeper takes `db->lock` only with it released). A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
+  sweeper takes `db->lock` only with it released). The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
+  `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
+  that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
+  the warmer take `latest_rw` (read) > `db->lock`, a lookup then `buf_lock` in sub-holds. The window's `pmu`/`pcv` (a writer
+  waits there with no other lock, `lt_end` takes `pmu` under `latest_rw`) and the warmer's hint mutex are leaves. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
   not yet appended anything, so nothing a registered large write waits for (a flush, the WAL writer role,
   `publish_lock`, `cls_rw`) waits for it. The write wait hook (`tsdb_set_write_wait_hook`) is a leaf: its +1 and
   the waiter's -1 run with no engine lock, the large write's -1 (`lw_leave`) with `cls_rw` held for reading; tsdbd's

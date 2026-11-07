@@ -1,6 +1,6 @@
 # The latest point of every series, from a sharded in-memory table
 
-Status: design, not implemented. Branch `latest-design`, written on 2026-11-06 from main at ea89968, revised the
+Status: design; step 1 (the slow path) is on main, step 2 (the table, `src/ltab.c`) is built on branch `latest-s2`. Branch `latest-design`, written on 2026-11-06 from main at ea89968, revised the
 same day after a correctness review and a performance review, again after a verification of both, and a third time
 after a second verification and a simplification review that took the user's answers below into account (what
 changed in each round: "Changes after review", at the end).
@@ -947,6 +947,69 @@ factor, which §7.2's gate measures.
 
 `tools/bench-tsdb.sh` gets the latest classes, and AGENTS.md's benchmark section the numbers.
 
+### 9.1 Measured at step 2: insert cost with the table (2026-11-07)
+
+`build/insert-bench --latest-cache BYTES` (0 = no table), the machine otherwise idle (each run under the BENCH lock,
+`--seconds 3`), 1,000 series of the mixed sensors, ext4 on NVMe. Table on is the default (RAM/16).
+
+Large batches and the memtable path, 3 interleaved runs each (rows/s, no lookups running): parts 1 M rows
+52 / 53 / 52 M on against 52 / 43 / 53 M off; parts 10 M rows 57 / 55 / 59 M on against 57 / 55 / 47 M off; WAL and
+memtable at 10,000 rows per call 9.50 / 9.43 / 9.55 M on against 9.51 / 9.35 / 9.57 M off. The runs are within each
+other's noise (the lowest "off" values are runs that followed a 10 M insert's disk writeback).
+
+Durable one-row appends (the fsync-bound rows), order off, on, on, off, four times, 20 s apart; inserts/s, mean of 8
+runs per mode (one outlier run of each mode, at 586 and 817 per second with one thread, is disk noise: the median
+and the p50 and p99 latencies are the same):
+
+| appenders | table off | table on |
+|---:|---:|---:|
+| 1 | 1,344 (median 1,467) | 1,367 (median 1,452) |
+| 16 | 11,388 | 12,277 |
+| 64 | 41,308 | 42,835 |
+| 256 | 143,518 | 142,833 |
+
+So at **1,000 series and no nulls** the table costs nothing this benchmark can measure on the insert path. That is the
+only series count measured here, and the one where the fold has almost nothing to do (the fold list is short and
+`lf_granule`'s null passes find no nulls): the review measured a flush of 10^6 series at +8% (about 48 ms) against no
+table, so §2.3's "no measurable cost" is NOT shown at scale; §9.2 has the flush measurement. Not yet measured: inserts
+under lookups through the server (step 3) and the other items above.
+
+### 9.2 Measured at step 2: a flush of 10^6 series, with and without the table and its window (2026-11-07)
+
+`build/latest-bench` (tools/latest-bench.c, embedded, not in `make`), each run under the exclusive BENCH lock, the machine
+otherwise idle, ext4 on NVMe. Every round writes one row for each of 10^6 series (a tenth of the rows null), then
+`tsdb_flush`es while readers look up random ids and one writer thread appends one row per call. Five repetitions x
+modes interleaved (on = default table with the §3.2 window, nowin = table without the window, off = `latest_cache` 0);
+round 1 of each run is a warm-up and left out, so 25 rounds per mode. A is the table path (1 reader, 256 ids per call),
+B the slow path (`WITH_NULLS`, 2 readers x 4,096 ids, 3 repetitions, 15 rounds, table on or off).
+
+| | flush, mean (sd) / median | lookups completed during the flush | lookup p50 / p99 | max lookup / max append |
+|---|---:|---:|---:|---:|
+| A, table on (window) | 768 (30) / 761 ms | 20,059 | 35 / 58 us | 16.6 / 16.5 ms |
+| A, table on, no window | 775 (62) / 763 ms | 20,455 | 34 / 55 us | 16.7 / 28.2 ms |
+| A, table off (slow path) | 745 (47) / 730 ms | 4,826 | 147 / 206 us | 16.6 / 16.4 ms |
+| B, table on (`WITH_NULLS`) | 759 (65) / 750 ms | 364 | 4.1 / 9.1 ms | 20.5 / 38.0 ms |
+| B, table off | 713 (23) / 723 ms | 344 | 4.0 / 9.0 ms | 21.0 / 14.9 ms |
+
+- **Flush cost of the table**: +3 to +4% on the medians (about 30 ms for 10^6 series, about 30 ns per series for the
+  fold). That is above the 2% this design expected for large inserts and is what a flush of 10^6 one-row series pays;
+  a flush with fewer series per row (the insert-bench data) pays nothing visible (§9.1). The run-to-run sd of one mode
+  is 4 to 8%, so only the medians of 25 rounds say this. The window itself changes neither the flush time nor the lookup
+  p99 (A on against nowin). The slow path (B) is as slow with the table as without: its lookups skip the table.
+- **Lookups during a flush**: the table answers 4x as many lookups with a p50 of 35 us against 147 us.
+- **The multi-ms worst case is not the table.** Max lookup and max append are the same ~16 ms in every mode, table off
+  included, and the max append equals the max lookup in the same round: one pause that both threads were caught in. A
+  run of the "off" mode with `strace -f -T` shows the flusher thread in `munmap` of buffers of 184 MB and 168 MB
+  (during the flush, from its write step) for 7 to 8 ms (and a 40 MB `write` for 5.6 ms) while the other threads wait: the kernel takes the
+  mmap lock for writing for the whole unmap and a thread that page-faults or allocates waits behind it. Timing
+  `mt_unref` of the flushed memtable (48 ms, 3 x 10^6 frees) and leaving it out did not change the tail, and the
+  listing section (parts listed under `db->lock`) takes under 10 us. So this belongs to the flush path of main (large
+  buffers handed back to the kernel), and a fix is a separate change (keeping the flusher's buffers, or `madvise`
+  in slices); it is not part of the latest table.
+- The window threshold (`LT_WINDOW_MIN` 50,000) stays. This measurement shows no difference between on and nowin at
+  10^6 series (the pause above hides the window's effect on the worst case; the review's own run saw worst lookups of
+  2 to 6 ms with the window and 5 to 12 ms without). The window threshold itself is not measured below 10^6 series.
+
 ## 10. Build plan
 
 Each step is a track (tsdb-tracks): build, adversarial review, fix, gates, merge.
@@ -974,7 +1037,7 @@ hidden by a tombstone of a later block, rows a later write overwrote or rows alr
 write section and make the entries it may affect unknown. Lock order: `publish_lock` > `latest_rw` > `manifest_lock`
 > `db->lock` > `buf_lock`; `ret_lock` > `latest_rw` > `db->lock`; drops and the rare merge take `latest_rw` (write) >
 `db->lock`; lookups and the warmer take `latest_rw` (read) > `db->lock`, lookups then `buf_lock` in sub-holds; the
-hint set's mutex is a leaf. `latest_rw` is never held across I/O: lookups take their cut and read granules only after
+hint set's mutex and the window's `pmu` are leaves. `latest_rw` is held across no I/O except the renames of the partitions `tsdb_drop_before` retires (in its write section, where `db->lock` was held across them already): lookups take their cut and read granules only after
 their read hold, and `series_reload` runs outside it. No scheduler helper waits for `latest_rw` in write mode. NFS
 followers have no table.
 

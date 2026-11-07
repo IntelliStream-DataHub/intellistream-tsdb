@@ -27,6 +27,7 @@ public final class EmbeddedOptions {
     private int insertZstdLevel;
     private int stats;
     private int statsSweepMbS;
+    private long latestCache;
     private int valueCodec;
     private boolean fsync;
     private int mergeThreads;
@@ -67,6 +68,7 @@ public final class EmbeddedOptions {
             insertZstdLevel = o.get(JAVA_INT, offset(OPTIONS, "insert_zstd_level"));
             stats = o.get(JAVA_INT, offset(OPTIONS, "stats"));
             statsSweepMbS = o.get(JAVA_INT, offset(OPTIONS, "stats_sweep_mb_s"));
+            latestCache = o.get(JAVA_LONG, offset(OPTIONS, "latest_cache"));
             valueCodec = o.get(JAVA_INT, offset(OPTIONS, "value_codec"));
             fsync = o.get(JAVA_INT, offset(OPTIONS, "fsync")) != 0;
             mergeThreads = o.get(JAVA_INT, offset(OPTIONS, "merge_threads"));
@@ -99,6 +101,7 @@ public final class EmbeddedOptions {
         o.set(JAVA_INT, offset(OPTIONS, "insert_zstd_level"), insertZstdLevel);
         o.set(JAVA_INT, offset(OPTIONS, "stats"), stats);
         o.set(JAVA_INT, offset(OPTIONS, "stats_sweep_mb_s"), statsSweepMbS);
+        o.set(JAVA_LONG, offset(OPTIONS, "latest_cache"), latestCache);
         o.set(JAVA_INT, offset(OPTIONS, "value_codec"), valueCodec);
         o.set(JAVA_INT, offset(OPTIONS, "fsync"), fsync ? 1 : 0);
         o.set(JAVA_INT, offset(OPTIONS, "merge_threads"), mergeThreads);
@@ -189,6 +192,17 @@ public final class EmbeddedOptions {
     public EmbeddedOptions stats(int mode, int sweepMbS) {
         stats = mode;
         statsSweepMbS = sweepMbS;
+        return this;
+    }
+
+    /**
+     * Bytes of memory for the latest tables of the whole process (16 bytes a series).
+     *
+     * @param bytes default RAM / 16; 0: no table, the same answers from the parts and memtables, slower
+     * @return this
+     */
+    public EmbeddedOptions latestCache(long bytes) {
+        latestCache = bytes;
         return this;
     }
 

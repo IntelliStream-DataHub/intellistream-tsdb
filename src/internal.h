@@ -773,11 +773,16 @@ typedef struct part {
                           * granules: out of merges and drops (part_checked, part_mark_payload) */
     atomic_bool wait_logged; /* db_wait_merges said once that inserts no longer wait for this damaged part's partition */
     uint64_t fail_seq;       /* db->merge_fail_seq when a merge that took it as a source last failed (db->lock) */
+    uint64_t merge_len_gen;  /* db->ret_len_gen when a merge selected it (db->lock) */
     uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
     int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
     atomic_bool obsolete; /* delete the file when the last reference goes */
     bool retired; /* set before obsolete: the file is retired_<name> (db_retire_locked), not <name> */
     char pending[64];     /* tmp file name while the part awaits parts_commit, else "" */
+    /* the latest table's fold list (latest.c): per series of this pending part, its newest non-null row and the range
+     * of its nulls, made by the part writer; the publisher folds and frees it (NULL when the table is off) */
+    struct lfold *lf;
+    size_t nlf;
 } part;
 
 
@@ -962,6 +967,9 @@ typedef struct part_writer {
     int *defer_fd;    /* pending parts: hand the fd over here, its writeback started, for the caller's fdatasync */
     int effort;       /* CODEC_FAST (pw_begin) or CODEC_MERGE */
     int64_t empty_ts; /* its min_ts = max_ts then */
+    bool lf_on;       /* collect the latest table's fold list (pw_begin: when the engine has a table; merges clear it) */
+    struct lfold *lf; /* per series of the rows given to pw_add, in series order */
+    size_t nlf, lfcap;
 } part_writer;
 
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq);
@@ -1192,13 +1200,19 @@ void query_run_end(qrun *r, int type, uint64_t result_rows);
 sched *query_sched(tsdb *t);
 
 /* ---- memtable + WAL (memtable.c) ---- */
+/* mt_series.fl (latest.c, design-latest.md 2.2): kept by mt_add when it is given the series' type */
+enum { MTF_HAS_NN = 1, MTF_HAS_NULL = 2, MTF_NN_STALE = 4 };
 typedef struct mt_series {
     int64_t *ts;
     uint64_t *v; /* slots, zero-extended */
     uint64_t *lsn; /* WAL sequence of each row; increasing, 0 when already durable */
     uint32_t n, cap;
     bool sorted; /* non-decreasing ts, in insertion order */
+    uint8_t fl;   /* MTF_*: a non-null row was added; a null was added; the newest non-null row was overwritten by a null */
+    uint8_t type; /* the series' type once a row was added with tracking (fl != 0), else 0 */
+    uint32_t top_nn; /* index of the newest non-null row (the later one on equal timestamps), with MTF_HAS_NN */
 } mt_series;
+_Static_assert(sizeof(mt_series) == 40, "mt_series stays 40 bytes");
 
 /* A flushed memtable's series and their newest timestamps, while its WAL segment may still be replayed (classes.c) */
 struct cls_wtail {
@@ -1241,16 +1255,18 @@ memtable *mt_new(uint64_t wal_seq);
 void mt_ref(memtable *m);
 void mt_unref(memtable *m);
 /* v: slots of width w (4 or 8). lsn0: WAL sequence of the first row (the rest
- * follow), 0 for rows that are durable already */
+ * follow), 0 for rows that are durable already.
+ * type: the series' type (every row of one call has it), which makes mt_add keep the latest table's flags
+ * (mt_series.fl, top_nn); -1: no tracking (replay and follower memtables, which no lookup reads) */
 int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n,
-           uint64_t lsn0);
+           uint64_t lsn0, int type);
 /* only rows with a WAL sequence <= visible; values as slots of width w */
 int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t end, uint64_t visible, mem_run *out);
 void mem_run_free(mem_run *r);
 void mt_note_fno(memtable *m, uint64_t first, size_t n);
 int mt_flush(struct eng *db);
 int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
-               size_t n);
+               size_t n, int type);
 /* WAL records, version 2 (format 9, docs/design-cdc.md 2.1):
  *   [u32 len | kind << 28][u32 header check][u64 hash][u64 fno][i64 commit_ms][payload]
  * kind 0, rows: len = rows (below 2^28), payload rows of 20 bytes (u32 series, i64 ts, u64 slot); takes len numbers.
@@ -1400,6 +1416,60 @@ typedef struct ret_table {
     _Atomic int64_t limit[];
 } ret_table;
 
+/* ---- the latest table (latest.c, docs/design-latest.md) ----
+ * Per volume, indexed by local id, in pages of LT_PAGE entries of 16 bytes (t, x) and a bitmap of unknown entries.
+ * t = ts ^ INT64_MAX, so all-zero memory is "empty" (ts = TSDB_TS_MAX is never a row's). Known: bit clear, the
+ * newest non-null row in the parts is (ts, slot x). Unknown: bit set, t holds a bound u (every non-null row in the
+ * parts is at or below it), x = 0. Read and written only under `rw` (latest_rw). */
+#define LT_PAGE_BITS 16
+#define LT_PAGE (1u << LT_PAGE_BITS)
+#define LT_MAXPAGES (1u << (31 - LT_PAGE_BITS))
+typedef struct lt_page {
+    uint64_t e[2 * LT_PAGE];
+    uint64_t unk[LT_PAGE / 64];
+} lt_page;
+#define LT_PAGE_BYTES (sizeof(lt_page))
+
+/* What a publish brings for one series of one part: R, its newest non-null row, and N, the range of the timestamps
+ * where its row is a null (conservative). Made by the part writer, folded by the publisher (design-latest.md 3). */
+typedef struct lfold {
+    uint32_t series;
+    uint32_t flags; /* LF_R, LF_N */
+    int64_t r_ts;
+    uint64_t r_slot;
+    int64_t n_lo, n_hi;
+} lfold;
+enum { LF_R = 1, LF_N = 2 };
+
+typedef struct ltab {
+    pthread_rwlock_t rw; /* latest_rw: entries, bitmaps, pages, drop_floor, pending and lgen */
+    uint64_t lgen;       /* bumped by every write section (rw); the warmer's stores check it */
+    lt_page **pg;        /* LT_MAXPAGES slots, made in id order, never moved */
+    uint32_t npg;        /* pages made: ids below npg * LT_PAGE have entries; ids above have none yet (empty) */
+    bool capped;         /* the budget refused page npg: ids from npg * LT_PAGE have no entry (the slow path) */
+    int64_t drop_floor;  /* a known entry below it reads as unknown (ts) (tsdb_drop_before) */
+    atomic_bool pending; /* a large flush's unlocked stores are under way (3.2) */
+    pthread_mutex_t pmu; /* only for pcv */
+    pthread_cond_t pcv;
+    size_t bytes;        /* budget taken (rw) */
+    /* the warmer: a thread of its own per volume, the only filler of entries */
+    pthread_mutex_t hmu; /* leaf */
+    pthread_cond_t hcv;
+    uint32_t *hint;      /* local ids whose unknown entries want a fill, at most LT_HINTS */
+    size_t nhint;
+    bool rescan;         /* walk the unknown bitmap (after the open or a full hint set) */
+    bool walk_floor;     /* walk the known entries below drop_floor */
+    bool wstop, has_warmer;
+    pthread_t warmer;
+    atomic_uint_fast64_t st_table, st_search, st_floor, st_nn, st_fill_ok, st_fill_refused;
+} ltab;
+#define LT_HINTS 65536
+
+/* a lookup that waits for a publisher's window or the warmer: test hooks (tests/test_latest.c) */
+typedef void (*latest_hook_fn)(void *arg, int at);
+enum { LH_FOLD_BEFORE_LIST = 1, LH_WARM_BEFORE_STORE = 2, LH_LOOKUP_AFTER_ENTRY = 3, LH_WARM_AFTER_CUT = 4,
+       LH_WINDOW_MID = 5 };
+
 struct eng {
     char *dir;
     int dirfd;
@@ -1486,6 +1556,8 @@ struct eng {
     uint64_t wal_unlink_next; /* the first flushed segment whose unlink failed, to try again (flush_lock); 0: none */
     atomic_int_fast64_t clock_floor; /* now never goes below this */
     atomic_uint ret_gen;             /* bumped by every change of a limit (parts cache their expiry) */
+    atomic_uint_fast64_t ret_len_gen; /* bumped (db->lock) when a change lowers a series' cutoff: a merge that spans one
+                                       * lists across it in a latest_rw section, marking its entries (merge_commit_locked) */
     int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
     bool drop_pending;               /* eng_drop_before is waiting for merges, then retiring (under lock) */
     int64_t drop_pending_end;        /* ...every partition ending at or before this: no merge of one is selected */
@@ -1600,6 +1672,11 @@ struct eng {
     pthread_mutex_t fail_lock; /* innermost; held only to fill fail_msg */
     pthread_mutex_t dir_sync_lock; /* eng_sync_dir; inside every lock but fail_lock */
     char fail_msg[256];
+
+    /* the latest table (latest.c): NULL without one (latest_cache 0, a follower or a read-only open) */
+    ltab *lt;
+    latest_hook_fn lt_hook; /* test hook (tests/test_latest.c), NULL otherwise */
+    void *lt_hook_arg;
 };
 
 /* the list functions' hooks (db.c): one branch while statistics are off */
@@ -1687,7 +1764,7 @@ void db_release(part **parts, size_t n);
 /* merge.c */
 void *merge_thread_main(void *arg);
 int merge_parts(struct eng *db, part **src, size_t k, part **out);
-void merge_commit_locked(struct eng *db, part **src, size_t k, part *out, int rc);
+bool merge_commit_locked(struct eng *db, part **src, size_t k, part *out, int rc);
 
 /* insert.c: sorts (stably), keeps the last row per (series, ts), writes one
  * part per partition. Parts are published, or handed back in `collect`. With `refuse` (rows from a caller, not
@@ -1881,6 +1958,43 @@ typedef struct latest_row {
 } latest_row;
 int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
                latest_row *out);
+int eng_latest_search(eng *db, const uint32_t *local, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
+                      latest_row *out); /* every id searched on one cut (the slow path) */
+/* The warmer's fill: the newest non-null row in the parts of the cut (no memtable in it), no cutoff. */
+int eng_latest_fill(eng *db, const qcut *c, const uint32_t *local, size_t n, latest_row *out);
+/* The latest table (design-latest.md steps 2): created at open when the options and the role allow, rebuilt from
+ * the parts after cls_check_parts and before the WAL replay, closed with the engine. */
+int latest_open(eng *db);       /* the table, empty (NULL db->lt: off) */
+int latest_build(eng *db);      /* every part's runs folded in; the volume's pages reserved first */
+void latest_start(eng *db);     /* the warmer thread, once the engine is up */
+void latest_stop(eng *db);      /* stops the warmer (eng_halt) */
+bool latest_stats(eng *db, uint64_t out[6]); /* tests: see tsdb_test_latest_stats */
+void latest_close(eng *db);     /* frees the table and gives its pages back to the budget */
+/* A publisher's write section: lt_begin takes latest_rw for writing (no-op without a table); lt_fold, after
+ * parts_commit succeeded and before the parts are listed, folds their fold lists and tombstones in block order;
+ * the caller then lists them (under db->lock); lt_end bumps lgen, releases the lock and hints the warmer with the
+ * ids the fold made unknown. Parts without a fold list (tombstone-only parts) fold only their tombstones. */
+typedef struct lt_sec {
+    uint32_t *id;
+    size_t n, cap;
+    bool oom;
+    bool win;           /* a large flush's window (3.2) is open: lt_end closes it */
+    const lfold **note; /* the window's folds left for the write section (a null over a known row) */
+    size_t nnote, capnote;
+    bool noteoom;       /* a note did not fit: the write section folds every list */
+} lt_sec;
+void lt_begin(eng *db, lt_sec *sec);
+/* lt_begin for a flush's parts: a long fold list is stored in a window without the lock (3.2) */
+void lt_begin_flush(eng *db, lt_sec *sec, part **ps, size_t n);
+void lt_fold(eng *db, lt_sec *sec, part **ps, size_t n);
+void lt_end(eng *db, lt_sec *sec);
+/* in a write section of lt_begin: */
+void lt_retention_lowered(eng *db, lt_sec *sec, uint32_t series, int64_t oldc);
+void lt_merge_marks(eng *db, lt_sec *sec, part **src, size_t k);
+void lt_drop_floor(eng *db, int64_t ts);
+/* the part writer's side: add the rows of one granule of `series` (strictly increasing ts, slots of type) */
+int lf_granule(struct lfold **lf, size_t *n, size_t *cap, uint32_t series, int type, const int64_t *ts,
+               const void *v, size_t cnt, uint32_t nulls);
 /* LTTB downsampling to `threshold` points (>= 3) of the known, finite values; state series: TSDB_ERR_INVALID.
  * desc: the same points newest first; `keep` (0: all) is how many of them the caller takes at most, which bounds
  * what newest first holds in memory (fn still decides when to stop). */
@@ -2000,6 +2114,10 @@ void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
 uint64_t tsdb_test_fence_wakeups(struct tsdb *t);
 /* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
+bool tsdb_test_latest_stats(struct tsdb *t, uint64_t out[6]);
+void tsdb_test_latest_hook(struct tsdb *t, void (*fn)(void *, int), void *arg);
+void tsdb_test_latest_window(int min); /* flushes with this many series or more use the 3.2 window (process-wide) */
+void tsdb_test_latest_nowarm(int on); /* engines opened while on start no warmer (process-wide) */
 /* tests: fn(arg, 0) runs in tsdb_volume_reopen before it halts the old engine, fn(arg, 1) once the new engine is
  * open and its threads run; a reference on a series' engine as a
  * name or type lookup holds it between its route and its use (tsdb_test_meta_use reads the type through it) */

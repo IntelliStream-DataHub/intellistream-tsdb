@@ -262,7 +262,20 @@ int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
         return TSDB_ERR_IO;
     }
     db->ret_off += RET_REC;
+    /* One section (ret_lock > latest_rw > db->lock): the limit and, if it lowers the series' cutoff, the entries that
+     * may name a row the old cutoff let a merge drop (design-latest.md 3.5). No lookup sees one without the other */
+    lt_sec lsec;
+    lt_begin(db, &lsec);
+    pthread_mutex_lock(&db->lock);
+    int64_t now = eng_now_ms(db), oldc = eng_cutoff_at(db, series, now);
     rc = ret_put_locked(db, series, limit_ms);
+    bool lowered = rc == 0 && eng_cutoff_at(db, series, now) < oldc;
+    if (lowered)
+        atomic_fetch_add(&db->ret_len_gen, 1); /* a merge in flight lists across it (merge_commit_locked) */
+    pthread_mutex_unlock(&db->lock);
+    if (lowered)
+        lt_retention_lowered(db, &lsec, series, oldc);
+    lt_end(db, &lsec);
     if (rc == 0)
         jr_commit(db, JR_RETENTION, &series);
     pthread_mutex_unlock(&db->ret_lock);

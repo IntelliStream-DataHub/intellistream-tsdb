@@ -170,6 +170,11 @@ typedef struct tsdb_options {
                               * all three: they are computed when asked and keep nothing */
     int stats_sweep_mb_s;    /* the sweeper reads at most this many MB/s of granule indexes (a hard cap: more work
                               * makes the numbers older, never the sweeper dearer); 0: 256; negative: no cap */
+    size_t latest_cache;     /* bytes of memory for the latest tables of the whole process (16 bytes a series, in
+                              * pages of 65,536), shared by its volumes first come, first served; default RAM / 16;
+                              * 0: no table, every tsdb_latest is answered from the parts and memtables (the same
+                              * answers, 50 to 100 times slower per series). Followers and read-only opens keep none.
+                              * A series beyond the budget is answered the same way (design-latest.md) */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -942,7 +947,7 @@ size_t tsdb_struct_size(int kind);
 /* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
  * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
  * number they were written for when they load the library and refuse another. */
-#define TSDB_ABI_VERSION 4 /* Statistics: tsdb_options.stats and stats_sweep_mb_s (design-stats.md steps 1-2). Before it:  Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
+#define TSDB_ABI_VERSION 5 /* The latest table: tsdb_options.latest_cache (design-latest.md). Before it, 4: Statistics: tsdb_options.stats and stats_sweep_mb_s (design-stats.md steps 1-2). Before it:  Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
  * expected topology one export of one pool). tsdb_health_open starts a monitor thread; every domain added gets a
  * probe thread that reads 4 KiB with O_DIRECT from <dir>/PROBE every second and writes and fdatasyncs 4 KiB to
  * <dir>/PROBE.<node> every 5 s. Probes may hang for as long as the server is away; nothing else of the process

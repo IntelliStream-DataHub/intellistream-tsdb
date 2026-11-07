@@ -169,11 +169,15 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
             jr_commit(db, JR_COMMIT, &all);
     }
     if (rc == 0) {
+        lt_sec lsec; /* the latest table: tombstones, then the rows, in the section that lists them (3.4) */
+        lt_begin(db, &lsec);
+        lt_fold(db, &lsec, all.p, all.n);
         pthread_mutex_lock(&db->lock);
         for (size_t i = 0; i < all.n; i++)
             db_parts_insert_locked(db, all.p[i]);
         pthread_cond_signal(&db->merge_cv);
         pthread_mutex_unlock(&db->lock);
+        lt_end(db, &lsec);
     }
     pthread_mutex_unlock(&db->publish_lock);
     lw_leave(db, &f); /* published (newer small writes win from now on) or failed */

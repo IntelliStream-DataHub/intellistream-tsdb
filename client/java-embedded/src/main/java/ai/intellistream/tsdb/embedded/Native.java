@@ -85,7 +85,8 @@ final class Native {
             JAVA_INT.withName("insert_zstd_level"),
             JAVA_INT.withName("stats"),
             JAVA_INT.withName("stats_sweep_mb_s"),
-            MemoryLayout.paddingLayout(4)).withName("tsdb_options");
+            MemoryLayout.paddingLayout(4),
+            JAVA_LONG.withName("latest_cache")).withName("tsdb_options");
 
     static final StructLayout VALUES = MemoryLayout.structLayout(
             JAVA_INT.withName("type"),
@@ -245,7 +246,7 @@ final class Native {
      * incompatible change of a struct's layout or a function's signature, which the size check misses
      * (tsdb_series_result kept its size when its series id became 64 bits and its fields moved).
      */
-    static final int ABI_VERSION = 4;
+    static final int ABI_VERSION = 5;
 
     /** Where the library was loaded from, for {@link EmbeddedDb#librarySource()}. */
     static final String SOURCE;

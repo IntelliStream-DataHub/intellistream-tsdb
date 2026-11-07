@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -541,6 +542,8 @@ static void random_run(const char *name, tsdb_options opt, bool classes, int ste
         size_t si = rnd() % w.ns;
         uint64_t r = rnd() % 100;
         int nullp = (int)(rnd() % 4) * 15; /* 0, 15, 30, 45 */
+        if (getenv("LATEST_TRACE")) /* which op ran at which step, for a failing seed */
+            fprintf(stderr, "step %d series %zu op %d nullp %d\n", w.step, si, (int)r, nullp);
         if (r < 30)
             do_insert(&w, si, false, nullp);
         else if (r < 45)
@@ -808,6 +811,15 @@ typedef struct conc {
     atomic_int_fast64_t written[CS]; /* newest timestamp acknowledged */
 } conc;
 
+static int conc_flush_every = 50;
+static atomic_int conc_windows; /* flushes that went through the 3.2 window */
+static void conc_hook(void *arg, int at)
+{
+    (void)arg;
+    if (at == LH_FOLD_BEFORE_LIST)
+        atomic_fetch_add(&conc_windows, 1);
+}
+
 static double conc_val(int64_t ts) { return (double)(ts * 3 + 1); }
 
 typedef struct cwr {
@@ -837,7 +849,7 @@ static void *conc_writer(void *arg)
             OK(tsdb_insert_series_values(c->db, c->id[s], ts, &vals, n));
             atomic_store(&c->written[s], ts[n - 1]);
         }
-        if (i % 50 == 0)
+        if (i % conc_flush_every == 0)
             OK(tsdb_flush(c->db));
     }
     return NULL;
@@ -896,6 +908,8 @@ static void test_concurrent(void)
         OK(tsdb_series_create(c.db, name, TSDB_FLOAT64, NULL, &c.id[i]));
     }
     pthread_t wt[2], mt, rt[3];
+    atomic_store(&conc_windows, 0);
+    tsdb_test_latest_hook(c.db, conc_hook, NULL);
     cwr wa[2] = {{&c, 0}, {&c, 1}};
     for (int i = 0; i < 2; i++)
         CHECK(pthread_create(&wt[i], NULL, conc_writer, &wa[i]) == 0);
@@ -918,6 +932,8 @@ static void test_concurrent(void)
         CHECK(out.ts == atomic_load(&c.written[s]));
         rs_free(&rr);
     }
+    tsdb_test_latest_hook(c.db, NULL, NULL);
+    CHECK(conc_flush_every == 50 || atomic_load(&conc_windows) > 20); /* the windows ran under the lookups */
     OK(tsdb_close(c.db));
 }
 
@@ -1044,6 +1060,397 @@ static void bench_one(int parts, int run, const char *dir_root)
  * replace's parts that leaves the big old part out (max_part_bytes) writes a part with its own rows and the
  * tombstones next to them; those tombstones hide the old part's rows and never the part's own. The newest rows
  * below the small bounds lie in that mixed part. */
+/* A retention limit lengthened while a merge runs (design-latest.md 3.5). The merge read the old limit and drops all
+ * three rows (they are expired under it, as they would be without the change); the limit then goes from 3 d to 20 d,
+ * the warmer fills the entry from the parts (the merge's sources are still listed: the row at 92 d), and the merge
+ * lists. The listing marks the entries of its series that name a row in its range (lt_merge_marks): without it the
+ * table keeps naming the row at 92 d, which no longer exists. The merge is listed (not discarded and run again:
+ * discarding made every lengthening in the volume throw away every merge in flight, see test_merges_not_starved).
+ * Regression: the merge thread read the discarded (freed) output afterwards (heap-use-after-free under `make asan`,
+ * found by test_latest's random runs); the checks here are exact answers, and under ASan that nothing touches a freed
+ * part. */
+static void check_vs_scan(tsdb *db, tsdb_sid id, const char *what);
+static _Atomic int rl_fired;
+static tsdb *rl_db;
+static tsdb_sid rl_id;
+static void rl_hook(int at)
+{
+    if (at != 1 || atomic_exchange(&rl_fired, 1))
+        return;
+    uint64_t s0[6], s1[6];
+    CHECK(tsdb_test_latest_stats(rl_db, s0));
+    OK(tsdb_set_retention(rl_db, rl_id, 20 * DAY)); /* the cutoff goes from 97 d to 80 d */
+    for (int i = 0; i < 500; i++) { /* the warmer fills the entry from the sources (fill_ok) */
+        CHECK(tsdb_test_latest_stats(rl_db, s1));
+        if (s1[3] > s0[3])
+            break;
+        usleep(10000);
+    }
+    CHECK(s1[3] > s0[3]);
+}
+
+static void test_retention_lengthened_in_merge(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 1; /* the merge thread read the freed output (tsdb_optimize did not) */
+    o.merge_idle_s = 1; /* idle for 1 s: the thread merges the two parts */
+    o.clock_ms = test_clock;
+    o.partition_ms = 1000 * DAY;
+    o.partition_classes = 0;
+    set_clock(100 * DAY);
+    tsdb *db = open_plain("latest_retlen", &o);
+    tsdb_sid s;
+    OK(tsdb_series_create(db, "rl.a", TSDB_FLOAT64, NULL, &s));
+    OK(tsdb_set_retention(db, s, 3 * DAY)); /* keeps >= 97 d */
+    put_f64(db, s, 90 * DAY, 1.0, false);
+    put_f64(db, s, 91 * DAY, 2.0, false);
+    OK(tsdb_flush(db));
+    tsdb_latest_result r = one(db, s, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE); /* all of it has expired */
+    rl_db = db;
+    rl_id = s;
+    atomic_store(&rl_fired, 0);
+    atomic_store(&merge_hook, rl_hook);
+    put_f64(db, s, 92 * DAY, 3.0, false); /* the second part: the merge thread selects the two */
+    OK(tsdb_flush(db));
+    tsdb_stats st;
+    for (int i = 0; i < 600 && (!atomic_load(&rl_fired) || (tsdb_get_stats(db, &st), st.merges < 1)); i++) {
+        struct timespec d = {0, 50000000};
+        nanosleep(&d, NULL);
+    }
+    atomic_store(&merge_hook, NULL);
+    CHECK(atomic_load(&rl_fired) == 1);
+    tsdb_get_stats(db, &st);
+    CHECK(st.merges == 1); /* listed across the change, not discarded */
+    check_vs_scan(db, s, "retention lengthened in a merge");
+    r = one(db, s, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE); /* the merge dropped them under the limit it read */
+    OK(tsdb_close(db));
+}
+
+/* Lengthening the limit of OTHER series must not throw away a merge (design-latest.md 3.5 lists across a change). The
+ * first version discarded every merge in flight in the volume at every lengthening, so while such calls kept coming
+ * tsdb_optimize never finished (starve.c of the review: 8 s and 123 merges, 122 of them discarded, for one that takes
+ * 0.07 s). Here a thread lengthens the limits of 64 other series in a loop until optimize returns or 20 s have gone. */
+static _Atomic int ns_stop;
+static _Atomic long ns_calls;
+static tsdb *ns_db;
+static tsdb_sid ns_other[64];
+static void *ns_lengthen(void *arg)
+{
+    (void)arg;
+    long i = 0;
+    while (!atomic_load(&ns_stop)) {
+        OK(tsdb_set_retention(ns_db, ns_other[i % 64], 1000 * DAY + i)); /* each call lowers that series' cutoff */
+        atomic_store(&ns_calls, ++i);
+    }
+    return NULL;
+}
+
+static void *ns_watchdog(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 2000 && !atomic_load(&ns_stop); i++)
+        usleep(10000);
+    atomic_store(&ns_stop, 1);
+    return NULL;
+}
+
+static void test_merges_not_starved(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0; /* tsdb_optimize merges */
+    o.partition_classes = 0;
+    ns_db = open_plain("latest_starve", &o);
+    tsdb_sid s;
+    OK(tsdb_series_create(ns_db, "ns.big", TSDB_FLOAT64, NULL, &s));
+    for (int i = 0; i < 64; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ns.o%d", i);
+        OK(tsdb_series_create(ns_db, nm, TSDB_FLOAT64, NULL, &ns_other[i]));
+        OK(tsdb_set_retention(ns_db, ns_other[i], 500 * DAY)); /* the loop's calls then all lower a cutoff */
+    }
+    enum { N = 200000, PARTS = 6 };
+    int64_t *ts = malloc(N * sizeof *ts);
+    double *v = malloc(N * sizeof *v);
+    for (int p = 0; p < PARTS; p++) { /* PARTS parts in one partition: the day starts at 0 */
+        for (int i = 0; i < N; i++) {
+            ts[i] = (int64_t)i * PARTS + p;
+            v[i] = i * 0.25 + p;
+        }
+        tsdb_values vals = {TSDB_FLOAT64, v, NULL};
+        OK(tsdb_insert_series_values(ns_db, s, ts, &vals, N));
+    }
+    free(ts);
+    free(v);
+    tsdb_stats st0, st1;
+    tsdb_get_stats(ns_db, &st0);
+    CHECK(st0.parts >= 2);
+    atomic_store(&ns_stop, 0);
+    atomic_store(&ns_calls, 0);
+    pthread_t th, wd;
+    CHECK(pthread_create(&th, NULL, ns_lengthen, NULL) == 0);
+    while (atomic_load(&ns_calls) < 10)
+        usleep(1000);
+    CHECK(pthread_create(&wd, NULL, ns_watchdog, NULL) == 0);
+    OK(tsdb_optimize(ns_db));
+    int timed_out = atomic_load(&ns_stop); /* the watchdog ended the run before optimize did */
+    atomic_store(&ns_stop, 1);
+    pthread_join(th, NULL);
+    pthread_join(wd, NULL);
+    CHECK(!timed_out);
+    tsdb_get_stats(ns_db, &st1);
+    CHECK(st1.parts == 1);
+    CHECK(st1.merges - st0.merges <= 2); /* one merge, not one per lengthening */
+    check_vs_scan(ns_db, s, "starve");
+    OK(tsdb_close(ns_db));
+}
+
+/* ------------------------------------------------------------------ directed cases found by a mutation review */
+
+/* An fdatasync of a WAL file that blocks once armed (T4), the way a slow disk would. The tests link libtsdb.a, so this
+ * definition is the one the engine's tsdb_fdatasync reaches. */
+static atomic_int sy_armed, sy_stalled, sy_release;
+int fdatasync(int fd)
+{
+    if (atomic_load(&sy_armed)) {
+        char p[64], buf[512];
+        snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(p, buf, sizeof buf - 1);
+        if (n > 0) {
+            buf[n] = 0;
+            if (strstr(buf, "/wal_") && atomic_exchange(&sy_armed, 0)) {
+                atomic_store(&sy_stalled, 1);
+                while (!atomic_load(&sy_release))
+                    usleep(1000);
+            }
+        }
+    }
+    return (int)syscall(SYS_fdatasync, fd);
+}
+
+/* T1: the active memtable rewrites a timestamp the flushing memtable holds: the active one is newer, so it wins the
+ * tie (last write wins). Mutant: the flushing memtable wins ties. */
+typedef struct {
+    tsdb *db;
+    tsdb_sid id;
+    bool armed;
+    int fired;
+} dc1;
+static void dc1_hook(void *arg)
+{
+    dc1 *x = arg;
+    if (!x->armed)
+        return;
+    x->armed = false;
+    x->fired++;
+    put_f64(x->db, x->id, 30, 2.0, false);
+    tsdb_latest_result r = one(x->db, x->id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 30 && r.v.f64 == 2.0);
+}
+
+static void test_active_over_flushing(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    dc1 x = {0};
+    x.db = open_plain("latest_dc1", &o);
+    OK(tsdb_series_create(x.db, "dc1.a", TSDB_FLOAT64, NULL, &x.id));
+    put_f64(x.db, x.id, 30, 8.0, false);
+    tsdb_test_midplace(x.db, dc1_hook, &x);
+    x.armed = true;
+    OK(tsdb_flush(x.db));
+    tsdb_test_midplace(x.db, NULL, NULL);
+    CHECK(x.fired == 1);
+    tsdb_latest_result r = one(x.db, x.id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 30 && r.v.f64 == 2.0);
+    OK(tsdb_close(x.db));
+}
+
+/* T2: a known entry below the drop floor whose row drop_before removed, looked up while the warmer holds its floor
+ * walk (it has not stored yet): the lookup reads the entry as unknown and searches. Mutant: lookups read it as known. */
+static atomic_int dc2_hold;
+static void dc2_hook(void *arg, int at)
+{
+    (void)arg;
+    if (at != LH_WARM_AFTER_CUT)
+        return;
+    while (atomic_load(&dc2_hold))
+        usleep(1000);
+}
+
+static void test_drop_floor_lookup(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_classes = 0;
+    tsdb *db = open_plain("latest_dc2", &o);
+    tsdb_sid id;
+    OK(tsdb_series_create(db, "dc2.a", TSDB_FLOAT64, NULL, &id));
+    put_f64(db, id, DAY + 5, 1.0, false);
+    OK(tsdb_flush(db));
+    tsdb_latest_result r = one(db, id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == DAY + 5);
+    atomic_store(&dc2_hold, 1);
+    tsdb_test_latest_hook(db, dc2_hook, NULL);
+    OK(tsdb_drop_before(db, 2 * DAY));
+    r = one(db, id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    atomic_store(&dc2_hold, 0);
+    tsdb_test_latest_hook(db, NULL, NULL);
+    OK(tsdb_close(db));
+}
+
+/* T3: a merge dropped the expired newest rows, then the limit is lengthened. The newest row then in the table (20 d + 1 h)
+ * no longer exists: lt_retention_lowered must make the entry unknown, or the warmer (which never revisits known
+ * entries) leaves it. Mutant: lt_retention_lowered does nothing. */
+static void test_lengthened_after_merge(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_classes = 0;
+    o.clock_ms = test_clock;
+    set_clock(100 * DAY);
+    tsdb *db = open_plain("latest_dc3", &o);
+    tsdb_sid id;
+    OK(tsdb_series_create(db, "dc3.a", TSDB_FLOAT64, NULL, &id));
+    put_f64(db, id, 10 * DAY, 1.0, false);
+    OK(tsdb_flush(db));
+    put_f64(db, id, 20 * DAY, 2.0, false);
+    OK(tsdb_flush(db));
+    put_f64(db, id, 20 * DAY + HOUR, 3.0, false);
+    OK(tsdb_flush(db));
+    OK(tsdb_set_retention(db, id, 50 * DAY)); /* every row is below 50 d */
+    OK(tsdb_optimize(db));                     /* the merge drops them all */
+    OK(tsdb_set_retention(db, id, 0));
+    check_vs_scan(db, id, "lengthened after a merge");
+    tsdb_latest_result r = one(db, id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    OK(tsdb_close(db));
+}
+
+/* T4: sync mode, an appended row whose WAL fdatasync is still held: a query does not see it, so the lookup must not
+ * either (the table's memtable read honours `visible`). Mutant: lookups ignore the WAL's durable position. */
+typedef struct {
+    tsdb *db;
+    tsdb_sid id;
+} dc4;
+static void *dc4_writer(void *arg)
+{
+    dc4 *x = arg;
+    put_f64(x->db, x->id, 20, 2.0, false);
+    return NULL;
+}
+
+static void test_sync_visibility(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    dc4 x;
+    x.db = open_plain("latest_dc4", &o);
+    OK(tsdb_series_create(x.db, "dc4.a", TSDB_FLOAT64, NULL, &x.id));
+    put_f64(x.db, x.id, 10, 1.0, false);
+    atomic_store(&sy_release, 0);
+    atomic_store(&sy_stalled, 0);
+    atomic_store(&sy_armed, 1);
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, dc4_writer, &x) == 0);
+    while (!atomic_load(&sy_stalled))
+        usleep(1000);
+    rowset rr = {0};
+    scan(x.db, x.id, &rr);
+    CHECK(rr.n == 1 && rr.ts[0] == 10); /* the query sees only the durable row */
+    tsdb_latest_result r = one(x.db, x.id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 10 && r.v.f64 == 1.0);
+    rs_free(&rr);
+    atomic_store(&sy_release, 1);
+    pthread_join(th, NULL);
+    r = one(x.db, x.id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 20 && r.v.f64 == 2.0);
+    OK(tsdb_close(x.db));
+}
+
+/* T5: the newest row exactly one below the cutoff has expired. Mutant: the cutoff test is off by one. */
+static void test_row_below_cutoff(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.clock_ms = test_clock;
+    set_clock(100 * DAY);
+    tsdb *db = open_plain("latest_dc5", &o);
+    tsdb_sid id;
+    OK(tsdb_series_create(db, "dc5.a", TSDB_FLOAT64, NULL, &id));
+    put_f64(db, id, 90 * DAY - 1, 1.0, false);
+    OK(tsdb_flush(db));
+    OK(tsdb_set_retention(db, id, 10 * DAY)); /* the cutoff is 90 d */
+    tsdb_latest_result r = one(db, id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    put_f64(db, id, 90 * DAY, 2.0, false); /* and one at the cutoff is live */
+    OK(tsdb_flush(db));
+    r = one(db, id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 90 * DAY);
+    OK(tsdb_close(db));
+}
+
+/* T6: the build's bound for state series (no time-weighted statistics, so a granule's newest non-null row is not known
+ * from them). With the warmer off after the reopen, the lookups use the build's bounds: a granule that has nulls and
+ * ends in a value (bound = its last ts), one that ends in a null, and an all-null one (known empty). Mutant: the bound is
+ * always last ts - 1 (a memtable row at last ts - 1 then wins wrongly). */
+static void test_build_state_bounds(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_classes = 0;
+    char dir[700];
+    snprintf(dir, sizeof dir, "%s/latest_dc6", root);
+    rmrf(dir);
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id[3];
+    uint32_t code;
+    for (int i = 0; i < 3; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "dc6.s%d", i);
+        OK(tsdb_series_create(db, nm, TSDB_STATE, NULL, &id[i]));
+    }
+    OK(tsdb_state(db, id[0], "up", &code));
+    uint32_t vals[3][2] = {{0, code}, {code, 0}, {0, 0}}; /* null, up | up, null | null, null */
+    uint8_t valid[3] = {0x2, 0x1, 0x0}; /* a bit per row */
+    int64_t ts[2] = {10, 20};
+    for (int i = 0; i < 3; i++) {
+        tsdb_values v = {TSDB_STATE, vals[i], &valid[i]};
+        OK(tsdb_insert_series_values(db, id[i], ts, &v, 2));
+    }
+    OK(tsdb_flush(db));
+    OK(tsdb_close(db));
+    tsdb_test_latest_nowarm(1);
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_test_latest_nowarm(0);
+    /* a memtable row just below the granule's last row: it beats the entry only if the entry's bound were below it */
+    int64_t t19 = 19;
+    uint32_t c19 = code;
+    uint8_t v19 = 1;
+    tsdb_values mv = {TSDB_STATE, &c19, &v19};
+    OK(tsdb_insert_series_values(db, id[0], &t19, &mv, 1));
+    for (int i = 0; i < 3; i++)
+        check_vs_scan(db, id[i], "state build");
+    tsdb_latest_result r = one(db, id[0], TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 20);
+    r = one(db, id[1], TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 10);
+    r = one(db, id[2], TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    OK(tsdb_close(db));
+}
+
 static void test_partial_merge(void)
 {
     tsdb_options o;
@@ -1173,6 +1580,165 @@ static void fw_hook(void *arg)
     CHECK(r.kind == TSDB_LATEST_NONE);
 }
 
+/* ------------------------------------------------------------------ the warmer */
+
+typedef struct {
+    tsdb *db;
+    tsdb_sid id;
+    bool armed;
+    int fired;
+} wm;
+
+/* A publish between the warmer's cut and its store: a newer row, flushed. The fill (the row at 10) is then stale
+ * and must be refused: the entry the flush made (30) is the right one. */
+static void wm_hook(void *arg, int at)
+{
+    wm *x = arg;
+    if (at != LH_WARM_BEFORE_STORE || !x->armed)
+        return;
+    x->armed = false;
+    put_f64(x->db, x->id, 30, 99.0, false);
+    OK(tsdb_flush(x->db));
+    __atomic_add_fetch(&x->fired, 1, __ATOMIC_SEQ_CST);
+}
+
+static void wm_stats(tsdb *db, uint64_t s[6])
+{
+    CHECK(tsdb_test_latest_stats(db, s));
+}
+
+/* Waits until cond(stats) holds, at most 20 s. */
+static bool wm_wait(tsdb *db, bool (*cond)(const uint64_t *s, uint64_t arg), uint64_t arg)
+{
+    for (int i = 0; i < 2000; i++) {
+        uint64_t s[6];
+        wm_stats(db, s);
+        if (cond(s, arg))
+            return true;
+        usleep(10000);
+    }
+    return false;
+}
+static bool no_unknown(const uint64_t *s, uint64_t arg) { (void)arg; return s[5] == 0; }
+static bool refused_at_least(const uint64_t *s, uint64_t arg) { return s[4] >= arg; }
+
+static void test_warmer(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    tsdb *db = open_plain("latest_warmer", &o);
+    enum { N = 300 };
+    tsdb_sid id[N];
+    for (int i = 0; i < N; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "wm.%d", i);
+        OK(tsdb_series_create(db, nm, TSDB_FLOAT64, NULL, &id[i]));
+        put_f64(db, id[i], 10, i, false);
+        put_f64(db, id[i], 20, 1000 + i, false);
+    }
+    OK(tsdb_flush(db));
+    /* the newest row of every series deleted: every entry is unknown until the warmer fills it */
+    for (int i = 0; i < N; i++)
+        OK(tsdb_delete_range(db, id[i], 20, TSDB_TS_MAX));
+    CHECK(wm_wait(db, no_unknown, 0));
+    uint64_t s0[6], s1[6];
+    wm_stats(db, s0);
+    CHECK(s0[3] >= N); /* filled by the warmer */
+    for (int i = 0; i < N; i++) {
+        tsdb_latest_result r = one(db, id[i], TSDB_TS_MAX, 0);
+        CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 10 && r.v.f64 == (double)i);
+    }
+    wm_stats(db, s1);
+    CHECK(s1[0] - s0[0] == N); /* every lookup answered from the table, none searched */
+    CHECK(s1[1] == s0[1]);
+    for (int i = 0; i < N; i += 37)
+        check_vs_scan(db, id[i], "warmer, filled");
+
+    /* a series deleted entirely: its fill is empty */
+    tsdb_sid e;
+    OK(tsdb_series_create(db, "wm.empty", TSDB_FLOAT64, NULL, &e));
+    put_f64(db, e, 10, 1.0, false);
+    OK(tsdb_flush(db));
+    OK(tsdb_delete_range(db, e, TSDB_TS_MIN, TSDB_TS_MAX));
+    CHECK(wm_wait(db, no_unknown, 0));
+    wm_stats(db, s0);
+    tsdb_latest_result r = one(db, e, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    wm_stats(db, s1);
+    CHECK(s1[0] - s0[0] == 1 && s1[1] == s0[1]);
+
+    /* a publish between the cut and the store refuses the batch */
+    wm x = {.db = db};
+    OK(tsdb_series_create(db, "wm.race", TSDB_FLOAT64, NULL, &x.id));
+    put_f64(db, x.id, 10, 1.0, false);
+    put_f64(db, x.id, 20, 2.0, false);
+    OK(tsdb_flush(db));
+    wm_stats(db, s0);
+    tsdb_test_latest_hook(db, wm_hook, &x);
+    x.armed = true;
+    OK(tsdb_delete_range(db, x.id, 20, TSDB_TS_MAX));
+    CHECK(wm_wait(db, refused_at_least, s0[4] + 1));
+    CHECK(__atomic_load_n(&x.fired, __ATOMIC_SEQ_CST) == 1);
+    CHECK(wm_wait(db, no_unknown, 0));
+    tsdb_test_latest_hook(db, NULL, NULL);
+    r = one(db, x.id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 30 && r.v.f64 == 99.0);
+    check_vs_scan(db, x.id, "warmer, refused");
+    OK(tsdb_close(db));
+}
+
+/* Between the warmer's cut and its store: a retention limit (any write section bumps lgen), then a drop. Each must
+ * refuse the batch; the entry stays an exact bound until the next fill. */
+typedef struct {
+    tsdb *db;
+    tsdb_sid id;
+    int action; /* 0 none, 1 set a retention, 2 drop before */
+    int fired;
+} wr;
+
+static void wr_hook(void *arg, int at)
+{
+    wr *x = arg;
+    if (at != LH_WARM_BEFORE_STORE || !x->action)
+        return;
+    int a = x->action;
+    x->action = 0;
+    if (a == 1)
+        OK(tsdb_set_retention(x->db, x->id, 100000 * DAY));
+    else
+        OK(tsdb_drop_before(x->db, 15));
+    __atomic_add_fetch(&x->fired, 1, __ATOMIC_SEQ_CST);
+}
+
+static void test_warmer_other_writers(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    wr x = {0};
+    x.db = open_plain("latest_warmer2", &o);
+    OK(tsdb_series_create(x.db, "wr.a", TSDB_FLOAT64, NULL, &x.id));
+    put_f64(x.db, x.id, 10, 1.0, false);
+    put_f64(x.db, x.id, 20, 2.0, false);
+    OK(tsdb_flush(x.db));
+    for (int a = 1; a <= 2; a++) {
+        uint64_t s0[6];
+        wm_stats(x.db, s0);
+        tsdb_test_latest_hook(x.db, wr_hook, &x);
+        x.action = a;
+        OK(tsdb_delete_range(x.db, x.id, 20, TSDB_TS_MAX)); /* unknown: the warmer cuts and fills */
+        CHECK(wm_wait(x.db, refused_at_least, s0[4] + 1));
+        CHECK(__atomic_load_n(&x.fired, __ATOMIC_SEQ_CST) == a);
+        CHECK(wm_wait(x.db, no_unknown, 0));
+        tsdb_test_latest_hook(x.db, NULL, NULL);
+        check_vs_scan(x.db, x.id, a == 1 ? "warmer, refused by a retention" : "warmer, refused by a drop");
+        put_f64(x.db, x.id, 20, 2.0, false); /* the row is back for the next round */
+        OK(tsdb_flush(x.db));
+    }
+    OK(tsdb_close(x.db));
+}
+
 static void test_flush_window(void)
 {
     tsdb_options o;
@@ -1208,6 +1774,82 @@ static void test_flush_window(void)
     check_vs_scan(f, x.id, "follower, after the flush");
     OK(tsdb_close(f));
     OK(tsdb_close(w));
+}
+
+/* ------------------------------------------------------------------ the large-flush window (3.2) */
+
+enum { WS_N = 7 };
+typedef struct {
+    tsdb *db;
+    tsdb_sid id[WS_N];
+    int mid, before_list;
+} ww;
+
+/* Runs on the flusher's thread, in the window: some of the stores are made, no lock is held, the flushing memtable is
+ * listed. Every lookup must still give the full scan's answer. */
+static void ww_hook(void *arg, int at)
+{
+    ww *x = arg;
+    if (at != LH_WINDOW_MID && at != LH_FOLD_BEFORE_LIST)
+        return;
+    if (at == LH_WINDOW_MID)
+        x->mid++;
+    else
+        x->before_list++;
+    for (int i = 0; i < WS_N; i++)
+        check_vs_scan(x->db, x->id[i], at == LH_WINDOW_MID ? "window, half stored" : "window, all stored");
+}
+
+static void test_window(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    ww x = {0};
+    x.db = open_plain("latest_window", &o);
+    for (int i = 0; i < WS_N; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ww.%d", i);
+        OK(tsdb_series_create(x.db, nm, TSDB_FLOAT64, NULL, &x.id[i]));
+    }
+    /* the parts: s0 10, s1 30, s2 20, s4 40 (deleted below: unknown), s5 20, s6 20 */
+    put_f64(x.db, x.id[0], 10, 1.0, false);
+    put_f64(x.db, x.id[1], 30, 2.0, false);
+    put_f64(x.db, x.id[2], 20, 3.0, false);
+    put_f64(x.db, x.id[4], 40, 4.0, false);
+    put_f64(x.db, x.id[4], 5, 4.5, false);
+    put_f64(x.db, x.id[5], 20, 5.0, false);
+    put_f64(x.db, x.id[6], 20, 6.0, false);
+    OK(tsdb_flush(x.db));
+    OK(tsdb_delete_range(x.db, x.id[4], 40, TSDB_TS_MAX)); /* s4: unknown (39) until the warmer fills it */
+    /* the flush: s0 a newer row (known to R), s1 an older one (the entry stays), s2 a null over its row (noted for
+     * the write section), s3 a first row (empty to R), s4 a row above the bound (unknown to R), s5 the same
+     * timestamp (R.ts >= k.ts), s6 a newer row and then a null beyond it (R below the null) */
+    put_f64(x.db, x.id[0], 25, 7.0, false);
+    put_f64(x.db, x.id[1], 20, 8.0, false);
+    put_f64(x.db, x.id[2], 20, 0, true);
+    put_f64(x.db, x.id[3], 10, 9.0, false);
+    put_f64(x.db, x.id[4], 42, 10.0, false);
+    put_f64(x.db, x.id[5], 20, 11.0, false);
+    put_f64(x.db, x.id[6], 25, 12.0, false);
+    put_f64(x.db, x.id[6], 28, 0, true);
+    tsdb_test_latest_window(2);
+    tsdb_test_latest_hook(x.db, ww_hook, &x);
+    OK(tsdb_flush(x.db));
+    tsdb_test_latest_hook(x.db, NULL, NULL);
+    tsdb_test_latest_window(50000);
+    CHECK(x.mid == 1 && x.before_list == 1); /* the window ran */
+    for (int i = 0; i < WS_N; i++)
+        check_vs_scan(x.db, x.id[i], "window, after");
+    tsdb_latest_result r = one(x.db, x.id[2], TSDB_TS_MAX, 0); /* the null took 20: nothing below */
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    r = one(x.db, x.id[6], TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 25 && r.v.f64 == 12.0);
+    /* the warmer settles the unknown entry the null made */
+    CHECK(wm_wait(x.db, no_unknown, 0));
+    for (int i = 0; i < WS_N; i++)
+        check_vs_scan(x.db, x.id[i], "window, warmed");
+    OK(tsdb_close(x.db));
 }
 
 /* ------------------------------------------------------------------ a follower */
@@ -1299,10 +1941,25 @@ int main(int argc, char **argv)
     int steps = argc > 2 ? atoi(argv[2]) : 260;
     test_directed();
     printf("directed ok\n");
+    test_retention_lengthened_in_merge();
+    test_merges_not_starved();
+    test_active_over_flushing();
+    test_drop_floor_lookup();
+    test_lengthened_after_merge();
+    test_sync_visibility();
+    test_row_below_cutoff();
+    test_build_state_bounds();
+    printf("retention lengthened in a merge ok\n");
     test_partial_merge();
     printf("partial merge ok\n");
+    test_warmer();
+    printf("warmer ok\n");
+    test_warmer_other_writers();
+    printf("warmer refused by retention and drop ok\n");
     test_flush_window();
     printf("flushing + active memtables, follower tails ok\n");
+    test_window();
+    printf("large-flush window ok\n");
     test_follower(1500);
     printf("follower ok\n");
 
@@ -1320,7 +1977,9 @@ int main(int argc, char **argv)
     o.wal_max_batch_rows = 64;
     o.granule_rows = 16;
     o.merge_threads = 0;
+    tsdb_test_latest_window(1); /* every flush through the 3.2 window */
     random_run("latest_r1", o, false, steps, 22);
+    tsdb_test_latest_window(50000);
     printf("many unmerged parts ok\n");
 
     tsdb_options_init(&o);
@@ -1338,7 +1997,9 @@ int main(int argc, char **argv)
     o.granule_rows = 64;
     o.wal_max_batch_rows = 90;
     o.merge_threads = 2;
+    tsdb_test_latest_window(2);
     random_run("latest_r3", o, true, steps, 44);
+    tsdb_test_latest_window(50000);
     printf("periodic WAL ok\n");
 
     /* partial merges (merge_idle_s, a small max_part_bytes): parts with rows and their own tombstones */
@@ -1351,10 +2012,25 @@ int main(int argc, char **argv)
     random_run("latest_r4", o, false, steps, 55);
     printf("partial merges ok\n");
 
+    /* no table at all: the slow path alone answers the same */
+    tsdb_options_init(&o);
+    o.latest_cache = 0;
+    o.wal_max_batch_rows = 64;
+    o.granule_rows = 32;
+    o.merge_threads = 1;
+    random_run("latest_r5", o, true, steps / 2, 66);
+    printf("latest_cache = 0 ok\n");
+
     test_crash();
     printf("crash ok\n");
     test_concurrent();
     printf("concurrent ok\n");
+    tsdb_test_latest_window(1); /* writers, merges and lookups with every flush a window */
+    conc_flush_every = 4;
+    test_concurrent();
+    conc_flush_every = 50;
+    tsdb_test_latest_window(50000);
+    printf("concurrent with windows ok\n");
     rmrf(root);
     printf("test_latest ok\n");
     return 0;

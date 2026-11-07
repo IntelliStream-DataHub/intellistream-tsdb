@@ -10,7 +10,7 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 | disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 9 (unreleased; 0.9.0 and 0.9.1 wrote 8) |
 | wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 13 |
 | oldest protocol spoken (the floor) | `TSDB_PROTOCOL_MIN` in `include/tsdb_protocol.h` | 12 |
-| embedded C ABI version | `TSDB_ABI_VERSION` in `include/tsdb.h`, `tsdb_abi_version()` | 4 |
+| embedded C ABI version | `TSDB_ABI_VERSION` in `include/tsdb.h`, `tsdb_abi_version()` | 5 |
 
 0.9.1 reads databases of disk format 8 only (so did 0.9.0), and speaks to clients and servers of protocol 12 only. The next release speaks protocol 13 (the HA bodies of docs/ha.md section 15.4) and still accepts 12: its floor is 12. It reads those of format 9 (it carries a format-8 database over with `tsdb <dir> upgrade`, below).
 

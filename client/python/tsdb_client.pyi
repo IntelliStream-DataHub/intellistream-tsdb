@@ -1485,6 +1485,8 @@ class Db:
             none; merges compress them at zstd_level); -1: zstd_level.
         stats, stats_sweep_mb_s: statistics of what is stored (-1 off, 0 lazy,
             1 from the open; the sweeper's MB/s cap), as tsdb_options.
+        latest_cache: bytes of memory for the latest tables of the process
+            (default RAM / 16; 0: no table, the same answers, slower).
         The other keywords are the engine's tsdb_options fields of the same
         name; None keeps the engine's default. partition_ms and granule_rows
         are fixed when the database is created. value_codec is "auto",
@@ -1525,6 +1527,7 @@ class Db:
         insert_zstd_level: int | None = None,
         stats: int | None = None,
         stats_sweep_mb_s: int | None = None,
+        latest_cache: int | None = None,
     ) -> Db: ...
     def close(self) -> None:
         """Flushes the memtable and closes the database.

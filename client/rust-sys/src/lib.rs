@@ -46,7 +46,7 @@ pub type tsdb_sid = u64;
 
 /// Raised with every incompatible change of a public struct's layout or of a function's signature;
 /// bindings refuse a library whose [`tsdb_abi_version`] differs.
-pub const TSDB_ABI_VERSION: c_int = 4;
+pub const TSDB_ABI_VERSION: c_int = 5;
 
 pub const TSDB_TS_MIN: i64 = i64::MIN;
 pub const TSDB_TS_MAX: i64 = i64::MAX;
@@ -87,6 +87,7 @@ pub struct tsdb_options {
     pub insert_zstd_level: c_int,
     pub stats: c_int,
     pub stats_sweep_mb_s: c_int,
+    pub latest_cache: usize,
 }
 
 impl Default for tsdb_options {
