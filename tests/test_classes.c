@@ -821,10 +821,10 @@ static void test_format(void)
     char buf[512] = {0};
     int fd = open(path, O_RDWR);
     ssize_t n = read(fd, buf, sizeof buf - 1);
-    char *v = strstr(buf, "version=8");
+    char *v = strstr(buf, "version=9");
     CK(n > 0 && v, "META: %s", buf);
     if (v) {
-        v[8] = '7';
+        v[8] = '7'; /* version=9 -> version=7 */
         CK(pwrite(fd, buf, (size_t)n, 0) == n, "pwrite");
     }
     close(fd);

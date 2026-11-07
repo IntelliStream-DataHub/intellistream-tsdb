@@ -2000,7 +2000,7 @@ static void test_old_format(void)
     snprintf(meta, sizeof meta, "%s/META", dir);
     size_t n;
     char *buf = slurp(meta, &n);
-    char *v = buf ? strstr(buf, "version=8") : NULL;
+    char *v = buf ? strstr(buf, "version=9") : NULL;
     CHECK(v != NULL);
     if (!v) {
         free(buf);
@@ -2009,7 +2009,7 @@ static void test_old_format(void)
     v[8] = '7';
     spit(meta, buf, n);
     free(buf);
-    const char *want[] = {"disk format version 7", "reads version 8 only", "Export the data"};
+    const char *want[] = {"disk format version 7", "reads version 9 only", "Export the data"};
     CHECK(RUN(NULL, NULL, dir, "stats") == 1);
     for (int i = 0; i < 3; i++)
         CHECK(err_has(want[i]));

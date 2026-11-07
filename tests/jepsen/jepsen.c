@@ -885,6 +885,9 @@ static void scan_cuts(void)
  * or a few bytes cut off the end. Each kind of file is as likely as any other, however many parts there are. */
 static void rot_damage(uint64_t r)
 {
+    /* FNO is not here: what it protects (a log number is never handed out twice) is not visible to this workload, which
+     * has no checker for it, so a flip there would only look like a pass. The damage to either slot, and the numbers
+     * that skip ahead after it, are tests/test_fno.c's (test_slots, test_damaged_newest). */
     static const char *const kinds[] = {"wal_", ".part", "MANIFEST", "SERIES", "STATES", "CLASSES", "VOLUMES",
                                         "RETENTION", "txn_", "META"};
     char pick[PATH_MAX] = "";

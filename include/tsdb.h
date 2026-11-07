@@ -76,6 +76,10 @@ enum {
     TSDB_ERR_ABANDONED = -14,   /* a request that was parked on a stuck volume and discarded its work (ha.md 15.3) */
     TSDB_ERR_DENIED = -16, /* tsdbd: the user holds no right for this (or the series does not exist) */
     TSDB_ERR_AUTH = -17,   /* tsdbd: login failed or is required first */
+    /* -18 and -19 are reserved for the change feed (docs/design-cdc.md): nothing returns them yet; the wire and the
+       clients name them when the feed is built */
+    TSDB_ERR_FEED_GONE = -18,  /* reserved: the feed position asked for is older than the retained log */
+    TSDB_ERR_FEED_RESET = -19, /* reserved: the feed's history was rewritten; the consumer must start again */
 };
 
 /* The ends of the time axis, for query ranges. Ranges are half-open, [start, end), so no range reaches a row at
@@ -227,6 +231,14 @@ const char *tsdb_volume_path(tsdb *db, uint32_t index);
  * writer opens the volume when a request first names it. */
 int tsdb_volume_add(tsdb *db, const char *path, uint32_t *index);
 int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index);
+
+/* Carries a database of the previous disk format (8) over to this release's (9) in place, without opening it:
+ * every volume and the root, volumes first. Refuses (TSDB_ERR_INVALID, with a message on stderr) unless each
+ * directory was closed cleanly by the release that wrote it (no WAL segment, intent file or tmp part) and refuses
+ * (TSDB_ERR_LOCKED) while a writer holds one. Followers on other hosts cannot be seen and must be stopped first. Safe
+ * to run again after a crash. Returns the number of directories upgraded (0: nothing to do), or a negative status.
+ * Parts keep their old headers until merges rewrite them (docs/compatibility.md). */
+int tsdb_upgrade(const char *dir);
 
 /* ---- writing ----
  * (series, ts) is a unique key, as in ReplacingMergeTree read with FINAL:

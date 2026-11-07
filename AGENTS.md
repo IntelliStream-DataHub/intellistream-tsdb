@@ -20,7 +20,7 @@ make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBS
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
                           # with an output buffer of exactly n values, part, manifest, wal, dict, volumes, tz, import = the
-                          # export stream, users = USERS, classes = CLASSES) under ASan+UBSan in build-fuzz/; make test
+                          # export stream, users = USERS, classes = CLASSES, marker = WAL marker payloads) under ASan+UBSan in build-fuzz/; make test
                           # replays tests/fuzz/corpus/<name>/ (codecx uses codec's). A crash-* input, once fixed, goes there.
                           # At a CPU level: make fuzz FUZZ_ARCH=-march=x86-64-v4 (or -v3; its own dir build-fuzz-v4, and a changed level in a FUZZ_B you name
                           # empties it; make fuzz-v4-check replays part and codecx at v4 under ASan with use-after-return on; the
@@ -99,7 +99,9 @@ cgroup, so `nice` does not keep your work out of its way.
   in `src/internal.h`).
 - `src/part.c`: part files, the writer, atomic commits (intent files). `src/gindex.c`: the packed granule
   index (`gix_encode`, `gix_parse`; the readers `gx_*` and `gx_load` are inline in `internal.h`).
-- `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable.
+- `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable. `src/fno.c`: the `FNO` file (the
+  durable bound of the WAL's log numbers). `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
+  decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
 - `src/merge.c`: merge selection and execution. `src/query.c`: snapshots, raw
   queries, aggregation, bucketing. `src/manifest.c`: MANIFEST, retired parts, followers.
 - `src/sched.c`: the query scheduler, one per `tsdb` handle (`query_threads - 1` helpers): fork/join jobs, one
@@ -252,6 +254,27 @@ cgroup, so `nice` does not keep your work out of its way.
   id is a bug that tests with ids above 2^32 find; row files of the benchmarks keep a u32 series NUMBER that indexes
   the bench's table of ids, never an id. Ids are never reused and mean nothing in another database (export and
   import name series, not ids). `tsdb_abi_version` (3 in 0.9.0 and 0.9.1) changes when the C structs or signatures the bindings use change.
+- **Log numbers (`fno`) never go back.** Every WAL record (format 9: a 32-byte header with `fno` and `commit_ms`) takes
+  numbers (rows: one per row; a marker: `span`), assigned in `wal_buffer` under `buf_lock`. They must never be
+  handed out twice across opens, whatever was removed in between (a segment after its flush, a part by retention,
+  an empty merge output). The durable bound is the volume's `FNO` file (`src/fno.c`: two checksummed slots on
+  separate 4 KiB pages, the older generation overwritten and `fdatasync`ed, fail-stop on any failure): before a WAL
+  segment is unlinked (`wal_unlink_upto` after a flush, the replay at open, the empty segment at close) `FNO` holds
+  at least the segment's end (`fno_require`), and a clean close stores the exact next number. At open `fno_next` =
+  max(the slot with the higher generation, the end of the valid records of every segment, 1 + the largest part
+  `fno_hi`); one bad slot is a torn store or damage to the newest slot (they look alike), so the other is used and the
+  numbers skip ahead by `FNO_BELT` (2^40: a gap, never a repeat); both bad or no file in a format-9 volume is
+  `TSDB_ERR_CORRUPT` (a volume that never held a record, 0.9.0's add leaves one, gets its `FNO` at the first open).
+  Bounds at or above `FNO_BOUND_MAX` (2^62 minus two belts) fail the open, and the writer fails the engine rather than
+  number past it. **MANIFEST
+  cannot be the bound**: the writer never reads it at open and it is rewritten in place without a sync, so a power
+  loss tears it; its `fno_next` line is information for followers, and followers never read `FNO`. A part's
+  `fno_lo, fno_hi` cover the rows records it holds, never markers (0, 0 for a large insert, replace or delete), an
+  extra lower bound only. A replay and a follower skip markers and count their numbers; a marker is never rows.
+  `tests/test_fno.c` (power loss at every step; damage to the newest slot; numbers going back inside a segment or
+  across two; the limit; `requires=`; mutations: numbers restarting from parts, the bound from MANIFEST, a segment
+  unlinked before `FNO` holds its end, a marker replayed as rows). The jepsen rot nemesis leaves `FNO` alone: no
+  workload there sees a number handed out twice.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
   only into partitions without a part from that segment.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
@@ -390,7 +413,10 @@ cgroup, so `nice` does not keep your work out of its way.
   `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.
-- The on-disk format is version 8 (`FORMAT_VERSION`; 6: a 7-bit codec kind in block headers; 7: partition keys with
+- The on-disk format is version 9 (`FORMAT_VERSION`; 9: the WAL record has a 32-byte header with `fno` and
+  `commit_ms` and may be a marker, the part header is 48 bytes with `fno_lo`, `fno_hi` and `written_ms`, every volume
+  has an `FNO` file, META may say `requires=` (an open refuses a feature it does not know, naming it) and
+  `parts_v8=1`; a format-8 database is carried over by `tsdb DIR upgrade`, below; 6: a 7-bit codec kind in block headers; 7: partition keys with
   a class, CLASSES, zstd frames without magic and content size, the packed granule index and a 64-byte footer
   with `index_len`; 8: no CATALOG, the volume number in each volume's META, 64-bit series ids): granule entries
   with typed, time-weighted and spread statistics, bit-packed per part (about 32 bytes each), a checksum over each
@@ -399,6 +425,20 @@ cgroup, so `nice` does not keep your work out of its way.
   layout change bumps `FORMAT_VERSION` and goes in the changelog with a way to carry data over, and a database
   of another version is refused at open with a message that names both versions. Value blocks name their codec, so new
   codecs need no version bump.
+- **`tsdb DIR upgrade`** (`tsdb_upgrade`, `up_*` at the end of `src/volumes.c`) carries a format-8 database over in place.
+  It refuses, before writing anything, on a `wal_*` segment, an intent, a `tmp_*` part, a held writer lock or a
+  damaged MANIFEST (not on `retired_*`: those are normal after a clean close); holds every directory's `LOCK` and the
+  VOLUMES OFD lock for the whole run; per volume makes `FNO` (synced with its directory), rewrites MANIFEST as 9 (tmp,
+  fsync, rename) and writes META (version 9, `parts_v8=1`) last; volumes first, the root last; safe to run again.
+  Parts keep their 24-byte headers: `part_open_as` reads one only where META says `parts_v8=1` and only when header and
+  footer both say 8 (a v8 part anywhere else is damage), `rewrite_alone` (`src/merge.c`) lets an idle partition's merge
+  or `tsdb_optimize` rewrite one alone, the open logs how many are left, and `v8_parts_account` (`src/db.c`) takes the
+  line out of META when none is. Followers on other hosts cannot be detected: they are stopped first
+  (docs/compatibility.md). **The v8-part reader is removed before 1.0** (docs/tasks/pre-1.0-v8-parts.md).
+  `tests/test_upgrade.c` unpacks a database 0.9.0 wrote (`tests/data/v8-fixture.tar`, made by
+  `tests/data/make-v8-fixture.sh` with the tag's binary, with its 0.9.0 export), upgrades it, compares every series
+  with the import of that export, merges, reopens, loses power at every step (crashfs) and plants "a v8 header hashed
+  as 48 bytes". `TSDB_V090_CLI=/path/to/0.9.0/tsdb` adds a check that 0.9.0 itself refuses the result.
 - **Damage is never silent.** A torn tail of an append-only file is cut; a bad
   record with a valid one after it, a read error or a broken part fails the open
   (`TSDB_ERR_CORRUPT` / `TSDB_ERR_IO`) with a log line. Never treat a read error

@@ -57,10 +57,10 @@ static int write_all(int fd, const void *buf, size_t len)
 
 /* Covers everything open trusts besides the granule blocks: chained over three pieces. */
 /* The trailer is hashed only when present: parts without tombstones keep their hash. */
-static uint64_t part_hash(const part_header *h, const void *index, size_t len, const void *trailer, size_t tlen,
-                          const part_footer *f)
+static uint64_t part_hash(const part_header *h, size_t hlen, const void *index, size_t len, const void *trailer,
+                          size_t tlen, const part_footer *f)
 {
-    uint64_t x = xxh64(h, sizeof *h, 0);
+    uint64_t x = xxh64(h, hlen, 0); /* a part carried over from format 8 hashes its 24-byte header, as it was written */
     x = xxh64(index, len, x);
     if (tlen)
         x = xxh64(trailer, tlen, x);
@@ -95,7 +95,7 @@ static bool trailer_parse(const uint8_t *buf, size_t tlen, const tomb **t, uint3
 
 int part_open(int dirfd, const char *name, bool pin, part **out)
 {
-    return part_open_as(dirfd, name, name, pin, out);
+    return part_open_as(dirfd, name, name, pin, false, out);
 }
 
 /* Whether the index, tombstones, header and footer in the mapping still hash to what the open checked. A part read
@@ -107,12 +107,13 @@ bool part_index_intact(const part *p)
         return true; /* the copy is what was checked */
     part_header h;
     part_footer f;
-    memcpy(&h, p->map, sizeof h);
+    memset(&h, 0, sizeof h);
+    memcpy(&h, p->map, p->hdr_len);
     memcpy(&f, p->map + p->map_len - sizeof f, sizeof f);
     /* the geometry of the open, not the footer's now: damaged lengths must not move the read */
     size_t ilen = (size_t)p->index_len, tlen = p->map_len - sizeof f - (size_t)p->index_off - ilen;
     const uint8_t *ib = p->map + p->index_off;
-    return part_hash(&h, ib, ilen, ib + ilen, tlen, &f) == p->index_hash;
+    return part_hash(&h, p->hdr_len, ib, ilen, ib + ilen, tlen, &f) == p->index_hash;
 }
 
 /* Before a decision that is made for good from a part's index (a merge, which writes what it read under a fresh
@@ -152,8 +153,11 @@ void part_mark_payload(eng *db, part *p, const char *what)
 }
 
 /* Opens the file `file` as the part called `name` (a follower may find a part
- * under its retired_ name). pin: read the index and tombstones from a checked copy (pin_index). */
-int part_open_as(int dirfd, const char *file, const char *name, bool pin, part **out)
+ * under its retired_ name). pin: read the index and tombstones from a checked copy (pin_index). v8_ok: the volume's
+ * META says parts_v8=1 (`tsdb DIR upgrade` made it): a part with a format-8 header (24 bytes, version 8 in header
+ * and footer alike) is then one of its old parts. Anywhere else it is damage: a v8 part in a database created at 9
+ * cannot be a valid old part. */
+int part_open_as(int dirfd, const char *file, const char *name, bool pin, bool v8_ok, part **out)
 {
     *out = NULL;
     part *p = calloc(1, sizeof *p);
@@ -183,7 +187,7 @@ int part_open_as(int dirfd, const char *file, const char *name, bool pin, part *
         return TSDB_ERR_IO;
     }
     size_t size = (size_t)st.st_size;
-    if (size < sizeof(part_header) + sizeof(part_footer)) {
+    if (size < PART_HDR_V8 + sizeof(part_footer)) {
         close(fd);
         free(p);
         return TSDB_ERR_CORRUPT;
@@ -201,21 +205,34 @@ int part_open_as(int dirfd, const char *file, const char *name, bool pin, part *
 
     part_header h;
     part_footer f;
-    memcpy(&h, p->map, sizeof h);
+    memset(&h, 0, sizeof h);
+    memcpy(&h, p->map, PART_HDR_V8); /* the version is in these bytes in both formats */
     memcpy(&f, p->map + size - sizeof f, sizeof f);
     int rc = TSDB_ERR_CORRUPT;
     if (memcmp(h.magic, PART_MAGIC, 8) != 0 || memcmp(f.magic, PART_END_MAGIC, 8) != 0)
         goto fail;
-    if (h.version != FORMAT_VERSION || f.version != h.version || h.granule_rows == 0 ||
+    bool v8 = h.version == PREV_FORMAT_VERSION && v8_ok;
+    if ((h.version != FORMAT_VERSION && !v8) || f.version != h.version || h.granule_rows == 0 ||
         h.granule_rows > MAX_GRANULE_ROWS)
         goto fail;
+    p->hdr_len = v8 ? PART_HDR_V8 : (uint32_t)sizeof h;
+    if (!v8) {
+        if (size < sizeof(part_header) + sizeof(part_footer))
+            goto fail;
+        memcpy(&h, p->map, sizeof h);
+        p->fno_lo = h.fno_lo;
+        p->fno_hi = h.fno_hi;
+        p->written_ms = h.written_ms;
+        if (h.fno_lo > h.fno_hi || (h.fno_lo == 0) != (h.fno_hi == 0) || h.fno_hi >= FNO_BOUND_MAX)
+            goto fail;
+    }
     p->grows = h.granule_rows;
     p->wal_seq = h.wal_seq;
     /* checked without wrapping: the hash is no authentication, and a crafted index_off near 2^64 would otherwise
        make part_hash read before the mapping. The writer pads the index to a multiple of 8, so the tombstone
        trailer, read in place as tomb structs, starts 8-byte aligned; a length that is not is refused here,
        before trailer_parse touches it (gix_parse refuses it too, but runs later). */
-    if (f.index_off % 8 != 0 || f.index_len % 8 != 0 || f.index_off < sizeof h || f.index_off > (uint64_t)size - sizeof f ||
+    if (f.index_off % 8 != 0 || f.index_len % 8 != 0 || f.index_off < p->hdr_len || f.index_off > (uint64_t)size - sizeof f ||
         f.index_len > (uint64_t)size - sizeof f - f.index_off)
         goto fail;
     size_t ilen = (size_t)f.index_len, tlen = (size_t)((uint64_t)size - sizeof f - f.index_off - f.index_len);
@@ -236,7 +253,7 @@ int part_open_as(int dirfd, const char *file, const char *name, bool pin, part *
         p->pinned = ilen + tlen + 8;
         rc = TSDB_ERR_CORRUPT;
     }
-    if (part_hash(&h, ib, ilen, ib + ilen, tlen, &f) != f.index_hash || f.min_ts > f.max_ts ||
+    if (part_hash(&h, eng_test_mutant == MUT_V8_HASH48 ? sizeof h : p->hdr_len, ib, ilen, ib + ilen, tlen, &f) != f.index_hash || f.min_ts > f.max_ts ||
         !trailer_parse(ib + ilen, tlen, &p->t, &p->nt) || gix_parse(ib, ilen, f.ngranules, &p->ix) != 0)
         goto fail;
     p->ng = f.ngranules;
@@ -289,7 +306,7 @@ int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_
                  bool verify)
 {
     uint64_t len = (uint64_t)g->ts_len + g->val_len;
-    if (g->off < sizeof(part_header) || g->off > p->index_off || len > p->index_off - g->off || g->count == 0 ||
+    if (g->off < p->hdr_len || g->off > p->index_off || len > p->index_off - g->off || g->count == 0 ||
         g->count > p->grows || g->count > cap)
         return TSDB_ERR_CORRUPT;
     const uint8_t *blk = p->map + g->off;
@@ -308,6 +325,9 @@ int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_
 
 /* ---------------------------------------------------------------- writer */
 
+__thread uint64_t cur_fno_lo, cur_fno_hi;
+int eng_test_mutant;
+
 static void pw_header(const part_writer *w, part_header *h)
 {
     memset(h, 0, sizeof *h);
@@ -315,6 +335,9 @@ static void pw_header(const part_writer *w, part_header *h)
     h->version = FORMAT_VERSION;
     h->granule_rows = w->grows;
     h->wal_seq = w->wal_seq;
+    h->fno_lo = w->fno_lo;
+    h->fno_hi = w->fno_hi;
+    h->written_ms = w->written_ms;
 }
 
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq)
@@ -324,6 +347,9 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     w->fd = -1;
     w->partition = partition;
     w->wal_seq = wal_seq;
+    w->fno_lo = cur_fno_lo;
+    w->fno_hi = cur_fno_hi;
+    w->written_ms = eng_wall_ms();
     w->grows = db->granule_rows;
     int64_t cut = db->partition_ms * GRANULE_CUT; /* cls_len is partition_ms for every class without classes */
     w->cut_ms = db->cls_len[partition_class(db, partition)] > cut ? cut : 0;
@@ -682,7 +708,7 @@ int pw_copy_granule(part_writer *w, const part *src, uint32_t i)
     gx_load(src, i, GW_ALL, &gb);
     const granule *g = &gb;
     size_t len = (size_t)g->ts_len + g->val_len;
-    if (g->off < sizeof(part_header) || g->off > src->index_off || len > src->index_off - g->off)
+    if (g->off < src->hdr_len || g->off > src->index_off || len > src->index_off - g->off)
         return TSDB_ERR_CORRUPT;
     bool decoded = w->hc_min && w->hk_dsrc == src && w->hk_di == i; /* pw_copy_fits decoded its stamps */
     if (decoded && g->count != w->hk_dn)
@@ -795,9 +821,14 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         memcpy(trailer + tlen - 8, &cnt, 4);
         memcpy(trailer + tlen - 4, &magic, 4);
     }
-    f.index_hash = part_hash(&h, index, ilen, trailer, tlen, &f);
+    f.index_hash = part_hash(&h, sizeof h, index, ilen, trailer, tlen, &f);
     memcpy(f.magic, PART_END_MAGIC, 8);
-    if ((rc = pw_flush(w)) != 0 || (rc = write_all(w->fd, index, ilen)) != 0 ||
+    /* the range and the write time may be set after pw_begin wrote the header (a merge knows its sources only then):
+       the header on disk is the one hashed */
+    rc = pw_flush(w);
+    if (rc == 0 && pwrite(w->fd, &h, sizeof h, 0) != (ssize_t)sizeof h)
+        rc = TSDB_ERR_IO;
+    if (rc != 0 || (rc = write_all(w->fd, index, ilen)) != 0 ||
         (tlen && (rc = write_all(w->fd, trailer, tlen)) != 0) || (rc = write_all(w->fd, &f, sizeof f)) != 0) {
         free(trailer);
         free(index);
@@ -825,7 +856,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         else
             close(w->fd);
         w->fd = -1; /* the tmp file stays */
-        rc = part_open_as(db->dirfd, w->tmp_name, name, db->opt.pin_index, out);
+        rc = part_open_as(db->dirfd, w->tmp_name, name, db->opt.pin_index, db->parts_v8, out);
         if (rc == 0)
             (*out)->verify = db->opt.verify_checksums;
         if (rc == 0)
@@ -848,7 +879,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         pw_abort(w);
         return TSDB_ERR_IO;
     }
-    rc = part_open(db->dirfd, name, db->opt.pin_index, out);
+    rc = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, out);
     if (rc == 0)
         (*out)->verify = db->opt.verify_checksums;
     if (rc != 0)

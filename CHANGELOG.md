@@ -14,6 +14,34 @@ still version 3 (it only gained functions and structs). A database of 0.9.0 open
 not change (the new status `TSDB_ERR_UNAVAILABLE` only appears for volumes that an operator put in a
 `--health-domain`); use the same release on the server and its clients all the same.
 
+### Changed
+
+- **Disk format 9** (step S0 of docs/design-ha-modes.md; the disk half). The WAL record has a 32-byte header with a log
+  number (`fno`) and the group commit's time, and can be a marker; the part header is 48 bytes (the range of log numbers
+  of its rows, and `written_ms`); every volume has an `FNO` file, two checksummed slots that bound the numbers so
+  that they never go back across opens (before a WAL segment is unlinked it holds the segment's end: one `fdatasync`
+  per flush); `META` can say `requires=` (a binary refuses a feature it does not know, naming it); `MANIFEST` has an
+  `fno_next` line (information for followers). The cost is 16 more bytes per WAL record: not measurable with an
+  fsync per call, 1 to 8% on appends without one (BENCHMARKS.md, "Format 9").
+  **Carrying a database over:** a format-8 database is refused, naming both versions. `tsdb DIR upgrade` carries it
+  over in place when it was closed cleanly with 0.9.0 (no WAL segment, intent or tmp part; stop tsdbd and every
+  follower first): FNO, MANIFEST and META of each volume, the root last, safe to run again. The parts keep their old
+  headers until merges rewrite them (`META` says `parts_v8=1` meanwhile; merges of idle partitions and `tsdb DIR
+  optimize` do it, the open logs how many are left). Export and import (docs/export-format.md) still always works.
+  See docs/compatibility.md. With one bad `FNO` slot (a torn store or damage; they look alike) the open uses the other
+  and skips the numbers ahead by 2^40, so none is handed out twice; do not run 0.9.0's `tsdb` (`volume add`) on an
+  upgraded database.
+- New status codes -18 (`TSDB_ERR_FEED_GONE`) and -19 (`TSDB_ERR_FEED_RESET`) are reserved in `tsdb.h` for the change
+  feed; nothing returns them yet.
+
+### Added
+
+- **Marker payloads and the namespace-event hook** (docs/design-ha-modes.md 2.1): `COMMIT`, `DROP`, `RETENTION` and
+  `EPOCH` have one encoder and one decoder (`src/marker.c`, fuzzed), the type numbers of the feed's and the cluster's
+  other markers are reserved, and the engine calls a no-op `jr_intent` / `jr_commit` hook where names and files
+  become visible. No backend yet: no marker is written outside the tests.
+- `tsdb_upgrade(dir)` in `tsdb.h` and `tsdb DIR upgrade` (above).
+
 ### Fixed
 
 - **A deleted partition no longer comes back after a crash while a merge of it was running.**
