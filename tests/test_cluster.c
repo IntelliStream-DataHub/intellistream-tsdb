@@ -1338,6 +1338,79 @@ static void scen_watch(void)
     }
 }
 
+/* M11 (item 2): the leader's disk stalls (its log sync hangs, for hours on a hard mount). The cluster thread must keep
+ * answering and heartbeating (the member is never marked down), and after 2 s (stall_ms=1500 here) the leader hands
+ * leadership to another voter. The knob holds the worker's sync while <state-dir>/stall exists. */
+static void scen_stall(void)
+{
+    scenario("stall");
+    for (int i = 0; i < 4; i++) {
+        envs[i] = "sync_stall_file=1,stall_ms=1500";
+        start(i);
+    }
+    init_cluster(0, 600); /* a silent voter stays a voter */
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int L = leader_of(0);
+    if (L < 0 || L > 2)
+        die("no leader among the voters");
+    int U = (L + 1) % 3;
+    char path[PATH_MAX + 160];
+    snprintf(path, sizeof path, "%s/n%d/state/stall", base, L);
+    FILE *f = fopen(path, "w");
+    if (!f || fclose(f) != 0)
+        die("making %s", path);
+    /* a proposal on the stalled leader: its sync round never ends. The answer may time out or be refused. */
+    char addr[META_ADDR_MAX], err[1024];
+    peer_of(L, addr, sizeof addr);
+    uint8_t req[META_ADDR_MAX + 2], *rep = NULL;
+    size_t rl = node_add_req(3, req), replen = 0;
+    int rc;
+    cluster_admin(addr, secret, secret_len, CLUSTER_OP_NODE_ADD, req, rl, 1500, &rc, &rep, &replen, err,
+                  sizeof err);
+    free(rep);
+    /* the thread is not blocked on the disk: STATUS answers at once, 2.5 s into the stall */
+    uint64_t t0 = now_ms();
+    while (now_ms() - t0 < 2500)
+        usleep(50000);
+    uint64_t q0 = now_ms();
+    struct view v;
+    view(L, &v);
+    view_free(&v);
+    if (now_ms() - q0 > 1000)
+        die("STATUS of the stalled leader took %" PRIu64 " ms: the cluster thread waits for the disk", now_ms() - q0);
+    /* leadership has moved to another voter */
+    uint64_t t1 = now_ms();
+    int nl = -1;
+    while (now_ms() - t1 < 10000) {
+        view(U, &v);
+        nl = leader_index(&v);
+        view_free(&v);
+        if (nl >= 0 && nl != L)
+            break;
+        usleep(100000);
+    }
+    if (nl < 0 || nl == L)
+        die("the stalled leader did not hand leadership on within 10 s");
+    printf("  leader %d stalled: server %d leads after %" PRIu64 " ms\n", L, nl, now_ms() - t0);
+    if (!log_has(L, "handing leadership"))
+        die("the stalled leader says nothing of handing leadership on");
+    /* well past the 1.5 s of node_timeout: its heartbeats still arrive */
+    t0 = now_ms();
+    while (now_ms() - t0 < 3000)
+        usleep(50000);
+    struct state_want up = {ids[L], META_UP, 0};
+    await_view_ms(nl, p_member_state, &up, "the stalled node still up (its heartbeats flow)", 3000);
+    unlink(path);
+    view(nl, &v);
+    struct catch_up c = {v.m.applied, meta_hash(&v.m)};
+    view_free(&v);
+    await_view_ms(L, p_caught_up, &c, "the node catching up once its disk returns", 10000);
+    printf("  the stall ended: server %d is a follower again and caught up\n", L);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1363,7 +1436,8 @@ int main(int argc, char **argv)
                {"dirsync", scen_dirsync},   {"install", scen_install}, {"reseed", scen_reseed},
                {"torn", scen_torn},         {"rebase", scen_rebase},
                {"slowinstall", scen_slowinstall},
-               {"ids", scen_ids},           {"watch", scen_watch},     {"life", scen_life}};
+               {"ids", scen_ids},           {"watch", scen_watch},     {"stall", scen_stall},
+               {"life", scen_life}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;

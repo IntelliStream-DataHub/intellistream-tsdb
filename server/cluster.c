@@ -95,6 +95,7 @@
 #define CL_VERSION 2 /* 2: heartbeat sections, flags in PROBE_REPLY; peers of version 1 are refused (no mixed versions) */
 #define RING 4096
 #define SNAP_EVERY 1000
+#define SYNC_STALL_NS (2000ull * 1000000) /* M11: a leader whose own sync is outstanding this long hands leadership on */
 #define MS 1000000ull
 #define HANDSHAKE_NS (5000 * MS)
 #define DIAL_GAP_NS (250 * MS)
@@ -854,6 +855,29 @@ struct pend {
     uint64_t join; /* a NODE_ADD's MEMBER_ADD: the link to the new server, which gets JOIN once it applied */
 };
 
+
+/* ------------------------------------------------------------------ the disk worker's jobs */
+#define DW_Q 8
+enum { DJ_SYNC = 1, DJ_SNAP };
+struct djob {
+    int kind;
+    uint64_t gen;
+    raft_log_sync sync; /* DJ_SYNC: the descriptors a prepare handed out */
+    uint8_t *img;       /* DJ_SNAP: the image, handed back in the result */
+    size_t len;
+    uint64_t index, term;
+    raft_config cfg;
+    int fail_dirsync;
+};
+struct dres {
+    int kind;
+    uint64_t gen;
+    int rc, err; /* DJ_SYNC: rc != 0 failed; DJ_SNAP: write_durable's result (-2: the directory sync failed) */
+    uint64_t index, term;
+    uint8_t *img;
+    size_t len;
+    raft_config cfg;
+};
 static struct {
     char dir[1024], metadir[1040], logdir[1060], nodefile[1060], snapfile[1060], identfile[1060], pendfile[1060];
     char copyfile[1060], retiredfile[1060];
@@ -926,6 +950,26 @@ static struct {
     uint64_t snap_every, snap_retain, seg_bytes;
     int fail_snap_dirsync;
     uint64_t hold_install_ns, hold_from;
+
+    /* The disk worker (M11, item 2): the fdatasyncs of a log sync round and the durable write of a snapshot run on
+     * their own thread, so a disk that stalls leaves the heartbeats, the watch streams and the Raft messages alone.
+     * The core thread prepares a round (descriptors), the worker syncs, the core thread hears the result through
+     * dw_pipe and tells the core. dw_gen: results of an older generation (the core was stopped or restored since)
+     * are dropped. */
+    pthread_t dw_th;
+    int dw_on, dw_stop, dw_busy, dw_pipe[2];
+    pthread_mutex_t dw_mu;
+    pthread_cond_t dw_cv, dw_idle;
+    struct djob dw_q[DW_Q];
+    size_t dw_nq;
+    struct dres dw_r[DW_Q];
+    size_t dw_nr;
+    uint64_t dw_gen;
+    uint64_t sync_since; /* core thread: when the sync round now outstanding was handed to the worker; 0: none */
+    int snap_out;        /* core thread: a snapshot write is outstanding */
+    uint64_t stall_ns, xfer_for, xfer_next; /* a leader whose sync is outstanding this long hands leadership on */
+    int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
+    char stallfile[1100];
 
     struct buf fb; /* the frame being built; never held across a call that builds another */
     raft_entry ents[RAFT_WIRE_MAX_ENTRIES];
@@ -1115,6 +1159,7 @@ static void test_knobs(void)
     const char *t = getenv("TSDB_CLUSTER_TEST");
     C.snap_every = SNAP_EVERY;
     C.free_min = FREE_MIN_DEFAULT;
+    C.stall_ns = SYNC_STALL_NS;
     for (const char *p = t; p && *p;) {
         unsigned long long v = 0;
         unsigned a = 0, b = 0, c = 0, ep = 0;
@@ -1140,6 +1185,10 @@ static void test_knobs(void)
             C.seg_bytes = v;
         else if (sscanf(p, "fail_snap_dirsync=%llu", &v) == 1)
             C.fail_snap_dirsync = v != 0;
+        else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
+            C.stall_file = v != 0;
+        else if (sscanf(p, "stall_ms=%llu", &v) == 1 && v)
+            C.stall_ns = v * 1000000ull;
         else if (sscanf(p, "hold_install_ms=%llu", &v) == 1)
             C.hold_install_ns = v * 1000000ull;
         p = strchr(p, ',');
@@ -1653,21 +1702,183 @@ static void check_fault(void)
         log_fault("the Raft log: %s", what);
 }
 
+/* ------------------------------------------------------------------ the disk worker */
+
+/* The worker takes jobs in order: a sync round's fdatasyncs (descriptors only, never the log) and a snapshot's durable
+ * write. Everything that touches the log's own state (prepare, durable, compaction, the hard state) stays on the core
+ * thread: the hard state's slot sequence is shared with the durable floor, which the Raft core's log does not guard. */
+static void *dw_main(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&C.dw_mu);
+    for (;;) {
+        while (!C.dw_nq && !C.dw_stop)
+            pthread_cond_wait(&C.dw_cv, &C.dw_mu);
+        if (!C.dw_nq)
+            break;
+        struct djob j = C.dw_q[0];
+        memmove(C.dw_q, C.dw_q + 1, (--C.dw_nq) * sizeof C.dw_q[0]);
+        C.dw_busy = 1;
+        pthread_mutex_unlock(&C.dw_mu);
+        struct dres r = {.kind = j.kind, .gen = j.gen, .index = j.index, .term = j.term, .img = j.img, .len = j.len,
+                         .cfg = j.cfg};
+        if (j.kind == DJ_SYNC) {
+            while (C.stall_file && access(C.stallfile, F_OK) == 0 && !C.dw_stop)
+                usleep(10000); /* a test's stalled disk */
+            iso_err e = raft_log_sync_run(&j.sync);
+            r.index = j.sync.index;
+            r.term = j.sync.term;
+            r.rc = e != ISO_OK || j.sync.err;
+            r.err = j.sync.err ? j.sync.err : EIO;
+        } else {
+            r.rc = write_durable(C.snapfile, j.img, j.len);
+            r.err = errno;
+            if (r.rc == 0 && j.fail_dirsync) {
+                r.rc = -2;
+                r.err = EIO;
+            }
+        }
+        pthread_mutex_lock(&C.dw_mu);
+        C.dw_busy = 0;
+        if (C.dw_nr < DW_Q)
+            C.dw_r[C.dw_nr++] = r;
+        else
+            free(r.img); /* cannot happen: the core thread has at most two jobs out */
+        pthread_cond_broadcast(&C.dw_idle);
+        ssize_t w = write(C.dw_pipe[1], "x", 1);
+        (void)w;
+    }
+    pthread_mutex_unlock(&C.dw_mu);
+    return NULL;
+}
+
+static int dw_start(void)
+{
+    if (C.dw_on)
+        return 0;
+    pthread_mutex_init(&C.dw_mu, NULL);
+    pthread_cond_init(&C.dw_cv, NULL);
+    pthread_cond_init(&C.dw_idle, NULL);
+    if (pipe2(C.dw_pipe, O_CLOEXEC | O_NONBLOCK) != 0)
+        return -1;
+    C.dw_stop = 0;
+    if (pthread_create(&C.dw_th, NULL, dw_main, NULL) != 0) {
+        close(C.dw_pipe[0]);
+        close(C.dw_pipe[1]);
+        return -1;
+    }
+    C.dw_on = 1;
+    return 0;
+}
+
+static void dw_submit(struct djob *j)
+{
+    j->gen = C.dw_gen;
+    pthread_mutex_lock(&C.dw_mu);
+    if (C.dw_nq == DW_Q)
+        fail_stop("the disk worker's queue is full"); /* the core thread keeps at most two jobs out */
+    C.dw_q[C.dw_nq++] = *j;
+    pthread_cond_signal(&C.dw_cv);
+    pthread_mutex_unlock(&C.dw_mu);
+}
+
+/* Waits until the worker has nothing queued or running (the core is about to go, or to rewrite the snapshot file:
+ * what the worker holds must not land after that). Its results stay for dw_collect, which drops them by generation. */
+static void dw_quiesce(void)
+{
+    if (!C.dw_on)
+        return;
+    pthread_mutex_lock(&C.dw_mu);
+    while (C.dw_nq || C.dw_busy)
+        pthread_cond_wait(&C.dw_idle, &C.dw_mu);
+    pthread_mutex_unlock(&C.dw_mu);
+}
+
+/* The core was stopped or its log reset: what the worker was doing means nothing to the core that follows. */
+static void dw_forget(void)
+{
+    dw_quiesce();
+    C.dw_gen++;
+    C.sync_since = 0;
+    C.snap_out = 0;
+}
+
+static void dw_stop_thread(void)
+{
+    if (!C.dw_on)
+        return;
+    pthread_mutex_lock(&C.dw_mu);
+    C.dw_stop = 1;
+    pthread_cond_signal(&C.dw_cv);
+    pthread_mutex_unlock(&C.dw_mu);
+    pthread_join(C.dw_th, NULL);
+    for (size_t i = 0; i < C.dw_nr; i++)
+        free(C.dw_r[i].img);
+    C.dw_nr = 0;
+    close(C.dw_pipe[0]);
+    close(C.dw_pipe[1]);
+    C.dw_on = 0;
+}
+
+static void snap_done(struct dres *r);
+
+/* The results the worker has for the core thread, applied in order. */
+static void dw_collect(void)
+{
+    if (!C.dw_on)
+        return;
+    char junk[64];
+    while (read(C.dw_pipe[0], junk, sizeof junk) > 0)
+        ;
+    for (;;) {
+        struct dres r;
+        pthread_mutex_lock(&C.dw_mu);
+        if (!C.dw_nr) {
+            pthread_mutex_unlock(&C.dw_mu);
+            return;
+        }
+        r = C.dw_r[0];
+        memmove(C.dw_r, C.dw_r + 1, (--C.dw_nr) * sizeof C.dw_r[0]);
+        pthread_mutex_unlock(&C.dw_mu);
+        if (r.gen != C.dw_gen || !C.r) {
+            free(r.img);
+            continue;
+        }
+        if (r.kind == DJ_SYNC) {
+            C.sync_since = 0;
+            if (r.rc) {
+                log_fault("syncing the Raft log in %s: %s", C.logdir, strerror(r.err));
+                continue;
+            }
+            raft_log_durable(C.log, r.index, r.term);
+            raft_persisted(C.r, r.index, r.term);
+        } else {
+            snap_done(&r);
+        }
+    }
+}
+
+/* A sync round: the descriptors are taken here, the fdatasyncs run on the worker, and the core hears raft_persisted
+ * from dw_collect. One round at a time: the core asks again for what was appended meanwhile. */
 static void sync_round(void)
 {
-    raft_log_sync s;
-    iso_err e = raft_log_sync_prepare(C.log, &s);
-    if (e == ISO_OK)
-        e = raft_log_sync_run(&s);
-    else
-        for (unsigned i = 0; i < s.n; i++)
-            close(s.fds[i]);
-    if (e != ISO_OK || s.err) {
-        log_fault("syncing the Raft log in %s: %s", C.logdir, strerror(s.err ? s.err : EIO));
+    if (C.sync_since)
+        return;
+    struct djob j = {.kind = DJ_SYNC};
+    iso_err e = raft_log_sync_prepare(C.log, &j.sync);
+    if (e != ISO_OK) {
+        for (unsigned i = 0; i < j.sync.n; i++)
+            close(j.sync.fds[i]);
+        log_fault("syncing the Raft log in %s: %s", C.logdir, strerror(j.sync.err ? j.sync.err : EIO));
         return;
     }
-    raft_log_durable(C.log, s.index, s.term);
-    raft_persisted(C.r, s.index, s.term);
+    if (!j.sync.n && !j.sync.err) { /* nothing to sync: done at once */
+        raft_log_durable(C.log, j.sync.index, j.sync.term);
+        raft_persisted(C.r, j.sync.index, j.sync.term);
+        return;
+    }
+    C.sync_since = iso_now_ns();
+    dw_submit(&j);
 }
 
 static int config_of(const struct meta_state *m, raft_config *c)
@@ -1678,32 +1889,37 @@ static int config_of(const struct meta_state *m, raft_config *c)
 
 static void take_snapshot(void)
 {
-    raft_config c;
-    if (!config_of(&C.sm, &c))
+    if (C.snap_out)
         return;
-    uint8_t *img;
-    size_t len;
-    if (meta_snapshot_encode(&C.sm, &img, &len) != META_OK)
+    struct djob j = {.kind = DJ_SNAP};
+    if (!config_of(&C.sm, &j.cfg))
+        return;
+    if (meta_snapshot_encode(&C.sm, &j.img, &j.len) != META_OK)
         oom();
-    int rc = write_durable(C.snapfile, img, len);
-    if (rc == 0 && C.fail_snap_dirsync) {
-        rc = -2;
-        errno = EIO;
-    }
-    if (rc == -2) /* the new snapshot is named, maybe not durably: compacting on it could lose the log's base */
-        fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.snapfile, strerror(errno));
-    if (rc != 0) {
-        say("cannot write %s: %s (the log is kept until a later snapshot is written)", C.snapfile,
-            strerror(errno));
-        free(img);
-        C.snap_index = C.sm.applied; /* try again snap_every entries later, not on every one */
+    j.index = C.sm.applied;
+    j.term = C.sm.applied_term;
+    j.fail_dirsync = C.fail_snap_dirsync;
+    C.snap_out = 1;
+    dw_submit(&j);
+}
+
+/* The worker wrote the image (or failed to): the log is compacted onto it only now, as it was when this ran inline. */
+static void snap_done(struct dres *r)
+{
+    C.snap_out = 0;
+    if (r->rc == -2) /* the new snapshot is named, maybe not durably: compacting on it could lose the log's base */
+        fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.snapfile, strerror(r->err));
+    if (r->rc != 0) {
+        say("cannot write %s: %s (the log is kept until a later snapshot is written)", C.snapfile, strerror(r->err));
+        free(r->img);
+        C.snap_index = r->index; /* try again snap_every entries later, not on every one */
         return;
     }
     free(C.snap);
-    C.snap = img;
-    C.snaplen = len;
-    C.snap_index = C.sm.applied;
-    raft_compact(C.r, C.sm.applied, C.sm.applied_term, &c);
+    C.snap = r->img;
+    C.snaplen = r->len;
+    C.snap_index = r->index;
+    raft_compact(C.r, r->index, r->term, &r->cfg);
 }
 
 static void send_raft(const raft_msg *m)
@@ -1744,6 +1960,7 @@ static void send_raft(const raft_msg *m)
 
 static void restore(const raft_action *a)
 {
+    dw_forget(); /* a snapshot write still out would land over this image */
     struct meta_state t;
     meta_init(&t);
     if (meta_snapshot_decode(&t, a->u.snapshot.data, a->u.snapshot.len) != META_OK ||
@@ -1820,6 +2037,37 @@ static void pump(void)
     check_fault();
     if (C.sm.applied >= C.snap_index + C.snap_every)
         take_snapshot();
+}
+
+/* M11: a leader whose own log sync has been outstanding for SYNC_STALL_NS cannot commit anything, and its disk may be
+ * gone for hours. The heartbeats and the Raft messages still run (the worker has the sync), so it hands leadership to
+ * the voter that holds most of its log (the core's transfer: TimeoutNow once that voter has everything) and steps
+ * down on the higher term. Tried again every second while the same sync is out. */
+static void sync_stall_check(uint64_t now)
+{
+    if (!C.sync_since || C.role != RAFT_LEADER || now - C.sync_since < C.stall_ns || now < C.xfer_next)
+        return;
+    C.xfer_next = now + 1000 * MS;
+    const raft_config *cfg = raft_get_config(C.r);
+    raft_id best = 0;
+    raft_index best_match = 0;
+    for (unsigned i = 0; cfg && i < cfg->n; i++) {
+        raft_progress pr;
+        if (cfg->m[i].learner || cfg->m[i].id == C.id || !raft_get_progress(C.r, cfg->m[i].id, &pr))
+            continue;
+        if (!best || pr.match > best_match) {
+            best = cfg->m[i].id;
+            best_match = pr.match;
+        }
+    }
+    if (!best)
+        return;
+    if (C.xfer_for != C.sync_since) {
+        C.xfer_for = C.sync_since;
+        say("node %" PRIu32 ": its Raft log sync has been outstanding for %" PRIu64 " ms; handing leadership to node %u",
+            C.id, (uint64_t)((now - C.sync_since) / MS), (unsigned)best);
+    }
+    raft_transfer(C.r, best);
 }
 
 static void close_watches(void)
@@ -2075,6 +2323,7 @@ static int log_fault(const char *fmt, ...)
 
 static void core_stop(struct meta_state *next)
 {
+    dw_forget();
     raft_free(C.r);
     C.r = NULL;
     raft_log_close(C.log);
@@ -3324,11 +3573,14 @@ static void *cluster_main(void *arg)
     size_t pfcap = 0;
     while (!atomic_load(&C.stop)) {
         uint64_t now = iso_now_ns();
+        dw_collect();
         if (C.r) {
             raft_tick(C.r, now);
             pump();
-            if (C.r && raft_log_floor_due(C.log, raft_get_commit(C.r), now))
+            if (C.r && !C.sync_since && raft_log_floor_due(C.log, raft_get_commit(C.r), now))
                 sync_round();
+            if (C.r)
+                sync_stall_check(now);
         }
         copy_flush(now, 0);
         if (now >= C.next_hb) {
@@ -3349,20 +3601,21 @@ static void *cluster_main(void *arg)
             }
         }
         size_t n0 = C.nconns;
-        if (pfcap < n0 + 2) {
-            pfcap = (n0 + 2) * 2;
+        if (pfcap < n0 + 3) {
+            pfcap = (n0 + 3) * 2;
             pf = realloc(pf, pfcap * sizeof *pf);
             if (!pf)
                 oom();
         }
         pf[0] = (struct pollfd){C.lfd, POLLIN, 0};
         pf[1] = (struct pollfd){C.stop_pipe[0], POLLIN, 0};
+        pf[2] = (struct pollfd){C.dw_pipe[0], POLLIN, 0};
         for (size_t i = 0; i < n0; i++) {
             struct conn *c = C.conns[i];
             short ev = POLLIN;
             if (c->state == CS_CONNECTING || c->wb.len > c->wb.off)
                 ev |= POLLOUT;
-            pf[i + 2] = (struct pollfd){c->fd, ev, 0};
+            pf[i + 3] = (struct pollfd){c->fd, ev, 0};
         }
         int timeout = 50;
         if (C.r) {
@@ -3370,7 +3623,7 @@ static void *cluster_main(void *arg)
             if (d != UINT64_MAX)
                 timeout = d <= now ? 0 : (d - now) / MS + 1 < 50 ? (int)((d - now) / MS + 1) : 50;
         }
-        int rc = poll(pf, n0 + 2, timeout);
+        int rc = poll(pf, n0 + 3, timeout);
         if (rc < 0 && errno != EINTR)
             fail_stop("poll: %s", strerror(errno));
         if (rc > 0 && (pf[0].revents & POLLIN)) {
@@ -3385,7 +3638,7 @@ static void *cluster_main(void *arg)
         }
         for (size_t i = 0; rc > 0 && i < n0; i++) {
             struct conn *c = C.conns[i];
-            short re = pf[i + 2].revents;
+            short re = pf[i + 3].revents;
             if (c->dead || !re)
                 continue;
             if (c->state == CS_CONNECTING && (re & (POLLOUT | POLLERR | POLLHUP))) {
@@ -3460,6 +3713,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.pendfile, sizeof C.pendfile, "%s/snapshot.install", C.metadir);
     snprintf(C.copyfile, sizeof C.copyfile, "%s/copy", C.metadir);
     snprintf(C.retiredfile, sizeof C.retiredfile, "%s/retired", C.metadir);
+    snprintf(C.stallfile, sizeof C.stallfile, "%s/stall", C.metadir);
     test_knobs();
     meta_init(&C.sm);
     meta_init(&C.wsm);
@@ -3542,6 +3796,10 @@ int cluster_start(const struct cluster_cfg *cfg)
                 C.r ? "in the metadata group" : "following a watch stream");
     else
         fprintf(stderr, "tsdbd: cluster: in no cluster yet (tsdb cluster init, or node add from a member)\n");
+    if (dw_start() != 0) {
+        fprintf(stderr, "tsdbd: cluster: cannot start the disk worker\n");
+        return -1;
+    }
     if (pthread_create(&C.th, NULL, cluster_main, NULL) != 0) {
         fprintf(stderr, "tsdbd: cluster: cannot start its thread\n");
         return -1;
@@ -3558,6 +3816,7 @@ void cluster_stop(void)
     ssize_t w = write(C.stop_pipe[1], "x", 1);
     (void)w;
     pthread_join(C.th, NULL);
+    dw_stop_thread();
     C.running = 0;
     for (size_t i = 0; i < C.nconns; i++)
         conn_free(C.conns[i]);
