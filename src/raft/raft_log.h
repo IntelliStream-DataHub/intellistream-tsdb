@@ -69,6 +69,24 @@ typedef struct raft_log raft_log;
 #define RAFT_LOG_REGION_SLOTS 8u
 #define RAFT_LOG_REGION_MIN (RAFT_LOG_REGION_HEAD + RAFT_LOG_REGION_SLOTS * RAFT_LOG_SEGMENT_MIN)
 
+/* **The carve lays slots out in whole 4 KiB blocks** (plan 28h-tp2 item 5, #840): behind a
+ * head that is itself a multiple of 4 KiB, every slot then starts on a block, so no slot header
+ * straddles two sectors, and a header torn by a power cut is one sector's write, blank or not --
+ * never half of each, which the open could not tell from damage. RAFT_LOG_SEGMENT_MIN is not a
+ * multiple of 4 KiB (48 bytes past one), so the smallest aligned slot is the next block up.
+ *
+ * RAFT_LOG_REGION_MIN stays the floor the carve accepts and every open checks, so a region an
+ * older build carved at it still opens and is laid out again at the same geometry; the carve
+ * aligns only where the region has room for eight aligned slots (`raft_log_carve`), and
+ * RAFT_LOG_REGION_FORMAT_MIN is the size `isod mds init` gives a small device, so that a new
+ * format is aligned. */
+#define RAFT_LOG_SLOT_ALIGN 4096u
+#define RAFT_LOG_SEGMENT_ALIGNED                                                     \
+	((RAFT_LOG_SEGMENT_MIN + RAFT_LOG_SLOT_ALIGN - 1) / RAFT_LOG_SLOT_ALIGN * \
+	 RAFT_LOG_SLOT_ALIGN)
+#define RAFT_LOG_REGION_FORMAT_MIN \
+	(RAFT_LOG_REGION_HEAD + RAFT_LOG_REGION_SLOTS * RAFT_LOG_SEGMENT_ALIGNED)
+
 typedef struct {
 	/* 0 selects 64 MiB; a record never straddles two segments. In a directory a segment is a
 	 * file, and one whose single record is larger than this grows to hold it; a region's slot
@@ -143,11 +161,31 @@ extern const raft_log_ops raft_log_file_ops;
  * before the new one is made. */
 iso_err raft_log_discard(raft_log *l, char *err, size_t errsize);
 
+/* Drop every entry and start the log on `index`/`term`, for a log that ends below its store's
+ * applied index (#842). The contract is at the definition. */
+iso_err raft_log_rebase(raft_log *l, raft_index index, raft_term term, char *err, size_t errsize);
+
 #ifdef ISO_DEBUG
 /* A test seam, compiled only into debug builds, as `iso_pwrite_hook` is: when non-zero, the next
  * reset or discard fails once it has deleted this many segments, as a crash or a failed unlink or
  * slot release there would leave the log (plan 5a-i-g, test 24). Cleared when it fires. */
 extern unsigned raft_log_test_fail_reset_after;
+
+/* When non-zero, the next this-many syncs an open makes of what it is about to read -- a segment,
+ * the region, the hard state -- fail with EIO, as a disk's error would (plan 28h-tp2, item 2). */
+extern unsigned raft_log_test_fail_settle;
+
+/* When non-zero, the open's scan fails its read of the record that should hold this index with
+ * EIO, once, as a sector the disk cannot read would (plan 28h-tp2, item 5, #839); cleared
+ * when it fires. The seam is the scan's pread itself (`scan_pread`), and these shape the failure,
+ * cleared with it: the body's read instead of the header's; a first read that returns only this
+ * many bytes, as a drive returns the sectors before the one it cannot read; and the errno of the
+ * failing read in place of EIO, or -1 for a read of 0 bytes, as at the end of a file that shrank
+ * (tp2 review F10). */
+extern raft_index raft_log_test_eio_index;
+extern bool raft_log_test_eio_body;
+extern size_t raft_log_test_eio_short;
+extern int raft_log_test_eio_errno;
 
 /* A path whose existence refuses the segment the next reset starts the log on, as a create at the
  * descriptor limit is refused (EMFILE) -- after every segment has gone -- and removes the file (#308,
@@ -181,8 +219,11 @@ extern uint64_t raft_log_test_say_every_ns;
  * when non-zero, fails that many of them with EIO -- a slot given back, a segment made, a
  * directory synced, standing in for the call's result -- counted down as each fires; and
  * `raft_log_test_fail_own_file` is a path whose existence arms the same failure for the next one,
- * which removes it. Each fires a fault (`raft_log_fault`). */
+ * which removes it. Each fires a fault (`raft_log_fault`). `raft_log_test_pass_own_sync`, when
+ * non-zero while the count is armed, lets that many through first, counted down, so a test can
+ * fail the second of two syncs (a discard's slot scrub, then the region header it lays out). */
 extern unsigned raft_log_test_fail_own_sync;
+extern unsigned raft_log_test_pass_own_sync;
 extern const char *raft_log_test_fail_own_file;
 
 /* **A power cut the moment after a roll** (#296, plan 28c), in a directory: at the next roll that
@@ -306,8 +347,10 @@ iso_err raft_log_format_region(int fd, uint64_t off, uint64_t len, uint64_t segm
  * two: the configured bound, or an eighth of the room the region has. A test image and a 14 TB disk
  * then both get a sensible carve without anyone computing one.
  *
- * **And never smaller than RAFT_LOG_SEGMENT_MIN**, which is what #161 added. A ceiling below it is
- * raised to it, with one INFO line; it is a ceiling, and refusing to start over one would make a
+ * **And never smaller than RAFT_LOG_SEGMENT_MIN**, which is what #161 added -- nor, where the
+ * region has room for eight of them, than RAFT_LOG_SEGMENT_ALIGNED, and then always a multiple of
+ * RAFT_LOG_SLOT_ALIGN (plan 28h-tp2 item 5); a region with less room than that keeps the unaligned
+ * eighth an older build carved it at. A ceiling below the floor is raised to it, with one INFO line; it is a ceiling, and refusing to start over one would make a
  * setting that says "small segments" into a node that does not run. A region too small for
  * RAFT_LOG_REGION_SLOTS such segments is refused -- ISO_ERR_INVAL, naming both sizes and the
  * remedy, which is room: no ceiling can make a region hold what it has no room for.

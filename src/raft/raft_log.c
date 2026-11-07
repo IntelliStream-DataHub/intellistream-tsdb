@@ -131,6 +131,8 @@
 #define REG_SLOTS_OFF ((uint64_t)REG_ALIGN * 2)
 ISO_STATIC_ASSERT(REG_SLOTS_OFF == RAFT_LOG_REGION_HEAD, "the header's figure is the layout's");
 ISO_STATIC_ASSERT(RAFT_LOG_SEGMENT_MIN <= DEFAULT_SEGMENT, "the default holds the largest entry");
+ISO_STATIC_ASSERT(RAFT_LOG_REGION_HEAD % RAFT_LOG_SLOT_ALIGN == 0, "slots start on a block");
+ISO_STATIC_ASSERT(DEFAULT_SEGMENT % RAFT_LOG_SLOT_ALIGN == 0, "the default is whole blocks");
 ISO_STATIC_ASSERT(RAFT_WIRE_ENTRY_MAX <= REC_MAX_LEN, "a replicable entry is not corruption");
 
 typedef struct {
@@ -193,10 +195,14 @@ struct raft_log {
 
 	/* The open's own state (#185): the owner's remedy, borrowed for the length of
 	 * raft_log_open; opened to be emptied (`raft_log_opts.discard_only`), which only the open
-	 * reads; and a region's header to lay out again, which the discard writes. */
+	 * reads; and a region's header to lay out again, which the discard writes. `scrub_slots`:
+	 * a discard's open found a slot header that is neither valid nor blank, so the discard
+	 * zeroes every slot's header (`scrub_free_slots`) -- a normal open refuses such a slot
+	 * when its magic is whole, and reads it as free otherwise (`foreign_slot`). */
 	const char *remedy;
 	bool discard_only;
 	bool relay_header;
+	bool scrub_slots;
 
 	/* Syncs a round made on the spot rather than hand out (#264, plan 26z): every one, and those
 	 * for want of a duplicate descriptor -- the process at its descriptor limit -- which are said
@@ -363,7 +369,13 @@ bool raft_log_fault(const raft_log *l, char *what, size_t n)
 
 #ifdef ISO_DEBUG
 unsigned raft_log_test_fail_own_sync;
+unsigned raft_log_test_pass_own_sync;
 const char *raft_log_test_fail_own_file;
+unsigned raft_log_test_fail_settle;
+raft_index raft_log_test_eio_index;
+bool raft_log_test_eio_body;
+size_t raft_log_test_eio_short;
+int raft_log_test_eio_errno;
 #endif
 
 /* **A sync the log makes outside a round** -- of a slot given back, a segment made or rolled from,
@@ -377,8 +389,11 @@ static int own_sync(raft_log *l, int fd, bool dir)
 #ifdef ISO_DEBUG
 	/* Stands in for the call's result, so a test fails the branch a disk's error takes. Armed by
 	 * a count, or by a file the failure removes (an unlink that finds it is the test-and-clear). */
-	bool armed = raft_log_test_fail_own_sync ||
-		     (raft_log_test_fail_own_file && unlink(raft_log_test_fail_own_file) == 0);
+	bool pass = raft_log_test_pass_own_sync && raft_log_test_fail_own_sync;
+	if (pass)
+		raft_log_test_pass_own_sync--;
+	bool armed = !pass && (raft_log_test_fail_own_sync ||
+			       (raft_log_test_fail_own_file && unlink(raft_log_test_fail_own_file) == 0));
 	if (armed) {
 		if (raft_log_test_fail_own_sync)
 			raft_log_test_fail_own_sync--;
@@ -397,6 +412,52 @@ static int own_sync(raft_log *l, int fd, bool dir)
 	(void)l;
 #endif
 	return e;
+}
+
+/*
+ * settle
+ *		Make durable what the page cache holds of `fd`, then drop the range [off, off+len)
+ *		(len 0: to the end) from it, so that what an open reads next is what the platter holds.
+ *
+ * Returns 0, or the errno the fdatasync failed with; on a failure nothing is dropped and the caller
+ * must refuse to read the range as durable. Runs on the opening thread, before the log or the hard
+ * state exists for anyone else.
+ *
+ * NOTE: why an open syncs what it is about to read (plan 28h-tp2, item 2, #832). A process
+ * that crashed -- kill -9, an abort, a halt and a restart -- leaves the bytes it wrote but never
+ * synced in the page cache, where the next life's buffered reads find them. The core then takes
+ * the log's last index for persisted (`raft_new`) and acknowledges or counts entries no fdatasync
+ * ever covered, and a power cut after that loses entries a quorum counted; a hard-state slot read
+ * the same way is a vote that may never have reached the platter. Syncing first makes the page
+ * cache's view the true one. The drop is for the case a sync cannot fix: a writeback that failed in
+ * the previous life can leave pages marked clean that never reached the platter, which no later
+ * fdatasync reports ("fsyncgate"); dropped, they are read again from the disk. It is advice, so a
+ * kernel that ignores it leaves us where the sync alone does.
+ */
+static int settle(int fd, off_t off, off_t len)
+{
+	int e = fdatasync(fd) != 0 ? (errno ? errno : EIO) : 0;
+#ifdef ISO_DEBUG
+	/* So a test can show the open refuses rather than read what it could not make durable. */
+	if (!e && raft_log_test_fail_settle) {
+		raft_log_test_fail_settle--;
+		LOG_WARN("raft log: a fault injected by the test seam fails the sync an open makes "
+			 "before it reads");
+		e = EIO;
+	}
+#endif
+	if (!e)
+		(void)posix_fadvise(fd, off, len, POSIX_FADV_DONTNEED);
+	return e;
+}
+
+/* The refusal an open gives when `settle` fails on `what`. */
+static iso_err settle_err(char *err, size_t errsize, int e, const char *what)
+{
+	return iso_errf(err, errsize, ISO_ERR_IO,
+			"syncing %s before reading it failed: %s; what it holds cannot be taken for "
+			"durable. Check the disk (the kernel log, `smartctl`) and start the node again",
+			what, strerror(e));
 }
 
 /* There is at least one segment between calls, but in a log that faulted at a reset or one opened
@@ -740,8 +801,86 @@ static iso_err seg_delete_last(raft_log *l, char *err, size_t errsize)
 	return ISO_OK;
 }
 
-/* Scan one segment's records into memory. A bad record in the last segment is a torn tail
- * and is cut off; anywhere else it is corruption. */
+/*
+ * scan_pread
+ *		One pread of the scan: the place the read-fault seam stands in for the disk.
+ *
+ * In a debug build, while `raft_log_test_eio_index` names `idx` and `raft_log_test_eio_body`
+ * names this read (the record's body, or its header), it returns what a failing drive would:
+ * first `raft_log_test_eio_short` bytes when asked for more, then -1 with
+ * `raft_log_test_eio_errno` (EIO when 0), or 0 bytes, as at the end of a file that shrank, when
+ * that is -1; and disarms. It stands at the pread rather than in front of `scan_read`, so the
+ * rules `scan_read` and `seg_scan` apply to a read are the ones under test (tp2 review F10).
+ */
+static ssize_t scan_pread(int fd, void *buf, size_t len, uint64_t off, raft_index idx, bool body)
+{
+#ifdef ISO_DEBUG
+	if (raft_log_test_eio_index && raft_log_test_eio_index == idx &&
+	    raft_log_test_eio_body == body) {
+		if (raft_log_test_eio_short && raft_log_test_eio_short < len) {
+			size_t n = raft_log_test_eio_short;
+			raft_log_test_eio_short = 0;
+			return pread(fd, buf, n, (off_t)off);
+		}
+		int e = raft_log_test_eio_errno ? raft_log_test_eio_errno : EIO;
+		raft_log_test_eio_index = 0;
+		raft_log_test_eio_body = false;
+		raft_log_test_eio_short = 0;
+		raft_log_test_eio_errno = 0;
+		if (e < 0)
+			return 0;
+		errno = e;
+		return -1;
+	}
+#else
+	(void)idx;
+	(void)body;
+#endif
+	return pread(fd, buf, len, (off_t)off);
+}
+
+/*
+ * scan_read
+ *		Read `len` bytes of the record that should hold index `idx` at `off` of `fd`: its header,
+ *		or its body when `body`.
+ *
+ * Returns true when every byte was read. On false, errno says why: a read past what the file
+ * holds (it shrank under the scan) is ENODATA, never EIO, so that only the disk's own medium
+ * error reaches the rule in seg_scan that reads EIO as a tear. A short read is followed by a read
+ * of the rest, because a drive that cannot read a sector returns the bytes before it first and
+ * the error only when asked for the sector itself (plan 28h-tp2, item 5, #839).
+ */
+static bool scan_read(int fd, void *buf, size_t len, uint64_t off, raft_index idx, bool body)
+{
+	size_t done = 0;
+	while (done < len) {
+		ssize_t got = scan_pread(fd, (uint8_t *)buf + done, len - done, off + done, idx, body);
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got < 0)
+			return false;
+		if (got == 0) {
+			errno = ENODATA;
+			return false;
+		}
+		done += (size_t)got;
+	}
+	return true;
+}
+
+/*
+ * seg_scan
+ *		Scan one segment's records into memory.
+ *
+ * A bad record in the last segment is a torn tail and is cut off -- unless the durable floor
+ * covers it, when it is rot in what this replica acknowledged and the open refuses with nothing
+ * cut (#483). Anywhere else it is corruption. A record the disk cannot read (EIO) is a bad record
+ * like any other in the last segment: a sector a power cut tore mid-write can read back as a
+ * medium error rather than as wrong bytes, and refusing the start over the unsynced tail would
+ * halt a replica that lost nothing it acknowledged. Below the floor the same EIO is refused as
+ * damage. In an earlier segment it stays an I/O error: those are whole and synced, and nothing
+ * there may be cut (plan 28h-tp2, item 5, #839).
+ */
 static iso_err seg_scan(raft_log *l, segment *s, bool is_last, const char *name, char *err,
 			size_t errsize)
 {
@@ -773,7 +912,11 @@ static iso_err seg_scan(raft_log *l, segment *s, bool is_last, const char *name,
 			break;
 		}
 		uint8_t rh[REC_HEADER];
-		if (pread(s->fd, rh, REC_HEADER, (off_t)(s->base + off)) != REC_HEADER) {
+		if (!scan_read(s->fd, rh, REC_HEADER, s->base + off, expect, false)) {
+			if (is_last && errno == EIO) {
+				why = "a record header cannot be read (Input/output error)";
+				break;
+			}
 			rc = io_err(err, errsize, "reading", name);
 			break;
 		}
@@ -795,7 +938,11 @@ static iso_err seg_scan(raft_log *l, segment *s, bool is_last, const char *name,
 			bufcap = len;
 			buf = iso_xrealloc(buf, bufcap);
 		}
-		if (len && pread(s->fd, buf, len, (off_t)(s->base + off + REC_HEADER)) != (ssize_t)len) {
+		if (len && !scan_read(s->fd, buf, len, s->base + off + REC_HEADER, expect, true)) {
+			if (is_last && errno == EIO) {
+				why = "a record cannot be read (Input/output error)";
+				break;
+			}
 			rc = io_err(err, errsize, "reading", name);
 			break;
 		}
@@ -849,19 +996,29 @@ static iso_err seg_scan(raft_log *l, segment *s, bool is_last, const char *name,
 				 log_name(l), name, why, off);
 			uint64_t rest = size - off;
 			uint8_t *zeros = iso_xcalloc(1, rest);
-			bool ok = pwrite(s->fd, zeros, rest, (off_t)(s->base + off)) == (ssize_t)rest &&
-				  fdatasync(s->fd) == 0;
+			bool ok = pwrite(s->fd, zeros, rest, (off_t)(s->base + off)) == (ssize_t)rest;
+			int se = ok ? own_sync(l, s->fd, false) : 0;
 			free(zeros);
 			if (!ok)
 				return io_err(err, errsize, "clearing a torn tail of", log_name(l));
+			if (se) {
+				errno = se;
+				return io_err(err, errsize, "syncing the cleared torn tail of",
+					      log_name(l));
+			}
 			l->torn_tail_bytes += rest;
 		} else {
 			LOG_WARN("raft log %s/%s: %s at offset %" PRIu64 "; cutting off %" PRIu64
 				 " bytes written during the last crash",
 				 log_name(l), name, why, off, size - off);
 			l->torn_tail_bytes += size - off;
-			if (ftruncate(s->fd, (off_t)off) != 0 || fdatasync(s->fd) != 0)
+			if (ftruncate(s->fd, (off_t)off) != 0)
 				return io_err(err, errsize, "truncating", name);
+			int se = own_sync(l, s->fd, false);
+			if (se) {
+				errno = se;
+				return io_err(err, errsize, "syncing the truncation of", name);
+			}
 		}
 	}
 	/* `off` is where the records stop, which in a file is the file's size and in a slot is what
@@ -911,6 +1068,65 @@ static int cmp_found(const void *a, const void *b)
 	return x->first < y->first ? -1 : x->first > y->first;
 }
 
+/*
+ * foreign_slot
+ *		Decide what a slot whose header does not check out is: free, or damage that refuses
+ *		the open.
+ *
+ * A slot is free when its header is blank: the format, `slot_release` and `scrub_free_slots`
+ * write zeros there, and each syncs before the slot can be taken. A header that is neither valid
+ * nor blank is told apart by its magic (plan 28h-tp2 item 3, #834):
+ *
+ *   - the magic gone: what a power cut leaves. A sector torn mid-write is garbage, all 512 bytes
+ *     of it (tests/crash/README, "The persistence model"), so a create cut short leaves its
+ *     header zeros, whole, or garbage, and so does an append whose first sector is the header's.
+ *     Read as free, with a WARN naming the slot;
+ *   - the magic whole and the header in one sector: no tear leaves that, since the magic and
+ *     the rest of the header land together or not at all. It is damage to a header that was
+ *     durable, with up to a segment of acknowledged entries behind it: ISO_ERR_CORRUPT, naming
+ *     the remedy.
+ *
+ * A header that crosses a sector, as a slot of a region carved before slots were rounded to the
+ * sector can have, is read as free with a WARN whatever its magic: a torn create can land one
+ * of its sectors and not the other. A log opened to be emptied only notes the slot, so that its
+ * discard zeroes every header (`scrub_free_slots`): the slots of a geometry laid out again fall
+ * in the middle of the old one's.
+ *
+ * NOTE: a free reading loses the segment behind the header from the open's view. Rot that takes
+ * the magic reads so too: every record's checksum is seeded with the nonce the garbage took, so
+ * nothing behind it can be verified. What guards an acknowledged entry then is the durable floor
+ * and the join: a log that ends below the floor is refused (`floor_check_end`), and a slot lost
+ * from the middle leaves segments that do not join, which `open_region` refuses. An entry above
+ * the floor in the newest slot is not guarded -- #579, pinned by crash_explore's raft driver
+ * (CRASH_KNOWN_BUGS) and by the two #579 tests of test_raft_log.c.
+ */
+static iso_err foreign_slot(raft_log *l, uint64_t k, const uint8_t *h, char *err, size_t errsize)
+{
+	static const uint8_t blank[SEG_HEADER];
+	if (memcmp(h, blank, SEG_HEADER) == 0)
+		return ISO_OK;
+	if (l->discard_only) {
+		l->scrub_slots = true;
+		return ISO_OK;
+	}
+	uint64_t at = slot_base(l, k);
+	if (at % 512 + SEG_HEADER > 512 || memcmp(h, SEG_MAGIC, 8) != 0) {
+		LOG_WARN("the raft log on %s: slot %" PRIu64 " (byte %" PRIu64 ") has a header that "
+			 "is neither valid nor blank, as a create or an append a power cut tore "
+			 "leaves it; reading the slot as free (a log that then ends below its durable "
+			 "floor is refused)",
+			 log_name(l), k, at);
+		return ISO_OK;
+	}
+	char remedy[1024];
+	return iso_errf(err, errsize, ISO_ERR_CORRUPT,
+			"the raft log on %s: slot %" PRIu64 " (byte %" PRIu64 ") has a header that is "
+			"neither valid nor blank, with its magic whole. A power cut garbles a sector "
+			"whole, so this is damage to a segment that may hold acknowledged entries; it "
+			"is not read as free. %s",
+			log_name(l), k, at, log_remedy(l, remedy, sizeof remedy));
+}
+
 static iso_err open_region(raft_log *l, char *err, size_t errsize)
 {
 	found_slot *f = iso_xcalloc(l->n_slots ? l->n_slots : 1, sizeof *f);
@@ -926,8 +1142,12 @@ static iso_err open_region(raft_log *l, char *err, size_t errsize)
 		raft_index first;
 		raft_term prev_term;
 		uint64_t nonce;
-		if (!check_seg_header(h, &first, &prev_term, &nonce))
-			continue; /* free: never written, cleared by compaction, or a torn create */
+		if (!check_seg_header(h, &first, &prev_term, &nonce)) {
+			rc = foreign_slot(l, k, h, err, errsize);
+			if (rc != ISO_OK)
+				goto done;
+			continue;
+		}
 		l->slot_used[k] = true;
 		f[n++] = (found_slot){ first, prev_term, nonce, k };
 	}
@@ -993,8 +1213,8 @@ done:
 	return rc;
 }
 
-static iso_err open_listed(raft_log *l, const uint64_t *firsts, size_t n, char *err,
-			   size_t errsize);
+static iso_err open_listed(raft_log *l, const uint64_t *firsts, size_t n, raft_index base_index,
+			   char *err, size_t errsize);
 
 /* Every segment in the directory, however many: the open read the first 1,024 names `readdir`
  * gave and dropped the rest without a word (#411). A
@@ -1004,7 +1224,7 @@ static iso_err open_listed(raft_log *l, const uint64_t *firsts, size_t n, char *
  * refused to open, the segments it kept not continuing one another. A log holds that many
  * segments when they are small: `mds.log_segment_bytes = 1` and `snapshot_every`'s 10,000 entries
  * before a compaction. */
-static iso_err open_existing(raft_log *l, char *err, size_t errsize)
+static iso_err open_existing(raft_log *l, raft_index base_index, char *err, size_t errsize)
 {
 	int lfd = dup(l->dirfd);
 	DIR *d = lfd >= 0 ? fdopendir(lfd) : NULL;
@@ -1030,14 +1250,43 @@ static iso_err open_existing(raft_log *l, char *err, size_t errsize)
 	closedir(d);
 	if (n)
 		qsort(firsts, n, sizeof firsts[0], cmp_u64);
-	iso_err rc = open_listed(l, firsts, n, err, errsize);
+	iso_err rc = open_listed(l, firsts, n, base_index, err, errsize);
 	free(firsts);
 	return rc;
 }
 
-/* Open the segments `firsts` names, in order (sorted): each scanned, joined to the one before. */
-static iso_err open_listed(raft_log *l, const uint64_t *firsts, size_t n, char *err,
-			   size_t errsize)
+/*
+ * torn_create
+ *		Whether segment `k` of `n`, named for index `first`, can be one whose create a crash
+ *		cut short, given that its header does not check out and the file is no longer than
+ *		a header.
+ *
+ * Only the newest segment is ever being created: a roll's or a truncation's next one when
+ * others precede it, and when it is the only one, the segment a first open or a reset started
+ * the log on -- which is the store's `base_index + 1`. An only segment named for any other index
+ * held the log once, and its loss is not a tear (a reset beside a store behind it halts by
+ * design: plan 28h-tp2, item 3).
+ */
+static bool torn_create(size_t k, size_t n, raft_index first, raft_index base_index)
+{
+	if (k != n - 1)
+		return false;
+	return k > 0 || first == base_index + 1;
+}
+
+/*
+ * open_listed
+ *		Open the segments `firsts` names, in order (sorted): each settled, scanned and
+ *		joined to the one before.
+ *
+ * `base_index` is the index the caller's store holds everything up to, the one a log with no
+ * segment is started after. A segment whose header does not check out is removed only when it
+ * provably never held a record: see `torn_create`. Every other one refuses the open
+ * (ISO_ERR_CORRUPT, naming the remedy). Returns ISO_ERR_IO, the log faulted, when a removal
+ * cannot be made durable.
+ */
+static iso_err open_listed(raft_log *l, const uint64_t *firsts, size_t n, raft_index base_index,
+			   char *err, size_t errsize)
 {
 	char remedy[1024];
 	for (size_t k = 0; k < n; k++) {
@@ -1054,6 +1303,19 @@ static iso_err open_listed(raft_log *l, const uint64_t *firsts, size_t n, char *
 		int fd = openat(l->dirfd, name, O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 			return io_err(err, errsize, "opening", name);
+		/* Only the newest segment is settled. Every other one was synced at its roll before
+		 * the next segment was made (#296), and a roll whose sync failed faulted the log
+		 * before it made one, so that segment is the newest here; a sealed segment is never
+		 * written again but by a truncation, which syncs it and leaves it the newest.
+		 * Settling them all cost one device flush per segment on every start, and dropped
+		 * the cache a follower's catch-up reads them from (tp2 review F3). */
+		int se = k == n - 1 ? settle(fd, 0, 0) : 0;
+		if (se) {
+			close(fd);
+			char what[192];
+			snprintf(what, sizeof what, "raft log %s/%s", log_name(l), name);
+			return settle_err(err, errsize, se, what);
+		}
 		uint8_t h[SEG_HEADER];
 		raft_index first;
 		raft_term prev_term;
@@ -1062,8 +1324,10 @@ static iso_err open_listed(raft_log *l, const uint64_t *firsts, size_t n, char *
 		bool ok = got == SEG_HEADER && check_seg_header(h, &first, &prev_term, &nonce) &&
 			  first == firsts[k];
 		if (!ok) {
+			struct stat st;
+			bool small = fstat(fd, &st) == 0 && (uint64_t)st.st_size <= SEG_HEADER;
 			close(fd);
-			if (k == n - 1 && k > 0 && floor_covers(l, firsts[k])) {
+			if (k == n - 1 && floor_covers(l, firsts[k])) {
 				/* Not created during the last crash: it holds what this
 				 * replica acknowledged, so it is not deleted (plan 28h, P1m-15). */
 				char what[256];
@@ -1073,14 +1337,35 @@ static iso_err open_listed(raft_log *l, const uint64_t *firsts, size_t n, char *
 					 name, firsts[k]);
 				return floor_refuse(l, what, err, errsize);
 			}
-			if (k == n - 1 && k > 0) {
-				/* Created during the last crash, before its header landed. */
-				LOG_WARN("raft log %s/%s has no valid header; removing it", log_name(l), name);
-				unlinkat(l->dirfd, name, 0);
+			if (small && torn_create(k, n, firsts[k], base_index)) {
+				/* Created during the last crash, before its header was durable: nothing
+				 * was ever appended to it (`seg_create` syncs the header first), so
+				 * nothing acknowledged goes with it. The removal is made durable now, or
+				 * a later life could find the file again behind segments made since. */
+				LOG_WARN("raft log %s/%s was being created when this node stopped and "
+					 "holds no entry; removing it",
+					 log_name(l), name);
+				if (unlinkat(l->dirfd, name, 0) != 0) {
+					int e = errno;
+					log_fault(l, e, "removing a segment whose create a crash cut short");
+					errno = e;
+					return io_err(err, errsize, "removing", name);
+				}
+				iso_err rc = sync_dir(l, err, errsize);
+				if (rc != ISO_OK)
+					return rc;
 				break;
 			}
+			/* A header `seg_create` made durable before it wrote a record behind it, now
+			 * unreadable: the entries behind it may be acknowledged ones, and a header
+			 * gives no way to tell how many. Up to a whole segment of the log is not
+			 * thrown away on a guess (plan 28h-tp2, item 3). */
 			return iso_errf(err, errsize, ISO_ERR_CORRUPT,
-					"raft log %s/%s has a bad header. %s", log_name(l), name,
+					"raft log %s/%s has a bad header and %s, so it may hold "
+					"acknowledged entries; it is not removed. %s",
+					log_name(l), name,
+					small ? "is not the segment a crash could have cut short"
+					      : "is longer than a header",
 					log_remedy(l, remedy, sizeof remedy));
 		}
 		segment *s = seg_push(l);
@@ -1277,8 +1562,21 @@ iso_err raft_log_open(const char *dir, const raft_log_opts *opts, raft_index bas
 			raft_log_close(l);
 			return rc;
 		}
+		rc = ISO_OK;
+		if (!l->discard_only) {
+			/* What a previous life left unsynced is made durable, or refused, before the
+			 * floor and the slots are read (`settle`); the hard-state ring is inside the
+			 * range. A reseed reads nothing it keeps. */
+			int se = settle(l->region_fd, (off_t)l->region_off, (off_t)l->region_len);
+			if (se) {
+				char what[192];
+				snprintf(what, sizeof what, "the raft log on %s", l->region_name);
+				rc = settle_err(err, errsize, se, what);
+			}
+		}
 		/* The floor before any segment is read: the scan asks it (plan 28h, P1m-15). */
-		rc = floor_load(l, err, errsize);
+		if (rc == ISO_OK)
+			rc = floor_load(l, err, errsize);
 		if (rc == ISO_OK)
 			rc = region_geometry(l, opts->segment_bytes, err, errsize);
 		if (rc == ISO_OK)
@@ -1309,7 +1607,7 @@ iso_err raft_log_open(const char *dir, const raft_log_opts *opts, raft_index bas
 		l->dir = iso_xstrdup(dir);
 		rc = floor_load(l, err, errsize);
 		if (rc == ISO_OK)
-			rc = open_existing(l, err, errsize);
+			rc = open_existing(l, base_index, err, errsize);
 	}
 	if (rc == ISO_OK && !l->discard_only)
 		rc = floor_check_end(l, base_index, err, errsize);
@@ -1503,10 +1801,17 @@ static iso_err f_append(void *log, const raft_entry *es, unsigned n)
 			 * roll, of a segment of 64 MiB by default. It orders this tail before the next
 			 * segment's first entry and stands in for no round's: the segment stays `dirty`,
 			 * so the next round still hands it out (#264's rounds are as they were) and pays
-			 * one sync of a clean file for it, off the loop. A region needs none: the next
-			 * segment's header is synced through the device, which writes this one's tail
-			 * back with it. */
-			if (!in_region(l)) {
+			 * one sync of a clean file for it, off the loop.
+			 *
+			 * A region needs it as much (#831, plan 28h-tp2 item 5). The next slot's
+			 * header is synced through the same device, which writes this one's tail back
+			 * with it -- once that sync returns, but not if the power goes inside it: the
+			 * drive may keep the header and lose earlier writes of this slot, and after a
+			 * conflict truncation those writes overwrite synced records, so a slot no longer
+			 * the last could end inside a half-rewritten record (refused as corrupt) or the
+			 * log could hold a gap below the new slot's first entry. A sync of its own first
+			 * orders this slot's writes before the header, as a file's roll does. */
+			{
 				int e2 = own_sync(l, s->fd, false);
 				if (e2) {
 					log_fault(l, e2, "syncing the segment a roll leaves");
@@ -1604,8 +1909,27 @@ static iso_err f_truncate(void *log, raft_index from)
 		return ISO_ERR_IO; /* the log faulted */
 	}
 	/* Drop whole segments that start at or after `from`, then cut the one that holds it. */
+	bool unlinked = false;
 	while (l->n_seg > 1 && last_seg(l)->first >= from) {
 		iso_err rc = seg_delete_last(l, err, sizeof err); /* a failure faulted the log */
+		if (rc != ISO_OK)
+			return rc;
+		unlinked = true;
+	}
+	/*
+	 * **The unlinks are durable before the survivor is cut** (#588). Cut first and the
+	 * survivor's smaller size can be on the platter while an unlink is not -- since #841 syncs
+	 * the cut, that is the order the calls themselves make, not only a reorder POSIX allows --
+	 * and the next open finds a segment past the cut that does not continue the shrunk one,
+	 * and refuses to start. With the directory synced first, a crash at any point leaves the
+	 * old log cut at some index at or past `from`: every entry dropped from there on is one
+	 * the truncation was told to drop, and `floor_lower` above already let the durable floor
+	 * down to `from - 1`. A region has synced each slot it released, inline, for the reason
+	 * `slot_release` gives. With nothing unlinked the directory is synced after the cut
+	 * instead; see the end of this function for why that sync is kept.
+	 */
+	if (unlinked && !in_region(l)) {
+		iso_err rc = sync_dir(l, err, sizeof err); /* a failure faulted the log */
 		if (rc != ISO_OK)
 			return rc;
 	}
@@ -1649,11 +1973,32 @@ static iso_err f_truncate(void *log, raft_index from)
 		s->n = keep;
 		s->size = off;
 		s->dirty = true;
+		/* **The cut is made durable before the next append can land where it cut**
+		 * (#841, plan 28h-tp2 item 5). It used to ride the dirty flag to the next
+		 * round, together with the records appended over it -- and a crash inside that round
+		 * may keep a new record and lose the cut. Then the dropped suffix comes back behind
+		 * the new record: Raft's Figure 8 (c)->(d), where a rewritten entry of term 3 is
+		 * followed by the dropped one of term 4. The scan's index and term checks accept
+		 * that log, since every term is in order, and it holds an entry whose predecessor no
+		 * leader ever sent: the Log Matching property is broken. A file needs this too: only
+		 * the file's own fdatasync makes the smaller size durable, not the directory's. One
+		 * sync per truncation, which happens at a change of leader, not on the write path. */
+		int e = own_sync(l, s->fd, false);
+		if (e) {
+			log_fault(l, e, "making a truncation durable");
+			return ISO_ERR_IO;
+		}
 	}
-	/* A file syncs its directory, because segments were unlinked. A region has already synced
-	 * each slot it released, inline, for the reason `slot_release` gives; the zeroed suffix
-	 * above rides the dirty flag to the next sync round, exactly as `ftruncate` does. */
-	if (in_region(l))
+	/*
+	 * XXX: with nothing unlinked no name changed, and the cut's own fdatasync above makes
+	 * the smaller size durable, so this directory sync protects nothing a reader of this
+	 * file can name: a roll's new segment is synced into the directory by seg_create
+	 * itself. It is kept, as it was before #588, because dropping a sync needs a crash
+	 * proof (the raftdir driver) that no path leaves a name to it, and it costs one
+	 * fsync per truncation, which happens at a change of leader, not on the write path
+	 * (AP40 review round 4, F2).
+	 */
+	if (unlinked || in_region(l))
 		return ISO_OK;
 	return sync_dir(l, err, sizeof err); /* a failure faulted the log */
 }
@@ -1663,6 +2008,38 @@ unsigned raft_log_test_fail_reset_after;
 const char *raft_log_test_fail_reset_file;
 const char *raft_log_test_fail_noop_file;
 #endif
+
+/*
+ * scrub_free_slots
+ *		Zero the header of every slot, and sync, once a discard has released them all.
+ *
+ * For a region whose slots may hold headers that are neither valid nor blank -- a geometry laid
+ * out again (`relay_geometry`), whose slots start inside the old one's, or a slot the open
+ * refused (`foreign_slot`) -- which a normal open may refuse. Called with no segment left, so
+ * every slot is free. On a failure the log is faulted and ISO_ERR_IO returned; the region's
+ * header, if it is to be laid out again, is not yet written, so a crash leaves a region the next
+ * discard handles the same way.
+ */
+static iso_err scrub_free_slots(raft_log *l, char *err, size_t errsize)
+{
+	static const uint8_t blank[SEG_HEADER];
+	for (uint64_t k = 0; k < l->n_slots; k++) {
+		if (pwrite(l->region_fd, blank, SEG_HEADER, (off_t)slot_base(l, k)) != SEG_HEADER) {
+			int e = errno ? errno : EIO;
+			log_fault(l, e, "clearing the slot headers of a discarded log");
+			errno = e;
+			return io_err(err, errsize, "clearing a slot of", log_name(l));
+		}
+	}
+	int e = own_sync(l, l->region_fd, false);
+	if (e) {
+		log_fault(l, e, "clearing the slot headers of a discarded log");
+		errno = e;
+		return io_err(err, errsize, "syncing the cleared slots of", log_name(l));
+	}
+	l->scrub_slots = false;
+	return ISO_OK;
+}
 
 /* Every segment goes, the last first, and one is started on `index + 1` with `term` before it.
  * Deleting from the end keeps what is left a prefix of the log at every step, so a reset that stops
@@ -1696,6 +2073,11 @@ static iso_err log_reset(raft_log *l, raft_index index, raft_term term, char *er
 		if (rc != ISO_OK)
 			return rc;
 		deleted++;
+	}
+	if (in_region(l) && (l->relay_header || l->scrub_slots)) {
+		iso_err rc = scrub_free_slots(l, err, errsize);
+		if (rc != ISO_OK)
+			return rc;
 	}
 	if (l->relay_header) {
 		/* The region's header, laid out again (`relay_geometry`): after every slot of
@@ -1752,6 +2134,30 @@ static iso_err f_reset(void *log, raft_index index, raft_term term)
 iso_err raft_log_discard(raft_log *l, char *err, size_t errsize)
 {
 	return log_reset(l, 0, 0, err, errsize);
+}
+
+/*
+ * raft_log_rebase
+ *		Drop every entry and start the log again on `index`/`term`, the store's applied index
+ *		and its term.
+ *
+ * For a log that ends below what its store has applied (#842): the core proposes at the
+ * log's last + 1 and hands out from the applied index + 1, so a leader on such a log writes
+ * entries at indexes the store has already applied, which it never applies, and which a replica
+ * fed from it later takes for the ones the store holds. Every entry dropped is at or below
+ * `index`, so the store holds what each did. It is the reset a snapshot's install makes, made
+ * here by the caller on an open rather than by the core.
+ *
+ * The caller has made the store durable first, since this deletes the only other record of
+ * entries the store may otherwise give back on a power cut. Runs on the thread that opened the
+ * log, before a core uses it. The floor is lowered to 0 before anything is deleted, and the
+ * segments go last first, so one stopped part way leaves a prefix that still ends below
+ * `index`, which the next start rebases again. On failure returns the error with `err` set and
+ * the log faulted, as a failed reset leaves it.
+ */
+iso_err raft_log_rebase(raft_log *l, raft_index index, raft_term term, char *err, size_t errsize)
+{
+	return log_reset(l, index, term, err, errsize);
 }
 
 static iso_err f_compact(void *log, raft_index upto)
@@ -1981,19 +2387,53 @@ iso_err raft_log_sync_run(raft_log_sync *s)
 
 /* ---- hard state
  *
- * Slot, 4 KiB: magic[8], u32 crc32c of bytes [12, 40), u64 seq, u64 term, u32 vote, zeros to 40;
- * then the vote fence (raft_hard_state; plan 5a-i-g, L's demotion's repair): u64 fence_index,
- * u64 fence_term, and a u32 crc32c of bytes [40, 56); then the durable floor (#483, P1m-15, plan
- * 28h): u64 floor_index, u64 floor_term, and a u32 crc32c of bytes [60, 76); zeros after.
+ * Slot, 4 KiB: magic[8], u32 crc32c of bytes [12, 40), u64 seq, u64 term, u32 vote, a flags byte
+ * at 32 and zeros to 40; then the vote fence (raft_hard_state; plan 5a-i-g, L's demotion's
+ * repair): u64 fence_index, u64 fence_term, and a u32 crc32c of bytes [40, 56); then the durable
+ * floor (#483, P1m-15, plan 28h): u64 floor_index, u64 floor_term, and a u32 crc32c of bytes
+ * [60, 76); zeros after. Seq 1 goes to slot 1, so slot 0 is a hole until seq 2.
  *
- * The floor is kept as the fence is, for the same reason: twenty zero bytes are no floor -- what
- * every older build writes, and a downgrade's save loses the floor, which only gives back the
- * truncation of a bad record that the floor would have refused.
+ * The fence and the floor have checksums of their own so that the first stays what it was: an
+ * older build reads the slot as it always did, and ignores both. Twenty zero bytes are a slot
+ * with no fence, or no floor -- what every older build wrote, and a downgrade's save loses the
+ * floor, which only gives back the truncation of a bad record that the floor would have refused.
+ * So that zeroing a fence or a floor cannot read as "none", a slot that carries one says so in the
+ * flags byte (HARD_FLAG_FENCE, HARD_FLAG_FLOOR; #837): the byte lies inside the first
+ * checksum, which an older build checks and whose other bytes it never reads, so the format is
+ * the same to it. A slot an older build wrote has no flags, and its fence or floor is taken as
+ * the twenty bytes say.
  *
- * The fence has a checksum of its own so that the first stays what it was: an older build reads
- * the slot as it always did, and ignores the fence. Twenty zero bytes are a slot with no fence --
- * what every older build wrote. A slot whose second checksum fails is not valid, as a torn one is
- * not, and the other slot is read. */
+ * **What the reader accepts** (plan 28h-tp2 item 4, #835, #836). A save writes one slot whole
+ * and syncs it before anything waits on it (a vote or an acknowledgement waits for its save), and
+ * the two slots take turns, so a power cut can damage only the slot being written: its sectors
+ * land old, new, or one of them garbage, all 512 bytes (tests/crash/README, "The persistence
+ * model"), while the other slot holds the last save that returned. Hence:
+ *   - both slots blank is a node that has never voted: a fresh format, or a crash between a hard
+ *     file's O_CREAT and its first sync, before which nothing was sent;
+ *   - a slot whose magic is gone beside a valid one (SLOT_TORN) is the save a power cut tore,
+ *     which nothing waited on: the valid slot is read, with a WARN. Beside a blank slot it
+ *     is the same only as slot 1, where seq 1 goes: a first save torn, read as never voted. Slot
+ *     0 is written only after seq 1 is durable in slot 1, so a torn slot 0 beside a blank slot 1,
+ *     and two torn slots, are damage no power cut leaves: refused;
+ *   - a slot whose magic is whole and which does not verify -- its first checksum, its fence or
+ *     its floor fails, or its flags name a fence or a floor that is zero (#837) -- is damage
+ *     (SLOT_BAD): every byte checked lies in the slot's first sector, which a tear leaves old,
+ *     new or garbage, never half of each. Refused whatever the other slot holds;
+ *   - a blank slot beside a valid one is legitimate only beside seq 1, the one write that has a
+ *     hole beside it; beside a later seq the blank slot was zeroed after it was written, and may
+ *     have been the newer one.
+ * XXX Rot that takes the magic is not told from a tear: it reads as a torn save -- beside
+ * a valid slot that slot is read, which loses the newer term and vote when the rotted slot held
+ * them, and seq 1's slot rotted beside the hole reads as "never voted". A device that returns
+ * zeros for exactly the ring is not caught either: both slots zeroed after the node has voted
+ * read as "never voted", and slot 0 zeroed beside seq 1 in slot 1 reads as seq 1, which a torn
+ * second save also leaves. The log cannot say otherwise: a follower appends a new term's
+ * entries before its save of that term is durable, so a log entry of a term is no proof that a
+ * save of it ever landed (plan 28h-tp2 item 4). An earlier version refused every slot that did
+ * not verify, which made a power cut inside any save a node that would not start (withdrawn). */
+
+#define HARD_FLAG_FENCE 0x01 /* bytes [40, 60) hold a fence */
+#define HARD_FLAG_FLOOR 0x02 /* bytes [60, 80) hold a floor */
 
 /* Where the two slots live: the head of a file of their own, or a fixed offset in the region. */
 static uint64_t hard_base(const raft_log *l)
@@ -2001,18 +2441,39 @@ static uint64_t hard_base(const raft_log *l)
 	return in_region(l) ? l->region_off + REG_HARD_OFF : 0;
 }
 
-static bool check_slot(const uint8_t *p, uint64_t *seq, raft_hard_state *hs, raft_index *floor,
-		       raft_term *floor_term)
+/* What one slot holds: see "What the reader accepts" above for what each state is taken as. */
+typedef enum {
+	SLOT_VALID, /* verifies */
+	SLOT_BLANK, /* every byte zero */
+	SLOT_TORN,  /* not blank, and the magic gone: what a torn save leaves */
+	SLOT_BAD    /* the magic whole, and a checksum or a flag fails: never a tear */
+} slot_state;
+
+/* What one slot (HARD_SLOT bytes at `p`) holds; on SLOT_VALID its fields are stored. */
+static slot_state check_slot(const uint8_t *p, uint64_t *seq, raft_hard_state *hs,
+			     raft_index *floor, raft_term *floor_term)
 {
-	if (memcmp(p, HARD_MAGIC, 8) != 0 || iso_get_u32le(p + 8) != iso_crc32c_buf(p + 12, 28))
-		return false;
+	size_t nz = 0;
+	while (nz < HARD_SLOT && p[nz] == 0)
+		nz++;
+	if (nz == HARD_SLOT)
+		return SLOT_BLANK;
+	if (memcmp(p, HARD_MAGIC, 8) != 0)
+		return SLOT_TORN;
+	if (iso_get_u32le(p + 8) != iso_crc32c_buf(p + 12, 28))
+		return SLOT_BAD;
 	static const uint8_t none[20];
+	uint8_t flags = p[32];
 	bool fenced = memcmp(p + 40, none, sizeof none) != 0;
+	if ((flags & HARD_FLAG_FENCE) && !fenced)
+		return SLOT_BAD;
 	if (fenced && iso_get_u32le(p + 56) != iso_crc32c_buf(p + 40, 16))
-		return false;
+		return SLOT_BAD;
 	bool floored = memcmp(p + 60, none, sizeof none) != 0;
+	if ((flags & HARD_FLAG_FLOOR) && !floored)
+		return SLOT_BAD;
 	if (floored && iso_get_u32le(p + 76) != iso_crc32c_buf(p + 60, 16))
-		return false;
+		return SLOT_BAD;
 	*floor = floored ? iso_get_u64le(p + 60) : 0;
 	*floor_term = floored ? iso_get_u64le(p + 68) : 0;
 	*seq = iso_get_u64le(p + 12);
@@ -2020,42 +2481,88 @@ static bool check_slot(const uint8_t *p, uint64_t *seq, raft_hard_state *hs, raf
 	hs->vote = iso_get_u32le(p + 28);
 	hs->fence_index = fenced ? iso_get_u64le(p + 40) : 0;
 	hs->fence_term = fenced ? iso_get_u64le(p + 48) : 0;
-	return true;
+	return SLOT_VALID;
 }
 
-/* The ring's newest valid slot: its hard state, sequence and floor (`floor` and `floor_term` may
- * be NULL). `*any` false when neither slot is valid. ISO_ERR_IO: the read failed. */
-static iso_err hard_read_floor(int fd, uint64_t base, raft_hard_state *out, uint64_t *seq_out,
-			       bool *any, raft_index *floor, raft_term *floor_term)
+/*
+ * hard_read_floor
+ *		Read the ring at `base` of `fd`: its newest slot's hard state, sequence and floor.
+ *
+ * `floor` and `floor_term` may be NULL. `what` names the file or region in errors. A short read
+ * (a hard file that a crash left shorter than two slots) reads the missing bytes as blank. ISO_OK
+ * with `*any` false: both slots are blank, a node that has never voted. ISO_ERR_CORRUPT with `err`
+ * set: a slot is damaged, or blank beside a slot past seq 1 (see the section comment) -- the
+ * term and vote may be lost and are not guessed at. ISO_ERR_IO with `err` set: the read failed.
+ * Reads only; the caller has settled the ring (`settle`).
+ */
+static iso_err hard_read_floor(int fd, uint64_t base, const char *what, raft_hard_state *out,
+			       uint64_t *seq_out, bool *any, raft_index *floor, raft_term *floor_term,
+			       char *err, size_t errsize)
 {
-	uint8_t buf[2 * HARD_SLOT];
-	ssize_t got = pread(fd, buf, sizeof buf, (off_t)base);
-	if (got < 0)
-		return ISO_ERR_IO;
+	uint8_t buf[2 * HARD_SLOT] = { 0 };
 	*any = false;
+	if (pread(fd, buf, sizeof buf, (off_t)base) < 0)
+		return io_err(err, errsize, "reading the hard state of", what);
+	slot_state st[2];
+	uint64_t seq[2] = { 0, 0 };
+	raft_hard_state hs[2];
+	raft_index f[2];
+	raft_term ft[2];
+	for (unsigned i = 0; i < 2; i++)
+		st[i] = check_slot(buf + i * HARD_SLOT, &seq[i], &hs[i], &f[i], &ft[i]);
 	for (unsigned i = 0; i < 2; i++) {
-		if ((size_t)got < (i + 1) * HARD_SLOT)
-			break;
-		uint64_t seq;
-		raft_hard_state hs;
-		raft_index f;
-		raft_term ft;
-		if (check_slot(buf + i * HARD_SLOT, &seq, &hs, &f, &ft) && (!*any || seq > *seq_out)) {
-			*any = true;
-			*seq_out = seq;
-			*out = hs;
-			if (floor)
-				*floor = f;
-			if (floor_term)
-				*floor_term = ft;
-		}
+		/* A torn slot is forgiven only where a torn save can have left it: beside a valid
+		 * slot, or as slot 1 beside a blank slot 0 (a first save). */
+		bool forgiven = st[i] == SLOT_TORN &&
+				(st[i ^ 1] == SLOT_VALID || (i == 1 && st[0] == SLOT_BLANK));
+		if (st[i] == SLOT_VALID || st[i] == SLOT_BLANK || forgiven)
+			continue;
+		return iso_errf(err, errsize, ISO_ERR_CORRUPT,
+				"slot %u of the raft hard state in %s does not verify, and %s. A "
+				"power cut damages only the slot being saved, never this, so it is "
+				"damage, and it may have held this node's newest term and vote; they "
+				"are not guessed at. Check the disk (the kernel log, `smartctl`), then "
+				"restore the hard state from a backup, or remove this node from the "
+				"metadata group and add it back as a new member.",
+				i, what,
+				st[i] == SLOT_BAD ? "its magic is whole, which a torn save never "
+						    "leaves"
+				: st[i ^ 1] == SLOT_TORN ? "neither does the other slot"
+				: st[i ^ 1] == SLOT_BAD	 ? "the other slot is damaged too"
+							 : "slot 1 beside it is blank");
 	}
+	for (unsigned i = 0; i < 2; i++)
+		if (st[i] == SLOT_TORN)
+			LOG_WARN("slot %u of the raft hard state in %s does not verify: a save a "
+				 "power cut tore, which nothing waited on; reading %s",
+				 i, what, st[i ^ 1] == SLOT_VALID ? "the other slot" : "the ring as "
+				 "never voted");
+	if (st[0] != SLOT_VALID && st[1] != SLOT_VALID)
+		return ISO_OK;
+	unsigned n = st[0] != SLOT_VALID ? 1 : st[1] != SLOT_VALID ? 0 : seq[1] > seq[0] ? 1 : 0;
+	if (st[n ^ 1] == SLOT_BLANK && seq[n] != 1)
+		return iso_errf(err, errsize, ISO_ERR_CORRUPT,
+				"slot %u of the raft hard state in %s is blank beside sequence %llu in "
+				"slot %u. Only the first save leaves a slot blank, so this one was "
+				"zeroed after it was written and may have held a newer term and vote; "
+				"they are not guessed at. Check the disk (the kernel log, `smartctl`), "
+				"then restore the hard state from a backup, or remove this node from "
+				"the metadata group and add it back as a new member.",
+				n ^ 1, what, (unsigned long long)seq[n], n);
+	*any = true;
+	*seq_out = seq[n];
+	*out = hs[n];
+	if (floor)
+		*floor = f[n];
+	if (floor_term)
+		*floor_term = ft[n];
 	return ISO_OK;
 }
 
-static iso_err hard_read(int fd, uint64_t base, raft_hard_state *out, uint64_t *seq_out, bool *any)
+static iso_err hard_read(int fd, uint64_t base, const char *what, raft_hard_state *out,
+			 uint64_t *seq_out, bool *any, char *err, size_t errsize)
 {
-	return hard_read_floor(fd, base, out, seq_out, any, NULL, NULL);
+	return hard_read_floor(fd, base, what, out, seq_out, any, NULL, NULL, err, errsize);
 }
 
 iso_err raft_log_probe_dir(const char *dir, raft_log_dir_info *out, char *err, size_t errsize)
@@ -2098,20 +2605,24 @@ iso_err raft_log_hard_load(const char *dir, raft_hard_state *out, char *err, siz
 			return ISO_ERR_NOTFOUND;
 		return io_err(err, errsize, "opening", path);
 	}
-	struct stat st;
+	/* A slot written and not synced by a life that crashed is not a vote this node may act on
+	 * (`settle`). */
+	int se = settle(fd, 0, 0);
+	if (se) {
+		close(fd);
+		return settle_err(err, errsize, se, path);
+	}
 	bool any = false;
 	uint64_t seq = 0;
-	iso_err rc = fstat(fd, &st) != 0 ? ISO_ERR_IO : hard_read(fd, 0, out, &seq, &any);
+	iso_err rc = hard_read(fd, 0, path, out, &seq, &any, err, errsize);
 	close(fd);
 	if (rc != ISO_OK)
-		return iso_errf(err, errsize, rc, "reading %s failed", path);
-	if (!any)
-		return iso_errf(err, errsize, ISO_ERR_CORRUPT,
-				"%s holds no valid hard state (%lld bytes). This node's term and vote "
-				"are lost; do not guess them. Restore the file from a backup, or remove "
-				"this node from the metadata group and add it back as a new member.",
-				path, (long long)st.st_size);
-	return ISO_OK;
+		return rc;
+	/* **Blank is not damaged** (#835): a file of no length or of zeros is a crash
+	 * between its O_CREAT and its first sync, before which nothing was sent, as two blank
+	 * slots in a region are. */
+	return any ? ISO_OK
+		   : iso_errf(err, errsize, ISO_ERR_NOTFOUND, "%s holds no hard state yet", path);
 }
 
 /* The hard state as the disk has it now, and the ring's sequence with it: opened on first use. */
@@ -2127,8 +2638,10 @@ static iso_err hard_current(raft_log *l, raft_hard_state *cur, bool *any, char *
 		}
 	}
 	uint64_t seq = 0;
-	if (hard_read(l->hard_fd, hard_base(l), cur, &seq, any) != ISO_OK)
-		return io_err(err, errsize, "reading", in_region(l) ? log_name(l) : "hard");
+	iso_err rc = hard_read(l->hard_fd, hard_base(l), in_region(l) ? log_name(l) : "raft/hard",
+			       cur, &seq, any, err, errsize);
+	if (rc != ISO_OK)
+		return rc;
 	l->hard_seq = *any ? seq : 0;
 	l->hard_seq_known = true;
 	l->hard_any = *any;
@@ -2146,6 +2659,7 @@ static void hard_slot_fill(uint8_t *slot, uint64_t seq, const raft_hard_state *h
 	iso_put_u64le(slot + 12, seq);
 	iso_put_u64le(slot + 20, hs->term);
 	iso_put_u32le(slot + 28, hs->vote);
+	slot[32] = (uint8_t)((hs->fence_index ? HARD_FLAG_FENCE : 0) | (floor ? HARD_FLAG_FLOOR : 0));
 	iso_put_u32le(slot + 8, iso_crc32c_buf(slot + 12, 28));
 	if (hs->fence_index) {
 		iso_put_u64le(slot + 40, hs->fence_index);
@@ -2240,25 +2754,10 @@ iso_err raft_log_hard_fence(raft_log *l, raft_term term, raft_index fence_index,
 	raft_hard_state cur;
 	bool any = false;
 	iso_err rc = hard_current(l, &cur, &any, err, errsize);
+	/* A ring that was written and then lost refused in `hard_current` (its reader says why);
+	 * `any` false is a blank ring, never written, which may be fenced from nothing. */
 	if (rc != ISO_OK)
 		return rc;
-	if (!any) {
-		/* Never written, or written and then lost: only the first may be fenced from
-		 * nothing. A term and a vote that did exist are not guessed at
-		 * (raft_log_hard_load). */
-		uint8_t buf[2 * HARD_SLOT];
-		ssize_t got = pread(l->hard_fd, buf, sizeof buf, (off_t)hard_base(l));
-		if (got < 0)
-			return io_err(err, errsize, "reading", in_region(l) ? log_name(l) : "hard");
-		const char *what = in_region(l) ? log_name(l) : "raft/hard";
-		for (ssize_t i = 0; i < got; i++)
-			if (buf[i])
-				return iso_errf(err, errsize, ISO_ERR_CORRUPT,
-						"%s holds no valid hard state, so this node's "
-						"term and vote are lost; they are not guessed at, "
-						"and nothing is fenced over them",
-						what);
-	}
 	if (term > cur.term) {
 		cur.term = term;
 		cur.vote = 0; /* a term it had not reached, so one it had not voted in */
@@ -2328,8 +2827,11 @@ static iso_err floor_refuse(raft_log *l, const char *what, char *err, size_t err
  *
  * In a region `hard_fd` is open already; a directory's `hard` is opened here without creating it
  * -- a node that never saved a term has none, and an empty file would read as a lost hard state
- * (raft_log_hard_load). No file, or no valid slot, is no floor. Caches the newest slot for the
- * floor's own slots to carry. ISO_ERR_IO with `err` set when the ring cannot be read.
+ * (raft_log_hard_load). No file, or a blank ring, is no floor. Caches the newest slot for the
+ * floor's own slots to carry. ISO_ERR_CORRUPT with `err` set when a slot is damaged (the ring's
+ * reader says why), except on an open that only empties the log, which reads no floor and saves no
+ * term, and finds such a ring as it did before: no floor. ISO_ERR_IO with `err` set when the ring
+ * cannot be read, or when the sync an open makes before it reads (`settle`) fails.
  */
 static iso_err floor_load(raft_log *l, char *err, size_t errsize)
 {
@@ -2338,13 +2840,27 @@ static iso_err floor_load(raft_log *l, char *err, size_t errsize)
 		if (fd < 0)
 			return errno == ENOENT ? ISO_OK : io_err(err, errsize, "opening", "hard");
 		l->hard_fd = fd;
+		/* What a previous life left unsynced is made durable, or refused, before the floor
+		 * is trusted (`settle`, #832); a region's ring is settled with the region. */
+		int se = l->discard_only ? 0 : settle(fd, 0, 0);
+		if (se)
+			return settle_err(err, errsize, se, "the raft hard state file");
 	}
 	raft_hard_state hs;
 	uint64_t seq = 0;
 	bool any = false;
-	if (hard_read_floor(l->hard_fd, hard_base(l), &hs, &seq, &any, &l->floor, &l->floor_term) !=
-	    ISO_OK)
-		return io_err(err, errsize, "reading", in_region(l) ? log_name(l) : "hard");
+	iso_err rc = hard_read_floor(l->hard_fd, hard_base(l),
+				     in_region(l) ? log_name(l) : "raft/hard", &hs, &seq, &any,
+				     &l->floor, &l->floor_term, err, errsize);
+	if (rc == ISO_ERR_CORRUPT && l->discard_only) {
+		any = false;
+		l->floor = 0;
+		l->floor_term = 0;
+		if (err && errsize)
+			err[0] = '\0';
+	} else if (rc != ISO_OK) {
+		return rc;
+	}
 	l->hard_seq = any ? seq : 0;
 	l->hard_seq_known = true;
 	l->hard_any = any;
@@ -2563,17 +3079,29 @@ iso_err raft_log_carve(uint64_t region_len, uint64_t configured, uint64_t *segme
 				(uint64_t)RAFT_LOG_SEGMENT_MIN, (uint64_t)RAFT_WIRE_ENTRY_MAX,
 				(uint64_t)RAFT_LOG_REGION_HEAD);
 
-	uint64_t ceiling = configured ? configured : DEFAULT_SEGMENT;
-	if (ceiling < RAFT_LOG_SEGMENT_MIN) {
-		LOG_INFO("`[mds] log_segment_bytes` is %" PRIu64 ", and a raft log segment in a region "
-			 "holds at least %" PRIu64 " so that the largest entry replication can carry "
-			 "(%" PRIu64 " bytes) fits one; segments are carved at that",
-			 ceiling, (uint64_t)RAFT_LOG_SEGMENT_MIN, (uint64_t)RAFT_WIRE_ENTRY_MAX);
-		ceiling = RAFT_LOG_SEGMENT_MIN;
-	}
 	/* At least RAFT_LOG_SEGMENT_MIN, because the region is at least RAFT_LOG_REGION_MIN. */
 	uint64_t eighth = (region_len - RAFT_LOG_REGION_HEAD) / RAFT_LOG_REGION_SLOTS;
-	*segment_bytes = ceiling < eighth ? ceiling : eighth;
+	/* **Slots in whole 4 KiB blocks where there is room for them** (#840). A region
+	 * within 32 KiB of the minimum has no room for eight aligned slots; it keeps the eighth an
+	 * older build carved it at, so that laying it out again (`relay_geometry`, which asks the
+	 * carve with the region's own length) finds the slots where they are, and its headers are
+	 * judged by the open's sector rule (`foreign_slot`). */
+	bool aligned = eighth >= RAFT_LOG_SEGMENT_ALIGNED;
+	uint64_t floor = aligned ? RAFT_LOG_SEGMENT_ALIGNED : RAFT_LOG_SEGMENT_MIN;
+	uint64_t ceiling = configured ? configured : DEFAULT_SEGMENT;
+	if (ceiling < floor) {
+		LOG_INFO("`[mds] log_segment_bytes` is %" PRIu64 ", and a raft log segment in a region "
+			 "holds at least %" PRIu64 " so that the largest entry replication can carry "
+			 "(%" PRIu64 " bytes) fits one in whole %u-byte blocks; segments are carved at "
+			 "that",
+			 ceiling, floor, (uint64_t)RAFT_WIRE_ENTRY_MAX, RAFT_LOG_SLOT_ALIGN);
+		ceiling = floor;
+	}
+	uint64_t seg = ceiling < eighth ? ceiling : eighth;
+	/* Never below the floor: both are at least `floor`, a multiple of the block. */
+	if (aligned)
+		seg -= seg % RAFT_LOG_SLOT_ALIGN;
+	*segment_bytes = seg;
 	return ISO_OK;
 }
 
@@ -2730,23 +3258,16 @@ iso_err raft_log_hard_load_region(int fd, uint64_t off, uint64_t len, raft_hard_
 	(void)len;
 	bool any = false;
 	uint64_t seq = 0;
-	iso_err rc = hard_read(fd, off + REG_HARD_OFF, out, &seq, &any);
+	int se = settle(fd, (off_t)(off + REG_HARD_OFF), 2 * HARD_SLOT);
+	if (se)
+		return settle_err(err, errsize, se, "the raft hard state on the metadata device");
+	iso_err rc = hard_read(fd, off + REG_HARD_OFF, "the metadata device", out, &seq, &any, err,
+			       errsize);
 	if (rc != ISO_OK)
-		return iso_errf(err, errsize, rc, "reading the raft hard state failed");
-	if (any)
-		return ISO_OK;
-
+		return rc;
 	/* **Blank is not damaged, here too.** Both slots zero is a node that has never voted, which
-	 * a fresh format leaves; anything else with no valid slot is a term and a vote that were
-	 * lost, and those must never be guessed. */
-	uint8_t buf[2 * HARD_SLOT];
-	if (pread(fd, buf, sizeof buf, (off_t)(off + REG_HARD_OFF)) != (ssize_t)sizeof buf)
-		return io_err(err, errsize, "reading", "the raft hard state");
-	for (size_t i = 0; i < sizeof buf; i++)
-		if (buf[i])
-			return iso_errf(err, errsize, ISO_ERR_CORRUPT,
-					"the raft hard state on the metadata device holds no valid slot. "
-					"This node's term and vote are lost; do not guess them. Remove this "
-					"node from the metadata group and add it back as a new member.");
-	return ISO_ERR_NOTFOUND;
+	 * a fresh format leaves; a damaged slot refused above. */
+	return any ? ISO_OK
+		   : iso_errf(err, errsize, ISO_ERR_NOTFOUND,
+			      "the raft hard state on the metadata device is blank");
 }

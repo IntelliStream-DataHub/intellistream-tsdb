@@ -307,12 +307,6 @@ static raft_index log_last(raft *r) { return r->ops->last(r->log); }
 static raft_term term_at(raft *r, raft_index i) { return i == 0 ? 0 : r->ops->term_at(r->log, i); }
 static raft_term last_term(raft *r) { return term_at(r, log_last(r)); }
 
-static bool is_learner_in(const raft_config *c, raft_id id)
-{
-	const raft_member *m = raft_config_find(c, id);
-	return m && m->learner;
-}
-
 static bool is_voter_in(const raft_config *c, raft_id id)
 {
 	const raft_member *m = raft_config_find(c, id);
@@ -1545,7 +1539,12 @@ static void on_append_resp(raft *r, const raft_msg *m)
 	 * the moment it needs a snapshot. */
 	if (p->state == PROG_SNAPSHOT || rejected < p->match)
 		return;
-	if (p->state == PROG_PROBE && rejected != p->next - 1)
+	/* A rejection at match answers a heartbeat, not the probe that is out, and it is kept: the
+	 * probe's own answer may have been lost, and the heartbeat that names match with no term
+	 * (compacted away) is then the only thing that can still tell the leader a snapshot is
+	 * due. Dropped, the probe would never be resent and the follower would stay behind for
+	 * ever. A repeated one is harmless: it lands on the same `next`. */
+	if (p->state == PROG_PROBE && rejected != p->next - 1 && rejected != p->match)
 		return; /* not the probe that is out; a duplicate or a reordered answer */
 	raft_index next;
 	if (!m->u.append_resp.hint_term && m->u.append_resp.hint_index <= p->match) {
@@ -1693,9 +1692,23 @@ void raft_step(raft *r, const raft_msg *m)
 	bool prevote = m->type == RAFT_MSG_PREVOTE || m->type == RAFT_MSG_PREVOTE_RESP;
 
 	if (is_vote_req) {
-		if (is_learner_in(&r->config, r->self) || vote_fenced(r)) {
+		/* **A learner votes** (etcd's rule, raft thesis section 4.1: a server answers an RPC
+		 * without looking at its own configuration; who counts a vote is the candidate's
+		 * quorum test alone, `tally`, over the voters of the candidate's configuration).
+		 * A learner that has just been promoted, but has not yet received the entry that
+		 * promotes it, still sees itself as a learner, while the leader that committed the
+		 * change counts it: with one of the other voters down, the survivor can win only with
+		 * this node's vote, and refusing it stalled the group for ever. The vote is safe
+		 * because the node's log is not amnesiac -- what it acknowledged as a voter it still
+		 * holds (a replica that was reseeded is the other case, and it is the fence's: a
+		 * fenced log never votes) -- and because term and vote are made durable before the
+		 * reply like any other. A vote nobody counts is harmless, and `sticky` below applies
+		 * to a learner as to a voter: a promoted learner acknowledges its leader's appends,
+		 * the leader's lease counts it, and refusing while the leader is heard keeps lease
+		 * reads safe. */
+		if (vote_fenced(r)) {
 			settle(r);
-			return; /* learners never vote, and nor does a fenced log */
+			return; /* a fenced log never votes */
 		}
 		if (sticky(r, m)) {
 			r->st.prevotes_refused++;

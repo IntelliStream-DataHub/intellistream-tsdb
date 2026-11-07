@@ -105,6 +105,7 @@ typedef struct {
 	uint64_t changes;         /* membership changes accepted */
 	uint64_t reseeds;         /* replicas emptied behind a vote fence */
 	uint64_t transfers;
+	uint64_t learner_votes;   /* votes granted by a node that read itself as a learner */
 	uint64_t snapshots_installed;
 	raft_term max_term;
 	raft_index max_applied;

@@ -417,6 +417,12 @@ struct raft_sim {
 	raft_id *term_leader;
 	size_t tlcap;
 
+	/* Whom each node granted its vote in each term, `[term * (NODES_MAX + 1) + node]`, 0 for
+	 * nobody: kept across crashes, which is what makes a second grant in one term visible, and
+	 * what a leader's election is counted from (a voter's live hard state may have moved on). */
+	raft_id *grant;
+	size_t gcap; /* terms the array has room for */
+
 	uint64_t next_value;
 	pending pend[PEND_MAX];
 	unsigned pend_n, pend_head, pend_cap;
@@ -821,6 +827,20 @@ static simmsg *copy_msg(raft_sim *s, simnode *from, const raft_msg *m)
 	return c;
 }
 
+static raft_id *grant_slot(raft_sim *s, raft_term term, raft_id node)
+{
+	if (term >= s->gcap) {
+		size_t cap = s->gcap ? s->gcap : 256;
+		while (cap <= term)
+			cap *= 2;
+		size_t row = NODES_MAX + 1;
+		s->grant = iso_xrealloc(s->grant, cap * row * sizeof *s->grant);
+		memset(s->grant + s->gcap * row, 0, (cap - s->gcap) * row * sizeof *s->grant);
+		s->gcap = cap;
+	}
+	return &s->grant[term * (NODES_MAX + 1) + node];
+}
+
 static void check_send(raft_sim *s, simnode *nd, const raft_msg *m)
 {
 	bool prevote = m->type == RAFT_MSG_PREVOTE || m->type == RAFT_MSG_PREVOTE_RESP;
@@ -846,9 +866,19 @@ static void check_send(raft_sim *s, simnode *nd, const raft_msg *m)
 		if (h->vote != m->to || h->term != m->term)
 			fail(s, "node %u granted a vote to %u in term %llu before saving it", nd->id,
 			     m->to, (unsigned long long)m->term);
+		/* A learner votes as a voter does (raft.c, raft_step); who counts it is the
+		 * candidate's configuration, and on_state checks that a leader's election was won by
+		 * voters of its own. Here: at most one candidate a term, across crashes, and a count
+		 * of the votes a node that read itself as a learner gave, so that a run shows the
+		 * path was taken. */
+		raft_id *g = grant_slot(s, m->term, nd->id);
+		if (*g && *g != m->to)
+			fail(s, "node %u granted n%u and n%u in term %llu", nd->id, *g, m->to,
+			     (unsigned long long)m->term);
+		*g = m->to;
 		const raft_member *me = raft_config_find(raft_get_config(nd->r), nd->id);
 		if (me && me->learner)
-			fail(s, "node %u voted while a learner", nd->id);
+			s->st.learner_votes++;
 	}
 	if ((m->type == RAFT_MSG_VOTE_RESP || m->type == RAFT_MSG_PREVOTE_RESP) &&
 	    m->u.vote_resp.granted && sim_fenced(nd))
@@ -937,6 +967,24 @@ static void on_state(raft_sim *s, simnode *nd, const raft_action *a)
 	if (s->term_leader[term] == nd->id)
 		return; /* the same leadership reported again (leader changed) */
 	s->term_leader[term] = nd->id;
+	/* **A leader was elected by a quorum of the voters of its own configuration**: itself and
+	 * those that granted it this term. The configuration read now is the one the tally used
+	 * (the no-op that opens a term changes none). This is the design rule that "a learner never
+	 * votes" stood in for. */
+	{
+		const raft_config *c = raft_get_config(nd->r);
+		unsigned voters = 0, votes = 0;
+		for (uint32_t i = 0; i < c->n; i++) {
+			if (c->m[i].learner)
+				continue;
+			voters++;
+			votes += c->m[i].id == nd->id || *grant_slot(s, term, c->m[i].id) == nd->id;
+		}
+		if (votes < voters / 2 + 1)
+			fail(s, "n%u led term %llu with %u of %u votes from voters of its own "
+				"configuration (needs %u)",
+			     nd->id, (unsigned long long)term, votes, voters, voters / 2 + 1);
+	}
 	if (nd->id != s->last_leader) {
 		s->st.leader_changes++;
 		s->last_leader = nd->id;
@@ -1546,6 +1594,7 @@ void raft_sim_free(raft_sim *s)
 	free(s->cterm);
 	free(s->cchain);
 	free(s->term_leader);
+	free(s->grant);
 	free(s);
 }
 
