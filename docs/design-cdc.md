@@ -346,9 +346,19 @@ sync is skipped (a power loss is damage there already).
   when the value moved since the last store, so at most one `fdatasync` per flush, under `flush_lock` and off
   `buf_lock`. A clean close stores the exact `fno_next`.
 - **At open**, `fno_next` is the largest of the valid slot with the higher generation, the end of the valid records
-  of every segment, and 1 + the largest part `fno_hi`. One bad slot is a torn store (nothing relied on the newer
-  value before its sync) and the other is used; both bad, or no file in a format-9 volume, is `TSDB_ERR_CORRUPT`
-  with a log line.
+  of every segment, and 1 + the largest part `fno_hi`. **One bad slot** is a torn store or damage at rest (rot, a
+  misdirected write), which the content cannot tell apart: a store always targets the older slot, so after a tear the
+  other slot is the value before it and nothing relied on the newer one; but damage may hit the newest slot, whose
+  segments are unlinked already, and the other is then older by any number of stores. So the open uses the other
+  slot and **skips ahead by 2^40** (`FNO_BELT`; gaps are allowed, a repeat is not), logs "torn or damaged", and a
+  feed gets a new `feed_id` (the F19 rule for a rolled-back history; the feed is not built yet). Both bad, or no file
+  in a format-9 volume, is `TSDB_ERR_CORRUPT` with a log line; the one exception is a volume that never held a
+  record (only META, ROOT_ID and the empty dictionaries: no segment, part, series or MANIFEST), which is how 0.9.0's
+  `volume add` leaves a volume of an upgraded database: its first open makes `FNO` with 1.
+- **The limit.** Numbers stay below 2^62 (`FNO_LIMIT`; a record at or above it is not a record). A bound read at
+  open (a slot, a part's `fno_hi`, the end of a segment's record) at or above `FNO_BOUND_MAX` (2^62 minus two belts)
+  fails the open as damage (`TSDB_ERR_CORRUPT`, logged), never read as a torn tail, and the writer fails the engine
+  (fail-stop) rather than number a record that would end there.
 - **MANIFEST's `fno_next`** is information for followers only; the writer never relies on it, and followers never read
   `FNO`. A part's `fno_lo, fno_hi` cover the rows records it holds, never markers (a rebuild must not skip a marker
   a part seems to cover); at open they are an extra lower bound, never the main one. A part written by a large
@@ -357,7 +367,8 @@ sync is skipped (a power loss is damage there already).
   cluster's log `[start, end]` and its epoch to first position history would then have to accept. Keeping the last
   segment instead does not work either: an empty segment carries no number.
 `test_fno` (CRASHFS_TEAR power loss at every step of rows, a flush, a drop, markers, and of the open that replays a
-segment of markers only; the retention history; torn and missing slots) and four planted bugs it must catch: numbers
+segment of markers only; the retention history; torn, damaged and missing slots; numbers that go back inside a segment
+or across two; the limit; META `requires=`) and four planted bugs it must catch: numbers
 restarting from the parts, the bound taken from MANIFEST, a segment unlinked before `FNO` holds its end, a marker
 replayed as rows.
 

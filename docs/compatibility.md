@@ -32,7 +32,10 @@ exception is the step from 8 to 9, which `tsdb <dir> upgrade` does in place:
   a 0.9.0 follower that reads a MANIFEST of version 9 reports damage), then run `tsdb <dir> upgrade` with the new
   release. It takes the locks of every volume, writes `FNO`, MANIFEST and `META` of each volume and of the root
   last, and can simply be run again if it died. Keep the export of the old release until the new one has run for a
-  while: 0.9.0 refuses the upgraded database (it names the version), and a way back is the export.
+  while: 0.9.0 refuses the upgraded database (it names the version), and a way back is the export. **Do not run
+  0.9.0's `tsdb` on an upgraded database**, `volume add` above all: that release adds a volume without an `FNO` file.
+  (This release makes the file at the volume's first open when the volume never held a record, and its own `volume add`
+  refuses a root of another format or with an unknown `requires=`.)
 - The parts are not rewritten: they keep their 24-byte headers, `META` says `parts_v8=1`, and the open reads such a
   part (only where `META` says so, never in a database created at 9). Merges of idle partitions, and `tsdb <dir>
   optimize` at once, rewrite them one by one; the open logs how many are left, and the line leaves `META` when none is.

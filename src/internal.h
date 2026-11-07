@@ -1231,6 +1231,7 @@ typedef struct wal_rec {
     uint16_t mtype, mflags; /* a marker's */
 } wal_rec;
 size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wal_rec *r);
+void wal_reseal(uint8_t *rec, uint64_t seq, uint64_t off); /* tests: a record changed or moved, sealed again */
 /* Whether a valid record starts anywhere in p[from, len) (p at segment offset
  * base): then a bad record before it is damage, not a torn tail. */
 bool wal_valid_after(const uint8_t *p, size_t len, size_t from, uint64_t seq, uint64_t base);
@@ -1266,6 +1267,14 @@ static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
 }
 
 #define FNO_FILE "FNO"
+/* Log numbers stay below FNO_LIMIT (a record at or above it is not one: wal_record). A bound read at open (a slot, a
+ * part's fno_hi, the end of a segment) at or above FNO_BOUND_MAX fails the open: the writer must never assign past
+ * the limit, which would make its own records unreadable (a torn tail at the next open). The margin is room for the
+ * raise by FNO_BELT that an open makes when one FNO slot is bad: that slot may have been the newest, and the open
+ * cannot know how far the numbers ran past the other one, so it leaves a gap (numbers may have gaps, never repeat). */
+#define FNO_LIMIT ((uint64_t)1 << 62)
+#define FNO_BELT ((uint64_t)1 << 40)
+#define FNO_BOUND_MAX (FNO_LIMIT - 2 * FNO_BELT)
 int fno_create(int dirfd, uint64_t next, bool sync);
 void v8_parts_account(struct eng *db, bool at_open); /* upgraded databases: parts with a format-8 header left (db.c) */
 bool fno_file_intact(int dirfd);

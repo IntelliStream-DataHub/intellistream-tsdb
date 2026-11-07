@@ -7,7 +7,13 @@
  *    still comes from FNO (the mutation "the bound is MANIFEST's" must fail this);
  *  - a replay skips markers and counts their numbers; a follower does too; damage in a marker before valid records
  *    fails the open and in the last record is a torn tail (the mutation "a marker is replayed as rows" must fail);
- *  - FNO's slots: one torn slot is a torn store and the other is used, both torn or no file fails the open;
+ *  - FNO's slots: with one bad slot (a torn store, or damage to the newest slot, which cannot be told apart) the other
+ *    is used and the numbers skip ahead by FNO_BELT; both bad or no file fails the open; damage to the newest slot
+ *    of a history whose segments and parts are gone never hands out a number twice;
+ *  - limits: a bound at the limit of the numbers (a slot, a segment's record) fails the open, never a torn tail;
+ *    a record whose number goes back, or a segment that starts below the end of the one before it, is damage;
+ *  - META requires= refuses the open of a root and of a volume, and a volume is not added to such a root;
+ *  - a volume that never held a record and has no FNO (an add by 0.9.0) gets one at its first open;
  *  - power lost at every step (crashfs, tearing unsynced data): after rows, a flush, a drop and markers, and during
  *    the open that replays a segment of markers only, every number a caller was told is below the next one.
  *
@@ -193,8 +199,8 @@ static void test_slots(void)
         uint64_t want;
         const char *what;
     } cases[] = {
-        {1, 0, 1000, 5, 0, 0, 0, 1000, "slot 1 torn: slot 0 is used"},
-        {0, 1, 0, 0, 2000, 3, 0, 2000, "slot 0 torn: slot 1 is used"},
+        {1, 0, 1000, 5, 0, 0, 0, 1000 + FNO_BELT, "slot 1 bad: slot 0 is used, the numbers skip ahead"},
+        {0, 1, 0, 0, 2000, 3, 0, 2000 + FNO_BELT, "slot 0 bad: slot 1 is used, the numbers skip ahead"},
         {1, 1, 3000, 7, 3500, 8, 0, 3500, "both valid: the newer generation"},
         {1, 1, 4500, 9, 4000, 8, 0, 4500, "both valid: the newer generation, slot 0"},
         {0, 0, 0, 0, 0, 0, TSDB_ERR_CORRUPT, 0, "both torn: the open fails"},
@@ -218,7 +224,7 @@ static void test_slots(void)
             CHECK(eng_close(db) == 0); /* writes the exact number back */
         }
     }
-    /* a flipped bit in a valid slot is a torn slot, not a number */
+    /* a flipped bit in a valid slot is a bad slot, not a number */
     uint8_t pages[8192];
     memset(pages, 0, sizeof pages);
     fno_slot_page(pages, 777, 3);
@@ -227,13 +233,259 @@ static void test_slots(void)
     int fd = open(fno, O_WRONLY);
     CHECK(fd >= 0 && pwrite(fd, pages, sizeof pages, 0) == (ssize_t)sizeof pages);
     close(fd);
-    CHECK(open_eng(dir, false, false, &db) == 0 && fno_of(db) == 777);
+    CHECK(open_eng(dir, false, false, &db) == 0 && fno_of(db) == 777 + FNO_BELT);
     CHECK(eng_close(db) == 0);
     /* no file at all in a format-9 volume */
     CHECK(unlink(fno) == 0);
     fprintf(stderr, "  (a refusal is logged next: FNO missing)\n");
     CHECK(open_eng(dir, false, false, &db) == TSDB_ERR_CORRUPT);
-    printf("  FNO: a torn slot is skipped, both torn or no file fails the open, the newer generation wins\n");
+    printf("  FNO: a bad slot is skipped and the numbers skip ahead, both bad or no file fails the open, the newer "
+           "generation wins\n");
+}
+
+static int run_child(const char *kind, const char *dir, const char *ackfile, bool under_shim, int warmup, int seed);
+
+/* Damage to the newest slot, found after its segments and parts are gone: the history of test_history, the newest
+ * slot of FNO flipped in one bit. The number it held (1001) cannot be told from a tear, so the next one must be
+ * above it all the same: a number handed out twice would let a feed consumer take new rows for old ones. */
+static void test_damaged_newest(void)
+{
+    char dir[PATH_MAX + 32], fno[PATH_MAX + 64];
+    fresh("newest", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, false, false, &db) == 0);
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 500);
+    CHECK(eng_flush(db) == 0); /* FNO holds 501 */
+    rows(db, s, T0 + 1000, 500);
+    CHECK(eng_flush(db) == 0); /* and now 1001, in the other slot */
+    CHECK(eng_drop_before(db, T0 + 10 * 86400000LL) == 0);
+    CHECK(eng_close(db) == 0);
+    CHECK(sh("ls '%s'/wal_* 2>/dev/null | grep -q .", dir) != 0);
+    snprintf(fno, sizeof fno, "%s/FNO", dir);
+    uint8_t pages[8192];
+    int fd = open(fno, O_RDWR);
+    CHECK(fd >= 0 && pread(fd, pages, sizeof pages, 0) == (ssize_t)sizeof pages);
+    uint64_t g0, g1;
+    memcpy(&g0, pages + 16, 8);
+    memcpy(&g1, pages + 4096 + 16, 8);
+    off_t newest = g1 > g0 ? 4096 : 0;
+    uint8_t b = pages[newest + 8] ^ 1; /* one bit of the number in the newest slot */
+    CHECK(pwrite(fd, &b, 1, newest + 8) == 1);
+    close(fd);
+    CHECK(open_eng(dir, false, false, &db) == 0);
+    CHECK(fno_of(db) > 1001); /* never 501: that would hand out 501..1000 a second time */
+    CHECK(marker(db, 1) > 1001);
+    CHECK(eng_close(db) == 0);
+    printf("  damage to the newest FNO slot, segments and parts gone: numbers skip ahead, none is handed out twice\n");
+}
+
+/* A WAL segment as the "mixed" child leaves it (records: 10 rows at 0, a marker at 232, ...). */
+static void segment_of_mixed(const char *name, char *dir, size_t cap)
+{
+    char ack[PATH_MAX + 32];
+    fresh(name, dir, cap);
+    snprintf(ack, sizeof ack, "%s/%s.ack", S, name);
+    unlink(ack);
+    CHECK(run_child("mixed", dir, ack, false, -1, 0) == 0);
+}
+
+static void patch_file(const char *path, off_t at, const void *p, size_t n)
+{
+    int fd = open(path, O_RDWR);
+    CHECK(fd >= 0 && pwrite(fd, p, n, at) == (ssize_t)n);
+    if (fd >= 0)
+        close(fd);
+}
+
+/* Records that pass every check of a record and still cannot come from a writer: the open fails and names the
+ * damage (it is neither replayed nor cut as a torn tail). */
+static void test_number_guards(void)
+{
+    char dir[PATH_MAX + 32], seg[PATH_MAX + 64], seg2[PATH_MAX + 64];
+    eng *db;
+    /* 1. inside a segment: the marker after the 10 rows (numbers 1..10) says it is number 5 */
+    segment_of_mixed("guard1", dir, sizeof dir);
+    snprintf(seg, sizeof seg, "%s/wal_0000000000000001.log", dir);
+    struct stat st;
+    int fd = open(seg, O_RDWR);
+    CHECK(fd >= 0 && fstat(fd, &st) == 0);
+    size_t whole = (size_t)st.st_size;
+    uint8_t *rec = malloc(whole);
+    CHECK(rec && pread(fd, rec, whole, 0) == (ssize_t)whole);
+    close(fd);
+    uint64_t five = 5;
+    memcpy(rec + 232 + 16, &five, 8);
+    wal_reseal(rec + 232, 1, 232);
+    patch_file(seg, 0, rec, whole);
+    free(rec);
+    fprintf(stderr, "  (a refusal is logged next: a number that goes back inside a segment)\n");
+    CHECK(open_eng(dir, false, false, &db) == TSDB_ERR_CORRUPT);
+    /* 2. across segments: the second segment is a copy of the first, sealed for its own number, so it starts at
+       number 1 where the first ends at 27 */
+    segment_of_mixed("guard2", dir, sizeof dir);
+    snprintf(seg, sizeof seg, "%s/wal_0000000000000001.log", dir);
+    snprintf(seg2, sizeof seg2, "%s/wal_0000000000000002.log", dir);
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    fd = open(seg, O_RDONLY);
+    CHECK(fd >= 0 && fstat(fd, &st) == 0);
+    len = (size_t)st.st_size;
+    buf = malloc(len);
+    CHECK(buf && pread(fd, buf, len, 0) == (ssize_t)len);
+    close(fd);
+    for (size_t pos = 0; pos < len;) {
+        wal_rec wr;
+        size_t rl = wal_record(buf + pos, len - pos, 1, pos, &wr);
+        CHECK(rl != 0);
+        if (rl == 0)
+            break;
+        wal_reseal(buf + pos, 2, pos);
+        pos += rl;
+    }
+    fd = open(seg2, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    CHECK(fd >= 0 && write(fd, buf, len) == (ssize_t)len);
+    close(fd);
+    free(buf);
+    fprintf(stderr, "  (a refusal is logged next: a segment that starts below the end of the one before it)\n");
+    CHECK(open_eng(dir, false, false, &db) == TSDB_ERR_CORRUPT);
+    printf("  a record whose number goes back, or a segment below the one before it, fails the open\n");
+}
+
+/* The limit of the numbers: a bound at it is damage or a bug, and the writer must never number a record past what
+ * its own replay accepts (it would cut its acknowledged rows as a torn tail at the next open). */
+static void test_limits(void)
+{
+    char dir[PATH_MAX + 32], fno[PATH_MAX + 64], seg[PATH_MAX + 64];
+    eng *db;
+    uint32_t s;
+    fresh("limits", dir, sizeof dir);
+    CHECK(open_eng(dir, false, false, &db) == 0 && eng_close(db) == 0);
+    snprintf(fno, sizeof fno, "%s/FNO", dir);
+    uint8_t pages[8192];
+    /* a slot at the limit fails the open, a slot below it (with room for what a run numbers) works */
+    memset(pages, 0xa5, sizeof pages);
+    fno_slot_page(pages, FNO_LIMIT - 2, 5);
+    fno_slot_page(pages + 4096, FNO_LIMIT - 3, 4);
+    patch_file(fno, 0, pages, sizeof pages);
+    fprintf(stderr, "  (a refusal is logged next: FNO beyond the limit of the numbers)\n");
+    CHECK(open_eng(dir, false, false, &db) == TSDB_ERR_CORRUPT);
+    fno_slot_page(pages, FNO_BOUND_MAX - 100, 5);
+    fno_slot_page(pages + 4096, FNO_BOUND_MAX - 101, 4);
+    patch_file(fno, 0, pages, sizeof pages);
+    CHECK(open_eng(dir, false, false, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 5);
+    CHECK(fno_of(db) == FNO_BOUND_MAX - 95);
+    CHECK(eng_close(db) == 0);
+    CHECK(open_eng(dir, false, false, &db) == 0 && rows_of(db) == 5); /* all five rows came back */
+    /* the numbers run out: the next write would end at the bound, so the engine fails (fail-stop) rather than number
+       a record the next open refuses; what was acknowledged is all there at that open */
+    CHECK(fno_of(db) == FNO_BOUND_MAX - 95);
+    {
+        mk m;
+        memset(&m, 0, sizeof m);
+        m.type = MK_COMMIT;
+        m.u.commit = (mk_commit){.op = MK_OP_INSERT, .keys_form = MK_KEYS_NONE, .events = 95};
+        CHECK(wal_marker_mk(db, &m, NULL) == TSDB_ERR_IO); /* 95 numbers would end at the bound */
+        CHECK(eng_failed_msg(db, NULL, 0) != 0);
+    }
+    eng_close(db);
+    fprintf(stderr, "  (a refusal is logged next: none; the reopen below must work)\n");
+    CHECK(open_eng(dir, false, false, &db) == 0 && rows_of(db) == 5 && fno_of(db) == FNO_BOUND_MAX - 95);
+    CHECK(eng_close(db) == 0);
+    /* a record at the limit in a segment: the checks of the record pass, so it is damage, not a torn tail, and the
+       segment stays */
+    segment_of_mixed("limits2", dir, sizeof dir);
+    snprintf(seg, sizeof seg, "%s/wal_0000000000000001.log", dir);
+    struct stat st;
+    int fd = open(seg, O_RDWR);
+    CHECK(fd >= 0 && fstat(fd, &st) == 0);
+    size_t whole = (size_t)st.st_size, last = 0;
+    uint8_t *rec = malloc(whole);
+    CHECK(rec && pread(fd, rec, whole, 0) == (ssize_t)whole);
+    close(fd);
+    for (size_t pos = 0, rl; pos < whole; pos += rl) { /* the last record: with valid records after it the replay's
+                                                         own checks would fail the open, and not show the guard */
+        wal_rec wr;
+        rl = wal_record(rec + pos, whole - pos, 1, pos, &wr);
+        CHECK(rl != 0);
+        if (rl == 0)
+            break;
+        last = pos;
+    }
+    uint64_t far = FNO_LIMIT + 7;
+    memcpy(rec + last + 16, &far, 8);
+    wal_reseal(rec + last, 1, last);
+    patch_file(seg, 0, rec, whole);
+    free(rec);
+    fprintf(stderr, "  (a refusal is logged next: a record beyond the limit of the numbers)\n");
+    CHECK(open_eng(dir, false, false, &db) == TSDB_ERR_CORRUPT);
+    CHECK(access(seg, F_OK) == 0);
+    printf("  a bound at the limit of the numbers fails the open; numbers below it replay whole\n");
+}
+
+/* META requires=: a feature this binary does not know changes what the files mean. */
+static void test_requires(void)
+{
+    char dir[PATH_MAX + 32], meta[PATH_MAX + 64], vol[PATH_MAX + 64], vmeta[PATH_MAX + 96];
+    eng *db;
+    tsdb *t;
+    uint32_t idx;
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    fresh("requires", dir, sizeof dir);
+    CHECK(tsdb_open(dir, &o, &t) == 0);
+    tsdb_close(t);
+    snprintf(meta, sizeof meta, "%s/META", dir);
+    CHECK(sh("cp '%s' '%s.saved' && echo 'requires=feed-v2' >> '%s'", meta, meta, meta) == 0);
+    fprintf(stderr, "  (a refusal is logged next: requires=feed-v2 on a root)\n");
+    CHECK(open_eng(dir, false, false, &db) == TSDB_ERR_INVALID);
+    CHECK(open_eng(dir, true, false, &db) == TSDB_ERR_INVALID);
+    CHECK(open_eng(dir, true, true, &db) == TSDB_ERR_INVALID);
+    /* a root that requires something, or is of another format, is given no volume: it would get one made by these
+       rules that the root's own release cannot use */
+    snprintf(vol, sizeof vol, "%s/requires-vol2", S);
+    CHECK(tsdb_volume_add_dir(dir, vol, &idx) == TSDB_ERR_INVALID);
+    CHECK(sh("test ! -e '%s/META'", vol) == 0);
+    CHECK(sh("cp '%s.saved' '%s' && sed -i 's/^version=.*/version=10/' '%s'", meta, meta, meta) == 0);
+    CHECK(tsdb_volume_add_dir(dir, vol, &idx) == TSDB_ERR_INVALID);
+    CHECK(sh("test ! -e '%s/META'", vol) == 0);
+    /* a volume that requires something: the open of the database refuses */
+    CHECK(sh("cp '%s.saved' '%s'", meta, meta) == 0);
+    snprintf(vol, sizeof vol, "%s/requires-vol1", S);
+    CHECK(tsdb_volume_add_dir(dir, vol, &idx) == 0 && idx == 1);
+    snprintf(vmeta, sizeof vmeta, "%s/META", vol);
+    CHECK(sh("grep -q '^volume=1' '%s'", vmeta) == 0);
+    CHECK(sh("echo 'requires=feed-v2' >> '%s'", vmeta) == 0);
+    fprintf(stderr, "  (a refusal is logged next: requires=feed-v2 on a volume)\n");
+    CHECK(tsdb_open(dir, &o, &t) != 0);
+    printf("  META requires= refuses the open of a root and of a volume; no volume is added to such a root\n");
+}
+
+/* A volume made by an add that left no FNO (0.9.0's, on an upgraded database): nothing there ever had a number, so
+ * its first open makes FNO(1). */
+static void test_empty_volume(void)
+{
+    char dir[PATH_MAX + 32], vol[PATH_MAX + 64], path[PATH_MAX + 96];
+    tsdb *t;
+    uint32_t idx;
+    fresh("emptyvol", dir, sizeof dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    CHECK(tsdb_open(dir, &o, &t) == 0);
+    tsdb_close(t);
+    snprintf(vol, sizeof vol, "%s/emptyvol-vol1", S);
+    CHECK(tsdb_volume_add_dir(dir, vol, &idx) == 0 && idx == 1);
+    snprintf(path, sizeof path, "%s/FNO", vol);
+    CHECK(access(path, F_OK) == 0 && unlink(path) == 0); /* what 0.9.0's add leaves */
+    CHECK(tsdb_open(dir, &o, &t) == 0);
+    CHECK(access(path, F_OK) == 0);
+    if (t)
+        tsdb_close(t);
+    printf("  a volume with no FNO that never held a record gets one at its first open\n");
 }
 
 /* Writes records into a directory the way a writer that died leaves them: a child that does not close. */
@@ -511,6 +763,11 @@ int main(int argc, char **argv)
         test_replay_markers();
         if (!mutant) {
             test_slots();
+            test_damaged_newest();
+            test_number_guards();
+            test_limits();
+            test_requires();
+            test_empty_volume();
             test_power_loss();
         }
     }

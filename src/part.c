@@ -206,7 +206,7 @@ int part_open_as(int dirfd, const char *file, const char *name, bool pin, bool v
         p->fno_lo = h.fno_lo;
         p->fno_hi = h.fno_hi;
         p->written_ms = h.written_ms;
-        if (h.fno_lo > h.fno_hi || (h.fno_lo == 0) != (h.fno_hi == 0))
+        if (h.fno_lo > h.fno_hi || (h.fno_lo == 0) != (h.fno_hi == 0) || h.fno_hi >= FNO_BOUND_MAX)
             goto fail;
     }
     p->grows = h.granule_rows;

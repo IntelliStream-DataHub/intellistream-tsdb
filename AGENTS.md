@@ -258,13 +258,19 @@ cgroup, so `nice` does not keep your work out of its way.
   segment is unlinked (`wal_unlink_upto` after a flush, the replay at open, the empty segment at close) `FNO` holds
   at least the segment's end (`fno_require`), and a clean close stores the exact next number. At open `fno_next` =
   max(the slot with the higher generation, the end of the valid records of every segment, 1 + the largest part
-  `fno_hi`); one bad slot is a torn store, both bad or no file in a format-9 volume is `TSDB_ERR_CORRUPT`. **MANIFEST
+  `fno_hi`); one bad slot is a torn store or damage to the newest slot (they look alike), so the other is used and the
+  numbers skip ahead by `FNO_BELT` (2^40: a gap, never a repeat); both bad or no file in a format-9 volume is
+  `TSDB_ERR_CORRUPT` (a volume that never held a record, 0.9.0's add leaves one, gets its `FNO` at the first open).
+  Bounds at or above `FNO_BOUND_MAX` (2^62 minus two belts) fail the open, and the writer fails the engine rather than
+  number past it. **MANIFEST
   cannot be the bound**: the writer never reads it at open and it is rewritten in place without a sync, so a power
   loss tears it; its `fno_next` line is information for followers, and followers never read `FNO`. A part's
   `fno_lo, fno_hi` cover the rows records it holds, never markers (0, 0 for a large insert, replace or delete), an
   extra lower bound only. A replay and a follower skip markers and count their numbers; a marker is never rows.
-  `tests/test_fno.c` (power loss at every step; mutations: numbers restarting from parts, the bound from MANIFEST,
-  a segment unlinked before `FNO` holds its end, a marker replayed as rows).
+  `tests/test_fno.c` (power loss at every step; damage to the newest slot; numbers going back inside a segment or
+  across two; the limit; `requires=`; mutations: numbers restarting from parts, the bound from MANIFEST, a segment
+  unlinked before `FNO` holds its end, a marker replayed as rows). The jepsen rot nemesis leaves `FNO` alone: no
+  workload there sees a number handed out twice.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
   only into partitions without a part from that segment.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never

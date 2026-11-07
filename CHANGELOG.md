@@ -22,7 +22,9 @@ disk format and the wire protocol.
   follower first): FNO, MANIFEST and META of each volume, the root last, safe to run again. The parts keep their old
   headers until merges rewrite them (`META` says `parts_v8=1` meanwhile; merges of idle partitions and `tsdb DIR
   optimize` do it, the open logs how many are left). Export and import (docs/export-format.md) still always works.
-  See docs/compatibility.md.
+  See docs/compatibility.md. With one bad `FNO` slot (a torn store or damage; they look alike) the open uses the other
+  and skips the numbers ahead by 2^40, so none is handed out twice; do not run 0.9.0's `tsdb` (`volume add`) on an
+  upgraded database.
 - New status codes -18 (`TSDB_ERR_FEED_GONE`) and -19 (`TSDB_ERR_FEED_RESET`) are reserved in `tsdb.h` for the change
   feed; nothing returns them yet.
 

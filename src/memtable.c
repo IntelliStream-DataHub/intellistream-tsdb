@@ -423,6 +423,18 @@ static void wal_seal(uint8_t *buf, size_t len, uint64_t seq, uint64_t off, int64
     }
 }
 
+/* Seals the one record at rec again after a test changed its bytes (its fno, say) or moved it to segment seq, offset
+ * off: the hash and the header check come out as the writer's (tests/test_fno.c builds records a bad disk or a bug
+ * could leave, which still pass every check of a record). */
+void wal_reseal(uint8_t *rec, uint64_t seq, uint64_t off)
+{
+    size_t last;
+    uint64_t hash;
+    int64_t commit_ms;
+    memcpy(&commit_ms, rec + 24, 8);
+    wal_seal(rec, wal_rec_size(rec), seq, off, commit_ms, &last, &hash);
+}
+
 /* One rows record of n rows (the rows at buf + WAL_HDR) numbered from fno, written at once (the relog's). */
 static int wal_write_record(int fd, uint64_t seq, uint64_t off, uint8_t *buf, size_t nrows, uint64_t fno)
 {
@@ -435,7 +447,9 @@ static int wal_write_record(int fd, uint64_t seq, uint64_t off, uint8_t *buf, si
     return write_full(fd, buf, WAL_HDR + nrows * WAL_ROW);
 }
 
-size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wal_rec *r)
+/* range: a number at or above FNO_LIMIT is not a record. The check of a writer's open passes false and judges the
+ * range itself: a record whose checks pass but whose number is out of range is damage, not a torn tail. */
+static size_t wal_record_x(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wal_rec *r, bool range)
 {
     if (avail < WAL_HDR)
         return 0;
@@ -466,7 +480,7 @@ size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wa
         return 0;
     }
     if (wal_head_check(w, hash, seq, off) != load32(p + 4) || xxh64(p + 16, 16 + body, 0) != hash || fno == 0 ||
-        fno >= (uint64_t)1 << 62)
+        (range && fno >= FNO_LIMIT))
         return 0;
     r->kind = kind;
     r->n = n;
@@ -477,6 +491,11 @@ size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wa
     r->mtype = mtype;
     r->mflags = mflags;
     return WAL_HDR + body;
+}
+
+size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wal_rec *r)
+{
+    return wal_record_x(p, avail, seq, off, r, true);
 }
 
 bool wal_valid_after(const uint8_t *p, size_t len, size_t from, uint64_t seq, uint64_t base)
@@ -503,6 +522,10 @@ void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot)
 static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
                       size_t n, uint64_t *fno0)
 {
+    if (db->fno_next >= FNO_BOUND_MAX - n) { /* never number a record past what the next open accepts */
+        eng_fail(db, "WAL numbers", EOVERFLOW);
+        return TSDB_ERR_IO;
+    }
     bool extend = db->wal_rec_open && (uint64_t)(load32(db->wal_buf + db->wal_rec_at) & 0x0fffffffu) + n < (1u << 28);
     size_t need = db->wal_len + (extend ? 0 : WAL_HDR) + n * WAL_ROW;
     if (need > db->wal_cap) {
@@ -549,6 +572,10 @@ int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void
     size_t plen = WAL_MARKER_HDR + body_len;
     pthread_mutex_lock(&db->buf_lock);
     int rc = eng_check(db);
+    if (rc == 0 && db->fno_next >= FNO_BOUND_MAX - span) {
+        eng_fail(db, "WAL numbers", EOVERFLOW);
+        rc = TSDB_ERR_IO;
+    }
     if (rc == 0 && db->wal_len + WAL_HDR + plen > db->wal_cap) {
         size_t cap = MAX(db->wal_len + WAL_HDR + plen, db->wal_cap * 2);
         cap = MAX(cap, (size_t)65536);
@@ -1178,9 +1205,16 @@ static int wal_check_segment(eng *db, seg *s)
         return rc;
     uint32_t count = eng_series_count(db);
     s->fno_first = s->fno_end = 0;
-    while (rc == 0 && (rec = wal_record(buf + pos, len - pos, s->seq, pos, &wr)) != 0) {
+    while (rc == 0 && (rec = wal_record_x(buf + pos, len - pos, s->seq, pos, &wr, false)) != 0) {
         const uint8_t *r = wr.payload;
         size_t n = wr.kind == WAL_KIND_ROWS ? wr.n : 0; /* a marker holds no rows */
+        if (wr.fno >= FNO_BOUND_MAX || wr.span >= FNO_BOUND_MAX - wr.fno) { /* numbers no writer could have given */
+            fprintf(stderr, "tsdb: WAL segment %s: the record at offset %zu has number %" PRIu64 " (span %" PRIu64
+                            "), beyond the limit of the log numbers: the log is damaged\n",
+                    s->name, pos, wr.fno, wr.span);
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
         if (wr.fno < s->fno_end) { /* numbers never go back: a valid record that does is damage, not a torn tail */
             fprintf(stderr, "tsdb: WAL segment %s: the record at offset %zu has number %" PRIu64 ", below %" PRIu64
                             ", where the one before it ends: the log is damaged\n", s->name, pos, wr.fno, s->fno_end);
@@ -1283,19 +1317,43 @@ static int wal_open_numbers(eng *db, const seg *segs, size_t nseg)
     uint64_t fno, gen;
     int slot, rc;
     bool torn;
-    if ((rc = fno_load(db, &fno, &gen, &slot, &torn)) == TSDB_ERR_NOTFOUND) {
+    rc = fno_load(db, &fno, &gen, &slot, &torn);
+    if (rc == TSDB_ERR_NOTFOUND && nseg == 0 && db->nparts == 0 && eng_series_count(db) == 0 &&
+        faccessat(db->dirfd, "MANIFEST", F_OK, AT_SYMLINK_NOFOLLOW) != 0 &&
+        faccessat(db->dirfd, "ROOT_ID", F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+        /* A volume that never held a record: an add by a release that did not make FNO (0.9.0's, on an upgraded
+         * database) left only META and ROOT_ID. Nothing here ever had a number, so the bound is 1: the one case where
+         * a missing FNO is not lost data (MANIFEST is written at the end of the first open that gets here). */
+        if ((rc = fno_create(db->dirfd, 1, db->opt.fsync)) == 0)
+            rc = fno_load(db, &fno, &gen, &slot, &torn);
+        if (rc == 0)
+            fprintf(stderr, "tsdb: FNO was missing in a volume that holds no series, part or segment: made (numbers "
+                            "start at 1)\n");
+    }
+    if (rc == TSDB_ERR_NOTFOUND) {
         fprintf(stderr, "tsdb: FNO is missing: the numbers of the log cannot be bounded, the open fails (a database "
                         "of this format has one in every volume; restore it from a backup)\n");
         return TSDB_ERR_CORRUPT;
     }
     if (rc)
         return rc;
-    if (torn)
-        fprintf(stderr, "tsdb: FNO: one slot is torn (a store the power loss cut): the other is used\n");
+    if (fno >= FNO_BOUND_MAX) {
+        fprintf(stderr, "tsdb: FNO holds %" PRIu64 ", beyond the limit of the log numbers: the file is damaged, the open "
+                        "fails (restore FNO from a backup)\n", fno);
+        return TSDB_ERR_CORRUPT;
+    }
     db->fno_slot = slot;
     db->fno_gen = gen;
     atomic_store(&db->fno_durable, fno);
     db->fno_next = MAX(next, fno);
+    if (torn) {
+        /* A tear (a store the power loss cut) and damage at rest (rot, a misdirected write) look alike, and damage
+         * may have hit the newest slot, whose segments are unlinked already: the number it held is lost, and the
+         * other slot is older by any number of stores. So the numbers jump ahead (a gap, never a repeat). */
+        db->fno_next += FNO_BELT;
+        fprintf(stderr, "tsdb: FNO: one slot is torn or damaged: the other is used and the log numbers skip ahead by "
+                        "%" PRIu64 " (the newer value may be lost)\n", (uint64_t)FNO_BELT);
+    }
     if (eng_test_mutant == MUT_FNO_REUSE) { /* planted: numbers restart from what parts hold (tests/test_fno.c) */
         db->fno_next = 1;
         for (size_t i = 0; i < db->nparts; i++)

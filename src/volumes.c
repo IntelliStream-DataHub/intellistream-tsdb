@@ -483,6 +483,18 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     int rc = read_file_all(rootfd, "META", &txt, &len);
     if (rc)
         return rc;
+    /* The volume gets the root's META and a FNO of this format: a root of another format, or one that needs a feature
+     * this release does not know, is not given a volume made by these rules (the open of the root refuses it too). */
+    {
+        char *vl = strstr(txt, "version="), *rq = strstr(txt, "requires=");
+        if ((vl ? atoi(vl + 8) : 0) != FORMAT_VERSION || (rq && rq[9] != '\n' && rq[9] != '\0')) {
+            fprintf(stderr, "tsdb: the root META says format %d%s%s: a volume is added only to a database of format "
+                            "%d without unknown requirements\n", vl ? atoi(vl + 8) : 0, rq ? ", " : "",
+                    rq ? "with requires=" : "", FORMAT_VERSION);
+            free(txt);
+            return TSDB_ERR_INVALID;
+        }
+    }
     char *buf = malloc(len + 32);
     if (!buf) {
         free(txt);
