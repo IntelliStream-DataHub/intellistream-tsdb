@@ -934,7 +934,7 @@ static void wal_unreachable_write(const char *dir)
     OK(eng_series(db, "a", TSDB_FLOAT32, &id));
     int64_t ts[2] = {INT64_MAX, 1000};
     float v[2] = {1, 2};
-    OK(mem_insert(db, NULL, id, ts, v, sizeof *v, 2)); /* past write_rows, which refuses it */
+    OK(mem_insert(db, NULL, id, ts, v, sizeof *v, 2, TSDB_FLOAT32)); /* past write_rows, which refuses it */
     _exit(failures ? 1 : 0); /* no close: the rows stay in the WAL only */
 }
 

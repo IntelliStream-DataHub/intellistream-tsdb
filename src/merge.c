@@ -125,6 +125,7 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
     for (size_t k = 0; k < best_n; k++) {
         sel[k] = db->parts[best_i + k];
         sel[k]->merging = true;
+        sel[k]->merge_len_gen = atomic_load(&db->ret_len_gen);
         part_ref(sel[k]);
     }
     return best_n;
@@ -253,6 +254,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         return rc;
     }
     w.keep_empty = true; /* replaces its sources even when nothing is left */
+    w.lf_on = false;     /* a merge keeps every live last-write-wins value: the latest table is not told (L8) */
     w.effort = CODEC_MERGE;
     w.zstd_level = db->opt.zstd_level; /* pw_begin chose the insert level */
     w.empty_ts = min_ts;
@@ -464,10 +466,18 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
 void merge_commit_locked(eng *db, part **src, size_t k, part *out, int rc)
 {
     bool dropped = false;
+    /* A limit lengthened since this merge's sources were selected (db->ret_len_gen, bumped under db->lock): the
+     * merge may have dropped rows the new limit keeps, and the latest table may name one of them. Its output is
+     * discarded like one whose source was dropped, and the sources merge again (a retention change during a merge
+     * is rare; design-latest.md 3.5 lists across it instead, which takes latest_rw here) */
+    bool lengthened = false;
     for (size_t i = 0; i < k; i++) {
         src[i]->merging = false;
         dropped |= src[i]->dropped;
+        lengthened |= src[i]->merge_len_gen != atomic_load(&db->ret_len_gen);
     }
+    if (lengthened && out && !dropped && db->lt)
+        dropped = true; /* the output goes the way of a dropped source's, the sources stay listed */
     if (!out && rc != 0 && rc != TSDB_ERR_STOPPED && !dropped) {
         /* a failed merge is no progress, whatever the reason (a full disk, EIO on the output, NOMEM): db_wait_merges
          * counts the time of its partition's merges as idle once one has failed since its wait began */
@@ -615,6 +625,7 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
                 wall - p->created < db->opt.retention_merge_s)
                 continue;
             p->merging = true;
+            p->merge_len_gen = atomic_load(&db->ret_len_gen);
             part_ref(p);
             sel[k++] = p;
         }
@@ -745,6 +756,7 @@ int eng_optimize(eng *db)
         for (size_t i = a; i < db->nparts && db->parts[i]->partition == partition && k < MAX_MERGE_PARTS; i++) {
             sel[k] = db->parts[i];
             sel[k]->merging = true;
+            sel[k]->merge_len_gen = atomic_load(&db->ret_len_gen);
             part_ref(sel[k]);
             k++;
         }

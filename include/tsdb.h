@@ -155,6 +155,11 @@ typedef struct tsdb_options {
                               * every such part at zstd_level: with others, or alone once its partition is idle
                               * (merge_idle_s; with merge_idle_s = -1 or merge_threads = 0 a part no merge
                               * combines stays as inserted). -1: zstd_level, as merges (the earlier behaviour) */
+    size_t latest_cache;     /* bytes of memory for the latest tables of the whole process (16 bytes a series, in
+                              * pages of 65,536), shared by its volumes first come, first served; default RAM / 16;
+                              * 0: no table, every tsdb_latest is answered from the parts and memtables (the same
+                              * answers, 50 to 100 times slower per series). Followers and read-only opens keep none.
+                              * A series beyond the budget is answered the same way (design-latest.md) */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);

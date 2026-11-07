@@ -541,6 +541,8 @@ static void random_run(const char *name, tsdb_options opt, bool classes, int ste
         size_t si = rnd() % w.ns;
         uint64_t r = rnd() % 100;
         int nullp = (int)(rnd() % 4) * 15; /* 0, 15, 30, 45 */
+        if (getenv("LATEST_TRACE")) /* which op ran at which step, for a failing seed */
+            fprintf(stderr, "step %d series %zu op %d nullp %d\n", w.step, si, (int)r, nullp);
         if (r < 30)
             do_insert(&w, si, false, nullp);
         else if (r < 45)

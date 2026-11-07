@@ -366,8 +366,9 @@ static int latest_at(lctx *x, uint32_t series, int64_t lo, int64_t end, bool wit
     return rc;
 }
 
-int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
-               latest_row *out)
+/* The slow path for n ids on one cut of the engine: no table, every id searched (also the table path's searches). */
+int eng_latest_search(eng *db, const uint32_t *local, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
+                      latest_row *out)
 {
     int64_t *lo = malloc((n ? n : 1) * sizeof *lo);
     if (!lo)

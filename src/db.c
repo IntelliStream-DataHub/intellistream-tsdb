@@ -45,6 +45,8 @@ void tsdb_options_init(tsdb_options *o)
     o->merge_threads = 2;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     o->query_threads = (int)MIN(MAX(ncpu, 1), 256); /* every logical CPU, SMT included */
+    long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+    o->latest_cache = pages > 0 && psz > 0 ? (size_t)pages * (size_t)psz / 16 : (size_t)1 << 30; /* RAM / 16 */
     o->buffer_rows = 1u << 20;
     o->flush_interval_ms = 5000;
     o->wal_sync_ms = 0;
@@ -150,11 +152,15 @@ void db_add_parts(eng *db, part **ps, size_t n)
 {
     if (n == 0)
         return;
+    lt_sec sec; /* the latest table folds what the parts bring in the section that lists them */
+    lt_begin(db, &sec);
+    lt_fold(db, &sec, ps, n);
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < n; i++)
         db_parts_insert_locked(db, ps[i]);
     pthread_cond_signal(&db->merge_cv);
     pthread_mutex_unlock(&db->lock);
+    lt_end(db, &sec);
     manifest_publish(db);
 }
 
@@ -724,6 +730,10 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     db->dirfd = db->lockfd = db->wal_fd = -1;
     db->series.fd = -1;
     db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0;
+    if (latest_open(db) != 0) { /* the latest table (latest.c); a writer's only */
+        free(db);
+        return TSDB_ERR_NOMEM;
+    }
     pthread_mutex_init(&db->lock, NULL);
     pthread_mutex_init(&db->cc_lock, NULL);
     pthread_mutex_init(&db->buf_lock, NULL);
@@ -800,7 +810,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         if (test_before_parts)
             test_before_parts(test_before_parts_arg);
         if ((rc = load_parts(db, ro)) != 0 || (rc = parts_check_series(db, ro)) != 0 ||
-            (rc = cls_check_parts(db)) != 0)
+            (rc = cls_check_parts(db)) != 0 || (rc = latest_build(db)) != 0)
             goto fail;
         /* a follower takes WAL rows from the writer's manifest once there is one; a writer cuts torn tails only
            after the WAL's checks too, just before the replay writes anything */
@@ -845,6 +855,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     atomic_store(&db->follow_ok_ms, eng_mono_ms());
     if (db->opt.follow && tsdb_thread_create(&db->follower, follower_main, db) == 0)
         db->has_follower = true;
+    latest_start(db);
     *out = db;
     return 0;
 fail:
@@ -873,6 +884,7 @@ void eng_halt(eng *db)
         pthread_join(db->follower, NULL);
         db->has_follower = false;
     }
+    latest_stop(db);
     pthread_mutex_lock(&db->lock);
     atomic_store(&db->stop, true);
     pthread_cond_broadcast(&db->merge_cv);
@@ -944,6 +956,7 @@ int eng_close(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     free(db->mergers);
+    latest_close(db); /* after the final flush: it folds into the table too */
     if (db->own_sched)
         sched_free(db->sched);
     wal_close(db);
@@ -1124,7 +1137,7 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
             unreachable |= ts[i] == TS_UNREACHABLE;
         if (unreachable)
             return TSDB_ERR_INVALID;
-        return mem_insert(db, series, cs, ts, v, type_width(type), n);
+        return mem_insert(db, series, cs, ts, v, type_width(type), n, type);
     }
     /* small writes to these keys wait from here until the parts are published (lw_fence) */
     lw_fence f;
@@ -1222,6 +1235,14 @@ int eng_drop_before(eng *db, int64_t ts)
         if (busy)
             pthread_cond_wait(&db->merged_cv, &db->lock);
     }
+    /* The retiring and the latest table's drop floor are one section (latest_rw > db->lock, design-latest.md 3.6),
+     * entered after the wait: no merge of these partitions is selected while drop_pending is set, so none is in
+     * flight when db->lock is taken again */
+    pthread_mutex_unlock(&db->lock);
+    lt_sec lsec;
+    lt_begin(db, &lsec);
+    pthread_mutex_lock(&db->lock);
+    bool retired = false;
     for (size_t i = 0; i < db->nparts;) {
         part *p = db->parts[i];
         int64_t lo, end;
@@ -1231,12 +1252,16 @@ int eng_drop_before(eng *db, int64_t ts)
         if (end <= ts) {
             p->dropped = true; /* an in-flight merge of it discards its result */
             db_retire_locked(db, p);
+            retired = true;
         } else {
             i++;
         }
     }
     db->drop_pending = false; /* also after a failed engine: the retire loop above is the only exit */
     pthread_mutex_unlock(&db->lock);
+    if (retired)
+        lt_drop_floor(db, ts);
+    lt_end(db, &lsec);
     if ((rc = eng_sync_dir(db, "fsync of the directory after retiring dropped parts")) != 0)
         return rc; /* failed since the flush, here or elsewhere */
     return manifest_publish(db);
