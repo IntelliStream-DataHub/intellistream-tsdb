@@ -99,7 +99,7 @@ fn a_server_older_than_12_is_refused_at_connect() {
     // a newer server is fine: the client speaks what it knows
     let (addr, h) = fake_server(13);
     let mut c = Client::connect(addr).unwrap();
-    assert_eq!(c.protocol_version().unwrap(), 13);
+    assert_eq!(c.protocol_version().unwrap(), 14);
     drop(c);
     h.join().unwrap();
 }

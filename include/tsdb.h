@@ -696,12 +696,21 @@ void tsdb_series_results_free(tsdb_series_result *r, size_t n);
  * (a concurrent insert may be seen in some of them and not in others). */
 typedef enum { TSDB_LATEST_VALUE = 0, TSDB_LATEST_NULL = 1, TSDB_LATEST_NONE = 2 } tsdb_latest_kind;
 
+/* The series' value slot: the member of its type, the rest of the eight bytes zero. */
+typedef union tsdb_latest_value {
+    float f32;
+    double f64;
+    int64_t i64;
+    uint8_t b;
+    uint32_t state;
+} tsdb_latest_value;
+
 typedef struct tsdb_latest_result {
-    int32_t status;   /* 0, or TSDB_ERR_NOTFOUND (no such series) */
+    int32_t status;   /* 0, TSDB_ERR_NOTFOUND (no such series) or TSDB_ERR_DENIED (tsdbd) */
     uint8_t kind;     /* tsdb_latest_kind (NULL only with with_nulls); NONE whenever status != 0 */
     uint8_t type;     /* the series' tsdb_type; 0 whenever status != 0 */
     int64_t ts;       /* with VALUE and NULL; 0 otherwise */
-    union { float f32; double f64; int64_t i64; uint8_t b; uint32_t state; } v; /* with VALUE; 0 otherwise */
+    tsdb_latest_value v; /* with VALUE; 0 otherwise */
 } tsdb_latest_result;
 
 typedef struct tsdb_latest_opts {

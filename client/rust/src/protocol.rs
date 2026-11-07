@@ -18,12 +18,12 @@
 //! which mechanisms the server offers; AUTH_START and AUTH_CONTINUE carry the exchange (`auth.rs`), and the
 //! user admin ops (WHOAMI to USER_LIST) follow.
 //! Version 13: the bodies of the HA statuses (`ha.rs`: UNAVAILABLE, MOVED, PARTIAL, DROPPED), TOPOLOGY and STATUS.
-//! The floor stays 12.
+//! Version 14: QUERY_LATEST (`client/latest.rs`). The floor stays 12.
 
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 /// The oldest server version this client talks to (`TSDB_PROTOCOL_MIN`): version 11 widened every series id,
 /// 12 added login; tsdbd refuses a client below 12, as this client refuses such a server.
 pub(crate) const PROTOCOL_MIN: u32 = 12;
@@ -72,6 +72,12 @@ pub(crate) const MULTI_PREFIX: usize = 4;
 pub(crate) const MULTI_END: u32 = u32::MAX;
 /// QUERY_MULTI flags (`TSDB_MULTI_PER_START` ...).
 pub(crate) const MULTI_PER_START: u8 = 1;
+/// QUERY_LATEST: the ids in one request, records in one reply frame, bytes of a record (`TSDB_LATEST_*`).
+pub(crate) const LATEST_MAX_IDS: usize = 1 << 20;
+pub(crate) const LATEST_FRAME_IDS: usize = 65536;
+pub(crate) const LATEST_REC: usize = 24;
+pub(crate) const LATEST_WITH_NULLS: u8 = 1;
+pub(crate) const LATEST_PER_END: u8 = 2;
 pub(crate) const MULTI_PER_END: u8 = 2;
 pub(crate) const MULTI_PER_INTERVAL: u8 = 4;
 pub(crate) const MULTI_TRIM_LO: u8 = 8;
@@ -117,6 +123,7 @@ pub(crate) enum Op {
     Grant = 36,
     Revoke = 37,
     UserList = 38,
+    QueryLatest = 39,
     Topology = 48,
     Status = 49,
 }

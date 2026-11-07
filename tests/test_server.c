@@ -503,8 +503,8 @@ static void *fake_server(void *arg)
             break;
         int32_t st = h[8] == TSDB_OP_HELLO ? 0 : TSDB_ERR_INVALID;
         fake_others += h[8] != TSDB_OP_HELLO;
-        uint8_t r[17];
-        uint32_t rlen = st ? 9 : 13;
+        uint8_t r[21] = {0};
+        uint32_t rlen = st ? 9 : fake_version >= 12 ? 17 : 13; /* from 12: u16 flags, u16 mechanisms follow */
         memcpy(r, &rlen, 4);
         memcpy(r + 4, &id, 4);
         r[8] = TSDB_OP_REPLY;
@@ -3351,6 +3351,294 @@ static void test_hostile(const char *dir)
         failures++;
 }
 
+/* ---- QUERY_LATEST (protocol 14) ---- */
+
+/* A QUERY_LATEST payload: header, optional ends, ids. */
+static uint8_t *latest_payload(uint8_t flags, uint8_t pad, uint32_t n, int64_t end, const int64_t *ends,
+                               const uint64_t *ids, size_t idn, size_t *len)
+{
+    size_t ne = (flags & TSDB_LATEST_PER_END) && ends ? idn : 0;
+    uint8_t *p = calloc(1, TSDB_LATEST_HEADER + (ne + idn) * 8);
+    p[0] = flags;
+    p[1] = pad;
+    memcpy(p + 4, &n, 4);
+    memcpy(p + 8, &end, 8);
+    if (ne)
+        memcpy(p + TSDB_LATEST_HEADER, ends, ne * 8);
+    memcpy(p + TSDB_LATEST_HEADER + ne * 8, ids, idn * 8);
+    *len = TSDB_LATEST_HEADER + (ne + idn) * 8;
+    return p;
+}
+
+typedef struct latest_frame_in {
+    int32_t st;
+    uint32_t first, m;
+    uint8_t last;
+    uint8_t *rec; /* m records, malloc'd */
+} latest_frame_in;
+
+/* Reads one reply frame of a QUERY_LATEST; false at the end of the stream. */
+static bool latest_read(int fd, uint32_t want_id, latest_frame_in *f)
+{
+    size_t cap = TSDB_LATEST_PREFIX + (size_t)TSDB_LATEST_FRAME_IDS * TSDB_LATEST_REC + 64;
+    uint8_t *buf = malloc(cap);
+    uint32_t rid = 0;
+    size_t n = 0;
+    f->st = raw_reply(fd, &rid, buf, cap, &n);
+    bool ok = f->st != INT32_MIN && rid == want_id && n >= TSDB_LATEST_PREFIX;
+    CHECK(f->st == INT32_MIN || (rid == want_id && n >= TSDB_LATEST_PREFIX));
+    f->first = f->m = 0;
+    f->last = 1;
+    f->rec = NULL;
+    if (ok) {
+        memcpy(&f->first, buf, 4);
+        memcpy(&f->m, buf + 4, 4);
+        f->last = buf[8];
+        CHECK(buf[9] == 0 && buf[10] == 0 && buf[11] == 0);
+        CHECK(n == TSDB_LATEST_PREFIX + (size_t)f->m * TSDB_LATEST_REC);
+        f->rec = malloc((size_t)f->m * TSDB_LATEST_REC + 1);
+        memcpy(f->rec, buf + TSDB_LATEST_PREFIX, (size_t)f->m * TSDB_LATEST_REC);
+    }
+    free(buf);
+    return ok;
+}
+
+/* A bad request: one frame with INVALID, m = 0, last = 1, and the connection still answers. */
+static void latest_expect_invalid(const uint8_t *p, size_t len)
+{
+    int fd = raw_connect();
+    raw_send(fd, 31, TSDB_OP_QUERY_LATEST, p, (uint32_t)len);
+    latest_frame_in f;
+    CHECK(latest_read(fd, 31, &f) && f.st == TSDB_ERR_INVALID && f.m == 0 && f.last == 1);
+    free(f.rec);
+    raw_send(fd, 32, TSDB_OP_STATS, NULL, 0);
+    uint32_t rid;
+    uint8_t rest[512];
+    size_t nrest;
+    CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 32);
+    close(fd);
+}
+
+static void test_latest_remote(tsdbc *c)
+{
+    tsdb_sid f32, f64, i64, bl, stt, none;
+    OK(tsdbc_series_create(c, "lt.f32", TSDB_FLOAT32, NULL, &f32));
+    OK(tsdbc_series_create(c, "lt.f64", TSDB_FLOAT64, NULL, &f64));
+    OK(tsdbc_series_create(c, "lt.i64", TSDB_INT64, NULL, &i64));
+    OK(tsdbc_series_create(c, "lt.bool", TSDB_BOOL, NULL, &bl));
+    OK(tsdbc_series_create(c, "lt.state", TSDB_STATE, NULL, &stt));
+    OK(tsdbc_series_create(c, "lt.none", TSDB_FLOAT32, NULL, &none));
+    const int64_t ts[4] = {T0, T0 + 1000, T0 + 2000, T0 + 3000};
+    float fv[4] = {1.5f, 2.5f, 3.5f, -0.25f};
+    double dv[4] = {1e300, -2.0, 3.0, 4.75};
+    int64_t iv[4] = {-5, -9, 7, 123};
+    uint8_t bv[4] = {1, 0, 1, 1};
+    uint32_t code_on, code_off;
+    OK(tsdbc_state(c, stt, "on", &code_on));
+    OK(tsdbc_state(c, stt, "off", &code_off));
+    uint32_t sv[4] = {code_on, code_off, code_on, code_off};
+    OK(tsdbc_insert_series(c, f32, ts, fv, 4));
+    tsdb_values col = {TSDB_FLOAT64, dv, NULL};
+    OK(tsdbc_insert_series_values(c, f64, ts, &col, 4));
+    uint8_t vmask[1] = {0x07}; /* the newest row of the int64 series is a null */
+    col = (tsdb_values){TSDB_INT64, iv, vmask};
+    OK(tsdbc_insert_series_values(c, i64, ts, &col, 4));
+    col = (tsdb_values){TSDB_BOOL, bv, NULL};
+    OK(tsdbc_insert_series_values(c, bl, ts, &col, 4));
+    col = (tsdb_values){TSDB_STATE, sv, NULL};
+    OK(tsdbc_insert_series_values(c, stt, ts, &col, 4));
+    const tsdb_sid unknown = TSDB_SID(0, 0xffffff00u), malformed = f32 | 1ull << 48;
+
+    tsdb_sid ids[8] = {f32, f64, i64, bl, stt, none, unknown, malformed};
+    tsdb_latest_result r[8], ref[8];
+    OK(tsdbc_latest(c, ids, 8, NULL, r));
+    memcpy(ref, r, sizeof r);
+    CHECK(r[0].status == 0 && r[0].kind == TSDB_LATEST_VALUE && r[0].type == TSDB_FLOAT32 && r[0].ts == ts[3] &&
+          r[0].v.f32 == -0.25f);
+    CHECK(r[1].kind == TSDB_LATEST_VALUE && r[1].type == TSDB_FLOAT64 && r[1].ts == ts[3] && r[1].v.f64 == 4.75);
+    CHECK(r[2].kind == TSDB_LATEST_VALUE && r[2].type == TSDB_INT64 && r[2].ts == ts[2] && r[2].v.i64 == 7);
+    CHECK(r[3].kind == TSDB_LATEST_VALUE && r[3].type == TSDB_BOOL && r[3].ts == ts[3] && r[3].v.b == 1);
+    CHECK(r[4].kind == TSDB_LATEST_VALUE && r[4].type == TSDB_STATE && r[4].ts == ts[3] && r[4].v.state == code_off);
+    CHECK(r[5].status == 0 && r[5].kind == TSDB_LATEST_NONE && r[5].ts == 0);
+    for (int i = 6; i < 8; i++) /* ids that name no series: NOTFOUND, kind NONE, type 0, ts 0, value 0 */
+        CHECK(r[i].status == TSDB_ERR_NOTFOUND && r[i].kind == TSDB_LATEST_NONE && r[i].type == 0 && r[i].ts == 0 &&
+              r[i].v.i64 == 0);
+
+    /* WITH_NULLS: the newest row, a null included; an end bound (rows before it) */
+    tsdb_latest_opts wn = {.end = INT64_MAX, .with_nulls = 1};
+    OK(tsdbc_latest(c, ids, 8, &wn, r));
+    CHECK(r[2].kind == TSDB_LATEST_NULL && r[2].ts == ts[3] && r[2].type == TSDB_INT64 && r[2].v.i64 == 0);
+    CHECK(r[0].kind == TSDB_LATEST_VALUE && r[0].ts == ts[3]);
+    tsdb_latest_opts bound = {.end = ts[2]}; /* before ts[2]: the rows at ts[0], ts[1] */
+    OK(tsdbc_latest(c, ids, 6, &bound, r));
+    CHECK(r[0].ts == ts[1] && r[0].v.f32 == 2.5f && r[1].v.f64 == -2.0 && r[3].v.b == 0);
+    CHECK(r[2].kind == TSDB_LATEST_VALUE && r[2].ts == ts[1] && r[2].v.i64 == -9);
+    int64_t ends[6] = {ts[1], ts[2], ts[3], ts[0], INT64_MIN, INT64_MAX};
+    tsdb_latest_opts per = {.ends = ends};
+    OK(tsdbc_latest(c, ids, 6, &per, r));
+    CHECK(r[0].ts == ts[0] && r[1].ts == ts[1] && r[2].ts == ts[2] && r[3].kind == TSDB_LATEST_NONE &&
+          r[4].kind == TSDB_LATEST_NONE && r[5].kind == TSDB_LATEST_NONE);
+
+    /* by name: found, unknown and empty names */
+    const char *names[4] = {"lt.f64", "lt.nope", "lt.state", ""};
+    OK(tsdbc_latest_by_name(c, names, 4, NULL, r));
+    CHECK(r[0].kind == TSDB_LATEST_VALUE && r[0].v.f64 == 4.75 && r[1].status == TSDB_ERR_NOTFOUND &&
+          r[1].kind == TSDB_LATEST_NONE && r[2].v.state == code_off && r[3].status == TSDB_ERR_INVALID);
+    OK(tsdbc_latest_by_name(c, names, 3, NULL, r)); /* the second time the ids come from the client's cache */
+    CHECK(r[0].v.f64 == 4.75 && r[1].status == TSDB_ERR_NOTFOUND);
+    CHECK(tsdbc_latest(c, ids, 0, NULL, r) == 0);
+    CHECK(tsdbc_latest(c, ids, TSDB_LATEST_MAX_IDS + 1, NULL, r) == TSDB_ERR_INVALID);
+
+    /* more ids than one frame holds: three frames, the records in index order */
+    enum { BIG = 2 * TSDB_LATEST_FRAME_IDS + 1000 };
+    tsdb_sid *many = malloc(BIG * sizeof *many);
+    tsdb_latest_result *big = malloc(BIG * sizeof *big);
+    for (size_t i = 0; i < BIG; i++)
+        many[i] = ids[i % 8];
+    OK(tsdbc_latest(c, many, BIG, NULL, big));
+    bool order = true;
+    for (size_t i = 0; i < BIG; i++)
+        order &= big[i].status == ref[i % 8].status && big[i].kind == ref[i % 8].kind &&
+                 big[i].ts == ref[i % 8].ts && big[i].v.i64 == ref[i % 8].v.i64;
+    CHECK(order);
+    {
+        /* raw: the frames' own shape */
+        int fd = raw_connect();
+        size_t len;
+        uint8_t *p = latest_payload(0, 0, BIG, INT64_MAX, NULL, many, BIG, &len);
+        raw_send(fd, 40, TSDB_OP_QUERY_LATEST, p, (uint32_t)len);
+        free(p);
+        uint32_t next = 0;
+        int frames = 0;
+        latest_frame_in f;
+        do {
+            CHECK(latest_read(fd, 40, &f));
+            CHECK(f.st == 0 && f.first == next && (f.last ? next + f.m == BIG : f.m == TSDB_LATEST_FRAME_IDS));
+            if (f.rec && f.m > 8) { /* the first record: f32's newest value */
+                int32_t rs;
+                memcpy(&rs, f.rec, 4);
+                CHECK(rs == 0 && f.rec[4] == TSDB_LATEST_VALUE && f.rec[5] == TSDB_FLOAT32);
+            }
+            next += f.m;
+            frames++;
+            free(f.rec);
+        } while (!f.last && frames < 10);
+        CHECK(frames == 3 && next == BIG);
+        close(fd);
+    }
+    free(many);
+    free(big);
+
+    /* a malformed request: one INVALID frame, m = 0, last = 1; the connection lives on */
+    {
+        uint64_t one[2] = {f32, f64};
+        size_t len;
+        uint8_t *p;
+        p = latest_payload(0, 0, 0, INT64_MAX, NULL, one, 0, &len); /* n = 0 */
+        latest_expect_invalid(p, len);
+        free(p);
+        p = latest_payload(0, 0, TSDB_LATEST_MAX_IDS + 1, INT64_MAX, NULL, one, 2, &len); /* n too large */
+        latest_expect_invalid(p, len);
+        free(p);
+        p = latest_payload(4, 0, 2, INT64_MAX, NULL, one, 2, &len); /* a reserved flag bit */
+        latest_expect_invalid(p, len);
+        free(p);
+        p = latest_payload(0, 1, 2, INT64_MAX, NULL, one, 2, &len); /* a nonzero pad byte */
+        latest_expect_invalid(p, len);
+        free(p);
+        int64_t e2[2] = {1, 2};
+        p = latest_payload(TSDB_LATEST_PER_END, 0, 2, 5, e2, one, 2, &len); /* PER_END with end != 0 */
+        latest_expect_invalid(p, len);
+        free(p);
+        p = latest_payload(0, 0, 3, INT64_MAX, NULL, one, 2, &len); /* n says 3, two ids follow */
+        latest_expect_invalid(p, len);
+        free(p);
+        p = latest_payload(0, 0, 2, INT64_MAX, NULL, one, 2, &len);
+        latest_expect_invalid(p, len - 1); /* one byte short */
+        latest_expect_invalid(p, 7);       /* shorter than the header */
+        free(p);
+        p = latest_payload(TSDB_LATEST_PER_END, 0, 2, 0, NULL, one, 2, &len); /* PER_END without ends[] */
+        latest_expect_invalid(p, len);
+        free(p);
+    }
+
+    /* CANCEL ends the reply after the chunk in flight (STOPPED) or lets it finish; the connection stays usable */
+    {
+        enum { HUGE_N = TSDB_LATEST_MAX_IDS };
+        uint64_t *hi = malloc((size_t)HUGE_N * 8);
+        for (size_t i = 0; i < HUGE_N; i++)
+            hi[i] = ids[i & 7];
+        size_t len;
+        uint8_t *p = latest_payload(TSDB_LATEST_WITH_NULLS, 0, HUGE_N, INT64_MAX, NULL, hi, HUGE_N, &len);
+        int fd = raw_connect();
+        raw_send(fd, 50, TSDB_OP_QUERY_LATEST, p, (uint32_t)len);
+        uint32_t cid = 50;
+        raw_send(fd, 50, TSDB_OP_CANCEL, &cid, 4);
+        latest_frame_in f;
+        int frames = 0;
+        bool ended = false;
+        while (frames < 32 && !ended && latest_read(fd, 50, &f)) {
+            ended = f.last == 1;
+            CHECK(f.st == 0 || f.st == TSDB_ERR_STOPPED);
+            if (f.st)
+                CHECK(f.m == 0);
+            free(f.rec);
+            frames++;
+        }
+        CHECK(ended);
+        raw_send(fd, 52, TSDB_OP_STATS, NULL, 0);
+        uint32_t rid;
+        uint8_t rest[512];
+        size_t nrest;
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 52);
+        close(fd);
+        free(p);
+        free(hi);
+    }
+
+    /* version rules: a client at the floor (12) is still welcome (it hears 12 back, as every older client does) */
+    {
+        int fd = raw_connect();
+        uint32_t v12 = 12, rid, got = 0;
+        uint8_t rest[64];
+        size_t nrest;
+        raw_send(fd, 60, TSDB_OP_HELLO, &v12, 4);
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 60);
+        memcpy(&got, rest, 4);
+        CHECK(got == 12 && TSDB_PROTOCOL_VERSION >= 14 && TSDB_PROTOCOL_MIN == 12); /* an older client hears its own */
+        close(fd);
+    }
+}
+
+/* A server of protocol 13 (the floor is 12, so a client connects): tsdbc_latest and tsdbc_latest_by_name fail with
+ * INVALID and send nothing but the HELLO. */
+static void test_latest_old_server(void)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    socklen_t sl = sizeof sa;
+    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 1) == 0 &&
+          getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0);
+    fake_version = 13;
+    fake_others = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, fake_server, &lfd) == 0);
+    tsdbc *c = NULL;
+    CHECK(tsdbc_connect("127.0.0.1", ntohs(sa.sin_port), &c) == 0 && c);
+    if (c) {
+        tsdb_sid id = TSDB_SID(0, 0);
+        tsdb_latest_result r;
+        const char *name = "x";
+        CHECK(tsdbc_latest(c, &id, 1, NULL, &r) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_latest_by_name(c, &name, 1, NULL, &r) == TSDB_ERR_INVALID);
+        tsdbc_close(c);
+    }
+    pthread_join(th, NULL);
+    close(lfd);
+    CHECK(fake_others == 0);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN); /* a check failing on a connection the server closed must not end the run */
@@ -3527,6 +3815,8 @@ int main(int argc, char **argv)
     test_wide_local_ranges(c);
     test_delete(c);
     test_frame_cap(c);
+    test_latest_remote(c);
+    test_latest_old_server();
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);

@@ -81,6 +81,7 @@ mod embedded;
 mod error;
 mod ha;
 mod keepalive;
+mod latest;
 mod pack;
 mod protocol;
 mod types;
@@ -101,6 +102,7 @@ pub use ha::{
     DEFAULT_RETRY_BUDGET, ErrorInfo, MOVED_HANDOFF, Moved, PartialVol, TopoNode, TopoVol, Topology, Unavailable, VOL_ANY,
 };
 pub use keepalive::KeepAlive;
+pub use latest::{Latest, LatestKind, LatestOpts, LatestValue};
 pub use protocol::{DEFAULT_PORT, PROTOCOL_VERSION};
 pub use types::{
     Bucket, Buckets, Group, MultiOpts, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket,

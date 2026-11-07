@@ -80,6 +80,13 @@ struct tsdbc {
     size_t nnodes, node_at;
     char *user, *password, *password_file;
     int connect_ms, require_auth;
+    /* tsdbc_latest_by_name: names already resolved to ids (an id never changes meaning, so it is never stale) */
+    struct name_ent {
+        char *name;
+        uint64_t h;
+        tsdb_sid id;
+    } *nc;
+    size_t nc_cap, nc_n;
 };
 
 #define QCAP_FRAMES 1024u            /* pipelined inserts kept for a resend: drain before there are more */
@@ -277,6 +284,9 @@ void tsdbc_close(tsdbc *c)
         free(c->password);
     }
     free(c->password_file);
+    for (size_t i = 0; i < c->nc_cap; i++)
+        free(c->nc[i].name);
+    free(c->nc);
     free(c->rbuf);
     free(c->frame);
     ZSTD_freeCCtx(c->zc);
@@ -3176,4 +3186,213 @@ int tsdbc_status(tsdbc *c, char **text)
         return TSDB_ERR_CORRUPT;
     *text = strndup((const char *)b + 4, n - 4);
     return *text ? 0 : TSDB_ERR_NOMEM;
+}
+
+/* ------------------------------------------------------- the newest value of many series (protocol 14) */
+
+/* One QUERY_LATEST for ids[0 .. n-1] (n in 1 .. TSDB_LATEST_MAX_IDS), ends per id or NULL. The reply comes in frames
+ * of up to 65,536 records in index order; records decode into out[]. A read-only request, so an UNAVAILABLE or MOVED
+ * before the first frame is retried by read_reply; once a frame has been delivered it cannot be. */
+static int latest_send(tsdbc *c, const tsdb_sid *ids, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
+                       int threads, tsdb_latest_result *out)
+{
+    uint8_t h[TSDB_LATEST_HEADER] = {(uint8_t)((with_nulls ? TSDB_LATEST_WITH_NULLS : 0) |
+                                               (ends ? TSDB_LATEST_PER_END : 0))};
+    uint16_t th = threads < 0 ? 0 : threads > 0xffff ? 0xffff : (uint16_t)threads;
+    uint32_t n32 = (uint32_t)n;
+    int64_t e = ends ? 0 : end;
+    memcpy(h + 2, &th, 2);
+    memcpy(h + 4, &n32, 4);
+    memcpy(h + 8, &e, 8);
+    struct iovec parts[4];
+    int np = 1;
+    parts[np++] = (struct iovec){h, sizeof h};
+    if (ends)
+        parts[np++] = (struct iovec){(void *)ends, n * 8};
+    parts[np++] = (struct iovec){(void *)ids, n * 8};
+    int rc = send_reqv(c, TSDB_OP_QUERY_LATEST, parts, np);
+    if (rc)
+        return rc;
+    size_t next = 0;
+    for (;;) {
+        int32_t st;
+        const uint8_t *b;
+        size_t len;
+        if ((rc = read_reply(c, &st, &b, &len)) != 0)
+            return rc;
+        if (len < TSDB_LATEST_PREFIX)
+            goto corrupt;
+        uint32_t first, m;
+        memcpy(&first, b, 4);
+        memcpy(&m, b + 4, 4);
+        uint8_t last = b[8];
+        if (b[9] || b[10] || b[11] || last > 1)
+            goto corrupt;
+        if (st) /* the request's own status: an empty frame (then, for the HA statuses, their body) */
+            return m || !last ? (c->broken = true, TSDB_ERR_CORRUPT) : st;
+        if (first != next || m > TSDB_LATEST_FRAME_IDS || m > n - next ||
+            len != TSDB_LATEST_PREFIX + (size_t)m * TSDB_LATEST_REC || (last ? next + m != n : m == 0))
+            goto corrupt;
+        for (uint32_t i = 0; i < m; i++) {
+            const uint8_t *r = b + TSDB_LATEST_PREFIX + (size_t)i * TSDB_LATEST_REC;
+            tsdb_latest_result *o = &out[next + i];
+            int32_t rs;
+            int64_t ts;
+            uint64_t v;
+            memcpy(&rs, r, 4);
+            memcpy(&ts, r + 8, 8);
+            memcpy(&v, r + 16, 8);
+            uint8_t kind = r[4], type = r[5];
+            if (kind > TSDB_LATEST_NONE || type > TSDB_STATE || r[6] || r[7] ||
+                (rs && (kind != TSDB_LATEST_NONE || type || ts || v)) || (kind != TSDB_LATEST_VALUE && v) ||
+                (kind == TSDB_LATEST_NONE && ts) || (kind == TSDB_LATEST_NULL && !with_nulls))
+                goto corrupt;
+            *o = (tsdb_latest_result){.status = rs, .kind = kind, .type = type, .ts = ts};
+            _Static_assert(sizeof o->v == 8, "the value union is the wire slot");
+            memcpy(&o->v, &v, 8); /* little endian: float32, bool and state sit in the low bytes */
+        }
+        next += m;
+        if (last)
+            return 0;
+        stream_more(c);
+    }
+corrupt:
+    c->broken = true;
+    return TSDB_ERR_CORRUPT;
+}
+
+int tsdbc_latest(tsdbc *c, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *opts, tsdb_latest_result *out)
+{
+    int rc = tsdbc_wait(c);
+    if (rc)
+        return rc;
+    if (n > TSDB_LATEST_MAX_IDS || (n && (!ids || !out)))
+        return TSDB_ERR_INVALID;
+    if (n == 0)
+        return 0;
+    if (server_version(c) < 14) /* an older server does not know the op: nothing is sent */
+        return c->broken ? TSDB_ERR_IO : TSDB_ERR_INVALID;
+    return latest_send(c, ids, n, opts ? opts->ends : NULL, opts ? opts->end : INT64_MAX,
+                       opts && opts->with_nulls, opts ? opts->threads : 0, out);
+}
+
+static uint64_t name_hash(const char *s) /* FNV-1a */
+{
+    uint64_t h = 1469598103934665603ull;
+    for (; *s; s++)
+        h = (h ^ (uint8_t)*s) * 1099511628211ull;
+    return h | 1; /* 0 marks a free slot */
+}
+
+static struct name_ent *name_find(tsdbc *c, const char *name, uint64_t h)
+{
+    if (!c->nc_cap)
+        return NULL;
+    for (size_t i = h & (c->nc_cap - 1);; i = (i + 1) & (c->nc_cap - 1)) {
+        struct name_ent *e = &c->nc[i];
+        if (!e->h)
+            return NULL;
+        if (e->h == h && strcmp(e->name, name) == 0)
+            return e;
+    }
+}
+
+#define NAME_CACHE_MAX ((size_t)1 << 20) /* ids kept per connection */
+
+static void name_put(tsdbc *c, const char *name, uint64_t h, tsdb_sid id)
+{
+    if (c->nc_n >= NAME_CACHE_MAX)
+        return; /* a full cache stays as it is: later misses are asked again */
+    if ((c->nc_n + 1) * 2 > c->nc_cap) {
+        size_t cap = c->nc_cap ? c->nc_cap * 2 : 1024;
+        struct name_ent *nc = calloc(cap, sizeof *nc);
+        if (!nc)
+            return;
+        for (size_t i = 0; i < c->nc_cap; i++)
+            if (c->nc[i].h) {
+                size_t j = c->nc[i].h & (cap - 1);
+                while (nc[j].h)
+                    j = (j + 1) & (cap - 1);
+                nc[j] = c->nc[i];
+            }
+        free(c->nc);
+        c->nc = nc;
+        c->nc_cap = cap;
+    }
+    char *copy = strdup(name);
+    if (!copy)
+        return;
+    size_t j = h & (c->nc_cap - 1);
+    while (c->nc[j].h)
+        j = (j + 1) & (c->nc_cap - 1);
+    c->nc[j] = (struct name_ent){copy, h, id};
+    c->nc_n++;
+}
+
+int tsdbc_latest_by_name(tsdbc *c, const char *const *names, size_t n, const tsdb_latest_opts *opts,
+                         tsdb_latest_result *out)
+{
+    int rc = tsdbc_wait(c);
+    if (rc)
+        return rc;
+    if (n > TSDB_LATEST_MAX_IDS || (n && (!names || !out)))
+        return TSDB_ERR_INVALID;
+    if (n == 0)
+        return 0;
+    if (server_version(c) < 14)
+        return c->broken ? TSDB_ERR_IO : TSDB_ERR_INVALID;
+    tsdb_sid *ids = malloc(n * sizeof *ids);
+    size_t *at = malloc(n * sizeof *at); /* request slot -> index in names */
+    int64_t *ends = opts && opts->ends ? malloc(n * sizeof *ends) : NULL;
+    if (!ids || !at || (opts && opts->ends && !ends)) {
+        free(ids);
+        free(at);
+        free(ends);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t k = 0;
+    for (size_t i = 0; rc == 0 && i < n; i++) {
+        if (!names[i] || !*names[i]) {
+            out[i] = (tsdb_latest_result){.status = TSDB_ERR_INVALID, .kind = TSDB_LATEST_NONE};
+            continue;
+        }
+        uint64_t h = name_hash(names[i]);
+        struct name_ent *e = name_find(c, names[i], h);
+        tsdb_sid id;
+        if (e) {
+            id = e->id;
+        } else {
+            int st = tsdbc_series(c, names[i], 0, &id);
+            if (st == TSDB_ERR_NOTFOUND || st == TSDB_ERR_DENIED) {
+                out[i] = (tsdb_latest_result){.status = st, .kind = TSDB_LATEST_NONE};
+                continue;
+            }
+            if (st) {
+                rc = st;
+                break;
+            }
+            name_put(c, names[i], h, id);
+        }
+        ids[k] = id;
+        at[k] = i;
+        if (ends)
+            ends[k] = opts->ends[i];
+        k++;
+    }
+    if (rc == 0 && k) {
+        tsdb_latest_result *r = malloc(k * sizeof *r);
+        if (!r) {
+            rc = TSDB_ERR_NOMEM;
+        } else {
+            rc = latest_send(c, ids, k, ends, opts ? opts->end : INT64_MAX, opts && opts->with_nulls,
+                             opts ? opts->threads : 0, r);
+            for (size_t j = 0; rc == 0 && j < k; j++)
+                out[at[j]] = r[j];
+            free(r);
+        }
+    }
+    free(ids);
+    free(at);
+    free(ends);
+    return rc;
 }

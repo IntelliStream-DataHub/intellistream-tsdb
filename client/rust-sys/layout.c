@@ -53,6 +53,13 @@ static const size_t layout[] = {
     S(tsdb_multi_opts), O(tsdb_multi_opts, threads), O(tsdb_multi_opts, max_rows), O(tsdb_multi_opts, max_held_bytes),
     O(tsdb_multi_opts, cancelled), O(tsdb_multi_opts, on_wait), O(tsdb_multi_opts, budget_take),
     O(tsdb_multi_opts, budget_give), O(tsdb_multi_opts, on_deferred), O(tsdb_multi_opts, hook_ctx),
+    S(tsdb_latest_result), O(tsdb_latest_result, status), O(tsdb_latest_result, kind), O(tsdb_latest_result, type),
+    O(tsdb_latest_result, ts), O(tsdb_latest_result, v),
+    S(tsdb_latest_opts), O(tsdb_latest_opts, end), O(tsdb_latest_opts, ends), O(tsdb_latest_opts, with_nulls),
+    O(tsdb_latest_opts, threads),
+    S(tsdb_latest_stats), O(tsdb_latest_stats, table), O(tsdb_latest_stats, searched), O(tsdb_latest_stats, floor_reads),
+    O(tsdb_latest_stats, fills_stored), O(tsdb_latest_stats, fills_refused), O(tsdb_latest_stats, unknown),
+    O(tsdb_latest_stats, table_bytes), O(tsdb_latest_stats, capped), O(tsdb_latest_stats, enabled),
     S(tsdb_type), S(tsdb_order), S(tsdb_unit), S(tsdb_twa_method),
 };
 

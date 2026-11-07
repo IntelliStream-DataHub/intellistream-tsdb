@@ -37,6 +37,7 @@ use crate::types::{
 };
 use crate::value::{Bitmap, Column, ColumnRef, Native, Value, ValueType};
 
+mod latest;
 mod multi;
 
 /// Rows per INSERT frame: 8M rows of the many-series layout make 128 MiB,
@@ -135,6 +136,8 @@ pub struct Client {
     node_at: usize,
     /// The login, for the reconnects.
     opts: ConnectOptions,
+    /// Names `latest_by_name` has resolved: an id never changes meaning, so an entry is never stale.
+    names: std::collections::HashMap<String, SeriesId>,
 }
 
 /// A request kept for a resend.
@@ -472,6 +475,7 @@ impl Client {
             nodes: Vec::new(),
             node_at: 0,
             opts: ConnectOptions::default(),
+            names: std::collections::HashMap::new(),
         })
     }
 

@@ -688,6 +688,63 @@ unsafe extern "C" {
     pub fn tsdb_series_results_free(r: *mut tsdb_series_result, n: usize);
 }
 
+/// One answer of `tsdb_latest` (the union `v` as its 8 bytes: float32, bool and state in the low bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct tsdb_latest_result {
+    /// 0, `TSDB_ERR_NOTFOUND`.
+    pub status: i32,
+    /// 0 value, 1 null (only with `with_nulls`), 2 none.
+    pub kind: u8,
+    pub type_: u8,
+    pub ts: i64,
+    pub v: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct tsdb_latest_opts {
+    /// Only rows before it; `i64::MAX`: no bound.
+    pub end: i64,
+    /// Per series instead of `end`, or null.
+    pub ends: *const i64,
+    pub with_nulls: c_int,
+    /// 0: tsdb_options.request_threads.
+    pub threads: c_int,
+}
+
+impl Default for tsdb_latest_opts {
+    fn default() -> Self {
+        tsdb_latest_opts { end: i64::MAX, ends: core::ptr::null(), with_nulls: 0, threads: 0 }
+    }
+}
+
+/// One volume's latest table, for monitoring.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct tsdb_latest_stats {
+    pub table: u64,
+    pub searched: u64,
+    pub floor_reads: u64,
+    pub fills_stored: u64,
+    pub fills_refused: u64,
+    pub unknown: u64,
+    pub table_bytes: u64,
+    pub capped: i32,
+    pub enabled: i32,
+}
+
+unsafe extern "C" {
+    pub fn tsdb_latest(
+        db: *mut tsdb,
+        ids: *const tsdb_sid,
+        n: usize,
+        opts: *const tsdb_latest_opts,
+        out: *mut tsdb_latest_result,
+    ) -> c_int;
+    pub fn tsdb_get_latest_stats(db: *mut tsdb, volume: u32, st: *mut tsdb_latest_stats) -> c_int;
+}
+
 /// For tests/layout.rs: sizes and field offsets as the C compiler sees them (layout.c).
 #[doc(hidden)]
 pub mod layout {
