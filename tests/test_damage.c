@@ -2297,7 +2297,12 @@ static void test_wait_merges_damaged(const char *scratch)
         o.verify_checksums = verify; /* the merge checks granule hashes in either case */
         tsdb *db;
         OK(tsdb_open(dir, &o, &db));
+        /* every part is damaged, but each merge marks only the one it met: until all are marked a pair is left
+         * to merge, so the wait ends by the stall rule (merges that fail count as no progress) */
+        int was = atomic_load(&wait_stall_ms);
+        atomic_store(&wait_stall_ms, 3000);
         mw_insert_returns(db, id, 30, verify ? "verify_checksums on" : "verify_checksums off");
+        atomic_store(&wait_stall_ms, was);
         tsdb_stats st = {0};
         for (int i = 0; i < 50 && st.broken_parts == 0; i++) { /* the merge thread marks it on its first try */
             usleep(100000);
@@ -2389,6 +2394,272 @@ static void test_wait_merges_failing(const char *scratch)
     atomic_store(&wait_stall_ms, was);
     tsdb_close(db);
     printf("  an insert stops waiting for merges that keep failing, near wait_stall_ms\n");
+    rm_rf(dir);
+}
+
+/* merge-barrier. A damaged part used to take its whole partition out of merges, so the part count grew without
+ * limit until the part was restored. Merges combine adjacent block ranges only, so the ranges below and above a
+ * damaged part can still be merged, each alone: the damaged part's tombstones keep hiding the lower blocks (the
+ * lower range gets a block number below it), and the tombstones of the upper range keep hiding its rows (the output
+ * keeps the union of its sources' tombstones, as a listed older part, the damaged one, exists). A merge across the
+ * barrier is never made: it would put a lower block's rows into an output newer than the damaged part's tombstones.
+ *
+ * The partition, in block order (1 s apart; t(i) = MB_T0 + i s, values are small integers so that sums are exact
+ * in every layout; 9 parts): L1 rows [0,150) = 1   L2 rows [100,400) = 2   L3 delete [200,230)   a replace of
+ * [300,600): its tombstone, and D = its rows [580,600) = 4 (the part damaged below: a flipped byte in its payload)
+ * U1 rows [250,350) = 5   U2 delete [320,330) (the tombstone that must go on hiding L2's rows [320,330) after
+ * the merges: it is above the barrier, they are below)   U3 rows [0,50) = 9   U4 rows [380,470) = 6.
+ * Queries cover [0,580): D's rows [580,600) are out of range and never decoded. */
+#define MB_T0 MW_T0
+#define MB_T(i) (MB_T0 + (int64_t)(i) * 1000)
+#define MB_END MB_T(580)
+
+static void mb_rows(tsdb *db, tsdb_sid id, int a, int b, float val)
+{
+    int64_t ts[300];
+    float v[300];
+    int n = b - a;
+    CHECK(n <= 300);
+    for (int i = 0; i < n; i++)
+        ts[i] = MB_T(a + i), v[i] = val;
+    OK(tsdb_insert_series(db, id, ts, v, (size_t)n));
+}
+
+static void mb_build(const char *dir, tsdb_sid *id)
+{
+    rm_rf(dir);
+    tsdb_options o = opts();
+    o.wal_max_batch_rows = 10; /* the inserts go straight to parts: one each (every one has more than 10 rows) */
+    o.partition_classes = 0;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "mb.series", id));
+    mb_rows(db, *id, 0, 150, 1);
+    mb_rows(db, *id, 100, 400, 2);
+    OK(tsdb_delete_range(db, *id, MB_T(200), MB_T(230)));
+    float v4[20];
+    int64_t ts4[20]; /* the replace: the tombstone part first, then the rows */
+    for (int i = 0; i < 20; i++)
+        ts4[i] = MB_T(580 + i), v4[i] = 4;
+    tsdb_values col = {.type = TSDB_FLOAT32, .values = v4, .valid = NULL};
+    OK(tsdb_replace_range(db, *id, MB_T(300), MB_T(600), ts4, &col, 20));
+    mb_rows(db, *id, 250, 350, 5);
+    OK(tsdb_delete_range(db, *id, MB_T(320), MB_T(330)));
+    mb_rows(db, *id, 0, 50, 9);
+    mb_rows(db, *id, 380, 470, 6);
+    OK(tsdb_close(db));
+}
+
+struct mb_names {
+    char name[16][96];
+    int64_t rows[16];
+    int n;
+};
+
+static void mb_collect(void *ctx, const tsdb_part_info *info)
+{
+    struct mb_names *c = ctx;
+    if (c->n < 16) {
+        snprintf(c->name[c->n], sizeof c->name[0], "%s", info->name);
+        c->rows[c->n] = (int64_t)info->rows;
+    }
+    c->n++;
+}
+
+/* The damaged part is the one with the 20 rows of the replace (the replace's tombstone is a part of its own, the
+ * one before it). */
+static void mb_damage(const char *dir, char *name, size_t len)
+{
+    tsdb_options o = opts();
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    struct mb_names pn = {.n = 0};
+    OK(tsdb_foreach_part(db, mb_collect, &pn));
+    CHECK(pn.n == 9);
+    for (int i = 0; i < pn.n && i < 16 && pn.n != 9; i++)
+        fprintf(stderr, "  part %s: %lld rows\n", pn.name[i], (long long)pn.rows[i]);
+    int d = -1;
+    for (int i = 0; i < pn.n && i < 16; i++)
+        if (pn.rows[i] == 20)
+            d = i;
+    CHECK(d == 4);
+    snprintf(name, len, "%s", d >= 0 ? pn.name[d] : "");
+    OK(tsdb_close(db));
+    part_footer ft = read_footer(dir, name);
+    flip(dir, name, (off_t)(sizeof(part_header) + ft.index_off) / 2);
+}
+
+struct mb_answers {
+    tsdb_points pts;
+    tsdb_bucket *agg[5];
+    size_t nagg[5];
+    int rc;
+};
+
+static void mb_ask(tsdb *db, tsdb_sid id, struct mb_answers *a)
+{
+    memset(a, 0, sizeof *a);
+    int rc = tsdb_query_points(db, id, MB_T0, MB_END, &a->pts);
+    const int64_t iv[3] = {0, 60000, 7000};
+    for (int i = 0; i < 3 && rc == 0; i++)
+        rc = tsdb_query_agg(db, id, MB_T0, MB_END, iv[i], &a->agg[i], &a->nagg[i]);
+    if (rc == 0) {
+        tsdb_group g = {.unit = TSDB_HOUR, .count = 1};
+        rc = tsdb_query_group(db, id, MB_T0, MB_END, &g, &a->agg[3], &a->nagg[3]);
+    }
+    if (rc == 0) {
+        tsdb_query_opts q = {.order = TSDB_DESC, .limit = 4};
+        rc = tsdb_query_agg_ex(db, id, MB_T0, MB_END, 30000, &q, &a->agg[4], &a->nagg[4]);
+    }
+    a->rc = rc;
+}
+
+static void mb_free(struct mb_answers *a)
+{
+    tsdb_points_free(&a->pts);
+    for (int i = 0; i < 5; i++)
+        free(a->agg[i]);
+}
+
+static bool mb_same(const struct mb_answers *x, const struct mb_answers *y)
+{
+    if (x->rc || y->rc || x->pts.n != y->pts.n || x->pts.n == 0)
+        return false;
+    for (size_t i = 0; i < x->pts.n; i++)
+        if (x->pts.ts[i] != y->pts.ts[i] || x->pts.values[i] != y->pts.values[i])
+            return false;
+    for (int k = 0; k < 5; k++) {
+        if (x->nagg[k] != y->nagg[k] || x->nagg[k] == 0)
+            return false;
+        for (size_t i = 0; i < x->nagg[k]; i++) {
+            const tsdb_bucket *p = &x->agg[k][i], *q = &y->agg[k][i];
+            if (p->start != q->start || p->count != q->count || p->sum != q->sum || p->min != q->min ||
+                p->max != q->max)
+                return false;
+        }
+    }
+    return true;
+}
+
+/* L1..L3 and the replace's tombstone become one part, U1..U4 another, the damaged part stays between them. */
+static void mb_check_layout(tsdb *db, const char *dparts)
+{
+    struct mb_names pn = {.n = 0};
+    OK(tsdb_foreach_part(db, mb_collect, &pn));
+    CHECK(pn.n == 3);
+    if (pn.n == 3) {
+        CHECK(strcmp(pn.name[1], dparts) == 0);
+        CHECK(pn.rows[1] == 20);
+        CHECK(strcmp(pn.name[0], dparts) != 0 && strcmp(pn.name[2], dparts) != 0);
+    }
+}
+
+static void test_merge_barrier(const char *scratch)
+{
+    char dir[600], dname[96];
+    snprintf(dir, sizeof dir, "%s/damage-merge-barrier", scratch);
+    for (int mode = 0; mode < 3; mode++) { /* optimize, then the merge thread; either one with verify_checksums */
+        tsdb_sid id;
+        mb_build(dir, &id);
+        struct mb_answers before;
+        tsdb_options o = opts();
+        o.partition_classes = 0;
+        tsdb *db;
+        OK(tsdb_open(dir, &o, &db));
+        mb_ask(db, id, &before);
+        OK(tsdb_close(db));
+        CHECK(before.rc == 0 && before.pts.n > 300);
+        mb_damage(dir, dname, sizeof dname);
+        o.verify_checksums = mode == 2;
+        if (mode == 0 || mode == 2) {
+            OK(tsdb_open(dir, &o, &db));
+            RC(tsdb_optimize(db), TSDB_ERR_CORRUPT); /* the damaged part is named: said so, the rest is merged */
+        } else {
+            o.merge_threads = 1;
+            o.merge_idle_s = 1; /* idle: every range may merge, and a rewrite of a single part too */
+            OK(tsdb_open(dir, &o, &db));
+            for (int i = 0; i < 400; i++) { /* the thread meets the damaged part in a merge, marks it, goes on */
+                struct mb_names pn = {.n = 0};
+                OK(tsdb_foreach_part(db, mb_collect, &pn));
+                if (pn.n == 3)
+                    break;
+                usleep(100000);
+            }
+        }
+        mb_check_layout(db, dname);
+        struct mb_answers after;
+        mb_ask(db, id, &after);
+        CHECK(mb_same(&before, &after));
+        tsdb_stats st;
+        OK(tsdb_get_stats(db, &st));
+        CHECK(st.broken_parts == 1);
+        OK(tsdb_close(db));
+        /* and from disk: the parts a merge named, and the damaged one, give the same answers after a reopen */
+        o.merge_threads = 0;
+        OK(tsdb_open(dir, &o, &db));
+        mb_check_layout(db, dname);
+        struct mb_answers again;
+        mb_ask(db, id, &again);
+        CHECK(mb_same(&before, &again));
+        OK(tsdb_close(db));
+        mb_free(&before);
+        mb_free(&after);
+        mb_free(&again);
+    }
+    printf("  a damaged part is a merge barrier: the ranges below and above merge (optimize and the merge thread),"
+           " none across it, answers unchanged\n");
+    rm_rf(dir);
+}
+
+static void mb_partition_parts(void *ctx, const tsdb_part_info *info)
+{
+    int *n = ctx;
+    (*n)++;
+    (void)info;
+}
+
+/* With a part marked, a stream of inserts into the partition keeps its part count bounded again (before, it grew
+ * with every insert: nothing merged, and the wait for merges was skipped for a partition with a marked part). */
+static void test_merge_barrier_bounded(const char *scratch)
+{
+    char dir[600], dname[96];
+    snprintf(dir, sizeof dir, "%s/damage-merge-barrier-stream", scratch);
+    tsdb_sid id;
+    mb_build(dir, &id);
+    mb_damage(dir, dname, sizeof dname);
+    tsdb_options o = opts();
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 100;
+    o.merge_threads = 1;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    RC(tsdb_optimize(db), TSDB_ERR_CORRUPT); /* marks it (one merge across it fails first), the rest merges */
+    tsdb_stats st;
+    OK(tsdb_get_stats(db, &st));
+    CHECK(st.broken_parts == 1);
+    int worst = 0;
+    int was = atomic_load(&wait_stall_ms);
+    atomic_store(&wait_stall_ms, 5000);
+    for (int k = 0; k < 900; k++) { /* each insert is a part of its own */
+        int64_t ts[120];
+        float v[120];
+        for (int i = 0; i < 120; i++)
+            ts[i] = MB_T(1000 + k) + i, v[i] = 1.0f; /* 1 ms apart: a second's rows, in the same partition */
+        OK(tsdb_insert_series(db, id, ts, v, 120));
+        int n = 0;
+        OK(tsdb_foreach_part(db, mb_partition_parts, &n));
+        worst = MAX(worst, n);
+    }
+    atomic_store(&wait_stall_ms, was);
+    CHECK(worst <= PARTS_TO_DELAY_INSERT + 5);
+    int rc;
+    tsdb_points pts = {0};
+    rc = tsdb_query_points(db, id, MB_T(1000), INT64_MAX, &pts);
+    CHECK(rc == 0 && pts.n == 900 * 120);
+    tsdb_points_free(&pts);
+    OK(tsdb_close(db));
+    printf("  with a damaged part in the partition a stream of inserts keeps its part count bounded"
+           " (at most %d parts)\n", worst);
     rm_rf(dir);
 }
 
@@ -2715,6 +2986,8 @@ int main(int argc, char **argv)
     test_wait_merges_damaged(base);
     test_wait_merges_stalled(base);
     test_wait_merges_failing(base);
+    test_merge_barrier(base);
+    test_merge_barrier_bounded(base);
     test_follower_steady_creation(base);
     test_wal_torn_before_later(base);
     test_follower_series_rewritten(base);

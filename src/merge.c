@@ -76,25 +76,24 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
             b++;
         size_t nparts = b - a;
         time_t newest = 0;
-        bool damaged = false; /* a merge of it would fail again (part_checked): the other partitions go on */
-        for (size_t i = a; i < b; i++) {
+        for (size_t i = a; i < b; i++)
             newest = MAX(newest, db->parts[i]->written);
-            damaged |= atomic_load(&db->parts[i]->damaged);
-        }
-        if (damaged || partition_dropping(db, db->parts[a]->partition)) { /* the drop retires it: start nothing */
+        if (partition_dropping(db, db->parts[a]->partition)) { /* the drop retires it: start nothing */
             a = b;
             continue;
         }
         bool idle = db->opt.merge_idle_s >= 0 && now - newest >= db->opt.merge_idle_s;
         for (size_t i = a; i < b && solo_ok && idle && solo == SIZE_MAX; i++)
-            if (insert_written(db->parts[i]) && !db->parts[i]->merging)
+            if (insert_written(db->parts[i]) && !db->parts[i]->merging && !atomic_load(&db->parts[i]->damaged))
                 solo = i;
         if (nparts >= 2) {
             for (size_t i = a; i < b; i++) {
                 double sum = 0, max_size = 0, min_age = INFINITY;
                 for (size_t j = i; j < b && j - i < MAX_MERGE_PARTS; j++) {
                     part *p = db->parts[j];
-                    if (p->merging)
+                    /* a damaged part is a barrier (merge_parts would fail on it again, part_checked): the ranges
+                     * on either side go on, never one across it, which would let a lower block's row win */
+                    if (p->merging || atomic_load(&p->damaged))
                         break;
                     double size = (double)p->map_len;
                     if (sum + size > (double)db->opt.max_part_bytes && j > i)
@@ -712,28 +711,35 @@ int eng_optimize(eng *db)
     bool skipped = false; /* a partition with a damaged part was left as it is: TSDB_ERR_CORRUPT at the end */
     pthread_mutex_lock(&db->lock);
     for (;;) {
-        /* first partition with several parts, or with one only inserts wrote, and no merge in flight; one a merge
-         * thread is rewriting alone right now is waited for like any other busy partition */
-        size_t a = SIZE_MAX, k = 0;
+        /* first range between damaged parts (barriers) with several parts, or with one only inserts wrote, and no
+         * merge in flight; one a merge thread is rewriting right now is waited for like any other busy range */
+        size_t a = SIZE_MAX, e = 0, k = 0;
         bool waiting = false;
         for (size_t i = 0, j; i < db->nparts && a == SIZE_MAX; i = j) {
-            bool busy = db->parts[i]->merging, damaged = atomic_load(&db->parts[i]->damaged);
-            for (j = i + 1; j < db->nparts && db->parts[j]->partition == db->parts[i]->partition; j++) {
-                busy |= db->parts[j]->merging;
+            bool damaged = false;
+            for (j = i; j < db->nparts && db->parts[j]->partition == db->parts[i]->partition; j++)
                 damaged |= atomic_load(&db->parts[j]->damaged);
-            }
-            if (j - i < 2 && !insert_written(db->parts[i]))
-                continue;
             if (partition_dropping(db, db->parts[i]->partition)) /* the drop retires it: nothing to optimize */
                 continue;
-            if (damaged) { /* found by a merge before (part_checked): the rest is merged, and the call fails */
+            if (damaged && (j - i >= 2 || insert_written(db->parts[i]))) /* the call fails at the end */
                 skipped = true;
-                continue;
+            for (size_t s = i, t; s < j && a == SIZE_MAX; s = t) {
+                if (atomic_load(&db->parts[s]->damaged)) {
+                    t = s + 1;
+                    continue;
+                }
+                bool busy = false;
+                for (t = s; t < j && !atomic_load(&db->parts[t]->damaged); t++)
+                    busy |= db->parts[t]->merging;
+                if (t - s < 2 && !insert_written(db->parts[s]))
+                    continue;
+                if (busy)
+                    waiting = true;
+                else {
+                    a = s;
+                    e = t;
+                }
             }
-            if (busy)
-                waiting = true;
-            else
-                a = i;
         }
         if (a == SIZE_MAX) {
             if (!waiting)
@@ -741,8 +747,7 @@ int eng_optimize(eng *db)
             pthread_cond_wait(&db->merged_cv, &db->lock);
             continue;
         }
-        int64_t partition = db->parts[a]->partition;
-        for (size_t i = a; i < db->nparts && db->parts[i]->partition == partition && k < MAX_MERGE_PARTS; i++) {
+        for (size_t i = a; i < e && k < MAX_MERGE_PARTS; i++) {
             sel[k] = db->parts[i];
             sel[k]->merging = true;
             part_ref(sel[k]);

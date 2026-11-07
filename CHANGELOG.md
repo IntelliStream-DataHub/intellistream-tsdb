@@ -6,6 +6,25 @@ All notable changes to tsdb are listed here, newest first. The format follows
 [docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.9.x release may still change the
 disk format and the wire protocol.
 
+## [Unreleased]
+
+### Changed
+
+- **A damaged part is a merge barrier, not a stop for its whole partition.** Since 0.9.1 a part that a merge found
+  damaged (an index that no longer matches its checksum, or a granule it could not decode) took its whole partition out
+  of merges, so the partition's part count grew with every insert until the part was restored (a mapping and a
+  descriptor per part, slower queries). Merges combine adjacent block ranges only, so the ranges below and above the
+  damaged part are now merged, each alone, and never one across it: the damaged part's tombstones keep hiding the
+  lower blocks (the lower output keeps a block number below it), and the upper output keeps the union of its sources'
+  tombstones, which keep hiding the damaged part's rows and everything below. The damaged part itself is never a merge
+  input, never rewritten alone and never dropped by retention. `tsdb_optimize` now leaves one part per range between
+  damaged parts, and still returns `TSDB_ERR_CORRUPT` for a partition with a damaged part. An insert waits for
+  merges of such a partition like for any other (bounded by the 30 s stall rule), and ends the wait at once only when
+  no two neighbouring parts are left that a merge may combine. `tests/test_damage.c` (`test_merge_barrier`: optimize
+  and the merge thread over a partition with deletes and a replace, answers of every query kind identical, with
+  `verify_checksums` on and off and after a reopen; `test_merge_barrier_bounded`: a stream of inserts keeps the part
+  count at 300).
+
 ## [0.9.1] - 2026-11-07
 
 A patch release: **two data fixes**, storage outage handling for NFS, macOS as a developer platform, and smaller

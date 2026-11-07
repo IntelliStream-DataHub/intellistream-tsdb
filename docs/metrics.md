@@ -41,7 +41,7 @@ directory) and `path`.
 | `tsdb_merges_total`, `tsdb_merged_rows_total` | counter | merges finished, rows they wrote |
 | `tsdb_merging_parts` | gauge | parts a running merge reads now (0: no merge running) |
 | `tsdb_wal_bytes_total`, `tsdb_wal_syncs_total` | counter | WAL bytes written, WAL `fdatasync`s (0 with `--no-fsync`) |
-| `tsdb_broken_parts` | gauge | parts found damaged: by a follower (left out of its view), or by a writer whose merge, retention drop or rate measurement found an index changed since its open (left out of merges and drops; the next open refuses it), or whose merge could not decode a granule of the part (payload damaged: left out of merges and drops, kept in memory only) |
+| `tsdb_broken_parts` | gauge | parts found damaged: by a follower (left out of its view), or by a writer whose merge, retention drop or rate measurement found an index changed since its open (a barrier for merges, never merged or dropped itself; the next open refuses it), or whose merge could not decode a granule of the part (payload damaged: a barrier, kept in memory only) |
 | `tsdb_pinned_index_bytes` | gauge | heap bytes the listed parts' index copies take with `--pin-index` (about 32 to 51 per granule; 0 without it). Parts already replaced by a merge but still read by a query keep their copy until that query ends, and are not counted |
 | `tsdb_failed` | gauge | 1 once the volume is fail-stopped: writes return IO errors and tsdbd exits; alert on it |
 | `tsdb_follow_errors_total`, `tsdb_follow_refresh_age_seconds` | counter, gauge | followers only: failed refreshes, and time since the last good one (the age of the follower's refresh, not of the writer's data: a stopped writer leaves it near 0) |

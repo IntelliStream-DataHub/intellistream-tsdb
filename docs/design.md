@@ -902,8 +902,9 @@ damage into silently missing or shifted data:
   measuring a partition's series rates (`cls_observe`, which also skips runs
   naming a series beyond SERIES or out of order) before it writes a class
   record. A part that fails such a check is marked: logged once, counted in
-  `broken_parts`, left out of merges, TTL rewrites and drops (its partition
-  stays as it is; `tsdb_optimize` merges the rest and returns
+  `broken_parts`, left out of merges, TTL rewrites and drops (it is a barrier,
+  below; its partition's retention drop does not happen either, since the drop
+  would take the part with it; `tsdb_optimize` merges the rest and returns
   `TSDB_ERR_CORRUPT`), and refused by the next open. Every retention change
   does not hash every index: that would hold the part list's lock for a pass
   over all of them, and only a drop needs it.
@@ -914,23 +915,46 @@ damage into silently missing or shifted data:
   `cur_load` or `pw_copy_fits`; never from `pw_add`, which refuses rows out of
   order, a bug of the merge and not damage in a source). The source part whose
   decode failed is marked in memory only (`part_mark_payload`): logged once,
-  counted once in `broken_parts`, left out of merges with its partition. It is
+  counted once in `broken_parts`, and a barrier for merges (below). It is
   not marked for the next open, which will not refuse it: a misdirected read can
   damage one mapping of a healthy part, and a restart reads it again; real
   damage marks it again at the first merge. Without the mark the merge was
   retried every second and the partition's part count never fell. An insert
   waits for merges while its partition has more than `PARTS_TO_DELAY_INSERT`
   parts, after its rows are published, so that wait never fails the insert
-  (`db_wait_merges`): it ends at once for a partition with a marked part or
-  after a failed engine, and after `wait_stall_ms` (30 s) in which the count did
+  (`db_wait_merges`): it ends at once after a failed engine, and for a
+  partition with a marked part when no two neighbours are left that a merge
+  may combine, and after `wait_stall_ms` (30 s) in which the count did
   not fall and no merge of the partition ran, or in which a merge of it failed
   (`merge_commit_locked` stamps the sources, so the time of a long failing
   merge counts too). The first wait that runs out records the partition in
   `stalled[]` with its count: later waiters go on at once until the count falls
-  or a merge of it commits, so the bound is paid once, not per call and part. A damaged partition's part count
-  then grows until an operator restores the part; refusing inserts instead
-  would report a visible write as failed, and flushes of the memtable add
-  parts without waiting anyway. A cap is future work.
+  or a merge of it commits, so the bound is paid once, not per call and part.
+  Refusing inserts instead would report a visible write as failed, and flushes
+  of the memtable add parts without waiting anyway. A cap is future work.
+
+  **A marked part is a barrier.** Merges combine adjacent block ranges only
+  (above), so the ranges below and above a marked part are merged each on its
+  own, never one across it: `select_merge_locked` ends a candidate range at a
+  marked part (and never takes one as the part of a solo rewrite), and
+  `eng_optimize` takes the first range between barriers with several parts or
+  one that only inserts wrote. The barrier keeps last-write-wins and the
+  tombstones as they were. The output of the range below has a block number
+  below the marked part's, so the marked part's tombstones hide its rows at read
+  time exactly as before (a merge does not apply them, and need not). The
+  output of the range above keeps the union of its sources' tombstones
+  (`merge_parts` keeps them whenever a listed part of the partition is older,
+  and the marked part is listed), so they go on hiding the marked part's rows
+  and everything below. A merge across the barrier would put a lower block's
+  rows into an output newer than the marked part's tombstones, and let them
+  win (`merge_parts` refuses a marked source in any case, `part_checked`). A
+  retention rewrite takes the parts of the ranges as before and never the
+  marked one; the drop of a whole expired partition checks the index of every
+  part and so does not happen while one is marked (it would retire the damaged
+  part, which only `tsdb_drop_before` does, on an operator's call). So the part count of a
+  damaged partition is bounded by the merges of its two sides again, and
+  "optimize leaves one part per partition" reads "one part per range between
+  barriers".
 - **Series in parts.** Every series a part holds is in SERIES: its record is
   synced (`dict_append`) before its id is handed out, and so before any row of
   it can reach a part. A part that names a series beyond the end of SERIES
