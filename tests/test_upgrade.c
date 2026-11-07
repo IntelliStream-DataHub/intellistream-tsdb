@@ -304,6 +304,7 @@ static void test_upgrade_and_merge(bool mutant)
     /* the open reads the parts as they are, and every series answers as 0.9.0's export says */
     tsdb *t;
     tsdb_options o = opts();
+    o.merge_idle_s = -1; /* the fixture's parts are old, so an idle merge could rewrite them before the close */
     if (tsdb_open(db, &o, &t) != 0) {
         CHECK(false && "the upgraded database opens");
         return;
