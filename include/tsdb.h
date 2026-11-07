@@ -864,7 +864,7 @@ size_t tsdb_struct_size(int kind);
 /* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
  * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
  * number they were written for when they load the library and refuse another. */
-#define TSDB_ABI_VERSION 3 /* Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
+#define TSDB_ABI_VERSION 4 /* Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
  * expected topology one export of one pool). tsdb_health_open starts a monitor thread; every domain added gets a
  * probe thread that reads 4 KiB with O_DIRECT from <dir>/PROBE every second and writes and fdatasyncs 4 KiB to
  * <dir>/PROBE.<node> every 5 s. Probes may hang for as long as the server is away; nothing else of the process

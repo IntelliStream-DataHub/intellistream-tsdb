@@ -25,6 +25,7 @@ public final class EmbeddedOptions {
     private int granuleRows;
     private int zstdLevel;
     private int insertZstdLevel;
+    private long latestCache;
     private int valueCodec;
     private boolean fsync;
     private int mergeThreads;
@@ -63,6 +64,7 @@ public final class EmbeddedOptions {
             granuleRows = o.get(JAVA_INT, offset(OPTIONS, "granule_rows"));
             zstdLevel = o.get(JAVA_INT, offset(OPTIONS, "zstd_level"));
             insertZstdLevel = o.get(JAVA_INT, offset(OPTIONS, "insert_zstd_level"));
+            latestCache = o.get(JAVA_LONG, offset(OPTIONS, "latest_cache"));
             valueCodec = o.get(JAVA_INT, offset(OPTIONS, "value_codec"));
             fsync = o.get(JAVA_INT, offset(OPTIONS, "fsync")) != 0;
             mergeThreads = o.get(JAVA_INT, offset(OPTIONS, "merge_threads"));
@@ -93,6 +95,7 @@ public final class EmbeddedOptions {
         o.set(JAVA_INT, offset(OPTIONS, "granule_rows"), granuleRows);
         o.set(JAVA_INT, offset(OPTIONS, "zstd_level"), zstdLevel);
         o.set(JAVA_INT, offset(OPTIONS, "insert_zstd_level"), insertZstdLevel);
+        o.set(JAVA_LONG, offset(OPTIONS, "latest_cache"), latestCache);
         o.set(JAVA_INT, offset(OPTIONS, "value_codec"), valueCodec);
         o.set(JAVA_INT, offset(OPTIONS, "fsync"), fsync ? 1 : 0);
         o.set(JAVA_INT, offset(OPTIONS, "merge_threads"), mergeThreads);
@@ -170,6 +173,17 @@ public final class EmbeddedOptions {
      */
     public EmbeddedOptions insertZstdLevel(int level) {
         insertZstdLevel = level;
+        return this;
+    }
+
+    /**
+     * Bytes of memory for the latest tables of the whole process (16 bytes a series).
+     *
+     * @param bytes default RAM / 16; 0: no table, the same answers from the parts and memtables, slower
+     * @return this
+     */
+    public EmbeddedOptions latestCache(long bytes) {
+        latestCache = bytes;
         return this;
     }
 

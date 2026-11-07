@@ -62,6 +62,8 @@ fn value_codec(name: &str) -> PyResult<tc::ValueCodec> {
 ///         database is created).
 ///     insert_zstd_level: zstd level of the parts inserts write (default 0:
 ///         none; merges compress them at zstd_level); -1: zstd_level.
+///     latest_cache: bytes of memory for the latest tables of the process
+///         (default RAM / 16; 0: no table, the same answers, slower).
 ///     The other keywords are the engine's tsdb_options fields of the same
 ///     name; None keeps the engine's default. partition_ms and granule_rows
 ///     are fixed when the database is created. value_codec is "auto",
@@ -159,7 +161,7 @@ impl Db {
                         wal_max_batch_rows = None, max_part_bytes = None, refresh_ms = None, merge_idle_s = None,
                         obsolete_part_lifetime_s = None, verify_checksums = None, retention_merge_s = None,
                         request_threads = None, partition_classes = None, pin_index = None,
-                        insert_zstd_level = None))]
+                        insert_zstd_level = None, latest_cache = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -187,6 +189,7 @@ impl Db {
         partition_classes: Option<bool>,
         pin_index: Option<bool>,
         insert_zstd_level: Option<i32>,
+        latest_cache: Option<usize>,
     ) -> PyResult<Self> {
         let d = tc::Options::default();
         let o = tc::Options {
@@ -214,6 +217,7 @@ impl Db {
             request_threads: request_threads.unwrap_or(d.request_threads),
             partition_classes: partition_classes.unwrap_or(d.partition_classes),
             insert_zstd_level: insert_zstd_level.unwrap_or(d.insert_zstd_level),
+            latest_cache: latest_cache.unwrap_or(d.latest_cache),
         };
         let db = py.detach(|| tc::Db::open(&path, &o)).map_err(|e| to_pyerr(py, e))?;
         Ok(Db { db: RwLock::new(Some(db)), path, last: Mutex::default() })
