@@ -1310,7 +1310,13 @@ static void take_snapshot(struct snode *nd)
 static void send_msg(struct msim *s, struct snode *from, const raft_msg *m)
 {
     struct snode *to = m->to >= 1 && m->to <= s->n ? &s->nd[m->to] : NULL;
-    if (!to || to->group != from->group || iso_rng_chance(&s->rng, 0.02))
+    /* Loss is a fault like the others: it stops at `quiet`, or the 12 s tail (one install, two resends) fails on three
+     * lost messages in a row (soak seed 4475: the ack of an install and both resends dropped, 0.0008 % a send, hit
+     * once in 5000 seeds). The draw is still made, so a seed replays the same until the tail. */
+    if (!to || to->group != from->group)
+        return;
+    int lost = iso_rng_chance(&s->rng, 0.02) && s->now < s->quiet;
+    if (lost)
         return;
     size_t wl = raft_wire_size(m), il = 0;
     const uint8_t *img = NULL;
