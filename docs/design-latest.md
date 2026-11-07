@@ -968,9 +968,11 @@ and the p50 and p99 latencies are the same):
 | 64 | 41,308 | 42,835 |
 | 256 | 143,518 | 142,833 |
 
-So the table costs nothing the benchmark can measure on the insert path (§2.3's rule holds). Not yet measured: inserts
-under lookups, the §3.2 window's threshold (`LT_WINDOW_MIN` stays 50,000) and the other items above; they need the
-server path (step 3) and a quiet machine.
+So at **1,000 series and no nulls** the table costs nothing this benchmark can measure on the insert path. That is the
+only series count measured here, and the one where the fold has almost nothing to do (the fold list is short and
+`lf_granule`'s null passes find no nulls): the review measured a flush of 10^6 series at +8% (about 48 ms) against no
+table, so §2.3's "no measurable cost" is NOT shown at scale; §9.2 has the flush measurement. Not yet measured: inserts
+under lookups through the server (step 3) and the other items above.
 
 ## 10. Build plan
 
