@@ -78,6 +78,13 @@ Hardening from the 0.9.1 security review (the minor findings). No format or prot
 
 ### Fixed
 
+- **A memtable flush no longer stalls appends and lookups for 8 to 20 ms (a million series).** After a flush swapped in
+  a fresh memtable, the first row with a high series id grew its series array (40 MB at 10^6 series) with `realloc`
+  and a `memset` under `buf_lock`, and the flusher's big buffers went back through one `munmap`, which holds the mmap
+  lock for writing. The array is now a lazily touched mapping grown by `mremap` (Linux), and big buffers are handed back
+  in 2 MB slices first (`tsdb_free_big`). `latest-bench` at 10^6 series, mean of the worst lookup in a flush
+  round: 14.2 ms to 0.7 ms (cache off), 17.2 ms to 2.3 ms (on); worst append 14.1 to 1.4 ms and 17.1 to 1.1 ms;
+  p99 and flush time are unchanged. No change to the flush's ordering, the WAL or what a reader sees.
 - **tsdbd: a slow reader needs a minimum rate, not any movement.** The send timeout (`--send-timeout`) used to be
   reset by any change of the socket's queue, so a client taking a few bytes whenever its small window opened held a
   worker and up to 18 MB of buffers for as long as it liked. A window of `--send-timeout` seconds must now see

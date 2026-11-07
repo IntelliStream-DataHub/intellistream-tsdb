@@ -998,14 +998,20 @@ B the slow path (`WITH_NULLS`, 2 readers x 4,096 ids, 3 repetitions, 15 rounds, 
   p99 (A on against nowin). The slow path (B) is as slow with the table as without: its lookups skip the table.
 - **Lookups during a flush**: the table answers 4x as many lookups with a p50 of 35 us against 147 us.
 - **The multi-ms worst case is not the table.** Max lookup and max append are the same ~16 ms in every mode, table off
-  included, and the max append equals the max lookup in the same round: one pause that both threads were caught in. A
-  run of the "off" mode with `strace -f -T` shows the flusher thread in `munmap` of buffers of 184 MB and 168 MB
-  (during the flush, from its write step) for 7 to 8 ms (and a 40 MB `write` for 5.6 ms) while the other threads wait: the kernel takes the
-  mmap lock for writing for the whole unmap and a thread that page-faults or allocates waits behind it. Timing
-  `mt_unref` of the flushed memtable (48 ms, 3 x 10^6 frees) and leaving it out did not change the tail, and the
-  listing section (parts listed under `db->lock`) takes under 10 us. So this belongs to the flush path of main (large
-  buffers handed back to the kernel), and a fix is a separate change (keeping the flusher's buffers, or `madvise`
-  in slices); it is not part of the latest table.
+  included, and the max append equals the max lookup in the same round: one pause that both threads were caught in.
+  `strace -f -T` showed the flusher in `munmap` of buffers of 184 MB and 168 MB for 7 to 8 ms, and that was taken for
+  the cause. It was one cause of two (found by the `flush-tail` track, 2026-11-07, `perf record -e context-switches -g`
+  and a poll of `/proc/PID/task/*/wchan`: the readers and the appender sit in `buf_lock`, and the holder is the
+  appender itself): (1) right after a flush swaps in a fresh memtable the first row with a high series id grows the
+  series array (`mt_reserve`) to id+1 entries, 40 MB at 10^6 series, and the `realloc` plus the `memset` of the new
+  tail touched every page under `buf_lock`: about 9 ms, twice (a doubling), and every append and lookup waited. The
+  array is now an anonymous mapping from 1 MB on (zero pages, grown by `mremap`, touched as series arrive:
+  `mt_s_grow`). (2) the flusher's big buffers went back through `munmap`, which holds the mmap lock for writing for
+  about 40 us per MB; they are now zapped in 2 MB slices of `madvise(MADV_DONTNEED)` first (`tsdb_free_big`,
+  `src/compat.h`; the read lock, so others fault in between). The ablation (15 rounds per variant, rounds 2 to 4 of 5
+  runs, `--series 1000000`) shows both are needed: with (1) alone the worst case stays at 8 to 10 ms in the first
+  rounds after a start (the buffers are then new) and the mean of the max lookup is 4.3 ms; with both 0.7 ms. Mode
+  "on" keeps a worst lookup of 2.2 ms that this change does not touch (not measured further: the lookups of that mode go through the table's own path). The listing section (parts listed under `db->lock`) takes under 10 us.
 - The window threshold (`LT_WINDOW_MIN` 50,000) stays. This measurement shows no difference between on and nowin at
   10^6 series (the pause above hides the window's effect on the worst case; the review's own run saw worst lookups of
   2 to 6 ms with the window and 5 to 12 ms without). The window threshold itself is not measured below 10^6 series.
