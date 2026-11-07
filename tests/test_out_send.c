@@ -145,6 +145,8 @@ static void out_wait_deadline(void)
     dom.ndoms = 0;
     close(sv[0]);
     close(sv[1]);
+    free(c->out.p);
+    free(c);
 }
 
 int main(void)
