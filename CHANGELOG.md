@@ -15,8 +15,8 @@ disk format and the wire protocol.
   of its rows, and `written_ms`); every volume has an `FNO` file, two checksummed slots that bound the numbers so
   that they never go back across opens (before a WAL segment is unlinked it holds the segment's end: one `fdatasync`
   per flush); `META` can say `requires=` (a binary refuses a feature it does not know, naming it); `MANIFEST` has an
-  `fno_next` line (information for followers). The cost is 16 more bytes per WAL record (measured in
-  docs/design-cdc.md 2.12 terms: see BENCHMARKS.md, "Format 9").
+  `fno_next` line (information for followers). The cost is 16 more bytes per WAL record: not measurable with an
+  fsync per call, 1 to 8% on appends without one (BENCHMARKS.md, "Format 9").
   **Carrying a database over:** a format-8 database is refused, naming both versions. `tsdb DIR upgrade` carries it
   over in place when it was closed cleanly with 0.9.0 (no WAL segment, intent or tmp part; stop tsdbd and every
   follower first): FNO, MANIFEST and META of each volume, the root last, safe to run again. The parts keep their old
