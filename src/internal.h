@@ -50,6 +50,7 @@ typedef struct eng eng;
  * catches the bug; nothing in the library or the server ever sets it. */
 enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC };
 extern int eng_test_mutant;
+extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -1340,6 +1341,7 @@ bool fno_file_intact(int dirfd);
 void fno_slot_page(uint8_t *page, uint64_t next, uint64_t gen); /* 4096 bytes: a slot as FNO stores it */
 int fno_load(struct eng *db, uint64_t *next, uint64_t *gen, int *slot, bool *torn);
 int fno_require(struct eng *db, uint64_t v);
+#include "feed.h"
 void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot);
 int wal_commit(struct eng *db, uint64_t target);
 int wal_open(struct eng *db, int (*before_replay)(struct eng *));
@@ -1554,6 +1556,27 @@ struct eng {
     uint64_t wtail_all_seq;
     int64_t wtail_all_max;
     uint64_t wal_unlink_next; /* the first flushed segment whose unlink failed, to try again (flush_lock); 0: none */
+    uint64_t wal_open_removed; /* wal_open: the segments up to this are gone (a failed unlink or rename at open stops it) */
+    /* the change feed (feed.h, feedfile.c, feedclean.c). Lock order: feed_lock is a leaf, never held while an engine
+     * lock is taken or across I/O; the cleaner never takes flush_lock. */
+    _Atomic bool feed_on;     /* FEED exists and the word is in META: segments are renamed to fwal_, not unlinked */
+    bool feed_req;            /* META said requires=feed at the open */
+    bool fno_torn_open;       /* the open found one FNO slot bad (the numbers skipped ahead by FNO_BELT) */
+    pthread_mutex_t feed_lock;
+    pthread_cond_t feed_cv;
+    feed_cfg feed;            /* feed_lock */
+    int fs_fd, fs_anchor;     /* FEEDSLOTS, and the half that is the anchor (the cleaner thread, or the open) */
+    uint64_t fs_gen, fs_ret_fed, fs_ckpt_fno;
+    uint64_t feed_floor_event; /* feed_lock: the last event removed from the feed */
+    uint32_t feed_floor_check;
+    fseg *fidx;                /* feed_lock: the retained segments, ascending seq */
+    size_t nfidx, capfidx;
+    pthread_t cleaner;
+    bool has_cleaner, cleaner_stop; /* cleaner_stop: feed_lock */
+    uint64_t feed_removed_segs;     /* counters (feed_lock) */
+    uint64_t feed_removed_bytes;
+    bool feed_enable_pending;       /* the open: the database has the feed on and this volume does not yet */
+    feed_opts feed_new_opts;        /* ...with these options (the root's) */
     atomic_int_fast64_t clock_floor; /* now never goes below this */
     atomic_uint ret_gen;             /* bumped by every change of a limit (parts cache their expiry) */
     atomic_uint_fast64_t ret_len_gen; /* bumped (db->lock) when a change lowers a series' cutoff: a merge that spans one

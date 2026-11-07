@@ -483,16 +483,18 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     char *txt;
     size_t len;
     int rc = read_file_all(rootfd, "META", &txt, &len);
+    bool root_feed = false;
     if (rc)
         return rc;
     /* The volume gets the root's META and a FNO of this format: a root of another format, or one that needs a feature
      * this release does not know, is not given a volume made by these rules (the open of the root refuses it too). */
     {
-        char *vl = strstr(txt, "version="), *rq = strstr(txt, "requires=");
-        if ((vl ? atoi(vl + 8) : 0) != FORMAT_VERSION || (rq && rq[9] != '\n' && rq[9] != '\0')) {
+        char *vl = strstr(txt, "version="), unknown[96];
+        meta_requires_parse(txt, &root_feed, unknown, sizeof unknown);
+        if ((vl ? atoi(vl + 8) : 0) != FORMAT_VERSION || unknown[0]) {
             fprintf(stderr, "tsdb: the root META says format %d%s%s: a volume is added only to a database of format "
-                            "%d without unknown requirements\n", vl ? atoi(vl + 8) : 0, rq ? ", " : "",
-                    rq ? "with requires=" : "", FORMAT_VERSION);
+                            "%d without unknown requirements\n", vl ? atoi(vl + 8) : 0, unknown[0] ? ", " : "",
+                    unknown[0] ? "with requires=" : "", FORMAT_VERSION);
             free(txt);
             return TSDB_ERR_INVALID;
         }
@@ -539,6 +541,24 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     if (ok && sync && tsdb_fsync(fd) != 0) {
         ok = false;
         err = errno;
+    }
+    if (ok && fd >= 0 && root_feed) {
+        /* The root has the feed on: the volume gets its FEEDSLOTS and FEED too (the word is in the META just
+         * written), before the VOLUMES line names it, with the root's options, a feed_id of its own and seeded = 0
+         * (design-cdc.md 2.7). Left whole when they are already intact (this runs again on a retry). If the root
+         * has no FEED (an enable or disable in flight) the volume has the word only, and the open that follows
+         * brings it to the root's state. */
+        feed_cfg rc_cfg;
+        if (feed_cfg_read(rootfd, &rc_cfg) == 0) {
+            feed_opts fo = {rc_cfg.retention_s, rc_cfg.max_bytes, rc_cfg.min_free_pct};
+            feed_cfg cfg;
+            feed_cfg_defaults(&cfg, &fo);
+            feed_dir fdir = {fd, NULL, sync};
+            if (feed_dir_enable(&fdir, &cfg, 0) != 0) {
+                ok = false;
+                err = errno ? errno : EIO;
+            }
+        }
     }
     if (fd >= 0)
         close(fd);
@@ -797,6 +817,21 @@ static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad
     if (rc)
         return rc;
     eng *e;
+    if (!t->opt.read_only) {
+        /* a volume is brought to the root's state by its writer's open, before its WAL replay (feed.c) */
+        feed_opts fo;
+        memset(&fo, 0, sizeof fo);
+        pthread_rwlock_rdlock(&t->lock);
+        eng *root = t->vols[0];
+        bool on = atomic_load(&root->feed_on);
+        if (on) {
+            pthread_mutex_lock(&root->feed_lock);
+            fo = (feed_opts){root->feed.retention_s, root->feed.max_bytes, root->feed.min_free_pct};
+            pthread_mutex_unlock(&root->feed_lock);
+        }
+        pthread_rwlock_unlock(&t->lock);
+        eng_set_open_feed_want(on ? 1 : 0, on ? &fo : NULL);
+    }
     if ((rc = eng_open_sched(path, &t->opt, t->sched, &e)) != 0)
         return rc;
     char *p = strdup(path);
@@ -1355,6 +1390,118 @@ int tsdb_volume_add(tsdb *t, const char *path, uint32_t *index)
     int rc = volume_add_open(t, path, index);
     pthread_mutex_unlock(&t->create_lock);
     return rc;
+}
+
+/* ------------------------------------------------------------ the change feed */
+
+/* The engines of a call, referenced, root first. Quiesced volumes (in recovery) are UNAVAILABLE. */
+static int feed_engines(tsdb *t, eng ***out, bool **live, size_t *n)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    *n = t->nvols;
+    eng **v = malloc(*n * sizeof *v);
+    bool *lv = malloc(*n * sizeof *lv);
+    if (v && lv) {
+        memcpy(v, t->vols, *n * sizeof *v);
+        for (size_t i = 0; i < *n; i++)
+            if ((lv[i] = !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
+                eng_ref(v[i]);
+    }
+    pthread_rwlock_unlock(&t->lock);
+    if (!v || !lv) {
+        free(v);
+        free(lv);
+        return TSDB_ERR_NOMEM;
+    }
+    *out = v;
+    *live = lv;
+    return 0;
+}
+
+enum { FEED_OP_ENABLE, FEED_OP_DISABLE, FEED_OP_NEW_ID };
+
+/* An operation on every volume, root first, under create_lock and the OFD write lock of VOLUMES for the whole call
+ * (a `volume add` in another process copies the root's requires= into a new META: it must not run in between). */
+static int feed_all(tsdb *t, int op, const feed_opts *o)
+{
+    if (t->opt.read_only)
+        return TSDB_ERR_READONLY;
+    pthread_mutex_lock(&t->create_lock);
+    int vfd = openat(t->dirfd, VOLUMES_FILE, O_RDWR | O_CLOEXEC);
+    int rc = vfd < 0 && errno != ENOENT ? TSDB_ERR_IO : 0;
+    if (rc == 0 && vfd >= 0)
+        rc = volumes_lock(vfd, F_WRLCK);
+    eng **v = NULL;
+    bool *live = NULL;
+    size_t n = 0;
+    if (rc == 0)
+        rc = feed_engines(t, &v, &live, &n);
+    feed_opts fo = o ? *o : (feed_opts){0};
+    for (size_t i = 0; rc == 0 && i < n; i++) {
+        int r;
+        if (!live[i]) {
+            r = TSDB_ERR_UNAVAILABLE;
+        } else if (op == FEED_OP_ENABLE) {
+            r = eng_feed_enable(v[i], &fo);
+            if (i == 0 && r == 0) { /* the others follow the root's options */
+                pthread_mutex_lock(&v[0]->feed_lock);
+                fo = (feed_opts){v[0]->feed.retention_s, v[0]->feed.max_bytes, v[0]->feed.min_free_pct};
+                pthread_mutex_unlock(&v[0]->feed_lock);
+            }
+        } else if (op == FEED_OP_DISABLE) {
+            r = eng_feed_disable(v[i]);
+        } else {
+            r = eng_feed_new_id(v[i]);
+        }
+        rc = r;
+    }
+    for (size_t i = 0; v && i < n; i++)
+        if (live[i])
+            eng_unref(&v[i]);
+    free(v);
+    free(live);
+    if (vfd >= 0)
+        close(vfd);
+    pthread_mutex_unlock(&t->create_lock);
+    return rc;
+}
+
+int tsdb_feed_enable(tsdb *t, const tsdb_feed_options *o)
+{
+    feed_opts fo = {0};
+    if (o)
+        fo = (feed_opts){o->retention_s, o->max_bytes, o->min_free_pct};
+    return feed_all(t, FEED_OP_ENABLE, &fo);
+}
+
+int tsdb_feed_disable(tsdb *t) { return feed_all(t, FEED_OP_DISABLE, NULL); }
+int tsdb_feed_new_id(tsdb *t) { return feed_all(t, FEED_OP_NEW_ID, NULL); }
+
+int tsdb_feed_info_get(tsdb *t, uint32_t volume, tsdb_feed_info *out)
+{
+    memset(out, 0, sizeof *out);
+    pthread_rwlock_rdlock(&t->lock);
+    eng *e = volume < t->nvols ? t->vols[volume] : NULL;
+    if (e)
+        eng_ref(e);
+    pthread_rwlock_unlock(&t->lock);
+    if (!e)
+        return TSDB_ERR_NOTFOUND;
+    out->on = atomic_load(&e->feed_on);
+    if (out->on) {
+        pthread_mutex_lock(&e->feed_lock);
+        out->feed_id = e->feed.feed_id;
+        out->retention_s = e->feed.retention_s;
+        out->min_free_pct = e->feed.min_free_pct;
+        out->max_bytes = e->feed.max_bytes;
+        out->floor_event = e->feed_floor_event;
+        out->retained_segments = e->nfidx;
+        for (size_t i = 0; i < e->nfidx; i++)
+            out->retained_bytes += e->fidx[i].size == UINT64_MAX ? 0 : e->fidx[i].size;
+        pthread_mutex_unlock(&e->feed_lock);
+    }
+    eng_unref(&e);
+    return 0;
 }
 
 int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index)

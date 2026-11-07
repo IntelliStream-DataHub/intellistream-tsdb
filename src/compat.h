@@ -180,12 +180,20 @@ static inline int tsdb_thread_create(pthread_t *t, void *(*fn)(void *), void *ar
     return rc;
 }
 
+/* rename that never replaces an existing name (renameatx_np with RENAME_EXCL). 0, or -1 with errno (EEXIST). */
+static inline int tsdb_rename_noreplace(int dirfd, const char *from, const char *to)
+{
+    return renameatx_np(dirfd, from, dirfd, to, RENAME_EXCL);
+}
+
 /* the calling thread's name (macOS names only the calling thread, with no pthread_t argument) */
 static inline void tsdb_thread_name(const char *name) { pthread_setname_np(name); }
 
 #else /* Linux and the rest: the defaults are right */
 
 #include <pthread.h>
+#include <errno.h>
+#include <stdio.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -202,6 +210,16 @@ static inline int tsdb_socket_cloexec(int domain, int type, int proto)
 static inline int tsdb_thread_create(pthread_t *t, void *(*fn)(void *), void *arg)
 {
     return pthread_create(t, NULL, fn, arg);
+}
+/* rename that never replaces an existing name (renameat2 with RENAME_NOREPLACE). 0, or -1 with errno (EEXIST).
+ * A file system that does not take the flag (the Linux NFS client answers EINVAL; ENOSYS on an old kernel) gets the
+ * plain rename: the caller's own rule for numbering names is the guard there (memtable.c, max_seq). */
+static inline int tsdb_rename_noreplace(int dirfd, const char *from, const char *to)
+{
+    int rc = (int)syscall(SYS_renameat2, dirfd, from, dirfd, to, 1u /* RENAME_NOREPLACE */);
+    if (rc != 0 && (errno == EINVAL || errno == ENOSYS))
+        rc = renameat(dirfd, from, dirfd, to);
+    return rc;
 }
 #define tsdb_thread_name(name) pthread_setname_np(pthread_self(), (name)) /* a macro: needs _GNU_SOURCE where used */
 
