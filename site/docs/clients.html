@@ -512,28 +512,27 @@ explains each.</p>
 <div class="tabpanel" role="tabpanel" data-key="c">
 <p>The calls in <code>include/tsdb.h</code>. The C client has the same ones with the prefix <code>tsdbc_</code>
 (<code>tsdbc_query_spread</code>, <code>tsdbc_query_twa</code>, <code>tsdbc_query_lttb</code>).</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L477-L485">
-int tsdb_query_group(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
-                     tsdb_bucket **out, size_t *nout);
-/* Buckets that begin at given UTC instants: bucket i covers [bounds[i],
- * bounds[i + 1]), the last one everything from bounds[n - 1] on; only rows in
- * [start, end) count. bounds must strictly increase. Reported starts are the
- * bounds; order and limit as in tsdb_query_group_ex. */
-int tsdb_query_bounds(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
-                      const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L541-L551">*  - The last reading of a series has no segment: it holds until a later
+<pre><code class="language-c" data-src="include/tsdb.h#L477-L485">} tsdb_unit;
+
+typedef struct tsdb_group {
+    tsdb_unit unit;
+    uint32_t count;       /* 0 means 1 */
+    const char *timezone; /* NULL or "UTC"; clients turn other zones into bounds */
+} tsdb_group;
+
+int tsdb_query_group(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L541-L551">* [t_i, t_{i+1}).
+*  - TSDB_TWA_STEP (last observation carried forward): v_i holds over the
+*    segment. A null reading holds nothing: a null ends the previous value.
+*  - TSDB_TWA_LINEAR: the value runs on a straight line from v_i to v_{i+1}
+*    (trapezoids); a segment with a null at either end covers nothing.
+*  - max_gap_ms &gt; 0: a segment longer than max_gap_ms covers nothing (the value
+*    is stale; LINEAR does not interpolate across it). 0: no limit.
+*  - The last reading of a series has no segment: it holds until a later
 *    reading arrives, never up to "now".
 *  - Deleted readings do not exist: the segment before a deleted range runs
-*    from the last live reading to the next live one. Expired readings
-*    (retention) do not either, and nothing is carried in from before the
-*    retention cutoff: the first segment starts at the first unexpired reading.
-* A bucket [b0, b1) integrates every segment over its intersection with the
-* bucket and with [start, end): segments are cut exactly at bucket edges and at
-* start and end (LINEAR interpolates the value at the cut), and the value in
-* force at b0 comes from the last reading before it, however long ago (within
-* max_gap_ms), even before start. Readings after end only end segments.</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">/* tsdb_query_agg with order and limit (opts NULL: as tsdb_query_agg). */
-int tsdb_query_agg_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,</code></pre>
+*    from the last live reading to the next live one. Expired readings</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">typedef enum { TSDB_ASC = 0, TSDB_DESC = 1 } tsdb_order;</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
 <pre><code class="language-rust" data-src="client/rust/examples/analytics.rs">use tsdb_client::{Client, ConnectOptions, QueryOpts, TwaOpts, ValueType};
@@ -631,12 +630,12 @@ ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);</code></
 <p><code>tsdb_query_multi</code> calls your function once per series as the answers come;
 <code>tsdb_query_multi_collect</code> returns them all at once. The C client has <code>tsdbc_query_multi</code> and
 <code>tsdbc_query_multi_collect</code>.</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">int64_t start, end;
-const int64_t *starts, *ends; /* per series, or NULL */
-tsdb_query_opts opts;
-int64_t interval_ms;
-const int64_t *intervals; /* per series, or NULL */
-const tsdb_group *group;  /* any zone */</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">} tsdb_multi_kind;
+
+#define TSDB_MULTI_TRIM_LO 1u
+#define TSDB_MULTI_TRIM_HI 2u
+
+typedef struct tsdb_multi_query {</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
 <p>The Rust client has the same many-series calls.
@@ -689,10 +688,11 @@ for (int i = 0; i &lt; pumps.length; i++) {
 <button type="button" role="tab" data-key="java">Java</button>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="c">
-<pre><code class="language-c" data-src="include/tsdb.h#L259-L261">/* ---- writing ----
- * (series, ts) is a unique key, as in ReplacingMergeTree read with FINAL:
- * writing an existing (series, ts) replaces its value, the last write wins</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">int tsdb_insert_series(tsdb *db, tsdb_sid series, const int64_t *ts, const float *values, size_t n);</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L259-L261">* every volume and the root, volumes first. Refuses (TSDB_ERR_INVALID, with a message on stderr) unless each
+* directory was closed cleanly by the release that wrote it (no WAL segment, intent file or tmp part) and refuses
+* (TSDB_ERR_LOCKED) while a writer holds one. Followers on other hosts cannot be seen and must be stopped first. Safe</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">* and visible. Large batches are written as one part per partition; small
+* ones go through the WAL into the memtable. Rows may be in any order;</code></pre>
 <p>The C client has the same calls with the prefix <code>tsdbc_</code>.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
