@@ -660,20 +660,33 @@ static int load_parts(eng *db, bool read_only)
 int eng_open(const char *dir, const tsdb_options *opts, eng **out) { return eng_open_sched(dir, opts, NULL, out); }
 
 static __thread int adopt_lockfd = -1;
+/* A check of the opened engine (eng_reopen), run by the open once nothing can fail any more and before the engine's
+ * own threads start: they change the parts list (a merge, a flush), which the check reads without a lock. */
+static __thread void (*open_check)(const eng *, void *);
+static __thread void *open_check_arg;
 
-int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, eng **out)
+int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, eng **out,
+               void (*check)(const eng *neu, void *arg), void *arg)
 {
-    if (old->lockfd < 0)
-        return eng_open_sched(dir, opts, qs, out);
-    int fd = fcntl(old->lockfd, F_DUPFD_CLOEXEC, 3); /* the new engine owns this copy; the old one keeps its own */
-    if (fd < 0)
-        return TSDB_ERR_IO;
-    adopt_lockfd = fd;
-    int rc = eng_open_sched(dir, opts, qs, out);
-    if (adopt_lockfd >= 0) { /* the open failed before it took the fd */
-        close(adopt_lockfd);
-        adopt_lockfd = -1;
+    open_check = check; /* taken by the open; cleared below when it failed before that */
+    open_check_arg = arg;
+    int rc;
+    if (old->lockfd < 0) {
+        rc = eng_open_sched(dir, opts, qs, out);
+    } else {
+        int fd = fcntl(old->lockfd, F_DUPFD_CLOEXEC, 3); /* the new engine owns this copy; the old one keeps its own */
+        if (fd < 0) {
+            open_check = NULL;
+            return TSDB_ERR_IO;
+        }
+        adopt_lockfd = fd;
+        rc = eng_open_sched(dir, opts, qs, out);
+        if (adopt_lockfd >= 0) { /* the open failed before it took the fd */
+            close(adopt_lockfd);
+            adopt_lockfd = -1;
+        }
     }
+    open_check = NULL;
     return rc;
 }
 
@@ -815,6 +828,11 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             rc = TSDB_ERR_NOMEM;
             goto fail;
         }
+    }
+    if (open_check) { /* a reopen's comparison with the engine it replaces: before any thread changes the parts */
+        void (*check)(const eng *, void *) = open_check;
+        open_check = NULL;
+        check(db, open_check_arg);
     }
     if (!ro && db->opt.merge_threads > 0) {
         db->mergers = calloc((size_t)db->opt.merge_threads, sizeof *db->mergers);

@@ -49,6 +49,16 @@ not change (the new status `TSDB_ERR_UNAVAILABLE` only appears for volumes that 
   count falls or a merge of it commits, instead of each paying 30 s. The rows are published before the wait, so the
   insert still succeeds; the partition's part count grows until the part is restored. `tests/test_damage.c`
   (`test_wait_merges_damaged`, `test_wait_merges_stalled`, `test_wait_merges_failing`).
+- **A volume recovery in `tsdbd` no longer frees an engine that a name or type lookup still holds.** While a volume
+  is quiesced the server still answers names and types, each holding a reference on the engine, and
+  `tsdb_volume_reopen` freed the old engine after swapping it without waiting for a reference taken after its own
+  check (a use after free under ASan). It now waits for them to give theirs back before it frees the engine.
+- **The loss of a part after a storage outage is no longer hidden by the new engine's merges.** `tsdb_volume_reopen`
+  compared the parts the halted engine had with the new engine's list after the new engine's merge and flush threads
+  had started: a merge across the gap of a lost part made it look covered (the loss was not reported, no DIVERGED),
+  healthy parts being merged were reported lost, and the loop read part pointers a merge freed. The comparison now
+  runs inside the open, before those threads start. Tests in `tests/test_recover.c`
+  (`meta_reference_at_reopen`, `merge_clears_loss`).
 - **A step of the wall clock no longer deletes retired parts early.** The `obsolete_part_lifetime_s` of a part a
   merge replaced (`retired_*`, which a follower on another host may still have mapped) is now counted on the monotonic
   clock, also for the retired files a restart finds. A clock set forward (NTP, an operator, a resumed VM) used to

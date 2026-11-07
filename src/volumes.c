@@ -1551,6 +1551,44 @@ int tsdb_volume_idle(tsdb *t, size_t vol, int timeout_ms)
     return rc;
 }
 
+/* tests (tests/test_recover.c): fn(arg, 0) runs in tsdb_volume_reopen once its checks passed, before it halts the old
+ * engine, and fn(arg, 1) when the new engine is open (its threads run), and a held reference on a series' engine (what a name or type lookup holds between its route and its use). */
+static void (*test_reopen_hook)(void *, int phase);
+static void *test_reopen_hook_arg;
+void tsdb_test_reopen_hook(void (*fn)(void *, int phase), void *arg)
+{
+    test_reopen_hook_arg = arg;
+    test_reopen_hook = fn;
+}
+
+typedef struct meta_hold {
+    eng *e;
+    uint32_t local;
+} meta_hold;
+
+void *tsdb_test_meta_hold(tsdb *t, tsdb_sid id)
+{
+    meta_hold *h = calloc(1, sizeof *h);
+    if (h && !route_meta(t, id, &h->e, &h->local)) {
+        free(h);
+        h = NULL;
+    }
+    return h;
+}
+
+int tsdb_test_meta_use(void *hold) /* what tsdb_series_type does with the engine */
+{
+    meta_hold *h = hold;
+    return eng_series_type(h->e, h->local);
+}
+
+void tsdb_test_meta_release(void *hold)
+{
+    meta_hold *h = hold;
+    eng_unref(&h->e);
+    free(h);
+}
+
 int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
 {
     tsdb_volume_report none, *rep = report ? report : &none;
@@ -1570,6 +1608,8 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
         free(path);
         return TSDB_ERR_INVALID; /* quiesce, then wait until idle: no call is inside the old engine */
     }
+    if (test_reopen_hook)
+        test_reopen_hook(test_reopen_hook_arg, 0); /* tests: a late route_meta caller takes its reference here */
     eng_halt(old);
     /* ha.md 15.5 step 3 and 4: compare the memory of the halted engine with the storage, before the open reads it.
      * Nothing here changes what the old engine knows, so a failed attempt can be repeated. */
@@ -1587,14 +1627,18 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     if (rc == 0)
         rc = reval_dicts(old, path, &rep->series_repaired, &rep->states_repaired);
     eng *e = NULL;
-    if (rc == 0)
-        rc = eng_reopen(old, path, &t->opt, t->sched, &e);
+    reval_check chk = {.x = exp, .nx = nexp};
+    if (rc == 0) /* the parts are compared inside the open, before the new engine's merge threads start */
+        rc = eng_reopen(old, path, &t->opt, t->sched, &e, reval_check_open, &chk);
     free(path);
     if (rc) {
         free(exp);
         return rc; /* the old engine stays, halted and quiesced: try again */
     }
-    reval_parts(e, exp, nexp, &rep->lost_parts, &rep->lost_part_rows);
+    if (test_reopen_hook)
+        test_reopen_hook(test_reopen_hook_arg, 1); /* tests: the new engine's merges get time to run */
+    rep->lost_parts = chk.lost;
+    rep->lost_part_rows = chk.lost_rows;
     reval_logs(old, e, &rep->lost_log_bytes);
     free(exp);
     rep->diverged = rep->lost_parts != 0 || rep->lost_log_bytes != 0;
@@ -1607,6 +1651,13 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     e->test_precommit_arg = t->test_precommit_arg;
     t->vols[vol] = e;
     pthread_rwlock_unlock(&t->lock);
+    /* A name or type lookup (route_meta) takes its reference on a quiesced engine, and may have done so after the
+     * check at the top: nothing new can reach the old engine now, so wait for those to give theirs back (eng_unref
+     * wakes us: it is quiesced) before eng_retire frees it. */
+    pthread_mutex_lock(&idle_mu);
+    while (atomic_load_explicit(&old->refs, memory_order_acquire) > 0)
+        pthread_cond_wait(&idle_cv, &idle_mu);
+    pthread_mutex_unlock(&idle_mu);
     eng_retire(old, &t->kept_mu, &t->kept_names, &t->nkept, &t->capkept); /* names stay valid until tsdb_close */
     return 0;
 }

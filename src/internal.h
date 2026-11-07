@@ -1596,10 +1596,20 @@ typedef struct reval_part {
 int reval_dicts(eng *old, const char *dir, uint64_t *series_added, uint64_t *states_added);
 int reval_capture(eng *old, reval_part **out, size_t *n);
 void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost, uint64_t *lost_rows);
+/* reval_parts as the `check` of eng_reopen: it runs before the new engine's threads start (see there). */
+typedef struct reval_check {
+    const reval_part *x;
+    size_t nx;
+    uint64_t lost, lost_rows; /* out */
+} reval_check;
+void reval_check_open(const eng *neu, void *arg);
 void reval_logs(const eng *old, const eng *neu, uint64_t *lost_bytes);
 void eng_halt(eng *db);
-/* A new engine for the directory of `old` (halted, closed afterwards by eng_retire) that takes over its lock. */
-int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, struct sched *qs, eng **out);
+/* A new engine for the directory of `old` (halted, closed afterwards by eng_retire) that takes over its lock.
+ * `check(neu, arg)`, when given, runs on the opened engine before its merge and flush threads start: the only moment
+ * its parts list is read without a lock and still the one the storage held. */
+int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, struct sched *qs, eng **out,
+               void (*check)(const eng *neu, void *arg), void *arg);
 int eng_series(eng *db, const char *name, int type, uint32_t *id);
 int eng_series_lookup(eng *db, const char *name, uint32_t *id);
 uint32_t eng_series_count(eng *db);
@@ -1815,6 +1825,13 @@ void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
 uint64_t tsdb_test_fence_wakeups(struct tsdb *t);
 /* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
+/* tests: fn(arg, 0) runs in tsdb_volume_reopen before it halts the old engine, fn(arg, 1) once the new engine is
+ * open and its threads run; a reference on a series' engine as a
+ * name or type lookup holds it between its route and its use (tsdb_test_meta_use reads the type through it) */
+void tsdb_test_reopen_hook(void (*fn)(void *, int phase), void *arg);
+void *tsdb_test_meta_hold(struct tsdb *t, tsdb_sid id);
+int tsdb_test_meta_use(void *hold);
+void tsdb_test_meta_release(void *hold);
 /* test hook: the WAL tail kept for switches, and how far segments are unlinked (durably) */
 void tsdb_test_wal_state(struct tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced);
 /* test hook: every granule of the first volume, with its partition's class (tests/test_classes.c) */

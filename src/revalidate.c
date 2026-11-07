@@ -105,7 +105,8 @@ int reval_capture(eng *old, reval_part **out, size_t *n)
     return 0;
 }
 
-/* After the open: which of the captured parts are gone. */
+/* After the open: which of the captured parts are gone. Reads neu->parts without a lock: only before its threads
+ * start (reval_check_open). */
 void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost, uint64_t *lost_rows)
 {
     for (size_t i = 0; i < nx; i++) {
@@ -131,6 +132,15 @@ void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost,
                 o->name, (unsigned long long)o->min_block, (unsigned long long)o->max_block,
                 (unsigned long long)o->rows, o->nt ? ", with deletes" : "");
     }
+}
+
+/* The check eng_reopen runs inside the open, before the new engine's merge threads and flusher exist: once they run,
+ * a merge across the gap of a lost part makes it look covered (the loss goes unreported), a part being merged looks
+ * lost, and the list changes under this loop. */
+void reval_check_open(const eng *neu, void *arg)
+{
+    reval_check *c = arg;
+    reval_parts(neu, c->x, c->nx, &c->lost, &c->lost_rows);
 }
 
 /* After the open: RETENTION and CLASSES only grow, so fewer bytes applied than the halted engine had means records

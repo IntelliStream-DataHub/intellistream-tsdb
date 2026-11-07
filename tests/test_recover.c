@@ -17,6 +17,7 @@
 
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -319,6 +320,128 @@ static void latest_quiesced(void)
     tsdb_close(db);
 }
 
+
+/* ------------------------------------------------- security review 0.9.1 */
+
+/* src/volumes.c, src/db.c: test hooks (internal.h) */
+void tsdb_test_reopen_hook(void (*fn)(void *, int phase), void *arg);
+void *tsdb_test_meta_hold(tsdb *t, tsdb_sid id);
+int tsdb_test_meta_use(void *hold);
+void tsdb_test_meta_release(void *hold);
+void tsdb_test_before_parts(void (*fn)(void *), void *arg);
+extern atomic_int merge_fault_ms;
+
+/* A name or type lookup (route_meta) answers on a quiesced volume and takes a reference on its engine. One that took
+ * it after the reopen's check that the volume is idle must be waited for: the reopen freed the old engine under it
+ * (a use after free that tsdbd's requests could trigger during domain recovery; ASan reports it). */
+typedef struct {
+    tsdb *db;
+    tsdb_sid s;
+    void *hold;
+    pthread_t th;
+    int released; /* __atomic */
+    int type;
+} late;
+
+static void *late_main(void *arg)
+{
+    late *l = arg;
+    sleep_ms(300); /* a preempted caller: the reopen has swapped the engines meanwhile */
+    l->type = tsdb_test_meta_use(l->hold); /* reads the old engine */
+    __atomic_store_n(&l->released, 1, __ATOMIC_SEQ_CST);
+    tsdb_test_meta_release(l->hold);
+    return NULL;
+}
+
+static void late_hook(void *arg, int phase)
+{
+    late *l = arg;
+    if (phase != 0)
+        return;
+    l->hold = tsdb_test_meta_hold(l->db, l->s); /* after the check at the top of the reopen */
+    CHECK(l->hold != NULL);
+    CHECK(pthread_create(&l->th, NULL, late_main, l) == 0);
+}
+
+static void meta_reference_at_reopen(void)
+{
+    char root[1024], vol[1024];
+    snprintf(root, sizeof root, "%s/metaref_root", scratch);
+    snprintf(vol, sizeof vol, "%s/metaref_vol", scratch);
+    sh("rm -rf '%s' '%s'", root, vol);
+    late l = {0};
+    tsdb *db = reval_open(root, vol, &l.s, "meta");
+    l.db = db;
+    int64_t ts[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    float v[10] = {0};
+    OK(tsdb_insert_series(db, l.s, ts, v, 10));
+    stop_volume(db);
+    tsdb_test_reopen_hook(late_hook, &l);
+    OK(tsdb_volume_reopen(db, 1, NULL));
+    tsdb_test_reopen_hook(NULL, NULL);
+    CHECK(__atomic_load_n(&l.released, __ATOMIC_SEQ_CST) == 1); /* the old engine outlived its last reference */
+    pthread_join(l.th, NULL);
+    CHECK(l.type == TSDB_FLOAT32);
+    OK(tsdb_volume_resume(db, 1));
+    tsdb_type ty;
+    OK(tsdb_series_type(db, l.s, &ty));
+    CHECK(ty == TSDB_FLOAT32);
+    tsdb_close(db);
+}
+
+/* the new engine is open: time for its merge threads to merge across the gap of the lost part, as they do whenever
+ * the caller is not scheduled for a moment */
+static void let_merges_run(void *arg, int phase)
+{
+    (void)arg;
+    if (phase == 1)
+        sleep_ms(500);
+}
+
+static void clear_fault(void *arg)
+{
+    (void)arg;
+    atomic_store(&merge_fault_ms, 0);
+}
+
+/* The parts the storage lost are compared with the new engine's parts before its merge threads start. After they run,
+ * a merge across the gap of a lost part makes the part look covered and the loss goes unreported. */
+static void merge_clears_loss(void)
+{
+    char root[1024], vol[1024];
+    snprintf(root, sizeof root, "%s/lostmid_root", scratch);
+    snprintf(vol, sizeof vol, "%s/lostmid_vol", scratch);
+    int64_t ts[300];
+    float v[300];
+    for (int i = 0; i < 300; i++)
+        v[i] = (float)i;
+    for (int round = 0; round < 5; round++) {
+        sh("rm -rf '%s' '%s'", root, vol);
+        tsdb_sid s;
+        tsdb *db = reval_open(root, vol, &s, "lostmid");
+        atomic_store(&merge_fault_ms, 1); /* the old engine's merges fail: its parts stay as they are */
+        for (int k = 0; k < 40; k++) { /* 40 parts of one partition, one block range each */
+            for (int i = 0; i < 300; i++)
+                ts[i] = k * 1000 + i;
+            OK(tsdb_insert_series(db, s, ts, v, 300));
+        }
+        stop_volume(db);
+        /* the new engine merges at once (the hook runs in its open, after the old engine halted) */
+        tsdb_test_before_parts(clear_fault, NULL);
+        tsdb_test_reopen_hook(let_merges_run, NULL);
+        sh("cd '%s' && f=$(ls p*.part | sort -t_ -k2,2n | sed -n 20p) && rm -f \"$f\"", vol);
+        tsdb_volume_report rep;
+        OK(tsdb_volume_reopen(db, 1, &rep));
+        tsdb_test_before_parts(NULL, NULL);
+        tsdb_test_reopen_hook(NULL, NULL);
+        atomic_store(&merge_fault_ms, 0);
+        CHECK(rep.lost_parts == 1 && rep.lost_part_rows == 300 && rep.diverged);
+        OK(tsdb_volume_resume(db, 1));
+        CHECK(count(db, s) == 39 * 300);
+        tsdb_close(db);
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1)
@@ -399,6 +522,8 @@ int main(int argc, char **argv)
     tsdb_close(db);
     revalidation();
     latest_quiesced();
+    meta_reference_at_reopen();
+    merge_clears_loss();
     if (failures) {
         fprintf(stderr, "test_recover: %d failures\n", failures);
         return 1;
