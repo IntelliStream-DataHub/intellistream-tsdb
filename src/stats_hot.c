@@ -265,7 +265,8 @@ static void hagg_finish(hagg *a)
 {
     if (a->done)
         return;
-    qsort(a->e, a->n, sizeof *a->e, hent_id_cmp);
+    if (a->n)
+        qsort(a->e, a->n, sizeof *a->e, hent_id_cmp); /* e is NULL while empty: qsort and memcpy take no null */
     size_t k = 0;
     for (size_t i = 0; i < a->n;) {
         hent r = a->e[i];
@@ -293,8 +294,10 @@ int hagg_top(hagg *a, tsdb_hot *out, size_t k, size_t *n, uint64_t *threshold)
     hent *c = malloc((a->n ? a->n : 1) * sizeof *c); /* a->e stays sorted by id for hagg_estimate */
     if (!c)
         return TSDB_ERR_NOMEM;
-    memcpy(c, a->e, a->n * sizeof *c);
-    qsort(c, a->n, sizeof *c, hent_est_cmp);
+    if (a->n) {
+        memcpy(c, a->e, a->n * sizeof *c);
+        qsort(c, a->n, sizeof *c, hent_est_cmp);
+    }
     size_t m = MIN(k, a->n);
     for (size_t i = 0; i < m; i++)
         out[i] = (tsdb_hot){c[i].id, c[i].est, c[i].err};
@@ -353,10 +356,12 @@ void eng_hot_collect(eng *db, void *writes, void *bpr, uint64_t sid_base)
 
 size_t resident_bytes_range(const uint8_t *p, size_t len)
 {
-    static size_t page;
+    static _Atomic size_t page_cache; /* several sweepers (one per engine) may fill it at once: same value */
+    size_t page = atomic_load_explicit(&page_cache, memory_order_relaxed);
     if (!page) {
         long ps = sysconf(_SC_PAGESIZE);
         page = ps > 0 ? (size_t)ps : 4096;
+        atomic_store_explicit(&page_cache, page, memory_order_relaxed);
     }
     if (!len)
         return 0;

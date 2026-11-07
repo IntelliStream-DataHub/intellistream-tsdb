@@ -621,6 +621,21 @@ static void test_hot(const char *base)
     CHECK(tsdb_hot_series(db, TSDB_HOT_READS, hot, 257, &n, &thr) == TSDB_ERR_INVALID);
     tsdb_close(db);
 
+    /* an empty database: no entries, no memory behind the lists (qsort and memcpy take no null: ASan + UBSan) */
+    char edir[512];
+    snprintf(edir, sizeof edir, "%s/hot-empty", base);
+    OK(mkdir(edir, 0755));
+    tsdb_options eo = base_opts();
+    tsdb *edb;
+    OK(tsdb_open(edir, &eo, &edb));
+    OK(tsdb_stats_settle(edb, 60000));
+    for (int kind = TSDB_HOT_READS; kind <= TSDB_HOT_BYTES_PER_ROW; kind++) {
+        n = 99;
+        OK(tsdb_hot_series(edb, kind, hot, 10, &n, &thr));
+        CHECK(n == 0);
+    }
+    tsdb_close(edb);
+
     o.stats = -1;
     OK(tsdb_open(dir, &o, &db));
     CHECK(tsdb_hot_series(db, TSDB_HOT_READS, hot, 10, &n, &thr) == TSDB_ERR_INVALID);
