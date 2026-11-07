@@ -6,13 +6,7 @@ All notable changes to tsdb are listed here, newest first. The format follows
 [docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.9.x release may still change the
 disk format and the wire protocol.
 
-## [0.9.1] - 2026-11-07
-
-A patch release: **two data fixes**, storage outage handling for NFS, macOS as a developer platform, and smaller
-fixes to the server. **Disk format version 8 and wire protocol version 12, as in 0.9.0**, and the embedded C ABI is
-still version 3 (it only gained functions and structs). A database of 0.9.0 opens as it is. The wire protocol did
-not change (the new status `TSDB_ERR_UNAVAILABLE` only appears for volumes that an operator put in a
-`--health-domain`); use the same release on the server and its clients all the same.
+## [Unreleased]
 
 ### Changed
 
@@ -41,6 +35,14 @@ not change (the new status `TSDB_ERR_UNAVAILABLE` only appears for volumes that 
   other markers are reserved, and the engine calls a no-op `jr_intent` / `jr_commit` hook where names and files
   become visible. No backend yet: no marker is written outside the tests.
 - `tsdb_upgrade(dir)` in `tsdb.h` and `tsdb DIR upgrade` (above).
+
+## [0.9.1] - 2026-11-07
+
+A patch release: **two data fixes**, storage outage handling for NFS, macOS as a developer platform, and smaller
+fixes to the server. **Disk format version 8 and wire protocol version 12, as in 0.9.0**, and the embedded C ABI is
+still version 3 (it only gained functions and structs). A database of 0.9.0 opens as it is. The wire protocol did
+not change (the new status `TSDB_ERR_UNAVAILABLE` only appears for volumes that an operator put in a
+`--health-domain`); use the same release on the server and its clients all the same.
 
 ### Fixed
 
