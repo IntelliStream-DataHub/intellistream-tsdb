@@ -1,10 +1,13 @@
 # Follow-up to the merge-wait fix (0.9.1)
 
+**Done (branch merge-barrier, CHANGELOG [Unreleased]): the damaged part as a barrier. Open: the cap on the part count.**
+
 0.9.1 ends an insert's wait for merges when a partition has a damaged part (`db_wait_merges`), and leaves the whole
 partition out of merges (`select_merge_locked`, `eng_optimize`, the retention rules) while a part of it is marked.
 Two things were left out on purpose:
 
-- **A damaged part as a barrier.** Merges combine adjacent block ranges only, so the ranges below and above a damaged
+- **A damaged part as a barrier (done: `select_merge_locked`, `eng_optimize`, `db_wait_merges`; the retention drops
+  were already per part, and the whole-partition drop stays blocked while a part is marked, see docs/design.md).** Merges combine adjacent block ranges only, so the ranges below and above a damaged
   part could each still be merged: the damaged part's tombstones keep hiding lower blocks, and the tombstones of merged
   upper parts hide its rows as before. That bounds the partition's part count, which today grows without limit until
   the part is restored (mmaps and descriptors per part, slower queries). It touches `select_merge_locked`, the first-k

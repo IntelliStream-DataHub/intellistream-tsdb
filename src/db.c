@@ -206,9 +206,11 @@ static int64_t wait_mono_ms(void)
 
 /* Backpressure, not a safety rule: the rows are published and visible when an insert gets here, so the wait never
  * fails the insert; it only ends early. It ends at once when merges of the partition cannot make progress:
- *  - a part of it is damaged (marked by part_checked or part_mark_payload): select_merge_locked leaves the whole
- *    partition out, so the count would never fall. Said once per damaged part; the damage itself was logged and
- *    counted (st_broken_parts) when it was marked;
+ *  - a part of it is damaged (marked by part_checked or part_mark_payload) and no two parts are left that merges
+ *    may combine: a damaged part is a barrier (select_merge_locked), the ranges on either side are merged, so with
+ *    a pair left the wait is as for any partition (and bounded by the stall rule below), and the part count of a
+ *    damaged partition stays bounded. Said once per damaged part; the damage itself was logged and counted
+ *    (st_broken_parts) when it was marked;
  *  - the engine failed (eng_fail): nothing is merged any more.
  * and after wait_stall_ms in which the count did not fall and no merge of the partition ran, for every other
  * cause (parts that can never pair under max_part_bytes): a rate-limited line. A merge in flight is not cut short:
@@ -228,7 +230,7 @@ void db_wait_merges(eng *db, int64_t partition)
     uint64_t start_seq = db->merge_fail_seq;
     while (!atomic_load(&db->stop)) {
         size_t n = 0;
-        bool merging = false, failed = false;
+        bool merging = false, failed = false, pairs = false, prev_ok = false;
         part *bad = NULL;
         for (size_t i = 0; i < db->nparts; i++) {
             part *p = db->parts[i];
@@ -237,19 +239,23 @@ void db_wait_merges(eng *db, int64_t partition)
             n++;
             merging |= p->merging;
             failed |= p->fail_seq > start_seq;
-            if (!bad && atomic_load(&p->damaged))
+            bool dmg = atomic_load(&p->damaged);
+            if (dmg && !bad)
                 bad = p;
+            pairs |= prev_ok && !dmg; /* two neighbours with no barrier between: a merge can still run */
+            prev_ok = !dmg;
         }
         if (n <= PARTS_TO_DELAY_INSERT || eng_check(db)) {
             if (n <= PARTS_TO_DELAY_INSERT)
                 db_stall_clear_locked(db, partition);
             break;
         }
-        if (bad) {
+        if (bad && !pairs) {
             if (!atomic_exchange(&bad->wait_logged, true))
-                fprintf(stderr, "tsdb: partition %" PRId64 " has %zu parts and part %s is damaged, so its merges "
-                                "are left out: inserts into it no longer wait for merges (its part count grows "
-                                "until the part is restored)\n", partition, n, bad->name);
+                fprintf(stderr, "tsdb: partition %" PRId64 " has %zu parts and part %s is damaged: no two parts "
+                                "are left that a merge may combine (a damaged part is a barrier), so inserts into "
+                                "it no longer wait for merges (its part count grows until the part is restored)\n",
+                        partition, n, bad->name);
             break;
         }
         size_t si = stall_find_locked(db, partition);
