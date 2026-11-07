@@ -34,6 +34,7 @@
 #include "raft/raft.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netinet/in.h>
@@ -1020,9 +1021,12 @@ static void scen_dirsync(void)
  * the way of its temporary file makes restore() stop there). The restarted server must catch up, not sit at applied
  * 0 over a log based past its snapshot: from the image it kept before the reset (install), or, that image gone too
  * (damage; reseed), by emptying its log for a new image. */
-static void install_crash(int drop_kept)
+enum { KEPT_TAKEN, KEPT_GONE, HEADER_TORN };
+
+static void install_crash(int mode)
 {
-    scenario(drop_kept ? "reseed" : "install");
+    int drop_kept = mode == KEPT_GONE;
+    scenario(mode == KEPT_GONE ? "reseed" : mode == HEADER_TORN ? "torn" : "install");
     for (int i = 0; i < 3; i++)
         envs[i] = "snap_every=2,snap_retain=1,seg_bytes=200"; /* small segments: compaction drops whole ones */
     for (int i = 0; i < 3; i++)
@@ -1041,6 +1045,27 @@ static void install_crash(int drop_kept)
         die("server 2 stopped inside an install without the image kept in %s", kept);
     if (drop_kept && unlink(kept) != 0)
         die("cannot remove %s: %s", kept, strerror(errno));
+    if (mode == HEADER_TORN) {
+        /* the crash inside the reset's last step: the segment the log starts again on is named, its header is not
+         * durable. It is the lone segment, named for the image's index + 1, which the snapshot (still the old one)
+         * is not at: the open refused it as damage before it knew the store the reset was made for. */
+        char dir[PATH_MAX + 128], seg[PATH_MAX + 256], name[300] = "";
+        snprintf(dir, sizeof dir, "%s/n2/meta/raft", base);
+        DIR *d = opendir(dir);
+        int nseg = 0;
+        for (struct dirent *e; d && (e = readdir(d));)
+            if (!strncmp(e->d_name, "log-", 4)) {
+                snprintf(name, sizeof name, "%s", e->d_name);
+                nseg++;
+            }
+        if (d)
+            closedir(d);
+        if (nseg != 1)
+            die("the install crash left %d log segments in %s, expected the one the reset made", nseg, dir);
+        snprintf(seg, sizeof seg, "%s/%s", dir, name);
+        if (truncate(seg, 0) != 0)
+            die("cannot truncate %s: %s", seg, strerror(errno));
+    }
     start(2);
     unsigned want = 3;
     await_view(0, p_voters, &want, "three voters");
@@ -1052,15 +1077,88 @@ static void install_crash(int drop_kept)
                "catches up\n");
         return;
     }
-    if (!log_has(2, "taking the image kept for it"))
+    if (!log_has(2, "taking the install image kept in"))
         die("server 2 did not take the image it kept for the unfinished install (the test proves nothing)");
     if (log_has(2, "fencing the vote"))
         die("server 2 emptied its log although it had kept the image");
-    printf("  a crash inside an install: the server takes the image it kept, and catches up\n");
+    if (mode == HEADER_TORN)
+        printf("  a crash inside an install, the new segment's header torn: the server takes the image it kept, and "
+               "catches up\n");
+    else
+        printf("  a crash inside an install: the server takes the image it kept, and catches up\n");
 }
 
-static void scen_install(void) { install_crash(0); }
-static void scen_reseed(void) { install_crash(1); }
+static void scen_install(void) { install_crash(KEPT_TAKEN); }
+static void scen_reseed(void) { install_crash(KEPT_GONE); }
+static void scen_torn(void) { install_crash(HEADER_TORN); }
+
+/* A log that ends below the snapshot beside it, as a reset stopped between its deletes (or a lazily written durable
+ * floor and a rotten tail) leaves: the newest segments are removed from a follower's directory. The start makes the
+ * snapshot the log's base (the store holds what the dropped entries did) and the follower catches up from the leader,
+ * where it used to boot with a log ending below its applied index (proposals at an index the store has applied). */
+static void scen_rebase(void)
+{
+    scenario("rebase");
+    for (int i = 0; i < 3; i++)
+        envs[i] = "snap_every=2,snap_retain=1000,seg_bytes=200"; /* every entry stays: no installs */
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_fast(0);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    check_all_agree(0, 3);
+    stop(2, SIGKILL);
+    char dir[PATH_MAX + 128], path[PATH_MAX + 256];
+    snprintf(path, sizeof path, "%s/n2/meta/snapshot", base);
+    FILE *f = fopen(path, "rb");
+    uint8_t img[1 << 16];
+    size_t len = f ? fread(img, 1, sizeof img, f) : 0;
+    if (f)
+        fclose(f);
+    struct meta_state m;
+    meta_init(&m);
+    if (!len || meta_snapshot_decode(&m, img, len) != META_OK)
+        die("server 2 has no snapshot to put the log below (%s)", path);
+    uint64_t applied = m.applied;
+    meta_free(&m);
+    if (applied < 4)
+        die("server 2's snapshot is at %" PRIu64 ", too early to put the log below", applied);
+    snprintf(dir, sizeof dir, "%s/n2/meta/raft", base);
+    DIR *d = opendir(dir);
+    int kept = 0, removed = 0;
+    for (struct dirent *e; d && (e = readdir(d));) {
+        unsigned long long first;
+        if (sscanf(e->d_name, "log-%llu", &first) != 1)
+            continue;
+        if (first + 1 >= applied) { /* the segment holds an entry at or above applied - 1: the log must end lower */
+            snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+            if (unlink(path) != 0)
+                die("cannot remove %s: %s", path, strerror(errno));
+            removed++;
+        } else
+            kept++;
+    }
+    if (d)
+        closedir(d);
+    /* the durable floor (the hard state's note of what was synced and committed) is what refuses a log cut below
+     * it as rot; a reset lowers it to 0 first, so a log it left cut is open to this start. The test lowers it the
+     * only way a file can: no hard state (this server was a learner for a moment; its term and vote come back from
+     * the leader's next message). */
+    snprintf(path, sizeof path, "%s/hard", dir);
+    if (unlink(path) != 0)
+        die("cannot remove %s: %s", path, strerror(errno));
+    if (!kept || !removed)
+        die("could not cut server 2's log below its snapshot at %" PRIu64 " (%d kept, %d removed)", applied, kept,
+            removed);
+    start(2);
+    await_view(0, p_voters, &want, "three voters");
+    check_all_agree(0, 3);
+    if (!log_has(2, "starting the log on it"))
+        die("server 2 did not start its log on the snapshot (the test proves nothing)");
+    printf("  a log that ends below the snapshot: the server starts it on the snapshot and catches up\n");
+}
 
 /* An install that takes longer than voter_replace_s (here: the new servers drop the leader's images for 6 s). A core
  * booted by the leader's first APPEND has an empty configuration until the image arrives; it must keep sending
@@ -1261,6 +1359,7 @@ int main(int argc, char **argv)
         void (*fn)(void);
     } all[] = {{"secret", scen_secret},     {"relay", scen_relay},     {"initcrash", scen_initcrash},
                {"dirsync", scen_dirsync},   {"install", scen_install}, {"reseed", scen_reseed},
+               {"torn", scen_torn},         {"rebase", scen_rebase},
                {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"life", scen_life}};
     int n = (int)(sizeof all / sizeof all[0]);

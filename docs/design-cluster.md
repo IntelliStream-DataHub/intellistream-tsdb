@@ -183,9 +183,15 @@ and stay with the volumes.
 - **Crash during a snapshot install.** The core resets the log to the image's index before the image is applied.
   So a server first writes the image it was sent, durably, to `meta/snapshot.install` (checked: its applied index
   and term are the message's), and only then hands the message to the core; a failed write drops the message (the
-  leader sends it again). A server that boots with a log based past its snapshot takes the kept image when it
-  matches the log's base (index and term) exactly, rather than booting a core that would never apply another entry.
-  Without a matching image (damage) it fences its vote at the log's last entry, drops the log and the snapshot, and
+  leader sends it again). A server that boots takes a kept image that is ahead of its snapshot before it opens
+  the log (a leader's image is committed state), then makes the log fit it: a log that ends below the image, or holds
+  another entry than the image's at its index, is dropped and started again on the image (every entry in it is
+  covered by the image, or can never commit). So a crash anywhere in the core's reset (the floor lowered, the
+  segments deleted newest first, the new segment made) boots the same way: a prefix of the old log that ends below
+  the snapshot, a lone new segment whose header is not durable, and no segment at all are all the same install cut
+  short, never a refused start and never a voter that forgot entries it had acknowledged (the simulator checks
+  both, and that the log covers the store at every boot). Without a kept image that fits a log based past the
+  snapshot (damage) it fences its vote at the log's last entry, drops the log and the snapshot, and
   waits for a new image from the leader (the reseed). The reseed is only the fallback: a fenced voter counts as
   missing until a leader sends it an image, so a group that needs its vote to elect that leader stays without one.
   A snapshot whose directory fsync fails after the rename is fail-stop. Snapshots are

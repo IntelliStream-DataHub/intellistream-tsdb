@@ -446,6 +446,40 @@ static void ml_release(void *p)
     l->ngrave = 0;
 }
 
+/* a deep copy of the durable part of `src` (what a crash leaves) in dst, with its first `keep` entries */
+static void ml_clone_durable(struct mlog *dst, const struct mlog *src, size_t keep)
+{
+    for (size_t i = 0; i < dst->n; i++)
+        free(dst->e[i].data);
+    free(dst->e);
+    *dst = (struct mlog){.base = src->base, .base_term = src->base_term};
+    size_t n = src->durable > src->base ? src->durable - src->base : 0;
+    if (n > src->n)
+        n = src->n;
+    if (keep < n)
+        n = keep;
+    dst->e = n ? calloc(n, sizeof *dst->e) : NULL;
+    dst->cap = n;
+    for (size_t i = 0; i < n; i++) {
+        dst->e[i] = src->e[i];
+        dst->e[i].data = malloc(src->e[i].len + 1);
+        if (src->e[i].len)
+            memcpy(dst->e[i].data, src->e[i].data, src->e[i].len);
+    }
+    dst->n = n;
+    dst->durable = dst->base + n;
+}
+
+static void ml_free(struct mlog *l)
+{
+    ml_release(l);
+    for (size_t k = 0; k < l->n; k++)
+        free(l->e[k].data);
+    free(l->e);
+    free(l->grave);
+    *l = (struct mlog){0};
+}
+
 static const raft_log_ops mlog_ops = {ml_first, ml_last, ml_term_at, ml_get, ml_append,
                                      ml_truncate, ml_reset, ml_compact, ml_release};
 
@@ -469,6 +503,8 @@ struct snode {
     size_t pendlen;
     raft_index pend_index;
     raft_term pend_term;
+    struct mlog prelog; /* the log as it was when an install message arrived: what a reset cut short leaves a prefix of */
+    raft_index ack_floor; /* what this server held durably and a cut install must not make it forget (I1) */
 };
 
 enum { EV_MSG, EV_SYNC, EV_HARD };
@@ -505,6 +541,8 @@ struct msim {
     uint64_t applied_max, proposals, ops_ok, leader_changes, crashes, partitions, installs, cut_installs, reseeds;
     uint64_t changes; /* membership changes the leaders started */
     uint64_t adopts;  /* installs cut short and finished from the kept image */
+    uint64_t partial_resets;
+    uint64_t rebases; /* logs started again on the snapshot at a boot (a reset cut short left them below it) */
     uint64_t quiet; /* no faults and no workload from here on */
     raft_config boot;
     int heal_pending;
@@ -753,6 +791,26 @@ static void drain(struct msim *s, struct snode *nd)
                  * is not kept yet (the boot finds a log based past its snapshot: reseed) */
                 s->cut_installs++;
                 crash(s, nd);
+                /* The reset is a floor lowered, then segments deleted newest first, then the new one made, a
+                 * crash at any step of it: the reset in full (the log on the image's index), a prefix of the old
+                 * log (cut anywhere, below the snapshot too), or no segment at all (the log opens on the snapshot).
+                 * What the server held durably it must not forget (I1). */
+                nd->ack_floor = nd->prelog.durable < nd->pend_index ? nd->prelog.durable : nd->pend_index;
+                unsigned how = (unsigned)rnd(s, 0, 3);
+                if (how == 1) {
+                    size_t n = nd->prelog.durable > nd->prelog.base ? nd->prelog.durable - nd->prelog.base : 0;
+                    ml_clone_durable(&nd->log, &nd->prelog, (size_t)rnd(s, 0, (uint64_t)n));
+                    s->partial_resets++;
+                } else if (how == 2) {
+                    struct meta_state t;
+                    meta_init(&t);
+                    if (nd->snap && meta_snapshot_decode(&t, nd->snap, nd->snaplen) != META_OK)
+                        abort();
+                    ml_reset(&nd->log, t.applied, t.applied_term);
+                    ml_release(&nd->log);
+                    meta_free(&t);
+                    s->partial_resets++;
+                }
                 break;
             }
             struct meta_state t;
@@ -796,16 +854,20 @@ static void boot(struct msim *s, struct snode *nd)
         if (meta_snapshot_decode(&nd->sm, nd->snap, nd->snaplen) != META_OK)
             abort();
     }
-    if (nd->log.base > nd->sm.applied && nd->pend && nd->pend_index == nd->log.base &&
-        nd->pend_term == nd->log.base_term) {
-        /* an install cut short (drain's RESTORE): cluster.c's adopt_install, the image kept before the reset */
+    int adopted = 0;
+    if (nd->pend && nd->pend_index > nd->sm.applied) {
+        /* cluster.c's adopt_install, before the open: a kept image ahead of the snapshot is the store the reset was
+         * made for (a leader's image is committed state), whatever the log a cut reset left holds */
         free(nd->snap);
         nd->snap = nd->pend;
         nd->snaplen = nd->pendlen;
         nd->snap_index = nd->pend_index;
         nd->pend = NULL;
+        meta_free(&nd->sm);
+        meta_init(&nd->sm);
         if (meta_snapshot_decode(&nd->sm, nd->snap, nd->snaplen) != META_OK)
             abort();
+        adopted = 1;
         s->adopts++;
     }
     free(nd->pend); /* cluster.c drops a kept image the log never moved to */
@@ -833,6 +895,26 @@ static void boot(struct msim *s, struct snode *nd)
         s->reseeds++;
         nd->reseeds++;
         nd->blank = 1;
+    }
+    if (nd->log.base <= nd->sm.applied &&
+        (ml_last(&nd->log) < nd->sm.applied ||
+         (adopted && nd->sm.applied && ml_term_at(&nd->log, nd->sm.applied) != nd->sm.applied_term))) {
+        /* cluster.c's rebase: the log ends below the store, or holds another entry than the leader's image at its
+         * index (it can never commit): the log starts again on the snapshot */
+        ml_reset(&nd->log, nd->sm.applied, nd->sm.applied_term);
+        ml_release(&nd->log);
+        s->rebases++;
+    }
+    if (nd->log.base > nd->sm.applied || nd->sm.applied > ml_last(&nd->log))
+        sim_fail(s, "node %u: the log (%" PRIu64 "..%" PRIu64 ") does not cover the store at %" PRIu64 " (I2)",
+                 nd->id, (uint64_t)nd->log.base, (uint64_t)ml_last(&nd->log), nd->sm.applied);
+    if (nd->ack_floor) {
+        raft_index have = ml_last(&nd->log) > nd->sm.applied ? ml_last(&nd->log) : nd->sm.applied;
+        if (have < nd->ack_floor && nd->hard.fence_index < nd->ack_floor)
+            sim_fail(s, "node %u held %" PRIu64 " durably and boots with %" PRIu64 " and a fence at %" PRIu64
+                     ": a forgetful voter (I1)", nd->id, (uint64_t)nd->ack_floor, (uint64_t)have,
+                     (uint64_t)nd->hard.fence_index);
+        nd->ack_floor = 0;
     }
     if (!nd->snap && !nd->blank) {
         uint8_t c[META_CONFIG_MAX];
@@ -1060,6 +1142,7 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
                 if (m.type == RAFT_MSG_SNAPSHOT) {
                     m.u.snapshot.data = ev.bytes + ev.wire_len;
                     m.u.snapshot.len = ev.len - ev.wire_len;
+                    ml_clone_durable(&nd->prelog, &nd->log, SIZE_MAX);
                     if (m.u.snapshot.index > nd->pend_index && m.u.snapshot.index > nd->sm.applied) {
                         free(nd->pend); /* keep_install: durable before the core resets the log */
                         nd->pend = malloc(m.u.snapshot.len + 1);
@@ -1181,10 +1264,11 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
     else if (verbose)
         printf("seed %" PRIu64 ": %u servers, %" PRIu64 " applied, %" PRIu64 " proposals, %" PRIu64
                " operations took effect, %" PRIu64 " leaders, %" PRIu64 " crashes, %" PRIu64 " partitions, %" PRIu64
-               " snapshot installs (%" PRIu64 " cut short, %" PRIu64 " finished from the kept image), %" PRIu64
+               " snapshot installs (%" PRIu64 " cut short, %" PRIu64 " finished from the kept image, %" PRIu64
+               " of them with a prefix of the old log or none; %" PRIu64 " logs started again on the snapshot), %" PRIu64
                " membership changes\n",
                seed, s->n, s->applied_max, s->proposals, s->ops_ok, s->leader_changes, s->crashes, s->partitions,
-               s->installs, s->cut_installs, s->adopts, s->changes);
+               s->installs, s->cut_installs, s->adopts, s->partial_resets, s->rebases, s->changes);
     for (unsigned i = 1; i <= s->n; i++) {
         struct snode *nd = &s->nd[i];
         if (nd->r)
@@ -1197,6 +1281,7 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
         meta_free(&nd->sm);
         free(nd->snap);
         free(nd->pend);
+        ml_free(&nd->prelog);
     }
     for (size_t i = 0; i < s->nev; i++)
         free(s->ev[i].bytes);

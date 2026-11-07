@@ -1623,8 +1623,8 @@ static void close_watches(void)
     C.watch_conn = 0;
 }
 
-/* The log begins after the snapshot's index and no kept image fits (adopt_install; only damage gets here, as
- * keep_install's copy is durable before the core resets the log). Entries between the two are in neither, so this
+/* The log begins after the snapshot's index and no kept image fits (adopt_install takes it before the open; only
+ * damage gets here, as keep_install's copy is durable before the core resets the log). Entries between the two are in neither, so this
  * server could never apply again. It fences its vote at what its log holds (the log forgot what it acknowledged;
  * the fence lifts once it holds that entry again or a snapshot covers it), drops the old snapshot and empties the
  * log, so the leader sends it an image again. Each step is durable before the next, and a crash part way leaves
@@ -1710,10 +1710,15 @@ static int load_image(const char *path, struct meta_state *m, uint8_t **img_out,
     return 0;
 }
 
-/* The log begins after the snapshot, at base (index, term): an install stopped between the core's reset of the log
- * and restore(). The image keep_install kept for exactly that base becomes the snapshot. 1 taken, 0 none that fits
- * (the caller reseeds), -1 with err. */
-static int adopt_install(raft_index index, raft_term term, char *err, size_t errn)
+/* The image keep_install kept, when it is ahead of the snapshot: it becomes the snapshot, before the log is opened.
+ * An install is the core's reset of the log to the image's index followed by restore()'s write of the snapshot,
+ * and a crash anywhere in between (or a reset the crash cut part way: a prefix of the old segments, or a new
+ * segment whose header is not durable) must find the store the reset was made for. The image is a leader's, so it is
+ * committed state (Raft section 7): every entry it covers is in it, whatever the log still holds. An image the core
+ * refused, or whose reset the log already holds, is harmless: core_boot then finds (index, term) in the log and
+ * keeps its suffix. An image that does not verify, or is not ahead, is left (core_boot unlinks it).
+ * 1 taken, 0 none, -1 with err. */
+static int adopt_install(char *err, size_t errn)
 {
     if (!exists(C.pendfile))
         return 0;
@@ -1721,9 +1726,13 @@ static int adopt_install(raft_index index, raft_term term, char *err, size_t err
     meta_init(&t);
     uint8_t *img = NULL;
     size_t n = 0;
-    if (load_image(C.pendfile, &t, &img, &n, err, errn) != 0 || t.applied != index || t.applied_term != term) {
-        say("%s does not hold the image for the log's base %" PRIu64 " (term %" PRIu64 ")", C.pendfile,
-            (uint64_t)index, (uint64_t)term);
+    char why[256];
+    if (load_image(C.pendfile, &t, &img, &n, why, sizeof why) != 0) {
+        say("%s is dropped: %s", C.pendfile, why);
+        meta_free(&t);
+        return 0;
+    }
+    if (t.applied <= C.sm.applied) {
         meta_free(&t);
         free(img);
         return 0;
@@ -1734,14 +1743,14 @@ static int adopt_install(raft_index index, raft_term term, char *err, size_t err
         free(img);
         return -1;
     }
-    say("the Raft log in %s begins at %" PRIu64 ", after the snapshot's %" PRIu64 " (an install that did not finish):"
-        " taking the image kept for it", C.logdir, (uint64_t)index, C.sm.applied);
+    say("taking the install image kept in %s (index %" PRIu64 ", term %" PRIu64 ") over the snapshot's %" PRIu64,
+        C.pendfile, t.applied, (uint64_t)t.applied_term, C.sm.applied);
     meta_free(&C.sm);
     C.sm = t;
     free(C.snap);
     C.snap = img;
     C.snaplen = n;
-    C.snap_index = index;
+    C.snap_index = C.sm.applied;
     return 1;
 }
 
@@ -1759,6 +1768,11 @@ static int core_boot(char *err, size_t errn)
         C.snap_index = C.sm.applied;
     }
     C.pend_index = 0;
+    /* Before the open: the log's own rules for a reset beside a store behind it (a lone segment named for anything
+     * but base + 1 is no tear) name the store the reset was made for. */
+    int adopted = adopt_install(err, errn);
+    if (adopted < 0)
+        return -1;
     raft_log_opts lo = {.segment_bytes = C.seg_bytes};
     if (raft_log_open(C.logdir, &lo, C.sm.applied, C.sm.applied_term, &C.log, err, errn) != ISO_OK)
         return -1;
@@ -1771,18 +1785,31 @@ static int core_boot(char *err, size_t errn)
     }
     if (e == ISO_ERR_NOTFOUND)
         hs = (raft_hard_state){0};
-    raft_index first = raft_log_file_ops.first(C.log);
-    int adopted = 0;
-    if (first > 1 && first - 1 > C.sm.applied)
-        adopted = adopt_install(first - 1, raft_log_file_ops.term_at(C.log, first - 1), err, errn);
-    if (adopted < 0 ||
-        (!adopted && first > 1 && first - 1 > C.sm.applied && reseed_self(&hs, err, errn) != 0)) {
+    raft_index first = raft_log_file_ops.first(C.log), last = raft_log_file_ops.last(C.log);
+    raft_term at = C.sm.applied ? raft_log_file_ops.term_at(C.log, C.sm.applied) : 0;
+    int bad = 0;
+    if (first > 1 && first - 1 > C.sm.applied) {
+        bad = reseed_self(&hs, err, errn) != 0; /* damage only: the image kept for the log's base is gone */
+    } else if (last < C.sm.applied || (adopted && C.sm.applied && at != C.sm.applied_term)) {
+        /* The log ends below the store (a reset stopped part way, or entries above the durable floor lost), or
+         * holds another entry than the leader's image at its index: everything in it is at or below the index or
+         * can never commit (Log Matching), and the store holds it. The snapshot is durable. */
+        say("the Raft log in %s ends at %" PRIu64 ", the snapshot is at %" PRIu64 " (term %" PRIu64 "): starting the log"
+            " on it", C.logdir, (uint64_t)last, C.sm.applied, (uint64_t)C.sm.applied_term);
+        bad = raft_log_rebase(C.log, C.sm.applied, C.sm.applied_term, err, errn) != ISO_OK;
+    } else if (C.sm.applied && at != C.sm.applied_term) {
+        snprintf(err, errn, "the Raft log in %s holds term %" PRIu64 " at the snapshot's index %" PRIu64
+                 ", the snapshot says %" PRIu64 ": damage", C.logdir, (uint64_t)at, C.sm.applied,
+                 (uint64_t)C.sm.applied_term);
+        bad = 1;
+    }
+    if (bad) {
         raft_log_close(C.log);
         C.log = NULL;
         return -1;
     }
     if (exists(C.pendfile))
-        unlink(C.pendfile); /* an image the log never moved to: no longer needed */
+        unlink(C.pendfile); /* an image the log never moved to, or taken above: no longer needed */
     raft_boot b = {.hard = hs, .applied = C.sm.applied, .applied_term = C.sm.applied_term};
     config_of(&C.sm, &b.config);
     raft_opts o;
