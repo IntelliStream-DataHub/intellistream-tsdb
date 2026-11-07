@@ -54,6 +54,7 @@ typedef struct cfg {
     double seconds; /* per window class, --qps */
     bool optimize;  /* --load: merge after the load, as the server benchmark does */
     int vtype;      /* --type: a tsdb_type; -1 the float32 calls */
+    bool no_stats;  /* --no-stats: tsdb_options.stats = -1 (the cost of the statistics, docs/design-stats.md) */
 } cfg;
 
 static const int64_t T0 = 1704067200000; /* 2024-01-01 */
@@ -494,7 +495,8 @@ int main(int argc, char **argv)
         {"seconds", required_argument, 0, 'T'}, {"optimize", no_argument, 0, 'O'},
         {"verify", required_argument, 0, 'V'},  {"type", required_argument, 0, 'Y'},
         {"insert-zstd", required_argument, 0, 'I'}, {"merge-threads", required_argument, 0, 'M'},
-        {"fresh", no_argument, 0, 'R'},         {0, 0, 0, 0}};
+        {"fresh", no_argument, 0, 'R'},         {"no-stats", no_argument, 0, 'N'},
+        {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
@@ -514,6 +516,7 @@ int main(int argc, char **argv)
         case 'I': c.insert_zstd = atoi(optarg); break;
         case 'M': c.merge_threads = atoi(optarg); break;
         case 'R': c.fresh = true; break;
+        case 'N': c.no_stats = true; break;
         case 'F': c.fsync = 0; break;
         case 'k': c.keep = true; break;
         case 'q': c.query_only = c.keep = true; break;
@@ -588,6 +591,8 @@ int main(int argc, char **argv)
     tsdb_options o;
     tsdb_options_init(&o);
     o.zstd_level = c.zstd;
+    if (c.no_stats)
+        o.stats = -1;
     if (c.insert_zstd != INT_MIN)
         o.insert_zstd_level = c.insert_zstd;
     if (c.merge_threads >= 0)
