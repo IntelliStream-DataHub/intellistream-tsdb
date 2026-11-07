@@ -19,9 +19,12 @@ ifeq ($(shell uname -m),arm64)
 ARCH    ?= -mcpu=native
 endif
 CRASHFS_SO :=
+OUTAGE_SERVER :=
 else
 SOEXT   := so
 CRASHFS_SO = $(B)/libcrashfs.so $(B)/liboutagefs.so
+# tests/outage_server.c: tsdbd on a storage domain that can be taken away, for the Rust, Python and Java client tests
+OUTAGE_SERVER = $(B)/outage_server $(B)/liboutagefs.so
 endif
 # -march=native gives the codecs BMI/LZCNT; the aggregation kernels pick
 # AVX-512/AVX2/scalar at runtime either way. `make PORTABLE=1` for a generic build.
@@ -44,7 +47,7 @@ LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 TSDBD   ?= $(B)/tsdbd
@@ -128,10 +131,11 @@ $(B)/tsdb_calendar.o: client/tsdb_calendar.c include/tsdb_calendar.h include/tsd
 # export writes the tsdb version and the on-disk format version (not in the public API) into its stream header
 TSDB_FORMAT := $(shell sed -n 's/^\#define FORMAT_VERSION \([0-9]*\).*/\1/p' src/internal.h)
 
-$(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c client/tsdb_client.h $(B)/users.o \
-          $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB)
+# CLUSTER_OBJ (defined further down, with the cluster) is a prerequisite there too: `tsdb cluster` (cluster-cli.c)
+$(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c tools/cluster-cli.c \
+          server/cluster.h client/tsdb_client.h $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB)
 	$(CC) $(CFLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -DTSDB_FORMAT_VERSION=$(TSDB_FORMAT) -o $@ $< tools/dump.c \
-	    tools/users-cli.c $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
+	    tools/users-cli.c $(B)/cluster-cli.o $(CLUSTER_OBJ) $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 
 # login (docs/design-auth.md): the crypto is client code, shared with tsdbd and the CLI; USERS and the grant model
 # are tsdbd's and the CLI's
@@ -147,7 +151,7 @@ $(B)/test_crypto: tests/test_crypto.c tests/rfc7677.h $(B)/tsdb_crypto.o
 # The C client with its test hooks (tests/client_hooks.h), which libtsdbclient.a does not have; linked before
 # $(CLIB), so the archive's own tsdb_client.o is not pulled in.
 $(B)/tsdb_client_hooks.o: client/tsdb_client.c client/tsdb_client.h client/tsdb_crypto.h include/tsdb_protocol.h \
-                          include/tsdb.h | $(B)
+                          include/tsdb.h include/tsdb_wire.h | $(B)
 	$(CC) $(CFLAGS) -DTSDBC_TEST_HOOKS -c -o $@ $<
 
 # starts tsdbd (login on) and links server/auth.c for the RFC 7677 exchange on the server side in this process
@@ -214,6 +218,16 @@ sim-repl-soak: $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
 sim-repl-mutants: $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
 	B=$(B) tests/sim_repl.sh mutants
 
+# `tsdb DIR upgrade` on the fixture release 0.9.0 wrote (tests/data), power loss at every step (crashfs); the mutant
+# run plants "a format-8 header hashed as 48 bytes" and must fail
+$(B)/test_upgrade: tests/test_upgrade.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# the numbers of the log (fno): never back across opens, FNO is the bound, markers are not rows; power loss at every
+# step (crashfs). The mutant runs plant the bugs it guards against and must fail.
+$(B)/test_fno: tests/test_fno.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
@@ -227,7 +241,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_stats $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_stats $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_cluster
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -243,6 +257,10 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_abandon
 	./$(B)/test_recover
 	./$(B)/test_damage
+	./$(B)/test_upgrade $(or $(TMPDIR),/tmp)
+	! ./$(B)/test_upgrade --mutant v8hash48 $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # the planted bug must fail it
+	./$(B)/test_fno $(or $(TMPDIR),/tmp)
+	for m in reuse manifest markers nosync; do ! ./$(B)/test_fno --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_crafted
 	./$(B)/test_gindex
 	./$(B)/test_stats
@@ -272,8 +290,11 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
+	./$(B)/test_meta /tmp --seeds 12 --seconds 15
+	TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
+	./$(B)/test_wire tests/data/wire13-vectors.txt
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server_multi && \
@@ -462,7 +483,7 @@ dist-check-sandybridge: dist
 # cargo, Python or JDK. Each runs its tests against build/tsdbd.
 PYVENV ?= build/pyvenv
 
-test-rust: $(B)/tsdbd $(B)/tsdb
+test-rust: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	cd client/rust && cargo test --features embedded
 	cd client/rust && cargo build --all-targets  # the TCP-only crate (no features) must still build
 	cd client/rust-sys && cargo test
@@ -470,7 +491,7 @@ test-rust: $(B)/tsdbd $(B)/tsdb
 # numpy is an optional extra of the package, but the tests use it (numpy results, batch calls); a venv made before
 # it was needed gets it too. The test build has the test hooks (feature test-hooks: a fixed client nonce, the
 # PBKDF2 count), which wheels never have.
-test-python: $(B)/tsdbd $(B)/tsdb
+test-python: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	$(PYVENV)/bin/python -c 'import numpy' 2>/dev/null || $(PYVENV)/bin/pip install -q numpy
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
@@ -495,7 +516,7 @@ test-python-sdist: python-sdist
 	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_client-*.tar.gz
 	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_client-*.whl
 
-test-java: $(B)/tsdbd $(B)/tsdb
+test-java: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	cd client/java && mvn -q test
 
 # The embedded Java binding (Java 22+, FFM) needs the TCP client's jar for the shared types. It is installed into a
@@ -579,19 +600,53 @@ $(B)/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 RELEASE_VERSION := $(shell cat VERSION)
 TSDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
 
+# The cluster (docs/design-cluster.md): the Raft core copied from intellistream-objects (src/raft/UPSTREAM, built as
+# upstream wrote it, with -Isrc -Isrc/raft/compat for what it includes from isod) and the metadata state machine
+# (server/meta.c). Not part of libtsdb: the cluster is a tsdbd mode (C24). raft_sim is the tests' only.
+RAFT_HDR := $(wildcard src/raft/*.h) $(wildcard src/raft/compat/*/*.h)
+RAFT_OBJ := $(B)/raft_raft.o $(B)/raft_raft_log.o $(B)/raft_raft_wire.o $(B)/raft_compat.o
+# -Wno-stringop-overflow: at -O3 GCC 15 warns about raft.c's vote tally (`r->votes[i]` for i below config.n, which
+# raft_config_decode bounds by RAFT_MEMBERS_MAX); the copy is not edited, so the false positive is silenced here.
+$(B)/raft_%.o: src/raft/%.c $(RAFT_HDR) | $(B)
+	$(CC) $(CFLAGS) -Wno-stringop-overflow -Isrc -Isrc/raft/compat -c -o $@ $<
+$(B)/meta.o: server/meta.c server/meta.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+# tsdbd's cluster thread (and the CLI's side of the admin ops); CLUSTER_OBJ goes into tsdbd, every binary that
+# includes tsdbd.c, and the CLI
+$(B)/cluster.o: server/cluster.c server/cluster.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
+	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
+CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(RAFT_OBJ)
+$(B)/tsdb: $(B)/cluster-cli.o $(CLUSTER_OBJ)
+$(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
+	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
+$(B)/test_meta: tests/test_meta.c server/meta.h $(B)/meta.o $(RAFT_OBJ) $(B)/raft_raft_sim.o
+	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -o $@ $< $(B)/meta.o $(RAFT_OBJ) $(B)/raft_raft_sim.o -lm
+# The Raft simulators for long: the copied core's own chaos runs and the metadata state machine under real cores,
+# META_SOAK_SEEDS seeds of META_SOAK_SECONDS virtual seconds from META_SOAK_FIRST (a failure names its seed).
+META_SOAK_SEEDS   ?= 5000
+META_SOAK_SECONDS ?= 30
+META_SOAK_FIRST   ?= 1000
+# tsdbd --cluster end to end: five servers, init, node add, a leader killed and restarted (the cluster thread polls:
+# one run covers both IO backends)
+$(B)/test_cluster: tests/test_cluster.c tests/harness.h server/cluster.h server/meta.h $(CLUSTER_OBJ) $(B)/tsdb_crypto.o
+	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o -lpthread -lm
+meta-soak: $(B)/test_meta
+	./$(B)/test_meta /tmp --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
+
 TSDBD_SRC := server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/users.h \
-             include/tsdb_protocol.h client/tsdb_pack.h client/tsdb_crypto.h
-$(B)/tsdbd: $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
+             server/cluster.h server/meta.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
+$(B)/tsdbd: $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c \
-	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS) $(URING_LIBS)
+	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
 
 # tests/fuzz/fuzz_frames.c includes server/tsdbd.c (epoll only: no ring needed without sockets). FRAMES_COV is
 # -fsanitize-coverage=trace-pc in `make fuzz-frames`, which feeds its coverage-guided driver (auth.c, the login and
 # the checks, is compiled with it too); empty in `make test` (FUZZ_COV is the on-disk harnesses' coverage flag and
 # is always set).
-$(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
+$(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
+                  $(CLUSTER_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c $(B)/tsdb_pack.o \
-	    $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
+	    $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
 # build-fuzz-frames/ (its own tree: `make fuzz` builds build-fuzz/ with other flags); new inputs go to
@@ -612,7 +667,7 @@ fuzz-frames:
 CLIB := $(B)/libtsdbclient.a
 
 $(B)/tsdb_client.o: client/tsdb_client.c client/tsdb_client.h client/tsdb_crypto.h include/tsdb_protocol.h \
-                    include/tsdb.h | $(B)
+                    include/tsdb.h include/tsdb_wire.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(B)/tsdb_pack.o: client/tsdb_pack.c client/tsdb_pack.h include/tsdb_protocol.h | $(B)
@@ -654,10 +709,14 @@ $(B)/test_ports: tests/test_ports.c tests/harness.h $(CLIB)
 $(B)/test_client: tests/test_client.c $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
+$(B)/test_wire: tests/test_wire.c include/tsdb_wire.h $(CLIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
-$(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
+$(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
+                    $(CLUSTER_OBJ) $(LIB)
 	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c $(B)/tsdb_pack.o $(B)/users.o \
-	    $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+	    $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LDLIBS)
@@ -745,6 +804,12 @@ $(B)/test_outagefs: tests/test_outagefs.c tests/outagefs_ctl.h | $(B)
 $(B)/test_outage: tests/test_outage.c tests/harness.h tests/outagefs_ctl.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
+$(B)/test_unavailable: tests/test_unavailable.c tests/harness.h tests/outagefs_ctl.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+
+$(B)/outage_server: tests/outage_server.c tests/harness.h tests/outagefs_ctl.h $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
@@ -825,11 +890,12 @@ test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 # The outage shim's own test (Linux only: LD_PRELOAD)
 ifneq ($(UNAME_S),Darwin)
 test: test-outagefs
-test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/liboutagefs.so $(B)/tsdbd
+test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/test_unavailable $(B)/liboutagefs.so $(B)/tsdbd
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs /tmp
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_health /tmp
 	for io in $(IO); do echo "== outage, tsdbd --io $$io"; \
-	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage /tmp || exit 1; done
+	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage /tmp || exit 1; \
+	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_unavailable /tmp || exit 1; done
 endif
 
 # The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.

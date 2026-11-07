@@ -140,6 +140,17 @@ dictionary appends), in two phases:
 
 N4 builds the hook, the call sites and the ledger backend; R2 adds only the marker backend.
 
+**Built in S0:** the payloads `COMMIT` (op, files, `F`, keys in the fence's form, rows, events, `reserve`), `DROP`
+(`wm_gen`, `dropped_before`, the drop's block number, an optional single partition), `RETENTION` (series, limit, the
+offset of its record) and `EPOCH` (epoch, owner) have one encoder and one decoder, `src/marker.c`, canonical (decode
+then encode gives the same bytes) and fuzzed (`fuzz_marker`); the type numbers of `FEED_SLOT`, `CLASS`, `SERIES`,
+`STATE`, `SLOT`, `NOW` and `COLD` are reserved there and their payloads left to the backends. The hook is
+`jr_intent` / `jr_commit` in `src/internal.h`, a no-op that compiles away, called at the places of the table above:
+the insert, replace and delete commit (`parts_publish`, `eng_delete_range`/`eng_replace_range`), the flush
+(`flush_waiting`), the merge (`merge_commit_locked`), the drop (`eng_drop_before`), the retention append and the purge
+of retired parts. **Not yet called:** the dictionary appends (SERIES, STATE, CLASSES: a dictionary has no engine
+pointer; the backend that needs them adds the call in `dict_get` and the class switch).
+
 **Lock order, D3 against design-cluster.md §5.2** (checked in review): there is no contradiction. ha.md D3 rejected
 appending COMMIT to the WAL group commit *from inside `publish_lock`*, because the WAL writer role ranks above
 `publish_lock` (AGENTS.md lock order). The cluster appends its COMMIT marker at §5.2 step 4, *before* it takes
@@ -670,7 +681,7 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 
 | Step | Mode | Content | Track-days | Gate hours | External |
 |---|---|---|---:|---:|---|
-| S0 | both | **Before 1.0** (design-cluster.md step 0, D6): format 9 (WAL record v2 with `fno`, kinds; part position range; META `requires=` with `nfs-ha` and `cluster`; `written_ms`, an 8-byte write time in the part header, for design-stats.md ST13 (user, 2026-11-06)); the namespace-event payloads (§2.1); **every wire body**: UNAVAILABLE with reasons and `retry_after`, PARTIAL, DROPPED, MOVED, TOPOLOGY with per-volume role and health, STATUS, in the four clients | 2-3 | 4 (jepsen, test-clients, integration) | the 1.0 freeze date |
+| S0 | both | **Before 1.0** (design-cluster.md step 0, D6): format 9 (built; WAL record v2 with `fno`, kinds; the `FNO` file; part position range; META `requires=` with `nfs-ha` and `cluster`; `written_ms`, an 8-byte write time in the part header, for design-stats.md ST13 (user, 2026-11-06)); the namespace-event payloads (§2.1); **every wire body**: UNAVAILABLE with reasons and `retry_after`, PARTIAL, DROPPED, MOVED, TOPOLOGY with per-volume role and health, STATUS, in the four clients | 2-3 | 4 (jepsen, test-clients, integration) | the 1.0 freeze date |
 | N0 | shared | **Go/no-go on production hardware**: ha.md §14 step 0 (lock probe: U1-U8, U13, U17, U19, U21, on the production servers' kernel and nfsd; U3, `cl_rpc_users` holding off COURTESY during a WRITE, which L1 and F2 rest on, with a partition in the middle of a WRITE) and §15.9 O0 (timeouts, grace, forced reconnect U41, V5, how often the transport reconnects without a server restart, V8) on AlmaLinux 10 over NFSv4.2/RDMA. **Gates N3-N7**; tunes N1's thresholds | 0.5 | 8-16 (runs on the hardware) | **a maintenance window on the production NFS servers** (nfsd restarts; nfsdcld enabled, ha.md §15.10 q4) |
 | N1 | shared (single server) | ha.md §15 single-server parts: domains and probes (O2), WAL taint (O3), parallel open and SIGTERM (O5), per-volume admission (O6, the only admission step), recovery, revalidation and DIVERGED (O7, without cross-node root repair), the outage nemesis (O9); a local high-water cache. No volumes-follower thread, no wire bodies (S0's) | 4-6 | 6 (jepsen `outage`) + manual runs (a)-(g) | a test NFS server; ha.md §15.1's defaults until N0's numbers come |
 | S1 | both | Rest of design-cluster.md step 1 with the amendments of §7.1 (heartbeat sections, threads, voter-role faults, local state dir, voter eligibility and `--witness`, persisted copies) and shared volumes in `meta.c` (§5.4: reserved epochs and `VOLUME_SELF`, `CLAIM_FAILED`, slot freezes) | 3-4 | 6 (meta-soak) | — |
@@ -690,6 +701,14 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | R4 | replicated | Rebuild, catch-up, moves, leader balance (step 7) | 2-3 | 12 (jepsen-cluster: kill2, rebuild, slow) | servers with disks |
 | X1 | both | Cold-tier boundary (step 8); a shared volume hands partitions over the same way | 2 | 4 (midcommit at the move) | — |
 | X3 | both | Measurements and docs: README section, AGENTS.md invariants and lock order, operator guides | 1-2 | the benchmarks, quiet machine | — |
+
+**S0, the wire half (built, branch s0-wire): protocol 13.** TOPOLOGY is op 48 and STATUS op 49 (ops 39-47 stay with
+the latest values, the feed and statistics); the protocols they plan move up one: `QUERY_LATEST` 14, the feed 15,
+statistics 16. Every body is in `include/tsdb_protocol.h` and `include/tsdb_wire.h` and described in ha.md §15.4.
+tsdbd (single server) sends UNAVAILABLE with its body and answers TOPOLOGY (itself, every volume, health from the
+domains) and STATUS; MOVED, PARTIAL and DROPPED are encoded, decoded and fuzzed but sent by S1 and S2 only. Not in 13:
+sessions, streams, `seq`, `attempt` and `resend_from` on inserts (S2, S3); the clients' retry relies on "refused
+means not applied" and resends in order from the first refused frame.
 
 **Minimum production HA** (shared mode; corrected in verification): S0, N0, N1, N2-N7, S1, S2 (whole: users and
 TOPOLOGY in the metadata copy are needed by `adopt`, which moves the root's users there), S4 and N8. N1 is in it

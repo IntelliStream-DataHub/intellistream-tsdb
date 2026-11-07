@@ -1545,3 +1545,88 @@ dl.terms dd {
         max-width: none;
     }
 }
+
+/* ---------- compression: the landing cards that are not links, and the figure of the times ---------- */
+
+.features.pairs {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
+}
+
+div.feature:hover {
+    border-color: color-mix(in srgb, var(--c) 30%, var(--line));
+}
+
+.compress-result {
+    max-width: 64ch;
+    margin: 28px 0 24px;
+    color: var(--muted);
+    font-size: 1.05rem;
+}
+
+.compress-result strong {
+    color: var(--text);
+}
+
+.fig {
+    max-width: 30rem;
+    margin: 0 0 1.4em;
+    padding: 16px 18px 12px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+}
+
+.fig svg {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+
+.fig text {
+    font-family: var(--font);
+    font-size: 14px;
+    font-weight: 650;
+    fill: var(--text);
+    text-anchor: middle;
+}
+
+.fig .lab {
+    font-size: 13px;
+    font-weight: 500;
+    fill: var(--muted);
+    text-anchor: start;
+}
+
+.fig .dim {
+    fill: var(--faint);
+}
+
+.fig .box {
+    fill: var(--surface-2);
+    stroke: var(--line-2);
+    stroke-width: 1;
+}
+
+.fig .hot {
+    fill: color-mix(in srgb, var(--cyan) 14%, var(--surface-2));
+    stroke: var(--cyan);
+}
+
+.fig .arrow {
+    fill: none;
+    stroke: var(--line-2);
+    stroke-width: 1.5;
+}
+
+.fig figcaption {
+    margin-top: 8px;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    color: var(--muted);
+}
+
+@media (max-width: 480px) {
+    .fig {
+        padding: 14px 12px 10px;
+    }
+}

@@ -2,8 +2,8 @@ package ai.intellistream.tsdb;
 
 /** Constants of the wire protocol; the authoritative description is {@code include/tsdb_protocol.h}. */
 final class Protocol {
-    /* HELLO answers the lower of both versions; version 12 (login) is the only one the client speaks */
-    static final int VERSION = 12;
+    /* HELLO answers the lower of both versions; 12 (login) is the floor, 13 adds the HA bodies */
+    static final int VERSION = 13;
     static final int MIN_VERSION = 12;     /* the oldest server the client connects to */
     static final int DEFAULT_PORT = 7070;
     static final int MAX_FRAME = 256 << 20;
@@ -67,6 +67,8 @@ final class Protocol {
     static final byte OP_GRANT = 36;
     static final byte OP_REVOKE = 37;
     static final byte OP_USER_LIST = 38;
+    static final byte OP_TOPOLOGY = 48;       /* version 13: the nodes and volumes of the server */
+    static final byte OP_STATUS = 49;         /* version 13: key=value lines, a superuser */
 
     static final int HELLO_AUTH = 1;          /* HELLO reply flags: login is required */
     static final String SCRAM_SHA256 = "SCRAM-SHA-256";

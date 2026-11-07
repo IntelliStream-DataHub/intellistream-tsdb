@@ -196,6 +196,7 @@ static inline int th_owns_port(pid_t pid, int port)
 /* Why the last th_await() failed, ready to print. */
 static char th_why[4352];
 static int th_mport; /* the metrics port of the last th_await(), 0 if the server has none (--metrics-port auto) */
+static int th_pport; /* the peer port of the last th_await(), 0 if the server has none (tsdbd --cluster) */
 #define TH_EXITED (-1) /* the child exited before it listened (reaped) */
 #define TH_BAD (-2)    /* anything else: another pid, a port that is not the child's, no file in time */
 
@@ -233,8 +234,8 @@ static inline int th_await(const char *portfile, pid_t child, int timeout_ms)
             return TH_EXITED;
         FILE *f = fopen(portfile, "r");
         if (f) {
-            int port = 0, pid = 0, mport = 0;
-            int n = fscanf(f, "%d %d %d", &port, &pid, &mport);
+            int port = 0, pid = 0, mport = 0, pport = 0;
+            int n = fscanf(f, "%d %d %d %d", &port, &pid, &mport, &pport); /* tsdbd --cluster: PEER as a fourth */
             fclose(f);
             if (n >= 2 && port > 0) {
                 if (pid != (int)child) {
@@ -256,7 +257,7 @@ static inline int th_await(const char *portfile, pid_t child, int timeout_ms)
                     usleep(5000);
                     continue;
                 }
-                if (n == 3 && !th_owns_port(child, mport)) {
+                if (n >= 3 && mport && !th_owns_port(child, mport)) {
                     if (th_reaped(child))
                         return TH_EXITED;
                     snprintf(th_why, sizeof th_why,
@@ -266,7 +267,18 @@ static inline int th_await(const char *portfile, pid_t child, int timeout_ms)
                     usleep(5000);
                     continue;
                 }
-                th_mport = n == 3 ? mport : 0;
+                if (n == 4 && !th_owns_port(child, pport)) {
+                    if (th_reaped(child))
+                        return TH_EXITED;
+                    snprintf(th_why, sizeof th_why,
+                             "harness: peer port %d is not held by the server started here (pid %d)\n", pport,
+                             (int)child);
+                    unheld = 1;
+                    usleep(5000);
+                    continue;
+                }
+                th_mport = n >= 3 ? mport : 0;
+                th_pport = n == 4 ? pport : 0;
                 return port;
             }
         }

@@ -501,10 +501,12 @@ impl Client {
             let ix = u32::from_le_bytes(self.body[..4].try_into().expect("4 bytes"));
             let b = &self.body[MULTI_PREFIX..];
             if ix == MULTI_END {
-                if b.len() != 4 || open {
+                // an error END carries the HA body after its u32 answered
+                let ha = (-13..=-10).contains(&st);
+                if b.len() < 4 || (b.len() != 4 && !ha) || open {
                     return Err(Error::Protocol("END frame in the middle of a series".into()));
                 }
-                let answered = u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize;
+                let answered = u32::from_le_bytes(b[..4].try_into().expect("4 bytes")) as usize;
                 self.reply_id = self.reply_id.wrapping_add(1);
                 return match st {
                     0 if answered != n && !stopped => {

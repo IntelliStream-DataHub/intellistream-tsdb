@@ -627,13 +627,18 @@ int parts_publish(eng *db, part **ps, size_t n)
 {
     if (n == 0)
         return 0;
+    int rc = jr_intent(db, JR_COMMIT, ps);
+    if (rc != 0)
+        return rc;
     pthread_mutex_lock(&db->publish_lock);
     /* a request parked on a stuck volume (cur_abandon): no block number is taken for it; the caller discards */
-    int rc = eng_abandoned();
+    rc = eng_abandoned();
     if (rc == 0)
         rc = parts_commit(db, ps, n);
-    if (rc == 0)
+    if (rc == 0) {
+        jr_commit(db, JR_COMMIT, ps);
         db_add_parts(db, ps, n); /* published: whatever happens to MANIFEST, the caller must not discard them */
+    }
     pthread_mutex_unlock(&db->publish_lock);
     return rc;
 }

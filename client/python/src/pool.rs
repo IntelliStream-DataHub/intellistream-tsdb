@@ -16,7 +16,7 @@ use ::tsdb_client as tc;
 use tc::ValueType;
 
 use crate::arrays::{BucketsMany, agg_queries, inserts, many_cols, points_list, range_queries, with_batches};
-use crate::{closed, connect, connect_options, multi, opts, to_pyerr};
+use crate::{closed, connect, connect_options, multi, opts, retry_budget, to_pyerr};
 
 /// A pool of connections to tsdbd for batch calls that use them all at once.
 ///
@@ -33,6 +33,8 @@ use crate::{closed, connect, connect_options, multi, opts, to_pyerr};
 ///     keepalive: TCP keepalive, as in Client.
 ///     user, password, password_file, require_auth: The login, as in Client;
 ///         every connection logs in, a replacement too.
+///     retry: Seconds one request may be retried on UNAVAILABLE or MOVED, as in Client (30 by default; 0 for
+///         none). The exceptions of a Pool's batch calls carry their class but not the reply's body.
 ///
 /// A connection that breaks (an I/O error or a timeout) is replaced by a new
 /// one before its next query, and so is every other connection made before
@@ -102,7 +104,8 @@ impl Pool {
 impl Pool {
     #[new]
     #[pyo3(signature = (host = "127.0.0.1", port = tc::DEFAULT_PORT, connections = None, *, timeout = None,
-                        keepalive = true, user = None, password = None, password_file = None, require_auth = false))]
+                        keepalive = true, user = None, password = None, password_file = None, require_auth = false,
+                        retry = 30.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -115,7 +118,9 @@ impl Pool {
         password: Option<String>,
         password_file: Option<std::path::PathBuf>,
         require_auth: bool,
+        retry: f64,
     ) -> PyResult<Self> {
+        let retry = retry_budget(retry)?;
         let n = connections.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
         if n == 0 {
             return Err(PyValueError::new_err("connections must be at least 1"));
@@ -125,7 +130,7 @@ impl Pool {
         let opts = connect_options(timeout, user, password, password_file, require_auth)?;
         let h = host.to_string();
         let pool = py
-            .detach(|| tc::Pool::with_connector(n, move || connect(&h, port, &opts, keepalive)))
+            .detach(|| tc::Pool::with_connector(n, move || connect(&h, port, &opts, keepalive, retry)))
             .map_err(|e| to_pyerr(py, e))?;
         Ok(Pool { pool: RwLock::new(Some(pool)), addr: format!("{host}:{port}"), types: Mutex::default() })
     }

@@ -207,6 +207,45 @@ in the epoch history, and the leader's commit point in a shrink of the ISR, gap 
   replica checks epochs (§6.3).
 - **Heartbeats** go from every server to the Raft leader every 500 ms (in memory, not entries): node id, incarnation,
   the volumes it leads with their epochs, and a summary of what it cannot reach. The answer carries the lease (§7.1).
+  A heartbeat also names the server's advertised and peer addresses: when a restart moved them (another port or
+  host), the Raft leader records the new ones (MEMBER_ADDR, with the up of the new incarnation; never another live
+  member's peer address, never an earlier run's). Every server keeps the voters' peer addresses in its `meta/NODE`
+  as seeds, rewritten when they change, so that a restarted server can find the group before anyone reaches it.
+  A learner whose core a leader's message started has no configuration until its first image arrives; it sends its
+  heartbeats to that leader meanwhile, or a slow install would get it marked down and removed, never to be heard again.
+- **Peer links** (`server/cluster.c`, step 1) prove the cluster secret both ways in a handshake whose MACs cover
+  everything either side claims (HELLO's body with the node id, uuid, identity, nonce and peer address, and
+  HELLO_ACK's fields): a relay that changes a claim fails. Every frame after it carries an HMAC tag under a key per
+  direction, derived from the secret and that transcript, over a sequence number per direction: someone who relays
+  a handshake (say, an operator's `tsdb cluster status` sent to the wrong address) can read what follows but not
+  write, reorder or replay into it. Before the handshake a frame is at most 512 bytes, so a stranger cannot make a
+  server buffer more than that per connection. The secret file must be a regular file readable by its owner only;
+  `tsdb cluster secret FILE` makes one (32 random bytes, mode 0600).
+- **Identity.** Each server makes a random identity (`meta/IDENT`) at its first start, and the member record keeps
+  it. A server that claims a member id whose record names another identity is refused at the handshake, so two
+  servers can never run as one member (a copied `meta/NODE` included). `node add` asks the new server for its
+  identity (PROBE), commits MEMBER_ADD with the next id and that identity, and only then sends JOIN, on which the
+  new server writes `meta/NODE`: an id exists in the log before any server holds it, and a leader change in the
+  middle cannot hand it out twice. A repeated `node add` of the same server answers with the same id.
+- **Crash during a snapshot install.** The core resets the log to the image's index before the image is applied.
+  So a server first writes the image it was sent, durably, to `meta/snapshot.install` (checked: its applied index
+  and term are the message's), and only then hands the message to the core; a failed write drops the message (the
+  leader sends it again). A server that boots takes a kept image that is ahead of its snapshot before it opens
+  the log (a leader's image is committed state), then makes the log fit it: a log that ends below the image, or holds
+  another entry than the image's at its index, is dropped and started again on the image (every entry in it is
+  covered by the image, or can never commit). So a crash anywhere in the core's reset (the floor lowered, the
+  segments deleted newest first, the new segment made) boots the same way: a prefix of the old log that ends below
+  the snapshot, a lone new segment whose header is not durable, and no segment at all are all the same install cut
+  short, never a refused start and never a voter that forgot entries it had acknowledged (the simulator checks
+  both, and that the log covers the store at every boot). Without a kept image that fits a log based past the
+  snapshot (damage) it fences its vote at the log's last entry, drops the log and the snapshot, and
+  waits for a new image from the leader (the reseed). The reseed is only the fallback: a fenced voter counts as
+  missing until a leader sends it an image, so a group that needs its vote to elect that leader stays without one.
+  A snapshot whose directory fsync fails after the rename is fail-stop. Snapshots are
+  taken only over a synced log (the syncs run inline, before the snapshot): an image past the synced log would boot
+  a core whose commit is above its last entry, which the core cannot fill.
+- **Watchers** rotate to another voter when the commit index they hear in heartbeat answers stays ahead of what
+  their stream has applied for a node timeout, so a hung or cut-off voter cannot keep one stale.
 - **Failure detection** is the Raft leader's job (§6.1). A new Raft leader first waits one lease length before it
   declares anyone down, since it does not know when leases were last granted.
 
@@ -313,8 +352,10 @@ The volume log is the leader's WAL, in WAL record version 2 of design-cdc.md:
 
 - **Rows** (kind 0): one group commit, as today. Its `fno` is the position of its first row; its rows take
   consecutive numbers.
-- **Markers** (kind 1): everything else, each taking one number. The cluster adds these kinds to the change feed's
-  markers:
+- **Markers** (kind 1): everything else, each taking `span` numbers (settled in S0: one for every marker but a
+  `COMMIT`, which takes the events it expands into; the cluster only needs the first; payloads in `src/marker.h`).
+  The cluster adds these kinds to the change feed's markers (their type numbers are reserved in S0, the payloads
+  come with the cluster):
 
 | Marker | Payload | Applied as |
 |---|---|---|
@@ -511,6 +552,10 @@ at once; the Raft leader sees the volume reported failed in the next heartbeat a
   open it **resigns** (`RESIGN(v, e)` to the metadata group) and follows; the metadata group promotes as for a dead
   leader (§6.2), at e+1, and the restarted server may be chosen again under the new epoch. It happens before the
   node timeout would, so a quick restart costs one promotion, not 3 s.
+- **Known gap until step 4.** In step 1 heartbeats come from the cluster thread (`server/cluster.c`, its own poll
+  loop beside the request loop), so a tsdbd whose request loop or engine hangs keeps heartbeating and is not marked
+  down. Step 4 moves the heartbeat onto the loop that serves the volumes, which closes it; until then nothing fails
+  over on a heartbeat anyway (no volume is replicated before step 4).
 
 ### 6.2 Promotion
 
@@ -892,7 +937,8 @@ applies to memory as to the rest.
 |---|---|---|
 | WAL record version 2 with `fno` and `commit_ms` (design-cdc.md §2.1), format 9 | **yes** | The record is the replication unit. Changing it after the freeze would be a break. Shared with the change feed. |
 | Marker records (kind 1) in the WAL; replay skips kinds it does not need | **yes** (the kind field; the cluster's kinds come later) | A 1.0 replay must not choke on a kind it does not know in a cluster volume it should not open anyway; a single server writes only rows (and feed markers). |
-| A position range `fno_lo, fno_hi` in the part header, covered by its checksum (0 when unknown; a merge takes the min and max) | **yes** | The cold move (§9.3), partial rebuild and the change feed need to know what a part holds. |
+| A position range `fno_lo, fno_hi` in the part header, covered by its checksum (0 when unknown; a merge takes the min and max), and `written_ms`; **the range covers the rows records a part holds, never markers** (settled in S0) | **yes** | The cold move (§9.3), partial rebuild and the change feed need to know what a part holds; a part claiming the numbers of markers it does not hold could make a rebuild skip a CLASS or RETENTION marker. |
+| `FNO`, two checksummed slots in every volume: the durable bound of the numbers (design-cdc.md §2.1), written before a segment is unlinked | **yes** | The log's numbers never go back across opens whatever was removed; MANIFEST cannot hold the bound (unsynced, rewritten in place). |
 | META `requires=<feature>,...`: an open refuses a feature it does not know | **yes** | A 1.0 server must refuse a cluster volume (and any later feature) instead of opening and writing it. |
 | `wal_seq` with an epoch in the high bits | no | Segment numbers are 64-bit already; a single server's epoch is 0. |
 | REPL, the slot index, `.cold` index files | no | New files in cluster volumes only, behind `requires=cluster`. |
@@ -923,6 +969,19 @@ applies to memory as to the rest.
 - **The metadata state machine** under the Raft core's simulator (`raft_sim`): seeded runs with crashes, partitions and
   clock drift, checking after every event: one leader per volume per epoch, epochs only rise, a new leader was in the
   ISR, the ISR only changes at the current epoch.
+  As built (step 1), this simulator is `tests/test_meta.c`'s own: the real Raft cores and `server/meta.c` over an
+  in-memory log with explicit durability, the core's wire encoding, snapshots, crashes, partitions, drops, duplicates
+  and drift. `raft_sim.c` has no state machine hook, and the copied files stay unchanged (so a re-sync is a clean
+  diff); `raft_sim`'s own chaos seeds run beside it in the same test. `make test` runs a few seeds, `make meta-soak`
+  thousands. Besides the state checks it checks what each operation named (an applied VOLUME_LEADER or ISR_CHANGE
+  named the volume's epoch and ISR version, an applied MEMBER_STATE an incarnation no older than the member's), cuts
+  snapshot installs short (a crash between the log's reset and the image being applied, with and without the kept
+  image), changes the membership (learners added and promoted, voters demoted and removed, down to 2 of 3) and ends
+  every run with a quiet stretch in which everyone is a voter again and every server must catch up.
+  `tests/test_cluster.c` runs real tsdbd servers through named scenarios (a wrong secret and oversized
+  pre-handshake frames, a relayed handshake, crashes during init and during an install (the kept image, and the
+  reseed without it), a failed snapshot directory fsync, an install slower than `voter_replace_s`, ids under a leader change and an impostor, a watcher on a
+  paused voter, and the life cycle: growth to 5 voters, a killed leader, replacement, restart).
 - **The replication core** (`src/repl.c`, sans-IO like the Raft core: records, ACKs, fences, commit points and ISR
   changes go in; sends, syncs, applies and cuts come out) under its own simulator: a fake disk that loses what was not
   synced on a crash, a network that delays, drops, duplicates, reorders and partitions, and a fake metadata service.
@@ -982,7 +1041,7 @@ Each step is a track (build, adversarial review, fixes) with the gates of AGENTS
 | 1 | Raft core copied in (Apache headers, `UPSTREAM`, `tools/sync-raft.sh`, an entry in licenses.md), compat shim, metadata state machine, watch stream, heartbeats, `tsdb cluster init / node add / status`; simulator runs | Raft simulator soak | 3 |
 | 2 | `src/repl.c` sans-IO replication core and its simulator | replication simulator soak | 3 |
 | 3 | Engine replica mode: apply up to the commit point, verbatim WAL writes, markers, pending files kept, replicated clock, class precondition, cut by position | jepsen (single server, regressions) | 4 |
-| 4 | tsdbd peer links (log and bulk), replication, ISR changes, failover, fencing, leases, TOPOLOGY, forwarding | jepsen-cluster: kill, partition, pause, midcommit | 4 |
+| 4 | tsdbd peer links (log and bulk), replication, ISR changes, failover, fencing, leases, TOPOLOGY, forwarding; heartbeats move from the cluster thread onto the loop that serves the volumes, so a hung loop stops them (§6.1's known gap) | jepsen-cluster: kill, partition, pause, midcommit | 4 |
 | 5 | Name slots, creation and lookup across volumes, users in metadata | jepsen-cluster with creations | 2 |
 | 6 | Clients: direct mode, streams, the 32-byte header, positions, QUERY_MULTI split; Pulsar sink | test-clients, integration-tests cluster | 3 |
 | 7 | Rebuild, catch-up, retained segments, moves, leader balance, throttling | jepsen-cluster: kill2, rebuild, slow | 3 |
