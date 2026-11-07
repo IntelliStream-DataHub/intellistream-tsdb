@@ -380,6 +380,15 @@ typedef struct {
 	raft_term leader_term;
 	raft_index leader_last;
 	uint64_t leader_last_chain;
+
+	/* The progress check (raft_sim_params.progress_ns): when the node's stretch of being
+	 * eligible began (0 = not in one), the leader's commit then, and what the stretch is
+	 * keyed on, so that any change of it starts a new one. */
+	uint64_t prog_start;
+	raft_index prog_target;
+	raft_id prog_leader;
+	raft_term prog_lterm;
+	unsigned prog_linc, prog_xinc, prog_group;
 } simnode;
 
 typedef struct {
@@ -433,6 +442,7 @@ struct raft_sim {
 	uint64_t next_ctx;
 
 	uint64_t last_delivery[NODES_MAX + 1][NODES_MAX + 1]; /* per pair, to keep order */
+	bool cut[NODES_MAX + 1][NODES_MAX + 1]; /* raft_sim_cut_link: nothing from [a] reaches [b] */
 	unsigned lose_every;                   /* raft_sim_lose_first_answers */
 	uint32_t lose_last[NODES_MAX + 1];      /* the round whose first answer each member lost */
 	raft_id last_leader;
@@ -918,7 +928,8 @@ static void send_msg(raft_sim *s, simnode *from, const raft_msg *m)
 		s->st.messages_dropped++;
 		return;
 	}
-	if (!to->up || to->group != from->group || iso_rng_chance(&s->rng, s->p.drop)) {
+	if (!to->up || to->group != from->group || s->cut[from->id][m->to] ||
+	    iso_rng_chance(&s->rng, s->p.drop)) {
 		s->st.messages_dropped++;
 		return;
 	}
@@ -1254,6 +1265,61 @@ static raft_id pick_leader(raft_sim *s)
 	return best;
 }
 
+/* The progress check. Every safety invariant above holds of a group that does nothing, so a
+ * follower the leader never catches up -- a probe whose rejection is taken for stale, a stalled
+ * snapshot -- passes the sweep for as long as it lasts (a 7 s stall of one node under
+ * `batched-lease`, seed 218817, passed every raft_sim test). What the core owes a follower that
+ * is up, reachable and a member is that it keeps pace: a stretch of `progress_ns` in which
+ * nothing touches the node, the leader or the configuration ends with the node at what the leader
+ * had committed when the stretch began. Anything that changes the setting starts a new stretch, so
+ * a crash, a partition, a leader change or a pending configuration entry excuses what follows
+ * and never a stall inside one. Lost messages do not excuse it: a core that needs a reliable
+ * network to catch a follower up is the bug. */
+static void progress_check(raft_sim *s)
+{
+	if (!s->p.progress_ns)
+		return;
+	raft_id lid = pick_leader(s);
+	simnode *ld = lid ? &s->node[lid] : NULL;
+	bool steady = ld && !ld->suspended && !ld->reseeding;
+	if (steady && ld->log.ncfg > 0 && ld->log.cfg[ld->log.ncfg - 1] > raft_get_commit(ld->r))
+		steady = false; /* a change in flight: the leader may already have stopped feeding a leaver */
+	raft_index lcommit = steady ? raft_get_commit(ld->r) : 0;
+	for (unsigned i = 1; i <= s->n && !s->failed; i++) {
+		simnode *x = &s->node[i];
+		bool eligible = steady && x != ld && x->up && !x->suspended && !x->reseeding &&
+				x->group == ld->group && raft_config_find(&ld->config, x->id);
+		if (!eligible) {
+			x->prog_start = 0;
+			continue;
+		}
+		raft_term lterm = raft_get_term(ld->r);
+		if (x->prog_start && (x->prog_leader != lid || x->prog_lterm != lterm ||
+				      x->prog_linc != ld->incarnation || x->prog_xinc != x->incarnation ||
+				      x->prog_group != x->group))
+			x->prog_start = 0;
+		if (x->prog_start && x->applied >= x->prog_target)
+			x->prog_start = 0; /* kept pace: the next stretch asks for the new commit */
+		if (x->prog_start && s->now - x->prog_start >= s->p.progress_ns) {
+			fail(s, "node %u has not kept pace with leader n%u (term %llu) for %.2f s of an "
+				"undisturbed group: applied %llu, the leader's commit was %llu when the "
+				"stretch began and is %llu now", x->id, lid, (unsigned long long)lterm,
+			     (double)(s->now - x->prog_start) / 1e9, (unsigned long long)x->applied,
+			     (unsigned long long)x->prog_target, (unsigned long long)lcommit);
+			return;
+		}
+		if (!x->prog_start) {
+			x->prog_start = s->now;
+			x->prog_target = lcommit;
+			x->prog_leader = lid;
+			x->prog_lterm = lterm;
+			x->prog_linc = ld->incarnation;
+			x->prog_xinc = x->incarnation;
+			x->prog_group = x->group;
+		}
+	}
+}
+
 /* Any node that believes it leads, for a workload that should also hit the stale ones. */
 static raft_id pick_believer(raft_sim *s)
 {
@@ -1433,6 +1499,7 @@ static void handle(raft_sim *s, event *ev)
 		}
 		if (s->now >= s->next_sweep) {
 			sweep(s);
+			progress_check(s);
 			s->next_sweep = s->now + SWEEP_NS;
 		}
 		schedule(s, (event){ .time = s->now + TICK_NS, .kind = EV_TICK });
@@ -1709,6 +1776,12 @@ void raft_sim_set_trace(raft_sim *s, void *file) { s->trace = file; }
 
 void raft_sim_set_drop(raft_sim *s, double drop) { s->p.drop = drop; }
 
+void raft_sim_cut_link(raft_sim *s, raft_id from, raft_id to, bool cut)
+{
+	if (from >= 1 && from <= s->n && to >= 1 && to <= s->n)
+		s->cut[from][to] = cut;
+}
+
 void raft_sim_lose_first_answers(raft_sim *s, unsigned every_n)
 {
 	s->lose_every = every_n;
@@ -1869,7 +1942,10 @@ iso_err raft_sim_transfer(raft_sim *s, raft_id at, raft_id to)
 bool raft_sim_chaos(const raft_sim_params *p, uint64_t duration_ns, raft_sim_stats *stats,
 		    char *failure, size_t failure_size)
 {
-	raft_sim *s = raft_sim_new(p);
+	raft_sim_params q = *p;
+	if (!q.progress_ns)
+		q.progress_ns = 4 * q.core.election_min_ns;
+	raft_sim *s = raft_sim_new(&q);
 	if (!s) {
 		iso_strlcpy(failure, "bad parameters", failure_size);
 		return false;

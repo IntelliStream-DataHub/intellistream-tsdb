@@ -1,5 +1,5 @@
 repository: intellistream-objects (git@repo.intellistream.ai:olavgg/intellistream-objects.git), directory src/raft
-commit: 66031baf87f9f6536d8c0f9da869262673bed758
+commit: 4844df4b7295145d228ac0d981e2f6ded62a63c2
 files: raft.h raft.c raft_log.h raft_log.c raft_wire.h raft_wire.c raft_sim.h raft_sim.c
 license: Apache License 2.0. The owner of intellistream-objects (IntelliStream AS, Olav Gjerde) granted copying
   these files into tsdb under Apache 2.0 on 2026-11-06 (docs/design-cluster.md, decision D2).

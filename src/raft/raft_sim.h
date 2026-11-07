@@ -83,6 +83,15 @@ typedef struct {
 				* the full ring's are, so that a walk past a chain's head is run) */
 	bool cross_check;
 
+	/* The progress check: a node that is up, in the leader's group and a member of the leader's
+	 * committed configuration, that no fault has touched for `progress_ns` of virtual time
+	 * (no crash, restart, partition, leader change, configuration change or suspend of its own
+	 * or the leader's), must have applied what the leader had committed when that stretch
+	 * began. 0 is off for raft_sim_new, where tests stage their own faults (a drop rate of 1
+	 * stalls everyone on purpose); raft_sim_chaos turns it on at four election timeouts when
+	 * it is 0. It draws nothing from the generator, so a seed's run is the same with it. */
+	uint64_t progress_ns;
+
 	raft_opts core; /* per-node core options; the seed is derived per node */
 } raft_sim_params;
 
@@ -152,6 +161,10 @@ void raft_sim_wipe(raft_sim *s, raft_id id);
 void raft_sim_partition(raft_sim *s, const raft_id *isolated, unsigned n);
 void raft_sim_heal(raft_sim *s);
 void raft_sim_set_drop(raft_sim *s, double drop);
+/* Messages from `from` to `to` are lost while the link is cut (one direction only; the rest of the
+ * network is as it was). Unlike a partition it is no excuse to the progress check, which is what
+ * makes it the way to stage a follower the leader cannot catch up. */
+void raft_sim_cut_link(raft_sim *s, raft_id from, raft_id to, bool cut);
 /* A network that loses, for one round in `every_n` (those whose number is a multiple of it), the
  * first answer of every member to the leader: what a burst that overflows a receive ring does to a
  * round (plan 28r). The second answer to the same round -- to a frame sent again -- is delivered,
