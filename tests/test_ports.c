@@ -32,6 +32,16 @@ static int prctl(int op, long arg)
 #include <sys/socket.h>
 
 static int failures;
+
+/* A child that only has to stay alive until the test kills it. alarm() bounds it: a test that dies first (a timeout,
+ * a crash under a sanitizer) would otherwise leave it paused for ever under init, holding every fd it inherited (a
+ * gate's BENCH.lock among them, 8 h on 2026-11-07). */
+static void park(void)
+{
+    alarm(600);
+    for (;;)
+        pause();
+}
 #define CHECK(cond)                                                      \
     do {                                                                 \
         if (!(cond)) {                                                   \
@@ -205,8 +215,7 @@ static void orphan(enum follow follow)
             sig(s, SIGKILL);
             _exit(1);
         }
-        for (;;)
-            pause();
+        park();
     }
     int port = 0, srv = 0;
     for (int waited = 0; waited < 30000 && mid > 0; waited += 5) {
@@ -444,7 +453,7 @@ int main(int argc, char **argv)
         th_portfile(tmp, sizeof tmp, d1);
         pid_t z = fork();
         if (z == 0) {
-            pause();
+            park();
             _exit(0);
         }
         snprintf(txt, sizeof txt, "%d %d\n", p1, (int)z); /* a port nobody holds under z's pid, like a dead server's */
