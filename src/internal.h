@@ -1228,6 +1228,7 @@ typedef struct memtable {
     atomic_int refs;
     mt_series *s; /* indexed by series id */
     uint32_t scap;
+    bool s_map; /* s is an anonymous mapping (zero pages, grown by mremap: mt_reserve); else malloc'd */
     uint32_t *ids; /* series present, first-insert order */
     uint32_t nids, idcap;
     size_t rows;

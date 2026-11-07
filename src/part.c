@@ -767,13 +767,14 @@ void pw_abort(part_writer *w)
     }
     if (w->cc)
         cc_put(w->db, w->cc);
-    free(w->buf);
-    free(w->idx);
+    /* a flush of a million series has an index of 160 MB here: handed back in slices (compat.h) */
+    tsdb_free_big(w->buf, w->cap);
+    tsdb_free_big(w->idx, w->idx_cap * sizeof *w->idx);
     free(w->pend_ts);
     free(w->pend_v);
     free(w->tombs);
     free(w->hk_buf);
-    free(w->lf);
+    tsdb_free_big(w->lf, w->lfcap * sizeof *w->lf);
     memset(w, 0, sizeof *w);
     w->fd = -1;
 }
@@ -840,7 +841,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         goto fail;
     }
     free(trailer);
-    free(index);
+    tsdb_free_big(index, ilen);
     /* a deferred sync starts the writeback now: the caller syncs all its parts after the last one is written,
      * by then mostly one journal commit for all of them instead of one each */
     if (db->opt.fsync && pending && w->defer_fd) {

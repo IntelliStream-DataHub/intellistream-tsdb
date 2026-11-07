@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -76,6 +77,61 @@ memtable *mt_new(uint64_t wal_seq)
 
 void mt_ref(memtable *m) { atomic_fetch_add(&m->refs, 1); }
 
+#ifndef __APPLE__
+/* The series array of a memtable that sees a million series is 40 MB, and mt_reserve grows it under buf_lock, which
+ * every append and lookup takes. realloc and the memset of the new tail touched every page there (about 9 ms, twice,
+ * right after a flush began a new memtable and the first rows with high ids arrived); a mapping is zero already,
+ * mremap moves page tables instead of copying, and the pages are touched one by one as series are added. */
+#define MT_S_MAP_MIN ((size_t)1 << 20)
+#define MT_PAGE ((size_t)4096)
+static size_t mt_s_bytes(uint32_t cap) { return ((size_t)cap * sizeof(mt_series) + MT_PAGE - 1) & ~(MT_PAGE - 1); }
+#endif
+
+static void mt_s_free(memtable *m)
+{
+#ifndef __APPLE__
+    if (m->s_map) {
+        tsdb_zap_slices(m->s, mt_s_bytes(m->scap)); /* the unmap then has nothing left to do under the mmap lock */
+        munmap(m->s, mt_s_bytes(m->scap));
+        return;
+    }
+#endif
+    free(m->s);
+}
+
+/* Grows m->s to cap entries, the new ones zero. Caller holds buf_lock when m is active. */
+static int mt_s_grow(memtable *m, uint32_t cap)
+{
+#ifndef __APPLE__
+    if ((size_t)cap * sizeof(mt_series) >= MT_S_MAP_MIN) {
+        void *p;
+        if (m->s_map) {
+            p = mremap(m->s, mt_s_bytes(m->scap), mt_s_bytes(cap), MREMAP_MAYMOVE);
+        } else {
+            p = mmap(NULL, mt_s_bytes(cap), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p != MAP_FAILED) {
+                if (m->scap)
+                    memcpy(p, m->s, (size_t)m->scap * sizeof *m->s);
+                free(m->s);
+            }
+        }
+        if (p == MAP_FAILED)
+            return TSDB_ERR_NOMEM;
+        m->s = p;
+        m->s_map = true;
+        m->scap = cap;
+        return 0;
+    }
+#endif
+    mt_series *s = realloc(m->s, cap * sizeof *s);
+    if (!s)
+        return TSDB_ERR_NOMEM;
+    memset(s + m->scap, 0, (cap - m->scap) * sizeof *s);
+    m->s = s;
+    m->scap = cap;
+    return 0;
+}
+
 void mt_unref(memtable *m)
 {
     if (!m || atomic_fetch_sub(&m->refs, 1) != 1)
@@ -86,8 +142,8 @@ void mt_unref(memtable *m)
         free(s->v);
         free(s->lsn);
     }
-    free(m->s);
-    free(m->ids);
+    mt_s_free(m);
+    tsdb_free_big(m->ids, (size_t)m->idcap * sizeof *m->ids);
     free(m);
 }
 
@@ -97,12 +153,9 @@ static int mt_reserve(memtable *m, uint32_t id)
     if (id >= m->scap) {
         uint32_t cap = MAX(id + 1, m->scap * 2);
         cap = MAX(cap, 64u);
-        mt_series *s = realloc(m->s, cap * sizeof *s);
-        if (!s)
-            return TSDB_ERR_NOMEM;
-        memset(s + m->scap, 0, (cap - m->scap) * sizeof *s);
-        m->s = s;
-        m->scap = cap;
+        int rc = mt_s_grow(m, cap);
+        if (rc)
+            return rc;
     }
     mt_series *s = &m->s[id];
     if (s->n < s->cap)
@@ -358,9 +411,9 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
         rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out, false, ucls, NULL, NULL);
         cur_fno_lo = cur_fno_hi = 0;
     }
-    free(s);
-    free(t);
-    free(v);
+    tsdb_free_big(s, m->rows * sizeof *s);
+    tsdb_free_big(t, m->rows * sizeof *t);
+    tsdb_free_big(v, m->rows * sizeof *v);
     free(ids);
     return rc;
 }

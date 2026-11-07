@@ -723,7 +723,7 @@ int cls_classify_memtable(eng *db, const memtable *m)
         k++;
     }
     int rc = k ? decide_fresh(db, st, k) : 0;
-    free(st);
+    tsdb_free_big(st, m->nids * sizeof *st);
     return rc;
 }
 

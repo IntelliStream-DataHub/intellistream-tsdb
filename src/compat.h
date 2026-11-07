@@ -207,4 +207,35 @@ static inline int tsdb_thread_create(pthread_t *t, void *(*fn)(void *), void *ar
 
 #endif /* __APPLE__ */
 
+/* free(p) for a block of n bytes (n at most what was allocated), without a long stall for the other threads.
+ * munmap of a large block takes the process's mmap lock for writing for as long as it takes to hand the pages back
+ * (about 40 us per MB: 8 ms for 184 MB), and every thread that page-faults or allocates waits behind it (a pending
+ * writer holds new readers off too). madvise(MADV_DONTNEED) zaps the pages under the lock for reading, so in slices the
+ * others fault in between, and the munmap or heap trim that follows has nothing left to do. Only a block about to be
+ * freed may go through here (its contents are gone). Not on macOS, where the plain free is kept (a developer
+ * instance). */
+#ifdef __APPLE__
+static inline void tsdb_free_big(void *p, size_t n) { free(p); }
+#else
+#include <stdlib.h>
+#include <sys/mman.h>
+#define TSDB_FREE_BIG_MIN ((size_t)4 << 20)   /* below this the plain free is as fast as the slicing */
+#define TSDB_FREE_BIG_SLICE ((size_t)2 << 20) /* what one madvise hands back: about 80 us under the read lock */
+/* the pages inside [p, p + n) handed back in slices (whole pages only; a larger page size only loses the call) */
+static inline void tsdb_zap_slices(void *p, size_t n)
+{
+    if (!p || n < TSDB_FREE_BIG_MIN)
+        return;
+    const uintptr_t pg = 4096;
+    uintptr_t a = ((uintptr_t)p + pg - 1) & ~(pg - 1), e = ((uintptr_t)p + n) & ~(pg - 1);
+    for (; a < e; a += TSDB_FREE_BIG_SLICE)
+        madvise((void *)a, e - a < TSDB_FREE_BIG_SLICE ? e - a : TSDB_FREE_BIG_SLICE, MADV_DONTNEED);
+}
+static inline void tsdb_free_big(void *p, size_t n)
+{
+    tsdb_zap_slices(p, n);
+    free(p);
+}
+#endif
+
 #endif

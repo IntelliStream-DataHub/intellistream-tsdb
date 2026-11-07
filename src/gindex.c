@@ -424,10 +424,11 @@ int gix_encode(const granule *g, size_t n, uint8_t **out, size_t *len)
     buf = NULL;
     rc = 0;
 out:
-    free(v);
-    free(r);
-    free(delta);
-    free(skip);
+    /* 184 MB of delta for 10^6 granules: see tsdb_free_big */
+    tsdb_free_big(v, (n + 1) * sizeof *v);
+    tsdb_free_big(r, (n + 1) * sizeof *r);
+    tsdb_free_big(delta, (n + 1) * GF_N * sizeof *delta);
+    tsdb_free_big(skip, 2 * n + 2);
     free(buf);
     return rc;
 }
