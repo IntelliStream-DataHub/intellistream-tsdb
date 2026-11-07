@@ -83,12 +83,16 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/statfs.h>
+#endif
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #define FRAME_MAX (16u << 20)
 #define WB_MAX (64u << 20) /* queued to one peer; beyond it the link is dropped (Raft resends) */
 #define CL_MAGIC 0x43445354u /* "TSDC" */
-#define CL_VERSION 1
+#define CL_VERSION 2 /* 2: heartbeat sections, flags in PROBE_REPLY; peers of version 1 are refused (no mixed versions) */
 #define RING 4096
 #define SNAP_EVERY 1000
 #define MS 1000000ull
@@ -122,6 +126,10 @@ enum {
     F_PROBE,
     F_PROBE_REPLY,
 };
+
+/* the sections of a heartbeat (after its address fields) */
+enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3 };
+#define FREE_MIN_DEFAULT (1ull << 30) /* a state directory below this is not voter_ok (M11) */
 
 /* ------------------------------------------------------------------ bytes */
 
@@ -429,6 +437,16 @@ static int settings_decode(struct rd *r, struct meta_settings *s, int *mode)
     return r->bad || v[9] > 255 || v[10] > 255 ? -1 : 0;
 }
 
+void cluster_status_free(struct cluster_status *st)
+{
+    for (uint32_t i = 0; st->heard && i < st->nheard; i++) {
+        free(st->heard[i].vols);
+        free(st->heard[i].doms);
+    }
+    free(st->heard);
+    st->heard = NULL;
+}
+
 int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status *st)
 {
     struct rd r = {body, len, 0, 0};
@@ -436,6 +454,7 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
     st->self = get32(&r);
     st->mode = get8(&r);
     st->role = get8(&r);
+    st->stale = get8(&r);
     st->term = get64(&r);
     st->leader = get32(&r);
     st->commit = get64(&r);
@@ -446,15 +465,49 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
     st->heard = calloc(st->nheard ? st->nheard : 1, sizeof *st->heard);
     if (!st->heard)
         return -1;
-    for (uint32_t i = 0; i < st->nheard; i++) {
-        st->heard[i].id = get32(&r);
-        st->heard[i].ago_ms = get64(&r);
-        st->heard[i].incarnation = get64(&r);
+    for (uint32_t i = 0; i < st->nheard && !r.bad; i++) {
+        struct cluster_heard *h = &st->heard[i];
+        h->id = get32(&r);
+        h->ago_ms = get64(&r);
+        h->incarnation = get64(&r);
+        h->flags = get8(&r);
+        h->core_dropped = get8(&r);
+        h->read_barrier = get8(&r);
+        h->state_free = get64(&r);
+        h->nvols = get32(&r);
+        if (r.bad || h->nvols > CLUSTER_REPORT_VOLS)
+            break;
+        h->vols = calloc(h->nvols ? h->nvols : 1, sizeof *h->vols);
+        if (!h->vols)
+            break;
+        for (uint32_t j = 0; j < h->nvols; j++) {
+            struct cluster_vol_report *v = &h->vols[j].v;
+            v->volume = get32(&r);
+            v->role = get8(&r);
+            v->health = get8(&r);
+            v->epoch = get64(&r);
+            getstr(&r, v->domain, sizeof v->domain);
+            v->series_len = get64(&r);
+            v->states_len = get64(&r);
+            v->fenced_age_ms = get64(&r);
+            v->wal_seg = get64(&r);
+            v->wal_off = get64(&r);
+            h->vols[j].local_fault_s = get64(&r);
+        }
+        h->ndoms = get32(&r);
+        if (r.bad || h->ndoms > CLUSTER_REPORT_DOMS)
+            break;
+        h->doms = calloc(h->ndoms ? h->ndoms : 1, sizeof *h->doms);
+        if (!h->doms)
+            break;
+        for (uint32_t j = 0; j < h->ndoms; j++) {
+            getstr(&r, h->doms[j].name, sizeof h->doms[j].name);
+            h->doms[j].state = get8(&r);
+        }
     }
-    uint32_t il = get32(&r);
+    uint32_t il = r.bad ? 0 : get32(&r);
     if (r.bad || r.len - r.off != il) {
-        free(st->heard);
-        st->heard = NULL;
+        cluster_status_free(st);
         return -1;
     }
     st->image = body + r.off;
@@ -776,6 +829,15 @@ struct heard {
     uint64_t ns, inc, applied;
     char addr[META_ADDR_MAX], peer[META_ADDR_MAX]; /* as the member's heartbeat advertises them */
     uint64_t moved_ns; /* when the leader last proposed these addresses for the record */
+    /* the heartbeat's sections (item 1) */
+    int have_flags;
+    uint8_t flags, core_dropped, read_barrier;
+    uint64_t state_free;
+    uint64_t bad_ns; /* since when its flags say it is not voter_ok or its core was dropped; 0: well */
+    uint64_t flags_ns; /* when the leader last proposed these flags for the record */
+    uint32_t nvols, ndoms;
+    struct cluster_vol_status *vols;
+    struct cluster_dom_report *doms;
 };
 
 struct addr_e {
@@ -794,8 +856,19 @@ struct pend {
 
 static struct {
     char dir[1024], metadir[1040], logdir[1060], nodefile[1060], snapfile[1060], identfile[1060], pendfile[1060];
+    char copyfile[1060], retiredfile[1060];
     uint64_t pend_index; /* the install image kept in pendfile (keep_install), 0 for none */
-    char adv[META_ADDR_MAX], padv[META_ADDR_MAX], rack[META_RACK_MAX];
+    char adv[META_ADDR_MAX], padv[META_ADDR_MAX], rack[META_RACK_MAX], feed[META_FEED_MAX], bmc[META_BMC_MAX];
+    int witness, rb_off;
+    int retired;        /* the state directory holds `retired`: this identity's core was dropped (§5.6) */
+    int core_dropped;   /* the core was dropped in this run, or a log fault ended the voter role (voter_ok 0) */
+    int copy_stale;     /* the sm is the persisted copy of an earlier run: no watch stream has confirmed it yet */
+    int copy_dirty;     /* the watch stream moved sm since the copy file was written */
+    uint64_t copy_next; /* not before this time (ns) */
+    uint64_t free_min;  /* bytes the state directory must have free for voter_ok */
+    unsigned nk_vols, nk_doms; /* TSDB_CLUSTER_TEST report knobs: what the heartbeat's sections carry in tests */
+    struct cluster_vol_report k_vols[4];
+    struct cluster_dom_report k_doms[4];
     uint8_t secret[CLUSTER_SECRET_MAX];
     size_t secret_len;
     int lfd, stop_pipe[2];
@@ -858,6 +931,7 @@ static struct {
     raft_entry ents[RAFT_WIRE_MAX_ENTRIES];
 } C;
 
+static uint8_t my_flags(void);
 static void fail_stop(const char *fmt, ...) __attribute__((format(printf, 1, 2), noreturn));
 static void fail_stop(const char *fmt, ...)
 {
@@ -1040,9 +1114,25 @@ static void test_knobs(void)
 {
     const char *t = getenv("TSDB_CLUSTER_TEST");
     C.snap_every = SNAP_EVERY;
+    C.free_min = FREE_MIN_DEFAULT;
     for (const char *p = t; p && *p;) {
         unsigned long long v = 0;
-        if (sscanf(p, "snap_every=%llu", &v) == 1 && v)
+        unsigned a = 0, b = 0, c = 0, ep = 0;
+        char dn[META_DOMAIN_MAX] = "";
+        if (sscanf(p, "free_min=%llu", &v) == 1)
+            C.free_min = v;
+        else if (sscanf(p, "vol=%u/%u/%u/%u/%63[^,]", &a, &b, &c, &ep, dn) >= 4 && C.nk_vols < 4) {
+            /* volume/role/health/epoch/domain: a volume this server reports as owning */
+            struct cluster_vol_report *v2 = &C.k_vols[C.nk_vols++];
+            v2->volume = a;
+            v2->role = (uint8_t)b;
+            v2->health = (uint8_t)c;
+            v2->epoch = ep;
+            snprintf(v2->domain, sizeof v2->domain, "%s", dn);
+        } else if (sscanf(p, "dom=%63[^/]/%u", dn, &a) == 2 && C.nk_doms < 4) {
+            snprintf(C.k_doms[C.nk_doms].name, META_DOMAIN_MAX, "%s", dn);
+            C.k_doms[C.nk_doms++].state = (uint8_t)a;
+        } else if (sscanf(p, "snap_every=%llu", &v) == 1 && v)
             C.snap_every = v;
         else if (sscanf(p, "snap_retain=%llu", &v) == 1)
             C.snap_retain = v;
@@ -1287,6 +1377,106 @@ static void heard_set(uint32_t id, uint64_t now, uint64_t inc, uint64_t applied,
     }
 }
 
+static cluster_report_fn g_reporter;
+static void *g_reporter_arg;
+
+void cluster_set_reporter(cluster_report_fn fn, void *arg)
+{
+    g_reporter = fn;
+    g_reporter_arg = arg;
+}
+
+/* The sections of a heartbeat from r->off on, into h. Sets r->bad on a malformed one. An unknown type is skipped. */
+static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
+{
+    while (!r->bad && r->off < r->len) {
+        uint32_t type = get8(r);
+        type |= (uint32_t)get8(r) << 8;
+        uint32_t len = get32(r);
+        if (r->bad || !need(r, len)) {
+            r->bad = 1;
+            return;
+        }
+        struct rd s = {r->p + r->off, len, 0, 0};
+        r->off += len;
+        if (type == HBS_NODE) {
+            uint8_t flags = get8(&s), dropped = get8(&s), rb = get8(&s);
+            uint64_t fr = get64(&s);
+            if (s.bad) {
+                r->bad = 1;
+                return;
+            }
+            h->flags = flags;
+            h->core_dropped = dropped;
+            h->read_barrier = rb;
+            h->state_free = fr;
+            h->have_flags = 1;
+            int bad = !(flags & META_MF_VOTER_OK) || dropped;
+            h->bad_ns = !bad ? 0 : h->bad_ns ? h->bad_ns : now;
+        } else if (type == HBS_VOLUMES) {
+            uint32_t n = get32(&s);
+            if (s.bad || n > CLUSTER_REPORT_VOLS || (size_t)n * 62 > len) {
+                r->bad = 1;
+                return;
+            }
+            struct cluster_vol_status *nv = calloc(n ? n : 1, sizeof *nv);
+            if (!nv)
+                oom();
+            for (uint32_t i = 0; i < n; i++) {
+                struct cluster_vol_report *v = &nv[i].v;
+                v->volume = get32(&s);
+                v->role = get8(&s);
+                v->health = get8(&s);
+                v->epoch = get64(&s);
+                getstr(&s, v->domain, sizeof v->domain);
+                v->series_len = get64(&s);
+                v->states_len = get64(&s);
+                v->fenced_age_ms = get64(&s);
+                v->wal_seg = get64(&s);
+                v->wal_off = get64(&s);
+                if (v->health == CL_HEALTH_OK)
+                    continue;
+                /* the timer of a (volume, domain) fault runs from the first report of it and breaks on a report
+                 * without it (M6); the leader reads it as `local_fault_s` */
+                nv[i].fault_ns = now;
+                for (uint32_t j = 0; j < h->nvols; j++)
+                    if (h->vols[j].v.volume == v->volume && h->vols[j].fault_ns &&
+                        !strcmp(h->vols[j].v.domain, v->domain))
+                        nv[i].fault_ns = h->vols[j].fault_ns;
+            }
+            if (s.bad) {
+                free(nv);
+                r->bad = 1;
+                return;
+            }
+            free(h->vols);
+            h->vols = nv;
+            h->nvols = n;
+        } else if (type == HBS_DOMAINS) {
+            uint32_t n = get32(&s);
+            if (s.bad || n > CLUSTER_REPORT_DOMS || (size_t)n * 3 > len) {
+                r->bad = 1;
+                return;
+            }
+            struct cluster_dom_report *nd = calloc(n ? n : 1, sizeof *nd);
+            if (!nd)
+                oom();
+            for (uint32_t i = 0; i < n; i++) {
+                getstr(&s, nd[i].name, sizeof nd[i].name);
+                nd[i].state = get8(&s);
+            }
+            if (s.bad) {
+                free(nd);
+                r->bad = 1;
+                return;
+            }
+            free(h->doms);
+            h->doms = nd;
+            h->ndoms = n;
+        }
+    }
+}
+
 /* when this server last heard `id` (now for itself), 0 never */
 static uint64_t heard_ns(uint32_t id, uint64_t now)
 {
@@ -1447,13 +1637,20 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
 
 /* ------------------------------------------------------------------ the core */
 
+/* A fault of the Raft log or the hard state (item 3, M11). In a shared-mode deployment the data does not live with the
+ * log, so it ends only this node's voter role: the core stops, a `retired` mark is written (this identity never boots
+ * a core from these files again), the heartbeat reports core_dropped, and the node goes on as a watcher with its
+ * volumes. Replicated mode keeps the fail-stop (the log and the data share disks). Returns 1 when the core was
+ * dropped (the caller must not touch C.r or C.log), else it does not return. */
+static int log_fault(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 static void check_fault(void)
 {
     char what[512];
     if (C.log && raft_log_fault(C.log, what, sizeof what))
-        fail_stop("the Raft log: %s", what);
-    if (C.r && raft_get_store_fault(C.r, what, sizeof what) != ISO_OK)
-        fail_stop("the Raft log: %s", what);
+        log_fault("the Raft log: %s", what);
+    else if (C.r && raft_get_store_fault(C.r, what, sizeof what) != ISO_OK)
+        log_fault("the Raft log: %s", what);
 }
 
 static void sync_round(void)
@@ -1465,8 +1662,10 @@ static void sync_round(void)
     else
         for (unsigned i = 0; i < s.n; i++)
             close(s.fds[i]);
-    if (e != ISO_OK || s.err)
-        fail_stop("syncing the Raft log in %s: %s", C.logdir, strerror(s.err ? s.err : EIO));
+    if (e != ISO_OK || s.err) {
+        log_fault("syncing the Raft log in %s: %s", C.logdir, strerror(s.err ? s.err : EIO));
+        return;
+    }
     raft_log_durable(C.log, s.index, s.term);
     raft_persisted(C.r, s.index, s.term);
 }
@@ -1577,8 +1776,10 @@ static void pump(void)
         switch (a.type) {
         case RAFT_ACT_SAVE_HARD: {
             char err[2048];
-            if (raft_log_hard_save(C.log, &a.u.hard, err, sizeof err) != ISO_OK)
-                fail_stop("saving the Raft hard state: %s", err);
+            if (raft_log_hard_save(C.log, &a.u.hard, err, sizeof err) != ISO_OK) {
+                log_fault("saving the Raft hard state: %s", err);
+                return;
+            }
             raft_hard_saved(C.r, &a.u.hard);
             break;
         }
@@ -1843,11 +2044,37 @@ static int core_boot(char *err, size_t errn)
     return 0;
 }
 
+static void core_stop(struct meta_state *next);
+
 /* removed from the group while away: the core goes (its files stay), the state goes on from `next` (or as is) */
 static void drop_core(struct meta_state *next, const char *why)
 {
     say("node %" PRIu32 " is not in the metadata group's configuration (%s): it follows a watch stream now", C.id,
         why);
+    core_stop(next);
+}
+
+static int log_fault(const char *fmt, ...)
+{
+    char what[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(what, sizeof what, fmt, ap);
+    va_end(ap);
+    if (C.sm.mode != META_MODE_SHARED)
+        fail_stop("%s", what);
+    say("%s: in shared mode this ends the voter role only (core_dropped, retired); the volumes go on", what);
+    core_stop(NULL);
+    C.core_dropped = C.retired = 1;
+    /* the mark is what keeps a restart from booting a core out of these files; if it cannot be written the node
+     * cannot be sure of that, and stops (the disk is gone: the log was the only thing that relied on it) */
+    if (write_durable(C.retiredfile, "retired\n", 8) != 0)
+        fail_stop("cannot write %s: %s (after: %s)", C.retiredfile, strerror(errno), what);
+    return 1;
+}
+
+static void core_stop(struct meta_state *next)
+{
     raft_free(C.r);
     C.r = NULL;
     raft_log_close(C.log);
@@ -1941,7 +2168,13 @@ static void on_hb(struct conn *c, struct rd *r)
         c->dead = r->bad;
         return;
     }
-    heard_set(node, iso_now_ns(), inc, applied, addr, peer);
+    uint64_t now = iso_now_ns();
+    heard_set(node, now, inc, applied, addr, peer);
+    heard_sections(heard_get(node), r, now);
+    if (r->bad) { /* a malformed section: the link is dropped, as for any broken frame */
+        c->dead = 1;
+        return;
+    }
     frame_begin(&C.fb, F_HB_ACK);
     put32(&C.fb, C.r ? raft_get_leader(C.r) : 0);
     put64(&C.fb, C.r ? raft_get_term(C.r) : 0);
@@ -1980,17 +2213,21 @@ static void on_watch_snap(struct conn *c, struct rd *r)
     struct meta_state *to = C.r ? &C.wsm : &C.sm;
     struct meta_state t;
     meta_init(&t);
-    if (meta_snapshot_decode(&t, r->p + r->off, r->len - r->off) != META_OK || t.applied < to->applied) {
+    int old_copy = to == &C.sm && C.copy_stale; /* a persisted copy of an earlier run yields to any live image */
+    if (meta_snapshot_decode(&t, r->p + r->off, r->len - r->off) != META_OK || (t.applied < to->applied && !old_copy)) {
         meta_free(&t);
         c->dead = 1; /* a damaged image, or a state behind this one: another server */
         return;
     }
     meta_free(to);
     *to = t;
-    if (to == &C.sm)
+    if (to == &C.sm) {
+        C.copy_stale = 0;
+        C.copy_dirty = 1;
         state_replaced();
-    else
+    } else {
         check_probe();
+    }
 }
 
 static void on_watch_entry(struct conn *c, struct rd *r)
@@ -2005,8 +2242,69 @@ static void on_watch_entry(struct conn *c, struct rd *r)
         return;
     }
     apply_entry(to, to == &C.sm, index, term, type, r->p + r->off, (uint32_t)(r->len - r->off));
-    if (to == &C.wsm)
+    if (to == &C.wsm) {
         check_probe();
+    } else {
+        C.copy_stale = 0;
+        C.copy_dirty = 1;
+    }
+}
+
+/* Item 8: a member without a core keeps its copy of the metadata (the snapshot bytes, so one format) in the state
+ * directory, written a moment after the watch stream moved it (tmp, fsync, rename, directory fsync), and serves from
+ * it after a restart, marked stale until a stream confirms it. A failed write keeps the older copy and is tried
+ * again: nothing in step 1 relies on it before a reservation does (S3). */
+static void copy_flush(uint64_t now, int force)
+{
+    if (!C.copy_dirty || C.r || (!force && now < C.copy_next))
+        return;
+    C.copy_dirty = 0;
+    if (!C.sm.initialised)
+        return;
+    uint8_t *img;
+    size_t len;
+    if (meta_snapshot_encode(&C.sm, &img, &len) != META_OK)
+        oom();
+    int rc = write_durable(C.copyfile, img, len);
+    free(img);
+    if (rc == -2)
+        fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.copyfile, strerror(errno));
+    if (rc != 0) {
+        say("cannot write %s: %s (tried again in 1 s)", C.copyfile, strerror(errno));
+        C.copy_dirty = 1;
+        C.copy_next = now + 1000 * MS;
+        return;
+    }
+    C.copy_next = now + 200 * MS;
+}
+
+/* what a member's heartbeat last reported (the sections), after its line of the status */
+static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now)
+{
+    put8(b, h && h->have_flags ? h->flags : 0);
+    put8(b, h ? h->core_dropped : 0);
+    put8(b, h ? h->read_barrier : 0);
+    put64(b, h && h->have_flags ? h->state_free : 0);
+    put32(b, h ? h->nvols : 0);
+    for (uint32_t i = 0; h && i < h->nvols; i++) {
+        const struct cluster_vol_report *v = &h->vols[i].v;
+        put32(b, v->volume);
+        put8(b, v->role);
+        put8(b, v->health);
+        put64(b, v->epoch);
+        putstr(b, v->domain);
+        put64(b, v->series_len);
+        put64(b, v->states_len);
+        put64(b, v->fenced_age_ms);
+        put64(b, v->wal_seg);
+        put64(b, v->wal_off);
+        put64(b, h->vols[i].fault_ns ? since(now, h->vols[i].fault_ns) / (1000 * MS) : 0);
+    }
+    put32(b, h ? h->ndoms : 0);
+    for (uint32_t i = 0; h && i < h->ndoms; i++) {
+        putstr(b, h->doms[i].name);
+        put8(b, h->doms[i].state);
+    }
 }
 
 static void put_status(struct buf *b)
@@ -2015,6 +2313,7 @@ static void put_status(struct buf *b)
     put32(b, C.have_node ? C.id : 0);
     put8(b, C.r ? CLUSTER_MODE_CORE : C.have_node ? CLUSTER_MODE_WATCH : CLUSTER_MODE_NONE);
     put8(b, C.r ? (uint8_t)raft_get_role(C.r) : 0);
+    put8(b, (uint8_t)C.copy_stale);
     put64(b, C.r ? raft_get_term(C.r) : C.hint_term);
     put32(b, C.r ? raft_get_leader(C.r) : C.hint_leader);
     put64(b, C.r ? raft_get_commit(C.r) : C.hint_commit);
@@ -2027,6 +2326,7 @@ static void put_status(struct buf *b)
         put32(b, C.id);
         put64(b, 0);
         put64(b, C.incarnation);
+        put_heard_extra(b, heard_get(C.id), now);
     }
     for (size_t i = 0; i < C.nheard; i++) {
         if (C.heard[i].id == C.id)
@@ -2034,6 +2334,7 @@ static void put_status(struct buf *b)
         put32(b, C.heard[i].id);
         put64(b, (since(now, C.heard[i].ns)) / MS);
         put64(b, C.heard[i].inc);
+        put_heard_extra(b, &C.heard[i], now);
     }
     if (C.sm.applied || C.sm.config_len) {
         uint8_t *img;
@@ -2187,6 +2488,9 @@ static void on_probe(struct conn *c, struct rd *r)
     putstr(&C.fb, C.adv);
     putstr(&C.fb, C.padv);
     putstr(&C.fb, C.rack);
+    putstr(&C.fb, C.feed);
+    putstr(&C.fb, C.bmc);
+    put8(&C.fb, my_flags());
     frame_end(&C.fb);
     conn_send(c, 0);
 }
@@ -2204,13 +2508,15 @@ static void on_probe_reply(struct conn *c, struct rd *r)
     if (c->join != 1)
         return;
     struct meta_member mb = {0};
-    mb.flags = META_MF_ALL;
     int32_t rc = (int32_t)get32(r);
     uint32_t has = get32(r);
     mb.incarnation = get64(r);
     getstr(r, mb.addr, sizeof mb.addr);
     getstr(r, mb.peer, sizeof mb.peer);
     getstr(r, mb.rack, sizeof mb.rack);
+    getstr(r, mb.power_feed, sizeof mb.power_feed);
+    getstr(r, mb.bmc, sizeof mb.bmc);
+    mb.flags = get8(r); /* what the new server says it is: a witness holds no volumes, a full disk no vote */
     c->join = 0;
     if (r->bad)
         rc = CLUSTER_ERR_UNREACHABLE;
@@ -2545,6 +2851,88 @@ static void conn_free(struct conn *c)
 
 /* ------------------------------------------------------------------ periodic duties */
 
+/* a section of a heartbeat: u16 type, u32 length, the body. A reader skips types it does not know (the peer link's
+ * rule: a newer server may send more; never a rule of the metadata entries, where an unknown kind stops the server). */
+static size_t sec_begin(struct buf *b, uint16_t type)
+{
+    put8(b, (uint8_t)type);
+    put8(b, (uint8_t)(type >> 8));
+    size_t at = b->len;
+    put32(b, 0);
+    return at;
+}
+
+static void sec_end(struct buf *b, size_t at)
+{
+    uint32_t n = (uint32_t)(b->len - at - 4);
+    for (int i = 0; i < 4; i++)
+        b->p[at + (size_t)i] = (uint8_t)(n >> (8 * i));
+}
+
+/* the free bytes of the state directory (UINT64_MAX when it cannot be told) */
+static uint64_t state_free_bytes(void)
+{
+    struct statvfs sv;
+    if (statvfs(C.metadir, &sv) != 0)
+        return UINT64_MAX;
+    return (uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize;
+}
+
+/* this server's flags (item 6): a witness holds no volumes; a node whose state directory is nearly full, whose core
+ * was dropped or that carries a `retired` mark may not be a voter */
+static uint8_t my_flags(void)
+{
+    uint8_t f = 0;
+    if (!C.retired && !C.core_dropped && state_free_bytes() >= C.free_min)
+        f |= META_MF_VOTER_OK;
+    if (!C.witness)
+        f |= META_MF_VOLUMES_OK;
+    return f;
+}
+
+static void put_sections(struct buf *b)
+{
+    size_t at = sec_begin(b, HBS_NODE);
+    put8(b, my_flags());
+    put8(b, (uint8_t)(C.core_dropped || C.retired));
+    put8(b, (uint8_t)(!C.rb_off));
+    put64(b, state_free_bytes());
+    sec_end(b, at);
+    static struct cluster_report rep;
+    memset(&rep, 0, sizeof rep);
+    if (g_reporter)
+        g_reporter(g_reporter_arg, &rep);
+    for (unsigned i = 0; i < C.nk_vols && rep.nvols < CLUSTER_REPORT_VOLS; i++)
+        rep.vols[rep.nvols++] = C.k_vols[i];
+    for (unsigned i = 0; i < C.nk_doms && rep.ndoms < CLUSTER_REPORT_DOMS; i++)
+        rep.doms[rep.ndoms++] = C.k_doms[i];
+    if (rep.nvols > CLUSTER_REPORT_VOLS || rep.ndoms > CLUSTER_REPORT_DOMS)
+        rep.nvols = rep.ndoms = 0;
+    at = sec_begin(b, HBS_VOLUMES);
+    put32(b, rep.nvols);
+    for (uint32_t i = 0; i < rep.nvols; i++) {
+        const struct cluster_vol_report *v = &rep.vols[i];
+        put32(b, v->volume);
+        put8(b, v->role);
+        put8(b, v->health);
+        put64(b, v->epoch);
+        putstr(b, v->domain);
+        put64(b, v->series_len);
+        put64(b, v->states_len);
+        put64(b, v->fenced_age_ms);
+        put64(b, v->wal_seg);
+        put64(b, v->wal_off);
+    }
+    sec_end(b, at);
+    at = sec_begin(b, HBS_DOMAINS);
+    put32(b, rep.ndoms);
+    for (uint32_t i = 0; i < rep.ndoms; i++) {
+        putstr(b, rep.doms[i].name);
+        put8(b, rep.doms[i].state);
+    }
+    sec_end(b, at);
+}
+
 static void heartbeat(uint64_t now)
 {
     if (!C.have_node)
@@ -2561,6 +2949,16 @@ static void heartbeat(uint64_t now)
     put64(&C.fb, C.sm.applied);
     putstr(&C.fb, C.adv);
     putstr(&C.fb, C.padv); /* a restart may have moved it (another port, another host) */
+    put_sections(&C.fb);
+    {
+        /* this server's own record of itself: the same sections, read back as a peer would */
+        struct rd me = {C.fb.p + 4 + 1, C.fb.len - 4 - 1, 0, 0};
+        (void)get32(&me), (void)get64(&me), (void)get64(&me);
+        char skip[META_ADDR_MAX];
+        getstr(&me, skip, sizeof skip);
+        getstr(&me, skip, sizeof skip);
+        heard_sections(heard_get(C.id), &me, now);
+    }
     frame_end(&C.fb);
     /* A core booted by a leader's message holds an empty configuration until its first install arrives; it must
      * still be heard, or the leader marks it down and removes it as a learner before the image reaches it, and a
@@ -2633,12 +3031,45 @@ static void member_states(uint64_t now)
             propose_member(id, META_UP, inc, moved, now);
         else if (moved)
             propose_member(id, -1, inc, moved, now);
+        else if (fresh && h && h->have_flags && inc >= minc && h->flags != m->flags &&
+                 (!h->flags_ns || since(now, h->flags_ns) >= to)) {
+            /* the flags its heartbeat reports differ from the record (item 6): voter_ok lost to a full disk or a
+             * dropped core, volumes_ok back after a repair; the record is what the placement reads */
+            struct meta_entry e;
+            meta_entry_init(&e);
+            h->flags_ns = now;
+            meta_op_member_flags(&e, id, inc, h->flags);
+            if (propose(&e, 0, 0, id) == ISO_OK)
+                say("proposes node %" PRIu32 " flags %u (voter_ok %d, volumes_ok %d)", id, (unsigned)h->flags,
+                    !!(h->flags & META_MF_VOTER_OK), !!(h->flags & META_MF_VOLUMES_OK));
+        }
     }
 }
 
 static int in_config(const raft_config *c, uint32_t id)
 {
     return raft_config_find(c, id) != NULL;
+}
+
+/* A voter is replaced when it has not answered the leader's Raft traffic for voter_replace_s (the core's own progress:
+ * a node whose core was dropped still heartbeats, so heartbeats prove nothing), or when its flags have said for that
+ * long that it is not voter_ok or its core was dropped (item 6). Never the leader itself. */
+static int voter_gone(uint32_t id, uint64_t now, uint64_t rep, uint64_t lead)
+{
+    if (id == C.id)
+        return 0;
+    raft_progress p;
+    int gone;
+    if (raft_get_progress(C.r, id, &p)) {
+        gone = p.silence_ns >= rep;
+    } else {
+        uint64_t last = heard_ns(id, now);
+        gone = last ? since(now, last) >= rep : lead >= rep;
+    }
+    const struct heard *h = heard_get(id);
+    if (h && h->bad_ns && since(now, h->bad_ns) >= rep)
+        gone = 1;
+    return gone;
 }
 
 static void manage_voters(uint64_t now)
@@ -2658,11 +3089,13 @@ static void manage_voters(uint64_t now)
     for (unsigned i = 0; i < cfg.n; i++) {
         uint32_t id = cfg.m[i].id;
         uint64_t last = heard_ns(id, now);
-        int gone = last ? since(now, last) >= rep : lead >= rep;
+        int gone = voter_gone(id, now, rep, lead);
         if (cfg.m[i].learner) {
             learners++;
             raft_progress p;
-            if (last && since(now, last) < to && raft_get_progress(C.r, id, &p) && p.match >= commit) {
+            const struct meta_member *lm = meta_member(&C.sm, id);
+            if (last && since(now, last) < to && lm && (lm->flags & META_MF_VOTER_OK) &&
+                raft_get_progress(C.r, id, &p) && p.match >= commit) {
                 raft_index idx;
                 if (raft_change(C.r, RAFT_ADD_VOTER, id, &idx) == ISO_OK) {
                     say("promotes node %" PRIu32 " to a voter", id);
@@ -2689,17 +3122,23 @@ static void manage_voters(uint64_t now)
         for (uint32_t i = 0; i < C.sm.nmembers; i++) {
             const struct meta_member *m = &C.sm.members[i];
             uint64_t last = heard_ns(m->id, now);
-            if (m->state != META_UP || in_config(&cfg, m->id) || !last || since(now, last) >= to || !m->peer[0])
-                continue;
-            int new_rack = 1;
+            const struct heard *mh = heard_get(m->id);
+            if (m->state != META_UP || in_config(&cfg, m->id) || !last || since(now, last) >= to || !m->peer[0] ||
+                !(m->flags & META_MF_VOTER_OK) || (mh && mh->have_flags && !(mh->flags & META_MF_VOTER_OK)) ||
+                (mh && mh->core_dropped))
+                continue; /* only a node whose state directory is local, writable and has room (item 6) */
+            int new_rack = 1, new_feed = 1;
             for (unsigned j = 0; j < cfg.n; j++) {
                 const struct meta_member *v = meta_member(&C.sm, cfg.m[j].id);
                 if (v && m->rack[0] && !strcmp(v->rack, m->rack))
                     new_rack = 0;
+                if (v && m->power_feed[0] && !strcmp(v->power_feed, m->power_feed))
+                    new_feed = 0;
             }
-            if (!best || (new_rack && !best_new_rack)) {
+            int score = new_rack * 2 + new_feed; /* distinct racks first, then distinct power feeds (item 10) */
+            if (!best || score > best_new_rack) {
                 best = m;
-                best_new_rack = new_rack;
+                best_new_rack = score;
             }
         }
         if (best) {
@@ -2715,8 +3154,7 @@ static void manage_voters(uint64_t now)
     if (voters > target) {
         for (unsigned i = 0; i < cfg.n; i++) {
             uint32_t id = cfg.m[i].id;
-            uint64_t last = heard_ns(id, now);
-            if (cfg.m[i].learner || id == C.id || !(last ? since(now, last) >= rep : lead >= rep))
+            if (cfg.m[i].learner || id == C.id || !voter_gone(id, now, rep, lead))
                 continue;
             raft_index idx;
             if (raft_change(C.r, RAFT_REMOVE, id, &idx) == ISO_OK) {
@@ -2733,10 +3171,12 @@ static void leader_duties(uint64_t now)
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
         return;
     if (C.init_pending && !C.sm.initialised) {
-        struct meta_member first = {.id = C.id, .state = META_UP, .incarnation = C.incarnation, .flags = META_MF_ALL};
+        struct meta_member first = {.id = C.id, .state = META_UP, .incarnation = C.incarnation, .flags = my_flags()};
         snprintf(first.addr, sizeof first.addr, "%s", C.adv);
         snprintf(first.peer, sizeof first.peer, "%s", C.padv);
         snprintf(first.rack, sizeof first.rack, "%s", C.rack);
+        snprintf(first.power_feed, sizeof first.power_feed, "%s", C.feed);
+        snprintf(first.bmc, sizeof first.bmc, "%s", C.bmc);
         memcpy(first.ident, C.ident, 16);
         struct meta_entry e;
         meta_entry_init(&e);
@@ -2890,6 +3330,7 @@ static void *cluster_main(void *arg)
             if (C.r && raft_log_floor_due(C.log, raft_get_commit(C.r), now))
                 sync_round();
         }
+        copy_flush(now, 0);
         if (now >= C.next_hb) {
             uint32_t hb = settings()->heartbeat_ms;
             C.next_hb = now + (uint64_t)(hb < 10 ? 10 : hb) * MS;
@@ -2981,6 +3422,7 @@ static void *cluster_main(void *arg)
         }
         C.nconns = k;
     }
+    copy_flush(iso_now_ns(), 1);
     free(pf);
     return NULL;
 }
@@ -2995,34 +3437,56 @@ int cluster_start(const struct cluster_cfg *cfg)
     }
     if (!cfg->peer_advertise || !cfg->peer_advertise[0] || strlen(cfg->peer_advertise) >= META_ADDR_MAX ||
         strlen(cfg->advertise) >= META_ADDR_MAX || strlen(cfg->rack) >= META_RACK_MAX ||
-        strlen(cfg->dir) >= sizeof C.dir) {
-        fprintf(stderr, "tsdbd: cluster: an address, the rack or the directory is too long\n");
+        strlen(cfg->power_feed) >= META_FEED_MAX || strlen(cfg->bmc) >= META_BMC_MAX || !cfg->state_dir ||
+        !cfg->state_dir[0] || strlen(cfg->state_dir) >= sizeof C.metadir) {
+        fprintf(stderr, "tsdbd: cluster: an address, the rack, the power feed, the BMC or the state directory is "
+                        "missing or too long\n");
         return -1;
     }
-    snprintf(C.dir, sizeof C.dir, "%s", cfg->dir);
     snprintf(C.adv, sizeof C.adv, "%s", cfg->advertise);
     snprintf(C.padv, sizeof C.padv, "%s", cfg->peer_advertise);
     snprintf(C.rack, sizeof C.rack, "%s", cfg->rack);
+    snprintf(C.feed, sizeof C.feed, "%s", cfg->power_feed);
+    snprintf(C.bmc, sizeof C.bmc, "%s", cfg->bmc);
+    C.witness = cfg->witness != 0;
+    C.rb_off = cfg->read_barrier_off != 0;
     memcpy(C.secret, cfg->secret, cfg->secret_len);
     C.secret_len = cfg->secret_len;
-    snprintf(C.metadir, sizeof C.metadir, "%s/meta", C.dir);
+    snprintf(C.metadir, sizeof C.metadir, "%s", cfg->state_dir);
     snprintf(C.logdir, sizeof C.logdir, "%s/raft", C.metadir);
     snprintf(C.nodefile, sizeof C.nodefile, "%s/NODE", C.metadir);
     snprintf(C.snapfile, sizeof C.snapfile, "%s/snapshot", C.metadir);
     snprintf(C.identfile, sizeof C.identfile, "%s/IDENT", C.metadir);
     snprintf(C.pendfile, sizeof C.pendfile, "%s/snapshot.install", C.metadir);
+    snprintf(C.copyfile, sizeof C.copyfile, "%s/copy", C.metadir);
+    snprintf(C.retiredfile, sizeof C.retiredfile, "%s/retired", C.metadir);
     test_knobs();
     meta_init(&C.sm);
     meta_init(&C.wsm);
     if (mkdir(C.metadir, 0755) == 0) {
-        if (fsync_dir(C.dir) != 0) {
-            fprintf(stderr, "tsdbd: cluster: cannot sync %s: %s\n", C.dir, strerror(errno));
+        /* the parent of the state directory is made durable: a new directory's name lives there */
+        char parent[sizeof C.metadir + 4];
+        snprintf(parent, sizeof parent, "%s/..", C.metadir);
+        if (fsync_dir(parent) != 0) {
+            fprintf(stderr, "tsdbd: cluster: cannot sync the parent of %s: %s\n", C.metadir, strerror(errno));
             return -1;
         }
     } else if (errno != EEXIST) {
         fprintf(stderr, "tsdbd: cluster: cannot make %s: %s\n", C.metadir, strerror(errno));
         return -1;
     }
+#ifdef __linux__
+    {
+        /* M11: the Raft log lives on a local disk only. A pool rollback reverts a log on NFS together with the volumes,
+         * and a hung sync on a hard mount freezes the leader for a whole outage. */
+        struct statfs sf;
+        if (statfs(C.metadir, &sf) == 0 && (sf.f_type == 0x6969 /* NFS */ || sf.f_type == 0xFF534D42 /* CIFS */)) {
+            fprintf(stderr, "tsdbd: cluster: --state-dir %s is on a network file system: the Raft log must be on a "
+                            "local disk (design-ha-modes.md M11)\n", C.metadir);
+            return -1;
+        }
+    }
+#endif
     iso_log_quiet = getenv("TSDB_CLUSTER_RAFT_LOG") == NULL; /* the core's INFO and WARN lines, on request */
     char err[2048];
     if (ident_load(err, sizeof err) != 0) {
@@ -3041,9 +3505,28 @@ int cluster_start(const struct cluster_cfg *cfg)
             fprintf(stderr, "tsdbd: cluster: cannot write %s: %s\n", C.nodefile, strerror(errno));
             return -1;
         }
-        if ((exists(C.snapfile) || exists(C.logdir)) && core_boot(err, sizeof err) != 0) {
+        if (exists(C.retiredfile)) {
+            /* a fault of the Raft log ended this identity's voter role (item 3): no core from these files, ever */
+            C.retired = C.core_dropped = 1;
+            fprintf(stderr, "tsdbd: cluster: %s exists: this node does not boot a Raft core (clear the state "
+                            "directory and node add it as a new member to make it a voter again)\n",
+                    C.retiredfile);
+        } else if ((exists(C.snapfile) || exists(C.logdir)) && core_boot(err, sizeof err) != 0) {
             fprintf(stderr, "tsdbd: cluster: cannot start the Raft core: %s\n", err);
             return -1;
+        }
+        if (!C.r && exists(C.copyfile)) {
+            /* the copy of the last run, served stale until a watch stream confirms it (item 8) */
+            uint8_t *img = NULL;
+            size_t n = 0;
+            meta_free(&C.sm);
+            meta_init(&C.sm);
+            if (load_image(C.copyfile, &C.sm, &img, &n, err, sizeof err) != 0) {
+                fprintf(stderr, "tsdbd: cluster: %s\n", err);
+                return -1;
+            }
+            free(img);
+            C.copy_stale = 1;
         }
     }
     C.lfd = cfg->peer_fd;
@@ -3087,6 +3570,10 @@ void cluster_stop(void)
     meta_free(&C.wsm);
     ring_reset();
     free(C.snap);
+    for (size_t i = 0; i < C.nheard; i++) {
+        free(C.heard[i].vols);
+        free(C.heard[i].doms);
+    }
     free(C.heard);
     free(C.addrs);
     free(C.pend);

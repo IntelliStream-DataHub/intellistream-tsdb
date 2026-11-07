@@ -135,8 +135,10 @@ static void start(int i)
             setenv("TSDB_CLUSTER_TEST", envs[i], 1);
         else
             unsetenv("TSDB_CLUSTER_TEST");
+        char state[PATH_MAX + 90];
+        snprintf(state, sizeof state, "%s/state", dir);
         const char *argv[] = {"tsdbd", "--no-auth", flag, "--dir", dir, "--port", "0", "--port-file", pf,
-                              "--cluster", "--cluster-secret-file", secret_path, NULL};
+                              "--cluster", "--cluster-secret-file", secret_path, "--state-dir", state, NULL};
         execv(bin, (char *const *)argv);
         _exit(127);
     }
@@ -251,7 +253,7 @@ struct view {
 
 static void view_free(struct view *v)
 {
-    free(v->st.heard);
+    cluster_status_free(&v->st);
     meta_free(&v->m);
     free(v->raw);
 }
@@ -953,7 +955,7 @@ static void scen_relay(void)
 static void meta_tmp(int i, int make)
 {
     char p[PATH_MAX + 128];
-    snprintf(p, sizeof p, "%s/n%d/meta/snapshot.tmp", base, i);
+    snprintf(p, sizeof p, "%s/n%d/state/snapshot.tmp", base, i);
     if ((make ? mkdir(p, 0755) : rmdir(p)) != 0)
         die("%s %s: %s", make ? "mkdir" : "rmdir", p, strerror(errno));
 }
@@ -1040,7 +1042,7 @@ static void install_crash(int mode)
         die("the learner whose snapshot cannot be written ended with status %d", st);
     meta_tmp(2, 0);
     char kept[PATH_MAX + 128];
-    snprintf(kept, sizeof kept, "%s/n2/meta/snapshot.install", base);
+    snprintf(kept, sizeof kept, "%s/n2/state/snapshot.install", base);
     if (access(kept, F_OK) != 0)
         die("server 2 stopped inside an install without the image kept in %s", kept);
     if (drop_kept && unlink(kept) != 0)
@@ -1050,7 +1052,7 @@ static void install_crash(int mode)
          * durable. It is the lone segment, named for the image's index + 1, which the snapshot (still the old one)
          * is not at: the open refused it as damage before it knew the store the reset was made for. */
         char dir[PATH_MAX + 128], seg[PATH_MAX + 256], name[300] = "";
-        snprintf(dir, sizeof dir, "%s/n2/meta/raft", base);
+        snprintf(dir, sizeof dir, "%s/n2/state/raft", base);
         DIR *d = opendir(dir);
         int nseg = 0;
         for (struct dirent *e; d && (e = readdir(d));)
@@ -1111,7 +1113,7 @@ static void scen_rebase(void)
     check_all_agree(0, 3);
     stop(2, SIGKILL);
     char dir[PATH_MAX + 128], path[PATH_MAX + 256];
-    snprintf(path, sizeof path, "%s/n2/meta/snapshot", base);
+    snprintf(path, sizeof path, "%s/n2/state/snapshot", base);
     FILE *f = fopen(path, "rb");
     uint8_t img[1 << 16];
     size_t len = f ? fread(img, 1, sizeof img, f) : 0;
@@ -1125,7 +1127,7 @@ static void scen_rebase(void)
     meta_free(&m);
     if (applied < 4)
         die("server 2's snapshot is at %" PRIu64 ", too early to put the log below", applied);
-    snprintf(dir, sizeof dir, "%s/n2/meta/raft", base);
+    snprintf(dir, sizeof dir, "%s/n2/state/raft", base);
     DIR *d = opendir(dir);
     int kept = 0, removed = 0;
     for (struct dirent *e; d && (e = readdir(d));) {
@@ -1253,8 +1255,8 @@ static void scen_ids(void)
     mkdir(dst, 0755);
     snprintf(dst, sizeof dst, "%s/n5/meta", base);
     mkdir(dst, 0755);
-    snprintf(src, sizeof src, "%s/n1/meta/NODE", base);
-    snprintf(dst, sizeof dst, "%s/n5/meta/NODE", base);
+    snprintf(src, sizeof src, "%s/n1/state/NODE", base);
+    snprintf(dst, sizeof dst, "%s/n5/state/NODE", base);
     {
         FILE *in = fopen(src, "rb"), *out = fopen(dst, "wb");
         char b[4096];

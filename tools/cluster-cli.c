@@ -60,6 +60,8 @@ static void print_status(const struct cluster_status *st)
            " applied %" PRIu64 "\n",
            st->self, st->mode < 3 ? mode[st->mode] : "?", st->mode == CLUSTER_MODE_CORE ? role_name(st->role) : "-",
            st->term, st->leader, st->commit, st->applied);
+    if (st->stale)
+        printf("stale this is the copy of an earlier run; no watch stream has confirmed it yet\n");
     struct meta_state m;
     meta_init(&m);
     if (!st->image_len || meta_snapshot_decode(&m, st->image, st->image_len) != META_OK) {
@@ -104,9 +106,27 @@ static void print_status(const struct cluster_status *st)
         for (uint32_t j = 0; j < st->nheard; j++)
             if (st->heard[j].id == mb->id && st->heard[j].ago_ms != UINT64_MAX)
                 snprintf(heard, sizeof heard, "%" PRIu64 "ms", st->heard[j].ago_ms);
-        printf("member %" PRIu32 " %s incarnation %" PRIu64 " addr %s peer %s rack %s heard %s\n", mb->id,
-               meta_member_state_name(mb->state), mb->incarnation, mb->addr, mb->peer, mb->rack[0] ? mb->rack : "-",
-               heard);
+        const struct cluster_heard *h = NULL;
+        for (uint32_t j = 0; j < st->nheard; j++)
+            if (st->heard[j].id == mb->id)
+                h = &st->heard[j];
+        printf("member %" PRIu32 " %s incarnation %" PRIu64 " addr %s peer %s rack %s heard %s feed %s voter_ok %d"
+               " volumes_ok %d core_dropped %d read_barrier %s\n",
+               mb->id, meta_member_state_name(mb->state), mb->incarnation, mb->addr, mb->peer,
+               mb->rack[0] ? mb->rack : "-", heard, mb->power_feed[0] ? mb->power_feed : "-",
+               !!(mb->flags & META_MF_VOTER_OK), !!(mb->flags & META_MF_VOLUMES_OK), h ? h->core_dropped : 0,
+               !h || (!h->flags && !h->state_free) ? "?" : h->read_barrier ? "on" : "off");
+        for (uint32_t j = 0; h && j < h->nvols; j++) {
+            const struct cluster_vol_status *v = &h->vols[j];
+            printf("volume-report node %" PRIu32 " volume %" PRIu32 " role %s health %s epoch %" PRIu64
+                   " domain %s local_fault_s %" PRIu64 " fenced_age_ms %" PRIu64 "\n",
+                   mb->id, v->v.volume, v->v.role == CL_ROLE_OWNER ? "owner" : v->v.role == CL_ROLE_RELEASING ? "releasing" : "none",
+                   v->v.health == CL_HEALTH_OK ? "ok" : v->v.health == CL_HEALTH_LOCAL_FAULT ? "local-fault" : "domain-fault",
+                   v->v.epoch, v->v.domain[0] ? v->v.domain : "-", v->local_fault_s, v->v.fenced_age_ms);
+        }
+        for (uint32_t j = 0; h && j < h->ndoms; j++)
+            printf("domain-report node %" PRIu32 " %s %s\n", mb->id, h->doms[j].name,
+                   h->doms[j].state == CL_DOM_OK ? "ok" : h->doms[j].state == CL_DOM_SLOW ? "slow" : "fault");
     }
     printf("volumes %" PRIu32 " users %" PRIu32 "\n", m.nvolumes, m.nusers);
     meta_free(&m);
@@ -263,7 +283,7 @@ int cluster_cli(int argc, char **argv)
                 return 1;
             }
             print_status(&st);
-            free(st.heard);
+            cluster_status_free(&st);
         } else if (op == CLUSTER_OP_INIT) {
             printf("initialised: node 1 at %s\n", target);
         } else {
