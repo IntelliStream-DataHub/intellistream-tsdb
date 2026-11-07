@@ -50,6 +50,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -321,7 +322,7 @@ static void paths_free(char **p, size_t n)
 }
 
 /* A name the engine of a volume would take for a file of its own beyond MANIFEST, SERIES and LOCK (an engine's,
- * checked apart) and META (an add's too): its open replays a WAL segment, cuts what it reads as the torn tail of
+ * checked apart) and META and FNO (an add's too: it makes FNO before META): its open replays a WAL segment, cuts what it reads as the torn tail of
  * STATES, RETENTION or CLASSES, runs an intent, opens a part, deletes a part's temporary, a retired part or
  * META.tmp. That exact name is written only by an engine making its own META (meta_write), never into a directory
  * before it is added, so it is a user's file; an add's own temporaries (META.tmp.HOST.PID.TID, which a concurrent
@@ -482,16 +483,28 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     int rc = read_file_all(rootfd, "META", &txt, &len);
     if (rc)
         return rc;
+    /* The volume gets the root's META and a FNO of this format: a root of another format, or one that needs a feature
+     * this release does not know, is not given a volume made by these rules (the open of the root refuses it too). */
+    {
+        char *vl = strstr(txt, "version="), *rq = strstr(txt, "requires=");
+        if ((vl ? atoi(vl + 8) : 0) != FORMAT_VERSION || (rq && rq[9] != '\n' && rq[9] != '\0')) {
+            fprintf(stderr, "tsdb: the root META says format %d%s%s: a volume is added only to a database of format "
+                            "%d without unknown requirements\n", vl ? atoi(vl + 8) : 0, rq ? ", " : "",
+                    rq ? "with requires=" : "", FORMAT_VERSION);
+            free(txt);
+            return TSDB_ERR_INVALID;
+        }
+    }
     char *buf = malloc(len + 32);
     if (!buf) {
         free(txt);
         return TSDB_ERR_NOMEM;
     }
     size_t n = 0;
-    for (char *l = txt, *next; *l; l = next) { /* every line but the root's volume number */
+    for (char *l = txt, *next; *l; l = next) { /* every line but the root's volume number and its old parts */
         next = strchr(l, '\n');
         next = next ? next + 1 : l + strlen(l);
-        if (strncmp(l, "volume=", 7) != 0) {
+        if (strncmp(l, "volume=", 7) != 0 && strncmp(l, "parts_v8=", 9) != 0) {
             memcpy(buf + n, l, (size_t)(next - l));
             n += (size_t)(next - l);
         }
@@ -501,6 +514,14 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     char tmp[128];
     meta_tmp_make(tmp, sizeof tmp); /* our own: another add of this directory may be writing META right now */
     int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    /* the volume's FNO (fno.c), made and synced with its directory before META says the volume is there */
+    if (fd >= 0 && !fno_file_intact(fd) && fno_create(fd, 1, sync) != 0) {
+        int e = errno;
+        close(fd);
+        free(buf);
+        errno = e;
+        return TSDB_ERR_IO;
+    }
     int mfd = fd < 0 ? -1 : openat(fd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     ssize_t wr = mfd < 0 ? -1 : write(mfd, buf, n);
     bool ok = wr == (ssize_t)n && (!sync || tsdb_fsync(mfd) == 0);
@@ -2724,4 +2745,277 @@ const char *tsdb_volume_path(tsdb *t, uint32_t index)
     const char *p = index < t->nvols ? t->paths[index] : NULL;
     pthread_rwlock_unlock(&t->lock);
     return p;
+}
+
+/* ------------------------------------------------------- upgrade, format 8 to 9 */
+
+/*
+ * `tsdb DIR upgrade` (tsdb_upgrade): carries a database of the previous format over in place. What changed is the
+ * WAL record, MANIFEST (one more line), the part header (48 bytes instead of 24: the position range and the write
+ * time) and the new FNO file. The parts are left as they are: a volume's META says `parts_v8=1`, and the open
+ * reads a part with a 24-byte header only in such a volume; merges rewrite them (select_merge_locked takes an idle
+ * one alone), and the flag goes once none is left.
+ *
+ * It refuses, before it writes anything, unless every volume was closed cleanly by the release that wrote it: no
+ * WAL segment (a v8 record is not a v9 record), no intent file, no tmp part, and the writer's lock free. It holds
+ * the writers' locks (LOCK of every directory) and the OFD lock of VOLUMES until it is done. Followers on other
+ * hosts cannot be seen: they must be stopped first (docs/compatibility.md).
+ *
+ * Per volume: FNO is made and synced (with its directory), MANIFEST is rewritten as version 9 (tmp, fsync, rename,
+ * directory fsync), and META is written last (same way) with version=9: META is what says which format the files
+ * have. Volumes first, the root last, so that a crash anywhere leaves a root that still says 8: the new binary
+ * refuses it and names this command, the old binary opens it and refuses the volumes already at 9. Every step is
+ * safe to repeat, so a run that died is simply run again; a volume at 9 is skipped.
+ */
+typedef struct up_dir {
+    char *path;
+    int dirfd, lockfd;
+    int version;
+} up_dir;
+
+static int meta_version_of(const char *txt)
+{
+    for (const char *l = txt; *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : l + strlen(l))
+        if (strncmp(l, "version=", 8) == 0)
+            return atoi(l + 8);
+    return 0;
+}
+
+/* Fsyncs the file written under `name` (tmp), then renames it over `final`, then the directory. */
+static int up_put(int dirfd, const char *tmp, const char *final, const char *data, size_t len)
+{
+    int fd = openat(dirfd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    bool ok = write(fd, data, len) == (ssize_t)len && tsdb_fsync(fd) == 0;
+    close(fd);
+    if (!ok || renameat(dirfd, tmp, dirfd, final) != 0 || tsdb_fsync(dirfd) != 0)
+        return TSDB_ERR_IO;
+    return 0;
+}
+
+/* MANIFEST as format 9: the first line says 9 and an `fno_next` line (information for followers only, 1: no
+ * number was ever given) goes before `parts`; the checksum is made again. A missing MANIFEST stays missing (the
+ * open writes it); one that is damaged or of another format is refused. A MANIFEST already at 9 is kept. */
+static int up_manifest(const up_dir *d, bool write)
+{
+    char *txt;
+    size_t len;
+    int rc = read_file_all(d->dirfd, "MANIFEST", &txt, &len);
+    if (rc == TSDB_ERR_NOTFOUND)
+        return 0;
+    if (rc)
+        return rc;
+    char *ck = len > 1 ? memrchr(txt, '\n', len - 1) : NULL;
+    char *body_end = ck ? ck + 1 : txt;
+    uint64_t want;
+    int format = 0;
+    if (!ck || sscanf(body_end, "checksum %" SCNx64, &want) != 1 || xxh64(txt, (size_t)(body_end - txt), 0) != want ||
+        sscanf(txt, "tsdb-manifest %d\n", &format) != 1 || (format != PREV_FORMAT_VERSION && format != FORMAT_VERSION)) {
+        fprintf(stderr, "tsdb: upgrade: %s/MANIFEST is damaged or of another format: open the database with the "
+                "release that wrote it, close it, and run this again\n", d->path);
+        free(txt);
+        return TSDB_ERR_CORRUPT;
+    }
+    if (format == FORMAT_VERSION || !write) {
+        free(txt);
+        return 0;
+    }
+    size_t blen = (size_t)(body_end - txt);
+    char *nl = memchr(txt, '\n', blen); /* the end of the first line */
+    char *parts = nl ? strstr(nl, "\nparts ") : NULL;
+    if (!nl || !parts) {
+        free(txt);
+        return TSDB_ERR_CORRUPT;
+    }
+    parts++;
+    char *out = malloc(blen + 64);
+    if (!out) {
+        free(txt);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t n = (size_t)snprintf(out, 32, "tsdb-manifest %d", FORMAT_VERSION);
+    memcpy(out + n, nl, (size_t)(parts - nl)); /* from the newline of the first line to the start of `parts` */
+    n += (size_t)(parts - nl);
+    n += (size_t)snprintf(out + n, 32, "fno_next 1\n");
+    memcpy(out + n, parts, (size_t)(body_end - parts));
+    n += (size_t)(body_end - parts);
+    n += (size_t)snprintf(out + n, 40, "checksum %016" PRIx64 "\n", xxh64(out, n, 0));
+    rc = up_put(d->dirfd, "MANIFEST.tmp", "MANIFEST", out, n);
+    free(out);
+    free(txt);
+    return rc;
+}
+
+static int up_meta(const up_dir *d, const char *txt)
+{
+    size_t cap = strlen(txt) + 64, n = 0;
+    char *out = malloc(cap);
+    if (!out)
+        return TSDB_ERR_NOMEM;
+    for (const char *l = txt; *l;) {
+        const char *e = strchr(l, '\n');
+        size_t ll = e ? (size_t)(e - l) + 1 : strlen(l);
+        if (strncmp(l, "version=", 8) == 0)
+            n += (size_t)snprintf(out + n, cap - n, "version=%d\n", FORMAT_VERSION);
+        else if (strncmp(l, "parts_v8=", 9) != 0) {
+            memcpy(out + n, l, ll);
+            n += ll;
+            if (!e)
+                out[n++] = '\n';
+        }
+        l += ll;
+    }
+    n += (size_t)snprintf(out + n, cap - n, "parts_v8=1\n");
+    char tmp[256];
+    meta_tmp_make(tmp, sizeof tmp);
+    int rc = up_put(d->dirfd, tmp, "META", out, n);
+    free(out);
+    return rc;
+}
+
+/* Whether the directory holds what a clean close leaves: no WAL segment, intent or tmp part. */
+static int up_scan(const up_dir *d)
+{
+    int fd = dup(d->dirfd);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    if (!dir) {
+        if (fd >= 0)
+            close(fd);
+        return TSDB_ERR_IO;
+    }
+    rewinddir(dir);
+    int rc = 0;
+    struct dirent *e;
+    while (rc == 0 && (e = readdir(dir)) != NULL) {
+        const char *why = strncmp(e->d_name, "wal_", 4) == 0 ? "a WAL segment"
+                          : intent_file_name(e->d_name)       ? "an insert's intent"
+                          : part_tmp_name(e->d_name)          ? "a part that was being written"
+                                                              : NULL;
+        if (why) {
+            fprintf(stderr, "tsdb: upgrade: %s/%s is %s: the database was not closed cleanly. Open it with the "
+                    "release that wrote it (it recovers), close it, and run this again\n", d->path, e->d_name, why);
+            rc = TSDB_ERR_INVALID;
+        }
+    }
+    closedir(dir);
+    return rc;
+}
+
+static int up_open(up_dir *d, const char *path, uint32_t index)
+{
+    memset(d, 0, sizeof *d);
+    d->dirfd = d->lockfd = -1;
+    d->path = strdup(path);
+    d->dirfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (!d->path || d->dirfd < 0) {
+        fprintf(stderr, "tsdb: upgrade: cannot open %s\n", path);
+        return TSDB_ERR_IO;
+    }
+    d->lockfd = openat(d->dirfd, "LOCK", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (d->lockfd < 0)
+        return TSDB_ERR_IO;
+    if (flock(d->lockfd, LOCK_EX | LOCK_NB) != 0) {
+        fprintf(stderr, "tsdb: upgrade: %s is in use (its writer holds the lock): stop tsdbd first\n", path);
+        return TSDB_ERR_LOCKED;
+    }
+    char *txt;
+    size_t len;
+    int rc = read_file_all(d->dirfd, "META", &txt, &len);
+    if (rc) {
+        fprintf(stderr, "tsdb: upgrade: %s has no readable META\n", path);
+        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_CORRUPT : rc;
+    }
+    d->version = meta_version_of(txt);
+    free(txt);
+    if (d->version != PREV_FORMAT_VERSION && d->version != FORMAT_VERSION) {
+        fprintf(stderr, "tsdb: upgrade: %s has disk format version %d; this tsdb carries version %d over to %d. "
+                "Export the data with the release that wrote it and import it here (docs/compatibility.md)\n", path,
+                d->version, PREV_FORMAT_VERSION, FORMAT_VERSION);
+        return TSDB_ERR_INVALID;
+    }
+    if ((rc = meta_check(d->dirfd, path, index)) != 0)
+        return rc;
+    if (d->version != PREV_FORMAT_VERSION)
+        return 0;
+    return (rc = up_scan(d)) != 0 ? rc : up_manifest(d, false); /* before anything is written */
+}
+
+static void up_close(up_dir *d)
+{
+    if (d->lockfd >= 0)
+        close(d->lockfd); /* the flock goes with it */
+    if (d->dirfd >= 0)
+        close(d->dirfd);
+    free(d->path);
+}
+
+/* Upgrades one directory: FNO, MANIFEST, META, in that order. */
+static int up_one(const up_dir *d)
+{
+    int rc = 0;
+    if (!fno_file_intact(d->dirfd) && fno_create(d->dirfd, 1, true) != 0) {
+        fprintf(stderr, "tsdb: upgrade: cannot make %s/FNO\n", d->path);
+        return TSDB_ERR_IO;
+    }
+    if ((rc = up_manifest(d, true)) != 0)
+        return rc;
+    char *txt;
+    size_t len;
+    if ((rc = read_file_all(d->dirfd, "META", &txt, &len)) != 0)
+        return rc;
+    rc = up_meta(d, txt);
+    free(txt);
+    if (rc)
+        fprintf(stderr, "tsdb: upgrade: cannot write %s/META\n", d->path);
+    return rc;
+}
+
+int tsdb_upgrade(const char *dir)
+{
+    int rootfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfd < 0) {
+        fprintf(stderr, "tsdb: upgrade: cannot open %s\n", dir);
+        return TSDB_ERR_IO;
+    }
+    char **paths = NULL;
+    size_t nv = 0;
+    int vfd = openat(rootfd, VOLUMES_FILE, O_RDWR | O_CLOEXEC);
+    int rc = 0;
+    if (vfd < 0 && errno != ENOENT)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && vfd >= 0) {
+        struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+        off_t size;
+        if (fcntl(vfd, F_OFD_SETLK, &fl) != 0) {
+            fprintf(stderr, "tsdb: upgrade: VOLUMES is locked (a volume is being added): try again\n");
+            rc = TSDB_ERR_LOCKED;
+        } else {
+            rc = volumes_parse(vfd, false, false, &paths, &nv, &size);
+        }
+    }
+    up_dir *ds = rc == 0 ? calloc(nv + 1, sizeof *ds) : NULL;
+    size_t nopen = 0;
+    if (rc == 0 && !ds)
+        rc = TSDB_ERR_NOMEM;
+    /* volumes first, the root last; nothing is written until every directory has been checked */
+    for (size_t i = 0; rc == 0 && i <= nv; i++, nopen++)
+        rc = i < nv ? up_open(&ds[i], paths[i], (uint32_t)(i + 1)) : up_open(&ds[i], dir, 0);
+    int done = 0;
+    for (size_t i = 0; rc == 0 && i <= nv; i++) {
+        if (ds[i].version != PREV_FORMAT_VERSION)
+            continue;
+        if ((rc = up_one(&ds[i])) == 0)
+            done++;
+    }
+    for (size_t i = 0; i < nopen; i++)
+        up_close(&ds[i]);
+    free(ds);
+    for (size_t i = 0; i < nv; i++)
+        free(paths[i]);
+    free(paths);
+    if (vfd >= 0)
+        close(vfd);
+    close(rootfd);
+    return rc ? rc : done;
 }

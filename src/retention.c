@@ -232,6 +232,8 @@ int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
     int rc = eng_check(db);
     if (rc)
         return rc;
+    if ((rc = jr_intent(db, JR_RETENTION, &series)) != 0)
+        return rc;
     pthread_mutex_lock(&db->ret_lock);
     if (db->ret_broken) {
         pthread_mutex_unlock(&db->ret_lock);
@@ -274,6 +276,8 @@ int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
     if (lowered)
         lt_retention_lowered(db, &lsec, series, oldc);
     lt_end(db, &lsec);
+    if (rc == 0)
+        jr_commit(db, JR_RETENTION, &series);
     pthread_mutex_unlock(&db->ret_lock);
     if (rc == 0) {
         pthread_mutex_lock(&db->lock);

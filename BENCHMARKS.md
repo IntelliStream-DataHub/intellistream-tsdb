@@ -768,6 +768,39 @@ runs every time.
 - **Not measured:** the default durability mode (an fsync for every request; the inserts above had no fsync at all).
   The comparison with the earlier main (3bd4e96) is left for a separate investigation.
 
+## Format 9: the WAL record and the FNO file
+
+What do the 16 more bytes in every WAL record (the 32-byte header with the log number `fno` and the commit time) and
+the extra `fdatasync` of the `FNO` file per flush cost? `build/insert-bench` (4 s per mode, ext4 on the NVMe, fsync
+on), the tree before the change (ec2b00a) against the format-9 tree (bf76c26), both built the same way, 3 repetitions
+of each of two invocations (`--max-batch 10000` and `--appends-only`; the 1, 16 and 64 thread fsync-each rows come
+from both, so 6 runs, the others 3), interleaved, under the exclusive BENCH lock (nothing else of ours ran). Mean of
+the runs:
+
+| mode | rows per call | 0.9.0 format 8 | format 9 | change |
+|---|---:|---:|---:|---:|
+| append, fsync each, 1 thread | 1 | 1,403 /s | 1,442 /s | +2.8% |
+| append, fsync each, 16 threads | 1 | 11,946 /s | 12,496 /s | +4.6% |
+| append, fsync each, 64 threads | 1 | 42,189 /s | 43,096 /s | +2.1% |
+| append, fsync each, 256 threads | 1 | 144,987 /s | 142,076 /s | -2.0% |
+| append, WAL fsync every 10 ms, 1 thread | 1 | 7.81 M/s | 7.46 M/s | -4.5% |
+| append, WAL fsync every 10 ms, 16 threads | 1 | 1.89 M/s | 1.83 M/s | -2.9% |
+| append, WAL fsync every 100 ms, 1 thread | 1 | 7.50 M/s | 7.44 M/s | -0.7% |
+| append, WAL fsync every 100 ms, 16 threads | 1 | 1.93 M/s | 1.78 M/s | -7.6% |
+| insert batch, WAL + memtable | 10 | 1,467 /s | 1,441 /s | -1.7% |
+| insert batch, WAL + memtable | 100 | 1,429 /s | 1,421 /s | -0.6% |
+| insert batch, WAL + memtable | 1,000 | 1,305 /s | 1,314 /s | +0.7% |
+| insert batch, WAL + memtable | 10,000 | 909 /s | 912 /s | +0.3% |
+
+- **With an fsync per call the cost is not measurable:** the differences go both ways and are the size of the run-to-run
+  spread (the fsync of a 0.7 ms drive hides the 16 bytes). Latency p50 and p99 are the same.
+- **Without an fsync per call the record is a few percent slower:** a one-row append is a 12-byte payload that now
+  carries 32 bytes of header instead of 16, so a memory-speed append loop loses 1 to 8% (the 16-thread rows spread
+  the most). The flushes of these runs do the `FNO` sync; its cost does not show separately, because it happens once
+  per flush (every few seconds), not per call.
+- **Not measured:** the `FNO` sync alone (no run isolates it), `tsdb DIR upgrade` and the merges that rewrite format-8
+  parts, and queries (the part header grew by 24 bytes per part, which no query reads).
+
 ## Reproduce it yourself
 
 **tsdb alone, on your machine:** `tools/bench-tsdb.sh` builds an optimized copy in `build-bench/`, runs tsdb's own

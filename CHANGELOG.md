@@ -8,19 +8,58 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+### Changed
+
+- **Disk format 9** (step S0 of docs/design-ha-modes.md; the disk half). The WAL record has a 32-byte header with a log
+  number (`fno`) and the group commit's time, and can be a marker; the part header is 48 bytes (the range of log numbers
+  of its rows, and `written_ms`); every volume has an `FNO` file, two checksummed slots that bound the numbers so
+  that they never go back across opens (before a WAL segment is unlinked it holds the segment's end: one `fdatasync`
+  per flush); `META` can say `requires=` (a binary refuses a feature it does not know, naming it); `MANIFEST` has an
+  `fno_next` line (information for followers). The cost is 16 more bytes per WAL record: not measurable with an
+  fsync per call, 1 to 8% on appends without one (BENCHMARKS.md, "Format 9").
+  **Carrying a database over:** a format-8 database is refused, naming both versions. `tsdb DIR upgrade` carries it
+  over in place when it was closed cleanly with 0.9.0 (no WAL segment, intent or tmp part; stop tsdbd and every
+  follower first): FNO, MANIFEST and META of each volume, the root last, safe to run again. The parts keep their old
+  headers until merges rewrite them (`META` says `parts_v8=1` meanwhile; merges of idle partitions and `tsdb DIR
+  optimize` do it, the open logs how many are left). Export and import (docs/export-format.md) still always works.
+  See docs/compatibility.md. With one bad `FNO` slot (a torn store or damage; they look alike) the open uses the other
+  and skips the numbers ahead by 2^40, so none is handed out twice; do not run 0.9.0's `tsdb` (`volume add`) on an
+  upgraded database.
+- New status codes -18 (`TSDB_ERR_FEED_GONE`) and -19 (`TSDB_ERR_FEED_RESET`) are reserved in `tsdb.h` for the change
+  feed; nothing returns them yet.
+- **Wire protocol 13: every HA body, before the 1.0 freeze** (step S0, the wire half; docs/ha.md 15.4,
+  `include/tsdb_protocol.h`, `include/tsdb_wire.h`). The floor stays 12: the new statuses only answer requests a
+  client of 12 already sends, and it treats an unknown status as an error. New statuses `TSDB_ERR_MOVED` (-10),
+  `TSDB_ERR_UNAVAILABLE` (-11, which already existed without a body), `TSDB_ERR_PARTIAL` (-12) and
+  `TSDB_ERR_DROPPED` (-13), each with a body: UNAVAILABLE names the volume, the reason, `retry_after_ms` and the outage;
+  MOVED names the volume, epoch and owner address; PARTIAL the status of each volume and the rows not applied; DROPPED
+  the volume and its watermark. New ops `TOPOLOGY` (48: nodes, and per volume owner, role, health, epoch; a single
+  tsdbd answers itself) and `STATUS` (49: `key=value` lines, superuser). tsdbd sends only UNAVAILABLE, with its body
+  from the storage domains (docs/ha.md 15.2); the others are defined, coded, decoded and fuzzed
+  (`tests/fuzz/fuzz_wire.c`) for the cluster. All four clients decode the bodies, retry UNAVAILABLE after
+  `retry_after` within a time budget (30 s by default, off with `tsdbc_set_retry(c, 0)`, `set_retry`, `retry=`,
+  `setRetry`), follow MOVED, and connect to a list of nodes (`tsdbc_connect_nodes`, `connect_nodes`,
+  `connectNodes`); new exceptions `TsdbUnavailable`, `TsdbMoved`, `TsdbPartial`, `TsdbDropped` (Python) and
+  `UnavailableException` and its siblings (Java), `Status::{Moved, Unavailable, Partial, Dropped}` (Rust). The
+  C client keeps a copy of each request until its reply (one more memcpy). A connection gets the bodies only if its
+  HELLO said 13 (a client of 12 reads the bare status, as before), and in QUERY_MULTI only the END frame carries the
+  body. The Pulsar sink works as before (its tests pass), and treats DROPPED as final (dead letter). **Protocol numbers moved:** `QUERY_LATEST` is protocol 14, the change feed 15, statistics 16.
+- The embedded C ABI is version 4 (`tsdb_options` gained `latest_cache`); the Rust, Python and Java embedded options
+  have `latest_cache`. Disk format and wire protocol are unchanged.
+
 ### Added
 
+- **Marker payloads and the namespace-event hook** (docs/design-ha-modes.md 2.1): `COMMIT`, `DROP`, `RETENTION` and
+  `EPOCH` have one encoder and one decoder (`src/marker.c`, fuzzed), the type numbers of the feed's and the cluster's
+  other markers are reserved, and the engine calls a no-op `jr_intent` / `jr_commit` hook where names and files
+  become visible. No backend yet: no marker is written outside the tests.
+- `tsdb_upgrade(dir)` in `tsdb.h` and `tsdb DIR upgrade` (above).
 - **The latest table** (engine, `docs/design-latest.md` step 2): per volume, the newest non-null row of every series in
   the parts (or a bound on it), kept exact by every listing of parts (flush, insert, replay, delete, replace), by
   retention and by `tsdb_drop_before`, and filled by a background warmer. `tsdb_latest` answers from it in O(1) and
   falls back to the slow path for an entry that is unknown. New option `latest_cache` (bytes; `tsdb_options_init` sets
   RAM/16, 0 turns the table off; followers have none). Large flushes (50,000 series or more) store their rows in a
   window that lookups can read.
-
-### Changed
-
-- The embedded C ABI is version 4 (`tsdb_options` gained `latest_cache`); the Rust, Python and Java embedded options
-  have `latest_cache`. Disk format and wire protocol are unchanged.
 
 ## [0.9.1] - 2026-11-07
 

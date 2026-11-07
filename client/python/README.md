@@ -396,7 +396,7 @@ The `_multi` calls ask for many series at once: one request, one answer,
 in the order of your list. The server (or, for `Db`, the database in this
 process) reads the series in parallel and from one moment in time, so an
 insert that wrote several series at once is seen whole or not at all.
-Every server this client connects to (protocol version 12) has them.
+Every server this client connects to (protocol version 12 or later) has them.
 
 ```python
 import numpy as np

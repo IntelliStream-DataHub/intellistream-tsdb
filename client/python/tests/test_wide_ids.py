@@ -57,7 +57,7 @@ def requests(level, call):
     call(c)
     c.close()
     th.join(5)
-    assert hello == [struct.pack("<I", 12)]
+    assert hello == [struct.pack("<I", 13)]
     return seen
 
 
@@ -69,7 +69,7 @@ def test_a_server_older_than_12_is_refused_at_connect(version):
     assert e.value.code == -3
     assert f"tsdbd speaks protocol {version}; this client needs 12: upgrade the server" in str(e.value)
     th.join(5)
-    assert hello == [struct.pack("<I", 12)] and seen == []
+    assert hello == [struct.pack("<I", 13)] and seen == []
 
 
 def test_the_frames_carry_the_whole_id():

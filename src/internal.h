@@ -21,6 +21,7 @@ typedef struct eng eng;
 #include <zstd.h>
 
 #include "compat.h" /* macOS shims; nothing on Linux */
+#include "marker.h" /* WAL marker payloads (format 9) */
 
 #include "levels.h" /* before the declarations: renames them in a per-CPU-level compile */
 
@@ -36,9 +37,19 @@ typedef struct eng eng;
  * classes (a partition key is 4 x its first base partition + its class, CLASSES holds each series' class
  * history) and zstd frames without magic number or content size, and the granule index bit-packed (gindex.c),
  * its length in the footer (64 bytes); 8: 64-bit series ids (volume + 1) << 32 | local, no CATALOG, each
- * directory's META says which volume it is ("volume=N"; the files inside a volume are as in 7). Databases of older versions
- * are refused (no release had them). */
-#define FORMAT_VERSION 8
+ * directory's META says which volume it is ("volume=N"; the files inside a volume are as in 7); 9: the WAL record
+ * has a 32-byte header with fno and commit_ms, and markers (docs/design-cdc.md 2.1), the part header 48 bytes (the
+ * position range fno_lo/fno_hi and written_ms), each volume an FNO file (the durable bound of the numbers, fno.c),
+ * META may say requires= and parts_v8=1 (a database `tsdb DIR upgrade` carried over from 8: its parts keep their
+ * 24-byte headers until merges rewrite them). Databases of older versions are refused (upgrade, or export and
+ * import). */
+#define FORMAT_VERSION 9
+#define PREV_FORMAT_VERSION 8
+#define PART_HDR_V8 24 /* the header of a part written at format 8 */
+/* Planted mutations: a test sets eng_test_mutant (tests link the engine) and must then fail, to show that it
+ * catches the bug; nothing in the library or the server ever sets it. */
+enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC };
+extern int eng_test_mutant;
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -580,7 +591,13 @@ typedef struct part_header {
     uint32_t version;
     uint32_t granule_rows;
     uint64_t wal_seq; /* newest WAL segment whose rows this part holds; 0 if none */
+    /* format 9 (a format-8 part has the first 24 bytes only, PART_HDR_V8): the smallest first and the largest last
+     * `fno` of the rows records the flush took, or the merged sources' range; 0, 0 for a part whose rows have no
+     * number (a large insert, a replace, a delete). Rows only: markers are not in it (design-cdc.md 2.1) */
+    uint64_t fno_lo, fno_hi;
+    int64_t written_ms; /* wall clock when its newest rows were inserted; a merge output has the newest of its inputs */
 } part_header;
+_Static_assert(sizeof(part_header) == 48, "part header must be 48 bytes");
 
 typedef struct part_footer {
     uint64_t index_off;
@@ -731,6 +748,9 @@ typedef struct part {
     uint32_t level;
     uint32_t grows; /* granule_rows the part was written with */
     uint64_t wal_seq;
+    uint64_t fno_lo, fno_hi; /* the header's position range of the rows (0, 0: none); 0 in a format-8 part */
+    int64_t written_ms;      /* the header's write time; 0 in a format-8 part */
+    uint32_t hdr_len;        /* sizeof(part_header), or PART_HDR_V8 for a part an upgrade carried over */
     const uint8_t *map;
     size_t map_len;
     gix ix; /* the granule index, in the map */
@@ -863,7 +883,9 @@ static inline void gx_load(const part *p, uint32_t i, unsigned want, granule *g)
 /* pin: the index and tombstones are read from a copy made when they were checked (tsdb_options.pin_index), not
    from the mapping; the caller sets p->verify (granule checksums, tsdb_options.verify_checksums) */
 int part_open(int dirfd, const char *name, bool pin, part **out);
-int part_open_as(int dirfd, const char *file, const char *name, bool pin, part **out);
+int part_open_as(int dirfd, const char *file, const char *name, bool pin, bool v8_ok, part **out);
+/* the position range a part writer begun on this thread takes (set around a flush; a merge sets its own) */
+extern __thread uint64_t cur_fno_lo, cur_fno_hi;
 bool part_index_intact(const part *p);
 /* part_index_intact; a part that fails it is marked damaged, logged and counted once (st_broken_parts) */
 bool part_checked(struct eng *db, part *p, const char *what);
@@ -918,6 +940,8 @@ typedef struct part_writer {
     granule *idx;
     size_t ng, idx_cap;
     uint64_t wal_seq;
+    uint64_t fno_lo, fno_hi; /* the header's position range (pw_begin takes the flush's, a merge sets its own) */
+    int64_t written_ms;
     uint32_t pend_series;
     int pend_type;
     size_t pend_n;
@@ -1176,6 +1200,8 @@ typedef struct memtable {
     int64_t min_ts, max_ts;
     uint64_t wal_seq;
     int64_t created_ms;
+    uint64_t fno_lo, fno_hi; /* the smallest first and largest last number of the rows records it took; 0, 0: none */
+    uint64_t fno_end;        /* a sealed memtable: the next number at its seal, the end of its segment (FNO bound) */
 } memtable;
 
 /* Rows of one series copied out of a memtable: sorted, unique by ts; v in
@@ -1203,19 +1229,83 @@ int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, 
 /* only rows with a WAL sequence <= visible; values as slots of width w */
 int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t end, uint64_t visible, mem_run *out);
 void mem_run_free(mem_run *r);
+void mt_note_fno(memtable *m, uint64_t first, size_t n);
 int mt_flush(struct eng *db);
 int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
                size_t n, int type);
-/* WAL records: [u32 rows][u32 header check][u64 rows hash][rows of 20 bytes:
- * u32 series, i64 ts, u64 slot]. The header check covers the row count and the
- * hash, and binds the record to its segment and offset. wal_record returns the
- * size of the record at segment offset `off`, or 0 when it is torn or absent. */
-#define WAL_HDR 16
+/* WAL records, version 2 (format 9, docs/design-cdc.md 2.1):
+ *   [u32 len | kind << 28][u32 header check][u64 hash][u64 fno][i64 commit_ms][payload]
+ * kind 0, rows: len = rows (below 2^28), payload rows of 20 bytes (u32 series, i64 ts, u64 slot); takes len numbers.
+ * kind 1, marker: len = payload bytes (a multiple of 4, at least 8), payload u16 type, u16 flags, u32 span, then the
+ * type's body; takes span numbers (at least 1). A replay or a follower skips the markers it does not apply and
+ * continues the numbering. The hash covers fno, commit_ms and the payload; the header check covers the first word and
+ * the hash and binds the record to its segment and offset. wal_record returns the size of the record at segment offset
+ * `off`, or 0 when it is torn or absent. */
+#define WAL_HDR 32
 #define WAL_ROW 20
-size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, size_t *nrows);
+#define WAL_KIND_ROWS 0
+#define WAL_KIND_MARKER 1
+#define WAL_MARKER_HDR 8 /* type, flags, span */
+typedef struct wal_rec {
+    uint32_t kind;
+    uint32_t n;             /* rows, or payload bytes of a marker */
+    uint64_t fno;           /* the first number it takes */
+    uint64_t span;          /* how many: rows, or the marker's span */
+    int64_t commit_ms;
+    const uint8_t *payload; /* the rows, or the marker's payload (type first) */
+    uint16_t mtype, mflags; /* a marker's */
+} wal_rec;
+size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wal_rec *r);
+void wal_reseal(uint8_t *rec, uint64_t seq, uint64_t off); /* tests: a record changed or moved, sealed again */
 /* Whether a valid record starts anywhere in p[from, len) (p at segment offset
  * base): then a bad record before it is damage, not a torn tail. */
 bool wal_valid_after(const uint8_t *p, size_t len, size_t from, uint64_t seq, uint64_t base);
+/* Appends a marker record (the engine's side of the namespace events; no backend in S0: tests, and the hooks that
+ * come later). *fno gets its first number. Durable when it returns, where the WAL syncs per write. */
+int wal_marker(struct eng *db, uint16_t type, uint16_t flags, uint32_t span, const void *body, size_t body_len,
+               uint64_t *fno);
+/* Encodes `m` (marker.h) and appends it as one record (wal_marker); *fno gets its first number. */
+int wal_marker_mk(struct eng *db, const mk *m, uint64_t *fno);
+
+/* The namespace-event hook (docs/design-ha-modes.md 2.1, M15): one call at each place a name or a file becomes
+ * visible, in two phases. jr_intent runs before publish_lock is taken (a replicated backend appends the marker and
+ * waits for its commit point there), jr_commit under publish_lock once block numbers are assigned (the ledger
+ * backend of shared mode edits its ledger there). S0 has no backend: both do nothing and compile away, the call
+ * sites are in place. `arg` is the event's payload (an `mk` or a part list), unused until a backend reads it. */
+enum jr_kind {
+    JR_COMMIT = 1, /* an insert, replace or delete committed its parts */
+    JR_FLUSHED,    /* a memtable's parts were listed and its segment may go */
+    JR_MERGE,      /* a merge replaced parts */
+    JR_PURGE,      /* retired parts were deleted */
+    JR_DROP,       /* tsdb_drop_before */
+    JR_RETENTION,  /* a retention limit was appended */
+    JR_DICT,       /* a SERIES, STATE or CLASSES record was appended */
+};
+static inline int jr_intent(struct eng *db, enum jr_kind kind, const void *arg)
+{
+    (void)db, (void)kind, (void)arg;
+    return 0;
+}
+static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
+{
+    (void)db, (void)kind, (void)arg;
+}
+
+#define FNO_FILE "FNO"
+/* Log numbers stay below FNO_LIMIT (a record at or above it is not one: wal_record). A bound read at open (a slot, a
+ * part's fno_hi, the end of a segment) at or above FNO_BOUND_MAX fails the open: the writer must never assign past
+ * the limit, which would make its own records unreadable (a torn tail at the next open). The margin is room for the
+ * raise by FNO_BELT that an open makes when one FNO slot is bad: that slot may have been the newest, and the open
+ * cannot know how far the numbers ran past the other one, so it leaves a gap (numbers may have gaps, never repeat). */
+#define FNO_LIMIT ((uint64_t)1 << 62)
+#define FNO_BELT ((uint64_t)1 << 40)
+#define FNO_BOUND_MAX (FNO_LIMIT - 2 * FNO_BELT)
+int fno_create(int dirfd, uint64_t next, bool sync);
+void v8_parts_account(struct eng *db, bool at_open); /* upgraded databases: parts with a format-8 header left (db.c) */
+bool fno_file_intact(int dirfd);
+void fno_slot_page(uint8_t *page, uint64_t next, uint64_t gen); /* 4096 bytes: a slot as FNO stores it */
+int fno_load(struct eng *db, uint64_t *next, uint64_t *gen, int *slot, bool *torn);
+int fno_require(struct eng *db, uint64_t v);
 void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot);
 int wal_commit(struct eng *db, uint64_t target);
 int wal_open(struct eng *db, int (*before_replay)(struct eng *));
@@ -1465,7 +1555,18 @@ struct eng {
     uint64_t wal_last_seq, wal_last_off, wal_last_len, wal_last_hash;
     uint8_t *wal_buf, *wal_spare;
     size_t wal_len, wal_cap, wal_spare_cap;
-    uint64_t wal_appended;            /* rows appended (buf_lock) */
+    uint64_t wal_appended;            /* rows (and one per marker) appended (buf_lock) */
+    uint64_t fno_next;                /* the next record number to assign (buf_lock) */
+    bool wal_rec_open;                /* the last record in wal_buf is a rows record that takes more (buf_lock) */
+    size_t wal_rec_at;                /* its offset in wal_buf */
+    /* FNO (fno.c): the file, the slot the newest store is in, its generation and the value it holds */
+    int fno_fd, fno_slot;
+    uint64_t fno_gen;
+    atomic_uint_fast64_t fno_durable;
+    pthread_mutex_t fno_lock; /* after dir_sync_lock, before fail_lock; held across the store's I/O */
+    atomic_uint_fast64_t st_fno_syncs;
+    bool parts_v8;                    /* META said parts_v8=1 at open: format-8 part headers are valid here (upgrade) */
+    bool v8_meta;                     /* META still says it (db->lock): v8_parts_account takes it out when none is left */
     atomic_uint_fast64_t wal_durable; /* rows durable */
     int64_t last_wal_sync_ms;
     int bg_error;
@@ -1876,6 +1977,13 @@ int eng_optimize(eng *db);
 int eng_drop_before(eng *db, int64_t ts);
 int eng_get_stats(eng *db, tsdb_stats *st);
 int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs);
+
+static inline int64_t eng_wall_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static inline int64_t eng_mono_ms(void)
 {

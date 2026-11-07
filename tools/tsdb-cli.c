@@ -21,6 +21,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: tsdb <dir> <command> [args]\n"
+            "       tsdb cluster init|node add|status PEER ... (tsdb cluster for the details)\n"
             "       tsdb --version\n"
             "\n"
             "  insert <series>                    read \"time,value\" lines from stdin\n"
@@ -68,6 +69,8 @@ static void usage(void)
             "  volume add <path>                  add a volume: a directory for series of their own\n"
             "                                     (e.g. one per disk or NFS mount); also while tsdbd runs\n"
             "  volume list                        list the volumes, the database directory first\n"
+            "  upgrade                            carry a database closed cleanly by the previous release\n"
+            "                                     (disk format 8) over to this one, in place; stop followers first\n"
             "  stats                              rows, parts, size, compression ratio\n"
             "  parts                              list active parts (partition class and range)\n"
             "  optimize                           merge every partition into one part\n"
@@ -91,6 +94,7 @@ static void usage(void)
 }
 
 int user_main(const char *dir, int argc, char **argv); /* tools/users-cli.c */
+int cluster_cli(int argc, char **argv);                /* tools/cluster-cli.c */
 
 static void die(const char *what, int rc)
 {
@@ -723,11 +727,26 @@ int main(int argc, char **argv)
     }
     if (argc < 3)
         usage();
+    if (strcmp(argv[1], "cluster") == 0) /* `tsdb cluster VERB PEER ...`: a server's peer port, no directory */
+        return cluster_cli(argc - 1, argv + 1);
     for (int i = 3; strcmp(argv[1], "user") == 0 && i < argc; i++)
         if (strcmp(argv[i], "--server") == 0) /* `tsdb user VERB ... --server HOST:PORT`: no directory */
             return user_main(NULL, argc - 2, argv + 2);
     const char *dir = argv[1], *cmd = argv[2];
     drop_root(dir); /* before anything in dir is opened, by every command */
+    if (strcmp(cmd, "upgrade") == 0) {
+        if (argc != 3)
+            usage();
+        int rc = tsdb_upgrade(dir); /* the database is not opened: its files are of the previous format */
+        if (rc < 0)
+            die(dir, rc);
+        if (rc == 0)
+            printf("%s: nothing to upgrade (already disk format 9)\n", dir);
+        else
+            printf("%s: %d director%s carried over to disk format 9; parts keep their old headers until merges "
+                   "rewrite them\n", dir, rc, rc == 1 ? "y" : "ies");
+        return 0;
+    }
     if (strcmp(cmd, "volume") == 0 && argc == 5 && strcmp(argv[3], "add") == 0) {
         /* without opening the database: a running tsdbd holds its lock, and opens the volume when a
          * request first names it */

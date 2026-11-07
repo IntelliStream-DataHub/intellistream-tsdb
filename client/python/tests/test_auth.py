@@ -164,7 +164,7 @@ def test_login_with_the_right_password_a_wrong_one_and_an_unknown_user(auth_serv
         me = c.whoami()
         assert (me.name, me.superuser, me.grants) == ("root", True, [])
         assert "root" in repr(me)
-        assert c.protocol_version() == 12 == tsdb_client.PROTOCOL_VERSION
+        assert c.protocol_version() == 13 == tsdb_client.PROTOCOL_VERSION
         s = c.series("plant/a")
         c.insert_series(s, [T0], [1.5])
     with pytest.raises(TsdbError) as wrong:

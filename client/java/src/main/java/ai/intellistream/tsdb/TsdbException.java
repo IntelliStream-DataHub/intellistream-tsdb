@@ -16,6 +16,9 @@ public class TsdbException extends IOException {
     /** The negative status code. */
     private final int status;
 
+    /** The body of an UNAVAILABLE, MOVED, PARTIAL or DROPPED reply; {@code null} for any other error. */
+    private final transient ErrorInfo info;
+
     /**
      * An error reported by the server.
      *
@@ -35,6 +38,41 @@ public class TsdbException extends IOException {
     public TsdbException(int status, String detail, Throwable cause) {
         super(Status.message(status) + " (" + status + ")" + (detail != null ? ": " + detail : ""), cause);
         this.status = status;
+        this.info = null;
+    }
+
+    /**
+     * An error with the body of the reply (protocol 13).
+     *
+     * @param status the negative status code
+     * @param info the decoded body
+     */
+    TsdbException(int status, ErrorInfo info) {
+        super(Status.message(status) + " (" + status + ")" + describe(info));
+        this.status = status;
+        this.info = info;
+    }
+
+    private static String describe(ErrorInfo i) {
+        if (!i.hasBody())
+            return "";
+        if (!i.unavailable().isEmpty()) {
+            ErrorInfo.Unavailable u = i.unavailable().get(0);
+            return ": volume " + (u.vol() == ErrorInfo.VOL_ANY ? "any" : String.valueOf(u.vol())) + ", reason "
+                    + u.reason() + ", retry after " + i.retryAfterMs() + " ms";
+        }
+        if (!i.moved().isEmpty())
+            return ": volume " + i.moved().get(0).vol() + " is on " + i.moved().get(0).addr();
+        return "";
+    }
+
+    /**
+     * The body of an UNAVAILABLE, MOVED, PARTIAL or DROPPED reply (protocol 13).
+     *
+     * @return the body, or {@code null} for any other error
+     */
+    public ErrorInfo info() {
+        return info;
     }
 
     /**

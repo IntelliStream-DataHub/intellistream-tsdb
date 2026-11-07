@@ -17,11 +17,13 @@
 //! Version 12: login (SCRAM-SHA-256) and access control. HELLO's reply says whether login is required and
 //! which mechanisms the server offers; AUTH_START and AUTH_CONTINUE carry the exchange (`auth.rs`), and the
 //! user admin ops (WHOAMI to USER_LIST) follow.
+//! Version 13: the bodies of the HA statuses (`ha.rs`: UNAVAILABLE, MOVED, PARTIAL, DROPPED), TOPOLOGY and STATUS.
+//! The floor stays 12.
 
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 /// The oldest server version this client talks to (`TSDB_PROTOCOL_MIN`): version 11 widened every series id,
 /// 12 added login; tsdbd refuses a client below 12, as this client refuses such a server.
 pub(crate) const PROTOCOL_MIN: u32 = 12;
@@ -115,6 +117,8 @@ pub(crate) enum Op {
     Grant = 36,
     Revoke = 37,
     UserList = 38,
+    Topology = 48,
+    Status = 49,
 }
 
 /// Builds one request frame in a reusable buffer.
@@ -188,6 +192,16 @@ impl FrameBuf {
         let pad = (8 - (self.buf.len() - 9) % 8) % 8;
         self.buf.extend_from_slice(&[0; 7][..pad]);
         self
+    }
+
+    /// The frame's length so far, header included.
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The op of the frame begun.
+    pub(crate) fn op(&self) -> u8 {
+        self.buf[8]
     }
 
     /// Fills in the length and returns the frame.

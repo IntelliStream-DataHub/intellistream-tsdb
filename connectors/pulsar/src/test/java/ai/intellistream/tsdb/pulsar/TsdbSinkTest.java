@@ -597,6 +597,15 @@ class TsdbSinkTest {
                 new ErrorClassifier(Set.of(), Set.of(Status.ERR_DENIED)).classify(Status.ERR_DENIED));
     }
 
+    @Test
+    void droppedIsFinalAndTheOtherHaStatusesAreRetried() {
+        ErrorClassifier k = new ErrorClassifier(Set.of(), Set.of());
+        assertEquals(ErrorClassifier.Kind.PERMANENT, k.classify(Status.ERR_DROPPED)); /* never applied, never will be */
+        assertEquals(ErrorClassifier.Kind.RETRYABLE, k.classify(Status.ERR_UNAVAILABLE));
+        assertEquals(ErrorClassifier.Kind.RETRYABLE, k.classify(Status.ERR_MOVED));
+        assertEquals(ErrorClassifier.Kind.RETRYABLE, k.classify(Status.ERR_PARTIAL));
+    }
+
     /** One foreign series in a batch: tsdbd refuses the frame, the sink finds the records by halving. */
     @Test
     void deniedRecordsAreDeadLetteredAndTheRestIsWritten() throws Exception {

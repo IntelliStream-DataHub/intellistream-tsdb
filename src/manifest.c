@@ -78,12 +78,15 @@ int manifest_publish(eng *db)
         pthread_mutex_unlock(&db->manifest_lock);
         return TSDB_ERR_NOMEM;
     }
+    pthread_mutex_lock(&db->buf_lock); /* after db->lock in the order */
+    uint64_t fno_next = db->fno_next;
+    pthread_mutex_unlock(&db->buf_lock);
     len += (size_t)snprintf(buf + len, cap - len,
                             "tsdb-manifest %d\nversion %" PRIu64 "\nseries %u\nwal_flushed %" PRIu64
-                            "\nwal_active %" PRIu64 "\nfsync %d\nstates %u\nparts %zu\n",
+                            "\nwal_active %" PRIu64 "\nfsync %d\nstates %u\nfno_next %" PRIu64 "\nparts %zu\n",
                             FORMAT_VERSION, ++db->manifest_version, atomic_load(&db->series.count), db->wal_flushed,
                             db->wal_enabled ? db->wal_seq : db->wal_flushed, db->opt.fsync ? 1 : 0,
-                            atomic_load(&db->states.count), db->nparts);
+                            atomic_load(&db->states.count), fno_next, db->nparts);
     for (size_t i = 0; i < db->nparts; i++)
         len += (size_t)snprintf(buf + len, cap - len, "%s\n", db->parts[i]->name);
     pthread_mutex_unlock(&db->lock);
@@ -179,6 +182,8 @@ void graveyard_purge(eng *db, bool all)
         else
             db->graveyard[kept++] = *e;
     }
+    if (kept != db->ngraveyard)
+        jr_commit(db, JR_PURGE, NULL);
     db->ngraveyard = kept;
     pthread_mutex_unlock(&db->lock);
 }
@@ -313,11 +318,11 @@ static int cmp_part_order(const void *x, const void *y)
 /* Opens a part by its active name or, if the writer has just retired it, by its retired name. */
 static int open_listed_part(eng *db, const char *name, part **out)
 {
-    int rc = part_open(db->dirfd, name, db->opt.pin_index, out);
+    int rc = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, out);
     if (rc == TSDB_ERR_NOTFOUND) {
         char retired[256];
         snprintf(retired, sizeof retired, RETIRED_PREFIX "%s", name);
-        rc = part_open_as(db->dirfd, retired, name, db->opt.pin_index, out);
+        rc = part_open_as(db->dirfd, retired, name, db->opt.pin_index, db->parts_v8, out);
     }
     if (rc == 0)
         (*out)->verify = db->opt.verify_checksums;
@@ -355,9 +360,11 @@ static int tail_segment(eng *db, wal_tail *t)
     bool reloaded = false, unknown = false;
     uint32_t unknown_id = 0;
     size_t n, rec;
+    wal_rec wr;
     /* a record that does not check out is still being written: next poll */
-    while (rc == 0 && (rec = wal_record(buf + pos, (size_t)got - pos, t->seq, t->off + pos, &n)) != 0) {
-        const uint8_t *r0 = buf + pos + WAL_HDR, *r = r0;
+    while (rc == 0 && (rec = wal_record(buf + pos, (size_t)got - pos, t->seq, t->off + pos, &wr)) != 0) {
+        n = wr.kind == WAL_KIND_ROWS ? wr.n : 0; /* a marker holds no rows: skipped, the position moves on */
+        const uint8_t *r0 = wr.payload, *r = r0;
         uint32_t id;
         int64_t ts;
         uint64_t slot;

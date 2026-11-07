@@ -24,7 +24,7 @@
 <div class="scrim" hidden></div>
 <div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
 <div class="doc-shell">
-<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="clients.html" aria-current="page">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html" aria-current="page">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
 <main id="main" class="doc">
 <h1>Clients</h1>
 <p class="lead">tsdb has clients for C, Rust, Python and Java. Each one talks to tsdbd, and each one can also run the
@@ -512,28 +512,28 @@ explains each.</p>
 <div class="tabpanel" role="tabpanel" data-key="c">
 <p>The calls in <code>include/tsdb.h</code>. The C client has the same ones with the prefix <code>tsdbc_</code>
 (<code>tsdbc_query_spread</code>, <code>tsdbc_query_twa</code>, <code>tsdbc_query_lttb</code>).</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L477-L485">*    deviations from the mean, granule by granule with the parallel formula of
-*    Chan et al.), so a large offset (pressure in Pa around 101325) costs no
-*    precision. Like sums, they may differ in the last bits with the order in
-*    which rows were combined (parts, merges). Constant data gives
-*    exactly 0.
-*  - int64 and bool keep exact integer sums of x and x^2: the variance is
-*    computed from exact moments, with a few roundings at the end (in long
-*    double), and does not depend on the order of the rows.
-* Like every aggregate, the spread covers only the rows that are left: a</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L541-L551"> * Types: float32, float64, int64 (as double: exact up to 2^53), bool (0 or 1:
- * twa is the fraction of covered time that it was true); state series are
- * TSDB_ERR_INVALID. Whole granules inside one bucket are answered from stored
- * statistics without decoding, except where a delete overlaps them and until a
- * merge has removed the deleted rows (see docs/design.md). */
-typedef enum { TSDB_TWA_STEP = 0, TSDB_TWA_LINEAR = 1 } tsdb_twa_method;
+<pre><code class="language-c" data-src="include/tsdb.h#L477-L485">                      const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
+/* group NULL: one bucket for the whole range. */
+int tsdb_query_group_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
+                        const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
-typedef struct tsdb_twa_opts {
-    tsdb_twa_method method;
-    int64_t max_gap_ms; /* 0: no staleness limit */
-    tsdb_order order;   /* of the buckets */</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">*    ClickHouse's and the TimescaleDB toolkit's). From each bucket the point
-*    with the largest triangle formed with the point kept from the previous</code></pre>
+/* ---- the spread: range, variance, standard deviation ----
+ * A bucket as above followed by the spread of its known values: range is
+ * max - min; var_pop and stddev_pop are the population variance and standard
+ * deviation (divided by count), var_samp and stddev_samp the sample ones</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L541-L551">* start and end (LINEAR interpolates the value at the cut), and the value in
+* force at b0 comes from the last reading before it, however long ago (within
+* max_gap_ms), even before start. Readings after end only end segments.
+*    area       = integral of value dt, in value x ms
+*    covered_ms = time covered by segments
+*    twa        = area / covered_ms (NaN when covered_ms is 0)
+*    count      = non-null readings in the bucket and in [start, end)
+* area and covered_ms add up across buckets: the average over several buckets is
+* the sum of their areas over the sum of their covered_ms. A bucket is returned
+* when covered_ms or count is not 0. Since a segment alone fills a bucket, a
+* query may span at most 4M buckets between its first and last reading in range</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">
+/* Raw points of a series of any type, with nulls. */</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
 <pre><code class="language-rust" data-src="client/rust/examples/analytics.rs">use tsdb_client::{Client, ConnectOptions, QueryOpts, TwaOpts, ValueType};
@@ -631,12 +631,12 @@ ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);</code></
 <p><code>tsdb_query_multi</code> calls your function once per series as the answers come;
 <code>tsdb_query_multi_collect</code> returns them all at once. The C client has <code>tsdbc_query_multi</code> and
 <code>tsdbc_query_multi_collect</code>.</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">
-typedef int (*tsdb_multi_fn)(void *ctx, const tsdb_series_result *r);
+<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">    unsigned trim;
+    size_t threshold; /* LTTB */
+    tsdb_twa_opts twa;
+} tsdb_multi_query;
 
-typedef struct tsdb_multi_opts {
-    int threads;
-    uint64_t max_rows;</code></pre>
+typedef struct tsdb_series_result {</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
 <p>The Rust client has the same many-series calls.
@@ -689,11 +689,11 @@ for (int i = 0; i &lt; pumps.length; i++) {
 <button type="button" role="tab" data-key="java">Java</button>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="c">
-<pre><code class="language-c" data-src="include/tsdb.h#L259-L261">* A delete is a write like any other: an insert of the same (series, ts)
-* acknowledged after the delete returned is visible, one acknowledged before
-* it started is gone. It returns once the delete is durable (fsync'd) and</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">* (TSDB_ERR_INVALID otherwise); values as in tsdb_insert_series_values. n = 0
-* is a delete. */</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L259-L261">* sorted input (by series, then time) skips the sort. A row at TSDB_TS_MAX
+* fails the whole call with TSDB_ERR_INVALID (and so does tsdb_append, and
+* a replace): no query range could reach it.</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">/* ---- deleting ----
+ * tsdb_delete_range deletes every value of one series with start &lt;= ts &lt; end.</code></pre>
 <p>The C client has the same calls with the prefix <code>tsdbc_</code>.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
@@ -738,12 +738,12 @@ login.user = argc &gt; 3 ? argv[3] : NULL;          /* NULL: no login */
 login.password_file = argc &gt; 4 ? argv[4] : NULL; /* never the password itself: argv is visible in ps */</code></pre>
 <p>and the calls for users are in <code>client/tsdb_client.h</code> (the kinds of selector are
 <code>TSDB_SEL_*</code>, the rights <code>TSDB_RIGHT_*</code> bits):</p>
-<pre><code class="language-c" data-src="client/tsdb_client.h#L85-L90">int tsdbc_user_create(tsdbc *c, const char *name, const char *password, uint32_t iterations, uint8_t flags);
+<pre><code class="language-c" data-src="client/tsdb_client.h#L85-L90">void tsdbc_users_free(tsdbc_user *u, size_t n);
+int tsdbc_user_create(tsdbc *c, const char *name, const char *password, uint32_t iterations, uint8_t flags);
 int tsdbc_user_drop(tsdbc *c, const char *name);
 int tsdbc_user_alter(tsdbc *c, const char *name, uint8_t flags);
 int tsdbc_user_password(tsdbc *c, const char *name, const char *password, uint32_t iterations);
-int tsdbc_grant(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);
-int tsdbc_revoke(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);</code></pre>
+int tsdbc_grant(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);</code></pre>
 <p class="code-source">From examples/client.c and client/tsdb_client.h.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
@@ -884,7 +884,7 @@ and <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/ma
 instead of 16.</li>
 </ul>
 
-<nav class="pager" aria-label="Previous and next page"><a class="prev" href="concepts.html"><span>Previous</span>Concepts</a><a class="next" href="cli.html"><span>Next</span>Command line</a></nav></main>
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="compression.html"><span>Previous</span>Compression</a><a class="next" href="cli.html"><span>Next</span>Command line</a></nav></main>
 </div>
 <footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>

@@ -47,13 +47,19 @@ static void msleep(int ms)
     nanosleep(&t, NULL);
 }
 
+/* What this tool records is what the server answers, so the client's own retry of UNAVAILABLE is off. */
 static int connect_c(tsdbc **c)
 {
+    int rc;
     if (user) {
         tsdbc_options o = {.user = user, .password_file = pwfile};
-        return tsdbc_connect_opts(host, port, &o, c);
+        rc = tsdbc_connect_opts(host, port, &o, c);
+    } else {
+        rc = tsdbc_connect_timeout(host, port, 3000, c);
     }
-    return tsdbc_connect_timeout(host, port, 3000, c);
+    if (rc == 0)
+        tsdbc_set_retry(*c, 0);
+    return rc;
 }
 
 static void note(const char *name, char what, int64_t ts)

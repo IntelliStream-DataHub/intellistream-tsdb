@@ -176,6 +176,15 @@ int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     return 0;
 }
 
+/* The rows just added took the numbers first .. first + n - 1 (the memtable's position range: rows only). */
+void mt_note_fno(memtable *m, uint64_t first, size_t n)
+{
+    if (n == 0)
+        return;
+    m->fno_lo = m->fno_lo ? MIN(m->fno_lo, first) : first;
+    m->fno_hi = MAX(m->fno_hi, first + n - 1);
+}
+
 typedef struct tv {
     int64_t t;
     uint64_t v;
@@ -345,7 +354,9 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
                 memcpy((uint8_t *)v + 4 * i, &x, 4);
             }
         /* in (series, ts) order; insert_rows re-sorts only when partitions interleave */
+        cur_fno_lo = m->fno_lo, cur_fno_hi = m->fno_hi; /* the parts' position range (pw_begin) */
         rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out, false, ucls, NULL, NULL);
+        cur_fno_lo = cur_fno_hi = 0;
     }
     free(s);
     free(t);
@@ -393,45 +404,122 @@ static int write_full(int fd, const void *buf, size_t len)
     return 0;
 }
 
-static uint32_t wal_head_check(uint32_t nrows, uint64_t hash, uint64_t seq, uint64_t off)
+static uint32_t wal_head_check(uint32_t word, uint64_t hash, uint64_t seq, uint64_t off)
 {
     uint8_t t[12];
-    store32(t, nrows);
+    store32(t, word);
     memcpy(t + 4, &hash, 8);
     return (uint32_t)xxh64(t, sizeof t, seq * 0x9e3779b97f4a7c15ull ^ off);
 }
 
-/* buf holds WAL_HDR spare bytes in front of the rows for the record header. */
-static int wal_write_record(int fd, uint64_t seq, uint64_t off, uint8_t *buf, size_t nrows)
+/* The size of the record whose header (len and kind in place) is at h. */
+static size_t wal_rec_size(const uint8_t *h)
 {
-    uint64_t hash = xxh64(buf + WAL_HDR, nrows * WAL_ROW, 0);
-    store32(buf, (uint32_t)nrows);
-    store32(buf + 4, wal_head_check((uint32_t)nrows, hash, seq, off));
-    memcpy(buf + 8, &hash, 8);
+    uint32_t w = load32(h), n = w & 0x0fffffffu;
+    return WAL_HDR + (size_t)n * ((w >> 28) == WAL_KIND_ROWS ? WAL_ROW : 1);
+}
+
+/* Seals the records in buf[0, len), which will be written at segment offset off: the group commit's time, the hash
+ * over fno, commit_ms and the payload, and the header check. Their len, kind and fno are set where they were
+ * appended (wal_buffer, wal_marker). Gives the offset and hash of the last one. */
+static void wal_seal(uint8_t *buf, size_t len, uint64_t seq, uint64_t off, int64_t commit_ms, size_t *last_pos,
+                     uint64_t *last_hash)
+{
+    for (size_t pos = 0; pos < len;) {
+        uint8_t *h = buf + pos;
+        size_t sz = wal_rec_size(h);
+        memcpy(h + 24, &commit_ms, 8);
+        uint64_t hash = xxh64(h + 16, sz - 16, 0);
+        store32(h + 4, wal_head_check(load32(h), hash, seq, off + pos));
+        memcpy(h + 8, &hash, 8);
+        *last_pos = pos;
+        *last_hash = hash;
+        pos += sz;
+    }
+}
+
+/* Seals the one record at rec again after a test changed its bytes (its fno, say) or moved it to segment seq, offset
+ * off: the hash and the header check come out as the writer's (tests/test_fno.c builds records a bad disk or a bug
+ * could leave, which still pass every check of a record). */
+void wal_reseal(uint8_t *rec, uint64_t seq, uint64_t off)
+{
+    size_t last;
+    uint64_t hash;
+    int64_t commit_ms;
+    memcpy(&commit_ms, rec + 24, 8);
+    wal_seal(rec, wal_rec_size(rec), seq, off, commit_ms, &last, &hash);
+}
+
+/* One rows record of n rows (the rows at buf + WAL_HDR) numbered from fno, written at once (the relog's). */
+static int wal_write_record(int fd, uint64_t seq, uint64_t off, uint8_t *buf, size_t nrows, uint64_t fno)
+{
+    memset(buf, 0, WAL_HDR);
+    store32(buf, (uint32_t)nrows | (uint32_t)WAL_KIND_ROWS << 28);
+    memcpy(buf + 16, &fno, 8);
+    size_t last;
+    uint64_t hash;
+    wal_seal(buf, WAL_HDR + nrows * WAL_ROW, seq, off, eng_wall_ms(), &last, &hash);
     return write_full(fd, buf, WAL_HDR + nrows * WAL_ROW);
 }
 
-size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, size_t *nrows)
+/* range: a number at or above FNO_LIMIT is not a record. The check of a writer's open passes false and judges the
+ * range itself: a record whose checks pass but whose number is out of range is damage, not a torn tail. */
+static size_t wal_record_x(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wal_rec *r, bool range)
 {
     if (avail < WAL_HDR)
         return 0;
-    uint32_t n = load32(p);
-    uint64_t hash;
+    uint32_t w = load32(p), kind = w >> 28, n = w & 0x0fffffffu;
+    uint64_t hash, fno;
+    int64_t commit_ms;
     memcpy(&hash, p + 8, 8);
-    if (n == 0 || n > (avail - WAL_HDR) / WAL_ROW || wal_head_check(n, hash, seq, off) != load32(p + 4) ||
-        xxh64(p + WAL_HDR, (size_t)n * WAL_ROW, 0) != hash)
+    memcpy(&fno, p + 16, 8);
+    memcpy(&commit_ms, p + 24, 8);
+    size_t body;
+    uint64_t span;
+    uint16_t mtype = 0, mflags = 0;
+    if (kind == WAL_KIND_ROWS) {
+        if (n == 0 || n > (avail - WAL_HDR) / WAL_ROW)
+            return 0;
+        body = (size_t)n * WAL_ROW;
+        span = n;
+    } else if (kind == WAL_KIND_MARKER) {
+        if (n < WAL_MARKER_HDR || n % 4 != 0 || n > avail - WAL_HDR)
+            return 0;
+        body = n;
+        memcpy(&mtype, p + WAL_HDR, 2);
+        memcpy(&mflags, p + WAL_HDR + 2, 2);
+        span = load32(p + WAL_HDR + 4);
+        if (span == 0)
+            return 0;
+    } else {
         return 0;
-    *nrows = n;
-    return WAL_HDR + (size_t)n * WAL_ROW;
+    }
+    if (wal_head_check(w, hash, seq, off) != load32(p + 4) || xxh64(p + 16, 16 + body, 0) != hash || fno == 0 ||
+        (range && fno >= FNO_LIMIT))
+        return 0;
+    r->kind = kind;
+    r->n = n;
+    r->fno = fno;
+    r->span = span;
+    r->commit_ms = commit_ms;
+    r->payload = p + WAL_HDR;
+    r->mtype = mtype;
+    r->mflags = mflags;
+    return WAL_HDR + body;
+}
+
+size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wal_rec *r)
+{
+    return wal_record_x(p, avail, seq, off, r, true);
 }
 
 bool wal_valid_after(const uint8_t *p, size_t len, size_t from, uint64_t seq, uint64_t base)
 {
-    size_t n;
-    /* records are 4-byte aligned (16 + 20 n bytes); the header check rejects
+    wal_rec r;
+    /* records are 4-byte aligned (32 + 20 n bytes, or 32 + a multiple of 4); the header check rejects
      * nearly every other offset without hashing rows */
     for (size_t q = (from + 4) & ~(size_t)3; q + WAL_HDR <= len; q += 4)
-        if (wal_record(p + q, len - q, seq, base + q, &n))
+        if (wal_record(p + q, len - q, seq, base + q, &r))
             return true;
     return false;
 }
@@ -443,13 +531,18 @@ void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot)
     memcpy(slot, r + 12, 8);
 }
 
-/* Appends rows to the pending WAL buffer; caller holds buf_lock. */
+/* Appends rows to the pending WAL buffer and numbers them (*fno0 gets the first); caller holds buf_lock. Rows of
+ * successive batches join one record while no marker comes between them (their numbers stay contiguous). Fails
+ * without side effects. */
 static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
-                      size_t n)
+                      size_t n, uint64_t *fno0)
 {
-    if (db->wal_len == 0)
-        db->wal_len = WAL_HDR; /* room for the record header */
-    size_t need = db->wal_len + n * WAL_ROW;
+    if (db->fno_next >= FNO_BOUND_MAX - n) { /* never number a record past what the next open accepts */
+        eng_fail(db, "WAL numbers", EOVERFLOW);
+        return TSDB_ERR_IO;
+    }
+    bool extend = db->wal_rec_open && (uint64_t)(load32(db->wal_buf + db->wal_rec_at) & 0x0fffffffu) + n < (1u << 28);
+    size_t need = db->wal_len + (extend ? 0 : WAL_HDR) + n * WAL_ROW;
     if (need > db->wal_cap) {
         size_t cap = MAX(need, db->wal_cap * 2);
         cap = MAX(cap, (size_t)65536);
@@ -459,6 +552,19 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
         db->wal_buf = b;
         db->wal_cap = cap;
     }
+    if (!extend) {
+        uint8_t *h = db->wal_buf + db->wal_len;
+        memset(h, 0, WAL_HDR);
+        store32(h, (uint32_t)WAL_KIND_ROWS << 28);
+        memcpy(h + 16, &db->fno_next, 8);
+        db->wal_rec_at = db->wal_len;
+        db->wal_rec_open = true;
+        db->wal_len += WAL_HDR;
+    }
+    uint8_t *h = db->wal_buf + db->wal_rec_at;
+    store32(h, load32(h) + (uint32_t)n);
+    *fno0 = db->fno_next;
+    db->fno_next += n;
     uint8_t *p = db->wal_buf + db->wal_len;
     for (size_t i = 0; i < n; i++, p += WAL_ROW) {
         uint32_t id = series ? series[i] : cs;
@@ -469,6 +575,65 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
     }
     db->wal_len = need;
     return 0;
+}
+
+/* A marker record: appended to the same buffer as the rows, in order, and made durable before it returns (markers
+ * are rare). body_len is a multiple of 4 (the record is 4-byte aligned). */
+int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void *body, size_t body_len,
+               uint64_t *fno)
+{
+    if (!db->wal_enabled || span == 0 || body_len % 4 != 0 || body_len > ((size_t)1 << 27))
+        return TSDB_ERR_INVALID;
+    size_t plen = WAL_MARKER_HDR + body_len;
+    pthread_mutex_lock(&db->buf_lock);
+    int rc = eng_check(db);
+    if (rc == 0 && db->fno_next >= FNO_BOUND_MAX - span) {
+        eng_fail(db, "WAL numbers", EOVERFLOW);
+        rc = TSDB_ERR_IO;
+    }
+    if (rc == 0 && db->wal_len + WAL_HDR + plen > db->wal_cap) {
+        size_t cap = MAX(db->wal_len + WAL_HDR + plen, db->wal_cap * 2);
+        cap = MAX(cap, (size_t)65536);
+        uint8_t *b = realloc(db->wal_buf, cap);
+        if (!b)
+            rc = TSDB_ERR_NOMEM;
+        else
+            db->wal_buf = b, db->wal_cap = cap;
+    }
+    uint64_t lsn = 0;
+    if (rc == 0) {
+        uint8_t *h = db->wal_buf + db->wal_len;
+        memset(h, 0, WAL_HDR);
+        store32(h, (uint32_t)plen | (uint32_t)WAL_KIND_MARKER << 28);
+        memcpy(h + 16, &db->fno_next, 8);
+        memcpy(h + WAL_HDR, &type, 2);
+        memcpy(h + WAL_HDR + 2, &flags, 2);
+        store32(h + WAL_HDR + 4, span);
+        if (body_len)
+            memcpy(h + WAL_HDR + WAL_MARKER_HDR, body, body_len);
+        if (fno)
+            *fno = db->fno_next;
+        db->fno_next += span;
+        db->wal_len += WAL_HDR + plen;
+        db->wal_rec_open = false;
+        lsn = ++db->wal_appended;
+    }
+    pthread_mutex_unlock(&db->buf_lock);
+    return rc ? rc : wal_commit(db, lsn);
+}
+
+int wal_marker_mk(eng *db, const mk *m, uint64_t *fno)
+{
+    uint8_t *p;
+    size_t n;
+    int rc = mk_encode(m, &p, &n);
+    if (rc != 0)
+        return rc;
+    uint32_t span;
+    memcpy(&span, p + 4, 4);
+    rc = wal_marker(db, m->type, m->flags, span, p + MK_HDR, n - MK_HDR, fno);
+    free(p);
+    return rc;
 }
 
 /* Takes the single WAL writer role; waits while someone else holds it. */
@@ -494,9 +659,12 @@ static void wal_writer_leave(eng *db)
  * the caller holds the writer role and has not woken anyone yet. */
 static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t *buf, size_t len)
 {
-    if (len <= WAL_HDR)
+    if (len == 0)
         return 0;
-    if (wal_write_record(fd, seq, *off, buf, (len - WAL_HDR) / WAL_ROW) != 0) {
+    size_t last_pos = 0;
+    uint64_t last_hash = 0;
+    wal_seal(buf, len, seq, *off, eng_wall_ms(), &last_pos, &last_hash);
+    if (write_full(fd, buf, len) != 0) {
         eng_fail(db, "WAL write", errno);
         return TSDB_ERR_IO;
     }
@@ -508,8 +676,9 @@ static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t 
         atomic_fetch_add_explicit(&db->st_wal_syncs, 1, memory_order_relaxed);
     }
     atomic_fetch_add_explicit(&db->st_wal_bytes, len, memory_order_relaxed);
-    db->wal_last_seq = seq, db->wal_last_off = *off, db->wal_last_len = len;
-    memcpy(&db->wal_last_hash, buf + 8, 8);
+    /* the last record of the write: what the revalidation reads again */
+    db->wal_last_seq = seq, db->wal_last_off = *off + last_pos, db->wal_last_len = len - last_pos;
+    db->wal_last_hash = last_hash;
     *off += len;
     return 0;
 }
@@ -545,6 +714,7 @@ int wal_commit(eng *db, uint64_t target)
         db->wal_buf = db->wal_spare;
         db->wal_cap = db->wal_spare_cap;
         db->wal_len = 0;
+        db->wal_rec_open = false;
         pthread_mutex_unlock(&db->buf_lock);
 
         rc = wal_write_sync(db, fd, seq, &db->wal_off, buf, len);
@@ -757,12 +927,15 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     /* wal_appended counts rows the WAL holds: a refusal before the append adds none, or a flush would wait for
      * rows that never come (wal_durable never reaches them) */
     bool counted = rc == 0;
+    uint64_t fno0 = 0;
     if (rc == 0 && db->wal_enabled) {
-        rc = wal_buffer(db, series, cs, ts, v, w, n); /* first: it can fail without side effects */
+        rc = wal_buffer(db, series, cs, ts, v, w, n, &fno0); /* first: it can fail without side effects */
         counted = rc == 0;
     }
     if (rc == 0)
         rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_appended + 1, type);
+    if (rc == 0 && fno0)
+        mt_note_fno(db->active, fno0, n);
     if (counted)
         db->wal_appended += n;
     uint64_t lsn = db->wal_appended;
@@ -823,6 +996,8 @@ static int flush_waiting(eng *db)
             rc = parts_commit(db, pl.p, pl.n);
             if (rc)
                 pthread_mutex_unlock(&db->publish_lock);
+            else
+                jr_commit(db, JR_FLUSHED, &pl);
         }
         if (rc) {
             cls_thaw(db);
@@ -849,6 +1024,8 @@ static int flush_waiting(eng *db)
         cls_thaw(db);
         int mrc = manifest_publish(db); /* fails the engine on error */
         free(pl.p);
+        if (mrc == 0) /* the numbers of the segment stay used after it is gone (fno.c) */
+            mrc = fno_require(db, m->fno_end);
         if (mrc == 0)
             wal_unlink_upto(db, m->wal_seq); /* else MANIFEST may still name it: a follower would tail it */
         if (mrc == 0)
@@ -900,6 +1077,8 @@ int mt_flush(eng *db)
             db->wal_off = 0;
             db->wal_buf = NULL;
             db->wal_cap = db->wal_len = 0;
+            db->wal_rec_open = false;
+            m->fno_end = db->fno_next; /* the end of the old segment: FNO holds it before the segment goes */
             db->wal_fd = newfd;
             db->wal_seq = seq;
             db->flushing[db->nflushing++] = m;
@@ -976,6 +1155,7 @@ void *flusher_main(void *arg)
 
 typedef struct seg {
     uint64_t seq;
+    uint64_t fno_first, fno_end; /* the first number of its first valid record (0: none) and where the numbers end */
     size_t end; /* a writer's open: where the valid records end, as wal_check_segment found */
     size_t len; /* and the segment's size */
     char name[256];
@@ -1038,13 +1218,32 @@ static int read_file(int dirfd, const char *name, uint8_t **out, size_t *len)
 static int wal_check_segment(eng *db, seg *s)
 {
     uint8_t *buf;
-    size_t len, pos = 0, n, rec;
+    size_t len, pos = 0, rec;
+    wal_rec wr;
     int rc = read_file(db->dirfd, s->name, &buf, &len);
     if (rc)
         return rc;
     uint32_t count = eng_series_count(db);
-    while (rc == 0 && (rec = wal_record(buf + pos, len - pos, s->seq, pos, &n)) != 0) {
-        const uint8_t *r = buf + pos + WAL_HDR;
+    s->fno_first = s->fno_end = 0;
+    while (rc == 0 && (rec = wal_record_x(buf + pos, len - pos, s->seq, pos, &wr, false)) != 0) {
+        const uint8_t *r = wr.payload;
+        size_t n = wr.kind == WAL_KIND_ROWS ? wr.n : 0; /* a marker holds no rows */
+        if (wr.fno >= FNO_BOUND_MAX || wr.span >= FNO_BOUND_MAX - wr.fno) { /* numbers no writer could have given */
+            fprintf(stderr, "tsdb: WAL segment %s: the record at offset %zu has number %" PRIu64 " (span %" PRIu64
+                            "), beyond the limit of the log numbers: the log is damaged\n",
+                    s->name, pos, wr.fno, wr.span);
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        if (wr.fno < s->fno_end) { /* numbers never go back: a valid record that does is damage, not a torn tail */
+            fprintf(stderr, "tsdb: WAL segment %s: the record at offset %zu has number %" PRIu64 ", below %" PRIu64
+                            ", where the one before it ends: the log is damaged\n", s->name, pos, wr.fno, s->fno_end);
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        if (!s->fno_first)
+            s->fno_first = wr.fno;
+        s->fno_end = wr.fno + wr.span;
         for (size_t i = 0; i < n; i++, r += WAL_ROW) {
             uint32_t id;
             int64_t ts;
@@ -1116,6 +1315,90 @@ bool wal_file_name(const char *name)
 
 /* Replays WAL segments left by a previous run, then opens a fresh segment. A writer checks every segment first and
  * then calls before_replay (the open's cuts of torn tails), so nothing is written or cut until all checks passed. */
+/* A writer's open: the next number is the largest of FNO's valid slot, the end of every valid record of every segment
+ * and 1 + the largest part range (design-cdc.md 2.1). Numbers also go up from segment to segment. */
+static int wal_open_numbers(eng *db, const seg *segs, size_t nseg)
+{
+    uint64_t next = 1, prev_end = 0;
+    for (size_t k = 0; k < nseg; k++) {
+        if (segs[k].fno_first && segs[k].fno_first < prev_end) {
+            fprintf(stderr, "tsdb: WAL segment %s starts at number %" PRIu64 ", below %" PRIu64
+                            ", where the segment before it ends: the log is damaged\n",
+                    segs[k].name, segs[k].fno_first, prev_end);
+            return TSDB_ERR_CORRUPT;
+        }
+        if (segs[k].fno_end)
+            prev_end = segs[k].fno_end;
+        next = MAX(next, segs[k].fno_end);
+    }
+    for (size_t i = 0; i < db->nparts; i++)
+        if (db->parts[i]->fno_hi)
+            next = MAX(next, db->parts[i]->fno_hi + 1);
+    uint64_t fno, gen;
+    int slot, rc;
+    bool torn;
+    rc = fno_load(db, &fno, &gen, &slot, &torn);
+    if (rc == TSDB_ERR_NOTFOUND && nseg == 0 && db->nparts == 0 && eng_series_count(db) == 0 &&
+        faccessat(db->dirfd, "MANIFEST", F_OK, AT_SYMLINK_NOFOLLOW) != 0 &&
+        faccessat(db->dirfd, "ROOT_ID", F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+        /* A volume that never held a record: an add by a release that did not make FNO (0.9.0's, on an upgraded
+         * database) left only META and ROOT_ID. Nothing here ever had a number, so the bound is 1: the one case where
+         * a missing FNO is not lost data (MANIFEST is written at the end of the first open that gets here). */
+        if ((rc = fno_create(db->dirfd, 1, db->opt.fsync)) == 0)
+            rc = fno_load(db, &fno, &gen, &slot, &torn);
+        if (rc == 0)
+            fprintf(stderr, "tsdb: FNO was missing in a volume that holds no series, part or segment: made (numbers "
+                            "start at 1)\n");
+    }
+    if (rc == TSDB_ERR_NOTFOUND) {
+        fprintf(stderr, "tsdb: FNO is missing: the numbers of the log cannot be bounded, the open fails (a database "
+                        "of this format has one in every volume; restore it from a backup)\n");
+        return TSDB_ERR_CORRUPT;
+    }
+    if (rc)
+        return rc;
+    if (fno >= FNO_BOUND_MAX) {
+        fprintf(stderr, "tsdb: FNO holds %" PRIu64 ", beyond the limit of the log numbers: the file is damaged, the open "
+                        "fails (restore FNO from a backup)\n", fno);
+        return TSDB_ERR_CORRUPT;
+    }
+    db->fno_slot = slot;
+    db->fno_gen = gen;
+    atomic_store(&db->fno_durable, fno);
+    db->fno_next = MAX(next, fno);
+    if (torn) {
+        /* A tear (a store the power loss cut) and damage at rest (rot, a misdirected write) look alike, and damage
+         * may have hit the newest slot, whose segments are unlinked already: the number it held is lost, and the
+         * other slot is older by any number of stores. So the numbers jump ahead (a gap, never a repeat). */
+        db->fno_next += FNO_BELT;
+        fprintf(stderr, "tsdb: FNO: one slot is torn or damaged: the other is used and the log numbers skip ahead by "
+                        "%" PRIu64 " (the newer value may be lost)\n", (uint64_t)FNO_BELT);
+    }
+    if (eng_test_mutant == MUT_FNO_REUSE) { /* planted: numbers restart from what parts hold (tests/test_fno.c) */
+        db->fno_next = 1;
+        for (size_t i = 0; i < db->nparts; i++)
+            if (db->parts[i]->fno_hi)
+                db->fno_next = MAX(db->fno_next, db->parts[i]->fno_hi + 1);
+    } else if (eng_test_mutant == MUT_FNO_MANIFEST_ONLY) { /* planted: MANIFEST's number is the bound, not FNO's */
+        uint64_t m = 0;
+        int mfd = openat(db->dirfd, "MANIFEST", O_RDONLY | O_CLOEXEC);
+        FILE *f = mfd >= 0 ? fdopen(mfd, "r") : NULL;
+        char line[128];
+        while (f && fgets(line, sizeof line, f))
+            if (sscanf(line, "fno_next %" SCNu64, &m) == 1)
+                break;
+        if (f)
+            fclose(f);
+        db->fno_next = MAX(m, 1);
+        for (size_t i = 0; i < db->nparts; i++)
+            if (db->parts[i]->fno_hi)
+                db->fno_next = MAX(db->fno_next, db->parts[i]->fno_hi + 1);
+        for (size_t k = 0; k < nseg; k++)
+            db->fno_next = MAX(db->fno_next, segs[k].fno_end);
+    }
+    return 0;
+}
+
 int wal_open(eng *db, int (*before_replay)(eng *))
 {
     bool ro = db->opt.read_only;
@@ -1176,6 +1459,8 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         rc = wal_check_segment(db, &segs[k]);
     if (rc == 0 && !ro)
         rc = wal_check_order(segs, nseg, parts_seq);
+    if (rc == 0 && !ro)
+        rc = wal_open_numbers(db, segs, nseg);
     if (rc == 0 && before_replay)
         rc = before_replay(db);
     for (size_t k = 0; k < nseg && rc == 0; k++) {
@@ -1191,12 +1476,16 @@ int wal_open(eng *db, int (*before_replay)(eng *))
             rc = TSDB_ERR_NOMEM;
             break;
         }
-        size_t pos = 0, n, rec;
+        size_t pos = 0, rec;
+        wal_rec wr;
         int64_t cached_p = 0;
         uint64_t cached_seq = 0;
         bool have_cache = false, reloaded = false;
-        while (rc == 0 && (rec = wal_record(buf + pos, len - pos, segs[k].seq, pos, &n)) != 0) {
-            const uint8_t *r = buf + pos + WAL_HDR;
+        while (rc == 0 && (rec = wal_record(buf + pos, len - pos, segs[k].seq, pos, &wr)) != 0) {
+            const uint8_t *r = wr.payload;
+            size_t n = wr.kind == WAL_KIND_ROWS ? wr.n : 0; /* a marker is skipped; its numbers are counted */
+            if (eng_test_mutant == MUT_MARKER_ROWS && wr.kind == WAL_KIND_MARKER)
+                n = wr.n / WAL_ROW; /* planted: a marker's payload replayed as rows (tests/test_fno.c) */
             for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
                 uint32_t id;
                 int64_t ts;
@@ -1229,6 +1518,8 @@ int wal_open(eng *db, int (*before_replay)(eng *))
                 if (cached_seq >= segs[k].seq)
                     continue; /* already in a part */
                 rc = mt_add(m, NULL, id, &ts, &slot, 8, 1, 0, -1);
+                if (rc == 0)
+                    mt_note_fno(m, wr.fno + i, 1);
             }
             if (rc)
                 break;
@@ -1261,6 +1552,9 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         }
         if (!ro)
             mt_unref(m);
+        /* the numbers of the segment stay used once it is gone, markers included: FNO holds them first */
+        if (rc == 0 && !ro && segs[k].fno_end)
+            rc = fno_require(db, segs[k].fno_end);
         if (rc == 0 && !ro)
             unlinkat(db->dirfd, segs[k].name, 0);
     }
@@ -1279,11 +1573,16 @@ void wal_close(eng *db)
         close(db->wal_fd);
         db->wal_fd = -1;
         if (db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db) && !db->retiring) {
-            char name[64];
-            wal_name(name, sizeof name, db->wal_seq);
-            unlinkat(db->dirfd, name, 0);
+            /* a clean close holds the exact next number; an empty segment carries none, so FNO must before it goes */
+            if (fno_require(db, db->fno_next) == 0) {
+                char name[64];
+                wal_name(name, sizeof name, db->wal_seq);
+                unlinkat(db->dirfd, name, 0);
+            }
         }
     }
+    if (db->wal_enabled && !eng_check(db) && !db->retiring)
+        fno_require(db, db->fno_next); /* a failure fails the engine; the segments stay and the open finds the end */
     for (size_t i = 0; i < db->nflushing; i++)
         mt_unref(db->flushing[i]);
     db->nflushing = 0;
@@ -1371,12 +1670,11 @@ int wal_verify_tail(eng *db, const char *dir)
     if (rc == 2) /* ENOENT */
         rc = db->wal_last_seq <= atomic_load(&db->wal_removed) ? 0 : 1;
     else if (rc == 0) {
-        uint32_t n = load32(rec);
         uint64_t hash;
+        wal_rec wr;
         memcpy(&hash, rec + 8, 8);
-        bool ok = len > WAL_HDR && n == (len - WAL_HDR) / WAL_ROW && hash == db->wal_last_hash &&
-                  wal_head_check(n, hash, db->wal_last_seq, db->wal_last_off) == load32(rec + 4) &&
-                  xxh64(rec + WAL_HDR, (size_t)n * WAL_ROW, 0) == hash;
+        bool ok = len > WAL_HDR && hash == db->wal_last_hash &&
+                  wal_record(rec, len, db->wal_last_seq, db->wal_last_off, &wr) == len;
         rc = ok ? 0 : 1;
     }
     free(rec);
@@ -1414,6 +1712,7 @@ int wal_relog(eng *db, const char *dir, uint64_t *rows_out)
     }
     const size_t CH = 4096; /* rows per record */
     uint8_t *buf = malloc(WAL_HDR + CH * WAL_ROW);
+    uint64_t fno = db->fno_next; /* the rows get numbers of their own: the numbers they had are not kept per row */
     int rc = buf ? 0 : TSDB_ERR_NOMEM;
     uint64_t off = 0, total = 0;
     pthread_mutex_lock(&db->lock);
@@ -1437,8 +1736,9 @@ int wal_relog(eng *db, const char *dir, uint64_t *rows_out)
                     memcpy(p + 4, &r.ts[a + j], 8);
                     memcpy(p + 12, &x, 8);
                 }
-                if ((rc = wal_write_record(fd, seq, off, buf, n)) == 0) {
+                if ((rc = wal_write_record(fd, seq, off, buf, n, fno)) == 0) {
                     off += WAL_HDR + n * WAL_ROW;
+                    fno += n;
                     total += n;
                 }
                 a += n;

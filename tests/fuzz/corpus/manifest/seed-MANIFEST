@@ -1,20 +1,15 @@
-tsdb-manifest 6
+tsdb-manifest 9
 version 8
 series 4
 wal_flushed 1
 wal_active 2
-parts 14
-p19723_1_1_0.part
-p19723_4_4_0.part
-p19723_7_7_0.part
-p19723_10_10_0.part
-p19723_13_13_0.part
-p19724_2_2_0.part
-p19724_5_5_0.part
-p19724_8_8_0.part
-p19724_11_11_0.part
-p19725_3_3_0.part
-p19725_6_6_0.part
-p19725_9_9_0.part
-p19725_12_12_0.part
-p19725_14_14_0.part
+fsync 0
+states 0
+fno_next 21
+parts 6
+p78877_1_1_0.part
+p78877_2_2_0.part
+p78877_3_3_0.part
+p78877_4_4_0.part
+p78877_5_5_0.part
+p78877_6_6_0.part

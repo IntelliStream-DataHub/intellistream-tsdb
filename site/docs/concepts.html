@@ -24,7 +24,7 @@
 <div class="scrim" hidden></div>
 <div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
 <div class="doc-shell">
-<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html" aria-current="page">Concepts</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html" aria-current="page">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
 <main id="main" class="doc">
 <h1>Concepts</h1>
 <p class="lead">A few ideas carry all of tsdb. Each section below is short, and the <a href="clients.html">clients</a>
@@ -72,7 +72,8 @@ them (2 weeks). Days, months and years have different lengths, so these are not 
 <p>A limit works on buckets too: "the last 10 hours" of a year of data reads about 10 hours of it.</p>
 <p>tsdb keeps a summary (count, sum, min, max) of every block of up to 8192 points. A bucket that covers whole blocks is
 answered from those summaries without reading the points. That is why a count over all the data is almost free, and why
-buckets smaller than a block cost more.</p>
+buckets smaller than a block cost more. <a href="compression.html#statistics">Compression</a> explains the summaries and
+how the blocks are packed.</p>
 
 <h2 id="time-zones">Time zones</h2>
 <p>The database and the server know only UTC. A day in Oslo begins at 22:00 or 23:00 UTC the day before, depending on
@@ -135,7 +136,7 @@ series does not spoil the others.</p>
 power failure can lose to the last few milliseconds of answered writes. We test this by killing the server and by
 simulating power loss.</p>
 
-<nav class="pager" aria-label="Previous and next page"><a class="prev" href="quickstart.html"><span>Previous</span>Quick start</a><a class="next" href="clients.html"><span>Next</span>Clients</a></nav></main>
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="quickstart.html"><span>Previous</span>Quick start</a><a class="next" href="compression.html"><span>Next</span>Compression</a></nav></main>
 </div>
 <footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
