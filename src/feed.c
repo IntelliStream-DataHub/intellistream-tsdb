@@ -57,6 +57,13 @@ int feed_open_reconcile(eng *db, int want)
                 feed_fail_log(db, "reading FEED", rc);
                 return TSDB_ERR_CORRUPT;
             }
+            fslots fs;
+            if ((rc = fslots_read(db->dirfd, &fs)) != 0) { /* the floor, for `feed info` and F2's reader */
+                feed_fail_log(db, "reading FEEDSLOTS", rc);
+                return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_CORRUPT : rc;
+            }
+            db->feed_floor_event = fs.floor_event;
+            db->feed_floor_check = fs.floor_check;
             atomic_store(&db->feed_on, true);
         }
         return 0;

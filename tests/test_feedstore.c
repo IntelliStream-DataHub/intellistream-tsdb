@@ -903,6 +903,83 @@ static void check_feed_dir(const char *dir, const char *what, int k, uint64_t wh
     }
 }
 
+/* The offline check jepsen runs (tests/jepsen/feedcheck.c) must see a lost segment, a torn retained segment, numbers that
+ * go back and a floor above the oldest kept number: a check that passes everything proves nothing. */
+int feedcheck_dir(const char *dir, bool crashed, char *why, size_t cap);
+
+static void test_feedcheck(void)
+{
+    char dir[PATH_MAX + 32], bad[PATH_MAX + 32], why[512];
+    fresh("feedcheck", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    feed_opts fo = {.retention_s = 100000};
+    CHECK(eng_feed_enable(db, &fo) == 0);
+    for (int i = 0; i < 4; i++) {
+        rows(db, s, T0 + i * 100000, 50);
+        CHECK(eng_flush(db) == 0);
+    }
+    CHECK(eng_close(db) == 0);
+    CHECK(count_prefix(dir, "fwal_") == 4);
+    CHECK(feedcheck_dir(dir, false, why, sizeof why) == 0);
+    CHECK(feedcheck_dir(dir, true, why, sizeof why) == 0);
+    fresh("feedcheck-bad", bad, sizeof bad);
+    sh("rm -rf '%s' && cp -a '%s' '%s' && rm '%s/fwal_0000000000000002.log'", bad, dir, bad, bad);
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "contiguous"));
+    sh("rm -rf '%s' && cp -a '%s' '%s' && truncate -s -3 '%s/fwal_0000000000000003.log'", bad, dir, bad, bad);
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "torn"));
+    sh("rm -rf '%s' && cp -a '%s' '%s' && cp '%s/fwal_0000000000000002.log' '%s/fwal_0000000000000003.log'", bad, dir,
+       bad, bad, bad);
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0); /* a segment bound to another seq is not whole either */
+    /* a floor at or above the first number kept */
+    sh("rm -rf '%s' && cp -a '%s' '%s'", bad, dir, bad);
+    CHECK(open_eng(bad, &db) == 0 && fslots_set_floor(db, 60, 1) == 0 && eng_close(db) == 0);
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "floor"));
+    /* the floor at the end of segment 1 with segment 1 still there: a cleaner that died before its unlinks; fine */
+    uint64_t f1, l1;
+    CHECK(seg_walk(dir, "fwal_0000000000000001.log", 1, &f1, &l1) > 0);
+    sh("rm -rf '%s' && cp -a '%s' '%s'", bad, dir, bad);
+    CHECK(open_eng(bad, &db) == 0 && fslots_set_floor(db, l1, 1) == 0 && eng_close(db) == 0);
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) == 0);
+    /* a gap above the floor still counts */
+    sh("rm '%s/fwal_0000000000000003.log'", bad);
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) != 0 && strstr(why, "contiguous"));
+    /* a torn newest wal_ is what a crash leaves: fine before the open, never in a retained one */
+    sh("rm -rf '%s' && cp -a '%s' '%s' && cp '%s/fwal_0000000000000004.log' '%s/wal_0000000000000005.log' && "
+       "truncate -s -3 '%s/wal_0000000000000005.log'", bad, dir, bad, bad, bad, bad);
+    CHECK(feedcheck_dir(bad, true, why, sizeof why) == 0);
+    CHECK(feedcheck_dir(bad, false, why, sizeof why) == 0); /* not counted as a name when none is expected */
+    printf("  feedcheck: sees a lost segment, a torn one, a damaged one and a floor too high\n");
+}
+
+/* `feed info` of a handle without a cleaner (read-only): the floor from FEEDSLOTS, the segments from the files. */
+static void test_info(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("info", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    feed_opts fo = {.retention_s = 100000};
+    CHECK(eng_feed_enable(db, &fo) == 0);
+    for (int i = 0; i < 3; i++) {
+        rows(db, s, T0 + i * 100000, 20);
+        CHECK(eng_flush(db) == 0);
+    }
+    CHECK(fslots_set_floor(db, 7, 1) == 0 && eng_close(db) == 0);
+    tsdb *t;
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.read_only = 1;
+    o.create_volumes = 0;
+    tsdb_feed_info fi;
+    CHECK(tsdb_open(dir, &o, &t) == 0 && tsdb_feed_info_get(t, 0, &fi) == 0);
+    CHECK(fi.on && fi.floor_event == 7 && fi.retained_segments == 3 && fi.retained_bytes > 0 && fi.retention_s == 100000);
+    tsdb_close(t);
+    printf("  info: a read-only handle reports the floor and the retained segments\n");
+}
+
 static void test_power_replay(void)
 {
     if (access(SHIM, R_OK) != 0) {
@@ -982,6 +1059,8 @@ int main(int argc, char **argv)
     test_two_volumes();
     test_new_id();
     test_slot_halves();
+    test_feedcheck();
+    test_info();
     test_power_replay();
     printf(failures ? "FAILED: %d\n" : "all ok\n", failures);
     return failures != 0;

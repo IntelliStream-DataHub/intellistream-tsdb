@@ -65,6 +65,8 @@ typedef struct feed_dir {
 
 bool fwal_file_name(const char *name); /* fwal_<16 lowercase hex>.log */
 void fwal_name(char *buf, size_t len, uint64_t seq);
+/* The retained segments in a directory, counted from its files (for `feed info`, also of a read-only handle). */
+int feed_scan_retained(int dirfd, uint64_t *segments, uint64_t *bytes);
 
 /* META's requires= line: the words it lists. *feed: "feed" is among them; unknown (cap bytes, NUL-terminated, may be
  * NULL): the words this release does not know, comma separated. */

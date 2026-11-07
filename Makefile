@@ -229,8 +229,8 @@ $(B)/test_fno: tests/test_fno.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # the change feed's disk side (design-cdc.md step F1): FEED, requires=feed, retained segments, the cleaner
-$(B)/test_feedstore: tests/test_feedstore.c src/internal.h src/feed.h $(LIB)
-	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+$(B)/test_feedstore: tests/test_feedstore.c tests/jepsen/feedcheck.c src/internal.h src/feed.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_feedstore.c tests/jepsen/feedcheck.c $(LIB) $(LDLIBS)
 
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -825,8 +825,8 @@ $(B)/outage_server: tests/outage_server.c tests/harness.h tests/outagefs_ctl.h $
 $(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB) $(LIB)
-	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+$(B)/jepsen: tests/jepsen/jepsen.c tests/jepsen/feedcheck.c tests/harness.h src/internal.h src/feed.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ tests/jepsen/jepsen.c tests/jepsen/feedcheck.c $(CLIB) $(LIB) $(LDLIBS)
 
 # Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while
 # clients write and read; a checker verifies durability, atomicity and reads.
@@ -869,7 +869,15 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --auth --nemesis kill \
 	        --seconds $(call jsec,20) && \
 	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --auth --nemesis power \
-	        --seconds $(call jsec,20) --seed 1 --crashfs $(B)/libcrashfs.so || exit 1; done
+	        --seconds $(call jsec,20) --seed 1 --crashfs $(B)/libcrashfs.so && \
+	    echo "== tsdbd --io $$io, workload kv with the change feed on" && \
+	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --feed --nemesis kill \
+	        --seconds $(call jsec,20) && \
+	    for seed in $(JEPSEN_SEEDS); do \
+	        TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --feed --nemesis power \
+	            --seconds $(call jsec,20) --seed $$seed --crashfs $(B)/libcrashfs.so || exit 1; done && \
+	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --feed --nemesis eio \
+	        --seconds $(call jsec,20) --crashfs $(B)/libcrashfs.so || exit 1; done
 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
 # power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too.

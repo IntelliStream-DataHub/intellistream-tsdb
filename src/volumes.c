@@ -1495,10 +1495,9 @@ int tsdb_feed_info_get(tsdb *t, uint32_t volume, tsdb_feed_info *out)
         out->min_free_pct = e->feed.min_free_pct;
         out->max_bytes = e->feed.max_bytes;
         out->floor_event = e->feed_floor_event;
-        out->retained_segments = e->nfidx;
-        for (size_t i = 0; i < e->nfidx; i++)
-            out->retained_bytes += e->fidx[i].size == UINT64_MAX ? 0 : e->fidx[i].size;
         pthread_mutex_unlock(&e->feed_lock);
+        /* from the files: a handle without a cleaner (read-only, or just opened) has no index yet */
+        feed_scan_retained(e->dirfd, &out->retained_segments, &out->retained_bytes);
     }
     eng_unref(&e);
     return 0;

@@ -526,6 +526,30 @@ int feed_dir_state(int dirfd, feed_state *s)
     return rc;
 }
 
+int feed_scan_retained(int dirfd, uint64_t *segments, uint64_t *bytes)
+{
+    *segments = *bytes = 0;
+    int fd = dup(dirfd);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    if (!dir) {
+        if (fd >= 0)
+            close(fd);
+        return TSDB_ERR_IO;
+    }
+    rewinddir(dir);
+    struct dirent *e;
+    for (errno = 0; (e = readdir(dir)); errno = 0) {
+        struct stat st;
+        if (fwal_file_name(e->d_name) && fstatat(dirfd, e->d_name, &st, 0) == 0) {
+            (*segments)++;
+            *bytes += (uint64_t)st.st_size;
+        }
+    }
+    int rc = errno ? TSDB_ERR_IO : 0;
+    closedir(dir);
+    return rc;
+}
+
 /* --------------------------------------------------------- enable, disable */
 
 int feed_dir_enable(const feed_dir *d, const feed_cfg *cfg, uint64_t floor_event)

@@ -4,7 +4,13 @@
  *
  *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|none] [--seconds 20]
  *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]
- *          [--verify-checksums] [--auth]
+ *          [--verify-checksums] [--auth] [--feed]
+ *
+ * Change feed (--feed; docs/design-cdc.md, step F1): before the first server the CLI (`tsdb DIR feed enable`) turns the
+ * feed on, so every WAL segment the engine is done with is kept as fwal_<seq>.log instead of being unlinked. Before every
+ * server start (the directory as the crash or the power loss left it) and after the final clean stop, tests/jepsen/
+ * feedcheck.c checks what F2's reader relies on: every retained segment whole, seqs contiguous, numbers increasing, the
+ * floor below the oldest kept number. The writes and reads are checked as without the flag: the feed adds no behaviour.
  *
  * Login (--auth): before the first server, the CLI (JEPSEN_TSDB, default ./build/tsdb) makes USERS in DIR: a
  * superuser, which tsdbd needs to start, and the user `kv` with read and write on prefix:jepsen., as which every
@@ -181,6 +187,9 @@ static uint64_t seed = 1;
 static tsdb_sid ids[MAX_SERIES];
 static bool classes;                /* --workload classes */
 static bool auth;                   /* --auth: the servers require a login, the clients log in as KV_USER */
+static bool feed;                   /* --feed: the change feed is on (retained WAL segments), checked offline */
+static int feed_checks;             /* directories checked offline */
+static void feed_check(const char *when, bool crashed);
 static char kv_pw[PATH_MAX];        /* KV_USER's password file, beside DIR */
 #define KV_USER "kv"
 static int nseries = NSERIES;
@@ -370,6 +379,8 @@ static void note_death(int st, bool we_killed, pid_t pid);
 static void start_server(bool faulty)
 {
     char pms[32], pf[PATH_MAX];
+    if (feed)
+        feed_check("before the server recovers it", true); /* the directory the last server left, torn or not */
     snprintf(pms, sizeof pms, "%lld", classes ? (long long)CL_PARTITION_MS : PARTITION_MS);
     atomic_store(&port, 0); /* until this server says where it listens, the clients have nowhere to go */
     for (int attempt = 0;; attempt++) {
@@ -1224,6 +1235,40 @@ static int violations;
             fprintf(stderr, "  " __VA_ARGS__); \
     } while (0)
 
+int feedcheck_dir(const char *dir, bool crashed, char *why, size_t cap); /* tests/jepsen/feedcheck.c */
+
+static void feed_check(const char *when, bool crashed)
+{
+    char why[512];
+    feed_checks++;
+    if (feedcheck_dir(dir, crashed, why, sizeof why) != 0)
+        VIOLATION("feed, %s: %s\n", when, why);
+    else if (!crashed && why[0])
+        printf("feed, %s: %s\n", when, why);
+}
+
+/* the CLI as an operator runs it before the first start (never under the shim) */
+static int feed_cli(bool enable)
+{
+    const char *cli = getenv("JEPSEN_TSDB") ? getenv("JEPSEN_TSDB") : "./build/tsdb";
+    pid_t pid = fork();
+    if (pid == 0) {
+        unsetenv("LD_PRELOAD");
+        /* short retention and a small size bound: the cleaner runs, and its floor is under every fault too */
+        if (enable)
+            execl(cli, "tsdb", dir, "feed", "enable", "--retention", "5s", "--max-bytes", "3M", (char *)NULL);
+        else
+            execl(cli, "tsdb", dir, "feed", "info", (char *)NULL);
+        _exit(127);
+    }
+    int st;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        fprintf(stderr, "jepsen: %s %s feed %s failed\n", cli, dir, enable ? "enable" : "info");
+        return 1;
+    }
+    return 0;
+}
+
 /* w1 completed before w2 began: w1 is strictly older */
 static bool older(uint32_t w1, uint32_t w2) { return writes[w1].complete < writes[w2].invoke; }
 
@@ -2068,6 +2113,7 @@ int main(int argc, char **argv)
                                    {"seconds", required_argument, 0, 't'}, {"clients", required_argument, 0, 'c'},
                                    {"seed", required_argument, 0, 's'},    {"crashfs", required_argument, 0, 'f'},
                                    {"workload", required_argument, 0, 'w'}, {"verify-checksums", no_argument, 0, 'V'},
+                                   {"feed", no_argument, 0, 'E'},
                                    {"auth", no_argument, 0, 'A'},           {"outagefs", required_argument, 0, 'o'},
                                    {"mutant-idle", no_argument, 0, 'I'},
                                    {"mutant-longnap", no_argument, 0, 'L'},
@@ -2088,6 +2134,7 @@ int main(int argc, char **argv)
             break;
         case 'V': verify = true; break;
         case 'A': auth = true; break;
+        case 'E': feed = true; break;
         case 'I': idle_mutant = true; break;
         case 'L': idle_mutant_long = true; break;
         case 'o': outagefs_lib = optarg; break;
@@ -2102,7 +2149,7 @@ int main(int argc, char **argv)
         ((md || rot) && classes)) {
         fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|none] [--seconds S]\n"
                         "              [--clients N] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]\n"
-                        "              [--verify-checksums]   (misdirect and rot: workload kv) [--auth]\n"
+                        "              [--verify-checksums]   (misdirect and rot: workload kv) [--auth] [--feed]\n"
                         "              [--outagefs build/liboutagefs.so]   (outage: workload kv, no login)\n");
         return 2;
     }
@@ -2148,6 +2195,12 @@ int main(int argc, char **argv)
     if (auth && make_users())
         return 2;
     if (outage && make_volumes())
+        return 2;
+    if (feed && (outage || md || rot || classes)) {
+        fprintf(stderr, "jepsen: --feed goes with the kv workload under kill, power, pause and eio\n");
+        return 2;
+    }
+    if (feed && ((mkdir(dir, 0755) != 0 && errno != EEXIST) || feed_cli(true)))
         return 2;
 
     start_server(false); /* the series exist before any fault */
@@ -2220,6 +2273,10 @@ int main(int argc, char **argv)
         scan_cuts();
     int fv = fport ? check_follower(again) : 0;
     stop_server(SIGTERM);
+    if (feed && !damaged) {
+        feed_check("after the final clean stop", false);
+        feed_cli(false); /* what the cleaner did: its floor and what it kept */
+    }
     pthread_mutex_unlock(&server_lock);
 
     uint32_t nw = atomic_load(&nwrites) - 1, nr = atomic_load(&nreads);
@@ -2236,6 +2293,9 @@ int main(int argc, char **argv)
                "%u deletes and %u replaces ok\n",
                nemesis, seconds, nclients, restarts, ok, info, fail, rok, dels, reps);
     }
+    if (feed)
+        printf("feed: %d directory checks (retained segments whole and contiguous, numbers increasing, floor below)\n",
+               feed_checks);
     if (crashfs && !md)
         printf("servers under the shim: %d faulty, %d clean (fallback after a failed start), %d died while starting\n",
                lives_faulty, lives_clean, lives_died_starting);
