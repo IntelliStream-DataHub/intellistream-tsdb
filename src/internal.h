@@ -1161,8 +1161,10 @@ struct estats;
  * probes pass this number (default 100 million). */
 extern atomic_uint stats_ring_cap;
 extern atomic_uint stats_pause;
+extern atomic_uint_fast64_t stats_open_reconciles;
 extern atomic_uint_fast64_t sstats_budget;
 void stats_start(eng *db, bool reconcile); /* idempotent; does nothing with stats = -1 */
+void stats_open_done(eng *db); /* the open no longer changes the part list without db->lock: the sweeper may reconcile */
 void stats_stop(eng *db);
 void stats_push(eng *db, part *p, int kind); /* db->lock held (or the open, single-threaded) */
 enum { STAT_EV_ADD = 1, STAT_EV_REMOVE = 2 };

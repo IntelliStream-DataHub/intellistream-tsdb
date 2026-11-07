@@ -2808,8 +2808,17 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
             eng *e EREF = NULL;
             uint32_t local, locals[SSTATS_CHUNK];
             size_t at[SSTATS_CHUNK], k = 0;
+            size_t dup[SSTATS_CHUNK][2], nd = 0, first_at = 0; /* [to, from]: a repeat gets the first's record */
             for (size_t q = i; q < j; q++) {
                 eng *e2 EREF = NULL;
+                if (q > i && keys[q].id == keys[q - 1].id) {
+                    /* a repeated id is answered once: it would repeat the same scan, and the cost bound counts
+                     * the work done, not the ids asked for */
+                    dup[nd][0] = keys[q].at;
+                    dup[nd++][1] = first_at;
+                    continue;
+                }
+                first_at = keys[q].at;
                 if (route_meta(t, keys[q].id, &e2, &local)) { /* false: no such volume or id */
                     if (!e)
                         e = eng_ref(e2);
@@ -2830,6 +2839,8 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
                 for (size_t q = 0; q < k; q++)
                     cout[at[q]] = res[q];
             }
+            for (size_t q = 0; q < nd; q++) /* after the first's record is in place (also a NOTFOUND one) */
+                cout[dup[q][0]] = cout[dup[q][1]];
             i = j;
         }
         *done += m;

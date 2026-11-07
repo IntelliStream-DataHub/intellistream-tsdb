@@ -607,6 +607,125 @@ static void test_series_stats_api(const char *base)
     tsdb_close(db);
 }
 
+/* ---------------------------------------------------------------------- review fixes: open, last write, duplicate ids */
+
+/* The sweeper starts before load_parts, which changes the part list without db->lock: a ring overflow during the
+ * open must not make it reconcile (it would read a list in the middle of a sort or a realloc) until the open is
+ * done, and the totals afterwards are still exact. A ring of one overflows on the second part. */
+static void test_open_overflow(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/openrace", base);
+    OK(mkdir(dir, 0755));
+    tsdb_options o = base_opts();
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series_create(db, "r", TSDB_FLOAT64, dir, &id));
+    for (int k = 0; k < 1500; k++) /* more than 1000 rows: straight to a part, one partition per call */
+        put_rows(db, id, TSDB_FLOAT64, T0 + k * 2 * DAY, 60000, 0, 1100);
+    tsdb_close(db);
+    atomic_store(&stats_ring_cap, 1);
+    atomic_store(&stats_open_reconciles, 0);
+    OK(tsdb_open(dir, &o, &db));
+    CHECK(atomic_load(&stats_open_reconciles) == 0);
+    check_volumes(db, "after an open that overflowed the ring");
+    tsdb_volume_stats vs;
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    CHECK(vs.stats_ring_overflows > 0 && vs.stats_parts_listed >= 1500);
+    atomic_store(&stats_ring_cap, 4096);
+    tsdb_close(db);
+}
+
+/* last_write_ms is the part header's write time, which a merge carries over from its inputs: a merge and a reopen
+ * do not make a series' last write the merge time (the file's mtime does). */
+static void test_last_write(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/lastw", base);
+    OK(mkdir(dir, 0755));
+    tsdb_options o = base_opts();
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series_create(db, "w", TSDB_FLOAT64, dir, &id));
+    put_rows(db, id, TSDB_FLOAT64, T0, 1000, 0, 1100); /* two parts of one partition */
+    put_rows(db, id, TSDB_FLOAT64, T0 + 2000000, 1000, 0, 1100);
+    tsdb_close(db);
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_series_stat st;
+    size_t done;
+    OK(tsdb_series_stats(db, &id, 1, 0, &st, &done));
+    CHECK(done == 1 && st.parts == 2 && st.last_write_ms > 0 && !(st.flags & TSDB_SSTAT_WRITE_FROM_MTIME));
+    int64_t lw = st.last_write_ms;
+    struct timespec ts = {2, 200000000}; /* a second boundary at least passes: mtimes have a second */
+    nanosleep(&ts, NULL);
+    OK(tsdb_optimize(db));
+    OK(tsdb_series_stats(db, &id, 1, 0, &st, &done));
+    CHECK(st.parts == 1 && st.last_write_ms == lw);
+    tsdb_close(db);
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series_stats(db, &id, 1, 0, &st, &done));
+    CHECK(st.parts == 1);
+    if (st.last_write_ms != lw)
+        fprintf(stderr, "  last write %" PRId64 " after a merge and a reopen, was %" PRId64 "\n", st.last_write_ms, lw);
+    CHECK(st.last_write_ms == lw);
+    tsdb_close(db);
+}
+
+/* two records of one series, but for the memtable's creation time (wall clock mapped from a monotonic one: it moves) */
+static bool same_stat(const tsdb_series_stat *a, const tsdb_series_stat *b)
+{
+    tsdb_series_stat x = *a, y = *b;
+    x.last_write_ms = y.last_write_ms = 0;
+    return memcmp(&x, &y, sizeof x) == 0;
+}
+
+/* Repeated ids are answered once, and the rows scanned in a memtable (unsorted series are scanned for their range)
+ * count against the call's budget. */
+static void test_dup_ids(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/dups", base);
+    OK(mkdir(dir, 0755));
+    tsdb_options o = base_opts();
+    o.wal_max_batch_rows = 65536; /* the batches below go through the WAL into the memtable */
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series_create(db, "d", TSDB_FLOAT64, dir, &id));
+    for (int b = 99; b >= 0; b--) /* batches in descending time: the series is not sorted in the memtable */
+        put_rows(db, id, TSDB_FLOAT64, T0 + b * 1000000ll, 1000, 0, 1000);
+    tsdb_series_stat one;
+    size_t done;
+    OK(tsdb_series_stats(db, &id, 1, 0, &one, &done));
+    if (one.memtable_rows != 100000 || one.first_ts != T0)
+        fprintf(stderr, "  memtable rows %" PRIu64 " first %" PRId64 " parts %" PRIu64 "\n", one.memtable_rows, one.first_ts, one.parts);
+    CHECK(done == 1 && one.memtable_rows == 100000 && one.first_ts == T0);
+    enum { N = 65536 };
+    tsdb_sid *ids = malloc(N * sizeof *ids);
+    tsdb_series_stat *st = malloc(N * sizeof *st);
+    for (int i = 0; i < N; i++)
+        ids[i] = id;
+    /* each chunk of 256 repeats costs one scan, not 256 (the default budget of 10^8 probes is not reached by the
+     * 256 chunks: 256 x 100,000) */
+    OK(tsdb_series_stats(db, ids, N, 0, st, &done));
+    CHECK(done == N);
+    for (int i = 0; i < N; i += 997)
+        CHECK(same_stat(&st[i], &one));
+    CHECK(same_stat(&st[N - 1], &one));
+    /* the scan is charged: a small budget stops the call after a few chunks */
+    atomic_store(&sstats_budget, 1000000);
+    OK(tsdb_series_stats(db, ids, N, 0, st, &done));
+    CHECK(done >= 256 && done < N / 2);
+    for (size_t i = 0; i < done; i += 251)
+        CHECK(same_stat(&st[i], &one));
+    atomic_store(&sstats_budget, 100000000ull);
+    free(ids);
+    free(st);
+    tsdb_close(db);
+}
+
 /* ---------------------------------------------------------------------- the query counters */
 
 typedef struct tctx {
@@ -783,6 +902,9 @@ int main(int argc, char **argv)
     test_series_stats_api(base);
     test_modes(base);
     test_overflow(base);
+    test_open_overflow(base);
+    test_last_write(base);
+    test_dup_ids(base);
     test_oracle(base);
     test_throttle(base);
     rm_rf(base);

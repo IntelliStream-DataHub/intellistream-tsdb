@@ -122,7 +122,7 @@ behind what happened.
 | `tomb_bytes` | exact: 24 x the series' tombstones | 0 | part trailer (src/internal.h:603-608) |
 | compression ratio = `logical_bytes` / (ts + value + index + tomb bytes) | derived from part rows and part bytes only, so memtable rows do not inflate it | 0 | |
 | `first_ts`, `last_ts` | physical; `first_ts` raised to the retention cutoff; when every stored row is before the cutoff, both are absent (flag `NO_RANGE`) | 0 | first and last entry's ts range; memtable min/max |
-| `last_write_ms` | approximate: the newest `written` of a part holding the series, or the memtable's `created_ms` when it holds rows; flag `WRITE_FROM_MTIME` when it comes from a part this process opened rather than wrote (ST13) | one flush | src/internal.h:747, 1154 |
+| `last_write_ms` | approximate: the newest `written_ms` of a part holding the series (the header's write time), or the memtable's `created_ms` when it holds rows; flag `WRITE_FROM_MTIME` when it comes from a part written before format 9, which has only the file's mtime (ST13) | one flush | src/internal.h:747, 1154 |
 | `parts`, `partitions`, `granules`, `full_granules` (count = the part's granule rows) | exact | 0 | runs and entries |
 | `class` | exact | 0 | `tsdb_series_class` |
 | `resident_bytes` (flag `RESIDENT`, n <= 1,024) | exact for the pages at the time of the call | 0 | one `mincore` per (part, series): a series' granules are contiguous in a part |
@@ -246,7 +246,9 @@ part, mostly cache misses: about 1 us per (part, series) for single ids, and the
 Memtables (M5): under one `db->lock` hold, the sweeper's event sequence number is read, the part list is copied with
 references (as `db_snapshot`), and the slots of the flushing memtables and of a follower's WAL tails are read for the
 request's ids, in batches of at most 256 ids per hold (about 5 us each). The active memtable is read under `buf_lock`
-(after `db->lock`, AGENTS.md lock order), in batches of at most 256 ids. If the event sequence number moved in the
+(after `db->lock`, AGENTS.md lock order), in batches of at most 256 ids, `buf_lock` taken for one series at a time (a scan of an unsorted series for its range
+is at most the memtable's rows). Every row scanned there is charged to the call's probe budget, and an id repeated in
+one chunk is answered once (a copy of the first record). If the event sequence number moved in the
 meantime (a flush listed a part), the memtable reads are done once more; if it moves again, the reply sets
 `MEM_APPROX` (a row may count in both places or in neither, for at most one flush).
 

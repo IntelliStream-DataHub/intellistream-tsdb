@@ -933,6 +933,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             goto fail;
         }
     }
+    stats_open_done(db); /* load_parts changed the list without db->lock: from here the sweeper may read it */
     if (open_check) { /* a reopen's comparison with the engine it replaces: before any thread changes the parts */
         void (*check)(const eng *, void *) = open_check;
         open_check = NULL;

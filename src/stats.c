@@ -191,6 +191,7 @@ void qreg_totals(qreg *r, uint64_t out[QC_N])
 #define RING_N 4096
 atomic_uint stats_ring_cap = RING_N;
 atomic_uint stats_pause;
+atomic_uint_fast64_t stats_open_reconciles; /* tests: reconciles that ran before the open was done: none may */
 #define TICK_MS 1000
 
 typedef struct stat_ev {
@@ -218,6 +219,7 @@ struct estats {
     stat_ev ring[RING_N];
     atomic_uint_fast64_t head, tail;
     atomic_bool overflow, swapped, stop;
+    atomic_bool opened; /* the open has finished: only then may the sweeper read db->parts (load_parts changes it unlocked) */
     atomic_uint_fast64_t overflows, cpu_ns;
     atomic_uint_fast64_t settle_req, settle_done;
     pthread_t th;
@@ -515,6 +517,8 @@ static void reconcile(struct estats *es)
 {
     eng *db = es->db;
     stat_ev ev;
+    if (!atomic_load(&es->opened))
+        atomic_fetch_add(&stats_open_reconciles, 1);
     pthread_mutex_lock(&db->lock);
     while (ring_pop(es, &ev))
         if (ev.kind == STAT_EV_ADD)
@@ -616,10 +620,12 @@ static void *sweeper_main(void *arg)
         while (atomic_load_explicit(&stats_pause, memory_order_relaxed) && !atomic_load(&es->stop))
             usleep(1000); /* tests only */
         uint64_t req = atomic_load(&es->settle_req);
-        if (atomic_load(&es->overflow) || atomic_load(&es->swapped))
+        bool opened = atomic_load(&es->opened);
+        if (opened && (atomic_load(&es->overflow) || atomic_load(&es->swapped)))
             reconcile(es);
         drain(es);
-        retry_pending(es);
+        if (opened)
+            retry_pending(es);
         struct timespec ct;
         if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ct) == 0)
             atomic_store(&es->cpu_ns, (uint64_t)ct.tv_sec * 1000000000u + (uint64_t)ct.tv_nsec);
@@ -628,7 +634,8 @@ static void *sweeper_main(void *arg)
             atomic_store(&es->settle_done, req);
             pthread_cond_broadcast(&es->done_cv);
         }
-        bool idle = !atomic_load(&es->overflow) && !atomic_load(&es->swapped) &&
+        /* before the end of the open an overflow stays set, and is no work yet */
+        bool idle = !(opened && (atomic_load(&es->overflow) || atomic_load(&es->swapped))) &&
                     atomic_load(&es->head) == atomic_load(&es->tail) && atomic_load(&es->settle_req) == req;
         if (idle && !atomic_load(&es->stop))
             sleep_cv(es, (int64_t)TICK_MS * 1000000);
@@ -689,8 +696,10 @@ void stats_start(eng *db, bool reconcile_first)
     pthread_mutex_init(&es->mu, NULL);
     pthread_cond_init(&es->cv, NULL);
     pthread_cond_init(&es->done_cv, NULL);
-    if (reconcile_first)
+    if (reconcile_first) { /* a start after the open (lazy, or a follower's) */
         atomic_store(&es->swapped, true);
+        atomic_store(&es->opened, true);
+    }
     /* published before the thread runs: a part listed from now on is an event, and the first reconcile copies
      * the list after that, so nothing falls between them */
     pthread_mutex_lock(&db->lock);
@@ -706,6 +715,17 @@ void stats_start(eng *db, bool reconcile_first)
         return;
     }
     es->th_started = true;
+}
+
+void stats_open_done(eng *db)
+{
+    struct estats *es = atomic_load(&db->stats);
+    if (!es)
+        return;
+    atomic_store(&es->opened, true);
+    pthread_mutex_lock(&es->mu);
+    pthread_cond_broadcast(&es->cv); /* an overflow that waited for the open is work now */
+    pthread_mutex_unlock(&es->mu);
 }
 
 void stats_stop(eng *db)
@@ -856,23 +876,40 @@ typedef struct sacc {
     bool has, inpart;
 } sacc;
 
+/* One memtable's rows of the requested series. An unsorted series is scanned for its range (the write path keeps no
+ * min and max), and every row scanned is charged to the caller's budget. A memtable that still grows (`live`) is read
+ * under buf_lock, taken for one series at a time: the writers of the volume wait for one series' scan (at most the
+ * rows of the memtable), never for a whole chunk. */
 static void mem_account(const memtable *mt, const uint32_t *ids, size_t m, tsdb_series_stat *out, sacc *acc,
-                        int64_t wall_ms)
+                        int64_t wall_ms, uint64_t *probes, eng *live)
 {
     int64_t created = wall_ms - (eng_mono_ms() - mt->created_ms);
     for (size_t i = 0; i < m; i++) {
         uint32_t id = ids[i];
-        if (out[i].status || id >= mt->scap || !mt->s[id].n)
+        if (out[i].status)
             continue;
+        if (live)
+            pthread_mutex_lock(&live->buf_lock);
+        if (id >= mt->scap || !mt->s[id].n) {
+            if (live)
+                pthread_mutex_unlock(&live->buf_lock);
+            continue;
+        }
         const mt_series *s = &mt->s[id];
         int64_t lo = s->ts[0], hi = s->ts[s->n - 1];
-        if (!s->sorted)
+        *probes += 1;
+        if (!s->sorted) {
+            *probes += s->n;
             for (uint32_t k = 1; k < s->n; k++) {
                 lo = MIN(lo, s->ts[k]);
                 hi = MAX(hi, s->ts[k]);
             }
-        out[i].rows += s->n;
-        out[i].memtable_rows += s->n;
+        }
+        uint32_t rows = s->n;
+        if (live)
+            pthread_mutex_unlock(&live->buf_lock);
+        out[i].rows += rows;
+        out[i].memtable_rows += rows;
         acc[i].first = acc[i].has ? MIN(acc[i].first, lo) : lo;
         acc[i].last = acc[i].has ? MAX(acc[i].last, hi) : hi;
         acc[i].has = true;
@@ -958,7 +995,14 @@ void sscx_run(sscx *x, const uint32_t *ids, size_t m, tsdb_series_stat *out, uin
                 acc[i].first = acc[i].has ? MIN(acc[i].first, lo) : lo;
                 acc[i].last = acc[i].has ? MAX(acc[i].last, hi2) : hi2;
                 acc[i].has = true;
-                o->last_write_ms = MAX(o->last_write_ms, (int64_t)p->written * 1000);
+                /* format 9 keeps the write time in the header (a merge carries its inputs' newest); a format-8 part has
+                 * only the file's mtime, which a merge moves: say so */
+                int64_t wms = p->written_ms;
+                if (wms == 0) {
+                    wms = (int64_t)p->written * 1000;
+                    o->flags |= TSDB_SSTAT_WRITE_FROM_MTIME;
+                }
+                o->last_write_ms = MAX(o->last_write_ms, wms);
             }
         }
         if (tombs) {
@@ -987,13 +1031,9 @@ void sscx_run(sscx *x, const uint32_t *ids, size_t m, tsdb_series_stat *out, uin
     clock_gettime(CLOCK_REALTIME, &now);
     int64_t wall_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
     for (size_t k = 0; k < x->nflush; k++) /* flushing memtables never change */
-        mem_account(x->ms[k], ids, m, out, acc, wall_ms);
-    if (x->nm > x->nflush) {
-        pthread_mutex_lock(&db->buf_lock); /* the active memtable and the tails grow under it */
-        for (size_t k = x->nflush; k < x->nm; k++)
-            mem_account(x->ms[k], ids, m, out, acc, wall_ms);
-        pthread_mutex_unlock(&db->buf_lock);
-    }
+        mem_account(x->ms[k], ids, m, out, acc, wall_ms, probes, NULL);
+    for (size_t k = x->nflush; k < x->nm; k++) /* the active memtable and the tails grow under buf_lock */
+        mem_account(x->ms[k], ids, m, out, acc, wall_ms, probes, db);
     for (size_t i = 0; i < m; i++) {
         if (out[i].status)
             continue;

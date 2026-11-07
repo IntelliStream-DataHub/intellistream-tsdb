@@ -402,8 +402,9 @@ cgroup, so `nice` does not keep your work out of its way.
   part writer or a merge: the two functions that change a part list (`db_parts_insert_locked`,
   `db_parts_remove_locked`) push one event into a bounded ring under the `db->lock` they hold, and a nice-19
   sweeper thread (throttled to `stats_sweep_mb_s`, a hard cap) walks each added part's granule index once. A full
-  ring drops events and the sweeper reconciles its records with the part list, so the totals are the sum of the
-  records and cannot drift. Statistics never write a file, never call `eng_fail` and keep answering after the engine
+  ring drops events and the sweeper reconciles its records with the part list (never before the open has finished:
+  `load_parts` changes the list without `db->lock`; an overflow stays set until `stats_open_done`), so the totals are
+  the sum of the records and cannot drift. Statistics never write a file, never call `eng_fail` and keep answering after the engine
   failed; a failed allocation means "not counted" (`stats_parts_counted < stats_parts_listed`), never a failed
   query or write. Query counters are one block per (thread, handle), written without a read-modify-write
   (`qs_end`, about 10 ns); a thread that outlives `tsdb_close` holds a reference on the registry, not on the handle.

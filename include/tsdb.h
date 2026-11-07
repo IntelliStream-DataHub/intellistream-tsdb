@@ -817,12 +817,13 @@ typedef struct tsdb_series_stat {
     uint64_t tomb_bytes;       /* 24 x its tombstones */
     uint64_t parts, partitions, granules, full_granules; /* full: a granule of granule_rows rows */
     int64_t first_ts, last_ts; /* stored rows (first raised to the retention cutoff); 0 with TSDB_SSTAT_NO_RANGE */
-    int64_t last_write_ms;     /* the newest part holding it (its `written`, one flush old) or memtable creation */
+    int64_t last_write_ms;     /* the newest part holding it (its written_ms, one flush old) or memtable creation */
     uint64_t resident_bytes;   /* reserved: 0 */
     uint64_t reads_est, reads_err, writes_est, writes_err; /* reserved: 0 */
     uint64_t live_rows;        /* reserved: 0 */
 } tsdb_series_stat;
 enum {
+    TSDB_SSTAT_WRITE_FROM_MTIME = 4, /* last_write_ms comes from the file time of a part written before format 9 */
     TSDB_SSTAT_NO_RANGE = 2,   /* no stored row at or after the retention cutoff: first_ts and last_ts are 0 */
 };
 /* ids[0..n): n up to 65,536 (TSDB_ERR_INVALID above); flags must be 0 (RESIDENT and EXACT_ROWS are not built). out
