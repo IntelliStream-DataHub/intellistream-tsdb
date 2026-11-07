@@ -444,11 +444,25 @@ static int mode_qps(const cfg *c)
     tsdb_options_init(&o);
     if (c->query_threads > 0)
         o.query_threads = c->query_threads;
+    if (c->no_stats)
+        o.stats = -1;
     tsdb *db;
     int rc = tsdb_open(c->dir, &o, &db);
     if (rc) {
         fprintf(stderr, "open: %s\n", tsdb_strerror(rc));
         return 1;
+    }
+    /* sids[] is filled by the load path; this mode opens an existing database and has to look the ids up
+       (a NULL table crashed every query thread). */
+    sids = calloc(c->series ? c->series : 1, sizeof *sids);
+    for (uint32_t s = 0; s < c->series; s++) {
+        char name[64];
+        snprintf(name, sizeof name, "%s.%u", ds_info[kind_of(c, s)].name, s);
+        rc = tsdb_series_lookup(db, name, &sids[s]);
+        if (rc) {
+            fprintf(stderr, "qps: series %s: %s\n", name, tsdb_strerror(rc));
+            return 1;
+        }
     }
     int nt = c->qps;
     qwjob *q = calloc((size_t)nt, sizeof *q);
