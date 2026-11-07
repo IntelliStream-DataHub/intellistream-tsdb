@@ -974,6 +974,42 @@ only series count measured here, and the one where the fold has almost nothing t
 table, so §2.3's "no measurable cost" is NOT shown at scale; §9.2 has the flush measurement. Not yet measured: inserts
 under lookups through the server (step 3) and the other items above.
 
+### 9.2 Measured at step 2: a flush of 10^6 series, with and without the table and its window (2026-11-07)
+
+`build/latest-bench` (tools/latest-bench.c, embedded, not in `make`), each run under the exclusive BENCH lock, the machine
+otherwise idle, ext4 on NVMe. Every round writes one row for each of 10^6 series (a tenth of the rows null), then
+`tsdb_flush`es while readers look up random ids and one writer thread appends one row per call. Five repetitions x
+modes interleaved (on = default table with the §3.2 window, nowin = table without the window, off = `latest_cache` 0);
+round 1 of each run is a warm-up and left out, so 25 rounds per mode. A is the table path (1 reader, 256 ids per call),
+B the slow path (`WITH_NULLS`, 2 readers x 4,096 ids, 3 repetitions, 15 rounds, table on or off).
+
+| | flush, mean (sd) / median | lookups completed during the flush | lookup p50 / p99 | max lookup / max append |
+|---|---:|---:|---:|---:|
+| A, table on (window) | 768 (30) / 761 ms | 20,059 | 35 / 58 us | 16.6 / 16.5 ms |
+| A, table on, no window | 775 (62) / 763 ms | 20,455 | 34 / 55 us | 16.7 / 28.2 ms |
+| A, table off (slow path) | 745 (47) / 730 ms | 4,826 | 147 / 206 us | 16.6 / 16.4 ms |
+| B, table on (`WITH_NULLS`) | 759 (65) / 750 ms | 364 | 4.1 / 9.1 ms | 20.5 / 38.0 ms |
+| B, table off | 713 (23) / 723 ms | 344 | 4.0 / 9.0 ms | 21.0 / 14.9 ms |
+
+- **Flush cost of the table**: +3 to +4% on the medians (about 30 ms for 10^6 series, about 30 ns per series for the
+  fold). That is above the 2% this design expected for large inserts and is what a flush of 10^6 one-row series pays;
+  a flush with fewer series per row (the insert-bench data) pays nothing visible (§9.1). The run-to-run sd of one mode
+  is 4 to 8%, so only the medians of 25 rounds say this. The window itself changes neither the flush time nor the lookup
+  p99 (A on against nowin). The slow path (B) is as slow with the table as without: its lookups skip the table.
+- **Lookups during a flush**: the table answers 4x as many lookups with a p50 of 35 us against 147 us.
+- **The multi-ms worst case is not the table.** Max lookup and max append are the same ~16 ms in every mode, table off
+  included, and the max append equals the max lookup in the same round: one pause that both threads were caught in. A
+  run of the "off" mode with `strace -f -T` shows the flusher thread in `munmap` of buffers of 184 MB and 168 MB
+  (during the flush, from its write step) for 7 to 8 ms (and a 40 MB `write` for 5.6 ms) while the other threads wait: the kernel takes the
+  mmap lock for writing for the whole unmap and a thread that page-faults or allocates waits behind it. Timing
+  `mt_unref` of the flushed memtable (48 ms, 3 x 10^6 frees) and leaving it out did not change the tail, and the
+  listing section (parts listed under `db->lock`) takes under 10 us. So this belongs to the flush path of main (large
+  buffers handed back to the kernel), and a fix is a separate change (keeping the flusher's buffers, or `madvise`
+  in slices); it is not part of the latest table.
+- The window threshold (`LT_WINDOW_MIN` 50,000) stays. This measurement shows no difference between on and nowin at
+  10^6 series (the pause above hides the window's effect on the worst case; the review's own run saw worst lookups of
+  2 to 6 ms with the window and 5 to 12 ms without). The window threshold itself is not measured below 10^6 series.
+
 ## 10. Build plan
 
 Each step is a track (tsdb-tracks): build, adversarial review, fix, gates, merge.
