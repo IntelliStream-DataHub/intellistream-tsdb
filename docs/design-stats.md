@@ -519,6 +519,29 @@ standard deviations reported (benchmark policy):
 | `STATS_SERIES` on parts with 10^7 runs | 1 id, 1,024 ids, 65,536 ids; time and probes | within the budget; the merge pass wins for large n |
 | memory | RSS with 10^8 series, tenants in runs and interleaved | as §3.6 |
 
+### Results of steps 1 and 2 (2026-11-07, merged tree, AMD Ryzen 9 7950X, quiet machine under `BENCH.lock`)
+
+Stats on (the default) against `--no-stats`, same binaries, `tsdb-bench --qps` on a 100-series, 1 M-row-per-series
+database (3 interleaved runs of 5 s each; mean queries/s) and `insert-bench --appends-only` with fsync (5 interleaved
+rounds of 10 s; mean inserts/s). The single-row lookup class and the two-handle case are not measured yet; the
+`qs_end` hook (about 10 ns per query) is below the noise of the classes that were.
+
+| class | on | off | on / off |
+|---|---:|---:|---:|
+| raw 3600 samples, 1 thread | 66,263 | 64,281 | +3.1% (one noisy "off" run) |
+| 86400 samples in 300-s buckets, 1 thread | 18,131 | 17,982 | +0.8% |
+| 604800 samples in 3600-s buckets, 1 thread | 16,992 | 17,107 | -0.7% |
+| raw 3600 samples, 32 threads | 1,061,914 | 1,069,623 | -0.7% |
+| 86400 samples in 300-s buckets, 32 threads | 110,224 | 109,834 | +0.4% |
+| 604800 samples in 3600-s buckets, 32 threads | 54,544 | 54,478 | +0.1% |
+| append, fsync each, 1 thread | 1,458 | 1,455 | +0.2% |
+| append, fsync each, 16 threads | 12,473 | 12,379 | +0.8% |
+| append, fsync each, 64 threads | 43,113 | 43,464 | -0.8% |
+| append, fsync each, 256 threads | 145,035 | 143,392 | +1.1% |
+
+No difference outside run-to-run noise (in both directions, so the cost is not measurable here). Not yet run: the
+sweeper's catch-up time on the 100 M-row set, `tsdbc-bench`, and the settle time after a load.
+
 ## 9. Build plan
 
 | Step | What | Gate | Effort (days) |
