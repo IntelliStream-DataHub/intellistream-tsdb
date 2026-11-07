@@ -1175,6 +1175,114 @@ static void fw_hook(void *arg)
     CHECK(r.kind == TSDB_LATEST_NONE);
 }
 
+/* ------------------------------------------------------------------ the warmer */
+
+typedef struct {
+    tsdb *db;
+    tsdb_sid id;
+    bool armed;
+    int fired;
+} wm;
+
+/* A publish between the warmer's cut and its store: a newer row, flushed. The fill (the row at 10) is then stale
+ * and must be refused: the entry the flush made (30) is the right one. */
+static void wm_hook(void *arg, int at)
+{
+    wm *x = arg;
+    if (at != LH_WARM_BEFORE_STORE || !x->armed)
+        return;
+    x->armed = false;
+    put_f64(x->db, x->id, 30, 99.0, false);
+    OK(tsdb_flush(x->db));
+    __atomic_add_fetch(&x->fired, 1, __ATOMIC_SEQ_CST);
+}
+
+static void wm_stats(tsdb *db, uint64_t s[6])
+{
+    CHECK(tsdb_test_latest_stats(db, s));
+}
+
+/* Waits until cond(stats) holds, at most 20 s. */
+static bool wm_wait(tsdb *db, bool (*cond)(const uint64_t *s, uint64_t arg), uint64_t arg)
+{
+    for (int i = 0; i < 2000; i++) {
+        uint64_t s[6];
+        wm_stats(db, s);
+        if (cond(s, arg))
+            return true;
+        usleep(10000);
+    }
+    return false;
+}
+static bool no_unknown(const uint64_t *s, uint64_t arg) { (void)arg; return s[5] == 0; }
+static bool refused_at_least(const uint64_t *s, uint64_t arg) { return s[4] >= arg; }
+
+static void test_warmer(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    tsdb *db = open_plain("latest_warmer", &o);
+    enum { N = 300 };
+    tsdb_sid id[N];
+    for (int i = 0; i < N; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "wm.%d", i);
+        OK(tsdb_series_create(db, nm, TSDB_FLOAT64, NULL, &id[i]));
+        put_f64(db, id[i], 10, i, false);
+        put_f64(db, id[i], 20, 1000 + i, false);
+    }
+    OK(tsdb_flush(db));
+    /* the newest row of every series deleted: every entry is unknown until the warmer fills it */
+    for (int i = 0; i < N; i++)
+        OK(tsdb_delete_range(db, id[i], 20, TSDB_TS_MAX));
+    CHECK(wm_wait(db, no_unknown, 0));
+    uint64_t s0[6], s1[6];
+    wm_stats(db, s0);
+    CHECK(s0[3] >= N); /* filled by the warmer */
+    for (int i = 0; i < N; i++) {
+        tsdb_latest_result r = one(db, id[i], TSDB_TS_MAX, 0);
+        CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 10 && r.v.f64 == (double)i);
+    }
+    wm_stats(db, s1);
+    CHECK(s1[0] - s0[0] == N); /* every lookup answered from the table, none searched */
+    CHECK(s1[1] == s0[1]);
+    for (int i = 0; i < N; i += 37)
+        check_vs_scan(db, id[i], "warmer, filled");
+
+    /* a series deleted entirely: its fill is empty */
+    tsdb_sid e;
+    OK(tsdb_series_create(db, "wm.empty", TSDB_FLOAT64, NULL, &e));
+    put_f64(db, e, 10, 1.0, false);
+    OK(tsdb_flush(db));
+    OK(tsdb_delete_range(db, e, TSDB_TS_MIN, TSDB_TS_MAX));
+    CHECK(wm_wait(db, no_unknown, 0));
+    wm_stats(db, s0);
+    tsdb_latest_result r = one(db, e, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE);
+    wm_stats(db, s1);
+    CHECK(s1[0] - s0[0] == 1 && s1[1] == s0[1]);
+
+    /* a publish between the cut and the store refuses the batch */
+    wm x = {.db = db};
+    OK(tsdb_series_create(db, "wm.race", TSDB_FLOAT64, NULL, &x.id));
+    put_f64(db, x.id, 10, 1.0, false);
+    put_f64(db, x.id, 20, 2.0, false);
+    OK(tsdb_flush(db));
+    wm_stats(db, s0);
+    tsdb_test_latest_hook(db, wm_hook, &x);
+    x.armed = true;
+    OK(tsdb_delete_range(db, x.id, 20, TSDB_TS_MAX));
+    CHECK(wm_wait(db, refused_at_least, s0[4] + 1));
+    CHECK(__atomic_load_n(&x.fired, __ATOMIC_SEQ_CST) == 1);
+    CHECK(wm_wait(db, no_unknown, 0));
+    tsdb_test_latest_hook(db, NULL, NULL);
+    r = one(db, x.id, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 30 && r.v.f64 == 99.0);
+    check_vs_scan(db, x.id, "warmer, refused");
+    OK(tsdb_close(db));
+}
+
 static void test_flush_window(void)
 {
     tsdb_options o;
@@ -1303,6 +1411,8 @@ int main(int argc, char **argv)
     printf("directed ok\n");
     test_partial_merge();
     printf("partial merge ok\n");
+    test_warmer();
+    printf("warmer ok\n");
     test_flush_window();
     printf("flushing + active memtables, follower tails ok\n");
     test_follower(1500);

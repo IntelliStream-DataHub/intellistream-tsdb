@@ -1695,12 +1695,26 @@ void tsdb_test_dict_fault(tsdb *t, int (*fn)(void *arg, int point, const char *n
     pthread_rwlock_unlock(&t->lock);
 }
 
+/* Volume 0's latest-table hook (tests/test_latest.c): called with LH_* at the points ltab.c names. */
+void tsdb_test_latest_hook(tsdb *t, void (*fn)(void *, int), void *arg)
+{
+    t->vols[0]->lt_hook_arg = arg;
+    t->vols[0]->lt_hook = fn;
+}
+
 void tsdb_test_midplace(tsdb *t, void (*fn)(void *), void *arg)
 {
     for (size_t i = 0; i < t->nvols; i++) {
         t->vols[i]->test_midplace_arg = arg;
         t->vols[i]->test_midplace = fn;
     }
+}
+
+/* The latest table of volume 0 (tests): counters {answered from the table, searched, floor reads, fills stored, fills
+ * refused, unknown entries now}; false when the volume has no table. */
+bool tsdb_test_latest_stats(tsdb *t, uint64_t out[6])
+{
+    return latest_stats(t->vols[0], out);
 }
 
 void tsdb_test_wal_state(tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced)

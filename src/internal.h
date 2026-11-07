@@ -1791,12 +1791,15 @@ int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, in
                latest_row *out);
 int eng_latest_search(eng *db, const uint32_t *local, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
                       latest_row *out); /* every id searched on one cut (the slow path) */
+/* The warmer's fill: the newest non-null row in the parts of the cut (no memtable in it), no cutoff. */
+int eng_latest_fill(eng *db, const qcut *c, const uint32_t *local, size_t n, latest_row *out);
 /* The latest table (design-latest.md steps 2): created at open when the options and the role allow, rebuilt from
  * the parts after cls_check_parts and before the WAL replay, closed with the engine. */
 int latest_open(eng *db);       /* the table, empty (NULL db->lt: off) */
 int latest_build(eng *db);      /* every part's runs folded in; the volume's pages reserved first */
 void latest_start(eng *db);     /* the warmer thread, once the engine is up */
 void latest_stop(eng *db);      /* stops the warmer (eng_halt) */
+bool latest_stats(eng *db, uint64_t out[6]); /* tests: see tsdb_test_latest_stats */
 void latest_close(eng *db);     /* frees the table and gives its pages back to the budget */
 /* A publisher's write section: lt_begin takes latest_rw for writing (no-op without a table); lt_fold, after
  * parts_commit succeeded and before the parts are listed, folds their fold lists and tombstones in block order;
@@ -1928,6 +1931,8 @@ void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
 uint64_t tsdb_test_fence_wakeups(struct tsdb *t);
 /* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
+bool tsdb_test_latest_stats(struct tsdb *t, uint64_t out[6]);
+void tsdb_test_latest_hook(struct tsdb *t, void (*fn)(void *, int), void *arg);
 /* tests: fn(arg, 0) runs in tsdb_volume_reopen before it halts the old engine, fn(arg, 1) once the new engine is
  * open and its threads run; a reference on a series' engine as a
  * name or type lookup holds it between its route and its use (tsdb_test_meta_use reads the type through it) */

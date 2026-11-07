@@ -846,8 +846,242 @@ int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, in
     return rc;
 }
 
-/* ---- the warmer (3.8): not yet; the unknown entries are settled by the next publish of a newer row ---- */
+/* ---- the warmer (3.8) ----
+ * One thread per volume, the only filler of entries. A batch: under a read hold of latest_rw it notes lgen, keeps
+ * the ids that still want a fill and takes a cut (no write section is half done inside the hold, so the cut's parts
+ * are exactly the ones folded into the entries); outside every lock it searches the PARTS of the cut (the memtables'
+ * refs are dropped: the table describes parts only); then under the write lock it stores only if lgen is unchanged,
+ * that is, no publish, delete, retention change or drop ran since the cut (the entries are then still as they were).
+ * Otherwise the batch is refused and its ids go back to the hint set. */
 
-void latest_start(eng *db) { (void)db; }
+enum { WB_MIN = 16, WB_START = 64, WB_MAX = 4096 };
+enum { WS_OK = 0, WS_REFUSED = 1, WS_ERR = 2 };
 
-void latest_stop(eng *db) { (void)db; }
+static int64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static void warm_requeue(eng *db, const uint32_t *ids, size_t n, bool floor_mode)
+{
+    ltab *t = db->lt;
+    if (floor_mode) {
+        pthread_mutex_lock(&t->hmu);
+        t->walk_floor = true;
+        pthread_mutex_unlock(&t->hmu);
+    } else {
+        hints_push(db, ids, n, false);
+    }
+}
+
+/* Fills ids[0..n): the unknown ones, or (floor_mode) the known ones below the drop floor, which can only become
+ * empty (the rows that hold them are gone; one that remains below the floor stays what it is). */
+static int warm_batch(eng *db, ltab *t, uint32_t *ids, size_t n, bool floor_mode)
+{
+    qcut c;
+    pthread_rwlock_rdlock(&t->rw);
+    uint64_t g = t->lgen;
+    bool pend = atomic_load(&t->pending);
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        lt_ent e;
+        if (!lt_load(t, ids[i], &e))
+            continue;
+        if (floor_mode ? (e.st == LE_KNOWN && e.ts < t->drop_floor) : e.st == LE_UNKNOWN)
+            ids[k++] = ids[i];
+    }
+    n = k;
+    int rc = n && !pend ? cut_take(db, &c) : 0;
+    pthread_rwlock_unlock(&t->rw);
+    if (n == 0)
+        return WS_OK;
+    if (pend) {
+        warm_requeue(db, ids, n, floor_mode);
+        return WS_REFUSED;
+    }
+    if (rc)
+        return WS_ERR;
+    for (size_t i = 0; i < c.nms; i++)
+        mt_unref(c.ms[i]);
+    for (size_t i = 0; i < c.ntails; i++)
+        mt_unref(c.tails[i]);
+    c.nms = c.ntails = 0;
+    c.has_active = false;
+    latest_row *out = malloc(n * sizeof *out);
+    if (db->lt_hook)
+        db->lt_hook(db->lt_hook_arg, LH_WARM_AFTER_CUT);
+    rc = out ? eng_latest_fill(db, &c, ids, n, out) : TSDB_ERR_NOMEM;
+    cut_release(&c);
+    if (rc) {
+        free(out);
+        return WS_ERR;
+    }
+    if (db->lt_hook)
+        db->lt_hook(db->lt_hook_arg, LH_WARM_BEFORE_STORE);
+    pthread_rwlock_wrlock(&t->rw);
+    if (t->lgen != g) {
+        pthread_rwlock_unlock(&t->rw);
+        free(out);
+        warm_requeue(db, ids, n, floor_mode);
+        atomic_fetch_add(&t->st_fill_refused, 1);
+        return WS_REFUSED;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (out[i].status)
+            continue;
+        lt_ent cur;
+        if (!lt_load(t, ids[i], &cur))
+            continue;
+        if (out[i].kind == LK_NONE_)
+            lt_store(t, ids[i], &(lt_ent){LE_EMPTY, INT64_MAX, 0});
+        else if (!floor_mode)
+            lt_store(t, ids[i], &(lt_ent){LE_KNOWN, out[i].ts, out[i].slot});
+        atomic_fetch_add(&t->st_fill_ok, 1);
+    }
+    t->lgen++;
+    pthread_rwlock_unlock(&t->rw);
+    free(out);
+    return WS_OK;
+}
+
+/* The next ids from the cursor that want a fill (a walk of the unknown bitmap, or of the known entries below the
+ * floor), looking at no more than one page of ids per hold. *active goes false at the end of the table. */
+static size_t warm_collect(ltab *t, bool floor_mode, uint32_t *cur, uint32_t *ids, size_t max, bool *active)
+{
+    size_t n = 0;
+    pthread_rwlock_rdlock(&t->rw);
+    uint64_t end = (uint64_t)t->npg << LT_PAGE_BITS;
+    uint64_t id = *cur, stop = id + LT_PAGE;
+    while (id < end && id < stop && n < max) {
+        const lt_page *p = t->pg[id >> LT_PAGE_BITS];
+        uint32_t i = (uint32_t)id & (LT_PAGE - 1);
+        if (!floor_mode) {
+            uint64_t w = p->unk[i >> 6] >> (i & 63);
+            if (!w) {
+                id += 64 - (i & 63);
+                continue;
+            }
+            id += (uint64_t)__builtin_ctzll(w);
+            ids[n++] = (uint32_t)id++;
+            continue;
+        }
+        lt_ent e;
+        if (lt_load(t, (uint32_t)id, &e) && e.st == LE_KNOWN && e.ts < t->drop_floor)
+            ids[n++] = (uint32_t)id;
+        id++;
+    }
+    pthread_rwlock_unlock(&t->rw);
+    *cur = (uint32_t)(id < end ? id : 0);
+    if (id >= end)
+        *active = false;
+    return n;
+}
+
+static void *warmer_main(void *arg)
+{
+    eng *db = arg;
+    ltab *t = db->lt;
+    uint32_t *ids = malloc(WB_MAX * sizeof *ids);
+    size_t B = WB_START;
+    uint32_t rcur = 0, fcur = 0;
+    bool rscan = false, fwalk = false;
+    while (ids) {
+        size_t n = 0;
+        int mode = 0; /* 0 hints, 1 rescan, 2 floor walk */
+        pthread_mutex_lock(&t->hmu);
+        while (!t->wstop && !t->nhint && !t->rescan && !t->walk_floor && !rscan && !fwalk)
+            pthread_cond_wait(&t->hcv, &t->hmu);
+        if (t->wstop) {
+            pthread_mutex_unlock(&t->hmu);
+            break;
+        }
+        if (t->nhint) {
+            n = t->nhint < B ? t->nhint : B;
+            t->nhint -= n;
+            memcpy(ids, t->hint + t->nhint, n * sizeof *ids);
+        } else if (t->rescan || rscan) {
+            if (!rscan) {
+                rscan = true;
+                t->rescan = false;
+                rcur = 0;
+            }
+            mode = 1;
+        } else {
+            if (!fwalk) {
+                fwalk = true;
+                t->walk_floor = false;
+                fcur = 0;
+            }
+            mode = 2;
+        }
+        pthread_mutex_unlock(&t->hmu);
+        if (mode == 1)
+            n = warm_collect(t, false, &rcur, ids, B, &rscan);
+        else if (mode == 2)
+            n = warm_collect(t, true, &fcur, ids, B, &fwalk);
+        if (!n)
+            continue;
+        int64_t t0 = mono_ns();
+        int rc = warm_batch(db, t, ids, n, mode == 2);
+        int64_t dt = mono_ns() - t0;
+        if (rc == WS_REFUSED) {
+            B = B / 2 < WB_MIN ? WB_MIN : B / 2;
+            usleep(1000); /* a publish just ran: let it finish before the next cut */
+        } else if (dt < 250000) {
+            B = 2 * B > WB_MAX ? WB_MAX : 2 * B;
+        } else if (dt > 1000000) {
+            B = B / 2 < WB_MIN ? WB_MIN : B / 2;
+        }
+        if (rc == WS_ERR)
+            usleep(10000); /* out of memory or an I/O error: the ids are dropped; do not spin */
+    }
+    free(ids);
+    return NULL;
+}
+
+void latest_start(eng *db)
+{
+    ltab *t = db->lt;
+    if (!t)
+        return;
+    t->rescan = true; /* entries the build could not make exact */
+    if (tsdb_thread_create(&t->warmer, warmer_main, db) == 0)
+        t->has_warmer = true;
+}
+
+void latest_stop(eng *db)
+{
+    ltab *t = db->lt;
+    if (!t)
+        return;
+    pthread_mutex_lock(&t->hmu);
+    t->wstop = true;
+    pthread_cond_broadcast(&t->hcv);
+    pthread_mutex_unlock(&t->hmu);
+    if (t->has_warmer) {
+        pthread_join(t->warmer, NULL);
+        t->has_warmer = false;
+    }
+}
+
+bool latest_stats(eng *db, uint64_t out[6])
+{
+    ltab *t = db->lt;
+    if (!t)
+        return false;
+    out[0] = atomic_load(&t->st_table);
+    out[1] = atomic_load(&t->st_search);
+    out[2] = atomic_load(&t->st_floor);
+    out[3] = atomic_load(&t->st_fill_ok);
+    out[4] = atomic_load(&t->st_fill_refused);
+    uint64_t unk = 0;
+    pthread_rwlock_rdlock(&t->rw);
+    for (uint32_t i = 0; i < t->npg; i++)
+        for (size_t w = 0; w < LT_PAGE / 64; w++)
+            unk += (uint64_t)__builtin_popcountll(t->pg[i]->unk[w]);
+    pthread_rwlock_unlock(&t->rw);
+    out[5] = unk;
+    return true;
+}
