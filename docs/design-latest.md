@@ -947,6 +947,31 @@ factor, which §7.2's gate measures.
 
 `tools/bench-tsdb.sh` gets the latest classes, and AGENTS.md's benchmark section the numbers.
 
+### 9.1 Measured at step 2: insert cost with the table (2026-11-07)
+
+`build/insert-bench --latest-cache BYTES` (0 = no table), the machine otherwise idle (each run under the BENCH lock,
+`--seconds 3`), 1,000 series of the mixed sensors, ext4 on NVMe. Table on is the default (RAM/16).
+
+Large batches and the memtable path, 3 interleaved runs each (rows/s, no lookups running): parts 1 M rows
+52 / 53 / 52 M on against 52 / 43 / 53 M off; parts 10 M rows 57 / 55 / 59 M on against 57 / 55 / 47 M off; WAL and
+memtable at 10,000 rows per call 9.50 / 9.43 / 9.55 M on against 9.51 / 9.35 / 9.57 M off. The runs are within each
+other's noise (the lowest "off" values are runs that followed a 10 M insert's disk writeback).
+
+Durable one-row appends (the fsync-bound rows), order off, on, on, off, four times, 20 s apart; inserts/s, mean of 8
+runs per mode (one outlier run of each mode, at 586 and 817 per second with one thread, is disk noise: the median
+and the p50 and p99 latencies are the same):
+
+| appenders | table off | table on |
+|---:|---:|---:|
+| 1 | 1,344 (median 1,467) | 1,367 (median 1,452) |
+| 16 | 11,388 | 12,277 |
+| 64 | 41,308 | 42,835 |
+| 256 | 143,518 | 142,833 |
+
+So the table costs nothing the benchmark can measure on the insert path (§2.3's rule holds). Not yet measured: inserts
+under lookups, the §3.2 window's threshold (`LT_WINDOW_MIN` stays 50,000) and the other items above; they need the
+server path (step 3) and a quiet machine.
+
 ## 10. Build plan
 
 Each step is a track (tsdb-tracks): build, adversarial review, fix, gates, merge.
