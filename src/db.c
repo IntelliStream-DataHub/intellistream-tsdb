@@ -978,12 +978,40 @@ void eng_halt(eng *db)
     db->nmergers = 0;
 }
 
-/* Appends the name strings of d to *vec (freed by the owner of the vector, at tsdb_close). */
-static void names_take(series_dict *d, char ***vec, size_t *n, size_t *cap)
+/* The names of `old` that `neu` also holds at the same index become `neu`'s: it frees its own copy and keeps the
+ * pointer the old engine handed out. Only a prefix (the dictionaries are append-only, so a recovered one is the same
+ * names): the first difference stops it, and the rest is kept by eng_retire as before. Returns how many. */
+static uint32_t dict_adopt(series_dict *neu, series_dict *old)
+{
+    if (!neu->file || !old->file)
+        return 0;
+    pthread_mutex_lock(&old->lock); /* both are leaf locks taken only here together: no order to keep */
+    pthread_mutex_lock(&neu->lock);
+    uint32_t n = MIN(atomic_load(&old->count), atomic_load(&neu->count)), i = 0;
+    for (; i < n && strcmp(old->names[i], neu->names[i]) == 0; i++) {
+        if (old->names[i] != neu->names[i]) {
+            free(neu->names[i]);
+            neu->names[i] = old->names[i];
+        }
+    }
+    pthread_mutex_unlock(&neu->lock);
+    pthread_mutex_unlock(&old->lock);
+    return i;
+}
+
+void eng_adopt_names(eng *neu, eng *old)
+{
+    old->adopted_series = dict_adopt(&neu->series, &old->series);
+    old->adopted_states = dict_adopt(&neu->states, &old->states);
+}
+
+/* Appends the name strings of d from index `from` on to *vec (freed by the owner of the vector, at tsdb_close). */
+static void names_take(series_dict *d, uint32_t from, char ***vec, size_t *n, size_t *cap)
 {
     uint32_t cnt = atomic_load(&d->count);
-    if (!d->file || !cnt)
+    if (!d->file || cnt <= from)
         return;
+    cnt -= from;
     if (*n + cnt > *cap) {
         size_t nc = (*n + cnt) * 2;
         char **v = realloc(*vec, nc * sizeof *v);
@@ -993,7 +1021,7 @@ static void names_take(series_dict *d, char ***vec, size_t *n, size_t *cap)
         *cap = nc;
     }
     for (uint32_t i = 0; i < cnt; i++)
-        (*vec)[(*n)++] = d->names[i];
+        (*vec)[(*n)++] = d->names[from + i];
 }
 
 int eng_retire(eng *db, pthread_mutex_t *mu, char ***kept, size_t *nkept, size_t *capkept)
@@ -1002,8 +1030,8 @@ int eng_retire(eng *db, pthread_mutex_t *mu, char ***kept, size_t *nkept, size_t
         return 0;
     db->retiring = true;
     pthread_mutex_lock(mu); /* retires of several volumes run at once; the close below may be slow and is outside */
-    names_take(&db->series, kept, nkept, capkept);
-    names_take(&db->states, kept, nkept, capkept);
+    names_take(&db->series, db->adopted_series, kept, nkept, capkept);
+    names_take(&db->states, db->adopted_states, kept, nkept, capkept);
     pthread_mutex_unlock(mu);
     return eng_close(db);
 }

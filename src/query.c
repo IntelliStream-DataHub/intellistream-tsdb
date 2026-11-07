@@ -85,8 +85,10 @@ void cut_release(qcut *c)
 void qcuts_free(qcuts *cs)
 {
     for (size_t i = 0; i < cs->n; i++) {
-        cut_release(cs->c[i]);
+        eng *db = cs->c[i]->db;
+        cut_release(cs->c[i]); /* the parts first: part_unref of a retired name uses the engine's directory */
         free(cs->c[i]);
+        eng_cut_drop(db);
     }
     free(cs->c);
     pthread_mutex_destroy(&cs->lock);
@@ -154,9 +156,14 @@ static int cut_get(qcuts *cs, eng *db, qcut **out)
         qcut *c = rc ? NULL : calloc(1, sizeof *c);
         if (rc == 0 && !c)
             rc = TSDB_ERR_NOMEM;
-        if (rc == 0 && (rc = cut_take(db, c)) == 0)
+        if (rc == 0 && (rc = cut_take(db, c)) == 0) {
+            /* The cut holds parts of this engine until the request ends: it holds a reference too (the request's
+             * series each hold one while they run, which is how this thread is here), so a recovery waits for the
+             * request instead of replacing the engine under its parts (part_unref of an obsolete part unlinks
+             * through the engine's directory), and a new engine at the old one's address is never taken for it. */
+            eng_cut_hold(db);
             cs->c[cs->n++] = c;
-        else
+        } else
             free(c);
     }
     *out = rc ? NULL : cs->c[i];

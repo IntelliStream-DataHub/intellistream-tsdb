@@ -30,7 +30,8 @@
 #define DOM_MAX 64
 
 typedef struct dom_vol {
-    int dom;                 /* domain index, -1 outside every domain, -2 not decided yet */
+    atomic_int dom;          /* domain index, -1 outside every domain, -2 not decided yet; workers decide it
+                                concurrently (to the same value), and others read it in dom_enter (review m4) */
     int inflight, counted;   /* under dom_mu: requests inside, and how many of them count as waiting workers */
     atomic_bool recovering;  /* a recovery thread runs */
     atomic_bool diverged;    /* the reopen found lost data: quiesced until tsdbd restarts (sticky) */
@@ -61,7 +62,7 @@ static int dom_of(size_t v)
 {
     if (v == 0 || v >= DOM_MAX_VOLS || dom.ndoms == 0)
         return -1;
-    int d = dom.vol[v].dom;
+    int d = atomic_load(&dom.vol[v].dom);
     if (d != -2)
         return d;
     const char *path = tsdb_volume_path(dom.db, (uint32_t)v);
@@ -76,7 +77,7 @@ static int dom_of(size_t v)
             best_len = n;
         }
     }
-    dom.vol[v].dom = best;
+    atomic_store(&dom.vol[v].dom, best);
     return best;
 }
 
@@ -107,7 +108,7 @@ static int dom_volume_of(uint8_t op, const uint8_t *p, size_t len)
  * is full of requests. */
 static int dom_enter(int v)
 {
-    int d = dom.vol[v].dom, w = 0;
+    int d = atomic_load(&dom.vol[v].dom), w = 0;
     pthread_mutex_lock(&dom.mu);
     bool nonup = atomic_load(&dom.nonup[d]);
     if (nonup && dom.vol[v].inflight >= DOM_CAP) {
@@ -185,6 +186,18 @@ static bool dom_any_nonup(void)
         if (atomic_load(&dom.nonup[d]))
             return true;
     return false;
+}
+
+/* Is a request that entered with v (dom_enter's volume, -1: dom_any_enter, 0: no domain) inside a domain that is not UP?
+ * The recovery of such a domain waits for the request to return. */
+static bool dom_inside_nonup(int v)
+{
+    if (v == -1)
+        return dom_any_nonup();
+    if (v <= 0 || v >= DOM_MAX_VOLS)
+        return false;
+    int d = atomic_load(&dom.vol[v].dom);
+    return d >= 0 && atomic_load(&dom.nonup[d]);
 }
 
 /* A request that names no volume (or names them only inside its handler) while a domain is configured: it may be
@@ -382,7 +395,7 @@ static int dom_init(tsdb *db, char *const *prefixes, int n, void (*waits)(int))
     dom.db = db;
     dom.waits = waits;
     for (int i = 0; i < DOM_MAX_VOLS; i++)
-        dom.vol[i].dom = -2;
+        atomic_store(&dom.vol[i].dom, -2);
     if (n == 0)
         return 0;
     if (n > DOM_MAX) {

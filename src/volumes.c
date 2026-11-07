@@ -106,6 +106,7 @@ struct tsdb {
     const char **names_held;
     char **kept_names; /* name strings of retired engines: tsdb_series_name pointers outlive a reopen */
     size_t nkept, capkept;
+    atomic_int ndeferred;     /* retired engines a multi call's cut still keeps (eng_cut_drop retires them) */
     pthread_mutex_t kept_mu; /* a leaf: guards the three above */
     size_t nheld, held_cap;
     atomic_bool dup_logged; /* a name found in two volumes (damage, or a hand-made copy) is reported once */
@@ -752,6 +753,30 @@ static int vols_grow(tsdb *t)
     return 0;
 }
 
+/* The checks an open makes of a volume's directory before the engine touches it: ROOT_ID names this database, and
+ * META says the volume is number `index` (a directory without either is not this volume: a bare mount point, an
+ * export that did not come back). tsdb_volume_reopen runs them too, before anything of the directory is repaired
+ * or written. *meta_bad (when given): META names another number, or is missing. */
+static int volume_dir_check(tsdb *t, const char *path, uint32_t index, bool *meta_bad)
+{
+    if (meta_bad)
+        *meta_bad = false;
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    char *txt;
+    size_t len;
+    int rc = read_file_all(fd, ROOT_ID_FILE, &txt, &len);
+    if (rc == 0) {
+        rc = strtoull(txt, NULL, 16) == t->id ? 0 : TSDB_ERR_INVALID; /* a volume of another database */
+        free(txt);
+    }
+    if (rc == 0 && (rc = meta_check(fd, path, index)) == TSDB_ERR_CORRUPT && meta_bad)
+        *meta_bad = true;
+    close(fd);
+    return rc;
+}
+
 /* Opens volume `index` (line `index` of VOLUMES) at `path` (canonical, with our ROOT_ID) and lists it. Called
  * without t->lock: the open reads the volume's files, and a volume on a file system that hangs must not hold up
  * the lookups and creations in the volumes already open, which take the lock for reading. Callers open in line
@@ -767,19 +792,7 @@ static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad
     pthread_rwlock_unlock(&t->lock);
     if (listed)
         return 0;
-    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0)
-        return TSDB_ERR_IO;
-    char *txt;
-    size_t len;
-    int rc = read_file_all(fd, ROOT_ID_FILE, &txt, &len);
-    if (rc == 0) {
-        rc = strtoull(txt, NULL, 16) == t->id ? 0 : TSDB_ERR_INVALID; /* a volume of another database */
-        free(txt);
-    }
-    if (rc == 0 && (rc = meta_check(fd, path, index)) == TSDB_ERR_CORRUPT && meta_bad) /* before the engine */
-        *meta_bad = true;
-    close(fd);
+    int rc = volume_dir_check(t, path, index, meta_bad); /* before the engine */
     if (rc)
         return rc;
     eng *e;
@@ -1009,6 +1022,64 @@ static void eng_unref(eng **ep)
 }
 #define EREF __attribute__((cleanup(eng_unref)))
 
+/* A request's cut (tsdb_query_multi) holds parts of an engine until the request ends: part_unref of an obsolete part
+ * unlinks through the engine's directory, and cut_get tells engines by address. That is not a reference in `refs`:
+ * a multi call stuck in another volume (an NFS server away for hours) must not keep this volume from being recovered.
+ * tsdb_volume_reopen swaps the engine in without waiting for cuts and leaves the retired one to the drop of the
+ * last cut. Taken by a series that runs inside the engine (it holds a reference), so the engine cannot be freed. */
+/* names stay valid until tsdb_close */
+static void eng_retire_now_t(tsdb *t, eng *old)
+{
+    eng_retire(old, &t->kept_mu, &t->kept_names, &t->nkept, &t->capkept);
+}
+
+static void eng_retire_now(eng *old)
+{
+    tsdb *t = old->retire_owner;
+    atomic_fetch_sub_explicit(&t->ndeferred, 1, memory_order_relaxed);
+    eng_retire_now_t(t, old);
+}
+
+void eng_cut_hold(eng *e)
+{
+    pthread_mutex_lock(&idle_mu);
+    e->crefs++;
+    pthread_mutex_unlock(&idle_mu);
+}
+
+void eng_cut_drop(eng *e)
+{
+    pthread_mutex_lock(&idle_mu); /* e is not touched after this unlock unless this drop was the one to retire it */
+    bool retire = --e->crefs == 0 && e->retire_deferred;
+    e->retire_deferred = false;
+    pthread_mutex_unlock(&idle_mu);
+    if (retire)
+        eng_retire_now(e);
+}
+
+/* A name, type or class lookup (route_meta) is counted apart: it answers from the dictionaries, which a recovery does
+ * not change before it swaps the engine, so tsdb_volume_idle does not wait for it (a steady stream of lookups kept
+ * `refs` above 0 for as long as clients asked: recovery starved). Only the free of the old engine waits for
+ * `mrefs`, after the swap, when no new lookup can reach it. */
+static eng *eng_ref_meta(eng *e)
+{
+    atomic_fetch_add_explicit(&e->mrefs, 1, memory_order_acq_rel);
+    return e;
+}
+
+static void eng_unref_meta(eng **ep)
+{
+    eng *e = *ep;
+    if (e && atomic_fetch_sub_explicit(&e->mrefs, 1, memory_order_acq_rel) == 1 &&
+        atomic_load_explicit(&e->quiesced, memory_order_acquire)) {
+        pthread_mutex_lock(&idle_mu);
+        pthread_cond_broadcast(&idle_cv);
+        pthread_mutex_unlock(&idle_mu);
+    }
+    *ep = NULL;
+}
+#define EREFM __attribute__((cleanup(eng_unref_meta)))
+
 /* Why the last route of this thread failed, when it was not that the id does not exist: 0 or TSDB_ERR_UNAVAILABLE */
 static __thread int route_rc;
 static int route_fail(int dflt) { return route_rc ? route_rc : dflt; }
@@ -1027,7 +1098,7 @@ static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
         ok = TSDB_SID_LOCAL(id) < eng_series_count(t->vols[v]);
     }
     if (ok) {
-        *e = eng_ref(t->vols[v]);
+        *e = live ? eng_ref(t->vols[v]) : eng_ref_meta(t->vols[v]);
         *local = TSDB_SID_LOCAL(id);
     }
     pthread_rwlock_unlock(&t->lock);
@@ -1457,14 +1528,14 @@ int tsdb_abi_version(void) { return TSDB_ABI_VERSION; }
 
 const char *tsdb_series_name(tsdb *t, tsdb_sid id)
 {
-    eng *e EREF = NULL;
+    eng *e EREFM = NULL;
     uint32_t local;
     return route_meta(t, id, &e, &local) ? eng_series_name(e, local) : NULL;
 }
 
 int tsdb_series_type(tsdb *t, tsdb_sid id, tsdb_type *type)
 {
-    eng *e EREF = NULL;
+    eng *e EREFM = NULL;
     uint32_t local;
     int ty = route_meta(t, id, &e, &local) ? eng_series_type(e, local) : -1;
     if (ty < 0)
@@ -1475,7 +1546,7 @@ int tsdb_series_type(tsdb *t, tsdb_sid id, tsdb_type *type)
 
 int tsdb_series_class(tsdb *t, tsdb_sid id, int *cls)
 {
-    eng *e EREF = NULL;
+    eng *e EREFM = NULL;
     uint32_t local;
     return route_meta(t, id, &e, &local) ? eng_series_class(e, local, cls) : TSDB_ERR_NOTFOUND;
 }
@@ -1606,8 +1677,18 @@ int tsdb_test_meta_use(void *hold) /* what tsdb_series_type does with the engine
 void tsdb_test_meta_release(void *hold)
 {
     meta_hold *h = hold;
-    eng_unref(&h->e);
+    eng_unref_meta(&h->e);
     free(h);
+}
+
+int tsdb_test_deferred_retires(tsdb *t) { return atomic_load_explicit(&t->ndeferred, memory_order_relaxed); }
+
+size_t tsdb_test_kept_names(tsdb *t)
+{
+    pthread_mutex_lock(&t->kept_mu);
+    size_t n = t->nkept;
+    pthread_mutex_unlock(&t->kept_mu);
+    return n;
 }
 
 int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
@@ -1631,6 +1712,14 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     }
     if (test_reopen_hook)
         test_reopen_hook(test_reopen_hook_arg, 0); /* tests: a late route_meta caller takes its reference here */
+    /* The checks of every open, before anything of the directory is repaired or written: a bare mount point or a
+     * restore that came back empty must not be adopted (reval_dicts and wal_relog would fill it, and the open write
+     * a META with volume=0). Nothing has changed yet: the volume stays quiesced and the caller can try again. */
+    int crc = volume_dir_check(t, path, (uint32_t)vol, NULL);
+    if (crc) {
+        free(path);
+        return crc == TSDB_ERR_INVALID ? TSDB_ERR_CORRUPT : crc; /* INVALID is "not idle" above */
+    }
     eng_halt(old);
     /* ha.md 15.5 step 3 and 4: compare the memory of the halted engine with the storage, before the open reads it.
      * Nothing here changes what the old engine knows, so a failed attempt can be repeated. */
@@ -1665,6 +1754,7 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     rep->diverged = rep->lost_parts != 0 || rep->lost_log_bytes != 0;
     if (rep->diverged) /* refused until an operator accepts the loss (tsdb_volume_resume) */
         atomic_store_explicit(&e->quiesced, true, memory_order_release);
+    eng_adopt_names(e, old); /* before anyone can see e: its own copies of the names go, the handed-out ones stay */
     pthread_rwlock_wrlock(&t->lock);
     e->wait_fn = t->wait_fn; /* before anyone can write to it */
     e->wait_ctx = t->wait_ctx;
@@ -1676,10 +1766,22 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
      * check at the top: nothing new can reach the old engine now, so wait for those to give theirs back (eng_unref
      * wakes us: it is quiesced) before eng_retire frees it. */
     pthread_mutex_lock(&idle_mu);
-    while (atomic_load_explicit(&old->refs, memory_order_acquire) > 0)
+    while (atomic_load_explicit(&old->refs, memory_order_acquire) > 0 ||
+           atomic_load_explicit(&old->mrefs, memory_order_acquire) > 0)
         pthread_cond_wait(&idle_cv, &idle_mu);
     pthread_mutex_unlock(&idle_mu);
-    eng_retire(old, &t->kept_mu, &t->kept_names, &t->nkept, &t->capkept); /* names stay valid until tsdb_close */
+    /* cuts of a multi call still running keep the old engine: its last cut retires it (eng_cut_drop). Decided under
+     * idle_mu, where the count changes. */
+    pthread_mutex_lock(&idle_mu);
+    bool defer = old->crefs > 0;
+    if (defer) {
+        old->retire_owner = t;
+        old->retire_deferred = true;
+        atomic_fetch_add_explicit(&t->ndeferred, 1, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&idle_mu);
+    if (!defer)
+        eng_retire_now_t(t, old);
     return 0;
 }
 
@@ -1778,14 +1880,14 @@ int tsdb_state_lookup(tsdb *t, tsdb_sid series, const char *name, uint32_t *code
 
 const char *tsdb_state_name(tsdb *t, tsdb_sid series, uint32_t code)
 {
-    eng *e EREF = NULL;
+    eng *e EREFM = NULL;
     uint32_t local;
     return route_meta(t, series, &e, &local) ? eng_state_name(e, code) : NULL;
 }
 
 const char *tsdb_series_path(tsdb *t, tsdb_sid id)
 {
-    eng *e EREF = NULL;
+    eng *e EREFM = NULL;
     uint32_t local;
     if (!route_meta(t, id, &e, &local))
         return NULL;

@@ -57,6 +57,21 @@ static char ctl[256], root[512];
 static int port;
 static pid_t server;
 
+/* The server runs with login on (users made with the CLI before it starts): "root" for the test's own clients, and
+ * "weak", who may read pump.b and nothing else (the admission-before-rights check). */
+#define ROOT_PW "outage-root-pw"
+#define WEAK_PW "outage-weak-pw"
+static int oconnect_as(const char *user, const char *pw, int ms, tsdbc **c)
+{
+    tsdbc_options o = {0};
+    o.user = user;
+    o.password = pw;
+    o.connect_ms = ms;
+    o.require_auth = 1;
+    return tsdbc_connect_opts("127.0.0.1", port, &o, c);
+}
+#define tsdbc_connect_timeout(host, port_, ms, c) oconnect_as("root", ROOT_PW, ms, c)
+
 static double now_ms(void)
 {
     struct timespec t;
@@ -90,9 +105,9 @@ static pid_t start_server(const char *dir_a, const char *dir_b)
     setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=400,spawn=60000", 1);
     pid_t pid = fork();
     if (pid == 0) {
-        const char *argv[32] = {"tsdbd", "--dir", root, "--port", "0", "--port-file", pf, "--workers", "8", "--no-auth",
-                                follow, "--health-domain", da, "--health-domain", db_};
-        int n = 15;
+        const char *argv[32] = {"tsdbd", "--dir", root, "--port", "0", "--port-file", pf, "--workers", "8",
+                                follow, "--send-timeout", "3", "--health-domain", da, "--health-domain", db_};
+        int n = 16;
         if (getenv("TSDBD_IO")) {
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
@@ -109,6 +124,66 @@ static pid_t start_server(const char *dir_a, const char *dir_b)
     }
     port = p;
     return pid;
+}
+
+/* The CLI beside tsdbd makes the users: root (superuser) and weak (read on pump.b only). */
+static void make_users(const char *dir)
+{
+    const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+    const char *slash = strrchr(bin, '/');
+    char pwf[PATH_MAX + 16], cmd[4 * PATH_MAX];
+    for (int k = 0; k < 2; k++) {
+        snprintf(pwf, sizeof pwf, "%s.pw%d", dir, k);
+        FILE *f = fopen(pwf, "w");
+        if (!f || fprintf(f, "%s\n", k ? WEAK_PW : ROOT_PW) < 0 || fclose(f)) {
+            fprintf(stderr, "cannot write %s\n", pwf);
+            exit(1);
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        int n = snprintf(cmd, sizeof cmd, "%.*stsdb '%s' user ", slash ? (int)(slash - bin + 1) : 0, bin, dir);
+        if (k == 0)
+            snprintf(cmd + n, sizeof cmd - (size_t)n, "add root --superuser --password-file '%s.pw0'", dir);
+        else if (k == 1)
+            snprintf(cmd + n, sizeof cmd - (size_t)n, "add weak --password-file '%s.pw1'", dir);
+        else
+            snprintf(cmd + n, sizeof cmd - (size_t)n, "grant weak read name:pump.b");
+        strcat(cmd, " </dev/null >/dev/null 2>&1");
+        int st = system(cmd);
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+            fprintf(stderr, "make_users: '%s' failed\n", cmd);
+            exit(1);
+        }
+    }
+    for (int k = 0; k < 2; k++) {
+        snprintf(pwf, sizeof pwf, "%s.pw%d", dir, k);
+        unlink(pwf);
+    }
+}
+
+/* Step 4's reader: a client that reads a long reply steadily but slowly (some hundred KB/s, so --send-timeout never cuts
+ * it) and keeps the volume's engine referenced for as long as the server lets it. */
+static tsdb_sid big_id;
+static atomic_bool slow_stop;
+static atomic_int slow_calls;
+static int slow_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ctx, (void)ts, (void)v, (void)n;
+    atomic_fetch_add(&slow_calls, 1);
+    if (atomic_load(&slow_stop))
+        return -1;
+    msleep(300);
+    return 0;
+}
+static void *slow_main(void *arg)
+{
+    (void)arg;
+    tsdbc *c;
+    if (tsdbc_connect_timeout("127.0.0.1", port, 3000, &c))
+        return NULL;
+    tsdbc_query_raw(c, big_id, 0, INT64_MAX / 2, slow_cb, NULL);
+    tsdbc_close(c);
+    return NULL;
 }
 
 /* what the writers saw of one series */
@@ -334,7 +409,20 @@ int main(int argc, char **argv)
     sb.name = "pump.b";
     CHECK(tsdb_series_at(db, sa.name, dir_a, &sa.id) == 0);
     CHECK(tsdb_series_at(db, sb.name, dir_b, &sb.id) == 0);
+    /* a long series on A, for the slow reader (step 4): more than the socket and both output buffers hold */
+    CHECK(tsdb_series_at(db, "big.a", dir_a, &big_id) == 0);
+    {
+        enum { BIG = 6000000 };
+        int64_t *bt = malloc(BIG * sizeof *bt);
+        float *bv = malloc(BIG * sizeof *bv);
+        for (int i = 0; i < BIG; i++)
+            bt[i] = i, bv[i] = (float)(i % 1000) * 0.25f;
+        CHECK(bt && bv && tsdb_insert_series(db, big_id, bt, bv, BIG) == 0);
+        free(bt);
+        free(bv);
+    }
     CHECK(tsdb_close(db) == 0);
+    make_users(root);
 
     server = start_server(dir_a, dir_b);
     pthread_t ta, tb;
@@ -377,6 +465,23 @@ int main(int argc, char **argv)
     }
     if (pc)
         tsdbc_close(pc);
+    /* m3 (security review 0.9.1): a user with no insert right is DENIED, not told that A is full and degraded, by an
+     * unpacked insert of many series (the packed one checked rights first) */
+    {
+        tsdbc *wc;
+        CHECK(oconnect_as("weak", WEAK_PW, 3000, &wc) == 0);
+        if (wc) {
+            CHECK(tsdbc_set_compression(wc, 0) == 0);
+            tsdb_sid ids[2] = {sa.id, sa.id};
+            int64_t ts[2] = {2100000000, 2100000001};
+            float v[2] = {1, 2};
+            int rc = tsdbc_insert(wc, ids, ts, v, 2);
+            if (rc != TSDB_ERR_DENIED)
+                fprintf(stderr, "weak user, unpacked insert on a degraded volume: %d, expected DENIED\n", rc);
+            CHECK(rc == TSDB_ERR_DENIED);
+            tsdbc_close(wc);
+        }
+    }
     msleep(2500);
     CHECK(sb.nacked - b_before > 100);          /* B kept writing */
     /* and at its latency: the packed inserts of A may hold every worker until the domain is seen to be in trouble
@@ -431,6 +536,30 @@ int main(int argc, char **argv)
     server = start_server(dir_a, dir_b);
     verify("restart", &sa);
     verify("restart", &sb);
+
+    /* 4. (m2, security review 0.9.1) a query on A streams to a client that reads slowly but steadily: when A's domain
+     * goes DOWN the reply is cut after --send-timeout (3 s here) instead of keeping the engine referenced, which the
+     * volume's recovery waits for. Without the deadline A stays unavailable for as long as the client reads. */
+    {
+        pthread_t sr;
+        pthread_create(&sr, NULL, slow_main, NULL);
+        msleep(2000);
+        int calls0 = slow_calls;
+        msleep(1000);
+        fprintf(stderr, "slow reader: %d batches a second\n", slow_calls - calls0);
+        CHECK(slow_calls > calls0); /* it reads, steadily: the send timeout is not what ends it */
+        CHECK(fault("hang", dir_a, NULL) == 0);
+        msleep(4500); /* DOWN at 2.5 s, then the next 1 s look of the waiting worker */
+        CHECK(fault("heal", dir_a, NULL) == 0);
+        int rc = await_writes(&sa, 25000);
+        if (rc)
+            fprintf(stderr, "A did not recover while a slow client streams from it: %d\n", rc);
+        CHECK(rc == 0);
+        fprintf(stderr, "slow reader: %d batches in all\n", (int)slow_calls);
+        atomic_store(&slow_stop, true);
+        pthread_join(sr, NULL);
+        CHECK(alive());
+    }
 
     /* 3. a part of A lost while A is down: DIVERGED, and a second outage does not resume it */
     {

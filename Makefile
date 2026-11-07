@@ -856,12 +856,20 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 	        --seconds $(call jsec,20) --seed 1 --crashfs $(B)/libcrashfs.so || exit 1; done
 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
-# power run, and a power run that restarts too rarely fails too.
+# power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too.
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss'; then \
 	        echo "jepsen-selftest: a SIGSEGV in the server went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 10 --crashfs $(B)/libcrashfs.so \
+	    --mutant-idle 2>&1); rc=$$?; \
+	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'it was idle'; then \
+	        echo "jepsen-selftest: a nemesis that sleeps through its naps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so \
+	    --mutant-longnap 2>&1); rc=$$?; \
+	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'restarts in .* it was idle'; then \
+	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	    echo "jepsen-selftest: ok"
 
 # Build and test on AlmaLinux 10 (the main target OS) in Podman; takes minutes, logs in $LOGDIR.
@@ -886,7 +894,7 @@ test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 # The outage shim's own test (Linux only: LD_PRELOAD)
 ifneq ($(UNAME_S),Darwin)
 test: test-outagefs
-test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/test_unavailable $(B)/liboutagefs.so $(B)/tsdbd
+test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/test_unavailable $(B)/liboutagefs.so $(B)/tsdbd $(B)/tsdb
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs /tmp
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_health /tmp
 	for io in $(IO); do echo "== outage, tsdbd --io $$io"; \

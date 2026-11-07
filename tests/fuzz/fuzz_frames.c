@@ -357,7 +357,7 @@ static void run_one(const uint8_t *in, size_t len)
     c->n_out = (note){NULL, c, false}; /* as on_accept: replies push n_out onto note_top, which nobody takes here */
     c->n_done = (note){NULL, c, true};
     pthread_mutex_init(&c->lock, NULL);
-    pthread_cond_init(&c->cv, NULL);
+    conn_cv_init(&c->cv);
     auth_conn_init(&c->auth); /* as on_accept: login required */
     atomic_store(&c->authed, c->auth.state == AS_IN);
     uint32_t seq = 0;

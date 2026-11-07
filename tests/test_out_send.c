@@ -36,8 +36,123 @@ static size_t drain(int fd, uint8_t *to, size_t cap)
     }
 }
 
+/* Security review m1: the send timeout judges bytes consumed per window, not a change of the socket's queue. A client
+ * that takes 1 KB a second changes SIOCOUTQ at every tick and used to hold the connection for as long as it liked;
+ * one that takes 100 KB a second keeps it, however long. */
+static void send_window(void)
+{
+    enum { TO = 2, TICK = 1000 };
+    for (int rate = 0; rate <= 1; rate++) { /* 0: 1 KB/s, 1: 100 KB/s */
+        int64_t t0 = 0, base = -1, acked = 0, now_ms = 0;
+        bool cut = false;
+        int ticks = 0;
+        for (; ticks < 600 && !cut; ticks++) {
+            now_ms += TICK;
+            acked += rate ? 100 * 1024 : 1024;
+            send_window_note(&t0, &base, acked, now_ms, TO);
+            cut = send_window_expired(t0, now_ms, TO);
+        }
+        if (rate == 0)
+            CHECK(cut && ticks <= 4); /* the first reading is the baseline: closed at the first window's end */
+        else
+            CHECK(!cut);
+    }
+    /* just under and just at the minimum rate over one window */
+    int64_t t0 = 0, base = -1;
+    send_window_note(&t0, &base, 0, 0, TO);
+    send_window_note(&t0, &base, (int64_t)TO * SEND_MIN_RATE - 1, 1999, TO);
+    CHECK(send_window_expired(t0, 2000, TO) && base == 0);
+    send_window_note(&t0, &base, (int64_t)TO * SEND_MIN_RATE, 1999, TO);
+    CHECK(!send_window_expired(t0, 2000, TO) && t0 == 1999 && base == (int64_t)TO * SEND_MIN_RATE);
+}
+
+/* Review of the m2 fix (F3): inside a domain that is not UP the deadline of out_wait runs over all the request's
+ * waits, not from each one. A client that reads steadily ends every wait (the main thread broadcasts when a whole
+ * buffer has gone out) well inside --send-timeout, and was never cut, holding the volume's recovery up for as long
+ * as the reply lasted. The "main thread" here empties the output every 0.6 s; the worker, as out_put does, waits
+ * again each time, for up to 12 s (--send-timeout 2). Outside a domain that is not UP, or in a new request, the
+ * clock starts again. */
+typedef struct {
+    conn *c;
+    atomic_bool stop;
+} drainer;
+
+static void *drainer_main(void *arg)
+{
+    drainer *d = arg;
+    while (!atomic_load(&d->stop)) {
+        struct timespec ts = {0, 600 * 1000000L};
+        nanosleep(&ts, NULL);
+        pthread_mutex_lock(&d->c->lock);
+        d->c->out.len = 0; /* a whole buffer has gone out */
+        pthread_cond_broadcast(&d->c->cv);
+        pthread_mutex_unlock(&d->c->lock);
+    }
+    return NULL;
+}
+
+/* waits as a worker does until the connection is closed or `max_ms` have passed; returns the ms it took, -1 if cut not */
+static int waits_until_cut(conn *c, int max_ms)
+{
+    int64_t t0 = mono_ms();
+    while (mono_ms() - t0 < max_ms && !atomic_load(&c->closing)) {
+        pthread_mutex_lock(&c->lock);
+        c->out.len = OUT_CAP + 1; /* the next piece did not fit: wait for space */
+        out_wait(c);
+        pthread_mutex_unlock(&c->lock);
+    }
+    return atomic_load(&c->closing) ? (int)(mono_ms() - t0) : -1;
+}
+
+static void out_wait_deadline(void)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
+        return;
+    conn *c = calloc(1, sizeof *c);
+    c->fd = sv[0];
+    pthread_mutex_init(&c->lock, NULL);
+    conn_cv_init(&c->cv);
+    send_timeout_s = 2;
+    base_workers = running_workers = 8; /* worker_waits must not start an extra worker */
+    dom.ndoms = 1;
+    atomic_store(&dom.vol[1].dom, 0);
+    atomic_store(&dom.nonup[0], true);
+    atomic_store(&c->dom_v, 1);
+    buf_reserve(&c->out, OUT_CAP + 2);
+    drainer d = {.c = c};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, drainer_main, &d) == 0);
+
+    int ms = waits_until_cut(c, 12000);
+    CHECK(ms >= 1800 && ms < 4500); /* --send-timeout from the first wait, over waits that each end after 0.6 s */
+
+    /* a new request (handle() resets the stamp) and a domain that is back up: no cut */
+    atomic_store(&c->closing, false);
+    atomic_store(&c->nonup_since, 0);
+    atomic_store(&dom.nonup[0], false);
+    CHECK(waits_until_cut(c, 4500) == -1);
+    CHECK(atomic_load(&c->nonup_since) == 0);
+
+    /* it went down again after the request had waited a while: the clock starts at its first wait inside */
+    atomic_store(&dom.nonup[0], true);
+    ms = waits_until_cut(c, 12000);
+    CHECK(ms >= 1800 && ms < 4500);
+
+    atomic_store(&d.stop, true);
+    pthread_join(th, NULL);
+    atomic_store(&dom.nonup[0], false);
+    dom.ndoms = 0;
+    close(sv[0]);
+    close(sv[1]);
+    free(c->out.p);
+    free(c);
+}
+
 int main(void)
 {
+    send_window();
+    out_wait_deadline();
     enum { BIG = 256 << 10, MORE = 1024, SMALL = 100 };
     uint8_t *data = malloc(BIG + MORE + SMALL), *got = malloc(BIG + MORE + SMALL);
     for (size_t i = 0; i < BIG + MORE + SMALL; i++)
@@ -65,7 +180,7 @@ int main(void)
     c->n_out = (note){NULL, c, false};
     c->n_done = (note){NULL, c, true};
     pthread_mutex_init(&c->lock, NULL);
-    pthread_cond_init(&c->cv, NULL);
+    conn_cv_init(&c->cv);
 
     /* A reply larger than the socket takes: the worker sends what fits and hands the rest to the loop. */
     struct iovec v = {data, BIG};
