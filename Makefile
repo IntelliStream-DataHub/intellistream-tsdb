@@ -821,7 +821,7 @@ test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 # The outage shim's own test (Linux only: LD_PRELOAD)
 ifneq ($(UNAME_S),Darwin)
 test: test-outagefs
-test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/liboutagefs.so $(B)/tsdbd
+test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/liboutagefs.so $(B)/tsdbd $(B)/tsdb
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs /tmp
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_health /tmp
 	for io in $(IO); do echo "== outage, tsdbd --io $$io"; \

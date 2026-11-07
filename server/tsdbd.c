@@ -245,8 +245,10 @@ typedef struct conn {
     bool eof;           /* the client sent everything it will: reply to it, then close */
     buf sending;
     size_t sent;
-    int64_t tx_t0;      /* when the output last moved (monotonic ms): a send started, or the socket's queue changed */
-    int tx_outq;        /* the socket's unsent and unacknowledged bytes (SIOCOUTQ) at the last tick */
+    int64_t tx_t0;      /* start of the progress window of the output (monotonic ms), see on_tick */
+    int64_t tx_base;    /* what the client had consumed (tx_total - SIOCOUTQ) at tx_t0, -1: not read yet */
+    bool tx_win;        /* a progress window is open: a send is in flight */
+    _Atomic int64_t tx_total; /* bytes handed to the socket so far, by the loop or by a worker (out_send) */
     size_t in_charged;  /* of in.cap, counted in req_held (a buffer grown for a large frame) */
     size_t q_bytes;     /* REQ_COST of the requests in q */
     int64_t frame_t0;   /* when the partial frame in `in` was started (monotonic s), 0: none */
@@ -265,6 +267,7 @@ typedef struct conn {
     pthread_cond_t cv;
     buf out;
     atomic_bool closing;
+    atomic_int dom_v;   /* the volume the request now running is inside (handle), -1: any (it names none), 0: none */
     bool notified;      /* `out` has bytes the main thread was told of (n_out pushed): it sends them */
     bool tx_loop;       /* the main thread sends: a send in flight, bytes left in `sending`, or bytes a worker's
                            send left in `out` or handed it (out_put); the worker only appends until the main thread
@@ -356,6 +359,9 @@ static bool work_stop;
 static int base_workers, running_workers, waiting_workers;
 static pthread_cond_t workers_gone_cv = PTHREAD_COND_INITIALIZER;
 static int send_timeout_s = 60;
+/* A client has to read this many bytes a second of what the server has for it (averaged over --send-timeout), or
+ * its connection is closed: 16 KB/s lets a 100 MB reply take under two hours, and holds a worker no longer. */
+#define SEND_MIN_RATE 16384
 static void *worker_main(void *arg);
 
 /* Bytes of requests held (see the file header): receive buffers grown for large frames, and payloads from
@@ -485,18 +491,37 @@ static void notify(conn *c, bool done)
 
 static inline void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
+static int64_t mono_ms(void);
 #ifndef OUT_WAIT /* tests/fuzz/fuzz_frames.c drains the output instead of waiting for a send */
 #define OUT_WAIT out_wait
 /* Waits, under c->lock, while c's output is over OUT_CAP. It has no deadline of its own: the cv is broadcast only
  * when a whole `sending` buffer (up to OUT_CAP + OUT_PIECE) has gone out, so a deadline here would cut a client
  * that keeps reading, only slower than that buffer per --send-timeout. The tick alone decides (on_tick: output
- * that has not moved for --send-timeout), and conn_close, like the shutdown, sets `closing` and wakes this. While
+ * that is read slower than SEND_MIN_RATE over --send-timeout), and conn_close, like the shutdown, sets `closing` and wakes this. While
  * a worker waits here the main thread has a send in flight on the connection, which the tick watches. */
 static void out_wait(conn *c)
 {
     worker_waits(1);
-    while (c->out.len > OUT_CAP && !atomic_load(&c->closing))
-        pthread_cond_wait(&c->cv, &c->lock);
+    int64_t t0 = mono_ms();
+    while (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
+        if (dom.ndoms == 0) {
+            pthread_cond_wait(&c->cv, &c->lock);
+            continue;
+        }
+        /* A request inside a volume whose domain is not UP: the volume's recovery waits for it to return (the
+         * engine's references), however slowly its client reads (review m2). One wait of --send-timeout seconds
+         * ends it: the connection is closed, as when a message does not fit in memory (out_put). */
+        struct timespec at;
+        clock_gettime(CLOCK_REALTIME, &at);
+        at.tv_sec += 1;
+        pthread_cond_timedwait(&c->cv, &c->lock, &at);
+        if (c->out.len > OUT_CAP && !atomic_load(&c->closing) && mono_ms() - t0 >= send_timeout_s * 1000LL &&
+            dom_inside_nonup(atomic_load(&c->dom_v))) {
+            fprintf(stderr, "tsdbd: connection closed: its client reads too slowly for a volume in recovery\n");
+            atomic_store(&c->closing, true);
+            shutdown(c->fd, SHUT_RDWR);
+        }
+    }
     worker_waits(-1);
 }
 #endif
@@ -526,6 +551,7 @@ static bool out_send(conn *c)
     if (done && done < len)
         memmove(c->out.p, c->out.p + done, len - done);
     c->out.len = len - done;
+    atomic_fetch_add_explicit(&c->tx_total, (int64_t)done, memory_order_relaxed);
     pthread_mutex_lock(&c->lock);
     c->tx_worker = false;
     /* What the socket did not take now waits for it to drain: the main thread sends it, and everything appended
@@ -1405,7 +1431,9 @@ static void handle(req *r)
             reply_error(c, r->id, r->op, rc);
             return;
         }
+        atomic_store(&c->dom_v, dv);
         handle_op(r);
+        atomic_store(&c->dom_v, 0);
         dom_exit(dv);
         return;
     }
@@ -1430,6 +1458,12 @@ static void handle(req *r)
             if (ids) {
                 uint16_t list[DOM_MAX_VOLS];
                 size_t nl;
+                /* rights before admission: a user without them is DENIED whatever the volume's state, or the
+                 * answer would tell which volumes exist and are degraded (review m3) */
+                if ((rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0) {
+                    reply_error(c, r->id, r->op, rc);
+                    return;
+                }
                 if ((rc = dom_enter_ids(ids, n, list, &nl)) != 0) {
                     reply_error(c, r->id, r->op, rc);
                     return;
@@ -1442,7 +1476,9 @@ static void handle(req *r)
     }
     if (dom.ndoms > 0) {
         dom_any_enter();
+        atomic_store(&c->dom_v, -1);
         handle_op(r);
+        atomic_store(&c->dom_v, 0);
         dom_any_exit();
         return;
     }
@@ -2222,8 +2258,11 @@ static void submit_send(conn *c)
         }
     }
     c->send_inflight = true;
-    c->tx_t0 = mono_ms(); /* a send is started only after the last one moved bytes (on_send) */
-    c->tx_outq = -1;     /* the next tick's reading is the baseline, not progress: it would add a second */
+    if (!c->tx_win) { /* the window runs across sends: a send that took a few bytes is not progress by itself */
+        c->tx_win = true;
+        c->tx_t0 = mono_ms();
+        c->tx_base = -1; /* the first tick's reading is the baseline, not progress */
+    }
     if (io == IO_EPOLL) {
         ep_want(c);
         return;
@@ -2593,22 +2632,29 @@ static void on_tick(void)
             conn_close(c);
             continue;
         }
-        /* Output that has not moved for --send-timeout: the client reads nothing. This is the one place that
-         * decides, for a worker waiting for output space (out_wait, which this wakes through conn_close) and for
-         * a reply that fit whole in the two buffers alike (which would otherwise hold up to 2 x (OUT_CAP +
-         * OUT_PIECE) for as long as the client keeps the socket open). A send completes (io_uring) or the socket
-         * turns writable (epoll) only once about a third of its send buffer is free, over a megabyte when the
-         * kernel has grown it, so a client reading slowly but steadily moves no send for long: the socket's queue
-         * (SIOCOUTQ: sent but unacknowledged, and not yet sent) is asked as well, and any change in it is
-         * progress. */
+        /* Output that is not being read: the one place that decides, for a worker waiting for output space
+         * (out_wait, which this wakes through conn_close) and for a reply that fit whole in the two buffers alike
+         * (which would otherwise hold up to 2 x (OUT_CAP + OUT_PIECE) for as long as the client keeps the socket
+         * open). A send completes (io_uring) or the socket turns writable (epoll) only once about a third of its
+         * send buffer is free, over a megabyte when the kernel has grown it, so a client reading slowly but
+         * steadily moves no send for long: what the client has consumed is asked of the socket instead (bytes
+         * handed to it minus SIOCOUTQ, its unsent and unacknowledged bytes). A window of --send-timeout seconds
+         * must see at least SEND_MIN_RATE bytes a second consumed, else the connection is closed; a window that
+         * has seen that starts again. Any change of the queue used to count, so a client reading a few bytes a
+         * minute held a worker (and up to 18 MB of buffers) as long as it liked (review m1). */
         if (c->send_inflight && !c->closed) {
             int q;
-            if (sock_outq(c->fd, &q) == 0 && q != c->tx_outq) {
-                if (c->tx_outq >= 0)
+            if (sock_outq(c->fd, &q) == 0) {
+                int64_t acked = atomic_load_explicit(&c->tx_total, memory_order_relaxed) - q;
+                if (c->tx_base < 0)
+                    c->tx_base = acked;
+                else if (acked - c->tx_base >= (int64_t)send_timeout_s * SEND_MIN_RATE) {
                     c->tx_t0 = now_ms;
-                c->tx_outq = q;
+                    c->tx_base = acked;
+                }
             }
-        }
+        } else
+            c->tx_win = false;
         if (c->send_inflight && !c->closed && now_ms - c->tx_t0 >= send_timeout_s * 1000LL) {
             if (send_logged != now) {
                 send_logged = now;
@@ -2631,6 +2677,7 @@ static void on_send(conn *c, ssize_t res)
         return;
     }
     c->sent += (size_t)res;
+    atomic_fetch_add_explicit(&c->tx_total, (int64_t)res, memory_order_relaxed);
     submit_send(c);
     finish_if_drained(c);
 }
