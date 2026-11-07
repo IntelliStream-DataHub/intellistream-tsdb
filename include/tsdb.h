@@ -155,6 +155,14 @@ typedef struct tsdb_options {
                               * every such part at zstd_level: with others, or alone once its partition is idle
                               * (merge_idle_s; with merge_idle_s = -1 or merge_threads = 0 a part no merge
                               * combines stays as inserted). -1: zstd_level, as merges (the earlier behaviour) */
+    int stats;               /* statistics of what is stored (docs/design-stats.md). -1: off (no event ring, no sweeper
+                              * thread: tsdb_get_volume_stats' column totals stay 0); 0 (default): lazy, the sweeper
+                              * starts at the first tsdb_get_volume_stats or tsdb_stats_settle call; 1: it starts with
+                              * the open and follows it (tsdbd's default). Query counters (tsdb_query_totals) count
+                              * with 0 and 1, and not with -1. Per-series statistics (tsdb_series_stats) work with
+                              * all three: they are computed when asked and keep nothing */
+    int stats_sweep_mb_s;    /* the sweeper reads at most this many MB/s of granule indexes (a hard cap: more work
+                              * makes the numbers older, never the sweeper dearer); 0: 256; negative: no cap */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -706,6 +714,19 @@ typedef struct tsdb_query_stats {
 } tsdb_query_stats;
 void tsdb_last_query_stats(tsdb_query_stats *out);
 
+/* What every thread's queries on this handle did since it was opened (the sums of tsdb_query_stats over the outermost
+ * queries, QUERY_MULTI counted once per call). Counted in per-thread blocks without atomic read-modify-writes, so
+ * a total read while queries run may lag by the queries in flight. All 0 with tsdb_options.stats = -1. */
+typedef struct tsdb_query_totals {
+    uint64_t queries;
+    uint64_t rows_decoded, rows_from_stats, rows_from_memtable; /* rows covered, by source */
+    uint64_t bytes_read;            /* compressed bytes of the granules decoded */
+    uint64_t parts, granules, granules_from_stats;
+    uint64_t result_rows;           /* rows, or buckets, returned */
+    uint64_t query_ns;              /* wall time inside the queries */
+} tsdb_query_totals;
+int tsdb_query_totals_get(tsdb *db, tsdb_query_totals *out);
+
 /* ---- maintenance ---- */
 int tsdb_optimize(tsdb *db);                /* merge every partition down to one part */
 /* Drops whole partitions that end at or before ts. A slow series' partitions are 7, 28 or 364 base partitions
@@ -745,8 +766,54 @@ typedef struct tsdb_volume_stats {
     uint64_t pinned_bytes;   /* heap the listed parts' index copies take (pin_index; 0 without it); a part a
                                 merge replaced keeps its copy, uncounted, until the last query reading it ends */
     int failed;              /* fail-stop state of this volume (see tsdb_failed) */
+    /* What the listed parts hold, from the granule index (docs/design-stats.md section 2.3), kept by the stats
+     * sweeper (tsdb_options.stats): exact for the parts it has counted, which is every part once
+     * stats_parts_counted == stats_parts_listed. The first call of a lazy sweeper (stats = 0) starts it and sees
+     * 0 until it has walked the parts; tsdb_stats_settle waits for it. All 0 with stats = -1. */
+    uint64_t logical_bytes;  /* rows x (8 + width of the series' type): what the rows would take uncompressed */
+    uint64_t ts_bytes, value_bytes, index_bytes; /* compressed timestamps and values; granule index entries */
+    uint64_t other_bytes;    /* part headers, footers, tombstones, the fixed part of each index */
+    uint64_t stats_parts_counted, stats_parts_listed;
+    uint64_t stats_ring_overflows; /* events the ring dropped (the sweeper then compared its records with the list) */
+    uint64_t stats_cpu_ns;   /* CPU time of the sweeper thread */
 } tsdb_volume_stats;
 int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
+
+/* Starts the sweepers (when stats = 0) and waits until each has handled the parts listed or unlisted before the call
+ * (and any it put off, a follower's parts ahead of its SERIES, do not hold it), for at most timeout_ms. 0, or
+ * TSDB_ERR_UNAVAILABLE when time ran out. For tools that print the totals once (tsdb DIR stats) and for tests;
+ * a server reads tsdb_volume_stats as it is. Negative stats = -1 volumes return 0 at once. */
+int tsdb_stats_settle(tsdb *db, int timeout_ms);
+
+/* Storage numbers of series, computed when asked from the granule index and the memtables, kept nowhere: 176 bytes
+ * a record (the wire record of design-stats.md section 5.1). "Physical": rows and bytes as stored, including rows a
+ * newer write, a tombstone or retention hides until a merge removes them. Every field after `flags` is 0 when
+ * `status` is not 0 (TSDB_ERR_NOTFOUND for an id the database does not have). */
+typedef struct tsdb_series_stat {
+    int32_t status;
+    uint8_t cls, type;
+    uint16_t flags;            /* TSDB_SSTAT_* */
+    uint64_t rows;             /* in parts and memtables */
+    uint64_t nulls;            /* in parts (memtable rows are not scanned for nulls) */
+    uint64_t memtable_rows;    /* active, flushing and (a follower) WAL tails */
+    uint64_t logical_bytes;    /* part rows x (8 + width of the type) */
+    uint64_t ts_bytes, value_bytes;
+    uint64_t index_bytes;      /* the series' share of the granule indexes: its entries and run records */
+    uint64_t tomb_bytes;       /* 24 x its tombstones */
+    uint64_t parts, partitions, granules, full_granules; /* full: a granule of granule_rows rows */
+    int64_t first_ts, last_ts; /* stored rows (first raised to the retention cutoff); 0 with TSDB_SSTAT_NO_RANGE */
+    int64_t last_write_ms;     /* the newest part holding it (its `written`, one flush old) or memtable creation */
+    uint64_t resident_bytes;   /* reserved: 0 */
+    uint64_t reads_est, reads_err, writes_est, writes_err; /* reserved: 0 */
+    uint64_t live_rows;        /* reserved: 0 */
+} tsdb_series_stat;
+enum {
+    TSDB_SSTAT_NO_RANGE = 2,   /* no stored row at or after the retention cutoff: first_ts and last_ts are 0 */
+};
+/* ids[0..n): n up to 65,536 (TSDB_ERR_INVALID above); flags must be 0 (RESIDENT and EXACT_ROWS are not built). out
+ * has n records. The call spends at most 100 million index probes (about a second of one core): it may stop with
+ * *done < n, and the caller asks again for ids[done..]. *done records are filled, in request order. */
+int tsdb_series_stats(tsdb *db, const tsdb_sid *ids, size_t n, int flags, tsdb_series_stat *out, size_t *done);
 
 /* A small write (one that goes through the WAL) into the keys of a large insert, replace or delete that has not
  * published its parts yet waits for that publish, so it does not win over a write that came before it. For as long
@@ -859,7 +926,7 @@ size_t tsdb_struct_size(int kind);
 /* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
  * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
  * number they were written for when they load the library and refuse another. */
-#define TSDB_ABI_VERSION 3 /* Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
+#define TSDB_ABI_VERSION 4 /* Statistics: tsdb_options.stats and stats_sweep_mb_s (design-stats.md steps 1-2). Before it:  Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
  * expected topology one export of one pool). tsdb_health_open starts a monitor thread; every domain added gets a
  * probe thread that reads 4 KiB with O_DIRECT from <dir>/PROBE every second and writes and fdatasyncs 4 KiB to
  * <dir>/PROBE.<node> every 5 s. Probes may hang for as long as the server is away; nothing else of the process

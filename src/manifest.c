@@ -616,6 +616,7 @@ int follow_refresh(eng *db)
             db->follow_active = m.wal_active;
             pthread_mutex_unlock(&db->buf_lock);
             pthread_mutex_unlock(&db->lock);
+            stats_list_swapped(db); /* no per-part events for a swapped list: the sweeper diffs it with its records */
             for (size_t i = 0; i < nold; i++)
                 part_unref(old[i]);
             free(old);

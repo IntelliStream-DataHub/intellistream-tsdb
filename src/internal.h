@@ -1120,9 +1120,35 @@ int sched_leave(void);
 void *qscratch_get(int slot, size_t bytes);
 void qscratch_put(void *p);
 
+/* ---- statistics (stats.c, docs/design-stats.md) ----
+ * Query counters: one block per (thread, handle), written by its owner with plain relaxed stores, summed by readers.
+ * Storage numbers: list changes push an event (db->lock held), a sweeper thread walks each part's index once. */
+typedef struct qreg qreg;
+enum { QC_QUERIES, QC_ROWS_DECODED, QC_ROWS_STATS, QC_ROWS_MEM, QC_BYTES_READ, QC_PARTS, QC_GRANULES,
+       QC_GRANULES_STATS, QC_RESULT_ROWS, QC_NS, QC_N };
+qreg *qreg_new(void);
+void qreg_close(qreg *r); /* the handle's reference: blocks of threads that outlive the handle stay valid */
+void qreg_add(qreg *r, const uint64_t v[QC_N]);
+void qreg_totals(qreg *r, uint64_t out[QC_N]);
+
+struct estats;
+void stats_start(eng *db, bool reconcile); /* idempotent; does nothing with stats = -1 */
+void stats_stop(eng *db);
+void stats_push(eng *db, part *p, int kind); /* db->lock held (or the open, single-threaded) */
+enum { STAT_EV_ADD = 1, STAT_EV_REMOVE = 2 };
+void stats_list_swapped(eng *db); /* a follower replaced its whole list */
+void stats_fill(eng *db, tsdb_volume_stats *vs);
+int stats_settle(eng *db, int timeout_ms);
+/* per-series numbers of one chunk of ids (sorted ascending, at most 256) from one cut of the engine */
+typedef struct sscx sscx;
+sscx *sscx_open(eng *db);
+void sscx_close(sscx *x);
+void sscx_run(sscx *x, const uint32_t *ids, size_t m, tsdb_series_stat *out, uint64_t *probes);
+
 /* One outermost query's statistics and scheduler group (volumes.c). */
 typedef struct qrun {
     qstats q;
+    qreg *reg; /* the handle's counters, NULL: not counted */
     bool outer;
     struct timespec t0;
     sgroup g; /* the threads it may use (request_threads); a query inside a multi call uses the call's */
@@ -1448,11 +1474,28 @@ struct eng {
     atomic_bool failed;
     atomic_int refs;       /* callers inside this engine through the tsdb handle (volumes.c, ha.md 15.5 step 2) */
     atomic_bool quiesced;  /* no new caller: the volume is being recovered */
+    /* statistics (stats.c): `stats` exists once the sweeper has started and is freed by eng_close; `stats_on` is
+     * set (under db->lock, after `stats` is complete) while list changes push events into its ring */
+    _Atomic(struct estats *) stats;
+    atomic_bool stats_on;
+    atomic_flag stats_starting;
     bool retiring;         /* eng_close keeps the names of the dictionaries (eng_retire) */
     pthread_mutex_t fail_lock; /* innermost; held only to fill fail_msg */
     pthread_mutex_t dir_sync_lock; /* eng_sync_dir; inside every lock but fail_lock */
     char fail_msg[256];
 };
+
+/* the list functions' hooks (db.c): one branch while statistics are off */
+static inline void stats_ev_add(eng *db, part *p)
+{
+    if (UNLIKELY(atomic_load_explicit(&db->stats_on, memory_order_acquire)))
+        stats_push(db, p, STAT_EV_ADD);
+}
+static inline void stats_ev_remove(eng *db, part *p)
+{
+    if (UNLIKELY(atomic_load_explicit(&db->stats_on, memory_order_acquire)))
+        stats_push(db, p, STAT_EV_REMOVE);
+}
 
 /* Fail-stop. After a storage error that leaves durable state uncertain (a
  * failed WAL write or fdatasync, a failed directory fsync after a publish, a
