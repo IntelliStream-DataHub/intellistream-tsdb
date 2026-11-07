@@ -26,7 +26,8 @@ static int cl_usage(void)
     fprintf(stderr,
             "usage: tsdb cluster init PEER --secret-file F [--replication 3] [--min-isr 1] [--node-timeout-ms 3000]\n"
             "            [--heartbeat-ms 500] [--isr-lag-ms 1000] [--out-after-s 1800] [--voter-replace-s 600]\n"
-            "            [--voters 5] [--volumes-per-server 16]\n"
+            "            [--voters 5] [--volumes-per-server 16] [--mode replicated|shared]\n"
+            "            [--failover lease|attested|bmc] [--read-barrier on|off] [--lease-s 10]\n"
             "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
             "       tsdb cluster status PEER --secret-file F\n"
             "       tsdb cluster secret FILE    (makes a new secret file, mode 0600; never overwrites one)\n"
@@ -71,9 +72,13 @@ static void print_status(const struct cluster_status *st)
         sprintf(u + 2 * i, "%02x", m.uuid[i]);
     if (m.initialised)
         printf("cluster %s replication %" PRIu32 " min_isr %" PRIu32 " node_timeout_ms %" PRIu32
-               " heartbeat_ms %" PRIu32 " voter_replace_s %" PRIu32 " voters_max %" PRIu32 "\n",
+               " heartbeat_ms %" PRIu32 " voter_replace_s %" PRIu32 " voters_max %" PRIu32 " mode %s failover %s"
+               " read_barrier %s lease_s %" PRIu32 " restore_gen %" PRIu64 "\n",
                u, m.set.replication, m.set.min_isr, m.set.node_timeout_ms, m.set.heartbeat_ms,
-               m.set.voter_replace_s, m.set.voters);
+               m.set.voter_replace_s, m.set.voters, m.mode == META_MODE_SHARED ? "shared" : "replicated",
+               m.set.failover == META_FAILOVER_BMC ? "bmc" : m.set.failover == META_FAILOVER_ATTESTED ? "attested"
+                                                                                                     : "lease",
+               m.set.read_barrier ? "on" : "off", m.set.lease_s, m.restore_gen);
     else
         printf("cluster %s (not initialised)\n", u);
     raft_config cfg = {0};
@@ -139,6 +144,7 @@ int cluster_cli(int argc, char **argv)
     }
     struct meta_settings s;
     meta_settings_default(&s);
+    int mode = META_MODE_REPLICATED;
     struct {
         const char *flag;
         uint32_t *v;
@@ -150,10 +156,35 @@ int cluster_cli(int argc, char **argv)
                 {"--out-after-s", &s.out_after_s},
                 {"--voter-replace-s", &s.voter_replace_s},
                 {"--voters", &s.voters},
-                {"--volumes-per-server", &s.volumes_per_server}};
+                {"--volumes-per-server", &s.volumes_per_server},
+                {"--lease-s", &s.lease_s}};
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--secret-file") && i + 1 < argc) {
             secret_file = argv[++i];
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--mode")) {
+            mode = !strcmp(argv[i + 1], "shared") ? META_MODE_SHARED
+                   : !strcmp(argv[i + 1], "replicated") ? META_MODE_REPLICATED : 0;
+            if (!mode)
+                return cl_usage();
+            i++;
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--failover")) {
+            s.failover = !strcmp(argv[i + 1], "lease") ? META_FAILOVER_LEASE
+                         : !strcmp(argv[i + 1], "attested") ? META_FAILOVER_ATTESTED
+                         : !strcmp(argv[i + 1], "bmc") ? META_FAILOVER_BMC : 99;
+            if (s.failover == 99)
+                return cl_usage();
+            i++;
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--read-barrier")) {
+            if (strcmp(argv[i + 1], "on") && strcmp(argv[i + 1], "off"))
+                return cl_usage();
+            s.read_barrier = !strcmp(argv[i + 1], "on");
+            i++;
             continue;
         }
         size_t k = 0;
@@ -188,7 +219,7 @@ int cluster_cli(int argc, char **argv)
     int op;
     if (!strcmp(verb, "init")) {
         op = CLUSTER_OP_INIT;
-        rl = cluster_settings_encode(&s, req);
+        rl = cluster_settings_encode(&s, mode, req);
     } else if (!strcmp(verb, "node")) {
         op = CLUSTER_OP_NODE_ADD;
         size_t n = strlen(newpeer);

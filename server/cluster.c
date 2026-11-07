@@ -404,24 +404,29 @@ const char *cluster_strerror(int rc)
     }
 }
 
-size_t cluster_settings_encode(const struct meta_settings *s, uint8_t *out)
+size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out)
 {
-    const uint32_t v[9] = {s->replication, s->min_isr,         s->node_timeout_ms,
-                           s->heartbeat_ms, s->isr_lag_ms,     s->out_after_s,
-                           s->voter_replace_s, s->voters,      s->volumes_per_server};
-    for (int i = 0; i < 9; i++)
+    const uint32_t v[13] = {s->replication,     s->min_isr,       s->node_timeout_ms, s->heartbeat_ms,
+                            s->isr_lag_ms,      s->out_after_s,   s->voter_replace_s, s->voters,
+                            s->volumes_per_server, s->failover,   s->read_barrier,    s->lease_s,
+                            (uint32_t)mode};
+    for (int i = 0; i < 13; i++)
         for (int j = 0; j < 4; j++)
             out[i * 4 + j] = (uint8_t)(v[i] >> (8 * j));
-    return 36;
+    return 52;
 }
 
-static int settings_decode(struct rd *r, struct meta_settings *s)
+static int settings_decode(struct rd *r, struct meta_settings *s, int *mode)
 {
-    uint32_t v[9];
-    for (int i = 0; i < 9; i++)
+    uint32_t v[13];
+    for (int i = 0; i < 13; i++)
         v[i] = get32(r);
-    *s = (struct meta_settings){v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]};
-    return r->bad ? -1 : 0;
+    *s = (struct meta_settings){.replication = v[0], .min_isr = v[1], .node_timeout_ms = v[2], .heartbeat_ms = v[3],
+                                .isr_lag_ms = v[4], .out_after_s = v[5], .voter_replace_s = v[6], .voters = v[7],
+                                .volumes_per_server = v[8], .failover = (uint8_t)v[9],
+                                .read_barrier = (uint8_t)v[10], .lease_s = v[11]};
+    *mode = (int)v[12];
+    return r->bad || v[9] > 255 || v[10] > 255 ? -1 : 0;
 }
 
 int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status *st)
@@ -833,6 +838,7 @@ static struct {
     uint64_t init_conn;
     uint32_t init_reqid;
     struct meta_settings init_set;
+    int init_mode;
     uint32_t reserved_id;
     uint64_t pend_join; /* set around propose() by a NODE_ADD: the new server's link (struct pend) */
 
@@ -2052,7 +2058,8 @@ static const char *leader_peer(void)
 static void admin_init(struct conn *c, uint32_t reqid, struct rd *r)
 {
     struct meta_settings s;
-    if (settings_decode(r, &s) != 0) {
+    int mode;
+    if (settings_decode(r, &s, &mode) != 0) {
         admin_reply(c->serial, reqid, META_ERR_FORMAT, NULL, 0);
         return;
     }
@@ -2099,6 +2106,7 @@ static void admin_init(struct conn *c, uint32_t reqid, struct rd *r)
     C.init_conn = c->serial;
     C.init_reqid = reqid;
     C.init_set = s;
+    C.init_mode = mode;
 }
 
 /* NODE_ADD (§2.2), on the leader. The new server's id comes from the log, never from this leader's memory: PROBE asks
@@ -2196,6 +2204,7 @@ static void on_probe_reply(struct conn *c, struct rd *r)
     if (c->join != 1)
         return;
     struct meta_member mb = {0};
+    mb.flags = META_MF_ALL;
     int32_t rc = (int32_t)get32(r);
     uint32_t has = get32(r);
     mb.incarnation = get64(r);
@@ -2724,14 +2733,14 @@ static void leader_duties(uint64_t now)
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
         return;
     if (C.init_pending && !C.sm.initialised) {
-        struct meta_member first = {.id = C.id, .state = META_UP, .incarnation = C.incarnation};
+        struct meta_member first = {.id = C.id, .state = META_UP, .incarnation = C.incarnation, .flags = META_MF_ALL};
         snprintf(first.addr, sizeof first.addr, "%s", C.adv);
         snprintf(first.peer, sizeof first.peer, "%s", C.padv);
         snprintf(first.rack, sizeof first.rack, "%s", C.rack);
         memcpy(first.ident, C.ident, 16);
         struct meta_entry e;
         meta_entry_init(&e);
-        meta_op_init(&e, C.uuid, &C.init_set, &first);
+        meta_op_init(&e, C.uuid, &C.init_set, &first, C.init_mode, META_LEVEL);
         C.init_pending = 0;
         propose(&e, C.init_conn, C.init_reqid, 0);
         return;

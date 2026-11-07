@@ -30,7 +30,7 @@ void cluster_stop(void);
 /* ---- the admin ops (`tsdb cluster ...`), sent to a server's peer address */
 
 enum cluster_admin_op {
-    CLUSTER_OP_INIT = 1,     /* body: struct meta_settings, 9 u32; on a server that is in no cluster */
+    CLUSTER_OP_INIT = 1,     /* body: struct meta_settings (12 u32) and the mode (u32); on a server in no cluster */
     CLUSTER_OP_NODE_ADD = 2, /* body: the new server's peer address; on the Raft leader */
     CLUSTER_OP_STATUS = 3,   /* no body; on any server */
 };
@@ -86,7 +86,7 @@ int cluster_make_secret(const char *path, char *err, size_t errn);
 void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *const *part, const size_t *len,
                         uint8_t out[32]);
 
-/* The INIT body for `s` (36 bytes). */
-size_t cluster_settings_encode(const struct meta_settings *s, uint8_t *out);
+/* The INIT body for `s` and the deployment's mode, an enum meta_mode (52 bytes). */
+size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);
 
 #endif

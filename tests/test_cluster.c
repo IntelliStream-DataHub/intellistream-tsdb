@@ -407,7 +407,7 @@ static void init_cluster(int i, uint32_t replace_s)
     s.voter_replace_s = replace_s;
     uint8_t req[64], *reply;
     size_t len;
-    size_t rl = cluster_settings_encode(&s, req);
+    size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
     int rc = admin(i, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
     free(reply);
     if (rc != 0)
@@ -729,7 +729,7 @@ static void scen_life(void)
         struct meta_settings s;
         meta_settings_default(&s);
         uint8_t req[64], *reply;
-        size_t len, rl = cluster_settings_encode(&s, req);
+        size_t len, rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
         int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
         free(reply);
         if (rc != CLUSTER_ERR_EXISTS)
@@ -970,7 +970,7 @@ static void scen_initcrash(void)
     s.node_timeout_ms = 1500;
     s.heartbeat_ms = 200;
     uint8_t req[64], *rep = NULL;
-    size_t rl = cluster_settings_encode(&s, req), len;
+    size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req), len;
     char addr[META_ADDR_MAX], err[1024];
     peer_of(0, addr, sizeof addr);
     int rc;
@@ -1000,7 +1000,7 @@ static void scen_dirsync(void)
     struct meta_settings s;
     meta_settings_default(&s);
     uint8_t req[META_ADDR_MAX + 64], *rep = NULL;
-    size_t n = cluster_settings_encode(&s, req), len;
+    size_t n = cluster_settings_encode(&s, META_MODE_REPLICATED, req), len;
     char addr[META_ADDR_MAX], err[1024];
     peer_of(0, addr, sizeof addr);
     int rc;
