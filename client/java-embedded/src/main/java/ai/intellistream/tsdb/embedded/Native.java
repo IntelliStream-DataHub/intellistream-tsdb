@@ -24,6 +24,7 @@ import java.util.function.IntToLongFunction;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_DOUBLE;
 import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
@@ -227,13 +228,27 @@ final class Native {
             PTR.withName("on_deferred"),
             PTR.withName("hook_ctx")).withName("tsdb_multi_opts");
 
+    static final StructLayout LATEST = MemoryLayout.structLayout(
+            JAVA_INT.withName("status"),
+            JAVA_BYTE.withName("kind"),
+            JAVA_BYTE.withName("type"),
+            MemoryLayout.paddingLayout(2),
+            JAVA_LONG.withName("ts"),
+            JAVA_LONG.withName("v")).withName("tsdb_latest_result");
+
+    static final StructLayout LATEST_OPTS = MemoryLayout.structLayout(
+            JAVA_LONG.withName("end"),
+            PTR.withName("ends"),
+            JAVA_INT.withName("with_nulls"),
+            JAVA_INT.withName("threads")).withName("tsdb_latest_opts");
+
     /* tsdb_multi_kind and the trim flags */
     static final int MULTI_VALUES = 1, MULTI_BUCKETS = 2, MULTI_SPREAD = 3, MULTI_TWA = 4, MULTI_LTTB = 5;
     static final int MULTI_TRIM_LO = 1, MULTI_TRIM_HI = 2;
 
     /** Every struct, for the layout test, in the order of the C enum tsdb_struct_kind (tsdb_struct_size). */
     static final StructLayout[] ALL_STRUCTS = {OPTIONS, VALUES, BUCKET, POINTS, GROUP, QUERY_OPTS, QUERY_STATS, STATS,
-        PART_INFO, SPREAD_BUCKET, TWA_OPTS, TWA_BUCKET, MULTI_QUERY, SERIES_RESULT, MULTI_OPTS};
+        PART_INFO, SPREAD_BUCKET, TWA_OPTS, TWA_BUCKET, MULTI_QUERY, SERIES_RESULT, MULTI_OPTS, LATEST, LATEST_OPTS};
 
     static long offset(StructLayout s, String field) {
         return s.byteOffset(MemoryLayout.PathElement.groupElement(field));
@@ -474,6 +489,7 @@ final class Native {
     static final MethodHandle QUERY_TWA_BOUNDS = fn("tsdb_query_twa_bounds",
             i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
     static final MethodHandle QUERY_MULTI_COLLECT = fn("tsdb_query_multi_collect", i(PTR, PTR, PTR, SIZE_T, PTR, PTR));
+    static final MethodHandle LATEST_CALL = fn("tsdb_latest", i(PTR, PTR, SIZE_T, PTR, PTR));
     static final MethodHandle SERIES_RESULTS_FREE = fn("tsdb_series_results_free",
             FunctionDescriptor.ofVoid(PTR, SIZE_T));
     static final MethodHandle QUERY_LTTB_EX = fn("tsdb_query_lttb_ex",

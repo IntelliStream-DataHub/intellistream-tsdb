@@ -2,6 +2,8 @@ package ai.intellistream.tsdb.embedded;
 
 import ai.intellistream.tsdb.Column;
 import ai.intellistream.tsdb.Group;
+import ai.intellistream.tsdb.Latest;
+import ai.intellistream.tsdb.LatestOptions;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.TsdbException;
@@ -118,6 +120,22 @@ class TcpCompareTest {
             assertTrue(server.isAlive() && port > 0, () -> "tsdbd did not serve: " + read(log));
             try (EmbeddedDb db = EmbeddedDb.open(dir.toString(), new EmbeddedOptions().readOnly(true));
                  TsdbClient tcp = TsdbClient.connect("127.0.0.1", port)) {
+                /* the newest row of every series, both doors: unbounded, with nulls, bounded (the deleted and the
+                 * replaced ranges, the nulls at i % 97 == 5), by id and by name, and an id nobody has */
+                long[] lids = {ids[0], ids[1], ids[2], ids[3], ids[4], (1L << 32) | 999_999};
+                String[] lnames = {names[0], names[1], names[2], names[3], names[4], "no.such.series"};
+                for (LatestOptions lo : new LatestOptions[] {LatestOptions.defaults(),
+                    LatestOptions.defaults().withNulls(true), LatestOptions.defaults().end(T0 + 1200 * 60_000L),
+                    LatestOptions.defaults().end(T0 + 2000 * 60_000L + 1).withNulls(true),
+                    LatestOptions.defaults().end(T0 + 5 * 60_000L).withNulls(true),
+                    LatestOptions.defaults().ends(new long[] {T0 + 7 * 60_000L, T0, T0 + 1, T0 + 1_000_000L,
+                        Long.MAX_VALUE, T0})}) {
+                    assertEquals(tcp.latest(lids, lo).toString(), db.latest(lids, lo).toString(), "latest " + lo);
+                    assertEquals(tcp.latestByName(lnames, lo).toString(), db.latestByName(lnames, lo).toString(),
+                            "latest by name " + lo);
+                }
+                assertEquals(Latest.Kind.VALUE, db.latest(lids[1]).get(0).get().kind());
+                assertEquals(ai.intellistream.tsdb.Status.ERR_NOTFOUND, db.latest(lids).get(5).status());
                 for (int k = 0; k < names.length; k++) {
                     long id = ids[k];
                     assertEquals(tcp.series(names[k], false), id);

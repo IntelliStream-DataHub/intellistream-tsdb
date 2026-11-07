@@ -272,6 +272,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_group
 	./$(B)/test_lttb
 	B=$(B) tests/test_cli_lttb.sh
+	B=$(B) tests/test_cli_latest.sh
 	./$(B)/test_twa
 	./$(B)/test_spread
 	B=$(B) tests/test_cli_spread.sh

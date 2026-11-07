@@ -71,6 +71,10 @@ static void usage(void)
             "  volume list                        list the volumes, the database directory first\n"
             "  upgrade                            carry a database closed cleanly by the previous release\n"
             "                                     (disk format 8) over to this one, in place; stop followers first\n"
+            "  latest NAME... [--with-nulls] [--end TIME]\n"
+            "                                     the newest value of each series, one line each: name, time,\n"
+            "                                     value (no row: \\N \\N; with --with-nulls a null row: time \\N);\n"
+            "                                     --end: only rows before TIME\n"
             "  stats                              rows, parts, size, compression ratio, where the bytes go\n"
             "  stats series NAME...               rows, bytes, parts and range of each series\n"
             "  parts                              list active parts (partition class and range)\n"
@@ -809,6 +813,75 @@ static int cmd_stats_series(tsdb *db, int n, char **names)
     return 0;
 }
 
+/* `tsdb DIR latest NAME... [--with-nulls] [--end TIME]`: tsdb_latest for the named series, one TSV line each. */
+static int cmd_latest(tsdb *db, int argc, char **argv)
+{
+    tsdb_latest_opts lo = {.end = TSDB_TS_MAX};
+    const char **names = malloc((size_t)(argc > 0 ? argc : 1) * sizeof *names);
+    int n = 0;
+    if (!names)
+        die("latest", TSDB_ERR_NOMEM);
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--with-nulls") == 0) {
+            lo.with_nulls = 1;
+        } else if (strcmp(argv[i], "--end") == 0 && i + 1 < argc) {
+            if (!parse_time(argv[++i], &lo.end)) {
+                fprintf(stderr, "tsdb: cannot parse --end \"%s\"\n", argv[i]);
+                free(names);
+                return 2;
+            }
+        } else {
+            names[n++] = argv[i];
+        }
+    }
+    if (n < 1 || n > (1 << 20))
+        usage();
+    tsdb_sid *ids = malloc((size_t)n * sizeof *ids);
+    tsdb_latest_result *out = malloc((size_t)n * sizeof *out);
+    if (!ids || !out)
+        die("latest", TSDB_ERR_NOMEM);
+    for (int i = 0; i < n; i++) {
+        int rc = tsdb_series_lookup(db, names[i], &ids[i]);
+        if (rc)
+            die(names[i], rc);
+    }
+    int rc = tsdb_latest(db, ids, (size_t)n, &lo, out);
+    if (rc)
+        die("latest", rc);
+    for (int i = 0; i < n; i++) {
+        const tsdb_latest_result *r = &out[i];
+        char tb[40];
+        if (r->status != 0)
+            die(names[i], r->status);
+        put_name(stdout, names[i]);
+        if (r->kind == TSDB_LATEST_NONE) {
+            fputs("\t\\N\t\\N\n", stdout);
+            continue;
+        }
+        format_time(r->ts, tb, sizeof tb);
+        printf("\t%s\t", tb);
+        if (r->kind == TSDB_LATEST_NULL) {
+            fputs("\\N\n", stdout);
+            continue;
+        }
+        switch (r->type) {
+        case TSDB_FLOAT32: printf("%.9g\n", (double)r->v.f32); break;
+        case TSDB_FLOAT64: printf("%.17g\n", r->v.f64); break;
+        case TSDB_INT64: printf("%" PRId64 "\n", r->v.i64); break;
+        case TSDB_BOOL: printf("%s\n", r->v.b ? "true" : "false"); break;
+        default: {
+            const char *sn = tsdb_state_name(db, ids[i], r->v.state);
+            put_name(stdout, sn ? sn : "?");
+            putchar('\n');
+        }
+        }
+    }
+    free(names);
+    free(ids);
+    free(out);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
@@ -926,6 +999,10 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "volume") == 0) {
         for (uint32_t i = 0; i < tsdb_volume_count(db); i++)
             printf("%u\t%s\n", i, tsdb_volume_path(db, i));
+    } else if (strcmp(cmd, "latest") == 0) {
+        rc = cmd_latest(db, argc - 3, argv + 3);
+        if (rc)
+            ret = rc;
     } else if (strcmp(cmd, "stats") == 0 && argc >= 4 && strcmp(argv[3], "series") == 0) {
         rc = cmd_stats_series(db, argc - 4, argv + 4);
     } else if (strcmp(cmd, "stats") == 0) {
