@@ -105,6 +105,7 @@ struct tsdb {
     const char **names_held;
     char **kept_names; /* name strings of retired engines: tsdb_series_name pointers outlive a reopen */
     size_t nkept, capkept;
+    atomic_int ndeferred;     /* retired engines a multi call's cut still keeps (eng_cut_drop retires them) */
     pthread_mutex_t kept_mu; /* a leaf: guards the three above */
     size_t nheld, held_cap;
     atomic_bool dup_logged; /* a name found in two volumes (damage, or a hand-made copy) is reported once */
@@ -1000,8 +1001,40 @@ static void eng_unref(eng **ep)
 }
 #define EREF __attribute__((cleanup(eng_unref)))
 
-void eng_cut_hold(eng *e) { eng_ref(e); }
-void eng_cut_drop(eng *e) { eng_unref(&e); }
+/* A request's cut (tsdb_query_multi) holds parts of an engine until the request ends: part_unref of an obsolete part
+ * unlinks through the engine's directory, and cut_get tells engines by address. That is not a reference in `refs`:
+ * a multi call stuck in another volume (an NFS server away for hours) must not keep this volume from being recovered.
+ * tsdb_volume_reopen swaps the engine in without waiting for cuts and leaves the retired one to the drop of the
+ * last cut. Taken by a series that runs inside the engine (it holds a reference), so the engine cannot be freed. */
+/* names stay valid until tsdb_close */
+static void eng_retire_now_t(tsdb *t, eng *old)
+{
+    eng_retire(old, &t->kept_mu, &t->kept_names, &t->nkept, &t->capkept);
+}
+
+static void eng_retire_now(eng *old)
+{
+    tsdb *t = old->retire_owner;
+    atomic_fetch_sub_explicit(&t->ndeferred, 1, memory_order_relaxed);
+    eng_retire_now_t(t, old);
+}
+
+void eng_cut_hold(eng *e)
+{
+    pthread_mutex_lock(&idle_mu);
+    e->crefs++;
+    pthread_mutex_unlock(&idle_mu);
+}
+
+void eng_cut_drop(eng *e)
+{
+    pthread_mutex_lock(&idle_mu); /* e is not touched after this unlock unless this drop was the one to retire it */
+    bool retire = --e->crefs == 0 && e->retire_deferred;
+    e->retire_deferred = false;
+    pthread_mutex_unlock(&idle_mu);
+    if (retire)
+        eng_retire_now(e);
+}
 
 /* A name, type or class lookup (route_meta) is counted apart: it answers from the dictionaries, which a recovery does
  * not change before it swaps the engine, so tsdb_volume_idle does not wait for it (a steady stream of lookups kept
@@ -1627,6 +1660,8 @@ void tsdb_test_meta_release(void *hold)
     free(h);
 }
 
+int tsdb_test_deferred_retires(tsdb *t) { return atomic_load_explicit(&t->ndeferred, memory_order_relaxed); }
+
 size_t tsdb_test_kept_names(tsdb *t)
 {
     pthread_mutex_lock(&t->kept_mu);
@@ -1714,7 +1749,18 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
            atomic_load_explicit(&old->mrefs, memory_order_acquire) > 0)
         pthread_cond_wait(&idle_cv, &idle_mu);
     pthread_mutex_unlock(&idle_mu);
-    eng_retire(old, &t->kept_mu, &t->kept_names, &t->nkept, &t->capkept); /* names stay valid until tsdb_close */
+    /* cuts of a multi call still running keep the old engine: its last cut retires it (eng_cut_drop). Decided under
+     * idle_mu, where the count changes. */
+    pthread_mutex_lock(&idle_mu);
+    bool defer = old->crefs > 0;
+    if (defer) {
+        old->retire_owner = t;
+        old->retire_deferred = true;
+        atomic_fetch_add_explicit(&t->ndeferred, 1, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&idle_mu);
+    if (!defer)
+        eng_retire_now_t(t, old);
     return 0;
 }
 

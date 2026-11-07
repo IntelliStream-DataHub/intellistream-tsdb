@@ -268,6 +268,8 @@ typedef struct conn {
     buf out;
     atomic_bool closing;
     atomic_int dom_v;   /* the volume the request now running is inside (handle), -1: any (it names none), 0: none */
+    _Atomic int64_t nonup_since; /* when this request first waited for output inside a domain that is not UP
+                            (monotonic ms), 0: not yet; reset by handle() for every request (out_wait) */
     bool notified;      /* `out` has bytes the main thread was told of (n_out pushed): it sends them */
     bool tx_loop;       /* the main thread sends: a send in flight, bytes left in `sending`, or bytes a worker's
                            send left in `out` or handed it (out_put); the worker only appends until the main thread
@@ -492,35 +494,68 @@ static void notify(conn *c, bool done)
 static inline void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
 static int64_t mono_ms(void);
+/* The clock of c->cv: monotonic where the platform lets a cv have it (a step of the wall clock must not stretch or
+ * cut a wait); macOS has no pthread_condattr_setclock. */
+#ifdef __APPLE__
+#define CV_CLOCK CLOCK_REALTIME
+#else
+#define CV_CLOCK CLOCK_MONOTONIC
+#endif
+static void conn_cv_init(pthread_cond_t *cv)
+{
+#ifdef __APPLE__
+    pthread_cond_init(cv, NULL);
+#else
+    pthread_condattr_t at;
+    pthread_condattr_init(&at);
+    pthread_condattr_setclock(&at, CV_CLOCK);
+    pthread_cond_init(cv, &at);
+    pthread_condattr_destroy(&at);
+#endif
+}
 #ifndef OUT_WAIT /* tests/fuzz/fuzz_frames.c drains the output instead of waiting for a send */
 #define OUT_WAIT out_wait
-/* Waits, under c->lock, while c's output is over OUT_CAP. It has no deadline of its own: the cv is broadcast only
- * when a whole `sending` buffer (up to OUT_CAP + OUT_PIECE) has gone out, so a deadline here would cut a client
- * that keeps reading, only slower than that buffer per --send-timeout. The tick alone decides (on_tick: output
- * that is read slower than SEND_MIN_RATE over --send-timeout), and conn_close, like the shutdown, sets `closing` and wakes this. While
- * a worker waits here the main thread has a send in flight on the connection, which the tick watches. */
+/* Waits, under c->lock, while c's output is over OUT_CAP. Outside a domain that is not UP it has no deadline of its
+ * own: the cv is broadcast only when a whole `sending` buffer (up to OUT_CAP + OUT_PIECE) has gone out, so a deadline
+ * per wait would cut a client that keeps reading, only slower than that buffer per --send-timeout. The tick decides
+ * there (on_tick: output that is read slower than SEND_MIN_RATE over --send-timeout), and conn_close, like the
+ * shutdown, sets `closing` and wakes this. While a worker waits here the main thread has a send in flight on the
+ * connection, which the tick watches.
+ * Inside a domain that is not UP the request holds the volume's recovery up (the engine's references), however
+ * steadily its client reads: the deadline is then --send-timeout from the request's first wait there, over all its
+ * waits (nonup_since, reset for each request), not from each wait: the waits end whenever a whole buffer has gone
+ * out, which a client above 9 MB per --send-timeout would restart for ever. */
 static void out_wait(conn *c)
 {
     worker_waits(1);
-    int64_t t0 = mono_ms();
     while (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
-        if (dom.ndoms == 0) {
-            pthread_cond_wait(&c->cv, &c->lock);
-            continue;
+        bool nonup = dom.ndoms > 0 && dom_inside_nonup(atomic_load(&c->dom_v));
+        if (!nonup) {
+            /* the domain is up (or none is configured): the request holds no recovery up */
+            atomic_store_explicit(&c->nonup_since, 0, memory_order_relaxed);
+            if (dom.ndoms == 0) {
+                pthread_cond_wait(&c->cv, &c->lock);
+                continue;
+            }
+        } else {
+            /* A request inside a volume whose domain is not UP: the volume's recovery waits for it to return (the
+             * engine's references), however steadily its client reads (review m2). --send-timeout seconds from its
+             * first wait here end it: the connection is closed, as when a message does not fit in memory (out_put).
+             * Checked on entering as well as after a timed wait: a wait that a broadcast ends ends before the check. */
+            int64_t now = mono_ms(), since = atomic_load_explicit(&c->nonup_since, memory_order_relaxed);
+            if (since == 0)
+                atomic_store_explicit(&c->nonup_since, now, memory_order_relaxed);
+            else if (now - since >= send_timeout_s * 1000LL) {
+                fprintf(stderr, "tsdbd: connection closed: its client reads too slowly for a volume in recovery\n");
+                atomic_store(&c->closing, true);
+                shutdown(c->fd, SHUT_RDWR);
+                break;
+            }
         }
-        /* A request inside a volume whose domain is not UP: the volume's recovery waits for it to return (the
-         * engine's references), however slowly its client reads (review m2). One wait of --send-timeout seconds
-         * ends it: the connection is closed, as when a message does not fit in memory (out_put). */
-        struct timespec at;
-        clock_gettime(CLOCK_REALTIME, &at);
+        struct timespec at; /* the domain's state changes without this cv being signalled: look again within 1 s */
+        clock_gettime(CV_CLOCK, &at);
         at.tv_sec += 1;
         pthread_cond_timedwait(&c->cv, &c->lock, &at);
-        if (c->out.len > OUT_CAP && !atomic_load(&c->closing) && mono_ms() - t0 >= send_timeout_s * 1000LL &&
-            dom_inside_nonup(atomic_load(&c->dom_v))) {
-            fprintf(stderr, "tsdbd: connection closed: its client reads too slowly for a volume in recovery\n");
-            atomic_store(&c->closing, true);
-            shutdown(c->fd, SHUT_RDWR);
-        }
     }
     worker_waits(-1);
 }
@@ -1416,6 +1451,8 @@ static void handle(req *r)
     int rc = 0;
     auth_conn *a = &c->auth;
     uint8_t was = a->state;
+    atomic_store_explicit(&c->nonup_since, 0, memory_order_relaxed); /* a new request: its time inside a domain
+                                                                         * that is not UP starts again (out_wait) */
     if ((rc = auth_fresh(a)) != 0 || (rc = auth_check(a, r->op, p, len)) != 0) {
         if (rc == TSDB_ERR_AUTH) { /* not logged in, or the user was dropped: the connection closes */
             if (was == AS_NONE || was == AS_STARTED)
@@ -2756,7 +2793,7 @@ static void on_accept(int fd)
     c->recv_ev = (ev){EV_RECV, c};
     c->send_ev = (ev){EV_SEND, c};
     pthread_mutex_init(&c->lock, NULL);
-    pthread_cond_init(&c->cv, NULL);
+    conn_cv_init(&c->cv);
     auth_conn_init(&c->auth);
     atomic_store(&c->authed, c->auth.state == AS_IN); /* --no-auth: logged in from the start */
     c->t_open = mono_s();

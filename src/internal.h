@@ -1449,6 +1449,11 @@ struct eng {
     atomic_int refs;       /* callers inside this engine through the tsdb handle (volumes.c, ha.md 15.5 step 2) */
     atomic_int mrefs;      /* name, type and class lookups on it (route_meta): they never block a recovery's idle wait,
                             * only the free of a retired engine (a steady stream of lookups must not starve it) */
+    int crefs;             /* request cuts (qcuts) holding parts of this engine (eng_cut_hold), under idle_mu: they keep
+                            * the engine's memory and directory alive past a recovery, never count in `refs` (a recovery
+                            * must not wait for a call that is stuck in another volume) */
+    bool retire_deferred;  /* tsdb_volume_reopen swapped it out while a cut was still held: the last cut retires it */
+    void *retire_owner;    /* the tsdb handle it does that for */
     uint32_t adopted_series, adopted_states; /* the first names the next engine took over (eng_adopt_names) */
     atomic_bool quiesced;  /* no new caller: the volume is being recovered */
     bool retiring;         /* eng_close keeps the names of the dictionaries (eng_retire) */
@@ -1676,7 +1681,8 @@ typedef struct qcuts {
 /* One engine's cut on its own (latest.c): taken, then released, by the caller; the qcut is not heap-allocated. */
 int cut_take(struct eng *db, qcut *c);
 void cut_release(qcut *c);
-/* A request's cuts (qcuts) hold a reference on each engine they cut, for tsdb_volume_idle (volumes.c) */
+/* A request's cuts (qcuts) keep each engine they cut allocated, with its directory open, until the request ends;
+ * a recovery does not wait for them (volumes.c: the engine it replaced is retired by the last cut's drop) */
 void eng_cut_hold(struct eng *db);
 void eng_cut_drop(struct eng *db);
 extern __thread qcuts *cur_cuts; /* the multi-series request this thread works for; NULL elsewhere */
@@ -1842,6 +1848,7 @@ void tsdb_test_reopen_hook(void (*fn)(void *, int phase), void *arg);
 void *tsdb_test_meta_hold(struct tsdb *t, tsdb_sid id);
 int tsdb_test_meta_use(void *hold);
 void tsdb_test_meta_release(void *hold);
+int tsdb_test_deferred_retires(struct tsdb *t); /* retired engines a multi call's cut still keeps */
 size_t tsdb_test_kept_names(struct tsdb *t); /* name strings of retired engines still kept (not adopted by a new one) */
 /* test hook: the WAL tail kept for switches, and how far segments are unlinked (durably) */
 void tsdb_test_wal_state(struct tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced);

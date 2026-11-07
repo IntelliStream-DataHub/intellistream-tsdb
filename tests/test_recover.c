@@ -446,6 +446,7 @@ static void merge_clears_loss(void)
 /* ------------------------------------------- security review 0.9.1, minor */
 
 size_t tsdb_test_kept_names(tsdb *t);
+int tsdb_test_deferred_retires(tsdb *t);
 
 static int dir_entries(const char *dir)
 {
@@ -584,11 +585,12 @@ static void lookups_do_not_starve_idle(void)
     tsdb_close(db);
 }
 
-/* m4: a tsdb_query_multi call holds the engines it cut until it ends: the volume is not idle while the call runs,
- * so it is not reopened under the parts the call still references (their last unref unlinks through the engine's
- * directory), and a new engine at the old one's address is never mistaken for it. The call's first series is on
- * the root and blocks in the callback; the volume's series ran ahead, finished (its own reference is gone) and
- * waits for its turn, holding the call's cut of the volume. */
+/* m4: a tsdb_query_multi call keeps the engines it cut allocated until it ends (the last unref of a part it still
+ * references unlinks through the engine's directory, and a new engine at the old one's address must never be mistaken
+ * for it), but never holds up a recovery: a call stuck in another domain (here: blocked in its callback on the root)
+ * must not keep this volume from going idle and being reopened. The volume's series ran ahead, finished (its own
+ * reference is gone) and waits for its turn, holding the call's cut of the volume. The reopen swaps the engine in at
+ * once and leaves the old one to the call's end. */
 typedef struct {
     tsdb *db;
     tsdb_sid ids[2];
@@ -635,14 +637,14 @@ static void multi_cut_holds_volume(void)
         sleep_ms(5);
     sleep_ms(300); /* the volume's series ran ahead on the helper thread and waits for its turn: no series is in it */
     OK(tsdb_volume_quiesce(db, 1));
-    CHECK(tsdb_volume_idle(db, 1, 300) == 1); /* but the call's cut of it is */
-    CHECK(tsdb_volume_reopen(db, 1, NULL) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_idle(db, 1, 300) == 0); /* the call's cut of it does not count */
+    OK(tsdb_volume_reopen(db, 1, NULL));      /* nor does it hold the swap up */
+    CHECK(tsdb_test_deferred_retires(db) == 1); /* the old engine waits for the call's end */
+    OK(tsdb_volume_resume(db, 1));
     __atomic_store_n(&h.release, 1, __ATOMIC_SEQ_CST);
     pthread_join(th, NULL);
     CHECK(h.rc == 0 || h.rc == TSDB_ERR_UNAVAILABLE);
-    CHECK(tsdb_volume_idle(db, 1, 5000) == 0);
-    OK(tsdb_volume_reopen(db, 1, NULL));
-    OK(tsdb_volume_resume(db, 1));
+    CHECK(tsdb_test_deferred_retires(db) == 0); /* retired by the last cut's drop, parts released first */
     tsdb_close(db);
 }
 

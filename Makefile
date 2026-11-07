@@ -801,6 +801,10 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --mutant-idle 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that sleeps through its naps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so \
+	    --mutant-longnap 2>&1); rc=$$?; \
+	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'restarts in .* it was idle'; then \
+	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	    echo "jepsen-selftest: ok"
 
 # Build and test on AlmaLinux 10 (the main target OS) in Podman; takes minutes, logs in $LOGDIR.

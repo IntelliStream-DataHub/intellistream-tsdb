@@ -17,9 +17,12 @@ Hardening from the 0.9.1 security review (the minor findings). No format or prot
   worker and up to 18 MB of buffers for as long as it liked. A window of `--send-timeout` seconds must now see
   16 KB/s of the output consumed by the client (bytes handed to the socket minus what is still queued). A slow but
   steady reader above that rate is served whole as before. Test: `send_window` in `tests/test_out_send.c`.
-- **tsdbd: a query streaming to a slow client no longer blocks the recovery of its volume.** While the request is
-  inside a health domain that is not up, a worker waiting for output space gives up after `--send-timeout` in one
-  wait and the connection is closed. Test: `tests/test_outage.c` (step 4).
+- **tsdbd: a query streaming to a slow client no longer holds up the recovery of its volume for long.** While the
+  request is inside a health domain that is not up, the connection is closed `--send-timeout` seconds after the
+  request's first wait for output space there, over all its waits (not from each wait: a client that takes a whole
+  output buffer, up to 9 MB, in less than the timeout ended every wait in time and was never cut). A request that
+  does not wait for output (a hung volume call, a client that reads quickly and the reply ends) is not limited
+  by this. Tests: `tests/test_outage.c` (step 4), `out_wait_deadline` in `tests/test_out_send.c`.
 - **tsdbd: rights are checked before domain admission** for an unpacked many-series INSERT and INSERT_VALUES, so a
   user without the right gets `TSDB_ERR_DENIED` whether or not a volume is down (it answered `UNAVAILABLE` for a
   volume the user could not see, leaking volume numbers). `tests/test_outage.c`, step 1.
@@ -28,12 +31,16 @@ Hardening from the 0.9.1 security review (the minor findings). No format or prot
   repairs or writes anything (an empty directory where the volume was, such as a mount point whose export did not
   come back, was adopted); a recovery no longer keeps every name of the volume until `tsdb_close` (the new engine
   takes over the old one's strings); name, type and class lookups no longer keep `tsdb_volume_idle` from returning
-  (a steady stream of them starved recovery); and a `tsdb_query_multi` call holds the engines it cut until it ends,
-  so a volume is not reopened under the parts of its cut. Tests: `tests/test_recover.c`.
+  (a steady stream of them starved recovery); and a `tsdb_query_multi` call keeps the engines it cut allocated, with
+  their directories open, until it ends (the recovery swaps the new engine in at once and the call's end retires the old
+  one), so a part of its cut is not unlinked through a closed directory, and it never waits for a call that is stuck
+  in another volume. Tests: `tests/test_recover.c`.
 - **jepsen**: the power nemesis's "was idle" check measures how long the nemesis takes to notice a server that
   died by itself (median reaction, the harness's own restarts excluded), not a count of restarts, which failed
-  under machine load with no violations. `make jepsen-selftest` plants a nemesis that sleeps through its naps
-  (`--mutant-idle`) and requires the check to fail.
+  under machine load with no violations; and it fails a run in which the nemesis restarted the server less than once
+  every 2 s, which a load-independent floor (the busiest run had 60 restarts in 20 s) leaves to honest runs. The
+  reaction line is always printed. `make jepsen-selftest` plants a nemesis that sleeps through its naps
+  (`--mutant-idle`) and one that naps 5 s at a time (`--mutant-longnap`) and requires the check to fail for both.
 
 ## [0.9.1] - 2026-11-07
 
