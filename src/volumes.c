@@ -1698,8 +1698,8 @@ void tsdb_test_dict_fault(tsdb *t, int (*fn)(void *arg, int point, const char *n
 /* Volume 0's latest-table hook (tests/test_latest.c): called with LH_* at the points ltab.c names. */
 void tsdb_test_latest_hook(tsdb *t, void (*fn)(void *, int), void *arg)
 {
-    t->vols[0]->lt_hook_arg = arg;
-    t->vols[0]->lt_hook = fn;
+    __atomic_store_n(&t->vols[0]->lt_hook_arg, arg, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->vols[0]->lt_hook, fn, __ATOMIC_RELEASE);
 }
 
 void tsdb_test_midplace(tsdb *t, void (*fn)(void *), void *arg)

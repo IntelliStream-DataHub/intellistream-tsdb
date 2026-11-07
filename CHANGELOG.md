@@ -6,6 +6,22 @@ All notable changes to tsdb are listed here, newest first. The format follows
 [docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.9.x release may still change the
 disk format and the wire protocol.
 
+## [Unreleased]
+
+### Added
+
+- **The latest table** (engine, `docs/design-latest.md` step 2): per volume, the newest non-null row of every series in
+  the parts (or a bound on it), kept exact by every listing of parts (flush, insert, replay, delete, replace), by
+  retention and by `tsdb_drop_before`, and filled by a background warmer. `tsdb_latest` answers from it in O(1) and
+  falls back to the slow path for an entry that is unknown. New option `latest_cache` (bytes; `tsdb_options_init` sets
+  RAM/16, 0 turns the table off; followers have none). Large flushes (50,000 series or more) store their rows in a
+  window that lookups can read.
+
+### Changed
+
+- The embedded C ABI is version 4 (`tsdb_options` gained `latest_cache`); the Rust, Python and Java embedded options
+  have `latest_cache`. Disk format and wire protocol are unchanged.
+
 ## [0.9.1] - 2026-11-07
 
 A patch release: **two data fixes**, storage outage handling for NFS, macOS as a developer platform, and smaller

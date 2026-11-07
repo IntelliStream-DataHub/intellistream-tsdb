@@ -289,6 +289,15 @@ static void lt_wait_window(ltab *t)
     pthread_mutex_unlock(&t->pmu);
 }
 
+/* The test hook (tsdb_test_latest_hook): set and cleared by a test while the warmer and the lookups run, so its
+ * pointers go through atomics (the function last stored, the argument before it). */
+static void lt_hook(eng *db, int at)
+{
+    latest_hook_fn fn = __atomic_load_n(&db->lt_hook, __ATOMIC_ACQUIRE);
+    if (fn)
+        fn(__atomic_load_n(&db->lt_hook_arg, __ATOMIC_RELAXED), at);
+}
+
 /* The write lock, once no window is open: every writer but the window's owner (retention, drops, the warmer) comes
  * through here. */
 static void lt_wrlock(ltab *t)
@@ -316,7 +325,7 @@ static int lt_window_min = 50000;
 
 void tsdb_test_latest_window(int min)
 {
-    lt_window_min = min;
+    __atomic_store_n(&lt_window_min, min, __ATOMIC_RELAXED);
 }
 
 /* A flush's write section (3.2). A short fold list: lt_begin. A long one: the window. 1. Under the write lock, make the
@@ -338,7 +347,7 @@ void lt_begin_flush(eng *db, lt_sec *sec, part **ps, size_t n)
         for (size_t k = 0; k < ps[i]->nlf; k++)
             maxid = MAX(maxid, ps[i]->lf[k].series);
     }
-    if (!t || tomb || cnt < (size_t)lt_window_min) {
+    if (!t || tomb || cnt < (size_t)__atomic_load_n(&lt_window_min, __ATOMIC_RELAXED)) {
         lt_begin(db, sec);
         return;
     }
@@ -354,8 +363,8 @@ void lt_begin_flush(eng *db, lt_sec *sec, part **ps, size_t n)
         for (size_t k = 0; k < p->nlf; k++, seen++) {
             const lfold *f = &p->lf[k];
             lt_ent e;
-            if (seen == cnt / 2 && db->lt_hook) /* tests: lookups run with half the stores made */
-                db->lt_hook(db->lt_hook_arg, LH_WINDOW_MID);
+            if (seen == cnt / 2) /* tests: lookups run with half the stores made */
+                lt_hook(db, LH_WINDOW_MID);
             if ((f->series >> LT_PAGE_BITS) >= t->npg || !lt_load(t, f->series, &e))
                 continue;
             lt_ent nx = fold_next(t, f, e);
@@ -377,8 +386,7 @@ void lt_begin_flush(eng *db, lt_sec *sec, part **ps, size_t n)
                 lt_store(t, f->series, &nx);
         }
     }
-    if (db->lt_hook)
-        db->lt_hook(db->lt_hook_arg, LH_FOLD_BEFORE_LIST);
+    lt_hook(db, LH_FOLD_BEFORE_LIST);
     pthread_rwlock_wrlock(&t->rw);
     sec->win = true;
 }
@@ -813,8 +821,7 @@ static void lookup_hold(eng *db, const uint32_t *local, size_t m, const int64_t 
         x->cutoff = eng_cutoff(db, local[i]); /* inside the hold: a lengthened limit marks entries in one section */
         lmc_read(fl, local[i], visible, &x->f);
     }
-    if (db->lt_hook)
-        db->lt_hook(db->lt_hook_arg, LH_LOOKUP_AFTER_ENTRY);
+    lt_hook(db, LH_LOOKUP_AFTER_ENTRY);
     for (size_t a = 0; act && a < m; a += LH_SUB) {
         size_t b = a + LH_SUB < m ? a + LH_SUB : m;
         pthread_mutex_lock(&db->buf_lock);
@@ -1043,16 +1050,14 @@ static int warm_batch(eng *db, ltab *t, uint32_t *ids, size_t n, bool floor_mode
     c.nms = c.ntails = 0;
     c.has_active = false;
     latest_row *out = malloc(n * sizeof *out);
-    if (db->lt_hook)
-        db->lt_hook(db->lt_hook_arg, LH_WARM_AFTER_CUT);
+    lt_hook(db, LH_WARM_AFTER_CUT);
     rc = out ? eng_latest_fill(db, &c, ids, n, out) : TSDB_ERR_NOMEM;
     cut_release(&c);
     if (rc) {
         free(out);
         return WS_ERR;
     }
-    if (db->lt_hook)
-        db->lt_hook(db->lt_hook_arg, LH_WARM_BEFORE_STORE);
+    lt_hook(db, LH_WARM_BEFORE_STORE);
     pthread_rwlock_wrlock(&t->rw);
     if (t->lgen != g) {
         pthread_rwlock_unlock(&t->rw);

@@ -362,6 +362,20 @@ cgroup, so `nice` does not keep your work out of its way.
   crashfs) is the fault shim; `test_outage` and jepsen's `outage` nemesis use it. mmap page faults are not gated by
   the shim. Not built yet: mountinfo discovery, parking and BUSY, a per-volume bounded queue, SIGTERM with a stuck call,
   metrics, the volumes cache, parallel open.
+- **The latest table** (`src/ltab.c`, `docs/design-latest.md`). Per series it holds the newest non-null row in the
+  parts, or a bound on it (unknown); it is read and written only under `latest_rw` (`lt->rw`), and every write section
+  bumps the volume's `lgen`. Writers: publishers (in the write section that lists their parts, after `parts_commit`,
+  folding each part's newest non-null row and null range; a flush of 50,000 series or more goes through the window:
+  its unlocked stores only ever store the flush's own row, the rest is noted and applied in the closing section while
+  `pending` makes every other writer wait), retention lengthening, `tsdb_drop_before` (the floor), a merge that lists
+  across a retention change (`ret_gen`), and the warmer, the only filler, which stores a parts-only search only if
+  `lgen` is unchanged since its cut and no window is open. Lookups never write it. Whoever makes an entry unknown gives
+  it a correct bound and hints its id to the warmer. A new listing point must fold there, nulls included; anything else
+  that removes live rows (other than rows hidden by a tombstone of a later block, rows a later write overwrote or rows
+  already expired) must bump `lgen` in a write section and make the entries it may affect unknown. The table must
+  always give the slow path's answer (`tests/test_latest.c` compares both after every random step). Entry words are
+  loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
+  `latest_rw` is never held across I/O. Followers have no table.
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has

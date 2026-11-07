@@ -1,6 +1,6 @@
 # The latest point of every series, from a sharded in-memory table
 
-Status: design, not implemented. Branch `latest-design`, written on 2026-11-06 from main at ea89968, revised the
+Status: design; step 1 (the slow path) is on main, step 2 (the table, `src/ltab.c`) is built on branch `latest-s2`. Branch `latest-design`, written on 2026-11-06 from main at ea89968, revised the
 same day after a correctness review and a performance review, again after a verification of both, and a third time
 after a second verification and a simplification review that took the user's answers below into account (what
 changed in each round: "Changes after review", at the end).
