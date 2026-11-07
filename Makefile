@@ -591,6 +591,10 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
+# the latest table's flush and lookup benchmark (embedded; uses the test knobs of internal.h): not part of `all`
+$(B)/latest-bench: tools/latest-bench.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
