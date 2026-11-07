@@ -251,7 +251,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `TSDB_ERR_NOTFOUND` for lookups). A 32-bit variable, `%u`, Java `int`, Rust `as u32` or Python `"I"` that holds an
   id is a bug that tests with ids above 2^32 find; row files of the benchmarks keep a u32 series NUMBER that indexes
   the bench's table of ids, never an id. Ids are never reused and mean nothing in another database (export and
-  import name series, not ids). `tsdb_abi_version` (3 in 0.9.0 and 0.9.1) changes when the C structs or signatures the bindings use change.
+  import name series, not ids). `tsdb_abi_version` (3 in 0.9.0 and 0.9.1, 4 with the statistics) changes when the C structs or signatures the bindings use change.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
   only into partitions without a part from that segment.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never

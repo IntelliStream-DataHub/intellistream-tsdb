@@ -31,6 +31,9 @@
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
  *         [--verify-checksums] [--pin-index] [--metrics-port N|auto [--metrics-bind ADDR]]
  *
+ * --no-stats turns the statistics of what is stored off (no sweeper thread, no query counters, no column totals
+ * in the metrics; docs/design-stats.md). On by default: the sweeper follows the open.
+ *
  * --metrics-port serves Prometheus metrics (GET /metrics) on a port of its own, from a
  * thread of its own: see metrics.c. Off by default; binds to --listen unless --metrics-bind.
  *
@@ -3123,6 +3126,7 @@ int main(int argc, char **argv)
     int port = TSDB_DEFAULT_PORT, nworkers = (int)sysconf(_SC_NPROCESSORS_ONLN);
     tsdb_options o;
     tsdb_options_init(&o);
+    o.stats = 1;          /* statistics follow the open (docs/design-stats.md); --no-stats turns them off */
     o.create_volumes = 0; /* a client names a volume an operator added (tsdb-cli volume add), never a new one */
     static struct option opts[] = {{"dir", required_argument, 0, 'd'},        {"listen", required_argument, 0, 'l'},
                                    {"port", required_argument, 0, 'p'},       {"workers", required_argument, 0, 'w'},
@@ -3154,6 +3158,7 @@ int main(int argc, char **argv)
                                    {"login-timeout", required_argument, 0, 'O'},
                                    {"exit-with-parent", optional_argument, 0, 'E'},
                                    {"health-domain", required_argument, 0, 0x100},
+                                   {"no-stats", no_argument, 0, 0x101},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0, no_auth = 0;
     char *health_domains[DOM_MAX];
@@ -3216,6 +3221,7 @@ int main(int argc, char **argv)
         case 'W': lttb_max_threshold = (uint64_t)num_arg("lttb-max-threshold", optarg, 3, LLONG_MAX); break;
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'A': no_auth = 1; break;
+        case 0x101: o.stats = -1; break;
         case 'E':
             start_ppid = getppid();
             if (start_ppid == 1) { /* the parent is gone already (or never was one to follow) */
@@ -3261,7 +3267,7 @@ int main(int argc, char **argv)
                         "             [--lttb-max-threshold 16777216]\n"
                         "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
                         "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n"
-                        "             [--health-domain PREFIX]...\n",
+                        "             [--health-domain PREFIX]... [--no-stats]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }

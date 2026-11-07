@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -310,6 +311,29 @@ static void render(sb *b)
     VOL_FAMILY("tsdb_wal_syncs_total", "counter", "WAL fdatasync calls since start.", wal_syncs);
     VOL_FAMILY("tsdb_broken_parts", "gauge", "Parts found damaged: left out by a follower, or of merges and drops by a writer (index changed since the open, or a merge that could not decode a granule).", broken_parts);
     VOL_FAMILY("tsdb_pinned_index_bytes", "gauge", "Heap bytes of the parts' index copies (--pin-index).", pinned_bytes);
+    VOL_FAMILY("tsdb_logical_bytes", "gauge",
+               "What the rows in parts would take uncompressed: rows x (8 + width of the series' type). 0 with --no-stats.",
+               logical_bytes);
+    VOL_FAMILY("tsdb_ts_bytes", "gauge", "Compressed timestamps in parts (from the granule index). 0 with --no-stats.",
+               ts_bytes);
+    VOL_FAMILY("tsdb_value_bytes", "gauge", "Compressed values in parts (from the granule index). 0 with --no-stats.",
+               value_bytes);
+    VOL_FAMILY("tsdb_index_bytes", "gauge", "Granule index entries in parts. 0 with --no-stats.", index_bytes);
+    VOL_FAMILY("tsdb_other_bytes", "gauge",
+               "Part headers, footers, tombstones and the fixed part of each index. 0 with --no-stats.", other_bytes);
+    VOL_FAMILY("tsdb_stats_parts_counted", "gauge", "Parts the statistics sweeper has counted.", stats_parts_counted);
+    VOL_FAMILY("tsdb_stats_parts_listed", "gauge",
+               "Parts listed; the totals above are exact once this equals tsdb_stats_parts_counted.",
+               stats_parts_listed);
+    VOL_FAMILY("tsdb_stats_ring_overflows_total", "counter",
+               "Part events the statistics ring dropped (the sweeper then compared its records with the part list).",
+               stats_ring_overflows);
+    family(b, "tsdb_stats_cpu_seconds_total", "counter", "CPU time of the statistics sweeper thread.");
+    for (uint32_t i = 0; i < nv; i++) {
+        sb_add(b, "tsdb_stats_cpu_seconds_total{volume=\"%u\",path=\"", i);
+        sb_label(b, tsdb_volume_path(cfg.db, i) ? tsdb_volume_path(cfg.db, i) : "");
+        sb_add(b, "\"} %.6f\n", (double)vs[i].stats_cpu_ns / 1e9);
+    }
     VOL_FAMILY("tsdb_failed", "gauge", "1 once the volume is in its fail-stop state (writes return IO errors).",
                failed);
     if (strcmp(cfg.role, "follower") == 0) {
@@ -323,6 +347,35 @@ static void render(sb *b)
         }
     }
     free(vs);
+
+    tsdb_query_totals qt;
+    if (tsdb_query_totals_get(cfg.db, &qt) != 0)
+        memset(&qt, 0, sizeof qt);
+    family(b, "tsdb_queries_total", "counter",
+           "Outermost queries the engine ran (all volumes; QUERY_MULTI once per call). 0 with --no-stats.");
+    sb_add(b, "tsdb_queries_total %llu\n", (unsigned long long)qt.queries);
+    family(b, "tsdb_query_rows_total", "counter", "Rows queries covered, by where the answer came from.");
+    sb_add(b, "tsdb_query_rows_total{source=\"decoded\"} %llu\n", (unsigned long long)qt.rows_decoded);
+    sb_add(b, "tsdb_query_rows_total{source=\"stats\"} %llu\n", (unsigned long long)qt.rows_from_stats);
+    sb_add(b, "tsdb_query_rows_total{source=\"memtable\"} %llu\n", (unsigned long long)qt.rows_from_memtable);
+    family(b, "tsdb_query_bytes_read_total", "counter", "Compressed bytes of the granules queries decoded.");
+    sb_add(b, "tsdb_query_bytes_read_total %llu\n", (unsigned long long)qt.bytes_read);
+    family(b, "tsdb_query_parts_total", "counter", "Parts queries touched.");
+    sb_add(b, "tsdb_query_parts_total %llu\n", (unsigned long long)qt.parts);
+    family(b, "tsdb_query_granules_total", "counter", "Granules queries covered, by how they were answered.");
+    sb_add(b, "tsdb_query_granules_total{source=\"decoded\"} %llu\n",
+           (unsigned long long)(qt.granules - qt.granules_from_stats));
+    sb_add(b, "tsdb_query_granules_total{source=\"stats\"} %llu\n", (unsigned long long)qt.granules_from_stats);
+    family(b, "tsdb_query_result_rows_total", "counter", "Rows or buckets queries returned.");
+    sb_add(b, "tsdb_query_result_rows_total %llu\n", (unsigned long long)qt.result_rows);
+    family(b, "tsdb_query_engine_seconds_total", "counter", "Wall time inside the engine's queries, summed.");
+    sb_add(b, "tsdb_query_engine_seconds_total %.6f\n", (double)qt.query_ns / 1e9);
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        family(b, "tsdb_major_faults_total", "counter",
+               "Major page faults of the server process (reads of mapped parts that went to storage).");
+        sb_add(b, "tsdb_major_faults_total %llu\n", (unsigned long long)ru.ru_majflt);
+    }
 
     family(b, "tsdb_requests_total", "counter", "Requests handled by the main port, by operation.");
     for (unsigned o = 1; o <= NOPS; o++)
