@@ -1253,7 +1253,7 @@ static void scen_ids(void)
     char src[PATH_MAX + 128], dst[PATH_MAX + 128];
     snprintf(dst, sizeof dst, "%s/n5", base);
     mkdir(dst, 0755);
-    snprintf(dst, sizeof dst, "%s/n5/meta", base);
+    snprintf(dst, sizeof dst, "%s/n5/state", base);
     mkdir(dst, 0755);
     snprintf(src, sizeof src, "%s/n1/state/NODE", base);
     snprintf(dst, sizeof dst, "%s/n5/state/NODE", base);
