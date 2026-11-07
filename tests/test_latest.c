@@ -1059,6 +1059,64 @@ static void bench_one(int parts, int run, const char *dir_root)
  * replace's parts that leaves the big old part out (max_part_bytes) writes a part with its own rows and the
  * tombstones next to them; those tombstones hide the old part's rows and never the part's own. The newest rows
  * below the small bounds lie in that mixed part. */
+/* A retention limit lengthened while a merge runs (design-latest.md 3.5): the merge may have dropped rows the new
+ * limit keeps, and the table may name one of them, so merge_commit_locked discards the output and the sources merge
+ * again. Regression: the merge thread read the discarded (freed) output afterwards (heap-use-after-free under
+ * `make asan`, found by test_latest's random runs); the check here is that the answers stay exact across it and the
+ * rows come back, and under ASan that nothing touches the freed part. */
+static _Atomic int rl_fired;
+static tsdb *rl_db;
+static tsdb_sid rl_id;
+static void rl_hook(int at)
+{
+    if (at != 1 || atomic_exchange(&rl_fired, 1))
+        return;
+    OK(tsdb_set_retention(rl_db, rl_id, 20 * DAY)); /* the cutoff goes from 97 d to 80 d */
+}
+
+static void test_retention_lengthened_in_merge(void)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 1; /* the merge thread read the freed output (tsdb_optimize did not) */
+    o.merge_idle_s = 1; /* idle for 1 s: the thread merges the two parts */
+    o.clock_ms = test_clock;
+    o.partition_ms = 1000 * DAY;
+    o.partition_classes = 0;
+    set_clock(100 * DAY);
+    tsdb *db = open_plain("latest_retlen", &o);
+    tsdb_sid s;
+    OK(tsdb_series_create(db, "rl.a", TSDB_FLOAT64, NULL, &s));
+    OK(tsdb_set_retention(db, s, 3 * DAY)); /* keeps >= 97 d */
+    put_f64(db, s, 90 * DAY, 1.0, false);
+    put_f64(db, s, 91 * DAY, 2.0, false);
+    OK(tsdb_flush(db));
+    tsdb_latest_result r = one(db, s, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_NONE); /* all of it has expired */
+    rl_db = db;
+    rl_id = s;
+    atomic_store(&rl_fired, 0);
+    atomic_store(&merge_hook, rl_hook);
+    put_f64(db, s, 92 * DAY, 3.0, false); /* the second part: the merge thread selects the two */
+    OK(tsdb_flush(db));
+    tsdb_stats st;
+    for (int i = 0; i < 600 && (!atomic_load(&rl_fired) || (tsdb_get_stats(db, &st), st.parts != 1)); i++) {
+        struct timespec d = {0, 50000000};
+        nanosleep(&d, NULL);
+    }
+    atomic_store(&merge_hook, NULL);
+    CHECK(atomic_load(&rl_fired) == 1);
+    r = one(db, s, TSDB_TS_MAX, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 92 * DAY && r.v.f64 == 3.0);
+    r = one(db, s, 91 * DAY + 1, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 91 * DAY && r.v.f64 == 2.0);
+    tsdb_get_stats(db, &st);
+    CHECK(st.parts == 1); /* the sources merged again, now with the longer limit: nothing was lost */
+    r = one(db, s, 90 * DAY + 1, 0);
+    CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == 90 * DAY && r.v.f64 == 1.0);
+    OK(tsdb_close(db));
+}
+
 static void test_partial_merge(void)
 {
     tsdb_options o;
@@ -1549,6 +1607,8 @@ int main(int argc, char **argv)
     int steps = argc > 2 ? atoi(argv[2]) : 260;
     test_directed();
     printf("directed ok\n");
+    test_retention_lengthened_in_merge();
+    printf("retention lengthened in a merge ok\n");
     test_partial_merge();
     printf("partial merge ok\n");
     test_warmer();

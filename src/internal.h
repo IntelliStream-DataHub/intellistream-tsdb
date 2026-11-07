@@ -1604,7 +1604,7 @@ void db_release(part **parts, size_t n);
 /* merge.c */
 void *merge_thread_main(void *arg);
 int merge_parts(struct eng *db, part **src, size_t k, part **out);
-void merge_commit_locked(struct eng *db, part **src, size_t k, part *out, int rc);
+bool merge_commit_locked(struct eng *db, part **src, size_t k, part *out, int rc);
 
 /* insert.c: sorts (stably), keeps the last row per (series, ts), writes one
  * part per partition. Parts are published, or handed back in `collect`. With `refuse` (rows from a caller, not
