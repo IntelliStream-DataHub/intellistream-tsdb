@@ -71,7 +71,8 @@ static void usage(void)
             "  volume list                        list the volumes, the database directory first\n"
             "  upgrade                            carry a database closed cleanly by the previous release\n"
             "                                     (disk format 8) over to this one, in place; stop followers first\n"
-            "  stats                              rows, parts, size, compression ratio\n"
+            "  stats                              rows, parts, size, compression ratio, where the bytes go\n"
+            "  stats series NAME...               rows, bytes, parts and range of each series\n"
             "  parts                              list active parts (partition class and range)\n"
             "  optimize                           merge every partition into one part\n"
             "  drop-before <time>                 drop whole partitions ending before <time>\n"
@@ -719,6 +720,95 @@ static void drop_root(const char *dir)
             (unsigned)gid, p);
 }
 
+/* `tsdb DIR stats`: the rows and parts as stored, and where the bytes go. The sweeper counts what the granule
+ * indexes say (docs/design-stats.md): logical bytes are rows x (8 + the series' value width), exact; the 12 bytes a
+ * row of a Float32 series takes is no longer assumed for every type. */
+static int cmd_stats(tsdb *db)
+{
+    tsdb_stats st;
+    tsdb_get_stats(db, &st);
+    int rc = tsdb_stats_settle(db, 600000);
+    if (rc)
+        die("stats", rc);
+    tsdb_volume_stats tot;
+    memset(&tot, 0, sizeof tot);
+    for (uint32_t i = 0; i < tsdb_volume_count(db); i++) {
+        tsdb_volume_stats v;
+        if (tsdb_get_volume_stats(db, i, &v) != 0)
+            continue;
+        tot.logical_bytes += v.logical_bytes;
+        tot.ts_bytes += v.ts_bytes;
+        tot.value_bytes += v.value_bytes;
+        tot.index_bytes += v.index_bytes;
+        tot.other_bytes += v.other_bytes;
+    }
+    char sz[32], raw[32], ts[32], va[32], ix[32], ot[32];
+    human((double)st.bytes, sz, sizeof sz);
+    human((double)tot.logical_bytes, raw, sizeof raw);
+    human((double)tot.ts_bytes, ts, sizeof ts);
+    human((double)tot.value_bytes, va, sizeof va);
+    human((double)tot.index_bytes, ix, sizeof ix);
+    human((double)tot.other_bytes, ot, sizeof ot);
+    printf("series      %" PRIu64 "\nrows        %" PRIu64 "\nparts       %" PRIu64 "\npartitions  %" PRIu64
+           "\non disk     %s (%.3f bytes/row)\nuncompressed %s (8 bytes of time + the value, by type)\n"
+           "ratio       %.1fx\n",
+           tsdb_series_count(db), st.rows, st.parts, st.partitions, sz,
+           st.rows ? (double)st.bytes / (double)st.rows : 0.0, raw,
+           st.bytes ? (double)tot.logical_bytes / (double)st.bytes : 0.0);
+    printf("  timestamps %s (%.2f bits/row)\n  values     %s (%.2f bits/row)\n  index      %s\n  other      %s\n"
+           "simd        %s\n",
+           ts, st.rows ? 8.0 * (double)tot.ts_bytes / (double)st.rows : 0.0, va,
+           st.rows ? 8.0 * (double)tot.value_bytes / (double)st.rows : 0.0, ix, ot, tsdb_simd_level());
+    return 0;
+}
+
+/* `tsdb DIR stats series NAME...`: one line per series, from the granule index (rows and bytes as stored, which
+ * include rows a newer write or a tombstone hides until a merge removes them). */
+static int cmd_stats_series(tsdb *db, int n, char **names)
+{
+    if (n < 1)
+        usage();
+    tsdb_sid *ids = malloc((size_t)n * sizeof *ids);
+    tsdb_series_stat *out = malloc((size_t)n * sizeof *out);
+    if (!ids || !out)
+        die("stats series", TSDB_ERR_NOMEM);
+    for (int i = 0; i < n; i++) {
+        int rc = tsdb_series_lookup(db, names[i], &ids[i]);
+        if (rc)
+            die(names[i], rc);
+    }
+    size_t done = 0;
+    while (done < (size_t)n) {
+        size_t d = 0, chunk = (size_t)n - done;
+        int rc = tsdb_series_stats(db, ids + done, chunk > 65536 ? 65536 : chunk, 0, out + done, &d);
+        if (rc)
+            die("stats series", rc);
+        done += d;
+    }
+    for (int i = 0; i < n; i++) {
+        const tsdb_series_stat *s = &out[i];
+        char a[40] = "-", b[40] = "-", lw[40] = "-";
+        if (s->status != 0)
+            die(names[i], s->status);
+        if (!(s->flags & TSDB_SSTAT_NO_RANGE)) {
+            format_time(s->first_ts, a, sizeof a);
+            format_time(s->last_ts, b, sizeof b);
+        }
+        if (s->last_write_ms)
+            format_time(s->last_write_ms, lw, sizeof lw);
+        put_name(stdout, names[i]);
+        printf("\t%s\tclass %d\t%" PRIu64 " rows (%" PRIu64 " in memtables, %" PRIu64 " nulls)\t%" PRIu64
+               " bytes (%" PRIu64 " ts, %" PRIu64 " values, %" PRIu64 " index, %" PRIu64 " tombstones)\t%" PRIu64
+               " parts, %" PRIu64 " partitions, %" PRIu64 " granules (%" PRIu64 " full)\t%s .. %s\twritten %s\n",
+               type_names[s->type], s->cls, s->rows, s->memtable_rows, s->nulls,
+               s->ts_bytes + s->value_bytes + s->index_bytes + s->tomb_bytes, s->ts_bytes, s->value_bytes,
+               s->index_bytes, s->tomb_bytes, s->parts, s->partitions, s->granules, s->full_granules, a, b, lw);
+    }
+    free(ids);
+    free(out);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
@@ -783,6 +873,8 @@ int main(int argc, char **argv)
     o.read_only = !writes;
     o.merge_threads = 0; /* a short-lived process: merging happens in optimize or in the long-running writer */
     o.create_volumes = 0; /* volumes are added by "volume add", as for tsdbd */
+    o.stats = 0;          /* "stats" settles the sweeper once; every other verb never starts it */
+    o.stats_sweep_mb_s = -1; /* a one-shot walk of the indexes: no cap */
     if (!writes && access(dir, F_OK) != 0) {
         fprintf(stderr, "tsdb: %s does not exist\n", dir);
         return 1;
@@ -834,18 +926,10 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "volume") == 0) {
         for (uint32_t i = 0; i < tsdb_volume_count(db); i++)
             printf("%u\t%s\n", i, tsdb_volume_path(db, i));
+    } else if (strcmp(cmd, "stats") == 0 && argc >= 4 && strcmp(argv[3], "series") == 0) {
+        rc = cmd_stats_series(db, argc - 4, argv + 4);
     } else if (strcmp(cmd, "stats") == 0) {
-        tsdb_stats st;
-        tsdb_get_stats(db, &st);
-        char sz[32], raw[32];
-        human((double)st.bytes, sz, sizeof sz);
-        human((double)st.rows * 12, raw, sizeof raw);
-        printf("series      %" PRIu64 "\nrows        %" PRIu64 "\nparts       %" PRIu64 "\npartitions  %" PRIu64
-               "\non disk     %s (%.3f bytes/row)\nuncompressed %s (DateTime64(3) + Float32)\nratio       %.1fx\n"
-               "simd        %s\n",
-               tsdb_series_count(db), st.rows, st.parts, st.partitions, sz,
-               st.rows ? (double)st.bytes / (double)st.rows : 0.0, raw,
-               st.bytes ? (double)st.rows * 12 / (double)st.bytes : 0.0, tsdb_simd_level());
+        rc = cmd_stats(db);
     } else if (strcmp(cmd, "parts") == 0) {
         tsdb_foreach_part(db, print_part, NULL);
     } else if (strcmp(cmd, "optimize") == 0) {

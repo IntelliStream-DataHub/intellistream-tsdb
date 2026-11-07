@@ -43,8 +43,17 @@ directory) and `path`.
 | `tsdb_wal_bytes_total`, `tsdb_wal_syncs_total` | counter | WAL bytes written, WAL `fdatasync`s (0 with `--no-fsync`) |
 | `tsdb_broken_parts` | gauge | parts found damaged: by a follower (left out of its view), or by a writer whose merge, retention drop or rate measurement found an index changed since its open (a barrier for merges, never merged or dropped itself; the next open refuses it), or whose merge could not decode a granule of the part (payload damaged: a barrier, kept in memory only) |
 | `tsdb_pinned_index_bytes` | gauge | heap bytes the listed parts' index copies take with `--pin-index` (about 32 to 51 per granule; 0 without it). Parts already replaced by a merge but still read by a query keep their copy until that query ends, and are not counted |
+| `tsdb_logical_bytes` | gauge | what the rows in parts would take uncompressed: rows x (8 + width of the series' type); with `tsdb_disk_bytes` it gives the compression ratio. All the statistics families below are 0 with `--no-stats` |
+| `tsdb_ts_bytes`, `tsdb_value_bytes`, `tsdb_index_bytes`, `tsdb_other_bytes` | gauge | where the part bytes go: compressed timestamps, compressed values, granule index entries, and headers, footers, tombstones and the fixed part of each index |
+| `tsdb_stats_parts_counted`, `tsdb_stats_parts_listed` | gauge | parts the statistics sweeper has counted, and parts listed: the five numbers above are exact once the two are equal (they differ for a moment after a flush or merge, or for a while after the open of a large database) |
+| `tsdb_stats_ring_overflows_total`, `tsdb_stats_cpu_seconds_total` | counter | part events the sweeper's ring dropped (it then compared its records with the part list: still exact, just later), and the CPU time of the sweeper thread |
 | `tsdb_failed` | gauge | 1 once the volume is fail-stopped: writes return IO errors and tsdbd exits; alert on it |
 | `tsdb_follow_errors_total`, `tsdb_follow_refresh_age_seconds` | counter, gauge | followers only: failed refreshes, and time since the last good one (the age of the follower's refresh, not of the writer's data: a stopped writer leaves it near 0) |
+| `tsdb_queries_total` | counter | outermost queries the engine ran, all volumes (a QUERY_MULTI counts once). 0 with `--no-stats`; the `tsdb_query_*_total` families too |
+| `tsdb_query_rows_total{source}` | counter | rows queries covered: `decoded` (granules decoded), `stats` (answered from granule statistics), `memtable` |
+| `tsdb_query_granules_total{source}` | counter | granules queries covered: `decoded` or `stats` |
+| `tsdb_query_bytes_read_total`, `tsdb_query_parts_total`, `tsdb_query_result_rows_total`, `tsdb_query_engine_seconds_total` | counter | compressed bytes decoded, parts touched, rows or buckets returned, wall time inside the engine's queries |
+| `tsdb_major_faults_total` | counter | major page faults of the server process (`getrusage`): reads of mapped parts that went to storage |
 | `tsdb_requests_total{op}` | counter | requests handled, by operation (`insert`, `query_raw`, `query_buckets`, ...) |
 | `tsdb_inserted_rows_total` | counter | rows in successful insert requests |
 | `tsdb_multi_series_total` | counter | series answered by many-series requests (QUERY_MULTI, `op="query_multi"` in the request counters) |
@@ -58,7 +67,8 @@ directory) and `path`.
 | `tsdb_request_memory_bytes`, `tsdb_request_memory_limit_bytes` | gauge | memory of requests received and not yet run (with large receive buffers and packed inserts being unpacked), and `--max-request-memory` |
 | `tsdb_metrics_scrapes_total`, `tsdb_metrics_rejected_total` | counter | this endpoint: scrapes answered, requests refused or timed out |
 
-Useful expressions: `rate(tsdb_inserted_rows_total[1m])` is the insert rate;
+Useful expressions: `tsdb_logical_bytes / tsdb_disk_bytes` is the compression ratio;
+`sum(rate(tsdb_query_rows_total{source="stats"}[5m])) / sum(rate(tsdb_query_rows_total[5m]))` is the share of rows answered without decoding; `rate(tsdb_inserted_rows_total[1m])` is the insert rate;
 `histogram_quantile(0.99, sum by (le, op) (rate(tsdb_query_duration_seconds_bucket[5m])))` the p99 query time;
 `tsdb_failed == 1` pages someone; `tsdb_follow_refresh_age_seconds > 5` means the follower has stopped refreshing (it does not detect a dead writer);
 `tsdb_memtable_rows` growing without bound means flushes are not keeping up;

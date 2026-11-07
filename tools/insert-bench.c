@@ -88,6 +88,7 @@ static void stream_fill_parallel(stream *s, tsdb_sid *sv, int64_t *tv, float *vv
     s->pos += n;
 }
 
+static bool no_stats;             /* --no-stats: tsdb_options.stats = -1 */
 static int insert_zstd = INT_MIN; /* --insert-zstd: tsdb_options.insert_zstd_level; INT_MIN the default */
 
 static tsdb *open_fresh(int wal_sync_ms, size_t wal_max_batch)
@@ -101,6 +102,8 @@ static tsdb *open_fresh(int wal_sync_ms, size_t wal_max_batch)
     o.fsync = 1;
     o.wal_sync_ms = wal_sync_ms;
     o.wal_max_batch_rows = wal_max_batch;
+    if (no_stats)
+        o.stats = -1;
     if (insert_zstd != INT_MIN)
         o.insert_zstd_level = insert_zstd;
     tsdb *db;
@@ -286,6 +289,7 @@ int main(int argc, char **argv)
                                    {"volumes", required_argument, 0, 'v'},
                                    {"appends-only", no_argument, 0, 'a'},
                                    {"insert-zstd", required_argument, 0, 'z'},
+                                   {"no-stats", no_argument, 0, 'N'},
                                    {0, 0, 0, 0}};
     bool appends_only = false;
     int ch;
@@ -298,11 +302,12 @@ int main(int argc, char **argv)
         case 'v': nvolumes = atoi(optarg) > 0 ? atoi(optarg) : 1; break;
         case 'a': appends_only = true; break;
         case 'z': insert_zstd = atoi(optarg); break;
+        case 'N': no_stats = true; break;
         default: return 2;
         }
     }
     if (!dir) {
-        fprintf(stderr, "usage: insert-bench --dir DIR [--series N] [--max-batch ROWS] [--seconds S] [--insert-zstd LEVEL]\n");
+        fprintf(stderr, "usage: insert-bench --dir DIR [--series N] [--max-batch ROWS] [--seconds S] [--insert-zstd LEVEL] [--no-stats]\n");
         return 2;
     }
     printf("durable inserts, fsync on, %u series of mixed sensors in %d volume(s), dir %s\n\n", nseries, nvolumes, dir);

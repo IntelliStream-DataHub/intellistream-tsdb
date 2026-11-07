@@ -99,6 +99,7 @@ struct tsdb {
     char *meta_bad_path;
     uint32_t meta_bad_index;
     sched *sched;                /* the query helpers of every volume */
+    qreg *reg;                   /* query counters (tsdb_query_totals_get); NULL with stats = -1 */
     /* The names being created now: a creation holds its name from the probe of every volume to its append, so
      * two creators of one name take turns and those of different names do not wait for each other's disks. */
     pthread_mutex_t name_mu;
@@ -885,6 +886,8 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
     pthread_mutex_init(&t->kept_mu, NULL);
     pthread_cond_init(&t->name_cv, NULL);
     t->dirfd = -1;
+    if (t->opt.stats >= 0)
+        t->reg = qreg_new(); /* NULL when out of memory: queries then go uncounted */
     t->sched = sched_new(t->opt.query_threads, t->opt.request_threads);
     if (!t->sched) {
         tsdb_close(t);
@@ -969,6 +972,7 @@ int tsdb_close(tsdb *t)
         free(t->paths[i]);
     }
     sched_free(t->sched); /* after the volumes: none of them runs a query now */
+    qreg_close(t->reg);   /* threads that still hold a block keep the registry alive until they exit */
     free(t->vols);
     free(t->paths);
     free(t->meta_bad_path);
@@ -2219,6 +2223,7 @@ static void qs_begin(tsdb *t, qrun *r)
     r->outer = cur_qstats == NULL;
     if (!r->outer)
         return;
+    r->reg = t->reg;
     memset(&r->q, 0, sizeof r->q);
     cur_qstats = &r->q;
     sched_group_begin(t->sched, &r->g, 0);
@@ -2228,6 +2233,7 @@ static void qs_begin(tsdb *t, qrun *r)
 void query_run_begin(tsdb *t, qrun *r, int cap)
 {
     r->outer = true;
+    r->reg = t->reg;
     memset(&r->q, 0, sizeof r->q);
     cur_qstats = &r->q;
     sched_group_begin(t->sched, &r->g, cap);
@@ -2256,11 +2262,43 @@ static void qs_end(qrun *r, int type, uint64_t result_rows)
     s->granules = atomic_load(&r->q.granules);
     s->granules_from_stats = atomic_load(&r->q.granules_from_stats);
     s->result_rows = result_rows;
+    if (r->reg) { /* the handle's totals: a few stores into this thread's own block (stats.c) */
+        uint64_t v[QC_N] = {[QC_QUERIES] = 1,
+                            [QC_ROWS_DECODED] = s->rows_decoded,
+                            [QC_ROWS_STATS] = s->rows_from_stats,
+                            [QC_ROWS_MEM] = s->memtable_rows,
+                            [QC_BYTES_READ] = s->bytes_read,
+                            [QC_PARTS] = s->parts,
+                            [QC_GRANULES] = s->granules,
+                            [QC_GRANULES_STATS] = s->granules_from_stats,
+                            [QC_RESULT_ROWS] = result_rows,
+                            [QC_NS] = (uint64_t)((double)s->elapsed_s * 1e9)};
+        qreg_add(r->reg, v);
+    }
 }
 
 void query_run_end(qrun *r, int type, uint64_t result_rows) { qs_end(r, type, result_rows); }
 
 void tsdb_last_query_stats(tsdb_query_stats *out) { *out = last_stats; }
+
+int tsdb_query_totals_get(tsdb *t, tsdb_query_totals *out)
+{
+    memset(out, 0, sizeof *out);
+    uint64_t v[QC_N] = {0};
+    if (t->reg)
+        qreg_totals(t->reg, v);
+    out->queries = v[QC_QUERIES];
+    out->rows_decoded = v[QC_ROWS_DECODED];
+    out->rows_from_stats = v[QC_ROWS_STATS];
+    out->rows_from_memtable = v[QC_ROWS_MEM];
+    out->bytes_read = v[QC_BYTES_READ];
+    out->parts = v[QC_PARTS];
+    out->granules = v[QC_GRANULES];
+    out->granules_from_stats = v[QC_GRANULES_STATS];
+    out->result_rows = v[QC_RESULT_ROWS];
+    out->query_ns = v[QC_NS];
+    return 0;
+}
 
 /* float32 rows to a tsdb_raw_fn: the slots are the floats */
 typedef struct f32_out {
@@ -2807,6 +2845,109 @@ int tsdb_get_volume_stats(tsdb *t, uint32_t volume, tsdb_volume_stats *st)
     int rc = volume < t->nvols ? eng_get_volume_stats(t->vols[volume], st) : TSDB_ERR_INVALID;
     pthread_rwlock_unlock(&t->lock);
     return rc;
+}
+
+int tsdb_stats_settle(tsdb *t, int timeout_ms)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    size_t n = t->nvols;
+    eng **es = malloc((n ? n : 1) * sizeof *es);
+    for (size_t i = 0; es && i < n; i++)
+        es[i] = eng_ref(t->vols[i]);
+    pthread_rwlock_unlock(&t->lock);
+    if (!es)
+        return TSDB_ERR_NOMEM;
+    int rc = 0;
+    for (size_t i = 0; i < n; i++) {
+        int r = rc ? 0 : stats_settle(es[i], timeout_ms);
+        rc = rc ? rc : r;
+        eng_unref(&es[i]);
+    }
+    free(es);
+    return rc;
+}
+
+/* Per-series numbers (stats.c sscx_run). Chunks of at most 256 ids in request order; within a chunk the ids of a
+ * volume are sorted, so each part's runs are met in order. The probes of every chunk are charged to one budget:
+ * once it is spent the call stops at a chunk boundary and says how far it got (the caller asks again). */
+#define SSTATS_CHUNK 256
+#define SSTATS_MAX_IDS 65536
+#define SSTATS_BUDGET 100000000ull
+atomic_uint_fast64_t sstats_budget = SSTATS_BUDGET;
+
+typedef struct sskey {
+    uint64_t id;
+    size_t at; /* index in the chunk */
+} sskey;
+
+static int sskey_cmp(const void *a, const void *b)
+{
+    const sskey *x = a, *y = b;
+    return (x->id > y->id) - (x->id < y->id);
+}
+
+int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_series_stat *out, size_t *done)
+{
+    if (!done)
+        return TSDB_ERR_INVALID;
+    *done = 0;
+    if (flags != 0 || n > SSTATS_MAX_IDS || (n && (!ids || !out)))
+        return TSDB_ERR_INVALID;
+    uint64_t probes = 0;
+    while (*done < n && (*done == 0 || probes < atomic_load_explicit(&sstats_budget, memory_order_relaxed))) {
+        size_t m = MIN((size_t)SSTATS_CHUNK, n - *done);
+        const tsdb_sid *cid = ids + *done;
+        tsdb_series_stat *cout = out + *done;
+        sskey keys[SSTATS_CHUNK];
+        for (size_t i = 0; i < m; i++)
+            keys[i] = (sskey){cid[i], i};
+        qsort(keys, m, sizeof keys[0], sskey_cmp); /* by id: the ids of one volume are together, ascending */
+        for (size_t i = 0; i < m;) {
+            int64_t vol = sid_volume(keys[i].id);
+            size_t j = i;
+            while (j < m && sid_volume(keys[j].id) == vol)
+                j++;
+            eng *e EREF = NULL;
+            uint32_t local, locals[SSTATS_CHUNK];
+            size_t at[SSTATS_CHUNK], k = 0;
+            size_t dup[SSTATS_CHUNK][2], nd = 0, first_at = 0; /* [to, from]: a repeat gets the first's record */
+            for (size_t q = i; q < j; q++) {
+                eng *e2 EREF = NULL;
+                if (q > i && keys[q].id == keys[q - 1].id) {
+                    /* a repeated id is answered once: it would repeat the same scan, and the cost bound counts
+                     * the work done, not the ids asked for */
+                    dup[nd][0] = keys[q].at;
+                    dup[nd++][1] = first_at;
+                    continue;
+                }
+                first_at = keys[q].at;
+                if (route_meta(t, keys[q].id, &e2, &local)) { /* false: no such volume or id */
+                    if (!e)
+                        e = eng_ref(e2);
+                    locals[k] = local;
+                    at[k++] = keys[q].at;
+                } else {
+                    memset(&cout[keys[q].at], 0, sizeof cout[0]);
+                    cout[keys[q].at].status = TSDB_ERR_NOTFOUND;
+                }
+            }
+            if (k) {
+                tsdb_series_stat res[SSTATS_CHUNK];
+                sscx *x = sscx_open(e);
+                if (!x)
+                    return TSDB_ERR_NOMEM;
+                sscx_run(x, locals, k, res, &probes);
+                sscx_close(x);
+                for (size_t q = 0; q < k; q++)
+                    cout[at[q]] = res[q];
+            }
+            for (size_t q = 0; q < nd; q++) /* after the first's record is in place (also a NOTFOUND one) */
+                cout[dup[q][0]] = cout[dup[q][1]];
+            i = j;
+        }
+        *done += m;
+    }
+    return 0;
 }
 
 int tsdb_foreach_part(tsdb *t, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx)

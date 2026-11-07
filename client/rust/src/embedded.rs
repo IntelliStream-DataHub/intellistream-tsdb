@@ -113,6 +113,11 @@ pub struct Options {
     pub create_volumes: bool,
     /// Threads one query (or one multi-series call) uses at most, its caller included; 0: `query_threads`.
     pub request_threads: i32,
+    /// Statistics of what is stored (docs/design-stats.md): -1 off (no sweeper thread, no query counters,
+    /// column totals 0); 0 lazy, the sweeper starts at the first volume-stats call (default); 1 with the open.
+    pub stats: i32,
+    /// The stats sweeper reads at most this many MB/s of granule indexes; 0: 256; negative: no cap.
+    pub stats_sweep_mb_s: i32,
 }
 
 impl Default for Options {
@@ -125,6 +130,8 @@ impl Default for Options {
             granule_rows: o.granule_rows,
             zstd_level: o.zstd_level,
             insert_zstd_level: o.insert_zstd_level,
+            stats: o.stats,
+            stats_sweep_mb_s: o.stats_sweep_mb_s,
             value_codec: match o.value_codec {
                 sys::TSDB_VALUES_GORILLA => ValueCodec::Gorilla,
                 sys::TSDB_VALUES_CHIMP => ValueCodec::Chimp,
@@ -186,6 +193,8 @@ impl Options {
             partition_classes: self.partition_classes as c_int,
             pin_index: self.pin_index as c_int,
             insert_zstd_level: self.insert_zstd_level,
+            stats: self.stats,
+            stats_sweep_mb_s: self.stats_sweep_mb_s,
         }
     }
 }
@@ -380,7 +389,7 @@ impl Drop for Db {
 
 /// The `TSDB_ABI_VERSION` this crate was written for. A struct can keep its size while its fields move
 /// (`tsdb_series_result` did when ids became 64 bits), so the engine's number is compared, not sizes.
-const ABI_VERSION: c_int = 3;
+const ABI_VERSION: c_int = 4;
 
 fn check_abi(found: c_int) -> Result<()> {
     if found != ABI_VERSION {

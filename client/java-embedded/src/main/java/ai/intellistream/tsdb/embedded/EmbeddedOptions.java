@@ -25,6 +25,8 @@ public final class EmbeddedOptions {
     private int granuleRows;
     private int zstdLevel;
     private int insertZstdLevel;
+    private int stats;
+    private int statsSweepMbS;
     private int valueCodec;
     private boolean fsync;
     private int mergeThreads;
@@ -63,6 +65,8 @@ public final class EmbeddedOptions {
             granuleRows = o.get(JAVA_INT, offset(OPTIONS, "granule_rows"));
             zstdLevel = o.get(JAVA_INT, offset(OPTIONS, "zstd_level"));
             insertZstdLevel = o.get(JAVA_INT, offset(OPTIONS, "insert_zstd_level"));
+            stats = o.get(JAVA_INT, offset(OPTIONS, "stats"));
+            statsSweepMbS = o.get(JAVA_INT, offset(OPTIONS, "stats_sweep_mb_s"));
             valueCodec = o.get(JAVA_INT, offset(OPTIONS, "value_codec"));
             fsync = o.get(JAVA_INT, offset(OPTIONS, "fsync")) != 0;
             mergeThreads = o.get(JAVA_INT, offset(OPTIONS, "merge_threads"));
@@ -93,6 +97,8 @@ public final class EmbeddedOptions {
         o.set(JAVA_INT, offset(OPTIONS, "granule_rows"), granuleRows);
         o.set(JAVA_INT, offset(OPTIONS, "zstd_level"), zstdLevel);
         o.set(JAVA_INT, offset(OPTIONS, "insert_zstd_level"), insertZstdLevel);
+        o.set(JAVA_INT, offset(OPTIONS, "stats"), stats);
+        o.set(JAVA_INT, offset(OPTIONS, "stats_sweep_mb_s"), statsSweepMbS);
         o.set(JAVA_INT, offset(OPTIONS, "value_codec"), valueCodec);
         o.set(JAVA_INT, offset(OPTIONS, "fsync"), fsync ? 1 : 0);
         o.set(JAVA_INT, offset(OPTIONS, "merge_threads"), mergeThreads);
@@ -170,6 +176,19 @@ public final class EmbeddedOptions {
      */
     public EmbeddedOptions insertZstdLevel(int level) {
         insertZstdLevel = level;
+        return this;
+    }
+
+    /**
+     * Statistics of what is stored (docs/design-stats.md).
+     *
+     * @param mode -1: off (no sweeper thread, no query counters); 0: lazy, the default; 1: from the open
+     * @param sweepMbS the sweeper reads at most this many MB/s of granule indexes; 0: 256; negative: no cap
+     * @return this
+     */
+    public EmbeddedOptions stats(int mode, int sweepMbS) {
+        stats = mode;
+        statsSweepMbS = sweepMbS;
         return this;
     }
 

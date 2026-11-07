@@ -44,6 +44,8 @@ disk format and the wire protocol.
   C client keeps a copy of each request until its reply (one more memcpy). A connection gets the bodies only if its
   HELLO said 13 (a client of 12 reads the bare status, as before), and in QUERY_MULTI only the END frame carries the
   body. The Pulsar sink works as before (its tests pass), and treats DROPPED as final (dead letter). **Protocol numbers moved:** `QUERY_LATEST` is protocol 14, the change feed 15, statistics 16.
+- The embedded C ABI is version 4: `tsdb_options` gained `stats` and `stats_sweep_mb_s` (the Rust, Python and Java
+  bindings carry them). The statistics change neither the wire protocol nor the disk format.
 
 ### Added
 
@@ -52,6 +54,18 @@ disk format and the wire protocol.
   other markers are reserved, and the engine calls a no-op `jr_intent` / `jr_commit` hook where names and files
   become visible. No backend yet: no marker is written outside the tests.
 - `tsdb_upgrade(dir)` in `tsdb.h` and `tsdb DIR upgrade` (above).
+- **Statistics of what is stored and of what queries did** (`docs/design-stats.md`, steps 1 and 2).
+  `tsdb_options.stats` (-1 off, 0 lazy, 1 from the open; tsdbd runs with 1, `--no-stats` turns it off) and
+  `stats_sweep_mb_s` (a hard cap on the sweeper's index reads, default 256). `tsdb_volume_stats` gains the logical
+  bytes (rows x (8 + the value width of the series' type)), the compressed timestamp and value bytes, the index
+  and the rest, and the sweeper's progress and CPU time; `tsdb_stats_settle` waits for it. `tsdb_series_stats` gives
+  rows, nulls, bytes, parts, granules, the time range and the last write of up to 65,536 series per call, computed
+  from the granule index when asked, with a cost bound. `tsdb_query_totals_get` sums what the queries of a handle
+  did. Nothing is added to the write path. tsdbd's metrics port gains `tsdb_logical_bytes`, `tsdb_ts_bytes`,
+  `tsdb_value_bytes`, `tsdb_index_bytes`, `tsdb_other_bytes`, the `tsdb_stats_*` progress families, the
+  `tsdb_query_*_total` counters and `tsdb_major_faults_total` (docs/metrics.md); there are no per-tenant metrics.
+  `tsdb DIR stats` now reports the bytes by type and where they go (it used to assume 12 bytes a row for every
+  type), and `tsdb DIR stats series NAME...` prints the numbers of single series.
 
 Hardening from the 0.9.1 security review (the minor findings). No format or protocol change.
 

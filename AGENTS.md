@@ -103,6 +103,10 @@ cgroup, so `nice` does not keep your work out of its way.
 - `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable. `src/fno.c`: the `FNO` file (the
   durable bound of the WAL's log numbers). `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
   decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
+- `src/stats.c`: statistics (`docs/design-stats.md`, steps 1-2): the per-thread query counters
+  (`tsdb_query_totals`), the event ring and sweeper thread behind `tsdb_volume_stats`' column totals, and the
+  per-series walk of `tsdb_series_stats`. `tests/test_stats.c` is its oracle (`stats_ring_cap`, `stats_pause` and
+  `sstats_budget` are its hooks).
 - `src/merge.c`: merge selection and execution. `src/query.c`: snapshots, raw
   queries, aggregation, bucketing. `src/manifest.c`: MANIFEST, retired parts, followers.
 - `src/sched.c`: the query scheduler, one per `tsdb` handle (`query_threads - 1` helpers): fork/join jobs, one
@@ -262,7 +266,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `TSDB_ERR_NOTFOUND` for lookups). A 32-bit variable, `%u`, Java `int`, Rust `as u32` or Python `"I"` that holds an
   id is a bug that tests with ids above 2^32 find; row files of the benchmarks keep a u32 series NUMBER that indexes
   the bench's table of ids, never an id. Ids are never reused and mean nothing in another database (export and
-  import name series, not ids). `tsdb_abi_version` (3 in 0.9.0 and 0.9.1) changes when the C structs or signatures the bindings use change.
+  import name series, not ids). `tsdb_abi_version` (3 in 0.9.0 and 0.9.1, 4 with the statistics) changes when the C structs or signatures the bindings use change.
 - **Log numbers (`fno`) never go back.** Every WAL record (format 9: a 32-byte header with `fno` and `commit_ms`) takes
   numbers (rows: one per row; a marker: `span`), assigned in `wal_buffer` under `buf_lock`. They must never be
   handed out twice across opens, whatever was removed in between (a segment after its flush, a part by retention,
@@ -394,9 +398,22 @@ cgroup, so `nice` does not keep your work out of its way.
   crashfs) is the fault shim; `test_outage` and jepsen's `outage` nemesis use it. mmap page faults are not gated by
   the shim. Not built yet: mountinfo discovery, parking and BUSY, a per-volume bounded queue, SIGTERM with a stuck call,
   metrics, the volumes cache, parallel open.
+- **Statistics are never on the append path** (`src/stats.c`). Nothing is added to a write, the WAL, the memtable, the
+  part writer or a merge: the two functions that change a part list (`db_parts_insert_locked`,
+  `db_parts_remove_locked`) push one event into a bounded ring under the `db->lock` they hold, and a nice-19
+  sweeper thread (throttled to `stats_sweep_mb_s`, a hard cap) walks each added part's granule index once. A full
+  ring drops events and the sweeper reconciles its records with the part list (never before the open has finished:
+  `load_parts` changes the list without `db->lock`; an overflow stays set until `stats_open_done`), so the totals are
+  the sum of the records and cannot drift. Statistics never write a file, never call `eng_fail` and keep answering after the engine
+  failed; a failed allocation means "not counted" (`stats_parts_counted < stats_parts_listed`), never a failed
+  query or write. Query counters are one block per (thread, handle), written without a read-modify-write
+  (`qs_end`, about 10 ns); a thread that outlives `tsdb_close` holds a reference on the registry, not on the handle.
+  A new number that is kept per part goes into `part_walk` and must make the four byte columns add up to the part's
+  file (`test_stats`: `bytes == sum of tsdb_foreach_part`).
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
-  is a leaf. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
+  is a leaf, and so is the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
+  sweeper takes `db->lock` only with it released). A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
   not yet appended anything, so nothing a registered large write waits for (a flush, the WAL writer role,
   `publish_lock`, `cls_rw`) waits for it. The write wait hook (`tsdb_set_write_wait_hook`) is a leaf: its +1 and
   the waiter's -1 run with no engine lock, the large write's -1 (`lw_leave`) with `cls_rw` held for reading; tsdbd's

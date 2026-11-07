@@ -121,6 +121,7 @@ void db_parts_insert_locked(eng *db, part *p)
     memmove(db->parts + lo + 1, db->parts + lo, (db->nparts - lo) * sizeof *db->parts);
     db->parts[lo] = p;
     db->nparts++;
+    stats_ev_add(db, p); /* statistics: two stores under the lock this holds; never more than this on the write path */
 }
 
 /* Removes p from the list and drops the list's reference. */
@@ -130,6 +131,7 @@ void db_parts_remove_locked(eng *db, part *p)
         if (db->parts[i] == p) {
             memmove(db->parts + i, db->parts + i + 1, (db->nparts - i - 1) * sizeof *db->parts);
             db->nparts--;
+            stats_ev_remove(db, p);
             part_unref(p);
             return;
         }
@@ -718,6 +720,9 @@ static int load_parts(eng *db, bool read_only)
             db->parts_cap = cap;
         }
         db->parts[db->nparts++] = p;
+        /* the sweeper walks it now, while the index pages part_open just hashed are in memory; a part a newer one
+         * covers (below) is removed again by an event */
+        stats_ev_add(db, p);
     }
     if (rc == 0 && errno != 0) {
         fprintf(stderr, "tsdb: reading the directory failed: %s: the open fails\n", strerror(errno));
@@ -741,6 +746,8 @@ static int load_parts(eng *db, bool read_only)
                 db->nparts = kept + 1;
                 part_ref(p);
                 db_retire_locked(db, p);
+            } else {
+                stats_ev_remove(db, p); /* a reader leaves it alone on disk, and does not list it */
             }
             part_unref(p);
             continue;
@@ -872,6 +879,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0 ||
         (rc = ret_open(db, ro)) != 0 || (rc = cls_open(db, ro)) != 0) /* classes before the WAL replay */
         goto fail;
+    if (db->opt.stats > 0)
+        stats_start(db, false); /* follows the open: load_parts hands it each part as it reads it */
     bool has_manifest = faccessat(db->dirfd, "MANIFEST", F_OK, 0) == 0;
     if (ro && has_manifest) {
         /* a reader follows what the writer published, not the directory */
@@ -930,6 +939,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             goto fail;
         }
     }
+    stats_open_done(db); /* load_parts changed the list without db->lock: from here the sweeper may read it */
     if (open_check) { /* a reopen's comparison with the engine it replaces: before any thread changes the parts */
         void (*check)(const eng *, void *) = open_check;
         open_check = NULL;
@@ -1073,6 +1083,7 @@ int eng_close(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     free(db->mergers);
+    stats_stop(db);
     if (db->own_sched)
         sched_free(db->sched);
     wal_close(db);
@@ -1436,6 +1447,7 @@ int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs)
     vs->wal_bytes = atomic_load_explicit(&db->st_wal_bytes, memory_order_relaxed);
     vs->wal_syncs = atomic_load_explicit(&db->st_wal_syncs, memory_order_relaxed);
     vs->failed = atomic_load(&db->failed) ? 1 : 0;
+    stats_fill(db, vs);
     if (db->opt.follow) {
         int64_t lag = eng_mono_ms() - atomic_load(&db->follow_ok_ms);
         vs->follow_refresh_age_ms = lag > 0 ? lag : 0;

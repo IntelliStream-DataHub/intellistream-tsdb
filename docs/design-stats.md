@@ -1,6 +1,7 @@
 # Statistics per series and per tenant
 
-Status: design, not implemented. Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
+Status: steps 1 and 2 (§9) built on branch `stats-s1` (query counters, event ring, sweeper, `tsdb_series_stats`, the
+metrics and `tsdb DIR stats [series]`); steps 3-5 are not. Design as written: Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
 same day after an adversarial review (findings H1-H4, M1-M10, L1-L10; §11 says where each one is answered).
 Code references are `file:line` at e33d87f.
 
@@ -121,7 +122,7 @@ behind what happened.
 | `tomb_bytes` | exact: 24 x the series' tombstones | 0 | part trailer (src/internal.h:603-608) |
 | compression ratio = `logical_bytes` / (ts + value + index + tomb bytes) | derived from part rows and part bytes only, so memtable rows do not inflate it | 0 | |
 | `first_ts`, `last_ts` | physical; `first_ts` raised to the retention cutoff; when every stored row is before the cutoff, both are absent (flag `NO_RANGE`) | 0 | first and last entry's ts range; memtable min/max |
-| `last_write_ms` | approximate: the newest `written` of a part holding the series, or the memtable's `created_ms` when it holds rows; flag `WRITE_FROM_MTIME` when it comes from a part this process opened rather than wrote (ST13) | one flush | src/internal.h:747, 1154 |
+| `last_write_ms` | approximate: the newest `written_ms` of a part holding the series (the header's write time), or the memtable's `created_ms` when it holds rows; flag `WRITE_FROM_MTIME` when it comes from a part written before format 9, which has only the file's mtime (ST13) | one flush | src/internal.h:747, 1154 |
 | `parts`, `partitions`, `granules`, `full_granules` (count = the part's granule rows) | exact | 0 | runs and entries |
 | `class` | exact | 0 | `tsdb_series_class` |
 | `resident_bytes` (flag `RESIDENT`, n <= 1,024) | exact for the pages at the time of the call | 0 | one `mincore` per (part, series): a series' granules are contiguous in a part |
@@ -245,7 +246,9 @@ part, mostly cache misses: about 1 us per (part, series) for single ids, and the
 Memtables (M5): under one `db->lock` hold, the sweeper's event sequence number is read, the part list is copied with
 references (as `db_snapshot`), and the slots of the flushing memtables and of a follower's WAL tails are read for the
 request's ids, in batches of at most 256 ids per hold (about 5 us each). The active memtable is read under `buf_lock`
-(after `db->lock`, AGENTS.md lock order), in batches of at most 256 ids. If the event sequence number moved in the
+(after `db->lock`, AGENTS.md lock order), in batches of at most 256 ids, `buf_lock` taken for one series at a time (a scan of an unsorted series for its range
+is at most the memtable's rows). Every row scanned there is charged to the call's probe budget, and an id repeated in
+one chunk is answered once (a copy of the first record). If the event sequence number moved in the
 meantime (a flush listed a part), the memtable reads are done once more; if it moves again, the reply sets
 `MEM_APPROX` (a row may count in both places or in neither, for at most one flush).
 
@@ -517,6 +520,29 @@ standard deviations reported (benchmark policy):
 | sweeper, sparse: 10^8 series at 1 M rows/s | sweeper CPU against merge CPU; `stale_s` | at most 5% of merge CPU; capped by the throttle |
 | `STATS_SERIES` on parts with 10^7 runs | 1 id, 1,024 ids, 65,536 ids; time and probes | within the budget; the merge pass wins for large n |
 | memory | RSS with 10^8 series, tenants in runs and interleaved | as §3.6 |
+
+### Results of steps 1 and 2 (2026-11-07, merged tree, AMD Ryzen 9 7950X, quiet machine under `BENCH.lock`)
+
+Stats on (the default) against `--no-stats`, same binaries, `tsdb-bench --qps` on a 100-series, 1 M-row-per-series
+database (3 interleaved runs of 5 s each; mean queries/s) and `insert-bench --appends-only` with fsync (5 interleaved
+rounds of 10 s; mean inserts/s). The single-row lookup class and the two-handle case are not measured yet; the
+`qs_end` hook (about 10 ns per query) is below the noise of the classes that were.
+
+| class | on | off | on / off |
+|---|---:|---:|---:|
+| raw 3600 samples, 1 thread | 66,263 | 64,281 | +3.1% (one noisy "off" run) |
+| 86400 samples in 300-s buckets, 1 thread | 18,131 | 17,982 | +0.8% |
+| 604800 samples in 3600-s buckets, 1 thread | 16,992 | 17,107 | -0.7% |
+| raw 3600 samples, 32 threads | 1,061,914 | 1,069,623 | -0.7% |
+| 86400 samples in 300-s buckets, 32 threads | 110,224 | 109,834 | +0.4% |
+| 604800 samples in 3600-s buckets, 32 threads | 54,544 | 54,478 | +0.1% |
+| append, fsync each, 1 thread | 1,458 | 1,455 | +0.2% |
+| append, fsync each, 16 threads | 12,473 | 12,379 | +0.8% |
+| append, fsync each, 64 threads | 43,113 | 43,464 | -0.8% |
+| append, fsync each, 256 threads | 145,035 | 143,392 | +1.1% |
+
+No difference outside run-to-run noise (in both directions, so the cost is not measurable here). Not yet run: the
+sweeper's catch-up time on the 100 M-row set, `tsdbc-bench`, and the settle time after a load.
 
 ## 9. Build plan
 
