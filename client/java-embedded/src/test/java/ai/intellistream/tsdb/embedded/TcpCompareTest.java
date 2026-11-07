@@ -37,6 +37,14 @@ import static org.junit.jupiter.api.Assertions.fail;
  * directory and read with the TCP client, every query is compared with the embedded answer.
  */
 class TcpCompareTest {
+    /** The answers of a latest call as text: the row, or the status (the messages differ between the doors). */
+    static String answers(List<ai.intellistream.tsdb.SeriesResult<Latest>> r) {
+        StringBuilder b = new StringBuilder();
+        for (ai.intellistream.tsdb.SeriesResult<Latest> x : r)
+            b.append(x.ok() ? x.toString() : "status " + x.status()).append('\n');
+        return b.toString();
+    }
+
     static final long T0 = 1_704_067_200_000L;
 
     @TempDir
@@ -130,8 +138,8 @@ class TcpCompareTest {
                     LatestOptions.defaults().end(T0 + 5 * 60_000L).withNulls(true),
                     LatestOptions.defaults().ends(new long[] {T0 + 7 * 60_000L, T0, T0 + 1, T0 + 1_000_000L,
                         Long.MAX_VALUE, T0})}) {
-                    assertEquals(tcp.latest(lids, lo).toString(), db.latest(lids, lo).toString(), "latest " + lo);
-                    assertEquals(tcp.latestByName(lnames, lo).toString(), db.latestByName(lnames, lo).toString(),
+                    assertEquals(answers(tcp.latest(lids, lo)), answers(db.latest(lids, lo)), "latest " + lo);
+                    assertEquals(answers(tcp.latestByName(lnames, lo)), answers(db.latestByName(lnames, lo)),
                             "latest by name " + lo);
                 }
                 assertEquals(Latest.Kind.VALUE, db.latest(lids[1]).get(0).get().kind());
