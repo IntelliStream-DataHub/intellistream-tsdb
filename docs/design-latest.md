@@ -25,7 +25,7 @@ change).
 ## Summary
 
 - **One question, answered in well under a microsecond per series**: "what is the newest value of these series?",
-  for 1 to a million ids in one request (`QUERY_LATEST`, protocol 13; `tsdb_latest` in C).
+  for 1 to a million ids in one request (`QUERY_LATEST`, protocol 14; `tsdb_latest` in C).
 - **"Newest value" means the greatest timestamp whose last-write-wins value is not null**, among the series' live
   rows. It is exactly the last non-null row of an ascending raw query over everything; that query is the reference,
   and the tests compare against it. With `WITH_NULLS` the answer is the last row of that query, null or not.
@@ -90,7 +90,7 @@ change).
 | L11 | **Rebuilt at open**, inside `cls_check_parts` (classes.c:1095), which already walks every run of every part in (partition, block) order. The walk is split into blocks of 32,768 series ids that the open's threads take in turn; for its block a thread visits every part's runs of those ids, so the block's 512 KiB of table stays in its cache across all partitions. The table itself holds the walk's state (timestamp, part and granule of the newest run so far), tombstones are applied as the walk meets them, and one pass at the end of each block reads `GF_LAST`, the null flag and the null count once per series. The volume's pages are reserved from the budget before the walk, in id order. | A LATEST file written at close; a lazy build on first use; a transient array per series; the serial walk | A file is one more durable thing with fail-stop and torn-tail rules, and is wrong after a crash anyway. A lazy build delays the first answers by minutes on a big volume. Reading `GF_LAST` per run would cost series x partitions field reads (the performance review); per series it is one. A serial walk that touches a table line per run moves terabytes at 10^8 series (the verification's P5). Reserving pages first keeps "the first refused page caps the volume" true when threads build blocks out of order (the verification's N9). |
 | L12 | **What the index cannot give exactly starts unknown with a bound**: state series (no time-weighted statistics, twa.c:126-131; the bound is the timestamp, or one below it when the granule is all null), int64 whose last value as a double is at or beyond 2^53 in magnitude (twa.c:70-73), NaN last values (the payload), and a last row that is a null (`GT_LAST_NULL`, twa.c:107-109; the bound is one below its timestamp). The next flush or insert of a non-null row at or past the bound settles it; the warmer fills the rest at the scheduler's full width right after the open. | Decoding their last granule during the open | The warmer does the same decoding in parallel and does not delay the open; series that are still written are settled by their next flush without any read. The format bump of L18 removes the case. |
 | L13 | **No latest table on NFS followers** in this design: `--follow` (and an embedded follower open) forces `latest_cache = 0`; a follower answers every id by the slow path (§3.10). A follower table is a later step (§11). | The incremental follower table of the earlier rounds (24-byte entries, folds by block, shadow checks, re-derivation from leaving parts, `rm_gen`) | It produced six findings in three rounds and needed a seventh (the verification's N3: a null in an already listed part with a higher block than a new merge output). The cluster does not need it: NFS followers stay for single-server use, and in a cluster replicas take their role (design-cluster.md:22, 739) and use the writer's path (L16). The slow path costs 50 to 100 times more per id there. |
-| L14 | **One op, `QUERY_LATEST`**, protocol 13: ids (1 to 1,048,576), an optional end bound (one, or one per id), a `WITH_NULLS` flag; replies of fixed 24-byte records in index order. The floor stays 12. Clients add `latest_by_name`. | Names in the request; a QUERY_MULTI kind | Clients already resolve and cache ids (insert paths need them). A QUERY_MULTI kind would carry a template and a frame per series: 30 bytes of framing for 24 of answer. |
+| L14 | **One op, `QUERY_LATEST`**, protocol 14: ids (1 to 1,048,576), an optional end bound (one, or one per id), a `WITH_NULLS` flag; replies of fixed 24-byte records in index order. The floor stays 12. Clients add `latest_by_name`. | Names in the request; a QUERY_MULTI kind | Clients already resolve and cache ids (insert paths need them). A QUERY_MULTI kind would carry a template and a frame per series: 30 bytes of framing for 24 of answer. |
 | L15 | **Rights: `read` on each series**, checked per id in the op's case as QUERY_MULTI does; a denied id answers `TSDB_ERR_DENIED` in its own record, whether or not it exists; a missing id is `TSDB_ERR_NOTFOUND` for a user with `read` on `all` (and with `--no-auth`). | Refusing the whole request; "none" for a missing id | The same rule as QUERY_MULTI and as lookups by id elsewhere (AGENTS.md, "Series ids"; design-auth A16). |
 | L16 | **The cluster changes nothing in the table**: replicas apply `COMMIT` markers through the same listing path and see memtable rows up to the commit point, so their tables match the leader's at every commit point. Clients split by leader as QUERY_MULTI does (cluster C16); `REPLICA_OK` and `min_pos` as for queries. | A cluster-wide latest service | It would be a second replicated state to fence at failover. Here a new leader's table is already warm. |
 | L17 | **The slow path gets a real "limit 1"** (`latest_at`, §5.1): partitions newest first, those that end at or before the cutoff skipped, a part's snapshot window computed only when it is visited and only if its series range holds the id, one granule per source, stopping as soon as no older partition can hold a newer row. | Using raw_desc as it is | raw_desc decodes about 8 granules to return one row and enumerates every granule of the series in every part (query.c:1930-1953): O(parts) per series. |
@@ -741,7 +741,7 @@ writer has just created is not reported missing. The reload runs outside `latest
 them by volume and runs each volume's chunks on the query scheduler. The CLI gets `tsdb DIR latest NAME...`
 (`--with-nulls`, `--end`). `tsdb_abi_version` goes up (new struct and call used by the bindings).
 
-### 6.2 Wire (protocol 13)
+### 6.2 Wire (protocol 14)
 
 ```
 QUERY_LATEST (39)  u8 flags, u8 0, u16 threads, u32 n (1..1048576), i64 end, [i64 ends[n]], u64 ids[n]
@@ -955,7 +955,7 @@ Each step is a track (tsdb-tracks): build, adversarial review, fix, gates, merge
 |---|---|---|---|
 | 1 | `latest_at` (§5.1: partitions newest first, cutoff skip, O(1) id-range checks, one granule per source, the non-null default with §5.2's shadow rule, `WITH_NULLS`) and `tsdb_latest` on the slow path alone (no table), C API, `tests/test_latest.c` with the oracle | `make test`, `make asan`; slow-path numbers at 10, 100, 1,000 partitions | 3 days |
 | 2 | The table: `src/latest.c`, pages and budget (a sticky cap), `latest_rw` and `lgen`, the folds with `R` and `N` at every listing (flush, insert, replay, delete, replace), the §3.2 window for large flushes, retention under `latest_rw` and the merge's `ret_gen` compare, `drop_before` with the floor, the build in `cls_check_parts` split by id blocks, the warmer and its hint set, `top_nn` and the flags in `mt_add`, the lookup with read holds of 256 ids and the searches after them, `latest_cache = 0` on followers; concurrency tests and hooks | `make test`, `asan`, `tsan`, `make jepsen` (it touches the publish path); the benchmark gates of §2.3 (inserts against no lookups; publish latency under slow-path lookups), flush holds | 6 to 7 days |
-| 3 | Protocol 13: QUERY_LATEST in tsdbd, `auth_ops`, the C, Rust, Python and Java clients and embedded bindings with `latest_by_name`, the CLI, metrics, fuzz seeds; jepsen's latest check and null writes | `make test`, `test-clients`, `integration-tests`, `fuzz-frames` 600 s, `make jepsen` with the new check | 4 to 5 days |
+| 3 | Protocol 14: QUERY_LATEST in tsdbd, `auth_ops`, the C, Rust, Python and Java clients and embedded bindings with `latest_by_name`, the CLI, metrics, fuzz seeds; jepsen's latest check and null writes | `make test`, `test-clients`, `integration-tests`, `fuzz-frames` 600 s, `make jepsen` with the new check | 4 to 5 days |
 | 4 | Benchmarks (§9), README and docs (protocol comment, metrics.md, CHANGELOG, roadmap: the "not planned" line goes), AGENTS.md (the invariant below) | numbers on a quiet machine | 2 days |
 | 5 | Cluster: the client split per leader, REPLICA_OK and `min_pos` for the op; with the cluster's own steps | cluster simulators and `make jepsen-cluster` | part of the cluster work |
 
@@ -978,9 +978,9 @@ hint set's mutex is a leaf. `latest_rw` is never held across I/O: lookups take t
 their read hold, and `series_reload` runs outside it. No scheduler helper waits for `latest_rw` in write mode. NFS
 followers have no table.
 
-**What lands in a 0.9.x**: protocol 13 (one new op; floor still 12, so no client breaks) and the C API
+**What lands in a 0.9.x**: protocol 14 (one new op; floor still 12, so no client breaks) and the C API
 (`tsdb_abi_version` up). No disk format change: nothing to migrate. The changelog says under "Added": the op, the
-call, the option, the client helpers, the metrics; under "Changed": protocol 13, the ABI version.
+call, the option, the client helpers, the metrics; under "Changed": protocol 14, the ABI version.
 
 ## 11. Later: a latest table on NFS followers
 

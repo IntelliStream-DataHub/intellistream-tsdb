@@ -84,6 +84,8 @@ int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len);
 /* The rights on one id / every id of a request (all or nothing, A16): 0 or TSDB_ERR_DENIED. */
 int auth_id(auth_conn *a, tsdb_sid id, uint8_t need);
 int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need);
+/* The connection may see operator details (volume paths in TOPOLOGY): a superuser, or no login at all (--no-auth). */
+bool auth_conn_super(const auth_conn *a);
 /* Whether the connection holds `need` on every series (no per-id checks needed). */
 bool auth_all(const auth_conn *a, uint8_t need);
 

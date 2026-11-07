@@ -26,7 +26,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyAttributeError, PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use ::tsdb_client as tc;
 use tc::{Column, ColumnRef, ValueType, Values};
@@ -45,18 +45,108 @@ create_exception!(
     "An error from tsdbd or the client; `code` is the TSDB_ERR_* number (negative)."
 );
 
+create_exception!(
+    tsdb_client,
+    TsdbUnavailable,
+    TsdbError,
+    "A volume's storage is unavailable (code ERR_UNAVAILABLE): the request was not applied. The client already \
+     retried within its budget (`retry`); `retry_after` (seconds), `entries` (one dict per refused volume: \
+     volume, reason, epoch, since_ms, retry_after, outage_id) and `has_body` say what the server sent."
+);
+create_exception!(
+    tsdb_client,
+    TsdbMoved,
+    TsdbError,
+    "Another node owns the volume (code ERR_MOVED): the request was not applied. `moved` lists dicts of volume, \
+     epoch, node_id and addr."
+);
+create_exception!(
+    tsdb_client,
+    TsdbPartial,
+    TsdbError,
+    "A request over several volumes was applied for some only (code ERR_PARTIAL): `volumes` lists (volume, \
+     status), `rows` the row count and `not_applied` the indexes of the rows that were not applied."
+);
+create_exception!(
+    tsdb_client,
+    TsdbDropped,
+    TsdbError,
+    "The rows are below the volume's drop watermark (code ERR_DROPPED): never applied, never to be sent again. \
+     `volume` and `before_ms` say where the watermark is."
+);
+
 fn to_pyerr(py: Python<'_>, e: tc::Error) -> PyErr {
-    let err = TsdbError::new_err(e.to_string());
-    if let Err(set) = err.value(py).setattr("code", e.code()) {
-        return set;
+    to_pyerr_info(py, e, None)
+}
+
+/// The error as its exception class: UNAVAILABLE, MOVED, PARTIAL and DROPPED have their own, with the body of the
+/// reply (`info`, the client's last_error) as attributes.
+fn to_pyerr_info(py: Python<'_>, e: tc::Error, info: Option<&tc::ErrorInfo>) -> PyErr {
+    let status = e.status();
+    let msg = e.to_string();
+    let err = match status {
+        Some(tc::Status::Unavailable) => TsdbUnavailable::new_err(msg),
+        Some(tc::Status::Moved) => TsdbMoved::new_err(msg),
+        Some(tc::Status::Partial) => TsdbPartial::new_err(msg),
+        Some(tc::Status::Dropped) => TsdbDropped::new_err(msg),
+        _ => TsdbError::new_err(msg),
+    };
+    let v = err.value(py);
+    let attrs = || -> PyResult<()> {
+        v.setattr("code", e.code())?;
+        v.setattr("index", e.batch_index())?;
+        v.setattr("result", py.None())?;
+        let own = info.filter(|i| Some(i.status) == status.map(tc::Status::code));
+        let empty = tc::ErrorInfo::default();
+        let i = own.unwrap_or(&empty);
+        match status {
+            Some(tc::Status::Unavailable) => {
+                v.setattr("has_body", own.is_some_and(|i| i.has_body))?;
+                v.setattr("retry_after", f64::from(i.retry_after_ms()) / 1000.0)?;
+                let l = PyList::empty(py);
+                for u in &i.unavailable {
+                    let d = PyDict::new(py);
+                    d.set_item("volume", u.vol)?;
+                    d.set_item("reason", u.reason)?;
+                    d.set_item("epoch", u.epoch)?;
+                    d.set_item("since_ms", u.since_ms)?;
+                    d.set_item("retry_after", f64::from(u.retry_after_ms) / 1000.0)?;
+                    d.set_item("outage_id", u.outage_id)?;
+                    l.append(d)?;
+                }
+                v.setattr("entries", l)?;
+            }
+            Some(tc::Status::Moved) => {
+                let l = PyList::empty(py);
+                for m in &i.moved {
+                    let d = PyDict::new(py);
+                    d.set_item("volume", m.vol)?;
+                    d.set_item("epoch", m.epoch)?;
+                    d.set_item("node_id", m.node_id)?;
+                    d.set_item("addr", &m.addr)?;
+                    l.append(d)?;
+                }
+                v.setattr("moved", l)?;
+            }
+            Some(tc::Status::Partial) => {
+                let vols: Vec<(u16, i16)> = i.volumes.iter().map(|v| (v.vol, v.status)).collect();
+                v.setattr("volumes", vols)?;
+                v.setattr("rows", i.rows)?;
+                let rows: Vec<usize> = (0..i.rows as usize).filter(|&r| i.row_not_applied(r)).collect();
+                v.setattr("not_applied", rows)?;
+            }
+            Some(tc::Status::Dropped) => {
+                v.setattr("volume", i.dropped_vol)?;
+                v.setattr("before_ms", i.dropped_before)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    match attrs() {
+        Ok(()) => err,
+        Err(set) => set,
     }
-    if let Err(set) = err.value(py).setattr("index", e.batch_index()) {
-        return set;
-    }
-    if let Err(set) = err.value(py).setattr("result", py.None()) {
-        return set;
-    }
-    err
 }
 
 fn closed() -> tc::Error {
@@ -761,6 +851,10 @@ impl Inner {
 ///         instead, without the LF or CR LF that ends it, at every login.
 ///     require_auth: Refuse (ERR_AUTH) a server that does not ask for a
 ///         login (--no-auth). Otherwise such a server is used without one.
+///     retry: Seconds one request may be retried: tsdbd answers UNAVAILABLE when a volume's storage is down
+///         and MOVED when another node owns it, both meaning the request was not applied, so the client waits what
+///         the reply asks for, follows a MOVED and sends the request again until this budget is spent; then the call
+///         raises TsdbUnavailable or TsdbMoved. 30 by default; 0 turns retries off.
 ///
 /// Raises:
 ///     TsdbError: The connection failed; ERR_AUTH when the login failed (an
@@ -793,13 +887,18 @@ impl Client {
                 g
             });
             let r = f(&mut inner);
+            // the body of an UNAVAILABLE, MOVED, PARTIAL or DROPPED reply, for the exception
+            let info = match &r {
+                Err(e) if matches!(e.code(), -13..=-10) => inner.conn.as_ref().map(|c| c.last_error().clone()),
+                _ => None,
+            };
             // after an I/O error (a timeout included) the stream is out of step: close it
             if inner.conn.as_ref().is_some_and(tc::Client::is_broken) {
                 inner.conn = None;
             }
-            r
+            r.map_err(|e| (e, info))
         })
-        .map_err(|e| to_pyerr(py, e))
+        .map_err(|(e, info)| to_pyerr_info(py, e, info.as_ref()))
     }
 
     /// Runs `f` on the connection with the GIL released.
@@ -871,12 +970,60 @@ impl Client {
     }
 }
 
-fn connect(host: &str, port: u16, opts: &tc::ConnectOptions, keepalive: bool) -> tc::Result<tc::Client> {
-    let c = tc::Client::connect_opts((host, port), opts)?;
+fn connect(
+    host: &str,
+    port: u16,
+    opts: &tc::ConnectOptions,
+    keepalive: bool,
+    retry: Option<Duration>,
+) -> tc::Result<tc::Client> {
+    let mut c = tc::Client::connect_opts((host, port), opts)?;
     if !keepalive {
         c.set_keepalive(None)?;
     }
+    c.set_retry(retry);
     Ok(c)
+}
+
+/// The time budget of one request's retries as the keyword `retry` gives it: seconds, 0 for none.
+fn retry_budget(retry: f64) -> PyResult<Option<Duration>> {
+    if retry == 0.0 {
+        return Ok(None);
+    }
+    seconds(Some(retry)).map_err(|_| PyValueError::new_err("retry must be a positive number of seconds, or 0 for none"))
+}
+
+/// A topology as Python data: dicts of plain values.
+fn topology_dict<'py>(py: Python<'py>, t: &tc::Topology) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("generation", t.generation)?;
+    let nodes = PyList::empty(py);
+    for n in &t.nodes {
+        let e = PyDict::new(py);
+        e.set_item("node_id", n.node_id)?;
+        e.set_item("alive", n.alive)?;
+        e.set_item("addr", &n.addr)?;
+        nodes.append(e)?;
+    }
+    d.set_item("nodes", nodes)?;
+    let vols = PyList::empty(py);
+    for v in &t.volumes {
+        let e = PyDict::new(py);
+        e.set_item("volume", v.vol)?;
+        e.set_item("role", v.role)?;
+        e.set_item("health", v.health)?;
+        e.set_item("epoch", v.epoch)?;
+        e.set_item("reason", v.reason)?;
+        e.set_item("domain", v.domain)?;
+        e.set_item("since_ms", v.since_ms)?;
+        e.set_item("owner", v.owner)?;
+        e.set_item("server", v.server)?;
+        e.set_item("addr", &v.addr)?;
+        e.set_item("path", &v.path)?;
+        vols.append(e)?;
+    }
+    d.set_item("volumes", vols)?;
+    Ok(d)
 }
 
 /// The keyword arguments of Client and Pool as the Rust client's options. They live as long as the Client or
@@ -994,7 +1141,7 @@ fn seconds(t: Option<f64>) -> PyResult<Option<Duration>> {
 impl Client {
     #[new]
     #[pyo3(signature = (host = "127.0.0.1", port = 7070, timeout = None, keepalive = true, *, user = None,
-                        password = None, password_file = None, require_auth = false))]
+                        password = None, password_file = None, require_auth = false, retry = 30.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1006,10 +1153,91 @@ impl Client {
         password: Option<String>,
         password_file: Option<std::path::PathBuf>,
         require_auth: bool,
+        retry: f64,
     ) -> PyResult<Self> {
         let opts = connect_options(timeout, user, password, password_file, require_auth)?;
-        let c = py.detach(|| connect(host, port, &opts, keepalive)).map_err(|e| to_pyerr(py, e))?;
+        let retry = retry_budget(retry)?;
+        let c = py.detach(|| connect(host, port, &opts, keepalive, retry)).map_err(|e| to_pyerr(py, e))?;
         Ok(Client { inner: Mutex::new(Inner { conn: Some(c), ..Inner::default() }), addr: format!("{host}:{port}") })
+    }
+
+    /// Connects to the first of several nodes that answers.
+    ///
+    /// Args:
+    ///     nodes: "host:port,host:port,..." (IPv6 as "[::1]:7070"; a node without a port is on 7070).
+    ///         The list is shuffled once, so a fleet of clients spreads over the nodes. The client
+    ///         keeps it: a MOVED reply without an address, or an address that cannot be reached,
+    ///         goes on to the next node.
+    ///     timeout, keepalive, user, password, password_file, require_auth, retry: As for Client().
+    ///
+    /// Raises:
+    ///     TsdbError: No node answered (the last error), or the login failed (ERR_AUTH).
+    ///     ValueError: The list is empty or a node is not a host:port.
+    #[staticmethod]
+    #[pyo3(signature = (nodes, timeout = None, keepalive = true, *, user = None, password = None,
+                        password_file = None, require_auth = false, retry = 30.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn connect_nodes(
+        py: Python<'_>,
+        nodes: &str,
+        timeout: Option<f64>,
+        keepalive: bool,
+        user: Option<String>,
+        password: Option<String>,
+        password_file: Option<std::path::PathBuf>,
+        require_auth: bool,
+        retry: f64,
+    ) -> PyResult<Self> {
+        let opts = connect_options(timeout, user, password, password_file, require_auth)?;
+        let retry = retry_budget(retry)?;
+        let c = py.detach(|| tc::Client::connect_nodes(nodes, &opts)).map_err(|e| match e {
+            tc::Error::InvalidArgument(m) => PyValueError::new_err(m),
+            e => to_pyerr(py, e),
+        })?;
+        let mut c = c;
+        if !keepalive {
+            c.set_keepalive(None).map_err(|e| to_pyerr(py, e))?;
+        }
+        c.set_retry(retry);
+        Ok(Client { inner: Mutex::new(Inner { conn: Some(c), ..Inner::default() }), addr: nodes.to_string() })
+    }
+
+    /// Sets the time budget of one request's retries, in seconds; 0 turns retries off.
+    ///
+    /// tsdbd answers UNAVAILABLE when a volume's storage is down and MOVED when another node owns it:
+    /// both mean the request was not applied. The client waits what the reply asks for (retry_after),
+    /// follows a MOVED and sends the request again until the budget is spent; then the call raises
+    /// TsdbUnavailable or TsdbMoved. The default is 30 seconds.
+    ///
+    /// Raises:
+    ///     ValueError: retry is negative, not finite, or under a nanosecond.
+    ///     TsdbError: The client is closed.
+    fn set_retry(&self, py: Python<'_>, retry: f64) -> PyResult<()> {
+        let b = retry_budget(retry)?;
+        self.with(py, |c| {
+            c.set_retry(b);
+            Ok(())
+        })
+    }
+
+    /// The nodes and volumes the server lists (protocol 13): a dict with generation, nodes (dicts of node_id,
+    /// alive, addr; addr "" is the node that answered) and volumes (dicts of volume, role, health, epoch,
+    /// reason, domain, since_ms, owner, server, addr and path; path only for a superuser). A single server
+    /// lists itself and every volume it serves.
+    ///
+    /// Raises:
+    ///     TsdbError: The client is closed or the call failed.
+    fn topology<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let t = self.with(py, tc::Client::topology)?;
+        topology_dict(py, &t)
+    }
+
+    /// The server's status as key=value lines (a superuser).
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_DENIED for a user who is no superuser; the client is closed.
+    fn status(&self, py: Python<'_>) -> PyResult<String> {
+        self.with(py, tc::Client::server_status)
     }
 
     /// Changes how long a call waits for the server, in seconds; None waits forever.
@@ -2249,6 +2477,10 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Stats>()?;
     m.add_class::<QueryStats>()?;
     m.add("TsdbError", m.py().get_type::<TsdbError>())?;
+    m.add("TsdbUnavailable", m.py().get_type::<TsdbUnavailable>())?;
+    m.add("TsdbMoved", m.py().get_type::<TsdbMoved>())?;
+    m.add("TsdbPartial", m.py().get_type::<TsdbPartial>())?;
+    m.add("TsdbDropped", m.py().get_type::<TsdbDropped>())?;
     m.add_function(wrap_pyfunction!(strerror, m)?)?;
     m.add_function(wrap_pyfunction!(calendar_bounds, m)?)?;
     m.add("DEFAULT_PORT", tc::DEFAULT_PORT)?;
@@ -2265,6 +2497,10 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
         ("ERR_TOO_MANY_BUCKETS", tc::Status::TooManyBuckets),
         ("ERR_STOPPED", tc::Status::Stopped),
         ("ERR_READONLY", tc::Status::ReadOnly),
+        ("ERR_MOVED", tc::Status::Moved),
+        ("ERR_UNAVAILABLE", tc::Status::Unavailable),
+        ("ERR_PARTIAL", tc::Status::Partial),
+        ("ERR_DROPPED", tc::Status::Dropped),
         ("ERR_DENIED", tc::Status::Denied),
         ("ERR_AUTH", tc::Status::Auth),
     ] {

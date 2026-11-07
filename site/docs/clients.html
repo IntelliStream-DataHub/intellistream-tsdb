@@ -512,28 +512,28 @@ explains each.</p>
 <div class="tabpanel" role="tabpanel" data-key="c">
 <p>The calls in <code>include/tsdb.h</code>. The C client has the same ones with the prefix <code>tsdbc_</code>
 (<code>tsdbc_query_spread</code>, <code>tsdbc_query_twa</code>, <code>tsdbc_query_lttb</code>).</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L477-L485">* deviation (divided by count), var_samp and stddev_samp the sample ones
-* (divided by count - 1, NaN for a single value). All are NaN for a bucket
-* without known values and for state series. A NaN or an infinity among the
-* values makes the variances NaN (the deviation of an infinity from the mean
-* is undefined), not the range, which comes from min and max; so do finite
-* floats whose sum overflows (values near DBL_MAX), as it does the sum.
-*  - Floats are combined in the numerically stable form (the sum of squared
-*    deviations from the mean, granule by granule with the parallel formula of
-*    Chan et al.), so a large offset (pressure in Pa around 101325) costs no</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L541-L551">* the sum of their areas over the sum of their covered_ms. A bucket is returned
+<pre><code class="language-c" data-src="include/tsdb.h#L477-L485">/* ---- the spread: range, variance, standard deviation ----
+ * A bucket as above followed by the spread of its known values: range is
+ * max - min; var_pop and stddev_pop are the population variance and standard
+ * deviation (divided by count), var_samp and stddev_samp the sample ones
+ * (divided by count - 1, NaN for a single value). All are NaN for a bucket
+ * without known values and for state series. A NaN or an infinity among the
+ * values makes the variances NaN (the deviation of an infinity from the mean
+ * is undefined), not the range, which comes from min and max; so do finite
+ * floats whose sum overflows (values near DBL_MAX), as it does the sum.</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L541-L551">*    twa        = area / covered_ms (NaN when covered_ms is 0)
+*    count      = non-null readings in the bucket and in [start, end)
+* area and covered_ms add up across buckets: the average over several buckets is
+* the sum of their areas over the sum of their covered_ms. A bucket is returned
 * when covered_ms or count is not 0. Since a segment alone fills a bucket, a
 * query may span at most 4M buckets between its first and last reading in range
 * (TSDB_ERR_TOO_MANY_BUCKETS beyond).
 * NaN propagates: a NaN value held for any time makes the area and twa NaN;
 * infinities follow IEEE arithmetic, and a LINEAR segment with an infinite end
 * is that infinity throughout (+inf to -inf: NaN), wherever buckets cut it. A NaN result is the canonical quiet NaN.
-* Types: float32, float64, int64 (as double: exact up to 2^53), bool (0 or 1:
-* twa is the fraction of covered time that it was true); state series are
-* TSDB_ERR_INVALID. Whole granules inside one bucket are answered from stored
-* statistics without decoding, except where a delete overlaps them and until a</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">* shape, and streams them in time order with their stored values, exactly
-* (bools as bytes, valid always NULL: no nulls are returned).</code></pre>
+* Types: float32, float64, int64 (as double: exact up to 2^53), bool (0 or 1:</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">
+/* Downsampling for charts: Largest-Triangle-Three-Buckets (Steinarsson 2013)</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
 <pre><code class="language-rust" data-src="client/rust/examples/analytics.rs">use tsdb_client::{Client, ConnectOptions, QueryOpts, TwaOpts, ValueType};
@@ -631,12 +631,12 @@ ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);</code></
 <p><code>tsdb_query_multi</code> calls your function once per series as the answers come;
 <code>tsdb_query_multi_collect</code> returns them all at once. The C client has <code>tsdbc_query_multi</code> and
 <code>tsdbc_query_multi_collect</code>.</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">int status;
-int last; /* the series' last call */
-size_t n;
-const int64_t *ts;  /* VALUES, LTTB */
-tsdb_values values; /* VALUES, LTTB */
-const void *buckets; /* BUCKETS, SPREAD, TWA */</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">typedef struct tsdb_series_result {
+    size_t index; /* into series[] */
+    tsdb_sid series;
+    int status;
+    int last; /* the series' last call */
+    size_t n;</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
 <p>The Rust client has the same many-series calls.
@@ -689,11 +689,11 @@ for (int i = 0; i &lt; pumps.length; i++) {
 <button type="button" role="tab" data-key="java">Java</button>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="c">
-<pre><code class="language-c" data-src="include/tsdb.h#L259-L261"> * must have the column's type (TSDB_ERR_INVALID otherwise); the float32
- * calls above are these with a float32 column and no nulls. */
-int tsdb_insert_values(tsdb *db, const tsdb_sid *series, const int64_t *ts, const tsdb_values *values, size_t n);</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">* range, without holding up other writers meanwhile; merges absorb those
-* parts and remove the deleted rows for good later. Frequent small deletes</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L259-L261">int tsdb_insert_series(tsdb *db, tsdb_sid series, const int64_t *ts, const float *values, size_t n);
+
+/* The same for any value type, and with nulls. Every series of one call</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">* visible; it is all or nothing across a crash. A delete costs about what a
+* large insert costs: it flushes the memtable (of all series) and writes and</code></pre>
 <p>The C client has the same calls with the prefix <code>tsdbc_</code>.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
@@ -738,12 +738,12 @@ login.user = argc &gt; 3 ? argv[3] : NULL;          /* NULL: no login */
 login.password_file = argc &gt; 4 ? argv[4] : NULL; /* never the password itself: argv is visible in ps */</code></pre>
 <p>and the calls for users are in <code>client/tsdb_client.h</code> (the kinds of selector are
 <code>TSDB_SEL_*</code>, the rights <code>TSDB_RIGHT_*</code> bits):</p>
-<pre><code class="language-c" data-src="client/tsdb_client.h#L85-L90">int tsdbc_user_create(tsdbc *c, const char *name, const char *password, uint32_t iterations, uint8_t flags);
+<pre><code class="language-c" data-src="client/tsdb_client.h#L85-L90">void tsdbc_users_free(tsdbc_user *u, size_t n);
+int tsdbc_user_create(tsdbc *c, const char *name, const char *password, uint32_t iterations, uint8_t flags);
 int tsdbc_user_drop(tsdbc *c, const char *name);
 int tsdbc_user_alter(tsdbc *c, const char *name, uint8_t flags);
 int tsdbc_user_password(tsdbc *c, const char *name, const char *password, uint32_t iterations);
-int tsdbc_grant(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);
-int tsdbc_revoke(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);</code></pre>
+int tsdbc_grant(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);</code></pre>
 <p class="code-source">From examples/client.c and client/tsdb_client.h.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">

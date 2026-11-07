@@ -71,8 +71,11 @@ enum {
     TSDB_ERR_TOO_MANY_BUCKETS = -7,
     TSDB_ERR_STOPPED = -8, /* a query callback returned non-zero, or the db is closing */
     TSDB_ERR_READONLY = -9,
-    /* -10 to -15 are kept for the HA track (docs/ha.md); the wire bodies of these are step S0's */
+    /* -10 to -15 are the HA track's (docs/ha.md); their wire bodies are defined once in tsdb_protocol.h (version 13) */
+    TSDB_ERR_MOVED = -10,       /* tsdbd: another node owns the volume; definitely not applied (body: tsdb_wire.h) */
     TSDB_ERR_UNAVAILABLE = -11, /* tsdbd: the volume's storage is unavailable; definitely not applied (ha.md 15.4) */
+    TSDB_ERR_PARTIAL = -12,     /* tsdbd: a frame spanning volumes was applied for some of them (per-row bits) */
+    TSDB_ERR_DROPPED = -13,     /* tsdbd: below the volume's drop watermark; never applied, never resend (final) */
     TSDB_ERR_ABANDONED = -14,   /* a request that was parked on a stuck volume and discarded its work (ha.md 15.3) */
     TSDB_ERR_DENIED = -16, /* tsdbd: the user holds no right for this (or the series does not exist) */
     TSDB_ERR_AUTH = -17,   /* tsdbd: login failed or is required first */
