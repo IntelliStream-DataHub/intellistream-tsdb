@@ -175,6 +175,13 @@ typedef struct tsdb_options {
                               * 0: no table, every tsdb_latest is answered from the parts and memtables (the same
                               * answers, 50 to 100 times slower per series). Followers and read-only opens keep none.
                               * A series beyond the budget is answered the same way (design-latest.md) */
+    int stats_recompute_s;   /* the per-tenant numbers of a partition that a merge or a delete changed are counted
+                              * again at most this often (seconds); 0: 30 (docs/design-stats.md, ST4) */
+    int stats_resident_s;    /* the sampled page-cache residency of a part is taken again after this many seconds;
+                              * 0: 600 */
+    const char *const *tenants; /* tenant prefixes (a name's tenant is the longest prefix it starts with); the
+                              * strings are copied at the open. NULL, 0: none, every series is in tenant "(none)" */
+    size_t ntenants;
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -796,6 +803,7 @@ typedef struct tsdb_volume_stats {
     uint64_t stats_parts_counted, stats_parts_listed;
     uint64_t stats_ring_overflows; /* events the ring dropped (the sweeper then compared its records with the list) */
     uint64_t stats_cpu_ns;   /* CPU time of the sweeper thread */
+    uint64_t stats_tmap_bytes; /* the tenant map: 2 bytes a series, nothing for a run of series of one tenant */
 } tsdb_volume_stats;
 int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
 
@@ -823,18 +831,63 @@ typedef struct tsdb_series_stat {
     uint64_t parts, partitions, granules, full_granules; /* full: a granule of granule_rows rows */
     int64_t first_ts, last_ts; /* stored rows (first raised to the retention cutoff); 0 with TSDB_SSTAT_NO_RANGE */
     int64_t last_write_ms;     /* the newest part holding it (its written_ms, one flush old) or memtable creation */
-    uint64_t resident_bytes;   /* reserved: 0 */
-    uint64_t reads_est, reads_err, writes_est, writes_err; /* reserved: 0 */
+    uint64_t resident_bytes;   /* with TSDB_SSTAT_REQ_RESIDENT: bytes of its granules in the page cache now, else 0 */
+    uint64_t reads_est, reads_err; /* queries in the last 60-120 s, from the hot-reads list: 0 when it is not in it */
+    uint64_t writes_est, writes_err; /* rows written in the last 60-120 s, from the hot-writes list */
     uint64_t live_rows;        /* reserved: 0 */
 } tsdb_series_stat;
 enum {
     TSDB_SSTAT_WRITE_FROM_MTIME = 4, /* last_write_ms comes from the file time of a part written before format 9 */
     TSDB_SSTAT_NO_RANGE = 2,   /* no stored row at or after the retention cutoff: first_ts and last_ts are 0 */
 };
-/* ids[0..n): n up to 65,536 (TSDB_ERR_INVALID above); flags must be 0 (RESIDENT and EXACT_ROWS are not built). out
- * has n records. The call spends at most 100 million index probes (about a second of one core): it may stop with
+/* tsdb_series_stats `flags` */
+enum {
+    TSDB_SSTAT_REQ_RESIDENT = 1, /* fill resident_bytes: one mincore per (part, series); at most 1,024 ids */
+};
+/* ids[0..n): n up to 65,536 (TSDB_ERR_INVALID above); flags is 0 or TSDB_SSTAT_REQ_RESIDENT (EXACT_ROWS is not built).
+ * out has n records. The call spends at most 100 million index probes (about a second of one core): it may stop with
  * *done < n, and the caller asks again for ids[done..]. *done records are filled, in request order. */
 int tsdb_series_stats(tsdb *db, const tsdb_sid *ids, size_t n, int flags, tsdb_series_stat *out, size_t *done);
+
+/* ---- tenants (docs/design-stats.md steps 3 and 4) ----
+ * A tenant is a prefix of series names (tsdb_options.tenants, or tsdb_set_tenants later): a series belongs to the
+ * tenant with the longest prefix its name starts with, else to "(none)" (prefix NULL below). Storage numbers are
+ * kept by the stats sweeper (tsdb_options.stats 0 or 1: the first call of a lazy sweeper starts it), each partition's
+ * share per tenant, so a tenant's totals are always the sum of what is stored and cannot drift. tsdb_stats_settle
+ * waits until nothing is stale. Per-tenant numbers go to whoever is allowed to read them: never onto a metrics port. */
+int tsdb_set_tenants(tsdb *db, const char *const *prefixes, size_t n);
+/* The prefix at index i of the current list (sorted bytewise) into out (cap bytes, NUL-terminated); its length, or
+ * TSDB_ERR_NOTFOUND past the end. */
+int tsdb_tenant_prefix(tsdb *db, size_t i, char *out, size_t cap);
+enum {
+    TSDB_TENANT_PARTIAL = 1, /* a sweep or a move of series between tenants is not finished: the numbers are stale */
+    TSDB_TENANT_VOLUME_SUM = 0xffffffffu, /* tsdb_tenant_stats `volume`: the sum over the volumes */
+};
+typedef struct tsdb_tenant_stats {
+    uint32_t flags, generation; /* generation: of the tenant list (one more at every tsdb_set_tenants) */
+    uint64_t list_hash;         /* of the list's prefixes: two servers with the same list have the same hash */
+    uint64_t series, series_created, active_series_cur, active_series_prev; /* active: about 3%, by hour */
+    uint64_t rows, nulls, logical_bytes, ts_bytes, value_bytes, index_bytes, granules; /* physical (ST1) */
+    uint64_t ingested_rows, ingested_bytes; /* the writer's flushes since start, the WAL replay left out */
+    uint64_t merged_rows, merge_removed_rows, retention_dropped_rows;
+    uint64_t resident_bytes;    /* page cache, sampled: up to 64 granules of a part every stats_resident_s */
+    uint64_t stale_s;           /* the age of the oldest partition waiting for its recount */
+} tsdb_tenant_stats;
+/* The numbers of the tenant with this prefix (NULL: tenant "(none)") in one volume or, with
+ * TSDB_TENANT_VOLUME_SUM, the sum; TSDB_ERR_NOTFOUND for a prefix that is not in the list, TSDB_ERR_INVALID
+ * with stats = -1 or a volume that does not exist. */
+int tsdb_tenant_stats_get(tsdb *db, const char *prefix, uint32_t volume, tsdb_tenant_stats *out);
+
+/* The hottest series: kind 1 queries (sampled, so the estimates are within the sampling error and `error`), 2 rows
+ * written (exact for what flushed, up to `error` from the list's size), 3 bytes per row x 1000 (the worst series, over
+ * granules of a full 8192 rows in merged parts). The two windows of 60 s. Up to k entries (k at most 256), the
+ * hottest first. *threshold: an id that is not listed weighs at most that (0 for kind 3). */
+typedef struct tsdb_hot {
+    tsdb_sid id;
+    uint64_t estimate, error;
+} tsdb_hot;
+enum { TSDB_HOT_READS = 1, TSDB_HOT_WRITES = 2, TSDB_HOT_BYTES_PER_ROW = 3 };
+int tsdb_hot_series(tsdb *db, int kind, tsdb_hot *out, size_t k, size_t *n, uint64_t *threshold);
 
 /* A small write (one that goes through the WAL) into the keys of a large insert, replace or delete that has not
  * published its parts yet waits for that publish, so it does not win over a write that came before it. For as long
@@ -947,7 +1000,7 @@ size_t tsdb_struct_size(int kind);
 /* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
  * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
  * number they were written for when they load the library and refuse another. */
-#define TSDB_ABI_VERSION 5 /* The latest table: tsdb_options.latest_cache (design-latest.md). Before it, 4: Statistics: tsdb_options.stats and stats_sweep_mb_s (design-stats.md steps 1-2). Before it:  Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
+#define TSDB_ABI_VERSION 6 /* Tenants: tsdb_options.stats_recompute_s, stats_resident_s, tenants, ntenants and tsdb_volume_stats.stats_tmap_bytes (design-stats.md steps 3-4). Before it, 5: The latest table: tsdb_options.latest_cache (design-latest.md). Before it, 4: Statistics: tsdb_options.stats and stats_sweep_mb_s (design-stats.md steps 1-2). Before it:  Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
  * expected topology one export of one pool). tsdb_health_open starts a monitor thread; every domain added gets a
  * probe thread that reads 4 KiB with O_DIRECT from <dir>/PROBE every second and writes and fdatasyncs 4 KiB to
  * <dir>/PROBE.<node> every 5 s. Probes may hang for as long as the server is away; nothing else of the process

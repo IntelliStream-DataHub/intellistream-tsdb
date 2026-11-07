@@ -43,6 +43,7 @@
  * read again later.
  */
 #include "internal.h"
+#include "stats_priv.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -100,6 +101,9 @@ struct tsdb {
     uint32_t meta_bad_index;
     sched *sched;                /* the query helpers of every volume */
     qreg *reg;                   /* query counters (tsdb_query_totals_get); NULL with stats = -1 */
+    tlist *tl;                   /* the tenant list (stats_priv.h), NULL with stats = -1; under tl_mu */
+    uint32_t tlgen;              /* one more at every tsdb_set_tenants */
+    pthread_mutex_t tl_mu;       /* a leaf */
     /* The names being created now: a creation holds its name from the probe of every volume to its append, so
      * two creators of one name take turns and those of different names do not wait for each other's disks. */
     pthread_mutex_t name_mu;
@@ -778,6 +782,9 @@ static int volume_dir_check(tsdb *t, const char *path, uint32_t index, bool *met
     return rc;
 }
 
+static void opts_with_tenants(tsdb *t, tsdb_options *o, tlist **hold, uint32_t *gen);
+static void tenants_catch_up(tsdb *t, eng *e, uint32_t gen);
+
 /* Opens volume `index` (line `index` of VOLUMES) at `path` (canonical, with our ROOT_ID) and lists it. Called
  * without t->lock: the open reads the volume's files, and a volume on a file system that hangs must not hold up
  * the lookups and creations in the volumes already open, which take the lock for reading. Callers open in line
@@ -797,8 +804,15 @@ static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad
     if (rc)
         return rc;
     eng *e;
-    if ((rc = eng_open_sched(path, &t->opt, t->sched, &e)) != 0)
+    tsdb_options o;
+    tlist *hold;
+    uint32_t tlgen;
+    opts_with_tenants(t, &o, &hold, &tlgen);
+    rc = eng_open_sched(path, &o, t->sched, &e);
+    tlist_unref(hold);
+    if (rc != 0)
         return rc;
+    tenants_catch_up(t, e, tlgen);
     char *p = strdup(path);
     rc = p ? 0 : TSDB_ERR_NOMEM;
     listed = false;
@@ -867,6 +881,32 @@ static int load_layout(tsdb *t)
 
 /* ------------------------------------------------------------- open/close */
 
+/* The options an engine of this handle is opened with: the handle's own, and the tenant list as it is now (a copy of
+ * the strings is made by the open; `hold` keeps them until then). */
+static void opts_with_tenants(tsdb *t, tsdb_options *o, tlist **hold, uint32_t *gen)
+{
+    pthread_mutex_lock(&t->tl_mu);
+    *hold = tlist_ref(t->tl);
+    *gen = t->tlgen;
+    pthread_mutex_unlock(&t->tl_mu);
+    *o = t->opt;
+    o->tenants = *hold ? (const char *const *)(*hold)->s : NULL;
+    o->ntenants = *hold ? (*hold)->n : 0;
+}
+
+/* A list set while the engine was opening is not in its options: give it that one now. */
+static void tenants_catch_up(tsdb *t, eng *e, uint32_t gen)
+{
+    pthread_mutex_lock(&t->tl_mu);
+    tlist *cur = tlist_ref(t->tl);
+    bool moved = t->tlgen != gen;
+    pthread_mutex_unlock(&t->tl_mu);
+    if (moved && cur)
+        eng_set_tenants(e, (const char *const *)cur->s, cur->n);
+    tlist_unref(cur);
+}
+
+
 int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
 {
     *out = NULL;
@@ -879,6 +919,12 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         tsdb_options_init(&t->opt);
     if (t->opt.follow)
         t->opt.read_only = 1;
+    pthread_mutex_init(&t->tl_mu, NULL);
+    t->tlgen = 1;
+    if (t->opt.stats >= 0 && tlist_make(t->opt.tenants, t->opt.ntenants, &t->tl) != 0)
+        t->tl = NULL; /* more prefixes than a process can number: none are used */
+    t->opt.tenants = NULL; /* the caller's strings are not ours past this call: engines get the list from tl */
+    t->opt.ntenants = 0;
     pthread_rwlock_init(&t->lock, NULL);
     pthread_mutex_init(&t->create_lock, NULL);
     pthread_mutex_init(&t->layout_lock, NULL);
@@ -905,7 +951,12 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         return rc;
     }
     eng *root;
-    rc = eng_open_sched(dir, &t->opt, t->sched, &root); /* creates the directory for a writer */
+    tsdb_options o;
+    tlist *hold;
+    uint32_t tlgen;
+    opts_with_tenants(t, &o, &hold, &tlgen);
+    rc = eng_open_sched(dir, &o, t->sched, &root); /* creates the directory for a writer */
+    tlist_unref(hold);
     if (rc) {
         tsdb_close(t);
         return rc;
@@ -973,6 +1024,8 @@ int tsdb_close(tsdb *t)
     }
     sched_free(t->sched); /* after the volumes: none of them runs a query now */
     qreg_close(t->reg);   /* threads that still hold a block keep the registry alive until they exit */
+    tlist_unref(t->tl);
+    pthread_mutex_destroy(&t->tl_mu);
     free(t->vols);
     free(t->paths);
     free(t->meta_bad_path);
@@ -1743,7 +1796,16 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     eng *e = NULL;
     reval_check chk = {.x = exp, .nx = nexp};
     if (rc == 0) /* the parts are compared inside the open, before the new engine's merge threads start */
-        rc = eng_reopen(old, path, &t->opt, t->sched, &e, reval_check_open, &chk);
+    {
+        tsdb_options o;
+        tlist *hold;
+        uint32_t tlgen;
+        opts_with_tenants(t, &o, &hold, &tlgen);
+        rc = eng_reopen(old, path, &o, t->sched, &e, reval_check_open, &chk);
+        tlist_unref(hold);
+        if (rc == 0)
+            tenants_catch_up(t, e, tlgen);
+    }
     free(path);
     if (rc) {
         free(exp);
@@ -2238,6 +2300,7 @@ static void qs_begin(tsdb *t, qrun *r)
     if (!r->outer)
         return;
     r->reg = t->reg;
+    r->sid = 0;
     memset(&r->q, 0, sizeof r->q);
     cur_qstats = &r->q;
     sched_group_begin(t->sched, &r->g, 0);
@@ -2248,6 +2311,7 @@ void query_run_begin(tsdb *t, qrun *r, int cap)
 {
     r->outer = true;
     r->reg = t->reg;
+    r->sid = 0;
     memset(&r->q, 0, sizeof r->q);
     cur_qstats = &r->q;
     sched_group_begin(t->sched, &r->g, cap);
@@ -2255,6 +2319,12 @@ void query_run_begin(tsdb *t, qrun *r, int cap)
 }
 
 sched *query_sched(tsdb *t) { return t->sched; }
+
+void query_note_series(tsdb *t, tsdb_sid id)
+{
+    if (t->reg)
+        qreg_hot_note(t->reg, id);
+}
 
 static void qs_end(qrun *r, int type, uint64_t result_rows)
 {
@@ -2287,7 +2357,7 @@ static void qs_end(qrun *r, int type, uint64_t result_rows)
                             [QC_GRANULES_STATS] = s->granules_from_stats,
                             [QC_RESULT_ROWS] = result_rows,
                             [QC_NS] = (uint64_t)((double)s->elapsed_s * 1e9)};
-        qreg_add(r->reg, v);
+        qreg_add(r->reg, v, r->sid);
     }
 }
 
@@ -2335,6 +2405,7 @@ int tsdb_query_raw_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, cons
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
+    qr.sid = series; /* a candidate for the hot-reads list */
     f32_out o = {fn, ctx, 0};
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
     if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
@@ -2441,6 +2512,7 @@ int tsdb_query_values(tsdb *t, tsdb_sid series, int64_t start, int64_t end, cons
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
+    qr.sid = series; /* a candidate for the hot-reads list */
     vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
     if (rc == 0 && route_q(t, series, &e, &local, &rc) && (o.type = eng_series_type(e, local)) >= 0)
@@ -2621,6 +2693,7 @@ int tsdb_query_lttb_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, siz
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
+    qr.sid = series; /* a candidate for the hot-reads list */
     vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
     lttb_limit l = {.o = &o, .limit = opts ? opts->limit : 0};
     bool desc = opts && opts->order == TSDB_DESC;
@@ -2652,6 +2725,7 @@ static int query_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, con
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
+    qr.sid = series; /* a candidate for the hot-reads list */
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
     if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
         type = eng_series_type(e, local);
@@ -2706,6 +2780,7 @@ static int query_twa(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const
         opts = &def;
     qrun qr;
     qs_begin(t, &qr);
+    qr.sid = series; /* a candidate for the hot-reads list */
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
     if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
         type = eng_series_type(e, local);
@@ -2762,6 +2837,7 @@ static int query_spread(tsdb *t, tsdb_sid series, int64_t start, int64_t end, co
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
+    qr.sid = series; /* a candidate for the hot-reads list */
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
     if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
         type = eng_series_type(e, local);
@@ -2905,8 +2981,10 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
     if (!done)
         return TSDB_ERR_INVALID;
     *done = 0;
-    if (flags != 0 || n > SSTATS_MAX_IDS || (n && (!ids || !out)))
+    if ((flags & ~TSDB_SSTAT_REQ_RESIDENT) || n > SSTATS_MAX_IDS || (n && (!ids || !out)) ||
+        ((flags & TSDB_SSTAT_REQ_RESIDENT) && n > 1024)) /* a mincore per (part, series): not for a bulk request */
         return TSDB_ERR_INVALID;
+    bool resident = flags & TSDB_SSTAT_REQ_RESIDENT;
     uint64_t probes = 0;
     while (*done < n && (*done == 0 || probes < atomic_load_explicit(&sstats_budget, memory_order_relaxed))) {
         size_t m = MIN((size_t)SSTATS_CHUNK, n - *done);
@@ -2950,7 +3028,7 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
                 sscx *x = sscx_open(e);
                 if (!x)
                     return TSDB_ERR_NOMEM;
-                sscx_run(x, locals, k, res, &probes);
+                sscx_run(x, locals, k, res, &probes, resident);
                 sscx_close(x);
                 for (size_t q = 0; q < k; q++)
                     cout[at[q]] = res[q];
@@ -2961,7 +3039,138 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
         }
         *done += m;
     }
+    if (*done && t->opt.stats >= 0) { /* what the hot lists know of these series (0 when they are in none) */
+        hagg *ar = hagg_new(), *aw = hagg_new();
+        if (ar && aw) {
+            if (t->reg)
+                qreg_hot_collect(t->reg, ar);
+            pthread_rwlock_rdlock(&t->lock);
+            for (size_t v = 0; v < t->nvols; v++)
+                eng_hot_collect(t->vols[v], aw, NULL, (uint64_t)(v + 1) << 32);
+            pthread_rwlock_unlock(&t->lock);
+            for (size_t i = 0; i < *done; i++)
+                if (out[i].status == 0) {
+                    out[i].reads_est = hagg_estimate(ar, ids[i], &out[i].reads_err);
+                    out[i].writes_est = hagg_estimate(aw, ids[i], &out[i].writes_err);
+                }
+        }
+        hagg_free(ar);
+        hagg_free(aw);
+    }
     return 0;
+}
+
+/* ---- tenants and hot lists (stats_tenant.c, stats_hot.c) ---- */
+
+int tsdb_set_tenants(tsdb *t, const char *const *prefixes, size_t n)
+{
+    if (t->opt.stats < 0)
+        return 0;
+    tlist *nl;
+    int rc = tlist_make(prefixes, n, &nl);
+    if (rc)
+        return rc;
+    pthread_mutex_lock(&t->tl_mu);
+    tlist *old = t->tl;
+    t->tl = nl;
+    t->tlgen++;
+    pthread_mutex_unlock(&t->tl_mu);
+    pthread_rwlock_rdlock(&t->lock);
+    for (size_t i = 0; i < t->nvols; i++)
+        eng_set_tenants(t->vols[i], (const char *const *)nl->s, nl->n);
+    pthread_rwlock_unlock(&t->lock);
+    tlist_unref(old);
+    return 0;
+}
+
+int tsdb_tenant_prefix(tsdb *t, size_t i, char *out, size_t cap)
+{
+    int rc = TSDB_ERR_NOTFOUND;
+    pthread_mutex_lock(&t->tl_mu);
+    if (t->tl && i < t->tl->n) {
+        size_t len = t->tl->len[i];
+        if (cap && out) {
+            memcpy(out, t->tl->s[i], MIN(len, cap - 1));
+            out[MIN(len, cap - 1)] = 0;
+        }
+        rc = (int)len;
+    }
+    pthread_mutex_unlock(&t->tl_mu);
+    return rc;
+}
+
+_Static_assert(offsetof(tsdb_tenant_stats, resident_bytes) == offsetof(tsdb_tenant_stats, series) + 16 * sizeof(uint64_t),
+               "the engine fills the counters from series to resident_bytes in order");
+
+int tsdb_tenant_stats_get(tsdb *t, const char *prefix, uint32_t volume, tsdb_tenant_stats *out)
+{
+    memset(out, 0, sizeof *out);
+    if (t->opt.stats < 0)
+        return TSDB_ERR_INVALID;
+    pthread_mutex_lock(&t->tl_mu);
+    tlist *tl = tlist_ref(t->tl);
+    uint32_t gen = t->tlgen;
+    pthread_mutex_unlock(&t->tl_mu);
+    uint32_t no = 0;
+    int rc = 0;
+    if (prefix && (!tl || (rc = tlist_find(tl, prefix, &no)) != 0))
+        rc = TSDB_ERR_NOTFOUND;
+    if (rc == 0) {
+        uint64_t sum[17] = {0};
+        pthread_rwlock_rdlock(&t->lock);
+        size_t lo = 0, hi = t->nvols;
+        if (volume != TSDB_TENANT_VOLUME_SUM) {
+            if (volume >= t->nvols)
+                rc = TSDB_ERR_INVALID;
+            lo = volume;
+            hi = (size_t)volume + 1;
+        }
+        for (size_t v = lo; rc == 0 && v < hi; v++) {
+            uint64_t x[17], stale;
+            uint32_t fl;
+            if ((rc = eng_tenant_fill(t->vols[v], no, x, &fl, &stale)) != 0)
+                break;
+            tsdb_volume_stats vs;
+            if (eng_get_volume_stats(t->vols[v], &vs) == 0 && vs.stats_parts_counted != vs.stats_parts_listed)
+                fl |= TSDB_TENANT_PARTIAL; /* a part is not walked yet */
+            for (int i = 0; i < 17; i++)
+                sum[i] += x[i];
+            out->flags |= fl;
+            out->stale_s = MAX(out->stale_s, stale);
+        }
+        pthread_rwlock_unlock(&t->lock);
+        if (rc == 0)
+            memcpy(&out->series, sum, sizeof sum);
+    }
+    out->generation = gen;
+    out->list_hash = tl ? tl->hash : 0;
+    tlist_unref(tl);
+    return rc;
+}
+
+int tsdb_hot_series(tsdb *t, int kind, tsdb_hot *out, size_t k, size_t *n, uint64_t *threshold)
+{
+    *n = 0;
+    if (threshold)
+        *threshold = 0;
+    if (t->opt.stats < 0 || kind < TSDB_HOT_READS || kind > TSDB_HOT_BYTES_PER_ROW || k > SS_K || (k && !out))
+        return TSDB_ERR_INVALID;
+    hagg *a = hagg_new();
+    if (!a)
+        return TSDB_ERR_NOMEM;
+    if (kind == TSDB_HOT_READS) {
+        if (t->reg)
+            qreg_hot_collect(t->reg, a);
+    } else {
+        pthread_rwlock_rdlock(&t->lock);
+        for (size_t v = 0; v < t->nvols; v++)
+            eng_hot_collect(t->vols[v], kind == TSDB_HOT_WRITES ? a : NULL, kind == TSDB_HOT_BYTES_PER_ROW ? a : NULL,
+                            (uint64_t)(v + 1) << 32);
+        pthread_rwlock_unlock(&t->lock);
+    }
+    int rc = hagg_top(a, out, k, n, threshold);
+    hagg_free(a);
+    return rc;
 }
 
 int tsdb_foreach_part(tsdb *t, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx)

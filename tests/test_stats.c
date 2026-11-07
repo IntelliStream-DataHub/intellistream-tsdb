@@ -570,7 +570,7 @@ static void test_series_stats_api(const char *base)
     tsdb_sid ids[600];
     for (int i = 0; i < 600; i++)
         ids[i] = id;
-    CHECK(tsdb_series_stats(db, ids, 1, 1, st, &done) == TSDB_ERR_INVALID); /* flags are not built */
+    CHECK(tsdb_series_stats(db, ids, 1, 2, st, &done) == TSDB_ERR_INVALID); /* EXACT_ROWS is not built */
     CHECK(tsdb_series_stats(db, ids, 65537, 0, st, &done) == TSDB_ERR_INVALID);
     CHECK(tsdb_series_stats(db, ids, 1, 0, st, NULL) == TSDB_ERR_INVALID);
     OK(tsdb_series_stats(db, ids, 0, 0, st, &done));
