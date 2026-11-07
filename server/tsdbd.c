@@ -2100,6 +2100,26 @@ static int sock_outq(int fd, int *q)
 #endif
 }
 
+/* The send-progress window of one connection (on_tick; tests/test_out_send.c): `acked` is what the client has consumed
+ * so far (bytes handed to the socket minus SIOCOUTQ). The first reading is the baseline; a window that has seen
+ * timeout_s x SEND_MIN_RATE bytes starts again; and a window that is timeout_s old without that has expired. The
+ * count of bytes, not any change of the queue, is progress: a client taking a few bytes whenever its small window
+ * opens changes the queue all the time and moves nothing worth a worker. */
+static void send_window_note(int64_t *t0, int64_t *base, int64_t acked, int64_t now_ms, int timeout_s)
+{
+    if (*base < 0)
+        *base = acked;
+    else if (acked - *base >= (int64_t)timeout_s * SEND_MIN_RATE) {
+        *t0 = now_ms;
+        *base = acked;
+    }
+}
+
+static bool send_window_expired(int64_t t0, int64_t now_ms, int timeout_s)
+{
+    return now_ms - t0 >= timeout_s * 1000LL;
+}
+
 /* What c's receive buffer counts in req_held: all of it once grown past IN_KEEP. */
 static void in_account(conn *c)
 {
@@ -2646,16 +2666,11 @@ static void on_tick(void)
             int q;
             if (sock_outq(c->fd, &q) == 0) {
                 int64_t acked = atomic_load_explicit(&c->tx_total, memory_order_relaxed) - q;
-                if (c->tx_base < 0)
-                    c->tx_base = acked;
-                else if (acked - c->tx_base >= (int64_t)send_timeout_s * SEND_MIN_RATE) {
-                    c->tx_t0 = now_ms;
-                    c->tx_base = acked;
-                }
+                send_window_note(&c->tx_t0, &c->tx_base, acked, now_ms, send_timeout_s);
             }
         } else
             c->tx_win = false;
-        if (c->send_inflight && !c->closed && now_ms - c->tx_t0 >= send_timeout_s * 1000LL) {
+        if (c->send_inflight && !c->closed && send_window_expired(c->tx_t0, now_ms, send_timeout_s)) {
             if (send_logged != now) {
                 send_logged = now;
                 fprintf(stderr, "tsdbd: connection closed: its output did not move for %d s\n", send_timeout_s);

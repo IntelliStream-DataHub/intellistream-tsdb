@@ -1447,6 +1447,9 @@ struct eng {
      * fail_lock before `failed` is stored, so whoever sees `failed` can read it */
     atomic_bool failed;
     atomic_int refs;       /* callers inside this engine through the tsdb handle (volumes.c, ha.md 15.5 step 2) */
+    atomic_int mrefs;      /* name, type and class lookups on it (route_meta): they never block a recovery's idle wait,
+                            * only the free of a retired engine (a steady stream of lookups must not starve it) */
+    uint32_t adopted_series, adopted_states; /* the first names the next engine took over (eng_adopt_names) */
     atomic_bool quiesced;  /* no new caller: the volume is being recovered */
     bool retiring;         /* eng_close keeps the names of the dictionaries (eng_retire) */
     pthread_mutex_t fail_lock; /* innermost; held only to fill fail_msg */
@@ -1584,6 +1587,10 @@ int eng_close(eng *db);
 /* As eng_close, for an engine replaced by a fresh open of its directory (ha.md 15.5): the name strings stay, for the
  * `tsdb_series_name` pointers callers hold until tsdb_close. */
 int eng_retire(eng *db, pthread_mutex_t *mu, char ***kept, size_t *nkept, size_t *capkept);
+/* The new engine of a reopen takes over the name strings of the old one that it also has (same name at the same
+ * index; the dictionaries are append-only), frees its own copies, and eng_retire(old) then keeps only the rest: the
+ * pointers tsdb_series_name handed out stay valid, and a recovery adds no names to kept_names. Before neu is listed. */
+void eng_adopt_names(eng *neu, eng *old);
 /* Recovery of a halted engine (revalidate.c, ha.md 15.5 step 3 and 4); see tsdb_volume_reopen. */
 int wal_verify_tail(eng *db, const char *dir); /* 0 intact, 1 the storage lost what was durable, <0 error */
 int wal_relog(eng *db, const char *dir, uint64_t *rows); /* the rows memory holds into a new segment */
@@ -1669,6 +1676,9 @@ typedef struct qcuts {
 /* One engine's cut on its own (latest.c): taken, then released, by the caller; the qcut is not heap-allocated. */
 int cut_take(struct eng *db, qcut *c);
 void cut_release(qcut *c);
+/* A request's cuts (qcuts) hold a reference on each engine they cut, for tsdb_volume_idle (volumes.c) */
+void eng_cut_hold(struct eng *db);
+void eng_cut_drop(struct eng *db);
 extern __thread qcuts *cur_cuts; /* the multi-series request this thread works for; NULL elsewhere */
 void qcuts_init(qcuts *cs);
 void qcuts_free(qcuts *cs);
@@ -1832,6 +1842,7 @@ void tsdb_test_reopen_hook(void (*fn)(void *, int phase), void *arg);
 void *tsdb_test_meta_hold(struct tsdb *t, tsdb_sid id);
 int tsdb_test_meta_use(void *hold);
 void tsdb_test_meta_release(void *hold);
+size_t tsdb_test_kept_names(struct tsdb *t); /* name strings of retired engines still kept (not adopted by a new one) */
 /* test hook: the WAL tail kept for switches, and how far segments are unlinked (durably) */
 void tsdb_test_wal_state(struct tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced);
 /* test hook: every granule of the first volume, with its partition's class (tests/test_classes.c) */

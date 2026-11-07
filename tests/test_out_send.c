@@ -36,8 +36,39 @@ static size_t drain(int fd, uint8_t *to, size_t cap)
     }
 }
 
+/* Security review m1: the send timeout judges bytes consumed per window, not a change of the socket's queue. A client
+ * that takes 1 KB a second changes SIOCOUTQ at every tick and used to hold the connection for as long as it liked;
+ * one that takes 100 KB a second keeps it, however long. */
+static void send_window(void)
+{
+    enum { TO = 2, TICK = 1000 };
+    for (int rate = 0; rate <= 1; rate++) { /* 0: 1 KB/s, 1: 100 KB/s */
+        int64_t t0 = 0, base = -1, acked = 0, now_ms = 0;
+        bool cut = false;
+        int ticks = 0;
+        for (; ticks < 600 && !cut; ticks++) {
+            now_ms += TICK;
+            acked += rate ? 100 * 1024 : 1024;
+            send_window_note(&t0, &base, acked, now_ms, TO);
+            cut = send_window_expired(t0, now_ms, TO);
+        }
+        if (rate == 0)
+            CHECK(cut && ticks <= 4); /* the first reading is the baseline: closed at the first window's end */
+        else
+            CHECK(!cut);
+    }
+    /* just under and just at the minimum rate over one window */
+    int64_t t0 = 0, base = -1;
+    send_window_note(&t0, &base, 0, 0, TO);
+    send_window_note(&t0, &base, (int64_t)TO * SEND_MIN_RATE - 1, 1999, TO);
+    CHECK(send_window_expired(t0, 2000, TO) && base == 0);
+    send_window_note(&t0, &base, (int64_t)TO * SEND_MIN_RATE, 1999, TO);
+    CHECK(!send_window_expired(t0, 2000, TO) && t0 == 1999 && base == (int64_t)TO * SEND_MIN_RATE);
+}
+
 int main(void)
 {
+    send_window();
     enum { BIG = 256 << 10, MORE = 1024, SMALL = 100 };
     uint8_t *data = malloc(BIG + MORE + SMALL), *got = malloc(BIG + MORE + SMALL);
     for (size_t i = 0; i < BIG + MORE + SMALL; i++)

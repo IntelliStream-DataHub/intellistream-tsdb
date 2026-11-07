@@ -197,6 +197,16 @@ static atomic_bool stop;
 static atomic_int server_pid;
 static pthread_mutex_t server_lock = PTHREAD_MUTEX_INITIALIZER;
 static int restarts;
+/* The nemesis's own idleness (power nemesis): the server dies by itself a few ms after it is up (crashfs), and the
+ * nemesis is meant to notice at once and restart it. death_thread stamps the first moment it sees the server exited
+ * while the nemesis is napping (not inside its fault, where stopping and starting servers is the harness's time);
+ * the nemesis records how long after that it woke up. What the machine does to the server (a slow start, a late
+ * crash) is not in it, and a run under load differs only by the scheduling delay of a 5 ms poll. */
+static _Atomic int64_t death_ts;
+static atomic_bool nem_busy;
+static double react_ms[16384];
+static int nreact;
+static bool idle_mutant;            /* --mutant-idle: a nemesis that sleeps through its naps; the check must fail */
 static char markpath[PATH_MAX]; /* eio: crashfs writes the path of the file it failed here */
 static char slogpath[PATH_MAX]; /* the stderr of the server's latest start */
 
@@ -1057,10 +1067,14 @@ static void *nemesis_thread(void *arg)
     uint64_t r = mix(seed + 77);
     while (!atomic_load(&stop)) {
         r = mix(r);
-        nap(150000 + (useconds_t)(r % 600000), (!strcmp(nemesis, "power") && crashfs) || md);
+        nap(150000 + (useconds_t)(r % 600000), ((!strcmp(nemesis, "power") && crashfs) && !idle_mutant) || md);
         if (atomic_load(&stop))
             break;
+        int64_t dts = atomic_exchange(&death_ts, 0);
+        if (dts && nreact < (int)(sizeof react_ms / sizeof *react_ms))
+            react_ms[nreact++] = (double)(now_ns() - dts) / 1e6;
         pthread_mutex_lock(&server_lock);
+        atomic_store(&nem_busy, true);
         if (!strcmp(nemesis, "kill")) {
             stop_server(SIGKILL);
             start_server(false);
@@ -1083,6 +1097,7 @@ static void *nemesis_thread(void *arg)
             server_gone();
             start_server(true);
             restarts++;
+            atomic_store(&death_ts, 0); /* a death seen while we were killing it is ours */
         } else if (!strcmp(nemesis, "eio")) {
             pid_t pid = atomic_load(&server_pid);
             int st = 0;
@@ -1161,9 +1176,35 @@ static void *nemesis_thread(void *arg)
             usleep(100000 + (useconds_t)(r % 300000));
             signal_pid(pid, SIGCONT);
         }
+        atomic_store(&nem_busy, false);
         pthread_mutex_unlock(&server_lock);
     }
     return NULL;
+}
+
+/* Stamps the moment the server is first seen dead while the nemesis naps (see death_ts). */
+static void *death_thread(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&stop)) {
+        usleep(2000);
+        pid_t pid = atomic_load(&server_pid);
+        siginfo_t si;
+        si.si_pid = 0;
+        if (pid > 0 && !atomic_load(&nem_busy) && atomic_load(&death_ts) == 0 &&
+            waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == pid && !atomic_load(&nem_busy) &&
+            atomic_load(&server_pid) == pid) {
+            int64_t zero = 0;
+            atomic_compare_exchange_strong(&death_ts, &zero, now_ns());
+        }
+    }
+    return NULL;
+}
+
+static int cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
 }
 
 /* -------------------------------------------------------------- checker */
@@ -2021,6 +2062,7 @@ int main(int argc, char **argv)
                                    {"seed", required_argument, 0, 's'},    {"crashfs", required_argument, 0, 'f'},
                                    {"workload", required_argument, 0, 'w'}, {"verify-checksums", no_argument, 0, 'V'},
                                    {"auth", no_argument, 0, 'A'},           {"outagefs", required_argument, 0, 'o'},
+                                   {"mutant-idle", no_argument, 0, 'I'},
                                    {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -2038,6 +2080,7 @@ int main(int argc, char **argv)
             break;
         case 'V': verify = true; break;
         case 'A': auth = true; break;
+        case 'I': idle_mutant = true; break;
         case 'o': outagefs_lib = optarg; break;
         default: return 2;
         }
@@ -2126,12 +2169,18 @@ int main(int argc, char **argv)
     run_start = now_ns();
     for (int i = 0; i < nclients; i++)
         pthread_create(&th[i], NULL, client, (void *)(intptr_t)i);
+    pthread_t dth;
+    bool dmon = !strcmp(nemesis, "power") && crashfs;
     if (strcmp(nemesis, "none"))
         pthread_create(&nem, NULL, nemesis_thread, NULL);
+    if (dmon)
+        pthread_create(&dth, NULL, death_thread, NULL);
     usleep((useconds_t)(seconds * 1e6));
     atomic_store(&stop, true);
     if (strcmp(nemesis, "none"))
         pthread_join(nem, NULL);
+    if (dmon)
+        pthread_join(dth, NULL);
     for (int i = 0; i < nclients; i++)
         pthread_join(th[i], NULL);
     if (fport)
@@ -2212,11 +2261,21 @@ int main(int argc, char **argv)
     if (!strcmp(nemesis, "power")) {
         v += death_problems;
         /* the nemesis must keep killing: a server left dead until the next tick (the clients idle, 40 restarts in
-         * 20 s instead of 300) tests far less, and passes every check above */
-        if (crashfs && seconds >= 10 && restarts < (int)(seconds * 4)) {
-            fprintf(stderr, "  only %d restarts in %.0f s (at least %d expected): the nemesis was idle\n", restarts,
-                    seconds, (int)(seconds * 4));
-            v++;
+         * 20 s instead of 300) tests far less, and passes every check above. Judged by the nemesis's own reaction
+         * to a server that died by itself, not by a count of restarts: a count also falls when the machine is busy
+         * and the servers start slowly (0 violations, "only 60 restarts in 20 s" under load). The median of
+         * the reaction stays within a few polls of 5 ms whatever the load; a nemesis that sleeps through its naps
+         * (150 to 750 ms) has a median of hundreds. */
+        if (crashfs && nreact >= 5) {
+            qsort(react_ms, (size_t)nreact, sizeof *react_ms, cmp_double);
+            double med = react_ms[nreact / 2], p90 = react_ms[(int)((double)nreact * 0.9)];
+            printf("nemesis: %d server deaths seen while napping, reaction median %.0f ms, p90 %.0f ms (%d restarts)\n",
+                   nreact, med, p90, restarts);
+            if (med > 100) {
+                fprintf(stderr, "  the nemesis took a median of %.0f ms to notice a dead server (at most 100 expected): "
+                        "it was idle\n", med);
+                v++;
+            }
         }
     }
     unlink(markpath);

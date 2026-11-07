@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include "tsdb.h"
 
+#include <dirent.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -442,6 +443,209 @@ static void merge_clears_loss(void)
     }
 }
 
+/* ------------------------------------------- security review 0.9.1, minor */
+
+size_t tsdb_test_kept_names(tsdb *t);
+
+static int dir_entries(const char *dir)
+{
+    int n = 0;
+    DIR *d = opendir(dir);
+    if (!d)
+        return -1;
+    for (struct dirent *e; (e = readdir(d)) != NULL;)
+        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+            n++;
+    closedir(d);
+    return n;
+}
+
+/* m1: the reopen makes the checks of every open (ROOT_ID, META's volume number) before it repairs or writes
+ * anything. A bare directory where the volume was (a mount point whose export did not come back) was adopted: SERIES
+ * and a WAL segment were written into it and its META said volume 0. */
+static void reopen_checks_directory(void)
+{
+    char root[1024], vol[1024], bak[1100];
+    snprintf(root, sizeof root, "%s/bare_root", scratch);
+    snprintf(vol, sizeof vol, "%s/bare_vol", scratch);
+    snprintf(bak, sizeof bak, "%s.moved", vol);
+    sh("rm -rf '%s' '%s' '%s'", root, vol, bak);
+    tsdb_sid s;
+    tsdb *db = reval_open(root, vol, &s, "bare");
+    int64_t ts[5] = {1, 2, 3, 4, 5};
+    float v[5] = {0};
+    OK(tsdb_insert_series(db, s, ts, v, 5)); /* only in the WAL: no part says the volume lost something */
+    stop_volume(db);
+    sh("mv '%s' '%s' && mkdir '%s'", vol, bak, vol);
+    CHECK(tsdb_volume_reopen(db, 1, NULL) != 0);
+    CHECK(dir_entries(vol) == 0); /* nothing written into it */
+    /* the same directory with a META of another volume number */
+    sh("rmdir '%s' && mv '%s' '%s' && sed -i 's/^volume=1$/volume=2/' '%s/META' && grep -q '^volume=2$' '%s/META'", vol,
+       bak, vol, vol, vol);
+    CHECK(tsdb_volume_reopen(db, 1, NULL) != 0);
+    sh("sed -i 's/^volume=2$/volume=1/' '%s/META'", vol);
+    tsdb_volume_report rep;
+    OK(tsdb_volume_reopen(db, 1, &rep)); /* the real directory is taken, and the volume's rows are still there */
+    OK(tsdb_volume_resume(db, 1));
+    CHECK(count(db, s) == 5);
+    tsdb_close(db);
+}
+
+/* m2: a recovery adds no names to the kept ones: the new engine takes over the old one's strings, and the pointer a
+ * caller got before is the one it gets after. Each recovery used to keep every name of the volume until tsdb_close. */
+static void names_not_kept(void)
+{
+    char root[1024], vol[1024];
+    snprintf(root, sizeof root, "%s/kept_root", scratch);
+    snprintf(vol, sizeof vol, "%s/kept_vol", scratch);
+    sh("rm -rf '%s' '%s'", root, vol);
+    tsdb_sid s0;
+    tsdb *db = reval_open(root, vol, &s0, "kept_0");
+    enum { N = 200 };
+    tsdb_sid ids[N];
+    const char *before[N];
+    for (int i = 0; i < N; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "kept_%d", i);
+        OK(tsdb_series_at(db, name, vol, &ids[i]));
+        before[i] = tsdb_series_name(db, ids[i]);
+    }
+    for (int round = 0; round < 3; round++) {
+        stop_volume(db);
+        OK(tsdb_volume_reopen(db, 1, NULL));
+        OK(tsdb_volume_resume(db, 1));
+    }
+    CHECK(tsdb_test_kept_names(db) == 0);
+    for (int i = 0; i < N; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "kept_%d", i);
+        CHECK(strcmp(before[i], name) == 0);                /* still valid (ASan: not freed) */
+        CHECK(tsdb_series_name(db, ids[i]) == before[i]);   /* and the engine's own */
+    }
+    tsdb_sid more;
+    OK(tsdb_series_at(db, "kept_new", vol, &more)); /* a name created after the reopens is not shared */
+    CHECK(strcmp(tsdb_series_name(db, more), "kept_new") == 0);
+    stop_volume(db);
+    OK(tsdb_volume_reopen(db, 1, NULL));
+    OK(tsdb_volume_resume(db, 1));
+    CHECK(tsdb_test_kept_names(db) == 0);
+    CHECK(strcmp(tsdb_series_name(db, more), "kept_new") == 0);
+    tsdb_close(db); /* every string freed once (ASan) */
+}
+
+/* m3: a steady stream of name lookups does not keep the volume from going idle (they used to count as calls inside
+ * the engine, and eight readers never let tsdb_volume_idle return). */
+typedef struct {
+    tsdb *db;
+    tsdb_sid s;
+    int stop; /* __atomic */
+    long calls;
+    int bad;
+} reader;
+
+static void *reader_main(void *arg)
+{
+    reader *r = arg;
+    while (!__atomic_load_n(&r->stop, __ATOMIC_SEQ_CST)) {
+        const char *n = tsdb_series_name(r->db, r->s);
+        if (!n || strcmp(n, "lookups") != 0)
+            r->bad++;
+        r->calls++;
+    }
+    return NULL;
+}
+
+static void lookups_do_not_starve_idle(void)
+{
+    char root[1024], vol[1024];
+    snprintf(root, sizeof root, "%s/starve_root", scratch);
+    snprintf(vol, sizeof vol, "%s/starve_vol", scratch);
+    sh("rm -rf '%s' '%s'", root, vol);
+    reader rd[8];
+    tsdb_sid s;
+    tsdb *db = reval_open(root, vol, &s, "lookups");
+    pthread_t th[8];
+    for (int i = 0; i < 8; i++) {
+        rd[i] = (reader){.db = db, .s = s};
+        CHECK(pthread_create(&th[i], NULL, reader_main, &rd[i]) == 0);
+    }
+    sleep_ms(50);
+    OK(tsdb_volume_quiesce(db, 1));
+    CHECK(tsdb_volume_idle(db, 1, 10000) == 0);
+    OK(tsdb_volume_reopen(db, 1, NULL)); /* the old engine is freed once the lookups still inside it have returned */
+    OK(tsdb_volume_resume(db, 1));
+    sleep_ms(50);
+    for (int i = 0; i < 8; i++)
+        __atomic_store_n(&rd[i].stop, 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < 8; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(rd[i].bad == 0 && rd[i].calls > 0);
+    }
+    tsdb_close(db);
+}
+
+/* m4: a tsdb_query_multi call holds the engines it cut until it ends: the volume is not idle while the call runs,
+ * so it is not reopened under the parts the call still references (their last unref unlinks through the engine's
+ * directory), and a new engine at the old one's address is never mistaken for it. The call's first series is on
+ * the root and blocks in the callback; the volume's series ran ahead, finished (its own reference is gone) and
+ * waits for its turn, holding the call's cut of the volume. */
+typedef struct {
+    tsdb *db;
+    tsdb_sid ids[2];
+    int inside, release, rc; /* __atomic */
+} multi_hold;
+
+static int multi_hold_fn(void *ctx, const tsdb_series_result *r)
+{
+    multi_hold *h = ctx;
+    (void)r;
+    __atomic_store_n(&h->inside, 1, __ATOMIC_SEQ_CST);
+    while (!__atomic_load_n(&h->release, __ATOMIC_SEQ_CST))
+        sleep_ms(5);
+    return 0;
+}
+
+static void *multi_hold_main(void *arg)
+{
+    multi_hold *h = arg;
+    tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = INT64_MIN, .end = INT64_MAX};
+    tsdb_multi_opts mo = {.threads = 2};
+    h->rc = tsdb_query_multi(h->db, &q, h->ids, 2, &mo, multi_hold_fn, h);
+    return NULL;
+}
+
+static void multi_cut_holds_volume(void)
+{
+    char root[1024], vol[1024];
+    snprintf(root, sizeof root, "%s/cutref_root", scratch);
+    snprintf(vol, sizeof vol, "%s/cutref_vol", scratch);
+    sh("rm -rf '%s' '%s'", root, vol);
+    multi_hold h = {0};
+    tsdb *db = reval_open(root, vol, &h.ids[1], "cut_vol");
+    h.db = db;
+    OK(tsdb_series_at(db, "cut_root", root, &h.ids[0])); /* first in the call, on the volume that stays up */
+    int64_t ts[5] = {1, 2, 3, 4, 5};
+    float v[5] = {0};
+    OK(tsdb_insert_series(db, h.ids[0], ts, v, 5));
+    OK(tsdb_insert_series(db, h.ids[1], ts, v, 5));
+    OK(tsdb_flush(db)); /* parts: the cut references them */
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, multi_hold_main, &h) == 0);
+    while (!__atomic_load_n(&h.inside, __ATOMIC_SEQ_CST))
+        sleep_ms(5);
+    sleep_ms(300); /* the volume's series ran ahead on the helper thread and waits for its turn: no series is in it */
+    OK(tsdb_volume_quiesce(db, 1));
+    CHECK(tsdb_volume_idle(db, 1, 300) == 1); /* but the call's cut of it is */
+    CHECK(tsdb_volume_reopen(db, 1, NULL) == TSDB_ERR_INVALID);
+    __atomic_store_n(&h.release, 1, __ATOMIC_SEQ_CST);
+    pthread_join(th, NULL);
+    CHECK(h.rc == 0 || h.rc == TSDB_ERR_UNAVAILABLE);
+    CHECK(tsdb_volume_idle(db, 1, 5000) == 0);
+    OK(tsdb_volume_reopen(db, 1, NULL));
+    OK(tsdb_volume_resume(db, 1));
+    tsdb_close(db);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1)
@@ -524,6 +728,10 @@ int main(int argc, char **argv)
     latest_quiesced();
     meta_reference_at_reopen();
     merge_clears_loss();
+    reopen_checks_directory();
+    names_not_kept();
+    lookups_do_not_starve_idle();
+    multi_cut_holds_volume();
     if (failures) {
         fprintf(stderr, "test_recover: %d failures\n", failures);
         return 1;
