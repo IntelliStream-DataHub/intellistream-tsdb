@@ -71,6 +71,13 @@ static void usage(void)
             "  volume list                        list the volumes, the database directory first\n"
             "  upgrade                            carry a database closed cleanly by the previous release\n"
             "                                     (disk format 8) over to this one, in place; stop followers first\n"
+            "  feed enable [--retention AGE] [--max-bytes N[K|M|G|T]] [--min-free-pct N]\n"
+            "                                     keep the WAL segments a flush no longer needs, for the change\n"
+            "                                     feed (default 24h and 64G per volume, 10%% free space); not\n"
+            "                                     beside a running tsdbd\n"
+            "  feed disable                       stop keeping them and remove the kept segments\n"
+            "  feed info                          per volume: on or off, feed id, limits, floor, kept segments\n"
+            "  feed new-id                        a new feed id for every volume (after restoring a backup)\n"
             "  stats                              rows, parts, size, compression ratio, where the bytes go\n"
             "  stats series NAME...               rows, bytes, parts and range of each series\n"
             "  parts                              list active parts (partition class and range)\n"
@@ -809,6 +816,85 @@ static int cmd_stats_series(tsdb *db, int n, char **names)
     return 0;
 }
 
+/* "20", "64G", "512M": a byte count with an optional binary suffix */
+static bool parse_bytes(const char *s, uint64_t *out)
+{
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno || end == s || !v)
+        return false;
+    int shift = 0;
+    if (*end == 'K' || *end == 'k')
+        shift = 10, end++;
+    else if (*end == 'M' || *end == 'm')
+        shift = 20, end++;
+    else if (*end == 'G' || *end == 'g')
+        shift = 30, end++;
+    else if (*end == 'T' || *end == 't')
+        shift = 40, end++;
+    if (*end || v > (UINT64_MAX >> shift))
+        return false;
+    *out = (uint64_t)v << shift;
+    return true;
+}
+
+/* tsdb DIR feed enable|disable|info|new-id (src/feed.h): the writer open the verb needs fails with
+ * TSDB_ERR_LOCKED beside tsdbd, which is the "refused beside a running writer" of design 2.13 */
+static int cmd_feed(tsdb *db, int argc, char **argv)
+{
+    if (argc < 1)
+        usage();
+    const char *verb = argv[0];
+    int rc;
+    if (strcmp(verb, "enable") == 0) {
+        tsdb_feed_options fo;
+        memset(&fo, 0, sizeof fo);
+        for (int i = 1; i < argc; i++) {
+            int64_t ms;
+            uint64_t n;
+            if (strcmp(argv[i], "--retention") == 0 && i + 1 < argc) {
+                if (!parse_interval(argv[++i], &ms) || ms < 1000 || ms / 1000 > UINT32_MAX)
+                    usage();
+                fo.retention_s = (uint32_t)(ms / 1000);
+            } else if (strcmp(argv[i], "--max-bytes") == 0 && i + 1 < argc) {
+                if (!parse_bytes(argv[++i], &fo.max_bytes))
+                    usage();
+            } else if (strcmp(argv[i], "--min-free-pct") == 0 && i + 1 < argc) {
+                if (!parse_bytes(argv[++i], &n) || n > 90)
+                    usage();
+                fo.min_free_pct = (uint32_t)n;
+            } else {
+                usage();
+            }
+        }
+        if ((rc = tsdb_feed_enable(db, &fo)) != 0)
+            die("feed enable", rc);
+    } else if (strcmp(verb, "disable") == 0 && argc == 1) {
+        if ((rc = tsdb_feed_disable(db)) != 0)
+            die("feed disable", rc);
+    } else if (strcmp(verb, "new-id") == 0 && argc == 1) {
+        if ((rc = tsdb_feed_new_id(db)) != 0)
+            die("feed new-id", rc);
+    } else if (strcmp(verb, "info") != 0 || argc != 1) {
+        usage();
+    }
+    for (uint32_t v = 0; v < tsdb_volume_count(db); v++) {
+        tsdb_feed_info fi;
+        if ((rc = tsdb_feed_info_get(db, v, &fi)) != 0)
+            die("feed info", rc);
+        if (!fi.on) {
+            printf("%u\t%s\toff\n", v, tsdb_volume_path(db, v));
+            continue;
+        }
+        printf("%u\t%s\ton\tfeed_id %016" PRIx64 "\tretention %us\tmax_bytes %" PRIu64 "\tmin_free %u%%\t"
+               "floor %" PRIu64 "\tkept %" PRIu64 " segments, %" PRIu64 " bytes\n",
+               v, tsdb_volume_path(db, v), fi.feed_id, fi.retention_s, fi.max_bytes, fi.min_free_pct,
+               fi.floor_event, fi.retained_segments, fi.retained_bytes);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
@@ -867,7 +953,8 @@ int main(int argc, char **argv)
     }
     bool writes = strcmp(cmd, "insert") == 0 || strcmp(cmd, "import") == 0 || strcmp(cmd, "optimize") == 0 ||
                   strcmp(cmd, "drop-before") == 0 || strcmp(cmd, "create") == 0 || strcmp(cmd, "delete") == 0 ||
-                  (strcmp(cmd, "retention") == 0 && argc > 4);
+                  (strcmp(cmd, "retention") == 0 && argc > 4) ||
+                  (strcmp(cmd, "feed") == 0 && argc > 3 && strcmp(argv[3], "info") != 0);
     tsdb_options o;
     tsdb_options_init(&o);
     o.read_only = !writes;
@@ -950,6 +1037,8 @@ int main(int argc, char **argv)
             usage();
         if ((rc = tsdb_series_lookup(db, argv[3], &id)) != 0 || (rc = tsdb_delete_range(db, id, a, b)) != 0)
             die(argv[3], rc);
+    } else if (strcmp(cmd, "feed") == 0) {
+        ret = cmd_feed(db, argc - 3, argv + 3);
     } else if (strcmp(cmd, "retention") == 0) {
         tsdb_sid id;
         int64_t limit = 0;
