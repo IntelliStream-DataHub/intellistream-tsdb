@@ -183,13 +183,48 @@
  *   with the right on all series sees NOTFOUND); QUERY_MULTI answers a denied series with its own status
  *   TSDB_ERR_DENIED and the others as before. A user dropped while connected is answered TSDB_ERR_AUTH and
  *   the connection closes.
+ *   Version 13: the HA bodies (docs/ha.md 9 and 15.4, docs/design-ha-modes.md 2), defined once here and coded once in
+ *   tsdb_wire.h. The floor stays 12: the new statuses only ever answer requests a version-12 client already sends, and
+ *   a version-12 client treats any status it does not know as an error. A reply with one of these statuses carries the
+ *   op's own reply shape for an error (nothing for most ops; for a streaming op the empty last chunk, QUERY_RAW
+ *   u8 last, u32 n; QUERY_VALUES and QUERY_LTTB u8 last, u8 type, u8 flags, u8 0, u32 n; QUERY_MULTI's END frame:
+ *   u32 index, u32 answered) and then the body:
+ *   TSDB_ERR_UNAVAILABLE (-11)  u16 n, n x entry, [u64 resend_from]
+ *               entry (TSDB_UNAVAIL_ENTRY bytes): u16 vol, u8 reason (TSDB_WHY_*), u8 flags, u32 epoch, i64 since_ms,
+ *               u32 retry_after_ms, u64 outage_id. Definitely not applied: the client retries the same request after
+ *               retry_after_ms (the largest of the entries) within its time budget. vol is TSDB_VOL_ANY (0xffff) when
+ *               the server cannot say which volume (a request that names none, or a library-level refusal);
+ *               epoch is 0 without HA; since_ms is Unix ms of the volume's last state change (0: unknown);
+ *               outage_id counts the times the volume left AVAILABLE. resend_from is sent only for a frame that
+ *               carried a seq (none does yet: no stream state in 13).
+ *   TSDB_ERR_MOVED (-10)        u16 n, n x {u16 vol, u32 epoch, u8 flags, u32 node_id, u16 len, addr}, [u64 resend_from]
+ *               flags TSDB_MOVED_HANDOFF: a clean release is under way. Definitely not applied; the client refreshes
+ *               TOPOLOGY, or connects to addr, and sends the request again. addr is "host:port" (empty: no address
+ *               known, the client asks TOPOLOGY).
+ *   TSDB_ERR_PARTIAL (-12)      u16 nv, nv x {u16 vol, i16 status}, u32 nrows, u8 not_applied[(nrows + 7) / 8],
+ *               then u16 n, n x entry (the UNAVAILABLE entries of the refused volumes). Bit i of not_applied is set
+ *               when row i of the frame was not applied (status UNAVAILABLE or MOVED: send again; DROPPED: never).
+ *   TSDB_ERR_DROPPED (-13)      u16 vol, i64 dropped_before. Final: not applied and never will be.
+ *   TOPOLOGY    [u64 since_gen]  ->  u64 gen, u32 nn, nn x {u32 node_id, u8 alive, u16 len, addr},
+ *               u32 n, n x {u16 vol, u8 role (TSDB_ROLE_*), u8 health (TSDB_HEALTH_*), u32 epoch, u8 reason, u8 0,
+ *               u16 domain, i64 since_ms, u32 owner (a node_id), u16 server, u16 len, addr, u16 plen, path}
+ *               An empty request is since_gen 0. since_gen is reserved: version 13 answers in full whatever it is
+ *               (the clients send none), so no client may rely on a short reply; a version that answers an
+ *               unchanged gen shortly will say so by its number. gen changes whenever anything in the reply does
+ *               (clients poll; there is no push). domain and server are 0xffff when unknown. addr is the owner's address for clients;
+ *               empty means "the node you are connected to". path is the volume's directory, sent only to a superuser
+ *               (a client needs ids, not paths). tsdbd without a cluster answers itself as node 1, every volume
+ *               as OWNER (FOLLOWER under --follow), with the health of its storage domain.
+ *   STATUS      -> u32 len, then len bytes of `key=value` lines (docs/ha.md 15.4); superuser only.
+ *   Version 13 also moves the planned numbers of the other designs one up: QUERY_LATEST is protocol 14, the change
+ *   feed 15, statistics 16 (their op numbers are unchanged: 39 to 47; TOPOLOGY is 48 and STATUS 49).
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
 #include <stdint.h>
 
-#define TSDB_PROTOCOL_VERSION 12
+#define TSDB_PROTOCOL_VERSION 13
 #define TSDB_PROTOCOL_MIN 12 /* the oldest version tsdbd and the clients speak */
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
@@ -236,7 +271,9 @@
     X(USER_PASSWORD, 35, user_password)                    \
     X(GRANT, 36, grant)                                    \
     X(REVOKE, 37, revoke)                                  \
-    X(USER_LIST, 38, user_list)
+    X(USER_LIST, 38, user_list)                            \
+    X(TOPOLOGY, 48, topology)                              \
+    X(STATUS, 49, status)
 
 #define TSDB_OP_ENUM_(name, num, metric) TSDB_OP_##name = num,
 enum { TSDB_OP_REPLY = 0, TSDB_OPS(TSDB_OP_ENUM_) };
@@ -249,6 +286,28 @@ enum { TSDB_OP_REPLY = 0, TSDB_OPS(TSDB_OP_ENUM_) };
 #define TSDB_USER_SUPERUSER 1      /* user flags */
 enum { TSDB_SEL_ALL = 0, TSDB_SEL_PREFIX = 1, TSDB_SEL_NAME = 2, TSDB_SEL_GLOB = 3 };
 enum { TSDB_RIGHT_READ = 1, TSDB_RIGHT_INSERT = 2, TSDB_RIGHT_DELETE = 4, TSDB_RIGHT_ADMIN = 8 };
+
+/* Version 13: the HA bodies. Reasons a volume is not available (ha.md 15.2; 0: none given). Never renumbered:
+ * clients log them and metrics label by them. */
+enum {
+    TSDB_WHY_NONE = 0, TSDB_WHY_NFS_DOWN = 1, TSDB_WHY_NOT_MOUNTED = 2, TSDB_WHY_STUCK = 3, TSDB_WHY_FULL = 4,
+    TSDB_WHY_BUSY = 5, TSDB_WHY_ROOT_DOWN = 6, TSDB_WHY_LOCKED = 7, TSDB_WHY_RECOVERING = 8, TSDB_WHY_DIVERGED = 9,
+    TSDB_WHY_MAINTENANCE = 10, TSDB_WHY_SUSPECT = 11, TSDB_WHY_PROMOTING = 12, TSDB_WHY_FENCED = 13,
+    TSDB_WHY_MISMATCH = 14, TSDB_WHY_NO_OWNER = 15, TSDB_WHY_UNREACHABLE = 16, TSDB_WHY_RELOADING = 17,
+    TSDB_WHY_LAST = 17
+};
+enum { TSDB_HEALTH_AVAILABLE = 0, TSDB_HEALTH_DEGRADED = 1, TSDB_HEALTH_UNAVAILABLE = 2 };
+enum { TSDB_ROLE_NONE = 0, TSDB_ROLE_OWNER = 1, TSDB_ROLE_STANDBY = 2, TSDB_ROLE_FOLLOWER = 3 };
+#define TSDB_MOVED_HANDOFF 1        /* MOVED entry flags */
+#define TSDB_VOL_ANY 0xffffu        /* the vol of an entry that names no one volume */
+#define TSDB_UNAVAIL_ENTRY 28       /* bytes of one UNAVAILABLE entry */
+#define TSDB_UNAVAIL_MAX 1024u      /* entries in one body: a decoder refuses more (a body is never that large) */
+#define TSDB_RETRY_MIN_MS 1         /* retry_after_ms is clamped by the client to [1 ms, TSDB_RETRY_MAX_MS] */
+#define TSDB_RETRY_MAX_MS 60000u
+#define TSDB_BUDGET_MS 30000        /* the default time budget of a client retrying UNAVAILABLE and MOVED */
+#define TSDB_TOPOLOGY_MAX_NODES 4096u
+#define TSDB_TOPOLOGY_MAX_VOLS 65535u
+#define TSDB_ADDR_MAX 255u          /* the longest address in a body */
 
 #define TSDB_BUCKET_ROW 64 /* bytes per bucket in a QUERY_BUCKETS reply */
 #define TSDB_SPREAD 1       /* QUERY_BUCKETS/QUERY_BOUNDS fields: the spread follows each bucket (version 8) */

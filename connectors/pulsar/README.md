@@ -366,10 +366,12 @@ usual case: a point per series and time) are unaffected. TCP keepalive is on
 as well.
 
 Unknown codes are retried on purpose: a wrong "retry" stalls the sink where
-everyone can see it, a wrong "dead-letter" silently moves data aside. Later
-protocol versions may add codes such as "unavailable" or "moved"; they are
-retried until `ErrorClassifier` names them, and `permanentCodes` /
-`retryableCodes` change the decision without a rebuild.
+everyone can see it, a wrong "dead-letter" silently moves data aside. The
+refusals of protocol 13 "unavailable", "moved" and "partial" are retried (the
+client has already retried within its own budget); "dropped" is final (the rows
+were never applied and never will be) and goes to the dead-letter topic. A code
+a later protocol adds is retried until `ErrorClassifier` names it, and
+`permanentCodes` / `retryableCodes` change the decision without a rebuild.
 
 If one message holds points of several series and one of them is refused, the
 whole message is dead-lettered; its other points may already be in tsdb. Do not

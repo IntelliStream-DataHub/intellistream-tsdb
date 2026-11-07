@@ -7,12 +7,12 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 | | where | now |
 |---|---|---|
 | release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.9.1 |
-| disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 8 |
-| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 12 |
+| disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 9 (unreleased; 0.9.0 and 0.9.1 wrote 8) |
+| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 13 |
 | oldest protocol spoken (the floor) | `TSDB_PROTOCOL_MIN` in `include/tsdb_protocol.h` | 12 |
 | embedded C ABI version | `TSDB_ABI_VERSION` in `include/tsdb.h`, `tsdb_abi_version()` | 3 |
 
-0.9.1 reads databases of disk format 8 only (so did 0.9.0), and speaks to clients and servers of protocol 12 only.
+0.9.1 reads databases of disk format 8 only (so did 0.9.0), and speaks to clients and servers of protocol 12 only. The next release speaks protocol 13 (the HA bodies of docs/ha.md section 15.4) and still accepts 12: its floor is 12. It reads those of format 9 (it carries a format-8 database over with `tsdb <dir> upgrade`, below).
 
 0.9.1 changed neither the disk format nor the protocol, and the C ABI is still 3: it only added functions and structs
 (`tsdb_latest`, the volume and health calls) and the status codes `TSDB_ERR_UNAVAILABLE` (-11) and
@@ -22,12 +22,29 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 
 | version | what changed |
 |---|---|
+| 9 | the WAL record has a 32-byte header with a log number (`fno`) and the group commit's time, and can be a marker (`docs/design-cdc.md` 2.1); the part header is 48 bytes (the range of log numbers its rows had, and the time they were written); each volume has an `FNO` file, the durable bound of the log numbers; `META` may say `requires=` (a feature this binary does not know is refused, and named) and, in an upgraded database, `parts_v8=1`; `MANIFEST` has an `fno_next` line (for followers) |
 | 8 | `CATALOG` is gone: a series id is `(volume + 1) << 32 \| local`, so it names its volume, and each volume's `META` holds its number (`volume=N`, checked at open) |
 | 7 | part keys `4 x first base partition + class` and the `CLASSES` file (partition classes); zstd frames without magic number and content size; the granule index bit-packed per part (about 32 bytes an entry instead of 160) behind a 64-byte footer that gives the index's length (`index_len`) |
 | 6 | block headers name their codec in 7 bits; the dictionary codec |
 | 5 | the spread in every granule entry (160 bytes) |
 
-Each version is refused by every release that reads another one; carry data over with export and import.
+Each version is refused by every release that reads another one; carry data over with export and import. The one
+exception is the step from 8 to 9, which `tsdb <dir> upgrade` does in place:
+
+- Close the database cleanly with 0.9.0 (stop tsdbd; no `wal_*` segment may be left, nor an intent or a `tmp_*`
+  part; the upgrade refuses and says which), **stop every follower on other hosts** (they cannot be seen from here, and
+  a 0.9.0 follower that reads a MANIFEST of version 9 reports damage), then run `tsdb <dir> upgrade` with the new
+  release. It takes the locks of every volume, writes `FNO`, MANIFEST and `META` of each volume and of the root
+  last, and can simply be run again if it died. Keep the export of the old release until the new one has run for a
+  while: 0.9.0 refuses the upgraded database (it names the version), and a way back is the export. **Do not run
+  0.9.0's `tsdb` on an upgraded database**, `volume add` above all: that release adds a volume without an `FNO` file.
+  (This release makes the file at the volume's first open when the volume never held a record, and its own `volume add`
+  refuses a root of another format or with an unknown `requires=`.)
+- The parts are not rewritten: they keep their 24-byte headers, `META` says `parts_v8=1`, and the open reads such a
+  part (only where `META` says so, never in a database created at 9). Merges of idle partitions, and `tsdb <dir>
+  optimize` at once, rewrite them one by one; the open logs how many are left, and the line leaves `META` when none is.
+- **Before 1.0 that allowance is removed** (`docs/tasks/pre-1.0-v8-parts.md`): run 0.9.x until the count is zero
+  (or `optimize`), or export and import. A 1.0 that finds a format-8 part refuses it and says so.
 
 ## What 0.9.x promises
 

@@ -30,6 +30,13 @@
  *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--port-file FILE] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
  *         [--verify-checksums] [--pin-index] [--metrics-port N|auto [--metrics-bind ADDR]]
+ *         [--cluster --cluster-secret-file F [--peer-port 7071|0] [--peer-listen ADDR] [--advertise HOST]
+ *          [--rack NAME]]
+ *
+ * --cluster runs the cluster thread (cluster.c, docs/design-cluster.md): the metadata group on a peer port of its
+ * own (--peer-port, default the client port + 1; bound to --peer-listen, default --listen), with its files in
+ * DIR/meta/. --advertise is the host other servers and clients reach this one at (default --listen, which must then
+ * not be a wildcard). Step 1 of the design: the engine and the client port are unchanged.
  *
  * --metrics-port serves Prometheus metrics (GET /metrics) on a port of its own, from a
  * thread of its own: see metrics.c. Off by default; binds to --listen unless --metrics-bind.
@@ -45,6 +52,7 @@
  * and renamed once the listener is up; an old FILE is removed at start), and the banner names the real port.
  * Scripts and tests start servers this way and never compute a port, so two of them cannot collide.
  * --metrics-port auto does the same for the metrics port, which the file then names as a third number.
+ * With --cluster the file names the peer port as a fourth ("PORT PID MPORT PEER_PORT", MPORT 0 without metrics).
  *
  * --follow serves queries from a directory another process writes (on this
  * host or another one, over NFS), following its parts and WAL as they change.
@@ -100,9 +108,12 @@
 #define _GNU_SOURCE
 #include "tsdb.h"
 #include "tsdb_protocol.h"
+#include "tsdb_wire.h"
 #include "../client/tsdb_pack.h"
+#include "../client/tsdb_crypto.h"
 #include "metrics.h"
 #include "auth.h"
+#include "cluster.h"
 
 #ifndef TSDB_BUILD_VERSION
 #define TSDB_BUILD_VERSION "dev"
@@ -265,6 +276,7 @@ typedef struct conn {
     pthread_cond_t cv;
     buf out;
     atomic_bool closing;
+    atomic_uint proto;  /* the version the HELLO settled on (TSDB_PROTOCOL_MIN until there is one): HA bodies from 13 */
     bool notified;      /* `out` has bytes the main thread was told of (n_out pushed): it sends them */
     bool tx_loop;       /* the main thread sends: a send in flight, bytes left in `sending`, or bytes a worker's
                            send left in `out` or handed it (out_put); the worker only appends until the main thread
@@ -435,8 +447,105 @@ static void write_on_wait(void *ctx, int delta)
     worker_waits(delta);
 }
 
+/* The volume an UNAVAILABLE reply names (protocol 13): the volume that refused the request in hand, else the volume
+ * of its series id, else TSDB_VOL_ANY. Set per request by handle() and dom_enter on the worker running it, read by
+ * frame_put, so every path that answers TSDB_ERR_UNAVAILABLE (the admission, a quiesced volume under an engine
+ * call) sends the same body. */
+static __thread uint16_t unav_vol = TSDB_VOL_ANY;
+
 #include "domains.h"
 static void dom_waits(int delta) { worker_waits(delta); }
+
+static uint32_t unav_jitter(uint32_t ms) /* +-20% */
+{
+    static __thread uint64_t x;
+    if (!x)
+        x = (uint64_t)(uintptr_t)&x ^ ((uint64_t)time(NULL) << 20) ^ 0x9e3779b97f4a7c15ull;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    return (uint32_t)((uint64_t)ms * (800 + x % 401) / 1000);
+}
+
+/* The health of volume v from its storage domain, no I/O: what TOPOLOGY, STATUS and UNAVAILABLE say. A volume
+ * outside every domain (and the root) is AVAILABLE here: its failure ends the process. */
+static void vol_health(size_t v, uint8_t *health, uint8_t *reason, int64_t *since_ms, uint64_t *outage_id,
+                       uint32_t *retry_ms, uint16_t *domain)
+{
+    *health = TSDB_HEALTH_AVAILABLE;
+    *reason = TSDB_WHY_NONE;
+    *since_ms = 0;
+    *outage_id = 0;
+    *retry_ms = 1000;
+    *domain = 0xffff;
+    int d = dom_of(v);
+    if (d < 0 || !dom.health)
+        return;
+    *domain = (uint16_t)d;
+    tsdb_domain_info di;
+    if (tsdb_health_info(dom.health, d, &di) != 0)
+        return;
+    *since_ms = di.since_ms;
+    *outage_id = di.outage_id;
+    bool diverged = v < DOM_MAX_VOLS && atomic_load(&dom.vol[v].diverged);
+    int64_t age = di.age_ms < 0 ? 0 : di.age_ms;
+    uint32_t after = (uint32_t)(age / 10 < 1000 ? 1000 : age / 10 > 60000 ? 60000 : age / 10);
+    if (diverged) {
+        *health = TSDB_HEALTH_UNAVAILABLE;
+        *reason = TSDB_WHY_DIVERGED;
+        *retry_ms = 60000;
+        return;
+    }
+    switch (di.state) {
+    case TSDB_DOM_DOWN:
+        *health = TSDB_HEALTH_UNAVAILABLE;
+        *reason = TSDB_WHY_NFS_DOWN;
+        *retry_ms = after;
+        break;
+    case TSDB_DOM_RECOVERING:
+        *health = TSDB_HEALTH_UNAVAILABLE;
+        *reason = TSDB_WHY_RECOVERING;
+        *retry_ms = after;
+        break;
+    case TSDB_DOM_DEGRADED:
+        *health = TSDB_HEALTH_DEGRADED;
+        *reason = TSDB_WHY_BUSY;
+        *retry_ms = 200;
+        break;
+    default:
+        if (v < DOM_MAX_VOLS && atomic_load(&dom.vol[v].recovering)) {
+            *health = TSDB_HEALTH_UNAVAILABLE;
+            *reason = TSDB_WHY_RECOVERING;
+            *retry_ms = after;
+        }
+        break;
+    }
+}
+
+/* The one entry of an UNAVAILABLE reply: the named volume's health. A refusal whose volume is known to be fine
+ * (the library quiesced it a moment ago) says RECOVERING, the reason a quiesced volume has. */
+static tsdb_unavail unav_entry(uint16_t vol)
+{
+    tsdb_unavail e = {.vol = vol, .reason = TSDB_WHY_NONE};
+    uint8_t health, reason;
+    uint16_t dom_idx;
+    uint32_t retry;
+    if (vol == TSDB_VOL_ANY) { /* the first domain that is not UP, else nothing is known */
+        size_t nvol = dom.db ? tsdb_volume_count(dom.db) : 0;
+        for (size_t v = 1; v < DOM_MAX_VOLS && v < nvol; v++) {
+            vol_health(v, &health, &reason, &e.since_ms, &e.outage_id, &retry, &dom_idx);
+            if (health != TSDB_HEALTH_AVAILABLE)
+                goto found;
+        }
+        e.retry_after_ms = unav_jitter(1000);
+        return e;
+    }
+    vol_health(vol, &health, &reason, &e.since_ms, &e.outage_id, &retry, &dom_idx);
+found:
+    e.reason = health == TSDB_HEALTH_AVAILABLE ? (dom_idx == 0xffff ? TSDB_WHY_NONE : TSDB_WHY_RECOVERING) : reason;
+    e.retry_after_ms = unav_jitter(retry);
+    return e;
+}
 
 /* Tests (TSDBD_TEST_HOLD_LARGE_MS): every large insert, replace and delete sleeps that long after writing its parts,
  * before it publishes them, so a test can write into its keys while it is in flight. */
@@ -647,7 +756,15 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
                       size_t alen, const void *b, size_t blen, const void *d, size_t dlen)
 {
     size_t pre = ix ? TSDB_MULTI_PREFIX : 0;
-    size_t body = 4 + 1 + 4 + pre + alen + blen + dlen;
+    uint8_t ub[2 + TSDB_UNAVAIL_ENTRY]; /* the body of UNAVAILABLE (protocol 13), after the op's own error shape */
+    size_t ulen = 0;
+    /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
+     * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
+    if (status == TSDB_ERR_UNAVAILABLE && atomic_load(&c->proto) >= 13 && (!ix || *ix == TSDB_MULTI_END)) {
+        tsdb_unavail e = unav_entry(unav_vol);
+        ulen = tsdb_wire_put_unavail(ub, sizeof ub, &e, 1);
+    }
+    size_t body = 4 + 1 + 4 + pre + alen + blen + dlen + ulen;
     if (body > TSDB_MAX_FRAME + pre) { /* callers check: a client could not read it, and the length would wrap */
         atomic_store(&c->closing, true);
         shutdown(c->fd, SHUT_RDWR);
@@ -688,13 +805,16 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
         o += blen;
         if (dlen)
             memcpy(o, d, dlen);
+        o += dlen;
+        if (ulen)
+            memcpy(o, ub, ulen);
         ob->len += 4 + body;
         return ob->len >= OB_FLUSH ? ob_flush(ob) : !atomic_load(&c->closing);
     }
     if (ob && !ob_flush(ob))
         return false;
-    struct iovec v[4] = {{hdr, hl}, {(void *)a, alen}, {(void *)b, blen}, {(void *)d, dlen}};
-    return out_put(c, v, 4);
+    struct iovec v[5] = {{hdr, hl}, {(void *)a, alen}, {(void *)b, blen}, {(void *)d, dlen}, {ub, ulen}};
+    return out_put(c, v, 5);
 }
 
 /* Appends a complete reply frame to c's output, waiting while the output is over OUT_CAP. Returns false when the
@@ -1381,6 +1501,123 @@ static int list_emit(void *ctx, bool last, uint32_t n, const uint8_t *e, size_t 
     return reply(o->c, o->id, 0, h, 5, e, len, NULL, 0) ? 0 : TSDB_ERR_STOPPED;
 }
 
+/* The volume a request names by one series id (a name, many ids or no series: TSDB_VOL_ANY), for UNAVAILABLE. */
+static uint16_t req_volume(uint8_t op, const uint8_t *p, size_t len)
+{
+    const auth_op *e = &auth_ops[op];
+    size_t at = e->where == W_ID0 ? 0 : e->where == W_ID8 ? 8 : (size_t)-1;
+    tsdb_sid id;
+    if (at == (size_t)-1 || len < at + 8)
+        return TSDB_VOL_ANY;
+    memcpy(&id, p + at, 8);
+    if (id == TSDB_MANY_SERIES || id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY)
+        return TSDB_VOL_ANY;
+    return (uint16_t)TSDB_SID_VOLUME(id);
+}
+
+static bool g_reader_only; /* --follow or --read-only: every volume is a FOLLOWER in TOPOLOGY */
+
+/* TOPOLOGY of a server without a cluster (protocol 13): itself as node 1, every volume it has, owned by it, with
+ * the health of its storage domain. Its address is empty (the node you are connected to). The paths go to a
+ * superuser only. gen is a hash of the rest of the reply, so it changes exactly when the reply does. */
+static void handle_topology(req *r)
+{
+    conn *c = r->c;
+    uint64_t since;
+    if (tsdb_wire_get_topology_request(r->payload, r->len, &since) != 0) {
+        reply_status(c, r->id, TSDB_ERR_INVALID);
+        return;
+    }
+    uint32_t nv = tsdb_volume_count(db);
+    bool paths = auth_conn_super(&c->auth);
+    size_t cap = 12 + 7 + 4 + (size_t)nv * (30 + 2 + (paths ? 4096 : 0));
+    uint8_t *buf = malloc(cap);
+    if (!buf) {
+        reply_status(c, r->id, TSDB_ERR_NOMEM);
+        return;
+    }
+    size_t at = tsdb_wire_put_topo_head(buf, cap, 0, 1);
+    tsdb_topo_node node = {1, 1, "", 0};
+    at += tsdb_wire_put_topo_node(buf + at, cap - at, &node);
+    at += tsdb_wire_put_u32(buf + at, cap - at, nv);
+    for (uint32_t v = 0; v < nv && v < TSDB_VOL_ANY; v++) {
+        tsdb_topo_vol tv = {.vol = (uint16_t)v, .role = g_reader_only ? TSDB_ROLE_FOLLOWER : TSDB_ROLE_OWNER,
+                            .owner = 1, .server = 0xffff, .addr = "", .path = ""};
+        uint32_t retry;
+        vol_health(v, &tv.health, &tv.reason, &tv.since_ms, &(uint64_t){0}, &retry, &tv.domain);
+        const char *path = paths ? tsdb_volume_path(db, v) : NULL;
+        if (path && strlen(path) <= 4096) {
+            tv.path = path;
+            tv.path_len = (uint16_t)strlen(path);
+        }
+        size_t n = tsdb_wire_put_topo_vol(buf + at, cap - at, &tv);
+        if (n == 0 || n > cap - at)
+            break; /* cannot happen: cap holds every volume at its largest */
+        at += n;
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 8; i < at; i++)
+        h = (h ^ buf[i]) * 1099511628211ull;
+    tsdb_wire_wr64(buf, h);
+    reply(c, r->id, 0, buf, at, NULL, 0, NULL, 0);
+    free(buf);
+}
+
+static const char *why_name(unsigned why)
+{
+    static const char *const names[] = {"none", "nfs_down", "not_mounted", "stuck", "full", "busy", "root_down",
+                                        "locked", "recovering", "diverged", "maintenance", "suspect", "promoting",
+                                        "fenced", "mismatch", "no_owner", "unreachable", "reloading"};
+    return why <= TSDB_WHY_LAST ? names[why] : "unknown";
+}
+
+/* STATUS (superuser): key=value lines, ha.md 15.4. */
+static void handle_status(req *r)
+{
+    conn *c = r->c;
+    if (r->len != 0) {
+        reply_status(c, r->id, TSDB_ERR_INVALID);
+        return;
+    }
+    uint32_t nv = tsdb_volume_count(db);
+    size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256;
+    char *t = malloc(cap + 4);
+    if (!t) {
+        reply_status(c, r->id, TSDB_ERR_NOMEM);
+        return;
+    }
+    size_t at = 4;
+#define ST_PUT(...) (at += (size_t)snprintf(t + at, cap - at, __VA_ARGS__))
+    ST_PUT("node.id=1\nnode.role=%s\nprotocol=%d\nvolumes=%u\n", g_reader_only ? "follower" : "owner",
+           TSDB_PROTOCOL_VERSION, (unsigned)nv);
+    for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
+        uint8_t health, reason;
+        int64_t since;
+        uint64_t outage;
+        uint32_t retry;
+        uint16_t d;
+        vol_health(v, &health, &reason, &since, &outage, &retry, &d);
+        ST_PUT("vol.%u.health=%s\nvol.%u.reason=%s\n", (unsigned)v,
+               health == TSDB_HEALTH_AVAILABLE ? "available" : health == TSDB_HEALTH_DEGRADED ? "degraded" : "unavailable",
+               (unsigned)v, why_name(reason));
+    }
+    for (int d = 0; dom.health && d < dom.ndoms && at + 256 < cap; d++) {
+        tsdb_domain_info di;
+        if (tsdb_health_info(dom.health, d, &di) != 0)
+            continue;
+        static const char *const st[] = {"up", "degraded", "down", "recovering"};
+        ST_PUT("domain.%d.state=%s\ndomain.%d.since_ms=%lld\ndomain.%d.outage_id=%llu\ndomain.%d.probe_ms=%d\n", d,
+               di.state >= 0 && di.state <= 3 ? st[di.state] : "?", d, (long long)di.since_ms, d,
+               (unsigned long long)di.outage_id, d, di.write_ms);
+    }
+#undef ST_PUT
+    if (at > cap)
+        at = cap; /* snprintf truncated: cannot happen with the margins above */
+    tsdb_wire_wr32((uint8_t *)t, (uint32_t)(at - 4));
+    reply(c, r->id, 0, t, at, NULL, 0, NULL, 0);
+    free(t);
+}
+
 static void handle_op(req *r);
 static void handle(req *r)
 {
@@ -1399,6 +1636,7 @@ static void handle(req *r)
         reply_error(c, r->id, r->op, rc);
         return;
     }
+    unav_vol = req_volume(r->op, p, len);
     int dv = dom_volume_of(r->op, p, len); /* a volume of a storage domain: at most DOM_CAP requests inside */
     if (dv >= 0) {
         if ((rc = dom_enter(dv)) != 0) {
@@ -1471,6 +1709,7 @@ static void handle_op(req *r)
             if (theirs < v)
                 v = theirs;
         }
+        atomic_store(&c->proto, v);
         uint8_t h[64]; /* the version, then whether login is required and how (version 12) */
         memcpy(h, &v, 4);
         size_t hl = 4 + auth_hello(h + 4);
@@ -1905,6 +2144,8 @@ static void handle_op(req *r)
         reply(c, r->id, 0, v, sizeof v, NULL, 0, NULL, 0);
         return;
     }
+    case TSDB_OP_TOPOLOGY: handle_topology(r); return;
+    case TSDB_OP_STATUS: handle_status(r); return;
     default: rc = TSDB_ERR_INVALID; break;
     }
     if (rc == 0 && (r->op == TSDB_OP_INSERT || r->op == TSDB_OP_INSERT_VALUES)) {
@@ -2663,6 +2904,7 @@ static void on_accept(int fd)
         drop_new_conn(fd, "connection", ENOMEM);
         return;
     }
+    atomic_store(&c->proto, TSDB_PROTOCOL_MIN);
     if (io == IO_EPOLL) {
         if ((size_t)fd >= fd_conn_cap) {
             size_t cap = fd_conn_cap ? fd_conn_cap : 1024;
@@ -3040,7 +3282,7 @@ static int listen_on(const char *addr, int *port_p)
 
 /* "PORT PID [METRICS_PORT]\n", written to a temporary file and renamed once the listener is up, so a reader sees
  * all of it or none (a half-written pid would read as another server's, and the harness would refuse a good one). A stale file is removed at startup: whoever finds one now knows this server wrote it. */
-static int write_port_file(const char *path, int port, int mport)
+static int write_port_file(const char *path, int port, int mport, int pport)
 {
     /* A name nobody can guess, created new (mkostemp: O_EXCL, so never through a link planted there): the directory
      * may be shared. */
@@ -3068,8 +3310,10 @@ static int write_port_file(const char *path, int port, int mport)
         return -1;
     }
     int ok = fprintf(f, "%d %d", port, (int)getpid()) > 0;
-    if (mport)
+    if (mport || pport)
         ok = (fprintf(f, " %d", mport) > 0 && ok);
+    if (pport)
+        ok = (fprintf(f, " %d", pport) > 0 && ok);
     ok = (fputc('\n', f) != EOF && ok);
     ok = (fflush(f) == 0 && ok);
     ok = (fclose(f) == 0 && ok);
@@ -3154,10 +3398,17 @@ int main(int argc, char **argv)
                                    {"login-timeout", required_argument, 0, 'O'},
                                    {"exit-with-parent", optional_argument, 0, 'E'},
                                    {"health-domain", required_argument, 0, 0x100},
+                                   {"cluster", no_argument, 0, 'c'},
+                                   {"peer-port", required_argument, 0, 'y'},
+                                   {"peer-listen", required_argument, 0, 'Y'},
+                                   {"advertise", required_argument, 0, 'a'},
+                                   {"rack", required_argument, 0, 'k'},
+                                   {"cluster-secret-file", required_argument, 0, 'S'},
                                    {0, 0, 0, 0}};
-    int ch, metrics_port = 0, metrics_on = 0, no_auth = 0;
+    int ch, metrics_port = 0, metrics_on = 0, no_auth = 0, cluster_on = 0, peer_port = -1, cluster_opts = 0;
     char *health_domains[DOM_MAX];
     int nhealth = 0;
+    const char *peer_addr = NULL, *advertise = NULL, *rack = "", *secret_file = NULL;
     const char *metrics_addr = NULL;
     long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page > 0 && (size_t)pages / 8 * (size_t)page > req_budget)
@@ -3216,6 +3467,12 @@ int main(int argc, char **argv)
         case 'W': lttb_max_threshold = (uint64_t)num_arg("lttb-max-threshold", optarg, 3, LLONG_MAX); break;
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'A': no_auth = 1; break;
+        case 'c': cluster_on = 1; break;
+        case 'y': peer_port = (int)num_arg("peer-port", optarg, 0, 65535); cluster_opts = 1; break;
+        case 'Y': peer_addr = optarg; cluster_opts = 1; break;
+        case 'a': advertise = optarg; cluster_opts = 1; break;
+        case 'k': rack = optarg; cluster_opts = 1; break;
+        case 'S': secret_file = optarg; cluster_opts = 1; break;
         case 'E':
             start_ppid = getppid();
             if (start_ppid == 1) { /* the parent is gone already (or never was one to follow) */
@@ -3246,8 +3503,12 @@ int main(int argc, char **argv)
         default: goto usage;
         }
     }
+    if (cluster_on && (!secret_file || o.read_only || o.follow)) {
+        fprintf(stderr, "tsdbd: --cluster needs --cluster-secret-file, and a writer (not --read-only or --follow)\n");
+        return 2;
+    }
     if (!dir || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
-        (metrics_addr && !metrics_on)) {
+        (metrics_addr && !metrics_on) || (cluster_opts && !cluster_on)) {
     usage:
         fprintf(stderr, "usage: tsdbd --version\n"
                         "       tsdbd --dir DIR [--listen ADDR] [--port %d|0] [--port-file FILE] [--workers N]\n"
@@ -3261,9 +3522,25 @@ int main(int argc, char **argv)
                         "             [--lttb-max-threshold 16777216]\n"
                         "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
                         "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n"
-                        "             [--health-domain PREFIX]...\n",
-                TSDB_DEFAULT_PORT);
+                        "             [--health-domain PREFIX]...\n"
+                        "             [--cluster --cluster-secret-file F [--peer-port %d|0] [--peer-listen ADDR]\n"
+                        "              [--advertise HOST] [--rack NAME]]\n",
+                TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1);
         return 2;
+    }
+    uint8_t secret[CLUSTER_SECRET_MAX];
+    size_t secret_len = 0;
+    if (cluster_on) {
+        char err[512];
+        if (cluster_read_secret(secret_file, secret, sizeof secret, &secret_len, err, sizeof err) != 0) {
+            fprintf(stderr, "tsdbd: %s\n", err);
+            return 1;
+        }
+        const char *host = advertise ? advertise : addr;
+        if (!strcmp(host, "0.0.0.0") || !strcmp(host, "::")) {
+            fprintf(stderr, "tsdbd: --cluster on a wildcard --listen needs --advertise HOST\n");
+            return 2;
+        }
     }
     if (port_file)
         unlink(port_file);
@@ -3276,6 +3553,7 @@ int main(int argc, char **argv)
     if (no_auth)
         fprintf(stderr, "tsdbd: --no-auth: no login, every client may read and write every series (user admin ops "
                         "are refused, A28): listen on a trusted interface only\n");
+    g_reader_only = o.read_only || o.follow;
     if (auth_init(dir, !no_auth, !o.read_only && !o.follow, db) != 0) {
         tsdb_close(db);
         return 1;
@@ -3304,9 +3582,16 @@ int main(int argc, char **argv)
     /* static: the accept and failwatch threads read it through a pointer, and a startup failure after they began
      * (the port file) returns from main while they may not have read it yet */
     static int lfd;
+    if (cluster_on && peer_port < 0) /* by default the client port + 1; with --port 0 one the kernel chooses */
+        peer_port = port == 0 || port == 65535 ? 0 : port + 1;
     lfd = listen_on(addr, &port);
     if (lfd < 0)
         return 1;
+    int pfd = -1;
+    if (cluster_on) {
+        if ((pfd = listen_on(peer_addr ? peer_addr : addr, &peer_port)) < 0)
+            return 1;
+    }
     int mfd = -1;
     if (metrics_on)
         metrics_enable(); /* before any connection: the hooks count from the start */
@@ -3395,13 +3680,28 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: cannot start the USERS reload thread: %s\n", strerror(rc));
         return 1;
     }
+    if (cluster_on) {
+        const char *host = advertise ? advertise : addr;
+        const char *lb = strchr(host, ':') ? "[" : "", *rb = strchr(host, ':') ? "]" : "";
+        char cadv[256], padv[256];
+        snprintf(cadv, sizeof cadv, "%s%s%s:%d", lb, host, rb, port);
+        snprintf(padv, sizeof padv, "%s%s%s:%d", lb, host, rb, peer_port);
+        struct cluster_cfg cc = {.dir = dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
+                                 .rack = rack, .secret = secret, .secret_len = secret_len};
+        if (cluster_start(&cc) != 0)
+            return 1;
+        tsdb_wipe(secret, sizeof secret);
+        fprintf(stderr, "tsdbd: cluster peer port on %s:%d (advertised as %s)\n", peer_addr ? peer_addr : addr,
+                peer_port, padv);
+    }
     fs_warn(db, o.verify_checksums);
     /* io stays last: scripts read it from the end of this line (bench-tsdb.sh, test_stability) */
     fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, %s, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
             max_conns, no_auth ? "no login (--no-auth)" : "login required", tsdb_simd_level(),
             io == IO_URING ? "io_uring" : "epoll");
-    if (port_file && write_port_file(port_file, port, metrics_on ? metrics_port : 0) != 0) { /* last: whoever reads it finds a server that serves */
+    if (port_file && write_port_file(port_file, port, metrics_on ? metrics_port : 0,
+                                      cluster_on ? peer_port : 0) != 0) { /* last: whoever reads it finds a server that serves */
         fprintf(stderr, "tsdbd: cannot write %s: %s\n", port_file, strerror(errno));
         return 1;
     }
@@ -3419,6 +3719,8 @@ int main(int argc, char **argv)
     close(lfd);
     if (mfd >= 0)
         metrics_stop(); /* before tsdb_close: it reads the database */
+    if (cluster_on)
+        cluster_stop();
     pthread_mutex_lock(&work_lock);
     work_stop = true;
     pthread_cond_broadcast(&work_cv);

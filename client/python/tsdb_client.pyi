@@ -40,6 +40,14 @@ ERR_NOTFOUND: int
 ERR_TOO_MANY_BUCKETS: int
 ERR_STOPPED: int
 ERR_READONLY: int
+ERR_MOVED: int
+"""Another node owns the volume (-10): the request was not applied."""
+ERR_UNAVAILABLE: int
+"""The volume's storage is unavailable (-11): the request was not applied."""
+ERR_PARTIAL: int
+"""A request over several volumes was applied for some only (-12)."""
+ERR_DROPPED: int
+"""The rows are below the volume's drop watermark (-13): never applied."""
 ERR_DENIED: int
 """The user may not do this (no grant covers the series, or not its admin)."""
 ERR_AUTH: int
@@ -96,6 +104,35 @@ class TsdbError(Exception):
     """For a series of a multi-series call that failed with errors="raise",
     the whole answer (the other series' results and statuses). None for
     other calls."""
+
+class TsdbUnavailable(TsdbError):
+    """A volume's storage is unavailable (code ERR_UNAVAILABLE): the request was not applied. The client already retried within its budget (`retry`); `retry_after` (seconds), `entries` (one dict per refused volume: volume, reason, epoch, since_ms, retry_after, outage_id) and `has_body` say what the server sent."""
+
+    has_body: bool
+    """False: the server sent no body (or a malformed one); only the code is known."""
+    retry_after: float
+    """The longest wait the server asked for, in seconds (0 without a body)."""
+    entries: list[dict[str, Any]]
+    """One dict per refused volume."""
+
+class TsdbMoved(TsdbError):
+    """Another node owns the volume (code ERR_MOVED): the request was not applied. `moved` lists dicts of volume, epoch, node_id and addr."""
+
+    moved: list[dict[str, Any]]
+    """One dict per volume: volume, epoch, node_id, addr ("" when the reply names none)."""
+
+class TsdbPartial(TsdbError):
+    """A request over several volumes was applied for some only (code ERR_PARTIAL): `volumes` lists (volume, status), `rows` the row count and `not_applied` the indexes of the rows that were not applied."""
+
+    volumes: list[tuple[int, int]]
+    rows: int
+    not_applied: list[int]
+
+class TsdbDropped(TsdbError):
+    """The rows are below the volume's drop watermark (code ERR_DROPPED): never applied, never to be sent again. `volume` and `before_ms` say where the watermark is."""
+
+    volume: int
+    before_ms: int
 
 def strerror(code: int) -> str:
     """Returns the text for a TSDB_ERR_* code, such as ERR_NOTFOUND."""
@@ -518,6 +555,10 @@ class Client:
             instead, without the LF or CR LF that ends it, at every login.
         require_auth: Refuse (ERR_AUTH) a server that does not ask for a
             login (--no-auth). Otherwise such a server is used without one.
+        retry: Seconds one request may be retried: tsdbd answers UNAVAILABLE when a volume's storage is down
+            and MOVED when another node owns it, both meaning the request was not applied, so the client waits what
+            the reply asks for, follows a MOVED and sends the request again until this budget is spent; then the call
+            raises TsdbUnavailable or TsdbMoved. 30 by default; 0 turns retries off.
 
     Raises:
         TsdbError: The connection failed; ERR_AUTH when the login failed (an
@@ -541,7 +582,60 @@ class Client:
         password: str | None = None,
         password_file: str | os.PathLike[str] | None = None,
         require_auth: bool = False,
+        retry: float = 30.0,
     ) -> Client: ...
+    @staticmethod
+    def connect_nodes(
+        nodes: str,
+        timeout: float | None = None,
+        keepalive: bool = True,
+        *,
+        user: str | None = None,
+        password: str | None = None,
+        password_file: str | os.PathLike[str] | None = None,
+        require_auth: bool = False,
+        retry: float = 30.0,
+    ) -> Client:
+        """Connects to the first of several nodes that answers.
+
+        Args:
+            nodes: "host:port,host:port,..." (IPv6 as "[::1]:7070"; a node without a port is on 7070).
+                The list is shuffled once, so a fleet of clients spreads over the nodes. The client
+                keeps it: a MOVED reply without an address, or an address that cannot be reached,
+                goes on to the next node.
+            timeout, keepalive, user, password, password_file, require_auth, retry: As for Client().
+
+        Raises:
+            TsdbError: No node answered (the last error), or the login failed (ERR_AUTH).
+            ValueError: The list is empty or a node is not a host:port.
+        """
+    def set_retry(self, retry: float) -> None:
+        """Sets the time budget of one request's retries, in seconds; 0 turns retries off.
+
+        tsdbd answers UNAVAILABLE when a volume's storage is down and MOVED when another node owns it:
+        both mean the request was not applied. The client waits what the reply asks for (retry_after),
+        follows a MOVED and sends the request again until the budget is spent; then the call raises
+        TsdbUnavailable or TsdbMoved. The default is 30 seconds.
+
+        Raises:
+            ValueError: retry is negative, not finite, or under a nanosecond.
+            TsdbError: The client is closed.
+        """
+    def topology(self) -> dict[str, Any]:
+        """The nodes and volumes the server lists (protocol 13): a dict with generation, nodes (dicts of node_id,
+        alive, addr; addr "" is the node that answered) and volumes (dicts of volume, role, health, epoch,
+        reason, domain, since_ms, owner, server, addr and path; path only for a superuser). A single server
+        lists itself and every volume it serves.
+
+        Raises:
+            TsdbError: The client is closed or the call failed.
+        """
+    def status(self) -> str:
+        """The server's status as key=value lines (a superuser).
+
+        Raises:
+            TsdbError: ERR_DENIED for a user who is no superuser; the client is closed.
+        """
     def set_timeout(self, timeout: float | None) -> None:
         """Changes how long a call waits for the server, in seconds; None waits forever.
 
@@ -2012,6 +2106,8 @@ class Pool:
         keepalive: TCP keepalive, as in Client.
         user, password, password_file, require_auth: The login, as in Client;
             every connection logs in, a replacement too.
+        retry: Seconds one request may be retried on UNAVAILABLE or MOVED, as in Client (30 by default; 0 for
+            none). The exceptions of a Pool's batch calls carry their class but not the reply's body.
 
     A connection that breaks (an I/O error or a timeout) is replaced by a new
     one before its next query, and so is every other connection made before
@@ -2039,6 +2135,7 @@ class Pool:
         password: str | None = None,
         password_file: str | os.PathLike[str] | None = None,
         require_auth: bool = False,
+        retry: float = 30.0,
     ) -> Pool: ...
     @property
     def connections(self) -> int:

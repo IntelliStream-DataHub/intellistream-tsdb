@@ -319,6 +319,9 @@ static int meta_write(eng *db)
     int len = snprintf(buf, sizeof buf,
                        "version=%d\npartition_ms=%" PRId64 "\ngranule_rows=%u\npartition_classes=%d\nvolume=0\n",
                        FORMAT_VERSION, db->partition_ms, db->granule_rows, db->cls_on ? 1 : 0);
+    /* FNO first, synced with the directory: META is what says the database exists (fno.c) */
+    if (fno_create(db->dirfd, 1, db->opt.fsync) != 0)
+        return TSDB_ERR_IO;
     int fd = openat(db->dirfd, META_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0)
         return TSDB_ERR_IO;
@@ -397,12 +400,35 @@ static int meta_load_or_create(eng *db, bool read_only)
         if (version != FORMAT_VERSION) {
             /* the format may change in a 0.9.x release (docs/compatibility.md): another version is refused, never
              * read as if it were ours */
-            fprintf(stderr,
-                    "tsdb: the database has disk format version %d; tsdb %s reads version %d only. Export the data "
-                    "with the release that wrote it and import it here (docs/compatibility.md)\n",
-                    version, TSDB_VERSION, FORMAT_VERSION);
+            if (version == PREV_FORMAT_VERSION)
+                fprintf(stderr,
+                        "tsdb: the database has disk format version %d; tsdb %s reads version %d only. Close it "
+                        "cleanly with the release that wrote it and run `tsdb DIR upgrade` here, or export the data "
+                        "with that release and import it here (docs/compatibility.md)\n",
+                        version, TSDB_VERSION, FORMAT_VERSION);
+            else
+                fprintf(stderr,
+                        "tsdb: the database has disk format version %d; tsdb %s reads version %d only. Export the "
+                        "data with the release that wrote it and import it here (docs/compatibility.md)\n",
+                        version, TSDB_VERSION, FORMAT_VERSION);
             return TSDB_ERR_CORRUPT;
         }
+        if ((line = strstr(buf, "requires="))) {
+            /* a feature this binary does not know changes what the files mean (markers to apply, links to keep):
+             * the open refuses and names it. None is known in this release. */
+            char feat[96];
+            size_t k = 0;
+            for (const char *c = line + 9; *c && *c != '\n' && k < sizeof feat - 1; c++)
+                feat[k++] = *c;
+            feat[k] = '\0';
+            if (k) {
+                fprintf(stderr,
+                        "tsdb: META requires the feature(s) \"%s\", which tsdb %s does not know: the open "
+                        "refuses (use a release that does)\n", feat, TSDB_VERSION);
+                return TSDB_ERR_INVALID;
+            }
+        }
+        db->parts_v8 = db->v8_meta = (line = strstr(buf, "parts_v8=")) && atoi(line + 9) == 1;
         if (pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS || classes < 0 || classes > 1)
             return TSDB_ERR_CORRUPT;
         db->partition_ms = pms;
@@ -418,6 +444,71 @@ static int meta_load_or_create(eng *db, bool read_only)
         return TSDB_ERR_INVALID;
     cls_setup(db, db->opt.partition_classes);
     return meta_write(db);
+}
+
+/* An upgraded database (`tsdb DIR upgrade`) keeps the parts of format 8 until merges rewrite them, which an idle
+ * partition's merge or tsdb_optimize does one part at a time (merge.c). Logged at open, and once none is left META's
+ * parts_v8=1 goes (tmp, fsync, rename, directory fsync): from the next open a part with the old header is damage like
+ * any other, and a database that has none can be opened by every later release. A failed rewrite only leaves the
+ * line, which is harmless: nothing depends on it going. */
+void v8_parts_account(eng *db, bool at_open)
+{
+    if (db->opt.read_only || db->opt.follow)
+        return;
+    pthread_mutex_lock(&db->lock);
+    size_t n = 0;
+    for (size_t i = 0; db->v8_meta && i < db->nparts; i++)
+        n += db->parts[i]->hdr_len == PART_HDR_V8;
+    bool drop = db->v8_meta && n == 0;
+    bool log = db->v8_meta && n > 0 && at_open;
+    if (drop)
+        db->v8_meta = false; /* one caller does it */
+    pthread_mutex_unlock(&db->lock);
+    if (log)
+        fprintf(stderr, "tsdb: %s: %zu part%s still ha%s the format-8 header (carried over by `tsdb DIR upgrade`): "
+                "merges of idle partitions rewrite them, `tsdb DIR optimize` does it at once\n", db->dir, n,
+                n == 1 ? "" : "s", n == 1 ? "s" : "ve");
+    if (!drop)
+        return;
+    char *txt = NULL;
+    int fd = openat(db->dirfd, META_FILE, O_RDONLY | O_CLOEXEC);
+    ssize_t r = -1;
+    char buf[512];
+    if (fd >= 0) {
+        r = read(fd, buf, sizeof buf - 1);
+        close(fd);
+    }
+    if (r <= 0)
+        goto fail;
+    buf[r] = '\0';
+    txt = malloc((size_t)r + 1);
+    if (!txt)
+        goto fail;
+    size_t len = 0;
+    for (const char *l = buf; *l;) {
+        const char *e = strchr(l, '\n');
+        size_t ll = e ? (size_t)(e - l) + 1 : strlen(l);
+        if (strncmp(l, "parts_v8=", 9) != 0) {
+            memcpy(txt + len, l, ll);
+            len += ll;
+        }
+        l += ll;
+    }
+    char tmp[256];
+    meta_tmp_make(tmp, sizeof tmp);
+    fd = openat(db->dirfd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        goto fail;
+    bool ok = write(fd, txt, len) == (ssize_t)len && tsdb_fsync(fd) == 0;
+    close(fd);
+    if (!ok || renameat(db->dirfd, tmp, db->dirfd, META_FILE) != 0 || tsdb_fsync(db->dirfd) != 0)
+        goto fail;
+    free(txt);
+    fprintf(stderr, "tsdb: %s: no part has the format-8 header any more: META no longer allows it\n", db->dir);
+    return;
+fail:
+    free(txt);
+    fprintf(stderr, "tsdb: %s: could not take parts_v8 out of META (left as it is; it does no harm)\n", db->dir);
 }
 
 /* Every series a part holds rows or tombstones of is in SERIES: its record was synced before the series was used.
@@ -556,7 +647,8 @@ static int load_parts(eng *db, bool read_only)
         const char *name = e->d_name;
         /* Only names the engine writes: a volume may be a directory with the user's own files in it
          * (tsdb_volume_add_dir), and their tmp_notes.txt or retired_old.csv is not ours to delete. */
-        if (part_tmp_name(name) || meta_tmp_name(name)) {
+        if (part_tmp_name(name) || meta_tmp_name(name) || strcmp(name, FNO_FILE ".tmp") == 0 ||
+            strcmp(name, "MANIFEST.tmp") == 0) { /* an interrupted fno_create or `tsdb upgrade` */
             if (!read_only)
                 unlinkat(db->dirfd, name, 0);
             continue;
@@ -585,7 +677,7 @@ static int load_parts(eng *db, bool read_only)
         if (!part_file_name(name))
             continue;
         part *p;
-        int r = part_open(db->dirfd, name, db->opt.pin_index, &p);
+        int r = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, &p);
         if (r == TSDB_ERR_NOTFOUND)
             continue; /* removed while we listed the directory */
         if (r == 0 && p->grows != db->granule_rows) {
@@ -721,7 +813,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         db->opt.retention_merge_s = 3600;
     if (db->opt.merge_idle_s == 0) /* a zeroed struct: merging everything all the time is never meant */
         db->opt.merge_idle_s = 300;
-    db->dirfd = db->lockfd = db->wal_fd = -1;
+    db->dirfd = db->lockfd = db->wal_fd = db->fno_fd = -1;
+    db->fno_next = 1;
     db->series.fd = -1;
     db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0;
     pthread_mutex_init(&db->lock, NULL);
@@ -733,6 +826,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->publish_lock, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
+    pthread_mutex_init(&db->fno_lock, NULL);
     pthread_mutex_init(&db->dir_sync_lock, NULL);
     pthread_cond_init(&db->wal_cv, NULL);
     pthread_cond_init(&db->merge_cv, NULL);
@@ -816,6 +910,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         db->wal_removed = db->wal_removed_synced = db->wal_seq - 1; /* and unlinked them, with a directory fsync */
         if ((rc = manifest_publish(db)) != 0)
             goto fail;
+        v8_parts_account(db, true);
     }
 
     ret_clock_init(db);
@@ -971,6 +1066,8 @@ int eng_close(eng *db)
         db->cc_free = c->next;
         codec_free(c);
     }
+    if (db->fno_fd >= 0)
+        close(db->fno_fd);
     if (db->lockfd >= 0)
         close(db->lockfd);
     if (db->dirfd >= 0)
@@ -984,6 +1081,7 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->publish_lock);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);
+    pthread_mutex_destroy(&db->fno_lock);
     pthread_mutex_destroy(&db->dir_sync_lock);
     pthread_cond_destroy(&db->wal_cv);
     pthread_cond_destroy(&db->merge_cv);
@@ -1199,7 +1297,9 @@ int eng_drop_before(eng *db, int64_t ts)
     if (db->opt.read_only)
         return TSDB_ERR_READONLY;
     /* memtable rows become parts first, so they are dropped with them */
-    int rc = eng_flush(db);
+    int rc = jr_intent(db, JR_DROP, &ts);
+    if (rc == 0)
+        rc = eng_flush(db);
     if (rc)
         return rc;
     pthread_mutex_lock(&db->lock);
@@ -1236,6 +1336,7 @@ int eng_drop_before(eng *db, int64_t ts)
         }
     }
     db->drop_pending = false; /* also after a failed engine: the retire loop above is the only exit */
+    jr_commit(db, JR_DROP, &ts);
     pthread_mutex_unlock(&db->lock);
     if ((rc = eng_sync_dir(db, "fsync of the directory after retiring dropped parts")) != 0)
         return rc; /* failed since the flush, here or elsewhere */

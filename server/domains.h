@@ -112,6 +112,7 @@ static int dom_enter(int v)
     bool nonup = atomic_load(&dom.nonup[d]);
     if (nonup && dom.vol[v].inflight >= DOM_CAP) {
         pthread_mutex_unlock(&dom.mu);
+        unav_vol = (uint16_t)v; /* the reply names it (tsdbd.c) */
         return TSDB_ERR_UNAVAILABLE;
     }
     dom.vol[v].inflight++;

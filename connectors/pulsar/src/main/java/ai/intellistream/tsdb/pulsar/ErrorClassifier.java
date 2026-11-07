@@ -82,6 +82,7 @@ public class ErrorClassifier {
         case Status.ERR_NOTFOUND:         /* unknown series and auto-create off */
         case Status.ERR_TOO_MANY_BUCKETS: /* never from a write; a query bug, not a server condition */
         case Status.ERR_DENIED:           /* the sink's user has no right on the record's series */
+        case Status.ERR_DROPPED:          /* final: rows older than the drop watermark are never applied (protocol 13) */
             return Kind.PERMANENT;
         case Status.ERR_AUTH:     /* login refused, or the user was dropped: wait for the operator, Pulsar buffers */
         case Status.ERR_IO:       /* connection lost, or the volume's disk (NFS) is unavailable */
