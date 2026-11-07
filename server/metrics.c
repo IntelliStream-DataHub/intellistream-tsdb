@@ -93,7 +93,8 @@ _Static_assert(TSDB_OP_USER_LIST < NOPS, "an op number past the metrics table");
 static bool is_query_op(unsigned o)
 {
     return o == TSDB_OP_QUERY_RAW || o == TSDB_OP_QUERY_VALUES || o == TSDB_OP_QUERY_BUCKETS ||
-           o == TSDB_OP_QUERY_BOUNDS || o == TSDB_OP_QUERY_LTTB || o == TSDB_OP_QUERY_TWA || o == TSDB_OP_QUERY_MULTI;
+           o == TSDB_OP_QUERY_BOUNDS || o == TSDB_OP_QUERY_LTTB || o == TSDB_OP_QUERY_TWA || o == TSDB_OP_QUERY_MULTI ||
+           o == TSDB_OP_QUERY_LATEST;
 }
 
 /* by -TSDB_ERR_*; NULL slots (-10 to -15, ha.md's) are counted as "other" until they exist */
