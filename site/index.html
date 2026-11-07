@@ -135,24 +135,24 @@ test it by killing the server and by simulating power loss.</p></a>
 <div class="wrap">
 <h2 id="compression">How compression works</h2>
 <p class="intro">Sensor data has patterns, and tsdb stores the pattern instead of the numbers. It cuts the readings of
-each sensor into blocks of 8,192 and packs every block on its own.</p>
+each sensor into blocks of up to 8,192 and packs every block on its own.</p>
 <div class="features pairs">
 <div class="feature f1"><h3>Times as steps</h3><p>Sensors report at a steady pace: 10:00:00, 10:00:10, 10:00:20.
-tsdb stores the first time and the step, and after that only how much each step differs from the one before. That
-is almost always 0, which costs almost nothing.</p></div>
+tsdb stores the first time and the step, and after that only how much each step differs from the one before. For a
+steady clock that is 0, which costs almost nothing; for a clock that wobbles by a few milliseconds, tsdb has other layouts.</p></div>
 <div class="feature f2"><h3>Values as whole-number steps</h3><p>A gauge measures in fixed steps, such as 0.001 bar. So
 1.204, 1.205, 1.207 are really the whole numbers 1204, 1205, 1207. tsdb stores the first one and then the changes:
 +1, +2. Small changes need a few bits each, not the 32 bits of a float.</p></div>
-<div class="feature f3"><h3>Exceptions on the side</h3><p>A reading that does not fit the step, a glitch or a gap, is
+<div class="feature f3"><h3>Exceptions on the side</h3><p>A reading that does not fit the step, a glitch or a missing value, is
 stored on the side, so it does not spoil the rest of the block.</p></div>
 <div class="feature f4"><h3>The smallest method per block</h3><p>When values do not follow steps, tsdb tries other
 methods and keeps the smallest result for each block. Then zstd goes over it, but only where that still makes the block
 smaller.</p></div>
 </div>
 <p class="compress-result"><strong>The result:</strong> a reading that takes 12 bytes raw takes about 1.2 bytes on
-disk. <strong>It is fast too:</strong> every block keeps a short summary of its readings (how many, their sum, the
-smallest and the largest). For "the average per day", the blocks that fall inside one day are answered from their
-summaries and never unpacked.</p>
+disk in our benchmarks. <strong>It is fast too:</strong> every block keeps a short summary of its readings (how many, their sum, the
+smallest and the largest). For "the average per day", the blocks that fall inside one day are, in most cases, answered from their
+summaries without unpacking.</p>
 <p class="more"><a class="btn" href="docs/compression.html">How compression works, in depth</a></p>
 </div>
 </section>
