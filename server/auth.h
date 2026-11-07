@@ -22,7 +22,7 @@ enum { P_NONE, P_ANY, P_PRE, P_LOGIN, P_SERIES, P_SUPER, P_STATS, P_COMMIT, P_AD
  * the handler), a name after u8, u16 len (offset 3), QUERY_MULTI's ids (the handler), none. */
 enum { W_NONE, W_ID0, W_ID8, W_NAME3, W_MULTI };
 /* How the op answers an error: a status, a raw chunk (u8 last, u32 n), a values chunk (8 bytes), QUERY_MULTI's END. */
-enum { S_STATUS, S_RAW, S_VALUES, S_MULTI };
+enum { S_STATUS, S_RAW, S_VALUES, S_MULTI, S_LATEST };
 #define NEED_ANY 0x80 /* any right on the series */
 
 typedef struct auth_op {

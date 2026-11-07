@@ -336,6 +336,52 @@ static void render(sb *b)
     }
     VOL_FAMILY("tsdb_failed", "gauge", "1 once the volume is in its fail-stop state (writes return IO errors).",
                failed);
+    /* the latest table (QUERY_LATEST): per volume; all 0 for a volume without a table */
+    tsdb_latest_stats *ls = calloc(nv ? nv : 1, sizeof *ls);
+    if (ls) {
+        for (uint32_t i = 0; i < nv; i++)
+            if (tsdb_get_latest_stats(cfg.db, i, &ls[i]) != 0)
+                memset(&ls[i], 0, sizeof ls[i]);
+#define LVOL_(name, type, help, expr)                                                                                 \
+    do {                                                                                                              \
+        family(b, name, type, help);                                                                                  \
+        for (uint32_t i = 0; i < nv; i++) {                                                                           \
+            sb_add(b, name "{volume=\"%u\",path=\"", i);                                                             \
+            sb_label(b, tsdb_volume_path(cfg.db, i) ? tsdb_volume_path(cfg.db, i) : "");                              \
+            sb_add(b, "\"} %llu\n", (unsigned long long)(expr));                                                     \
+        }                                                                                                             \
+    } while (0)
+#define LSER_(path, field)                                                                                            \
+    for (uint32_t i = 0; i < nv; i++) {                                                                               \
+        sb_add(b, "tsdb_latest_series_total{volume=\"%u\",path=\"", i);                                              \
+        sb_label(b, tsdb_volume_path(cfg.db, i) ? tsdb_volume_path(cfg.db, i) : "");                                  \
+        sb_add(b, "\",how=\"" path "\"} %llu\n", (unsigned long long)ls[i].field);                                 \
+    }
+        family(b, "tsdb_latest_series_total", "counter",
+               "Series QUERY_LATEST (and tsdb_latest) answered, by how: from the latest table or by a search of the parts.");
+        LSER_("table", table)
+        LSER_("search", searched)
+#undef LSER_
+        LVOL_("tsdb_latest_floor_reads_total", "counter",
+              "Table entries read as unknown below a tsdb_drop_before floor (answered by a search).", ls[i].floor_reads);
+        family(b, "tsdb_latest_fills_total", "counter", "The warmer's batches: stored, or refused (a write section ran after its cut).");
+        for (uint32_t i = 0; i < nv; i++) {
+            const char *pth = tsdb_volume_path(cfg.db, i) ? tsdb_volume_path(cfg.db, i) : "";
+            sb_add(b, "tsdb_latest_fills_total{volume=\"%u\",path=\"", i);
+            sb_label(b, pth);
+            sb_add(b, "\",result=\"stored\"} %llu\n", (unsigned long long)ls[i].fills_stored);
+            sb_add(b, "tsdb_latest_fills_total{volume=\"%u\",path=\"", i);
+            sb_label(b, pth);
+            sb_add(b, "\",result=\"refused\"} %llu\n", (unsigned long long)ls[i].fills_refused);
+        }
+        LVOL_("tsdb_latest_unknown", "gauge", "Table entries left to fill (the warmer works them off).", ls[i].unknown);
+        LVOL_("tsdb_latest_table_bytes", "gauge", "Memory the volume's latest table takes (16 bytes a series, in pages).",
+              ls[i].table_bytes);
+        LVOL_("tsdb_latest_budget_capped", "gauge",
+              "1 when --latest-cache refused the volume a page: the ids beyond are answered by a search.", ls[i].capped);
+#undef LVOL_
+        free(ls);
+    }
     if (strcmp(cfg.role, "follower") == 0) {
         VOL_FAMILY("tsdb_follow_errors_total", "counter", "Follower refreshes that failed.", follow_errors);
         family(b, "tsdb_follow_refresh_age_seconds", "gauge",

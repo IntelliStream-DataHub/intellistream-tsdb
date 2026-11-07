@@ -246,7 +246,7 @@ final class Native {
      * incompatible change of a struct's layout or a function's signature, which the size check misses
      * (tsdb_series_result kept its size when its series id became 64 bits and its fields moved).
      */
-    static final int ABI_VERSION = 5;
+    static final int ABI_VERSION = 6;
 
     /** Where the library was loaded from, for {@link EmbeddedDb#librarySource()}. */
     static final String SOURCE;

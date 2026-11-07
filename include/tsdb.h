@@ -715,6 +715,21 @@ typedef struct tsdb_latest_opts {
  * TSDB_ERR_INVALID (n out of range) or TSDB_ERR_NOMEM; per-series problems are in out[i].status. */
 int tsdb_latest(tsdb *db, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *opts, tsdb_latest_result *out);
 
+/* One volume's latest table, for monitoring (tsdbd --metrics-port); all 0 and enabled 0 for a volume without one
+ * (latest_cache 0, a follower or a read-only open). TSDB_ERR_INVALID for a volume >= tsdb_volume_count. */
+typedef struct tsdb_latest_stats {
+    uint64_t table;         /* series answered from the table since open */
+    uint64_t searched;      /* series answered by a search of the parts (unknown entries, series beyond the budget) */
+    uint64_t floor_reads;   /* of those, known entries read as unknown below a tsdb_drop_before floor */
+    uint64_t fills_stored;  /* the warmer's batches stored and refused (a write section ran after its cut) */
+    uint64_t fills_refused;
+    uint64_t unknown;       /* entries left to fill now (gauge) */
+    uint64_t table_bytes;   /* budget the volume's pages take (gauge) */
+    int32_t capped;         /* the budget refused a page: ids from there on are searched */
+    int32_t enabled;        /* the volume has a table */
+} tsdb_latest_stats;
+int tsdb_get_latest_stats(tsdb *db, uint32_t volume, tsdb_latest_stats *st);
+
 /* ---- query statistics ----
  * What the calling thread's last query did, like ClickHouse's "Processed N
  * rows, M MB": rows it covered (decoded, answered from granule statistics, or
@@ -947,7 +962,7 @@ size_t tsdb_struct_size(int kind);
 /* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
  * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
  * number they were written for when they load the library and refuse another. */
-#define TSDB_ABI_VERSION 5 /* The latest table: tsdb_options.latest_cache (design-latest.md). Before it, 4: Statistics: tsdb_options.stats and stats_sweep_mb_s (design-stats.md steps 1-2). Before it:  Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
+#define TSDB_ABI_VERSION 6 /* tsdb_latest, tsdb_latest_stats and tsdb_get_latest_stats (design-latest.md; the bindings call them). Before it, 5: The latest table: tsdb_options.latest_cache. Before it, 4: Statistics: tsdb_options.stats and stats_sweep_mb_s (design-stats.md steps 1-2). Before it:  Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
  * expected topology one export of one pool). tsdb_health_open starts a monitor thread; every domain added gets a
  * probe thread that reads 4 KiB with O_DIRECT from <dir>/PROBE every second and writes and fdatasyncs 4 KiB to
  * <dir>/PROBE.<node> every 5 s. Probes may hang for as long as the server is away; nothing else of the process
