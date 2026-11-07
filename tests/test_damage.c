@@ -2407,8 +2407,10 @@ static void test_wait_merges_failing(const char *scratch)
  * The partition, in block order (1 s apart; t(i) = MB_T0 + i s, values are small integers so that sums are exact
  * in every layout; 9 parts): L1 rows [0,150) = 1   L2 rows [100,400) = 2   L3 delete [200,230)   a replace of
  * [300,600): its tombstone, and D = its rows [580,600) = 4 (the part damaged below: a flipped byte in its payload)
- * U1 rows [250,350) = 5   U2 delete [320,330) (the tombstone that must go on hiding L2's rows [320,330) after
- * the merges: it is above the barrier, they are below)   U3 rows [0,50) = 9   U4 rows [380,470) = 6.
+ * U1 rows [250,350) = 5   U2 delete [320,330) (it hides only U1's rows inside the upper merge: L2's rows there are
+ * already hidden by the replace's tombstone [300,600), a block below the barrier; test_merge_barrier_upper_tomb and
+ * test_merge_barrier_bottom are the cases where an upper tombstone alone hides rows below it)
+ * U3 rows [0,50) = 9   U4 rows [380,470) = 6.
  * Queries cover [0,580): D's rows [580,600) are out of range and never decoded. */
 #define MB_T0 MW_T0
 #define MB_T(i) (MB_T0 + (int64_t)(i) * 1000)
@@ -2616,6 +2618,128 @@ static void mb_partition_parts(void *ctx, const tsdb_part_info *info)
     int *n = ctx;
     (*n)++;
     (void)info;
+}
+
+/* The only tombstone that hides rows below the barrier is in the upper range: a delete over L1/L2 rows [50,150),
+ * after D. The upper merge must keep it (its output's `older` is true because D and the lower parts are listed);
+ * with `older` false the merge drops the tombstone and 100 deleted rows come back. Both merge paths. */
+static void test_merge_barrier_upper_tomb(const char *scratch)
+{
+    char dir[600], dname[96];
+    snprintf(dir, sizeof dir, "%s/mb-upper-tomb", scratch);
+    for (int mode = 0; mode < 2; mode++) {
+        rm_rf(dir);
+        tsdb_options o = opts();
+        o.wal_max_batch_rows = 10;
+        o.partition_classes = 0;
+        tsdb *db;
+        tsdb_sid id;
+        OK(tsdb_open(dir, &o, &db));
+        OK(tsdb_series(db, "mb.series", &id));
+        mb_rows(db, id, 0, 100, 1);   /* L1 */
+        mb_rows(db, id, 100, 200, 2); /* L2 */
+        mb_rows(db, id, 200, 260, 3); /* L3 */
+        mb_rows(db, id, 580, 600, 4); /* D (damaged below; its rows are out of the queried range) */
+        mb_rows(db, id, 300, 350, 5); /* U1 */
+        OK(tsdb_delete_range(db, id, MB_T(50), MB_T(150))); /* U2: hides L1/L2 rows [50,150), below the barrier */
+        mb_rows(db, id, 400, 450, 6); /* U3 */
+        mb_rows(db, id, 450, 480, 7); /* U4 */
+        OK(tsdb_close(db));
+        OK(tsdb_open(dir, &o, &db));
+        struct mb_answers before;
+        mb_ask(db, id, &before);
+        struct mb_names pn = {.n = 0};
+        OK(tsdb_foreach_part(db, mb_collect, &pn));
+        CHECK(pn.n == 8);
+        int d = -1;
+        for (int i = 0; i < pn.n && i < 16; i++)
+            if (pn.rows[i] == 20)
+                d = i;
+        CHECK(d == 3);
+        snprintf(dname, sizeof dname, "%s", d >= 0 ? pn.name[d] : "");
+        OK(tsdb_close(db));
+        part_footer ft = read_footer(dir, dname);
+        flip(dir, dname, (off_t)(sizeof(part_header) + ft.index_off) / 2);
+        if (mode == 0) {
+            OK(tsdb_open(dir, &o, &db));
+            RC(tsdb_optimize(db), TSDB_ERR_CORRUPT);
+        } else {
+            o.merge_threads = 1;
+            o.merge_idle_s = 1;
+            OK(tsdb_open(dir, &o, &db));
+            for (int i = 0; i < 400; i++) {
+                struct mb_names q = {.n = 0};
+                OK(tsdb_foreach_part(db, mb_collect, &q));
+                if (q.n == 3)
+                    break;
+                usleep(100000);
+            }
+        }
+        struct mb_names q = {.n = 0};
+        OK(tsdb_foreach_part(db, mb_collect, &q));
+        CHECK(q.n == 3);
+        struct mb_answers after;
+        mb_ask(db, id, &after);
+        CHECK(before.rc == 0 && after.rc == 0);
+        CHECK(before.pts.n == after.pts.n);
+        CHECK(mb_same(&before, &after));
+        OK(tsdb_close(db));
+        mb_free(&before);
+        mb_free(&after);
+    }
+    rm_rf(dir);
+    printf("  merge barrier: an upper tombstone keeps hiding rows below the barrier\n");
+}
+
+/* The damaged part is the lowest of its partition and only an upper tombstone hides some of its rows. The upper
+ * merge must keep that tombstone because D is listed below it (`older` must count a damaged part). The damage is
+ * then undone (a misdirected read: part_mark_payload keeps the mark in memory only) and the reopen reads D again:
+ * rows [0,50) must stay hidden. */
+static void test_merge_barrier_bottom(const char *scratch)
+{
+    char dir[600], dname[96];
+    snprintf(dir, sizeof dir, "%s/mb-bottom", scratch);
+    rm_rf(dir);
+    tsdb_options o = opts();
+    o.wal_max_batch_rows = 10;
+    o.partition_classes = 0;
+    tsdb *db;
+    tsdb_sid id;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "mb.series", &id));
+    mb_rows(db, id, 0, 100, 4);   /* D */
+    mb_rows(db, id, 200, 300, 5); /* U1 */
+    OK(tsdb_delete_range(db, id, MB_T(0), MB_T(50))); /* U2: hides D's rows [0,50) */
+    mb_rows(db, id, 300, 350, 6); /* U3 */
+    OK(tsdb_close(db));
+    OK(tsdb_open(dir, &o, &db));
+    struct mb_answers before;
+    mb_ask(db, id, &before);
+    struct mb_names pn = {.n = 0};
+    OK(tsdb_foreach_part(db, mb_collect, &pn));
+    CHECK(pn.n == 4);
+    snprintf(dname, sizeof dname, "%s", pn.name[0]);
+    OK(tsdb_close(db));
+    part_footer ft = read_footer(dir, dname);
+    off_t off = (off_t)(sizeof(part_header) + ft.index_off) / 2;
+    flip(dir, dname, off);
+    OK(tsdb_open(dir, &o, &db));
+    RC(tsdb_optimize(db), TSDB_ERR_CORRUPT);
+    struct mb_names q = {.n = 0};
+    OK(tsdb_foreach_part(db, mb_collect, &q));
+    CHECK(q.n == 2);
+    OK(tsdb_close(db));
+    flip(dir, dname, off); /* the damage was a misread: the part is whole again */
+    OK(tsdb_open(dir, &o, &db));
+    struct mb_answers after;
+    mb_ask(db, id, &after);
+    CHECK(before.rc == 0 && after.rc == 0);
+    CHECK(mb_same(&before, &after));
+    OK(tsdb_close(db));
+    mb_free(&before);
+    mb_free(&after);
+    rm_rf(dir);
+    printf("  merge barrier: an upper tombstone keeps hiding the damaged part's rows\n");
 }
 
 /* With a part marked, a stream of inserts into the partition keeps its part count bounded again (before, it grew
@@ -2987,6 +3111,8 @@ int main(int argc, char **argv)
     test_wait_merges_stalled(base);
     test_wait_merges_failing(base);
     test_merge_barrier(base);
+    test_merge_barrier_upper_tomb(base);
+    test_merge_barrier_bottom(base);
     test_merge_barrier_bounded(base);
     test_follower_steady_creation(base);
     test_wal_torn_before_later(base);
