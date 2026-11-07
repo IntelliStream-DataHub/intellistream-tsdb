@@ -518,7 +518,7 @@ static uint32_t free_pct_now = 100;
 static int free_hook(void *ctx, const char *dir, uint32_t *pct)
 {
     (void)ctx, (void)dir;
-    *pct = free_pct_now;
+    *pct = __atomic_load_n(&free_pct_now, __ATOMIC_RELAXED); /* the cleaner thread reads it */
     return 0;
 }
 
@@ -588,11 +588,11 @@ static void test_cleaner(void)
     make_segs(db, s, 6, T0);
     usleep(1500000);
     CHECK(count_prefix(dir, "fwal_") == 6); /* nothing yet: young and small */
-    free_pct_now = 5;
+    __atomic_store_n(&free_pct_now, 5, __ATOMIC_RELAXED);
     feed_cleaner_wake(db);
     wait_segs(dir, 1, 6000);
     CHECK(count_prefix(dir, "fwal_") == 1 && exists(dir, "fwal_0000000000000006.log"));
-    free_pct_now = 100;
+    __atomic_store_n(&free_pct_now, 100, __ATOMIC_RELAXED);
     CHECK(eng_close(db) == 0);
 
     /* a crash after the floor was made durable but before the unlinks: the segments below it go first, whatever
