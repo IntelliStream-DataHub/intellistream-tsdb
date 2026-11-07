@@ -59,8 +59,23 @@ job_of() { local p=$1 g f i; for i in $(seq 1 30); do [ -n "$p" ] && [ "$p" -gt 
 ino=$(stat -c %i "$L" 2>/dev/null)
 holders=$(grep -E ":$ino " /proc/locks 2>/dev/null | grep -v -- '->' | awk '{print $(NF-3)}' | sort -u)
 for h in $holders; do
-    # a step that took the lock for a moment may be gone by now: not an orphan
-    if ! kill -0 "$h" 2>/dev/null; then echo "LOCK     holder pid $h exited since (a short step)"; continue; fi
+    # /proc/locks names the pid that opened the file; once it is gone the lock lives on in whoever inherited the fd
+    # (a test's orphaned child kept a shared lock for 8 h this way, 2026-11-07). Name those holders: the flock
+    # processes still waiting for it are listed with "->" and are not holders.
+    if ! kill -0 "$h" 2>/dev/null; then
+        waiters=" $(grep -E ":$ino " /proc/locks 2>/dev/null | grep -- '->' | awk '{print $(NF-3)}' | tr '\n' ' ')"
+        heirs=""
+        for fd in /proc/[0-9]*/fd/*; do
+            [ "$(readlink "$fd" 2>/dev/null)" = "$L" ] || continue
+            p=${fd#/proc/}; p=${p%%/*}; case "$waiters" in *" $p "*) continue ;; esac; heirs="$heirs $p"
+        done
+        heirs=$(printf '%s\n' $heirs | sort -u)
+        [ -z "$heirs" ] && { echo "LOCK     holder pid $h exited since (a short step)"; continue; }
+        for p in $heirs; do
+            echo "LOCK     holder pid $p () inherited the lock of exited $h: $(ps -o etime=,args= -p $p 2>/dev/null | cut -c1-100)"
+        done
+        continue
+    fi
     echo "LOCK     holder pid $h ($(job_of $h)) $(ps -o etime=,args= -p $h 2>/dev/null | cut -c1-100)"
 done
 
