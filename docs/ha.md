@@ -539,7 +539,7 @@ There is no release yet, so version 5 replaces versions 1-4 (D32). The server re
 **New statuses.**
 - `TSDB_ERR_MOVED = -10`, body `u16 n, n × {u16 vol, u32 epoch, u8 flags, u32 node_id, u16 len, addr}`, then `[u64 resend_from]` when the frame carried a seq. Sent before engine work only: definitely not applied. `epoch` is the sender's current view, never a predicted one; the HANDOFF flag means a clean release is under way (§2.6). Between nodes only `node_id` counts; the address a client sees is filled in from NODES (D35).
 - `TSDB_ERR_UNAVAILABLE = -11`, body in §15.4. Sent before engine work only.
-- `TSDB_ERR_PARTIAL = -12` (§15.4), `TSDB_ERR_DROPPED = -13` (above), `TSDB_ERR_STALE_ID = -14` (final: re-resolve the id by path and name, §5) and `TSDB_ERR_EXISTS = -15` (library without HA, §5).
+- `TSDB_ERR_PARTIAL = -12` (§15.4), `TSDB_ERR_DROPPED = -13` (above), `TSDB_ERR_STALE_ID = -15` (final: re-resolve the id by path and name, §5) and `TSDB_ERR_EXISTS = -20` (library without HA, §5). (`-14` is `TSDB_ERR_ABANDONED`, released in 0.9.1, so these two are not -14 and -15 as this document first planned; -16 and -17 are `DENIED` and `AUTH`, -18 and -19 are reserved for the change feed.)
 - Errors after engine work started are `TSDB_ERR_IO` (indeterminate). So is a connection lost while a frame is outstanding, whether to the owner or to an entry node.
 
 **All four clients** (C `client/tsdb_client.c`, Rust `client/rust/src/client.rs`, Python via `client/python/src/lib.rs`, Java `TsdbClient.java`) must:
@@ -1159,7 +1159,7 @@ The row numbers refer to the stall map (rows 1-16).
 >   node of the connect string; and connect to a list of nodes (`tsdbc_connect_nodes`, `Client::connect_nodes`,
 >   `Client.connect_nodes`, `TsdbClient.connectNodes`). A streamed reply is retried only if no row was delivered, and
 >   QUERY_MULTI is never resent (its rows may have been delivered). The embedded bindings have no wire and no change.
-> - The code `-14` is `TSDB_ERR_ABANDONED` in `tsdb.h`; this document's STALE_ID (D-numbers above) has no code yet.
+> - The code `-14` is `TSDB_ERR_ABANDONED` in `tsdb.h` (released in 0.9.1). This document's STALE_ID is planned as `-15` and EXISTS as `-20` (§5, §9); neither has a code in `tsdb.h` yet.
 
 **`TSDB_ERR_UNAVAILABLE = -11`** is sent only before engine work, by the owner or by an entry node (§9.1).
 - Body: `u16 n, n × {u16 vol, u8 reason, u8 flags, u32 epoch, i64 since_ms, u32 retry_after_ms, u64 outage_id}`, then `[u64 resend_from]` when the frame carried a seq.

@@ -127,7 +127,7 @@ recommendations). Two were taken as defaults and the user may still change them 
 | `set_retention` appends its record to `RETENTION` and fdatasyncs it before it changes the limit in memory | retention.c:240-262 |
 | Merge threads: 2 per engine by default | db.c:45 |
 | Ops go up to `USER_LIST` (38), then `TOPOLOGY` (48) and `STATUS` (49) of protocol 13; floor 12; design-latest.md takes 39 (`QUERY_LATEST`) and protocol 14 | tsdb_protocol.h:192-193, 228-239 |
-| Status codes: -10 to -15 kept for HA, -16 `DENIED`, -17 `AUTH` | tsdb.h:74-76 |
+| Status codes: -10 to -15 kept for HA (-14 is `ABANDONED`, released in 0.9.1; `STALE_ID` is planned as -15), -16 `DENIED`, -17 `AUTH`; HA's `EXISTS` is planned as -20 | tsdb.h:74-76 |
 | `FORMAT_VERSION` 8 | internal.h:41 |
 | tsdbd: output capped at `OUT_CAP` (8 MiB); `CANCEL` handled in `parse()`, stops QUERY_MULTI (`cancel_multi`) | tsdbd.c:160-161, 2273, 2343 |
 | crashfs intercepts `rename`, `renameat`, `unlinkat`, not `linkat` | tests/jepsen/crashfs.c:174-212 |
@@ -825,7 +825,7 @@ FEED_SLOT_LIST (45)  -> u32 n, n x {name, owner, state and reason, caps, u32 nvo
 CANCEL (24)          also names a FEED_SUBSCRIBE: the stream ends after its current frame with a POS and END STOPPED
 ```
 
-New status codes: `TSDB_ERR_FEED_GONE = -18`, `TSDB_ERR_FEED_RESET = -19` (after `AUTH`; -10 to -15 stay with HA);
+New status codes: `TSDB_ERR_FEED_GONE = -18`, `TSDB_ERR_FEED_RESET = -19` (after `AUTH`; -10 to -15 and -20 stay with HA);
 `TSDB_ERR_INVALID` when the feed is not enabled.
 
 A connection that sent `FEED_SUBSCRIBE` carries that stream only; a later frame other than `CANCEL` and `FEED_ADVANCE`
