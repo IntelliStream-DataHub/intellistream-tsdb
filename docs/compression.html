@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Compression</title>
+<meta name="description" content="tsdb docs|How tsdb packs times and values: blocks of 8,192 readings, delta of deltas, fixed-step values with exceptions, the fallback methods, zstd, block summaries and the numbers.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#070a17">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="../assets/favicon.png" type="image/png" sizes="32x32">
+<link rel="stylesheet" href="../assets/site.css?v=2d2fdbe">
+<script src="../assets/site.js?v=2d2fdbe"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+<div class="topbar-in">
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="28" height="28"><span>tsdb</span></a>
+<nav class="topnav" id="topnav" aria-label="Main"><a href="../index.html">Home</a><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a><a class="gh" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg><span>GitHub</span></a></nav>
+<button class="icon-btn menu-btn" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topnav"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</div>
+</header>
+<div class="scrim" hidden></div>
+<div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
+<div class="doc-shell">
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html" aria-current="page">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<main id="main" class="doc">
+<h1>How compression works</h1>
+<p class="lead">tsdb stores a reading in about 1.2 bytes in our benchmarks (see <a href="#numbers">numbers</a>) where the raw reading takes 12: 8 bytes for the time and 4 for a
+float32 value. This page shows how, one step at a time. The short version is on the
+<a href="../index.html#compression">home page</a>.</p>
+
+<h2 id="blocks">Blocks of 8,192 readings of one sensor</h2>
+<p>tsdb keeps the readings of one sensor sorted by time and cuts them into <strong>granules</strong> of up to 8,192
+readings. A granule is the block this page talks about; the code and the logs use that word. The size is the option
+<code>granule_rows</code>, and it is fixed when the database is created.</p>
+<p>A granule holds one sensor only, and with the default one-day partitions (tsdb files its data by day) it never crosses
+the edge of a UTC day. Granules are written into files called <strong>parts</strong>: every insert, and every flush of
+the readings kept in memory, writes parts, and in the background tsdb <strong>merges</strong> small parts into bigger
+ones. A granule is stored as two blocks next to each other: first the times, then the values. Each block is packed with its own method,
+chosen for that granule alone. A sensor that changes its behaviour in the middle of the day gets another method for the
+later granules.</p>
+<p>Why one sensor per block? Neighbouring readings of one sensor look alike: the same pace, the same step size, about
+the same range. Put two sensors in one block and the pattern is gone. A query for one sensor also reads only the
+granules of that sensor. Beside the blocks, the part's index keeps one small entry per granule with where it is and a
+<a href="#statistics">summary of its readings</a>.</p>
+
+<h2 id="times">Times: steps and changes of steps</h2>
+<p>A time is a 64-bit number, milliseconds since 1970. Raw, it takes 8 bytes. Sensors report at a steady pace, so the
+times of a granule are nearly a straight line. tsdb stores the line instead of the numbers.</p>
+<figure class="fig" id="fig-times">
+<svg viewBox="0 0 360 226" role="img" aria-labelledby="fig-times-t fig-times-d">
+<title id="fig-times-t">Six times, ten seconds apart, become steps and then zeros</title>
+<desc id="fig-times-d">Row one: the times 0, 10, 20, 30, 40 and 50 seconds after 10:00:00. Row two: the steps between
+them, 10 each. Row three: how each step differs from the step before, 0 each.</desc>
+<text class="lab" x="9" y="14">Times (seconds after 10:00:00)</text>
+<rect class="box" x="9" y="22" width="50" height="30" rx="6"/><text x="34" y="42">0</text>
+<rect class="box" x="66" y="22" width="50" height="30" rx="6"/><text x="91" y="42">10</text>
+<rect class="box" x="123" y="22" width="50" height="30" rx="6"/><text x="148" y="42">20</text>
+<rect class="box" x="180" y="22" width="50" height="30" rx="6"/><text x="205" y="42">30</text>
+<rect class="box" x="237" y="22" width="50" height="30" rx="6"/><text x="262" y="42">40</text>
+<rect class="box" x="294" y="22" width="50" height="30" rx="6"/><text x="319" y="42">50</text>
+<path class="arrow" d="M20 58v14m-5-5 5 5 5-5"/>
+<text class="lab dim" x="34" y="68">subtract the time before</text>
+<text class="lab" x="9" y="96">Steps</text>
+<rect class="box" x="9" y="104" width="50" height="30" rx="6"/><text class="dim" x="34" y="124">–</text>
+<rect class="box" x="66" y="104" width="50" height="30" rx="6"/><text x="91" y="124">10</text>
+<rect class="box" x="123" y="104" width="50" height="30" rx="6"/><text x="148" y="124">10</text>
+<rect class="box" x="180" y="104" width="50" height="30" rx="6"/><text x="205" y="124">10</text>
+<rect class="box" x="237" y="104" width="50" height="30" rx="6"/><text x="262" y="124">10</text>
+<rect class="box" x="294" y="104" width="50" height="30" rx="6"/><text x="319" y="124">10</text>
+<path class="arrow" d="M20 140v14m-5-5 5 5 5-5"/>
+<text class="lab dim" x="34" y="150">subtract the step before</text>
+<text class="lab" x="9" y="178">Change of the step (what is stored)</text>
+<rect class="box" x="9" y="186" width="50" height="30" rx="6"/><text class="dim" x="34" y="206">–</text>
+<rect class="box" x="66" y="186" width="50" height="30" rx="6"/><text class="dim" x="91" y="206">–</text>
+<rect class="box hot" x="123" y="186" width="50" height="30" rx="6"/><text x="148" y="206">0</text>
+<rect class="box hot" x="180" y="186" width="50" height="30" rx="6"/><text x="205" y="206">0</text>
+<rect class="box hot" x="237" y="186" width="50" height="30" rx="6"/><text x="262" y="206">0</text>
+<rect class="box hot" x="294" y="186" width="50" height="30" rx="6"/><text x="319" y="206">0</text>
+</svg>
+<figcaption>The first time and the first step go in a 16-byte header; for them there is nothing to subtract. Every later
+reading of a steady clock is a 0, and a 0 costs one bit.</figcaption>
+</figure>
+<h3 id="times-regular">A steady clock: delta of deltas</h3>
+<p>The method is called <strong>DoubleDelta</strong>, or delta of deltas. tsdb stores the first time and the first step,
+and for every later reading only how much the step changed. The idea comes from the Gorilla paper, and tsdb's version
+follows the DoubleDelta codec of ClickHouse. A change of 0 is written as a single 0 bit, so a steady clock costs about
+one bit per reading. A change of up to 64 either way costs 9 bits; bigger changes cost 12, 16, 37 or 69 bits.</p>
+<p>Before zstd goes over it (see <a href="#zstd">below</a>), a steady clock is already near one bit per reading. After
+zstd, the one perfectly regular sensor of our test data (a disk temperature every 60 seconds) needs about 0.03 bits per
+reading for its times.</p>
+<h3 id="times-jitter">A clock that wobbles</h3>
+<p>Real clocks are off by a few milliseconds. Then the step changes on almost every reading, and DoubleDelta pays at
+least 9 bits each time. It also makes the noise larger with every subtraction: the change of a wobbling step wobbles several times as much as
+the wobble itself. So when DoubleDelta needs more than about one bit per reading, tsdb also tries two other layouts, and keeps the
+one it estimates to be smallest:</p>
+<ul>
+<li><strong>Grid.</strong> Lay a perfectly regular grid over the granule: the first time, then one step apart, with the
+step taken from the first and last time. Store how far each reading is from its grid point. That is just the wobble,
+a few milliseconds.</li>
+<li><strong>Steps.</strong> Store each step minus the smallest step in the granule, with no second subtraction.</li>
+</ul>
+<p>Both write whole 1-, 2-, 4- or 8-byte words, the narrowest that fits the largest number, and leave the rest to zstd.
+So the times of a jittery clock are not bit-packed: they are bytes. The layouts are tried only when the block is written
+with zstd on, which by default means the background merge (see <a href="#zstd">zstd</a>).</p>
+
+<h2 id="values">Float values: whole-number steps</h2>
+<p>Values are float32 unless you say otherwise (<a href="concepts.html#types">value types</a>). Raw, a float32 takes 32
+bits. Most of the bytes of a database are values, so this is where the most work went.</p>
+<p>A sensor measures in fixed steps: a pressure gauge in steps of 0.001 bar, a thermometer in steps of 0.1 °C, or a
+16-bit converter that counts and multiplies by a constant. Its readings are whole numbers times a step. tsdb finds that
+step, stores the whole numbers, and stores them as changes.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Reading</th><th scope="col">Whole number (step 0.001)</th><th scope="col">Change</th><th scope="col">Zigzag</th></tr></thead>
+<tbody>
+<tr><td>1.204</td><td>1204</td><td>first value, kept in the header</td><td></td></tr>
+<tr><td>1.205</td><td>1205</td><td>+1</td><td>2</td></tr>
+<tr><td>1.205</td><td>1205</td><td>0</td><td>0</td></tr>
+<tr><td>1.207</td><td>1207</td><td>+2</td><td>4</td></tr>
+</tbody></table></div>
+<p><strong>Zigzag</strong> turns changes that can be negative into plain small numbers: 0, −1, +1, −2, +2 become 0, 1,
+2, 3, 4. A small change either way is then a small number, and a small number needs few bits. Here the largest is 4,
+which fits in 3 bits.</p>
+
+<h3 id="values-step">Finding the step</h3>
+<p>tsdb knows 35 steps: ten-powers from 1 down to 0.0000000001 (11 of them), and powers of two from ½ down to 2<sup>−24</sup>
+(24 of them). The binary steps are tsdb's own. They catch the raw counts of a converter: our vibration test data is
+16-bit counts times 2<sup>−13</sup>, and no ten-power fits that.</p>
+<p>Trying 35 steps on 8,192 readings would be slow, so tsdb looks at a <strong>sample</strong>: four runs of 16
+neighbouring readings, spread over the granule. A step costs the bytes its changes need in the sample, plus a penalty for
+every reading that does not fit it. Ten-powers are tried from 1 downwards, then powers of two from ½ downwards, and the search stops at the first one that gives
+one-byte changes and no misfits. A step is dropped if more than a quarter of the sample does not fit. If even the best
+step is not cheap (about 4.5 bytes a reading or more), the granule is not fixed-step and goes to
+<a href="#fallbacks">the other methods</a>.</p>
+
+<h3 id="values-exceptions">Checking every reading, and the exceptions</h3>
+<p>The sample only chooses. Then tsdb checks <em>every</em> reading: it computes the whole number, rebuilds the value
+from it the way the reader will (the number times the step, in double precision, rounded to float32), and compares all
+32 bits with the original. A reading that does not come back exactly is an <strong>exception</strong>: a glitch, a missing value (null), a NaN,
+a negative zero. It is stored on the side as its position (4 bytes) and its original 32 bits (4 bytes). In the stream of
+whole numbers its place repeats the number before, so its change is 0 and it does not make the other changes wider. If
+more than 1 reading in 16 is an exception, the granule is not fixed-step.</p>
+<p>Nothing is rounded away: every value comes back with the same bits it went in with.</p>
+
+<h3 id="values-pack">Packing in groups of 1,024</h3>
+<p>The zigzag changes are packed in <strong>groups of 1,024</strong>. Each group has a one-byte header with its width,
+the number of bits of its largest change, and all 1,024 changes then take exactly that many bits. A group of constant
+values has width 0 and takes that one byte. Fixed width is what makes the reader fast: unpacking is one short loop per
+width, with no branches per value. The reader then adds up the changes to get the whole numbers back, multiplies by the
+step, and puts the exceptions in place.</p>
+<p>The result of a granule is: the step, the first whole number (8 bytes), the number of exceptions, the groups, and the
+exceptions.</p>
+
+<h3 id="values-alp">What is ALP's and what is ours</h3>
+<div class="note">
+<p>This codec is tsdb's own, built on ideas from <strong>ALP</strong> (Afroozeh, Kuffó and Boncz, SIGMOD 2024, see
+<a href="#papers">the papers</a>), the method DuckDB also uses for floating-point columns. From ALP: look at a sample to find the step
+instead of trying every possibility on every reading; keep the readings that do not fit as exceptions; pack groups of
+1,024 at a fixed width. What tsdb added for sensor data: steps that are powers of two as well as of ten; storing the
+<em>changes between neighbours</em> instead of each number's distance from the smallest in the group; a check in double
+precision, which has fewer misfits than float32 arithmetic; and the choice per granule.</p>
+</div>
+<p>The change from "distance from the smallest" to "change from the neighbour" matters for slow signals. A disk
+temperature drifts over a wide range, but each step is small. In tsdb's measurement on that data (<a
+href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/design.md">docs/design.md</a>, section
+"ALP, and why it fits sensor data"), ALP's groups needed 6 bits a reading and the changes needed 2.</p>
+<p>tsdb also contains ALP itself, as the paper describes it (in float32, as DuckDB does). It is never written to disk. It
+stays in <code>build/codec-bench</code> as a reference, and it was not smaller than the fixed-step codec on any of our
+sensor data sets.</p>
+
+<h2 id="fallbacks">When values are not fixed steps</h2>
+<p>Not every signal is a decimal. A pressure converted from bar to psi and left unrounded is not a whole number times any
+step. A noisy float is just noise. For these, tsdb has other methods. Each one finds a different kind of pattern:</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Method</th><th scope="col">What it does</th><th scope="col">Used for</th></tr></thead>
+<tbody>
+<tr><td><strong>Gorilla</strong></td><td>Compares the bits of each value with the bits of the one before (XOR). If they are equal, it writes one 0 bit.
+Otherwise it writes only the middle stretch of bits that changed, and where it is.</td><td>float64 blocks; float32 only when you ask for it with <code>value_codec</code></td></tr>
+<tr><td><strong>Chimp</strong></td><td>The same idea, improved: the number of leading zero bits is rounded to one of 8 values, so it fits in 3 bits and is
+often reused. tsdb's float32 version.</td><td>float32 blocks</td></tr>
+<tr><td><strong>ALP_rd</strong> (ALP's second method)</td><td>Splits each value into its last bits, which look random and are stored as they are, and its first bits (sign,
+exponent and the top bits of the digits part, the mantissa), which repeat a lot. The first bits go into a small dictionary of up to 8 entries; one that is not in the dictionary
+is an exception.</td><td>float32 and float64 blocks of noisy values</td></tr>
+<tr><td><strong>Packed bit delta</strong></td><td>Treats the raw bits of a value as an integer, subtracts the neighbour's, and packs the changes in groups of 1,024 like the fixed-step
+codec. Neighbours share their sign, exponent and top bits, so the difference is narrow.</td><td>smooth values that are not decimals, such as unrounded psi</td></tr>
+<tr><td><strong>Byte split</strong> and plain bit delta</td><td>No packing of their own. Byte split puts all first bytes together, then all second bytes, and so on, so zstd sees like with like. Plain bit delta stores each value's raw bits minus the previous value's, as whole 4-byte words.</td><td>candidates that exist to give zstd something to work with</td></tr>
+<tr><td><strong>Dictionary</strong></td><td>Stores the distinct values in order, and then each reading's rank among them, as packed changes. At most 2,048 distinct values and a quarter of the rows.</td><td>sensors with only a few hundred possible values (an ADC converted to psi); tried only in merges</td></tr>
+</tbody></table></div>
+<p>Gorilla and Chimp are the well-known XOR methods for floating-point time series (see
+<a href="#papers">the papers</a>).</p>
+
+<h2 id="choosing">Choosing the smallest</h2>
+<p>For a float32 granule the choice goes like this:</p>
+<ol>
+<li><strong>Fixed steps first.</strong> If the fixed-step codec fits, and its result needs 16 bits a reading or less,
+tsdb keeps it and compares nothing else. (In a merge, the dictionary may still replace it, if the dictionary comes out
+smaller.)</li>
+<li><strong>Otherwise, a contest on a sample.</strong> Each of the other methods encodes a sample of 8 KB (16 runs of 128
+neighbouring values, spread over the granule), with zstd on top as the real block would have. The sizes are scaled to the
+whole granule and ranked against the fixed-step result, which counts at any width.</li>
+<li><strong>The best, and any within 3% of it,</strong> are then encoded in full, and the smallest block is kept.</li>
+</ol>
+<p>So "the smallest method per block" means the smallest among the methods tried, judged on a sample first. It is not an
+exhaustive search, and that keeps writes fast.</p>
+
+<h2 id="types">The other types</h2>
+<ul>
+<li><strong>float64</strong> uses the same fixed-step idea with wider reach: ten-powers down to 10<sup>−15</sup> and
+powers of two down to 2<sup>−30</sup>, and exceptions that keep all 64 bits. If a float64 series holds values that were
+float32 first (widened by a collector), a merge stores the block as a float32 block (an insert does so only when the
+values are fixed steps), but storing the right type from the start is still better: see
+<a href="concepts.html#types">value types</a>. When the values are not fixed steps,
+inserts try Gorilla and byte split; merges also try packed bit delta, ALP_rd and the dictionary.</li>
+<li><strong>int64</strong> goes through the same integer coder as the fixed-step codec: zigzag changes in groups of 1,024
+at a fixed width. It stores plain changes between neighbours, so what a value costs depends on how big the change is, not on how
+steady: a counter that grows by 1 each time costs a few bits, one that grows by about 1,000 needs about 11 bits before
+zstd (a steady increment helps only through zstd), and a group of equal values costs one byte. A group whose changes
+need more than 32 bits is stored with its changes (zigzag) at 64 bits each, not packed.</li>
+<li><strong>bool</strong> and <strong>state</strong> are small whole numbers and use the integer coder too. A door that
+changes a few times an hour, or a machine mode that changes every few minutes, comes down to a fraction of a bit per
+value (see <a href="#numbers">numbers</a>).</li>
+</ul>
+
+<h2 id="zstd">zstd, only where it still helps</h2>
+<p><a href="https://facebook.github.io/zstd/">zstd</a> is a general-purpose compressor. After a block is coded by one of
+the methods above, tsdb tries zstd on the result (level 1 by default, the option <code>zstd_level</code>) and keeps the
+zstd version only if it is clearly smaller:</p>
+<ul>
+<li>the coded block must be at least 64 bytes;</li>
+<li>for values, zstd must save at least about 3% (1/32) of the block, plus the 4 bytes that record its original length;</li>
+<li>for times, it must save about 12% (1/8). Every query that reads rows decodes the times, so a small gain is not worth
+the decoding time.</li>
+</ul>
+<p>The block's first byte says which method wrote it (7 bits) and whether zstd was used (1 bit).</p>
+<p><strong>When this work is done.</strong> To keep inserts fast, a part written by an insert, or by a flush of the readings kept in memory (the memtable), uses
+the quick set of methods and, by default, no zstd (<code>insert_zstd_level</code> is 0). Times then always use
+DoubleDelta. Background merges rewrite such parts with the full set of methods and zstd at level 1. A part with nothing
+to merge with is rewritten alone once its partition has had no new part for 5 minutes (<code>merge_idle_s</code>), or by
+<code>tsdb_optimize</code>. So the data at rest is the smallest, and fresh data is a little larger for a short time.</p>
+
+<h2 id="statistics">Summaries: why queries often skip the unpacking</h2>
+<p>When tsdb writes a granule, it also computes a summary from the readings, before they are packed, and keeps it in the
+part's index: the number of readings and of nulls, the first and last time, the sum, the smallest and the largest value,
+the spread (for the standard deviation), and what time-weighted averages need. The summaries are exact, not estimates:
+integer sums use 128 bits, so they are never off. The index entries are bit-packed too, at about 32 bytes per granule.</p>
+<p>Take "the average per day". A day bucket covers whole granules, so tsdb adds up their summaries and, in most cases,
+does not unpack them. A granule that a bucket edge cuts is unpacked, and so is one that a delete or the retention limit
+touched, and one whose times overlap other granules of the same sensor (parts not yet merged, or readings still in
+memory). The edges of a UTC day fall between granules; the edges of a local day usually fall inside one, so those
+granules are unpacked, unless the zone is a whole-hour zone and the sensor is busy enough for the hour edges below.
+Granules are cut with this in mind: they never span two sensors, never cross a UTC day edge in the default layout,
+and, for a busy sensor (at least 3,000 readings an hour), end at the hour edges too, so that many buckets line up with
+whole granules.</p>
+<p>The sums of float values are added per granule, so they can differ from another order of adding in the last digits.
+<a href="concepts.html#types">Value types</a> says what that means in practice.</p>
+
+<h2 id="cpu">The same bytes on every CPU</h2>
+<p>A database directory can be copied to another machine, or read by a follower (a read-only copy of the database on another host). So whatever CPU
+wrote a part, any other CPU must read it, and the same readings must give the same bytes. tsdb works for that on
+purpose:</p>
+<ul>
+<li>The portable release (<code>make dist</code>) is built for x86-64-v2 (SSE4.2, CPUs from about 2009 on), and the codecs are built
+again for v3 (AVX2) and v4 (AVX-512). At startup tsdb picks the best level the CPU has. <code>TSDB_CPU=v2</code>,
+<code>v3</code> or <code>v4</code> picks a lower one. A plain <code>make</code> builds for the machine it runs on and has no
+levels.</li>
+<li>All levels must give identical blocks and identical values. So there is no fused multiply-add
+(<code>-ffp-contract=off</code>), no maths-library function that the C library picks by CPU, float sums are added in one
+fixed order, and the codecs run in round-to-nearest mode and put the caller's mode back.</li>
+<li><code>tests/test_levels.c</code> compares every level the machine has.</li>
+</ul>
+
+<h2 id="numbers">Numbers</h2>
+<p>Bits per value after coding and zstd, in granules of 8,192 values, on the generated sensor data of the benchmark tool (<code>tools/datasets.h</code>). A
+float32 takes 32 bits raw. The columns are Gorilla and Chimp (the two well-known methods, for float32) and tsdb's
+automatic choice. Source: <code>build/codec-bench</code> at release 0.9.1;
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/design.md">docs/design.md</a> has an
+older run of the same table, with slightly different numbers.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Sensor</th><th scope="col" class="num">Gorilla</th><th scope="col" class="num">Chimp</th><th scope="col" class="num">tsdb</th><th scope="col">What tsdb used</th></tr></thead>
+<tbody>
+<tr><td>disk temperature, 0.1 °C, every 60 s</td><td class="num">2.66</td><td class="num">2.33</td><td class="num"><strong>0.88</strong></td><td>fixed steps</td></tr>
+<tr><td>CPU temperature, spikes to 100 °C, every 1 s</td><td class="num">10.82</td><td class="num">11.34</td><td class="num"><strong>2.99</strong></td><td>fixed steps</td></tr>
+<tr><td>tank pressure, 0.001 bar, every 10 s</td><td class="num">9.13</td><td class="num">8.88</td><td class="num"><strong>1.81</strong></td><td>fixed steps</td></tr>
+<tr><td>tank pressure in psi, converted and unrounded</td><td class="num">23.82</td><td class="num">19.58</td><td class="num"><strong>17.54</strong></td><td>packed bit delta</td></tr>
+<tr><td>vibration, 16-bit counts, every 1 ms</td><td class="num">21.51</td><td class="num">23.58</td><td class="num"><strong>14.02</strong></td><td>fixed steps of 2<sup>−13</sup></td></tr>
+<tr><td>pipeline flow rate, 0.01 m³/h, every 1 s</td><td class="num">23.08</td><td class="num">20.85</td><td class="num"><strong>10.72</strong></td><td>fixed steps</td></tr>
+<tr><td>pipeline flow totalizer, m³, every 1 s</td><td class="num">8.68</td><td class="num">6.07</td><td class="num"><strong>1.68</strong></td><td>fixed steps</td></tr>
+<tr><td>uniform random floats</td><td class="num">32.33</td><td class="num">32.90</td><td class="num"><strong>27.29</strong></td><td>ALP_rd</td></tr>
+</tbody></table></div>
+<p>Random numbers have no pattern to find, so they hardly shrink: that row is the floor. The psi row shows what happens
+when values are no longer steps. The "what tsdb used" column is from the section "How AUTO picks" of
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/design.md">docs/design.md</a>.</p>
+<p>The other types, in bits per value after zstd, from <code>build/type-bench</code> at release 0.9.1 (the "Value codecs"
+section of <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/AGENTS.md">AGENTS.md</a> has an
+earlier run, with 1.18 and 0.04 for the two int64 rows below):</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Data</th><th scope="col">Type</th><th scope="col" class="num">Bits per value</th></tr></thead>
+<tbody>
+<tr><td>disk temperature, 0.1 °C</td><td>float64</td><td class="num">0.88</td></tr>
+<tr><td>totalizer in whole liters</td><td>int64</td><td class="num">1.17</td></tr>
+<tr><td>a rate, random between 50,000 and 70,000</td><td>int64</td><td class="num">16.01</td></tr>
+<tr><td>an event sequence</td><td>int64</td><td class="num">0.03</td></tr>
+<tr><td>a door, a few changes an hour</td><td>bool</td><td class="num">0.06</td></tr>
+<tr><td>coin flips</td><td>bool</td><td class="num">1.29</td></tr>
+<tr><td>a machine mode of 5 states</td><td>state</td><td class="num">0.13</td></tr>
+</tbody></table></div>
+<p>All together, on 100 million readings of the seven sensor kinds, each at its own rate: 1.19 bytes per reading in
+all, times and values
+(<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/AGENTS.md">AGENTS.md</a>, "100 million
+rows, seven databases"). On 100 billion readings, 10,000 sensors of the same seven kinds but all at 1 Hz: 1.161 bytes per
+reading, of which the times take 2.00 bits, the values 7.22 bits and the index 0.07 bits (AGENTS.md, "100 billion
+rows"). Both runs are from an earlier build, before 2026-10-24, so they do not include later changes such as the packed
+index, the dictionary method and inserts without zstd. The other
+<a href="benchmarks.html">benchmarks</a> compare tsdb with other databases.</p>
+
+<h2 id="papers">The papers</h2>
+<ul>
+<li><strong>ALP.</strong> Azim Afroozeh, Leonardo X. Kuffó and Peter Boncz,
+<a href="https://doi.org/10.1145/3626717">ALP: Adaptive Lossless floating-Point Compression</a>, SIGMOD 2024.</li>
+<li><strong>Gorilla.</strong> Tuomas Pelkonen and others,
+<a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf">Gorilla: A Fast, Scalable, In-Memory Time Series
+Database</a>, VLDB 2015.</li>
+<li><strong>Chimp.</strong> Panagiotis Liakos, Katia Papakonstantinopoulou and Yannis Kotidis,
+<a href="https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf">Chimp: Efficient Lossless Floating Point Compression for Time
+Series Databases</a>, VLDB 2022.</li>
+</ul>
+<p>The code is in <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/src/codec.c"><code>src/codec.c</code></a>,
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/src/codec_typed.c"><code>src/codec_typed.c</code></a>,
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/src/codec_alp.c"><code>src/codec_alp.c</code></a> and
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/src/codec_xor.c"><code>src/codec_xor.c</code></a>.
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/design.md">docs/design.md</a> has the
+measurements behind each choice.</p>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="concepts.html"><span>Previous</span>Concepts</a><a class="next" href="clients.html"><span>Next</span>Clients</a></nav></main>
+</div>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+</body>
+</html>

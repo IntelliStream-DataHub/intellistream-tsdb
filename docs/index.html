@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>What tsdb is</title>
+<meta name="description" content="tsdb docs|What tsdb is, what it is for, and how it is built: a small, fast time series database in C.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#070a17">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="../assets/favicon.png" type="image/png" sizes="32x32">
+<link rel="stylesheet" href="../assets/site.css?v=2d2fdbe">
+<script src="../assets/site.js?v=2d2fdbe"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+<div class="topbar-in">
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="28" height="28"><span>tsdb</span></a>
+<nav class="topnav" id="topnav" aria-label="Main"><a href="../index.html">Home</a><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a><a class="gh" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg><span>GitHub</span></a></nav>
+<button class="icon-btn menu-btn" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topnav"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</div>
+</header>
+<div class="scrim" hidden></div>
+<div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
+<div class="doc-shell">
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html" aria-current="page">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<main id="main" class="doc">
+<h1>What tsdb is</h1>
+<p class="lead">tsdb is a small, fast time series database written in C. It stores readings from sensors, one series
+per sensor, and gives them back by time range: as raw points, or as summaries such as the average of every hour.</p>
+
+<h2 id="why">Why it exists</h2>
+<p>At <a href="https://intellistream.ai">IntelliStream</a> we work with industrial data: sensors on pumps, tanks,
+pipelines and machines that report a value every second or every minute, for years. Our DataHub platform first stored
+this data in ClickHouse. ClickHouse is a general analytics database, and time series are only one of the many things it
+has to be good at. So we wrote a database that does nothing but time series. It keeps the best ideas of ClickHouse's
+storage design (MergeTree) and adds <a href="compression.html">ALP-style compression</a> for the sensor values.</p>
+<p>We built it to:</p>
+<ul>
+<li>store that data for less money: about a tenth of its raw size, and less than half the disk ClickHouse needs for
+the same data;</li>
+<li>cost less to run: one small program that works well with its defaults, and no cluster to look after;</li>
+<li>answer time series questions faster: "the 5-minute averages of this sensor yesterday" takes 0.09 ms.</li>
+</ul>
+
+<h2 id="two-ways">Two ways to use it</h2>
+<dl class="terms">
+<dt>As a library, inside your program</dt>
+<dd>Link <code>libtsdb.a</code> into a C program, or use the embedded mode of the Rust, Python or Java clients. The
+database is a directory on disk. There is no server and no network.</dd>
+<dt>As a server, tsdbd</dt>
+<dd>Run <code>tsdbd</code> and talk to it over TCP from C, Rust, Python or Java. One server answers many clients at
+once.</dd>
+</dl>
+
+<h2 id="what-it-is-not">What it is not</h2>
+<ul>
+<li>It is not a SQL database. There are no tables and no joins. You ask for a series and a time range.</li>
+<li>Clients log in, and each user gets rights on some series, but there is no encryption yet. Run it on a trusted
+network only. See
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a>.</li>
+<li>It is still young. Version 0.9.0 is the first release. Until 1.0, a new 0.9.x version may not open the files of an
+older one; you then move your data with <a href="operations.html#backup">export and import</a>.</li>
+</ul>
+
+<h2 id="features">What it can do</h2>
+<ul>
+<li>Values can be float32, float64, int64, bool or a state (a text label from a small set, like "running"). Any value
+may be missing (null). Times are in milliseconds.</li>
+<li>Writing a value for a time that already exists replaces it. You never get duplicates back.</li>
+<li>Read raw points, or summaries per time bucket: fixed buckets (every 5 minutes) or calendar ones (day, week, month,
+quarter, year) in your time zone.</li>
+<li>Downsample a series for a chart (LTTB), get the spread of each bucket, and time-weighted averages.</li>
+<li>Delete or replace the values of a range, and let old values expire with a retention period.</li>
+<li>Ask about many series in one request, all read at the same instant.</li>
+<li>Safe writes: data is on disk when a write returns.</li>
+<li>One writer and any number of read-only followers can share a directory, also over NFS.</li>
+<li>An <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/tree/main/connectors/pulsar">Apache
+Pulsar 5 sink</a> writes points from Pulsar into tsdb.</li>
+</ul>
+<p><a href="concepts.html">Concepts</a> explains each of these.</p>
+
+<h2 id="license">License</h2>
+<p>tsdb is open source under the Apache License 2.0. Copyright 2026 IntelliStream AS. The source, the issues and the
+releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p>
+
+<nav class="pager" aria-label="Previous and next page"><a class="next" href="install.html"><span>Next</span>Install and build</a></nav></main>
+</div>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+</body>
+</html>

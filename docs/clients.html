@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Clients</title>
+<meta name="description" content="tsdb docs|Tutorials for the C, Rust, Python and Java clients: install, write and read through the server, embedded use, spread, time-weighted averages, charts and many series at once.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#070a17">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="../assets/favicon.png" type="image/png" sizes="32x32">
+<link rel="stylesheet" href="../assets/site.css?v=2d2fdbe">
+<script src="../assets/site.js?v=2d2fdbe"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+<div class="topbar-in">
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="28" height="28"><span>tsdb</span></a>
+<nav class="topnav" id="topnav" aria-label="Main"><a href="../index.html">Home</a><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a><a class="gh" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg><span>GitHub</span></a></nav>
+<button class="icon-btn menu-btn" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topnav"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</div>
+</header>
+<div class="scrim" hidden></div>
+<div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
+<div class="doc-shell">
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html" aria-current="page">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<main id="main" class="doc">
+<h1>Clients</h1>
+<p class="lead">tsdb has clients for C, Rust, Python and Java. Each one talks to tsdbd, and each one can also run the
+database inside your program, with no server. Pick your language once; every page remembers it.</p>
+<p>Every program on this page is one our tests build and run, or a README section they run or compile. A check in
+<code>make test</code> makes sure the page still shows exactly that code.</p>
+
+<h2 id="install">1. Get the client</h2>
+<p>First build tsdb and start a server, in the top directory of the checkout. The server lets in only clients that
+log in, so first add a user, <code>admin</code>, who may do everything (a "superuser"). Its password goes in a file only
+you can read; every example on this page logs in with it:</p>
+<pre><code class="language-sh" data-src="client/rust/README.md#Quick start">make
+mkdir -p /tmp/tsdb-demo
+(umask 077 &amp;&amp; echo 'try-out-password-17' &gt; /tmp/tsdb-demo/password)
+./build/tsdb /tmp/tsdb-demo/db user add admin --superuser --password-file /tmp/tsdb-demo/password
+./build/tsdbd --dir /tmp/tsdb-demo/db</code></pre>
+<p>It listens on port 7070. Leave it running and open a second terminal.</p>
+<div class="tabs">
+<div class="tablist" role="tablist" aria-label="Language">
+<button type="button" role="tab" data-key="c">C</button>
+<button type="button" role="tab" data-key="rust">Rust</button>
+<button type="button" role="tab" data-key="python">Python</button>
+<button type="button" role="tab" data-key="java">Java</button>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="c">
+<p><code>make</code> has built the client already. Include <code>client/tsdb_client.h</code> (and
+<code>include/tsdb_calendar.h</code> for time zones) and link with
+<code>build/libtsdbclient.a -lzstd -lpthread -lm</code>. The C client does not contain the database; it only talks to
+the server. For the database inside your program, include <code>include/tsdb.h</code> and link
+<code>build/libtsdb.a</code> instead.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="rust">
+<p>The package is <code>intellistream-tsdb-client</code>; in code it is <code>tsdb_client</code>. Add it to your
+<code>Cargo.toml</code>:</p>
+<pre><code class="language-toml" data-src="client/rust/README.md#Quick start">[dependencies]
+intellistream-tsdb-client = { path = "path/to/tsdb/client/rust" }</code></pre>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="python">
+<p>You need Rust (<code>cargo</code>) and Python 3.9 or newer. Build the module into a virtual environment:</p>
+<pre><code class="language-sh" data-block="2" data-src="client/python/README.md#Quick start">cd client/python
+python3 -m venv /tmp/tsdb-venv
+/tmp/tsdb-venv/bin/pip install maturin
+VIRTUAL_ENV=/tmp/tsdb-venv /tmp/tsdb-venv/bin/maturin develop --release</code></pre>
+<p>Then <code>import tsdb_client</code>.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="java">
+<p>You need Java 17 or newer and Maven. Install the client into your local Maven repository with
+<code>mvn install</code> in <code>client/java</code>, and add it to your project:</p>
+<pre><code class="language-xml" data-src="client/java/README.md#Quick start">&lt;dependency&gt;
+  &lt;groupId&gt;ai.intellistream&lt;/groupId&gt;
+  &lt;artifactId&gt;tsdb-client&lt;/artifactId&gt;
+  &lt;version&gt;0.9.1&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+</div>
+</div>
+
+<h2 id="first">2. Write a day and read it back</h2>
+<p>This program connects to tsdbd and gets the id of the series <code>pump7.flow</code> (the first time, that creates
+it). It writes one reading a minute for a day, then reads it back three ways: the newest readings, a summary per hour,
+and the sum per day where days begin at midnight in Oslo.</p>
+<div class="tabs">
+<div class="tablist" role="tablist" aria-label="Language">
+<button type="button" role="tab" data-key="c">C</button>
+<button type="button" role="tab" data-key="rust">Rust</button>
+<button type="button" role="tab" data-key="python">Python</button>
+<button type="button" role="tab" data-key="java">Java</button>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="c">
+<pre><code class="language-c" data-src="examples/client.c">/* tsdb as a server: write one day of readings through tsdbd and read them back.
+ *
+ *   build/tsdb /tmp/tsdb-qs/server user add admin --superuser --password-file /tmp/tsdb-qs/password
+ *   build/tsdbd --dir /tmp/tsdb-qs/server --port 17070 &amp;
+ *   build/client-example 127.0.0.1 17070 admin /tmp/tsdb-qs/password
+ *
+ * The last two arguments are the user and a file whose first line is the password. Leave them out for a
+ * tsdbd started with --no-auth. The C client does not link the storage engine; it only talks to the server. */
+#include &lt;inttypes.h&gt;
+#include &lt;math.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+#include "tsdb_calendar.h"
+#include "tsdb_client.h"
+
+#define N 1440 /* one reading a minute for a day */
+
+/* Called with blocks of rows. We only count them and remember the first one. */
+struct seen {
+    size_t rows;
+    int64_t first_ts;
+    float first_value;
+};
+
+static int on_rows(void *ctx, const int64_t *ts, const float *values, size_t n)
+{
+    struct seen *s = ctx;
+    if (s-&gt;rows == 0 &amp;&amp; n &gt; 0) {
+        s-&gt;first_ts = ts[0];
+        s-&gt;first_value = values[0];
+    }
+    s-&gt;rows += n;
+    return 0; /* non-zero would stop early */
+}
+
+#define CHECK(call)                                                         \
+    do {                                                                    \
+        int err_ = (call);                                                  \
+        if (err_ &lt; 0) {                                                     \
+            fprintf(stderr, "%s failed: %s\n", #call, tsdbc_strerror(err_)); \
+            rc = 1;                                                         \
+            goto done;                                                      \
+        }                                                                   \
+    } while (0)
+
+int main(int argc, char **argv)
+{
+    const char *host = argc &gt; 1 ? argv[1] : "127.0.0.1";
+    int port = argc &gt; 2 ? atoi(argv[2]) : 7070;
+    tsdbc_options login = {0};
+    login.user = argc &gt; 3 ? argv[3] : NULL;          /* NULL: no login */
+    login.password_file = argc &gt; 4 ? argv[4] : NULL; /* never the password itself: argv is visible in ps */
+    const int64_t start = 1717200000000; /* 2024-06-01 00:00:00 UTC, in milliseconds */
+    const int64_t end = start + 86400000;
+
+    int rc = 0;
+    tsdbc *c = NULL;
+    tsdb_bucket *hours = NULL, *days = NULL;
+    CHECK(tsdbc_connect_opts(host, port, &amp;login, &amp;c)); /* on an error, CHECK prints it and jumps to done: below */
+
+    tsdb_sid flow;
+    CHECK(tsdbc_series(c, "pump7.flow", 1, &amp;flow)); /* 1: create the series if it is missing */
+
+    static int64_t times[N];
+    static float values[N];
+    for (int i = 0; i &lt; N; i++) {
+        times[i] = start + (int64_t)i * 60000;
+        values[i] = 50.0f + 10.0f * sinf((float)i / 229.0f);
+    }
+    CHECK(tsdbc_insert_series(c, flow, times, values, N)); /* the server has it on disk when this returns */
+    printf("wrote %d rows\n", N);
+
+    struct seen seen = {0};
+    CHECK(tsdbc_query_raw(c, flow, start, end, on_rows, &amp;seen));
+    printf("read %zu rows, the first: %" PRId64 " %.2f\n", seen.rows, seen.first_ts, seen.first_value);
+
+    size_t nhours;
+    CHECK(tsdbc_query_agg(c, flow, start, end, 3600000, &amp;hours, &amp;nhours)); /* one summary per hour */
+    if (nhours &gt; 0) /* an empty time range gives no buckets */
+        printf("%zu hours, the first average: %.2f\n", nhours, tsdb_bucket_avg(&amp;hours[0]));
+
+    size_t ndays;
+    tsdb_group day = {TSDB_DAY, 1, "Europe/Oslo"};
+    CHECK(tsdbc_query_group(c, flow, start, end, &amp;day, NULL, &amp;days, &amp;ndays)); /* one summary per Oslo day */
+    for (size_t i = 0; i &lt; ndays; i++)
+        printf("Oslo day %zu: %" PRIu64 " rows, average %.2f\n", i + 1, days[i].count, tsdb_bucket_avg(&amp;days[i]));
+
+done:
+    free(hours);
+    free(days);
+    if (c)
+        tsdbc_close(c);
+    return rc;
+}</code></pre>
+<p class="code-source">examples/client.c. <code>make</code> builds it; run
+<code>build/client-example 127.0.0.1 7070 admin /tmp/tsdb-demo/password</code>.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="rust">
+<pre><code class="language-rust" data-src="client/rust/examples/quickstart.rs">use tsdb_client::{Client, ConnectOptions, Group, QueryOpts, Unit};
+
+fn main() -&gt; Result&lt;(), tsdb_client::Error&gt; {
+    // Connect to tsdbd and log in. The arguments, all optional: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let login = ConnectOptions::new().user(user).password_file(password_file);
+    let mut client = Client::connect_opts(addr.as_str(), &amp;login)?;
+
+    // Get the id of a series (it is created the first time).
+    let id = client.series("pump7.flow")?;
+
+    // Insert one value per minute for a day. Times are ms since 1970-01-01 UTC.
+    let t0: i64 = 1_699_999_200_000; // 2023-11-14 22:00 UTC
+    let ts: Vec&lt;i64&gt; = (0..1440).map(|i| t0 + i * 60_000).collect();
+    let values: Vec&lt;f32&gt; = (0..1440).map(|i| (i % 60) as f32).collect();
+    client.insert_series(id, &amp;ts, &amp;values)?;
+
+    // Read the newest three values.
+    for (t, v) in client.query_points(id, .., QueryOpts::desc().limit(3))?.iter() {
+        println!("raw  {t} {v}");
+    }
+
+    // Count, average, min and max per hour, for the first six hours.
+    for b in client.query_agg(id, t0..t0 + 6 * 3_600_000, 3_600_000)? {
+        println!("hour {} count {} avg {:.2} min {} max {}", b.start, b.count, b.avg(), b.min, b.max);
+    }
+
+    // Sum per day, where days begin at midnight in Oslo.
+    let days = Group::new(Unit::Day).timezone("Europe/Oslo");
+    for b in client.query_group(id, .., Some(&amp;days), QueryOpts::asc())? {
+        println!("day  {} count {} sum {}", b.start, b.count, b.sum);
+    }
+
+    client.close()
+}</code></pre>
+<p class="code-source">client/rust/examples/quickstart.rs. In <code>client/rust</code>, run
+<code>cargo run --example quickstart</code>. It prints:</p>
+<pre><code data-lang="text" data-src="client/rust/README.md#Quick start">raw  1700085540000 59
+raw  1700085480000 58
+raw  1700085420000 57
+hour 1699999200000 count 60 avg 29.50 min 0 max 59
+...
+day  1699916400000 count 60 sum 1770
+day  1700002800000 count 1380 sum 40710</code></pre>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="python">
+<pre><code class="language-python" data-src="client/python/README.md#Quick start">from tsdb_client import Client
+
+# Connect and log in as admin, with the password from the file of step 1.
+# The connection closes at the end of the with block.
+with Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as client:
+    # Get the id of a series (it is created the first time).
+    series = client.series("pump7.flow")
+
+    # Insert one value per minute for a day. Times are ms since 1970-01-01 UTC.
+    t0 = 1_699_999_200_000  # 2023-11-14 22:00 UTC
+    ts = [t0 + i * 60_000 for i in range(1440)]
+    values = [float(i % 60) for i in range(1440)]
+    client.insert_series(series, ts, values)
+
+    # Read the newest three values.
+    newest_ts, newest_values = client.query_raw(series, order="desc", limit=3)
+    for t, v in zip(newest_ts, newest_values):
+        print("raw ", int(t), float(v))
+
+    # Count, average, min and max per hour, for the first six hours.
+    for b in client.query_agg(series, t0, t0 + 6 * 3_600_000, interval_ms=3_600_000):
+        print("hour", b.start, b.count, round(b.avg, 2), b.min, b.max)
+
+    # Sum per day, where days begin at midnight in Oslo.
+    for b in client.query_group(series, unit="day", timezone="Europe/Oslo"):
+        print("day ", b.start, b.count, b.sum)</code></pre>
+<p class="code-source">The quick start of client/python/README.md. Save it as <code>quickstart.py</code> and run it with
+<code>/tmp/tsdb-venv/bin/python quickstart.py</code>.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="java">
+<pre><code class="language-java" data-src="client/java/src/main/java/ai/intellistream/tsdb/example/Example.java">package ai.intellistream.tsdb.example;
+
+import ai.intellistream.tsdb.Bucket;
+import ai.intellistream.tsdb.ConnectOptions;
+import ai.intellistream.tsdb.Group;
+import ai.intellistream.tsdb.Order;
+import ai.intellistream.tsdb.Points;
+import ai.intellistream.tsdb.TsdbClient;
+import ai.intellistream.tsdb.Unit;
+
+import java.nio.file.Path;
+import java.time.Instant;
+
+/**
+ * Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port] [user]
+ * [password-file]}.
+ */
+public final class Example {
+    private Example() {
+    }
+
+    /**
+     * Runs the example.
+     *
+     * @param args the host and port of a running tsdbd, the user to log in as and the file with its password;
+     *     default 127.0.0.1 7070 admin /tmp/tsdb-demo/password
+     * @throws Exception if the server cannot be reached, the login fails or a request fails
+     */
+    public static void main(String[] args) throws Exception {
+        String host = args.length &gt; 0 ? args[0] : "127.0.0.1";
+        int port = args.length &gt; 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
+        String user = args.length &gt; 2 ? args[2] : "admin";
+        Path passwordFile = Path.of(args.length &gt; 3 ? args[3] : "/tmp/tsdb-demo/password");
+
+        // Log in as user, with the password from the first line of passwordFile.
+        ConnectOptions login = ConnectOptions.defaults().user(user).passwordFile(passwordFile);
+        try (TsdbClient client = TsdbClient.connect(host, port, login)) {
+            long pump = client.series("pump7.flow_m3h"); // get or create
+
+            // One reading per minute for a day, from 2024-03-01T00:00Z, as a single batch.
+            long t0 = Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();
+            int n = 24 * 60;
+            long[] ts = new long[n];
+            float[] values = new float[n];
+            for (int i = 0; i &lt; n; i++) {
+                ts[i] = t0 + i * 60_000L;
+                values[i] = 40 + (i % 60) / 10f;
+            }
+            client.insert(pump, ts, values);
+
+            // Raw points: the three newest.
+            Points newest = client.queryPoints(pump, Long.MIN_VALUE, Long.MAX_VALUE, Order.DESC, 3);
+            for (int i = 0; i &lt; newest.size(); i++)
+                System.out.printf("%s %.1f%n", Instant.ofEpochMilli(newest.timestamp(i)), newest.value(i));
+
+            // Aggregates over fixed 6-hour intervals.
+            for (Bucket b : client.queryAgg(pump, t0, t0 + 86_400_000L, 6 * 3_600_000L))
+                System.out.printf("%s count %d avg %.2f min %.1f max %.1f%n", Instant.ofEpochMilli(b.start()),
+                        b.count(), b.avg(), b.min(), b.max());
+
+            // Calendar days in Oslo (UTC+1 in March): the UTC day spans two local days.
+            Group osloDays = Group.of(Unit.DAY).in("Europe/Oslo");
+            for (Bucket b : client.queryGroup(pump, Long.MIN_VALUE, Long.MAX_VALUE, osloDays))
+                System.out.printf("Oslo day from %s: %d points%n", Instant.ofEpochMilli(b.start()), b.count());
+        }
+    }
+}</code></pre>
+<p class="code-source">client/java/src/main/java/ai/intellistream/tsdb/example/Example.java. Build and run it:</p>
+<pre><code class="language-sh" data-block="2" data-src="client/java/README.md#Quick start">cd client/java
+mvn -q package -DskipTests
+java -cp target/tsdb-client-0.9.1.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070 admin /tmp/tsdb-demo/password</code></pre>
+</div>
+</div>
+<p>Times are milliseconds since 1970 in UTC. The Oslo days are worked out by the client: the server knows only UTC
+(see <a href="concepts.html#time-zones">time zones</a>).</p>
+
+<h2 id="embedded">3. The database inside your program</h2>
+<p>The same work with no server and no network: the database is a directory, opened by your program.</p>
+<div class="tabs">
+<div class="tablist" role="tablist" aria-label="Language">
+<button type="button" role="tab" data-key="c">C</button>
+<button type="button" role="tab" data-key="rust">Rust</button>
+<button type="button" role="tab" data-key="python">Python</button>
+<button type="button" role="tab" data-key="java">Java</button>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="c">
+<pre><code class="language-c" data-src="examples/embedded.c">/* tsdb as a library: write one day of readings and read them back.
+ *
+ *   build/embedded-example /tmp/tsdb-qs/embedded
+ *
+ * Needs no server. The database is a directory; it is created if it is missing. */
+#include &lt;inttypes.h&gt;
+#include &lt;math.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+#include "tsdb.h"
+#include "tsdb_calendar.h"
+
+#define N 1440 /* one reading a minute for a day */
+
+/* Called with blocks of rows. We only count them and remember the first one. */
+struct seen {
+    size_t rows;
+    int64_t first_ts;
+    float first_value;
+};
+
+static int on_rows(void *ctx, const int64_t *ts, const float *values, size_t n)
+{
+    struct seen *s = ctx;
+    if (s-&gt;rows == 0 &amp;&amp; n &gt; 0) {
+        s-&gt;first_ts = ts[0];
+        s-&gt;first_value = values[0];
+    }
+    s-&gt;rows += n;
+    return 0; /* non-zero would stop early */
+}
+
+#define CHECK(call)                                                         \
+    do {                                                                    \
+        int err_ = (call);                                                  \
+        if (err_ &lt; 0) {                                                     \
+            fprintf(stderr, "%s failed: %s\n", #call, tsdb_strerror(err_)); \
+            rc = 1;                                                         \
+            goto done;                                                      \
+        }                                                                   \
+    } while (0)
+
+int main(int argc, char **argv)
+{
+    const char *dir = argc &gt; 1 ? argv[1] : "/tmp/tsdb-qs/embedded";
+    const int64_t start = 1717200000000; /* 2024-06-01 00:00:00 UTC, in milliseconds */
+    const int64_t end = start + 86400000;
+
+    int rc = 0;
+    tsdb *db = NULL;
+    tsdb_bucket *hours = NULL, *days = NULL;
+    CHECK(tsdb_open(dir, NULL, &amp;db)); /* on an error, CHECK prints it and jumps to done: below */
+
+    tsdb_sid flow;
+    CHECK(tsdb_series(db, "pump7.flow", &amp;flow)); /* finds the series, or creates it */
+
+    static int64_t times[N];
+    static float values[N];
+    for (int i = 0; i &lt; N; i++) {
+        times[i] = start + (int64_t)i * 60000;
+        values[i] = 50.0f + 10.0f * sinf((float)i / 229.0f);
+    }
+    CHECK(tsdb_insert_series(db, flow, times, values, N)); /* on disk when it returns */
+    printf("wrote %d rows\n", N);
+
+    struct seen seen = {0};
+    CHECK(tsdb_query_raw(db, flow, start, end, on_rows, &amp;seen));
+    printf("read %zu rows, the first: %" PRId64 " %.2f\n", seen.rows, seen.first_ts, seen.first_value);
+
+    size_t nhours;
+    CHECK(tsdb_query_agg(db, flow, start, end, 3600000, &amp;hours, &amp;nhours)); /* one summary per hour */
+    if (nhours &gt; 0) /* an empty time range gives no buckets */
+        printf("%zu hours, the first average: %.2f\n", nhours, tsdb_bucket_avg(&amp;hours[0]));
+
+    size_t ndays;
+    tsdb_group day = {TSDB_DAY, 1, "Europe/Oslo"};
+    CHECK(tsdb_query_group_local(db, flow, start, end, &amp;day, NULL, &amp;days, &amp;ndays)); /* one summary per Oslo day */
+    for (size_t i = 0; i &lt; ndays; i++)
+        printf("Oslo day %zu: %" PRIu64 " rows, average %.2f\n", i + 1, days[i].count, tsdb_bucket_avg(&amp;days[i]));
+
+done:
+    free(hours);
+    free(days);
+    if (db)
+        tsdb_close(db);
+    return rc;
+}</code></pre>
+<p class="code-source">examples/embedded.c. <code>make</code> builds it; run
+<code>build/embedded-example /tmp/tsdb-embedded</code>.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="rust">
+<pre><code class="language-rust" data-src="client/rust/examples/embedded_quickstart.rs">use tsdb_client::{Db, Group, Options, QueryOpts, Unit};
+
+fn main() -&gt; tsdb_client::Result&lt;()&gt; {
+    let dir = std::env::args().nth(1).unwrap_or_else(|| "/tmp/tsdb-embedded".into());
+    let db = Db::open(&amp;dir, &amp;Options::default())?; // the engine runs in this process
+
+    let s = db.series("pump7.flow")?;
+    let t0 = 1_700_000_000_000; // one row a minute for a day
+    let ts: Vec&lt;i64&gt; = (0..1440).map(|i| t0 + i * 60_000).collect();
+    let values: Vec&lt;f32&gt; = (0..1440).map(|i| (i % 60) as f32).collect();
+    db.insert_series(s, &amp;ts, &amp;values)?;
+
+    let p = db.query_points(s, t0..t0 + 180_000, QueryOpts::asc())?;
+    for (t, v) in p.ts.iter().zip(&amp;p.values) {
+        println!("raw  {t} {v}");
+    }
+    let days = Group::new(Unit::Day).timezone("Europe/Oslo");
+    for b in db.query_group(s, .., Some(&amp;days), QueryOpts::asc())? {
+        println!("day  {} {} {}", b.start, b.count, b.sum);
+    }
+    db.close()
+}</code></pre>
+<p class="code-source">client/rust/examples/embedded_quickstart.rs. It needs the <code>embedded</code> feature:
+<code>cargo run --features embedded --example embedded_quickstart -- /tmp/tsdb-embedded</code>.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="python">
+<pre><code class="language-python" data-src="client/python/README.md#Embedded">import tsdb_client
+
+with tsdb_client.Db("/tmp/tsdb-embedded") as db:
+    s = db.series("pump7.flow")
+    t0 = 1_700_000_000_000  # one row a minute for a day
+    db.insert_series(s, [t0 + i * 60_000 for i in range(1440)], [float(i % 60) for i in range(1440)])
+    ts, values = db.query_raw(s, t0, t0 + 180_000, numpy=False)
+    for t, v in zip(ts, values):
+        print("raw ", t, v)
+    for b in db.query_group(s, unit="day", timezone="Europe/Oslo"):
+        print("day ", b.start, b.count, b.sum)</code></pre>
+<p class="code-source">From client/python/README.md. <code>tsdb_client.Db</code> has the same methods as
+<code>Client</code>, so code switches between the two by changing one line.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="java">
+<p>The embedded Java library is <code>tsdb-embedded</code> in <code>client/java-embedded</code>. It needs Java 22 or
+newer. Its <code>EmbeddedDb</code> has the same methods as <code>TsdbClient</code> and uses the same types, so only
+the line that opens the database changes. Start Java with <code>--enable-native-access=ALL-UNNAMED</code>.
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/client/java-embedded/README.md">Its
+README</a> shows how to build it.</p>
+</div>
+</div>
+
+<h2 id="analytics">4. Spread, time-weighted averages and charts</h2>
+<p>Three questions that a plain average does not answer: how much do the values spread, what was the average over time
+for a sensor that reports only on change, and which few points draw the same line. <a href="concepts.html#spread">Concepts</a>
+explains each.</p>
+<div class="tabs">
+<div class="tablist" role="tablist" aria-label="Language">
+<button type="button" role="tab" data-key="c">C</button>
+<button type="button" role="tab" data-key="rust">Rust</button>
+<button type="button" role="tab" data-key="python">Python</button>
+<button type="button" role="tab" data-key="java">Java</button>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="c">
+<p>The calls in <code>include/tsdb.h</code>. The C client has the same ones with the prefix <code>tsdbc_</code>
+(<code>tsdbc_query_spread</code>, <code>tsdbc_query_twa</code>, <code>tsdbc_query_lttb</code>).</p>
+<pre><code class="language-c" data-src="include/tsdb.h#L477-L485">/* ---- the spread: range, variance, standard deviation ----
+ * A bucket as above followed by the spread of its known values: range is
+ * max - min; var_pop and stddev_pop are the population variance and standard
+ * deviation (divided by count), var_samp and stddev_samp the sample ones
+ * (divided by count - 1, NaN for a single value). All are NaN for a bucket
+ * without known values and for state series. A NaN or an infinity among the
+ * values makes the variances NaN (the deviation of an infinity from the mean
+ * is undefined), not the range, which comes from min and max; so do finite
+ * floats whose sum overflows (values near DBL_MAX), as it does the sum.</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L541-L551">*    twa        = area / covered_ms (NaN when covered_ms is 0)
+*    count      = non-null readings in the bucket and in [start, end)
+* area and covered_ms add up across buckets: the average over several buckets is
+* the sum of their areas over the sum of their covered_ms. A bucket is returned
+* when covered_ms or count is not 0. Since a segment alone fills a bucket, a
+* query may span at most 4M buckets between its first and last reading in range
+* (TSDB_ERR_TOO_MANY_BUCKETS beyond).
+* NaN propagates: a NaN value held for any time makes the area and twa NaN;
+* infinities follow IEEE arithmetic, and a LINEAR segment with an infinite end
+* is that infinity throughout (+inf to -inf: NaN), wherever buckets cut it. A NaN result is the canonical quiet NaN.
+* Types: float32, float64, int64 (as double: exact up to 2^53), bool (0 or 1:</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">
+/* Downsampling for charts: Largest-Triangle-Three-Buckets (Steinarsson 2013)</code></pre>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="rust">
+<pre><code class="language-rust" data-src="client/rust/examples/analytics.rs">use tsdb_client::{Client, ConnectOptions, QueryOpts, TwaOpts, ValueType};
+
+fn main() -&gt; Result&lt;(), tsdb_client::Error&gt; {
+    // As in the quick start: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let login = ConnectOptions::new().user(user).password_file(password_file);
+    let mut client = Client::connect_opts(addr.as_str(), &amp;login)?;
+    let t0: i64 = 1_699_999_200_000; // 2023-11-14 22:00 UTC
+    let hour = 3_600_000;
+
+    // A tank level, sent only when it changes: 10 until 22:45, then 70, then 40 at midnight.
+    let tank = client.series_create("tank3.level", ValueType::Float64, None)?;
+    let at = [t0, t0 + 45 * 60_000, t0 + hour, t0 + 2 * hour];
+    client.insert_series_values(tank, &amp;at, &amp;[10.0f64, 70.0, 70.0, 40.0])?;
+
+    // The plain average counts each reading once; the time-weighted one counts how long each value held.
+    let plain = client.query_agg(tank, t0..t0 + 2 * hour, hour)?;
+    let twa = client.query_twa(tank, t0..t0 + 2 * hour, hour, TwaOpts::step())?;
+    for (p, w) in plain.iter().zip(&amp;twa) {
+        println!("hour {} avg {:.1} twa {:.1}", p.start, p.avg(), w.twa);
+    }
+
+    // How far the readings spread: range and standard deviation of the whole series.
+    let s = &amp;client.query_spread(tank, .., 0, QueryOpts::asc())?[0];
+    println!("spread range {} stddev {:.2}", s.range, s.stddev_samp);
+
+    // 10,000 vibration readings cut to 100 points that keep the shape of the line, for a chart.
+    let vib = client.series("pump7.vibration")?;
+    let ts: Vec&lt;i64&gt; = (0..10_000).map(|i| t0 + i * 1000).collect();
+    let values: Vec&lt;f32&gt; = (0..10_000).map(|i| (i as f32 / 300.0).sin()).collect();
+    client.insert_series(vib, &amp;ts, &amp;values)?;
+    let chart = client.query_lttb(vib, .., 100, QueryOpts::asc())?;
+    println!("chart {} of {} points", chart.len(), ts.len());
+
+    client.close()
+}</code></pre>
+<p class="code-source">client/rust/examples/analytics.rs: <code>cargo run --example analytics</code>. It prints:</p>
+<pre><code data-lang="text" data-src="client/rust/README.md#Time-weighted averages">hour 1699999200000 avg 40.0 twa 25.0
+hour 1700002800000 avg 70.0 twa 70.0
+spread range 60 stddev 28.72
+chart 100 of 10000 points</code></pre>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="python">
+<pre><code class="language-python" data-src="client/python/README.md#Spread, time-weighted">from tsdb_client import Db
+
+with Db("/tmp/tsdb-analytics") as db:
+    s = db.series_create("tank1.level", "float64")
+    db.insert_series_values(s, [0, 1000, 3000, 4000], [10.0, 20.0, 30.0, 40.0])
+
+    (b,) = db.query_spread(s)                        # count, sum, min, max and the spread
+    print("spread", b.range, b.var_pop, b.stddev_pop)
+
+    (w,) = db.query_twa(s, 0, 5000)                  # each value weighted by how long it held
+    print("twa", w.twa, w.covered_ms)
+
+    ts, values = db.query_lttb(s, 3, numpy=False)    # at most 3 points that keep the shape
+    print("chart", ts)
+
+    last = db.query_agg(s, None, None, 1000, order="desc", limit=1)
+    print("last", last[0].start, last[0].sum)</code></pre>
+<p class="code-source">From client/python/README.md.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="java">
+<pre><code class="language-java" data-src="client/java/README.md#Spread, time-weighted">// range, variance and standard deviation per hour, newest hour first, the last 24 only
+List&lt;SpreadBucket&gt; spread = client.querySpread(energy, t0, t0 + 86_400_000, 3_600_000, Order.DESC, 24);
+double sd = spread.get(0).stddevSamp();
+
+// time-weighted average per hour: each reading counts for as long as it held
+List&lt;TwaBucket&gt; twa = client.queryTwa(energy, t0, t0 + 86_400_000, 3_600_000,
+        TwaOptions.linear().maxGap(600_000));   // straight lines between readings; gaps over 10 minutes count as unknown
+double avg = twa.get(0).twa();
+
+// at most 500 points that keep the shape of the line, for a chart
+ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);</code></pre>
+<p class="code-source">From client/java/README.md; <code>client</code> is a connected <code>TsdbClient</code> and
+<code>energy</code> a series id.</p>
+</div>
+</div>
+
+<h2 id="multi">5. Many series in one request</h2>
+<p>One request, one answer per series, in the order of your list, all read at the same instant.</p>
+<div class="tabs">
+<div class="tablist" role="tablist" aria-label="Language">
+<button type="button" role="tab" data-key="c">C</button>
+<button type="button" role="tab" data-key="rust">Rust</button>
+<button type="button" role="tab" data-key="python">Python</button>
+<button type="button" role="tab" data-key="java">Java</button>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="c">
+<p><code>tsdb_query_multi</code> calls your function once per series as the answers come;
+<code>tsdb_query_multi_collect</code> returns them all at once. The C client has <code>tsdbc_query_multi</code> and
+<code>tsdbc_query_multi_collect</code>.</p>
+<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">typedef struct tsdb_series_result {
+    size_t index; /* into series[] */
+    tsdb_sid series;
+    int status;
+    int last; /* the series' last call */
+    size_t n;</code></pre>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="rust">
+<p>The Rust client has the same many-series calls.
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/client/rust/README.md#many-series-in-one-request">Its
+README</a> shows them.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="python">
+<pre><code class="language-python" data-src="client/python/README.md#Many series in one request">import numpy as np
+import tsdb_client
+
+with tsdb_client.Db("/tmp/tsdb-multi") as db:
+    t0 = 1_700_000_000_000
+    ts = t0 + np.arange(1440, dtype=np.int64) * 60_000  # one row a minute for a day
+    pumps = [db.series(f"pump{i}.flow") for i in range(3)]
+    for i, s in enumerate(pumps):
+        db.insert_series(s, ts, np.full(1440, i + 1.0, dtype=np.float32))
+
+    # hourly buckets of every pump in one call; numpy over all of them at once
+    r = db.query_buckets_multi(pumps, t0, t0 + 86_400_000, interval_ms=3_600_000)
+    print(len(r), r.offsets.tolist(), r.sum.sum())
+    print(len(r[1]), r[1].sum[0])  # pump 1 alone, as query_agg() gives it
+
+    # the newest row of every pump
+    last = db.query_values_multi(pumps, order="desc", limit=1)
+    print(last.values.tolist())</code></pre>
+<p class="code-source">From client/python/README.md.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="java">
+<pre><code class="language-java" data-src="client/java/README.md#Many series in one request">long[] pumps = new long[200];
+for (int i = 0; i &lt; pumps.length; i++) pumps[i] = client.series("pump" + i + ".flow");
+long day = 86_400_000L;
+// every pump by hour over one day
+List&lt;SeriesResult&lt;List&lt;Bucket&gt;&gt;&gt; hourly =
+        client.queryBucketsMulti(pumps, 0, day, Buckets.every(3_600_000), Order.ASC, 0, MultiOptions.defaults());
+for (int i = 0; i &lt; pumps.length; i++) {
+    SeriesResult&lt;List&lt;Bucket&gt;&gt; r = hourly.get(i);
+    if (r.ok()) System.out.println("pump " + pumps[i] + ": " + r.get().size() + " hours");
+    else System.out.println("pump " + pumps[i] + ": status " + r.status());
+}</code></pre>
+<p class="code-source">From client/java/README.md.</p>
+</div>
+</div>
+
+<h2 id="delete">6. Delete, replace and retention</h2>
+<div class="tabs">
+<div class="tablist" role="tablist" aria-label="Language">
+<button type="button" role="tab" data-key="c">C</button>
+<button type="button" role="tab" data-key="rust">Rust</button>
+<button type="button" role="tab" data-key="python">Python</button>
+<button type="button" role="tab" data-key="java">Java</button>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="c">
+<pre><code class="language-c" data-src="include/tsdb.h#L259-L261">int tsdb_insert_series(tsdb *db, tsdb_sid series, const int64_t *ts, const float *values, size_t n);
+
+/* The same for any value type, and with nulls. Every series of one call</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">* visible; it is all or nothing across a crash. A delete costs about what a
+* large insert costs: it flushes the memtable (of all series) and writes and</code></pre>
+<p>The C client has the same calls with the prefix <code>tsdbc_</code>.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="rust">
+<p>See <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/client/rust/README.md#delete-replace-and-retention">Delete,
+replace and retention</a> in the Rust README.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="python">
+<p>See <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/client/python/README.md#delete-replace-and-retention">Delete,
+replace and retention</a> in the Python README.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="java">
+<pre><code class="language-java" data-src="client/java/README.md#Delete, replace and retention">client.deleteRange(energy, t0, t0 + 3_600_000);   // one hour, its end excluded; Long.MIN_VALUE/MAX_VALUE: open
+client.replaceRange(energy, t0, t0 + 2000, new long[] {t0}, Column.ofLongs(7));
+client.setRetention(energy, 30 * 86_400_000L);    // keep 30 days; 0 keeps everything
+long limit = client.retention(energy);</code></pre>
+<p class="code-source">From client/java/README.md.</p>
+</div>
+</div>
+
+<h2 id="login">7. Logging in, users and rights</h2>
+<p>Every program on this page logs in with a user name and a password. The password never crosses the network:
+client and server prove to each other that they know it. A wrong user name and a wrong password give the same
+error. Keep passwords in a file only you can read, or wherever your program keeps secrets, never in the source.</p>
+<p>A superuser may do everything. Every other user has rights (<code>read</code>, <code>insert</code>,
+<code>delete</code>, <code>admin</code>) on the series a selector matches: <code>all</code>, a name prefix such as
+<code>prefix:acme/</code>, one name, or a pattern such as <code>glob:acme/*/temp</code>. A series a user may not touch
+answers "permission denied", whether it exists or not. A superuser, or a user with <code>admin</code> on a prefix,
+adds users and gives them rights over the connection. Here a superuser adds a user for a collector that may only add
+rows under <code>acme/</code>, which then cannot read them back nor see another tenant's series. On the server's own
+machine an operator does the same with <a href="cli.html#users"><code>tsdb DIR user</code></a>.</p>
+<div class="tabs">
+<div class="tablist" role="tablist" aria-label="Language">
+<button type="button" role="tab" data-key="c">C</button>
+<button type="button" role="tab" data-key="rust">Rust</button>
+<button type="button" role="tab" data-key="python">Python</button>
+<button type="button" role="tab" data-key="java">Java</button>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="c">
+<p>The login is part of the connect options:</p>
+<pre><code class="language-c" data-src="examples/client.c#L51-L53">tsdbc_options login = {0};
+login.user = argc &gt; 3 ? argv[3] : NULL;          /* NULL: no login */
+login.password_file = argc &gt; 4 ? argv[4] : NULL; /* never the password itself: argv is visible in ps */</code></pre>
+<p>and the calls for users are in <code>client/tsdb_client.h</code> (the kinds of selector are
+<code>TSDB_SEL_*</code>, the rights <code>TSDB_RIGHT_*</code> bits):</p>
+<pre><code class="language-c" data-src="client/tsdb_client.h#L85-L90">void tsdbc_users_free(tsdbc_user *u, size_t n);
+int tsdbc_user_create(tsdbc *c, const char *name, const char *password, uint32_t iterations, uint8_t flags);
+int tsdbc_user_drop(tsdbc *c, const char *name);
+int tsdbc_user_alter(tsdbc *c, const char *name, uint8_t flags);
+int tsdbc_user_password(tsdbc *c, const char *name, const char *password, uint32_t iterations);
+int tsdbc_grant(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);</code></pre>
+<p class="code-source">From examples/client.c and client/tsdb_client.h.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="rust">
+<pre><code class="language-rust" data-src="client/rust/examples/users.rs">use tsdb_client::{Client, ConnectOptions, QueryOpts, Rights, Selector};
+
+fn main() -&gt; Result&lt;(), tsdb_client::Error&gt; {
+    // Log in as the superuser of the quick start: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let mut admin = Client::connect_opts(addr.as_str(), &amp;ConnectOptions::new().user(user).password_file(password_file))?;
+
+    // A user for a collector of the tenant "acme": it may add rows to the series whose names start with
+    // "acme/", and do nothing else.
+    admin.user_create("acme/ingest", "collector-password-5", false, None)?;
+    admin.grant("acme/ingest", &amp;Selector::Prefix("acme/".into()), Rights::INSERT)?;
+    for u in admin.user_list()? {
+        let grants: Vec&lt;String&gt; = u.grants.iter().map(|g| format!("{} on {}", g.rights, g.selector)).collect();
+        println!("{}: {}", u.name, if u.superuser { "superuser".to_string() } else { grants.join(", ") });
+    }
+
+    // The collector logs in with its own password and writes a row.
+    let login = ConnectOptions::new().user("acme/ingest").password("collector-password-5");
+    let mut collector = Client::connect_opts(addr.as_str(), &amp;login)?;
+    let pump = collector.series("acme/pump1")?;
+    collector.insert_series(pump, &amp;[1_700_000_000_000], &amp;[1.5])?;
+
+    // It may not read the row back, nor see a series of another tenant.
+    if let Err(e) = collector.query_points(pump, .., QueryOpts::asc()) {
+        println!("read acme/pump1: {e}");
+    }
+    if let Err(e) = collector.series("globex/pump1") {
+        println!("globex/pump1: {e}");
+    }
+    collector.close()?;
+
+    // Drop the user again, so that the example can run once more.
+    admin.user_drop("acme/ingest")?;
+    admin.close()
+}</code></pre>
+<p class="code-source">client/rust/examples/users.rs. After the quick start, run
+<code>cargo run --example users</code>. It prints:</p>
+<pre><code data-lang="text" data-src="client/rust/README.md#Users and rights">admin: superuser
+acme/ingest: insert on prefix:acme/
+read acme/pump1: server error -16: permission denied
+globex/pump1: server error -16: permission denied</code></pre>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="python">
+<pre><code class="language-python" data-src="client/python/README.md#Users and rights">from tsdb_client import Client, TsdbError
+
+# Log in as the superuser of the quick start.
+with Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as admin:
+    # A user for a collector of the tenant "acme": it may add rows to the
+    # series whose names start with "acme/", and do nothing else.
+    admin.user_create("acme/ingest", "collector-password-5")
+    admin.grant("acme/ingest", "prefix:acme/", "insert")
+    for u in admin.user_list():
+        print(f"{u.name}:", "superuser" if u.superuser else u.grants)
+
+    # The collector logs in with its own password and writes a row.
+    with Client("127.0.0.1", port=7070, user="acme/ingest", password="collector-password-5") as collector:
+        pump = collector.series("acme/pump1")
+        collector.insert_series(pump, [1_700_000_000_000], [1.5])
+
+        # It may not read the row back, nor see a series of another tenant.
+        try:
+            collector.query_raw(pump)
+        except TsdbError as e:
+            print("read acme/pump1:", e)
+        try:
+            collector.series("globex/pump1")
+        except TsdbError as e:
+            print("globex/pump1:", e)
+
+    # Drop the user again, so that the program can run once more.
+    admin.user_drop("acme/ingest")</code></pre>
+<p class="code-source">From client/python/README.md. It prints:</p>
+<pre><code data-lang="text" data-src="client/python/README.md#Users and rights">admin: superuser
+acme/ingest: [('prefix:acme/', 'insert')]
+read acme/pump1: server error -16: permission denied
+globex/pump1: server error -16: permission denied</code></pre>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="java">
+<pre><code class="language-java" data-src="client/java/README.md#Users and rights">ConnectOptions login = ConnectOptions.defaults().user(user).passwordFile(passwordFile);
+try (TsdbClient admin = TsdbClient.connect(host, port, login)) {
+    // A user for a collector of the tenant "acme": it may add rows to the series whose names start
+    // with "acme/", and do nothing else.
+    admin.userCreate("acme/ingest", "collector-password-5".toCharArray(), false);
+    admin.grant("acme/ingest", Selector.prefix("acme/"), Rights.INSERT);
+    for (User u : admin.userList()) {
+        StringJoiner grants = new StringJoiner(", ");
+        for (Grant g : u.grants())
+            grants.add(g.rights() + " on " + g.selector());
+        System.out.println(u.name() + ": " + (u.superuser() ? "superuser" : grants));
+    }
+
+    // The collector logs in with its own password and writes a row.
+    ConnectOptions collectorLogin = ConnectOptions.defaults().user("acme/ingest")
+            .password("collector-password-5");
+    try (TsdbClient collector = TsdbClient.connect(host, port, collectorLogin)) {
+        long pump = collector.series("acme/pump1");
+        collector.insert(pump, new long[] {1_700_000_000_000L}, new float[] {1.5f});
+
+        // It may not read the row back, nor see a series of another tenant.
+        try {
+            collector.queryPoints(pump, Long.MIN_VALUE, Long.MAX_VALUE, Order.ASC, 10);
+        } catch (TsdbException e) {
+            System.out.println("read acme/pump1: " + e.getMessage());
+        }
+        try {
+            collector.series("globex/pump1");
+        } catch (TsdbException e) {
+            System.out.println("globex/pump1: " + e.getMessage());
+        }
+    }
+
+    // Drop the user again, so that the example can run once more.
+    admin.userDrop("acme/ingest");
+}</code></pre>
+<p class="code-source">The heart of client/java/src/main/java/ai/intellistream/tsdb/example/UsersExample.java, which you
+can run as the quick start's <code>Example</code>. It prints:</p>
+<pre><code data-lang="text" data-src="client/java/README.md#Users and rights">admin: superuser
+acme/ingest: insert on prefix:acme/
+read acme/pump1: permission denied (-16)
+globex/pump1: permission denied (-16)</code></pre>
+</div>
+</div>
+
+<h2 id="more">More</h2>
+<ul>
+<li>Each client's README has the whole API: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/client/rust/README.md">Rust</a>,
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/client/python/README.md">Python</a>,
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/client/java/README.md">Java</a>,
+and for C the headers <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/client/tsdb_client.h">client/tsdb_client.h</a>
+and <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/include/tsdb.h">include/tsdb.h</a>.</li>
+<li>All four clients compress the data before they send it: an insert uses about 6 bytes per point on the network
+instead of 16.</li>
+</ul>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="compression.html"><span>Previous</span>Compression</a><a class="next" href="cli.html"><span>Next</span>Command line</a></nav></main>
+</div>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+</body>
+</html>

@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Benchmarks</title>
+<meta name="description" content="tsdb docs|tsdb 0.9.0 against ClickHouse, InfluxDB, VictoriaMetrics, QuestDB, TimescaleDB, IoTDB, TDengine, Prometheus, DuckDB and chDB: size, load, queries, memory and failures.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#070a17">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="../assets/favicon.png" type="image/png" sizes="32x32">
+<link rel="stylesheet" href="../assets/site.css?v=2d2fdbe">
+<script src="../assets/site.js?v=2d2fdbe"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+<div class="topbar-in">
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="28" height="28"><span>tsdb</span></a>
+<nav class="topnav" id="topnav" aria-label="Main"><a href="../index.html">Home</a><a href="../docs/index.html">Docs</a><a href="../docs/benchmarks.html" aria-current="page">Benchmarks</a><a class="gh" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg><span>GitHub</span></a></nav>
+<button class="icon-btn menu-btn" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topnav"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</div>
+</header>
+<div class="scrim" hidden></div>
+<div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
+<div class="doc-shell">
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html" aria-current="page">Benchmarks</a></li></ul></nav></aside>
+<main id="main" class="doc">
+<h1>Benchmarks</h1>
+<p class="lead">How tsdb 0.9.0 compares with eleven other databases on the same machine and the same data. Every number
+here comes from the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md">published
+0.9.0 results</a>.</p>
+
+<h2 id="how">How it was measured</h2>
+<ul>
+<li>One machine: AMD Ryzen 9 7950X (16 cores, 32 threads), 64 GB RAM, NVMe disk. One system at a time; every server in
+a container with the same hard memory limit of 48 GB (InfluxDB 2: 24 GB, and it used at most 8.3 GB).</li>
+<li>The data: 100 sensors with 1 million readings each, 100 million readings in all, from seven kinds of sensors that
+behave like real ones (temperatures that creep, tanks that fill and drain, a fast vibration sensor, flows with
+shutdowns). The size test adds 23 real sensors from a hydraulic test rig: 31 data sets.</li>
+<li>Every answer was checked against tsdb's before it was timed. Every timing was repeated 5 times; a time is the
+median time of one request. tsdb ran as a server, over TCP.</li>
+<li>We left out the questions tsdb answers from the summaries it stores, such as a count over all the data: they
+measure a lookup, not reading data. Every question below reads the data.</li>
+<li>A system that ran out of memory or refused a request is shown with the reason. That is a result, not a missing
+number.</li>
+</ul>
+
+<h2 id="servers">Servers: 100 million readings</h2>
+<p>100 sensors with 1 million readings each. tsdb ran as a server, over TCP. Ingest is 100 million rows divided by
+the load time: tsdb syncs every write to disk before it answers; ClickHouse, VictoriaMetrics and QuestDB do not.
+Read is all 100 sensors over the whole history in buckets of 60 readings, in one request. Max memory is the most each
+server held without the file cache over the runs that finished, the 16-client runs included; a red tag marks a
+system that failed with 32 clients asking about many sensors at once.</p>
+<!-- readme-chart bench-servers -->
+<div class="charts">
+<figure class="chart" id="bench-servers-1">
+<figcaption><h3>Size on disk</h3><p>bytes per reading; times tsdb's size; shorter is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">bytes per reading; times tsdb's size; shorter is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="0.0155"><th scope="row">tsdb</th><td>0.78</td></tr>
+<tr data-len="0.0499"><th scope="row">ClickHouse</th><td>3.2× (2.51)</td></tr>
+<tr data-len="0.6859"><th scope="row">InfluxDB 2</th><td>44× (34.5)</td></tr>
+<tr data-len="0.1907"><th scope="row">InfluxDB 3</th><td>12× (9.59)</td></tr>
+<tr data-len="0.0318"><th scope="row">VictoriaMetrics</th><td>2.1× (1.60)</td></tr>
+<tr data-len="1.0000"><th scope="row">QuestDB*</th><td>64× (50.3)</td></tr>
+<tr data-len="0.0680"><th scope="row">TimescaleDB</th><td>4.4× (3.42)</td></tr>
+<tr data-len="0.0517"><th scope="row">IoTDB</th><td>3.3× (2.60)</td></tr>
+<tr data-len="0.0539"><th scope="row">TDengine</th><td>3.5× (2.71)</td></tr>
+<tr data-len="0.0563"><th scope="row">Prometheus</th><td>3.6× (2.83)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-servers-2">
+<figcaption><h3>Ingest</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>85.8 M rows/s</td></tr>
+<tr data-len="0.5556"><th scope="row">ClickHouse</th><td>1.8× slower (47.5 M rows/s)</td></tr>
+<tr data-len="0.0417"><th scope="row">InfluxDB 2</th><td>24× slower (3.59 M rows/s)</td></tr>
+<tr data-len="0.0156"><th scope="row">InfluxDB 3</th><td>64× slower (1.34 M rows/s)</td></tr>
+<tr data-len="0.3846"><th scope="row">VictoriaMetrics</th><td>2.6× slower (33.4 M rows/s)</td></tr>
+<tr data-len="0.3846"><th scope="row">QuestDB*</th><td>2.6× slower (32.9 M rows/s)</td></tr>
+<tr data-len="0.0400"><th scope="row">TimescaleDB</th><td>25× slower (3.49 M rows/s)</td></tr>
+<tr data-len="0.0500"><th scope="row">IoTDB</th><td>20× slower (4.19 M rows/s)</td></tr>
+<tr data-len="0.0500"><th scope="row">TDengine</th><td>20× slower (4.22 M rows/s)</td></tr>
+<tr data-len="0.1099"><th scope="row">Prometheus</th><td>9.1× slower (9.46 M rows/s)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-servers-3">
+<figcaption><h3>Read</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>1,524 M rows/s</td></tr>
+<tr data-len="0.1754"><th scope="row">ClickHouse</th><td>5.7× slower (265 M rows/s)</td></tr>
+<tr data-len="0.0096"><th scope="row">InfluxDB 2</th><td>104× slower (14.6 M rows/s)</td></tr>
+<tr data-len="0.0015"><th scope="row">InfluxDB 3</th><td>685× slower (2.23 M rows/s)</td></tr>
+<tr data-len="0.0714"><th scope="row">VictoriaMetrics</th><td>14× slower (106 M rows/s)</td></tr>
+<tr data-len="0.0500"><th scope="row">QuestDB*</th><td>20× slower (75.8 M rows/s)</td></tr>
+<tr data-len="0.0154"><th scope="row">TimescaleDB</th><td>65× slower (23.6 M rows/s)</td></tr>
+<tr data-len="0.0500"><th scope="row">IoTDB</th><td>20× slower (76.1 M rows/s)</td></tr>
+<tr data-len="0.1010"><th scope="row">TDengine</th><td>9.9× slower (153 M rows/s)</td></tr>
+<tr data-len="0.0038"><th scope="row">Prometheus</th><td>261× slower (5.84 M rows/s)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-servers-4">
+<figcaption><h3>Time-weighted average</h3><p>median time; shorter is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="0.0004"><th scope="row">tsdb</th><td>36.4 ms</td></tr>
+<tr data-len="0.0120"><th scope="row">ClickHouse</th><td>29× slower (1,063 ms)</td></tr>
+<tr data-none="not measured: other answers"><th scope="row">InfluxDB 2</th><td>not measured: other answers</td></tr>
+<tr data-len="0.0962"><th scope="row">InfluxDB 3</th><td>233× slower (8,488 ms)</td></tr>
+<tr data-none="no such function"><th scope="row">VictoriaMetrics</th><td>no such function</td></tr>
+<tr data-len="0.0153"><th scope="row">QuestDB*</th><td>37× slower (1,336 ms)</td></tr>
+<tr data-len="0.2592"><th scope="row">TimescaleDB</th><td>628× slower (22,869 ms)</td></tr>
+<tr data-len="1.0000"><th scope="row">IoTDB</th><td>2,423× slower (88,214 ms)</td></tr>
+<tr data-len="0.4903"><th scope="row">TDengine</th><td>1,188× slower (43,254 ms)</td></tr>
+<tr data-none="not measured"><th scope="row">Prometheus</th><td>not measured</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-servers-5">
+<figcaption><h3>LTTB downsampling</h3><p>median time; shorter is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="0.0370"><th scope="row">tsdb</th><td>456 ms</td></tr>
+<tr data-len="0.0444"><th scope="row">ClickHouse</th><td>1.2× slower (540 ms)</td></tr>
+<tr data-none="not measured"><th scope="row">InfluxDB 2</th><td>not measured</td></tr>
+<tr data-none="not measured"><th scope="row">InfluxDB 3</th><td>not measured</td></tr>
+<tr data-none="no such function"><th scope="row">VictoriaMetrics</th><td>no such function</td></tr>
+<tr data-none="not measured"><th scope="row">QuestDB*</th><td>not measured</td></tr>
+<tr data-len="1.0000"><th scope="row">TimescaleDB</th><td>27× slower (12,256 ms)</td></tr>
+<tr data-none="no such function"><th scope="row">IoTDB</th><td>no such function</td></tr>
+<tr data-none="no such function"><th scope="row">TDengine</th><td>no such function</td></tr>
+<tr data-none="not measured"><th scope="row">Prometheus</th><td>not measured</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-servers-6">
+<figcaption><h3>Max memory</h3><p>GB without file cache, peak of finished runs (16 clients too)</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">GB without file cache, peak of finished runs (16 clients too)</th></tr></thead>
+<tbody>
+<tr class="us" data-len="0.0417"><th scope="row">tsdb</th><td>2.0 GB</td></tr>
+<tr data-len="0.6250" data-tag="refused at 32 clients"><th scope="row">ClickHouse</th><td>30.0 GB (refused at 32 clients)</td></tr>
+<tr data-len="0.1646"><th scope="row">InfluxDB 2</th><td>7.9 GB</td></tr>
+<tr data-len="0.5438" data-tag="ran out at 32 clients"><th scope="row">InfluxDB 3</th><td>26.1 GB (ran out at 32 clients)</td></tr>
+<tr data-len="0.1229"><th scope="row">VictoriaMetrics</th><td>5.9 GB</td></tr>
+<tr data-len="0.9979" data-tag="refused at 32 clients"><th scope="row">QuestDB*</th><td>47.9 GB (refused at 32 clients)</td></tr>
+<tr data-len="0.9104" data-tag="ran out at 32 clients"><th scope="row">TimescaleDB</th><td>43.7 GB (ran out at 32 clients)</td></tr>
+<tr data-len="0.3875" data-tag="refused at 32 clients"><th scope="row">IoTDB</th><td>18.6 GB (refused at 32 clients)</td></tr>
+<tr data-len="0.8000" data-tag="failed at 32 clients"><th scope="row">TDengine</th><td>38.4 GB (failed at 32 clients)</td></tr>
+<tr data-len="0.0229"><th scope="row">Prometheus</th><td>1.1 GB</td></tr>
+</tbody></table></div>
+</figure>
+</div>
+<p class="chart-notes">Speed: tsdb is the full bar. Size, time and memory: shorter is better. A box instead of a bar: no number, and why. * QuestDB open source, in its default format, which does not compress. It compresses only partitions you convert to Parquet by hand (with ZSTD 1.02 bytes per reading; converting took 28 minutes); automatic conversion is Enterprise only. Exact numbers: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>
+<!-- /readme-chart -->
+
+<h2 id="embedded">Embedded: a library inside your program</h2>
+<p>The same 100 million readings in one process, with no network. chDB is ClickHouse as a library. Read is random
+days of one sensor in 5-minute buckets, one call at a time: tsdb uses one thread per call, chDB and DuckDB 32. DuckDB
+got its readings sorted beforehand (not counted).</p>
+<!-- readme-chart bench-embedded -->
+<div class="charts">
+<figure class="chart" id="bench-embedded-1">
+<figcaption><h3>Size on disk</h3><p>MB; times tsdb's size; shorter is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">MB; times tsdb's size; shorter is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="0.3725"><th scope="row">tsdb</th><td>114 MB</td></tr>
+<tr data-len="0.7157"><th scope="row">chDB</th><td>1.9× (219 MB)</td></tr>
+<tr data-len="1.0000"><th scope="row">DuckDB</th><td>2.7× (306 MB)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-embedded-2">
+<figcaption><h3>Ingest</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>144.8 M rows/s</td></tr>
+<tr data-len="0.4348"><th scope="row">chDB</th><td>2.3× slower (62.5 M rows/s)</td></tr>
+<tr data-len="0.1887"><th scope="row">DuckDB</th><td>5.3× slower (27.5 M rows/s)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-embedded-3">
+<figcaption><h3>Read</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>1,697 M rows/s</td></tr>
+<tr data-len="0.0141"><th scope="row">chDB</th><td>71× slower (23.9 M rows/s)</td></tr>
+<tr data-len="0.0141"><th scope="row">DuckDB</th><td>71× slower (23.9 M rows/s)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-embedded-4">
+<figcaption><h3>Time-weighted average</h3><p>median time; shorter is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="0.0213"><th scope="row">tsdb</th><td>38.7 ms</td></tr>
+<tr data-len="0.5745"><th scope="row">chDB</th><td>27× slower (1,054 ms)</td></tr>
+<tr data-len="1.0000"><th scope="row">DuckDB</th><td>47× slower (1,820 ms)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-embedded-5">
+<figcaption><h3>LTTB downsampling</h3><p>median time; shorter is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="0.9091"><th scope="row">tsdb</th><td>404 ms</td></tr>
+<tr data-len="1.0000"><th scope="row">chDB</th><td>1.1× slower (432 ms)</td></tr>
+<tr data-none="not measured"><th scope="row">DuckDB</th><td>not measured</td></tr>
+</tbody></table></div>
+</figure>
+</div>
+<p class="chart-notes">Speed: tsdb is the full bar. Size, time and memory: shorter is better. A box instead of a bar: no number, and why. Exact numbers: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>
+<!-- /readme-chart -->
+
+<h2 id="big">100 billion readings: tsdb and ClickHouse</h2>
+<p>10,000 sensors with 10 million readings each, loaded by 8 streams. Read is the whole table in hourly buckets.</p>
+<!-- readme-chart bench-100b -->
+<div class="charts">
+<figure class="chart" id="bench-100b-1">
+<figcaption><h3>Size on disk</h3><p>GB; times tsdb's size; shorter is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">GB; times tsdb's size; shorter is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="0.6497"><th scope="row">tsdb</th><td>137.8 GB</td></tr>
+<tr data-len="1.0000"><th scope="row">ClickHouse</th><td>1.5× (212.1 GB)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-100b-2">
+<figcaption><h3>Ingest</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>109.4 M rows/s</td></tr>
+<tr data-len="0.4762"><th scope="row">ClickHouse</th><td>2.1× slower (51.6 M rows/s)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-100b-3">
+<figcaption><h3>Read</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
+<tbody>
+<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>1,910 M rows/s</td></tr>
+<tr data-len="0.4545"><th scope="row">ClickHouse</th><td>2.2× slower (886 M rows/s)</td></tr>
+</tbody></table></div>
+</figure>
+<figure class="chart" id="bench-100b-4">
+<figcaption><h3>Max memory</h3><p>GB; linear scale</p></figcaption>
+<div class="chart-svg"></div>
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<thead><tr><th scope="col">System</th><th scope="col">GB; linear scale</th></tr></thead>
+<tbody>
+<tr class="us" data-len="0.1864"><th scope="row">tsdb</th><td>1.1 GB</td></tr>
+<tr data-len="1.0000"><th scope="row">ClickHouse</th><td>5.9 GB</td></tr>
+</tbody></table></div>
+</figure>
+</div>
+<p class="chart-notes">Speed: tsdb is the full bar. Size, time and memory: shorter is better. A box instead of a bar: no number, and why. Exact numbers: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>
+<!-- /readme-chart -->
+
+<h2 id="yourself">Measure it yourself</h2>
+<p>Clone the repository and run <code>tools/bench-tsdb.sh --quick</code> first to see that it works. It builds an
+optimized copy, runs tsdb's own benchmarks several times and writes a summary with the mean and spread of every number.
+The comparison with the other databases is in
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/tree/main/bench/dbcmp">bench/dbcmp</a>; every
+single measurement is in
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0-tables.md">0.9.0-tables.md</a>.</p>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="operations.html"><span>Previous</span>Operations</a></nav></main>
+</div>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+</body>
+</html>

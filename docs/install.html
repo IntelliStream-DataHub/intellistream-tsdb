@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Install and build</title>
+<meta name="description" content="tsdb docs|Install the packages tsdb needs on Debian, Ubuntu, Fedora, RHEL or AlmaLinux, build it, or use the portable tarball.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#070a17">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="../assets/favicon.png" type="image/png" sizes="32x32">
+<link rel="stylesheet" href="../assets/site.css?v=2d2fdbe">
+<script src="../assets/site.js?v=2d2fdbe"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+<div class="topbar-in">
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="28" height="28"><span>tsdb</span></a>
+<nav class="topnav" id="topnav" aria-label="Main"><a href="../index.html">Home</a><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a><a class="gh" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg><span>GitHub</span></a></nav>
+<button class="icon-btn menu-btn" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topnav"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</div>
+</header>
+<div class="scrim" hidden></div>
+<div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
+<div class="doc-shell">
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html" aria-current="page">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<main id="main" class="doc">
+<h1>Install and build</h1>
+<p class="lead">tsdb is built from source with <code>make</code>. To run it on another machine, build the portable
+tarball and copy it over.</p>
+
+<h2 id="packages">The packages you need</h2>
+<p>You need a C compiler (C11), <code>make</code>, libzstd, and liburing for the server. Python 3 is used by some of
+the tests.</p>
+<h3 id="debian">Debian or Ubuntu</h3>
+<pre><code class="language-sh" data-src="README.md#Getting started">sudo apt install build-essential libzstd-dev liburing-dev python3</code></pre>
+<h3 id="fedora">Fedora, RHEL or AlmaLinux</h3>
+<pre><code class="language-sh" data-src="README.md#Getting started" data-block="2">sudo dnf install gcc make libzstd-devel liburing-devel python3</code></pre>
+<p>On RHEL or AlmaLinux, if <code>liburing-devel</code> is not found, enable the CRB repository
+(<code>sudo dnf config-manager --set-enabled crb</code>). Or leave liburing out and build with
+<code>make NO_URING=1</code>: io_uring is disabled by default there anyway, and tsdbd then uses epoll.</p>
+<p>The Rust, Python and Java clients need their own tools on top: <code>cargo</code>, <code>python3</code> and
+<code>mvn</code>. <a href="clients.html">Clients</a> says which.</p>
+
+<h2 id="build">Build</h2>
+<p>Run <code>make</code> in the top directory of the checkout. Everything lands in <code>build/</code>:</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">File</th><th scope="col">What it is</th></tr></thead>
+<tbody>
+<tr><td><code>build/tsdbd</code></td><td>the server</td></tr>
+<tr><td><code>build/tsdb</code></td><td>the <a href="cli.html">command-line tool</a></td></tr>
+<tr><td><code>build/libtsdb.a</code></td><td>the database as a C library; link with <code>-lzstd -lpthread -lm</code></td></tr>
+<tr><td><code>build/libtsdbclient.a</code></td><td>the C client of tsdbd; link with <code>-lzstd -lpthread -lm</code></td></tr>
+</tbody></table></div>
+<p>A few variants:</p>
+<ul>
+<li><code>make</code> builds for the CPU of this machine (<code>-march=native</code>).</li>
+<li><code>make PORTABLE=1</code> builds without <code>-march=native</code>.</li>
+<li><code>make NO_URING=1</code> (after <code>make clean</code>) builds tsdbd for epoll only, so liburing need not be
+installed.</li>
+<li><code>make test</code> runs all unit, crash-recovery and server tests.</li>
+</ul>
+
+<h2 id="tarball">The portable tarball</h2>
+<p><code>make</code> builds for this machine's CPU. To run tsdb on another one, AlmaLinux 10 for example, build a
+portable tarball and copy it over:</p>
+<pre><code class="language-sh" data-src="README.md#On another machine">make dist       # build-dist/tsdb-VERSION-x86_64-linux.tar.gz</code></pre>
+<p>It runs on any x86-64 Linux with glibc 2.34 or newer and an x86-64-v2 CPU (Intel Nehalem, Sandy Bridge and later;
+AMD Bulldozer and later). zstd and liburing are linked in, so nothing else is needed. The code that packs and unpacks
+values is in it three times, for x86-64-v2, v3 (AVX2) and v4 (AVX-512); tsdbd picks the best one at startup. Every
+level writes the same bytes and gives the same answers, so data moves freely between machines.</p>
+<p>The tarball holds <code>bin/tsdbd</code>, <code>bin/tsdb</code>, the two libraries and their headers, its own
+test suite and a systemd unit. To install it as a service:</p>
+<pre><code class="language-sh" data-src="dist/README.dist#L42-L50">tar xzf tsdb-VERSION-x86_64-linux.tar.gz &amp;&amp; cd tsdb-VERSION-x86_64-linux
+tests/run-tests.sh /var/tmp            # optional, a few minutes
+install -m 755 bin/tsdbd bin/tsdb /usr/local/bin/
+restorecon -v /usr/local/bin/tsdbd /usr/local/bin/tsdb    # SELinux: bin_t
+useradd -r -s /sbin/nologin -d /var/lib/tsdb tsdb
+install -d -o tsdb -g tsdb -m 750 /var/lib/tsdb
+runuser -u tsdb -- /usr/local/bin/tsdb /var/lib/tsdb user add admin --superuser   # asks for a password
+install -m 644 systemd/tsdbd.service /etc/systemd/system/
+systemctl daemon-reload &amp;&amp; systemctl enable --now tsdbd</code></pre>
+<p>The unit runs tsdbd on 127.0.0.1:7070 with its data in <code>/var/lib/tsdb</code>. Running
+<code>tests/run-tests.sh</code> is optional and takes a few minutes. <code>make dist-check-almalinux10</code> runs
+the tarball's tests in an AlmaLinux 10 container with Podman.</p>
+<div class="note"><p>On AlmaLinux and RHEL 10, io_uring is disabled by default. tsdbd notices and uses epoll by
+itself (<code>--io auto</code>, the default), and says so when it starts.</p></div>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="index.html"><span>Previous</span>What tsdb is</a><a class="next" href="quickstart.html"><span>Next</span>Quick start</a></nav></main>
+</div>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+</body>
+</html>
