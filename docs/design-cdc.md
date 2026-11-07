@@ -1343,6 +1343,43 @@ review: the drop as a commit, the slot registry's two phases, the resync and the
 embedded bindings 500; Pulsar source 1,500 + sink reader 350 + tests 1,100 + script 250; Jepsen workload and checker
 1,000. About 14,500 in all, half of it tests.
 
+### F1 as built (differences from the text above)
+
+What step F1 settled while it was built (advisor's answers, 2026-11-07); F10 puts the operator-facing parts in
+docs/feed.md.
+
+- **FEEDSLOTS halves are picked by `gen`, not by "the higher fno"**: the header's `ckpt_fno` does not change on a
+  cleaner-only checkpoint, so two halves can tie on it. Every write is `anchor.gen + 1` into the scratch half only. The
+  floor is the last number of the last record of the newest removed segment (`fno + span - 1`; `floor_check` is the low
+  32 bits of that record's xxh64) and never goes down.
+- **ENOSPC on FEEDSLOTS is possible on ZFS** (copy-on-write: an in-place write can need a new block), so §2.10's "preallocated,
+  so ENOSPC cannot be its cause" holds only on update-in-place file systems. It is fail-stop either way. The 10% free-space
+  rule acts long before, and the WAL would fail first.
+- **The cleaner is one thread per engine, not per `tsdb` handle** (§2.6): H3's point was "not the merge threads", and volumes
+  are few. Under the free-space rule a pass removes at most 16 segments and then re-evaluates (the design said: down to
+  the newest at once). A segment found at the open is read lazily (record header to record header, the last record's hash);
+  the flush path does not yet pass its own numbers in (an optimisation, not a rule).
+- **Segments wholly below the floor** (a crash between the durable floor and the unlinks) are removed first, whatever
+  their age or size; `tests/jepsen/feedcheck.c` therefore ignores them and requires contiguity only above the floor.
+- **Enable order** is per volume: the word in META, then FEEDSLOTS, then FEED, with a directory fsync between each (all
+  through `eng_sync_dir` in a live engine); disable is the reverse (FEED first). Across volumes the root decides, in both
+  directions: a writer's open brings every volume to the root's state (root on, volume without FEED: enable before its WAL
+  replay with a fresh feed_id; root off: finish the disable). The CLI and the live calls hold the VOLUMES OFD lock for the
+  whole operation. A live enable's floor is `fno_next - 1` sampled under `buf_lock`.
+- **Retained segments at open:** every replayed segment is fdatasynced before its rename (a kill -9 can leave bytes that
+  were never synced), after the two-read check and the cut of a torn tail. A failed unlink or rename at open stops there
+  (`wal_open_removed`), so `wal_removed` never passes a segment that is still on disk; this also fixes a bug that existed
+  without the feed (an unlink failing at open let `wal_removed` claim the segment gone, and an empty merge output could
+  then be dropped while the next open replayed deleted rows back). `wal_close` renames an active segment that was ever written
+  to (a marker-only one included) and unlinks one that never was. F2: `mt_flush`'s `empty` test counts rows only, so a
+  marker-only active segment is not sealed by a flush.
+- **`RENAME_NOREPLACE`** falls back to a plain rename on EINVAL/ENOSYS (the Linux NFS client refuses the flag); the
+  max_seq count of `fwal_` names is the guard that matters. `crashfs` intercepts `renameat2` now (it did not: no power-loss
+  test had ever undone such a rename); `outagefs` still does not.
+- **Jepsen:** `jepsen --feed` (the CLI enables the feed with a 5 s / 3 MB limit so that the cleaner and its floor run under
+  every fault), run under kill, power and eio; `tests/jepsen/feedcheck.c` checks the directory before every server start and
+  after the final clean stop.
+
 ## Open questions for the user
 
 None. The six questions of the revision before were answered on 2026-11-06 and are decided as F22-F27 (two of them,
