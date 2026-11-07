@@ -2,6 +2,8 @@ import ai.intellistream.tsdb.Bucket;
 import ai.intellistream.tsdb.Column;
 import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.Group;
+import ai.intellistream.tsdb.Latest;
+import ai.intellistream.tsdb.LatestOptions;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.Points;
 import ai.intellistream.tsdb.TsdbClient;
@@ -229,6 +231,25 @@ public final class Itj {
                         for (int i = 0; i < bs.length; i++)
                             bounds[i] = Long.parseLong(bs[i]);
                         buckets(rows, c.queryBounds(s.id(), start, end, bounds, order(q[4]), Long.parseLong(q[5])));
+                    }
+                    case "latest" -> { // latest NAME START END WITH_NULLS how: the newest row before END (see run.py)
+                        LatestOptions lo = LatestOptions.defaults().end(end).withNulls(q[4].equals("1"));
+                        var res = q[5].equals("name") && !q[1].startsWith("#")
+                                ? c.latestByName(new String[] {q[1]}, lo)
+                                : c.latest(new long[] {s.id()}, lo);
+                        Latest r = res.get(0).get();
+                        if (r.kind() == Latest.Kind.NULL) {
+                            rows.add(r.ts() + "\tN");
+                        } else if (r.kind() == Latest.Kind.VALUE) {
+                            String v = switch (r.type()) {
+                                case FLOAT32 -> hex(r.bits() & 0xffffffffL, 8);
+                                case FLOAT64 -> hex(r.bits(), 16);
+                                case INT64 -> Long.toString(r.asLong());
+                                case BOOL -> r.asBoolean() ? "1" : "0";
+                                default -> stateName(s.id(), r.asState());
+                            };
+                            rows.add(r.ts() + "\t" + v);
+                        }
                     }
                     default -> throw new IllegalArgumentException(q[0]);
                 }

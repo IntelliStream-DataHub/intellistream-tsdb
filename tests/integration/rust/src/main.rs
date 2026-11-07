@@ -2,7 +2,10 @@
 //! java/Itj.java (see run.py).
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::ops::ControlFlow;
-use tsdb_client::{Bucket, Client, Column, ConnectOptions, Group, QueryOpts, Unit, ValueType, Values};
+use tsdb_client::{
+    Bucket, Client, Column, ConnectOptions, Group, LatestKind, LatestOpts, LatestValue, QueryOpts, Unit, ValueType,
+    Values,
+};
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -295,6 +298,37 @@ fn read(cx: &mut Ctx, path: &str) -> R<()> {
                     let bounds: Vec<i64> = t[6].split(',').map(|x| x.parse().unwrap()).collect();
                     let b = cx.c.query_bounds(id, start..end, &bounds, opts(t[4], t[5].parse().unwrap()))?;
                     buckets_to(&mut rows, &b);
+                }
+                // latest NAME START END WITH_NULLS how: the newest row before END, by id or by name (see run.py)
+                "latest" => {
+                    let mut lo = LatestOpts::default().end(end);
+                    if t[4] == "1" {
+                        lo = lo.with_nulls();
+                    }
+                    let r = if t[5] == "name" && !t[1].starts_with('#') {
+                        cx.c.latest_by_name(&[t[1]], &lo)?
+                    } else {
+                        cx.c.latest(&[id], &lo)?
+                    };
+                    let r = r[0];
+                    if let Some(st) = r.status {
+                        return Err(tsdb_client::Error::Server(st));
+                    }
+                    match (r.kind, r.value) {
+                        (LatestKind::None, _) => {}
+                        (LatestKind::Null, _) => rows.push(format!("{}\tN", r.ts)),
+                        (_, Some(v)) => {
+                            let v = match v {
+                                LatestValue::Float32(x) => format!("{:08x}", x.to_bits()),
+                                LatestValue::Float64(x) => format!("{:016x}", x.to_bits()),
+                                LatestValue::Int64(x) => x.to_string(),
+                                LatestValue::Bool(x) => (x as u8).to_string(),
+                                LatestValue::State(c) => state_name(cx, id, c),
+                            };
+                            rows.push(format!("{}\t{v}", r.ts));
+                        }
+                        _ => unreachable!(),
+                    }
                 }
                 _ => panic!("unknown query kind"),
             }

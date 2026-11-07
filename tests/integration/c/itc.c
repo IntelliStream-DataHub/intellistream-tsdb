@@ -267,6 +267,34 @@ static int emit_values(void *ctx, const int64_t *ts, const tsdb_values *col, siz
     return 0;
 }
 
+static void emit_latest(const tsdb_latest_result *r)
+{
+    if (r->kind == TSDB_LATEST_NONE)
+        return;
+    printf("%" PRId64 "\t", r->ts);
+    if (r->kind == TSDB_LATEST_NULL) {
+        puts("N");
+        return;
+    }
+    switch (r->type) {
+    case TSDB_FLOAT32: {
+        uint32_t b;
+        memcpy(&b, &r->v.f32, 4);
+        printf("%08x\n", b);
+        break;
+    }
+    case TSDB_FLOAT64: {
+        uint64_t b;
+        memcpy(&b, &r->v.f64, 8);
+        printf("%016" PRIx64 "\n", b);
+        break;
+    }
+    case TSDB_INT64: printf("%" PRId64 "\n", r->v.i64); break;
+    case TSDB_BOOL: printf("%d\n", r->v.b ? 1 : 0); break;
+    default: puts(state_name(r->v.state));
+    }
+}
+
 static int emit_f32(void *ctx, const int64_t *ts, const float *v, size_t n)
 {
     (void)ctx;
@@ -374,6 +402,19 @@ static void do_read(tsdbc *c, const char *path)
             for (char *p = strtok_r(tok[6], ",", &sv2); p && m < 4096; p = strtok_r(NULL, ",", &sv2))
                 bounds[m++] = strtoll(p, NULL, 10);
             rc = tsdbc_query_bounds(c, s->id, start, end, bounds, m, &o, &b, &nb);
+        } else if (strcmp(kind, "latest") == 0) {
+            /* latest NAME START END WITH_NULLS how: the newest row before END, by id or by name (see run.py) */
+            tsdb_latest_opts lo = {.end = end, .with_nulls = atoi(tok[4]), .threads = 0};
+            tsdb_latest_result r;
+            const char *nm = name;
+            if (strcmp(tok[5], "name") == 0 && name[0] != '#')
+                rc = tsdbc_latest_by_name(c, &nm, 1, &lo, &r);
+            else
+                rc = tsdbc_latest(c, &s->id, 1, &lo, &r);
+            if (!rc && r.status)
+                rc = r.status;
+            if (!rc)
+                emit_latest(&r);
         } else
             die("unknown query kind", 0);
         if (rc)

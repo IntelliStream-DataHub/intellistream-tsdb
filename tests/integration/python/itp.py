@@ -195,6 +195,13 @@ def read(cx, path):
                 rows = bucket_lines(
                     cx.c.query_bounds(sid, bounds, bound(start), bound(end), order=q[4], limit=int(q[5]) or None)
                 )
+            elif q[0] == "latest":  # latest NAME START END WITH_NULLS how: the newest row before END (see run.py)
+                nulls = q[4] == "1"
+                if q[5] == "name" and not q[1].startswith("#"):
+                    r = cx.c.latest_by_name([q[1]], bound(end), with_nulls=nulls, numpy=False)
+                else:
+                    r = cx.c.latest([sid], bound(end), with_nulls=nulls, numpy=False)
+                rows = [] if r[0] is None else ["%d\t%s" % (r[0][0], fmt_value(cx, sid, ty, r[0][1]))]
             else:
                 raise SystemExit("unknown query kind " + q[0])
         except t.TsdbError:

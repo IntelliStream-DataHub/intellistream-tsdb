@@ -19,7 +19,8 @@ epoll alone where io_uring is unavailable). About two minutes. It needs what `ma
 | `mutate.py` | the harness's own test: planted bugs (see the list with `--list`) |
 
 Scenarios (see the docstring of `run.py` for the details): `matrix` (each client writes a set, every client reads
-every set; answers identical to each other, to the model and to `tsdb query` on the stopped directory), `cli`
+every set; answers identical to each other, to the model and to `tsdb query` (and `tsdb latest`) on the stopped
+directory; the reads include `latest` and `latest_by_name` with an end bound, with and without nulls), `cli`
 (`tsdb create/import`, read back by the clients), `follower` (`tsdbd --follow` catches up with two waves),
 `stale_wal` (a WAL segment left behind by a flush is put back after newer parts exist and must not be replayed),
 `durability` (SIGKILL in the middle of a pipelined load from each client; 8 batches are sent, then all 8 are waited

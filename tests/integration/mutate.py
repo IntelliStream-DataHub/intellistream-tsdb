@@ -136,6 +136,28 @@ mut("M19", "server skips the rights check of reads by id: a tenant reads any ser
     "        return need == R_READ ? 0 : auth_id(a, id, need);",
     ["c"], "matrix")
 
+# QUERY_LATEST (protocol 14)
+mut("M20", "server answers QUERY_LATEST for ids the user may not read (the denied mask is never set)",
+    "server/tsdbd.c",
+    "            bool no = auth_id(&c->auth, ids[i], R_READ) != 0;",
+    "            bool no = false;",
+    ["c"], "matrix")
+mut("M21", "Java client drops the WITH_NULLS flag of latest (a null answers as the older value under it)",
+    "client/java/src/main/java/ai/intellistream/tsdb/TsdbClient.java",
+    "int flags = (o.withNulls() ? Protocol.LATEST_WITH_NULLS : 0)",
+    "int flags = (false ? Protocol.LATEST_WITH_NULLS : 0)",
+    ["java"], "matrix")
+mut("M22", "Rust client drops the WITH_NULLS flag of latest",
+    "client/rust/src/client/latest.rs",
+    "let flags = (if opts.with_nulls { LATEST_WITH_NULLS } else { 0 })",
+    "let flags = (if false { LATEST_WITH_NULLS } else { 0 })",
+    ["rust"], "matrix")
+mut("M23", "latest table: a null over the newest row does not make the entry unknown (the table answers the older value)",
+    "src/ltab.c",
+    "else if (!floor && (f->flags & LF_N)",
+    "else if (0 && !floor && (f->flags & LF_N)",
+    ["c"], "matrix")
+
 
 def sh(cmd, cwd, log, env=None, check=True, timeout=None):
     with open(log, "ab") as f:
