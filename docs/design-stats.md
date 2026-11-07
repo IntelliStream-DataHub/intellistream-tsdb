@@ -1,6 +1,7 @@
 # Statistics per series and per tenant
 
-Status: design, not implemented. Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
+Status: steps 1 and 2 (§9) built on branch `stats-s1` (query counters, event ring, sweeper, `tsdb_series_stats`, the
+metrics and `tsdb DIR stats [series]`); steps 3-5 are not. Design as written: Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
 same day after an adversarial review (findings H1-H4, M1-M10, L1-L10; §11 says where each one is answered).
 Code references are `file:line` at e33d87f.
 

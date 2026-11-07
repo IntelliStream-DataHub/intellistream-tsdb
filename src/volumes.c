@@ -2750,6 +2750,7 @@ int tsdb_stats_settle(tsdb *t, int timeout_ms)
 #define SSTATS_CHUNK 256
 #define SSTATS_MAX_IDS 65536
 #define SSTATS_BUDGET 100000000ull
+atomic_uint_fast64_t sstats_budget = SSTATS_BUDGET;
 
 typedef struct sskey {
     uint64_t id;
@@ -2770,7 +2771,7 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
     if (flags != 0 || n > SSTATS_MAX_IDS || (n && (!ids || !out)))
         return TSDB_ERR_INVALID;
     uint64_t probes = 0;
-    while (*done < n && (*done == 0 || probes < SSTATS_BUDGET)) {
+    while (*done < n && (*done == 0 || probes < atomic_load_explicit(&sstats_budget, memory_order_relaxed))) {
         size_t m = MIN((size_t)SSTATS_CHUNK, n - *done);
         const tsdb_sid *cid = ids + *done;
         tsdb_series_stat *cout = out + *done;

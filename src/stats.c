@@ -189,6 +189,8 @@ void qreg_totals(qreg *r, uint64_t out[QC_N])
 /* ------------------------------------------------------------- the sweeper */
 
 #define RING_N 4096
+atomic_uint stats_ring_cap = RING_N;
+atomic_uint stats_pause;
 #define TICK_MS 1000
 
 typedef struct stat_ev {
@@ -353,8 +355,8 @@ static int part_walk(eng *db, const part *p, prec *r)
         r->val_bytes += val;
     }
     r->index_bytes = (uint64_t)x->n * x->stride + 8ull * x->nruns;
-    uint64_t tomb_bytes = (uint64_t)p->nt * sizeof(tomb);
-    uint64_t used = r->ts_bytes + r->val_bytes + r->index_bytes + tomb_bytes;
+    uint64_t used = r->ts_bytes + r->val_bytes + r->index_bytes; /* the tombstones are in "other": a part's four columns
+                                                                    * add up to its file */
     r->other_bytes = p->map_len > used ? p->map_len - used : 0;
     if (rows != p->rows) /* damage after the open: still counted, its bytes are on disk */
         fprintf(stderr, "tsdb: stats: part %s: its index holds %" PRIu64 " rows, its footer says %" PRIu64 "\n", p->name,
@@ -611,6 +613,8 @@ static void *sweeper_main(void *arg)
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19); /* this thread only */
 #endif
     while (!atomic_load(&es->stop)) {
+        while (atomic_load_explicit(&stats_pause, memory_order_relaxed) && !atomic_load(&es->stop))
+            usleep(1000); /* tests only */
         uint64_t req = atomic_load(&es->settle_req);
         if (atomic_load(&es->overflow) || atomic_load(&es->swapped))
             reconcile(es);
@@ -638,7 +642,7 @@ void stats_push(eng *db, part *p, int kind)
     struct estats *es = atomic_load_explicit(&db->stats, memory_order_acquire);
     uint64_t h = atomic_load_explicit(&es->head, memory_order_relaxed);
     uint64_t t = atomic_load_explicit(&es->tail, memory_order_acquire);
-    if (h - t >= RING_N) {
+    if (h - t >= atomic_load_explicit(&stats_ring_cap, memory_order_relaxed)) {
         atomic_store(&es->overflow, true);
         atomic_fetch_add_explicit(&es->overflows, 1, memory_order_relaxed);
         pthread_cond_signal(&es->cv);
@@ -648,7 +652,7 @@ void stats_push(eng *db, part *p, int kind)
         part_ref(p);
     es->ring[h % RING_N] = (stat_ev){p, kind};
     atomic_store_explicit(&es->head, h + 1, memory_order_release);
-    if (h + 1 - t == RING_N / 2)
+    if (h + 1 - t == MAX(1u, atomic_load_explicit(&stats_ring_cap, memory_order_relaxed) / 2))
         pthread_cond_signal(&es->cv);
 }
 

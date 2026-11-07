@@ -1132,6 +1132,12 @@ void qreg_add(qreg *r, const uint64_t v[QC_N]);
 void qreg_totals(qreg *r, uint64_t out[QC_N]);
 
 struct estats;
+/* Test hooks (tests/test_stats.c): the ring holds this many events (at most its size, 4096) so a test can overflow
+ * it; the sweeper does not run while stats_pause is set; tsdb_series_stats stops after the chunk in which its index
+ * probes pass this number (default 100 million). */
+extern atomic_uint stats_ring_cap;
+extern atomic_uint stats_pause;
+extern atomic_uint_fast64_t sstats_budget;
 void stats_start(eng *db, bool reconcile); /* idempotent; does nothing with stats = -1 */
 void stats_stop(eng *db);
 void stats_push(eng *db, part *p, int kind); /* db->lock held (or the open, single-threaded) */
