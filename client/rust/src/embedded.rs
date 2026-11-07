@@ -200,6 +200,11 @@ impl Options {
             stats: self.stats,
             stats_sweep_mb_s: self.stats_sweep_mb_s,
             latest_cache: self.latest_cache,
+            // the defaults; the tenant list is not offered here yet
+            stats_recompute_s: 0,
+            stats_resident_s: 0,
+            tenants: std::ptr::null(),
+            ntenants: 0,
         }
     }
 }
@@ -394,7 +399,7 @@ impl Drop for Db {
 
 /// The `TSDB_ABI_VERSION` this crate was written for. A struct can keep its size while its fields move
 /// (`tsdb_series_result` did when ids became 64 bits), so the engine's number is compared, not sizes.
-const ABI_VERSION: c_int = 5;
+const ABI_VERSION: c_int = 6;
 
 fn check_abi(found: c_int) -> Result<()> {
     if found != ABI_VERSION {
