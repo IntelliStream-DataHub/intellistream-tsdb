@@ -479,17 +479,27 @@ bool merge_commit_locked(eng *db, part **src, size_t k, part *out, int rc)
 {
     bool dropped = false;
     /* A limit lengthened since this merge's sources were selected (db->ret_len_gen, bumped under db->lock): the
-     * merge may have dropped rows the new limit keeps, and the latest table may name one of them. Its output is
-     * discarded like one whose source was dropped, and the sources merge again (a retention change during a merge
-     * is rare; design-latest.md 3.5 lists across it instead, which takes latest_rw here) */
+     * merge may have dropped rows the new limit keeps, and the latest table may name one of them. It lists across the
+     * change (design-latest.md 3.5): in a write section of the table, which comes before db->lock, it marks the
+     * entries that may name a row it dropped (lt_merge_marks) and lists. The sources are still `merging`, so no
+     * drop or other merge takes them while db->lock is let go. */
     bool lengthened = false;
+    for (size_t i = 0; i < k; i++)
+        lengthened |= src[i]->merge_len_gen != atomic_load(&db->ret_len_gen);
+    lt_sec lsec;
+    bool in_sec = false;
+    if (lengthened && out && db->lt) {
+        pthread_mutex_unlock(&db->lock);
+        lt_begin(db, &lsec);
+        pthread_mutex_lock(&db->lock);
+        in_sec = true;
+    }
     for (size_t i = 0; i < k; i++) {
         src[i]->merging = false;
         dropped |= src[i]->dropped;
-        lengthened |= src[i]->merge_len_gen != atomic_load(&db->ret_len_gen);
     }
-    if (lengthened && out && !dropped && db->lt)
-        dropped = true; /* the output goes the way of a dropped source's, the sources stay listed */
+    if (in_sec && out && !dropped)
+        lt_merge_marks(db, &lsec, src, k);
     if (!out && rc != 0 && rc != TSDB_ERR_STOPPED && !dropped) {
         /* a failed merge is no progress, whatever the reason (a full disk, EIO on the output, NOMEM): db_wait_merges
          * counts the time of its partition's merges as idle once one has failed since its wait began */
@@ -520,6 +530,8 @@ bool merge_commit_locked(eng *db, part **src, size_t k, part *out, int rc)
         }
         part_unref(out);
     }
+    if (in_sec)
+        lt_end(db, &lsec);
     pthread_cond_broadcast(&db->merged_cv);
     return listed;
 }

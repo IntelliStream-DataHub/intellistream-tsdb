@@ -271,7 +271,7 @@ int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
     rc = ret_put_locked(db, series, limit_ms);
     bool lowered = rc == 0 && eng_cutoff_at(db, series, now) < oldc;
     if (lowered)
-        atomic_fetch_add(&db->ret_len_gen, 1); /* a merge in flight discards its output (merge_commit_locked) */
+        atomic_fetch_add(&db->ret_len_gen, 1); /* a merge in flight lists across it (merge_commit_locked) */
     pthread_mutex_unlock(&db->lock);
     if (lowered)
         lt_retention_lowered(db, &lsec, series, oldc);

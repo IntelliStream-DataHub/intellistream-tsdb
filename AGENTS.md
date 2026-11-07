@@ -407,10 +407,15 @@ cgroup, so `nice` does not keep your work out of its way.
   already expired) must bump `lgen` in a write section and make the entries it may affect unknown. The table must
   always give the slow path's answer (`tests/test_latest.c` compares both after every random step). Entry words are
   loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
-  `latest_rw` is never held across I/O. Followers have no table.
+  `latest_rw` is held across no I/O but `tsdb_drop_before`'s renames of the partitions it retires (`db_retire_locked`,
+  in its write section; `db->lock` was held across them already), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
-  is a leaf. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
+  is a leaf. The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
+  `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
+  that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
+  the warmer take `latest_rw` (read) > `db->lock`, a lookup then `buf_lock` in sub-holds. The window's `pmu`/`pcv` (a writer
+  waits there with no other lock, `lt_end` takes `pmu` under `latest_rw`) and the warmer's hint mutex are leaves. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
   not yet appended anything, so nothing a registered large write waits for (a flush, the WAL writer role,
   `publish_lock`, `cls_rw`) waits for it. The write wait hook (`tsdb_set_write_wait_hook`) is a leaf: its +1 and
   the waiter's -1 run with no engine lock, the large write's -1 (`lw_leave`) with `cls_rw` held for reading; tsdbd's

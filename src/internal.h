@@ -1523,7 +1523,7 @@ struct eng {
     atomic_int_fast64_t clock_floor; /* now never goes below this */
     atomic_uint ret_gen;             /* bumped by every change of a limit (parts cache their expiry) */
     atomic_uint_fast64_t ret_len_gen; /* bumped (db->lock) when a change lowers a series' cutoff: a merge that spans one
-                                       * is discarded (the latest table may name a row it dropped) */
+                                       * lists across it in a latest_rw section, marking its entries (merge_commit_locked) */
     int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
     bool drop_pending;               /* eng_drop_before is waiting for merges, then retiring (under lock) */
     int64_t drop_pending_end;        /* ...every partition ending at or before this: no merge of one is selected */
@@ -1923,6 +1923,7 @@ void lt_fold(eng *db, lt_sec *sec, part **ps, size_t n);
 void lt_end(eng *db, lt_sec *sec);
 /* in a write section of lt_begin: */
 void lt_retention_lowered(eng *db, lt_sec *sec, uint32_t series, int64_t oldc);
+void lt_merge_marks(eng *db, lt_sec *sec, part **src, size_t k);
 void lt_drop_floor(eng *db, int64_t ts);
 /* the part writer's side: add the rows of one granule of `series` (strictly increasing ts, slots of type) */
 int lf_granule(struct lfold **lf, size_t *n, size_t *cap, uint32_t series, int type, const int64_t *ts,
@@ -2049,6 +2050,7 @@ void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
 bool tsdb_test_latest_stats(struct tsdb *t, uint64_t out[6]);
 void tsdb_test_latest_hook(struct tsdb *t, void (*fn)(void *, int), void *arg);
 void tsdb_test_latest_window(int min); /* flushes with this many series or more use the 3.2 window (process-wide) */
+void tsdb_test_latest_nowarm(int on); /* engines opened while on start no warmer (process-wide) */
 /* tests: fn(arg, 0) runs in tsdb_volume_reopen before it halts the old engine, fn(arg, 1) once the new engine is
  * open and its threads run; a reference on a series' engine as a
  * name or type lookup holds it between its route and its use (tsdb_test_meta_use reads the type through it) */

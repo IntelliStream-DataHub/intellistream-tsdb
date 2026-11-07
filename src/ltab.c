@@ -453,6 +453,33 @@ void lt_retention_lowered(eng *db, lt_sec *sec, uint32_t series, int64_t oldc)
     hints_add(sec, series);
 }
 
+/* A merge that selected its sources before a limit was lengthened lists across the change (3.5), in a write section
+ * of lt_begin and under db->lock: it may have dropped rows the new limit keeps, so a known entry of a series it holds
+ * whose timestamp lies in one of that series' granules of its sources (the only place its row could have been) no
+ * longer names a row that exists: unknown (ts). Every other entry is unaffected by the merge. */
+void lt_merge_marks(eng *db, lt_sec *sec, part **src, size_t k)
+{
+    ltab *t = db->lt;
+    if (!t)
+        return;
+    for (size_t j = 0; j < k; j++) {
+        const part *p = src[j];
+        for (uint32_t i = 0; i < p->ng; i++) {
+            uint32_t s = gx_series(p, i);
+            lt_ent e;
+            if (!lt_load(t, s, &e) || e.st != LE_KNOWN)
+                continue;
+            int64_t lo, hi;
+            gx_ts(p, i, &lo, &hi);
+            if (e.ts < lo || e.ts > hi)
+                continue;
+            lt_ent n = {LE_UNKNOWN, e.ts, 0};
+            lt_store(t, s, &n);
+            hints_add(sec, s);
+        }
+    }
+}
+
 /* tsdb_drop_before(ts) retired partitions: a known entry below ts reads as unknown from now on (L20), in the
  * section that retired them. The warmer walks them (3.8). */
 void lt_drop_floor(eng *db, int64_t ts)
@@ -1179,10 +1206,19 @@ static void *warmer_main(void *arg)
     return NULL;
 }
 
+/* tests: engines opened while this is set start no warmer, so the entries the build left unknown stay unknown (the
+ * build's bounds are then what the lookups use). Process-wide. */
+static int lt_nowarm;
+
+void tsdb_test_latest_nowarm(int on)
+{
+    __atomic_store_n(&lt_nowarm, on, __ATOMIC_RELAXED);
+}
+
 void latest_start(eng *db)
 {
     ltab *t = db->lt;
-    if (!t)
+    if (!t || __atomic_load_n(&lt_nowarm, __ATOMIC_RELAXED))
         return;
     t->rescan = true; /* entries the build could not make exact */
     if (tsdb_thread_create(&t->warmer, warmer_main, db) == 0)

@@ -999,7 +999,7 @@ hidden by a tombstone of a later block, rows a later write overwrote or rows alr
 write section and make the entries it may affect unknown. Lock order: `publish_lock` > `latest_rw` > `manifest_lock`
 > `db->lock` > `buf_lock`; `ret_lock` > `latest_rw` > `db->lock`; drops and the rare merge take `latest_rw` (write) >
 `db->lock`; lookups and the warmer take `latest_rw` (read) > `db->lock`, lookups then `buf_lock` in sub-holds; the
-hint set's mutex is a leaf. `latest_rw` is never held across I/O: lookups take their cut and read granules only after
+hint set's mutex and the window's `pmu` are leaves. `latest_rw` is held across no I/O except the renames of the partitions `tsdb_drop_before` retires (in its write section, where `db->lock` was held across them already): lookups take their cut and read granules only after
 their read hold, and `series_reload` runs outside it. No scheduler helper waits for `latest_rw` in write mode. NFS
 followers have no table.
 
