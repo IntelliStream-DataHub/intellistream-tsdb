@@ -43,16 +43,6 @@ static int failures;
         }                                                                      \
     } while (0)
 
-/* This test is about what the server answers: the client's own retry of UNAVAILABLE (protocol 13) is off here
- * (tests/test_unavailable.c has it on). */
-static int connect_noretry(const char *host, int port, int ms, tsdbc **out)
-{
-    int rc = tsdbc_connect_timeout(host, port, ms, out);
-    if (rc == 0)
-        tsdbc_set_retry(*out, 0);
-    return rc;
-}
-
 static char ctl[256], root[512];
 static int port;
 static pid_t server;
@@ -71,6 +61,16 @@ static int oconnect_as(const char *user, const char *pw, int ms, tsdbc **c)
     return tsdbc_connect_opts("127.0.0.1", port, &o, c);
 }
 #define tsdbc_connect_timeout(host, port_, ms, c) oconnect_as("root", ROOT_PW, ms, c)
+
+/* This test is about what the server answers: the client's own retry of UNAVAILABLE (protocol 13) is off here
+ * (tests/test_unavailable.c has it on). */
+static int connect_noretry(const char *host, int port, int ms, tsdbc **out)
+{
+    int rc = tsdbc_connect_timeout(host, port, ms, out);
+    if (rc == 0)
+        tsdbc_set_retry(*out, 0);
+    return rc;
+}
 
 static double now_ms(void)
 {
