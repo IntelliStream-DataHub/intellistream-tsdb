@@ -181,6 +181,7 @@ static inline int tsdb_thread_create(pthread_t *t, void *(*fn)(void *), void *ar
 }
 
 /* rename that never replaces an existing name (renameatx_np with RENAME_EXCL). 0, or -1 with errno (EEXIST). */
+extern int renameat2(int, const char *, int, const char *, unsigned int); /* glibc 2.28; stdio.h needs _GNU_SOURCE */
 static inline int tsdb_rename_noreplace(int dirfd, const char *from, const char *to)
 {
     return renameatx_np(dirfd, from, dirfd, to, RENAME_EXCL);
@@ -214,9 +215,11 @@ static inline int tsdb_thread_create(pthread_t *t, void *(*fn)(void *), void *ar
 /* rename that never replaces an existing name (renameat2 with RENAME_NOREPLACE). 0, or -1 with errno (EEXIST).
  * A file system that does not take the flag (the Linux NFS client answers EINVAL; ENOSYS on an old kernel) gets the
  * plain rename: the caller's own rule for numbering names is the guard there (memtable.c, max_seq). */
+extern int renameat2(int, const char *, int, const char *, unsigned int); /* glibc 2.28; stdio.h needs _GNU_SOURCE */
 static inline int tsdb_rename_noreplace(int dirfd, const char *from, const char *to)
 {
-    int rc = (int)syscall(SYS_renameat2, dirfd, from, dirfd, to, 1u /* RENAME_NOREPLACE */);
+    /* the libc wrapper, not syscall(): the fault-injection shims (tests/jepsen/crashfs.c) interpose on the wrapper */
+    int rc = renameat2(dirfd, from, dirfd, to, 1u /* RENAME_NOREPLACE */);
     if (rc != 0 && (errno == EINVAL || errno == ENOSYS))
         rc = renameat(dirfd, from, dirfd, to);
     return rc;

@@ -43,7 +43,7 @@ static int failures;
     } while (0)
 
 #define T0 1700000000000LL
-static char S[PATH_MAX];
+static char S[PATH_MAX], SELF[PATH_MAX], SHIM[PATH_MAX + 32];
 
 static int sh(const char *fmt, ...)
 {
@@ -73,6 +73,14 @@ static int open_opt(const char *dir, int wal_sync_ms, bool ro, eng **db)
 }
 static int open_eng(const char *dir, eng **db) { return open_opt(dir, 0, false, db); }
 
+static uint64_t fno_of(eng *db)
+{
+    pthread_mutex_lock(&db->buf_lock);
+    uint64_t v = db->fno_next;
+    pthread_mutex_unlock(&db->buf_lock);
+    return v;
+}
+
 static void rows(eng *db, uint32_t series, int64_t t0, size_t n)
 {
     int64_t ts[64];
@@ -98,6 +106,13 @@ static uint64_t marker1(eng *db)
     m.u.drop = (mk_drop){.wm_gen = 1, .dropped_before = 5, .block = 9, .partition = MK_NO_PARTITION};
     CHECK(wal_marker_mk(db, &m, &fno) == 0);
     return fno;
+}
+
+static int unlink_in(const char *dir, const char *name)
+{
+    char p[PATH_MAX + 64];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return unlink(p);
 }
 
 static bool exists(const char *dir, const char *name)
@@ -198,6 +213,25 @@ static void crash_writer(const char *dir, size_t nrows, int markers)
         eng *db;
         uint32_t s;
         if (open_eng(dir, &db) != 0 || eng_series(db, "s", TSDB_FLOAT32, &s) != 0)
+            _exit(2);
+        rows(db, s, T0, nrows);
+        for (int i = 0; i < markers; i++)
+            marker1(db);
+        _exit(0);
+    }
+    int st = 0;
+    waitpid(p, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+/* The same with the feed on: the killed writer leaves wal_1 and the feed's files. */
+static void crash_writer_feed(const char *dir, size_t nrows, int markers)
+{
+    pid_t p = fork();
+    if (p == 0) {
+        eng *db;
+        uint32_t s;
+        if (open_eng(dir, &db) != 0 || eng_series(db, "s", TSDB_FLOAT32, &s) != 0 || eng_feed_enable(db, NULL) != 0)
             _exit(2);
         rows(db, s, T0, nrows);
         for (int i = 0; i < markers; i++)
@@ -584,10 +618,358 @@ static void test_cleaner(void)
     printf("  cleaner: size, age, free space, leftovers below the floor; never the newest; the floor is durable\n");
 }
 
+
+/* ---------------------------------------------------- volumes, numbers, FEEDSLOTS halves, power loss */
+
+static int open_tsdb(const char *dir, tsdb **t)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    return tsdb_open(dir, &o, t);
+}
+
+static bool vol_on(const char *dir)
+{
+    return exists(dir, "FEED") && exists(dir, "FEEDSLOTS") && meta_has_feed(dir);
+}
+
+static bool vol_clean(const char *dir)
+{
+    return !exists(dir, "FEED") && !exists(dir, "FEEDSLOTS") && !meta_has_feed(dir) && count_prefix(dir, "fwal_") == 0;
+}
+
+/* The root decides: a volume follows it at the open, whatever its own files say (design-cdc.md 2.13). */
+static void test_two_volumes(void)
+{
+    char root[PATH_MAX + 32], v1[PATH_MAX + 32], v2[PATH_MAX + 32];
+    fresh("two", root, sizeof root);
+    snprintf(v1, sizeof v1, "%s/vol1", S);
+    snprintf(v2, sizeof v2, "%s/vol2", S);
+    sh("rm -rf '%s' '%s'; mkdir -p '%s' '%s'", v1, v2, v1, v2);
+    tsdb *t;
+    uint32_t idx;
+    CHECK(open_tsdb(root, &t) == 0 && tsdb_close(t) == 0);
+    CHECK(tsdb_volume_add_dir(root, v1, &idx) == 0 && idx == 1);
+    CHECK(open_tsdb(root, &t) == 0);
+    tsdb_sid a, b;
+    CHECK(tsdb_series_create(t, "a", TSDB_FLOAT32, NULL, &a) == 0 && tsdb_series_create(t, "b", TSDB_FLOAT32, v1, &b) == 0);
+    CHECK(tsdb_feed_enable(t, NULL) == 0 && tsdb_feed_enable(t, NULL) == 0); /* idempotent */
+    tsdb_feed_info i0, i1;
+    CHECK(tsdb_feed_info_get(t, 0, &i0) == 0 && tsdb_feed_info_get(t, 1, &i1) == 0 && i0.on && i1.on &&
+          i0.feed_id != i1.feed_id && i0.feed_id && i1.feed_id);
+    CHECK(vol_on(root) && vol_on(v1));
+    /* a volume added beside the open writer, with the feed on, starts with a feed of its own, before its VOLUMES line */
+    CHECK(tsdb_volume_add_dir(root, v2, &idx) == 0 && idx == 2);
+    tsdb_sid c;
+    CHECK(tsdb_series_create(t, "c", TSDB_FLOAT32, v2, &c) == 0);
+    tsdb_feed_info i2;
+    CHECK(vol_on(v2) && tsdb_feed_info_get(t, 2, &i2) == 0 && i2.on && i2.feed_id != i0.feed_id);
+    CHECK(tsdb_close(t) == 0);
+
+    /* the crash states of a disable, root first: the root lost FEED, the volumes still have everything. The open
+     * finishes the disable in every volume (the root's FEED is the commit point of the whole database) */
+    CHECK(unlink_in(root, "FEED") == 0);
+    CHECK(open_tsdb(root, &t) == 0);
+    CHECK(tsdb_feed_info_get(t, 0, &i0) == 0 && !i0.on && tsdb_feed_info_get(t, 1, &i1) == 0 && !i1.on &&
+          tsdb_feed_info_get(t, 2, &i2) == 0 && !i2.on);
+    CHECK(tsdb_close(t) == 0);
+    CHECK(vol_clean(root) && vol_clean(v1) && vol_clean(v2));
+
+    /* the crash states of an enable, root first: the root has FEED, a volume has nothing (or only the word): the
+     * open enables the volume, with a new feed_id of its own, before its WAL is replayed */
+    CHECK(open_tsdb(root, &t) == 0 && tsdb_feed_enable(t, NULL) == 0 && tsdb_close(t) == 0);
+    for (int k = 0; k < 3; k++) {
+        feed_dir d = {open(v1, O_RDONLY | O_DIRECTORY), NULL, true};
+        CHECK(d.dirfd >= 0 && feed_dir_disable(&d) == 0);
+        if (k == 1) { /* only the word left: a disable that died before the last step ... or an enable that began */
+            feed_cfg cfg;
+            feed_cfg_defaults(&cfg, NULL);
+            CHECK(feed_dir_enable(&d, &cfg, 0) == 0 && unlinkat(d.dirfd, "FEED", 0) == 0);
+        }
+        close(d.dirfd);
+        CHECK(!exists(v1, "FEED") || k == 2);
+        CHECK(open_tsdb(root, &t) == 0);
+        tsdb_feed_info r, v;
+        CHECK(tsdb_feed_info_get(t, 0, &r) == 0 && tsdb_feed_info_get(t, 1, &v) == 0 && r.on && v.on &&
+              r.feed_id != v.feed_id);
+        CHECK(tsdb_close(t) == 0);
+        CHECK(vol_on(root) && vol_on(v1));
+    }
+    /* a volume that is on while the root is off is turned off */
+    CHECK(open_tsdb(root, &t) == 0 && tsdb_feed_disable(t) == 0 && tsdb_close(t) == 0);
+    CHECK(vol_clean(root) && vol_clean(v1));
+    {
+        feed_dir d = {open(v1, O_RDONLY | O_DIRECTORY), NULL, true};
+        feed_cfg cfg;
+        feed_cfg_defaults(&cfg, NULL);
+        CHECK(feed_dir_enable(&d, &cfg, 0) == 0);
+        close(d.dirfd);
+    }
+    CHECK(vol_on(v1) && open_tsdb(root, &t) == 0);
+    CHECK(tsdb_feed_info_get(t, 1, &i1) == 0 && !i1.on);
+    CHECK(tsdb_close(t) == 0 && vol_clean(v1));
+    printf("  two volumes: enable and disable go root first; crash states are finished to the root's state at open; "
+           "a volume added with the feed on gets one\n");
+}
+
+/* feed new-id: a new feed_id first, then the numbers 2^40 higher; a torn FNO at the open does the same */
+static void test_new_id(void)
+{
+    char dir[PATH_MAX + 32], p[PATH_MAX + 64];
+    fresh("newid", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0 && eng_feed_enable(db, NULL) == 0);
+    rows(db, s, T0, 20);
+    feed_cfg c0, c1;
+    CHECK(feed_cfg_read(db->dirfd, &c0) == 0);
+    uint64_t n0 = fno_of(db);
+    CHECK(eng_feed_new_id(db) == 0 && feed_cfg_read(db->dirfd, &c1) == 0 && c1.feed_id != c0.feed_id);
+    CHECK(fno_of(db) >= n0 + FNO_BELT);
+    rows(db, s, T0 + 100, 5);
+    CHECK(eng_close(db) == 0);
+    CHECK(open_eng(dir, &db) == 0 && fno_of(db) >= n0 + FNO_BELT); /* durable */
+    CHECK(feed_cfg_read(db->dirfd, &c0) == 0 && c0.feed_id == c1.feed_id);
+    CHECK(eng_close(db) == 0);
+    /* a torn FNO slot at the open: the numbers skip ahead and the feed_id is new (consumers resync) */
+    uint64_t before;
+    CHECK(open_eng(dir, &db) == 0);
+    before = fno_of(db);
+    CHECK(eng_close(db) == 0);
+    snprintf(p, sizeof p, "%s/FNO", dir);
+    uint8_t junk[4096];
+    memset(junk, 0xa5, sizeof junk);
+    int fd = open(p, O_WRONLY);
+    CHECK(fd >= 0 && pwrite(fd, junk, sizeof junk, 4096) == (ssize_t)sizeof junk);
+    close(fd);
+    fprintf(stderr, "  (a torn FNO slot is logged next)\n");
+    CHECK(open_eng(dir, &db) == 0);
+    CHECK(feed_cfg_read(db->dirfd, &c0) == 0 && c0.feed_id != c1.feed_id && fno_of(db) >= before);
+    uint64_t torn_next = fno_of(db);
+    CHECK(eng_close(db) == 0);
+    /* with the feed off a torn slot changes no feed_id: there is none */
+    printf("  new-id: a new feed_id, numbers 2^40 higher, durable; a torn FNO slot at the open renews the feed_id "
+           "(next %" PRIu64 ")\n", torn_next);
+}
+
+/* FEEDSLOTS: the half with the higher gen wins, a torn half is ignored, both torn fails the open */
+static void test_slot_halves(void)
+{
+    char dir[PATH_MAX + 32], p[PATH_MAX + 64];
+    fresh("halves", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0 && eng_feed_enable(db, NULL) == 0);
+    CHECK(fslots_set_floor(db, 10, 0xaa) == 0 && fslots_set_floor(db, 20, 0xbb) == 0);
+    CHECK(eng_close(db) == 0);
+    fslots fs;
+    snprintf(p, sizeof p, "%s/FEEDSLOTS", dir);
+    struct stat st;
+    CHECK(stat(p, &st) == 0 && st.st_size == 8192);
+    uint8_t img[8192], junk[4096];
+    memset(junk, 0xa5, sizeof junk);
+    int fd = open(p, O_RDWR);
+    CHECK(fd >= 0 && pread(fd, img, sizeof img, 0) == (ssize_t)sizeof img);
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    CHECK(fslots_read(dfd, &fs) == 0 && fs.floor_event == 20 && fs.gen == 3);
+    int newer = -1;
+    for (int h = 0; h < 2; h++) { /* tear the half that holds the newest: the other one (gen 2, floor 10) is the anchor */
+        CHECK(pwrite(fd, junk, sizeof junk, h * 4096) == (ssize_t)sizeof junk);
+        CHECK(fslots_read(dfd, &fs) == 0);
+        if (fs.floor_event == 10)
+            newer = h;
+        CHECK(pwrite(fd, img + h * 4096, 4096, h * 4096) == 4096); /* put it back */
+    }
+    CHECK(newer >= 0);
+    CHECK(pwrite(fd, junk, sizeof junk, newer * 4096) == (ssize_t)sizeof junk);
+    CHECK(open_eng(dir, &db) == 0 && db->feed_floor_event == 10); /* the torn newest is ignored, never fatal */
+    CHECK(fslots_set_floor(db, 30, 1) == 0 && eng_close(db) == 0); /* the next write goes to the scratch half */
+    CHECK(fslots_read(dfd, &fs) == 0 && fs.floor_event == 30 && fs.gen == 3);
+    CHECK(pwrite(fd, junk, sizeof junk, 0) == (ssize_t)sizeof junk && pwrite(fd, junk, sizeof junk, 4096) == (ssize_t)sizeof junk);
+    fprintf(stderr, "  (a refusal is logged next: both halves of FEEDSLOTS are torn)\n");
+    CHECK(open_eng(dir, &db) == TSDB_ERR_CORRUPT);
+    close(fd);
+    close(dfd);
+    printf("  FEEDSLOTS: the higher gen wins, a torn half is ignored, both torn fails the open\n");
+}
+
+/* Power loss while an open replays a segment that was never synced (wal_sync_ms > 0, or a kill -9): the replay
+ * truncates, fdatasyncs, then renames it to fwal_. Were the sync missing, the rename could be durable while the data is
+ * not, and a "sealed" fwal_ would end in a torn record. The child writes unsynced rows, drops its engine without a
+ * close and opens the directory again, all under the crashfs shim; power is lost at the k-th tracked step. */
+static void child_replay(const char *dir)
+{
+    /* the segment a killed writer left, as a process under the shim sees it: written, never synced (a kill -9 between
+     * the write and the fdatasync, or the page cache of the crash before); its name is durable */
+    char p[PATH_MAX + 64];
+    snprintf(p, sizeof p, "%s/wal_0000000000000001.log", dir);
+    size_t len = 0;
+    char *img = slurp(dir, "wal_0000000000000001.log", &len);
+    if (!img || len == 0 || unlink(p) != 0)
+        _exit(2);
+    int fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0 || write(fd, img, len) != (ssize_t)len)
+        _exit(3);
+    close(fd);
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0 || fsync(dfd) != 0)
+        _exit(4);
+    close(dfd);
+    eng *b;
+    if (open_eng(dir, &b) != 0)
+        _exit(5);
+    _exit(failures ? 6 : 0);
+}
+
+static int run_child(const char *dir, int k, int seed)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        char w[16];
+        snprintf(w, sizeof w, "%d", k);
+        char asan[512];
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0:detect_leaks=0",
+                 getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        setenv("LD_PRELOAD", SHIM, 1);
+        setenv("CRASHFS_ROOT", dir, 1);
+        setenv("CRASHFS_PROB", "1", 1);
+        setenv("CRASHFS_WARMUP", w, 1);
+        setenv("CRASHFS_TEAR", "1", 1);
+        char sd[16];
+        snprintf(sd, sizeof sd, "%d", seed);
+        setenv("CRASHFS_SEED", sd, 1);
+        int null = open("/dev/null", O_WRONLY);
+        if (null >= 0)
+            dup2(null, 1), dup2(null, 2);
+        execl(SELF, "test_feedstore", "--child", "replay", dir, (char *)NULL);
+        _exit(127);
+    }
+    int st = -1;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+/* After a recovery with the feed on: the offline check F2's reader relies on. fwal_ seqs above the floor contiguous, every
+ * fwal_ valid to its last byte, numbers only increase across segments, the floor below the oldest kept number. */
+static void check_feed_dir(const char *dir, const char *what, int k, uint64_t whole_last)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    uint64_t seqs[256];
+    int n = 0;
+    while (d && (e = readdir(d)))
+        if (fwal_file_name(e->d_name) && n < 256)
+            seqs[n++] = strtoull(e->d_name + 5, NULL, 16);
+    if (d)
+        closedir(d);
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            if (seqs[j] < seqs[i]) {
+                uint64_t t = seqs[i];
+                seqs[i] = seqs[j];
+                seqs[j] = t;
+            }
+    uint64_t prev_last = 0;
+    for (int i = 0; i < n; i++) {
+        char name[64];
+        uint64_t f, l;
+        fwal_name(name, sizeof name, seqs[i]);
+        if (i && seqs[i] != seqs[i - 1] + 1) {
+            fprintf(stderr, "  %s, step %d: fwal_ seqs not contiguous at %" PRIu64 "\n", what, k, seqs[i]);
+            failures++;
+        }
+        int recs = seg_walk(dir, name, seqs[i], &f, &l);
+        if (recs < 0) {
+            fprintf(stderr, "  %s, step %d: %s is torn or damaged\n", what, k, name);
+            failures++;
+            continue;
+        }
+        if (whole_last && seqs[i] == 1 && (recs <= 0 || l != whole_last)) {
+            /* the replay accepted every record of it: a rename that outlived its data is a loss */
+            fprintf(stderr, "  %s, step %d: %s ends at %" PRIu64 ", not at %" PRIu64 " (renamed before its data was "
+                            "synced)\n", what, k, name, l, whole_last);
+            failures++;
+        }
+        if (recs && f <= prev_last) {
+            fprintf(stderr, "  %s, step %d: %s starts at %" PRIu64 ", not above %" PRIu64 "\n", what, k, name, f, prev_last);
+            failures++;
+        }
+        if (recs)
+            prev_last = l;
+    }
+}
+
+static void test_power_replay(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  power loss at the replay: skipped (no %s)\n", SHIM);
+        return;
+    }
+    char dir[PATH_MAX + 32], src[PATH_MAX + 32];
+    int crashes = 0, finished = 0;
+    fresh("pl-replay-src", src, sizeof src);
+    crash_writer_feed(src, 60, 2);
+    CHECK(exists(src, "wal_0000000000000001.log") && exists(src, "FEED"));
+    uint64_t f0, want = 0;
+    CHECK(seg_walk(src, "wal_0000000000000001.log", 1, &f0, &want) > 0 && want >= 60);
+    /* the tear of unsynced bytes is random: each step is lost with several seeds */
+    for (int k = 0; k < 300 && !finished; k++) {
+        for (int seed = 1; seed <= 12 && !finished; seed++) {
+            fresh("pl-replay", dir, sizeof dir);
+            sh("rm -rf '%s' && cp -a '%s' '%s'", dir, src, dir);
+            int code = run_child(dir, k, seed);
+            CHECK(code == 99 || code == 0);
+            if (code != 99 && code != 0)
+                return;
+            crashes += code == 99;
+            finished = code == 0;
+            check_feed_dir(dir, "replay", k, want);
+            if (seed == 1) { /* and the directory opens, with its feed in order */
+                eng *db;
+                int rc = open_eng(dir, &db);
+                CHECK(rc == 0);
+                if (rc == 0) {
+                    check_feed_dir(dir, "after the open", k, 0);
+                    CHECK(eng_close(db) == 0);
+                }
+            }
+        }
+    }
+    CHECK(finished && crashes > 10);
+    printf("  power lost at each of %d steps of a replay of an unsynced segment: every fwal_ is whole, contiguous, "
+           "increasing\n", crashes);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 4 && strcmp(argv[1], "--child") == 0 && strcmp(argv[2], "replay") == 0) {
+        feed_test_free_hook(free_hook, NULL);
+        if (getenv("FEEDSTORE_MUTANT"))
+            eng_test_mutant = MUT_FEED_NOSEAL;
+        child_replay(argv[3]);
+        return 6;
+    }
+    bool mutant = argc > 1 && strcmp(argv[1], "--mutant") == 0; /* a planted bug that the power-loss sweep must see */
+    const char *self = argv[0];
+    if (mutant) {
+        argv++, argc--;
+        setenv("FEEDSTORE_MUTANT", "noseal", 1);
+    }
     snprintf(S, sizeof S, "%s", argc > 1 ? argv[1] : "/tmp");
+    if (!realpath(self, SELF))
+        snprintf(SELF, sizeof SELF, "%s", self);
+    char *slash = strrchr(SELF, '/');
+    snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
     feed_test_free_hook(free_hook, NULL); /* the machine's own free space must not decide (the rule is tested alone) */
+    if (mutant) { /* the replayed segment renamed without its fdatasync: only a power loss sees it */
+        test_power_replay();
+        printf(failures ? "FAILED: %d\n" : "all ok\n", failures);
+        return failures != 0;
+    }
     test_off();
     test_retained();
     test_replay();
@@ -597,6 +979,10 @@ int main(int argc, char **argv)
     test_refusals();
     test_enable_disable();
     test_cleaner();
+    test_two_volumes();
+    test_new_id();
+    test_slot_halves();
+    test_power_replay();
     printf(failures ? "FAILED: %d\n" : "all ok\n", failures);
     return failures != 0;
 }

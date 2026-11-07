@@ -1441,7 +1441,8 @@ static int wal_seal_replayed(eng *db, const char *name, size_t valid, size_t len
         fprintf(stderr, "tsdb: %s: cutting the torn tail of %s failed: %s\n", db->dir, name, strerror(errno));
         rc = TSDB_ERR_IO;
     }
-    if (rc == 0 && db->opt.fsync && tsdb_fdatasync(fd) != 0) {
+    if (rc == 0 && db->opt.fsync && eng_test_mutant != MUT_FEED_NOSEAL && /* planted: the rename without the sync */
+        tsdb_fdatasync(fd) != 0) {
         fprintf(stderr, "tsdb: %s: fdatasync of %s failed: %s\n", db->dir, name, strerror(errno));
         rc = TSDB_ERR_IO;
     }

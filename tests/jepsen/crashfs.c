@@ -1170,6 +1170,27 @@ static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool 
 int rename(const char *a, const char *b) { return do_rename(AT_FDCWD, a, AT_FDCWD, b, false); }
 int renameat(int ofd, const char *a, int nfd, const char *b) { return do_rename(ofd, a, nfd, b, true); }
 
+/* renameat2: the engine renames a retained WAL segment with RENAME_NOREPLACE (the change feed). Flags 0 and NOREPLACE
+ * (1) are tracked as a rename, so that a power loss undoes one whose directory was not synced; the other flags
+ * (exchange, whiteout) the engine never uses: they pass through untracked. */
+int renameat2(int ofd, const char *a, int nfd, const char *b, unsigned flags)
+{
+    if (flags & ~1u) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (flags & 1u) {
+        char pb[PATH_MAX];
+        path_of_at(nfd, b, pb);
+        struct stat st;
+        if (lstat(pb, &st) == 0) {
+            errno = EEXIST;
+            return -1;
+        }
+    }
+    return do_rename(ofd, a, nfd, b, true);
+}
+
 static int do_unlink(int dirfd, const char *name, int flags, bool at)
 {
     char p[PATH_MAX];
