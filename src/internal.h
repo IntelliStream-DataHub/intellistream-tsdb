@@ -1181,6 +1181,7 @@ void eng_hot_collect(eng *db, void *writes_agg, void *bpr_agg, uint64_t sid_base
  * probes pass this number (default 100 million). */
 extern atomic_uint stats_ring_cap;
 extern atomic_uint stats_pause;
+extern atomic_size_t stats_test_alloc_cap; /* tests: the tenant side's big allocations above this many bytes fail (0: off) */
 extern atomic_uint_fast64_t stats_open_reconciles;
 extern atomic_uint_fast64_t sstats_budget;
 extern atomic_int_fast64_t stats_hot_clock_ms; /* tests: nonzero is "now" in ms for the hot-list windows and the HLL hours */

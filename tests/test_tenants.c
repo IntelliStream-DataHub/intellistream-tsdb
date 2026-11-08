@@ -832,6 +832,174 @@ static void test_lazy_and_races(const char *base)
     tsdb_close(db);
 }
 
+/* ------------------------------------------------------------------ list changes: races, cost, lag, no memory */
+
+static double mono_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+typedef struct setter_ctx {
+    tsdb *db;
+    int k;
+} setter_ctx;
+
+static void *setter(void *arg)
+{
+    setter_ctx *c = arg;
+    const char *all[] = {"a/", "b/", "c/", "d/", "a/s0"};
+    for (int i = 0; i < 400; i++) {
+        const char *l[5];
+        size_t n = 0;
+        for (int j = 0; j < 5; j++)
+            if (((i + c->k) >> j & 1) || j == (i + c->k) % 5)
+                l[n++] = all[j];
+        if (tsdb_set_tenants(c->db, l, n) != 0)
+            failures++;
+    }
+    return NULL;
+}
+
+/* Concurrent tsdb_set_tenants: one call freed the list another still read (a heap use-after-free under ASan), and
+ * two pushes to the engines could land in the reverse order of the swaps, so the engines counted by another list
+ * than the handle answered with. After the threads end, the engines must count by the handle's list. */
+static void test_set_races(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/setrace", base);
+    OK(mkdir(dir, 0755));
+    tsdb_options o = base_opts();
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    ser sv[8];
+    size_t ns = 0;
+    const char *names[] = {"a/s0", "a/s1", "b/s2", "c/s3", "d/s4", "e/s5"};
+    for (int i = 0; i < 6; i++)
+        add_series(db, sv, &ns, names[i], TSDB_FLOAT64, dir);
+    load_series(db, sv, ns, 2000, 0);
+    OK(tsdb_flush(db));
+    setter_ctx c[4];
+    pthread_t th[4];
+    for (int i = 0; i < 4; i++) {
+        c[i] = (setter_ctx){db, i};
+        pthread_create(&th[i], NULL, setter, &c[i]);
+    }
+    for (int i = 0; i < 4; i++)
+        pthread_join(th[i], NULL);
+    char buf[8][32];
+    const char *pf[8];
+    size_t np = 0;
+    while (np < 8 && tsdb_tenant_prefix(db, np, buf[np], sizeof buf[np]) >= 0) {
+        pf[np] = buf[np];
+        np++;
+    }
+    CHECK(np >= 1);
+    check_tenants(db, sv, ns, pf, np, "after concurrent sets");
+    tsdb_close(db);
+}
+
+/* A list change that moves many series over parts that each hold a few of them, at a slow sweep rate. The old move
+ * searched all moved ids in every part (parts x moved series: minutes here); it must cost about one walk of the index,
+ * and a tenant the change does not touch stays exact meanwhile. Right after the call the engine has not applied the
+ * list: the answers are PARTIAL then, not the new list's zeros. Then a list change with no memory for its moves:
+ * the tenant totals of the volume stop and read PARTIAL; nothing else fails, and a reopen counts again. */
+static void test_list_change(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/lchg", base);
+    OK(mkdir(dir, 0755));
+    tsdb_options o = base_opts();
+    o.wal_max_batch_rows = 10; /* every batch below goes straight to parts */
+    o.stats_sweep_mb_s = 1;
+    o.partition_classes = 0;
+    const char *l0[] = {"o/"};
+    o.tenants = l0;
+    o.ntenants = 1;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    enum { NS = 6000, CH = 50, ND = 3 };
+    ser *sv = calloc(NS, sizeof *sv);
+    size_t ns = 0;
+    for (int i = 0; i < NS; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "%c/s%05d", i % 6 == 5 ? 'o' : 'm', i);
+        add_series(db, sv, &ns, name, TSDB_FLOAT32, dir);
+    }
+    tsdb_sid ids[CH * ND];
+    int64_t tsv[CH * ND];
+    float vv[CH * ND];
+    for (int c = 0; c < NS; c += CH) {
+        size_t k = 0;
+        for (int i = c; i < c + CH; i++)
+            for (int d = 0; d < ND; d++, k++) {
+                ids[k] = sv[i].id;
+                tsv[k] = T0 + d * DAY + 1000;
+                vv[k] = (float)(i % 100);
+            }
+        OK(tsdb_insert(db, ids, tsv, vv, k));
+    }
+    OK(tsdb_flush(db));
+    OK(tsdb_stats_settle(db, 120000));
+
+    const char *l1[] = {"o/", "m/"};
+    tsdb_tenant_stats fm, fo;
+    atomic_store(&stats_pause, 1); /* the engine has not applied the list yet */
+    OK(tsdb_set_tenants(db, l1, 2));
+    OK(tsdb_tenant_stats_get(db, "m/", TSDB_TENANT_VOLUME_SUM, &fm));
+    OK(tsdb_tenant_stats_get(db, "o/", TSDB_TENANT_VOLUME_SUM, &fo));
+    CHECK(fm.flags & TSDB_TENANT_PARTIAL);
+    CHECK(fo.flags & TSDB_TENANT_PARTIAL);
+    atomic_store(&stats_pause, 0);
+
+    double t0 = mono_s();
+    bool seen_move = false, o_exact = false;
+    for (;;) {
+        OK(tsdb_tenant_stats_get(db, "m/", TSDB_TENANT_VOLUME_SUM, &fm));
+        OK(tsdb_tenant_stats_get(db, "o/", TSDB_TENANT_VOLUME_SUM, &fo));
+        if (!(fo.flags & TSDB_TENANT_PARTIAL)) {
+            o_exact = true;
+            seen_move = seen_move || (fm.flags & TSDB_TENANT_PARTIAL);
+        } else if (o_exact) {
+            CHECK(!"a tenant the change does not touch went PARTIAL during the move");
+            break;
+        }
+        if (o_exact && !(fm.flags & TSDB_TENANT_PARTIAL))
+            break;
+        if (mono_s() - t0 > 40) {
+            CHECK(!"the list change takes more than one walk of the index");
+            break;
+        }
+        struct timespec ms = {0, 10 * 1000 * 1000};
+        nanosleep(&ms, NULL);
+    }
+    CHECK(seen_move); /* the move was in progress while the untouched tenant answered exactly */
+    check_tenants(db, sv, ns, l1, 2, "after the move");
+
+    /* no memory for the moved series: the tenant side stops, the rest goes on */
+    atomic_store(&stats_test_alloc_cap, 20000);
+    OK(tsdb_set_tenants(db, l0, 1));
+    OK(tsdb_stats_settle(db, 60000));
+    atomic_store(&stats_test_alloc_cap, 0);
+    OK(tsdb_tenant_stats_get(db, "o/", TSDB_TENANT_VOLUME_SUM, &fo));
+    CHECK(fo.flags & TSDB_TENANT_PARTIAL);
+    tsdb_volume_stats vs;
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    CHECK(vs.parts > 0 && vs.logical_bytes > 0);
+    tsdb_series_stat st;
+    size_t done;
+    OK(tsdb_series_stats(db, &sv[0].id, 1, 0, &st, &done));
+    CHECK(st.rows == ND);
+    put_rows(db, sv[0].id, TSDB_FLOAT32, T0 + 10 * DAY, 60000, 0, 100); /* inserts, flushes and queries still work */
+    OK(tsdb_flush(db));
+    tsdb_close(db);
+    OK(tsdb_open(dir, &o, &db)); /* opened again: counted from the parts */
+    check_tenants(db, sv, ns, l0, 1, "after the failed list change, reopened");
+    tsdb_close(db);
+    free(sv);
+}
+
 /* ------------------------------------------------------------------------ the map's memory */
 
 static void map_bench(const char *base, size_t n)
@@ -907,6 +1075,8 @@ int main(int argc, char **argv)
     test_hot(base);
     test_residency(base);
     test_lazy_and_races(base);
+    test_set_races(base);
+    test_list_change(base);
     rm_rf(base);
     if (failures) {
         fprintf(stderr, "test_tenants: %d failures\n", failures);

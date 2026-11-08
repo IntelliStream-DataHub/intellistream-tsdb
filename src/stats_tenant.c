@@ -23,6 +23,15 @@
 
 #include <math.h>
 
+/* Tests only (test_tenants): makes the tenant side's large allocations fail, as under memory pressure. */
+atomic_size_t stats_test_alloc_cap;
+
+static bool alloc_refused(size_t n)
+{
+    size_t cap = atomic_load_explicit(&stats_test_alloc_cap, memory_order_relaxed);
+    return cap && n > cap;
+}
+
 /* ------------------------------------------------------------------------ the process-wide numbers */
 
 static pthread_mutex_t intern_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -262,8 +271,10 @@ void tenants_grow_to(struct estats *es, uint32_t maxno)
         es->ttn = n;
     }
     pthread_mutex_unlock(&es->mu);
-    if (es->ttn != n)
-        return; /* out of memory: the numbers above the old size are not counted (tenant_of keeps to scn) */
+    if (es->ttn != n) {
+        tenants_fail(es); /* out of memory: the numbers above the old size are not counted */
+        return;
+    }
     tent *sc = realloc(es->sc, n * sizeof *sc), *sc2 = realloc(es->sc2, n * sizeof *sc2);
     uint32_t *t1 = realloc(es->touch, n * sizeof *t1), *t2 = realloc(es->touch2, n * sizeof *t2);
     if (sc)
@@ -274,8 +285,10 @@ void tenants_grow_to(struct estats *es, uint32_t maxno)
         es->touch = t1;
     if (t2)
         es->touch2 = t2;
-    if (!(sc && sc2 && t1 && t2))
-        abort(); /* scratch the size of the tenant table: the walk cannot go on without it */
+    if (!(sc && sc2 && t1 && t2)) {
+        tenants_fail(es); /* scratch the size of the tenant table: the walk cannot go on without it */
+        return;
+    }
     memset(es->sc + es->scn, 0, (n - es->scn) * sizeof *sc);
     memset(es->sc2 + es->scn, 0, (n - es->scn) * sizeof *sc2);
     es->scn = n;
@@ -286,12 +299,58 @@ void tenants_init(struct estats *es)
     eng *db = es->db;
     pthread_mutex_lock(&db->tl_mu);
     es->tl = tlist_ref(db->tl);
+    es->applied = db->tl; /* NULL: no list was ever set (the empty one below stands in) */
     pthread_mutex_unlock(&db->tl_mu);
-    if (!es->tl && tlist_make(NULL, 0, &es->tl) != 0)
-        abort();
     es->tl_gen = 1;
     es->tbase = eng_series_count(db);
+    if (!es->tl && tlist_make(NULL, 0, &es->tl) != 0) {
+        es->tl = NULL;
+        tenants_fail(es);
+        return;
+    }
     tenants_grow_to(es, es->tl->maxno);
+}
+
+static bool tdead(const struct estats *es) { return atomic_load_explicit(&es->tdead, memory_order_acquire); }
+
+/* Out of memory on the tenant side. Statistics never fail the engine: the tenant numbers of this volume stop where
+ * they are and read PARTIAL from now on (the sweeper frees the vectors at its next step; a reopen counts again).
+ * Every entry point of this file returns at once while tdead is set, so nothing is added or subtracted half way
+ * afterwards. */
+void tenants_fail(struct estats *es)
+{
+    if (!atomic_exchange(&es->tdead, true))
+        fprintf(stderr, "tsdb: statistics: out of memory: the tenant totals of this volume stop here (PARTIAL) "
+                "until it is opened again\n");
+}
+
+/* The sweeper, once tdead is set: the partition vectors and the pending moves are not needed any more. */
+static void tenants_release(struct estats *es)
+{
+    for (size_t b = 0; b < es->phtn; b++)
+        for (pvec *pv = es->pht[b], *nx; pv; pv = nx) {
+            nx = pv->next;
+            free(pv->v);
+            free(pv);
+        }
+    free(es->pht);
+    es->pht = NULL;
+    es->phtn = es->npv = 0;
+    es->qhead = es->qtail = NULL;
+    es->moving = 0;
+    free(es->moves);
+    es->moves = NULL;
+    es->nmoves = 0;
+    free(es->mids);
+    free(es->mwid);
+    free(es->mgr);
+    es->mids = NULL;
+    es->mwid = NULL;
+    es->mgr = NULL;
+    es->nmgr = 0;
+    pthread_mutex_lock(&es->mu);
+    es->oldest_stale_ns = 0;
+    pthread_mutex_unlock(&es->mu);
 }
 
 void tenants_free(struct estats *es)
@@ -307,6 +366,9 @@ void tenants_free(struct estats *es)
         }
     free(es->pht);
     free(es->moves);
+    free(es->mids);
+    free(es->mwid);
+    free(es->mgr);
     for (size_t i = 0; i < es->ttn; i++) {
         free(es->hll[i].reg[0]);
         free(es->hll[i].reg[1]);
@@ -339,9 +401,11 @@ static void map_set(struct estats *es, uint32_t id, uint32_t tn)
         }
         if (pg->one == tn)
             return; /* a new id joins the page's one tenant, or a move that changes nothing */
-        uint16_t *v = malloc(65536 * sizeof *v);
-        if (!v)
-            abort(); /* the map cannot be left half made */
+        uint16_t *v = alloc_refused(65536 * sizeof *v) ? NULL : malloc(65536 * sizeof *v);
+        if (!v) {
+            tenants_fail(es); /* the map cannot be left half made: nothing is set */
+            return;
+        }
         uint32_t lo = id & ~0xffffu;
         uint32_t known = es->tfront > lo ? (uint32_t)MIN((uint64_t)65536, (uint64_t)es->tfront - lo) : 0; /* assigned */
         for (uint32_t i = 0; i < known; i++)
@@ -355,22 +419,26 @@ static void map_set(struct estats *es, uint32_t id, uint32_t tn)
 
 void tenants_extend(struct estats *es, uint32_t nseries)
 {
-    if (nseries <= es->tfront)
+    if (nseries <= es->tfront || tdead(es))
         return;
     size_t need = ((size_t)nseries + 65535) >> 16;
     if (need > es->ntp) {
         tpage *tp = realloc(es->tp, need * sizeof *tp);
-        if (!tp)
-            abort();
+        if (!tp) {
+            tenants_fail(es);
+            return;
+        }
         memset(tp + es->ntp, 0, (need - es->ntp) * sizeof *tp);
         atomic_fetch_add(&es->tmap_bytes, (need - es->ntp) * sizeof *tp);
         es->tp = tp;
         es->ntp = need;
     }
     uint16_t *buf = malloc(65536 * sizeof *buf);
-    if (!buf)
-        abort();
-    while (es->tfront < nseries) {
+    if (!buf) {
+        tenants_fail(es);
+        return;
+    }
+    while (es->tfront < nseries && !tdead(es)) {
         uint32_t lo = es->tfront, hi = (uint32_t)MIN((uint64_t)nseries, (uint64_t)lo + 65536);
         for (uint32_t id = lo; id < hi; id++) { /* the names first: the dictionary's lock never meets es->mu */
             const char *name = eng_series_name(es->db, id);
@@ -405,7 +473,7 @@ void tenant_scratch_clear(struct estats *es)
 void tenant_walk_run(struct estats *es, uint32_t id, uint64_t cnt, uint64_t nulls, uint64_t logical, uint64_t ts,
                      uint64_t val, uint64_t index, uint64_t granules)
 {
-    if (!granules)
+    if (!granules || tdead(es))
         return;
     uint32_t t = tenant_of(es, id);
     if (t >= es->scn)
@@ -564,22 +632,28 @@ static tvec_e *pv_find(const pvec *pv, uint32_t t)
  * tenant the vector does not have is skipped, never done: nothing is subtracted that was not added. */
 static void pv_apply(struct estats *es, pvec *pv, const tent *sc, uint32_t *touch, size_t nt, int sign)
 {
+    if (tdead(es))
+        return;
     qsort(touch, nt, sizeof *touch, u32_cmp);
     uint32_t *fresh = NULL;
     size_t nf = 0;
     uint32_t *done = malloc((nt ? nt : 1) * sizeof *done);
     size_t nd = 0;
     if (sign > 0)
-        if (!(fresh = malloc((nt ? nt : 1) * sizeof *fresh)))
-            abort(); /* a partition that misses a tenant would drift */
+        fresh = malloc((nt ? nt : 1) * sizeof *fresh);
+    if (!done || (sign > 0 && !fresh)) { /* a partition that misses a tenant would drift: nothing is applied */
+        free(done);
+        free(fresh);
+        tenants_fail(es);
+        return;
+    }
     for (size_t i = 0; i < nt; i++) {
         uint32_t t = touch[i];
         tvec_e *e = pv_find(pv, t);
         if (e) {
             tent_add(&e->v, &sc[t], sign);
-            if (done)
-                done[nd++] = t;
-        } else if (sign > 0 && fresh) {
+            done[nd++] = t;
+        } else if (sign > 0) {
             fresh[nf++] = t;
         }
     }
@@ -587,8 +661,12 @@ static void pv_apply(struct estats *es, pvec *pv, const tent *sc, uint32_t *touc
         if (pv->nv + nf > pv->cap) {
             uint32_t cap = MAX(pv->cap * 2, pv->nv + (uint32_t)nf);
             tvec_e *v = realloc(pv->v, cap * sizeof *v);
-            if (!v)
-                abort(); /* a vector that misses a tenant would drift: this is a few hundred bytes */
+            if (!v) { /* a vector that misses a tenant would drift: the totals stop here */
+                free(done);
+                free(fresh);
+                tenants_fail(es);
+                return;
+            }
             pv->v = v;
             pv->cap = cap;
         }
@@ -618,9 +696,13 @@ static void pv_apply(struct estats *es, pvec *pv, const tent *sc, uint32_t *touc
 
 void pv_part_added(struct estats *es, const prec *r, bool fresh)
 {
+    if (tdead(es))
+        return;
     pvec *pv = pv_get(es, r->partition);
-    if (!pv)
-        return; /* out of memory: the partition is not tracked, and its tenants miss this part until a restart */
+    if (!pv) {
+        tenants_fail(es);
+        return; /* out of memory: the partition is not tracked, and its tenants would miss this part */
+    }
     pv->nrec++;
     /* a merge output is not added: its partition is counted again. A vector in terms of an older list is not added
      * to either (the split is in terms of the new map): the recount puts it right. */
@@ -645,6 +727,8 @@ static void pv_drop_whole(struct estats *es, pvec *pv)
 
 void pv_part_removed(struct estats *es, const prec *r, bool dropped)
 {
+    if (tdead(es))
+        return;
     pvec *pv = pv_lookup(es, r->partition);
     if (!pv)
         return;
@@ -660,10 +744,14 @@ void pv_part_removed(struct estats *es, const prec *r, bool dropped)
  * are what merges (and deletes, overwrites and retention inside the partition) removed. */
 static void pv_replace(struct estats *es, pvec *pv, const tent *sc, uint32_t *touch, size_t n)
 {
+    if (tdead(es))
+        return;
     qsort(touch, n, sizeof *touch, u32_cmp);
     tvec_e *nv = malloc((n ? n : 1) * sizeof *nv);
-    if (!nv)
-        abort();
+    if (!nv) { /* the vector stays as it was: the totals stop here */
+        tenants_fail(es);
+        return;
+    }
     for (size_t i = 0; i < n; i++) {
         nv[i].t = touch[i];
         nv[i].pad = 0;
@@ -820,11 +908,53 @@ static void finish_moves(struct estats *es)
     free(es->moves);
     es->moves = NULL;
     es->nmoves = 0;
+    free(es->mids);
+    free(es->mwid);
+    free(es->mgr);
+    es->mids = NULL;
+    es->mwid = NULL;
+    es->mgr = NULL;
+    es->nmgr = 0;
+}
+
+/* After the sort: the groups, and the ids and widths of the moves as the groups slice them. On failure they stay
+ * NULL, and move_pv counts the partitions again. The widths are looked up here, once per change. */
+static void moves_prepare(struct estats *es)
+{
+    size_t ng = 0;
+    for (size_t i = 0; i < es->nmoves; i++)
+        if (!i || es->moves[i].from != es->moves[i - 1].from || es->moves[i].to != es->moves[i - 1].to)
+            ng++;
+    uint32_t *ids = malloc(es->nmoves * sizeof *ids);
+    uint8_t *wid = malloc(es->nmoves);
+    struct mgroup *gr = malloc(ng * sizeof *gr);
+    if (!ids || !wid || !gr) {
+        free(ids);
+        free(wid);
+        free(gr);
+        return;
+    }
+    size_t k = 0;
+    for (size_t i = 0; i < es->nmoves; i++) {
+        const struct move *m = &es->moves[i];
+        ids[i] = m->id;
+        int type = eng_series_type(es->db, m->id);
+        wid[i] = (uint8_t)(type >= 0 ? type_width(type) : 4);
+        if (!i || m->from != es->moves[i - 1].from || m->to != es->moves[i - 1].to)
+            gr[k++] = (struct mgroup){i, 0, m->from, m->to};
+        gr[k - 1].n++;
+    }
+    es->mids = ids;
+    es->mwid = wid;
+    es->mgr = gr;
+    es->nmgr = ng;
 }
 
 void tenants_apply_list(struct estats *es)
 {
     eng *db = es->db;
+    if (tdead(es))
+        return;
     pthread_mutex_lock(&db->tl_mu);
     tlist *nt = db->tl;
     if (!nt || nt == es->tl) {
@@ -861,7 +991,10 @@ void tenants_apply_list(struct estats *es)
     free(in_old);
     free(in_new);
     if (!changed) { /* the same prefixes again */
+        pthread_mutex_lock(&es->mu);
         es->tl = nt;
+        es->applied = nt;
+        pthread_mutex_unlock(&es->mu);
         tlist_unref(old);
         free(aff);
         return;
@@ -881,7 +1014,8 @@ void tenants_apply_list(struct estats *es)
     struct move *mv = NULL;
     size_t nm = 0, cap = 0;
     int64_t *ds = calloc(top + 1, sizeof *ds); /* series count change per tenant */
-    for (size_t pg = 0; pg < es->ntp && ds; pg++) {
+    bool oom = !ds;
+    for (size_t pg = 0; pg < es->ntp && !oom; pg++) {
         uint32_t lo = (uint32_t)(pg << 16), hi = (uint32_t)MIN((uint64_t)es->tfront, (uint64_t)lo + 65536);
         if (lo >= hi)
             break;
@@ -897,9 +1031,11 @@ void tenants_apply_list(struct estats *es)
                 continue;
             if (nm == cap) {
                 cap = cap ? cap * 2 : 1024;
-                struct move *v = realloc(mv, cap * sizeof *v);
-                if (!v)
-                    abort();
+                struct move *v = alloc_refused(cap * sizeof *v) ? NULL : realloc(mv, cap * sizeof *v);
+                if (!v) { /* the list of moved series cannot be kept: the totals stop here */
+                    oom = true;
+                    break;
+                }
                 mv = v;
             }
             mv[nm++] = (struct move){id, (uint16_t)t, (uint16_t)n2};
@@ -909,8 +1045,16 @@ void tenants_apply_list(struct estats *es)
         }
     }
     free(aff);
+    if (oom || tdead(es)) { /* a map page that could not be made counts too */
+        free(mv);
+        free(ds);
+        tlist_unref(old);
+        tenants_fail(es);
+        return;
+    }
     pthread_mutex_lock(&es->mu);
-    for (uint32_t t = 0; ds && t <= top && t < es->ttn; t++)
+    es->applied = nt; /* the tenants a change touches are PARTIAL from here (below) until their moves are done */
+    for (uint32_t t = 0; t <= top && t < es->ttn; t++)
         es->tt[t].series += (uint64_t)ds[t];
     for (size_t i = 0; i < nm; i++) {
         es->tt[mv[i].from].partial = true;
@@ -925,6 +1069,7 @@ void tenants_apply_list(struct estats *es)
         es->nmoves = nm;
         es->moving = es->npv;
         es->mv_cursor = 0;
+        moves_prepare(es);
     } else {
         free(mv);
         for (size_t b = 0; b < es->phtn; b++)
@@ -936,20 +1081,128 @@ void tenants_apply_list(struct estats *es)
 
 /* The entries of a part that belong to the sorted ids[0..g): their column sums into *x. The cheaper of a binary
  * search per id and one pass over the run table. Returns the index probes made. */
+static unsigned ceil_lg(uint64_t n)
+{
+    unsigned lg = 1;
+    while (((uint64_t)1 << lg) < n)
+        lg++;
+    return lg;
+}
+
+/* The ids[0..g) (sorted) that fall inside a part's series range: [*lo, *hi). */
+static void ids_in_range(const gix *gx, const uint32_t *ids, size_t g, size_t *lo, size_t *hi)
+{
+    size_t a = 0, b = g;
+    while (a < b) { /* the first id >= the part's first series */
+        size_t m = a + (b - a) / 2;
+        if (ids[m] < gx->rser[0])
+            a = m + 1;
+        else
+            b = m;
+    }
+    size_t c = a, d = g;
+    while (c < d) { /* the first id > its last */
+        size_t m = c + (d - c) / 2;
+        if (ids[m] <= gx->rser[gx->nruns - 1])
+            c = m + 1;
+        else
+            d = m;
+    }
+    *lo = a;
+    *hi = c;
+}
+
+enum { IDS_MERGE, IDS_PER_ID, IDS_PER_RUN };
+
+/* How the moved ids (g of them, already cut to the part's range) are best found in a part's run table, and what it
+ * costs in index probes: one merge pass over both, a search of the run table per id, or a search of the ids per run.
+ * The last is what keeps a part of a few series cheap when millions of series moved. */
+static uint64_t ids_plan(const gix *gx, size_t g, int *how)
+{
+    uint64_t lg = ceil_lg(gx->nruns), lgg = ceil_lg(g + 1);
+    uint64_t m = (uint64_t)gx->nruns + g, pi = (uint64_t)g * lg, pr = (uint64_t)gx->nruns * lgg;
+    *how = IDS_MERGE;
+    uint64_t best = m;
+    if (pi < best) {
+        best = pi;
+        *how = IDS_PER_ID;
+    }
+    if (pr < best) {
+        best = pr;
+        *how = IDS_PER_RUN;
+    }
+    return best;
+}
+
+/* What moving the ids out of this part costs in index bytes at the least (the probes), for the choice between moving
+ * a partition and counting it again. */
+static uint64_t part_ids_cost(const part *p, const uint32_t *ids, size_t g)
+{
+    const gix *gx = &p->ix;
+    if (!gx->nruns || !g)
+        return 8;
+    size_t lo, hi;
+    ids_in_range(gx, ids, g, &lo, &hi);
+    if (hi <= lo)
+        return 8;
+    int how;
+    return ids_plan(gx, hi - lo, &how) * 8;
+}
+
+static void entries_sum(const gix *gx, uint32_t a, uint32_t b, uint8_t wid, tent *x)
+{
+    uint64_t cnt = 0;
+    for (uint32_t e = a; e < b; e++) {
+        cnt += gix_get(gx, e, GF_COUNT);
+        x->nulls += gix_get(gx, e, GF_NULLS);
+        x->ts += gix_get(gx, e, GF_TSLEN);
+        x->val += gix_get(gx, e, GF_VALLEN);
+    }
+    x->rows += cnt;
+    x->logical += cnt * (8 + wid);
+    x->index += (uint64_t)(b - a) * gx->stride + 8;
+    x->granules += b - a;
+}
+
+/* Returns the index bytes read (the throttle's price). */
 static uint64_t part_ids_sum(const part *p, const uint32_t *ids, size_t g, const uint8_t *wid, tent *x)
 {
     const gix *gx = &p->ix;
-    if (!gx->nruns || gx->rser[gx->nruns - 1] < ids[0] || gx->rser[0] > ids[g - 1])
-        return 1;
-    unsigned lg = 1;
-    while (((uint64_t)1 << lg) < gx->nruns)
-        lg++;
-    bool merge = (uint64_t)gx->nruns + g < (uint64_t)g * lg;
+    if (!gx->nruns || !g)
+        return 8;
+    size_t lo, hi;
+    ids_in_range(gx, ids, g, &lo, &hi);
+    if (hi <= lo)
+        return 8;
+    ids += lo;
+    wid += lo;
+    g = hi - lo;
+    int how;
+    uint64_t bytes = ids_plan(gx, g, &how) * 8;
+    if (how == IDS_PER_RUN) {
+        for (uint32_t k = 0; k < gx->nruns; k++) {
+            size_t a = 0, b = g;
+            while (a < b) {
+                size_t m = a + (b - a) / 2;
+                if (ids[m] < gx->rser[k])
+                    a = m + 1;
+                else
+                    b = m;
+            }
+            if (a >= g || ids[a] != gx->rser[k])
+                continue;
+            uint32_t s = gix_rstart(gx, k), e = k + 1 < gx->nruns ? gix_rstart(gx, k + 1) : gx->n;
+            if (e > s) {
+                entries_sum(gx, s, e, wid[a], x);
+                bytes += (uint64_t)(e - s) * gx->stride + 8;
+            }
+        }
+        return bytes;
+    }
     uint32_t rc = 0;
-    uint64_t probes = merge ? gx->nruns + g : (uint64_t)g * lg;
     for (size_t i = 0; i < g; i++) {
         uint32_t a, b;
-        if (merge) {
+        if (how == IDS_MERGE) {
             while (rc < gx->nruns && gx->rser[rc] < ids[i])
                 rc++;
             a = rc < gx->nruns ? gix_rstart(gx, rc) : gx->n;
@@ -961,20 +1214,10 @@ static uint64_t part_ids_sum(const part *p, const uint32_t *ids, size_t g, const
         }
         if (b <= a)
             continue;
-        uint64_t cnt = 0;
-        for (uint32_t e = a; e < b; e++) {
-            cnt += gix_get(gx, e, GF_COUNT);
-            x->nulls += gix_get(gx, e, GF_NULLS);
-            x->ts += gix_get(gx, e, GF_TSLEN);
-            x->val += gix_get(gx, e, GF_VALLEN);
-        }
-        x->rows += cnt;
-        x->logical += cnt * (8 + wid[i]);
-        x->index += (uint64_t)(b - a) * gx->stride + 8;
-        x->granules += b - a;
-        probes += b - a;
+        entries_sum(gx, a, b, wid[i], x);
+        bytes += (uint64_t)(b - a) * gx->stride + 8;
     }
-    return probes;
+    return bytes;
 }
 
 /* One partition's share of the series that moved: found in its counted parts (the listed parts that have a record),
@@ -982,7 +1225,6 @@ static uint64_t part_ids_sum(const part *p, const uint32_t *ids, size_t g, const
  * not stale: its vector is then exactly the sum of its records' splits. */
 static void move_pv(struct estats *es, pvec *pv)
 {
-    eng *db = es->db;
     int64_t key = pv->key;
     part **ps;
     size_t np;
@@ -990,37 +1232,41 @@ static void move_pv(struct estats *es, pvec *pv)
         return;
     pv = pv_lookup(es, key);
     if (pv && !pv->stale && pv->tgen != es->tl_gen) {
-        size_t gi = 0;
-        while (gi < es->nmoves && !stats_stopping(es)) {
-            size_t gj = gi;
-            while (gj < es->nmoves && es->moves[gj].from == es->moves[gi].from && es->moves[gj].to == es->moves[gi].to)
-                gj++;
-            size_t g = gj - gi;
-            uint32_t *ids = malloc(g * sizeof *ids);
-            uint8_t *wid = malloc(g);
-            if (!ids || !wid)
-                abort();
-            for (size_t k = 0; k < g; k++) {
-                ids[k] = es->moves[gi + k].id;
-                int type = eng_series_type(db, ids[k]);
-                wid[k] = (uint8_t)(type >= 0 ? type_width(type) : 4);
-            }
+        /* Moving finds the moved series in every part; counting again reads every part's index. Where the first
+         * would cost more than the second (parts that hold a few of very many moved series), count again: a list
+         * change then costs one walk of the index at most, as the design says. */
+        bool *known_part = malloc(np ? np : 1);
+        uint64_t mcost = 0, rcost = 0;
+        for (size_t i = 0; known_part && i < np; i++) {
+            pthread_mutex_lock(&es->mu);
+            prec *rec = rec_find(es, ps[i]);
+            known_part[i] = rec && rec_matches(rec, ps[i]);
+            pthread_mutex_unlock(&es->mu);
+            if (!known_part[i] || !es->mids)
+                continue;
+            rcost += ps[i]->index_len;
+            for (size_t gk = 0; gk < es->nmgr && mcost <= rcost; gk++)
+                mcost += part_ids_cost(ps[i], es->mids + es->mgr[gk].first, es->mgr[gk].n);
+        }
+        if (!known_part || !es->mids || mcost > rcost) {
+            mark_stale(es, pv);
+            pv = NULL;
+        }
+        for (size_t gk = 0; pv && gk < es->nmgr && !stats_stopping(es); gk++) {
+            const struct mgroup *gr = &es->mgr[gk];
+            const uint32_t *ids = es->mids + gr->first;
+            const uint8_t *wid = es->mwid + gr->first;
+            size_t g = gr->n;
             tent x;
             memset(&x, 0, sizeof x);
             for (size_t i = 0; i < np; i++) {
-                pthread_mutex_lock(&es->mu);
-                prec *rec = rec_find(es, ps[i]);
-                bool known = rec && rec_matches(rec, ps[i]);
-                pthread_mutex_unlock(&es->mu);
-                if (!known)
+                if (!known_part[i])
                     continue; /* not in the vector (put off): nothing to move */
                 throttle_wait(es);
-                uint64_t probes = part_ids_sum(ps[i], ids, g, wid, &x);
-                throttle_pay(es, probes * 32);
+                uint64_t bytes = part_ids_sum(ps[i], ids, g, wid, &x);
+                throttle_pay(es, bytes);
             }
-            free(ids);
-            free(wid);
-            uint32_t from = es->moves[gi].from, to = es->moves[gi].to;
+            uint32_t from = gr->from, to = gr->to;
             tvec_e *e = pv_find(pv, from);
             if (e && x.granules) {
                 tent_add(&e->v, &x, -1);
@@ -1032,10 +1278,10 @@ static void move_pv(struct estats *es, pvec *pv)
                 tt_add(&es->tt[from], &x, -1);
                 pthread_mutex_unlock(&es->mu);
             }
-            gi = gj;
         }
-        if (!stats_stopping(es))
+        if (pv && !stats_stopping(es))
             pv_converted(es, pv);
+        free(known_part);
     }
     for (size_t i = 0; i < np; i++)
         part_unref(ps[i]);
@@ -1049,6 +1295,10 @@ static void move_pv(struct estats *es, pvec *pv)
 #define STEP_UNITS 16
 bool tenants_step(struct estats *es, bool forced)
 {
+    if (tdead(es)) {
+        tenants_release(es);
+        return false;
+    }
     int64_t now = stats_mono_ns();
     size_t units = 0, nq = 0;
     for (pvec *q = es->qhead; q; q = q->qnext)
@@ -1196,7 +1446,21 @@ void tenants_fill(struct estats *es, uint32_t no, uint64_t v[17], uint32_t *flag
     *flags = 0;
     *stale_s = 0;
     int64_t hour = hot_now_ms() / 3600000;
+    /* The numbers lag a list the handle set while the engine has not applied it yet (its sweeper does at its next
+     * tick): they are those of the old list. A failed tenant side (tenants_fail) is PARTIAL for good. The listed
+     * parts not yet counted are checked here, from the count alone. */
+    eng *db = es->db;
+    pthread_mutex_lock(&db->tl_mu);
+    const tlist *want = db->tl;
+    pthread_mutex_unlock(&db->tl_mu);
+    pthread_mutex_lock(&db->lock);
+    uint64_t listed = db->nparts;
+    pthread_mutex_unlock(&db->lock);
+    if (tdead(es))
+        *flags |= TSDB_TENANT_PARTIAL;
     pthread_mutex_lock(&es->mu);
+    if (want != es->applied || listed != es->nrec)
+        *flags |= TSDB_TENANT_PARTIAL;
     if (no < es->ttn) {
         const ttot *t = &es->tt[no];
         v[0] = t->series;
@@ -1219,8 +1483,6 @@ void tenants_fill(struct estats *es, uint32_t no, uint64_t v[17], uint32_t *flag
         if (t->partial)
             *flags |= TSDB_TENANT_PARTIAL;
     }
-    if (es->moving)
-        *flags |= TSDB_TENANT_PARTIAL;
     if (es->oldest_stale_ns) {
         int64_t age = stats_mono_ns() - es->oldest_stale_ns;
         *stale_s = age > 0 ? (uint64_t)age / 1000000000u : 0;

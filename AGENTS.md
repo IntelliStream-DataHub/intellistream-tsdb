@@ -415,8 +415,14 @@ cgroup, so `nice` does not keep your work out of its way.
   file (`test_stats`: `bytes == sum of tsdb_foreach_part`). **Tenant totals are the sum of the partition vectors**
   (`src/stats_tenant.c`): a total changes only together with the vector it comes from, under `es->mu`, so it cannot
   drift or go negative; a merge or a delete marks its partition stale and the recount replaces the vector whole; a
-  list change moves only the series whose tenant changed. Per-tenant numbers are never put on the metrics port (no
-  login there; design-stats.md section 10).
+  list change moves only the series whose tenant changed, and never costs more than counting the partition again
+  (`move_pv` compares the two). **The tenant side never fails the engine**: an allocation that fails there calls
+  `tenants_fail` (no `abort`), the tenant numbers of that volume stop and read PARTIAL until a reopen, and every entry
+  point returns at once while `tdead` is set. `tsdb_set_tenants` and a volume's catch-up with its listing
+  (`volume_open`, `volume_reopen`) take `set_mu` (below `create_lock` and `layout_lock`, above the `tsdb` rwlock), so a
+  list is never freed while another call pushes it and no volume misses a list set while it was being listed. A
+  tenant read is PARTIAL while the engine's applied list (`es->applied`) is not the handle's. Per-tenant numbers are
+  never put on the metrics port (no login there; design-stats.md section 10).
 - **The latest table** (`src/ltab.c`, `docs/design-latest.md`). Per series it holds the newest non-null row in the
   parts, or a bound on it (unknown); it is read and written only under `latest_rw` (`lt->rw`), and every write section
   bumps the volume's `lgen`. Writers: publishers (in the write section that lists their parts, after `parts_commit`,

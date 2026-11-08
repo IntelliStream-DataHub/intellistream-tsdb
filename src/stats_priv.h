@@ -157,6 +157,11 @@ struct move { /* a series whose tenant a list change changed */
     uint16_t from, to;
 };
 
+struct mgroup { /* moves[first .. first + n) all go from one tenant to one other */
+    size_t first, n;
+    uint16_t from, to;
+};
+
 #define RING_N 4096
 struct estats {
     eng *db;
@@ -184,6 +189,7 @@ struct estats {
     /* tenants (stats_tenant.c). The sweeper alone changes tl, tp, pht and the scratch; the tenant totals (tt) and the
      * HyperLogLogs change under mu so that readers see whole parts. */
     tlist *tl;
+    const tlist *applied; /* the engine's list (db->tl) this volume has applied, compared by address only (mu) */
     uint32_t tl_gen; /* bumped at each list the sweeper applies */
     tpage *tp;
     size_t ntp;
@@ -211,6 +217,16 @@ struct estats {
     struct move *moves; /* series that changed tenant, sorted by (from, to, id), until every partition has moved */
     size_t nmoves;
     size_t mv_cursor;
+    /* The moves cut into groups of one (from, to) and made once per change, not once per partition: the ids and
+     * their value widths in `moves` order, and where each group starts. NULL when they could not be allocated: the
+     * partitions are then counted again instead of moved. */
+    uint32_t *mids;
+    uint8_t *mwid;
+    struct mgroup *mgr;
+    size_t nmgr;
+    /* An allocation of the tenant side failed (tenants_fail): the tenant numbers of this volume are frozen and every
+     * read says PARTIAL until the volume is opened again. The rest of the statistics go on; nothing fails. */
+    atomic_bool tdead;
 };
 
 int64_t stats_mono_ns(void);
@@ -234,6 +250,7 @@ void process_events(struct estats *es, stat_ev *batch, size_t n);
 bool partition_cut(struct estats *es, int64_t key, part ***ps, size_t *np);
 
 /* stats_tenant.c */
+void tenants_fail(struct estats *es); /* out of memory: the tenant side of this volume stops (see tdead) */
 void tenants_init(struct estats *es);
 void tenants_free(struct estats *es);
 void tenants_extend(struct estats *es, uint32_t nseries); /* assigns tenants to the ids below nseries */

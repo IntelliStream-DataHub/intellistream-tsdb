@@ -558,7 +558,17 @@ Where the code differs from the text above:
 - **No A0** (a pending sum of level-0 parts): a part's split is added to the partition's vector at once; the recount
   after a merge or a delete replaces the vector wholesale.
 - **A list change** keeps (from, to, id) triples of the moved series in memory until every partition has moved (8
-  bytes a moved series).
+  bytes a moved series, and 5 more for the ids and widths cut into groups once per change). Per partition the move
+  finds the moved ids in each part by the cheapest of a merge pass, a search per id or a search of the ids per run,
+  and is replaced by a recount of the partition when its probes would cost more than reading its indexes (so a change
+  costs one walk of the index at most; the old move cost parts x moved series). Only the tenants a change touches
+  are PARTIAL while it runs; right after `tsdb_set_tenants`, until the engine applies the list at its next tick,
+  every answer is PARTIAL (the numbers are those of the old list).
+- **The tenant side never fails the engine.** An allocation that fails there (the moved series, a map page, a
+  partition vector) stops that volume's tenant totals (`tenants_fail`: they read PARTIAL, the vectors are freed, a
+  reopen counts again); there is no runtime rebuild. `tsdb_set_tenants` and a volume's catch-up with its listing run
+  under `set_mu`.
+- **Step 5 builds** the "list unchanged for 30 s before it is applied" rule: it is tsdbd's, the engine applies at once.
 - **Not built**: the per-series EXACT_ROWS flag (`tsdb_series_stats` flags 2 stays invalid), the wire flag for
   approximate ingest (the ring overflow is counted in `stats_ring_overflows`; the struct has only PARTIAL), and
   reading USERS beside the database in the CLI (`stats tenants` takes the prefixes as arguments and `--tenants FILE`).

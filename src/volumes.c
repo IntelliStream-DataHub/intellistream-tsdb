@@ -104,6 +104,12 @@ struct tsdb {
     tlist *tl;                   /* the tenant list (stats_priv.h), NULL with stats = -1; under tl_mu */
     uint32_t tlgen;              /* one more at every tsdb_set_tenants */
     pthread_mutex_t tl_mu;       /* a leaf */
+    /* Serializes every change of the list with its push to the engines: tsdb_set_tenants (swap and push), and a
+     * volume's catch-up with its listing (volume_open, volume_reopen). Below create_lock and layout_lock, above the
+     * tsdb rwlock (taken inside) and tl_mu. Without it a second set frees the list the first still reads, two pushes
+     * land in reverse order, and a volume opened meanwhile never gets the list set between its catch-up and its
+     * listing. */
+    pthread_mutex_t set_mu;
     /* The names being created now: a creation holds its name from the probe of every volume to its append, so
      * two creators of one name take turns and those of different names do not wait for each other's disks. */
     pthread_mutex_t name_mu;
@@ -812,6 +818,7 @@ static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad
     tlist_unref(hold);
     if (rc != 0)
         return rc;
+    pthread_mutex_lock(&t->set_mu); /* from the catch-up to the listing: a set in between would miss this volume */
     tenants_catch_up(t, e, tlgen);
     char *p = strdup(path);
     rc = p ? 0 : TSDB_ERR_NOMEM;
@@ -830,6 +837,7 @@ static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad
         rc = TSDB_ERR_INVALID; /* callers open in line order: never */
     }
     pthread_rwlock_unlock(&t->lock);
+    pthread_mutex_unlock(&t->set_mu);
     if (!listed) { /* another thread listed it first, or we failed */
         eng_close(e);
         free(p);
@@ -920,6 +928,7 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
     if (t->opt.follow)
         t->opt.read_only = 1;
     pthread_mutex_init(&t->tl_mu, NULL);
+    pthread_mutex_init(&t->set_mu, NULL);
     t->tlgen = 1;
     if (t->opt.stats >= 0 && tlist_make(t->opt.tenants, t->opt.ntenants, &t->tl) != 0)
         t->tl = NULL; /* more prefixes than a process can number: none are used */
@@ -1026,6 +1035,7 @@ int tsdb_close(tsdb *t)
     qreg_close(t->reg);   /* threads that still hold a block keep the registry alive until they exit */
     tlist_unref(t->tl);
     pthread_mutex_destroy(&t->tl_mu);
+    pthread_mutex_destroy(&t->set_mu);
     free(t->vols);
     free(t->paths);
     free(t->meta_bad_path);
@@ -1795,16 +1805,14 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
         rc = reval_dicts(old, path, &rep->series_repaired, &rep->states_repaired);
     eng *e = NULL;
     reval_check chk = {.x = exp, .nx = nexp};
+    uint32_t tlgen = 0;
     if (rc == 0) /* the parts are compared inside the open, before the new engine's merge threads start */
     {
         tsdb_options o;
         tlist *hold;
-        uint32_t tlgen;
         opts_with_tenants(t, &o, &hold, &tlgen);
         rc = eng_reopen(old, path, &o, t->sched, &e, reval_check_open, &chk);
         tlist_unref(hold);
-        if (rc == 0)
-            tenants_catch_up(t, e, tlgen);
     }
     free(path);
     if (rc) {
@@ -1821,6 +1829,8 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     if (rep->diverged) /* refused until an operator accepts the loss (tsdb_volume_resume) */
         atomic_store_explicit(&e->quiesced, true, memory_order_release);
     eng_adopt_names(e, old); /* before anyone can see e: its own copies of the names go, the handed-out ones stay */
+    pthread_mutex_lock(&t->set_mu); /* from the catch-up to the swap: a list set in between would miss e */
+    tenants_catch_up(t, e, tlgen);
     pthread_rwlock_wrlock(&t->lock);
     e->wait_fn = t->wait_fn; /* before anyone can write to it */
     e->wait_ctx = t->wait_ctx;
@@ -1828,6 +1838,7 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     e->test_precommit_arg = t->test_precommit_arg;
     t->vols[vol] = e;
     pthread_rwlock_unlock(&t->lock);
+    pthread_mutex_unlock(&t->set_mu);
     /* A name or type lookup (route_meta) takes its reference on a quiesced engine, and may have done so after the
      * check at the top: nothing new can reach the old engine now, so wait for those to give theirs back (eng_unref
      * wakes us: it is quiesced) before eng_retire frees it. */
@@ -3070,6 +3081,8 @@ int tsdb_set_tenants(tsdb *t, const char *const *prefixes, size_t n)
     int rc = tlist_make(prefixes, n, &nl);
     if (rc)
         return rc;
+    /* Swap and push under set_mu: another set cannot free nl while it is read here, nor push its list first. */
+    pthread_mutex_lock(&t->set_mu);
     pthread_mutex_lock(&t->tl_mu);
     tlist *old = t->tl;
     t->tl = nl;
@@ -3079,6 +3092,7 @@ int tsdb_set_tenants(tsdb *t, const char *const *prefixes, size_t n)
     for (size_t i = 0; i < t->nvols; i++)
         eng_set_tenants(t->vols[i], (const char *const *)nl->s, nl->n);
     pthread_rwlock_unlock(&t->lock);
+    pthread_mutex_unlock(&t->set_mu);
     tlist_unref(old);
     return 0;
 }
@@ -3130,9 +3144,6 @@ int tsdb_tenant_stats_get(tsdb *t, const char *prefix, uint32_t volume, tsdb_ten
             uint32_t fl;
             if ((rc = eng_tenant_fill(t->vols[v], no, x, &fl, &stale)) != 0)
                 break;
-            tsdb_volume_stats vs;
-            if (eng_get_volume_stats(t->vols[v], &vs) == 0 && vs.stats_parts_counted != vs.stats_parts_listed)
-                fl |= TSDB_TENANT_PARTIAL; /* a part is not walked yet */
             for (int i = 0; i < 17; i++)
                 sum[i] += x[i];
             out->flags |= fl;
