@@ -256,6 +256,34 @@ int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index);
  * Parts keep their old headers until merges rewrite them (docs/compatibility.md). */
 int tsdb_upgrade(const char *dir);
 
+/* ---- the change feed's disk side (docs/design-cdc.md 2.13) ----
+ * Off by default, a persistent property of the database: with it on, the WAL segments a flush, an open or a close
+ * no longer needs are kept (fwal_<seq>.log) for 24 hours and 64 GiB per volume (the defaults), and `feed` is in
+ * every volume's META requires=, so a release without the feed refuses to open it. Zero fields are the defaults.
+ * Enable and disable work on the open writer (the CLI opens one: it fails with TSDB_ERR_LOCKED beside tsdbd), take
+ * the VOLUMES lock for the whole call and go root first; a crash in between is finished by the next open (a
+ * volume follows the root). Refused (TSDB_ERR_INVALID) with wal_sync_ms = -1 and on a read-only handle.
+ * tsdb_feed_new_id gives every volume a new feed_id and raises its numbers by 2^40: run it after a restore. */
+typedef struct tsdb_feed_options {
+    uint32_t retention_s;   /* 0: 86400 */
+    uint64_t max_bytes;     /* per volume, 0: 64 GiB */
+    uint32_t min_free_pct;  /* below it the oldest segments go whatever their age, 0: 10 */
+} tsdb_feed_options;
+typedef struct tsdb_feed_info {
+    int on;                 /* this volume has the feed on */
+    uint64_t feed_id;
+    uint32_t retention_s;
+    uint32_t min_free_pct;
+    uint64_t max_bytes;
+    uint64_t floor_event;   /* every event up to it has been removed */
+    uint64_t retained_segments;
+    uint64_t retained_bytes;
+} tsdb_feed_info;
+int tsdb_feed_enable(tsdb *t, const tsdb_feed_options *opts);
+int tsdb_feed_disable(tsdb *t);
+int tsdb_feed_new_id(tsdb *t);
+int tsdb_feed_info_get(tsdb *t, uint32_t volume, tsdb_feed_info *out);
+
 /* ---- writing ----
  * (series, ts) is a unique key, as in ReplacingMergeTree read with FINAL:
  * writing an existing (series, ts) replaces its value, the last write wins

@@ -427,15 +427,12 @@ static int meta_load_or_create(eng *db, bool read_only)
                         version, TSDB_VERSION, FORMAT_VERSION);
             return TSDB_ERR_CORRUPT;
         }
-        if ((line = strstr(buf, "requires="))) {
+        {
             /* a feature this binary does not know changes what the files mean (markers to apply, links to keep):
-             * the open refuses and names it. None is known in this release. */
+             * the open refuses and names it. Known: "feed" (the change feed, feed.h). */
             char feat[96];
-            size_t k = 0;
-            for (const char *c = line + 9; *c && *c != '\n' && k < sizeof feat - 1; c++)
-                feat[k++] = *c;
-            feat[k] = '\0';
-            if (k) {
+            meta_requires_parse(buf, &db->feed_req, feat, sizeof feat);
+            if (feat[0]) {
                 fprintf(stderr,
                         "tsdb: META requires the feature(s) \"%s\", which tsdb %s does not know: the open "
                         "refuses (use a release that does)\n", feat, TSDB_VERSION);
@@ -662,7 +659,8 @@ static int load_parts(eng *db, bool read_only)
         /* Only names the engine writes: a volume may be a directory with the user's own files in it
          * (tsdb_volume_add_dir), and their tmp_notes.txt or retired_old.csv is not ours to delete. */
         if (part_tmp_name(name) || meta_tmp_name(name) || strcmp(name, FNO_FILE ".tmp") == 0 ||
-            strcmp(name, "MANIFEST.tmp") == 0) { /* an interrupted fno_create or `tsdb upgrade` */
+            strcmp(name, "MANIFEST.tmp") == 0 || strcmp(name, FEED_FILE ".tmp") == 0 ||
+            strcmp(name, FEEDSLOTS_FILE ".tmp") == 0) { /* an interrupted fno_create, `tsdb upgrade` or feed file */
             if (!read_only)
                 unlinkat(db->dirfd, name, 0);
             continue;
@@ -804,6 +802,8 @@ int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, e
 int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **out)
 {
     *out = NULL;
+    feed_opts feed_wanted; /* taken before any failure point: see eng_take_open_feed_want */
+    int feed_want = eng_take_open_feed_want(&feed_wanted);
     simd_init();
     eng *db = calloc(1, sizeof *db);
     if (!db)
@@ -851,6 +851,9 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->fail_lock, NULL);
     pthread_mutex_init(&db->fno_lock, NULL);
     pthread_mutex_init(&db->dir_sync_lock, NULL);
+    pthread_mutex_init(&db->feed_lock, NULL);
+    pthread_cond_init(&db->feed_cv, NULL);
+    db->fs_fd = -1;
     pthread_cond_init(&db->wal_cv, NULL);
     pthread_cond_init(&db->merge_cv, NULL);
     pthread_cond_init(&db->merged_cv, NULL);
@@ -884,6 +887,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         }
     }
     if ((rc = meta_load_or_create(db, ro)) != 0)
+        goto fail;
+    if ((rc = feed_open_reconcile(db, feed_want, &feed_wanted)) != 0)
         goto fail;
     if ((rc = series_open(&db->series, db->dirfd, "SERIES", ro, db->opt.fsync)) != 0 ||
         (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0 ||
@@ -932,7 +937,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     }
     if (!ro) {
         db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
-        db->wal_removed = db->wal_removed_synced = db->wal_seq - 1; /* and unlinked them, with a directory fsync */
+        /* and unlinked them, with a directory fsync: all but the ones a failed unlink or rename left (wal_open) */
+        db->wal_removed = db->wal_removed_synced = db->wal_open_removed;
         if ((rc = manifest_publish(db)) != 0)
             goto fail;
         v8_parts_account(db, true);
@@ -963,6 +969,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     }
     if (!ro && tsdb_thread_create(&db->flusher, flusher_main, db) == 0)
         db->has_flusher = true;
+    if (!ro && atomic_load(&db->feed_on) && (rc = feed_cleaner_start(db)) != 0)
+        goto fail;
     atomic_store(&db->follow_ok_ms, eng_mono_ms());
     if (db->opt.follow && tsdb_thread_create(&db->follower, follower_main, db) == 0)
         db->has_follower = true;
@@ -995,6 +1003,7 @@ void eng_halt(eng *db)
         pthread_join(db->follower, NULL);
         db->has_follower = false;
     }
+    feed_cleaner_stop(db);
     latest_stop(db);
     pthread_mutex_lock(&db->lock);
     atomic_store(&db->stop, true);
@@ -1083,6 +1092,7 @@ int eng_close(eng *db)
         pthread_mutex_unlock(&db->buf_lock);
         pthread_join(db->follower, NULL);
     }
+    feed_cleaner_stop(db); /* before the final flush and wal_close: it unlinks and syncs the directory */
     /* a retired engine writes nothing: its replacement owns the directory */
     if (!db->opt.read_only && db->active && !db->retiring)
         rc = eng_flush(db);
@@ -1126,6 +1136,8 @@ int eng_close(eng *db)
     }
     if (db->fno_fd >= 0)
         close(db->fno_fd);
+    fslots_close(db);
+    feed_index_free(db);
     if (db->lockfd >= 0)
         close(db->lockfd);
     if (db->dirfd >= 0)
@@ -1141,6 +1153,8 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->fail_lock);
     pthread_mutex_destroy(&db->fno_lock);
     pthread_mutex_destroy(&db->dir_sync_lock);
+    pthread_mutex_destroy(&db->feed_lock);
+    pthread_cond_destroy(&db->feed_cv);
     pthread_cond_destroy(&db->wal_cv);
     pthread_cond_destroy(&db->merge_cv);
     pthread_cond_destroy(&db->merged_cv);

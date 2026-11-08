@@ -1006,17 +1006,43 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     return rc;
 }
 
-/* Unlinks the WAL segments up to seq, now in parts, and moves wal_removed on over those that are gone. One whose
- * unlink fails (an I/O error, say) stays, and so does every later one, to be tried again at the next flush:
- * wal_removed must not pass a segment that a reopen would replay (its empty parts and the switches' bound in
- * classes.c rely on it). Called with flush_lock held. */
-static void wal_unlink_upto(eng *db, uint64_t seq)
+int (*eng_test_retire_fail)(const char *name); /* test hook: errno to fail the unlink or rename of a segment, or 0 */
+
+/* Moves segment s out of the engine's way: unlinked, or with the feed on renamed to fwal_<s> (the feed keeps it;
+ * the engine looks only for wal_ names, so for it the segment is gone either way). A rename never replaces: a
+ * name taken is a reused number or files put there by hand, and fails loudly like any failed unlink. ENOENT is the
+ * caller's (already gone). */
+static int wal_retire_name(eng *db, uint64_t s, bool feed, const fseg *info)
+{
+    char name[64], fname[64];
+    wal_name(name, sizeof name, s);
+    if (eng_test_retire_fail && (errno = eng_test_retire_fail(name)) != 0)
+        return -1; /* planted failure (tests/test_feedstore.c) */
+    if (!feed)
+        return unlinkat(db->dirfd, name, 0);
+    fwal_name(fname, sizeof fname, s);
+    if (tsdb_rename_noreplace(db->dirfd, name, fname) != 0) {
+        if (errno == EEXIST)
+            fprintf(stderr, "tsdb: %s: %s exists already: a number of the log was used twice, or a file was put "
+                            "there by hand; %s stays\n", db->dir, fname, name);
+        return -1;
+    }
+    feed_index_add(db, s, info);
+    return 0;
+}
+
+/* Unlinks (with the feed on: renames to fwal_) the WAL segments up to seq, now in parts, and moves wal_removed on over
+ * those that are gone. One whose unlink fails (an I/O error, say) stays, and so does every later one, to be tried
+ * again at the next flush: wal_removed must not pass a segment that a reopen would replay (its empty parts and the
+ * switches' bound in classes.c rely on it). Called with flush_lock held. */
+static void wal_unlink_upto(eng *db, uint64_t seq, const fseg *info)
 {
     if (db->wal_enabled) {
+        bool feed = atomic_load(&db->feed_on); /* changed only under flush_lock */
         for (uint64_t s = db->wal_unlink_next ? db->wal_unlink_next : seq; s <= seq; s++) {
-            char name[64];
-            wal_name(name, sizeof name, s);
-            if (unlinkat(db->dirfd, name, 0) != 0 && errno != ENOENT) {
+            if (wal_retire_name(db, s, feed, s == seq ? info : NULL) != 0 && errno != ENOENT) {
+                char name[64];
+                wal_name(name, sizeof name, s);
                 if (db->wal_unlink_next != s)
                     fprintf(stderr, "tsdb: removing %s failed (%s): it stays until a later flush removes it\n", name,
                             strerror(errno));
@@ -1029,6 +1055,8 @@ static void wal_unlink_upto(eng *db, uint64_t seq)
     pthread_mutex_lock(&db->lock);
     db->wal_removed = MAX(db->wal_removed, seq);
     pthread_mutex_unlock(&db->lock);
+    if (atomic_load(&db->feed_on))
+        feed_cleaner_wake(db);
 }
 
 /* Writes every memtable waiting to be flushed, oldest first; one whose write
@@ -1080,7 +1108,7 @@ static int flush_waiting(eng *db)
         if (mrc == 0) /* the numbers of the segment stay used after it is gone (fno.c) */
             mrc = fno_require(db, m->fno_end);
         if (mrc == 0)
-            wal_unlink_upto(db, m->wal_seq); /* else MANIFEST may still name it: a follower would tail it */
+            wal_unlink_upto(db, m->wal_seq, NULL); /* else MANIFEST may still name it: a follower would tail it */
         if (mrc == 0)
             mrc = cls_flush_guard(db, m); /* a series of a long class that got fast moves on now */
         mt_unref(m);
@@ -1419,6 +1447,7 @@ static int wal_open_numbers(eng *db, const seg *segs, size_t nseg)
     db->fno_gen = gen;
     atomic_store(&db->fno_durable, fno);
     db->fno_next = MAX(next, fno);
+    db->fno_torn_open = torn;
     if (torn) {
         /* A tear (a store the power loss cut) and damage at rest (rot, a misdirected write) look alike, and damage
          * may have hit the newest slot, whose segments are unlinked already: the number it held is lost, and the
@@ -1452,11 +1481,34 @@ static int wal_open_numbers(eng *db, const seg *segs, size_t nseg)
     return 0;
 }
 
+/* A replayed segment about to be retained: cut at its last valid record when torn, then fdatasynced. */
+static int wal_seal_replayed(eng *db, const char *name, size_t valid, size_t len)
+{
+    int fd = openat(db->dirfd, name, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "tsdb: %s: cannot open %s to seal it: %s\n", db->dir, name, strerror(errno));
+        return TSDB_ERR_IO;
+    }
+    int rc = 0;
+    if (valid < len && ftruncate(fd, (off_t)valid) != 0) {
+        fprintf(stderr, "tsdb: %s: cutting the torn tail of %s failed: %s\n", db->dir, name, strerror(errno));
+        rc = TSDB_ERR_IO;
+    }
+    if (rc == 0 && db->opt.fsync && eng_test_mutant != MUT_FEED_NOSEAL && /* planted: the rename without the sync */
+        tsdb_fdatasync(fd) != 0) {
+        fprintf(stderr, "tsdb: %s: fdatasync of %s failed: %s\n", db->dir, name, strerror(errno));
+        rc = TSDB_ERR_IO;
+    }
+    close(fd);
+    return rc;
+}
+
 int wal_open(eng *db, int (*before_replay)(eng *))
 {
     bool ro = db->opt.read_only;
     seg *segs = NULL;
     size_t nseg = 0, cap = 0;
+    uint64_t max_fwal = 0;
     DIR *d = fdopendir(dup(db->dirfd));
     if (!d)
         return TSDB_ERR_IO;
@@ -1465,6 +1517,8 @@ int wal_open(eng *db, int (*before_replay)(eng *))
     for (errno = 0; (e = readdir(d)); errno = 0) { /* NULL with errno set is a read error, not the end */
         uint64_t seq;
         int consumed = 0;
+        if (fwal_file_name(e->d_name) && sscanf(e->d_name, "fwal_%" SCNx64 ".log", &seq) == 1)
+            max_fwal = MAX(max_fwal, seq); /* retained for the feed: a new segment must never take its number */
         if (!wal_file_name(e->d_name) || sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &consumed) != 1 ||
             e->d_name[consumed])
             continue;
@@ -1492,7 +1546,7 @@ int wal_open(eng *db, int (*before_replay)(eng *))
     if (nseg)
         qsort(segs, nseg, sizeof *segs, cmp_seg);
 
-    uint64_t max_seq = 0;
+    uint64_t max_seq = max_fwal;
     for (size_t i = 0; i < db->nparts; i++)
         max_seq = MAX(max_seq, db->parts[i]->wal_seq);
     if (nseg)
@@ -1506,6 +1560,8 @@ int wal_open(eng *db, int (*before_replay)(eng *))
 
     int rc = 0;
     uint64_t parts_seq = 0;
+    bool stuck = false;
+    db->wal_open_removed = db->wal_seq - 1;
     for (size_t i = 0; i < db->nparts; i++)
         parts_seq = MAX(parts_seq, db->parts[i]->wal_seq);
     for (size_t k = 0; !ro && k < nseg && rc == 0; k++)
@@ -1514,6 +1570,8 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         rc = wal_check_order(segs, nseg, parts_seq);
     if (rc == 0 && !ro)
         rc = wal_open_numbers(db, segs, nseg);
+    if (rc == 0 && !ro)
+        rc = feed_open_numbers(db); /* enable or renew FEED before the first FNO store (and so before the replay) */
     if (rc == 0 && before_replay)
         rc = before_replay(db);
     for (size_t k = 0; k < nseg && rc == 0; k++) {
@@ -1605,11 +1663,27 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         }
         if (!ro)
             mt_unref(m);
-        /* the numbers of the segment stay used once it is gone, markers included: FNO holds them first */
-        if (rc == 0 && !ro && segs[k].fno_end)
-            rc = fno_require(db, segs[k].fno_end);
-        if (rc == 0 && !ro)
-            unlinkat(db->dirfd, segs[k].name, 0);
+        if (rc == 0 && !ro) {
+            /* With the feed on a segment with records is kept, as fwal_: cut at its last valid record and synced first
+             * (a torn tail or page-cache bytes of a killed process must not become a "sealed" segment that a power
+             * loss cuts); one without a record is unlinked. */
+            bool keep = atomic_load(&db->feed_on) && pos > 0;
+            if (keep) /* also after a rename that failed: the next flush renames this one too, as it is */
+                rc = wal_seal_replayed(db, segs[k].name, pos, len);
+            /* the numbers of the segment stay used once it is gone, markers included: FNO holds them first */
+            if (rc == 0 && segs[k].fno_end)
+                rc = fno_require(db, segs[k].fno_end);
+            /* A segment that cannot be unlinked or renamed stays, and so does every later one (the retained set stays
+             * contiguous): wal_removed must not pass it, or an empty merge output could go and the next open replay
+             * the segment, deleted rows with it. The next flush tries again (wal_unlink_upto). */
+            if (rc == 0 && !stuck && wal_retire_name(db, segs[k].seq, keep, NULL) != 0 && errno != ENOENT) {
+                fprintf(stderr, "tsdb: %s: removing %s at the open failed (%s): it stays until a later flush removes "
+                                "it\n", db->dir, segs[k].name, strerror(errno));
+                stuck = true;
+                db->wal_unlink_next = segs[k].seq;
+                db->wal_open_removed = segs[k].seq - 1;
+            }
+        }
     }
     free(segs);
     if (rc == 0 && !ro && db->opt.fsync && tsdb_fsync(db->dirfd) != 0)
@@ -1630,7 +1704,12 @@ void wal_close(eng *db)
             if (fno_require(db, db->fno_next) == 0) {
                 char name[64];
                 wal_name(name, sizeof name, db->wal_seq);
-                unlinkat(db->dirfd, name, 0);
+                /* With the feed on a segment that holds any record, a marker alone included (it adds no rows), is
+                 * kept as fwal_; only one nothing was ever written to goes. With the feed off: as it was. */
+                if (atomic_load(&db->feed_on) && db->wal_off != 0) /* bytes in the file: a pending buffer is not written */
+                    wal_retire_name(db, db->wal_seq, true, NULL);
+                else
+                    unlinkat(db->dirfd, name, 0);
             }
         }
     }

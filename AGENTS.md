@@ -290,6 +290,19 @@ cgroup, so `nice` does not keep your work out of its way.
   across two; the limit; `requires=`; mutations: numbers restarting from parts, the bound from MANIFEST, a segment
   unlinked before `FNO` holds its end, a marker replayed as rows). The jepsen rot nemesis leaves `FNO` alone: no
   workload there sees a number handed out twice.
+- **Retained segments** (change feed, `docs/design-cdc.md` 2.2, 2.6, 2.13; `src/feed.h`). With a feed on (a `FEED` file and
+  `requires=feed` in META; both are made by `tsdb DIR feed enable` or `tsdb_feed_enable`, root volume first, FEEDSLOTS between)
+  a WAL segment the engine is done with is renamed `fwal_<seq>.log` (flush, open, close) instead of unlinked; with it off
+  every byte is as before. The order that keeps this safe: at open a replayed segment gets the two-read check, the cut of its
+  torn tail, an `fdatasync`, then `fno_require`, then the rename (a `fwal_` is whole or does not exist); a failed unlink or
+  rename at open stops there and holds `wal_removed` behind it; `wal_close` never unlinks a segment that was written to (a
+  marker is not a row); a new segment's seq counts `fwal_` names (`wal_open`), or a rename could overwrite one (it is
+  `RENAME_NOREPLACE` where the file system allows). The cleaner (one thread per engine, `src/feedclean.c`) makes its floor
+  durable in `FEEDSLOTS` (scratch half, `fdatasync`, picked by `gen`) before any unlink, never removes the newest segment, and
+  takes `feed_lock` only for the index; its `eng_sync_dir` runs after that lock is released. An open brings each volume to the
+  root's state (`feed_open_reconcile`); disable removes FEED first. The renewal of `feed_id` (torn FNO at open, `feed new-id`)
+  writes the new FEED before FNO is raised. Tests: `tests/test_feedstore.c`, `tests/test_cli_feed.sh`, `jepsen --feed`
+  with `tests/jepsen/feedcheck.c`.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
   only into partitions without a part from that segment.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never

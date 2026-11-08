@@ -50,6 +50,15 @@ disk format and the wire protocol.
 
 ### Added
 
+- **Change feed, step F1: the disk side** (docs/design-cdc.md). Off by default; with it off nothing changes on disk or in
+  timing. `tsdb DIR feed enable [--retention AGE] [--max-bytes N] [--min-free-pct N]`, `feed disable`, `feed info` and `feed
+  new-id` (and `tsdb_feed_enable`, `tsdb_feed_disable`, `tsdb_feed_new_id`, `tsdb_feed_info_get` in `tsdb.h`) turn it on and
+  off, refused beside a running writer; a half-finished enable or disable is finished at the next open, the root volume
+  deciding for all. Every volume then has `FEED` and `FEEDSLOTS` and `requires=feed` in META (a binary without the feed
+  refuses it), and WAL segments the engine no longer needs are kept as `fwal_<seq>.log`; a cleaner thread removes them
+  after 24 h or beyond 64 GiB per volume (the oldest first, never the newest), or at once when the disk has less than 10%
+  free. Nothing reads the retained segments yet (F2). `jepsen --feed` runs the kv workload with it on.
+
 - **Marker payloads and the namespace-event hook** (docs/design-ha-modes.md 2.1): `COMMIT`, `DROP`, `RETENTION` and
   `EPOCH` have one encoder and one decoder (`src/marker.c`, fuzzed), the type numbers of the feed's and the cluster's
   other markers are reserved, and the engine calls a no-op `jr_intent` / `jr_commit` hook where names and files
@@ -90,6 +99,9 @@ Hardening from the 0.9.1 security review (the minor findings). No format or prot
   are unchanged. The price: appends during a flush touch the lazily mapped array's pages under `buf_lock`, so the
   append p50 goes from 2 to 4-5 us and its p99 (cache on) from 7-10 to 16-38 us. No change to the flush's ordering,
   the WAL or what a reader sees.
+- A WAL segment whose unlink failed while the database was opened was still counted as removed: an empty merge output
+  could then be dropped and the next open replayed the segment, bringing deleted rows back. The open now stops at the
+  first segment it could not remove.
 - **tsdbd: a slow reader needs a minimum rate, not any movement.** The send timeout (`--send-timeout`) used to be
   reset by any change of the socket's queue, so a client taking a few bytes whenever its small window opened held a
   worker and up to 18 MB of buffers for as long as it liked. A window of `--send-timeout` seconds must now see
