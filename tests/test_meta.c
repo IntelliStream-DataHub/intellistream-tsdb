@@ -1016,7 +1016,10 @@ static void ml_clone_durable(struct mlog *dst, const struct mlog *src, size_t ke
     for (size_t i = 0; i < dst->n; i++)
         free(dst->e[i].data);
     free(dst->e);
-    *dst = (struct mlog){.base = src->base, .base_term = src->base_term};
+    /* payloads dropped earlier stay in dst's grave (the core may still name them until release()): resetting the
+     * struct would leak them and the grave itself (LeakSanitizer, has1-asan2) */
+    *dst = (struct mlog){.base = src->base, .base_term = src->base_term,
+                         .grave = dst->grave, .ngrave = dst->ngrave, .gravecap = dst->gravecap};
     size_t n = src->durable > src->base ? src->durable - src->base : 0;
     if (n > src->n)
         n = src->n;
