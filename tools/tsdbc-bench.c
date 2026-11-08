@@ -5,6 +5,7 @@
  *   tsdbc-bench verify FILE.rowbinary     the server holds exactly the rows of FILE (count, sum, every timestamp and value)
  *   tsdbc-bench optimize                  flush and merge, as tsdb-bench does after its load
  *   tsdbc-bench query [--series 100] [--points 1000000] [--conns 1] [--seconds 3] [--multi K [--multi-one]]
+ *   tsdbc-bench latest [--series 100] [--ids 4096] [--conns 1] [--seconds 3] [--sorted] [--flush] [--with-nulls] [--dataset]
  *   tsdbc-bench connections --conns 5000 [--seconds 5]
  *
  * load sends a RowBinary file (u32 series, i64 ts, f32 value per row), split
@@ -14,6 +15,8 @@
  * range. --multi K sends K windows per QUERY_MULTI request; 0 is one request per window as always, 1 the plain op
  * that QUERY_MULTI wraps (QUERY_VALUES for raw rows), and --multi-one with K = 1 QUERY_MULTI of one series (its
  * overhead over the plain op).
+ * latest sends QUERY_LATEST requests of --ids random ids on --conns connections and reports p50, p99 and max of
+ * a request, with a connection writing and flushing every series in a loop under --flush (see run_latest).
  * connections holds --conns connections open at once (from up to 64 threads)
  * and keeps sending small aggregate queries through all of them.
  * --user U --password-file F logs every connection in (a tsdbd without --no-auth); the keys are derived once per
@@ -379,6 +382,219 @@ static int run_queries(const cb_class *k)
     return 0;
 }
 
+/* ---------------------------------------------------------- latest */
+
+/* QUERY_LATEST (design-latest.md 9): --conns connections each send requests of --ids random ids (--sorted: in
+ * ascending order) for --seconds, timing every request. Series "lb.<i>", i < --series, are created and given a row
+ * first (--dataset: the series of a load instead, as the query benchmarks use). --flush adds one more connection that
+ * writes a row to every series and flushes, again and again, while the lookups run (steady flushes: the lookups'
+ * p99 under a publish). --with-nulls forces the slow path. */
+static int lat_ids = 4096, lat_sorted, lat_dataset, lat_flush, lat_with_nulls;
+static tsdb_sid *lat_sids;
+static atomic_int lat_run;
+
+enum { LAT_MAX = 1 << 21, LAT_CHUNK = 100000 };
+
+typedef struct ljob {
+    int seed;
+    double *us;
+    uint64_t n, ids, errors;
+} ljob;
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int cmp_dbl(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void *lat_querier(void *arg)
+{
+    ljob *j = arg;
+    tsdbc *c;
+    int rc = tsdbc_connect(host, port, &c);
+    if (rc)
+        die("connect", rc);
+    uint64_t r = cb_seed(j->seed) | 1;
+    tsdb_sid *q = malloc((size_t)lat_ids * sizeof *q);
+    uint64_t *ix = malloc((size_t)lat_ids * sizeof *ix);
+    tsdb_latest_result *out = malloc((size_t)lat_ids * sizeof *out);
+    tsdb_latest_opts op = {.end = TSDB_TS_MAX, .with_nulls = lat_with_nulls, .threads = 1};
+    j->us = malloc(LAT_MAX * sizeof *j->us);
+    while (atomic_load(&lat_run)) {
+        for (int i = 0; i < lat_ids; i++) {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            ix[i] = r % nseries;
+        }
+        if (lat_sorted)
+            qsort(ix, (size_t)lat_ids, sizeof *ix, cmp_u64);
+        for (int i = 0; i < lat_ids; i++)
+            q[i] = lat_sids[ix[i]];
+        double t0 = now_s();
+        rc = tsdbc_latest(c, q, (size_t)lat_ids, &op, out);
+        double dt = now_s() - t0;
+        if (rc) {
+            j->errors++;
+            continue;
+        }
+        for (int i = 0; i < lat_ids; i++)
+            if (out[i].status)
+                j->errors++;
+        if (j->n < LAT_MAX)
+            j->us[j->n] = dt * 1e6;
+        j->n++;
+        j->ids += (uint64_t)lat_ids;
+    }
+    tsdbc_close(c);
+    free(q);
+    free(ix);
+    free(out);
+    return NULL;
+}
+
+typedef struct fjob {
+    uint64_t rounds;
+    double *ms;
+} fjob;
+
+/* one row for every series per round, at a time that grows, then a flush */
+static void *lat_flusher(void *arg)
+{
+    fjob *f = arg;
+    tsdbc *c;
+    int rc = tsdbc_connect(host, port, &c);
+    if (rc)
+        die("connect", rc);
+    tsdb_sid *s = malloc(LAT_CHUNK * sizeof *s);
+    int64_t *t = malloc(LAT_CHUNK * 8);
+    float *v = malloc(LAT_CHUNK * 4);
+    f->ms = malloc(4096 * sizeof *f->ms);
+    while (atomic_load(&lat_run) && f->rounds < 4096) {
+        double t0 = now_s();
+        for (uint32_t off = 0; off < nseries; off += LAT_CHUNK) {
+            uint32_t m = nseries - off < LAT_CHUNK ? nseries - off : LAT_CHUNK;
+            for (uint32_t k = 0; k < m; k++) {
+                s[k] = lat_sids[off + k];
+                t[k] = 1700000000000LL + (int64_t)(f->rounds + 1) * 1000;
+                v[k] = (float)(f->rounds + k);
+            }
+            if ((rc = tsdbc_insert(c, s, t, v, m)) != 0)
+                die("insert", rc);
+        }
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush", rc);
+        f->ms[f->rounds++] = (now_s() - t0) * 1e3;
+    }
+    tsdbc_close(c);
+    free(s);
+    free(t);
+    free(v);
+    return NULL;
+}
+
+static int run_latest(void)
+{
+    tsdbc *c;
+    int rc = tsdbc_connect(host, port, &c);
+    if (rc)
+        die("connect", rc);
+    if (lat_dataset) {
+        resolve_ids(c, nseries, 0);
+        lat_sids = sids;
+    } else {
+        lat_sids = malloc(nseries * sizeof *lat_sids);
+        tsdb_sid *s = malloc(LAT_CHUNK * sizeof *s);
+        int64_t *t = malloc(LAT_CHUNK * 8);
+        float *v = malloc(LAT_CHUNK * 4);
+        for (uint32_t i = 0; i < nseries; i++) {
+            char name[64];
+            snprintf(name, sizeof name, "lb.%u", i);
+            if ((rc = tsdbc_series(c, name, 1, &lat_sids[i])) != 0)
+                die(name, rc);
+        }
+        for (uint32_t off = 0; off < nseries; off += LAT_CHUNK) {
+            uint32_t m = nseries - off < LAT_CHUNK ? nseries - off : LAT_CHUNK;
+            for (uint32_t k = 0; k < m; k++) {
+                s[k] = lat_sids[off + k];
+                t[k] = 1700000000000LL;
+                v[k] = (float)k;
+            }
+            if ((rc = tsdbc_insert(c, s, t, v, m)) != 0)
+                die("insert", rc);
+        }
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush", rc);
+        free(s);
+        free(t);
+        free(v);
+    }
+    tsdbc_close(c);
+    pthread_t th[256], ft;
+    ljob jobs[256];
+    fjob fj = {0, NULL};
+    atomic_store(&lat_run, 1);
+    double cpu0 = cb_cpu_s();
+    for (int i = 0; i < conns; i++) {
+        jobs[i] = (ljob){i, NULL, 0, 0, 0};
+        pthread_create(&th[i], NULL, lat_querier, &jobs[i]);
+    }
+    if (lat_flush)
+        pthread_create(&ft, NULL, lat_flusher, &fj);
+    double t0 = now_s();
+    while (now_s() - t0 < seconds)
+        usleep(10000);
+    atomic_store(&lat_run, 0);
+    uint64_t nq = 0, nids = 0, errors = 0, kept = 0;
+    for (int i = 0; i < conns; i++) {
+        pthread_join(th[i], NULL);
+        nq += jobs[i].n;
+        nids += jobs[i].ids;
+        errors += jobs[i].errors;
+        kept += jobs[i].n < LAT_MAX ? jobs[i].n : LAT_MAX;
+    }
+    if (lat_flush)
+        pthread_join(ft, NULL);
+    double secs = now_s() - t0;
+    double *all = malloc((kept ? kept : 1) * sizeof *all);
+    size_t k = 0;
+    for (int i = 0; i < conns; i++) {
+        uint64_t m = jobs[i].n < LAT_MAX ? jobs[i].n : LAT_MAX;
+        memcpy(all + k, jobs[i].us, m * sizeof *all);
+        k += m;
+    }
+    qsort(all, k, sizeof *all, cmp_dbl);
+    double p50 = k ? all[k / 2] : 0, p99 = k ? all[(size_t)((double)k * 0.99)] : 0, mx = k ? all[k - 1] : 0;
+    printf("  latest %u series, %d ids per request%s, %d conns%s%s: %.0f requests/s %.2f M ids/s, p50 %.0f us, p99 %.0f us, "
+           "max %.0f us, %" PRIu64 " errors\n",
+           nseries, lat_ids, lat_sorted ? " sorted" : "", conns, lat_flush ? ", flushing" : "",
+           lat_with_nulls ? ", with nulls" : "", (double)nq / secs, (double)nids / secs / 1e6, p50, p99, mx, errors);
+    double fmean = 0, fmax = 0;
+    if (lat_flush && fj.rounds) {
+        qsort(fj.ms, fj.rounds, sizeof *fj.ms, cmp_dbl);
+        for (uint64_t i = 0; i < fj.rounds; i++)
+            fmean += fj.ms[i];
+        fmean /= (double)fj.rounds;
+        fmax = fj.ms[fj.rounds - 1];
+        printf("  %" PRIu64 " write+flush rounds of %u series: mean %.1f ms, median %.1f ms, max %.1f ms\n", fj.rounds,
+               nseries, fmean, fj.ms[fj.rounds / 2], fmax);
+    }
+    printf("RESULT kind=latest client=c series=%u ids=%d conns=%d sorted=%d flush=%d nulls=%d requests=%" PRIu64
+           " idcount=%" PRIu64 " secs=%.4f p50_us=%.1f p99_us=%.1f max_us=%.1f errors=%" PRIu64 " rounds=%" PRIu64
+           " flush_mean_ms=%.1f cpu=%.4f\n",
+           nseries, lat_ids, conns, lat_sorted, lat_flush, lat_with_nulls, nq, nids, secs, p50, p99, mx, errors,
+           fj.rounds, fmean, cb_cpu_s() - cpu0);
+    fflush(stdout);
+    free(all);
+    return errors ? 1 : 0;
+}
+
 /* ---------------------------------------------------------- connections */
 
 typedef struct cjob {
@@ -463,6 +679,9 @@ int main(int argc, char **argv)
                                    {"series", required_argument, 0, 's'}, {"points", required_argument, 0, 'n'},
                                    {"seconds", required_argument, 0, 't'}, {"compression", required_argument, 0, 'z'},
                                    {"multi", required_argument, 0, 'm'}, {"multi-one", no_argument, 0, 'o'},
+                                   {"ids", required_argument, 0, 'i'}, {"sorted", no_argument, 0, 'S'},
+                                   {"flush", no_argument, 0, 'F'}, {"with-nulls", no_argument, 0, 'N'},
+                                   {"dataset", no_argument, 0, 'D'},
                                    {"user", required_argument, 0, 'u'},  {"password-file", required_argument, 0, 'w'},
                                    {0, 0, 0, 0}};
     int ch;
@@ -478,6 +697,11 @@ int main(int argc, char **argv)
         case 'z': compression = atoi(optarg); break;
         case 'm': multi_k = atoi(optarg); break;
         case 'o': multi_one = 1; break;
+        case 'i': lat_ids = atoi(optarg); break;
+        case 'S': lat_sorted = 1; break;
+        case 'F': lat_flush = 1; break;
+        case 'N': lat_with_nulls = 1; break;
+        case 'D': lat_dataset = 1; break;
         case 'u': login.user = optarg; break;
         case 'w': login.password_file = optarg; break;
         default: return 2;
@@ -487,10 +711,12 @@ int main(int argc, char **argv)
         resolve_query_ids();
         return connections();
     }
-    if (conns < 1 || conns > 256 || optind >= argc || multi_k < 0 || multi_k > 65536) {
+    if (conns < 1 || conns > 256 || optind >= argc || multi_k < 0 || multi_k > 65536 ||
+        lat_ids < 1 || lat_ids > (1 << 20)) {
         fprintf(stderr, "usage: tsdbc-bench load FILE [--conns N] [--batch ROWS] [--compression LEVEL]\n"
                         "       tsdbc-bench verify FILE | optimize\n"
                         "       tsdbc-bench query [--series N] [--points N] [--conns N] [--seconds S] [--multi K [--multi-one]]\n"
+                        "       tsdbc-bench latest [--series N] [--ids N] [--conns N] [--seconds S] [--sorted] [--flush] [--with-nulls] [--dataset]\n"
                         "       tsdbc-bench connections --conns N [--seconds S]\n"
                         "       [--host H] [--port P] [--user U --password-file F]\n");
         return 2;
@@ -501,6 +727,8 @@ int main(int argc, char **argv)
         return verify(argv[optind + 1]);
     if (strcmp(argv[optind], "optimize") == 0)
         return optimize();
+    if (strcmp(argv[optind], "latest") == 0)
+        return run_latest();
     if (strcmp(argv[optind], "query") == 0) {
         resolve_query_ids();
         int bad = 0;

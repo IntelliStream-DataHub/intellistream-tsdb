@@ -210,6 +210,10 @@ def wave2_script(lang, rng, model, scale=1.0):
         times = sorted(model.rows[name])
         legacy = name.endswith(".f32leg")
         correct(rng, sc, name, ty, times, nulls=not legacy, legacy=legacy)
+        if not legacy:
+            # a null over the newest row, after the first flush: the latest table, which knows that row, must stop
+            # answering it (the random corrections hit the newest row of a series too rarely to test this)
+            sc.batch(name, ty, rng.choice(LEVELS), rand_flags(rng, legacy), [(times[-1], "N")])
     new = lang + ".late"
     sc.series(new, "float64")
     sc.batch(new, "float64", 1, "sync", [(t, value_token(rng, "float64", t)) for t in sparse_times(0.2)])
@@ -275,6 +279,12 @@ def queries_for(name, ty, rows, quick=False):
         "bnd %s %d %d asc 0 %s" % (name, a, b, ",".join(map(str, bounds))),
         "bnd %s %d %d asc 0 %d" % (name, lo, e, lo),
     ]
+    # QUERY_LATEST (latest NAME START END WITH_NULLS how): the newest row before END (START is not used), by name
+    # (latest_by_name) or by id; the first one of a series is the one the tenant checks of run.py pick
+    for end, nulls, how in ((I64_MAX, 0, "name"), (I64_MAX, 0, "id"), (I64_MAX, 1, "name"), (I64_MAX, 1, "id"),
+                            (a, 0, "name"), (a, 1, "id"), (b + 1, 0, "id"), (b + 1, 1, "name"), (lo, 0, "name"),
+                            (lo + 1, 1, "name"), (hi, 0, "id"), (hi, 1, "id"), (hi + 1, 1, "name")):
+        q.append("latest %s %d %d %d %s" % (name, I64_MIN, end, nulls, how))
     return q
 
 
@@ -300,6 +310,9 @@ def expect_one(q, model):
         return ["!!"]
     ty, rows = model.types[name], model.rows[name]
     start, end = int(q[2]), int(q[3])
+    if kind == "latest":  # the newest row before end: a null only with WITH_NULLS (q[4]), else the newest non-null
+        best = [(t, v) for t, v in rows.items() if t < end and (q[4] == "1" or v != "N")]
+        return ["%d\t%s" % max(best)] if best else []
     sel = sorted((t, v) for t, v in rows.items() if start <= t < end)
     if kind in ("raw", "f32raw"):
         order, limit = q[4], int(q[5])

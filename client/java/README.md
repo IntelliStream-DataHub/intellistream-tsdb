@@ -236,7 +236,7 @@ refuses these calls.
 
 Series ids are 64-bit numbers in a `long`, handed out by the database: the volume in the high half, so every id is
 at least 2^32 and positive. Look them up by name and keep them in a `long`, never an `int`; do not count on them
-being 0, 1, 2 and so on. The client speaks protocol 13 (a server of 12 works too) and
+being 0, 1, 2 and so on. The client speaks protocol 14 (a server of 12 works too) and
 `TsdbClient.connect` fails with `Status.ERR_INVALID` ("upgrade the server") when the server answers a version below 12.
 
 A series has a name and a value type. `series` gets a series of 32-bit floats, and creates it if it is missing.
@@ -413,6 +413,21 @@ end, cap the threads the request uses (`threads(n)`) and the rows or buckets of 
 (`maxRows(n)`). `get()` throws the series' error. A list longer than 65,536 series is split into several
 requests for you. `queryValuesMulti` with a `MultiValuesConsumer` streams raw rows as they arrive; a consumer that
 returns `false` stops the request on the server too. `EmbeddedDb` (client/java-embedded) has the same methods.
+
+## The newest value of many series
+
+`latest(long...)` and `latest(long[] ids, LatestOptions o)` (protocol 14) return the newest row of every series in one
+request, in the order of the ids; `latestByName(String[] names, LatestOptions o)` takes names (ids are cached per
+connection). Each element is a `SeriesResult<Latest>`; `get()` throws `NOTFOUND` or `DENIED` for that series (a
+denied series and a missing one look alike to a user without `read` on it). `Latest` has `kind()` (`VALUE`, `NULL`
+with `LatestOptions.defaults().withNulls()`, or `NONE`), `ts()` and the value. `end(t)` and `ends(long[])` ask as of a
+time. `EmbeddedDb` has the same methods.
+
+```java
+List<SeriesResult<Latest>> r = client.latestByName(new String[] {"pump0.flow", "pump1.flow"}, LatestOptions.defaults());
+Latest first = r.get(0).get();
+System.out.println(first.kind() + " " + first.ts());
+```
 
 ## Errors
 

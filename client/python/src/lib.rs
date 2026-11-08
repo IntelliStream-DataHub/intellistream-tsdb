@@ -33,6 +33,7 @@ use tc::{Column, ColumnRef, ValueType, Values};
 
 mod arrays;
 mod embedded;
+mod latest;
 mod multi;
 mod pool;
 
@@ -2184,6 +2185,84 @@ impl Client {
         self.with(py, |c| c.revoke(name, &sel, r))
     }
 
+    /// The newest row of many series in one request (tsdbd protocol 14).
+    ///
+    /// The server answers a series from an in-memory table of each series' newest value, so the cost does
+    /// not grow with the history; lists of more than 65,536 series go as several frames.
+    ///
+    /// Args:
+    ///     series: Series ids: a list of ints, or a uint64 or int64 array.
+    ///     end: Only rows before this timestamp (ms): one for every series, or a list or int64 array with
+    ///         one per series; None for no bound.
+    ///     with_nulls: Answer the newest row even when it is a null (then r[i] is (ts, None)); slower.
+    ///     threads: Threads the request uses at most; 0 for the server's --request-threads.
+    ///     errors: "raise" raises TsdbError (with .index and .result, the LatestMany) for the first series
+    ///         that was NOTFOUND or DENIED (a denied series looks like a missing one); "status" returns the
+    ///         LatestMany, whose .status tells which failed.
+    ///     numpy: As for query_values().
+    ///
+    /// Returns:
+    ///     LatestMany: r[i] is (ts, value), (ts, None) for a null, or None for a series without a row.
+    ///     r.ts, r.kind and r.status are columns; r.values a list.
+    ///
+    /// Raises:
+    ///     TsdbError: A series failed (errors="raise"), or the whole request failed (a server below
+    ///         protocol 14 answers INVALID).
+    #[pyo3(signature = (series, end = None, *, with_nulls = false, threads = 0, errors = "raise", numpy = None))]
+    fn latest(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        end: Option<&Bound<'_, PyAny>>,
+        with_nulls: bool,
+        threads: u16,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<latest::LatestMany>> {
+        let q = latest::LatestReq::new(series, false, end, with_nulls, threads, errors, numpy)?;
+        let a = self.with(py, |c| q.run_client(c))?;
+        q.finish(py, a)
+    }
+
+    /// As latest(), by name: the newest row of many series, asked by name (tsdbd protocol 14).
+    ///
+    /// The server answers a series from an in-memory table of each series' newest value, so the cost does
+    /// not grow with the history; lists of more than 65,536 series go as several frames.
+    ///
+    /// Args:
+    ///     names: Series names: a list of str. A name is looked up once per connection.
+    ///     end: Only rows before this timestamp (ms): one for every series, or a list or int64 array with
+    ///         one per series; None for no bound.
+    ///     with_nulls: Answer the newest row even when it is a null (then r[i] is (ts, None)); slower.
+    ///     threads: Threads the request uses at most; 0 for the server's --request-threads.
+    ///     errors: "raise" raises TsdbError (with .index and .result, the LatestMany) for the first series
+    ///         that was NOTFOUND or DENIED (a denied series looks like a missing one); "status" returns the
+    ///         LatestMany, whose .status tells which failed.
+    ///     numpy: As for query_values().
+    ///
+    /// Returns:
+    ///     LatestMany: r[i] is (ts, value), (ts, None) for a null, or None for a series without a row.
+    ///     r.ts, r.kind and r.status are columns; r.values a list.
+    ///
+    /// Raises:
+    ///     TsdbError: A series failed (errors="raise"), or the whole request failed (a server below
+    ///         protocol 14 answers INVALID).
+    #[pyo3(signature = (names, end = None, *, with_nulls = false, threads = 0, errors = "raise", numpy = None))]
+    fn latest_by_name(
+        &self,
+        py: Python<'_>,
+        names: &Bound<'_, PyAny>,
+        end: Option<&Bound<'_, PyAny>>,
+        with_nulls: bool,
+        threads: u16,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<latest::LatestMany>> {
+        let q = latest::LatestReq::new(names, true, end, with_nulls, threads, errors, numpy)?;
+        let a = self.with(py, |c| q.run_client(c))?;
+        q.finish(py, a)
+    }
+
     /// Returns what the server did for this connection's previous query (a QueryStats).
     ///
     /// Rows covered, decompressed or answered from block statistics, bytes
@@ -2467,6 +2546,7 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Buckets>()?;
     m.add_class::<arrays::BucketsMany>()?;
     m.add_class::<multi::Many>()?;
+    m.add_class::<latest::LatestMany>()?;
     m.add_class::<arrays::TwaBucket>()?;
     m.add_class::<TwaBuckets>()?;
     // they are sequences, as the lists they replace were

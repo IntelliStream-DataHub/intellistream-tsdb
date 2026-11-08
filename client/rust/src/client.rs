@@ -37,6 +37,7 @@ use crate::types::{
 };
 use crate::value::{Bitmap, Column, ColumnRef, Native, Value, ValueType};
 
+mod latest;
 mod multi;
 
 /// Rows per INSERT frame: 8M rows of the many-series layout make 128 MiB,
@@ -135,6 +136,8 @@ pub struct Client {
     node_at: usize,
     /// The login, for the reconnects.
     opts: ConnectOptions,
+    /// Names `latest_by_name` has resolved: an id never changes meaning, so an entry is never stale.
+    names: std::collections::HashMap<String, SeriesId>,
 }
 
 /// A request kept for a resend.
@@ -472,6 +475,7 @@ impl Client {
             nodes: Vec::new(),
             node_at: 0,
             opts: ConnectOptions::default(),
+            names: std::collections::HashMap::new(),
         })
     }
 
@@ -708,14 +712,29 @@ impl Client {
     }
 
     fn series_req(&mut self, name: &str, create: bool, path: Option<&str>) -> Result<SeriesId> {
+        self.wait_inner()?;
+        self.series_send(name, create, path)?;
+        self.series_recv()
+    }
+
+    /// Sends a SERIES request without reading its reply (the caller has called `wait_inner`; replies are read in
+    /// order by `series_recv`, which `latest_by_name` uses to look many names up together).
+    fn series_send(&mut self, name: &str, create: bool, path: Option<&str>) -> Result<()> {
         let name = wire_str("series name", name, false)?;
         let path = path.map(|p| wire_str("path", p, true)).transpose()?;
-        self.request(Op::Series, |f| {
-            f.u8(create as u8).u16(name.len() as u16).bytes(name);
-            if let Some(p) = path {
-                f.u16(p.len() as u16).bytes(p);
-            }
-        })?;
+        self.req.begin(self.next_id, Op::Series).u8(create as u8).u16(name.len() as u16).bytes(name);
+        if let Some(p) = path {
+            self.req.u16(p.len() as u16).bytes(p);
+        }
+        self.send()
+    }
+
+    /// Reads the reply of the oldest SERIES request not yet read.
+    fn series_recv(&mut self) -> Result<SeriesId> {
+        let st = self.read_frame()?;
+        self.reply_id = self.reply_id.wrapping_add(1);
+        self.trim();
+        status_result(st)?;
         let mut r = Cursor::new(&self.body);
         let id = r.u64()?;
         end(&r)?;

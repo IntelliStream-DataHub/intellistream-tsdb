@@ -294,7 +294,7 @@ class LayoutTest {
      */
     @Test
     void aLibraryOfAnotherAbiVersionIsRefused() {
-        assertEquals(6, Native.ABI_VERSION);
+        assertEquals(7, Native.ABI_VERSION);
         assertEquals(Native.ABI_VERSION, Native.LIBRARY_ABI_VERSION, "the loaded library's tsdb_abi_version()");
         for (int other : new int[] {Native.ABI_VERSION - 1, Native.ABI_VERSION + 1}) {
             UnsatisfiedLinkError e = assertThrows(UnsatisfiedLinkError.class,

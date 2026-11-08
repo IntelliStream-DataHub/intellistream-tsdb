@@ -294,6 +294,20 @@ int tsdbc_query_multi_collect(tsdbc *c, const tsdb_multi_query *q, const tsdb_si
                               const tsdb_multi_opts *mo, tsdb_series_result **out);
 void tsdbc_series_results_free(tsdb_series_result *r, size_t n);
 
+/* The newest value of each series, as tsdb_latest (tsdb.h; out[i] for ids[i], n up to 1 << 20, opts NULL: no bound,
+ * the newest non-null value). Needs a server that speaks protocol 14: against an older one the call fails with
+ * TSDB_ERR_INVALID and sends nothing. A series the user may not read answers status TSDB_ERR_DENIED whether or not it
+ * exists; one that does not exist (for a user with `read` on all) TSDB_ERR_NOTFOUND (kind NONE, type 0). A read-only
+ * request: UNAVAILABLE and MOVED before the first reply frame are retried as for other reads. */
+int tsdbc_latest(tsdbc *c, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *opts, tsdb_latest_result *out);
+/* The same by name. A name is resolved once per connection (tsdbc_series without create) and its id kept, since an id
+ * never changes meaning; the names not known yet are looked up together (up to 256 requests out before their replies
+ * are read), not one round trip each. A name that does not resolve answers NOTFOUND or DENIED in its own out[i]; an
+ * empty, NULL or over-long (above 65,535 bytes) name answers TSDB_ERR_INVALID in its record. As in tsdb_latest,
+ * opts->ends replaces opts->end: end is not looked at when ends is set. */
+int tsdbc_latest_by_name(tsdbc *c, const char *const *names, size_t n, const tsdb_latest_opts *opts,
+                         tsdb_latest_result *out);
+
 int tsdbc_commit(tsdbc *c);
 int tsdbc_flush(tsdbc *c);
 int tsdbc_optimize(tsdbc *c);

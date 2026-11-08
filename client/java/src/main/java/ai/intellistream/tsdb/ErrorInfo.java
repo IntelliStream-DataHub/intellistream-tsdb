@@ -190,6 +190,7 @@ public final class ErrorInfo {
         case Protocol.OP_QUERY_VALUES:
         case Protocol.OP_QUERY_LTTB:
         case Protocol.OP_QUERY_MULTI: return 8;
+        case Protocol.OP_QUERY_LATEST: return Protocol.LATEST_PREFIX;
         default: return 0;
         }
     }

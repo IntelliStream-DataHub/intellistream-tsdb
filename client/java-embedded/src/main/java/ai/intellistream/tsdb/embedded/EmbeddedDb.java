@@ -4,6 +4,8 @@ import ai.intellistream.tsdb.Bucket;
 import ai.intellistream.tsdb.Buckets;
 import ai.intellistream.tsdb.Column;
 import ai.intellistream.tsdb.Group;
+import ai.intellistream.tsdb.Latest;
+import ai.intellistream.tsdb.LatestOptions;
 import ai.intellistream.tsdb.MultiOptions;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.Points;
@@ -2036,6 +2038,128 @@ public final class EmbeddedDb implements AutoCloseable {
         stream(s, series, start, end, order, limit, LTTB, threshold);
         int n = s.fill;
         return new ValuePoints(Arrays.copyOf(s.ts, n), s.column(n, true));
+    }
+
+    // ------------------------------------------------------------------------------------------------- latest
+
+    /**
+     * The newest row of each series, in one call of {@code tsdb_latest}: as {@link TsdbClient#latest(long[],
+     * LatestOptions)}, in this process. An id that names no series fails in its own entry
+     * ({@link Status#ERR_NOTFOUND}).
+     *
+     * @param ids series ids, up to 1,048,576
+     * @param o the bound, nulls and threads
+     * @return one result per id, in order
+     * @throws TsdbException the call failed
+     */
+    public List<SeriesResult<Latest>> latest(long[] ids, LatestOptions o) throws TsdbException {
+        Objects.requireNonNull(ids, "ids");
+        Objects.requireNonNull(o, "options");
+        int n = ids.length;
+        if (n > (1 << 20))
+            throw new IllegalArgumentException(n + " series (at most " + (1 << 20) + ")");
+        if (o.ends() != null && o.ends().length != n)
+            throw new IllegalArgumentException(o.ends().length + " ends for " + n + " series");
+        if (n == 0)
+            return List.of();
+        MemorySegment d = enter();
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment op = a.allocate(Native.LATEST_OPTS).fill((byte) 0);
+            op.set(JAVA_LONG, Native.offset(Native.LATEST_OPTS, "end"), o.end());
+            op.set(PTR, Native.offset(Native.LATEST_OPTS, "ends"), longs(a, o.ends()));
+            op.set(JAVA_INT, Native.offset(Native.LATEST_OPTS, "with_nulls"), o.withNulls() ? 1 : 0);
+            op.set(JAVA_INT, Native.offset(Native.LATEST_OPTS, "threads"), o.threads());
+            long rec = Native.LATEST.byteSize();
+            MemorySegment out = a.allocate(n * rec, 8).fill((byte) 0);
+            int rc;
+            try {
+                rc = (int) Native.LATEST_CALL.invokeExact(d, a.allocateFrom(JAVA_LONG, ids), (long) n, op, out);
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+            check(rc, "latest");
+            List<SeriesResult<Latest>> list = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) {
+                MemorySegment one = out.asSlice(i * rec, rec);
+                int st = one.get(JAVA_INT, Native.offset(Native.LATEST, "status"));
+                if (st != 0) {
+                    list.add(SeriesResult.failed(st, null));
+                    continue;
+                }
+                Latest l = Latest.of(one.get(JAVA_BYTE, Native.offset(Native.LATEST, "kind")) & 0xff,
+                        one.get(JAVA_BYTE, Native.offset(Native.LATEST, "type")) & 0xff,
+                        one.get(JAVA_LONG, Native.offset(Native.LATEST, "ts")),
+                        one.get(JAVA_LONG, Native.offset(Native.LATEST, "v")));
+                if (l == null)
+                    throw new TsdbException(Status.ERR_CORRUPT, "tsdb_latest answered a record out of shape", null);
+                list.add(SeriesResult.of(l));
+            }
+            return list;
+        } finally {
+            exit();
+        }
+    }
+
+    /**
+     * {@link #latest(long[], LatestOptions)} with no bound.
+     *
+     * @param ids series ids
+     * @return one result per id, in order
+     * @throws TsdbException as {@link #latest(long[], LatestOptions)}
+     */
+    public List<SeriesResult<Latest>> latest(long... ids) throws TsdbException {
+        return latest(ids, LatestOptions.defaults());
+    }
+
+    /**
+     * {@link #latest(long[], LatestOptions)} by name: a name that names no series fails in its own entry
+     * ({@link Status#ERR_NOTFOUND}), an empty one with {@link Status#ERR_INVALID}.
+     *
+     * @param names series names
+     * @param o the bound, nulls and threads
+     * @return one result per name, in order
+     * @throws TsdbException as {@link #latest(long[], LatestOptions)}
+     */
+    public List<SeriesResult<Latest>> latestByName(String[] names, LatestOptions o) throws TsdbException {
+        Objects.requireNonNull(names, "names");
+        Objects.requireNonNull(o, "options");
+        int n = names.length;
+        if (o.ends() != null && o.ends().length != n)
+            throw new IllegalArgumentException(o.ends().length + " ends for " + n + " series");
+        if (n == 0)
+            return List.of();
+        List<SeriesResult<Latest>> res = new ArrayList<>(Collections.nCopies(n, null));
+        long[] ids = new long[n];
+        int[] at = new int[n];
+        int k = 0;
+        for (int i = 0; i < n; i++) {
+            String name = Objects.requireNonNull(names[i], "name");
+            if (name.isEmpty()) {
+                res.set(i, SeriesResult.failed(Status.ERR_INVALID, "empty series name"));
+                continue;
+            }
+            try {
+                ids[k] = series(name, false);
+                at[k++] = i;
+            } catch (TsdbException e) {
+                if (e.status() != Status.ERR_NOTFOUND && e.status() != Status.ERR_INVALID)
+                    throw e;
+                res.set(i, SeriesResult.failed(e.status(), name));
+            }
+        }
+        if (k > 0) {
+            LatestOptions q = o;
+            if (o.ends() != null) {
+                long[] e = new long[k];
+                for (int j = 0; j < k; j++)
+                    e[j] = o.ends()[at[j]];
+                q = o.ends(e);
+            }
+            List<SeriesResult<Latest>> got = latest(Arrays.copyOf(ids, k), q);
+            for (int j = 0; j < k; j++)
+                res.set(at[j], got.get(j));
+        }
+        return Collections.unmodifiableList(res);
     }
 
     // ------------------------------------------------------------------------------------------- many series

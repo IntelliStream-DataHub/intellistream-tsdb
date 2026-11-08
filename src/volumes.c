@@ -3111,6 +3111,18 @@ int tsdb_get_volume_stats(tsdb *t, uint32_t volume, tsdb_volume_stats *st)
     return rc;
 }
 
+int tsdb_get_latest_stats(tsdb *t, uint32_t volume, tsdb_latest_stats *st)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    int rc = TSDB_ERR_INVALID;
+    if (volume < t->nvols) {
+        latest_info(t->vols[volume], st);
+        rc = 0;
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
+
 int tsdb_stats_settle(tsdb *t, int timeout_ms)
 {
     pthread_rwlock_rdlock(&t->lock);

@@ -1040,6 +1040,43 @@ static int cmd_seeds(const char *dir)
     SEED("delete-range-id64", TSDB_OP_DELETE_RANGE, (psid(&p, 0x100000000ull), p64(&p, 10000), p64(&p, 20000)));
     SEED("set-retention", TSDB_OP_SET_RETENTION, (psid(&p, 1), p64(&p, 86400000)));
     SEED("get-retention", TSDB_OP_GET_RETENTION, psid(&p, 1));
+    /* QUERY_LATEST (version 14): flags, 0, threads, n, end, [ends], ids; the forms, and the headers it refuses */
+    SEED("query-latest", TSDB_OP_QUERY_LATEST,
+         (p8(&p, 0), p8(&p, 0), p16(&p, 0), p32(&p, 3), p64(&p, INT64_MAX), psid(&p, 0), psid(&p, 1), psid(&p, 2)));
+    SEED("query-latest-nulls-end", TSDB_OP_QUERY_LATEST,
+         (p8(&p, TSDB_LATEST_WITH_NULLS), p8(&p, 0), p16(&p, 2), p32(&p, 4), p64(&p, 50000), psid(&p, 0), psid(&p, 3),
+          psid(&p, 77), psid(&p, 0x100000001ull)));
+    SEED("query-latest-per-end", TSDB_OP_QUERY_LATEST,
+         (p8(&p, TSDB_LATEST_PER_END | TSDB_LATEST_WITH_NULLS), p8(&p, 0), p16(&p, 0), p32(&p, 3), p64(&p, 0),
+          p64(&p, 10000), p64(&p, 0), p64(&p, INT64_MAX), psid(&p, 1), psid(&p, 2), psid(&p, 4)));
+    SEED("query-latest-per-end-with-end", TSDB_OP_QUERY_LATEST, /* end must be 0 with PER_END: INVALID */
+         (p8(&p, TSDB_LATEST_PER_END), p8(&p, 0), p16(&p, 0), p32(&p, 1), p64(&p, 5), p64(&p, 6), psid(&p, 1)));
+    SEED("query-latest-reserved-flag", TSDB_OP_QUERY_LATEST,
+         (p8(&p, 4), p8(&p, 0), p16(&p, 0), p32(&p, 1), p64(&p, INT64_MAX), psid(&p, 1)));
+    SEED("query-latest-reserved-byte", TSDB_OP_QUERY_LATEST,
+         (p8(&p, 0), p8(&p, 1), p16(&p, 0), p32(&p, 1), p64(&p, INT64_MAX), psid(&p, 1)));
+    SEED("query-latest-n0", TSDB_OP_QUERY_LATEST, (p8(&p, 0), p8(&p, 0), p16(&p, 0), p32(&p, 0), p64(&p, INT64_MAX)));
+    SEED("query-latest-n-big", TSDB_OP_QUERY_LATEST, /* more ids than the frame holds: INVALID, nothing allocated */
+         (p8(&p, 0), p8(&p, 0), p16(&p, 0), p32(&p, 0x7fffffff), p64(&p, INT64_MAX), psid(&p, 1)));
+    SEED("query-latest-n-over", TSDB_OP_QUERY_LATEST, /* 1 << 20 + 1 */
+         (p8(&p, 0), p8(&p, 0), p16(&p, 0), p32(&p, TSDB_LATEST_MAX_IDS + 1), p64(&p, INT64_MAX), psid(&p, 1)));
+    SEED("query-latest-short", TSDB_OP_QUERY_LATEST, (p8(&p, 0), p8(&p, 0), p16(&p, 0), p32(&p, 2), p64(&p, 0)));
+    /* more than a reply frame of records: 70,000 ids, most of them one series (two reply frames) */
+    SEED("query-latest-two-frames", TSDB_OP_QUERY_LATEST, ({
+             p8(&p, 0), p8(&p, 0), p16(&p, 0), p32(&p, 70000), p64(&p, INT64_MAX);
+             for (uint32_t i = 0; i < 70000; i++)
+                 psid(&p, i % 7 == 0 ? 77 : i % 3);
+         }));
+    /* a CANCEL of a QUERY_LATEST in flight (its id is the request's) */
+    f.len = p.len = 0;
+    p8(&p, 0), p8(&p, 0), p16(&p, 0), p32(&p, 70000), p64(&p, INT64_MAX);
+    for (uint32_t i = 0; i < 70000; i++)
+        psid(&p, i % 3);
+    frame(&f, TSDB_OP_QUERY_LATEST, &p);
+    p.len = 0;
+    p32(&p, 1);
+    frame(&f, TSDB_OP_CANCEL, &p);
+    seed_write(dir, "query-latest-cancel", &f);
     /* a pipeline: several requests in one input */
     f.len = 0;
     p.len = 0;

@@ -1256,6 +1256,30 @@ void latest_stop(eng *db)
     }
 }
 
+/* tsdb_get_latest_stats (monitoring): the counters, the unknown entries now, the pages' bytes and whether the budget
+ * capped the volume. Cheap: the unknown entries are counted from their bitmaps under a read hold. */
+bool latest_info(eng *db, tsdb_latest_stats *st)
+{
+    ltab *t = db->lt;
+    memset(st, 0, sizeof *st);
+    if (!t)
+        return false;
+    st->enabled = 1;
+    st->table = atomic_load(&t->st_table);
+    st->searched = atomic_load(&t->st_search);
+    st->floor_reads = atomic_load(&t->st_floor);
+    st->fills_stored = atomic_load(&t->st_fill_ok);
+    st->fills_refused = atomic_load(&t->st_fill_refused);
+    pthread_rwlock_rdlock(&t->rw);
+    for (uint32_t i = 0; i < t->npg; i++)
+        for (size_t w = 0; w < LT_PAGE / 64; w++)
+            st->unknown += (uint64_t)__builtin_popcountll(__atomic_load_n(&t->pg[i]->unk[w], __ATOMIC_RELAXED));
+    st->table_bytes = t->bytes;
+    st->capped = t->capped;
+    pthread_rwlock_unlock(&t->rw);
+    return true;
+}
+
 bool latest_stats(eng *db, uint64_t out[6])
 {
     ltab *t = db->lt;

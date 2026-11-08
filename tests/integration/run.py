@@ -9,7 +9,8 @@ Scenarios (each runs once per server backend, --io uring and --io epoll; on a ho
   matrix      Each client (C, Rust, Python, Java) writes its own set of series (every type, nulls, special floats,
               corrections, packed/plain/legacy and pipelined inserts); then every client reads every set back
               (raw both orders with limits, aggregates, buckets, calendar groups in UTC, Europe/Oslo,
-              America/New_York, Asia/Kolkata and, with midnight clock changes, America/Havana and Asia/Beirut, explicit bounds, errors). The four answers must be identical to
+              America/New_York, Asia/Kolkata and, with midnight clock changes, America/Havana and Asia/Beirut, explicit bounds, errors),
+              and QUERY_LATEST, the newest row before an end bound, with and without nulls, by name and by id). The four answers must be identical to
               each other, to an independent model (gen.py) and, after tsdbd stopped, to `tsdb <dir> query`.
               Repeated after flush and after optimize (merges).
   cli         `tsdb create/import` a CSV (ms and ISO times, nan/inf/-0, nulls, a second import correcting the first),
@@ -589,6 +590,10 @@ def cli_args(q):
     t = q.split(" ")
     kind, name, start, end = t[0], t[1], int(t[2]), int(t[3])
     tm = lambda x: "min" if x == I64_MIN else "max" if x == I64_MAX else str(x)  # noqa: E731
+    if kind == "latest":  # `tsdb DIR latest NAME [--with-nulls] [--end T]`; the by-id twins have no CLI form
+        if t[5] != "name":
+            return None
+        return ["latest", name] + (["--with-nulls"] if t[4] == "1" else []) + (["--end", str(end)] if end != I64_MAX else [])
     a = [name, tm(start), tm(end)]
     if kind == "raw":
         a += ["raw"] + (["--desc"] if t[4] == "desc" else []) + (["--limit", t[5]] if int(t[5]) else [])
@@ -613,6 +618,13 @@ def cli_expected(q, ty, lines):
     if lines == ["!!"]:
         return None
     out = []
+    if t[0] == "latest":  # NAME, time, value (\N for a null; \N twice for a series with no row)
+        if not lines:
+            return ["%s\t\\N\t\\N" % t[1]]
+        ts, tok = lines[0].split("\t")
+        v = "\\N" if tok == "N" else f9(int(tok, 16)) if ty == "float32" else f17(int(tok, 16)) if ty == "float64" \
+            else ("true" if tok == "1" else "false") if ty == "bool" else tok
+        return ["%s\t%s\t%s" % (t[1], fmt_time(int(ts)), v)]
     if t[0] == "raw":
         for ln in lines:
             ts, tok = ln.split("\t")
@@ -687,7 +699,8 @@ def cli_check(ctx, F, dbdir, model, queries, text, d):
 
     def one(item):
         q, lines, a = item
-        p = subprocess.run([str(ctx.tsdb), str(dbdir), "query"] + a, capture_output=True, timeout=120)
+        sub = ["latest"] + a[1:] if a[0] == "latest" else ["query"] + a
+        p = subprocess.run([str(ctx.tsdb), str(dbdir)] + sub, capture_output=True, timeout=120)
         return q, lines, a, p
 
     t0 = time.time()
@@ -698,9 +711,9 @@ def cli_check(ctx, F, dbdir, model, queries, text, d):
             ty = model.types[q.split(" ")[1]]
             want = cli_expected(q, ty, lines)
             got = p.stdout.decode("utf-8", "replace").split("\n")[:-1] if p.returncode == 0 else None
-            if got and q.split(" ")[0] != "raw":
+            if got and q.split(" ")[0] not in ("raw", "latest"):
                 got = [spread_checked(ln, ty) for ln in got]
-            if got and q.split(" ")[0] != "raw" and ty in ("float32", "float64"):
+            if got and q.split(" ")[0] not in ("raw", "latest") and ty in ("float32", "float64"):
                 got = [("\t".join(f[:2] + ["*"] + [x.replace("-0", "0") if x == "-0" else x for x in f[3:5]] + ["*"])
                         if len(f := ln.split("\t")) == 6 and f[1].isdigit() else ln) for ln in got]
                 want = [("\t".join(f[:2] + ["*"] + [x.replace("-0", "0") if x == "-0" else x for x in f[3:5]] + ["*"])

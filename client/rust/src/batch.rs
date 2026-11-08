@@ -445,6 +445,16 @@ impl Pool {
         self.one(|c| c.query_rows_multi(series, s..e, opts, m))
     }
 
+    /// [`Client::latest`] on one of the pool's connections (retried once on a new one if it breaks).
+    pub fn latest(&self, ids: &[SeriesId], opts: &crate::LatestOpts) -> Result<Vec<crate::Latest>> {
+        self.one(|c| c.latest(ids, opts))
+    }
+
+    /// [`Client::latest_by_name`] on one of the pool's connections.
+    pub fn latest_by_name(&self, names: &[&str], opts: &crate::LatestOpts) -> Result<Vec<crate::Latest>> {
+        self.one(|c| c.latest_by_name(names, opts))
+    }
+
     /// [`Client::query_lttb_multi`] on one of the pool's connections.
     pub fn query_lttb_multi(
         &self,

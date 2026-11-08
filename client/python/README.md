@@ -436,6 +436,23 @@ failed series raises `TsdbError`, with `err.index` (which series) and
 `err.result` (the whole answer); with `errors="status"` you get the answer
 and check `r.status` yourself.
 
+## The newest value of many series
+
+`latest(series, end=None, *, with_nulls=False)` gives the newest row of every series in one request (protocol 14;
+the server keeps a table for it, so 100,000 series answer in milliseconds). `latest_by_name(names, ...)` takes names
+and remembers their ids. Both exist on `Client`, `Pool` and `Db`.
+
+```python
+r = c.latest_by_name(["pump0.flow", "pump1.flow", "no.such.series"], errors="status")
+print(r[0])         # (ts_ms, value), the newest row that is not null
+print(r[2], r.status.tolist())   # None for a series with no row; status says NOTFOUND or DENIED
+```
+
+`r[i]` is `(ts, value)`, `(ts, None)` for a null row (only with `with_nulls=True`, which gives the newest row
+whether null or not), `None` when the series has no row (before `end`, which is exclusive), and raises
+`NotFoundError` or `DeniedError` for a missing or denied series; a user without `read` on a series cannot tell
+whether it exists. `r.ts`, `r.values` and `r.kind` are numpy arrays over all of them.
+
 ## Many queries at once
 
 Each call into the module costs a few microseconds of Python time, and

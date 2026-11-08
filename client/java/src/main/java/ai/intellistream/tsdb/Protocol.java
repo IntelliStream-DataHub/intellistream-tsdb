@@ -2,8 +2,8 @@ package ai.intellistream.tsdb;
 
 /** Constants of the wire protocol; the authoritative description is {@code include/tsdb_protocol.h}. */
 final class Protocol {
-    /* HELLO answers the lower of both versions; 12 (login) is the floor, 13 adds the HA bodies */
-    static final int VERSION = 13;
+    /* HELLO answers the lower of both versions; 12 (login) is the floor, 13 adds the HA bodies, 14 QUERY_LATEST */
+    static final int VERSION = 14;
     static final int MIN_VERSION = 12;     /* the oldest server the client connects to */
     static final int DEFAULT_PORT = 7070;
     static final int MAX_FRAME = 256 << 20;
@@ -29,6 +29,16 @@ final class Protocol {
     static final int MULTI_PER_INTERVAL = 4;
     static final int MULTI_TRIM_LO = 8;
     static final int MULTI_TRIM_HI = 16;
+
+    /* QUERY_LATEST (v14): u8 flags, u8 0, u16 threads, u32 n, i64 end, [i64 ends[n]], u64 ids[n]; the reply is frames of
+     * i32 status, u32 first, u32 m, u8 last, 3 zero bytes, then m records of 24 bytes */
+    static final int LATEST_HEADER = 16;
+    static final int LATEST_MAX_IDS = 1 << 20;
+    static final int LATEST_FRAME_IDS = 65536;
+    static final int LATEST_PREFIX = 12;
+    static final int LATEST_REC = 24;
+    static final int LATEST_WITH_NULLS = 1;
+    static final int LATEST_PER_END = 2;
 
     static final byte OP_REPLY = 0;
     static final byte OP_HELLO = 1;
@@ -67,6 +77,7 @@ final class Protocol {
     static final byte OP_GRANT = 36;
     static final byte OP_REVOKE = 37;
     static final byte OP_USER_LIST = 38;
+    static final byte OP_QUERY_LATEST = 39;   /* version 14: the newest value of each of many series */
     static final byte OP_TOPOLOGY = 48;       /* version 13: the nodes and volumes of the server */
     static final byte OP_STATUS = 49;         /* version 13: key=value lines, a superuser */
 

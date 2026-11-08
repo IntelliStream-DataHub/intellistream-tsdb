@@ -16,7 +16,7 @@ use ::tsdb_client as tc;
 use tc::ValueType;
 
 use crate::arrays::{BucketsMany, agg_queries, inserts, many_cols, points_list, range_queries, with_batches};
-use crate::{closed, connect, connect_options, multi, opts, retry_budget, to_pyerr};
+use crate::{closed, connect, connect_options, latest, multi, opts, retry_budget, to_pyerr};
 
 /// A pool of connections to tsdbd for batch calls that use them all at once.
 ///
@@ -225,6 +225,40 @@ impl Pool {
     fn insert_many(&self, py: Python<'_>, batches: &Bound<'_, PyAny>, value_type: Option<&str>) -> PyResult<()> {
         let b = inserts(batches, value_type.map(crate::value_type).transpose()?, |ids| self.types(py, ids))?;
         self.with(py, |p| with_batches(&b, |b| p.insert_many(b)))
+    }
+
+    /// As Client.latest() (on one of the connections).
+    #[pyo3(signature = (series, end = None, *, with_nulls = false, threads = 0, errors = "raise", numpy = None))]
+    fn latest(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        end: Option<&Bound<'_, PyAny>>,
+        with_nulls: bool,
+        threads: u16,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<latest::LatestMany>> {
+        let q = latest::LatestReq::new(series, false, end, with_nulls, threads, errors, numpy)?;
+        let a = self.with(py, |p| q.run(p))?;
+        q.finish(py, a)
+    }
+
+    /// As Client.latest_by_name() (on one of the connections).
+    #[pyo3(signature = (names, end = None, *, with_nulls = false, threads = 0, errors = "raise", numpy = None))]
+    fn latest_by_name(
+        &self,
+        py: Python<'_>,
+        names: &Bound<'_, PyAny>,
+        end: Option<&Bound<'_, PyAny>>,
+        with_nulls: bool,
+        threads: u16,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<latest::LatestMany>> {
+        let q = latest::LatestReq::new(names, true, end, with_nulls, threads, errors, numpy)?;
+        let a = self.with(py, |p| q.run(p))?;
+        q.finish(py, a)
     }
 
     /// As Client.query_values_multi() (on one of the connections).

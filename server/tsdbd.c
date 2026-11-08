@@ -179,6 +179,8 @@
 /* QUERY_MULTIs waiting on one connection before it is read no further: a CANCEL looks only at them, so what one
  * CANCEL costs the loop is bounded by this and the multis of one receive buffer, not by the queue's length. */
 #define MULTI_QUEUED 16
+/* the ops a CANCEL can name (and MULTI_QUEUED counts): the ones that answer in pieces */
+static inline bool cancelable(uint8_t op) { return op == TSDB_OP_QUERY_MULTI || op == TSDB_OP_QUERY_LATEST; }
 /* A receive buffer up to this size is not counted in the request memory; a frame larger than it gets a buffer of
  * its own size, which is (see the file header). */
 #define IN_KEEP (64u << 10)
@@ -1510,6 +1512,133 @@ static void handle_multi(conn *c, req *r)
     free(m.ob.p);
 }
 
+/* ------------------------------------------------------------ QUERY_LATEST */
+
+/* The newest value of each of many series (protocol 14, docs/design-latest.md 6.2). The ids are answered in chunks
+ * of TSDB_LATEST_FRAME_IDS, each a frame, so a million ids are never held as one reply; CANCEL is looked at between
+ * chunks. A denied id is asked as TSDB_SID_NONE (NOTFOUND) and turned into DENIED, as QUERY_MULTI does (A16, A17). */
+static void latest_put(uint8_t *o, const tsdb_latest_result *r)
+{
+    uint64_t v = 0;
+    if (r->status == 0 && r->kind == TSDB_LATEST_VALUE) {
+        switch (r->type) {
+        case TSDB_FLOAT64: memcpy(&v, &r->v.f64, 8); break;
+        case TSDB_INT64: v = (uint64_t)r->v.i64; break;
+        case TSDB_BOOL: v = r->v.b; break;
+        case TSDB_STATE: v = r->v.state; break;
+        default: memcpy(&v, &r->v.f32, 4); break; /* float32: its bits in the low 4 bytes */
+        }
+    }
+    int32_t st = r->status;
+    memcpy(o, &st, 4);
+    o[4] = r->status ? (uint8_t)TSDB_LATEST_NONE : r->kind;
+    o[5] = r->status ? 0 : r->type;
+    o[6] = o[7] = 0;
+    int64_t ts = r->status || r->kind == TSDB_LATEST_NONE ? 0 : r->ts;
+    memcpy(o + 8, &ts, 8);
+    memcpy(o + 16, &v, 8);
+}
+
+/* One frame of the reply: the request's status, first, m, last, then the records. */
+static bool latest_frame(conn *c, uint32_t id, int32_t status, uint32_t first, uint32_t m, bool last,
+                         const uint8_t *rec)
+{
+    uint8_t h[TSDB_LATEST_PREFIX] = {0};
+    memcpy(h, &first, 4);
+    memcpy(h + 4, &m, 4);
+    h[8] = last;
+    return frame_put(c, NULL, id, status, NULL, h, sizeof h, rec, (size_t)m * TSDB_LATEST_REC, NULL, 0);
+}
+
+static void handle_latest(conn *c, req *r)
+{
+    const uint8_t *p = r->payload;
+    int rc = 0;
+    uint32_t n = 0;
+    uint8_t flags = 0;
+    uint16_t threads = 0;
+    int64_t end = 0;
+    const int64_t *ends = NULL;
+    const tsdb_sid *ids = NULL;
+    if (r->len < TSDB_LATEST_HEADER) {
+        rc = TSDB_ERR_INVALID;
+    } else {
+        flags = p[0];
+        memcpy(&threads, p + 2, 2);
+        memcpy(&n, p + 4, 4);
+        memcpy(&end, p + 8, 8);
+        bool per = flags & TSDB_LATEST_PER_END;
+        size_t want = TSDB_LATEST_HEADER + (size_t)n * 8 * (per ? 2 : 1);
+        if (p[1] || n == 0 || n > TSDB_LATEST_MAX_IDS ||
+            (flags & ~(unsigned)(TSDB_LATEST_WITH_NULLS | TSDB_LATEST_PER_END)) || (per && end != 0) ||
+            r->len != want) {
+            rc = TSDB_ERR_INVALID;
+        } else {
+            /* the arrays are 8-aligned in the malloc'd payload */
+            if (per)
+                ends = (const int64_t *)(const void *)(p + TSDB_LATEST_HEADER);
+            ids = (const tsdb_sid *)(const void *)(p + TSDB_LATEST_HEADER + (per ? (size_t)n * 8 : 0));
+        }
+    }
+    if (rc) { /* a bad header: one frame, m = 0, last = 1 */
+        latest_frame(c, r->id, rc, 0, 0, true, NULL);
+        return;
+    }
+    tsdb_sid *own = NULL;
+    uint8_t *denied = NULL;
+    if (!auth_all(&c->auth, R_READ)) {
+        own = malloc((size_t)n * sizeof *own);
+        denied = calloc(((size_t)n + 7) / 8, 1);
+        if (!own || !denied)
+            rc = TSDB_ERR_NOMEM;
+        for (uint32_t i = 0; rc == 0 && i < n; i++) {
+            bool no = auth_id(&c->auth, ids[i], R_READ) != 0;
+            own[i] = no ? TSDB_SID_NONE : ids[i];
+            denied[i >> 3] |= (uint8_t)(no << (i & 7));
+        }
+        ids = own;
+    }
+    tsdb_latest_result *res = rc ? NULL : malloc((size_t)TSDB_LATEST_FRAME_IDS * sizeof *res);
+    uint8_t *rec = rc ? NULL : malloc((size_t)TSDB_LATEST_FRAME_IDS * TSDB_LATEST_REC);
+    if (rc == 0 && (!res || !rec))
+        rc = TSDB_ERR_NOMEM;
+    uint32_t first = 0;
+    bool gone = false;
+    while (rc == 0 && first < n) {
+        if (atomic_load_explicit(&c->cancel_running, memory_order_relaxed) || atomic_load(&c->closing)) {
+            rc = TSDB_ERR_STOPPED;
+            break;
+        }
+        uint32_t m = n - first < TSDB_LATEST_FRAME_IDS ? n - first : TSDB_LATEST_FRAME_IDS;
+        tsdb_latest_opts lo = {.end = end,
+                               .ends = ends ? ends + first : NULL,
+                               .with_nulls = (flags & TSDB_LATEST_WITH_NULLS) != 0,
+                               .threads = threads};
+        int lrc = tsdb_latest(db, ids + first, m, &lo, res);
+        if (lrc != 0) {
+            rc = lrc;
+            break;
+        }
+        for (uint32_t i = 0; i < m; i++) {
+            uint32_t ix = first + i;
+            if (denied && (denied[ix >> 3] >> (ix & 7) & 1))
+                res[i] = (tsdb_latest_result){.status = TSDB_ERR_DENIED, .kind = TSDB_LATEST_NONE};
+            latest_put(rec + (size_t)i * TSDB_LATEST_REC, &res[i]);
+        }
+        first += m;
+        if (!latest_frame(c, r->id, 0, first - m, m, first == n, rec)) {
+            gone = true;
+            break;
+        }
+    }
+    if (rc && !gone) /* the request's status in a closing frame with no records (earlier frames may have gone out) */
+        latest_frame(c, r->id, rc, first, 0, true, NULL);
+    free(res);
+    free(rec);
+    free(own);
+    free(denied);
+}
+
 /* An error in the shape the op's replies have, so a client reads it as it reads that op's errors. */
 static void reply_error(conn *c, uint32_t id, uint8_t op, int32_t status)
 {
@@ -1530,6 +1659,7 @@ static void reply_error(conn *c, uint32_t id, uint8_t op, int32_t status)
         frame_put(c, NULL, id, status, &end_ix, &none, 4, NULL, 0, NULL, 0);
         return;
     }
+    case S_LATEST: latest_frame(c, id, status, 0, 0, true, NULL); return;
     default: reply_status(c, id, status); return;
     }
 }
@@ -2146,6 +2276,7 @@ static void handle_op(req *r)
             return;
         break;
     case TSDB_OP_QUERY_MULTI: handle_multi(c, r); return;
+    case TSDB_OP_QUERY_LATEST: handle_latest(c, r); return;
     case TSDB_OP_DELETE_RANGE: {
         tsdb_sid s;
         int64_t start, end;
@@ -2585,7 +2716,7 @@ static void dispatch(conn *c)
         c->q_tail = NULL;
     r->next = NULL;
     c->q_bytes -= REQ_COST(r);
-    if (r->op == TSDB_OP_QUERY_MULTI) { /* the queue's order, so it is the first multi */
+    if (cancelable(r->op)) { /* the queue's order, so it is the first of them */
         c->mq_head = r->mnext;
         if (!c->mq_head)
             c->mq_tail = NULL;
@@ -2682,7 +2813,7 @@ static void cancel_multi(conn *c, uint32_t id)
     for (req *r = c->mq_head; r; r = r->mnext)
         if (r->id == id)
             r->cancelled = true;
-    if (c->busy && c->run_op == TSDB_OP_QUERY_MULTI && c->run_id == id)
+    if (c->busy && cancelable(c->run_op) && c->run_id == id)
         atomic_store(&c->cancel_running, true);
 }
 
@@ -2776,7 +2907,7 @@ static int parse(conn *c)
         else
             c->q_head = r;
         c->q_tail = r;
-        if (r->op == TSDB_OP_QUERY_MULTI) {
+        if (cancelable(r->op)) {
             if (c->mq_tail)
                 c->mq_tail->mnext = r;
             else
@@ -3502,6 +3633,7 @@ int main(int argc, char **argv)
                                    {"exit-with-parent", optional_argument, 0, 'E'},
                                    {"health-domain", required_argument, 0, 0x100},
                                    {"no-stats", no_argument, 0, 0x101},
+                                   {"latest-cache", required_argument, 0, 0x102},
                                    {"cluster", no_argument, 0, 'c'},
                                    {"peer-port", required_argument, 0, 'y'},
                                    {"peer-listen", required_argument, 0, 'Y'},
@@ -3572,6 +3704,7 @@ int main(int argc, char **argv)
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'A': no_auth = 1; break;
         case 0x101: o.stats = -1; break;
+        case 0x102: o.latest_cache = (size_t)num_arg("latest-cache", optarg, 0, LLONG_MAX); break;
         case 'c': cluster_on = 1; break;
         case 'y': peer_port = (int)num_arg("peer-port", optarg, 0, 65535); cluster_opts = 1; break;
         case 'Y': peer_addr = optarg; cluster_opts = 1; break;
@@ -3627,7 +3760,7 @@ int main(int argc, char **argv)
                         "             [--lttb-max-threshold 16777216]\n"
                         "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
                         "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n"
-                        "             [--health-domain PREFIX]... [--no-stats]\n"
+                        "             [--health-domain PREFIX]... [--no-stats] [--latest-cache BYTES]\n"
                         "             [--cluster --cluster-secret-file F [--peer-port %d|0] [--peer-listen ADDR]\n"
                         "              [--advertise HOST] [--rack NAME]]\n",
                 TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1);

@@ -16,6 +16,8 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # kv also with login on (jepsen --auth) under kill and power, on each backend;
                           # JEPSEN_SECONDS=300 makes every run that long (the weekly CI run)
                           # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
+                          # (kv also writes nulls and checks every QUERY_LATEST answer, and the final ones; tests/jepsen/mutant-latest.sh
+                          # plants stale latest-table entries in tsdbd, which the check must fail: jepsen-selftest runs it)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
@@ -271,7 +273,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `TSDB_ERR_NOTFOUND` for lookups). A 32-bit variable, `%u`, Java `int`, Rust `as u32` or Python `"I"` that holds an
   id is a bug that tests with ids above 2^32 find; row files of the benchmarks keep a u32 series NUMBER that indexes
   the bench's table of ids, never an id. Ids are never reused and mean nothing in another database (export and
-  import name series, not ids). `tsdb_abi_version` (3 in 0.9.0 and 0.9.1, 4 with the statistics) changes when the C structs or signatures the bindings use change.
+  import name series, not ids). `tsdb_abi_version` (3 in 0.9.0 and 0.9.1; 4 and 6 the statistics, 5 the latest table, 7 `tsdb_latest_stats`) changes when the C structs or signatures the bindings use change.
 - **Log numbers (`fno`) never go back.** Every WAL record (format 9: a 32-byte header with `fno` and `commit_ms`) takes
   numbers (rows: one per row; a marker: `span`), assigned in `wal_buffer` under `buf_lock`. They must never be
   handed out twice across opens, whatever was removed in between (a segment after its flush, a part by retention,

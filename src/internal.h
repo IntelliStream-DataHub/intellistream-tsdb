@@ -2010,6 +2010,7 @@ int latest_open(eng *db);       /* the table, empty (NULL db->lt: off) */
 int latest_build(eng *db);      /* every part's runs folded in; the volume's pages reserved first */
 void latest_start(eng *db);     /* the warmer thread, once the engine is up */
 void latest_stop(eng *db);      /* stops the warmer (eng_halt) */
+bool latest_info(eng *db, tsdb_latest_stats *st); /* tsdb_get_latest_stats; false without a table (all zero) */
 bool latest_stats(eng *db, uint64_t out[6]); /* tests: see tsdb_test_latest_stats */
 void latest_close(eng *db);     /* frees the table and gives its pages back to the budget */
 /* A publisher's write section: lt_begin takes latest_rw for writing (no-op without a table); lt_fold, after

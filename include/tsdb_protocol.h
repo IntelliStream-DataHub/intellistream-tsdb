@@ -218,13 +218,32 @@
  *   STATUS      -> u32 len, then len bytes of `key=value` lines (docs/ha.md 15.4); superuser only.
  *   Version 13 also moves the planned numbers of the other designs one up: QUERY_LATEST is protocol 14, the change
  *   feed 15, statistics 16 (their op numbers are unchanged: 39 to 47; TOPOLOGY is 48 and STATUS 49).
+
+ *   Version 14: QUERY_LATEST (docs/design-latest.md 6.2), the newest value of each of many series. The floor stays 12:
+ *   a client sends the op only to a server whose HELLO says 14 or more (an older one: TSDB_ERR_INVALID, nothing sent).
+ *   QUERY_LATEST u8 flags, u8 0, u16 threads (0: the server's --request-threads; more is clamped), u32 n (1..1048576),
+ *               i64 end, [i64 ends[n]], u64 ids[n]
+ *               flags: TSDB_LATEST_WITH_NULLS 1 (the newest row, a null included), TSDB_LATEST_PER_END 2 (ends[] is
+ *               present and `end` must be 0); other bits are reserved (TSDB_ERR_INVALID). `end`: only rows before it;
+ *               TSDB_TS_MAX: no bound. The length is exactly that.
+ *               -> frames, each: i32 status, u32 first, u32 m, u8 last, u8 0, u16 0, then m records of 24 bytes:
+ *                  i32 status, u8 kind (0 value, 1 null, 2 none), u8 type, u16 0, i64 ts, u64 value (the series'
+ *                  slot zero-extended: float32 bits in the low 4 bytes, bool 0/1, state code, float64 or int64 bits;
+ *                  0 with NULL and NONE). Records are in index order, at most 65,536 per frame; the frame with
+ *                  last = 1 ends the reply. Kind NULL appears only with WITH_NULLS. A record with status NOTFOUND or
+ *                  DENIED has kind NONE, type 0, ts 0, value 0. The frame's own status is the request's: INVALID
+ *                  for a bad header (one frame, m = 0, last = 1), STOPPED after a CANCEL, NOMEM, or one of the HA
+ *                  statuses (these carry the empty frame shape above, then their body).
+ *               A denied id (no `read` on its series, existing or not) answers DENIED in its own record; a missing id
+ *               answers NOTFOUND for a user with `read` on all series. CANCEL names a QUERY_LATEST as it does a
+ *               QUERY_MULTI: it ends after the chunk in flight with STOPPED.
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
 #include <stdint.h>
 
-#define TSDB_PROTOCOL_VERSION 13
+#define TSDB_PROTOCOL_VERSION 14
 #define TSDB_PROTOCOL_MIN 12 /* the oldest version tsdbd and the clients speak */
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
@@ -272,6 +291,7 @@
     X(GRANT, 36, grant)                                    \
     X(REVOKE, 37, revoke)                                  \
     X(USER_LIST, 38, user_list)                            \
+    X(QUERY_LATEST, 39, query_latest)                      \
     X(TOPOLOGY, 48, topology)                              \
     X(STATUS, 49, status)
 
@@ -320,6 +340,14 @@ enum { TSDB_ROLE_NONE = 0, TSDB_ROLE_OWNER = 1, TSDB_ROLE_STANDBY = 2, TSDB_ROLE
 #define TSDB_STATS_REPLY 88 /* bytes in a LAST_STATS reply after the status */
 #define TSDB_VALID 1  /* flags: a validity bitmap follows the values */
 #define TSDB_PACKED 2 /* flags: the arrays are packed and zstd compressed (version 3) */
+
+#define TSDB_LATEST_HEADER 16            /* QUERY_LATEST bytes before the arrays (version 14) */
+#define TSDB_LATEST_MAX_IDS 1048576u     /* ids in one QUERY_LATEST (1 << 20) */
+#define TSDB_LATEST_FRAME_IDS 65536u     /* records in one reply frame, at most */
+#define TSDB_LATEST_PREFIX 12            /* a reply frame after its status: u32 first, u32 m, u8 last, 3 zero bytes */
+#define TSDB_LATEST_REC 24               /* bytes of one reply record */
+#define TSDB_LATEST_WITH_NULLS 1         /* QUERY_LATEST flags */
+#define TSDB_LATEST_PER_END 2
 
 #define TSDB_MULTI_HEADER 24            /* QUERY_MULTI bytes before the per-series arrays (version 10) */
 #define TSDB_MULTI_MAX_SERIES 65536u     /* series in one QUERY_MULTI */

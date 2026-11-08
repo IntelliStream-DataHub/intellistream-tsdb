@@ -41,6 +41,10 @@ fn structs_match_the_c_header() {
         tsdb_series_result { index, series, status, last, n, ts, values, buckets }
         tsdb_multi_opts { threads, max_rows, max_held_bytes, cancelled, on_wait, budget_take, budget_give,
             on_deferred, hook_ctx }
+        tsdb_latest_result { status, kind, type_, ts, v }
+        tsdb_latest_opts { end, ends, with_nulls, threads }
+        tsdb_latest_stats { table, searched, floor_reads, fills_stored, fills_refused, unknown, table_bytes, capped,
+            enabled }
     };
     rust.push(("tsdb_type", "sizeof", size_of::<tsdb_type>()));
     rust.push(("tsdb_order", "sizeof", size_of::<tsdb_order>()));

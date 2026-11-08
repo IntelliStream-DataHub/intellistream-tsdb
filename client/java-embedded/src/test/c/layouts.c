@@ -72,6 +72,11 @@ int main(void)
     F(tsdb_multi_opts, threads); F(tsdb_multi_opts, max_rows); F(tsdb_multi_opts, max_held_bytes);
     F(tsdb_multi_opts, cancelled); F(tsdb_multi_opts, on_wait); F(tsdb_multi_opts, budget_take);
     F(tsdb_multi_opts, budget_give); F(tsdb_multi_opts, on_deferred); F(tsdb_multi_opts, hook_ctx);
+    S(tsdb_latest_result);
+    F(tsdb_latest_result, status); F(tsdb_latest_result, kind); F(tsdb_latest_result, type); F(tsdb_latest_result, ts);
+    F(tsdb_latest_result, v);
+    S(tsdb_latest_opts);
+    F(tsdb_latest_opts, end); F(tsdb_latest_opts, ends); F(tsdb_latest_opts, with_nulls); F(tsdb_latest_opts, threads);
     /* enum and value-type widths the binding assumes */
     printf("enum %zu\n", sizeof(tsdb_type));
     /* the codes it passes: "type.FLOAT64 1" is ValueType.FLOAT64.code(), "unit.DAY 4" Unit.DAY.code(), "order.DESC 1",
@@ -91,7 +96,8 @@ int main(void)
     E("kind", tsdb_part_info, TSDB_STRUCT_PART_INFO); E("kind", tsdb_spread_bucket, TSDB_STRUCT_SPREAD_BUCKET);
     E("kind", tsdb_twa_opts, TSDB_STRUCT_TWA_OPTS); E("kind", tsdb_twa_bucket, TSDB_STRUCT_TWA_BUCKET);
     E("kind", tsdb_multi_query, TSDB_STRUCT_MULTI_QUERY); E("kind", tsdb_series_result, TSDB_STRUCT_SERIES_RESULT);
-    E("kind", tsdb_multi_opts, TSDB_STRUCT_MULTI_OPTS);
+    E("kind", tsdb_multi_opts, TSDB_STRUCT_MULTI_OPTS); E("kind", tsdb_latest_result, TSDB_STRUCT_LATEST);
+    E("kind", tsdb_latest_opts, TSDB_STRUCT_LATEST_OPTS);
     E("multi", VALUES, TSDB_MULTI_VALUES); E("multi", BUCKETS, TSDB_MULTI_BUCKETS); E("multi", SPREAD, TSDB_MULTI_SPREAD);
     E("multi", TWA, TSDB_MULTI_TWA); E("multi", LTTB, TSDB_MULTI_LTTB);
     E("multi", TRIM_LO, TSDB_MULTI_TRIM_LO); E("multi", TRIM_HI, TSDB_MULTI_TRIM_HI);

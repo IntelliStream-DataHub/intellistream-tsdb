@@ -495,6 +495,7 @@ static inline int tsdb_wire_error_shape(unsigned op)
     case TSDB_OP_QUERY_VALUES:
     case TSDB_OP_QUERY_LTTB: return 8;
     case TSDB_OP_QUERY_MULTI: return 8; /* u32 index, u32 answered of the END frame */
+    case TSDB_OP_QUERY_LATEST: return TSDB_LATEST_PREFIX; /* u32 first, u32 m, u8 last, 3 zero bytes */
     default: return 0;
     }
 }

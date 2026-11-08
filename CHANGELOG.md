@@ -44,7 +44,9 @@ disk format and the wire protocol.
   C client keeps a copy of each request until its reply (one more memcpy). A connection gets the bodies only if its
   HELLO said 13 (a client of 12 reads the bare status, as before), and in QUERY_MULTI only the END frame carries the
   body. The Pulsar sink works as before (its tests pass), and treats DROPPED as final (dead letter). **Protocol numbers moved:** `QUERY_LATEST` is protocol 14, the change feed 15, statistics 16.
-- The embedded C ABI is version 5: `tsdb_options` gained `stats` and `stats_sweep_mb_s` (4) and `latest_cache` (5); the
+- The embedded C ABI is version 7: `tsdb_options` gained `stats` and `stats_sweep_mb_s` (4) and `latest_cache` (5), then
+  `stats_recompute_s`, `stats_resident_s`, `tenants` and `ntenants`, and `tsdb_volume_stats.stats_tmap_bytes` (6), and
+  `tsdb_latest_stats` with `tsdb_get_latest_stats` (7); the
   Rust, Python and Java bindings carry them. The statistics and the latest table change neither the wire protocol
   nor the disk format.
 
@@ -76,6 +78,17 @@ disk format and the wire protocol.
   `tsdb_query_*_total` counters and `tsdb_major_faults_total` (docs/metrics.md); there are no per-tenant metrics.
   `tsdb DIR stats` now reports the bytes by type and where they go (it used to assume 12 bytes a row for every
   type), and `tsdb DIR stats series NAME...` prints the numbers of single series.
+- **QUERY_LATEST over the wire, protocol 14** (`docs/design-latest.md` step 3). New op 39: the newest row of up to
+  1,048,576 series by id (optionally as of a time, one `end` or one per id, and with nulls), answered in frames of
+  at most 65,536 records of 24 bytes in index order; CANCEL stops it between frames. It needs the right `read` on each
+  series (`auth_ops`); a denied id and a missing one look alike (`TSDB_ERR_DENIED`) unless the user has `read` on
+  `all` (then `TSDB_ERR_NOTFOUND`). The floor stays 12, a client below 14 asked for `latest` fails with
+  `TSDB_ERR_INVALID` without sending. All four clients have `latest` and `latest_by_name` (C `tsdbc_latest`,
+  Rust `Client::latest`, Python `latest`, Java `latest`; the embedded bindings too; names resolve through a
+  per-connection cache, so a name outside the user's grants answers DENIED in its own record), and the CLI has
+  `tsdb DIR latest NAME... [--with-nulls] [--end T]`. `tsdbd --latest-cache BYTES` sets the table's budget. Metrics:
+  `tsdb_latest_*` (docs/metrics.md). The jepsen kv workload writes nulls and checks every latest answer against the
+  acknowledged writes.
 - **The latest table** (engine, `docs/design-latest.md` step 2): per volume, the newest non-null row of every series in
   the parts (or a bound on it), kept exact by every listing of parts (flush, insert, replay, delete, replace), by
   retention and by `tsdb_drop_before`, and filled by a background warmer. `tsdb_latest` answers from it in O(1) and

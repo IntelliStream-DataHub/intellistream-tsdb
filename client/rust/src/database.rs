@@ -7,6 +7,7 @@ use std::ops::{ControlFlow, RangeBounds};
 use crate::SeriesId;
 use crate::client::Client;
 use crate::error::Result;
+use crate::latest::{Latest, LatestOpts};
 use crate::types::{
     Bucket, Buckets, Group, MultiOpts, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts,
 };
@@ -188,6 +189,8 @@ pub trait Database {
     fn optimize(&mut self) -> Result<()>;
     fn stats(&mut self) -> Result<Stats>;
     fn last_query_stats(&mut self) -> Result<QueryStats>;
+    fn latest(&mut self, ids: &[SeriesId], opts: &LatestOpts) -> Result<Vec<Latest>>;
+    fn latest_by_name(&mut self, names: &[&str], opts: &LatestOpts) -> Result<Vec<Latest>>;
 }
 
 macro_rules! forward {
@@ -353,6 +356,12 @@ macro_rules! forward {
             }
             fn last_query_stats(&mut $s) -> Result<QueryStats> {
                 $last_query_stats
+            }
+            fn latest(&mut self, ids: &[SeriesId], opts: &LatestOpts) -> Result<Vec<Latest>> {
+                <$t>::latest(self, ids, opts)
+            }
+            fn latest_by_name(&mut self, names: &[&str], opts: &LatestOpts) -> Result<Vec<Latest>> {
+                <$t>::latest_by_name(self, names, opts)
             }
         }
     };

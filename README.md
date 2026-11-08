@@ -383,6 +383,7 @@ build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 avg 1h --desc --
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 lttb 1000   # 1000 points for a chart
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 all 1mo --tz Europe/Oslo
 build/tsdb /data/sensors query pump7.temp 2024-01-01 2024-02-01 twa 1d --linear --max-gap 10m
+build/tsdb /data/sensors latest pump7.flow pump7.temp          # the newest row of each series
 ```
 
 Run `build/tsdb` without arguments for all commands, time formats and groups.

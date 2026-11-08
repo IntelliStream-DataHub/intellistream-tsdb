@@ -58,6 +58,12 @@ directory) and `path`.
 | `tsdb_inserted_rows_total` | counter | rows in successful insert requests |
 | `tsdb_multi_series_total` | counter | series answered by many-series requests (QUERY_MULTI, `op="query_multi"` in the request counters) |
 | `tsdb_multi_deferred_total` | counter | series of such requests too large to hold ahead of their turn, run again at it (streaming); a high rate next to `tsdb_multi_series_total` means the requests are mostly large series |
+| `tsdb_latest_series_total{volume,path,how}` | counter | series QUERY_LATEST (and `tsdb_latest`) answered, per volume: `how="table"` from the latest table, `how="search"` by a search of the parts. A high `search` share means entries still unknown (see `tsdb_latest_unknown`), `WITH_NULLS` or as-of requests, or a volume the budget capped |
+| `tsdb_latest_floor_reads_total{volume,path}` | counter | table entries read as unknown below a `tsdb_drop_before` floor (answered by a search) |
+| `tsdb_latest_fills_total{volume,path,result}` | counter | the warmer's batches: `stored`, or `refused` (a write section ran after its cut; the next round tries again) |
+| `tsdb_latest_unknown{volume,path}` | gauge | table entries still to fill; falls to 0 after a restart as the warmer works. Lookups of these ids are searches until then |
+| `tsdb_latest_table_bytes{volume,path}` | gauge | memory the volume's latest table takes (16 bytes a series, in pages) |
+| `tsdb_latest_budget_capped{volume,path}` | gauge | 1 when `--latest-cache` refused the volume a page: ids beyond it are answered by a search. Alert on it |
 | `tsdb_request_errors_total{code}` | counter | replies with an error status: `io`, `invalid`, `notfound`, ...; `denied` is a request for series or operations the user holds no right on, `auth` a failed login or a request before login |
 | `tsdb_logins_total{result}` | counter | login attempts: `ok`; `failed` (a wrong password, an unknown user or a malformed exchange: they are not told apart); `timeout` (not logged in within `--login-timeout`); `refused` (another request, or a message over 4 KiB, before login) |
 | `tsdb_query_duration_seconds{op}` | histogram | time a worker spent on a query request (0.5 ms to 30 s), up to handing the reply to the kernel, so a slow client taking a large result adds to it |
@@ -66,6 +72,11 @@ directory) and `path`.
 | `tsdb_workers`, `tsdb_workers_busy` | gauge | worker threads (extras start for slow clients), and those running a request |
 | `tsdb_request_memory_bytes`, `tsdb_request_memory_limit_bytes` | gauge | memory of requests received and not yet run (with large receive buffers and packed inserts being unpacked), and `--max-request-memory` |
 | `tsdb_metrics_scrapes_total`, `tsdb_metrics_rejected_total` | counter | this endpoint: scrapes answered, requests refused or timed out |
+
+Not exported, although docs/design-latest.md 6.5 names them: the engine keeps no counters for why a lookup searched
+(`tsdb_latest_search_total{why}`), for the time lookups waited for a write section (`wait_seconds_total`) or for the
+series whose newest row lies more than an hour ahead of the clock (`future_series`). Requests themselves are the
+generic `tsdb_requests_total{op="query_latest"}` and `tsdb_query_duration_seconds{op="query_latest"}`.
 
 Useful expressions: `tsdb_logical_bytes / tsdb_disk_bytes` is the compression ratio;
 `sum(rate(tsdb_query_rows_total{source="stats"}[5m])) / sum(rate(tsdb_query_rows_total[5m]))` is the share of rows answered without decoding; `rate(tsdb_inserted_rows_total[1m])` is the insert rate;

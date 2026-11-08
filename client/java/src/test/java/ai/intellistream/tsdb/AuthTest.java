@@ -66,7 +66,7 @@ class AuthTest {
         try (TsdbClient c = login("root", ROOT_PW)) {
             User me = c.whoami();
             assertEquals(new User("root", true, List.of()), me);
-            assertEquals(13, c.hello());
+            assertEquals(14, c.hello());
             long id = c.series("plant/a");
             c.insert(id, new long[] {T0}, new float[] {1.5f});
 
@@ -146,6 +146,16 @@ class AuthTest {
                 List<SeriesResult<ValuePoints>> m = u.queryValuesMulti(new long[] {own, foreign}, ALL, NOW);
                 assertArrayEquals(new long[] {T0}, m.get(0).get().timestamps());
                 assertEquals(Status.ERR_DENIED, m.get(1).status());
+                /* and so does QUERY_LATEST: denied and missing look alike */
+                List<SeriesResult<Latest>> l = u.latest(own, foreign, (1L << 32) | 999_999);
+                assertEquals(T0, l.get(0).get().ts());
+                assertEquals(Status.ERR_DENIED, l.get(1).status());
+                assertEquals(Status.ERR_DENIED, l.get(2).status());
+                List<SeriesResult<Latest>> ln = u.latestByName(new String[] {"acme/x", "globex/y", "globex/missing"},
+                        LatestOptions.defaults());
+                assertEquals(1f, ln.get(0).get().asDouble());
+                assertEquals(Status.ERR_DENIED, ln.get(1).status());
+                assertEquals(Status.ERR_DENIED, ln.get(2).status());
             }
             assertArrayEquals(new float[] {9}, r.queryPoints(foreign, ALL, NOW).values());
         }

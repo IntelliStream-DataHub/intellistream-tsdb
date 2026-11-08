@@ -105,6 +105,7 @@ pub(crate) fn error_shape(op: u8) -> usize {
     match op {
         x if x == Op::QueryRaw as u8 => 5,
         x if x == Op::QueryValues as u8 || x == Op::QueryLttb as u8 || x == Op::QueryMulti as u8 => 8,
+        x if x == Op::QueryLatest as u8 => 12,
         _ => 0,
     }
 }
