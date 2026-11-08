@@ -1,7 +1,9 @@
 # Statistics per series and per tenant
 
-Status: steps 1 and 2 (§9) built on branch `stats-s1` (query counters, event ring, sweeper, `tsdb_series_stats`, the
-metrics and `tsdb DIR stats [series]`); steps 3-5 are not. Design as written: Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
+Status: steps 1 and 2 (§9) are on main (query counters, event ring, sweeper, `tsdb_series_stats`, the metrics and
+`tsdb DIR stats [series]`); steps 3 and 4 are built on branch `stats-s34` (tenants, hot lists, residency, the C API
+and `tsdb DIR stats tenants|hot`; "Steps 3 and 4 as built" in §8 lists where they differ from the text below); step 5
+(the server ops and the clients) is not. Design as written: Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
 same day after an adversarial review (findings H1-H4, M1-M10, L1-L10; §11 says where each one is answered).
 Code references are `file:line` at e33d87f.
 
@@ -525,8 +527,8 @@ standard deviations reported (benchmark policy):
 
 Stats on (the default) against `--no-stats`, same binaries, `tsdb-bench --qps` on a 100-series, 1 M-row-per-series
 database (3 interleaved runs of 5 s each; mean queries/s) and `insert-bench --appends-only` with fsync (5 interleaved
-rounds of 10 s; mean inserts/s). The single-row lookup class and the two-handle case are not measured yet; the
-`qs_end` hook (about 10 ns per query) is below the noise of the classes that were.
+rounds of 10 s; mean inserts/s). The single-row lookup class is in the results of steps 3 and 4 below; the
+`qs_end` hook (about 10 ns per query) is below the noise of the classes measured here.
 
 | class | on | off | on / off |
 |---|---:|---:|---:|
@@ -543,6 +545,78 @@ rounds of 10 s; mean inserts/s). The single-row lookup class and the two-handle 
 
 No difference outside run-to-run noise (in both directions, so the cost is not measurable here). Not yet run: the
 sweeper's catch-up time on the 100 M-row set, `tsdbc-bench`, and the settle time after a load.
+
+### Steps 3 and 4 as built (`src/stats_tenant.c`, `src/stats_hot.c`, `tests/test_tenants.c`)
+
+Where the code differs from the text above:
+
+- **Hot lists** are guarded by one mutex per list, taken by the owner once per sample (1 query in 8), not a seqlock:
+  TSan-clean and a few nanoseconds per query. The sample is a Bernoulli draw per query (xorshift), not a geometric
+  skip: the same distribution, and no aliasing with a client that sends its queries round-robin.
+- **The tenant map** is 2 bytes a series always (no 1-byte form under 256 tenants); a page of 65,536 ids that all
+  belong to one tenant is a number in the page table and allocates nothing.
+- **No A0** (a pending sum of level-0 parts): a part's split is added to the partition's vector at once; the recount
+  after a merge or a delete replaces the vector wholesale.
+- **A list change** keeps (from, to, id) triples of the moved series in memory until every partition has moved (8
+  bytes a moved series, and 5 more for the ids and widths cut into groups once per change). Per partition the move
+  finds the moved ids in each part by the cheapest of a merge pass, a search per id or a search of the ids per run,
+  and is replaced by a recount of the partition when its probes would cost more than reading its indexes (so a change
+  costs one walk of the index at most; the old move cost parts x moved series). Only the tenants a change touches
+  are PARTIAL while it runs; right after `tsdb_set_tenants`, until the engine applies the list at its next tick,
+  every answer is PARTIAL (the numbers are those of the old list).
+- **The tenant side never fails the engine.** An allocation that fails there (the moved series, a map page, a
+  partition vector) stops that volume's tenant totals (`tenants_fail`: they read PARTIAL, the vectors are freed, a
+  reopen counts again); there is no runtime rebuild. `tsdb_set_tenants` and a volume's catch-up with its listing run
+  under `set_mu`.
+- **Step 5 builds** the "list unchanged for 30 s before it is applied" rule: it is tsdbd's, the engine applies at once.
+- **Not built**: the per-series EXACT_ROWS flag (`tsdb_series_stats` flags 2 stays invalid), the wire flag for
+  approximate ingest (the ring overflow is counted in `stats_ring_overflows`; the struct has only PARTIAL), and
+  reading USERS beside the database in the CLI (`stats tenants` takes the prefixes as arguments and `--tenants FILE`).
+- **Tenant numbers are process-wide** and never reused (`tenant_intern`); `tsdb_tenant_stats_get` is named so because
+  the struct has the design's name. `TSDB_ABI_VERSION` is 6; the bindings carry the new `tsdb_options` fields (the
+  tenant list itself is not offered in them before step 5).
+
+**Benchmarks** (stats on against `--no-stats`, same binaries, Ryzen 9 7950X, `flock -o -x BENCH.lock`, `sync` and a
+20 s pause before every run so one mode's dirty pages are not written back during the next).
+
+`tsdb-bench` load 100 x 1 M, random windows of 2 s each, mean of 3 repetitions that alternate the order of the modes
+(log `runs/s34f-bench`, `/var/tmp/stats-s34/bench/run2.log`):
+
+| class (queries/s) | on | off | on / off |
+|---|---:|---:|---:|
+| a single row, 1 thread (the cheapest query, 8.5 us) | 118,093 | 117,319 | +0.7 % |
+| a single row, 32 threads | 1,314,740 | 1,301,383 | +1.0 % |
+| raw 3600 samples, 1 thread | 67,104 | 67,064 | +0.1 % |
+| raw 3600 samples, 32 threads | 1,082,670 | 1,078,860 | +0.4 % |
+| agg 86,400 samples in buckets of 300, 1 thread | 18,621 | 18,344 | +1.5 % |
+| agg 86,400 samples in buckets of 300, 32 threads | 112,567 | 111,313 | +1.1 % |
+| agg 604,800 samples in buckets of 3600, 1 thread | 16,878 | 16,730 | +0.9 % |
+| agg 604,800 samples in buckets of 3600, 32 threads | 55,515 | 55,066 | +0.8 % |
+| load, M rows/s | 76.6 | 76.3 | +0.4 % |
+
+On is never slower than off beyond the spread of the runs (the differences are all on the faster side, so they are
+noise: the per-query cost measured on its own, `qreg_add` 50 M calls, is +8 ns with hot-reads sampling, under 0.1 % of
+a single-row lookup).
+
+`insert-bench --appends-only` (fsync each call, group commit), 10 s a run, one warm-up round that is not counted, then
+6 rounds that alternate the order, mean inserts/s (log `runs/s34g-bench`, `/var/tmp/stats-s34/bench/run3.log`):
+
+| threads | on | off | on / off |
+|---:|---:|---:|---:|
+| 1 | 1,449 | 1,436 | +1.0 % |
+| 16 | 12,394 | 12,205 | +1.5 % |
+| 64 | 42,905 | 42,574 | +0.8 % |
+| 256 | 142,905 | 136,477 | +4.7 % (one `off` run of 111,071; without it +1.0 %) |
+
+The write path gains one relaxed atomic load and one field in `stats_push`, inside calls that are dominated by the
+fsync, and the numbers agree: no measurable cost, within 1 % to the noise of the machine, and the gate holds. An
+earlier run (3 rounds of 5 s, no warm-up) had `on` 1.7 to 2.8 % below `off` at 16 to 256 threads, with the order of
+the modes visible in the repetitions (on slower in rounds 1 and 2, faster in round 3) and a cold first run at 1
+thread; the longer run with a warm-up does not repeat it, so it was an order effect.
+
+**The tenant map at 10^7 series** (`build/test_tenants --map-bench 10000000`): series created interleaved between
+tenants: 20.1 MB (2.01 bytes a series), filled 0.1 s after the last creation; created in runs per tenant: 2.0 MB
+(0.20 bytes a series, whole pages of one tenant are only a table entry). Planning number: 2 GB per 10^9 series.
 
 ## 9. Build plan
 

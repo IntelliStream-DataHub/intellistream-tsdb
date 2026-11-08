@@ -1161,17 +1161,31 @@ enum { QC_QUERIES, QC_ROWS_DECODED, QC_ROWS_STATS, QC_ROWS_MEM, QC_BYTES_READ, Q
        QC_GRANULES_STATS, QC_RESULT_ROWS, QC_NS, QC_N };
 qreg *qreg_new(void);
 void qreg_close(qreg *r); /* the handle's reference: blocks of threads that outlive the handle stay valid */
-void qreg_add(qreg *r, const uint64_t v[QC_N]);
+void qreg_add(qreg *r, const uint64_t v[QC_N], uint64_t sid); /* sid != 0: the series is a candidate for the hot-reads list */
+void qreg_hot_note(qreg *r, uint64_t sid); /* the same for a series read inside a multi call */
 void qreg_totals(qreg *r, uint64_t out[QC_N]);
 
 struct estats;
+struct tlist; /* stats_priv.h */
+int tlist_make(const char *const *prefixes, size_t n, struct tlist **out);
+void tlist_unref(struct tlist *t);
+/* The tenant list the sweeper counts by (a copy of the strings is made); the sweeper applies it at its next tick. */
+int eng_set_tenants(eng *db, const char *const *prefixes, size_t n);
+/* One volume's numbers of the tenant with number `no` (volumes.c finds the number in the handle's list): the 17
+ * counters of tsdb_tenant_stats from `series` to `resident_bytes` in their order, the flags (TSDB_TENANT_PARTIAL), and
+ * the age of the oldest stale partition. Starts a lazy sweeper. */
+int eng_tenant_fill(eng *db, uint32_t no, uint64_t v[17], uint32_t *flags, uint64_t *stale_s);
+/* The hot lists of one volume (local ids): rows written, worst bytes per row, merged into the aggregates. */
+void eng_hot_collect(eng *db, void *writes_agg, void *bpr_agg, uint64_t sid_base);
 /* Test hooks (tests/test_stats.c): the ring holds this many events (at most its size, 4096) so a test can overflow
  * it; the sweeper does not run while stats_pause is set; tsdb_series_stats stops after the chunk in which its index
  * probes pass this number (default 100 million). */
 extern atomic_uint stats_ring_cap;
 extern atomic_uint stats_pause;
+extern atomic_size_t stats_test_alloc_cap; /* tests: the tenant side's big allocations above this many bytes fail (0: off) */
 extern atomic_uint_fast64_t stats_open_reconciles;
 extern atomic_uint_fast64_t sstats_budget;
+extern atomic_int_fast64_t stats_hot_clock_ms; /* tests: nonzero is "now" in ms for the hot-list windows and the HLL hours */
 void stats_start(eng *db, bool reconcile); /* idempotent; does nothing with stats = -1 */
 void stats_open_done(eng *db); /* the open no longer changes the part list without db->lock: the sweeper may reconcile */
 void stats_stop(eng *db);
@@ -1184,12 +1198,13 @@ int stats_settle(eng *db, int timeout_ms);
 typedef struct sscx sscx;
 sscx *sscx_open(eng *db);
 void sscx_close(sscx *x);
-void sscx_run(sscx *x, const uint32_t *ids, size_t m, tsdb_series_stat *out, uint64_t *probes);
+void sscx_run(sscx *x, const uint32_t *ids, size_t m, tsdb_series_stat *out, uint64_t *probes, bool resident);
 
 /* One outermost query's statistics and scheduler group (volumes.c). */
 typedef struct qrun {
     qstats q;
     qreg *reg; /* the handle's counters, NULL: not counted */
+    tsdb_sid sid; /* the one series the query reads (0: none or many): a candidate for the hot-reads list */
     bool outer;
     struct timespec t0;
     sgroup g; /* the threads it may use (request_threads); a query inside a multi call uses the call's */
@@ -1199,6 +1214,7 @@ typedef struct qrun {
 void query_run_begin(tsdb *t, qrun *r, int cap);
 void query_run_end(qrun *r, int type, uint64_t result_rows);
 sched *query_sched(tsdb *t);
+void query_note_series(tsdb *t, tsdb_sid id); /* a series read by a multi call: a candidate for the hot-reads list */
 
 /* ---- memtable + WAL (memtable.c) ---- */
 /* mt_series.fl (latest.c, design-latest.md 2.2): kept by mt_add when it is given the series' type */
@@ -1692,7 +1708,9 @@ struct eng {
     _Atomic(struct estats *) stats;
     atomic_bool stats_on;
     atomic_flag stats_starting;
-    bool retiring;         /* eng_close keeps the names of the dictionaries (eng_retire) */
+    struct tlist *tl;       /* the tenant list the sweeper is to count by (stats_priv.h), under tl_mu */
+    pthread_mutex_t tl_mu;  /* a leaf */
+    bool retiring;        /* eng_close keeps the names of the dictionaries (eng_retire) */
     pthread_mutex_t fail_lock; /* innermost; held only to fill fail_msg */
     pthread_mutex_t dir_sync_lock; /* eng_sync_dir; inside every lock but fail_lock */
     char fail_msg[256];

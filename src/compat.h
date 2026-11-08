@@ -17,6 +17,7 @@
  *                        that waits gives up after CLS_SWITCH_WAIT_MS as before and tries later)
  *  - MSG_NOSIGNAL        0, with SO_NOSIGPIPE on the socket (tsdb_nosigpipe)
  *  - thread stacks       8 MB: macOS gives a secondary thread 512 KB, Linux 8 MB
+ *  - mincore             tsdb_mincore: the residency vector is a char array there (statistics, residency)
  *  - fsync, fdatasync    tsdb_fsync and tsdb_fdatasync: macOS's fsync only hands the data to the drive, whose cache a
  *                        power loss empties, so they follow the real call with fcntl(F_FULLFSYNC) (the drive's own
  *                        cache flush; slower, tens of ms for a call on some SSDs). TSDB_FAST_FSYNC=1 in the
@@ -190,13 +191,20 @@ static inline int tsdb_rename_noreplace(int dirfd, const char *from, const char 
 /* the calling thread's name (macOS names only the calling thread, with no pthread_t argument) */
 static inline void tsdb_thread_name(const char *name) { pthread_setname_np(name); }
 
+/* page-cache residency of a mapping: macOS's mincore takes a char vector */
+#include <sys/mman.h>
+static inline int tsdb_mincore(void *addr, size_t len, unsigned char *vec) { return mincore(addr, len, (char *)vec); }
+
 #else /* Linux and the rest: the defaults are right */
 
 #include <pthread.h>
 #include <errno.h>
 #include <stdio.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+static inline int tsdb_mincore(void *addr, size_t len, unsigned char *vec) { return mincore(addr, len, vec); }
 
 #include <sys/socket.h>
 

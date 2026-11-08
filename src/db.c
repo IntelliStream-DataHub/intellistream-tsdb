@@ -849,6 +849,11 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->publish_lock, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
+    pthread_mutex_init(&db->tl_mu, NULL);
+    if (db->opt.stats >= 0 && tlist_make(db->opt.tenants, db->opt.ntenants, &db->tl) != 0)
+        db->tl = NULL; /* too many prefixes: no tenants; the sweeper starts with an empty list */
+    db->opt.tenants = NULL; /* the caller's strings are not ours past this call */
+    db->opt.ntenants = 0;
     pthread_mutex_init(&db->fno_lock, NULL);
     pthread_mutex_init(&db->dir_sync_lock, NULL);
     pthread_mutex_init(&db->feed_lock, NULL);
@@ -1151,6 +1156,8 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->publish_lock);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);
+    pthread_mutex_destroy(&db->tl_mu);
+    tlist_unref(db->tl);
     pthread_mutex_destroy(&db->fno_lock);
     pthread_mutex_destroy(&db->dir_sync_lock);
     pthread_mutex_destroy(&db->feed_lock);

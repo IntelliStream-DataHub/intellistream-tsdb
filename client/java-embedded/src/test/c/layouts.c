@@ -23,6 +23,8 @@ int main(void)
     F(tsdb_options, request_threads); F(tsdb_options, partition_classes); F(tsdb_options, pin_index);
     F(tsdb_options, insert_zstd_level); F(tsdb_options, stats); F(tsdb_options, stats_sweep_mb_s);
     F(tsdb_options, latest_cache);
+    F(tsdb_options, stats_recompute_s); F(tsdb_options, stats_resident_s); F(tsdb_options, tenants);
+    F(tsdb_options, ntenants);
     S(tsdb_values);
     F(tsdb_values, type); F(tsdb_values, values); F(tsdb_values, valid);
     S(tsdb_bucket);

@@ -31,7 +31,7 @@
  * db->lock and the dictionary's lock only with es->mu released. Statistics never write a file, never call eng_fail
  * and keep answering after the engine failed.
  */
-#include "internal.h"
+#include "stats_priv.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -48,6 +48,7 @@ _Static_assert(sizeof(tsdb_series_stat) == 176, "tsdb_series_stats is the 176-by
 
 typedef struct qblock {
     _Alignas(128) atomic_uint_fast64_t c[QC_N];
+    _Atomic(hotl *) hot; /* the thread's hot-reads list: made at its first sample, read by qreg_hot_collect */
 } qblock;
 
 struct qreg {
@@ -57,6 +58,7 @@ struct qreg {
     qblock **blocks;
     size_t n, cap;
     uint64_t retired[QC_N]; /* the blocks of threads that exited or dropped the handle */
+    hotl *retired_hot;      /* their hot-reads lists, folded together */
 };
 
 static atomic_uint_fast64_t qreg_serial;
@@ -77,6 +79,7 @@ static void qreg_unref(qreg *r)
     if (atomic_fetch_sub_explicit(&r->refs, 1, memory_order_acq_rel) != 1)
         return;
     free(r->blocks); /* every block was removed by its thread */
+    hotl_free(r->retired_hot);
     pthread_mutex_destroy(&r->mu);
     free(r);
 }
@@ -91,6 +94,7 @@ typedef struct qslot {
     uint64_t no;
     qreg *r;
     qblock *b;
+    uint64_t rng; /* xorshift state of the hot-reads sampling: this thread's own */
 } qslot;
 #define QSLOTS 8
 static __thread qslot qtl[QSLOTS];
@@ -109,7 +113,20 @@ static void qslot_drop(qslot *s)
         }
     for (int i = 0; i < QC_N; i++)
         r->retired[i] += atomic_load_explicit(&s->b->c[i], memory_order_relaxed);
+    hotl *h = atomic_load_explicit(&s->b->hot, memory_order_acquire);
+    if (h) { /* what this thread saw of the last two minutes goes into the registry's list */
+        int64_t epoch = hot_now_ms() / HOT_PERIOD_MS;
+        if (!r->retired_hot)
+            r->retired_hot = hotl_new();
+        pthread_mutex_lock(&h->mu);
+        if (r->retired_hot && h->epoch >= epoch - 1)
+            for (int w = 0; w < 2; w++)
+                for (uint32_t i = 0; i < h->w[w].n; i++)
+                    hotl_add(r->retired_hot, epoch, h->w[w].e[i].id, h->w[w].e[i].est);
+        pthread_mutex_unlock(&h->mu);
+    }
     pthread_mutex_unlock(&r->mu);
+    hotl_free(h);
     free(s->b);
     qreg_unref(r);
     memset(s, 0, sizeof *s);
@@ -155,24 +172,71 @@ static qslot *qslot_new(qreg *r)
         s = &qtl[qtl_next++ % QSLOTS];
         qslot_drop(s);
     }
-    *s = (qslot){.no = r->no, .r = r, .b = b};
+    *s = (qslot){.no = r->no, .r = r, .b = b,
+                 .rng = (((uint64_t)(uintptr_t)s * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)stats_mono_ns() << 7)) | 1};
     pthread_setspecific(qkey, qtl); /* any non-NULL value: the destructor runs when the thread exits */
     return s;
 }
 
-void qreg_add(qreg *r, const uint64_t v[QC_N])
+static qslot *qslot_get(qreg *r)
 {
-    qslot *s = NULL;
     for (int i = 0; i < QSLOTS; i++)
-        if (qtl[i].no == r->no) {
-            s = &qtl[i];
-            break;
-        }
-    if (!s && !(s = qslot_new(r)))
+        if (qtl[i].no == r->no)
+            return &qtl[i];
+    return qslot_new(r);
+}
+
+/* One query in eight, drawn at random for each (so no client pattern, a round robin over eight series included, lines
+ * up with it), goes into this thread's hot-reads list with weight 8. */
+static void hot_sample(qslot *s, uint64_t sid)
+{
+    uint64_t x = s->rng;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    s->rng = x;
+    if ((x >> 32) & 7)
+        return;
+    hotl *h = atomic_load_explicit(&s->b->hot, memory_order_relaxed);
+    if (!h) {
+        if (!(h = hotl_new()))
+            return;
+        atomic_store_explicit(&s->b->hot, h, memory_order_release);
+    }
+    hotl_add(h, hot_now_ms() / HOT_PERIOD_MS, sid, 8);
+}
+
+void qreg_add(qreg *r, const uint64_t v[QC_N], uint64_t sid)
+{
+    qslot *s = qslot_get(r);
+    if (!s)
         return;
     for (int i = 0; i < QC_N; i++)
         atomic_store_explicit(&s->b->c[i], atomic_load_explicit(&s->b->c[i], memory_order_relaxed) + v[i],
                               memory_order_relaxed);
+    if (sid)
+        hot_sample(s, sid);
+}
+
+void qreg_hot_note(qreg *r, uint64_t sid)
+{
+    qslot *s = qslot_get(r);
+    if (s)
+        hot_sample(s, sid);
+}
+
+void qreg_hot_collect(qreg *r, hagg *a)
+{
+    int64_t epoch = hot_now_ms() / HOT_PERIOD_MS;
+    pthread_mutex_lock(&r->mu);
+    for (size_t k = 0; k < r->n; k++) {
+        hotl *h = atomic_load_explicit(&r->blocks[k]->hot, memory_order_acquire);
+        if (h)
+            hagg_add_hotl(a, h, 0, epoch);
+    }
+    if (r->retired_hot)
+        hagg_add_hotl(a, r->retired_hot, 0, epoch);
+    pthread_mutex_unlock(&r->mu);
 }
 
 void qreg_totals(qreg *r, uint64_t out[QC_N])
@@ -188,64 +252,24 @@ void qreg_totals(qreg *r, uint64_t out[QC_N])
 
 /* ------------------------------------------------------------- the sweeper */
 
-#define RING_N 4096
 atomic_uint stats_ring_cap = RING_N;
 atomic_uint stats_pause;
 atomic_uint_fast64_t stats_open_reconciles; /* tests: reconciles that ran before the open was done: none may */
 #define TICK_MS 1000
 
-typedef struct stat_ev {
-    part *p;
-    int kind;
-} stat_ev;
-
-/* What the sweeper counted of one part. `key` is the part's address; the rest is its identity, which makes a record
- * of a freed part whose address was reused another part's no match. */
-typedef struct prec {
-    struct prec *next;
-    const part *key;
-    int64_t partition;
-    uint64_t min_block, max_block, rows;
-    uint32_t level, gen;
-    uint64_t logical, ts_bytes, val_bytes, index_bytes, other_bytes;
-} prec;
-
-typedef struct vtot {
-    uint64_t logical, ts_bytes, val_bytes, index_bytes, other_bytes;
-} vtot;
-
-struct estats {
-    eng *db;
-    stat_ev ring[RING_N];
-    atomic_uint_fast64_t head, tail;
-    atomic_bool overflow, swapped, stop;
-    atomic_bool opened; /* the open has finished: only then may the sweeper read db->parts (load_parts changes it unlocked) */
-    atomic_uint_fast64_t overflows, cpu_ns;
-    atomic_uint_fast64_t settle_req, settle_done;
-    pthread_t th;
-    bool th_started;
-    pthread_mutex_t mu; /* a leaf: records, totals, the pending list; also what cv waits on */
-    pthread_cond_t cv, done_cv;
-    prec **ht;
-    size_t htn, nrec;
-    uint32_t gen;
-    vtot tot;
-    part **pend; /* parts put off (their series are not in the dictionary yet), each with a reference */
-    size_t npend, pend_cap;
-    int64_t ready_ns; /* the throttle: the next walk may start then */
-    int64_t mb_s;
-};
-
-static int64_t mono_ns(void)
+int64_t stats_mono_ns(void)
 {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
 }
+#define mono_ns stats_mono_ns
+
+bool stats_stopping(struct estats *es) { return atomic_load_explicit(&es->stop, memory_order_relaxed); }
 
 static size_t ptr_hash(const void *p) { return (size_t)(((uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull >> 20); }
 
-static bool rec_matches(const prec *r, const part *p)
+bool rec_matches(const prec *r, const part *p)
 {
     return r->key == p && r->partition == p->partition && r->min_block == p->min_block &&
            r->max_block == p->max_block && r->level == p->level && r->rows == p->rows;
@@ -253,7 +277,7 @@ static bool rec_matches(const prec *r, const part *p)
 
 
 /* es->mu held for the record table */
-static prec *rec_find(struct estats *es, const part *p)
+prec *rec_find(struct estats *es, const part *p)
 {
     if (!es->htn)
         return NULL;
@@ -263,7 +287,7 @@ static prec *rec_find(struct estats *es, const part *p)
     return NULL;
 }
 
-static void rec_insert(struct estats *es, prec *r)
+void rec_insert(struct estats *es, prec *r)
 {
     if (es->nrec >= es->htn) { /* load factor 1; if the table cannot grow, chains get longer, nothing breaks */
         size_t n = es->htn ? es->htn * 2 : 1024;
@@ -289,7 +313,7 @@ static void rec_insert(struct estats *es, prec *r)
     es->nrec++;
 }
 
-static void tot_apply(struct estats *es, const prec *r, bool add)
+void tot_apply(struct estats *es, const prec *r, bool add)
 {
     vtot *t = &es->tot;
     if (add) {
@@ -308,7 +332,7 @@ static void tot_apply(struct estats *es, const prec *r, bool add)
 }
 
 /* Takes the record of p out of the table and the totals; the caller frees it. */
-static prec *rec_remove(struct estats *es, const part *p)
+prec *rec_remove(struct estats *es, const part *p)
 {
     if (!es->htn)
         return NULL;
@@ -325,8 +349,9 @@ static prec *rec_remove(struct estats *es, const part *p)
 
 /* Walks the index of p once: the column totals of its runs. -1: a series of p is not in the dictionary yet (a
  * follower ahead of its SERIES), so its width is unknown: the caller puts the part off. */
-static int part_walk(eng *db, const part *p, prec *r)
+int part_walk(struct estats *es, const part *p, prec *r, unsigned flags)
 {
+    eng *db = es->db;
     memset(r, 0, sizeof *r);
     r->key = p;
     r->partition = p->partition;
@@ -338,6 +363,17 @@ static int part_walk(eng *db, const part *p, prec *r)
     uint64_t rows = 0;
     if (x->nruns && x->rser[x->nruns - 1] >= eng_series_count(db))
         return -1;
+    if (flags & WALK_SPLIT) {
+        tenants_extend(es, x->nruns ? x->rser[x->nruns - 1] + 1 : 0); /* every id of the part has a tenant */
+        tenant_scratch_clear(es);
+    }
+    if ((flags & WALK_RUNCNT) && x->nruns > es->runcnt_cap) {
+        uint64_t *v = realloc(es->runcnt, (size_t)x->nruns * sizeof *v);
+        if (!v)
+            return -1; /* put off: tried again at the next tick */
+        es->runcnt = v;
+        es->runcnt_cap = x->nruns;
+    }
     for (uint32_t k = 0; k < x->nruns; k++) {
         uint32_t a = gix_rstart(x, k), b = k + 1 < x->nruns ? gix_rstart(x, k + 1) : x->n;
         if (b < a)
@@ -345,16 +381,26 @@ static int part_walk(eng *db, const part *p, prec *r)
         int type = eng_series_type(db, x->rser[k]);
         if (type < 0)
             return -1;
-        uint64_t cnt = 0, ts = 0, val = 0;
+        uint64_t cnt = 0, ts = 0, val = 0, nulls = 0, full = 0;
         for (uint32_t i = a; i < b; i++) {
-            cnt += gix_get(x, i, GF_COUNT);
+            uint64_t c = gix_get(x, i, GF_COUNT);
+            cnt += c;
+            full += c == p->grows;
+            nulls += gix_get(x, i, GF_NULLS);
             ts += gix_get(x, i, GF_TSLEN);
             val += gix_get(x, i, GF_VALLEN);
         }
         rows += cnt;
-        r->logical += cnt * (8 + type_width(type));
+        uint64_t logical = cnt * (8 + type_width(type));
+        r->logical += logical;
         r->ts_bytes += ts;
         r->val_bytes += val;
+        if (flags & WALK_RUNCNT)
+            es->runcnt[k] = cnt;
+        if (flags & WALK_SPLIT)
+            tenant_walk_run(es, x->rser[k], cnt, nulls, logical, ts, val, (uint64_t)(b - a) * x->stride + 8, b - a);
+        if ((flags & WALK_BPR) && p->level > 0 && full && cnt) /* merges' output: where compression shows */
+            hot_bpr_run(es, x->rser[k], cnt, ts + val, true);
     }
     r->index_bytes = (uint64_t)x->n * x->stride + 8ull * x->nruns;
     uint64_t used = r->ts_bytes + r->val_bytes + r->index_bytes; /* the tombstones are in "other": a part's four columns
@@ -378,7 +424,7 @@ static void sleep_cv(struct estats *es, int64_t ns)
 
 /* The throttle: a hard cap on the index bytes walked a second. A walk waits until its turn (at most 100 ms of
  * unused time is kept as a burst), then pays for itself. */
-static void throttle_wait(struct estats *es)
+void throttle_wait(struct estats *es)
 {
     if (es->mb_s <= 0)
         return;
@@ -392,7 +438,7 @@ static void throttle_wait(struct estats *es)
     pthread_mutex_unlock(&es->mu);
 }
 
-static void throttle_pay(struct estats *es, uint64_t bytes)
+void throttle_pay(struct estats *es, uint64_t bytes)
 {
     if (es->mb_s <= 0)
         return;
@@ -402,8 +448,18 @@ static void throttle_pay(struct estats *es, uint64_t bytes)
     pthread_mutex_unlock(&es->mu);
 }
 
-/* Counts p unless its record is there. false: put off. */
-static bool add_part(struct estats *es, part *p)
+/* A record is gone (its part was removed, or the list moved on): what it added to the tenant side is taken back (the
+ * partition is marked for a recount, or, when retention retired it and nothing of it is left, subtracted whole). */
+void rec_discard(struct estats *es, prec *r, bool dropped)
+{
+    pv_part_removed(es, r, dropped);
+    residency_forget(es, r);
+    free(r);
+}
+
+/* Counts p unless its record is there. `fresh`: the writer listed it after the open (its own flush, merge or
+ * insert): a level-0 one is ingest, a merge output makes its partition stale. false: put off. */
+static bool add_part(struct estats *es, part *p, bool fresh)
 {
     pthread_mutex_lock(&es->mu);
     prec *r = rec_find(es, p);
@@ -412,26 +468,35 @@ static bool add_part(struct estats *es, part *p)
     if (known)
         return true;
     throttle_wait(es);
-    prec *fresh = malloc(sizeof *fresh);
-    if (!fresh)
+    prec *rec = malloc(sizeof *rec);
+    if (!rec)
         return true; /* not counted: stats_parts_counted stays below stats_parts_listed */
-    if (part_walk(es->db, p, fresh) != 0) {
-        free(fresh);
+    bool ing = fresh && p->level == 0;
+    if (part_walk(es, p, rec, WALK_SPLIT | WALK_BPR | (ing ? WALK_RUNCNT : 0)) != 0) {
+        free(rec);
         return false;
     }
     throttle_pay(es, p->index_len);
     pthread_mutex_lock(&es->mu);
     prec *stale = rec_remove(es, p); /* the address of a part that is gone, its REMOVE lost to a full ring */
-    fresh->gen = es->gen;
-    tot_apply(es, fresh, true);
+    rec->gen = es->gen;
+    rec->mcounted = !fresh || p->level == 0; /* a merge's rows are counted by the recount that first sees the part */
+    tot_apply(es, rec, true);
     size_t before = es->nrec;
-    rec_insert(es, fresh);
-    if (es->nrec == before) { /* no table to put it in */
-        tot_apply(es, fresh, false);
-        free(fresh);
+    rec_insert(es, rec);
+    bool inserted = es->nrec != before;
+    if (!inserted) { /* no table to put it in */
+        tot_apply(es, rec, false);
+        free(rec);
     }
     pthread_mutex_unlock(&es->mu);
-    free(stale);
+    if (stale)
+        rec_discard(es, stale, false);
+    if (inserted) {
+        pv_part_added(es, rec, fresh); /* the split is in the scratch the walk filled */
+        if (ing)
+            tenants_ingest(es, p, rec);
+    }
     return true;
 }
 
@@ -463,7 +528,7 @@ static void pend_add(struct estats *es, part *p) /* takes the caller's reference
     pthread_mutex_unlock(&es->mu);
 }
 
-static void handle_remove(struct estats *es, part *p)
+static void handle_remove(struct estats *es, part *p, bool dropped)
 {
     part *gone = NULL;
     pthread_mutex_lock(&es->mu);
@@ -475,9 +540,36 @@ static void handle_remove(struct estats *es, part *p)
             break;
         }
     pthread_mutex_unlock(&es->mu);
-    free(r);
+    if (r)
+        rec_discard(es, r, dropped);
     if (gone)
         part_unref(gone);
+}
+
+/* Events in ring order. An ADD of a part that is removed again within the batch needs no walk, except a flush: its
+ * rows are ingest, and the reference the event holds keeps the part readable. */
+void process_events(struct estats *es, stat_ev *batch, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].kind == STAT_EV_REMOVE) {
+            handle_remove(es, batch[i].p, batch[i].dropped);
+            continue;
+        }
+        bool cancelled = false;
+        if (!(batch[i].fresh && batch[i].p->level == 0))
+            for (size_t j = i + 1; j < n && !cancelled; j++)
+                cancelled = batch[j].kind == STAT_EV_REMOVE && batch[j].p == batch[i].p;
+        if (cancelled || add_part(es, batch[i].p, batch[i].fresh))
+            part_unref(batch[i].p);
+        else
+            pend_add(es, batch[i].p);
+        if (atomic_load_explicit(&es->stop, memory_order_relaxed)) { /* out of the ring: release them here */
+            for (size_t j = i + 1; j < n; j++)
+                if (batch[j].kind == STAT_EV_ADD)
+                    part_unref(batch[j].p);
+            return;
+        }
+    }
 }
 
 static void drain(struct estats *es)
@@ -489,26 +581,53 @@ static void drain(struct estats *es)
             n++;
         if (!n)
             return;
-        for (size_t i = 0; i < n; i++) {
-            if (batch[i].kind == STAT_EV_REMOVE) {
-                handle_remove(es, batch[i].p);
-                continue;
-            }
-            bool cancelled = false; /* merged away within this batch: no walk for a part nobody lists any more */
-            for (size_t j = i + 1; j < n && !cancelled; j++)
-                cancelled = batch[j].kind == STAT_EV_REMOVE && batch[j].p == batch[i].p;
-            if (cancelled || add_part(es, batch[i].p))
-                part_unref(batch[i].p);
-            else
-                pend_add(es, batch[i].p);
-            if (atomic_load_explicit(&es->stop, memory_order_relaxed)) { /* out of the ring: release them here */
-                for (size_t j = i + 1; j < n; j++)
-                    if (batch[j].kind == STAT_EV_ADD)
-                        part_unref(batch[j].p);
-                return;
-            }
-        }
+        process_events(es, batch, n);
+        if (atomic_load_explicit(&es->stop, memory_order_relaxed))
+            return;
     }
+}
+
+bool partition_cut(struct estats *es, int64_t key, part ***psp, size_t *npp)
+{
+    eng *db = es->db;
+    stat_ev *batch = malloc(RING_N * sizeof *batch);
+    if (!batch)
+        return false;
+    size_t nb = 0;
+    pthread_mutex_lock(&db->lock);
+    while (nb < RING_N && ring_pop(es, &batch[nb]))
+        nb++;
+    size_t lo = 0, hi = db->nparts; /* the list is ordered by partition first (part_cmp) */
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (db->parts[mid]->partition < key)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    size_t end = lo;
+    while (end < db->nparts && db->parts[end]->partition == key)
+        end++;
+    part **ps = malloc((end - lo ? end - lo : 1) * sizeof *ps);
+    if (ps)
+        for (size_t i = lo; i < end; i++) {
+            part_ref(db->parts[i]);
+            ps[i - lo] = db->parts[i];
+        }
+    pthread_mutex_unlock(&db->lock);
+    if (!ps) { /* their changes are not in any list we have: the sweeper reconciles */
+        for (size_t i = 0; i < nb; i++)
+            if (batch[i].kind == STAT_EV_ADD)
+                part_unref(batch[i].p);
+        atomic_store(&es->overflow, true);
+        free(batch);
+        return false;
+    }
+    process_events(es, batch, nb);
+    free(batch);
+    *psp = ps;
+    *npp = end - lo;
+    return true;
 }
 
 /* The records against the list. Under db->lock the queued events are dropped (their changes are in the list copied
@@ -556,6 +675,7 @@ static void reconcile(struct estats *es)
         else
             continue;
     }
+    prec *dead = NULL; /* records of parts the list no longer has: their partitions are counted again */
     for (size_t b = 0; b < es->htn; b++)
         for (prec **pp = &es->ht[b]; *pp;) {
             prec *r = *pp;
@@ -566,14 +686,20 @@ static void reconcile(struct estats *es)
             *pp = r->next;
             es->nrec--;
             tot_apply(es, r, false);
-            free(r);
+            r->next = dead;
+            dead = r;
         }
     pthread_mutex_unlock(&es->mu);
+    while (dead) {
+        prec *r = dead;
+        dead = r->next;
+        rec_discard(es, r, false);
+    }
     for (size_t i = 0; i < nfreed; i++)
         part_unref(freed[i]);
     free(freed);
-    for (size_t i = 0; i < nt; i++)
-        if (!atomic_load_explicit(&es->stop, memory_order_relaxed) && !add_part(es, todo[i])) {
+    for (size_t i = 0; i < nt; i++) /* not ingest: the previous list was counted by someone else or never seen */
+        if (!atomic_load_explicit(&es->stop, memory_order_relaxed) && !add_part(es, todo[i], false)) {
             part_ref(todo[i]);
             pend_add(es, todo[i]);
         }
@@ -601,7 +727,7 @@ static void retry_pending(struct estats *es)
         pthread_mutex_unlock(&es->db->lock);
         if (!listed) {
             part_unref(v[i]);
-        } else if (add_part(es, v[i])) {
+        } else if (add_part(es, v[i], false)) {
             part_unref(v[i]);
         } else {
             pend_add(es, v[i]);
@@ -621,21 +747,30 @@ static void *sweeper_main(void *arg)
             usleep(1000); /* tests only */
         uint64_t req = atomic_load(&es->settle_req);
         bool opened = atomic_load(&es->opened);
-        if (opened && (atomic_load(&es->overflow) || atomic_load(&es->swapped)))
+        if (opened && (atomic_load(&es->overflow) || atomic_load(&es->swapped))) {
+            if (atomic_load(&es->overflow))
+                atomic_store(&es->ingest_approx, true); /* what the lost events added is not counted as ingest */
             reconcile(es);
+        }
+        tenants_apply_list(es);
+        tenants_extend(es, eng_series_count(es->db)); /* the series that no part names yet have a tenant too */
         drain(es);
-        if (opened)
+        bool more = false;
+        if (opened) {
             retry_pending(es);
+            more = tenants_step(es, atomic_load(&es->settle_done) < req);
+            residency_step(es);
+        }
         struct timespec ct;
         if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ct) == 0)
             atomic_store(&es->cpu_ns, (uint64_t)ct.tv_sec * 1000000000u + (uint64_t)ct.tv_nsec);
         pthread_mutex_lock(&es->mu);
-        if (atomic_load(&es->settle_done) < req) {
+        if (atomic_load(&es->settle_done) < req && !more) {
             atomic_store(&es->settle_done, req);
             pthread_cond_broadcast(&es->done_cv);
         }
         /* before the end of the open an overflow stays set, and is no work yet */
-        bool idle = !(opened && (atomic_load(&es->overflow) || atomic_load(&es->swapped))) &&
+        bool idle = !more && !(opened && (atomic_load(&es->overflow) || atomic_load(&es->swapped))) &&
                     atomic_load(&es->head) == atomic_load(&es->tail) && atomic_load(&es->settle_req) == req;
         if (idle && !atomic_load(&es->stop))
             sleep_cv(es, (int64_t)TICK_MS * 1000000);
@@ -657,7 +792,8 @@ void stats_push(eng *db, part *p, int kind)
     }
     if (kind == STAT_EV_ADD)
         part_ref(p);
-    es->ring[h % RING_N] = (stat_ev){p, kind};
+    es->ring[h % RING_N] = (stat_ev){p, (uint8_t)kind, kind == STAT_EV_ADD && atomic_load_explicit(&es->opened, memory_order_relaxed),
+                                     kind == STAT_EV_REMOVE && p->dropped}; /* db->lock is held: dropped is stable */
     atomic_store_explicit(&es->head, h + 1, memory_order_release);
     if (h + 1 - t == MAX(1u, atomic_load_explicit(&stats_ring_cap, memory_order_relaxed) / 2))
         pthread_cond_signal(&es->cv);
@@ -675,9 +811,13 @@ static void estats_free(struct estats *es)
     for (size_t b = 0; b < es->htn; b++)
         for (prec *r = es->ht[b], *nx; r; r = nx) {
             nx = r->next;
+            rec_free_res(r);
             free(r);
         }
     free(es->ht);
+    tenants_free(es);
+    hotl_free(es->hw);
+    free(es->runcnt);
     pthread_mutex_destroy(&es->mu);
     pthread_cond_destroy(&es->cv);
     pthread_cond_destroy(&es->done_cv);
@@ -693,9 +833,13 @@ void stats_start(eng *db, bool reconcile_first)
         return;
     es->db = db;
     es->mb_s = db->opt.stats_sweep_mb_s == 0 ? 256 : db->opt.stats_sweep_mb_s;
+    es->recompute_ns = (int64_t)(db->opt.stats_recompute_s == 0 ? 30 : db->opt.stats_recompute_s) * 1000000000;
+    es->res_period_ns = (int64_t)(db->opt.stats_resident_s == 0 ? 600 : db->opt.stats_resident_s) * 1000000000;
+    es->hw = hotl_new();
     pthread_mutex_init(&es->mu, NULL);
     pthread_cond_init(&es->cv, NULL);
     pthread_cond_init(&es->done_cv, NULL);
+    tenants_init(es);
     if (reconcile_first) { /* a start after the open (lazy, or a follower's) */
         atomic_store(&es->swapped, true);
         atomic_store(&es->opened, true);
@@ -776,6 +920,7 @@ void stats_fill(eng *db, tsdb_volume_stats *vs)
     vs->stats_parts_listed = vs->parts;
     vs->stats_ring_overflows = atomic_load(&es->overflows);
     vs->stats_cpu_ns = atomic_load(&es->cpu_ns);
+    vs->stats_tmap_bytes = tenants_map_bytes(es);
 }
 
 int stats_settle(eng *db, int timeout_ms)
@@ -917,7 +1062,7 @@ static void mem_account(const memtable *mt, const uint32_t *ids, size_t m, tsdb_
     }
 }
 
-void sscx_run(sscx *x, const uint32_t *ids, size_t m, tsdb_series_stat *out, uint64_t *probes)
+void sscx_run(sscx *x, const uint32_t *ids, size_t m, tsdb_series_stat *out, uint64_t *probes, bool resident)
 {
     eng *db = x->db;
     sacc acc[256];
@@ -982,6 +1127,13 @@ void sscx_run(sscx *x, const uint32_t *ids, size_t m, tsdb_series_stat *out, uin
                 o->index_bytes += (uint64_t)(b - a) * g->stride + 8;
                 o->granules += b - a;
                 o->full_granules += full;
+                if (resident) { /* a series' granules are contiguous in a part: one mincore for the run */
+                    uint64_t off0 = gix_get(g, a, GF_OFF);
+                    uint64_t off1 = gix_get(g, b - 1, GF_OFF) + gix_get(g, b - 1, GF_TSLEN) + gix_get(g, b - 1, GF_VALLEN);
+                    if (off1 > off0 && off1 <= p->map_len)
+                        o->resident_bytes += resident_bytes_range(p->map + off0, off1 - off0);
+                    *probes += 1 + (off1 > off0 ? (off1 - off0) / 4096 / 16 : 0); /* a syscall and its page vector */
+                }
                 o->parts++;
                 if (!acc[i].inpart || acc[i].lastp != p->partition) /* parts are listed by partition */
                     o->partitions++;

@@ -80,6 +80,12 @@ static void usage(void)
             "  feed new-id                        a new feed id for every volume (after restoring a backup)\n"
             "  stats                              rows, parts, size, compression ratio, where the bytes go\n"
             "  stats series NAME...               rows, bytes, parts and range of each series\n"
+            "  stats tenants [PREFIX...] [--volumes] [--tenants FILE]\n"
+            "                                     rows and bytes per tenant: the series whose name starts with\n"
+            "                                     a prefix (the longest wins; the rest are \"(none)\"); prefixes\n"
+            "                                     from the arguments and FILE (one per line, # comments)\n"
+            "  stats hot [reads|writes|bytes] [-k N]  the series with the most bytes per row (reads and writes\n"
+            "                                     are counted by a running server, so they are empty here)\n"
             "  parts                              list active parts (partition class and range)\n"
             "  optimize                           merge every partition into one part\n"
             "  drop-before <time>                 drop whole partitions ending before <time>\n"
@@ -895,6 +901,159 @@ static int cmd_feed(tsdb *db, int argc, char **argv)
     return 0;
 }
 
+/* The tenant list of `stats tenants`: the PREFIX arguments and the lines of --tenants FILE. The strings live until
+ * the process ends (tsdb_options.tenants copies them at the open, the printing reads the list back from the handle). */
+static const char **tenant_list;
+static size_t tenant_n;
+static bool tenant_volumes;
+
+static void tenant_add(const char *p)
+{
+    const char **n = realloc(tenant_list, (tenant_n + 1) * sizeof *n);
+    char *c = strdup(p);
+    if (!n || !c)
+        die("stats tenants", TSDB_ERR_NOMEM);
+    tenant_list = n;
+    tenant_list[tenant_n++] = c;
+}
+
+static void tenant_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "tsdb: %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    char line[4096];
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        if (n && line[n - 1] != '\n' && !feof(f)) {
+            fprintf(stderr, "tsdb: %s: a line longer than %zu bytes\n", path, sizeof line - 1);
+            exit(1);
+        }
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = 0;
+        if (n && line[0] != '#')
+            tenant_add(line);
+    }
+    fclose(f);
+}
+
+/* argv[4..): before the open, which needs the list */
+static void tenant_args(int argc, char **argv)
+{
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "--volumes") == 0)
+            tenant_volumes = true;
+        else if (strcmp(argv[i], "--tenants") == 0 && i + 1 < argc)
+            tenant_file(argv[++i]);
+        else if (argv[i][0] == '-' && argv[i][1] == '-')
+            usage();
+        else if (argv[i][0] == 0)
+            usage();
+        else
+            tenant_add(argv[i]);
+    }
+}
+
+static void print_tenant(const char *label, const tsdb_tenant_stats *t, const char *where)
+{
+    char lg[32], ph[32], rs[32];
+    human((double)t->logical_bytes, lg, sizeof lg);
+    human((double)(t->ts_bytes + t->value_bytes + t->index_bytes), ph, sizeof ph);
+    human((double)t->resident_bytes, rs, sizeof rs);
+    put_name(stdout, label);
+    printf("\t%s\t%" PRIu64 " series\t%" PRIu64 " rows (%" PRIu64 " nulls)\t%s on disk (%s uncompressed)\t%" PRIu64
+           " granules\t%" PRIu64 " active series (last hour)\t%s in the page cache (sampled)\n",
+           where, t->series, t->rows, t->nulls, ph, lg, t->granules, t->active_series_prev, rs);
+}
+
+/* `tsdb DIR stats tenants`: one line per prefix of the list, then "(none)". The CLI runs the sweep itself first (the
+ * numbers a running tsdbd keeps are in its process), so it takes as long as the index walk of every part. */
+static int cmd_stats_tenants(tsdb *db)
+{
+    int rc = tsdb_stats_settle(db, 600000);
+    if (rc)
+        die("stats tenants", rc);
+    uint32_t nv = tsdb_volume_count(db);
+    for (size_t i = 0;; i++) {
+        char pf[1024];
+        int n = tsdb_tenant_prefix(db, i, pf, sizeof pf);
+        if (n == TSDB_ERR_NOTFOUND)
+            break;
+        if (n < 0)
+            die("stats tenants", n);
+        for (uint32_t v = tenant_volumes ? 0 : TSDB_TENANT_VOLUME_SUM;; v++) {
+            tsdb_tenant_stats t;
+            char where[32] = "all";
+            uint32_t vol = tenant_volumes ? v : TSDB_TENANT_VOLUME_SUM;
+            if (tenant_volumes)
+                snprintf(where, sizeof where, "volume %u", v);
+            if ((rc = tsdb_tenant_stats_get(db, pf, vol, &t)) != 0)
+                die("stats tenants", rc);
+            print_tenant(pf, &t, where);
+            if (t.flags & TSDB_TENANT_PARTIAL)
+                fprintf(stderr, "tsdb: the numbers of %s are stale\n", pf);
+            if (!tenant_volumes || v + 1 >= nv)
+                break;
+        }
+    }
+    for (uint32_t v = tenant_volumes ? 0 : TSDB_TENANT_VOLUME_SUM;; v++) {
+        tsdb_tenant_stats t;
+        char where[32] = "all";
+        uint32_t vol = tenant_volumes ? v : TSDB_TENANT_VOLUME_SUM;
+        if (tenant_volumes)
+            snprintf(where, sizeof where, "volume %u", v);
+        if ((rc = tsdb_tenant_stats_get(db, NULL, vol, &t)) != 0)
+            die("stats tenants", rc);
+        print_tenant("(none)", &t, where);
+        if (!tenant_volumes || v + 1 >= nv)
+            break;
+    }
+    return 0;
+}
+
+/* `tsdb DIR stats hot [reads|writes|bytes] [-k N]` */
+static int cmd_stats_hot(tsdb *db, int argc, char **argv)
+{
+    int kind = TSDB_HOT_BYTES_PER_ROW;
+    size_t k = 20;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "reads") == 0)
+            kind = TSDB_HOT_READS;
+        else if (strcmp(argv[i], "writes") == 0)
+            kind = TSDB_HOT_WRITES;
+        else if (strcmp(argv[i], "bytes") == 0)
+            kind = TSDB_HOT_BYTES_PER_ROW;
+        else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+            char *end;
+            long v = strtol(argv[++i], &end, 10);
+            if (*end || v < 1 || v > 256)
+                usage();
+            k = (size_t)v;
+        } else {
+            usage();
+        }
+    }
+    int rc = tsdb_stats_settle(db, 600000);
+    if (rc)
+        die("stats hot", rc);
+    tsdb_hot hot[256];
+    size_t n = 0;
+    uint64_t thr = 0;
+    if ((rc = tsdb_hot_series(db, kind, hot, k, &n, &thr)) != 0)
+        die("stats hot", rc);
+    for (size_t i = 0; i < n; i++) {
+        const char *name = tsdb_series_name(db, hot[i].id);
+        put_name(stdout, name ? name : "?");
+        if (kind == TSDB_HOT_BYTES_PER_ROW)
+            printf("\t%.3f bytes/row\n", (double)hot[i].estimate / 1000.0);
+        else
+            printf("\t%" PRIu64 " (+- %" PRIu64 ")\n", hot[i].estimate, hot[i].error);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
@@ -962,6 +1121,11 @@ int main(int argc, char **argv)
     o.create_volumes = 0; /* volumes are added by "volume add", as for tsdbd */
     o.stats = 0;          /* "stats" settles the sweeper once; every other verb never starts it */
     o.stats_sweep_mb_s = -1; /* a one-shot walk of the indexes: no cap */
+    if (strcmp(cmd, "stats") == 0 && argc >= 4 && strcmp(argv[3], "tenants") == 0) {
+        tenant_args(argc, argv);
+        o.tenants = tenant_list;
+        o.ntenants = tenant_n;
+    }
     if (!writes && access(dir, F_OK) != 0) {
         fprintf(stderr, "tsdb: %s does not exist\n", dir);
         return 1;
@@ -1015,6 +1179,10 @@ int main(int argc, char **argv)
             printf("%u\t%s\n", i, tsdb_volume_path(db, i));
     } else if (strcmp(cmd, "stats") == 0 && argc >= 4 && strcmp(argv[3], "series") == 0) {
         rc = cmd_stats_series(db, argc - 4, argv + 4);
+    } else if (strcmp(cmd, "stats") == 0 && argc >= 4 && strcmp(argv[3], "tenants") == 0) {
+        rc = cmd_stats_tenants(db);
+    } else if (strcmp(cmd, "stats") == 0 && argc >= 4 && strcmp(argv[3], "hot") == 0) {
+        rc = cmd_stats_hot(db, argc - 4, argv + 4);
     } else if (strcmp(cmd, "stats") == 0) {
         rc = cmd_stats(db);
     } else if (strcmp(cmd, "parts") == 0) {
