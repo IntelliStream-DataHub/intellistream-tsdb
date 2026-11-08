@@ -32,6 +32,7 @@
 #include "harness.h"
 #include "meta.h"
 #include "raft/raft.h"
+#include "raft/raft_log.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -1663,8 +1664,13 @@ static void power_loss(int snaps)
     scenario(snaps ? "powersnap" : "power");
     const char *so = getenv("CRASHFS_SO") ? getenv("CRASHFS_SO") : "./build/libcrashfs.so";
     if (access(so, F_OK) != 0) {
+#ifdef __linux__
+        /* a missing shim must not pass as a skipped test (ha-s1 review 8): make builds it with this test */
+        die("no %s (make build/libcrashfs.so): the power-loss scenarios cannot run, and must not pass as skipped", so);
+#else
         printf("  skipped: no %s\n", so);
         return;
+#endif
     }
     /* the ASan runtime must come first in the library list: with crashfs preloaded the server refuses to start */
     int asan = 0;
@@ -1736,6 +1742,95 @@ static void power_loss(int snaps)
     view_free(&v);
 }
 static void scen_power(void) { power_loss(0); }
+
+/* A voter's vote survives a power loss (ha-s1 review 8; the single-voter power scenario sees only the term). Three
+ * voters, crashfs under n2. The leader is killed, n1 and n2 elect one in a higher term T (n2 votes for the winner or
+ * for itself, saving the hard state first), then n2 loses power at its next tracked operation (a proposal's append).
+ * What its state directory holds then must say it voted in T, and for whom: a hard save that kept the term but lost
+ * the vote would let it vote again for another candidate in T (two leaders), and one that kept nothing is worse. */
+static void scen_powervote(void)
+{
+    scenario("powervote");
+    const char *so = getenv("CRASHFS_SO") ? getenv("CRASHFS_SO") : "./build/libcrashfs.so";
+    if (access(so, F_OK) != 0) {
+#ifdef __linux__
+        die("no %s (make build/libcrashfs.so): the power-loss scenarios cannot run, and must not pass as skipped", so);
+#else
+        printf("  skipped: no %s\n", so);
+        return;
+#endif
+    }
+#if defined(__SANITIZE_ADDRESS__)
+    printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
+    return;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
+    return;
+#endif
+#endif
+    static char pe[PATH_MAX * 2 + 128];
+    char st[PATH_MAX + 160], dir2[PATH_MAX + 160];
+    snprintf(dir2, sizeof dir2, "%s/n2", base);
+    snprintf(st, sizeof st, "%s/n2/state", base);
+    if (mkdir(dir2, 0755) != 0 || mkdir(st, 0755) != 0)
+        die("mkdir %s: %s", st, strerror(errno));
+    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s", so, st);
+    penv[2] = pe;
+    envs[3] = "free_min=9999999999999999"; /* a watcher: the proposal that makes n2 append */
+    for (int i = 0; i < 4; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    struct view v;
+    view(0, &v);
+    struct catch_up c = {v.m.applied, meta_hash(&v.m)};
+    uint64_t term0 = v.st.term;
+    view_free(&v);
+    await_view(2, p_caught_up, &c, "n2 caught up");
+    stop(0, SIGKILL);
+    uint64_t t0 = now_ms(), term = 0;
+    uint32_t leader = 0;
+    while (now_ms() - t0 < 20000 && !leader) {
+        view(2, &v);
+        if (v.st.term > term0 && v.st.leader && v.st.leader != ids[0]) {
+            term = v.st.term;
+            leader = v.st.leader;
+        }
+        view_free(&v);
+        if (!leader)
+            usleep(100000);
+    }
+    if (!leader)
+        die("no new leader after the first one was killed");
+    int li = leader == ids[1] ? 1 : 2;
+    signal_child(pids[2], SIGUSR2); /* the power fails at n2's next tracked operation */
+    char addr[META_ADDR_MAX], err[1024];
+    peer_of(li, addr, sizeof addr);
+    uint8_t req[META_ADDR_MAX + 2], *rep = NULL;
+    size_t rl = node_add_req(3, req), replen = 0;
+    int rc;
+    cluster_admin(addr, secret, secret_len, CLUSTER_OP_NODE_ADD, req, rl, 2000, &rc, &rep, &replen, err, sizeof err);
+    free(rep);
+    int status = await_exit(2, 15000);
+    if (status != 99)
+        die("server 2 ended with status %d after the power loss, expected 99 (crashfs)", status);
+    char rd[PATH_MAX + 200];
+    snprintf(rd, sizeof rd, "%s/raft", st);
+    raft_hard_state hs;
+    memset(&hs, 0, sizeof hs);
+    char lerr[512] = "";
+    if (raft_log_hard_load(rd, &hs, lerr, sizeof lerr) != ISO_OK)
+        die("after the power loss server 2 holds no hard state (it voted in term %" PRIu64 "): %s", term, lerr);
+    if (hs.term < term || (hs.term == term && hs.vote != leader))
+        die("after the power loss server 2's hard state is term %" PRIu64 " voted for %" PRIu32 ", it voted in term %" PRIu64
+            " for %" PRIu32,
+            (uint64_t)hs.term, (uint32_t)hs.vote, term, leader);
+    printf("  a voter's vote in term %" PRIu64 " (for node %" PRIu32 ") survives a power loss\n", term, leader);
+}
 static void scen_powersnap(void) { power_loss(1); }
 
 /* Placement (item 10): a replacement voter comes from a power feed the voters do not use. */
@@ -1973,7 +2068,7 @@ int main(int argc, char **argv)
                {"witness", scen_witness},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
-               {"installshared", scen_install_shared}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault}};
+               {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
