@@ -46,6 +46,9 @@
  *    order they were made for each name: once one on a name is undone,
  *    every later one on that name (or inside it) is undone too.
  *
+ * A duplicate of a tracked descriptor (dup, dup2, dup3, fcntl F_DUPFD) is the same file: syncing it makes the file
+ * durable (the Raft log of tsdbd --cluster hands duplicates of its segments to a worker to sync).
+ *
  * syncfs of a tracked file or directory makes everything on its file system
  * durable (files that lie after an injected EIO excepted), and is a point
  * where the EIO can be injected.
@@ -175,6 +178,10 @@ REAL(renameat);
 REAL(unlink);
 REAL(unlinkat);
 REAL(close);
+REAL(dup);
+REAL(dup2);
+REAL(dup3);
+REAL(fcntl);
 REAL(mkdir);
 REAL(mkdirat);
 REAL(ftruncate);
@@ -211,6 +218,10 @@ __attribute__((constructor)) static void init(void)
     LOAD(unlink);
     LOAD(unlinkat);
     LOAD(close);
+    LOAD(dup);
+    LOAD(dup2);
+    LOAD(dup3);
+    LOAD(fcntl);
     LOAD(mkdir);
     LOAD(mkdirat);
     LOAD(ftruncate);
@@ -1243,6 +1254,51 @@ int ftruncate(int fd, off_t len)
 }
 
 int ftruncate64(int fd, off_t len) __attribute__((alias("ftruncate")));
+
+/* a duplicate of a tracked descriptor is the same open file: its fsync makes the file durable (the Raft log hands
+ * duplicates of its segments to a worker thread to sync) */
+static void dup_note(int from, int to)
+{
+    if (to < 0 || to >= MAX_FDS || from < 0 || from >= MAX_FDS || to == from)
+        return;
+    pthread_mutex_lock(&lock);
+    free(fdpath[to]);
+    fdpath[to] = fdpath[from] ? strdup(fdpath[from]) : NULL;
+    pthread_mutex_unlock(&lock);
+}
+
+int dup(int fd)
+{
+    int r = real_dup(fd);
+    dup_note(fd, r);
+    return r;
+}
+
+int dup2(int fd, int to)
+{
+    int r = real_dup2(fd, to);
+    dup_note(fd, r);
+    return r;
+}
+
+int dup3(int fd, int to, int flags)
+{
+    int r = real_dup3(fd, to, flags);
+    dup_note(fd, r);
+    return r;
+}
+
+int fcntl(int fd, int cmd, ...)
+{
+    va_list ap;
+    va_start(ap, cmd);
+    void *arg = va_arg(ap, void *); /* every command takes at most one int, long or pointer */
+    va_end(ap);
+    int r = real_fcntl(fd, cmd, arg);
+    if (r >= 0 && (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC))
+        dup_note(fd, r);
+    return r;
+}
 
 int close(int fd)
 {

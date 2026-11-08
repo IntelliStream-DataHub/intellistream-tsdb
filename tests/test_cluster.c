@@ -65,6 +65,7 @@ static pid_t pids[N];
 static int pports[N], stopped[N];
 static const char *envs[N]; /* TSDB_CLUSTER_TEST of server i */
 static const char *xargs[N]; /* more tsdbd options of server i, separated by spaces (--rack R, --power-feed F) */
+static const char *penv[N];  /* environment of server i: NAME=VALUE, separated by spaces (LD_PRELOAD of crashfs) */
 static int is_witness[N];    /* server i runs --witness: no --dir, no volumes */
 static uint32_t ids[N];     /* member id of server i (0 until it is a member) */
 
@@ -137,6 +138,15 @@ static void start(int i)
             setenv("TSDB_CLUSTER_TEST", envs[i], 1);
         else
             unsetenv("TSDB_CLUSTER_TEST");
+        char penvbuf[PATH_MAX * 2 + 256];
+        snprintf(penvbuf, sizeof penvbuf, "%s", penv[i] ? penv[i] : "");
+        for (char *t = strtok(penvbuf, " "); t; t = strtok(NULL, " ")) {
+            char *eq = strchr(t, '=');
+            if (eq) {
+                *eq = 0;
+                setenv(t, eq + 1, 1);
+            }
+        }
         char state[PATH_MAX + 90];
         snprintf(state, sizeof state, "%s/state", dir);
         const char *argv[40];
@@ -240,6 +250,7 @@ static void scenario(const char *name)
     memset(stopped, 0, sizeof stopped);
     memset(envs, 0, sizeof envs);
     memset(xargs, 0, sizeof xargs);
+    memset(penv, 0, sizeof penv);
     memset(is_witness, 0, sizeof is_witness);
     snprintf(base, sizeof base, "%s/%s", root, name);
     if (mkdir(base, 0755) != 0)
@@ -1634,6 +1645,82 @@ static void scen_syncrace(void)
     printf("  entries appended under an outstanding sync round are synced by the next one\n");
 }
 
+/* Power loss on the metadata state (crashfs under server 0's state directory): what the leader acknowledged, it keeps.
+ * Three watchers join (the one voter commits each entry after its own sync), then the power fails at the next write
+ * the server makes. After the restart the state holds everything that was acknowledged and the term has gone up.
+ * Catches a log that is never synced (applied falls back), a hard state that is never saved (the term restarts from
+ * the start) and a snapshot whose directory entry is not synced (with `snaps`: the log was compacted behind it, and the
+ * state goes back to an earlier image). Planted in a copy of the server, `power` fails on the unsynced log (C1) and on
+ * the unsaved hard state (C2), `powersnap` on those and on the snapshot without its directory sync (C7); the clean
+ * server passes every run. crashfs follows dup'ed descriptors for this (the log syncs duplicates of its segments).
+ * No CRASHFS_TEAR: a tear may keep every unsynced byte, which would let the unsynced log pass now and then. */
+static void power_loss(int snaps)
+{
+    scenario(snaps ? "powersnap" : "power");
+    const char *so = getenv("CRASHFS_SO") ? getenv("CRASHFS_SO") : "./build/libcrashfs.so";
+    if (access(so, F_OK) != 0) {
+        printf("  skipped: no %s\n", so);
+        return;
+    }
+    static char pe[PATH_MAX * 2 + 128];
+    char st[PATH_MAX + 160];
+    snprintf(st, sizeof st, "%s/n0/state", base);
+    char dir0[PATH_MAX + 160];
+    snprintf(dir0, sizeof dir0, "%s/n0", base);
+    if (mkdir(dir0, 0755) != 0 || mkdir(st, 0755) != 0)
+        die("mkdir %s: %s", st, strerror(errno));
+    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s", so, st);
+    penv[0] = pe;
+    envs[0] = snaps ? "snap_every=2,snap_retain=1,seg_bytes=200" : NULL;
+    for (int i = 1; i < 5; i++)
+        envs[i] = "free_min=9999999999999999"; /* watchers: never voters, so server 0 stays the one voter */
+    for (int i = 0; i < 5; i++)
+        start(i);
+    init_fast(0);
+    for (int i = 1; i < 4; i++)
+        node_add(0, i);
+    /* a clean restart first: the term goes up and must be saved */
+    usleep(500000);
+    stop(0, SIGTERM);
+    start(0);
+    await_view(0, p_leader_self, NULL, "server 0 leading again");
+    usleep(1500000);
+    struct view v;
+    view(0, &v);
+    uint64_t term0 = v.st.term, applied0 = v.m.applied;
+    uint32_t members0 = v.m.nmembers;
+    view_free(&v);
+    if (members0 != 4)
+        die("server 0 has %u members before the power loss, expected 4", (unsigned)members0);
+    /* the power fails at the next tracked operation: a proposal makes one */
+    signal_child(pids[0], SIGUSR2);
+    char addr[META_ADDR_MAX], err[1024];
+    peer_of(0, addr, sizeof addr);
+    uint8_t req[META_ADDR_MAX + 2], *rep = NULL;
+    size_t rl = node_add_req(4, req), replen = 0;
+    int rc;
+    cluster_admin(addr, secret, secret_len, CLUSTER_OP_NODE_ADD, req, rl, 2000, &rc, &rep, &replen, err, sizeof err);
+    free(rep);
+    int status = await_exit(0, 15000);
+    if (status != 99)
+        die("server 0 ended with status %d after the power loss, expected 99 (crashfs)", status);
+    start(0);
+    await_view(0, p_leader_self, NULL, "server 0 leading after the power loss");
+    view(0, &v);
+    if (v.m.nmembers < members0 || v.m.applied < applied0)
+        die("after the power loss server 0 holds %u members and applied %" PRIu64 ", it had acknowledged %u and %" PRIu64,
+            (unsigned)v.m.nmembers, v.m.applied, (unsigned)members0, applied0);
+    if (v.st.term <= term0)
+        die("after the power loss the term is %" PRIu64 ", it was %" PRIu64 " (the hard state was not kept)", v.st.term,
+            term0);
+    printf("  after a power loss the leader holds all %u acknowledged members (applied %" PRIu64 " of %" PRIu64
+           "), term %" PRIu64 " -> %" PRIu64 "\n",
+           (unsigned)members0, v.m.applied, applied0, term0, v.st.term);
+    view_free(&v);
+}
+static void scen_power(void) { power_loss(0); }
+static void scen_powersnap(void) { power_loss(1); }
+
 /* Placement (item 10): a replacement voter comes from a power feed the voters do not use. */
 static void scen_feed(void)
 {
@@ -1695,7 +1782,7 @@ int main(int argc, char **argv)
                {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"stall", scen_stall},
                {"witness", scen_witness},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
-               {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace},   {"life", scen_life}};
+               {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
