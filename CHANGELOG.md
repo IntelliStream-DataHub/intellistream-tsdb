@@ -38,7 +38,11 @@ disk format and the wire protocol.
   voter role in shared mode (a `retired` mark in the state directory; replicated mode still stops the server). Heartbeats
   carry sections (owned volumes, storage domains, node flags); every member keeps a copy of the metadata it serves
   after a restart, marked stale. The disk worker takes log syncs and snapshot writes off the cluster thread; a leader
-  whose own sync has been out for 2 s hands leadership on.
+  whose own sync has been out for 2 s hands leadership on. The copy a member keeps never goes back to an older
+  image from a lagging voter (only a restore replaces it with one), voters keep one too, and in shared mode every
+  state-directory fault (snapshot, install, kept image, copy file) ends only the voter role. Under
+  `failover = attested` or `bmc` every grant that moves a shared volume to another node needs an attestation, except
+  PLANNED and REFUSED; a CLAIM_FAILED bar lifts only when the node's `claim_ok` flag goes from 0 to 1.
 - New status codes -18 (`TSDB_ERR_FEED_GONE`) and -19 (`TSDB_ERR_FEED_RESET`) are reserved in `tsdb.h` for the change
   feed; nothing returns them yet.
 - **Wire protocol 13: every HA body, before the 1.0 freeze** (step S0, the wire half; docs/ha.md 15.4,
