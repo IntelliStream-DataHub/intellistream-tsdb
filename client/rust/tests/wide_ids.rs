@@ -71,7 +71,7 @@ fn requests(level: i32, f: impl FnOnce(&mut Client)) -> Seen {
     f(&mut c);
     drop(c);
     let (hello, seen) = h.join().unwrap();
-    assert_eq!(hello, Some(13u32.to_le_bytes().to_vec()));
+    assert_eq!(hello, Some(14u32.to_le_bytes().to_vec()));
     seen
 }
 
@@ -93,13 +93,13 @@ fn a_server_older_than_12_is_refused_at_connect() {
         assert!(e.to_string().contains(&want));
         assert_eq!(e.code(), -3);
         let (hello, seen) = h.join().unwrap();
-        assert_eq!(hello, Some(13u32.to_le_bytes().to_vec())); // the client said 13
+        assert_eq!(hello, Some(14u32.to_le_bytes().to_vec())); // the client said 14
         assert!(seen.is_empty(), "nothing but HELLO was sent");
     }
     // a newer server is fine: the client speaks what it knows
-    let (addr, h) = fake_server(13);
+    let (addr, h) = fake_server(15);
     let mut c = Client::connect(addr).unwrap();
-    assert_eq!(c.protocol_version().unwrap(), 14);
+    assert_eq!(c.protocol_version().unwrap(), 15);
     drop(c);
     h.join().unwrap();
 }

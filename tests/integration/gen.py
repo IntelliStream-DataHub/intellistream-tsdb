@@ -210,6 +210,10 @@ def wave2_script(lang, rng, model, scale=1.0):
         times = sorted(model.rows[name])
         legacy = name.endswith(".f32leg")
         correct(rng, sc, name, ty, times, nulls=not legacy, legacy=legacy)
+        if not legacy:
+            # a null over the newest row, after the first flush: the latest table, which knows that row, must stop
+            # answering it (the random corrections hit the newest row of a series too rarely to test this)
+            sc.batch(name, ty, rng.choice(LEVELS), rand_flags(rng, legacy), [(times[-1], "N")])
     new = lang + ".late"
     sc.series(new, "float64")
     sc.batch(new, "float64", 1, "sync", [(t, value_token(rng, "float64", t)) for t in sparse_times(0.2)])

@@ -1010,6 +1010,54 @@ B the slow path (`WITH_NULLS`, 2 readers x 4,096 ids, 3 repetitions, 15 rounds, 
   10^6 series (the pause above hides the window's effect on the worst case; the review's own run saw worst lookups of
   2 to 6 ms with the window and 5 to 12 ms without). The window threshold itself is not measured below 10^6 series.
 
+### 9.3 Measured at step 3: lookups over TCP under steady flushes, and the window below 10^6 series (2026-11-08)
+
+Server side: `build/tsdbd --no-auth` (on = default table, off = `--latest-cache 0`), `build/tsdbc-bench latest --series
+1000000 --conns 32 --seconds 20`, one 20 s run per cell, 3 repetitions with the two modes interleaved, each under the
+exclusive BENCH lock (`/var/tmp/latest-s3/bench-latest.sh`). `--flush` adds a 33rd connection that writes one row to
+each of the 10^6 series and flushes, again and again (one round takes 0.8 to 1.6 s; 13 to 26 rounds in a run), while the
+32 connections send random ids (256 per request) or sorted ids (4,096 per request). Means of the three runs; the three
+runs of one cell are within 5% of each other (p99), except off / 4,096 / steady (27.3, 27.5 and 33.7 ms).
+
+| ids per request | table | flushes | requests/s | M ids/s | p50 | p99 | worst (median / max of the 3 runs) |
+|---|---|---|---:|---:|---:|---:|---:|
+| 256 | on | none | 44,873 | 11.49 | 682 us | 1.44 ms | 5.0 / 6.4 ms |
+| 256 | on | steady | 42,183 | 10.80 | 688 us | **1.60 ms** | 5.8 / 6.1 ms |
+| 256 | off | none | 22,136 | 5.67 | 1.42 ms | 2.28 ms | 7.8 / 14.7 ms |
+| 256 | off | steady | 20,177 | 5.16 | 1.51 ms | 2.66 ms | 12.8 / 13.9 ms |
+| 4,096 sorted | on | none | 2,825 | 11.57 | 11.0 ms | 14.7 ms | 27.6 / 27.9 ms |
+| 4,096 sorted | on | steady | 2,702 | 11.07 | 11.3 ms | **18.6 ms** | 30.5 / 30.7 ms |
+| 4,096 sorted | off | none | 1,448 | 5.93 | 21.8 ms | 26.2 ms | 41.3 / 43.1 ms |
+| 4,096 sorted | off | steady | 1,316 | 5.39 | 23.8 ms | 29.5 ms | 43.2 / 58.3 ms |
+
+- **Steady flushes of 10^6 series cost the lookups 5% of the ids/s and 12% (256 ids) to 27% (4,096 ids) of the p99**,
+  and the worst request stays at 6 ms (256 ids) and 31 ms (4,096 ids, where a request itself takes 11 ms). The table
+  answers twice as many ids/s as the slow path at half its p50 and p99, flushing or not, so the flush hold is not what
+  decides the lookups' latency; the 4,096-id p99 is the time of a request of 4,096 lookups meeting a flusher thread
+  on the same cores (the machine has 32 threads, the bench 33 connections).
+- The flush rounds of the flushing runs take 0.79 to 0.88 s with the table (the 256-id run of repetition 1: 1.62 s,
+  one slow stretch) against 0.81 to 0.96 s without it: the flusher's own cost is inside the noise of a cell here
+  (§9.2 measured the +3 to +4% of the fold).
+
+The window below 10^6 series, embedded (`build/latest-bench`, as §9.2, 3 repetitions, rounds 2 to 8 so 21 rounds per
+cell, on = window, nowin = without it, 1 reader, 256 ids, one appending writer; `/var/tmp/latest-s3/window-sweep.sh`):
+
+| series | window | flush (mean) | lookups per round | p50 | p99 (mean / median) | worst lookup (median / mean) |
+|---:|---|---:|---:|---:|---:|---:|
+| 60,000 | on | 39.4 ms | 1,656 | 22.5 us | 34.7 / 33 us | 262 / 435 us |
+| 60,000 | nowin | 39.4 ms | 1,667 | 22.2 us | 34.8 / 33 us | 437 / 543 us |
+| 200,000 | on | 135.1 ms | 4,358 | 30.0 us | 40.5 / 41 us | 1,722 / 2,270 us |
+| 200,000 | nowin | 131.8 ms | 4,189 | 30.0 us | 42.6 / 41 us | 2,382 / 2,469 us |
+
+- **`LT_WINDOW_MIN` (50,000) stays.** The p50 and p99 of lookups do not move with the window at 60,000, 200,000 or
+  10^6 series (§9.2); the worst lookup is 0.2 to 0.7 ms smaller with it at 60,000 and 200,000 series, within the noise
+  of a 21-round sample (the worst of a round is one pause). The window costs no flush time (39.4 against 39.4 ms; 135
+  against 132 ms is +2.5%, and the sd of a round is 4 to 8%). No threshold between 50,000 and 10^6 series changes
+  what a lookup sees: no hold shows at either size, so there is nothing to tune toward. Below 50,000 series a flush
+  stores under the write lock (§3.2), about a millisecond at most.
+- The server has no `nowin` switch (it is a compile-time test knob of the engine), so the window is judged on the
+  embedded numbers; the server measurement above has the table on or off only.
+
 ## 10. Build plan
 
 Each step is a track (tsdb-tracks): build, adversarial review, fix, gates, merge.
