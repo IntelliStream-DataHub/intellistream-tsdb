@@ -743,6 +743,8 @@ int main(int argc, char **argv)
 
     printf("\nrandom windows (2 s each):\n");
     int nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    run_qps(db, &c, "raw, 1 sample (a single row)", 0, 1, 0, 1); /* the cheapest query: any per-query cost shows here */
+    run_qps(db, &c, "raw, 1 sample (a single row)", 0, 1, 0, nthreads);
     run_qps(db, &c, "raw, 3600 samples", 0, 3600, 0, 1);
     run_qps(db, &c, "raw, 3600 samples", 0, 3600, 0, nthreads);
     run_qps(db, &c, "agg, 86400 samples in buckets of 300", 1, 86400, 300, 1);
