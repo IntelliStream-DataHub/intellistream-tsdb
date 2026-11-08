@@ -590,6 +590,7 @@ static void test_shared(void)
     struct meta_grant g = sgrant(meta_volume(&m, 0), 2, v->epoch + 1, META_GR_UNHEARD);
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    v = meta_volume(&m, 0); /* an apply replaces the state: the pointer from before it is freed */
     g = sgrant(meta_volume(&m, 0), 2, v->epoch + 2, META_GR_UNHEARD);
     g.pos = (struct meta_positions){.wal_seg = 7};
     meta_copy(&prev, &m);
@@ -640,6 +641,7 @@ static void test_shared(void)
     g = sgrant(meta_volume(&m, 0), 3, v->epoch + 1, META_GR_CLAIMANT); /* back to the barred node while others are fine: refused */
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_BLOCKED);
+    v = meta_volume(&m, 0);
     g = sgrant(meta_volume(&m, 0), 1, v->epoch + 2, META_GR_CLAIMANT);
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
@@ -691,9 +693,11 @@ static void test_shared(void)
     g = sgrant(v, someone, META_EPOCH_LIMIT - 1, META_GR_PLANNED); /* its reservation would be 2^24 - 1 */
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_RANGE);
+    v = meta_volume(&m, 1);
     g = sgrant(v, someone, UINT64_MAX, META_GR_PLANNED); /* and no wrap-around */
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_RANGE);
+    v = meta_volume(&m, 1);
     g = sgrant(v, someone, META_EPOCH_LIMIT - 2, META_GR_PLANNED);
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
@@ -711,15 +715,18 @@ static void test_shared(void)
     v = meta_volume(&m, 0);
     meta_op_volume_relocate(&e, 0, v->epoch - 1, "nfs9:/pool/s0");
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
+    v = meta_volume(&m, 0);
     meta_op_volume_relocate(&e, 0, v->epoch, "nfs9:/pool/s0");
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK &&
           !strcmp(meta_volume(&m, 0)->st.export, "nfs9:/pool/s0") && !strcmp(meta_volume(&m, 0)->st.path, "/mnt/s0"));
+    v = meta_volume(&m, 0);
     meta_op_replica_add(&e, 0, v->epoch, 4, 0);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v = meta_volume(&m, 0);
     CHECK(v->nrep == 4 && v->nisr == 4 && !v->rep[3].learner);
     meta_op_replica_remove(&e, 0, v->epoch, v->leader); /* never the owner */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    v = meta_volume(&m, 0);
     meta_op_replica_remove(&e, 0, v->epoch, 4);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->nisr == 3);
     meta_copy(&prev, &m);
