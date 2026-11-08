@@ -566,6 +566,34 @@ Where the code differs from the text above:
   the struct has the design's name. `TSDB_ABI_VERSION` is 6; the bindings carry the new `tsdb_options` fields (the
   tenant list itself is not offered in them before step 5).
 
+**Benchmarks** (stats on against `--no-stats`, 3 interleaved repetitions, Ryzen 9 7950X, `flock -o -x BENCH.lock`,
+log `runs/s34-bench/out`; the machine was not fully quiet: other tracks started work during repetition 3 of the
+`off` runs, which slowed every number of that run by 15 to 35 percent, so it is left out of the query means below):
+
+| `tsdb-bench` load 100 x 1 M, random windows (queries/s, mean of reps 1-2) | on | off | difference |
+|---|---:|---:|---:|
+| raw 3600 samples, 1 thread | 67,284 | 67,350 | -0.1 % |
+| raw 3600 samples, 32 threads | 1,131,589 | 1,092,343 | +3.6 % (noise, on the faster side) |
+| agg 86,400 samples in buckets of 300, 1 thread | 18,308 | 18,513 | -1.1 % |
+| agg 86,400 samples in buckets of 300, 32 threads | 111,487 | 111,310 | +0.2 % |
+| agg 604,800 samples in buckets of 3600, 1 thread | 16,926 | 15,836 | +6.9 % (noise: off varies 14,849-16,822) |
+| load, M rows/s | 75.6 | 74.5 | +1.4 % |
+
+Queries cost no measurable amount (within the spread of the runs, about 1 % at one thread). `insert-bench`
+(`--appends-only`, fsync each) showed on faster than off at 1 thread (1,441 against 910 inserts/s), which is not a
+saving: every `off` run started right after the `on` run's load had left dirty pages to write back, so its first
+fsyncs were slower (p99 6.7 ms against 0.8 ms). At 64 and 256 threads, where that effect is gone, the means are
+43,013 against 41,667 and 144,684 against 137,355 inserts/s with the noisy repetition 3 included; in repetitions 1
+and 2 the difference is 0.7 % at 64 threads (42,842 against 42,539) and 2.7 % at 256 threads (144,744 against
+140,872, on again the faster side). The
+bound of 1 % for the append path therefore holds only to the noise of this machine; a rerun on a quiet machine with
+a `sync` and a pause between modes is the check that would settle it. The `qps` modes of the script failed (a wrong
+invocation; the load already runs the random-window queries) and give no numbers.
+
+**The tenant map at 10^7 series** (`build/test_tenants --map-bench 10000000`): series created interleaved between
+tenants: 20.1 MB (2.01 bytes a series), filled 0.1 s after the last creation; created in runs per tenant: 2.0 MB
+(0.20 bytes a series, whole pages of one tenant are only a table entry). Planning number: 2 GB per 10^9 series.
+
 ## 9. Build plan
 
 | Step | What | Gate | Effort (days) |
