@@ -858,14 +858,14 @@ struct pend {
 
 /* ------------------------------------------------------------------ the disk worker's jobs */
 #define DW_Q 8
-enum { DJ_SYNC = 1, DJ_SNAP };
+enum { DJ_SYNC = 1, DJ_SNAP, DJ_COPY };
 struct djob {
     int kind;
     uint64_t gen;
     raft_log_sync sync; /* DJ_SYNC: the descriptors a prepare handed out */
     uint8_t *img;       /* DJ_SNAP: the image, handed back in the result */
     size_t len;
-    uint64_t index, term;
+    uint64_t index, term, rgen; /* rgen: DJ_COPY, the restore generation of the image */
     raft_config cfg;
     int fail_dirsync;
 };
@@ -873,7 +873,7 @@ struct dres {
     int kind;
     uint64_t gen;
     int rc, err; /* DJ_SYNC: rc != 0 failed; DJ_SNAP: write_durable's result (-2: the directory sync failed) */
-    uint64_t index, term;
+    uint64_t index, term, rgen;
     uint8_t *img;
     size_t len;
     raft_config cfg;
@@ -889,6 +889,12 @@ static struct {
     int copy_stale;     /* the sm is the persisted copy of an earlier run: no watch stream has confirmed it yet */
     int copy_dirty;     /* the watch stream moved sm since the copy file was written */
     uint64_t copy_next; /* not before this time (ns) */
+    int copy_out;       /* a DJ_COPY job is on the disk worker */
+    uint64_t copy_applied, copy_gen; /* what the copy file holds (applied index, restore generation): never written lower */
+    struct meta_state cpy; /* a voter's persisted copy that is ahead of what its core has applied since the restart */
+    int cpy_on;
+    int fail_copy_dirsync, fail_pend_dirsync;
+    int img_shared; /* an image this run saw (an install) says shared mode: a learner's own state is empty until then */
     uint64_t free_min;  /* bytes the state directory must have free for voter_ok */
     unsigned nk_vols, nk_doms; /* TSDB_CLUSTER_TEST report knobs: what the heartbeat's sections carry in tests */
     struct cluster_vol_report k_vols[4];
@@ -1189,6 +1195,10 @@ static void test_knobs(void)
             C.seg_bytes = v;
         else if (sscanf(p, "fail_snap_dirsync=%llu", &v) == 1)
             C.fail_snap_dirsync = v != 0;
+        else if (sscanf(p, "fail_copy_dirsync=%llu", &v) == 1)
+            C.fail_copy_dirsync = v != 0;
+        else if (sscanf(p, "fail_pend_dirsync=%llu", &v) == 1)
+            C.fail_pend_dirsync = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
             C.stall_file = v != 0;
         else if (sscanf(p, "sync_delay_ms=%llu", &v) == 1)
@@ -1700,6 +1710,7 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
  * volumes. Replicated mode keeps the fail-stop (the log and the data share disks). Returns 1 when the core was
  * dropped (the caller must not touch C.r or C.log), else it does not return. */
 static int log_fault(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static int is_shared(void);
 
 static void check_fault(void)
 {
@@ -1728,8 +1739,8 @@ static void *dw_main(void *arg)
         memmove(C.dw_q, C.dw_q + 1, (--C.dw_nq) * sizeof C.dw_q[0]);
         C.dw_busy = 1;
         pthread_mutex_unlock(&C.dw_mu);
-        struct dres r = {.kind = j.kind, .gen = j.gen, .index = j.index, .term = j.term, .img = j.img, .len = j.len,
-                         .cfg = j.cfg};
+        struct dres r = {.kind = j.kind, .gen = j.gen, .index = j.index, .term = j.term, .rgen = j.rgen,
+                         .img = j.img, .len = j.len, .cfg = j.cfg};
         if (j.kind == DJ_SYNC) {
             while (C.stall_file && access(C.stallfile, F_OK) == 0 && !C.dw_stop)
                 usleep(10000); /* a test's stalled disk */
@@ -1745,7 +1756,7 @@ static void *dw_main(void *arg)
                 r.err = EIO;
             }
         } else {
-            r.rc = write_durable(C.snapfile, j.img, j.len);
+            r.rc = write_durable(j.kind == DJ_COPY ? C.copyfile : C.snapfile, j.img, j.len);
             r.err = errno;
             if (r.rc == 0 && j.fail_dirsync) {
                 r.rc = -2;
@@ -1836,6 +1847,7 @@ static void dw_stop_thread(void)
 }
 
 static void snap_done(struct dres *r);
+static void copy_done(struct dres *r);
 static void sync_round(void);
 
 /* The results the worker has for the core thread, applied in order. */
@@ -1856,6 +1868,10 @@ static void dw_collect(void)
         r = C.dw_r[0];
         memmove(C.dw_r, C.dw_r + 1, (--C.dw_nr) * sizeof C.dw_r[0]);
         pthread_mutex_unlock(&C.dw_mu);
+        if (r.kind == DJ_COPY) { /* what the file holds is true whatever core came and went since */
+            copy_done(&r);
+            continue;
+        }
         if (r.gen != C.dw_gen || !C.r) {
             free(r.img);
             continue;
@@ -1929,8 +1945,13 @@ static void take_snapshot(void)
 static void snap_done(struct dres *r)
 {
     C.snap_out = 0;
-    if (r->rc == -2) /* the new snapshot is named, maybe not durably: compacting on it could lose the log's base */
-        fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.snapfile, strerror(r->err));
+    if (r->rc == -2) { /* the new snapshot is named, maybe not durably: compacting on it could lose the log's base */
+        if (!is_shared())
+            fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.snapfile, strerror(r->err));
+        free(r->img);
+        log_fault("cannot sync %s after naming %s: %s", C.metadir, C.snapfile, strerror(r->err));
+        return;
+    }
     if (r->rc != 0) {
         say("cannot write %s: %s (the log is kept until a later snapshot is written)", C.snapfile, strerror(r->err));
         free(r->img);
@@ -1989,8 +2010,14 @@ static void restore(const raft_action *a)
         t.applied != a->u.snapshot.index)
         fail_stop("the snapshot image from node %" PRIu32 " at %" PRIu64 " does not verify", a->u.snapshot.from,
                   a->u.snapshot.index);
-    if (write_durable(C.snapfile, a->u.snapshot.data, a->u.snapshot.len) != 0)
-        fail_stop("cannot write %s: %s", C.snapfile, strerror(errno));
+    C.img_shared |= t.mode == META_MODE_SHARED;
+    if (write_durable(C.snapfile, a->u.snapshot.data, a->u.snapshot.len) != 0) {
+        if (!is_shared())
+            fail_stop("cannot write %s: %s", C.snapfile, strerror(errno));
+        meta_free(&t);
+        log_fault("cannot write %s: %s", C.snapfile, strerror(errno));
+        return;
+    }
     if (C.pend_index) { /* the kept copy has done its work; one left behind is ignored at the next start */
         unlink(C.pendfile);
         C.pend_index = 0;
@@ -2004,6 +2031,7 @@ static void restore(const raft_action *a)
     memcpy(C.snap, a->u.snapshot.data, a->u.snapshot.len);
     C.snaplen = a->u.snapshot.len;
     C.snap_index = a->u.snapshot.index;
+    C.copy_dirty = 1;
     pend_applied(a->u.snapshot.index, 0, CLUSTER_ERR_RETRY);
     state_replaced();
 }
@@ -2033,8 +2061,10 @@ static void pump(void)
                 apply_entry(&C.sm, 1, e->index, e->term, e->type, e->data, e->len);
                 last = e->index;
             }
-            if (last)
+            if (last) {
+                C.copy_dirty = 1;
                 raft_applied(C.r, last);
+            }
             break;
         }
         case RAFT_ACT_RESTORE: restore(&a); break;
@@ -2152,12 +2182,19 @@ static int keep_install(const raft_msg *m)
     meta_init(&t);
     int ok = meta_snapshot_decode(&t, m->u.snapshot.data, m->u.snapshot.len) == META_OK &&
              t.applied == m->u.snapshot.index && t.applied_term == m->u.snapshot.term;
+    C.img_shared |= ok && t.mode == META_MODE_SHARED;
     meta_free(&t);
     if (!ok)
         return 1;
     int rc = write_durable(C.pendfile, m->u.snapshot.data, m->u.snapshot.len);
-    if (rc == -2)
-        fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.pendfile, strerror(errno));
+    if (rc == 0 && C.fail_pend_dirsync)
+        rc = -2;
+    if (rc == -2) {
+        if (!is_shared())
+            fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.pendfile, strerror(errno));
+        log_fault("cannot sync %s after naming %s: %s", C.metadir, C.pendfile, strerror(errno));
+        return 0; /* the core is gone: nothing takes the message */
+    }
     if (rc != 0) {
         say("cannot write %s: %s (the install waits for the leader's next try)", C.pendfile, strerror(errno));
         return 0;
@@ -2319,6 +2356,7 @@ static int core_boot(char *err, size_t errn)
 }
 
 static void core_stop(struct meta_state *next);
+static int cpy_ahead(void);
 
 /* removed from the group while away: the core goes (its files stay), the state goes on from `next` (or as is) */
 static void drop_core(struct meta_state *next, const char *why)
@@ -2328,6 +2366,11 @@ static void drop_core(struct meta_state *next, const char *why)
     core_stop(next);
 }
 
+static int is_shared(void)
+{
+    return C.sm.mode == META_MODE_SHARED || C.img_shared;
+}
+
 static int log_fault(const char *fmt, ...)
 {
     char what[1024];
@@ -2335,7 +2378,7 @@ static int log_fault(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(what, sizeof what, fmt, ap);
     va_end(ap);
-    if (C.sm.mode != META_MODE_SHARED)
+    if (!is_shared())
         fail_stop("%s", what);
     say("%s: in shared mode this ends the voter role only (core_dropped, retired); the volumes go on", what);
     core_stop(NULL);
@@ -2363,6 +2406,15 @@ static void core_stop(struct meta_state *next)
     if (C.wsm_on) {
         meta_free(&C.wsm);
         C.wsm_on = 0;
+    }
+    if (cpy_ahead()) { /* the core had applied less than the file holds: the state goes on from the copy, stale */
+        meta_free(&C.sm);
+        C.sm = C.cpy;
+        C.cpy_on = 0;
+        C.copy_stale = 1;
+    } else if (C.cpy_on) {
+        meta_free(&C.cpy);
+        C.cpy_on = 0;
     }
     for (size_t i = 0; i < C.npend; i++)
         if (C.pend[i].conn)
@@ -2490,8 +2542,12 @@ static void on_watch_snap(struct conn *c, struct rd *r)
     struct meta_state *to = C.r ? &C.wsm : &C.sm;
     struct meta_state t;
     meta_init(&t);
-    int old_copy = to == &C.sm && C.copy_stale; /* a persisted copy of an earlier run yields to any live image */
-    if (meta_snapshot_decode(&t, r->p + r->off, r->len - r->off) != META_OK || (t.applied < to->applied && !old_copy)) {
+    /* An image below this state's index is a server that lags (or the copy of an earlier run, which went further
+     * than that server did): never taken, not even over a persisted copy, or "never goes down" fails from this node's
+     * view, and the copy file goes back with it. Only a `tsdb cluster restore` (a higher restore generation) takes
+     * the state down. The link is dropped and another voter tried; the copy stays stale until one reaches it. */
+    if (meta_snapshot_decode(&t, r->p + r->off, r->len - r->off) != META_OK ||
+        (t.applied < to->applied && t.restore_gen <= to->restore_gen)) {
         meta_free(&t);
         c->dead = 1; /* a damaged image, or a state behind this one: another server */
         return;
@@ -2531,27 +2587,95 @@ static void on_watch_entry(struct conn *c, struct rd *r)
  * directory, written a moment after the watch stream moved it (tmp, fsync, rename, directory fsync), and serves from
  * it after a restart, marked stale until a stream confirms it. A failed write keeps the older copy and is tried
  * again: nothing in step 1 relies on it before a reservation does (S3). */
+static int state_after(const struct meta_state *a, const struct meta_state *b)
+{
+    return a->restore_gen > b->restore_gen || (a->restore_gen == b->restore_gen && a->applied > b->applied);
+}
+
+/* a voter's copy file is ahead of what its core has applied since the restart */
+static int cpy_ahead(void)
+{
+    return C.cpy_on && state_after(&C.cpy, &C.sm);
+}
+
+/* The state a status is shown from: a voter that restarted shows its persisted copy (marked stale) until its core has
+ * applied that far again. */
+static const struct meta_state *view_state(void)
+{
+    return cpy_ahead() ? &C.cpy : &C.sm;
+}
+
+/* Item 8, for every member (a voter writes its copy after it applied, a watcher after its stream moved it), on the
+ * disk worker. The file never goes back: an image below the file's index under the same restore generation is not
+ * written (a restarted voter applies from its snapshot up, behind the copy it loaded), and an equal one is not
+ * written again. */
 static void copy_flush(uint64_t now, int force)
 {
-    if (!C.copy_dirty || C.r || (!force && now < C.copy_next))
+    if (C.cpy_on && !cpy_ahead()) {
+        meta_free(&C.cpy);
+        C.cpy_on = 0;
+    }
+    if (!C.copy_dirty || (!force && (now < C.copy_next || C.copy_out)))
         return;
-    C.copy_dirty = 0;
-    if (!C.sm.initialised)
+    if (!C.sm.initialised) {
+        C.copy_dirty = 0;
         return;
+    }
+    if (C.sm.restore_gen == C.copy_gen && C.sm.applied == C.copy_applied) {
+        C.copy_dirty = 0;
+        return;
+    }
+    if (C.sm.restore_gen < C.copy_gen || (C.sm.restore_gen == C.copy_gen && C.sm.applied < C.copy_applied))
+        return; /* behind the file: dirty stays set, written once the state is past it */
     uint8_t *img;
     size_t len;
     if (meta_snapshot_encode(&C.sm, &img, &len) != META_OK)
         oom();
+    if (!force && C.dw_on) {
+        struct djob j = {.kind = DJ_COPY, .img = img, .len = len, .index = C.sm.applied, .rgen = C.sm.restore_gen,
+                         .fail_dirsync = C.fail_copy_dirsync};
+        C.copy_dirty = 0;
+        C.copy_out = 1;
+        dw_submit(&j);
+        return;
+    }
+    if (C.dw_on)
+        dw_quiesce(); /* at the end: the worker's write is done before this one */
+    C.copy_dirty = 0;
     int rc = write_durable(C.copyfile, img, len);
+    if (rc == 0 && C.fail_copy_dirsync)
+        rc = -2;
     free(img);
-    if (rc == -2)
+    if (rc == 0) {
+        C.copy_applied = C.sm.applied;
+        C.copy_gen = C.sm.restore_gen;
+        return;
+    }
+    if (rc == -2 && !is_shared())
         fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.copyfile, strerror(errno));
-    if (rc != 0) {
-        say("cannot write %s: %s (tried again in 1 s)", C.copyfile, strerror(errno));
+    say("cannot %s %s: %s (the copy is not relied on)", rc == -2 ? "sync the directory of" : "write", C.copyfile,
+        strerror(errno));
+}
+
+/* The worker's write of the copy is back. A failure keeps the older file and is tried again in a second. A failed
+ * directory sync is fail-stop in replicated mode and a log line in shared mode: nothing relies on the copy in S1, and
+ * a state-directory fault must not take the node's volumes down (§5.6). */
+static void copy_done(struct dres *r)
+{
+    uint64_t now = iso_now_ns();
+    C.copy_out = 0;
+    free(r->img);
+    if (r->rc == -2 && !is_shared())
+        fail_stop("cannot sync %s after naming %s: %s", C.metadir, C.copyfile, strerror(r->err));
+    if (r->rc != 0) {
+        say("cannot %s %s: %s (tried again in 1 s; the copy is not relied on)",
+            r->rc == -2 ? "sync the directory of" : "write", C.copyfile, strerror(r->err));
         C.copy_dirty = 1;
         C.copy_next = now + 1000 * MS;
         return;
     }
+    C.copy_applied = r->index;
+    C.copy_gen = r->rgen;
     C.copy_next = now + 200 * MS;
 }
 
@@ -2590,11 +2714,12 @@ static void put_status(struct buf *b)
     put32(b, C.have_node ? C.id : 0);
     put8(b, C.r ? CLUSTER_MODE_CORE : C.have_node ? CLUSTER_MODE_WATCH : CLUSTER_MODE_NONE);
     put8(b, C.r ? (uint8_t)raft_get_role(C.r) : 0);
-    put8(b, (uint8_t)C.copy_stale);
+    const struct meta_state *S = view_state();
+    put8(b, (uint8_t)(C.copy_stale || S != &C.sm));
     put64(b, C.r ? raft_get_term(C.r) : C.hint_term);
     put32(b, C.r ? raft_get_leader(C.r) : C.hint_leader);
     put64(b, C.r ? raft_get_commit(C.r) : C.hint_commit);
-    put64(b, C.sm.applied);
+    put64(b, S->applied);
     uint32_t others = 0;
     for (size_t i = 0; i < C.nheard; i++)
         others += C.heard[i].id != C.id;
@@ -2613,10 +2738,10 @@ static void put_status(struct buf *b)
         put64(b, C.heard[i].inc);
         put_heard_extra(b, &C.heard[i], now);
     }
-    if (C.sm.applied || C.sm.config_len) {
+    if (S->applied || S->config_len) {
         uint8_t *img;
         size_t len;
-        if (meta_snapshot_encode(&C.sm, &img, &len) != META_OK)
+        if (meta_snapshot_encode(S, &img, &len) != META_OK)
             oom();
         put32(b, (uint32_t)len);
         put(b, img, len);
@@ -3798,18 +3923,30 @@ int cluster_start(const struct cluster_cfg *cfg)
             fprintf(stderr, "tsdbd: cluster: cannot start the Raft core: %s\n", err);
             return -1;
         }
-        if (!C.r && exists(C.copyfile)) {
-            /* the copy of the last run, served stale until a watch stream confirms it (item 8) */
+        if (exists(C.copyfile)) {
+            /* the copy of the last run, served stale until a watch stream (or, for a voter, its core) confirms it
+             * (item 8) */
             uint8_t *img = NULL;
             size_t n = 0;
-            meta_free(&C.sm);
-            meta_init(&C.sm);
-            if (load_image(C.copyfile, &C.sm, &img, &n, err, sizeof err) != 0) {
+            struct meta_state t;
+            meta_init(&t);
+            if (load_image(C.copyfile, &t, &img, &n, err, sizeof err) != 0) {
                 fprintf(stderr, "tsdbd: cluster: %s\n", err);
                 return -1;
             }
             free(img);
-            C.copy_stale = 1;
+            C.copy_applied = t.applied;
+            C.copy_gen = t.restore_gen;
+            if (!C.r) {
+                meta_free(&C.sm);
+                C.sm = t;
+                C.copy_stale = 1;
+            } else if (state_after(&t, &C.sm)) {
+                C.cpy = t; /* a voter: its core has applied less since the restart than it had */
+                C.cpy_on = 1;
+            } else {
+                meta_free(&t);
+            }
         }
     }
     C.lfd = cfg->peer_fd;
@@ -3856,6 +3993,8 @@ void cluster_stop(void)
         raft_log_close(C.log);
     meta_free(&C.sm);
     meta_free(&C.wsm);
+    if (C.cpy_on)
+        meta_free(&C.cpy);
     ring_reset();
     free(C.snap);
     for (size_t i = 0; i < C.nheard; i++) {

@@ -1768,6 +1768,178 @@ static void scen_feed(void)
     printf("  the replacement voter comes from the feed the voters do not use\n");
 }
 
+/* REVIEW 1: a restarted member's persisted copy never goes back to an older image from a lagging voter. n2 is paused
+ * while the leader commits a MEMBER_STATE and the watcher n3 persists its copy; then n3, n0 and n1 are killed, n2
+ * resumed and n3 restarted: n2 is the only voter n3 can reach, and it is behind the copy. n3 used to take n2's image
+ * (a persisted copy "yielded to any live image"), mark itself fresh and write the old state over its copy file. */
+static int p_fresh_from(const struct view *v, void *a)
+{
+    return !v->st.stale && v->m.applied >= *(uint64_t *)a;
+}
+
+static void scen_copyback(void)
+{
+    scenario("copyback");
+    envs[3] = "free_min=9999999999999999"; /* a watcher */
+    for (int i = 0; i < 4; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    node_add(0, 3);
+    pause_server(2, 1); /* n2 lags from here on */
+    struct state_want down = {ids[2], META_DOWN, 0};
+    await_view(0, p_member_state, &down, "n2 marked down");
+    struct view x;
+    view(0, &x);
+    struct catch_up c = {x.m.applied, meta_hash(&x.m)};
+    view_free(&x);
+    await_view(3, p_caught_up, &c, "the watcher caught up");
+    usleep(1500000); /* the copy file */
+    uint64_t a = c.applied;
+    stop(3, SIGKILL);
+    stop(0, SIGKILL); /* the watcher's dial to them is refused at once: the lagging n2 is the one it reaches */
+    stop(1, SIGKILL);
+    pause_server(2, 0);
+    view(2, &x);
+    if (x.m.applied >= a)
+        die("n2 is not behind the watcher's copy (%" PRIu64 " >= %" PRIu64 "): the test proves nothing", x.m.applied, a);
+    view_free(&x);
+    start(3);
+    uint64_t t0 = now_ms();
+    while (now_ms() - t0 < 6000) { /* n2 answers the watcher's dial: its older image must not be taken */
+        view(3, &x);
+        if (x.m.applied < a || !x.st.stale)
+            die("the restarted watcher took a lagging voter's image: applied %" PRIu64 " (its copy %" PRIu64
+                "), stale %d",
+                x.m.applied, a, (int)x.st.stale);
+        view_free(&x);
+        usleep(200000);
+    }
+    stop(3, SIGTERM); /* a copy that went back would be what this start finds */
+    start(3);
+    view(3, &x);
+    if (x.m.applied < a || !x.st.stale)
+        die("the copy file went back to applied %" PRIu64 " (was %" PRIu64 ")", x.m.applied, a);
+    view_free(&x);
+    printf("  a restarted watcher keeps its copy against a lagging voter's older image\n");
+}
+
+/* REVIEW 2: a voter restarted while the group is away serves its persisted copy, marked stale (it used to serve an
+ * empty state, or its last snapshot, as if it were current). */
+static void scen_voterstale(void)
+{
+    scenario("voterstale");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    struct view x;
+    view(0, &x);
+    struct catch_up c = {x.m.applied, meta_hash(&x.m)};
+    view_free(&x);
+    await_view(1, p_caught_up, &c, "n1 caught up");
+    usleep(1000000);
+    pause_server(0, 1); /* the group is away (paused: a restart gets a new port, and the others would not find it) */
+    pause_server(2, 1);
+    stop(1, SIGTERM);
+    start(1);
+    usleep(3000000);
+    view(1, &x);
+    if (!x.st.stale || x.m.applied < c.applied || x.m.nmembers != 3)
+        die("the voter restarted alone shows stale %d, applied %" PRIu64 " (was %" PRIu64 "), %u members (3 expected)",
+            (int)x.st.stale, x.m.applied, c.applied, x.m.nmembers);
+    view_free(&x);
+    pause_server(0, 0);
+    pause_server(2, 0);
+    await_view(1, p_fresh_from, &c.applied, "the voter confirmed once the group is back");
+    printf("  a voter restarted while the group is away serves its copy, marked stale, then the live state\n");
+}
+
+/* REVIEW 4: in shared mode a fault on the state directory ends the voter role only: tsdbd and its volumes go on. */
+static void scen_dirsync_shared(void)
+{
+    scenario("dirsyncshared");
+    envs[0] = "snap_every=2,fail_snap_dirsync=1";
+    start(0);
+    start(1);
+    struct meta_settings s;
+    meta_settings_default(&s);
+    uint8_t req[META_ADDR_MAX + 64], *rep = NULL;
+    size_t n = cluster_settings_encode(&s, META_MODE_SHARED, req), len;
+    char addr[META_ADDR_MAX], err[1024];
+    peer_of(0, addr, sizeof addr);
+    int rc;
+    if (cluster_admin(addr, secret, secret_len, CLUSTER_OP_INIT, req, n, 5000, &rc, &rep, &len, err, sizeof err) == 0)
+        free(rep);
+    n = node_add_req(1, req);
+    if (cluster_admin(addr, secret, secret_len, CLUSTER_OP_NODE_ADD, req, n, 5000, &rc, &rep, &len, err,
+                      sizeof err) == 0)
+        free(rep);
+    uint64_t t0 = now_ms();
+    while (now_ms() - t0 < 10000 && !log_has(0, "ends the voter role only"))
+        usleep(100000);
+    if (!log_has(0, "ends the voter role only"))
+        die("shared mode: a failed directory fsync after a snapshot did not end the voter role");
+    if (await_exit(0, 1500) >= 0)
+        die("shared mode: a failed state-directory fsync after a snapshot stopped tsdbd");
+    printf("  shared mode: a failed directory fsync after a snapshot ends the voter role, tsdbd goes on\n");
+}
+
+/* REVIEW 4: the same for an install whose snapshot cannot be written (a directory in the way of its temp file). */
+static void install_shared(int pend)
+{
+    scenario(pend ? "pendshared" : "installshared");
+    for (int i = 0; i < 3; i++)
+        envs[i] = "snap_every=2,snap_retain=1,seg_bytes=200";
+    if (pend)
+        envs[2] = "snap_every=2,snap_retain=1,seg_bytes=200,fail_pend_dirsync=1"; /* the kept image's directory sync */
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_mode(0, 3, META_MODE_SHARED);
+    node_add(0, 1);
+    if (!pend)
+        meta_tmp(2, 1);
+    node_add(0, 2);
+    uint64_t t0 = now_ms();
+    while (now_ms() - t0 < 15000 && !log_has(2, "ends the voter role only"))
+        usleep(100000);
+    if (!log_has(2, "ends the voter role only"))
+        die("shared mode: an install that cannot be written did not end the voter role");
+    if (await_exit(2, 1500) >= 0)
+        die("shared mode: an install that cannot be written stopped tsdbd");
+    if (!pend)
+        meta_tmp(2, 0);
+    printf("  shared mode: a snapshot install that cannot be %s ends the voter role, tsdbd goes on\n",
+           pend ? "kept" : "written");
+}
+static void scen_install_shared(void) { install_shared(0); }
+static void scen_pend_shared(void) { install_shared(1); }
+
+/* REVIEW 4: a coreless member's copy file whose directory cannot be synced: replicated mode stops, shared mode logs. */
+static void scen_copyfault(void)
+{
+    scenario("copyfault");
+    envs[1] = "free_min=9999999999999999,fail_copy_dirsync=1"; /* a watcher */
+    start(0);
+    start(1);
+    init_mode(0, 600, META_MODE_SHARED);
+    node_add(0, 1);
+    uint64_t t0 = now_ms();
+    while (now_ms() - t0 < 10000 && !log_has(1, "sync the directory of"))
+        usleep(100000);
+    if (!log_has(1, "sync the directory of"))
+        die("the watcher never wrote its copy (the test proves nothing)");
+    if (await_exit(1, 1500) >= 0)
+        die("shared mode: a copy file whose directory cannot be synced stopped tsdbd");
+    printf("  shared mode: a copy file that cannot be synced is logged, tsdbd goes on\n");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1795,7 +1967,9 @@ int main(int argc, char **argv)
                {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"stall", scen_stall},
                {"witness", scen_witness},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
-               {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life}};
+               {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
+               {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
+               {"installshared", scen_install_shared}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
