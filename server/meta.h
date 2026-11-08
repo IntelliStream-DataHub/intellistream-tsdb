@@ -97,9 +97,10 @@ enum meta_failover { META_FAILOVER_LEASE = 0, META_FAILOVER_ATTESTED = 1, META_F
 
 enum meta_member_state { META_UP = 0, META_DOWN = 1, META_DRAINING = 2, META_OUT = 3 };
 const char *meta_member_state_name(int s);
-/* A member's flags (MEMBER_ADD, then MEMBER_FLAGS from heartbeats): may it be a voter, may it hold volumes. A
- * witness has volumes_ok = 0; a node whose disk filled has voter_ok = 0. */
-enum meta_member_flags { META_MF_VOTER_OK = 1, META_MF_VOLUMES_OK = 2, META_MF_ALL = 3 };
+/* A member's flags (MEMBER_ADD, then MEMBER_FLAGS from heartbeats): may it be a voter, may it hold volumes, can it
+ * claim a volume it was granted. A witness has volumes_ok = 0; a node whose disk filled has voter_ok = 0; a node whose
+ * claims failed (CLAIM_FAILED's reasons: the state disk, the storage) reports claim_ok = 0 until it is well again. */
+enum meta_member_flags { META_MF_VOTER_OK = 1, META_MF_VOLUMES_OK = 2, META_MF_CLAIM_OK = 4, META_MF_ALL = 7 };
 
 struct meta_settings {
     uint32_t replication;        /* replicas per volume (3) */
@@ -275,7 +276,7 @@ enum meta_op_kind {
     META_OP_USER_PUT,         /* a user's record, by name */
     META_OP_USER_DEL,         /* a user, by name */
     META_OP_MEMBER_ADDR,      /* a server's addresses as its run `incarnation` advertises them (a restart moved it) */
-    META_OP_MEMBER_FLAGS,     /* a member's flags, as its run `incarnation` reports them; volumes_ok clears its blocks */
+    META_OP_MEMBER_FLAGS,     /* a member's flags, as its run `incarnation` reports them; claim_ok 0 -> 1 clears its blocks */
     META_OP_VOLUME_SELF,      /* shared: if leader == W and epoch + 1 == E: W's own claim of its reserved epoch E */
     META_OP_VOLUME_RESERVE,   /* shared: if epoch == E: ids reserved (absolute, never lower), the positions reported */
     META_OP_VOLUME_DROP,      /* shared: if epoch == E: the drop watermark (generation and ms, never lower) */
@@ -328,8 +329,10 @@ struct meta_fence_reply { /* a replica's answer to a fence (design-cluster.md §
  *   shared: the ISR stays every candidate; a grant to another node needs new_epoch >= epoch + 2 and above
  *     highest_seen, a grant to the leader itself above max(epoch, highest_seen); new_epoch + 1 stays below
  *     META_EPOCH_LIMIT (else META_ERR_RANGE); `leader` is a candidate no CLAIM_FAILED bars (unless all are barred);
- *     with failover != lease, reasons UNHEARD and FENCED that move the volume need an attestation (operator, or for
- *     bmc a power-off of the owner's incarnation or later). */
+ *     with failover != lease, every grant that moves the volume to another node needs an attestation (operator, or
+ *     for bmc a power-off of the owner's incarnation or later) whatever its reason, except PLANNED (the owner's
+ *     release) and REFUSED (the claimant never held the lock); RESIGNED is refused (META_ERR_INVALID: the replicated
+ *     mode's reason). */
 struct meta_grant {
     uint32_t number;
     uint64_t epoch, new_epoch, isr_version;
@@ -375,7 +378,8 @@ void meta_op_member_state(struct meta_entry *e, uint32_t id, int state, uint64_t
 /* Refused as STALE for an incarnation below the member's, EXISTS for a peer address another live member has. */
 void meta_op_member_addr(struct meta_entry *e, uint32_t id, uint64_t incarnation, const char *addr,
                          const char *peer);
-/* STALE for an incarnation below the member's. volumes_ok 0 -> 1 clears the member's CLAIM_FAILED blocks. */
+/* STALE for an incarnation below the member's. claim_ok 0 -> 1 (the record's flag before, this one after) clears the
+ * member's CLAIM_FAILED blocks; no other change of flags does. */
 void meta_op_member_flags(struct meta_entry *e, uint32_t id, uint64_t incarnation, uint8_t flags);
 void meta_op_settings(struct meta_entry *e, const struct meta_settings *s);
 void meta_op_volume_add(struct meta_entry *e, const struct meta_volume_add *a);

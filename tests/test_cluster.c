@@ -1500,6 +1500,7 @@ static void scen_flags(void)
 {
     scenario("flags");
     envs[2] = "free_min=9999999999999999"; /* more than any disk has: voter_ok 0 */
+    envs[1] = "claim_ok=0"; /* its claims fail: claim_ok 0 in its record (the leader lifts a bar only on 0 -> 1) */
     for (int i = 0; i < 3; i++)
         start(i);
     init_fast(0);
@@ -1518,6 +1519,9 @@ static void scen_flags(void)
         die("server 2's record has flags %u, expected volumes_ok without voter_ok", m ? (unsigned)m->flags : 99u);
     if (v.cfg.n != 2 || raft_config_find(&v.cfg, ids[2]))
         die("a member with voter_ok 0 is in the Raft group");
+    const struct meta_member *m1 = meta_member(&v.m, ids[1]);
+    if (!m1 || (m1->flags & META_MF_CLAIM_OK) || !(m1->flags & META_MF_VOTER_OK))
+        die("server 1's record has flags %u, expected voter_ok without claim_ok", m1 ? (unsigned)m1->flags : 99u);
     struct catch_up c = {v.m.applied, meta_hash(&v.m)};
     uint32_t members = v.m.nmembers;
     view_free(&v);

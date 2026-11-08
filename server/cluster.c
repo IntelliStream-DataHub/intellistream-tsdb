@@ -905,6 +905,7 @@ static struct {
     pthread_t th;
     int running;
     atomic_int stop;
+    atomic_int claim_bad; /* cluster_set_claim_ok(0) */
 
     int have_node;
     uint8_t ident[16]; /* this server's own identity (meta/IDENT), made at its first start, never changed */
@@ -1174,7 +1175,9 @@ static void test_knobs(void)
         unsigned long long v = 0;
         unsigned a = 0, b = 0, c = 0, ep = 0;
         char dn[META_DOMAIN_MAX] = "";
-        if (sscanf(p, "free_min=%llu", &v) == 1)
+        if (sscanf(p, "claim_ok=%llu", &v) == 1)
+            atomic_store(&C.claim_bad, v == 0);
+        else if (sscanf(p, "free_min=%llu", &v) == 1)
             C.free_min = v;
         else if (sscanf(p, "vol=%u/%u/%u/%u/%63[^,]", &a, &b, &c, &ep, dn) >= 4 && C.nk_vols < 4) {
             /* volume/role/health/epoch/domain: a volume this server reports as owning */
@@ -1446,6 +1449,11 @@ static void heard_set(uint32_t id, uint64_t now, uint64_t inc, uint64_t applied,
 
 static cluster_report_fn g_reporter;
 static void *g_reporter_arg;
+
+void cluster_set_claim_ok(int ok)
+{
+    atomic_store(&C.claim_bad, !ok);
+}
 
 void cluster_set_reporter(cluster_report_fn fn, void *arg)
 {
@@ -3289,6 +3297,8 @@ static uint8_t my_flags(void)
         f |= META_MF_VOTER_OK;
     if (!C.witness)
         f |= META_MF_VOLUMES_OK;
+    if (!atomic_load(&C.claim_bad))
+        f |= META_MF_CLAIM_OK;
     return f;
 }
 

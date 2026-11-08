@@ -85,6 +85,10 @@ struct cluster_report {
  * block. Without one (set before cluster_start) the server reports no volumes and no domains. */
 typedef void (*cluster_report_fn)(void *arg, struct cluster_report *out);
 void cluster_set_reporter(cluster_report_fn fn, void *arg);
+/* The volume manager's claim health (any thread): 0 while claims of volumes granted to this node fail for reasons of
+ * its own (the state disk, the storage), 1 once they work again. It goes into the heartbeat's flags (claim_ok), and
+ * the leader lifts a CLAIM_FAILED bar only on the 0 -> 1 change. */
+void cluster_set_claim_ok(int ok);
 
 struct cluster_vol_status {
     struct cluster_vol_report v;

@@ -479,7 +479,8 @@ static void put_settings(struct wr *w, const struct meta_settings *s)
 static void get_settings(struct rd *r, struct meta_settings *s)
 {
     uint32_t n = get32(r);
-    if (n != 12) { /* a later build adds fields at the end and raises the count; this one knows 12 */
+    if (n != 12) { /* the count of this build's fields: until 1.0 a change of them bumps the level (and re-inits), after it
+                    * a new field is a new op kind (the freeze rule at the head of this file) */
         r->bad = 1;
         return;
     }
@@ -1073,10 +1074,10 @@ static int grant_shared(struct meta_state *m, struct meta_volume *v, const struc
 {
     int w = replica_at(v, g->leader);
     const struct meta_member *mb = meta_member(m, g->leader);
-    if (w < 0 || !mb || mb->state == META_OUT)
+    if (w < 0 || !mb || (mb->state == META_OUT && !MUT(25)))
         return META_ERR_INVALID;
     int same = g->leader == v->leader;
-    if (g->new_epoch <= v->epoch || (!same && g->new_epoch < v->epoch + (MUT(2) ? 1 : 2)))
+    if ((g->new_epoch <= v->epoch && !(MUT(31) && same && g->new_epoch == v->epoch)) || (!same && g->new_epoch < v->epoch + (MUT(2) ? 1 : 2)))
         return META_ERR_INVALID; /* e + 1 is the owner's */
     if (g->new_epoch >= META_EPOCH_LIMIT - 1 && !MUT(9))
         return META_ERR_RANGE; /* the reservation after it must stay legal too */
@@ -1086,10 +1087,16 @@ static int grant_shared(struct meta_state *m, struct meta_volume *v, const struc
         for (uint32_t i = 0; i < v->nrep; i++)
             if (!v->rep[i].claim_blocked)
                 return META_ERR_BLOCKED;
-    if (!same && !MUT(8) && m->set.failover != META_FAILOVER_LEASE &&
-        (g->reason == META_GR_UNHEARD || g->reason == META_GR_FENCED)) {
+    if (g->reason == META_GR_RESIGNED)
+        return META_ERR_INVALID; /* the replicated mode's reason: a shared owner does not resign */
+    /* Under attested and bmc every move of a shared volume to another node needs the attestation, whatever reason the
+     * proposer names: a label it chooses must not decide whether the only server-side fence is applied. Two moves
+     * stand on the old owner's own word: PLANNED (its release is the basis) and REFUSED (the claimant that refused
+     * never held the lock). */
+    if (!same && !MUT(8) && m->set.failover != META_FAILOVER_LEASE && g->reason != META_GR_PLANNED &&
+        g->reason != META_GR_REFUSED) {
         const struct meta_attest *a = &g->att;
-        if (a->kind == META_ATT_NONE || !a->who[0] || !a->ms)
+        if ((a->kind == META_ATT_NONE && !MUT(35)) || !a->who[0] || !a->ms)
             return META_ERR_ATTEST;
         if (m->set.failover == META_FAILOVER_BMC) {
             const struct meta_member *old = meta_member(m, v->leader);
@@ -1182,8 +1189,9 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             return META_ERR_STATE;
         if (inc < mb->incarnation)
             return META_ERR_STALE; /* the flags of an earlier run */
+        int healed = !(mb->flags & META_MF_CLAIM_OK) && (flags & META_MF_CLAIM_OK);
         mb->flags = flags;
-        if (flags & META_MF_VOLUMES_OK) /* it says it is well again: its CLAIM_FAILED bars end (F8) */
+        if (healed || MUT(28)) /* it says its claims work again (a 0 -> 1 of claim_ok): its CLAIM_FAILED bars end (F8) */
             for (uint32_t i = 0; i < m->nvolumes; i++)
                 for (uint32_t j = 0; j < m->volumes[i].nrep; j++)
                     if (m->volumes[i].rep[j].node == id)
@@ -2152,6 +2160,11 @@ static int check_volume_step(const struct meta_volume *a, const struct meta_volu
                  va, a->leader, b->leader, (unsigned long long)b->epoch, a->leader, (unsigned long long)a->epoch);
         if (b->epoch >= META_EPOCH_LIMIT)
             FAIL("volume %u: epoch %llu is beyond the u24 bound", va, (unsigned long long)b->epoch);
+        /* a grant lands above every epoch a claimant reported (highest_seen); only the owner's own step to e + 1
+         * (VOLUME_SELF) is exempt */
+        if (b->epoch > a->epoch && (moved || b->epoch != a->epoch + 1) && b->epoch <= a->highest_seen)
+            FAIL("volume %u: epoch %llu was granted although epoch %llu was seen", va, (unsigned long long)b->epoch,
+                 (unsigned long long)a->highest_seen);
     }
     if (b->epoch > a->epoch && moved && !meta_volume_in_isr(a, b->leader))
         FAIL("volume %u: leader %u of epoch %llu was not in the ISR of epoch %llu", va, b->leader,
@@ -2213,6 +2226,19 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
             FAIL("volume %u disappeared", a->number);
         if (check_volume_step(a, b, why, n))
             return -1;
+        if (a->kind == META_VOL_SHARED && b->leader != a->leader) {
+            /* a shared volume goes to a member that is in the group, and not to one a claim fault barred while
+             * another candidate is not barred */
+            const struct meta_member *mb = meta_member(prev, b->leader);
+            if (!mb || mb->state == META_OUT)
+                FAIL("volume %u: granted to node %u, which is not a member", a->number, b->leader);
+            const struct meta_replica *rn = meta_replica(a, b->leader);
+            if (rn && rn->claim_blocked)
+                for (uint32_t j = 0; j < a->nrep; j++)
+                    if (!a->rep[j].claim_blocked)
+                        FAIL("volume %u: granted to node %u, whose claims failed, while node %u was not barred",
+                             a->number, b->leader, a->rep[j].node);
+        }
     }
     for (uint32_t i = 0; i < next->nvolumes; i++) {
         const struct meta_volume *b = &next->volumes[i];

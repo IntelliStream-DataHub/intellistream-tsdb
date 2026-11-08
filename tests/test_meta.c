@@ -657,6 +657,17 @@ static void test_shared(void)
         free(img);
     }
     v = meta_volume(&m, 0);
+    /* flags that change nothing about claims do not lift the bar (ha-s1 review 6: any flags used to), nor does a
+     * voter_ok loss; a claim_ok 0 -> 1 does */
+    meta_op_member_flags(&e, 3, 0, META_MF_ALL);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_replica(meta_volume(&m, 0), 3)->claim_blocked);
+    meta_op_member_flags(&e, 3, 0, META_MF_VOLUMES_OK | META_MF_CLAIM_OK); /* its state disk filled */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_replica(meta_volume(&m, 0), 3)->claim_blocked);
+    meta_op_member_flags(&e, 3, 0, META_MF_VOLUMES_OK); /* its claims fail */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_replica(meta_volume(&m, 0), 3)->claim_blocked);
     meta_op_member_flags(&e, 3, 0, META_MF_ALL); /* node 3 is well again */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     CHECK(!meta_replica(meta_volume(&m, 0), 3)->claim_blocked);
@@ -747,7 +758,31 @@ static void test_shared(void)
     g.reason = META_GR_FENCED;
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
+    /* the reason is the proposer's label: every other move to another node needs it too (ha-s1 review 3) */
+    for (int rsn = META_GR_UNHEARD; rsn <= META_GR_LAST; rsn++) {
+        if (rsn == META_GR_PLANNED || rsn == META_GR_REFUSED)
+            continue;
+        g.reason = (uint8_t)rsn;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&m, &e, res, 8) == META_OK &&
+              res[0] == (rsn == META_GR_RESIGNED ? META_ERR_INVALID : META_ERR_ATTEST)); /* shared: no resigning */
+    }
+    g.reason = META_GR_UNHEARD; /* kind NONE with a name and a time is no attestation */
+    snprintf(g.att.who, sizeof g.att.who, "olav");
+    g.att.ms = 1234;
+    meta_op_volume_leader(&e, &g);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
+    g.reason = META_GR_RESIGNED; /* not even with a full attestation */
+    g.att.kind = META_ATT_OPERATOR;
+    meta_op_volume_leader(&e, &g);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    memset(&g.att, 0, sizeof g.att);
     g.reason = META_GR_PLANNED; /* a planned move of a live owner needs none */
+    meta_op_volume_leader(&e, &g);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    v = meta_volume(&m, 0);
+    someone = v->leader == 1 ? 2 : 1;
+    g = sgrant(meta_volume(&m, 0), someone, v->epoch + 2, META_GR_REFUSED); /* a claimant refused: it never held the lock */
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v = meta_volume(&m, 0);
@@ -794,6 +829,42 @@ static void test_shared(void)
     g.att.incarnation = 5;
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+
+    /* the owner is granted its own volume at an epoch it holds already: refused (it would not raise the epoch) */
+    v = meta_volume(&m, 0);
+    g = sgrant(v, v->leader, v->epoch, META_GR_PLANNED);
+    meta_op_volume_leader(&e, &g);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    /* never to a member that is out */
+    v = meta_volume(&m, 0);
+    uint32_t gone = v->rep[0].node == v->leader ? v->rep[1].node : v->rep[0].node;
+    meta_op_member_state(&e, gone, META_OUT, 9);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    v = meta_volume(&m, 0);
+    g = sgrant(v, gone, v->epoch + 2, META_GR_PLANNED);
+    meta_op_volume_leader(&e, &g);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+
+    /* the checker alone (the simulator has no unit test of its own for these): a grant to a member that is out, and a
+     * grant at or below an epoch a claimant reported, are failures of the step */
+    {
+        struct meta_state pv, nx;
+        meta_copy(&pv, &m);
+        meta_copy(&nx, &m);
+        struct meta_volume *nv = (struct meta_volume *)meta_volume(&nx, 0);
+        nv->leader = gone;
+        nv->epoch += 2;
+        CHECK(meta_check_step(&pv, &nx, why, sizeof why) == -1);
+        meta_free(&nx);
+        meta_copy(&nx, &m);
+        nv = (struct meta_volume *)meta_volume(&nx, 0);
+        ((struct meta_volume *)meta_volume(&pv, 0))->highest_seen = nv->epoch + 5;
+        ((struct meta_volume *)meta_volume(&nx, 0))->highest_seen = nv->epoch + 5;
+        nv->epoch += 2; /* the owner's own grant, below what was seen */
+        CHECK(meta_check_step(&pv, &nx, why, sizeof why) == -1);
+        meta_free(&nx);
+        meta_free(&pv);
+    }
 
     /* a snapshot of all this round-trips, byte for byte in hash */
     {
