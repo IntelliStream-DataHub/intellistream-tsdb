@@ -401,6 +401,35 @@ static int threads_now(void)
 #endif
 }
 
+/* /proc/self/task still lists a thread for a while after pthread_join returned for it (the task is reaped later, and
+ * on a loaded machine that takes long), so a count taken right after a close or an open is a lower or upper bound
+ * only. The baselines wait until the count has held for 200 ms; an expected count is polled for up to 10 s. */
+static int threads_stable(void)
+{
+    int last = threads_now();
+    if (last < 0)
+        return last;
+    for (int still = 0, waited = 0; still < 20 && waited < 1000; waited++) {
+        usleep(10000);
+        int n = threads_now();
+        if (n == last)
+            still++;
+        else
+            still = 0, last = n;
+    }
+    return last;
+}
+
+static bool threads_are(int want)
+{
+    for (int i = 0; i < 1000; i++) {
+        if (threads_now() == want)
+            return true;
+        usleep(10000);
+    }
+    return false;
+}
+
 static void test_modes(const char *base)
 {
     char dir[512];
@@ -417,10 +446,10 @@ static void test_modes(const char *base)
     put_rows(db, id, TSDB_FLOAT64, T0, 1000, 0, 3000);
     tsdb_close(db);
 
-    int t0 = threads_now();
+    int t0 = threads_stable();
     o.stats = -1; /* off: no thread, no event ring, no query counters, zeros in the totals */
     OK(tsdb_open(dir, &o, &db));
-    int t_off = threads_now();
+    int t_off = threads_stable();
     decoded d = decode(db, id);
     CHECK(d.rows == 3000);
     tsdb_query_totals qt;
@@ -437,12 +466,12 @@ static void test_modes(const char *base)
     OK(tsdb_series_stats(db, &id, 1, 0, &st, &done));
     CHECK(done == 1 && st.status == 0 && st.rows == 3000 && st.logical_bytes == 3000 * 16);
     if (t0 >= 0)
-        CHECK(threads_now() == t_off); /* the sweeper was never started, by the settle or by the stats call */
+        CHECK(threads_are(t_off)); /* the sweeper was never started, by the settle or by the stats call */
     tsdb_close(db);
 
     o.stats = 0; /* lazy: no thread until the first volume stats or settle */
     OK(tsdb_open(dir, &o, &db));
-    int t_lazy = threads_now();
+    int t_lazy = threads_stable();
     if (t0 >= 0)
         CHECK(t_lazy == t_off);
     OK(tsdb_query_totals_get(db, &qt));
@@ -452,12 +481,12 @@ static void test_modes(const char *base)
     CHECK(qt.queries == 1); /* the counters run in lazy mode */
     OK(tsdb_stats_settle(db, 60000));
     if (t0 >= 0)
-        CHECK(threads_now() == t_lazy + 1);
+        CHECK(threads_are(t_lazy + 1));
     OK(tsdb_get_volume_stats(db, 0, &vs));
     CHECK(vs.logical_bytes == 3000 * 16 && vs.stats_parts_counted == vs.stats_parts_listed && vs.stats_parts_listed > 0);
     tsdb_close(db);
     if (t0 >= 0)
-        CHECK(threads_now() == t0); /* tsdb_close joined it */
+        CHECK(threads_are(t0)); /* tsdb_close joined it */
 
     /* the sweeper's CPU time is reported */
     o.stats = 1;
@@ -568,6 +597,9 @@ static void test_series_stats_api(const char *base)
     tsdb_sid id;
     OK(tsdb_series_create(db, "a", TSDB_FLOAT64, dir, &id));
     put_rows(db, id, TSDB_FLOAT64, T0, 1000, 0, 3000);
+    /* the hot-writes list (writes_est) is fed by the sweeper from the flush event: wait for it, or the first
+     * records and the last differ on a machine where the sweeper is starved */
+    OK(tsdb_stats_settle(db, 60000));
     size_t done = 99;
     tsdb_series_stat st[600];
     tsdb_sid ids[600];
