@@ -1925,6 +1925,70 @@ static void test_follower(int steps)
 
 /* ------------------------------------------------------------------ main */
 
+/* flush-tail: a publisher's fold lists are freed after the table's write lock is released. At 10^6 series one list is
+ * 40 MB and its munmap (2 ms) held every lookup off. The hook runs at each free (LH_LF_FREE); the lock must not be
+ * held. Mutant: lt_fold frees the lists itself (as before). */
+typedef struct {
+    tsdb *db;
+    int frees, held;
+} lfx;
+
+static void lf_hook(void *arg, int at)
+{
+    lfx *x = arg;
+    if (at != LH_LF_FREE)
+        return;
+    x->frees++;
+    x->held += tsdb_test_latest_wr_held(x->db);
+}
+
+static void test_lf_free_unlocked(void)
+{
+    for (int mode = 0; mode < 3; mode++) { /* flush, flush through the window, a large insert's parts */
+        tsdb_options o;
+        tsdb_options_init(&o);
+        o.merge_threads = 0;
+        o.partition_classes = 0;
+        o.buffer_rows = 100;
+        tsdb_test_latest_window(mode == 1 ? 1 : 50000);
+        tsdb *db = open_plain("latest_lf", &o);
+        tsdb_sid id[4];
+        for (int i = 0; i < 4; i++) {
+            char name[32];
+            snprintf(name, sizeof name, "lf.%d", i);
+            OK(tsdb_series_create(db, name, TSDB_FLOAT64, NULL, &id[i]));
+        }
+        lfx x = {db, 0, 0};
+        tsdb_test_latest_hook(db, lf_hook, &x);
+        for (int i = 0; i < 4; i++) {
+            if (mode < 2) {
+                for (int k = 0; k < 20; k++)
+                    put_f64(db, id[i], 1000 + k, 1.0 + k, false);
+            } else {
+                int64_t ts[500];
+                double v[500];
+                for (int k = 0; k < 500; k++) {
+                    ts[k] = 1000 + k;
+                    v[k] = k;
+                }
+                tsdb_values vals = {TSDB_FLOAT64, v, NULL};
+                OK(tsdb_insert_series_values(db, id[i], ts, &vals, 500));
+            }
+        }
+        if (mode < 2)
+            OK(tsdb_flush(db));
+        tsdb_test_latest_hook(db, NULL, NULL);
+        CHECK(x.frees > 0);
+        CHECK(x.held == 0);
+        if (x.held || !x.frees)
+            fprintf(stderr, "  mode %d: %d fold lists freed, %d under the table's write lock\n", mode, x.frees, x.held);
+        tsdb_latest_result r = one(db, id[0], TSDB_TS_MAX, 0);
+        CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == (mode < 2 ? 1019 : 1499));
+        OK(tsdb_close(db));
+    }
+    tsdb_test_latest_window(50000);
+}
+
 int main(int argc, char **argv)
 {
     const char *scratch = argc > 1 ? argv[1] : "/tmp";
@@ -1946,6 +2010,7 @@ int main(int argc, char **argv)
     test_active_over_flushing();
     test_drop_floor_lookup();
     test_lengthened_after_merge();
+    test_lf_free_unlocked();
     test_sync_visibility();
     test_row_below_cutoff();
     test_build_state_bounds();

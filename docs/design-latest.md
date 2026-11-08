@@ -1011,7 +1011,15 @@ B the slow path (`WITH_NULLS`, 2 readers x 4,096 ids, 3 repetitions, 15 rounds, 
   `src/compat.h`; the read lock, so others fault in between). The ablation (15 rounds per variant, rounds 2 to 4 of 5
   runs, `--series 1000000`) shows both are needed: with (1) alone the worst case stays at 8 to 10 ms in the first
   rounds after a start (the buffers are then new) and the mean of the max lookup is 4.3 ms; with both 0.7 ms. Mode
-  "on" keeps a worst lookup of 2.2 ms that this change does not touch (not measured further: the lookups of that mode go through the table's own path). The listing section (parts listed under `db->lock`) takes under 10 us.
+  "on" kept a worst lookup of 2.2 ms after both: `lt_fold` freed the fold lists (`free(ps[i]->lf)`, 2^20 x 40 B = 40 MB at
+  10^6 series, an `munmap` of about 2 ms) inside the table's write section, with `t->rw` held for writing, so every
+  lookup waited on it (found by the review of the track: mode off has no fold lists and reached 0.4 ms). `lt_fold` now
+  only collects the lists in the `lt_sec` and `lt_end` frees them through `tsdb_free_big` after `pthread_rwlock_unlock`
+  (`tests/test_latest.c`, `test_lf_free_unlocked`, through the hook `LH_LF_FREE`). They are still freed while the caller's
+  `publish_lock` is held (it holds off only other publishers). The listing section (parts listed under `db->lock`) takes
+  under 10 us. The cost in appends: the array's pages are touched lazily under `buf_lock` (p50 2 to 4-5 us, p99 with the
+  table on 7-10 to 16-38 us); pre-sizing and pre-touching the new memtable's array in `mt_flush` would bring the 40 MB
+  back into RSS at every flush whether the series come or not, so it is left.
 - The window threshold (`LT_WINDOW_MIN` 50,000) stays. This measurement shows no difference between on and nowin at
   10^6 series (the pause above hides the window's effect on the worst case; the review's own run saw worst lookups of
   2 to 6 ms with the window and 5 to 12 ms without). The window threshold itself is not measured below 10^6 series.

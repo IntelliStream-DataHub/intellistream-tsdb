@@ -782,7 +782,7 @@ typedef struct part {
     /* the latest table's fold list (latest.c): per series of this pending part, its newest non-null row and the range
      * of its nulls, made by the part writer; the publisher folds and frees it (NULL when the table is off) */
     struct lfold *lf;
-    size_t nlf;
+    size_t nlf, lfcap; /* lfcap: the allocation, for tsdb_free_big */
 } part;
 
 
@@ -1469,7 +1469,7 @@ typedef struct ltab {
 /* a lookup that waits for a publisher's window or the warmer: test hooks (tests/test_latest.c) */
 typedef void (*latest_hook_fn)(void *arg, int at);
 enum { LH_FOLD_BEFORE_LIST = 1, LH_WARM_BEFORE_STORE = 2, LH_LOOKUP_AFTER_ENTRY = 3, LH_WARM_AFTER_CUT = 4,
-       LH_WINDOW_MID = 5 };
+       LH_WINDOW_MID = 5, LH_LF_FREE = 6 /* before lt_end frees a fold list (tests: the write lock is not held) */ };
 
 struct eng {
     char *dir;
@@ -1983,6 +1983,8 @@ typedef struct lt_sec {
     const lfold **note; /* the window's folds left for the write section (a null over a known row) */
     size_t nnote, capnote;
     bool noteoom;       /* a note did not fit: the write section folds every list */
+    struct lt_lf { void *p; size_t bytes; } *dfree; /* the fold lists, freed by lt_end after the lock is released: at */
+    size_t ndfree;                                  /* 10^6 series one is 40 MB, and its munmap stalled every lookup */
 } lt_sec;
 void lt_begin(eng *db, lt_sec *sec);
 /* lt_begin for a flush's parts: a long fold list is stored in a window without the lock (3.2) */
@@ -2117,6 +2119,7 @@ uint64_t tsdb_test_fence_wakeups(struct tsdb *t);
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
 bool tsdb_test_latest_stats(struct tsdb *t, uint64_t out[6]);
 void tsdb_test_latest_hook(struct tsdb *t, void (*fn)(void *, int), void *arg);
+bool tsdb_test_latest_wr_held(struct tsdb *t); /* the table's lock is held for writing (tests) */
 void tsdb_test_latest_window(int min); /* flushes with this many series or more use the 3.2 window (process-wide) */
 void tsdb_test_latest_nowarm(int on); /* engines opened while on start no warmer (process-wide) */
 /* tests: fn(arg, 0) runs in tsdb_volume_reopen before it halts the old engine, fn(arg, 1) once the new engine is

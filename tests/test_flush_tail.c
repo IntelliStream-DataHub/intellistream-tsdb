@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef __APPLE__
+#include <sys/mman.h>
+#endif
 
 static int failures;
 #define CHECK(c)                                                                                                       \
@@ -28,7 +31,13 @@ static int failures;
         }                                                                                                              \
     } while (0)
 
-/* resident memory of this process, bytes */
+/* resident memory of this process, bytes. macOS has no /proc: the RSS checks are skipped there (rss_ok is 0; the
+ * checks of the contents stay) */
+#ifdef __APPLE__
+#define rss_ok 0
+static long rss(void) { return 0; }
+#else
+#define rss_ok 1
 static long rss(void)
 {
     FILE *f = fopen("/proc/self/statm", "r");
@@ -40,6 +49,7 @@ static long rss(void)
     }
     return b * sysconf(_SC_PAGESIZE);
 }
+#endif
 
 static void add(memtable *m, uint32_t id, int64_t ts, double x)
 {
@@ -71,8 +81,8 @@ static void test_series_array(void)
      * 1,000,001 entries, 40 MB. The old code wrote every page of it under buf_lock */
     add(m, 1000000, 200, 2.5);
     long grown = rss() - r0;
-    CHECK(grown < (8l << 20));
-    if (grown >= (8l << 20))
+    CHECK(!rss_ok || grown < (8l << 20));
+    if (rss_ok && grown >= (8l << 20))
         fprintf(stderr, "  the array's growth made %ld MB resident\n", grown >> 20);
     /* growing again keeps what was there (mremap moves it) and reads zero elsewhere */
     add(m, 3000000, 300, 3.5);
@@ -82,7 +92,7 @@ static void test_series_array(void)
     mem_run r = {0};
     CHECK(mt_collect(m, 2000000, 8, INT64_MIN, INT64_MAX, UINT64_MAX, &r) == 0 && r.n == 0);
     mem_run_free(&r);
-    CHECK(rss() - r0 < (8l << 20));
+    CHECK(!rss_ok || rss() - r0 < (8l << 20));
     mt_unref(m);
 }
 
@@ -104,7 +114,7 @@ static void test_free_big(void)
         CHECK(c[i] == 0xc3);
     }
     CHECK(a[n - 1] == 0xa5 && c[0] == 0xc3);
-    CHECK(freed > (12l << 20)); /* the block's pages went back */
+    CHECK(!rss_ok || freed > (12l << 20)); /* the block's pages went back */
     /* a block that starts inside a page and a short one: no crash, no damage */
     unsigned char *d = malloc((size_t)20 << 20);
     memset(d, 0x11, (size_t)20 << 20);
@@ -115,6 +125,34 @@ static void test_free_big(void)
     free(a);
     free(c);
 }
+
+#ifndef __APPLE__
+/* the zap rounds to the page size it is given and clears no byte outside the block, whatever the kernel's page size:
+ * on a 64 KB kernel madvise rounds a 4 KB-rounded range up and clears the next chunk. Here the "kernel" has 4 KB pages
+ * and the zap is told 16 KB: the 4 KB pages at either end of the block that are not whole 16 KB pages must stay.
+ * Mutant: the page size fixed at 4096 again. */
+static void test_zap_page_size(void)
+{
+    CHECK(tsdb_page_size() >= 4096 && (tsdb_page_size() & (tsdb_page_size() - 1)) == 0);
+    size_t n = (size_t)20 << 20, pg = 16384;
+    unsigned char *m = mmap(NULL, n + (1 << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(m != MAP_FAILED);
+    if (m == MAP_FAILED)
+        return;
+    memset(m, 0xa5, n + (1 << 20));
+    /* the block starts 4 KB past a 16 KB boundary (m is page aligned; make it so) and ends 4 KB past another */
+    unsigned char *b = (unsigned char *)(((uintptr_t)m + pg - 1) & ~(uintptr_t)(pg - 1)) + 4096;
+    tsdb_zap_slices_pg(b, n, pg);
+    unsigned char *a = (unsigned char *)(((uintptr_t)b + pg - 1) & ~(uintptr_t)(pg - 1));
+    unsigned char *e = (unsigned char *)(((uintptr_t)b + n) & ~(uintptr_t)(pg - 1));
+    CHECK(b[0] == 0xa5 && b[4095] == 0xa5 && a[-1] == 0xa5); /* the partial 16 KB page at the start stays */
+    CHECK(e[0] == 0xa5 && b[n - 1] == 0xa5);                 /* and at the end */
+    CHECK(a[0] == 0 && e[-1] == 0 && a[(e - a) / 2] == 0);   /* whole pages inside went */
+    CHECK(*(b - 4096) == 0xa5);                                /* the neighbour before the block */
+    CHECK(b[n + 4095] == 0xa5);                                /* and after: the page the end is in */
+    munmap(m, n + (1 << 20));
+}
+#endif
 #endif
 
 int main(void)
@@ -122,6 +160,11 @@ int main(void)
     test_series_array();
 #ifndef OLD_CODE
     test_free_big();
+#ifndef __APPLE__
+    test_zap_page_size();
+#else
+    printf("test_flush_tail: RSS checks and the zap test skipped on macOS (no /proc, plain free)\n");
+#endif
 #endif
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);

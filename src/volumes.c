@@ -1829,6 +1829,19 @@ void tsdb_test_latest_hook(tsdb *t, void (*fn)(void *, int), void *arg)
     __atomic_store_n(&t->vols[0]->lt_hook, fn, __ATOMIC_RELEASE);
 }
 
+/* Whether volume 0's latest table is held by a writer (tests: the hook's LH_LF_FREE must find it free). Called from the
+ * writer's own thread, a try-read on a lock it holds for writing is refused as well. */
+bool tsdb_test_latest_wr_held(tsdb *t)
+{
+    ltab *lt = t->vols[0]->lt;
+    if (!lt)
+        return false;
+    if (pthread_rwlock_tryrdlock(&lt->rw) != 0)
+        return true;
+    pthread_rwlock_unlock(&lt->rw);
+    return false;
+}
+
 void tsdb_test_midplace(tsdb *t, void (*fn)(void *), void *arg)
 {
     for (size_t i = 0; i < t->nvols; i++) {

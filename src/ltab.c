@@ -414,10 +414,19 @@ void lt_fold(eng *db, lt_sec *sec, part **ps, size_t n)
         for (size_t k = 0; k < p->nlf; k++)
             fold_one(db, t, &p->lf[k], sec);
     }
-    for (size_t i = 0; i < n; i++) { /* consumed, also when there is no table */
-        free(ps[i]->lf);
+    /* Consumed, also when there is no table. With a table the caller holds its write lock: the lists (40 MB at 10^6
+     * series, an munmap of 2 ms) are freed by lt_end, after the lock is released, not here. */
+    if (t && n && !sec->dfree)
+        sec->dfree = calloc(n, sizeof *sec->dfree);
+    for (size_t i = 0; i < n; i++) {
+        if (ps[i]->lf && sec->dfree)
+            sec->dfree[sec->ndfree++] = (struct lt_lf){ps[i]->lf, ps[i]->lfcap * sizeof *ps[i]->lf};
+        else if (ps[i]->lf) {
+            lt_hook(db, LH_LF_FREE);
+            tsdb_free_big(ps[i]->lf, ps[i]->lfcap * sizeof *ps[i]->lf);
+        }
         ps[i]->lf = NULL;
-        ps[i]->nlf = 0;
+        ps[i]->nlf = ps[i]->lfcap = 0;
     }
 }
 
@@ -434,6 +443,11 @@ void lt_end(eng *db, lt_sec *sec)
         pthread_mutex_unlock(&t->pmu);
     }
     pthread_rwlock_unlock(&t->rw);
+    for (size_t i = 0; i < sec->ndfree; i++) { /* lt_fold's fold lists, now that lookups can go on */
+        lt_hook(db, LH_LF_FREE);
+        tsdb_free_big(sec->dfree[i].p, sec->dfree[i].bytes);
+    }
+    free(sec->dfree);
     hints_push(db, sec->id, sec->n, sec->oom);
     free(sec->id);
     memset(sec, 0, sizeof *sec);

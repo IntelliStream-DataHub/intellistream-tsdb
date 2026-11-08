@@ -220,19 +220,37 @@ static inline void tsdb_free_big(void *p, size_t n) { free(p); }
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #define TSDB_FREE_BIG_MIN ((size_t)16 << 20)  /* below this the plain munmap is under 0.7 ms, and zapping pages the heap would
                                                * keep for the next allocation only makes it fault them in again (-4% on
                                                * 1M-row part writes at 4 MB) */
 #define TSDB_FREE_BIG_SLICE ((size_t)2 << 20) /* what one madvise hands back: about 80 us under the read lock */
-/* the pages inside [p, p + n) handed back in slices (whole pages only; a larger page size only loses the call) */
-static inline void tsdb_zap_slices(void *p, size_t n)
+/* the kernel's page size, once. madvise rounds the length up to whole pages, so a zap rounded to a smaller page than the
+ * kernel's (4096 on a 64 KB kernel) would clear up to 60 KB past the block: the next heap chunk's live data. */
+static inline uintptr_t tsdb_page_size(void)
+{
+    static uintptr_t pg;
+    uintptr_t v = __atomic_load_n(&pg, __ATOMIC_RELAXED);
+    if (!v) {
+        long s = sysconf(_SC_PAGESIZE);
+        v = s >= 4096 && (s & (s - 1)) == 0 ? (uintptr_t)s : 65536; /* unknown: the largest in use, which only loses pages */
+        __atomic_store_n(&pg, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
+/* the pages inside [p, p + n) handed back in slices, page size pg (a power of two: only whole pages of that size, so no
+ * byte outside the block is touched; tests pass another one) */
+static inline void tsdb_zap_slices_pg(void *p, size_t n, uintptr_t pg)
 {
     if (!p || n < TSDB_FREE_BIG_MIN)
         return;
-    const uintptr_t pg = 4096;
     uintptr_t a = ((uintptr_t)p + pg - 1) & ~(pg - 1), e = ((uintptr_t)p + n) & ~(pg - 1);
     for (; a < e; a += TSDB_FREE_BIG_SLICE)
         madvise((void *)a, e - a < TSDB_FREE_BIG_SLICE ? e - a : TSDB_FREE_BIG_SLICE, MADV_DONTNEED);
+}
+static inline void tsdb_zap_slices(void *p, size_t n)
+{
+    tsdb_zap_slices_pg(p, n, tsdb_page_size());
 }
 static inline void tsdb_free_big(void *p, size_t n)
 {

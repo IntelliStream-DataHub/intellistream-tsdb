@@ -869,6 +869,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
             snprintf((*out)->pending, sizeof (*out)->pending, "%s", w->tmp_name);
             (*out)->lf = w->lf; /* the publisher folds it into the latest table and frees it */
             (*out)->nlf = w->nlf;
+            (*out)->lfcap = w->lfcap;
             w->lf = NULL;
         } else
             unlinkat(db->dirfd, w->tmp_name, 0);
