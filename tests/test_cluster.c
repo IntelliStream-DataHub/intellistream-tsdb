@@ -64,6 +64,8 @@ static size_t secret_len;
 static pid_t pids[N];
 static int pports[N], stopped[N];
 static const char *envs[N]; /* TSDB_CLUSTER_TEST of server i */
+static const char *xargs[N]; /* more tsdbd options of server i, separated by spaces (--rack R, --power-feed F) */
+static int is_witness[N];    /* server i runs --witness: no --dir, no volumes */
 static uint32_t ids[N];     /* member id of server i (0 until it is a member) */
 
 static void die(const char *fmt, ...)
@@ -137,8 +139,31 @@ static void start(int i)
             unsetenv("TSDB_CLUSTER_TEST");
         char state[PATH_MAX + 90];
         snprintf(state, sizeof state, "%s/state", dir);
-        const char *argv[] = {"tsdbd", "--no-auth", flag, "--dir", dir, "--port", "0", "--port-file", pf,
-                              "--cluster", "--cluster-secret-file", secret_path, "--state-dir", state, NULL};
+        const char *argv[40];
+        int n = 0;
+        argv[n++] = "tsdbd";
+        argv[n++] = "--no-auth";
+        argv[n++] = flag;
+        if (is_witness[i])
+            argv[n++] = "--witness";
+        else {
+            argv[n++] = "--dir";
+            argv[n++] = dir;
+            argv[n++] = "--port";
+            argv[n++] = "0";
+        }
+        argv[n++] = "--port-file";
+        argv[n++] = pf;
+        argv[n++] = "--cluster";
+        argv[n++] = "--cluster-secret-file";
+        argv[n++] = secret_path;
+        argv[n++] = "--state-dir";
+        argv[n++] = state;
+        char extra[256];
+        snprintf(extra, sizeof extra, "%s", xargs[i] ? xargs[i] : "");
+        for (char *t = strtok(extra, " "); t && n < 38; t = strtok(NULL, " "))
+            argv[n++] = t;
+        argv[n] = NULL;
         execv(bin, (char *const *)argv);
         _exit(127);
     }
@@ -214,6 +239,8 @@ static void scenario(const char *name)
     memset(pports, 0, sizeof pports);
     memset(stopped, 0, sizeof stopped);
     memset(envs, 0, sizeof envs);
+    memset(xargs, 0, sizeof xargs);
+    memset(is_witness, 0, sizeof is_witness);
     snprintf(base, sizeof base, "%s/%s", root, name);
     if (mkdir(base, 0755) != 0)
         die("mkdir %s: %s", base, strerror(errno));
@@ -400,7 +427,7 @@ static void node_add(int via, int newi)
 }
 
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
-static void init_cluster(int i, uint32_t replace_s)
+static void init_mode(int i, uint32_t replace_s, int mode)
 {
     struct meta_settings s;
     meta_settings_default(&s);
@@ -409,7 +436,7 @@ static void init_cluster(int i, uint32_t replace_s)
     s.voter_replace_s = replace_s;
     uint8_t req[64], *reply;
     size_t len;
-    size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
+    size_t rl = cluster_settings_encode(&s, mode, req);
     int rc = admin(i, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
     free(reply);
     if (rc != 0)
@@ -418,6 +445,7 @@ static void init_cluster(int i, uint32_t replace_s)
     await_view(i, p_leader_self, NULL, "leading the initialised cluster");
 }
 
+static void init_cluster(int i, uint32_t replace_s) { init_mode(i, replace_s, META_MODE_REPLICATED); }
 static void init_fast(int i) { init_cluster(i, 3); }
 
 /* Every live server's STATUS agrees on the leader and, once caught up, on the state (meta_hash). */
@@ -1415,6 +1443,231 @@ static void scen_stall(void)
     printf("  the stall ended: server %d is a follower again and caught up\n", L);
 }
 
+
+/* A witness (item 7): a cluster member with no --dir, no engine and no volumes. It holds a Raft core (a voter), its
+ * member record says volumes_ok 0, and nothing in its directory looks like a volume. */
+static void scen_witness(void)
+{
+    scenario("witness");
+    start(0);
+    is_witness[1] = 1;
+    xargs[1] = "--peer-port 0"; /* a witness takes the peer port 7071 unless told */
+    char wdir[PATH_MAX + 160];
+    snprintf(wdir, sizeof wdir, "%s/n1", base); /* no --dir makes it; the state directory goes inside */
+    if (mkdir(wdir, 0755) != 0)
+        die("mkdir %s: %s", wdir, strerror(errno));
+    start(1);
+    start(2);
+    init_fast(0);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters (the witness is one)");
+    struct view v;
+    view(0, &v);
+    const struct meta_member *w = meta_member(&v.m, ids[1]);
+    if (!w || (w->flags & META_MF_VOLUMES_OK) || !(w->flags & META_MF_VOTER_OK))
+        die("the witness's record has flags %u, expected voter_ok without volumes_ok", w ? (unsigned)w->flags : 99u);
+    const struct meta_member *m0 = meta_member(&v.m, ids[0]);
+    if (!m0 || !(m0->flags & META_MF_VOLUMES_OK))
+        die("a normal member's record lacks volumes_ok");
+    view_free(&v);
+    char path[PATH_MAX + 160];
+    snprintf(path, sizeof path, "%s/n1/SERIES", base);
+    if (access(path, F_OK) == 0)
+        die("the witness made %s: it holds volumes", path);
+    snprintf(path, sizeof path, "%s/n1/state/NODE", base);
+    if (access(path, F_OK) != 0)
+        die("the witness has no NODE file in its state directory");
+    printf("  a witness is a voter without volumes_ok and without a data directory\n");
+}
+
+/* Flags (item 6) and the copy (item 8): a server that reports voter_ok 0 (no room in its state directory) joins as a
+ * member, is never added to the group, and, as a watcher, keeps a copy of the metadata that it serves, marked stale,
+ * after a restart with the group down. */
+static void scen_flags(void)
+{
+    scenario("flags");
+    envs[2] = "free_min=9999999999999999"; /* more than any disk has: voter_ok 0 */
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_fast(0);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 2;
+    await_view(0, p_voters, &want, "two voters, the third server is not one");
+    /* it stays out for well past voter_replace_s and the learner rounds of the leader */
+    uint64_t t0 = now_ms();
+    while (now_ms() - t0 < 5000)
+        usleep(100000);
+    struct view v;
+    view(0, &v);
+    const struct meta_member *m = meta_member(&v.m, ids[2]);
+    if (!m || (m->flags & META_MF_VOTER_OK) || !(m->flags & META_MF_VOLUMES_OK))
+        die("server 2's record has flags %u, expected volumes_ok without voter_ok", m ? (unsigned)m->flags : 99u);
+    if (v.cfg.n != 2 || raft_config_find(&v.cfg, ids[2]))
+        die("a member with voter_ok 0 is in the Raft group");
+    struct catch_up c = {v.m.applied, meta_hash(&v.m)};
+    uint32_t members = v.m.nmembers;
+    view_free(&v);
+    await_view(2, p_caught_up, &c, "the watcher catching up");
+    printf("  voter_ok 0 keeps a member out of the group\n");
+    /* the copy: all down, then the watcher alone */
+    usleep(1000000); /* the copy is written a moment after the applied entries */
+    stop(2, SIGTERM);
+    stop(1, SIGTERM);
+    stop(0, SIGTERM);
+    start(2);
+    view(2, &v);
+    if (!v.st.stale || v.m.nmembers != members)
+        die("the restarted watcher shows stale %d and %u members, expected a stale copy with %u", (int)v.st.stale,
+            (unsigned)v.m.nmembers, (unsigned)members);
+    view_free(&v);
+    printf("  a restarted watcher serves its copy of the metadata, marked stale\n");
+}
+
+/* Heartbeat sections (item 1): a server that reports a volume with a fault and a slow domain shows both in the
+ * leader's status, and the fault timer grows while the reports keep it. */
+static void scen_hbsections(void)
+{
+    scenario("hbsections");
+    envs[1] = "vol=7/1/1/5/diskA,dom=diskA/2"; /* volume 7, role 1, health local fault, epoch 5; domain diskA FAULT */
+    for (int i = 0; i < 2; i++)
+        start(i);
+    init_fast(0);
+    node_add(0, 1);
+    usleep(3500000); /* a watcher of the group reports through heartbeats as well */
+    struct view v;
+    view(0, &v);
+    const struct cluster_heard *h = NULL;
+    for (uint32_t k = 0; k < v.st.nheard; k++)
+        if (v.st.heard[k].id == ids[1])
+            h = &v.st.heard[k];
+    if (!h || h->nvols != 1 || h->ndoms != 1)
+        die("the leader's heard entry of server 1 has %u volumes and %u domains, expected 1 and 1",
+            h ? (unsigned)h->nvols : 99u, h ? (unsigned)h->ndoms : 99u);
+    if (h->vols[0].v.volume != 7 || h->vols[0].v.epoch != 5 || h->vols[0].v.health != 1 ||
+        strcmp(h->vols[0].v.domain, "diskA") || h->doms[0].state != 2 || strcmp(h->doms[0].name, "diskA"))
+        die("the volume or domain report of server 1 is not what it sent");
+    if (h->vols[0].local_fault_s < 2)
+        die("the fault timer of server 1's volume reads %" PRIu64 " s after 3.5 s of reports", h->vols[0].local_fault_s);
+    printf("  volume and domain reports reach the leader; the fault timer runs (%" PRIu64 " s)\n",
+           h->vols[0].local_fault_s);
+    view_free(&v);
+}
+
+/* A Raft log fault in shared mode (item 3) ends the voter role only: the server drops its core, writes `retired`,
+ * stays up as a watcher, and the leader replaces it by another member; a restart does not boot the core again. */
+static void scen_retired(void)
+{
+    scenario("retired");
+    envs[2] = "fail_sync_file=1";
+    for (int i = 0; i < 4; i++)
+        start(i);
+    init_mode(0, 3, META_MODE_SHARED);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    char path[PATH_MAX + 160];
+    snprintf(path, sizeof path, "%s/n2/state/failsync", base);
+    FILE *f = fopen(path, "w");
+    if (!f || fclose(f) != 0)
+        die("making %s", path);
+    node_add(0, 3); /* an entry: server 2 must sync it, and cannot */
+    uint64_t t0 = now_ms();
+    while (!log_has(2, "ends the voter role only") && now_ms() - t0 < 10000)
+        usleep(100000);
+    if (!log_has(2, "ends the voter role only"))
+        die("server 2 did not end its voter role on a failed log sync");
+    snprintf(path, sizeof path, "%s/n2/state/retired", base);
+    if (access(path, F_OK) != 0)
+        die("server 2 wrote no retired mark");
+    int rc = waitpid(pids[2], NULL, WNOHANG);
+    if (rc != 0)
+        die("server 2 is gone: a log fault in shared mode must end the voter role only");
+    /* the leader replaces it with server 3, which was added as a member beside the three */
+    struct view v;
+    t0 = now_ms();
+    int ok = 0;
+    while (now_ms() - t0 < 40000 && !ok) {
+        view(0, &v);
+        ok = is_voter(&v, ids[3]) && !raft_config_find(&v.cfg, ids[2]);
+        view_free(&v);
+        usleep(200000);
+    }
+    if (!ok)
+        die("server 3 did not replace server 2 in the group");
+    view(2, &v);
+    if (v.st.mode == CLUSTER_MODE_CORE)
+        die("server 2 still runs a Raft core");
+    view_free(&v);
+    printf("  a log fault ends the voter role: server 2 is retired, serves as a watcher, server 3 took its place\n");
+    stop(2, SIGTERM);
+    snprintf(path, sizeof path, "%s/n2/state/failsync", base);
+    unlink(path);
+    start(2);
+    view(2, &v);
+    if (v.st.mode == CLUSTER_MODE_CORE)
+        die("a retired server booted a Raft core after its restart");
+    view_free(&v);
+    printf("  after a restart it still holds no core\n");
+}
+
+/* A sync round out while more entries are appended (a slow disk): the core asked for a sync once per append, and the
+ * round that returns must start the next one, or the entries wait for an append that may never come (has1: a node add
+ * that never answered, one start in three). Each sync takes 300 ms here, so INIT is proposed under the first round. */
+static void scen_syncrace(void)
+{
+    scenario("syncrace");
+    for (int i = 0; i < 2; i++) {
+        envs[i] = "sync_delay_ms=300";
+        start(i);
+    }
+    init_fast(0);
+    node_add(0, 1);
+    struct view v;
+    view(0, &v);
+    if (v.m.nmembers != 2)
+        die("two members expected, %u", (unsigned)v.m.nmembers);
+    view_free(&v);
+    printf("  entries appended under an outstanding sync round are synced by the next one\n");
+}
+
+/* Placement (item 10): a replacement voter comes from a power feed the voters do not use. */
+static void scen_feed(void)
+{
+    scenario("feed");
+    static const char *feed[5] = {"--power-feed A", "--power-feed A", "--power-feed B", "--power-feed A",
+                                  "--power-feed C"};
+    for (int i = 0; i < 5; i++) {
+        xargs[i] = feed[i];
+        start(i);
+    }
+    init_fast(0);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    node_add(0, 3); /* server 3 (feed A) joins before server 4 (feed C): the order alone would pick it */
+    node_add(0, 4);
+    stop(1, SIGKILL); /* a voter on feed A goes: the replacement must be the one on feed C */
+    struct view v;
+    uint64_t t0 = now_ms();
+    int ok = 0;
+    while (now_ms() - t0 < 40000 && !ok) {
+        view(0, &v);
+        ok = voters(&v) == 3 && v.cfg.n == 3 && !raft_config_find(&v.cfg, ids[1]);
+        if (ok && (!is_voter(&v, ids[4]) || is_voter(&v, ids[3])))
+            die("the replacement voter is server 3 (feed A) or not server 4 (feed C)");
+        view_free(&v);
+        usleep(200000);
+    }
+    if (!ok)
+        die("the group was not repaired");
+    printf("  the replacement voter comes from the feed the voters do not use\n");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1441,7 +1694,8 @@ int main(int argc, char **argv)
                {"torn", scen_torn},         {"rebase", scen_rebase},
                {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"stall", scen_stall},
-               {"life", scen_life}};
+               {"witness", scen_witness},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
+               {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace},   {"life", scen_life}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;

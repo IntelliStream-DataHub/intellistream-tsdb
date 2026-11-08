@@ -965,11 +965,15 @@ static struct {
     struct dres dw_r[DW_Q];
     size_t dw_nr;
     uint64_t dw_gen;
+    int sync_again;      /* core thread: the core asked for a sync while one was out; run another when it returns */
     uint64_t sync_since; /* core thread: when the sync round now outstanding was handed to the worker; 0: none */
     int snap_out;        /* core thread: a snapshot write is outstanding */
     uint64_t stall_ns, xfer_for, xfer_next; /* a leader whose sync is outstanding this long hands leadership on */
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
+    unsigned sync_delay_ms; /* TSDB_CLUSTER_TEST sync_delay_ms=N: the worker waits N ms before each sync round */
+    int fail_file;       /* TSDB_CLUSTER_TEST fail_sync_file=1: a sync fails with EIO while <state-dir>/failsync exists */
+    char failfile[1100];
 
     struct buf fb; /* the frame being built; never held across a call that builds another */
     raft_entry ents[RAFT_WIRE_MAX_ENTRIES];
@@ -1187,6 +1191,10 @@ static void test_knobs(void)
             C.fail_snap_dirsync = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
             C.stall_file = v != 0;
+        else if (sscanf(p, "sync_delay_ms=%llu", &v) == 1)
+            C.sync_delay_ms = (unsigned)v;
+        else if (sscanf(p, "fail_sync_file=%llu", &v) == 1)
+            C.fail_file = v != 0;
         else if (sscanf(p, "stall_ms=%llu", &v) == 1 && v)
             C.stall_ns = v * 1000000ull;
         else if (sscanf(p, "hold_install_ms=%llu", &v) == 1)
@@ -1725,11 +1733,17 @@ static void *dw_main(void *arg)
         if (j.kind == DJ_SYNC) {
             while (C.stall_file && access(C.stallfile, F_OK) == 0 && !C.dw_stop)
                 usleep(10000); /* a test's stalled disk */
+            if (C.sync_delay_ms)
+                usleep(C.sync_delay_ms * 1000u); /* a test's slow disk: appends land while a round is out */
             iso_err e = raft_log_sync_run(&j.sync);
             r.index = j.sync.index;
             r.term = j.sync.term;
             r.rc = e != ISO_OK || j.sync.err;
             r.err = j.sync.err ? j.sync.err : EIO;
+            if (C.fail_file && access(C.failfile, F_OK) == 0) { /* a test's dying disk */
+                r.rc = 1;
+                r.err = EIO;
+            }
         } else {
             r.rc = write_durable(C.snapfile, j.img, j.len);
             r.err = errno;
@@ -1800,6 +1814,7 @@ static void dw_forget(void)
     dw_quiesce();
     C.dw_gen++;
     C.sync_since = 0;
+    C.sync_again = 0;
     C.snap_out = 0;
 }
 
@@ -1821,6 +1836,7 @@ static void dw_stop_thread(void)
 }
 
 static void snap_done(struct dres *r);
+static void sync_round(void);
 
 /* The results the worker has for the core thread, applied in order. */
 static void dw_collect(void)
@@ -1852,6 +1868,10 @@ static void dw_collect(void)
             }
             raft_log_durable(C.log, r.index, r.term);
             raft_persisted(C.r, r.index, r.term);
+            if (C.sync_again) { /* entries were appended while this round ran, and the core asked only once */
+                C.sync_again = 0;
+                sync_round();
+            }
         } else {
             snap_done(&r);
         }
@@ -1862,8 +1882,10 @@ static void dw_collect(void)
  * from dw_collect. One round at a time: the core asks again for what was appended meanwhile. */
 static void sync_round(void)
 {
-    if (C.sync_since)
+    if (C.sync_since) {
+        C.sync_again = 1;
         return;
+    }
     struct djob j = {.kind = DJ_SYNC};
     iso_err e = raft_log_sync_prepare(C.log, &j.sync);
     if (e != ISO_OK) {
@@ -2399,6 +2421,8 @@ static void on_raft(struct conn *c, struct rd *r)
             return; /* not kept: the core must not reset the log for it; the leader sends it again */
     }
     if (!C.r) {
+        if (C.retired)
+            return; /* a log fault ended this identity's voter role: the leader still sends until it removes it */
         char err[2048];
         if (core_boot(err, sizeof err) != 0)
             fail_stop("cannot start the Raft core: %s", err);
@@ -3718,6 +3742,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.copyfile, sizeof C.copyfile, "%s/copy", C.metadir);
     snprintf(C.retiredfile, sizeof C.retiredfile, "%s/retired", C.metadir);
     snprintf(C.stallfile, sizeof C.stallfile, "%s/stall", C.metadir);
+    snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     meta_init(&C.sm);
     meta_init(&C.wsm);
