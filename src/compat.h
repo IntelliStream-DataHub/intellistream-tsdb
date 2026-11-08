@@ -220,7 +220,9 @@ static inline void tsdb_free_big(void *p, size_t n) { free(p); }
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
-#define TSDB_FREE_BIG_MIN ((size_t)4 << 20)   /* below this the plain free is as fast as the slicing */
+#define TSDB_FREE_BIG_MIN ((size_t)16 << 20)  /* below this the plain munmap is under 0.7 ms, and zapping pages the heap would
+                                               * keep for the next allocation only makes it fault them in again (-4% on
+                                               * 1M-row part writes at 4 MB) */
 #define TSDB_FREE_BIG_SLICE ((size_t)2 << 20) /* what one madvise hands back: about 80 us under the read lock */
 /* the pages inside [p, p + n) handed back in slices (whole pages only; a larger page size only loses the call) */
 static inline void tsdb_zap_slices(void *p, size_t n)

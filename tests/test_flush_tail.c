@@ -90,7 +90,7 @@ static void test_series_array(void)
 /* tsdb_free_big zaps only the pages inside the block it is given: the neighbours and the block's partial pages stay */
 static void test_free_big(void)
 {
-    size_t n = (size_t)12 << 20;
+    size_t n = (size_t)24 << 20; /* above TSDB_FREE_BIG_MIN */
     unsigned char *a = malloc(n), *b = malloc(n), *c = malloc(n);
     CHECK(a && b && c);
     memset(a, 0xa5, n);
@@ -104,11 +104,11 @@ static void test_free_big(void)
         CHECK(c[i] == 0xc3);
     }
     CHECK(a[n - 1] == 0xa5 && c[0] == 0xc3);
-    CHECK(freed > (6l << 20)); /* the block's pages went back */
+    CHECK(freed > (12l << 20)); /* the block's pages went back */
     /* a block that starts inside a page and a short one: no crash, no damage */
-    unsigned char *d = malloc((size_t)5 << 20);
-    memset(d, 0x11, (size_t)5 << 20);
-    tsdb_free_big(d, (size_t)5 << 20);
+    unsigned char *d = malloc((size_t)20 << 20);
+    memset(d, 0x11, (size_t)20 << 20);
+    tsdb_free_big(d, (size_t)20 << 20);
     tsdb_free_big(NULL, (size_t)64 << 20);
     tsdb_free_big(malloc(100), 100);
     CHECK(a[12345] == 0xa5 && c[12345] == 0xc3);

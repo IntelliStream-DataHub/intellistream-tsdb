@@ -1007,7 +1007,7 @@ B the slow path (`WITH_NULLS`, 2 readers x 4,096 ids, 3 repetitions, 15 rounds, 
   tail touched every page under `buf_lock`: about 9 ms, twice (a doubling), and every append and lookup waited. The
   array is now an anonymous mapping from 1 MB on (zero pages, grown by `mremap`, touched as series arrive:
   `mt_s_grow`). (2) the flusher's big buffers went back through `munmap`, which holds the mmap lock for writing for
-  about 40 us per MB; they are now zapped in 2 MB slices of `madvise(MADV_DONTNEED)` first (`tsdb_free_big`,
+  about 40 us per MB; those of 16 MB and more are now zapped in 2 MB slices of `madvise(MADV_DONTNEED)` first (`tsdb_free_big`,
   `src/compat.h`; the read lock, so others fault in between). The ablation (15 rounds per variant, rounds 2 to 4 of 5
   runs, `--series 1000000`) shows both are needed: with (1) alone the worst case stays at 8 to 10 ms in the first
   rounds after a start (the buffers are then new) and the mean of the max lookup is 4.3 ms; with both 0.7 ms. Mode
