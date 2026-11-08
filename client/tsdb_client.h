@@ -301,8 +301,10 @@ void tsdbc_series_results_free(tsdb_series_result *r, size_t n);
  * request: UNAVAILABLE and MOVED before the first reply frame are retried as for other reads. */
 int tsdbc_latest(tsdbc *c, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *opts, tsdb_latest_result *out);
 /* The same by name. A name is resolved once per connection (tsdbc_series without create) and its id kept, since an id
- * never changes meaning; a name that does not resolve answers NOTFOUND or DENIED in its own out[i]. An empty or NULL
- * name answers TSDB_ERR_INVALID in its record. */
+ * never changes meaning; the names not known yet are looked up together (up to 256 requests out before their replies
+ * are read), not one round trip each. A name that does not resolve answers NOTFOUND or DENIED in its own out[i]; an
+ * empty, NULL or over-long (above 65,535 bytes) name answers TSDB_ERR_INVALID in its record. As in tsdb_latest,
+ * opts->ends replaces opts->end: end is not looked at when ends is set. */
 int tsdbc_latest_by_name(tsdbc *c, const char *const *names, size_t n, const tsdb_latest_opts *opts,
                          tsdb_latest_result *out);
 

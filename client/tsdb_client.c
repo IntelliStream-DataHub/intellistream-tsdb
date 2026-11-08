@@ -942,7 +942,9 @@ static int call(tsdbc *c, uint8_t op, const void *a, size_t alen, const void *b,
 
 /* -------------------------------------------------------------- calls */
 
-static int series_req(tsdbc *c, const char *name, int create, const char *path, tsdb_sid *id)
+/* The two halves of a SERIES call, so that a caller can send several requests and then read their replies in order
+ * (tsdbc_latest_by_name). Sending does not wait for earlier acknowledgements: the caller has done tsdbc_wait. */
+static int series_send(tsdbc *c, const char *name, int create, const char *path)
 {
     size_t len = strlen(name), plen = path ? strlen(path) : 0;
     if (len == 0 || len > 65535 || plen > 65535)
@@ -950,17 +952,18 @@ static int series_req(tsdbc *c, const char *name, int create, const char *path, 
     uint8_t h[3] = {(uint8_t)(create != 0)};
     uint16_t l16 = (uint16_t)len, p16 = (uint16_t)plen;
     memcpy(h + 1, &l16, 2);
-    int rc = tsdbc_wait(c);
-    if (rc)
-        return rc;
-    rc = path ? send_req(c, TSDB_OP_SERIES, h, 3, name, len, &p16, 2, path, plen)
-              : send_req(c, TSDB_OP_SERIES, h, 3, name, len, NULL, 0, NULL, 0);
-    if (rc)
-        return rc;
+    return path ? send_req(c, TSDB_OP_SERIES, h, 3, name, len, &p16, 2, path, plen)
+                : send_req(c, TSDB_OP_SERIES, h, 3, name, len, NULL, 0, NULL, 0);
+}
+
+/* Reads the reply of one SERIES request: its status, or a transport error (the connection is then broken). */
+static int series_recv(tsdbc *c, tsdb_sid *id)
+{
     int32_t st;
     const uint8_t *b;
     size_t n;
-    if ((rc = read_reply(c, &st, &b, &n)) != 0)
+    int rc = read_reply(c, &st, &b, &n);
+    if (rc)
         return rc;
     if (st)
         return st;
@@ -968,6 +971,18 @@ static int series_req(tsdbc *c, const char *name, int create, const char *path, 
         return TSDB_ERR_CORRUPT;
     memcpy(id, b, 8);
     return 0;
+}
+
+static int series_req(tsdbc *c, const char *name, int create, const char *path, tsdb_sid *id)
+{
+    size_t len = strlen(name), plen = path ? strlen(path) : 0;
+    if (len == 0 || len > 65535 || plen > 65535)
+        return TSDB_ERR_INVALID;
+    int rc = tsdbc_wait(c);
+    if (rc)
+        return rc;
+    rc = series_send(c, name, create, path);
+    return rc ? rc : series_recv(c, id);
 }
 
 int tsdbc_series(tsdbc *c, const char *name, int create, tsdb_sid *id) { return series_req(c, name, create, NULL, id); }
@@ -3301,7 +3316,7 @@ static struct name_ent *name_find(tsdbc *c, const char *name, uint64_t h)
 
 static void name_put(tsdbc *c, const char *name, uint64_t h, tsdb_sid id)
 {
-    if (c->nc_n >= NAME_CACHE_MAX)
+    if (c->nc_n >= NAME_CACHE_MAX || name_find(c, name, h))
         return; /* a full cache stays as it is: later misses are asked again */
     if ((c->nc_n + 1) * 2 > c->nc_cap) {
         size_t cap = c->nc_cap ? c->nc_cap * 2 : 1024;
@@ -3329,6 +3344,90 @@ static void name_put(tsdbc *c, const char *name, uint64_t h, tsdb_sid id)
     c->nc_n++;
 }
 
+/* Resolves the names that are not in the cache (st[i] == 1): the requests of a window go out together and their
+ * replies are read in order, so that a cold list costs one round trip per window, not one per name. A name the lookup
+ * refuses (NOTFOUND, DENIED, INVALID) is answered in its own record (st[i] = 2). UNAVAILABLE and MOVED, which a
+ * lone request retries (read_reply), are asked again one at a time once the window is read. Any other status, or a
+ * broken connection, fails the call. */
+#define NAME_WINDOW 256
+static int names_resolve(tsdbc *c, const char *const *names, size_t n, uint8_t *st, tsdb_sid *idv,
+                         tsdb_latest_result *out)
+{
+    size_t win[NAME_WINDOW];
+    for (size_t i = 0; i < n;) {
+        size_t w = 0;
+        while (i < n && w < NAME_WINDOW) {
+            if (st[i] == 1)
+                win[w++] = i;
+            i++;
+        }
+        if (!w)
+            continue;
+        int rc = tsdbc_wait(c);
+        if (rc)
+            return rc;
+        bool sent[NAME_WINDOW] = {false};
+        size_t nsent = 0;
+        for (size_t k = 0; k < w; k++) { /* an INVALID name (too long) is not sent */
+            rc = series_send(c, names[win[k]], 0, NULL);
+            if (rc == 0) {
+                sent[k] = true;
+                nsent++;
+            } else if (rc == TSDB_ERR_INVALID) {
+                out[win[k]] = (tsdb_latest_result){.status = TSDB_ERR_INVALID, .kind = TSDB_LATEST_NONE};
+                st[win[k]] = 2;
+            } else {
+                if (nsent && !c->broken) /* replies of what was sent stay unread: the connection is out of step */
+                    c->broken = true;
+                return rc;
+            }
+        }
+        int first = 0; /* the first hard error: the replies are all read first */
+        bool again[NAME_WINDOW] = {false};
+        for (size_t k = 0; k < w; k++) {
+            if (!sent[k])
+                continue;
+            size_t at = win[k];
+            tsdb_sid id = 0;
+            int s = series_recv(c, &id);
+            if (c->broken)
+                return s ? s : TSDB_ERR_IO;
+            if (s == 0) {
+                name_put(c, names[at], name_hash(names[at]), id);
+                idv[at] = id;
+                st[at] = 0;
+            } else if (s == TSDB_ERR_NOTFOUND || s == TSDB_ERR_DENIED || s == TSDB_ERR_INVALID) {
+                out[at] = (tsdb_latest_result){.status = s, .kind = TSDB_LATEST_NONE};
+                st[at] = 2;
+            } else if (s == TSDB_ERR_UNAVAILABLE || s == TSDB_ERR_MOVED) {
+                again[k] = true;
+            } else if (!first) {
+                first = s;
+            }
+        }
+        if (first)
+            return first;
+        for (size_t k = 0; k < w; k++) {
+            if (!again[k])
+                continue;
+            size_t at = win[k];
+            tsdb_sid id;
+            int s = tsdbc_series(c, names[at], 0, &id);
+            if (s == 0) {
+                name_put(c, names[at], name_hash(names[at]), id);
+                idv[at] = id;
+                st[at] = 0;
+            } else if (s == TSDB_ERR_NOTFOUND || s == TSDB_ERR_DENIED || s == TSDB_ERR_INVALID) {
+                out[at] = (tsdb_latest_result){.status = s, .kind = TSDB_LATEST_NONE};
+                st[at] = 2;
+            } else {
+                return s;
+            }
+        }
+    }
+    return 0;
+}
+
 int tsdbc_latest_by_name(tsdbc *c, const char *const *names, size_t n, const tsdb_latest_opts *opts,
                          tsdb_latest_result *out)
 {
@@ -3343,37 +3442,40 @@ int tsdbc_latest_by_name(tsdbc *c, const char *const *names, size_t n, const tsd
         return c->broken ? TSDB_ERR_IO : TSDB_ERR_INVALID;
     tsdb_sid *ids = malloc(n * sizeof *ids);
     size_t *at = malloc(n * sizeof *at); /* request slot -> index in names */
+    uint8_t *st = malloc(n);             /* 0: resolved (ids[i] holds the id), 1: to look up, 2: answered in out[i] */
+    tsdb_sid *idv = malloc(n * sizeof *idv);
     int64_t *ends = opts && opts->ends ? malloc(n * sizeof *ends) : NULL;
-    if (!ids || !at || (opts && opts->ends && !ends)) {
+    if (!ids || !at || !st || !idv || (opts && opts->ends && !ends)) {
         free(ids);
         free(at);
+        free(st);
+        free(idv);
         free(ends);
         return TSDB_ERR_NOMEM;
     }
-    size_t k = 0;
-    for (size_t i = 0; rc == 0 && i < n; i++) {
+    bool miss = false;
+    for (size_t i = 0; i < n; i++) {
         if (!names[i] || !*names[i]) {
             out[i] = (tsdb_latest_result){.status = TSDB_ERR_INVALID, .kind = TSDB_LATEST_NONE};
+            st[i] = 2;
             continue;
         }
-        uint64_t h = name_hash(names[i]);
-        struct name_ent *e = name_find(c, names[i], h);
-        tsdb_sid id;
+        struct name_ent *e = name_find(c, names[i], name_hash(names[i]));
         if (e) {
-            id = e->id;
+            idv[i] = e->id;
+            st[i] = 0;
         } else {
-            int st = tsdbc_series(c, names[i], 0, &id);
-            if (st == TSDB_ERR_NOTFOUND || st == TSDB_ERR_DENIED) {
-                out[i] = (tsdb_latest_result){.status = st, .kind = TSDB_LATEST_NONE};
-                continue;
-            }
-            if (st) {
-                rc = st;
-                break;
-            }
-            name_put(c, names[i], h, id);
+            st[i] = 1;
+            miss = true;
         }
-        ids[k] = id;
+    }
+    if (miss)
+        rc = names_resolve(c, names, n, st, idv, out);
+    size_t k = 0;
+    for (size_t i = 0; rc == 0 && i < n; i++) {
+        if (st[i] != 0)
+            continue;
+        ids[k] = idv[i];
         at[k] = i;
         if (ends)
             ends[k] = opts->ends[i];
@@ -3393,6 +3495,8 @@ int tsdbc_latest_by_name(tsdbc *c, const char *const *names, size_t n, const tsd
     }
     free(ids);
     free(at);
+    free(st);
+    free(idv);
     free(ends);
     return rc;
 }

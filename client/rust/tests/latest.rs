@@ -199,3 +199,109 @@ fn denied_and_missing_look_alike_for_a_user_without_read_on_all() {
     assert_eq!(r[1].point(), Some((T0, LatestValue::Float32(2.5))));
     assert_eq!(r[2].status, Some(Status::NotFound));
 }
+
+/// A fake server of protocol 14 that holds the replies to SERIES until the client has been quiet for 100 ms, and
+/// reports the most requests it held at once and how many SERIES it saw: a client that looks names up one round trip
+/// at a time never has two. Names starting "missing" are NOT FOUND, "flaky" is UNAVAILABLE the first time, the rest
+/// get an id; QUERY_LATEST answers a NONE record per id.
+fn lookup_server() -> (String, std::thread::JoinHandle<(usize, usize)>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let h = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let reply = |s: &mut std::net::TcpStream, id: [u8; 4], st: i32, body: &[u8]| {
+            let mut r = ((9 + body.len()) as u32).to_le_bytes().to_vec();
+            r.extend_from_slice(&id);
+            r.push(0);
+            r.extend_from_slice(&st.to_le_bytes());
+            r.extend_from_slice(body);
+            s.write_all(&r).unwrap();
+        };
+        let (mut held, mut max_held, mut total, mut seq, mut flaked) = (Vec::<([u8; 4], String)>::new(), 0, 0, 0u64, false);
+        loop {
+            let mut h = [0u8; 9];
+            match s.read_exact(&mut h) {
+                Ok(()) => {}
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    max_held = max_held.max(held.len());
+                    for (id, name) in held.drain(..) {
+                        if name.starts_with("missing") {
+                            reply(&mut s, id, -6, &[]); // NOTFOUND
+                        } else if name.starts_with("flaky") && !flaked {
+                            flaked = true;
+                            reply(&mut s, id, -11, &[]); // UNAVAILABLE
+                        } else {
+                            seq += 1;
+                            reply(&mut s, id, 0, &((1u64 << 32) | seq).to_le_bytes());
+                        }
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            }
+            s.set_read_timeout(None).unwrap();
+            let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+            let mut p = vec![0; len - 5];
+            s.read_exact(&mut p).unwrap();
+            s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            let id: [u8; 4] = h[4..8].try_into().unwrap();
+            match h[8] {
+                1 => reply(&mut s, id, 0, &[14u32.to_le_bytes(), [0; 4]].concat()),
+                2 => {
+                    total += 1;
+                    let n = u16::from_le_bytes([p[1], p[2]]) as usize;
+                    held.push((id, String::from_utf8_lossy(&p[3..3 + n]).into_owned()));
+                }
+                39 => {
+                    let n = u32::from_le_bytes(p[4..8].try_into().unwrap());
+                    let mut body = vec![0, 0, 0, 0];
+                    body.extend_from_slice(&n.to_le_bytes());
+                    body.extend_from_slice(&[1, 0, 0, 0]);
+                    for _ in 0..n {
+                        body.extend_from_slice(&[0, 0, 0, 0, 2, 0, 0, 0]);
+                        body.extend_from_slice(&[0; 16]);
+                    }
+                    reply(&mut s, id, 0, &body);
+                }
+                _ => reply(&mut s, id, -4, &[]),
+            }
+        }
+        (max_held, total)
+    });
+    (addr, h)
+}
+
+/// `latest_by_name` looks the names it does not know up together (a round trip per window, not per name), answers a
+/// name the lookup refuses in its own entry (an over-long one INVALID), asks a name the server could not answer yet
+/// again, alone, and keeps the ids.
+#[test]
+fn latest_by_name_looks_names_up_together() {
+    let (addr, h) = lookup_server();
+    let mut c = Client::connect(addr).unwrap();
+    let long = "x".repeat(70_000);
+    let names: Vec<String> =
+        (0..40).map(|i| if i == 7 { "missing7".into() } else if i == 9 { "flaky9".into() } else { format!("n{i}") }).collect();
+    let mut refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    refs[11] = &long;
+    refs[12] = "";
+    let out = c.latest_by_name(&refs, &LatestOpts::default()).unwrap();
+    for (i, l) in out.iter().enumerate() {
+        let want = match i {
+            7 => Some(Status::NotFound),
+            11 | 12 => Some(Status::Invalid),
+            _ => None,
+        };
+        assert_eq!(l.status, want, "name {i}");
+        assert_eq!(l.kind, LatestKind::None);
+    }
+    // the second call asks only the NOT FOUND name again: the others have ids
+    c.latest_by_name(&refs, &LatestOpts::default()).unwrap();
+    c.close().unwrap();
+    let (max_held, total) = h.join().unwrap();
+    assert!(max_held >= 38, "the 38 sendable names of the window were held together, not {max_held}");
+    assert_eq!(total, 38 + 1 + 1); // the window, the flaky name again, the NOT FOUND name in the second call
+}

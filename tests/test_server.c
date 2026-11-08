@@ -3639,6 +3639,165 @@ static void test_latest_old_server(void)
     CHECK(fake_others == 0);
 }
 
+/* A server of protocol 14 that holds the replies to SERIES until the client has been quiet for 100 ms, and records
+ * the most requests it held at once: a client that looks names up one round trip at a time never has two. Names
+ * starting "missing" are NOTFOUND, "flaky" is UNAVAILABLE the first time, the rest get an id. QUERY_LATEST is
+ * answered with a NONE record per id. */
+static int lk_max_held, lk_series_total;
+
+static void *lookup_server(void *arg)
+{
+    int fd = accept(*(int *)arg, NULL, NULL);
+    uint8_t h[9];
+    struct held {
+        uint32_t id;
+        char name[16];
+    } held[512];
+    size_t nheld = 0;
+    uint32_t seq = 0;
+    bool flaked = false;
+    for (;;) {
+        struct pollfd pf = {fd, POLLIN, 0};
+        int pr = fd < 0 ? -1 : poll(&pf, 1, 100);
+        if (pr < 0)
+            break;
+        if (pr == 0) { /* quiet: answer what is held, in order */
+            if ((int)nheld > lk_max_held)
+                lk_max_held = (int)nheld;
+            for (size_t i = 0; i < nheld; i++) {
+                int32_t st = 0;
+                if (!strncmp(held[i].name, "missing", 7))
+                    st = TSDB_ERR_NOTFOUND;
+                else if (!strncmp(held[i].name, "flaky", 5) && !flaked) {
+                    st = TSDB_ERR_UNAVAILABLE;
+                    flaked = true;
+                }
+                uint8_t r[21] = {0};
+                uint32_t rlen = st ? 9 : 17;
+                uint64_t sid = TSDB_SID(0, seq++);
+                memcpy(r, &rlen, 4);
+                memcpy(r + 4, &held[i].id, 4);
+                r[8] = TSDB_OP_REPLY;
+                memcpy(r + 9, &st, 4);
+                memcpy(r + 13, &sid, 8);
+                if (write(fd, r, 4 + rlen) != (ssize_t)(4 + rlen))
+                    goto done;
+            }
+            nheld = 0;
+            continue;
+        }
+        uint8_t body[4096];
+        uint32_t flen, id;
+        if (!read_full(fd, h, 9))
+            break;
+        memcpy(&flen, h, 4);
+        memcpy(&id, h + 4, 4);
+        if (flen < 5 || flen - 5 > sizeof body || !read_full(fd, body, flen - 5))
+            break;
+        uint8_t r[64] = {0};
+        uint32_t rlen = 0;
+        int32_t st = 0;
+        if (h[8] == TSDB_OP_HELLO) {
+            uint32_t v = 14;
+            rlen = 17;
+            memcpy(r + 13, &v, 4);
+        } else if (h[8] == TSDB_OP_SERIES) {
+            uint16_t l16;
+            memcpy(&l16, body + 1, 2);
+            lk_series_total++;
+            if (nheld < 512) {
+                held[nheld].id = id;
+                snprintf(held[nheld].name, sizeof held[nheld].name, "%.*s", l16 < 15 ? l16 : 15, (char *)body + 3);
+                nheld++;
+            }
+            continue;
+        } else if (h[8] == TSDB_OP_QUERY_LATEST) {
+            uint32_t n, first = 0, last = 1;
+            memcpy(&n, body + 4, 4);
+            uint8_t *big = calloc(1, 13 + 12 + (size_t)n * 24);
+            uint32_t blen = (uint32_t)(5 + 4 + 12 + n * 24);
+            memcpy(big, &blen, 4);
+            memcpy(big + 4, &id, 4);
+            big[8] = TSDB_OP_REPLY;
+            memcpy(big + 13, &first, 4);
+            memcpy(big + 17, &n, 4);
+            big[21] = (uint8_t)last;
+            for (uint32_t i = 0; i < n; i++)
+                big[25 + i * 24 + 4] = TSDB_LATEST_NONE;
+            bool ok = write(fd, big, 4 + blen) == (ssize_t)(4 + blen);
+            free(big);
+            if (!ok)
+                break;
+            continue;
+        } else {
+            st = TSDB_ERR_INVALID;
+            rlen = 9;
+        }
+        memcpy(r, &rlen, 4);
+        memcpy(r + 4, &id, 4);
+        r[8] = TSDB_OP_REPLY;
+        memcpy(r + 9, &st, 4);
+        if (write(fd, r, 4 + rlen) != (ssize_t)(4 + rlen))
+            break;
+    }
+done:
+    if (fd >= 0)
+        close(fd);
+    return NULL;
+}
+
+/* tsdbc_latest_by_name looks the names it does not know up together (the window's requests go out before any reply is
+ * read), answers a refused name in its own record (an over-long or empty one INVALID, as the other clients do), asks again,
+ * alone, a name the server could not answer yet, and keeps the ids. */
+static void test_latest_by_name_lookup(void)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    socklen_t sl = sizeof sa;
+    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 1) == 0 &&
+          getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0);
+    lk_max_held = lk_series_total = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, lookup_server, &lfd) == 0);
+    tsdbc *c = NULL;
+    CHECK(tsdbc_connect("127.0.0.1", ntohs(sa.sin_port), &c) == 0 && c);
+    if (c) {
+        enum { N = 40 };
+        char names[N][16];
+        const char *p[N];
+        char *longname = malloc(70000);
+        memset(longname, 'x', 69999);
+        longname[69999] = 0;
+        for (int i = 0; i < N; i++) {
+            snprintf(names[i], sizeof names[i], i == 7 ? "missing%d" : i == 9 ? "flaky%d" : "n%d", i);
+            p[i] = names[i];
+        }
+        p[11] = longname;
+        p[12] = "";
+        tsdb_latest_result out[N];
+        CHECK(tsdbc_latest_by_name(c, p, N, NULL, out) == 0);
+        for (int i = 0; i < N; i++) {
+            int want = i == 7 ? TSDB_ERR_NOTFOUND : i == 11 || i == 12 ? TSDB_ERR_INVALID : 0;
+            CHECK(out[i].status == want);
+            CHECK(out[i].kind == TSDB_LATEST_NONE);
+        }
+        CHECK(lk_max_held >= N - 2); /* every name but the two never sent (over-long, empty): held together */
+        int total = lk_series_total;
+        CHECK(total == N - 2 + 1); /* the 38 sendable names, plus the flaky one a second time */
+        CHECK(tsdbc_latest_by_name(c, p, N, NULL, out) == 0);
+        CHECK(lk_series_total == total + 1); /* the NOTFOUND name is asked again; the ones with ids are cached */
+        /* ends[] replaces end, as in tsdb_latest: {.ends = ends} with end left 0 is the idiom, not an error */
+        tsdb_latest_opts o = {.end = 5, .ends = (const int64_t[N]){0}};
+        tsdb_sid id = TSDB_SID(0, 1);
+        CHECK(tsdbc_latest(c, &id, 1, &o, out) == 0 && out[0].status == 0);
+        free(longname);
+        tsdbc_close(c);
+    }
+    pthread_join(th, NULL);
+    close(lfd);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN); /* a check failing on a connection the server closed must not end the run */
@@ -3817,6 +3976,7 @@ int main(int argc, char **argv)
     test_frame_cap(c);
     test_latest_remote(c);
     test_latest_old_server();
+    test_latest_by_name_lookup();
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);

@@ -778,16 +778,33 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     private long seriesRequest(String name, boolean create, String path) throws TsdbException {
+        byte[] n = seriesNameBytes(name);
+        byte[] p = path != null ? utf8(path, "path") : null;
+        request();
+        seriesSend(n, create, p);
+        return seriesRecv();
+    }
+
+    /** The UTF-8 bytes of a series name: not empty, at most 65,535 bytes (IllegalArgumentException otherwise). */
+    private static byte[] seriesNameBytes(String name) throws TsdbException {
         byte[] n = utf8(Objects.requireNonNull(name, "name"), "name");
         if (n.length == 0)
             throw new IllegalArgumentException("empty series name");
-        byte[] p = path != null ? utf8(path, "path") : null;
-        request();
+        return n;
+    }
+
+    /** Sends a SERIES request without reading its reply (after request()); replies are read in order by
+     * seriesRecv, which latestByName uses to look many names up together. */
+    private void seriesSend(byte[] n, boolean create, byte[] p) throws TsdbException {
         begin(Protocol.OP_SERIES, 3 + n.length + (p != null ? 2 + p.length : 0));
         out.put((byte) (create ? 1 : 0)).putShort((short) n.length).put(n);
         if (p != null)
             out.putShort((short) p.length).put(p);
         send();
+    }
+
+    /** Reads the reply of the oldest SERIES request not yet read. */
+    private long seriesRecv() throws TsdbException {
         int st = frame();
         if (st == 0 && bodyLen != 8)
             throw lost(Status.ERR_CORRUPT, "SERIES reply of " + bodyLen + " bytes");
@@ -3476,7 +3493,8 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * {@link #latest(long[], LatestOptions)} by name. A name is looked up once per connection and its id kept; a name
+     * {@link #latest(long[], LatestOptions)} by name. A name is looked up once per connection and its id kept (the
+     * names not known yet are looked up together, up to 256 requests out before their replies are read); a name
      * that does not resolve fails in its own entry ({@link Status#ERR_NOTFOUND}, or {@link Status#ERR_DENIED} outside
      * the user's grants, whether or not it exists).
      *
@@ -3494,9 +3512,10 @@ public final class TsdbClient implements AutoCloseable {
             return List.of();
         latestVersion();
         SeriesResult<Latest>[] res = newResults(n);
-        long[] ids = new long[n];
-        int[] at = new int[n];
-        int k = 0;
+        long[] got = new long[n];
+        boolean[] have = new boolean[n];
+        int[] misses = new int[n];
+        int nm = 0;
         for (int i = 0; i < n; i++) {
             String name = Objects.requireNonNull(names[i], "name");
             if (name.isEmpty()) {
@@ -3504,21 +3523,22 @@ public final class TsdbClient implements AutoCloseable {
                 continue;
             }
             Long id = latestNames.get(name);
-            if (id == null) {
-                try {
-                    id = seriesRequest(name, false, null);
-                } catch (TsdbException e) {
-                    int st = e.status();
-                    if (st != Status.ERR_NOTFOUND && st != Status.ERR_DENIED && st != Status.ERR_INVALID)
-                        throw e;
-                    res[i] = SeriesResult.failed(st, e.getMessage());
-                    continue;
-                }
-                if (latestNames.size() < Protocol.LATEST_MAX_IDS)
-                    latestNames.put(name, id);
+            if (id != null) {
+                got[i] = id;
+                have[i] = true;
+            } else {
+                misses[nm++] = i;
             }
-            ids[k] = id;
-            at[k++] = i;
+        }
+        resolveNames(names, misses, nm, got, have, res);
+        long[] ids = new long[n];
+        int[] at = new int[n];
+        int k = 0;
+        for (int i = 0; i < n; i++) {
+            if (have[i]) {
+                ids[k] = got[i];
+                at[k++] = i;
+            }
         }
         if (k > 0) {
             long[] ends = o.ends();
@@ -3529,11 +3549,85 @@ public final class TsdbClient implements AutoCloseable {
                     e[j] = ends[at[j]];
                 q = o.ends(e);
             }
-            List<SeriesResult<Latest>> got = latestRequest(k == n ? ids : Arrays.copyOf(ids, k), q);
+            List<SeriesResult<Latest>> answers = latestRequest(k == n ? ids : Arrays.copyOf(ids, k), q);
             for (int j = 0; j < k; j++)
-                res[at[j]] = got.get(j);
+                res[at[j]] = answers.get(j);
         }
         return Collections.unmodifiableList(Arrays.asList(res));
+    }
+
+    /** Name lookups sent before their replies are read. */
+    private static final int NAME_WINDOW = 256;
+
+    /**
+     * Looks up the names {@code names[misses[0 .. nm)]} the cache does not hold: the requests of a window go out
+     * together and their replies are read in order, so a cold list costs a round trip per window, not per name. A
+     * name the lookup refuses (not found, denied, invalid) fails in its own entry of {@code res}; UNAVAILABLE and
+     * MOVED, which a lone request retries, are asked again one at a time once the window is read; any other
+     * status fails the call.
+     */
+    private void resolveNames(String[] names, int[] misses, int nm, long[] got, boolean[] have,
+            SeriesResult<Latest>[] res) throws TsdbException {
+        int[] sent = new int[NAME_WINDOW];
+        int[] again = new int[NAME_WINDOW];
+        for (int w0 = 0; w0 < nm; w0 += NAME_WINDOW) {
+            int w1 = Math.min(nm, w0 + NAME_WINDOW);
+            request();
+            int ns = 0, na = 0;
+            for (int m = w0; m < w1; m++) {
+                int i = misses[m];
+                byte[] nb;
+                try {
+                    nb = seriesNameBytes(names[i]);
+                } catch (TsdbException e) {
+                    res[i] = SeriesResult.failed(e.status(), e.getMessage());
+                    continue;
+                } catch (IllegalArgumentException e) { /* over-long: INVALID in its own entry, as C and Rust do */
+                    res[i] = SeriesResult.failed(Status.ERR_INVALID, e.getMessage());
+                    continue;
+                }
+                seriesSend(nb, false, null);
+                sent[ns++] = i;
+            }
+            TsdbException first = null;
+            for (int x = 0; x < ns; x++) {
+                int i = sent[x];
+                try {
+                    long id = seriesRecv();
+                    got[i] = id;
+                    have[i] = true;
+                    if (latestNames.size() < Protocol.LATEST_MAX_IDS)
+                        latestNames.put(names[i], id);
+                } catch (TsdbException e) {
+                    int st = e.status();
+                    if (broken)
+                        throw e;
+                    if (st == Status.ERR_NOTFOUND || st == Status.ERR_DENIED || st == Status.ERR_INVALID)
+                        res[i] = SeriesResult.failed(st, e.getMessage());
+                    else if (st == Status.ERR_UNAVAILABLE || st == Status.ERR_MOVED)
+                        again[na++] = i;
+                    else if (first == null)
+                        first = e;
+                }
+            }
+            if (first != null)
+                throw first;
+            for (int x = 0; x < na; x++) {
+                int i = again[x];
+                try {
+                    long id = seriesRequest(names[i], false, null);
+                    got[i] = id;
+                    have[i] = true;
+                    if (latestNames.size() < Protocol.LATEST_MAX_IDS)
+                        latestNames.put(names[i], id);
+                } catch (TsdbException e) {
+                    int st = e.status();
+                    if (st != Status.ERR_NOTFOUND && st != Status.ERR_DENIED && st != Status.ERR_INVALID)
+                        throw e;
+                    res[i] = SeriesResult.failed(st, e.getMessage());
+                }
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")

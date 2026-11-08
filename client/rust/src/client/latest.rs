@@ -8,6 +8,8 @@ use crate::protocol::{LATEST_FRAME_IDS, LATEST_MAX_IDS, LATEST_PER_END, LATEST_R
 
 /// Names kept per connection.
 const NAME_CACHE_MAX: usize = 1 << 20;
+/// Name lookups sent before their replies are read.
+const NAME_WINDOW: usize = 256;
 
 impl Client {
     /// The newest value of each series: the row with the greatest timestamp whose value is not null (below
@@ -40,7 +42,8 @@ impl Client {
     }
 
     /// [`latest`](Client::latest) by name. A name is resolved once per connection (`series_lookup`) and its id
-    /// kept; a name that does not resolve answers [`Status::NotFound`] or [`Status::Denied`] in its own entry.
+    /// kept; the names not known yet are looked up together (up to 256 requests out before their replies are
+    /// read), not one round trip each. A name that does not resolve answers [`Status::NotFound`] or [`Status::Denied`] in its own entry.
     ///
     /// # Errors
     ///
@@ -56,34 +59,24 @@ impl Client {
             }
             c.latest_version()?;
             let mut out = vec![None; names.len()];
-            let (mut ids, mut at) = (Vec::with_capacity(names.len()), Vec::with_capacity(names.len()));
+            let mut resolved: Vec<Option<SeriesId>> = vec![None; names.len()];
+            let mut misses = Vec::new();
             for (i, name) in names.iter().enumerate() {
                 if name.is_empty() {
                     out[i] = Some(Latest::missing(Status::Invalid));
-                    continue;
+                } else if let Some(id) = c.names.get(*name) {
+                    resolved[i] = Some(*id);
+                } else {
+                    misses.push(i);
                 }
-                let id = match c.names.get(*name) {
-                    Some(id) => *id,
-                    None => match c.series_req(name, false, None) {
-                        Ok(id) => {
-                            if c.names.len() < NAME_CACHE_MAX {
-                                c.names.insert((*name).to_string(), id);
-                            }
-                            id
-                        }
-                        Err(Error::Server(s @ (Status::NotFound | Status::Denied))) => {
-                            out[i] = Some(Latest::missing(s));
-                            continue;
-                        }
-                        Err(Error::InvalidArgument(_)) => {
-                            out[i] = Some(Latest::missing(Status::Invalid));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    },
-                };
-                ids.push(id);
-                at.push(i);
+            }
+            c.names_resolve(names, &misses, &mut resolved, &mut out)?;
+            let (mut ids, mut at) = (Vec::with_capacity(names.len()), Vec::with_capacity(names.len()));
+            for (i, id) in resolved.iter().enumerate() {
+                if let Some(id) = id {
+                    ids.push(*id);
+                    at.push(i);
+                }
             }
             if !ids.is_empty() {
                 let sub =
@@ -94,6 +87,65 @@ impl Client {
             }
             Ok(out.into_iter().map(|r| r.expect("every name answered")).collect())
         })
+    }
+
+    /// Looks up the names `misses` (indexes into `names`) that the cache does not hold: the requests of a window go
+    /// out together and their replies are read in order, so a cold list costs a round trip per window, not per
+    /// name. A name the lookup refuses (not found, denied, invalid) is answered in its own `out` entry; UNAVAILABLE
+    /// and MOVED, which a lone request retries, are asked again one at a time once the window is read. Any other
+    /// status fails the call.
+    fn names_resolve(
+        &mut self,
+        names: &[&str],
+        misses: &[usize],
+        resolved: &mut [Option<SeriesId>],
+        out: &mut [Option<Latest>],
+    ) -> Result<()> {
+        let refused = |s: &Status| matches!(s, Status::NotFound | Status::Denied | Status::Invalid);
+        for window in misses.chunks(NAME_WINDOW) {
+            self.wait_inner()?;
+            let mut sent = Vec::with_capacity(window.len());
+            for &i in window {
+                match self.series_send(names[i], false, None) {
+                    Ok(()) => sent.push(i),
+                    Err(Error::InvalidArgument(_)) => out[i] = Some(Latest::missing(Status::Invalid)),
+                    Err(e) => return Err(e),
+                }
+            }
+            let (mut again, mut first) = (Vec::new(), None);
+            for &i in &sent {
+                match self.series_recv() {
+                    Ok(id) => {
+                        resolved[i] = Some(id);
+                        if self.names.len() < NAME_CACHE_MAX {
+                            self.names.insert(names[i].to_string(), id);
+                        }
+                    }
+                    Err(Error::Server(s)) if refused(&s) => out[i] = Some(Latest::missing(s)),
+                    Err(Error::Server(Status::Unavailable | Status::Moved)) => again.push(i),
+                    Err(e @ (Error::Io(_) | Error::Protocol(_))) => return Err(e),
+                    Err(e) => {
+                        first.get_or_insert(e);
+                    }
+                }
+            }
+            if let Some(e) = first {
+                return Err(e);
+            }
+            for i in again {
+                match self.series_req(names[i], false, None) {
+                    Ok(id) => {
+                        resolved[i] = Some(id);
+                        if self.names.len() < NAME_CACHE_MAX {
+                            self.names.insert(names[i].to_string(), id);
+                        }
+                    }
+                    Err(Error::Server(s)) if refused(&s) => out[i] = Some(Latest::missing(s)),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The server must speak 14: an older one does not know the op, and nothing is sent to it.

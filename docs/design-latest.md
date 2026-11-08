@@ -756,9 +756,9 @@ QUERY_LATEST (39)  u8 flags, u8 0, u16 threads, u32 n (1..1048576), i64 end, [i6
                    A bad header gets one frame with INVALID, m = 0, last = 1.
 ```
 
-- Version rules (compatibility.md): the server speaks 13; the floor stays 12. A client asked for `latest` by a
-  caller while connected to a 12 server fails with `TSDB_ERR_INVALID` without sending. HELLO, every other op and
-  the floor are unchanged, so a 13 client talks to a 12 server for everything else.
+- Version rules (compatibility.md): the server speaks 14; the floor stays 12. A client asked for `latest` by a
+  caller while connected to a 12 or 13 server fails with `TSDB_ERR_INVALID` without sending. HELLO, every other op
+  and the floor are unchanged, so a 14 client talks to a 12 or 13 server for everything else.
 - tsdbd runs it on a worker like QUERY_MULTI (the event loop only parses), counts it against the connection's
   request budget, and honours CANCEL between chunks as it does for QUERY_MULTI (version 10 rules).
 - Records are fixed size so that clients decode them without branching; 100,000 ids answer in 2.4 MB.
@@ -786,7 +786,12 @@ QUERY_LATEST (39)  u8 flags, u8 0, u16 threads, u32 n (1..1048576), i64 end, [i6
 - Java: `long[]` ids (never `int`), `Latest[] latest(long[] ids, LatestOptions o)` and
   `Latest[] latestByName(String[] names, LatestOptions o)`; `EmbeddedDb` the same.
 - **`latest_by_name`** resolves each name to an id through the client's id cache (the insert paths keep one), looks
-  up the misses in one batch (the existing name lookup op), and sends ids. A name that does not resolve gets the
+  up the misses with the existing name lookup op, pipelined (a window of up to 256 requests goes out before their
+  replies are read, so a cold list of 10^6 names costs about 4,000 round trips, not 10^6), and sends ids. A name
+  the lookup refuses (INVALID for an empty or over-long one) is answered in its own record in every client; a lookup
+  answered UNAVAILABLE or MOVED is asked again alone, with the retries of a single request. The C `opts->ends`
+  replaces `opts->end` as in `tsdb_latest` (the C struct has no default of TSDB_TS_MAX for `end`); Rust refuses
+  both. A name that does not resolve gets the
   lookup's answer in its own record: `TSDB_ERR_NOTFOUND`, or `TSDB_ERR_DENIED` for a name outside the user's grants
   (AGENTS.md, "Login and rights"). Names never travel in `QUERY_LATEST`; ids never change meaning, so the cache is
   never stale.
@@ -1014,10 +1019,18 @@ B the slow path (`WITH_NULLS`, 2 readers x 4,096 ids, 3 repetitions, 15 rounds, 
 
 Server side: `build/tsdbd --no-auth` (on = default table, off = `--latest-cache 0`), `build/tsdbc-bench latest --series
 1000000 --conns 32 --seconds 20`, one 20 s run per cell, 3 repetitions with the two modes interleaved, each under the
-exclusive BENCH lock (`/var/tmp/latest-s3/bench-latest.sh`). `--flush` adds a 33rd connection that writes one row to
-each of the 10^6 series and flushes, again and again (one round takes 0.8 to 1.6 s; 13 to 26 rounds in a run), while the
-32 connections send random ids (256 per request) or sorted ids (4,096 per request). Means of the three runs; the three
-runs of one cell are within 5% of each other (p99), except off / 4,096 / steady (27.3, 27.5 and 33.7 ms).
+exclusive BENCH lock (`/var/tmp/latest-s3/bench-latest.sh`). Each series holds one row before the run (the load
+writes one row to each of the 10^6 series), plus one per flush round, and every request is sent with `threads = 1`
+(`tsdbc-bench latest`): the "off" column (the search) is the cost of one search thread per request, which is what
+it depends on. `--flush` adds a 33rd connection that writes one row to each of the 10^6 series and flushes, again and
+again (one round takes 0.8 to 1.6 s; 13 to 26 rounds in a run), while the 32 connections send random ids (256 per
+request) or sorted ids (4,096 per request). Means of the three runs. The runs of the "on" cells agree to within 5%
+(p99), the runs of the "off" cells do not: the p99 of off / 256 / none ran from 2,177 to 2,415 us (11%), off / 256 /
+steady 2,512 to 2,892 us (15%), off / 4,096 / none 24.5 to 29.5 ms (20%), off / 4,096 / steady 27.3 to 33.7 ms (24%).
+Repetition 3 of the "off" mode was 9 to 20% slower than the other two in all four cells (M ids/s, 256 ids none: 5.29
+against 5.96 and 5.75; steady 4.48 against 5.54 and 5.47; 4,096 none 5.44 against 6.18 and 6.17; steady 4.63 against
+5.78 and 5.76): a noisy run, averaged in, so the "off" rows below are good to about 10%, not 5%. The "on" against
+"off" gap is far outside that.
 
 | ids per request | table | flushes | requests/s | M ids/s | p50 | p99 | worst (median / max of the 3 runs) |
 |---|---|---|---:|---:|---:|---:|---:|
@@ -1032,7 +1045,8 @@ runs of one cell are within 5% of each other (p99), except off / 4,096 / steady 
 
 - **Steady flushes of 10^6 series cost the lookups 5% of the ids/s and 12% (256 ids) to 27% (4,096 ids) of the p99**,
   and the worst request stays at 6 ms (256 ids) and 31 ms (4,096 ids, where a request itself takes 11 ms). The table
-  answers twice as many ids/s as the slow path at half its p50 and p99, flushing or not, so the flush hold is not what
+  answers twice as many ids/s as the slow path at half its p50 and about 0.6x its p99 (0.63, 0.60, 0.56 and 0.63 in
+  the four rows, 0.48 for the p50), flushing or not, so the flush hold is not what
   decides the lookups' latency; the 4,096-id p99 is the time of a request of 4,096 lookups meeting a flusher thread
   on the same cores (the machine has 32 threads, the bench 33 connections).
 - The flush rounds of the flushing runs take 0.79 to 0.88 s with the table (the 256-id run of repetition 1: 1.62 s,
