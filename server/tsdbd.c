@@ -3633,18 +3633,25 @@ int main(int argc, char **argv)
                                    {"exit-with-parent", optional_argument, 0, 'E'},
                                    {"health-domain", required_argument, 0, 0x100},
                                    {"no-stats", no_argument, 0, 0x101},
-                                   {"latest-cache", required_argument, 0, 0x102},
+                                   {"latest-cache", required_argument, 0, 0x107},
                                    {"cluster", no_argument, 0, 'c'},
                                    {"peer-port", required_argument, 0, 'y'},
                                    {"peer-listen", required_argument, 0, 'Y'},
                                    {"advertise", required_argument, 0, 'a'},
                                    {"rack", required_argument, 0, 'k'},
                                    {"cluster-secret-file", required_argument, 0, 'S'},
+                                   {"state-dir", required_argument, 0, 0x102},
+                                   {"power-feed", required_argument, 0, 0x103},
+                                   {"bmc", required_argument, 0, 0x104},
+                                   {"witness", no_argument, 0, 0x105},
+                                   {"read-barrier", required_argument, 0, 0x106},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0, no_auth = 0, cluster_on = 0, peer_port = -1, cluster_opts = 0;
+    int witness = 0, rb_off = 0;
     char *health_domains[DOM_MAX];
     int nhealth = 0;
     const char *peer_addr = NULL, *advertise = NULL, *rack = "", *secret_file = NULL;
+    const char *state_dir = NULL, *power_feed = "", *bmc = "";
     const char *metrics_addr = NULL;
     long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page > 0 && (size_t)pages / 8 * (size_t)page > req_budget)
@@ -3704,13 +3711,24 @@ int main(int argc, char **argv)
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'A': no_auth = 1; break;
         case 0x101: o.stats = -1; break;
-        case 0x102: o.latest_cache = (size_t)num_arg("latest-cache", optarg, 0, LLONG_MAX); break;
+        case 0x107: o.latest_cache = (size_t)num_arg("latest-cache", optarg, 0, LLONG_MAX); break;
         case 'c': cluster_on = 1; break;
         case 'y': peer_port = (int)num_arg("peer-port", optarg, 0, 65535); cluster_opts = 1; break;
         case 'Y': peer_addr = optarg; cluster_opts = 1; break;
         case 'a': advertise = optarg; cluster_opts = 1; break;
         case 'k': rack = optarg; cluster_opts = 1; break;
         case 'S': secret_file = optarg; cluster_opts = 1; break;
+        case 0x102: state_dir = optarg; cluster_opts = 1; break;
+        case 0x103: power_feed = optarg; cluster_opts = 1; break;
+        case 0x104: bmc = optarg; cluster_opts = 1; break;
+        case 0x105: witness = 1; cluster_opts = 1; break;
+        case 0x106:
+            if (!strcmp(optarg, "off"))
+                rb_off = 1;
+            else if (strcmp(optarg, "on"))
+                goto usage;
+            cluster_opts = 1;
+            break;
         case 'E':
             start_ppid = getppid();
             if (start_ppid == 1) { /* the parent is gone already (or never was one to follow) */
@@ -3741,11 +3759,17 @@ int main(int argc, char **argv)
         default: goto usage;
         }
     }
-    if (cluster_on && (!secret_file || o.read_only || o.follow)) {
-        fprintf(stderr, "tsdbd: --cluster needs --cluster-secret-file, and a writer (not --read-only or --follow)\n");
+    if (cluster_on && (!secret_file || !state_dir || o.read_only || o.follow)) {
+        fprintf(stderr, "tsdbd: --cluster needs --cluster-secret-file and --state-dir (a local disk, never --dir), "
+                        "and a writer (not --read-only or --follow)\n");
         return 2;
     }
-    if (!dir || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
+    if (witness && (!cluster_on || dir)) {
+        fprintf(stderr, "tsdbd: --witness is a cluster member without volumes: it needs --cluster, and takes no "
+                        "--dir\n");
+        return 2;
+    }
+    if ((!dir && !witness) || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
         (metrics_addr && !metrics_on) || (cluster_opts && !cluster_on)) {
     usage:
         fprintf(stderr, "usage: tsdbd --version\n"
@@ -3761,9 +3785,12 @@ int main(int argc, char **argv)
                         "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
                         "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n"
                         "             [--health-domain PREFIX]... [--no-stats] [--latest-cache BYTES]\n"
-                        "             [--cluster --cluster-secret-file F [--peer-port %d|0] [--peer-listen ADDR]\n"
-                        "              [--advertise HOST] [--rack NAME]]\n",
-                TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1);
+                        "             [--cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
+                        "              [--peer-listen ADDR] [--advertise HOST] [--rack NAME] [--power-feed NAME]\n"
+                        "              [--bmc ADDR] [--read-barrier on|off]]\n"
+                        "       tsdbd --witness --cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
+                        "             [--peer-listen ADDR] --advertise HOST [--rack NAME] [--power-feed NAME]\n",
+                TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1, TSDB_DEFAULT_PORT + 1);
         return 2;
     }
     uint8_t secret[CLUSTER_SECRET_MAX];
@@ -3779,6 +3806,51 @@ int main(int argc, char **argv)
             fprintf(stderr, "tsdbd: --cluster on a wildcard --listen needs --advertise HOST\n");
             return 2;
         }
+    }
+    if (witness) {
+        /* A witness (design-ha-modes.md §7.1 item 7): the cluster thread and nothing else. No --dir, no engine, no
+         * client port, volumes_ok 0 (never in placement); a voter candidate on any small machine with a local disk.
+         * The port file names the peer port twice ("PEER PID 0 PEER"), so a harness that waits for the first number
+         * finds a server that serves. */
+        if (peer_port < 0)
+            peer_port = TSDB_DEFAULT_PORT + 1;
+        if (port_file)
+            unlink(port_file);
+        int wfd = listen_on(peer_addr ? peer_addr : addr, &peer_port);
+        if (wfd < 0)
+            return 1;
+        signal(SIGINT, on_signal);
+        signal(SIGTERM, on_signal);
+        signal(SIGPIPE, SIG_IGN);
+        signal(SIGHUP, SIG_IGN);
+        const char *host = advertise ? advertise : addr;
+        const char *lb = strchr(host, ':') ? "[" : "", *rb = strchr(host, ':') ? "]" : "";
+        char cadv[256], padv[256];
+        snprintf(cadv, sizeof cadv, "%s%s%s:0", lb, host, rb);
+        snprintf(padv, sizeof padv, "%s%s%s:%d", lb, host, rb, peer_port);
+        struct cluster_cfg wc = {.state_dir = state_dir, .peer_fd = wfd, .advertise = cadv, .peer_advertise = padv,
+                                 .rack = rack, .power_feed = power_feed, .bmc = bmc, .witness = 1,
+                                 .secret = secret, .secret_len = secret_len};
+        if (cluster_start(&wc) != 0)
+            return 1;
+        tsdb_wipe(secret, sizeof secret);
+        fprintf(stderr, "tsdbd: witness: cluster peer port on %s:%d (advertised as %s), no volumes\n",
+                peer_addr ? peer_addr : addr, peer_port, padv);
+        if (port_file && write_port_file(port_file, peer_port, 0, peer_port) != 0) {
+            fprintf(stderr, "tsdbd: cannot write %s: %s\n", port_file, strerror(errno));
+            return 1;
+        }
+        while (!atomic_load(&stopping)) {
+            if (start_ppid && getppid() != start_ppid) {
+                fprintf(stderr, "tsdbd: --exit-with-parent: parent %d exited, stopping\n", (int)start_ppid);
+                break;
+            }
+            struct timespec d = {0, 50000000};
+            nanosleep(&d, NULL);
+        }
+        fprintf(stderr, "tsdbd: shutting down\n");
+        cluster_stop();
+        return 0;
     }
     if (port_file)
         unlink(port_file);
@@ -3924,8 +3996,9 @@ int main(int argc, char **argv)
         char cadv[256], padv[256];
         snprintf(cadv, sizeof cadv, "%s%s%s:%d", lb, host, rb, port);
         snprintf(padv, sizeof padv, "%s%s%s:%d", lb, host, rb, peer_port);
-        struct cluster_cfg cc = {.dir = dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
-                                 .rack = rack, .secret = secret, .secret_len = secret_len};
+        struct cluster_cfg cc = {.state_dir = state_dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
+                                 .rack = rack, .power_feed = power_feed, .bmc = bmc, .read_barrier_off = rb_off,
+                                 .secret = secret, .secret_len = secret_len};
         if (cluster_start(&cc) != 0)
             return 1;
         tsdb_wipe(secret, sizeof secret);

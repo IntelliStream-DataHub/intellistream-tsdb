@@ -151,7 +151,13 @@ cgroup, so `nice` does not keep your work out of its way.
   invariants as `meta_check_step`). `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
   add|status`). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
-  for thousands of seeds); `tests/test_cluster.c`: five tsdbd end to end (init, node add, leader killed, restart).
+  for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
+  `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
+  disk, power loss under crashfs). The metadata state (NODE, IDENT, `raft/`, snapshot, `copy`, `retired`) lives in
+  `--state-dir` on a local file system; log syncs and snapshot writes run on a disk worker thread (`dw_*`), never on
+  the cluster thread; the hard-state save stays on the cluster thread (its slot sequence is shared with the durable
+  floor, which the copied log does not lock). `tests/jepsen/crashfs.c` follows dup'ed descriptors (the Raft log syncs
+  duplicates of its segments).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,

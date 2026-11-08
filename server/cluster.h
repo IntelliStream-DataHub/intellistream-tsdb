@@ -14,11 +14,17 @@
 #define CLUSTER_SECRET_MAX 1024
 
 struct cluster_cfg {
-    const char *dir;            /* tsdbd's --dir: the cluster's files live in <dir>/meta/ */
+    const char *state_dir;      /* tsdbd's --state-dir: the cluster's files (NODE, IDENT, raft/, snapshot, copy,
+                                 * retired). A local file system, never --dir (NFS in shared mode); made when
+                                 * missing (its parent must exist) */
     int peer_fd;                /* bound and listening; cluster_start takes it over */
     const char *advertise;      /* the client address others reach this server at, host:port */
     const char *peer_advertise; /* the peer address, host:port */
     const char *rack;           /* "" when not given */
+    const char *power_feed;     /* "" when not given (--power-feed) */
+    const char *bmc;            /* "" when not given (--bmc) */
+    int witness;                /* --witness: no volumes (volumes_ok 0), a voter candidate only */
+    int read_barrier_off;       /* --read-barrier off: this node runs without it; its heartbeat says so */
     const uint8_t *secret;      /* the cluster secret (every member and the CLI hold the same bytes) */
     size_t secret_len;
 };
@@ -30,7 +36,7 @@ void cluster_stop(void);
 /* ---- the admin ops (`tsdb cluster ...`), sent to a server's peer address */
 
 enum cluster_admin_op {
-    CLUSTER_OP_INIT = 1,     /* body: struct meta_settings, 9 u32; on a server that is in no cluster */
+    CLUSTER_OP_INIT = 1,     /* body: struct meta_settings (12 u32) and the mode (u32); on a server in no cluster */
     CLUSTER_OP_NODE_ADD = 2, /* body: the new server's peer address; on the Raft leader */
     CLUSTER_OP_STATUS = 3,   /* no body; on any server */
 };
@@ -48,14 +54,63 @@ const char *cluster_strerror(int rc);
 
 /* The STATUS reply: this server's view, then the metadata image (meta_snapshot_encode; empty when it has none). */
 enum cluster_mode { CLUSTER_MODE_NONE = 0, CLUSTER_MODE_CORE = 1, CLUSTER_MODE_WATCH = 2 };
+/* ---- what a server reports in its heartbeat besides its address: sections (docs/design-ha-modes.md §7.1 item 1) */
+
+enum cluster_vol_role { CL_ROLE_NONE = 0, CL_ROLE_OWNER = 1, CL_ROLE_RELEASING = 2 };
+enum cluster_vol_health { CL_HEALTH_OK = 0, CL_HEALTH_LOCAL_FAULT = 1, CL_HEALTH_DOMAIN_FAULT = 2 };
+enum cluster_dom_state { CL_DOM_OK = 0, CL_DOM_SLOW = 1, CL_DOM_FAULT = 2 };
+#define CLUSTER_REPORT_VOLS 256
+#define CLUSTER_REPORT_DOMS 64
+
+struct cluster_vol_report { /* a volume this server owns */
+    uint32_t volume;
+    uint8_t role;   /* enum cluster_vol_role */
+    uint8_t health; /* enum cluster_vol_health: why it is not well, when it is not */
+    uint64_t epoch;
+    char domain[META_DOMAIN_MAX]; /* the storage domain its files live on ("" when unknown) */
+    uint64_t series_len, states_len;   /* the dictionaries' lengths */
+    uint64_t fenced_age_ms;            /* age of the oldest fenced call still outstanding (the stuck-release rule) */
+    uint64_t wal_seg, wal_off;         /* positions as the owner last made them durable */
+};
+struct cluster_dom_report {
+    char name[META_DOMAIN_MAX];
+    uint8_t state; /* enum cluster_dom_state */
+};
+struct cluster_report {
+    uint32_t nvols, ndoms;
+    struct cluster_vol_report vols[CLUSTER_REPORT_VOLS];
+    struct cluster_dom_report doms[CLUSTER_REPORT_DOMS];
+};
+/* Fills `out` (zeroed) from what this server runs; called from the cluster thread once per heartbeat, so it must not
+ * block. Without one (set before cluster_start) the server reports no volumes and no domains. */
+typedef void (*cluster_report_fn)(void *arg, struct cluster_report *out);
+void cluster_set_reporter(cluster_report_fn fn, void *arg);
+/* The volume manager's claim health (any thread): 0 while claims of volumes granted to this node fail for reasons of
+ * its own (the state disk, the storage), 1 once they work again. It goes into the heartbeat's flags (claim_ok), and
+ * the leader lifts a CLAIM_FAILED bar only on the 0 -> 1 change. */
+void cluster_set_claim_ok(int ok);
+
+struct cluster_vol_status {
+    struct cluster_vol_report v;
+    uint64_t local_fault_s; /* how long the owner has reported a fault of this volume's domain, without a break */
+    uint64_t fault_ns;      /* inside the server: when that fault began, on its own clock; 0 none */
+};
 struct cluster_heard {
     uint32_t id;
     uint64_t ago_ms; /* UINT64_MAX: never */
     uint64_t incarnation;
+    uint8_t flags;       /* enum meta_member_flags as the member reported them */
+    uint8_t core_dropped;
+    uint8_t read_barrier; /* 1: the node runs with the read barrier */
+    uint64_t state_free; /* free bytes of its state directory */
+    uint32_t nvols, ndoms;
+    struct cluster_vol_status *vols;
+    struct cluster_dom_report *doms;
 };
 struct cluster_status {
     uint32_t self;
     uint8_t mode, role; /* role: raft_role (0 follower, 1 pre-candidate, 2 candidate, 3 leader) */
+    uint8_t stale;      /* 1: the image is this member's persisted copy of an earlier run, not yet confirmed */
     uint64_t term, commit, applied;
     uint32_t leader;
     uint32_t nheard;
@@ -63,8 +118,9 @@ struct cluster_status {
     const uint8_t *image;
     size_t image_len;
 };
-/* Parses a STATUS body; `image` and `heard` point into / are allocated for it (free st->heard). 0 or -1. */
+/* Parses a STATUS body; `image` points into it, `heard` is allocated (cluster_status_free). 0 or -1. */
 int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status *st);
+void cluster_status_free(struct cluster_status *st);
 
 /* One admin request to `addr` (host:port, the server's peer address): connects, authenticates with the secret, sends
  * the op and waits up to timeout_ms for the reply. Returns 0 with the op's result in *rc and its body in *reply
@@ -86,7 +142,7 @@ int cluster_make_secret(const char *path, char *err, size_t errn);
 void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *const *part, const size_t *len,
                         uint8_t out[32]);
 
-/* The INIT body for `s` (36 bytes). */
-size_t cluster_settings_encode(const struct meta_settings *s, uint8_t *out);
+/* The INIT body for `s` and the deployment's mode, an enum meta_mode (52 bytes). */
+size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);
 
 #endif

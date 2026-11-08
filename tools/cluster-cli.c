@@ -26,7 +26,8 @@ static int cl_usage(void)
     fprintf(stderr,
             "usage: tsdb cluster init PEER --secret-file F [--replication 3] [--min-isr 1] [--node-timeout-ms 3000]\n"
             "            [--heartbeat-ms 500] [--isr-lag-ms 1000] [--out-after-s 1800] [--voter-replace-s 600]\n"
-            "            [--voters 5] [--volumes-per-server 16]\n"
+            "            [--voters 5] [--volumes-per-server 16] [--mode replicated|shared]\n"
+            "            [--failover lease|attested|bmc] [--read-barrier on|off] [--lease-s 10]\n"
             "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
             "       tsdb cluster status PEER --secret-file F\n"
             "       tsdb cluster secret FILE    (makes a new secret file, mode 0600; never overwrites one)\n"
@@ -59,6 +60,8 @@ static void print_status(const struct cluster_status *st)
            " applied %" PRIu64 "\n",
            st->self, st->mode < 3 ? mode[st->mode] : "?", st->mode == CLUSTER_MODE_CORE ? role_name(st->role) : "-",
            st->term, st->leader, st->commit, st->applied);
+    if (st->stale)
+        printf("stale this is the copy of an earlier run; no watch stream has confirmed it yet\n");
     struct meta_state m;
     meta_init(&m);
     if (!st->image_len || meta_snapshot_decode(&m, st->image, st->image_len) != META_OK) {
@@ -71,9 +74,13 @@ static void print_status(const struct cluster_status *st)
         sprintf(u + 2 * i, "%02x", m.uuid[i]);
     if (m.initialised)
         printf("cluster %s replication %" PRIu32 " min_isr %" PRIu32 " node_timeout_ms %" PRIu32
-               " heartbeat_ms %" PRIu32 " voter_replace_s %" PRIu32 " voters_max %" PRIu32 "\n",
+               " heartbeat_ms %" PRIu32 " voter_replace_s %" PRIu32 " voters_max %" PRIu32 " mode %s failover %s"
+               " read_barrier %s lease_s %" PRIu32 " restore_gen %" PRIu64 "\n",
                u, m.set.replication, m.set.min_isr, m.set.node_timeout_ms, m.set.heartbeat_ms,
-               m.set.voter_replace_s, m.set.voters);
+               m.set.voter_replace_s, m.set.voters, m.mode == META_MODE_SHARED ? "shared" : "replicated",
+               m.set.failover == META_FAILOVER_BMC ? "bmc" : m.set.failover == META_FAILOVER_ATTESTED ? "attested"
+                                                                                                     : "lease",
+               m.set.read_barrier ? "on" : "off", m.set.lease_s, m.restore_gen);
     else
         printf("cluster %s (not initialised)\n", u);
     raft_config cfg = {0};
@@ -99,9 +106,27 @@ static void print_status(const struct cluster_status *st)
         for (uint32_t j = 0; j < st->nheard; j++)
             if (st->heard[j].id == mb->id && st->heard[j].ago_ms != UINT64_MAX)
                 snprintf(heard, sizeof heard, "%" PRIu64 "ms", st->heard[j].ago_ms);
-        printf("member %" PRIu32 " %s incarnation %" PRIu64 " addr %s peer %s rack %s heard %s\n", mb->id,
-               meta_member_state_name(mb->state), mb->incarnation, mb->addr, mb->peer, mb->rack[0] ? mb->rack : "-",
-               heard);
+        const struct cluster_heard *h = NULL;
+        for (uint32_t j = 0; j < st->nheard; j++)
+            if (st->heard[j].id == mb->id)
+                h = &st->heard[j];
+        printf("member %" PRIu32 " %s incarnation %" PRIu64 " addr %s peer %s rack %s heard %s feed %s voter_ok %d"
+               " volumes_ok %d core_dropped %d read_barrier %s\n",
+               mb->id, meta_member_state_name(mb->state), mb->incarnation, mb->addr, mb->peer,
+               mb->rack[0] ? mb->rack : "-", heard, mb->power_feed[0] ? mb->power_feed : "-",
+               !!(mb->flags & META_MF_VOTER_OK), !!(mb->flags & META_MF_VOLUMES_OK), h ? h->core_dropped : 0,
+               !h || (!h->flags && !h->state_free) ? "?" : h->read_barrier ? "on" : "off");
+        for (uint32_t j = 0; h && j < h->nvols; j++) {
+            const struct cluster_vol_status *v = &h->vols[j];
+            printf("volume-report node %" PRIu32 " volume %" PRIu32 " role %s health %s epoch %" PRIu64
+                   " domain %s local_fault_s %" PRIu64 " fenced_age_ms %" PRIu64 "\n",
+                   mb->id, v->v.volume, v->v.role == CL_ROLE_OWNER ? "owner" : v->v.role == CL_ROLE_RELEASING ? "releasing" : "none",
+                   v->v.health == CL_HEALTH_OK ? "ok" : v->v.health == CL_HEALTH_LOCAL_FAULT ? "local-fault" : "domain-fault",
+                   v->v.epoch, v->v.domain[0] ? v->v.domain : "-", v->local_fault_s, v->v.fenced_age_ms);
+        }
+        for (uint32_t j = 0; h && j < h->ndoms; j++)
+            printf("domain-report node %" PRIu32 " %s %s\n", mb->id, h->doms[j].name,
+                   h->doms[j].state == CL_DOM_OK ? "ok" : h->doms[j].state == CL_DOM_SLOW ? "slow" : "fault");
     }
     printf("volumes %" PRIu32 " users %" PRIu32 "\n", m.nvolumes, m.nusers);
     meta_free(&m);
@@ -139,6 +164,7 @@ int cluster_cli(int argc, char **argv)
     }
     struct meta_settings s;
     meta_settings_default(&s);
+    int mode = META_MODE_REPLICATED;
     struct {
         const char *flag;
         uint32_t *v;
@@ -150,10 +176,35 @@ int cluster_cli(int argc, char **argv)
                 {"--out-after-s", &s.out_after_s},
                 {"--voter-replace-s", &s.voter_replace_s},
                 {"--voters", &s.voters},
-                {"--volumes-per-server", &s.volumes_per_server}};
+                {"--volumes-per-server", &s.volumes_per_server},
+                {"--lease-s", &s.lease_s}};
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--secret-file") && i + 1 < argc) {
             secret_file = argv[++i];
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--mode")) {
+            mode = !strcmp(argv[i + 1], "shared") ? META_MODE_SHARED
+                   : !strcmp(argv[i + 1], "replicated") ? META_MODE_REPLICATED : 0;
+            if (!mode)
+                return cl_usage();
+            i++;
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--failover")) {
+            s.failover = !strcmp(argv[i + 1], "lease") ? META_FAILOVER_LEASE
+                         : !strcmp(argv[i + 1], "attested") ? META_FAILOVER_ATTESTED
+                         : !strcmp(argv[i + 1], "bmc") ? META_FAILOVER_BMC : 99;
+            if (s.failover == 99)
+                return cl_usage();
+            i++;
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--read-barrier")) {
+            if (strcmp(argv[i + 1], "on") && strcmp(argv[i + 1], "off"))
+                return cl_usage();
+            s.read_barrier = !strcmp(argv[i + 1], "on");
+            i++;
             continue;
         }
         size_t k = 0;
@@ -188,7 +239,7 @@ int cluster_cli(int argc, char **argv)
     int op;
     if (!strcmp(verb, "init")) {
         op = CLUSTER_OP_INIT;
-        rl = cluster_settings_encode(&s, req);
+        rl = cluster_settings_encode(&s, mode, req);
     } else if (!strcmp(verb, "node")) {
         op = CLUSTER_OP_NODE_ADD;
         size_t n = strlen(newpeer);
@@ -232,7 +283,7 @@ int cluster_cli(int argc, char **argv)
                 return 1;
             }
             print_status(&st);
-            free(st.heard);
+            cluster_status_free(&st);
         } else if (op == CLUSTER_OP_INIT) {
             printf("initialised: node 1 at %s\n", target);
         } else {

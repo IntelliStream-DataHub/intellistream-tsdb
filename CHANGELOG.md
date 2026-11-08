@@ -25,6 +25,24 @@ disk format and the wire protocol.
   See docs/compatibility.md. With one bad `FNO` slot (a torn store or damage; they look alike) the open uses the other
   and skips the numbers ahead by 2^40, so none is handed out twice; do not run 0.9.0's `tsdb` (`volume add`) on an
   upgraded database.
+- **Cluster step S1: the metadata format (snapshot version 2) and the peer protocol (version 2)** (docs/design-ha-modes.md
+  §7.1; `tsdbd --cluster` is not in a release yet). The metadata snapshot `TMS1` is version 2 and version 1 is refused;
+  INIT and the snapshot carry a `level` (1, room for a rolling upgrade later). The state machine knows shared volumes
+  (reserved epochs, `VOLUME_SELF`, `CLAIM_FAILED`, attested and BMC grants, name-slot freezes), replica instance ids,
+  member flags, a power feed and BMC address per member, domains, positions as reports, and the deployment's mode,
+  `failover` and `read_barrier`. Peers of version 1 are refused. **There is no way to run servers of mixed versions: a
+  cluster built before S1 is initialised again, not upgraded.** The metadata state now lives in `--state-dir` on a
+  local file system (required with `--cluster`; refused on NFS and CIFS), not in `<dir>/meta`. New tsdbd options:
+  `--state-dir`, `--witness` (a voter without `--dir` or volumes), `--power-feed`, `--bmc`, `--read-barrier on|off`;
+  `tsdb cluster init` takes `--mode`, `--failover`, `--read-barrier`, `--lease-s`. A Raft log fault ends only the
+  voter role in shared mode (a `retired` mark in the state directory; replicated mode still stops the server). Heartbeats
+  carry sections (owned volumes, storage domains, node flags); every member keeps a copy of the metadata it serves
+  after a restart, marked stale. The disk worker takes log syncs and snapshot writes off the cluster thread; a leader
+  whose own sync has been out for 2 s hands leadership on. The copy a member keeps never goes back to an older
+  image from a lagging voter (only a restore replaces it with one), voters keep one too, and in shared mode every
+  state-directory fault (snapshot, install, kept image, copy file) ends only the voter role. Under
+  `failover = attested` or `bmc` every grant that moves a shared volume to another node needs an attestation, except
+  PLANNED and REFUSED; a CLAIM_FAILED bar lifts only when the node's `claim_ok` flag goes from 0 to 1.
 - New status codes -18 (`TSDB_ERR_FEED_GONE`) and -19 (`TSDB_ERR_FEED_RESET`) are reserved in `tsdb.h` for the change
   feed; nothing returns them yet.
 - **Wire protocol 13: every HA body, before the 1.0 freeze** (step S0, the wire half; docs/ha.md 15.4,
