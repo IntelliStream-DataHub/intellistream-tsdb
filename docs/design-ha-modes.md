@@ -752,6 +752,17 @@ default, which the user may change):
 
 ### 7.1 What cluster steps 1 and 2 give shared mode, and what step 1 must change
 
+**Status (S1, branch ha-s1, 2026-11-08).** Items 1-12, 15-22 are built; 13 and 14 are what they say (the opcode
+`NAME_GROUP` is reserved and applies INVALID, the snapshot has an empty rule list; the heartbeat section carries the
+oldest fenced call age). Format rulings of the advisor are in the head comment of `server/meta.h` (snapshot version 2,
+`level`, `VOLUME_LEADER` carries its new epoch, the reserved epoch is implicit, `META_ERR_RANGE`, `META_ERR_BLOCKED`,
+`META_ERR_ATTEST`, positions are reports, no clocks in apply). **Not as the list says:** item 2's heartbeats and watch
+run on the cluster thread with no Raft log I/O, and log syncs and snapshot writes run on a disk worker; the hard-state
+save (`raft_log_hard_save`) stays on the cluster thread, because its slot sequence is shared with the durable floor and
+the copied Raft log has no lock for it: moving it needs a thread rule from the Raft core (upstream, not done). A hard
+save is a 4 KiB `fdatasync`, so a stalled disk can still hold the cluster thread there until the leader's 2 s transfer
+(which needs the thread) is reached: the transfer fires from syncs, not from hard saves.
+
 - **Step 1 (`cluster-s1`: 35e1456 the metadata state machine, ede84e5 tsdbd's peer thread and the CLI)**: the Raft
   core copied in, the metadata state machine (members, volumes with replicas, leader, epoch, ISR, epoch history, name
   slots, users), epoch-conditional operations applied one by one, snapshots, the step checker and the simulator. All
