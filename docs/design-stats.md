@@ -527,8 +527,8 @@ standard deviations reported (benchmark policy):
 
 Stats on (the default) against `--no-stats`, same binaries, `tsdb-bench --qps` on a 100-series, 1 M-row-per-series
 database (3 interleaved runs of 5 s each; mean queries/s) and `insert-bench --appends-only` with fsync (5 interleaved
-rounds of 10 s; mean inserts/s). The single-row lookup class and the two-handle case are not measured yet; the
-`qs_end` hook (about 10 ns per query) is below the noise of the classes that were.
+rounds of 10 s; mean inserts/s). The single-row lookup class is in the results of steps 3 and 4 below; the
+`qs_end` hook (about 10 ns per query) is below the noise of the classes measured here.
 
 | class | on | off | on / off |
 |---|---:|---:|---:|
@@ -576,29 +576,43 @@ Where the code differs from the text above:
   the struct has the design's name. `TSDB_ABI_VERSION` is 6; the bindings carry the new `tsdb_options` fields (the
   tenant list itself is not offered in them before step 5).
 
-**Benchmarks** (stats on against `--no-stats`, 3 interleaved repetitions, Ryzen 9 7950X, `flock -o -x BENCH.lock`,
-log `runs/s34-bench/out`; the machine was not fully quiet: other tracks started work during repetition 3 of the
-`off` runs, which slowed every number of that run by 15 to 35 percent, so it is left out of the query means below):
+**Benchmarks** (stats on against `--no-stats`, same binaries, Ryzen 9 7950X, `flock -o -x BENCH.lock`, `sync` and a
+20 s pause before every run so one mode's dirty pages are not written back during the next).
 
-| `tsdb-bench` load 100 x 1 M, random windows (queries/s, mean of reps 1-2) | on | off | difference |
+`tsdb-bench` load 100 x 1 M, random windows of 2 s each, mean of 3 repetitions that alternate the order of the modes
+(log `runs/s34f-bench`, `/var/tmp/stats-s34/bench/run2.log`):
+
+| class (queries/s) | on | off | on / off |
 |---|---:|---:|---:|
-| raw 3600 samples, 1 thread | 67,284 | 67,350 | -0.1 % |
-| raw 3600 samples, 32 threads | 1,131,589 | 1,092,343 | +3.6 % (noise, on the faster side) |
-| agg 86,400 samples in buckets of 300, 1 thread | 18,308 | 18,513 | -1.1 % |
-| agg 86,400 samples in buckets of 300, 32 threads | 111,487 | 111,310 | +0.2 % |
-| agg 604,800 samples in buckets of 3600, 1 thread | 16,926 | 15,836 | +6.9 % (noise: off varies 14,849-16,822) |
-| load, M rows/s | 75.6 | 74.5 | +1.4 % |
+| a single row, 1 thread (the cheapest query, 8.5 us) | 118,093 | 117,319 | +0.7 % |
+| a single row, 32 threads | 1,314,740 | 1,301,383 | +1.0 % |
+| raw 3600 samples, 1 thread | 67,104 | 67,064 | +0.1 % |
+| raw 3600 samples, 32 threads | 1,082,670 | 1,078,860 | +0.4 % |
+| agg 86,400 samples in buckets of 300, 1 thread | 18,621 | 18,344 | +1.5 % |
+| agg 86,400 samples in buckets of 300, 32 threads | 112,567 | 111,313 | +1.1 % |
+| agg 604,800 samples in buckets of 3600, 1 thread | 16,878 | 16,730 | +0.9 % |
+| agg 604,800 samples in buckets of 3600, 32 threads | 55,515 | 55,066 | +0.8 % |
+| load, M rows/s | 76.6 | 76.3 | +0.4 % |
 
-Queries cost no measurable amount (within the spread of the runs, about 1 % at one thread). `insert-bench`
-(`--appends-only`, fsync each) showed on faster than off at 1 thread (1,441 against 910 inserts/s), which is not a
-saving: every `off` run started right after the `on` run's load had left dirty pages to write back, so its first
-fsyncs were slower (p99 6.7 ms against 0.8 ms). At 64 and 256 threads, where that effect is gone, the means are
-43,013 against 41,667 and 144,684 against 137,355 inserts/s with the noisy repetition 3 included; in repetitions 1
-and 2 the difference is 0.7 % at 64 threads (42,842 against 42,539) and 2.7 % at 256 threads (144,744 against
-140,872, on again the faster side). The
-bound of 1 % for the append path therefore holds only to the noise of this machine; a rerun on a quiet machine with
-a `sync` and a pause between modes is the check that would settle it. The `qps` modes of the script failed (a wrong
-invocation; the load already runs the random-window queries) and give no numbers.
+On is never slower than off beyond the spread of the runs (the differences are all on the faster side, so they are
+noise: the per-query cost measured on its own, `qreg_add` 50 M calls, is +8 ns with hot-reads sampling, under 0.1 % of
+a single-row lookup).
+
+`insert-bench --appends-only` (fsync each call, group commit), 10 s a run, one warm-up round that is not counted, then
+6 rounds that alternate the order, mean inserts/s (log `runs/s34g-bench`, `/var/tmp/stats-s34/bench/run3.log`):
+
+| threads | on | off | on / off |
+|---:|---:|---:|---:|
+| 1 | 1,449 | 1,436 | +1.0 % |
+| 16 | 12,394 | 12,205 | +1.5 % |
+| 64 | 42,905 | 42,574 | +0.8 % |
+| 256 | 142,905 | 136,477 | +4.7 % (one `off` run of 111,071; without it +1.0 %) |
+
+The write path gains one relaxed atomic load and one field in `stats_push`, inside calls that are dominated by the
+fsync, and the numbers agree: no measurable cost, within 1 % to the noise of the machine, and the gate holds. An
+earlier run (3 rounds of 5 s, no warm-up) had `on` 1.7 to 2.8 % below `off` at 16 to 256 threads, with the order of
+the modes visible in the repetitions (on slower in rounds 1 and 2, faster in round 3) and a cold first run at 1
+thread; the longer run with a warm-up does not repeat it, so it was an order effect.
 
 **The tenant map at 10^7 series** (`build/test_tenants --map-bench 10000000`): series created interleaved between
 tenants: 20.1 MB (2.01 bytes a series), filled 0.1 s after the last creation; created in runs per tenant: 2.0 MB
