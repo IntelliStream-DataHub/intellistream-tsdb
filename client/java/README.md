@@ -424,7 +424,7 @@ with `LatestOptions.defaults().withNulls()`, or `NONE`), `ts()` and the value. `
 time. `EmbeddedDb` has the same methods.
 
 ```java
-List<SeriesResult<Latest>> r = c.latestByName(new String[] {"pump0.flow", "pump1.flow"}, LatestOptions.defaults());
+List<SeriesResult<Latest>> r = client.latestByName(new String[] {"pump0.flow", "pump1.flow"}, LatestOptions.defaults());
 Latest first = r.get(0).get();
 System.out.println(first.kind() + " " + first.ts());
 ```
