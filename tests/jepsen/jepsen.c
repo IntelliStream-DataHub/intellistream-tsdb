@@ -714,8 +714,13 @@ static void *client(void *arg)
             w->series = s;
             w->kind = (r >> 16) % 2 ? W_REPLACE : W_DELETE;
             w->lo = pick_key(s, mix(r + 3), mix(r + 6), 50);
+            /* latest: a share of the replaces rewrite the top of the series and always write its last key, so that a
+             * replace's row is the newest row of the series (what the latest answers must then show) */
+            bool top = latest_on && w->kind == W_REPLACE && (mix(r + 11) % 100) < 30;
+            if (top)
+                w->lo = key_limit(s) - 1 - (uint32_t)(mix(r + 12) % (key_limit(s) < 60 ? key_limit(s) : 60));
             w->hi = w->lo + 1 + (uint32_t)(mix(r + 4) % 200);
-            if (w->hi > key_limit(s))
+            if (w->hi > key_limit(s) || top)
                 w->hi = key_limit(s) > w->lo ? key_limit(s) : w->lo + 1;
             uint32_t n = w->kind == W_REPLACE ? (w->hi - w->lo) : 0, stride = 1 + (uint32_t)(mix(r + 5) % 4), m = 0;
             w->keys = malloc((n ? n : 1) * sizeof *w->keys);
@@ -724,6 +729,11 @@ static void *client(void *arg)
             for (uint32_t k = w->lo; k < w->lo + n; k += stride) {
                 w->keys[m] = k;
                 ts[m] = key_ts(s, k);
+                v[m++] = (float)id;
+            }
+            if (top && w->keys[m - 1] != w->hi - 1) { /* m < n here: a stride above 1 left room */
+                w->keys[m] = w->hi - 1;
+                ts[m] = key_ts(s, w->hi - 1);
                 v[m++] = (float)id;
             }
             w->nkeys = m;
@@ -833,17 +843,26 @@ static void *client(void *arg)
                 uint32_t span = n * stride, jitter = (uint32_t)(mix(r + 1) % CL_NEAR);
                 start = span + jitter < lim ? lim - span - jitter : 0;
             }
+            /* latest: the top key of every odd series is written by replaces only (see below), so a replace's row is
+             * often the newest row of its series, which inserts would otherwise cover within moments */
+            bool reserved = latest_on && !classes && (s & 1);
             for (uint32_t i = 0; i < n; i++) {
                 uint32_t k = (start + i * stride) % lim;
                 bool dup = false;
                 for (uint32_t j = 0; j < m && n <= 20; j++)
                     dup |= w->keys[j] == k;
-                if (dup || (n > 20 && i * stride >= lim))
+                if (dup || (n > 20 && i * stride >= lim) || (reserved && k == lim - 1))
                     continue;
                 w->keys[m] = k;
                 ts[m] = key_ts(s, k);
                 v[m] = (float)id;
                 m++;
+            }
+            if (!m) { /* only the reserved key was drawn */
+                w->keys[0] = lim - 2;
+                ts[0] = key_ts(s, lim - 2);
+                v[0] = (float)id;
+                m = 1;
             }
             w->nkeys = m;
             w->invoke = now_ns();
@@ -1372,12 +1391,17 @@ static bool absent_ok(int series, uint32_t k, int64_t after, int64_t before)
  *     the null writes that could be its row;
  *  L3 nothing newer: no key between the answer and `end` (all keys below it when the answer is none) holds a row
  *     that an acknowledged write (completed before I) put there, unless a write that could be ordered after it and
- *     began before C removes it: deletes and replaces always; null writes too when the answer skips nulls. */
-static bool latest_removes(int series, uint32_t k, int64_t after, int64_t before, bool nulls_remove)
+ *     began before C removes it: deletes always, and replaces that did not write the key (one that did leaves a
+ *     row there; the write itself is no remover); null writes too when the answer skips nulls. */
+static bool latest_removes(int series, uint32_t k, uint32_t self, int64_t after, int64_t before, bool nulls_remove)
 {
     size_t slot = koff[series] + k;
     for (uint32_t i = dcnt[slot]; i < dcnt[slot + 1]; i++) {
         const wop *d = &writes[dlist[i]];
+        /* the write being checked is no remover of its own row, nor is a replace that wrote the key (it leaves a
+         * row there, as new as itself): without this L3 never required a row that a replace wrote */
+        if (dlist[i] == self || (d->kind == W_REPLACE && wrote_key(dlist[i], k)))
+            continue;
         if ((nulls_remove || d->kind != W_NULL) && d->st != ST_FAIL && d->complete >= after && d->invoke <= before)
             return true;
     }
@@ -1499,7 +1523,7 @@ static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
                 int row = row_of(w, (uint32_t)k, true);
                 if (w->st != ST_OK || w->complete >= l->invoke || row == 0 || (row == 2 && !l->with_nulls))
                     continue;
-                if (latest_removes(s, (uint32_t)k, w->invoke, l->complete, !l->with_nulls))
+                if (latest_removes(s, (uint32_t)k, cov[j], w->invoke, l->complete, !l->with_nulls))
                     continue;
                 LVIOL("%s at key %lld (write %u, acknowledged before the request), newer than the answer (%s%s key "
                       "%lld): stale or missing\n", row == 1 ? "a value" : "a null", (long long)k, cov[j],
