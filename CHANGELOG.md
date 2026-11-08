@@ -3,12 +3,21 @@
 All notable changes to tsdb are listed here, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the versions follow
 [Semantic Versioning](https://semver.org/), with the exception described in
-[docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.9.x release may still change the
+[docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.x release may still change the
 disk format and the wire protocol.
 
-## [Unreleased]
+## [0.10.0] - 2026-11-08
 
-### Changed
+**Disk format 9, wire protocol 14 (floor 12, so clients and servers of protocol 12 and up still talk), embedded C ABI 7.**
+0.9.0 and 0.9.1 wrote format 8, spoke protocol 12 and had ABI 3. A 0.9.x database needs one step before this release
+opens it: `tsdb DIR upgrade` after a clean shutdown, or export and import (first item below). This release adds the
+latest value of every series (`tsdb_latest` and `QUERY_LATEST`, in all four clients), statistics of what is stored and
+of what queries did, the disk side of a change feed (**off by default**), and the first build of the cluster's metadata
+group (**a preview**: no data replication and no failover yet, do not run it in production). It also fixes a stall of appends during a memtable flush at
+a million series, several tsdbd edge cases found by the 0.9.1 security review, and makes a damaged part a barrier inside its
+partition instead of a stop for the whole partition. Use the same release on the server and its clients.
+
+### Upgrading from 0.9.x
 
 - **Disk format 9** (step S0 of docs/design-ha-modes.md; the disk half). The WAL record has a 32-byte header with a log
   number (`fno`) and the group commit's time, and can be a marker; the part header is 48 bytes (the range of log numbers
@@ -17,36 +26,99 @@ disk format and the wire protocol.
   per flush); `META` can say `requires=` (a binary refuses a feature it does not know, naming it); `MANIFEST` has an
   `fno_next` line (information for followers). The cost is 16 more bytes per WAL record: not measurable with an
   fsync per call, 1 to 8% on appends without one (BENCHMARKS.md, "Format 9").
-  **Carrying a database over:** a format-8 database is refused, naming both versions. `tsdb DIR upgrade` carries it
-  over in place when it was closed cleanly with 0.9.0 (no WAL segment, intent or tmp part; stop tsdbd and every
-  follower first): FNO, MANIFEST and META of each volume, the root last, safe to run again. The parts keep their old
+  **Carrying a database over:** this release refuses a format-8 database (the line names both versions and this
+  command), and 0.9.0 and 0.9.1 refuse a format-9 database the same way ("the database has disk format version 9; tsdb
+  0.9.1 reads version 8 only"; nothing is written). So, for a database of 0.9.x: stop tsdbd and every follower, make sure
+  it was shut down cleanly, keep the export or a copy, and run `tsdb DIR upgrade` with this release. It carries
+  the database over in place when it was closed cleanly by 0.9.0 or 0.9.1 (no WAL segment, intent or tmp part; it
+  refuses and says which if not): it writes FNO, MANIFEST and META of each volume, the root last, safe to run again. The parts keep their old
   headers until merges rewrite them (`META` says `parts_v8=1` meanwhile; merges of idle partitions and `tsdb DIR
   optimize` do it, the open logs how many are left). Export and import (docs/export-format.md) still always works.
   See docs/compatibility.md. With one bad `FNO` slot (a torn store or damage; they look alike) the open uses the other
-  and skips the numbers ahead by 2^40, so none is handed out twice; do not run 0.9.0's `tsdb` (`volume add`) on an
+  and skips the numbers ahead by 2^40, so none is handed out twice; do not run 0.9.0's or 0.9.1's `tsdb` (`volume add`) on an
   upgraded database.
-- **Cluster step S1: the metadata format (snapshot version 2) and the peer protocol (version 2)** (docs/design-ha-modes.md
-  §7.1; `tsdbd --cluster` is not in a release yet). The metadata snapshot `TMS1` is version 2 and version 1 is refused;
-  INIT and the snapshot carry a `level` (1, room for a rolling upgrade later). The state machine knows shared volumes
-  (reserved epochs, `VOLUME_SELF`, `CLAIM_FAILED`, attested and BMC grants, name-slot freezes), replica instance ids,
-  member flags, a power feed and BMC address per member, domains, positions as reports, and the deployment's mode,
-  `failover` and `read_barrier`. Peers of version 1 are refused. **There is no way to run servers of mixed versions: a
-  cluster built before S1 is initialised again, not upgraded.** The metadata state now lives in `--state-dir` on a
-  local file system (required with `--cluster`; refused on NFS and CIFS), not in `<dir>/meta`. New tsdbd options:
-  `--state-dir`, `--witness` (a voter without `--dir` or volumes), `--power-feed`, `--bmc`, `--read-barrier on|off`;
-  `tsdb cluster init` takes `--mode`, `--failover`, `--read-barrier`, `--lease-s`. A Raft log fault ends only the
-  voter role in shared mode (a `retired` mark in the state directory; replicated mode still stops the server). Heartbeats
-  carry sections (owned volumes, storage domains, node flags); every member keeps a copy of the metadata it serves
-  after a restart, marked stale. The disk worker takes log syncs and snapshot writes off the cluster thread; a leader
-  whose own sync has been out for 2 s hands leadership on. The copy a member keeps never goes back to an older
-  image from a lagging voter (only a restore replaces it with one), voters keep one too, and in shared mode every
-  state-directory fault (snapshot, install, kept image, copy file) ends only the voter role. Under
-  `failover = attested` or `bmc` every grant that moves a shared volume to another node needs an attestation, except
-  PLANNED and REFUSED; a CLAIM_FAILED bar lifts only when the node's `claim_ok` flag goes from 0 to 1.
+- `tsdb_upgrade(dir)` in `tsdb.h` and `tsdb DIR upgrade` (the step above). Nothing else on disk changes for a database
+  that stays on format 9; the new files (`FNO`, `FEED`, `FEEDSLOTS`) are made by the open, the upgrade or the feed commands.
+- **Protocol 14, floor 12.** A client of 12 or 13 talks to this server and the other way round; a call that needs a
+  newer server than the one connected (`latest` below 14) fails with `TSDB_ERR_INVALID` without sending. Version 13
+  adds the HA reply bodies and 14 `QUERY_LATEST` (both below). The numbers planned next are the change feed (15) and
+  statistics over the wire (16); neither exists yet.
+- **ABI 7.** `tsdb_options` gained `stats` and `stats_sweep_mb_s` (4) and `latest_cache` (5), then
+  `stats_recompute_s`, `stats_resident_s`, `tenants` and `ntenants`, and `tsdb_volume_stats.stats_tmap_bytes` (6), and
+  `tsdb_latest_stats` with `tsdb_get_latest_stats` (7); the
+  Rust, Python and Java bindings carry them. The statistics and the latest table change neither the wire protocol
+  nor the disk format.
+
+### Added
+
+- **The latest value of every series** (`docs/design-latest.md`), embedded and over the wire.
+  - **The latest table** (engine, `docs/design-latest.md` step 2): per volume, the newest non-null row of every series in
+    the parts (or a bound on it), kept exact by every listing of parts (flush, insert, replay, delete, replace), by
+    retention and by `tsdb_drop_before`, and filled by a background warmer. `tsdb_latest` answers from it in O(1) and
+    falls back to the slow path for an entry that is unknown. New option `latest_cache` (bytes; `tsdb_options_init` sets
+    RAM/16, 0 turns the table off; followers have none). Large flushes (50,000 series or more) store their rows in a
+    window that lookups can read.
+  - **QUERY_LATEST over the wire, protocol 14** (`docs/design-latest.md` step 3). New op 39: the newest row of up to
+    1,048,576 series by id (optionally as of a time, one `end` or one per id, and with nulls), answered in frames of
+    at most 65,536 records of 24 bytes in index order; CANCEL stops it between frames. It needs the right `read` on each
+    series (`auth_ops`); a denied id and a missing one look alike (`TSDB_ERR_DENIED`) unless the user has `read` on
+    `all` (then `TSDB_ERR_NOTFOUND`). The floor stays 12, a client below 14 asked for `latest` fails with
+    `TSDB_ERR_INVALID` without sending. All four clients have `latest` and `latest_by_name` (C `tsdbc_latest`,
+    Rust `Client::latest`, Python `latest`, Java `latest`; the embedded bindings too; names resolve through a
+    per-connection cache, so a name outside the user's grants answers DENIED in its own record), and the CLI has
+    `tsdb DIR latest NAME... [--with-nulls] [--end T]`. `tsdbd --latest-cache BYTES` sets the table's budget. Metrics:
+    `tsdb_latest_*` (docs/metrics.md). The jepsen kv workload writes nulls and checks every latest answer against the
+    acknowledged writes.
+- **Statistics of what is stored and of what queries did** (`docs/design-stats.md`, steps 1 and 2).
+  `tsdb_options.stats` (-1 off, 0 lazy, 1 from the open; tsdbd runs with 1, `--no-stats` turns it off) and
+  `stats_sweep_mb_s` (a hard cap on the sweeper's index reads, default 256). `tsdb_volume_stats` gains the logical
+  bytes (rows x (8 + the value width of the series' type)), the compressed timestamp and value bytes, the index
+  and the rest, and the sweeper's progress and CPU time; `tsdb_stats_settle` waits for it. `tsdb_series_stats` gives
+  rows, nulls, bytes, parts, granules, the time range and the last write of up to 65,536 series per call, computed
+  from the granule index when asked, with a cost bound. `tsdb_query_totals_get` sums what the queries of a handle
+  did. Nothing is added to the write path. tsdbd's metrics port gains `tsdb_logical_bytes`, `tsdb_ts_bytes`,
+  `tsdb_value_bytes`, `tsdb_index_bytes`, `tsdb_other_bytes`, the `tsdb_stats_*` progress families, the
+  `tsdb_query_*_total` counters and `tsdb_major_faults_total` (docs/metrics.md); there are no per-tenant metrics.
+  `tsdb DIR stats` now reports the bytes by type and where they go (it used to assume 12 bytes a row for every
+  type), and `tsdb DIR stats series NAME...` prints the numbers of single series.
+- **Tenants, hot series and page-cache residency** (`docs/design-stats.md`, steps 3 and 4; embedded API and CLI only).
+  A tenant is a prefix of series names (`tsdb_options.tenants` or `tsdb_set_tenants`; the longest prefix a name starts
+  with wins, the rest are "(none)"). The sweeper keeps each partition's share per tenant, so a tenant's totals are the
+  sum of what is stored: `tsdb_tenant_stats_get` gives series, active series, rows, nulls, bytes, ingested and merged
+  rows, retention drops, sampled resident bytes (`mincore`, `stats_resident_s`) and how stale the numbers are
+  (`stats_recompute_s`; a list change or a sweep in progress sets `TSDB_TENANT_PARTIAL`). `tsdb_hot_series` lists the
+  series with the most reads, rows written or bytes per row. `tsdb DIR stats tenants [PREFIX...] [--volumes] [--tenants
+  FILE]` and `tsdb DIR stats hot [reads|writes|bytes] [-k N]` print them (reads and writes are counted by a running
+  server, so the CLI shows none). Per-tenant numbers are never put on the metrics port, and `tsdbd` has no op for them.
+- **Change feed, step F1: the disk side** (docs/design-cdc.md). Off by default; with it off nothing changes on disk or in
+  timing. `tsdb DIR feed enable [--retention AGE] [--max-bytes N] [--min-free-pct N]`, `feed disable`, `feed info` and `feed
+  new-id` (and `tsdb_feed_enable`, `tsdb_feed_disable`, `tsdb_feed_new_id`, `tsdb_feed_info_get` in `tsdb.h`) turn it on and
+  off, refused beside a running writer; a half-finished enable or disable is finished at the next open, the root volume
+  deciding for all. Every volume then has `FEED` and `FEEDSLOTS` and `requires=feed` in META (a binary without the feed
+  refuses it), and WAL segments the engine no longer needs are kept as `fwal_<seq>.log`; a cleaner thread removes them
+  after 24 h or beyond 64 GiB per volume (the oldest first, never the newest), or at once when the disk has less than 10%
+  free. Nothing reads the retained segments yet (F2). `jepsen --feed` runs the kv workload with it on.
+- **Marker payloads and the namespace-event hook** (docs/design-ha-modes.md 2.1): `COMMIT`, `DROP`, `RETENTION` and
+  `EPOCH` have one encoder and one decoder (`src/marker.c`, fuzzed), the type numbers of the feed's and the cluster's
+  other markers are reserved, and the engine calls a no-op `jr_intent` / `jr_commit` hook where names and files
+  become visible. No backend yet: no marker is written outside the tests.
+- **The cluster's metadata group, a preview** (`docs/design-cluster.md`, `docs/design-ha-modes.md` section 7.1). `tsdbd
+  --cluster --cluster-secret-file F --state-dir DIR` starts a cluster thread that joins a Raft group of servers on a peer
+  port of its own (`--peer-port`, default the client port + 1; `--peer-listen`, `--advertise`, `--rack`, `--power-feed`,
+  `--bmc`, `--read-barrier on|off`); `tsdbd --witness --cluster` is a voter without data (no `--dir`). `tsdb cluster init
+  PEER`, `node add`, `status` and `secret` set up and inspect the group (`init` takes `--mode replicated|shared`,
+  `--failover lease|attested|bmc`, `--read-barrier`, `--lease-s`, and the replication and timing options). What exists is
+  the group and its state machine: members, volumes with replicas, owner and epoch, ISR, name slots, shared-volume
+  grants and fences, with a simulator, a checker and fault tests (`make test` runs them; `make meta-soak` is the long
+  one). **What does not exist yet:** nothing in `tsdbd` replicates data, moves a volume or fails over, the proposer's
+  rules for ownership and the time rules are not built, and the client port, the engine and every request are
+  unchanged by `--cluster`. The metadata snapshot is version 2 and the peer protocol version 2; builds of the preview
+  are not compatible with each other across such a change (a cluster is initialised again, not upgraded), and
+  `--state-dir` must be on a local file system (refused on NFS and CIFS). Without `--cluster` nothing of this runs.
 - New status codes -18 (`TSDB_ERR_FEED_GONE`) and -19 (`TSDB_ERR_FEED_RESET`) are reserved in `tsdb.h` for the change
   feed; nothing returns them yet.
-- **Wire protocol 13: every HA body, before the 1.0 freeze** (step S0, the wire half; docs/ha.md 15.4,
-  `include/tsdb_protocol.h`, `include/tsdb_wire.h`). The floor stays 12: the new statuses only answer requests a
+- **Wire protocol 13: HA reply bodies, before the 1.0 freeze** (`docs/ha.md` 15.4, `include/tsdb_protocol.h`,
+  `include/tsdb_wire.h`). The floor stays 12: the new statuses only answer requests a
   client of 12 already sends, and it treats an unknown status as an error. New statuses `TSDB_ERR_MOVED` (-10),
   `TSDB_ERR_UNAVAILABLE` (-11, which already existed without a body), `TSDB_ERR_PARTIAL` (-12) and
   `TSDB_ERR_DROPPED` (-13), each with a body: UNAVAILABLE names the volume, the reason, `retry_after_ms` and the outage;
@@ -62,61 +134,10 @@ disk format and the wire protocol.
   C client keeps a copy of each request until its reply (one more memcpy). A connection gets the bodies only if its
   HELLO said 13 (a client of 12 reads the bare status, as before), and in QUERY_MULTI only the END frame carries the
   body. The Pulsar sink works as before (its tests pass), and treats DROPPED as final (dead letter). **Protocol numbers moved:** `QUERY_LATEST` is protocol 14, the change feed 15, statistics 16.
-- The embedded C ABI is version 7: `tsdb_options` gained `stats` and `stats_sweep_mb_s` (4) and `latest_cache` (5), then
-  `stats_recompute_s`, `stats_resident_s`, `tenants` and `ntenants`, and `tsdb_volume_stats.stats_tmap_bytes` (6), and
-  `tsdb_latest_stats` with `tsdb_get_latest_stats` (7); the
-  Rust, Python and Java bindings carry them. The statistics and the latest table change neither the wire protocol
-  nor the disk format.
-
-### Added
-
-- **Change feed, step F1: the disk side** (docs/design-cdc.md). Off by default; with it off nothing changes on disk or in
-  timing. `tsdb DIR feed enable [--retention AGE] [--max-bytes N] [--min-free-pct N]`, `feed disable`, `feed info` and `feed
-  new-id` (and `tsdb_feed_enable`, `tsdb_feed_disable`, `tsdb_feed_new_id`, `tsdb_feed_info_get` in `tsdb.h`) turn it on and
-  off, refused beside a running writer; a half-finished enable or disable is finished at the next open, the root volume
-  deciding for all. Every volume then has `FEED` and `FEEDSLOTS` and `requires=feed` in META (a binary without the feed
-  refuses it), and WAL segments the engine no longer needs are kept as `fwal_<seq>.log`; a cleaner thread removes them
-  after 24 h or beyond 64 GiB per volume (the oldest first, never the newest), or at once when the disk has less than 10%
-  free. Nothing reads the retained segments yet (F2). `jepsen --feed` runs the kv workload with it on.
-
-- **Marker payloads and the namespace-event hook** (docs/design-ha-modes.md 2.1): `COMMIT`, `DROP`, `RETENTION` and
-  `EPOCH` have one encoder and one decoder (`src/marker.c`, fuzzed), the type numbers of the feed's and the cluster's
-  other markers are reserved, and the engine calls a no-op `jr_intent` / `jr_commit` hook where names and files
-  become visible. No backend yet: no marker is written outside the tests.
-- `tsdb_upgrade(dir)` in `tsdb.h` and `tsdb DIR upgrade` (above).
-- **Statistics of what is stored and of what queries did** (`docs/design-stats.md`, steps 1 and 2).
-  `tsdb_options.stats` (-1 off, 0 lazy, 1 from the open; tsdbd runs with 1, `--no-stats` turns it off) and
-  `stats_sweep_mb_s` (a hard cap on the sweeper's index reads, default 256). `tsdb_volume_stats` gains the logical
-  bytes (rows x (8 + the value width of the series' type)), the compressed timestamp and value bytes, the index
-  and the rest, and the sweeper's progress and CPU time; `tsdb_stats_settle` waits for it. `tsdb_series_stats` gives
-  rows, nulls, bytes, parts, granules, the time range and the last write of up to 65,536 series per call, computed
-  from the granule index when asked, with a cost bound. `tsdb_query_totals_get` sums what the queries of a handle
-  did. Nothing is added to the write path. tsdbd's metrics port gains `tsdb_logical_bytes`, `tsdb_ts_bytes`,
-  `tsdb_value_bytes`, `tsdb_index_bytes`, `tsdb_other_bytes`, the `tsdb_stats_*` progress families, the
-  `tsdb_query_*_total` counters and `tsdb_major_faults_total` (docs/metrics.md); there are no per-tenant metrics.
-  `tsdb DIR stats` now reports the bytes by type and where they go (it used to assume 12 bytes a row for every
-  type), and `tsdb DIR stats series NAME...` prints the numbers of single series.
-- **QUERY_LATEST over the wire, protocol 14** (`docs/design-latest.md` step 3). New op 39: the newest row of up to
-  1,048,576 series by id (optionally as of a time, one `end` or one per id, and with nulls), answered in frames of
-  at most 65,536 records of 24 bytes in index order; CANCEL stops it between frames. It needs the right `read` on each
-  series (`auth_ops`); a denied id and a missing one look alike (`TSDB_ERR_DENIED`) unless the user has `read` on
-  `all` (then `TSDB_ERR_NOTFOUND`). The floor stays 12, a client below 14 asked for `latest` fails with
-  `TSDB_ERR_INVALID` without sending. All four clients have `latest` and `latest_by_name` (C `tsdbc_latest`,
-  Rust `Client::latest`, Python `latest`, Java `latest`; the embedded bindings too; names resolve through a
-  per-connection cache, so a name outside the user's grants answers DENIED in its own record), and the CLI has
-  `tsdb DIR latest NAME... [--with-nulls] [--end T]`. `tsdbd --latest-cache BYTES` sets the table's budget. Metrics:
-  `tsdb_latest_*` (docs/metrics.md). The jepsen kv workload writes nulls and checks every latest answer against the
-  acknowledged writes.
-- **The latest table** (engine, `docs/design-latest.md` step 2): per volume, the newest non-null row of every series in
-  the parts (or a bound on it), kept exact by every listing of parts (flush, insert, replay, delete, replace), by
-  retention and by `tsdb_drop_before`, and filled by a background warmer. `tsdb_latest` answers from it in O(1) and
-  falls back to the slow path for an entry that is unknown. New option `latest_cache` (bytes; `tsdb_options_init` sets
-  RAM/16, 0 turns the table off; followers have none). Large flushes (50,000 series or more) store their rows in a
-  window that lookups can read.
-
-Hardening from the 0.9.1 security review (the minor findings). No format or protocol change.
 
 ### Fixed
+
+Fixes from the 0.9.1 security review (the minor findings, no format or protocol change), the merge barrier, and the flush stall.
 
 - **A memtable flush no longer stalls appends and lookups for 8 to 20 ms (a million series).** After a flush swapped in
   a fresh memtable, the first row with a high series id grew its series array (40 MB at 10^6 series) with `realloc`
@@ -162,8 +183,7 @@ Hardening from the 0.9.1 security review (the minor findings). No format or prot
   every 2 s, which a load-independent floor (the busiest run had 60 restarts in 20 s) leaves to honest runs. The
   reaction line is always printed. `make jepsen-selftest` plants a nemesis that sleeps through its naps
   (`--mutant-idle`) and one that naps 5 s at a time (`--mutant-longnap`) and requires the check to fail for both.
-
-- **A damaged part is a merge barrier, not a stop for its whole partition.** Since 0.9.1 a part that a merge found
+- **A damaged part is a merge barrier, not a stop for its whole partition.** In 0.9.1 a part that a merge found
   damaged (an index that no longer matches its checksum, or a granule it could not decode) took its whole partition out
   of merges, so the partition's part count grew with every insert until the part was restored (a mapping and a
   descriptor per part, slower queries). Merges combine adjacent block ranges only, so the ranges below and above the
@@ -177,6 +197,28 @@ Hardening from the 0.9.1 security review (the minor findings). No format or prot
   and the merge thread over a partition with deletes and a replace, answers of every query kind identical, with
   `verify_checksums` on and off and after a reopen; `test_merge_barrier_bounded`: a stream of inserts keeps the part
   count at 300).
+
+### Known limitations
+
+The list of 0.9.0 and 0.9.1 below still holds, with these changes:
+
+- The disk format (9) and the wire protocol (14) may still change in a 0.x release; they freeze at 1.0
+  (docs/compatibility.md). A database of another format is refused at open; 0.9.x databases go through
+  `tsdb DIR upgrade` or export and import.
+- The cluster (`tsdbd --cluster`) is a preview: the metadata group only. No data replication, no failover, no
+  placement, no rolling upgrade of the peer protocol; shared-storage failover (docs/ha.md) is designed, not built.
+- The change feed is the disk side only and off by default: segments are kept (`tsdb DIR feed enable`), nothing reads
+  them yet (no reader, no wire op), and `TSDB_ERR_FEED_GONE` and `TSDB_ERR_FEED_RESET` are never returned.
+- Tenants, hot series and residency (`tsdb_tenant_stats_get`, `tsdb_hot_series`, `tsdb DIR stats tenants|hot`) are
+  in the embedded API and the CLI only; `tsdbd` and the clients have no op for them, and the metrics port carries no
+  per-tenant numbers.
+- Storage outage handling (`--health-domain`) is still the first step of 0.9.1 (no discovery of domains from the
+  mounts, no deadline for a parked request, no queue bound per volume). The clients now decode `TSDB_ERR_UNAVAILABLE`
+  and the other HA statuses (protocol 13) and retry UNAVAILABLE within a budget, but tsdbd sends only UNAVAILABLE.
+- Merges do not retry a part with a damaged granule, and an insert into its partition goes on (the part count of the
+  partition grows) until the part is restored from a backup; the ranges on either side of it are merged.
+- Parts of an upgraded database keep their 24-byte format-8 headers until merges rewrite them; a 1.0 will refuse such
+  a part (`docs/tasks/pre-1.0-v8-parts.md`).
 
 ## [0.9.1] - 2026-11-07
 

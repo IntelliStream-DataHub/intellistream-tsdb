@@ -4,6 +4,7 @@
 
 | version | supported |
 |---|---|
+| 0.10.x | yes: security fixes go into the latest 0.10.x release |
 | 0.9.x | yes: security fixes go into the latest 0.9.x release |
 | older | there are none; 0.9.0 is the first release |
 

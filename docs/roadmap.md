@@ -11,6 +11,15 @@ series store underneath; tsdb does not duplicate it.
 
 ## Done
 
+- 0.10.0 (2026-11-08), a minor release that changes the disk format (9: a log number in every WAL record, a 48-byte
+  part header, an `FNO` file per volume, `META requires=`; `tsdb DIR upgrade` carries a 0.9.x database over, or export
+  and import) and the wire protocol (13: the HA reply bodies, 14: `QUERY_LATEST`; floor 12) and the C ABI (7). New:
+  the latest value of every series (`tsdb_latest`, `QUERY_LATEST`, all four clients, the CLI), statistics of what is
+  stored and of what queries did, with tenants, hot series and residency in the embedded API and the CLI, the disk side
+  of the change feed (step F1, **off by default**: `tsdb DIR feed enable` keeps WAL segments, nothing reads them yet),
+  and the metadata group of the cluster (steps 0 and 1 of docs/design-ha-modes.md, **a preview**: `tsdbd --cluster`,
+  `tsdb cluster ...`; no replication and no failover). A damaged part is now a merge barrier, and the minor findings of
+  the 0.9.1 security review are fixed (CHANGELOG.md).
 - 0.9.1 (2026-11-07), a patch release (CHANGELOG.md): two data fixes (a dropped partition that came back after a
   crash while a merge of it ran; inserts that waited for ever on a partition with a damaged part), the first step of
   storage outage handling on NFS (`--health-domain`, `TSDB_ERR_UNAVAILABLE`, in-place recovery of a volume,
@@ -84,19 +93,27 @@ otherwise:
 
 ## Next
 
-What comes after 0.9.1, in the order it is likely to be done. The format and the protocol freeze at 1.0, so what
+What comes after 0.10.0, in the order it is likely to be done. The format and the protocol freeze at 1.0, so what
 changes them goes before it:
 
-1. TLS for the client port (and the metrics port), with `SCRAM-SHA-256-PLUS` channel binding: the one thing logins
+1. The change feed's reader (docs/design-cdc.md, step F2 and on): a wire op (protocol 15) and the clients, on top of the
+   segments that F1 keeps. Until then the feed is off by default and has no consumer.
+2. Statistics over the wire (docs/design-stats.md; protocol 16): tenants, hot series and residency are in the embedded
+   API and the CLI only today, and the metrics port carries no per-tenant numbers on purpose.
+3. The cluster beyond its metadata group (docs/design-cluster.md, docs/design-ha-modes.md): the proposer's rules and
+   the time rules (N7), data replication, failover and placement. It must not need another format or protocol
+   change after 1.0: what 1.0 needs of it is in docs/design-cluster.md section 11.
+4. TLS for the client port (and the metrics port), with `SCRAM-SHA-256-PLUS` channel binding: the one thing logins
    still lack (SECURITY.md). It needs no protocol break (a flag), so it may come after 1.0.
-2. The comparison of the CPU unpack kernels on the machines the user measures on (Zen 4 and Zen 5 at v4, with the
+5. The comparison of the CPU unpack kernels on the machines the user measures on (Zen 4 and Zen 5 at v4, with the
    AVX2 kernel switched on by `-DTSDB_UNPACK_AVX2` and `build/decode-bench`; VBMI and BMI2 variants, see the tasks in
    docs/tasks): it waits for those measurements, and it needs no format change.
-3. Anything from the 0.9.x field use that changes the format or the protocol, and the VALUE_PROPOSITION.md above.
-4. What 0.9.1 left of NFS outage handling (docs/ha.md section 15): discovery of domains from the mounts, parked
-   requests with a deadline, a bounded queue per volume, SIGTERM while a call is stuck, metrics, and
-   `TSDB_ERR_UNAVAILABLE` in the clients' status text; and `tsdb_latest` in tsdbd, the protocol and the clients
-   (docs/design-latest.md), which changes the protocol and so goes before 1.0.
+6. Before 1.0: the format-8 part headers that an upgraded database keeps until merges rewrite them are refused
+   (docs/tasks/pre-1.0-v8-parts.md), and anything from field use that changes the format or the protocol, and the
+   VALUE_PROPOSITION.md above.
+7. What 0.9.1 left of NFS outage handling (docs/ha.md section 15): discovery of domains from the mounts, parked
+   requests with a deadline, a bounded queue per volume and SIGTERM while a call is stuck. (The clients decode
+   `TSDB_ERR_UNAVAILABLE` and the other HA statuses since protocol 13, and `tsdb_latest` is in tsdbd since 14.)
 
 After 1.0: failover with one writer per volume, then the rows of the next table.
 
@@ -104,7 +121,7 @@ After 1.0: failover with one writer per volume, then the rows of the next table.
 
 | feature | notes |
 |---|---|
-| Failover with one writer per volume | designed in docs/ha.md (NFS outage handling: first step done in 0.9.1) |
+| Failover with one writer per volume | designed in docs/ha.md (NFS outage handling: first step done in 0.9.1; the metadata group it will run on is a preview in 0.10.0) |
 | TLS | logins and per-series rights came in 0.9.0 (docs/design-auth.md); without TLS data and login exchanges travel in the clear, so tsdbd belongs on a trusted network until then. With TLS the server offers `SCRAM-SHA-256-PLUS` (channel binding, design-auth.md A3): a flag, not a protocol break |
 | Store on change (opt-in, per series) | keep a row only when the value changes, plus a heartbeat row after a maximum gap so a silent sensor is not mistaken for a steady one (decided on 2026-10-26). Measured on 2026-10-26 (1000 series x 86,400 rows, sizes compared to keeping every row): it pays where values repeat and timestamps jitter (slow float32 0.09x, door 0.007-0.03x, 5-state mode 0.01-0.03x, counter 0.11-0.12x; raw-row queries 11-312x faster), saves less with exactly regular timestamps (0.2-0.9x: they already cost 0.03 bits a row), and costs on series that change almost every sample (1.11x jittered) and on most real hydraulic sensors (14 of 17 larger, up to 1.16x), so it stays opt-in per series. Step TWA gives identical answers on both; a client-side filter costs about 1 ns a row. Exact equality only by default (a deadband threshold would be lossy compression). Counts and plain averages then count stored rows; time-weighted averages and the `state` type stay right. Start in the clients and the Pulsar connector (no engine or format change); an engine option in the series dictionary only if that is not enough, before the 1.0 freeze |
 | Interpolation at query time (resampling to a finer or regular grid) | decided on 2026-10-26, replacing the earlier "not planned". A query names a range, an output step and a method, and gets one value per step: previous value (step, last observation carried forward), nearest, linear, monotone cubic (PCHIP, never overshoots the readings) and Akima (smooth, little ripple). All five are local (two readings on each side at most), so they run one granule run at a time like the TWA code, whose rules they reuse: the reading before the range is carried in, nulls and gaps longer than `max_gap_ms` give null instead of a made-up value, deleted and expired readings do not exist. bool and state allow previous and nearest only. One timestamp gives the value at a time. A cap on output points like the bucket limits; written without FMA so every CPU level gives the same values. A new operation in the protocol, in all four clients and the embedded bindings in one change. Pairs with store on change: previous value rebuilds the regular series from changes only |

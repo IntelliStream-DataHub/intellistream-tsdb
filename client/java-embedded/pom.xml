@@ -10,7 +10,7 @@
        into a repository of the tree's build (build/m2), not into the ~/.m2 that other trees share. -->
   <groupId>ai.intellistream</groupId>
   <artifactId>tsdb-embedded</artifactId>
-  <version>0.9.1</version>
+  <version>0.10.0</version>
   <packaging>jar</packaging>
 
   <name>tsdb-embedded</name>
@@ -48,7 +48,7 @@
     <dependency>
       <groupId>ai.intellistream</groupId>
       <artifactId>tsdb-client</artifactId>
-      <version>0.9.1</version>
+      <version>0.10.0</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>

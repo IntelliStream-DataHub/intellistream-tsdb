@@ -2385,10 +2385,14 @@ static void test_wait_merges_failing(const char *scratch)
     o.wal_max_batch_rows = 100;
     o.merge_idle_s = 1000000;
     tsdb *db;
-    OK(tsdb_open(dir, &o, &db));
     int was = atomic_load(&wait_stall_ms);
     atomic_store(&wait_stall_ms, 2500);
-    atomic_store(&merge_fault_ms, 5000); /* every merge runs 5 s, then fails; 1 s back-off between them */
+    /* Every merge runs 5 s, then fails; 1 s back-off between them. Set before the open: the merge thread starts
+     * with it and sees MW_PARTS parts at once, so a hook set after the open lost a race under load (a starved
+     * test thread let one real merge of about 100 parts through, the partition fell under the delay limit and
+     * the insert returned at once: ms >= 4000 failed in about 1 run in 18 at 128 busy loops). */
+    atomic_store(&merge_fault_ms, 5000);
+    OK(tsdb_open(dir, &o, &db));
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     /* first failure after 5 s, then 2.5 s: about 8 s. The old clock gained at most 1 s per 6 s cycle: 15 s or more */

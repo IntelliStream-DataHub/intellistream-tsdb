@@ -42,7 +42,7 @@ Start Java with `--enable-native-access=ALL-UNNAMED` so that it allows the calls
    ```sh
    cd client/java
    mvn -q package -DskipTests
-   java -cp target/tsdb-client-0.9.1.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070 admin /tmp/tsdb-demo/password
+   java -cp target/tsdb-client-0.10.0.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070 admin /tmp/tsdb-demo/password
    ```
 
 3. To use the client in your own Maven project, install it into your local Maven repository with `mvn install`
@@ -52,7 +52,7 @@ Start Java with `--enable-native-access=ALL-UNNAMED` so that it allows the calls
    <dependency>
      <groupId>ai.intellistream</groupId>
      <artifactId>tsdb-client</artifactId>
-     <version>0.9.1</version>
+     <version>0.10.0</version>
    </dependency>
    ```
 
@@ -445,7 +445,7 @@ one or more connections, and prints rows per second and bytes per row.
 ../../build/tsdb-bench --export /tmp/x.rb --series 10 --points 100000
 ../../build/tsdbd --dir /tmp/bench-db --port 7070 &
 mvn -q package -DskipTests
-java --enable-native-access=ALL-UNNAMED -cp target/tsdb-client-0.9.1.jar \
+java --enable-native-access=ALL-UNNAMED -cp target/tsdb-client-0.10.0.jar \
     ai.intellistream.tsdb.bench.InsertBench /tmp/x.rb --port 7070 --conns 4 --compression 1
 ```
 

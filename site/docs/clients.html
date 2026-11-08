@@ -76,7 +76,7 @@ VIRTUAL_ENV=/tmp/tsdb-venv /tmp/tsdb-venv/bin/maturin develop --release</code></
 <pre><code class="language-xml" data-src="client/java/README.md#Quick start">&lt;dependency&gt;
   &lt;groupId&gt;ai.intellistream&lt;/groupId&gt;
   &lt;artifactId&gt;tsdb-client&lt;/artifactId&gt;
-  &lt;version&gt;0.9.1&lt;/version&gt;
+  &lt;version&gt;0.10.0&lt;/version&gt;
 &lt;/dependency&gt;</code></pre>
 </div>
 </div>
@@ -341,7 +341,7 @@ public final class Example {
 <p class="code-source">client/java/src/main/java/ai/intellistream/tsdb/example/Example.java. Build and run it:</p>
 <pre><code class="language-sh" data-block="2" data-src="client/java/README.md#Quick start">cd client/java
 mvn -q package -DskipTests
-java -cp target/tsdb-client-0.9.1.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070 admin /tmp/tsdb-demo/password</code></pre>
+java -cp target/tsdb-client-0.10.0.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070 admin /tmp/tsdb-demo/password</code></pre>
 </div>
 </div>
 <p>Times are milliseconds since 1970 in UTC. The Oslo days are worked out by the client: the server knows only UTC

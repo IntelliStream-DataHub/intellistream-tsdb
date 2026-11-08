@@ -407,6 +407,9 @@ static void test_modes(const char *base)
     snprintf(dir, sizeof dir, "%s/modes", base);
     OK(mkdir(dir, 0755));
     tsdb_options o = base_opts();
+    /* the latest table's warmer is a thread that comes and goes on its own time (it ends when it has nothing left
+     * to warm): with it on, the thread counts below fail under load. This test counts the sweeper's thread. */
+    o.latest_cache = 0;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
     tsdb_sid id;
@@ -626,15 +629,24 @@ static void test_open_overflow(const char *base)
         put_rows(db, id, TSDB_FLOAT64, T0 + k * 2 * DAY, 60000, 0, 1100);
     tsdb_close(db);
     atomic_store(&stats_ring_cap, 1);
-    atomic_store(&stats_open_reconciles, 0);
-    OK(tsdb_open(dir, &o, &db));
-    CHECK(atomic_load(&stats_open_reconciles) == 0);
-    check_volumes(db, "after an open that overflowed the ring");
-    tsdb_volume_stats vs;
-    OK(tsdb_get_volume_stats(db, 0, &vs));
-    CHECK(vs.stats_ring_overflows > 0 && vs.stats_parts_listed >= 1500);
+    /* Whether the ring overflows during an open is a race between load_parts and the sweeper (it drains each part
+     * as it is pushed when it is scheduled between two pushes), so a run that did not overflow proves nothing about
+     * the guard: open again, up to 20 times, until one did. Every open, overflowed or not, must pass the checks;
+     * on a quiet machine the first overflows, and a starved loader (a machine under load) needs a few more. */
+    bool overflowed = false;
+    for (int attempt = 0; attempt < 20 && !overflowed; attempt++) {
+        atomic_store(&stats_open_reconciles, 0);
+        OK(tsdb_open(dir, &o, &db));
+        CHECK(atomic_load(&stats_open_reconciles) == 0);
+        check_volumes(db, "after an open that overflowed the ring");
+        tsdb_volume_stats vs;
+        OK(tsdb_get_volume_stats(db, 0, &vs));
+        CHECK(vs.stats_parts_listed >= 1500);
+        overflowed = vs.stats_ring_overflows > 0;
+        tsdb_close(db);
+    }
+    CHECK(overflowed);
     atomic_store(&stats_ring_cap, 4096);
-    tsdb_close(db);
 }
 
 /* last_write_ms is the part header's write time, which a merge carries over from its inputs: a merge and a reopen

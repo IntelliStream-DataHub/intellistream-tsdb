@@ -196,9 +196,13 @@ have to be unpacked are unpacked in parallel.
 
 More detail: [docs/design.md](docs/design.md).
 
-**Version 0.9.1** ([CHANGELOG.md](CHANGELOG.md)) follows 0.9.0, the first release. The disk format and the wire protocol
-may still change in a 0.9.x release and freeze at 1.0; what that means for your data is in
-[docs/compatibility.md](docs/compatibility.md). `tsdbd --version` and `tsdb --version` print the version.
+**Version 0.10.0** ([CHANGELOG.md](CHANGELOG.md)) follows 0.9.1. It changes the disk format (9) and the wire protocol
+(14, and it still talks to protocol 12); a 0.9.x database is carried over with `tsdb DIR upgrade` or export and import
+(see the changelog). It adds the latest value of every series, statistics of what is stored, and two things that are
+not for production yet: the change feed (off by default, nothing reads it) and the cluster's metadata group
+(`tsdbd --cluster`, a preview: no replication, no failover). The disk format and the wire protocol may still change in
+a 0.x release and freeze at 1.0; what that means for your data is in [docs/compatibility.md](docs/compatibility.md).
+`tsdbd --version` and `tsdb --version` print the version.
 
 ## Getting started
 

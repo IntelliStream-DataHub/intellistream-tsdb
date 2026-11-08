@@ -6,7 +6,7 @@
 
   <groupId>ai.intellistream</groupId>
   <artifactId>tsdb-client</artifactId>
-  <version>0.9.1</version>
+  <version>0.10.0</version>
   <packaging>jar</packaging>
 
   <name>tsdb-client</name>
