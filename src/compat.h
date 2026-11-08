@@ -217,6 +217,7 @@ static inline int tsdb_thread_create(pthread_t *t, void *(*fn)(void *), void *ar
 #ifdef __APPLE__
 static inline void tsdb_free_big(void *p, size_t n) { free(p); }
 #else
+#include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #define TSDB_FREE_BIG_MIN ((size_t)4 << 20)   /* below this the plain free is as fast as the slicing */
