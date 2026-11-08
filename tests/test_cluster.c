@@ -1662,6 +1662,19 @@ static void power_loss(int snaps)
         printf("  skipped: no %s\n", so);
         return;
     }
+    /* the ASan runtime must come first in the library list: with crashfs preloaded the server refuses to start */
+    int asan = 0;
+#if defined(__SANITIZE_ADDRESS__)
+    asan = 1;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    asan = 1;
+#endif
+#endif
+    if (asan) {
+        printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
+        return;
+    }
     static char pe[PATH_MAX * 2 + 128];
     char st[PATH_MAX + 160];
     snprintf(st, sizeof st, "%s/n0/state", base);
