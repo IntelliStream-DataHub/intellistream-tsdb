@@ -2043,9 +2043,13 @@ static void pump(void)
  * gone for hours. The heartbeats and the Raft messages still run (the worker has the sync), so it hands leadership to
  * the voter that holds most of its log (the core's transfer: TimeoutNow once that voter has everything) and steps
  * down on the higher term. Tried again every second while the same sync is out. */
-static void sync_stall_check(uint64_t now)
+static void sync_stall_check(void)
 {
-    if (!C.sync_since || C.role != RAFT_LEADER || now - C.sync_since < C.stall_ns || now < C.xfer_next)
+    /* a fresh clock: the loop's `now` was read before pump() handed a sync to the worker, so sync_since can be
+     * later than it, and the unsigned difference would read as hours (a stall at every round, leadership flapping) */
+    uint64_t now = iso_now_ns();
+    if (!C.sync_since || C.role != RAFT_LEADER || now < C.sync_since || now - C.sync_since < C.stall_ns ||
+        now < C.xfer_next)
         return;
     C.xfer_next = now + 1000 * MS;
     const raft_config *cfg = raft_get_config(C.r);
@@ -3580,7 +3584,7 @@ static void *cluster_main(void *arg)
             if (C.r && !C.sync_since && raft_log_floor_due(C.log, raft_get_commit(C.r), now))
                 sync_round();
             if (C.r)
-                sync_stall_check(now);
+                sync_stall_check();
         }
         copy_flush(now, 0);
         if (now >= C.next_hb) {

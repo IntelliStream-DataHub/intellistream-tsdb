@@ -440,6 +440,10 @@ static void check_all_agree(int leader_i, uint32_t members)
             die("server %d (core) names leader %" PRIu32 ", the leader says %" PRIu32, i, v.st.leader, leader);
         if (members && v.m.nmembers != members)
             die("server %d sees %" PRIu32 " members, expected %" PRIu32, i, v.m.nmembers, members);
+        /* no stalled disk here: a leader that hands leadership on has misread a sync as stalled (the clock read
+         * before the sync began made its age 2^64 - x: has1-cl6, leadership flapping and a reseed that never ended) */
+        if (log_has(i, "handing leadership"))
+            die("server %d handed leadership on although no disk stalled", i);
         view_free(&v);
     }
 }
