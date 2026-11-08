@@ -153,8 +153,18 @@ int feedcheck_dir(const char *dir, bool crashed, char *why, size_t cap)
             snprintf(why, cap, "%s vanished during the check", name);
             rc = 1;
         } else if (recs < 0) {
-            /* a wal_ may be torn only as the newest segment of a crashed directory */
-            if (s[i].retained || !crashed || i + 1 < n) {
+            /* a wal_ may be torn only as the newest segment of a crashed directory, or when every newer one is an
+             * empty wal_: mt_flush creates wal_N+1 before it syncs the rest of wal_N (nothing writes to N+1 until that
+             * sync is done and nobody was acknowledged for the rest), so a power loss in between leaves exactly that;
+             * the open cuts the tail of N and unlinks the empty N+1 */
+            bool tail_empty = true;
+            for (int j = i + 1; j < n && tail_empty; j++) {
+                char nm[64];
+                uint64_t f2, l2;
+                snprintf(nm, sizeof nm, "wal_%016" PRIx64 ".log", s[j].seq);
+                tail_empty = !s[j].retained && fc_walk(dirfd, nm, s[j].seq, &f2, &l2) == 0;
+            }
+            if (s[i].retained || !crashed || !tail_empty) {
                 snprintf(why, cap, "%s is torn or damaged", name);
                 rc = 1;
             }

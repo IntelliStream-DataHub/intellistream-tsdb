@@ -962,6 +962,17 @@ static void test_feedcheck(void)
     feedcheck_forget();
     CHECK(feedcheck_dir(bad, true, why, sizeof why) == 0);
     CHECK(feedcheck_dir(bad, false, why, sizeof why) == 0); /* not counted as a name when none is expected */
+    /* mt_flush creates wal_N+1 before it syncs the rest of wal_N: a power loss between leaves a torn wal_N and an empty
+     * wal_N+1 (jepsen --feed --nemesis power, 2026-11-08: wal_61 torn, wal_62 of size 0). The open cuts the tail and
+     * unlinks the empty one, so the checker accepts it; a newer wal_ that holds anything is not that window. */
+    sh("rm -rf '%s' && cp -a '%s' '%s' && cp '%s/fwal_0000000000000004.log' '%s/wal_0000000000000005.log' && "
+       "truncate -s -3 '%s/wal_0000000000000005.log' && : > '%s/wal_0000000000000006.log'", bad, dir, bad, bad, bad, bad,
+       bad);
+    feedcheck_forget();
+    CHECK(feedcheck_dir(bad, true, why, sizeof why) == 0);
+    sh("printf x > '%s/wal_0000000000000006.log'", bad);
+    feedcheck_forget();
+    CHECK(feedcheck_dir(bad, true, why, sizeof why) != 0 && strstr(why, "torn"));
 
     /* (a) a seq gap the engine makes: an empty newest wal_N found at the open is unlinked and the next segment is
      * N+1; no event is lost, so the checker accepts it (the reader goes by log numbers) */
