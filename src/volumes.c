@@ -3487,7 +3487,10 @@ static int up_manifest(const up_dir *d, bool write)
 
 static int up_meta(const up_dir *d, const char *txt)
 {
-    size_t cap = strlen(txt) + 64, n = 0;
+    /* The META is read from a file anyone can damage, and every line is copied or replaced. A line grows by at
+     * most one byte (`version=` and its newline become `version=9` and a newline; a last line without a newline
+     * gets one), so twice the input and room for the added line bound the output. */
+    size_t cap = 2 * strlen(txt) + 64, n = 0;
     char *out = malloc(cap);
     if (!out)
         return TSDB_ERR_NOMEM;

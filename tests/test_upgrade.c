@@ -277,6 +277,37 @@ static void test_refusals(void)
            "writes nothing\n");
 }
 
+/* A damaged META with very many `version=` lines (each grows by a byte when it is rewritten) must not overflow the
+ * buffer that rewrites it: the upgrade finishes and the META says 9. Before the fix the output was sized
+ * strlen + 64 and this wrote tens of kilobytes past it (a crash here, a heap-buffer-overflow under ASan). */
+static void test_meta_many_version_lines(void)
+{
+    char top[PATH_MAX + 16], db[PATH_MAX + 16], mp[PATH_MAX + 32];
+    snprintf(top, sizeof top, "%s/metalines", S);
+    snprintf(db, sizeof db, "%s/db", top);
+    snprintf(mp, sizeof mp, "%s/META", db);
+    unpack(top);
+    size_t n;
+    char *m = slurp(mp, &n);
+    CHECK(m && n > 0);
+    enum { LINES = 40000 };
+    char *big = malloc(n + (size_t)LINES * 9 + 1);
+    if (m && big) {
+        memcpy(big, m, n);
+        size_t k = n;
+        for (int i = 0; i < LINES; i++, k += 9)
+            memcpy(big + k, "version=\n", 9);
+        spit(mp, big, k);
+        CHECK(tsdb_upgrade(db) == 2);
+        CHECK(meta_version(db) == 9);
+        CHECK(tsdb_upgrade(db) == 0);
+    }
+    free(big);
+    free(m);
+    sh("rm -rf '%s'", top);
+    printf("  a META with 40000 version= lines is upgraded without writing past its buffer\n");
+}
+
 static void test_upgrade_and_merge(bool mutant)
 {
     char top[PATH_MAX + 16], db[PATH_MAX + 16], vol[PATH_MAX + 16];
@@ -484,6 +515,7 @@ int main(int argc, char **argv)
     test_upgrade_and_merge(mutant != NULL);
     if (!mutant) {
         test_refusals();
+        test_meta_many_version_lines();
         test_v8_part_not_allowed();
         test_power_loss();
         test_old_binary();
