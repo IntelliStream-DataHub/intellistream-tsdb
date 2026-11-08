@@ -782,7 +782,7 @@ typedef struct part {
     /* the latest table's fold list (latest.c): per series of this pending part, its newest non-null row and the range
      * of its nulls, made by the part writer; the publisher folds and frees it (NULL when the table is off) */
     struct lfold *lf;
-    size_t nlf, lfcap; /* lfcap: the allocation, for tsdb_free_big */
+    size_t nlf;
 } part;
 
 
@@ -1983,8 +1983,8 @@ typedef struct lt_sec {
     const lfold **note; /* the window's folds left for the write section (a null over a known row) */
     size_t nnote, capnote;
     bool noteoom;       /* a note did not fit: the write section folds every list */
-    struct lt_lf { void *p; size_t bytes; } *dfree; /* the fold lists, freed by lt_end after the lock is released: at */
-    size_t ndfree;                                  /* 10^6 series one is 40 MB, and its munmap stalled every lookup */
+    void **dfree; /* the fold lists, freed by lt_end after the lock is released: at 10^6 series one is 40 MB, and its */
+    size_t ndfree; /* munmap (2 ms) stalled every lookup */
 } lt_sec;
 void lt_begin(eng *db, lt_sec *sec);
 /* lt_begin for a flush's parts: a long fold list is stored in a window without the lock (3.2) */

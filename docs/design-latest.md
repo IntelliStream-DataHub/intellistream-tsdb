@@ -1014,7 +1014,7 @@ B the slow path (`WITH_NULLS`, 2 readers x 4,096 ids, 3 repetitions, 15 rounds, 
   "on" kept a worst lookup of 2.2 ms after both: `lt_fold` freed the fold lists (`free(ps[i]->lf)`, 2^20 x 40 B = 40 MB at
   10^6 series, an `munmap` of about 2 ms) inside the table's write section, with `t->rw` held for writing, so every
   lookup waited on it (found by the review of the track: mode off has no fold lists and reached 0.4 ms). `lt_fold` now
-  only collects the lists in the `lt_sec` and `lt_end` frees them through `tsdb_free_big` after `pthread_rwlock_unlock`
+  only collects the lists in the `lt_sec` and `lt_end` frees them (plain `free`: sliced through `tsdb_free_big` the worst lookup stayed at 2.1 ms in every round, unsliced it is 0.2-0.6 ms from round 3, cause not found) after `pthread_rwlock_unlock`
   (`tests/test_latest.c`, `test_lf_free_unlocked`, through the hook `LH_LF_FREE`). They are still freed while the caller's
   `publish_lock` is held (it holds off only other publishers). The listing section (parts listed under `db->lock`) takes
   under 10 us. The cost in appends: the array's pages are touched lazily under `buf_lock` (p50 2 to 4-5 us, p99 with the

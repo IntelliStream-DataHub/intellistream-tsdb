@@ -420,13 +420,13 @@ void lt_fold(eng *db, lt_sec *sec, part **ps, size_t n)
         sec->dfree = calloc(n, sizeof *sec->dfree);
     for (size_t i = 0; i < n; i++) {
         if (ps[i]->lf && sec->dfree)
-            sec->dfree[sec->ndfree++] = (struct lt_lf){ps[i]->lf, ps[i]->lfcap * sizeof *ps[i]->lf};
+            sec->dfree[sec->ndfree++] = ps[i]->lf;
         else if (ps[i]->lf) {
             lt_hook(db, LH_LF_FREE);
-            tsdb_free_big(ps[i]->lf, ps[i]->lfcap * sizeof *ps[i]->lf);
+            free(ps[i]->lf);
         }
         ps[i]->lf = NULL;
-        ps[i]->nlf = ps[i]->lfcap = 0;
+        ps[i]->nlf = 0;
     }
 }
 
@@ -443,9 +443,11 @@ void lt_end(eng *db, lt_sec *sec)
         pthread_mutex_unlock(&t->pmu);
     }
     pthread_rwlock_unlock(&t->rw);
-    for (size_t i = 0; i < sec->ndfree; i++) { /* lt_fold's fold lists, now that lookups can go on */
+    /* lt_fold's fold lists, now that lookups can go on. A plain free (munmap): sliced through tsdb_free_big the worst
+     * lookup stayed at 2.1 ms in every round (latest-bench --mode on, 5 runs), unsliced it is 0.2-0.6 ms from round 3 */
+    for (size_t i = 0; i < sec->ndfree; i++) {
         lt_hook(db, LH_LF_FREE);
-        tsdb_free_big(sec->dfree[i].p, sec->dfree[i].bytes);
+        free(sec->dfree[i]);
     }
     free(sec->dfree);
     hints_push(db, sec->id, sec->n, sec->oom);

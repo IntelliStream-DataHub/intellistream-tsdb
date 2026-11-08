@@ -83,10 +83,10 @@ Hardening from the 0.9.1 security review (the minor findings). No format or prot
   and a `memset` under `buf_lock`, and the flusher's big buffers went back through one `munmap`, which holds the mmap
   lock for writing. The array is now a lazily touched mapping grown by `mremap` (Linux), and buffers of 16 MB and more are handed back
   in 2 MB slices first (`tsdb_free_big`; the page size is the kernel's, not 4096). The latest table's fold lists
-  (40 MB at 10^6 series) are freed by `lt_end` after the table's write lock is released, not inside it (a 2 ms
-  stall of every lookup with the cache on). `latest-bench` at 10^6 series, mean of the worst lookup in a flush round
-  (16 MB build, 5 runs, rounds 2 to 4): 13.6 ms to 0.43 ms (cache off), 15.9 ms to 2.2 ms (on, before the fold-list
-  change; see the track notes for the number after it); worst append 13.5 to 0.84 ms (off). Lookup p99 and flush time
+  (40 MB at 10^6 series) are freed by `lt_end` after the table's write lock is released, not inside it (an `munmap`
+  of 2 ms that stalled every lookup with the cache on). `latest-bench` at 10^6 series, mean of the worst lookup in a flush round
+  (16 MB build, 5 runs, rounds 2 to 4): 13.6 ms to 0.43 ms (cache off), 15.9 ms to 0.2-0.6 ms from the third round of a run (on;
+  the first measured round still shows 2 ms in both modes, a pause not yet explained); worst append 13.5 to 0.84 ms (off). Lookup p99 and flush time
   are unchanged. The price: appends during a flush touch the lazily mapped array's pages under `buf_lock`, so the
   append p50 goes from 2 to 4-5 us and its p99 (cache on) from 7-10 to 16-38 us. No change to the flush's ordering,
   the WAL or what a reader sees.
