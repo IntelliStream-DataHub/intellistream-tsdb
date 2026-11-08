@@ -388,8 +388,9 @@ struct catch_up {
 static int p_caught_up(const struct view *v, void *a)
 {
     const struct catch_up *c = a;
-    return v->st.applied >= c->applied && v->m.applied >= c->applied && (v->m.applied != c->applied ||
-                                                                          meta_hash(&v->m) == c->hash);
+    /* not stale: a restarted voter shows its persisted copy, equal to the leader's, until its core has applied that far */
+    return !v->st.stale && v->st.applied >= c->applied && v->m.applied >= c->applied &&
+           (v->m.applied != c->applied || meta_hash(&v->m) == c->hash);
 }
 
 static size_t node_add_req(int newi, uint8_t *req)
