@@ -304,7 +304,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_out_send
 	./$(B)/test_meta /tmp --seeds 12 --seconds 15
 	tests/meta_mutants.sh $(B)/test_meta_mut
-	TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
+	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	./$(B)/test_wire tests/data/wire13-vectors.txt
