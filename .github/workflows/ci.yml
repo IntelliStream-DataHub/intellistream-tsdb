@@ -64,6 +64,13 @@ jobs:
         run: |
           ulimit -n 65536 || true
           mkdir -p ci-logs
+          # test_cli_users runs the root cases (tests/test_cli_root.sh) as root or in `podman unshare`. Where the
+          # runner can do the latter they are required (a skip would fail the job); where it cannot, say so.
+          if podman unshare true 2>/dev/null; then
+              export TSDB_REQUIRE_ROOT_CASES=1
+          else
+              echo "::warning::podman unshare does not work on this runner: test_cli_users skips the root cases"
+          fi
           make -j"$(nproc)" test IO="$IO_LIST" 2>&1 | tee ci-logs/make-test.log
       - name: Upload logs
         if: failure()

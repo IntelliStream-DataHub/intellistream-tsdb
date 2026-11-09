@@ -1184,6 +1184,18 @@ static void test_retention_lengthened_in_merge(void)
     OK(tsdb_close(db));
 }
 
+/* Waits until *v >= want, at most `ms`; a miss prints what was waited for (a hang is a failure with a message). */
+static bool wait_until(_Atomic long *v, long want, int ms, const char *what)
+{
+    for (int i = 0; i < ms; i++) {
+        if (atomic_load(v) >= want)
+            return true;
+        usleep(1000);
+    }
+    fprintf(stderr, "test_latest: waited %d ms for %s\n", ms, what);
+    return false;
+}
+
 /* Lengthening the limit of OTHER series must not throw away a merge (design-latest.md 3.5 lists across a change). The
  * first version discarded every merge in flight in the volume at every lengthening, so while such calls kept coming
  * tsdb_optimize never finished (starve.c of the review: 8 s and 123 merges, 122 of them discarded, for one that takes
@@ -1247,8 +1259,8 @@ static void test_merges_not_starved(void)
     atomic_store(&ns_calls, 0);
     pthread_t th, wd;
     CHECK(pthread_create(&th, NULL, ns_lengthen, NULL) == 0);
-    while (atomic_load(&ns_calls) < 10)
-        usleep(1000);
+    bool started = wait_until(&ns_calls, 10, 20000, "ns_lengthen to make 10 calls");
+    CHECK(started);
     CHECK(pthread_create(&wd, NULL, ns_watchdog, NULL) == 0);
     OK(tsdb_optimize(ns_db));
     int timed_out = atomic_load(&ns_stop); /* the watchdog ended the run before optimize did */
@@ -1267,7 +1279,8 @@ static void test_merges_not_starved(void)
 
 /* An fdatasync of a WAL file that blocks once armed (T4), the way a slow disk would. The tests link libtsdb.a, so this
  * definition is the one the engine's tsdb_fdatasync reaches. */
-static atomic_int sy_armed, sy_stalled, sy_release;
+static atomic_int sy_armed, sy_release;
+static _Atomic long sy_stalled;
 int fdatasync(int fd)
 {
     if (atomic_load(&sy_armed)) {
@@ -1328,11 +1341,13 @@ static void test_active_over_flushing(void)
 /* T2: a known entry below the drop floor whose row drop_before removed, looked up while the warmer holds its floor
  * walk (it has not stored yet): the lookup reads the entry as unknown and searches. Mutant: lookups read it as known. */
 static atomic_int dc2_hold;
+static _Atomic long dc2_arrived;
 static void dc2_hook(void *arg, int at)
 {
     (void)arg;
     if (at != LH_WARM_AFTER_CUT)
         return;
+    atomic_fetch_add(&dc2_arrived, 1);
     while (atomic_load(&dc2_hold))
         usleep(1000);
 }
@@ -1351,10 +1366,16 @@ static void test_drop_floor_lookup(void)
     tsdb_latest_result r = one(db, id, TSDB_TS_MAX, 0);
     CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == DAY + 5);
     atomic_store(&dc2_hold, 1);
+    atomic_store(&dc2_arrived, 0);
     tsdb_test_latest_hook(db, dc2_hook, NULL);
     OK(tsdb_drop_before(db, 2 * DAY));
+    /* The lookup must run while the warmer is held at its floor walk: wait for it to arrive (it never does if the
+     * hook point is no longer reached, and then this test would check nothing). */
+    bool arrived = wait_until(&dc2_arrived, 1, 10000, "the warmer to reach LH_WARM_AFTER_CUT");
+    CHECK(arrived);
     r = one(db, id, TSDB_TS_MAX, 0);
     CHECK(r.kind == TSDB_LATEST_NONE);
+    CHECK(atomic_load(&dc2_arrived) == 1);
     atomic_store(&dc2_hold, 0);
     tsdb_test_latest_hook(db, NULL, NULL);
     OK(tsdb_close(db));
@@ -1416,8 +1437,13 @@ static void test_sync_visibility(void)
     atomic_store(&sy_armed, 1);
     pthread_t th;
     CHECK(pthread_create(&th, NULL, dc4_writer, &x) == 0);
-    while (!atomic_load(&sy_stalled))
-        usleep(1000);
+    if (!wait_until(&sy_stalled, 1, 10000, "the WAL fdatasync of the append to block")) {
+        CHECK(false);
+        atomic_store(&sy_release, 1);
+        pthread_join(th, NULL);
+        OK(tsdb_close(x.db));
+        return;
+    }
     rowset rr = {0};
     scan(x.db, x.id, &rr);
     CHECK(rr.n == 1 && rr.ts[0] == 10); /* the query sees only the durable row */
