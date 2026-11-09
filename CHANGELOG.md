@@ -67,6 +67,12 @@ live in their own packages, so that the network clients can stay Apache-2.0 with
   follows); `make test-rust`, `test-python` and `test-licenses` cover both packages of each language, and
   `tools/check-version.sh` the pins between them.
 
+### Added
+
+- `tsdb cluster` with no arguments (or `help`) prints the cluster commands and options (it printed the general usage and
+  exited with 2). New tutorial for the cluster preview, [docs/cluster-preview.md](docs/cluster-preview.md): three servers
+  and a witness on one machine, the leader killed and restarted; `tests/test_cluster_tutorial.sh` runs its command block.
+
 ## [0.10.0] - 2026-11-09
 
 **Disk format 9, wire protocol 14 (floor 12, so clients and servers of protocol 12 and up still talk), embedded C ABI 7.**

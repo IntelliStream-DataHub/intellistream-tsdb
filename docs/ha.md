@@ -7,6 +7,8 @@
 > decides who owns a volume and at which epoch (it replaces this document's lock arbitration, rank polling, `NODES`,
 > `OWNERS` and D38), while the NFS lock, the chained fds, the ledger and the ack gate of §2-§3 stay as the fence on
 > the storage. The mode map below says which parts of this document are replaced and which stay shared-mode-only.
+>
+> To try the cluster's metadata group (a preview, 0.10.0) on one machine, see the tutorial [cluster-preview.md](cluster-preview.md).
 
 **Mode map** (2026-11-06; M-numbers are decisions of [design-ha-modes.md](design-ha-modes.md)):
 
