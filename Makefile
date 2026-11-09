@@ -321,7 +321,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
 	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
 
-test-net: $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stability $(B)/tsdbd $(CRASHFS_SO)
+test-net: $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stability $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	./$(B)/test_wire tests/data/wire13-vectors.txt
