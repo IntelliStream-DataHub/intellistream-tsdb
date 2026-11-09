@@ -1171,7 +1171,8 @@ int mt_flush(eng *db)
             db->active = nm;
             if (m->fno_lo) /* it took rows records, and the last of them is the last the WAL took (all under buf_lock) */
                 m->fno_hi = MAX(m->fno_hi, db->fno_rows_hi);
-            wal_rec_close(db);
+            if (eng_test_mutant != MUT_FLUSH_NOCLOSE) /* planted: the tail keeps a header with no count (test_fno) */
+                wal_rec_close(db);
             uint8_t *buf = db->wal_buf;
             size_t len = db->wal_len;
             uint64_t upto = db->wal_appended;

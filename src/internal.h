@@ -48,7 +48,8 @@ typedef struct eng eng;
 #define PART_HDR_V8 24 /* the header of a part written at format 8 */
 /* Planted mutations: a test sets eng_test_mutant (tests link the engine) and must then fail, to show that it
  * catches the bug; nothing in the library or the server ever sets it. */
-enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR };
+enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR,
+       MUT_FLUSH_NOCLOSE };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1612,8 +1613,9 @@ struct eng {
     bool wal_writing;              /* one WAL writer (commit or segment switch) at a time */
     /* What a small write stores to under buf_lock sits in two cache lines of its own, which nothing else writes: a
      * call's critical section moves them and the mutex between cores, and every further line it touched (these
-     * fields lay over five before) cost a 16-thread append loop 1 to 3% (BENCHMARKS.md, Format 9). eng_open_sched
-     * allocates the struct 64-byte aligned for this. */
+     * fields lay over five before) slowed a 16-thread append loop, which queues on this mutex: what one critical
+     * section moves between cores sets the throughput there. eng_open_sched allocates the struct 64-byte aligned for
+     * this. */
     _Alignas(64) pthread_mutex_t buf_lock; /* active memtable and pending WAL bytes */
     struct lw_fence *lw_head;      /* large writes between their memtable flush and their publish (buf_lock) */
     memtable *active;

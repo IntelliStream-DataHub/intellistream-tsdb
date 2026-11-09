@@ -18,7 +18,8 @@
  *    the open that replays a segment of markers only, every number a caller was told is below the next one.
  *
  *   ./build/test_fno [scratch dir]                run from the source directory is not needed
- *   ./build/test_fno --mutant reuse|manifest|markers|nosync [scratch dir]    must fail (nosync: in the power-loss sweeps)
+ *   ./build/test_fno --mutant reuse|manifest|markers|nosync|flushclose [scratch dir]    must fail
+ *                                                  (nosync: in the power-loss sweeps; flushclose: a flush leaves a record open)
  *   ./build/test_fno --child KIND DIR ACKFILE     (internal: a process the shim kills)
  */
 #define _GNU_SOURCE
@@ -704,9 +705,10 @@ static void test_wal_books(void)
     CHECK(rows_of(db) == 13 && fno_of(db) == 16);
     CHECK(eng_close(db) == 0);
 
-#ifdef __linux__
+#if defined(__x86_64__) && defined(__GLIBC__)
     /* the layout: the mutex and what is stored under it in two lines nothing else writes, and the engine's reference
-       count (stored on every call) on a line other than the failure flag (read on every call) */
+       count (stored on every call) on a line other than the failure flag (read on every call). Only where the mutex
+       is 40 bytes (glibc, x86-64): other ABIs size it otherwise and the first line holds fewer fields there. */
     CHECK(_Alignof(eng) == 64);
     CHECK(offsetof(eng, buf_lock) % 64 == 0);
     CHECK(offsetof(eng, wal_appended) + sizeof(uint64_t) - offsetof(eng, buf_lock) == 64);
@@ -736,6 +738,44 @@ static void *racer_run(void *arg)
     while (!atomic_load(r->stop) && r->n < 400000)
         rows(r->db, r->series, r->t0 + (int64_t)r->n++, 1);
     return NULL;
+}
+
+/* A flush hands the open record over: the old segment's tail, written by the flush, parses (its header holds the
+ * count). That tail is what keeps the rows durable until their part is listed, and the feed serves it as it is. A
+ * failed unlink (eng_test_retire_fail) keeps the segment so that the test can read it; the mutant "flushclose" leaves
+ * the record open (the flush then crashes in the seal, or writes a header with no count). */
+static int keep_segment(const char *name)
+{
+    (void)name;
+    return EIO;
+}
+
+static void test_wal_flush_tail(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("walflushtail", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(sync_far(dir, &db) == 0);
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 2);
+    rows(db, s, T0 + 10, 1); /* one open record of 3 rows, still in the buffer */
+    eng_test_retire_fail = keep_segment;
+    CHECK(mt_flush(db) == 0);
+    eng_test_retire_fail = NULL;
+    rec r[4];
+    size_t k = read_records(dir, r, 4);
+    CHECK(k == 1);
+    if (k == 1)
+        CHECK(r[0].kind == WAL_KIND_ROWS && r[0].n == 3 && r[0].fno == 1);
+    CHECK(eng_close(db) == 0);
+    if (open_eng(dir, false, false, &db) == 0) { /* the kept segment replays into no second copy */
+        CHECK(rows_of(db) == 3 && fno_of(db) == 4);
+        CHECK(eng_close(db) == 0);
+    } else {
+        failures++;
+    }
+    printf("  a flush ends the open record: the old segment's tail parses, and a reopen has the rows once\n");
 }
 
 /* A record that reaches the row cap is closed before the next one opens: its header holds its count, so the buffer
@@ -949,6 +989,7 @@ static void set_mutant(const char *mutant)
                       : strcmp(mutant, "manifest") == 0 ? MUT_FNO_MANIFEST_ONLY
                       : strcmp(mutant, "markers") == 0  ? MUT_MARKER_ROWS
                       : strcmp(mutant, "nosync") == 0   ? MUT_FNO_NOSYNC
+                      : strcmp(mutant, "flushclose") == 0 ? MUT_FLUSH_NOCLOSE
                                                         : MUT_NONE;
     if (eng_test_mutant == MUT_NONE) {
         fprintf(stderr, "unknown mutant %s\n", mutant);
@@ -993,6 +1034,7 @@ int main(int argc, char **argv)
         test_replay_markers();
         test_wal_books();
         test_wal_split();
+        test_wal_flush_tail();
         test_wal_races();
         if (!mutant) {
             test_slots();
