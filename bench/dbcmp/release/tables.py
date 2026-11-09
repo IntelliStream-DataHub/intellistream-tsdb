@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """The release run's results as Markdown, each table followed by how it was run.
 
   python3 -I tables.py OUT > tables.md

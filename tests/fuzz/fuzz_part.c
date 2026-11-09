@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Part files: part_open (header, index, footer, tombstones and their checksum)
  * and then every granule through granule_read, with and without checksum

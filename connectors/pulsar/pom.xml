@@ -99,12 +99,12 @@
   <build>
     <resources>
       <!-- src/main/resources (pulsar-io.yaml and THIRD-PARTY-NOTICES under META-INF), then the Apache-2.0 LICENSE and
-           NOTICE of the repository beside them. -->
+           NOTICE of this directory beside them. -->
       <resource>
         <directory>src/main/resources</directory>
       </resource>
       <resource>
-        <directory>${project.basedir}/../..</directory>
+        <directory>${project.basedir}</directory>
         <includes>
           <include>LICENSE</include>
           <include>NOTICE</include>

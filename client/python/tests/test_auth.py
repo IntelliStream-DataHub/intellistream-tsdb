@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Login (SCRAM-SHA-256, protocol 12) and access control through the Rust client: the RFC 7677 §3 exchange byte for
 byte against a fake server (its values read from tests/rfc7677.h, which the C and Rust tests use too), server
 messages that must fail the login, then a real tsdbd with USERS made by the CLI: the right and a wrong password, an

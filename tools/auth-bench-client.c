@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The workloads of tools/auth-bench.sh that tsdbc-bench does not have: inserts of a chosen shape, logins per second,
  * and (with a login) grants in bulk.

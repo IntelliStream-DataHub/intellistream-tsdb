@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * tsdbstat [settle|optimize]: tsdbd's storage statistics after a load (TSDB_HOST:TSDB_PORT).
  *   settle    polls until parts, merges and memtable rows have not changed for 3 s and prints

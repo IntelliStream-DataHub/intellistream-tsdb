@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * USERS and the grant model (server/users.c, docs/design-auth.md §2, §4, §9):
  *  - selectors: user names, normalization (A24), globs against a reference matcher, rights words;

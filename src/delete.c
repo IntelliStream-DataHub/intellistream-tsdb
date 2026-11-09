@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Deletes and replaces of a time range of one series (tomb.c has the design).
  *

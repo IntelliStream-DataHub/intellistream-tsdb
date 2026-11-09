@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Protocol 13 (docs/ha.md 9, 15.4): the HA bodies and what the C client does with them.
  *
  *   codec     every body of include/tsdb_wire.h: encode, decode, every truncation and every one-byte mutation (no read

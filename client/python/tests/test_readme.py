@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The README's quick start runs against a live server."""
 
 import pathlib
@@ -39,29 +40,13 @@ def test_users(readme_server):
         assert out.stdout == printed
 
 
-def test_embedded(tmp_path):
-    text = README.read_text()
-    section = text[text.index("## Embedded") :]
-    code = re.search(r"```python\n(.*?)\n```", section, re.S).group(1)
-    assert '"/tmp/tsdb-embedded"' in code
-    code = code.replace('"/tmp/tsdb-embedded"', repr(str(tmp_path / "db")))
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
-    assert out.returncode == 0, out.stderr
-    assert out.stdout.splitlines() == [
-        "raw  1700000000000 0.0",
-        "raw  1700000060000 1.0",
-        "raw  1700000120000 2.0",
-        "day  1699916400000 47 1081.0",
-        "day  1700002800000 1393 41399.0",
-    ], out.stdout
-
-
-def test_many(tmp_path):
+def test_many(readme_server):
     text = README.read_text()
     section = text[text.index("## Many queries at once") :]
     code = re.search(r"```python\n(.*?)\n```", section, re.S).group(1)
-    assert '"/tmp/tsdb-many"' in code
-    code = code.replace('"/tmp/tsdb-many"', repr(str(tmp_path / "db")))
+    assert code.count("7070") == 2 and '"/tmp/tsdb-demo/password"' in code
+    code = code.replace("7070", str(readme_server.port))
+    code = code.replace('"/tmp/tsdb-demo/password"', repr(str(readme_server.password_file)))
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.splitlines() == [
@@ -72,12 +57,13 @@ def test_many(tmp_path):
     ]
 
 
-def test_analytics(tmp_path):
+def test_analytics(readme_server):
     text = README.read_text()
     section = text[text.index("## Spread, time-weighted") :]
     code = re.search(r"```python\n(.*?)\n```", section, re.S).group(1)
-    assert '"/tmp/tsdb-analytics"' in code
-    code = code.replace('"/tmp/tsdb-analytics"', repr(str(tmp_path / "db")))
+    assert code.count("7070") == 1 and '"/tmp/tsdb-demo/password"' in code
+    code = code.replace("7070", str(readme_server.port))
+    code = code.replace('"/tmp/tsdb-demo/password"', repr(str(readme_server.password_file)))
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.splitlines() == [
@@ -88,12 +74,13 @@ def test_analytics(tmp_path):
     ], out.stdout
 
 
-def test_multi(tmp_path):
+def test_multi(readme_server):
     text = README.read_text()
     section = text[text.index("## Many series in one request") :]
     code = re.search(r"```python\n(.*?)\n```", section, re.S).group(1)
-    assert '"/tmp/tsdb-multi"' in code
-    code = code.replace('"/tmp/tsdb-multi"', repr(str(tmp_path / "db")))
+    assert code.count("7070") == 1 and '"/tmp/tsdb-demo/password"' in code
+    code = code.replace("7070", str(readme_server.port))
+    code = code.replace('"/tmp/tsdb-demo/password"', repr(str(readme_server.password_file)))
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.splitlines() == ["3 [0, 25, 50, 75] 8640.0", "25 94.0", "[1.0, 2.0, 3.0]"]

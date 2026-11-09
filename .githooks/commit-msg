@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # commit-msg: the project's commit rules (AGENTS.md), for people and agents alike.
 #   - no link to a Claude session (Claude-Session trailer, claude.ai/code URL);
 #   - a DCO Signed-off-by, as the last trailer (git commit -s).

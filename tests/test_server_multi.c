@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* QUERY_MULTI and CANCEL (protocol 10) against a tsdbd started here: every inner op answers each series exactly
  * as the single request does, malformed requests get END INVALID alone, and stopping early leaves the connection
  * usable. Usage: test_server_multi [scratch dir]; TSDBD and TSDBD_IO as for test_server. */

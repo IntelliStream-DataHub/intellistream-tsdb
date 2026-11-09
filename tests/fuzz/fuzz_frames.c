@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * fuzz_frames: feeds arbitrary bytes to tsdbd's request path (parse() splits them into frames, handle() decodes
  * and runs each request against a real database) without sockets or threads, and checks the replies.

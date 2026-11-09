@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The query scheduler (src/sched.c): fork/join jobs on one set of helpers per database, groups with caps,
  * rebalancing between groups, nesting, cancel. `make tsan` runs it under ThreadSanitizer. */
 #include "internal.h"

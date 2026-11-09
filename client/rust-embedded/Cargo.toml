@@ -1,0 +1,29 @@
+[package]
+name = "intellistream-tsdb-embedded"
+version = "0.10.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+rust-version = "1.88"
+description = "The tsdb time series database inside your process: the embedded Db, with the C engine built in (AGPL-3.0; the network client is intellistream-tsdb-client, Apache-2.0)"
+publish = false
+readme = "README.md"
+keywords = ["timeseries", "database", "embedded"]
+categories = ["database"]
+
+# imports are `use tsdb_embedded::...`
+[lib]
+name = "tsdb_embedded"
+
+[features]
+# link a prebuilt libtsdb.so (TSDB_LIB_DIR) instead of compiling the engine
+system = ["tsdb-sys/system"]
+# the engine compiled for this CPU (-march=native)
+native = ["tsdb-sys/native"]
+
+[dependencies]
+# The client crate's types, errors and the Database trait. Pinned with `=`: this crate also uses its hidden
+# `__private` module, which carries no semver promise.
+tsdb-client = { package = "intellistream-tsdb-client", version = "=0.10.0", path = "../rust" }
+tsdb-sys = { package = "intellistream-tsdb-sys", path = "../rust-sys" }
+# batch calls (Db::*_many) run on rayon's thread pool
+rayon = "1"

@@ -1,4 +1,5 @@
-//! [`Database`]: the operations a TCP [`Client`] and an embedded `Db` share, so code can be
+// SPDX-License-Identifier: Apache-2.0
+//! [`Database`]: the operations a TCP [`Client`] and the embedded `Db` (another crate) share, so code can be
 //! written once for both. The trait only forwards to the inherent methods, which keep their own
 //! documentation; it takes `&mut self` because a `Client` needs it (a `Db` does not).
 
@@ -13,7 +14,7 @@ use crate::types::{
 };
 use crate::value::{Column, ColumnRef, Value, ValueType};
 
-/// What both a remote [`Client`] and an embedded `Db` (feature `embedded`) can do.
+/// What both a remote [`Client`] and the embedded `Db` (crate `intellistream-tsdb-embedded`) can do.
 ///
 /// ```no_run
 /// use tsdb_client::{Database, QueryOpts};
@@ -368,5 +369,3 @@ macro_rules! forward {
 }
 
 forward!(Client, |self| Client::last_query_stats(self));
-#[cfg(feature = "embedded")]
-forward!(crate::Db, |self| Ok(crate::Db::last_query_stats(self)));

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # bgrun.sh NAME CMD...: start CMD detached and return at once. Output -> $RUNS/NAME/out, exit code -> $RUNS/NAME/rc
 # (written last). Check with await.sh NAME. When SE_QUEUE names a queue wrapper (waits for a free slot on the machine,
 # then execs its arguments) CMD runs behind it; BGRUN_NOWAIT=1 skips the queue for light commands.

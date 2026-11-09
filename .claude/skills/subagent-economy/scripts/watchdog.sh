@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # watchdog.sh [STALL_MIN=45] [PATTERN]: one line per detached job (bgrun.sh) that has no rc yet, and what it is doing:
 #   RUNNING  NAME  out Nm ago, cpu X%      it writes output or uses CPU: leave it
 #   WAITING  NAME  on BENCH.lock held by PID (JOB) for Nm   a flock waiter: fine unless the holder is STALLED

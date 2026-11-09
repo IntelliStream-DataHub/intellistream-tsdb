@@ -1,4 +1,5 @@
-"""Multi-series calls (query_*_multi, protocol version 10) on Client, Pool and Db.
+# SPDX-License-Identifier: Apache-2.0
+"""Multi-series calls (query_*_multi, protocol version 10) on Client and Pool (the tests of Db are tsdb_embedded's test_multi.py).
 
 A multi-series call must answer, series by series and in the order asked, exactly what the
 single-series call answers for that series; a series that fails has its own status and does not
@@ -10,7 +11,7 @@ import pytest
 
 from conftest import Server
 import tsdb_client
-from tsdb_client import Buckets, Client, Db, Many, Pool, TsdbError, TwaBuckets
+from tsdb_client import Buckets, Client, Many, Pool, TsdbError, TwaBuckets
 
 T0 = 1_700_000_000_000 - 1_700_000_000_000 % 86_400_000  # a UTC midnight
 N = 3000  # rows per series, 1 min apart: a little over two days
@@ -46,14 +47,10 @@ def same_rows(a, b):
     return np.array_equal(ma, mb) and np.array_equal(np.ma.getdata(va)[~ma], np.ma.getdata(vb)[~mb])
 
 
-@pytest.fixture(params=["client", "pool", "db"])
+@pytest.fixture(params=["client", "pool"])
 def target(request, server, tmp_path):
     """Each of the three, filled the same way, with what answers the single calls (a Pool has none:
     a Client of its server)."""
-    if request.param == "db":
-        with Db(tmp_path / "db", fsync=False, merge_threads=0) as d:
-            yield d, d, fill(d)
-        return
     with Client("127.0.0.1", server.port, timeout=30) as c:
         ids = fill(c)
         if request.param == "client":
@@ -198,23 +195,3 @@ def test_split_over_65536(server):
                                                   for s in series[65_536:]])
 
 
-def test_embedded_matches_server(tmp_path):
-    """Db and tsdbd over the same directory give the same multi answers."""
-    path = tmp_path / "db"
-    with Db(path, fsync=False, merge_threads=0) as d:
-        f32, other = fill(d)
-        series = f32 + other[:2]
-        emb = (d.query_values_multi(series), d.query_buckets_multi(series, unit="hour", timezone="America/New_York"),
-               d.query_twa_multi(series, interval_ms=7_200_000))
-    srv = Server(tmp_path, dir=path)
-    try:
-        with Client("127.0.0.1", srv.port, timeout=30) as c:
-            tcp = (c.query_values_multi(series), c.query_buckets_multi(series, unit="hour", timezone="America/New_York"),
-                   c.query_twa_multi(series, interval_ms=7_200_000))
-    finally:
-        srv.stop()
-    for i in range(len(series)):
-        assert same_rows(emb[0][i], tcp[0][i])
-        assert emb[1][i] == tcp[1][i]
-        assert emb[2][i] == tcp[2][i]
-    assert np.array_equal(emb[0].offsets, tcp[0].offsets)

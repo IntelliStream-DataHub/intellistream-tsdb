@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # The release version lives in the file VERSION. This checks that every other place says the same:
 # the macros of include/tsdb.h, `tsdbd --version`, `tsdb --version`, and the manifests of the clients
 # and the connector. A release bump edits VERSION and these (docs/release.md); this script finds a miss.

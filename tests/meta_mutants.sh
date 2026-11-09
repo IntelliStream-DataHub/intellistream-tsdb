@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Every bug planted in server/meta.c (MUT(n)) must be caught by test_meta: the unit tests or the simulator's checker.
 # Usage: meta_mutants.sh BUILD/test_meta_mut [MUTANT...]
 set -u

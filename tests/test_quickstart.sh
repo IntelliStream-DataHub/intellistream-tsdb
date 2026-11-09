@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Runs the README's quick start word for word and checks its key output lines.
 #
 #   tests/test_quickstart.sh           (make test-quickstart does this after building)

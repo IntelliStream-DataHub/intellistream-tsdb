@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* outage-load: a steady writer per series and a read-back check, for the manual NFS outage runs
  * (docs/tasks/nfs-outage.md). It is the small cousin of tests/test_outage.c, for a real tsdbd on real storage.
  *

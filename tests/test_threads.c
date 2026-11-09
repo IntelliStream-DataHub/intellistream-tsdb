@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Threads per query (query_threads_for): a query's answer must not depend on how many threads decoded it.
  * Aggregates, spreads and TWAs (step and linear) over windows of 1 to 40 granules, cut by buckets that do not

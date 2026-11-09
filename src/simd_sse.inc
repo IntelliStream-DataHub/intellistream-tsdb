@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The 128-bit kernels, included twice by simd.c: for x86-64-v2 (KSUF sse, SSE4.2) and for AVX without AVX2
  * (KSUF avx: Sandy Bridge and Ivy Bridge, the same code VEX-encoded). AVX has 256-bit float operations but no

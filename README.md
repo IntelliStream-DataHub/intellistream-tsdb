@@ -609,8 +609,18 @@ make integration-tests  # tsdbd, the CLI and all four clients end to end, both s
 
 ## License
 
-tsdb is open source under the [Apache License 2.0](LICENSE). Copyright 2026 IntelliStream AS; see [NOTICE](NOTICE).
-The libraries tsdb builds on, and their licenses, are listed in [docs/licenses.md](docs/licenses.md).
+tsdb has two licences, chosen so that your own program is never pulled under the AGPL just because it talks to a
+tsdbd:
+
+- **The server and the engine** (`tsdbd`, `libtsdb`, the `tsdb` tool, and the embedded Rust, Python and Java
+  libraries that contain the engine) are under the [GNU AGPL, version 3 only](LICENSE). A commercial licence is
+  available from IntelliStream AS if the AGPL does not fit you.
+- **The client libraries** (C, Rust, Python and Java, over the network, and the Pulsar connector) are under the
+  [Apache License 2.0](LICENSES/Apache-2.0.txt). Use them in any program.
+
+[LICENSING.md](LICENSING.md) lists every directory and says what links to what. Releases 0.9.0, 0.9.1 and 0.10.0 were
+published under the Apache License 2.0 and stay so. Copyright 2026 IntelliStream AS; see [NOTICE](NOTICE). The
+libraries tsdb builds on, and their licenses, are listed in [docs/licenses.md](docs/licenses.md).
 
 ## Contributing and security
 

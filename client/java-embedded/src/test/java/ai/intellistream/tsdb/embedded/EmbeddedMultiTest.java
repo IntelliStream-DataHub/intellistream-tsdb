@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 package ai.intellistream.tsdb.embedded;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;

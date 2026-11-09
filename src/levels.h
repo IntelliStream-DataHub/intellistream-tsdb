@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * CPU levels: the functions compiled once per x86-64 microarchitecture level.
  *

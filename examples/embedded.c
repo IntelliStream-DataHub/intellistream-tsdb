@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdb as a library: write one day of readings and read them back.
  *
  *   build/embedded-example /tmp/tsdb-qs/embedded

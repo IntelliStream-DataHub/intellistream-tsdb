@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Integration test: starts build/tsdbd and talks to it through the client library. */
 #define _GNU_SOURCE
 #include "tsdb.h"

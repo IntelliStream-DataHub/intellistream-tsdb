@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Tests: codec round trips, and every query checked against a brute-force reference. */
 #include "internal.h"
 #include "samekeys.h"

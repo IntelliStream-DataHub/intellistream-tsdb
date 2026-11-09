@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdbd and storage domains (docs/ha.md 15.2, 15.3, 15.5; included by tsdbd.c, one translation unit).
  *
  * A volume whose directory lies under a --health-domain prefix belongs to that domain (the root never does: its

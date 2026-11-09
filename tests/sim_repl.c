@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The replication core (src/repl.c) under seeded random schedules: docs/design-cluster.md §13.1.
  *
  * One volume of 3 to 5 replicas, each the real core driven by a fake server: a log on a fake disk (records are

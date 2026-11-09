@@ -143,19 +143,10 @@ name = "intellistream-tsdb-client"
 version = "0.10.0"
 dependencies = [
  "hmac",
- "intellistream-tsdb-sys",
  "libc",
  "rayon",
  "sha2",
  "zstd",
-]
-
-[[package]]
-name = "intellistream-tsdb-sys"
-version = "0.10.0"
-dependencies = [
- "cc",
- "zstd-sys",
 ]
 
 [[package]]
@@ -424,6 +415,16 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tsdb-client-python"
+version = "0.10.0"
+dependencies = [
+ "intellistream-tsdb-client",
+ "numpy",
+ "pyo3",
+ "tsdb-client-python-common",
+]
+
+[[package]]
+name = "tsdb-client-python-common"
 version = "0.10.0"
 dependencies = [
  "intellistream-tsdb-client",

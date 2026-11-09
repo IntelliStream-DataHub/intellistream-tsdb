@@ -10,12 +10,17 @@ Contents
   bench/               codec-bench, type-bench, tsdb-bench, insert-bench, tsdbc-bench, scale-bench
   lib/libtsdb.a        the embedded engine; link with -lzstd -lpthread -lm
   lib/libtsdbclient.a  the C client of tsdbd; link with -lzstd -lpthread -lm
-  include/             tsdb.h, tsdb_protocol.h, tsdb_calendar.h, tsdb_client.h
+  include/             tsdb.h, tsdb_protocol.h, tsdb_wire.h, tsdb_calendar.h, tsdb_client.h
   tests/               the test suite of this build; tests/run-tests.sh runs it (libcrashfs.so there is a
                        test-only shim that fails a write on purpose; nothing else loads it)
   systemd/tsdbd.service
   BUILDINFO            version, build id, compiler, glibc
-  LICENSE, NOTICE      tsdb is licensed under the Apache License 2.0
+  LICENSE, NOTICE      the server, the engine (lib/libtsdb.a) and the tools: GNU AGPL, version 3 only
+  LICENSES/, LICENSING.md
+                       the Apache License 2.0 text, which covers the C client (lib/libtsdbclient.a) and the
+                       headers in include/ (a header's licence does not change that of lib/libtsdb.a: a program
+                       that links libtsdb is under the AGPL, one that only uses libtsdbclient.a is not);
+                       LICENSING.md explains the split and the commercial licence
   THIRD-PARTY-NOTICES  zstd and liburing are linked into the binaries: their licenses
 
 Requirements

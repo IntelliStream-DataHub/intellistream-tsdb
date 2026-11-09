@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Runs a `make dist` tarball's test suite inside a stock AlmaLinux 10 image
 # with Podman (never Docker): nothing is installed in the image, so only its
 # glibc is used, as on a production host.
@@ -38,7 +39,7 @@ mkdir -p /tmp/dist /tmp/scratch && tar -C /tmp/dist -xzf /dist.tar.gz && cd /tmp
 for b in bin/* bench/* tests/test_*; do
     if ldd "$b" | grep -q "not found"; then echo "$b: missing libraries"; ldd "$b"; exit 1; fi
 done
-for f in LICENSE NOTICE THIRD-PARTY-NOTICES; do
+for f in LICENSE NOTICE LICENSING.md LICENSES/Apache-2.0.txt THIRD-PARTY-NOTICES; do
     [ -s "$f" ] || { echo "$f missing from the tarball"; exit 1; }
 done
 cat BUILDINFO

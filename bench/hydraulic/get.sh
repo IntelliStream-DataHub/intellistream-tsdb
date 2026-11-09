@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Downloads the UCI "Condition monitoring of hydraulic systems" data set into
 # DIR, checks it is exactly the file these numbers were measured on, and
 # unpacks it there.

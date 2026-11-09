@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The reference LTTB for the tests: the straightforward array version of
  * Steinarsson's algorithm, with the paper's bucket boundaries and

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # The replication core's simulator (tests/sim_repl.c, docs/design-cluster.md §13.1).
 #   tests/sim_repl.sh quick            make test: 300 seeds, and the planted bugs that die within 200 seeds
 #   tests/sim_repl.sh mutants          every planted bug, up to 20,000 seeds each; fails if one survives

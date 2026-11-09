@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! 64-bit series ids on the wire (protocol version 11): the frames carry every bit of an id (checked on a fake server
 //! that records what it receives), a server of an older protocol is refused when the client connects, and tsdbd, which
 //! gives ids the volume in bits 32-47, answers an id like `a + 2^32` (another volume) as an unknown series, never as `a`.

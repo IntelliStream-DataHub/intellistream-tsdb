@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The C client against fake servers in this process: replies out of step, a
  * reply that comes after the caller gave up, malformed name replies, a stream
  * cut short, a series whose value type changes between chunks (a heap overflow

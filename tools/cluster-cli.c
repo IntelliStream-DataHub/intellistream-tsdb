@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * `tsdb cluster ...`: the admin ops of tsdbd's cluster thread (server/cluster.c), sent to a server's peer address.
  * No directory: the CLI holds no cluster state; it authenticates with the cluster secret (--secret-file) and prints

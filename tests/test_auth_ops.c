@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Every op across tenants (docs/design-auth.md §5 and §9), generated from TSDB_OPS: tsdbd with login on, users of
  * acme/ holding all rights there, each single right on one series, read on all, no grants, and rights given by a
  * glob. For every op of the list a minimal well-formed frame goes out over a logged-in raw connection, naming a

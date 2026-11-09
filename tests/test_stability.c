@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Stability of tsdbd as a process: signals, restarts, dead listeners, and
  * clients that misbehave. Each check runs under a watchdog, so a server or a

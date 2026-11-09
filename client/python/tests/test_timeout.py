@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Timeouts against fake servers that stall: no tsdbd here, each test runs a
 listener that accepts and then misbehaves in one way. The call must fail with
 TsdbError (ERR_IO) within bounds and the client must be closed afterwards."""

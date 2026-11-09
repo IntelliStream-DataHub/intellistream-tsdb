@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Query benchmark: the random windows of `tsdbc-bench query`, over TCP from this client.
 //!
 //! ```text

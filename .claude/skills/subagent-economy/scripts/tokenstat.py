@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """tokenstat.py DIR...: token economics of workflow subagents. DIR = a workflow transcript dir (wf_*) or the
 `subagents/workflows` dir holding several. One API request is counted once (a transcript writes one record per
 content block, all with the same usage)."""

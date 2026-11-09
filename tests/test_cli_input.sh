@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # The CLI refuses input it cannot take exactly instead of acting on something else: numbers out of range or
 # equal to a reserved null, times and intervals that overflow or name no real time (99:99:99, 02-31), --limit
 # and group counts that are not numbers; the import's name cache does not mistake a name for a longer one with

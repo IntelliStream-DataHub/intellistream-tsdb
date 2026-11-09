@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Partition classes (docs/design.md): a series slower than about one row per 1.3 s gets partitions of 7, 28 or 364
  * days, chosen from its rate. Checks, each against a model of what the series hold:
  *   1. a bulk load of every generator kind lands in its class, hdd_temp at <= 0.285 bytes per reading (0.268 with

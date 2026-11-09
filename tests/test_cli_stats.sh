@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # `tsdb DIR stats tenants` and `stats hot` (docs/design-stats.md section 5.3): the numbers per prefix are those of the
 # series under it (the longest prefix wins), the rest are "(none)", a prefix list from a file works like the arguments,
 # a bad option is refused. The engine's own numbers are checked in test_tenants.c; this checks the command.

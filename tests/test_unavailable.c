@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdbd with a volume on a storage domain under the outagefs shim, and the C client's protocol 13 side (ha.md 9,
  * 15.4): while the domain is DOWN a request for the volume is refused with TSDB_ERR_UNAVAILABLE and its body (the
  * volume, the reason, the retry_after); TOPOLOGY says the volume is unavailable and the root is not; a client with

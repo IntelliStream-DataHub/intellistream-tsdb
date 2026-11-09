@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * `tsdb DIR upgrade` (tsdb_upgrade): a database that release 0.9.0 wrote (disk format 8; tests/data/v8-fixture.tar,
  * made by tests/data/make-v8-fixture.sh with the 0.9.0 binary: a root and a volume, every value type, parts of

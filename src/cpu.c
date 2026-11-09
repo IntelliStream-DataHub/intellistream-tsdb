@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * CPU levels: which compile of the codecs runs (see levels.h for why they are
  * compiled per level), and the cap for the aggregation kernels of simd.c.

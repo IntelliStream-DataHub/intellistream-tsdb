@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // Real clicks in a real Firefox, over WebDriver BiDi (built into Firefox; node 22's WebSocket talks to it).
 //
 //     node tests/firefox-clicks.mjs site        # run by tests/check_site.py

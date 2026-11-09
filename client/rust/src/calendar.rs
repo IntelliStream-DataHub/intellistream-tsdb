@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Calendar periods in a time zone, as UTC bucket bounds: a port of
 //! `client/tsdb_calendar.c`, which defines them.
 //!

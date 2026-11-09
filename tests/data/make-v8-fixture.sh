@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Makes tests/data/v8-fixture.tar and v8-fixture.tsdbdump with the binary of release 0.9.0 (disk format 8):
 #   git archive v0.9.0 | tar -x -C /tmp/v090 && make -C /tmp/v090 build/tsdb
 #   tests/data/make-v8-fixture.sh /tmp/v090/build/tsdb tests/data

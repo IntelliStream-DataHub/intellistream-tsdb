@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The client's side of SCRAM-SHA-256 against fake servers: the RFC 7677 §3 exchange byte for byte (its values
 //! read from tests/rfc7677.h, which the C tests use too), and the server-first and server-final messages it
 //! must refuse. A test binary of its own: the fixed client nonce is process-wide.

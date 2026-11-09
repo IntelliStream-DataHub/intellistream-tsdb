@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # save-usage.sh: feed it the status line's JSON on stdin; it saves the rate limits for usage.sh. The status line is the
 # only place Claude Code hands these numbers out, so add one line to your status-line script after it reads its input:
 #   printf '%s' "$input" | bash ~/.claude/skills/subagent-economy/scripts/save-usage.sh

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Tests: range deletes, replaces and retention.
  *
  * The core is model based: random inserts (small ones through the WAL, large

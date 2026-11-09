@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The change feed's files (feed.h): FEED, FEEDSLOTS, the word in META, and the order in which they are made and
  * removed. docs/design-cdc.md 2.7 and 2.13.

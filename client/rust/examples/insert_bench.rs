@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Insert benchmark: loads a RowBinary file into tsdbd, as `tsdbc-bench load`.
 //!
 //! ```text

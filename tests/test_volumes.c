@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Volumes: series stored in directories of their own, routed by the root. */
 #define _GNU_SOURCE
 #include "tsdb.h"

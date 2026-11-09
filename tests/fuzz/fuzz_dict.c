@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * SERIES and STATES (the same record format): series_open on any bytes, then
  * lookups and a reload. A torn tail is cut; anything else bad fails the open.

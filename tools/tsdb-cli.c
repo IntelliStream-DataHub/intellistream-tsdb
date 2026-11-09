@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Command line client for a tsdb directory. */
 #include "common.h"
 #include "dump.h"

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 #ifndef TSDB_INTERNAL_H
 #define TSDB_INTERNAL_H
 

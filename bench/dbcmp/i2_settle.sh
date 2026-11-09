@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # i2_settle.sh LOADEND_EPOCH: poll InfluxDB 2's storage metrics until the cache is empty, no compaction
 # is active, and nothing has changed for $STABLE s (300); print when the last change happened,
 # counted from LOADEND_EPOCH (date +%s when the load returned).

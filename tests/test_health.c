@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Storage domain health (src/health.c, ha.md 15.2): probes, the states and what moves between them, against the
  * outagefs shim. Three domains, A and A2 (two filesystems of one server) and B (another server). The thresholds are
  * scaled down so the whole test takes about 30 s. Usage: test_health [scratch directory]. */

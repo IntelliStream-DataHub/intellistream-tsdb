@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package ai.intellistream.tsdb.pulsar;
 
 /** A record tsdb will never take as it is: it goes to the dead-letter path. */

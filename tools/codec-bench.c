@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Float32 codec comparison: size and speed per 8192-value granule, the unit
  * tsdb stores. Every result is checked to round-trip bit for bit.

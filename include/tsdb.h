@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * tsdb - an embedded time series database in the spirit of ClickHouse MergeTree.
  *

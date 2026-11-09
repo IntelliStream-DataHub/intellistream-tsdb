@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # checktest.py: the answer checkers (rel.py compare, check.py --dumps) must reject wrong answers and accept right ones.
 #   python3 -I checktest.py mutate [TWA_REF WINDOWS_REF FULL_REF]
 # Takes reference answers (tsdb's relq twa / tsdbq dump / tsdbq full dumps of the crafted data set; without files, a

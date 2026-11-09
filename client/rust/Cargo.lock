@@ -132,19 +132,10 @@ version = "0.10.0"
 dependencies = [
  "hmac",
  "intellistream-tsdb-client",
- "intellistream-tsdb-sys",
  "libc",
  "rayon",
  "sha2",
  "zstd",
-]
-
-[[package]]
-name = "intellistream-tsdb-sys"
-version = "0.10.0"
-dependencies = [
- "cc",
- "zstd-sys",
 ]
 
 [[package]]

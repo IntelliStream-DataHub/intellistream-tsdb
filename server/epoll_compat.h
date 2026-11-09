@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* epoll_compat.h: the part of epoll that tsdbd uses, over kqueue, for macOS (a developer instance; the loop is
  * the same as on Linux, only how it asks the kernel differs).
  *

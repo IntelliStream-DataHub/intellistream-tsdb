@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Users, their verifiers and grants (docs/design-auth.md §2 and §4): the file USERS in the database root, and the
  * grant model as pure functions: selectors (all, prefix, name, glob), rights, rights_of, the inside-rules (A25) and

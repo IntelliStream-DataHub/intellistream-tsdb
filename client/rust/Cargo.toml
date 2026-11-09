@@ -15,12 +15,6 @@ categories = ["database"]
 name = "tsdb_client"
 
 [features]
-# Db: the database inside this process (crate tsdb-sys builds the C engine into it)
-embedded = ["dep:tsdb-sys"]
-# embedded, linking a prebuilt libtsdb.so (TSDB_LIB_DIR) instead of compiling the engine
-embedded-system = ["embedded", "tsdb-sys/system"]
-# embedded, with the engine compiled for this CPU (-march=native)
-native = ["embedded", "tsdb-sys/native"]
 # tests only (a fixed client nonce, the PBKDF2 count: `tsdb_client::test_hooks`); this crate's own tests turn it
 # on through the dev-dependency below, the Python module's test build through its own feature. Not for users.
 test-hooks = []
@@ -28,7 +22,6 @@ test-hooks = []
 [dependencies]
 # packed inserts (protocol version 3); the bundled libzstd, no optional features
 zstd = { version = "0.13", default-features = false }
-tsdb-sys = { package = "intellistream-tsdb-sys", path = "../rust-sys", optional = true }
 # batch calls (Pool, Db::*_many) run their queries and inserts on a thread pool
 rayon = "1"
 # login (SCRAM-SHA-256, design-auth.md A19): SHA-256 and HMAC; PBKDF2 is a loop over them in auth.rs
@@ -42,15 +35,3 @@ libc = "0.2"
 # the crate itself with its test hooks, for its own tests (a dev-dependency never reaches a user's build)
 [dev-dependencies]
 intellistream-tsdb-client = { path = ".", features = ["test-hooks"] }
-
-[[example]]
-name = "embedded_quickstart"
-required-features = ["embedded"]
-
-[[example]]
-name = "embedded_bench"
-required-features = ["embedded"]
-
-[[example]]
-name = "embedded_suite"
-required-features = ["embedded"]

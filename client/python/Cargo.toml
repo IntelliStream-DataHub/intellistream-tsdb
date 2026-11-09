@@ -12,7 +12,8 @@ name = "tsdb_client"
 crate-type = ["cdylib"]
 
 [dependencies]
-tsdb-client = { package = "intellistream-tsdb-client", path = "../rust", features = ["embedded"] }
+tsdb-client = { package = "intellistream-tsdb-client", version = "=0.10.0", path = "../rust" }
+tsdb-client-python-common = { path = "../python-common" }
 pyo3 = "0.29"
 # results handed to numpy without a copy (PyArray from a Vec)
 numpy = "0.29"

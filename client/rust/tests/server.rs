@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration tests against a real tsdbd: every op, over the wire.
 
 mod common;

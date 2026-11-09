@@ -496,38 +496,48 @@ dist-check-sandybridge: dist
 # cargo, Python or JDK. Each runs its tests against build/tsdbd.
 PYVENV ?= build/pyvenv
 
+# client/rust is the network client (Apache-2.0) and links no engine; client/rust-embedded (AGPL-3.0-only) is the
+# embedded Db over client/rust-sys.
 test-rust: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
-	cd client/rust && cargo test --features embedded
-	cd client/rust && cargo build --all-targets  # the TCP-only crate (no features) must still build
+	cd client/rust && cargo test
+	cd client/rust && cargo build --all-targets
+	cd client/rust-embedded && cargo test
 	cd client/rust-sys && cargo test
 
 # numpy is an optional extra of the package, but the tests use it (numpy results, batch calls); a venv made before
 # it was needed gets it too. The test build has the test hooks (feature test-hooks: a fixed client nonce, the
 # PBKDF2 count), which wheels never have.
+# tsdb_client (client/python, Apache-2.0) is tested alone, then tsdb_embedded (client/python-embedded, AGPL-3.0-only)
+# next to it: its tests also run tsdb_client's against a Db, and check that one `except tsdb_client.TsdbError` catches both.
 test-python: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	$(PYVENV)/bin/python -c 'import numpy' 2>/dev/null || $(PYVENV)/bin/pip install -q numpy
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
 	    --features test-hooks && $(abspath $(PYVENV))/bin/python -m pytest tests
+	cd client/python-embedded && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
+	    && $(abspath $(PYVENV))/bin/python -m pytest tests
 
-# The Python sdist (distribution intellistream-tsdb-client, module tsdb_client) carries intellistream-tsdb-sys as a
+# The Python sdists: intellistream-tsdb-client (module tsdb_client, Apache-2.0, no engine) and
+# intellistream-tsdb-embedded (module tsdb_embedded, AGPL-3.0-only). The second carries intellistream-tsdb-sys as a
 # path dependency, so the engine's C sources travel in it as the copy client/rust-sys/vendor.sh makes (csrc/).
-# test-python-sdist builds a wheel from the sdist alone and imports it; the file names follow the distribution name.
+# test-python-sdist builds a wheel from each sdist and imports them together; the file names follow the distribution names.
 python-sdist:
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	client/rust-sys/vendor.sh
 	rm -rf $(B)/sdist
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin sdist -o $(abspath $(B))/sdist
+	cd client/python-embedded && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin sdist -o $(abspath $(B))/sdist
 
 test-python-sdist: python-sdist
 	rm -rf $(B)/sdist-check && mkdir -p $(B)/sdist-check/whl
 	PATH=$(abspath $(PYVENV))/bin:$$PATH $(PYVENV)/bin/pip wheel -q --no-build-isolation --no-deps -w $(B)/sdist-check/whl $(B)/sdist/intellistream_tsdb_client-*.tar.gz
-	cd $(B)/sdist-check && unzip -q whl/intellistream_tsdb_client-*.whl -d site \
-	    && $(abspath $(PYVENV))/bin/python -I -c "import os, sys; sys.path.insert(0, os.path.abspath('site')); import tsdb_client; \
-	    assert tsdb_client.__file__.startswith('$(abspath $(B))/sdist-check/site'), tsdb_client.__file__; tsdb_client.Db; \
-	    assert not hasattr(tsdb_client, '_set_client_nonce'), 'a wheel with the test hooks'"
-	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_client-*.tar.gz
-	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_client-*.whl
+	PATH=$(abspath $(PYVENV))/bin:$$PATH $(PYVENV)/bin/pip wheel -q --no-build-isolation --no-deps -w $(B)/sdist-check/whl $(B)/sdist/intellistream_tsdb_embedded-*.tar.gz
+	cd $(B)/sdist-check && unzip -q whl/intellistream_tsdb_client-*.whl -d site && unzip -q whl/intellistream_tsdb_embedded-*.whl -d site
+	$(abspath $(PYVENV))/bin/python -I tools/check-wheels-import.py $(B)/sdist-check/site
+	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_client-*.tar.gz apache rust=apache python=apache python-common=apache
+	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_client-*.whl apache
+	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_embedded-*.tar.gz agpl rust=apache rust-sys=agpl rust-embedded=agpl python-embedded=agpl python-common=apache
+	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_embedded-*.whl agpl
 
 test-java: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	cd client/java && mvn -q test
@@ -539,20 +549,24 @@ test-java-embedded: $(B)/tsdbd $(B)/libtsdb.$(SOEXT)
 	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
 	cd client/java-embedded && mvn -q $(JAVA_M2) test
 
-# Every package carries LICENSE and NOTICE (Apache-2.0), and those that pack other software its notices
-# (docs/licenses.md): the Rust crates (cargo package --list), the two jars and the Pulsar NAR, built here without
-# their tests. The Python sdist and wheel are checked by test-python-sdist. The Pulsar NAR needs build/m2 of
+# Every package carries the LICENSE of its own licence (Apache-2.0 for the client libraries, AGPL-3.0-only for the
+# engine and the embedded bindings, LICENSING.md) and NOTICE, and those that pack other software its notices
+# (docs/licenses.md): the Rust crates (cargo package --list), the four jars and the Pulsar NAR, built here without
+# their tests, and tools/check-spdx.sh (the SPDX line of every source file and the licence fields of the manifests).
+# The Python sdists and wheels are checked by test-python-sdist. The Pulsar NAR needs build/m2 of
 # test-java-embedded's way (the tsdb-client jar) and the Maven plugins of connectors/pulsar.
 test-licenses:
+	tools/check-spdx.sh
 	tools/check-package-licenses.sh sources
-	tools/check-package-licenses.sh crate client/rust
-	tools/check-package-licenses.sh crate client/rust-sys
+	tools/check-package-licenses.sh crate client/rust apache
+	tools/check-package-licenses.sh crate client/rust-sys agpl
+	tools/check-package-licenses.sh crate client/rust-embedded agpl
 	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
-	tools/check-package-licenses.sh jar client/java/target/tsdb-client-$(RELEASE_VERSION).jar
+	tools/check-package-licenses.sh jar client/java/target/tsdb-client-$(RELEASE_VERSION).jar apache
 	cd client/java-embedded && mvn -q $(JAVA_M2) -DskipTests package
-	tools/check-package-licenses.sh jar client/java-embedded/target/tsdb-embedded-$(RELEASE_VERSION).jar
+	tools/check-package-licenses.sh jar client/java-embedded/target/tsdb-embedded-$(RELEASE_VERSION).jar agpl
 	cd connectors/pulsar && mvn -q $(JAVA_M2) -DskipTests package
-	tools/check-package-licenses.sh nar connectors/pulsar/target/tsdb-pulsar-sink-$(RELEASE_VERSION).nar
+	tools/check-package-licenses.sh nar connectors/pulsar/target/tsdb-pulsar-sink-$(RELEASE_VERSION).nar apache
 
 test-clients: test-rust test-python test-python-sdist test-java test-java-embedded test-licenses
 

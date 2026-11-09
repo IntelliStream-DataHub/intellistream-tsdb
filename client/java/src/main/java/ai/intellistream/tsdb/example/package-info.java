@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * Runnable examples, the code of the README's quick start: {@link ai.intellistream.tsdb.example.Example} (float32
  * series, raw points, aggregates, days in a time zone) and {@link ai.intellistream.tsdb.example.TypedExample} (other

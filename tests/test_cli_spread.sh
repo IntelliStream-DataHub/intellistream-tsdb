@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # The CLI's range, stddev, stddev_samp, var and var_samp modes and the three columns `all` gains: the
 # values of a known set, the int64 range printed exactly (it needs 64 unsigned bits), \N for a bucket of
 # only nulls.

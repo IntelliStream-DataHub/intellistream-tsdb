@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # ch_settle.sh TABLE: wait until ClickHouse has finished merging cmp.TABLE.
 #
 # Settled means: system.merges is empty and the active part count has not changed for CH_STABLE seconds (default 180).

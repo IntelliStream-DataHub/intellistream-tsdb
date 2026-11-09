@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # harnesstest.sh: run.sh's death detection (oom_killed, ctr_died) against a stub podman and a fake cgroup tree, so
 # no container is needed; ts_many_probe against a stub qdrive; mem_sample against fake memory files; the
 # extra pass (phase6, tstep's labels and RESUME, NO_PC) and the TWA batch suites (twabsuite, tsdbtwab) against stubs. Prints one line per case and "harnesstest OK" or "harnesstest FAILED".

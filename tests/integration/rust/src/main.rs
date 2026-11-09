@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The Rust client of the integration tests: same command line and output as c/itc.c, python/itp.py and
 //! java/Itj.java (see run.py).
 use std::io::{BufRead, BufReader, BufWriter, Write};

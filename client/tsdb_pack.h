@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * The packed body of an INSERT_VALUES frame (flags & TSDB_PACKED), shared by
  * tsdbd and the C client.

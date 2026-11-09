@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* compat.h: what Linux has and macOS (the developer instance, arm64 or x86-64) lacks.
  *
  * Everything here is under __APPLE__; on Linux this header adds only the tsdb_* wrappers, each the plain call it

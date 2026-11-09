@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Raw FFI declarations of tsdb's public C API: `include/tsdb.h` and `include/tsdb_calendar.h`.
 //!
 //! By default the build script compiles the engine into this crate (see the README), so these

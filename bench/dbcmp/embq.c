@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Embedded comparison: tsdb through its C library and DuckDB through its C API, in one process,
  * with the same query spec, timing and result handling, so neither side pays for a network.

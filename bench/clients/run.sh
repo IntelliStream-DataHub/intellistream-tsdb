@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Embedded C, Java (FFM), Rust and Python and the four tsdbd clients (C, Rust, Python, Java) on one data set: loads
 # and queries, side by side.
 # See README.md. Usage:
@@ -27,7 +28,7 @@ MAXLOAD=2   # load average at the start
 MAXBUSY=1   # CPUs other processes may keep busy before a measurement (see quiet_wait)
 PYVENV=${PYVENV:-$B/pyvenv}
 
-usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 while [ $# -gt 0 ]; do
     case $1 in
     --work) WORK=$2; shift 2 ;;

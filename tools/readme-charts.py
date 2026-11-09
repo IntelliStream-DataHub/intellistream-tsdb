@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Draws the README's benchmark charts: docs/img/bench-{servers,embedded,100b}-{light,dark}.svg.
 
     python3 tools/readme-charts.py             # write the SVGs

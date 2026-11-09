@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The replication core of a cluster volume (docs/design-cluster.md §4-§6 and §8.2, decision C23).
  *
  * Sans-IO, like the Raft core: no sockets, no files, no threads, no clock. One `struct repl` is one replica of one

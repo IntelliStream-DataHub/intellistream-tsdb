@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Range tombstones (deletes) and the sets that apply them.
  *

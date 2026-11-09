@@ -1,13 +1,13 @@
 Third-party software in the tsdb Python wheel and source distribution
 =====================================================================
 
-tsdb itself is licensed under the Apache License 2.0 (the file LICENSE next to this one; see also NOTICE). It
-includes the tsdb database engine, written in C and compiled into the extension module.
+This package, the tsdb network client for Python (module tsdb_client), is licensed under the Apache License 2.0 (the
+file LICENSE next to this one; see also NOTICE). It does not contain the database engine: it talks to a tsdbd.
 
-The extension module also contains the Rust libraries listed below, and the zstd C library (compiled by the
-zstd-sys crate), all linked statically. Their licenses ask that their copyright notice and license text travel
-with the binary; they are reproduced here. A crate that offers MIT OR Apache-2.0 is used under MIT. Libraries that
-only run at build time (the build tools, procedural macros) are not part of the wheel and are not listed.
+The extension module contains the Rust libraries listed below, and the zstd C library (compiled by the zstd-sys
+crate), all linked statically. Their licenses ask that their copyright notice and license text travel with the
+binary; they are reproduced here. A crate that offers MIT OR Apache-2.0 is used under MIT. Libraries that only run
+at build time (the build tools, procedural macros) are not part of the wheel and are not listed.
 
 NumPy, when installed (pip install intellistream-tsdb-client[numpy]), is a separate package and not part of this one.
 

@@ -255,9 +255,9 @@ you do the two steps yourself).
 ## Spread, time-weighted averages and charts
 
 ```python
-from tsdb_client import Db
+from tsdb_client import Client
 
-with Db("/tmp/tsdb-analytics") as db:
+with Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as db:
     s = db.series_create("tank1.level", "float64")
     db.insert_series_values(s, [0, 1000, 3000, 4000], [10.0, 20.0, 30.0, 40.0])
 
@@ -357,44 +357,22 @@ client.set_compression(3)  # smaller, but uses more CPU
 It prints rows per second and bytes sent per row. Try `--compression 0` to compare.
 
 `bench_query.py` runs the random query windows of `tsdbc-bench query` (`--conns N` threads, which share the GIL;
-see the file). `../../bench/clients/run.sh` runs both next to the other clients and the embedded library.
-`bench_embedded.py` loads and queries the same way through an embedded `Db` (`--load FILE`, `--qps THREADS`, as
-`tsdb-bench`), and `bench_embedded_suite.py` runs the whole default suite of `tsdb-bench` through it.
+see the file). `../../bench/clients/run.sh` runs both next to the other clients and the embedded library (AGPL-3.0-only, with its own directory).
+(The same benchmarks through the embedded `Db` are `bench_embedded.py` and `bench_embedded_suite.py` in
+`../python-embedded`.)
 
-## Embedded
+## The embedded database moved
 
-`tsdb_client.Db` is the database itself inside your Python process: no
-tsdbd, no network. Give it a directory; it has the same methods as
-`Client`, so code switches between the two by changing one line. The
-engine is compiled into the module, runs on any x86-64 and picks AVX2 or
-AVX-512 code at run time.
-
-```python
-import tsdb_client
-
-with tsdb_client.Db("/tmp/tsdb-embedded") as db:
-    s = db.series("pump7.flow")
-    t0 = 1_700_000_000_000  # one row a minute for a day
-    db.insert_series(s, [t0 + i * 60_000 for i in range(1440)], [float(i % 60) for i in range(1440)])
-    ts, values = db.query_raw(s, t0, t0 + 180_000, numpy=False)
-    for t, v in zip(ts, values):
-        print("raw ", t, v)
-    for b in db.query_group(s, unit="day", timezone="Europe/Oslo"):
-        print("day ", b.start, b.count, b.sum)
-```
-
-The engine works with the GIL released, and threads sharing one `Db` run
-in parallel. One process at a time can open a directory for writing
-(others get `ERR_LOCKED`); readers open it with `Db(path, read_only=True)`
-and call `refresh()` to see new data. The keyword arguments of `Db` are
-the engine's options, such as `fsync=False` or `wal_sync_ms=100`;
-`help(tsdb_client.Db)` lists them.
+Up to 0.10.0 this package also held `Db`, the database inside your Python process. The engine is licensed
+AGPL-3.0-only from 0.11.0 (this client stays Apache-2.0), so `Db` lives in its own package,
+`intellistream-tsdb-embedded` (module `tsdb_embedded`, in `client/python-embedded`). It has the methods of
+`Client`, raises this package's `TsdbError`, and `from tsdb_client import Db` fails with a message that says so.
+This package never imports it and never links the engine: a program that only talks to tsdbd stays Apache-2.0.
 
 ## Many series in one request
 
 The `_multi` calls ask for many series at once: one request, one answer,
-in the order of your list. The server (or, for `Db`, the database in this
-process) reads the series in parallel and from one moment in time, so an
+in the order of your list. The server reads the series in parallel and from one moment in time, so an
 insert that wrote several series at once is seen whole or not at all.
 Every server this client connects to (protocol version 12 or later) has them.
 
@@ -402,7 +380,7 @@ Every server this client connects to (protocol version 12 or later) has them.
 import numpy as np
 import tsdb_client
 
-with tsdb_client.Db("/tmp/tsdb-multi") as db:
+with tsdb_client.Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as db:
     t0 = 1_700_000_000_000
     ts = t0 + np.arange(1440, dtype=np.int64) * 60_000  # one row a minute for a day
     pumps = [db.series(f"pump{i}.flow") for i in range(3)]
@@ -421,7 +399,7 @@ with tsdb_client.Db("/tmp/tsdb-multi") as db:
 
 There are five: `query_values_multi`, `query_buckets_multi`,
 `query_spread_multi`, `query_twa_multi` and `query_lttb_multi`, on
-`Client`, `Pool` and `Db`. `series` is a list of ints or a numpy `uint64` (or `int64`) array; a
+`Client` and `Pool`. `series` is a list of ints or a numpy `uint64` (or `int64`) array; a
 32-bit array cannot hold an id and raises `TypeError`.
 `start`, `end` and `interval_ms` are one number for every series or one
 per series. The bucket calls take `interval_ms`, or `unit`, `count` and
@@ -440,7 +418,7 @@ and check `r.status` yourself.
 
 `latest(series, end=None, *, with_nulls=False)` gives the newest row of every series in one request (protocol 14;
 the server keeps a table for it, so 100,000 series answer in milliseconds). `latest_by_name(names, ...)` takes names
-and remembers their ids. Both exist on `Client`, `Pool` and `Db`.
+and remembers their ids. Both exist on `Client` and `Pool`.
 
 ```python
 r = c.latest_by_name(["pump0.flow", "pump1.flow", "no.such.series"], errors="status")
@@ -465,18 +443,22 @@ Python out of the way: one Python thread then does as much as many.
 import numpy as np
 import tsdb_client
 
-with tsdb_client.Db("/tmp/tsdb-many") as db:
+login = dict(user="admin", password_file="/tmp/tsdb-demo/password")  # as for Client
+with (
+    tsdb_client.Client("127.0.0.1", 7070, **login) as client,
+    tsdb_client.Pool("127.0.0.1", 7070, connections=4, **login) as pool,
+):
     t0 = 1_700_000_000_000
     ts = t0 + np.arange(1440, dtype=np.int64) * 60_000  # one row a minute for a day
-    pumps = [db.series(f"pump{i}.flow") for i in range(3)]
-    db.insert_many([(s, ts, np.full(1440, i + 1.0, dtype=np.float32)) for i, s in enumerate(pumps)])
+    pumps = [client.series(f"pump{i}.flow") for i in range(3)]
+    pool.insert_many([(s, ts, np.full(1440, i + 1.0, dtype=np.float32)) for i, s in enumerate(pumps)])
 
     # the first hour of every pump: one (timestamps, values) pair per query
-    for i, (t, v) in enumerate(db.query_raw_many(pumps, t0, t0 + 3_600_000)):
+    for i, (t, v) in enumerate(pool.query_raw_many(pumps, t0, t0 + 3_600_000)):
         print("raw  ", f"pump{i}", len(t), v.sum())
 
     # hourly buckets of every pump, then numpy over all of them at once
-    hours = db.query_agg_many(pumps, t0, t0 + 86_400_000, 3_600_000)
+    hours = pool.query_agg_many(pumps, t0, t0 + 86_400_000, 3_600_000)
     print("hours", len(hours), len(hours[0]), hours.buckets.sum.sum())
 ```
 
@@ -493,14 +475,8 @@ another thread during the call cannot hurt it. In `insert_many`, entries
 for the same series are written in list order, so where two of them have
 a row at the same time, the later entry wins, as with separate inserts.
 
-Over the network, `tsdb_client.Pool` does the same with several
-connections to one server (by default one per CPU of this machine):
-
-```python
-login = dict(user="admin", password_file="/tmp/tsdb-demo/password")  # as for Client
-with tsdb_client.Pool("127.0.0.1", 7070, connections=16, **login) as pool:
-    hours = pool.query_agg_many(pumps, t0, t0 + 86_400_000, 3_600_000)
-```
+A `tsdb_client.Pool` has several connections to one server (by default one per CPU of this machine; the
+example above opens 4) and runs the queries over all of them.
 
 A connection that breaks is replaced on its next use. When the server
 restarts, every connection is replaced: a query that failed because its

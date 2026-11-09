@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Value types and typed columns: everything that knows how values look on the wire.
 //!
 //! A series has one [`ValueType`], chosen when it is created. Columns are
@@ -367,8 +368,9 @@ impl Bitmap {
         self.extend_bits(&[], n, true);
     }
 
-    /// Appends the first `n` bits of wire-form `src`.
-    pub(crate) fn extend_from_wire(&mut self, src: &[u8], n: usize) {
+    /// Appends the first `n` bits of wire-form `src`. (Not a public API: for `intellistream-tsdb-embedded`.)
+    #[doc(hidden)]
+    pub fn extend_from_wire(&mut self, src: &[u8], n: usize) {
         self.extend_bits(src, n, false);
     }
 
@@ -496,7 +498,8 @@ impl Column {
         ColumnRef { values: self.values.as_ref(), valid: self.valid.as_ref() }
     }
 
-    pub(crate) fn clear(&mut self) {
+    #[doc(hidden)]
+    pub fn clear(&mut self) {
         self.values.clear();
         self.valid = None;
     }

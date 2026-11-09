@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Login (docs/design-auth.md §3, §9): tsdbd started with USERS and without --no-auth, through the C client and raw
  * frames, on the backend TSDBD_IO names (make test runs uring and epoll). The RFC 7677 §3 exchange runs twice byte
  * for byte: the C client against a fake server here, and tsdbd's server side (server/auth.c, linked in) in this

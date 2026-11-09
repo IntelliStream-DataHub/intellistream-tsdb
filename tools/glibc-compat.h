@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Force-included (-include) by `make dist`: keeps the binaries loadable by
  * an older glibc than the one they are built with.

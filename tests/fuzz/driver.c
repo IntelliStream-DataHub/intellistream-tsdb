@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * A small coverage-guided mutational fuzzer, for machines without clang's
  * libFuzzer. The harnesses have libFuzzer's interface (LLVMFuzzerTestOneInput,

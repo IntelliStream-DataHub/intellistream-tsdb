@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # rel.py: LTTB and time-weighted averages (TWA) in each system's dialect, and the check of their answers against
 # tsdb's (relq KIND 1 1 ref/KIND.jsonl).
 #

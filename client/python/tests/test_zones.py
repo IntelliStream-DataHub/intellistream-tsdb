@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Grouping by local periods (protocol version 4): the client turns a time zone
 into bucket bounds."""
 

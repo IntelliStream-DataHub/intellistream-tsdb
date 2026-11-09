@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * WAL marker payloads (format 9, docs/design-cdc.md 2.1, design-ha-modes.md 2.1, design-cluster.md 4.1).
  *

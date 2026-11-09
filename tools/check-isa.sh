@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Fails if a portable build has per-level code that runs before the CPU check
 # (constructors), per-level code whose rounding depends on the CPU (FMA, libm's
 # dispatched functions), or uses instructions beyond x86-64-v2 outside the code

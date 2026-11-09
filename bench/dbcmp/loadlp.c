@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Parallel line protocol loader (InfluxDB 2 and 3, QuestDB):
  *   loadlp FILE HOST PORT PATH HEADERS LINES_PER_BATCH THREADS

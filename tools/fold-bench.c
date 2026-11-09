@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The aggregation folds over decoded values, per type and aggregate, at the
  * CPU level and kernels this process runs with (TSDB_CPU=v2|v3|v4 in a

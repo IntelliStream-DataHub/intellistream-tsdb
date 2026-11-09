@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # qdb_wait.sh: wait until QuestDB has applied every WAL transaction of 'sensors' (writerTxn reaches
 # sequencerTxn); rows are acknowledged on ingest but queryable only once applied.
 s=$(date +%s.%N)

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Minimal HTTP/1.1 client for loadlp and qdrive: one keep-alive connection per thread, a request
  * at a time, Content-Length or chunked responses. Bodies are always read to the end, so a query

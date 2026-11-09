@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdb export / import (tools/dump.c, docs/export-format.md), through the tsdb binary as a user runs it:
  *
  * - a round trip keeps every type bit for bit: nulls, NaN payloads, -0.0, the int64 extremes, the ends of the time

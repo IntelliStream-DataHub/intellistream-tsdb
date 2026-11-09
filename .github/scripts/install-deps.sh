@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Installs what the Makefile and the tests need on an ubuntu-24.04 runner (apt only).
 #
 #   .github/scripts/install-deps.sh [clients]

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Revalidation of a volume after a storage outage (ha.md 15.5 steps 3 and 4), the parts of it that compare the
  * halted engine's memory with what the storage holds now.
  *

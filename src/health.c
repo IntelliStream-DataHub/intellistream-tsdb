@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Storage domains and their health (docs/ha.md §15.2; N1, step O2).
  *

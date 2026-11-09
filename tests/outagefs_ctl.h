@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The client side of the outagefs shim's control socket (tests/jepsen/outagefs.c): one command per connection. */
 #ifndef TSDB_TEST_OUTAGEFS_CTL_H
 #define TSDB_TEST_OUTAGEFS_CTL_H

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The README's quick start is `examples/quickstart.rs`, and it runs against a live server that requires a login.
 
 mod common;
@@ -6,11 +7,21 @@ use std::process::Command;
 
 use common::Server;
 
+/// An example's source without its SPDX line: the README shows the code only.
+fn example(name: &str) -> String {
+    let path = format!("{}/examples/{name}.rs", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(path).unwrap();
+    match text.split_once('\n') {
+        Some((first, rest)) if first.starts_with("// SPDX-License-Identifier:") => rest.to_string(),
+        _ => text,
+    }
+}
+
 #[test]
 fn readme_quick_start_is_the_example() {
     let dir = env!("CARGO_MANIFEST_DIR");
     let readme = std::fs::read_to_string(format!("{dir}/README.md")).unwrap();
-    let example = std::fs::read_to_string(format!("{dir}/examples/quickstart.rs")).unwrap();
+    let example = example("quickstart");
     let start = readme.find("## Quick start").expect("a Quick start section");
     let code = readme[start..].split("```rust\n").nth(1).and_then(|s| s.split("\n```").next()).unwrap();
     assert_eq!(code.trim_end(), example.trim_end(), "README.md quick start differs from examples/quickstart.rs");
@@ -53,47 +64,10 @@ fn quick_start_runs() {
 }
 
 #[test]
-fn readme_embedded_section_is_the_example() {
-    let dir = env!("CARGO_MANIFEST_DIR");
-    let readme = std::fs::read_to_string(format!("{dir}/README.md")).unwrap();
-    let example = std::fs::read_to_string(format!("{dir}/examples/embedded_quickstart.rs")).unwrap();
-    let start = readme.find("## Embedded").expect("an Embedded section");
-    let code = readme[start..].split("```rust\n").nth(1).and_then(|s| s.split("\n```").next()).unwrap();
-    assert_eq!(code.trim_end(), example.trim_end(), "README.md Embedded differs from examples/embedded_quickstart.rs");
-}
-
-#[cfg(feature = "embedded")]
-#[test]
-fn embedded_example_runs() {
-    let dir = common::test_dir("tsdb-readme-embedded");
-    let out = Command::new(env!("CARGO"))
-        .args(["run", "--quiet", "--features", "embedded", "--example", "embedded_quickstart", "--"])
-        .arg(&dir)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "embedded_quickstart failed:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-    // Oslo days begin at 23:00 UTC in November
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(
-        lines,
-        [
-            "raw  1700000000000 0",
-            "raw  1700000060000 1",
-            "raw  1700000120000 2",
-            "day  1699916400000 47 1081",
-            "day  1700002800000 1393 41399"
-        ]
-    );
-    std::fs::remove_dir_all(dir).ok();
-}
-
-#[test]
 fn readme_analytics_section_is_the_example() {
     let dir = env!("CARGO_MANIFEST_DIR");
     let readme = std::fs::read_to_string(format!("{dir}/README.md")).unwrap();
-    let example = std::fs::read_to_string(format!("{dir}/examples/analytics.rs")).unwrap();
+    let example = example("analytics");
     let start = readme.find("## Time-weighted averages").expect("an analytics section");
     let section = &readme[start..];
     let code = section.split("```rust\n").nth(1).and_then(|s| s.split("\n```").next()).unwrap();
@@ -119,7 +93,7 @@ fn analytics_example_runs() {
 fn readme_users_section_is_the_example() {
     let dir = env!("CARGO_MANIFEST_DIR");
     let readme = std::fs::read_to_string(format!("{dir}/README.md")).unwrap();
-    let example = std::fs::read_to_string(format!("{dir}/examples/users.rs")).unwrap();
+    let example = example("users");
     let start = readme.find("## Users and rights").expect("a Users and rights section");
     let section = &readme[start..];
     let code = section.split("```rust\n").nth(1).and_then(|s| s.split("\n```").next()).unwrap();
