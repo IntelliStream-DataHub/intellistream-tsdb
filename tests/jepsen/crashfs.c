@@ -54,6 +54,11 @@
  * durable (files that lie after an injected EIO excepted), and is a point
  * where the EIO can be injected.
  *
+ * With CRASHFS_REWRITE=old the dirty regions that rewrote durable bytes get those bytes back at a power loss
+ * instead of zeros (what a disk keeps of an in-place overwrite: old or new, never blank); data past the durable
+ * size is still cut. Without CRASHFS_TEAR (no kept prefixes, no mixed sectors), so a log append never synced is
+ * lost for certain, and a rewritten hard-state slot is not blank.
+ *
  * With CRASHFS_AT_EXIT=1 the power also fails as the process exits normally:
  * what a command reported done must already be durable.
  *
@@ -147,6 +152,7 @@ static long warmup, ops;
 static uint64_t rng;
 static volatile sig_atomic_t crash_requested;
 static bool tear; /* CRASHFS_TEAR=1 */
+static bool rewrite_old; /* CRASHFS_REWRITE=old */
 static unsigned tear_prefix, tear_garbage, tear_old, tear_kept; /* what the power loss kept, for the message */
 static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
 static bool loss_at_exit;       /* CRASHFS_AT_EXIT=1 */
@@ -244,6 +250,7 @@ __attribute__((constructor)) static void init(void)
     if (getenv("CRASHFS_MARK"))
         snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
     tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
+    rewrite_old = getenv("CRASHFS_REWRITE") && !strcmp(getenv("CRASHFS_REWRITE"), "old");
     loss_at_exit = getenv("CRASHFS_AT_EXIT") && atoi(getenv("CRASHFS_AT_EXIT")) != 0;
     md_mode = getenv("CRASHFS_MODE") && !strcmp(getenv("CRASHFS_MODE"), "misdirect");
     md_rate = getenv("CRASHFS_MD_RATE") ? atof(getenv("CRASHFS_MD_RATE")) : 0.001;
@@ -323,7 +330,7 @@ static file *file_get(const char *path, bool create_new)
  * are about to change, once per sync, so a power loss can bring them back. */
 static void keep_old(file *f, int fd, off_t off, off_t end)
 {
-    if (!tear || f->lying)
+    if (!(tear || rewrite_old) || f->lying)
         return;
     if (end > f->durable)
         end = f->durable;
@@ -520,7 +527,15 @@ static void rollback(void)
             real_close(fd);
             continue;
         }
-        for (int k = 0; k < f->ndirty; k++) { /* rewritten in place, never synced */
+        if (rewrite_old) { /* rewritten in place, never synced: the old bytes come back, not zeros */
+            for (size_t i = 0; i < f->nold; i++) {
+                struct old_sector *o = &f->old[i];
+                off_t len = f->durable - o->off < SECTOR ? f->durable - o->off : SECTOR;
+                if (len > 0 && real_pwrite(fd, o->data, (size_t)len, o->off) < 0)
+                    break;
+            }
+        }
+        for (int k = 0; !rewrite_old && k < f->ndirty; k++) { /* rewritten in place, never synced */
             off_t end = f->dirty[k].off + f->dirty[k].len;
             if (end > f->durable)
                 end = f->durable;

@@ -1664,7 +1664,10 @@ static void scen_syncrace(void)
  * state goes back to an earlier image). Planted in a copy of the server, `power` fails on the unsynced log (C1) and on
  * the unsaved hard state (C2), `powersnap` on those and on the snapshot without its directory sync (C7); the clean
  * server passes every run. crashfs follows dup'ed descriptors for this (the log syncs duplicates of its segments).
- * No CRASHFS_TEAR: a tear may keep every unsynced byte, which would let the unsynced log pass now and then. */
+ * No CRASHFS_TEAR: a tear may keep every unsynced byte, which would let the unsynced log pass now and then.
+ * CRASHFS_REWRITE=old: a hard-state slot rewritten in place and not yet synced comes back as the old slot, not as zeros
+ * (a blank slot beside sequence N > 1 is damage by the log's own rule, and a disk leaves old or new bytes there: with
+ * zeros the restart refused to open in about 1 run in 10, 2 of 20 in tt-cluster-20b). */
 static void power_loss(int snaps)
 {
     scenario(snaps ? "powersnap" : "power");
@@ -1698,7 +1701,7 @@ static void power_loss(int snaps)
     snprintf(dir0, sizeof dir0, "%s/n0", base);
     if (mkdir(dir0, 0755) != 0 || mkdir(st, 0755) != 0)
         die("mkdir %s: %s", st, strerror(errno));
-    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s", so, st);
+    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_REWRITE=old", so, st);
     penv[0] = pe;
     envs[0] = snaps ? "snap_every=2,snap_retain=1,seg_bytes=200" : NULL;
     for (int i = 1; i < 5; i++)
@@ -1792,7 +1795,7 @@ static void scen_powervote(void)
     snprintf(st, sizeof st, "%s/n2/state", base);
     if (mkdir(dir2, 0755) != 0 || mkdir(st, 0755) != 0)
         die("mkdir %s: %s", st, strerror(errno));
-    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s", so, st);
+    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_REWRITE=old", so, st);
     penv[2] = pe;
     envs[3] = "free_min=9999999999999999"; /* a watcher: the proposal that makes n2 append */
     for (int i = 0; i < 4; i++)
