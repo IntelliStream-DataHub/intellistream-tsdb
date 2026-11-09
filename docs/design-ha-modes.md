@@ -699,7 +699,14 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | R2 | replicated | Engine replica mode (step 3); the marker backend of the journal hook | 2-4 | 6 (jepsen) | — |
 | R3 | replicated | Replication, ISR, promotion and leases in tsdbd (step 4 without what S2 built) | 3-4 | 12 (jepsen-cluster: kill, partition, pause, midcommit) | servers with disks |
 | R4 | replicated | Rebuild, catch-up, moves, leader balance (step 7) | 2-3 | 12 (jepsen-cluster: kill2, rebuild, slow) | servers with disks |
-| X1 | both | Cold-tier boundary (step 8); a shared volume hands partitions over the same way | 2 | 4 (midcommit at the move) | — |
+| R5 | replicated | EC codec (`src/ec/`), CPU dispatch, `test_rs`, `build/ec-bench` ([design-cluster-data.md](design-cluster-data.md) §11, added 2026-11-09) | 1-2 | numbers on three CPUs | the licence grant (open question 1 there) |
+| R6 | replicated | Object layout, chunk files, local chunk store, directory backend, range decode, fuzzers | 2 | 2 (fuzz) | — |
+| R7 | replicated | Engine: `.ec` parts, read seam and granule cache, the settle as a replace, re-encode; **takes X1's cold boundary** | 3-4 | 6 (jepsen, directory backend) | — |
+| R8 | replicated | tsdbd: server roles (compute, storage, both), chunk peer messages, epoch fences, degraded reads, orphan GC, metadata v3, `TSDB_WHY_LOST` in the four clients | 3-4 | 12 (jepsen-cluster on 4+2 and 16+4) | — |
+| R9 | replicated | DOWN/OUT at `rebuild_after`, holds, mass-OUT guard, stripe rebuild by priority, moves, balancer; `sim_place` | 3-4 | 24 (jepsen-cluster on 4 geometries; sim_place soak) | servers with disks for the timings |
+| R10 | replicated | Redundancy change on a running volume | 2-3 | 6 | — |
+| R11 | replicated | Benchmarks per mode, operator guide, README, AGENTS.md | 1-2 | the benchmarks, quiet machine | — |
+| X1 | both | Cold-tier boundary (step 8); a shared volume hands partitions over the same way. *Since 2026-11-09 folded into R7 for replicated mode; what remains is the shared-volume hand-over and an external tier, after 0.11.0* | 2 | 4 (midcommit at the move) | — |
 | X3 | both | Measurements and docs: README section, AGENTS.md invariants and lock order, operator guides | 1-2 | the benchmarks, quiet machine | — |
 
 **S0, the wire half (built, branch s0-wire): protocol 13.** TOPOLOGY is op 48 and STATUS op 49 (ops 39-47 stay with
@@ -724,6 +731,11 @@ follow it; until then clients reach owners through forwarding. N1 also ships on 
 3. **Then** N7 with its jepsen-ha matrix, then N8 in maintenance windows; S3 alongside.
 4. **Replicated mode**: R2-R4 after N7, on servers with disks. Its per-volume admission is N1's, which no longer
    waits for N0.
+   *Changed on 2026-11-09* (the user: data redundancy with erasure coding and 3 replicas, volume moves and failover
+   "will go in v0.11.0"; [design-cluster-data.md](design-cluster-data.md) E23, its open question 2): **v0.11.0 holds
+   replicated mode's data path**: the rest of S1, S2, S4, R2-R4 and R5-R11 (R5 and R6 can start at once, R7 after
+   R2, R8 after R3 and S2), about 29-42 track-days. Replicated mode no longer waits for N7; shared mode's N-steps go
+   on in parallel on their own tracks and their maintenance windows. M21's minimum production HA set is unchanged.
 
 **Totals** (restated in verification; the first revision's sum left N1 out and did not add up). Minimum production HA:
 S0 2-3, N0 0.5, N1 4-6, N2 1, N3 1-2, N4 3-5, N5 1, N6 2-3, S1 3-4, S2 2-3, S4 1-2, N7 4-6, N8 2: **about 27-39
