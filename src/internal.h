@@ -1091,6 +1091,7 @@ extern void (*_Atomic merge_hook)(int at);
  * count that many times over (threads-bench: 105 us against 8.1 us for one granule). */
 #define TWA_ROW_WEIGHT 12
 extern uint64_t query_rows_per_thread;
+extern _Atomic int query_threads_peak; /* test hook: the most threads query_threads_for has returned (tests reset it) */
 int query_threads_for(const eng *db, uint64_t rows, size_t items);
 static inline bool qbudget_ok(size_t bytes)
 {
