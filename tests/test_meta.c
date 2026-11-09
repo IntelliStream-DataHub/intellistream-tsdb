@@ -963,6 +963,252 @@ static void test_raft_log(const char *base)
     /* the files are left in the scratch directory, as the other tests leave theirs */
 }
 
+/* The log's damage branches (open: a tear is cut, rot is refused, the durable floor tells them apart; the hard-state ring).
+ * The layouts are those in the header comment of src/raft/raft_log.c, which this test does not edit. */
+#define DMG_N 40
+static char dmg_payload[DMG_N + 1][32];
+static uint64_t dmg_off[DMG_N + 2]; /* byte offset of record i in the segment file; [DMG_N + 1] is its end */
+
+/* A log of DMG_N entries in `dir`, synced; with `floor` the durable floor is made to name DMG_N. Returns nothing:
+ * the files are the result. */
+static void dmg_make(const char *dir, bool floor)
+{
+    char err[512];
+    raft_log *l;
+    raft_log_opts o = {0};
+    o.segment_bytes = RAFT_LOG_SEGMENT_MIN;
+    o.floor_every_ns = 1;
+    CHECK(raft_log_open(dir, &o, 0, 0, &l, err, sizeof err) == ISO_OK);
+    raft_entry e[DMG_N];
+    dmg_off[1] = RAFT_LOG_SEGMENT_HEAD;
+    for (unsigned i = 0; i < DMG_N; i++) {
+        snprintf(dmg_payload[i + 1], sizeof dmg_payload[i + 1], "entry %u", i + 1);
+        e[i] = (raft_entry){.index = i + 1, .term = 1, .type = RAFT_ENTRY_NORMAL,
+                            .len = (uint32_t)strlen(dmg_payload[i + 1]), .data = dmg_payload[i + 1]};
+        dmg_off[i + 2] = dmg_off[i + 1] + RAFT_LOG_RECORD_HEAD + e[i].len;
+    }
+    CHECK(raft_log_file_ops.append(l, e, DMG_N) == ISO_OK);
+    raft_hard_state hs = {.term = 1, .vote = 1};
+    CHECK(raft_log_hard_save(l, &hs, err, sizeof err) == ISO_OK);
+    raft_log_sync s;
+    CHECK(raft_log_sync_prepare(l, &s) == ISO_OK);
+    CHECK(raft_log_sync_run(&s) == ISO_OK);
+    raft_log_durable(l, s.index, s.term);
+    if (floor) {
+        CHECK(raft_log_floor_due(l, DMG_N, 1000000000ull));
+        CHECK(raft_log_sync_prepare(l, &s) == ISO_OK);
+        CHECK(raft_log_sync_run(&s) == ISO_OK);
+        raft_log_durable(l, s.index, s.term);
+        raft_term ft;
+        CHECK(raft_log_floor(l, &ft) == DMG_N);
+    }
+    raft_log_close(l);
+}
+
+static void dmg_path(char *out, size_t n, const char *dir)
+{
+    snprintf(out, n, "%s/log-%020d", dir, 1);
+}
+
+static off_t dmg_size(const char *dir)
+{
+    char p[4200];
+    struct stat st;
+    dmg_path(p, sizeof p, dir);
+    CHECK(stat(p, &st) == 0);
+    return st.st_size;
+}
+
+static void dmg_flip(const char *dir, uint64_t at)
+{
+    char p[4200];
+    dmg_path(p, sizeof p, dir);
+    FILE *f = fopen(p, "r+b");
+    CHECK(f != NULL);
+    uint8_t b = 0;
+    CHECK(f && fseek(f, (long)at, SEEK_SET) == 0 && fread(&b, 1, 1, f) == 1);
+    b ^= 0x5a;
+    CHECK(f && fseek(f, (long)at, SEEK_SET) == 0 && fwrite(&b, 1, 1, f) == 1);
+    if (f)
+        fclose(f);
+}
+
+static void dmg_open_ok(const char *dir, raft_index want_last, uint64_t want_torn, const char *what)
+{
+    char err[512];
+    raft_log *l;
+    raft_log_opts o = {0};
+    o.segment_bytes = RAFT_LOG_SEGMENT_MIN;
+    iso_err rc = raft_log_open(dir, &o, 0, 0, &l, err, sizeof err);
+    if (rc != ISO_OK) {
+        fprintf(stderr, "%s: open failed (%d): %s\n", what, (int)rc, err);
+        failures++;
+        return;
+    }
+    raft_log_stats st;
+    raft_log_stat(l, &st);
+    if (raft_log_file_ops.last(l) != want_last || st.torn_tail_bytes != want_torn) {
+        fprintf(stderr, "%s: last %" PRIu64 " (want %" PRIu64 "), torn bytes %" PRIu64 " (want %" PRIu64 ")\n", what,
+                (uint64_t)raft_log_file_ops.last(l), (uint64_t)want_last, st.torn_tail_bytes, want_torn);
+        failures++;
+    }
+    /* what is left reads back whole, and the log takes the next entry */
+    raft_entry got[1];
+    for (raft_index i = 1; i <= want_last && i <= DMG_N; i++) {
+        unsigned n = raft_log_file_ops.get(l, i, i + 1, 1 << 20, got, 1);
+        CHECK(n == 1 && got[0].len == strlen(dmg_payload[i]) && !memcmp(got[0].data, dmg_payload[i], got[0].len));
+        raft_log_file_ops.release(l);
+    }
+    raft_entry e = {.index = want_last + 1, .term = 1, .type = RAFT_ENTRY_NORMAL, .len = 3, .data = "new"};
+    CHECK(raft_log_file_ops.append(l, &e, 1) == ISO_OK && raft_log_file_ops.last(l) == want_last + 1);
+    raft_log_close(l);
+}
+
+/* The open refuses: ISO_ERR_CORRUPT, a message that says where, and nothing cut (twice: a restart refuses again) */
+static void dmg_open_refused(const char *dir, const char *word, const char *what)
+{
+    for (int round = 0; round < 2; round++) {
+        char err[1024] = "";
+        raft_log *l = NULL;
+        raft_log_opts o = {0};
+        o.segment_bytes = RAFT_LOG_SEGMENT_MIN;
+        off_t before = dmg_size(dir);
+        iso_err rc = raft_log_open(dir, &o, 0, 0, &l, err, sizeof err);
+        if (rc != ISO_ERR_CORRUPT || !strstr(err, word)) {
+            fprintf(stderr, "%s (open %d): rc %d, message '%s'; wanted ISO_ERR_CORRUPT naming '%s'\n", what, round,
+                    (int)rc, err, word);
+            failures++;
+            if (rc == ISO_OK)
+                raft_log_close(l);
+        }
+        CHECK(dmg_size(dir) == before); /* a refusal cuts nothing */
+    }
+}
+
+static void test_raft_log_damage(const char *base)
+{
+    char dir[4096], seg[4200];
+    /* 1. a record cut in two: the tail of the last segment is where a crash leaves one: cut, no more */
+    snprintf(dir, sizeof dir, "%s/torn", base);
+    dmg_make(dir, false);
+    dmg_path(seg, sizeof seg, dir);
+    uint64_t cut = dmg_off[DMG_N] + RAFT_LOG_RECORD_HEAD + 3; /* inside the last record's payload */
+    CHECK(truncate(seg, (off_t)cut) == 0);
+    dmg_open_ok(dir, DMG_N - 1, cut - dmg_off[DMG_N], "torn last record");
+    /* 2. zeros after the last record (a file extended and never written) */
+    snprintf(dir, sizeof dir, "%s/zeros", base);
+    dmg_make(dir, false);
+    dmg_path(seg, sizeof seg, dir);
+    CHECK(truncate(seg, (off_t)dmg_off[DMG_N + 1] + 100) == 0);
+    dmg_open_ok(dir, DMG_N, 100, "zeros after the last record");
+    /* 3. no floor yet: a flipped byte in a record in the middle is cut with everything after it (the floor is what
+     * tells acknowledged rot from a tear; before it there is none) */
+    snprintf(dir, sizeof dir, "%s/nofloor", base);
+    dmg_make(dir, false);
+    dmg_flip(dir, dmg_off[21] + RAFT_LOG_RECORD_HEAD + 2);
+    dmg_open_ok(dir, 20, dmg_off[DMG_N + 1] - dmg_off[21], "rot above no floor");
+    /* 4. the floor names the end: the same flip is rot in what was acknowledged, refused, nothing cut */
+    snprintf(dir, sizeof dir, "%s/floor", base);
+    dmg_make(dir, true);
+    dmg_flip(dir, dmg_off[21] + RAFT_LOG_RECORD_HEAD + 2);
+    dmg_open_refused(dir, "21", "rot at or below the durable floor");
+    /* ... and so is a record cut in two at or below it */
+    snprintf(dir, sizeof dir, "%s/floortorn", base);
+    dmg_make(dir, true);
+    dmg_path(seg, sizeof seg, dir);
+    CHECK(truncate(seg, (off_t)(dmg_off[DMG_N] + RAFT_LOG_RECORD_HEAD + 3)) == 0);
+    dmg_open_refused(dir, "40", "a torn record at the durable floor");
+    /* 5. the header of the only segment damaged: refused whatever else holds */
+    snprintf(dir, sizeof dir, "%s/header", base);
+    dmg_make(dir, false);
+    dmg_flip(dir, 20);
+    dmg_open_refused(dir, "log-", "a damaged segment header");
+}
+
+/* The hard state's two slots (4096 bytes each; 0 magic[8], 8 crc, 12 seq, 20 term, 28 vote): a slot a save tore is
+ * forgiven beside a valid one, a damaged one whose magic is whole is not, a zeroed one beside a later sequence is not. */
+static void test_hard_state_damage(const char *base)
+{
+    char dir[4096], hard[4200], err[512];
+    raft_hard_state hs, back;
+    raft_log *l;
+    raft_log_opts o = {0};
+    o.segment_bytes = RAFT_LOG_SEGMENT_MIN;
+    for (int variant = 0; variant < 4; variant++) {
+        snprintf(dir, sizeof dir, "%s/hard%d", base, variant);
+        CHECK(raft_log_open(dir, &o, 0, 0, &l, err, sizeof err) == ISO_OK);
+        for (unsigned t = 1; t <= 3; t++) { /* three saves: sequences 1 to 3, in both slots */
+            hs = (raft_hard_state){.term = 10 + t, .vote = t};
+            CHECK(raft_log_hard_save(l, &hs, err, sizeof err) == ISO_OK);
+        }
+        raft_log_close(l);
+        snprintf(hard, sizeof hard, "%s/hard", dir);
+        CHECK(raft_log_hard_load(dir, &back, err, sizeof err) == ISO_OK && back.term == 13 && back.vote == 3);
+        FILE *f = fopen(hard, "r+b");
+        CHECK(f != NULL);
+        if (!f)
+            return;
+        uint8_t slot[2][8192 / 2];
+        CHECK(fread(slot[0], 1, 4096, f) == 4096 && fread(slot[1], 1, 4096, f) == 4096);
+        uint64_t seq[2];
+        memcpy(&seq[0], slot[0] + 12, 8);
+        memcpy(&seq[1], slot[1] + 12, 8);
+        int newer = seq[1] > seq[0], older = !newer;
+        CHECK(seq[newer] == 3 && seq[older] == 2);
+        long at = 0;
+        const char *label = "";
+        switch (variant) {
+        case 0: /* the older slot's magic broken: a torn save beside a valid slot, forgiven */
+            at = older * 4096 + 0;
+            label = "torn older slot";
+            break;
+        case 1: /* the newest slot's magic broken: forgiven, the older state is what is read */
+            at = newer * 4096 + 0;
+            label = "torn newest slot";
+            break;
+        case 2: /* a slot whose magic is whole and whose checksum is not: damage, refused */
+            at = newer * 4096 + 20;
+            label = "damaged newest slot";
+            break;
+        default: /* the older slot zeroed beside sequence 3: refused (only the first save leaves a blank) */
+            at = -1;
+            label = "zeroed older slot";
+        }
+        if (at >= 0) {
+            CHECK(fseek(f, at, SEEK_SET) == 0);
+            uint8_t b = slot[at / 4096][at % 4096] ^ 0x5a;
+            CHECK(fwrite(&b, 1, 1, f) == 1);
+        } else {
+            uint8_t zeros[4096] = {0};
+            CHECK(fseek(f, older * 4096, SEEK_SET) == 0 && fwrite(zeros, 1, 4096, f) == 4096);
+        }
+        fclose(f);
+        iso_err rc = raft_log_hard_load(dir, &back, err, sizeof err);
+        if (variant <= 1) {
+            raft_term want = variant == 0 ? 13 : 12;
+            if (rc != ISO_OK || back.term != want) {
+                fprintf(stderr, "%s: load rc %d term %" PRIu64 " (want ok, term %" PRIu64 "): %s\n", label, (int)rc,
+                        (uint64_t)back.term, (uint64_t)want, err);
+                failures++;
+            }
+        } else if (rc != ISO_ERR_CORRUPT || !strstr(err, "hard state")) {
+            fprintf(stderr, "%s: load rc %d, message '%s'; wanted ISO_ERR_CORRUPT naming the hard state\n", label,
+                    (int)rc, err);
+            failures++;
+        }
+        /* the log's own open reads the ring too and agrees */
+        err[0] = 0;
+        l = NULL;
+        rc = raft_log_open(dir, &o, 0, 0, &l, err, sizeof err);
+        if ((variant <= 1) != (rc == ISO_OK)) {
+            fprintf(stderr, "%s: open rc %d: %s\n", label, (int)rc, err);
+            failures++;
+        }
+        if (rc == ISO_OK)
+            raft_log_close(l);
+    }
+}
+
 /* ================================================================ the metadata simulator */
 
 #define SIM_NODES_MAX 5
@@ -2116,7 +2362,10 @@ int main(int argc, char **argv)
         test_shared();
     }
     if (!mutant) {
-        test_raft_log(scratch_make(dir, "test_meta_log"));
+        const char *b = scratch_make(dir, "test_meta_log");
+        test_raft_log(b);
+        test_raft_log_damage(b);
+        test_hard_state_damage(b);
         test_raft_sim(seeds, first, seconds);
     }
     unsigned bad = 0;
