@@ -2,6 +2,7 @@
 #
 #   every push to main and every pull request: build-test, asan, tsan, clients, portable, integration, dco (pull requests)
 #   jepsen (about 12 minutes of fault injection) on every push and pull request too, and once a week (about 2 hours)
+#   integration-mutants (the integration suite against 23 planted bugs, about 40 minutes): once a week and on demand
 #
 # Rules this file follows:
 #   - Jobs run directly on ubuntu-24.04 runners (4 CPUs, 16 GB), never in container jobs. Packages come from apt.
@@ -276,6 +277,44 @@ jobs:
           path: |
             ci-logs
             build/integ/logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ------------------------------------------------------------------------------------ integration mutants
+  # Does the integration suite have teeth? Each of the 23 planted bugs (tests/integration/mutate.py) is built into a
+  # copy of the tree and the scenario that should notice it must fail. About 40 minutes, so once a week and on demand.
+  integration-mutants:
+    name: integration suite planted bugs
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install packages
+        run: .github/scripts/install-deps.sh clients
+      - name: Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: stable
+      - name: Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - name: make integration-mutants
+        run: |
+          ulimit -n 65536 || true
+          mkdir -p ci-logs
+          set -o pipefail
+          make -j"$(nproc)" build/tsdbd build/tsdb
+          make integration-mutants MUTATE_ARGS="--logs $PWD/ci-logs/mutants" 2>&1 | tee ci-logs/make-integration-mutants.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-integration-mutants
+          path: ci-logs
           if-no-files-found: ignore
           retention-days: 14
 

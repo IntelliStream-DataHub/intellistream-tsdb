@@ -618,13 +618,20 @@ integration-tests: $(B)/tsdbd $(B)/tsdb $(INTEG)/itc integ-rust integ-python int
 integration-selftest: $(B)/tsdbd $(B)/tsdb $(INTEG)/itc integ-rust integ-python integ-java
 	python3 tests/integration/selftest.py
 
+# Does the integration suite have teeth? Plants each known bug in a copy of the tree and requires the scenario that
+# should notice to fail (tests/integration/mutate.py; a mutant that survives, or a run that errors, fails this).
+# MUTATE_ARGS="--only M3,M5" runs some.
+MUTATE_ARGS ?=
+integration-mutants: $(B)/tsdbd $(B)/tsdb $(INTEG)/itc integ-rust integ-python integ-java
+	python3 tests/integration/mutate.py $(MUTATE_ARGS)
+
 # The same against the binaries of `make dist`: its tsdbd and tsdb, and the C client linked with its libtsdbclient.a.
 integration-tests-dist: dist integ-rust integ-python integ-java
 	$(CC) -O2 -g -std=gnu11 -Iinclude -Iclient -o $(DIST_B)/itc tests/integration/c/itc.c $(DIST_B)/libtsdbclient.a \
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-cli-stats sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: test-cli-stats sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

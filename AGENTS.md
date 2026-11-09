@@ -41,7 +41,8 @@ make test-clients         # Rust, Python and Java clients (network and embedded)
                           # (needs cargo, python3, mvn); make test-spdx: the licence line of every file (part of make test)
 make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
 make integration-tests    # tsdbd + CLI + C/Rust/Python/Java clients end to end, uring and epoll (~2 min, same tools);
-                          # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/; mutate.py checks it has teeth;
+                          # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/;
+                          # make integration-mutants (mutate.py: 23 planted bugs, ~40 min, CI weekly) checks it has teeth;
                           # run.py --auth off,on (default both): matrix and cli also as users with grants, cross-tenant reads fail;
                           # make integration-selftest tests the harness itself (seconds)
 ```
