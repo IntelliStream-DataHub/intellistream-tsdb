@@ -715,11 +715,6 @@ fn tsdbd_answers_what_the_embedded_engine_answered() {
         db.insert_series_values(id, &ts[100..110], &make(ty, 100..110, 1, codes)).unwrap();
         names.push(name);
     }
-    // Both sides read the same parts: closing writes the corrections to a part of their own, which tsdbd's
-    // background merge may combine before or after its queries, and a float spread over two overlapping parts
-    // differs in the last bits from one over their merge (docs/design.md; 1 run in 20 on 4 CPUs).
-    db.flush().unwrap();
-    db.optimize().unwrap();
     let groups = [
         Group::new(Unit::Hour),
         Group::new(Unit::Minute).count(15),
@@ -728,7 +723,24 @@ fn tsdbd_answers_what_the_embedded_engine_answered() {
         Group::new(Unit::Month).timezone("+05:30"),
     ];
     let range = T0 + 1000..T0 + 200_000_000;
-    let embedded: Vec<String> = names.iter().flat_map(|name| answers(&mut db, name, range.clone(), &groups)).collect();
+    // The answers of int64, bool and state series do not depend on how rows are spread over parts: taken now, with
+    // the corrections still in the memtable over the part, they must be the ones tsdbd gives from its reopened
+    // parts, however its background merge has combined them by then.
+    let floats = |name: &str| name.ends_with("float32") || name.ends_with("float64");
+    let mut embedded: Vec<Vec<String>> =
+        names.iter().map(|n| if floats(n) { Vec::new() } else { answers(&mut db, n, range.clone(), &groups) }).collect();
+    // Float sums, variances and spreads combine per granule, so their last bits do depend on the layout (two
+    // overlapping parts and their merge differ: docs/design.md). Both sides read one merged part: closing writes the
+    // corrections to a part of their own, which tsdbd's merge may combine before or after its queries (1 run in 20
+    // on 4 CPUs).
+    db.flush().unwrap();
+    db.optimize().unwrap();
+    for (i, n) in names.iter().enumerate() {
+        if floats(n) {
+            embedded[i] = answers(&mut db, n, range.clone(), &groups);
+        }
+    }
+    let embedded: Vec<String> = embedded.into_iter().flatten().collect();
     db.close().unwrap();
     let srv = Server::start_in(dir);
     let mut c = srv.client();
