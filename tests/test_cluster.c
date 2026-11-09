@@ -1664,8 +1664,10 @@ static void scen_syncrace(void)
  * state goes back to an earlier image). What each scenario catches was measured, not assumed (test-trust review,
  * 2026-11-09): with every fdatasync of raft_log.c removed `power` fails; with only the hard state's sync removed (C2)
  * `power` and `powersnap` PASS, because the term saved at the restart is synced by the log's own rounds, and only
- * `powervote` (below) fails it. The planted C1, C2 and C7 are run by `make test` (cluster-mutants). The clean server
- * passes every run. crashfs follows dup'ed descriptors for this (the log syncs duplicates of its segments).
+ * `powervote` (below) fails it, in every run, and `make test` plants it (cluster-mutants). NOT caught (measured, 6 runs
+ * each): the log's two fdatasync sites removed (C1) by `power`, and the snapshot's rename without its directory fsync
+ * (C7, cluster.c write of the snapshot) by `powersnap`: other syncs cover them, so those two have no test yet. The clean
+ * server passes every run. crashfs follows dup'ed descriptors for this (the log syncs duplicates of its segments).
  * No CRASHFS_TEAR: a tear may keep every unsynced byte, which would let the unsynced log pass now and then.
  * CRASHFS_REWRITE=old: a hard-state slot rewritten in place and not yet synced comes back as the old slot, not as zeros
  * (a blank slot beside sequence N > 1 is damage by the log's own rule, and a disk leaves old or new bytes there: with
