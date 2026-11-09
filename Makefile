@@ -278,6 +278,16 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_types
 	./$(B)/test_delete
 	./$(B)/test_levels
+	$(if $(TEST_GROUPS),$(MAKE) -j1 $(TEST_GROUPS))
+
+# The rest of `make test` as groups (the recipe lines are those that were here, in the same order). `make test` runs
+# them last, one after the other; CI runs each on a runner of its own (`make tsan TEST_TARGET=test-meta`,
+# .github/workflows/ci.yml): ThreadSanitizer and ASan take about 80 minutes for all of them on 4 CPUs. A group has the
+# prerequisites it needs, so that it builds and runs alone. `make test TEST_GROUPS=` runs only the lines above.
+TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
+TEST_TARGET ?= test
+.PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
+test-units-b: $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB)
 	./$(B)/test_group
 	./$(B)/test_lttb
 	B=$(B) tests/test_cli_lttb.sh
@@ -302,9 +312,16 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
+
+test-meta: $(B)/test_meta $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	./$(B)/test_meta /tmp --seeds 12 --seconds 15
-	tests/meta_mutants.sh $(B)/test_meta_mut
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
+
+# the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 17 runs of 2 minutes each under a sanitizer
+test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
+	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
+
+test-net: $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stability $(B)/tsdbd
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	./$(B)/test_wire tests/data/wire13-vectors.txt
@@ -424,7 +441,7 @@ ASAN_RUN   := $(if $(ASAN_ARCH),detect_stack_use_after_return=0:)
 asan: ubsan-check
 	$(MAKE) clean
 	ASAN_OPTIONS="$(ASAN_RUN)$$ASAN_OPTIONS" UBSAN_OPTIONS="$(UBSAN_RUN) $$UBSAN_OPTIONS" \
-	$(MAKE) ARCH="$(ASAN_ARCH)" CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" test
+	$(MAKE) ARCH="$(ASAN_ARCH)" CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" $(TEST_TARGET)
 
 ubsan-check:
 	@mkdir -p $(B)
@@ -442,7 +459,7 @@ ubsan-check:
 TSAN_FLAGS := -O1 -g -fsanitize=thread -fno-omit-frame-pointer
 tsan:
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 $$TSAN_OPTIONS" \
-	$(MAKE) B=build-tsan TSDBD=build-tsan/tsdbd ARCH= CFLAGS="$(TSAN_FLAGS)" test
+	$(MAKE) B=build-tsan TSDBD=build-tsan/tsdbd ARCH= CFLAGS="$(TSAN_FLAGS)" $(TEST_TARGET)
 
 $(B):
 	mkdir -p $(B)
@@ -972,4 +989,9 @@ test-release:
 	tests/test_release_notes.sh
 	python3 -I tests/test_release_publish.py
 
-.PHONY: test-quickstart check-site test-release
+# every group above is a matrix entry of the sanitizer jobs in .github/workflows/ci.yml
+test: check-ci-groups
+check-ci-groups:
+	tests/check_ci_groups.sh
+
+.PHONY: test-quickstart check-site test-release check-ci-groups
