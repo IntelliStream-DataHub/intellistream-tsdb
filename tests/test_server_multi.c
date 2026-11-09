@@ -714,6 +714,30 @@ static int read_to_end(int fd, uint32_t id, uint32_t *answered, uint32_t *seen)
     }
 }
 
+/* The server's anonymous memory growth since `before`, once the request has started to fill it (at least `lo_kb`:
+ * a lower bound, so that a request that never started cannot pass an upper bound) and has stopped growing (the same
+ * to within 1 MiB for 600 ms): measured, not slept for. Fails with the numbers when `lo_kb` is not reached in 20 s. */
+static long settled_growth_kb(pid_t pid, long before, long lo_kb, const char *what)
+{
+    long last = -1;
+    int flat = 0;
+    for (int i = 0; i < 200; i++) {
+        long g = rss_anon_kb(pid) - before;
+        if (g >= lo_kb && last >= 0 && g - last < 1024 && last - g < 1024)
+            flat++;
+        else
+            flat = 0;
+        if (flat >= 6)
+            return g;
+        last = g;
+        usleep(100000);
+    }
+    long g = rss_anon_kb(pid) - before;
+    fprintf(stderr, "%s: memory grew %ld KiB, wanted at least %ld KiB and a flat curve within 20 s\n", what, g, lo_kb);
+    CHECK(g >= lo_kb); /* a miss of the lower bound is the failure; a curve still rising is judged by the caller */
+    return g;
+}
+
 /* A client that sends a large QUERY_MULTI and reads nothing: the server holds at most the results ahead of the head
  * and its output cap, other connections are answered at once, and --send-timeout ends the connection. */
 static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
@@ -725,8 +749,7 @@ static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
     int fd = raw_connect();
     double t0 = now_ms();
     raw_values_multi(fd, 7, list, 64);
-    usleep(1500000);
-    long grown = rss_anon_kb(pid) - before;
+    long grown = settled_growth_kb(pid, before, 1024, "stalled reader");
     fprintf(stderr, "stalled reader: server anonymous memory grew %ld KiB\n", grown);
     CHECK(SANITIZED || grown <= (64 + 8 + 48) * 1024L);
     tsdbc *c2;
@@ -773,8 +796,7 @@ static void test_stall_small(pid_t pid)
     long before = rss_anon_kb(pid);
     int fd = raw_connect();
     raw_send(fd, 9, TSDB_OP_QUERY_MULTI, req, len);
-    usleep(2000000);
-    long grown = rss_anon_kb(pid) - before;
+    long grown = settled_growth_kb(pid, before, 256, "stalled reader, small replies");
     fprintf(stderr, "stalled reader, small replies: server anonymous memory grew %ld KiB\n", grown);
     CHECK(SANITIZED || grown <= (64 + 8 + 48) * 1024L);
     close(fd);
@@ -807,8 +829,8 @@ static void test_stall_buckets(pid_t pid)
             raw_send(fd, 11, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_BUCKETS, 0, 1, &big_id, t, 48));
         else
             raw_send(fd, 11, TSDB_OP_QUERY_BUCKETS, t, 48);
-        usleep(2000000);
-        long grown = status_kb(pid, "RssAnon") - before, peak = hwm ? status_kb(pid, "VmHWM") - hwm0 : -1;
+        long grown = settled_growth_kb(pid, before, result_kb / 2, "stalled reader, a full frame of buckets"),
+             peak = hwm ? status_kb(pid, "VmHWM") - hwm0 : -1;
         fprintf(stderr, "stalled reader, a full frame of buckets (%s, io %s): server anonymous memory grew %ld KiB, "
                         "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS",
                 getenv("TSDBD_IO") ? getenv("TSDBD_IO") : "default", grown, peak, result_kb);
