@@ -13,6 +13,7 @@
 #include <limits.h>
 #include "harness.h"
 #include "outagefs_ctl.h"
+#include "outage_status.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -272,7 +273,7 @@ int main(int argc, char **argv)
 
     /* the domain hangs and goes DOWN */
     CHECK(fault("hang", dir_a) == 0);
-    msleep(4500);
+    CHECK(os_await_domain_down(c, vol_a, 30000) >= 0);
     int64_t ts = 2000;
     int rc = tsdbc_insert_series(c, sid_a, &ts, &v, 1);
     CHECK(rc == TSDB_ERR_UNAVAILABLE);

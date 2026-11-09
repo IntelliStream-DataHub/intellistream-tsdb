@@ -873,11 +873,11 @@ $(B)/test_outagefs: tests/test_outagefs.c tests/outagefs_ctl.h | $(B)
 $(B)/test_outage: tests/test_outage.c tests/harness.h tests/outagefs_ctl.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
-$(B)/test_unavailable: tests/test_unavailable.c tests/harness.h tests/outagefs_ctl.h $(CLIB) $(LIB)
+$(B)/test_unavailable: tests/test_unavailable.c tests/harness.h tests/outagefs_ctl.h tests/outage_status.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
-$(B)/outage_server: tests/outage_server.c tests/harness.h tests/outagefs_ctl.h $(LIB)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+$(B)/outage_server: tests/outage_server.c tests/harness.h tests/outagefs_ctl.h tests/outage_status.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
 $(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
