@@ -1649,14 +1649,37 @@ static int sweep_delete(const char *name, int round, bool *fired_out)
     return rc;
 }
 
-static void run_sweep(const char *what, sweep_fn fn, const char *name)
+/* A sweep that fires no fault proves nothing, and one that stops at its cap has not reached the end of the
+ * scenario: both are failures. `min` is the least number of faults (fsyncs and fdatasyncs of the scenario together)
+ * the sweep must have fired; the counts are printed, so a change that shrinks a scenario shows. */
+#define SWEEP_CAP 60
+static int sweep_total;
+
+static void sweep_judge(const char *what, int fired_count, int min)
 {
+    printf("    %s: %d faults fired\n", what, fired_count);
+    if (fired_count < min) {
+        fprintf(stderr, "%s: only %d faults fired in the sweep, at least %d expected: it no longer tests what it says\n",
+                what, fired_count, min);
+        failures++;
+    }
+    sweep_total += fired_count;
+}
+
+static void run_sweep(const char *what, sweep_fn fn, const char *name, int min)
+{
+    int fired_count = 0;
     for (int kind = 0; kind < 2; kind++) {
-        for (int n = 0; n < 60; n++) {
+        for (int n = 0; n < SWEEP_CAP; n++) {
             bool hit = false;
             int rc = fn(name, (kind << 8) | n, &hit);
             if (!hit)
                 break;
+            fired_count++;
+            if (n == SWEEP_CAP - 1) {
+                fprintf(stderr, "%s: the sweep reached its cap of %d with faults still firing\n", what, SWEEP_CAP);
+                failures++;
+            }
             if (rc == 0) {
                 fprintf(stderr, "%s: the %s number %d failed and the call returned success\n", what,
                         kind ? "fdatasync" : "fsync", n);
@@ -1664,14 +1687,16 @@ static void run_sweep(const char *what, sweep_fn fn, const char *name)
             }
         }
     }
+    sweep_judge(what, fired_count, min);
 }
 
 /* An open that finds work to redo (an intent to roll forward, a WAL segment to replay, tmp files to remove) makes
  * the result durable before it goes on; if that fails the open fails. `prepare` leaves such a directory in `src`. */
-static void run_open_sweep(const char *what, const char *src, const char *work)
+static void run_open_sweep(const char *what, const char *src, const char *work, int min)
 {
+    int fired_count = 0;
     for (int kind = 0; kind < 2; kind++) {
-        for (int n = 0; n < 60; n++) {
+        for (int n = 0; n < SWEEP_CAP; n++) {
             char cmd[1400];
             rm_tree(work);
             snprintf(cmd, sizeof cmd, "cp -a '%s' '%s'", src, work);
@@ -1689,6 +1714,11 @@ static void run_open_sweep(const char *what, const char *src, const char *work)
                 tsdb_close(db);
             if (!hit)
                 break;
+            fired_count++;
+            if (n == SWEEP_CAP - 1) {
+                fprintf(stderr, "%s: the open sweep reached its cap of %d with faults still firing\n", what, SWEEP_CAP);
+                failures++;
+            }
             if (rc == 0) {
                 fprintf(stderr, "%s: open: the %s number %d failed and the open succeeded\n", what,
                         kind ? "fdatasync" : "fsync", n);
@@ -1696,19 +1726,21 @@ static void run_open_sweep(const char *what, const char *src, const char *work)
             }
         }
     }
+    sweep_judge(what, fired_count, min);
 }
 
 static void test_fsync_results(const char *base)
 {
     char name[600], src[600], work[600];
     snprintf(name, sizeof name, "%s/failstop-sweep", base);
-    run_sweep("insert", sweep_insert, name);
-    run_sweep("flush", sweep_flush, name);
-    run_sweep("merge", sweep_merge, name);
-    run_sweep("delete", sweep_delete, name);
+    run_sweep("insert", sweep_insert, name, 6);
+    run_sweep("flush", sweep_flush, name, 3);
+    run_sweep("merge", sweep_merge, name, 2);
+    run_sweep("delete", sweep_delete, name, 2);
     printf("  every failed fsync of an insert, a flush, a merge and a delete reaches the caller\n");
 
     /* creating a database */
+    int create_fired = 0;
     for (int kind = 0; kind < 2; kind++) {
         for (int n = 0; n < 20; n++) {
             rm_tree(name);
@@ -1723,6 +1755,7 @@ static void test_fsync_results(const char *base)
                 tsdb_close(db);
             if (!hit)
                 break;
+            create_fired++;
             if (rc == 0) {
                 fprintf(stderr, "create: the %s number %d failed and the open succeeded\n",
                         kind ? "fdatasync" : "fsync", n);
@@ -1731,11 +1764,13 @@ static void test_fsync_results(const char *base)
         }
     }
 
+    sweep_judge("create", create_fired, 5);
+
     /* a leftover intent, rolled forward at the open */
     snprintf(src, sizeof src, "%s/failstop-sweep-src", base);
     snprintf(work, sizeof work, "%s/failstop-sweep-work", base);
     intent_left(src);
-    run_open_sweep("intent roll forward", src, work);
+    run_open_sweep("intent roll forward", src, work, 2);
 
     /* a WAL segment to replay: the directory copied while the database is open (a crash) */
     rm_tree(src);
@@ -1753,7 +1788,7 @@ static void test_fsync_results(const char *base)
     tsdb_close(db);
     char crash[620];
     snprintf(crash, sizeof crash, "%s.crash", src);
-    run_open_sweep("WAL replay", crash, work);
+    run_open_sweep("WAL replay", crash, work, 3);
     rm_tree(crash);
     printf("  every failed fsync while a database is created or opened reaches the open\n");
 }
