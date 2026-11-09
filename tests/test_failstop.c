@@ -339,6 +339,11 @@ static tsdb *open_fresh(const char *name, tsdb_options o)
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0)
         failures++;
+    /* the files just removed free their inode numbers, which a new file may take: the sizes recorded for them
+     * (what a failing sync with `drop` truncates to) are not this database's */
+    pthread_mutex_lock(&f_lock);
+    nsynced = 0;
+    pthread_mutex_unlock(&f_lock);
     tsdb *db = NULL;
     OK(tsdb_open(dir, &o, &db));
     char real[PATH_MAX];
@@ -741,6 +746,66 @@ static void test_manifest(const char *base)
     expect_rows(db, "s", ts, 100);
     tsdb_close(db);
     printf("  failed MANIFEST rewrite after an insert's commit\n");
+}
+
+/* A failed write or sync of RETENTION is not fail-stop (nothing acknowledged relies on it: the call answers IO): the
+ * limit is not applied, the file takes no more records (ret_broken: it may end in a torn one), and everything else
+ * goes on. A reopen cuts a torn tail, and the limit can then be set again and stays. `drop` makes the sync lose what
+ * the pwrite wrote since the last one, as a power loss would; without it the record is on disk and a reopen applies
+ * the limit although the call said IO, which an IO answer allows, so that case is not asserted. */
+static void retention_case(const char *base, const char *label, int op, bool partial, bool drop)
+{
+    char name[600];
+    int before = failures;
+    snprintf(name, sizeof name, "%s/failstop-retention", base);
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    struct timespec nowts;
+    clock_gettime(CLOCK_REALTIME, &nowts);
+    int64_t now = (int64_t)nowts.tv_sec * 1000 + nowts.tv_nsec / 1000000;
+    int64_t want[6];
+    for (int i = 0; i < 5; i++) {
+        want[i] = now - 60000 + i * 1000;
+        OK(tsdb_append(db, id, want[i], (float)i));
+    }
+    arm(op, "/RETENTION", partial, drop);
+    CHECK(tsdb_set_retention(db, id, 1000) == TSDB_ERR_IO); /* 1 s: would hide every row if it were applied */
+    CHECK(fired() == 1);
+    int64_t lim = -1;
+    OK(tsdb_get_retention(db, id, &lim));
+    CHECK(lim == 0);                          /* not applied in memory */
+    expect_rows(db, "s", want, 5);            /* so every row is still there */
+    CHECK(!is_failed(db, NULL));              /* not fail-stop */
+    CHECK(tsdb_set_retention(db, id, 2000) == TSDB_ERR_IO); /* the file takes no more records */
+    CHECK(fired() == 1);                      /* and was not even tried: the shim fired once */
+    want[5] = now - 30000;
+    OK(tsdb_append(db, id, want[5], 5)); /* rows still go in */
+    expect_rows(db, "s", want, 6);
+    db = reopen(db);
+    OK(tsdb_series_lookup(db, "s", &id));
+    OK(tsdb_get_retention(db, id, &lim));
+    CHECK(lim == 0);                          /* the torn or lost record is not there */
+    expect_rows(db, "s", want, 6);
+    OK(tsdb_set_retention(db, id, 1000));     /* and the file takes a limit again */
+    OK(tsdb_get_retention(db, id, &lim));
+    CHECK(lim == 1000);
+    expect_rows(db, "s", want, 0);            /* applied now: the rows are older than a second */
+    db = reopen(db);
+    OK(tsdb_series_lookup(db, "s", &id));
+    OK(tsdb_get_retention(db, id, &lim));
+    CHECK(lim == 1000);                       /* durable */
+    tsdb_close(db);
+    if (failures != before)
+        fprintf(stderr, "  ... in the case: failed RETENTION %s\n", label);
+    printf("  failed RETENTION %s\n", label);
+}
+
+static void test_retention_write(const char *base)
+{
+    retention_case(base, "write (torn record)", F_PWRITE, true, false);
+    retention_case(base, "write (nothing written)", F_PWRITE, false, false);
+    retention_case(base, "fdatasync (the record is lost)", F_FDATASYNC, false, true);
 }
 
 /* A torn series dictionary record ends the dictionary for the next open. */
@@ -1807,6 +1872,7 @@ int main(int argc, char **argv)
     test_fence_failure(root);
     test_flush_retry(root);
     test_manifest(root);
+    test_retention_write(root);
     test_series_dict(root);
     test_series_dict_add(root);
     test_series_dict_cause(root);
