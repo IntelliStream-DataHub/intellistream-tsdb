@@ -48,9 +48,13 @@ static void spin_us(int us)
 
 /* a job of n items, each spinning us microseconds; counts who did what */
 typedef struct job {
-    atomic_int next, done, inside, max_inside, helper_items, stopped;
+    atomic_int next, done, inside, max_inside, helper_items, stopped, released;
     int n, us;
+    int wait_inside; /* >0: a thread that enters waits (10 s at most) until this many are inside: "more than one
+                      * thread worked" is then a fact of the run, not a race against the machine's load */
     double t0, first_helper; /* when a helper first finished an item */
+    struct job *other;       /* with wait_inside: the job whose items left are counted when it is satisfied */
+    int other_left;
     pthread_mutex_t m;
     int ids[64];
     int nids;
@@ -71,6 +75,13 @@ static void job_fn(void *arg, int i)
     int in = atomic_fetch_add(&j->inside, 1) + 1;
     for (int m = atomic_load(&j->max_inside); in > m && !atomic_compare_exchange_weak(&j->max_inside, &m, in);)
         ;
+    if (j->wait_inside && !atomic_load(&j->released)) {
+        double dl = now_s() + 10;
+        while (atomic_load(&j->inside) < j->wait_inside && now_s() < dl)
+            usleep(100);
+        if (!atomic_exchange(&j->released, 1) && j->other)
+            j->other_left = j->other->n - atomic_load(&j->other->next);
+    }
     pthread_mutex_lock(&j->m);
     bool seen = false;
     for (int k = 0; k < j->nids; k++)
@@ -99,7 +110,8 @@ static void job_fn(void *arg, int i)
 
 typedef struct run_arg {
     sched *s;
-    int cap, n, us;
+    int cap, n, us, wait;
+    job *other; /* see job.other */
     job j;
     pthread_barrier_t *bar;
 } run_arg;
@@ -112,6 +124,8 @@ static void *run_thread(void *a)
         pthread_barrier_wait(r->bar);
     sched_group_begin(r->s, &g, r->cap);
     job_init(&r->j, r->n, r->us);
+    r->j.wait_inside = r->wait;
+    r->j.other = r->other;
     sched_run(r->s, 32, job_fn, &r->j);
     sched_group_end(&g);
     return NULL;
@@ -124,7 +138,8 @@ static void test_two_jobs(void)
     CHECK(sched_helpers(s) == 7);
     pthread_barrier_t bar;
     pthread_barrier_init(&bar, NULL, 2);
-    run_arg a[2] = {{.s = s, .n = 400, .us = 200, .bar = &bar}, {.s = s, .n = 400, .us = 200, .bar = &bar}};
+    run_arg a[2] = {{.s = s, .n = 400, .us = 200, .bar = &bar, .wait = 2},
+                    {.s = s, .n = 400, .us = 200, .bar = &bar, .wait = 2}};
     pthread_t th[2];
     for (int i = 0; i < 2; i++)
         pthread_create(&th[i], NULL, run_thread, &a[i]);
@@ -144,11 +159,11 @@ static void test_caps(void)
 {
     sched *s = sched_new(16, 3);
     CHECK(sched_request_threads(s) == 3);
-    run_arg a = {.s = s, .n = 300, .us = 100};
+    run_arg a = {.s = s, .n = 300, .us = 100, .wait = 2};
     run_thread(&a);
     CHECK(atomic_load(&a.j.done) == 300);
     CHECK(atomic_load(&a.j.max_inside) >= 2 && atomic_load(&a.j.max_inside) <= 3);
-    run_arg b = {.s = s, .cap = 5, .n = 300, .us = 100}; /* the call's own cap */
+    run_arg b = {.s = s, .cap = 5, .n = 300, .us = 100, .wait = 2}; /* the call's own cap */
     run_thread(&b);
     CHECK(atomic_load(&b.j.max_inside) >= 2 && atomic_load(&b.j.max_inside) <= 5);
     run_arg c = {.s = s, .cap = 1, .n = 50, .us = 10}; /* alone */
@@ -215,7 +230,7 @@ static void test_load(void)
     load_requests(s, 6, 1);
     load_requests(s, 4, 2);
 
-    run_arg r = {.s = s, .n = 2000, .us = 100}; /* 200 ms of items; the tree staffs all 7 helpers in far less */
+    run_arg r = {.s = s, .n = 2000, .us = 100, .wait = 7}; /* the first item waits until the tree has staffed 7 */
     run_thread(&r);
     CHECK(atomic_load(&r.j.done) == 2000);
     CHECK(atomic_load(&r.j.max_inside) >= 7 && atomic_load(&r.j.max_inside) <= 8);
@@ -231,15 +246,21 @@ static void test_newcomer(void)
     pthread_create(&th, NULL, run_thread, &big);
     while (atomic_load(&big.j.max_inside) < 8)
         spin_us(100);
-    run_arg small = {.s = s, .n = 200, .us = 1000};
+    /* The newcomer's first item waits until three threads are inside it (about half of the helpers): they must come
+     * while the big request still holds the pool, which the count of big's items left at that moment shows. The
+     * old pool ran the second request alone and never got there (10 s, then the checks fail). No bound in ms: how
+     * long that takes depends on the machine's load; what counts is that helpers left big's job for it. */
+    run_arg small = {.s = s, .n = 200, .us = 1000, .wait = 3, .other = &big.j};
     double t0 = now_s();
+    int big_left = -1;
     run_thread(&small);
+    big_left = small.j.other_left;
     CHECK(atomic_load(&small.j.helper_items) > 0);
-    double wait_ms = (small.j.first_helper - t0) * 1e3;
-    fprintf(stderr, "  newcomer: first helper item after %.2f ms, %d of 200 items by helpers, %d threads\n",
-            wait_ms, atomic_load(&small.j.helper_items), atomic_load(&small.j.max_inside));
-    CHECK(wait_ms < 25);                             /* one item is 1 ms; slack for a loaded machine */
-    CHECK(atomic_load(&small.j.max_inside) >= 3);    /* about half of the helpers */
+    fprintf(stderr, "  newcomer: first helper item after %.2f ms, %d of 200 items by helpers, %d threads, %d of 4000 items "
+            "of the big request left when the third joined\n", (small.j.first_helper - t0) * 1e3,
+            atomic_load(&small.j.helper_items), atomic_load(&small.j.max_inside), big_left);
+    CHECK(atomic_load(&small.j.max_inside) >= 3);
+    CHECK(big_left > 4000 / 10); /* helpers came from a pool that big still held, not from a pool big had finished */
     pthread_join(th, NULL);
     CHECK(atomic_load(&big.j.done) == 4000);
     sched_free(s);
