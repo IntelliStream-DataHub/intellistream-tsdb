@@ -72,7 +72,7 @@ values is in it three times, for x86-64-v2, v3 (AVX2) and v4 (AVX-512); tsdbd pi
 level writes the same bytes and gives the same answers, so data moves freely between machines.</p>
 <p>The tarball holds <code>bin/tsdbd</code>, <code>bin/tsdb</code>, the two libraries and their headers, its own
 test suite and a systemd unit. To install it as a service:</p>
-<pre><code class="language-sh" data-src="dist/README.dist#L47-L55">tar xzf tsdb-VERSION-x86_64-linux.tar.gz &amp;&amp; cd tsdb-VERSION-x86_64-linux
+<pre><code class="language-sh" data-src="dist/README.dist#L57-L65">tar xzf tsdb-VERSION-x86_64-linux.tar.gz &amp;&amp; cd tsdb-VERSION-x86_64-linux
 tests/run-tests.sh /var/tmp            # optional, a few minutes
 install -m 755 bin/tsdbd bin/tsdb /usr/local/bin/
 restorecon -v /usr/local/bin/tsdbd /usr/local/bin/tsdb    # SELinux: bin_t
