@@ -578,6 +578,9 @@ typedef struct cutrun {
     size_t n;
     atomic_int stop;
     atomic_long checked, torn;
+    atomic_long gens;     /* inserts the writer completed */
+    atomic_long nonempty; /* requests whose first series had a row */
+    atomic_long advanced; /* requests that saw a newer generation than the reader's previous one */
 } cutrun;
 
 static void *cut_writer(void *a)
@@ -589,6 +592,7 @@ static void *cut_writer(void *a)
         for (size_t i = 0; i < r->n; i++)
             ts[i] = T0 + 100000000 + g, v[i] = (float)g;
         OK(tsdb_insert(r->db, r->s, ts, v, r->n)); /* one insert: every series or none */
+        atomic_fetch_add(&r->gens, 1);
         if (g % 500 == 0)
             OK(tsdb_flush(r->db));
     }
@@ -612,6 +616,7 @@ static void *cut_reader(void *a)
     tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = T0 + 100000000, .end = INT64_MAX,
                           .opts = {TSDB_DESC, 1}};
     tsdb_multi_opts mo = {.threads = 4};
+    int64_t before = -1;
     while (!atomic_load(&r->stop)) {
         for (size_t i = 0; i < r->n; i++)
             last[i] = -1;
@@ -619,6 +624,13 @@ static void *cut_reader(void *a)
         for (size_t i = 1; i < r->n; i++)
             if (last[i] != last[0])
                 atomic_fetch_add(&r->torn, 1);
+        if (last[0] >= 0)
+            atomic_fetch_add(&r->nonempty, 1);
+        if (last[0] > before) {
+            if (before >= 0)
+                atomic_fetch_add(&r->advanced, 1);
+            before = last[0];
+        }
         atomic_fetch_add(&r->checked, 1);
     }
     free(last);
@@ -638,13 +650,33 @@ static void cuts(tsdb *db, double secs)
     pthread_create(&w, NULL, cut_writer, &r);
     for (int i = 0; i < 3; i++)
         pthread_create(&rd[i], NULL, cut_reader, &r);
-    usleep((useconds_t)(secs * 1e6));
+    /* Not a bare sleep: a writer that never ran, or readers that only ever saw empty answers, would make "no torn
+     * answer" true of nothing. Run for `secs`, then until the writer has made GENS inserts and the readers have seen
+     * the data and its newer generations (the floors), or fail at the deadline. */
+    enum { GENS = 200, NONEMPTY = 100, ADVANCED = 20 };
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    double waited;
+    for (;;) {
+        usleep(10000);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        waited = (double)(now.tv_sec - t0.tv_sec) + (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
+        if (waited >= secs && atomic_load(&r.gens) >= GENS && atomic_load(&r.nonempty) >= NONEMPTY &&
+            atomic_load(&r.advanced) >= ADVANCED)
+            break;
+        if (waited >= secs + 60)
+            break;
+    }
     atomic_store(&r.stop, 1);
     pthread_join(w, NULL);
     for (int i = 0; i < 3; i++)
         pthread_join(rd[i], NULL);
-    printf("  cuts: %ld requests over %zu series, %ld torn\n", atomic_load(&r.checked), r.n, atomic_load(&r.torn));
-    CHECK(atomic_load(&r.checked) > 0);
+    printf("  cuts: %ld requests over %zu series, %ld torn; the writer made %ld inserts, %ld answers held rows, %ld saw "
+           "a newer generation\n", atomic_load(&r.checked), r.n, atomic_load(&r.torn), atomic_load(&r.gens),
+           atomic_load(&r.nonempty), atomic_load(&r.advanced));
+    CHECK(atomic_load(&r.gens) >= GENS);       /* the writer ran */
+    CHECK(atomic_load(&r.nonempty) >= NONEMPTY); /* the readers read rows, not empty answers */
+    CHECK(atomic_load(&r.advanced) >= ADVANCED); /* and saw the writer's progress while it ran */
     CHECK(atomic_load(&r.torn) == 0);
     free(r.s);
 }

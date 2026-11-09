@@ -449,6 +449,8 @@ static void test_modes(const char *base)
     tsdb_close(db);
 
     int t0 = threads_stable();
+    if (t0 < 0)
+        printf("  stats off and lazy: SKIPPED the thread-count checks (no /proc/self/task here)\n");
     o.stats = -1; /* off: no thread, no event ring, no query counters, zeros in the totals */
     OK(tsdb_open(dir, &o, &db));
     int t_off = threads_stable();
@@ -495,7 +497,8 @@ static void test_modes(const char *base)
     OK(tsdb_open(dir, &o, &db));
     OK(tsdb_stats_settle(db, 60000));
     OK(tsdb_get_volume_stats(db, 0, &vs));
-    CHECK(vs.stats_cpu_ns > 0 || vs.stats_parts_counted > 0);
+    CHECK(vs.stats_parts_counted > 0);
+    CHECK(vs.stats_cpu_ns > 0); /* alone: the parts counted above would have made an `||` true without the clock */
     tsdb_close(db);
 }
 
