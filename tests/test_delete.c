@@ -366,17 +366,36 @@ static void test_crash(uint64_t seed)
         }
     }
     close(pfd[1]);
-    struct timespec d = {0, (long)(20 + seed * 7919 % 400) * 1000000};
+    /* Kill after the child has acknowledged a number of ops that depends on the seed (and a little later by the
+     * seed's own delay, so that the kill lands inside an op): not after a fixed time, which on a loaded machine
+     * may come before the child has made the series, and the round would then check nothing. */
+    size_t acked = 0, want = 5 + seed * 7919 % 140; /* the spread the fixed sleeps gave: 5 to 138 */
+    char buf[256];
+    ssize_t got;
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (acked < want) {
+        got = read(pfd[0], buf, sizeof buf);
+        if (got <= 0)
+            break; /* the child died by itself */
+        acked += (size_t)got;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - t0.tv_sec > 60)
+            break;
+    }
+    struct timespec d = {0, (long)(seed * 7919 % 40) * 1000000};
     nanosleep(&d, NULL);
     kill_child(pid);
     int status;
     waitpid(pid, &status, 0);
-    size_t acked = 0;
-    char buf[256];
-    ssize_t got;
     while ((got = read(pfd[0], buf, sizeof buf)) > 0)
         acked += (size_t)got;
     close(pfd[0]);
+    if (acked < want) {
+        fprintf(stderr, "FAIL crash seed %" PRIu64 ": the child acknowledged %zu ops, wanted %zu\n", seed, acked, want);
+        failures++;
+        return;
+    }
 
     static model m, m2;
     for (uint32_t s = 0; s < NS; s++)
@@ -397,12 +416,14 @@ static void test_crash(uint64_t seed)
     tsdb_options opt = test_opts();
     tsdb *db;
     int rc = tsdb_open(dir, &opt, &db);
-    if (rc == TSDB_ERR_NOTFOUND || (rc == 0 && tsdb_series_count(db) < NS)) { /* killed before the series existed */
-        if (rc == 0)
-            tsdb_close(db);
+    OK(rc);
+    if (tsdb_series_count(db) < NS) { /* acknowledged ops need their series: never skip a round silently */
+        fprintf(stderr, "FAIL crash seed %" PRIu64 ": %zu ops acknowledged but only %zu series after the kill\n", seed,
+                acked, (size_t)tsdb_series_count(db));
+        failures++;
+        tsdb_close(db);
         return;
     }
-    OK(rc);
     for (int pass = 0; pass < 2; pass++) {
         bool a = true, b = true;
         for (uint32_t s = 0; s < NS; s++) {
@@ -640,7 +661,26 @@ static void test_follower(void)
         n = agg_count(fo, 2, 0, D, &sum, &st);
     }
     CHECK(n == 50);
+    tsdb_stats ws0, ws, fs;
+    OK(tsdb_get_stats(db, &ws0));
     OK(tsdb_optimize(db));
+    OK(tsdb_get_stats(db, &ws));
+    CHECK(ws.parts < ws0.parts); /* the merge replaced the delete's parts: the follower must pass through that state */
+    /* The follower has the merged part list (it refreshed after the merge) before its answers are sampled, or a
+     * window of answers taken before the refresh would prove nothing; then it must go on answering 50. */
+    bool refreshed = false;
+    for (int i = 0; i < 1000 && !refreshed; i++) {
+        OK(tsdb_get_stats(fo, &fs));
+        refreshed = fs.parts == ws.parts;
+        if (!refreshed) {
+            struct timespec d = {0, 10000000};
+            nanosleep(&d, NULL);
+        }
+    }
+    if (!refreshed)
+        fprintf(stderr, "follower: %" PRIu64 " parts, the writer %" PRIu64 " after the merge, 10 s later\n", fs.parts,
+                ws.parts);
+    CHECK(refreshed);
     for (int i = 0; i < 30; i++) {
         struct timespec d = {0, 10000000};
         nanosleep(&d, NULL);
