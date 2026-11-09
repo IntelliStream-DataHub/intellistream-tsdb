@@ -262,7 +262,7 @@ before.</p>
 <tr><td><code>--rack NAME</code>, <code>--power-feed NAME</code></td><td>Where the server stands, for placing copies apart later. Shown by <code>status</code>.</td></tr>
 <tr><td><code>--bmc ADDR</code></td><td>The server's management controller, for the <code>bmc</code> failover. Stored; nothing uses it yet.</td></tr>
 <tr><td><code>--read-barrier on|off</code></td><td>This server's read barrier setting, for shared volumes. Default <code>on</code>.</td></tr>
-<tr><td><code>--witness</code></td><td>A member without data: needs <code>--cluster</code> and <code>--advertise</code>, takes no <code>--dir</code>. It votes and keeps the group's state.</td></tr>
+<tr><td><code>--witness</code></td><td>A member without data: needs <code>--cluster</code>, takes no <code>--dir</code> and has no client port. Give it <code>--advertise</code>, the host the others reach it at. It votes and keeps the group's state.</td></tr>
 </tbody></table></div>
 <p>For scripts: with <code>--port-file F</code> the file says <code>PORT PID MPORT PEER_PORT</code>. Start servers with
 <code>--port 0 --peer-port 0 --port-file F</code>, as the tests do, and a port is never taken twice.</p>

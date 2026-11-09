@@ -302,7 +302,7 @@ Everything below is off without `--cluster`.
 | `--power-feed NAME` | The server's power feed, the same. Shown by `status`. |
 | `--bmc ADDR` | The address of the server's management controller, for the `bmc` failover. Stored; nothing uses it yet. |
 | `--read-barrier on\|off` | This server's own read barrier setting, for shared volumes. Default `on`. |
-| `--witness` | A member without data: needs `--cluster`, takes no `--dir`, needs `--advertise`. Votes and keeps the group's state. |
+| `--witness` | A member without data: needs `--cluster`, takes no `--dir` (and has no client port). Give it `--advertise`, the host the others reach it at. It votes and keeps the group's state. |
 
 The client port, `--dir` and every other option work as without `--cluster`. For a script: with `--port-file F` the
 file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start servers with `--port 0 --peer-port 0
