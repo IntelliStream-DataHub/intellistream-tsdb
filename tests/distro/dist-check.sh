@@ -42,6 +42,12 @@ done
 for f in LICENSE NOTICE LICENSING.md LICENSES/Apache-2.0.txt THIRD-PARTY-NOTICES; do
     [ -s "$f" ] || { echo "$f missing from the tarball"; exit 1; }
 done
+# AGPL section 6: the way to the Corresponding Source, and the versions of the libraries linked in statically
+for w in "^source   https://github.com/" "^zstd     [0-9]" "^liburing [0-9]"; do
+    grep -q "$w" BUILDINFO || { echo "BUILDINFO has no line matching $w"; exit 1; }
+done
+grep -q "github.com/IntelliStream-DataHub/intellistream-tsdb" README.dist \
+    || { echo "README.dist does not say where the source is"; exit 1; }
 cat BUILDINFO
 bin/tsdb 2>&1 | head -n 1
 tests/run-tests.sh /tmp/scratch

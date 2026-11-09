@@ -1,6 +1,6 @@
 [package]
 name = "intellistream-tsdb-sys"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.88"

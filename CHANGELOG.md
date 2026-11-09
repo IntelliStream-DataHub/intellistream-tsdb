@@ -24,9 +24,12 @@ licence, what links to what, and how to ask for the commercial licence (IntelliS
   part of an AGPL work (`libtsdb` contains `tsdb_calendar.c`, `tsdbd` uses `tsdb_crypto.c`); the reverse is not done,
   and `tools/check-spdx.sh` (in `make test`) fails when an Apache file includes or imports an AGPL one. A header's
   licence does not change the terms of `libtsdb`: only `libtsdbclient.a` and the network clients are Apache.
-- Every source file has an `SPDX-License-Identifier` line, every package its `LICENSE` and `NOTICE` (the AGPL packages
-  also the Apache text, `LICENSES/Apache-2.0.txt`, since they contain Apache files), and the tarball `LICENSE`,
-  `LICENSES/`, `LICENSING.md`, `NOTICE` and `THIRD-PARTY-NOTICES`. `CONTRIBUTING.md` asks outside contributors for a
+- Every source file has an `SPDX-License-Identifier` line, every package its `LICENSE` and `NOTICE` (an Apache package
+  an Apache-only `NOTICE`, `LICENSES/NOTICE.apache`, which Apache-2.0 section 4(d) passes on to every program that bundles
+  it; the AGPL packages the `NOTICE` that names both, and the Apache text, `LICENSES/Apache-2.0.txt`, since they
+  contain Apache files), and the tarball `LICENSE`,
+  `LICENSES/`, `LICENSING.md`, `NOTICE` and `THIRD-PARTY-NOTICES`; the tarball's `README.dist` and `BUILDINFO` say where the source and the versions of the
+  statically linked zstd and liburing are (AGPL section 6). `CONTRIBUTING.md` asks outside contributors for a
   licence grant besides the DCO sign-off, so that the dual licence stays possible (to be checked by a lawyer before
   outside contributions are accepted). `docs/licenses.md` is the audit, redone for the combination.
 
@@ -37,11 +40,13 @@ live in their own packages, so that the network clients can stay Apache-2.0 with
 
 - **Rust.** The `embedded`, `embedded-system` and `native` features of `intellistream-tsdb-client` are gone (a build that
   names them fails with "feature not found"). New crate `intellistream-tsdb-embedded` (`client/rust-embedded`,
-  AGPL-3.0-only, library `tsdb_embedded`), which depends on the client crate at exactly the same version:
+  AGPL-3.0-only, library `tsdb_embedded`), which depends on the client crate at exactly the same version. Neither
+  crate is on crates.io (`publish = false`): use path dependencies on a checkout of the same release, as the crate's
+  README shows, and keep the two on one release (the `=` pin in the embedded crate enforces it):
 
   ```toml
-  intellistream-tsdb-embedded = "=0.11.0"    # features: "system" (link libtsdb.so), "native" (-march=native)
-  intellistream-tsdb-client = "=0.11.0"      # the types, errors and the Database trait
+  intellistream-tsdb-embedded = { path = "../tsdb/client/rust-embedded" }   # features: "system" (link libtsdb.so), "native" (-march=native)
+  intellistream-tsdb-client = { path = "../tsdb/client/rust" }              # the types, errors and the Database trait
   ```
 
   `tsdb_client::Db` is now `tsdb_embedded::Db`; `Options`, `ValueCodec`, `PartInfo`, `ChunkRef` and `RawValues` moved

@@ -494,7 +494,7 @@ cgroup, so `nice` does not keep your work out of its way.
   lock is taken under either; a user's rights index is built before it is shared and read without a lock.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
-- **Versions.** The release version is the file `VERSION` (0.10.0); `tools/check-version.sh` compares it with
+- **Versions.** The release version is the file `VERSION` (0.11.0); `tools/check-version.sh` compares it with
   `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.
@@ -588,7 +588,8 @@ cgroup, so `nice` does not keep your work out of its way.
   directory; `tools/check-spdx.sh` (in `make test`, `tests/test_check_spdx.sh` tests it) fails on a file without one, on
   the wrong one, on a wrong `license` field in a manifest, and when an Apache-2.0 file includes, imports or depends on an
   AGPL-3.0-only one (the other way round is fine). A new directory defaults to AGPL; one that must be Apache-2.0 needs a
-  line in `expected()` of the script and in `LICENSING.md`. A new package carries `LICENSE` and `NOTICE` (and the Apache
+  line in `expected()` of the script and in `LICENSING.md`. A new package carries `LICENSE` and `NOTICE` (an Apache
+  package `LICENSES/NOTICE.apache`, an AGPL one the root `NOTICE`; and the Apache
   text when it is AGPL and packs Apache files): `tools/check-package-licenses.sh`. Outside contributions need the grant
   of `CONTRIBUTING.md`. Never move code from an AGPL directory into an Apache one (the owner decides that).
 - Never commit `build/` or benchmark data. Commits carry a DCO

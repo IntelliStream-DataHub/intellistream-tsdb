@@ -1,6 +1,6 @@
 [package]
 name = "intellistream-tsdb-embedded"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.88"
@@ -23,7 +23,7 @@ native = ["tsdb-sys/native"]
 [dependencies]
 # The client crate's types, errors and the Database trait. Pinned with `=`: this crate also uses its hidden
 # `__private` module, which carries no semver promise.
-tsdb-client = { package = "intellistream-tsdb-client", version = "=0.10.0", path = "../rust" }
+tsdb-client = { package = "intellistream-tsdb-client", version = "=0.11.0", path = "../rust" }
 tsdb-sys = { package = "intellistream-tsdb-sys", path = "../rust-sys" }
 # batch calls (Db::*_many) run on rayon's thread pool
 rayon = "1"

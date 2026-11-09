@@ -110,7 +110,7 @@ build/tsdbc-bench --port 17070 optimize                # flush and merge
 build/tsdbc-bench --port 17070 --conns 32 --series 100 --points 1000000 --seconds 3 query
 client/rust/target/release/examples/query_bench --addr 127.0.0.1:17070 --conns 32
 build/pyvenv/bin/python client/python/bench_query.py --addr 127.0.0.1:17070 --conns 32
-java --enable-native-access=ALL-UNNAMED -cp client/java/target/tsdb-client-0.10.0.jar:$ZSTD_JNI \
+java --enable-native-access=ALL-UNNAMED -cp client/java/target/tsdb-client-0.11.0.jar:$ZSTD_JNI \
     ai.intellistream.tsdb.bench.QueryBench --port 17070 --conns 32
 ```
 

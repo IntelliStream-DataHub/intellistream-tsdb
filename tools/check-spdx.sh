@@ -46,8 +46,9 @@ is_source() {
     [ -f "$1" ] && [ "$(head -c 2 "$1")" = '#!' ]
 }
 
-spdx_of() { # the licence named in the first two lines of $1, or nothing
-    head -n 2 "$1" | sed -n 's/.*SPDX-License-Identifier: *\([A-Za-z0-9.+-]*\).*/\1/p' | head -n 1
+spdx_of() { # the whole expression named in the first two lines of $1 (a comment closer cut off), or nothing
+    head -n 2 "$1" | sed -n 's/.*SPDX-License-Identifier: *\(.*\)$/\1/p' | head -n 1 \
+        | sed 's/[[:space:]]*\(\*\/\|-->\|"""\)[[:space:]]*$//; s/[[:space:]]*$//'
 }
 
 declare -A have
@@ -92,7 +93,7 @@ while IFS= read -r f; do
     case $f in
     */target/* | */csrc/*) continue ;;
     *.rs) agpl_dep "$f" '^\s*(pub\s+)?(use|extern\s+crate)\s+(::)?(tsdb_embedded|tsdb_sys)\b' ;;
-    *.py | *.pyi) agpl_dep "$f" '^\s*(import|from)\s+tsdb_embedded\b' ;;
+    *.py | *.pyi) agpl_dep "$f" '^\s*(import|from)\s+tsdb_embedded\b|(import_module|__import__)\(\s*["'"'"']tsdb_embedded' ;;
     *.java) agpl_dep "$f" '^\s*import\s+(static\s+)?ai\.intellistream\.tsdb\.embedded\b' ;;
     *Cargo.toml) agpl_dep "$f" 'intellistream-tsdb-(embedded|sys)|^\s*tsdb-(embedded|sys)\s*=' ;;
     *pyproject.toml) agpl_dep "$f" 'intellistream-tsdb-embedded|tsdb_embedded' ;;
@@ -104,7 +105,7 @@ while IFS= read -r f; do
                 [ "$(expected "$cand")" = Apache-2.0 ] || bad "$f (Apache-2.0) includes $cand, which is AGPL-3.0-only"
                 break
             done
-        done < <(sed -n 's/^[[:space:]]*#[[:space:]]*include[[:space:]]*"\([^"]*\)".*/\1/p' "$f")
+        done < <(sed -n 's/^[[:space:]]*#[[:space:]]*include[[:space:]]*["<]\([^">]*\)[">].*/\1/p' "$f")
         ;;
     esac
 done <<< "$files"

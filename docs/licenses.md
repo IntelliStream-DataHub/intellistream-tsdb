@@ -166,7 +166,7 @@ be run offline; the poms of the artifacts that are there were read for their lic
 | pulsar-client-v5 | 5.0.0 | Apache-2.0 | Pulsar connector, test scope in the `integration` profile |
 | junit-jupiter | 5.13.1 | EPL-2.0 | test scope in all three; never shipped |
 | slf4j-simple | 2.0.16 | MIT | Pulsar connector, test scope |
-| `tsdb-client` (ours) | 0.10.0 | Apache-2.0 | dependency of `tsdb-embedded` (AGPL-3.0-only) and of the connector (Apache-2.0) |
+| `tsdb-client` (ours) | 0.11.0 | Apache-2.0 | dependency of `tsdb-embedded` (AGPL-3.0-only) and of the connector (Apache-2.0) |
 | maven-compiler-plugin 3.14.0, maven-surefire-plugin 3.5.3, maven-jar-plugin 3.4.2, maven-javadoc-plugin 3.12.0, maven-dependency-plugin 3.8.0, nifi-nar-maven-plugin 1.5.0 | | Apache-2.0 | build only |
 
 `tsdb-embedded` (AGPL-3.0-only) bundles `libtsdb.so` (our code, AGPL-3.0-only) in its jar. That library links the system's libzstd

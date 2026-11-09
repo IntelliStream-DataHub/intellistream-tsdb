@@ -86,6 +86,25 @@ expect "an Apache Python file importing the embedded wheel" 1 "depends on AGPL"
 fresh; printf '// %s\nimport ai.intellistream.tsdb.embedded.EmbeddedDb;\n' "$A" > "$t/client/java/src/A.java"; restage
 expect "an Apache Java file importing EmbeddedDb" 1 "depends on AGPL"
 
+# a compound expression is not the licence of the directory, whatever its first term says
+fresh; printf '// SPDX-License-Identifier: Apache-2.0 OR AGPL-3.0-only\nuse std::io;\n' > "$t/client/rust/src/lib.rs"; restage
+expect "an Apache file with a dual expression" 1 "client/rust/src/lib.rs: says Apache-2.0 OR AGPL-3.0-only"
+
+fresh; printf '/* SPDX-License-Identifier: AGPL-3.0-only AND Apache-2.0 */\n' > "$t/src/both.c"; restage
+expect "an engine file with a compound expression" 1 "src/both.c: says AGPL-3.0-only AND Apache-2.0"
+
+# an include in angle brackets is an include too
+fresh; printf '/* %s */\n#include <engine.h>\n' "$A" > "$t/client/tsdb_client.c"
+printf '/* %s */\n' "$G" > "$t/src/engine.h"; restage
+expect "an Apache C file including an AGPL header with <>" 1 "includes src/engine.h"
+
+fresh; printf '/* %s */\n#include <stdio.h>\n#include <tsdb.h>\n' "$A" > "$t/client/tsdb_client.c"; restage
+expect "an Apache C file including system and Apache headers with <>" 0
+
+# a dynamic import of the embedded module
+fresh; printf '# %s\nimport importlib\nm = importlib.import_module("tsdb_embedded")\n' "$A" > "$t/client/python/mod.py"; restage
+expect "an Apache Python file importing the embedded wheel by name" 1 "depends on AGPL"
+
 # the other way round is allowed: AGPL code includes and uses Apache code (the fresh tree has both already)
 fresh; printf '/* %s */\n#include "tsdb_client.h"\n#include "tsdb.h"\n' "$G" > "$t/src/uses_client.c"; restage
 expect "AGPL code including Apache headers" 0

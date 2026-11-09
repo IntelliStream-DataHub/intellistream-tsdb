@@ -14,7 +14,7 @@ license-files = ["LICENSE", "NOTICE", "THIRD-PARTY-NOTICES", "LICENSES/Apache-2.
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 # tsdb_embedded raises the exceptions of tsdb_client and is built against the same release: pinned exactly
 # (the version is that of Cargo.toml; check-version.sh keeps the two together)
-dependencies = ["intellistream-tsdb-client==0.10.0"]
+dependencies = ["intellistream-tsdb-client==0.11.0"]
 
 [project.optional-dependencies]
 numpy = ["numpy"]

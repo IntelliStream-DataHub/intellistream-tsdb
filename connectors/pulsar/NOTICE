@@ -2,9 +2,4 @@ tsdb
 Copyright 2026 IntelliStream AS
 
 This product includes software developed at IntelliStream AS (https://intellistream.ai).
-
-The server (tsdbd), the engine (libtsdb), the command line tools and the embedded bindings are licensed under the
-GNU Affero General Public License, version 3 only (see LICENSE). The client libraries (the C, Rust, Python and Java
-clients, the Pulsar connector, and the headers and sources they share with the engine) are licensed under the Apache
-License, Version 2.0 (see LICENSES/Apache-2.0.txt). Every source file names its licence in its
-SPDX-License-Identifier line; LICENSING.md explains the split and the commercial licence.
+Licensed under the Apache License, Version 2.0 (see LICENSE).

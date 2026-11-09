@@ -1,6 +1,6 @@
 [package]
 name = "tsdb-embedded-python"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.88"
@@ -12,8 +12,8 @@ name = "tsdb_embedded"
 crate-type = ["cdylib"]
 
 [dependencies]
-tsdb-client = { package = "intellistream-tsdb-client", version = "=0.10.0", path = "../rust" }
-tsdb-embedded = { package = "intellistream-tsdb-embedded", version = "=0.10.0", path = "../rust-embedded" }
+tsdb-client = { package = "intellistream-tsdb-client", version = "=0.11.0", path = "../rust" }
+tsdb-embedded = { package = "intellistream-tsdb-embedded", version = "=0.11.0", path = "../rust-embedded" }
 tsdb-client-python-common = { path = "../python-common", features = ["embedded"] }
 pyo3 = "0.29"
 numpy = "0.29"

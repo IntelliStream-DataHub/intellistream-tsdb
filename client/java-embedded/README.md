@@ -7,6 +7,11 @@ The methods and types are the same as the TCP client's (`TsdbClient`, in `client
 server to an embedded database, change how you open it. Everything else stays: `Bucket`, `Column`, `Group`,
 `Points`, `ValuePoints`, `TsdbException` and its status codes.
 
+**Licence: AGPL-3.0-only** (a commercial licence is available from IntelliStream AS; see
+[LICENSING.md](../../LICENSING.md)). `EmbeddedDb` contains the engine, so a program that uses it is under the
+AGPL-3.0 or needs the commercial licence. Up to 0.10.0 this jar was Apache-2.0; from 0.11.0 it is not. The network
+client, `tsdb-client` (`client/java`), is Apache-2.0 and has no engine in it; this jar depends on it.
+
 ## Quick start
 
 ```sh
@@ -135,7 +140,7 @@ suite:
 ```sh
 build/tsdb-bench --export /data/rows.rowbinary --series 100 --points 1000000
 java --enable-native-access=ALL-UNNAMED \
-  -cp target/tsdb-embedded-0.10.0.jar:target/lib/tsdb-client-0.10.0.jar \
+  -cp target/tsdb-embedded-0.11.0.jar:target/lib/tsdb-client-0.11.0.jar \
   ai.intellistream.tsdb.embedded.bench.EmbeddedBench --dir /data/emb --file /data/rows.rowbinary \
   --series 100 --points 1000000
 ```
