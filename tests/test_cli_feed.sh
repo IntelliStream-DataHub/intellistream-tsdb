@@ -64,8 +64,19 @@ me=$BASHPID
 pid=$!
 for _ in $(seq 100); do [ -s "$dir/port" ] && break; sleep 0.1; done
 if [ -s "$dir/port" ]; then
-    t feed disable >/dev/null 2>&1 && fail "disable beside a running tsdbd was accepted"
-    t feed enable >/dev/null 2>&1 && fail "enable beside a running tsdbd was accepted"
+    # the port file names the child we started (tsdbd writes "PORT PID"), and it still runs: the refusals below are
+    # about a live writer, not about a server that never came up or died
+    read -r _ fpid _ < "$dir/port"
+    [ "$fpid" = "$pid" ] || fail "the port file names pid $fpid, not the tsdbd we started ($pid)"
+    kill -0 "$pid" 2>/dev/null || fail "tsdbd exited before the refusals"
+    . tests/cli_refuse.sh
+    for verb in disable enable; do
+        t feed $verb >/dev/null 2>"$dir/err"
+        rc=$?
+        [ "$rc" -ne 0 ] || fail "$verb beside a running tsdbd was accepted"
+        cli_refusal_ok "$rc" "$dir/err" "tsdb:" || fail "$verb beside tsdbd: status $rc, stderr '$(head -c 200 "$dir/err")'"
+    done
+    kill -0 "$pid" 2>/dev/null || fail "tsdbd died during the refusals"
     [ -f "$db/FEED" ] || fail "the refused disable removed FEED"
 else
     fail "tsdbd did not start: $(tail -3 "$dir/d.log")"

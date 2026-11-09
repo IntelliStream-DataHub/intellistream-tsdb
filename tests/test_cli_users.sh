@@ -185,15 +185,23 @@ u list | grep -q root || fail "list beside a database"
 # as root on a directory another user owns, with links planted there (tests/test_cli_root.sh): in a user namespace
 # where this user is root (podman unshare), or directly when this is root
 mkdir "$dir/root" && cp "$B/tsdb" "$dir/root/tsdb" && chmod 755 "$dir" "$dir/root" "$dir/root/tsdb"
+# TSDB_REQUIRE_ROOT_CASES=1 (the gate on a machine that has them) makes a skip a failure; without it the skip is
+# named in the summary line below
+skipped=
+skip_root() {
+    skipped="the root cases (test_cli_root.sh): $1"
+    echo "test_cli_users: SKIPPED the root cases: $1"
+    [ "${TSDB_REQUIRE_ROOT_CASES:-0}" = 1 ] && fail "the root cases are required (TSDB_REQUIRE_ROOT_CASES=1) and cannot run: $1"
+}
 if ! command -v setpriv > /dev/null; then
-    echo "test_cli_users: the root cases are skipped: no setpriv"
+    skip_root "no setpriv"
 elif [ "$(id -u)" = 0 ]; then
     bash tests/test_cli_root.sh "$dir/root/tsdb" "$dir/root/s" || fail "the root cases"
 elif command -v podman > /dev/null && podman unshare true 2> /dev/null; then
     podman unshare bash tests/test_cli_root.sh "$dir/root/tsdb" "$dir/root/s" || fail "the root cases"
     podman unshare rm -rf "$dir/root" # files of another uid of the namespace
 else
-    echo "test_cli_users: the root cases are skipped: not root, and no podman unshare"
+    skip_root "not root, and no podman unshare"
 fi
 
-[ "$errors" = 0 ] && echo "test_cli_users: ok" || { echo "test_cli_users: $errors failures" >&2; exit 1; }
+[ "$errors" = 0 ] && echo "test_cli_users: ok${skipped:+ (SKIPPED: $skipped)}" || { echo "test_cli_users: $errors failures" >&2; exit 1; }
