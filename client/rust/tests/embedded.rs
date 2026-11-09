@@ -711,10 +711,15 @@ fn tsdbd_answers_what_the_embedded_engine_answered() {
         let col = make(ty, 0..n, 0, codes);
         db.insert_series_values(id, &ts, ColumnRef::from(&col).with_validity(&valid)).unwrap();
         db.flush().unwrap();
-        // corrections that stay in the memtable
+        // corrections over rows of the part
         db.insert_series_values(id, &ts[100..110], &make(ty, 100..110, 1, codes)).unwrap();
         names.push(name);
     }
+    // Both sides read the same parts: closing writes the corrections to a part of their own, which tsdbd's
+    // background merge may combine before or after its queries, and a float spread over two overlapping parts
+    // differs in the last bits from one over their merge (docs/design.md; 1 run in 20 on 4 CPUs).
+    db.flush().unwrap();
+    db.optimize().unwrap();
     let groups = [
         Group::new(Unit::Hour),
         Group::new(Unit::Minute).count(15),

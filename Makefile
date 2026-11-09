@@ -287,7 +287,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
-test-units-b: $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB)
+test-units-b: $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_group
 	./$(B)/test_lttb
 	B=$(B) tests/test_cli_lttb.sh
@@ -321,7 +321,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
 	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
 
-test-net: $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stability $(B)/tsdbd
+test-net: $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stability $(B)/tsdbd $(CRASHFS_SO)
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	./$(B)/test_wire tests/data/wire13-vectors.txt
@@ -571,7 +571,17 @@ test-licenses:
 	cd connectors/pulsar && mvn -q $(JAVA_M2) -DskipTests package
 	tools/check-package-licenses.sh nar connectors/pulsar/target/tsdb-pulsar-sink-$(RELEASE_VERSION).nar
 
-test-clients: test-rust test-python test-python-sdist test-java test-java-embedded test-licenses
+# The three Java targets (test-java, test-java-embedded, test-licenses) all build client/java (and its target/), so
+# `make -j4 test-clients` runs them one after the other: two Maven runs in one target/ overwrote each other's classes
+# ("Unable to create test class", 1 run in 5 on 4 CPUs). The Rust and Python targets run beside them; what the
+# sub-makes need is built here first, once, by this make.
+.PHONY: test-clients-java
+test-clients-java: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER) $(B)/libtsdb.$(SOEXT)
+	$(MAKE) test-java
+	$(MAKE) test-java-embedded
+	$(MAKE) test-licenses
+
+test-clients: test-rust test-python test-python-sdist test-clients-java
 
 # Commit rules as a git hook (no session links, DCO sign-off last); once per clone.
 hooks:
