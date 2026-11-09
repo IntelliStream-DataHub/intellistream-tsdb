@@ -11,6 +11,7 @@
 #include "internal.h"
 
 #include <dirent.h>
+#include "seed.h"
 #include "watchdog.h"
 #include <fcntl.h>
 #include <inttypes.h>
@@ -1480,7 +1481,7 @@ int main(int argc, char **argv)
     test_edges();
     test_anchors();
     for (int i = 0; i < rounds && !failures; i++)
-        test_model(1000 + (uint64_t)i, 150);
+        test_model(ts_seed("delete model", 1000 + (uint64_t)i), 150);
     if (rounds >= 2 && !failures && model_mixed == 0) {
         fprintf(stderr, "model: no merge ever kept tombstones next to rows (partial merges untested)\n");
         failures++;
@@ -1488,7 +1489,7 @@ int main(int argc, char **argv)
     if (getenv("TSDB_DELETE_VERBOSE"))
         printf("model: %d steps saw a part with rows and tombstones\n", model_mixed);
     for (int i = 0; i < 4 * rounds && !failures; i++)
-        test_crash(5000 + (uint64_t)i);
+        test_crash(ts_seed("delete crash", 5000 + (uint64_t)i));
     if (failures) {
         fprintf(stderr, "test_delete: %d failures\n", failures);
         return 1;

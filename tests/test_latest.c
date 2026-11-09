@@ -19,6 +19,7 @@
 #include "internal.h" /* part_footer, tsdb_test_midplace */
 
 #include <dirent.h>
+#include "seed.h"
 #include "watchdog.h"
 #include <fcntl.h>
 #include <ftw.h>
@@ -886,7 +887,7 @@ static void *conc_writer(void *arg)
 {
     cwr *a = arg;
     conc *c = a->c;
-    uint64_t seed = 1234567u + (uint64_t)a->idx * 77;
+    uint64_t seed = ts_seed("latest writer", 1234567u + (uint64_t)a->idx * 77);
     int64_t t = 1000 * (a->idx + 1);
     for (int i = 0; i < 400; i++) {
         seed = seed * 6364136223846793005ull + 1442695040888963407ull;

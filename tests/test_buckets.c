@@ -15,6 +15,7 @@
 #include "internal.h"
 
 #include <math.h>
+#include "seed.h"
 #include "watchdog.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +45,7 @@ static void must(int rc, const char *what)
 
 static const int64_t T0 = 1700000040000; /* a minute edge */
 
-static uint64_t rnd_state = 0x9e3779b97f4a7c15ull;
+static uint64_t rnd_state = 0x9e3779b97f4a7c15ull; /* ts_seed in main */
 static uint64_t rnd(void)
 {
     rnd_state ^= rnd_state << 13, rnd_state ^= rnd_state >> 7, rnd_state ^= rnd_state << 17;
@@ -288,6 +289,7 @@ int main(int argc, char **argv)
     th_watchdog("test_buckets", 1200);
     char dir[512];
     snprintf(dir, sizeof dir, "%s/test_buckets_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    rnd_state = ts_seed("buckets", rnd_state); /* before load: the data too */
     tsdb *db = open_db(dir, 1);
     tsdb_sid ids[2];
     load(db, &ids[0], &ids[1]);

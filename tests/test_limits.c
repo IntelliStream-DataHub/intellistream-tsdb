@@ -22,6 +22,7 @@
 #include "tsdb.h"
 
 #include <math.h>
+#include "seed.h"
 #include "watchdog.h"
 #include <stdbool.h>
 #include <inttypes.h>
@@ -811,6 +812,8 @@ int main(int argc, char **argv)
 #ifndef LIMITS_STATS_ONLY
     if (argc > 2) /* another seed */
         rng = strtoull(argv[2], NULL, 0) | 1;
+    else
+        rng = ts_seed("limits", rng) | 1;
     test_random(1, 300);
     test_random(4, 200);
     printf("test_limits: %d random queries against compute-all-then-cut\n", queries);

@@ -1035,7 +1035,18 @@ $(B)/client-example: examples/client.c client/tsdb_client.h include/tsdb_calenda
 all: $(B)/embedded-example $(B)/client-example
 
 # Runs the README's quick start, word for word, in a scratch directory.
-test: test-quickstart test-cli-stats test-cli-cluster test-cluster-tutorial
+test: test-quickstart test-seeds-selftest test-cli-stats test-cli-cluster test-cluster-tutorial
+# The random-heavy tests under a seed that is not their constant (tests/seed.h): `make test-seeds` picks one and prints it,
+# `make test-seeds TSDB_TEST_SEED=N` repeats a run. A failure is rerun with the same N on the one test.
+SEED_TESTS = test_users test_latest test_buckets test_delete test_limits
+.PHONY: test-seeds test-seeds-selftest
+test-seeds: $(SEED_TESTS:%=$(B)/%) $(B)/test_wire
+	@seed=$${TSDB_TEST_SEED:-$$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')}; echo "TSDB_TEST_SEED=$$seed"; \
+	TSDB_TEST_SEED=$$seed ./$(B)/test_wire tests/data/wire13-vectors.txt || { echo "FAILED: TSDB_TEST_SEED=$$seed ./$(B)/test_wire"; exit 1; }; \
+	for t in $(SEED_TESTS); do TSDB_TEST_SEED=$$seed ./$(B)/$$t $(SCRATCH) || { echo "FAILED: TSDB_TEST_SEED=$$seed ./$(B)/$$t"; exit 1; }; done; \
+	echo "test-seeds passed (TSDB_TEST_SEED=$$seed)"
+test-seeds-selftest: $(B)/test_wire
+	B=$(B) tests/test_seeds.sh
 test-cli-stats: $(B)/tsdb
 	B=$(B) tests/test_cli_stats.sh $(TMPDIR)
 test-cli-cluster: $(B)/tsdb
