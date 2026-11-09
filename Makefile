@@ -284,6 +284,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_tenants $(SCRATCH)
 	./$(B)/test_tzfiles $(SCRATCH)
 	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
+	tests/test_fuzz_replay.sh $(B) $(SCRATCH) # a replay of nothing, or of a missing corpus, fails
 	./$(B)/test_types $(SCRATCH)
 	./$(B)/test_delete $(SCRATCH)
 	./$(B)/test_levels
