@@ -460,13 +460,23 @@ static void test_power_loss(void)
            "the open refuses or works, a second run finishes, the rows are the same\n", crashes, half);
 }
 
-/* An optional check with the binary of 0.9.0 itself (TSDB_V090_CLI): it refuses what the upgrade made, loudly. */
+/* An optional check with the binary of 0.9.0 itself (TSDB_V090_CLI; TSDB_REQUIRE_V090_CLI=1 makes a
+ * missing one a failure): it refuses what the upgrade made, loudly. */
 static void test_old_binary(void)
 {
     const char *old = getenv("TSDB_V090_CLI");
     if (!old) {
-        printf("  the 0.9.0 binary on an upgraded database: skipped (set TSDB_V090_CLI)\n");
+        const char *req = getenv("TSDB_REQUIRE_V090_CLI"); /* the weekly job (ci.yml, upgrade-v090) sets it */
+        if (req && *req && strcmp(req, "0") != 0) {
+            fprintf(stderr, "test_upgrade: FAIL: the 0.9.0 binary is required (TSDB_REQUIRE_V090_CLI) and TSDB_V090_CLI is not set\n");
+            exit(1);
+        }
+        printf("  the 0.9.0 binary on an upgraded database: SKIPPED (set TSDB_V090_CLI; counted by the weekly job)\n");
         return;
+    }
+    if (access(old, X_OK) != 0) { /* a path that is not there is a failed check, not a skip */
+        fprintf(stderr, "test_upgrade: FAIL: TSDB_V090_CLI=%s is not an executable file\n", old);
+        exit(1);
     }
     char top[PATH_MAX + 16], db[PATH_MAX + 16], vol[PATH_MAX + 16];
     snprintf(top, sizeof top, "%s/old", S);

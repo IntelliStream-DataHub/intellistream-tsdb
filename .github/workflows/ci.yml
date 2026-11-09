@@ -329,6 +329,46 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # ------------------------------------------------------------------------------------------------------ upgrade
+  # 0.9.0 itself must refuse a database `tsdb upgrade` made (format 9), naming both versions: test_upgrade runs the
+  # CLI built from the v0.9.0 tag. Weekly, not per push (a second build of the tree); a missing binary is a failure
+  # there (TSDB_REQUIRE_V090_CLI), where a local run prints SKIPPED.
+  upgrade-v090:
+    name: 0.9.0 refuses an upgraded database
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Install packages
+        run: .github/scripts/install-deps.sh
+      - name: Build the 0.9.0 CLI from its tag
+        run: |
+          set -o pipefail
+          mkdir "$RUNNER_TEMP/tsdb-v090"
+          git archive v0.9.0 | tar -x -C "$RUNNER_TEMP/tsdb-v090"
+          make -C "$RUNNER_TEMP/tsdb-v090" -j"$(nproc)" build/tsdb
+          "$RUNNER_TEMP/tsdb-v090/build/tsdb" --version | grep -q 'tsdb 0.9.0'
+      - name: test_upgrade with it
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          make -j"$(nproc)" build/test_upgrade
+          TSDB_V090_CLI="$RUNNER_TEMP/tsdb-v090/build/tsdb" TSDB_REQUIRE_V090_CLI=1 \
+              build/test_upgrade "$RUNNER_TEMP" 2>&1 | tee ci-logs/test-upgrade-v090.log
+          grep -q 'the 0.9.0 binary refuses an upgraded database' ci-logs/test-upgrade-v090.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-upgrade-v090
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
   # ------------------------------------------------------------------------------------------------------ jepsen
   jepsen:
     name: jepsen fault injection
