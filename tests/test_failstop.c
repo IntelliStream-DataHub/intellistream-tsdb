@@ -68,7 +68,8 @@ int tsdb_failed(tsdb *db, char *msg, size_t len)
 
 /* ------------------------------------------------------- fault injection */
 
-enum { F_WRITE = 1, F_PWRITE = 2, F_FSYNC = 4, F_FDATASYNC = 8, F_RENAME = 16, F_UNLINK = 32 };
+enum { F_WRITE = 1, F_PWRITE = 2, F_FSYNC = 4, F_FDATASYNC = 8, F_RENAME = 16, F_UNLINK = 32, F_FTRUNCATE = 64,
+       F_CLOSE = 128 };
 
 static pthread_mutex_t f_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t f_cv = PTHREAD_COND_INITIALIZER;
@@ -77,6 +78,7 @@ static char f_match[64];  /* substring of the path; "/" with F_FSYNC: the databa
 static char *f_dir; /* the database directory */
 static bool f_partial;    /* a failing write writes half its bytes first */
 static bool f_drop;       /* a failing fdatasync loses the bytes since the last successful one */
+static bool f_short;      /* a failing write or pwrite writes half its bytes and reports them: no -1, no errno */
 static int f_fired;
 static int f_skip;        /* matching calls to let through before the one that fails */
 static int h_op;          /* hold the next such call on a path with h_match until h_go */
@@ -158,12 +160,21 @@ static int real_sync(long sysno, int fd)
 #endif
 }
 
+static int real_ftruncate(int fd, off_t len)
+{
+#ifdef __APPLE__
+    return REAL(ftruncate)(fd, len);
+#else
+    return (int)syscall(SYS_ftruncate, fd, len);
+#endif
+}
+
 static int sync_call(int op, long sysno, int fd)
 {
     if (inject(op, fd, NULL)) {
         pthread_mutex_lock(&f_lock);
         off_t *s = f_drop ? synced_slot(fd) : NULL;
-        if (s && ftruncate(fd, *s) != 0)
+        if (s && real_ftruncate(fd, *s) != 0) /* not ftruncate: that is interposed below and takes f_lock */
             fprintf(stderr, "ftruncate: %s\n", strerror(errno));
         pthread_mutex_unlock(&f_lock);
         errno = EIO;
@@ -196,6 +207,8 @@ static ssize_t real_write(int fd, const void *buf, size_t n)
 ssize_t write(int fd, const void *buf, size_t n)
 {
     if (fd > 2 && inject(F_WRITE, fd, NULL)) {
+        if (f_short && n > 1)
+            return real_write(fd, buf, n / 2);
         if (f_partial && n > 1)
             real_write(fd, buf, n / 2);
         errno = EIO;
@@ -207,8 +220,12 @@ ssize_t write(int fd, const void *buf, size_t n)
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
 {
     if (inject(F_PWRITE, fd, NULL)) {
-        errno = EIO;
-        return -1;
+        if (f_short && n > 1)
+            n /= 2;
+        else {
+            errno = EIO;
+            return -1;
+        }
     }
 #ifdef __APPLE__
     return REAL(pwrite)(fd, buf, n, off);
@@ -243,6 +260,32 @@ int unlinkat(int dirfd, const char *path, int flags)
 #endif
 }
 
+/* ftruncate fails with EIO and does nothing. close fails with EIO and still closes (as the system does: the
+ * descriptor is gone either way; NFS reports the write-back error there). */
+int ftruncate(int fd, off_t len)
+{
+    if (inject(F_FTRUNCATE, fd, NULL)) {
+        errno = EIO;
+        return -1;
+    }
+    return real_ftruncate(fd, len);
+}
+
+int close(int fd)
+{
+    bool fail = fd > 2 && __atomic_load_n(&f_op, __ATOMIC_RELAXED) == F_CLOSE && inject(F_CLOSE, fd, NULL);
+#ifdef __APPLE__
+    int r = REAL(close)(fd);
+#else
+    int r = (int)syscall(SYS_close, fd);
+#endif
+    if (fail) {
+        errno = EIO;
+        return -1;
+    }
+    return r;
+}
+
 static void arm(int op, const char *match, bool partial, bool drop)
 {
     pthread_mutex_lock(&f_lock);
@@ -250,6 +293,7 @@ static void arm(int op, const char *match, bool partial, bool drop)
     snprintf(f_match, sizeof f_match, "%s", match);
     f_partial = partial;
     f_drop = drop;
+    f_short = false;
     f_fired = 0;
     f_skip = 0;
     pthread_mutex_unlock(&f_lock);
@@ -746,6 +790,89 @@ static void test_manifest(const char *base)
     expect_rows(db, "s", ts, 100);
     tsdb_close(db);
     printf("  failed MANIFEST rewrite after an insert's commit\n");
+}
+
+/* A failed ftruncate or close of MANIFEST (on NFS close sends the data to the server) is a failed rewrite as well. */
+static void test_manifest_truncate_close(const char *base)
+{
+    for (int k = 0; k < 2; k++) {
+        char name[600];
+        snprintf(name, sizeof name, "%s/failstop-manifest-%s", base, k ? "close" : "ftruncate");
+        tsdb *db = open_fresh(name, opts());
+        tsdb_sid id;
+        OK(tsdb_series(db, "s", &id));
+        OK(tsdb_append(db, id, 1, 1));
+        arm(k ? F_CLOSE : F_FTRUNCATE, "/MANIFEST", false, false);
+        CHECK(tsdb_flush(db) == TSDB_ERR_IO);
+        CHECK(fired() == 1);
+        CHECK(is_failed(db, "MANIFEST"));
+        CHECK(tsdb_append(db, id, 2, 2) == TSDB_ERR_IO);
+        db = reopen(db);
+        int64_t want[] = {1};
+        expect_rows(db, "s", want, 1);
+        tsdb_close(db);
+    }
+    printf("  failed MANIFEST ftruncate and close fail the engine\n");
+}
+
+/* Cutting a torn tail is a write like another: when the cut of SERIES, RETENTION or CLASSES fails the open fails
+ * (a torn tail left in place would have records appended behind it). A torn WAL tail is not cut in place: the
+ * segment is replayed into a part and removed. */
+static void test_tail_cut_fails(const char *base)
+{
+    static const struct {
+        const char *file, *what;
+    } cases[] = {{"/SERIES", "SERIES"}, {"/RETENTION", "RETENTION"}};
+    for (int k = 0; k < 2; k++) {
+        char name[600];
+        snprintf(name, sizeof name, "%s/failstop-tailcut-%d", base, k);
+        tsdb *db = open_fresh(name, opts());
+        tsdb_sid a, b;
+        OK(tsdb_series(db, "a", &a));
+        OK(tsdb_append(db, a, 1, 1));
+        if (k == 0) {
+            arm(F_WRITE, cases[k].file, true, false);
+            CHECK(tsdb_series(db, "b", &b) == TSDB_ERR_IO); /* a torn record at the end of SERIES */
+        } else {
+            OK(tsdb_set_retention(db, a, 4000000000000LL)); /* a record, then a torn one after it (below) */
+        }
+        CHECK(k == 1 || fired() == 1);
+        tsdb_close(db);
+        if (k == 1) {
+            char file[700];
+            snprintf(file, sizeof file, "%s/RETENTION", name);
+            FILE *f = fopen(file, "ab");
+            CHECK(f != NULL);
+            if (f) {
+                CHECK(fwrite("torn....", 1, 8, f) == 8);
+                fclose(f);
+            }
+        }
+        arm(F_FTRUNCATE, cases[k].file, false, false);
+        tsdb_options o = opts();
+        db = NULL;
+        int rc = tsdb_open(name, &o, &db);
+        int fr = fired();
+        if (fr != 1 || rc != TSDB_ERR_IO)
+            fprintf(stderr, "case %s: fired %d rc %d (%s)\n", cases[k].what, fr, rc, tsdb_strerror(rc));
+        CHECK(fr == 1);
+        CHECK(rc == TSDB_ERR_IO);
+        if (db)
+            tsdb_close(db);
+        db = NULL;
+        OK(tsdb_open(name, &o, &db)); /* unarmed: the cut is made, and the file takes records again */
+        int64_t one[] = {1};
+        expect_rows(db, "a", one, 1);
+        OK(tsdb_series(db, "d", &b));
+        OK(tsdb_append(db, b, 5, 5));
+        tsdb_close(db);
+        db = NULL;
+        OK(tsdb_open(name, &o, &db));
+        int64_t five[] = {5};
+        expect_rows(db, "d", five, 1);
+        tsdb_close(db);
+        printf("  a failed ftruncate of the torn tail of %s fails the open\n", cases[k].what);
+    }
 }
 
 /* A failed write or sync of RETENTION is not fail-stop (nothing acknowledged relies on it: the call answers IO): the
@@ -1714,6 +1841,73 @@ static int sweep_delete(const char *name, int round, bool *fired_out)
     return rc;
 }
 
+/* The same for a replace (a delete tombstone and new rows in one commit), a retention limit, the creation of a
+ * series in an open database and of a volume: each ends in an acknowledgement that relies on a sync. */
+static int sweep_replace(const char *name, int round, bool *fired_out)
+{
+    tsdb *db = two_parts(name);
+    tsdb_sid id;
+    OK(tsdb_series_lookup(db, "s", &id));
+    int64_t ts[20];
+    float v[20];
+    for (int i = 0; i < 20; i++) {
+        ts[i] = 20 + i;
+        v[i] = (float)i;
+    }
+    tsdb_values col = {TSDB_FLOAT32, v, NULL};
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    int rc = tsdb_replace_range(db, id, 10, 50, ts, &col, 20);
+    *fired_out = fired() > 0;
+    tsdb_close(db);
+    return rc;
+}
+
+static int sweep_retention(const char *name, int round, bool *fired_out)
+{
+    tsdb *db = open_fresh(name, opts_days());
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    OK(tsdb_append(db, id, 5, 5));
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    int rc = tsdb_set_retention(db, id, 86400000);
+    *fired_out = fired() > 0;
+    tsdb_close(db);
+    return rc;
+}
+
+static int sweep_series_create(const char *name, int round, bool *fired_out)
+{
+    tsdb *db = open_fresh(name, opts_days());
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    OK(tsdb_append(db, id, 5, 5));
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    int rc = tsdb_series(db, "second", &id);
+    *fired_out = fired() > 0;
+    tsdb_close(db);
+    return rc;
+}
+
+static int sweep_volume_add(const char *name, int round, bool *fired_out)
+{
+    char vol[700], cmd[800];
+    snprintf(vol, sizeof vol, "%s-vol", name);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", vol);
+    if (system(cmd) != 0)
+        failures++;
+    tsdb *db = open_fresh(name, opts_days());
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    uint32_t index = 0;
+    int rc = tsdb_volume_add(db, vol, &index);
+    *fired_out = fired() > 0;
+    tsdb_close(db);
+    if (system(cmd) != 0)
+        failures++;
+    return rc;
+}
+
 /* A sweep that fires no fault proves nothing, and one that stops at its cap has not reached the end of the
  * scenario: both are failures. `min` is the least number of faults (fsyncs and fdatasyncs of the scenario together)
  * the sweep must have fired; the counts are printed, so a change that shrinks a scenario shows. */
@@ -1794,6 +1988,88 @@ static void run_open_sweep(const char *what, const char *src, const char *work, 
     sweep_judge(what, fired_count, min);
 }
 
+/* Short writes: write or pwrite takes half the bytes and returns that count, no -1 and no errno (a full file system or
+ * a signal can do it). Every write and pwrite of a scenario that touches the WAL, the series dictionary, parts,
+ * MANIFEST, FNO, RETENTION and the deletes does this in turn. A site that loops (the WAL, the part writer) must
+ * finish the job; one that cannot (a single record) must report an error, fail-stop or not as its file's rule says.
+ * What no site may do is take the short count for the whole write: then the call returns 0 and the data is missing
+ * or torn after a reopen. */
+static int short_scenario(const char *name, int op, int n, int *fired_out)
+{
+    tsdb *db = open_fresh(name, opts_days());
+    arm_after(n, op, "");
+    pthread_mutex_lock(&f_lock);
+    f_short = true;
+    pthread_mutex_unlock(&f_lock);
+    int bad = 0;
+    tsdb_sid s, t;
+    bad |= tsdb_series(db, "s", &s) != 0;
+    for (int i = 1; i <= 5; i++)
+        bad |= tsdb_append(db, s, i, (float)i) != 0;
+    bad |= insert_n(db, s, 1000, 100, true) != 0;
+    bad |= tsdb_series(db, "t", &t) != 0;
+    bad |= tsdb_set_retention(db, t, 1000000) != 0;
+    bad |= tsdb_flush(db) != 0;
+    int64_t ts[5] = {2000, 2001, 2002, 2003, 2004};
+    float v[5] = {1, 2, 3, 4, 5};
+    tsdb_values col = {TSDB_FLOAT32, v, NULL};
+    bad |= tsdb_replace_range(db, s, 2000, 2010, ts, &col, 5) != 0;
+    bad |= tsdb_delete_range(db, s, 3, 4) != 0;
+    *fired_out = fired() > 0;
+    tsdb_close(db);
+    tsdb_options o = opts_days();
+    tsdb *again = NULL;
+    int orc = tsdb_open(name, &o, &again);
+    if (orc != 0) {
+        fprintf(stderr, "short %s number %d: the reopen failed: %s\n", op == F_WRITE ? "write" : "pwrite", n,
+                tsdb_strerror(orc));
+        failures++;
+        return bad;
+    }
+    if (!bad) {
+        int64_t rows = count_rows(again, "s");
+        int64_t lim = -1;
+        tsdb_sid t2;
+        if (rows != 109 || tsdb_series_lookup(again, "t", &t2) != 0 || tsdb_get_retention(again, t2, &lim) != 0 ||
+            lim != 1000000) {
+            fprintf(stderr, "short %s number %d: every call returned success, and after a reopen s has %lld rows (want "
+                    "109), retention %lld (want 1000000)\n", op == F_WRITE ? "write" : "pwrite", n, (long long)rows,
+                    (long long)lim);
+            failures++;
+        }
+    }
+    tsdb_close(again);
+    return bad;
+}
+
+static void test_short_writes(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-short", base);
+    for (int k = 0; k < 2; k++) {
+        int op = k ? F_PWRITE : F_WRITE, hit_count = 0, errors = 0;
+        for (int n = 0; n < 200; n++) {
+            int hit = 0;
+            int bad = short_scenario(name, op, n, &hit);
+            if (!hit)
+                break;
+            hit_count++;
+            errors += bad != 0;
+            if (n == 199) {
+                fprintf(stderr, "short writes: the sweep reached its cap with faults still firing\n");
+                failures++;
+            }
+        }
+        printf("    short %s: %d faults fired, %d of them reported by a call\n", k ? "pwrite" : "write", hit_count, errors);
+        if (hit_count < (k ? 5 : 10)) {
+            fprintf(stderr, "short %s: only %d faults fired: the scenario no longer tests what it says\n",
+                    k ? "pwrite" : "write", hit_count);
+            failures++;
+        }
+    }
+    printf("  a short write is completed or reported, never taken for a whole one\n");
+}
+
 static void test_fsync_results(const char *base)
 {
     char name[600], src[600], work[600];
@@ -1802,7 +2078,12 @@ static void test_fsync_results(const char *base)
     run_sweep("flush", sweep_flush, name, 3);
     run_sweep("merge", sweep_merge, name, 2);
     run_sweep("delete", sweep_delete, name, 2);
-    printf("  every failed fsync of an insert, a flush, a merge and a delete reaches the caller\n");
+    run_sweep("replace", sweep_replace, name, 4);
+    run_sweep("retention", sweep_retention, name, 1);
+    run_sweep("series creation", sweep_series_create, name, 1);
+    run_sweep("volume add", sweep_volume_add, name, 8);
+    printf("  every failed fsync of an insert, a flush, a merge, a delete, a replace, a retention limit, a series and"
+           " a volume reaches the caller\n");
 
     /* creating a database */
     int create_fired = 0;
@@ -1889,7 +2170,10 @@ int main(int argc, char **argv)
     test_drop_before(root);
     test_dir_fsync_race(root);
     test_partial_insert(root);
+    test_manifest_truncate_close(root);
+    test_tail_cut_fails(root);
     test_fsync_results(root);
+    test_short_writes(root);
     if (!failures) {
         char cmd[512];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
