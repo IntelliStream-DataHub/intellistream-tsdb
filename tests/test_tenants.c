@@ -669,7 +669,8 @@ static void drop_cache(const char *dir)
         closedir(d);
 }
 
-static void test_residency(const char *base)
+/* returns 1 when the file system keeps its pages (tmpfs) or the kernel reads everything ahead: nothing can be learned there */
+static int test_residency(const char *base)
 {
     char dir[512];
     snprintf(dir, sizeof dir, "%s/resident", base);
@@ -707,9 +708,10 @@ static void test_residency(const char *base)
     uint64_t bytes = st.ts_bytes + st.value_bytes;
     uint64_t cold = st.resident_bytes;
     if (cold * 10 > bytes * 9) { /* a file system whose pages stay (tmpfs) or a kernel that reads it all ahead */
-        printf("test_tenants: residency skipped (%" PRIu64 " of %" PRIu64 " bytes stay in the cache)\n", cold, bytes);
+        printf("test_tenants: residency not measurable in %s (%" PRIu64 " of %" PRIu64 " bytes stay in the cache)\n", base,
+               cold, bytes);
         tsdb_close(db);
-        return;
+        return 1;
     }
     OK(tsdb_query_values(db, id, INT64_MIN, INT64_MAX, NULL, q_cb, NULL)); /* decodes every granule */
     OK(tsdb_series_stats(db, &id, 1, TSDB_SSTAT_REQ_RESIDENT, &st, &done));
@@ -728,6 +730,24 @@ static void test_residency(const char *base)
     CHECK(seen * 2 >= bytes && seen <= bytes * 2);
     CHECK(tsdb_series_stats(db, &id, 1, 4, &st, &done) == TSDB_ERR_INVALID);
     tsdb_close(db);
+    return 0;
+}
+
+/* The scratch directory may be a tmpfs (/tmp often is), where every page stays resident: the residency test then
+ * tries a directory on a disk (TSDB_RESIDENCY_DIR, else /var/tmp). Where that is no better, the skip is named in the
+ * last line, and a failure when TSDB_REQUIRE_RESIDENCY is set. */
+static int residency_with_fallback(const char *base)
+{
+    if (!test_residency(base))
+        return 0;
+    const char *alt = getenv("TSDB_RESIDENCY_DIR");
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/test_tenants_res_%d", alt && *alt ? alt : "/var/tmp", (int)getpid());
+    if (mkdir(dir, 0755) != 0)
+        return 1;
+    int skipped = test_residency(dir);
+    rm_rf(dir);
+    return skipped;
 }
 
 /* ------------------------------------------------------------------------ lazy start and races */
@@ -1076,7 +1096,7 @@ int main(int argc, char **argv)
     test_ingest(base);
     test_hll(base);
     test_hot(base);
-    test_residency(base);
+    int residency_skipped = residency_with_fallback(base);
     test_lazy_and_races(base);
     test_set_races(base);
     test_list_change(base);
@@ -1084,6 +1104,15 @@ int main(int argc, char **argv)
     if (failures) {
         fprintf(stderr, "test_tenants: %d failures\n", failures);
         return 1;
+    }
+    if (residency_skipped) {
+        const char *req = getenv("TSDB_REQUIRE_RESIDENCY");
+        if (req && *req && strcmp(req, "0") != 0) {
+            fprintf(stderr, "test_tenants: FAIL: the residency test could not measure anything (TSDB_REQUIRE_RESIDENCY)\n");
+            return 1;
+        }
+        printf("test_tenants: ok (SKIPPED: residency, no file system here drops its pages)\n");
+        return 0;
     }
     printf("test_tenants: ok\n");
     return 0;
