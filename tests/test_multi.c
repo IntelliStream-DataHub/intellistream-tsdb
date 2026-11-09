@@ -768,14 +768,27 @@ static void b_deferred(void *ctx) { atomic_fetch_add(&((budget *)ctx)->deferred,
 typedef struct {
     int status[64], calls[64];
     uint64_t rows;
+    /* when set: the head's last call holds until *gate reaches 1 (a helper ahead was refused by the budget, or holds
+     * a result), at most 10 s, instead of a fixed 300 ms in the hope that the helpers got there. `gate_hit` counts
+     * the waits that ended by the counter rather than by the deadline. */
+    atomic_long *gate;
+    int gate_hit;
 } slow_ctx;
+static atomic_long gate_open = 1;
 static void late_conductor(void) { usleep(20000); } /* the helpers run first */
 
 static int slow_head(void *ctx, const tsdb_series_result *r)
 {
     slow_ctx *s = ctx;
-    if (r->index == 0 && r->last)
-        usleep(300000);
+    if (r->index == 0 && r->last) {
+        if (!s->gate)
+            usleep(300000);
+        else {
+            for (int i = 0; i < 10000 && atomic_load(s->gate) < 1; i++)
+                usleep(1000);
+            s->gate_hit += atomic_load(s->gate) >= 1;
+        }
+    }
     s->rows += r->status ? 0 : r->n;
     if (r->index < 64)
         s->calls[r->index]++;
@@ -893,8 +906,10 @@ static void bounds(const char *base)
         list[i] = good[i % 8];
     memset(&b, 0, sizeof b);
     memset(&sc, 0, sizeof sc);
+    sc.gate = &b.deferred;
     mo.max_held_bytes = 600 << 10; /* one result of 20,000 float32 rows (room for 32,768: 384 KiB) fits */
     OK(tsdb_query_multi(db, &qv, list, 16, &mo, slow_head, &sc));
+    CHECK(sc.gate_hit == 1); /* a helper ahead was refused while the head was held */
     CHECK(sc.rows == 16 * (uint64_t)ROWS);
     fprintf(stderr, "  held ahead: peak %ld KiB of %zu KiB, %ld deferred\n", atomic_load(&b.peak) >> 10,
             mo.max_held_bytes >> 10, atomic_load(&b.deferred));
@@ -912,7 +927,9 @@ static void bounds(const char *base)
         list[i] = wide;
     memset(&b, 0, sizeof b);
     memset(&sc, 0, sizeof sc);
+    sc.gate = &b.deferred;
     OK(tsdb_query_multi(db, &qb, list, 9, &mo, slow_head, &sc));
+    CHECK(sc.gate_hit == 1);
     multi_defer_bytes = sb;
     for (int i = 0; i < 9; i++)
         CHECK(sc.status[i] == 0);
@@ -932,7 +949,9 @@ static void bounds(const char *base)
         list[i] = good[i % 8];
     memset(&b, 0, sizeof b);
     memset(&sc, 0, sizeof sc);
+    sc.gate = &b.deferred;
     OK(tsdb_query_multi(db, &ql, list, 9, &mo, slow_head, &sc));
+    CHECK(sc.gate_hit == 1);
     multi_defer_bytes = sb;
     for (int i = 0; i < 9; i++)
         CHECK(sc.status[i] == 0);
@@ -955,6 +974,7 @@ static void bounds(const char *base)
         qt.trim = trim == 0 ? TSDB_MULTI_TRIM_LO | TSDB_MULTI_TRIM_HI : trim == 1 ? TSDB_MULTI_TRIM_LO
                                                                                     : TSDB_MULTI_TRIM_HI;
         memset(&sc, 0, sizeof sc);
+        sc.gate = &gate_open; /* no budget here: the head need not be slow */
         OK(tsdb_query_multi(db, &qt, good, 8, NULL, slow_head, &sc));
         for (int i = 0; i < 8; i++)
             CHECK(sc.status[i] == (trim == 0 ? 0 : TSDB_ERR_TOO_MANY_BUCKETS));
@@ -971,7 +991,9 @@ static void bounds(const char *base)
     memset(&b, 0, sizeof b);
     memset(&sc, 0, sizeof sc);
     mo.threads = 32;
+    sc.gate = &b.peak; /* hold the head until a result waits ahead */
     OK(tsdb_query_multi(db, &qv, list, 16, &mo, slow_head, &sc));
+    CHECK(sc.gate_hit == 1);
     CHECK(sc.rows == 16 * (uint64_t)ROWS);
     fprintf(stderr, "  threads 32 of 2: peak %ld KiB ahead\n", atomic_load(&b.peak) >> 10);
     CHECK(atomic_load(&b.peak) > 0 && atomic_load(&b.peak) <= 4 * (400 << 10));
