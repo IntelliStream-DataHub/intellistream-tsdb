@@ -1310,7 +1310,7 @@ and MAINTENANCE is a domain state in the metadata group, so M6 never moves a vol
 - A Pulsar retry after a `drop_before` that covered part of the batch: DROPPED rows are acknowledged, not resent, and no dropped partition reappears.
 - A Pulsar sink against a volume that goes down for minutes: no message is acknowledged early, none is lost, per-series order holds after recovery (connectors/pulsar integration tests).
 
-**`make jepsen`: an `outage` nemesis** (hang, eio, slow or rollback of one prefix for 2-600 s, mixed with kill -9 and power loss). Checks: no acked write lost (outside declared rollbacks), no refused write visible, healthy throughput ≥ 80%, recovery within 30 s of heal plus grace.
+**`make jepsen`: an `outage` nemesis** (hang, eio, slow or rollback of one prefix for 2-600 s, mixed with kill -9 and power loss). Checks: no acked write lost (outside declared rollbacks), no refused write visible, healthy throughput ≥ 80%, recovery within 30 s of heal plus grace, and within 90 s for a domain that went DOWN three times in ten minutes (the 60 s of good probes of §15.2 plus the same 30 s; a 300 s run reaches that, and the check counts only a write invoked after the heal).
 
 **jepsen-ha:** a 10-minute hang of one domain, with zero SIGKILLs, zero reboots and zero takeovers. Server reboot with the clients' RDMA reconnect at maximum backoff, with grace 45 s, 30 s and 10 s: count the failovers in each run (none expected at 45 s); in every run no acked write is lost and takeovers stay within the per-server-group cap.
 
