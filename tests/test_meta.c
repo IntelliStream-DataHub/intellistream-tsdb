@@ -28,6 +28,7 @@
 #include "raft/raft_wire.h"
 
 #include <errno.h>
+#include "watchdog.h"
 #include <stdarg.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -35,6 +36,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "scratch.h"
 
 static int failures;
 #define CHECK(c)                                                                                                     \
@@ -393,7 +396,8 @@ static void test_state_machine(void)
         meta_op_slot_freeze(&e, 100, 0, e0);
         meta_op_slot_move(&e, 100, 1); /* the freeze is in this very entry: not committed before it */
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_INVALID);
-        CHECK(meta_slot_pending(&m, 100)->freeze_epoch == e0);
+        const struct meta_slot_pending *pend = meta_slot_pending(&m, 100);
+        CHECK(pend && pend->freeze_epoch == e0); /* a planted bug can leave no pending move: fail, do not crash */
         meta_op_slot_freeze(&e, 100, 0, e0);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS);
         meta_copy(&prev, &m);
@@ -924,7 +928,7 @@ static void test_raft_sim(unsigned seeds, uint64_t first, double seconds)
 static void test_raft_log(const char *base)
 {
     char dir[4096];
-    snprintf(dir, sizeof dir, "%s/test_meta_log.%d", base, (int)getpid());
+    snprintf(dir, sizeof dir, "%s/log", base); /* base is this run's own directory (scratch_make) */
     char err[512];
     raft_log *l;
     raft_log_opts o = {0};
@@ -2073,6 +2077,7 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_meta", 1200);
     const char *dir = argc > 1 && argv[1][0] != '-' ? argv[1] : "/tmp";
     unsigned seeds = 40;
     uint64_t first = 1;
@@ -2086,10 +2091,17 @@ int main(int argc, char **argv)
             seconds = strtod(argv[++i], NULL);
     }
     iso_log_quiet = true;
-    int mutant = 0;
-    for (int i = 1; i < argc; i++)
+    int mutant = 0, sim_only = 0;
+    for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--mutant") && i + 1 < argc)
             mutant = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sim-only")) /* the simulator's checker alone, to see it catch a planted bug */
+            sim_only = 1;
+    }
+    if (sim_only && !mutant) {
+        fprintf(stderr, "test_meta: --sim-only is for --mutant runs\n");
+        return 2;
+    }
 #ifdef META_MUTANTS
     extern uint64_t meta_mutants;
     meta_mutants = mutant ? 1ull << mutant : 0;
@@ -2099,16 +2111,19 @@ int main(int argc, char **argv)
         return 2;
     }
 #endif
-    test_state_machine();
-    test_shared();
+    if (!sim_only) {
+        test_state_machine();
+        test_shared();
+    }
     if (!mutant) {
-        test_raft_log(dir);
+        test_raft_log(scratch_make(dir, "test_meta_log"));
         test_raft_sim(seeds, first, seconds);
     }
     unsigned bad = 0;
     for (unsigned i = 0; i < seeds && bad < 3; i++)
         bad += !msim_run(first + i, seconds, seeds <= 4);
     failures += (int)bad;
+    scratch_done(failures);
     if (failures) {
         fprintf(stderr, "test_meta: %d failures%s\n", failures, mutant ? " (the planted bug was caught)" : "");
         return 1;

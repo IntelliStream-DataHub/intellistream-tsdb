@@ -19,6 +19,7 @@
 #include "internal.h" /* part_footer, tsdb_test_midplace */
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <fcntl.h>
 #include <ftw.h>
 #include <pthread.h>
@@ -1992,6 +1993,7 @@ static void test_lf_free_unlocked(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_latest", 1200);
     const char *scratch = argc > 1 ? argv[1] : "/tmp";
     snprintf(root, sizeof root, "%s/tsdb_latest_%d", scratch, (int)getpid());
     mkdir(root, 0755);

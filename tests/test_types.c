@@ -7,6 +7,7 @@
 #include "hydraulic_psi.h"
 
 #include <fcntl.h>
+#include "watchdog.h"
 #include <inttypes.h>
 #include <math.h>
 #include <stdlib.h>
@@ -1533,6 +1534,7 @@ static void test_ts_zstd_rule(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_types", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     test_dataset_clock();
     for (effort = CODEC_FAST; effort <= CODEC_MERGE; effort++) {

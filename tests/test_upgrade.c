@@ -19,6 +19,8 @@
 #include "internal.h"
 
 #include <dirent.h>
+#include "watchdog.h"
+#include "require.h"
 #include <fcntl.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -391,7 +393,7 @@ static void test_v8_part_not_allowed(void)
 static void test_power_loss(void)
 {
     if (access(CLI, X_OK) != 0 || access(SHIM, R_OK) != 0) {
-        printf("  power loss during the upgrade: skipped (no %s or %s)\n", CLI, SHIM);
+        failures += tr_crashfs_missing("power loss during the upgrade", access(CLI, X_OK) != 0 ? CLI : SHIM);
         return;
     }
     char top[PATH_MAX + 16], db[PATH_MAX + 16], vol[PATH_MAX + 16];
@@ -482,6 +484,7 @@ static void test_old_binary(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_upgrade", 1200);
     const char *scratch = "/tmp";
     const char *mutant = NULL;
     for (int i = 1; i < argc; i++) {
@@ -489,6 +492,14 @@ int main(int argc, char **argv)
             mutant = argv[++i];
         else
             scratch = argv[i];
+    }
+    if (mutant && strcmp(mutant, "v8hash48") != 0) { /* a typo must not count as a planted bug that was caught */
+        fprintf(stderr, "test_upgrade: unknown mutant \"%s\" (exit 2)\n", mutant);
+        return 2;
+    }
+    if (access(FIXTURE, R_OK) != 0) { /* the fixture is read relative to the source directory */
+        fprintf(stderr, "test_upgrade: cannot read %s: run it from the source directory (exit 2)\n", FIXTURE);
+        return 2;
     }
     char tmpl[PATH_MAX];
     snprintf(tmpl, sizeof tmpl, "%s/test-upgrade.XXXXXX", scratch);

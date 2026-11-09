@@ -108,10 +108,9 @@ static pid_t start_server(const char *dir, const char *const *extra)
 
 static void stop_server(pid_t pid)
 {
-    if (pid > 0)
-        kill(pid, SIGTERM);
-    int status;
-    waitpid(pid, &status, 0);
+    int hung;
+    int status = th_stop(pid, 30000, &hung);
+    CHECK(!hung); /* a server that ignores SIGTERM for 30 s is a failure, not something to wait for */
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
@@ -1194,6 +1193,7 @@ static void run_cases(tsdbc *c)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_server_multi", 900);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     char dir[PATH_MAX];
     snprintf(dir, sizeof dir, "%s/test_server_multi-%d", base, (int)getpid());

@@ -15,6 +15,7 @@
 #include "tsdb.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,6 +149,7 @@ static void make_retired(tsdb *db)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_graveyard", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     char cmd[700];
     snprintf(dir, sizeof dir, "%s/tsdb-graveyard-%d", base, (int)getpid());

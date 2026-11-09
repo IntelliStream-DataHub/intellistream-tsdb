@@ -5,6 +5,8 @@
 #include "tsdb_calendar.h"
 
 #include <dirent.h>
+#include "watchdog.h"
+#include "require.h"
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -1618,7 +1620,7 @@ static void test_add_power_loss(const char *base, const char *argv0)
     snprintf(shim, sizeof shim, "%s/libcrashfs.so", dir);
     char shim_abs[PATH_MAX];
     if (access(cli, X_OK) != 0 || !realpath(shim, shim_abs)) {
-        printf("  power loss during volume add: skipped (no %s or %s)\n", cli, shim);
+        failures += tr_crashfs_missing("power loss during volume add", access(cli, X_OK) != 0 ? cli : shim);
         return;
     }
     char top[600], root[700], p[800];
@@ -2154,6 +2156,7 @@ static void test_large_insert_reuses_buffers(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_volumes", 1200);
     tp_raise_nofile();
     const char *base = argc > 1 ? argv[1] : "/tmp";
     /* canonical, as VOLUMES keeps paths (/tmp is /private/tmp on macOS); static: nothing for LeakSanitizer at exit.

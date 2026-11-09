@@ -4,6 +4,8 @@
 #include "samekeys.h"
 
 #include <dirent.h>
+#include "watchdog.h"
+#include "require.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2456,7 +2458,7 @@ static void drop_vs_merge_power(const char *base, int point, int lifetime)
              strrchr(self_path, '/') ? self_path : ".");
     char shim_abs[PATH_MAX];
     if (!realpath(shim, shim_abs)) {
-        printf("  (power loss during a drop and a merge: skipped, no %s)\n", shim);
+        failures += tr_crashfs_missing("power loss during a drop and a merge", shim);
         return;
     }
     /* the shim's root holds the database directory (it does not track the root's own entries) */
@@ -2920,6 +2922,7 @@ static void test_raw_many_parts(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_tsdb", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     char dir[256];
     self_path = argv[0];

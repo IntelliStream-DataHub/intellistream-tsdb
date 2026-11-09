@@ -39,8 +39,11 @@ mode=${1:-quick}
 # rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
 quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20 21 22 23 26 27 28 29 31 34 35 36"
 all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36"
-# test_repl's scenarios and the planted bug each must catch
-scenarios="34 35 36 37"
+# test_repl's scenarios: BUG:SCENARIO, the planted bug and the scenario that must report it. The bug has to make the
+# run exit 1 with "scenario(s) failed" and a failure line of that scenario: a crash (139), an unknown bug number (2)
+# or a missing binary (127) is not a planted bug caught. 24 (rounding a cut up) and 11 (on its own) cannot be seen
+# by the simulator, so a scenario is their only planted-bug check; 14 is also in the simulator's list.
+scenarios="34:promote 35:sync_cut 36:trim 36:cut_applied 37:unanswered 24:round_cut 11:promote 14:promote"
 
 mutants() {
     local seeds=$1 bad=0 m out
@@ -49,12 +52,17 @@ mutants() {
         echo "$out"
         case $out in *KILLED*) ;; *) bad=1 ;; esac
     done
-    for m in $scenarios; do
-        if "$B"/test_repl_mut --mutant "$m" > /dev/null 2>&1; then
-            echo "test_repl: planted bug $m: SURVIVED"
-            bad=1
+    local ms s rc
+    for ms in $scenarios; do
+        m=${ms%%:*} s=${ms#*:}
+        out=$("$B"/test_repl_mut --mutant "$m" 2>&1)
+        rc=$?
+        if [ $rc = 1 ] && case $out in *"test_repl: $s:"*"scenario(s) failed"*) true ;; *) false ;; esac; then
+            echo "test_repl: planted bug $m: KILLED by $s"
         else
-            echo "test_repl: planted bug $m: KILLED"
+            echo "test_repl: planted bug $m: NOT caught by $s (exit $rc, not 1 with a failure line of $s):"
+            echo "$out" | tail -n 5
+            bad=1
         fi
     done
     [ $bad = 0 ] || { echo "sim_repl.sh: a planted bug survived: the checker lost its teeth"; exit 1; }

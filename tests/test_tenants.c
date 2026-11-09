@@ -22,6 +22,7 @@
 #include "tsdb.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <fcntl.h>
 #include <ftw.h>
 #include <inttypes.h>
@@ -1056,6 +1057,7 @@ static void map_bench(const char *base, size_t n)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_tenants", 1200);
     int bench = argc > 2 && strcmp(argv[1], "--map-bench") == 0;
     const char *scratch = bench ? (argc > 3 ? argv[3] : "/tmp") : (argc > 1 ? argv[1] : "/tmp");
     char base[400];

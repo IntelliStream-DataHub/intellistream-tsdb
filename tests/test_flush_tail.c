@@ -16,6 +16,7 @@
 #include "tsdb.h"
 
 #include <stdio.h>
+#include "watchdog.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -158,6 +159,7 @@ static void test_zap_page_size(void)
 
 int main(void)
 {
+    th_watchdog("test_flush_tail", 1200);
     test_series_array();
 #ifndef OLD_CODE
     test_free_big();

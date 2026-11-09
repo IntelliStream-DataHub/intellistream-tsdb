@@ -26,6 +26,8 @@
 #include "internal.h"
 
 #include <fcntl.h>
+#include "watchdog.h"
+#include "require.h"
 #include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -547,7 +549,7 @@ static void test_replay_markers(void)
     /* rows 1..10, DROP (11), rows 12..21, COMMIT with 3 events (22..24), rows 25..26: 22 rows, next 27 */
     eng *db;
     int rc = open_eng(dir, false, false, &db);
-    CHECK(rc == 0);
+    CHECK(rc == 0 && "a segment of markers replays and the database opens");
     if (rc == 0) {
         CHECK(rows_of(db) == 22); /* markers are not rows */
         CHECK(fno_of(db) == 27);
@@ -674,7 +676,7 @@ static bool bound_holds(const char *dir, const char *ackfile, int k, const char 
 static void test_power_loss(void)
 {
     if (access(SHIM, R_OK) != 0) {
-        printf("  power loss: skipped (no %s)\n", SHIM);
+        failures += tr_crashfs_missing("power loss", SHIM);
         return;
     }
     char dir[PATH_MAX + 32], ackf[PATH_MAX + 32];
@@ -730,6 +732,7 @@ static void set_mutant(const char *mutant)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_fno", 1200);
     if (argc >= 5 && strcmp(argv[1], "--child") == 0) {
         if (getenv("TSDB_FNO_MUTANT"))
             set_mutant(getenv("TSDB_FNO_MUTANT"));

@@ -10,6 +10,7 @@
 #include "internal.h"
 
 #include <stdio.h>
+#include "watchdog.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -142,6 +143,7 @@ static void answers(tsdb *db, blob *out)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_threads", 1200);
     char dir[512];
     snprintf(dir, sizeof dir, "%s/test_threads_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     tsdb *db = open_db(dir, 1);

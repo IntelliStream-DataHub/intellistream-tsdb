@@ -11,6 +11,7 @@
 #include "rfc7677.h"
 
 #include <stdbool.h>
+#include "watchdog.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -271,6 +272,7 @@ static void scram_rfc7677(void)
 
 int main(void)
 {
+    th_watchdog("test_crypto", 1200);
     printf("test_crypto\n");
     sha256();
     hmac();

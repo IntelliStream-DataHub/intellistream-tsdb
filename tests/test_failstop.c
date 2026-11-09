@@ -21,6 +21,7 @@
 #include "tsdb.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
@@ -1759,6 +1760,7 @@ static void test_fsync_results(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_failstop", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     char root[300];
     snprintf(root, sizeof root, "%s/tsdb-failstop-%d", base, (int)getpid());

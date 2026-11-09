@@ -132,9 +132,9 @@ static void signal_pid(pid_t pid, int sig)
 
 static void stop_server(pid_t pid)
 {
-    signal_pid(pid, SIGTERM);
-    int status;
-    waitpid(pid, &status, 0);
+    int hung;
+    int status = th_stop(pid, 30000, &hung);
+    CHECK(!hung); /* a server that ignores SIGTERM for 30 s is a failure, not something to wait for */
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
@@ -3802,6 +3802,7 @@ static void test_latest_by_name_lookup(void)
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN); /* a check failing on a connection the server closed must not end the run */
+    th_watchdog("test_server", 900);
     char dir[512];
     snprintf(dir, sizeof dir, "%s/tsdbd-test-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     char cmd[1300];

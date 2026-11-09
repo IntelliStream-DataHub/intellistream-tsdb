@@ -7,6 +7,7 @@
 #include "outagefs_ctl.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -77,6 +78,7 @@ static bool stays(int dom, int st, int ms)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_health", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     const char *const names[] = {"a", "a2", "b"};
     if (outagefs_reexec(argv, base, names, 3))

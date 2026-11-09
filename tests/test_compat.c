@@ -9,6 +9,7 @@
 #include "portable.h"
 
 #include <errno.h>
+#include "watchdog.h"
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -50,6 +51,7 @@ int fcntl(int fd, int cmd, ...)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_compat", 1200);
     char path[512];
     snprintf(path, sizeof path, "%s/tsdb-compat-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);

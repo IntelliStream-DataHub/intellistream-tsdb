@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 #include "tsdb.h"
 #include <ftw.h>
+#include "watchdog.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -384,6 +385,7 @@ static void run(const char *dir, unsigned seed)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_small_parts", 1200);
     char dir[600];
     snprintf(dir, sizeof dir, "%s/tsdb-small-parts-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     unsigned seeds = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 4;

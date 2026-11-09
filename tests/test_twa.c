@@ -14,6 +14,7 @@
 #include "tsdb_calendar.h"
 
 #include <math.h>
+#include "watchdog.h"
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -1081,6 +1082,7 @@ static void test_retention_carry(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_twa", 1200);
     snprintf(base, sizeof base, "%s/tsdb_twa_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     rmrf(base);
     char cmd[600];

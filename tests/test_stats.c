@@ -21,6 +21,7 @@
 #include "tsdb.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <ftw.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -936,6 +937,7 @@ static void test_counters(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_stats", 1200);
     char base[400];
     snprintf(base, sizeof base, "%s/tsdb-stats-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     rm_rf(base);

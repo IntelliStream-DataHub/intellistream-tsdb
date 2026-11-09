@@ -5,6 +5,7 @@
 #include "tsdb.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -583,6 +584,7 @@ static void test_volumes(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_sched", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     test_two_jobs();
     test_caps();

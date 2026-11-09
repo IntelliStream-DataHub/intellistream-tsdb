@@ -7,6 +7,7 @@
 #include "tsdb.h"
 
 #include <dlfcn.h>
+#include "watchdog.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,7 @@ static int failures;
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_shared", 1200);
     char dir[512], cmd[600];
     snprintf(dir, sizeof dir, "%s/tsdb-shared-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);

@@ -24,6 +24,7 @@
 #include "hydraulic_psi.h"
 
 #include <fenv.h>
+#include "watchdog.h"
 #include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1294,6 +1295,7 @@ static void check_thresholds(void)
 
 int main(void)
 {
+    th_watchdog("test_levels", 1200);
     check_dispatch();
     make_inputs();
     size_t maxn = GR;

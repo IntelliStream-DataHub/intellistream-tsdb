@@ -46,6 +46,12 @@ URING_LIB ?= -luring
 LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
+# the power-loss sweeps need libcrashfs.so: where it is built (every platform but macOS) a missing one is a failure
+ifneq ($(UNAME_S),Darwin)
+export TSDB_REQUIRE_CRASHFS := 1
+endif
+# where the tests make their scratch directories (each run makes its own below it)
+SCRATCH ?= $(or $(TMPDIR),/tmp)
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
 FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire
 # objects a harness links besides the library (in $(B) or build-fuzz/)
@@ -246,63 +252,66 @@ $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
 test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
-	./$(B)/test_tsdb
+	./$(B)/test_tsdb $(SCRATCH)
 	B=$(B) tests/sim_repl.sh quick
-	./$(B)/test_sched
-	./$(B)/test_multi
-	./$(B)/test_latest
-	./$(B)/test_threads
-	./$(B)/test_buckets
-	LD_LIBRARY_PATH=$(B) DYLD_LIBRARY_PATH=$(B) ./$(B)/test_shared
-	./$(B)/test_compat
-	TSDB_FAST_FSYNC=1 ./$(B)/test_compat
-	./$(B)/test_failstop
-	./$(B)/test_graveyard
-	./$(B)/test_abandon
-	./$(B)/test_recover
-	./$(B)/test_damage
-	./$(B)/test_upgrade $(or $(TMPDIR),/tmp)
-	! ./$(B)/test_upgrade --mutant v8hash48 $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # the planted bug must fail it
-	./$(B)/test_fno $(or $(TMPDIR),/tmp)
-	for m in reuse manifest markers nosync; do ! ./$(B)/test_fno --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
-	./$(B)/test_feedstore $(or $(TMPDIR),/tmp)
-	! ./$(B)/test_feedstore --mutant noseal $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # a replayed segment renamed without its fdatasync must fail it
-	! ./$(B)/test_feedstore --mutant latefloor $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # the cleaner's floor set after its unlinks must fail it
-	./$(B)/test_crafted
-	./$(B)/test_gindex
+	./$(B)/test_sched $(SCRATCH)
+	./$(B)/test_multi $(SCRATCH)
+	./$(B)/test_latest $(SCRATCH)
+	./$(B)/test_threads $(SCRATCH)
+	./$(B)/test_buckets $(SCRATCH)
+	LD_LIBRARY_PATH=$(B) DYLD_LIBRARY_PATH=$(B) ./$(B)/test_shared $(SCRATCH)
+	./$(B)/test_compat $(SCRATCH)
+	TSDB_FAST_FSYNC=1 ./$(B)/test_compat $(SCRATCH)
+	./$(B)/test_failstop $(SCRATCH)
+	./$(B)/test_graveyard $(SCRATCH)
+	./$(B)/test_abandon $(SCRATCH)
+	./$(B)/test_recover $(SCRATCH)
+	./$(B)/test_damage $(SCRATCH)
+	./$(B)/test_upgrade $(SCRATCH)
+	tests/expect_fail.sh 'the upgraded database opens' ./$(B)/test_upgrade --mutant v8hash48 $(SCRATCH) # the planted bug must fail it, with this check
+	./$(B)/test_fno $(SCRATCH)
+	tests/expect_fail.sh 'next == 1001' ./$(B)/test_fno --mutant reuse $(SCRATCH) # each planted bug must fail it, with its own check
+	tests/expect_fail.sh 'next == 1001' ./$(B)/test_fno --mutant manifest $(SCRATCH)
+	tests/expect_fail.sh 'a segment of markers replays' ./$(B)/test_fno --mutant markers $(SCRATCH)
+	tests/expect_fail.sh 'f > mx' ./$(B)/test_fno --mutant nosync $(SCRATCH)
+	./$(B)/test_feedstore $(SCRATCH)
+	tests/expect_fail.sh 'renamed before its data was synced' ./$(B)/test_feedstore --mutant noseal $(SCRATCH) # a replayed segment renamed without its fdatasync must fail it
+	tests/expect_fail.sh 'removed before the floor was durable' ./$(B)/test_feedstore --mutant latefloor $(SCRATCH) # the cleaner's floor set after its unlinks must fail it
+	./$(B)/test_crafted $(SCRATCH)
+	./$(B)/test_gindex $(SCRATCH)
 	./$(B)/test_flush_tail
-	./$(B)/test_stats
-	./$(B)/test_tenants $(or $(TMPDIR),/tmp)
-	./$(B)/test_tzfiles
+	./$(B)/test_stats $(SCRATCH)
+	./$(B)/test_tenants $(SCRATCH)
+	./$(B)/test_tzfiles $(SCRATCH)
 	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
-	./$(B)/test_types
-	./$(B)/test_delete
+	./$(B)/test_types $(SCRATCH)
+	./$(B)/test_delete $(SCRATCH)
 	./$(B)/test_levels
-	./$(B)/test_group
-	./$(B)/test_lttb
+	./$(B)/test_group $(SCRATCH)
+	./$(B)/test_lttb $(SCRATCH)
 	B=$(B) tests/test_cli_lttb.sh
 	B=$(B) tests/test_cli_latest.sh
-	./$(B)/test_twa
-	./$(B)/test_spread
+	./$(B)/test_twa $(SCRATCH)
+	./$(B)/test_spread $(SCRATCH)
 	B=$(B) tests/test_cli_spread.sh
 	B=$(B) tests/test_cli_input.sh
 	B=$(B) tests/test_bench_export.sh
 	B=$(B) tests/test_bench_qps.sh
 	B=$(B) tests/test_fs_warning.sh
-	./$(B)/test_limits
-	./$(B)/test_small_parts
-	./$(B)/test_classes
-	./$(B)/test_follow
-	./$(B)/test_volumes
+	./$(B)/test_limits $(SCRATCH)
+	./$(B)/test_small_parts $(SCRATCH)
+	./$(B)/test_classes $(SCRATCH)
+	./$(B)/test_follow $(SCRATCH)
+	./$(B)/test_volumes $(SCRATCH)
 	./$(B)/test_crypto
-	./$(B)/test_users
+	./$(B)/test_users $(SCRATCH)
 	B=$(B) tests/test_cli_users.sh
 	B=$(B) tests/test_cli_feed.sh
 	! nm $(CLIB) | grep -wE '_?tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only (_: Mach-O)
-	./$(B)/test_export
+	./$(B)/test_export $(SCRATCH)
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
-	./$(B)/test_meta /tmp --seeds 12 --seconds 15
+	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	tests/meta_mutants.sh $(B)/test_meta_mut
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
 	TSDBD=$(TSDBD) ./$(B)/test_ports
@@ -358,7 +367,7 @@ $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
 fuzz-replay: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
-	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 FUZZ_TMP=$(or $(TMPDIR),/tmp) ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
+	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 FUZZ_TMP=$(SCRATCH) ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
 
 # abspath: FUZZ_B=./build from the environment is build/ too, and must not redirect the normal build's rules
 ifneq ($(abspath $(B)),$(abspath $(FUZZ_B)))
@@ -394,12 +403,12 @@ fuzz: $(FUZZ:%=$(FUZZ_B)/fuzz-%)
 # their whole corpus. Not part of `make test`: it needs AVX-512 (skipped without) and a build of the engine under ASan.
 FUZZ_V4_CHECK  ?= part codecx
 fuzz-replay-asan: $(FUZZ_V4_CHECK:%=$(FUZZ_B)/fuzz-%)
-	for h in $(FUZZ_V4_CHECK); do FUZZ_TMP=$(or $(TMPDIR),/tmp) ASAN_OPTIONS=detect_stack_use_after_return=1:detect_leaks=0 \
+	for h in $(FUZZ_V4_CHECK); do FUZZ_TMP=$(SCRATCH) ASAN_OPTIONS=detect_stack_use_after_return=1:detect_leaks=0 \
 	    UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$(FUZZ_B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
 
 # writes each harness's generated seeds into tests/fuzz/corpus/<harness>/ (after a format change)
 fuzz-seeds: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
-	for h in $(FUZZ_HARNESSES); do FUZZ_TMP=$(or $(TMPDIR),/tmp) ./$(B)/fuzz-$$h -seeds tests/fuzz/corpus/$$h || exit 1; done
+	for h in $(FUZZ_HARNESSES); do FUZZ_TMP=$(SCRATCH) ./$(B)/fuzz-$$h -seeds tests/fuzz/corpus/$$h || exit 1; done
 
 endif
 fuzz-v4-check:
@@ -673,7 +682,7 @@ $(B)/test_cluster: tests/test_cluster.c tests/harness.h server/cluster.h server/
 meta-mutants: $(B)/test_meta_mut
 	tests/meta_mutants.sh $(B)/test_meta_mut
 meta-soak: $(B)/test_meta
-	./$(B)/test_meta /tmp --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
+	./$(B)/test_meta $(SCRATCH) --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
 TSDBD_SRC := server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/users.h \
              server/cluster.h server/meta.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
@@ -961,11 +970,11 @@ test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 ifneq ($(UNAME_S),Darwin)
 test: test-outagefs
 test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/test_unavailable $(B)/liboutagefs.so $(B)/tsdbd $(B)/tsdb
-	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs /tmp
-	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_health /tmp
+	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs $(SCRATCH)
+	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_health $(SCRATCH)
 	for io in $(IO); do echo "== outage, tsdbd --io $$io"; \
-	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage /tmp || exit 1; \
-	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_unavailable /tmp || exit 1; done
+	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage $(SCRATCH) || exit 1; \
+	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_unavailable $(SCRATCH) || exit 1; done
 endif
 
 # The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.

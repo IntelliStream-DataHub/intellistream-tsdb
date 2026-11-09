@@ -392,6 +392,7 @@ int main(int argc, char **argv)
     const char *names[] = {"a", "b"};
     if (outagefs_reexec(argv, base, names, 2) != 0)
         return 1;
+    th_watchdog("test_outage", 900);
     const char *dir_a = outagefs_dir("a"), *dir_b = outagefs_dir("b");
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
     snprintf(root, sizeof root, "%s.root", getenv("OUTAGEFS_CTL"));

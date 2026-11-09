@@ -1598,9 +1598,13 @@ static void scen_retired(void)
         usleep(100000);
     if (!log_has(2, "ends the voter role only"))
         die("server 2 did not end its voter role on a failed log sync");
+    /* the server writes the mark after the log line (as in the order of its code): poll for it, never test once */
     snprintf(path, sizeof path, "%s/n2/state/retired", base);
+    t0 = now_ms();
+    while (access(path, F_OK) != 0 && now_ms() - t0 < 10000)
+        usleep(20000);
     if (access(path, F_OK) != 0)
-        die("server 2 wrote no retired mark");
+        die("server 2 wrote no retired mark within 10 s of its log line");
     int rc = waitpid(pids[2], NULL, WNOHANG);
     if (rc != 0)
         die("server 2 is gone: a log fault in shared mode must end the voter role only");
@@ -2044,6 +2048,7 @@ static void scen_copyfault(void)
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
+    th_watchdog("test_cluster", 1800);
     const char *scratch = argc > 1 ? argv[1] : "/tmp";
     snprintf(root, sizeof root, "%s/tsdb_cluster.XXXXXX", scratch);
     if (!mkdtemp(root)) {
@@ -2072,6 +2077,13 @@ int main(int argc, char **argv)
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault}};
     int n = (int)(sizeof all / sizeof all[0]);
+    for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
+        int known = 0;
+        for (int k = 0; k < n; k++)
+            known |= !strcmp(argv[a], all[k].name);
+        if (!known)
+            die("unknown scenario \"%s\"", argv[a]);
+    }
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
         for (int a = 2; a < argc; a++)

@@ -9,6 +9,7 @@
 #include "tsdb_calendar.h"
 
 #include <math.h>
+#include "watchdog.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -951,6 +952,7 @@ static void bounds(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_multi", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     snprintf(root, sizeof root, "%s/test_multi-%d", base, (int)getpid());
     snprintf(vol2, sizeof vol2, "%s/test_multi-%d-vol2", base, (int)getpid());

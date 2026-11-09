@@ -24,6 +24,7 @@
 #include "tsdb_wire.h"
 
 #include <arpa/inet.h>
+#include "watchdog.h"
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -971,6 +972,7 @@ static void test_topology(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_wire", 1200);
     if (argc > 1 && strcmp(argv[1], "--emit") == 0) {
         emit();
         return 0;

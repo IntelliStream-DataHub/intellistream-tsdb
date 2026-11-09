@@ -228,6 +228,7 @@ int main(int argc, char **argv)
     const char *names[] = {"a"};
     if (outagefs_reexec(argv, base, names, 1) != 0)
         return 1;
+    th_watchdog("test_unavailable", 600);
     const char *dir_a = outagefs_dir("a");
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
     snprintf(root, sizeof root, "%s.root", getenv("OUTAGEFS_CTL"));

@@ -12,6 +12,7 @@
 #include "tsdb_protocol.h"
 
 #include <arpa/inet.h>
+#include "watchdog.h"
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -774,6 +775,7 @@ static void test_pack_wide_ids(void)
 
 int main(void)
 {
+    th_watchdog("test_client", 1200);
     test_pack_wide_ids();
     test_wide_ids();
     test_timeout_breaks_connection();

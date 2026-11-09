@@ -11,6 +11,7 @@
 #include "internal.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -1415,6 +1416,7 @@ static void test_lww_nested(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_delete", 1200);
     /* a directory of this run's own: the fixed names below collided between worktrees testing at once */
     static char own[600];
     snprintf(own, sizeof own, "%s/tsdb-delete-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());

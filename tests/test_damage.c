@@ -19,6 +19,7 @@
 #include "tsdb.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -3103,6 +3104,7 @@ static void test_follower_series_rewritten(const char *scratch)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_damage", 1200);
     const char *scratch = argc > 1 ? argv[1] : "/tmp";
     char base[512];
     snprintf(base, sizeof base, "%s/tsdb-damage-%d", scratch, (int)getpid());

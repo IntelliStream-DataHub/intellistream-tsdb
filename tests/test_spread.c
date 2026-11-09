@@ -22,6 +22,7 @@
 #include "tsdb.h"
 
 #include <float.h>
+#include "watchdog.h"
 #include <math.h>
 #include <stdbool.h>
 #include <inttypes.h>
@@ -1419,6 +1420,7 @@ static void test_int_variance_bits(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_spread", 1200);
     test_int_variance_bits();
 #if LDBL_MANT_DIG < 64
     /* the reference below is computed in long double and needs the x87 one (64-bit mantissa); where it is a plain

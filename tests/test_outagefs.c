@@ -5,6 +5,7 @@
 #include "outagefs_ctl.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -246,6 +247,7 @@ static void orphan(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_outagefs", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     if (outagefs_reexec(argv, base, (const char *const[]){"a", "b"}, 2))
         return 1;

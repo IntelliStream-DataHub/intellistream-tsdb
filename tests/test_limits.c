@@ -22,6 +22,7 @@
 #include "tsdb.h"
 
 #include <math.h>
+#include "watchdog.h"
 #include <stdbool.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -800,6 +801,7 @@ static void test_max_buckets(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_limits", 1200);
     snprintf(base, sizeof base, "%s/tsdb_limits_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     rmrf(base);
     char cmd[600];

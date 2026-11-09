@@ -12,6 +12,7 @@
 #include "tsdb.h"
 
 #include <fcntl.h>
+#include "watchdog.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -577,6 +578,7 @@ static void test_rowless_series(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_follow", 1200);
     char dir[512];
     snprintf(dir, sizeof dir, "%s/tsdb-follow-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     char cmd[600];

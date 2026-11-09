@@ -18,6 +18,7 @@
 #include "repl.h"
 
 #include <inttypes.h>
+#include "watchdog.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -371,6 +372,7 @@ static void round_cut(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_repl", 1200);
     uint64_t mutant = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {

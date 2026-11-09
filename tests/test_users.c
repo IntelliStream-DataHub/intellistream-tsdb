@@ -21,6 +21,7 @@
 #include "users.c" /* -Iserver: the record builders and the batch internals */
 
 #include <ftw.h>
+#include "watchdog.h"
 #include <limits.h>
 #include <signal.h>
 #include <sys/syscall.h>
@@ -2032,6 +2033,7 @@ static void power_loss(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_users", 1200);
     snprintf(base_dir, sizeof base_dir, "%s", argc > 1 ? argv[1] : "/tmp");
     char self[PATH_MAX];
     ssize_t n = tp_self_exe(self, sizeof self);

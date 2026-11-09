@@ -15,6 +15,7 @@
 #include "tsdb_calendar.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <fcntl.h>
 #include <ftw.h>
 #include <stdio.h>
@@ -1194,6 +1195,7 @@ static void test_check_order(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_crafted", 1200);
     /* a directory of this run's own: the fixed names below collided between worktrees testing at once */
     char base[400];
     snprintf(base, sizeof base, "%s/tsdb-crafted-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());

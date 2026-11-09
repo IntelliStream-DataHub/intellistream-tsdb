@@ -15,6 +15,7 @@
 #include "internal.h"
 
 #include <math.h>
+#include "watchdog.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -284,6 +285,7 @@ static void answers(tsdb *db, const tsdb_sid *ids, bool verify, blob *out)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_buckets", 1200);
     char dir[512];
     snprintf(dir, sizeof dir, "%s/test_buckets_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     tsdb *db = open_db(dir, 1);
