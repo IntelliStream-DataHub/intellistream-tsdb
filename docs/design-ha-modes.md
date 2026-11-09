@@ -709,8 +709,8 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | R14 | replicated | Operator CLI and metrics for the cluster data path | 2 | — (test_server) | — |
 | R10 | replicated | Redundancy change on a running volume; in 0.11.0 (the user, 2026-11-09: E33 there) | 3 | 6 | — |
 | R11 | replicated | Benchmarks per mode (NVMe and HDD storage) and the sizing numbers for P5's guide, README, AGENTS.md | 1-2 | the benchmarks, quiet machine | — |
-| P1 | replicated | **Production** (the user, 2026-11-09: cluster data is production in 0.11.0, design-cluster-data.md E36, §14). Versions: peer protocol ranges per link, the cluster version and `upgrade finish`, every new writer gated on it, `node prepare` one server at a time, metadata converted in place at the `CLUSTER_VERSION` entry, versioned state files, AGENTS.md's one-step-back format rule (E37-E41) | 4-6 | 6 (meta-soak with two versions) | — |
-| P2 | replicated | Upgrade test with a dummy bump of every version (`make upgrade-test`, the upgrade nemesis) | 2-3 | 8 | — |
+| P1 | replicated | **Production** (the user, 2026-11-09: cluster data is production in 0.11.0, design-cluster-data.md E36, §14). Versions: the compat triple (disk format, metadata snapshot version, peer protocol version) checked at links and opens, the cluster version and `upgrade finish` gating behaviour, `node prepare` one server at a time and only within one triple; a release that changes a member of the triple is a maintenance window (E37-E41; the user, 2026-11-09: today's pre-1.0 rule is kept, no reader of older versions, AGENTS.md unchanged, E40) | 3-4 | 4 (meta-soak with two builds of one triple) | — |
+| P2 | replicated | Upgrade test: a dummy behaviour bump within the formats (rolling) and a refusal test across a format change (`make upgrade-test`, the upgrade nemesis) | 1-2 | 6 | — |
 | P3 | replicated | Backup and restore: per-volume cuts, incremental by oid, restore into a new cluster, salvage from a backup (E42) | 4-5 | 6 (jepsen-cluster `backup`) | a backup target (an NFS export) for the guide's runs |
 | P4 | replicated | Alerts shipped as Prometheus rules, a test per rule (E43) | 1-2 | — | — |
 | P5 | replicated | Production operator guide (install, nodes, dead disk, dead node, upgrades, backups, alerts) with every runbook a test (E44) | 3-4 | 3 | — |
@@ -747,9 +747,10 @@ follow it; until then clients reach owners through forwarding. N1 also ships on 
    review of design-cluster-data.md). Replicated mode no longer waits for N7; shared mode's N-steps go
    on in parallel on their own tracks and their maintenance windows. M21's minimum production HA set is unchanged.
    *Changed again on 2026-11-09* (the user's answers, design-cluster-data.md E32-E36): R10 stays in 0.11.0, and the
-   cluster data path is **production** in 0.11.0, which adds P1-P6 (rolling upgrades and version negotiation,
-   upgrades in place, backup and restore, alerts, the production operator guide, the release gates): **about 59-84
-   track-days and 226 gate hours**. P1 lands after R8 and before R9; P6 runs last, on the release commit. Shared mode
+   cluster data path is **production** in 0.11.0, which adds P1-P6 (rolling upgrades within a format and the
+   compat check, backup and restore, alerts, the production operator guide, the release gates; a format change
+   before 1.0 is a maintenance window, since the user kept today's compatibility rule, E40): **about 57-81
+   track-days and 222 gate hours**. P1 lands after R8 and before R9; P6 runs last, on the release commit. Shared mode
    is not production in 0.11.0 (its steps that are merged ship behind `--preview`, E46 there).
 
 **Totals** (restated in verification; the first revision's sum left N1 out and did not add up). Minimum production HA:
@@ -758,8 +759,8 @@ track-days**, which on three tracks is roughly 2-3 weeks of calendar if the main
 for replicated mode, 8-13 track-days, and X1 and X3, 3-4. *Since 2026-11-09* replicated mode no longer comes after the
 minimum: v0.11.0 holds S1, S2 and S4 with R2-R14 (R1 goes on) and X1 is folded into R7. *Restated on 2026-11-09
 after the user's answers* (R10 in 0.11.0; cluster data production, so P1-P6 too): the rest of S1, S2, S4 and R2-R4
-13-20 track-days and 43 gate hours, R5-R14 30-40 and 64, P1-P6 16-24 and 119: **about 59-84 track-days and 226 gate
-hours (about 9.5 machine-days, 3 of them the 72-hour soak) before reruns**, roughly 6-8 weeks of calendar on three
+13-20 track-days and 43 gate hours, R5-R14 30-40 and 64, P1-P6 14-21 and 115: **about 57-81 track-days and 222 gate
+hours (about 9.25 machine-days, 3 of them the 72-hour soak) before reruns**, roughly 6-8 weeks of calendar on three
 tracks ([design-cluster-data.md](design-cluster-data.md) §11). Gate time for the minimum: about 68-88 machine-hours of
 gates plus N8's 2-3 days of real NFS runs, **about 5-7 machine-days**, mostly jepsen-ha and the NFS runs. The calendar
 is set by the two maintenance windows (N0 and N8) and the review rounds, not by building.
