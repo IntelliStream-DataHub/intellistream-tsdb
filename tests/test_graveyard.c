@@ -5,18 +5,25 @@
  * the wall clock (NTP, an operator, a VM resumed) must not delete retired parts early, while a follower reads them
  * (docs/ha.md, B6).
  *
- * The fake time source: this test defines time(), which the library (linked into the test) calls instead of
- * libc's, and adds a settable step to the real wall clock. The monotonic clock is not touched. Code that reads
- * the lifetime from time() sees the step; code that uses CLOCK_MONOTONIC does not.
+ * The fake time source: this test defines time() and gettimeofday(), which the library (linked into the test) calls
+ * instead of libc's, and adds a settable step to the real wall clock. The monotonic clock is not touched. Code that
+ * reads the lifetime from time() or gettimeofday() sees the step; code that uses CLOCK_MONOTONIC does not. Not
+ * faked: clock_gettime(CLOCK_REALTIME). The engine builds its timed-wait deadlines from it (flusher, merge thread,
+ * health), and a faked reading beside the kernel's real clock puts those a day ahead of it: the threads then sleep
+ * for the step. A lifetime built on that reading is not caught here; it is why the code uses the monotonic clock
+ * through one helper (eng_mono_ms, mono_ms).
  *
  *   ./build/test_graveyard [scratch dir]
  */
 #define _GNU_SOURCE
 #include "tsdb.h"
 
+#include <sys/time.h>
+
 #include <dirent.h>
 #include "watchdog.h"
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +51,16 @@ static int failures;
 
 #ifndef __APPLE__
 static atomic_llong wall_step_s; /* added to the wall clock the library reads through time() */
+
+int gettimeofday(struct timeval *tv, void *tz)
+{
+    (void)tz;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    tv->tv_sec = ts.tv_sec + (time_t)atomic_load(&wall_step_s);
+    tv->tv_usec = ts.tv_nsec / 1000;
+    return 0;
+}
 
 time_t time(time_t *t)
 {
@@ -109,13 +126,23 @@ static int64_t wait_gone(void)
 /* A wall clock stepped a day ahead (and back) while the retired parts wait: they stay, then go after the lifetime.
  * t0 is taken by the caller before the call that sets the deadline (the merge, the open), so the time measured is at
  * least the parts' real age and a slow open cannot fail correct code. */
-static void check_step(const char *what, int want, int64_t t0)
+static bool check_step(const char *what, int want, int64_t t0)
 {
     atomic_store(&wall_step_s, 86400);
     sleep_ms(700); /* several flusher cycles */
-    if (retired_files() != want) {
-        fprintf(stderr, "%s: %d retired parts left after a wall clock step of a day (want %d)\n", what,
-                retired_files(), want);
+    int left = retired_files();
+    int64_t age = mono_ms() - t0; /* at least the parts' age: they can be gone legitimately only at 2000 */
+    if (left != want && age >= 1900) {
+        /* a loaded machine kept this thread away until the lifetime was over: nothing can be said about the step,
+         * and the caller runs the scenario again */
+        fprintf(stderr, "%s: inconclusive: %lld ms went by before the check (%d of %d parts left)\n", what,
+                (long long)age, left, want);
+        atomic_store(&wall_step_s, 0);
+        return false;
+    }
+    if (left != want) {
+        fprintf(stderr, "%s: %d retired parts left after a wall clock step of a day (want %d), at %lld ms\n", what,
+                left, want, (long long)age);
         failures++;
     }
     atomic_store(&wall_step_s, -86400); /* and a step back must not keep them forever either */
@@ -129,6 +156,7 @@ static void check_step(const char *what, int want, int64_t t0)
         failures++;
     }
     atomic_store(&wall_step_s, 0);
+    return true;
 }
 
 static void make_retired(tsdb *db)
@@ -147,51 +175,76 @@ static void make_retired(tsdb *db)
     OK(tsdb_optimize(db)); /* one part from two: the sources are retired */
 }
 
+static void clean_dir(void)
+{
+    char cmd[700];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0)
+        failures++;
+}
+
+/* Parts retired by a merge. False: inconclusive (the machine was too slow to check in time). */
+static bool scenario_merge(const tsdb_options *o)
+{
+    clean_dir();
+    tsdb *db = NULL;
+    int64_t t0 = mono_ms();
+    OK(tsdb_open(dir, o, &db));
+    make_retired(db);
+    int n = retired_files();
+    CHECK(n > 0);
+    bool done = check_step("retired by a merge", n, t0);
+    tsdb_close(db);
+    return done;
+}
+
+/* Retired files a restart finds: collected obsolete_part_lifetime_s after the open. */
+static bool scenario_open(const tsdb_options *o)
+{
+    clean_dir();
+    tsdb *db = NULL;
+    OK(tsdb_open(dir, o, &db));
+    make_retired(db);
+    tsdb_close(db); /* the lifetime has not passed: they stay for the next open */
+    int n = retired_files();
+    CHECK(n > 0);
+    int64_t t0 = mono_ms();
+    OK(tsdb_open(dir, o, &db));
+    bool done = check_step("found at open", n, t0);
+    tsdb_close(db);
+    return done;
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_graveyard", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
-    char cmd[700];
     snprintf(dir, sizeof dir, "%s/tsdb-graveyard-%d", base, (int)getpid());
-    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
-    if (system(cmd) != 0)
-        return 1;
     printf("graveyard lifetime and the wall clock\n");
 #ifdef __APPLE__
     printf("  skipped: the fake time source needs ELF symbol interposition\n");
     return 0;
 #else
     tsdb_options o = opts();
-    tsdb *db = NULL;
-    int64_t t0 = mono_ms();
-    OK(tsdb_open(dir, &o, &db));
-    make_retired(db);
-    int n = retired_files();
-    CHECK(n > 0);
-    check_step("retired by a merge", n, t0);
-    tsdb_close(db);
-    printf("  parts retired by a merge outlive a step of the wall clock\n");
-
-    /* the same for retired files a restart finds: collected obsolete_part_lifetime_s after the open */
-    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
-    if (system(cmd) != 0)
-        return 1;
-    OK(tsdb_open(dir, &o, &db));
-    make_retired(db);
-    tsdb_close(db); /* the lifetime has not passed: they stay for the next open */
-    n = retired_files();
-    CHECK(n > 0);
-    t0 = mono_ms();
-    OK(tsdb_open(dir, &o, &db));
-    check_step("found at open", n, t0);
-    tsdb_close(db);
-    printf("  retired parts found at open too\n");
-
-    if (!failures) {
-        snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
-        if (system(cmd) != 0)
+    static const struct {
+        bool (*run)(const tsdb_options *);
+        const char *done;
+    } scenarios[] = {
+        {scenario_merge, "parts retired by a merge outlive a step of the wall clock"},
+        {scenario_open, "retired parts found at open too"},
+    };
+    for (size_t k = 0; k < sizeof scenarios / sizeof *scenarios; k++) {
+        int tries = 0;
+        while (!scenarios[k].run(&o) && ++tries < 5)
+            fprintf(stderr, "  again (%d)\n", tries);
+        if (tries >= 5) {
+            fprintf(stderr, "scenario %zu: five inconclusive runs in a row\n", k);
             failures++;
+        }
+        printf("  %s\n", scenarios[k].done);
     }
+    if (!failures)
+        clean_dir();
     printf(failures ? "FAILED: %d checks\n" : "all tests passed\n", failures);
     return failures != 0;
 #endif
