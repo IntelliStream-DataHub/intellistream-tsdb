@@ -3760,6 +3760,19 @@ int main(int argc, char **argv)
         default: goto usage;
         }
     }
+    /* For tests only (the client suites start tsdbd themselves and cannot all take a flag): the backend of a start
+     * without --io. production runs epoll on RHEL-family systems and io_uring elsewhere; both are tested. */
+    const char *test_io = getenv("TSDBD_TEST_IO");
+    if (test_io && io == IO_AUTO) {
+        if (strcmp(test_io, "epoll") == 0)
+            io = IO_EPOLL;
+        else if (strcmp(test_io, "uring") == 0)
+            io = IO_URING;
+        else {
+            fprintf(stderr, "tsdbd: TSDBD_TEST_IO is epoll or uring\n");
+            return 2;
+        }
+    }
     if (cluster_on && (!secret_file || !state_dir || o.read_only || o.follow)) {
         fprintf(stderr, "tsdbd: --cluster needs --cluster-secret-file and --state-dir (a local disk, never --dir), "
                         "and a writer (not --read-only or --follow)\n");

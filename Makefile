@@ -586,7 +586,17 @@ test-licenses:
 	cd connectors/pulsar && mvn -q $(JAVA_M2) -DskipTests package
 	tools/check-package-licenses.sh nar connectors/pulsar/target/tsdb-pulsar-sink-$(RELEASE_VERSION).nar apache
 
-test-clients: test-rust test-python test-python-sdist test-java test-java-embedded test-licenses
+test-clients: test-rust test-python test-python-sdist test-java test-java-embedded test-pulsar test-licenses
+
+# The same suites against tsdbd on epoll (production on AlmaLinux 10 runs it; make test-clients takes io_uring where
+# there is one). TSDBD_TEST_IO is read by tsdbd when a start names no --io, and by nothing else.
+test-clients-epoll:
+	TSDBD_TEST_IO=epoll $(MAKE) test-rust test-python test-java
+
+# The Pulsar sink's own tests (they start tsdbd), and the Pulsar-in-Podman run is connectors/pulsar/test/integration.sh
+test-pulsar: $(B)/tsdbd $(B)/tsdb
+	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
+	cd connectors/pulsar && mvn -q $(JAVA_M2) test
 
 # Commit rules as a git hook (no session links, DCO sign-off last); once per clone.
 hooks:
