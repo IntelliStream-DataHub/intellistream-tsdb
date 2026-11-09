@@ -28,7 +28,12 @@ desc=$("$B/tsdb" "$dir/db" query s min max lttb 50 --desc 2>/dev/null) || fail "
 [ "$desc" = "$(printf '%s\n' "$out" | tac)" ] || fail "lttb --desc is not the points reversed"
 lim=$("$B/tsdb" "$dir/db" query s min max lttb 50 --desc --limit 7 2>/dev/null) || fail "lttb --desc --limit 7"
 [ "$lim" = "$(printf '%s\n' "$desc" | head -n 7)" ] || fail "lttb --desc --limit 7 is not the newest 7"
+. tests/cli_refuse.sh
 for bad in -1 2 x 5x ""; do
-    if "$B/tsdb" "$dir/db" query s min max lttb $bad >/dev/null 2>&1; then fail "lttb '$bad' accepted"; fi
+    "$B/tsdb" "$dir/db" query s min max lttb $bad >/dev/null 2>"$dir/stderr"
+    rc=$?
+    [ "$rc" -ne 0 ] || fail "lttb '$bad' accepted"
+    # status 1 or 2 and a message: a crash is not a refusal (the valid form, lttb 50, is checked above)
+    cli_refusal_ok "$rc" "$dir/stderr" "tsdb" || fail "lttb '$bad': status $rc, stderr '$(head -c 200 "$dir/stderr")'"
 done
 echo "test_cli_lttb: ok"
