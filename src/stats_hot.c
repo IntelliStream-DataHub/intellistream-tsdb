@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Hot lists and page-cache residency (docs/design-stats.md step 4, ST10, ST12).
  *

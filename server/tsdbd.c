@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * tsdbd: serves a tsdb directory over TCP (protocol in tsdb_protocol.h).
  *

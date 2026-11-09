@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # ch_bench.sh SYS (ch | chday): the query files q/SYS.* through clickhouse-benchmark over the native
 # protocol. Whole-range queries: a warm-up, then the median of 5. Random windows and point lookups:
 # a 3 s warm-up, then 15 s at 1 and at 32 clients. The queries carry no FORMAT Null, so results are

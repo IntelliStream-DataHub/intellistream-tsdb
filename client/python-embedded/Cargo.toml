@@ -1,0 +1,23 @@
+[package]
+name = "tsdb-embedded-python"
+version = "0.11.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+rust-version = "1.88"
+description = "Python binding (PyO3) for the embedded tsdb engine: tsdb_embedded.Db"
+publish = false
+
+[lib]
+name = "tsdb_embedded"
+crate-type = ["cdylib"]
+
+[dependencies]
+tsdb-client = { package = "intellistream-tsdb-client", version = "=0.11.0", path = "../rust" }
+tsdb-embedded = { package = "intellistream-tsdb-embedded", version = "=0.11.0", path = "../rust-embedded" }
+tsdb-client-python-common = { path = "../python-common", features = ["embedded"] }
+pyo3 = "0.29"
+numpy = "0.29"
+
+[features]
+# the engine compiled for this CPU (-march=native), as `make test-python` builds it
+native = ["tsdb-embedded/native"]

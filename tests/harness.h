@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Shared by the C test harnesses that start tsdbd (test_server, test_stability, jepsen, test_ports).
  * They pass th_follow_me()'s --exit-with-parent=PID as well: a test killed by a timeout leaves no server behind.
  *

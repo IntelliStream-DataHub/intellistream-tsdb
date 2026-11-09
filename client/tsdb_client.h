@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * Client for tsdbd. Mirrors the embedded API in tsdb.h; one tsdbc is one TCP
  * connection and must be used by one thread at a time (open one per thread).

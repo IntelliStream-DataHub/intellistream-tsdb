@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * A small database for the file harnesses: four series of four types over two
  * daily partitions, written as parts of 64-row granules (one with a range

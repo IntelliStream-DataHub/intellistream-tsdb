@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # Writes the queries of spec.tsv in one system's dialect: q/SYS.<class>.txt with one query per line
 # (the input of qdrive and clickhouse-benchmark) and q/SYS.full{0,3600,60}.txt for the whole-range
 # queries. Run in $WORK:  python3 -I mkq.py SYS

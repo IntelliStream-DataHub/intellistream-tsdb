@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Builds and checks the release tarball of TAG from the checkout in the current directory, which must be exactly
 # that tag, clean, with VERSION equal to TAG without its "v" and without a -prerelease suffix (VERSION is always
 # X.Y.Z: tools/check-version.sh). The release workflow (.github/workflows/release.yml) runs it from its own checkout

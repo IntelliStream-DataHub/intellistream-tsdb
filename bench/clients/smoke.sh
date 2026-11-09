@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # A quick check that the harness works (make bench-clients-smoke): embedded and the C client on a tiny data set,
 # and that verification notices rows that are not the file's. The numbers mean nothing. run.sh --clients "c rust
 # python java" does the same for the other clients.

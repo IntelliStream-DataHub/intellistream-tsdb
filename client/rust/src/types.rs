@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Query options and results.
 
 use crate::value::{Column, Value, ValueType};
@@ -244,7 +245,8 @@ impl TwaOpts {
     }
 
     /// The order and limit as [`QueryOpts`].
-    pub(crate) fn query_opts(&self) -> QueryOpts {
+    #[doc(hidden)]
+    pub fn query_opts(&self) -> QueryOpts {
         QueryOpts { order: self.order, limit: self.limit }
     }
 }

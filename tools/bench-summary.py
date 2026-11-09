@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Turns the raw logs of tools/bench-tsdb.sh into summary.md and summary.json.
 
     tools/bench-summary.py RESULTS_DIR

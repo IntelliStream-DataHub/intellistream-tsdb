@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * Calendar grouping in a time zone, done where the time zone is known: in the
  * client. The database stores and groups UTC only; for "per day in

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The public tsdb: one root directory plus any number of volumes, each a
  * storage directory of its own (its parts, WAL, MANIFEST and LOCK), for

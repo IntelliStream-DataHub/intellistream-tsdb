@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Wire format of `include/tsdb_protocol.h`: little-endian frames
 //! `[u32 len][u32 id][u8 op] payload`, where `len` counts the bytes after
 //! itself. Every reply has op REPLY and starts with an i32 status.

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Where do the short-run kernels hand over to the wide ones on this CPU? (src/simd.c: AVX2_SHORT, THR_*)
 #
 #   bench/cpu-compare/thresholds.sh [--cpu v3|v4] [--work DIR] [--rounds 11] [--ms 50] [--vary]
@@ -22,7 +23,7 @@ while [ $# -gt 0 ]; do
     --rounds) ROUNDS=$2; shift 2 ;;
     --ms) MS=$2; shift 2 ;;
     --vary) VARY=--vary; shift ;;
-    *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     esac
 done
 T=$WORK/tree; O=$WORK/thr-$CPU; mkdir -p "$WORK" "$O"; rm -f "$O"/R*

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The latest table (docs/design-latest.md, step 2): per volume, for every series, the newest non-null row in the
  * parts (or a bound on it), so that "what is the newest value of these series?" is a few memory reads instead of a

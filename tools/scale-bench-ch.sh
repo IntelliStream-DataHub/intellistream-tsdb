@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Runs the queries written by `scale-bench query --sql DIR` in ClickHouse, one
 # clickhouse-benchmark run per class over a single connection, and prints the
 # mean and median latency in the format of scale-bench.

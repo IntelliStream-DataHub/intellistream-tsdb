@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # The commit rules of a pull request, for every commit in BASE..HEAD (merge commits are skipped):
 #   - the message passes .githooks/commit-msg (no link to a Claude session; ends with a Signed-off-by trailer);
 #   - that last Signed-off-by names the commit's author (the e-mail address must match): the DCO says the author

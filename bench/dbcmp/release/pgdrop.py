@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """pgdrop.py PORTFILE: a fake PostgreSQL server for harnesstest.sh. It accepts one connection, answers the startup
 (no SSL, AuthenticationOk, ReadyForQuery), then closes it before any query: qdrive's next PQexec has no server."""
 import socket, struct, sys

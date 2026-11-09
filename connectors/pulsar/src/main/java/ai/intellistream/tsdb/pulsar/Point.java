@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package ai.intellistream.tsdb.pulsar;
 
 import ai.intellistream.tsdb.ValueType;

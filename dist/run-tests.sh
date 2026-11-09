@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # The test suite of a dist tarball, run where the binaries are going to run.
 #
 #   tests/run-tests.sh [scratch-dir]     (from the unpacked tarball; default /tmp)

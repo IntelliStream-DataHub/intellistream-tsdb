@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 // shape: the shape of a RowBinary input (u32 series, i64 ts ms, f32 value per 16-byte row), per series:
 //   series rows duplicates unordered nans max_gap_ms first_ms last_ms
 // The release run's answers are checked on this data only, and several TWA recipes (QuestDB's twap() with

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # One command that benchmarks tsdb itself on this machine and writes a summary.
 #
 #   tools/bench-tsdb.sh [--quick|--standard|--full] [--reps N] [--dir SCRATCH] [--out RESULTS_DIR]

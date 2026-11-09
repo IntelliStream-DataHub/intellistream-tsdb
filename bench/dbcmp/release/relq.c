@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Release benchmark: LTTB and time-weighted averages over the whole range, every series, for tsdb.
  *   relq lttb CONNS REPS [OUT]   LTTB, 1000 points per series (tsdb_query_lttb)

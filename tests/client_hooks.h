@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The C client's test hooks: only in build/tsdb_client_hooks.o (client/tsdb_client.c compiled with
  * -DTSDBC_TEST_HOOKS), never in libtsdbclient.a or tsdb_client.h. */
 #ifndef TSDB_CLIENT_HOOKS_H

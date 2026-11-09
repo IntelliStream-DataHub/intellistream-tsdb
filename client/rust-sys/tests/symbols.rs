@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The engine exports only its `tsdb_*` API from the static build. This binary defines C
 //! functions with names the engine uses internally; were the engine's own definitions global, the
 //! link would fail with duplicate symbols (or, through an archive, bind the engine to these).

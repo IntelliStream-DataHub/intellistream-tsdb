@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Synthetic but physically plausible sensor streams, shared by the benchmarks.
  * Each kind has its own sample interval, clock jitter and value resolution.

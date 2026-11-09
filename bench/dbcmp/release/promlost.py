@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # promlost.py: when check.py finds Prometheus' remote-write answers short, find exactly which acknowledged samples it
 # lost, and whether that explains every difference.
 #   PROM_PORT=9090 DATA=mixed.rowbinary python3 -I promlost.py CHECK_RW_TXT

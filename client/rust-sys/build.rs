@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Builds the tsdb engine into the crate, or links a prebuilt libtsdb.so (feature `system`).
 //!
 //! The static build mirrors the Makefile: every `src/*.c` plus `client/tsdb_calendar.c` (the

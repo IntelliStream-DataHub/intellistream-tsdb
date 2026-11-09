@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * WAL marker payloads (src/marker.c) on arbitrary bytes: mk_decode must not read past the length it is given, and
  * whatever it accepts must encode back to the very same bytes (one encoding per payload) and decode to the same

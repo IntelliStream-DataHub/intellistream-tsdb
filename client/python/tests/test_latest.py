@@ -1,4 +1,5 @@
-"""latest() and latest_by_name() (protocol version 14) on Client, Pool and Db.
+# SPDX-License-Identifier: Apache-2.0
+"""latest() and latest_by_name() (protocol version 14) on Client and Pool (test_latest.py of tsdb_embedded has Db).
 
 The newest row of each series, from the table the engine keeps: it must agree with what a read of the
 series' rows says, for every value type, with nulls, with an end bound, and for series that do not exist.
@@ -9,7 +10,7 @@ import pytest
 
 from conftest import ROOT_PASSWORD, Server  # noqa: F401
 import tsdb_client
-from tsdb_client import Client, Db, LatestMany, Pool, TsdbError
+from tsdb_client import Client, LatestMany, Pool, TsdbError
 
 T0 = 1_700_000_000_000 - 1_700_000_000_000 % 86_400_000
 UNKNOWN = 1 << 32 | 999_999
@@ -37,12 +38,8 @@ def fill(c):
     return ids, ts
 
 
-@pytest.fixture(params=["client", "pool", "db"])
+@pytest.fixture(params=["client", "pool"])
 def target(request, server, tmp_path):
-    if request.param == "db":
-        with Db(tmp_path / "db", fsync=False, merge_threads=0) as d:
-            yield d, fill(d)
-        return
     with Client("127.0.0.1", server.port, timeout=30) as c:
         filled = fill(c)
         if request.param == "client":
@@ -141,12 +138,3 @@ def test_denied_looks_like_missing(auth_server, tmp_path):
         assert p.latest([a])[0] == (T0, 1.5)
 
 
-def test_embedded_agrees_with_tsdbd(server, tmp_path):
-    with Client("127.0.0.1", server.port, timeout=30) as c, Db(tmp_path / "db", fsync=False, merge_threads=0) as d:
-        got = []
-        for x in (c, d):
-            ids, ts = fill(x)
-            names = ["l.f32", "l.f64", "l.i64", "l.bool", "l.state", "l.null", "l.empty", "l.missing"]
-            r = x.latest_by_name(names, errors="status", with_nulls=True)
-            got.append((list(r.status), list(r.kind), list(r.ts), r.values))
-        assert got[0] == got[1]

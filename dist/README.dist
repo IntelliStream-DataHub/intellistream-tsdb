@@ -10,13 +10,28 @@ Contents
   bench/               codec-bench, type-bench, tsdb-bench, insert-bench, tsdbc-bench, scale-bench
   lib/libtsdb.a        the embedded engine; link with -lzstd -lpthread -lm
   lib/libtsdbclient.a  the C client of tsdbd; link with -lzstd -lpthread -lm
-  include/             tsdb.h, tsdb_protocol.h, tsdb_calendar.h, tsdb_client.h
+  include/             tsdb.h, tsdb_protocol.h, tsdb_wire.h, tsdb_calendar.h, tsdb_client.h
   tests/               the test suite of this build; tests/run-tests.sh runs it (libcrashfs.so there is a
                        test-only shim that fails a write on purpose; nothing else loads it)
   systemd/tsdbd.service
-  BUILDINFO            version, build id, compiler, glibc
-  LICENSE, NOTICE      tsdb is licensed under the Apache License 2.0
+  BUILDINFO            version, build id, the source repository, zstd and liburing versions, compiler, glibc
+  LICENSE, NOTICE      the server, the engine (lib/libtsdb.a) and the tools: GNU AGPL, version 3 only
+  LICENSES/, LICENSING.md
+                       the Apache License 2.0 text, which covers the C client (lib/libtsdbclient.a) and the
+                       headers in include/ (a header's licence does not change that of lib/libtsdb.a: a program
+                       that links libtsdb is under the AGPL, one that only uses libtsdbclient.a is not);
+                       LICENSING.md explains the split and the commercial licence
   THIRD-PARTY-NOTICES  zstd and liburing are linked into the binaries: their licenses
+
+Source code (GNU AGPL, version 3, section 6)
+  The Corresponding Source of this tarball is the tsdb repository at the build id in BUILDINFO:
+    https://github.com/IntelliStream-DataHub/intellistream-tsdb
+  (`git checkout` the tag vX.Y.Z of the release, or the commit after the "-gCOMMIT" of a build id; `make dist`
+  there builds this tarball). The binaries also contain two libraries that `make dist` links in statically, in the
+  versions BUILDINFO names; their sources are upstream's tags of those versions:
+    zstd      https://github.com/facebook/zstd          (tag vVERSION)
+    liburing  https://github.com/axboe/liburing         (tag liburing-VERSION)
+  Whoever passes the tarball on must offer the same (or this text, unchanged).
 
 Requirements
   CPU     x86-64-v2: SSE4.2 and POPCNT, AVX not needed (Intel Nehalem and

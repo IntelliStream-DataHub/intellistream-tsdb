@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The graveyard: a part a merge replaced is renamed to retired_<name> and deleted obsolete_part_lifetime_s later
  * (a follower on another host may still have it mapped). The lifetime is measured on the monotonic clock: a step of

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Self-test for `make asan`: signed overflow that UBSan must turn into a failing exit status.
  * Built and run by `make ubsan-check` with the sanitizer flags and options of `make asan`. */
 #include <limits.h>

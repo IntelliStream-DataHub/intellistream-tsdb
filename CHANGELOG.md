@@ -6,6 +6,67 @@ All notable changes to tsdb are listed here, newest first. The format follows
 [docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.x release may still change the
 disk format and the wire protocol.
 
+## [Unreleased]
+
+**Licence change: the server and the engine are AGPL-3.0-only, the client libraries stay Apache-2.0, and a commercial
+licence is available.** (Ships in 0.11.0.) The releases 0.9.0, 0.9.1 and 0.10.0 were published under Apache 2.0 and stay
+so: their code may be used under that licence for ever. [LICENSING.md](LICENSING.md) says which directory has which
+licence, what links to what, and how to ask for the commercial licence (IntelliStream AS).
+
+- **AGPL-3.0-only** (text in `LICENSE`): `src/` and `libtsdb`, `server/` and `tsdbd`, `tools/` and the `tsdb` CLI, the
+  Raft core of the cluster (its source repository, intellistream-objects, is AGPL as well), `tests/`, `bench/`, and the
+  embedded bindings, which contain the engine: Rust `Db`, Python `Db` and Java `EmbeddedDb`. A program that links
+  `libtsdb` or uses an embedded binding is a work based on the engine: AGPL, or the commercial licence.
+- **Apache-2.0** (text in `LICENSES/Apache-2.0.txt`): what a program needs to talk to `tsdbd` over the network and
+  nothing more: the C client (`client/tsdb_{client,crypto,calendar,pack}.{c,h}`) and the headers it includes
+  (`include/tsdb.h`, `tsdb_protocol.h`, `tsdb_wire.h`, `tsdb_calendar.h`), the Rust crate `intellistream-tsdb-client`, the
+  Python package `intellistream-tsdb-client`, the Java client `tsdb-client` and the Pulsar sink. Apache code may be
+  part of an AGPL work (`libtsdb` contains `tsdb_calendar.c`, `tsdbd` uses `tsdb_crypto.c`); the reverse is not done,
+  and `tools/check-spdx.sh` (in `make test`) fails when an Apache file includes or imports an AGPL one. A header's
+  licence does not change the terms of `libtsdb`: only `libtsdbclient.a` and the network clients are Apache.
+- Every source file has an `SPDX-License-Identifier` line, every package its `LICENSE` and `NOTICE` (an Apache package
+  an Apache-only `NOTICE`, `LICENSES/NOTICE.apache`, which Apache-2.0 section 4(d) passes on to every program that bundles
+  it; the AGPL packages the `NOTICE` that names both, and the Apache text, `LICENSES/Apache-2.0.txt`, since they
+  contain Apache files), and the tarball `LICENSE`,
+  `LICENSES/`, `LICENSING.md`, `NOTICE` and `THIRD-PARTY-NOTICES`; the tarball's `README.dist` and `BUILDINFO` say where the source and the versions of the
+  statically linked zstd and liburing are (AGPL section 6). `CONTRIBUTING.md` asks outside contributors for a
+  licence grant besides the DCO sign-off, so that the dual licence stays possible (to be checked by a lawyer before
+  outside contributions are accepted). `docs/licenses.md` is the audit, redone for the combination.
+
+### What breaks for users of the embedded bindings (the network clients are unchanged)
+
+Before 1.0 the docs already say to use the same release on the server and its clients; the embedded bindings now
+live in their own packages, so that the network clients can stay Apache-2.0 without a mixed licence field.
+
+- **Rust.** The `embedded`, `embedded-system` and `native` features of `intellistream-tsdb-client` are gone (a build that
+  names them fails with "feature not found"). New crate `intellistream-tsdb-embedded` (`client/rust-embedded`,
+  AGPL-3.0-only, library `tsdb_embedded`), which depends on the client crate at exactly the same version. Neither
+  crate is on crates.io (`publish = false`): use path dependencies on a checkout of the same release, as the crate's
+  README shows, and keep the two on one release (the `=` pin in the embedded crate enforces it):
+
+  ```toml
+  intellistream-tsdb-embedded = { path = "../tsdb/client/rust-embedded" }   # features: "system" (link libtsdb.so), "native" (-march=native)
+  intellistream-tsdb-client = { path = "../tsdb/client/rust" }              # the types, errors and the Database trait
+  ```
+
+  `tsdb_client::Db` is now `tsdb_embedded::Db`; `Options`, `ValueCodec`, `PartInfo`, `ChunkRef` and `RawValues` moved
+  with it, everything else (`Error`, `Group`, `QueryOpts`, the `Database` trait, ...) stays in `tsdb_client`.
+  The client crate has a `#[doc(hidden)] pub mod __private` that the embedded crate uses (no semver promise, hence the
+  exact pin). The embedded examples and tests moved with the crate.
+- **Python.** `tsdb_client.Db` is gone: `tsdb_client.Db` and `from tsdb_client import Db` raise an `ImportError` that
+  names the new place. New wheel `intellistream-tsdb-embedded` (`client/python-embedded`, AGPL-3.0-only, module
+  `tsdb_embedded`, `from tsdb_embedded import Db`), which requires `intellistream-tsdb-client` of the same version:
+  `Db` raises `tsdb_client.TsdbError` (one `except` catches both). The result classes (`Buckets`, `Many`, ...) that
+  `Db` returns are its own types, `tsdb_embedded.Buckets`, with the same attributes: an `isinstance` check against
+  `tsdb_client.Buckets` is false for them. `tsdb_client` never imports `tsdb_embedded` and has no extra for it.
+  The shared glue of the two modules is `client/python-common` (Apache-2.0, no `#[pymodule]`).
+- **Java.** Unchanged: `tsdb-client` (Apache-2.0) and `tsdb-embedded` (AGPL-3.0-only, depends on the first) keep their
+  coordinates and packages.
+- **C.** Unchanged, except for the terms: `libtsdb` (embedded use) is AGPL-3.0-only, `libtsdbclient.a` Apache-2.0.
+- Tests, examples and benchmarks of the embedded bindings moved to the new directories (`bench/clients/run.sh`
+  follows); `make test-rust`, `test-python` and `test-licenses` cover both packages of each language, and
+  `tools/check-version.sh` the pins between them.
+
 ## [0.10.0] - 2026-11-09
 
 **Disk format 9, wire protocol 14 (floor 12, so clients and servers of protocol 12 and up still talk), embedded C ABI 7.**

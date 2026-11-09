@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Prometheus remote write loader (remote write 1.0: prometheus.WriteRequest, protobuf + snappy):
  *   loadprw FILE HOST PORT SAMPLES_PER_REQUEST SHARDS

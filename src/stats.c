@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Statistics (docs/design-stats.md, steps 1 and 2).
  *

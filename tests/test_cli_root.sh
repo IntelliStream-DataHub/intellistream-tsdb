@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # `tsdb <dir> ...` run as root on a directory that another user owns (secrel cli #1). The owner (the service
 # account, or whoever took it over) plants symbolic and hard links where USERS, USERS.compact and the engine's files
 # go; root then runs the CLI, as the docs allow. No file outside the directory may be created, written, chowned or

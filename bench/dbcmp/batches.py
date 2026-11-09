@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # The batches every system answers, made once from spec.tsv and shared by all of them:
 #   python3 -I batches.py spec.tsv > batches.tsv          (NSERIES, default 100, as for spec.py)
 # One line per member of a batch:  set  K  group  member  series  start_ms  end_ms  bucket_ms  spec_line

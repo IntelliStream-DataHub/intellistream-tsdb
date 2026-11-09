@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Benchmark at scale: load a large data set, then run a fixed query suite, in
  * tsdb and, through the SQL it writes, in ClickHouse.

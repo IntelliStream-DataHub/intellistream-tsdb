@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # rb_hyd.py F32FILE STEP_MS OUT: a hydraulic series (bench/hydraulic/convert.py's .f32, little-endian float32 in
 # time order) as RowBinary rows of tsdb-bench --export (u32 series 0, i64 ms, f32), sample i at
 # 2024-01-01 + i * STEP_MS. Standard library only.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* CLASSES (src/classes.c): a template database with parts, its CLASSES replaced by the input, then tsdb_open (the
  * load, the open's checks of every part against the history, cls_check_parts) and queries of every series. Records
  * are re-sealed (rec_check) unless bit 31 of their zero word is set (cleared, left as it is). */

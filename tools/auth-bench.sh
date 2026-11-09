@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # The before-and-after benchmark of login and per-series grants (docs/design-auth.md, A27): what does access control
 # cost in tsdbd?
 #
@@ -71,7 +72,7 @@ KEEP=0
 JOBS=${MAKE_JOBS:-$(nproc 2>/dev/null || echo 2)}
 
 usage() {
-    sed -n '2,/^set -u/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'
+    sed -n '3,/^set -u/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # await.sh NAME [MAX_SECONDS=540]: block up to MAX_SECONDS (keep it under the 10 minute tool cap) for a bgrun.sh job.
 # Prints ONE short status, never the whole output. Exit 0 = finished (rc printed), 10 = still running, 11 = unknown/died.
 . "$(dirname "$(readlink -f "$0")")/se-env.sh"

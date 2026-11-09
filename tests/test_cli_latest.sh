@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # The CLI's `latest NAME... [--with-nulls] [--end TIME]`: the newest value of each series (the last non-null row of
 # a read), a null row only with --with-nulls, `\N \N` for a series with no row, every value type, --end as a bound,
 # and an unknown series or a bad option refused.

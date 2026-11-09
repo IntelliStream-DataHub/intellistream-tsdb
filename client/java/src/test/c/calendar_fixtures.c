@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * Prints tsdb_calendar_bounds output (client/tsdb_calendar.c, the reference
  * definition of local calendar periods) as fixtures for CalendarBoundsTest,

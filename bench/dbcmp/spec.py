@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # The query list every system runs: python3 -I spec.py DATA N > spec.tsv
 # One query per line:  class  series  start_ms  end_ms  bucket_ms
 #   raw    3600 samples of one series                 agg1d  86400 samples in buckets of 300

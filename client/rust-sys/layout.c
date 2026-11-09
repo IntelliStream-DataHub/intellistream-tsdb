@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Sizes and field offsets of the public structs as the C compiler lays them
  * out, for tests/layout.rs to compare with the Rust declarations. */
 #include <stddef.h>

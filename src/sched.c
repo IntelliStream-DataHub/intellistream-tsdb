@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The query scheduler: one per database (tsdb handle), shared by its volumes.
  *
  * Work comes as fork/join jobs: fn(arg, i) runs on the calling thread (i == 0) and on helpers that join it, each

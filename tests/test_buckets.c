@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Small buckets: where each bucket's run of rows ends (query.c run_end, which steps from the previous run's length
  * before it searches) and the passes over the dense array of bucket states, which run by chunks on the query's

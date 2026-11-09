@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * Client for {@code tsdbd}, the TCP server of the tsdb time series database.
  *

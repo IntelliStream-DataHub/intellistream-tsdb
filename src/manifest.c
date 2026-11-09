@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * One writer, any number of followers: on one host, or on several hosts that
  * share the directory over NFS.

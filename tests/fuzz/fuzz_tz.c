@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Time zones as the clients read them (client/tsdb_calendar.c, included
  * here so its static parsers can be called): a TZif file from TZDIR, a zone

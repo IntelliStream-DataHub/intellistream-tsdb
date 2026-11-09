@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The engine through libtsdb.so, as the embedded bindings (Rust, Python, Java
  * FFM) use it: only the public API, memory returned by the library freed with

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Tenants (docs/design-stats.md steps 3, ST4-ST8, ST11, section 4).
  *

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `QUERY_LATEST` (protocol 14): the newest value of up to 2^20 series in one request, as `tsdbc_latest` in
 //! `client/tsdb_client.c` sends it. The reply comes in frames of up to 65,536 records of 24 bytes, in index order.
 //! A read-only request: UNAVAILABLE and MOVED before the first frame are retried like any read.

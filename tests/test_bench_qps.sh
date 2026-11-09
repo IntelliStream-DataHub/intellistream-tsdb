@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # `tsdb-bench --qps` opens an existing database and queries it from threads. It once used the table of series ids
 # that only a load fills (a NULL pointer: every query thread crashed), so the server-less query benchmark never ran.
 # It looks the ids up now, with the statistics on and with --no-stats.

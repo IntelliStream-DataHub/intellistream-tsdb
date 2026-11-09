@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* A tsdbd with a volume on a storage domain under the outagefs shim, for the tests of the Rust, Python and Java
  * clients (the C client's own test is test_unavailable.c): it makes a database (the root and volume A, the series
  * pump.a in A and pump.root in the root), starts tsdbd on it, prints one line

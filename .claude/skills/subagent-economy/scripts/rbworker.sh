@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # rbworker.sh CMD...: the detached half of rbgrun.sh (env RB_N RB_WT RB_PROF RB_D). Not called by hand.
 . "$(dirname "$(readlink -f "$0")")/se-env.sh"
 K="${RB_KEY:+-i $RB_KEY} -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.Status;
 import ai.intellistream.tsdb.TsdbClient;

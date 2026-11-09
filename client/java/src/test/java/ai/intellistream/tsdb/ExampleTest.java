@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package ai.intellistream.tsdb;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -36,7 +37,10 @@ class ExampleTest {
             blocks.add(quick.substring(open + "```java\n".length(), close + 1));
         }
         String dir = "src/main/java/ai/intellistream/tsdb/example/";
-        assertEquals(List.of(Files.readString(BASE.resolve(dir + "Example.java"), StandardCharsets.UTF_8)), blocks,
+        String example = Files.readString(BASE.resolve(dir + "Example.java"), StandardCharsets.UTF_8);
+        // the file's SPDX line is a licence header, not part of the quick start
+        if (example.startsWith("// SPDX-License-Identifier:")) example = example.substring(example.indexOf('\n') + 1);
+        assertEquals(List.of(example), blocks,
                 "README.md's quick start must hold Example.java, verbatim");
     }
 

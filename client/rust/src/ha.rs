@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The bodies of protocol 13 (`include/tsdb_wire.h`): why a request was refused (UNAVAILABLE), where a volume went
 //! (MOVED), what a frame spanning volumes did (PARTIAL), the drop watermark (DROPPED) and TOPOLOGY. The decoders
 //! never trust a count: an entry count the bytes cannot hold, or bytes that are left over, make the body

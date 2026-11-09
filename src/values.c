@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Value types: aggregation that skips nulls, granule statistics, and the
  * statistics as query results.

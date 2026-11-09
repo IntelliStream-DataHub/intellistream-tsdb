@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Abandoned requests (tsdb_set_abandon_flag, ha.md 15.3).
  *

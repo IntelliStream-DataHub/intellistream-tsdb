@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The big buffers of a flush and of a memtable: what the other threads wait on (flush-tail).
  *

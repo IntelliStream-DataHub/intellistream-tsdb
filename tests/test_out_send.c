@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The worker's own send of its replies (out_put, out_send in server/tsdbd.c), on a socket pair whose reader is
  * this test, with no event loop: what a non-blocking send leaves stays at the front of the output, in order, and
  * belongs to the event loop from then on (tx_loop), so the worker's later replies are only appended until the loop

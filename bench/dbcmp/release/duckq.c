@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* duckq: one DuckDB statement timed, DuckDB's counterpart of `chq sqlt` (embq, which the multi-series branch owns,
  * has only an untimed `sql`).
  *

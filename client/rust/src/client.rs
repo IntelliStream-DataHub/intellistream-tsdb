@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The blocking client: one [`Client`] is one TCP connection.
 //!
 //! Requests are written as whole frames and replies read in order. The server
@@ -2846,7 +2847,7 @@ fn check_lengths(series: Option<&[SeriesId]>, one: SeriesId, ts: &[i64], values:
 }
 
 /// Converts a range to the protocol's `[start, end)`.
-pub(crate) fn bounds(r: &impl RangeBounds<i64>) -> (i64, i64) {
+pub fn bounds(r: &impl RangeBounds<i64>) -> (i64, i64) {
     let start = match r.start_bound() {
         Bound::Included(&s) => s,
         Bound::Excluded(&s) => s.saturating_add(1),

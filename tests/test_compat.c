@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The portability shims of src/compat.h that need a test of their own.
  *
  * tsdb_fsync and tsdb_fdatasync: on macOS a plain fsync does not flush the drive's cache, so a power loss can lose

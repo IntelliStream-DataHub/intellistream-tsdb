@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * tsdbd's cluster thread (docs/design-cluster.md §2, step 1 of §14): the metadata group's Raft core, the watch stream
  * of the servers that are not in the group, heartbeats, and the admin ops of `tsdb cluster`. See cluster.c.

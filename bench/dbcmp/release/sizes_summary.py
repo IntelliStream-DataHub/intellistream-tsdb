@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # sizes_summary.py P1DIR: the per-sensor size table from phase 1's <system>.tsv files (ds, rows, bytes, note).
 # One row per data set, one column per system: bytes per reading and the size compared to tsdb (tsdb = 1x; 2.6x
 # means 2.6 times tsdb's size). tsdb's column is after tsdb_optimize (what idle merges do); tsdb-settled is the

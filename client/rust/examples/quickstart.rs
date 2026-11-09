@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use tsdb_client::{Client, ConnectOptions, Group, QueryOpts, Unit};
 
 fn main() -> Result<(), tsdb_client::Error> {

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # qbench.sh SYS DRIVER-ARGS...: the query files q/SYS.* through qdrive.
 #   DRIVER-ARGS: pg CONNINFO | http HOST PORT HEADERS
 # Whole-range queries: a warm-up, then the median of 5. Random windows and point lookups: a 3 s

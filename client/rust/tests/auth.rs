@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Login and access control against a real tsdbd (protocol 12): USERS made by the CLI, a login with the right
 //! and a wrong password, an unknown user, require_auth against `--no-auth`, DENIED on another tenant's series,
 //! and a round trip through every admin call.

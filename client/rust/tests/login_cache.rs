@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The key cache: PBKDF2 runs once per process for a user, salt and password, not once per connection, also
 //! across the connections of a Pool that start together (REVIEW3 #1). A test binary of its own, so no other test's
 //! login moves the counter.

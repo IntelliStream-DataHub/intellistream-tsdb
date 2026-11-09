@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Runs a `make dist` build the way a Sandy Bridge (x86-64-v2 + AVX, no AVX2,
 # BMI1/2, FMA, LZCNT, MOVBE) and a Westmere (x86-64-v2 without AVX: the
 # oldest CPUs AlmaLinux's v2 build is for) run it: under `qemu-x86_64 -cpu

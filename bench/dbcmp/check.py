@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # Correctness: runs the first N queries of each class on SYS (the benchmark's query text from q/,
 # only the output format may differ) and the whole-range queries, and compares them with tsdb's
 # answers in ref/ (tsdbq dump / tsdbq full ... dump). Run in $WORK:

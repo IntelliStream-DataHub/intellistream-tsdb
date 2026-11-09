@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Every public name has a docstring, the type stub carries the same ones (so
 IDEs show what help() shows), and the module's example runs."""
 
@@ -55,7 +56,6 @@ def test_everything_is_documented():
 def test_the_stub_has_the_same_docstrings():
     stub, runtime = stub_docs(), runtime_docs()
     stub.pop("Client.__new__")  # documented on the class
-    stub.pop("Db.__new__")
     stub.pop("Pool.__new__")
     assert sorted(stub) == sorted(runtime), "the stub and the module name different things"
     differ = [name for name in runtime if stub[name] != runtime[name]]

@@ -124,8 +124,13 @@ tell us in the pull request, so that we can fix the test.
    [AGENTS.md](AGENTS.md).
 8. **Update the [CHANGELOG](CHANGELOG.md)** under "Unreleased" for anything a user can notice.
 9. **A new dependency needs a compatible license** (MIT, BSD, Apache-2.0 and the like; no GPL or LGPL code linked
-   in). Add it to [docs/licenses.md](docs/licenses.md), and to `dist/THIRD-PARTY-NOTICES` if `make dist` links it
+   in, and nothing that cannot be part of an AGPL-3.0 work or, in the client libraries, of an Apache-2.0 work). Add it to [docs/licenses.md](docs/licenses.md), and to `dist/THIRD-PARTY-NOTICES` if `make dist` links it
    into the tarball.
+
+10. **Every source file has an `SPDX-License-Identifier` line** (the first line, or the second after a `#!` line)
+   with the licence of its directory, and an Apache-2.0 file never includes, imports or depends on an AGPL-3.0-only
+   one. `tools/check-spdx.sh` checks it (`make test` runs it); [LICENSING.md](LICENSING.md) lists which directory is
+   which.
 
 Do not commit `build*/` directories or benchmark data.
 
@@ -144,8 +149,8 @@ Keep each commit to one logical change, and write the message so that it says **
 
 Every commit must carry a `Signed-off-by` line. That is the
 [Developer Certificate of Origin](https://developercertificate.org/): by signing off you say that you wrote the
-change (or have the right to submit it) and that you are fine with it going into the project under the
-[Apache License 2.0](LICENSE). It is not a legal contract with us and needs no paperwork.
+change (or have the right to submit it) and that you are fine with it going into the project under the licence of
+the files it changes (see "License" below). It needs no paperwork beyond the line itself.
 
 ```sh
 git commit -s        # adds: Signed-off-by: Your Name <you@example.com>
@@ -191,6 +196,23 @@ any file. Session links are private and add noise to the history. The `commit-ms
 
 ## License
 
-By contributing you agree that your contribution is licensed under the [Apache License 2.0](LICENSE), like the
-rest of tsdb. The copyright of the project is held by IntelliStream AS; you keep the copyright of your own
-contribution (the sign-off is all we ask for).
+tsdb has two licences, by directory ([LICENSING.md](LICENSING.md)): the server, the engine, the tools and the embedded
+bindings are **AGPL-3.0-only**, the client libraries (the C, Rust, Python and Java network clients and the Pulsar
+connector) are **Apache-2.0**, and IntelliStream AS also offers a commercial licence for the AGPL parts. A new file
+gets the SPDX line of its directory.
+
+By submitting a contribution (a pull request, a patch, anything you send to us for inclusion) you agree that:
+
+1. it is licensed to everyone under the licence of the files it changes, AGPL-3.0-only or Apache-2.0, as the
+   project distributes them; and
+2. you also grant IntelliStream AS a perpetual, worldwide, non-exclusive, royalty-free, irrevocable licence to use,
+   copy, modify, sublicense and distribute your contribution under other terms as well, including a commercial
+   licence, and in a later version of the project under another open source licence. You keep the copyright of your
+   contribution, and this grant is what keeps the dual licence possible.
+
+The sign-off (`git commit -s`) means you accept both. If your employer owns what you write, get the employer's
+permission first.
+
+> **For the owner, before outside contributions are accepted:** have a lawyer check the wording of this grant (the
+> scope of "other terms", the position of employers, the effect in your jurisdiction). It is a plain-language
+> draft, not legal advice, and the project has only had one author so far.

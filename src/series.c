@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Series dictionary: name <-> dense uint32 id, and each series' value type.
  * Persisted as an append-only file of records; the id is the record index:

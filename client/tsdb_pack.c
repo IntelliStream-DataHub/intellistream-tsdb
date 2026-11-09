@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* The packed INSERT_VALUES body (see tsdb_pack.h). */
 #include "tsdb_pack.h"
 

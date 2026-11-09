@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Helpers shared by the harnesses: scratch directories and files. Each
  * harness defines LLVMFuzzerTestOneInput (and optionally LLVMFuzzerInitialize

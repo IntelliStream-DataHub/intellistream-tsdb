@@ -82,11 +82,16 @@ Pulsar 5 sink</a> writes points from Pulsar into tsdb.</li>
 <p><a href="concepts.html">Concepts</a> explains each of these.</p>
 
 <h2 id="license">License</h2>
-<p>tsdb is open source under the Apache License 2.0. Copyright 2026 IntelliStream AS. The source, the issues and the
-releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p>
+<p>tsdb is open source with two licences. The server (<code>tsdbd</code>), the engine (<code>libtsdb</code>), the
+command line tools and the embedded bindings (the database inside your own program) are under the GNU Affero General
+Public License 3.0 (AGPL-3.0-only); a commercial licence is available from IntelliStream AS. The client libraries (C,
+Rust, Python and Java, and the Pulsar sink) are under the Apache License 2.0, so a program that only talks to
+<code>tsdbd</code> over the network is not covered by the AGPL. The releases 0.9.0 to 0.10.0 stay under the Apache
+License 2.0. <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSING.md">LICENSING.md</a> has the details. Copyright 2026 IntelliStream AS. The
+source, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p>
 
 <nav class="pager" aria-label="Previous and next page"><a class="next" href="install.html"><span>Next</span>Install and build</a></nav></main>
 </div>
-<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source: the server and the engine under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">GNU AGPL-3.0</a> (a commercial licence is available), the client libraries under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSES/Apache-2.0.txt">Apache License 2.0</a>; <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSING.md">which is which</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
 </html>

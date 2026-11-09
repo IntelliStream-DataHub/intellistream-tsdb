@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Query load driver for the systems spoken to over HTTP or the PostgreSQL wire protocol.
  *   qdrive http HOST PORT HEADERS QFILE THREADS SECONDS [MAXQ]   lines: "GET path" or "POST path<TAB>ctype<TAB>body",

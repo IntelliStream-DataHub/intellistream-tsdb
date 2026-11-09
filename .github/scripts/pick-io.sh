@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Prints the event loop backends the server tests can use here, for `make test IO="$(pick-io.sh)"`:
 # "uring epoll" when this machine lets the current user set up an io_uring, otherwise "epoll".
 #
