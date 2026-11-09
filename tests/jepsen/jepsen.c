@@ -291,7 +291,7 @@ static int loss_violations;         /* of the violations, those of checks 1, 3 a
 static bool outage;                 /* --nemesis outage */
 static const char *outagefs_lib;    /* --outagefs */
 static char vol_dir[2][PATH_MAX], octl[PATH_MAX]; /* the two volume directories; the shim's control socket */
-static atomic_llong vol_ok[2], vol_last_ok[2];    /* acknowledged writes per volume; ns of the latest */
+static atomic_llong vol_ok[2], vol_last_ok[2];    /* acknowledged writes per volume; ns of the latest one's INVOKE */
 static int outage_problems, outage_faults, outage_kills;
 static double healthy_ops, healthy_secs, healthy_base_ops; /* B's writes during A's outage, and what B did before */
 
@@ -396,8 +396,11 @@ static int near_pct(int s) { return s % 2 ? 70 : 97; }
 
 static void stop_server(int sig);
 /* No server runs: clients must not try the old port, which anything may take now. */
+static int64_t life_start_ns; /* outage: when the server that runs now began (its memory of DOWNs begins then) */
+
 static void server_gone(void)
 {
+    life_start_ns = now_ns(); /* outage: the DOWNs the old server counted went with it */
     atomic_store(&server_pid, 0);
     atomic_store(&port, 0);
 }
@@ -453,7 +456,7 @@ static void start_server(bool faulty)
             if (outage) /* thresholds of seconds, not tens of them: an outage of a few seconds is one */
                 setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=400,spawn=60000", 1);
             if (!getenv("JEPSEN_VERBOSE")) { /* kept for a server that does not come up */
-                int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot ? O_APPEND : O_TRUNC), 0644);
+                int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot || outage ? O_APPEND : O_TRUNC), 0644);
                 if (lfd < 0)
                     lfd = open("/dev/null", O_WRONLY);
                 if (lfd >= 0)
@@ -686,13 +689,18 @@ static void *follower_reader(void *arg)
 
 /* outage: what a write to series s came to. UNAVAILABLE is "not applied" (a definite failure, checked by 2); a
  * client that gets it does not spin. */
-static void outage_note(int s, int rc)
+static void outage_note(int s, int rc, int64_t invoke)
 {
     if (!outage)
         return;
     if (rc == 0) {
         atomic_fetch_add(&vol_ok[s % 2], 1);
-        atomic_store(&vol_last_ok[s % 2], now_ns());
+        /* the invoke time, not the ack: a call that was stuck in the hang and returns the moment it heals is a write
+         * the old outage acknowledged, and says nothing of whether the volume takes new ones (it made the check
+         * below pass at once in half the runs). The latest invoke among the acknowledged writes. */
+        long long cur = atomic_load(&vol_last_ok[s % 2]);
+        while (cur < invoke && !atomic_compare_exchange_weak(&vol_last_ok[s % 2], &cur, invoke))
+            ;
     } else if (rc == TSDB_ERR_UNAVAILABLE)
         usleep(2000);
 }
@@ -756,7 +764,7 @@ static void *client(void *arg)
                                           : tsdbc_delete_range(c, ids[s], a, b);
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
-            outage_note(s, rc);
+            outage_note(s, rc, w->invoke);
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
@@ -790,7 +798,7 @@ static void *client(void *arg)
             int rc = tsdbc_insert_series(c, ids[s], ts, v, n);
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
-            outage_note(s, rc);
+            outage_note(s, rc, w->invoke);
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
@@ -881,7 +889,7 @@ static void *client(void *arg)
             int rc = tsdbc_insert_series(c, ids[s], ts, v, m);
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
-            outage_note(s, rc);
+            outage_note(s, rc, w->invoke);
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
@@ -1092,13 +1100,45 @@ static void rot_damage(uint64_t r)
  * A hang is also ended by kill -9 now and then (the shim lives in the server: the next one opens a healthy
  * directory; opening a volume that is hung has no deadline of its own yet, O5). */
 #define OUTAGE_RECOVER_S 30
+/* A domain that went DOWN three times in ten minutes needs 60 s of good probes to leave DOWN (ha.md 15.2 "Hysteresis",
+ * health.c: it is flapping, and recovering volumes into the next outage costs more than waiting). That is the
+ * documented promise for such a volume, and a 300 s run reaches it all the time (the seed 1 and 2 runs of the
+ * weekly CI failed on it: the volume was DOWN on purpose). Its bound is those 60 s plus OUTAGE_RECOVER_S. */
+#define OUTAGE_FLAP_S 60
+#define OUTAGE_FLAP_WINDOW_S 600
+#define OUTAGE_FLAP_DOWNS 3
 #define OUTAGE_DOWN_S 5.0 /* DOWN is declared 2.5 s (the threshold here) plus a probe period or two after the hang
                            * starts, and the calls stuck before it are released then; the healthy volume is measured from here */
+
+/* The faults that take a volume's domain DOWN (a hang past the threshold, eio: three probes fail), each at most once,
+ * since the server that runs now began: the server's memory of DOWNs (health.c) goes with the process. A relapse from
+ * RECOVERING is a DOWN too, and comes from a fault of this list as well, so the count is never below the server's. */
+static int64_t down_faults[2][256];
+static int n_down_faults[2];
+
+static void outage_down_fault(int v)
+{
+    if (n_down_faults[v] < (int)(sizeof down_faults[v] / sizeof *down_faults[v]))
+        down_faults[v][n_down_faults[v]++] = now_ns();
+}
+
+/* Is volume v's domain, healed now, one the health monitor holds DOWN for 60 s of good probes? */
+static bool outage_flapping(int v)
+{
+    int64_t now = now_ns(), from = now - (int64_t)OUTAGE_FLAP_WINDOW_S * 1000000000LL;
+    int n = 0;
+    for (int i = 0; i < n_down_faults[v]; i++)
+        if (down_faults[v][i] >= life_start_ns && down_faults[v][i] >= from)
+            n++;
+    return n >= OUTAGE_FLAP_DOWNS;
+}
 
 static void outage_ctl(const char *cmd, int v, const char *arg)
 {
     char line[PATH_MAX + 64], out[256];
     snprintf(line, sizeof line, "%s %s%s%s", cmd, vol_dir[v], arg ? " " : "", arg ? arg : "");
+    if (getenv("JEPSEN_OUTAGE_TRACE")) /* on the monotonic clock of the server's log lines */
+        fprintf(stderr, "jepsen: [%.3f] %s\n", (double)now_ns() / 1e9, line);
     if (outagefs_cmd(octl, line, out, sizeof out)) {
         outage_problems++;
         fprintf(stderr, "  the shim refused '%s': %s\n", line, out);
@@ -1109,13 +1149,20 @@ static void outage_ctl(const char *cmd, int v, const char *arg)
 static void outage_await_recovery(int v, int64_t since, const char *what)
 {
     int64_t t0 = now_ns();
+    bool flap = outage_flapping(v);
+    int bound = OUTAGE_RECOVER_S + (flap ? OUTAGE_FLAP_S : 0);
     while (!atomic_load(&stop)) {
-        if (atomic_load(&vol_last_ok[v]) > since)
+        if (atomic_load(&vol_last_ok[v]) > since) {
+            if (getenv("JEPSEN_OUTAGE_TRACE"))
+                fprintf(stderr, "jepsen: [%.3f] volume %d takes a new write %.2f s after the heal (bound %d s%s)\n",
+                        (double)now_ns() / 1e9, v, (double)(now_ns() - since) / 1e9, bound, flap ? ", flapping" : "");
             return;
-        if (now_ns() - t0 > OUTAGE_RECOVER_S * 1000000000LL) {
+        }
+        if (now_ns() - t0 > bound * 1000000000LL) {
             outage_problems++;
-            fprintf(stderr, "  volume %d: no write acknowledged in %d s after the heal (%s)\n", v, OUTAGE_RECOVER_S,
-                    what);
+            fprintf(stderr, "  volume %d: no write acknowledged in %d s after the heal (%s%s)\n", v, bound, what,
+                    flap ? "; its domain was flapping, 60 s of good probes included" : "");
+            print_tail(slogpath); /* the server's side of it: the log of every start since the run began */
             return;
         }
         usleep(20000);
@@ -1152,6 +1199,8 @@ static void outage_tick(uint64_t r)
             outage_ctl("hang", v, NULL);
             usleep(2000000);
         }
+        if (getenv("JEPSEN_OUTAGE_TRACE"))
+            fprintf(stderr, "jepsen: [%.3f] kill -9 (%s)\n", (double)now_ns() / 1e9, what);
         stop_server(SIGKILL); /* the shim lives in the server: the hang ends with it, the next server opens a healthy directory */
         server_gone();
         start_server(true);
@@ -1160,6 +1209,8 @@ static void outage_tick(uint64_t r)
         return;
     }
     outage_faults++;
+    if (kind <= 1 || kind == 3)
+        outage_down_fault(v);
     if (kind <= 1) { /* past DOWN: the volume answers UNAVAILABLE, the other goes on at its pace */
         outage_ctl("hang", v, NULL);
         for (int i = 0; getenv("JEPSEN_VERBOSE") && i < 16; i++) { /* the pace of both volumes, per half second */

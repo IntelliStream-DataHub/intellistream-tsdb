@@ -52,9 +52,19 @@ static struct {
     void (*waits)(int delta);
 } dom = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
+/* Seconds on the monotonic clock: the lines of a storage event can be set beside the harness's own clock (jepsen's
+ * outage trace) and the ones of another volume. */
+static double dom_now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 static void dom_log(const char *what, size_t v, const char *extra)
 {
-    fprintf(stderr, "tsdbd: volume %zu: %s%s%s\n", v, what, extra ? ": " : "", extra ? extra : "");
+    fprintf(stderr, "tsdbd: [%.3f] volume %zu: %s%s%s\n", dom_now_s(), v, what, extra ? ": " : "",
+            extra ? extra : "");
 }
 
 /* The domain of volume v: the longest prefix that holds its directory. Decided once, by comparing strings (no I/O:
@@ -345,7 +355,7 @@ static void dom_on_change(void *ctx, int d, int old_state, int new_state)
     (void)ctx;
     if (d < 0 || d >= dom.ndoms)
         return;
-    fprintf(stderr, "tsdbd: storage domain %s: %d -> %d\n", dom.prefix[d], old_state, new_state);
+    fprintf(stderr, "tsdbd: [%.3f] storage domain %s: %d -> %d\n", dom_now_s(), dom.prefix[d], old_state, new_state);
     if (new_state == TSDB_DOM_UP) {
         pthread_mutex_lock(&dom.mu);
         atomic_store(&dom.nonup[d], false);
