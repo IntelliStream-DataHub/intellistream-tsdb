@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -714,16 +715,28 @@ static int read_to_end(int fd, uint32_t id, uint32_t *answered, uint32_t *seen)
     }
 }
 
-/* The server's anonymous memory growth since `before`, once the request has started to fill it (at least `lo_kb`:
- * a lower bound, so that a request that never started cannot pass an upper bound) and has stopped growing (the same
- * to within 1 MiB for 600 ms): measured, not slept for. Fails with the numbers when `lo_kb` is not reached in 20 s. */
-static long settled_growth_kb(pid_t pid, long before, long lo_kb, const char *what)
+/* The server's anonymous memory growth since `before`, once the request has started and has stopped growing (the same
+ * to within 1 MiB for 600 ms): measured, not slept for. "Started" is that the server has written something to `fd`
+ * (a request that never ran cannot pass an upper bound this way) and the growth reached `lo_kb` (0: the allocator may
+ * reuse freed memory, so only a reply whose size forces new pages has a floor). Fails when either does not hold
+ * within 20 s. */
+static long settled_growth_kb(pid_t pid, int fd, long before, long lo_kb, const char *what)
 {
-    long last = -1;
+    int queued = 0;
+    for (int i = 0; i < 200 && queued <= 0; i++) {
+        if (ioctl(fd, FIONREAD, &queued) != 0)
+            queued = 0;
+        if (queued <= 0)
+            usleep(100000);
+    }
+    if (queued <= 0)
+        fprintf(stderr, "%s: the server sent nothing in 20 s\n", what);
+    CHECK(queued > 0);
+    long last = LONG_MIN;
     int flat = 0;
     for (int i = 0; i < 200; i++) {
         long g = rss_anon_kb(pid) - before;
-        if (g >= lo_kb && last >= 0 && g - last < 1024 && last - g < 1024)
+        if ((lo_kb <= 0 || g >= lo_kb) && last != LONG_MIN && g - last < 1024 && last - g < 1024)
             flat++;
         else
             flat = 0;
@@ -734,7 +747,8 @@ static long settled_growth_kb(pid_t pid, long before, long lo_kb, const char *wh
     }
     long g = rss_anon_kb(pid) - before;
     fprintf(stderr, "%s: memory grew %ld KiB, wanted at least %ld KiB and a flat curve within 20 s\n", what, g, lo_kb);
-    CHECK(g >= lo_kb); /* a miss of the lower bound is the failure; a curve still rising is judged by the caller */
+    /* a miss of the lower bound is the failure; a curve still rising is judged by the caller */
+    CHECK(lo_kb <= 0 || g >= lo_kb);
     return g;
 }
 
@@ -749,7 +763,7 @@ static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
     int fd = raw_connect();
     double t0 = now_ms();
     raw_values_multi(fd, 7, list, 64);
-    long grown = settled_growth_kb(pid, before, 1024, "stalled reader");
+    long grown = settled_growth_kb(pid, fd, before, 0, "stalled reader");
     fprintf(stderr, "stalled reader: server anonymous memory grew %ld KiB\n", grown);
     CHECK(SANITIZED || grown <= (64 + 8 + 48) * 1024L);
     tsdbc *c2;
@@ -796,7 +810,7 @@ static void test_stall_small(pid_t pid)
     long before = rss_anon_kb(pid);
     int fd = raw_connect();
     raw_send(fd, 9, TSDB_OP_QUERY_MULTI, req, len);
-    long grown = settled_growth_kb(pid, before, 256, "stalled reader, small replies");
+    long grown = settled_growth_kb(pid, fd, before, 0, "stalled reader, small replies");
     fprintf(stderr, "stalled reader, small replies: server anonymous memory grew %ld KiB\n", grown);
     CHECK(SANITIZED || grown <= (64 + 8 + 48) * 1024L);
     close(fd);
@@ -829,7 +843,7 @@ static void test_stall_buckets(pid_t pid)
             raw_send(fd, 11, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_BUCKETS, 0, 1, &big_id, t, 48));
         else
             raw_send(fd, 11, TSDB_OP_QUERY_BUCKETS, t, 48);
-        long grown = settled_growth_kb(pid, before, result_kb / 2, "stalled reader, a full frame of buckets"),
+        long grown = settled_growth_kb(pid, fd, before, result_kb / 2, "stalled reader, a full frame of buckets"),
              peak = hwm ? status_kb(pid, "VmHWM") - hwm0 : -1;
         fprintf(stderr, "stalled reader, a full frame of buckets (%s, io %s): server anonymous memory grew %ld KiB, "
                         "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS",
