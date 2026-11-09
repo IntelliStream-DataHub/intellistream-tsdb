@@ -459,7 +459,9 @@ large one, or a request for many series, spreads over more.
 | Rust (package `intellistream-tsdb-client`, `use tsdb_client::...`) | [client/rust](client/rust/README.md) |
 | Python (package `intellistream-tsdb-client`, `import tsdb_client`) | [client/python](client/python/README.md) |
 | Java 17+ | [client/java](client/java/README.md) |
-| Java 22+, embedded (no server) | [client/java-embedded](client/java-embedded/README.md) |
+| Rust, embedded (no server; AGPL-3.0, package `intellistream-tsdb-embedded`, `use tsdb_embedded::Db`) | [client/rust-embedded](client/rust-embedded/README.md) |
+| Python, embedded (no server; AGPL-3.0, package `intellistream-tsdb-embedded`, `import tsdb_embedded`) | [client/python-embedded](client/python-embedded/README.md) |
+| Java 22+, embedded (no server; AGPL-3.0) | [client/java-embedded](client/java-embedded/README.md) |
 
 The key lines of the C client (link with `build/libtsdbclient.a -lzstd -lpthread -lm`):
 

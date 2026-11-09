@@ -986,4 +986,10 @@ test-release:
 	tests/test_release_notes.sh
 	python3 -I tests/test_release_publish.py
 
-.PHONY: test-quickstart check-site test-release
+# The licence of every source file (tools/check-spdx.sh) and the test of that check (it must fail on each kind of slip).
+test: test-spdx
+test-spdx:
+	tools/check-spdx.sh
+	tests/test_check_spdx.sh
+
+.PHONY: test-quickstart check-site test-release test-spdx

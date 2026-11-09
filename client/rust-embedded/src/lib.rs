@@ -55,7 +55,7 @@ pub enum ValueCodec {
 /// change fields with struct update syntax:
 ///
 /// ```
-/// let opts = tsdb_client::Options { fsync: false, merge_threads: 1, ..Default::default() };
+/// let opts = tsdb_embedded::Options { fsync: false, merge_threads: 1, ..Default::default() };
 /// # let _ = opts;
 /// ```
 #[derive(Debug, Clone, PartialEq)]
@@ -356,7 +356,8 @@ impl<'a> ChunkRef<'a> {
 /// An open database in this process: the embedded counterpart of [`Client`](tsdb_client::Client).
 ///
 /// ```no_run
-/// use tsdb_embedded::{Db, Group, Options, QueryOpts, Unit};
+/// use tsdb_client::{Group, QueryOpts, Unit};
+/// use tsdb_embedded::{Db, Options};
 ///
 /// let db = Db::open("/tmp/plant", &Options::default())?;
 /// let id = db.series("tank.level_bar")?;

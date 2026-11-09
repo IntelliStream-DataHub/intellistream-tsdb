@@ -313,23 +313,29 @@ def long_batch(c, ids):
 def check_gil_released(c, ids):
     """Another Python thread keeps running during a long batch call: the GIL is released."""
     series = long_batch(c, ids)
-    count, stop = [0], [False]
+    for _ in range(6):
+        count, stop = [0], [False]
 
-    def spin():
-        while not stop[0]:
-            count[0] += 1
+        def spin():
+            while not stop[0]:
+                count[0] += 1
 
-    th = threading.Thread(target=spin)
-    th.start()
-    try:
-        time.sleep(0.01)
-        before = count[0]
-        t = time.perf_counter()
-        c.query_raw_many(series)
-        took, ran = time.perf_counter() - t, count[0] - before
-    finally:
-        stop[0] = True
-        th.join()
+        th = threading.Thread(target=spin)
+        th.start()
+        try:
+            time.sleep(0.01)
+            before = count[0]
+            t = time.perf_counter()
+            c.query_raw_many(series)
+            took, ran = time.perf_counter() - t, count[0] - before
+        finally:
+            stop[0] = True
+            th.join()
+        # The calibration in long_batch ran without the spinning thread; a warm second call can be faster (37 ms on a
+        # GitHub runner against the 50 ms calibrated), too short to judge. Make the batch longer and ask again.
+        if took > 0.04:
+            break
+        series = series * 2
     # Held for the whole call, the GIL would let the other thread run only before it started
     assert took > 0.04 and ran > 10_000, (took, ran)
 

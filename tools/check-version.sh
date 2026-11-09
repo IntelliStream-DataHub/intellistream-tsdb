@@ -26,13 +26,24 @@ want "include/tsdb.h TSDB_VERSION" "$(def TSDB_VERSION)"
 want "tsdbd --version" "$("$b/tsdbd" --version | sed -n 's/^tsdbd \([^ ]*\).*/\1/p')"
 want "tsdb --version" "$("$b/tsdb" --version | sed -n 's/^tsdb \([^ ]*\).*/\1/p')"
 toml() { sed -n 's/^version = "\(.*\)"$/\1/p' "$1" | head -n 1; }
-for f in client/rust/Cargo.toml client/rust-sys/Cargo.toml client/python/Cargo.toml; do
+for f in client/rust/Cargo.toml client/rust-sys/Cargo.toml client/rust-embedded/Cargo.toml client/python/Cargo.toml \
+    client/python-common/Cargo.toml client/python-embedded/Cargo.toml; do
     want "$f" "$(toml $f)"
 done
+# the exact pins between our own packages (the embedded crate and wheel use the network client's hidden internals)
+for f in client/rust-embedded/Cargo.toml client/python/Cargo.toml client/python-common/Cargo.toml \
+    client/python-embedded/Cargo.toml; do
+    want "$f (intellistream-tsdb-client pin)" \
+        "$(sed -n 's/^tsdb-client = {.*version = "=\([^"]*\)".*/\1/p' $f)"
+done
+want "client/python-embedded/Cargo.toml (intellistream-tsdb-embedded pin)" \
+    "$(sed -n 's/^tsdb-embedded = {.*version = "=\([^"]*\)".*/\1/p' client/python-embedded/Cargo.toml)"
+want "client/python-embedded/pyproject.toml (intellistream-tsdb-client pin)" \
+    "$(sed -n 's/^dependencies = \["intellistream-tsdb-client==\([^"]*\)"\].*/\1/p' client/python-embedded/pyproject.toml)"
 # every Cargo.lock in the tree that names one of our crates (a lock file of a test crate that depends on the client
 # too): cargo build --locked refuses a lock file that still names the previous version
 for f in $(git ls-files '*Cargo.lock' 2>/dev/null || find . -name Cargo.lock -not -path '*/target/*'); do
-    for c in intellistream-tsdb-client intellistream-tsdb-sys; do
+    for c in intellistream-tsdb-client intellistream-tsdb-sys intellistream-tsdb-embedded tsdb-client-python-common; do
         for lv in $(sed -n "/^name = \"$c\"\$/{n;s/^version = \"\(.*\)\"\$/\1/p;}" "$f"); do
             want "$f ($c)" "$lv"
         done

@@ -27,6 +27,8 @@ Decided by the user on 2026-11-06 (the open questions of the first draft):
   copying its `src/raft` (core, log, wire, simulator) into tsdb under Apache 2.0, with Apache headers and a sync
   script (C3, §2.3). intellistream-objects should get a LICENSE (or a grant file naming Apache 2.0) as well, and
   tsdb's [licenses.md](licenses.md) lists the copied files when they land (build plan step 1).
+  **Superseded 2026-11-09:** both repositories are AGPL-3.0-only now (the relicense of 0.11.0), so the copy carries AGPL-3.0-only
+  headers and needs no grant; releases up to 0.10.0 still carry it under Apache 2.0.
 - **D3. Replaced on 2026-11-06.** It read: "The cluster replaces ha.md for new work; its NFS lock, ledger and SUSPECT
   state are dropped." The user then decided: "I have been thinking, I still want to keep the NFS implementation."
   So ha.md's NFS failover stays **as a second HA mode** (shared mode) beside this one (replicated mode), for

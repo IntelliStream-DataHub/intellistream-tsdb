@@ -171,7 +171,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'Makefile') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'client/python-embedded/pyproject.toml', 'Makefile') }}
           restore-keys: pip-${{ runner.os }}-
       - name: make test-clients (Rust, Python, the Python sdist, Java, embedded Java; against build/tsdbd)
         run: |
@@ -253,7 +253,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'Makefile') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'client/python-embedded/pyproject.toml', 'Makefile') }}
           restore-keys: pip-${{ runner.os }}-
       - name: Build, then check that VERSION, tsdb.h, the binaries and the client manifests agree
         run: |

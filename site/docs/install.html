@@ -72,7 +72,7 @@ values is in it three times, for x86-64-v2, v3 (AVX2) and v4 (AVX-512); tsdbd pi
 level writes the same bytes and gives the same answers, so data moves freely between machines.</p>
 <p>The tarball holds <code>bin/tsdbd</code>, <code>bin/tsdb</code>, the two libraries and their headers, its own
 test suite and a systemd unit. To install it as a service:</p>
-<pre><code class="language-sh" data-src="dist/README.dist#L42-L50">tar xzf tsdb-VERSION-x86_64-linux.tar.gz &amp;&amp; cd tsdb-VERSION-x86_64-linux
+<pre><code class="language-sh" data-src="dist/README.dist#L47-L55">tar xzf tsdb-VERSION-x86_64-linux.tar.gz &amp;&amp; cd tsdb-VERSION-x86_64-linux
 tests/run-tests.sh /var/tmp            # optional, a few minutes
 install -m 755 bin/tsdbd bin/tsdb /usr/local/bin/
 restorecon -v /usr/local/bin/tsdbd /usr/local/bin/tsdb    # SELinux: bin_t
@@ -89,6 +89,6 @@ itself (<code>--io auto</code>, the default), and says so when it starts.</p></d
 
 <nav class="pager" aria-label="Previous and next page"><a class="prev" href="index.html"><span>Previous</span>What tsdb is</a><a class="next" href="quickstart.html"><span>Next</span>Quick start</a></nav></main>
 </div>
-<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source: the server and the engine under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">GNU AGPL-3.0</a> (a commercial licence is available), the client libraries under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSES/Apache-2.0.txt">Apache License 2.0</a>; <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSING.md">which is which</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
 </html>

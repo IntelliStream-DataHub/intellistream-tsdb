@@ -48,7 +48,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 # The embedded benchmarks: tsdb-bench (C) and, for the clients in --clients that have one, the same modes through the
-# Rust and Python embedded Db (client/rust/examples/embedded_bench.rs, client/python/bench_embedded.py).
+# Rust and Python embedded Db (client/rust-embedded/examples/embedded_bench.rs, client/python-embedded/bench_embedded.py;
+# the AGPL packages intellistream-tsdb-embedded, beside the Apache network clients).
 EMBEDDED="c"
 for c in rust python; do case " $CLIENTS " in *" $c "*) EMBEDDED="$EMBEDDED $c" ;; esac; done
 
@@ -95,7 +96,8 @@ LOG=$OUT/results.log
 SPID=""
 
 # ------------------------------------------------------------------ build
-RUSTX=$ROOT/client/rust/target/release/examples
+RUSTX=$ROOT/client/rust/target/release/examples # the network client's benches
+RUSTEX=$ROOT/client/rust-embedded/target/release/examples # the embedded Db's
 JAR=$ROOT/client/java/target/tsdb-client-0.9.0.jar
 EJAR=$ROOT/client/java-embedded/target/tsdb-embedded-0.9.0.jar
 JM2="-Dmaven.repo.local=$B/m2 -Dmaven.repo.local.tail=$HOME/.m2/repository"
@@ -103,10 +105,15 @@ PY=$PYVENV/bin/python
 if [ "$BUILD" = 1 ]; then
     echo "== building"
     make -C "$ROOT" -j"$(nproc)" >"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; }
-    case " $CLIENTS " in *" rust "*) (cd "$ROOT/client/rust" && cargo build --release --features embedded --examples) >>"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; } ;; esac
+    case " $CLIENTS " in *" rust "*)
+        (cd "$ROOT/client/rust" && cargo build --release --examples && cd ../rust-embedded && cargo build --release --examples) \
+            >>"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; } ;; esac
     case " $CLIENTS " in *" python "*)
         if [ ! -x "$PYVENV/bin/maturin" ]; then python3 -m venv "$PYVENV" && "$PYVENV/bin/pip" -q install maturin numpy >>"$OUT/build.log" 2>&1 || exit 1; fi
-        (cd "$ROOT/client/python" && VIRTUAL_ENV=$PYVENV "$PYVENV/bin/maturin" develop --release) >>"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; }
+        # the network client first (the embedded wheel depends on the same version of it), then the embedded wheel
+        (cd "$ROOT/client/python" && VIRTUAL_ENV=$PYVENV "$PYVENV/bin/maturin" develop --release \
+            && cd ../python-embedded && VIRTUAL_ENV=$PYVENV "$PYVENV/bin/maturin" develop --release) >>"$OUT/build.log" 2>&1 \
+            || { tail -n 20 "$OUT/build.log"; exit 1; }
         "$PYVENV/bin/python" -c 'import numpy' 2>/dev/null || "$PYVENV/bin/pip" -q install numpy >>"$OUT/build.log" 2>&1 ;;
     esac
     case " $CLIENTS " in *" java "*) (cd "$ROOT/client/java" && mvn -q package -DskipTests) >>"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; } ;; esac
@@ -204,8 +211,8 @@ record() {
 embedded_cmd() { # lang
     case $1 in
     c) echo "$B/tsdb-bench" ;;
-    rust) echo "$RUSTX/embedded_bench" ;;
-    python) echo "$PY $ROOT/client/python/bench_embedded.py" ;;
+    rust) echo "$RUSTEX/embedded_bench" ;;
+    python) echo "$PY $ROOT/client/python-embedded/bench_embedded.py" ;;
     esac
 }
 client_load_cmd() { # client conns level

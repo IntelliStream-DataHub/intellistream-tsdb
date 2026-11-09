@@ -6,8 +6,9 @@ compiles the C sources of this repository with the `cc` crate, so a Rust
 program that uses it needs no `libtsdb.so`, no tsdbd and no C toolchain
 beyond the one `cc` finds.
 
-Use the safe API instead: `tsdb_client::Db` (crate `intellistream-tsdb-client`, feature
-`embedded`). This crate is for code that wants the C functions directly.
+Use the safe API instead: `tsdb_embedded::Db` (crate `intellistream-tsdb-embedded`, `client/rust-embedded`). This
+crate is for code that wants the C functions directly. It is licensed under the AGPL-3.0-only like the engine it
+contains (with the Apache-2.0 files of the C client that the engine shares: `LICENSES/Apache-2.0.txt`).
 The package is called `intellistream-tsdb-sys`; the library inside it is
 still `tsdb_sys`, so you write `use tsdb_sys::...`.
 
