@@ -584,6 +584,18 @@ void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot)
     memcpy(slot, r + 12, 8);
 }
 
+/* Closes the open rows record: its row count goes into its header now, once, instead of on every append (the header
+ * is a cache line far from the tail the appenders write, and it would travel between cores with every call). Called
+ * with buf_lock held at every place that hands wal_buf on or appends something that is not a row of this record. */
+static void wal_rec_close(eng *db)
+{
+    if (db->wal_rec_open) {
+        uint8_t *h = db->wal_buf + db->wal_rec_at;
+        store32(h, ((uint32_t)WAL_KIND_ROWS << 28) | db->wal_rec_rows);
+        db->wal_rec_open = false;
+    }
+}
+
 /* Appends rows to the pending WAL buffer and numbers them (*fno0 gets the first); caller holds buf_lock. Rows of
  * successive batches join one record while no marker comes between them (their numbers stay contiguous). Fails
  * without side effects. */
@@ -594,7 +606,7 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
         eng_fail(db, "WAL numbers", EOVERFLOW);
         return TSDB_ERR_IO;
     }
-    bool extend = db->wal_rec_open && (uint64_t)(load32(db->wal_buf + db->wal_rec_at) & 0x0fffffffu) + n < (1u << 28);
+    bool extend = db->wal_rec_open && (uint64_t)db->wal_rec_rows + n < (1u << 28);
     size_t need = db->wal_len + (extend ? 0 : WAL_HDR) + n * WAL_ROW;
     if (need > db->wal_cap) {
         size_t cap = MAX(need, db->wal_cap * 2);
@@ -612,12 +624,13 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
         memcpy(h + 16, &db->fno_next, 8);
         db->wal_rec_at = db->wal_len;
         db->wal_rec_open = true;
+        db->wal_rec_rows = 0;
         db->wal_len += WAL_HDR;
     }
-    uint8_t *h = db->wal_buf + db->wal_rec_at;
-    store32(h, load32(h) + (uint32_t)n);
+    db->wal_rec_rows += (uint32_t)n;
     *fno0 = db->fno_next;
     db->fno_next += n;
+    db->fno_rows_hi = db->fno_next - 1;
     uint8_t *p = db->wal_buf + db->wal_len;
     for (size_t i = 0; i < n; i++, p += WAL_ROW) {
         uint32_t id = series ? series[i] : cs;
@@ -655,6 +668,7 @@ int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void
     }
     uint64_t lsn = 0;
     if (rc == 0) {
+        wal_rec_close(db); /* the marker follows the rows record: it takes no more rows */
         uint8_t *h = db->wal_buf + db->wal_len;
         memset(h, 0, WAL_HDR);
         store32(h, (uint32_t)plen | (uint32_t)WAL_KIND_MARKER << 28);
@@ -668,7 +682,6 @@ int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void
             *fno = db->fno_next;
         db->fno_next += span;
         db->wal_len += WAL_HDR + plen;
-        db->wal_rec_open = false;
         lsn = ++db->wal_appended;
     }
     pthread_mutex_unlock(&db->buf_lock);
@@ -764,10 +777,10 @@ int wal_commit(eng *db, uint64_t target)
         uint64_t upto = db->wal_appended;
         int fd = db->wal_fd;
         uint64_t seq = db->wal_seq;
+        wal_rec_close(db);
         db->wal_buf = db->wal_spare;
         db->wal_cap = db->wal_spare_cap;
         db->wal_len = 0;
-        db->wal_rec_open = false;
         pthread_mutex_unlock(&db->buf_lock);
 
         rc = wal_write_sync(db, fd, seq, &db->wal_off, buf, len);
@@ -969,7 +982,7 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     /* A failure while this write waited (the large write's own publish, say) must refuse it: in async WAL mode
      * nothing after this point checks, and the write would be acknowledged by a failed engine. */
     int rc = eng_check(db);
-    if (rc == 0) {
+    if (rc == 0 && db->bg_error) { /* a store only when there is something to clear: it is read on every call */
         rc = db->bg_error;
         db->bg_error = 0;
     }
@@ -987,8 +1000,10 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     }
     if (rc == 0)
         rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_appended + 1, type);
-    if (rc == 0 && fno0)
-        mt_note_fno(db->active, fno0, n);
+    /* the memtable's position range: its first number now (a read, a store only for its first rows), its last one
+     * when it is sealed (mt_flush: db->fno_rows_hi), not a store of both on the memtable's line with every call */
+    if (rc == 0 && fno0 && !db->active->fno_lo)
+        db->active->fno_lo = fno0;
     if (counted)
         db->wal_appended += n;
     uint64_t lsn = db->wal_appended;
@@ -1150,6 +1165,9 @@ int mt_flush(eng *db)
             pthread_mutex_lock(&db->buf_lock);
             memtable *m = db->active;
             db->active = nm;
+            if (m->fno_lo) /* it took rows records, and the last of them is the last the WAL took (all under buf_lock) */
+                m->fno_hi = MAX(m->fno_hi, db->fno_rows_hi);
+            wal_rec_close(db);
             uint8_t *buf = db->wal_buf;
             size_t len = db->wal_len;
             uint64_t upto = db->wal_appended;
@@ -1158,7 +1176,6 @@ int mt_flush(eng *db)
             db->wal_off = 0;
             db->wal_buf = NULL;
             db->wal_cap = db->wal_len = 0;
-            db->wal_rec_open = false;
             m->fno_end = db->fno_next; /* the end of the old segment: FNO holds it before the segment goes */
             db->wal_fd = newfd;
             db->wal_seq = seq;

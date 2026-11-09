@@ -294,8 +294,10 @@ int main(int argc, char **argv)
                                    {"insert-zstd", required_argument, 0, 'z'},
                                    {"no-stats", no_argument, 0, 'N'},
                                    {"latest-cache", required_argument, 0, 'l'},
+                                   {"only", required_argument, 0, 'o'},
                                    {0, 0, 0, 0}};
     bool appends_only = false;
+    int only_sync = -1, only_threads = 0; /* --only SYNC_MS:THREADS: that one append mode (for perf and A/B runs) */
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
@@ -308,6 +310,12 @@ int main(int argc, char **argv)
         case 'z': insert_zstd = atoi(optarg); break;
         case 'N': no_stats = true; break;
         case 'l': latest_cache = atol(optarg); break;
+        case 'o':
+            if (sscanf(optarg, "%d:%d", &only_sync, &only_threads) != 2 || only_sync < 0 || only_threads < 1) {
+                fprintf(stderr, "--only wants SYNC_MS:THREADS (0:16 is fsync each, 16 threads)\n");
+                return 2;
+            }
+            break;
         default: return 2;
         }
     }
@@ -318,6 +326,15 @@ int main(int argc, char **argv)
     printf("durable inserts, fsync on, %u series of mixed sensors in %d volume(s), dir %s\n\n", nseries, nvolumes, dir);
     printf("%-34s %6s %12s %12s %9s %10s %10s %7s\n", "mode", "batch", "inserts/s", "rows/s", "MB/s", "p50 ms",
            "p99 ms", "parts");
+    if (only_threads) {
+        char label[64];
+        snprintf(label, sizeof label, only_sync ? "append, WAL fsync every %d ms" : "append, fsync each (group commit)",
+                 only_sync);
+        run_appends(label, only_sync, only_threads, secs);
+        char cmd[1024];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'.vol*", dir, dir);
+        return system(cmd) != 0;
+    }
     run_appends("append, fsync each (group commit)", 0, 1, secs);
     run_appends("append, fsync each (group commit)", 0, 16, secs);
     run_appends("append, fsync each (group commit)", 0, 64, secs);

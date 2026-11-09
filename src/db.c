@@ -805,9 +805,12 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     feed_opts feed_wanted; /* taken before any failure point: see eng_take_open_feed_want */
     int feed_want = eng_take_open_feed_want(&feed_wanted);
     simd_init();
-    eng *db = calloc(1, sizeof *db);
+    /* 64-byte aligned: the hot fields of the write path are laid out in whole cache lines (internal.h, buf_lock) */
+    _Static_assert(_Alignof(eng) == 64, "eng is aligned to a cache line");
+    eng *db = aligned_alloc(64, (sizeof *db + 63) & ~(size_t)63);
     if (!db)
         return TSDB_ERR_NOMEM;
+    memset(db, 0, sizeof *db);
     db->ret_fd = -2; /* retention not opened yet */
     db->cls_fd = -2;
     if (opts)

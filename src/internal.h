@@ -1609,15 +1609,27 @@ struct eng {
     pthread_mutex_t wal_sync_lock; /* guards wal_writing; never held across I/O */
     pthread_cond_t wal_cv;         /* wal_writing cleared, or wal_durable advanced */
     bool wal_writing;              /* one WAL writer (commit or segment switch) at a time */
-    pthread_mutex_t buf_lock;      /* active memtable and pending WAL bytes */
-    pthread_cond_t flush_cv;
+    /* What a small write stores to under buf_lock sits in two cache lines of its own, which nothing else writes: a
+     * call's critical section moves them and the mutex between cores, and every further line it touched (these
+     * fields lay over five before) cost a 16-thread append loop 1 to 3% (BENCHMARKS.md, Format 9). eng_open_sched
+     * allocates the struct 64-byte aligned for this. */
+    _Alignas(64) pthread_mutex_t buf_lock; /* active memtable and pending WAL bytes */
     struct lw_fence *lw_head;      /* large writes between their memtable flush and their publish (buf_lock) */
+    memtable *active;
+    uint64_t wal_appended;         /* rows (and one per marker) appended (buf_lock) */
+    _Alignas(64) uint8_t *wal_buf; /* the pending WAL bytes: this field and the five below, under buf_lock */
+    size_t wal_len, wal_cap;
+    uint64_t fno_next;             /* the next record number to assign */
+    uint64_t fno_rows_hi;          /* the last number a rows record took, 0: none yet */
+    size_t wal_rec_at;             /* the offset of the last record in wal_buf */
+    uint32_t wal_rec_rows;         /* its rows so far: put in its header when it closes (wal_rec_close) */
+    bool wal_rec_open;             /* the last record in wal_buf is a rows record that takes more */
+    pthread_cond_t flush_cv;
     uint64_t lw_wakeups;           /* wake-ups of small writes waiting for one (buf_lock; tests) */
     /* tsdb_set_write_wait_hook: around a small write's wait for a fence, so a server with a fixed set of threads
      * starts another (buf_lock; a wait keeps the hook it counted with for its -1) */
     void (*wait_fn)(void *ctx, int delta);
     void *wait_ctx;
-    memtable *active;
     memtable *flushing[MAX_FLUSHING]; /* oldest first; guarded by db->lock */
     size_t nflushing;
     bool wal_enabled;
@@ -1627,12 +1639,8 @@ struct eng {
     /* the last record whose write and sync succeeded, in any segment (the WAL writer role; read once the engine is
      * halted): revalidation after an outage finds it again, byte for byte, before it trusts the log (ha.md 15.5) */
     uint64_t wal_last_seq, wal_last_off, wal_last_len, wal_last_hash;
-    uint8_t *wal_buf, *wal_spare;
-    size_t wal_len, wal_cap, wal_spare_cap;
-    uint64_t wal_appended;            /* rows (and one per marker) appended (buf_lock) */
-    uint64_t fno_next;                /* the next record number to assign (buf_lock) */
-    bool wal_rec_open;                /* the last record in wal_buf is a rows record that takes more (buf_lock) */
-    size_t wal_rec_at;                /* its offset in wal_buf */
+    uint8_t *wal_spare;
+    size_t wal_spare_cap;
     /* FNO (fno.c): the file, the slot the newest store is in, its generation and the value it holds */
     int fno_fd, fno_slot;
     uint64_t fno_gen;
@@ -1692,8 +1700,15 @@ struct eng {
 
     /* fail-stop (eng_fail): set once, never cleared; fail_msg is written under
      * fail_lock before `failed` is stored, so whoever sees `failed` can read it */
-    atomic_bool failed;
-    atomic_int refs;       /* callers inside this engine through the tsdb handle (volumes.c, ha.md 15.5 step 2) */
+    _Alignas(64) atomic_bool failed; /* read by every write (eng_check): on a line that nothing writes per call... */
+    /* statistics (stats.c): `stats` exists once the sweeper has started and is freed by eng_close; `stats_on` is
+     * set (under db->lock, after `stats` is complete) while list changes push events into its ring */
+    _Atomic(struct estats *) stats;
+    atomic_bool stats_on;
+    atomic_flag stats_starting;
+    /* ...not on the one of `refs`, which every call through the tsdb handle increments and decrements: `failed`
+     * shared that line, and each small write waited for it inside the critical section of buf_lock */
+    _Alignas(64) atomic_int refs; /* callers inside this engine through the tsdb handle (volumes.c, ha.md 15.5 step 2) */
     atomic_int mrefs;      /* name, type and class lookups on it (route_meta): they never block a recovery's idle wait,
                             * only the free of a retired engine (a steady stream of lookups must not starve it) */
     int crefs;             /* request cuts (qcuts) holding parts of this engine (eng_cut_hold), under idle_mu: they keep
@@ -1703,11 +1718,6 @@ struct eng {
     void *retire_owner;    /* the tsdb handle it does that for */
     uint32_t adopted_series, adopted_states; /* the first names the next engine took over (eng_adopt_names) */
     atomic_bool quiesced;  /* no new caller: the volume is being recovered */
-    /* statistics (stats.c): `stats` exists once the sweeper has started and is freed by eng_close; `stats_on` is
-     * set (under db->lock, after `stats` is complete) while list changes push events into its ring */
-    _Atomic(struct estats *) stats;
-    atomic_bool stats_on;
-    atomic_flag stats_starting;
     struct tlist *tl;       /* the tenant list the sweeper is to count by (stats_priv.h), under tl_mu */
     pthread_mutex_t tl_mu;  /* a leaf */
     bool retiring;        /* eng_close keeps the names of the dictionaries (eng_retire) */
