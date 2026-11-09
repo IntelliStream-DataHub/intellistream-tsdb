@@ -5,7 +5,9 @@ Status: design, not implemented. Branch `cluster-data-design`, written on 2026-1
 node): their findings are fixed below or answered with the reason, and §13 lists where. Code references are
 `file:line` at 47ae317 for tsdb (design-cluster.md and design-ha-modes.md as edited on this branch), and at 9c5f97d2
 (origin/main, pulled 2026-11-09) for intellistream-objects (written `objects:path:line` below). Target release:
-**v0.11.0**.
+**v0.11.0**. **The user answered its five open questions the same day** (2026-11-09): E32-E36. The fifth, cluster data
+is **production** in 0.11.0 and not a preview (E36), brought in the production design of §14 (E37-E46: rolling
+upgrades, upgrades in place, backups, alerts, the operator guide, the release gates) and the steps P1-P6 of §11.
 
 The user's request (2026-11-09, verbatim): "cluster should support data replication, preferably using erasure code,
 test with 4+2 and 8+2 and 8 + 4 and 16+4. I know we lose performance, but it makes operation much easier. Its a
@@ -22,14 +24,15 @@ failover and fencing (C12-C14), name slots, clients. It is extended, not replace
 replicated volume with m + 1 copies of its young data, plus an erasure-coded tier for its settled partitions (E3).
 
 Related: [design-cluster.md](design-cluster.md) (replicated mode), [design-ha-modes.md](design-ha-modes.md) (the two HA
-modes and the combined build plan; §7 there carries this design's steps R5-R14), [design-cdc.md](design-cdc.md)
+modes and the combined build plan; §7 there carries this design's steps R5-R14 and P1-P6), [design-cdc.md](design-cdc.md)
 (positions, `fno`).
 
 ## Summary
 
 - **Redundancy is a per-volume setting** with a cluster default: `replicas=3` or `ec=k+m` with k+m one of 4+2, 8+2,
   8+4, 16+4 (any k ≤ 16, m ≤ 4 is accepted; those four are tested). It can be changed on a running volume, as a
-  background conversion in a fixed safe order (E2; the step may move to 0.12, open question 2).
+  background conversion in a fixed safe order (E2; in 0.11.0, E33). A new cluster defaults to `ec=4+2` with at least
+  7 storage-capable servers, else `replicas=3` (E34).
 - **Two tiers per volume.** Young data (the WAL, memtables and the parts of partitions still taking rows or merging)
   is replicated exactly as design-cluster.md says, on **m + 1** servers (3 in `replicas=3`). A partition whose day is
   over and whose merges are done is **settled**: each of its part files is erasure coded across k + m servers and the
@@ -56,8 +59,15 @@ modes and the combined build plan; §7 there carries this design's steps R5-R14)
 - **Storage and compute can be separated** (E20): `compute` servers lead volumes, hold the replicated WAL, young parts
   and indexes and cache granules; `storage` servers hold chunks only; `both` is the default. They scale independently;
   a compute server holds terabytes (young data and indexes), not gigabytes.
-- **Codec**: systematic Cauchy Reed-Solomon over GF(2^8) with SSSE3/AVX2/AVX-512/GFNI kernels, as in
-  intellistream-objects `src/codec`. Copy it under a grant (as the Raft core was) or write our own: open question 1.
+- **Codec**: systematic Cauchy Reed-Solomon over GF(2^8) with SSSE3/AVX2/AVX-512/GFNI kernels: intellistream-objects'
+  `src/codec`, copied unchanged into `src/ec/` by `tools/sync-ec.sh`. Both repositories are AGPL-3.0-only from 0.11.0,
+  so no grant is needed; the Apache-2.0 network clients never contain it (E32).
+- **Production in 0.11.0** (E36): rolling upgrades one server at a time between adjacent minor releases, with a
+  cluster version the operator raises once every server runs the new one (E37, E38, E41); the metadata and every file
+  upgraded in place (E39, E40); physical, incremental backups per volume (E42); alerts shipped and tested (E43); an
+  operator guide whose runbooks are tests (E44); and release gates of a 72-hour soak, jepsen-cluster on every
+  geometry and an upgrade test with a dummy version bump (E45). Not production in 0.11.0: shared NFS mode and the
+  S3/isod backend (E46, §14.6).
 
 ## Assumptions
 
@@ -89,13 +99,13 @@ modes and the combined build plan; §7 there carries this design's steps R5-R14)
 | E15 | **Three outcomes, never confused**: **unavailable** (more than m positions of a stripe DOWN or unreachable: UNAVAILABLE, retryable, reason `TSDB_WHY_UNREACHABLE`); **corrupt** (enough positions present but checks fail beyond what decoding repairs: `TSDB_ERR_CORRUPT` naming the partition and granule; a repair is scheduled); **lost** (more than m positions OUT whose holders the operator declared destroyed, or whose stores came back empty: `TSDB_ERR_IO` naming the partition, the volume `LOST` in TOPOLOGY, UNAVAILABLE reason `TSDB_WHY_LOST` with "do not retry"). Queries answered from statistics still answer over lost partitions (the index is local and intact). `tsdb cluster volume salvage V` drops lost objects by oid (`MK_DROP_OBJ`), keeps the young parts, and refuses while an OUT holder may still return, unless `--force`. | One error for all three; salvage by `MK_DROP` (it would retire the surviving young parts: acknowledged writes thrown away) | AGENTS.md "Damage is never silent"; a partition is not lost while its holders may return (objects keeps a DESTROYED state for this, objects:src/cluster/cmap.h:76). |
 | E16 | **Shared NFS mode has no EC.** `redundancy` is replicated mode only; a shared-mode cluster refuses it. | EC over NFS | ZFS already gives the redundancy under NFS; one copy on shared storage is shared mode's point ([design-ha-modes.md](design-ha-modes.md) §1). |
 | E17 | **No new disk format number.** Chunk files, `.ec` index files, the part position in MANIFEST entries, and the markers `MK_COLD` (11, reserved in format 9) and `MK_GC`, `MK_DIGEST`, `MK_DROP_OBJ`, `MK_UNSETTLE` (12-15) live only in cluster volumes behind `requires=cluster,ec` in META (format 9's mechanism, src/feedfile.c:385, src/db.c:437); they freeze at 1.0 with the rest. | Format 10 | Nothing in a single-server volume changes; the `requires=` line refuses the files in a binary that does not know them. |
-| E18 | **The metadata snapshot becomes version 3** (redundancy, two member lists per volume, roles, holds, stores, DESTROYED), and the peer protocol version 3 (chunk messages). Whether 0.11.0's cluster data is a preview (initialised again at the next change, as from version 1 to 2) or upgraded in place from now on is open question 5. | Silently keeping the preview rule | From 0.11.0 the cluster holds data, 10-100 TB a node: re-initialising means exporting and importing it. |
-| E19 | **The EC codec is systematic Cauchy Reed-Solomon over GF(2^8), polynomial 0x11d**, kernels dispatched by tsdb's `src/cpu.c` (no constructors: AGENTS.md "CPU levels"), every kernel byte-identical to the scalar one. | ISA-L as a dependency; LRC or other codes | Interoperable with Jerasure, ISA-L and klauspost (objects:src/codec/gf256.h:1-5); any k of k + m reconstruct, with no unlucky sets (objects:src/codec/rs.h:11-15). Locally repairable codes save rebuild reads but are not MDS at the same space; a later change if rebuild reads hurt (§5.3). Where the code comes from is open question 1. |
+| E18 | **The metadata snapshot becomes version 3** (redundancy, two member lists per volume, roles, holds, stores, DESTROYED), and the peer protocol version 3 (chunk messages). *Decided 2026-11-09* (E36, E37, E39): both are upgraded in place from 0.11.0 on; version 3 is the first snapshot version that later releases convert, and 0.10.0's preview group (version 2, no data path) is initialised again. | Silently keeping the preview rule | From 0.11.0 the cluster holds data, 10-100 TB a node: re-initialising means exporting and importing it. |
+| E19 | **The EC codec is systematic Cauchy Reed-Solomon over GF(2^8), polynomial 0x11d**, kernels dispatched by tsdb's `src/cpu.c` (no constructors: AGENTS.md "CPU levels"), every kernel byte-identical to the scalar one. | ISA-L as a dependency; LRC or other codes | Interoperable with Jerasure, ISA-L and klauspost (objects:src/codec/gf256.h:1-5); any k of k + m reconstruct, with no unlucky sets (objects:src/codec/rs.h:11-15). Locally repairable codes save rebuild reads but are not MDS at the same space; a later change if rebuild reads hurt (§5.3). Where the code comes from: E32. |
 | E20 | **Storage and compute can be separated**: server roles `compute`, `storage`, `both` (default). §9. | Every server both | The user's question. It costs little (two member lists exist anyway, E3) and lets bytes and CPU scale apart. |
 | E21 | **A compute server's state is replicated, not small**: the young tier (a day or more of ingest at m + 1 copies), the `.ec` index files (about 0.75% of settled bytes, on each of the m + 1 log replicas) and caches. Losing one loses nothing durable (while the ISR is full, E4); rebuilding its log replicas is design-cluster.md §8.1's rebuild of terabytes: hours, spread over the other compute servers. A separated cluster needs at least **m + 2 compute servers**, so a lost one has somewhere to be rebuilt. | Stateless compute nodes (WAL on storage nodes); the index on fewer log replicas | A WAL on remote storage adds a round trip to every acknowledged insert; m + 1 local NVMe copies are the replicated mode that already exists. The index on every log replica keeps statistics queries warm right after a failover; at 0.75% its copies cost less than one more data copy of the young tier. |
 | E22 | **The settled tier is an interface with backends**: the cluster's own storage servers (0.11.0), a directory (tests), and later isod or any S3 (design-cluster.md §9.2's `tsdb_cold_ops`). | Only the own backend | With an S3 backend, tsdb servers become compute only and isod does the erasure coding and its rebuild. That is the "true separation" end state; it waits for 0.12 or later (§9.4). |
-| E23 | **0.11.0 holds replicated mode's data path (R2-R4) and this design (R5-R14)**; shared mode's steps go on in parallel and ship when their maintenance windows allow. | Waiting for N7 (M21's order) | The user's "that will go in v0.11.0". M21 put replicated mode after shared mode; this changes the order, not the content (open question 2 is what may move to 0.12). |
-| E24 | **The young tier's ISR floor for EC volumes**: `min_isr` defaults to **m** for `ec=k+m` volumes (2 for m = 2, 4 for m = 4), so an acknowledged row survives at least m − 1 losses at worst and m with the ISR full; `replicas=3` keeps D1's 1. TOPOLOGY and health report both margins: the young tier's (ISR size − 1) and the settled tier's (fewest positions beyond k). | D1's 1 for every volume | The user chose m = 4 to survive 4 losses; with `min_isr = 1` one slow node (or two on 8+4) leaves writes acknowledged on one copy. The cost: an EC volume refuses writes when more than one of its log replicas lags (of 3 for m = 2, of 5 for m = 4). Open question 4. |
+| E23 | **0.11.0 holds replicated mode's data path (R2-R4), this design (R5-R14, R10 included: E33) and the production steps P1-P6 (E36)**; shared mode's steps go on in parallel and ship when their maintenance windows allow (not as production in 0.11.0, E46). | Waiting for N7 (M21's order) | The user's "that will go in v0.11.0". M21 put replicated mode after shared mode; this changes the order, not the content. Nothing moves to 0.12 (E33). |
+| E24 | **The young tier's ISR floor for EC volumes**: `min_isr` defaults to **m** for `ec=k+m` volumes (2 for m = 2, 4 for m = 4), so an acknowledged row survives at least m − 1 losses at worst and m with the ISR full; `replicas=3` keeps D1's 1. TOPOLOGY and health report both margins: the young tier's (ISR size − 1) and the settled tier's (fewest positions beyond k). | D1's 1 for every volume | The user chose m = 4 to survive 4 losses; with `min_isr = 1` one slow node (or two on 8+4) leaves writes acknowledged on one copy. The cost: an EC volume refuses writes when more than one of its log replicas lags (of 3 for m = 2, of 5 for m = 4). Confirmed by the user on 2026-11-09 (E35). |
 | E25 | **Scrub every chunk every `scrub_days` (14)**, paced by `scrub_mb_s` (50 MB/s per disk) below rebuild: each storage server reads its chunks and checks every cell against the encode-time cell checksums (E26); log replicas scrub `.ec` files and young parts the same way (`verify_checksums` reads). A bad cell is repaired by a range decode through the rebuild path. Damaged chunks are counted per disk; a disk with more than `scrub_out_count` (8) in a day goes OUT (E27). Health shows the oldest unscrubbed object. | Scrub on demand; checking parity against data across servers | Systematic reads never touch parity, and range reads cannot check a 1 MiB cell's sum, so rot in parity or unread data stays hidden until a degraded read or a rebuild needs it: at margin 0 that is loss. Encode-time sums make a local check sufficient: a cell that matches its encode-time sum is what the encoder produced (objects counts damage per device the same way, objects:src/cluster/cmap.h:169-170). |
 | E26 | **Checks at every hand-over.** The encode checks every granule checksum and the footer hash of each part it reads (it reads every byte anyway) and aborts on a mismatch (the part is repaired from a replica first, design-cluster.md §8.5); it computes a 64-bit sum per cell for **every position**, data and parity, sends each position its sums with the put, and records all of them in the object record; a chunk server checks the cells it receives before PUT_OK and the leader compares each PUT_OK's sum. After the settle, every log replica compares a **logical digest** of the rows it retired (rows per series and an xxh64 over the visible rows in (series, ts) order) with the leader's (`MK_DIGEST`), before it deletes them; a mismatch keeps the retired parts and raises DIVERGED. Retired parts of a settle are kept `settle_keep_s` (1 day), not `obsolete_part_lifetime_s`. A rebuilt cell is checked against its encode-time sum, never self-certified. | Trusting the leader's bytes (the first draft); a digest on the apply path | Granule payloads are hashed only with `verify_checksums` (default off; src/part.c:314-318), so rot in the leader's part would be encoded with fresh, matching sums while the good replica copies are retired; and a merge bug on the leader would become the only lineage. The digest costs one decode of each settled partition per log replica, in the background (EU6). |
 | E27 | **A storage server holds one chunk store per disk** (`--chunk-dir`, repeated; each with its own META and store id). A position stays one per server; each chunk lives on one of its disks, in the server's local index. A dead disk is a **device** DOWN/OUT: only that disk's chunks are rebuilt, onto the server's other disks when they have room, else the server's positions move by the balancer. `tsdb cluster disk out|replace NODE DISK`. | One file system over all disks (one disk loss is the whole server); RAID under the chunks (redundancy on redundancy, the 1.25x is no longer 1.25x) | At 1-2% a year per disk, a 20-node cluster of 24-disk servers loses several disks a year: the most frequent hardware event. Objects does it per device (objects:src/cluster/cmap.h:66-77; timers per device, objects:src/mds/server.h:84-100). |
@@ -103,6 +113,27 @@ modes and the combined build plan; §7 there carries this design's steps R5-R14)
 | E29 | **Segments are retained for a DOWN or held member** of the log group until it goes OUT or its hold ends, within `repl_retain_down_gb` per server (sized by §4's rule: ingest × `rebuild_after` × WAL bytes per row), beyond design-cluster.md §8.3's 30 min and `repl_retain_mb`. | §8.3's budget alone | At high ingest 4 GB lasts minutes, so "back within 30 minutes only catches up" would not hold, and a planned 2-hour hold would cost a snapshot of terabytes of young data. |
 | E30 | **Backpressure before ENOSPC**: a log replica above `young_high_pct` (90%) of its WAL and young-data file system makes its leader refuse inserts with UNAVAILABLE reason `TSDB_WHY_FULL` (4, protocol 13) until it is below again; the operator guide sizes compute disks (§4). | Letting the WAL reach ENOSPC (fail-stop on every compute node at about the same time) | Young data grows when settles wait (E10, E12) and every compute node fills at the same rate; refusing is retryable, fail-stop is not. |
 | E31 | **Hedged reads per server**: a cell read is hedged after `2 × that server's read p99` (floor 20 ms, ceiling 500 ms), not a fixed 50 ms; hedges are capped by a token bucket at 5% of reads per server; a server with 8 timeouts in 10 s is `read-avoid` for 30 s (decoded around without waiting). | A fixed 50 ms timeout with k reads per hedge (the first draft) | On HDD storage servers (§9.1) queue p99 under rebuild or scrub is routinely above 50 ms; each hedge reads k cells (16 on 16+4), raising latency further: a feedback loop that can outlive its cause. |
+
+**Decided by the user on 2026-11-09** (the five open questions of the revised draft; E32-E36), and what production
+then required (E37-E46, decided in this revision; the user may change them):
+
+| # | Decision | Rejected | Why |
+|---|---|---|---|
+| E32 | **The EC codec is intellistream-objects' `src/codec`, copied unchanged** (user, open question 1): `gf256.c`, `gf256.h`, `gf256_avx2.c`, `gf256_avx512.c`, `rs.c`, `rs.h` (1,143 lines) into `src/ec/` below an AGPL-3.0-only header by `tools/sync-ec.sh` (as `tools/sync-raft.sh` does), which writes `src/ec/UPSTREAM` (repository, commit, licence); what they include from objects' `common/` is tsdb's own `src/ec/compat.h`. gf256.c's start-up constructor (objects:src/codec/gf256.c:469, which AGENTS.md "CPU levels" forbids) is replaced **upstream** by an explicit selection call that tsdb's `src/cpu.c` makes, so the copy stays byte for byte. The codec is in `libtsdb` and tsdbd (AGPL-3.0-only, the embedded bindings too). The Apache-2.0 network clients never contain it: settled data is decoded on servers only (a later direct-mode client routes to log replicas, never to storage servers), `tools/check-spdx.sh` already refuses an Apache-2.0 file that includes an AGPL one, and R5 adds a check that `libtsdbclient.a` and the client packages hold no `gf256_` or `rs_` symbol. docs/licenses.md lists the copy. | A second grant under Apache 2.0 (the revised draft's recommendation, moot since the relicence); a patched copy, the patch re-applied at every sync; our own codec from the papers (2-3 more track-days) | From 0.11.0 tsdb's server and engine are AGPL-3.0-only (the relicence, merged into main on 2026-11-09) and objects is AGPL-3.0-only with the same owner, so copying needs no grant. An unchanged copy makes `git diff src/ec` after a sync exactly the upstream change; a patch kept in tsdb would be re-applied and re-reviewed each time. The clients stay Apache-2.0 so that programs that only talk to tsdbd are not AGPL works (LICENSING.md). |
+| E33 | **0.11.0 holds everything, R10 included** (user, open question 2: "even if 0.11.0 takes longer"): the prerequisites, R5-R14 with the redundancy change of a running volume (§6.4), and P1-P6. No cut line. | The recommended cut (R10 to 0.12; volumes keep the redundancy they were created with) | The user's choice; it costs R10's 3 track-days and 6 gate hours, counted in §11. |
+| E34 | **The default redundancy of a new cluster** (user, open question 3, as recommended): `cluster init` sets `ec=4+2` when it sees at least 7 storage-capable servers, else `replicas=3`, and prints which and why; `--redundancy` overrides. The default is fixed at `init` and changed only by `tsdb cluster set redundancy` (for volumes added later; existing ones change by E2). The operator guide recommends m = 4 above 20-30 TB of chunks a node (§5.3). | Re-evaluating the default whenever servers join | 4+2 needs 6 distinct servers and a seventh to rebuild onto (objects' room-to-rebuild rule, objects:src/placement/README:84-99); below that, 3 replicas survive the same 2 losses with room to rebuild. A default that followed the member count would give volumes added on different days different redundancy without anyone asking. |
+| E35 | **`min_isr = m` for `ec=k+m` volumes** (user, open question 4, as recommended): E24 as written; `replicas=3` keeps D1's 1. | D1's 1 for every volume | E24. |
+| E36 | **Cluster data is production in 0.11.0** (user, open question 5), not a preview: data on a 0.11.0 cluster reaches later versions in place, without initialising again and without stopping the cluster. 0.11.0 therefore holds (§14, P1-P6): rolling upgrades with version negotiation (E37, E38, E41), the metadata state and every file upgraded in place (E39, E40), backup and restore (E42), shipped alerts (E43), the production operator guide (E44) and the release gates of E45. | The recommended preview for test data, with only the metadata upgradable | The user's choice. At 10-100 TB a node, a cluster that must be initialised again means exporting and importing everything; production means reaching the next version without that and without downtime. |
+| E37 | **Versions N and N + 1 run together, and a cluster version says which is in force.** A binary supports peer protocol versions from the previous minor release's to its own, and reads the previous minor release's metadata and files. A peer link takes the highest version both ends support at its HELLO (and is refused, both versions logged, when the ranges do not meet); no message is sent that the negotiated version lacks. The metadata group holds a **cluster version** (op `CLUSTER_VERSION`), set at `init` and raised only by `tsdb cluster upgrade finish`, which is refused until every member that is not OUT or DESTROYED reports the new version in its heartbeats (`--without NODE` lets a DOWN member be upgraded before it rejoins). Until finish, **nothing the old version cannot read is written anywhere**: no new metadata op or snapshot field, marker kind, chunk, `.ec` or part version, or peer message. After it the new forms are used, and a binary older than the cluster version refuses to start, naming both. Patch releases never change a peer protocol, metadata or file version, so they mix freely. Rolling upgrades go one minor at a time (0.11 → 0.12 → 0.13); a binary two minors ahead refuses to join. | One version per cluster (design-cluster.md §11.2 until now: every upgrade a whole-cluster restart); finishing automatically when the last server reports N + 1; wider version skew | CockroachDB's cluster version and Ceph's `require-osd-release` follow the same pattern: a rolling upgrade needs a period in which old and new code read everything written, and one explicit moment after which new forms appear. Before finish any server can go back to N, because nothing N cannot read exists; an automatic finish would take that last rollback point away from the operator. One step at a time keeps the compatibility matrix at two versions. |
+| E38 | **One server at a time, by `tsdb cluster node prepare N`.** It refuses unless every volume N is in keeps a margin of at least 1 in both tiers without N (no other member of its log or stripe groups DOWN, every ISR full) and no other server is prepared and not yet back; then it holds N from OUT for `--for` (30 min by default, E12), moves N's volume leaderships away by planned transfer (design-cluster.md §3.2), hands the Raft leadership on if N has it, and reports ready. The operator stops tsdbd, installs, starts; N rejoins, catches up from retained segments (E29), and is back when it is in every ISR and stripe group again. `tsdb cluster upgrade status` lists versions, the prepared server and the margins. While versions are mixed, `volume redundancy` and operator re-encodes are refused; failure handling, settles, rebuilds and scrub go on. A mixed cluster is supported without a time limit, but health warns after 24 h (E43). | Restarting on DOWN timers and holds alone; several servers at once (a rack at a time); no limit on what runs while versions are mixed | A restart is a planned failure: checking the margin first means an upgrade never takes a volume to margin 0, and moving leaderships first means no client waits for a failover. A rack at a time is faster but takes m positions of every stripe group that spans the rack at once; it can come later if upgrading 20 servers (minutes each) is too slow. A conversion running across versions would double the states the upgrade test must cover. |
+| E39 | **The metadata state is upgraded in place, at one log index.** Snapshots and log entries carry their version; a binary reads its own and the previous minor's. The conversion (new fields and their defaults, new tables) runs when the `CLUSTER_VERSION` entry is applied, on every member at the same index, so every copy of the state machine stays identical; snapshots after it are written in the new version. Each released snapshot version keeps a golden file in `tests/data/` (`meta-snap-v3.bin` from 0.11.0) that every later release must load and convert, as `tests/data/export-v1.tsdbdump` is for exports. The per-server state (`--state-dir`, REPL, chunk store META, `EPOCH`) follows the same rule, each file with its own version. 0.10.0's metadata group (snapshot version 2, a preview without a data path) is not converted: it is initialised again, as 0.10.0's CHANGELOG says. | Converting each member's snapshot as it loads (members converting at different indexes would apply later entries to different states); export and initialise again at each version | Raft's state machine must be deterministic over the log; a committed entry is the one point where every member converts the same state without further coordination. |
+| E40 | **On disk, each minor release opens the previous one's files in place.** From 0.11.0, a change to a part, MANIFEST, WAL record, marker, chunk or `.ec` file keeps a version in the file or its header, and the new release reads both; the new form is written only after `upgrade finish` (in a cluster) or from the first open by the new binary (a single server, where nothing older still runs). This replaces AGENTS.md's "until 1.0 older formats need not stay readable" by one step back from 0.11.0: a database of version N opens in N + 1; N − 1 and older go through N, or export and import. P1 updates AGENTS.md. | Keeping the pre-1.0 rule (refuse at open; export and import); every older format readable forever before 1.0 | Export and import of 10-100 TB is days per node, and a rolling upgrade needs the restarted server to open its own files with the new binary. One step back is what rolling needs, and it bounds the reading code to two versions until the format freezes at 1.0. |
+| E41 | **Clients during an upgrade**: until `upgrade finish` every server announces the old version's client protocol in HELLO, so all servers speak one protocol and forwarding never carries an op the next hop does not know; after finish, the new one. A release never raises the client protocol floor above the previous minor release's highest version, so clients of N keep working against N + 1. | Each server announcing its own protocol | A client connected to an upgraded server could send an op that is forwarded to an old leader and refused as unknown, in the middle of an upgrade. |
+| E42 | **Backup is physical, per volume at a cut, and incremental** (§14.3): `tsdb cluster backup --to DIR` has every volume's leader take a cut at a log position P (the rebuild snapshot of design-cluster.md §8.1, under `publish_lock`, no fence), pins it (`BACKUP_PIN(volume, P)`, respected by `MK_GC` and by retirement until the backup ends or `backup_pin_max_s`, 1 day, passes) and copies through the directory backend (R6): every settled object by oid, decoded (the part file, so a backup does not depend on the geometry), every young part, the WAL tail up to P and the volume's metadata; then a metadata snapshot (users, volumes, name slots, settings). Files already in DIR (same name and checksum) are not copied again, so a daily backup copies about a day of ingest, plus the young parts that merges rewrote since the last one (EU8). A backup is complete when its manifest, written last and checksummed, lists every volume; `backup verify` reads it all back. `tsdb cluster restore-data --from DIR` fills a newly initialised cluster: the backup's metadata, every volume at its P, the objects encoded again by the new cluster's geometry, a new cluster identity (a restore generation, design-cluster.md §8.5; change feeds reset, design-cdc.md F19), orphan collection suspended until the operator resumes it (E14). `volume salvage V --from-backup DIR` puts lost objects back by oid (E15). Each volume is consistent at its own P, never at one cluster-wide instant (C16). | Logical backups only (`tsdb export` through a client: no increments, days at 100 TB a node; it stays the way across incompatible versions); file system snapshots of each server (not consistent across replicas and chunk stores, and a restored directory is a rolled-back one, design-cluster.md gap 14); a cluster-wide consistent cut | Settled objects are immutable and named by oid, so an increment is a set difference and the cost follows ingest, not size. A cut per volume is what a rebuild already takes; a cluster-wide instant would need coordination the cluster has nowhere else. Production's NFS/ZFS servers suit the directory backend as a target; S3 follows with its backend. |
+| E43 | **Alerts ship with tsdb**: `dist/alerts/tsdb-cluster.rules.yml` (Prometheus rules) beside docs/metrics.md, each naming its runbook (§14.4). A test drives each rule's metric through a scripted fault on the one-machine cluster and evaluates the rule's expression against the metrics endpoint. | Documenting the metrics and leaving alerts to each operator | Margin 1 against margin 0 is the one thing an operator must not miss, and the thresholds come from this design; shipped and tested, the rules stay right as the metrics change. |
+| E44 | **The production operator guide** (`docs/cluster-operations.md`, §14.5) covers install, sizing, adding and removing nodes, a dead disk, a dead node, rolling upgrades, backup and restore, monitoring and alerts, and salvage. **Every runbook is a script** in `tests/cluster/runbooks/` that runs its commands against the one-machine cluster, so the guide and the CLI cannot drift apart. | Runbooks as prose only | A runbook never run fails when it is needed, at the worst moment; the commands printed in the guide are the ones the test runs. |
+| E45 | **What production requires before 0.11.0 is tagged**, all on the release commit (no gate carried over from an earlier commit): every step's gates; jepsen-cluster's full nemesis set (§10.3, the upgrade and backup nemeses included) on **every** geometry and `replicas=3`; the **72-hour soak** (§10.5); the upgrade test with a dummy version bump (§10.6); the runbook and alert tests; the jepsen-review skill and an operations review on the final code, with no open finding rated high or critical. Performance claims only where measured: absolute numbers for a geometry only from servers with disks, and the release notes say which. | A 24-hour soak; jepsen-cluster on R8's two geometries only | A soak finds what only time shows: memory and descriptor growth, GC and retention converging, settles and scrub keeping up, restarts. 72 h covers three daily cycles of settles, retention and backups. Each geometry has its own placement, small-object k' and degraded-settle edges. |
+| E46 | **Not production in 0.11.0** (§14.6): shared NFS mode (N0-N8 wait for their maintenance windows): `cluster init --mode shared` is refused without `--preview`, and its docs say so; the S3/isod backend and the external cold tier are not built; the directory backend is for tests and backups only (`init` refuses it as the settled tier without `--test-backend`). | Shipping merged shared-mode steps as production | Shared mode's go/no-go (N0) and its jepsen-ha matrix have not run; production needs both. |
 
 ## 1. Words
 
@@ -570,8 +601,8 @@ In this order, each step committed before the next:
 
 `ec` to `replicas=3`: first `MK_UNSETTLE` per object (every log replica reads the object through the read path,
 checks it, and lists it as a normal part in its place, by the same intent swap), then the stripe group empties by
-step 4. The time is the same order as a re-encode. If 0.11.0 must shrink, this is the step that waits (open question
-2): volumes then keep the redundancy they were created with.
+step 4. The time is the same order as a re-encode. In 0.11.0 (E33). While a rolling upgrade has versions mixed, a
+redundancy change is refused, and one already running pauses at its next key until `upgrade finish` (E38).
 
 ## 7. Shared NFS mode and the existing plan
 
@@ -591,9 +622,11 @@ the log group, R3's replication is the young tier, R4's rebuild is the log-posit
 | Markers: `MK_COLD` body (Z, object records, `.ec` and `Y` files, retired oids, `stripe_version`), and new `MK_GC` (12), `MK_DIGEST` (13), `MK_DROP_OBJ` (14), `MK_UNSETTLE` (15) | WAL; `MK_TYPE_LAST` moves to 15 (src/marker.h:41) | yes |
 | The settle intent record (an extension of `parts_commit`'s) | log replicas | yes |
 | `FORMAT_VERSION` | stays 9 (E17) | |
-| Metadata snapshot version 3: `struct meta_volume` (server/meta.h:161-183) gains `redundancy` (kind, k, m), `min_isr` default by mode, the stripe list (up to 24 positions: 20 plus 4 moving; each pos, node, rid, state, barrier), `stripe_version`; members gain roles, holds (with their bound), chunk store ids and states, DESTROYED | metadata group | at 1.0 with the rest of the metadata; open question 5 decides whether 0.11.0 already upgrades it in place |
+| Metadata snapshot version 3: `struct meta_volume` (server/meta.h:161-183) gains `redundancy` (kind, k, m), `min_isr` default by mode, the stripe list (up to 24 positions: 20 plus 4 moving; each pos, node, rid, state, barrier), `stripe_version`; members gain roles, holds (with their bound), chunk store ids and states, DESTROYED | metadata group | at 1.0 with the rest of the metadata; until then each minor release converts the previous one's in place, at the `CLUSTER_VERSION` entry (E39) |
 | New ops at the end of `enum meta_op_kind` (never renumbered, server/meta.h:264-295): `STRIPE_SET` (if stripe_version == v), `NODE_HOLD`, `VOLUME_REDUNDANCY`, `NODE_REPLACE`, `STORE_STATE`, `NODE_DESTROYED`, `GC_SUSPEND` | metadata group | yes |
-| Peer protocol version 3 (`CL_VERSION`, server/cluster.c:95): CHUNK_PUT (with cell sums), PUT_OK, CHUNK_READ (oid, pos, offset, length), CHUNK_DATA, CHUNK_LIST, CHUNK_DEL (naming its `MK_GC`), all with volume and epoch; heartbeats gain "opening" and "fail-stopped" | peers | no (same-version peers only, design-cluster.md §11.2; open question 5) |
+| Peer protocol version 3 (`CL_VERSION`, server/cluster.c:95): CHUNK_PUT (with cell sums), PUT_OK, CHUNK_READ (oid, pos, offset, length), CHUNK_DATA, CHUNK_LIST, CHUNK_DEL (naming its `MK_GC`), all with volume and epoch; heartbeats gain "opening" and "fail-stopped" | peers | no; versions N and N + 1 negotiate per link (E37), new messages only after `upgrade finish` |
+| Cluster version (`CLUSTER_VERSION`, a new metadata op), versions in snapshots, log entries and per-server state files (E37, E39); version fields in chunk, `.ec` and part headers that each minor release reads one step back (E40) | metadata group, servers | the mechanism yes; the rule "N + 1 reads N" holds from 0.11.0 on |
+| `BACKUP_PIN` (a new metadata op); the backup directory: a checksummed manifest naming each volume's P, objects as part files by oid, young parts, WAL tail, the metadata snapshot (E42) | metadata group; backup target | yes; a release restores its own backups and the previous minor's |
 | `TSDB_WHY_LOST` = 18; TOPOLOGY's per-volume health gains both margins and `LOST`; `TSDB_WHY_FULL` (4) and `TSDB_WHY_UNREACHABLE` (16) exist | client protocol | the code yes; whether it needs a protocol number depends on whether every 1.0 client treats an unknown reason as retryable (to check in R8; if not, it waits for the next protocol number) |
 
 ## 9. Storage and compute separation (the user's question)
@@ -687,6 +720,13 @@ deletes, replaces and large inserts into settling and re-encoding keys. Checker:
 acknowledged write, last write wins, no resurrection) plus: every query answer equals the oracle or is an error that
 names a partition.
 
+Added for production (E45): **upgrade** (a rolling upgrade by `node prepare` under load, with kills during it, a
+failover between servers of two versions, a server rolled back before finish, then finish; §10.6), **backup** (backups
+running through failovers, settles, re-encodes and GC; each restored into a fresh cluster and every volume compared with
+the oracle at its P), and **conversion** (a redundancy change running under the other nemeses). Before the tag the
+whole set runs on the release commit on 4+2, 8+2, 8+4, 16+4 and `replicas=3`, `JEPSEN_SECONDS=300` per run (about 24
+machine-hours).
+
 ### 10.4 Benchmarks (quiet machine, 5 runs, the mean; AGENTS.md benchmark policy)
 
 Per mode (`replicas=3`, 4+2, 8+2, 8+4, 16+4): `build/ec-bench` (encode, decode, range decode per k, m, cell size, per
@@ -694,6 +734,33 @@ kernel; 7950X, 9950X, i9-10850K); insert-bench and tsdbc-bench through the clust
 warm cache, a cold cache, one position down and m down, on NVMe and on an HDD-backed storage configuration; settle
 throughput and the settle fence's length; rebuild time against foreground p99; network bytes per row; the digest's
 cost (EU6). On one machine the numbers compare the modes; absolute numbers need servers with disks.
+
+### 10.5 Soak (E45)
+
+72 hours on one machine (the 9950X; no benchmarks beside it), `tests/cluster/soak.sh`: 22 tsdbd processes with
+several chunk stores each, volumes of every geometry and `replicas=3` in one cluster, roles mixed (some `compute`,
+some `storage`); ingest at a steady rate with the 100 B benchmark's sensor mix plus deletes, replaces, large inserts
+and retention short enough to drop partitions daily; queries checked against an oracle, sampled. A slow nemesis: one
+fault every 20-40 minutes drawn from §10.3's set (an OUT and rebuild, a dead disk, a node back during rebuild among
+them), a rolling restart of every server by `node prepare` every 12 hours, a backup every 6 hours with a restore and
+comparison daily, one redundancy change. Passes when: the checker finds nothing; no fail-stop but injected ones;
+after the first 24 h each server's RSS, open descriptors and threads stay within 10% of their level then; disk use
+follows ingest minus retention (GC, retired parts and retained segments converge); the settle backlog and the
+oldest unscrubbed object stay bounded; the alerts fire for the injected faults and for nothing else. With servers with
+disks available, a 24-hour run on them before the release notes claim hardware numbers.
+
+### 10.6 Upgrade test (E37-E41, E45)
+
+`make upgrade-test` builds two binaries: the base (the previous release tag, from `git archive`; before 0.11.0 is
+tagged, this tree) and this tree with `-DTSDB_TEST_BUMP`, which bumps every version once with a dummy change: a
+snapshot field and a metadata op, a peer message, a marker kind, a chunk header and a part format flag, a client
+protocol op. A cluster of every geometry starts on the base and takes jepsen-cluster's workload; the servers are
+upgraded one at a time by `node prepare`, with a kill during an upgrade, a failover from an old leader to a new one and
+back, and one server rolled back to the base before finish. Checked: no dummy form appears anywhere (metadata, WAL,
+files, peer links, HELLO) before `upgrade finish`; after it they are used; the base binary then refuses to start;
+a build bumped twice refuses to join a base cluster; the golden snapshots of `tests/data/` load and convert; and
+jepsen-cluster's checker over the whole history. A short form (one geometry, 5 minutes) runs with the cluster tests of §10.1. From
+0.12 on the base is the real previous tag, and docs/release.md runs the long form before each tag.
 
 ## 11. Build plan for v0.11.0
 
@@ -704,7 +771,7 @@ Track-days as in design-ha-modes.md §7 (build, review and fix rounds); gate hou
 
 | Step | Content | Gate | Gate hours | Track-days |
 |---|---|---|---:|---:|
-| R5 | EC codec in `src/ec/` (open question 1: a patched copy, dispatch moved to `src/cpu.c`, no constructor), fitting AGENTS.md "CPU levels" (`tools/check-isa.sh` must allow the AVX-512 and GFNI kernels behind target attributes, or they move into `src/levels.h`), `test_rs`, `build/ec-bench`; docs/licenses.md row | numbers on three CPUs | — | 1-2 |
+| R5 | EC codec in `src/ec/`, copied unchanged by `tools/sync-ec.sh` with `src/ec/UPSTREAM` (E32), after the upstream change that replaces gf256.c's constructor by a selection call that `src/cpu.c` makes; fitting AGENTS.md "CPU levels" (`tools/check-isa.sh` must allow the AVX-512 and GFNI kernels behind target attributes, or they move into `src/levels.h`); `test_rs`, `build/ec-bench`; the check that no client library or package holds a codec symbol; docs/licenses.md's row moves from planned to present | numbers on three CPUs | — | 1-2 |
 | R6 | Object layout, chunk files (header with epoch, cell sums), chunk stores per disk with ids and `EPOCH`, the directory backend; range decode; `fuzz_chunk`, `fuzz_ec` | fuzz 1 h each | 2 | 2-3 |
 | R7 | Engine: `.ec` parts (the read seam, the cache, merges skip them), `ppos` in MANIFEST, the settle gate and cut, the settle intent, DIVERGED on a part above Z, encode-time checks, `MK_DIGEST` and `settle_keep_s`, per-part and coarse settles, re-encode, retention drops; X1's cold boundary folded in | `make jepsen` (single server, directory backend: kill, power during settle, deletes/replaces/large inserts into settling keys, the `Y` mutant) | 8 | 5-7 |
 | R8 | tsdbd: roles, chunk peer messages, epoch fences (durable per volume), `MK_GC` and the orphan rules, GC suspension, degraded reads with E31's hedging and `read-avoid`, metadata v3, TOPOLOGY with both margins, unavailable/corrupt/lost, `TSDB_WHY_LOST` in the four clients, `min_isr` by mode | `make jepsen-cluster` (kill, partition, partial partition, pause past the lifetime, disk loss, chunk rot, crash between `MK_COLD` and commit) on 4+2 and 16+4; `make test-clients` | 12 | 6-8 |
@@ -712,18 +779,29 @@ Track-days as in design-ha-modes.md §7 (build, review and fix rounds); gate hou
 | R12 | Scrub (E25, §5.9): chunks, `.ec` files and young parts, damage counts and disk OUT, health age, metrics | jepsen-cluster: rot (parity included) then m failures | 6 | 2 |
 | R13 | Disks (E27, §5.5): device DOWN/OUT, rebuild within a server, `disk out` and `disk replace` | jepsen-cluster: single-disk loss, disk loss back within 30 min | 6 | 2-3 |
 | R14 | Operator CLI (`node hold/replace/drain/destroyed`, `disk ...`, `volume move/redundancy/salvage/gc`, `cluster status` with both margins, rebuild progress and settle backlog) and metrics (docs/metrics.md) | test_server cases | — | 2 |
-| R10 | Redundancy change on a running volume (§6.4: order, re-encode, `MK_UNSETTLE`) | jepsen-cluster with a conversion running | 6 | 3 |
-| R11 | Benchmarks (§10.4, NVMe and HDD storage), operator guide (sizing for compute disks, index and rebuild time, holds, salvage, m = 4 above 20-30 TB a node), README section, AGENTS.md invariants (the settle cut, chunk fences, `MK_GC`) | the numbers | — | 2 |
+| R10 | Redundancy change on a running volume (§6.4: order, re-encode, `MK_UNSETTLE`); in 0.11.0 (E33) | jepsen-cluster with a conversion running | 6 | 3 |
+| R11 | Benchmarks (§10.4, NVMe and HDD storage) and the sizing numbers for P5's guide (compute disks, index and rebuild time, m = 4 above 20-30 TB a node), README section, AGENTS.md invariants (the settle cut, chunk fences, `MK_GC`) | the numbers | — | 1-2 |
+| P1 | Versions (E37-E41, §14.1-14.2): peer protocol ranges negotiated per link; `CLUSTER_VERSION`, `upgrade status` and `upgrade finish`; every new writer gated on the cluster version (metadata ops and snapshot fields, markers, chunk, `.ec` and part versions, peer messages, the client protocol in HELLO); the refusals (two minors apart, older than the cluster version); `node prepare` (margin check, hold, leadership and Raft-leader hand-off, one at a time); versioned snapshots and entries converted at the `CLUSTER_VERSION` entry, the golden `tests/data/meta-snap-v3.bin`; versioned state files; AGENTS.md's format rule (E40) | meta-soak with members of two versions (a member capped at the older version stands in for the old binary); test_server cases | 6 | 4-6 |
+| P2 | Upgrade test (§10.6): `make upgrade-test`, the `TSDB_TEST_BUMP` build, the upgrade nemesis in jepsen-cluster | `make upgrade-test`, long form | 8 | 2-3 |
+| P3 | Backup and restore (E42, §14.3): `BACKUP_PIN`, `cluster backup` (incremental, manifest last), `backup verify`, `restore-data` into a new cluster (new identity, GC suspended, feeds reset), `volume salvage --from-backup` | jepsen-cluster `backup` nemesis with restores compared against the oracle | 6 | 4-5 |
+| P4 | Alerts (E43, §14.4): `dist/alerts/tsdb-cluster.rules.yml`, the metrics they need (docs/metrics.md), a test per rule | the rule tests | — | 1-2 |
+| P5 | The production operator guide (E44, §14.5): `docs/cluster-operations.md`, systemd units in `dist/`, runbook scripts in `tests/cluster/runbooks/` | the runbook tests | 3 | 3-4 |
+| P6 | Release gates (E45) on the release commit: jepsen-cluster's full set on all four geometries and `replicas=3` (§10.3), the 72-hour soak (§10.5), the upgrade test, the reviews, and the fixes they find | the gates themselves | 96 (24 + 72) | 2-4 |
 
-R5-R14: **31-40 track-days**, 64 gate hours; with the prerequisites **about 44-60 track-days and 107 gate hours
-(about 4.5 machine-days) before reruns after fixes**. On three tracks that is roughly 4-5 weeks of calendar, set by
-the review rounds and the gates. R5 and R6 need nothing and can start now; R7 needs R2; R8 needs R3 and S2; R12 and R13
-need R8; R9 needs R4 and R8; R14 runs alongside R9.
+R5-R14: **30-40 track-days**, 64 gate hours (R11 is 1-2 since the guide moved to P5). P1-P6: **16-24 track-days**,
+119 gate hours. **Total for 0.11.0, with the prerequisites: about 59-84 track-days and 226 gate hours (about 9.5
+machine-days, 3 of them the soak) before reruns after fixes** (2026-11-09, after the user's answers; it was 44-60
+track-days and 107 gate hours with R10 as the first cut and the cluster data a preview). On three tracks that is
+roughly 6-8 weeks of calendar: 4-6 weeks of building and reviewing, set by the review rounds, then P6's gates run in
+series on the release commit (about 5 machine-days), and a failed soak costs another 72 hours. R5 and R6 need nothing
+and can start now; R7 needs R2; R8 needs R3 and S2; R12 and R13 need R8; R9 needs R4 and R8; R14 runs alongside R9;
+P1 needs R8 (it versions metadata v3) and should land before R9, so that every later writer is gated from the start;
+P2 needs P1 and R9; P3 needs R7 and R8, its nemesis R9; P4 and P5 need R14, P5 also P1 and P3; P6 comes last.
 
 **What waits**: the S3/isod backend and the external cold tier (§9.4); local repair codes; shipping merges; partial
 rebuild of a returning log replica from position ranges (design-cluster.md "Later"; E29's retention covers the
-30-minute and held cases); direct-mode clients (S3 of design-ha-modes.md, forwarding serves until then); rolling
-upgrades between peer versions (open question 5). If 0.11.0 must shrink, R10 moves to 0.12 first (open question 2).
+30-minute and held cases); direct-mode clients (S3 of design-ha-modes.md, forwarding serves until then); upgrading
+a rack at a time (E38); a cluster-wide consistent backup (E42). Nothing of R5-R14 or P1-P6 moves to 0.12 (E33).
 
 ## 12. What intellistream-objects gives, and what not
 
@@ -754,7 +832,7 @@ operations and performance at 10-100 TB a node (2 critical, 9 major, 9 minor). W
 | Durability C1: the settle retired acknowledged writes in neither `S` nor `Y` | E6, §2.3 (gate, cut Z, `ppos`, DIVERGED, the proof over parts and memtables, re-encode by the same protocol), §10.2-10.3 tests and mutant |
 | H1: rot or a merge bug on the leader becomes the only lineage | E26, §2.3 steps 2 and 7 (`MK_DIGEST`, `settle_keep_s`) |
 | H2: chunk deletion not fenced | E14, §2.2 (`EPOCH`, writer epoch), §2.3 "Crash and failover", §5.7, `MK_GC` |
-| H3: `min_isr = 1` does not survive m losses | E4, E24, §5.8; open question 4 |
+| H3: `min_isr = 1` does not survive m losses | E4, E24, §5.8; decided by the user (E35) |
 | H4 and operations M7: no scrub | E25, §5.9, R12 |
 | M1: rebuild checks nothing; trial decode by a 32-bit sum | E11, E26, §3.2, §5.3 |
 | M2: the second settle retires the first object | E6, §2.3 step 6 (only non-`.ec` parts, and named oids) |
@@ -778,56 +856,119 @@ operations and performance at 10-100 TB a node (2 critical, 9 major, 9 minor). W
 | M4: retention shorter than the 30 minutes promised | E29, §5.2 |
 | M5: index 10x underestimated; compute state is TBs | §2.1, E21, §4 (sizing tables), §9.2-9.3, separated minimum m + 2 |
 | M6: HDD performance and hedging overload | E31, §3.4 (HDD column), §10.3-10.4 |
-| M8: 0.11.0 holds data but cannot upgrade | E18, open question 5 |
-| M9: plan underestimated, steps missing, gate time, S4's gate, Totals | §11 (R7-R9 re-estimated, R12-R14 added, gate hours, S4's own gate), design-ha-modes.md §7 rows, Order and Totals; cut line in open question 2 |
+| M8: 0.11.0 holds data but cannot upgrade | E18; decided by the user (E36: production), designed in E37-E41 and §14.1-14.2 |
+| M9: plan underestimated, steps missing, gate time, S4's gate, Totals | §11 (R7-R9 re-estimated, R12-R14 added, gate hours, S4's own gate), design-ha-modes.md §7 rows, Order and Totals; no cut line (E33) |
 | m1: costs missing (merges, ingest, compute-only settle, index) | §4 |
 | m2: adding a node is bound by its receive rate | §6.2 (`balance_mb_s`) |
 | m3: geometry change takes a week | E2, §6.4 |
 | m4: coarse partitions stay replicated a year | E5 (coarse keys settle part by part), EA2, EU5 |
 | m5: the fence is longer than 1-10 ms with forced flushes | E5 (wait for a natural flush), §2.3 proof paragraph, §10.4 |
-| m6: licence details | open question 1; docs/licenses.md corrected |
+| m6: licence details | E32 (the relicence makes a grant unnecessary); docs/licenses.md |
 | m7: small objects pay more | E7 (cell size per object), §4 |
 | m8: warm-up may not fit, competes with rebuild | §3.3 |
 | m9: opening hold and fail-stop fast path | E12 |
 
-## Open questions (each with a recommendation)
+## 14. Production in 0.11.0 (E36)
 
-1. **The licence of the EC code.** intellistream-objects is AGPL-3.0-only (objects:LICENSE since its commit 3fe89800
-   of 2026-10-26, LICENSING.md:1-4) and sells a commercial licence; tsdb is Apache 2.0. The Raft core came under the
-   owner's grant D2 (src/raft/UPSTREAM, docs/licenses.md:16-21), which names `src/raft` only. (a) A second grant
-   naming `src/codec/gf256.c`, `gf256.h`, `gf256_avx2.c`, `gf256_avx512.c`, `rs.c`, `rs.h` (1,143 lines), copied by
-   `tools/sync-ec.sh` with `src/ec/UPSTREAM`. Unlike Raft, this is **a patched copy**, not an unchanged one: the files
-   include objects' `common/{cpu,clock,log,util}.h` (compat shims, as for Raft), gf256.c has a constructor
-   (objects:src/codec/gf256.c:469) that AGENTS.md "CPU levels" forbids, so the dispatch moves to tsdb's `src/cpu.c`; and
-   the codec lands in libtsdb (the read seam is `granule_read`), so it reaches the embedded Rust, Python and Java
-   bindings, where Raft did not (docs/licenses.md:21). All 16 commits to objects' `src/codec` are the owner's, so the
-   grant is possible today; it should be written into objects' LICENSING.md ("these files are also available under
-   Apache 2.0"), cover later syncs, and be given knowing that Apache 2.0 carries a patent licence (its §3). (b) Our own
-   from the papers (Cauchy RS; the split-table PSHUFB method of Plank, Greenan and Miller, "Screaming fast Galois field
-   arithmetic using Intel SIMD instructions", FAST 2013; GFNI's affine instruction), 2-3 more track-days with the same
-   tests; not a clean room, since the people and agents writing it have read objects' code. **Recommended: (a)**, the
-   grant written in objects' LICENSING.md covering later syncs.
-2. **What 0.11.0 holds.** The user put this design in v0.11.0 and asked for the four geometries to be tested; the
-   honest size is 44-60 track-days with the prerequisites (§11). **Recommended**: 0.11.0 holds the replicated data path
-   (S1 rest, S2, S4, R2-R9, R11-R14) with `replicas=3` and all four geometries, tested on one machine and in the
-   simulator, and server roles (cheap; they answer the separation question); 8+4 and 16+4 hardware numbers are not
-   claimed until measured on servers. **R10 (changing the redundancy of a running volume) moves to 0.12** as the
-   first cut (volumes keep the redundancy they were created with); shared mode's N-steps go on in parallel and ship in
-   0.11.0 only if their maintenance windows came (E23).
-3. **The default redundancy of a new cluster.** **Recommended**: `ec=4+2` when `cluster init` sees at least 7
-   storage-capable servers, else `replicas=3`; `init` prints which and why, and `--redundancy` overrides; the operator
-   guide recommends m = 4 above 20-30 TB of chunks a node (§5.3).
-4. **The young tier's ISR floor (E24).** D1 (the user's) keeps `min_isr = 1`; with it, an EC volume's acknowledged rows
-   survive one loss at worst, not m. **Recommended**: `min_isr = m` by default for `ec=k+m` volumes, `replicas=3`
-   unchanged, both margins in TOPOLOGY; the cost is that an EC volume refuses writes when more than one of its log
-   replicas lags (m = 2), or more than one of five (m = 4).
-5. **Preview or upgradeable cluster data.** From 0.11.0 the cluster holds 10-100 TB a node; the preview rule
-   ("initialised again" at a metadata or peer protocol change, E18; peers of one version only, design-cluster.md
-   §11.2) would then mean export and import of everything, and every tsdbd upgrade a whole-cluster restart.
-   **Recommended**: 0.11.0's cluster data path ships as a **preview for test data** (CHANGELOG, docs and `cluster init`
-   say so), but 0.11.0 already carries the in-place upgrade of metadata snapshot v3 to later versions (1-2 track-days in
-   R8, so test clusters survive 0.12); rolling upgrades (peers speaking versions N and N + 1, with a jepsen-cluster
-   upgrade one node at a time) are designed and built before the cluster is declared for production.
+The user made the cluster data path production in 0.11.0. This section is what that adds; the decisions are E37-E46.
+
+### 14.1 Versions and rolling upgrades (E37, E38, E41)
+
+| | Patch releases of one minor | N and N + 1, before `upgrade finish` | After `upgrade finish` | N and N + 2 |
+|---|---|---|---|---|
+| Peer links | the same version | negotiated: N's protocol | N + 1's; an N binary refuses to start | refused at the link |
+| Metadata ops and snapshots | the same | N's only | N + 1's, converted at the `CLUSTER_VERSION` entry (E39) | — |
+| Files written (parts, markers, chunks, `.ec`, state files) | the same | N's forms only | N + 1's (E40) | — |
+| Client protocol announced in HELLO | the same | N's on every server (E41) | N + 1's | — |
+| Taking a server back to the older binary | yes | yes | no: forward fixes or restore (E42) | — |
+| Operator conversions (`volume redundancy`, re-encodes) | yes | refused (E38) | yes | — |
+| How long | any | no limit; a warning and an alert after 24 h | — | — |
+
+The procedure, which the guide's upgrade runbook runs (E44):
+1. `tsdb cluster upgrade status`: every server on N, no volume below full margin, no backup running.
+2. For each server, non-voters first, then voters, the Raft leader last: `tsdb cluster node prepare N` (E38), stop
+   tsdbd, install N + 1, start, and wait until `upgrade status` shows N back in every ISR and stripe group. A server
+   costs a planned leadership transfer (seconds), its restart and open (an `.ec` part opens from its index, so the open
+   is the WAL replay of its memtables) and its catch-up: minutes, so a 20-server cluster takes one to three hours.
+3. `tsdb cluster upgrade finish`: the `CLUSTER_VERSION` entry commits, every member converts its metadata at that
+   index, and from then on the new forms appear. Before this step, going back is step 2 with the old binary.
+
+The Raft core's messages travel inside peer messages, so a sync of `src/raft` that changes `raft_wire`'s encoding is a
+peer protocol change under the same rule; the upgrade test (§10.6) covers it.
+
+### 14.2 Upgrades in place (E39, E40)
+
+Every persistent thing has a version and a reader one step back: the metadata snapshot and log entries (converted at
+the `CLUSTER_VERSION` entry), the per-server state (`--state-dir`, REPL, chunk store META, `EPOCH`), and the volume's
+files (parts, MANIFEST, WAL records and markers, chunk and `.ec` headers), which the new release reads in both forms
+and writes in the new one only after finish. A volume can therefore hold parts of two versions for as long as merges
+and settles take to rewrite them; nothing rewrites them on purpose. Golden files of each released version
+(`tests/data/meta-snap-v3.bin`, and a small cluster volume directory with chunk and `.ec` files, `tests/data/cluster-v1/`)
+are opened by every later release's tests, as the export stream is.
+
+### 14.3 Backup and restore (E42)
+
+A backup per volume is a cut at P, pinned so that nothing it names is retired or collected while it is copied; the
+copy goes through the directory backend to a mounted target (production's NFS/ZFS servers; S3 when that backend
+exists). Objects are stored decoded, as part files named by oid, which makes increments a set difference and makes a
+backup independent of the geometry it came from. `backup` takes `--volumes` and a parallelism bounded by the
+rebuild token bucket (design-cluster.md §8.4), below foreground and rebuild traffic. A restore is disaster recovery
+into a new cluster: the old one must never run again beside it (the new identity makes its servers' peer links and
+clients' cached topologies refuse each other). What a restore loses is everything after each volume's P; Pulsar or
+the source replays it if it still holds it. `volume salvage --from-backup` is the partial case: objects of a volume
+reported lost (E15) are put back by oid from the newest backup that holds them, and only the rows written after that
+backup's P in those partitions are gone (objects the backup lacks are dropped by `MK_DROP_OBJ`, as in E15).
+
+### 14.4 Monitoring and alerts (E43)
+
+`dist/alerts/tsdb-cluster.rules.yml`, every rule naming its runbook: a volume at margin 0 in either tier (page) or
+below m (ticket); a volume UNAVAILABLE, LOST or DIVERGED (page); a fail-stopped server (page); the metadata quorum
+lost (page); a settle backlog older than `settle_wait_max_s`; young-tier disks above 80% (before E30's 90%
+backpressure); a rebuild that made no progress for 15 minutes; scrub older than 2 × `scrub_days`; a server's clock
+offset above half the lease bound (design-cluster.md U5); versions mixed for more than 24 h; the last complete backup
+older than its schedule allows (a setting, 26 h by default). docs/metrics.md lists the metrics; each rule has a test
+(P4).
+
+### 14.5 The operator guide (E44)
+
+`docs/cluster-operations.md`, for the people who run it, in the plain language of the README (one runbook per page
+section, each with what tsdb does, what the operator does, and the commands):
+- **Install**: the tarball (`make dist`), the systemd units in `dist/` (`Restart=on-failure` with a start limit: a
+  restart after a fail-stop reopens from disk, which is safe, but a disk that fails again must not loop), chrony's slew
+  bound (design-cluster.md U5), the disk layout (WAL and young parts on NVMe; one chunk store per data disk; the state
+  directory on the OS disk, never restored from a backup), ports and the cluster secret, `cluster init` and its default
+  redundancy (E34).
+- **Sizing** (§4 and R11's numbers): compute disks for young data, settle waits and indexes; storage disks; rebuild
+  time per geometry and node size; when to choose m = 4.
+- **Adding and removing nodes**: `node add` with its role, the balancer's pace (`balance_mb_s`), `node drain` then
+  removal, voters.
+- **A dead disk** (§5.5), **a dead node** (§5.1-5.4: DOWN, holds, OUT, rebuild, `node replace`, `node destroyed`),
+  **two or more down** (§5.8: unavailable against lost, salvage).
+- **Rolling upgrades** (§14.1), **backup and restore** (§14.3), **monitoring and alerts** (§14.4): what each alert
+  means and its runbook.
+
+### 14.6 What is not production in 0.11.0 (E46)
+
+- **Shared NFS mode** (design-ha-modes.md N0-N8): its go/no-go on the production NFS servers (N0) and the jepsen-ha
+  matrix (N7) need maintenance windows that have not come. Steps merged by 0.11.0 ship behind `--mode shared
+  --preview`; the single-server parts of N1 ship on their own as their step says.
+- **The S3/isod backend and the external cold tier** (§9.4, E22): not built; the settled tier is the cluster's own
+  storage servers. The directory backend is for tests and as a backup target.
+- **Direct-mode clients** (design-ha-modes.md S3): not built; clients reach leaders through forwarding, which is
+  production and costs one hop.
+- **Hardware numbers**: correctness is claimed for all four geometries and `replicas=3`; absolute performance only for
+  what was measured on servers with disks (E45).
+- **Upgrades from 0.10.0's preview metadata group**: none; it held no data path and is initialised again (E39).
+
+Limits, not previews: each volume is backed up at its own position, not at one cluster-wide instant; upgrades go one
+server and one minor release at a time.
+
+## Open questions
+
+None. The five open questions of the revised draft were answered by the user on 2026-11-09: the licence (E32), what
+0.11.0 holds (E33), the default redundancy (E34), the young tier's ISR floor (E35), and preview against production
+(E36). The decisions that production then required (E37-E46) were made in this revision with their rejected
+alternatives; the user may change them.
 
 ## Unverified assumptions
 
@@ -840,3 +981,8 @@ operations and performance at 10-100 TB a node (2 critical, 9 major, 9 minor). W
 - EU5: Coarse-class keys (7-364 days) hold a minority of the bytes on a realistic mix of 10^9 series (R11 measures).
 - EU6: The logical digest (one decode of each settled partition per log replica) costs a few percent of a core at the
   100 B benchmark's ingest (R11 measures; if not, it samples series instead of decoding all).
+- EU7: A server's turn in a rolling upgrade (leadership transfer, restart, open, catch-up) takes minutes at 10-100 TB
+  a node, because an `.ec` part opens from its index and only memtables replay (P1 measures it; if it takes much
+  longer, `node prepare`'s default hold of 30 minutes is raised).
+- EU8: A daily incremental backup copies about 1-3 days of ingest: the day's rows, and young parts again each time
+  merges rewrite them before their key settles (P3 measures it on the soak's ingest).

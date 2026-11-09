@@ -12,6 +12,9 @@ Update 2026-11-08: step 1 is built (branch ha-s1 on top of cluster-s1) with the 
 the metadata format is snapshot version 2, the peer protocol version 2, the state lives in `--state-dir`, and a
 cluster of an earlier build is initialised again (no mixed versions). Where this document says §2.3 puts hard saves
 on a worker, the hard save is still on the cluster thread (see design-ha-modes.md §7.1, Status).
+*Update 2026-11-09*: the cluster's data path is **production** in 0.11.0 (the user; [design-cluster-data.md](design-cluster-data.md)
+E36): from 0.11.0 on, servers of versions N and N + 1 run together during a rolling upgrade, the metadata and every
+file are upgraded in place, and "initialised again" holds only for 0.10.0's preview group (E37-E41 there).
 
 Decided by the user on 2026-11-05 and not reopened here:
 1. A cluster (for example 8 servers) stays up, and keeps almost all of its performance, when one or two servers go
@@ -969,7 +972,7 @@ applies to memory as to the rest.
 | A client connect string with several nodes | yes (cheap) | The same client code then works against a cluster. |
 | The 32-byte INSERT_VALUES header with `vol`, `epoch`, `attempt`, `seq` (ha.md §9) | no: 1.x, by HELLO version | A server can accept both headers by version. Without it a 1.0 client gets at-least-once without the stream ordering rule. |
 | TOPOLOGY, the insert reply position, `min_pos` on queries, `REPLICA_OK` | no: 1.x | New ops and longer forms, gated on HELLO, as earlier versions did. |
-| Peer-link protocol | no | Between servers of one version only (a rolling upgrade is a later design). |
+| Peer-link protocol | no | Between servers of one version only (a rolling upgrade is a later design). *Since 2026-11-09*: versions N and N + 1 negotiate per link and a cluster version gates new messages ([design-cluster-data.md](design-cluster-data.md) E37). |
 
 ## 12. What stays single-server
 
@@ -1113,7 +1116,8 @@ estimates, is [design-ha-modes.md](design-ha-modes.md) §7; how this plan's step
 - Shipping merged parts instead of merging on every replica, if the merge CPU measured in §10.3 hurts and the network
   has room (100 GbE).
 - Rebuilding a returning replica partially, from the part position ranges, when its absence outlived the retained WAL.
-- A rolling upgrade protocol for the peer links.
+- ~~A rolling upgrade protocol for the peer links.~~ In 0.11.0 since 2026-11-09 ([design-cluster-data.md](design-cluster-data.md)
+  E37-E41, §14.1).
 - A local cache of cold granules on replicas.
 - A read lease from the ISR rather than the Raft leader, so that leader reads go on while the Raft majority is lost:
   each ISR member promises the leader not to answer a FENCE for a higher epoch until `lease_ms × (1 + drift)` after its
