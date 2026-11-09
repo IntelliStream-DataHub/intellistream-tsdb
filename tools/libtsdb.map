@@ -1,8 +1,31 @@
 /* Exported symbols of libtsdb.so: the public API of include/tsdb.h and
- * include/tsdb_calendar.h, nothing internal. */
+ * include/tsdb_calendar.h, nothing internal. The test hooks (tsdb_test_*, declared in src/internal.h or in the tests
+ * themselves) reach into the engine and can corrupt a database, so a binding must not find them. They match
+ * tsdb_*, and the linker prefers a name written out in full to a pattern, so each is named below as local. A new
+ * hook needs a line here: tests/test_shared.c fails on any exported name that no public header declares. */
 {
     global:
         tsdb_*;
     local:
+        tsdb_test_before_parts;
+        tsdb_test_class_switch;
+        tsdb_test_deferred_retires;
+        tsdb_test_dict_fault;
+        tsdb_test_fence_wakeups;
+        tsdb_test_granules;
+        tsdb_test_kept_names;
+        tsdb_test_latest_hook;
+        tsdb_test_latest_nowarm;
+        tsdb_test_latest_stats;
+        tsdb_test_latest_window;
+        tsdb_test_latest_wr_held;
+        tsdb_test_meta_hold;
+        tsdb_test_meta_release;
+        tsdb_test_meta_use;
+        tsdb_test_midplace;
+        tsdb_test_observe;
+        tsdb_test_precommit;
+        tsdb_test_reopen_hook;
+        tsdb_test_wal_state;
         *;
 };

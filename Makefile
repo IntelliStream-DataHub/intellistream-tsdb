@@ -123,7 +123,9 @@ ifeq ($(UNAME_S),Darwin)
 # no version script: the exported names are the public tsdb_* prefix, as in tools/libtsdb.map
 $(B)/libtsdb.$(SOEXT): $(OBJ) $(B)/tsdb_calendar.o tools/libtsdb.map
 	printf '_tsdb_*\n' > $(B)/libtsdb.exports
-	$(CC) $(CFLAGS) -dynamiclib -Wl,-exported_symbols_list,$(B)/libtsdb.exports -install_name @rpath/libtsdb.dylib -o $@ \
+	printf '_tsdb_test_*\n' > $(B)/libtsdb.unexports
+	$(CC) $(CFLAGS) -dynamiclib -Wl,-exported_symbols_list,$(B)/libtsdb.exports \
+	    -Wl,-unexported_symbols_list,$(B)/libtsdb.unexports -install_name @rpath/libtsdb.dylib -o $@ \
 	    $(OBJ) $(B)/tsdb_calendar.o $(LDLIBS)
 else
 $(B)/libtsdb.so: $(OBJ) $(B)/tsdb_calendar.o tools/libtsdb.map
