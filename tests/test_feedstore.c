@@ -1226,6 +1226,34 @@ static void test_stuck_seals_later(void)
     printf("  open: a replayed segment behind a failed rename is sealed too\n");
 }
 
+/* The leftover of an interrupted disable (FEEDSLOTS.tmp) in a feed-off database is removed by the open: feed_dir_state
+ * finds it by scanning the directory (the scan rewinds first: the dup shares its offset with dirfd). Nothing scanned
+ * dirfd before that scan at the open, so tests/rewind_mutants.sh classes that rewinddir as one no test can tell
+ * (equivalent today); this test keeps the behaviour. */
+static void test_dir_scan_after_scan(void)
+{
+    char dir[PATH_MAX + 32], p[PATH_MAX + 64];
+    fresh("scan_twice", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 500);
+    CHECK(eng_flush(db) == 0);
+    CHECK(eng_close(db) == 0);
+    snprintf(p, sizeof p, "%s/FEEDSLOTS.tmp", dir);
+    int fd = open(p, O_WRONLY | O_CREAT, 0644);
+    CHECK(fd >= 0 && write(fd, "x", 1) == 1);
+    if (fd >= 0)
+        close(fd);
+    CHECK(exists(dir, "FEEDSLOTS.tmp"));
+    CHECK(open_eng(dir, &db) == 0);
+    CHECK(!exists(dir, "FEEDSLOTS.tmp")); /* the open finished the disable that left it */
+    CHECK(db && !atomic_load(&db->feed_on));
+    if (db)
+        CHECK(eng_close(db) == 0);
+    printf("  the open scans the directory from its start after the scans before it (FEEDSLOTS.tmp removed)\n");
+}
+
 static void test_power_replay(void)
 {
     if (access(SHIM, R_OK) != 0) {
@@ -1323,6 +1351,7 @@ int main(int argc, char **argv)
     test_slot_halves();
     test_feedcheck();
     test_info();
+    test_dir_scan_after_scan();
     test_power_replay();
     scratch_done(failures);
     if (failures)

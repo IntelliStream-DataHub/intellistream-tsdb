@@ -321,6 +321,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_out_send
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	tests/meta_mutants.sh $(B)/test_meta_mut
+	$(MAKE) cluster-mutants
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
@@ -649,7 +650,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-cli-stats sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest integration-mutants
+.PHONY: cluster-mutants rewind-mutants test-cli-stats sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -705,6 +706,8 @@ META_SOAK_FIRST   ?= 1000
 $(B)/test_cluster: tests/test_cluster.c tests/harness.h server/cluster.h server/meta.h $(CLUSTER_OBJ) $(B)/tsdb_crypto.o \
     $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o -lpthread -lm
+rewind-mutants:
+	tests/rewind_mutants.sh $(or $(REWIND_DIR),/var/tmp/rewind-mutants-$$$$)
 meta-mutants: $(B)/test_meta_mut
 	tests/meta_mutants.sh $(B)/test_meta_mut
 meta-soak: $(B)/test_meta
@@ -715,6 +718,24 @@ TSDBD_SRC := server/tsdbd.c server/metrics.c server/metrics.h server/auth.c serv
 $(B)/tsdbd: $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
+
+# A server with a bug planted in the Raft log (the copy in src/raft is upstream's and stays unedited, so the mutant is
+# made here, from it, by sed): C2, the hard state (term and vote) saved without its fdatasync. test_cluster's powervote
+# must fail it with its own message, every time (the test-trust review: it passed 2 runs in 5 before it made n2 vote
+# for another candidate). `make cluster-mutants`, part of `make test`. The sed must change exactly one line.
+$(B)/raft_log_c2.c: src/raft/raft_log.c | $(B)
+	test "$$(grep -c ' || fdatasync(l->hard_fd) != 0' $<)" = 1
+	sed 's/ || fdatasync(l->hard_fd) != 0//' $< > $@
+	! cmp -s $< $@
+$(B)/raft_log_c2.o: $(B)/raft_log_c2.c $(RAFT_HDR) | $(B)
+	$(CC) $(CFLAGS) -Wno-stringop-overflow -Isrc -Isrc/raft -Isrc/raft/compat -c -o $@ $<
+$(B)/tsdbd-mut-c2: $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(B)/raft_log_c2.o $(LIB)
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c \
+	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(filter-out $(B)/raft_raft_log.o,$(CLUSTER_OBJ)) \
+	    $(B)/raft_log_c2.o $(LIB) $(LDLIBS) $(URING_LIBS)
+cluster-mutants: $(B)/tsdbd-mut-c2 $(B)/test_cluster $(B)/tsdb $(CRASHFS_SO)
+	tests/expect_fail.sh "hard state is term" env CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd-mut-c2 TSDB_CLI=$(B)/tsdb \
+	    ./$(B)/test_cluster $(SCRATCH) powervote
 
 # tests/fuzz/fuzz_frames.c includes server/tsdbd.c (epoll only: no ring needed without sockets). FRAMES_COV is
 # -fsanitize-coverage=trace-pc in `make fuzz-frames`, which feeds its coverage-guided driver (auth.c, the login and

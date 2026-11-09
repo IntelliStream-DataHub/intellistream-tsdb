@@ -1661,9 +1661,11 @@ static void scen_syncrace(void)
  * the server makes. After the restart the state holds everything that was acknowledged and the term has gone up.
  * Catches a log that is never synced (applied falls back), a hard state that is never saved (the term restarts from
  * the start) and a snapshot whose directory entry is not synced (with `snaps`: the log was compacted behind it, and the
- * state goes back to an earlier image). Planted in a copy of the server, `power` fails on the unsynced log (C1) and on
- * the unsaved hard state (C2), `powersnap` on those and on the snapshot without its directory sync (C7); the clean
- * server passes every run. crashfs follows dup'ed descriptors for this (the log syncs duplicates of its segments).
+ * state goes back to an earlier image). What each scenario catches was measured, not assumed (test-trust review,
+ * 2026-11-09): with every fdatasync of raft_log.c removed `power` fails; with only the hard state's sync removed (C2)
+ * `power` and `powersnap` PASS, because the term saved at the restart is synced by the log's own rounds, and only
+ * `powervote` (below) fails it. The planted C1, C2 and C7 are run by `make test` (cluster-mutants). The clean server
+ * passes every run. crashfs follows dup'ed descriptors for this (the log syncs duplicates of its segments).
  * No CRASHFS_TEAR: a tear may keep every unsynced byte, which would let the unsynced log pass now and then.
  * CRASHFS_REWRITE=old: a hard-state slot rewritten in place and not yet synced comes back as the old slot, not as zeros
  * (a blank slot beside sequence N > 1 is damage by the log's own rule, and a disk leaves old or new bytes there: with
@@ -1768,25 +1770,31 @@ static void scen_power(void) { power_loss(0); }
  * for itself, saving the hard state first), then n2 loses power at its next tracked operation (a proposal's append).
  * What its state directory holds then must say it voted in T, and for whom: a hard save that kept the term but lost
  * the vote would let it vote again for another candidate in T (two leaders), and one that kept nothing is worse. */
-static void scen_powervote(void)
+static int powervote_round(int attempt)
 {
-    scenario("powervote");
+    if (attempt == 0)
+        scenario("powervote");
+    else {
+        char name[32];
+        snprintf(name, sizeof name, "powervote%d", attempt);
+        scenario(name);
+    }
     const char *so = getenv("CRASHFS_SO") ? getenv("CRASHFS_SO") : "./build/libcrashfs.so";
     if (access(so, F_OK) != 0) {
 #ifdef __linux__
         die("no %s (make build/libcrashfs.so): the power-loss scenarios cannot run, and must not pass as skipped", so);
 #else
         printf("  skipped: no %s\n", so);
-        return;
+        return 1;
 #endif
     }
 #if defined(__SANITIZE_ADDRESS__)
     printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
-    return;
+    return 1;
 #elif defined(__has_feature)
 #if __has_feature(address_sanitizer)
     printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
-    return;
+    return 1;
 #endif
 #endif
     static char pe[PATH_MAX * 2 + 128];
@@ -1826,6 +1834,14 @@ static void scen_powervote(void)
     }
     if (!leader)
         die("no new leader after the first one was killed");
+    if (leader == ids[2]) {
+        /* n2 won the election itself: it is the leader now, and its own log syncs (its first entries) make the hard
+         * state durable too, whether or not the hard save syncs. That run cannot tell a vote that was not synced
+         * (planted C2: it passed in 3 of 8 runs), so the cluster is made again until n2 is the one that votes for
+         * another candidate. */
+        printf("  n2 won term %" PRIu64 " itself: its vote proves nothing here, trying again\n", term);
+        return 0;
+    }
     int li = leader == ids[1] ? 1 : 2;
     signal_child(pids[2], SIGUSR2); /* the power fails at n2's next tracked operation */
     char addr[META_ADDR_MAX], err[1024];
@@ -1850,6 +1866,14 @@ static void scen_powervote(void)
             " for %" PRIu32,
             (uint64_t)hs.term, (uint32_t)hs.vote, term, leader);
     printf("  a voter's vote in term %" PRIu64 " (for node %" PRIu32 ") survives a power loss\n", term, leader);
+    return 1;
+}
+static void scen_powervote(void)
+{
+    for (int attempt = 0; attempt < 12; attempt++)
+        if (powervote_round(attempt))
+            return;
+    die("n2 won its own election in 12 clusters in a row (a fair coin: 1 in 4096): the vote was never checked");
 }
 static void scen_powersnap(void) { power_loss(1); }
 
