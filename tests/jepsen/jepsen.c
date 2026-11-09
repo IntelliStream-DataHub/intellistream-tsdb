@@ -1247,9 +1247,23 @@ static void *nemesis_thread(void *arg)
         } else if (!strcmp(nemesis, "eio")) {
             pid_t pid = atomic_load(&server_pid);
             int st = 0;
-            bool gone = waitpid(pid, &st, WNOHANG) == pid;
+            bool gone = waitpid(pid, &st, WNOHANG) == pid, sent = false;
+            if (!gone && !server_faulty) {
+                /* the clean server after a faulty one failed to start (an EIO while opening) has no shim, so no
+                 * handler: SIGUSR2 would kill it, which later read as "ended (status 0xc) without a fault". Crash
+                 * it as the kill nemesis does and start a faulty one. */
+                signal_pid(pid, SIGKILL);
+                waitpid(pid, &st, 0);
+                server_gone();
+                start_server(true);
+                restarts++;
+                atomic_store(&nem_busy, false);
+                pthread_mutex_unlock(&server_lock);
+                continue;
+            }
             if (!gone && access(markpath, F_OK) != 0) { /* the next write or sync fails */
                 signal_pid(pid, SIGUSR2);
+                sent = true;
                 for (int i = 0; i < 100 && access(markpath, F_OK) != 0; i++)
                     usleep(10000);
             }
@@ -1267,7 +1281,11 @@ static void *nemesis_thread(void *arg)
                 const char *base = strrchr(failed, '/') ? strrchr(failed, '/') + 1 : failed;
                 if (gone) {
                     failstops++;
-                    if (!WIFEXITED(st) || WEXITSTATUS(st) != 1) {
+                    /* An EIO the shim's own odds injected just after we looked for the mark, and then our SIGUSR2:
+                     * to the shim a signal after the EIO means a power loss at the next file operation, which may
+                     * come before the fail-stop's exit (99, 0x6300). That is the fault we sent, not the server's. */
+                    bool ours = sent && WIFEXITED(st) && WEXITSTATUS(st) == 99;
+                    if (!ours && (!WIFEXITED(st) || WEXITSTATUS(st) != 1)) {
                         eio_problems++;
                         fprintf(stderr, "  after EIO on %s the server ended with status %#x, not exit 1\n", failed, st);
                     }
