@@ -120,13 +120,13 @@ $(LIB): $(OBJ) $(B)/tsdb_calendar.o
 # Only the public tsdb_* API is exported (tools/libtsdb.map); zstd is linked in
 # statically when ZSTD_LIB says so (make dist), else dynamically.
 ifeq ($(UNAME_S),Darwin)
-# no version script: the exported names are the public tsdb_* prefix, as in tools/libtsdb.map
+# no version script. ld64 takes either -exported_symbols_list or -unexported_symbols_list, never both ("can't use
+# -unexported_symbols_list and -exported_symbols_list"), so one list: every tsdb_* the objects define except the
+# tsdb_test_* hooks (tools/libtsdb.map's twin; nobody has run this on a Mac yet: docs/tasks/macos.md)
 $(B)/libtsdb.$(SOEXT): $(OBJ) $(B)/tsdb_calendar.o tools/libtsdb.map
-	printf '_tsdb_*\n' > $(B)/libtsdb.exports
-	printf '_tsdb_test_*\n' > $(B)/libtsdb.unexports
+	nm -gUj $(OBJ) $(B)/tsdb_calendar.o | grep '^_tsdb_' | grep -v '^_tsdb_test_' | sort -u > $(B)/libtsdb.exports
 	$(CC) $(CFLAGS) -dynamiclib -Wl,-exported_symbols_list,$(B)/libtsdb.exports \
-	    -Wl,-unexported_symbols_list,$(B)/libtsdb.unexports -install_name @rpath/libtsdb.dylib -o $@ \
-	    $(OBJ) $(B)/tsdb_calendar.o $(LDLIBS)
+	    -install_name @rpath/libtsdb.dylib -o $@ $(OBJ) $(B)/tsdb_calendar.o $(LDLIBS)
 else
 $(B)/libtsdb.so: $(OBJ) $(B)/tsdb_calendar.o tools/libtsdb.map
 	$(CC) $(CFLAGS) -shared -Wl,--version-script=tools/libtsdb.map -Wl,-soname,libtsdb.so -o $@ \

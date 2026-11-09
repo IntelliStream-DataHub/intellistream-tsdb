@@ -1325,6 +1325,9 @@ int main(int argc, char **argv)
     test_info();
     test_power_replay();
     scratch_done(failures);
-    printf(failures ? "FAILED: %d\n" : "all ok\n", failures);
+    if (failures)
+        printf("FAILED: %d\n", failures);
+    else
+        printf("all ok%s\n", tr_skips());
     return failures != 0;
 }

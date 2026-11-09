@@ -1067,7 +1067,6 @@ typedef struct tsdb_health_options {
     int read_every_ms;    /* 1000 */
     int write_every_ms;   /* 5000 */
     int recover_ms;       /* 10000: write probes good for this long leave DOWN (flap_recover_ms when it flaps) */
-    int flap_recover_ms;  /* 60000: the same after a third DOWN within ten minutes (never below recover_ms) */
     int fast_ms;          /* 1000: a good write probe takes at most this */
     int spawn_ms;         /* 60000: a stuck probe thread gets a second one beside it after this */
     int degraded_min_ms;  /* 500: the floor of the DEGRADED threshold (10 x the baseline above it) */
@@ -1079,6 +1078,8 @@ typedef struct tsdb_health_options {
     /* Called from the monitor or a probe thread after every state change, with no lock held; it must not block. */
     void (*on_change)(void *ctx, int domain, int old_state, int new_state);
     void *ctx;
+    /* appended after 0.10.0: the fields above keep their offsets */
+    int flap_recover_ms;  /* 60000: the same after a third DOWN within ten minutes (never below recover_ms) */
 } tsdb_health_options;
 typedef struct tsdb_domain_info {
     const char *name, *dir; /* valid until tsdb_health_close */

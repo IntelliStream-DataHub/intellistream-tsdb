@@ -779,6 +779,6 @@ int main(int argc, char **argv)
     if (failures)
         fprintf(stderr, "%d fno checks FAILED\n", failures);
     else
-        printf("fno tests passed\n");
+        printf("fno tests passed%s\n", tr_skips());
     return failures ? 1 : 0;
 }

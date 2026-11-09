@@ -28,6 +28,7 @@
 
 #include <fenv.h>
 #include "watchdog.h"
+#include "require.h"
 #include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1452,12 +1453,14 @@ int main(int argc, char **argv)
     free(base.hash);
     if (configs > 1)
         printf("%d inputs, %d configurations compared\n", nin, configs);
-    else /* an older CPU, or TSDB_CPU=v2 on a build without levels: still decodes every input exactly */
-        printf("%d inputs, one configuration on this CPU: nothing to compare (SKIPPED the comparison)\n", nin);
+    else { /* an older CPU, or TSDB_CPU=v2 on a build without levels: still decodes every input exactly */
+        printf("%d inputs: ", nin);
+        tr_skip("the comparison", "one configuration on this CPU: nothing to compare");
+    }
     if (failures) {
         printf("test_levels: %d failures\n", failures);
         return 1;
     }
-    printf("test_levels: all passed\n");
+    printf("test_levels: all passed%s\n", tr_skips());
     return 0;
 }

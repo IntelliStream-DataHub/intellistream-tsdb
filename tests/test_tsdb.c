@@ -2975,6 +2975,6 @@ int main(int argc, char **argv)
         printf("FAILED: %d checks\n", failures);
         return 1;
     }
-    printf("all tests passed\n");
+    printf("all tests passed%s\n", tr_skips());
     return 0;
 }

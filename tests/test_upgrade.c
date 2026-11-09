@@ -471,7 +471,7 @@ static void test_old_binary(void)
             fprintf(stderr, "test_upgrade: FAIL: the 0.9.0 binary is required (TSDB_REQUIRE_V090_CLI) and TSDB_V090_CLI is not set\n");
             exit(1);
         }
-        printf("  the 0.9.0 binary on an upgraded database: SKIPPED (set TSDB_V090_CLI; counted by the weekly job)\n");
+        tr_skip("the 0.9.0 binary on an upgraded database", "set TSDB_V090_CLI; counted by the weekly job");
         return;
     }
     if (access(old, X_OK) != 0) { /* a path that is not there is a failed check, not a skip */
@@ -546,6 +546,6 @@ int main(int argc, char **argv)
     if (failures)
         fprintf(stderr, "%d upgrade checks FAILED\n", failures);
     else
-        printf("upgrade tests passed\n");
+        printf("upgrade tests passed%s\n", tr_skips());
     return failures ? 1 : 0;
 }

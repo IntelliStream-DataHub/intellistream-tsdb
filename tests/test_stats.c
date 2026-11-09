@@ -22,6 +22,7 @@
 
 #include <dirent.h>
 #include "watchdog.h"
+#include "require.h"
 #include <ftw.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -450,7 +451,7 @@ static void test_modes(const char *base)
 
     int t0 = threads_stable();
     if (t0 < 0)
-        printf("  stats off and lazy: SKIPPED the thread-count checks (no /proc/self/task here)\n");
+        tr_skip("stats off and lazy: the thread-count checks", "no /proc/self/task here");
     o.stats = -1; /* off: no thread, no event ring, no query counters, zeros in the totals */
     OK(tsdb_open(dir, &o, &db));
     int t_off = threads_stable();
@@ -962,6 +963,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "test_stats: %d failures\n", failures);
         return 1;
     }
-    printf("test_stats: ok\n");
+    printf("test_stats: ok%s\n", tr_skips());
     return 0;
 }

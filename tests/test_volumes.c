@@ -2461,6 +2461,6 @@ int main(int argc, char **argv)
         printf("FAILED: %d checks\n", failures);
         return 1;
     }
-    printf("volume tests passed\n");
+    printf("volume tests passed%s\n", tr_skips());
     return 0;
 }

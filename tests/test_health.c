@@ -76,6 +76,18 @@ static bool stays(int dom, int st, int ms)
     return true;
 }
 
+/* tsdb_health_options is public and 0.10.0 released it: a program built against that header sets fields by offset, so
+ * a new field goes at the end (flap_recover_ms was once put after recover_ms and moved every later field). */
+#include <stddef.h>
+#if defined(__LP64__)
+_Static_assert(offsetof(tsdb_health_options, recover_ms) == 12, "tsdb_health_options layout of 0.10.0");
+_Static_assert(offsetof(tsdb_health_options, fast_ms) == 16, "tsdb_health_options layout of 0.10.0");
+_Static_assert(offsetof(tsdb_health_options, auto_up) == 40, "tsdb_health_options layout of 0.10.0");
+_Static_assert(offsetof(tsdb_health_options, node) == 48, "tsdb_health_options layout of 0.10.0");
+_Static_assert(offsetof(tsdb_health_options, on_change) == 56, "tsdb_health_options layout of 0.10.0");
+_Static_assert(offsetof(tsdb_health_options, ctx) == 64, "tsdb_health_options layout of 0.10.0");
+#endif
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_health", 1200);

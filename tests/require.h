@@ -10,6 +10,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Every skip is counted, and the test's last line says how many ("all tests passed (2 skipped)"): a run that
+ * skipped its power-loss checks must not read like one that ran them. */
+static int tr_skipped;
+static inline const char *tr_skips(void)
+{
+    static char buf[32];
+    if (tr_skipped == 0)
+        return "";
+    snprintf(buf, sizeof buf, " (%d skipped)", tr_skipped);
+    return buf;
+}
+/* A part `what` that did not run, reported loudly and counted. */
+static inline void tr_skip(const char *what, const char *why)
+{
+    tr_skipped++;
+    printf("  %s: SKIPPED (%s)\n", what, why);
+}
+
 /* The power-loss part `what` cannot run because `why` is missing. Returns 1 when that is a failure (the caller adds it
  * to its failure count), 0 when it is only reported as skipped. */
 static inline int tr_crashfs_missing(const char *what, const char *why)
@@ -20,6 +38,7 @@ static inline int tr_crashfs_missing(const char *what, const char *why)
                 why);
         return 1;
     }
+    tr_skipped++;
     printf("  %s: SKIPPED (no %s)\n", what, why);
     return 0;
 }

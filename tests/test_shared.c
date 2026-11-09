@@ -10,6 +10,7 @@
 #include <dlfcn.h>
 #include <string.h>
 #include "watchdog.h"
+#include "require.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,7 +112,7 @@ static void check_exports(void *self)
     free(cal);
 #else
     (void)self;
-    printf("  exports: SKIPPED (the export list is checked on Linux)\n");
+    tr_skip("exports", "the export list is checked on Linux");
 #endif
 }
 
@@ -182,6 +183,6 @@ int main(int argc, char **argv)
         printf("FAILED: %d checks\n", failures);
         return 1;
     }
-    printf("shared library tests passed\n");
+    printf("shared library tests passed%s\n", tr_skips());
     return 0;
 }
