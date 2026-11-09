@@ -738,6 +738,39 @@ static void *racer_run(void *arg)
     return NULL;
 }
 
+/* A record that reaches the row cap is closed before the next one opens: its header holds its count, so the buffer
+ * parses and every row is there after a reopen. The cap is lowered to make a few rows reach it. */
+static void test_wal_split(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("walsplit", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    atomic_store(&wal_rec_max_rows, 10);
+    CHECK(sync_far(dir, &db) == 0);
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 4);
+    rows(db, s, T0 + 10, 4);
+    rows(db, s, T0 + 20, 4); /* 8 + 4 would pass the cap: a second record */
+    rows(db, s, T0 + 30, 3);
+    rows(db, s, T0 + 40, 9); /* 7 + 9: a third */
+    wal_flush_now(db);
+    rec r[8];
+    size_t k = read_records(dir, r, 8);
+    CHECK(k == 3);
+    if (k == 3) {
+        CHECK(r[0].kind == WAL_KIND_ROWS && r[0].n == 8 && r[0].fno == 1);
+        CHECK(r[1].kind == WAL_KIND_ROWS && r[1].n == 7 && r[1].fno == 9);
+        CHECK(r[2].kind == WAL_KIND_ROWS && r[2].n == 9 && r[2].fno == 16);
+    }
+    CHECK(eng_close(db) == 0);
+    CHECK(open_eng(dir, false, false, &db) == 0);
+    CHECK(rows_of(db) == 24 && fno_of(db) == 25);
+    CHECK(eng_close(db) == 0);
+    atomic_store(&wal_rec_max_rows, 1u << 28);
+    printf("  a rows record that reaches its cap is closed: the buffer parses and a reopen has every row\n");
+}
+
 static void test_wal_races(void)
 {
     char dir[PATH_MAX + 32];
@@ -959,6 +992,7 @@ int main(int argc, char **argv)
         test_history();
         test_replay_markers();
         test_wal_books();
+        test_wal_split();
         test_wal_races();
         if (!mutant) {
             test_slots();

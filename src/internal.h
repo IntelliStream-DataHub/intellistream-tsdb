@@ -929,6 +929,7 @@ extern void (*_Atomic index_reload_hook)(const part *p, uint32_t i, int at);
 #define HOUR_CUT_MIN 3000
 #endif
 #define HOUR_CUT_MS 3600000
+extern atomic_uint wal_rec_max_rows; /* 2^28; tests lower it to make a rows record split */
 extern atomic_uint hour_cut_min; /* HOUR_CUT_MIN; tests set 0 to compare against the layout without hour cuts */
 typedef struct part_writer {
     struct eng *db;

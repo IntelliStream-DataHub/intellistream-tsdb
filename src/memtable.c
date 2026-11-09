@@ -587,6 +587,8 @@ void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot)
 /* Closes the open rows record: its row count goes into its header now, once, instead of on every append (the header
  * is a cache line far from the tail the appenders write, and it would travel between cores with every call). Called
  * with buf_lock held at every place that hands wal_buf on or appends something that is not a row of this record. */
+atomic_uint wal_rec_max_rows = 1u << 28; /* a record's row count has 28 bits; tests lower it to split records */
+
 static void wal_rec_close(eng *db)
 {
     if (db->wal_rec_open) {
@@ -606,7 +608,8 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
         eng_fail(db, "WAL numbers", EOVERFLOW);
         return TSDB_ERR_IO;
     }
-    bool extend = db->wal_rec_open && (uint64_t)db->wal_rec_rows + n < (1u << 28);
+    bool extend = db->wal_rec_open &&
+                  (uint64_t)db->wal_rec_rows + n < atomic_load_explicit(&wal_rec_max_rows, memory_order_relaxed);
     size_t need = db->wal_len + (extend ? 0 : WAL_HDR) + n * WAL_ROW;
     if (need > db->wal_cap) {
         size_t cap = MAX(need, db->wal_cap * 2);
@@ -618,6 +621,7 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
         db->wal_cap = cap;
     }
     if (!extend) {
+        wal_rec_close(db); /* a record that reached its cap ends here: its count must be in its header */
         uint8_t *h = db->wal_buf + db->wal_len;
         memset(h, 0, WAL_HDR);
         store32(h, (uint32_t)WAL_KIND_ROWS << 28);
