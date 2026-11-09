@@ -1875,6 +1875,54 @@ static int sweep_retention(const char *name, int round, bool *fired_out)
     return rc;
 }
 
+/* The class history (CLASSES): the first record creates the file (a directory fsync), each record is written and
+ * fdatasync'ed before anything relies on it, and a failure is fail-stop ("write or fsync of CLASSES"). With
+ * classes on, a flush classifies a fresh series (a decision record) and a switch writes its own record; the sweep
+ * fails each fsync of either and wants the caller's error; a switch syncs nothing but CLASSES, so there it wants the
+ * engine stopped too, not only a return code. */
+int tsdb_test_class_switch(tsdb *t, tsdb_sid series, int cls, const int64_t *at); /* internal test hook */
+
+static int classes_failed_stop(tsdb *db, int rc, bool fired, const char *what, int round)
+{
+    char msg[256];
+    if (fired && rc != 0 && !tsdb_failed(db, msg, sizeof msg)) {
+        fprintf(stderr, "%s, fault %d: the call failed (%d) but the engine did not stop\n", what, round, rc);
+        failures++;
+    }
+    return rc;
+}
+
+static int sweep_class_decision(const char *name, int round, bool *fired_out)
+{
+    tsdb *db = open_fresh(name, opts()); /* classes on: the flush classifies the series and records it */
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    for (int i = 0; i < 20; i++)
+        OK(tsdb_append(db, id, 100 + i, i));
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    int rc = tsdb_flush(db);
+    *fired_out = fired() > 0;
+    /* no stop check here: the flush also syncs a tmp part, whose failure fails just the call */
+    tsdb_close(db);
+    return rc;
+}
+
+static int sweep_class_switch(const char *name, int round, bool *fired_out)
+{
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    for (int i = 0; i < 20; i++)
+        OK(tsdb_append(db, id, 100 + i, i));
+    OK(tsdb_flush(db));
+    arm_after(round & 0xff, (round >> 8) ? F_FDATASYNC : F_FSYNC, "");
+    int rc = tsdb_test_class_switch(db, id, 2, NULL);
+    *fired_out = fired() > 0;
+    classes_failed_stop(db, rc, *fired_out, "class switch", round);
+    tsdb_close(db);
+    return rc;
+}
+
 static int sweep_series_create(const char *name, int round, bool *fired_out)
 {
     tsdb *db = open_fresh(name, opts_days());
@@ -2081,8 +2129,10 @@ static void test_fsync_results(const char *base)
     run_sweep("replace", sweep_replace, name, 4);
     run_sweep("retention", sweep_retention, name, 1);
     run_sweep("series creation", sweep_series_create, name, 1);
+    run_sweep("class decision", sweep_class_decision, name, 1);
+    run_sweep("class switch", sweep_class_switch, name, 1);
     run_sweep("volume add", sweep_volume_add, name, 8);
-    printf("  every failed fsync of an insert, a flush, a merge, a delete, a replace, a retention limit, a series and"
+    printf("  every failed fsync of an insert, a flush, a merge, a delete, a replace, a retention limit, a series, a class decision, a class switch and"
            " a volume reaches the caller\n");
 
     /* creating a database */

@@ -417,7 +417,7 @@ static double await_status(const char *key, const char *want, int timeout_ms)
     return -1;
 }
 
-static char key_vol_reason[32], key_dom_state[32];
+static char key_vol_reason[32], key_vol_health[32], key_dom_state[32];
 
 /* Waits until a write on s is acknowledged (the volume recovered). */
 static int await_writes(side *s, int timeout_ms)
@@ -488,6 +488,7 @@ int main(int argc, char **argv)
         for (size_t i = 0; topo && i < topo->nvols; i++)
             if (topo->vols[i].vol == va && topo->vols[i].domain != 0xffff) {
                 snprintf(key_vol_reason, sizeof key_vol_reason, "vol.%u.reason", va);
+                snprintf(key_vol_health, sizeof key_vol_health, "vol.%u.health", va);
                 snprintf(key_dom_state, sizeof key_dom_state, "domain.%u.state", topo->vols[i].domain);
                 found = 1;
             }
@@ -575,7 +576,10 @@ int main(int argc, char **argv)
     /* 2. eio on A: the engine fails stop; the server stays (A is in a domain) and A recovers after the heal */
     int64_t a_mid = sa.nacked;
     CHECK(fault("eio", dir_a, NULL) == 0);
-    msleep(4000);
+    /* until the domain is DOWN (state, not a fixed 4 s: the check below means "while A is failing", and a slow
+     * machine that had not noticed yet would pass it for nothing), then a moment for calls already inside A */
+    CHECK(await_status(key_dom_state, "down", 30000) >= 0);
+    msleep(500);
     CHECK(alive());
     CHECK(sa.nacked - a_mid <= 1);
     CHECK(fault("heal", dir_a, NULL) == 0);
@@ -591,7 +595,10 @@ int main(int argc, char **argv)
      * are not on the storage; the server is killed afterwards, so only what reached the disk is left to read */
     int64_t a_drop = sa.nacked;
     CHECK(fault("eiodrop", dir_a, NULL) == 0);
-    msleep(3000);
+    /* until A is seen to fail, not a fixed 3 s: here the domain may stay UP (the volume fail-stops and cannot reopen
+     * over the dropped pages: "reopen failed, will retry"), so the volume's own health says it */
+    CHECK(await_status(key_vol_health, "!available", 30000) >= 0);
+    msleep(500);
     CHECK(alive());
     CHECK(sa.nacked - a_drop <= 1);
     CHECK(fault("heal", dir_a, NULL) == 0);
