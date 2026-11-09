@@ -12,6 +12,9 @@ Update 2026-11-08: step 1 is built (branch ha-s1 on top of cluster-s1) with the 
 the metadata format is snapshot version 2, the peer protocol version 2, the state lives in `--state-dir`, and a
 cluster of an earlier build is initialised again (no mixed versions). Where this document says §2.3 puts hard saves
 on a worker, the hard save is still on the cluster thread (see design-ha-modes.md §7.1, Status).
+*Update 2026-11-09*: the cluster's data path is **production** in 0.11.0 (the user; [design-cluster-data.md](design-cluster-data.md)
+E36): from 0.11.0 on, servers of versions N and N + 1 run together during a rolling upgrade, the metadata and every
+file are upgraded in place, and "initialised again" holds only for 0.10.0's preview group (E37-E41 there).
 
 Decided by the user on 2026-11-05 and not reopened here:
 1. A cluster (for example 8 servers) stays up, and keeps almost all of its performance, when one or two servers go
@@ -46,8 +49,12 @@ Decided by the user on 2026-11-06 (the open questions of the first draft):
 
 Scope: the replicated hot tier. The metadata group, placement, the write path to in-sync replicas, failover and
 fencing, reads, rebuild, the two-servers-down case, room in the 1.0 format and protocol, tests and a build plan.
-**Not here**: erasure coding, shard placement, ISA-L, degraded reads. §9 says only what the hot tier hands to a
-cold tier and what it needs from one.
+~~**Not here**: erasure coding, shard placement, ISA-L, degraded reads.~~ *Reversed on 2026-11-09* by the user
+("cluster should support data replication, preferably using erasure code ... Also support replication with 3
+replicas", for v0.11.0): erasure coding is a per-volume redundancy mode of this replicated mode,
+[design-cluster-data.md](design-cluster-data.md) E1-E23. An EC volume is a volume of this design with m + 1 replicas
+of its young data (its log group) plus an erasure-coded tier for its settled partitions, built on §9's boundary; a
+`replicas=3` volume is this design exactly. §9 says what the hot tier hands to a settled or cold tier.
 
 Related designs: [design-ha-modes.md](design-ha-modes.md) (the two HA modes, what they share, one control plane, the
 combined build plan), [ha.md](ha.md) (shared mode: failover over shared NFS storage, the other HA mode (D3); its
@@ -103,7 +110,7 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 | # | Decision | Rejected | Why |
 |---|---|---|---|
 | C1 | **The volume is the unit** of replication, leadership and placement, as in ha.md D1. A cluster has many: by default 16 led per server (128 on 8 servers), so a lost server's work and its rebuild spread over all the others. | One volume per server; per series; per partition | A series id names its volume (series64), so routing needs no table beyond volume to replicas. One volume per server would put a dead server's whole load on its two replica holders, and rebuild from two sources. Finer units would need a map the size of the data. |
-| C2 | **Metadata in a Raft group of 5 voters** (3 below 5 servers; at most 5 at any size). Other servers are not Raft members: they follow the applied state through a watch stream from any voter. | etcd or ZooKeeper; every server a voter; the NFS lock of ha.md | The user ruled out an external coordinator (ha.md D2). More voters only slow commits. A shared-nothing cluster has no shared lock. 5 voters survive 2 losses, which is the requirement. |
+| C2 | **Metadata in a Raft group of 5 voters** (3 below 5 servers; at most 5 at any size; *amended 2026-11-09*: 2m + 1, at most 9, when a volume is erasure coded with m > 2, [design-cluster-data.md](design-cluster-data.md) E8). Other servers are not Raft members: they follow the applied state through a watch stream from any voter. | etcd or ZooKeeper; every server a voter; the NFS lock of ha.md | The user ruled out an external coordinator (ha.md D2). More voters only slow commits. A shared-nothing cluster has no shared lock. 5 voters survive 2 losses, which is the requirement. |
 | C3 | **The user's Raft core**, copied into `src/raft/` from intellistream-objects at a recorded commit, under Apache 2.0 by the owner's grant (D2, 2026-11-06; §2.3). | Writing a new Raft; linking the other repository | It is sans-IO, tested by a seeded simulator with crashes, torn disks and partitions, has pre-vote, check-quorum, learners, leader transfer and a durable floor. A copy keeps tsdb's build self-contained; a script re-syncs it. |
 | C4 | **Raft is not on the insert path.** Each volume leader replicates to its in-sync set directly (§4, §5). | Raft per volume; majority quorum writes | The user's decision. A majority of 3 cannot write with 2 replicas down; an in-sync set can. |
 | C5 | **The replicated log is the leader's WAL, byte for byte**, in the same segments, plus marker records for everything that is not rows (§4). | Each replica re-framing rows into its own WAL; shipping client frames; a separate control log | Identical bytes need no re-encoding, the existing record checks hold unchanged (they bind a record to its segment and offset), and a replica's memtables match the leader's, so "flush through segment S" means the same everywhere. |
@@ -122,7 +129,7 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 | C18 | **Names stay unique in the whole database** (decided 2026-11-02, confirmed with D4 on 2026-11-06) through **name slots**: a name hashes to one of 65,536 slots; each slot has a home volume, whose leader serialises creation of the slot's names and records every one of them (§3.3). | A name index in Raft; names unique per volume; asking every leader | A billion names do not fit a Raft state machine. Per-volume names reverse the user's decision. Asking every leader cannot stop two concurrent creations. |
 | C19 | **Placement is explicit** in the metadata: replica lists per volume, chosen by a balancing rule (distinct servers, distinct racks, even leaders, even pairs) and changed only by moves (§3.2). | Placement computed from the member list (CRUSH, rendezvous hashing) | A computed placement moves data whenever membership changes, even briefly. Explicit lists move it only when the operator or a permanent loss says so. |
 | C20 | **Rebuild from a hard-linked snapshot** of any ISR member, throttled per server, then catch-up from the leader's retained WAL segments (§8). | Copying only from the leader; replaying a log from the beginning | Spreading sources spreads the load; the WAL is not kept forever. |
-| C21 | **Cold tier: only the boundary here** (§9). A whole partition, settled and idle, is handed over; every replica keeps its granule index locally. | Designing erasure coding inside tsdb now | The user moved the cold tier to its own design; isod may serve it over S3 (see Later). |
+| C21 | ~~**Cold tier: only the boundary here** (§9). A whole partition, settled and idle, is handed over; every replica keeps its granule index locally.~~ **Replaced on 2026-11-09** by [design-cluster-data.md](design-cluster-data.md) E3, E5-E7 and E22: the boundary is now first the volume's own erasure-coded settled tier (a settled partition key's parts, one object per part, by a replace at a cut that needs no idleness), and later an external tier (isod, S3) behind the same calls. | Designing erasure coding inside tsdb now (the rejection of 2026-11-05, reversed by the user on 2026-11-09) | The user moved the cold tier to its own design; isod may serve it over S3 (see Later). Since 2026-11-09 the cluster codes its own settled data (E1). |
 | C22 | **Users and grants live in the metadata group** in a cluster; peer links prove the cluster secret (ha.md D35), and a forwarded request carries the user it was logged in as. | A USERS file per server | Login must work on every server, and a password change must reach all of them. |
 | C23 | **The replication logic is a sans-IO core** (`src/repl.c`) with its own simulator, as the Raft core is (§13.1). | Testing it only end to end | Truncation, epochs and ISR changes are where replicated logs lose data; a simulator explores millions of interleavings that a test cluster never reaches. |
 | C24 | **The cluster is a tsdbd mode** (`--cluster`). The embedded library, a standalone tsdbd and NFS followers stay as they are; a cluster volume refuses a non-cluster open (§12). | A cluster mode in the embedded library | Replication needs peer links, an event loop and timers, which tsdbd has and an application embedding tsdb should not get. |
@@ -312,7 +319,9 @@ Rules, in order:
 The Raft leader computes changes with a deterministic greedy pass over these rules and carries each out as a **move**:
 add a learner on the target, let it catch up (§8), add it to the ISR, then drop the old replica from the list. A
 move never lowers the number of in-sync copies. Moves happen when a server is added (`tsdb cluster node add`), drained
-(`node drain`), or declared lost (`node out`, or down for `out_after_s`, 30 min by default).
+(`node drain`), or declared lost (`node out`, or down for `out_after_s`, 30 min by default; *renamed
+`rebuild_after_s` on 2026-11-09, with operator holds and a mass-OUT guard*, [design-cluster-data.md](design-cluster-data.md)
+E12; an EC volume moves its log replicas this way and its stripe positions by §6 there).
 
 **Leader balance.** When a server comes back and its replicas are in sync again, leadership moves back to the preferred
 leader with a planned transfer: the old leader stops admitting writes to that volume, waits until the target's log end
@@ -483,7 +492,11 @@ they come after the marker and rank above it. That is the same argument as on on
 Deletes and replaces are the same: the tombstone parts (and a replace's rows) are written by the leader and shipped.
 
 A replica that misses a file a `COMMIT` names (it was a learner at step 3, or it lost a `tmp_` file) fetches it from
-the leader before it acknowledges the marker: "durable" for a `COMMIT` means the marker and every file it names. At
+the leader before it acknowledges the marker: "durable" for a `COMMIT` means the marker and every file it names. *Added
+2026-11-09* ([design-cluster-data.md](design-cluster-data.md) review, durability M4): the leader keeps every file a
+marker names, hard linked beside the retained segment that holds the marker, until that segment leaves retention
+(§8.3), so a replica catching up finds it even after the leader merged it away; a replica further behind installs a
+snapshot. At
 open, a cluster replica keeps `tmp_*` files that a marker above the commit floor names; others are removed as today.
 
 ### 5.3 Flushes and segments
@@ -836,7 +849,11 @@ Time: a server's hot replicas are rebuilt on all the others at once. With 2 TB o
 ## 9. The boundary to a cold tier
 
 This section is all the hot tier needs; the cold tier itself (erasure coding, placement of its pieces, reconstruction,
-repair, scrubbing) is a separate design.
+repair, scrubbing) is a separate design. *Since 2026-11-09* that design is [design-cluster-data.md](design-cluster-data.md):
+its settled tier uses this boundary first (the `MK_COLD` marker, the local index file, the swap under
+`publish_lock`, orphan cleanup), with the cluster's own storage servers as the tier, a settle that replaces the
+partition by the leader's bytes instead of waiting for idleness (E5, E6 there), and an `.ec` index file in place of
+`.cold`. An external tier (isod, S3) comes later behind the same calls (E22 there).
 
 ### 9.1 When a partition is cold-eligible
 
@@ -957,7 +974,7 @@ applies to memory as to the rest.
 | A client connect string with several nodes | yes (cheap) | The same client code then works against a cluster. |
 | The 32-byte INSERT_VALUES header with `vol`, `epoch`, `attempt`, `seq` (ha.md §9) | no: 1.x, by HELLO version | A server can accept both headers by version. Without it a 1.0 client gets at-least-once without the stream ordering rule. |
 | TOPOLOGY, the insert reply position, `min_pos` on queries, `REPLICA_OK` | no: 1.x | New ops and longer forms, gated on HELLO, as earlier versions did. |
-| Peer-link protocol | no | Between servers of one version only (a rolling upgrade is a later design). |
+| Peer-link protocol | no | Between servers of one version only (a rolling upgrade is a later design). *Since 2026-11-09*: versions N and N + 1 negotiate per link and a cluster version gates new messages ([design-cluster-data.md](design-cluster-data.md) E37). |
 
 ## 12. What stays single-server
 
@@ -1101,7 +1118,8 @@ estimates, is [design-ha-modes.md](design-ha-modes.md) §7; how this plan's step
 - Shipping merged parts instead of merging on every replica, if the merge CPU measured in §10.3 hurts and the network
   has room (100 GbE).
 - Rebuilding a returning replica partially, from the part position ranges, when its absence outlived the retained WAL.
-- A rolling upgrade protocol for the peer links.
+- ~~A rolling upgrade protocol for the peer links.~~ In 0.11.0 since 2026-11-09 ([design-cluster-data.md](design-cluster-data.md)
+  E37-E41, §14.1).
 - A local cache of cold granules on replicas.
 - A read lease from the ISR rather than the Raft leader, so that leader reads go on while the Raft majority is lost:
   each ISR member promises the leader not to answer a FENCE for a higher epoch until `lease_ms × (1 + drift)` after its
