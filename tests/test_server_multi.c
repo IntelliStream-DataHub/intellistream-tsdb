@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 
@@ -320,6 +321,18 @@ static void raw_send(int fd, uint32_t id, uint8_t op, const void *p, size_t len)
     h[8] = op;
     CHECK(send(fd, h, 9, MSG_NOSIGNAL) == 9);
     CHECK(len == 0 || send(fd, p, len, MSG_NOSIGNAL) == (ssize_t)len);
+}
+
+/* Frames meant to arrive together: with the socket corked the writes leave as one segment when it is uncorked, so
+ * a server that acts on the first frame before it has read the next cannot be helped by Nagle's delay (without
+ * TCP_CORK, as on macOS, the frames may still go out one by one: the check then proves less, never more). */
+static void raw_cork(int fd, int on)
+{
+#ifdef TCP_CORK
+    setsockopt(fd, IPPROTO_TCP, TCP_CORK, &on, sizeof on);
+#else
+    (void)fd, (void)on;
+#endif
 }
 
 static bool read_full(int fd, void *p, size_t n)
@@ -820,6 +833,7 @@ static void test_cancel_pipeline(void)
 {
     int fd = raw_connect();
     tsdb_sid a[4] = {big_id, big_id, ids[0], big_id}, b[2] = {ids[1], ids[2]};
+    raw_cork(fd, 1); /* request 2 is cancelled while it still waits behind request 1: they must arrive together */
     raw_values_multi(fd, 1, a, 4);
     raw_values_multi(fd, 2, b, 2);
     uint8_t t[33];
@@ -828,6 +842,7 @@ static void test_cancel_pipeline(void)
     uint32_t cid = 2, nobody = 77;
     raw_send(fd, 2, TSDB_OP_CANCEL, &cid, 4);
     raw_send(fd, 77, TSDB_OP_CANCEL, &nobody, 4);
+    raw_cork(fd, 0);
     uint32_t answered = 99, seen = 0;
     CHECK(read_to_end(fd, 1, &answered, &seen) == 0 && answered == 4 && seen == 4);
     CHECK(read_to_end(fd, 2, &answered, &seen) == TSDB_ERR_STOPPED && answered == 0 && seen == 0);

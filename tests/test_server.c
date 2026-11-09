@@ -162,6 +162,18 @@ static void raw_send(int fd, uint32_t id, uint8_t op, const void *payload, uint3
     CHECK(len == 0 || write(fd, payload, len) == (ssize_t)len);
 }
 
+/* Frames meant to arrive together: with the socket corked the writes leave as one segment when it is uncorked, so
+ * a server that acts on the first frame before it has read the next cannot be helped by Nagle's delay (without
+ * TCP_CORK, as on macOS, the frames may still go out one by one: the check then proves less, never more). */
+static void raw_cork(int fd, int on)
+{
+#ifdef TCP_CORK
+    setsockopt(fd, IPPROTO_TCP, TCP_CORK, &on, sizeof on);
+#else
+    (void)fd, (void)on;
+#endif
+}
+
 static bool read_full(int fd, void *p, size_t n)
 {
     for (size_t got = 0; got < n;) {
@@ -280,8 +292,10 @@ static void test_hello(void)
     for (int k = 0; k < 3; k++) {
         fd = raw_connect();
         /* a request behind the refused HELLO, in the same segment: never answered */
+        raw_cork(fd, 1);
         raw_send(fd, 80, TSDB_OP_HELLO, &old[k], 4);
         raw_send(fd, 81, TSDB_OP_STATS, NULL, 0);
+        raw_cork(fd, 0);
         uint32_t rid;
         uint8_t rest[16];
         size_t nrest = 0;
