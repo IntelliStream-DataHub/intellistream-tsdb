@@ -12,6 +12,10 @@
  *               it, and a loss of the promoted member's disk then stranded the volume: sim seed 76).
  *   unanswered  the new leader drops a kept member that does not ACK within unanswered_ticks, long before isr_lag
  *               (MUT(37)); the simulator cannot see this: it costs time, not safety.
+ *   open_damage a log reopened with an epoch history or a floor that cannot be right fails at once (the branches of
+ *               repl_open that nothing reached).
+ *   follower_damage a follower fails, never repairs, when the leader's log differs from its own below the verified end
+ *               (MUT(30)), or a cut would pass its applied end or a position its log no longer retains.
  *   round       a cut can fall inside a record: a replica whose last epoch the leader lacks cuts at the end of the
  *               leader's epoch before it, inside an older epoch's record that only the replica has.
  */
@@ -225,6 +229,128 @@ static void cut_applied(void)
     repl_free(r);
 }
 
+/* A replica reopened on a log that cannot be right is failed at once (damage is never silent): an epoch history
+ * that is not increasing, starts at 0 or past the log, a floor above the log's end. The sound log opens first, so
+ * each refusal is about the one value changed. */
+static void open_damage(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    fill(&d, 101, 200, 2, 1);
+    struct repl_config c = config(1, &d);
+    struct repl_epoch good[2] = {{.epoch = 1, .start = 1}, {.epoch = 2, .start = 101}};
+    struct repl_durable du = {.rid = 22, .fence = 2, .floor = 150, .log_start = 1, .log_end = 200, .hist = good,
+                              .nhist = 2};
+    struct repl *r = repl_open(&c, &du);
+    CHECK(r && !repl_failed(r), "a sound log is refused");
+    repl_free(r);
+    struct {
+        const char *what;
+        struct repl_epoch h[2];
+        uint64_t floor;
+    } bad[] = {
+        {"epochs not increasing", {{.epoch = 2, .start = 1}, {.epoch = 2, .start = 101}}, 150},
+        {"starts not increasing", {{.epoch = 1, .start = 101}, {.epoch = 2, .start = 101}}, 150},
+        {"a start of 0", {{.epoch = 1, .start = 0}, {.epoch = 2, .start = 101}}, 150},
+        {"a start past the log's end", {{.epoch = 1, .start = 1}, {.epoch = 2, .start = 201}}, 150},
+        {"the floor above the log's end", {{.epoch = 1, .start = 1}, {.epoch = 2, .start = 101}}, 201},
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        struct repl_durable x = du;
+        x.hist = bad[i].h;
+        x.floor = bad[i].floor;
+        r = repl_open(&c, &x);
+        CHECK(r && repl_failed(r), "%s: the log is accepted", bad[i].what);
+        repl_free(r);
+    }
+}
+
+/* A replica with log 1..`end` (epoch 1; 1..`applied` applied, `start` the first retained position), told that
+ * node 0 leads epoch 3. With `answered` the leader's answer says the logs agree, so the replica follows. */
+static struct repl *follower(struct drv *d, uint64_t end, uint64_t applied, uint64_t start, int answered)
+{
+    memset(d, 0, sizeof *d);
+    fill(d, 1, end, 1, 1);
+    d->start = start;
+    static struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    static struct repl_config c;
+    c = config(1, d);
+    struct repl_durable du = {.rid = 22, .fence = 1, .floor = applied, .log_start = start, .log_end = end, .hist = h,
+                              .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    if (!r)
+        return NULL;
+    struct repl_msg m = meta_msg(1, 3, 0, 0x3, 0);
+    repl_recv(r, &m);
+    drain(r, d, NULL);
+    if (answered) {
+        struct repl_msg an = {.type = REPL_M_ANSWER, .from = 0, .to = 1, .epoch = 3, .leader = 0, .last_epoch = 1,
+                              .written = end, .prev_epoch = 1, .prev_pos = end, .end = 1};
+        repl_recv(r, &an);
+        drain(r, d, NULL);
+    }
+    return r;
+}
+
+/* The follower fails (never repairs, never skips) when the leader's log differs from its own below the verified end,
+ * and when a cut would pass its applied end or a position its log no longer retains. */
+static void follower_damage(void)
+{
+    static struct drv d;
+    struct repl *r = follower(&d, 10, 5, 1, 1);
+    CHECK(r && !repl_failed(r), "the follower did not start");
+    /* Control: an append that continues the log is taken. */
+    struct repl_rec ok[1] = {{.pos = 11, .epoch = 3, .n = 1}};
+    struct repl_msg ap = {.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 3, .prev_pos = 10, .prev_epoch = 1,
+                          .nrec = 1, .rec = ok, .commit = 5};
+    repl_recv(r, &ap);
+    drain(r, &d, NULL);
+    CHECK(!repl_failed(r) && repl_written(r) == 11, "an append that continues the log was refused (written %" PRIu64
+          ")", (uint64_t)repl_written(r));
+    /* The leader says position 5 is in epoch 2 while ours has epoch 1 there: another epoch at a position both logs
+     * hold is damage, never a cut (MUT(30) lets it pass). */
+    ap = (struct repl_msg){.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 3, .prev_pos = 5, .prev_epoch = 2,
+                           .commit = 5};
+    repl_recv(r, &ap);
+    drain(r, &d, NULL);
+    CHECK(repl_failed(r), "an append whose previous record is of another epoch than ours there was accepted");
+    CHECK(find_act(&d, REPL_A_FAIL, 0), "no FAIL action");
+    repl_free(r);
+
+    /* A record at a position we hold, of another epoch. */
+    r = follower(&d, 10, 5, 1, 1);
+    CHECK(r && !repl_failed(r), "the follower did not start (2)");
+    struct repl_rec other[1] = {{.pos = 7, .epoch = 2, .n = 1}};
+    ap = (struct repl_msg){.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 3, .prev_pos = 0, .prev_epoch = 0,
+                           .nrec = 1, .rec = other, .commit = 5};
+    repl_recv(r, &ap);
+    drain(r, &d, NULL);
+    CHECK(repl_failed(r), "a record of another epoch at a position we hold was accepted");
+    repl_free(r);
+
+    /* A leader whose epoch 1 ends below our applied end: the cut would drop applied records. */
+    r = follower(&d, 1000, 1000, 1001, 0);
+    CHECK(r && !repl_failed(r), "the follower did not start (3)");
+    struct repl_msg an = {.type = REPL_M_ANSWER, .from = 0, .to = 1, .epoch = 3, .leader = 0, .last_epoch = 1,
+                          .written = 900, .prev_epoch = 1, .prev_pos = 1000, .end = 1};
+    repl_recv(r, &an);
+    drain(r, &d, NULL);
+    CHECK(repl_failed(r), "a cut below the applied end was not refused");
+    repl_free(r);
+
+    /* A cut above the applied end, to a position the log no longer retains (it was trimmed under the replica). */
+    r = follower(&d, 1010, 1000, 1001, 0);
+    CHECK(r && !repl_failed(r), "the follower did not start (4)");
+    d.start = 1006;
+    an.written = 1005;
+    an.prev_pos = 1010;
+    repl_recv(r, &an);
+    drain(r, &d, NULL);
+    CHECK(repl_failed(r), "a cut to a position the log does not retain was not refused");
+    repl_free(r);
+}
+
 static void sync_cut(void)
 {
     static struct drv d;
@@ -394,6 +520,8 @@ int main(int argc, char **argv)
     }
 #endif
     trim();
+    open_damage();
+    follower_damage();
     cut_applied();
     sync_cut();
     promote();
