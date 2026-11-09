@@ -691,7 +691,7 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | N5 | shared | Grant and abandon (ha.md step 4): poison, drain, the abort rule | 1 | 2 (crashfs EIO) | N0 |
 | N6 | shared | NFS backend (ha.md step 5): OFD lock, chaining, read-back, RECHECK, read barrier, `fence_gen`, ack gate, SUSPECT | 2-3 | 3 (test_failover both FENCE) + 8 on a test NFS server | N0; a test NFS server |
 | S2 | both | tsdbd peer links (cluster secret), TOPOLOGY from the metadata copy, forwarding (ha.md §9.1 without `OWNERS`), users in the metadata group. Admission is N1's | 2-3 | 3 (test_server, forwarding, tsdbc-bench) | — |
-| S4 | both | Name slots: creation and lookup by name, slot chains and two-phase moves (§5.7, M19); the cross-volume slot index for replicated mode only | 1-2 | in N7's jepsen-ha | — |
+| S4 | both | Name slots: creation and lookup by name, slot chains and two-phase moves (§5.7, M19); the cross-volume slot index for replicated mode only | 1-2 | in N7's jepsen-ha; *for 0.11.0 (2026-11-09), where N7 is not: 4, its own jepsen-cluster run with name creation* | — |
 | N7 | shared | Shared-mode HA manager: grants to claims (§5.5), `CLAIM` with its counter, `CLAIM_REFUSED`, `CLAIM_FAILED`, clean, shortened and stuck release, M6 moves, reservations and drops (indeterminate proposals), the cold open after every outage and the claim at the reserved epoch (M17, M18), rollback detection by positions, `tsdb cluster adopt`, `restore` and `domain rolled-back`, the shared-mode CLI (§8), watchdog and escalation (ha.md §8, §15.2) | 4-6 | 16-28 (`make jepsen-ha`: kill, power, pause, partition, NFS restart, local NFS fault, wedged domain, U4 broken by a fake nfsd, pool rollback with creations, and the cases of §6.4 added in verification) | — |
 | N8 | shared | Real NFS/RDMA runs (ha.md §13 a-h, §15 manual runs), takeover timings (U10), the read barrier's cost (V6), operator guide and runbooks (§8) | 2 | 2-3 days of runs | **maintenance windows**; a pool that may be rolled back |
 | S3 | both | Clients (design-cluster.md step 6): direct mode, streams, the 32-byte header, QUERY_MULTI split; Pulsar sink | 3 | 4 (test-clients, integration with failover) | — |
@@ -699,13 +699,16 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | R2 | replicated | Engine replica mode (step 3); the marker backend of the journal hook | 2-4 | 6 (jepsen) | — |
 | R3 | replicated | Replication, ISR, promotion and leases in tsdbd (step 4 without what S2 built) | 3-4 | 12 (jepsen-cluster: kill, partition, pause, midcommit) | servers with disks |
 | R4 | replicated | Rebuild, catch-up, moves, leader balance (step 7) | 2-3 | 12 (jepsen-cluster: kill2, rebuild, slow) | servers with disks |
-| R5 | replicated | EC codec (`src/ec/`), CPU dispatch, `test_rs`, `build/ec-bench` ([design-cluster-data.md](design-cluster-data.md) §11, added 2026-11-09) | 1-2 | numbers on three CPUs | the licence grant (open question 1 there) |
-| R6 | replicated | Object layout, chunk files, local chunk store, directory backend, range decode, fuzzers | 2 | 2 (fuzz) | — |
-| R7 | replicated | Engine: `.ec` parts, read seam and granule cache, the settle as a replace, re-encode; **takes X1's cold boundary** | 3-4 | 6 (jepsen, directory backend) | — |
-| R8 | replicated | tsdbd: server roles (compute, storage, both), chunk peer messages, epoch fences, degraded reads, orphan GC, metadata v3, `TSDB_WHY_LOST` in the four clients | 3-4 | 12 (jepsen-cluster on 4+2 and 16+4) | — |
-| R9 | replicated | DOWN/OUT at `rebuild_after`, holds, mass-OUT guard, stripe rebuild by priority, moves, balancer; `sim_place` | 3-4 | 24 (jepsen-cluster on 4 geometries; sim_place soak) | servers with disks for the timings |
-| R10 | replicated | Redundancy change on a running volume | 2-3 | 6 | — |
-| R11 | replicated | Benchmarks per mode, operator guide, README, AGENTS.md | 1-2 | the benchmarks, quiet machine | — |
+| R5 | replicated | EC codec (`src/ec/`, a patched copy), CPU dispatch in `src/cpu.c`, `test_rs`, `build/ec-bench` ([design-cluster-data.md](design-cluster-data.md) §11, added 2026-11-09, re-estimated after its review the same day) | 1-2 | numbers on three CPUs | the licence grant (open question 1 there) |
+| R6 | replicated | Object layout, chunk files (writer epoch, cell sums), chunk stores per disk, directory backend, range decode, fuzzers | 2-3 | 2 (fuzz) | — |
+| R7 | replicated | Engine: `.ec` parts, read seam and granule cache, the settle at a cut (gate, `ppos`, intent, DIVERGED), encode-time checks and `MK_DIGEST`, per-part and coarse settles, re-encode; **takes X1's cold boundary** | 5-7 | 8 (jepsen, directory backend, writes into settling keys) | R2 |
+| R8 | replicated | tsdbd: server roles (compute, storage, both), chunk peer messages, durable epoch fences, `MK_GC` and orphan rules, degraded reads with hedging limits, metadata v3, both margins in TOPOLOGY, unavailable/corrupt/lost, `TSDB_WHY_LOST` in the four clients | 6-8 | 12 (jepsen-cluster on 4+2 and 16+4, partial partitions) | R3, S2 |
+| R9 | replicated | DOWN/OUT at `rebuild_after`, bounded holds and guard, degraded settles, retention for DOWN members, backpressure, checked rebuild paced by margin, return during rebuild, `node replace`, moves, balancer; `sim_place` with MTTDL | 6-8 | 24 (jepsen-cluster on 4 geometries; sim_place soak) | R4, R8; servers with disks for the timings |
+| R12 | replicated | Scrub of chunks, `.ec` files and young parts; damage counts | 2 | 6 (rot, then m failures) | R8 |
+| R13 | replicated | Chunk stores per disk: device DOWN/OUT, `disk out`/`replace` | 2-3 | 6 (single-disk loss) | R8 |
+| R14 | replicated | Operator CLI and metrics for the cluster data path | 2 | — (test_server) | — |
+| R10 | replicated | Redundancy change on a running volume; **the first step to move to 0.12** (open question 2 there) | 3 | 6 | — |
+| R11 | replicated | Benchmarks per mode (NVMe and HDD storage), operator guide with sizing rules, README, AGENTS.md | 2 | the benchmarks, quiet machine | — |
 | X1 | both | Cold-tier boundary (step 8); a shared volume hands partitions over the same way. *Since 2026-11-09 folded into R7 for replicated mode; what remains is the shared-volume hand-over and an external tier, after 0.11.0* | 2 | 4 (midcommit at the move) | — |
 | X3 | both | Measurements and docs: README section, AGENTS.md invariants and lock order, operator guides | 1-2 | the benchmarks, quiet machine | — |
 
@@ -733,14 +736,17 @@ follow it; until then clients reach owners through forwarding. N1 also ships on 
    waits for N0.
    *Changed on 2026-11-09* (the user: data redundancy with erasure coding and 3 replicas, volume moves and failover
    "will go in v0.11.0"; [design-cluster-data.md](design-cluster-data.md) E23, its open question 2): **v0.11.0 holds
-   replicated mode's data path**: the rest of S1, S2, S4, R2-R4 and R5-R11 (R5 and R6 can start at once, R7 after
-   R2, R8 after R3 and S2), about 29-42 track-days. Replicated mode no longer waits for N7; shared mode's N-steps go
+   replicated mode's data path**: the rest of S1, S2, S4, R2-R4 and R5-R14 (R5 and R6 can start at once, R7 after
+   R2, R8 after R3 and S2, R9 after R4 and R8), about 44-60 track-days and 107 gate hours (re-estimated after the
+   review of design-cluster-data.md; 41-57 if R10 moves to 0.12). Replicated mode no longer waits for N7; shared mode's N-steps go
    on in parallel on their own tracks and their maintenance windows. M21's minimum production HA set is unchanged.
 
 **Totals** (restated in verification; the first revision's sum left N1 out and did not add up). Minimum production HA:
 S0 2-3, N0 0.5, N1 4-6, N2 1, N3 1-2, N4 3-5, N5 1, N6 2-3, S1 3-4, S2 2-3, S4 1-2, N7 4-6, N8 2: **about 27-39
 track-days**, which on three tracks is roughly 2-3 weeks of calendar if the maintenance windows come in time. Then R1-R4
-for replicated mode, 8-13 track-days, and X1 and X3, 3-4. Gate time for the minimum: about 68-88 machine-hours of
+for replicated mode, 8-13 track-days, and X1 and X3, 3-4. *Since 2026-11-09* replicated mode no longer comes after the
+minimum: v0.11.0 holds S1, S2 and S4 with R2-R14 (R1 goes on), about 44-60 track-days and 107 gate hours (about 4.5
+machine-days before reruns; [design-cluster-data.md](design-cluster-data.md) §11), and X1 is folded into R7. Gate time for the minimum: about 68-88 machine-hours of
 gates plus N8's 2-3 days of real NFS runs, **about 5-7 machine-days**, mostly jepsen-ha and the NFS runs. The calendar
 is set by the two maintenance windows (N0 and N8) and the review rounds, not by building.
 
