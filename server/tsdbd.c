@@ -1814,6 +1814,9 @@ static void handle_status(req *r)
 }
 
 static void handle_op(req *r);
+/* Tests (TSDBD_TEST_AUTH_DELAY_MS): a worker that answered TSDB_ERR_AUTH waits that long before it reports done, the
+ * window in which the client's next frame arrives (a preempted worker on a busy CI machine); test_auth. */
+static int test_auth_delay_ms;
 static void handle(req *r)
 {
     conn *c = r->c;
@@ -1831,6 +1834,10 @@ static void handle(req *r)
             atomic_store(&c->auth_end, true);
         }
         reply_error(c, r->id, r->op, rc);
+        if (rc == TSDB_ERR_AUTH && test_auth_delay_ms > 0) { /* tests: this worker, preempted before its done note */
+            struct timespec d = {test_auth_delay_ms / 1000, (long)(test_auth_delay_ms % 1000) * 1000000};
+            nanosleep(&d, NULL);
+        }
         return;
     }
     unav_vol = req_volume(r->op, p, len);
@@ -2832,6 +2839,16 @@ static int parse(conn *c)
     size_t off = 0;
     int rc = 0;
     bool consumed = false;
+    if (atomic_load(&c->auth_end)) {
+        /* A worker set auth_end before it sent TSDB_ERR_AUTH (a failed login, a dropped user), so a client that
+         * has read that answer cannot have a frame parsed any more: the connection closes, as take_notes does
+         * once the worker's done note arrives. Without this the frame sent in the window between the reply and
+         * the note was answered AUTH again, and the connection stayed open as long as the client kept sending. */
+        c->eof = true;
+        c->in.len = 0;
+        c->frame_t0 = 0;
+        return 0;
+    }
     while (c->in.len - off >= 4) {
         uint32_t flen;
         memcpy(&flen, c->in.p + off, 4);
@@ -3876,6 +3893,8 @@ int main(int argc, char **argv)
     }
     if (getenv("TSDBD_TEST_HOLD_LARGE_MS") && (hold_large_ms = atoi(getenv("TSDBD_TEST_HOLD_LARGE_MS"))) > 0)
         tsdb_test_precommit(db, hold_large, NULL);
+    if (getenv("TSDBD_TEST_AUTH_DELAY_MS"))
+        test_auth_delay_ms = atoi(getenv("TSDBD_TEST_AUTH_DELAY_MS"));
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
         rl.rlim_cur = rl.rlim_max; /* one descriptor per connection */
