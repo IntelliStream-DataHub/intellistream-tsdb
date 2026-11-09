@@ -23,7 +23,8 @@ for args in "" help --help -h; do
     for want in "usage: tsdb cluster secret FILE" "tsdb cluster init PEER" "tsdb cluster node add PEER NEW_PEER" \
         "tsdb cluster status PEER" "--secret-file" "--node-timeout-ms" "--voter-replace-s" "--mode replicated|shared" \
         "--failover lease|attested|bmc" "--read-barrier on|off" "--lease-s" "--replication" "--min-isr" \
-        "--heartbeat-ms" "--isr-lag-ms" "--out-after-s" "--voters" "--volumes-per-server" "docs/cluster-preview.md"; do
+        "--heartbeat-ms" "--isr-lag-ms" "--out-after-s" "--voters" "--volumes-per-server" "docs/cluster-preview.md" \
+        "marked out [1800] (stored, not acted on yet)"; do
         case $out in *"$want"*) ;; *) echo "FAIL tsdb cluster $args: no '$want' in the help"; fail=1 ;; esac
     done
     case $out in *"usage: tsdb <dir> <command>"*) echo "FAIL tsdb cluster $args: the general usage"; fail=1 ;; esac

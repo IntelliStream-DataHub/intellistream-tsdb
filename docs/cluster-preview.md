@@ -36,8 +36,9 @@ If you do not use `--cluster`, none of this runs, and nothing about your server 
 ## What you need
 
 - A checkout of tsdb, built with `make` (the first step below does it). Linux. No root.
-- Four free ports for the servers' client side (17081 to 17084) and four for their peer side (17091 to 17094), on
-  `127.0.0.1`. If something else uses one of them, change the numbers in the two lines marked `# ports` in step 3.
+- Three free ports for the servers' client side (17081 to 17083; the witness of step 9 has none) and four for their
+  peer side (17091 to 17094), on `127.0.0.1`. If something else uses one of them, change the numbers in the two
+  lines marked `# ports` in step 3: they are the only place where the block writes a port.
 - Nothing else. The block only writes under `/tmp/tsdb-cluster`.
 
 ## The tutorial
@@ -59,16 +60,17 @@ build/tsdb cluster secret $D/secret
 
 # 3. Helpers. A "node" is a server with its own data directory (n1/data) and its own state directory (n1/state).
 #    The state directory holds the cluster's own files and must be on a local disk, never on NFS.
-#    Node N listens for clients on port 1708N and for the other servers on port 1709N.
+#    Node N listens for clients on port 1708N and for the other servers on port 1709N (the two lines marked ports).
 #    --no-auth: no login, because users are still per server in the preview. Fine on 127.0.0.1, nowhere else.
 #    A witness (node 4) has no data directory and no client port.
-peer() { echo 127.0.0.1:1709$1; }          # ports: the peer address of node N
 port() { echo 1708$1; }                    # ports: the client port of node N
+pport() { echo 1709$1; }                   # ports: the peer port of node N
+peer() { echo 127.0.0.1:$(pport $1); }     # the peer address of node N
 start_node() {                             # start_node N [witness]: start a server, remember its process id
     mkdir -p $D/n$1/state
     if [ "${2:-}" = witness ]; then role="--witness --advertise 127.0.0.1"
-    else mkdir -p $D/n$1/data; role="--dir $D/n$1/data --no-auth --port 1708$1"; fi
-    build/tsdbd $role --state-dir $D/n$1/state --peer-port 1709$1 \
+    else mkdir -p $D/n$1/data; role="--dir $D/n$1/data --no-auth --port $(port $1)"; fi
+    build/tsdbd $role --state-dir $D/n$1/state --peer-port $(pport $1) \
         --cluster --cluster-secret-file $D/secret --rack rack$1 >> $D/n$1/log 2>&1 &
     echo $! > $D/n$1/pid
 }
@@ -97,8 +99,9 @@ build/client-example 127.0.0.1 $(port 1)
 build/tsdb $D/n1/data series | cut -f1,2
 echo "node 2 has $(build/tsdb $D/n2/data series | wc -l) series"
 
-# 7. Kill the leader, as a crash would (kill -9, by its process id). The others notice after three seconds without
-#    its heartbeat, elect a new leader, and mark the dead node down. Ask a survivor.
+# 7. Kill the leader, as a crash would (kill -9, by its process id). The others elect a new leader, and once that
+#    one has led for three seconds (node_timeout_ms) without a heartbeat from the dead node, it marks the node down.
+#    Ask a survivor.
 leader=$(status 2 | awk 'NR == 1 { print $10 }')
 other=$(( leader % 3 + 1 ))
 echo "node $leader is the leader: stopping it"
@@ -132,8 +135,8 @@ rm -rf $D
 ## What you should see
 
 The lines below come from a real run. Yours differ in the places the test ignores: the cluster's id (a random
-number), the times after `heard`, the term and commit numbers, and which node leads. The test compares every
-other line of this page with the real output.
+number), the times after `heard`, the term and commit numbers, and which node leads (so which member the kill of step 7 hits, with its
+rack). The test compares every other line of this page with the real output.
 
 Step 2 writes the secret:
 
@@ -240,8 +243,9 @@ tsdbd: cluster: proposes node 1 up (incarnation 2)
 ```
 
 Why the dead node is `down` only after a few seconds: a server is marked down when the leader has not heard its
-heartbeat for `node_timeout_ms` (3 s by default). In that time the survivors also elect the new leader. Step 7's
-`wait_for` waits for the `down` line, so by then a new leader exists.
+heartbeat for `node_timeout_ms` (3 s by default). The survivors first elect a new leader, and the new leader marks the
+node `down` once it has itself led for `node_timeout_ms`, so the `down` comes a few seconds after the election, not at
+the moment of the kill. Step 7's `wait_for` waits for the `down` line, so by then a new leader exists.
 
 ## How to read `status`
 
@@ -255,7 +259,7 @@ line until the group has confirmed it.
 | `stale ...` | This is the copy this server saved before a restart; no one has confirmed it yet. |
 | `cluster UUID replication ... lease_s ...` | The cluster's id and its settings (`init` fixes them; see the reference below). |
 | `group voters 1,2,3 learners -` | Who votes, and who is catching up to join the vote. |
-| `member N STATE incarnation I addr A peer P rack R heard H feed F voter_ok V volumes_ok W core_dropped D read_barrier B` | One line per member. `STATE`: `up`, `down`, `draining` or `out`. `I`: how many times this member has started (it goes up at every restart). `A`: where clients reach it. `P`: where servers reach it. `R`, `F`: its `--rack` and `--power-feed`, `-` for none. `H`: how long ago the server you asked last heard from it. `V`, `W`: whether it may vote and may hold volumes (1/0; a witness has `volumes_ok 0`). `D`: 1 when its Raft core was dropped after a log fault (it goes on as a watcher). `B`: its read barrier setting; `?` when you have not heard it yet. |
+| `member N STATE incarnation I addr A peer P rack R heard H feed F voter_ok V volumes_ok W core_dropped D read_barrier B` | One line per member. `STATE`: `up` or `down` (the group also knows `draining` and `out`, which nothing sets in the preview). `I`: how many times this member has started (it goes up at every restart). `A`: where clients reach it. `P`: where servers reach it. `R`, `F`: its `--rack` and `--power-feed`, `-` for none. `H`: how long ago the server you asked last heard from it. `V`, `W`: whether it may vote and may hold volumes (1/0; a witness has `volumes_ok 0`). `D`: 1 when its Raft core was dropped after a log fault (it goes on as a watcher). `B`: its read barrier setting; `?` when you have not heard it yet. |
 | `volume-report ...`, `domain-report ...` | Per member, what it says about its volumes and storage domains. Empty in the preview: no volumes exist. |
 | `volumes N users M` | How many volumes and users the group holds. Always 0 in the preview. |
 
@@ -266,15 +270,17 @@ more (at most `--voters`). A member that does not vote watches.
 
 - **`cannot connect to ...: Connection refused`**: the server is not running (yet), or the address is wrong. Look at
   `/tmp/tsdb-cluster/n1/log`. A client port or peer port that is taken shows there as "cannot listen"; change the
-  numbers in step 3.
+  numbers in the two lines of step 3 marked `# ports`, and nothing else.
 - **`... is not a cluster peer port with this secret`**: the address is not a server's peer port (a client port, say),
   or the secret file differs from the one the server was started with.
 - **`the secret file ... is open to its group or to others: refused`**: `chmod 600` it. `tsdb cluster secret FILE`
   makes a file with the right mode.
 - **`the server is already in a cluster`** (from `init`): that server has a cluster already. To start over, stop it,
   remove its state directory and start it again.
-- **`the new server did not answer`** (from `node add`): the server at `NEW_PEER` is not running with `--cluster`
-  with the same secret, or it is a member of a cluster already.
+- **`the new server did not answer`** (from `node add`): the server at `NEW_PEER` is not running, or not running
+  with `--cluster` and the same secret.
+- **`the new server belongs to another cluster or has another id`** (from `node add`): the server at `NEW_PEER` is a
+  member of a cluster already. To use it here, stop it, remove its state directory and start it again.
 - **`--state-dir ... on NFS`**: the cluster's files must be on a local file system.
 - **The block fails in the middle and servers keep running**: stop them by process id:
   `for n in 1 2 3 4; do kill $(cat /tmp/tsdb-cluster/n$n/pid); done`. Do not use `pkill` or `killall`: they stop every
@@ -322,7 +328,8 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 | `tsdb cluster status PEER --secret-file F` | What that server knows (see above). |
 
 Options of `init`. Each number is a whole number above 0. The settings are stored and shown; in the preview nothing acts on
-those about volumes and failover yet.
+those about volumes and failover yet. Members are only `up` or `down` in the preview: `draining` and `out` are
+for later.
 
 | Option | Default | Meaning |
 |---|---:|---|
@@ -330,8 +337,8 @@ those about volumes and failover yet.
 | `--min-isr N` | 1 | Copies that must be in sync for a write to count. At most `--replication`. |
 | `--node-timeout-ms MS` | 3000 | A server is marked down after this long without a heartbeat. |
 | `--heartbeat-ms MS` | 500 | How often servers report. Below `--node-timeout-ms`. |
-| `--isr-lag-ms MS` | 1000 | A copy this far behind leaves the in-sync set. |
-| `--out-after-s S` | 1800 | A server down this long is marked `out`. |
+| `--isr-lag-ms MS` | 1000 | A copy this far behind leaves the in-sync set. Stored; nothing acts on it in the preview. |
+| `--out-after-s S` | 1800 | A server down this long is marked `out`. Stored; in the preview no server is ever marked `out`. |
 | `--voter-replace-s S` | 600 | A voter down this long is replaced by another member. |
 | `--voters N` | 5 | The most voters the group has (an even number counts as one less). |
 | `--volumes-per-server N` | 16 | Volumes led per server. |
@@ -347,11 +354,12 @@ others). They are not built: `tsdb cluster` prints what exists.
 
 The preview is the first step of a longer plan. The designs are written; the work is in this order:
 
-- **The metadata group, finished** (S1, S2, S4): the proposer's rules for ownership and the time rules, the servers'
-  links to each other and routing of requests, users and grants kept in the group, and names that are unique
-  across the cluster.
-- **Shared mode** (N0 to N8): failover on NFS storage with one writer per volume, fenced by the group (the design of
-  [ha.md](ha.md)); this is what production on NFSv4 needs first.
+- **The metadata group, finished** (S2, S4): the servers' links to each other and routing of requests, users and
+  grants kept in the group, and names that are unique across the cluster. The group's state machine (S1) and what a
+  single server does while its storage is away (UNAVAILABLE, in N1) are already in 0.10.0; the proposer's rules for
+  ownership and the time rules come with N7.
+- **Shared mode** (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume,
+  fenced by the group (the design of [ha.md](ha.md)); this is what production on NFSv4 needs first.
 - **Replicated mode** (R1 to R4): each volume on three servers with their own disks, with replication, the in-sync set,
   promotion and rebuild. Raft stays off the insert path.
 - Then clients that talk to the owner directly, and a cold tier.

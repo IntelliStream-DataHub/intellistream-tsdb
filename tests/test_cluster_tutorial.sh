@@ -6,10 +6,11 @@
 # The block is the first fenced block after the "<!-- cluster-tutorial" marker. Four things are changed in a copy of
 # it, nothing else:
 #   /tmp/tsdb-cluster   becomes a fresh scratch directory;
-#   the two port numbers of a node (--port 1708$1, --peer-port 1709$1) become --port 0 and --peer-port 0 with a port
-#       file and --exit-with-parent=$$ (the shell that runs the block): AGENTS.md "Ports", a server picks its port, a
-#       test never does, and a test killed by its timeout leaves no server behind;
-#   the two helper lines marked "# ports" (peer address and client port of node N) read the port file instead;
+#   the two port numbers of a node (--port $(port $1), --peer-port $(pport $1)) become --port 0 and --peer-port 0 with
+#       a port file and --exit-with-parent=$$ (the shell that runs the block): AGENTS.md "Ports", a server picks its
+#       port, a test never does, and a test killed by its timeout leaves no server behind;
+#   the two helper lines marked "# ports" (client port and peer port of node N) read the port file instead (the
+#       page says that these two lines are the only place to change a port, so nothing else may name one);
 #   build/ becomes $B/ (B=build-tsan for a sanitizer build).
 # A restart gets a new port, and the cluster has to cope (its members announce a new address): that is part of
 # what the test checks, though a reader on fixed ports never meets it.
@@ -22,7 +23,7 @@
 set -u
 cd "$(dirname "$0")/.."
 B=${B:-build}
-DOC=docs/cluster-preview.md
+DOC=${DOC:-docs/cluster-preview.md}
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/tsdb-clt.XXXXXX")
 D=$scratch/c
@@ -64,14 +65,18 @@ awk '/^<!-- cluster-tutorial-output/ { want = 1; next }
 [ -s "$scratch/shown.txt" ] || { echo "test_cluster_tutorial: FAIL: no output blocks in $DOC" >&2; exit 1; }
 
 # The rewrite. Each pattern must be in the block (else the page changed and the test has to follow).
-for pat in 'D=/tmp/tsdb-cluster' '--port 1708$1' '--peer-port 1709$1' 'peer() { echo 127.0.0.1:1709$1; }' \
+for pat in 'D=/tmp/tsdb-cluster' '--port $(port $1)' '--peer-port $(pport $1)' 'pport() { echo 1709$1; }' \
     'port() { echo 1708$1; }'; do
     grep -qF -- "$pat" "$scratch/block.orig" || { echo "test_cluster_tutorial: FAIL: the block no longer has: $pat" >&2; exit 1; }
 done
+# The page says the two lines marked "# ports" are the only place a port is written: a reader who changes a port there
+# (because it is taken) must get servers and helpers on the new number. So no other line of the block names one.
+stray=$(grep -E '170[89][0-9]' "$scratch/block.orig" | grep -v '# ports' || true)
+[ -z "$stray" ] || { echo "test_cluster_tutorial: FAIL: a port is written outside the lines marked '# ports': $stray" >&2; exit 1; }
 sed -e "s#^D=/tmp/tsdb-cluster\$#D=$D#" \
-    -e 's#--port 1708\$1#--port 0#' \
-    -e 's#--peer-port 1709\$1#--peer-port 0 --port-file $D/n$1/port --exit-with-parent=$$#' \
-    -e 's#^peer() { echo 127.0.0.1:1709\$1; }#peer() { echo 127.0.0.1:$(cut -d" " -f4 $D/n$1/port 2>/dev/null); }#' \
+    -e 's#--port \$(port \$1)#--port 0#' \
+    -e 's#--peer-port \$(pport \$1)#--peer-port 0 --port-file $D/n$1/port --exit-with-parent=$$#' \
+    -e 's#^pport() { echo 1709\$1; }#pport() { cut -d" " -f4 $D/n$1/port 2>/dev/null; }#' \
     -e 's#^port() { echo 1708\$1; }#port() { cut -d" " -f1 $D/n$1/port; }#' \
     -e "s#^\\(build/\\)#$B/#" \
     -e "s#\\([ <(]\\)build/#\\1$B/#g" "$scratch/block.orig" > "$scratch/block.sh"
@@ -92,8 +97,16 @@ norm() {
         -e 's/heard [^ ]+/heard H/' \
         -e 's/cluster [0-9a-f]{32} /cluster UUID /' \
         -e 's/^node [0-9]+ mode ([a-z]+) role ([a-z-]+) term [0-9]+ leader [0-9]+ commit [0-9]+ applied [0-9]+$/node N mode \1 role R term T leader L commit C applied A/' \
-        -e 's/read_barrier (on|off|\?)$/read_barrier X/'
+        -e 's/read_barrier (on|off|\?)$/read_barrier X/' \
+        -e 's/^member [0-9]+ (up|down) incarnation/member M \1 incarnation/' \
+        -e 's/ rack rack[0-9]+ / rack rackM /'
 }
+# The killed node is the leader of the moment, and an election before step 7 can make it node 2 or 3, not node 1: the
+# page's member lines (it names member 1, rack1) must match whichever member the run killed.
+a=$(printf '%s\n' 'member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms' | norm)
+b=$(printf '%s\n' 'member 3 up incarnation 2 addr 127.0.0.1:44444 peer 127.0.0.1:44445 rack rack3 heard 12ms' | norm)
+[ "$a" = "$b" ] || fail "norm does not treat the member killed in step 7 alike whichever node it is: '$a' and '$b'"
+
 sed -e "s#$D#/tmp/tsdb-cluster#g" "$scratch/out" | norm > "$scratch/out.norm"
 nshown=0
 while IFS= read -r line; do
@@ -115,7 +128,7 @@ expect 1 '^cluster \(no state yet\)$'                         # step 4: node 1 b
 expect 1 '^initialised: node 1 at '
 expect 3 '^added 127\.0\.0\.1:[0-9]+$'                       # nodes 2 and 3, then the witness
 expect 1 '^node [0-9]+ is the leader: stopping it$'
-expect 1 '^member [123] down incarnation 1 '                # the killed leader (node 1 unless a load-induced election moved it)
+expect 1 '^member [123] down incarnation 1 '                # the killed leader (node 1 unless an election moved it)
 expect 2 '^member [123] up incarnation 2 '                  # step 8, and step 9 (the witness sees the new incarnation)
 expect 1 '^node 4 mode watch role - '
 expect 1 '^member 4 up incarnation 1 .* volumes_ok 0 '

@@ -24,7 +24,7 @@
 <div class="scrim" hidden></div>
 <div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
 <div class="doc-shell">
-<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="cluster.html" aria-current="page">Cluster (preview)</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
 <main id="main" class="doc">
 <h1>Cluster preview</h1>
 <p class="lead">Release 0.10.0 has the first piece of tsdb's cluster: a small group of servers that agree on who the
@@ -49,9 +49,9 @@ simulator, a checker and fault tests, and now you can run it yourself. Without <
 <h2 id="need">What you need</h2>
 <ul>
 <li>A checkout of tsdb, built with <code>make</code> (the first step does it). Linux, no root.</li>
-<li>Four free ports for the servers' clients (17081 to 17084) and four for their peers (17091 to 17094) on
-<code>127.0.0.1</code>. If something else uses one, change the numbers in the two lines marked <code># ports</code> in
-step 3.</li>
+<li>Three free ports for the servers' clients (17081 to 17083; the witness of step 9 has none) and four for their
+peers (17091 to 17094) on <code>127.0.0.1</code>. If something else uses one, change the numbers in the two lines
+marked <code># ports</code> in step 3: they are the only place where the block writes a port.</li>
 <li>Nothing else. The block only writes under <code>/tmp/tsdb-cluster</code>.</li>
 </ul>
 
@@ -69,16 +69,17 @@ build/tsdb cluster secret $D/secret
 
 # 3. Helpers. A "node" is a server with its own data directory (n1/data) and its own state directory (n1/state).
 #    The state directory holds the cluster's own files and must be on a local disk, never on NFS.
-#    Node N listens for clients on port 1708N and for the other servers on port 1709N.
+#    Node N listens for clients on port 1708N and for the other servers on port 1709N (the two lines marked ports).
 #    --no-auth: no login, because users are still per server in the preview. Fine on 127.0.0.1, nowhere else.
 #    A witness (node 4) has no data directory and no client port.
-peer() { echo 127.0.0.1:1709$1; }          # ports: the peer address of node N
 port() { echo 1708$1; }                    # ports: the client port of node N
+pport() { echo 1709$1; }                   # ports: the peer port of node N
+peer() { echo 127.0.0.1:$(pport $1); }     # the peer address of node N
 start_node() {                             # start_node N [witness]: start a server, remember its process id
     mkdir -p $D/n$1/state
     if [ "${2:-}" = witness ]; then role="--witness --advertise 127.0.0.1"
-    else mkdir -p $D/n$1/data; role="--dir $D/n$1/data --no-auth --port 1708$1"; fi
-    build/tsdbd $role --state-dir $D/n$1/state --peer-port 1709$1 \
+    else mkdir -p $D/n$1/data; role="--dir $D/n$1/data --no-auth --port $(port $1)"; fi
+    build/tsdbd $role --state-dir $D/n$1/state --peer-port $(pport $1) \
         --cluster --cluster-secret-file $D/secret --rack rack$1 &gt;&gt; $D/n$1/log 2&gt;&amp;1 &amp;
     echo $! &gt; $D/n$1/pid
 }
@@ -107,8 +108,9 @@ build/client-example 127.0.0.1 $(port 1)
 build/tsdb $D/n1/data series | cut -f1,2
 echo "node 2 has $(build/tsdb $D/n2/data series | wc -l) series"
 
-# 7. Kill the leader, as a crash would (kill -9, by its process id). The others notice after three seconds without
-#    its heartbeat, elect a new leader, and mark the dead node down. Ask a survivor.
+# 7. Kill the leader, as a crash would (kill -9, by its process id). The others elect a new leader, and once that
+#    one has led for three seconds (node_timeout_ms) without a heartbeat from the dead node, it marks the node down.
+#    Ask a survivor.
 leader=$(status 2 | awk 'NR == 1 { print $10 }')
 other=$(( leader % 3 + 1 ))
 echo "node $leader is the leader: stopping it"
@@ -140,7 +142,7 @@ rm -rf $D</code></pre>
 
 <h2 id="output">What you should see</h2>
 <p>These lines come from a real run. Yours differ in the cluster's id (random), the times after <code>heard</code>, the
-term and commit numbers, and which node leads.</p>
+term and commit numbers, and which node leads (so which member the kill of step 7 hits, with its rack).</p>
 <p>Step 2 writes the secret:</p>
 <pre><code data-lang="plain" data-block="1" data-src="docs/cluster-preview.md#What you should see">wrote a new cluster secret to /tmp/tsdb-cluster/secret (copy it to every server; tsdbd --cluster-secret-file)</code></pre>
 <p>Step 4: a server that is in no cluster yet.</p>
@@ -202,8 +204,9 @@ shows in one log only. For example:</p>
 tsdbd: cluster: proposes node 1 down (incarnation 1)
 tsdbd: cluster: proposes node 1 up (incarnation 2)</code></pre>
 <p>The dead node is <code>down</code> only after a few seconds: a server is marked down when the leader has not heard its
-heartbeat for <code>node_timeout_ms</code> (3 s by default). In that time the survivors also elect the new leader, so
-when the <code>down</code> line appears, a new leader exists.</p>
+heartbeat for <code>node_timeout_ms</code> (3 s by default). The survivors first elect a new leader, and it marks the
+node <code>down</code> once it has itself led for <code>node_timeout_ms</code>, so the <code>down</code> comes a few
+seconds after the election. When the <code>down</code> line appears, a new leader exists.</p>
 
 <h2 id="status">How to read status</h2>
 <p><code>tsdb cluster status PEER</code> asks one server what it knows and prints one fact per line. Ask any member: they
@@ -216,7 +219,7 @@ agree, up to a moment's delay. A server that has just restarted may show its sav
 <tr><td><code>stale ...</code></td><td>The copy this server saved before a restart; no one has confirmed it yet.</td></tr>
 <tr><td><code>cluster UUID replication ...</code></td><td>The cluster's id and its settings (<code>init</code> fixes them).</td></tr>
 <tr><td><code>group voters 1,2,3 learners -</code></td><td>Who votes, and who is catching up to join the vote.</td></tr>
-<tr><td><code>member N STATE incarnation I addr A peer P rack R heard H ...</code></td><td>One line per member. <code>STATE</code>: <code>up</code>, <code>down</code>, <code>draining</code> or <code>out</code>. <code>I</code>: how many times it has started. <code>A</code>: where clients reach it. <code>P</code>: where servers reach it. <code>H</code>: how long ago the server you asked last heard from it. <code>voter_ok</code> and <code>volumes_ok</code>: whether it may vote and may hold volumes (a witness has <code>volumes_ok 0</code>). <code>core_dropped 1</code>: its Raft core was dropped after a log fault; it goes on as a watcher.</td></tr>
+<tr><td><code>member N STATE incarnation I addr A peer P rack R heard H ...</code></td><td>One line per member. <code>STATE</code>: <code>up</code> or <code>down</code> (the group also knows <code>draining</code> and <code>out</code>, which nothing sets in the preview). <code>I</code>: how many times it has started. <code>A</code>: where clients reach it. <code>P</code>: where servers reach it. <code>H</code>: how long ago the server you asked last heard from it. <code>voter_ok</code> and <code>volumes_ok</code>: whether it may vote and may hold volumes (a witness has <code>volumes_ok 0</code>). <code>core_dropped 1</code>: its Raft core was dropped after a log fault; it goes on as a watcher.</td></tr>
 <tr><td><code>volume-report ...</code>, <code>domain-report ...</code></td><td>What a member says about its volumes and storage domains. None in the preview: no volumes exist.</td></tr>
 <tr><td><code>volumes N users M</code></td><td>How many volumes and users the group holds. Always 0 in the preview.</td></tr>
 </tbody></table></div>
@@ -227,7 +230,7 @@ agree, up to a moment's delay. A server that has just restarted may show its sav
 <ul>
 <li><strong>"cannot connect to ...: Connection refused"</strong>: the server is not running (yet), or the address is
 wrong. Look at <code>/tmp/tsdb-cluster/n1/log</code>. A port that is taken shows there as "cannot listen"; change the
-numbers in step 3.</li>
+numbers in the two lines of step 3 marked <code># ports</code>, and nothing else.</li>
 <li><strong>"... is not a cluster peer port with this secret"</strong>: the address is not a server's peer port, or the
 secret file differs from the one the server was started with.</li>
 <li><strong>"the secret file ... is open to its group or to others: refused"</strong>: <code>chmod 600</code> it.
@@ -235,7 +238,10 @@ secret file differs from the one the server was started with.</li>
 <li><strong>"the server is already in a cluster"</strong> (from <code>init</code>): stop it, remove its state directory and
 start it again to start over.</li>
 <li><strong>"the new server did not answer"</strong> (from <code>node add</code>): the server at the new address is not
-running with <code>--cluster</code> and the same secret, or it is a member of a cluster already.</li>
+running, or not running with <code>--cluster</code> and the same secret.</li>
+<li><strong>"the new server belongs to another cluster or has another id"</strong> (from <code>node add</code>): the
+server at the new address is a member of a cluster already. To use it here, stop it, remove its state directory and
+start it again.</li>
 <li><strong>The block fails in the middle and servers keep running</strong>: stop them by process id:
 <code>for n in 1 2 3 4; do kill $(cat /tmp/tsdb-cluster/n$n/pid); done</code>. Do not use <code>pkill</code> or
 <code>killall</code>: they stop every process with that name, also ones that are not yours.</li>
@@ -288,8 +294,8 @@ nothing acts on those about volumes and failover yet.</p>
 <tr><td><code>--min-isr N</code></td><td>1</td><td>Copies that must be in sync for a write to count. At most <code>--replication</code>.</td></tr>
 <tr><td><code>--node-timeout-ms MS</code></td><td>3000</td><td>A server is marked down after this long without a heartbeat.</td></tr>
 <tr><td><code>--heartbeat-ms MS</code></td><td>500</td><td>How often servers report. Below <code>--node-timeout-ms</code>.</td></tr>
-<tr><td><code>--isr-lag-ms MS</code></td><td>1000</td><td>A copy this far behind leaves the in-sync set.</td></tr>
-<tr><td><code>--out-after-s S</code></td><td>1800</td><td>A server down this long is marked <code>out</code>.</td></tr>
+<tr><td><code>--isr-lag-ms MS</code></td><td>1000</td><td>A copy this far behind leaves the in-sync set. Stored; nothing acts on it in the preview.</td></tr>
+<tr><td><code>--out-after-s S</code></td><td>1800</td><td>A server down this long is marked <code>out</code>. Stored; in the preview no server is ever marked <code>out</code>.</td></tr>
 <tr><td><code>--voter-replace-s S</code></td><td>600</td><td>A voter down this long is replaced by another member.</td></tr>
 <tr><td><code>--voters N</code></td><td>5</td><td>The most voters the group has (an even number counts as one less).</td></tr>
 <tr><td><code>--volumes-per-server N</code></td><td>16</td><td>Volumes led per server.</td></tr>
@@ -304,9 +310,11 @@ nothing acts on those about volumes and failover yet.</p>
 <h2 id="next">What's next</h2>
 <p>The designs are written; the work goes in this order:</p>
 <ul>
-<li><strong>The metadata group, finished</strong> (steps S1, S2, S4): the rules for ownership and time, the servers'
-links and routing of requests, users and grants kept in the group, and names that are unique across the cluster.</li>
-<li><strong>Shared mode</strong> (N0 to N8): failover on NFS storage with one writer per volume, fenced by the group.
+<li><strong>The metadata group, finished</strong> (steps S2, S4): the servers' links and routing of
+requests, users and grants kept in the group, and names that are unique across the cluster. The group's state machine
+(S1) and what a single server does while its storage is away (UNAVAILABLE, N1) are already in 0.10.0; the rules for
+ownership and time come with N7.</li>
+<li><strong>Shared mode</strong> (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume, fenced by the group.
 Production on NFSv4 needs this first.</li>
 <li><strong>Replicated mode</strong> (R1 to R4): each volume on three servers with their own disks, with replication,
 the in-sync set, promotion and rebuild. Raft stays off the insert path.</li>
