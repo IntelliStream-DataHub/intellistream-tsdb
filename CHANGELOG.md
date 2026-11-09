@@ -67,6 +67,15 @@ live in their own packages, so that the network clients can stay Apache-2.0 with
   follows); `make test-rust`, `test-python` and `test-licenses` cover both packages of each language, and
   `tools/check-version.sh` the pins between them.
 
+### Fixed
+
+- **tsdbd: a storage domain whose volumes cannot be recovered stays DOWN no more.** After an outage of a domain whose only
+  volume was DIVERGED (or that holds no volume), nothing set the domain UP again: STATUS and the metrics reported an outage
+  that was over, and every request that names no volume (QUERY_MULTI, COMMIT, FLUSH) counted as a waiting worker. The
+  volume itself stays refused as DIVERGED (only a restart accepts the loss); the domain is UP when the storage works.
+  New option `flap_recover_ms` of `tsdb_health_options` (60000, the wait after a third DOWN in ten minutes, which was
+  fixed in the code).
+
 ## [0.10.0] - 2026-11-09
 
 **Disk format 9, wire protocol 14 (floor 12, so clients and servers of protocol 12 and up still talk), embedded C ABI 7.**

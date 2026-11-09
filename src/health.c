@@ -417,7 +417,7 @@ static void tick_domain(tsdb_health *h, int di, int64_t now, hev *events, int *n
         /* flapping: three DOWNs in ten minutes need a minute of good probes instead of recover_ms */
         int64_t need = h->o.recover_ms;
         if (d->ndown >= 3 && now - d->down_at[(d->ndown - 3) % 3] < 600000)
-            need = need > 60000 ? need : 60000;
+            need = need > h->o.flap_recover_ms ? need : h->o.flap_recover_ms;
         if (!stuck && d->good_since_ms && now - d->good_since_ms >= need) {
             set_state(d, TSDB_DOM_RECOVERING, now);
             d->good_since_ms = 0;
@@ -470,6 +470,8 @@ static void defaults(tsdb_health_options *o)
         o->write_every_ms = 5000;
     if (o->recover_ms <= 0)
         o->recover_ms = 10000;
+    if (o->flap_recover_ms <= 0)
+        o->flap_recover_ms = 60000;
     if (o->fast_ms <= 0)
         o->fast_ms = 1000;
     if (o->spawn_ms <= 0)

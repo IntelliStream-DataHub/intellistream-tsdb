@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdbd with two volumes on two storage domains under the outagefs shim (ha.md 15.3 and 15.5, N1).
  *
- * The root is local; volume A and volume B each are a domain (--health-domain). One writer thread per volume inserts
+ * The root is local; volume A and volume B each are a domain (--health-domain), and C is a domain with no volume. One writer thread per volume inserts
  * rows (ts = counter) and records what the server said: acknowledged, refused with TSDB_ERR_UNAVAILABLE ("definitely
  * not applied"), or anything else (indeterminate). The faults come from the shim's control socket. After each one
  * the rows are read back and checked: every acknowledged row is there, no refused row is, and the server is still the
@@ -13,6 +13,8 @@
  *   packed (during the hang) 16 connections send packed multi-series inserts to A: B keeps its pace anyway.
  *   diverged  a part of A is removed while A is down: A comes back DIVERGED (refused, the server stays), and a second
  *          outage of its domain does not recover it again.
+ *   (the domain of A: after the second outage it is UP again, though its volume stays DIVERGED; C, with no volume,
+ *          comes back UP after its outage.)
  *   eiodrop  writes on A are dropped and the first fsync of each descriptor fails (fsyncgate), then the server is
  *          killed and restarted: everything acknowledged is still there (an engine that retried its fsync fails this).
  *   eio    every call on A fails: the engine fails stop, the server does not exit (the volume is in a domain), A
@@ -95,20 +97,22 @@ static int fault(const char *cmd, const char *dir, const char *arg)
     return rc;
 }
 
-static pid_t start_server(const char *dir_a, const char *dir_b)
+static pid_t start_server(const char *dir_a, const char *dir_b, const char *dir_c)
 {
-    char pf[PATH_MAX + 64], follow[64], da[PATH_MAX + 32], db_[PATH_MAX + 32];
+    char pf[PATH_MAX + 64], follow[64], da[PATH_MAX + 32], db_[PATH_MAX + 32], dc[PATH_MAX + 32];
     th_portfile(pf, sizeof pf, root);
     th_follow_me(follow, sizeof follow);
     snprintf(da, sizeof da, "%s", dir_a);
     snprintf(db_, sizeof db_, "%s", dir_b);
+    snprintf(dc, sizeof dc, "%s", dir_c);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
-    setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=400,spawn=60000", 1);
+    setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,flap=3000,fast=400,spawn=60000", 1);
     pid_t pid = fork();
     if (pid == 0) {
         const char *argv[32] = {"tsdbd", "--dir", root, "--port", "0", "--port-file", pf, "--workers", "8",
-                                follow, "--send-timeout", "3", "--health-domain", da, "--health-domain", db_};
-        int n = 16;
+                                follow, "--send-timeout", "3", "--health-domain", da, "--health-domain", db_,
+                                "--health-domain", dc}; /* C: a domain with no volume */
+        int n = 18;
         if (getenv("TSDBD_IO")) {
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
@@ -438,11 +442,11 @@ static int await_writes(side *s, int timeout_ms)
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
-    const char *names[] = {"a", "b"};
-    if (outagefs_reexec(argv, base, names, 2) != 0)
+    const char *names[] = {"a", "b", "c"};
+    if (outagefs_reexec(argv, base, names, 3) != 0)
         return 1;
     th_watchdog("test_outage", 900);
-    const char *dir_a = outagefs_dir("a"), *dir_b = outagefs_dir("b");
+    const char *dir_a = outagefs_dir("a"), *dir_b = outagefs_dir("b"), *dir_c = outagefs_dir("c");
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
     snprintf(root, sizeof root, "%s.root", getenv("OUTAGEFS_CTL"));
     signal(SIGPIPE, SIG_IGN);
@@ -475,7 +479,7 @@ int main(int argc, char **argv)
     CHECK(tsdb_close(db) == 0);
     make_users(root);
 
-    server = start_server(dir_a, dir_b);
+    server = start_server(dir_a, dir_b, dir_c);
     {
         tsdbc *tc;
         tsdbc_topo *topo = NULL;
@@ -602,7 +606,7 @@ int main(int argc, char **argv)
     CHECK(alive());
     kill(server, SIGKILL);
     waitpid(server, NULL, 0);
-    server = start_server(dir_a, dir_b);
+    server = start_server(dir_a, dir_b, dir_c);
     verify("restart", &sa);
     verify("restart", &sb);
 
@@ -629,6 +633,17 @@ int main(int argc, char **argv)
         atomic_store(&slow_stop, true);
         pthread_join(sr, NULL);
         CHECK(alive());
+    }
+
+    /* 2b. a domain with no volume (C) that goes DOWN comes back UP: nothing recovers there, so the monitor's own
+     * RECOVERING has to be answered. It stayed DOWN for good, and with it the server's count of requests that wait. */
+    {
+        CHECK(fault("hang", dir_c, NULL) == 0);
+        CHECK(await_status("domain.2.state", "down", 30000) >= 0);
+        CHECK(fault("heal", dir_c, NULL) == 0);
+        double ms = await_status("domain.2.state", "up", 15000);
+        fprintf(stderr, "domain C (no volume): up %.0f ms after the heal\n", ms);
+        CHECK(ms >= 0);
     }
 
     /* 3. a part of A lost while A is down: DIVERGED, and a second outage does not resume it */
@@ -662,11 +677,16 @@ int main(int argc, char **argv)
         CHECK(fault("hang", dir_a, NULL) == 0);
         CHECK(await_status(key_dom_state, "down", 30000) >= 0);
         CHECK(fault("heal", dir_a, NULL) == 0);
-        /* A stays DIVERGED: a second recovery must not resume it, as it once did. Nothing in the server says "the
-         * recovery of A's volume did nothing" (the domain stays DOWN after a second outage of a domain whose only
-         * volume is diverged: NOTES, test-trust), so this one negative is a settle, as long as it was when the bug
-         * showed. */
-        msleep(8000);
+        /* The domain is UP again (its only volume is diverged and has no thread to say so: the monitor's RECOVERING
+         * is what sets it, after the heal and the 3 s a flapping domain waits here (flap=: A had its third DOWN; that wait is
+         * 60 s by default, which the first run of this check took for the bug); it stayed DOWN for good). */
+        double up_ms = await_status(key_dom_state, "up", 15000);
+        fprintf(stderr, "domain A (its only volume DIVERGED): up %.0f ms after the second heal\n", up_ms);
+        CHECK(up_ms >= 0);
+        /* A stays DIVERGED: a second recovery must not resume it, as it once did. Resuming would show after the UP
+         * (a write is acknowledged), so the refusals below are asked after two more recover periods. */
+        msleep(3000);
+        CHECK(await_status(key_dom_state, "up", 1000) >= 0); /* no relapse */
         char why[64];
         tsdbc *sc;
         CHECK(connect_noretry("127.0.0.1", port, 3000, &sc) == 0 && sc);

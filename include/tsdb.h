@@ -1066,7 +1066,8 @@ typedef struct tsdb_health_options {
     int down_ms;          /* 10000: a probe outstanding this long takes the domain DOWN */
     int read_every_ms;    /* 1000 */
     int write_every_ms;   /* 5000 */
-    int recover_ms;       /* 10000: write probes good for this long leave DOWN (60000 when it flaps) */
+    int recover_ms;       /* 10000: write probes good for this long leave DOWN (flap_recover_ms when it flaps) */
+    int flap_recover_ms;  /* 60000: the same after a third DOWN within ten minutes (never below recover_ms) */
     int fast_ms;          /* 1000: a good write probe takes at most this */
     int spawn_ms;         /* 60000: a stuck probe thread gets a second one beside it after this */
     int degraded_min_ms;  /* 500: the floor of the DEGRADED threshold (10 x the baseline above it) */
