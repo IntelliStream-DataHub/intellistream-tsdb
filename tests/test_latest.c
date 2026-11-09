@@ -22,6 +22,7 @@
 #include "watchdog.h"
 #include <fcntl.h>
 #include <ftw.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -763,10 +764,18 @@ static void test_crash(void)
     char dir[700];
     snprintf(dir, sizeof dir, "%s/latest_crash", root);
     rmrf(dir);
+    /* The child reports progress: one byte per PROGRESS_EVERY acknowledged inserts. The parent kills it only after
+     * it has seen at least `need` bytes, so a slow or loaded machine cannot make a round check an empty database,
+     * and every acknowledged row must be there after the crash (the WAL syncs before it acknowledges). */
+    enum { PROGRESS_EVERY = 20 };
+    int rounds_with_value = 0;
     for (int round = 0; round < 4; round++) {
+        int pf[2];
+        CHECK(pipe(pf) == 0);
         pid_t pid = fork();
         CHECK(pid >= 0);
         if (pid == 0) {
+            close(pf[0]);
             tsdb *db;
             OK(tsdb_open(dir, &o, &db));
             tsdb_sid id;
@@ -777,30 +786,74 @@ static void test_crash(void)
                 double v = (double)i;
                 uint8_t valid = i % 5 != 0;
                 tsdb_values vals = {TSDB_FLOAT64, &v, &valid};
-                (void)tsdb_insert_series_values(db, id, &ts, &vals, 1);
+                if (tsdb_insert_series_values(db, id, &ts, &vals, 1) == 0 && (i + 1) % PROGRESS_EVERY == 0) {
+                    char b = 'x';
+                    if (write(pf[1], &b, 1) != 1)
+                        _exit(3);
+                }
             }
         }
-        struct timespec d = {0, (100 + round * 60) * 1000000L};
+        close(pf[1]);
+        long bytes = 0;
+        int need = 3 + round * 2; /* 60 rows at least, more each round */
+        for (int waited_ms = 0; bytes < need; ) {
+            struct pollfd p = {pf[0], POLLIN, 0};
+            int pr = poll(&p, 1, 1000);
+            if (pr > 0) {
+                char b[64];
+                ssize_t got = read(pf[0], b, sizeof b);
+                if (got <= 0) {
+                    fprintf(stderr, "crash round %d: the writer child ended after %ld progress bytes\n", round, bytes);
+                    exit(1);
+                    break;
+                }
+                bytes += got;
+            } else if (++waited_ms >= 120) {
+                fprintf(stderr, "crash round %d: the writer made no progress in 120 s (%ld of %d)\n", round, bytes, need);
+                exit(1);
+                break;
+            }
+        }
+        struct timespec d = {0, (20 + round * 60) * 1000000L}; /* the kill lands at a varying place after that */
         nanosleep(&d, NULL);
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
+        for (;;) { /* what it reported before the kill */
+            char b[64];
+            ssize_t got = read(pf[0], b, sizeof b);
+            if (got <= 0)
+                break;
+            bytes += got;
+        }
+        close(pf[0]);
+        long acked = bytes * PROGRESS_EVERY; /* inserts of one row each, i < 5000 so every timestamp is its own */
         tsdb *db;
         OK(tsdb_open(dir, &o, &db));
         tsdb_sid id;
-        if (tsdb_series_lookup(db, "c.a", &id) == 0) {
+        if (tsdb_series_lookup(db, "c.a", &id) != 0) {
+            fprintf(stderr, "crash round %d: series c.a is gone after %ld acknowledged inserts\n", round, acked);
+            exit(1);
+        } else {
             rowset rr = {0};
             scan(db, id, &rr);
+            if ((long)rr.n < (acked < 5000 ? acked : 5000)) {
+                fprintf(stderr, "crash round %d: %ld acknowledged rows, %zu found after the crash\n", round, acked, rr.n);
+                exit(1);
+            }
             for (int wn = 0; wn < 2; wn++) {
                 tsdb_latest_opts op = {.end = TSDB_TS_MAX, .with_nulls = wn};
                 tsdb_latest_result out;
                 OK(tsdb_latest(db, &id, 1, &op, &out));
                 expect e = oracle(&rr, TSDB_TS_MAX, wn);
                 same(&out, &e, id, "after a crash", round);
+                if (wn == 0 && out.kind == TSDB_LATEST_VALUE)
+                    rounds_with_value++;
             }
             rs_free(&rr);
         }
         OK(tsdb_close(db));
     }
+    CHECK(rounds_with_value == 4); /* every round compared a real answer, not only an empty one */
 }
 
 /* ------------------------------------------------------------------ concurrency */
