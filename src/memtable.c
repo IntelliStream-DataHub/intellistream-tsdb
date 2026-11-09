@@ -147,6 +147,8 @@ void mt_unref(memtable *m)
     free(m);
 }
 
+int (*mt_test_reserve_fail)(uint32_t id); /* test hook: nonzero fails the growth of series id (tests/test_failstop.c) */
+
 /* Room for one more row of series id. */
 static int mt_reserve(memtable *m, uint32_t id)
 {
@@ -160,6 +162,8 @@ static int mt_reserve(memtable *m, uint32_t id)
     mt_series *s = &m->s[id];
     if (s->n < s->cap)
         return 0;
+    if (mt_test_reserve_fail && mt_test_reserve_fail(id))
+        return TSDB_ERR_NOMEM;
     if (s->cap == 0 && m->nids == m->idcap) {
         uint32_t c = m->idcap ? m->idcap * 2 : 64;
         uint32_t *ids = realloc(m->ids, c * sizeof *ids);
@@ -187,6 +191,38 @@ static int mt_reserve(memtable *m, uint32_t id)
     }
     s->cap = cap;
     return 0;
+}
+
+/* Room for all rows of one insert in m (the active memtable, under buf_lock), taken before the insert's WAL append:
+ * the mt_add after that append cannot fail then. A failure between the two would leave a refused write in the WAL,
+ * which a crash replays (and part of it in the memtable at once). Counts each row into its series' n while it grows
+ * the arrays, and takes the counts back; on failure the series it registered are unregistered and freed again, so
+ * no series is listed without rows. */
+static int mt_reserve_rows(memtable *m, const uint32_t *series, uint32_t cs, size_t n)
+{
+    uint32_t nids0 = m->nids;
+    size_t i = 0;
+    int rc = 0;
+    for (; i < n; i++) {
+        uint32_t id = series ? series[i] : cs;
+        if ((rc = mt_reserve(m, id)) != 0)
+            break;
+        m->s[id].n++; /* counted, not written: taken back below */
+    }
+    while (i-- > 0)
+        m->s[series ? series[i] : cs].n--;
+    if (rc) {
+        for (uint32_t k = nids0; k < m->nids; k++) {
+            mt_series *s = &m->s[m->ids[k]];
+            free(s->ts);
+            free(s->v);
+            free(s->lsn);
+            s->ts = NULL, s->v = NULL, s->lsn = NULL;
+            s->cap = 0;
+        }
+        m->nids = nids0;
+    }
+    return rc;
 }
 
 /* Adds rows to a memtable the caller may modify (the active one, under buf_lock). */
@@ -979,14 +1015,19 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         rc = eng_abandoned();
     /* wal_appended counts rows the WAL holds: a refusal before the append adds none, or a flush would wait for
      * rows that never come (wal_durable never reaches them) */
+    if (rc == 0)
+        rc = mt_reserve_rows(db->active, series, cs, n); /* before the WAL: after it, nothing may fail */
     bool counted = rc == 0;
     uint64_t fno0 = 0;
     if (rc == 0 && db->wal_enabled) {
-        rc = wal_buffer(db, series, cs, ts, v, w, n, &fno0); /* first: it can fail without side effects */
+        rc = wal_buffer(db, series, cs, ts, v, w, n, &fno0); /* it can fail without side effects */
         counted = rc == 0;
     }
-    if (rc == 0)
+    if (rc == 0) {
         rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_appended + 1, type);
+        if (rc && db->wal_enabled)
+            eng_fail(db, "adding a write the WAL holds to the memtable", ENOMEM); /* cannot happen: room reserved */
+    }
     if (rc == 0 && fno0)
         mt_note_fno(db->active, fno0, n);
     if (counted)

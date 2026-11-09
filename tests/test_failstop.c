@@ -1532,6 +1532,72 @@ static void rm_tree(const char *path)
 /* B2: a failure while the parts of one insert are written, synced or named is never a success, and the insert
  * leaves nothing: not a part in the live database, not one after a reopen, not a tmp or intent file. Failures at
  * each write and sync of the first and of the second partition's part. */
+extern int (*mt_test_reserve_fail)(uint32_t id); /* src/memtable.c: nonzero fails the memtable's growth for series id */
+static uint32_t reserve_fail_id;
+static int reserve_fail_hits;
+
+static int reserve_fail(uint32_t id)
+{
+    if (id != reserve_fail_id)
+        return 0;
+    reserve_fail_hits++;
+    return 1;
+}
+
+/* A small write the memtable has no room for (malloc failed) is refused before it reaches the WAL. It used to be
+ * appended to the WAL buffer first: the refused write's earlier rows stayed in the memtable (visible at once), and
+ * the next write's sync made the whole of it durable, so a crash replayed it. Nothing of it may show, now or after
+ * a crash, and the engine goes on (an allocation failure is no storage error). */
+static void test_memtable_room(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-mtroom", base);
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid a, b, c;
+    OK(tsdb_series(db, "a", &a));
+    OK(tsdb_series(db, "b", &b));
+    OK(tsdb_series(db, "c", &c));
+    const tsdb_sid ids[4] = {a, a, b, c};
+    const int64_t ts[4] = {1, 2, 3, 4};
+    const float v[4] = {1, 2, 3, 4};
+    reserve_fail_id = (uint32_t)TSDB_SID_LOCAL(c), reserve_fail_hits = 0;
+    mt_test_reserve_fail = reserve_fail;
+    int rc = tsdb_insert(db, ids, ts, v, 4);
+    mt_test_reserve_fail = NULL;
+    if (reserve_fail_hits != 1 || rc != TSDB_ERR_NOMEM) {
+        fprintf(stderr, "memtable room: the planted failure fired %d times, the insert gave %s\n", reserve_fail_hits,
+                tsdb_strerror(rc));
+        failures++;
+    }
+    const int64_t later = 100;
+    const float lv = 100;
+    OK(tsdb_insert_series(db, a, &later, &lv, 1)); /* syncs the WAL: whatever the refused write left there too */
+    if (is_failed(db, NULL)) {
+        fprintf(stderr, "memtable room: the engine failed\n");
+        failures++;
+    }
+    expect_rows(db, "a", &later, 1);
+    expect_rows(db, "b", NULL, 0);
+    expect_rows(db, "c", NULL, 0);
+    /* a crash: the directory as it is while open, WAL and all */
+    char cmd[2000], crash[620];
+    snprintf(crash, sizeof crash, "%s.crash", name);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' && cp -a '%s' '%s'", crash, name, crash);
+    if (system(cmd) != 0)
+        failures++;
+    tsdb_close(db);
+    tsdb_options o = opts();
+    db = NULL;
+    OK(tsdb_open(crash, &o, &db));
+    if (db) {
+        expect_rows(db, "a", &later, 1);
+        expect_rows(db, "b", NULL, 0);
+        expect_rows(db, "c", NULL, 0);
+        tsdb_close(db);
+    }
+    rm_tree(crash);
+}
+
 static void test_partial_insert(const char *base)
 {
     char name[600];
@@ -1785,6 +1851,7 @@ int main(int argc, char **argv)
     test_drop_before(root);
     test_dir_fsync_race(root);
     test_partial_insert(root);
+    test_memtable_room(root);
     test_fsync_results(root);
     if (!failures) {
         char cmd[512];
