@@ -264,19 +264,24 @@ more (at most `--voters`). A member that does not vote watches.
 
 ## If something goes wrong
 
-- **`cannot connect ... Connection refused`**: the server is not running (yet), or the address is wrong. Look at
-  `/tmp/tsdb-cluster/n1/log`. A port that is taken shows as "cannot listen". The block waits for each server; with a
-  slow disk, run the step again.
-- **`tsdb cluster: ... bad secret`, or the handshake fails**: the secret file differs from the one the servers were
-  started with. A secret file must be readable by you only (mode 0600), or tsdb refuses it.
-- **`init` says the cluster exists**: that server already is in a cluster. Stop it, remove its state directory and
-  start it again.
+- **`cannot connect to ...: Connection refused`**: the server is not running (yet), or the address is wrong. Look at
+  `/tmp/tsdb-cluster/n1/log`. A client port or peer port that is taken shows there as "cannot listen"; change the
+  numbers in step 3.
+- **`... is not a cluster peer port with this secret`**: the address is not a server's peer port (a client port, say),
+  or the secret file differs from the one the server was started with.
+- **`the secret file ... is open to its group or to others: refused`**: `chmod 600` it. `tsdb cluster secret FILE`
+  makes a file with the right mode.
+- **`the server is already in a cluster`** (from `init`): that server has a cluster already. To start over, stop it,
+  remove its state directory and start it again.
+- **`the new server did not answer`** (from `node add`): the server at `NEW_PEER` is not running with `--cluster`
+  with the same secret, or it is a member of a cluster already.
 - **`--state-dir ... on NFS`**: the cluster's files must be on a local file system.
 - **The block fails in the middle and servers keep running**: stop them by process id:
   `for n in 1 2 3 4; do kill $(cat /tmp/tsdb-cluster/n$n/pid); done`. Do not use `pkill` or `killall`: they stop every
   process with that name, also ones that are not yours.
-- **Killing two of three nodes**: the third has no majority. It stays `pre-candidate` with `leader 0` and the group
-  makes no change until one of the others is back. That is the rule, not a bug.
+- **Two of the three nodes are gone**: the third has no majority. Its role stays `pre-candidate`, it shows `leader 0`,
+  and the dead members stay `up` in its view: nobody is left to mark them down. The group changes nothing until
+  one of the others is back. That is the rule, not a bug.
 - When you are done: `rm -rf /tmp/tsdb-cluster`.
 
 ## Reference

@@ -6,6 +6,12 @@ All notable changes to tsdb are listed here, newest first. The format follows
 [docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.x release may still change the
 disk format and the wire protocol.
 
+## [Unreleased]
+
+- `tsdb cluster` with no arguments (or `help`) prints the cluster commands and options (it printed the general usage and
+  exited with 2). New tutorial for the cluster preview, [docs/cluster-preview.md](docs/cluster-preview.md): three servers
+  and a witness on one machine, the leader killed and restarted; `tests/test_cluster_tutorial.sh` runs its command block.
+
 ## [0.10.0] - 2026-11-09
 
 **Disk format 9, wire protocol 14 (floor 12, so clients and servers of protocol 12 and up still talk), embedded C ABI 7.**

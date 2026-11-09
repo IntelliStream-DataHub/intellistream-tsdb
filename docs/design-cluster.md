@@ -8,6 +8,7 @@ This design is the *replicated mode* of tsdb's two HA modes; ha.md is the *share
 the fifteen gaps that build step 2's replication simulator found (branch `cluster-s2`, 44b352b, 13081cc and 9f2cf49;
 "Corrections from step 2's simulator" below, each with its mutant or seed, and marked *Corrected 2026-11-06 (gap N)*
 in the section it changes).
+Tutorial: [cluster-preview.md](cluster-preview.md) runs what is built (the metadata group, `tsdb cluster`) on one machine.
 Update 2026-11-08: step 1 is built (branch ha-s1 on top of cluster-s1) with the amendments of design-ha-modes.md §7.1:
 the metadata format is snapshot version 2, the peer protocol version 2, the state lives in `--state-dir`, and a
 cluster of an earlier build is initialised again (no mixed versions). Where this document says §2.3 puts hard saves
@@ -964,7 +965,8 @@ applies to memory as to the rest.
 - NFS followers (`--follow`): unchanged. In a cluster, replicas take that role.
 - Export and import: `tsdb export` against a cluster reads through a client (by name), not from directories.
 - The CLI: `tsdb cluster ...` commands (init, node add/drain/out, volume add/move/force-leader, status) talk to any
-  server.
+  server. Built so far: `secret`, `init`, `node add` and `status`; `tsdb cluster` prints them, and
+  [cluster-preview.md](cluster-preview.md) is the tutorial.
 
 ## 13. Testing
 
