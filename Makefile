@@ -173,6 +173,11 @@ $(B)/test_auth_ops: tests/test_auth_ops.c tests/harness.h tests/auth_harness.h s
                     server/users.h include/tsdb_protocol.h $(B)/users.o $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
 
+# tsdbd --read-only, op by op (the frames of test_auth_ops; links server/users.c for the harness's login helpers)
+$(B)/test_readonly: tests/test_readonly.c tests/harness.h tests/auth_harness.h server/users.h include/tsdb_protocol.h \
+                    $(B)/users.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
+
 # includes server/users.c (its record builders) and defines write/fdatasync/fsync/rename to inject errors into it
 $(B)/test_users: tests/test_users.c server/users.c server/users.h $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
@@ -253,7 +258,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
 	./$(B)/test_tsdb $(SCRATCH)
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched $(SCRATCH)
@@ -325,12 +330,13 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server_multi && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth_ops && \
+	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_readonly $(SCRATCH) && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stability || exit 1; done
 
 # the portability headers (macOS shims) are part of these tests and of the server
 $(B)/test_classes $(B)/test_damage $(B)/test_export $(B)/test_failstop $(B)/test_follow $(B)/test_group $(B)/test_sched \
 $(B)/test_server_multi $(B)/test_server $(B)/test_spread $(B)/test_stability $(B)/test_tsdb $(B)/test_volumes \
-$(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_ports $(B)/test_out_send $(B)/fuzz_frames $(B)/tsdbd $(B)/users.o $(B)/tsdb: \
+$(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_ports $(B)/test_out_send $(B)/fuzz_frames $(B)/tsdbd $(B)/users.o $(B)/tsdb: \
     tests/portable.h src/compat.h server/epoll_compat.h
 
 # ------------------------------------------------------------------ fuzzing
