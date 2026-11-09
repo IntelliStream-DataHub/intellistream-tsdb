@@ -6,7 +6,7 @@ All notable changes to tsdb are listed here, newest first. The format follows
 [docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.x release may still change the
 disk format and the wire protocol.
 
-## [0.10.0] - 2026-11-08
+## [0.10.0] - 2026-11-09
 
 **Disk format 9, wire protocol 14 (floor 12, so clients and servers of protocol 12 and up still talk), embedded C ABI 7.**
 0.9.0 and 0.9.1 wrote format 8, spoke protocol 12 and had ABI 3. A 0.9.x database needs one step before this release
@@ -25,7 +25,7 @@ partition instead of a stop for the whole partition. Use the same release on the
   that they never go back across opens (before a WAL segment is unlinked it holds the segment's end: one `fdatasync`
   per flush); `META` can say `requires=` (a binary refuses a feature it does not know, naming it); `MANIFEST` has an
   `fno_next` line (information for followers). The cost is 16 more bytes per WAL record: not measurable with an
-  fsync per call, 1 to 8% on appends without one (BENCHMARKS.md, "Format 9").
+  fsync per call, 1 to 10% on appends without one (BENCHMARKS.md, "Format 9").
   **Carrying a database over:** this release refuses a format-8 database (the line names both versions and this
   command), and 0.9.0 and 0.9.1 refuse a format-9 database the same way ("the database has disk format version 9; tsdb
   0.9.1 reads version 8 only"; nothing is written). So, for a database of 0.9.x: stop tsdbd and every follower, make sure
