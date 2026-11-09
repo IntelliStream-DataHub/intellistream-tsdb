@@ -1735,7 +1735,18 @@ static void power_loss(int snaps)
         die("server 0 ended with status %d after the power loss, expected 99 (crashfs)", status);
     start(0);
     await_view(0, p_leader_self, NULL, "server 0 leading after the power loss");
-    view(0, &v);
+    /* A restarted leader knows its commit index only once an entry of its own term is committed (the one voter syncs
+     * it and commits at once), so until then `applied` is the earlier copy of the state (run 17 of 20 read applied 7 of
+     * 10 right after "leader"). Wait for it, bounded: a log that lost acknowledged entries never gets back to
+     * applied0 (its first new entry gets applied0 - k + 1), and the check below fails with its numbers. */
+    uint64_t t_applied = now_ms();
+    for (;;) {
+        view(0, &v);
+        if ((v.m.nmembers >= members0 && v.m.applied >= applied0) || now_ms() - t_applied > 10000)
+            break;
+        view_free(&v);
+        usleep(100000);
+    }
     if (v.m.nmembers < members0 || v.m.applied < applied0)
         die("after the power loss server 0 holds %u members and applied %" PRIu64 ", it had acknowledged %u and %" PRIu64,
             (unsigned)v.m.nmembers, v.m.applied, (unsigned)members0, applied0);
