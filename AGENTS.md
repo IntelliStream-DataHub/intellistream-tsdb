@@ -10,7 +10,8 @@ make                      # library, CLI, server, client, benchmarks (into build
 make test                 # all unit, integration and server tests
 make test IO=epoll        # server tests on epoll only (where io_uring is disabled)
 make asan                 # the tests under AddressSanitizer + UBSan
-make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
+make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 80 minutes on 4 CPUs; CI runs the groups of
+                          # make test as separate jobs: make tsan TEST_TARGET=test-meta, see TEST_GROUPS in the Makefile)
 make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO; workloads kv and classes;
                           # misdirected I/O (verify_checksums on and off) and damage at rest (rot) on kv;
                           # kv also with login on (jepsen --auth) under kill and power, on each backend;

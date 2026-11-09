@@ -39,12 +39,14 @@ bindings), and the files keep their SPDX line and the NOTICE.
 
 ## Copied code and data
 
-One piece of source code is copied from another project: the Raft core of the cluster (2026-11-06). The rest of this
-table is close to copying without being it.
+One piece of source code is copied from another project: the Raft core of the cluster (2026-11-06). A second, the
+erasure codec of the cluster's data path, is planned for 0.11.0 (decided 2026-11-09) and is listed already. The rest of
+this table is close to copying without being it.
 
 | what | where | origin and license | note |
 |---|---|---|---|
 | Raft core: `raft.c`, `raft.h`, `raft_log.c`, `raft_log.h`, `raft_wire.c`, `raft_wire.h`, `raft_sim.c`, `raft_sim.h` | `src/raft/` | intellistream-objects `src/raft`, IntelliStream AS, at the commit in `src/raft/UPSTREAM`; **AGPL-3.0-only**, the licence of both repositories since 2026-11-09. (Until then tsdb carried the copy under Apache 2.0 by its owner's grant of 2026-11-06, [design-cluster.md](design-cluster.md) D2; the releases 0.9.x and 0.10.0 still do.) | copied unchanged below an AGPL-3.0-only header by `tools/sync-raft.sh`, which also writes `UPSTREAM` (repository, commit, licence). `compat.h`, `compat.c` and the headers under `compat/` are tsdb's own: what the files include from isod. Linked into tsdbd, the CLI and the tests, not into libtsdb. Same owner, same licence: no grant is needed any more. |
+| Erasure codec (planned, 0.11.0; **not in the tree yet**): `gf256.c`, `gf256.h`, `gf256_avx2.c`, `gf256_avx512.c`, `rs.c`, `rs.h` | `src/ec/` | intellistream-objects `src/codec`, IntelliStream AS, at the commit that `src/ec/UPSTREAM` will name; **AGPL-3.0-only**, as tsdb's engine and server are from 0.11.0 ([design-cluster-data.md](design-cluster-data.md) E32, the user's decision of 2026-11-09) | to be copied unchanged below an AGPL-3.0-only header by `tools/sync-ec.sh` (build step R5), which writes `UPSTREAM` (repository, commit, licence), as `tools/sync-raft.sh` does for Raft; what the files include from objects' `common/` is tsdb's own `src/ec/compat.h`. Same owner, same licence: no grant is needed. Unlike Raft it is linked into `libtsdb` (the settled tier is read through the engine), so it reaches tsdbd, the CLI and the embedded bindings, all AGPL-3.0-only. **Never in the Apache-2.0 client libraries** (C, Rust, Python, Java, the Pulsar sink): servers decode settled data, `tools/check-spdx.sh` refuses an Apache-2.0 file that includes an AGPL one, and R5 adds a check that no client library or package holds a codec symbol. When it lands, this row loses "planned". |
 | xxHash64 checksum | `src/codec.c` (`xxh64`) | the algorithm and constants of xxHash by Yann Collet (BSD-2-Clause) | written for tsdb from the published algorithm; no xxHash file is included. The credit is here. |
 | LTTB downsampling | `src/query.c`, `tests/lttb_ref.h` | the algorithm of Sveinn Steinarsson's thesis (2013) | an algorithm is not covered by copyright; the code is our own. |
 | Gorilla, Chimp, Patas, ALP codecs | `src/codec*.c` | published papers | own code. The benchmarks compare with these codecs; their reference code is not included. |

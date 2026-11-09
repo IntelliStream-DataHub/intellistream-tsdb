@@ -42,7 +42,7 @@ The Rust, Python and Java clients need `cargo`, `python3` (with `maturin`) and `
 make test               # all unit, crash-recovery and server tests
 make test IO=epoll      # the server tests on epoll only
 make asan               # the tests under AddressSanitizer and UBSan (starts with make clean)
-make tsan               # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
+make tsan               # the tests under ThreadSanitizer, in build-tsan/ (over an hour on 4 CPUs; `TEST_TARGET=` runs one group, see CI below)
 make jepsen             # fault injection: kill -9, simulated power loss, pauses, disk errors, misdirected I/O, rot
 make fuzz               # the fuzz harnesses (FUZZ_SECONDS=600 for longer)
 make test-clients       # the Rust, Python and Java clients against build/tsdbd
@@ -76,8 +76,12 @@ Ubuntu 24.04 runners with 4 CPUs and 16 GB. These checks should be green before 
 
 - **build and test:** `make`, then `make test`. If the runner does not allow io_uring, the server tests run on
   epoll only (`make test IO=epoll`) and the log says so.
-- **AddressSanitizer and UBSan:** `make asan`.
-- **ThreadSanitizer:** `make tsan`.
+- **AddressSanitizer and UBSan, ThreadSanitizer:** `make asan` and `make tsan`. Each of them is seven jobs, one per
+  group of `make test` (`make asan TEST_TARGET=test-meta`: the groups are listed under `TEST_GROUPS` in the Makefile),
+  because all of it under a sanitizer takes over an hour on 4 CPUs. A new group of `make test` needs an entry in both
+  matrices of `ci.yml`; `tests/check_ci_groups.sh` (run by `make test`) fails without it. Measured under tsan on
+  4 CPUs: the two unit groups about 20 minutes each, meta and cluster 15, each half of the meta mutants 18 to 19, the
+  server tests 4 on each backend; every job has 60 minutes.
 - **clients:** `make test-clients` (Rust, Python and Java).
 - **portable build and tarball:** `make PORTABLE=1`, `make dist` and `make dist-test`.
 - **integration tests:** `make check-version`, then `make integration-tests`.

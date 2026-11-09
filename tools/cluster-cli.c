@@ -22,17 +22,53 @@
 
 int cluster_cli(int argc, char **argv); /* tools/tsdb-cli.c */
 
+/* The one text of the cluster commands: `tsdb cluster` (or help, --help) prints it on stdout and exits 0; a mistake in
+ * a command prints the same on stderr and exits 2. docs/cluster-preview.md has the longer story. */
+static const char cl_help[] =
+    "tsdb cluster: the commands of tsdbd's cluster (a preview: the metadata group only, no data replication and\n"
+    "no failover yet; docs/cluster-preview.md is the tutorial).\n"
+    "\n"
+    "usage: tsdb cluster secret FILE\n"
+    "       tsdb cluster init PEER --secret-file F [options]\n"
+    "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
+    "       tsdb cluster status PEER --secret-file F\n"
+    "       tsdb cluster help\n"
+    "\n"
+    "  PEER and NEW_PEER are a server's peer address, host:port (tsdbd --cluster, its --peer-port and --advertise).\n"
+    "  No directory: these commands talk to a running server and keep no state of their own. The secret file is the\n"
+    "  one every server was started with (tsdbd --cluster-secret-file); it is never given on the command line.\n"
+    "\n"
+    "  secret FILE         make a new cluster secret (32 random bytes as hex, mode 0600). Never overwrites a file.\n"
+    "                      Copy it to every server, by a safe way.\n"
+    "  init PEER           create the cluster on one server that is in no cluster yet. It becomes node 1 and the\n"
+    "                      leader. Settings are fixed here, for the life of the cluster.\n"
+    "  node add PEER NEW   add the server at NEW (it must be running with --cluster and in no cluster yet) to the\n"
+    "                      cluster that PEER belongs to; PEER may be any member. The members vote\n"
+    "                      in groups of 1, 3 or 5 (at most --voters); the rest watch and take a voter's place when\n"
+    "                      one is lost. A witness (tsdbd --witness) is added the same way.\n"
+    "  status PEER         what that server knows: its role, the leader, the settings, every member (up or down,\n"
+    "                      incarnation, when it was last heard), the volumes and users. One fact a line.\n"
+    "\n"
+    "  init options (each takes a whole number above 0; defaults in brackets):\n"
+    "    --replication N         copies of every volume the cluster will keep [3]\n"
+    "    --min-isr N             copies that must be in sync for a write to count, at most --replication [1]\n"
+    "    --node-timeout-ms MS    a server is marked down after this long without a heartbeat [3000]\n"
+    "    --heartbeat-ms MS       how often servers report, below --node-timeout-ms [500]\n"
+    "    --isr-lag-ms MS         a copy this far behind leaves the in-sync set [1000] (stored, not acted on yet)\n"
+    "    --out-after-s S         a server down this long is marked out [1800] (stored, not acted on yet)\n"
+    "    --voter-replace-s S     a voter down this long is replaced by another member [600]\n"
+    "    --voters N              the most voters the group has (an even number counts as one less) [5]\n"
+    "    --volumes-per-server N  volumes led per server at init [16]\n"
+    "    --mode replicated|shared    shared-nothing copies, or shared (NFS) volumes [replicated]\n"
+    "    --failover lease|attested|bmc   how a dead owner is replaced in shared mode [lease]\n"
+    "    --read-barrier on|off   owners answer reads only behind a fenced write [on]\n"
+    "    --lease-s S             the lease of a shared volume [10]\n"
+    "  In this preview the settings are stored and shown by status; nothing acts on the replication, failover and\n"
+    "  volume ones yet.\n";
+
 static int cl_usage(void)
 {
-    fprintf(stderr,
-            "usage: tsdb cluster init PEER --secret-file F [--replication 3] [--min-isr 1] [--node-timeout-ms 3000]\n"
-            "            [--heartbeat-ms 500] [--isr-lag-ms 1000] [--out-after-s 1800] [--voter-replace-s 600]\n"
-            "            [--voters 5] [--volumes-per-server 16] [--mode replicated|shared]\n"
-            "            [--failover lease|attested|bmc] [--read-barrier on|off] [--lease-s 10]\n"
-            "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
-            "       tsdb cluster status PEER --secret-file F\n"
-            "       tsdb cluster secret FILE    (makes a new secret file, mode 0600; never overwrites one)\n"
-            "  PEER is a server's peer address, host:port (tsdbd --cluster --peer-port)\n");
+    fputs(cl_help, stderr);
     return 2;
 }
 
@@ -135,7 +171,12 @@ static void print_status(const struct cluster_status *st)
 
 int cluster_cli(int argc, char **argv)
 {
-    /* argv[0] is "cluster" */
+    /* argv[0] is "cluster". No verb, or help: the commands, on stdout, success (asking is not a mistake). */
+    if (argc == 1 || (argc == 2 && (!strcmp(argv[1], "help") || !strcmp(argv[1], "--help") ||
+                                    !strcmp(argv[1], "-h")))) {
+        fputs(cl_help, stdout);
+        return 0;
+    }
     if (argc < 3)
         return cl_usage();
     if (!strcmp(argv[1], "secret")) {

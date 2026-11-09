@@ -545,6 +545,13 @@ build/tsdb user grant acme/dashboard read prefix:acme/ --server db1:7070 --login
 for tests and try-outs on your own machine. `tsdb <dir> user` on its own lists every command, and
 [SECURITY.md](SECURITY.md) says what logins protect and what they do not.
 
+### Cluster (preview)
+
+`tsdbd --cluster` joins servers into a small Raft group that keeps the list of members, their state and the cluster's
+settings. It is a **preview**: it does not copy data between servers and does not fail over, and the client port works as
+without it. Do not run it in production. [docs/cluster-preview.md](docs/cluster-preview.md) is a ten-minute tutorial:
+three servers and a witness on one machine, a leader killed and restarted. `tsdb cluster` prints the commands.
+
 ### Backup and moving to a new version
 
 `export` writes the whole database (or some series) into one file; `import` reads it into another database.

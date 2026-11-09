@@ -513,6 +513,11 @@ class EmbeddedDbTest {
                 Column.ofLongs(1)));
         assertEquals(5, db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).size(), "a refused replace changes nothing");
 
+        /* a merge thread drops a partition whose rows have all expired, for good: with none, "merges have not
+         * removed them yet" below holds however long the test is held up */
+        db.close();
+        db = EmbeddedDb.open(tmp.resolve("db").toString(),
+                new EmbeddedOptions().fsync(false).walSyncMs(-1).mergeThreads(0));
         assertEquals(0, db.retention(s));
         db.setRetention(s, 1000); /* the rows are from 2024: all expired */
         assertEquals(1000, db.retention(s));

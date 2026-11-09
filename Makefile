@@ -295,6 +295,16 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_types $(SCRATCH)
 	./$(B)/test_delete $(SCRATCH)
 	./$(B)/test_levels
+	$(if $(TEST_GROUPS),$(MAKE) -j1 $(TEST_GROUPS))
+
+# The rest of `make test` as groups (the recipe lines are those that were here, in the same order). `make test` runs
+# them last, one after the other; CI runs each on a runner of its own (`make tsan TEST_TARGET=test-meta`,
+# .github/workflows/ci.yml): ThreadSanitizer and ASan take about 80 minutes for all of them on 4 CPUs. A group has the
+# prerequisites it needs, so that it builds and runs alone. `make test TEST_GROUPS=` runs only the lines above.
+TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
+TEST_TARGET ?= test
+.PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
+test-units-b: $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_group $(SCRATCH)
 	./$(B)/test_lttb $(SCRATCH)
 	B=$(B) tests/test_cli_lttb.sh
@@ -319,10 +329,17 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_export $(SCRATCH)
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
+
+test-meta: $(B)/test_meta $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
-	tests/meta_mutants.sh $(B)/test_meta_mut
-	$(MAKE) cluster-mutants
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
+	$(MAKE) cluster-mutants
+
+# the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 17 runs of 2 minutes each under a sanitizer
+test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
+	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
+
+test-net: $(B)/test_readonly $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stability $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	./$(B)/test_wire tests/data/wire13-vectors.txt
@@ -443,7 +460,7 @@ ASAN_RUN   := $(if $(ASAN_ARCH),detect_stack_use_after_return=0:)
 asan: ubsan-check
 	$(MAKE) clean
 	ASAN_OPTIONS="$(ASAN_RUN)$$ASAN_OPTIONS" UBSAN_OPTIONS="$(UBSAN_RUN) $$UBSAN_OPTIONS" \
-	$(MAKE) ARCH="$(ASAN_ARCH)" CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" test
+	$(MAKE) ARCH="$(ASAN_ARCH)" CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" $(TEST_TARGET)
 
 ubsan-check:
 	@mkdir -p $(B)
@@ -461,7 +478,7 @@ ubsan-check:
 TSAN_FLAGS := -O1 -g -fsanitize=thread -fno-omit-frame-pointer
 tsan:
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 $$TSAN_OPTIONS" \
-	$(MAKE) B=build-tsan TSDBD=build-tsan/tsdbd ARCH= CFLAGS="$(TSAN_FLAGS)" test
+	$(MAKE) B=build-tsan TSDBD=build-tsan/tsdbd ARCH= CFLAGS="$(TSAN_FLAGS)" $(TEST_TARGET)
 
 $(B):
 	mkdir -p $(B)
@@ -587,7 +604,18 @@ test-licenses:
 	cd connectors/pulsar && mvn -q $(JAVA_M2) -DskipTests package
 	tools/check-package-licenses.sh nar connectors/pulsar/target/tsdb-pulsar-sink-$(RELEASE_VERSION).nar apache
 
-test-clients: test-rust test-python test-python-sdist test-java test-java-embedded test-pulsar test-licenses
+# The three Java targets (test-java, test-java-embedded, test-licenses) all build client/java (and its target/), so
+# `make -j4 test-clients` runs them one after the other: two Maven runs in one target/ overwrote each other's classes
+# ("Unable to create test class", 1 run in 5 on 4 CPUs). The Rust and Python targets run beside them; what the
+# sub-makes need is built here first, once, by this make.
+.PHONY: test-clients-java
+test-clients-java: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER) $(B)/libtsdb.$(SOEXT)
+	$(MAKE) test-java
+	$(MAKE) test-java-embedded
+	$(MAKE) test-licenses
+	$(MAKE) test-pulsar
+
+test-clients: test-rust test-python test-python-sdist test-clients-java
 
 # The same suites against tsdbd on epoll (production on AlmaLinux 10 runs it; make test-clients takes io_uring where
 # there is one). TSDBD_TEST_IO is read by tsdbd when a start names no --io, and by nothing else.
@@ -650,7 +678,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: cluster-mutants rewind-mutants test-cli-stats sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest integration-mutants
+.PHONY: cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants test-cli-stats test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1007,9 +1035,14 @@ $(B)/client-example: examples/client.c client/tsdb_client.h include/tsdb_calenda
 all: $(B)/embedded-example $(B)/client-example
 
 # Runs the README's quick start, word for word, in a scratch directory.
-test: test-quickstart test-cli-stats
+test: test-quickstart test-cli-stats test-cli-cluster test-cluster-tutorial
 test-cli-stats: $(B)/tsdb
 	B=$(B) tests/test_cli_stats.sh $(TMPDIR)
+test-cli-cluster: $(B)/tsdb
+	B=$(B) tests/test_cli_cluster.sh $(TMPDIR)
+# The cluster tutorial's command block, word for word (docs/cluster-preview.md), on ports the kernel picks.
+test-cluster-tutorial: $(B)/tsdb $(B)/tsdbd $(B)/client-example
+	B=$(B) tests/test_cluster_tutorial.sh
 test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 	B=$(B) tests/test_quickstart.sh
 
@@ -1048,4 +1081,9 @@ test-spdx:
 	tools/check-spdx.sh
 	tests/test_check_spdx.sh
 
-.PHONY: test-quickstart check-site test-release test-spdx
+# every group above is a matrix entry of the sanitizer jobs in .github/workflows/ci.yml
+test: check-ci-groups
+check-ci-groups:
+	tests/check_ci_groups.sh
+
+.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups

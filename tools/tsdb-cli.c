@@ -22,7 +22,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: tsdb <dir> <command> [args]\n"
-            "       tsdb cluster init|node add|status PEER ... (tsdb cluster for the details)\n"
+            "       tsdb cluster secret|init|node add|status ... (tsdb cluster for the details)\n"
             "       tsdb --version\n"
             "\n"
             "  insert <series>                    read \"time,value\" lines from stdin\n"
@@ -1134,10 +1134,12 @@ int main(int argc, char **argv)
         printf("tsdb %s (build %s)\n", tsdb_version(), TSDB_BUILD_VERSION);
         return 0;
     }
+    /* `tsdb cluster VERB PEER ...`: a server's peer port, no directory. Before the argument count check:
+     * `tsdb cluster` alone prints the cluster's commands, as the usage line promises. */
+    if (argc >= 2 && strcmp(argv[1], "cluster") == 0)
+        return cluster_cli(argc - 1, argv + 1);
     if (argc < 3)
         usage();
-    if (strcmp(argv[1], "cluster") == 0) /* `tsdb cluster VERB PEER ...`: a server's peer port, no directory */
-        return cluster_cli(argc - 1, argv + 1);
     for (int i = 3; strcmp(argv[1], "user") == 0 && i < argc; i++)
         if (strcmp(argv[i], "--server") == 0) /* `tsdb user VERB ... --server HOST:PORT`: no directory */
             return user_main(NULL, argc - 2, argv + 2);
