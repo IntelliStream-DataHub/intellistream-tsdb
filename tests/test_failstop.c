@@ -1674,7 +1674,7 @@ static void test_backpressure_flush(const char *base)
     tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     flush_fail_main = pthread_self(), flush_fail_hits = 0;
-    mt_test_flush_fail = flush_fail;
+    __atomic_store_n(&mt_test_flush_fail, flush_fail, __ATOMIC_RELAXED);
     for (int k = 0; k < 8; k++) { /* the 8th reaches the limit: applied, so a success whatever the flush would say */
         int rc = insert_n(db, id, k * 50, 50, false);
         if (rc != 0) {
@@ -1712,11 +1712,159 @@ static void test_backpressure_flush(const char *base)
         tsdb_close(cdb);
     }
     rm_tree(crash);
-    mt_test_flush_fail = NULL; /* they work again: the next write flushes the 400 rows, then is applied */
+    __atomic_store_n(&mt_test_flush_fail, NULL, __ATOMIC_RELAXED); /* they work again: the next write flushes the 400 rows, then is applied */
     OK(insert_n(db, id, 8 * 50, 50, false));
     CHECK(count_rows(db, "s") == 450);
     CHECK(memtable_rows_of(db) == 50);
     tsdb_close(db);
+}
+
+/* A series that comes again after others ({a, b, a}, a with one row of room), and one series given as a run of 2
+ * rows (tsdb_insert_series): each counts every row of a series, and each is refused whole when the growth fails. */
+static void test_memtable_room_more(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-mtroom-more", base);
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid a, b;
+    OK(tsdb_series(db, "a", &a));
+    OK(tsdb_series(db, "b", &b));
+    OK(insert_n(db, a, 0, 63, false));
+    {
+        const tsdb_sid order[3] = {a, b, a};
+        const int64_t ts[3] = {1000, 2000, 3000};
+        const float v[3] = {1, 2, 3};
+        reserve_fail_id = (uint32_t)TSDB_SID_LOCAL(a), reserve_fail_hits = 0;
+        mt_test_reserve_fail = reserve_fail;
+        int rc = tsdb_insert(db, order, ts, v, 3);
+        mt_test_reserve_fail = NULL;
+        if (reserve_fail_hits != 1 || rc != TSDB_ERR_NOMEM) {
+            fprintf(stderr, "memtable room more {a,b,a}: hits %d, %s\n", reserve_fail_hits, tsdb_strerror(rc));
+            failures++;
+        }
+        CHECK(count_rows(db, "a") == 63);
+        CHECK(count_rows(db, "b") == 0);
+        CHECK(!is_failed(db, NULL));
+    }
+    {
+        reserve_fail_id = (uint32_t)TSDB_SID_LOCAL(a), reserve_fail_hits = 0;
+        mt_test_reserve_fail = reserve_fail;
+        int rc = insert_n(db, a, 5000, 2, false);
+        mt_test_reserve_fail = NULL;
+        if (reserve_fail_hits != 1 || rc != TSDB_ERR_NOMEM) {
+            fprintf(stderr, "memtable room more, one series of 2: hits %d, %s\n", reserve_fail_hits, tsdb_strerror(rc));
+            failures++;
+        }
+        CHECK(count_rows(db, "a") == 63);
+        CHECK(!is_failed(db, NULL));
+    }
+    /* the counts of the refused writes are gone: a's 64th row fits, then the next growth works */
+    OK(insert_n(db, a, 6000, 1, false));
+    CHECK(count_rows(db, "a") == 64);
+    const tsdb_sid order[3] = {a, b, a};
+    const int64_t ts[3] = {7000, 8000, 9000};
+    const float v[3] = {1, 2, 3};
+    OK(tsdb_insert(db, order, ts, v, 3));
+    CHECK(count_rows(db, "a") == 66);
+    CHECK(count_rows(db, "b") == 1);
+    tsdb_close(db);
+}
+
+/* What a backpressure flush hook does on the writer's thread (the writer's own flush, before its append) */
+enum { BP_COUNT, BP_FAIL_ENGINE, BP_ABANDON };
+static int bp_mode;
+static int bp_hits;
+static tsdb *bp_db;
+static volatile int bp_flag;
+
+static int bp_hook(void)
+{
+    if (!pthread_equal(pthread_self(), flush_fail_main))
+        return INT_MIN; /* the flusher thread: slow */
+    bp_hits++;
+    if (bp_mode == BP_FAIL_ENGINE) {
+        arm(F_FDATASYNC, "/wal_", false, false);
+        (void)tsdb_commit(bp_db); /* syncs the rows of the 8 writes: fails, the engine is failed */
+    } else if (bp_mode == BP_ABANDON) {
+        bp_flag = 1; /* the request is abandoned while its flush runs */
+    }
+    return INT_MIN; /* the flush itself does nothing */
+}
+
+static int64_t count_after_crash(const char *name, const char *series)
+{
+    char cmd[2000], crash[620];
+    snprintf(crash, sizeof crash, "%s.crash", name);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' && cp -a '%s' '%s'", crash, name, crash);
+    if (system(cmd) != 0)
+        failures++;
+    tsdb *cdb = NULL;
+    tsdb_options co = opts();
+    int64_t n = -1;
+    OK(tsdb_open(crash, &co, &cdb));
+    if (cdb) {
+        n = count_rows(cdb, series);
+        tsdb_close(cdb);
+    }
+    rm_tree(crash);
+    return n;
+}
+
+/* The write that finds the memtable over its limit starts a flush before its append, and what happens while that
+ * runs counts: with wal_sync_ms > 0 nothing after the append checks, so a write whose engine failed or whose request
+ * was abandoned meanwhile must be refused before it, appending nothing (not in the memtable, not in the WAL: a
+ * crash does not bring it back). A request already abandoned starts no flush at all. */
+static void test_backpressure_guards(const char *base)
+{
+    static const char *const what[] = {"flush hook runs, nothing happens", "engine failed by the flush",
+                                       "request abandoned during the flush", "request abandoned before"};
+    for (int c = 0; c < 4; c++) {
+        char name[600];
+        snprintf(name, sizeof name, "%s/failstop-bpguards%d", base, c);
+        tsdb_options o = opts();
+        o.buffer_rows = 200;
+        o.wal_sync_ms = 10000; /* the WAL is synced by the timer: the write is acknowledged at its append */
+        tsdb *db = open_fresh(name, o);
+        tsdb_sid id;
+        OK(tsdb_series(db, "s", &id));
+        bp_db = db, bp_hits = 0, bp_flag = 0;
+        bp_mode = c == 1 ? BP_FAIL_ENGINE : c == 2 ? BP_ABANDON : BP_COUNT;
+        flush_fail_main = pthread_self();
+        __atomic_store_n(&mt_test_flush_fail, bp_hook, __ATOMIC_RELAXED);
+        tsdb_set_abandon_flag(&bp_flag);
+        for (int k = 0; k < 8; k++)
+            OK(insert_n(db, id, k * 50, 50, false)); /* the memtable reaches 2 x buffer_rows with the 8th */
+        CHECK(count_rows(db, "s") == 400);
+        CHECK(bp_hits == 0);
+        if (c == 3)
+            bp_flag = 1;
+        int rc = insert_n(db, id, 400, 50, false);
+        int want = c == 0 ? 0 : c == 1 ? TSDB_ERR_IO : TSDB_ERR_ABANDONED;
+        if (rc != want) {
+            fprintf(stderr, "backpressure guards (%s): the write gave %s, want %s\n", what[c], tsdb_strerror(rc),
+                    tsdb_strerror(want));
+            failures++;
+        }
+        if (bp_hits != (c == 3 ? 0 : 1)) {
+            fprintf(stderr, "backpressure guards (%s): the flush hook ran %d times\n", what[c], bp_hits);
+            failures++;
+        }
+        int64_t rows = c == 0 ? 450 : 400; /* a refused write is in neither the memtable nor the WAL */
+        CHECK(count_rows(db, "s") == rows);
+        CHECK(memtable_rows_of(db) == (uint64_t)rows);
+        CHECK(is_failed(db, c == 1 ? "WAL fdatasync" : NULL) == (c == 1));
+        if (c == 1)
+            CHECK(fired() == 1);
+        __atomic_store_n(&mt_test_flush_fail, NULL, __ATOMIC_RELAXED);
+        tsdb_set_abandon_flag(NULL);
+        if (c == 1)
+            db = reopen(db); /* the failed engine: only a reopen replays from disk */
+        else
+            OK(tsdb_commit(db));
+        CHECK(count_rows(db, "s") == rows);
+        tsdb_close(db);
+        CHECK(count_after_crash(name, "s") == rows);
+    }
 }
 
 /* B2: a failure while the parts of one insert are written, synced or named is never a success, and the insert
@@ -1978,6 +2126,8 @@ int main(int argc, char **argv)
     test_memtable_room(root);
     test_memtable_room_runs(root);
     test_backpressure_flush(root);
+    test_memtable_room_more(root);
+    test_backpressure_guards(root);
     test_fsync_results(root);
     if (!failures) {
         char cmd[512];
