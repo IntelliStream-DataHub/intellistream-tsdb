@@ -612,12 +612,24 @@ int cluster_make_secret(const char *path, char *err, size_t errn)
 
 /* ---- the CLI's side: one blocking request */
 
+/* write_all and read_all leave errno as the cause: ETIMEDOUT when the deadline passed, ECONNRESET for an end of file
+ * (the peer closed the link), else the call's own (the admin client's message names it: a slow server and a closed
+ * link look alike without it). */
 static int write_all(int fd, const uint8_t *p, size_t n, int64_t deadline_ms)
 {
     while (n) {
         struct pollfd pf = {fd, POLLOUT, 0};
         int64_t left = deadline_ms - (int64_t)(iso_now_ns() / MS);
-        if (left <= 0 || poll(&pf, 1, (int)left) <= 0)
+        if (left <= 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        int pr = poll(&pf, 1, (int)left);
+        if (pr == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (pr < 0)
             return -1;
         ssize_t w = write(fd, p, n);
         if (w < 0 && (errno == EINTR || errno == EAGAIN))
@@ -635,11 +647,22 @@ static int read_all(int fd, uint8_t *p, size_t n, int64_t deadline_ms)
     while (n) {
         struct pollfd pf = {fd, POLLIN, 0};
         int64_t left = deadline_ms - (int64_t)(iso_now_ns() / MS);
-        if (left <= 0 || poll(&pf, 1, (int)left) <= 0)
+        if (left <= 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        int pr = poll(&pf, 1, (int)left);
+        if (pr == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (pr < 0)
             return -1;
         ssize_t got = read(fd, p, n);
         if (got < 0 && (errno == EINTR || errno == EAGAIN))
             continue;
+        if (got == 0)
+            errno = ECONNRESET;
         if (got <= 0)
             return -1;
         p += got;
@@ -655,7 +678,11 @@ static int read_frame(int fd, int64_t deadline_ms, uint8_t *type, uint8_t **payl
     if (read_all(fd, h, 4, deadline_ms) != 0)
         return -1;
     uint32_t n = le32(h);
-    if (n == 0 || n > FRAME_MAX || read_all(fd, h + 4, 1, deadline_ms) != 0)
+    if (n == 0 || n > FRAME_MAX) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (read_all(fd, h + 4, 1, deadline_ms) != 0)
         return -1;
     uint8_t *p = malloc(n);
     if (!p)
@@ -700,7 +727,7 @@ int cluster_admin(const char *addr, const uint8_t *secret, size_t secret_len, in
     trlen = b.len - 5;
     memcpy(tr, b.p + 5, trlen);
     if (write_all(fd, b.p, b.len, deadline) != 0 || read_frame(fd, deadline, &type, &p, &n) != 0) {
-        snprintf(err, errn, "%s did not answer as a tsdbd cluster peer port", addr);
+        snprintf(err, errn, "%s did not answer as a tsdbd cluster peer port (%s)", addr, strerror(errno));
         goto out;
     }
     /* HELLO_ACK: id, uuid, identity, nonce, then the MAC over the transcript so far */
@@ -736,13 +763,13 @@ int cluster_admin(const char *addr, const uint8_t *secret, size_t secret_len, in
     int wr = write_all(fd, b.p, b.len, deadline);
     buf_free(&a);
     if (wr) {
-        snprintf(err, errn, "%s closed the connection (a wrong secret?)", addr);
+        snprintf(err, errn, "%s closed the connection (a wrong secret?): %s", addr, strerror(errno));
         goto out;
     }
     for (;;) {
         if (read_frame(fd, deadline, &type, &p, &n) != 0) {
-            snprintf(err, errn, "no answer from %s within %d ms (a wrong secret closes the connection)", addr,
-                     timeout_ms);
+            snprintf(err, errn, "no answer from %s within %d ms (a wrong secret closes the connection): %s", addr,
+                     timeout_ms, strerror(errno));
             goto out;
         }
         uint8_t t[TAG];

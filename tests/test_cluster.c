@@ -263,7 +263,10 @@ static void scenario(const char *name)
 
 static void peer_of(int i, char *out, size_t n) { snprintf(out, n, "127.0.0.1:%d", pports[i]); }
 
-/* One admin op to server i; follows NOTLEADER once when `follow`. Returns the op's result; dies when unreachable. */
+/* One admin op to server i; follows NOTLEADER once when `follow`. Returns the op's result; dies when unreachable.
+ * The deadline is 30 s: the five servers of a scenario under AddressSanitizer on a machine that other gates keep busy
+ * answered a STATUS after more than 10 s (test-trust gate tt4-asan: "closed the connection" at [feed], the deadline
+ * of the handshake passing between its two halves); a hung server is the watchdog's to end, not this deadline's. */
 static int admin(int i, int op, const void *req, size_t rl, int follow, uint8_t **reply, size_t *len)
 {
     char target[META_ADDR_MAX + 1], err[1024];
@@ -272,7 +275,7 @@ static int admin(int i, int op, const void *req, size_t rl, int follow, uint8_t 
         int rc;
         *reply = NULL;
         *len = 0;
-        if (cluster_admin(target, secret, secret_len, op, req, rl, 10000, &rc, reply, len, err, sizeof err) != 0)
+        if (cluster_admin(target, secret, secret_len, op, req, rl, 30000, &rc, reply, len, err, sizeof err) != 0)
             die("admin op %d to %s: %s", op, target, err);
         if (rc == CLUSTER_ERR_NOTLEADER && follow && hop == 0 && *len > 0 && *len < sizeof target) {
             memcpy(target, *reply, *len);
@@ -935,6 +938,35 @@ static void scen_secret(void)
     if (!strstr(err, "secret"))
         die("a wrong secret failed with \"%s\", not a word of the secret", err);
     printf("  a wrong secret is refused: %s\n", err);
+    /* The message names the cause: a peer that is slow (the deadline passed) and one that closed the link looked alike,
+     * which left the tt4-asan failure of [feed] undecidable. A listener that never answers, and one that closes. */
+    for (int closes = 0; closes < 2; closes++) {
+        int lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_in la = {.sin_family = AF_INET};
+        la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t ll = sizeof la;
+        if (lfd < 0 || bind(lfd, (struct sockaddr *)&la, sizeof la) != 0 || listen(lfd, 4) != 0 ||
+            getsockname(lfd, (struct sockaddr *)&la, &ll) != 0)
+            die("listener for the cause test: %s", strerror(errno));
+        char ls[64];
+        snprintf(ls, sizeof ls, "127.0.0.1:%d", (int)ntohs(la.sin_port));
+        pid_t kid = closes ? fork() : 0;
+        if (kid == 0 && closes) { /* accepts one link and closes it at once, with the HELLO unread */
+            int a = accept(lfd, NULL, NULL);
+            if (a >= 0)
+                close(a);
+            _exit(0);
+        }
+        if (cluster_admin(ls, secret, secret_len, CLUSTER_OP_STATUS, NULL, 0, 400, &rc, &rep, &rl, err, sizeof err) == 0)
+            die("a listener that %s gave an answer", closes ? "closes" : "never answers");
+        const char *cause = strerror(closes ? ECONNRESET : ETIMEDOUT);
+        if (!strstr(err, cause))
+            die("a peer that %s: \"%s\", the cause (%s) is not named", closes ? "closes the link" : "never answers", err,
+                cause);
+        if (kid > 0)
+            waitpid(kid, NULL, 0);
+        close(lfd);
+    }
     /* a long frame before the handshake: closed at once, never buffered */
     int fd = dial_peer(0);
     uint8_t h[5] = {0, 0, 0x10, 0, W_HELLO}; /* 1 MiB */
@@ -1659,9 +1691,10 @@ static void scen_syncrace(void)
 /* Power loss on the metadata state (crashfs under server 0's state directory): what the leader acknowledged, it keeps.
  * Three watchers join (the one voter commits each entry after its own sync), then the power fails at the next write
  * the server makes. After the restart the state holds everything that was acknowledged and the term has gone up.
- * Catches a log that is never synced (applied falls back), a hard state that is never saved (the term restarts from
- * the start) and a snapshot whose directory entry is not synced (with `snaps`: the log was compacted behind it, and the
- * state goes back to an earlier image). What each scenario catches was measured, not assumed (test-trust review,
+ * Catches a log that is never synced at all (applied falls back), a hard state that is never saved (the term restarts
+ * from the start) and, with `snaps` (the log is compacted behind the snapshot), a snapshot lost with its directory
+ * entry where no other sync covers it; a single missing sync site is another matter, see below.
+ * What each scenario catches was measured, not assumed (test-trust review,
  * 2026-11-09): with every fdatasync of raft_log.c removed `power` fails; with only the hard state's sync removed (C2)
  * `power` and `powersnap` PASS, because the term saved at the restart is synced by the log's own rounds, and only
  * `powervote` (below) fails it, in every run, and `make test` plants it (cluster-mutants). NOT caught (measured, 6 runs
