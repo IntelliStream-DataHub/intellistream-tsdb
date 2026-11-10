@@ -763,9 +763,15 @@ $(B)/tsdbd-mut-c2: $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(filter-out $(B)/raft_raft_log.o,$(CLUSTER_OBJ)) \
 	    $(B)/raft_log_c2.o $(LIB) $(LDLIBS) $(URING_LIBS)
+# Under AddressSanitizer crashfs cannot be preloaded (test_cluster's powervote prints "skipped" and passes, so the planted
+# bug would not fail anything): the target says so and does not run, instead of reporting a mutant that nothing caught.
 cluster-mutants: $(B)/tsdbd-mut-c2 $(B)/test_cluster $(B)/tsdb $(CRASHFS_SO)
+ifeq ($(findstring fsanitize=address,$(CFLAGS)),)
 	tests/expect_fail.sh "hard state is term" env CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd-mut-c2 TSDB_CLI=$(B)/tsdb \
 	    ./$(B)/test_cluster $(SCRATCH) powervote
+else
+	@echo "cluster-mutants: SKIPPED under AddressSanitizer (crashfs cannot be preloaded into it; 1 mutant not run)"
+endif
 
 # tests/fuzz/fuzz_frames.c includes server/tsdbd.c (epoll only: no ring needed without sockets). FRAMES_COV is
 # -fsanitize-coverage=trace-pc in `make fuzz-frames`, which feeds its coverage-guided driver (auth.c, the login and
