@@ -245,6 +245,8 @@ static _Atomic int64_t death_ts;
 static atomic_bool nem_busy;
 static double react_ms[16384];
 static int nreact;
+static bool slow_create;            /* --mutant-slowcreate: waits 1 s before it creates the series (a server that crashed
+                                     * by then must end the run at "cannot connect", not hang it: a self-test) */
 static bool idle_mutant;            /* --mutant-idle: a nemesis that sleeps through its naps; the check must fail */
 static bool idle_mutant_long;       /* --mutant-longnap: naps of 5 s without watching, so it wakes too rarely to be judged
                                      * by a reaction time: the count floor must fail it */
@@ -2513,13 +2515,28 @@ static int make_volumes(void)
 
 static int create_series(int from, int to)
 {
-    tsdbc *c = connect_retry();
+    if (from >= to)
+        return 0;
+    if (slow_create)
+        sleep(1);
+    /* bounded, never connect_retry(): that waits for as long as `stop` is unset, and a server that crashed right
+     * after it listened (the self-test's, under load: 0.1 s) is never found again: the run hung for hours */
+    tsdbc *c = NULL;
+    for (int i = 0; i < 500 && connect_own(atomic_load(&port), atomic_load(&server_pid), &c) != 0; i++)
+        usleep(10000);
+    if (!c) {
+        fprintf(stderr, "jepsen: cannot connect to create the series (the server died or does not listen)\n");
+        print_tail(slogpath);
+        outage_keep_log();
+        return 1;
+    }
     for (int s = from; s < to; s++) {
         char name[32];
         snprintf(name, sizeof name, "jepsen.%d", s);
         if (tsdbc_series(c, name, 1, &ids[s])) {
             fprintf(stderr, "jepsen: cannot create series\n");
             tsdbc_close(c);
+            outage_keep_log();
             return 1;
         }
     }
@@ -2690,6 +2707,7 @@ int main(int argc, char **argv)
                                    {"auth", no_argument, 0, 'A'},           {"outagefs", required_argument, 0, 'o'},
                                    {"mutant-idle", no_argument, 0, 'I'},
                                    {"mutant-longnap", no_argument, 0, 'L'},
+                                   {"mutant-slowcreate", no_argument, 0, 'C'},
                                    {"scan-slow-probes", required_argument, 0, 'P'},
                                    {0, 0, 0, 0}};
     int ch;
@@ -2711,6 +2729,7 @@ int main(int argc, char **argv)
         case 'E': feed = true; break;
         case 'I': idle_mutant = true; break;
         case 'L': idle_mutant_long = true; break;
+        case 'C': slow_create = true; break;
         case 'P': { /* the self-test of slow_probe_since: FILE,DOMAIN,SINCE prints the time of the latest line, or 0 */
             char *a = strdup(optarg), *c2 = strrchr(a, ','), *c1 = c2 ? (*c2 = 0, strrchr(a, ',')) : NULL;
             if (!c1)

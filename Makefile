@@ -972,6 +972,10 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --seconds 8 --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 2 ] || ! find $(JEPSEN_DIR)-selftest.outage-s1.server.log -size +0 -mmin -2 2>/dev/null | grep -q .; then \
 	        echo "jepsen-selftest: an outage run that ended at a server that never started did not keep its log (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_TSDBD=tests/jepsen/early-segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest \
+	    --nemesis kill --seconds 5 --mutant-slowcreate 2>&1); rc=$$?; \
+	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'cannot connect to create the series'; then \
+	        echo "jepsen-selftest: a run whose server crashed before the series were created hung or went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage --seconds 20 --seed 2 \
 	    --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^outage heals: [1-9][0-9]*, [0-9]* judged .*, 0 not judged$$'; then \
