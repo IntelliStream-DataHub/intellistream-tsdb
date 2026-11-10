@@ -9,6 +9,7 @@
 #include "harness.h"
 
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <signal.h>
@@ -747,7 +748,14 @@ static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
     int fd = raw_connect();
     double t0 = now_ms();
     raw_values_multi(fd, 7, list, 64);
-    usleep(1500000);
+    /* When the first byte of the reply arrives: the server's window starts at its first send, a few ms before. The
+     * bounds on the close below are counted from here, not from the request (a first send delayed by a busy server
+     * is not the close's lateness). Nothing is consumed. */
+    struct pollfd pf = {fd, POLLIN, 0};
+    double first_byte = poll(&pf, 1, 15000) == 1 ? now_ms() - t0 : -1;
+    CHECK(first_byte >= 0);
+    if (first_byte < 1500)
+        usleep((useconds_t)((1500 - first_byte) * 1000));
     long grown = rss_anon_kb(pid) - before;
     fprintf(stderr, "stalled reader: server anonymous memory grew %ld KiB\n", grown);
     CHECK(SANITIZED || grown <= (64 + 8 + 48) * 1024L);
@@ -773,8 +781,11 @@ static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
      * is a right answer to that (CI, io_uring under ASan: this read began at a fixed 4.5 s, before the close). The
      * close has to come neither before the timeout nor long after it. */
     double closed = now_ms() - t0;
+    /* From above: the first tick at or after first send + timeout is at most a second late; the rest is slack for a
+     * sanitizer build on a busy runner. */
+    double limit = first_byte + send_timeout_s * 1e3 + 1000 + 5000;
     int shut = server_shut_connection(fd);
-    for (; shut == 0 && closed < send_timeout_s * 1e3 + 15000; closed = now_ms() - t0) {
+    for (; shut == 0 && closed < limit; closed = now_ms() - t0) {
         usleep(20000);
         shut = server_shut_connection(fd);
     }
@@ -782,11 +793,14 @@ static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
         double wait = send_timeout_s * 1e3 + 1500 - closed;
         if (wait > 0)
             usleep((useconds_t)(wait * 1000));
-    } else {
-        fprintf(stderr, "stalled reader: the server shut the connection %.0f ms after the request (--send-timeout %d "
-                        "s)\n", closed, send_timeout_s);
+    } else if (shut == 0) {
+        fprintf(stderr, "stalled reader: the server has not shut the connection after %.0f ms (first byte at %.0f "
+                        "ms, --send-timeout %d s)\n", closed, first_byte, send_timeout_s);
         CHECK(shut == 1);
-        CHECK(closed >= send_timeout_s * 1e3 - 500);
+    } else {
+        fprintf(stderr, "stalled reader: the server shut the connection %.0f ms after the request, first byte at "
+                        "%.0f ms (--send-timeout %d s)\n", closed, first_byte, send_timeout_s);
+        CHECK(closed >= first_byte + send_timeout_s * 1e3 - 500);
     }
     struct timeval tv = {10, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
