@@ -42,7 +42,7 @@ The Rust, Python and Java clients need `cargo`, `python3` (with `maturin`) and `
 make test               # all unit, crash-recovery and server tests
 make test IO=epoll      # the server tests on epoll only
 make asan               # the tests under AddressSanitizer and UBSan (starts with make clean)
-make tsan               # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
+make tsan               # the tests under ThreadSanitizer, in build-tsan/ (over an hour on 4 CPUs; `TEST_TARGET=` runs one group, see CI below)
 make jepsen             # fault injection: kill -9, simulated power loss, pauses, disk errors, misdirected I/O, rot
 make fuzz               # the fuzz harnesses (FUZZ_SECONDS=600 for longer)
 make test-clients       # the Rust, Python and Java clients against build/tsdbd
@@ -76,8 +76,12 @@ Ubuntu 24.04 runners with 4 CPUs and 16 GB. These checks should be green before 
 
 - **build and test:** `make`, then `make test`. If the runner does not allow io_uring, the server tests run on
   epoll only (`make test IO=epoll`) and the log says so.
-- **AddressSanitizer and UBSan:** `make asan`.
-- **ThreadSanitizer:** `make tsan`.
+- **AddressSanitizer and UBSan, ThreadSanitizer:** `make asan` and `make tsan`. Each of them is seven jobs, one per
+  group of `make test` (`make asan TEST_TARGET=test-meta`: the groups are listed under `TEST_GROUPS` in the Makefile),
+  because all of it under a sanitizer takes over an hour on 4 CPUs. A new group of `make test` needs an entry in both
+  matrices of `ci.yml`; `tests/check_ci_groups.sh` (run by `make test`) fails without it. Measured under tsan on
+  4 CPUs: the two unit groups about 20 minutes each, meta and cluster 15, each half of the meta mutants 18 to 19, the
+  server tests 4 on each backend; every job has 60 minutes.
 - **clients:** `make test-clients` (Rust, Python and Java).
 - **portable build and tarball:** `make PORTABLE=1`, `make dist` and `make dist-test`.
 - **integration tests:** `make check-version`, then `make integration-tests`.
@@ -124,8 +128,13 @@ tell us in the pull request, so that we can fix the test.
    [AGENTS.md](AGENTS.md).
 8. **Update the [CHANGELOG](CHANGELOG.md)** under "Unreleased" for anything a user can notice.
 9. **A new dependency needs a compatible license** (MIT, BSD, Apache-2.0 and the like; no GPL or LGPL code linked
-   in). Add it to [docs/licenses.md](docs/licenses.md), and to `dist/THIRD-PARTY-NOTICES` if `make dist` links it
+   in, and nothing that cannot be part of an AGPL-3.0 work or, in the client libraries, of an Apache-2.0 work). Add it to [docs/licenses.md](docs/licenses.md), and to `dist/THIRD-PARTY-NOTICES` if `make dist` links it
    into the tarball.
+
+10. **Every source file has an `SPDX-License-Identifier` line** (the first line, or the second after a `#!` line)
+   with the licence of its directory, and an Apache-2.0 file never includes, imports or depends on an AGPL-3.0-only
+   one. `tools/check-spdx.sh` checks it (`make test` runs it); [LICENSING.md](LICENSING.md) lists which directory is
+   which.
 
 Do not commit `build*/` directories or benchmark data.
 
@@ -144,8 +153,8 @@ Keep each commit to one logical change, and write the message so that it says **
 
 Every commit must carry a `Signed-off-by` line. That is the
 [Developer Certificate of Origin](https://developercertificate.org/): by signing off you say that you wrote the
-change (or have the right to submit it) and that you are fine with it going into the project under the
-[Apache License 2.0](LICENSE). It is not a legal contract with us and needs no paperwork.
+change (or have the right to submit it) and that you are fine with it going into the project under the licence of
+the files it changes (see "License" below). It needs no paperwork beyond the line itself.
 
 ```sh
 git commit -s        # adds: Signed-off-by: Your Name <you@example.com>
@@ -191,6 +200,23 @@ any file. Session links are private and add noise to the history. The `commit-ms
 
 ## License
 
-By contributing you agree that your contribution is licensed under the [Apache License 2.0](LICENSE), like the
-rest of tsdb. The copyright of the project is held by IntelliStream AS; you keep the copyright of your own
-contribution (the sign-off is all we ask for).
+tsdb has two licences, by directory ([LICENSING.md](LICENSING.md)): the server, the engine, the tools and the embedded
+bindings are **AGPL-3.0-only**, the client libraries (the C, Rust, Python and Java network clients and the Pulsar
+connector) are **Apache-2.0**, and IntelliStream AS also offers a commercial licence for the AGPL parts. A new file
+gets the SPDX line of its directory.
+
+By submitting a contribution (a pull request, a patch, anything you send to us for inclusion) you agree that:
+
+1. it is licensed to everyone under the licence of the files it changes, AGPL-3.0-only or Apache-2.0, as the
+   project distributes them; and
+2. you also grant IntelliStream AS a perpetual, worldwide, non-exclusive, royalty-free, irrevocable licence to use,
+   copy, modify, sublicense and distribute your contribution under other terms as well, including a commercial
+   licence, and in a later version of the project under another open source licence. You keep the copyright of your
+   contribution, and this grant is what keeps the dual licence possible.
+
+The sign-off (`git commit -s`) means you accept both. If your employer owns what you write, get the employer's
+permission first.
+
+> **For the owner, before outside contributions are accepted:** have a lawyer check the wording of this grant (the
+> scope of "other terms", the position of employers, the effect in your jurisdiction). It is a plain-language
+> draft, not legal advice, and the project has only had one author so far.

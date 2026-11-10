@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Login (docs/design-auth.md §3, §9): tsdbd started with USERS and without --no-auth, through the C client and raw
  * frames, on the backend TSDBD_IO names (make test runs uring and epoll). The RFC 7677 §3 exchange runs twice byte
  * for byte: the C client against a fake server here, and tsdbd's server side (server/auth.c, linked in) in this
@@ -772,6 +773,29 @@ static void test_follower(const char *dir)
     printf("  follower: logins, admin ops READONLY, the CLI's grant after %.0f ms, its drop\n", took * 1000);
 }
 
+/* A user dropped while connected is answered TSDB_ERR_AUTH once and the connection closes: the next frame, sent as
+ * soon as the client has read the answer, is never answered. Without the stop in parse() it was, whenever the worker
+ * that sent the answer had not yet reported done (a preempted worker: the server's TSDBD_TEST_AUTH_DELAY_MS stands
+ * for it): the client got AUTH, AUTH, AUTH for as long as it kept sending (CI, 4 CPUs under tsan). */
+static void test_dropped_closes(const char *dir)
+{
+    setenv("TSDBD_TEST_AUTH_DELAY_MS", "400", 1);
+    pid_t srv = start(dir, NULL);
+    unsetenv("TSDBD_TEST_AUTH_DELAY_MS");
+    tsdbc *root = login_as("root", "rootpw");
+    OK(tsdbc_user_create(root, "acme/gone", "gonepw", 0, 0));
+    tsdbc *g = login_as("acme/gone", "gonepw");
+    CHECK(query(g, sx) == TSDB_ERR_DENIED);
+    OK(tsdbc_user_drop(root, "acme/gone"));
+    CHECK(query(g, sy) == TSDB_ERR_AUTH);
+    CHECK(query(g, sy) == TSDB_ERR_IO); /* not AUTH again, whatever the worker is doing */
+    CHECK(query(g, sy) == TSDB_ERR_IO);
+    tsdbc_close(g);
+    tsdbc_close(root);
+    stop(srv);
+    printf("  a dropped user: AUTH once, then closed, even with the answering worker slow to report\n");
+}
+
 /* A29: USERS losing its last superuser while tsdbd runs: it keeps serving with one log line; a restart refuses. */
 static void test_no_superuser_left(const char *dir, pid_t *srv)
 {
@@ -1052,6 +1076,7 @@ int main(int argc, char **argv)
     CHECK(log_count("rootpw") == 0 && log_count("ingestpw") == 0 && log_count("wrongpw") == 0 &&
           log_count("newpw") == 0);
     stop(srv);
+    test_dropped_closes(dir);
     test_login_timeout(dir);
     srv = start(dir, NULL);
     test_no_superuser_left(dir, &srv);

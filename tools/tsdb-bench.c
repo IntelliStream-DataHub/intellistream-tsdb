@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Benchmark: insert throughput, merge cost, compression and query speed on
  * the sensor workloads of datasets.h.

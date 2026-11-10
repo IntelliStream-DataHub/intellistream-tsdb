@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 /* tsdb site: the phone menu, the docs sidebar and its section list, language tabs, copy buttons and the benchmark
  * charts. Plain JavaScript, no libraries. Loaded in <head>; everything waits for the document. localStorage may be
  * missing or throw (private windows, blocked storage): every access is wrapped, and the page works without it. The

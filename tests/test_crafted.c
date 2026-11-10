@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Crafted files and extreme inputs: what someone with write access to the
  * data directory (or a shared NFS mount) can put there, and inputs at the

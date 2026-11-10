@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Every block decoder on arbitrary bytes. Granule payloads are hashed only
  * with verify_checksums, so a damaged or crafted part hands its bytes straight

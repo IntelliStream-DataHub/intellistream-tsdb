@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Calendar grouping against glibc: for each zone, the bucket of every row is
  * computed with localtime_r and every bucket start with mktime, and both must

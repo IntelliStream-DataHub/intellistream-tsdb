@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Excerpts of real pressure readings: one granule (8192 values) each of sensors PS2 and PS3 of the
  * "Condition monitoring of hydraulic systems" data set (UCI Machine Learning Repository, CC BY 4.0;

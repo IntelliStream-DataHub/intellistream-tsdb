@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // verify-patterns.js: the cheap adversarial-verify shape for fan-out workflows (audits, reviews), measured on the
 // clock audit of 2026-10-18 (189 agents, 29 M relative cost; about half of it avoidable). Paste what you need into a
 // Workflow script. Three rules:

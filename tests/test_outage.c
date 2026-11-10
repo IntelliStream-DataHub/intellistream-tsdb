@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdbd with two volumes on two storage domains under the outagefs shim (ha.md 15.3 and 15.5, N1).
  *
  * The root is local; volume A and volume B each are a domain (--health-domain). One writer thread per volume inserts

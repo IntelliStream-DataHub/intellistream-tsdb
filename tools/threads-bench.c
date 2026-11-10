@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * How many threads a query should use for the rows it decodes: the sweep behind QUERY_ROWS_PER_THREAD
  * (src/internal.h, query_threads_for).

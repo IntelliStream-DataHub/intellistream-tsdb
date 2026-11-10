@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A client for tsdbd, the network server of the tsdb time series database.
 //!
 //! One [`Client`] is one TCP connection. With it you create series, insert
@@ -64,7 +65,8 @@
 //! repository; this crate mirrors the C client in `client/tsdb_client.h`.
 //! Its dependencies are `zstd`, `rayon` (the thread pool of the batch calls: [`Pool`] and the
 //! `*_many` calls of `Db`), `sha2` and `hmac` (the login) and, on Unix, `libc` (for the TCP keepalive
-//! options and the login's nonces); with the `embedded` feature also `tsdb-sys`, the engine.
+//! options and the login's nonces). The embedded `Db` (the database inside your process) is not here: it is
+//! the crate `intellistream-tsdb-embedded` (AGPL-3.0-only), which builds on this one.
 //!
 //! A tsdbd that requires a login (the default) is reached with [`Client::connect_opts`] or
 //! [`Pool::connect_opts`] and a [`ConnectOptions`] naming the user and the password; the users and their
@@ -76,8 +78,6 @@ mod batch;
 mod calendar;
 mod client;
 mod database;
-#[cfg(feature = "embedded")]
-mod embedded;
 mod error;
 mod ha;
 mod keepalive;
@@ -95,11 +95,10 @@ pub use batch::{AggQuery, InsertBatch, Pool, RangeQuery, Target};
 pub use calendar::calendar_bounds;
 pub use client::{CONNECT_TIMEOUT, Client, ConnectOptions, DEFAULT_COMPRESSION};
 pub use database::Database;
-#[cfg(feature = "embedded")]
-pub use embedded::{ChunkRef, Db, Options, PartInfo, RawValues, ValueCodec};
 pub use error::{Error, Result, Status, strerror};
 pub use ha::{
-    DEFAULT_RETRY_BUDGET, ErrorInfo, MOVED_HANDOFF, Moved, PartialVol, TopoNode, TopoVol, Topology, Unavailable, VOL_ANY,
+    DEFAULT_RETRY_BUDGET, ErrorInfo, MOVED_HANDOFF, Moved, PartialVol, TopoNode, TopoVol, Topology, Unavailable,
+    VOL_ANY,
 };
 pub use keepalive::KeepAlive;
 pub use latest::{Latest, LatestKind, LatestOpts, LatestValue};
@@ -112,3 +111,15 @@ pub use types::{
 pub type SeriesId = u64;
 
 pub use value::{Bitmap, Column, ColumnRef, NULL_F32_BITS, NULL_F64_BITS, Native, Value, ValueType, Values, ValuesRef};
+
+/// What the sibling crate `intellistream-tsdb-embedded` (the embedded `Db`) builds on. Not a public API: no
+/// semver promise, so that crate pins this one with `=`.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::batch::{chains, par_map};
+    pub use crate::client::bounds;
+    pub use crate::error::*;
+    pub use crate::latest::*;
+    pub use crate::types::*;
+    pub use crate::value::*;
+}

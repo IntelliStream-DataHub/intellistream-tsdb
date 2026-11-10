@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Value types and nulls (protocol version 2) against a real tsdbd."""
 
 import array

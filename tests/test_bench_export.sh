@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # `tsdb-bench --export` writes the RowBinary file (16-byte rows: u32 series number, i64 ts, f32 value) without a
 # database, so it has no series ids to put in the rows: the file keeps the NUMBERS, 0 .. series - 1. It once
 # dereferenced the id table that only a database run fills, and crashed.

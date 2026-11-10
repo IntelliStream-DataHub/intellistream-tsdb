@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package ai.intellistream.tsdb;
 
 /** How a time-weighted average joins one reading to the next. */

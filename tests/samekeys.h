@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Concurrent writers on the same keys: the model and the checks, shared by
  * test_tsdb (embedded) and test_server (over the network).

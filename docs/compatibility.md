@@ -6,7 +6,7 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 
 | | where | now |
 |---|---|---|
-| release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.10.0 |
+| release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.11.0 |
 | disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 9 (0.10.0; 0.9.0 and 0.9.1 wrote 8) |
 | wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 14 |
 | oldest protocol spoken (the floor) | `TSDB_PROTOCOL_MIN` in `include/tsdb_protocol.h` | 12 |
@@ -16,6 +16,7 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 
 | release | reads disk format | wire protocol (floor) | embedded C ABI | clients it talks to |
 |---|---|---|---|---|
+| 0.11.0 | 9 | 14 (12) | 7 | clients and servers of protocol 12, 13 and 14 |
 | 0.10.0 | 9 (a format-8 database after `tsdb <dir> upgrade`, below) | 14 (12) | 7 | clients and servers of protocol 12, 13 and 14 |
 | 0.9.1 | 8 | 12 (12) | 3 | protocol 12 only |
 | 0.9.0 | 8 | 12 (12) | 3 | protocol 12 only |

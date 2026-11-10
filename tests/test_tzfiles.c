@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Time zone input the calendar must refuse or survive: crafted TZif files
  * under TZDIR, POSIX rules in their footers, fixed offsets and zone names.

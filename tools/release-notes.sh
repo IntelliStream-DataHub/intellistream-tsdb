@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Prints the text of a GitHub release: docs/releases/TAG.md when there is one, else the section of CHANGELOG.md for
 # the tag's version ("## [X.Y.Z] - date" up to the next "## "). The release workflow
 # (.github/workflows/release.yml) puts it on the release page; tests/test_release_notes.sh is its test.

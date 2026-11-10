@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Build and test tsdb on AlmaLinux 10 inside Podman (never Docker).
 #
 #   tests/distro/almalinux10.sh [step...]     steps: build portable test asan  (default: all)

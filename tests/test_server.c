@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Integration test: starts build/tsdbd and talks to it through the client library. */
 #define _GNU_SOURCE
 #include "tsdb.h"
@@ -2542,7 +2543,9 @@ static void test_metrics(const char *dir)
         pthread_create(&th[i], NULL, metrics_load_thread, &jobs[i]);
     }
     int scrapes_during = 0, saw_conns = 0, saw_busy = 0;
-    for (int done = 0; done < 1;) {
+    /* The load is small: on a loaded or sanitized machine it can finish before the third scrape (asan, epoll, 4 CPUs,
+     * ci-green), so scraping goes on after it until three answered; attempts bound the loop if none does. */
+    for (int done = 0, attempts = 0; (!done || scrapes_during < 3) && attempts < 2000; attempts++) {
         mset cur;
         if (scrape(&cur)) {
             scrapes_during++;

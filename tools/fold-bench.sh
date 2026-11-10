@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # fold-bench at every CPU level of a `make dist` build, interleaved: round r runs every configuration once
 # before round r + 1 starts, so a busy machine slows them alike. Prints, per case, the median rows/s of
 # each configuration and the spread (lowest - highest) over the rounds.

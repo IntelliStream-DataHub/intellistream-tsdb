@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The export stream reader (tools/dump.c): im_pass over any bytes, in the verifying pass (no database) and, for
  * inputs with bit 0 of the last byte set, applying straight away (a pipe, --no-verify) into a scratch database with
  * --merge or --replace. CRC-32C is no authentication: the harness re-seals the header and every record (unless bit 1

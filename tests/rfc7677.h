@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The SCRAM-SHA-256 exchange of RFC 7677 §3, copied from the RFC text: user "user", password "pencil", both nonces
  * fixed. tests/test_crypto.c builds it from the primitives; tests/test_auth.c runs it through the C client against a
  * fake server and through tsdbd's server side (server/auth.c), byte for byte. */

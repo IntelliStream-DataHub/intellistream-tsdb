@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* MSB-first bit streams shared by the codecs. */
 #ifndef TSDB_BITS_H
 #define TSDB_BITS_H

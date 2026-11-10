@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Ports: tsdbd --port 0 --port-file, and the harness side of it (tests/harness.h).
  *
  * Two servers started at once get different ports and each port file names its own server; a server that cannot

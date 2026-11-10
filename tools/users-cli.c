@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * `tsdb <dir> user ...`: the users of tsdbd's login, edited in USERS without opening the engine, so it runs beside
  * a running tsdbd (which reads the change within a second). Whoever can write the directory holds every right

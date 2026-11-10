@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # tsdbd says at startup when its directory is on ext2/3/4 or XFS (macOS: APFS or HFS+) and --verify-checksums is off
 # (those file systems keep no checksums of the data, so a damaged or misdirected data block would be read as wrong
 # values), and says nothing with --verify-checksums or on another file system (tmpfs, ZFS, btrfs, NFS).

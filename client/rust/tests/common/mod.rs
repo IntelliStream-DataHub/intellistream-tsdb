@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Starts `build/tsdbd` for one test: a port tsdbd chose and a fresh data directory.
 //!
 //! The binary is `$TSDBD` or `../../build/tsdbd` (build it with `make` in the

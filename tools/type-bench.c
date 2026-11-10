@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Compression and decode speed of the value types beyond float32: the
  * sensor streams of datasets.h as float64, integer counters, flags and

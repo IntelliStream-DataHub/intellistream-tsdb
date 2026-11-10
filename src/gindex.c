@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The granule index of a part, bit-packed at fixed width and read in place from the mapping.
  *

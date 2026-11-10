@@ -10,7 +10,8 @@ make                      # library, CLI, server, client, benchmarks (into build
 make test                 # all unit, integration and server tests
 make test IO=epoll        # server tests on epoll only (where io_uring is disabled)
 make asan                 # the tests under AddressSanitizer + UBSan
-make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
+make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 80 minutes on 4 CPUs; CI runs the groups of
+                          # make test as separate jobs: make tsan TEST_TARGET=test-meta, see TEST_GROUPS in the Makefile)
 make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO; workloads kv and classes;
                           # misdirected I/O (verify_checksums on and off) and damage at rest (rot) on kv;
                           # kv also with login on (jepsen --auth) under kill and power, on each backend;
@@ -37,7 +38,8 @@ make dist-check-almalinux10   # that suite in an AlmaLinux 10 container (Podman)
 make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu Westmere/SandyBridge if installed
 make meta-soak            # the metadata simulator (tests/test_meta.c) over META_SOAK_SEEDS=5000 seeds of 30 virtual s
 make check-version        # VERSION, tsdb.h, tsdbd/tsdb --version and the client manifests agree (make test runs it)
-make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
+make test-clients         # Rust, Python and Java clients (network and embedded) against build/tsdbd, and test-licenses
+                          # (needs cargo, python3, mvn); make test-spdx: the licence line of every file (part of make test)
 make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
 make integration-tests    # tsdbd + CLI + C/Rust/Python/Java clients end to end, uring and epoll (~2 min, same tools);
                           # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/; mutate.py checks it has teeth;
@@ -145,8 +147,11 @@ cgroup, so `nice` does not keep your work out of its way.
   which edits it beside a running tsdbd). `client/tsdb_crypto.c`: SHA-256, HMAC, PBKDF2 and base64 for SCRAM, used
   by tsdbd, the C client and the CLI. `docs/design-auth.md` is the design (decisions A1-A29).
   `client/`: C client library (does not link the engine);
-  `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
-  A protocol change has to reach all four; `make test-clients` runs their tests.
+  `client/rust`, `client/python` (PyO3 over the Rust crate; its shared glue is `client/python-common`), `client/java`:
+  the other clients, network only and Apache-2.0. The embedded bindings, which contain the engine and are AGPL-3.0:
+  `client/rust-embedded` (`tsdb_embedded::Db`; it uses the client crate's `#[doc(hidden)] __private` module and
+  `client/rust-sys`), `client/python-embedded` (the wheel `intellistream-tsdb-embedded`, module `tsdb_embedded`) and
+  `client/java-embedded`. A protocol change has to reach all four clients; `make test-clients` runs their tests.
 - The cluster (`docs/design-cluster.md`; step 1 of its §14 so far: the metadata group only, nothing on the insert
   path). `src/raft/`: the Raft core copied from intellistream-objects (`UPSTREAM`; `tools/sync-raft.sh` copies it
   again, never edit the copies; `compat.[ch]` is tsdb's shim for what they include). `server/meta.c`: the metadata
@@ -493,7 +498,7 @@ cgroup, so `nice` does not keep your work out of its way.
   lock is taken under either; a user's rights index is built before it is shared and read without a lock.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
-- **Versions.** The release version is the file `VERSION` (0.10.0); `tools/check-version.sh` compares it with
+- **Versions.** The release version is the file `VERSION` (0.11.0); `tools/check-version.sh` compares it with
   `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.
@@ -551,7 +556,7 @@ cgroup, so `nice` does not keep your work out of its way.
   connect to a list of nodes; tsdbd sends only UNAVAILABLE (MOVED, PARTIAL and DROPPED wait for the cluster).
   The planned protocols moved up: QUERY_LATEST 14, the change feed 15, statistics 16.
   All four clients speak 13 and no call is gated on a version below the floor;
-  the embedded bindings (Rust `Db`, Python `Db`, Java `EmbeddedDb`) have the
+  the embedded bindings (Rust `tsdb_embedded::Db`, Python `tsdb_embedded.Db`, Java `EmbeddedDb`) have the
   same operations, and their tests compare them with tsdbd's answers.
 
 - **CPU levels.** `make dist` compiles for x86-64-v2 and compiles codec.c,
@@ -579,6 +584,18 @@ cgroup, so `nice` does not keep your work out of its way.
   (`build/codec-bench`, `build/tsdb-bench`, `build/insert-bench`, `build/tsdbc-bench`).
 - Comparisons with ClickHouse run it in **Podman** (never Docker), bound to
   127.0.0.1, with data on the same filesystem as tsdb's.
+- **Licences** (`LICENSING.md`; from 0.11.0): the server, the engine, the tools, the tests, the benchmarks and the
+  embedded bindings are `AGPL-3.0-only`; the client libraries and what only they use (`client/tsdb_{client,crypto,
+  calendar,pack}.{c,h}`, `include/tsdb.h`, `tsdb_protocol.h`, `tsdb_wire.h`, `tsdb_calendar.h`, `examples/client.c`,
+  `client/rust`, `client/python`, `client/python-common`, `client/java`, `connectors/pulsar`) are `Apache-2.0`.
+  Every source file starts with an `SPDX-License-Identifier:` line (the second line after a `#!`) naming the licence of its
+  directory; `tools/check-spdx.sh` (in `make test`, `tests/test_check_spdx.sh` tests it) fails on a file without one, on
+  the wrong one, on a wrong `license` field in a manifest, and when an Apache-2.0 file includes, imports or depends on an
+  AGPL-3.0-only one (the other way round is fine). A new directory defaults to AGPL; one that must be Apache-2.0 needs a
+  line in `expected()` of the script and in `LICENSING.md`. A new package carries `LICENSE` and `NOTICE` (an Apache
+  package `LICENSES/NOTICE.apache`, an AGPL one the root `NOTICE`; and the Apache
+  text when it is AGPL and packs Apache files): `tools/check-package-licenses.sh`. Outside contributions need the grant
+  of `CONTRIBUTING.md`. Never move code from an AGPL directory into an Apache one (the owner decides that).
 - Never commit `build/` or benchmark data. Commits carry a DCO
   `Signed-off-by` as the last trailer (`git commit -s`) and no links to agent
   sessions.

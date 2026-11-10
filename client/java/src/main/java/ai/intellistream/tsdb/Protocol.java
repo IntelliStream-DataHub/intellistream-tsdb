@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package ai.intellistream.tsdb;
 
 /** Constants of the wire protocol; the authoritative description is {@code include/tsdb_protocol.h}. */

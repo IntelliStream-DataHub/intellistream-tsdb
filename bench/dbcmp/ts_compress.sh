@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # ts_compress.sh PAR: compress_chunk on every chunk of t100m from PAR sessions at once, then ANALYZE.
 # A compression policy would do the same from one background job; parallel sessions report what
 # the machine can do, and the session count belongs in any published number.

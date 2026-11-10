@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 import ai.intellistream.tsdb.Bucket;
 import ai.intellistream.tsdb.Column;
 import ai.intellistream.tsdb.ConnectOptions;

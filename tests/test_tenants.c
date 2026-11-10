@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Tenants, hot lists and residency (docs/design-stats.md steps 3 and 4; src/stats_tenant.c, src/stats_hot.c).
  *

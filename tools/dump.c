@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdb export and import: a database as one self-describing stream (docs/export-format.md has the layout).
  *
  * It exists so that data outlives the on-disk format: before 1.0 a 0.9.x release may change the format, and a

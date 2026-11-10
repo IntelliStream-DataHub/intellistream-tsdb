@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 /* The hero's car: a generic modern open-wheel racing car (no livery, no team's shapes) as a 3D wireframe of about
  * 5,000 edges in metres, projected with a simple perspective camera from slightly above into SVG paths. The body is
  * a surface mesh: lofted cross-section loops along the car with longitudinal lines through them (monocoque and

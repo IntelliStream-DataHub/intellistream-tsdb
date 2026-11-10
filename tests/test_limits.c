@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Limits that stop early. A bucketed query with a limit (aggregates, calendar
  * groups, bounds, the spread, TWA) computes only the buckets it returns plus

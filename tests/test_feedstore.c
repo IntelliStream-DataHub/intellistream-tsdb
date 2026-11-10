@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The change feed's disk side (step F1 of docs/design-cdc.md): the FEED and FEEDSLOTS files, requires=feed, enable
  * and disable, retained WAL segments (fwal_<seq>.log: renamed at flush, open and close instead of unlinked) and the

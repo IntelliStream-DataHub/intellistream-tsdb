@@ -1,13 +1,15 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Copy the Raft core (core, log, wire, simulator) from intellistream-objects into src/raft/ and record where it came
 # from in src/raft/UPSTREAM (docs/design-cluster.md §2.3, decision D2).
 #
 #   tools/sync-raft.sh [--repo DIR] COMMIT
 #
-# The files are copied byte for byte below an Apache 2.0 header, so `git diff src/raft` after a sync shows exactly
+# The files are copied byte for byte below an AGPL-3.0-only header, so `git diff src/raft` after a sync shows exactly
 # what changed upstream. Nothing in src/raft/*.[ch] is edited by hand: what tsdb needs of isod's common code is in
 # src/raft/compat.h and compat.c, which this script does not touch. The owner of intellistream-objects granted
-# copying these files into tsdb under Apache 2.0 on 2026-11-06.
+# copying these files into tsdb on 2026-11-06 under Apache 2.0; intellistream-objects is AGPL-3.0-only now, as tsdb is,
+# and the header says so.
 set -eu
 
 repo=${RAFT_REPO:-$(dirname "$0")/../../intellistream-objects}
@@ -23,17 +25,9 @@ for f in $files; do
     tmp=$dst/.$f.tmp
     {
         cat <<'EOF'
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Copyright 2026 IntelliStream AS
- *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
- * with the License. You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
- * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for
- * the specific language governing permissions and limitations under the License.
  *
  * Copied from intellistream-objects src/raft (src/raft/UPSTREAM names the commit) by tools/sync-raft.sh; everything
  * below this comment is the upstream file unchanged. Do not edit it here: change it upstream and sync.
@@ -48,8 +42,8 @@ cat > "$dst/UPSTREAM" <<EOF
 repository: intellistream-objects (git@repo.intellistream.ai:olavgg/intellistream-objects.git), directory src/raft
 commit: $commit
 files: $files
-license: Apache License 2.0. The owner of intellistream-objects (IntelliStream AS, Olav Gjerde) granted copying
-  these files into tsdb under Apache 2.0 on 2026-11-06 (docs/design-cluster.md, decision D2).
+license: AGPL-3.0-only, as intellistream-objects (the owner, IntelliStream AS, Olav Gjerde, granted copying the files into
+  tsdb on 2026-11-06 under Apache 2.0, decision D2 of docs/design-cluster.md; both repositories are AGPL-3.0-only now).
 local: compat.h and compat.c (what the files include from isod's src/common and src/proto), and the one-line
   headers under compat/ that point there; tsdb's own, not synced.
 sync: tools/sync-raft.sh [--repo DIR] COMMIT

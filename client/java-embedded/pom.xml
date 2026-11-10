@@ -10,7 +10,7 @@
        into a repository of the tree's build (build/m2), not into the ~/.m2 that other trees share. -->
   <groupId>ai.intellistream</groupId>
   <artifactId>tsdb-embedded</artifactId>
-  <version>0.10.0</version>
+  <version>0.11.0</version>
   <packaging>jar</packaging>
 
   <name>tsdb-embedded</name>
@@ -22,8 +22,8 @@
   </organization>
   <licenses>
     <license>
-      <name>Apache-2.0</name>
-      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+      <name>AGPL-3.0-only</name>
+      <url>https://www.gnu.org/licenses/agpl-3.0.html</url>
       <distribution>repo</distribution>
     </license>
   </licenses>
@@ -48,7 +48,7 @@
     <dependency>
       <groupId>ai.intellistream</groupId>
       <artifactId>tsdb-client</artifactId>
-      <version>0.10.0</version>
+      <version>0.11.0</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -84,14 +84,22 @@
 
   <build>
     <resources>
-      <!-- Apache-2.0 asks for LICENSE and NOTICE with every copy: they go to META-INF of the jar. -->
+      <!-- AGPL-3.0-only: LICENSE and NOTICE of this directory go to META-INF of the jar, and the Apache-2.0 text of the
+           files of the client libraries that are compiled into libtsdb.so (headers, calendar) beside them. -->
       <resource>
-        <directory>${project.basedir}/../..</directory>
+        <directory>${project.basedir}</directory>
         <includes>
           <include>LICENSE</include>
           <include>NOTICE</include>
         </includes>
         <targetPath>META-INF</targetPath>
+      </resource>
+      <resource>
+        <directory>${project.basedir}/LICENSES</directory>
+        <includes>
+          <include>Apache-2.0.txt</include>
+        </includes>
+        <targetPath>META-INF/LICENSES</targetPath>
       </resource>
       <resource>
         <directory>${tsdb.native.dir}</directory>

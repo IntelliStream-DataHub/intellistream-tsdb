@@ -24,7 +24,7 @@
 <div class="scrim" hidden></div>
 <div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
 <div class="doc-shell">
-<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html" aria-current="page">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html" aria-current="page">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="cluster.html">Cluster (preview)</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
 <main id="main" class="doc">
 <h1>Install and build</h1>
 <p class="lead">tsdb is built from source with <code>make</code>. To run it on another machine, build the portable
@@ -72,7 +72,7 @@ values is in it three times, for x86-64-v2, v3 (AVX2) and v4 (AVX-512); tsdbd pi
 level writes the same bytes and gives the same answers, so data moves freely between machines.</p>
 <p>The tarball holds <code>bin/tsdbd</code>, <code>bin/tsdb</code>, the two libraries and their headers, its own
 test suite and a systemd unit. To install it as a service:</p>
-<pre><code class="language-sh" data-src="dist/README.dist#L42-L50">tar xzf tsdb-VERSION-x86_64-linux.tar.gz &amp;&amp; cd tsdb-VERSION-x86_64-linux
+<pre><code class="language-sh" data-src="dist/README.dist#L57-L65">tar xzf tsdb-VERSION-x86_64-linux.tar.gz &amp;&amp; cd tsdb-VERSION-x86_64-linux
 tests/run-tests.sh /var/tmp            # optional, a few minutes
 install -m 755 bin/tsdbd bin/tsdb /usr/local/bin/
 restorecon -v /usr/local/bin/tsdbd /usr/local/bin/tsdb    # SELinux: bin_t
@@ -89,6 +89,6 @@ itself (<code>--io auto</code>, the default), and says so when it starts.</p></d
 
 <nav class="pager" aria-label="Previous and next page"><a class="prev" href="index.html"><span>Previous</span>What tsdb is</a><a class="next" href="quickstart.html"><span>Next</span>Quick start</a></nav></main>
 </div>
-<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source: the server and the engine under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">GNU AGPL-3.0</a> (a commercial licence is available), the client libraries under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSES/Apache-2.0.txt">Apache License 2.0</a>; <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSING.md">which is which</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
 </html>

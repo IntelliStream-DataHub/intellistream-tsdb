@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # prom_settle.sh START_EPOCH_S: waits until Prometheus' TSDB has settled after a load: no compaction,
 # no block (re)load and no change in the head's chunks for $STABLE s (180; the TSDB looks for work
 # once a minute). Prints the state every 30 s and, at the end, the seconds from START (the end of

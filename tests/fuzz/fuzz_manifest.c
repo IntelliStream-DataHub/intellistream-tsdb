@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * MANIFEST as a follower reads it (follow_refresh): any text, with a valid
  * checksum line appended (it is no authentication), then the part set it

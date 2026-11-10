@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """How each result was run: one how.json per system and phase, written by run.sh when the system's step ends.
 
   python3 -I how.py write PHASE SYS OUT    OUT/p<PHASE>/<dir>/how.json (phase 2) or OUT/p<PHASE>/how-<SYS>.json

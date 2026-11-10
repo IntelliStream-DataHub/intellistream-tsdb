@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * What tsdb-bench (embedded) and tsdbc-bench (TCP) share, and what the Rust, Python and Java
  * query benchmarks copy line by line, so that all of them do the same work:

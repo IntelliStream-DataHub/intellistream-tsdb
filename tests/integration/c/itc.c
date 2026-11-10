@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The C client of the integration tests: libtsdbclient, as a user links it.
  *
  *   itc write <port> <writes-file>       apply a write script (see run.py)

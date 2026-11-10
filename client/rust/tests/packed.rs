@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Packed, zstd-compressed inserts (protocol version 3): the server stores
 //! what it unpacks exactly as the plain arrays, and compression can be turned off.
 

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Bit packing shared by the ALP-style codecs: values of w bits, LSB first. */
 #ifndef TSDB_BITPACK_H
 #define TSDB_BITPACK_H

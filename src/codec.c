@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * DoubleDelta (int64) and Gorilla (float32) codecs, bit compatible in spirit
  * with ClickHouse's CompressionCodecDoubleDelta / CompressionCodecGorilla

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # `tsdb DIR feed ...` (docs/design-cdc.md 2.13): enable, info, new-id and disable on a closed database; the files each
 # leaves (META requires=feed, FEED, FEEDSLOTS) in every volume; the verbs refused beside a running writer (the LOCK of
 # a tsdbd) and on bad options; a feed that is off changes nothing.

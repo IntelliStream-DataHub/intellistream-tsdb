@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # `tsdb <dir> user ...` (tools/users-cli.c): the verbs work on USERS alone, beside a database or before there is
 # one; passwords come from --password-file, TSDB_PASSWORD or a terminal and never from argv; selectors and rights
 # are checked and normalized; the verifier stored for a password is the one SCRAM expects (RFC 7677: the salt and

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The cluster's metadata state machine; see meta.h for what it holds and the rules it keeps.
  *

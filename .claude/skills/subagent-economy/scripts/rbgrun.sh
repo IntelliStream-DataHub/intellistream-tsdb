@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # rbgrun.sh NAME WORKTREE PROFILES CMD...: like bgrun.sh, but CMD runs on a FLEET machine (RB_HOSTS in config.sh), not here.
 #   PROFILES = comma list of build/<profile> dirs to ship (release,debug,...) or "-" for none; the source tree is always
 #   shipped (without .git and build/). CMD runs as root in the shipped copy ($RB_ROOT/NAME on the machine, default

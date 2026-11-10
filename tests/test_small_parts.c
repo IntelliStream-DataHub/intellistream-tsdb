@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Many small parts (granules of 16 rows, inserts of 1 to 40 rows) of five series of every value type, written in
  * random order with replaces, deletes, retention, memtable rows and a reopen, and every query kind over random
  * windows checked against a model of what each series holds. Raw queries step through hundreds of parts and partial

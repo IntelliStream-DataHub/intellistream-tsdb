@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The change feed's files and retained segments (docs/design-cdc.md 2.2, 2.6, 2.7, 2.13). Step F1 builds the disk side:
  * the FEED and FEEDSLOTS files, `requires=feed` in META, retained WAL segments (fwal_<seq>.log), enable and disable,

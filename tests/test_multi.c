@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdb_query_multi: every kind, mode, order and limit equals the single-series call, byte for byte, on data with
  * all five types, nulls, memtable rows, unmerged overlaps, deletes, replaces, retention, series in partitions of
  * several classes and two volumes; for 1, 2,

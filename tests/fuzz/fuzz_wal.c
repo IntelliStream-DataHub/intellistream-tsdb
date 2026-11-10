@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * WAL replay at a writer's open (memtable.c): one segment of any bytes in a
  * database whose SERIES knows four series, then a clean close (which flushes

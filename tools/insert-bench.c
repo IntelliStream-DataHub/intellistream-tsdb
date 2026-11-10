@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Durable insert throughput from single values up to one huge batch, with
  * fsync on. Data is the mixed sensor workload of datasets.h, arriving the

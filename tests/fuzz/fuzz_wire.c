@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The HA reply bodies of protocol 13 (include/tsdb_wire.h, which the C client, tsdbd and the tests share): every decoder
  * on arbitrary bytes, and whatever one accepts must encode again to the bytes it read. Byte 0 picks the body (UNAVAILABLE,
  * MOVED, PARTIAL, DROPPED, TOPOLOGY, the TOPOLOGY request, the resend_from tail), the rest is the body. The decoders must

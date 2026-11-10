@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * What the statistics files share (docs/design-stats.md): the sweeper's state (stats.c), the tenant machinery
  * (stats_tenant.c: the list, the map from series to tenant, the partition vectors, the HyperLogLogs) and the hot

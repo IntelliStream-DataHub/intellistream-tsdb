@@ -459,7 +459,9 @@ large one, or a request for many series, spreads over more.
 | Rust (package `intellistream-tsdb-client`, `use tsdb_client::...`) | [client/rust](client/rust/README.md) |
 | Python (package `intellistream-tsdb-client`, `import tsdb_client`) | [client/python](client/python/README.md) |
 | Java 17+ | [client/java](client/java/README.md) |
-| Java 22+, embedded (no server) | [client/java-embedded](client/java-embedded/README.md) |
+| Rust, embedded (no server; AGPL-3.0, package `intellistream-tsdb-embedded`, `use tsdb_embedded::Db`) | [client/rust-embedded](client/rust-embedded/README.md) |
+| Python, embedded (no server; AGPL-3.0, package `intellistream-tsdb-embedded`, `import tsdb_embedded`) | [client/python-embedded](client/python-embedded/README.md) |
+| Java 22+, embedded (no server; AGPL-3.0) | [client/java-embedded](client/java-embedded/README.md) |
 
 The key lines of the C client (link with `build/libtsdbclient.a -lzstd -lpthread -lm`):
 
@@ -543,6 +545,13 @@ build/tsdb user grant acme/dashboard read prefix:acme/ --server db1:7070 --login
 for tests and try-outs on your own machine. `tsdb <dir> user` on its own lists every command, and
 [SECURITY.md](SECURITY.md) says what logins protect and what they do not.
 
+### Cluster (preview)
+
+`tsdbd --cluster` joins servers into a small Raft group that keeps the list of members, their state and the cluster's
+settings. It is a **preview**: it does not copy data between servers and does not fail over, and the client port works as
+without it. Do not run it in production. [docs/cluster-preview.md](docs/cluster-preview.md) is a ten-minute tutorial:
+three servers and a witness on one machine, a leader killed and restarted. `tsdb cluster` prints the commands.
+
 ### Backup and moving to a new version
 
 `export` writes the whole database (or some series) into one file; `import` reads it into another database.
@@ -609,8 +618,18 @@ make integration-tests  # tsdbd, the CLI and all four clients end to end, both s
 
 ## License
 
-tsdb is open source under the [Apache License 2.0](LICENSE). Copyright 2026 IntelliStream AS; see [NOTICE](NOTICE).
-The libraries tsdb builds on, and their licenses, are listed in [docs/licenses.md](docs/licenses.md).
+tsdb has two licences, chosen so that your own program is never pulled under the AGPL just because it talks to a
+tsdbd:
+
+- **The server and the engine** (`tsdbd`, `libtsdb`, the `tsdb` tool, and the embedded Rust, Python and Java
+  libraries that contain the engine) are under the [GNU AGPL, version 3 only](LICENSE). A commercial licence is
+  available from IntelliStream AS if the AGPL does not fit you.
+- **The client libraries** (C, Rust, Python and Java, over the network, and the Pulsar connector) are under the
+  [Apache License 2.0](LICENSES/Apache-2.0.txt). Use them in any program.
+
+[LICENSING.md](LICENSING.md) lists every directory and says what links to what. Releases 0.9.0, 0.9.1 and 0.10.0 were
+published under the Apache License 2.0 and stay so. Copyright 2026 IntelliStream AS; see [NOTICE](NOTICE). The
+libraries tsdb builds on, and their licenses, are listed in [docs/licenses.md](docs/licenses.md).
 
 ## Contributing and security
 

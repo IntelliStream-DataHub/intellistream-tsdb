@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # ch_load.sh TABLE: INSERT $DATA into cmp.TABLE as RowBinary, sync the filesystem, then wait for merges.
 #
 # ClickHouse does not fsync inserted parts by default, so the syncfs after the insert is timed on

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * LTTB downsampling against a reference: the straightforward array version of
  * Steinarsson's algorithm, run over what tsdb_query_values returns for the

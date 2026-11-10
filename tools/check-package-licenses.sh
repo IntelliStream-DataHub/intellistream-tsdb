@@ -1,58 +1,115 @@
 #!/bin/bash
-# A package of tsdb without its LICENSE fails. Apache-2.0 wants LICENSE and NOTICE with every copy, and the packages
-# that link or pack other software also carry its notices (docs/licenses.md is the audit).
+# SPDX-License-Identifier: AGPL-3.0-only
+# A package of tsdb without its LICENSE fails. tsdb has two licences (LICENSING.md): the client libraries are
+# Apache-2.0, the engine, the server and the embedded bindings AGPL-3.0-only. A package is one or the other, and
+# carries the text of its own licence as LICENSE, the repository's NOTICE, and, where it packs other software, its
+# notices (docs/licenses.md is the audit). An AGPL package that contains files of the Apache-2.0 clients (the headers,
+# the calendar code) also carries the Apache text, as LICENSES/Apache-2.0.txt.
 #
-#   tools/check-package-licenses.sh wheel FILE.whl      .dist-info/licenses/{LICENSE,NOTICE,THIRD-PARTY-NOTICES}
-#   tools/check-package-licenses.sh sdist FILE.tar.gz   the same at the top, and LICENSE/NOTICE in rust/ and rust-sys/
-#   tools/check-package-licenses.sh jar FILE.jar        META-INF/{LICENSE,NOTICE}
-#   tools/check-package-licenses.sh nar FILE.nar        the jar's, plus META-INF/THIRD-PARTY-NOTICES (zstd-jni, zstd, Jackson)
-#   tools/check-package-licenses.sh crate DIR           what `cargo package --list` of the crate in DIR would ship
-#   tools/check-package-licenses.sh sources             the copies in the client directories equal the root's;
-#                                                       client/python/THIRD-PARTY-NOTICES is what the lockfile gives
+#   tools/check-package-licenses.sh wheel FILE.whl LICENCE         .dist-info/licenses/{LICENSE,NOTICE,THIRD-PARTY-NOTICES}
+#   tools/check-package-licenses.sh sdist FILE.tar.gz LICENCE DIR=LICENCE...
+#                                                                  the same at the top, and LICENSE/NOTICE in each DIR
+#   tools/check-package-licenses.sh jar FILE.jar LICENCE           META-INF/{LICENSE,NOTICE}
+#   tools/check-package-licenses.sh nar FILE.nar LICENCE           the jar's, plus META-INF/THIRD-PARTY-NOTICES
+#   tools/check-package-licenses.sh crate DIR LICENCE              what `cargo package --list` of the crate in DIR ships
+#   tools/check-package-licenses.sh sources                        the copies in the package directories equal the
+#                                                                  reference texts; THIRD-PARTY-NOTICES are the lockfiles'
 #
-# The LICENSE and NOTICE inside a package must be byte for byte those of the repository root.
+# LICENCE is apache or agpl. The LICENSE inside a package is byte for byte LICENSES/Apache-2.0.txt (apache) or the
+# repository's LICENSE (agpl). NOTICE is the one of the kind too (Apache-2.0 section 4(d) passes a NOTICE on to every
+# program that bundles the package, so an Apache package must not name the AGPL or point at files it lacks): the
+# repository's LICENSES/NOTICE.apache (apache), or the repository's NOTICE, which names both licences (agpl).
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
 fail=0
 bad() { echo "FAIL: $*" >&2; fail=1; }
+
+# the repository file a LICENSE of the given licence must equal
+ref_license() {
+    case $1 in
+    apache) echo LICENSES/Apache-2.0.txt ;;
+    agpl) echo LICENSE ;;
+    *) echo "licence must be apache or agpl, not '$1'" >&2; exit 2 ;;
+    esac
+}
+
+# the repository file a NOTICE of the given licence must equal
+ref_notice() {
+    case $1 in
+    apache) echo LICENSES/NOTICE.apache ;;
+    *) echo NOTICE ;;
+    esac
+}
 
 # same FILE-IN-PACKAGE ROOTFILE: reads FILE-IN-PACKAGE from stdin
 same() {
     if ! cmp -s - "$root/$2"; then bad "$1: $2 is missing or differs from the repository's"; fi
 }
 
-kind=${1:-}; target=${2:-}
+kind=${1:-}; target=${2:-}; licence=${3:-}
 case "$kind" in
 wheel)
     [ -f "$target" ] || { echo "no such file: $target" >&2; exit 2; }
+    lic=$(ref_license "$licence")
     names=$(unzip -Z1 "$target")
     d=$(echo "$names" | grep -m1 -E '\.dist-info/$' || true)
     d=${d:-$(echo "$names" | grep -m1 -E '\.dist-info/' | sed 's|/.*|/|')}
-    for f in LICENSE NOTICE THIRD-PARTY-NOTICES; do
+    extra=
+    [ "$licence" = agpl ] && extra=LICENSES/Apache-2.0.txt
+    for f in LICENSE NOTICE THIRD-PARTY-NOTICES $extra; do
         echo "$names" | grep -qx "${d}licenses/$f" || bad "$target: ${d}licenses/$f missing"
     done
-    for f in LICENSE NOTICE; do unzip -p "$target" "${d}licenses/$f" 2>/dev/null | same "$target ${d}licenses/$f" "$f"; done
+    unzip -p "$target" "${d}licenses/LICENSE" 2>/dev/null | same "$target ${d}licenses/LICENSE" "$lic"
+    unzip -p "$target" "${d}licenses/NOTICE" 2>/dev/null | same "$target ${d}licenses/NOTICE" "$(ref_notice "$licence")"
+    if [ -n "$extra" ]; then
+        unzip -p "$target" "${d}licenses/$extra" 2>/dev/null | same "$target ${d}licenses/$extra" LICENSES/Apache-2.0.txt
+    fi
     unzip -p "$target" "${d}licenses/THIRD-PARTY-NOTICES" 2>/dev/null | grep -q 'zstd' \
         || bad "$target: THIRD-PARTY-NOTICES does not mention zstd"
     ;;
 sdist)
     [ -f "$target" ] || { echo "no such file: $target" >&2; exit 2; }
+    lic=$(ref_license "$licence")
     names=$(tar tzf "$target")
     top=$(echo "$names" | head -n 1 | sed 's|/.*||')
-    for f in LICENSE NOTICE THIRD-PARTY-NOTICES python/LICENSE python/NOTICE rust/LICENSE rust/NOTICE \
-             rust-sys/LICENSE rust-sys/NOTICE; do
+    for f in LICENSE NOTICE THIRD-PARTY-NOTICES; do
         echo "$names" | grep -qx "$top/$f" || bad "$target: $top/$f missing"
     done
-    for f in LICENSE NOTICE rust/LICENSE rust/NOTICE rust-sys/LICENSE rust-sys/NOTICE; do
-        tar xzOf "$target" "$top/$f" 2>/dev/null | same "$target $top/$f" "$(basename "$f")"
+    tar xzOf "$target" "$top/LICENSE" 2>/dev/null | same "$target $top/LICENSE" "$lic"
+    tar xzOf "$target" "$top/NOTICE" 2>/dev/null | same "$target $top/NOTICE" "$(ref_notice "$licence")"
+    if [ "$licence" = agpl ]; then
+        tar xzOf "$target" "$top/LICENSES/Apache-2.0.txt" 2>/dev/null \
+            | same "$target $top/LICENSES/Apache-2.0.txt" LICENSES/Apache-2.0.txt
+    fi
+    shift 3
+    for spec in "$@"; do
+        dir=${spec%%=*}; dl=${spec#*=}
+        dlic=$(ref_license "$dl")
+        for f in LICENSE NOTICE; do
+            echo "$names" | grep -qx "$top/$dir/$f" || bad "$target: $top/$dir/$f missing"
+        done
+        tar xzOf "$target" "$top/$dir/LICENSE" 2>/dev/null | same "$target $top/$dir/LICENSE" "$dlic"
+        tar xzOf "$target" "$top/$dir/NOTICE" 2>/dev/null | same "$target $top/$dir/NOTICE" "$(ref_notice "$dl")"
+        # an AGPL directory with Apache files in it (rust-sys: the headers and the calendar code of csrc/)
+        if [ "$dl" = agpl ] && echo "$names" | grep -q "^$top/$dir/csrc/"; then
+            echo "$names" | grep -qx "$top/$dir/LICENSES/Apache-2.0.txt" \
+                || bad "$target: $top/$dir/LICENSES/Apache-2.0.txt missing"
+        fi
     done
     ;;
 jar|nar)
     [ -f "$target" ] || { echo "no such file: $target" >&2; exit 2; }
-    for f in LICENSE NOTICE; do
-        unzip -Z1 "$target" | grep -qx "META-INF/$f" || bad "$target: META-INF/$f missing"
-        unzip -p "$target" "META-INF/$f" 2>/dev/null | same "$target META-INF/$f" "$f"
-    done
+    lic=$(ref_license "$licence")
+    unzip -Z1 "$target" | grep -qx "META-INF/LICENSE" || bad "$target: META-INF/LICENSE missing"
+    unzip -p "$target" "META-INF/LICENSE" 2>/dev/null | same "$target META-INF/LICENSE" "$lic"
+    unzip -Z1 "$target" | grep -qx "META-INF/NOTICE" || bad "$target: META-INF/NOTICE missing"
+    unzip -p "$target" "META-INF/NOTICE" 2>/dev/null | same "$target META-INF/NOTICE" "$(ref_notice "$licence")"
+    if [ "$licence" = agpl ]; then
+        unzip -Z1 "$target" | grep -qx "META-INF/LICENSES/Apache-2.0.txt" \
+            || bad "$target: META-INF/LICENSES/Apache-2.0.txt missing"
+        unzip -p "$target" "META-INF/LICENSES/Apache-2.0.txt" 2>/dev/null \
+            | same "$target META-INF/LICENSES/Apache-2.0.txt" LICENSES/Apache-2.0.txt
+    fi
     if [ "$kind" = nar ]; then
         n=$(unzip -p "$target" META-INF/THIRD-PARTY-NOTICES 2>/dev/null)
         for w in zstd-jni 'BSD 2-Clause' 'BSD License' Jackson; do
@@ -62,20 +119,40 @@ jar|nar)
     ;;
 crate)
     [ -d "$target" ] || { echo "no such directory: $target" >&2; exit 2; }
+    lic=$(ref_license "$licence")
     list=$(cd "$target" && cargo package --list --allow-dirty --offline 2>/dev/null)
     for f in LICENSE NOTICE; do
         echo "$list" | grep -qx "$f" || bad "$target: cargo package would not ship $f"
-        same "$target/$f" "$f" < "$target/$f"
     done
+    same "$target/LICENSE" "$lic" < "$target/LICENSE"
+    same "$target/NOTICE" "$(ref_notice "$licence")" < "$target/NOTICE"
+    if [ "$licence" = agpl ] && [ -d "$target/LICENSES" ]; then
+        echo "$list" | grep -qx "LICENSES/Apache-2.0.txt" || bad "$target: cargo package would not ship LICENSES/Apache-2.0.txt"
+    fi
     ;;
 sources)
-    for d in client/python client/rust client/rust-sys; do
-        for f in LICENSE NOTICE; do same "$d/$f" "$f" < "$root/$d/$f"; done
+    # directory:licence of every package directory; the AGPL ones that hold Apache files also carry the Apache text
+    for spec in client/rust:apache client/python:apache client/python-common:apache client/java:apache \
+                connectors/pulsar:apache client/rust-sys:agpl client/rust-embedded:agpl client/python-embedded:agpl \
+                client/java-embedded:agpl; do
+        d=${spec%%:*}; l=${spec#*:}
+        same "$d/LICENSE" "$(ref_license "$l")" < "$root/$d/LICENSE"
+        same "$d/NOTICE" "$(ref_notice "$l")" < "$root/$d/NOTICE"
     done
+    for d in client/rust-sys client/rust-embedded client/python-embedded client/java-embedded; do
+        same "$d/LICENSES/Apache-2.0.txt" LICENSES/Apache-2.0.txt < "$root/$d/LICENSES/Apache-2.0.txt"
+    done
+    # the README of an AGPL package says so (a reader of the package page must not take it for the Apache client)
+    for d in client/rust-sys client/rust-embedded client/python-embedded client/java-embedded; do
+        grep -q 'AGPL-3.0' "$root/$d/README.md" || bad "$d/README.md does not say that the package is AGPL-3.0-only"
+    done
+    # the root LICENSE is the AGPL (the same text as intellistream-objects'), LICENSES/ has the Apache text
+    grep -q 'GNU AFFERO GENERAL PUBLIC LICENSE' "$root/LICENSE" || bad "LICENSE is not the AGPL"
+    grep -q 'Apache License' "$root/LICENSES/Apache-2.0.txt" || bad "LICENSES/Apache-2.0.txt is not the Apache License"
     "$root/tools/gen-third-party.py" --check >&2 || fail=1
     ;;
 *)
-    sed -n 2,14p "$0" >&2; exit 2 ;;
+    sed -n 3,21p "$0" >&2; exit 2 ;;
 esac
 [ $fail = 0 ] && echo "ok: $kind $target"
 exit $fail

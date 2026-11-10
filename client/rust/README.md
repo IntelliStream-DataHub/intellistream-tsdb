@@ -377,7 +377,7 @@ chart 100 of 10000 points
 `.limit(n)` order and cut the buckets. The `_group` and `_bounds` forms take
 calendar groups and bucket starts as `query_group` and `query_bounds` do, and
 `query_agg_ex` is `query_agg` with an order and a limit. The
-embedded `Db` has all of them, with the same answers.
+embedded `Db` (crate `intellistream-tsdb-embedded`) has all of them, with the same answers.
 
 ## Compression
 
@@ -403,58 +403,13 @@ It prints rows per second and bytes sent per row. Try `--compression 0` to compa
 
 `examples/query_bench.rs` runs the random query windows of `tsdbc-bench query` from this client
 (`--conns N` threads, `--seconds S`); `../../bench/clients/run.sh` runs it next to the other clients and the
-embedded library. `examples/embedded_bench.rs` (feature `embedded`) loads and queries the same way through an
-embedded `Db` (`--load FILE`, `--qps THREADS`, as `tsdb-bench`), and `examples/embedded_suite.rs` runs the
-whole default suite of `tsdb-bench` through it.
+embedded library.
 
 ## Embedded
 
-The feature `embedded` puts the database itself into your program: no
-tsdbd, no network. `Db::open` takes a directory and the engine runs in
-your process at C speed, with the same methods as `Client` (the
-`Database` trait has both, so code written against `impl Database` runs
-on either).
-
-```toml
-intellistream-tsdb-client = { path = "../tsdb/client/rust", features = ["embedded"] }
-```
-
-The build compiles the C engine (the `intellistream-tsdb-sys` crate in `../rust-sys`)
-with your C compiler, and zstd with it: nothing to install. It runs on
-any x86-64 and picks AVX2 or AVX-512 code at run time; the feature
-`native` builds for this CPU only. `embedded-system` links a `libtsdb.so`
-you built with make instead (from `TSDB_LIB_DIR`, by default the
-repository's `build/`).
-
-```rust
-use tsdb_client::{Db, Group, Options, QueryOpts, Unit};
-
-fn main() -> tsdb_client::Result<()> {
-    let dir = std::env::args().nth(1).unwrap_or_else(|| "/tmp/tsdb-embedded".into());
-    let db = Db::open(&dir, &Options::default())?; // the engine runs in this process
-
-    let s = db.series("pump7.flow")?;
-    let t0 = 1_700_000_000_000; // one row a minute for a day
-    let ts: Vec<i64> = (0..1440).map(|i| t0 + i * 60_000).collect();
-    let values: Vec<f32> = (0..1440).map(|i| (i % 60) as f32).collect();
-    db.insert_series(s, &ts, &values)?;
-
-    let p = db.query_points(s, t0..t0 + 180_000, QueryOpts::asc())?;
-    for (t, v) in p.ts.iter().zip(&p.values) {
-        println!("raw  {t} {v}");
-    }
-    let days = Group::new(Unit::Day).timezone("Europe/Oslo");
-    for b in db.query_group(s, .., Some(&days), QueryOpts::asc())? {
-        println!("day  {} {} {}", b.start, b.count, b.sum);
-    }
-    db.close()
-}
-```
-
-A `Db` is `Send` and `Sync`: share it between threads (`Arc<Db>`), they
-run in parallel. One process at a time can open a directory for writing;
-others get `Status::Locked`, readers open it with `read_only: true`.
-`query_chunks` hands out the engine's own buffers without copying.
+The database inside your own process (no tsdbd, no network) is a separate crate, `intellistream-tsdb-embedded`
+(`client/rust-embedded`), because it contains the engine, which is under the AGPL-3.0. This crate stays Apache-2.0:
+a program that only talks to tsdbd is never pulled under the AGPL. See [LICENSING.md](../../LICENSING.md).
 
 ## Many queries at once
 
@@ -489,7 +444,7 @@ over the connections.
 The `_multi` calls ask one question of a whole list of series in a single
 request (protocol version 10): `query_rows_multi`, `query_lttb_multi`,
 `query_buckets_multi`, `query_spread_multi` and `query_twa_multi`, on
-`Client`, `Pool` and the embedded `Db`. The server works on the series in
+`Client`, `Pool` and the embedded `Db` (its own crate). The server works on the series in
 parallel, sends the answers back in the order of the list, and reads every
 series at the same instant. Each series has its own result: an unknown or
 bad one does not spoil the others.

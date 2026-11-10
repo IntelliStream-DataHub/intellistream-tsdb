@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * tsdb wire protocol, spoken by tsdbd and the client library.
  *

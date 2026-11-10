@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "intellistream-tsdb-embedded"
+description = "The tsdb time series database inside your Python process (AGPL-3.0-only); the network client is intellistream-tsdb-client (Apache-2.0)"
+requires-python = ">=3.9"
+dynamic = ["version"]
+license = "AGPL-3.0-only"
+# the wheel carries these under .dist-info/licenses/: the AGPL, tsdb's notices, the Apache-2.0 text of the files
+# of the network client that are compiled in (LICENSES/Apache-2.0.txt), and the notices of the libraries linked in
+license-files = ["LICENSE", "NOTICE", "THIRD-PARTY-NOTICES", "LICENSES/Apache-2.0.txt"]
+classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
+# tsdb_embedded raises the exceptions of tsdb_client and is built against the same release: pinned exactly
+# (the version is that of Cargo.toml; check-version.sh keeps the two together)
+dependencies = ["intellistream-tsdb-client==0.11.0"]
+
+[project.optional-dependencies]
+numpy = ["numpy"]
+test = ["pytest"]
+
+[tool.maturin]
+module-name = "tsdb_embedded"
+features = ["pyo3/extension-module"]

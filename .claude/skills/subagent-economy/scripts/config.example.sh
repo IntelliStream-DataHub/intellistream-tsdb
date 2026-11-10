@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # Copy to $SE_HOME/config.sh (default ~/.local/state/subagent-economy/config.sh) and keep what this machine needs.
 
 # A queue wrapper for heavy local jobs: a script that waits for a free slot on the machine, then execs its arguments.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # Writes the batches of batches.tsv in one system's dialect, one request per line (the input of qdrive and
 # clickhouse-benchmark):  q/SYS.fullN.bK.txt (N = 0, 3600, 60) and q/SYS.CLASS.bK.txt (K = 1, 10, 100), and
 # q/SYS.fullN.per.txt, the whole range as one query per series.

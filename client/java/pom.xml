@@ -6,7 +6,7 @@
 
   <groupId>ai.intellistream</groupId>
   <artifactId>tsdb-client</artifactId>
-  <version>0.10.0</version>
+  <version>0.11.0</version>
   <packaging>jar</packaging>
 
   <name>tsdb-client</name>
@@ -52,7 +52,7 @@
     <resources>
       <!-- Apache-2.0 asks for LICENSE and NOTICE with every copy: they go to META-INF of the jar. -->
       <resource>
-        <directory>${project.basedir}/../..</directory>
+        <directory>${project.basedir}</directory>
         <includes>
           <include>LICENSE</include>
           <include>NOTICE</include>

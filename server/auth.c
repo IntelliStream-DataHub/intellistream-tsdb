@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Login and access control in tsdbd (docs/design-auth.md §3 and §5).
  *

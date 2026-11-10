@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The newest value of many series (`QUERY_LATEST`, protocol 14; `tsdb_latest` in the engine): the types
 //! [`Client::latest`](crate::Client::latest), [`Client::latest_by_name`](crate::Client::latest_by_name) and the
-//! embedded [`Db::latest`](crate::Db::latest) share.
+//! embedded `Db::latest` (crate `intellistream-tsdb-embedded`) share.
 
 use crate::error::Status;
 use crate::value::ValueType;
@@ -53,7 +54,8 @@ impl Latest {
         self.value.map(|v| (self.ts, v))
     }
 
-    pub(crate) fn from_wire(status: i32, kind: u8, ty: u8, ts: i64, bits: u64) -> Option<Latest> {
+    #[doc(hidden)]
+    pub fn from_wire(status: i32, kind: u8, ty: u8, ts: i64, bits: u64) -> Option<Latest> {
         let st = if status == 0 { None } else { Some(Status::from_code(status)) };
         let kind = match kind {
             0 => LatestKind::Value,
@@ -85,7 +87,8 @@ impl Latest {
     }
 
     /// An id or a name that does not resolve.
-    pub(crate) fn missing(status: Status) -> Latest {
+    #[doc(hidden)]
+    pub fn missing(status: Status) -> Latest {
         Latest { status: Some(status), kind: LatestKind::None, ty: None, ts: 0, value: None }
     }
 }

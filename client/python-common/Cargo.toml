@@ -1,0 +1,18 @@
+[package]
+name = "tsdb-client-python-common"
+version = "0.11.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+description = "What the Python bindings of tsdb share: column and result conversion, the multi-series and latest calls (no #[pymodule])"
+publish = false
+
+[dependencies]
+tsdb-client = { package = "intellistream-tsdb-client", version = "=0.11.0", path = "../rust" }
+pyo3 = "0.29"
+# results handed to numpy without a copy (PyArray from a Vec)
+numpy = "0.29"
+
+[features]
+# the result classes belong to the module tsdb_embedded instead of tsdb_client
+embedded = []

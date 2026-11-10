@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Prometheus metrics for tsdbd: GET /metrics in the text exposition format 0.0.4.
  *

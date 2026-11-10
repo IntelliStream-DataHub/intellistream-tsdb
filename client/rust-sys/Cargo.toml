@@ -1,8 +1,8 @@
 [package]
 name = "intellistream-tsdb-sys"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 rust-version = "1.88"
 description = "Raw FFI bindings to the tsdb embedded time series database (include/tsdb.h), with the engine built in"
 publish = false
@@ -10,7 +10,7 @@ readme = "README.md"
 links = "tsdb"
 build = "build.rs"
 # csrc/ is the engine copied by vendor.sh: listed explicitly because it is not in git
-include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "NOTICE", "build.rs", "layout.c", "src/**", "tests/**", "csrc/**"]
+include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "NOTICE", "LICENSES/**", "build.rs", "layout.c", "src/**", "tests/**", "csrc/**"]
 keywords = ["timeseries", "database", "ffi"]
 categories = ["database", "external-ffi-bindings"]
 

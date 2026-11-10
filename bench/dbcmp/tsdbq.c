@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * tsdbd harness over the C client, on the same query spec as the other systems.
  *   tsdbq qps  SPEC CLASS THREADS SECONDS     random windows / point lookups of CLASS, like qdrive

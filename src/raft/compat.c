@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The helpers of compat.h: tsdb's versions of what the copied Raft core takes from isod's src/common. See compat.h.
  */

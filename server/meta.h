@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The cluster's metadata state machine (docs/design-cluster.md §2): what the Raft group agrees on. Sans-IO and
  * deterministic: an entry's bytes go in (meta_apply), the state changes the same way on every server, and a snapshot

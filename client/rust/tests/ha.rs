@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Protocol 13 (docs/ha.md 9 and 15.4): the bodies of UNAVAILABLE, MOVED, PARTIAL and DROPPED, retry after
 //! `retry_after` within a time budget, MOVED followed to the node it names, several nodes in a connect string,
 //! TOPOLOGY. The refusals come from fake servers (a script per test); the outage is real: tsdbd on a storage

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Protocol 9 queries against a real tsdbd: the spread, time-weighted averages, LTTB, and
 aggregates with order and limit. test_embedded.py runs the same tests on a Db, and compares
 its answers with tsdbd's."""

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The Rust declarations must lay out every struct exactly as the C compiler does.
 
 use std::mem::{offset_of, size_of};

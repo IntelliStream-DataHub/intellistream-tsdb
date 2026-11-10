@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # se-env.sh: shared settings of the subagent-economy scripts; sourced by them, not run.
 # SE_HOME holds runs/, state/ and the hold files. It is outside ~/.claude on purpose: subagents may be refused writes there.
 # $SE_HOME/config.sh, if it exists, sets this machine's choices (SE_QUEUE, the fleet's RB_*, USAGE_SESSION);

@@ -6,9 +6,9 @@ One data set, loaded and queried by the same program in twelve ways:
 |---|---|---|
 | embedded C, fsync on / off | `build/tsdb-bench --load`, `--qps` | libtsdb in the process: no server, no network |
 | embedded Java (FFM), fsync on / off | `client/java-embedded/.../bench/EmbeddedBench.java --load`, `--qps` | `EmbeddedDb`: libtsdb in the JVM through the FFM API (Java 22+) |
-| embedded Rust, fsync on / off | `client/rust/examples/embedded_bench.rs --load`, `--qps` | `tsdb_client::Db` (feature `embedded`): the engine compiled into the crate |
-| embedded Python, fsync on / off | `client/python/bench_embedded.py --load`, `--qps` | `tsdb_client.Db` over the Rust `Db`, threads |
-| embedded Python, batch calls | `client/python/bench_embedded.py --qps --many 256` | `Db.query_raw_many`, `query_agg_many`: 256 queries per call, run on every CPU |
+| embedded Rust, fsync on / off | `client/rust-embedded/examples/embedded_bench.rs --load`, `--qps` | `tsdb_embedded::Db` (crate `intellistream-tsdb-embedded`, AGPL-3.0): the engine compiled into the crate |
+| embedded Python, fsync on / off | `client/python-embedded/bench_embedded.py --load`, `--qps` | `tsdb_embedded.Db` over the Rust `Db`, threads |
+| embedded Python, batch calls | `client/python-embedded/bench_embedded.py --qps --many 256` | `Db.query_raw_many`, `query_agg_many`: 256 queries per call, run on every CPU |
 | C over TCP | `build/tsdbc-bench` | `client/tsdb_client.c` to tsdbd |
 | Rust over TCP | `client/rust/examples/insert_bench.rs`, `query_bench.rs` | `tsdb-client` crate |
 | Python over TCP | `client/python/bench_insert.py`, `bench_query.py` | `tsdb_client` (PyO3 over the Rust crate), threads |
@@ -43,7 +43,7 @@ kept and printed with the results. The port is never guessed: tsdbd binds a free
 
 What it does:
 
-1. Builds everything (`make`, `cargo build --release --features embedded --examples`, `maturin develop --release`, `mvn package`).
+1. Builds everything (`make`, `cargo build --release --examples` in `client/rust` and `client/rust-embedded`, `maturin develop --release` in `client/python` and `client/python-embedded`, `mvn package`).
 2. Records the machine: CPU, memory, kernel, governor, file system, git revision, tool versions.
 3. Exports the data set once with `tsdb-bench --export` (mixed sensor kinds, time-major).
 4. Loads, per repetition: embedded (C and Java, and Rust and Python when they are in `--clients`) with 1, 4 and 16
@@ -110,7 +110,7 @@ build/tsdbc-bench --port 17070 optimize                # flush and merge
 build/tsdbc-bench --port 17070 --conns 32 --series 100 --points 1000000 --seconds 3 query
 client/rust/target/release/examples/query_bench --addr 127.0.0.1:17070 --conns 32
 build/pyvenv/bin/python client/python/bench_query.py --addr 127.0.0.1:17070 --conns 32
-java --enable-native-access=ALL-UNNAMED -cp client/java/target/tsdb-client-0.10.0.jar:$ZSTD_JNI \
+java --enable-native-access=ALL-UNNAMED -cp client/java/target/tsdb-client-0.11.0.jar:$ZSTD_JNI \
     ai.intellistream.tsdb.bench.QueryBench --port 17070 --conns 32
 ```
 

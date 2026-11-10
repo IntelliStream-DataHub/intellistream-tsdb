@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Fails if a binary needs a glibc symbol version newer than a ceiling, or a
 # shared library other than glibc's own: what `make dist` ships must load on
 # the oldest system it claims (AlmaLinux 10: glibc 2.39; EL9: 2.34).

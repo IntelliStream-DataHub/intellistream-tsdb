@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The login cryptography (client/tsdb_crypto.c) against published vectors:
  * SHA-256 (FIPS 180-4 examples), HMAC-SHA-256 (RFC 4231 cases 1 to 7),

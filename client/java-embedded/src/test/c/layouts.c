@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Prints the size of every struct of tsdb.h that the Java binding lays out, and the offset of each field, as the
  * C compiler sees them: "tsdb_bucket 64" and "tsdb_bucket.count 8". LayoutTest compares them with Native's.

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Compression of the UCI hydraulic sensors in tsdb's value codecs.
 #
 #   bench/hydraulic/run.sh DATA_DIR        (DATA_DIR: the output of convert.py)

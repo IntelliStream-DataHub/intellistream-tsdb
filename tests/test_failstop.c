@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Fail-stop after a storage error (see tsdb_failed in tsdb.h and eng_fail in
  * src/internal.h).

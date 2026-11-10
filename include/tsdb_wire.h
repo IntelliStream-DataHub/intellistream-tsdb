@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * The coding of the HA bodies of protocol 13 (layouts: tsdb_protocol.h), written once: tsdbd, the C client, the
  * test servers and the fuzz harness include this header; the Rust, Python and Java clients have the same

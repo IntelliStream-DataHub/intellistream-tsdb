@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Puts the release of TAG on GitHub with its assets, through the REST API with curl and the job's GITHUB_TOKEN
 # (no gh). The release workflow (.github/workflows/release.yml) runs it; tests/test_release_publish.py runs it
 # against a local mock of the API.

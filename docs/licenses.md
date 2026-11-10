@@ -1,24 +1,52 @@
 # Licenses of what tsdb uses
 
-tsdb is licensed under the [Apache License 2.0](../LICENSE) (copyright IntelliStream AS, see [NOTICE](../NOTICE)).
-This page lists the software and data that tsdb builds on, under which license each comes, and how it is used.
-It answers two questions: *can these licenses live together with Apache 2.0?* and *what has to ship with a
-release?* The audit was made on 2026-11-02 for version 0.9.0. Redo it when a dependency is added or a version
-changes (the Rust lockfiles and the poms are the source of truth).
+tsdb has two licences (see [LICENSING.md](../LICENSING.md)): the server, the engine, the tools and the embedded
+bindings are under the [GNU AGPL, version 3 only](../LICENSE); the client libraries are under the
+[Apache License 2.0](../LICENSES/Apache-2.0.txt) (copyright IntelliStream AS, see [NOTICE](../NOTICE)). IntelliStream AS
+also offers a commercial licence. This page lists the software and data that tsdb builds on, under which license each
+comes, and how it is used. It answers three questions: *can these licenses live together with the AGPL (and, for the
+clients, with Apache 2.0)?*, *can Apache 2.0 code sit inside an AGPL work?* and *what has to ship with a release?*
+The audit was made on 2026-11-02 for version 0.9.0 and redone on 2026-11-09 for the licence change of 0.11.0 (the
+dependencies were not changed by it, the licences they are combined with were). Redo it when a dependency is added or
+a version changes (the Rust lockfiles and the poms are the source of truth).
 
-**In short.** Everything is compatible with Apache 2.0. Nothing is GPL or LGPL in the way tsdb uses it, and no
-copyleft code is linked into any binary. Two libraries are linked statically into the tarball's binaries (zstd and
-liburing); their licenses (BSD and MIT) ask that their notice travels with the binaries. The tarball
-now carries it: [dist/THIRD-PARTY-NOTICES](../dist/THIRD-PARTY-NOTICES), plus `LICENSE` and `NOTICE`.
+**In short.** Everything is compatible. Nothing is GPL or LGPL in a way that reaches tsdb's own code: the licences of
+all dependencies (MIT, BSD, Apache-2.0, the GCC Runtime Library Exception, LGPL by dynamic linking) can be combined
+with the AGPL-3.0, and those of the clients' dependencies with Apache 2.0. Apache-2.0 code may be part of an AGPL
+work (the FSF lists Apache-2.0 as compatible with GPLv3, and the AGPL-3.0 is GPLv3 with its network clause added; the
+result as a whole is under the AGPL), so `libtsdb` and `tsdbd` contain the Apache-2.0 files they share with the
+clients (see the table below); the other way round is not allowed, and `tools/check-spdx.sh` fails when an Apache-2.0
+file includes, imports or depends on an AGPL-3.0-only one. Two libraries are linked statically into the tarball's
+binaries (zstd and liburing); their licenses (BSD and MIT) ask that their notice travels with the binaries. The
+tarball carries it: [dist/THIRD-PARTY-NOTICES](../dist/THIRD-PARTY-NOTICES), plus `LICENSE`, `LICENSES/Apache-2.0.txt`,
+`LICENSING.md` and `NOTICE`.
+
+## Apache-2.0 code inside the AGPL work
+
+Programs that only talk to tsdbd over the network must not fall under the AGPL, so the client libraries stay
+Apache-2.0, together with the few files they share with the engine. These files are part of the AGPL works too:
+
+| file | Apache-2.0 because | where the AGPL work uses it |
+|---|---|---|
+| `include/tsdb.h`, `tsdb_protocol.h`, `tsdb_wire.h`, `tsdb_calendar.h` | the C client includes every one of them | the engine and the server include them; the dist tarball puts `tsdb.h` beside the AGPL `libtsdb`. A header's licence does not change the terms of the library it declares. |
+| `client/tsdb_calendar.c` | the C client's local-time bounds | compiled into `libtsdb.a` and `libtsdb.so` (the engine's `tsdb_query_group_local` uses it) |
+| `client/tsdb_crypto.{c,h}` | SCRAM-SHA-256 in the C client | `server/auth.c`, `users.c`, `cluster.c` and the CLI |
+| `client/tsdb_pack.{c,h}`, `client/tsdb_client.{c,h}` | the C client | `tsdbd` (the packed-insert code in `tsdb_pack`), and the tests that drive a server |
+
+Apache 2.0 section 4 asks that a recipient of Apache-licensed files gets the licence text: the packages that contain
+them carry `LICENSES/Apache-2.0.txt` (the tarball, `client/rust-sys` and the crate, wheel and jar of the embedded
+bindings), and the files keep their SPDX line and the NOTICE.
 
 ## Copied code and data
 
-One piece of source code is copied from another project: the Raft core of the cluster (2026-11-06). The rest of this
-table is close to copying without being it.
+One piece of source code is copied from another project: the Raft core of the cluster (2026-11-06). A second, the
+erasure codec of the cluster's data path, is planned for 0.11.0 (decided 2026-11-09) and is listed already. The rest of
+this table is close to copying without being it.
 
 | what | where | origin and license | note |
 |---|---|---|---|
-| Raft core: `raft.c`, `raft.h`, `raft_log.c`, `raft_log.h`, `raft_wire.c`, `raft_wire.h`, `raft_sim.c`, `raft_sim.h` | `src/raft/` | intellistream-objects `src/raft`, IntelliStream AS, at the commit in `src/raft/UPSTREAM`; **Apache 2.0** by its owner's grant of 2026-11-06 ([design-cluster.md](design-cluster.md) D2) | copied unchanged below an Apache 2.0 header by `tools/sync-raft.sh`, which also writes `UPSTREAM` (repository, commit, grant). `compat.h`, `compat.c` and the headers under `compat/` are tsdb's own: what the files include from isod. Linked into tsdbd, the CLI and the tests, not into libtsdb. intellistream-objects has no LICENSE file of its own yet; the grant should be written down there too. |
+| Raft core: `raft.c`, `raft.h`, `raft_log.c`, `raft_log.h`, `raft_wire.c`, `raft_wire.h`, `raft_sim.c`, `raft_sim.h` | `src/raft/` | intellistream-objects `src/raft`, IntelliStream AS, at the commit in `src/raft/UPSTREAM`; **AGPL-3.0-only**, the licence of both repositories since 2026-11-09. (Until then tsdb carried the copy under Apache 2.0 by its owner's grant of 2026-11-06, [design-cluster.md](design-cluster.md) D2; the releases 0.9.x and 0.10.0 still do.) | copied unchanged below an AGPL-3.0-only header by `tools/sync-raft.sh`, which also writes `UPSTREAM` (repository, commit, licence). `compat.h`, `compat.c` and the headers under `compat/` are tsdb's own: what the files include from isod. Linked into tsdbd, the CLI and the tests, not into libtsdb. Same owner, same licence: no grant is needed any more. |
+| Erasure codec (planned, 0.11.0; **not in the tree yet**): `gf256.c`, `gf256.h`, `gf256_avx2.c`, `gf256_avx512.c`, `rs.c`, `rs.h` | `src/ec/` | intellistream-objects `src/codec`, IntelliStream AS, at the commit that `src/ec/UPSTREAM` will name; **AGPL-3.0-only**, as tsdb's engine and server are from 0.11.0 ([design-cluster-data.md](design-cluster-data.md) E32, the user's decision of 2026-11-09) | to be copied unchanged below an AGPL-3.0-only header by `tools/sync-ec.sh` (build step R5), which writes `UPSTREAM` (repository, commit, licence), as `tools/sync-raft.sh` does for Raft; what the files include from objects' `common/` is tsdb's own `src/ec/compat.h`. Same owner, same licence: no grant is needed. Unlike Raft it is linked into `libtsdb` (the settled tier is read through the engine), so it reaches tsdbd, the CLI and the embedded bindings, all AGPL-3.0-only. **Never in the Apache-2.0 client libraries** (C, Rust, Python, Java, the Pulsar sink): servers decode settled data, `tools/check-spdx.sh` refuses an Apache-2.0 file that includes an AGPL one, and R5 adds a check that no client library or package holds a codec symbol. When it lands, this row loses "planned". |
 | xxHash64 checksum | `src/codec.c` (`xxh64`) | the algorithm and constants of xxHash by Yann Collet (BSD-2-Clause) | written for tsdb from the published algorithm; no xxHash file is included. The credit is here. |
 | LTTB downsampling | `src/query.c`, `tests/lttb_ref.h` | the algorithm of Sveinn Steinarsson's thesis (2013) | an algorithm is not covered by copyright; the code is our own. |
 | Gorilla, Chimp, Patas, ALP codecs | `src/codec*.c` | published papers | own code. The benchmarks compare with these codecs; their reference code is not included. |
@@ -39,18 +67,24 @@ data of `tools/datasets.h`) is ours.
 | glibc | 2.34 or newer | LGPL-2.1-or-later | linked dynamically, taken from the machine the program runs on; not shipped. |
 | Linux kernel headers (`io_uring.h` via liburing) | | GPL-2.0 with the Linux-syscall-note, or MIT | the syscall note allows user programs under any license. |
 
-`libtsdb.a` and `libtsdbclient.a` in the tarball contain tsdb code only. A program that links them also links
-its own libzstd, so it carries zstd's notice itself.
+`libtsdb.a` (AGPL-3.0-only, with the Apache-2.0 `tsdb_calendar.o` inside) and `libtsdbclient.a` (the C client,
+Apache-2.0) in the tarball contain tsdb code only. A program that links them also links its own libzstd, so it
+carries zstd's notice itself. License combinations: zstd is taken under its BSD terms (it is also offered under
+GPL-2.0, which would not combine with the AGPL-3.0; the BSD terms do), liburing under MIT, libgcc under the Runtime
+Library Exception and glibc by dynamic linking, so each can be linked into AGPL and Apache-2.0 programs alike.
 
-**What ships with the tarball** (`make dist`, `tools/mkdist.sh`): `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES`
-(the texts of the zstd and liburing licenses and the libgcc remark) at its top level. `tests/distro/dist-check.sh`
-checks that they are there. Before this audit the tarball had none of them; that was the one gap found.
+**What ships with the tarball** (`make dist`, `tools/mkdist.sh`): `LICENSE` (the AGPL-3.0), `LICENSES/Apache-2.0.txt`,
+`LICENSING.md`, `NOTICE` and `THIRD-PARTY-NOTICES` (the texts of the zstd and liburing licenses and the libgcc remark)
+at its top level. `tests/distro/dist-check.sh` checks that they are there.
 
-## Rust: `client/rust`, `client/rust-sys`, `client/python`, `tests/integration/rust`
+## Rust: `client/rust`, `client/rust-sys`, `client/rust-embedded`, `client/python`, `client/python-embedded`, `tests/integration/rust`
 
-From `cargo metadata` on the four lockfiles (the union is below; `tsdb-client` needs the first block,
-`tsdb-sys` only zstd-sys and the build tools, the Python module adds the PyO3 block, the integration tests only
-`tsdb-client`'s). None is a dev-dependency of the crates; the crates are `publish = false` for now.
+From `cargo metadata` on the lockfiles (the union is below; `tsdb-client` (Apache-2.0) needs the first block,
+`tsdb-sys` (AGPL-3.0-only) only zstd-sys and the build tools, `tsdb-embedded` (AGPL-3.0-only) both, the Python modules
+add the PyO3 block, the integration tests only `tsdb-client`'s). The dependencies did not change with the split into
+the network client and the embedded crate. None is a dev-dependency of the crates; the crates are `publish = false`
+for now. All are MIT, BSD or Apache-2.0 (or an OR of them): fine to link into an Apache-2.0 client and into an AGPL
+work.
 
 | name | version | license | how it is used |
 |---|---|---|---|
@@ -72,7 +106,7 @@ From `cargo metadata` on the four lockfiles (the union is below; `tsdb-client` n
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | build only (through jobserver) |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | build only, and only on UEFI targets; we take the MIT or Apache terms |
 
-The Python module (`client/python`, PyO3) adds:
+The Python modules (`client/python`, Apache-2.0, and `client/python-embedded`, AGPL-3.0-only; PyO3) add:
 
 | name | version | license | how it is used |
 |---|---|---|---|
@@ -90,16 +124,20 @@ The Python module (`client/python`, PyO3) adds:
 Every license above is MIT, BSD, Apache-2.0 or an "OR" that offers one of them, apart from the Unicode data
 license, which applies to compiler-side code only.
 
-**What ships.** The Python wheel and sdist (`client/python`) carry `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES`
+**What ships.** The two Python wheels and sdists (`client/python`: Apache-2.0 `LICENSE`; `client/python-embedded`:
+AGPL-3.0 `LICENSE` plus `LICENSES/Apache-2.0.txt`) carry `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES`
 (maturin `license-files`; in the wheel under `.dist-info/licenses/`). `THIRD-PARTY-NOTICES` has the license texts of
 the crates that are linked into the extension module (normal dependencies, not build tools and not procedural
 macros, which run in the compiler) and of the zstd C library inside zstd-sys, where a crate that offers MIT OR
-Apache-2.0 is taken under MIT. It is generated from `client/python/Cargo.lock` by `tools/gen-third-party.py`
-(`--check` fails when the lockfile moved; no `cargo about` needed): rerun it when a dependency changes. The two
-published crates (`client/rust`, `client/rust-sys`) hold copies of `LICENSE` and `NOTICE` in their directories, so
-`cargo package --list` shows them; the sdist carries both crates as path dependencies and so both copies.
-`client/rust-sys` vendors the engine's own C sources (`vendor.sh`, `csrc/`): nothing in them comes from another
-project (see "Copied code" above), so `LICENSE` and `NOTICE` are all they need. The crates do not pack their
+Apache-2.0 is taken under MIT. It is generated from `client/python/Cargo.lock` and
+`client/python-embedded/Cargo.lock` by `tools/gen-third-party.py` (`--check` fails when a lockfile moved; no
+`cargo about` needed): rerun it when a dependency changes. The three crates (`client/rust`: Apache-2.0;
+`client/rust-sys` and `client/rust-embedded`: AGPL-3.0-only) hold copies of their `LICENSE` and `NOTICE` in their
+directories, so `cargo package --list` shows them; the AGPL crates also hold `LICENSES/Apache-2.0.txt`; the sdists
+carry their crates as path dependencies and so those copies.
+`client/rust-sys` vendors the engine's own C sources (`vendor.sh`, `csrc/`), among them the Apache-2.0 files of the
+table above (which is why it carries the Apache text): nothing in them comes from another
+project (see "Copied code" above), so the licence files are all they need. The crates do not pack their
 dependencies (cargo fetches them), so a program that links them carries its dependencies' notices itself.
 `tools/check-package-licenses.sh` is the check (see below).
 
@@ -108,11 +146,13 @@ dependencies (cargo fetches them), so a program that links them carries its depe
 | name | version | license | how it is used |
 |---|---|---|---|
 | maturin | >=1.9, <2 | MIT OR Apache-2.0 | build only (the build backend in `pyproject.toml`) |
-| numpy | any | BSD-3-Clause | optional at run time (`pip install tsdb-client[numpy]`); not shipped |
+| numpy | any | BSD-3-Clause | optional at run time (`pip install intellistream-tsdb-client[numpy]`); not shipped |
 | pytest | any | MIT | tests only |
 | apache-iotdb, pandas, numpy | pinned in `bench/dbcmp/release/iotdb-requirements.txt` | Apache-2.0, BSD-3-Clause, BSD-3-Clause | benchmark scripts only; installed by the person who runs the comparison, not part of tsdb |
 
-The Python module itself is the Rust crates above, compiled by maturin.
+The Python modules themselves are the Rust crates above, compiled by maturin: `tsdb_client` (Apache-2.0, the network
+client) and `tsdb_embedded` (AGPL-3.0-only, the engine in the process, which depends on `tsdb_client` of the same
+version for the exceptions and the shared types).
 
 ## Java: `client/java`, `client/java-embedded`, `connectors/pulsar`
 
@@ -128,14 +168,15 @@ be run offline; the poms of the artifacts that are there were read for their lic
 | pulsar-client-v5 | 5.0.0 | Apache-2.0 | Pulsar connector, test scope in the `integration` profile |
 | junit-jupiter | 5.13.1 | EPL-2.0 | test scope in all three; never shipped |
 | slf4j-simple | 2.0.16 | MIT | Pulsar connector, test scope |
-| `tsdb-client` (ours) | 0.9.0 | Apache-2.0 | dependency of `tsdb-embedded` and of the connector |
+| `tsdb-client` (ours) | 0.11.0 | Apache-2.0 | dependency of `tsdb-embedded` (AGPL-3.0-only) and of the connector (Apache-2.0) |
 | maven-compiler-plugin 3.14.0, maven-surefire-plugin 3.5.3, maven-jar-plugin 3.4.2, maven-javadoc-plugin 3.12.0, maven-dependency-plugin 3.8.0, nifi-nar-maven-plugin 1.5.0 | | Apache-2.0 | build only |
 
-`tsdb-embedded` bundles `libtsdb.so` (our code) in its jar. That library links the system's libzstd
+`tsdb-embedded` (AGPL-3.0-only) bundles `libtsdb.so` (our code, AGPL-3.0-only) in its jar. That library links the system's libzstd
 dynamically, so no zstd code is inside the jar. It needs Java 22 or newer (the FFM API); the JDK is the user's.
 
-The two jars (`tsdb-client`, `tsdb-embedded`) carry `LICENSE` and `NOTICE` in `META-INF/` (a Maven resource that
-reads the two files at the repository root). `tsdb-client` does not pack zstd-jni and `tsdb-embedded` packs only our
+The two jars (`tsdb-client`: Apache-2.0; `tsdb-embedded`: AGPL-3.0-only, with `LICENSES/Apache-2.0.txt` as well)
+carry `LICENSE` and `NOTICE` in `META-INF/` (a Maven resource that reads them from the package's own directory, or the
+repository root). `tsdb-client` does not pack zstd-jni and `tsdb-embedded` packs only our
 `libtsdb.so`, which links the system's libzstd dynamically, so neither needs more. (A `libtsdb.so` built with zstd
 linked statically would need the zstd text of `dist/THIRD-PARTY-NOTICES` in the jar.)
 
@@ -160,14 +201,18 @@ benchmarks or publishing test results. Enterprise editions, which can carry othe
 
 ## Conclusion
 
-- **Compatible with Apache 2.0: yes.** Every dependency is under MIT, BSD, Apache-2.0, EPL-2.0 (test only, never
-  shipped), MIT-or-LGPL (taken as MIT), or the GCC Runtime Library Exception. No GPL or LGPL code is linked into
-  tsdb's binaries, jars or wheels.
-- **The tarball must carry** `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (zstd BSD text, liburing MIT text).
-  `make dist` now copies them.
-- **The other packages carry theirs too** (done 2026-11-04): the Python wheel and sdist (`LICENSE`, `NOTICE`,
-  `THIRD-PARTY-NOTICES`), the Rust crates (`LICENSE`, `NOTICE`), the jars (`META-INF/LICENSE`, `NOTICE`) and the
-  Pulsar NAR (also `THIRD-PARTY-NOTICES`). `make test-licenses` (part of `make test-clients`; the sdist and the wheel
+- **Compatible with the AGPL-3.0 and, for the clients, with Apache 2.0: yes.** Every dependency is under MIT, BSD,
+  Apache-2.0, EPL-2.0 (test only, never shipped), MIT-or-LGPL (taken as MIT), or the GCC Runtime Library Exception.
+  No GPL or LGPL code is linked into tsdb's binaries, jars or wheels except by dynamic linking against the system's
+  glibc. No dependency of the Apache-2.0 clients is copyleft, so the clients stay usable in closed programs.
+- **Apache-2.0 inside AGPL-3.0: allowed** (one direction only); `tools/check-spdx.sh` (run by `make test`) checks
+  that no Apache-2.0 file depends on an AGPL one.
+- **The tarball must carry** `LICENSE`, `LICENSES/Apache-2.0.txt`, `LICENSING.md`, `NOTICE` and `THIRD-PARTY-NOTICES`
+  (zstd BSD text, liburing MIT text). `make dist` copies them.
+- **The other packages carry theirs too** (done 2026-11-04, redone for the two licences 2026-11-09): the two Python
+  wheels and sdists (`LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES`; the AGPL one also `LICENSES/Apache-2.0.txt`), the Rust
+  crates (`LICENSE`, `NOTICE`; the AGPL ones also the Apache text), the jars (`META-INF/LICENSE`, `NOTICE`) and the
+  Pulsar NAR (Apache-2.0, also `THIRD-PARTY-NOTICES`). `make test-licenses` (part of `make test-clients`; the sdist and the wheel
   in `make test-python-sdist`) builds each package and fails when a file is missing or differs from the root's
-  `LICENSE`/`NOTICE`; `tests/distro/dist-check.sh` does it for the tarball. After a dependency change: rerun
+  `LICENSE`/`NOTICE` of its licence (`tools/check-package-licenses.sh`); `tests/distro/dist-check.sh` does it for the tarball. After a dependency change: rerun
   `tools/gen-third-party.py` and update the NAR's notices by hand.

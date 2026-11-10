@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * FNO: the durable bound of the WAL record numbers (`fno`, design-cdc.md 2.1), one file per volume.
  *

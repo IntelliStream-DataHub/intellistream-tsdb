@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # The CLI's `query ... lttb N`: N points printed like raw, the ends kept, and bad
 # thresholds ("-1", "2", "x", none) refused instead of read as some number.
 #

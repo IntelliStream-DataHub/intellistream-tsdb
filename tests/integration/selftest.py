@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Tests of the harness itself (seconds, no clients needed): the places where run.py and mutate.py could turn a
 failure into a pass.
 

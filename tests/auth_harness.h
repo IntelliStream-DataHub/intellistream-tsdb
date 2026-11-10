@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Shared by the login tests (tests/test_auth.c, tests/test_auth_ops.c): tsdbd started with login on, users made with
  * the CLI, and raw frames with a SCRAM client of their own, for what the client library never sends (malformed
  * logins, every op number). A caller defines _GNU_SOURCE and includes tsdb_client.h, tsdb_crypto.h, tsdb_protocol.h,

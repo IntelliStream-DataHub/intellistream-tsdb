@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """The Python client of the integration tests: same command line and output as c/itc.c, rust/ and java/
 (see run.py). Needs the tsdb_client module (make test-python's venv, build/pyvenv)."""
 import array

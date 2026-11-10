@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Query benchmark: the random windows of `tsdbc-bench query`, over TCP from this client.
 
     python bench_query.py [--addr 127.0.0.1:7070] [--series 100] [--points 1000000] [--conns 1] [--seconds 3]

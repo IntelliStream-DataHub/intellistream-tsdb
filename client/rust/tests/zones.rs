@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Grouping by local periods (protocol version 4): the server knows UTC only,
 //! so the client turns a time zone into bucket bounds (QUERY_BOUNDS). Against
 //! a real tsdbd the buckets are those of the C client

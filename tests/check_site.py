@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Checks the GitHub Pages site in site/, so that it cannot rot quietly.
 
     python3 tests/check_site.py          # check (make test runs this)
@@ -119,6 +120,13 @@ def source_text(spec, lang, block, page):
         return None
     with open(full, encoding="utf-8") as f:
         text = f.read()
+    # the SPDX line is a header of the file, not code to show: line numbers (data-src ...#L10-L20) count without it
+    head = text.split("\n", 2)
+    for i in range(min(2, len(head) - 1)):
+        if "SPDX-License-Identifier:" in head[i]:
+            del head[i]
+            text = "\n".join(head)
+            break
     if not frag:
         return text.rstrip("\n")
     m = re.fullmatch(r"L(\d+)-L(\d+)", frag)

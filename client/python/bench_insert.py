@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Insert benchmark: loads a RowBinary file into tsdbd, as `tsdbc-bench load`.
 
     python bench_insert.py FILE [--addr 127.0.0.1:7070] [--conns 4] [--batch 1000000]

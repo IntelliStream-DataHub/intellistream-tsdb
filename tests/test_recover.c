@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * In-process recovery of a volume (tsdb_volume_quiesce / idle / reopen, ha.md 15.5 steps 2 and 4.3).
  *

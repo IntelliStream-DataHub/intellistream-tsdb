@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Reads results.log and facts.txt of a bench/clients/run.sh run and prints Markdown: the machine, the load
 tables (throughput, client CPU, bytes on the wire, server CPU) and one table per query class, each the median
 of the repetitions, embedded first. Exits 1 if any load did not store the rows of the file, if nothing was verified, or if the systems did not

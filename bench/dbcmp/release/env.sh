@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # Paths, pins and knobs of the release comparison; sourced by run.sh and prep.sh. Every one can be overridden.
 #   TSDB_TREE  a built tsdb tree: build/tsdbd, build/tsdbc-bench, build/tsdb-bench, build/dbcmp/{tsdbq,tsdbstat,embq}
 #              (default: this repository; the multi-series run points it at a detached worktree of that branch)
