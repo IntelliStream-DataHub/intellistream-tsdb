@@ -2435,6 +2435,15 @@ int tsdb_failed(tsdb *t, char *msg, size_t len)
     pthread_rwlock_unlock(&t->lock);
     return rc;
 }
+int tsdb_volume_failed(tsdb *t, uint32_t volume, char *msg, size_t len)
+{
+    if (msg && len)
+        msg[0] = '\0';
+    pthread_rwlock_rdlock(&t->lock);
+    int rc = volume < t->nvols ? eng_failed_msg(t->vols[volume], msg, len) : TSDB_ERR_INVALID;
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
 int tsdb_flush(tsdb *t) { return each(t, eng_flush); }
 int tsdb_optimize(tsdb *t) { return each(t, eng_optimize); }
 

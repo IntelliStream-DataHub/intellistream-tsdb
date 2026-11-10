@@ -143,6 +143,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../../src/health_rules.h"
 #include "../harness.h"
 #include "../outagefs_ctl.h"
 
@@ -293,6 +294,14 @@ static const char *outagefs_lib;    /* --outagefs */
 static char vol_dir[2][PATH_MAX], octl[PATH_MAX]; /* the two volume directories; the shim's control socket */
 static atomic_llong vol_ok[2], vol_last_ok[2];    /* acknowledged writes per volume; ns of the latest one's INVOKE */
 static int outage_problems, outage_faults, outage_kills;
+/* The heals the check judged: each is awaited until a write to the volume is acknowledged, or the bound passes. One a
+ * run's end cuts short is counted, never silent. The nemesis stops starting faults at the end of the run's time
+ * (nem_stop) and finishes the heal it is in before the clients stop, so the last heal is judged like the others. */
+static atomic_bool nem_stop;
+static int outage_heals, outage_judged, outage_flap_judged;
+static double outage_worst_s, outage_worst_flap_s;
+static char outage_keeppath[PATH_MAX + 64]; /* where a failed or close outage run's server log is kept */
+static bool outage_near_miss; /* a heal took more than three quarters of its bound: the server log is kept */
 static double healthy_ops, healthy_secs, healthy_base_ops; /* B's writes during A's outage, and what B did before */
 
 #define CL_STR_(x) #x
@@ -949,7 +958,7 @@ static void *client(void *arg)
  * here (WNOWAIT): the nemesis below does that. */
 static void nap(useconds_t us, bool watch)
 {
-    for (useconds_t t = 0; t < us && !atomic_load(&stop); t += 5000) {
+    for (useconds_t t = 0; t < us && !atomic_load(&stop) && !atomic_load(&nem_stop); t += 5000) {
         pid_t pid = atomic_load(&server_pid);
         siginfo_t si;
         si.si_pid = 0;
@@ -1104,9 +1113,11 @@ static void rot_damage(uint64_t r)
  * health.c: it is flapping, and recovering volumes into the next outage costs more than waiting). That is the
  * documented promise for such a volume, and a 300 s run reaches it all the time (the seed 1 and 2 runs of the
  * weekly CI failed on it: the volume was DOWN on purpose). Its bound is those 60 s plus OUTAGE_RECOVER_S. */
-#define OUTAGE_FLAP_S 60
-#define OUTAGE_FLAP_WINDOW_S 600
-#define OUTAGE_FLAP_DOWNS 3
+#define OUTAGE_FLAP_S (HEALTH_FLAP_NEED_MS / 1000) /* the server's own numbers (src/health_rules.h): one source */
+#define OUTAGE_FLAP_WINDOW_S (HEALTH_FLAP_WINDOW_MS / 1000)
+#define OUTAGE_FLAP_DOWNS HEALTH_FLAP_DOWNS
+_Static_assert(OUTAGE_FLAP_S * 1000 == HEALTH_FLAP_NEED_MS && OUTAGE_FLAP_WINDOW_S * 1000 == HEALTH_FLAP_WINDOW_MS,
+               "the flapping rule is whole seconds here");
 #define OUTAGE_DOWN_S 5.0 /* DOWN is declared 2.5 s (the threshold here) plus a probe period or two after the hang
                            * starts, and the calls stuck before it are released then; the healthy volume is measured from here */
 
@@ -1151,8 +1162,22 @@ static void outage_await_recovery(int v, int64_t since, const char *what)
     int64_t t0 = now_ns();
     bool flap = outage_flapping(v);
     int bound = OUTAGE_RECOVER_S + (flap ? OUTAGE_FLAP_S : 0);
+    outage_heals++;
     while (!atomic_load(&stop)) {
         if (atomic_load(&vol_last_ok[v]) > since) {
+            double took = (double)(now_ns() - since) / 1e9;
+            outage_judged++;
+            if (flap) {
+                outage_flap_judged++;
+                outage_worst_flap_s = took > outage_worst_flap_s ? took : outage_worst_flap_s;
+            } else {
+                outage_worst_s = took > outage_worst_s ? took : outage_worst_s;
+            }
+            if (took > 0.75 * bound) {
+                outage_near_miss = true;
+                fprintf(stderr, "  volume %d: a write was acknowledged only %.1f s after the heal (bound %d s%s)\n", v,
+                        took, bound, flap ? ", flapping" : "");
+            }
             if (getenv("JEPSEN_OUTAGE_TRACE"))
                 fprintf(stderr, "jepsen: [%.3f] volume %d takes a new write %.2f s after the heal (bound %d s%s)\n",
                         (double)now_ns() / 1e9, v, (double)(now_ns() - since) / 1e9, bound, flap ? ", flapping" : "");
@@ -1160,6 +1185,7 @@ static void outage_await_recovery(int v, int64_t since, const char *what)
         }
         if (now_ns() - t0 > bound * 1000000000LL) {
             outage_problems++;
+            outage_judged++;
             fprintf(stderr, "  volume %d: no write acknowledged in %d s after the heal (%s%s)\n", v, bound, what,
                     flap ? "; its domain was flapping, 60 s of good probes included" : "");
             print_tail(slogpath); /* the server's side of it: the log of every start since the run began */
@@ -1167,6 +1193,8 @@ static void outage_await_recovery(int v, int64_t since, const char *what)
         }
         usleep(20000);
     }
+    /* stop was set (a server that would not start, or the run ended another way): this heal has no verdict */
+    fprintf(stderr, "  volume %d: the run ended before its heal was judged (%s)\n", v, what);
 }
 
 static void outage_tick(uint64_t r)
@@ -1253,11 +1281,11 @@ static void *nemesis_thread(void *arg)
 {
     (void)arg;
     uint64_t r = mix(seed + 77);
-    while (!atomic_load(&stop)) {
+    while (!atomic_load(&stop) && !atomic_load(&nem_stop)) {
         r = mix(r);
         nap(idle_mutant_long ? 5000000 : 150000 + (useconds_t)(r % 600000),
             ((!strcmp(nemesis, "power") && crashfs) && !idle_mutant && !idle_mutant_long) || md);
-        if (atomic_load(&stop))
+        if (atomic_load(&stop) || atomic_load(&nem_stop))
             break;
         int64_t dts = atomic_exchange(&death_ts, 0);
         if (dts && nreact < (int)(sizeof react_ms / sizeof *react_ms))
@@ -2569,6 +2597,10 @@ int main(int argc, char **argv)
     else
         snprintf(slogpath, sizeof slogpath, "%s.server.log", dir);
     unlink(slogpath);
+    if (outage) { /* a log kept by an earlier run of this directory and seed is not this run's */
+        snprintf(outage_keeppath, sizeof outage_keeppath, "%s.outage-s%llu.server.log", dir, (unsigned long long)seed);
+        unlink(outage_keeppath);
+    }
     writes = calloc(MAX_OPS, sizeof *writes);
     reads = calloc(MAX_OPS, sizeof *reads);
     /* QUERY_LATEST: with nulls written and every answer checked against the acknowledged writes. Not where damage is
@@ -2626,9 +2658,15 @@ int main(int argc, char **argv)
     if (dmon)
         pthread_create(&dth, NULL, death_thread, NULL);
     usleep((useconds_t)(seconds * 1e6));
-    atomic_store(&stop, true);
-    if (strcmp(nemesis, "none"))
+    if (outage) { /* the clients go on until the heal the nemesis is in has been judged (up to its bound, 90 s) */
+        atomic_store(&nem_stop, true);
         pthread_join(nem, NULL);
+        atomic_store(&stop, true);
+    } else {
+        atomic_store(&stop, true);
+        if (strcmp(nemesis, "none"))
+            pthread_join(nem, NULL);
+    }
     if (dmon)
         pthread_join(dth, NULL);
     for (int i = 0; i < nclients; i++)
@@ -2722,6 +2760,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "  only %d volume faults in %.0f s: the nemesis was idle\n", outage_faults, seconds);
             v++;
         }
+        printf("outage heals: %d, %d judged (%d of a flapping domain; slowest %.1f s, slowest flapping %.1f s), "
+               "%d not judged\n",
+               outage_heals, outage_judged, outage_flap_judged, outage_worst_s, outage_worst_flap_s,
+               outage_heals - outage_judged);
         v += outage_problems;
     }
     if (!strcmp(nemesis, "power")) {
@@ -2756,8 +2798,14 @@ int main(int argc, char **argv)
         }
     }
     unlink(markpath);
-    if (!v)
+    if (outage && (v || outage_near_miss)) {
+        /* what a failed or a close run has to show: the server's side of it (the log of every start of the run), under
+         * a name the next run does not unlink; CI uploads /tmp/tsdb-jepsen-ci*.log */
+        if (rename(slogpath, outage_keeppath) == 0)
+            fprintf(stderr, "  the server log of this run is kept in %s\n", outage_keeppath);
+    } else if (!v && !getenv("JEPSEN_KEEP_LOG")) {
         unlink(slogpath);
+    }
     if (fport && !fv)
         unlink(flogpath);
     if (system(cmd) != 0)

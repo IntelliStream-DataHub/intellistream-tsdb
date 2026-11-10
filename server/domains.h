@@ -463,7 +463,10 @@ static int dom_failwatch(char *msg, size_t msglen)
         if (dom_of(v) < 0)
             return 1;
         if (!atomic_load(&dom.vol[v].recovering) && !atomic_load(&dom.vol[v].diverged)) {
-            dom_log("storage failure, recovering in place", v, msg);
+            char own[512]; /* this volume's own error: msg is the first failed volume's, which may be another one */
+            if (tsdb_volume_failed(dom.db, (uint32_t)v, own, sizeof own) != TSDB_ERR_IO || !own[0])
+                snprintf(own, sizeof own, "%s", msg);
+            dom_log("storage failure, recovering in place", v, own);
             tsdb_health_probe_now(dom.health, dom_of(v));
             dom_recover(v);
         }

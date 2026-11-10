@@ -1001,6 +1001,9 @@ void tsdb_set_write_wait_hook(tsdb *db, void (*on_wait)(void *ctx, int delta), v
  * Returns 0 while healthy; TSDB_ERR_IO once failed, with what failed (the
  * directory, the operation, the errno text) in msg. */
 int tsdb_failed(tsdb *db, char *msg, size_t len);
+/* The same for one volume (0 is the root): its own failure, not the first one tsdb_failed finds. TSDB_ERR_INVALID for a
+ * volume >= tsdb_volume_count. */
+int tsdb_volume_failed(tsdb *db, uint32_t volume, char *msg, size_t len);
 
 typedef struct tsdb_part_info {
     const char *name;

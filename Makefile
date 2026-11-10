@@ -90,6 +90,7 @@ $(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/l
 	$(CC) $(CFLAGS) -c -o $@ $<
 # simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
 $(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
+$(B)/health.o: src/health_rules.h
 # Its lanes start at zero (arrays of 16 and 32 doubles): GCC's generic tuning (the dist build) clears 33 to 8192
 # known bytes with `rep stosq`, whose startup (some 30 cycles) was a third of a short run's fold (fold-bench --rows
 # 32, sse kernels); -march=native picks vector stores itself. Vector stores up to 512 bytes, memset beyond.
@@ -887,10 +888,10 @@ $(B)/test_unavailable: tests/test_unavailable.c tests/harness.h tests/outagefs_c
 $(B)/outage_server: tests/outage_server.c tests/harness.h tests/outagefs_ctl.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
+$(B)/test_health: tests/test_health.c tests/outagefs_ctl.h src/health_rules.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/jepsen: tests/jepsen/jepsen.c tests/jepsen/feedcheck.c tests/harness.h src/internal.h src/feed.h $(CLIB) $(LIB)
+$(B)/jepsen: tests/jepsen/jepsen.c tests/jepsen/feedcheck.c tests/harness.h src/internal.h src/feed.h src/health_rules.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ tests/jepsen/jepsen.c tests/jepsen/feedcheck.c $(CLIB) $(LIB) $(LDLIBS)
 
 # Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while
@@ -908,6 +909,9 @@ JEPSEN_WORKLOADS ?= kv classes
 # engine's checks, which do not depend on the workload. JEPSEN_SECONDS, when set, is the length of every run (the
 # weekly CI run sets it, with one power seed); otherwise each nemesis has its own short default.
 JEPSEN_SECONDS ?=
+# The outage nemesis's seeds: a seed fixes the fault schedule, so more seeds test more than repeats of one do (the weekly CI
+# run sets six; a run with a flapping domain spends minutes waiting for its 60 s, and what it does in them is the seed's).
+JEPSEN_OUTAGE_SEEDS ?= 1 2
 # Then kv once more with login (--auth: USERS made by $(B)/tsdb, every client logs in at every reconnect) under kill
 # and one power seed, per backend.
 jsec = $(if $(JEPSEN_SECONDS),$(JEPSEN_SECONDS),$(1))
@@ -921,7 +925,7 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 	        --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis pause --seconds $(call jsec,10) && \
 	    if [ $$wl = kv ]; then \
-	        for seed in 1 2; do \
+	        for seed in $(JEPSEN_OUTAGE_SEEDS); do \
 	            TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis outage --seconds $(call jsec,40) \
 	                --seed $$seed --outagefs $(B)/liboutagefs.so || exit 1; done && \
 	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
@@ -960,6 +964,14 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --mutant-longnap 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'restarts in .* it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage \
+	    --seconds 8 --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
+	    if [ $$rc -eq 0 ] || ! find $(JEPSEN_DIR)-selftest.outage-s1.server.log -size +0 -mmin -2 2>/dev/null | grep -q .; then \
+	        echo "jepsen-selftest: a failed outage run did not keep its server log (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage --seconds 20 --seed 2 \
+	    --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^outage heals: [1-9][0-9]*, [0-9]* judged .*, 0 not judged$$'; then \
+	        echo "jepsen-selftest: an outage run left a heal unjudged, or did not say how many (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 
