@@ -1529,9 +1529,6 @@ static void rm_tree(const char *path)
         failures++;
 }
 
-/* B2: a failure while the parts of one insert are written, synced or named is never a success, and the insert
- * leaves nothing: not a part in the live database, not one after a reopen, not a tmp or intent file. Failures at
- * each write and sync of the first and of the second partition's part. */
 extern int (*mt_test_reserve_fail)(uint32_t id); /* src/memtable.c: nonzero fails the memtable's growth for series id */
 static uint32_t reserve_fail_id;
 static int reserve_fail_hits;
@@ -1598,6 +1595,132 @@ static void test_memtable_room(const char *base)
     rm_tree(crash);
 }
 
+/* The room a batch needs counts every row of a series that comes more than once: series b holds 63 rows of its 64,
+ * so one more row fits and two do not. Ids in ascending order take one capacity check per series, other orders
+ * count row by row; each must refuse the batch (the growth fails) with nothing of it visible, and no engine fail
+ * (the mt_add after the WAL append would have to fail then). */
+static void test_memtable_room_runs(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-mtroom-runs", base);
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid a, b;
+    OK(tsdb_series(db, "a", &a));
+    OK(tsdb_series(db, "b", &b));
+    OK(insert_n(db, b, 0, 63, false));
+    const tsdb_sid order[2][3] = {{a, b, b}, {b, a, b}}; /* ascending (a run of b), and not */
+    for (int c = 0; c < 2; c++) {
+        const int64_t ts[3] = {1000 + c, 2000 + c, 3000 + c};
+        const float v[3] = {1, 2, 3};
+        reserve_fail_id = (uint32_t)TSDB_SID_LOCAL(b), reserve_fail_hits = 0;
+        mt_test_reserve_fail = reserve_fail;
+        int rc = tsdb_insert(db, order[c], ts, v, 3);
+        mt_test_reserve_fail = NULL;
+        if (reserve_fail_hits != 1 || rc != TSDB_ERR_NOMEM) {
+            fprintf(stderr, "memtable room, order %d: the planted failure fired %d times, the insert gave %s\n", c,
+                    reserve_fail_hits, tsdb_strerror(rc));
+            failures++;
+        }
+        CHECK(count_rows(db, "a") == 0);
+        CHECK(count_rows(db, "b") == 63);
+        if (is_failed(db, NULL)) {
+            fprintf(stderr, "memtable room, order %d: the engine failed\n", c);
+            failures++;
+        }
+    }
+    const int64_t ts[3] = {5000, 6000, 7000};
+    const float v[3] = {1, 2, 3};
+    OK(tsdb_insert(db, order[1], ts, v, 3)); /* no failure planted: all of it is applied */
+    CHECK(count_rows(db, "a") == 1);
+    CHECK(count_rows(db, "b") == 65);
+    tsdb_close(db);
+}
+
+extern int (*mt_test_flush_fail)(void); /* src/memtable.c: 0 flushes, INT_MIN skips the flush, else its error */
+static pthread_t flush_fail_main;
+static int flush_fail_hits;
+
+/* The flusher thread is "slow" (its flush does nothing), the writer's own backpressure flush fails with NOMEM */
+static int flush_fail(void)
+{
+    if (!pthread_equal(pthread_self(), flush_fail_main))
+        return INT_MIN;
+    flush_fail_hits++;
+    return TSDB_ERR_NOMEM;
+}
+
+static uint64_t memtable_rows_of(tsdb *db)
+{
+    tsdb_volume_stats vs;
+    memset(&vs, 0, sizeof vs);
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    return vs.memtable_rows;
+}
+
+/* The backpressure flush (a memtable at twice buffer_rows) failing is never the result of a write that is applied.
+ * It used to run after the append: the write that took the memtable to the limit returned the flush's error
+ * although its rows were visible and in the WAL (a crash replays them), an error a client takes for a refused
+ * write. Now it runs before the next write's append: that write is refused, definitely (not visible, not in the
+ * WAL), the memtable stops growing while flushes fail, and the first write after they work again flushes and is
+ * applied. */
+static void test_backpressure_flush(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-backpressure", base);
+    tsdb_options o = opts();
+    o.buffer_rows = 200; /* writes of 50 rows (below wal_max_batch_rows): the limit 2 x 200 comes at the 8th */
+    tsdb *db = open_fresh(name, o);
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    flush_fail_main = pthread_self(), flush_fail_hits = 0;
+    mt_test_flush_fail = flush_fail;
+    for (int k = 0; k < 8; k++) { /* the 8th reaches the limit: applied, so a success whatever the flush would say */
+        int rc = insert_n(db, id, k * 50, 50, false);
+        if (rc != 0) {
+            fprintf(stderr, "backpressure: write %d gave %s, it is applied\n", k, tsdb_strerror(rc));
+            failures++;
+        }
+    }
+    CHECK(count_rows(db, "s") == 400);
+    CHECK(memtable_rows_of(db) == 400);
+    for (int k = 8; k < 13; k++) { /* flushes keep failing: each write is refused whole, the memtable stays */
+        int rc = insert_n(db, id, k * 50, 50, false);
+        if (rc != TSDB_ERR_NOMEM) {
+            fprintf(stderr, "backpressure: write %d gave %s, want NOMEM\n", k, tsdb_strerror(rc));
+            failures++;
+        }
+        CHECK(count_rows(db, "s") == 400);
+        CHECK(memtable_rows_of(db) == 400);
+    }
+    CHECK(flush_fail_hits == 5);
+    if (is_failed(db, NULL)) {
+        fprintf(stderr, "backpressure: the engine failed\n");
+        failures++;
+    }
+    /* a crash: nothing of the refused writes is in the WAL */
+    char cmd[2000], crash[620];
+    snprintf(crash, sizeof crash, "%s.crash", name);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' && cp -a '%s' '%s'", crash, name, crash);
+    if (system(cmd) != 0)
+        failures++;
+    tsdb *cdb = NULL;
+    tsdb_options co = opts();
+    OK(tsdb_open(crash, &co, &cdb));
+    if (cdb) {
+        CHECK(count_rows(cdb, "s") == 400);
+        tsdb_close(cdb);
+    }
+    rm_tree(crash);
+    mt_test_flush_fail = NULL; /* they work again: the next write flushes the 400 rows, then is applied */
+    OK(insert_n(db, id, 8 * 50, 50, false));
+    CHECK(count_rows(db, "s") == 450);
+    CHECK(memtable_rows_of(db) == 50);
+    tsdb_close(db);
+}
+
+/* B2: a failure while the parts of one insert are written, synced or named is never a success, and the insert
+ * leaves nothing: not a part in the live database, not one after a reopen, not a tmp or intent file. Failures at
+ * each write and sync of the first and of the second partition's part. */
 static void test_partial_insert(const char *base)
 {
     char name[600];
@@ -1852,6 +1975,8 @@ int main(int argc, char **argv)
     test_dir_fsync_race(root);
     test_partial_insert(root);
     test_memtable_room(root);
+    test_memtable_room_runs(root);
+    test_backpressure_flush(root);
     test_fsync_results(root);
     if (!failures) {
         char cmd[512];
