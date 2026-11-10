@@ -709,6 +709,60 @@ static tsdbc *connect_retry(void)
     }
 }
 
+/* Before the clients and the nemesis start, nobody else reaps the server: a server that died (a crash right after it
+ * listened, the segv self-test) is a zombie that holds no socket, so connect_retry() would try for ever and a run
+ * hung for 18 hours (found 2026-11-10: the self-test asleep in usleep with a zombie tsdbd). This one asks the child
+ * whether it is gone, says how it ended, and gives up after SETUP_CONNECT_S. */
+#define SETUP_CONNECT_S 60
+static tsdbc *connect_setup(void)
+{
+    int64_t until = now_ns() + SETUP_CONNECT_S * 1000000000LL;
+    for (;;) {
+        tsdbc *c;
+        pid_t pid = atomic_load(&server_pid);
+        if (connect_own(atomic_load(&port), pid, &c) == 0)
+            return c;
+        int st;
+        if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid) {
+            note_death(st, false, pid); /* names the status: a SIGSEGV is "not a power loss" */
+            fprintf(stderr, "jepsen: the server ended before the setup was done (status %#x)\n", st);
+            print_tail(slogpath);
+            server_gone();
+            exit(2);
+        }
+        if (now_ns() > until) {
+            fprintf(stderr, "jepsen: no connection to the server in %d s during the setup\n", SETUP_CONNECT_S);
+            print_tail(slogpath);
+            stop_server(SIGKILL);
+            exit(2);
+        }
+        usleep(2000);
+    }
+}
+
+/* Self-test hook: a pause between the start of a server and the connection to it (the server of segv-tsdbd.sh is
+ * dead by then, which is what the run must notice). */
+static void setup_pause(void)
+{
+    const char *e = getenv("JEPSEN_SETUP_PAUSE_MS");
+    if (e && atoi(e) > 0)
+        usleep((useconds_t)atoi(e) * 1000);
+}
+
+/* A watchdog for the whole run: the budget is generous (every honest run ends within seconds + a few start-ups and
+ * the final reads), and a run that is still going then is hung, whatever it waits for. It exits 124 with a message
+ * (the servers follow it out: --exit-with-parent). JEPSEN_WATCHDOG_S sets the budget for the self-test. */
+static void jepsen_watchdog(void)
+{
+    long budget = (long)(seconds * 5) + 1200;
+    const char *e = getenv("JEPSEN_WATCHDOG_S");
+    if (e && atol(e) > 0)
+        budget = atol(e);
+    char name[64];
+    snprintf(name, sizeof name, "jepsen --nemesis %s", nemesis);
+    th_watchdog(name, budget);
+}
+
 static void *client(void *arg)
 {
     uint64_t r = mix(seed * 1000 + (uint64_t)(intptr_t)arg);
@@ -2270,7 +2324,8 @@ static int make_volumes(void)
 
 static int create_series(int from, int to)
 {
-    tsdbc *c = connect_retry();
+    setup_pause();
+    tsdbc *c = connect_setup();
     for (int s = from; s < to; s++) {
         char name[32];
         snprintf(name, sizeof name, "jepsen.%d", s);
@@ -2485,12 +2540,14 @@ int main(int argc, char **argv)
     }
     signal(SIGPIPE, SIG_IGN);
     if (md || rot) {
+        jepsen_watchdog(); /* the parent: all the epochs */
         int rc = epochs(); /* the parent runs the epochs and returns here; each child goes on below */
         if (rc >= 0)
             return rc;
         snprintf(faultlog, sizeof faultlog, "%s.e%d.faults", dir, epoch);
         unlink(faultlog);
     }
+    jepsen_watchdog(); /* a run without epochs, or one epoch: a timer is not inherited by a forked child */
     /* Two runs on one directory wipe and write each other's database, and the checker then reports the other run's
      * writes as lost acknowledged writes. The lock beside the directory (it survives the wipe) is held until exit. */
     char lockpath[1100];
@@ -2690,16 +2747,28 @@ int main(int argc, char **argv)
             }
             printf("nemesis: %d server deaths seen while napping, reaction median %.0f ms, p90 %.0f ms (%d restarts)\n",
                    nreact, med, p90, restarts);
-            /* a nemesis that wakes too rarely has too few reactions to judge: a nap is at most 0.75 s, so a
-             * restart every 2 s is far below any honest run, and the busiest one had 60 restarts in 20 s */
-            if ((double)restarts < seconds / 2) {
-                fprintf(stderr, "  only %d restarts in %.0f s (at least %.0f expected): it was idle\n", restarts,
-                        seconds, seconds / 2);
+            /* No count of restarts is judged: it falls with the machine's load (a start-up that takes a second
+             * halves it: "only 6 restarts in 20 s, it was idle" on a busy box, with 0 violations). What is judged
+             * is how long the nemesis left a dead server alone, which a load changes by a few polls only. A nemesis
+             * that naps 5 s at a time (--mutant-longnap) has few reactions but each one is seconds, so three of
+             * them decide; fewer than two in 10 s or more means the servers hardly ever died by themselves
+             * while it napped, and the run proved nothing about its reaction (it must not pass for that). */
+            double total = 0;
+            for (int i = 0; i < nreact; i++)
+                total += react_ms[i];
+            if (seconds >= 10 && nreact < 2) {
+                fprintf(stderr, "  only %d server deaths seen while napping in %.0f s (at least 2 needed to judge the "
+                        "nemesis): it was idle\n", nreact, seconds);
                 v++;
             }
-            if (nreact >= 5 && med > 100) {
+            if (nreact >= 3 && med > 100) {
                 fprintf(stderr, "  the nemesis took a median of %.0f ms to notice a dead server (at most 100 expected): "
                         "it was idle\n", med);
+                v++;
+            }
+            if (nreact >= 3 && total > seconds * 500) {
+                fprintf(stderr, "  the nemesis left dead servers alone for %.1f s of %.0f s (at most half expected): "
+                        "it was idle\n", total / 1e3, seconds);
                 v++;
             }
         }

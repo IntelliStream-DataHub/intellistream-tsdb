@@ -1013,17 +1013,30 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too. A tsdbd with a stale
 # entry in its latest table (three mutants, built from a copy of the tree) fails the kv run's latest check.
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
-	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
+	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss'; then \
-	        echo "jepsen-selftest: a SIGSEGV in the server went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	        echo "jepsen-selftest: a SIGSEGV in the server went unnoticed (rc $$rc, 124 is the timeout)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh JEPSEN_SETUP_PAUSE_MS=1500 timeout 120 ./$(B)/jepsen \
+	    --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss'; then \
+	        echo "jepsen-selftest: a server that died before the setup connected hung or went unnoticed (rc $$rc, 124 is the timeout)"; \
+	        echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_SETUP_PAUSE_MS=100000 JEPSEN_WATCHDOG_S=5 timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest \
+	    --nemesis power --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 124 ] || ! echo "$$out" | grep -q 'jepsen --nemesis power: watchdog: still running after'; then \
+	        echo "jepsen-selftest: a stalled run was not ended by the watchdog (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_TSDBD=tests/jepsen/slow-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
+	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ]; then \
+	        echo "jepsen-selftest: servers that start slowly made an honest nemesis look idle (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 10 --crashfs $(B)/libcrashfs.so \
 	    --mutant-idle 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that sleeps through its naps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so \
+	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 30 --crashfs $(B)/libcrashfs.so \
 	    --mutant-longnap 2>&1); rc=$$?; \
-	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'restarts in .* it was idle'; then \
+	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'took a median of .* it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
