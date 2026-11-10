@@ -72,6 +72,11 @@ live in their own packages, so that the network clients can stay Apache-2.0 with
 - `tsdb cluster` with no arguments (or `help`) prints the cluster commands and options (it printed the general usage and
   exited with 2). New tutorial for the cluster preview, [docs/cluster-preview.md](docs/cluster-preview.md): three servers
   and a witness on one machine, the leader killed and restarted; `tests/test_cluster_tutorial.sh` runs its command block.
+- Storage domains: tsdbd logs the first write probe of each DOWN that works but takes longer than `fast_ms` (then one a
+  minute at most), since such a probe starts the count of good probes over (a flapping domain on a slow disk stayed DOWN
+  with no sign of why); the "recovering in place" line names the volume's own error (`tsdb_volume_failed`, C API, new
+  function; `tsdb_abi_version` stays). The outage nemesis of `make jepsen` judges the last heal of a run, reports the
+  heals it judged, keeps the server log of a failed run (also one that ends at a server that does not start or a final read that cannot connect), runs the servers with `fast_ms` 2000, extends a flapping heal's bound when the server logged a slow write probe after it and jepsen's own fdatasync was slow then too (never past 150 s after the heal: the heal fails there, naming the slow-probe lines; `tests/jepsen/mutant-slowprobe.sh`, in jepsen-selftest, plants a server that reports every probe slow), bounds the wait for the last heal at the run's end, and takes its seeds from `JEPSEN_OUTAGE_SEEDS`.
 
 ## [0.10.0] - 2026-11-09
 
