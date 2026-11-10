@@ -171,14 +171,14 @@ static int scenario(char *prog, const char *dir, const struct scen *sc, int *run
 }
 
 /* four threads on one CPU: each waits for it about three quarters of the time */
-static volatile int hog_stop;
+static int hog_stop; /* __atomic: the hogs read it while main writes it (TSan) */
 static void *hog(void *arg)
 {
     cpu_set_t cs;
     CPU_ZERO(&cs);
     CPU_SET((int)(intptr_t)arg, &cs);
     sched_setaffinity(0, sizeof cs, &cs);
-    while (!hog_stop)
+    while (!__atomic_load_n(&hog_stop, __ATOMIC_RELAXED))
         ;
     return NULL;
 }
@@ -203,7 +203,7 @@ static void gauge_sees_contention(const char *dir)
     for (int i = 0; i < 4; i++)
         pthread_create(&hs[i], NULL, hog, (void *)(intptr_t)cpu);
     usleep(1500 * 1000);
-    hog_stop = 1;
+    __atomic_store_n(&hog_stop, 1, __ATOMIC_RELAXED);
     for (int i = 0; i < 4; i++)
         pthread_join(hs[i], NULL);
     int wake, runq, fsync;

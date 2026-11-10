@@ -252,6 +252,7 @@ static int64_t death_ts;         /* under death_mu: when death_stamp_pid was fir
 static pid_t death_stamp_pid;    /* under death_mu */
 static pid_t death_last_pid;     /* under death_mu: the pid of the last stamp: never stamped twice */
 static int own_pulls, alive_looks;
+#define PULLS_MIN_ALIVE 8 /* live servers the nemesis must have found before its plug pulls are judged */
 static int64_t stop_ns; /* when the run's time was up: a server still dead and unreaped then has been waiting since its stamp */
 static const char *nem_mutant;   /* --mutant-nemesis: nothing, once, never, oncereact, nap:MS (the check must fail) */
 static atomic_bool nem_busy;
@@ -2917,6 +2918,10 @@ int main(int argc, char **argv)
             int want = (int)(seconds * 2 / 10);
             if (want > (alive_looks + 1) / 2) /* half of the live servers it found: one may die by itself as it is signalled */
                 want = (alive_looks + 1) / 2;
+            /* With crashfs's default rate on a tmpfs the servers die within ms of starting, so even an honest nemesis finds
+             * 0 or 1 live server in a run (the gate of 0f6b112: 1 found, 276 restarts) and its faults are crashfs's own: the
+             * pulls are judged only when it found enough live servers to tell (the selftest lowers the rate for that). */
+            bool pulls_judged = alive_looks >= PULLS_MIN_ALIVE;
             printf("nemesis: %d plugs pulled (crashfs log or our kill) of %d live servers found, %d reactions to servers "
                    "that died by themselves, slowest %.0f ms\n", own_pulls, alive_looks, nreact, worst);
             /* Servers started in the run: a nemesis that does nothing, or naps for seconds, starts few (at least 2 + 1 per
@@ -2941,7 +2946,7 @@ int main(int argc, char **argv)
                         "it was idle\n", total / 1e3, seconds);
                 v++;
             }
-            if (seconds >= 10 && own_pulls < want) {
+            if (seconds >= 10 && pulls_judged && own_pulls < want) {
                 fprintf(stderr, "  the nemesis pulled the plug %d times in %.0f s (at least %d expected: it found %d live servers): "
                         "it injected too little\n", own_pulls, seconds, want, alive_looks);
                 v++;
