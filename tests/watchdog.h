@@ -71,20 +71,50 @@ static int th_cpu_pressure(void)
     return pct;
 }
 
+/* A whole number as text into out (no stdio: the signal handler uses it); returns the length. */
+static size_t th_watch_itoa(int v, char *out)
+{
+    char t[16];
+    size_t n = 0, k = 0;
+    if (v < 0)
+        v = 0;
+    do {
+        t[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v && n < sizeof t);
+    while (n)
+        out[k++] = t[--n];
+    return k;
+}
+
 #define TH_WATCH_BUSY_PCT 30 /* the machine has been this busy for five minutes: a slow test is not yet a hung one */
 #define TH_WATCH_EXTENSIONS 2
 
 static void th_watch_sig(int sig)
 {
     (void)sig;
-    if (th_watch_ext < TH_WATCH_EXTENSIONS && th_cpu_pressure() >= TH_WATCH_BUSY_PCT) {
+    int pct = th_watch_ext < TH_WATCH_EXTENSIONS ? th_cpu_pressure() : 0;
+    if (th_watch_ext < TH_WATCH_EXTENSIONS && pct >= TH_WATCH_BUSY_PCT) {
         struct itimerspec its;
         memset(&its, 0, sizeof its);
         its.it_value.tv_sec = th_watch_seconds;
         if (timer_settime(th_watch_timer, 0, &its, NULL) == 0) {
             th_watch_ext++;
-            static const char note[] = "\nwatchdog: the machine is busy (CPU pressure), the test gets more time\n";
-            if (write(2, note, sizeof note - 1) < 0)
+            /* "\nwatchdog: NAME: the machine is busy (CPU pressure avg300 P%), the test gets more time (renewal K of N)\n" */
+            char note[320];
+            size_t k = 0, l;
+            static const char a[] = "\nwatchdog: ", b[] = ": the machine is busy (CPU pressure avg300 ",
+                              c[] = "%), the test gets more time (renewal ", d[] = " of ", e[] = ")\n";
+            memcpy(note, a, sizeof a - 1), k += sizeof a - 1;
+            l = strnlen(th_watch_name, 96), memcpy(note + k, th_watch_name, l), k += l;
+            memcpy(note + k, b, sizeof b - 1), k += sizeof b - 1;
+            k += th_watch_itoa(pct, note + k);
+            memcpy(note + k, c, sizeof c - 1), k += sizeof c - 1;
+            k += th_watch_itoa(th_watch_ext, note + k);
+            memcpy(note + k, d, sizeof d - 1), k += sizeof d - 1;
+            k += th_watch_itoa(TH_WATCH_EXTENSIONS, note + k);
+            memcpy(note + k, e, sizeof e - 1), k += sizeof e - 1;
+            if (write(2, note, k) < 0)
                 th_watch_ext = TH_WATCH_EXTENSIONS;
             return;
         }

@@ -14,17 +14,14 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 
-static int failures;
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            fprintf(stderr, "%s:%d: FAILED: %s\n", __FILE__, __LINE__, #cond); \
-            failures++;                                                        \
-        }                                                                      \
-    } while (0)
+/* CHECK is a verdict about the code and fails the run at once; CHECK_T is "within N ms", excused only by this run's own
+ * evidence of load (busy.h). */
+#define CHECK(cond) TH_CHECK(cond)
+#define CHECK_T(cond) TH_CHECK_T(cond)
 
 static char ctl[256];
 static tsdb_health *h;
@@ -51,11 +48,9 @@ static int cmd(const char *verb, const char *dir, const char *arg)
     return outagefs_cmd(ctl, line, NULL, 0);
 }
 
-/* How late this thread was woken, at most: the test's own gauge of a busy machine. The thresholds below are a few
- * hundred ms (scaled down from seconds), so a probe thread that waits for a CPU for that long flips a domain to
- * DEGRADED that no fault touched: a failure with load in it is not a verdict (busy.h). */
-static atomic_int max_over_ms;
-
+/* How late this thread was woken: the test's own gauge of a busy machine, with the gauge thread's (busy.h). The
+ * thresholds below are a few hundred ms (scaled down from seconds), so a probe thread that waits for a CPU for that
+ * long flips a domain to DEGRADED that no fault touched: a timing failure with load in it is not a verdict. */
 static void nap(int ms)
 {
     struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L}, a, b;
@@ -63,9 +58,41 @@ static void nap(int ms)
     nanosleep(&ts, NULL);
     clock_gettime(CLOCK_MONOTONIC, &b);
     int over = (int)((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000) - ms;
-    int old = atomic_load(&max_over_ms);
-    while (over > old && !atomic_compare_exchange_weak(&max_over_ms, &old, over))
-        ;
+    if (over > 0)
+        th_note(TH_EV_WAKE, over);
+}
+
+/* The CPU time (user + system, ms) of every thread of this process except the caller's, summed: the probe threads of
+ * the health object (the test's own thread sleeps; the gauge is left out). A probe loop that spins instead of waiting shows here. */
+static long threads_cpu_ms(void)
+{
+    long ticks = 0;
+    DIR *d = opendir("/proc/self/task");
+    if (!d)
+        return -1;
+    struct dirent *e;
+    pid_t me = (pid_t)syscall(SYS_gettid);
+    while ((e = readdir(d))) {
+        int tid = atoi(e->d_name);
+        if (tid <= 0 || tid == me || tid == th_gauge_tid)
+            continue;
+        char path[64], b[1024];
+        snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0)
+            continue;
+        ssize_t n = read(fd, b, sizeof b - 1);
+        close(fd);
+        if (n <= 0)
+            continue;
+        b[n] = 0;
+        char *q = strrchr(b, ')'); /* the name may hold spaces; fields from the state on */
+        unsigned long ut = 0, st = 0;
+        if (q && sscanf(q + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) == 2)
+            ticks += (long)(ut + st);
+    }
+    closedir(d);
+    return ticks * 1000 / sysconf(_SC_CLK_TCK);
 }
 
 /* waits up to ms for a domain to be in a state */
@@ -115,6 +142,7 @@ static int run_test(int argc, char **argv)
     const char *const names[] = {"a", "a2", "b"};
     if (outagefs_reexec(argv, base, names, 3))
         return 1;
+    th_gauge_start(base);
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
     const char *da = outagefs_dir("a"), *da2 = outagefs_dir("a2"), *db = outagefs_dir("b");
 
@@ -138,69 +166,94 @@ static int run_test(int argc, char **argv)
     CHECK(dom_a == 0 && dom_a2 == 1 && dom_b == 2 && tsdb_health_domains(h) == 3);
 
     /* everything UP, probe files made, probes counted */
+    long cpu0 = threads_cpu_ms();
     nap(1200);
     for (int d = 0; d < 3; d++) {
         tsdb_domain_info in;
         CHECK(tsdb_health_info(h, d, &in) == 0);
-        CHECK(in.state == TSDB_DOM_UP);
-        CHECK(in.probes_ok >= 5 && in.probes_err == 0);
-        CHECK(in.threads == 1);
+        CHECK_T(in.state == TSDB_DOM_UP);
+        CHECK_T(in.probes_ok >= 5);
+        CHECK(in.probes_err == 0); /* a probe that failed with no fault is a bug, slow or not */
+        CHECK_T(in.threads == 1);
     }
     char p[512];
     snprintf(p, sizeof p, "%s/PROBE", da);
     CHECK(access(p, F_OK) == 0);
     snprintf(p, sizeof p, "%s/PROBE.t1", da);
     CHECK(access(p, F_OK) == 0);
-    CHECK(atomic_load(&changes) == 0);
+    CHECK_T(atomic_load(&changes) == 0);
+    /* idle: the probe threads wait between probes. A deadline in the past turns the wait into a busy loop (a thread of
+     * the health object burning a CPU: the test's own thread sleeps). CPU time, not wall time: load does not move it. */
+    nap(800);
+    long cpu1 = threads_cpu_ms();
+    fprintf(stderr, "probe threads used %ld ms of CPU in 2 s idle\n", cpu1 - cpu0);
+    CHECK(cpu0 >= 0 && cpu1 >= cpu0 && cpu1 - cpu0 < 400);
 
     /* hang: only A goes DOWN, after about down_ms; its sibling and the other server stay UP */
     CHECK(cmd("hang", da, NULL) == 0);
-    CHECK(stays(dom_a, TSDB_DOM_UP, 1000)); /* not yet: a probe has been out for 1 s of the 1.5 */
-    CHECK(wait_state(dom_a, TSDB_DOM_DOWN, 2000));
-    CHECK(tsdb_health_state(h, dom_a2) == TSDB_DOM_UP && tsdb_health_state(h, dom_b) == TSDB_DOM_UP);
+    CHECK_T(stays(dom_a, TSDB_DOM_UP, 1000)); /* not yet: a probe has been out for 1 s of the 1.5 */
+    CHECK_T(wait_state(dom_a, TSDB_DOM_DOWN, 2000));
+    CHECK_T(tsdb_health_state(h, dom_a2) == TSDB_DOM_UP && tsdb_health_state(h, dom_b) == TSDB_DOM_UP);
     tsdb_domain_info in;
-    CHECK(tsdb_health_info(h, dom_a, &in) == 0 && in.outage_id == 1 && in.stuck_ms > 1000);
+    CHECK(tsdb_health_info(h, dom_a, &in) == 0);
+    CHECK(in.outage_id == 1);
+    CHECK_T(in.stuck_ms > 1000);
     /* stuck past spawn_ms: a second probe thread */
     nap(1500);
-    CHECK(tsdb_health_info(h, dom_a, &in) == 0 && in.threads == 2);
-    CHECK(tsdb_health_state(h, dom_a) == TSDB_DOM_DOWN);
+    CHECK(tsdb_health_info(h, dom_a, &in) == 0);
+    CHECK_T(in.threads == 2);
+    CHECK_T(tsdb_health_state(h, dom_a) == TSDB_DOM_DOWN);
     /* heal: the stuck threads return, write probes work for recover_ms, then UP (auto_up) */
     CHECK(cmd("heal", da, NULL) == 0);
-    CHECK(wait_state(dom_a, TSDB_DOM_RECOVERING, 2500) || tsdb_health_state(h, dom_a) == TSDB_DOM_UP);
-    CHECK(wait_state(dom_a, TSDB_DOM_UP, 2000));
+    CHECK_T(wait_state(dom_a, TSDB_DOM_RECOVERING, 2500) || tsdb_health_state(h, dom_a) == TSDB_DOM_UP);
+    CHECK_T(wait_state(dom_a, TSDB_DOM_UP, 2000));
     nap(300);
-    CHECK(tsdb_health_info(h, dom_a, &in) == 0 && in.threads == 1);
-    CHECK(in.age_ms < 5000 && in.outage_id == 1);
+    CHECK(tsdb_health_info(h, dom_a, &in) == 0);
+    CHECK_T(in.threads == 1);
+    CHECK_T(in.age_ms < 5000);
+    CHECK(in.outage_id == 1);
 
     /* a read-only heal is not enough: with writes failing, the domain does not leave DOWN (reads would pass) */
     CHECK(cmd("eio", da, NULL) == 0);
-    CHECK(wait_state(dom_a, TSDB_DOM_DOWN, 2500)); /* three failed probes */
-    CHECK(tsdb_health_info(h, dom_a, &in) == 0 && in.outage_id == 2 && in.probes_err >= 3);
+    CHECK_T(wait_state(dom_a, TSDB_DOM_DOWN, 2500)); /* three failed probes */
+    CHECK(tsdb_health_info(h, dom_a, &in) == 0);
+    CHECK(in.outage_id == 2);
+    CHECK_T(in.probes_err >= 3);
     CHECK(cmd("heal", da, NULL) == 0);
-    CHECK(wait_state(dom_a, TSDB_DOM_UP, 4000));
+    CHECK_T(wait_state(dom_a, TSDB_DOM_UP, 4000));
 
     /* full: ENOSPC on the write probe sets `full` and nothing else */
     CHECK(cmd("enospc", db, NULL) == 0);
     nap(600);
-    CHECK(tsdb_health_info(h, dom_b, &in) == 0 && in.full == 1 && in.state == TSDB_DOM_UP);
+    CHECK(tsdb_health_info(h, dom_b, &in) == 0);
+    CHECK_T(in.full == 1);
+    CHECK_T(in.state == TSDB_DOM_UP);
     CHECK(cmd("heal", db, NULL) == 0);
     nap(600);
-    CHECK(tsdb_health_info(h, dom_b, &in) == 0 && in.full == 0 && in.state == TSDB_DOM_UP);
+    CHECK(tsdb_health_info(h, dom_b, &in) == 0);
+    CHECK_T(in.full == 0);
+    CHECK_T(in.state == TSDB_DOM_UP);
 
     /* slow: DEGRADED, nothing is refused (not DOWN); leaves after degraded_exit_ms under the threshold */
     CHECK(cmd("slow", da2, "400") == 0);
-    CHECK(wait_state(dom_a2, TSDB_DOM_DEGRADED, 3000));
-    CHECK(stays(dom_a2, TSDB_DOM_DEGRADED, 800));
-    CHECK(tsdb_health_state(h, dom_a) == TSDB_DOM_UP);
+    CHECK_T(wait_state(dom_a2, TSDB_DOM_DEGRADED, 3000));
+    CHECK_T(stays(dom_a2, TSDB_DOM_DEGRADED, 800));
+    CHECK_T(tsdb_health_state(h, dom_a) == TSDB_DOM_UP);
     CHECK(cmd("heal", da2, NULL) == 0);
-    CHECK(stays(dom_a2, TSDB_DOM_DEGRADED, 500)); /* hysteresis: not at once */
-    CHECK(wait_state(dom_a2, TSDB_DOM_UP, 4500));
+    CHECK_T(stays(dom_a2, TSDB_DOM_DEGRADED, 500)); /* hysteresis: not at once */
+    CHECK_T(wait_state(dom_a2, TSDB_DOM_UP, 4500));
 
-    /* the callback saw the transitions of the domains, and B's none */
+    /* the callback saw the transitions of the domains, and B's none. These are verdicts about the code and fail at
+     * once; but they rest on the transitions the timed waits above saw, so after a timing failure (which is judged
+     * by its own evidence, and a run that excuses it is run again) the log says nothing and is not judged. */
     pthread_mutex_lock(&lg_mu);
-    CHECK(strstr(lg, "0:0>2") && strstr(lg, "0:2>3") && strstr(lg, "0:3>0"));
-    CHECK(strstr(lg, "1:0>1") && strstr(lg, "1:1>0"));
-    CHECK(!strstr(lg, "2:"));
+    if (th_ntiming == 0) {
+        CHECK(strstr(lg, "0:0>2") && strstr(lg, "0:2>3") && strstr(lg, "0:3>0"));
+        CHECK(strstr(lg, "1:0>1") && strstr(lg, "1:1>0"));
+        CHECK(!strstr(lg, "2:"));
+    } else {
+        fprintf(stderr, "the callback log is not judged after a timing failure (log: %s)\n", lg);
+    }
     pthread_mutex_unlock(&lg_mu);
 
     /* a manual owner: with auto_up off, RECOVERING stays until tsdb_health_set_up */
@@ -210,10 +263,10 @@ static int run_test(int argc, char **argv)
     h = tsdb_health_open(&o);
     int d0 = tsdb_health_add_domain(h, "b", db);
     CHECK(cmd("eio", db, NULL) == 0);
-    CHECK(wait_state(d0, TSDB_DOM_DOWN, 2500));
+    CHECK_T(wait_state(d0, TSDB_DOM_DOWN, 2500));
     CHECK(cmd("heal", db, NULL) == 0);
-    CHECK(wait_state(d0, TSDB_DOM_RECOVERING, 4000));
-    CHECK(stays(d0, TSDB_DOM_RECOVERING, 1500));
+    CHECK_T(wait_state(d0, TSDB_DOM_RECOVERING, 4000));
+    CHECK_T(stays(d0, TSDB_DOM_RECOVERING, 1500));
     tsdb_health_set_up(h, d0);
     CHECK(tsdb_health_state(h, d0) == TSDB_DOM_UP);
     tsdb_health_close(h);
@@ -231,9 +284,10 @@ static int run_test(int argc, char **argv)
     CHECK(access(p, F_OK) != 0);
     tsdb_health_close(h);
 
-    if (failures) {
-        fprintf(stderr, "test_health: %d failures (log: %s)\n", failures, lg);
-        return th_failed(atomic_load(&max_over_ms));
+    int rc = th_finish("test_health");
+    if (rc) {
+        fprintf(stderr, "test_health: failed (log: %s)\n", lg);
+        return rc;
     }
     printf("test_health: ok\n");
     return 0;

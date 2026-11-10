@@ -306,7 +306,7 @@ TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(B)/test_watchdog $(B)/test_busy $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_watchdog
-	./$(B)/test_busy
+	./$(B)/test_busy $(SCRATCH)
 	./$(B)/test_group $(SCRATCH)
 	./$(B)/test_lttb $(SCRATCH)
 	B=$(B) tests/test_cli_lttb.sh
@@ -1021,7 +1021,9 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 	        --seconds $(call jsec,20) --crashfs $(B)/libcrashfs.so || exit 1; done
 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
-# power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too. A tsdbd with a stale
+# power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too, and so does one that does
+# nothing, kills once and then sleeps, naps 5 s or 9 s at a time, or never pulls the plug itself and only restarts the
+# servers that died by themselves (--mutant-nemesis nothing|once|nap:MS|never|oncereact). A tsdbd with a stale
 # entry in its latest table (three mutants, built from a copy of the tree) fails the kv run's latest check.
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
@@ -1049,6 +1051,14 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --mutant-longnap 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'took a median of .* it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	for spec in 'nothing|it was idle' 'once|it was idle' 'nap:9000|it was idle' 'never|injected too little' \
+	    'oncereact|injected too little'; do \
+	    m=$${spec%%|*}; want=$${spec#*|}; \
+	    out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so \
+	        --mutant-nemesis $$m 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "$$want"; then \
+	        echo "jepsen-selftest: a nemesis that is '$$m' went unnoticed (rc $$rc, wanted rc 1 and '$$want')"; echo "$$out" | tail -n 20; exit 1; fi; \
+	done; \
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 

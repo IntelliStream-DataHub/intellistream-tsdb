@@ -3,11 +3,15 @@
  * ThreadSanitizer when the parent has a second thread: that broke `make tsan` for every such test), (2) a child that
  * outlives it exits with status 124 and says which test hung, (3) a child that finishes in time is left alone, (4) on a
  * machine busy for minutes (a fake pressure file) the deadline is renewed twice, on an idle one it is not. */
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include "watchdog.h"
 
@@ -39,8 +43,38 @@ static int threads_now(void)
 #endif
 }
 
+/* This test's own bound: a watchdog that renews its deadline without limit (the planted TH_WATCH_EXTENSIONS 1000000)
+ * would leave the children below sleeping and this test waiting for them for ever, and a job with it. It is SIGALRM
+ * (the watchdog under test uses SIGRTMIN) and a child dies with its parent. */
+static void own_bound(int sig)
+{
+    (void)sig;
+    static const char m[] = "\nFAIL test_watchdog: still running after its own bound, a child's watchdog never ended it "
+                            "(exit 124)\n";
+    if (write(2, m, sizeof m - 1) < 0)
+        _exit(124);
+    _exit(124);
+}
+
+static void die_with_parent(void)
+{
+#ifdef __linux__
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
+}
+
+static int count_str(const char *hay, const char *needle)
+{
+    int n = 0;
+    for (const char *p = hay; (p = strstr(p, needle)); p += strlen(needle))
+        n++;
+    return n;
+}
+
 int main(void)
 {
+    signal(SIGALRM, own_bound);
+    alarm((unsigned)(60 * TH_SAN_SCALE));
     /* the parent does not have a watchdog of its own here: the children arm one each. The first child's message goes
      * to a pipe: it starts with "FAIL" (it is what a hung test prints), and a passing run must not print that. */
     setenv("TH_WATCHDOG_PSI", "/nonexistent", 1); /* an idle machine, whatever the real one is doing */
@@ -48,6 +82,7 @@ int main(void)
     CHECK(pipe(pf) == 0);
     pid_t pid = fork();
     if (pid == 0) {
+        die_with_parent();
         close(pf[0]);
         dup2(pf[1], 2);
         int before = threads_now(); /* not 1 under TSan, which has a thread of its own */
@@ -89,6 +124,7 @@ int main(void)
         clock_gettime(CLOCK_MONOTONIC, &t0);
         pid = fork();
         if (pid == 0) {
+            die_with_parent();
             close(pe[0]);
             dup2(pe[1], 2);
             setenv("TH_WATCHDOG_PSI", psi, 1);
@@ -109,7 +145,11 @@ int main(void)
         CHECK(strstr(msg, "pressure child: watchdog: still running after"));
         if (busy) {
             CHECK(took >= 2.9 * one); /* three deadlines: the first two renewed */
-            CHECK(strstr(msg, "the machine is busy"));
+            CHECK(took < 3.9 * one);  /* and no third renewal: five renewals, or none ever, take longer */
+            /* exactly two notes, each naming the test and the pressure it read (87 here), and the last line is the hang */
+            CHECK(count_str(msg, "the machine is busy") == 2);
+            CHECK(count_str(msg, "watchdog: test_watchdog pressure child: the machine is busy (CPU pressure avg300 87%)") == 2);
+            CHECK(strstr(msg, "(renewal 1 of 2)") && strstr(msg, "(renewal 2 of 2)") && !strstr(msg, "(renewal 3"));
         } else {
             CHECK(took < 2.0 * one);
             CHECK(!strstr(msg, "the machine is busy"));
@@ -117,6 +157,7 @@ int main(void)
     }
     pid = fork();
     if (pid == 0) {
+        die_with_parent();
         th_watchdog("test_watchdog quick child", 5);
         _exit(0); /* finishes in time */
     }

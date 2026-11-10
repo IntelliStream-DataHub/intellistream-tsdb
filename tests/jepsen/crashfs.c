@@ -193,9 +193,12 @@ REAL(mkdir);
 REAL(mkdirat);
 REAL(ftruncate);
 
+static volatile sig_atomic_t usr2_seen; /* only a SIGUSR2 sets it: the power loss line says so (jepsen counts the nemesis's own) */
+
 static void on_usr2(int sig)
 {
     (void)sig;
+    usr2_seen = 1;
     crash_requested = 1;
 }
 
@@ -585,11 +588,14 @@ __attribute__((noreturn)) static void power_loss(void)
 {
     rollback();
     char msg[200];
+    /* "requested by SIGUSR2": the harness (tests/jepsen/jepsen.c) pulled the plug; without it the loss was drawn by the
+     * shim's own odds. The harness counts the first kind from this line, not from its own bookkeeping. */
+    const char *by = usr2_seen ? " requested by SIGUSR2" : "";
     int n = tear ? snprintf(msg, sizeof msg,
-                            "crashfs: power loss (torn: %u unsynced prefixes kept, %u garbage tails, %u old sectors "
+                            "crashfs: power loss%s (torn: %u unsynced prefixes kept, %u garbage tails, %u old sectors "
                             "back, %u unsynced directory operations kept)\n",
-                            tear_prefix, tear_garbage, tear_old, tear_kept)
-                 : snprintf(msg, sizeof msg, "crashfs: power loss\n");
+                            by, tear_prefix, tear_garbage, tear_old, tear_kept)
+                 : snprintf(msg, sizeof msg, "crashfs: power loss%s\n", by);
     if (real_write(2, msg, (size_t)n) < 0) {
     }
     _exit(99);

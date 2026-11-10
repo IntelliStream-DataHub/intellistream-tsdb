@@ -25,14 +25,11 @@
 #include <sys/wait.h>
 #include <time.h>
 
-static int failures;
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            fprintf(stderr, "%s:%d: FAILED: %s\n", __FILE__, __LINE__, #cond); \
-            failures++;                                                        \
-        }                                                                      \
-    } while (0)
+/* CHECK: a verdict about the code: fails the run at once. CHECK_T: "within N ms": excused only by this run's own
+ * evidence of load. CHECK_D: reads what a timed wait was to bring about (busy.h). */
+#define CHECK(cond) TH_CHECK(cond)
+#define CHECK_T(cond) TH_CHECK_T(cond)
+#define CHECK_D(cond) TH_CHECK_D(cond)
 
 static char ctl[256], root[512];
 static int port;
@@ -191,8 +188,8 @@ static void check_version_gate(void)
             continue;
         int32_t st = 0;
         long len = raw_call(fd, 2, TSDB_OP_QUERY_RAW, q, sizeof q, &st);
-        CHECK(st == TSDB_ERR_UNAVAILABLE);
-        CHECK(ver == 12 ? len == 14 : len > 14); /* mutation "body for every connection": 12 gets it too */
+        CHECK_D(st == TSDB_ERR_UNAVAILABLE);
+        CHECK_D(ver == 12 ? len == 14 : len > 14); /* mutation "body for every connection": 12 gets it too */
         /* and the connection still answers */
         uint8_t rq[24] = {0};
         tsdb_sid r = sid_root;
@@ -214,7 +211,7 @@ static void check_multi_during_outage(tsdbc *c)
         int rc = tsdbc_query_multi_collect(c, &q, ids, 2, NULL, &out);
         CHECK(rc == 0);
         if (rc == 0 && out) {
-            CHECK(out[0].status == TSDB_ERR_UNAVAILABLE);
+            CHECK_D(out[0].status == TSDB_ERR_UNAVAILABLE);
             CHECK(out[1].status == 0);
             tsdbc_series_results_free(out, 2);
         }
@@ -234,6 +231,7 @@ static int run_test(int argc, char **argv)
     if (outagefs_reexec(argv, base, names, 1) != 0)
         return 1;
     th_watchdog("test_unavailable", 600);
+    th_gauge_start(base);
     const char *dir_a = outagefs_dir("a");
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
     snprintf(root, sizeof root, "%s.root", getenv("OUTAGEFS_CTL"));
@@ -252,8 +250,9 @@ static int run_test(int argc, char **argv)
     uint16_t vol_a = (uint16_t)TSDB_SID_VOLUME(sid_a);
 
     server = start_server(dir_a);
+    th_gauge_watch_pid(server);
     tsdbc *c;
-    CHECK(tsdbc_connect_timeout("127.0.0.1", port, 3000, &c) == 0);
+    CHECK_T(tsdbc_connect_timeout("127.0.0.1", port, 3000, &c) == 0);
     tsdbc_set_retry(c, 0);
     int64_t t0s = 1000;
     float v = 1;
@@ -268,7 +267,10 @@ static int run_test(int argc, char **argv)
     if (t) {
         CHECK(t->nnodes == 1 && t->nvols == 2);
         for (size_t i = 0; i < t->nvols; i++)
-            CHECK(t->vols[i].health == TSDB_HEALTH_AVAILABLE && t->vols[i].role == TSDB_ROLE_OWNER);
+            {
+                CHECK_T(t->vols[i].health == TSDB_HEALTH_AVAILABLE);
+                CHECK(t->vols[i].role == TSDB_ROLE_OWNER);
+            }
         tsdbc_topology_free(t);
     }
     char *status = NULL;
@@ -277,18 +279,18 @@ static int run_test(int argc, char **argv)
 
     /* the domain hangs and goes DOWN */
     CHECK(fault("hang", dir_a) == 0);
-    CHECK(os_await_domain_down(c, vol_a, 30000) >= 0);
+    CHECK_T(os_await_domain_down(c, vol_a, 30000) >= 0);
     int64_t ts = 2000;
     int rc = tsdbc_insert_series(c, sid_a, &ts, &v, 1);
-    CHECK(rc == TSDB_ERR_UNAVAILABLE);
+    CHECK_D(rc == TSDB_ERR_UNAVAILABLE);
     tsdbc_err_info ei;
-    CHECK(tsdbc_last_error(c, &ei) == TSDB_ERR_UNAVAILABLE); /* mutation "drop the body": has_body is 0 */
-    CHECK(ei.has_body && ei.nunavail >= 1);
+    CHECK_D(tsdbc_last_error(c, &ei) == TSDB_ERR_UNAVAILABLE); /* mutation "drop the body": has_body is 0 */
+    CHECK_D(ei.has_body && ei.nunavail >= 1);
     if (ei.nunavail >= 1) {
-        CHECK(ei.unavail[0].vol == vol_a);
-        CHECK(ei.unavail[0].reason != TSDB_WHY_NONE && ei.unavail[0].reason <= TSDB_WHY_LAST);
-        CHECK(ei.unavail[0].retry_after_ms > 0);
-        CHECK(ei.unavail[0].since_ms > 0);
+        CHECK_D(ei.unavail[0].vol == vol_a);
+        CHECK_D(ei.unavail[0].reason != TSDB_WHY_NONE && ei.unavail[0].reason <= TSDB_WHY_LAST);
+        CHECK_D(ei.unavail[0].retry_after_ms > 0);
+        CHECK_D(ei.unavail[0].since_ms > 0);
     }
     /* the root answers while A is away */
     ts = 2001;
@@ -302,20 +304,20 @@ static int run_test(int argc, char **argv)
         for (size_t i = 0; i < t->nvols; i++) {
             if (t->vols[i].vol == vol_a) {
                 seen_a = 1;
-                CHECK(t->vols[i].health == TSDB_HEALTH_UNAVAILABLE && t->vols[i].reason != TSDB_WHY_NONE);
+                CHECK_D(t->vols[i].health == TSDB_HEALTH_UNAVAILABLE && t->vols[i].reason != TSDB_WHY_NONE);
             } else {
                 CHECK(t->vols[i].health == TSDB_HEALTH_AVAILABLE);
             }
         }
-        CHECK(seen_a);
+        CHECK_D(seen_a);
         tsdbc_topology_free(t);
     }
 
     /* a budget shorter than the outage: the status comes back after about the budget */
     struct caller shortb = {.budget_ms = 1200, .ts = 3000};
     call_insert(&shortb);
-    CHECK(shortb.rc == TSDB_ERR_UNAVAILABLE);
-    CHECK(shortb.ms >= 600 && shortb.ms < 4000);
+    CHECK_D(shortb.rc == TSDB_ERR_UNAVAILABLE);
+    CHECK_T(shortb.ms >= 600 && shortb.ms < 4000);
 
     /* the default budget: the call waits, the volume heals, the call succeeds (once) */
     struct caller longb = {.budget_ms = 30000, .ts = 4000};
@@ -324,8 +326,8 @@ static int run_test(int argc, char **argv)
     msleep(1500);
     CHECK(fault("heal", dir_a) == 0);
     pthread_join(th, NULL);
-    CHECK(longb.rc == 0); /* mutation "no retry": UNAVAILABLE */
-    CHECK(longb.ms >= 1200 && longb.ms < 25000);
+    CHECK_T(longb.rc == 0); /* mutation "no retry": UNAVAILABLE */
+    CHECK_T(longb.ms >= 1200 && longb.ms < 25000);
 
     /* the rows: 1000 and 4000 of A, not 2000 and 3000 (refused) */
     size_t n = 0;
@@ -336,13 +338,16 @@ static int run_test(int argc, char **argv)
         if (qrc)
             msleep(100);
     }
-    CHECK(qrc == 0 && n == 2);
+    CHECK_T(qrc == 0);
+    CHECK(n <= 2); /* 1000 and 4000 only: a refused row (2000, 3000) that shows up is a ghost, whatever the machine does */
+    CHECK_D(n == 2);
 
     tsdbc_close(c);
     CHECK(kill(server, SIGTERM) == 0);
     int st;
     waitpid(server, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
-    fprintf(stderr, "test_unavailable: %s\n", failures ? "FAILED" : "ok");
-    return failures ? th_failed(-1) : 0;
+    int fin = th_finish("test_unavailable");
+    fprintf(stderr, "test_unavailable: %s\n", fin ? "FAILED" : "ok");
+    return fin;
 }
