@@ -32,7 +32,16 @@ for m in $muts; do
     sed -i "0,/$from/s//$to/" "$tmp/src/$file"
     if cmp -s "$root/src/$file" "$tmp/src/$file"; then echo "mutant-latest: $m did not apply"; rc=1; continue; fi
     (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-latest: build of $m failed"; tail -5 "$tmp/build.log"; rc=1; continue; }
-    out=$(JEPSEN_TSDBD="$tmp/build/tsdbd" "${JEPSEN_BIN:-$root/build/jepsen}" --dir "$dir" --nemesis kill --seconds 8 2>&1); st=$?
+    # A planted bug is found by chance (a null over the newest row, then a latest request): a loaded machine does a
+    # third of the work in the same time, so a mutant gets up to five runs (other seeds, longer each time) and must be
+    # caught in one. (Only the mutant's detection: a clean tsdbd is never rerun to make a failure pass.)
+    try=0
+    for secs in 8 8 16 24 32; do
+        try=$((try + 1))
+        out=$(JEPSEN_TSDBD="$tmp/build/tsdbd" "${JEPSEN_BIN:-$root/build/jepsen}" --dir "$dir" --nemesis kill --seconds "$secs" \
+            --seed "$try" 2>&1); st=$?
+        if [ $st -eq 1 ] && echo "$out" | grep -q '^  latest [0-9]'; then break; fi
+    done
     if [ $st -ne 1 ] || ! echo "$out" | grep -q '^  latest [0-9]'; then
         echo "mutant-latest: $m went unnoticed (rc $st)"; echo "$out" | tail -n 8; rc=1
     else

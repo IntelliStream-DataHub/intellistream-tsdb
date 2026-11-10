@@ -215,7 +215,11 @@ static struct {
     unsigned long long rd; /* run_delay ns at the last look */
 } th_tids[TH_MAXTID];
 static int th_ntids;
-static volatile pid_t th_gauge_tid; /* the gauge's own thread, for a test that sums the CPU time of the others */
+static pid_t th_gauge_tid; /* the gauge's own thread, for a test that sums the CPU time of the others (atomic access) */
+static inline pid_t th_gauge_tid_get(void)
+{
+    return __atomic_load_n(&th_gauge_tid, __ATOMIC_ACQUIRE);
+}
 
 /* A server under test: its threads' waits for a CPU count too. */
 static inline void th_gauge_watch_pid(pid_t pid)
@@ -275,7 +279,7 @@ static void th_gauge_runq_pid(pid_t pid)
 static void *th_gauge_main(void *arg)
 {
     (void)arg;
-    th_gauge_tid = (pid_t)syscall(SYS_gettid);
+    __atomic_store_n(&th_gauge_tid, (pid_t)syscall(SYS_gettid), __ATOMIC_RELEASE);
     int fd = -1;
     if (th_gauge_dir[0]) {
         char p[1100];
@@ -321,8 +325,11 @@ static inline void th_gauge_start(const char *scratch_dir)
 {
     snprintf(th_gauge_dir, sizeof th_gauge_dir, "%s", scratch_dir ? scratch_dir : "");
     pthread_t t;
-    if (pthread_create(&t, NULL, th_gauge_main, NULL) == 0)
+    if (pthread_create(&t, NULL, th_gauge_main, NULL) == 0) {
         pthread_detach(t);
+        for (int i = 0; i < 1000 && !th_gauge_tid_get(); i++) /* a reader of the tid finds it set */
+            usleep(1000);
+    }
     th_mark();
 }
 

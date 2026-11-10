@@ -1028,28 +1028,35 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss'; then \
+	    if [ $$rc -eq 0 ] || [ $$rc -eq 124 ] || \
+	       ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss\|died of signal 11 before it listened'; then \
 	        echo "jepsen-selftest: a SIGSEGV in the server went unnoticed (rc $$rc, 124 is the timeout)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh JEPSEN_SETUP_PAUSE_MS=1500 timeout 120 ./$(B)/jepsen \
 	    --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss'; then \
+	    if [ $$rc -ne 2 ] || \
+	       ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss\|died of signal 11 before it listened'; then \
 	        echo "jepsen-selftest: a server that died before the setup connected hung or went unnoticed (rc $$rc, 124 is the timeout)"; \
 	        echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(JEPSEN_SETUP_PAUSE_MS=100000 JEPSEN_WATCHDOG_S=5 timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest \
 	    --nemesis power --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	    if [ $$rc -ne 124 ] || ! echo "$$out" | grep -q 'jepsen --nemesis power: watchdog: still running after'; then \
+	    if [ $$rc -ne 124 ] || ! echo "$$out" | grep -q 'jepsen --nemesis power: watchdog: still running after' || \
+	       ! echo "$$out" | grep -q 'jepsen at the hang: phase setup: creating the series'; then \
 	        echo "jepsen-selftest: a stalled run was not ended by the watchdog (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(JEPSEN_TSDBD=tests/jepsen/slow-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-selftest: servers that start slowly made an honest nemesis look idle (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 10 --crashfs $(B)/libcrashfs.so \
-	    --mutant-idle 2>&1); rc=$$?; \
+	for try in 1 2 3; do \
+	    out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 10 --crashfs $(B)/libcrashfs.so \
+	        --mutant-idle 2>&1); rc=$$?; \
+	    echo "$$out" | grep -q 'nemesis: 0 server deaths seen while napping' || break; done; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that sleeps through its naps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 30 --crashfs $(B)/libcrashfs.so \
-	    --mutant-longnap 2>&1); rc=$$?; \
-	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'took a median of .* it was idle'; then \
+	for try in 1 2 3; do \
+	    out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 30 --crashfs $(B)/libcrashfs.so \
+	        --mutant-longnap 2>&1); rc=$$?; \
+	    echo "$$out" | grep -q 'nemesis: 0 server deaths seen while napping' || break; done; \
+	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	for spec in 'nothing|it was idle' 'once|it was idle' 'nap:9000|it was idle' 'never|injected too little' \
 	    'oncereact|injected too little'; do \

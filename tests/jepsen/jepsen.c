@@ -138,6 +138,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -762,8 +765,65 @@ static void setup_pause(void)
 /* A watchdog for the whole run: the budget is generous (every honest run ends within seconds + a few start-ups and
  * the final reads), and a run that is still going then is hung, whatever it waits for. It exits 124 with a message
  * (the servers follow it out: --exit-with-parent). JEPSEN_WATCHDOG_S sets the budget for the self-test. */
+static const char *volatile jp_phase = "starting";
+#define JP_PHASE(p) (jp_phase = (p))
+
+#ifdef __linux__
+
+/* One command with its output on stderr, at most 20 s (fork, exec and waitpid only: it runs in the watchdog's signal handler). */
+static void jp_run(char *const argv[])
+{
+    pid_t c = fork();
+    if (c == 0) {
+        dup2(2, 1);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    if (c < 0)
+        return;
+    for (int i = 0; i < 4000; i++) {
+        int st;
+        if (waitpid(c, &st, WNOHANG) == c)
+            return;
+        struct timespec ts = {0, 5000000};
+        nanosleep(&ts, NULL);
+    }
+    kill(c, SIGKILL);
+    waitpid(c, NULL, 0);
+}
+
+/* What the watchdog says besides the exit: the phase of the run and where the threads are (this process by gdb, which
+ * the prctl in main lets attach; the server and the follower by their kernel wait channel). A hang reported as "still
+ * running after N s" says nothing about what it waited for. */
+static void jp_hang_dump(void)
+{
+    static const char a[] = "\n--- jepsen at the hang: phase ", b[] = " ---\n";
+    const char *ph = jp_phase;
+    if (write(2, a, sizeof a - 1) < 0 || write(2, ph, strlen(ph)) < 0 || write(2, b, sizeof b - 1) < 0)
+        return;
+    char me[16] = "", ps[64] = "";
+    size_t k = th_watch_itoa((int)getpid(), me), l = 0;
+    me[k] = 0;
+    l += th_watch_itoa((int)getpid(), ps + l);
+    ps[l++] = ',';
+    int sp = atomic_load(&server_pid), fp = atomic_load(&follower_pid);
+    l += th_watch_itoa(sp > 0 ? sp : (int)getpid(), ps + l);
+    ps[l++] = ',';
+    l += th_watch_itoa(fp > 0 ? fp : (int)getpid(), ps + l);
+    ps[l] = 0;
+    char *const psv[] = {"ps", "-L", "-o", "pid,tid,stat,wchan:24,pcpu,comm", "-p", ps, NULL};
+    jp_run(psv);
+    char *const gdbv[] = {"gdb", "-p", me, "-batch", "-ex", "thread apply all bt 12", NULL};
+    jp_run(gdbv);
+}
+#endif
+
 static void jepsen_watchdog(void)
 {
+#ifdef __linux__
+    th_watch_hook = jp_hang_dump;
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
     long budget = (long)(seconds * 5) + 1200;
     const char *e = getenv("JEPSEN_WATCHDOG_S");
     if (e && atol(e) > 0)
@@ -2387,6 +2447,18 @@ static int create_series(int from, int to)
         if (tsdbc_series(c, name, 1, &ids[s])) {
             fprintf(stderr, "jepsen: cannot create series\n");
             tsdbc_close(c);
+            pid_t pid = atomic_load(&server_pid); /* did the server end in the middle of it (a SIGSEGV)? say how */
+            int st;
+            for (int i = 0; pid > 0 && i < 100; i++) {
+                if (waitpid(pid, &st, WNOHANG) == pid) {
+                    note_death(st, false, pid);
+                    fprintf(stderr, "jepsen: the server ended during the setup (status %#x)\n", st);
+                    print_tail(slogpath);
+                    server_gone();
+                    break;
+                }
+                usleep(10000);
+            }
             return 1;
         }
     }
@@ -2660,6 +2732,7 @@ int main(int argc, char **argv)
      * record), which left power and eio runs with no fresh decision at all. A series whose first flush brings
      * fewer than 64 rows is decided class 0 without a record: the summary counts the decisions recorded. */
     int early = classes && shim ? 0 : nseries;
+    JP_PHASE("setup: creating the series");
     if (create_series(0, early))
         return 2;
     if (shim) { /* from here on, file operations may lose power or fail */
@@ -2680,6 +2753,7 @@ int main(int argc, char **argv)
         pthread_create(&fr, NULL, follower_reader, NULL);
     }
     run_start = now_ns();
+    JP_PHASE("running (clients and the nemesis)");
     for (int i = 0; i < nclients; i++)
         pthread_create(&th[i], NULL, client, (void *)(intptr_t)i);
     pthread_t dth;
@@ -2691,14 +2765,18 @@ int main(int argc, char **argv)
     usleep((useconds_t)(seconds * 1e6));
     stop_ns = now_ns();
     atomic_store(&stop, true);
+    JP_PHASE("stopped: joining the nemesis");
     if (strcmp(nemesis, "none"))
         pthread_join(nem, NULL);
     if (dmon)
         pthread_join(dth, NULL);
+    JP_PHASE("stopped: joining the clients");
     for (int i = 0; i < nclients; i++)
         pthread_join(th[i], NULL);
+    JP_PHASE("stopped: joining the follower reader");
     if (fport)
         pthread_join(fr, NULL);
+    JP_PHASE("the final state");
 
     /* the final state, from a server without faults, and again after a clean restart */
     pthread_mutex_lock(&server_lock);
@@ -2731,6 +2809,7 @@ int main(int argc, char **argv)
     }
     pthread_mutex_unlock(&server_lock);
 
+    JP_PHASE("the checker");
     uint32_t nw = atomic_load(&nwrites) - 1, nr = atomic_load(&nreads);
     unsigned ok = 0, info = 0, fail = 0, rok = 0, dels = 0, reps = 0, nulls_ok = 0;
     for (uint32_t w = 1; w <= nw && w < MAX_OPS; w++) {
@@ -2820,8 +2899,10 @@ int main(int argc, char **argv)
              *    one seconds;
              *  - its own plug pulls, counted from crashfs's log line (or our kill): the servers also die by
              *    themselves, and a nemesis that only restarts those (never, or once and then only that) has the
-             *    reactions of an honest one. At least 2 per 10 s, but not more than the live servers it found: with
-             *    slow starts (slow-tsdbd.sh) a server is dead again before the nemesis looks, and there is nothing to pull. */
+             *    reactions of an honest one. At least 2 per 10 s, but not more than half of the live servers it found
+             *    (rounded up): with slow starts (slow-tsdbd.sh) a server is dead again before the nemesis looks, and there is
+             *    nothing to pull, and one that dies by itself as it is signalled is not a pull. The servers started in the
+             *    run (a floor of 2 + 1 per 10 s) are what catches a nemesis that finds nothing to pull. */
             double total = 0, worst = 0;
             for (int i = 0; i < nreact; i++) {
                 total += react_ms[i];
@@ -2829,13 +2910,16 @@ int main(int argc, char **argv)
                     worst = react_ms[i];
             }
             int want = (int)(seconds * 2 / 10);
-            if (want > alive_looks)
-                want = alive_looks;
+            if (want > (alive_looks + 1) / 2) /* half of the live servers it found: one may die by itself as it is signalled */
+                want = (alive_looks + 1) / 2;
             printf("nemesis: %d plugs pulled (crashfs log or our kill) of %d live servers found, %d reactions to servers "
                    "that died by themselves, slowest %.0f ms\n", own_pulls, alive_looks, nreact, worst);
-            if (seconds >= 10 && nreact < 2) {
-                fprintf(stderr, "  only %d reactions to a server that died by itself in %.0f s (at least 2 needed to judge the "
-                        "nemesis: it must reap and restart it): it was idle\n", nreact, seconds);
+            /* Servers started in the run: a nemesis that does nothing, or naps for seconds, starts few (at least 2 + 1 per
+             * 10 s: honest runs start many times that, also with servers that take 2 s to start). It does not depend on
+             * what the nemesis says about itself. */
+            if (seconds >= 10 && lives_faulty < 2 + (int)(seconds / 10)) {
+                fprintf(stderr, "  only %d servers were started in %.0f s (at least %d expected: the nemesis must keep killing "
+                        "and restarting): it was idle\n", lives_faulty, seconds, 2 + (int)(seconds / 10));
                 v++;
             }
             if (worst > 3000) {
@@ -2859,6 +2943,7 @@ int main(int argc, char **argv)
             }
         }
     }
+    JP_PHASE("the cleanup (rm -rf of the directory)");
     unlink(markpath);
     if (!v)
         unlink(slogpath);

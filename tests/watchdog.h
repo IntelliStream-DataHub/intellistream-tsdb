@@ -33,10 +33,17 @@ static long th_watch_seconds;
 static char th_watch_msg[224];
 static size_t th_watch_msg_len;
 
+/* A test that wants to say more about where it hangs (jepsen: which phase, the threads of the processes it started)
+ * sets this; it runs in the signal handler, after the message and before the exit, so it may use only what a signal
+ * handler may (fork, exec, waitpid, write). */
+static void (*th_watch_hook)(void);
+
 static void th_watch_fire(void)
 {
     if (write(2, th_watch_msg, th_watch_msg_len) < 0)
         _exit(124);
+    if (th_watch_hook)
+        th_watch_hook();
     _exit(124);
 }
 

@@ -74,7 +74,7 @@ static long threads_cpu_ms(void)
     pid_t me = (pid_t)syscall(SYS_gettid);
     while ((e = readdir(d))) {
         int tid = atoi(e->d_name);
-        if (tid <= 0 || tid == me || tid == th_gauge_tid)
+        if (tid <= 0 || tid == me || tid == th_gauge_tid_get())
             continue;
         char path[64], b[1024];
         snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
