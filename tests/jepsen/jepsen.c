@@ -297,7 +297,7 @@ static int outage_problems, outage_faults, outage_kills;
 /* The heals the check judged: each is awaited until a write to the volume is acknowledged, or the bound passes. One a
  * run's end cuts short is counted, never silent. The nemesis stops starting faults at the end of the run's time
  * (nem_stop) and finishes the heal it is in before the clients stop, so the last heal is judged like the others. */
-static atomic_bool nem_stop;
+static atomic_bool nem_stop, nem_done; /* nem_done: the nemesis thread has returned (main waits for it, bounded) */
 static int outage_heals, outage_judged, outage_flap_judged, outage_slow_extended;
 static double outage_worst_s, outage_worst_flap_s;
 static char outage_keeppath[PATH_MAX + 64]; /* where a failed or close outage run's server log is kept */
@@ -1130,6 +1130,11 @@ static void rot_damage(uint64_t r)
 #define OUTAGE_FLAP_DOWNS HEALTH_FLAP_DOWNS
 _Static_assert(OUTAGE_FLAP_S * 1000 == HEALTH_FLAP_NEED_MS && OUTAGE_FLAP_WINDOW_S * 1000 == HEALTH_FLAP_WINDOW_MS,
                "the flapping rule is whole seconds here");
+/* The most a healed volume is ever given, whatever the server logged: the flapping bound and one more 60 s, at most (a
+ * slow write probe restarts the 60 s of good probes; a disk that slow for 60 s more is evidence, an endless run of
+ * them is a stall). The nemesis's thread is joined within this plus the fault that precedes the heal and some slack. */
+#define OUTAGE_HARD_S (OUTAGE_RECOVER_S + 2 * OUTAGE_FLAP_S)
+#define OUTAGE_JOIN_S (OUTAGE_HARD_S + 60)
 #define OUTAGE_DOWN_S 5.0 /* DOWN is declared 2.5 s (the threshold here) plus a probe period or two after the hang
                            * starts, and the calls stuck before it are released then; the healthy volume is measured from here */
 
@@ -1168,42 +1173,123 @@ static void outage_ctl(const char *cmd, int v, const char *arg)
     }
 }
 
-/* Waits until a write to volume v is acknowledged after `since` (ns). */
-/* The latest "a write probe took N ms" line of the server's log (health.c, src/health.c probe_done) for the domain
- * `domain` stamped at or after `since_s` (the monotonic clock in seconds, the one jepsen's trace uses too), or 0. Such
- * a line says why a flapping domain is still DOWN: a probe that works but takes more than fast_ms starts the 60 s of
- * good probes over, and on a loaded machine the host's disk does that (a fdatasync of 3 s, seen in the 10-seed runs). */
-static double slow_probe_since(const char *path, const char *domain, double since_s)
+/* jepsen's own evidence of a slow disk: a thread of this process (the shim lives in the server, so nothing here is
+ * hung or slowed by it) writes and fdatasyncs 4 KiB beside the volumes four times a second and keeps the ones that
+ * took long. A slow write probe the server logs counts as the host's doing only if one of these overlaps it; a server
+ * that reports every probe slow while the disk is fine (a planted stall in the health monitor) has none. */
+#define SAMPLE_SLOW_MS 250
+#define SAMPLE_KEEP 512
+static struct {
+    int64_t end_ns;
+    int ms;
+} samp[SAMPLE_KEEP];
+static int samp_n;
+static pthread_mutex_t samp_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool samp_stop;
+static pthread_t samp_th;
+static bool samp_on;
+
+static void *disk_sampler(void *arg)
+{
+    (void)arg;
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof path, "%s.disk-sample", vol_dir[0]);
+    int fd = open(path, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0)
+        return NULL;
+    char buf[4096];
+    memset(buf, 0, sizeof buf);
+    for (unsigned n = 0; !atomic_load(&samp_stop); n++) {
+        buf[0] = (char)n;
+        int64_t t0 = now_ns();
+        if (pwrite(fd, buf, sizeof buf, 0) == (ssize_t)sizeof buf)
+            (void)fdatasync(fd);
+        int64_t t1 = now_ns();
+        int ms = (int)((t1 - t0) / 1000000);
+        if (ms >= SAMPLE_SLOW_MS) {
+            pthread_mutex_lock(&samp_mu);
+            samp[samp_n++ % SAMPLE_KEEP] = (typeof(samp[0])){t1, ms};
+            pthread_mutex_unlock(&samp_mu);
+        }
+        usleep(250000);
+    }
+    close(fd);
+    unlink(path);
+    return NULL;
+}
+
+/* The slowest of jepsen's own samples that ended within [t - 8 s, t + 1 s] (t on the monotonic clock, in seconds): the
+ * probe that was logged at t began up to its own duration before. 0 when none was slow. */
+static int slow_sample_near(double t)
+{
+    int worst = 0;
+    int64_t lo = (int64_t)((t - 8.0) * 1e9), hi = (int64_t)((t + 1.0) * 1e9);
+    pthread_mutex_lock(&samp_mu);
+    for (int i = 0; i < SAMPLE_KEEP && i < samp_n; i++)
+        if (samp[i].end_ns >= lo && samp[i].end_ns <= hi && samp[i].ms > worst)
+            worst = samp[i].ms;
+    pthread_mutex_unlock(&samp_mu);
+    return worst;
+}
+
+/* The "a write probe took N ms" lines of the server's log (health.c, src/health.c probe_done) for the domain `domain`
+ * stamped at or after `since_s` (the monotonic clock in seconds, the one jepsen's trace uses too): their times, in
+ * file order, at most `max`. Such a line says why a flapping domain is still DOWN: a probe that works but takes more
+ * than fast_ms starts the 60 s of good probes over, and on a loaded machine the host's disk does that (a fdatasync
+ * of 3 s, seen in the 10-seed runs). */
+static int slow_probe_lines(const char *path, const char *domain, double since_s, double *out, int max)
 {
     FILE *f = fopen(path, "r");
     if (!f)
         return 0;
     char line[4096], pat[PATH_MAX + 32];
     snprintf(pat, sizeof pat, "storage domain %s: a write probe took", domain);
-    double last = 0;
-    while (fgets(line, sizeof line, f)) {
+    int n = 0;
+    while (n < max && fgets(line, sizeof line, f)) {
         double t;
         if (strncmp(line, "tsdb: [", 7) || sscanf(line + 7, "%lf]", &t) != 1 || !strstr(line, pat))
             continue;
-        if (t >= since_s && t > last)
-            last = t;
+        if (t >= since_s)
+            out[n++] = t;
     }
     fclose(f);
+    return n;
+}
+
+/* The latest such line, or 0 (the self-test of the scan: --scan-slow-probes). */
+static double slow_probe_since(const char *path, const char *domain, double since_s)
+{
+    double t[256], last = 0;
+    int n = slow_probe_lines(path, domain, since_s, t, 256);
+    for (int i = 0; i < n; i++)
+        if (t[i] > last)
+            last = t[i];
     return last;
 }
 
+/* Waits until a write to volume v is acknowledged after `since` (ns): within the bound, or (a flapping domain only)
+ * within the bound counted from a slow write probe the server logged after the heal AND jepsen's own fdatasync was
+ * slow then too, but never past OUTAGE_HARD_S after the heal. Past that the volume has failed its heal, and the
+ * failure names the slow-probe lines the server wrote. */
 static void outage_await_recovery(int v, int64_t since, const char *what)
 {
     int64_t t0 = now_ns();
     bool flap = outage_flapping(v);
     int bound = OUTAGE_RECOVER_S + (flap ? OUTAGE_FLAP_S : 0);
-    int64_t deadline = t0 + bound * 1000000000LL;
+    int64_t deadline = t0 + bound * 1000000000LL, hard = t0 + OUTAGE_HARD_S * 1000000000LL;
     bool extended = false;
     outage_heals++;
     while (!atomic_load(&stop)) {
         if (atomic_load(&vol_last_ok[v]) > since) {
             double took = (double)(now_ns() - since) / 1e9;
             outage_judged++;
+            if (took > OUTAGE_HARD_S) {
+                outage_problems++;
+                fprintf(stderr, "  volume %d: a write was acknowledged only %.1f s after the heal (%s; at most %d s)\n", v,
+                        took, what, OUTAGE_HARD_S);
+                print_tail(slogpath);
+                return;
+            }
             if (flap) {
                 outage_flap_judged++;
                 outage_worst_flap_s = took > outage_worst_flap_s ? took : outage_worst_flap_s;
@@ -1220,24 +1306,49 @@ static void outage_await_recovery(int v, int64_t since, const char *what)
                         (double)now_ns() / 1e9, v, (double)(now_ns() - since) / 1e9, bound, flap ? ", flapping" : "");
             return;
         }
-        if (now_ns() > deadline && flap) {
-            /* a probe the server logged as slow after the heal started the 60 s again: the bound runs from there
+        if (now_ns() > deadline && deadline < hard && flap) {
+            /* a probe the server logged as slow after the heal started the 60 s again, and a slow fdatasync of
+             * jepsen's own at the same time says the disk was slow: the bound runs from there, up to the hard limit
              * (a real stall has no such line, and fails at the end of its bound as before) */
-            double t = slow_probe_since(slogpath, vol_dir[v], (double)since / 1e9);
-            if (t > 0 && (int64_t)(t * 1e9) + bound * 1000000000LL > deadline) {
-                deadline = (int64_t)(t * 1e9) + bound * 1000000000LL;
+            double lines[256], best = 0;
+            int n = slow_probe_lines(slogpath, vol_dir[v], (double)since / 1e9, lines, 256);
+            for (int i = 0; i < n; i++) {
+                int ms = slow_sample_near(lines[i]);
+                if (ms > 0 && lines[i] > best)
+                    best = lines[i];
+                else if (ms == 0 && getenv("JEPSEN_OUTAGE_TRACE"))
+                    fprintf(stderr, "jepsen: [%.3f] volume %d: a slow write probe logged at %.3f, no slow fdatasync of "
+                            "jepsen's own near it: not a reason to wait\n", (double)now_ns() / 1e9, v, lines[i]);
+            }
+            if (best > 0 && (int64_t)(best * 1e9) + bound * 1000000000LL > deadline) {
+                deadline = (int64_t)(best * 1e9) + bound * 1000000000LL;
+                if (deadline > hard)
+                    deadline = hard;
                 if (!extended)
                     outage_slow_extended++;
                 extended = true;
-                fprintf(stderr, "  volume %d: a write probe took more than the fast limit at %.3f: the bound runs from there\n",
-                        v, t);
+                fprintf(stderr, "  volume %d: a write probe took more than the fast limit at %.3f, and so did jepsen's own "
+                        "fdatasync (%d ms): the bound runs from there (until %.0f s after the heal at the latest)\n", v,
+                        best, slow_sample_near(best), (double)(deadline - t0) / 1e9);
             }
         }
         if (now_ns() > deadline) {
+            double lines[256];
+            int n = slow_probe_lines(slogpath, vol_dir[v], (double)since / 1e9, lines, 256), ev = 0;
+            for (int i = 0; i < n; i++)
+                ev += slow_sample_near(lines[i]) > 0;
             outage_problems++;
             outage_judged++;
-            fprintf(stderr, "  volume %d: no write acknowledged in %d s after the heal (%s%s)\n", v, bound, what,
-                    flap ? "; its domain was flapping, 60 s of good probes included" : "");
+            fprintf(stderr, "  volume %d: no write acknowledged in %.0f s after the heal (%s%s)%s\n", v,
+                    (double)(deadline - t0) / 1e9, what, flap ? "; its domain was flapping, 60 s of good probes included" : "",
+                    extended ? ": the hard limit, after a bound extended by slow probes" : "");
+            if (n > 0) {
+                fprintf(stderr, "  the server logged %d slow write probes of this domain since the heal (%d with a slow "
+                        "fdatasync of jepsen's own near it), at", n, ev);
+                for (int i = 0; i < n && i < 8; i++)
+                    fprintf(stderr, " %.3f", lines[i]);
+                fprintf(stderr, "%s\n", n > 8 ? " ..." : "");
+            }
             print_tail(slogpath); /* the server's side of it: the log of every start since the run began */
             return;
         }
@@ -1446,6 +1557,7 @@ static void *nemesis_thread(void *arg)
         atomic_store(&nem_busy, false);
         pthread_mutex_unlock(&server_lock);
     }
+    atomic_store(&nem_done, true);
     return NULL;
 }
 
@@ -2714,6 +2826,9 @@ int main(int argc, char **argv)
         pthread_create(&th[i], NULL, client, (void *)(intptr_t)i);
     pthread_t dth;
     bool dmon = !strcmp(nemesis, "power") && crashfs;
+    if (outage) {
+        samp_on = pthread_create(&samp_th, NULL, disk_sampler, NULL) == 0;
+    }
     if (strcmp(nemesis, "none"))
         pthread_create(&nem, NULL, nemesis_thread, NULL);
     if (dmon)
@@ -2721,8 +2836,18 @@ int main(int argc, char **argv)
     usleep((useconds_t)(seconds * 1e6));
     if (outage) { /* the clients go on until the heal the nemesis is in has been judged (up to its bound, 90 s) */
         atomic_store(&nem_stop, true);
-        pthread_join(nem, NULL);
+        /* the heal it is in has a hard limit (OUTAGE_HARD_S) of its own; a nemesis still not done OUTAGE_JOIN_S after
+         * the run's time is stuck somewhere else: the run fails there, with the heal unjudged, and does not wait on */
+        int64_t join_by = now_ns() + (int64_t)OUTAGE_JOIN_S * 1000000000LL;
+        while (!atomic_load(&nem_done) && now_ns() < join_by)
+            usleep(20000);
+        if (!atomic_load(&nem_done)) {
+            outage_problems++;
+            fprintf(stderr, "  the nemesis was still in its last heal or fault %d s after the run's time (the heal's limit is "
+                    "%d s): it is cut short and counted as not judged\n", OUTAGE_JOIN_S, OUTAGE_HARD_S);
+        }
         atomic_store(&stop, true);
+        pthread_join(nem, NULL);
     } else {
         atomic_store(&stop, true);
         if (strcmp(nemesis, "none"))
@@ -2859,6 +2984,10 @@ int main(int argc, char **argv)
         }
     }
     unlink(markpath);
+    if (samp_on) {
+        atomic_store(&samp_stop, true);
+        pthread_join(samp_th, NULL);
+    }
     if (outage && (v || outage_near_miss)) {
         /* what a failed or a close run has to show: the server's side of it (the log of every start of the run), under
          * a name the next run does not unlink; CI uploads /tmp/tsdb-jepsen-ci*.log */
