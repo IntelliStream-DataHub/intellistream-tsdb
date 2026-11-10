@@ -702,6 +702,40 @@ static int read_to_end(int fd, uint32_t id, uint32_t *answered, uint32_t *seen)
     }
 }
 
+/* Whether the server has shut down its side of the connection that client socket `fd` is the other end of: its TCP
+ * state (/proc/net/tcp, the row whose local port is the server's and whose remote port is the client's) has left
+ * ESTABLISHED, which shutdown() does at once even with output still queued. Only this says it of one connection: the
+ * client cannot see the FIN before it has read what was queued ahead of it, and the server's count of connections
+ * also moves for the connections of earlier steps that it frees late. 0 when it has not, 1 when it has, -1 when
+ * the state cannot be read (not Linux). */
+static int server_shut_connection(int fd)
+{
+#ifdef __linux__
+    struct sockaddr_in me;
+    socklen_t len = sizeof me;
+    if (getsockname(fd, (struct sockaddr *)&me, &len) != 0)
+        return -1;
+    FILE *f = fopen("/proc/net/tcp", "r");
+    if (!f)
+        return -1;
+    char line[512];
+    int res = 1; /* no row: gone altogether */
+    while (fgets(line, sizeof line, f)) {
+        unsigned lport, rport, st;
+        if (sscanf(line, " %*d: %*x:%x %*x:%x %x", &lport, &rport, &st) == 3 && lport == (unsigned)port &&
+            rport == ntohs(me.sin_port)) {
+            res = st != 1; /* 1: ESTABLISHED */
+            break;
+        }
+    }
+    fclose(f);
+    return res;
+#else
+    (void)fd;
+    return -1;
+#endif
+}
+
 /* A client that sends a large QUERY_MULTI and reads nothing: the server holds at most the results ahead of the head
  * and its output cap, other connections are answered at once, and --send-timeout ends the connection. */
 static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
@@ -732,14 +766,36 @@ static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
     fprintf(stderr, "stalled reader: point query on another connection %.2f ms\n", best);
     CHECK(SANITIZED || best < 50);
     tsdbc_close(c2);
-    /* past the send timeout the server has shut the connection: what it had sent drains, then EOF */
-    double wait = send_timeout_s * 1e3 + 1500 - (now_ms() - t0);
-    if (wait > 0)
-        usleep((useconds_t)(wait * 1000));
+    /* The server closes the connection once its output has not moved for --send-timeout: its window starts at the
+     * first send, and the once-a-second tick that ends it runs up to a second late. How late is the server's business
+     * (a sanitizer build on a busy 4-CPU runner starts the first send well after the request), so the test waits
+     * for the close and reads only then: a client that reads before it takes the whole reply, and END with status 0
+     * is a right answer to that (CI, io_uring under ASan: this read began at a fixed 4.5 s, before the close). The
+     * close has to come neither before the timeout nor long after it. */
+    double closed = now_ms() - t0;
+    int shut = server_shut_connection(fd);
+    for (; shut == 0 && closed < send_timeout_s * 1e3 + 15000; closed = now_ms() - t0) {
+        usleep(20000);
+        shut = server_shut_connection(fd);
+    }
+    if (shut < 0) { /* not Linux: the longest the close takes on an idle machine */
+        double wait = send_timeout_s * 1e3 + 1500 - closed;
+        if (wait > 0)
+            usleep((useconds_t)(wait * 1000));
+    } else {
+        fprintf(stderr, "stalled reader: the server shut the connection %.0f ms after the request (--send-timeout %d "
+                        "s)\n", closed, send_timeout_s);
+        CHECK(shut == 1);
+        CHECK(closed >= send_timeout_s * 1e3 - 500);
+    }
     struct timeval tv = {10, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     uint32_t answered = 0, seen;
-    CHECK(read_to_end(fd, 7, &answered, &seen) == 1); /* no END: the connection ended */
+    int rc = read_to_end(fd, 7, &answered, &seen);
+    if (rc != 1) /* a failure has to say what the client saw */
+        fprintf(stderr, "stalled reader: got an END frame, status %d, %u series answered, %u seen\n", rc, answered,
+                seen);
+    CHECK(rc == 1); /* no END: the connection ended */
     close(fd);
     one o = {0};
     CHECK(tsdbc_query_values(c, ids[0], T0, T0 + 1, NULL, one_rows, &o) == 0 && o.n == 1);
