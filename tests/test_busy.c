@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* tests/busy.h: a test that failed on a busy machine runs again (up to 3 runs); one that failed on an idle machine, or
+/* tests/busy.h: a test that failed on a busy machine runs again (up to 4 runs); one that failed on an idle machine, or
  * that fails on every run, fails. Each scenario runs this program again as the test under busy.h's wrapper, with fake
  * pressure files (TH_PRESSURE_DIR) and a file that counts its runs. */
 #define _GNU_SOURCE
@@ -75,6 +75,7 @@ static int scenario(char *prog, const char *dir, const char *name, int pct, int 
     pid_t pid = fork();
     if (pid == 0) {
         setenv("TH_PRESSURE_DIR", dir, 1);
+        setenv("TH_RETRY_PAUSE_S", "0", 1);
         unsetenv("TH_RETRY_INNER");
         unsetenv("OUTAGEFS_CTL");
         if (!freopen("/dev/null", "w", stderr))
@@ -103,8 +104,8 @@ int main(int argc, char **argv)
     int runs, rc;
     rc = scenario(prog, dir, "flaky", 90, &runs); /* fails once on a busy machine, then passes: 2 runs, pass */
     CHECK(rc == 0 && runs == 2);
-    rc = scenario(prog, dir, "bug", 90, &runs); /* fails every run on a busy machine: 3 runs, fail */
-    CHECK(rc == 1 && runs == 3);
+    rc = scenario(prog, dir, "bug", 90, &runs); /* fails every run on a busy machine: 4 runs, fail */
+    CHECK(rc == 1 && runs == 4);
     rc = scenario(prog, dir, "flaky", 0, &runs); /* the same failure on an idle machine: no second run */
     CHECK(rc == 1 && runs == 1);
     char cmd[600];
