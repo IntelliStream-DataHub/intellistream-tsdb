@@ -298,11 +298,19 @@ static int outage_problems, outage_faults, outage_kills;
  * run's end cuts short is counted, never silent. The nemesis stops starting faults at the end of the run's time
  * (nem_stop) and finishes the heal it is in before the clients stop, so the last heal is judged like the others. */
 static atomic_bool nem_stop;
-static int outage_heals, outage_judged, outage_flap_judged;
+static int outage_heals, outage_judged, outage_flap_judged, outage_slow_extended;
 static double outage_worst_s, outage_worst_flap_s;
 static char outage_keeppath[PATH_MAX + 64]; /* where a failed or close outage run's server log is kept */
 static bool outage_near_miss; /* a heal took more than three quarters of its bound: the server log is kept */
 static double healthy_ops, healthy_secs, healthy_base_ops; /* B's writes during A's outage, and what B did before */
+
+/* A failed outage run keeps the server's side of it, under a name the next run does not unlink: every way the run can
+ * end (the verdict, a server that does not come up, a final read that cannot connect) goes through here. */
+static void outage_keep_log(void)
+{
+    if (outage && outage_keeppath[0] && rename(slogpath, outage_keeppath) == 0)
+        fprintf(stderr, "  the server log of this run is kept in %s\n", outage_keeppath);
+}
 
 #define CL_STR_(x) #x
 #define CL_STR(x) CL_STR_(x)
@@ -462,8 +470,11 @@ static void start_server(bool faulty)
                         setenv("CRASHFS_EIO_ONLY", "wal_", 1);
                 }
             }
-            if (outage) /* thresholds of seconds, not tens of them: an outage of a few seconds is one */
-                setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=400,spawn=60000", 1);
+            /* thresholds of seconds, not tens of them: an outage of a few seconds is one. fast=2000 (below down): a
+             * write probe slower than fast_ms starts the 60 s of a flapping domain over, and on a loaded 4-CPU machine
+             * probes of 400 to 1400 ms happen with no fault (the 10-seed runs, 6 of 20 failed at fast=400) */
+            if (outage)
+                setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=2000,spawn=60000", 1);
             if (!getenv("JEPSEN_VERBOSE")) { /* kept for a server that does not come up */
                 int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot || outage ? O_APPEND : O_TRUNC), 0644);
                 if (lfd < 0)
@@ -542,6 +553,7 @@ static void start_server(bool faulty)
         fprintf(stderr, "jepsen: the server does not come up: %s", th_why);
         print_tail(slogpath);
         stop_server(SIGKILL);
+        outage_keep_log();
         exit(2);
     }
 }
@@ -1157,11 +1169,36 @@ static void outage_ctl(const char *cmd, int v, const char *arg)
 }
 
 /* Waits until a write to volume v is acknowledged after `since` (ns). */
+/* The latest "a write probe took N ms" line of the server's log (health.c, src/health.c probe_done) for the domain
+ * `domain` stamped at or after `since_s` (the monotonic clock in seconds, the one jepsen's trace uses too), or 0. Such
+ * a line says why a flapping domain is still DOWN: a probe that works but takes more than fast_ms starts the 60 s of
+ * good probes over, and on a loaded machine the host's disk does that (a fdatasync of 3 s, seen in the 10-seed runs). */
+static double slow_probe_since(const char *path, const char *domain, double since_s)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    char line[4096], pat[PATH_MAX + 32];
+    snprintf(pat, sizeof pat, "storage domain %s: a write probe took", domain);
+    double last = 0;
+    while (fgets(line, sizeof line, f)) {
+        double t;
+        if (strncmp(line, "tsdb: [", 7) || sscanf(line + 7, "%lf]", &t) != 1 || !strstr(line, pat))
+            continue;
+        if (t >= since_s && t > last)
+            last = t;
+    }
+    fclose(f);
+    return last;
+}
+
 static void outage_await_recovery(int v, int64_t since, const char *what)
 {
     int64_t t0 = now_ns();
     bool flap = outage_flapping(v);
     int bound = OUTAGE_RECOVER_S + (flap ? OUTAGE_FLAP_S : 0);
+    int64_t deadline = t0 + bound * 1000000000LL;
+    bool extended = false;
     outage_heals++;
     while (!atomic_load(&stop)) {
         if (atomic_load(&vol_last_ok[v]) > since) {
@@ -1183,7 +1220,20 @@ static void outage_await_recovery(int v, int64_t since, const char *what)
                         (double)now_ns() / 1e9, v, (double)(now_ns() - since) / 1e9, bound, flap ? ", flapping" : "");
             return;
         }
-        if (now_ns() - t0 > bound * 1000000000LL) {
+        if (now_ns() > deadline && flap) {
+            /* a probe the server logged as slow after the heal started the 60 s again: the bound runs from there
+             * (a real stall has no such line, and fails at the end of its bound as before) */
+            double t = slow_probe_since(slogpath, vol_dir[v], (double)since / 1e9);
+            if (t > 0 && (int64_t)(t * 1e9) + bound * 1000000000LL > deadline) {
+                deadline = (int64_t)(t * 1e9) + bound * 1000000000LL;
+                if (!extended)
+                    outage_slow_extended++;
+                extended = true;
+                fprintf(stderr, "  volume %d: a write probe took more than the fast limit at %.3f: the bound runs from there\n",
+                        v, t);
+            }
+        }
+        if (now_ns() > deadline) {
             outage_problems++;
             outage_judged++;
             fprintf(stderr, "  volume %d: no write acknowledged in %d s after the heal (%s%s)\n", v, bound, what,
@@ -2135,6 +2185,7 @@ static int final_state(uint32_t *final)
     if (!c) {
         fprintf(stderr, "jepsen: cannot connect for the final read\n");
         stop_server(SIGTERM);
+        outage_keep_log();
         exit(2);
     }
     memset(final, 0, koff[nseries] * sizeof *final);
@@ -2162,6 +2213,7 @@ static int final_state(uint32_t *final)
                 fprintf(stderr, "jepsen: server %d is still running\n", (int)pid);
             }
             stop_server(SIGTERM); /* no orphan server */
+            outage_keep_log();
             exit(2);
         }
         for (size_t i = 0; i < p.n; i++) {
@@ -2526,6 +2578,7 @@ int main(int argc, char **argv)
                                    {"auth", no_argument, 0, 'A'},           {"outagefs", required_argument, 0, 'o'},
                                    {"mutant-idle", no_argument, 0, 'I'},
                                    {"mutant-longnap", no_argument, 0, 'L'},
+                                   {"scan-slow-probes", required_argument, 0, 'P'},
                                    {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -2546,6 +2599,14 @@ int main(int argc, char **argv)
         case 'E': feed = true; break;
         case 'I': idle_mutant = true; break;
         case 'L': idle_mutant_long = true; break;
+        case 'P': { /* the self-test of slow_probe_since: FILE,DOMAIN,SINCE prints the time of the latest line, or 0 */
+            char *a = strdup(optarg), *c2 = strrchr(a, ','), *c1 = c2 ? (*c2 = 0, strrchr(a, ',')) : NULL;
+            if (!c1)
+                return 2;
+            *c1 = 0;
+            printf("%.3f\n", slow_probe_since(a, c1 + 1, atof(c2 + 1)));
+            return 0;
+        }
         case 'o': outagefs_lib = optarg; break;
         default: return 2;
         }
@@ -2760,10 +2821,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "  only %d volume faults in %.0f s: the nemesis was idle\n", outage_faults, seconds);
             v++;
         }
-        printf("outage heals: %d, %d judged (%d of a flapping domain; slowest %.1f s, slowest flapping %.1f s), "
-               "%d not judged\n",
-               outage_heals, outage_judged, outage_flap_judged, outage_worst_s, outage_worst_flap_s,
-               outage_heals - outage_judged);
+        printf("outage heals: %d, %d judged (%d of a flapping domain, %d of them held back by a slow write probe the server logged; "
+               "slowest %.1f s, slowest flapping %.1f s), %d not judged\n",
+               outage_heals, outage_judged, outage_flap_judged, outage_slow_extended, outage_worst_s,
+               outage_worst_flap_s, outage_heals - outage_judged);
         v += outage_problems;
     }
     if (!strcmp(nemesis, "power")) {
@@ -2801,8 +2862,7 @@ int main(int argc, char **argv)
     if (outage && (v || outage_near_miss)) {
         /* what a failed or a close run has to show: the server's side of it (the log of every start of the run), under
          * a name the next run does not unlink; CI uploads /tmp/tsdb-jepsen-ci*.log */
-        if (rename(slogpath, outage_keeppath) == 0)
-            fprintf(stderr, "  the server log of this run is kept in %s\n", outage_keeppath);
+        outage_keep_log();
     } else if (!v && !getenv("JEPSEN_KEEP_LOG")) {
         unlink(slogpath);
     }

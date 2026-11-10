@@ -968,10 +968,23 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --seconds 8 --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! find $(JEPSEN_DIR)-selftest.outage-s1.server.log -size +0 -mmin -2 2>/dev/null | grep -q .; then \
 	        echo "jepsen-selftest: a failed outage run did not keep its server log (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_TSDBD=tests/jepsen/dead-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage \
+	    --seconds 8 --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 2 ] || ! find $(JEPSEN_DIR)-selftest.outage-s1.server.log -size +0 -mmin -2 2>/dev/null | grep -q .; then \
+	        echo "jepsen-selftest: an outage run that ended at a server that never started did not keep its log (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage --seconds 20 --seed 2 \
 	    --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^outage heals: [1-9][0-9]*, [0-9]* judged .*, 0 not judged$$'; then \
 	        echo "jepsen-selftest: an outage run left a heal unjudged, or did not say how many (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	printf '%s\n' 'tsdb: [100.500] storage domain /d/vola: a write probe took 900 ms (more than 400 ms): x' \
+	    'tsdb: [140.250] storage domain /d/volb: a write probe took 3000 ms (more than 400 ms): x' \
+	    'tsdb: [150.750] storage domain /d/vola: a write probe took 700 ms (more than 400 ms): x' \
+	    'tsdbd: [160.000] storage domain /d/vola: 2 -> 3' > $(JEPSEN_DIR)-selftest.scan.log; \
+	    a=$$(./$(B)/jepsen --scan-slow-probes $(JEPSEN_DIR)-selftest.scan.log,/d/vola,120 2>&1); \
+	    b=$$(./$(B)/jepsen --scan-slow-probes $(JEPSEN_DIR)-selftest.scan.log,/d/vola,151 2>&1); \
+	    c=$$(./$(B)/jepsen --scan-slow-probes $(JEPSEN_DIR)-selftest.scan.log,/d/volb,100 2>&1); \
+	    if [ "$$a" != 150.750 ] || [ "$$b" != 0.000 ] || [ "$$c" != 140.250 ]; then \
+	        echo "jepsen-selftest: the scan of slow write probes in a server log is wrong ($$a $$b $$c)"; exit 1; fi; \
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 

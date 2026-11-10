@@ -76,7 +76,7 @@ live in their own packages, so that the network clients can stay Apache-2.0 with
   minute at most), since such a probe starts the count of good probes over (a flapping domain on a slow disk stayed DOWN
   with no sign of why); the "recovering in place" line names the volume's own error (`tsdb_volume_failed`, C API, new
   function; `tsdb_abi_version` stays). The outage nemesis of `make jepsen` judges the last heal of a run, reports the
-  heals it judged, keeps the server log of a failed run, and takes its seeds from `JEPSEN_OUTAGE_SEEDS`.
+  heals it judged, keeps the server log of a failed run (also one that ends at a server that does not start or a final read that cannot connect), runs the servers with `fast_ms` 2000, extends a flapping heal's bound when the server logged a slow write probe after it, and takes its seeds from `JEPSEN_OUTAGE_SEEDS`.
 
 ## [0.10.0] - 2026-11-09
 
