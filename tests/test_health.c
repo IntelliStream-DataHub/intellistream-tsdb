@@ -22,6 +22,7 @@
  * evidence of load (busy.h). */
 #define CHECK(cond) TH_CHECK(cond)
 #define CHECK_T(cond) TH_CHECK_T(cond)
+#define CHECK_TW(cond, t0, t1) TH_CHECK_TW(cond, t0, t1)
 
 static char ctl[256];
 static tsdb_health *h;
@@ -30,6 +31,7 @@ static int dom_a, dom_a2, dom_b;
 static atomic_int changes;
 static pthread_mutex_t lg_mu = PTHREAD_MUTEX_INITIALIZER;
 static char lg[8192];
+static long b_change_ms; /* th_now_ms of the first change of domain 2 (B: only ENOSPC touches it), 0 = none */
 
 static void on_change(void *ctx, int dom, int old, int nw)
 {
@@ -38,7 +40,21 @@ static void on_change(void *ctx, int dom, int old, int nw)
     pthread_mutex_lock(&lg_mu);
     size_t l = strlen(lg);
     snprintf(lg + l, sizeof lg - l, "%d:%d>%d ", dom, old, nw);
+    if (dom == 2 && !b_change_ms)
+        b_change_ms = th_now_ms();
     pthread_mutex_unlock(&lg_mu);
+}
+
+/* With a timing failure: what each domain's last probes took, to tell a slow disk from a wrong state. */
+static void diag(void)
+{
+    for (int d = 0; h && d < 3; d++) {
+        tsdb_domain_info in;
+        if (tsdb_health_info(h, d, &in) == 0)
+            fprintf(stderr, "  domain %d (%s): state %d for %lld ms, last read %d ms, last write %d ms, probes %llu ok %llu failed\n",
+                    d, in.name, in.state, (long long)in.age_ms, in.read_ms, in.write_ms, (unsigned long long)in.probes_ok,
+                    (unsigned long long)in.probes_err);
+    }
 }
 
 static int cmd(const char *verb, const char *dir, const char *arg)
@@ -143,6 +159,7 @@ static int run_test(int argc, char **argv)
     if (outagefs_reexec(argv, base, names, 3))
         return 1;
     th_gauge_start(base);
+    th_diag = diag;
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
     const char *da = outagefs_dir("a"), *da2 = outagefs_dir("a2"), *db = outagefs_dir("b");
 
@@ -250,7 +267,9 @@ static int run_test(int argc, char **argv)
     if (th_ntiming == 0) {
         CHECK(strstr(lg, "0:0>2") && strstr(lg, "0:2>3") && strstr(lg, "0:3>0"));
         CHECK(strstr(lg, "1:0>1") && strstr(lg, "1:1>0"));
-        CHECK(!strstr(lg, "2:"));
+        /* B went DEGRADED or DOWN with no fault but ENOSPC: a probe of B was slow (or failed) for a reason outside the
+         * code (the disk, the CPU) or the code is wrong. Which one is the evidence of this run around the change. */
+        CHECK_TW(!strstr(lg, "2:"), b_change_ms - 3000, b_change_ms + 500);
     } else {
         fprintf(stderr, "the callback log is not judged after a timing failure (log: %s)\n", lg);
     }
@@ -258,6 +277,7 @@ static int run_test(int argc, char **argv)
 
     /* a manual owner: with auto_up off, RECOVERING stays until tsdb_health_set_up */
     tsdb_health_close(h);
+    h = NULL;
     o.auto_up = 0;
     o.on_change = NULL;
     h = tsdb_health_open(&o);
@@ -270,6 +290,7 @@ static int run_test(int argc, char **argv)
     tsdb_health_set_up(h, d0);
     CHECK(tsdb_health_state(h, d0) == TSDB_DOM_UP);
     tsdb_health_close(h);
+    h = NULL;
 
     /* read-only: no write probe, no files made */
     char ro[300];
@@ -283,6 +304,7 @@ static int run_test(int argc, char **argv)
     snprintf(p, sizeof p, "%s/PROBE.t1", ro);
     CHECK(access(p, F_OK) != 0);
     tsdb_health_close(h);
+    h = NULL;
 
     int rc = th_finish("test_health");
     if (rc) {

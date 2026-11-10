@@ -4,7 +4,8 @@
  *  - a plain check (CHECK) that fails fails the run at once, whatever the machine looks like (no second run);
  *  - a timing check (CHECK_T) is excused only by evidence from the run's own gauge (a thread woken 30 ms late, a thread
  *    that waited 30 ms for a CPU in a slot, a canary fdatasync of 100 ms) inside the window of the failing check; 29 ms
- *    is not enough, nor is the pressure of the whole machine at 90%, nor evidence from before the window;
+ *    is not enough, nor is the pressure of the whole machine at 90%, nor evidence from before the window (which reaches
+ *    2.5 s back before the previous check; CHECK_TW takes a window the test names);
  *  - then the run is run again (four runs in all), and a failure every run repeats stands;
  *  - a check that reads what a timed step was to bring about (CHECK_D) follows the timing failure before it, and alone is
  *    plain;
@@ -31,14 +32,14 @@ static int failures;
         }                                                                                                              \
     } while (0)
 
-enum { K_T = 1, K_P = 2, K_D = 4 }; /* which kinds of check the scenario fails */
+enum { K_T = 1, K_P = 2, K_D = 4, K_W = 8 }; /* which kinds of check the scenario fails (K_W: a windowed timing check) */
 struct scen {
     const char *name;
     int pct;               /* the fake machine pressure, whole percent */
     int wake, runq, fsync; /* what the run's own gauge saw (ms), 0 = nothing */
     int kinds;             /* the checks that fail */
     int flaky;             /* the failure is only in the first run */
-    int stale;             /* the evidence is noted, then the window moves past it */
+    int stale;             /* ms: the evidence is noted, then the run waits that long and marks (the next window starts there) */
     int rc, runs;          /* expected: exit status of the outer process, number of runs */
 };
 
@@ -57,7 +58,14 @@ static const struct scen scens[] = {
     {"t-psi-only", 90, 0, 0, 0, K_T, 1, 0, 1, 1},
     {"t-psi-only-29", 90, 29, 0, 0, K_T, 1, 0, 1, 1},
     /* evidence from before the failing window */
-    {"t-stale-evidence", 0, 50, 0, 0, K_T, 1, 1, 1, 1},
+    {"t-stale-evidence", 0, 50, 0, 0, K_T, 1, 3000, 1, 1},
+    /* the window reaches back TH_LOOKBACK_MS (2.5 s) before the previous check: a state is the outcome of the probes of the
+     * seconds before it */
+    {"t-lookback", 0, 50, 0, 0, K_T, 1, 1300, 0, 2},
+    /* a windowed check (a callback's moment): evidence inside the window excuses it, outside it does not */
+    {"w-inside", 0, 50, 0, 0, K_W, 1, 0, 0, 2},
+    {"w-outside", 0, 50, 0, 0, K_W, 1, 700, 1, 1},
+    {"w-psi-only", 90, 0, 0, 0, K_W, 1, 0, 1, 1},
     /* a plain failure on a busy machine fails at once, with or without a timing failure beside it */
     {"p-busy", 90, 50, 0, 0, K_P, 1, 0, 1, 1},
     {"p-busy-gauge", 90, 50, 50, 500, K_P, 0, 0, 1, 1},
@@ -106,12 +114,14 @@ static int the_test(int argc, char **argv)
     if (sc->fsync)
         th_note(TH_EV_FSYNC, sc->fsync);
     if (sc->stale) {
-        usleep(1300 * 1000); /* the window of the next check starts at the mark: after the evidence */
+        usleep((useconds_t)sc->stale * 1000); /* the window of the next check starts at the mark: after the evidence */
         th_mark();
     }
     if (!(sc->flaky && n >= 2)) {
         if (sc->kinds & K_T)
             TH_CHECK_T(n < 0);
+        if (sc->kinds & K_W)
+            TH_CHECK_TW(n < 0, th_now_ms() - 300, th_now_ms() + 10); /* the moment the test noted: just now */
         if (sc->kinds & K_D)
             TH_CHECK_D(n < 0);
         if (sc->kinds & K_P)

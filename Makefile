@@ -1023,7 +1023,10 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
 # power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too, and so does one that does
 # nothing, kills once and then sleeps, naps 5 s or 9 s at a time, or never pulls the plug itself and only restarts the
-# servers that died by themselves (--mutant-nemesis nothing|once|nap:MS|never|oncereact). A tsdbd with a stale
+# servers that died by themselves (--mutant-nemesis nothing|once|nap:MS|never|oncereact). The last two need servers
+# that are alive when the nemesis looks: on a fast file system (tmpfs) crashfs's loss rate of 0.0005 per operation ends
+# every server within milliseconds, an honest nemesis finds none either, and the case cannot be told from an honest run;
+# so they run at a sixteenth of the rate (JEPSEN_CRASH_PROB) and again while they found fewer than 8 live servers. A tsdbd with a stale
 # entry in its latest table (three mutants, built from a copy of the tree) fails the kv run's latest check.
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
@@ -1058,11 +1061,13 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    echo "$$out" | grep -q 'nemesis: 0 server deaths seen while napping' || break; done; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	for spec in 'nothing|it was idle' 'once|it was idle' 'nap:9000|it was idle' 'never|injected too little' \
-	    'oncereact|injected too little'; do \
-	    m=$${spec%%|*}; want=$${spec#*|}; \
-	    out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so \
-	        --mutant-nemesis $$m 2>&1); rc=$$?; \
+	for spec in 'nothing|it was idle|' 'once|it was idle|' 'nap:9000|it was idle|' 'never|injected too little|0.00003' \
+	    'oncereact|injected too little|0.00003'; do \
+	    m=$${spec%%|*}; rest=$${spec#*|}; want=$${rest%%|*}; prob=$${rest#*|}; \
+	    for try in 1 2 3; do \
+	        out=$$(env $${prob:+JEPSEN_CRASH_PROB=$$prob} ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
+	            --seconds 20 --crashfs $(B)/libcrashfs.so --mutant-nemesis $$m 2>&1); rc=$$?; \
+	        [ -z "$$prob" ] || ! echo "$$out" | grep -q ' of [0-7] live servers found' && break; done; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "$$want"; then \
 	        echo "jepsen-selftest: a nemesis that is '$$m' went unnoticed (rc $$rc, wanted rc 1 and '$$want')"; echo "$$out" | tail -n 20; exit 1; fi; \
 	done; \

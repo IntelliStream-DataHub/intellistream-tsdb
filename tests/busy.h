@@ -11,9 +11,10 @@
  *     wrong answer, a wrong state, a missing file. It fails the run at once, on any machine, and the run is never
  *     repeated. CHECK_T (TH_CHECK_T) is a timing check: "this happened within N ms". Only these can be excused.
  *  2. A timing failure is excused only by evidence from THIS run, taken over the window of the failing check (from the
- *     end of the previous check to the failure): the run's own gauge (below) saw a thread woken 30 ms late, a thread
- *     wait 30 ms for a CPU in one 100 ms slot (run_delay in /proc/<tid>/schedstat), or a canary fdatasync on the
- *     scratch file system take 100 ms. The pressure of the whole machine (/proc/pressure) is printed and never
+ *     end of the previous check, less TH_LOOKBACK_MS, to the failure; CHECK_TW: a window the test names, around the
+ *     moment it noted): the run's own gauge (below) saw a thread woken 30 ms late, a thread wait 30 ms for a CPU in one
+ *     100 ms slot (run_delay in /proc/<tid>/schedstat), or a canary on the scratch file system (a 4 KiB write with
+ *     fdatasync, and an O_DIRECT read like the health probe's) take 100 ms. The pressure of the whole machine (/proc/pressure) is printed and never
  *     enough: on a dev box it is above 20% with nothing of the test in it, and a logic bug that failed one run in three
  *     passed every time behind it.
  *     CHECK_D (TH_CHECK_D) is a verdict that depends on a timed step before it (see below).
@@ -138,24 +139,44 @@ static inline void th_fail_plain(const char *file, int line, const char *what)
     th_mark();
 }
 
-static inline void th_fail_timing(const char *file, int line, const char *what)
+/* A test may set a function that prints its own state (the domains' last probe latencies) with a timing failure. */
+static void (*th_diag)(void);
+
+/* A timing failure judged over [t0, t1] (th_now_ms's clock). */
+static inline void th_fail_timing_win(const char *file, int line, const char *what, long t0, long t1)
 {
-    long now = th_now_ms(), t0 = __atomic_load_n(&th_last_mark_ms, __ATOMIC_RELAXED);
-    if (t0 <= 0 || t0 > now - 1000)
-        t0 = now - 1000;
-    if (t0 < now - 60000)
-        t0 = now - 60000;
+    long now = th_now_ms();
+    if (t1 > now)
+        t1 = now;
+    if (t0 < t1 - 60000)
+        t0 = t1 - 60000;
     int wake, runq, fsync;
-    int ex = th_evidence(t0, now, &wake, &runq, &fsync);
+    int ex = th_evidence(t0, t1, &wake, &runq, &fsync);
     fprintf(stderr,
-            "%s:%d: FAILED (timing): %s\n  in the last %ld ms of this run: largest wake-up delay %d ms, longest wait for a "
-            "CPU in a %d ms slot %d ms, slowest canary fdatasync %d ms: %s\n",
-            file, line, what, now - t0, wake, TH_SLOT_MS, runq, fsync,
+            "%s:%d: FAILED (timing): %s\n  in the %ld ms before it: largest wake-up delay %d ms, longest wait for a "
+            "CPU in a %d ms slot %d ms, slowest canary fdatasync or direct read %d ms: %s\n",
+            file, line, what, t1 - t0, wake, TH_SLOT_MS, runq, fsync,
             ex ? "this run saw a busy machine" : "no sign of load in this run, the failure stands");
+    if (th_diag)
+        th_diag();
     __atomic_fetch_add(&th_ntiming, 1, __ATOMIC_RELAXED);
     if (ex)
         __atomic_fetch_add(&th_nexcused, 1, __ATOMIC_RELAXED);
     th_mark();
+}
+
+/* The window of a check: from TH_LOOKBACK_MS before the previous check ended (a state is the outcome of the probes of the
+ * seconds before: a domain is DEGRADED for the slow probes of its last degraded_window_ms, and the wait that preceded
+ * the check can have run through them) to now, and at least the last second. */
+#ifndef TH_LOOKBACK_MS
+#define TH_LOOKBACK_MS 2500
+#endif
+static inline void th_fail_timing(const char *file, int line, const char *what)
+{
+    long now = th_now_ms(), t0 = __atomic_load_n(&th_last_mark_ms, __ATOMIC_RELAXED) - TH_LOOKBACK_MS;
+    if (t0 <= 0 || t0 > now - 1000)
+        t0 = now - 1000;
+    th_fail_timing_win(file, line, what, t0, now);
 }
 
 /* CHECK: a verdict about the code. Never excused, never repeated. */
@@ -171,6 +192,16 @@ static inline void th_fail_timing(const char *file, int line, const char *what)
     do {                                                                                                               \
         if (!(cond))                                                                                                   \
             th_fail_timing(__FILE__, __LINE__, #cond);                                                                 \
+        else                                                                                                           \
+            th_mark();                                                                                                 \
+    } while (0)
+
+/* CHECK_TW: a timing check about something that happened at a moment the test noted (th_now_ms of a callback): judged
+ * over [t0, t1] around it, evaluated only when it fails. */
+#define TH_CHECK_TW(cond, t0, t1)                                                                                      \
+    do {                                                                                                               \
+        if (!(cond))                                                                                                   \
+            th_fail_timing_win(__FILE__, __LINE__, #cond, (t0), (t1));                                                 \
         else                                                                                                           \
             th_mark();                                                                                                 \
     } while (0)
@@ -290,6 +321,22 @@ static void *th_gauge_main(void *arg)
     }
     char page[4096];
     memset(page, 0x5a, sizeof page);
+    /* the health probes also read a block with O_DIRECT: a disk that is slow for those and not for a buffered write
+     * that is synced is seen by a canary that does the same (tmpfs and the like refuse O_DIRECT: no direct canary) */
+    void *dbuf = NULL;
+    int dfd = -1;
+    if (th_gauge_dir[0] && fd >= 0 && posix_memalign(&dbuf, 4096, 4096) == 0) {
+        char p[1100];
+        snprintf(p, sizeof p, "%s/.th_canary_d.%d", th_gauge_dir, (int)getpid());
+        int wfd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (wfd >= 0) {
+            memset(dbuf, 0x5a, 4096);
+            if (pwrite(wfd, dbuf, 4096, 0) == 4096 && fdatasync(wfd) == 0)
+                dfd = open(p, O_RDONLY | O_DIRECT);
+            close(wfd);
+            unlink(p);
+        }
+    }
     for (long tick = 0;; tick++) {
         struct timespec ts = {0, 10 * 1000000L}, a, b;
         clock_gettime(CLOCK_MONOTONIC, &a);
@@ -305,6 +352,13 @@ static void *th_gauge_main(void *arg)
                 int sy = fdatasync(fd);
                 clock_gettime(CLOCK_MONOTONIC, &b);
                 if (w == (ssize_t)sizeof page && sy == 0)
+                    th_note(TH_EV_FSYNC, (int)((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000));
+            }
+            if (dfd >= 0) {
+                clock_gettime(CLOCK_MONOTONIC, &a);
+                ssize_t rd = pread(dfd, dbuf, 4096, 0);
+                clock_gettime(CLOCK_MONOTONIC, &b);
+                if (rd == 4096)
                     th_note(TH_EV_FSYNC, (int)((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000));
             }
             th_gauge_runq_pid(getpid());

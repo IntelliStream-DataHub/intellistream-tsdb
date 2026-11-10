@@ -445,7 +445,9 @@ static void start_server(bool faulty)
                 setenv("LD_PRELOAD", crashfs, 1);
                 setenv("CRASHFS_ROOT", dir, 1);
                 setenv("CRASHFS_SEED", sd, 1);
-                setenv("CRASHFS_PROB", "0.0005", 1);
+                /* JEPSEN_CRASH_PROB: the selftest's power loss rate for the cases that need a server alive when the nemesis looks
+                 * (on a fast file system the random loss of 0.0005 per operation ends every server within milliseconds) */
+                setenv("CRASHFS_PROB", getenv("JEPSEN_CRASH_PROB") ? getenv("JEPSEN_CRASH_PROB") : "0.0005", 1);
                 setenv("CRASHFS_WARMUP", "200", 1);
                 if (!strcmp(nemesis, "power") && restarts % 2 == 1)
                     setenv("CRASHFS_TEAR", "1", 1); /* every other server: keep what a real disk may keep */
@@ -758,8 +760,11 @@ static tsdbc *connect_setup(void)
 static void setup_pause(void)
 {
     const char *e = getenv("JEPSEN_SETUP_PAUSE_MS");
-    if (e && atoi(e) > 0)
-        usleep((useconds_t)atoi(e) * 1000);
+    if (e && atoi(e) > 0) { /* the watchdog's renewal signal ends a plain sleep early: sleep out the whole time */
+        struct timespec ts = {atoi(e) / 1000, (atoi(e) % 1000) * 1000000L};
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+            ;
+    }
 }
 
 /* A watchdog for the whole run: the budget is generous (every honest run ends within seconds + a few start-ups and
