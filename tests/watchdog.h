@@ -2,6 +2,7 @@
 #ifndef TSDB_TEST_WATCHDOG_H
 #define TSDB_TEST_WATCHDOG_H
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +13,9 @@
 /* A watchdog for a whole test process: when `seconds` have passed (times TH_WATCHDOG_SCALE from the environment,
  * and 10 under a sanitizer, which runs the same test several times slower) the process prints which test hung and
  * exits with status 124. A test that waits for a server forever then fails by name instead of holding a job (or a
- * CI runner) until something else gives up; the servers it started follow it out (--exit-with-parent). It is a
+ * CI runner) until something else gives up; the servers it started follow it out (--exit-with-parent). On a machine
+ * whose CPUs have been saturated for minutes (a gate niced beside other gates: test_group under TSan, 3 minutes alone,
+ * met its 12000 s) the deadline is renewed up to twice, with a line that says so. It is a
  * POSIX timer on Linux (a thread elsewhere), not alarm(): a test may use SIGALRM for itself (test_stability does). The deadline is for the whole run,
  * far above the longest honest one, so it never fires on a slow box that is merely busy. */
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
@@ -43,9 +46,49 @@ static void th_watch_fire(void)
  * many tests fork a child that opens a database. The timer is not inherited by a child, as the thread was not. The
  * signal is SIGRTMIN (no test uses it; SIGALRM is left to test_stability), the handler only writes and exits. */
 #include <signal.h>
+static timer_t th_watch_timer;
+static int th_watch_ext;
+static char th_watch_psi[256];
+
+/* The CPU pressure of the whole machine ("some" avg300 of /proc/pressure/cpu, whole percent; 0 where there is none):
+ * a test niced behind a saturated machine (a gate beside other gates) runs hundreds of times slower than alone, which
+ * is not a hang. Only open, read and close in here: it runs in a signal handler. */
+static int th_cpu_pressure(void)
+{
+    char b[256];
+    int fd = open(th_watch_psi, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    ssize_t n = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    b[n] = 0;
+    const char *p = strstr(b, "avg300=");
+    int pct = 0;
+    for (p = p ? p + 7 : ""; *p >= '0' && *p <= '9'; p++)
+        pct = pct * 10 + (*p - '0');
+    return pct;
+}
+
+#define TH_WATCH_BUSY_PCT 30 /* the machine has been this busy for five minutes: a slow test is not yet a hung one */
+#define TH_WATCH_EXTENSIONS 2
+
 static void th_watch_sig(int sig)
 {
     (void)sig;
+    if (th_watch_ext < TH_WATCH_EXTENSIONS && th_cpu_pressure() >= TH_WATCH_BUSY_PCT) {
+        struct itimerspec its;
+        memset(&its, 0, sizeof its);
+        its.it_value.tv_sec = th_watch_seconds;
+        if (timer_settime(th_watch_timer, 0, &its, NULL) == 0) {
+            th_watch_ext++;
+            static const char note[] = "\nwatchdog: the machine is busy (CPU pressure), the test gets more time\n";
+            if (write(2, note, sizeof note - 1) < 0)
+                th_watch_ext = TH_WATCH_EXTENSIONS;
+            return;
+        }
+    }
     th_watch_fire();
 }
 
@@ -56,7 +99,6 @@ static inline void th_watch_start(void)
     sa.sa_handler = th_watch_sig;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
-    timer_t t;
     struct sigevent ev;
     memset(&ev, 0, sizeof ev);
     ev.sigev_notify = SIGEV_SIGNAL;
@@ -64,8 +106,11 @@ static inline void th_watch_start(void)
     struct itimerspec its;
     memset(&its, 0, sizeof its);
     its.it_value.tv_sec = th_watch_seconds;
-    if (sigaction(SIGRTMIN, &sa, NULL) != 0 || timer_create(CLOCK_MONOTONIC, &ev, &t) != 0 ||
-        timer_settime(t, 0, &its, NULL) != 0) {
+    const char *psi = getenv("TH_WATCHDOG_PSI"); /* test_watchdog points it at a file of its own */
+    snprintf(th_watch_psi, sizeof th_watch_psi, "%s", psi ? psi : "/proc/pressure/cpu");
+    th_watch_ext = 0;
+    if (sigaction(SIGRTMIN, &sa, NULL) != 0 || timer_create(CLOCK_MONOTONIC, &ev, &th_watch_timer) != 0 ||
+        timer_settime(th_watch_timer, 0, &its, NULL) != 0) {
         fprintf(stderr, "%s: cannot start the watchdog timer\n", th_watch_name);
         exit(1);
     }
