@@ -304,8 +304,9 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
-test-units-b: $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
+test-units-b: $(B)/test_watchdog $(B)/test_busy $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_watchdog
+	./$(B)/test_busy
 	./$(B)/test_group $(SCRATCH)
 	./$(B)/test_lttb $(SCRATCH)
 	B=$(B) tests/test_cli_lttb.sh
@@ -911,9 +912,13 @@ $(B)/test_group: tests/test_group.c $(LIB)
 $(B)/test_watchdog: tests/test_watchdog.c tests/watchdog.h | $(B)
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
+$(B)/test_busy: tests/test_busy.c tests/busy.h tests/watchdog.h | $(B)
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
 # the test headers are prerequisites of every test that includes them (a changed watchdog or seed rebuilds them)
 $(patsubst tests/%.c,$(B)/%,$(shell grep -l 'watchdog.h' tests/*.c)): tests/watchdog.h
 $(patsubst tests/%.c,$(B)/%,$(shell grep -l 'seed.h' tests/*.c)): tests/seed.h
+$(patsubst tests/%.c,$(B)/%,$(shell grep -l 'busy.h' tests/*.c)): tests/busy.h
 
 $(B)/test_twa: tests/test_twa.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

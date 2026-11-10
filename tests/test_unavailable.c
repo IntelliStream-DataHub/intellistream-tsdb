@@ -11,6 +11,7 @@
 #include "tsdb.h"
 #include "tsdb_client.h"
 #include <limits.h>
+#include "busy.h"
 #include "harness.h"
 #include "outagefs_ctl.h"
 #include "outage_status.h"
@@ -223,7 +224,10 @@ static void check_multi_during_outage(tsdbc *c)
     }
 }
 
-int main(int argc, char **argv)
+static int run_test(int argc, char **argv);
+int main(int argc, char **argv) { return th_run_retrying("test_unavailable", argc, argv, run_test); }
+
+static int run_test(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
     const char *names[] = {"a"};
@@ -340,5 +344,5 @@ int main(int argc, char **argv)
     waitpid(server, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     fprintf(stderr, "test_unavailable: %s\n", failures ? "FAILED" : "ok");
-    return failures ? 1 : 0;
+    return failures ? th_failed(-1) : 0;
 }

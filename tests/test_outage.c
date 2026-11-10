@@ -26,6 +26,7 @@
 #include "tsdb.h"
 #include "tsdb_client.h"
 #include <limits.h>
+#include "busy.h"
 #include "harness.h"
 #include "outagefs_ctl.h"
 
@@ -439,7 +440,10 @@ static int await_writes(side *s, int timeout_ms)
     return rc;
 }
 
-int main(int argc, char **argv)
+static int run_test(int argc, char **argv);
+int main(int argc, char **argv) { return th_run_retrying("test_outage", argc, argv, run_test); }
+
+static int run_test(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
     const char *names[] = {"a", "b", "c"};
@@ -657,7 +661,17 @@ int main(int argc, char **argv)
     {
         tsdbc *c;
         CHECK(connect_noretry("127.0.0.1", port, 3000, &c) == 0);
-        CHECK(c && tsdbc_flush(c) == 0); /* the rows so far are in parts */
+        /* the rows so far are in parts. A volume that no fault touched may be UNAVAILABLE for a moment on a busy
+         * machine (its domain's probes starved: "b: 2 -> 3" in the log of a gate that failed here, 2:0>1 in
+         * test_health's), so an answer of UNAVAILABLE is asked again for up to 30 s; any other answer is final. */
+        int frc = c ? tsdbc_flush(c) : -1;
+        for (int i = 0; c && frc == TSDB_ERR_UNAVAILABLE && i < 300; i++) {
+            usleep(100000);
+            frc = tsdbc_flush(c);
+        }
+        if (frc != 0)
+            fprintf(stderr, "flush before the part loss answered %d\n", frc);
+        CHECK(frc == 0);
         CHECK(fault("hang", dir_a, NULL) == 0);
         CHECK(await_status(key_dom_state, "down", 30000) >= 0);
         /* without the shim in the child: its init would take over the control socket */
@@ -723,5 +737,5 @@ int main(int argc, char **argv)
     waitpid(server, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     fprintf(stderr, "test_outage: %s\n", failures ? "FAILED" : "ok");
-    return failures ? 1 : 0;
+    return failures ? th_failed(-1) : 0;
 }

@@ -28,9 +28,9 @@
 #ifndef TH_SAN_SCALE
 #define TH_SAN_SCALE 1
 #endif
-static char th_watch_name[64];
+static char th_watch_name[96];
 static long th_watch_seconds;
-static char th_watch_msg[160];
+static char th_watch_msg[224];
 static size_t th_watch_msg_len;
 
 static void th_watch_fire(void)

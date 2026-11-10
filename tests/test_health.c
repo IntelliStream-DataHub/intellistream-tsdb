@@ -7,6 +7,7 @@
 #include "outagefs_ctl.h"
 
 #include <dirent.h>
+#include "busy.h"
 #include "watchdog.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -52,9 +53,8 @@ static int cmd(const char *verb, const char *dir, const char *arg)
 
 /* How late this thread was woken, at most: the test's own gauge of a busy machine. The thresholds below are a few
  * hundred ms (scaled down from seconds), so a probe thread that waits for a CPU for that long flips a domain to
- * DEGRADED that no fault touched: a failure with load in it is not a verdict (see main). */
+ * DEGRADED that no fault touched: a failure with load in it is not a verdict (busy.h). */
 static atomic_int max_over_ms;
-#define LOAD_OVER_MS 30
 
 static void nap(int ms)
 {
@@ -66,22 +66,6 @@ static void nap(int ms)
     int old = atomic_load(&max_over_ms);
     while (over > old && !atomic_compare_exchange_weak(&max_over_ms, &old, over))
         ;
-}
-
-/* The machine's CPU pressure over the last ten seconds, whole percent (0 without /proc/pressure/cpu). */
-static int cpu_pressure10(void)
-{
-    char b[256];
-    int fd = open("/proc/pressure/cpu", O_RDONLY);
-    if (fd < 0)
-        return 0;
-    ssize_t n = read(fd, b, sizeof b - 1);
-    close(fd);
-    if (n <= 0)
-        return 0;
-    b[n] = 0;
-    const char *q = strstr(b, "avg10=");
-    return q ? atoi(q + 6) : 0;
 }
 
 /* waits up to ms for a domain to be in a state */
@@ -117,44 +101,12 @@ _Static_assert(offsetof(tsdb_health_options, on_change) == 56, "tsdb_health_opti
 _Static_assert(offsetof(tsdb_health_options, ctx) == 64, "tsdb_health_options layout of 0.10.0");
 #endif
 
-#define EXIT_LOADED 3 /* failed, and the machine was busy: the outer process runs it again */
-
 static int run_test(int argc, char **argv);
 
-/* The thresholds here are scaled down to hundreds of ms, and the test failed ("test_health:140/183") on a busy machine
- * with domains in DEGRADED that no fault touched (log: 2:0>1 2:1>0, a domain with only ENOSPC). A failure is judged by
- * a run that saw no load: the outer process runs the test again (up to 3 times) when a failed run measured a thread
- * woken 30 ms late or a CPU pressure of 30% or more; a failure with no load in it, or one that every run repeats (a
- * bug), fails at once or at the end. The runs are separate processes (the shim state, the directories). */
-int main(int argc, char **argv)
-{
-    if (getenv("TEST_HEALTH_INNER") || getenv("OUTAGEFS_CTL"))
-        return run_test(argc, argv);
-    th_watchdog("test_health (outer)", 3600);
-    setenv("TEST_HEALTH_INNER", "1", 1);
-    int rc = 1;
-    for (int attempt = 1; attempt <= 3; attempt++) {
-        fflush(NULL);
-        pid_t pid = fork();
-        if (pid < 0)
-            return 1;
-        if (pid == 0) {
-            execv("/proc/self/exe", argv);
-            _exit(127);
-        }
-        int st = 0;
-        if (waitpid(pid, &st, 0) != pid)
-            return 1;
-        rc = WIFEXITED(st) ? WEXITSTATUS(st) : 1;
-        if (rc != EXIT_LOADED)
-            break;
-        fprintf(stderr, "test_health: attempt %d failed with the machine busy: running it again%s\n", attempt,
-                attempt < 3 ? "" : " (no more: the failure stands)");
-    }
-    if (rc == EXIT_LOADED)
-        rc = 1;
-    return rc;
-}
+/* The thresholds here are scaled down to hundreds of ms, and the test failed ("test_health:140/183/264") on a busy
+ * machine with domains in DEGRADED or DOWN that no fault touched (log: 2:0>1 2:1>0, a domain with only ENOSPC): see
+ * busy.h, which runs it again when a failed run saw the machine busy (its CPUs, or its disk). */
+int main(int argc, char **argv) { return th_run_retrying("test_health", argc, argv, run_test); }
 
 static int run_test(int argc, char **argv)
 {
@@ -280,11 +232,8 @@ static int run_test(int argc, char **argv)
     tsdb_health_close(h);
 
     if (failures) {
-        int over = atomic_load(&max_over_ms), psi = cpu_pressure10();
-        bool loaded = over >= LOAD_OVER_MS || psi >= 30;
-        fprintf(stderr, "test_health: %d failures (log: %s); largest wake-up delay %d ms, CPU pressure %d%%%s\n",
-                failures, lg, over, psi, loaded ? ": the machine was busy" : "");
-        return loaded ? EXIT_LOADED : 1;
+        fprintf(stderr, "test_health: %d failures (log: %s)\n", failures, lg);
+        return th_failed(atomic_load(&max_over_ms));
     }
     printf("test_health: ok\n");
     return 0;
