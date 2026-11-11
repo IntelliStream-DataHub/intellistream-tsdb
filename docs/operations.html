@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Operations</title>
+<meta name="description" content="tsdb docs|Running tsdb: volumes, read-only followers over NFS, checksums and the pinned index on ZFS, ext4 and XFS, metrics, backups, export and import.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#070a17">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="../assets/favicon.png" type="image/png" sizes="32x32">
+<link rel="stylesheet" href="../assets/site.css?v=e4e6549">
+<script src="../assets/site.js?v=e4e6549"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+<div class="topbar-in">
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="28" height="28"><span>tsdb</span></a>
+<nav class="topnav" id="topnav" aria-label="Main"><a href="../index.html">Home</a><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a><a class="gh" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg><span>GitHub</span></a></nav>
+<button class="icon-btn menu-btn" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topnav"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</div>
+</header>
+<div class="scrim" hidden></div>
+<div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
+<div class="doc-shell">
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html" aria-current="page">Operations</a></li><li><a href="cluster.html">Cluster (preview)</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<main id="main" class="doc">
+<h1>Operations</h1>
+<p class="lead">What to know when tsdb runs for real: where the data goes, how to read it from other machines, how to
+guard it against a bad disk, how to watch it, and how to back it up.</p>
+
+<h2 id="volumes">Volumes</h2>
+<p>A database is a directory. A <strong>volume</strong> is another directory that holds series of their own, for
+example one per disk or per NFS mount. Each series lives in one volume; you choose it when you create the series.</p>
+<ul>
+<li>Add one with <code>tsdb DIR volume add PATH</code>, also while tsdbd runs. <code>tsdb DIR volume list</code> lists
+them, the database directory first.</li>
+<li>Create a series in it with <code>tsdb DIR create SERIES PATH</code>, or from a client that names the path.</li>
+<li>Only an operator adds volumes. A client that names a path tsdbd does not know gets "not found", and nothing is
+created.</li>
+<li>The path must be absolute, and not inside the database directory or another volume.</li>
+</ul>
+
+<h2 id="followers">Followers, also over NFS</h2>
+<p>One writer and any number of read-only <strong>followers</strong> can share a directory. A follower answers queries
+and sees new data shortly after the writer has it:</p>
+<pre><code class="language-sh" data-src="README.md#As a server">build/tsdbd --dir /data/sensors --port 7070
+build/tsdbd --dir /mnt/sensors --port 7070 --follow    # a read-only copy that follows the writer</code></pre>
+<p>The first line is the writer, the second a follower. The follower looks for new data every 100 ms
+(<code>--refresh-ms</code>): new parts, merges, and the newest rows from the write-ahead log. The directory can be on
+NFS, so the followers can run on other machines.</p>
+<ul>
+<li>When a merge replaces files, the writer keeps the old ones for 8 minutes before it deletes them, so a follower on
+another machine can finish reading them.</li>
+<li>Watch <code>tsdb_follow_refresh_age_seconds</code>. Above 5 seconds, the follower has stopped refreshing. It does
+not tell you that the writer is down; watch the writer for that.</li>
+<li>An NFS server for tsdb needs some care (sync exports, locks, short leases).
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/nfs-server.md">docs/nfs-server.md</a>
+walks through it.</li>
+</ul>
+
+<h2 id="checksums">Checksums and the pinned index</h2>
+<p>tsdb keeps a checksum on every part's header and index, on its write-ahead log and on its small files, and checks them
+when it opens them. The data blocks themselves are checked only if you ask for it. Whether you should depends on the
+file system:</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">File system</th><th scope="col">Start tsdbd with</th><th scope="col">Why</th></tr></thead>
+<tbody>
+<tr><td>ext4 or XFS</td><td><code>--verify-checksums</code>, and <code>--pin-index</code> if the RAM is there</td><td>they keep no checksums of your data, so without the flag a damaged disk block can come back as wrong values instead of an error. tsdbd reminds you at startup</td></tr>
+<tr><td>ZFS</td><td>nothing</td><td>ZFS checks its data itself</td></tr>
+</tbody></table></div>
+<p><strong><code>--verify-checksums</code></strong> checks the data each query reads. Each part's index (which rows are
+where, and the sums, minimums and maximums that queries answer from) is checked when the part is opened, and then read
+from the file as it is. If the disk damages it after that, answers can be wrong until the next restart refuses the
+part.</p>
+<p><strong><code>--pin-index</code></strong> keeps a copy of every index in memory, as it was checked, so that cannot
+happen. The copy costs about 51 bytes of RAM per granule (a block of up to 8192 rows of one series), in the server and
+in every follower. That is about 4 MB per billion rows of busy series, but at least one granule per series and
+partition, so with many slow series it adds up: a billion series take about 51 GB per partition. The metric
+<code>tsdb_pinned_index_bytes</code> shows what it costs. Turn it on where you use <code>--verify-checksums</code> and
+the RAM is there.</p>
+
+<h2 id="users">Users, rights and tenants</h2>
+<p>Clients log in with a user name and a password; the <a href="server.html#users">server page</a> explains how. The
+users live in one file, <code>USERS</code>, in the database directory. Only the file's owner may read it, and it
+holds no passwords, only values made from them. Such a value is not enough to log in, but together with one
+recorded login of the same user it is (there is no TLS yet), so keep the file as secret as the data. Whoever can
+write the directory can add a superuser, so keep it as closed as the data.</p>
+
+<h3 id="users-setup">Setting up users</h3>
+<p>Start with one superuser, added before tsdbd first starts. Then give every program and person its own user,
+with the rights it needs and no more. A collector that only adds data gets <code>insert</code>, not
+<code>write</code>: if its password leaks, nobody can delete history with it.</p>
+<pre><code class="language-sh" data-src="README.md#Users and logins" data-block="2">build/tsdb /data/sensors user add acme/ingest --password-file /etc/tsdb/acme-ingest.password
+build/tsdb /data/sensors user grant acme/ingest insert prefix:acme/
+build/tsdb /data/sensors user list</code></pre>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Right</th><th scope="col">What it allows</th></tr></thead>
+<tbody>
+<tr><td><code>read</code></td><td>queries of every kind, and looking series up</td></tr>
+<tr><td><code>insert</code></td><td>writing rows and creating series (and looking them up, but not reading their rows)</td></tr>
+<tr><td><code>delete</code></td><td>deleting rows and setting retention; replacing a range needs <code>insert</code> too</td></tr>
+<tr><td><code>admin</code></td><td>read, insert and delete, plus managing the users named under its prefix</td></tr>
+<tr><td><code>write</code></td><td>short for <code>insert,delete</code></td></tr>
+</tbody></table></div>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Selector</th><th scope="col">The series it covers</th></tr></thead>
+<tbody>
+<tr><td><code>all</code></td><td>every series</td></tr>
+<tr><td><code>prefix:acme/</code></td><td>the names that start with <code>acme/</code>. A prefix is plain bytes: <code>prefix:acme</code> also covers <code>acmecorp/x</code>, so end a tenant's prefix with <code>/</code> (the command line warns otherwise)</td></tr>
+<tr><td><code>name:pump7.flow</code></td><td>that one series</td></tr>
+<tr><td><code>glob:acme/*/temp?</code></td><td>the names the pattern matches: <code>*</code> any bytes (also <code>/</code>, also none), <code>?</code> one byte, <code>\</code> takes the next byte as it is. At most 64 globs per user</td></tr>
+</tbody></table></div>
+<p>Rights only add up: a user may do on a series what any of its grants allows. There is no way to deny. To take a
+right away, <code>tsdb DIR user revoke NAME RIGHTS SELECTOR</code>. A series a user holds no right on answers as if it
+did not exist, so users cannot find out which series other tenants store (only roughly how many: see below).</p>
+
+<h3 id="tenants">Tenants and tenant admins</h3>
+<p>A tenant is a name prefix: <code>acme/</code> for acme's series and acme's users. A user with <code>admin</code> on
+<code>prefix:acme/</code> creates and drops users named <code>acme/...</code>, sets their passwords and gives them rights
+inside <code>acme/</code>, over the network, without access to the server's files:</p>
+<pre><code class="language-sh" data-src="README.md#Users and logins" data-block="3">build/tsdb /data/sensors user add acme/admin --password-file /etc/tsdb/acme-admin.password
+build/tsdb /data/sensors user grant acme/admin admin prefix:acme/
+# from any machine that reaches tsdbd, as acme/admin (it asks for acme/admin's password, then the new one):
+build/tsdb user add acme/dashboard --server db1:7070 --login acme/admin
+build/tsdb user grant acme/dashboard read prefix:acme/ --server db1:7070 --login acme/admin</code></pre>
+<p>It cannot give rights outside its prefix, create superusers, or change a user that holds a right outside its
+prefix.</p>
+<ul>
+<li><strong>Shares between tenants.</strong> Only a superuser grants an <code>acme/</code> user a right on another
+tenant's series. After that the acme admins can no longer set that user's password. They may still know the
+password they set before, so give such a share to a user whose password the tenant admins never set, or set a new
+one when you share (<code>tsdb DIR user passwd NAME</code>).</li>
+<li><strong>State names.</strong> Series of the <code>state</code> type store labels such as <code>RUNNING</code> in one
+list per volume. A user with a right on any series of a volume can look up the labels of every series there. Where
+those labels are sensitive, give each tenant its own <a href="#volumes">volume</a>.</li>
+<li><strong>Series counts.</strong> Series ids are numbered in the order series are created, one count per volume.
+A user who creates a series sees from its id how many series the volume held, and from two ids how many others
+created in between. A volume per tenant avoids that too; its path then shows on the <a href="#metrics">metrics
+port</a>.</li>
+<li><strong>The network.</strong> Without TLS (planned), whoever records a password change made through the server
+(<code>user add</code>, <code>user passwd</code>) and a later login of that user can log in as that user, and whoever
+can change traffic can take over a connection after its login. Keep the backend network isolated, and change
+passwords with <code>tsdb DIR user ...</code> on the server host where you can: that sends nothing over the
+network.</li>
+</ul>
+
+<h3 id="users-running">While tsdbd runs</h3>
+<ul>
+<li>The <code>tsdb DIR user ...</code> commands work beside a running tsdbd; it reads the change within a second. From
+then on a revoked right is gone on every connection of that user, also those already open, and the open
+connections of a dropped user get a login error on their next request.</li>
+<li>A user list that only grows: every change is added at the end of <code>USERS</code>.
+<code>tsdb DIR user compact</code> rewrites it with one entry per user and grant, also while tsdbd runs.</li>
+<li>If the last superuser is dropped, tsdbd keeps serving the users that are logged in, but the next start refuses
+until <code>tsdb DIR user add NAME --superuser</code> has run.</li>
+<li><a href="#followers">Followers</a> read the same <code>USERS</code> and accept no user changes: make them on the
+writer.</li>
+<li>If a write to <code>USERS</code> fails, tsdbd stops, as for any file it relies on: an acknowledged revoke must not
+come back after a crash.</li>
+<li><code>export</code> carries series, not users. Copy <code>USERS</code> into the new directory after an import, with
+tsdbd stopped, or add the users again.</li>
+<li>Failed logins are counted in <code>tsdb_logins_total{result="failed"}</code> and logged with the user name and
+the address, at most one line a second.</li>
+</ul>
+
+<h2 id="metrics">Metrics</h2>
+<p><code>--metrics-port 9170</code> serves <code>GET /metrics</code> in the Prometheus text format on a port of its own.
+It is off by default and, unlike the main port, has no login: bind it to a trusted interface. It shows counts for
+the whole server and per volume, never series names or values; the per-volume counts name each volume's directory,
+so with a volume per tenant anyone who reaches the port sees those paths and their sizes. A scrape never runs a query.
+A Prometheus scrape config:</p>
+<pre><code class="language-yaml" data-src="docs/metrics.md#Prometheus metrics">scrape_configs:
+  - job_name: tsdb
+    static_configs: [{targets: ["db1:9170"]}]</code></pre>
+<p>Some of the metrics:</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Metric</th><th scope="col">What it tells you</th></tr></thead>
+<tbody>
+<tr><td><code>tsdb_rows</code>, <code>tsdb_disk_bytes</code>, <code>tsdb_parts</code></td><td>rows and bytes on disk, and the number of parts</td></tr>
+<tr><td><code>tsdb_inserted_rows_total</code></td><td>rows written; <code>rate(tsdb_inserted_rows_total[1m])</code> is the insert rate</td></tr>
+<tr><td><code>tsdb_query_duration_seconds</code></td><td>a histogram of query times, by operation</td></tr>
+<tr><td><code>tsdb_memtable_rows</code></td><td>rows in memory, not yet in parts; growing without end means writes to disk do not keep up</td></tr>
+<tr><td><code>tsdb_failed</code></td><td>1 once the disk failed and tsdbd stops: alert on it</td></tr>
+<tr><td><code>tsdb_follow_refresh_age_seconds</code></td><td>followers: time since the last good refresh</td></tr>
+<tr><td><code>tsdb_connections</code>, <code>tsdb_request_errors_total</code></td><td>open connections, and replies with an error, by code (<code>denied</code>: a request for series the user holds no right on)</td></tr>
+<tr><td><code>tsdb_logins_total</code></td><td>logins by result: <code>ok</code>, <code>failed</code>, <code>timeout</code>, <code>refused</code>; many failures mean a client with a wrong password, or someone guessing</td></tr>
+</tbody></table></div>
+<p><a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/metrics.md">docs/metrics.md</a>
+lists them all.</p>
+
+<h2 id="backup">Backup, export and import</h2>
+<p><code>export</code> writes the whole database, or some series, into one file; <code>import</code> reads it into
+another database. Use it for backups, to move a database to another disk or machine, and when a new tsdb version
+cannot open the files of an older one (before 1.0 that can happen in a 0.9.x release; the release notes say so).</p>
+<pre><code class="language-sh" data-src="README.md#Backup and moving">build/tsdb /data/sensors export -o sensors.tsdbdump      # with the OLD tsdb; also while tsdbd is running
+build/tsdb /data/sensors-new import sensors.tsdbdump     # with the NEW tsdb, into a new directory
+build/tsdb /data/sensors export --series 'pump7.*' --from 2024-01-01 --to 2024-02-01 | ssh other \
+    tsdb /data/sensors import                             # some series and one month, straight to another host</code></pre>
+<ul>
+<li>The file has what your queries see (deleted rows are gone), with each series' type, retention and state names, and
+every value exactly as stored. Every later tsdb can import it.</li>
+<li><code>import</code> checks the whole file before it writes anything, so a damaged file changes nothing.
+<code>import --check FILE</code> only checks.</li>
+<li>Series that already exist are refused, unless you pass <code>--skip-existing</code>, <code>--merge</code> or
+<code>--replace</code>.</li>
+<li>Stop tsdbd before you import into its directory.</li>
+<li>An import into a new directory builds the database beside it and gives it its name only at the end, so an
+interrupted import leaves no half database under that name.</li>
+</ul>
+<h3 id="volumes-upgrade">Moving a database with volumes</h3>
+<p>Series in volumes keep their volume path in the file. The new database needs volume directories of its own, so tell
+<code>import</code> where each old volume goes, and add <code>--create-volumes</code>:</p>
+<pre><code class="language-sh" data-src="README.md#Backup and moving" data-block="2"># old database /data/sensors with volumes /mnt/nfs1/tsdb/sensors and /mnt/nfs2/tsdb/sensors
+build/tsdb /data/sensors export -o /backup/sensors.tsdbdump                 # with the OLD tsdb
+build/tsdb /data/sensors-new import /backup/sensors.tsdbdump --create-volumes \
+    --volume /mnt/nfs1/tsdb/sensors=/mnt/nfs1/tsdb/sensors-new \
+    --volume /mnt/nfs2/tsdb/sensors=/mnt/nfs2/tsdb/sensors-new                # with the NEW tsdb
+# or, when all volumes live under one directory, one rule for all of them:
+build/tsdb /data/sensors-new import /backup/sensors.tsdbdump --create-volumes \
+    --volume-root /mnt/tsdb/sensors=/mnt/tsdb/sensors-new</code></pre>
+<p>Then point tsdbd at the new directory, check your queries, and only then delete the old database and its volume
+directories.</p>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="server.html"><span>Previous</span>The server, tsdbd</a><a class="next" href="cluster.html"><span>Next</span>Cluster (preview)</a></nav></main>
+</div>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source: the server and the engine under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">GNU AGPL-3.0</a> (a commercial licence is available), the client libraries under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSES/Apache-2.0.txt">Apache License 2.0</a>; <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSING.md">which is which</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+</body>
+</html>

@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Command line</title>
+<meta name="description" content="tsdb docs|The tsdb command-line tool: import, query, export, create series, volumes, stats, delete and retention.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#070a17">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="../assets/favicon.png" type="image/png" sizes="32x32">
+<link rel="stylesheet" href="../assets/site.css?v=e4e6549">
+<script src="../assets/site.js?v=e4e6549"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+<div class="topbar-in">
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="28" height="28"><span>tsdb</span></a>
+<nav class="topnav" id="topnav" aria-label="Main"><a href="../index.html">Home</a><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a><a class="gh" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg><span>GitHub</span></a></nav>
+<button class="icon-btn menu-btn" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topnav"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</div>
+</header>
+<div class="scrim" hidden></div>
+<div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
+<div class="doc-shell">
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html" aria-current="page">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="cluster.html">Cluster (preview)</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<main id="main" class="doc">
+<h1>Command line</h1>
+<p class="lead"><code>tsdb</code> works on a database directory directly, with no server. Use it to load files,
+look at data, take backups and change settings.</p>
+<p>Every command starts with the database directory: <code>tsdb DIR COMMAND ...</code>. Run <code>build/tsdb</code>
+without arguments for the full list, the time formats and the groups. The <a href="quickstart.html">quick start</a>
+uses <code>import</code> and <code>query</code>. <code>tsdb DIR user</code> manages the <a href="#users">users</a> who
+may log in to tsdbd.</p>
+
+<h2 id="commands">Commands</h2>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+<tbody>
+<tr><td><code>insert SERIES</code></td><td>reads <code>time,value</code> lines from standard input into one series</td></tr>
+<tr><td><code>import [FILE]</code></td><td>reads <code>series,time,value</code> lines, or an export file (see <a href="operations.html#backup">backup</a>). New series are float32; an empty value or <code>null</code> is a null</td></tr>
+<tr><td><code>export [-o FILE]</code></td><td>writes all series, or those matching <code>--series PATTERN</code>, in a time range with <code>--from</code> and <code>--to</code>; also while tsdbd runs</td></tr>
+<tr><td><code>query SERIES START END [what] [group]</code></td><td>raw points, or <code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>avg</code>, <code>all</code>, <code>range</code>, <code>stddev_pop</code>, <code>stddev_samp</code>, <code>var_pop</code>, <code>var_samp</code> per group</td></tr>
+<tr><td><code>query SERIES START END lttb N</code></td><td>N points that keep the shape of the line, for charts</td></tr>
+<tr><td><code>query SERIES START END twa [group]</code></td><td>time-weighted average; <code>--linear</code> for straight lines between readings, <code>--max-gap INTERVAL</code> for the longest silence that still counts</td></tr>
+<tr><td><code>create SERIES [PATH] [--type T]</code></td><td>creates a series of type float32, float64, int64, bool or state, in volume PATH if given</td></tr>
+<tr><td><code>series</code></td><td>lists the series with their type and volume</td></tr>
+<tr><td><code>volume add PATH</code>, <code>volume list</code></td><td>adds or lists <a href="operations.html#volumes">volumes</a></td></tr>
+<tr><td><code>stats</code></td><td>rows, parts, size and compression ratio</td></tr>
+<tr><td><code>parts</code></td><td>lists the parts (the files the data is in)</td></tr>
+<tr><td><code>optimize</code></td><td>merges every partition into one part</td></tr>
+<tr><td><code>drop-before TIME</code></td><td>drops whole partitions that end before TIME</td></tr>
+<tr><td><code>delete SERIES START END</code></td><td>deletes the series' values in <code>[START, END)</code></td></tr>
+<tr><td><code>retention SERIES [AGE|off]</code></td><td>shows or sets how long the series keeps values, such as <code>30d</code> or <code>12h</code>; <code>off</code> keeps them for ever</td></tr>
+<tr><td><code>user ...</code></td><td>adds, changes and lists the users who may log in to tsdbd; see <a href="#users">below</a></td></tr>
+</tbody></table></div>
+
+<h2 id="users">Users</h2>
+<p>tsdbd lets in only clients that log in, and it does not start until the database has a superuser, a user who may
+do everything. <code>tsdb DIR user</code> changes the file <code>USERS</code> in the database directory. It works while
+tsdbd runs: the server sees a change within a second.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+<tbody>
+<tr><td><code>user add NAME [--superuser]</code></td><td>adds a user, a superuser with <code>--superuser</code>; it asks for the password</td></tr>
+<tr><td><code>user passwd NAME</code></td><td>sets a new password</td></tr>
+<tr><td><code>user drop NAME</code></td><td>removes a user; its open connections are closed. Dropping the last superuser only warns, but tsdbd then does not start again until there is one</td></tr>
+<tr><td><code>user alter NAME --superuser|--no-superuser</code></td><td>makes a user a superuser or takes that away</td></tr>
+<tr><td><code>user grant NAME RIGHTS SELECTOR</code></td><td>gives rights on the series the selector matches</td></tr>
+<tr><td><code>user revoke NAME RIGHTS SELECTOR</code></td><td>takes them away again</td></tr>
+<tr><td><code>user list</code></td><td>lists the users with their rights</td></tr>
+<tr><td><code>user compact</code></td><td>rewrites <code>USERS</code> with only what is current: every change is added at its end, so the file grows</td></tr>
+</tbody></table></div>
+<ul>
+<li><strong>Rights:</strong> <code>read</code>, <code>insert</code>, <code>delete</code>, <code>admin</code>, and
+<code>write</code> for insert and delete; several with commas, such as <code>read,insert</code>.</li>
+<li><strong>Selectors:</strong> <code>all</code>; <code>prefix:acme/</code>, the names that start with
+<code>acme/</code>; <code>name:pump7.flow</code>, one series; <code>glob:acme/*/temp?</code>, the names the pattern
+matches (<code>*</code> is any text, <code>?</code> one byte, <code>\</code> takes the next byte as it is). A series a
+user may not touch answers like a series that does not exist.</li>
+<li><strong>Passwords</strong> are never taken from the command line, where other users could see them:
+<code>--password-file FILE</code> reads the first line of FILE, else the variable <code>TSDB_PASSWORD</code>, else
+<code>tsdb</code> asks without showing what you type.</li>
+</ul>
+<p>A user for a collector that may only add data under <code>acme/</code>:</p>
+<pre><code class="language-sh" data-block="2" data-src="README.md#Users and logins">build/tsdb /data/sensors user add acme/ingest --password-file /etc/tsdb/acme-ingest.password
+build/tsdb /data/sensors user grant acme/ingest insert prefix:acme/
+build/tsdb /data/sensors user list</code></pre>
+<p>A user with <code>admin</code> on a prefix manages the users whose names start with it. It does that through a
+running tsdbd, so it needs no access to the server's files: add <code>--server HOST:PORT --login NAME</code> (the
+login's password comes from <code>--login-password-file FILE</code>, else <code>TSDB_LOGIN_PASSWORD</code>, else the
+terminal). <code>tsdb user whoami --server HOST:PORT --login NAME</code> shows that user's rights.</p>
+<pre><code class="language-sh" data-block="3" data-src="README.md#Users and logins">build/tsdb /data/sensors user add acme/admin --password-file /etc/tsdb/acme-admin.password
+build/tsdb /data/sensors user grant acme/admin admin prefix:acme/
+# from any machine that reaches tsdbd, as acme/admin (it asks for acme/admin's password, then the new one):
+build/tsdb user add acme/dashboard --server db1:7070 --login acme/admin
+build/tsdb user grant acme/dashboard read prefix:acme/ --server db1:7070 --login acme/admin</code></pre>
+
+<h2 id="query-options">Query options</h2>
+<ul>
+<li><code>--desc</code>: newest first.</li>
+<li><code>--limit N</code>: at most N rows or buckets. With <code>--desc</code>, "the last 10 hours" reads about 10
+hours of data.</li>
+<li><code>--tz ZONE</code>: calendar groups in a time zone, such as <code>Europe/Oslo</code>. The default is UTC.</li>
+</ul>
+
+<h2 id="times">Times and groups</h2>
+<ul>
+<li><strong>Times:</strong> <code>1700000000000</code> (milliseconds), <code>2024-01-31</code>,
+<code>"2024-01-31 12:00:00.250"</code>, <code>2024-01-31T12:00:00Z</code>, <code>now</code>, <code>now-1h</code>,
+<code>min</code>, <code>max</code>. A range is <code>[start, end)</code>.</li>
+<li><strong>Fixed groups:</strong> <code>500ms</code>, <code>10s</code>, <code>15m</code>, <code>6h</code>.</li>
+<li><strong>Calendar groups:</strong> <code>1d</code>, <code>1w</code>, <code>1mo</code>, <code>1q</code>,
+<code>1y</code>, in the zone of <code>--tz</code>.</li>
+</ul>
+<p>The output is tab-separated text, as ClickHouse's client prints it, with times in UTC. After the rows it prints how
+many there were, how long the query took and what it read.</p>
+
+<h2 id="example">An example</h2>
+<p>Steps 3 and 4 of the quick start load a day of readings and ask for them in three ways:</p>
+<pre><code class="language-sh" data-src="README.md#@# 3. Put it..# 5. The same"># 3. Put it in a database. A database is just a directory; tsdb creates it.
+build/tsdb /tmp/tsdb-qs/db import &lt; /tmp/tsdb-qs/rows.csv
+
+# 4. Ask for it: the first 3 rows, the average of every hour, and a summary of every day in Oslo.
+build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-02 raw --limit 3
+build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-02 avg 1h
+build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-03 all 1d --tz Europe/Oslo</code></pre>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="clients.html"><span>Previous</span>Clients</a><a class="next" href="server.html"><span>Next</span>The server, tsdbd</a></nav></main>
+</div>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source: the server and the engine under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">GNU AGPL-3.0</a> (a commercial licence is available), the client libraries under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSES/Apache-2.0.txt">Apache License 2.0</a>; <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSING.md">which is which</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+</body>
+</html>
