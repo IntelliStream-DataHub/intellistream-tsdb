@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* The watchdog of tests/watchdog.h: (1) it starts no thread (a test that forks a child which starts threads dies under
  * ThreadSanitizer when the parent has a second thread: that broke `make tsan` for every such test), (2) a child that
- * outlives it exits with status 124 and says which test hung, (3) a child that finishes in time is left alone, (4) on a
- * machine busy for minutes (a fake pressure file) the deadline is renewed twice, on an idle one it is not. */
+ * outlives it exits with status 124 and says which test hung, (3) a child that finishes in time is left alone, (4) the
+ * deadline is fixed: it ends the child at its first expiry, never renewed (the machine's load is not asked), and
+ * TH_WATCHDOG_SCALE multiplies it (the CI job's way to give a slow runner more time). */
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,8 +44,8 @@ static int threads_now(void)
 #endif
 }
 
-/* This test's own bound: a watchdog that renews its deadline without limit (the planted TH_WATCH_EXTENSIONS 1000000)
- * would leave the children below sleeping and this test waiting for them for ever, and a job with it. It is SIGALRM
+/* This test's own bound: a watchdog that never ends its child (disarmed, or renewing for ever) would leave the children
+ * below sleeping and this test waiting for them for ever, and a job with it. It is SIGALRM
  * (the watchdog under test uses SIGRTMIN) and a child dies with its parent. */
 static void own_bound(int sig)
 {
@@ -63,21 +64,12 @@ static void die_with_parent(void)
 #endif
 }
 
-static int count_str(const char *hay, const char *needle)
-{
-    int n = 0;
-    for (const char *p = hay; (p = strstr(p, needle)); p += strlen(needle))
-        n++;
-    return n;
-}
-
 int main(void)
 {
     signal(SIGALRM, own_bound);
     alarm((unsigned)(60 * TH_SAN_SCALE));
     /* the parent does not have a watchdog of its own here: the children arm one each. The first child's message goes
      * to a pipe: it starts with "FAIL" (it is what a hung test prints), and a passing run must not print that. */
-    setenv("TH_WATCHDOG_PSI", "/nonexistent", 1); /* an idle machine, whatever the real one is doing */
     int pf[2];
     CHECK(pipe(pf) == 0);
     pid_t pid = fork();
@@ -108,16 +100,9 @@ int main(void)
         fprintf(stderr, "the watchdog's message names no test or no hang: \"%s\"\n", msg);
         failures++;
     }
-    /* a busy machine (a fake pressure file) renews the deadline twice: the child ends after three deadlines, with the
-     * note; an idle one (the same file with a low number) ends at the first */
-    for (int busy = 0; busy < 2; busy++) {
-        char psi[] = "/tmp/test_watchdog_psi.XXXXXX";
-        int fd = mkstemp(psi);
-        CHECK(fd >= 0);
-        const char *txt = busy ? "some avg10=90.00 avg60=90.00 avg300=87.31 total=1\n"
-                               : "some avg10=0.00 avg60=0.00 avg300=2.10 total=1\n";
-        CHECK(write(fd, txt, strlen(txt)) == (ssize_t)strlen(txt));
-        close(fd);
+    /* the deadline is fixed: a child with a 1 s deadline ends after 1 s (times the sanitizer's scale), though the machine
+     * is as busy as can be (nothing of it is read), and TH_WATCHDOG_SCALE=2 makes it 2 s */
+    for (int scale = 1; scale <= 2; scale++) {
         int pe[2];
         CHECK(pipe(pe) == 0);
         struct timespec t0, t1;
@@ -127,8 +112,9 @@ int main(void)
             die_with_parent();
             close(pe[0]);
             dup2(pe[1], 2);
-            setenv("TH_WATCHDOG_PSI", psi, 1);
-            th_watchdog("test_watchdog pressure child", 1);
+            if (scale == 2)
+                setenv("TH_WATCHDOG_SCALE", "2", 1);
+            th_watchdog("test_watchdog fixed child", 1);
             for (;;)
                 sleep(1);
         }
@@ -136,24 +122,15 @@ int main(void)
         CHECK(waitpid(pid, &st, 0) == pid);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double took = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
-        double one = (double)TH_SAN_SCALE;
+        double one = (double)TH_SAN_SCALE * scale;
         got = read(pe[0], msg, sizeof msg - 1);
         msg[got > 0 ? got : 0] = 0;
         close(pe[0]);
-        unlink(psi);
         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 124);
-        CHECK(strstr(msg, "pressure child: watchdog: still running after"));
-        if (busy) {
-            CHECK(took >= 2.9 * one); /* three deadlines: the first two renewed */
-            CHECK(took < 3.9 * one);  /* and no third renewal: five renewals, or none ever, take longer */
-            /* exactly two notes, each naming the test and the pressure it read (87 here), and the last line is the hang */
-            CHECK(count_str(msg, "the machine is busy") == 2);
-            CHECK(count_str(msg, "watchdog: test_watchdog pressure child: the machine is busy (CPU pressure avg300 87%)") == 2);
-            CHECK(strstr(msg, "(renewal 1 of 2)") && strstr(msg, "(renewal 2 of 2)") && !strstr(msg, "(renewal 3"));
-        } else {
-            CHECK(took < 2.0 * one);
-            CHECK(!strstr(msg, "the machine is busy"));
-        }
+        CHECK(strstr(msg, "fixed child: watchdog: still running after"));
+        CHECK(took >= 0.95 * one); /* not before its deadline */
+        CHECK(took < 1.9 * one);   /* and not renewed: a second deadline would take twice as long */
+        CHECK(!strstr(msg, "busy") && !strstr(msg, "renewal"));
     }
     pid = fork();
     if (pid == 0) {

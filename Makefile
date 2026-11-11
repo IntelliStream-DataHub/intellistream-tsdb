@@ -304,9 +304,8 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
-test-units-b: $(B)/test_watchdog $(B)/test_busy $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
+test-units-b: $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_watchdog
-	./$(B)/test_busy $(SCRATCH)
 	./$(B)/test_group $(SCRATCH)
 	./$(B)/test_lttb $(SCRATCH)
 	B=$(B) tests/test_cli_lttb.sh
@@ -918,13 +917,9 @@ $(B)/test_group: tests/test_group.c $(LIB)
 $(B)/test_watchdog: tests/test_watchdog.c tests/watchdog.h | $(B)
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
-$(B)/test_busy: tests/test_busy.c tests/busy.h tests/watchdog.h | $(B)
-	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
-
 # the test headers are prerequisites of every test that includes them (a changed watchdog or seed rebuilds them)
 $(patsubst tests/%.c,$(B)/%,$(shell grep -l 'watchdog.h' tests/*.c)): tests/watchdog.h
 $(patsubst tests/%.c,$(B)/%,$(shell grep -l 'seed.h' tests/*.c)): tests/seed.h
-$(patsubst tests/%.c,$(B)/%,$(shell grep -l 'busy.h' tests/*.c)): tests/busy.h
 
 $(B)/test_twa: tests/test_twa.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1021,13 +1016,13 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 	        --seconds $(call jsec,20) --crashfs $(B)/libcrashfs.so || exit 1; done
 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
-# power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too, and so does one that does
-# nothing, kills once and then sleeps, naps 5 s or 9 s at a time, or never pulls the plug itself and only restarts the
-# servers that died by themselves (--mutant-nemesis nothing|once|nap:MS|never|oncereact). The last two need servers
-# that are alive when the nemesis looks: on a fast file system (tmpfs) crashfs's loss rate of 0.0005 per operation ends
-# every server within milliseconds, an honest nemesis finds none either, and the case cannot be told from an honest run;
-# so they run at a sixteenth of the rate (JEPSEN_CRASH_PROB) and again while they found fewer than 8 live servers. A tsdbd with a stale
-# entry in its latest table (three mutants, built from a copy of the tree) fails the kv run's latest check.
+# power run, and so does a server that hangs (SIGSTOP: a pulled plug never ends it; it is reported, not counted as a
+# pull), and a power run whose nemesis is idle: it does nothing, kills once and then sleeps, naps 9 s at a time, never
+# pulls the plug (never, oncereact), sleeps through its naps (--mutant-idle, --mutant-longnap) or sleeps inside its fault
+# step, with the server dead or with the new one up (deadsleep:MS, busysleep:MS). Each runs once and must fail: no case is
+# repeated until it does. The nemesis counts the faults it issues itself and the time a server lay dead (jepsen.c,
+# nemesis_check). A tsdbd with a stale entry in its latest table (three mutants, built from a copy of the tree) fails the
+# kv run's latest check.
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
@@ -1049,28 +1044,19 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-selftest: servers that start slowly made an honest nemesis look idle (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	for try in 1 2 3; do \
-	    out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 10 --crashfs $(B)/libcrashfs.so \
-	        --mutant-idle 2>&1); rc=$$?; \
-	    echo "$$out" | grep -q 'nemesis: 0 server deaths seen while napping' || break; done; \
-	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'it was idle'; then \
-	        echo "jepsen-selftest: a nemesis that sleeps through its naps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	for try in 1 2 3; do \
-	    out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 30 --crashfs $(B)/libcrashfs.so \
-	        --mutant-longnap 2>&1); rc=$$?; \
-	    echo "$$out" | grep -q 'nemesis: 0 server deaths seen while napping' || break; done; \
-	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'it was idle'; then \
-	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	for spec in 'nothing|it was idle|' 'once|it was idle|' 'nap:9000|it was idle|' 'never|injected too little|0.00003' \
-	    'oncereact|injected too little|0.00003'; do \
-	    m=$${spec%%|*}; rest=$${spec#*|}; want=$${rest%%|*}; prob=$${rest#*|}; \
-	    for try in 1 2 3; do \
-	        out=$$(env $${prob:+JEPSEN_CRASH_PROB=$$prob} ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
-	            --seconds 20 --crashfs $(B)/libcrashfs.so --mutant-nemesis $$m 2>&1); rc=$$?; \
-	        [ -z "$$prob" ] || ! echo "$$out" | grep -q ' of [0-7] live servers found' && break; done; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "$$want"; then \
-	        echo "jepsen-selftest: a nemesis that is '$$m' went unnoticed (rc $$rc, wanted rc 1 and '$$want')"; echo "$$out" | tail -n 20; exit 1; fi; \
+	for spec in 'nothing|20' 'once|20' 'nap:9000|20' 'never|20' 'oncereact|20' 'deadsleep:1500|20' 'busysleep:1500|20' \
+	    'idle|20' 'longnap|30'; do \
+	    m=$${spec%%|*}; secs=$${spec#*|}; \
+	    case $$m in idle) flag=--mutant-idle;; longnap) flag=--mutant-longnap;; *) flag="--mutant-nemesis $$m";; esac; \
+	    out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds $$secs --crashfs $(B)/libcrashfs.so \
+	        $$flag 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'it was idle'; then \
+	        echo "jepsen-selftest: a nemesis that is '$$m' went unnoticed (rc $$rc, wanted rc 1 and 'it was idle')"; echo "$$out" | tail -n 20; exit 1; fi; \
 	done; \
+	out=$$(JEPSEN_TSDBD=tests/jepsen/hang-tsdbd.sh timeout 300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
+	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'it is hung'; then \
+	        echo "jepsen-selftest: a server that hangs after a power pull went unnoticed or was counted as a pull (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 

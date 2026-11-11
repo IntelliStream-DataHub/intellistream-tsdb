@@ -26,7 +26,7 @@
 #include "tsdb.h"
 #include "tsdb_client.h"
 #include <limits.h>
-#include "busy.h"
+#include "watchdog.h"
 #include "harness.h"
 #include "outagefs_ctl.h"
 
@@ -38,12 +38,17 @@
 #include <sys/wait.h>
 #include <time.h>
 
-/* CHECK: a verdict about the code (a lost or visible-after-refusal row, a wrong answer): fails the run at once.
- * CHECK_T: "within N ms" (a state reached, a refusal fast enough, throughput): excused only by this run's own evidence
- * of load. CHECK_D: reads what a timed wait was to bring about (busy.h). */
-#define CHECK(cond) TH_CHECK(cond)
-#define CHECK_T(cond) TH_CHECK_T(cond)
-#define CHECK_D(cond) TH_CHECK_D(cond)
+/* Every check is a verdict: nothing is run again and no failure is excused by a busy machine. A bound on a time is
+ * what tsdb promises (a refusal instead of a wait, another volume going on), at the width of the outage here (6 s), not
+ * what one machine happened to take. */
+static int failures;
+#define CHECK(cond)                                                                                                    \
+    do {                                                                                                               \
+        if (!(cond)) {                                                                                                 \
+            fprintf(stderr, "%s:%d: FAILED: %s\n", __FILE__, __LINE__, #cond);                                        \
+            failures++;                                                                                                \
+        }                                                                                                              \
+    } while (0)
 
 static char ctl[256], root[512];
 static int port;
@@ -201,7 +206,7 @@ typedef struct side {
     int64_t refused[20000];
     _Atomic int64_t nrefused;       /* UNAVAILABLE: not applied */
     _Atomic int64_t maybe, worst_ok_ms; /* indeterminate answers; the slowest acknowledged call */
-    int refused_fast;               /* UNAVAILABLE answers that came in under 500 ms */
+    int refused_fast;               /* UNAVAILABLE answers that came in under 2 s */
 } side;
 
 static side sa, sb;
@@ -279,7 +284,7 @@ static void *writer(void *arg)
                 s->refused[n] = ts;
                 atomic_store(&s->nrefused, n + 1);
             }
-            if (dt < 500)
+            if (dt < 2000)
                 s->refused_fast++;
             msleep(20);
         } else {
@@ -332,7 +337,7 @@ static int has(const seen *s, int64_t ts)
 static void verify(const char *what, side *s)
 {
     tsdbc *c;
-    CHECK_T(connect_noretry("127.0.0.1", port, 3000, &c) == 0);
+    CHECK(connect_noretry("127.0.0.1", port, 3000, &c) == 0);
     if (!c)
         return;
     /* The writers go on while this runs: judge only what was acknowledged or refused before the read began (a row
@@ -349,7 +354,7 @@ static void verify(const char *what, side *s)
     }
     if (rc) {
         fprintf(stderr, "%s: %s: read back failed: %d\n", what, s->name, rc);
-        th_fail_plain(__FILE__, __LINE__, "the read back of the history");
+        CHECK(!"the read back of the history");
     }
     int64_t lost = 0, ghost = 0;
     for (int64_t i = 0; i < nacked; i++)
@@ -438,17 +443,13 @@ static int await_writes(side *s, int timeout_ms)
     return rc;
 }
 
-static int run_test(int argc, char **argv);
-int main(int argc, char **argv) { return th_run_retrying("test_outage", argc, argv, run_test); }
-
-static int run_test(int argc, char **argv)
+int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
     const char *names[] = {"a", "b", "c"};
     if (outagefs_reexec(argv, base, names, 3) != 0)
         return 1;
     th_watchdog("test_outage", 900);
-    th_gauge_start(base);
     const char *dir_a = outagefs_dir("a"), *dir_b = outagefs_dir("b"), *dir_c = outagefs_dir("c");
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
     snprintf(root, sizeof root, "%s.root", getenv("OUTAGEFS_CTL"));
@@ -483,11 +484,10 @@ static int run_test(int argc, char **argv)
     make_users(root);
 
     server = start_server(dir_a, dir_b, dir_c);
-    th_gauge_watch_pid(server);
     {
         tsdbc *tc;
         tsdbc_topo *topo = NULL;
-        CHECK_T(connect_noretry("127.0.0.1", port, 3000, &tc) == 0 && tc);
+        CHECK(connect_noretry("127.0.0.1", port, 3000, &tc) == 0 && tc);
         CHECK(tc && tsdbc_topology(tc, &topo) == 0 && topo);
         unsigned va = TSDB_SID_VOLUME(sa.id), found = 0;
         for (size_t i = 0; topo && i < topo->nvols; i++)
@@ -506,8 +506,9 @@ static int run_test(int argc, char **argv)
     pthread_t ta, tb;
     pthread_create(&ta, NULL, writer, &sa);
     pthread_create(&tb, NULL, writer, &sb);
-    msleep(1500);
-    CHECK_T(sa.nacked > 10 && sb.nacked > 10);
+    for (int i = 0; i < 300 && !(sa.nacked > 10 && sb.nacked > 10); i++) /* both are writing: a count, not a time */
+        msleep(100);
+    CHECK(sa.nacked > 10 && sb.nacked > 10);
 
     /* 0. a busy volume with its domain UP refuses nothing (more callers than the four a hung one may hold) */
     pthread_t xs[16];
@@ -519,8 +520,8 @@ static int run_test(int argc, char **argv)
         pthread_join(xs[i], NULL);
     fprintf(stderr, "busy: %lld ok, %lld unavailable, %lld other\n", (long long)extra_ok, (long long)extra_unavail,
             (long long)extra_other);
-    CHECK_T(extra_ok > 100);
-    CHECK_T(extra_unavail == 0);
+    CHECK(extra_ok > 10); /* the callers worked (the check that matters is the next one) */
+    CHECK(extra_unavail == 0);
     atomic_store(&stop_extra, false);
     extra_ok = extra_unavail = extra_other = 0;
 
@@ -530,17 +531,17 @@ static int run_test(int argc, char **argv)
     for (int i = 0; i < 16; i++) /* packed inserts to A: they hang inside it, and must not take every worker */
         pthread_create(&xs[i], NULL, extra_main, (void *)(intptr_t)(1000 + i));
     /* past the DOWN threshold (2.5 s here); A's own writer is inside a hung call until the heal */
-    CHECK_T(await_status(key_dom_state, "down", 30000) >= 0);
+    CHECK(await_status(key_dom_state, "down", 30000) >= 0);
     /* a request that arrives now is refused at once: DOWN quiesces the volume, and at most four wait inside it */
     tsdbc *pc;
-    CHECK_T(connect_noretry("127.0.0.1", port, 3000, &pc) == 0);
+    CHECK(connect_noretry("127.0.0.1", port, 3000, &pc) == 0);
     for (int i = 0; i < 3 && pc; i++) {
         int64_t ts = 2000000000 + i;
         float v = 1;
         double t0 = now_ms();
         int rc = tsdbc_insert_series(pc, sa.id, &ts, &v, 1);
-        CHECK_D(rc == TSDB_ERR_UNAVAILABLE);
-        CHECK_T(now_ms() - t0 < 500);
+        CHECK(rc == TSDB_ERR_UNAVAILABLE);
+        CHECK(now_ms() - t0 < 2000); /* refused, not held: the volume is DOWN, and a held call waits for the outage (6 s here) */
     }
     if (pc)
         tsdbc_close(pc);
@@ -548,7 +549,7 @@ static int run_test(int argc, char **argv)
      * unpacked insert of many series (the packed one checked rights first) */
     {
         tsdbc *wc;
-        CHECK_T(oconnect_as("weak", WEAK_PW, 3000, &wc) == 0);
+        CHECK(oconnect_as("weak", WEAK_PW, 3000, &wc) == 0);
         if (wc) {
             CHECK(tsdbc_set_compression(wc, 0) == 0);
             tsdb_sid ids[2] = {sa.id, sa.id};
@@ -562,17 +563,17 @@ static int run_test(int argc, char **argv)
         }
     }
     msleep(2500);
-    CHECK_T(sb.nacked - b_before > 100);          /* B kept writing */
+    CHECK(sb.nacked - b_before > 10);           /* B kept writing */
     /* and at its latency: the packed inserts of A may hold every worker until the domain is seen to be in trouble
-     * (about a second), but not the whole outage (6 s here, as it was when they were not counted) */
-    CHECK_T(sb.worst_ok_ms < 3000);
+     * (about a second), but not the whole outage (6 s here) */
+    CHECK(sb.worst_ok_ms < 5000);
     CHECK(sa.nacked - a_before <= 1);           /* nothing on A was acknowledged while it hung */
     CHECK(alive());
     atomic_store(&stop_extra, true);
     CHECK(fault("heal", dir_a, NULL) == 0);
     for (int i = 0; i < 16; i++)
         pthread_join(xs[i], NULL);
-    CHECK_T(await_writes(&sa, 30000) == 0);
+    CHECK(await_writes(&sa, 30000) == 0);
     msleep(1000);
     CHECK(alive());
     verify("hang", &sa);
@@ -583,17 +584,17 @@ static int run_test(int argc, char **argv)
     CHECK(fault("eio", dir_a, NULL) == 0);
     /* until the domain is DOWN (state, not a fixed 4 s: the check below means "while A is failing", and a slow
      * machine that had not noticed yet would pass it for nothing), then a moment for calls already inside A */
-    CHECK_T(await_status(key_dom_state, "down", 30000) >= 0);
+    CHECK(await_status(key_dom_state, "down", 30000) >= 0);
     msleep(500);
     CHECK(alive());
     CHECK(sa.nacked - a_mid <= 1);
     CHECK(fault("heal", dir_a, NULL) == 0);
-    CHECK_T(await_writes(&sa, 40000) == 0);
+    CHECK(await_writes(&sa, 40000) == 0);
     msleep(1000);
     CHECK(alive());
     int64_t a_after = sa.nacked;
     msleep(1500);
-    CHECK_T(sa.nacked > a_after); /* writes go on */
+    CHECK(sa.nacked > a_after); /* writes go on */
 
     /* 2b. the kernel drops the pages of a failed writeback (fsyncgate): writes on A are thrown away, the first fsync
      * of each descriptor fails and later ones succeed. A volume that retried its fsync would acknowledge rows that
@@ -602,12 +603,12 @@ static int run_test(int argc, char **argv)
     CHECK(fault("eiodrop", dir_a, NULL) == 0);
     /* until A is seen to fail, not a fixed 3 s: here the domain may stay UP (the volume fail-stops and cannot reopen
      * over the dropped pages: "reopen failed, will retry"), so the volume's own health says it */
-    CHECK_T(await_status(key_vol_health, "!available", 30000) >= 0);
+    CHECK(await_status(key_vol_health, "!available", 30000) >= 0);
     msleep(500);
     CHECK(alive());
     CHECK(sa.nacked - a_drop <= 1);
     CHECK(fault("heal", dir_a, NULL) == 0);
-    CHECK_T(await_writes(&sa, 40000) == 0);
+    CHECK(await_writes(&sa, 40000) == 0);
     msleep(1500);
 
     atomic_store(&stop_writers, true);
@@ -619,7 +620,6 @@ static int run_test(int argc, char **argv)
     kill(server, SIGKILL);
     waitpid(server, NULL, 0);
     server = start_server(dir_a, dir_b, dir_c);
-    th_gauge_watch_pid(server);
     verify("restart", &sa);
     verify("restart", &sb);
 
@@ -633,15 +633,15 @@ static int run_test(int argc, char **argv)
         int calls0 = slow_calls;
         msleep(1000);
         fprintf(stderr, "slow reader: %d batches a second\n", slow_calls - calls0);
-        CHECK_T(slow_calls > calls0); /* it reads, steadily: the send timeout is not what ends it */
+        CHECK(slow_calls > calls0); /* it reads, steadily: the send timeout is not what ends it */
         CHECK(fault("hang", dir_a, NULL) == 0);
-        CHECK_T(await_status(key_dom_state, "down", 30000) >= 0); /* DOWN at 2.5 s */
+        CHECK(await_status(key_dom_state, "down", 30000) >= 0); /* DOWN at 2.5 s */
         msleep(1500); /* then the next 1 s look of the waiting worker */
         CHECK(fault("heal", dir_a, NULL) == 0);
         int rc = await_writes(&sa, 25000);
         if (rc)
             fprintf(stderr, "A did not recover while a slow client streams from it: %d\n", rc);
-        CHECK_T(rc == 0);
+        CHECK(rc == 0);
         fprintf(stderr, "slow reader: %d batches in all\n", (int)slow_calls);
         atomic_store(&slow_stop, true);
         pthread_join(sr, NULL);
@@ -652,31 +652,25 @@ static int run_test(int argc, char **argv)
      * RECOVERING has to be answered. It stayed DOWN for good, and with it the server's count of requests that wait. */
     {
         CHECK(fault("hang", dir_c, NULL) == 0);
-        CHECK_T(await_status("domain.2.state", "down", 30000) >= 0);
+        CHECK(await_status("domain.2.state", "down", 30000) >= 0);
         CHECK(fault("heal", dir_c, NULL) == 0);
         double ms = await_status("domain.2.state", "up", 15000);
         fprintf(stderr, "domain C (no volume): up %.0f ms after the heal\n", ms);
-        CHECK_T(ms >= 0);
+        CHECK(ms >= 0);
     }
 
     /* 3. a part of A lost while A is down: DIVERGED, and a second outage does not resume it */
     {
         tsdbc *c;
-        CHECK_T(connect_noretry("127.0.0.1", port, 3000, &c) == 0);
-        /* the rows so far are in parts. A volume that no fault touched may be UNAVAILABLE for a moment on a busy
-         * machine (its domain's probes starved: "b: 2 -> 3" in the log of a gate that failed here, 2:0>1 in
-         * test_health's), so an answer of UNAVAILABLE is asked again for up to 30 s; any other answer is final. */
+        CHECK(connect_noretry("127.0.0.1", port, 3000, &c) == 0);
+        /* the rows so far are in parts: a flush of a volume nothing touched is answered, not refused (a probe starved
+         * by the machine would send it UNAVAILABLE, and that fails the test: it is asked about, never asked again) */
         int frc = c ? tsdbc_flush(c) : -1;
-        for (int i = 0; c && frc == TSDB_ERR_UNAVAILABLE && i < 300; i++) {
-            usleep(100000);
-            frc = tsdbc_flush(c);
-        }
         if (frc != 0)
             fprintf(stderr, "flush before the part loss answered %d\n", frc);
-        CHECK(frc == 0 || frc == TSDB_ERR_UNAVAILABLE); /* any other answer is final */
-        CHECK_T(frc != TSDB_ERR_UNAVAILABLE);
+        CHECK(frc == 0);
         CHECK(fault("hang", dir_a, NULL) == 0);
-        CHECK_T(await_status(key_dom_state, "down", 30000) >= 0);
+        CHECK(await_status(key_dom_state, "down", 30000) >= 0);
         /* without the shim in the child: its init would take over the control socket */
         char cmd[PATH_MAX + 64];
         snprintf(cmd, sizeof cmd, "rm -f '%s'/p*.part", dir_a);
@@ -690,57 +684,56 @@ static int run_test(int argc, char **argv)
         CHECK(rm > 0 && waitpid(rm, &rst, 0) == rm && WIFEXITED(rst) && WEXITSTATUS(rst) == 0);
         CHECK(fault("heal", dir_a, NULL) == 0);
         /* RECOVERING, the reopen, the report: A's reason becomes DIVERGED, not just "refused" */
-        CHECK_T(await_status(key_vol_reason, "diverged", 60000) >= 0);
+        CHECK(await_status(key_vol_reason, "diverged", 60000) >= 0);
         int64_t ts = 4000000000LL;
         float v = 1;
         int rc = c ? tsdbc_insert_series(c, sa.id, &ts, &v, 1) : -1;
-        CHECK_D(rc == TSDB_ERR_UNAVAILABLE);
+        CHECK(rc == TSDB_ERR_UNAVAILABLE);
         tsdb_unavail ue[4];
         unsigned nue = 0;
-        CHECK_D(c && tsdbc_unavailable(c, ue, 4, &nue) == 0 && nue >= 1 && ue[0].reason == TSDB_WHY_DIVERGED);
+        CHECK(c && tsdbc_unavailable(c, ue, 4, &nue) == 0 && nue >= 1 && ue[0].reason == TSDB_WHY_DIVERGED);
         CHECK(fault("hang", dir_a, NULL) == 0);
-        CHECK_T(await_status(key_dom_state, "down", 30000) >= 0);
+        CHECK(await_status(key_dom_state, "down", 30000) >= 0);
         CHECK(fault("heal", dir_a, NULL) == 0);
         /* The domain is UP again (its only volume is diverged and has no thread to say so: the monitor's RECOVERING
          * is what sets it, after the heal and the 3 s a flapping domain waits here (flap=: A had its third DOWN; that wait is
          * 60 s by default, which the first run of this check took for the bug); it stayed DOWN for good). */
         double up_ms = await_status(key_dom_state, "up", 15000);
         fprintf(stderr, "domain A (its only volume DIVERGED): up %.0f ms after the second heal\n", up_ms);
-        CHECK_T(up_ms >= 0);
+        CHECK(up_ms >= 0);
         /* A stays DIVERGED: a second recovery must not resume it, as it once did. Resuming would show after the UP
          * (a write is acknowledged), so the refusals below are asked after two more recover periods. */
         msleep(3000);
-        CHECK_T(await_status(key_dom_state, "up", 1000) >= 0); /* no relapse */
+        CHECK(await_status(key_dom_state, "up", 1000) >= 0); /* no relapse */
         char why[64];
         tsdbc *sc;
-        CHECK_T(connect_noretry("127.0.0.1", port, 3000, &sc) == 0 && sc);
-        CHECK_D(sc && status_line(sc, key_vol_reason, why, sizeof why) && strcmp(why, "diverged") == 0);
+        CHECK(connect_noretry("127.0.0.1", port, 3000, &sc) == 0 && sc);
+        CHECK(sc && status_line(sc, key_vol_reason, why, sizeof why) && strcmp(why, "diverged") == 0);
         if (sc)
             tsdbc_close(sc);
         ts++;
         rc = c ? tsdbc_insert_series(c, sa.id, &ts, &v, 1) : -1;
-        CHECK_D(rc == TSDB_ERR_UNAVAILABLE);
+        CHECK(rc == TSDB_ERR_UNAVAILABLE);
         nue = 0;
-        CHECK_D(c && tsdbc_unavailable(c, ue, 4, &nue) == 0 && nue >= 1 && ue[0].reason == TSDB_WHY_DIVERGED);
+        CHECK(c && tsdbc_unavailable(c, ue, 4, &nue) == 0 && nue >= 1 && ue[0].reason == TSDB_WHY_DIVERGED);
         ts = 4000000100LL; /* B is untouched */
         rc = c ? tsdbc_insert_series(c, sb.id, &ts, &v, 1) : -1;
-        CHECK_T(rc == 0);
+        CHECK(rc == 0);
         if (c)
             tsdbc_close(c);
     }
     /* the history checks above judge what was refused; they must have had something to judge */
-    fprintf(stderr, "refused: A %lld (%d within 500 ms), B %lld; other answers on busy readers %lld\n",
+    fprintf(stderr, "refused: A %lld (%d within 2 s), B %lld; other answers on busy readers %lld\n",
             (long long)sa.nrefused, sa.refused_fast, (long long)sb.nrefused, (long long)extra_other);
-    CHECK_D(sa.nrefused > 0);
-    CHECK_T(sa.refused_fast > 0);
-    CHECK_T(sb.nrefused == 0); /* B never had an outage: a refusal there is a probe starved (DOWN needs 2.5 s stuck) */
-    CHECK_T(extra_other == 0);
+    CHECK(sa.nrefused > 0);
+    CHECK(sa.refused_fast > 0);
+    CHECK(sb.nrefused == 0); /* B never had an outage: a refusal there is a probe starved (DOWN needs 2.5 s stuck) */
+    CHECK(extra_other == 0);
     CHECK(alive());
     kill(server, SIGTERM);
     int st;
     waitpid(server, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
-    int rc = th_finish("test_outage");
-    fprintf(stderr, "test_outage: %s\n", rc ? "FAILED" : "ok");
-    return rc;
+    fprintf(stderr, "test_outage: %s\n", failures ? "FAILED" : "ok");
+    return failures ? 1 : 0;
 }

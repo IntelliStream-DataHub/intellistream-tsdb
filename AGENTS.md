@@ -578,6 +578,15 @@ cgroup, so `nice` does not keep your work out of its way.
 - Match the surrounding code: 4-space indent, lines up to about 120
   characters, `snake_case`, errors as negative `TSDB_ERR_*` codes.
 - Comments say why, not what; file headers describe the design of the file.
+- **A test never retries and never excuses a failure by the load of the machine** (the `tests/busy.h` mechanism is gone).
+  A correctness check and a timing check both fail when they fail; a bound on a time is what tsdb documents or promises
+  (the 60 s flapping rule, `--send-timeout`, a client's retry budget), a state that is only promised to come is a
+  condition wait with a generous bound, never a tuned number. The watchdog (`tests/watchdog.h`) has a fixed deadline
+  (`TH_WATCHDOG_SCALE` gives a CI job more). A red run on an overloaded machine is investigated; CI runs the timing-heavy
+  groups with fewer jobs at once. The jepsen nemesis is judged by what it counted itself (`nemesis_check` in
+  `tests/jepsen/jepsen.c`): faults issued (a plug pulled with SIGUSR2, a kill, an EIO armed, a pause...) for the length of
+  the run, no server left dead for long, no time idle inside its fault step; `make jepsen-selftest` plants the idle
+  nemeses and a hung server and requires each to fail.
 - New behaviour comes with a test, and with numbers if it is about speed or size
   (`build/codec-bench`, `build/tsdb-bench`, `build/insert-bench`, `build/tsdbc-bench`).
 - Comparisons with ClickHouse run it in **Podman** (never Docker), bound to
