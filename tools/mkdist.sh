@@ -24,7 +24,7 @@ done
 cp "$b/libcrashfs.so" "$stage/tests/" # the power-loss and EIO shim test_server preloads
 cp dist/run-tests.sh "$stage/tests/"
 cp tests/data/levels-golden.txt "$stage/tests/" # test_levels compares every level with these digests (found next to it)
-cp dist/tsdbd.service "$stage/systemd/"
+cp dist/tsdbd.service dist/tsdbd.properties "$stage/systemd/"
 cp dist/README.dist "$stage/README.dist"
 # The binaries contain zstd and liburing (linked statically): their licenses require that their notices
 # travel with them (dist/THIRD-PARTY-NOTICES). The AGPL LICENSE, NOTICE and LICENSING.md travel with every copy, and so

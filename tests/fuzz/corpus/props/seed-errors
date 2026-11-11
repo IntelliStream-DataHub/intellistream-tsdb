@@ -1,0 +1,5 @@
+storage.dir = /a
+storage.dir = /b
+server.port = x
+nope = 1
+server.io = \q

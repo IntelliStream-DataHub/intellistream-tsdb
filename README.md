@@ -428,6 +428,22 @@ build/tsdbd --dir /mnt/sensors --port 7070 --follow    # a read-only copy that f
 file and a rename, once the server serves) and the start-up line names the port: a script or test that starts a server
 reads the port from there instead of guessing a free one.
 
+Every option can also be a line in a `.properties` file: `tsdbd --config /etc/tsdb/tsdbd.properties` (that path is
+read by itself when it exists). Keys are dotted groups, lists are comma-separated, the command line wins over the file,
+and a mistake (an unknown key, a bad value) stops the server with the file and the line.
+
+```properties
+storage.dir = /var/lib/tsdb
+storage.verify.checksums = true
+server.port = 7070
+metrics.port = 9100
+health.domains = /mnt/nfs1, /mnt/nfs2
+```
+
+`tsdbd --config FILE --check-config` checks a file and prints every setting with where it came from;
+[docs/config.md](docs/config.md) has every key. The `tsdb` tool reads its connection settings
+(`client.server`, `client.login`) from `~/.config/tsdb/tsdb.properties`.
+
 On AlmaLinux and RHEL 10, where io_uring is disabled by default, tsdbd runs on epoll by itself
 (`--io auto`, the default; `--io epoll` skips the attempt) and says so when it starts;
 `make NO_URING=1` builds it without io_uring, so liburing need not be installed there.

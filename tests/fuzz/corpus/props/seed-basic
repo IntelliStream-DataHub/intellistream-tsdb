@@ -1,0 +1,10 @@
+# tsdbd
+storage.dir = /data/tsdb
+server.port = 7070
+server.io = epoll
+metrics.port = auto
+health.domains = /mnt/nfs1, /mnt/nfs2
+server.send.timeout = 5m
+storage.fsync = true
+latest.cache = 1G
+server.max.request.memory = 2G

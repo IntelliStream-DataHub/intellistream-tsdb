@@ -1,0 +1,6 @@
+storage.read.only = true
+storage.follow = false
+auth.enabled = false
+stats.enabled = false
+cluster.enabled = true
+cluster.read.barrier = off

@@ -1,0 +1,5 @@
+storage.dir: /a
+server.port 7071
+  server.workers	=	4
+! comment
+
