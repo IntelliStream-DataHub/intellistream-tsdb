@@ -321,6 +321,21 @@ int main(int argc, char **argv)
     dup2(efd, 2);
     close(efd);
     CHECK(cmd("slow", db, "700") == 0); /* every probe works, none within fast_ms (500) */
+    /* the line comes when the first slow probe ends: waited for (a condition, not a promised time: how long a
+     * probe takes on a loaded or instrumented machine is not tsdb's promise), then a few more slow probes must not
+     * add another */
+    char txt[4096] = {0};
+    int lines = 0;
+    for (int t = 0; t < LATE_MS && lines == 0; t += 50) {
+        nap(50);
+        FILE *f = fopen(errlog, "r");
+        size_t n = f ? fread(txt, 1, sizeof txt - 1, f) : 0;
+        txt[n] = 0;
+        if (f)
+            fclose(f);
+        for (const char *q = txt; (q = strstr(q, "start over")) != NULL; q++)
+            lines++;
+    }
     nap(3000);
     CHECK(tsdb_health_state(h, df) == TSDB_DOM_DOWN);
     CHECK(cmd("heal", db, NULL) == 0);
@@ -328,13 +343,12 @@ int main(int argc, char **argv)
     dup2(saved, 2);
     close(saved);
     {
-        char txt[4096] = {0};
         FILE *f = fopen(errlog, "r");
         size_t n = f ? fread(txt, 1, sizeof txt - 1, f) : 0;
         txt[n] = 0;
         if (f)
             fclose(f);
-        int lines = 0;
+        lines = 0;
         for (const char *q = txt; (q = strstr(q, "start over")) != NULL; q++)
             lines++;
         CHECK(lines == 1); /* the first slow probe of this DOWN, not one per probe */
