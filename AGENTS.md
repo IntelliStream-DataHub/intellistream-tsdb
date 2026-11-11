@@ -591,10 +591,14 @@ cgroup, so `nice` does not keep your work out of its way.
   (the 60 s flapping rule, `--send-timeout`, a client's retry budget), a state that is only promised to come is a
   condition wait with a generous bound, never a tuned number. The watchdog (`tests/watchdog.h`) has a fixed deadline
   (`TH_WATCHDOG_SCALE` gives a CI job more). A red run on an overloaded machine is investigated; CI runs the timing-heavy
-  groups with fewer jobs at once. The jepsen nemesis is judged by what it counted itself (`nemesis_check` in
-  `tests/jepsen/jepsen.c`): faults issued (a plug pulled with SIGUSR2, a kill, an EIO armed, a pause...) for the length of
-  the run, no server left dead for long, no time idle inside its fault step; `make jepsen-selftest` plants the idle
-  nemeses and a hung server and requires each to fail.
+  groups with fewer jobs at once. The jepsen nemesis is judged (`nemesis_check` in
+  `tests/jepsen/jepsen.c`, right after the run, before the final state and the history check) from the faults it issued, each
+  with its time (a kill, an EIO the shim logged in its mark file, a plug the shim logged in its pull file, a pause...):
+  a floor from the time a server was listening (at least a third of an honest rate, never below 3), one in each third of
+  the run, and from a watcher thread that polls the server pid every 50 ms on its own clock: no server dead for more than
+  300 ms, the final stretch up to the end of the run included; and no time idle inside its fault step.
+  `make jepsen-selftest` plants the idle nemeses (once, a burst and then asleep, naps that do not look, a shim that ignores
+  SIGUSR2) and a hung server and requires each to fail.
 - New behaviour comes with a test, and with numbers if it is about speed or size
   (`build/codec-bench`, `build/tsdb-bench`, `build/insert-bench`, `build/tsdbc-bench`).
 - Comparisons with ClickHouse run it in **Podman** (never Docker), bound to

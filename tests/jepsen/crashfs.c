@@ -33,6 +33,10 @@
  * or syncfs). If $CRASHFS_MARK is set, the path of the
  * file that failed is written there, so a harness knows the fault happened.
  *
+ * $CRASHFS_PULL_FILE: a power loss that a SIGUSR2 asked for appends "pid N power loss requested by SIGUSR2" there before
+ * the process exits (99), so a harness counts the plugs it pulled from what the shim did, not from what it sent.
+ * $CRASHFS_IGNORE_USR2=1 makes the shim ignore SIGUSR2 (a self-test of that count).
+ *
  * With CRASHFS_TEAR=1 a power loss keeps what a real disk may keep rather
  * than the least it must (each choice drawn from $CRASHFS_SEED):
  *  - of a file's unsynced appends, a random prefix: none, all, or up to a
@@ -194,10 +198,14 @@ REAL(mkdirat);
 REAL(ftruncate);
 
 static volatile sig_atomic_t usr2_seen; /* only a SIGUSR2 sets it: the power loss line says so (jepsen counts the nemesis's own) */
+static char pull_file[PATH_MAX];        /* $CRASHFS_PULL_FILE: a line per power loss that a SIGUSR2 asked for, written by the shim */
+static bool ignore_usr2;                /* $CRASHFS_IGNORE_USR2=1: a shim that does not honour the pull (jepsen's self-test of its count) */
 
 static void on_usr2(int sig)
 {
     (void)sig;
+    if (ignore_usr2)
+        return;
     usr2_seen = 1;
     crash_requested = 1;
 }
@@ -264,6 +272,9 @@ __attribute__((constructor)) static void init(void)
         snprintf(md_log, sizeof md_log, "%s", getenv("CRASHFS_MD_LOG"));
     if (md_mode)
         prob = 0;
+    if (getenv("CRASHFS_PULL_FILE"))
+        snprintf(pull_file, sizeof pull_file, "%s", getenv("CRASHFS_PULL_FILE"));
+    ignore_usr2 = getenv("CRASHFS_IGNORE_USR2") && atoi(getenv("CRASHFS_IGNORE_USR2")) != 0;
     signal(SIGUSR2, on_usr2);
     active = files && dops;
 }
@@ -597,6 +608,16 @@ __attribute__((noreturn)) static void power_loss(void)
                             by, tear_prefix, tear_garbage, tear_old, tear_kept)
                  : snprintf(msg, sizeof msg, "crashfs: power loss%s\n", by);
     if (real_write(2, msg, (size_t)n) < 0) {
+    }
+    if (usr2_seen && pull_file[0]) { /* the harness's count of the plugs it pulled: only a loss this shim made on request is in it */
+        char line[64];
+        int m = snprintf(line, sizeof line, "pid %d power loss requested by SIGUSR2\n", (int)getpid());
+        int fd = (int)syscall(SYS_openat, AT_FDCWD, pull_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            if (syscall(SYS_write, fd, line, (size_t)m) < 0) {
+            }
+            syscall(SYS_close, fd);
+        }
     }
     _exit(99);
 }
