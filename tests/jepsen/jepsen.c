@@ -254,8 +254,9 @@ static bool nem_clock;                 /* the nemesis is running (the setup and 
 static int64_t start_total_ns;         /* the time the nemesis spent waiting for servers to start (start_server) while it ran */
 static int64_t nem_idle_ns;            /* power: time inside the fault step that was neither a server starting nor the wait for a pulled one to die */
 static int64_t stop_ns;                /* when the run's time was up */
-#define NEM_DEAD_MAX_S 5      /* no server may lie dead longer than this between its death and the fork of the next one */
-#define NEM_DEAD_SHARE 0.05   /* and all the dead time together, and the idle time inside the fault steps, stay below this share of the run */
+#define NEM_DEAD_MAX_MS 300   /* no server may lie dead longer than this between its death and the fork of the next one: the nemesis
+                               * restarts at once (an honest run measures microseconds to a few ms, also under 16 busy loops) */
+#define NEM_IDLE_SHARE 0.05   /* the idle time inside the fault steps stays below this share of the run */
 #define NEM_FAULT_EVERY_S 5   /* the least faults: one per this many seconds of the run (nem_every: the slower nemeses less) */
 #define PULL_WAIT_S 30        /* a server that has been sent SIGUSR2 and is still alive after this long is hung: a failure */
 static const char *nem_mutant;   /* --mutant-nemesis: nothing, once, never, oncereact, nap:MS, deadsleep:MS, busysleep:MS (the check must fail) */
@@ -462,8 +463,12 @@ static const char *crash_prob(void)
 static void start_server_run(bool faulty)
 {
     char pms[32], pf[PATH_MAX];
-    if (feed)
+    if (feed) {
+        int64_t c0 = now_ns();
         feed_check("before the server recovers it", true); /* the directory the last server left, torn or not */
+        if (dead_since_ns) /* the checker's own work (tens of ms with thousands of segments) is not the nemesis lying idle */
+            dead_since_ns += now_ns() - c0;
+    }
     snprintf(pms, sizeof pms, "%lld", classes ? (long long)CL_PARTITION_MS : PARTITION_MS);
     atomic_store(&port, 0); /* until this server says where it listens, the clients have nowhere to go */
     for (int attempt = 0;; attempt++) {
@@ -1800,19 +1805,14 @@ static int nemesis_check(void)
                 "one per %d s of the rest): it was idle\n", nem_faults, seconds, (double)start_total_ns / 1e9, want, every);
         bad++;
     }
-    if (dead_worst_ns > NEM_DEAD_MAX_S * 1000000000LL) {
-        fprintf(stderr, "  a server lay dead for %.1f s between its death and its restart (at most %d s expected): the nemesis "
-                "was idle\n", (double)dead_worst_ns / 1e9, NEM_DEAD_MAX_S);
+    if (dead_worst_ns > NEM_DEAD_MAX_MS * 1000000LL) {
+        fprintf(stderr, "  a server lay dead for %.0f ms between its death and its restart (at most %d ms expected): the nemesis "
+                "was idle\n", (double)dead_worst_ns / 1e6, NEM_DEAD_MAX_MS);
         bad++;
     }
-    if (seconds >= 10 && (double)nem_idle_ns > NEM_DEAD_SHARE * seconds * 1e9) {
+    if (seconds >= 10 && (double)nem_idle_ns > NEM_IDLE_SHARE * seconds * 1e9) {
         fprintf(stderr, "  the fault step took %.1f s of %.0f s besides starting servers and waiting for a pulled one to die (at "
-                "most %.0f%% expected): the nemesis was idle in it\n", (double)nem_idle_ns / 1e9, seconds, NEM_DEAD_SHARE * 100);
-        bad++;
-    }
-    if (seconds >= 10 && (double)dead_total_ns > NEM_DEAD_SHARE * seconds * 1e9) {
-        fprintf(stderr, "  servers lay dead for %.1f s of %.0f s (at most %.0f%% expected): the nemesis was idle\n",
-                (double)dead_total_ns / 1e9, seconds, NEM_DEAD_SHARE * 100);
+                "most %.0f%% expected): the nemesis was idle in it\n", (double)nem_idle_ns / 1e9, seconds, NEM_IDLE_SHARE * 100);
         bad++;
     }
     return bad;
