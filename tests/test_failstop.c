@@ -888,6 +888,42 @@ static void test_series_dict_cause(const char *base)
     printf("  the creator whose append failed names the cause of the failure\n");
 }
 
+/* Two volumes fail for different reasons: tsdb_failed names the first one's, tsdb_volume_failed each one's own (tsdbd's
+ * "recovering in place" line named volume 2 with volume 1's error, which sent a reader after the wrong failure). */
+static void test_volume_failed(const char *base)
+{
+    char name[600], v1[700], v2[700], cmd[1500];
+    snprintf(name, sizeof name, "%s/failstop-volerr", base);
+    snprintf(v1, sizeof v1, "%s/failstop-volerr-v1", base);
+    snprintf(v2, sizeof v2, "%s/failstop-volerr-v2", base);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", v1, v2);
+    if (system(cmd) != 0)
+        failures++;
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid a, b;
+    OK(tsdb_series_at(db, "a", v1, &a));
+    OK(tsdb_series_at(db, "b", v2, &b));
+    OK(tsdb_append(db, a, 1, 1));
+    OK(tsdb_append(db, b, 1, 1));
+    char msg[256];
+    for (uint32_t v = 0; v < 3; v++)
+        CHECK(tsdb_volume_failed(db, v, msg, sizeof msg) == 0 && msg[0] == '\0');
+    arm(F_WRITE, "-v1/wal_", true, false);
+    CHECK(tsdb_append(db, a, 2, 2) == TSDB_ERR_IO);
+    arm(F_FDATASYNC, "-v2/wal_", false, true);
+    CHECK(tsdb_append(db, b, 2, 2) == TSDB_ERR_IO);
+    CHECK(tsdb_failed(db, msg, sizeof msg) == TSDB_ERR_IO && strstr(msg, "WAL write")); /* the first volume's */
+    CHECK(tsdb_volume_failed(db, 0, msg, sizeof msg) == 0 && msg[0] == '\0');
+    CHECK(tsdb_volume_failed(db, 1, msg, sizeof msg) == TSDB_ERR_IO && strstr(msg, "WAL write"));
+    CHECK(tsdb_volume_failed(db, 2, msg, sizeof msg) == TSDB_ERR_IO && strstr(msg, "WAL fdatasync") &&
+          !strstr(msg, "WAL write"));
+    CHECK(tsdb_volume_failed(db, 3, msg, sizeof msg) == TSDB_ERR_INVALID);
+    tsdb_close(db);
+    if (system(cmd) != 0)
+        failures++;
+    printf("  a volume's own failure message, whichever volume failed first\n");
+}
+
 /* A volume add writes the volume's META (its number, which ids carry) before the VOLUMES line names the
  * directory. A failed write leaves no line and fails just the add: nothing relies on that META yet, so the writer
  * goes on, and the add tried again completes the directory, under the number it gets then. */
@@ -2215,6 +2251,7 @@ int main(int argc, char **argv)
     test_series_dict_add(root);
     test_series_dict_cause(root);
     test_volume_meta(root);
+    test_volume_failed(root);
     test_volume_meta_race(root);
     test_background_sync(root);
     test_state_race(root);
