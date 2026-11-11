@@ -254,6 +254,10 @@ static int nem_faults;                 /* faults the nemesis issued (nem_fault) 
 static int64_t nem_fault_ns[MAX_FAULT_TIMES], nem_fault_end_ns[MAX_FAULT_TIMES]; /* when each was issued and when it was over (the first
                                        * MAX_FAULT_TIMES): a pulled plug is over when the server is dead, which takes seconds when the machine is busy */
 static int pulls_issued;               /* power: SIGUSR2 sent to a live server; nem_faults counts those the shim logged */
+static int eio_own;                    /* eio: marks the shim made by its own odds, with no SIGUSR2 of the nemesis before them: not faults of it
+                                       * (unless the server went on and the nemesis pulled its plug: that act is one) */
+static _Atomic int64_t nem_act_ns;     /* when the last fault was issued or over (0: none yet): the watcher's clock of the nemesis' activity */
+static atomic_int nem_inprog;          /* faults being carried out now (a plug asked for and the server still alive, an EIO asked for and no mark yet) */
 static int64_t nem_t0_ns;              /* when the nemesis started */
 static bool nem_clock;                 /* the nemesis is running (the setup and the final checks are not its time) */
 static int64_t nem_idle_ns;            /* power: time inside the fault step that was neither a server starting nor the wait for a pulled one to die */
@@ -262,15 +266,26 @@ static pthread_t watch_th;
 static bool watch_started;
 static atomic_bool watch_excused;      /* the checker's own work while the server is dead (feed_check): not the nemesis lying idle */
 static int64_t watch_dead_total_ns, watch_dead_worst_ns, watch_live_ns; /* written by the watcher only */
+static int64_t watch_stop_worst_ns;    /* the longest stretch a server lay stopped (SIGSTOP, state T in /proc), as the watcher saw it */
+static int64_t watch_gap_worst_ns;     /* the longest stretch a server was listening with no fault issued or in progress */
 static int64_t watch_live3_ns[3];      /* the same per third of the run (nem_third_start) */
 static int watch_deaths, watch_restarts;
 #define WATCH_POLL_MS 50
-#define NEM_DEAD_MAX_MS 300   /* no server may lie dead longer than this, as the watcher sees it (to within two polls): the nemesis
+#define NEM_DEAD_MAX_MS 150   /* no server may lie dead longer than this, as the watcher sees it (to within two polls): the nemesis
                                * restarts at once (an honest run measures microseconds to a few ms, also under 16 busy loops) */
+#define NEM_STOP_MAX_MS 1500  /* no server may lie stopped longer than this (the pause nemesis stops one for 100 to 400 ms): a nemesis that
+                               * never continues it leaves every client waiting */
+#define NEM_GAP_MAX_MS 5000   /* the longest time a server may be listening with no fault issued or in progress (honest, with 16 busy loops
+                               * on 4 CPUs: kill and power at most 1.6 s, eio at most 3.3 s, because only the faults it asked for or the
+                               * plugs it pulled after the shim's own EIO are its own; the pause nemesis, whose faults come
+                               * every 0.8 s, has NEM_GAP_PAUSE_MAX_MS) */
+#define NEM_GAP_PAUSE_MAX_MS 2500
 #define NEM_IDLE_SHARE 0.05   /* the idle time inside the fault steps stays below this share of the run */
 #define NEM_MIN_FAULTS 3      /* the least faults of any run of 10 s or more */
 #define PULL_WAIT_S 30        /* a server that has been sent SIGUSR2 and is still alive after this long is hung: a failure */
-static const char *nem_mutant;   /* --mutant-nemesis: nothing, once, burst:S, never, oncereact, nap:MS (naps that do not look at the server), deadsleep:MS, busysleep:MS (the check must fail) */
+static const char *nem_mutant;   /* --mutant-nemesis: nothing, once, burst:S, hole:FROM:TO (nothing between those seconds of the run), never, oncereact,
+                                  * nap:MS (naps that do not look at the server), deadsleep:MS, busysleep:MS, eionosig (eio: never asks for the fault),
+                                  * pausenocont (pause: never continues the server) (the check must fail) */
 static bool slow_create;            /* --mutant-slowcreate: waits 1 s before it creates the series (a server that crashed
                                      * by then must end the run at "cannot connect", not hang it: a self-test) */
 static bool idle_mutant;            /* --mutant-idle: a nemesis that sleeps through its naps; the check must fail */
@@ -460,6 +475,9 @@ static void nem_fault_span(int64_t t, int64_t end)
         nem_fault_end_ns[nem_faults] = end;
     }
     nem_faults++;
+    atomic_store(&nem_act_ns, end > t ? end : t);
+    if (getenv("JEPSEN_FAULT_TRACE")) /* when each fault was issued, seconds into the nemesis' run */
+        fprintf(stderr, "jepsen: fault %d at %.3f s\n", nem_faults, (double)(t - nem_t0_ns) / 1e9);
 }
 static void nem_fault(void)
 {
@@ -486,14 +504,14 @@ static bool pull_logged(pid_t pid)
     return ok;
 }
 
-/* The shim's power loss rate per operation for the next server of the power nemesis. At 0.0005 a server on a fast file
+/* The shim's fault rate per operation for the next server of the power and the eio nemesis (a power loss, an EIO). At 0.0005 a server on a fast file
  * system dies by itself within milliseconds, and the nemesis would find nothing to pull: so two servers in four run at
  * a rate low enough that they are alive when it comes to pull the plug (JEPSEN_PULL_PROB, 0.00003), and the others at the
  * high one (JEPSEN_CRASH_PROB, 0.0005: losses at random points, mostly early in a server's life, the recovery). */
 static const char *crash_prob(void)
 {
     const char *hi = getenv("JEPSEN_CRASH_PROB") ? getenv("JEPSEN_CRASH_PROB") : "0.0005";
-    if (strcmp(nemesis, "power") || (restarts / 2) % 2)
+    if ((strcmp(nemesis, "power") && strcmp(nemesis, "eio")) || (restarts / 2) % 2)
         return hi;
     return getenv("JEPSEN_PULL_PROB") ? getenv("JEPSEN_PULL_PROB") : "0.00003";
 }
@@ -1187,15 +1205,35 @@ static bool server_running(void)
     return si.si_pid != pid;
 }
 
+/* Whether process `pid` is stopped by a signal (state T in /proc/PID/stat; t, a trace stop, is not). */
+static bool pid_stopped(pid_t pid)
+{
+    if (pid <= 0)
+        return false;
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    const char *p = strrchr(buf, ')'); /* the name may hold anything, spaces and parentheses included */
+    return p && p[1] == ' ' && p[2] == 'T';
+}
+
 /* An independent clock on the servers while the nemesis runs, until the run's time is up (stop_ns): every WATCH_POLL_MS it
  * stamps the death of a server (the first poll that finds none running) and the restart (the first that finds one), and
- * keeps the longest and the total of the stretches in between and the time a server was up and listening (port set).
- * A server dead as the time ends is a stretch to stop_ns. Nothing here depends on what the nemesis looks at or when. */
+ * keeps the longest and the total of the stretches in between and the time a server was up and listening (port set, not
+ * stopped). A server dead as the time ends is a stretch to stop_ns. A server lying stopped (SIGSTOP) is neither dead nor
+ * listening: its stretches have a bound of their own. The longest time a server was listening with no fault issued or in
+ * progress (the nemesis' activity is its own atomic stamp and counter, read here on the watcher's clock) is the bound on a
+ * nemesis that has stopped working part of the way through. Nothing here depends on what the nemesis looks at or when. */
 static void *watcher(void *arg)
 {
     (void)arg;
     bool dead = false, prev_serving = false;
-    int64_t since = 0, last = now_ns();
+    int64_t since = 0, last = now_ns(), gap = 0, stop_since = 0;
     for (;;) {
         usleep(WATCH_POLL_MS * 1000);
         int64_t t = now_ns(), lim = atomic_load(&stop_ns);
@@ -1216,6 +1254,24 @@ static void *watcher(void *arg)
                         watch_live3_ns[j] += b - a;
                 }
             }
+            /* the time a server has been listening since the nemesis last issued a fault or was carrying one out */
+            int64_t act = atomic_load(&nem_act_ns);
+            if (atomic_load(&nem_inprog) > 0)
+                gap = 0;
+            else if (act > last)
+                gap = prev_serving && tt > act ? tt - act : 0;
+            else if (prev_serving && tt > last)
+                gap += tt - last;
+            if (gap > watch_gap_worst_ns)
+                watch_gap_worst_ns = gap;
+            bool stopped = running && pid_stopped(atomic_load(&server_pid));
+            if (stopped && !stop_since)
+                stop_since = tt;
+            else if (!stopped && stop_since) {
+                if (tt - stop_since > watch_stop_worst_ns)
+                    watch_stop_worst_ns = tt - stop_since;
+                stop_since = 0;
+            }
             if (!running && !dead) {
                 dead = true;
                 since = tt;
@@ -1229,10 +1285,12 @@ static void *watcher(void *arg)
                         watch_dead_worst_ns = tt - since;
                 }
             }
-            prev_serving = running && atomic_load(&port) > 0;
+            prev_serving = running && !stopped && atomic_load(&port) > 0;
             last = tt;
         }
         if (end) {
+            if (stop_since && lim > stop_since && lim - stop_since > watch_stop_worst_ns) /* stopped as the time was up */
+                watch_stop_worst_ns = lim - stop_since;
             if (dead && lim > since) { /* no server as the time was up: dead since its death, to the end of the run */
                 watch_dead_total_ns += lim - since;
                 if (lim - since > watch_dead_worst_ns)
@@ -1740,6 +1798,14 @@ static void *nemesis_thread(void *arg)
                 usleep(5000);
             break;
         }
+        if (!strncmp(mm, "hole:", 5)) { /* hole:FROM:TO: asleep (the server up and listening) between those seconds of the run, then at work again */
+            int64_t from = (int64_t)atoi(mm + 5) * 1000000000LL, to = (int64_t)atoi(strchr(mm + 5, ':') + 1) * 1000000000LL;
+            if (now_ns() - nem_t0_ns >= from && now_ns() - nem_t0_ns < to) {
+                while (!atomic_load(&stop) && now_ns() - nem_t0_ns < to)
+                    usleep(5000);
+                continue;
+            }
+        }
         useconds_t mnap = !strncmp(mm, "nap:", 4) ? (useconds_t)atoi(mm + 4) * 1000 : 0; /* naps that do not watch */
         nap(mnap ? mnap : idle_mutant_long ? 5000000 : 150000 + (useconds_t)(r % 600000),
             (((!strcmp(nemesis, "power") && crashfs) || !strcmp(nemesis, "eio")) && !idle_mutant && !idle_mutant_long && !mnap) ||
@@ -1769,11 +1835,13 @@ static void *nemesis_thread(void *arg)
                 mut_pulls++;
                 pulls_issued++;
                 int64_t issued = now_ns();
+                atomic_fetch_add(&nem_inprog, 1);
                 signal_pid(pid, SIGUSR2);
                 bool gone = false;
                 int64_t w0 = now_ns();
                 for (int i = 0; i < PULL_WAIT_S * 100 && !(gone = waitpid(pid, &st, WNOHANG) == pid); i++)
                     usleep(10000);
+                atomic_fetch_sub(&nem_inprog, 1);
                 waited += now_ns() - w0;
                 if (gone && pull_logged(pid)) /* counted when the shim says it lost the power on request, stamped when it was asked */
                     nem_fault_span(issued, now_ns());
@@ -1802,6 +1870,7 @@ static void *nemesis_thread(void *arg)
             pid_t pid = atomic_load(&server_pid);
             int st = 0;
             bool gone = waitpid(pid, &st, WNOHANG) == pid, sent = false;
+            int64_t mark_seen_ns = 0;
             if (!gone && !server_faulty) {
                 /* the clean server after a faulty one failed to start (an EIO while opening) has no shim, so no
                  * handler: SIGUSR2 would kill it, which later read as "ended (status 0xc) without a fault". Crash
@@ -1814,14 +1883,27 @@ static void *nemesis_thread(void *arg)
                 pthread_mutex_unlock(&server_lock);
                 continue;
             }
-            if (!gone && access(markpath, F_OK) != 0) { /* the next write or sync fails */
+            if (!gone && access(markpath, F_OK) != 0 && strcmp(mm, "eionosig")) { /* the next write or sync fails */
+                atomic_fetch_add(&nem_inprog, 1);
                 signal_pid(pid, SIGUSR2);
                 sent = true;
                 for (int i = 0; i < 100 && access(markpath, F_OK) != 0; i++)
                     usleep(10000);
+                atomic_fetch_sub(&nem_inprog, 1);
+                if (access(markpath, F_OK) != 0 && getenv("JEPSEN_FAULT_TRACE"))
+                    fprintf(stderr, "jepsen: no mark 1 s after SIGUSR2, at %.3f s\n", (double)(now_ns() - nem_t0_ns) / 1e9);
             }
-            if (access(markpath, F_OK) == 0) { /* the shim failed a file (its mark: on the nemesis's request or by its own odds): a fault */
-                nem_fault();
+            if (access(markpath, F_OK) == 0) { /* the shim failed a file (its mark: on the nemesis's request or by its own odds) */
+                /* a fault of the nemesis only when it asked for it before the mark appeared: the shim fails files by its own
+                 * odds as well, and a nemesis that never sends SIGUSR2 would be credited with those */
+                mark_seen_ns = now_ns();
+                if (sent)
+                    nem_fault();
+                else {
+                    eio_own++;
+                    if (getenv("JEPSEN_FAULT_TRACE"))
+                        fprintf(stderr, "jepsen: shim's own EIO at %.3f s, server %s\n", (double)(now_ns() - nem_t0_ns) / 1e9, gone ? "gone" : "alive");
+                }
                 for (int i = 0; !gone && i < 100; i++) /* fail-stop takes about 220 ms */
                     if (!(gone = waitpid(pid, &st, WNOHANG) == pid))
                         usleep(10000);
@@ -1851,7 +1933,13 @@ static void *nemesis_thread(void *arg)
                         eio_problems++;
                         fprintf(stderr, "  after EIO on %s the server is still running after 1 s\n", failed);
                     }
-                    signal_pid(pid, SIGUSR2); /* a power loss at its next file operation */
+                    if (strcmp(mm, "eionosig")) {
+                        /* the nemesis's own act on a server the shim's EIO did not stop: a fault of it, from the mark to here
+                         * (one it asked for was counted already) */
+                        if (!sent)
+                            nem_fault_span(mark_seen_ns, now_ns());
+                        signal_pid(pid, SIGUSR2); /* a power loss at its next file operation */
+                    }
                     for (int i = 0; i < 100 && waitpid(pid, &st, WNOHANG) != pid; i++)
                         usleep(10000);
                     if (signal_pid(pid, 0) == 0) { /* idle: stopped, the shim rolls back at exit */
@@ -1891,10 +1979,12 @@ static void *nemesis_thread(void *arg)
             }
         } else if (!strcmp(nemesis, "pause")) {
             pid_t pid = atomic_load(&server_pid);
-            if (signal_pid(pid, SIGSTOP) == 0)
+            bool was_stopped = pid_stopped(pid); /* a SIGSTOP to a server that is stopped already is no new fault */
+            if (signal_pid(pid, SIGSTOP) == 0 && !was_stopped)
                 nem_fault();
             usleep(100000 + (useconds_t)(r % 300000));
-            signal_pid(pid, SIGCONT);
+            if (strcmp(mm, "pausenocont")) /* --mutant-nemesis pausenocont: never continues it */
+                signal_pid(pid, SIGCONT);
         }
         pthread_mutex_unlock(&server_lock);
     }
@@ -1940,9 +2030,11 @@ static int nemesis_check(void)
     for (int j = 0; j < 3; j++)
         judged[j] = watch_live3_ns[j] * 2 >= nem_third_start(j + 1) - nem_third_start(j);
     printf("nemesis %s: %d faults in %.0f s (%.1f s with a server listening; at least %d expected; by third of the run %d/%d/%d; "
-           "%d plugs asked for), %d deaths and %d restarts seen, servers dead %.1f s in all, longest %.0f ms, %.2f s idle in its fault steps\n",
+           "%d plugs asked for), %d deaths and %d restarts seen, servers dead %.1f s in all, longest %.0f ms, %.2f s idle in its fault steps, "
+           "longest listening stretch without a fault %.2f s, longest stop %.0f ms, %d marks of the shim's own odds not counted\n",
            nemesis, nem_faults, seconds, live, want, third[0], third[1], third[2], pulls_issued, watch_deaths, watch_restarts,
-           (double)watch_dead_total_ns / 1e9, (double)watch_dead_worst_ns / 1e6, (double)nem_idle_ns / 1e9);
+           (double)watch_dead_total_ns / 1e9, (double)watch_dead_worst_ns / 1e6, (double)nem_idle_ns / 1e9,
+           (double)watch_gap_worst_ns / 1e9, (double)watch_stop_worst_ns / 1e6, eio_own);
     if (nem_faults < want) {
         fprintf(stderr, "  the nemesis issued %d faults in %.0f s, %.1f s of it with a server listening (at least %d expected)%s: it was idle\n",
                 nem_faults, seconds, live, want, !strcmp(nemesis, "power") && pulls_issued > nem_faults ?
@@ -1954,6 +2046,20 @@ static int nemesis_check(void)
     if (seconds >= 10 && !outage && !(nem_faults < want) && ((judged[0] && !covered[0]) || (judged[1] && !covered[1]) || (judged[2] && !covered[2]))) {
         fprintf(stderr, "  the nemesis' faults (%d/%d/%d in the three thirds of the run) were not spread over it: it was idle for a part of it\n",
                 third[0], third[1], third[2]);
+        bad++;
+    }
+    /* a nemesis that stops part of the way through leaves one fault in each third and a count above the floor, and the
+     * stretch it leaves is a long one: the server listening and nothing issued or in progress (an outage fault is a step of
+     * many seconds: there only the number counts) */
+    int gap_max_ms = !strcmp(nemesis, "pause") ? NEM_GAP_PAUSE_MAX_MS : NEM_GAP_MAX_MS;
+    if (seconds >= 10 && !outage && watch_gap_worst_ns > gap_max_ms * 1000000LL) {
+        fprintf(stderr, "  a server was listening for %.1f s with no fault issued or in progress (at most %.1f s expected): the nemesis "
+                "was idle\n", (double)watch_gap_worst_ns / 1e9, gap_max_ms / 1e3);
+        bad++;
+    }
+    if (watch_stop_worst_ns > NEM_STOP_MAX_MS * 1000000LL) {
+        fprintf(stderr, "  a server lay stopped (SIGSTOP) for %.0f ms (at most %d ms expected): the nemesis was idle or never "
+                "continued it\n", (double)watch_stop_worst_ns / 1e6, NEM_STOP_MAX_MS);
         bad++;
     }
     if (watch_dead_worst_ns > NEM_DEAD_MAX_MS * 1000000LL) {
@@ -3421,6 +3527,10 @@ int main(int argc, char **argv)
         atomic_store(&stop, true);
         if (strcmp(nemesis, "none"))
             pthread_join(nem, NULL);
+        /* an honest pause nemesis has continued the server before it returns; one that has not (it is judged for that: the
+         * watcher saw the server stopped to the run's end) would leave every client waiting on it for good */
+        if (!strcmp(nemesis, "pause") && pid_stopped(atomic_load(&server_pid)))
+            signal_pid(atomic_load(&server_pid), SIGCONT);
     }
     JP_PHASE("stopped: joining the clients");
     for (int i = 0; i < nclients; i++)
