@@ -1224,11 +1224,13 @@ typedef struct mt_series {
     int64_t *ts;
     uint64_t *v; /* slots, zero-extended */
     uint64_t *lsn; /* WAL sequence of each row; increasing, 0 when already durable */
-    uint32_t n, cap;
+    uint32_t n;
+    uint32_t pend; /* rows a reservation counted for the insert under way (mt_reserve_rows), 0 between inserts */
+    uint32_t top_nn; /* index of the newest non-null row (the later one on equal timestamps), with MTF_HAS_NN */
     bool sorted; /* non-decreasing ts, in insertion order */
     uint8_t fl;   /* MTF_*: a non-null row was added; a null was added; the newest non-null row was overwritten by a null */
     uint8_t type; /* the series' type once a row was added with tracking (fl != 0), else 0 */
-    uint32_t top_nn; /* index of the newest non-null row (the later one on equal timestamps), with MTF_HAS_NN */
+    uint8_t lgcap; /* the capacity of ts, v and lsn: (1 << lgcap) >> 1, so 0 for none (mt_cap; always a power of two) */
 } mt_series;
 _Static_assert(sizeof(mt_series) == 40, "mt_series stays 40 bytes");
 

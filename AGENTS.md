@@ -76,8 +76,11 @@ released again can be taken by another run's tsdbd, whose clients then answer yo
 "lost writes" that way). Start tsdbd with `--port 0 --port-file FILE` and read "PORT PID" from FILE, which tsdbd writes
 (atomically, once it serves; a third number is the metrics port of `--metrics-port auto`). Check that the pid is the child you started (`tests/harness.h` also checks that the child
 holds the port), and fail if the server exited or the file names someone else. A restart gets a new port; clients
-reconnect to the one in the new file. `th_owns_port` remembers the listener's socket inode, so a client that asks on every
-connect scans only the server's descriptors, not `/proc/net/tcp` (which grows with every reconnect). `tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
+reconnect to the one in the new file. Ask after the connect whether the pid holds a socket that LISTENS on the port now
+(`th_owns_port`: the listeners from netlink sock_diag, not `/proc/net/tcp`, which grows with every reconnect), never
+whether it merely holds the socket: a failing tsdbd shuts its listener down 200 ms before it closes it, and another
+run's server can get the port meanwhile (jepsen eio, 2026-11-09: one run's clients wrote into another's database).
+`tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
 `tests/integration/run.py` has `Server`, and the client test helpers under `client/*/tests` do the same in their language.
 Every harness also passes `--exit-with-parent=PID`, PID being its own pid (the server stops cleanly once its parent is
 gone, and refuses to start under any other parent): a test killed by a timeout otherwise leaves its tsdbd running

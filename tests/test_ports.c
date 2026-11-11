@@ -143,6 +143,66 @@ static int occupy(int *port)
     return fd;
 }
 
+/* A server on its way out still holds its listener's descriptor but no longer listens: tsdbd after a storage failure
+ * shuts the listener down, gives replies in flight 200 ms, and closes it only then. Meanwhile the port is free for
+ * anyone to bind (SO_REUSEADDR, which tsdbd sets, lets a new listener in beside a socket that is not listening; the
+ * kernel's port 0 may hand it out), and a client that connects there reaches that other process. th_owns_port must
+ * say no from the shutdown on, or a harness talks to someone else's server as its own: on 2026-11-09 the clients of
+ * one jepsen run (eio nemesis, runs in parallel) wrote into another run's database while their own server was
+ * failing, and that run's checker found thousands of values "never written" (they were the other run's). Before the
+ * fix th_owns_port took "pid still has the socket open" for "pid listens on the port". */
+static void taken_over(void)
+{
+#ifdef __linux__
+    int one = 1, port, fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    socklen_t sl = sizeof sa;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); /* as tsdbd's listener */
+    if (fd < 0 || bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(fd, 8) != 0 ||
+        getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        perror("taken_over");
+        exit(1);
+    }
+    port = ntohs(sa.sin_port);
+    CHECK(th_owns_port(getpid(), port));
+    CHECK(th_owns_port(getpid(), port)); /* asked again, as jepsen's clients do on every connect */
+    shutdown(fd, SHUT_RDWR);             /* stops listening; the descriptor stays open */
+    CHECK(!th_owns_port(getpid(), port));
+
+    int ready[2];
+    if (pipe(ready) != 0) {
+        perror("pipe");
+        exit(1);
+    }
+    pid_t other = fork();
+    if (other == 0) { /* another server that gets the same port */
+        close(fd);
+        close(ready[0]);
+        int o = socket(AF_INET, SOCK_STREAM, 0);
+        setsockopt(o, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        char ok = bind(o, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(o, 8) == 0;
+        if (write(ready[1], &ok, 1) != 1)
+            _exit(1);
+        park();
+    }
+    close(ready[1]);
+    char ok = 0;
+    CHECK(other > 0 && read(ready[0], &ok, 1) == 1 && ok); /* the kernel lets it in while ours is still open */
+    close(ready[0]);
+    if (ok) {
+        CHECK(th_owns_port(other, port));
+        CHECK(!th_owns_port(getpid(), port)); /* a connect to the port now reaches `other`, not us */
+    }
+    sig(other, SIGKILL);
+    if (other > 0)
+        waitpid(other, NULL, 0);
+    close(fd);
+#else
+    printf("  (taken_over: skipped on macOS, where shutdown() of a listener is not known to end its listening)\n");
+#endif
+}
+
 static void rmrf(const char *path)
 {
     char cmd[1200];
@@ -384,6 +444,7 @@ int main(int argc, char **argv)
             CHECK(th_owns_port(s1, p1) && th_owns_port(s2, p2));
         CHECK(atomic_load(&th_scans) == before);
     }
+    taken_over();
     CHECK(serves(p1) && serves(p2));
     {
         tsdbc *c;

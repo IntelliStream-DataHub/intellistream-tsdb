@@ -478,9 +478,18 @@ static void start_server(bool faulty)
             if (outage)
                 setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=2000,spawn=60000", 1);
             if (!getenv("JEPSEN_VERBOSE")) { /* kept for a server that does not come up */
-                int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot || outage ? O_APPEND : O_TRUNC), 0644);
+                bool keep = getenv("JEPSEN_KEEP") != NULL;
+                int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot || outage || keep ? O_APPEND : O_TRUNC), 0644);
                 if (lfd < 0)
                     lfd = open("/dev/null", O_WRONLY);
+                else if (keep) { /* JEPSEN_KEEP: every server's log, each headed by when it started */
+                    char h[128];
+                    int hn = snprintf(h, sizeof h, "=== server %d at %.3f s, faulty %d, pid %d\n", restarts,
+                                      (double)(now_ns() - run_start) / 1e9, faulty && crashfs && attempt == 0,
+                                      (int)getpid());
+                    if (write(lfd, h, (size_t)hn) < 0) {
+                    }
+                }
                 if (lfd >= 0)
                     dup2(lfd, 2);
             }
@@ -1481,9 +1490,23 @@ static void *nemesis_thread(void *arg)
         } else if (!strcmp(nemesis, "eio")) {
             pid_t pid = atomic_load(&server_pid);
             int st = 0;
-            bool gone = waitpid(pid, &st, WNOHANG) == pid;
+            bool gone = waitpid(pid, &st, WNOHANG) == pid, sent = false;
+            if (!gone && !server_faulty) {
+                /* the clean server after a faulty one failed to start (an EIO while opening) has no shim, so no
+                 * handler: SIGUSR2 would kill it, which later read as "ended (status 0xc) without a fault". Crash
+                 * it as the kill nemesis does and start a faulty one. */
+                signal_pid(pid, SIGKILL);
+                waitpid(pid, &st, 0);
+                server_gone();
+                start_server(true);
+                restarts++;
+                atomic_store(&nem_busy, false);
+                pthread_mutex_unlock(&server_lock);
+                continue;
+            }
             if (!gone && access(markpath, F_OK) != 0) { /* the next write or sync fails */
                 signal_pid(pid, SIGUSR2);
+                sent = true;
                 for (int i = 0; i < 100 && access(markpath, F_OK) != 0; i++)
                     usleep(10000);
             }
@@ -1501,7 +1524,11 @@ static void *nemesis_thread(void *arg)
                 const char *base = strrchr(failed, '/') ? strrchr(failed, '/') + 1 : failed;
                 if (gone) {
                     failstops++;
-                    if (!WIFEXITED(st) || WEXITSTATUS(st) != 1) {
+                    /* An EIO the shim's own odds injected just after we looked for the mark, and then our SIGUSR2:
+                     * to the shim a signal after the EIO means a power loss at the next file operation, which may
+                     * come before the fail-stop's exit (99, 0x6300). That is the fault we sent, not the server's. */
+                    bool ours = sent && WIFEXITED(st) && WEXITSTATUS(st) == 99;
+                    if (!ours && (!WIFEXITED(st) || WEXITSTATUS(st) != 1)) {
                         eio_problems++;
                         fprintf(stderr, "  after EIO on %s the server ended with status %#x, not exit 1\n", failed, st);
                     }
@@ -1828,6 +1855,47 @@ static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
         if (violations > before)
             latest_violations++;
     }
+}
+
+/* JEPSEN_KEEP: the history of a failed run as text, DIR.hist. Times in ms since the clients started.
+ *   K series key ts            every key's timestamp
+ *   W id series kind lo hi status invoke complete key...
+ *   R id series lo hi status invoke complete (key=write)...   only keys with a value
+ *   F series key write          the final state, nonzero only */
+static void dump_history(const uint32_t *final)
+{
+    char p[PATH_MAX + 8];
+    snprintf(p, sizeof p, "%s.hist", dir);
+    FILE *f = fopen(p, "w");
+    if (!f)
+        return;
+    uint32_t nw = atomic_load(&nwrites), nr = atomic_load(&nreads);
+    nw = nw > MAX_OPS ? MAX_OPS : nw, nr = nr > MAX_OPS ? MAX_OPS : nr;
+    for (int s = 0; s < nseries; s++)
+        for (uint32_t k = 0; k < nkeys[s]; k++)
+            fprintf(f, "K %d %u %lld\n", s, k, (long long)kts[s][k]);
+    for (uint32_t w = 1; w < nw; w++) {
+        wop *o = &writes[w];
+        fprintf(f, "W %u %d %d %u %u %d %.3f %.3f", w, o->series, o->kind, o->lo, o->hi, (int)o->st,
+                (double)(o->invoke - run_start) / 1e6, (double)(o->complete - run_start) / 1e6);
+        for (uint32_t i = 0; i < o->nkeys; i++)
+            fprintf(f, " %u", o->keys[i]);
+        fputc('\n', f);
+    }
+    for (uint32_t i = 0; i < nr; i++) {
+        rop *q = &reads[i];
+        fprintf(f, "R %u %d %u %u %d %.3f %.3f", i, q->series, q->lo, q->hi, (int)q->st,
+                (double)(q->invoke - run_start) / 1e6, (double)(q->complete - run_start) / 1e6);
+        for (uint32_t k = q->lo; q->st == ST_OK && q->seen && k < q->hi; k++)
+            if (q->seen[k - q->lo])
+                fprintf(f, " %u=%u", k, q->seen[k - q->lo]);
+        fputc('\n', f);
+    }
+    for (int s = 0; final && s < nseries; s++)
+        for (uint32_t k = 0; k < nkeys[s]; k++)
+            if (final[koff[s] + k])
+                fprintf(f, "F %d %u %u\n", s, k, final[koff[s] + k]);
+    fclose(f);
 }
 
 static int check(const uint32_t *final)
@@ -3016,6 +3084,12 @@ int main(int argc, char **argv)
     }
     if (fport && !fv)
         unlink(flogpath);
+    if (v && getenv("JEPSEN_KEEP")) { /* the directory, and the history as DIR.hist, for a diagnosis */
+        dump_history(final);
+        printf("kept %s, history %s.hist, server log %s\n", dir, dir, slogpath);
+        printf("FAILED: %d violations\n", v);
+        return 1;
+    }
     if (system(cmd) != 0)
         return 2;
     if (v) {

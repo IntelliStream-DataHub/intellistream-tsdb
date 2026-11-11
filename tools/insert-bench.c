@@ -92,6 +92,8 @@ static void stream_fill_parallel(stream *s, tsdb_sid *sv, int64_t *tv, float *vv
 static bool no_stats;             /* --no-stats: tsdb_options.stats = -1 */
 static int insert_zstd = INT_MIN; /* --insert-zstd: tsdb_options.insert_zstd_level; INT_MIN the default */
 static long latest_cache = -1;    /* --latest-cache BYTES: tsdb_options.latest_cache (0: no latest table); -1 the default */
+static bool mem_batches;          /* --mem-batches SYNC_MS: only tsdb_insert of 1..10,000 rows through the WAL + memtable */
+static int mem_sync_ms;           /* ... with wal_sync_ms = SYNC_MS (0: fsync on every call) */
 
 static tsdb *open_fresh(int wal_sync_ms, size_t wal_max_batch)
 {
@@ -239,9 +241,10 @@ static void run_appends(const char *label, int wal_sync_ms, int threads, double 
 }
 
 /* tsdb_insert with batches of `batch` rows until `min_secs` and `min_rows`. */
-static void run_batches(const char *label, size_t batch, size_t wal_max_batch, double min_secs, uint64_t max_rows)
+static void run_batches(const char *label, size_t batch, size_t wal_max_batch, double min_secs, uint64_t max_rows,
+                        int wal_sync_ms)
 {
-    tsdb *db = open_fresh(0, wal_max_batch);
+    tsdb *db = open_fresh(wal_sync_ms, wal_max_batch);
     stream s;
     stream_init(&s);
     tsdb_sid *sv = malloc(batch * sizeof *sv);
@@ -295,6 +298,7 @@ int main(int argc, char **argv)
                                    {"insert-zstd", required_argument, 0, 'z'},
                                    {"no-stats", no_argument, 0, 'N'},
                                    {"latest-cache", required_argument, 0, 'l'},
+                                   {"mem-batches", required_argument, 0, 'b'},
                                    {0, 0, 0, 0}};
     bool appends_only = false;
     int ch;
@@ -309,6 +313,7 @@ int main(int argc, char **argv)
         case 'z': insert_zstd = atoi(optarg); break;
         case 'N': no_stats = true; break;
         case 'l': latest_cache = atol(optarg); break;
+        case 'b': mem_batches = true, mem_sync_ms = atoi(optarg); break;
         default: return 2;
         }
     }
@@ -319,6 +324,15 @@ int main(int argc, char **argv)
     printf("durable inserts, fsync on, %u series of mixed sensors in %d volume(s), dir %s\n\n", nseries, nvolumes, dir);
     printf("%-34s %6s %12s %12s %9s %10s %10s %7s\n", "mode", "batch", "inserts/s", "rows/s", "MB/s", "p50 ms",
            "p99 ms", "parts");
+    if (mem_batches) { /* the small-write path only: 1 to 10,000 rows per call through the WAL and the memtable */
+        char label[64];
+        snprintf(label, sizeof label, "insert -> WAL + memtable, sync %d ms", mem_sync_ms);
+        for (uint64_t b = 1; b <= 10000; b *= 10)
+            run_batches(label, (size_t)b, 65536, secs, (uint64_t)-1, mem_sync_ms);
+        char cmd[1024];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'.vol*", dir, dir);
+        return system(cmd) != 0;
+    }
     run_appends("append, fsync each (group commit)", 0, 1, secs);
     run_appends("append, fsync each (group commit)", 0, 16, secs);
     run_appends("append, fsync each (group commit)", 0, 64, secs);
@@ -335,10 +349,10 @@ int main(int argc, char **argv)
         run_appends(label, intervals[k], 1, secs);
         run_appends(label, intervals[k], 16, secs);
     }
-    run_batches("insert 1 row as a part (no WAL)", 1, 1, secs, 2000);
+    run_batches("insert 1 row as a part (no WAL)", 1, 1, secs, 2000, 0);
     for (uint64_t b = 10; b <= max_batch; b *= 10) {
         const char *how = b < 65536 ? "insert batch -> WAL + memtable" : "insert batch -> parts";
-        run_batches(how, (size_t)b, 65536, secs, b >= 100000000 ? b : (uint64_t)-1);
+        run_batches(how, (size_t)b, 65536, secs, b >= 100000000 ? b : (uint64_t)-1, 0);
     }
     char cmd[1024];
     snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'.vol*", dir, dir);
