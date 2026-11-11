@@ -12,6 +12,13 @@ operator guide, the release gates) and the steps P1-P6 of §11. **The user decid
 compatibility rule** (E40): before 1.0 no promise across format, metadata or peer protocol versions; the draft's
 "each minor release reads the previous one's files" is rejected.
 
+**Amended on 2026-11-11 with device classes** (§15, E47-E56; branch `device-classes` from main at 84b28e4). The user
+asked: "do we have tiered storage? So hot data can be on mirrored ssd, and cold data on erasure coded pool?" and, on
+hearing that roles were per server: "yes do that, so one instance can cover both nvme and hard drives". Each disk of a
+tsdbd now has a class (`nvme`, `ssd`, `hdd`); the young tier goes on the fast ones and settled chunks on the hard
+drives of the same server, the role follows from the disks, and a single server (no cluster) can move settled
+partitions to a hard-drive directory too (E55).
+
 The user's request (2026-11-09, verbatim): "cluster should support data replication, preferably using erasure code,
 test with 4+2 and 8+2 and 8 + 4 and 16+4. I know we lose performance, but it makes operation much easier. Its a
 tunable config. Also support replication with 3 replicas. We should support moving of volumes and fail overs, like if
@@ -62,6 +69,12 @@ modes and the combined build plan; §7 there carries this design's steps R5-R14 
 - **Storage and compute can be separated** (E20): `compute` servers lead volumes, hold the replicated WAL, young parts
   and indexes and cache granules; `storage` servers hold chunks only; `both` is the default. They scale independently;
   a compute server holds terabytes (young data and indexes), not gigabytes.
+- **Device classes** (§15, E47-E56): `tsdbd --disk PATH[:nvme|ssd|hdd]`, repeated, the class detected when not given.
+  NVMe and SSD are **fast** disks: WAL, young parts and `.ec` index files. Hard drives are **capacity** disks: chunks.
+  One server with both is compute and storage at once; the role follows from the disks (`--role` only narrows it).
+  A server with hard drives never puts chunks on its NVMe; an NVMe-only server does. Inserts are refused before a fast
+  disk fills, per disk. A single server gets the same split without erasure coding: `tsdb DIR tier add /hdd/x`, and
+  partitions a week past their end move there as whole part files, their index staying on NVMe (E55).
 - **Codec**: systematic Cauchy Reed-Solomon over GF(2^8) with SSSE3/AVX2/AVX-512/GFNI kernels: intellistream-objects'
   `src/codec`, copied unchanged into `src/ec/` by `tools/sync-ec.sh`. Both repositories are AGPL-3.0-only from 0.11.0,
   so no grant is needed; the Apache-2.0 network clients never contain it (E32).
@@ -105,17 +118,17 @@ modes and the combined build plan; §7 there carries this design's steps R5-R14 
 | E17 | **No new disk format number.** Chunk files, `.ec` index files, the part position in MANIFEST entries, and the markers `MK_COLD` (11, reserved in format 9) and `MK_GC`, `MK_DIGEST`, `MK_DROP_OBJ`, `MK_UNSETTLE` (12-15) live only in cluster volumes behind `requires=cluster,ec` in META (format 9's mechanism, src/feedfile.c:385, src/db.c:437); they freeze at 1.0 with the rest. | Format 10 | Nothing in a single-server volume changes; the `requires=` line refuses the files in a binary that does not know them. |
 | E18 | **The metadata snapshot becomes version 3** (redundancy, two member lists per volume, roles, holds, stores, DESTROYED), and the peer protocol version 3 (chunk messages). *Decided 2026-11-09* (E36, E39, E40): no promise of in-place upgrade across snapshot versions before 1.0 (the pre-1.0 rule is kept); a later release that changes the snapshot version says in its CHANGELOG how to carry a cluster over (E39), and 0.10.0's preview group (version 2, no data path) is initialised again. | Silently keeping the preview rule; every snapshot version converted in place from 0.11.0 on | From 0.11.0 the cluster holds data, 10-100 TB a node: a format change then costs a maintenance window (E39), and the user chose not to carry a reader for old versions before 1.0 (E40). |
 | E19 | **The EC codec is systematic Cauchy Reed-Solomon over GF(2^8), polynomial 0x11d**, kernels dispatched by tsdb's `src/cpu.c` (no constructors: AGENTS.md "CPU levels"), every kernel byte-identical to the scalar one. | ISA-L as a dependency; LRC or other codes | Interoperable with Jerasure, ISA-L and klauspost (objects:src/codec/gf256.h:1-5); any k of k + m reconstruct, with no unlucky sets (objects:src/codec/rs.h:11-15). Locally repairable codes save rebuild reads but are not MDS at the same space; a later change if rebuild reads hurt (§5.3). Where the code comes from: E32. |
-| E20 | **Storage and compute can be separated**: server roles `compute`, `storage`, `both` (default). §9. | Every server both | The user's question. It costs little (two member lists exist anyway, E3) and lets bytes and CPU scale apart. |
+| E20 | **Storage and compute can be separated**: server roles `compute`, `storage`, `both` (default). §9. *Amended 2026-11-11 by E49*: what a server can do follows from its disks' classes; `--role` only narrows it. | Every server both | The user's question. It costs little (two member lists exist anyway, E3) and lets bytes and CPU scale apart. |
 | E21 | **A compute server's state is replicated, not small**: the young tier (a day or more of ingest at m + 1 copies), the `.ec` index files (about 0.75% of settled bytes, on each of the m + 1 log replicas) and caches. Losing one loses nothing durable (while the ISR is full, E4); rebuilding its log replicas is design-cluster.md §8.1's rebuild of terabytes: hours, spread over the other compute servers. A separated cluster needs at least **m + 2 compute servers**, so a lost one has somewhere to be rebuilt. | Stateless compute nodes (WAL on storage nodes); the index on fewer log replicas | A WAL on remote storage adds a round trip to every acknowledged insert; m + 1 local NVMe copies are the replicated mode that already exists. The index on every log replica keeps statistics queries warm right after a failover; at 0.75% its copies cost less than one more data copy of the young tier. |
 | E22 | **The settled tier is an interface with backends**: the cluster's own storage servers (0.11.0), a directory (tests), and later isod or any S3 (design-cluster.md §9.2's `tsdb_cold_ops`). | Only the own backend | With an S3 backend, tsdb servers become compute only and isod does the erasure coding and its rebuild. That is the "true separation" end state; it waits for 0.12 or later (§9.4). |
 | E23 | **0.11.0 holds replicated mode's data path (R2-R4), this design (R5-R14, R10 included: E33) and the production steps P1-P6 (E36)**; shared mode's steps go on in parallel and ship when their maintenance windows allow (not as production in 0.11.0, E46). | Waiting for N7 (M21's order) | The user's "that will go in v0.11.0". M21 put replicated mode after shared mode; this changes the order, not the content. Nothing moves to 0.12 (E33). |
 | E24 | **The young tier's ISR floor for EC volumes**: `min_isr` defaults to **m** for `ec=k+m` volumes (2 for m = 2, 4 for m = 4), so an acknowledged row survives at least m − 1 losses at worst and m with the ISR full; `replicas=3` keeps D1's 1. TOPOLOGY and health report both margins: the young tier's (ISR size − 1) and the settled tier's (fewest positions beyond k). | D1's 1 for every volume | The user chose m = 4 to survive 4 losses; with `min_isr = 1` one slow node (or two on 8+4) leaves writes acknowledged on one copy. The cost: an EC volume refuses writes when more than one of its log replicas lags (of 3 for m = 2, of 5 for m = 4). Confirmed by the user on 2026-11-09 (E35). |
 | E25 | **Scrub every chunk every `scrub_days` (14)**, paced by `scrub_mb_s` (50 MB/s per disk) below rebuild: each storage server reads its chunks and checks every cell against the encode-time cell checksums (E26); log replicas scrub `.ec` files and young parts the same way (`verify_checksums` reads). A bad cell is repaired by a range decode through the rebuild path. Damaged chunks are counted per disk; a disk with more than `scrub_out_count` (8) in a day goes OUT (E27). Health shows the oldest unscrubbed object. | Scrub on demand; checking parity against data across servers | Systematic reads never touch parity, and range reads cannot check a 1 MiB cell's sum, so rot in parity or unread data stays hidden until a degraded read or a rebuild needs it: at margin 0 that is loss. Encode-time sums make a local check sufficient: a cell that matches its encode-time sum is what the encoder produced (objects counts damage per device the same way, objects:src/cluster/cmap.h:169-170). |
 | E26 | **Checks at every hand-over.** The encode checks every granule checksum and the footer hash of each part it reads (it reads every byte anyway) and aborts on a mismatch (the part is repaired from a replica first, design-cluster.md §8.5); it computes a 64-bit sum per cell for **every position**, data and parity, sends each position its sums with the put, and records all of them in the object record; a chunk server checks the cells it receives before PUT_OK and the leader compares each PUT_OK's sum. After the settle, every log replica compares a **logical digest** of the rows it retired (rows per series and an xxh64 over the visible rows in (series, ts) order) with the leader's (`MK_DIGEST`), before it deletes them; a mismatch keeps the retired parts and raises DIVERGED. Retired parts of a settle are kept `settle_keep_s` (1 day), not `obsolete_part_lifetime_s`. A rebuilt cell is checked against its encode-time sum, never self-certified. | Trusting the leader's bytes (the first draft); a digest on the apply path | Granule payloads are hashed only with `verify_checksums` (default off; src/part.c:314-318), so rot in the leader's part would be encoded with fresh, matching sums while the good replica copies are retired; and a merge bug on the leader would become the only lineage. The digest costs one decode of each settled partition per log replica, in the background (EU6). |
-| E27 | **A storage server holds one chunk store per disk** (`--chunk-dir`, repeated; each with its own META and store id). A position stays one per server; each chunk lives on one of its disks, in the server's local index. A dead disk is a **device** DOWN/OUT: only that disk's chunks are rebuilt, onto the server's other disks when they have room, else the server's positions move by the balancer. `tsdb cluster disk out|replace NODE DISK`. | One file system over all disks (one disk loss is the whole server); RAID under the chunks (redundancy on redundancy, the 1.25x is no longer 1.25x) | At 1-2% a year per disk, a 20-node cluster of 24-disk servers loses several disks a year: the most frequent hardware event. Objects does it per device (objects:src/cluster/cmap.h:66-77; timers per device, objects:src/mds/server.h:84-100). |
+| E27 | **A storage server holds one chunk store per disk** (`--chunk-dir`, repeated; each with its own META and store id; *2026-11-11*: declared with `--disk PATH[:CLASS]` instead, E47, chunk stores only on capacity disks where a server has any, E50). A position stays one per server; each chunk lives on one of its disks, in the server's local index. A dead disk is a **device** DOWN/OUT: only that disk's chunks are rebuilt, onto the server's other disks when they have room, else the server's positions move by the balancer. `tsdb cluster disk out|replace NODE DISK`. | One file system over all disks (one disk loss is the whole server); RAID under the chunks (redundancy on redundancy, the 1.25x is no longer 1.25x) | At 1-2% a year per disk, a 20-node cluster of 24-disk servers loses several disks a year: the most frequent hardware event. Objects does it per device (objects:src/cluster/cmap.h:66-77; timers per device, objects:src/mds/server.h:84-100). |
 | E28 | **A server back during a rebuild takes its positions back**: for each position whose replacement is not yet `whole`, a returned holder whose stores are intact gets it back with one `STRIPE_SET` conditional on `stripe_version`, and copies only what was settled while it was away; the partial fill is deleted. Where the replacement is already whole, it gets the position back only when that saves a balance move at an unchanged margin. `tsdb cluster node replace OLD NEW` gives OLD's positions to NEW directly, filled once by copy or decode. | The first draft: the returned server only serves as a copy source, then deletes everything, and the balancer moves 1/N of the cluster back onto it | A 35-minute firmware update without a hold would otherwise move the node's data twice (out by decoding at k times the reads, then back), days of traffic at reduced margin. Ceph does the same when an OSD returns during backfill. |
 | E29 | **Segments are retained for a DOWN or held member** of the log group until it goes OUT or its hold ends, within `repl_retain_down_gb` per server (sized by §4's rule: ingest × `rebuild_after` × WAL bytes per row), beyond design-cluster.md §8.3's 30 min and `repl_retain_mb`. | §8.3's budget alone | At high ingest 4 GB lasts minutes, so "back within 30 minutes only catches up" would not hold, and a planned 2-hour hold would cost a snapshot of terabytes of young data. |
-| E30 | **Backpressure before ENOSPC**: a log replica above `young_high_pct` (90%) of its WAL and young-data file system makes its leader refuse inserts with UNAVAILABLE reason `TSDB_WHY_FULL` (4, protocol 13) until it is below again; the operator guide sizes compute disks (§4). | Letting the WAL reach ENOSPC (fail-stop on every compute node at about the same time) | Young data grows when settles wait (E10, E12) and every compute node fills at the same rate; refusing is retryable, fail-stop is not. |
+| E30 | **Backpressure before ENOSPC**: a log replica above `young_high_pct` (90%) of its WAL and young-data file system makes its leader refuse inserts with UNAVAILABLE reason `TSDB_WHY_FULL` (4, protocol 13) until it is below again; the operator guide sizes compute disks (§4). *2026-11-11*: measured per fast disk, and only the volumes with a log replica on the full disk are refused (E53). | Letting the WAL reach ENOSPC (fail-stop on every compute node at about the same time) | Young data grows when settles wait (E10, E12) and every compute node fills at the same rate; refusing is retryable, fail-stop is not. |
 | E31 | **Hedged reads per server**: a cell read is hedged after `2 × that server's read p99` (floor 20 ms, ceiling 500 ms), not a fixed 50 ms; hedges are capped by a token bucket at 5% of reads per server; a server with 8 timeouts in 10 s is `read-avoid` for 30 s (decoded around without waiting). | A fixed 50 ms timeout with k reads per hedge (the first draft) | On HDD storage servers (§9.1) queue p99 under rebuild or scrub is routinely above 50 ms; each hedge reads k cells (16 on 16+4), raising latency further: a feedback loop that can outlive its cause. |
 
 **Decided by the user on 2026-11-09** (the five open questions of the revised draft; E32-E36), and what production
@@ -137,7 +150,23 @@ then required (E37-E46, decided in this revision; the user may change them):
 | E43 | **Alerts ship with tsdb**: `dist/alerts/tsdb-cluster.rules.yml` (Prometheus rules) beside docs/metrics.md, each naming its runbook (§14.4). A test drives each rule's metric through a scripted fault on the one-machine cluster and evaluates the rule's expression against the metrics endpoint. | Documenting the metrics and leaving alerts to each operator | Margin 1 against margin 0 is the one thing an operator must not miss, and the thresholds come from this design; shipped and tested, the rules stay right as the metrics change. |
 | E44 | **The production operator guide** (`docs/cluster-operations.md`, §14.5) covers install, sizing, adding and removing nodes, a dead disk, a dead node, rolling upgrades, backup and restore, monitoring and alerts, and salvage. **Every runbook is a script** in `tests/cluster/runbooks/` that runs its commands against the one-machine cluster, so the guide and the CLI cannot drift apart. | Runbooks as prose only | A runbook never run fails when it is needed, at the worst moment; the commands printed in the guide are the ones the test runs. |
 | E45 | **What production requires before 0.11.0 is tagged**, all on the release commit (no gate carried over from an earlier commit): every step's gates; jepsen-cluster's full nemesis set (§10.3, the upgrade and backup nemeses included) on **every** geometry and `replicas=3`; the **72-hour soak** (§10.5); the upgrade test (§10.6: a rolling upgrade within the formats, the refusal and the window across a format change); the runbook and alert tests; the jepsen-review skill and an operations review on the final code, with no open finding rated high or critical. Performance claims only where measured: absolute numbers for a geometry only from servers with disks, and the release notes say which. | A 24-hour soak; jepsen-cluster on R8's two geometries only | A soak finds what only time shows: memory and descriptor growth, GC and retention converging, settles and scrub keeping up, restarts. 72 h covers three daily cycles of settles, retention and backups. Each geometry has its own placement, small-object k' and degraded-settle edges. |
-| E46 | **Not production in 0.11.0** (§14.6): shared NFS mode (N0-N8 wait for their maintenance windows): `cluster init --mode shared` is refused without `--preview`, and its docs say so; the S3/isod backend and the external cold tier are not built; the directory backend is for tests and backups only (`init` refuses it as the settled tier without `--test-backend`). | Shipping merged shared-mode steps as production | Shared mode's go/no-go (N0) and its jepsen-ha matrix have not run; production needs both. |
+| E46 | **Not production in 0.11.0** (§14.6): shared NFS mode (N0-N8 wait for their maintenance windows): `cluster init --mode shared` is refused without `--preview`, and its docs say so; the S3/isod backend and the external cold tier are not built; the directory backend is for tests and backups only (`init` refuses it as the settled tier without `--test-backend`; *2026-11-11*: as a single server's local tier it is production, E55). | Shipping merged shared-mode steps as production | Shared mode's go/no-go (N0) and its jepsen-ha matrix have not run; production needs both. |
+
+**Device classes** (2026-11-11, §15; the user: "yes do that, so one instance can cover both nvme and hard drives").
+Decided in this amendment with their rejected alternatives; the user may change them.
+
+| # | Decision | Rejected | Why |
+|---|---|---|---|
+| E47 | **A tsdbd declares each disk with `--disk PATH[:CLASS]`**, repeated, CLASS one of `nvme`, `ssd`, `hdd`. Without a class tsdbd detects it from the block devices under PATH (§15.1): `nvme*` devices are `nvme`, other non-rotational ones `ssd`, rotational ones `hdd`; it refuses to start, asking for the class, when it finds no block device (NFS, ZFS, tmpfs, overlay) or devices of different kinds under one file system. Each disk gets a **disk META** (store id, node id, cluster uuid) at first use. The metadata group records the class at the disk's first heartbeat; a later `--disk` naming another class is refused, naming both, and only `tsdb cluster disk class NODE STORE CLASS` changes it. In cluster mode `--dir DIR` is one more `--disk DIR` (the preview's command lines keep working). Replaces E27's `--chunk-dir`. | Flags named by use (`--data-dir PATH`, `--chunk-dir PATH`); detection only; operator-defined class names with placement rules (Ceph's device classes and CRUSH rules); the class only in the disk's own META | A flag named after the hardware leaves placement to the cluster: the same NVMe holds chunks on an NVMe-only server and none on a server with hard drives (E50), with no command line to change. Detection alone is wrong too often: it can follow LUKS and md to their devices (the benchmark machine's NVMe is under LUKS), but dm-cache and bcache mix kinds, many virtual disks report the wrong one, and NFS and ZFS have no device to ask. This design has exactly two uses for a disk (E48), so free-form classes would add a rule language to test for nothing. One record of the class (the metadata) keeps a typo on one restart from moving terabytes. |
+| E48 | **Two uses, from three classes**: `nvme` and `ssd` are **fast**, `hdd` is **capacity**. Fast disks hold log replicas (`v<N>/`: WAL, MANIFEST, SERIES, STATES, REPL, young parts, `.ec` index files, retained segments, rebuild snapshots). Capacity disks hold chunk stores (`s<N>/`). The class name is kept for reports, metrics and one tie-break (a log replica goes to `nvme` before `ssd`). The granule cache stays in RAM (§3.3); there is no disk cache of chunks in 0.11.0. `--state-dir` stays its own flag; tsdbd warns when it is on a capacity disk (Raft syncs of 5-10 ms slow metadata commits and failover, never inserts). Each chunk store keeps its own per-volume `EPOCH` (E14) and lists itself at start, so a store depends on no other disk of its server. | A third use for `ssd` (for example `.ec` index files on SATA SSD, WAL on NVMe); an NVMe chunk cache in front of hard drives (L2ARC-like); one `EPOCH` per server | The design's costs split two ways only: the young tier needs low `fdatasync` latency and random reads (index pages, §3.1), chunks need bytes per euro. SATA SSD syncs in about 0.1-1 ms, close enough to NVMe for group commit (design-cluster.md §10.1). A chunk cache on NVMe would compete with the young tier for the disk whose filling refuses inserts (E53); `ec_keep_local_h` (§3.3) already keeps the newest settled day local where it is read hard. An `EPOCH` on the NVMe would be lost with it while the chunks it fences survive. |
+| E49 | **What a server can do follows from its disks; `--role` only narrows it.** A server with at least one fast disk is **compute-capable**; one with at least one chunk store (a capacity disk, or a fast disk on a server without capacity disks, E50) is **storage-capable**. `--role compute\|storage\|both` (default `both`, "whatever the disks allow") restricts it, and is refused when it asks for what the disks cannot give (`--role compute` with only hard drives). The member record holds the declared role and the capability; placement uses their intersection. A server whose last fast disk is gone stops being compute-capable at once (E54). | `--role` as the only source (E20 as first written); roles chosen by the balancer | A server with NVMe and hard drives is the user's case: it is both, with each tier on the right disk, and needs no flag. Keeping `--role` lets an operator keep a box out of leadership (`--role storage`) or out of chunks (`--role compute`) without unplugging disks. |
+| E50 | **Chunk stores go on capacity disks; a fast disk holds chunks only on a server that has no capacity disk.** There the fast disk is shared: chunks stop at `shared_chunk_pct` (60%) of it, the rest is the young tier's (E53). A capacity disk never holds a log replica, unless the cluster setting `log_on_hdd` (off by default; for clusters of hard-drive servers only) is on: then a server **without fast disks** may hold log replicas on its hard drives, and health warns while any does. | Chunks on every disk by free space; letting a server with hard drives spill chunks onto its NVMe when they fill; refusing all-NVMe and all-HDD clusters | NVMe-only servers (small clusters, all-flash) have nowhere else to put chunks, and that is today's `both` server. On a mixed server, chunks on the NVMe would take the room that keeps inserts going; when hard drives fill, placement moves positions to other servers (§5.6) instead. An all-HDD cluster works but every acknowledged insert waits for a hard drive's sync (5-10 ms p50 with group commit): allowed by a deliberate setting, never by default. |
+| E51 | **Placement by class.** Log replicas (E9's log group) go to compute-capable servers and, inside one, to a fast disk: `nvme` before `ssd`, then by free space. Stripe positions go to storage-capable servers, one per server (E9), each chunk to one of its chunk stores. The balancer **prefers stripe groups of one class** (all positions on hard drives, or all on fast disks) and mixes only when there are not k + m servers of one class; health then names the volume (a granule's latency then depends on its cell's disk). Rebuilds and moves keep the class: a log replica is rebuilt only on a fast disk, a chunk only on a store of the same use. Room to rebuild (§5.6) is counted per class: the capacity fill mark keeps room for the largest server's chunks, and E21's "at least m + 2 compute servers" counts servers with a fast disk. A log replica moves between disks of one server (a learner on the same node, design-cluster.md §3.2) when its disk passes `young_move_pct` (E53). | Placement blind to classes; separate member lists per class; mixed stripe groups as normal | The class is what the user asked placement to follow. A stripe group of mixed media makes a partition scan as slow as its hard drives and a granule read unpredictable; preferring one class costs nothing where there are enough servers. |
+| E52 | **The member record lists the disks**: per disk its store id, class, uses (log, chunk), size and state (UP, DOWN, OUT, DESTROYED: E27's device states). Changes go through metadata ops added at the end of `enum meta_op_kind`: `STORE_ADD` (a new disk's first heartbeat, conditional on its store id being unknown), `STORE_CLASS` (`disk class`), and E27's `STORE_STATE`. Free bytes per disk and per use (young data, index, retained segments, chunks) travel in heartbeats only and are never committed. It is part of metadata snapshot version 3 (E18): no new version. | Classes in heartbeats only; a new snapshot version | Placement must read the class from committed state, or two metadata leaders could place by different classes. Free space changes every second and would flood the Raft log. Snapshot version 3 is not released yet, so the fields join it. |
+| E53 | **Filling, per class and per disk.** Fast disks: at `young_warn_pct` (75%) a warning; at `young_move_pct` (80%) the balancer moves log replicas off it, to another fast disk of the server first; at E30's `young_high_pct` (90%) the leaders of **the volumes with a log replica on that disk** refuse inserts (UNAVAILABLE, `TSDB_WHY_FULL`), other volumes go on. Capacity disks: §5.6's fill mark, `full × (1 − the largest domain's share)`, counted over capacity disks only; a capacity class that fills makes settles wait (no position can take a chunk), so young data grows on the fast disks, which is why a capacity alert predicts the day it will fill. Metrics `tsdb_disk_bytes{node,store,class,use}` and `tsdb_class_bytes{class,use}`; four shipped alerts (E43): fast disk at 75% (warning), inserts refused for FULL (critical), capacity class full within 7 days at the current rate (warning), no room to rebuild in a class (critical). | One mark per server (E30 as first written); refusing every volume of the server; letting fast disks spill to capacity disks | A server with four NVMe disks fills them unevenly (each holds other volumes' replicas); refusing the server for one disk refuses volumes that have room. Moving before refusing gives the balancer 10 points of the disk to work with. |
+| E54 | **A lost disk, per class** (§15.6). A **capacity disk**: E27 and §5.5 as written (only its chunks, onto the server's other capacity disks below their mark, else the positions move), never onto its fast disks (E50). A **fast disk**: its log replicas leave their ISRs (`isr_lag_ms`, writes go on), volumes it led fail over in seconds, and after `rebuild_after` they are rebuilt as learners (design-cluster.md §8.5), on another fast disk of the same server when it has room, else elsewhere; **its chunk stores on hard drives keep serving** (put, read, scrub, rebuild source), since a chunk store depends on no other disk (E48). The last fast disk lost makes the server storage-only until one is added. A lost `--state-dir` (node identity) makes the server join as a new node; `node replace OLD NEW` then adopts the stores whose disk META names OLD and whose chunk lists match the metadata, copying nothing. | Treating any disk loss as the server's loss; rebuilding the young tier only elsewhere | A dead NVMe on a server with 20 hard drives would otherwise rebuild 100 TB of chunks that are intact. Adopting intact stores is E28's rule (positions back to a holder with intact stores) applied to a server that lost only its identity. |
+| E55 | **One server gets a local settled tier in 0.11.0** (§15.7): `tsdb DIR tier add PATH[:CLASS]` (operator only, like `volume add`; appended to a checksummed, append-only `TIERS` file beside VOLUMES under its OFD lock; each tier store has a META with its id, and each volume gets `<store>/v<N>/`). A volume with a tier settles a partition key **`tier_after_s` (604,800 s, 7 days) after its end**, or earlier, oldest first, when its fast disk passes `tier_high_pct` (80%): by E5-E6's settle, with an object of k' = 1, m = 0 (the part file, unchanged, with its cell sums: E22's directory backend made production for this use) on the tier store with the most room, its `.ec` index file in the volume directory on the fast disk. Reads go through R7's seam with `pread` (never a mapping of a hard-drive file) and the granule cache; every granule from the tier is checked against its checksum. A lost tier store fails the open, naming it, until `tsdb DIR tier lost STORE`; then its partitions are lost (E15: `TSDB_ERR_IO` naming the partition; statistics still answer) and `tsdb DIR tier salvage` drops them by oid. Shared-mode volumes refuse a tier in 0.11.0. | Moving old partitions into an HDD volume; a symlink or a whole part file moved to the hard drive and mapped there; tiers as tsdbd flags; cluster only | Series ids name their volume (AGENTS.md "Series ids"): rows never move between volumes, so a volume on a hard drive is not a tier. A part mapped from a hard drive puts its index there too: a statistics query would seek, and a page fault cannot be timed out. A flag forgotten at a restart would open the database with its settled partitions missing; the record in the database refuses that ("Damage is never silent"). R7 already builds and tests this settle on one server with the directory backend; the single server needs only the store records, the trigger and the operator commands. |
+| E56 | **Cost: R13 grows and R15 is new** (§11): R13 (disks) becomes "disks with classes" (detection, disk META, member record, placement and balancing by class, filling per disk, the per-class losses): 4-5 track-days (was 2-3), 10 gate hours (was 6). R15, the single server's local tier: 3-4 track-days, 8 gate hours, needing only R7. The tests run on one machine with two scratch file systems standing in for NVMe and hard drives (classes stated), detection against a fake `/sys` tree, and outagefs's `slow` mode with a new `rate` cap standing in for a hard drive's seeks and throughput (§15.9). | A cluster step only; tests on real hard drives in the gates | The single-server tier is the cheapest part (R7's machinery) and the user's "one instance" covers it. Real hard drives give numbers (R11), not correctness: the gates must run on any developer machine. |
 
 ## 1. Words
 
@@ -517,7 +546,8 @@ DOWN, then OUT after `rebuild_after` (the same holds and guard as servers, E12).
 server's other stores while they are below their fill mark, else the server's positions on that volume move by the
 balancer (copies). `tsdb cluster disk out NODE DISK` gives it up at once; `disk replace NODE DISK` adds the new store
 and fills it. Time: D/disks instead of D, at the same rates as §5.3. On a compute server, a lost WAL or young-data disk
-is design-cluster.md §8.5's replaced disk: its log replicas become learners and are rebuilt.
+is design-cluster.md §8.5's replaced disk: its log replicas become learners and are rebuilt. *2026-11-11*: which disk
+holds what follows from its class (E47-E50), and a lost fast disk leaves the server's chunk stores serving (E54, §15.6).
 
 ### 5.6 Disks full
 
@@ -620,14 +650,15 @@ the log group, R3's replication is the young tier, R4's rebuild is the log-posit
 | What | Where | Freezes at 1.0? |
 |---|---|---|
 | Chunk file (§2.2): 96-byte header with writer epoch, encode-time cell sums | storage servers, `<store>/s<volume>/` | yes, behind `requires=cluster,ec` |
-| Chunk store META with store id; per-volume `EPOCH` file | storage servers | yes |
+| Chunk store META with store id; per-volume `EPOCH` file. *2026-11-11*: the **disk META** of every `--disk` (store id, node id, cluster uuid; E47), the `EPOCH` in each chunk store (E48) | storage servers; every disk | yes |
 | `.ec` index file: the part's header, index, tombstones, footer, then the object record (with every position's cell sums) | log replicas | yes |
 | `ppos` in MANIFEST entries of cluster volumes | log replicas | yes, behind `requires=cluster` |
 | Markers: `MK_COLD` body (Z, object records, `.ec` and `Y` files, retired oids, `stripe_version`), and new `MK_GC` (12), `MK_DIGEST` (13), `MK_DROP_OBJ` (14), `MK_UNSETTLE` (15) | WAL; `MK_TYPE_LAST` moves to 15 (src/marker.h:41) | yes |
 | The settle intent record (an extension of `parts_commit`'s) | log replicas | yes |
 | `FORMAT_VERSION` | stays 9 (E17) | |
-| Metadata snapshot version 3: `struct meta_volume` (server/meta.h:161-183) gains `redundancy` (kind, k, m), `min_isr` default by mode, the stripe list (up to 24 positions: 20 plus 4 moving; each pos, node, rid, state, barrier), `stripe_version`; members gain roles, holds (with their bound), chunk store ids and states, DESTROYED | metadata group | at 1.0 with the rest of the metadata; until then each minor release converts the previous one's in place, at the `CLUSTER_VERSION` entry (E39) |
-| New ops at the end of `enum meta_op_kind` (never renumbered, server/meta.h:264-295): `STRIPE_SET` (if stripe_version == v), `NODE_HOLD`, `VOLUME_REDUNDANCY`, `NODE_REPLACE`, `STORE_STATE`, `NODE_DESTROYED`, `GC_SUSPEND` | metadata group | yes |
+| A single server's tiers (E55): `TIERS` (beside VOLUMES; checksummed append-only records: store id, path, class, state), each tier store's META, `requires=tier` in the META of a volume with a tier, `.ec` entries in its MANIFEST naming the store id; the settle markers of R7 | single-server databases | yes, behind `requires=tier`; `FORMAT_VERSION` stays 9 |
+| Metadata snapshot version 3: `struct meta_volume` (server/meta.h:161-183) gains `redundancy` (kind, k, m), `min_isr` default by mode, the stripe list (up to 24 positions: 20 plus 4 moving; each pos, node, rid, state, barrier), `stripe_version`; members gain roles, holds (with their bound), chunk store ids and states, DESTROYED; *2026-11-11*: the declared role and the capability, and per disk its store id, class, uses, size and state (E49, E52) | metadata group | at 1.0 with the rest of the metadata; until then each minor release converts the previous one's in place, at the `CLUSTER_VERSION` entry (E39) |
+| New ops at the end of `enum meta_op_kind` (never renumbered, server/meta.h:264-295): `STRIPE_SET` (if stripe_version == v), `NODE_HOLD`, `VOLUME_REDUNDANCY`, `NODE_REPLACE`, `STORE_STATE`, `NODE_DESTROYED`, `GC_SUSPEND`; *2026-11-11*: `STORE_ADD`, `STORE_CLASS` (E52) and the cluster setting `log_on_hdd` (E50) | metadata group | yes |
 | Peer protocol version 3 (`CL_VERSION`, server/cluster.c:95): CHUNK_PUT (with cell sums), PUT_OK, CHUNK_READ (oid, pos, offset, length), CHUNK_DATA, CHUNK_LIST, CHUNK_DEL (naming its `MK_GC`), all with volume and epoch; heartbeats gain "opening" and "fail-stopped" | peers | no; a link needs the same peer protocol version on both ends (E37); a release that changes it is a maintenance window (E39) |
 | Cluster version (`CLUSTER_VERSION`, a new metadata op), the compat triple in HELLO, heartbeats and the metadata group, versions in snapshots, log entries and per-server state files (E37, E39); chunk, `.ec` and part headers carry their format version, and a mismatch is refused at open (E40) | metadata group, servers | the mechanism yes; no reader of older versions before 1.0 (E40) |
 | `BACKUP_PIN` (a new metadata op); the backup directory: a checksummed manifest naming each volume's P, objects as part files by oid, young parts, WAL tail, the metadata snapshot (E42) | metadata group; backup target | yes; a release restores its own backups and the previous minor's |
@@ -648,6 +679,10 @@ flags, server/meta.h:267).
   range, list, delete, scrub). Needs capacity. HDDs serve it with the costs §3.4 and §5.3 state (a cold granule read
   is a seek; a rebuild is bound by the disks), and E31's hedging; NVMe where old data is decoded often.
 - **both**: either, today's servers.
+
+*2026-11-11* (E49, §15.5): the role a server can take follows from its disks. A fast disk (NVMe, SSD) makes it
+compute-capable, a capacity disk (hard drive) storage-capable, so one server with NVMe and hard drives is `both` with
+the young tier on the NVMe and the chunks on the hard drives; `--role` only narrows what the disks allow.
 
 `replicas=3` volumes have no stripe group: all three copies are engines on compute-capable servers. True separation is
 therefore an EC property.
@@ -690,6 +725,8 @@ E27), roles as the test asks; the harness reads "PORT PID" and checks the pid (A
 against a single-server oracle (bit-identical answers), kill a position, degraded reads, OUT and rebuild, back before
 and after (after 31 minutes: the bytes moved are those settled meanwhile, E28), node replace, a dead disk, moves,
 conversion. Timings for 8+4 and 16+4 come from one machine only; release notes claim no hardware numbers for them.
+*2026-11-11*: each server is started with one `:nvme` and one or more `:hdd` disks on two scratch file systems, some
+servers NVMe-only or HDD-only, and the hard-drive disks run under outagefs's `slow` and `rate` (§15.9).
 
 ### 10.2 Simulators and unit tests
 
@@ -787,8 +824,9 @@ Track-days as in design-ha-modes.md §7 (build, review and fix rounds); gate hou
 | R8 | tsdbd: roles, chunk peer messages, epoch fences (durable per volume), `MK_GC` and the orphan rules, GC suspension, degraded reads with E31's hedging and `read-avoid`, metadata v3, TOPOLOGY with both margins, unavailable/corrupt/lost, `TSDB_WHY_LOST` in the four clients, `min_isr` by mode | `make jepsen-cluster` (kill, partition, partial partition, pause past the lifetime, disk loss, chunk rot, crash between `MK_COLD` and commit) on 4+2 and 16+4; `make test-clients` | 12 | 6-8 |
 | R9 | Failure handling: DOWN/OUT at `rebuild_after`, opening hold and fail-stop fast path, bounded holds and guard, degraded settles, retention for DOWN members, backpressure (`TSDB_WHY_FULL`), checked stripe rebuild by margin and pace, the `whole` barrier, return during rebuild and `node replace`, moves and the balancer with `balance_mb_s`, `node drain`; `sim_place` with its mutants and MTTDL | sim_place soak; jepsen-cluster (rebuild during writes, back during rebuild, two, m, m + 1, slow node, slow then disk loss, 2-hour hold, `STRIPE_SET` during a settle) on all four geometries | 24 | 6-8 |
 | R12 | Scrub (E25, §5.9): chunks, `.ec` files and young parts, damage counts and disk OUT, health age, metrics | jepsen-cluster: rot (parity included) then m failures | 6 | 2 |
-| R13 | Disks (E27, §5.5): device DOWN/OUT, rebuild within a server, `disk out` and `disk replace` | jepsen-cluster: single-disk loss, disk loss back within 30 min | 6 | 2-3 |
+| R13 | Disks **with classes** (E27, §5.5; *2026-11-11*: E47-E54, §15): `--disk PATH[:CLASS]`, detection and its fake `/sys` test, disk META, the member record's disks, `STORE_ADD`/`STORE_CLASS`, roles from disks, placement and balancing by class (log replicas on fast disks, chunks on capacity disks, one-class stripe groups, moves between a server's disks), filling per disk and per class with the four alerts' metrics, device DOWN/OUT, rebuild within a server, a lost fast disk with the chunk stores serving on, `node replace` adopting intact stores, `disk out`, `disk replace`, `disk class` | jepsen-cluster: single-disk loss (hard drive, then NVMe), disk loss back within 30 min, a fast disk filling to FULL under ingest, on servers with two classes on outagefs | 10 | 4-5 |
 | R14 | Operator CLI (`node hold/replace/drain/destroyed`, `disk ...`, `volume move/redundancy/salvage/gc`, `cluster status` with both margins, rebuild progress and settle backlog) and metrics (docs/metrics.md) | test_server cases | — | 2 |
+| R15 | *2026-11-11*: a single server's local tier (E55, §15.7): `TIERS`, `tsdb DIR tier add/lost/salvage/status`, tier store META and `requires=tier`, the settle by `tier_after_s` and by `tier_high_pct` on R7's settle with k' = 1, m = 0 objects, reads by `pread` through the seam, the lost-store open check, followers and health domains over tier stores, scrub of tier stores (E25, no repair source: reported), `fuzz_tiers` | `make jepsen` on one server with a tier on outagefs (kill and power during a settle, EIO and stuck on the tier store, the tier lost); fuzz 1 h | 8 | 3-4 |
 | R10 | Redundancy change on a running volume (§6.4: order, re-encode, `MK_UNSETTLE`); in 0.11.0 (E33) | jepsen-cluster with a conversion running | 6 | 3 |
 | R11 | Benchmarks (§10.4, NVMe and HDD storage) and the sizing numbers for P5's guide (compute disks, index and rebuild time, m = 4 above 20-30 TB a node), README section, AGENTS.md invariants (the settle cut, chunk fences, `MK_GC`) | the numbers | — | 1-2 |
 | P1 | Versions (E37-E41, §14.1-14.2): the compat triple (`tsdbd --compat`, HELLO, heartbeats, recorded at `init`) and the refusals (peer link, open, a binary older than the cluster version); `CLUSTER_VERSION`, `upgrade check`, `upgrade status` and `upgrade finish`; every behaviour change gated on the cluster version; `node prepare` (triple check, margin check, hold, leadership and Raft-leader hand-off, one at a time); the window message; versioned state files refused on a mismatch; the golden `tests/data/meta-snap-v3.bin` for converters. No reader of older versions and no AGENTS.md change (E40) | meta-soak with members of two builds of one triple (a member held back stands in for the old build); test_server cases | 4 | 3-4 |
@@ -798,21 +836,25 @@ Track-days as in design-ha-modes.md §7 (build, review and fix rounds); gate hou
 | P5 | The production operator guide (E44, §14.5): `docs/cluster-operations.md`, systemd units in `dist/`, runbook scripts in `tests/cluster/runbooks/` | the runbook tests | 3 | 3-4 |
 | P6 | Release gates (E45) on the release commit: jepsen-cluster's full set on all four geometries and `replicas=3` (§10.3), the 72-hour soak (§10.5), the upgrade test, the reviews, and the fixes they find | the gates themselves | 96 (24 + 72) | 2-4 |
 
-R5-R14: **30-40 track-days**, 64 gate hours (R11 is 1-2 since the guide moved to P5). P1-P6: **14-21 track-days**,
-115 gate hours. **Total for 0.11.0, with the prerequisites: about 57-81 track-days and 222 gate hours (about 9.25
-machine-days, 3 of them the soak) before reruns after fixes** (2026-11-09, after the user's answers; it was 44-60
+R5-R15: **35-46 track-days**, 76 gate hours (R11 is 1-2 since the guide moved to P5; *2026-11-11*: R13 +2 track-days and
++4 hours, R15 3-4 and 8, E56; it was 30-40 and 64). P1-P6: **14-21 track-days**,
+115 gate hours. **Total for 0.11.0, with the prerequisites: about 62-87 track-days and 234 gate hours (about 9.75
+machine-days, 3 of them the soak) before reruns after fixes** (*2026-11-11*, with device classes; it was 57-81 and 222) (2026-11-09, after the user's answers; it was 44-60
 track-days and 107 gate hours with R10 as the first cut and the cluster data a preview, and 59-84 and 226 in the
 draft that read the previous minor's files in place, which the user rejected the same day with E40). On three tracks that is
 roughly 6-8 weeks of calendar: 4-6 weeks of building and reviewing, set by the review rounds, then P6's gates run in
 series on the release commit (about 5 machine-days), and a failed soak costs another 72 hours. R5 and R6 need nothing
-and can start now; R7 needs R2; R8 needs R3 and S2; R12 and R13 need R8; R9 needs R4 and R8; R14 runs alongside R9;
+and can start now; R7 needs R2; R8 needs R3 and S2; R12 and R13 need R8 (R13's balancing by class lands in R9's
+balancer, so R13 follows R9); R15 needs only R7, so a single server's tier can be built and gated before the cluster
+steps; R9 needs R4 and R8; R14 runs alongside R9;
 P1 needs R8 (it versions metadata v3) and should land before R9, so that every later writer is gated from the start;
 P2 needs P1 and R9; P3 needs R7 and R8, its nemesis R9; P4 and P5 need R14, P5 also P1 and P3; P6 comes last.
 
 **What waits**: the S3/isod backend and the external cold tier (§9.4); local repair codes; shipping merges; partial
 rebuild of a returning log replica from position ranges (design-cluster.md "Later"; E29's retention covers the
 30-minute and held cases); direct-mode clients (S3 of design-ha-modes.md, forwarding serves until then); upgrading
-a rack at a time (E38); a cluster-wide consistent backup (E42). Nothing of R5-R14 or P1-P6 moves to 0.12 (E33).
+a rack at a time (E38); a cluster-wide consistent backup (E42); a disk cache of chunks on NVMe and more classes than
+fast and capacity (E48); a tier for shared-mode volumes (E55). Nothing of R5-R15 or P1-P6 moves to 0.12 (E33).
 
 ## 12. What intellistream-objects gives, and what not
 
@@ -992,12 +1034,240 @@ section, each with what tsdb does, what the operator does, and the commands):
 Limits, not previews: each volume is backed up at its own position, not at one cluster-wide instant; upgrades go one
 server and one minor release at a time.
 
+## 15. Device classes: NVMe and hard drives in one server (E47-E56)
+
+The user asked on 2026-11-11 whether hot data can sit on mirrored SSDs and cold data in an erasure-coded pool, and,
+after hearing that this design gave each server one role, "yes do that, so one instance can cover both nvme and hard
+drives". The two tiers already exist (E3): young data replicated on m + 1 servers, settled partitions erasure coded.
+What was missing is the disk: until now a server was compute or storage, and a server with both NVMe and hard drives
+had no way to say which disk is which. This section gives every disk a class and lets placement follow it, in a
+cluster and on a single server.
+
+"Mirrored SSD" here is the log group: m + 1 copies of the young tier on fast disks of m + 1 servers, not RAID 1 inside
+one server. RAID under the young tier is allowed (it is just a file system to tsdbd) but not needed; under chunks E27
+advises against it (redundancy on redundancy).
+
+### 15.1 Declaring disks (E47)
+
+```
+tsdbd --cluster ... --state-dir /boot-mirror/tsdb \
+      --disk /nvme0/tsdb --disk /nvme1/tsdb \
+      --disk /hdd00/tsdb:hdd --disk /hdd01/tsdb ... --disk /hdd23/tsdb
+```
+
+Each `--disk` is one file system on one disk (or one RAID set the operator chooses to treat as one). The class is
+`nvme`, `ssd` or `hdd`; when it is left out, tsdbd finds it at start:
+1. `stat(PATH)` gives the device number; `/sys/dev/block/MAJ:MIN` gives the block device; a partition is replaced by
+   its disk.
+2. A device with `slaves/` (dm-crypt, LVM, md) is replaced by all of its slaves, recursively.
+3. If every leaf is named `nvme*`, the class is `nvme`; if every leaf has `queue/rotational` 0, `ssd`; if every leaf
+   has 1, `hdd`.
+4. Otherwise tsdbd refuses to start: "--disk /x: cannot tell its class (no block device / devices of different kinds);
+   add :nvme, :ssd or :hdd". That covers NFS, ZFS (whose file systems have no device number of a disk), tmpfs,
+   overlay, btrfs over several devices, and dm-cache or bcache over a mix.
+
+The first time tsdbd uses a disk it writes the **disk META** (store id, node id, cluster uuid) and syncs it with its
+directory; the next heartbeat brings the disk to the metadata group (`STORE_ADD`, with its class, size and uses). From
+then on the metadata is the record: a `--disk` that later names another class, or whose detection now disagrees, is
+refused with both classes named, so a kernel that reports a disk differently, or a typo in a unit file, does not
+move terabytes. `tsdb cluster disk class NODE STORE CLASS` changes it on purpose (`STORE_CLASS`), and the balancer
+then moves what no longer belongs on it. A disk META naming another node or cluster is refused, as a chunk store with
+an unknown id is today (§2.2). In cluster mode `--dir DIR` counts as one more `--disk DIR`.
+
+### 15.2 What lives where (E48)
+
+| On a fast disk (`nvme`, `ssd`) | On a capacity disk (`hdd`) |
+|---|---|
+| log replicas `v<N>/`: WAL segments, MANIFEST, SERIES, STATES, REPL, FNO, young parts, `.ec` index files, retained segments (E29), rebuild snapshots | chunk stores `s<N>/`: chunk files, the per-volume `EPOCH` |
+| chunk stores too, but only on a server without capacity disks, up to `shared_chunk_pct` (60%) of the disk (E50) | log replicas only with `log_on_hdd` on a server without fast disks (E50) |
+| the disk META | the disk META |
+
+Not on either: the granule cache (RAM, §3.3) and `--state-dir`, the Raft log and node identity, which the operator
+places (the guide says: a small mirrored boot SSD, so that the loss of a data disk never takes the node's identity;
+tsdbd warns when it detects a hard drive under it). Each chunk store keeps everything it needs on its own disk (its
+`EPOCH` files, and its chunk list, rebuilt by listing at start), so it outlives any other disk of its server (E54).
+
+### 15.3 Placement, rebuild and balancing (E50, E51)
+
+- **Log group** (m + 1 replicas): compute-capable servers (E9); inside a server the fast disk with an `nvme` class
+  before `ssd`, then the most free room below `young_move_pct`. A `replicas=3` volume's three copies are log
+  replicas, so they too live only on fast disks.
+- **Stripe group** (k + m positions): storage-capable servers, one position each (E9); inside a server each chunk goes
+  to a chunk store below its mark, by free room (E27). The balancer picks a stripe group's servers from one class
+  first (servers whose chunk stores are on hard drives, or servers whose chunk stores are on fast disks), and mixes
+  only when one class has fewer than k + m servers that pass E9's rules; health lists mixed volumes.
+- **Rebuilds and moves never change the use**: a log replica is rebuilt as a learner on a fast disk, a chunk on a chunk
+  store. Room to rebuild is counted per class (§5.6's fill mark over capacity disks; E21's m + 2 rule over servers
+  with a fast disk), and `cluster status` shows both.
+- **Moves inside a server**: a log replica on a fast disk above `young_move_pct` becomes a learner on another fast
+  disk of the same server (copied from an ISR member like any learner, design-cluster.md §8.1), then the old one is
+  dropped; the balancer prefers this to moving it to another server.
+
+### 15.4 Filling, capacity accounting and alerts (E53)
+
+Each disk reports in its heartbeats its size and its bytes by use: young data (WAL, young parts, retained segments),
+index (`.ec` files), chunks. The metadata leader sums them per class; `tsdb cluster status` prints:
+
+```
+class  disks  size     young    index   chunks   free    fill mark   days to mark
+nvme   22     169 TB   35 TB    20 TB   0        110 TB  80%/90%     -
+hdd    132    1.32 PB  -        -       1.10 PB  220 TB  91%         7
+```
+
+| Class | 75% | 80% | 90% | Fill mark (§5.6) |
+|---|---|---|---|---|
+| fast, holding log replicas | warning alert | log replicas move off (same server first) | inserts refused (UNAVAILABLE, `TSDB_WHY_FULL`) for the volumes with a log replica on that disk | — |
+| capacity | — | — | — | no new chunks (rebuilds may go to `full`); settles that cannot place their chunks wait, young data then grows on the fast disks, so the "full within 7 days" alert leaves time |
+| fast, shared with chunks (E50) | warning | log replicas move | inserts refused as above | chunks stop at 60% of the disk |
+
+E30's refusal already existed; it is now per disk, because an NVMe of one server fills by the volumes placed on it,
+not by the server's total. The four alerts join `dist/alerts/tsdb-cluster.rules.yml` with runbooks (E43, E44):
+`TsdbFastDiskFilling`, `TsdbInsertsRefusedFull`, `TsdbCapacityClassFull7d` (a linear prediction over the last day),
+`TsdbNoRoomToRebuild{class}`.
+
+### 15.5 Mixed clusters and roles (E49)
+
+| A server's disks | It can be | Typical use |
+|---|---|---|
+| NVMe and hard drives | compute and storage: young tier on the NVMe, chunks on the hard drives | the user's case: one instance per box |
+| NVMe (or SSD) only | compute and storage: young tier and chunks share the NVMe (chunks up to 60%) | small or all-flash clusters, today's `both` |
+| NVMe only, `--role compute` | compute | separated clusters (§9): leaders, young data, indexes, cache |
+| hard drives only | storage | chunk servers |
+| hard drives only, `log_on_hdd` on | compute (slow inserts) and storage | a cluster with no fast disk at all; health warns |
+| any, `--role storage` | storage | a box kept out of leadership |
+
+A cluster may mix all of these. `cluster init`'s default redundancy (E34) counts storage-capable servers; with mixed
+servers `ec=4+2` with 7 of them is the default as before. Ingest capacity (§4) counts compute-capable servers; sizing
+(§4) is now per class: the compute numbers of §4 are NVMe, the chunk numbers hard drives. A worked example, the 8+2
+cluster of §4 as 11 mixed servers: per server two 7.68 TB NVMe disks (15 TB: 3.2 TB young data, 1.8 TB of index,
+retained segments, headroom to 75%) and 12 × 10 TB hard drives (100 TB of chunks below the 91% mark of §5.6 for 11
+servers). The `cluster status` above is that cluster a week before its hard drives reach the mark.
+
+### 15.6 A lost disk, by class (E54)
+
+- **A hard drive**: E27 and §5.5 unchanged. Its chunks are rebuilt onto the server's other hard drives while they are
+  below their mark (D/disks: 100 TB on 24 drives is about 4 TB, a few hours at `rebuild_mb_s`), else its positions
+  move to other servers by copy. Never onto the server's NVMe.
+- **An NVMe holding log replicas**: the replicas on it stop answering; each leaves its ISR after `isr_lag_ms` and
+  writes go on (E4, E24: an EC volume with `min_isr = m` refuses writes only if more of its log replicas are out);
+  volumes it led fail over in seconds (design-cluster.md §6). After `rebuild_after` (or `disk out` at once) they are
+  rebuilt as learners: on another fast disk of the same server when it has room below `young_move_pct`, else on
+  another compute-capable server; most endangered first (E13). Meanwhile **the server's hard drives go on serving
+  their chunks** (reads, puts of new settles, scrub, rebuild sources): a chunk store needs no other disk (E48), and
+  the chunk service runs without an engine. If it was the server's last fast disk, the server is storage-only until
+  `disk replace` adds one.
+- **The disk holding `--state-dir`**: the node's Raft log and identity are gone. The server starts as a new node
+  (new state directory, `node add`); `tsdb cluster node replace OLD NEW` gives it OLD's positions (E28), and for
+  every disk whose META names OLD and whose store id and chunk list match the metadata's, it **adopts the store**
+  instead of filling it: nothing is copied. Log replicas whose directories survive are not adopted (a replica
+  directory restored or carried to a new identity is a lost disk, design-cluster.md gap 14): they are rebuilt.
+- **A server with both classes lost whole**: §5.3 as written, the log replicas onto other fast disks and the chunks onto
+  other servers' chunk stores, each paced by margin.
+
+### 15.7 One server: the local tier (E55)
+
+A single tsdbd (no cluster) with NVMe and hard drives can keep recent partitions on the NVMe and older ones on the hard
+drives. Today a single server can already put a **volume** on a hard drive (`tsdb DIR volume add /hdd/v1`), but that
+is not tiering: a series stays in its volume for life, so all its data, today's included, would be on the hard drive.
+
+```
+tsdb /nvme/db tier add /hdd0/tsdb-tier          # class detected (hdd), or /hdd0/tsdb-tier:hdd
+tsdb /nvme/db tier add /hdd1/tsdb-tier
+tsdb /nvme/db tier set --after 7d [--volume N]   # tier_after_s, per volume or all
+tsdb /nvme/db tier status                         # stores, bytes per volume, settles waiting, damage
+```
+
+- **Where it is recorded**: `TIERS`, beside VOLUMES in the root directory, append-only with checksummed records (store
+  id, path, class, state), written under the VOLUMES OFD lock and synced with its directory before the store is used,
+  as AGENTS.md "Volumes" does for adds; the store's META holds its id. A volume that has settled to a store gets
+  `requires=tier` in its META, so an older binary refuses it. tsdbd takes no flag: a database whose settled partitions
+  live elsewhere must not open without them, and a flag can be forgotten.
+- **When a key moves**: `tier_after_s` (7 days by default) after its end, by the settle rule of E5 with that grace
+  instead of `settle_grace_s` (coarse keys of classes 1-3 part by part, E5); and earlier, oldest key first, while the
+  volume's file system is above `tier_high_pct` (80%). Retention and partition classes are unchanged: a key that
+  expires is dropped whether it is on the tier or not (the object is deleted after `obsolete_part_lifetime_s`).
+- **How it moves**: E6's settle at a cut on one replica (R7 builds and gates exactly this case with the directory
+  backend). The object is the part file unchanged, k' = 1, m = 0, with its encode-time cell sums (E26), written to the
+  store with the most free room as `tmp_*`, fsync'd, renamed, directory fsync'd; then the `.ec` index file is written
+  in the volume directory and the full part retired under `publish_lock`, through the settle intent. The settle lists
+  parts, so it folds into the latest table like any publisher (AGENTS.md "The latest table"), with no change to its
+  answers. A crash between the put and the commit leaves an orphan object, deleted at the next open (no committed
+  record names it, and on one server no settle is in flight then).
+- **Reads**: statistics from the `.ec` index on the NVMe, as before. A granule to decode is read from the granule cache
+  or with one `pread` of its byte range from the hard drive (a seek), and checked against its checksum always (E11).
+  The hard-drive file is never mapped: a page fault on a slow or dead disk cannot be timed out or refused.
+- **Late rows, deletes, merges**: §2.4 as in a cluster: late rows go to new young parts above the object; deletes
+  write tombstones; merges never touch `.ec` parts; a re-encode combines a key's objects (`ec_objects_max`).
+- **Failures**: a tier store is one copy on whatever is under it (RAID or ZFS, as for the volume directory today).
+  An I/O error reading it is `TSDB_ERR_IO` for that query; under a `--health-domain` over the store's path an outage
+  makes decoding reads of its partitions UNAVAILABLE while writes and statistics go on. At open every store in TIERS
+  must be there with its id, or the open fails naming it. `tsdb DIR tier lost STORE` declares it gone: its
+  partitions are then lost (E15: `TSDB_ERR_IO` naming the partition, statistics still answer), and `tsdb DIR tier
+  salvage` drops their objects by oid, keeping the young parts. Scrub (E25) reads the stores at `scrub_mb_s`; with no
+  second copy, damage is reported (metrics, health, the partition named), not repaired.
+- **Followers** (`--follow`) open the stores listed in TIERS at the same paths and refuse to start without them;
+  objects of retired keys wait `obsolete_part_lifetime_s` like retired parts. **Shared mode** (ha.md) volumes refuse
+  a tier in 0.11.0. **Embedded**: the engine does all of it, so a tiered database opens in the embedded bindings
+  unchanged; `tier add` is the CLI and the C API (`tsdb_tier_add`).
+- **Production (NFS/ZFS)**: a tier store may be a second export from a hard-drive pool, stated `:hdd` (no device to
+  detect), under its own `--health-domain`.
+
+### 15.8 Formats that freeze at 1.0
+
+The disk META; the member record's disk list (store id, class, uses, size, state), the declared role and capability,
+`STORE_ADD`, `STORE_CLASS`, `log_on_hdd` (all in metadata snapshot version 3, E18, not yet released); `EPOCH` per
+chunk store; `TIERS`, the tier store META and `requires=tier`. `FORMAT_VERSION` stays 9 (E17). §8 lists them.
+
+### 15.9 Tests (E56)
+
+- **Detection**: `test_disks` against a fake `/sys` tree (a test hook for its root): NVMe, SATA SSD, hard drive, a
+  partition, dm-crypt over NVMe, md RAID 1 over two hard drives, dm-cache over a mix (refused), loop, no device
+  (refused); a class change refused at restart and accepted through `disk class`.
+- **One machine, two classes**: the cluster harness (§10.1) gives each server an `:nvme` disk under one scratch file
+  system and `:hdd` disks under another (both stated, since tmpfs or a loop file have no class to detect), the hard
+  drives under outagefs (`tests/jepsen/outagefs.c`) with its `slow MS` mode (a seek on every call) and a new `rate
+  MB/s` cap. Cases: placement by class (no log replica on an `hdd`, no chunk on the NVMe of a mixed server, chunks on
+  the NVMe of an NVMe-only one), one-class stripe groups, an NVMe filled to 75/80/90% under ingest (alert, move, FULL
+  for its volumes only), a lost hard drive, a lost NVMe with every chunk of that server still read, the state
+  directory lost and the stores adopted (bytes copied: 0), `log_on_hdd`.
+- **jepsen-cluster** (R13's gate): single-disk loss of each class, back within 30 minutes, a fast disk filling to
+  FULL; checker as §10.3.
+- **Single server** (R15's gate): `make jepsen` with a tier store on outagefs: kill and power loss (crashfs) during a
+  settle, EIO and stuck on the store, the store lost and salvaged; every answer against the oracle; `fuzz_tiers` on
+  the TIERS file; test_outage with a health domain over the store.
+- **Benchmarks** (R11, quiet machine, 5 runs): cold decode queries from a tier on a real hard drive where the machine
+  has one, else not claimed; the shim's numbers are not hardware numbers.
+
+### 15.10 Cost
+
+R13 becomes "disks with classes": 4-5 track-days and 10 gate hours instead of 2-3 and 6. R15, the single server's
+tier: 3-4 track-days and 8 gate hours, needing only R7, so it can be gated long before the cluster steps. P4 and P5
+take the four alerts and their runbooks within their estimates. The total for 0.11.0 rises from 57-81 to **62-87
+track-days** and from 222 to **234 gate hours** (§11).
+
 ## Open questions
 
 None. The five open questions of the revised draft were answered by the user on 2026-11-09: the licence (E32), what
 0.11.0 holds (E33), the default redundancy (E34), the young tier's ISR floor (E35), and preview against production
 (E36). The decisions that production then required (E37-E46) were made in this revision with their rejected
 alternatives; the user may change them.
+
+**Device classes (2026-11-11, §15)**, four questions, each with the recommended answer:
+
+1. **How long does a single server keep a partition on the NVMe?** `tier_after_s` defaults to 7 days after the key's
+   end (E55), with the 80% space trigger moving older keys sooner. *Recommended: 7 days*: dashboards mostly decode the
+   last days, and the space trigger covers a small NVMe. The alternatives are 1 day (less NVMe, more seeks) or off until
+   the operator sets it.
+2. **In a cluster whose stripe groups are on hard drives, does yesterday stay on NVMe?** Today a key settles one hour
+   after its end (E5), so yesterday's decoding queries seek on hard drives after a cache miss (§3.4: 6-12 ms per cold
+   query instead of 0.7). *Recommended: keep `settle_grace_s` at 1 h and `ec_keep_local_h` at 0 by default*, and the
+   operator guide recommends `ec_keep_local_h = 24` where yesterday is decoded often: it costs one more copy of a day
+   on the leader's NVMe, not m + 1.
+3. **Should `log_on_hdd` exist?** It lets a cluster with no fast disk run (E50). *Recommended: yes, off by default,
+   health warning while used*; without it an all-HDD site cannot run the cluster at all.
+4. **Do the embedded bindings (Rust, Python, Java) get `tier add` in 0.11.0?** A tiered database opens in them
+   unchanged (the engine does the work). *Recommended: no; the CLI and the C API only*, so the clients' surface does
+   not grow for an operator task.
 
 ## Unverified assumptions
 
@@ -1015,3 +1285,9 @@ alternatives; the user may change them.
   longer, `node prepare`'s default hold of 30 minutes is raised).
 - EU8: A daily incremental backup copies about 1-3 days of ingest: the day's rows, and young parts again each time
   merges rewrite them before their key settles (P3 measures it on the soak's ingest).
+- EU9: The detection rule of §15.1 (`nvme*` names, `queue/rotational`, dm and md slaves) gives the right class on
+  AlmaLinux 10 kernels for NVMe, SATA SSD, hard drives, LUKS and md (`test_disks` checks the rule on a fake `/sys`, not
+  the kernels' reports; R13 checks it on the test machines' disks).
+- EU10: A single server's tier answers a cold decode query in one seek per granule range not cached, 6-12 ms for
+  §3.4's one-series window, and the settle's copy (sequential writes) does not slow queries on the NVMe (R11 measures
+  it on a machine with a hard drive).
