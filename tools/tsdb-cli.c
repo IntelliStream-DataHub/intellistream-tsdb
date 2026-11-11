@@ -1199,7 +1199,7 @@ static char **cli_with_cfg(const struct cfg *c, int *argc, char **argv, const ch
     memcpy(nv + *argc, a, n * sizeof *nv);
     nv[*argc + (int)n] = NULL;
     *argc += (int)n;
-    free(a);
+    /* a is not freed: the "--option" strings of the new argv live inside it (the process ends with the command) */
     return nv;
 }
 
