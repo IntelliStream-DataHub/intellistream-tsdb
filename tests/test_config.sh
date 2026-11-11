@@ -23,6 +23,7 @@ alive() {
 # stop_srv PID: SIGTERM, then SIGKILL after 10 s (never a bare wait: a server that ignores the signal would hang make test)
 stop_srv() {
     local i
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 1 ] || { echo "test_config: stop_srv: refusing pid '$1'" >&2; return 1; }
     kill "$1" 2>/dev/null
     for ((i = 0; i < 100; i++)); do alive "$1" || break; sleep 0.1; done
     alive "$1" && kill -9 "$1" 2>/dev/null
