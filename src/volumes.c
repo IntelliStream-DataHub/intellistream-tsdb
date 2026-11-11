@@ -1899,6 +1899,20 @@ void tsdb_test_meta_release(void *hold)
     free(h);
 }
 
+/* The capacity of the arrays the active memtable holds for series id (0: none), for tests/test_failstop.c */
+size_t mt_test_cap(const memtable *m, uint32_t local);
+size_t tsdb_test_mem_cap(tsdb *t, tsdb_sid id)
+{
+    eng *e EREF = NULL;
+    uint32_t local;
+    if (!route(t, id, &e, &local))
+        return 0;
+    pthread_mutex_lock(&e->buf_lock);
+    size_t cap = mt_test_cap(e->active, local);
+    pthread_mutex_unlock(&e->buf_lock);
+    return cap;
+}
+
 int tsdb_test_deferred_retires(tsdb *t) { return atomic_load_explicit(&t->ndeferred, memory_order_relaxed); }
 
 size_t tsdb_test_kept_names(tsdb *t)
