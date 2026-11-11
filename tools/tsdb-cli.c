@@ -1199,7 +1199,13 @@ static char **cli_with_cfg(const struct cfg *c, int *argc, char **argv, const ch
     memcpy(nv + *argc, a, n * sizeof *nv);
     nv[*argc + (int)n] = NULL;
     *argc += (int)n;
-    /* a is not freed: the "--option" strings of the new argv live inside it (the process ends with the command) */
+    /* a and nv are not freed: the "--option" strings of the new argv live inside them (the process ends with the
+     * command); the statics keep them reachable, so LeakSanitizer does not report them */
+    static char **volatile keep_a, **volatile keep_nv;
+    keep_a = a;
+    keep_nv = nv;
+    (void)keep_a;
+    (void)keep_nv;
     return nv;
 }
 
@@ -1224,7 +1230,7 @@ int main(int argc, char **argv)
             break;
         }
     }
-    struct cfg cfg = {0};
+    static struct cfg cfg; /* static: the argv built from it (cli_with_cfg) points into it until the process ends */
     int have_cfg = 0, cfg_tried = 0;
     if (cfg_path && !no_config) { /* a file that is named is checked whatever the command does with it */
         have_cfg = cli_cfg_load(&cfg, cfg_path, 0);
