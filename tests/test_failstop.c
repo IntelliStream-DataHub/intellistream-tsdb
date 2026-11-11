@@ -1922,8 +1922,13 @@ static void test_backpressure_guards(const char *base)
         snprintf(name, sizeof name, "%s/failstop-bpguards%d", base, c);
         tsdb_options o = opts();
         o.buffer_rows = 200;
-        o.wal_sync_ms = 10000; /* the WAL is synced by the timer: the write is acknowledged at its append */
+        /* the WAL is synced by the timer: the write is acknowledged at its append. The flusher thread syncs once at its
+         * start (its last sync counts from 0) and then every wal_sync_ms: an hour keeps the second out of the test, and
+         * the wait lets the first happen before the writes, or a starved flusher (tsan next to other jobs) would sync
+         * the rows the failing commit is to find unsynced */
+        o.wal_sync_ms = 3600000;
         tsdb *db = open_fresh(name, o);
+        usleep(300000);
         tsdb_sid id;
         OK(tsdb_series(db, "s", &id));
         bp_db = db, bp_hits = 0, bp_flag = 0;
