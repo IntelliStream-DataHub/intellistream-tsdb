@@ -3735,6 +3735,10 @@ int main(int argc, char **argv)
                 nv[w++] = argv[i];
             nv[w] = NULL;
             free(ca);
+            /* nv lives until the process ends (optarg points into it); the static keeps it reachable for LeakSanitizer */
+            static char **volatile keep_nv;
+            keep_nv = nv;
+            (void)keep_nv;
             argv = nv;
             argc = w;
         }
