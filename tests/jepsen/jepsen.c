@@ -1629,7 +1629,8 @@ static void *nemesis_thread(void *arg)
         }
         useconds_t mnap = !strncmp(mm, "nap:", 4) ? (useconds_t)atoi(mm + 4) * 1000 : 0; /* naps that do not watch */
         nap(mnap ? mnap : idle_mutant_long ? 5000000 : 150000 + (useconds_t)(r % 600000),
-            ((!strcmp(nemesis, "power") && crashfs) && !idle_mutant && !idle_mutant_long && !mnap) || md);
+            (((!strcmp(nemesis, "power") && crashfs) || !strcmp(nemesis, "eio")) && !idle_mutant && !idle_mutant_long && !mnap) ||
+                md);
         if (atomic_load(&stop) || atomic_load(&nem_stop))
             break;
         if (!strcmp(mm, "nothing")) /* wakes, does nothing: no plug, no reaping, no restart */
@@ -1689,6 +1690,8 @@ static void *nemesis_thread(void *arg)
                 signal_pid(pid, SIGUSR2);
                 for (int i = 0; i < 100 && access(markpath, F_OK) != 0; i++)
                     usleep(10000);
+            } else if (access(markpath, F_OK) == 0) { /* the shim's own odds fired the fault the nemesis set up (CRASHFS_MODE=eio) */
+                nem_fault();
             }
             if (access(markpath, F_OK) == 0) {
                 for (int i = 0; !gone && i < 100; i++) /* fail-stop takes about 220 ms */
