@@ -36,6 +36,7 @@ struct cfg_key {
 struct cfg_set {
     const struct cfg_key *k;
     char *arg; /* the option's argument (NULL for a flag); one entry per list element */
+    char *optstr; /* "--option", owned by the set: what cfg_args hands out lives as long as the cfg */
     int bval;  /* CFG_BOOL */
     int line;
 };
@@ -56,14 +57,33 @@ void cfg_free(struct cfg *c);
 
 /* The option arguments the file contributes, for the options that do not appear in argv[1..argc) (an argument "--"
  * ends the options). Only keys that start with prefix (NULL: all). A malloc'd array of *n pointers into c: free the
- * array, never its strings. */
+ * array whenever you like; the strings it points to belong to c and live until cfg_free(c). */
 char **cfg_args(const struct cfg *c, int argc, char **argv, const char *prefix, size_t *n);
 
-/* Does argv carry the option of k? If so and val is not NULL, *val is its argument (or "true"/"false" for a flag). */
+struct option;
+/* The argv for getopt_long of a program whose options are opts: argv[0], then the file's settings (c may be NULL), then
+ * argv[1..argc) with two changes. (1) A flag of the table may be written --FLAG=true or --FLAG=false on the command
+ * line: the file can say true where the default is false and the command line must be able to say it back. =true
+ * becomes the bare flag and =false drops out (the option is the default's side then); a flag on the command line
+ * in either form keeps the file's value out, like every option on it. (2) An abbreviated long option (getopt_long
+ * accepts --work for --workers) is refused: the table's rule "an option on the command line is not taken from the
+ * file" matches names exactly, and an abbreviation would pass as absent and be applied twice. The result is a malloc'd
+ * block (the strings of (1) are inside it) that must stay alive as long as the options are read from it (optarg points
+ * into it): a program that parses once and ends keeps it. NULL with a message in err on an abbreviation or when out of
+ * memory. *nargc is the new count. */
+char **cfg_argv(const struct cfg *c, int argc, char **argv, const struct option *opts, const struct cfg_key *tab,
+                size_t ntab, int *nargc, char *err, size_t errsz);
+
+/* Does argv carry the option of k? If so and val is not NULL, *val is its argument (or "true"/"false" for a flag: the
+ * value of the key, so for a --no-X option --no-X is "false" and --no-X=false is "true"). */
 int cfg_on_cmdline(int argc, char **argv, const struct cfg_key *k, const char **val);
 
 /* "key (path:line)" for an argument that cfg_args handed out, else NULL (it came from the command line). */
 const char *cfg_where(const struct cfg *c, const char *arg, char *buf, size_t sz);
+
+/* "key (path:line)" when the option opt (without dashes) is in effect through the file: a key of the file set it, and
+ * the command line does not carry it. Else NULL. */
+const char *cfg_where_opt(const struct cfg *c, int argc, char **argv, const char *opt, char *buf, size_t sz);
 
 /* The effective settings as a .properties file: each key with its value, and a comment above it that says where the
  * value came from (the command line, path:line, or the default). c may be NULL. */

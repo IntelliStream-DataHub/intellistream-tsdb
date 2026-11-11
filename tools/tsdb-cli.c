@@ -1150,21 +1150,34 @@ static const struct cfg_key cli_keys[] = {
 #define CLI_NKEYS (sizeof cli_keys / sizeof cli_keys[0])
 
 /* 1: loaded into *c; 0: no file (none named, none in the usual places); exits with status 2 when one is wrong. */
+/* 1: the file is there, 0: it is not (ENOENT, ENOTDIR); any other error is a file that exists and cannot be looked
+ * at: not "no file", which would run on defaults without a word. */
+static int cfg_exists(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) == 0)
+        return 1;
+    if (errno != ENOENT && errno != ENOTDIR) {
+        fprintf(stderr, "tsdb: %s: %s\n", path, strerror(errno));
+        exit(2);
+    }
+    return 0;
+}
+
 static int cli_cfg_load(struct cfg *c, const char *path, int none)
 {
     char buf[4096], err[1024];
-    struct stat st;
     if (none)
         return 0;
     if (!path) {
         const char *x = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME");
         if (x && *x == '/' && snprintf(buf, sizeof buf, "%s/tsdb/tsdb.properties", x) < (int)sizeof buf &&
-            stat(buf, &st) == 0)
+            cfg_exists(buf))
             path = buf;
         else if (h && *h == '/' && snprintf(buf, sizeof buf, "%s/.config/tsdb/tsdb.properties", h) < (int)sizeof buf &&
-                 stat(buf, &st) == 0)
+                 cfg_exists(buf))
             path = buf;
-        else if (stat("/etc/tsdb/tsdb.properties", &st) == 0)
+        else if (cfg_exists("/etc/tsdb/tsdb.properties"))
             path = "/etc/tsdb/tsdb.properties";
         else
             return 0;
@@ -1199,12 +1212,10 @@ static char **cli_with_cfg(const struct cfg *c, int *argc, char **argv, const ch
     memcpy(nv + *argc, a, n * sizeof *nv);
     nv[*argc + (int)n] = NULL;
     *argc += (int)n;
-    /* a and nv are not freed: the "--option" strings of the new argv live inside them (the process ends with the
-     * command); the statics keep them reachable, so LeakSanitizer does not report them */
-    static char **volatile keep_a, **volatile keep_nv;
-    keep_a = a;
+    free(a); /* the strings are the cfg's, which lives until the process ends */
+    /* nv is not freed: the new argv is read until the command ends; the static keeps it reachable for LeakSanitizer */
+    static char **volatile keep_nv;
     keep_nv = nv;
-    (void)keep_a;
     (void)keep_nv;
     return nv;
 }

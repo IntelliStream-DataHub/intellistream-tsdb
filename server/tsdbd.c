@@ -3696,7 +3696,7 @@ int main(int argc, char **argv)
     char **orig_argv = argv;
     {
         const char *cfg_path = NULL;
-        int no_config = 0;
+        int no_config = 0, harness = 0;
         for (int i = 1; i < argc && strcmp(argv[i], "--"); i++) {
             if (!strcmp(argv[i], "--config-keys")) {
                 cfg_print_markdown(stdout, tsdbd_keys, TSDBD_NKEYS);
@@ -3708,40 +3708,44 @@ int main(int argc, char **argv)
                 cfg_path = argv[i] + 9;
             else if (!strcmp(argv[i], "--no-config"))
                 no_config = 1;
+            else if (!strcmp(argv[i], "--exit-with-parent") || !strncmp(argv[i], "--exit-with-parent=", 19))
+                harness = 1;
         }
-        struct stat cst;
         if (no_config)
             cfg_path = NULL;
-        else if (!cfg_path && stat(CONFIG_DEFAULT, &cst) == 0)
-            cfg_path = CONFIG_DEFAULT; /* not an error to be absent; an error to be unreadable or wrong */
-        if (cfg_path) {
-            char err[1024];
-            if (cfg_load_file(cfg_path, tsdbd_keys, TSDBD_NKEYS, &g_cfg, err, sizeof err) != 0) {
-                fprintf(stderr, "tsdbd: %s\n", err);
+        else if (!cfg_path && !harness) {
+            /* The place the unit reads. Not under --exit-with-parent, the flag of the test harnesses (AGENTS.md): a
+             * test's server must not take the metrics port, the login, the fsync or the cluster of the service that is
+             * installed on the machine; a harness that wants a file names it. */
+            const char *dflt = getenv("TSDBD_DEFAULT_CONFIG"); /* where the tests put one without /etc */
+            if (!dflt || !*dflt)
+                dflt = CONFIG_DEFAULT;
+            struct stat cst;
+            if (stat(dflt, &cst) == 0)
+                cfg_path = dflt;
+            else if (errno != ENOENT && errno != ENOTDIR) { /* unreadable is not absent: it would run on defaults */
+                fprintf(stderr, "tsdbd: %s: %s\n", dflt, strerror(errno));
                 return 2;
             }
-            size_t nca;
-            char **ca = cfg_args(&g_cfg, argc, argv, NULL, &nca);
-            char **nv = ca ? malloc((size_t)(argc + 1) * sizeof *nv + nca * sizeof *nv) : NULL;
-            if (!nv) {
-                fprintf(stderr, "tsdbd: out of memory\n");
-                return 2;
-            }
-            int w = 0;
-            nv[w++] = argv[0];
-            for (size_t i = 0; i < nca; i++)
-                nv[w++] = ca[i];
-            for (int i = 1; i < argc; i++)
-                nv[w++] = argv[i];
-            nv[w] = NULL;
-            free(ca);
-            /* nv lives until the process ends (optarg points into it); the static keeps it reachable for LeakSanitizer */
-            static char **volatile keep_nv;
-            keep_nv = nv;
-            (void)keep_nv;
-            argv = nv;
-            argc = w;
         }
+        char err[1024];
+        if (cfg_path && cfg_load_file(cfg_path, tsdbd_keys, TSDBD_NKEYS, &g_cfg, err, sizeof err) != 0) {
+            fprintf(stderr, "tsdbd: %s\n", err);
+            return 2;
+        }
+        /* nv lives until the process ends (optarg points into it); the static keeps it reachable for LeakSanitizer.
+         * The strings of the file's options belong to g_cfg, which is never freed. */
+        static char **volatile keep_nv;
+        int nargc = 0;
+        char **nv = cfg_argv(cfg_path ? &g_cfg : NULL, argc, argv, opts, tsdbd_keys, TSDBD_NKEYS, &nargc, err, sizeof err);
+        if (!nv) {
+            fprintf(stderr, "tsdbd: %s\n", err);
+            return 2;
+        }
+        keep_nv = nv;
+        (void)keep_nv;
+        argv = nv;
+        argc = nargc;
     }
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
@@ -3960,9 +3964,14 @@ int main(int argc, char **argv)
         return 1;
     }
     /* A13: login unless --no-auth, and then a superuser must exist; USERS is read before anyone connects */
-    if (no_auth)
-        fprintf(stderr, "tsdbd: --no-auth: no login, every client may read and write every series (user admin ops "
-                        "are refused, A28): listen on a trusted interface only\n");
+    if (no_auth) {
+        char wb[512];
+        const char *w = cfg_where_opt(g_cfg.path ? &g_cfg : NULL, orig_argc, orig_argv, "no-auth", wb, sizeof wb);
+        fprintf(stderr, "tsdbd: %s%s: no login, every client may read and write every series (user admin ops "
+                        "are refused, A28): listen on a trusted interface only%s\n",
+                w ? "" : "--no-auth", w ? w : "",
+                w ? "; set by the configuration file (--no-auth=false on the command line turns login back on)" : "");
+    }
     g_reader_only = o.read_only || o.follow;
     if (auth_init(dir, !no_auth, !o.read_only && !o.follow, db) != 0) {
         tsdb_close(db);

@@ -15,6 +15,7 @@ me=$BASHPID
 srv=""
 cleanup() {
     [ -n "$srv" ] && kill "$srv" 2>/dev/null && wait "$srv" 2>/dev/null
+    chmod -R u+rwx "${dir:?}" 2>/dev/null
     command rm -rf "${dir:?}"
 }
 trap cleanup EXIT
@@ -120,10 +121,100 @@ check "no file with --no-config" "$(echo "$out" | grep '^server.port = ')" "serv
 cfg lst2.properties 'storage.dir = /x' 'health.domains = /mnt/a, /mnt/b'
 out=$("$B/tsdbd" --config "$dir/lst2.properties" --health-domain /mnt/z --check-config 2>&1)
 check "list replaced" "$(echo "$out" | grep '^health.domains')" "health.domains = /mnt/z"
-# a flag on the command line wins over the file's false
-cfg flag.properties 'storage.dir = /x' 'auth.enabled = false'
-out=$("$B/tsdbd" --config "$dir/flag.properties" --check-config 2>&1)
-check "auth off from the file" "$(echo "$out" | grep '^auth.enabled')" "auth.enabled = false"
+# a flag set in the file is undone on the command line with --FLAG=false, and set with --FLAG=true (--no-X flags: the
+# option's own truth, so --no-auth=false is login on)
+cfg flag.properties 'storage.dir = /x' 'auth.enabled = false' 'storage.fsync = false' 'storage.read.only = true' \
+    'storage.pin.index = false'
+shown() { # shown KEY CMD...: the effective value of KEY and where it comes from
+    local k=$1 o
+    shift
+    o=$("$@" --check-config 2>&1) || { echo "refused: $o"; return; }
+    echo "$o" | grep -B1 "^$k = " | tr '\n' '|' | sed "s|$dir/||"
+}
+F="$B/tsdbd --config $dir/flag.properties"
+check "auth off from the file" "$(shown auth.enabled $F)" "# flag.properties:2|auth.enabled = false|"
+check "fsync off from the file" "$(shown storage.fsync $F)" "# flag.properties:3|storage.fsync = false|"
+check "--no-auth=false" "$(shown auth.enabled $F --no-auth=false)" "# command line|auth.enabled = true|"
+check "--no-auth=true" "$(shown auth.enabled $F --no-auth=true)" "# command line|auth.enabled = false|"
+check "--no-auth" "$(shown auth.enabled $F --no-auth)" "# command line|auth.enabled = false|"
+check "--no-fsync=false" "$(shown storage.fsync $F --no-fsync=false)" "# command line|storage.fsync = true|"
+check "--read-only=false" "$(shown storage.read.only $F --read-only=false)" "# command line|storage.read.only = false|"
+check "--pin-index=true" "$(shown storage.pin.index $F --pin-index=true)" "# command line|storage.pin.index = true|"
+refused "a flag with a word that is no boolean" 'read-only' $F --read-only=maybe --check-config
+# the same at run time: login is off in the file; --no-auth=false asks for it, and a database without a superuser
+# then refuses to start (without the override the server would run with no login)
+mkdir -p "$dir/db0"
+cfg runflag.properties "storage.dir = $dir/db0" 'server.listen = 127.0.0.1' 'server.port = 0' \
+    "server.port.file = $dir/port0" 'auth.enabled = false' 'server.io = epoll'
+"$B/tsdbd" --config "$dir/runflag.properties" --no-auth=false --exit-with-parent=$me > "$dir/log0" 2>&1 &
+p0=$!
+wait "$p0"
+check "--no-auth=false at run time: tsdbd refuses a database with no superuser" "$?" 1
+grep -q 'superuser' "$dir/log0" || fail "--no-auth=false at run time: no word about a superuser: $(tail -3 "$dir/log0")"
+command rm -f "$dir/port0"
+"$B/tsdbd" --config "$dir/runflag.properties" --exit-with-parent=$me > "$dir/log0" 2>&1 &
+p0=$!
+for _ in $(seq 1 100); do
+    [ -s "$dir/port0" ] && break
+    kill -0 "$p0" 2>/dev/null || break
+    sleep 0.1
+done
+[ -s "$dir/port0" ] || fail "tsdbd with auth.enabled = false did not start: $(tail -3 "$dir/log0")"
+kill "$p0" 2>/dev/null
+wait "$p0" 2>/dev/null
+# and its warning says where the setting came from
+grep -q 'auth.enabled (.*runflag.properties:5): no login' "$dir/log0" \
+    || fail "the no-login warning does not name the file and line: $(grep -i 'no login' "$dir/log0")"
+# abbreviations: getopt_long takes --work for --workers, but the rule "the command line wins" needs the whole name
+cfg abbr.properties 'storage.dir = /x' 'server.workers = 3' 'health.domains = /mnt/a' 'server.port.file = /x/pf'
+for a in "--work 2" "--workers=2 --port-f /tmp/pf" "--health-dom /mnt/b" "--no-au"; do
+    refused "abbreviated option $a" 'abbreviation' "$B/tsdbd" --config "$dir/abbr.properties" $a --check-config
+done
+refused "abbreviation without a file" 'abbreviation of --workers' "$B/tsdbd" --no-config --work 2 --check-config
+out=$("$B/tsdbd" --config "$dir/abbr.properties" --workers 2 --health-domain /mnt/b --dir --work --check-config 2>&1) \
+    || fail "whole option names refused: $out"
+check "an option's value that looks like an abbreviation" "$(echo "$out" | grep '^storage.dir')" "storage.dir = --work"
+check "whole names win over the file" "$(echo "$out" | grep -B1 '^server.workers' | tr '\n' '|')" "# command line|server.workers = 2|"
+
+# the strings of the file's options must outlive the parse: a freed block that is overwritten (tcache off, freed
+# memory filled) or unmapped (a long list) broke tsdbd's own copy once
+cfg uaf.properties 'storage.dir = /x' 'server.port = 7000' 'server.workers = 3' 'wal.sync = 5ms'
+out=$(GLIBC_TUNABLES=glibc.malloc.tcache_count=0 MALLOC_PERTURB_=165 "$B/tsdbd" --config "$dir/uaf.properties" --check-config 2>&1) \
+    || fail "options built from the file under perturbed free: $out"
+check "values under perturbed free" "$(echo "$out" | grep -c '^server.port = 7000$\|^server.workers = 3$\|^wal.sync = 5ms$')" 3
+{
+    printf 'storage.dir = /x\nhealth.domains = /a'
+    for _ in $(seq 1 10000); do printf ',/a'; done
+    printf '\n'
+} > "$dir/long.properties"
+chmod 600 "$dir/long.properties"
+refused "a list of 10,001 domains" 'at most' env MALLOC_PERTURB_=165 "$B/tsdbd" --config "$dir/long.properties" --check-config
+
+# the default file (/etc/tsdb/tsdbd.properties; TSDBD_DEFAULT_CONFIG puts it elsewhere for the tests): read when there
+# is no --config, not by a test harness's server (--exit-with-parent), never skipped silently when it cannot be seen
+cfg def.properties 'server.port = 7123' 'storage.nope = 1'
+refused "the default file is read" 'def.properties:2' env TSDBD_DEFAULT_CONFIG="$dir/def.properties" "$B/tsdbd" --dir /x --check-config
+out=$(TSDBD_DEFAULT_CONFIG=$dir/def.properties "$B/tsdbd" --no-config --dir /x --check-config 2>&1) || fail "--no-config reads the default: $out"
+out=$(TSDBD_DEFAULT_CONFIG=$dir/def.properties "$B/tsdbd" --exit-with-parent --dir /x --check-config 2>&1) \
+    || fail "a harness's tsdbd read the default file: $out"
+check "a harness's tsdbd ignores the default file" "$(echo "$out" | grep '^server.port = ')" "server.port = 7070"
+out=$(TSDBD_DEFAULT_CONFIG=$dir/def.properties "$B/tsdbd" --exit-with-parent --config "$dir/ok.properties" --check-config 2>&1) \
+    || fail "a harness's tsdbd refused the file it names: $out"
+check "a harness names its file" "$(echo "$out" | grep '^server.port = ')" "server.port = 7000"
+cfg def2.properties 'server.port = 7123'
+out=$(TSDBD_DEFAULT_CONFIG=$dir/def2.properties "$B/tsdbd" --dir /x --check-config 2>&1)
+check "the default file's setting" "$(echo "$out" | grep '^server.port = ')" "server.port = 7123"
+if [ "$(id -u)" != 0 ]; then
+    mkdir -p "$dir/locked/tsdb" "$dir/xdgl/tsdb"
+    cp "$dir/def.properties" "$dir/locked/tsdb/tsdbd.properties"
+    cp "$dir/def.properties" "$dir/xdgl/tsdb/tsdb.properties"
+    chmod 000 "$dir/locked/tsdb" "$dir/xdgl/tsdb"
+    refused "an unreadable default file (tsdbd)" 'locked/tsdb/tsdbd.properties: Permission denied' \
+        env TSDBD_DEFAULT_CONFIG="$dir/locked/tsdb/tsdbd.properties" "$B/tsdbd" --dir /x --check-config
+    refused "an unreadable default file (tsdb)" 'xdgl/tsdb/tsdb.properties: Permission denied' \
+        env XDG_CONFIG_HOME="$dir/xdgl" "$B/tsdb" --check-config
+    chmod 700 "$dir/locked/tsdb" "$dir/xdgl/tsdb"
+fi
 
 # 6. a tsdbd started from a file serves with its settings
 cfg serve.properties "storage.dir = $dir/db" 'server.listen = 127.0.0.1' 'server.port = 0' \
