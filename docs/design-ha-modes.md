@@ -705,7 +705,8 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | R8 | replicated | tsdbd: server roles (compute, storage, both), chunk peer messages, durable epoch fences, `MK_GC` and orphan rules, degraded reads with hedging limits, metadata v3, both margins in TOPOLOGY, unavailable/corrupt/lost, `TSDB_WHY_LOST` in the four clients | 6-8 | 12 (jepsen-cluster on 4+2 and 16+4, partial partitions) | R3, S2 |
 | R9 | replicated | DOWN/OUT at `rebuild_after`, bounded holds and guard, degraded settles, retention for DOWN members, backpressure, checked rebuild paced by margin, return during rebuild, `node replace`, moves, balancer; `sim_place` with MTTDL | 6-8 | 24 (jepsen-cluster on 4 geometries; sim_place soak) | R4, R8; servers with disks for the timings |
 | R12 | replicated | Scrub of chunks, `.ec` files and young parts; damage counts | 2 | 6 (rot, then m failures) | R8 |
-| R13 | replicated | Chunk stores per disk: device DOWN/OUT, `disk out`/`replace` | 2-3 | 6 (single-disk loss) | R8 |
+| R13 | replicated | Chunk stores per disk: device DOWN/OUT, `disk out`/`replace`; *2026-11-11*: disks with classes (`tsdb disk init`, `--disk PATH[:nvme\|ssd\|hdd]`, young tier on fast disks, chunks on hard drives, roles from disks, filling per disk, each disk a fault domain; design-cluster-data.md E47-E58) | 6-8 | 16 (EIO on a hard drive, a stuck NVMe, single-disk loss of each class, a fast disk filling; `sim_place` soak with classes) | R8, R9 |
+| R15 | single server | *2026-11-11*: a local tier (`tsdb DIR tier add`): settled partitions erasure coded across the server's hard drives (a mirror on two), the index on NVMe (design-cluster-data.md E55) | 5-6 | 10 (jepsen with a tier on outagefs) | R7 |
 | R14 | replicated | Operator CLI and metrics for the cluster data path | 2 | — (test_server) | — |
 | R10 | replicated | Redundancy change on a running volume; in 0.11.0 (the user, 2026-11-09: E33 there) | 3 | 6 | — |
 | R11 | replicated | Benchmarks per mode (NVMe and HDD storage) and the sizing numbers for P5's guide, README, AGENTS.md | 1-2 | the benchmarks, quiet machine | — |
@@ -714,7 +715,7 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | P3 | replicated | Backup and restore: per-volume cuts, incremental by oid, restore into a new cluster, salvage from a backup (E42) | 4-5 | 6 (jepsen-cluster `backup`) | a backup target (an NFS export) for the guide's runs |
 | P4 | replicated | Alerts shipped as Prometheus rules, a test per rule (E43) | 1-2 | — | — |
 | P5 | replicated | Production operator guide (install, nodes, dead disk, dead node, upgrades, backups, alerts) with every runbook a test (E44) | 3-4 | 3 | — |
-| P6 | replicated | Release gates on the release commit: jepsen-cluster's full set on 4+2, 8+2, 8+4, 16+4 and `replicas=3`, a 72-hour soak, the upgrade test, reviews and their fixes (E45) | 2-4 | 96 (24 + 72) | servers with disks for hardware numbers (not a gate) |
+| P6 | replicated | Release gates on the release commit: jepsen-cluster's full set on 4+2, 8+2, 8+4, 16+4 and `replicas=3`, a 72-hour soak, the upgrade test, reviews and their fixes (E45) | 2-4 | 98 (26 + 72) | servers with disks for hardware numbers (not a gate) |
 | X1 | both | Cold-tier boundary (step 8); a shared volume hands partitions over the same way. *Since 2026-11-09 folded into R7 for replicated mode; what remains is the shared-volume hand-over and an external tier, after 0.11.0* | 2 | 4 (midcommit at the move) | — |
 | X3 | both | Measurements and docs: README section, AGENTS.md invariants and lock order, operator guides | 1-2 | the benchmarks, quiet machine | — |
 
@@ -759,8 +760,9 @@ track-days**, which on three tracks is roughly 2-3 weeks of calendar if the main
 for replicated mode, 8-13 track-days, and X1 and X3, 3-4. *Since 2026-11-09* replicated mode no longer comes after the
 minimum: v0.11.0 holds S1, S2 and S4 with R2-R14 (R1 goes on) and X1 is folded into R7. *Restated on 2026-11-09
 after the user's answers* (R10 in 0.11.0; cluster data production, so P1-P6 too): the rest of S1, S2, S4 and R2-R4
-13-20 track-days and 43 gate hours, R5-R14 30-40 and 64, P1-P6 14-21 and 115: **about 57-81 track-days and 222 gate
-hours (about 9.25 machine-days, 3 of them the 72-hour soak) before reruns**, roughly 6-8 weeks of calendar on three
+13-20 track-days and 43 gate hours, R5-R15 39-51 and 84 (*2026-11-11*: device classes, it was R5-R14 30-40 and 64),
+P1-P6 14-21 and 117: **about 66-92 track-days and 244 gate hours (about 10.2 machine-days, 3 of them the 72-hour soak)
+before reruns**, roughly 6-8 weeks of calendar on three
 tracks ([design-cluster-data.md](design-cluster-data.md) §11). Gate time for the minimum: about 68-88 machine-hours of
 gates plus N8's 2-3 days of real NFS runs, **about 5-7 machine-days**, mostly jepsen-ha and the NFS runs. The calendar
 is set by the two maintenance windows (N0 and N8) and the review rounds, not by building.
