@@ -1081,6 +1081,11 @@ tsdbd --cluster ... --state-dir /boot-mirror/tsdb \
       --disk /hdd00/tsdb --disk /hdd01/tsdb ... --disk /hdd23/tsdb
 ```
 
+**Config keys** (2026-11-11). The track `config-files` adds `.properties` config files with dotted keys, so every disk
+flag of this design also gets a config key: `storage.disks = /nvme0:nvme, /hdd1:hdd` for `--disk` (a comma-separated
+list of `PATH[:CLASS]`, as the flag repeated), and likewise for the other flags of this section. Not built here: the
+key names are fixed when that track meets this one, and a flag on the command line wins over the file.
+
 Each `--disk` is one file system on one disk (or one RAID set the operator chooses to treat as one). The class is
 `nvme`, `ssd` or `hdd`; when it is left out, `disk init` finds it:
 1. `stat(PATH)` gives the device number; `/sys/dev/block/MAJ:MIN` gives the block device; a partition is replaced by
@@ -1285,6 +1290,10 @@ tsdb /nvme/db tier set --redundancy 4+2 --after 7d [--volume N]
 tsdb /nvme/db tier status    # stores, bytes per volume and store, margin, settles waiting, days to full, damage
 ```
 
+The single-server tier has a config key too (2026-11-11): `storage.tiers` lists its stores as `tier add` does
+(`PATH[:CLASS]`); `tier add` stays the command that makes and checks them (the TIERS record, the path and device checks
+below). How the key and TIERS agree at start is settled with the `config-files` track.
+
 - **Redundancy across stores**: each tier store is one position. An object is the part file erasure coded k' + m over
   k' + m distinct stores, with R5's codec and R6's cells and encode-time sums: a cluster stripe whose positions are
   stores instead of servers. The default follows the number of stores: 2, a mirror (1 + 1); 3 to 5, k' = stores − 1
@@ -1428,27 +1437,26 @@ None. The five open questions of the revised draft were answered by the user on 
 (E36). The decisions that production then required (E37-E46) were made in this revision with their rejected
 alternatives; the user may change them.
 
-**Device classes (2026-11-11, §15)**, four questions, each with the recommended answer:
+**Device classes (2026-11-11, §15)**: the four questions were answered by the user on 2026-11-11, each as
+recommended. Decisions:
 
-1. **How long does a single server keep a partition on the NVMe?** `tier_after_s` defaults to 7 days after the key's
-   end (E55), with the 80% space trigger moving older keys sooner. Decoding queries over older data then seek: about
-   1 s cold for one series by the hour over 116 days, about 80 s for 100 such series on one drive (§15.7); day buckets
-   and hours of dense series answer from the index on NVMe and pay nothing. *Recommended: 7 days*: dashboards mostly
-   decode the last days, and the space trigger covers a small NVMe. The alternatives are 1 day (less NVMe, more seeks)
-   or longer where the NVMe allows.
-2. **Is a single server's tier redundant by default?** *Recommended: yes*: each object coded across the hard drives (a
-   mirror on 2, k' + 1 on 3-5, 4+2 on 6 or more), and one copy only with `--single-copy` stated, which is the setting
-   for production's NFS export from ZFS. The alternative, one copy on any store by default, is simpler and costs no
-   space, but a lost drive then loses data.
-3. **In a cluster whose stripe groups are on hard drives, does yesterday stay on NVMe?** Today a key settles one hour
-   after its end (E5), so yesterday's decoding queries seek on hard drives after a cache miss (§3.4: 6-12 ms per cold
-   query instead of 0.7). *Recommended: keep `settle_grace_s` at 1 h and `ec_keep_local_h` at 0 by default*, and the
-   operator guide recommends `ec_keep_local_h = 24` where yesterday is decoded often: it costs one more copy of a day
-   on the leader's NVMe, not m + 1.
-4. **May a log replica move between two NVMe disks of one server in 0.11.0?** *Recommended: no* (E51): a replica
-   leaving a filling disk moves to another server, which costs network traffic but never lowers the number of servers
-   holding an acknowledged row. Moving within a server needs replica identities by (node, rid) and `min_isr` counted
-   by distinct nodes in the metadata state machine, its simulator and its mutants: about 2 more track-days, later.
+1. **Single server, NVMe to hard drives** (decided 2026-11-11): a partition moves to the hard-drive tier 7 days after it
+   ends (`tier_after_s`, E55), or sooner, oldest first, when the NVMe passes 80% (`tier_high_pct`). Decoding queries
+   over older data then seek (about 1 s cold for one series by the hour over 116 days, §15.7); day buckets and hours of
+   dense series answer from the index on NVMe. *Rejected*: 1 day (less NVMe, more seeks).
+2. **Single server, redundancy** (decided 2026-11-11): the tier is redundant by default: mirrored on 2 drives, one
+   spare (k' + 1) on 3-5, 4+2 on 6 or more. A single copy only when the operator states that the drive is already
+   protected (`--single-copy`, e.g. RAID or an NFS export from ZFS). *Rejected*: one copy by default, where a lost
+   drive loses data.
+3. **Cluster, yesterday** (decided 2026-11-11): there is no NVMe copy of yesterday by default: `settle_grace_s` stays at
+   1 h and `ec_keep_local_h` at 0. The operator guide suggests `ec_keep_local_h = 24` where yesterday is read a lot
+   (one more copy of a day on the leader's NVMe, not m + 1).
+4. **No same-server NVMe moves in 0.11.0** (decided 2026-11-11, E51): a full NVMe moves its log replicas to another
+   server, which costs network traffic but never lowers the number of servers holding an acknowledged row. Moving
+   within a server needs replica identities by (node, rid) and `min_isr` counted by distinct nodes (about 2
+   track-days), later.
+
+None open.
 
 ## Unverified assumptions
 
