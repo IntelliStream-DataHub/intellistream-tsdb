@@ -72,15 +72,15 @@ values is in it three times, for x86-64-v2, v3 (AVX2) and v4 (AVX-512); tsdbd pi
 level writes the same bytes and gives the same answers, so data moves freely between machines.</p>
 <p>The tarball holds <code>bin/tsdbd</code>, <code>bin/tsdb</code>, the two libraries and their headers, its own
 test suite and a systemd unit. To install it as a service:</p>
-<pre><code class="language-sh" data-src="dist/README.dist#L57-L65">tar xzf tsdb-VERSION-x86_64-linux.tar.gz &amp;&amp; cd tsdb-VERSION-x86_64-linux
-tests/run-tests.sh /var/tmp            # optional, a few minutes
-install -m 755 bin/tsdbd bin/tsdb /usr/local/bin/
-restorecon -v /usr/local/bin/tsdbd /usr/local/bin/tsdb    # SELinux: bin_t
-useradd -r -s /sbin/nologin -d /var/lib/tsdb tsdb
-install -d -o tsdb -g tsdb -m 750 /var/lib/tsdb
-runuser -u tsdb -- /usr/local/bin/tsdb /var/lib/tsdb user add admin --superuser   # asks for a password
-install -m 644 systemd/tsdbd.service /etc/systemd/system/
-systemctl daemon-reload &amp;&amp; systemctl enable --now tsdbd</code></pre>
+<pre><code class="language-sh" data-src="dist/README.dist#L57-L65">Install
+  tar xzf tsdb-VERSION-x86_64-linux.tar.gz &amp;&amp; cd tsdb-VERSION-x86_64-linux
+  tests/run-tests.sh /var/tmp            # optional, a few minutes
+  install -m 755 bin/tsdbd bin/tsdb /usr/local/bin/
+  restorecon -v /usr/local/bin/tsdbd /usr/local/bin/tsdb    # SELinux: bin_t
+  useradd -r -s /sbin/nologin -d /var/lib/tsdb tsdb
+  install -d -o tsdb -g tsdb -m 750 /var/lib/tsdb
+  runuser -u tsdb -- /usr/local/bin/tsdb /var/lib/tsdb user add admin --superuser   # asks for a password
+  install -d /etc/tsdb &amp;&amp; install -m 644 systemd/tsdbd.properties /etc/tsdb/</code></pre>
 <p>The unit runs tsdbd on 127.0.0.1:7070 with its data in <code>/var/lib/tsdb</code>. Running
 <code>tests/run-tests.sh</code> is optional and takes a few minutes. <code>make dist-check-almalinux10</code> runs
 the tarball's tests in an AlmaLinux 10 container with Podman.</p>

@@ -75,6 +75,32 @@ systemd unit of the <a href="install.html#tarball">portable tarball</a>.</p>
 lays out its files. They count only when the database is created; the defaults suit most data. Run
 <code>build/tsdbd</code> with a wrong flag to see the full list.</p>
 
+<h2 id="config">Configuration file</h2>
+<p>Every option can be a line in a <code>.properties</code> file: <code>tsdbd --config /etc/tsdb/tsdbd.properties</code>
+(that path is read by itself when it exists; <code>--no-config</code> reads none). Keys are dotted groups
+(<code>storage.</code>, <code>server.</code>, <code>query.</code>, <code>metrics.</code>, <code>health.</code>, <code>cluster.</code> ...),
+lists are comma-separated, durations and sizes take units (<code>30s</code>, <code>1G</code>). The command line wins over the file.
+A mistake stops the server with the file and the line: an unknown or duplicate key, a bad value, a file that others can write.
+There are no passwords in the file, and no reload: restart to apply.</p>
+<pre><code class="language-properties" data-src="docs/config.md#Configuration files"># /etc/tsdb/tsdbd.properties
+storage.dir = /var/lib/tsdb
+storage.verify.checksums = true
+
+server.listen = 127.0.0.1
+server.port = 7070
+server.io = epoll
+server.send.timeout = 30s
+
+query.threads = 32
+metrics.port = 9100
+
+# lists are comma-separated
+health.domains = /mnt/nfs1, /mnt/nfs2</code></pre>
+<p><code>tsdbd --config FILE --check-config</code> prints every setting with where its value came from. The
+<code>tsdb</code> tool reads its connection settings (<code>client.server</code>, <code>client.login</code>) from
+<code>~/.config/tsdb/tsdb.properties</code>. <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/config.md">docs/config.md</a>
+lists every key.</p>
+
 <h2 id="users">Users and logins</h2>
 <p>Every client logs in with a user name and a password. The password never crosses the network: the client and the
 server prove to each other that they know it (SCRAM-SHA-256, the method PostgreSQL uses). The users live in the

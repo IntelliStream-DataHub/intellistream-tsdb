@@ -183,6 +183,14 @@ cgroup, so `nice` does not keep your work out of its way.
   `tests/test_release_notes.sh` and `tests/test_release_publish.py` (the API calls against a local mock).
 - `tools/dump.c`: `tsdb export` / `import` (public API only), the stream of `docs/export-format.md`, which every
   later version must keep reading (`tests/data/export-v1.tsdbdump`, `tests/test_export.c`).
+- Configuration files (`docs/config.md`): `tools/props.[ch]` is the `.properties` parser, `tools/cfg.[ch]` the table
+  layer, `server/tsdbd_keys.h` the keys of tsdbd (one row per option of `opts[]` in `server/tsdbd.c`; a new option
+  needs a row, with a key or with the reason it has none) and `cli_keys` in `tools/tsdb-cli.c` those of the CLI. The
+  file's settings are spliced into argv in front of the real command line, so the program's own option parser stays the
+  only reader and the command line wins. The tables of `docs/config.md` between the `keys:` markers are what
+  `tsdbd --config-keys` and `tsdb --config-keys` print (`tests/test_config.sh` compares them; paste the output after
+  a change). `tests/test_props.c` and `tests/fuzz/fuzz_props.c` test the parser. The keys of `storage.` for the
+  device classes are reserved, not built.
 - `tools/`: CLI and benchmarks. `tests/`: tests; `tests/jepsen/`: the
   fault-injection harness and the `crashfs` LD_PRELOAD power-loss simulator.
 

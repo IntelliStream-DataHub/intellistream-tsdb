@@ -8,6 +8,29 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**Configuration files.** `tsdbd` and the `tsdb` tool read their settings from a `.properties` file
+([docs/config.md](docs/config.md)). Nothing changes for a server started with options.
+
+- `tsdbd --config FILE` (or `/etc/tsdb/tsdbd.properties`, when it exists and `--config` is not given; `--no-config`
+  reads none). One dotted key per option (`storage.dir`, `server.port`, `server.io`, `query.threads`, `metrics.port`,
+  `health.domains`, `cluster.secret.file`, ...); lists are comma-separated (`health.domains = /mnt/nfs1, /mnt/nfs2`,
+  an element with a comma is written `\,`); durations (`30s`, `5m`) and sizes (`8M`, `1G`) take units. The syntax is
+  Java's `.properties`, UTF-8 (not Java's ISO-8859-1), stricter: an unknown escape is an error. Precedence: default,
+  file, command line. An unknown or duplicate key, a bad value or a list where one value is expected stops the server
+  with `file:line`. A file that group or others can write is refused. No passwords in the file (keys name files). No
+  reload: restart to apply.
+- `tsdbd --check-config` checks the file and prints the effective settings, with the source of each (default,
+  `file:line`, command line), and exits; `tsdbd --config-keys` prints the table of keys.
+- `tsdb --config FILE` (default `$XDG_CONFIG_HOME/tsdb/tsdb.properties`, `~/.config/tsdb/tsdb.properties`,
+  `/etc/tsdb/tsdb.properties`) gives the commands that talk to a server their connection settings: `client.server`,
+  `client.login`, `client.login.password.file`, `cluster.secret.file`.
+- The systemd unit of the tarball starts `tsdbd --config /etc/tsdb/tsdbd.properties`; the tarball has
+  `systemd/tsdbd.properties` as the file to install. **Operators who copied the old unit keep working** (it names
+  its options); a new unit needs the file.
+- Tests: `tests/test_props.c` (the parser), `tests/test_config.sh` (the table covers every option both ways, the
+  tables of docs/config.md are what the programs print, errors, precedence, a server started from a file), and a fuzz
+  harness, `make fuzz FUZZ=props`.
+
 **Licence change: the server and the engine are AGPL-3.0-only, the client libraries stay Apache-2.0, and a commercial
 licence is available.** (Ships in 0.11.0.) The releases 0.9.0, 0.9.1 and 0.10.0 were published under Apache 2.0 and stay
 so: their code may be used under that licence for ever. [LICENSING.md](LICENSING.md) says which directory has which
