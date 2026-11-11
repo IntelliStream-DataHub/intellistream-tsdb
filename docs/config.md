@@ -25,9 +25,11 @@ health.domains = /mnt/nfs1, /mnt/nfs2
 `tsdbd --config FILE` reads that file. Without `--config`, `tsdbd` reads `/etc/tsdb/tsdbd.properties` when it exists;
 `--no-config` reads nothing. A server started with `--exit-with-parent` (the flag of the test harnesses) does not read
 that default file either: a test's server must not take the port, the login or the fsync setting of the service that
-is installed on the same machine; it reads a file only when `--config` names one. A default file that exists but
-cannot be looked at (a directory without the right to enter it) is an error, not "no file". (The tests put the default
-file elsewhere with the environment variable `TSDBD_DEFAULT_CONFIG`; it names a path, never a setting.)
+is installed on the same machine; it reads a file only when `--config` names one. When such a server finds the default file it prints one line on
+stderr that names it and says how to use it (`pass it with --config FILE`), so a service started with the flag by
+mistake is not silently running on defaults. A default file that exists but
+cannot be looked at (a directory without the right to enter it) is an error, not "no file". (`TSDBD_DEFAULT_CONFIG` is a test hook: the environment variable names another path for the default file, so the
+tests need no `/etc`; it names a path, never a setting, and is not for production.)
 `tsdbd --check-config` checks the file and the command line, prints every setting
 with where its value came from, and exits (status 0 when all is well, 2 when not): run it before a restart.
 `tsdbd --config-keys` prints the tables below.
@@ -65,7 +67,9 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
   server runs as it does. An option that appears on the command line is not taken from the file at all; so a list
   on the command line replaces the file's list, it does not add to it. That needs the option's whole name:
   `getopt_long` would take `--work` for `--workers`, which the rule would not see, so an abbreviated option is an
-  error (`--work is an abbreviation of --workers`).
+  error (`--work is an abbreviation of --workers`). **When an option or flag is given more than once on the command
+  line, the last one counts**, in every form (`--no-auth --no-auth=false` is login on, `--no-auth=false --no-auth` is
+  login off); `--check-config` shows the same.
 - **A flag that the file sets can be set back on the command line:** every boolean option also takes `=true` or
   `=false` (`--read-only=false`, `--verify-checksums=true`). For the options that are written the other way round,
   `--no-auth` and `--no-fsync` and `--no-stats`, the word is about the option: `--no-auth=false` is login on
@@ -88,8 +92,14 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 - **Options without a key** are those that only make sense on one command line: `--version`, the options that name
   or check the file, and `--exit-with-parent`, which test harnesses use and which must not be a permanent part of
   how a server is configured.
-- Disks: the keys of the `storage.` group are reserved for the device classes (`storage.data.dirs` and its
-  neighbours, `docs/design-cluster-data.md`). They are not built yet.
+- **`--cluster=false` on the command line turns the cluster off** whatever the file says: the file's other `cluster.*`
+  keys are then left out (tsdbd prints one line that names them), where they would otherwise be refused (cluster
+  settings without the cluster). A cluster option on the command line next to `--cluster=false` is an error, as is a
+  file that sets `cluster.*` keys and `cluster.enabled = false`: the message names the settings and where they are.
+- **Reserved keys:** `storage.disks` and `storage.tiers` are named for the device classes
+  (`docs/design-cluster-data.md`) and not built. They are rows in the table with no option: a file that sets one is
+  refused (`reserved and not implemented yet`), so a file written for a later version is never read as if the key did
+  nothing. Nothing else in the `storage.` group may take those names.
 
 ## tsdbd keys
 
@@ -153,6 +163,13 @@ Options with no key:
 | `--check-config` | Checks the file and the command line, prints the effective settings and exits. |
 | `--config-keys` | Prints the table of keys (Markdown) and exits. |
 | `--exit-with-parent` | Test harnesses only: stop when the parent process goes away. A file must not make a server depend on it. |
+
+Reserved keys (named for a design that is not built; a file that sets one is refused):
+
+| Key | Why |
+|---|---|
+| `storage.disks` | the disks of a device-class server, PATH[:CLASS] each (docs/design-cluster-data.md, section 15) |
+| `storage.tiers` | the stores of the single-server tier, PATH[:CLASS] each, as `tier add` makes them (docs/design-cluster-data.md) |
 <!-- keys:tsdbd:end -->
 
 ## The tsdb command line tool

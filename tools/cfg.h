@@ -4,7 +4,8 @@
  * of a .properties file (props.h) to one long option; loading checks every key and value against the table and turns
  * the settings into option arguments, which the program's own option parser then reads in front of the real command
  * line. The command line therefore wins, by one rule: an option that appears on it is not taken from the file at all
- * (so a list on the command line replaces the file's list, it does not extend it). Nothing here knows what an option
+ * (so a list on the command line replaces the file's list, it does not extend it). When an option or flag appears more
+ * than once on the command line, its last occurrence counts, in every form (--no-auth then --no-auth=false is login on). Nothing here knows what an option
  * means; ranges and combinations stay in the program, which says where a bad value came from through cfg_where.
  */
 #ifndef TSDB_CFG_H
@@ -21,11 +22,12 @@ enum cfg_kind {
     CFG_DUR,  /* a whole number of `unit` (ms or s), or a number with ms, s, m, h or d: 90s, 5m, 1h */
     CFG_SIZE, /* a whole number of `unit` (B or MB), or a number with B, K, M, G or T (binary: 1K = 1024 B) */
     CFG_LIST, /* comma-separated: the option is given once per element */
+    CFG_RESERVED, /* a key of a design that is not built: opt is NULL, doc says why; a file that sets it is refused */
 };
 
 struct cfg_key {
     const char *key;    /* the dotted key; NULL: an option that has none, and `doc` says why */
-    const char *opt;    /* the long option, without the dashes */
+    const char *opt;    /* the long option, without the dashes (NULL: CFG_RESERVED) */
     enum cfg_kind kind;
     int neg;            /* CFG_BOOL */
     const char *unit;   /* CFG_DUR, CFG_SIZE: the unit the option takes; CFG_ENUM: the words */
@@ -54,6 +56,10 @@ int cfg_load_file(const char *path, const struct cfg_key *tab, size_t ntab, stru
 int cfg_load_text(const char *text, size_t len, const char *name, const struct cfg_key *tab, size_t ntab,
                   struct cfg *c, char *err, size_t errsz);
 void cfg_free(struct cfg *c);
+/* Forgets the settings of the keys that start with prefix, except the key `keep` (NULL: none): for a program that lets a
+ * command-line switch turn a whole group off (--cluster=false). The names of the keys dropped go in names, comma
+ * separated (truncated to size); the count is returned. */
+size_t cfg_drop(struct cfg *c, const char *prefix, const char *keep, char *names, size_t size);
 
 /* The option arguments the file contributes, for the options that do not appear in argv[1..argc) (an argument "--"
  * ends the options). Only keys that start with prefix (NULL: all). A malloc'd array of *n pointers into c: free the
@@ -74,8 +80,8 @@ struct option;
 char **cfg_argv(const struct cfg *c, int argc, char **argv, const struct option *opts, const struct cfg_key *tab,
                 size_t ntab, int *nargc, char *err, size_t errsz);
 
-/* Does argv carry the option of k? If so and val is not NULL, *val is its argument (or "true"/"false" for a flag: the
- * value of the key, so for a --no-X option --no-X is "false" and --no-X=false is "true"). */
+/* Does argv carry the option of k? If so and val is not NULL, *val is its LAST argument, the one that counts (or
+ * "true"/"false" for a flag: the value of the key, so for a --no-X option --no-X is "false" and --no-X=false is "true"). */
 int cfg_on_cmdline(int argc, char **argv, const struct cfg_key *k, const char **val);
 
 /* "key (path:line)" for an argument that cfg_args handed out, else NULL (it came from the command line). */

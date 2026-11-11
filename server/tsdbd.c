@@ -3713,7 +3713,17 @@ int main(int argc, char **argv)
         }
         if (no_config)
             cfg_path = NULL;
-        else if (!cfg_path && !harness) {
+        else if (!cfg_path && harness) {
+            /* A file that exists and is not read must be seen: a service started with the harness flag by mistake would
+             * run on defaults without a word. One line, naming the file and the way to use it. */
+            const char *dflt = getenv("TSDBD_DEFAULT_CONFIG");
+            struct stat cst;
+            if (!dflt || !*dflt)
+                dflt = CONFIG_DEFAULT;
+            if (stat(dflt, &cst) == 0)
+                fprintf(stderr, "tsdbd: --exit-with-parent: %s exists and is not read (a test server reads no default "
+                                "file); pass it with --config %s to use it\n", dflt, dflt);
+        } else if (!cfg_path && !harness) {
             /* The place the unit reads. Not under --exit-with-parent, the flag of the test harnesses (AGENTS.md): a
              * test's server must not take the metrics port, the login, the fsync or the cluster of the service that is
              * installed on the machine; a harness that wants a file names it. */
@@ -3732,6 +3742,18 @@ int main(int argc, char **argv)
         if (cfg_path && cfg_load_file(cfg_path, tsdbd_keys, TSDBD_NKEYS, &g_cfg, err, sizeof err) != 0) {
             fprintf(stderr, "tsdbd: %s\n", err);
             return 2;
+        }
+        /* --cluster=false turns the cluster off whatever the file says: its other cluster.* settings would be refused
+         * (they need the cluster), so they are left out, with a line that names them. */
+        const char *cv = NULL;
+        for (size_t i = 0; cfg_path && i < TSDBD_NKEYS; i++) {
+            if (tsdbd_keys[i].key && !strcmp(tsdbd_keys[i].key, "cluster.enabled") &&
+                cfg_on_cmdline(argc, argv, &tsdbd_keys[i], &cv) && !strcmp(cv, "false")) {
+                char names[512];
+                if (cfg_drop(&g_cfg, "cluster.", "cluster.enabled", names, sizeof names))
+                    fprintf(stderr, "tsdbd: --cluster=false: the cluster settings of %s are ignored (%s)\n",
+                            g_cfg.path, names);
+            }
         }
         /* nv lives until the process ends (optarg points into it); the static keeps it reachable for LeakSanitizer.
          * The strings of the file's options belong to g_cfg, which is never freed. */
@@ -3855,6 +3877,24 @@ int main(int argc, char **argv)
             break;
         default: goto usage;
         }
+    }
+    if (cluster_opts && !cluster_on) { /* name what asked for the cluster, and where it was set */
+        char list[768];
+        size_t lw = 0;
+        list[0] = 0;
+        for (size_t i = 0; i < TSDBD_NKEYS && lw + 160 < sizeof list; i++) {
+            const struct cfg_key *k = &tsdbd_keys[i];
+            char wb[256];
+            if (!k->key || k->kind == CFG_RESERVED || strncmp(k->key, "cluster.", 8) || !strcmp(k->opt, "cluster"))
+                continue;
+            if (cfg_on_cmdline(orig_argc, orig_argv, k, NULL))
+                lw += (size_t)snprintf(list + lw, sizeof list - lw, "%s--%s", lw ? ", " : "", k->opt);
+            else if (cfg_where_opt(g_cfg.path ? &g_cfg : NULL, orig_argc, orig_argv, k->opt, wb, sizeof wb))
+                lw += (size_t)snprintf(list + lw, sizeof list - lw, "%s%s", lw ? ", " : "", wb);
+        }
+        fprintf(stderr, "tsdbd: cluster settings are given (%s) but the cluster is off: add --cluster (cluster.enabled "
+                        "= true), or remove them\n", list);
+        return 2;
     }
     if (cluster_on && (!secret_file || !state_dir || o.read_only || o.follow)) {
         fprintf(stderr, "tsdbd: --cluster needs --cluster-secret-file and --state-dir (a local disk, never --dir), "

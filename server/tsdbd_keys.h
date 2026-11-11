@@ -6,8 +6,10 @@
  * document says what this table says) all read it. A row without a key is an option the file cannot take, and says
  * why.
  *
- * Reserved for the device classes (docs/design-device-classes.md, not built): storage.data.dirs and the keys beside
- * it. The group `storage.` has room; nothing here may use those names.
+ * Reserved for the device classes (docs/design-cluster-data.md, not built): storage.disks (the --disk of that design,
+ * PATH[:CLASS] per element) and storage.tiers (the stores of the single-server tier, as `tier add`). They are rows
+ * with no option (CK_X): a file that sets one is refused with a message, so a file written for a later version is
+ * never read as if the key did nothing. When the design is built the row becomes a list with its option.
  */
 #ifndef TSDBD_KEYS_H
 #define TSDBD_KEYS_H
@@ -23,6 +25,7 @@
 #define CK_D(key, opt, unit, dflt, doc) {key, opt, CFG_DUR, 0, unit, dflt, doc}
 #define CK_Z(key, opt, unit, dflt, doc) {key, opt, CFG_SIZE, 0, unit, dflt, doc}
 #define CK_L(key, opt, dflt, doc) {key, opt, CFG_LIST, 0, NULL, dflt, doc}
+#define CK_X(key, doc) {key, NULL, CFG_RESERVED, 0, NULL, "", doc} /* a key of a design that is not built */
 
 static const struct cfg_key tsdbd_keys[] = {
     /* storage */
@@ -42,6 +45,9 @@ static const struct cfg_key tsdbd_keys[] = {
        "1: series of different rates go to partitions of 1, 7, 28 or 364 days; 0: all to base partitions. Used only "
        "when the database is created."),
     CK_I("storage.granule.rows", "granule-rows", "8192", "Rows per granule. Used only when the database is created."),
+    CK_X("storage.disks", "the disks of a device-class server, PATH[:CLASS] each (docs/design-cluster-data.md, section 15)"),
+    CK_X("storage.tiers", "the stores of the single-server tier, PATH[:CLASS] each, as `tier add` makes them "
+                          "(docs/design-cluster-data.md)"),
     /* server */
     CK_S("server.listen", "listen", "127.0.0.1", "The address clients connect to (there is no TLS: a trusted interface)."),
     CK_I("server.port", "port", "7070", "The client port; 0 lets the kernel choose (see server.port.file)."),

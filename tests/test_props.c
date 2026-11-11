@@ -10,6 +10,7 @@
 #include "../tools/props.h"
 #include "../server/tsdbd_keys.h"
 
+#include <getopt.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -397,6 +398,117 @@ static void test_precedence(void)
     cfg_free(&c);
 }
 
+/* the argv that the option parser reads: the last form of a flag counts, whatever the forms */
+static const char *argv_of(const char *text, int argc, char **argv)
+{
+    static const struct option opts[] = {{"str", required_argument, 0, 's'}, {"int", required_argument, 0, 'i'},
+                                         {"on", no_argument, 0, 'o'},        {"no-fsync", no_argument, 0, 'f'},
+                                         {"item", required_argument, 0, 'l'}, {0, 0, 0, 0}};
+    static char out[2048];
+    struct cfg c;
+    char err[512];
+    if (text && load(text, &c, err) != 0) {
+        snprintf(out, sizeof out, "ERROR %s", err);
+        return out;
+    }
+    int nargc = 0;
+    char **nv = cfg_argv(text ? &c : NULL, argc, argv, opts, T, NT, &nargc, err, sizeof err);
+    out[0] = 0;
+    if (!nv)
+        snprintf(out, sizeof out, "ERROR %s", err);
+    for (int i = 1; nv && i < nargc; i++)
+        snprintf(out + strlen(out), sizeof out - strlen(out), "%s%s", i > 1 ? " " : "", nv[i]);
+    free(nv);
+    if (text)
+        cfg_free(&c);
+    return out;
+}
+
+static void test_last_wins(void)
+{
+    char *a1[] = {"prog", "--on", "--on=false"};
+    CHECK_STR(argv_of(NULL, 3, a1), "");                         /* the last form is =false: not given */
+    CHECK_STR(argv_of("g.on = true", 3, a1), "");                /* and the file's true stays out: the command line spoke */
+    char *a2[] = {"prog", "--on=false", "--on"};
+    CHECK_STR(argv_of(NULL, 3, a2), "--on");
+    char *a3[] = {"prog", "--on=true", "--on=false", "--on=true"};
+    CHECK_STR(argv_of(NULL, 4, a3), "--on");
+    char *a4[] = {"prog", "--no-fsync", "--no-fsync=false"};     /* --no-X=false is the default's side again */
+    CHECK_STR(argv_of("g.fsync = false", 3, a4), "");
+    char *a5[] = {"prog", "--no-fsync=false", "--no-fsync"};
+    CHECK_STR(argv_of(NULL, 3, a5), "--no-fsync");
+    char *a6[] = {"prog", "--str", "--on", "--on=false"};        /* a value that looks like a flag is a value */
+    CHECK_STR(argv_of(NULL, 4, a6), "--str --on");
+    char *a7[] = {"prog", "--on=false", "--", "--on"};           /* after -- nothing is an option */
+    CHECK_STR(argv_of(NULL, 4, a7), "-- --on");
+    char *a8[] = {"prog", "--on=maybe"};                          /* not a flag form: left for the parser to refuse */
+    CHECK_STR(argv_of(NULL, 2, a8), "--on=maybe");
+    char *a9[] = {"prog", "--int", "1", "--int", "2"};            /* scalars are the parser's: last wins there */
+    CHECK_STR(argv_of("g.int = 5", 5, a9), "--int 1 --int 2");
+
+    const char *val = NULL;
+    CHECK(cfg_on_cmdline(3, a1, &T[2], &val) && !strcmp(val, "false"));
+    CHECK(cfg_on_cmdline(3, a2, &T[2], &val) && !strcmp(val, "true"));
+    CHECK(cfg_on_cmdline(3, a4, &T[3], &val) && !strcmp(val, "true"));   /* --no-fsync=false: fsync on */
+    CHECK(cfg_on_cmdline(3, a5, &T[3], &val) && !strcmp(val, "false"));
+    CHECK(cfg_on_cmdline(5, a9, &T[1], &val) && !strcmp(val, "2"));
+
+    /* --check-config's printout names the last one */
+    char *buf = NULL;
+    size_t blen = 0;
+    FILE *f = open_memstream(&buf, &blen);
+    cfg_print_effective(f, NULL, T, NT, 5, a9);
+    fclose(f);
+    CHECK(strstr(buf, "# command line\ng.int = 2\n") != NULL && !strstr(buf, "g.int = 1"));
+    free(buf);
+    f = open_memstream(&buf, &blen);
+    cfg_print_effective(f, NULL, T, NT, 3, a1);
+    fclose(f);
+    CHECK(strstr(buf, "# command line\ng.on = false\n") != NULL);
+    free(buf);
+    char *a10[] = {"prog", "--item", "a", "--item", "b"};
+    f = open_memstream(&buf, &blen);
+    cfg_print_effective(f, NULL, T, NT, 5, a10);
+    fclose(f);
+    CHECK(strstr(buf, "g.list = a, b\n") != NULL); /* a list keeps every element */
+    free(buf);
+}
+
+static void test_drop(void)
+{
+    struct cfg c;
+    char err[512], names[256];
+    char *none[] = {"prog"};
+    CHECK(load("g.str = a\ng.int = 1\ng.list = x, y\ng.on = true\ng.dur.s = 5", &c, err) == 0);
+    CHECK(cfg_drop(&c, "g.", "g.int", names, sizeof names) == 5); /* a, x, y, true, 5: the list counts per element */
+    CHECK_STR(names, "g.str, g.list, g.on, g.dur.s");              /* each key once */
+    size_t n;
+    char **a = cfg_args(&c, 1, none, NULL, &n);
+    CHECK(n == 2 && !strcmp(a[0], "--int") && !strcmp(a[1], "1"));
+    free(a);
+    CHECK(cfg_drop(&c, "nothing.", NULL, names, sizeof names) == 0 && names[0] == 0);
+    char small[8];
+    CHECK(cfg_drop(&c, "g.", NULL, small, sizeof small) == 1 && !strcmp(small, "g.int")); /* truncation is safe */
+    CHECK(c.n == 0);
+    cfg_free(&c);
+
+    /* a reserved key is refused with its line, and is no row of the printout */
+    static const struct cfg_key R[] = {
+        {"g.int", "int", CFG_INT, 0, NULL, "7", "a number"},
+        {"g.disks", NULL, CFG_RESERVED, 0, NULL, "", "not built"},
+    };
+    CHECK(cfg_load_text("g.int = 1\ng.disks = /a", 22, "f.properties", R, 2, &c, err, sizeof err) == -1);
+    CHECK_STR(err, "f.properties:2: g.disks is reserved and not implemented yet: not built (remove the key)");
+    char *buf = NULL;
+    size_t blen = 0;
+    FILE *f = open_memstream(&buf, &blen);
+    cfg_print_effective(f, NULL, R, 2, 1, none);
+    cfg_print_markdown(f, R, 2);
+    fclose(f);
+    CHECK(strstr(buf, "g.disks = ") == NULL && strstr(buf, "| `g.disks` | not built |") != NULL);
+    free(buf);
+}
+
 static void write_file(const char *path, const char *text, mode_t mode)
 {
     unlink(path);
@@ -504,13 +616,18 @@ static void test_real_table(void)
 {
     for (size_t i = 0; i < TSDBD_NKEYS; i++) {
         const struct cfg_key *k = &tsdbd_keys[i];
-        CHECK(k->opt && *k->opt && k->doc && *k->doc);
+        CHECK(k->doc && *k->doc);
+        CHECK((k->kind == CFG_RESERVED) == !k->opt); /* a reserved row has a key and no option, nothing else is */
+        CHECK(k->kind != CFG_RESERVED || k->key);
         if (!k->key)
             continue;
         for (size_t j = i + 1; j < TSDBD_NKEYS; j++) {
             CHECK(!tsdbd_keys[j].key || strcmp(k->key, tsdbd_keys[j].key));
-            CHECK(strcmp(k->opt, tsdbd_keys[j].opt));
+            CHECK(!k->opt || !tsdbd_keys[j].opt || strcmp(k->opt, tsdbd_keys[j].opt));
         }
+        if (k->kind == CFG_RESERVED)
+            continue;
+        CHECK(*k->opt);
         if (!k->dflt || !*k->dflt || k->kind == CFG_LIST)
             continue;
         char text[512], err[512];
@@ -532,6 +649,8 @@ int main(int argc, char **argv)
     test_lists();
     test_kinds();
     test_precedence();
+    test_last_wins();
+    test_drop();
     test_files(dir);
     test_print();
     test_real_table();

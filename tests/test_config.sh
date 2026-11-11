@@ -13,8 +13,38 @@ B=${B:-build}
 dir=$(mktemp -d "${1:-${TMPDIR:-/tmp}}/tsdb-config.XXXXXX") || exit 1
 me=$BASHPID
 srv=""
+# A server that is a child of this shell is a zombie between its exit and our wait, and kill -0 still succeeds on a
+# zombie: ask ps for the state.
+alive() {
+    local st
+    st=$(ps -o stat= -p "$1" 2>/dev/null)
+    [ -n "$st" ] && [ "${st#Z}" = "$st" ]
+}
+# stop_srv PID: SIGTERM, then SIGKILL after 10 s (never a bare wait: a server that ignores the signal would hang make test)
+stop_srv() {
+    local i
+    kill "$1" 2>/dev/null
+    for ((i = 0; i < 100; i++)); do alive "$1" || break; sleep 0.1; done
+    alive "$1" && kill -9 "$1" 2>/dev/null
+    wait "$1" 2>/dev/null
+}
+# wait_exit PID SECONDS: waits for the process to end and sets WRC to its status; a process that is still running after
+# SECONDS is killed (by pid), WRC is 'hung' and the call fails. A server that should have refused to start, and serves
+# instead, must fail the test, not hang it.
+WRC=""
+wait_exit() {
+    local i
+    for ((i = 0; i < $2 * 10; i++)); do alive "$1" || break; sleep 0.1; done
+    if alive "$1"; then
+        stop_srv "$1"
+        WRC=hung
+        return 1
+    fi
+    wait "$1"
+    WRC=$?
+}
 cleanup() {
-    [ -n "$srv" ] && kill "$srv" 2>/dev/null && wait "$srv" 2>/dev/null
+    [ -n "$srv" ] && stop_srv "$srv"
     chmod -R u+rwx "${dir:?}" 2>/dev/null
     command rm -rf "${dir:?}"
 }
@@ -148,26 +178,92 @@ cfg runflag.properties "storage.dir = $dir/db0" 'server.listen = 127.0.0.1' 'ser
     "server.port.file = $dir/port0" 'auth.enabled = false' 'server.io = epoll'
 "$B/tsdbd" --config "$dir/runflag.properties" --no-auth=false --exit-with-parent=$me > "$dir/log0" 2>&1 &
 p0=$!
-wait "$p0"
-check "--no-auth=false at run time: tsdbd refuses a database with no superuser" "$?" 1
+wait_exit "$p0" 10 || fail "--no-auth=false at run time: tsdbd served without a login instead of refusing to start"
+check "--no-auth=false at run time: tsdbd refuses a database with no superuser" "$WRC" 1
 grep -q 'superuser' "$dir/log0" || fail "--no-auth=false at run time: no word about a superuser: $(tail -3 "$dir/log0")"
 command rm -f "$dir/port0"
 "$B/tsdbd" --config "$dir/runflag.properties" --exit-with-parent=$me > "$dir/log0" 2>&1 &
 p0=$!
 for _ in $(seq 1 100); do
     [ -s "$dir/port0" ] && break
-    kill -0 "$p0" 2>/dev/null || break
+    alive "$p0" || break
     sleep 0.1
 done
 [ -s "$dir/port0" ] || fail "tsdbd with auth.enabled = false did not start: $(tail -3 "$dir/log0")"
-kill "$p0" 2>/dev/null
-wait "$p0" 2>/dev/null
+stop_srv "$p0"
 # and its warning says where the setting came from
 grep -q 'auth.enabled (.*runflag.properties:5): no login' "$dir/log0" \
     || fail "the no-login warning does not name the file and line: $(grep -i 'no login' "$dir/log0")"
+# one rule for repeats: the last occurrence of a flag wins, in either form, and what --check-config shows is what runs
+check "--no-auth then --no-auth=false" "$(shown auth.enabled $F --no-auth --no-auth=false)" "# command line|auth.enabled = true|"
+check "--no-auth=false then --no-auth" "$(shown auth.enabled $F --no-auth=false --no-auth)" "# command line|auth.enabled = false|"
+check "--no-auth=true then --no-auth=false" "$(shown auth.enabled $F --no-auth=true --no-auth=false)" "# command line|auth.enabled = true|"
+check "--no-auth=false then --no-auth=true" "$(shown auth.enabled $F --no-auth=false --no-auth=true)" "# command line|auth.enabled = false|"
+check "--read-only then =false" "$(shown storage.read.only $F --read-only --read-only=false)" "# command line|storage.read.only = false|"
+check "--read-only=false then --read-only" "$(shown storage.read.only $F --read-only=false --read-only)" "# command line|storage.read.only = true|"
+check "a flag's value is not an option: --dir --no-auth" "$(shown storage.dir $F --dir --no-auth)" "# command line|storage.dir = --no-auth|"
+check "the last --port wins" "$(shown server.port $F --port 7001 --port 7002)" "# command line|server.port = 7002|"
+check "the last --port wins, reversed" "$(shown server.port $F --port 7002 --port 7001)" "# command line|server.port = 7001|"
+check "a list keeps every element" "$(shown health.domains $F --health-domain /a --health-domain /b)" "# command line|health.domains = /a, /b|"
+# at run time: the database has no superuser, so a server that would run with login refuses to start (exit 1) and one
+# without login serves; the file says login off, so only the command line's last form decides
+for order in "--no-auth --no-auth=false" "--no-auth=false --no-auth=true --no-auth=false"; do
+    command rm -f "$dir/port0"
+    "$B/tsdbd" --config "$dir/runflag.properties" $order --exit-with-parent=$me > "$dir/log0" 2>&1 &
+    p0=$!
+    wait_exit "$p0" 10 || fail "$order: tsdbd served without a login (the last form is =false)"
+    check "$order at run time" "$WRC" 1
+done
+command rm -f "$dir/port0"
+"$B/tsdbd" --config "$dir/runflag.properties" --no-auth=false --no-auth --exit-with-parent=$me > "$dir/log0" 2>&1 &
+p0=$!
+for _ in $(seq 1 100); do
+    [ -s "$dir/port0" ] && break
+    alive "$p0" || break
+    sleep 0.1
+done
+[ -s "$dir/port0" ] || fail "--no-auth=false --no-auth at run time: no login was asked for, tsdbd did not serve: $(tail -3 "$dir/log0")"
+stop_srv "$p0"
+
+# every boolean row of the table, in each form, over a file that says the same or the opposite
+while IFS= read -r row; do
+    key=${row%% *}
+    rest=${row#* }
+    opt=${rest%% *}
+    neg=0
+    case $rest in *"(when false)"*) neg=1 ;; esac
+    for fileval in true false; do
+        for mode in none bare t f; do
+            case $mode in
+            none) arg=""; eff=$fileval ;;
+            bare | t) arg="--$opt"; [ $mode = t ] && arg="--$opt=true"; [ $neg = 1 ] && eff=false || eff=true ;;
+            f) arg="--$opt=false"; [ $neg = 1 ] && eff=true || eff=false ;;
+            esac
+            lines=("$key = $fileval")
+            extra=""
+            case $key in
+            cluster.witness)
+                lines+=('cluster.enabled = true' 'cluster.secret.file = /s' 'cluster.state.dir = /st')
+                [ $eff = false ] && extra="--dir /x" ;;
+            cluster.enabled)
+                lines+=('storage.dir = /x')
+                [ $eff = true ] && extra="--cluster-secret-file /s --state-dir /st" ;;
+            *) lines+=('storage.dir = /x') ;;
+            esac
+            cfg bool.properties "${lines[@]}"
+            [ $mode = none ] && want="# bool.properties:1|$key = $eff|" || want="# command line|$key = $eff|"
+            got=$(shown "$key" "$B/tsdbd" --config "$dir/bool.properties" $arg $extra)
+            check "boolean $key: file $fileval, command line '$arg'" "$got" "$want"
+        done
+    done
+done < <("$B/tsdbd" --config-keys | awk -F'|' '$4 ~ /^ boolean *$/ {k = $2; o = $3; w = o ~ /when false/; gsub(/[` ]/, "", k); \
+    sub(/ *\(when false\)/, "", o); gsub(/[` ]|^--/, "", o); sub(/^--/, "", o); print k, o (w ? " (when false)" : "")}')
+nbool=$("$B/tsdbd" --config-keys | awk -F'|' '$4 ~ /^ boolean *$/' | wc -l)
+[ "$nbool" -ge 8 ] || fail "found only $nbool boolean rows in the table"
+
 # abbreviations: getopt_long takes --work for --workers, but the rule "the command line wins" needs the whole name
 cfg abbr.properties 'storage.dir = /x' 'server.workers = 3' 'health.domains = /mnt/a' 'server.port.file = /x/pf'
-for a in "--work 2" "--workers=2 --port-f /tmp/pf" "--health-dom /mnt/b" "--no-au"; do
+for a in "--work 2" "--work=2" "--workers=2 --port-f /tmp/pf" "--health-dom /mnt/b" "--no-au"; do
     refused "abbreviated option $a" 'abbreviation' "$B/tsdbd" --config "$dir/abbr.properties" $a --check-config
 done
 refused "abbreviation without a file" 'abbreviation of --workers' "$B/tsdbd" --no-config --work 2 --check-config
@@ -214,7 +310,51 @@ if [ "$(id -u)" != 0 ]; then
     refused "an unreadable default file (tsdb)" 'xdgl/tsdb/tsdb.properties: Permission denied' \
         env XDG_CONFIG_HOME="$dir/xdgl" "$B/tsdb" --check-config
     chmod 700 "$dir/locked/tsdb" "$dir/xdgl/tsdb"
+else
+    echo "test_config: the unreadable-default-file checks are skipped (root can read it)"
 fi
+
+# --cluster=false turns the cluster off whatever the file says: the other cluster.* keys of the file are left out, and
+# named; without it the cluster settings in a file that has the cluster off are refused with their names and lines
+cfg cl.properties 'storage.dir = /x' 'cluster.enabled = true' 'cluster.secret.file = /s' 'cluster.state.dir = /st' \
+    'cluster.peer.port = 7100' 'cluster.rack = r1'
+"$B/tsdbd" --config "$dir/cl.properties" --check-config > /dev/null 2>&1 || fail "the cluster file is refused"
+out=$("$B/tsdbd" --config "$dir/cl.properties" --cluster=false --check-config 2>"$dir/cl.err") \
+    || fail "--cluster=false over a cluster file: $(cat "$dir/cl.err")"
+check "--cluster=false" "$(echo "$out" | grep -B1 '^cluster.enabled = ' | tr '\n' '|')" "# command line|cluster.enabled = false|"
+check "--cluster=false leaves the file's settings out" "$(echo "$out" | grep -B1 '^cluster\.' | grep -c 'cl.properties')" 0
+grep -q 'cluster.secret.file.*cluster.state.dir.*cluster.peer.port.*cluster.rack' "$dir/cl.err" \
+    || fail "--cluster=false does not name the settings it ignores: $(cat "$dir/cl.err")"
+cfg cl2.properties 'storage.dir = /x' 'cluster.enabled = false' 'cluster.peer.port = 7100' 'cluster.rack = r1'
+refused "cluster settings with the cluster off" 'cluster.peer.port (.*cl2.properties:3).*cluster.rack (.*cl2.properties:4)' \
+    "$B/tsdbd" --config "$dir/cl2.properties" --check-config
+refused "--peer-port next to --cluster=false" 'cluster settings are given (--peer-port)' \
+    "$B/tsdbd" --config "$dir/cl.properties" --cluster=false --peer-port 9 --check-config
+refused "--peer-port with no cluster" 'cluster settings are given (--peer-port)' "$B/tsdbd" --dir /x --peer-port 9 --check-config
+# a bare --cluster=false with no file keys is just off
+out=$("$B/tsdbd" --no-config --dir /x --cluster=false --check-config 2>&1) || fail "--cluster=false alone: $out"
+
+# the keys that the device classes will take are reserved: in the table, refused when a file sets one
+for k in storage.disks storage.tiers; do
+    "$B/tsdbd" --config-keys | grep -q "^| \`$k\` | " || fail "--config-keys does not list the reserved key $k"
+    cfg res.properties 'storage.dir = /x' "$k = /nvme0:nvme, /hdd1:hdd"
+    refused "reserved key $k" "res.properties:2: $k is reserved and not implemented yet" \
+        "$B/tsdbd" --config "$dir/res.properties" --check-config
+    refused "reserved key $k with --no-config" "res.properties:2: $k is reserved" \
+        "$B/tsdbd" --config "$dir/res.properties" --dir /y --check-config
+done
+"$B/tsdbd" --no-config --dir /x --check-config 2>&1 | grep -q '^storage.disks' && fail "--check-config prints a reserved key"
+
+# a harness's server that skips an existing default file says so, once, with the way to use it
+cfg hdef.properties 'server.port = 7123'
+err=$(TSDBD_DEFAULT_CONFIG=$dir/hdef.properties "$B/tsdbd" --exit-with-parent --dir /x --check-config 2>&1 >/dev/null)
+check "one line about the skipped default file" "$(echo "$err" | wc -l)" 1
+echo "$err" | grep -q "hdef.properties exists and is not read.*--config $dir/hdef.properties" \
+    || fail "no line that names the skipped default file and --config: $err"
+err=$(TSDBD_DEFAULT_CONFIG=$dir/none.properties "$B/tsdbd" --exit-with-parent --dir /x --check-config 2>&1 >/dev/null)
+check "no line when there is no default file" "$err" ""
+err=$(TSDBD_DEFAULT_CONFIG=$dir/hdef.properties "$B/tsdbd" --exit-with-parent --config "$dir/ok.properties" --check-config 2>&1 >/dev/null)
+check "no line when the harness names its file" "$err" ""
 
 # 6. a tsdbd started from a file serves with its settings
 cfg serve.properties "storage.dir = $dir/db" 'server.listen = 127.0.0.1' 'server.port = 0' \
@@ -224,7 +364,7 @@ TSDB_PASSWORD=pencil "$B/tsdb" "$dir/db" user add root --superuser > /dev/null |
 srv=$!
 for _ in $(seq 1 100); do
     [ -s "$dir/port" ] && break
-    kill -0 "$srv" 2>/dev/null || break
+    alive "$srv" || break
     sleep 0.1
 done
 if [ ! -s "$dir/port" ]; then
@@ -255,8 +395,7 @@ else
     cp "$dir/tsdb.properties" "$dir/xdg/tsdb/tsdb.properties"
     out=$(XDG_CONFIG_HOME=$dir/xdg "$B/tsdb" user whoami 2>&1) || fail "default place: $out"
     echo "$out" | grep -q root || fail "default place: whoami does not say root: $out"
-    kill "$srv"
-    wait "$srv" 2>/dev/null
+    stop_srv "$srv"
     srv=""
 fi
 cfg cli-bad.properties 'client.server = x' 'client.nope = 1'

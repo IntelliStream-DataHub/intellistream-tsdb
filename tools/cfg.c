@@ -114,6 +114,32 @@ void cfg_free(struct cfg *c)
     }
 }
 
+size_t cfg_drop(struct cfg *c, const char *prefix, const char *keep, char *names, size_t size)
+{
+    size_t w = 0, pl = strlen(prefix), cnt = 0, nw = 0;
+    const struct cfg_key *prev = NULL; /* the sets of one list key are adjacent: name it once */
+    if (names && size)
+        names[0] = 0;
+    for (size_t i = 0; c && i < c->n; i++) {
+        struct cfg_set s = c->s[i];
+        if (strncmp(s.k->key, prefix, pl) || (keep && !strcmp(s.k->key, keep))) {
+            c->s[w++] = s;
+            continue;
+        }
+        if (names && size && s.k != prev && nw < size - 1) {
+            int m = snprintf(names + nw, size - nw, "%s%s", nw ? ", " : "", s.k->key);
+            nw = m > 0 && (size_t)m < size - nw ? nw + (size_t)m : size - 1;
+        }
+        prev = s.k;
+        cnt++;
+        free(s.arg);
+        free(s.optstr);
+    }
+    if (c)
+        c->n = w;
+    return cnt;
+}
+
 static int add_set(struct cfg *c, size_t *cap, const struct cfg_key *k, char *arg, int bval, int line)
 {
     char *os = malloc(strlen(k->opt) + 3);
@@ -171,6 +197,11 @@ int cfg_load_text(const char *text, size_t len, const char *name, const struct c
             goto fail;
         }
         const struct cfg_key *k = &tab[t];
+        if (k->kind == CFG_RESERVED) {
+            seterr(err, errsz, "%s:%d: %s is reserved and not implemented yet: %s (remove the key)", name, e->line,
+                   k->key, k->doc);
+            goto fail;
+        }
         if (first[t]) {
             seterr(err, errsz, "%s:%d: %s is set twice (first on line %d)", name, e->line, k->key, first[t]);
             goto fail;
@@ -222,7 +253,7 @@ int cfg_load_text(const char *text, size_t len, const char *name, const struct c
                 if (scaled(val, k->kind, k->unit, num, sizeof num, why, sizeof why) != 0)
                     bad = 1;
                 break;
-            case CFG_LIST: break;
+            case CFG_LIST: case CFG_RESERVED: break;
             }
         }
         if (bad) {
@@ -327,8 +358,10 @@ static int flag_form(const char *rest, int *t)
     return 1;
 }
 
-/* The values of the option of k on the command line, in order (at most max of them). */
-static size_t cmdline_vals(int argc, char **argv, const struct cfg_key *k, const char **out, size_t max)
+/* The values of the option of k on the command line, in order (at most max of them); *last is the final one. A
+ * scalar takes its last value (as getopt does in the program), a list all of them. */
+static size_t cmdline_vals(int argc, char **argv, const struct cfg_key *k, const char **out, size_t max,
+                           const char **last)
 {
     size_t cnt = 0, ol = strlen(k->opt);
     int flag = k->kind == CFG_BOOL;
@@ -349,6 +382,8 @@ static size_t cmdline_vals(int argc, char **argv, const struct cfg_key *k, const
             continue;
         if (cnt < max)
             out[cnt] = v;
+        if (last)
+            *last = v;
         cnt++;
     }
     return cnt;
@@ -356,10 +391,10 @@ static size_t cmdline_vals(int argc, char **argv, const struct cfg_key *k, const
 
 int cfg_on_cmdline(int argc, char **argv, const struct cfg_key *k, const char **val)
 {
-    const char *v[1];
-    size_t n = cmdline_vals(argc, argv, k, v, 1);
+    const char *last = NULL;
+    size_t n = cmdline_vals(argc, argv, k, NULL, 0, &last);
     if (n && val)
-        *val = v[0];
+        *val = last;
     return n > 0;
 }
 
@@ -415,6 +450,37 @@ static int exact_options(int argc, char **argv, const struct option *opts, char 
     return 0;
 }
 
+/* The index of the boolean row that argument a spells (--FLAG, --FLAG=true or --FLAG=false, the whole name), with *t
+ * 1 for the bare and =true forms and 0 for =false; -1 when a is none. */
+static long flag_key(const char *a, const struct cfg_key *tab, size_t ntab, int *t)
+{
+    if (strncmp(a, "--", 2))
+        return -1;
+    size_t nl = strcspn(a + 2, "=");
+    for (size_t j = 0; j < ntab; j++) {
+        if (tab[j].kind != CFG_BOOL || strlen(tab[j].opt) != nl || strncmp(a + 2, tab[j].opt, nl))
+            continue;
+        if (!a[2 + nl]) {
+            *t = 1;
+            return (long)j;
+        }
+        if (flag_form(a + 2 + nl, t))
+            return (long)j;
+    }
+    return -1;
+}
+
+/* Is a "--name" (no =) of an option that takes its value from the next argument? */
+static int takes_value(const char *a, const struct option *opts)
+{
+    if (strncmp(a, "--", 2) || a[2 + strcspn(a + 2, "=")])
+        return 0;
+    for (const struct option *o = opts; o->name; o++)
+        if (!strcmp(o->name, a + 2))
+            return o->has_arg == required_argument;
+    return 0;
+}
+
 char **cfg_argv(const struct cfg *c, int argc, char **argv, const struct option *opts, const struct cfg_key *tab,
                 size_t ntab, int *nargc, char *err, size_t errsz)
 {
@@ -440,6 +506,25 @@ char **cfg_argv(const struct cfg *c, int argc, char **argv, const struct option 
     for (size_t i = 0; i < nca; i++)
         nv[w++] = ca[i];
     free(ca);
+    /* One rule for every flag: its last form on the command line wins (as the last --port does in getopt). The index
+     * of that form is found first; the earlier forms drop out, so --no-auth --no-auth=false is login on and the
+     * reverse is login off, and --check-config shows the same. */
+    int *lastf = malloc((ntab ? ntab : 1) * sizeof *lastf);
+    if (!lastf) {
+        free(nv);
+        seterr(err, errsz, "out of memory");
+        return NULL;
+    }
+    for (size_t j = 0; j < ntab; j++)
+        lastf[j] = -1;
+    for (int i = 1; i < argc && strcmp(argv[i], "--"); i++) {
+        int t;
+        long j = flag_key(argv[i], tab, ntab, &t);
+        if (j >= 0)
+            lastf[j] = i;
+        else
+            i += takes_value(argv[i], opts) && i + 1 < argc;
+    }
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--")) { /* the rest is operands */
@@ -447,35 +532,23 @@ char **cfg_argv(const struct cfg *c, int argc, char **argv, const struct option 
                 nv[w++] = argv[i];
             break;
         }
-        const struct cfg_key *fk = NULL;
         int t = 0;
-        size_t nl = 0;
-        if (!strncmp(a, "--", 2)) {
-            nl = strcspn(a + 2, "=");
-            for (size_t j = 0; j < ntab && !fk; j++)
-                if (tab[j].kind == CFG_BOOL && strlen(tab[j].opt) == nl && !strncmp(a + 2, tab[j].opt, nl) &&
-                    flag_form(a + 2 + nl, &t))
-                    fk = &tab[j];
-        }
-        if (fk) {
-            if (t) { /* --FLAG=true is --FLAG */
+        long j = flag_key(a, tab, ntab, &t);
+        if (j >= 0) {
+            if (t && lastf[j] == i) { /* --FLAG=true is --FLAG */
+                size_t nl = strlen(tab[j].opt);
                 memcpy(sp, a, nl + 2);
                 sp[nl + 2] = 0;
                 nv[w++] = sp;
                 sp += nl + 3;
-            } /* --FLAG=false: the option is not given */
+            } /* --FLAG=false, or a form that a later one overrides: the option is not given */
             continue;
         }
         nv[w++] = argv[i];
-        if (!strncmp(a, "--", 2) && !a[2 + strcspn(a + 2, "=")]) { /* an option that takes a value takes the next one */
-            for (const struct option *o = opts; o->name; o++)
-                if (!strcmp(o->name, a + 2)) {
-                    if (o->has_arg == required_argument && i + 1 < argc)
-                        nv[w++] = argv[++i];
-                    break;
-                }
-        }
+        if (takes_value(a, opts) && i + 1 < argc)
+            nv[w++] = argv[++i];
     }
+    free(lastf);
     nv[w] = NULL;
     *nargc = w;
     return nv;
@@ -537,7 +610,7 @@ void cfg_print_effective(FILE *f, const struct cfg *c, const struct cfg_key *tab
     char last_group[32] = "";
     for (size_t t = 0; t < ntab; t++) {
         const struct cfg_key *k = &tab[t];
-        if (!k->key)
+        if (!k->key || k->kind == CFG_RESERVED)
             continue;
         size_t gl = strcspn(k->key, ".");
         if (strlen(last_group) != gl || strncmp(last_group, k->key, gl)) {
@@ -545,10 +618,14 @@ void cfg_print_effective(FILE *f, const struct cfg *c, const struct cfg_key *tab
                 fputc('\n', f);
             snprintf(last_group, sizeof last_group, "%.*s", (int)(gl < 31 ? gl : 31), k->key);
         }
-        const char *cv[64];
-        size_t nc = cmdline_vals(argc, argv, k, cv, 64);
+        const char *cv[64], *last = NULL;
+        size_t nc = cmdline_vals(argc, argv, k, cv, 64, &last);
         if (nc > 64)
             nc = 64;
+        if (nc && k->kind != CFG_LIST) { /* the last occurrence wins, as the option parser has it */
+            cv[0] = last;
+            nc = 1;
+        }
         if (nc) {
             fprintf(f, "# command line\n%s = ", k->key);
             if (k->kind == CFG_BOOL)
@@ -608,6 +685,7 @@ static const char *kind_name(const struct cfg_key *k, char *buf, size_t sz)
     case CFG_DUR: snprintf(buf, sz, "duration (plain: %s)", k->unit); return buf;
     case CFG_SIZE: snprintf(buf, sz, "size (plain: %s)", !strcmp(k->unit, "MB") ? "MiB" : "bytes"); return buf;
     case CFG_LIST: return "list";
+    case CFG_RESERVED: return "";
     }
     return "";
 }
@@ -618,7 +696,7 @@ void cfg_print_markdown(FILE *f, const struct cfg_key *tab, size_t ntab)
     fputs("| Key | Option | Value | Default | Meaning |\n|---|---|---|---|---|\n", f);
     for (size_t t = 0; t < ntab; t++) {
         const struct cfg_key *k = &tab[t];
-        if (!k->key)
+        if (!k->key || k->kind == CFG_RESERVED)
             continue;
         fprintf(f, "| `%s` | `--%s`%s | %s | %s | %s |\n", k->key, k->opt, k->kind == CFG_BOOL && k->neg ? " (when false)" : "",
                 kind_name(k, kb, sizeof kb), k->dflt && *k->dflt ? k->dflt : "unset", k->doc);
@@ -627,4 +705,13 @@ void cfg_print_markdown(FILE *f, const struct cfg_key *tab, size_t ntab)
     for (size_t t = 0; t < ntab; t++)
         if (!tab[t].key)
             fprintf(f, "| `--%s` | %s |\n", tab[t].opt, tab[t].doc);
+    int head = 0;
+    for (size_t t = 0; t < ntab; t++)
+        if (tab[t].kind == CFG_RESERVED) {
+            if (!head)
+                fputs("\nReserved keys (named for a design that is not built; a file that sets one is refused):\n\n"
+                      "| Key | Why |\n|---|---|\n", f);
+            head = 1;
+            fprintf(f, "| `%s` | %s |\n", tab[t].key, tab[t].doc);
+        }
 }

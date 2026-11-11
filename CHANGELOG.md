@@ -23,7 +23,11 @@ disk format and the wire protocol.
   undo a boolean the file sets; an abbreviated long option (`--work`) is refused, since it would pass for absent and
   be applied beside the file's value; a tsdbd started with `--exit-with-parent` (the test harnesses) reads no default
   file; a default file that cannot be looked at (not just a missing one) is an error; the no-login warning names the
-  file and line when the file turned login off.
+  file and line when the file turned login off. When an option is given twice on the command line the last one counts,
+  in every form (`--no-auth --no-auth=false` is login on). `--cluster=false` turns the cluster off over a file that
+  sets it (the file's other `cluster.*` keys are left out, and named); a harness's server that skips an existing default
+  file says so on stderr. `storage.disks` and `storage.tiers` are reserved for the device classes: a file that sets one
+  is refused.
 - `tsdbd --check-config` checks the file and prints the effective settings, with the source of each (default,
   `file:line`, command line), and exits; `tsdbd --config-keys` prints the table of keys.
 - `tsdb --config FILE` (default `$XDG_CONFIG_HOME/tsdb/tsdb.properties`, `~/.config/tsdb/tsdb.properties`,
