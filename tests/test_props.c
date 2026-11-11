@@ -65,6 +65,7 @@ static void bad(const char *text, const char *msg_part)
     props p;
     char err[512];
     int rc = parse(text, &p, err);
+    int parsed = rc == 0; /* the entries are ours to free then, whichever way the values go */
     for (size_t i = 0; rc == 0 && i < p.n; i++) { /* escapes are processed with the value, not by the parser */
         char *v;
         if (props_value(p.v[i].raw, &v, err, sizeof err) == 0)
@@ -75,9 +76,11 @@ static void bad(const char *text, const char *msg_part)
     if (rc == 0) {
         fprintf(stderr, "FAIL \"%s\" was accepted\n", text);
         fails++;
-        props_free(&p);
-        return;
     }
+    if (parsed)
+        props_free(&p);
+    if (rc == 0)
+        return;
     if (!strstr(err, msg_part)) {
         fprintf(stderr, "FAIL \"%s\": error \"%s\" lacks \"%s\"\n", text, err, msg_part);
         fails++;
