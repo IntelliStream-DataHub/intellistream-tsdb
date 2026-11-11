@@ -150,6 +150,9 @@ void mt_unref(memtable *m)
 }
 
 int (*mt_test_reserve_fail)(uint32_t id); /* test hook: nonzero fails the growth of series id (tests/test_failstop.c) */
+/* test hook: how often the slow part of the room check ran (tests/test_failstop.c: a row inside the capacity must not
+ * get here; counted with a relaxed atomic, on the slow path only) */
+uint64_t mt_test_reserve_calls;
 
 static inline size_t mt_cap(const mt_series *s) { return (size_t)(((uint64_t)1 << s->lgcap) >> 1); }
 
@@ -157,6 +160,7 @@ static inline size_t mt_cap(const mt_series *s) { return (size_t)(((uint64_t)1 <
  * the arrays at least double when they grow). The slow part of mt_room. */
 static int mt_reserve_to(memtable *m, uint32_t id, size_t extra)
 {
+    __atomic_fetch_add(&mt_test_reserve_calls, 1, __ATOMIC_RELAXED);
     if (id >= m->scap) {
         uint32_t cap = MAX(id + 1, m->scap * 2);
         cap = MAX(cap, 64u);
@@ -202,6 +206,9 @@ static int mt_reserve_to(memtable *m, uint32_t id, size_t extra)
     s->lgcap = (uint8_t)(__builtin_ctzll(cap) + 1);
     return 0;
 }
+
+/* test hook (tsdb_test_mem_cap): the capacity of series `local` in the active memtable, 0 for none; caller holds buf_lock */
+size_t mt_test_cap(const memtable *m, uint32_t local) { return local < m->scap ? mt_cap(&m->s[local]) : 0; }
 
 /* Room for `extra` more rows of series id: the capacity check is inline, the growth is not. */
 static inline int mt_room(memtable *m, uint32_t id, size_t extra)

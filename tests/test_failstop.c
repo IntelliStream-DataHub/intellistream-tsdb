@@ -1770,6 +1770,105 @@ static void test_memtable_room_more(const char *base)
     tsdb_close(db);
 }
 
+extern uint64_t mt_test_reserve_calls; /* src/memtable.c: how often the slow part of the room check ran */
+size_t tsdb_test_mem_cap(tsdb *t, tsdb_sid id);  /* src/volumes.c: capacity of the memtable's arrays of a series */
+
+/* A refused reservation unregisters the series it registered. A series left with arrays but off the memtable's list
+ * of series has its rows acknowledged, visible, and never flushed: the flush walks the list, and the WAL segment goes
+ * once the flush is done. So after the refusal the new series are written, flushed, and found after a reopen. */
+static void test_memtable_room_rollback(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-mtroom-rollback", base);
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid a, b, c;
+    OK(tsdb_series(db, "a", &a));
+    OK(tsdb_series(db, "b", &b));
+    OK(tsdb_series(db, "c", &c));
+    const tsdb_sid ids[3] = {a, b, c}; /* a and b are registered by the reservation, then c's growth fails */
+    const int64_t ts[3] = {1, 2, 3};
+    const float v[3] = {1, 2, 3};
+    reserve_fail_id = (uint32_t)TSDB_SID_LOCAL(c), reserve_fail_hits = 0;
+    mt_test_reserve_fail = reserve_fail;
+    int rc = tsdb_insert(db, ids, ts, v, 3);
+    mt_test_reserve_fail = NULL;
+    if (reserve_fail_hits != 1 || rc != TSDB_ERR_NOMEM) {
+        fprintf(stderr, "room rollback: the planted failure fired %d times, the insert gave %s\n", reserve_fail_hits,
+                tsdb_strerror(rc));
+        failures++;
+    }
+    CHECK(!is_failed(db, NULL));
+    /* every series of the refused batch takes writes now, one by one and as one batch, all acknowledged */
+    OK(insert_n(db, a, 100, 3, false));
+    OK(insert_n(db, b, 200, 2, false));
+    OK(insert_n(db, c, 300, 1, false));
+    const tsdb_sid ids2[3] = {c, b, a};
+    const int64_t ts2[3] = {1000, 2000, 3000};
+    OK(tsdb_insert(db, ids2, ts2, v, 3));
+    CHECK(count_rows(db, "a") == 4);
+    CHECK(count_rows(db, "b") == 3);
+    CHECK(count_rows(db, "c") == 2);
+    OK(tsdb_flush(db)); /* the memtable becomes parts, its WAL segment goes */
+    CHECK(count_rows(db, "a") == 4);
+    CHECK(count_rows(db, "b") == 3);
+    CHECK(count_rows(db, "c") == 2);
+    tsdb_close(db);
+    tsdb_options o = opts();
+    db = NULL;
+    OK(tsdb_open(dir, &o, &db));
+    if (db) {
+        CHECK(count_rows(db, "a") == 4);
+        CHECK(count_rows(db, "b") == 3);
+        CHECK(count_rows(db, "c") == 2);
+        tsdb_close(db);
+    }
+}
+
+/* The capacity a series' arrays grow to, and when the slow path runs. Rows added one at a time to one series: the
+ * first row grows the arrays to 64, and nothing more runs until row 65 (to 128), so a row inside the capacity never
+ * leaves the inline check (the capacity is kept as a power of two, and an off-by-one there turns half of it away). */
+static void test_memtable_capacity(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-mtcap", base);
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid a, b;
+    OK(tsdb_series(db, "a", &a));
+    OK(tsdb_series(db, "b", &b));
+    const uint64_t calls0 = __atomic_load_n(&mt_test_reserve_calls, __ATOMIC_RELAXED);
+    const int rows[] = {1, 2, 32, 33, 63, 64, 65, 66, 127, 128};
+    const uint64_t want[] = {1, 1, 1, 1, 1, 1, 2, 2, 2, 2};
+    const size_t wcap[] = {64, 64, 64, 64, 64, 64, 128, 128, 128, 128};
+    int done = 0;
+    for (size_t k = 0; k < sizeof rows / sizeof *rows; k++) {
+        for (; done < rows[k]; done++)
+            OK(insert_n(db, a, 1000 + done, 1, false));
+        uint64_t calls = __atomic_load_n(&mt_test_reserve_calls, __ATOMIC_RELAXED) - calls0;
+        size_t cap = tsdb_test_mem_cap(db, a);
+        if (calls != want[k] || cap != wcap[k]) {
+            fprintf(stderr,
+                    "memtable capacity: after %d rows the slow path ran %llu times (want %llu), capacity %zu (want %zu)\n",
+                    rows[k], (unsigned long long)calls, (unsigned long long)want[k], cap, wcap[k]);
+            failures++;
+        }
+    }
+    /* Packed inserts of rows of two series: the counts a reservation keeps are cleared by the adds that follow, or
+     * every insert's rows count again and the arrays grow to twice what the rows need (40 rows of each: 64). */
+    for (int i = 0; i < 40; i++) {
+        const tsdb_sid ids[2] = {b, a};
+        const int64_t ts[2] = {5000 + i, 100000 + i};
+        const float v[2] = {1, 2};
+        OK(tsdb_insert(db, ids, ts, v, 2));
+    }
+    CHECK(count_rows(db, "b") == 40);
+    size_t capb = tsdb_test_mem_cap(db, b);
+    if (capb != 64) {
+        fprintf(stderr, "memtable capacity: 40 rows of a series given in packed inserts: capacity %zu, want 64\n", capb);
+        failures++;
+    }
+    tsdb_close(db);
+}
+
 /* What a backpressure flush hook does on the writer's thread (the writer's own flush, before its append) */
 enum { BP_COUNT, BP_FAIL_ENGINE, BP_ABANDON };
 static int bp_mode;
@@ -2127,6 +2226,10 @@ int main(int argc, char **argv)
     test_memtable_room_runs(root);
     test_backpressure_flush(root);
     test_memtable_room_more(root);
+    test_memtable_room_rollback(root);
+    test_memtable_capacity(root);
+    test_memtable_room_rollback(root);
+    test_memtable_capacity(root);
     test_backpressure_guards(root);
     test_fsync_results(root);
     if (!failures) {
