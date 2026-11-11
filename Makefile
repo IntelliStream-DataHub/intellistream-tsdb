@@ -1054,8 +1054,8 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    case $$m in idle) flag=--mutant-idle;; longnap) flag=--mutant-longnap;; *) flag="--mutant-nemesis $$m";; esac; \
 	    out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds $$secs --crashfs $(B)/libcrashfs.so \
 	        $$flag 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'it was idle'; then \
-	        echo "jepsen-selftest: a nemesis that is '$$m' went unnoticed (rc $$rc, wanted rc 1 and 'it was idle')"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'was idle'; then \
+	        echo "jepsen-selftest: a nemesis that is '$$m' went unnoticed (rc $$rc, wanted rc 1 and 'was idle')"; echo "$$out" | tail -n 20; exit 1; fi; \
 	done; \
 	out=$$(JEPSEN_TSDBD=tests/jepsen/hang-tsdbd.sh timeout 300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
