@@ -118,6 +118,8 @@
 #include "metrics.h"
 #include "auth.h"
 #include "cluster.h"
+#include "../tools/cfg.h" /* configuration files: docs/config.md */
+#include "tsdbd_keys.h"
 
 #ifndef TSDB_BUILD_VERSION
 #define TSDB_BUILD_VERSION "dev"
@@ -3576,12 +3578,22 @@ static int write_port_file(const char *path, int port, int mport, int pport)
 }
 
 /* A numeric flag: all of `s` a decimal integer within [lo, hi], or a message and exit status 2. */
+static struct cfg g_cfg; /* the configuration file, if any: the arguments it gave are named in errors */
+#define CONFIG_DEFAULT "/etc/tsdb/tsdbd.properties"
+
 static long long num_arg(const char *flag, const char *s, long long lo, long long hi)
 {
     char *end;
     errno = 0;
     long long v = strtoll(s, &end, 10);
     if (!*s || *end || errno == ERANGE || v < lo || v > hi) {
+        char wb[512];
+        const char *w = cfg_where(&g_cfg, s, wb, sizeof wb);
+        if (w) { /* the value came from the file: say which line (docs/config.md) */
+            fprintf(stderr, "tsdbd: %s: %s: in the unit of --%s (docs/config.md) a whole number from %lld to %lld\n", w, s,
+                    flag, lo, hi);
+            exit(2);
+        }
         fprintf(stderr, "tsdbd: --%s %s: expected a whole number from %lld to %lld\n", flag, s, lo, hi);
         exit(2);
     }
@@ -3663,6 +3675,10 @@ int main(int argc, char **argv)
                                    {"bmc", required_argument, 0, 0x104},
                                    {"witness", no_argument, 0, 0x105},
                                    {"read-barrier", required_argument, 0, 0x106},
+                                   {"config", required_argument, 0, 0x108},
+                                   {"no-config", no_argument, 0, 0x109},
+                                   {"check-config", no_argument, 0, 0x10a},
+                                   {"config-keys", no_argument, 0, 0x10b},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0, no_auth = 0, cluster_on = 0, peer_port = -1, cluster_opts = 0;
     int witness = 0, rb_off = 0;
@@ -3674,8 +3690,59 @@ int main(int argc, char **argv)
     long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page > 0 && (size_t)pages / 8 * (size_t)page > req_budget)
         req_budget = (size_t)pages / 8 * (size_t)page; /* 1024 MB slowed 32 connections loading at full speed */
+    /* The configuration file (docs/config.md): its settings become option arguments in front of the real command line,
+     * for the options the command line does not carry, so the command line wins by order and by omission. */
+    int check_config = 0, orig_argc = argc;
+    char **orig_argv = argv;
+    {
+        const char *cfg_path = NULL;
+        int no_config = 0;
+        for (int i = 1; i < argc && strcmp(argv[i], "--"); i++) {
+            if (!strcmp(argv[i], "--config-keys")) {
+                cfg_print_markdown(stdout, tsdbd_keys, TSDBD_NKEYS);
+                return 0;
+            }
+            if (!strcmp(argv[i], "--config") && i + 1 < argc)
+                cfg_path = argv[++i];
+            else if (!strncmp(argv[i], "--config=", 9))
+                cfg_path = argv[i] + 9;
+            else if (!strcmp(argv[i], "--no-config"))
+                no_config = 1;
+        }
+        struct stat cst;
+        if (no_config)
+            cfg_path = NULL;
+        else if (!cfg_path && stat(CONFIG_DEFAULT, &cst) == 0)
+            cfg_path = CONFIG_DEFAULT; /* not an error to be absent; an error to be unreadable or wrong */
+        if (cfg_path) {
+            char err[1024];
+            if (cfg_load_file(cfg_path, tsdbd_keys, TSDBD_NKEYS, &g_cfg, err, sizeof err) != 0) {
+                fprintf(stderr, "tsdbd: %s\n", err);
+                return 2;
+            }
+            size_t nca;
+            char **ca = cfg_args(&g_cfg, argc, argv, NULL, &nca);
+            char **nv = ca ? malloc((size_t)(argc + 1) * sizeof *nv + nca * sizeof *nv) : NULL;
+            if (!nv) {
+                fprintf(stderr, "tsdbd: out of memory\n");
+                return 2;
+            }
+            int w = 0;
+            nv[w++] = argv[0];
+            for (size_t i = 0; i < nca; i++)
+                nv[w++] = ca[i];
+            for (int i = 1; i < argc; i++)
+                nv[w++] = argv[i];
+            nv[w] = NULL;
+            free(ca);
+            argv = nv;
+            argc = w;
+        }
+    }
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
+        case 0x108: case 0x109: case 0x10b: break; /* read above */
+        case 0x10a: check_config = 1; break;
         case 'v': printf("tsdbd %s (build %s)\n", tsdb_version(), TSDB_BUILD_VERSION); return 0;
         case 'd': dir = optarg; break;
         case 0x100:
@@ -3743,8 +3810,10 @@ int main(int argc, char **argv)
         case 0x106:
             if (!strcmp(optarg, "off"))
                 rb_off = 1;
-            else if (strcmp(optarg, "on"))
-                goto usage;
+            else if (strcmp(optarg, "on")) {
+                fprintf(stderr, "tsdbd: --read-barrier %s: expected on or off\n", optarg);
+                return 2;
+            }
             cluster_opts = 1;
             break;
         case 'E':
@@ -3771,8 +3840,10 @@ int main(int argc, char **argv)
                 io = IO_URING;
             else if (strcmp(optarg, "epoll") == 0)
                 io = IO_EPOLL;
-            else
-                goto usage;
+            else {
+                fprintf(stderr, "tsdbd: --io %s: expected auto, uring or epoll\n", optarg);
+                return 2;
+            }
             break;
         default: goto usage;
         }
@@ -3791,6 +3862,9 @@ int main(int argc, char **argv)
         (metrics_addr && !metrics_on) || (cluster_opts && !cluster_on)) {
     usage:
         fprintf(stderr, "usage: tsdbd --version\n"
+                        "       tsdbd [--config FILE | --no-config] [--check-config] [any option below]\n"
+                        "             (settings from a .properties file, /etc/tsdb/tsdbd.properties when present; the\n"
+                        "             command line wins; --config-keys prints the keys: docs/config.md)\n"
                         "       tsdbd --dir DIR [--listen ADDR] [--port %d|0] [--port-file FILE] [--workers N]\n"
                         "             [--wal-sync-ms MS] [--partition-ms MS] [--partition-classes 1|0]\n"
                         "             [--granule-rows 8192] (at creation)\n"
@@ -3810,6 +3884,10 @@ int main(int argc, char **argv)
                         "             [--peer-listen ADDR] --advertise HOST [--rack NAME] [--power-feed NAME]\n",
                 TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1, TSDB_DEFAULT_PORT + 1);
         return 2;
+    }
+    if (check_config) { /* the file and the command line are well-formed: what tsdbd would run with */
+        cfg_print_effective(stdout, g_cfg.path ? &g_cfg : NULL, tsdbd_keys, TSDBD_NKEYS, orig_argc, orig_argv);
+        return 0;
     }
     uint8_t secret[CLUSTER_SECRET_MAX];
     size_t secret_len = 0;

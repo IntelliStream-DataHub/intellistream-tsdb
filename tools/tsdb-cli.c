@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Command line client for a tsdb directory. */
+#include "cfg.h"
 #include "common.h"
 #include "dump.h"
 #include "tsdb.h"
@@ -1128,21 +1129,149 @@ static int cmd_latest(tsdb *db, int argc, char **argv)
     return 0;
 }
 
+/* Configuration file (docs/config.md): the settings of the commands that talk to a server, so that a login and a
+ * cluster secret need not be typed each time. Only `tsdb user ... --server` and `tsdb cluster` read it; the commands
+ * on a directory take nothing from it. `tsdb --config FILE` names it, `--no-config` reads none, otherwise
+ * $XDG_CONFIG_HOME/tsdb/tsdb.properties, ~/.config/tsdb/tsdb.properties or /etc/tsdb/tsdb.properties, the first that
+ * exists. The command line wins: an option that is on it is not taken from the file. */
+static const struct cfg_key cli_keys[] = {
+    {"client.server", "server", CFG_STR, 0, NULL, "", "HOST:PORT of a running tsdbd: `tsdb user VERB ... ` goes through it "
+                                                      "(even without --server) and logs in as client.login."},
+    {"client.login", "login", CFG_STR, 0, NULL, "", "The user to log in as."},
+    {"client.login.password.file", "login-password-file", CFG_STR, 0, NULL, "",
+     "A file with that user's password (mode 600). Passwords are never written in the configuration file itself."},
+    {"cluster.secret.file", "secret-file", CFG_STR, 0, NULL, "", "The cluster's shared secret file, for `tsdb cluster`."},
+    {NULL, "config", CFG_STR, 0, NULL, "", "Names the file itself (the first argument: `tsdb --config FILE ...`)."},
+    {NULL, "no-config", CFG_STR, 0, NULL, "", "Reads no file."},
+    {NULL, "check-config", CFG_STR, 0, NULL, "",
+     "Checks the file and prints the effective settings (`tsdb --check-config`)."},
+    {NULL, "config-keys", CFG_STR, 0, NULL, "", "Prints the table of keys (Markdown)."},
+};
+#define CLI_NKEYS (sizeof cli_keys / sizeof cli_keys[0])
+
+/* 1: loaded into *c; 0: no file (none named, none in the usual places); exits with status 2 when one is wrong. */
+static int cli_cfg_load(struct cfg *c, const char *path, int none)
+{
+    char buf[4096], err[1024];
+    struct stat st;
+    if (none)
+        return 0;
+    if (!path) {
+        const char *x = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME");
+        if (x && *x == '/' && snprintf(buf, sizeof buf, "%s/tsdb/tsdb.properties", x) < (int)sizeof buf &&
+            stat(buf, &st) == 0)
+            path = buf;
+        else if (h && *h == '/' && snprintf(buf, sizeof buf, "%s/.config/tsdb/tsdb.properties", h) < (int)sizeof buf &&
+                 stat(buf, &st) == 0)
+            path = buf;
+        else if (stat("/etc/tsdb/tsdb.properties", &st) == 0)
+            path = "/etc/tsdb/tsdb.properties";
+        else
+            return 0;
+    }
+    if (cfg_load_file(path, cli_keys, CLI_NKEYS, c, err, sizeof err) != 0) {
+        fprintf(stderr, "tsdb: %s\n", err);
+        exit(2);
+    }
+    return 1;
+}
+
+static int is_user_verb(const char *v)
+{
+    static const char *const verbs[] = {"add", "passwd", "drop", "alter", "grant", "revoke", "list", "compact", "whoami"};
+    for (size_t i = 0; i < sizeof verbs / sizeof verbs[0]; i++)
+        if (strcmp(v, verbs[i]) == 0)
+            return 1;
+    return 0;
+}
+
+/* argv with the options of the file that match prefix added at the end; *argc is the new count. */
+static char **cli_with_cfg(const struct cfg *c, int *argc, char **argv, const char *prefix)
+{
+    size_t n;
+    char **a = cfg_args(c, *argc, argv, prefix, &n);
+    char **nv = a ? malloc((size_t)(*argc + 1 + (int)n) * sizeof *nv) : NULL;
+    if (!nv) {
+        fprintf(stderr, "tsdb: out of memory\n");
+        exit(1);
+    }
+    memcpy(nv, argv, (size_t)*argc * sizeof *nv);
+    memcpy(nv + *argc, a, n * sizeof *nv);
+    nv[*argc + (int)n] = NULL;
+    *argc += (int)n;
+    free(a);
+    return nv;
+}
+
 int main(int argc, char **argv)
 {
+    const char *cfg_path = NULL;
+    int no_config = 0;
+    for (; argc > 1;) { /* leading --config FILE and --no-config */
+        if (strcmp(argv[1], "--config") == 0 && argc > 2) {
+            cfg_path = argv[2];
+            argv[2] = argv[0];
+            argv += 2, argc -= 2;
+        } else if (strncmp(argv[1], "--config=", 9) == 0) {
+            cfg_path = argv[1] + 9;
+            argv[1] = argv[0];
+            argv++, argc--;
+        } else if (strcmp(argv[1], "--no-config") == 0) {
+            no_config = 1;
+            argv[1] = argv[0];
+            argv++, argc--;
+        } else {
+            break;
+        }
+    }
+    struct cfg cfg = {0};
+    int have_cfg = 0, cfg_tried = 0;
+    if (cfg_path && !no_config) { /* a file that is named is checked whatever the command does with it */
+        have_cfg = cli_cfg_load(&cfg, cfg_path, 0);
+        cfg_tried = 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--config-keys") == 0) {
+        cfg_print_markdown(stdout, cli_keys, CLI_NKEYS);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--check-config") == 0) {
+        if (!cfg_tried)
+            have_cfg = cli_cfg_load(&cfg, NULL, no_config);
+        cfg_print_effective(stdout, have_cfg ? &cfg : NULL, cli_keys, CLI_NKEYS, 1, argv);
+        return 0;
+    }
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
         printf("tsdb %s (build %s)\n", tsdb_version(), TSDB_BUILD_VERSION);
         return 0;
     }
     /* `tsdb cluster VERB PEER ...`: a server's peer port, no directory. Before the argument count check:
      * `tsdb cluster` alone prints the cluster's commands, as the usage line promises. */
-    if (argc >= 2 && strcmp(argv[1], "cluster") == 0)
+    if (argc >= 2 && strcmp(argv[1], "cluster") == 0) {
+        if (!cfg_tried)
+            have_cfg = cli_cfg_load(&cfg, NULL, no_config), cfg_tried = 1;
+        if (have_cfg)
+            argv = cli_with_cfg(&cfg, &argc, argv, "cluster.");
         return cluster_cli(argc - 1, argv + 1);
+    }
     if (argc < 3)
         usage();
-    for (int i = 3; strcmp(argv[1], "user") == 0 && i < argc; i++)
-        if (strcmp(argv[i], "--server") == 0) /* `tsdb user VERB ... --server HOST:PORT`: no directory */
+    if (strcmp(argv[1], "user") == 0) {
+        int online = 0;
+        for (int i = 3; i < argc; i++)
+            if (strcmp(argv[i], "--server") == 0) /* `tsdb user VERB ... --server HOST:PORT`: no directory */
+                online = 1;
+        if (!cfg_tried)
+            have_cfg = cli_cfg_load(&cfg, NULL, no_config), cfg_tried = 1;
+        /* a server in the file makes `tsdb user VERB ...` the online form (no database is named "user" with one of
+         * these verbs as its command: they are none of the commands on a directory) */
+        for (size_t i = 0; have_cfg && !online && i < cfg.n; i++)
+            online = strcmp(cfg.s[i].k->opt, "server") == 0 && is_user_verb(argv[2]);
+        if (online) {
+            if (have_cfg)
+                argv = cli_with_cfg(&cfg, &argc, argv, "client.");
             return user_main(NULL, argc - 2, argv + 2);
+        }
+    }
     const char *dir = argv[1], *cmd = argv[2];
     drop_root(dir); /* before anything in dir is opened, by every command */
     if (strcmp(cmd, "upgrade") == 0) {
