@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Login and access control in tsdbd (docs/design-auth.md §3 and §5): the table of what each op needs, SCRAM-SHA-256
  * on the server side, the users of USERS (a snapshot for logins, so USERS I/O never holds them up), and the rights

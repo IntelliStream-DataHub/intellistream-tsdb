@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Decode speed of the bit-unpacking kernels and of the codecs built on them, for comparing CPUs.
  *

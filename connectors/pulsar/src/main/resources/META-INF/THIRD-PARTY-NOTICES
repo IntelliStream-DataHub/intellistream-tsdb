@@ -1,8 +1,9 @@
 Third-party software in the tsdb Pulsar sink (NAR)
 ==================================================
 
-tsdb itself, including this connector and the tsdb Java client (tsdb-client) packed into the NAR, is licensed under
-the Apache License 2.0 (the files LICENSE and NOTICE next to this one).
+This connector and the tsdb Java client (tsdb-client) packed into the NAR are licensed under the Apache License 2.0
+(the files LICENSE and NOTICE next to this one). The tsdb server and engine (AGPL-3.0-only) are not part of the NAR:
+the connector talks to a tsdbd over the network.
 
 The NAR also packs the libraries below (META-INF/bundled-dependencies). Their licenses ask that their copyright
 notice and license text travel with them; they are reproduced here. The jars keep their own LICENSE and NOTICE
@@ -92,7 +93,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Jackson (jackson-databind, jackson-core, jackson-annotations)
 ----------------------------------------------------------------------------
 
-Licensed under the Apache License, Version 2.0, the same license as tsdb (the text is in the file LICENSE of this
+Licensed under the Apache License, Version 2.0, the same license as this connector (the text is in the file LICENSE of this
 NAR). Their NOTICE, as published:
 
 # Jackson JSON processor

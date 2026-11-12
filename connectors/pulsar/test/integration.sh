@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Integration test of the Pulsar sink: Pulsar 5.0.0 standalone in Podman, build/tsdbd on the host, the sink's NAR run
 # with `pulsar-admin sinks localrun` inside the Pulsar container on a scalable topic (topic://) with key-ordered
 # delivery. Produces N points over 500 series with corrections and checks that every point reaches tsdb exactly

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * RowBinary (u32 series, i64 ts ms, f32 value, as written by tsdb-bench --export) -> bulk formats.
  *   conv lp    IN OUT   line protocol for InfluxDB 2 and 3 (measurement sensors, tag series, ms)

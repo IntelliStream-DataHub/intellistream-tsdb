@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Mean, standard deviation, min and max over repeated runs of a benchmark, number by number.
 
     runstats.py DIR

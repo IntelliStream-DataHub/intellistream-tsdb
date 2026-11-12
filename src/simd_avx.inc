@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The 256-bit float32 and float64 kernels, included twice by simd.c: for AVX2 (KSUF avx2) and for AVX without
  * AVX2 (KSUF avx: Sandy Bridge and Ivy Bridge). These kernels are float work: loads, conversions, adds, min/max,

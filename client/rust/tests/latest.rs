@@ -1,5 +1,5 @@
-//! QUERY_LATEST (protocol 14): the newest value of many series, on tsdbd and (feature `embedded`) on the
-//! engine, with nulls, every type, missing and denied ids and names, end bounds, per-series bounds and lists
+// SPDX-License-Identifier: Apache-2.0
+//! QUERY_LATEST (protocol 14): the newest value of many series, on tsdbd, with nulls, every type, missing and denied ids and names, end bounds, per-series bounds and lists
 //! longer than one reply frame.
 
 mod common;
@@ -142,29 +142,6 @@ fn latest_on_tcp() {
     check(&mut c, &ids, "lt");
 }
 
-#[cfg(feature = "embedded")]
-#[test]
-fn latest_embedded_and_tsdbd_agree() {
-    let dir = common::test_dir("tsdb-latest-embedded");
-    let mut db = tsdb_client::Db::open(&dir, &tsdb_client::Options::default()).unwrap();
-    let ids = setup(&mut db, "lt");
-    check(&mut db, &ids, "lt");
-    let opts = [
-        LatestOpts::default(),
-        LatestOpts::default().with_nulls(),
-        LatestOpts::default().end(T0 + 5 * STEP),
-        LatestOpts::default().with_nulls().end(T0 + 5 * STEP),
-    ];
-    let embedded: Vec<Vec<Latest>> = opts.iter().map(|o| db.latest(&ids, o).unwrap()).collect();
-    db.flush().unwrap();
-    db.close().unwrap();
-    let srv = Server::start_in(dir);
-    let mut c = srv.client();
-    for (o, e) in opts.iter().zip(&embedded) {
-        assert_eq!(&c.latest(&ids, o).unwrap(), e);
-    }
-}
-
 #[test]
 fn denied_and_missing_look_alike_for_a_user_without_read_on_all() {
     let srv = Server::start_auth("root-pw");
@@ -221,7 +198,8 @@ fn lookup_server() -> (String, std::thread::JoinHandle<(usize, usize)>) {
             r.extend_from_slice(body);
             s.write_all(&r).unwrap();
         };
-        let (mut held, mut max_held, mut total, mut seq, mut flaked) = (Vec::<([u8; 4], String)>::new(), 0, 0, 0u64, false);
+        let (mut held, mut max_held, mut total, mut seq, mut flaked) =
+            (Vec::<([u8; 4], String)>::new(), 0, 0, 0u64, false);
         loop {
             let mut h = [0u8; 9];
             match s.read_exact(&mut h) {
@@ -283,8 +261,17 @@ fn latest_by_name_looks_names_up_together() {
     let (addr, h) = lookup_server();
     let mut c = Client::connect(addr).unwrap();
     let long = "x".repeat(70_000);
-    let names: Vec<String> =
-        (0..40).map(|i| if i == 7 { "missing7".into() } else if i == 9 { "flaky9".into() } else { format!("n{i}") }).collect();
+    let names: Vec<String> = (0..40)
+        .map(|i| {
+            if i == 7 {
+                "missing7".into()
+            } else if i == 9 {
+                "flaky9".into()
+            } else {
+                format!("n{i}")
+            }
+        })
+        .collect();
     let mut refs: Vec<&str> = names.iter().map(String::as_str).collect();
     refs[11] = &long;
     refs[12] = "";

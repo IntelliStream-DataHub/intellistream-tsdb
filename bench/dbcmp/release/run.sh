@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Release comparison driver: the full comparison of bench/dbcmp/README.md plus the release additions, unattended,
 # one command per phase (run.sh with no arguments lists them), e.g.
 #   BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p2

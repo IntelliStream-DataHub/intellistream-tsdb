@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The CLI's time and interval parsers (tools/common.h) on input past every
  * range, under UBSan with float-cast-overflow, which GCC's -fsanitize=undefined
  * leaves out: a double too large for int64 must be refused before the cast, not

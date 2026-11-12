@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Turn the UCI hydraulic text files into one series per sensor, as raw values.
 
     python3 -I convert.py SRC_DIR OUT_DIR

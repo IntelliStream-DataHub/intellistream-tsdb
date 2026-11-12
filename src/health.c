@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Storage domains and their health (docs/ha.md §15.2; N1, step O2).
  *
@@ -31,6 +32,7 @@
  * Lock order: h->mu is a leaf (nothing is called with it held except clock reads; the callback runs after it).
  */
 #define _GNU_SOURCE
+#include "health_rules.h"
 #include "internal.h"
 
 #include <errno.h>
@@ -73,8 +75,10 @@ struct hdomain {
     double base_ms; /* slow average of the write probe latency */
     int64_t up_since_ms;    /* the last time the state became UP: probes begun before it are no evidence of slowness */
     int64_t below_since_ms; /* DEGRADED: since when the latency is under the threshold */
-    int64_t down_at[3];     /* when the last three DOWNs began */
+    int64_t down_at[HEALTH_FLAP_DOWNS]; /* when the last DOWNs began */
     int ndown;
+    int64_t slow_logged_ms; /* the last "a slow probe restarts the count" line (0: none) and the DOWN it was for */
+    int slow_logged_ndown;
     bool probe_now;
     int64_t next_read_ms, next_write_ms;
     tsdb_health *h;
@@ -165,6 +169,17 @@ static int probe_write(const char *dir, const char *node, uint64_t n)
 
 /* ---------------------------------------------------------- state change */
 
+/* How long good write probes must last for the domain to leave DOWN: recover_ms, and the flapping minimum when it
+ * went DOWN HEALTH_FLAP_DOWNS times within HEALTH_FLAP_WINDOW_MS. Caller holds h->mu. */
+static int64_t down_need_ms(const struct hdomain *d, int64_t now)
+{
+    int64_t need = d->h->o.recover_ms;
+    if (d->ndown >= HEALTH_FLAP_DOWNS && now - d->down_at[(d->ndown - HEALTH_FLAP_DOWNS) % HEALTH_FLAP_DOWNS] <
+                                             HEALTH_FLAP_WINDOW_MS)
+        need = need > HEALTH_FLAP_NEED_MS ? need : HEALTH_FLAP_NEED_MS;
+    return need;
+}
+
 /* Caller holds h->mu. Returns true when the state changed (the callback is for the caller to run). */
 static bool set_state(struct hdomain *d, int st, int64_t now)
 {
@@ -174,7 +189,7 @@ static bool set_state(struct hdomain *d, int st, int64_t now)
         d->outage_id++; /* an outage; a relapse from RECOVERING is the same one */
     if (st == TSDB_DOM_DOWN) {
         d->nlat = 0; /* what was measured before the outage says nothing of the storage after it */
-        d->down_at[d->ndown % 3] = now;
+        d->down_at[d->ndown % HEALTH_FLAP_DOWNS] = now;
         d->ndown++;
         d->good_since_ms = 0;
     }
@@ -207,6 +222,8 @@ static void probe_done(struct hdomain *d, int slot, bool write, int err, int64_t
     tsdb_health *h = d->h;
     int ms = (int)(now - start);
     int old = -1, nw = -1;
+    bool slow_note = false;
+    int64_t slow_need_ms = 0, slow_run_ms = 0;
     pthread_mutex_lock(&h->mu);
     d->inflight_ms[slot] = 0;
     if (write)
@@ -223,7 +240,18 @@ static void probe_done(struct hdomain *d, int slot, bool write, int err, int64_t
                 if (!d->good_since_ms)
                     d->good_since_ms = now;
             } else if (!space) {
-                d->good_since_ms = 0; /* worked, but too slowly to count */
+                /* worked, but too slowly to count: the run of good probes starts over. In DOWN that is the one
+                 * thing an operator cannot see from outside (a flapping domain on a slow disk stays DOWN with every
+                 * probe succeeding), so the first one of a DOWN, and then one a minute at most, is logged. */
+                if (d->state == TSDB_DOM_DOWN &&
+                    (d->slow_logged_ndown != d->ndown || now - d->slow_logged_ms >= 60000)) {
+                    d->slow_logged_ndown = d->ndown;
+                    d->slow_logged_ms = now;
+                    slow_note = true;
+                    slow_need_ms = down_need_ms(d, now);
+                    slow_run_ms = d->good_since_ms ? now - d->good_since_ms : 0;
+                }
+                d->good_since_ms = 0;
             }
             if (start >= d->up_since_ms && (d->state == TSDB_DOM_UP || d->state == TSDB_DOM_DEGRADED)) {
                 lat_sample *s = &d->lat[d->nlat % LAT_N];
@@ -245,6 +273,11 @@ static void probe_done(struct hdomain *d, int slot, bool write, int err, int64_t
         }
     }
     pthread_mutex_unlock(&h->mu);
+    if (slow_note) /* the monotonic clock in seconds, as tsdbd's own lines */
+        fprintf(stderr,
+                "tsdb: [%.3f] storage domain %s: a write probe took %d ms (more than %d ms): the %lld ms of good probes "
+                "needed to leave DOWN start over (%lld ms had passed)\n",
+                (double)now / 1000.0, d->name, ms, h->o.fast_ms, (long long)slow_need_ms, (long long)slow_run_ms);
     if (nw >= 0)
         fire(h, dom_index(h, d), old, nw);
 }
@@ -413,10 +446,8 @@ static void tick_domain(tsdb_health *h, int di, int64_t now, hev *events, int *n
         }
         break;
     case TSDB_DOM_DOWN: {
-        /* flapping: three DOWNs in ten minutes need a minute of good probes instead of recover_ms */
-        int64_t need = h->o.recover_ms;
-        if (d->ndown >= 3 && now - d->down_at[(d->ndown - 3) % 3] < 600000)
-            need = need > 60000 ? need : 60000;
+        /* flapping: HEALTH_FLAP_DOWNS DOWNs in ten minutes need a minute of good probes instead of recover_ms */
+        int64_t need = down_need_ms(d, now);
         if (!stuck && d->good_since_ms && now - d->good_since_ms >= need) {
             set_state(d, TSDB_DOM_RECOVERING, now);
             d->good_since_ms = 0;

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Time-weighted averages: the granule-statistics fast path against decoding
  * every granule, next to the plain average, on one irregular on-change series.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Tests: value types (float64, int64, bool, state) and nulls, against a
  * reference; their codecs; and refusing databases of older formats. */
 #include "internal.h"

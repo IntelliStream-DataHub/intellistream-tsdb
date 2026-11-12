@@ -1,7 +1,7 @@
 # Continuous integration for tsdb. What runs where is described in CONTRIBUTING.md ("CI").
 #
 #   every push to main and every pull request: build-test, asan, tsan, clients, portable, integration, dco (pull requests)
-#   jepsen (about 12 minutes of fault injection) on every push and pull request too, and once a week (about 2 hours)
+#   jepsen (about 12 minutes of fault injection) on every push and pull request too, and once a week (about 3 hours)
 #
 # Rules this file follows:
 #   - Jobs run directly on ubuntu-24.04 runners (4 CPUs, 16 GB), never in container jobs. Packages come from apt.
@@ -75,10 +75,24 @@ jobs:
 
   # -------------------------------------------------------------------------------------------------------- asan
   asan:
-    name: AddressSanitizer and UBSan
+    # `make test` as runners of its own: its groups (the Makefile, "The rest of `make test` as groups") are the matrix.
+    # `make asan` takes 27 to 57 minutes for all of them here and about 80 on 4 CPUs under ThreadSanitizer, so one
+    # job for the lot has no room to grow. tests/check_ci_groups.sh (in `make test`) fails when a group is missing.
+    name: AddressSanitizer and UBSan (${{ matrix.name }})
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: units, target: test }
+          - { name: units 2, target: test-units-b }
+          - { name: meta and cluster, target: test-meta }
+          - { name: meta mutants 1, target: test-meta-mutants-1 }
+          - { name: meta mutants 2, target: test-meta-mutants-2 }
+          - { name: server on io_uring, target: test-net, io: uring }
+          - { name: server on epoll, target: test-net, io: epoll }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install packages
@@ -90,28 +104,50 @@ jobs:
       - name: Which event loops can the server tests use?
         id: io
         run: echo "list=$(.github/scripts/pick-io.sh)" >> "$GITHUB_OUTPUT"
-      - name: make asan (starts with make clean, which is fine in its own job)
+      - name: make asan ${{ matrix.target }} (starts with make clean, which is fine in its own job)
         env:
           IO_LIST: ${{ steps.io.outputs.list }}
+          TARGET: ${{ matrix.target }}
+          IO_ONLY: ${{ matrix.io }}
         run: |
           ulimit -n 65536 || true
+          io="$IO_LIST"
+          if [ -n "$IO_ONLY" ]; then
+              case " $IO_LIST " in
+              *" $IO_ONLY "*) io="$IO_ONLY" ;;
+              *) echo "::warning::$IO_ONLY is not available on this runner: this group is skipped"; exit 0 ;;
+              esac
+          fi
           mkdir -p ci-logs
-          make asan IO="$IO_LIST" 2>&1 | tee ci-logs/make-asan.log
+          make asan TEST_TARGET="$TARGET" TEST_GROUPS= IO="$io" 2>&1 | tee ci-logs/make-asan.log
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: logs-asan
+          name: logs-asan-${{ matrix.target }}-${{ matrix.io }}
           path: ci-logs
           if-no-files-found: ignore
           retention-days: 14
 
   # -------------------------------------------------------------------------------------------------------- tsan
   tsan:
-    name: ThreadSanitizer
+    # The groups of `make test`, as in the asan job. One job for all of them took 80 minutes on 4 CPUs and ran into
+    # the limit on every run since 2d2fdbe (more tests: test_meta, test_cluster); each group is 5 to 25 minutes.
+    name: ThreadSanitizer (${{ matrix.name }})
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: units, target: test }
+          - { name: units 2, target: test-units-b }
+          - { name: meta and cluster, target: test-meta }
+          - { name: meta mutants 1, target: test-meta-mutants-1 }
+          - { name: meta mutants 2, target: test-meta-mutants-2 }
+          - { name: server on io_uring, target: test-net, io: uring }
+          - { name: server on epoll, target: test-net, io: epoll }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install packages
@@ -121,18 +157,27 @@ jobs:
       - name: Which event loops can the server tests use?
         id: io
         run: echo "list=$(.github/scripts/pick-io.sh)" >> "$GITHUB_OUTPUT"
-      - name: make tsan (builds into build-tsan/, the server under test included)
+      - name: make tsan ${{ matrix.target }} (builds into build-tsan/, the server under test included)
         env:
           IO_LIST: ${{ steps.io.outputs.list }}
+          TARGET: ${{ matrix.target }}
+          IO_ONLY: ${{ matrix.io }}
         run: |
           ulimit -n 65536 || true
+          io="$IO_LIST"
+          if [ -n "$IO_ONLY" ]; then
+              case " $IO_LIST " in
+              *" $IO_ONLY "*) io="$IO_ONLY" ;;
+              *) echo "::warning::$IO_ONLY is not available on this runner: this group is skipped"; exit 0 ;;
+              esac
+          fi
           mkdir -p ci-logs
-          make tsan IO="$IO_LIST" 2>&1 | tee ci-logs/make-tsan.log
+          make tsan TEST_TARGET="$TARGET" TEST_GROUPS= IO="$io" 2>&1 | tee ci-logs/make-tsan.log
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: logs-tsan
+          name: logs-tsan-${{ matrix.target }}-${{ matrix.io }}
           path: ci-logs
           if-no-files-found: ignore
           retention-days: 14
@@ -171,7 +216,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'Makefile') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'client/python-embedded/pyproject.toml', 'Makefile') }}
           restore-keys: pip-${{ runner.os }}-
       - name: make test-clients (Rust, Python, the Python sdist, Java, embedded Java; against build/tsdbd)
         run: |
@@ -253,7 +298,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'Makefile') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'client/python-embedded/pyproject.toml', 'Makefile') }}
           restore-keys: pip-${{ runner.os }}-
       - name: Build, then check that VERSION, tsdb.h, the binaries and the client manifests agree
         run: |
@@ -284,16 +329,17 @@ jobs:
     name: jepsen fault injection
     # On every push and pull request: about 12 minutes of kill -9, simulated power loss (the crashfs LD_PRELOAD shim,
     # built by make), I/O errors, pauses, misdirected I/O and damage at rest, on both event loops and the workloads kv
-    # and classes. Once a week the same with every run 5 minutes long (one power seed): about 2 hours on both loops.
+    # and classes. Once a week the same with every run 5 minutes long (one power seed, six outage seeds): about 3 hours on both loops.
     if: >-
       github.event_name != 'schedule' ||
       github.repository == 'IntelliStream-DataHub/intellistream-tsdb'
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ github.event_name == 'schedule' && 200 || 60 }}
+    timeout-minutes: ${{ github.event_name == 'schedule' && 260 || 60 }}
     env:
       JEPSEN_DIR: /tmp/tsdb-jepsen-ci
       JEPSEN_SECONDS: ${{ github.event_name == 'schedule' && '300' || '' }}
       JEPSEN_SEEDS: ${{ github.event_name == 'schedule' && '1' || '1 2 3' }}
+      JEPSEN_OUTAGE_SEEDS: ${{ github.event_name == 'schedule' && '1 2 3 4 5 6' || '1 2' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install packages

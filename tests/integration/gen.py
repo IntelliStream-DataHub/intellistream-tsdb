@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Test data for the integration tests: write scripts for the four clients, their queries, and an independent
 model of what every query must answer (last write wins, nulls, calendar periods from Python's zoneinfo).
 

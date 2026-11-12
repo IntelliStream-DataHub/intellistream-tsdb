@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * The benchmarks: {@link ai.intellistream.tsdb.bench.InsertBench} loads a file of rows into tsdbd over one or more
  * connections and prints rows per second and bytes sent per row; {@link ai.intellistream.tsdb.bench.QueryBench}

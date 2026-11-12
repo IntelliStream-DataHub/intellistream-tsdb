@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * More XOR codecs of the Gorilla family, for comparison (tools/codec-bench).
  * All three were published for float64; these are float32 adaptations:

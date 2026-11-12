@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * outagefs: an LD_PRELOAD shim that takes a storage domain away, the way an NFS server does (ha.md §15.8; the
  * "crashfs control socket" of that section, built as its own shim so that it stacks with crashfs: preload both).

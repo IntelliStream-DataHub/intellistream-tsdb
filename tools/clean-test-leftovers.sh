@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Removes the scratch directories tsdb's tests and client tests leave in /tmp and /var/tmp.
 # Anything touched in the last MINUTES (default 90) is kept: another worktree's tests may be using it.
 #   tools/clean-test-leftovers.sh          list what would go

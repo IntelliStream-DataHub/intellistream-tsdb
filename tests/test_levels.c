@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Every CPU level gives the same bytes and the same numbers.
  *

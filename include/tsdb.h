@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * tsdb - an embedded time series database in the spirit of ClickHouse MergeTree.
  *
@@ -30,9 +31,9 @@ extern "C" {
 /* The release version, also in the file VERSION; `make check-version` makes sure they agree. 0.x may still
  * change the on-disk format and the wire protocol; 1.0 freezes them (docs/compatibility.md). */
 #define TSDB_VERSION_MAJOR 0
-#define TSDB_VERSION_MINOR 10
+#define TSDB_VERSION_MINOR 11
 #define TSDB_VERSION_PATCH 0
-#define TSDB_VERSION "0.10.0"
+#define TSDB_VERSION "0.11.0"
 
 /* The version of the library that is linked in, "MAJOR.MINOR.PATCH" (the macros above are the version the
  * header was written for). */
@@ -1000,6 +1001,9 @@ void tsdb_set_write_wait_hook(tsdb *db, void (*on_wait)(void *ctx, int delta), v
  * Returns 0 while healthy; TSDB_ERR_IO once failed, with what failed (the
  * directory, the operation, the errno text) in msg. */
 int tsdb_failed(tsdb *db, char *msg, size_t len);
+/* The same for one volume (0 is the root): its own failure, not the first one tsdb_failed finds. TSDB_ERR_INVALID for a
+ * volume >= tsdb_volume_count. */
+int tsdb_volume_failed(tsdb *db, uint32_t volume, char *msg, size_t len);
 
 typedef struct tsdb_part_info {
     const char *name;

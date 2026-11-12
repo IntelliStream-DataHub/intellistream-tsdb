@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # Defaults shared by the scripts here; every one can be overridden from the environment.
 #   DBCMP       root for data directories and converted inputs   (/var/tmp/dbcmp)
 #   WORK        spec.tsv, q/, ref/ and res/; scripts run there     ($DBCMP/work)

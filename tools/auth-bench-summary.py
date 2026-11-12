@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Turns the raw logs of tools/auth-bench.sh into summary.md and summary.json.
 
     tools/auth-bench-summary.py RESULTS_DIR

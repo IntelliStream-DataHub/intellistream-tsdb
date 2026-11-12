@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package ai.intellistream.tsdb.bench;
 
 import ai.intellistream.tsdb.TsdbClient;

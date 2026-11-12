@@ -1,0 +1,5 @@
+health.domains = /a,\
+    /b,\
+    /c
+storage.dir = /x\
+  y

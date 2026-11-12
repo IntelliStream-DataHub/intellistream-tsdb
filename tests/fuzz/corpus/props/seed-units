@@ -1,0 +1,7 @@
+wal.sync = 10ms
+merge.idle = 1h
+flush.interval = 1500ms
+storage.partition = 7d
+latest.cache = 512M
+server.frame.timeout = -5
+auth.login.timeout = 1d

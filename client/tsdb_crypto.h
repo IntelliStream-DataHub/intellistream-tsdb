@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * The cryptography of login (docs/design-auth.md A19): SHA-256, HMAC-SHA-256,
  * PBKDF2-HMAC-SHA-256, base64 and a constant-time compare, written out so that

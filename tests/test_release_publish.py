@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Runs .github/scripts/release-publish.sh against a local mock of the GitHub REST API and checks every request.
 
     python3 -I tests/test_release_publish.py        (make test runs it; needs curl and jq, else it skips)

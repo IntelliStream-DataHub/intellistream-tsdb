@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # VictoriaMetrics (single node, v1.154.0) for run.sh, which sources this file: start, load, settle, size, p1 and p2.
 # Facts and their sources (-help of the pinned image; docs and source at tag v1.154.0): what is not default:
 #   -retentionPeriod=100y         the default is 1 month: the 2024 data would be deleted

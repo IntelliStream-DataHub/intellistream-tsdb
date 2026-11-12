@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! TCP keepalive for the client's socket.
 //!
 //! std has no keepalive, so the options are set with `setsockopt` on Unix. A

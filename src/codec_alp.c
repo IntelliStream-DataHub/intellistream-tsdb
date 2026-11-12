@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * ALP and ALP_rd (Afroozeh, Kuffo, Boncz: "ALP: Adaptive Lossless
  * floating-Point Compression", SIGMOD 2024), adapted to float32 as DuckDB does.

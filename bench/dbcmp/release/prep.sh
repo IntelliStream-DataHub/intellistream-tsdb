@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # prep.sh: inputs of the release benchmark (not timed); run.sh prep calls it under flock -s of BENCH.lock.
 # PREP_SERIES/PREP_POINTS/PREP_SIZE_POINTS/PREP_SPEC shrink it for the smoke test.
 #   main:  $DBCMP/input/mixed.{rowbinary,lp,ilp32,csv,om}, $WORK/spec.tsv

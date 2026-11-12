@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Aggregation kernels with runtime dispatch, five sets: AVX-512 (v4), AVX2
  * (v3), AVX without AVX2 (Sandy Bridge, Ivy Bridge), SSE4.2 (x86-64-v2) and

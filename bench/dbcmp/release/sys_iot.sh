@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # Apache IoTDB (2.0, table model) for run.sh, which sources this file: start, load, settle, size, p1 and p2.
 # Facts and their sources: bench/dbcmp/README.md (IoTDB) and the builder's findings; what is not default:
 #   wal_mode=SYNC        the WAL is fsynced before a write is acknowledged (default ASYNC, 1 s): as tsdb in sync mode

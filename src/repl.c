@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The replication core of a cluster volume: src/repl.h has the design, docs/design-cluster.md the reasons.
  *
  * State of one replica:

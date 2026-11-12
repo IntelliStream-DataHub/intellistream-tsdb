@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdb_latest (docs/design-latest.md, step 1: the slow path alone).
  *
  * The oracle is a full scan: the answer for a series and an end bound is the last non-null row (with_nulls: the last

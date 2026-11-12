@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Part files: immutable, sorted by (series, ts), written once and mmap'd.
  *

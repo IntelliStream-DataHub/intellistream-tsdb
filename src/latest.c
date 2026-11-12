@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The latest row of a series (docs/design-latest.md, step 1: the slow path alone; there is no table yet).
  *

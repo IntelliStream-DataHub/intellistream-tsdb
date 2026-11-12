@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* portable.h: what the tests use of Linux, for macOS (see src/compat.h for the library's own).
  *
  *  - REAL(name): the libc function a test has replaced with its own (a fault injector linked statically with the

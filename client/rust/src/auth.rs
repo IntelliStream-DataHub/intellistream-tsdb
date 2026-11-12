@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Login and users (protocol 12, `docs/design-auth.md`): SCRAM-SHA-256 as the client (RFC 5802, RFC 7677), the
 //! verifiers the admin calls send, the process-wide key cache, and the types of users and grants.
 //!

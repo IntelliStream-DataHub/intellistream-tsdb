@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // workflow-template.js: paste into the Workflow tool's `script` and pass as args
 //   {tracks:[{key,wt,br,base,cont?,start?,risk?,models?}], rules?, agents?, seBin?}
 // Stages: build -> review -> fix. Any stage may end with wait={name} (a long run detached with bgrun.sh): the

@@ -24,7 +24,7 @@
 <div class="scrim" hidden></div>
 <div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
 <div class="doc-shell">
-<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html" aria-current="page">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html" aria-current="page">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="cluster.html">Cluster (preview)</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
 <main id="main" class="doc">
 <h1>Clients</h1>
 <p class="lead">tsdb has clients for C, Rust, Python and Java. Each one talks to tsdbd, and each one can also run the
@@ -76,7 +76,7 @@ VIRTUAL_ENV=/tmp/tsdb-venv /tmp/tsdb-venv/bin/maturin develop --release</code></
 <pre><code class="language-xml" data-src="client/java/README.md#Quick start">&lt;dependency&gt;
   &lt;groupId&gt;ai.intellistream&lt;/groupId&gt;
   &lt;artifactId&gt;tsdb-client&lt;/artifactId&gt;
-  &lt;version&gt;0.10.0&lt;/version&gt;
+  &lt;version&gt;0.11.0&lt;/version&gt;
 &lt;/dependency&gt;</code></pre>
 </div>
 </div>
@@ -341,7 +341,7 @@ public final class Example {
 <p class="code-source">client/java/src/main/java/ai/intellistream/tsdb/example/Example.java. Build and run it:</p>
 <pre><code class="language-sh" data-block="2" data-src="client/java/README.md#Quick start">cd client/java
 mvn -q package -DskipTests
-java -cp target/tsdb-client-0.10.0.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070 admin /tmp/tsdb-demo/password</code></pre>
+java -cp target/tsdb-client-0.11.0.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070 admin /tmp/tsdb-demo/password</code></pre>
 </div>
 </div>
 <p>Times are milliseconds since 1970 in UTC. The Oslo days are worked out by the client: the server knows only UTC
@@ -449,7 +449,8 @@ done:
 <code>build/embedded-example /tmp/tsdb-embedded</code>.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
-<pre><code class="language-rust" data-src="client/rust/examples/embedded_quickstart.rs">use tsdb_client::{Db, Group, Options, QueryOpts, Unit};
+<pre><code class="language-rust" data-src="client/rust-embedded/examples/embedded_quickstart.rs">use tsdb_client::{Group, QueryOpts, Unit};
+use tsdb_embedded::{Db, Options};
 
 fn main() -&gt; tsdb_client::Result&lt;()&gt; {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "/tmp/tsdb-embedded".into());
@@ -471,13 +472,14 @@ fn main() -&gt; tsdb_client::Result&lt;()&gt; {
     }
     db.close()
 }</code></pre>
-<p class="code-source">client/rust/examples/embedded_quickstart.rs. It needs the <code>embedded</code> feature:
-<code>cargo run --features embedded --example embedded_quickstart -- /tmp/tsdb-embedded</code>.</p>
+<p class="code-source">client/rust-embedded/examples/embedded_quickstart.rs. The embedded Db is its own crate,
+<code>intellistream-tsdb-embedded</code> (AGPL-3.0), beside the Apache-2.0 network client:
+<code>cd client/rust-embedded &amp;&amp; cargo run --example embedded_quickstart -- /tmp/tsdb-embedded</code>.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="python">
-<pre><code class="language-python" data-src="client/python/README.md#Embedded">import tsdb_client
+<pre><code class="language-python" data-src="client/python-embedded/README.md#Embedded">import tsdb_embedded
 
-with tsdb_client.Db("/tmp/tsdb-embedded") as db:
+with tsdb_embedded.Db("/tmp/tsdb-embedded") as db:
     s = db.series("pump7.flow")
     t0 = 1_700_000_000_000  # one row a minute for a day
     db.insert_series(s, [t0 + i * 60_000 for i in range(1440)], [float(i % 60) for i in range(1440)])
@@ -486,8 +488,9 @@ with tsdb_client.Db("/tmp/tsdb-embedded") as db:
         print("raw ", t, v)
     for b in db.query_group(s, unit="day", timezone="Europe/Oslo"):
         print("day ", b.start, b.count, b.sum)</code></pre>
-<p class="code-source">From client/python/README.md. <code>tsdb_client.Db</code> has the same methods as
-<code>Client</code>, so code switches between the two by changing one line.</p>
+<p class="code-source">From client/python-embedded/README.md. <code>tsdb_embedded.Db</code> (the package
+<code>intellistream-tsdb-embedded</code>, AGPL-3.0) has the same methods as <code>tsdb_client.Client</code>, so code
+switches between the two by changing one line.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="java">
 <p>The embedded Java library is <code>tsdb-embedded</code> in <code>client/java-embedded</code>. It needs Java 22 or
@@ -582,9 +585,9 @@ spread range 60 stddev 28.72
 chart 100 of 10000 points</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="python">
-<pre><code class="language-python" data-src="client/python/README.md#Spread, time-weighted">from tsdb_client import Db
+<pre><code class="language-python" data-src="client/python/README.md#Spread, time-weighted">from tsdb_client import Client
 
-with Db("/tmp/tsdb-analytics") as db:
+with Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as db:
     s = db.series_create("tank1.level", "float64")
     db.insert_series_values(s, [0, 1000, 3000, 4000], [10.0, 20.0, 30.0, 40.0])
 
@@ -647,7 +650,7 @@ README</a> shows them.</p>
 <pre><code class="language-python" data-src="client/python/README.md#Many series in one request">import numpy as np
 import tsdb_client
 
-with tsdb_client.Db("/tmp/tsdb-multi") as db:
+with tsdb_client.Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as db:
     t0 = 1_700_000_000_000
     ts = t0 + np.arange(1440, dtype=np.int64) * 60_000  # one row a minute for a day
     pumps = [db.series(f"pump{i}.flow") for i in range(3)]
@@ -886,6 +889,6 @@ instead of 16.</li>
 
 <nav class="pager" aria-label="Previous and next page"><a class="prev" href="compression.html"><span>Previous</span>Compression</a><a class="next" href="cli.html"><span>Next</span>Command line</a></nav></main>
 </div>
-<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source: the server and the engine under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">GNU AGPL-3.0</a> (a commercial licence is available), the client libraries under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSES/Apache-2.0.txt">Apache License 2.0</a>; <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSING.md">which is which</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
 </html>

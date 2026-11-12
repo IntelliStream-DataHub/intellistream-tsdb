@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Background merges, modelled on ClickHouse's SimpleMergeSelector.
  *

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # usage.sh [--gate PCT | --wgate PCT | --rate [HOURS]]: the Claude Code usage of the 5-hour window and of the week, as
 # the status line last saw them (save-usage.sh, called from the status-line script, writes $SE_HOME/state/usage*.json).
 #   no option: prints "five=N week=M age=Ss resets=..." ("-" when unknown), exit 0.

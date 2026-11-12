@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The spread in aggregates: range, population and sample variance and
  * standard deviation (tsdb_query_spread), for float32, float64, int64 and bool.

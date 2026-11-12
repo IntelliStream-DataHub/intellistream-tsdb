@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Errors: server statuses (`TSDB_ERR_*` in `tsdb.h`), I/O, protocol violations
 //! and arguments rejected before anything is sent.
 
@@ -132,8 +133,8 @@ pub fn strerror(code: i32) -> &'static str {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// The server executed the request and answered with an error status; for an embedded
-    /// [`Db`](crate::Db), the engine's status.
+    /// The server executed the request and answered with an error status; for the embedded `Db`
+    /// (crate `intellistream-tsdb-embedded`), the engine's status.
     Server(Status),
     /// The connection failed (or was already broken by an earlier failure).
     Io(io::Error),

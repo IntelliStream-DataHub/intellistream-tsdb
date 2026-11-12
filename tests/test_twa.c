@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Time-weighted averages (tsdb_query_twa*): hand-computed cases for each rule,
  * then random data of every type against a reference implementation that

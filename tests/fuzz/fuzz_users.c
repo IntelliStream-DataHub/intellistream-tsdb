@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* USERS (server/users.c): users_open on the first `split` bytes, then the rest appended and users_reload (the
  * incremental catch_up), then lookups, rights_of on a few names, and a writable open that appends a grant (the
  * writer's catch_up with its cut). xxh64 is no authentication: every record is re-sealed unless bit 6 of its type

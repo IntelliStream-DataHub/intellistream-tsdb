@@ -2,7 +2,12 @@
 #   useradd -r -s /sbin/nologin -d /var/lib/tsdb tsdb
 #   install -d -o tsdb -g tsdb -m 750 /var/lib/tsdb
 #   runuser -u tsdb -- /usr/local/bin/tsdb /var/lib/tsdb user add admin --superuser
+#   install -d /etc/tsdb && install -m 644 tsdbd.properties /etc/tsdb/
 #   cp tsdbd.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now tsdbd
+#
+# The settings are in /etc/tsdb/tsdbd.properties (docs/config.md): edit it and `systemctl restart tsdbd`; there is no
+# reload. `tsdbd --config /etc/tsdb/tsdbd.properties --check-config` checks it first. A file with a mistake stops
+# the service from starting, with the file and line in the journal.
 #
 # tsdbd refuses to start until the database has a superuser: the `user add ... --superuser` line above, run as
 # the tsdb user so that it owns USERS. --no-auth would let every client do everything; do not use it here.
@@ -24,8 +29,9 @@ User=tsdb
 Group=tsdb
 # /var/lib/tsdb, created and owned by User= when missing
 StateDirectory=tsdb
-# Clients log in, but there is no TLS (data travels in the clear): listen on a trusted interface only.
-ExecStart=/usr/local/bin/tsdbd --dir /var/lib/tsdb --listen 127.0.0.1 --port 7070
+# Clients log in, but there is no TLS (data travels in the clear): listen on a trusted interface only
+# (server.listen in the file; storage.dir there must be /var/lib/tsdb, the StateDirectory above).
+ExecStart=/usr/local/bin/tsdbd --config /etc/tsdb/tsdbd.properties
 # SIGTERM: requests in progress finish, the WAL is synced, then it exits
 KillSignal=SIGTERM
 TimeoutStopSec=120

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What the benchmarks of this crate share with tools/cbench.h (the C benchmarks): the random query windows,
 //! the three window classes, process CPU time and the result lines that bench/clients/run.sh reads. The
 //! constants and the generator are copied from the C header; change them together.

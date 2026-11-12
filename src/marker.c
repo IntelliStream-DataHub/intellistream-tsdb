@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * WAL marker payloads: one encoder and one decoder (marker.h has the layouts' contract). Layout of a payload,
  * little endian, the body a multiple of 4 bytes:

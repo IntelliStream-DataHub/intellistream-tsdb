@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Prometheus metrics for tsdbd (--metrics-port), in server/metrics.c.
  *

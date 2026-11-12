@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The numbers of the log (`fno`, docs/design-cdc.md 2.1) never go back across opens, and a marker is never rows
  * (format 9). The bound is FNO, not MANIFEST (src/fno.c). Tests:

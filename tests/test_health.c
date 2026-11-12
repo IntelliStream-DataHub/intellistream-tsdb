@@ -1,9 +1,11 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Storage domain health (src/health.c, ha.md 15.2): probes, the states and what moves between them, against the
  * outagefs shim. Three domains, A and A2 (two filesystems of one server) and B (another server). The thresholds are
  * scaled down so the whole test takes about 30 s. Usage: test_health [scratch directory]. */
 #define _GNU_SOURCE
 #include "tsdb.h"
 #include "outagefs_ctl.h"
+#include "../src/health_rules.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -181,6 +183,54 @@ int main(int argc, char **argv)
     CHECK(stays(d0, TSDB_DOM_RECOVERING, 1500));
     tsdb_health_set_up(h, d0);
     CHECK(tsdb_health_state(h, d0) == TSDB_DOM_UP);
+    tsdb_health_close(h);
+
+    /* flapping (health_rules.h): the third DOWN in the window needs HEALTH_FLAP_NEED_MS of good probes, far more than
+     * recover_ms, and a slow probe in the meantime starts that count over: it says so once (stderr), because a
+     * flapping domain on a slow disk stays DOWN with every probe working and nothing else tells why. */
+    o.auto_up = 1;
+    h = tsdb_health_open(&o);
+    int df = tsdb_health_add_domain(h, "flap", db);
+    CHECK(HEALTH_FLAP_DOWNS == 3 && HEALTH_FLAP_NEED_MS > 10 * o.recover_ms);
+    for (int i = 0; i < HEALTH_FLAP_DOWNS; i++) {
+        CHECK(cmd("eio", db, NULL) == 0);
+        CHECK(wait_state(df, TSDB_DOM_DOWN, 2500));
+        CHECK(cmd("heal", db, NULL) == 0);
+        if (i + 1 < HEALTH_FLAP_DOWNS)
+            CHECK(wait_state(df, TSDB_DOM_UP, 4500)); /* a first and a second DOWN leave after recover_ms */
+    }
+    CHECK(stays(df, TSDB_DOM_DOWN, 3 * o.recover_ms)); /* the third does not */
+    char errlog[512];
+    snprintf(errlog, sizeof errlog, "%s/health-stderr.%d", base, (int)getpid());
+    int saved = dup(2), efd = open(errlog, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(saved >= 0 && efd >= 0);
+    fflush(stderr);
+    dup2(efd, 2);
+    close(efd);
+    CHECK(cmd("slow", db, "700") == 0); /* every probe works, none within fast_ms (500) */
+    nap(3000);
+    CHECK(tsdb_health_state(h, df) == TSDB_DOM_DOWN);
+    CHECK(cmd("heal", db, NULL) == 0);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    {
+        char txt[4096] = {0};
+        FILE *f = fopen(errlog, "r");
+        size_t n = f ? fread(txt, 1, sizeof txt - 1, f) : 0;
+        txt[n] = 0;
+        if (f)
+            fclose(f);
+        int lines = 0;
+        for (const char *q = txt; (q = strstr(q, "start over")) != NULL; q++)
+            lines++;
+        CHECK(lines == 1); /* the first slow probe of this DOWN, not one per probe */
+        CHECK(strstr(txt, "storage domain flap: a write probe took") != NULL);
+        char want[64];
+        snprintf(want, sizeof want, "%d ms of good probes", HEALTH_FLAP_NEED_MS);
+        CHECK(strstr(txt, want) != NULL);
+        unlink(errlog);
+    }
     tsdb_health_close(h);
 
     /* read-only: no write probe, no files made */

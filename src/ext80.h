@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* x87 extended precision (a 64-bit mantissa, round to nearest even) emulated with integers, for the one result
  * that rests on it: the integer variances of int_variance (query.c), which convert an exact 256-bit numerator
  * through long double. On x86 long double is the x87 format and query.c uses it directly; where it is not (arm64

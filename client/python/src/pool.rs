@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `tsdb_client.Pool`: several connections to one tsdbd for batch calls (`tsdb_client::Pool`).
 //!
 //! A batch call converts its arguments while the GIL is held, then spreads the queries or inserts

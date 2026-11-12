@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # jepsen's latest check must have teeth: a tsdbd whose latest table keeps a stale entry (a row at a newer timestamp
 # than the entry's is not stored: M3; one at the same timestamp is not stored: M2, a stale value; a null over the newest
 # row does not make the entry unknown: M1; a search with_nulls that skips the rows of a part that has tombstones, which

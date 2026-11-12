@@ -1,5 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Many series in one request (protocol version 10): every `*_multi` call answers each series exactly
-//! as the single call does, on tsdbd and (feature `embedded`) on the engine, with per-series errors,
+//! as the single call does, on tsdbd, with per-series errors,
 //! unknown ids, duplicates, per-series ranges and intervals, time zones, splitting past 65,536 series,
 //! max_rows, and an early stop that leaves the connection usable.
 
@@ -243,56 +244,6 @@ fn multi_equals_single(db: &mut impl Database) {
 fn multi_equals_single_on_tcp() {
     let srv = Server::start();
     multi_equals_single(&mut srv.client());
-}
-
-#[cfg(feature = "embedded")]
-#[test]
-fn multi_equals_single_embedded() {
-    let dir = common::test_dir("tsdb-multi-embedded");
-    let mut db = tsdb_client::Db::open(&dir, &tsdb_client::Options::default()).unwrap();
-    multi_equals_single(&mut db);
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// The engine's multi calls answer what tsdbd's do, on the same directory.
-#[cfg(feature = "embedded")]
-#[test]
-fn tsdbd_multi_answers_what_the_engine_answered() {
-    let dir = common::test_dir("tsdb-multi-vs-tcp");
-    let mut db = tsdb_client::Db::open(&dir, &tsdb_client::Options::default()).unwrap();
-    // no unknown id here: tsdb_query_twa_group_local answers one with NOTFOUND, tsdbd (as a client trims
-    // local periods) with no buckets; each side's multi call matches its single call (multi_equals_single)
-    let ids = setup(&mut db);
-    db.flush().unwrap(); // tsdbd finds the memtable rows in a part, so the engine reads them from one too
-    // and the same parts: a float spread over two overlapping parts differs in the last bit from one over their
-    // merge (docs/design.md), and a background merge may finish before the engine's queries or only after them
-    db.optimize().unwrap();
-    let embedded = answers(&mut db, &ids);
-    db.close().unwrap();
-    let srv = Server::start_in(dir);
-    let tcp = answers(&mut srv.client(), &ids);
-    assert_eq!(embedded.len(), tcp.len());
-    for (e, t) in embedded.iter().zip(&tcp) {
-        assert_eq!(e, t);
-    }
-}
-
-#[cfg(feature = "embedded")]
-fn answers(db: &mut impl Database, ids: &[u64]) -> Vec<String> {
-    let full = (i64::MIN, i64::MAX);
-    let oslo = Group::new(Unit::Day).timezone("Europe/Oslo");
-    let starts: Vec<i64> = (0..ids.len() as i64).map(|i| T0 + i * 1_000_000).collect();
-    let mut out = Vec::new();
-    for m in [MultiOpts::default(), MultiOpts { starts: Some(&starts), ..MultiOpts::default() }] {
-        out.extend(db.query_rows_multi(ids, .., QueryOpts::desc().limit(100), m).unwrap().iter().map(key));
-        for b in [B::One, B::Every(600_000), B::G(oslo.clone()), B::Bd(vec![T0 + 5_000, T0 + 9_000_000])] {
-            for kind in ["agg", "spread", "twa"] {
-                out.extend(multi(db, kind, ids, full, &b, QueryOpts::asc(), TwaOpts::linear(), m));
-            }
-        }
-    }
-    out
 }
 
 /// More than 65,536 series go in several requests; the indexes run on across them.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # iotload.py: the IoTDB loader, through IoTDB's own client (the Python TableSession, insert of tablets over the
 # Thrift RPC on 6667), the bulk path IoTDB's docs recommend for applications. Run with the venv of
 # iotdb-requirements.txt:

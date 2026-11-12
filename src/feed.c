@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The engine's side of the change feed's files (feed.h, feedfile.c): what an open does with them, and the live
  * enable and disable. docs/design-cdc.md 2.2, 2.13.

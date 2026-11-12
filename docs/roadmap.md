@@ -53,7 +53,7 @@ series store underneath; tsdb does not duplicate it.
   times faster on an i9-10850K, docs/tasks/intel-10850k-results.md). See the table below for what is left.
 - Limits: raw, bucketed, bounds, calendar, time-weighted, spread and LTTB queries take an order and a limit;
   bucketed queries with a limit stop early (protocol 9, C client and CLI).
-- Embedded bindings: Rust (`tsdb_client::Db`), Python (`tsdb_client.Db`) and Java 22+ (FFM, client/java-embedded).
+- Embedded bindings: Rust (`tsdb_embedded::Db`, until 0.10.0 `tsdb_client::Db`), Python (`tsdb_embedded.Db`, until 0.10.0 `tsdb_client.Db`) and Java 22+ (FFM, client/java-embedded).
 - The Rust, Python and Java clients and the embedded bindings at protocol 9: the spread, LTTB and TWA with
   order and limit, range delete, replace and retention; embedded and TCP answers compared in the tests.
 - Delete or replace a time range of one series: atomic replace (delete plus

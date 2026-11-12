@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // stage-template.js: stage a gate batch (cherry-pick tracks onto main, number bugs, run the stage checks), then have a
 // second agent check the merge. Paste into the Workflow tool's `script` with args:
 //   {label:'B20', wt:'/abs/relq20', branch:'rel-queue20', base:'<sha of LOCAL main to cut from>',

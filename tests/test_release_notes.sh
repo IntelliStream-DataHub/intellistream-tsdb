@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Tests tools/release-notes.sh, which the release workflow uses for the text of a GitHub release: the notes file
 # before the changelog, the files at the tag before the working tree's, the changelog section cut exactly, and
 # refusals. Most of it runs in a scratch git repository with a copy of the script; make test runs it.

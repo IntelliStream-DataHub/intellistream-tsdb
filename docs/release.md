@@ -18,9 +18,12 @@ Machines and tools: a quiet x86-64 Linux machine with `gcc` 15 or 16, Podman (ne
 Edit `VERSION`, then the other places that must say the same:
 
 - `include/tsdb.h`: `TSDB_VERSION_MAJOR`, `_MINOR`, `_PATCH` and `TSDB_VERSION`
-- `client/rust/Cargo.toml`, `client/rust-sys/Cargo.toml`, `client/python/Cargo.toml` (`version =`), and the
+- `client/rust/Cargo.toml`, `client/rust-sys/Cargo.toml`, `client/rust-embedded/Cargo.toml`, `client/python/Cargo.toml`,
+  `client/python-common/Cargo.toml`, `client/python-embedded/Cargo.toml` (`version =`), the exact pins between them
+  (`version = "=X.Y.Z"` of `intellistream-tsdb-client` and `intellistream-tsdb-embedded`, and
+  `intellistream-tsdb-client==X.Y.Z` in `client/python-embedded/pyproject.toml`), and the
   matching entries in the `Cargo.lock` files (`cargo update -p intellistream-tsdb-client --offline` or edit the
-  lines): `client/rust`, `client/rust-sys`, `client/python` and `tests/integration/rust/Cargo.lock` (a test crate
+  lines): every `client/*/Cargo.lock` and `tests/integration/rust/Cargo.lock` (a test crate
   that depends on the client; `cargo build --locked` there fails when it still names the old version)
 - `client/java/pom.xml`, `client/java-embedded/pom.xml` (its version and its dependency on `tsdb-client`),
   `connectors/pulsar/pom.xml` (its version and `tsdb-client.version`)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Many series in one request (protocol version 10), as `tsdbc_query_multi` in `client/tsdb_client.c` sends them.
 //!
 //! QUERY_MULTI carries the single op's payload once, as a template, and the series (with per-series starts,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Request timeouts and keepalive, against fake servers that stall.
 //!
 //! No tsdbd here: each test runs a listener that accepts and then misbehaves

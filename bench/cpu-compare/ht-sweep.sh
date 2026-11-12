@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Does the second hardware thread of a core help tsdb, and how do queries scale with --query-threads?
 # Topology-aware (reads /sys/.../thread_siblings_list), so the same script runs on a 10850K, a 7950X and a 9950X.
 #
@@ -23,7 +24,7 @@ while [ $# -gt 0 ]; do
     --seconds) SECS=$2; shift 2 ;;
     --server) SERVER=1; shift ;;
     --db) DB=$2; shift 2 ;;
-    *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     esac
 done
 [ -x "$B/tsdb-bench" ] || { echo "ht-sweep.sh: no $B/tsdb-bench (make)" >&2; exit 1; }

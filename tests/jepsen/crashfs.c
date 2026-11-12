@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * crashfs: an LD_PRELOAD shim that simulates losing power, in the spirit of
  * Jepsen's LazyFS and of ALICE.

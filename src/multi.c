@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Many series in one call (tsdb_query_multi). The caller is the conductor: it
  * hands results to the callback in index order. Helpers of the database's

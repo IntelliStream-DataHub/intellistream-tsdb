@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """End-to-end tests of tsdb: real tsdbd processes, real clients in four languages, and the tsdb CLI.
 
   run.py [--only matrix,cli,follower,durability,stale_wal] [--io uring,epoll] [--auth off,on] [--scale 1.0]

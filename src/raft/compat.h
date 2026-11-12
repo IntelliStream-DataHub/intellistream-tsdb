@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * What the Raft core copied from intellistream-objects (src/raft/UPSTREAM) includes from isod's own src/common and
  * src/proto, written for tsdb. The copied files include "common/util.h", "common/rng.h", "common/clock.h",

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * tsdb_query_group_local: grouping in a time zone for programs that embed
  * the database. The engine knows UTC only; this is the client's part (the

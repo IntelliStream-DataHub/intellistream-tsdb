@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # TDengine (3.4, community) for run.sh, which sources this file: start, load, settle, size, p1 and p2.
 # Facts and their sources (docs at tag ver-3.4.2.8): the builder's FINDINGS-tdengine-builder.md; what is not default:
 #   CREATE DATABASE ... WAL_LEVEL 2 WAL_FSYNC_PERIOD 0   the WAL is fsynced before a write is acknowledged (default

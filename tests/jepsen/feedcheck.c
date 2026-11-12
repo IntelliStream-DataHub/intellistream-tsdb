@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The offline check of a database directory whose change feed is on (docs/design-cdc.md 2.6; step F1), run by jepsen
  * on the directory a crash or a power loss left (before the next server recovers it) and after a clean stop. What F2's

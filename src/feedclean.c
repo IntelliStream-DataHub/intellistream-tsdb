@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The cleaner: removes retained WAL segments (fwal_<seq>.log) that the feed no longer owes anyone.
  * docs/design-cdc.md 2.6 (F1 builds it without slots).

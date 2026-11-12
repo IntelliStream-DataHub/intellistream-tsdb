@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The public tsdb: one root directory plus any number of volumes, each a
  * storage directory of its own (its parts, WAL, MANIFEST and LOCK), for
@@ -1898,6 +1899,20 @@ void tsdb_test_meta_release(void *hold)
     free(h);
 }
 
+/* The capacity of the arrays the active memtable holds for series id (0: none), for tests/test_failstop.c */
+size_t mt_test_cap(const memtable *m, uint32_t local);
+size_t tsdb_test_mem_cap(tsdb *t, tsdb_sid id)
+{
+    eng *e EREF = NULL;
+    uint32_t local;
+    if (!route(t, id, &e, &local))
+        return 0;
+    pthread_mutex_lock(&e->buf_lock);
+    size_t cap = mt_test_cap(e->active, local);
+    pthread_mutex_unlock(&e->buf_lock);
+    return cap;
+}
+
 int tsdb_test_deferred_retires(tsdb *t) { return atomic_load_explicit(&t->ndeferred, memory_order_relaxed); }
 
 size_t tsdb_test_kept_names(tsdb *t)
@@ -2431,6 +2446,15 @@ int tsdb_failed(tsdb *t, char *msg, size_t len)
     int rc = 0;
     for (size_t i = 0; i < t->nvols && rc == 0; i++)
         rc = eng_failed_msg(t->vols[i], msg, len);
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
+int tsdb_volume_failed(tsdb *t, uint32_t volume, char *msg, size_t len)
+{
+    if (msg && len)
+        msg[0] = '\0';
+    pthread_rwlock_rdlock(&t->lock);
+    int rc = volume < t->nvols ? eng_failed_msg(t->vols[volume], msg, len) : TSDB_ERR_INVALID;
     pthread_rwlock_unlock(&t->lock);
     return rc;
 }

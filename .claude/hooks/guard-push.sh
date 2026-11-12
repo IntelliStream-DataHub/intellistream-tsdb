@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # PreToolUse hook for Bash: refuses a git push while any local commit that is on no
 # remote yet carries a link to a Claude session (project rule: no session links
 # in anything that lands in a repository). Checks every local branch, so pushes

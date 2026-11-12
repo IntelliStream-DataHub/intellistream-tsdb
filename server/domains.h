@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdbd and storage domains (docs/ha.md 15.2, 15.3, 15.5; included by tsdbd.c, one translation unit).
  *
  * A volume whose directory lies under a --health-domain prefix belongs to that domain (the root never does: its
@@ -51,9 +52,19 @@ static struct {
     void (*waits)(int delta);
 } dom = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
+/* Seconds on the monotonic clock: the lines of a storage event can be set beside the harness's own clock (jepsen's
+ * outage trace) and the ones of another volume. */
+static double dom_now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 static void dom_log(const char *what, size_t v, const char *extra)
 {
-    fprintf(stderr, "tsdbd: volume %zu: %s%s%s\n", v, what, extra ? ": " : "", extra ? extra : "");
+    fprintf(stderr, "tsdbd: [%.3f] volume %zu: %s%s%s\n", dom_now_s(), v, what, extra ? ": " : "",
+            extra ? extra : "");
 }
 
 /* The domain of volume v: the longest prefix that holds its directory. Decided once, by comparing strings (no I/O:
@@ -344,7 +355,7 @@ static void dom_on_change(void *ctx, int d, int old_state, int new_state)
     (void)ctx;
     if (d < 0 || d >= dom.ndoms)
         return;
-    fprintf(stderr, "tsdbd: storage domain %s: %d -> %d\n", dom.prefix[d], old_state, new_state);
+    fprintf(stderr, "tsdbd: [%.3f] storage domain %s: %d -> %d\n", dom_now_s(), dom.prefix[d], old_state, new_state);
     if (new_state == TSDB_DOM_UP) {
         pthread_mutex_lock(&dom.mu);
         atomic_store(&dom.nonup[d], false);
@@ -452,7 +463,10 @@ static int dom_failwatch(char *msg, size_t msglen)
         if (dom_of(v) < 0)
             return 1;
         if (!atomic_load(&dom.vol[v].recovering) && !atomic_load(&dom.vol[v].diverged)) {
-            dom_log("storage failure, recovering in place", v, msg);
+            char own[512]; /* this volume's own error: msg is the first failed volume's, which may be another one */
+            if (tsdb_volume_failed(dom.db, (uint32_t)v, own, sizeof own) != TSDB_ERR_IO || !own[0])
+                snprintf(own, sizeof own, "%s", msg);
+            dom_log("storage failure, recovering in place", v, own);
             tsdb_health_probe_now(dom.health, dom_of(v));
             dom_recover(v);
         }

@@ -1,8 +1,11 @@
 Third-party software in the tsdb tarball
 ========================================
 
-tsdb itself is licensed under the Apache License 2.0 (the file LICENSE in this
-tarball; see also NOTICE). The binaries in this tarball (bin/, bench/, tests/)
+tsdb itself is licensed under the GNU Affero General Public License, version 3
+only (the file LICENSE in this tarball), except for its client libraries and
+the headers they share with the engine, which are under the Apache License 2.0
+(LICENSES/Apache-2.0.txt; see LICENSING.md and NOTICE). The binaries in this
+tarball (bin/, bench/, tests/)
 also contain code from the libraries below, which `make dist` links in
 statically. Their licenses require that their copyright notice and license
 text travel with the binaries; they are reproduced here.

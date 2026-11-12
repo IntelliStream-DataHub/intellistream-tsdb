@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * The tsdb time series database in-process: {@link ai.intellistream.tsdb.embedded.EmbeddedDb} runs the engine
  * (libtsdb.so) in the JVM through the Java FFM API ({@code java.lang.foreign}, Java 22 and later), with no server

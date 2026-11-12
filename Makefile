@@ -47,9 +47,10 @@ LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
+FUZZ_OBJS_props := props.o cfg.o
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -90,6 +91,7 @@ $(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/l
 	$(CC) $(CFLAGS) -c -o $@ $<
 # simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
 $(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
+$(B)/health.o: src/health_rules.h
 # Its lanes start at zero (arrays of 16 and 32 doubles): GCC's generic tuning (the dist build) clears 33 to 8192
 # known bytes with `rep stosq`, whose startup (some 30 cycles) was a third of a short run's fold (fold-bench --rows
 # 32, sse kernels); -march=native picks vector stores itself. Vector stores up to 512 bytes, memset beyond.
@@ -131,11 +133,19 @@ $(B)/tsdb_calendar.o: client/tsdb_calendar.c include/tsdb_calendar.h include/tsd
 # export writes the tsdb version and the on-disk format version (not in the public API) into its stream header
 TSDB_FORMAT := $(shell sed -n 's/^\#define FORMAT_VERSION \([0-9]*\).*/\1/p' src/internal.h)
 
+# configuration files (tools/props.c, tools/cfg.c; docs/config.md): in tsdbd, in every binary that includes tsdbd.c, and
+# in the CLI
+CFG_OBJ := $(B)/props.o $(B)/cfg.o
+$(B)/props.o: tools/props.c tools/props.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(B)/cfg.o: tools/cfg.c tools/cfg.h tools/props.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 # CLUSTER_OBJ (defined further down, with the cluster) is a prerequisite there too: `tsdb cluster` (cluster-cli.c)
-$(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c tools/cluster-cli.c \
-          server/cluster.h client/tsdb_client.h $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB)
+$(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c tools/cluster-cli.c tools/cfg.h \
+          server/cluster.h client/tsdb_client.h $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -DTSDB_FORMAT_VERSION=$(TSDB_FORMAT) -o $@ $< tools/dump.c \
-	    tools/users-cli.c $(B)/cluster-cli.o $(CLUSTER_OBJ) $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
+	    tools/users-cli.c $(B)/cluster-cli.o $(CLUSTER_OBJ) $(CFG_OBJ) $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 
 # login (docs/design-auth.md): the crypto is client code, shared with tsdbd and the CLI; USERS and the grant model
 # are tsdbd's and the CLI's
@@ -176,6 +186,10 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # its own write/fsync/fdatasync/pwrite/renameat inject storage errors into the library
+# the .properties reader and the key tables (tools/props.c, tools/cfg.c, server/tsdbd_keys.h)
+$(B)/test_props: tests/test_props.c server/tsdbd_keys.h tools/cfg.h tools/props.h $(CFG_OBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(CFG_OBJ)
+
 $(B)/test_sched: tests/test_sched.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
@@ -245,7 +259,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -278,6 +292,18 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_types
 	./$(B)/test_delete
 	./$(B)/test_levels
+	$(if $(TEST_GROUPS),$(MAKE) -j1 $(TEST_GROUPS))
+
+# The rest of `make test` as groups (the recipe lines are those that were here, in the same order). `make test` runs
+# them last, one after the other; CI runs each on a runner of its own (`make tsan TEST_TARGET=test-meta`,
+# .github/workflows/ci.yml): ThreadSanitizer and ASan take about 80 minutes for all of them on 4 CPUs. A group has the
+# prerequisites it needs, so that it builds and runs alone. `make test TEST_GROUPS=` runs only the lines above.
+TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
+TEST_TARGET ?= test
+.PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
+test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
+	./$(B)/test_props $(or $(TMPDIR),/tmp)
+	B=$(B) tests/test_config.sh $(TMPDIR)
 	./$(B)/test_group
 	./$(B)/test_lttb
 	B=$(B) tests/test_cli_lttb.sh
@@ -302,9 +328,16 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
+
+test-meta: $(B)/test_meta $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	./$(B)/test_meta /tmp --seeds 12 --seconds 15
-	tests/meta_mutants.sh $(B)/test_meta_mut
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
+
+# the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 17 runs of 2 minutes each under a sanitizer
+test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
+	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
+
+test-net: $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stability $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	./$(B)/test_wire tests/data/wire13-vectors.txt
@@ -355,6 +388,7 @@ $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuz
 	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
+$(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
 fuzz-replay: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
@@ -370,7 +404,7 @@ $(FUZZ_B)/libtsdb.a: FORCE
 	    rm -f $(FUZZ_B)/*.o $(FUZZ_B)/*.a $(FUZZ_B)/fuzz-*; printf '%s\n' "$(FUZZ_SIG)" >$(FUZZ_B)/.flags; \
 	fi
 	$(MAKE) B=$(FUZZ_B) CC=$(FUZZ_CC) ARCH="$(FUZZ_ARCH)" CFLAGS="$(FUZZ_SAN) $(FUZZ_COV)" $@ \
-	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o
+	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o $(FUZZ_B)/props.o $(FUZZ_B)/cfg.o
 
 # the driver is built without coverage: it holds the hook
 $(FUZZ_B)/driver.o: tests/fuzz/driver.c $(FUZZ_B)/libtsdb.a
@@ -424,7 +458,7 @@ ASAN_RUN   := $(if $(ASAN_ARCH),detect_stack_use_after_return=0:)
 asan: ubsan-check
 	$(MAKE) clean
 	ASAN_OPTIONS="$(ASAN_RUN)$$ASAN_OPTIONS" UBSAN_OPTIONS="$(UBSAN_RUN) $$UBSAN_OPTIONS" \
-	$(MAKE) ARCH="$(ASAN_ARCH)" CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" test
+	$(MAKE) ARCH="$(ASAN_ARCH)" CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" $(TEST_TARGET)
 
 ubsan-check:
 	@mkdir -p $(B)
@@ -442,7 +476,7 @@ ubsan-check:
 TSAN_FLAGS := -O1 -g -fsanitize=thread -fno-omit-frame-pointer
 tsan:
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 $$TSAN_OPTIONS" \
-	$(MAKE) B=build-tsan TSDBD=build-tsan/tsdbd ARCH= CFLAGS="$(TSAN_FLAGS)" test
+	$(MAKE) B=build-tsan TSDBD=build-tsan/tsdbd ARCH= CFLAGS="$(TSAN_FLAGS)" $(TEST_TARGET)
 
 $(B):
 	mkdir -p $(B)
@@ -496,38 +530,48 @@ dist-check-sandybridge: dist
 # cargo, Python or JDK. Each runs its tests against build/tsdbd.
 PYVENV ?= build/pyvenv
 
+# client/rust is the network client (Apache-2.0) and links no engine; client/rust-embedded (AGPL-3.0-only) is the
+# embedded Db over client/rust-sys.
 test-rust: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
-	cd client/rust && cargo test --features embedded
-	cd client/rust && cargo build --all-targets  # the TCP-only crate (no features) must still build
+	cd client/rust && cargo test
+	cd client/rust && cargo build --all-targets
+	cd client/rust-embedded && cargo test
 	cd client/rust-sys && cargo test
 
 # numpy is an optional extra of the package, but the tests use it (numpy results, batch calls); a venv made before
 # it was needed gets it too. The test build has the test hooks (feature test-hooks: a fixed client nonce, the
 # PBKDF2 count), which wheels never have.
+# tsdb_client (client/python, Apache-2.0) is tested alone, then tsdb_embedded (client/python-embedded, AGPL-3.0-only)
+# next to it: its tests also run tsdb_client's against a Db, and check that one `except tsdb_client.TsdbError` catches both.
 test-python: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	$(PYVENV)/bin/python -c 'import numpy' 2>/dev/null || $(PYVENV)/bin/pip install -q numpy
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
 	    --features test-hooks && $(abspath $(PYVENV))/bin/python -m pytest tests
+	cd client/python-embedded && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
+	    && $(abspath $(PYVENV))/bin/python -m pytest tests
 
-# The Python sdist (distribution intellistream-tsdb-client, module tsdb_client) carries intellistream-tsdb-sys as a
+# The Python sdists: intellistream-tsdb-client (module tsdb_client, Apache-2.0, no engine) and
+# intellistream-tsdb-embedded (module tsdb_embedded, AGPL-3.0-only). The second carries intellistream-tsdb-sys as a
 # path dependency, so the engine's C sources travel in it as the copy client/rust-sys/vendor.sh makes (csrc/).
-# test-python-sdist builds a wheel from the sdist alone and imports it; the file names follow the distribution name.
+# test-python-sdist builds a wheel from each sdist and imports them together; the file names follow the distribution names.
 python-sdist:
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	client/rust-sys/vendor.sh
 	rm -rf $(B)/sdist
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin sdist -o $(abspath $(B))/sdist
+	cd client/python-embedded && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin sdist -o $(abspath $(B))/sdist
 
 test-python-sdist: python-sdist
 	rm -rf $(B)/sdist-check && mkdir -p $(B)/sdist-check/whl
 	PATH=$(abspath $(PYVENV))/bin:$$PATH $(PYVENV)/bin/pip wheel -q --no-build-isolation --no-deps -w $(B)/sdist-check/whl $(B)/sdist/intellistream_tsdb_client-*.tar.gz
-	cd $(B)/sdist-check && unzip -q whl/intellistream_tsdb_client-*.whl -d site \
-	    && $(abspath $(PYVENV))/bin/python -I -c "import os, sys; sys.path.insert(0, os.path.abspath('site')); import tsdb_client; \
-	    assert tsdb_client.__file__.startswith('$(abspath $(B))/sdist-check/site'), tsdb_client.__file__; tsdb_client.Db; \
-	    assert not hasattr(tsdb_client, '_set_client_nonce'), 'a wheel with the test hooks'"
-	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_client-*.tar.gz
-	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_client-*.whl
+	PATH=$(abspath $(PYVENV))/bin:$$PATH $(PYVENV)/bin/pip wheel -q --no-build-isolation --no-deps -w $(B)/sdist-check/whl $(B)/sdist/intellistream_tsdb_embedded-*.tar.gz
+	cd $(B)/sdist-check && unzip -q whl/intellistream_tsdb_client-*.whl -d site && unzip -q whl/intellistream_tsdb_embedded-*.whl -d site
+	$(abspath $(PYVENV))/bin/python -I tools/check-wheels-import.py $(B)/sdist-check/site
+	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_client-*.tar.gz apache rust=apache python=apache python-common=apache
+	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_client-*.whl apache
+	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_embedded-*.tar.gz agpl rust=apache rust-sys=agpl rust-embedded=agpl python-embedded=agpl python-common=apache
+	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_embedded-*.whl agpl
 
 test-java: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 	cd client/java && mvn -q test
@@ -539,22 +583,36 @@ test-java-embedded: $(B)/tsdbd $(B)/libtsdb.$(SOEXT)
 	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
 	cd client/java-embedded && mvn -q $(JAVA_M2) test
 
-# Every package carries LICENSE and NOTICE (Apache-2.0), and those that pack other software its notices
-# (docs/licenses.md): the Rust crates (cargo package --list), the two jars and the Pulsar NAR, built here without
-# their tests. The Python sdist and wheel are checked by test-python-sdist. The Pulsar NAR needs build/m2 of
+# Every package carries the LICENSE of its own licence (Apache-2.0 for the client libraries, AGPL-3.0-only for the
+# engine and the embedded bindings, LICENSING.md) and NOTICE, and those that pack other software its notices
+# (docs/licenses.md): the Rust crates (cargo package --list), the four jars and the Pulsar NAR, built here without
+# their tests, and tools/check-spdx.sh (the SPDX line of every source file and the licence fields of the manifests).
+# The Python sdists and wheels are checked by test-python-sdist. The Pulsar NAR needs build/m2 of
 # test-java-embedded's way (the tsdb-client jar) and the Maven plugins of connectors/pulsar.
 test-licenses:
+	tools/check-spdx.sh
 	tools/check-package-licenses.sh sources
-	tools/check-package-licenses.sh crate client/rust
-	tools/check-package-licenses.sh crate client/rust-sys
+	tools/check-package-licenses.sh crate client/rust apache
+	tools/check-package-licenses.sh crate client/rust-sys agpl
+	tools/check-package-licenses.sh crate client/rust-embedded agpl
 	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
-	tools/check-package-licenses.sh jar client/java/target/tsdb-client-$(RELEASE_VERSION).jar
+	tools/check-package-licenses.sh jar client/java/target/tsdb-client-$(RELEASE_VERSION).jar apache
 	cd client/java-embedded && mvn -q $(JAVA_M2) -DskipTests package
-	tools/check-package-licenses.sh jar client/java-embedded/target/tsdb-embedded-$(RELEASE_VERSION).jar
+	tools/check-package-licenses.sh jar client/java-embedded/target/tsdb-embedded-$(RELEASE_VERSION).jar agpl
 	cd connectors/pulsar && mvn -q $(JAVA_M2) -DskipTests package
-	tools/check-package-licenses.sh nar connectors/pulsar/target/tsdb-pulsar-sink-$(RELEASE_VERSION).nar
+	tools/check-package-licenses.sh nar connectors/pulsar/target/tsdb-pulsar-sink-$(RELEASE_VERSION).nar apache
 
-test-clients: test-rust test-python test-python-sdist test-java test-java-embedded test-licenses
+# The three Java targets (test-java, test-java-embedded, test-licenses) all build client/java (and its target/), so
+# `make -j4 test-clients` runs them one after the other: two Maven runs in one target/ overwrote each other's classes
+# ("Unable to create test class", 1 run in 5 on 4 CPUs). The Rust and Python targets run beside them; what the
+# sub-makes need is built here first, once, by this make.
+.PHONY: test-clients-java
+test-clients-java: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER) $(B)/libtsdb.$(SOEXT)
+	$(MAKE) test-java
+	$(MAKE) test-java-embedded
+	$(MAKE) test-licenses
+
+test-clients: test-rust test-python test-python-sdist test-clients-java
 
 # Commit rules as a git hook (no session links, DCO sign-off last); once per clone.
 hooks:
@@ -600,7 +658,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-cli-stats sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: test-cli-stats test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -661,20 +719,20 @@ meta-mutants: $(B)/test_meta_mut
 meta-soak: $(B)/test_meta
 	./$(B)/test_meta /tmp --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
-TSDBD_SRC := server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/users.h \
-             server/cluster.h server/meta.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
-$(B)/tsdbd: $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB)
+TSDBD_SRC := server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/users.h \
+             server/cluster.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
+$(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c \
-	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
+	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
 
 # tests/fuzz/fuzz_frames.c includes server/tsdbd.c (epoll only: no ring needed without sockets). FRAMES_COV is
 # -fsanitize-coverage=trace-pc in `make fuzz-frames`, which feeds its coverage-guided driver (auth.c, the login and
 # the checks, is compiled with it too); empty in `make test` (FUZZ_COV is the on-disk harnesses' coverage flag and
 # is always set).
 $(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
-                  $(CLUSTER_OBJ) $(LIB)
+                  $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c $(B)/tsdb_pack.o \
-	    $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
+	    $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
 # build-fuzz-frames/ (its own tree: `make fuzz` builds build-fuzz/ with other flags); new inputs go to
@@ -742,9 +800,9 @@ $(B)/test_wire: tests/test_wire.c include/tsdb_wire.h $(CLIB)
 
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
 $(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
-                    $(CLUSTER_OBJ) $(LIB)
+                    $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c $(B)/tsdb_pack.o $(B)/users.o \
-	    $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(LIB) $(LDLIBS)
+	    $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LDLIBS)
@@ -846,10 +904,10 @@ $(B)/test_unavailable: tests/test_unavailable.c tests/harness.h tests/outagefs_c
 $(B)/outage_server: tests/outage_server.c tests/harness.h tests/outagefs_ctl.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
+$(B)/test_health: tests/test_health.c tests/outagefs_ctl.h src/health_rules.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/jepsen: tests/jepsen/jepsen.c tests/jepsen/feedcheck.c tests/harness.h src/internal.h src/feed.h $(CLIB) $(LIB)
+$(B)/jepsen: tests/jepsen/jepsen.c tests/jepsen/feedcheck.c tests/harness.h src/internal.h src/feed.h src/health_rules.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ tests/jepsen/jepsen.c tests/jepsen/feedcheck.c $(CLIB) $(LIB) $(LDLIBS)
 
 # Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while
@@ -867,6 +925,9 @@ JEPSEN_WORKLOADS ?= kv classes
 # engine's checks, which do not depend on the workload. JEPSEN_SECONDS, when set, is the length of every run (the
 # weekly CI run sets it, with one power seed); otherwise each nemesis has its own short default.
 JEPSEN_SECONDS ?=
+# The outage nemesis's seeds: a seed fixes the fault schedule, so more seeds test more than repeats of one do (the weekly CI
+# run sets six; a run with a flapping domain spends minutes waiting for its 60 s, and what it does in them is the seed's).
+JEPSEN_OUTAGE_SEEDS ?= 1 2
 # Then kv once more with login (--auth: USERS made by $(B)/tsdb, every client logs in at every reconnect) under kill
 # and one power seed, per backend.
 jsec = $(if $(JEPSEN_SECONDS),$(JEPSEN_SECONDS),$(1))
@@ -880,7 +941,7 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 	        --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis pause --seconds $(call jsec,10) && \
 	    if [ $$wl = kv ]; then \
-	        for seed in 1 2; do \
+	        for seed in $(JEPSEN_OUTAGE_SEEDS); do \
 	            TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis outage --seconds $(call jsec,40) \
 	                --seed $$seed --outagefs $(B)/liboutagefs.so || exit 1; done && \
 	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
@@ -919,7 +980,33 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --mutant-longnap 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'restarts in .* it was idle'; then \
 	        echo "jepsen-selftest: a nemesis that naps 5 s at a time went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage \
+	    --seconds 8 --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
+	    if [ $$rc -eq 0 ] || ! find $(JEPSEN_DIR)-selftest.outage-s1.server.log -size +0 -mmin -2 2>/dev/null | grep -q .; then \
+	        echo "jepsen-selftest: a failed outage run did not keep its server log (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_TSDBD=tests/jepsen/dead-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage \
+	    --seconds 8 --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 2 ] || ! find $(JEPSEN_DIR)-selftest.outage-s1.server.log -size +0 -mmin -2 2>/dev/null | grep -q .; then \
+	        echo "jepsen-selftest: an outage run that ended at a server that never started did not keep its log (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_TSDBD=tests/jepsen/early-segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest \
+	    --nemesis kill --seconds 5 --mutant-slowcreate 2>&1); rc=$$?; \
+	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'cannot connect to create the series'; then \
+	        echo "jepsen-selftest: a run whose server crashed before the series were created hung or went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage --seconds 20 --seed 2 \
+	    --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^outage heals: [1-9][0-9]*, [0-9]* judged .*, 0 not judged$$'; then \
+	        echo "jepsen-selftest: an outage run left a heal unjudged, or did not say how many (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	printf '%s\n' 'tsdb: [100.500] storage domain /d/vola: a write probe took 900 ms (more than 400 ms): x' \
+	    'tsdb: [140.250] storage domain /d/volb: a write probe took 3000 ms (more than 400 ms): x' \
+	    'tsdb: [150.750] storage domain /d/vola: a write probe took 700 ms (more than 400 ms): x' \
+	    'tsdbd: [160.000] storage domain /d/vola: 2 -> 3' > $(JEPSEN_DIR)-selftest.scan.log; \
+	    a=$$(./$(B)/jepsen --scan-slow-probes $(JEPSEN_DIR)-selftest.scan.log,/d/vola,120 2>&1); \
+	    b=$$(./$(B)/jepsen --scan-slow-probes $(JEPSEN_DIR)-selftest.scan.log,/d/vola,151 2>&1); \
+	    c=$$(./$(B)/jepsen --scan-slow-probes $(JEPSEN_DIR)-selftest.scan.log,/d/volb,100 2>&1); \
+	    if [ "$$a" != 150.750 ] || [ "$$b" != 0.000 ] || [ "$$c" != 140.250 ]; then \
+	        echo "jepsen-selftest: the scan of slow write probes in a server log is wrong ($$a $$b $$c)"; exit 1; fi; \
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
+	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 
 # Build and test on AlmaLinux 10 (the main target OS) in Podman; takes minutes, logs in $LOGDIR.
@@ -937,9 +1024,14 @@ $(B)/client-example: examples/client.c client/tsdb_client.h include/tsdb_calenda
 all: $(B)/embedded-example $(B)/client-example
 
 # Runs the README's quick start, word for word, in a scratch directory.
-test: test-quickstart test-cli-stats
+test: test-quickstart test-cli-stats test-cli-cluster test-cluster-tutorial
 test-cli-stats: $(B)/tsdb
 	B=$(B) tests/test_cli_stats.sh $(TMPDIR)
+test-cli-cluster: $(B)/tsdb
+	B=$(B) tests/test_cli_cluster.sh $(TMPDIR)
+# The cluster tutorial's command block, word for word (docs/cluster-preview.md), on ports the kernel picks.
+test-cluster-tutorial: $(B)/tsdb $(B)/tsdbd $(B)/client-example
+	B=$(B) tests/test_cluster_tutorial.sh
 test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 	B=$(B) tests/test_quickstart.sh
 
@@ -972,4 +1064,15 @@ test-release:
 	tests/test_release_notes.sh
 	python3 -I tests/test_release_publish.py
 
-.PHONY: test-quickstart check-site test-release
+# The licence of every source file (tools/check-spdx.sh) and the test of that check (it must fail on each kind of slip).
+test: test-spdx
+test-spdx:
+	tools/check-spdx.sh
+	tests/test_check_spdx.sh
+
+# every group above is a matrix entry of the sanitizer jobs in .github/workflows/ci.yml
+test: check-ci-groups
+check-ci-groups:
+	tests/check_ci_groups.sh
+
+.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups

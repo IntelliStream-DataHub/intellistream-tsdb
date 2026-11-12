@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * VOLUMES (volumes.c): the template with a second volume, VOLUMES replaced by
  * the input, then a read-only open, every series of every volume (by its id,

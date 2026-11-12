@@ -1,0 +1,4 @@
+storage.dir = /a
+server.port = 1
+# c
+server.workers = 2

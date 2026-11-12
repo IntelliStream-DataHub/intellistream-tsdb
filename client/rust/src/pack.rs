@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The packed body of an INSERT_VALUES frame (protocol version 3), as
 //! `client/tsdb_pack.c` writes it and tsdbd reads it.
 //!

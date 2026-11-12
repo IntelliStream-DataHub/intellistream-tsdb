@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The Rust calendar bounds against the C client's: `fixtures/calendar_bounds.txt`
 //! holds what `tsdb_calendar_bounds` gives for about 45 zones (DST at
 //! midnight, half- and quarter-hour offsets, skipped days, negative DST,

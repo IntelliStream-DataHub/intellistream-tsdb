@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Database lifecycle, the active parts list, buffered appends and maintenance. */
 #include "internal.h"
 

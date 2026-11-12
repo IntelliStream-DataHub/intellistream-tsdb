@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Range deletes, replaces and retention (protocol version 7) against a real tsdbd."""
 
 import time

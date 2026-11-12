@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Packed, zstd-compressed inserts (protocol version 3) through the binding."""
 
 import socket

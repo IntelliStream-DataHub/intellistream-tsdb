@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * SHA-256 (FIPS 180-4), HMAC (RFC 2104), PBKDF2 (RFC 8018), base64 (RFC 4648)
  * for SCRAM-SHA-256; tests/test_crypto.c checks them against the published

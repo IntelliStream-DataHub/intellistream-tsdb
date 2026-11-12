@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Embedded ClickHouse (chDB, libchdb's C API) on the bench/dbcmp query spec, the counterpart of embq's DuckDB side.
  *   chq load DIR DATA CODECS          fresh table t from the RowBinary file (INSERT ... SELECT FROM file()), then

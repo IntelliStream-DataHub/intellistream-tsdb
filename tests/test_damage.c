@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Damage on disk is never silent (docs/design.md, "Damage on disk").
  *

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Helpers shared by the command line tools: DateTime64(3) parsing/printing and timing. */
 #ifndef TSDB_TOOLS_COMMON_H
 #define TSDB_TOOLS_COMMON_H

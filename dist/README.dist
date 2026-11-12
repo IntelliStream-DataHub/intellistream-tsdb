@@ -10,13 +10,29 @@ Contents
   bench/               codec-bench, type-bench, tsdb-bench, insert-bench, tsdbc-bench, scale-bench
   lib/libtsdb.a        the embedded engine; link with -lzstd -lpthread -lm
   lib/libtsdbclient.a  the C client of tsdbd; link with -lzstd -lpthread -lm
-  include/             tsdb.h, tsdb_protocol.h, tsdb_calendar.h, tsdb_client.h
+  include/             tsdb.h, tsdb_protocol.h, tsdb_wire.h, tsdb_calendar.h, tsdb_client.h
   tests/               the test suite of this build; tests/run-tests.sh runs it (libcrashfs.so there is a
                        test-only shim that fails a write on purpose; nothing else loads it)
   systemd/tsdbd.service
-  BUILDINFO            version, build id, compiler, glibc
-  LICENSE, NOTICE      tsdb is licensed under the Apache License 2.0
+  systemd/tsdbd.properties   the settings the unit reads (/etc/tsdb/tsdbd.properties)
+  BUILDINFO            version, build id, the source repository, zstd and liburing versions, compiler, glibc
+  LICENSE, NOTICE      the server, the engine (lib/libtsdb.a) and the tools: GNU AGPL, version 3 only
+  LICENSES/, LICENSING.md
+                       the Apache License 2.0 text, which covers the C client (lib/libtsdbclient.a) and the
+                       headers in include/ (a header's licence does not change that of lib/libtsdb.a: a program
+                       that links libtsdb is under the AGPL, one that only uses libtsdbclient.a is not);
+                       LICENSING.md explains the split and the commercial licence
   THIRD-PARTY-NOTICES  zstd and liburing are linked into the binaries: their licenses
+
+Source code (GNU AGPL, version 3, section 6)
+  The Corresponding Source of this tarball is the tsdb repository at the build id in BUILDINFO:
+    https://github.com/IntelliStream-DataHub/intellistream-tsdb
+  (`git checkout` the tag vX.Y.Z of the release, or the commit after the "-gCOMMIT" of a build id; `make dist`
+  there builds this tarball). The binaries also contain two libraries that `make dist` links in statically, in the
+  versions BUILDINFO names; their sources are upstream's tags of those versions:
+    zstd      https://github.com/facebook/zstd          (tag vVERSION)
+    liburing  https://github.com/axboe/liburing         (tag liburing-VERSION)
+  Whoever passes the tarball on must offer the same (or this text, unchanged).
 
 Requirements
   CPU     x86-64-v2: SSE4.2 and POPCNT, AVX not needed (Intel Nehalem and
@@ -46,10 +62,14 @@ Install
   useradd -r -s /sbin/nologin -d /var/lib/tsdb tsdb
   install -d -o tsdb -g tsdb -m 750 /var/lib/tsdb
   runuser -u tsdb -- /usr/local/bin/tsdb /var/lib/tsdb user add admin --superuser   # asks for a password
+  install -d /etc/tsdb && install -m 644 systemd/tsdbd.properties /etc/tsdb/
   install -m 644 systemd/tsdbd.service /etc/systemd/system/
   systemctl daemon-reload && systemctl enable --now tsdbd
 
-  The unit runs tsdbd on 127.0.0.1:7070 with its data in /var/lib/tsdb.
+  The unit runs tsdbd on 127.0.0.1:7070 with its data in /var/lib/tsdb, as
+  /etc/tsdb/tsdbd.properties says (a .properties file, one dotted key per setting;
+  `tsdbd --config-keys` lists them, docs/config.md in the source explains them;
+  `tsdbd --config FILE --check-config` checks a file; a change needs a restart).
   Clients log in with a user name and a password. tsdbd does not start until
   the database has a superuser (a user who may do everything): that is the
   `user add ... --superuser` line. More users and their rights:

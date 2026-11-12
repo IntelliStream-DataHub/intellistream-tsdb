@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Scenarios of the replication core (src/repl.c) that the simulator (tests/sim_repl.c) reaches rarely or never, each
  * driven by hand, event by event. Built twice: build/test_repl, and build/test_repl_mut (-DREPL_MUTANTS), where
  * `--mutant N` plants bug N and the scenario that guards it must fail (tests/sim_repl.sh quick checks that it does).

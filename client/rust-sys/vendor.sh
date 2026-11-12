@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
 # Copies the engine's C sources into csrc/ so that a package of this crate (the Python sdist, which
 # carries tsdb-sys as a path dependency) builds without the repository around it: build.rs uses
 # csrc/ when ../../include/tsdb.h is not there. csrc/ is generated, never committed.

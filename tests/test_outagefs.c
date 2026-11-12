@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* The outagefs shim (tests/jepsen/outagefs.c): hang, error, slow, full and rollback faults per prefix, applied to
  * this very process, which the test starts again under LD_PRELOAD. Usage: test_outagefs [scratch directory]. */
 #define _GNU_SOURCE

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Does the integration suite have teeth? Plants known bugs, one at a time, in a COPY of the tree, rebuilds only
 what the bug touches, runs the scenario that should notice, and expects it to fail. A mutation the suite does not
 catch (SURVIVED) is a hole in the suite.

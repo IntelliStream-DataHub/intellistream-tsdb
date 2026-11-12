@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Memtable and write-ahead log for small inserts.
  *
@@ -42,6 +43,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,7 +80,7 @@ memtable *mt_new(uint64_t wal_seq)
 void mt_ref(memtable *m) { atomic_fetch_add(&m->refs, 1); }
 
 #ifndef __APPLE__
-/* The series array of a memtable that sees a million series is 40 MB, and mt_reserve grows it under buf_lock, which
+/* The series array of a memtable that sees a million series is 40 MB, and mt_reserve_to grows it under buf_lock, which
  * every append and lookup takes. realloc and the memset of the new tail touched every page there (about 9 ms, twice,
  * right after a flush began a new memtable and the first rows with high ids arrived); a mapping is zero already,
  * mremap moves page tables instead of copying, and the pages are touched one by one as series are added. */
@@ -147,9 +149,18 @@ void mt_unref(memtable *m)
     free(m);
 }
 
-/* Room for one more row of series id. */
-static int mt_reserve(memtable *m, uint32_t id)
+int (*mt_test_reserve_fail)(uint32_t id); /* test hook: nonzero fails the growth of series id (tests/test_failstop.c) */
+/* test hook: how often the slow part of the room check ran (tests/test_failstop.c: a row inside the capacity must not
+ * get here; counted with a relaxed atomic, on the slow path only) */
+uint64_t mt_test_reserve_calls;
+
+static inline size_t mt_cap(const mt_series *s) { return (size_t)(((uint64_t)1 << s->lgcap) >> 1); }
+
+/* Room for `extra` more rows of series id, after the pend rows an insert has counted already (one capacity check;
+ * the arrays at least double when they grow). The slow part of mt_room. */
+static int mt_reserve_to(memtable *m, uint32_t id, size_t extra)
 {
+    __atomic_fetch_add(&mt_test_reserve_calls, 1, __ATOMIC_RELAXED);
     if (id >= m->scap) {
         uint32_t cap = MAX(id + 1, m->scap * 2);
         cap = MAX(cap, 64u);
@@ -158,9 +169,14 @@ static int mt_reserve(memtable *m, uint32_t id)
             return rc;
     }
     mt_series *s = &m->s[id];
-    if (s->n < s->cap)
+    size_t need = (size_t)s->n + s->pend + extra;
+    if (need <= mt_cap(s))
         return 0;
-    if (s->cap == 0 && m->nids == m->idcap) {
+    if (mt_test_reserve_fail && mt_test_reserve_fail(id))
+        return TSDB_ERR_NOMEM;
+    if (need > UINT32_MAX / 2)
+        return TSDB_ERR_NOMEM;
+    if (s->lgcap == 0 && m->nids == m->idcap) {
         uint32_t c = m->idcap ? m->idcap * 2 : 64;
         uint32_t *ids = realloc(m->ids, c * sizeof *ids);
         if (!ids)
@@ -168,7 +184,9 @@ static int mt_reserve(memtable *m, uint32_t id)
         m->ids = ids;
         m->idcap = c;
     }
-    uint32_t cap = s->cap ? s->cap * 2 : 64;
+    size_t cap = s->lgcap ? mt_cap(s) * 2 : 64;
+    while (cap < need)
+        cap *= 2;
     int64_t *t = realloc(s->ts, cap * sizeof *t);
     if (!t)
         return TSDB_ERR_NOMEM;
@@ -181,25 +199,88 @@ static int mt_reserve(memtable *m, uint32_t id)
     if (!l)
         return TSDB_ERR_NOMEM;
     s->lsn = l;
-    if (s->cap == 0) {
+    if (s->lgcap == 0) {
         m->ids[m->nids++] = id;
         s->sorted = true;
     }
-    s->cap = cap;
+    s->lgcap = (uint8_t)(__builtin_ctzll(cap) + 1);
     return 0;
 }
 
-/* Adds rows to a memtable the caller may modify (the active one, under buf_lock). */
+/* test hook (tsdb_test_mem_cap): the capacity of series `local` in the active memtable, 0 for none; caller holds buf_lock */
+size_t mt_test_cap(const memtable *m, uint32_t local) { return local < m->scap ? mt_cap(&m->s[local]) : 0; }
+
+/* Room for `extra` more rows of series id: the capacity check is inline, the growth is not. */
+static inline int mt_room(memtable *m, uint32_t id, size_t extra)
+{
+    if (__builtin_expect(id < m->scap, 1)) {
+        const mt_series *s = &m->s[id];
+        if (__builtin_expect((size_t)s->n + s->pend + extra <= mt_cap(s), 1))
+            return 0;
+    }
+    return mt_reserve_to(m, id, extra);
+}
+
+/* Room for all rows of one insert in m (the active memtable, under buf_lock), taken before the insert's WAL append:
+ * the mt_add after that append cannot fail then. A failure between the two would leave a refused write in the WAL,
+ * which a crash replays (and part of it in the memtable at once).
+ * One series (series == NULL): one capacity check for all rows. Rows of several series: each row is counted into
+ * its series' pend as it is checked, so a series that comes more than once is checked for all its rows, in any order
+ * of the ids; a row whose series has the room costs a compare and an increment. mt_add (on the lines it touches
+ * anyway) clears the counts, as does mt_unreserve when no mt_add follows.
+ * On failure the counts are cleared and the series this call registered are unregistered and freed again (the growth
+ * of one already listed stays: harmless). A series a successful reservation registered stays listed with no rows if
+ * the WAL append then fails: the readers of a memtable treat a series without rows like one with a few. */
+static void mt_unreserve(memtable *m, const uint32_t *series, size_t n)
+{
+    for (size_t k = 0; k < n; k++)
+        m->s[series[k]].pend = 0;
+}
+
+static int mt_reserve_rows(memtable *m, const uint32_t *series, uint32_t cs, size_t n)
+{
+    uint32_t nids0 = m->nids;
+    int rc = 0;
+    if (!series) {
+        rc = mt_room(m, cs, n);
+    } else {
+        size_t k = 0;
+        for (; k < n; k++) {
+            if ((rc = mt_room(m, series[k], 1)) != 0)
+                break;
+            m->s[series[k]].pend++;
+        }
+        if (rc) {
+            mt_unreserve(m, series, k);
+            for (uint32_t i = nids0; i < m->nids; i++) {
+                mt_series *s = &m->s[m->ids[i]];
+                free(s->ts);
+                free(s->v);
+                free(s->lsn);
+                s->ts = NULL, s->v = NULL, s->lsn = NULL;
+                s->lgcap = 0;
+            }
+            m->nids = nids0;
+        }
+    }
+    return rc;
+}
+
+/* Adds rows to a memtable the caller may modify (the active one, under buf_lock). After mt_reserve_rows for the same
+ * rows it cannot fail (and clears the counts); the replays at open reserve as they go. */
 int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n,
            uint64_t lsn0, int type)
 {
     const uint64_t null = type >= 0 ? type_null(type) : 0;
     for (size_t i = 0; i < n; i++) {
         uint32_t id = series ? series[i] : cs;
-        int rc = mt_reserve(m, id);
-        if (rc)
-            return rc;
+        if (__builtin_expect(id >= m->scap || m->s[id].n >= mt_cap(&m->s[id]), 0)) { /* not after a reservation */
+            int rc = mt_reserve_to(m, id, 1);
+            if (rc)
+                return rc;
+        }
         mt_series *s = &m->s[id];
+        s->pend = 0; /* the rows this insert counted are being added */
         if (s->n && ts[i] < s->ts[s->n - 1])
             s->sorted = false;
         uint64_t slot = slot_get(v, w, i);
@@ -958,7 +1039,22 @@ __thread const volatile int *cur_abandon;
 int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n,
                int type)
 {
+    /* Backpressure when the flusher falls behind: before the append, never after. A flush that fails (no memory,
+     * no space for its tmp part) then refuses a write that is not in the WAL and not in the memtable, a definite
+     * failure; after the append the same error would be the result of a write that is visible and replays. While
+     * flushes keep failing every write is refused here, so the memtable stops at the size it had. No lock is held,
+     * as for the flush this replaces; the flush takes flush_lock and the WAL writer role, which this writer does
+     * not hold, having appended nothing. */
     pthread_mutex_lock(&db->buf_lock);
+    if (db->active->rows >= 2 * db->opt.buffer_rows) {
+        pthread_mutex_unlock(&db->buf_lock);
+        int frc = eng_abandoned(); /* a parked request starts no flush on a stuck volume */
+        if (frc == 0)
+            frc = mt_flush(db);
+        if (frc)
+            return frc;
+        pthread_mutex_lock(&db->buf_lock);
+    }
     /* after the large write's publish this batch is the newer one, and wins as a memtable row (lw_fence) */
     bool announced = false;
     void (*hook)(void *, int) = NULL; /* the hook this wait counts with, from its first +1 to its -1 */
@@ -996,14 +1092,21 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         rc = eng_abandoned();
     /* wal_appended counts rows the WAL holds: a refusal before the append adds none, or a flush would wait for
      * rows that never come (wal_durable never reaches them) */
+    if (rc == 0)
+        rc = mt_reserve_rows(db->active, series, cs, n); /* before the WAL: after it, nothing may fail */
     bool counted = rc == 0;
     uint64_t fno0 = 0;
     if (rc == 0 && db->wal_enabled) {
-        rc = wal_buffer(db, series, cs, ts, v, w, n, &fno0); /* first: it can fail without side effects */
+        rc = wal_buffer(db, series, cs, ts, v, w, n, &fno0); /* it can fail without side effects */
         counted = rc == 0;
+        if (rc && series)
+            mt_unreserve(db->active, series, n); /* no mt_add clears the counts */
     }
-    if (rc == 0)
+    if (rc == 0) {
         rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_appended + 1, type);
+        if (rc && db->wal_enabled)
+            eng_fail(db, "adding a write the WAL holds to the memtable", ENOMEM); /* cannot happen: room reserved */
+    }
     /* the memtable's position range: its first number now (a read, a store only for its first rows), its last one
      * when it is sealed (mt_flush: db->fno_rows_hi), not a store of both on the memtable's line with every call */
     if (rc == 0 && fno0 && !db->active->fno_lo)
@@ -1018,11 +1121,8 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     if (announced)
         hook(hook_ctx, -1);
     if (rc == 0 && db->wal_enabled && db->opt.wal_sync_ms == 0)
-        rc = wal_commit(db, lsn);
-    /* backpressure when the flusher falls behind */
-    if (rc == 0 && rows >= 2 * db->opt.buffer_rows)
-        rc = mt_flush(db);
-    return rc;
+        rc = wal_commit(db, lsn); /* a failure is eng_fail: indeterminate, and the server exits */
+    return rc; /* an applied write is a success: the flush that backpressure wants comes before the next write */
 }
 
 int (*eng_test_retire_fail)(const char *name); /* test hook: errno to fail the unlink or rename of a segment, or 0 */
@@ -1139,10 +1239,20 @@ static int flush_waiting(eng *db)
 /* Turns the active memtable into parts. Rows stay visible throughout: the
  * memtable is moved to the flushing list and only leaves it together with
  * the publication of its parts. */
+/* test hook (tests/test_failstop.c): 0 flushes as usual, INT_MIN returns 0 without flushing (a flusher that falls
+ * behind), any other value is the flush's error, as a failed allocation or a tmp part that cannot be written gives */
+int (*mt_test_flush_fail)(void);
+
 int mt_flush(eng *db)
 {
     if (db->opt.read_only)
         return 0;
+    int (*hook)(void) = __atomic_load_n(&mt_test_flush_fail, __ATOMIC_RELAXED); /* the tests set it while threads run */
+    if (hook) {
+        int hr = hook();
+        if (hr)
+            return hr == INT_MIN ? 0 : hr;
+    }
     pthread_mutex_lock(&db->flush_lock);
     /* a memtable whose write failed earlier holds older rows than the active
      * one: it is written first, and the active one after it all the same, or

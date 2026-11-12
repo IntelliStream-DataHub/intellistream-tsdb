@@ -1,4 +1,5 @@
-"""Batch calls (query_raw_many, query_agg_many, insert_many) on Db and Pool, and Buckets.
+# SPDX-License-Identifier: Apache-2.0
+"""Batch calls (query_raw_many, query_agg_many, insert_many) on Pool (tsdb_embedded's test_batch.py has the Db).
 
 A batch must answer exactly what the one-query calls answer, query by query, in query order; an
 error in one query fails the call with that query's error; a Pool replaces a connection that broke.
@@ -17,7 +18,7 @@ import pytest
 
 import tsdb_client
 from conftest import Server
-from tsdb_client import Bucket, Buckets, BucketsMany, Db, Pool, TsdbError
+from tsdb_client import BucketsMany, Pool, TsdbError
 
 T0 = 1_699_999_980_000
 N = 2000  # rows per series, 1 s apart
@@ -165,18 +166,8 @@ def check_insert_many(c, ids, f64, i64):
     c.insert_many([])
 
 
-@pytest.fixture
-def db(tmp_path):
-    with Db(tmp_path / "db", fsync=False, merge_threads=1) as d:
-        yield d
 
 
-def test_db_batches_answer_as_single_queries(db):
-    ids, f64, i64 = fill(db)
-    check_raw(db, ids)
-    check_agg(db, ids)
-    check_errors(db, ids, i64)
-    check_insert_many(db, ids, f64, i64)
 
 
 def test_pool_batches_answer_as_single_queries(server, client):
@@ -273,55 +264,8 @@ def test_pool_replaces_a_broken_connection(server, client):
         proxy.close()
 
 
-def test_buckets_read_as_the_old_list(db):
-    s = db.series("x")
-    db.insert_series(s, [T0 + i * 1000 for i in range(600)], [float(i) for i in range(600)])
-    b = db.query_agg(s, T0, T0 + 600_000, 60_000)
-    assert isinstance(b, Buckets) and len(b) == 10
-    old = list(b)
-    assert all(isinstance(x, Bucket) for x in old)
-    assert b == old and old == list(b) and b == b and b != old[:-1]
-    assert b[0] == old[0] and b[-1] == old[-1] and b[2:5] == old[2:5] and list(b[::-3]) == old[::-3]
-    assert isinstance(b[2:5], Buckets)
-    with pytest.raises(IndexError):
-        b[10]
-    assert [x.count for x in b] == [60] * 10
-    assert b[3].sum == sum(range(180, 240)) and b[3].min == 180 and b[3].max == 239
-    # the columns, one numpy array per field
-    assert b.counts.dtype == np.uint64 and b.start.dtype == np.int64 and b.sum.dtype == np.float64
-    assert np.array_equal(b.start, [x.start for x in old])
-    assert np.array_equal(b.avg, [x.sum / x.count for x in old])
-    assert b.counts.sum() == 600 and b.max.max() == 599
-    empty = db.query_agg(s, T0 - 10, T0 - 5, 1)
-    assert len(empty) == 0 and empty == [] and list(empty.counts) == []
-    assert "Bucket" in repr(b)
-    # integers: exact columns
-    i = db.series_create("i", "int64")
-    db.insert_series_values(i, [T0, T0 + 1], [2**61 + 1, 2**61])
-    ib = db.query_agg(i)
-    assert ib.isum.dtype == np.int64 and ib.isum[0] == 2**62 + 1 and ib[0].isum == 2**62 + 1 and ib.imax[0] == 2**61 + 1
 
 
-def test_batches_from_many_threads(db):
-    ids, _, _ = fill(db)
-    series, start, end = windows(ids)
-    want = [(list(t), list(v)) for t, v in db.query_raw_many(series, start, end)]
-    errors = []
-
-    def run():
-        try:
-            for _ in range(20):
-                got = db.query_raw_many(series, start, end)
-                assert [(list(t), list(v)) for t, v in got] == want
-        except Exception as e:  # noqa: BLE001
-            errors.append(e)
-
-    th = [threading.Thread(target=run) for _ in range(8)]
-    for t in th:
-        t.start()
-    for t in th:
-        t.join()
-    assert not errors
 
 
 def test_module_exports():
@@ -346,8 +290,6 @@ def check_list_order(c):
     assert c.query_raw(t, numpy=False)[1] == [6.0] * 300
 
 
-def test_db_insert_many_keeps_list_order(db):
-    check_list_order(db)
 
 
 def test_pool_insert_many_keeps_list_order(server, client):
@@ -355,33 +297,8 @@ def test_pool_insert_many_keeps_list_order(server, client):
         check_list_order(Both(pool, client))
 
 
-def test_db_last_query_stats_after_a_batch(db):
-    ids, _, _ = fill(db)
-    many = db.query_raw_many(ids)
-    st = db.last_query_stats()
-    assert st.result_rows == sum(len(t) for t, _ in many) == N * len(ids)
-    agg = db.query_agg_many(ids, None, None, 60_000)
-    assert db.last_query_stats().result_rows == len(agg.buckets)
 
 
-def test_buckets_are_sequences(db):
-    s = db.series("x")
-    db.insert_series(s, [T0 + i * 1000 for i in range(120)], [float(i) for i in range(120)])
-    b = db.query_agg(s, T0, T0 + 120_000, 60_000)
-    old = list(b)
-    assert isinstance(b, collections.abc.Sequence) and issubclass(Buckets, collections.abc.Sequence)
-    assert b + old == old + old and old + b == old + old and b + b == old + old and isinstance(b + old, list)
-    with pytest.raises(TypeError):
-        b + (1,)
-    assert b.count(old[0]) == 1 and b.count(5) == 0 and b.index(old[1]) == 1 and old[1] in b
-    with pytest.raises(ValueError):
-        b.index(5)
-    assert b != tuple(old) and list(reversed(b)) == old[::-1]
-    m = db.query_agg_many([s, s], T0, T0 + 120_000, 60_000)
-    assert isinstance(m, collections.abc.Sequence) and issubclass(BucketsMany, collections.abc.Sequence)
-    assert m == [old, old] and m == m and m != [old] and isinstance(m[0:1], list) and m[0:1] == [b]
-    assert m[::-1] == [b, b] and m.count(b) == 2 and m.index(b) == 0 and list(m) == [b, b]
-    assert np.array_equal(m.buckets.counts, [60] * 4)
 
 
 def test_pool_survives_a_server_restart(server, client, tmp_path):
@@ -436,30 +353,33 @@ def long_batch(c, ids):
 def check_gil_released(c, ids):
     """Another Python thread keeps running during a long batch call: the GIL is released."""
     series = long_batch(c, ids)
-    count, stop = [0], [False]
+    for _ in range(6):
+        count, stop = [0], [False]
 
-    def spin():
-        while not stop[0]:
-            count[0] += 1
+        def spin():
+            while not stop[0]:
+                count[0] += 1
 
-    th = threading.Thread(target=spin)
-    th.start()
-    try:
-        time.sleep(0.01)
-        before = count[0]
-        t = time.perf_counter()
-        c.query_raw_many(series)
-        took, ran = time.perf_counter() - t, count[0] - before
-    finally:
-        stop[0] = True
-        th.join()
+        th = threading.Thread(target=spin)
+        th.start()
+        try:
+            time.sleep(0.01)
+            before = count[0]
+            t = time.perf_counter()
+            c.query_raw_many(series)
+            took, ran = time.perf_counter() - t, count[0] - before
+        finally:
+            stop[0] = True
+            th.join()
+        # The calibration in long_batch ran without the spinning thread; a warm second call can be faster (37 ms on a
+        # GitHub runner against the 50 ms calibrated), too short to judge. Make the batch longer and ask again.
+        if took > 0.04:
+            break
+        series = series * 2
     # Held for the whole call, the GIL would let the other thread run only before it started
     assert took > 0.04 and ran > 10_000, (took, ran)
 
 
-def test_db_batch_releases_the_gil(db):
-    ids, _, _ = fill(db)
-    check_gil_released(db, ids)
 
 
 def test_pool_batch_releases_the_gil(server, client):
@@ -468,35 +388,7 @@ def test_pool_batch_releases_the_gil(server, client):
         check_gil_released(pool, ids)
 
 
-def test_results_are_not_copied(db):
-    """numpy takes the result vectors over: the arrays do not own a copy of their data."""
-    ids, _, _ = fill(db)
-    for ts, v in db.query_raw_many(ids[:2]) + [db.query_raw(ids[0], numpy=True)]:
-        for a in (ts, v):
-            assert not a.flags.owndata and a.base is not None
-            assert not isinstance(a.base, (bytes, bytearray, np.ndarray)), type(a.base)
 
 
-NO_NUMPY = """
-import sys, tempfile
-sys.modules["numpy"] = None
-import tsdb_client as t
-with t.Db(tempfile.mkdtemp(dir=sys.argv[1]), fsync=False) as db:
-    s = db.series("x")
-    db.insert_series(s, [1000, 2000], [1.0, 2.0])
-    b = db.query_agg(s, None, None, 1000)
-    assert list(b.counts) == [1, 1] and isinstance(b.counts, list)
-    m = db.query_agg_many([s, s], None, None, 1000)
-    assert m.offsets == [0, 2, 4] and m.buckets.counts == [1] * 4 and m[1] == list(b)
-    try:
-        db.query_raw_many([s])
-        raise SystemExit("query_raw_many without numpy did not raise")
-    except ImportError as e:
-        assert "numpy" in str(e)
-print("ok")
-"""
 
 
-def test_batches_without_numpy(tmp_path):
-    p = subprocess.run([sys.executable, "-c", NO_NUMPY, str(tmp_path)], capture_output=True, text=True, timeout=60)
-    assert p.returncode == 0 and p.stdout.strip() == "ok", p.stderr

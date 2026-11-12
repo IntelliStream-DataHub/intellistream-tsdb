@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* tsdb export / import: the stream format of docs/export-format.md (tools/dump.c). */
 #ifndef TSDB_TOOLS_DUMP_H
 #define TSDB_TOOLS_DUMP_H

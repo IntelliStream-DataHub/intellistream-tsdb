@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* Client for tsdbd: blocking sockets, columnar frames, optional pipelining. */
 #define _GNU_SOURCE
 #include "tsdb_calendar.h"

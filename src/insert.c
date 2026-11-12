@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Insert path: bring rows into (partition, series, ts) order and write one
  * part per partition, like a MergeTree INSERT. All sorting is stable, and

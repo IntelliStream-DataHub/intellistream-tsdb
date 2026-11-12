@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* Shared by the C test harnesses that start tsdbd (test_server, test_stability, jepsen, test_ports).
  * They pass th_follow_me()'s --exit-with-parent=PID as well: a test killed by a timeout leaves no server behind.
  *
@@ -41,24 +42,16 @@ static inline void th_portfile(char *buf, size_t n, const char *base)
     unlink(buf);
 }
 
-/* Listening sockets already proven to be on a port: (port << 48 | inode). Listing /proc/net/tcp costs milliseconds
- * once it holds the TIME_WAIT sockets of a few thousand reconnects, and jepsen's clients ask on every connect. A
- * socket inode names one socket for as long as someone holds it, so "pid has inode I open" proves "pid listens on
- * the port I was found on" with a scan of the pid's few descriptors only; a dead server holds nothing and falls
- * through to the full scan, which then finds no listener. */
-#define TH_CACHE 16
-static _Atomic unsigned long long th_cache[TH_CACHE];
-static _Atomic unsigned th_cache_next;
-static _Atomic unsigned th_scans; /* full /proc/net/tcp listings so far (the test of the cache reads it) */
-
-static inline void th_cache_add(int port, unsigned long ino)
-{
-    unsigned long long v = ((unsigned long long)port << 48) | (ino & 0xffffffffffffULL);
-    for (int i = 0; i < TH_CACHE; i++)
-        if (atomic_load(&th_cache[i]) == v)
-            return;
-    atomic_store(&th_cache[atomic_fetch_add(&th_cache_next, 1) % TH_CACHE], v);
-}
+/* th_owns_port(pid, port) asks, after a client connected to the port, whether pid holds a socket that is LISTENING
+ * on it now. Only that proves the connection reached pid: a socket that listens now has listened since its listen()
+ * (tsdbd never listens twice), so pid listened when the client connected, and no one else could (no SO_REUSEPORT).
+ * Holding the socket is not enough: a server on its way out (tsdbd after a storage failure: shutdown() of the
+ * listener, 200 ms of grace, then close) holds a socket that no longer listens, and its port is free for another
+ * process to bind meanwhile, whose server then answers the client (jepsen, 2026-11-09: one run's clients wrote into
+ * another run's database; test_ports taken_over). The listeners on a port come from the kernel's socket diagnostics
+ * (netlink), which walk the listening sockets only: /proc/net/tcp, the fallback, costs milliseconds once it holds
+ * the TIME_WAIT sockets of a few thousand reconnects, and jepsen's clients ask on every connect. */
+static _Atomic unsigned th_scans; /* /proc/net/tcp listings so far (test_ports checks that netlink spares them) */
 
 #ifdef __APPLE__
 /* macOS has no /proc: libproc lists the descriptors of a process of ours (its sockets, with their state and local
@@ -67,9 +60,8 @@ static inline void th_cache_add(int port, unsigned long ino)
 #include <libproc.h>
 #include <sys/proc_info.h>
 
-/* Walks pid's sockets: with port > 0 the listening TCP socket on that port, else one of `want` (n objects).
- * Returns the socket's object id, or 0. */
-static inline unsigned long th_scan_sockets(pid_t pid, int port, const unsigned long *want, int n)
+/* Is a TCP socket of pid's in the LISTEN state on `port`? (only pid's own descriptors are walked: no cost to save) */
+static inline int th_owns_port(pid_t pid, int port)
 {
     int bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
     if (bytes <= 0)
@@ -78,52 +70,79 @@ static inline unsigned long th_scan_sockets(pid_t pid, int port, const unsigned 
     if (!fds)
         return 0;
     bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, bytes);
-    unsigned long found = 0;
+    int found = 0;
     for (int i = 0; bytes > 0 && !found && i < bytes / (int)sizeof *fds; i++) {
         struct socket_fdinfo si;
         if (fds[i].proc_fdtype != PROX_FDTYPE_SOCKET ||
             proc_pidfdinfo(pid, fds[i].proc_fd, PROC_PIDFDSOCKETINFO, &si, sizeof si) != (int)sizeof si)
             continue;
-        unsigned long so = (unsigned long)si.psi.soi_so;
-        if (port > 0) {
-            so &= 0xffffffffffffULL; /* as th_cache_add keeps it */
-            if (si.psi.soi_kind == SOCKINFO_TCP && si.psi.soi_proto.pri_tcp.tcpsi_state == TSI_S_LISTEN &&
-                ntohs((uint16_t)si.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport) == port)
-                found = so;
-        } else {
-            so &= 0xffffffffffffULL;
-            for (int k = 0; k < n; k++)
-                if (want[k] == so)
-                    found = so;
-        }
+        found = si.psi.soi_kind == SOCKINFO_TCP && si.psi.soi_proto.pri_tcp.tcpsi_state == TSI_S_LISTEN &&
+                ntohs((uint16_t)si.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport) == port;
     }
     free(fds);
     return found;
 }
-
-static inline unsigned long th_fd_socket(pid_t pid, const unsigned long *want, int n)
-{
-    return th_scan_sockets(pid, 0, want, n);
-}
-
-static inline int th_owns_port(pid_t pid, int port)
-{
-    unsigned long known[TH_CACHE];
-    int nk = 0;
-    for (int i = 0; i < TH_CACHE; i++) { /* sockets proven to listen on this port before */
-        unsigned long long v = atomic_load(&th_cache[i]);
-        if ((int)(v >> 48) == port && v && nk < TH_CACHE)
-            known[nk++] = (unsigned long)(v & 0xffffffffffffULL);
-    }
-    if (nk > 0 && th_fd_socket(pid, known, nk))
-        return 1;
-    atomic_fetch_add(&th_scans, 1);
-    unsigned long so = th_scan_sockets(pid, port, NULL, 0);
-    if (so)
-        th_cache_add(port, so);
-    return so != 0;
-}
 #else /* Linux */
+#include <arpa/inet.h>
+#include <linux/inet_diag.h>
+#include <linux/netlink.h>
+#include <linux/sock_diag.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#define TH_TCP_LISTEN 10 /* the kernel's TCP_LISTEN state */
+
+/* The inodes of the TCP sockets (IPv4 and IPv6) listening on `port` now, from sock_diag: up to max of them, their
+ * count, or -1 if the kernel did not answer (the caller then lists /proc/net/tcp). */
+static inline int th_listeners(int port, unsigned long *ino, int max)
+{
+    int n = 0;
+    for (int v6 = 0; v6 < 2; v6++) {
+        int s = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+        if (s < 0)
+            return -1;
+        struct {
+            struct nlmsghdr nh;
+            struct inet_diag_req_v2 r;
+        } req;
+        memset(&req, 0, sizeof req);
+        req.nh.nlmsg_len = sizeof req;
+        req.nh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+        req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+        req.r.sdiag_family = v6 ? AF_INET6 : AF_INET;
+        req.r.sdiag_protocol = IPPROTO_TCP;
+        req.r.idiag_states = 1u << TH_TCP_LISTEN; /* the listening table only, never the TIME_WAIT sockets */
+        req.r.id.idiag_sport = htons((uint16_t)port);
+        struct sockaddr_nl to = {.nl_family = AF_NETLINK};
+        int bad = sendto(s, &req, sizeof req, 0, (struct sockaddr *)&to, sizeof to) != (ssize_t)sizeof req;
+        for (int done = 0; !bad && !done;) {
+            long buf[8192 / sizeof(long)];
+            ssize_t len = recv(s, buf, sizeof buf, 0);
+            if (len <= 0) {
+                bad = 1;
+                break;
+            }
+            for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, len); h = NLMSG_NEXT(h, len)) {
+                if (h->nlmsg_type == NLMSG_DONE) {
+                    done = 1;
+                    break;
+                }
+                if (h->nlmsg_type == NLMSG_ERROR) {
+                    bad = 1;
+                    break;
+                }
+                const struct inet_diag_msg *m = NLMSG_DATA(h);
+                if (h->nlmsg_type == SOCK_DIAG_BY_FAMILY && m->idiag_state == TH_TCP_LISTEN &&
+                    ntohs(m->id.idiag_sport) == port && n < max)
+                    ino[n++] = m->idiag_inode;
+            }
+        }
+        close(s);
+        if (bad)
+            return -1;
+    }
+    return n;
+}
 
 /* Does `pid` hold a socket with one of these inodes (`want`, n of them)? Returns the inode, or 0. */
 static inline unsigned long th_fd_socket(pid_t pid, const unsigned long *want, int n)
@@ -152,18 +171,13 @@ static inline unsigned long th_fd_socket(pid_t pid, const unsigned long *want, i
     return found;
 }
 
-/* Is a listening TCP socket on `port` held by process `pid`? */
+/* Is a TCP socket held by process `pid` listening on `port` now? */
 static inline int th_owns_port(pid_t pid, int port)
 {
     unsigned long inodes[64];
-    int ni = 0;
-    for (int i = 0; i < TH_CACHE; i++) { /* sockets proven to listen on this port before */
-        unsigned long long v = atomic_load(&th_cache[i]);
-        if ((int)(v >> 48) == port && v && ni < 64)
-            inodes[ni++] = (unsigned long)(v & 0xffffffffffffULL);
-    }
-    if (ni > 0 && th_fd_socket(pid, inodes, ni))
-        return 1;
+    int ni = th_listeners(port, inodes, 64);
+    if (ni >= 0)
+        return ni > 0 && th_fd_socket(pid, inodes, ni) != 0;
     ni = 0;
     atomic_fetch_add(&th_scans, 1);
     for (int v6 = 0; v6 < 2; v6++) {
@@ -184,12 +198,7 @@ static inline int th_owns_port(pid_t pid, int port)
         }
         fclose(f);
     }
-    if (ni == 0)
-        return 0;
-    unsigned long ino = th_fd_socket(pid, inodes, ni);
-    if (ino)
-        th_cache_add(port, ino);
-    return ino != 0;
+    return ni > 0 && th_fd_socket(pid, inodes, ni) != 0;
 }
 #endif /* __APPLE__ */
 

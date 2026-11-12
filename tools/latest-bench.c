@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* latest-bench: what the latest table costs a flush, and what lookups cost it (design-latest.md 2.3, 9), embedded.
  *
  *   latest-bench --dir D [--mode on|off|nowin] [--series 1000000] [--rounds 6] [--readers 1] [--ids 256]
