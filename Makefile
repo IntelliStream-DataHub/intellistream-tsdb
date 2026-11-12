@@ -1040,7 +1040,9 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # power run, and so does a server that hangs (SIGSTOP: a pulled plug never ends it; it is reported, not counted as a
 # pull), and a power run whose nemesis is idle: it does nothing, kills once and then sleeps, naps 9 s at a time, never
 # pulls the plug (never, oncereact), sleeps through its naps (--mutant-idle, --mutant-longnap) or sleeps inside its fault
-# step, with the server dead or with the new one up (deadsleep:MS, busysleep:MS). Each runs once and must fail: no case is
+# step, with the server dead or with the new one up (deadsleep:MS, busysleep:MS; the idle one runs with servers that die by
+# themselves ten times as often, JEPSEN_PULL_PROB: a nemesis that sleeps through its naps shows only when a server dies in
+# one, 18 of 20 runs under 16 busy loops at the default rate, 20 of 20 at this one). Each runs once and must fail: no case is
 # repeated until it does. Also an eio nemesis that works once and sleeps, a burst (burst:5) and then asleep, naps that do
 # not look at the server (nap:600: a server that died lies dead), and a shim that ignores SIGUSR2 (CRASHFS_IGNORE_USR2:
 # the plugs are not counted), a nemesis that is asleep in the middle of the run with every third and the floor still met
@@ -1074,8 +1076,8 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	for spec in 'nothing|20' 'once|20' 'nap:9000|20' 'never|20' 'oncereact|20' 'deadsleep:1500|20' 'busysleep:1500|20' \
 	    'idle|20' 'longnap|30'; do \
 	    m=$${spec%%|*}; secs=$${spec#*|}; \
-	    case $$m in idle) flag=--mutant-idle;; longnap) flag=--mutant-longnap;; *) flag="--mutant-nemesis $$m";; esac; \
-	    out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds $$secs --crashfs $(B)/libcrashfs.so \
+	    pp=0.00003; case $$m in idle) flag=--mutant-idle; pp=0.0003;; longnap) flag=--mutant-longnap;; *) flag="--mutant-nemesis $$m";; esac; \
+	    out=$$(JEPSEN_PULL_PROB=$$pp ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds $$secs --crashfs $(B)/libcrashfs.so \
 	        $$flag 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'was idle'; then \
 	        echo "jepsen-selftest: a nemesis that is '$$m' went unnoticed (rc $$rc, wanted rc 1 and 'was idle')"; echo "$$out" | tail -n 20; exit 1; fi; \
