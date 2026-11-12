@@ -801,6 +801,53 @@ the runs:
 - **Not measured:** the `FNO` sync alone (no run isolates it), `tsdb DIR upgrade` and the merges that rewrite format-8
   parts, and queries (the part header grew by 24 bytes per part, which no query reads).
 
+### Appends without an fsync per call, 0.9.1 against 0.10.0 and the append-path branch
+
+The "few percent" above came from a noisy run, and the 16-thread rows hid a larger loss. The track `append-path`
+measured it again with all three trees side by side: v0.9.1, main at 47ae317 (0.10.0) and the branch (d491a29, main
+merged later), `build/insert-bench --only SYNC_MS:THREADS --seconds 5`, one-row appends of 1,000 series, 5 runs of each
+cell, v0.9.1 / main / branch interleaved, under the exclusive BENCH lock, a quiet machine (under 1.5 CPUs busy before
+each run, performance governor, Ryzen 9 7950X, ext4 on the NVMe), 2026-11-10 17:10. Rows per second in millions
+(fsync each call: per second): mean (sd; lowest-highest; median).
+
+| mode | 0.9.1 | 0.10.0 (main) | append-path |
+|---|---:|---:|---:|
+| WAL fsync every 10 ms, 1 thread | 7.24 (sd 0.89; 5.86-7.86; med 7.82) | 7.47 (sd 0.29; 7.03-7.71; med 7.60) | 7.57 (sd 0.24; 7.17-7.76; med 7.71) |
+| WAL fsync every 10 ms, 16 threads | 2.03 (sd 0.05; 2.00-2.12; med 2.02) | 1.71 (sd 0.06; 1.63-1.75; med 1.73) | 1.88 (sd 0.06; 1.84-1.98; med 1.85) |
+| WAL fsync every 10 ms, 64 threads | 1.81 (sd 0.01; 1.80-1.82; med 1.81) | 1.51 (sd 0.01; 1.50-1.52; med 1.51) | 1.67 (sd 0.01; 1.66-1.68; med 1.67) |
+| WAL fsync every 100 ms, 1 thread | 7.13 (sd 1.24; 5.02-7.90; med 7.85) | 6.65 (sd 0.96; 5.06-7.69; med 6.86) | 7.40 (sd 0.42; 6.97-7.82; med 7.45) |
+| WAL fsync every 100 ms, 16 threads | 2.16 (sd 0.20; 2.00-2.47; med 2.11) | 1.85 (sd 0.19; 1.69-2.15; med 1.79) | 1.98 (sd 0.07; 1.88-2.08; med 1.98) |
+| WAL fsync every 100 ms, 64 threads | 1.81 (sd 0.01; 1.80-1.82; med 1.81) | 1.51 (sd 0.01; 1.50-1.52; med 1.51) | 1.68 (sd 0.01; 1.67-1.69; med 1.68) |
+| fsync each call, 1 thread | 1,407 (sd 1; 1,406-1,408; med 1,408) | 1,406 (sd 5; 1,402-1,411; med 1,406) | 1,372 (sd 82; 1,226-1,412; med 1,409) |
+| fsync each call, 16 threads | 12,007 (sd 85; 11,929-12,139; med 12,010) | 12,222 (sd 121; 12,067-12,377; med 12,195) | 12,108 (sd 70; 12,015-12,198; med 12,094) |
+| fsync each call, 64 threads | 42,456 (sd 96; 42,343-42,573; med 42,424) | 42,295 (sd 161; 42,105-42,535; med 42,254) | 41,585 (sd 1,865; 38,254-42,543; med 42,434) |
+
+A difference counts only where the ranges barely overlap and the medians agree.
+
+- **With an fsync per call nothing differs** (the three trees are within their run-to-run spread; the branch has one low
+  run at 1 and at 64 threads, 1,226 and 38,254 /s, and the medians are the same as the others').
+- **At 16 and 64 threads without an fsync per call, 0.10.0 is 16 to 17% slower than 0.9.1** (10 ms: 1.71 against 2.03
+  M/s at 16 threads, 1.51 against 1.81 at 64; 100 ms at 64 threads the same; the ranges do not touch). More than the 5 to
+  10% of the 0.10.0 comparison, because this loop does nothing but append: a profile of the 16-thread case put 59% of the
+  cycles in the kernel's futex wait on `buf_lock`. The threads queue for one lock, so throughput is what one critical
+  section moves from core to core, not the instructions in it. 16 threads at 100 ms is the same direction (1.85 against
+  2.16, medians 1.79 and 2.11) but its sd is 0.2 and the ranges overlap: not shown separately from the 10 ms rows.
+- **At 1 thread no difference is shown.** The medians are 7.82, 7.60 and 7.71 M/s (10 ms) and 7.85, 6.86 and 7.45 (100
+  ms), but single runs of 5.0 to 5.9 M/s in 0.9.1 and main make the ranges overlap completely. A `perf stat` count
+  (earlier, on a busy machine) had main at 3.5% more instructions per row and 0.5% more cycles than 0.9.1: the loss is not on one
+  thread.
+- **The branch gets back about half of the loss** where it is measurable: 1.88 against 1.71 M/s at 16 threads (+10%),
+  1.67 against 1.51 at 64 (+11%), the ranges apart from both neighbours (still 7.7% below 0.9.1: 1.88 against
+  2.03 and 1.67 against 1.81). What it changes, all under the `buf_lock` the append already took, none of it on disk
+  (the WAL bytes are identical for the same input): the record's row count is written once, when the record is closed
+  at a hand-off (swap, marker, flush), not on every call; the memtable's last log number is taken at the seal, not
+  stored per call; `bg_error` is cleared only when set; the hot fields of the engine sit in two cache lines of their
+  own and `failed` no longer shares a line with the reference count that every call increments and decrements.
+- **Left in 0.10.0's cost:** about 8% at 16 and 64 threads. A measured part of it (about 3% in an earlier run) is the
+  latest table's per-row work in `mt_add`, which is the feature; the rest is not isolated.
+- **Not measured here:** other row counts per call, other CPUs (AVX2 Intel), more than 64 threads, and the 0.10.0 numbers
+  of the other append rows above, which this run does not touch.
+
 ## Reproduce it yourself
 
 **tsdb alone, on your machine:** `tools/bench-tsdb.sh` builds an optimized copy in `build-bench/`, runs tsdb's own

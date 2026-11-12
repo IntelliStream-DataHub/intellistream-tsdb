@@ -8,6 +8,19 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**Appends without an fsync per call are faster again, no format change.** 0.10.0 lost speed on one-row appends with
+`wal_sync_ms` above 0 when many threads append (16 to 17% less than 0.9.1 at 16 and 64 threads, measured; nothing
+measurable at one thread or with an fsync per call). The branch gets back about half of it (+10 to 11% over 0.10.0, 7.7%
+still below 0.9.1: BENCHMARKS.md, "Format 9"). The WAL bytes for the same input are identical, and every guarantee holds
+as before.
+
+- The row count of a WAL record is written once, when the record is closed (a buffer swap, a marker, a flush, or the
+  record's row cap), not on every append; the memtable's last log number is taken when it is sealed; the hot fields of
+  the engine lie in separate cache lines. All of it stays inside the `buf_lock` the append already took.
+- Tests: `test_fno` (`test_wal_books`, `test_wal_races`, `test_wal_split`, `test_wal_flush_tail`) checks the record
+  bytes, the part's position ranges and a flush that ends an open record, with the mutants `flushclose` and a marker
+  that leaves the record open.
+
 **Configuration files.** `tsdbd` and the `tsdb` tool read their settings from a `.properties` file
 ([docs/config.md](docs/config.md)). Nothing changes for a server started with options.
 
