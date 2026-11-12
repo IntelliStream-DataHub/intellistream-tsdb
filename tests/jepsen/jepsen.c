@@ -1309,6 +1309,11 @@ static void *watcher(void *arg)
  * here (WNOWAIT): the nemesis below does that. */
 static void nap(useconds_t us, bool watch)
 {
+    /* --mutant-idle: a server dies in a nap that does not watch it (what a real run does by the shim's own odds, only not
+     * left to chance: with the odds raised, 1 of ~20 loaded runs still had no death in a long nap): the plug is pulled at the
+     * start of every nap of 400 ms or more, so that the server lies dead for what is left of it, far above the dead bound */
+    if (idle_mutant && !watch && us >= 400000 && atomic_load(&server_pid) > 1)
+        signal_pid(atomic_load(&server_pid), SIGUSR2);
     for (useconds_t t = 0; t < us && !atomic_load(&stop) && !atomic_load(&nem_stop); t += 5000) {
         pid_t pid = atomic_load(&server_pid);
         siginfo_t si;
