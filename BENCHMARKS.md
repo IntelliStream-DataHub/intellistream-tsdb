@@ -848,6 +848,25 @@ A difference counts only where the ranges barely overlap and the medians agree.
 - **Not measured here:** other row counts per call, other CPUs (AVX2 Intel), more than 64 threads, and the 0.10.0 numbers
   of the other append rows above, which this run does not touch.
 
+**Again on the merged tree.** Main moved after that matrix (the eio-classes merge changed `mem_insert`: room is reserved
+before the WAL append, and backpressure comes before it), so the branch was merged with main (ba92c3d) and the one case
+that shows the gain was measured again: 16 threads, `wal_sync_ms` 10, the merged branch against main at b9b167a, 10
+rounds interleaved (the order swapped every round), 5 s each, exclusive BENCH lock, under 1.5 CPUs busy before every run
+(0.1 to 0.2 measured), 2026-11-12. Rows per second in millions:
+
+| 16 threads, WAL fsync every 10 ms | mean (sd) | median | lowest-highest |
+|---|---:|---:|---:|
+| main (b9b167a) | 1.88 (0.15) | 1.84 | 1.72-2.19 |
+| append-path, merged | 2.12 (0.25) | 2.02 | 1.88-2.62 |
+
+- The branch is ahead in 9 of the 10 rounds (round by round: +12.6, +23.0, +9.7, +22.0, +18.4, +31.4, -14.4, +9.7,
+  +20.2, +0.7%; median +15.5%, mean +13.3%). The medians are 9.8% apart, but the ranges overlap (1.88-2.19) and the spread
+  is larger than in the matrix above (sd 0.15 and 0.25, against 0.06): by the rule above this run alone does not show a
+  difference, the round-by-round pairing points the same way as the matrix. So the gain holds on the merged tree, at
+  the size the matrix gave (+10%) or more, not shown more precisely than that.
+- Both trees are faster here than in the matrix (main 1.88 against 1.71 M/s). That run was on another day, and the tree
+  is not the same (main has moved); do not compare the two tables' absolute numbers.
+
 ## Reproduce it yourself
 
 **tsdb alone, on your machine:** `tools/bench-tsdb.sh` builds an optimized copy in `build-bench/`, runs tsdb's own

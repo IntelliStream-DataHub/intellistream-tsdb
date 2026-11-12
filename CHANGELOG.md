@@ -11,8 +11,9 @@ disk format and the wire protocol.
 **Appends without an fsync per call are faster again, no format change.** 0.10.0 lost speed on one-row appends with
 `wal_sync_ms` above 0 when many threads append (16 to 17% less than 0.9.1 at 16 and 64 threads, measured; nothing
 measurable at one thread or with an fsync per call). The branch gets back about half of it (+10 to 11% over 0.10.0, 7.7%
-still below 0.9.1: BENCHMARKS.md, "Format 9"). The WAL bytes for the same input are identical, and every guarantee holds
-as before.
+still below 0.9.1: BENCHMARKS.md, "Format 9"; measured again on the tree with main merged, 16 threads and a 10 ms
+sync: ahead in 9 of 10 rounds, median +15%, ranges overlapping). The WAL bytes for the same input are identical, and
+every guarantee holds as before.
 
 - The row count of a WAL record is written once, when the record is closed (a buffer swap, a marker, a flush, or the
   record's row cap), not on every append; the memtable's last log number is taken when it is sealed; the hot fields of
