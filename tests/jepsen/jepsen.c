@@ -2186,7 +2186,19 @@ static void *nemesis_thread(void *arg)
  * that the run must have, per nemesis: half of the least an honest run made, quiet or with 16 busy loops on 4 CPUs, on tmpfs
  * (/tmp, the default JEPSEN_DIR here) or on disk (honest, in 8 runs of each kind: kill 2.04 to 2.34, pause 1.79 to 2.0, power 1.14 to 1.75, eio 0.86 to 1.7; the
  * outage nemesis' fault is one long step, 0.33 to 0.4 per listening second, a third of that is asked). A nemesis at half the honest
- * rate is what the check cannot tell from an honest one under load; one at a third of it, or less, fails. */
+ * rate is what the check cannot tell from an honest one under load; one at a third of it, or less, fails.
+ *
+ * Calibration of every bound (12 full `make jepsen` runs of this tree: JEPSEN_DIR on /tmp, tmpfs, and on /var/tmp, ext4, each quiet
+ * and with 16 busy loops on the 4 CPUs of the run, 3 runs each, both backends, kv and classes, login and feed; plus 12 eio, 6 kill and
+ * 6 power runs with 48 busy loops on 4 CPUs), the honest worst against the bound, margin in brackets:
+ *   rate per free listening second, least:    kill 2.00 (floor 1.0, 2.0x)  pause 1.74 (0.9, 1.9x)  power 1.05 (0.55, 1.9x)  eio 0.88 (0.4, 2.2x)
+ *   faults against the floor, least:          kill 1.9x  pause 1.7x  power 1.7x  eio 2.2x
+ *   longest listening stretch with no fault:  0.90 s (bound 2.0 s for runs of 10 and 20 s, 2.2x; eio had 1.63 s before its survive path
+ *                                             counted as a fault in progress)
+ *   longest dead stretch: 150 ms in a run of 300 with a load average of 90 (bound 250 ms, 1.7x; 101 ms in the 12 runs)
+ *   longest stop: 408 ms (bound 1500 ms, 3.7x)
+ * A nemesis that works at a third of the honest rate, at half of it (slow:MS), stops at three quarters of the run (hole:15:100) or
+ * sees no server die in its naps (blind:MS) is failed by the selftest of the Makefile, 10 of 10 runs in each of the four conditions. */
 static double nem_rate(void)
 {
     if (outage)

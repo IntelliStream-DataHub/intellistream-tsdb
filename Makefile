@@ -1052,6 +1052,13 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # and a watcher thread measures the time a server lay dead, lay stopped and was listening with no fault issued or in
 # progress (jepsen.c, nemesis_check). A tsdbd with a stale entry in its latest table (three mutants, built from a copy of the tree) fails the
 # kv run's latest check.
+# The nemesis check counts confirmed faults only (a kill: the server died of it and a new one listens; a pause: the watcher saw the
+# server stopped; a plug: the shim logged it; an EIO: the shim's mark): killnoeffect and pausenoeffect signal nothing and are
+# counted as nothing. Its floor is half the least honest rate per second of listening time with no fault being carried out (slow:MS,
+# a longer nap, works at half or two thirds of it), its gap bound a tenth of the run (2 to 5 s, the stretch to the end of the run
+# included: hole:15:100 stops at three quarters of a run of 20 s, hole:6:100 at six tenths of one of 10 s), and the dead bound
+# catches a nemesis that does not look at the server when the shim, with high odds, is what kills it (blind:1000, no forced death).
+# What each bound is set to, and the honest worst under load on tmpfs and disk, is in the comments of nemesis_check (jepsen.c).
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
