@@ -1052,7 +1052,7 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # and a watcher thread measures the time a server lay dead, lay stopped and was listening with no fault issued or in
 # progress (jepsen.c, nemesis_check). A tsdbd with a stale entry in its latest table (three mutants, built from a copy of the tree) fails the
 # kv run's latest check.
-jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
+jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || [ $$rc -eq 124 ] || \
@@ -1084,9 +1084,9 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	done; \
 	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis eio --seconds 20 --crashfs $(B)/libcrashfs.so \
 	    --mutant-nemesis once 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'the nemesis issued [0-9]* faults in 20 s.*it was idle'; then \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'was idle'; then \
 	        echo "jepsen-selftest: an eio nemesis that works once and sleeps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 --mutant-nemesis burst:10 2>&1); rc=$$?; \
+	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 --mutant-nemesis burst:12 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'were not spread over it'; then \
 	        echo "jepsen-selftest: a nemesis that works in a burst and sleeps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 --mutant-nemesis hole:3:10 2>&1); rc=$$?; \
@@ -1106,9 +1106,31 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --mutant-nemesis nap:600 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a server lay dead for'; then \
 	        echo "jepsen-selftest: a nemesis that does not look at the server left it dead unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(CRASHFS_IGNORE_USR2=1 JEPSEN_PULL_PROB=0.0003 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 \
+	for spec in \
+	    'kill@20@killnoeffect@-@the nemesis issued 0 faults in 20 s.*it was idle@a kill that kills nothing was counted as a fault' \
+	    'pause@10@pausenoeffect@-@the nemesis issued 0 faults in 10 s.*it was idle@a pause that stops nothing was counted as a fault' \
+	    'kill@20@slow:1500@-@the nemesis issued [0-9]* faults in 20 s.*it was idle@a kill nemesis at half the honest rate slipped past the floor' \
+	    'pause@10@slow:1200@-@the nemesis issued [0-9]* faults in 10 s.*it was idle@a pause nemesis at two thirds of the honest rate slipped past the floor' \
+	    'kill@20@hole:15:100@-@listening for [0-9.]* s with no fault issued or in progress@a kill nemesis that stops at three quarters of the run' \
+	    'pause@10@hole:6:100@-@listening for [0-9.]* s with no fault issued or in progress@a pause nemesis that stops at seven tenths of the run' \
+	    'power@20@hole:15:100@-@was idle@a power nemesis that stops at three quarters of the run' \
+	    'eio@20@hole:15:100@-@was idle@an eio nemesis that stops at three quarters of the run' \
+	    'power@20@blind:1000@JEPSEN_PULL_PROB=0.003,JEPSEN_CRASH_PROB=0.003@a server lay dead for@a blind power nemesis (no server made to die in its naps: the shim kills them)' \
+	    'eio@20@blind:1000@JEPSEN_PULL_PROB=0.003,JEPSEN_CRASH_PROB=0.003@a server lay dead for@a blind eio nemesis (no server made to die in its naps: the shim fails them)'; do \
+	    oldifs=$$IFS; IFS=@; set -- $$spec; IFS=$$oldifs; nem=$$1; secs=$$2; mut=$$3; envs=$$(echo "$$4" | tr , ' '); pat=$$5; what=$$6; \
+	    case $$envs in -) envs=X_NONE=1;; esac; \
+	    shim=; case $$nem in power|eio) shim="--crashfs $(B)/libcrashfs.so";; esac; \
+	    out=$$(env $$envs ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis $$nem --seconds $$secs $$shim --mutant-nemesis $$mut 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "$$pat"; then \
+	        echo "jepsen-selftest: $$what went unnoticed (rc $$rc, wanted rc 1 and '$$pat')"; echo "$$out" | tail -n 20; exit 1; fi; \
+	done; \
+	out=$$(CRASHFS_IGNORE_USR2=2 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 \
 	    --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'that the shim did not log are not faults'; then \
+	        echo "jepsen-selftest: plugs that the shim made and did not log were counted as pulled (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(CRASHFS_IGNORE_USR2=1 JEPSEN_PULL_PROB=0.0003 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 \
+	    --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'was idle'; then \
 	        echo "jepsen-selftest: plugs that the shim ignored were counted as pulled (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(JEPSEN_TSDBD=tests/jepsen/hang-tsdbd.sh timeout 300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
