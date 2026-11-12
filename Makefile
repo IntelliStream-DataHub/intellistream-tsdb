@@ -1043,7 +1043,7 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # step, with the server dead or with the new one up (deadsleep:MS, busysleep:MS; the idle one runs with servers that die by
 # themselves ten times as often, JEPSEN_PULL_PROB: a nemesis that sleeps through its naps shows only when a server dies in
 # one, 18 of 20 runs under 16 busy loops at the default rate, 20 of 20 at this one). Each runs once and must fail: no case is
-# repeated until it does. Also an eio nemesis that works once and sleeps, a burst (burst:5) and then asleep, naps that do
+# repeated until it does. Also an eio nemesis that works once and sleeps, a burst (burst:10: faults enough for the floor, also under load, but none in the last third) and then asleep, naps that do
 # not look at the server (nap:600: a server that died lies dead), and a shim that ignores SIGUSR2 (CRASHFS_IGNORE_USR2:
 # the plugs are not counted), a nemesis that is asleep in the middle of the run with every third and the floor still met
 # (hole:3:10 of 20 s, and hole:2:6 of 10 s for the pause nemesis, whose bound is tighter), an eio nemesis that never asks
@@ -1086,7 +1086,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    --mutant-nemesis once 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'the nemesis issued [0-9]* faults in 20 s.*it was idle'; then \
 	        echo "jepsen-selftest: an eio nemesis that works once and sleeps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 --mutant-nemesis burst:5 2>&1); rc=$$?; \
+	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 --mutant-nemesis burst:10 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'were not spread over it'; then \
 	        echo "jepsen-selftest: a nemesis that works in a burst and sleeps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 --mutant-nemesis hole:3:10 2>&1); rc=$$?; \
