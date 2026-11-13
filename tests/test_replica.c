@@ -1630,7 +1630,9 @@ static int run_power_child(const char *dir, const char *ackfile, int warmup, int
     pid_t pid = fork();
     if (pid == 0) {
         char asan[512], w[16], sd[16];
-        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        /* (no leak check in the child: it ends without freeing its leader, and crashfs keeps undo copies) */
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0:detect_leaks=0",
+                 getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
         setenv("ASAN_OPTIONS", asan, 1);
         snprintf(w, sizeof w, "%d", warmup);
         snprintf(sd, sizeof sd, "%d", seed);
@@ -1642,7 +1644,7 @@ static int run_power_child(const char *dir, const char *ackfile, int warmup, int
         setenv("CRASHFS_TEAR", "1", 1);
         setenv("CRASHFS_SEED", sd, 1);
         int null = open("/dev/null", O_WRONLY);
-        if (null >= 0)
+        if (null >= 0 && !getenv("TEST_REPLICA_CHILD_OUTPUT")) /* (set it to see why a child ended) */
             dup2(null, 1), dup2(null, 2);
         execl(SELF, SELF, "--power", dir, ackfile, MUTNAME ? MUTNAME : "none", (char *)NULL);
         _exit(127);
@@ -1671,6 +1673,8 @@ static void case_power(void)
         snprintf(hif, sizeof hif, "%s.hi", ack);
         unlink(hif);
         int code = run_power_child(dir, ack, k, k + 1);
+        if (code != 99 && code != 0)
+            fprintf(stderr, "P: step %d: the child ended with status %d\n", k, code);
         CHECK(code == 99 || code == 0);
         if (code != 99 && code != 0)
             break;
