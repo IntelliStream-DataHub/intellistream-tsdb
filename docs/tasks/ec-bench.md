@@ -87,7 +87,7 @@ What it shows:
   written k times. 16+4 at 4 MiB reads 4 x 64 MiB per 64 MiB of data: 7.4 GB/s of data is about 30 GB/s of reads, not
   the 9.3 GB/s that reading 16 and writing 4 shards once would take. The same shows at 1 MiB: 8+4 and 16+4 run at half
   the speed of 4+2 and 8+2 on both machines (twice the passes). Working the shards in cache-sized columns (every parity
-  of one 16-64 KiB column before the next) would read the data once; that is upstream's to change (intellistream-objects).
+  of one column before the next) reads the data once; done in intellistream-objects dc0018b3 (see the i5-13400 section below).
 
 ## The i5-13400 numbers (Raptor Lake, 6 P-cores + 4 E-cores, AVX2 + GFNI, no AVX-512; measured 2026-11-13)
 
@@ -109,3 +109,28 @@ of avx2, past the sd in most rows). Encode / decode, MB/s of data; scalar is 0.8
 The kernels are within 10 percent of each other even at 1 MiB (a 1.25 MiB L2 per P-core: the 1 MiB stripes already
 read from L3), and a core does 2.6 times less than a 7950X core at 1 MiB, 1.6 times less at 4 MiB: on this CPU the
 pass structure above, not the multiply, sets the speed.
+
+### After the dot kernel (intellistream-objects commit dc0018b3, synced into src/ec)
+
+Every kernel now computes up to four parity shards at once in registers and reads each data shard once, working in
+8 KiB column tiles (`ISO_RS_TILE`; tiles from 4 KiB to none were within noise for m <= 4). Same machine, same flags
+and pinning, 3 runs of 7 rounds of at least 300 ms, mean of the 3 (sd of the means under 3 percent except the avx2
+and gfni256 4 MiB rows, up to 12 percent). `build/test_rs`: ok. Encode / decode, MB/s of data; the factor is encode
+after / before from the first table.
+
+| shard | geometry | base ssse3 | v3 avx2 | v3 gfni256 | gfni256 factor |
+|---|---|---:|---:|---:|---:|
+| 1 MiB | 4+2 | 15948 / 15714 | 27617 / 27297 | 43520 / 43347 | 3.7x |
+| 1 MiB | 8+2 | 16699 / 16620 | 26328 / 26696 | 51707 / 51318 | 4.1x |
+| 1 MiB | 8+4 | 9656 / 9706 | 16045 / 16115 | 33090 / 32671 | 5.3x |
+| 1 MiB | 16+4 | 9668 / 9654 | 16204 / 16190 | 33966 / 31747 | 5.9x |
+| 4 MiB | 8+4 | 8627 / 8653 | 13570 / 14880 | 23619 / 24211 | 5.4x |
+| 4 MiB | 16+4 | 9469 / 9559 | 14792 / 15209 | 27093 / 26042 | 5.9x |
+
+The 4 MiB gfni256 rows are at the 23 to 30 GB/s that reading the data once and writing the parity once takes here. The
+avx2 kernel (the one a CPU with AVX2 and no GFNI or AVX-512 takes, such as an i9-10850K) gains 2.2 to 2.8 times at 1 MiB and 2.4 to
+3.5 times at 4 MiB, ssse3 1.5 to 2.3 times. That CPU was not measured: the same code runs there (test_rs passes as
+that CPU under qemu, `tests/distro/sandybridge.sh`), but its speed per clock will be lower than this table's avx2
+column. The avx2 loop is bound by its 8 vpshufb per source vector of a 4-output group and by the front end, not by
+loads, and the Skylake family runs vpshufb ymm on one port and allocates 4 micro-ops a cycle, where the i5's P-core
+has two ports and 6. At 4 MiB it is whatever its memory gives one core.

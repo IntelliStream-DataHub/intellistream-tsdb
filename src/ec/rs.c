@@ -139,21 +139,47 @@ const uint8_t *iso_rs_matrix_row(const iso_rs *rs, unsigned shard)
 	return &rs->gen[shard * rs->k];
 }
 
+/* ------------------------------------------------------------------ the sums
+ *
+ * Encode, and every kind of decode, is one thing: m outputs, each the sum over k sources of a
+ * coefficient times the source (a matrix times k vectors). iso_gf256_dot() does it with the sources
+ * read once per group of four outputs and the outputs written once and never read; this function
+ * cuts the shard into tiles and gives it a tile at a time.
+ *
+ * The tile is what keeps that true when a group is not all of m. The library's m is at most four,
+ * one group, and then every source byte is read once whatever the tile; but a dot kernel makes a
+ * pass over its range for every group of four outputs, so a caller with more outputs than that
+ * (the kernels take any m) and a shard that does not fit in cache would read every source from
+ * memory once per group. A tile of ISO_RS_TILE bytes of each of k <= 16 sources is at most
+ * 16 * 8 KiB = 128 KiB, half of the smallest L2 the codec runs on (256 KiB, Skylake client), so
+ * the second group finds the first one's sources in L2. It is also far more than a call costs
+ * (a few dozen ns against 10 us for a tile of 16 sources), so the tiling is not measurable in the
+ * rest. A multiple of 128 bytes, the widest step of any kernel, so only the last tile of a shard
+ * has a tail, and a power of two, so every tile of an aligned shard is aligned.
+ */
+static void rs_sums(unsigned m, unsigned k, uint8_t *const *out, const uint8_t *const *in,
+		    const uint8_t *coef, size_t len)
+{
+	if (m == 0)
+		return;
+	for (size_t off = 0; off < len; off += ISO_RS_TILE) {
+		size_t n = len - off < ISO_RS_TILE ? len - off : ISO_RS_TILE;
+		iso_gf256_dot(out, m, in, k, coef, off, n);
+	}
+}
+
 /* ------------------------------------------------------------------ encode */
 
 void iso_rs_encode(const iso_rs *rs, uint8_t *const *shards, size_t shard_len)
 {
 	unsigned k = rs->k, m = rs->m;
 
-	for (unsigned i = 0; i < m; i++) {
-		const uint8_t *row = &rs->gen[(k + i) * k];
-		uint8_t *out = shards[k + i];
-
-		/* mul_set for the first term avoids a separate memset of the output shard. */
-		iso_gf256_mul_set(out, shards[0], shard_len, row[0]);
-		for (unsigned j = 1; j < k; j++)
-			iso_gf256_mul_add(out, shards[j], shard_len, row[j]);
-	}
+	/* The k x m part of the generator below the identity is m rows of k, which is the matrix of
+	 * the sums; the sources are the data shards, as read-only pointers. */
+	const uint8_t *in[ISO_RS_MAX_K];
+	for (unsigned j = 0; j < k; j++)
+		in[j] = shards[j];
+	rs_sums(m, k, shards + k, in, &rs->gen[k * k], shard_len);
 }
 
 /* ------------------------------------------------------------------ plans */
@@ -230,14 +256,13 @@ void iso_rs_plan_apply(const iso_rs_plan *plan, uint8_t *const *shards, size_t s
 {
 	unsigned k = plan->k;
 
-	for (unsigned o = 0; o < plan->nout; o++) {
-		const uint8_t *coef = &plan->coef[o * k];
-		uint8_t *out = shards[plan->out[o]];
-
-		iso_gf256_mul_set(out, shards[plan->src[0]], shard_len, coef[0]);
-		for (unsigned j = 1; j < k; j++)
-			iso_gf256_mul_add(out, shards[plan->src[j]], shard_len, coef[j]);
-	}
+	const uint8_t *in[ISO_RS_MAX_K];
+	uint8_t *out[ISO_RS_MAX_SHARDS];
+	for (unsigned j = 0; j < k; j++)
+		in[j] = shards[plan->src[j]];
+	for (unsigned o = 0; o < plan->nout; o++)
+		out[o] = shards[plan->out[o]];
+	rs_sums(plan->nout, k, out, in, plan->coef, shard_len);
 }
 
 /* ------------------------------------------------------------------ decode */

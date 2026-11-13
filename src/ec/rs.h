@@ -34,6 +34,15 @@
 #define ISO_RS_MAX_M 4
 #define ISO_RS_MAX_SHARDS (ISO_RS_MAX_K + ISO_RS_MAX_M)
 
+/* Encode and decode work on a shard in column tiles of this many bytes (the last one shorter), each
+ * tile through every output before the next: see the comment above rs_sums() in rs.c for why this
+ * size. A multiple of 128, the widest step of any GF(256) kernel. Public so the tests can put shard
+ * lengths on both sides of a tile edge; a build may give another with -DISO_RS_TILE=. */
+#ifndef ISO_RS_TILE
+#define ISO_RS_TILE (8u * 1024u)
+#endif
+ISO_STATIC_ASSERT(ISO_RS_TILE % 128 == 0, "a tile is a whole number of the widest kernel's steps");
+
 typedef struct iso_rs iso_rs;
 
 /* Build a codec for k data and m parity shards. Returns NULL when k or m is out of range.

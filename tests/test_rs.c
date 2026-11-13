@@ -595,7 +595,7 @@ int main(int argc, char **argv)
         check_level_caps(level, ks, nk);
         check_best_kernel(level);
         if (!strcmp(mutant, "kernel") || !strcmp(mutant, "guard"))
-            ks[nk++] = (iso_gf256_kernel){"planted", planted_kernel, true, 1};
+            ks[nk++] = (iso_gf256_kernel){"planted", planted_kernel, true, 1, NULL};
         for (size_t ki = 0; ki < nk; ki++) {
             if (!ks[ki].available)
                 continue;
