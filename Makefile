@@ -95,8 +95,10 @@ EC_BENCH := $(B)/ec-bench
 override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
+# -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
+# make tsan, make asan) needs it; the dist build's x86-64-v2 has it already.
 $(B)/ec_%.o: src/ec/%.c $(EC_HDR) src/internal.h | $(B)
-	$(CC) $(CFLAGS) -Isrc/ec/compat -DISO_GF256_NO_BOOT -c -o $@ $<
+	$(CC) $(CFLAGS) -mssse3 -Isrc/ec/compat -DISO_GF256_NO_BOOT -c -o $@ $<
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
