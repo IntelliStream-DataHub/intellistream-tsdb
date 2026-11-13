@@ -324,6 +324,8 @@ static void unlink_due(eng *db)
 {
     struct replica *rp = db->rp;
     uint64_t floor = atomic_load(&rp->floor_saved);
+    if (eng_test_mutant == MUT_REPLICA_NO_FLOOR) /* planted: a segment goes before the floor is saved */
+        floor = UINT64_MAX - 1;
     uint64_t seqs[64];
     for (;;) {
         size_t n = 0;
@@ -600,6 +602,8 @@ int replica_apply(eng *db, uint64_t commit)
     struct replica *rp = db->rp;
     if (!rp)
         return TSDB_ERR_INVALID;
+    if (eng_test_mutant == MUT_REPLICA_APPLY_ALL) /* planted: apply above the commit point */
+        commit = UINT64_MAX;
     pthread_mutex_lock(&rp->mu);
     int rc = replica_apply_locked(db, rp, commit);
     pthread_mutex_unlock(&rp->mu);
@@ -699,6 +703,8 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
     if (rc == 0) {
         db->wal_off += len;
         db->fno_next = next;
+        if (eng_test_mutant == MUT_REPLICA_ACK_UNSYNCED) /* planted: acknowledge what is not synced */
+            rp->durable_next = next;
         pthread_mutex_lock(&rp->segs_mu);
         rseg *s = &rp->segs[rp->nsegs - 1];
         if (!s->first)
@@ -752,8 +758,10 @@ int replica_cut(eng *db, uint64_t last)
     if (!rp)
         return TSDB_ERR_INVALID;
     pthread_mutex_lock(&rp->mu);
+    pthread_mutex_lock(&db->flush_lock); /* a flush unlinks segments and edits the list: the cut sees one list */
     int rc = eng_check(db);
     if (rc == 0 && last + 1 == db->fno_next) { /* nothing above it */
+        pthread_mutex_unlock(&db->flush_lock);
         pthread_mutex_unlock(&rp->mu);
         return 0;
     }
@@ -813,6 +821,12 @@ int replica_cut(eng *db, uint64_t last)
         fprintf(stderr, "tsdb: %s: position %" PRIu64 " is not a record end of the retained log: the cut is refused\n",
                 db->dir, last);
         rc = TSDB_ERR_CORRUPT;
+    }
+    if (rc == 0 && eng_test_mutant == MUT_REPLICA_KEEP_CUT) { /* planted: a cut that changes nothing on disk */
+        free(ss);
+        pthread_mutex_unlock(&db->flush_lock);
+        pthread_mutex_unlock(&rp->mu);
+        return 0;
     }
     /* newest first: a crash in the middle leaves a prefix of the log, never a gap */
     bool removed = false;
@@ -887,6 +901,7 @@ int replica_cut(eng *db, uint64_t last)
         rp->rd_seq = 0;
     }
     free(ss);
+    pthread_mutex_unlock(&db->flush_lock);
     pthread_mutex_unlock(&rp->mu);
     return rc;
 }

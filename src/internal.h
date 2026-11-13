@@ -50,7 +50,8 @@ typedef struct eng eng;
 /* Planted mutations: a test sets eng_test_mutant (tests link the engine) and must then fail, to show that it
  * catches the bug; nothing in the library or the server ever sets it. */
 enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR,
-       MUT_FLUSH_NOCLOSE };
+       MUT_FLUSH_NOCLOSE,
+       MUT_REPLICA_APPLY_ALL, MUT_REPLICA_ACK_UNSYNCED, MUT_REPLICA_KEEP_CUT, MUT_REPLICA_NO_FLOOR };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
