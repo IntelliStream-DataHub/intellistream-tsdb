@@ -145,6 +145,14 @@ static void run(void)
     CHECK(cmd("hang", dir_a, NULL) == 0);
     pthread_t th;
     pthread_create(&th, NULL, hung_writer, NULL);
+    /* until the writer is in the hang (the shim counts it: hung=1): a thread that waits for a CPU for 300 ms (a load average of 150) has
+     * not made its call yet, and a fixed sleep read "hung=0" there */
+    char out[512];
+    for (int w = 0; w < 2000; w++) {
+        if (outagefs_cmd(ctl, "state", out, sizeof out) == 0 && strstr(out, "hung=1"))
+            break;
+        sleep_ms(10);
+    }
     sleep_ms(300);
     CHECK(atomic_load(&hung_done) == 0);
     /* the sibling's write returns while the hang is still in force (the hung call ends only at heal): that it
@@ -152,7 +160,6 @@ static void run(void)
      * ends in the watchdog) */
     put(pb, "still going");
     CHECK(atomic_load(&hung_done) == 0);
-    char out[512];
     CHECK(outagefs_cmd(ctl, "state", out, sizeof out) == 0);
     CHECK(strstr(out, "hang") && strstr(out, "hung=1"));
     CHECK(cmd("heal", dir_a, NULL) == 0);
