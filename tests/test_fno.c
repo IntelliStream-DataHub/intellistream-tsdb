@@ -602,6 +602,7 @@ static int sync_far(const char *dir, eng **db)
     o.merge_threads = 0;
     o.create_volumes = 0;
     o.buffer_rows = 1u << 24; /* no flush: the segment stays */
+    o.flush_interval_ms = 3600000; /* nor by age (5 s by default: a test that waited that long for a CPU read a directory of parts, no segment) */
     o.wal_sync_ms = 3600000; /* nothing syncs behind the test's back: the buffer holds what the calls appended */
     return eng_open(dir, &o, db);
 }
@@ -733,13 +734,16 @@ typedef struct racer {
     int64_t t0;
     atomic_bool *stop;
     uint64_t n; /* rows appended */
+    atomic_bool begun; /* the first row is in: a thread that waits for a CPU (a machine with a load average of 70) has not raced with anything yet */
 } racer;
 
 static void *racer_run(void *arg)
 {
     racer *r = arg;
-    while (!atomic_load(r->stop) && r->n < 400000)
+    while (!atomic_load(r->stop) && r->n < 400000) {
         rows(r->db, r->series, r->t0 + (int64_t)r->n++, 1);
+        atomic_store(&r->begun, true);
+    }
     return NULL;
 }
 
@@ -814,6 +818,25 @@ static void test_wal_split(void)
     printf("  a rows record that reaches its cap is closed: the buffer parses and a reopen has every row\n");
 }
 
+/* sync_far keeps its segment: a memtable that is older than flush_interval_ms is flushed and its segment removed, which a
+ * test thread that waits for a CPU for that long (a load average of 70) found out as a missing wal_0000000000000001.log. */
+static void test_sync_far_stays(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("syncfar", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(sync_far(dir, &db) == 0);
+    CHECK(eng_series(db, "a", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 1);
+    sleep(6); /* the engine's own interval is 5 s */
+    wal_flush_now(db);
+    rec r[2];
+    CHECK(read_records(dir, r, 2) == 1);
+    CHECK(eng_close(db) == 0);
+    printf("  a segment opened by sync_far is still there when the memtable is older than the default flush interval\n");
+}
+
 static void test_wal_races(void)
 {
     char dir[PATH_MAX + 32];
@@ -828,9 +851,14 @@ static void test_wal_races(void)
         char name[16];
         snprintf(name, sizeof name, "s%d", i);
         CHECK(eng_series(db, name, TSDB_FLOAT32, &s[i]) == 0);
-        rc[i] = (racer){db, s[i], T0 + i * 100000000LL, &stop, 0};
+        rc[i] = (racer){db, s[i], T0 + i * 100000000LL, &stop, 0, false};
         pthread_create(&th[i], NULL, racer_run, &rc[i]);
     }
+    /* the markers go in only once every racer has appended: threads that never got a CPU in the time 600 markers take left a file of
+     * the markers alone (k == 600, "k > 600" failed once in a make test under a load average of 70) and nothing to race with */
+    for (int i = 0; i < 3; i++)
+        for (int w = 0; w < 30000 && !atomic_load(&rc[i].begun); w++)
+            usleep(1000);
     for (int i = 0; i < 600; i++)
         marker(db, 1);
     atomic_store(&stop, true);
@@ -1040,6 +1068,7 @@ int main(int argc, char **argv)
         test_wal_split();
         test_wal_flush_tail();
         test_wal_races();
+        test_sync_far_stays();
         if (!mutant) {
             test_slots();
             test_damaged_newest();
