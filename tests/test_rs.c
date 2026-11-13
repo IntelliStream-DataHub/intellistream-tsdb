@@ -554,6 +554,10 @@ int main(int argc, char **argv)
     wrong_input_is_not_detected();
 
     int start = cpu_level();
+    {   /* the state the process starts in (cpu_pick: TSDB_CPU=v2 on a SandyBridge, say) already obeys its level */
+        iso_gf256_kernel ks0[ISO_GF256_MAX_KERNELS + 1];
+        check_level_caps(start, ks0, iso_gf256_kernels(ks0));
+    }
     unsigned configs = 0;
     for (int level = CPU_BASE; level <= cpu_level_max(); level++) {
         if (cpu_set_level(level) != 0)

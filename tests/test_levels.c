@@ -28,6 +28,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifdef TSDB_EC
+#include "ec/compat.h"
+#include "ec/gf256.h"
+#include "ec/rs.h"
+#endif
+
 static int failures;
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -998,8 +1004,59 @@ static void rounding_modes(codec_ctx *c)
     free(ref);
 }
 
+#ifdef TSDB_EC
+/* the erasure codec (src/ec) at this level: the parity of fixed data (8+4, a length that leaves every vector kernel a
+ * tail), and the data rebuilt from the loss of four shards, must be the same bytes at every level, and the kernel the
+ * level picked must be one it may run (the exhaustive checks are tests/test_rs.c) */
+static void ec_parity(rec *r)
+{
+    enum { K = 8, M = 4, LEN = 4096 + 77 };
+    static uint8_t sh[K + M][LEN + 64], keep[K][LEN];
+    uint8_t *p[K + M];
+    bool present[K + M];
+    uint64_t x = 0x9e3779b97f4a7c15ull;
+    for (int i = 0; i < K + M; i++) {
+        p[i] = sh[i] + 3 * (i & 1); /* some unaligned */
+        for (int j = 0; j < LEN; j++) {
+            x = x * 6364136223846793005ull + 1442695040888963407ull;
+            p[i][j] = i < K ? (uint8_t)(x >> 56) : 0;
+        }
+        present[i] = true;
+    }
+    iso_rs *rs = iso_rs_new(K, M);
+    iso_rs_encode(rs, p, LEN);
+    char what[64];
+    snprintf(what, sizeof what, "ec 8+4 parity");
+    for (int i = K; i < K + M; i++)
+        put(r, what, "ec", p[i], LEN);
+    for (int i = 0; i < K; i++)
+        memcpy(keep[i], p[i], LEN);
+    for (int i = 0; i < M; i++) { /* lose one shard in each corner of the data, wipe it, decode */
+        int gone = (i * 3) % K;
+        present[gone] = false;
+        memset(p[gone], 0xa5, LEN);
+    }
+    CHECK(iso_rs_decode(rs, p, present, LEN) == ISO_OK);
+    for (int i = 0; i < K; i++)
+        CHECK(memcmp(p[i], keep[i], LEN) == 0);
+    snprintf(what, sizeof what, "ec 8+4 decode");
+    for (int i = 0; i < K; i++)
+        put(r, what, "ec", p[i], LEN);
+    iso_rs_free(rs);
+    const char *k = iso_gf256_impl();
+    int lv = cpu_level();
+    if (lv < CPU_V3)
+        CHECK(!strcmp(k, "ssse3") || !strcmp(k, "scalar"));
+    if (lv < CPU_V4)
+        CHECK(strncmp(k, "avx512", 6) != 0 && strcmp(k, "gfni512") != 0);
+}
+#endif
+
 static void run(rec *r, codec_ctx *c)
 {
+#ifdef TSDB_EC
+    ec_parity(r);
+#endif
     crafted_sums(r);
     crafted_f64_decimal(r);
     crafted_unpack(r);

@@ -873,8 +873,8 @@ $(B)/test_delete: tests/test_delete.c src/internal.h $(LIB)
 $(B)/test_rs: tests/test_rs.c src/internal.h $(EC_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
 
-$(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels.h $(LIB)
-	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+$(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels.h $(EC_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS)
 
 # links against libtsdb.so, as the embedded bindings do; run with LD_LIBRARY_PATH=$(B)
 $(B)/test_compat: tests/test_compat.c src/compat.h tests/portable.h
