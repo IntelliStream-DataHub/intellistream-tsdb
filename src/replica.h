@@ -46,6 +46,8 @@ int replica_cut(struct eng *db, uint64_t last);
  * whole records of one segment, at most cap bytes unless the first one is larger (then it alone). *seq and *off say
  * where they lie, *last the last position covered. TSDB_ERR_NOTFOUND: the log no longer holds `from` (it is in
  * parts: a snapshot is needed). For a sender (catch-up, tests). A record the buffer cannot take is returned alone. */
+extern size_t replica_read_win_min; /* test hook */
+extern void (*replica_test_sync_hook)(struct eng *db); /* test hook: between a sync's fdatasync and its bookkeeping */
 int replica_read(struct eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
                  uint64_t *last);
 

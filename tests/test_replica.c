@@ -30,12 +30,15 @@
 #define _GNU_SOURCE
 #include "replica.h"
 #include "marker.h"
+#include "feed.h"
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,6 +68,7 @@ static int failures;
 #define NS 2    /* series */
 #define NT 64   /* distinct times per series (a day holds them: one partition) */
 static char S[PATH_MAX - 64], SELF[PATH_MAX];
+static const char *MUTNAME;
 
 static int sh(const char *fmt, ...)
 {
@@ -366,6 +370,178 @@ static void case_basic(void)
     leader_free(&l);
 }
 
+/* ------------------------------------------------------------ read */
+
+/* the sender's side: the log read back in chunks gives exactly the bytes that were appended, at every chunk size and
+ * window size, from every record start, and in a cost that follows what is sent (the cursor) */
+static void case_read(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "rd");
+    leader l;
+    unsigned rng = 11;
+    leader_init(&l);
+    for (int i = 0; i < 12; i++)
+        leader_rows(&l, 1 + i % 16, &rng);
+    leader_roll(&l);
+    for (int i = 0; i < 12; i++)
+        leader_rows(&l, 1 + (i * 5) % 16, &rng);
+    leader_roll(&l);
+    for (int i = 0; i < 6; i++)
+        leader_rows(&l, 16, &rng);
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    uint64_t end = replica_log_end(db);
+    size_t caps[] = {1, 200, 1000, 5000, 1 << 20};
+    size_t wins[] = {16, 100, 65536};
+    for (size_t wi = 0; wi < 3; wi++)
+        for (size_t ci = 0; ci < 5; ci++) {
+            replica_read_win_min = wins[wi];
+            size_t ri = 0; /* the next record of the leader's list */
+            uint64_t from = 1;
+            int guard = 0;
+            while (from <= end && guard++ < 1000) {
+                uint8_t *buf;
+                size_t len;
+                uint64_t seq, off, last;
+                int rc = replica_read(db, from, &buf, &len, caps[ci], &seq, &off, &last);
+                CHECK_EQ(rc, 0);
+                if (rc != 0)
+                    break;
+                size_t used = 0;
+                CHECK(len > 0);
+                while (used < len && ri < l.n) {
+                    CHECK(l.r[ri].seq == seq && l.r[ri].off == off + used);
+                    CHECK(used + l.r[ri].size <= len && memcmp(buf + used, l.r[ri].bytes, l.r[ri].size) == 0);
+                    used += l.r[ri].size;
+                    ri++;
+                }
+                CHECK_EQ(used, len);
+                CHECK(ri > 0 && last == l.r[ri - 1].last);
+                if (caps[ci] >= 200 && len > caps[ci])
+                    CHECK(used == l.r[ri - 1].size); /* only a single record may exceed the cap */
+                free(buf);
+                from = last + 1;
+            }
+            CHECK_EQ(ri, l.n);
+            CHECK_EQ(from, end + 1);
+        }
+    replica_read_win_min = 65536;
+    /* every record start, cold (no cursor to help) and with a stale cursor */
+    for (size_t i = l.n; i-- > 0;) {
+        uint8_t *buf;
+        size_t len;
+        uint64_t seq, off, last;
+        CHECK_EQ(replica_read(db, l.r[i].fno, &buf, &len, 1, &seq, &off, &last), 0);
+        CHECK(len == l.r[i].size && seq == l.r[i].seq && off == l.r[i].off && last == l.r[i].last);
+        free(buf);
+    }
+    uint8_t *buf;
+    size_t len;
+    uint64_t seq, off, last;
+    CHECK_EQ(replica_read(db, l.r[1].fno + 1, &buf, &len, 100, &seq, &off, &last), TSDB_ERR_INVALID); /* inside a record */
+    CHECK_EQ(replica_read(db, end + 1, &buf, &len, 100, &seq, &off, &last), 0);
+    CHECK_EQ(len, 0);
+    CHECK_EQ(replica_read(db, end + 2, &buf, &len, 100, &seq, &off, &last), TSDB_ERR_INVALID);
+    /* a cut resets the cursor: read again after the log is shortened and grown with other records */
+    CHECK_EQ(replica_cut(db, l.r[l.n - 3].last), 0);
+    CHECK_EQ(replica_read(db, l.r[l.n - 3].last + 1, &buf, &len, 100, &seq, &off, &last), 0);
+    CHECK_EQ(len, 0);
+    CHECK_EQ(eng_close(db), 0);
+    leader_free(&l);
+}
+
+/* ------------------------------------------------------------ sync across a cut, sealed segment after reopen */
+
+static void seg_file(char *out, size_t cap, const char *dir, uint64_t seq);
+static leader *HK_L, *HK_L2;
+static lrec *HK_N1, *HK_N2;
+
+/* in the middle of a sync: a cut and two new records (written, not synced) arrive */
+static void hook_cut_and_append(eng *db)
+{
+    replica_test_sync_hook = NULL;
+    if (replica_cut(db, HK_L->r[1].last) != 0)
+        return;
+    replica_append(db, HK_N1->seq, HK_N1->off, HK_N1->bytes, HK_N1->size);
+    replica_append(db, HK_N2->seq, HK_N2->off, HK_N2->bytes, HK_N2->size);
+}
+
+static void case_sync_cut(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "sc");
+    leader l, l2;
+    unsigned rng = 3, r2 = 9;
+    leader_init(&l);
+    leader_init(&l2);
+    for (int i = 0; i < 4; i++)
+        leader_rows(&l, 3, &rng);
+    unsigned rng2 = 3;
+    for (int i = 0; i < 2; i++) /* the new history: the first two records of the old one (the same bytes), then others */
+        leader_rows(&l2, 3, &rng2);
+    lrec *n1 = leader_rows(&l2, 3, &r2), *n2 = leader_rows(&l2, 3, &r2);
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    HK_L = &l, HK_L2 = &l2, HK_N1 = n1, HK_N2 = n2;
+    replica_test_sync_hook = hook_cut_and_append;
+    CHECK_EQ(replica_sync(db), 0);
+    replica_test_sync_hook = NULL;
+    /* the sync began before the cut: it covers nothing that was written after it */
+    CHECK(replica_durable_end(db) <= l.r[1].last);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_durable_end(db), n2->last);
+    eng_close(db);
+    leader_free(&l);
+    leader_free(&l2);
+}
+
+static void case_sealed_open(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "so");
+    leader l, l2;
+    unsigned rng = 13;
+    leader_init(&l);
+    for (int i = 0; i < 3; i++)
+        leader_rows(&l, 3, &rng);
+    leader_roll(&l);
+    for (int i = 0; i < 3; i++)
+        leader_rows(&l, 3, &rng);
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    uint64_t end = replica_log_end(db), end1 = l.r[2].last;
+    CHECK_EQ(replica_apply(db, end), 0);
+    CHECK_EQ(mt_flush(db), 0); /* segment 1's memtable is in parts now: it is sealed for good */
+    CHECK_EQ(replica_floor_saved(db, end1), 0);
+    CHECK_EQ(eng_close(db), 0);
+    char f2[PATH_MAX];
+    seg_file(f2, sizeof f2, dir, 2);
+    CHECK_EQ(unlink(f2), 0); /* nothing left of the log but the parts' own numbers */
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    /* the next leader's records start in a segment the parts hold a part of: rows there would be skipped by a replay */
+    leader_init(&l2);
+    l2.next = replica_log_end(db) + 1;
+    lrec *r = leader_rows(&l2, 3, &rng);
+    CHECK(replica_append(db, r->seq, r->off, r->bytes, r->size) != 0);
+    eng_close(db);
+    leader_free(&l);
+    leader_free(&l2);
+}
+
 /* ------------------------------------------------------------ B */
 
 static void case_cut(void)
@@ -641,7 +817,7 @@ static int child_main(const char *dir, const char *ackfile)
         if (replica_sync(db) != 0)
             return 4;
         uint64_t d = replica_durable_end(db);
-        char tmp[PATH_MAX + 8];
+        char tmp[PATH_MAX + 32];
         snprintf(tmp, sizeof tmp, "%s.tmp", ackfile);
         FILE *f = fopen(tmp, "w");
         if (!f)
@@ -651,6 +827,14 @@ static int child_main(const char *dir, const char *ackfile)
         rename(tmp, ackfile);
         rng = rng * 1103515245u + 12345u;
     }
+}
+
+/* a signal only to a child we started: kill(-1) and kill(0) reach every process of the user (AGENTS.md) */
+static int kill_child(pid_t pid, int sig)
+{
+    if (pid <= 1)
+        return -1;
+    return kill(pid, sig);
 }
 
 static void case_kill(void)
@@ -665,8 +849,7 @@ static void case_kill(void)
         _exit(9);
     }
     usleep(300 * 1000);
-    if (pid > 0) {
-        kill(pid, SIGKILL);
+    if (kill_child(pid, SIGKILL) == 0) {
         int st;
         waitpid(pid, &st, 0);
     }
@@ -684,6 +867,21 @@ static void case_kill(void)
         CHECK(replica_log_end(db) >= acked);
         CHECK_EQ(replica_apply(db, acked), 0);
         CHECK_EQ(replica_applied_end(db) <= acked, true);
+        /* the child's leader is deterministic (rng 5): what the replica holds at the acknowledged position is that
+         * history's rows, not merely some log of that length */
+        leader l;
+        unsigned rng = 5;
+        leader_init(&l);
+        while (l.next <= acked) {
+            if ((rng >> 4) % 9 == 0)
+                leader_roll(&l);
+            leader_rows(&l, 3, &rng);
+            rng = rng * 1103515245u + 12345u;
+        }
+        model m;
+        model_at(&l, replica_applied_end(db), &m);
+        CHECK(same_as(db, &m, "F: after kill -9"));
+        leader_free(&l);
         eng_close(db);
     }
 }
@@ -1017,20 +1215,550 @@ static void case_classes(void)
     leader_free(&l);
 }
 
-int main(int argc, char **argv)
+/* ------------------------------------------------------------ J..O: what the review of steps 1-2 found */
+
+static void seg_file(char *out, size_t cap, const char *dir, uint64_t seq)
 {
-    int a = 1;
-    if (argc >= 4 && strcmp(argv[1], "--child") == 0)
-        return child_main(argv[2], argv[3]);
-    if (a + 1 < argc && strcmp(argv[a], "--mutant") == 0) {
-        const char *m = argv[a + 1];
-        eng_test_mutant = strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
+    snprintf(out, cap, "%s/wal_%016" PRIx64 ".log", dir, seq);
+}
+
+/* J: the open refuses a log with a hole, cuts a torn tail so appends land at the valid end, refuses a floor beyond the
+ * log, and the apply itself refuses what the open cannot see (a gap inside a segment) and what is not durable. */
+static void case_open_checks(void)
+{
+    char dir[PATH_MAX], p[PATH_MAX + 64];
+    leader l;
+    unsigned rng = 4;
+    eng *db;
+    fresh(dir, "j1");
+    leader_init(&l);
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        leader_roll(&l);
+    }
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    uint64_t end = l.r[l.n - 1].last;
+    /* the commit point may be anywhere, the replica applies nothing that is not durable: segments 1 and 2 were synced
+     * at their rotations, segment 3 was not */
+    CHECK_EQ(replica_apply(db, end), 0);
+    CHECK_EQ(replica_applied_end(db), l.r[5].last);
+    eng_close(db);
+    /* the bytes were never synced (a process kill leaves them in the page cache): the open syncs every segment before
+     * it claims their positions, or a power loss takes what the driver was told is durable */
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (db) {
+        CHECK_EQ(replica_durable_end(db), end);
+        CHECK(atomic_load(&db->st_wal_syncs) >= 3);
+        eng_close(db);
+    }
+    /* a floor beyond the log */
+    CHECK_EQ(open_replica(dir, end + 5, &db) != 0, true);
+    /* segment 2 gone: positions 13..24 are missing, the open must not claim them */
+    seg_file(p, sizeof p, dir, 2);
+    CHECK_EQ(unlink(p), 0);
+    CHECK_EQ(open_replica(dir, 0, &db), TSDB_ERR_CORRUPT);
+    leader_free(&l);
+
+    /* a torn tail is cut: the next append lands at the valid end */
+    fresh(dir, "j2");
+    leader_init(&l);
+    rng = 8;
+    for (int i = 0; i < 4; i++)
+        leader_rows(&l, 3, &rng);
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    eng_close(db);
+    seg_file(p, sizeof p, dir, 1);
+    FILE *f = fopen(p, "ab");
+    CHECK(f != NULL);
+    if (f) {
+        fwrite("\x07garbage", 1, 8, f);
+        fclose(f);
+    }
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (db) {
+        CHECK_EQ(replica_log_end(db), l.r[3].last);
+        lrec *r = leader_rows(&l, 3, &rng);
+        CHECK_EQ(replica_append(db, r->seq, r->off, r->bytes, r->size), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        eng_close(db);
+        CHECK_EQ(open_replica(dir, 0, &db), 0);
+        if (db) {
+            CHECK_EQ(replica_log_end(db), r->last);
+            CHECK_EQ(replica_apply(db, r->last), 0);
+            model m;
+            model_at(&l, r->last, &m);
+            CHECK(same_as(db, &m, "J: after a torn tail and an append"));
+            eng_close(db);
+        }
+    }
+    leader_free(&l);
+
+    /* a gap inside a segment (a record of the right seal for its place, but the numbers skip): the apply refuses */
+    fresh(dir, "j3");
+    leader_init(&l);
+    rng = 9;
+    lrec *a = leader_rows(&l, 3, &rng);
+    leader_rows(&l, 3, &rng); /* skipped */
+    lrec *c = leader_rows(&l, 3, &rng);
+    uint8_t *cb = malloc(c->size);
+    memcpy(cb, c->bytes, c->size);
+    wal_reseal(cb, 1, a->size); /* where the leader's record B would have been */
+    seg_file(p, sizeof p, dir, 1);
+    f = fopen(p, "wb");
+    CHECK(f != NULL);
+    if (f) {
+        fwrite(a->bytes, 1, a->size, f);
+        fwrite(cb, 1, c->size, f);
+        fclose(f);
+    }
+    free(cb);
+    int rc = open_replica(dir, 0, &db);
+    if (rc == 0) {
+        CHECK_EQ(replica_apply(db, c->last), TSDB_ERR_CORRUPT);
+        eng_close(db);
+    }
+    leader_free(&l);
+}
+
+/* K: sealing. The old segment's memtable is sealed by the first COMMITTED record of the next segment, not by an
+ * uncommitted one: a cut at the end of the old segment must still let a new leader continue it. */
+static void case_seal(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "k");
+    leader l, l2;
+    unsigned rng = 6, r2 = 6;
+    leader_init(&l);
+    leader_init(&l2);
+    for (int i = 0; i < 3; i++)
+        leader_rows(&l, 4, &rng);
+    leader_roll(&l);
+    leader_rows(&l, 4, &rng); /* the first record of segment 2: never committed */
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    uint64_t c = l.r[2].last;
+    CHECK_EQ(replica_apply(db, c), 0);
+    CHECK_EQ(replica_cut(db, c), 0);
+    /* the new leader had only segment 1 and continues it */
+    for (int i = 0; i < 3; i++)
+        leader_rows(&l2, 4, &r2);
+    lrec *nr = leader_rows(&l2, 2, &r2);
+    CHECK_EQ(replica_append(db, nr->seq, nr->off, nr->bytes, nr->size), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, nr->last), 0);
+    model m;
+    model_at(&l2, nr->last, &m);
+    CHECK(same_as(db, &m, "K: the new leader's history"));
+    eng_close(db);
+    leader_free(&l);
+    leader_free(&l2);
+}
+
+/* L: replaying a segment must not put back rows that parts of a later segment overwrote (they rank above parts). */
+static void case_replay_skip(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "l");
+    leader l;
+    leader_init(&l);
+    int64_t t0 = T0;
+    lrec *r1 = leader_row1(&l, 0, t0, 1.0f, T0 + 1);
+    lrec *r2 = leader_row1(&l, 0, t0 + 5000, 5.0f, T0 + 2);
+    leader_roll(&l);
+    leader_row1(&l, 0, t0, 2.0f, T0 + 3); /* segment 2 overwrites t0 */
+    leader_roll(&l);
+    lrec *r4 = leader_row1(&l, 0, t0 + 9000, 9.0f, T0 + 4);
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, r4->last), 0);
+    CHECK_EQ(mt_flush(db), 0); /* segments 1 and 2 are parts; the floor was never saved: the segments stay */
+    float v = 0;
+    CHECK_EQ(count_query(db, 0, T0 - 1000, T0 + 1000, &v), 1);
+    CHECK(v == 2.0f);
+    CHECK_EQ(eng_close(db), 0);
+    /* the restart's floor lies inside segment 1: only its first record is replayed, and it must not win */
+    CHECK_EQ(open_replica(dir, r1->last, &db), 0);
+    if (db) {
+        CHECK_EQ(count_query(db, 0, T0 - 1000, T0 + 1000, &v), 1);
+        CHECK(v == 2.0f);
+        CHECK_EQ(replica_apply(db, r4->last), 0);
+        CHECK_EQ(count_query(db, 0, T0 - 1000, T0 + 10000, &v), 3);
+        CHECK(r2->last > r1->last);
+        eng_close(db);
+    }
+    leader_free(&l);
+}
+
+/* M: the retention clock is the NOW markers, never the commit_ms of a record. */
+static void case_clock_source(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "m");
+    leader l;
+    unsigned rng = 5;
+    leader_init(&l);
+    for (int i = 0; i < 6; i++)
+        leader_rows(&l, 5, &rng);
+    lrec *rt = m_ret(&l, 0, 20000, 0);
+    lrec *n1 = m_now(&l, T0 + 30000);
+    lrec *big = leader_row1(&l, 0, T0 + 64000, 7.0f, T0 + 3600000); /* its commit_ms is an hour ahead of the clock */
+    lrec *n2 = m_now(&l, T0 + 3600000);
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, n1->last), 0);
+    CHECK_EQ(eng_now_ms(db), T0 + 30000);
+    (void)rt;
+    int n0 = count_query(db, 0, T0 - 1000, T0 + 65000, NULL);
+    CHECK(n0 > 0);
+    CHECK_EQ(replica_apply(db, big->last), 0);
+    CHECK_EQ(eng_now_ms(db), T0 + 30000); /* a record's commit_ms does not move the clock */
+    CHECK_EQ(count_query(db, 0, T0 - 1000, T0 + 65000, NULL), n0 + 1);
+    CHECK_EQ(replica_apply(db, n2->last), 0);
+    CHECK_EQ(eng_now_ms(db), T0 + 3600000);
+    CHECK_EQ(count_query(db, 0, T0 - 1000, T0 + 65000, NULL), 0); /* 20 s of retention, an hour later */
+    eng_close(db);
+    leader_free(&l);
+}
+
+/* N: a committed record is visible whole or not at all. */
+typedef struct rd {
+    eng *db;
+    _Atomic int stop;
+    _Atomic int bad, seen;
+} rd;
+
+static int rd_fn(void *c, const int64_t *ts, const void *vals, size_t n)
+{
+    struct {
+        float first;
+        int have;
+        rd *r;
+    } *x = c;
+    (void)ts;
+    const float *f = vals;
+    for (size_t i = 0; i < n; i++) {
+        if (!x->have)
+            x->first = f[i], x->have = 1;
+        else if (f[i] != x->first)
+            atomic_fetch_add(&x->r->bad, 1);
+    }
+    return 0;
+}
+
+static void *rd_thread(void *a)
+{
+    rd *r = a;
+    while (!atomic_load(&r->stop)) {
+        struct {
+            float first;
+            int have;
+            rd *r;
+        } x = {0, 0, r};
+        eng_query_raw_ex(r->db, 0, T0, T0 + 10000000, false, 0, rd_fn, &x);
+        atomic_fetch_add(&r->seen, 1);
+    }
+    return NULL;
+}
+
+static void case_atomic(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "n");
+    enum { ROWS = 3000, RECS = 40 };
+    leader l;
+    leader_init(&l);
+    for (int k = 0; k < RECS; k++) { /* every record rewrites the same ROWS keys with its own value */
+        lrec *r = leader_rows(&l, 1, &(unsigned){1});
+        free(r->bytes);
+        r->n = 0;
+        r->size = WAL_HDR + (size_t)ROWS * WAL_ROW;
+        r->bytes = calloc(1, r->size);
+        r->last = r->fno + ROWS - 1;
+        l.next = r->fno + ROWS;
+        l.off = r->off + r->size;
+        uint32_t w = (uint32_t)ROWS | (uint32_t)WAL_KIND_ROWS << 28;
+        memcpy(r->bytes, &w, 4);
+        memcpy(r->bytes + 16, &r->fno, 8);
+        int64_t cms = T0 + 1;
+        memcpy(r->bytes + 24, &cms, 8);
+        for (int i = 0; i < ROWS; i++) {
+            uint8_t *p = r->bytes + WAL_HDR + (size_t)i * WAL_ROW;
+            uint32_t id = 0;
+            int64_t ts = T0 + (int64_t)i * 1000;
+            uint64_t slot = 0;
+            float v = (float)(k + 1);
+            memcpy(&slot, &v, 4);
+            memcpy(p, &id, 4);
+            memcpy(p + 4, &ts, 8);
+            memcpy(p + 12, &slot, 8);
+        }
+        wal_reseal(r->bytes, r->seq, r->off);
+    }
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    rd r = {.db = db};
+    pthread_t th;
+    CHECK_EQ(pthread_create(&th, NULL, rd_thread, &r), 0);
+    for (size_t i = 0; i < l.n; i++)
+        CHECK_EQ(replica_apply(db, l.r[i].last), 0);
+    atomic_store(&r.stop, 1);
+    pthread_join(th, NULL);
+    CHECK_EQ(atomic_load(&r.bad), 0);
+    CHECK(atomic_load(&r.seen) > 0);
+    eng_close(db);
+    leader_free(&l);
+}
+
+/* O: a volume with a change feed is refused (retained segments are not designed for a replica yet). */
+static void case_feed_refused(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "o");
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    eng *db;
+    CHECK_EQ(eng_open(dir, &o, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(eng_feed_enable(db, NULL), 0);
+    eng_close(db);
+    CHECK_EQ(open_replica(dir, 0, &db), TSDB_ERR_INVALID);
+}
+
+/* P: power lost at every step of a replica that appends, syncs, closes and reopens (a process kill), and cuts: what it
+ * acknowledged (durable_end) is on disk afterwards, and the log opens (nothing damaged, nothing missing). */
+static char SHIM[PATH_MAX + 32];
+
+static void write_ack(const char *ackfile, uint64_t v)
+{
+    char tmp[PATH_MAX + 32];
+    snprintf(tmp, sizeof tmp, "%s.tmp", ackfile);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return;
+    fprintf(f, "%" PRIu64 "\n", v);
+    fclose(f);
+    rename(tmp, ackfile);
+}
+
+static int power_child(const char *dir, const char *ackfile)
+{
+    leader l;
+    unsigned rng = 11;
+    leader_init(&l);
+    eng *db;
+    char hi[PATH_MAX + 8]; /* the highest position the child's history can hold: written before every append, lowered after a cut */
+    snprintf(hi, sizeof hi, "%s.hi", ackfile);
+    if (open_replica(dir, 0, &db) != 0)
+        return 2;
+    for (int round = 0; round < 16; round++) {
+        for (int k = 0; k < 3; k++) {
+            rng = rng * 1103515245u + 12345u;
+            if ((rng >> 12) % 3 == 0)
+                leader_roll(&l);
+            lrec *r = leader_rows(&l, 3, &rng);
+            write_ack(hi, r->last);
+            if (replica_append(db, r->seq, r->off, r->bytes, r->size) != 0)
+                return 3;
+        }
+        switch (round % 4) {
+        case 0: /* a sync, then the acknowledgement */
+            if (replica_sync(db) != 0)
+                return 4;
+            write_ack(ackfile, replica_durable_end(db));
+            break;
+        case 1: /* the process dies and restarts (the page cache keeps the bytes): the open's durable end is claimed */
+            if (eng_close(db) != 0 || open_replica(dir, 0, &db) != 0)
+                return 5;
+            write_ack(ackfile, replica_durable_end(db));
+            break;
+        case 2: { /* a cut inside the unsynced tail, then the acknowledgement of what stays */
+            size_t j = l.n - 2;
+            uint64_t last = l.r[j].last;
+            if (last < replica_durable_end(db))
+                write_ack(ackfile, last); /* the positions above it are given up before the cut */
+            if (replica_cut(db, last) != 0)
+                return 6;
+            for (size_t i = j + 1; i < l.n; i++)
+                free(l.r[i].bytes);
+            l.n = j + 1;
+            l.seq = l.r[j].seq;
+            l.off = l.r[j].off + l.r[j].size;
+            l.next = last + 1;
+            write_ack(hi, last); /* what was above the cut is gone from the history: from here nothing of it may reappear */
+            write_ack(ackfile, replica_durable_end(db));
+            break;
+        }
+        default: /* rows written without a sync, then a sync that covers every segment */
+            if (replica_sync(db) != 0)
+                return 4;
+            write_ack(ackfile, replica_durable_end(db));
+            break;
+        }
+    }
+    return 0;
+}
+
+static int run_power_child(const char *dir, const char *ackfile, int warmup, int seed)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512], w[16], sd[16];
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        snprintf(w, sizeof w, "%d", warmup);
+        snprintf(sd, sizeof sd, "%d", seed);
+        setenv("LD_PRELOAD", SHIM, 1);
+        setenv("CRASHFS_ROOT", dir, 1);
+        setenv("CRASHFS_PROB", "1", 1);
+        setenv("CRASHFS_WARMUP", w, 1);
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        setenv("CRASHFS_TEAR", "1", 1);
+        setenv("CRASHFS_SEED", sd, 1);
+        int null = open("/dev/null", O_WRONLY);
+        if (null >= 0)
+            dup2(null, 1), dup2(null, 2);
+        execl(SELF, SELF, "--power", dir, ackfile, MUTNAME ? MUTNAME : "none", (char *)NULL);
+        _exit(127);
+    }
+    int st = -1;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+/* (the ack files are named so that no root of crashfs, a path prefix, covers them: S/pl is the root) */
+static void case_power(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  power loss: skipped (no %s)\n", SHIM);
+        return;
+    }
+    char dir[PATH_MAX], ack[PATH_MAX + 16];
+    snprintf(ack, sizeof ack, "%s/acks-of-pl.ack", S);
+    int crashes = 0;
+    bool finished = false;
+    for (int k = 0; k < 900 && !finished; k++) {
+        fresh(dir, "pl");
+        unlink(ack);
+        char hif[PATH_MAX + 24];
+        snprintf(hif, sizeof hif, "%s.hi", ack);
+        unlink(hif);
+        int code = run_power_child(dir, ack, k, k + 1);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += code == 99;
+        finished = code == 0;
+        uint64_t acked = 0;
+        FILE *f = fopen(ack, "r");
+        if (f) {
+            if (fscanf(f, "%" SCNu64, &acked) != 1)
+                acked = 0;
+            fclose(f);
+        }
+        uint64_t hi = 0;
+        f = fopen(hif, "r");
+        if (f) {
+            if (fscanf(f, "%" SCNu64, &hi) != 1)
+                hi = 0;
+            fclose(f);
+        }
+        eng *db;
+        int rc = open_replica(dir, 0, &db);
+        if (rc != 0) {
+            fprintf(stderr, "P: step %d: the open failed: %d\n", k, rc);
+            failures++;
+            continue;
+        }
+        if (replica_log_end(db) < acked) {
+            fprintf(stderr, "P: step %d: acknowledged %" PRIu64 ", the log ends at %" PRIu64 "\n", k, acked,
+                    replica_log_end(db));
+            failures++;
+        }
+        if (replica_log_end(db) > hi) { /* a cut that was not durable: the records above it came back */
+            fprintf(stderr, "P: step %d: the log ends at %" PRIu64 ", above anything the history holds (%" PRIu64 ")\n", k,
+                    replica_log_end(db), hi);
+            failures++;
+        }
+        if (replica_apply(db, acked) != 0) {
+            fprintf(stderr, "P: step %d: the acknowledged log does not apply\n", k);
+            failures++;
+        }
+        eng_close(db);
+    }
+    CHECK(finished && crashes > 50);
+    printf("  power lost at each of %d steps of appends, syncs, restarts and cuts: every acknowledged position is on "
+           "disk\n", crashes);
+}
+
+
+static int mutant_of(const char *m)
+{
+    return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
                         : strcmp(m, "ackunsynced") == 0 ? MUT_REPLICA_ACK_UNSYNCED
                         : strcmp(m, "keepcut") == 0 ? MUT_REPLICA_KEEP_CUT
                         : strcmp(m, "nofloor") == 0 ? MUT_REPLICA_NO_FLOOR
                         : strcmp(m, "walclock") == 0 ? MUT_REPLICA_WALL_CLOCK
                         : strcmp(m, "nopos") == 0 ? MUT_REPLICA_NO_POS
-                        : strcmp(m, "classat") == 0 ? MUT_REPLICA_CLASS_AT : 0;
+                        : strcmp(m, "classat") == 0 ? MUT_REPLICA_CLASS_AT
+                        : strcmp(m, "opensync") == 0 ? MUT_REPLICA_NO_OPEN_SYNC
+                        : strcmp(m, "gapcheck") == 0 ? MUT_REPLICA_NO_GAP_CHECK
+                        : strcmp(m, "torncut") == 0 ? MUT_REPLICA_NO_TORN_CUT
+                        : strcmp(m, "floorcheck") == 0 ? MUT_REPLICA_NO_FLOOR_CHECK
+                        : strcmp(m, "durablegate") == 0 ? MUT_REPLICA_NO_DURABLE_GATE
+                        : strcmp(m, "applycontig") == 0 ? MUT_REPLICA_NO_APPLY_CONTIG
+                        : strcmp(m, "rotsync") == 0 ? MUT_REPLICA_NO_ROT_SYNC
+                        : strcmp(m, "cutsync") == 0 ? MUT_REPLICA_NO_CUT_SYNC
+                        : strcmp(m, "cutdirsync") == 0 ? MUT_REPLICA_NO_CUT_DIRSYNC
+                        : strcmp(m, "replayskip") == 0 ? MUT_REPLICA_NO_REPLAY_SKIP
+                        : strcmp(m, "nonow") == 0 ? MUT_REPLICA_NO_NOW_MARKER
+                        : strcmp(m, "commitclock") == 0 ? MUT_REPLICA_COMMIT_CLOCK
+                        : strcmp(m, "sealedrule") == 0 ? MUT_REPLICA_NO_SEALED_RULE
+                        : strcmp(m, "cutgen") == 0 ? MUT_REPLICA_NO_CUT_GEN
+                        : strcmp(m, "earlyseal") == 0 ? MUT_REPLICA_EARLY_SEAL : 0;
+}
+
+int main(int argc, char **argv)
+{
+    int a = 1;
+    if (argc >= 4 && strcmp(argv[1], "--child") == 0)
+        return child_main(argv[2], argv[3]);
+    if (argc >= 4 && strcmp(argv[1], "--power") == 0) {
+        if (argc >= 5) /* the mutant of the parent run: the child is a process of its own */
+            eng_test_mutant = mutant_of(argv[4]);
+        return power_child(argv[2], argv[3]);
+    }
+    if (a + 1 < argc && strcmp(argv[a], "--mutant") == 0) {
+        const char *m = argv[a + 1];
+        eng_test_mutant = mutant_of(m);
+        MUTNAME = m;
         if (!eng_test_mutant) {
             fprintf(stderr, "unknown mutant %s\n", m);
             return 2;
@@ -1048,6 +1776,20 @@ int main(int argc, char **argv)
     case_dicts();
     case_clock();
     case_classes();
+    {
+        char *slash = strrchr(SELF, '/');
+        snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
+    }
+    case_open_checks();
+    case_seal();
+    case_replay_skip();
+    case_clock_source();
+    case_atomic();
+    case_feed_refused();
+    case_read();
+    case_sync_cut();
+    case_sealed_open();
+    case_power();
     for (unsigned seed = 1; seed <= 20; seed++) {
         int f0 = failures;
         case_random(seed);

@@ -154,6 +154,12 @@ static void rfd_close(struct replica *rp)
 
 int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
 {
+    if (db->feed_req || atomic_load(&db->feed_on)) {
+        /* a retained segment (fwal_) is kept for the feed instead of unlinked: the replica unlinks flushed segments and
+         * ignores fwal_ names in its numbering, which would break that invariant silently. Not designed yet. */
+        fprintf(stderr, "tsdb: %s: a volume with a change feed cannot be opened as a replica yet\n", db->dir);
+        return TSDB_ERR_INVALID;
+    }
     struct replica *rp = calloc(1, sizeof *rp);
     if (!rp)
         return TSDB_ERR_NOMEM;
@@ -216,16 +222,53 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
         fprintf(stderr, "tsdb: %s: FNO has a damaged slot: a replica cannot tell its log end, rebuild it\n", db->dir);
         rc = TSDB_ERR_CORRUPT;
     }
+    /* The log of a replica is contiguous (replica_append enforces it): a segment that does not start where the one before
+     * it ends means a file went (damage, or a file system that reordered the unlinks of a cut), and the replica would
+     * acknowledge positions it does not hold. FNO is only a bound: it never exceeds what the log and parts hold. */
+    if (rc == 0) {
+        uint64_t prev_end = 0, last_end = 0;
+        for (size_t k = 0; k < nseg && rc == 0; k++) {
+            if (!segs[k].fno_first)
+                continue;
+            if (prev_end && segs[k].fno_first != prev_end && eng_test_mutant != MUT_REPLICA_NO_GAP_CHECK) {
+                fprintf(stderr, "tsdb: %s: segment %s starts at position %" PRIu64 ", but the segment before it ends at "
+                                "%" PRIu64 ": a segment is missing, the replica's log is damaged\n",
+                        db->dir, segs[k].name, segs[k].fno_first, prev_end - 1);
+                rc = TSDB_ERR_CORRUPT;
+            }
+            prev_end = last_end = segs[k].fno_end;
+        }
+        if (rc == 0 && last_end && atomic_load(&db->fno_durable) > last_end) {
+            fprintf(stderr, "tsdb: %s: FNO holds %" PRIu64 ", beyond the end of the log (%" PRIu64 "): the replica's log "
+                            "lost records, rebuild it\n", db->dir, (uint64_t)atomic_load(&db->fno_durable), last_end - 1);
+            rc = TSDB_ERR_CORRUPT;
+        }
+    }
     if (rc == 0 && cut_tails)
         rc = cut_tails(db);
     /* every torn tail goes now (the checks passed): a segment's file is its valid records and nothing else */
     bool cutany = false;
     for (size_t k = 0; k < nseg && rc == 0; k++) {
-        if (segs[k].end >= segs[k].len)
+        if (segs[k].end >= segs[k].len || eng_test_mutant == MUT_REPLICA_NO_TORN_CUT)
             continue;
         int fd = openat(db->dirfd, segs[k].name, O_RDWR | O_CLOEXEC);
         if (fd < 0 || ftruncate(fd, (off_t)segs[k].end) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0))
             rc = TSDB_ERR_IO;
+        if (fd >= 0)
+            close(fd);
+        cutany = true;
+    }
+    /* What is read back is the page cache's: after a process kill it holds bytes no power loss would keep. Only what
+     * is synced now is durable (the driver acknowledges positions by durable_next): every segment goes to disk before
+     * the open claims its positions, and the directory with it. A segment synced already costs a no-op. */
+    for (size_t k = 0; k < nseg && rc == 0 && db->opt.fsync && eng_test_mutant != MUT_REPLICA_NO_OPEN_SYNC; k++) {
+        if (segs[k].end == 0)
+            continue;
+        int fd = openat(db->dirfd, segs[k].name, O_RDWR | O_CLOEXEC);
+        if (fd < 0 || tsdb_fdatasync(fd) != 0)
+            rc = TSDB_ERR_IO;
+        else
+            atomic_fetch_add_explicit(&db->st_wal_syncs, 1, memory_order_relaxed);
         if (fd >= 0)
             close(fd);
         cutany = true;
@@ -247,7 +290,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
         db->wal_off = segs[nseg - 1].end;
     }
     db->wal_open_removed = db->wal_flushed = nseg ? segs[0].seq - 1 : parts_seq;
-    rp->durable_next = db->fno_next; /* what is read back from the files is what the file system kept */
+    rp->durable_next = db->fno_next; /* synced above (fsync on): the files' bytes are durable now */
     rp->sealed_seq = parts_seq;
     rp->apply_next = db->fno_next;
     for (size_t k = 0; k < nseg; k++)
@@ -262,16 +305,12 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     if (!db->active)
         return TSDB_ERR_NOMEM;
     atomic_store(&rp->floor_saved, floor);
-    if (floor >= db->fno_next && floor > 0) {
+    if (floor >= db->fno_next && floor > 0 && eng_test_mutant != MUT_REPLICA_NO_FLOOR_CHECK) {
         fprintf(stderr, "tsdb: %s: the commit floor %" PRIu64 " is beyond the log end %" PRIu64 ": the replica's log lost "
                         "records the floor says were applied\n", db->dir, floor, db->fno_next - 1);
         return TSDB_ERR_CORRUPT;
     }
     pthread_mutex_lock(&rp->mu);
-    pthread_mutex_lock(&db->lock);
-    for (size_t i = 0; i < db->nparts; i++) /* the parts say how late the leader's clock was when they were made */
-        replica_now_advance(db, db->parts[i]->written_ms);
-    pthread_mutex_unlock(&db->lock);
     rc = replica_apply_locked(db, rp, floor);
     pthread_mutex_unlock(&rp->mu);
     return rc;
@@ -453,47 +492,67 @@ int replica_floor_saved(eng *db, uint64_t floor)
 
 static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr, uint64_t pmax)
 {
-    enum { B = 1024 };
-    uint32_t ids[B];
-    int64_t ts[B];
-    uint64_t sl[B];
-    int ty[B];
+    /* One record is added under one hold of buf_lock: a replica's rows are visible at once (no lsn gating), and a query
+     * must see a committed record whole or not at all, as a sync-mode writer's rows are. So the rows are collected
+     * first (the skip of a replay takes db->lock, which sits above buf_lock) and added in one step. */
+    enum { B = 256 };
+    uint32_t ids_s[B];
+    int64_t ts_s[B];
+    uint64_t sl_s[B];
+    int ty_s[B];
+    uint32_t *ids = ids_s;
+    int64_t *ts = ts_s;
+    uint64_t *sl = sl_s;
+    int *ty = ty_s;
+    void *heap = NULL;
+    if (wr->n > B) {
+        size_t n = wr->n;
+        heap = malloc(n * (sizeof *ids + sizeof *ts + sizeof *sl + sizeof *ty));
+        if (!heap) {
+            eng_fail(db, "applying a committed record to the memtable", ENOMEM);
+            return TSDB_ERR_NOMEM;
+        }
+        sl = heap;
+        ts = (int64_t *)(sl + n);
+        ids = (uint32_t *)(ts + n);
+        ty = (int *)(ids + n);
+    }
     int64_t cached_p = 0;
     uint64_t cached_seq = 0;
-    bool have = false, added = false;
+    bool have = false;
     uint32_t scount = eng_series_count(db);
     const uint8_t *r = wr->payload;
-    for (size_t i0 = 0; i0 < wr->n; i0 += B) {
-        size_t k = 0, lim = MIN((size_t)B, wr->n - i0);
-        for (size_t i = 0; i < lim; i++, r += WAL_ROW) {
-            uint32_t id;
-            int64_t t;
-            uint64_t slot;
-            wal_row(r, &id, &t, &slot);
-            if (id >= scount && (scount = eng_series_count(db)) <= id) {
-                fprintf(stderr, "tsdb: %s: the record at position %" PRIu64 " names series %" PRIu32 ", which this replica's "
-                                "SERIES lacks\n", db->dir, wr->fno, id);
-                return TSDB_ERR_CORRUPT;
-            }
-            if (seq <= pmax) { /* a replay: rows a part of this segment holds already must not come back */
-                int64_t p = partition_of(db, id, t);
-                if (!have || p != cached_p) {
-                    pthread_mutex_lock(&db->lock);
-                    cached_seq = partition_wal_seq(db, p);
-                    pthread_mutex_unlock(&db->lock);
-                    cached_p = p;
-                    have = true;
-                }
-                if (cached_seq >= seq)
-                    continue;
-            }
-            ids[k] = id, ts[k] = t, sl[k] = slot, ty[k] = eng_series_type(db, id);
-            k++;
+    size_t k = 0;
+    int rc = 0;
+    for (size_t i = 0; i < wr->n; i++, r += WAL_ROW) {
+        uint32_t id;
+        int64_t t;
+        uint64_t slot;
+        wal_row(r, &id, &t, &slot);
+        if (id >= scount && (scount = eng_series_count(db)) <= id) {
+            fprintf(stderr, "tsdb: %s: the record at position %" PRIu64 " names series %" PRIu32 ", which this replica's "
+                            "SERIES lacks\n", db->dir, wr->fno, id);
+            free(heap);
+            return TSDB_ERR_CORRUPT;
         }
-        if (k == 0)
-            continue;
+        if (seq <= pmax) { /* a replay: rows a part of this segment holds already must not come back */
+            int64_t p = partition_of(db, id, t);
+            if (!have || p != cached_p) {
+                pthread_mutex_lock(&db->lock);
+                cached_seq = partition_wal_seq(db, p);
+                pthread_mutex_unlock(&db->lock);
+                cached_p = p;
+                have = true;
+            }
+            if (cached_seq >= seq && eng_test_mutant != MUT_REPLICA_NO_REPLAY_SKIP)
+                continue;
+        }
+        ids[k] = id, ts[k] = t, sl[k] = slot, ty[k] = eng_series_type(db, id);
+        k++;
+    }
+    if (k > 0) {
         pthread_mutex_lock(&db->buf_lock);
-        int rc = mt_reserve_rows(db->active, ids, 0, k);
+        rc = mt_reserve_rows(db->active, ids, 0, k);
         for (size_t a = 0; rc == 0 && a < k;) {
             size_t b = a + 1;
             while (b < k && ty[b] == ty[a])
@@ -501,20 +560,15 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
             rc = mt_add(db->active, ids + a, 0, ts + a, sl + a, 8, b - a, 0, ty[a]);
             a = b;
         }
+        if (rc == 0)
+            mt_note_fno(db->active, wr->fno, wr->n);
         pthread_mutex_unlock(&db->buf_lock);
-        if (rc) {
+        if (rc)
             eng_fail(db, "applying a committed record to the memtable", ENOMEM);
-            return rc;
-        }
-        added = true;
     }
-    if (added) {
-        pthread_mutex_lock(&db->buf_lock);
-        mt_note_fno(db->active, wr->fno, wr->n);
-        pthread_mutex_unlock(&db->buf_lock);
-    }
+    free(heap);
     (void)rp;
-    return 0;
+    return rc;
 }
 
 /* One marker, in position order, once committed. Every type is applied in a way a replay can repeat: a restart applies
@@ -540,7 +594,8 @@ static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec
     }
     switch (m.type) {
     case MK_NOW:
-        replica_now_advance(db, m.u.now.now_ms);
+        if (eng_test_mutant != MUT_REPLICA_NO_NOW_MARKER)
+            replica_now_advance(db, m.u.now.now_ms);
         return 0;
     case MK_SERIES:
         return eng_series_apply(db, m.u.series.name, m.u.series.name_len, (int)m.u.series.vtype, m.u.series.id);
@@ -607,8 +662,6 @@ static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit)
             rp->apply_seq = cur.seq;
             rp->apply_off = 0;
         }
-        if ((rc = switch_memtable(db, rp, cur.seq)) != 0)
-            break;
         if (rp->apply_off >= cur.len) { /* the end of what the segment holds: sealed when a later one exists */
             rseg nx;
             if (!segs_after(rp, cur.seq, &nx))
@@ -636,7 +689,7 @@ static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit)
             rc = TSDB_ERR_CORRUPT;
             break;
         }
-        if (wr.fno != rp->apply_next) {
+        if (wr.fno != rp->apply_next && eng_test_mutant != MUT_REPLICA_NO_APPLY_CONTIG) {
             fprintf(stderr, "tsdb: %s: the record at offset %" PRIu64 " of segment %" PRIx64 " has number %" PRIu64
                             ", not %" PRIu64 ": the replica's log is damaged\n", db->dir, rp->apply_off, cur.seq, wr.fno,
                     rp->apply_next);
@@ -644,9 +697,21 @@ static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit)
             break;
         }
         uint64_t last = wr.fno + wr.span - 1;
-        if (last > commit || last + 1 > rp->durable_next)
+        if (eng_test_mutant == MUT_REPLICA_EARLY_SEAL && (rc = switch_memtable(db, rp, cur.seq)) != 0)
+            break; /* planted: the old segment seals when the cursor reaches the next, committed or not */
+        if (last > commit || (last + 1 > rp->durable_next && eng_test_mutant != MUT_REPLICA_NO_DURABLE_GATE))
             break;
-        replica_now_advance(db, wr.commit_ms); /* the leader's clock at that record */
+        /* The memtable switches (and so the old segment seals) only here, at the first COMMITTED record of a later
+         * segment: a record that may still be cut must not seal anything. The new leader that cut it holds every
+         * committed record, so it holds this segment's first record and starts a segment above it: nobody appends to a
+         * sealed segment, which replica_append refuses (rows added to a flushed segment would be skipped by the next
+         * replay, which skips what a part of the segment holds). */
+        if ((rc = switch_memtable(db, rp, cur.seq)) != 0)
+            break;
+        /* The clock is the leader's NOW markers (design-cluster.md 5.4, C10), not the commit_ms of a record: the leader
+         * stamps commit_ms with its wall clock, which its retention clock (opt.clock_ms, the floor) need not follow. */
+        if (eng_test_mutant == MUT_REPLICA_COMMIT_CLOCK) /* planted: the clock follows every record's commit_ms */
+            replica_now_advance(db, wr.commit_ms);
         rc = wr.kind == WAL_KIND_ROWS ? apply_rows(db, rp, cur.seq, &wr, pmax) : apply_marker(db, rp, cur.seq, &wr);
         if (rc)
             break;
@@ -730,8 +795,8 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
     bool have = db->wal_fd >= 0, fresh = false;
     if (rc == 0) {
         if (have && seq == db->wal_seq)
-            rc = off == db->wal_off && seq > rp->sealed_seq ? 0 : TSDB_ERR_INVALID;
-        else if (seq > rp->sealed_seq && (!have || seq > db->wal_seq))
+            rc = off == db->wal_off && (seq > rp->sealed_seq || eng_test_mutant == MUT_REPLICA_NO_SEALED_RULE) ? 0 : TSDB_ERR_INVALID;
+        else if ((seq > rp->sealed_seq || eng_test_mutant == MUT_REPLICA_NO_SEALED_RULE) && (!have || seq > db->wal_seq))
             rc = off == 0 ? 0 : TSDB_ERR_INVALID, fresh = true;
         else
             rc = TSDB_ERR_INVALID;
@@ -739,7 +804,7 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
     if (rc == 0 && fresh) {
         /* a torn tail is a torn append only in the newest segment (wal_check_order): the old one is durable first */
         if (have) {
-            if (db->opt.fsync && tsdb_fdatasync(db->wal_fd) != 0) {
+            if (db->opt.fsync && eng_test_mutant != MUT_REPLICA_NO_ROT_SYNC && tsdb_fdatasync(db->wal_fd) != 0) {
                 eng_fail(db, "replica WAL fdatasync", errno);
                 rc = TSDB_ERR_IO;
             } else {
@@ -778,6 +843,8 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
     return rc;
 }
 
+void (*replica_test_sync_hook)(eng *db); /* test hook: runs after the fdatasync, before replica_sync takes its lock again */
+
 int replica_sync(eng *db)
 {
     struct replica *rp = db->rp;
@@ -802,9 +869,11 @@ int replica_sync(eng *db)
         }
         atomic_fetch_add_explicit(&db->st_wal_syncs, 1, memory_order_relaxed);
     }
+    if (replica_test_sync_hook)
+        replica_test_sync_hook(db);
     pthread_mutex_lock(&rp->mu);
     /* gaps 9 and 12: a sync that began before a cut does not cover what was written again after it */
-    uint64_t end = rp->cut_gen == gen ? target : MIN(target, rp->last_cut_next);
+    uint64_t end = rp->cut_gen == gen || eng_test_mutant == MUT_REPLICA_NO_CUT_GEN ? target : MIN(target, rp->last_cut_next);
     end = MIN(end, db->fno_next);
     rp->durable_next = MAX(rp->durable_next, end);
     pthread_mutex_unlock(&rp->mu);
@@ -863,9 +932,8 @@ int replica_cut(eng *db, uint64_t last)
             for (size_t pos = 0; pos < flen && !found;) {
                 wal_rec wr;
                 size_t sz = wal_record(fb + pos, flen - pos, ss[t].seq, pos, &wr);
-                if (sz == 0 || wr.fno + wr.span - 1 > last + (found ? 0 : 0))
-                    if (sz == 0 || wr.fno + wr.span - 1 > last)
-                        break;
+                if (sz == 0 || wr.fno + wr.span - 1 > last)
+                    break;
                 pos += sz;
                 if (wr.fno + wr.span - 1 == last)
                     found = true, off_cut = pos;
@@ -889,19 +957,19 @@ int replica_cut(eng *db, uint64_t last)
         pthread_mutex_unlock(&rp->mu);
         return 0;
     }
-    /* newest first: a crash in the middle leaves a prefix of the log, never a gap */
-    bool removed = false;
+    /* Newest first, the directory synced after each: a file system may reorder unsynced unlinks, and a crash with the
+     * newest segment present and a middle one gone would leave a hole in the log (the open refuses it). With a sync per
+     * unlink a crash leaves a prefix of the log. A cut is rare. */
     for (long i = (long)n - 1; rc == 0 && i > t; i--) {
         char name[64];
         wal_name(name, sizeof name, ss[i].seq);
         if (unlinkat(db->dirfd, name, 0) != 0 && errno != ENOENT) {
             eng_fail(db, "removing a segment above a cut", errno);
             rc = TSDB_ERR_IO;
+        } else if (eng_test_mutant != MUT_REPLICA_NO_CUT_DIRSYNC) { /* planted: no directory fsync */
+            rc = eng_sync_dir(db, "fsync of the directory after a cut"); /* fails the engine itself */
         }
-        removed = true;
     }
-    if (rc == 0 && removed)
-        rc = eng_sync_dir(db, "fsync of the directory after a cut"); /* fails the engine itself */
     if (rc == 0 && t >= 0) {
         int fd = db->wal_fd >= 0 && db->wal_seq == ss[t].seq ? dup(db->wal_fd) : -1;
         if (fd < 0) {
@@ -910,7 +978,7 @@ int replica_cut(eng *db, uint64_t last)
             fd = openat(db->dirfd, name, O_RDWR | O_CLOEXEC);
         }
         if (fd < 0 || (ss[t].len != off_cut && ftruncate(fd, (off_t)off_cut) != 0) ||
-            (db->opt.fsync && tsdb_fdatasync(fd) != 0)) {
+            (db->opt.fsync && eng_test_mutant != MUT_REPLICA_NO_CUT_SYNC && tsdb_fdatasync(fd) != 0)) {
             eng_fail(db, "cutting a segment", errno);
             rc = TSDB_ERR_IO;
         }
@@ -969,6 +1037,8 @@ int replica_cut(eng *db, uint64_t last)
 
 /* ------------------------------------------------------------------- read */
 
+size_t replica_read_win_min = 65536; /* test hook: the smallest read window, so a test reaches the growth of the window */
+
 int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
                  uint64_t *last)
 {
@@ -1004,56 +1074,101 @@ int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap,
         pthread_mutex_unlock(&rp->mu);
         return TSDB_ERR_NOTFOUND; /* below the log's start: it is in parts, a snapshot is needed */
     }
+    /* pread from where the last read of this segment ended (rd_*: the sender walks the log in order), in windows, never
+     * the whole segment: a catch-up in chunks costs the bytes it sends, not a square of the segment. The segment is
+     * append-only between cuts, and a cut holds rp->mu like this does. */
     char name[64];
-    uint8_t *fb;
-    size_t flen;
     wal_name(name, sizeof name, s.seq);
-    if ((rc = read_file(db->dirfd, name, &fb, &flen)) != 0) {
+    int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
         pthread_mutex_unlock(&rp->mu);
-        return rc;
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
     }
-    flen = MIN(flen, (size_t)s.len);
-    size_t pos = 0, start = 0, end = 0;
-    bool found = false;
-    uint64_t lastpos = 0;
-    while (pos < flen) {
-        wal_rec wr;
-        size_t sz = wal_record(fb + pos, flen - pos, s.seq, pos, &wr);
-        if (sz == 0) {
-            rc = TSDB_ERR_CORRUPT;
+    size_t flen = (size_t)s.len;
+    size_t pos0 = rp->rd_seq == s.seq && rp->rd_next && rp->rd_next <= from && rp->rd_off <= flen ? (size_t)rp->rd_off : 0;
+    size_t win = MAX(cap, replica_read_win_min);
+    uint8_t *fb = NULL;
+    size_t start = 0, blen = 0;
+    bool found = false, done = false;
+    uint64_t lastpos = 0, next_fno = 0;
+    size_t next_off = 0;
+    uint8_t *out = NULL;
+    size_t outlen = 0, outcap = 0;
+    while (rc == 0 && !done && pos0 < flen) {
+        size_t want = MIN(win, flen - pos0);
+        uint8_t *nb = realloc(fb, want);
+        if (!nb) {
+            rc = TSDB_ERR_NOMEM;
             break;
         }
-        if (!found) {
-            if (wr.fno == from)
-                found = true, start = pos;
-            else if (wr.fno > from) {
-                rc = TSDB_ERR_INVALID; /* from is inside a record */
+        fb = nb;
+        ssize_t got = pread(fd, fb, want, (off_t)pos0);
+        if (got < 0 || (size_t)got != want) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        blen = want;
+        size_t pos = 0;
+        bool window_end = pos0 + blen < flen; /* the file goes on beyond this window */
+        while (pos < blen) {
+            wal_rec wr;
+            size_t sz = wal_record(fb + pos, blen - pos, s.seq, pos0 + pos, &wr);
+            if (sz == 0) {
+                if (window_end)
+                    break; /* a record that does not fit the window: read from here with a larger one */
+                rc = TSDB_ERR_CORRUPT;
                 break;
             }
+            if (!found) {
+                if (wr.fno == from)
+                    found = true, start = pos0 + pos;
+                else if (wr.fno > from) {
+                    rc = TSDB_ERR_INVALID; /* from is inside a record */
+                    break;
+                }
+            }
+            if (found) {
+                if (outlen > 0 && outlen + sz > cap) {
+                    done = true;
+                    break;
+                }
+                if (outlen + sz > outcap) {
+                    size_t nc = MAX(outlen + sz, outcap * 2);
+                    uint8_t *no = realloc(out, nc);
+                    if (!no) {
+                        rc = TSDB_ERR_NOMEM;
+                        break;
+                    }
+                    out = no, outcap = nc;
+                }
+                memcpy(out + outlen, fb + pos, sz);
+                outlen += sz;
+                lastpos = wr.fno + wr.span - 1;
+                next_fno = lastpos + 1;
+                next_off = pos0 + pos + sz;
+            }
+            pos += sz;
         }
-        if (found) {
-            if (end > start && pos + sz - start > cap)
-                break;
-            end = pos + sz;
-            lastpos = wr.fno + wr.span - 1;
-        }
-        pos += sz;
+        if (rc || done)
+            break;
+        if (pos == 0 && window_end)
+            win *= 2; /* one record is larger than the window */
+        pos0 += pos;
     }
+    free(fb);
+    close(fd);
     if (rc == 0 && !found)
         rc = TSDB_ERR_INVALID;
     if (rc == 0) {
-        *buf = malloc(end - start);
-        if (!*buf)
-            rc = TSDB_ERR_NOMEM;
-        else {
-            memcpy(*buf, fb + start, end - start);
-            *len = end - start;
-            *seq = s.seq;
-            *off = start;
-            *last = lastpos;
-        }
+        *buf = out;
+        *len = outlen;
+        *seq = s.seq;
+        *off = start;
+        *last = lastpos;
+        rp->rd_seq = s.seq, rp->rd_off = next_off, rp->rd_next = next_fno;
+    } else {
+        free(out);
     }
-    free(fb);
     pthread_mutex_unlock(&rp->mu);
     return rc;
 }
