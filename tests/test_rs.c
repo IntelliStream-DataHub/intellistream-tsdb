@@ -544,6 +544,25 @@ static void check_level_caps(int level, const iso_gf256_kernel *ks, size_t n)
         CHECK(!wide_name(now));
 }
 
+/* The kernel the ladder must pick at `level`, worked out here from the compiler's own CPU probe (not compat.c's, so a
+ * slip in the probe or the cap shows): the widest the hardware and the level allow. A kernel below that passes every
+ * correctness check and costs 8 to 35 times the encode speed (docs/tasks/ec-bench.md), so the choice is checked too. */
+static void check_best_kernel(int level)
+{
+    __builtin_cpu_init();
+    bool ssse3 = __builtin_cpu_supports("ssse3");
+    bool avx2 = level >= CPU_V3 && __builtin_cpu_supports("avx2");
+    bool gfni = level >= CPU_V3 && __builtin_cpu_supports("gfni");
+    bool bw = level >= CPU_V4 && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
+    bool wide = bw && tsdb_ec_prefer_512();
+    const char *want = gfni && wide ? "gfni512" : gfni && avx2 ? "gfni256" : wide ? "avx512" : avx2 ? "avx2"
+                       : ssse3 ? "ssse3" : "scalar";
+    const char *now = iso_gf256_impl();
+    if (strcmp(now, want))
+        fprintf(stderr, "level %s: the ladder runs %s, the hardware allows %s\n", cpu_level_name(level), now, want);
+    CHECK(is_name(now, want));
+}
+
 int main(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++) {
@@ -565,6 +584,7 @@ int main(int argc, char **argv)
     {   /* the state the process starts in (cpu_pick: TSDB_CPU=v2 on a SandyBridge, say) already obeys its level */
         iso_gf256_kernel ks0[ISO_GF256_MAX_KERNELS + 1];
         check_level_caps(start, ks0, iso_gf256_kernels(ks0));
+        check_best_kernel(start);
     }
     unsigned configs = 0;
     for (int level = CPU_BASE; level <= cpu_level_max(); level++) {
@@ -573,6 +593,7 @@ int main(int argc, char **argv)
         iso_gf256_kernel ks[ISO_GF256_MAX_KERNELS + 1];
         size_t nk = iso_gf256_kernels(ks);
         check_level_caps(level, ks, nk);
+        check_best_kernel(level);
         if (!strcmp(mutant, "kernel") || !strcmp(mutant, "guard"))
             ks[nk++] = (iso_gf256_kernel){"planted", planted_kernel, true, 1};
         for (size_t ki = 0; ki < nk; ki++) {

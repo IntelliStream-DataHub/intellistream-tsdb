@@ -13,8 +13,10 @@
 # Makefile does): src/cpu.c calls iso_gf256_init() through tsdb_ec_select() instead (AGENTS.md "CPU levels").
 # intellistream-objects and tsdb have the same owner (IntelliStream AS) and the same licence, AGPL-3.0-only.
 #
-# --check exits 0 when every file matches, 1 when one differs, and 0 with a "skipped" line when the objects repository
-# or the commit is not there (a clone without it, a CI runner): a test that cannot run says so and does not fail.
+# --check first compares the sha256 of each file in src/ec with the ones src/ec/UPSTREAM holds (always, in every clone:
+# a hand edit fails), then each file with the commit UPSTREAM names. It exits 1 when one differs; 0 with a "skipped"
+# line for the second part when the objects repository is not there (a clone without it, a CI runner). A repository that
+# is there but has no such commit is a stale UPSTREAM (the branch was rebased, the commit never pushed): that fails.
 set -eu
 
 repo=${EC_REPO:-$(dirname "$0")/../../intellistream-objects}
@@ -40,11 +42,24 @@ HDR
 if [ "$1" = --check ]; then
     if [ ! -f "$dst/UPSTREAM" ]; then echo "check-ec-sync: no src/ec/UPSTREAM" >&2; exit 1; fi
     commit=$(sed -n 's/^commit: //p' "$dst/UPSTREAM")
-    if ! git -C "$repo" cat-file -e "$commit^{commit}" 2>/dev/null; then
-        echo "check-ec-sync: skipped (intellistream-objects at $repo has no commit $commit)"
-        exit 0
-    fi
     bad=0
+    for f in $files; do
+        want=$(sed -n "s/^sha256 $f: //p" "$dst/UPSTREAM")
+        have=$(sha256sum "$dst/$f" | cut -d' ' -f1)
+        if [ "$want" != "$have" ]; then
+            echo "check-ec-sync: src/ec/$f is not the file UPSTREAM hashes (hand edit? run tools/sync-ec.sh)" >&2
+            bad=1
+        fi
+    done
+    if [ ! -d "$repo/.git" ] && ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "check-ec-sync: hashes checked; skipped the comparison with $commit (no intellistream-objects at $repo)"
+        exit $bad
+    fi
+    if ! git -C "$repo" cat-file -e "$commit^{commit}" 2>/dev/null; then
+        echo "check-ec-sync: intellistream-objects at $repo has no commit $commit: UPSTREAM is stale (rebased, or never pushed?);" \
+            "run tools/sync-ec.sh on the commit that has these files" >&2
+        exit 1
+    fi
     for f in $files; do
         if ! { header; git -C "$repo" show "$commit:src/codec/$f"; } | cmp -s - "$dst/$f"; then
             echo "check-ec-sync: src/ec/$f differs from $commit:src/codec/$f (hand edit? run tools/sync-ec.sh)" >&2
@@ -63,6 +78,10 @@ for f in $files; do
     mv "$tmp" "$dst/$f"
 done
 
+sums=""
+for f in $files; do sums="$sums$(printf 'sha256 %s: %s' "$f" "$(sha256sum "$dst/$f" | cut -d' ' -f1)")
+"; done
+sums=${sums%?}
 cat > "$dst/UPSTREAM" <<UP
 repository: intellistream-objects (git@repo.intellistream.ai:olavgg/intellistream-objects.git), directory src/codec
 commit: $commit
@@ -71,6 +90,7 @@ license: AGPL-3.0-only, as intellistream-objects (LICENSE there); the owner is I
 local: compat.h and compat.c (what the files include from isod's src/common: the CPU features capped by tsdb's level,
   the error codes, the allocators, the clock), and the one-line headers under compat/ that point there; tsdb's own, not synced.
 built: with -DISO_GF256_NO_BOOT (no constructor: src/cpu.c calls tsdb_ec_select(), which calls iso_gf256_init()).
-sync: tools/sync-ec.sh [--repo DIR] COMMIT; tools/sync-ec.sh --check compares the copy with this commit.
+$sums
+sync: tools/sync-ec.sh [--repo DIR] COMMIT; tools/sync-ec.sh --check compares the copy with these hashes and this commit.
 UP
 echo "src/ec synced to $commit"

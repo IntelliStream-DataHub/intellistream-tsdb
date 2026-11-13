@@ -172,7 +172,11 @@ cgroup, so `nice` does not keep your work out of its way.
   `tsdb_ec_select`, which caps what `iso_cpu_has` says, so a `TSDB_CPU=v2` process never runs an AVX kernel
   (`tools/check-isa.sh` allows the wide kernels by name). In `libtsdb` on x86-64 only, never in a client library
   (`tools/check-ec-symbols.sh`). `tests/test_rs.c` (exhaustive erasure patterns, every level and kernel, mutants via
-  `--mutant coef|kernel|guard`), `tests/test_levels.c`, `build/ec-bench`.
+  `--mutant coef|kernel|guard`; it also checks that the ladder picks the widest kernel the level allows),
+  `tests/test_levels.c`, `build/ec-bench`; `tools/check-exports.sh` (libtsdb.so exports the public headers' names only:
+  `tsdb_ec_*` are `local:` in the map) and `tools/check-ec-baseline.sh` (no SSSE3 outside its kernel in a generic build).
+  The embedded bindings' crates (`client/rust-sys` build.rs, `vendor.sh`) copy `src/*.c` only and build without `src/ec`
+  and without `TSDB_EC`: an engine caller of `iso_rs_*` needs an `#ifdef TSDB_EC` or those crates stop linking.
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,

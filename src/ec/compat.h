@@ -17,8 +17,8 @@
  *  - Panics. A failed ISO_ASSERT or ISO_PANIC (a coefficient of 0 divided by, a singular Cauchy submatrix) is a bug
  *    of the caller or of the code: it logs and aborts, as upstream.
  *
- * Nothing here runs before main, and none of it is in the public API (include/tsdb.h; tools/libtsdb.map exports
- * tsdb_* only, which these are not: the names below start with tsdb_ec_ but the map lists the public ones).
+ * Nothing here runs before main, and none of it is in the public API (include/tsdb.h): tools/libtsdb.map exports
+ * tsdb_*, so it lists tsdb_ec_* as local; tools/check-exports.sh (make test) compares libtsdb.so's exports with the headers.
  */
 #ifndef TSDB_EC_COMPAT_H
 #define TSDB_EC_COMPAT_H

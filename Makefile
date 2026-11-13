@@ -96,9 +96,12 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
-# make tsan, make asan) needs it; the dist build's x86-64-v2 has it already.
+# make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
+# using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
+# the CPU is asked: a generic build stays x86-64 baseline there (tools/check-isa.sh checks the objects).
+EC_CFLAGS := -mssse3 -fno-tree-vectorize
 $(B)/ec_%.o: src/ec/%.c $(EC_HDR) src/internal.h | $(B)
-	$(CC) $(CFLAGS) -mssse3 -Isrc/ec/compat -DISO_GF256_NO_BOOT -c -o $@ $<
+	$(CC) $(CFLAGS) $(EC_CFLAGS) -Isrc/ec/compat -DISO_GF256_NO_BOOT -c -o $@ $<
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
@@ -318,6 +321,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
+test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
 test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(or $(TMPDIR),/tmp)
 	B=$(B) tests/test_config.sh $(TMPDIR)
@@ -338,10 +342,14 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_follow
 	./$(B)/test_volumes
 	./$(B)/test_rs $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in coef kernel guard; do ! ./$(B)/test_rs --mutant $$m >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),for m in coef kernel guard; do ! ./$(B)/test_rs --quick --mutant $$m >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (--quick: seconds, not 20 s a run)
+	tests/test_sync_ec.sh
 	tools/sync-ec.sh --check
+	tests/test_check_ec_symbols.sh
+	$(if $(EC_OBJ),EC_CFLAGS='$(EC_CFLAGS)' CC='$(CC)' tools/check-ec-baseline.sh)
 	B=$(B) tools/check-ec-symbols.sh
 	$(if $(EC_OBJ),! B=$(B) tools/check-ec-symbols.sh --lib $(LIB) >/dev/null 2>&1) # the engine's library holds the codec: the check must fail on it
+	$(if $(filter Linux,$(UNAME_S)),B=$(B) tools/check-exports.sh && tests/test_check_exports.sh)
 	./$(B)/test_crypto
 	./$(B)/test_users
 	B=$(B) tests/test_cli_users.sh

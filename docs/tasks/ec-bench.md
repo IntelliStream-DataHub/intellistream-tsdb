@@ -77,6 +77,8 @@ What it shows:
   (memory bound). Whether the 9950X (full-width 512) reverses the order is what the run there answers.
 - EU1 (design-cluster-data.md: "GFNI kernels encode k = 16, m = 4 above 8 GB/s a core on Zen 4/5"): 16 GB/s of data a core
   at 1 MiB shards, but 7.4 GB/s at 4 MiB, where the stripe (20 shards of 4 MiB) no longer fits the caches and the core
-  reads and writes memory. The claim holds when the stripe is cache-sized and misses by 8 percent when it is not.
+  reads and writes memory. The claim holds when the stripe is cache-sized and misses by 8 percent when it is not. The 4 MiB rows are the mean of 2
+  runs (1 MiB: 3), so read them as 7.0 to 7.8 GB/s for every kernel (ssse3 7.75, gfni256 at v3 7.59, v4 7.40): the spread is
+  inside the sd, and no kernel is the best there.
 - Memory bound at 4 MiB: 16+4 reads 16 and writes 4 shards of 4 MiB per stripe, 7.4 GB/s of data is about 9.3 GB/s of
   memory traffic a core; the kernels have run out of what one core's memory path gives.

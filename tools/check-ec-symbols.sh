@@ -3,7 +3,10 @@
 # The erasure codec (src/ec) is AGPL-3.0-only and lives in libtsdb and tsdbd; the Apache-2.0 network clients must never
 # contain it (docs/design-cluster-data.md E32, docs/licenses.md): settled data is decoded on servers only. Fails when
 #
-#   - a source of an Apache-2.0 client (client/, include/, connectors/, examples/client.c) names the codec, or
+#   - a source of an Apache-2.0 client names the codec (the Apache-2.0 directories of tools/check-spdx.sh: client/tsdb_{client,
+#     crypto,calendar,pack}.*, client/rust, client/python, client/python-common, client/java, connectors/pulsar, include/,
+#     examples/client.c; not the AGPL-3.0 bindings client/*-embedded and client/rust-sys, whose csrc/ copies the
+#     engine's src/*.c, cpu.c included), or
 #   - the C client library (libtsdbclient.a), or a client package that has been built, holds one of its symbols or files.
 #
 # Packages are looked for where the Makefile puts them (build/sdist*, client/java/target, client/rust/target) and skipped,
@@ -11,15 +14,21 @@
 #
 #   B=build tools/check-ec-symbols.sh [--lib ARCHIVE]    --lib: look in ARCHIVE instead of libtsdbclient.a (the test
 #                                                        of this script gives it libtsdb.a, which must fail it)
+#   EC_ROOT=DIR                                          look in DIR instead of the repository (tests/test_check_ec_symbols.sh)
 set -eu
-cd "$(dirname "$0")/.."
+cd "${EC_ROOT:-$(dirname "$0")/..}"
 B=${B:-build}
 lib=$B/libtsdbclient.a
 if [ "${1:-}" = --lib ]; then lib=$2; fi
 pat='iso_gf256_|iso_rs_|tsdb_ec_|gf256_avx|ISO_GF256_|src/ec/'
 bad=0
 
-hits=$(grep -rnE "$pat|ec/(gf256|rs)\.h" client include connectors examples/client.c 2>/dev/null \
+apache=""
+for f in client/tsdb_client.* client/tsdb_crypto.* client/tsdb_calendar.* client/tsdb_pack.* client/rust client/python \
+    client/python-common client/java connectors/pulsar include examples/client.c; do
+    [ -e "$f" ] && apache="$apache $f"
+done
+hits=$(grep -rnE "$pat|ec/(gf256|rs)\.h" $apache 2>/dev/null \
     --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.git | grep -v '^client/[^:]*/\(target\|build\)/' || true)
 if [ -n "$hits" ]; then
     echo "check-ec-symbols: an Apache-2.0 client source names the erasure codec:" >&2
