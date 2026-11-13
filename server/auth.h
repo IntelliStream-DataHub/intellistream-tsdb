@@ -87,6 +87,12 @@ int auth_id(auth_conn *a, tsdb_sid id, uint8_t need);
 int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need);
 /* The connection may see operator details (volume paths in TOPOLOGY): a superuser, or no login at all (--no-auth). */
 bool auth_conn_super(const auth_conn *a);
+/* Tenants (docs/design-stats.md section 4): the connection's tenant slot (0: "(none)"; --no-auth: 0), whether it sees
+ * every tenant (a superuser, read on `all`, no login), and whether it sees the tenant of this prefix (its own: a prefix that starts with the prefix of one of
+ * its admin grants). */
+uint16_t auth_tenant(const auth_conn *a);
+bool auth_tenants_full(const auth_conn *a);
+bool auth_tenant_visible(const auth_conn *a, const char *prefix, size_t len);
 /* Whether the connection holds `need` on every series (no per-id checks needed). */
 bool auth_all(const auth_conn *a, uint8_t need);
 

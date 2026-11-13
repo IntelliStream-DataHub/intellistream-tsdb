@@ -218,7 +218,8 @@
  *               as OWNER (FOLLOWER under --follow), with the health of its storage domain.
  *   STATUS      -> u32 len, then len bytes of `key=value` lines (docs/ha.md 15.4); superuser only.
  *   Version 13 also moves the planned numbers of the other designs one up: QUERY_LATEST is protocol 14, the change
- *   feed 15, statistics 16 (their op numbers are unchanged: 39 to 47; TOPOLOGY is 48 and STATUS 49).
+ *   feed 15, statistics 16 (their op numbers are unchanged: 39 to 47; TOPOLOGY is 48 and STATUS 49). Version 15 below
+ *   moved statistics up (versions are given in landing order): the change feed is now planned as 16.
 
  *   Version 14: QUERY_LATEST (docs/design-latest.md 6.2), the newest value of each of many series. The floor stays 12:
  *   a client sends the op only to a server whose HELLO says 14 or more (an older one: TSDB_ERR_INVALID, nothing sent).
@@ -238,13 +239,51 @@
  *               A denied id (no `read` on its series, existing or not) answers DENIED in its own record; a missing id
  *               answers NOTFOUND for a user with `read` on all series. CANCEL names a QUERY_LATEST as it does a
  *               QUERY_MULTI: it ends after the chunk in flight with STOPPED.
+ *
+ *   Version 15: statistics (docs/design-stats.md 5.1), two ops. The floor stays 12: a client sends them only to a
+ *   server whose HELLO says 15 or more (an older one: TSDB_ERR_INVALID, nothing sent). Every reply is a status, and a
+ *   body only when the status is 0. Every integer is little-endian.
+ *   STATS_SERIES (46)  u32 n (1..65536), u32 flags, u64 ids[n]      The length is exactly 8 + 8 n.
+ *               flags: TSDB_STATS_RESIDENT 1 (fill resident_bytes: at most 1,024 ids). TSDB_STATS_EXACT_ROWS 2 is
+ *               reserved and not built: TSDB_ERR_INVALID. Other bits are TSDB_ERR_INVALID.
+ *               -> u32 done, u32 0, then `done` records of TSDB_STATS_SERIES_REC (176) bytes in request order:
+ *                  i32 status (0, TSDB_ERR_DENIED, TSDB_ERR_NOTFOUND), u8 class, u8 type, u16 flags, u64 rows,
+ *                  nulls, memtable_rows, logical_bytes, ts_bytes, value_bytes, index_bytes, tomb_bytes, parts,
+ *                  partitions, granules, full_granules, i64 first_ts, last_ts, last_write_ms, u64 resident_bytes,
+ *                  reads_est, reads_err, writes_est, writes_err, live_rows (0 for now). Every field after `flags`
+ *                  is 0 when status is not 0. flags: TSDB_STATS_NO_RANGE 2, WRITE_FROM_MTIME 4, NO_BOUND 8 (the
+ *                  reads_err and writes_err of a user without read on all series are 0).
+ *               The reply stops early only at the server's work budget (about 10^8 index probes): the client sends
+ *               ids[done..] again. A denied id (no `read` on its series, existing or not) is DENIED in its record.
+ *               CANCEL names it as it does a QUERY_MULTI: STOPPED.
+ *   STATS_TENANTS (47) u16 flags, u16 k (at most 256), u32 n, u32 cursor, u32 0, then n x {u16 len, prefix bytes}
+ *               flags: TSDB_TSTATS_VOLUMES 1 (a row per volume after each tenant's summed row), HOT 2, CALLER 4.
+ *               n = 0: every tenant the user may see; len 0 names "(none)". cursor: 0, or the previous reply's.
+ *               -> u32 count (rows in this reply), u32 flags (TSDB_TSTATS_PARTIAL 1: a sweep or move is not done;
+ *                  TSDB_TSTATS_INGEST_APPROX 2), u32 next_cursor (0xffffffff: done), u32 generation (of the
+ *                  tenant list), u64 list_hash, u64 parts_counted, u64 parts_listed (both 0 unless superuser or
+ *                  read on all), then `count` rows: i32 status (0, DENIED, NOTFOUND), u32 volume (0xffffffff: the
+ *                  sum), u32 flags (PARTIAL 1), u16 len, u16 nhot, the prefix zero-padded to a multiple of 8, 18 x
+ *                  u64 (series, series_created, active_series_cur, active_series_prev, rows, nulls, logical_bytes,
+ *                  ts_bytes, value_bytes, index_bytes, granules, ingested_rows, ingested_bytes, merged_rows,
+ *                  merge_removed_rows, retention_dropped_rows, resident_bytes, stale_s), with CALLER on the summed
+ *                  row 20 x u64 (requests_query, _insert, _delete, _admin, _other, rows_decoded, rows_from_stats,
+ *                  rows_from_memtable, bytes_read, result_rows, query_us, inserted_rows, inserted_bytes,
+ *                  errors_invalid, _notfound, _io, _other, denied_requests, denied_series, failed_logins), with HOT
+ *                  on the summed row nhot x {u8 kind (1 reads, 2 writes, 3 bytes per row), u8[7] 0, u64 id,
+ *                  u64 estimate, u64 error}. A reply stops at 64 MB and gives the cursor to go on from.
+ *               Rights: a superuser or a user with read on all sees every tenant (and "(none)"); `admin` on a
+ *               prefix:Q sees each tenant whose prefix starts with Q; the rest see no row in a listing (status 0, count 0)
+ *               and DENIED for a tenant they name. A tenant named but not in the list is NOTFOUND to whoever may see
+ *               it, DENIED to anyone else. Whole-request statuses:
+ *               INVALID (a bad request, or the server runs with --no-stats), STOPPED (after a CANCEL).
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
 #include <stdint.h>
 
-#define TSDB_PROTOCOL_VERSION 14
+#define TSDB_PROTOCOL_VERSION 15
 #define TSDB_PROTOCOL_MIN 12 /* the oldest version tsdbd and the clients speak */
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
@@ -293,6 +332,8 @@
     X(REVOKE, 37, revoke)                                  \
     X(USER_LIST, 38, user_list)                            \
     X(QUERY_LATEST, 39, query_latest)                      \
+    X(STATS_SERIES, 46, stats_series)                      \
+    X(STATS_TENANTS, 47, stats_tenants)                    \
     X(TOPOLOGY, 48, topology)                              \
     X(STATUS, 49, status)
 
@@ -349,6 +390,30 @@ enum { TSDB_ROLE_NONE = 0, TSDB_ROLE_OWNER = 1, TSDB_ROLE_STANDBY = 2, TSDB_ROLE
 #define TSDB_LATEST_REC 24               /* bytes of one reply record */
 #define TSDB_LATEST_WITH_NULLS 1         /* QUERY_LATEST flags */
 #define TSDB_LATEST_PER_END 2
+
+/* Version 15: statistics */
+#define TSDB_STATS_SERIES_MAX_IDS 65536u /* ids in one STATS_SERIES */
+#define TSDB_STATS_SERIES_RESIDENT_MAX 1024u
+#define TSDB_STATS_SERIES_REC 176 /* bytes of one STATS_SERIES record */
+#define TSDB_STATS_RESIDENT 1     /* STATS_SERIES flags */
+#define TSDB_STATS_EXACT_ROWS 2   /* reserved */
+#define TSDB_STATS_NO_RANGE 2     /* a record's flags */
+#define TSDB_STATS_WRITE_FROM_MTIME 4
+#define TSDB_STATS_NO_BOUND 8
+#define TSDB_TSTATS_VOLUMES 1     /* STATS_TENANTS flags */
+#define TSDB_TSTATS_HOT 2
+#define TSDB_TSTATS_CALLER 4
+#define TSDB_TSTATS_PARTIAL 1     /* reply and row flags */
+#define TSDB_TSTATS_INGEST_APPROX 2
+#define TSDB_TSTATS_HEADER 40     /* bytes of a STATS_TENANTS reply before its rows */
+#define TSDB_TSTATS_ROW_HEAD 16
+#define TSDB_TSTATS_DATA_FIELDS 18
+#define TSDB_TSTATS_CALLER_FIELDS 20
+#define TSDB_TSTATS_HOT_REC 32
+#define TSDB_TSTATS_MAX_K 256u
+#define TSDB_TSTATS_MAX_REPLY ((size_t)64 << 20)
+#define TSDB_TSTATS_VOLUME_SUM 0xffffffffu /* a row's volume: the sum over the volumes */
+#define TSDB_TSTATS_DONE 0xffffffffu       /* next_cursor: no more */
 
 #define TSDB_MULTI_HEADER 24            /* QUERY_MULTI bytes before the per-series arrays (version 10) */
 #define TSDB_MULTI_MAX_SERIES 65536u     /* series in one QUERY_MULTI */

@@ -58,6 +58,8 @@ static const spec specs[] = {
     {TSDB_OP_QUERY_TWA, K_SERIES, N_R, BY_ID, 0},
     {TSDB_OP_QUERY_MULTI, K_SERIES, N_R, BY_ID, 0},
     {TSDB_OP_QUERY_LATEST, K_SERIES, N_R, BY_ID, 0}, /* the record's status: the frame's own is 0 */
+    {TSDB_OP_STATS_SERIES, K_SERIES, N_R, BY_ID, 0}, /* the record's status: the frame's own is 0 */
+    {TSDB_OP_STATS_TENANTS, K_LOGIN, 0, BY_NONE, 0}, /* every tenant the user may see: rows carry the rights */
     {TSDB_OP_DELETE_RANGE, K_SERIES, N_D, BY_ID, 0},
     {TSDB_OP_SET_RETENTION, K_SERIES, N_D, BY_ID, 0},
     {TSDB_OP_REPLACE_RANGE, K_SERIES, N_I | N_D, BY_ID, 0},
@@ -138,6 +140,8 @@ static size_t build(const spec *s, tsdb_sid id, const char *name, uint8_t *b)
         put64(b + 32, TSDB_MANY_SERIES); put64(b + 40, t0); put64(b + 48, t1); return 56;
     case TSDB_OP_QUERY_LATEST: /* one id, no bound: u8 flags, u8 0, u16 threads, u32 n, i64 end, the id */
         put32(b + 4, 1); put64(b + 8, (uint64_t)INT64_MAX); put64(b + 16, id); return 24;
+    case TSDB_OP_STATS_SERIES: put32(b, 1); put64(b + 8, id); return 16; /* u32 n, u32 flags, the id */
+    case TSDB_OP_STATS_TENANTS: return 16; /* flags 0, k 0, n 0, cursor 0: every tenant the user may see */
     default: return 0; /* no payload: LAST_STATS, WHOAMI, TOPOLOGY, STATUS, COMMIT, FLUSH, OPTIMIZE, STATS, USER_LIST */
     }
 }
@@ -193,6 +197,8 @@ static int32_t ask(int fd, uint8_t op, const uint8_t *p, size_t len)
             first = st;
             if (op == TSDB_OP_QUERY_LATEST && st == 0 && n >= TSDB_LATEST_PREFIX + 4)
                 memcpy(&first, rest + TSDB_LATEST_PREFIX, 4); /* the record's status: the frame's is the request's */
+            if (op == TSDB_OP_STATS_SERIES && st == 0 && n >= 8 + 4)
+                memcpy(&first, rest + 8, 4); /* the same: the first record's status */
         }
     }
 }
