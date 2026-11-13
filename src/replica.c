@@ -23,6 +23,7 @@
  * and applied by apply_marker (later steps add the types).
  */
 #include "replica.h"
+#include "marker.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -54,6 +55,7 @@ struct replica {
     uint64_t durable_next; /* positions below this are durable */
     uint64_t cut_gen, last_cut_next;
     _Atomic uint64_t floor_saved;
+    _Atomic int64_t now_ms; /* the replicated retention clock: the newest commit_ms / NOW applied, never the wall clock */
     struct {
         uint64_t seq, fno_end;
     } *unl; /* flushed segments not yet unlinked, ascending (unl_mu) */
@@ -69,6 +71,21 @@ struct replica {
 #define RP_CHUNK ((size_t)1 << 20)
 
 static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit);
+
+void replica_now_advance(eng *db, int64_t ms)
+{
+    struct replica *rp = db->rp;
+    int64_t cur = atomic_load_explicit(&rp->now_ms, memory_order_relaxed);
+    while (ms > cur && !atomic_compare_exchange_weak(&rp->now_ms, &cur, ms)) {
+    }
+}
+
+int64_t replica_now_ms(eng *db)
+{
+    if (eng_test_mutant == MUT_REPLICA_WALL_CLOCK) /* planted: the replica reads its own clock for retention */
+        return eng_wall_ms();
+    return atomic_load_explicit(&db->rp->now_ms, memory_order_relaxed);
+}
 
 static size_t rec_size(const uint8_t *h)
 {
@@ -251,6 +268,10 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
         return TSDB_ERR_CORRUPT;
     }
     pthread_mutex_lock(&rp->mu);
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++) /* the parts say how late the leader's clock was when they were made */
+        replica_now_advance(db, db->parts[i]->written_ms);
+    pthread_mutex_unlock(&db->lock);
     rc = replica_apply_locked(db, rp, floor);
     pthread_mutex_unlock(&rp->mu);
     return rc;
@@ -496,11 +517,48 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
     return 0;
 }
 
-/* One marker, in position order, once committed. The types are added by the steps that need them. */
+/* One marker, in position order, once committed. Every type is applied in a way a replay can repeat: a restart applies
+ * the markers of the segments it still holds again, from the floor. SERIES and STATE entries the dictionary holds
+ * already are checked and skipped, RETENTION and CLASS records by the offset they have in their file, NOW only
+ * moves the clock up. A type that carries data (COMMIT, DROP) or means a role (EPOCH) is not applied yet (steps 3
+ * and 4 of the replica): the engine fails rather than skip something a read would have to show. The reserved types
+ * and unknown ones are skipped, as every replay does. */
 static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr)
 {
-    (void)db, (void)rp, (void)seq, (void)wr;
-    return 0;
+    (void)seq;
+    mk m;
+    int rc = mk_decode(wr->payload, wr->n, &m);
+    if (rc != 0) {
+        fprintf(stderr, "tsdb: %s: the marker at position %" PRIu64 " does not decode: the replica's log is damaged\n", db->dir,
+                wr->fno);
+        return rc;
+    }
+    if (m.span != wr->span) {
+        fprintf(stderr, "tsdb: %s: the marker at position %" PRIu64 " has span %" PRIu64 " in its header and %" PRIu32 " in its "
+                        "payload\n", db->dir, wr->fno, wr->span, m.span);
+        return TSDB_ERR_CORRUPT;
+    }
+    switch (m.type) {
+    case MK_NOW:
+        replica_now_advance(db, m.u.now.now_ms);
+        return 0;
+    case MK_SERIES:
+        return eng_series_apply(db, m.u.series.name, m.u.series.name_len, (int)m.u.series.vtype, m.u.series.id);
+    case MK_STATE:
+        return eng_state_apply(db, m.u.state.name, m.u.state.name_len, m.u.state.id);
+    case MK_RETENTION:
+        return eng_retention_apply(db, m.u.retention.series, m.u.retention.limit_ms, m.u.retention.record_off);
+    case MK_CLASS:
+        return cls_apply(db, m.u.cls.series, (int)m.u.cls.cls, m.u.cls.at, m.u.cls.record_off);
+    case MK_COMMIT:
+    case MK_DROP:
+        fprintf(stderr, "tsdb: %s: the %s marker at position %" PRIu64 " is not applied by this replica yet\n", db->dir,
+                mk_type_name(m.type), wr->fno);
+        return TSDB_ERR_INVALID;
+    default:
+        (void)rp;
+        return 0; /* EPOCH (step 4), the reserved types and unknown ones */
+    }
 }
 
 static int rp_read_at(eng *db, struct replica *rp, uint64_t seq, uint64_t off, size_t want)
@@ -588,6 +646,7 @@ static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit)
         uint64_t last = wr.fno + wr.span - 1;
         if (last > commit || last + 1 > rp->durable_next)
             break;
+        replica_now_advance(db, wr.commit_ms); /* the leader's clock at that record */
         rc = wr.kind == WAL_KIND_ROWS ? apply_rows(db, rp, cur.seq, &wr, pmax) : apply_marker(db, rp, cur.seq, &wr);
         if (rc)
             break;

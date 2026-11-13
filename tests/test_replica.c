@@ -11,17 +11,25 @@
  *  C  the engine's own writes are refused (TSDB_ERR_READONLY);
  *  D  a bad append (wrong offset, a gap, backwards, a flipped byte, an old segment) writes nothing;
  *  E  random histories against the model, with reopens, cuts and flushes;
+ *  G  SERIES and STATE markers make the dictionaries (ids as the leader's, a replay changes nothing, a history that
+ *     does not match is TSDB_ERR_CORRUPT), the engine's own creations are refused;
+ *  H  the clock is the log's (commit_ms, NOW), never the wall clock: retention follows it; RETENTION records are
+ *     applied once, by their offset in the file, across a restart;
+ *  I  CLASS markers: T is moved past the replica's own rows (a part already holds them), a replay appends nothing,
+ *     a reopen checks every part against CLASSES;
  *  F  a process killed (kill -9) after the sync reported a position: every reported position is still there.
  * Planted mutations (--mutant NAME) must make it fail: applyall (apply ignores the commit point), ackunsynced
  * (the durable end reports what was not synced), keepcut (a cut leaves the records), nofloor (a segment goes
- * before the floor is saved).
+ * before the floor is saved), walclock (retention reads the replica's own clock), nopos (a replayed RETENTION or CLASS
+ * record is appended again), classat (a CLASS record takes the leader's T whatever this replica's parts hold).
  *
  *   ./build/test_replica [scratch dir]
- *   ./build/test_replica --mutant applyall|ackunsynced|keepcut|nofloor [scratch dir]    must fail
+ *   ./build/test_replica --mutant applyall|ackunsynced|keepcut|nofloor|walclock|nopos|classat [scratch dir]    must fail
  *   ./build/test_replica --child DIR ACKFILE      (internal)
  */
 #define _GNU_SOURCE
 #include "replica.h"
+#include "marker.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -680,6 +688,335 @@ static void case_kill(void)
     }
 }
 
+
+/* ------------------------------------------------------------ G, H, I: markers */
+
+/* a marker record at the end of the current segment (commit_ms given) */
+static lrec *leader_marker(leader *l, const mk *m, int64_t commit_ms)
+{
+    uint8_t *pl;
+    size_t pn;
+    if (mk_encode(m, &pl, &pn) != 0) {
+        fprintf(stderr, "cannot encode a marker\n");
+        exit(2);
+    }
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 64;
+        l->r = realloc(l->r, l->cap * sizeof *l->r);
+    }
+    lrec *r = &l->r[l->n++];
+    memset(r, 0, sizeof *r);
+    uint32_t span;
+    memcpy(&span, pl + 4, 4);
+    r->seq = l->seq;
+    r->off = l->off;
+    r->fno = l->next;
+    r->last = l->next + span - 1;
+    r->size = WAL_HDR + pn;
+    r->bytes = calloc(1, r->size);
+    uint32_t w = (uint32_t)pn | (uint32_t)WAL_KIND_MARKER << 28;
+    memcpy(r->bytes, &w, 4);
+    memcpy(r->bytes + 16, &r->fno, 8);
+    memcpy(r->bytes + 24, &commit_ms, 8);
+    memcpy(r->bytes + WAL_HDR, pl, pn);
+    free(pl);
+    wal_reseal(r->bytes, r->seq, r->off);
+    l->off += r->size;
+    l->next += span;
+    return r;
+}
+
+/* a rows record of one row at any time (the model does not see it: r->n stays 0) */
+static lrec *leader_row1(leader *l, uint32_t sid, int64_t ts, float v, int64_t commit_ms)
+{
+    unsigned rng = 1;
+    lrec *r = leader_rows(l, 1, &rng);
+    r->n = 0;
+    uint8_t *p = r->bytes + WAL_HDR;
+    uint64_t slot = 0;
+    memcpy(&slot, &v, 4);
+    memcpy(p, &sid, 4);
+    memcpy(p + 4, &ts, 8);
+    memcpy(p + 12, &slot, 8);
+    memcpy(r->bytes + 24, &commit_ms, 8);
+    wal_reseal(r->bytes, r->seq, r->off);
+    return r;
+}
+
+static lrec *m_series(leader *l, uint32_t id, const char *name, int vtype)
+{
+    mk m = {.type = MK_SERIES};
+    m.u.series = (mk_series){.id = id, .vtype = (uint32_t)vtype, .name = name, .name_len = (uint32_t)strlen(name)};
+    return leader_marker(l, &m, T0 + (int64_t)l->next);
+}
+
+static lrec *m_state(leader *l, uint32_t id, const char *name)
+{
+    mk m = {.type = MK_STATE};
+    m.u.state = (mk_state){.id = id, .name = name, .name_len = (uint32_t)strlen(name)};
+    return leader_marker(l, &m, T0 + (int64_t)l->next);
+}
+
+static lrec *m_now(leader *l, int64_t now)
+{
+    mk m = {.type = MK_NOW};
+    m.u.now.now_ms = now;
+    return leader_marker(l, &m, now);
+}
+
+static lrec *m_ret(leader *l, uint32_t series, int64_t limit, uint64_t off)
+{
+    mk m = {.type = MK_RETENTION};
+    m.u.retention = (mk_retention){.series = series, .limit_ms = limit, .record_off = off};
+    return leader_marker(l, &m, T0 + (int64_t)l->next);
+}
+
+static lrec *m_class(leader *l, uint32_t series, int cls, int64_t at, uint64_t off)
+{
+    mk m = {.type = MK_CLASS};
+    m.u.cls = (mk_class){.series = series, .cls = (uint32_t)cls, .at = at, .record_off = off};
+    return leader_marker(l, &m, T0 + (int64_t)l->next);
+}
+
+static void mkempty(const char *dir)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    eng *db;
+    if (eng_open(dir, &o, &db) != 0)
+        exit(2);
+    eng_close(db);
+}
+
+static void fresh_empty(char *dir, const char *name)
+{
+    snprintf(dir, PATH_MAX, "%s/%s", S, name);
+    sh("rm -rf '%s' && mkdir -p '%s'", dir, dir);
+    mkempty(dir);
+}
+
+/* a replica that is handed the records of l and applies them: the error of the apply (0: all applied) */
+static int run_log(const char *name, void (*build)(leader *), int *failed_engine)
+{
+    char dir[PATH_MAX];
+    fresh_empty(dir, name);
+    leader l;
+    leader_init(&l);
+    build(&l);
+    eng *db;
+    int rc = open_replica(dir, 0, &db);
+    CHECK_EQ(rc, 0);
+    if (rc)
+        return rc;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    rc = replica_apply(db, l.r[l.n - 1].last);
+    *failed_engine = eng_check(db) != 0;
+    eng_close(db);
+    leader_free(&l);
+    return rc;
+}
+
+static void log_gap(leader *l) { m_series(l, 1, "s1", TSDB_FLOAT32); }
+static void log_other_name(leader *l) { m_series(l, 0, "s0", TSDB_FLOAT32), m_series(l, 0, "other", TSDB_FLOAT32); }
+static void log_other_type(leader *l) { m_series(l, 0, "s0", TSDB_FLOAT32), m_series(l, 0, "s0", TSDB_INT64); }
+static void log_state_gap(leader *l) { m_state(l, 3, "RUN"); }
+static void log_ret_gap(leader *l) { m_series(l, 0, "s0", TSDB_FLOAT32), m_ret(l, 0, 1000, 16); }
+static void log_class_gap(leader *l) { m_series(l, 0, "s0", TSDB_FLOAT32), m_class(l, 0, 1, T0, 24); }
+
+static void case_dicts(void)
+{
+    char dir[PATH_MAX];
+    fresh_empty(dir, "g");
+    leader l;
+    unsigned rng = 3;
+    leader_init(&l);
+    m_series(&l, 0, "s0", TSDB_FLOAT32);
+    m_series(&l, 1, "s1", TSDB_FLOAT32);
+    lrec *st = m_state(&l, 0, "RUN");
+    for (int i = 0; i < 4; i++)
+        leader_rows(&l, 5, &rng);
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, 0), 0);
+    uint32_t id;
+    CHECK_EQ(eng_series_count(db), 0);
+    CHECK_EQ(eng_series_lookup(db, "s0", &id), TSDB_ERR_NOTFOUND);
+    CHECK_EQ(replica_apply(db, st->last), 0);
+    CHECK_EQ(eng_series_count(db), 2);
+    CHECK(eng_series_lookup(db, "s1", &id) == 0 && id == 1);
+    CHECK_EQ(eng_series_type(db, 0), TSDB_FLOAT32);
+    uint32_t code = 0;
+    CHECK(eng_state(db, "RUN", false, &code) == 0 && code == 1);
+    CHECK_EQ(replica_apply(db, l.r[l.n - 1].last), 0);
+    model m;
+    model_at(&l, l.r[l.n - 1].last, &m);
+    CHECK(same_as(db, &m, "G: applied"));
+    /* the engine's own creations are refused; what exists is found */
+    CHECK_EQ(eng_series(db, "new", TSDB_FLOAT32, &id), TSDB_ERR_READONLY);
+    CHECK_EQ(eng_state(db, "STOP", true, &code), TSDB_ERR_READONLY);
+    CHECK(eng_series(db, "s0", TSDB_FLOAT32, &id) == 0 && id == 0);
+    CHECK_EQ(eng_series(db, "s0", TSDB_INT64, &id), TSDB_ERR_INVALID);
+    CHECK_EQ(eng_series_count(db), 2);
+    /* a replay (a restart below the markers) makes nothing again */
+    CHECK_EQ(eng_close(db), 0);
+    CHECK_EQ(open_replica(dir, l.r[l.n - 1].last, &db), 0);
+    if (db) {
+        CHECK_EQ(eng_series_count(db), 2);
+        CHECK(eng_state(db, "RUN", false, &code) == 0 && code == 1);
+        CHECK(same_as(db, &m, "G: replayed"));
+        CHECK_EQ(eng_close(db), 0);
+    }
+    leader_free(&l);
+    /* histories that are not the leader's: the apply refuses and the engine fails */
+    int failed = 0;
+    CHECK_EQ(run_log("g1", log_gap, &failed), TSDB_ERR_CORRUPT);
+    CHECK(failed);
+    CHECK_EQ(run_log("g2", log_other_name, &failed), TSDB_ERR_CORRUPT);
+    CHECK(failed);
+    CHECK_EQ(run_log("g3", log_other_type, &failed), TSDB_ERR_CORRUPT);
+    CHECK(failed);
+    CHECK_EQ(run_log("g4", log_state_gap, &failed), TSDB_ERR_CORRUPT);
+    CHECK(failed);
+    CHECK_EQ(run_log("g5", log_ret_gap, &failed), TSDB_ERR_CORRUPT);
+    CHECK(failed);
+    CHECK_EQ(run_log("g6", log_class_gap, &failed), TSDB_ERR_CORRUPT);
+    CHECK(failed);
+}
+
+static int count_query(eng *db, uint32_t s, int64_t a, int64_t b, float *last)
+{
+    qctx q = {.n = 0};
+    if (eng_query_raw_ex(db, s, a, b, false, 0, qfn, &q) != 0)
+        return -1;
+    if (q.n && last)
+        *last = q.v[q.n - 1];
+    return (int)q.n;
+}
+
+static void case_clock(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "h");
+    leader l;
+    unsigned rng = 5;
+    leader_init(&l);
+    for (int i = 0; i < 6; i++)
+        leader_rows(&l, 5, &rng);
+    /* the leader's clock is a minute and a half past the rows; the wall clock is years later */
+    lrec *r1 = m_ret(&l, 0, 86400000, 0);
+    lrec *n1 = m_now(&l, T0 + 100000);
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, 0), 0);
+    CHECK_EQ(eng_now_ms(db), 0);
+    CHECK_EQ(replica_apply(db, r1->last), 0);
+    CHECK_EQ(eng_retention(db, 0), 86400000);
+    CHECK_EQ(replica_apply(db, n1->last), 0);
+    CHECK_EQ(eng_now_ms(db), T0 + 100000);
+    model m;
+    model_at(&l, n1->last, &m);
+    CHECK(same_as(db, &m, "H: retention by the leader's clock")); /* by the wall clock every row is a day old */
+    /* a NOW below the clock changes nothing; one above moves it */
+    lrec *n2 = m_now(&l, T0 + 50000);
+    lrec *n3 = m_now(&l, T0 + 200000);
+    lrec *r2 = m_ret(&l, 1, 600000, 16);
+    lrec *n4 = m_now(&l, T0 + 3600000);
+    CHECK_EQ(feed(db, &l, (size_t)(n1 - l.r) + 1, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, n2->last), 0);
+    CHECK_EQ(eng_now_ms(db), T0 + 100000);
+    CHECK_EQ(replica_apply(db, n3->last), 0);
+    CHECK_EQ(eng_now_ms(db), T0 + 200000);
+    CHECK_EQ(replica_apply(db, r2->last), 0);
+    CHECK_EQ(db->ret_off, 32);
+    CHECK(count_query(db, 1, T0 - 1000, T0 + 1000LL * (NT + 1), NULL) > 0);
+    CHECK_EQ(replica_apply(db, n4->last), 0);
+    CHECK_EQ(count_query(db, 1, T0 - 1000, T0 + 1000LL * (NT + 1), NULL), 0); /* ten minutes of retention, an hour later */
+    model_at(&l, n4->last, &m);
+    memset(m.has[1], 0, sizeof m.has[1]);
+    CHECK(same_as(db, &m, "H: s1 expired, s0 not"));
+    /* a part written by a flush carries the leader's time, and a restart starts the clock from it */
+    CHECK_EQ(mt_flush(db), 0);
+    CHECK_EQ(eng_close(db), 0);
+    CHECK_EQ(open_replica(dir, n4->last, &db), 0);
+    if (db) {
+        CHECK_EQ(db->ret_off, 32); /* the replay found both records there already */
+        CHECK(eng_now_ms(db) >= T0 + 3600000);
+        CHECK(same_as(db, &m, "H: after the restart"));
+        /* a record the file does not reach: the replica lacks one */
+        lrec *bad = m_ret(&l, 0, 1000, 4096);
+        CHECK_EQ(replica_append(db, bad->seq, bad->off, bad->bytes, bad->size), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(replica_apply(db, bad->last), TSDB_ERR_CORRUPT);
+        CHECK(eng_check(db) != 0);
+        eng_close(db);
+    }
+    leader_free(&l);
+}
+
+static void case_classes(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "i");
+    leader l;
+    unsigned rng = 7;
+    leader_init(&l);
+    for (int i = 0; i < 4; i++)
+        leader_rows(&l, 5, &rng); /* segment 1: rows of both series on the day of T0 */
+    leader_roll(&l);
+    lrec *first2 = leader_row1(&l, 1, T0 + 70000, 99.0f, T0 + 1000);
+    lrec *cm = m_class(&l, 0, 2, T0, 0);
+    int64_t far = T0 + 3 * 86400000LL;
+    lrec *fr = leader_row1(&l, 0, far, 7.0f, far);
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, first2->last), 0); /* segment 1 is sealed */
+    CHECK_EQ(mt_flush(db), 0);                    /* its rows of series 0 are in a part, in a class 0 partition */
+    int c = -1;
+    CHECK(eng_series_class(db, 0, &c) == 0 && c == 0);
+    CHECK_EQ(replica_apply(db, cm->last), 0);
+    CHECK(eng_series_class(db, 0, &c) == 0 && c == 2);
+    CHECK_EQ(db->cls_off, 24);
+    CHECK_EQ(replica_apply(db, fr->last), 0);
+    float v = 0;
+    CHECK_EQ(count_query(db, 0, far - 1, far + 1, &v), 1);
+    CHECK(v == 7.0f);
+    CHECK_EQ(mt_flush(db), 0);
+    CHECK_EQ(eng_close(db), 0);
+    /* the reopen checks every part against CLASSES; the replay of the CLASS record appends nothing */
+    CHECK_EQ(open_replica(dir, fr->last, &db), 0);
+    if (db) {
+        CHECK_EQ(db->cls_off, 24);
+        CHECK_EQ(count_query(db, 0, far - 1, far + 1, &v), 1);
+        model m;
+        model_at(&l, l.r[3].last, &m);
+        CHECK(same_as(db, &m, "I: segment 1's rows after the class switch"));
+        /* a CLASS record that is not where the file ends */
+        lrec *bad = m_class(&l, 1, 1, T0, 96);
+        CHECK_EQ(replica_append(db, bad->seq, bad->off, bad->bytes, bad->size), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(replica_apply(db, bad->last), TSDB_ERR_CORRUPT);
+        CHECK(eng_check(db) != 0);
+        eng_close(db);
+    }
+    leader_free(&l);
+}
+
 int main(int argc, char **argv)
 {
     int a = 1;
@@ -690,7 +1027,10 @@ int main(int argc, char **argv)
         eng_test_mutant = strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
                         : strcmp(m, "ackunsynced") == 0 ? MUT_REPLICA_ACK_UNSYNCED
                         : strcmp(m, "keepcut") == 0 ? MUT_REPLICA_KEEP_CUT
-                        : strcmp(m, "nofloor") == 0 ? MUT_REPLICA_NO_FLOOR : 0;
+                        : strcmp(m, "nofloor") == 0 ? MUT_REPLICA_NO_FLOOR
+                        : strcmp(m, "walclock") == 0 ? MUT_REPLICA_WALL_CLOCK
+                        : strcmp(m, "nopos") == 0 ? MUT_REPLICA_NO_POS
+                        : strcmp(m, "classat") == 0 ? MUT_REPLICA_CLASS_AT : 0;
         if (!eng_test_mutant) {
             fprintf(stderr, "unknown mutant %s\n", m);
             return 2;
@@ -705,6 +1045,9 @@ int main(int argc, char **argv)
     case_cut();
     case_refused();
     case_bad_appends();
+    case_dicts();
+    case_clock();
+    case_classes();
     for (unsigned seed = 1; seed <= 20; seed++) {
         int f0 = failures;
         case_random(seed);

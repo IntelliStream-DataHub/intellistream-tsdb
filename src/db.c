@@ -1274,8 +1274,54 @@ static int dict_get(eng *db, series_dict *d, const char *what, const char *name,
     return rc;
 }
 
+/* A replica makes names only as its log says (replica.c): the entry with this id is the next one of the dictionary, or
+ * one it holds already (a replay after a restart); anything else means its history is not the leader's. */
+static int dict_apply(eng *db, series_dict *d, const char *what, const char *name, size_t len, int type, bool is_state,
+                      uint32_t id)
+{
+    char *s = malloc(len + 1);
+    if (!s)
+        return TSDB_ERR_NOMEM;
+    memcpy(s, name, len);
+    s[len] = 0;
+    uint32_t have = 0;
+    int rc;
+    uint32_t count = atomic_load(&d->count);
+    if (id < count) {
+        rc = series_get(d, s, false, 0, &have);
+        rc = rc == 0 && (have != id || (!is_state && series_type(d, id) != type)) ? TSDB_ERR_CORRUPT
+             : rc == TSDB_ERR_NOTFOUND                                          ? TSDB_ERR_CORRUPT
+                                                                                : rc;
+    } else if (id == count) {
+        rc = dict_get(db, d, what, s, true, is_state ? 0 : type, &have);
+        if (rc == 0 && have != id)
+            rc = TSDB_ERR_CORRUPT;
+    } else {
+        rc = TSDB_ERR_CORRUPT;
+    }
+    if (rc == TSDB_ERR_CORRUPT)
+        fprintf(stderr, "tsdb: %s: the %s entry %" PRIu32 " (\"%s\") does not follow this replica's dictionary of %" PRIu32
+                        " entries: its history is not the leader's\n", db->dir, is_state ? "STATES" : "SERIES", id, s, count);
+    free(s);
+    return rc;
+}
+
+int eng_series_apply(eng *db, const char *name, size_t len, int type, uint32_t id)
+{
+    return dict_apply(db, &db->series, "append to the series dictionary", name, len, type, false, id);
+}
+
+int eng_state_apply(eng *db, const char *name, size_t len, uint32_t id)
+{
+    return dict_apply(db, &db->states, "append to the state dictionary", name, len, 0, true, id);
+}
+
 int eng_series(eng *db, const char *name, int type, uint32_t *id)
 {
+    if (db->rp) { /* names are made by the leader's SERIES records */
+        int rc = series_get(&db->series, name, false, type, id);
+        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_READONLY : rc == 0 && series_type(&db->series, *id) != type ? TSDB_ERR_INVALID : rc;
+    }
     return dict_get(db, &db->series, "append to the series dictionary", name, true, type, id);
 }
 int eng_series_lookup(eng *db, const char *name, uint32_t *id) { return series_get(&db->series, name, false, 0, id); }
@@ -1287,7 +1333,10 @@ int eng_series_type(eng *db, uint32_t id) { return series_type(&db->series, id);
 int eng_state(eng *db, const char *name, bool create, uint32_t *code)
 {
     uint32_t id;
-    int rc = dict_get(db, &db->states, "append to the state dictionary", name, create, 0, &id);
+    bool refuse = create && db->rp; /* a replica's names come from STATE records */
+    int rc = dict_get(db, &db->states, "append to the state dictionary", name, create && !db->rp, 0, &id);
+    if (refuse && rc == TSDB_ERR_NOTFOUND)
+        return TSDB_ERR_READONLY;
     if (rc == TSDB_ERR_NOTFOUND && db->opt.read_only) {
         series_reload(&db->states, db->dirfd); /* the writer may have made it a moment ago */
         rc = series_get(&db->states, name, false, 0, &id);

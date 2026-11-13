@@ -51,7 +51,7 @@ typedef struct eng eng;
  * catches the bug; nothing in the library or the server ever sets it. */
 enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR,
        MUT_FLUSH_NOCLOSE,
-       MUT_REPLICA_APPLY_ALL, MUT_REPLICA_ACK_UNSYNCED, MUT_REPLICA_KEEP_CUT, MUT_REPLICA_NO_FLOOR };
+       MUT_REPLICA_APPLY_ALL, MUT_REPLICA_ACK_UNSYNCED, MUT_REPLICA_KEEP_CUT, MUT_REPLICA_NO_FLOOR, MUT_REPLICA_WALL_CLOCK, MUT_REPLICA_NO_POS, MUT_REPLICA_CLASS_AT };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1946,6 +1946,13 @@ bool part_beyond_series(const part *p, uint32_t n, uint32_t *s);
 const char *eng_series_name(eng *db, uint32_t id);
 int eng_series_type(eng *db, uint32_t id);
 int eng_state(eng *db, const char *name, bool create, uint32_t *code);
+/* A replica's clock (replica.c): the newest commit_ms or NOW it applied, from parts at open; never the wall clock. */
+int64_t replica_now_ms(eng *db);
+void replica_now_advance(eng *db, int64_t ms);
+/* Replica only (replica.c): the leader's SERIES and STATE records. The id must be the dictionary's next one or an
+ * entry that is there already with this name (and type); anything else is TSDB_ERR_CORRUPT. */
+int eng_series_apply(eng *db, const char *name, size_t len, int type, uint32_t id);
+int eng_state_apply(eng *db, const char *name, size_t len, uint32_t id);
 const char *eng_state_name(eng *db, uint32_t code);
 /* v: slots of `type`; every series must be of that type */
 int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n);
@@ -2193,6 +2200,8 @@ int eng_series_class(eng *db, uint32_t series, int *cls);
 uint64_t cls_gen_now(eng *db);
 /* test hook: switch series to cls at the computed T, or at *at when that is later */
 int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at);
+/* Replica only (replica.c): the leader's CLASS record (classes.c cls_apply). */
+int cls_apply(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off);
 int tsdb_test_class_switch(struct tsdb *t, tsdb_sid series, int cls, const int64_t *at); /* through the volumes */
 /* An id no volume can have by its bits: a zero volume field (an id cut to 32 bits) or bits 48-63 set. Queries answer
  * TSDB_ERR_INVALID for it, so a truncated id does not look like an empty range; a well formed id that is unknown
@@ -2239,6 +2248,8 @@ int64_t eng_retention(eng *db, uint32_t series);
 int64_t eng_cutoff(eng *db, uint32_t series); /* rows before it have expired; INT64_MIN when none */
 int64_t eng_cutoff_at(eng *db, uint32_t series, int64_t now);
 int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms);
+/* Replica only: the leader's RETENTION record for `series`, which has record_off in the leader's file (replica.c). */
+int eng_retention_apply(eng *db, uint32_t series, int64_t limit_ms, uint64_t record_off);
 /* delete.c */
 int eng_delete_range(eng *db, uint32_t series, int64_t start, int64_t end);
 int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
