@@ -139,6 +139,8 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `metrics.port` | `--metrics-port` | string | unset | The Prometheus port (a number, or auto for one the kernel chooses). Off by default. |
 | `metrics.bind` | `--metrics-bind` | string | unset | The address of the metrics port. Default: server.listen. |
 | `stats.enabled` | `--no-stats` (when false) | boolean | true | false turns the statistics (docs/design-stats.md) off. |
+| `tenants.file` | `--tenants` | string | unset | The tenant list (docs/design-stats.md, section 2.1). Default: the prefix: grants that tenant admins hold admin on. |
+| `tenants.settle` | `--tenants-settle` | duration (plain: s) | 30s | How long a changed tenant list takes to settle before it applies. |
 | `latest.cache` | `--latest-cache` | size (plain: bytes) | unset | Memory of the latest-value table. Default: a sixteenth of the RAM. |
 | `health.domains` | `--health-domain` | list | unset | Path prefixes of storage that can fail alone (an NFS mount each): a volume under one answers UNAVAILABLE while its storage is down and the others go on. A comma-separated list. |
 | `cluster.enabled` | `--cluster` | boolean | false | Join a cluster (needs cluster.secret.file and cluster.state.dir). |
