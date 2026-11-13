@@ -664,7 +664,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-cli-stats test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1034,9 +1034,11 @@ $(B)/client-example: examples/client.c client/tsdb_client.h include/tsdb_calenda
 all: $(B)/embedded-example $(B)/client-example
 
 # Runs the README's quick start, word for word, in a scratch directory.
-test: test-quickstart test-cli-stats test-cli-cluster test-cluster-tutorial
+test: test-quickstart test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial
 test-cli-stats: $(B)/tsdb
 	B=$(B) tests/test_cli_stats.sh $(TMPDIR)
+test-cli-stats-net: $(B)/tsdb $(B)/tsdbd
+	B=$(B) tests/test_cli_stats_net.sh $(TMPDIR)
 test-cli-cluster: $(B)/tsdb
 	B=$(B) tests/test_cli_cluster.sh $(TMPDIR)
 # The cluster tutorial's command block, word for word (docs/cluster-preview.md), on ports the kernel picks.

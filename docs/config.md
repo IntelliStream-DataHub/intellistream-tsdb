@@ -177,11 +177,11 @@ Reserved keys (named for a design that is not built; a file that sets one is ref
 ## The tsdb command line tool
 
 `tsdb` reads a file for its connection settings only, the options of the commands that talk to a server:
-`tsdb user VERB ... --server HOST:PORT` (the user commands that work through a running tsdbd) and `tsdb cluster`.
+`tsdb user VERB ... --server HOST:PORT` (the user commands that work through a running tsdbd), `tsdb stats series|tenants|hot ... --server HOST:PORT` and `tsdb cluster`.
 Commands that open a database directory take everything from their arguments. `tsdb --config FILE ...` names the
 file; without it `tsdb` reads the first of `$XDG_CONFIG_HOME/tsdb/tsdb.properties`,
 `~/.config/tsdb/tsdb.properties` and `/etc/tsdb/tsdb.properties` that exists; `--no-config` reads none. With
-`client.server` set, `tsdb user VERB ...` goes through that server even without `--server`. `tsdb --check-config`
+`client.server` set, `tsdb user VERB ...` and `tsdb stats series|tenants|hot ...` go through that server even without `--server`. `tsdb --check-config`
 and `tsdb --config-keys` do what they do for tsdbd. The same rules apply (errors with the line, mode, precedence).
 
 ```properties
@@ -194,7 +194,7 @@ client.login.password.file = /home/me/.tsdb-password
 <!-- keys:tsdb:begin -->
 | Key | Option | Value | Default | Meaning |
 |---|---|---|---|---|
-| `client.server` | `--server` | string | unset | HOST:PORT of a running tsdbd: `tsdb user VERB ... ` goes through it (even without --server) and logs in as client.login. |
+| `client.server` | `--server` | string | unset | HOST:PORT of a running tsdbd: `tsdb user VERB ... ` and `tsdb stats series`, `tenants` and `hot` go through it (even without --server) and log in as client.login. |
 | `client.login` | `--login` | string | unset | The user to log in as. |
 | `client.login.password.file` | `--login-password-file` | string | unset | A file with that user's password (mode 600). Passwords are never written in the configuration file itself. |
 | `cluster.secret.file` | `--secret-file` | string | unset | The cluster's shared secret file, for `tsdb cluster`. |
