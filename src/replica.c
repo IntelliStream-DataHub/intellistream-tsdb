@@ -1172,3 +1172,98 @@ int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap,
     pthread_mutex_unlock(&rp->mu);
     return rc;
 }
+
+/* ------------------------------------------------------------ the leader side */
+/*
+ * The replicated backend of the namespace-event hook (internal.h, struct jr_ops; design-cluster.md 5.2, design-ha-modes.md
+ * 2.1): what a leader's engine does at a large insert, a replace, a delete and a drop so that every replica carries the
+ * same event out. The driver installs struct jr_ops (db->jr) before the engine is used.
+ *
+ * COMMIT (insert, replace, delete): the pending part files are shipped to every replica, which stages and syncs them
+ * (replica_stage); then a COMMIT marker (the leader's file names, sizes, checksums; F) is appended and the writer waits
+ * for its commit point; then the leader publishes as it always does (parts_commit under publish_lock). A failure after
+ * the marker is out fails the engine: a replica may apply it, so the leader must not go on as if nothing happened.
+ * F is the highest segment the leader has flushed (db->wal_flushed) once lw_enter's flush is done: every row of the
+ * write's keys that is older than the write is in a part of the leader, in a segment at or below F, so a replica that
+ * flushes through F before it commits has the same rows in parts (last write wins on each side the same way).
+ *
+ * DROP: the marker is the first record of the segment the flush starts (mt_flush_ex), so the replica that applies it
+ * has sealed every memtable the leader flushed, and none of the rows written after it.
+ */
+static int leader_commit(eng *db, const struct jr_commit_arg *ja)
+{
+    const struct jr_ops *jr = db->jr;
+    if (ja->n == 0)
+        return 0;
+    if (ja->n > MK_FILES_MAX)
+        return TSDB_ERR_INVALID;
+    size_t cap = 0;
+    for (size_t i = 0; i < ja->n; i++)
+        cap += 24 + 8 + 64;
+    uint8_t *files = malloc(cap);
+    if (!files)
+        return TSDB_ERR_NOMEM;
+    size_t len = 0;
+    int rc = 0;
+    for (size_t i = 0; i < ja->n && rc == 0; i++) {
+        part *p = ja->ps[i];
+        if (!p->pending[0] || !p->map) {
+            rc = TSDB_ERR_INVALID; /* not a pending part */
+            break;
+        }
+        mk_file f = {.name = p->pending, .name_len = (uint32_t)strlen(p->pending), .size = p->map_len,
+                     .xxh64 = xxh64(p->map, p->map_len, 0), .header_check = p->index_hash};
+        len += mk_file_put(files + len, &f);
+        rc = jr->ship(jr->ctx, db, p->pending, p->map_len);
+    }
+    if (rc) {
+        free(files);
+        return rc;
+    }
+    pthread_mutex_lock(&db->lock);
+    uint64_t through = db->wal_flushed;
+    pthread_mutex_unlock(&db->lock);
+    mk m = {.type = MK_COMMIT, .span = 1};
+    m.u.commit = (mk_commit){.op = (uint8_t)ja->op, .keys_form = MK_KEYS_NONE, .nfiles = (uint32_t)ja->n,
+                             .flush_through = through, .events = 1, .files = files, .files_len = len};
+    uint64_t fno = 0;
+    rc = wal_marker_mk(db, &m, &fno);
+    free(files);
+    if (rc)
+        return rc; /* the marker may be in the log (a failed sync): the engine is failed by the WAL's own rules */
+    rc = jr->wait(jr->ctx, db, fno);
+    if (rc) {
+        eng_fail(db, "a COMMIT marker was appended but its commit point did not come", EIO);
+        return rc;
+    }
+    return 0;
+}
+
+static int leader_drop(eng *db, int64_t ts)
+{
+    const struct jr_ops *jr = db->jr;
+    mk m = {.type = MK_DROP, .span = 1};
+    m.u.drop = (mk_drop){.dropped_before = ts, .partition = MK_NO_PARTITION};
+    uint64_t fno = 0;
+    int rc = mt_flush_ex(db, &m, &fno);
+    if (rc)
+        return rc;
+    rc = jr->wait(jr->ctx, db, fno);
+    if (rc)
+        eng_fail(db, "a DROP marker was appended but its commit point did not come", EIO);
+    return rc;
+}
+
+int jr_intent(eng *db, enum jr_kind kind, const void *arg)
+{
+    if (!db->jr)
+        return 0;
+    switch (kind) {
+    case JR_COMMIT:
+        return leader_commit(db, arg);
+    case JR_DROP:
+        return leader_drop(db, *(const int64_t *)arg);
+    default:
+        return 0; /* the dictionary and retention markers are the driver's (it appends them with wal_marker_mk) */
+    }
+}

@@ -1293,6 +1293,7 @@ int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t 
 void mem_run_free(mem_run *r);
 void mt_note_fno(memtable *m, uint64_t first, size_t n);
 int mt_flush(struct eng *db);
+int mt_flush_ex(struct eng *db, const mk *marker, uint64_t *fno); /* mt_flush with a marker as the new segment's first record */
 int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
                size_t n, int type);
 /* WAL records, version 2 (format 9, docs/design-cdc.md 2.1):
@@ -1343,11 +1344,28 @@ enum jr_kind {
     JR_RETENTION,  /* a retention limit was appended */
     JR_DICT,       /* a SERIES, STATE or CLASSES record was appended */
 };
-static inline int jr_intent(struct eng *db, enum jr_kind kind, const void *arg)
-{
-    (void)db, (void)kind, (void)arg;
-    return 0;
-}
+/* JR_COMMIT's `arg`: the pending parts of the insert, replace or delete (op: enum mk_op of marker.h). */
+struct jr_commit_arg {
+    struct part **ps;
+    size_t n;
+    int op;
+};
+/* The replicated backend (replica.c, "the leader side"; design-cluster.md 5.2): installed on a leader's engine by the
+ * driver (tsdbd's cluster thread in R3, tests/test_replica.c here), NULL otherwise (then jr_intent does nothing).
+ * The callbacks run on the writer's thread with no engine lock held except where said. */
+struct jr_ops {
+    void *ctx;
+    /* sends the pending file `name` (the leader's tmp name, `size` bytes, in the volume directory) to every replica of
+     * the ISR, which stages and syncs it (replica_stage); returns when they have */
+    int (*ship)(void *ctx, struct eng *db, const char *name, uint64_t size);
+    /* the marker whose last position is `last` is durable at the leader: returns once the commit point passed it and the
+     * replicas applied it (the leader's own apply follows), or an error (nothing is then published) */
+    int (*wait)(void *ctx, struct eng *db, uint64_t last);
+    /* a flushed WAL segment is about to be removed: the driver reads what it still needs (the records of the segment
+     * not yet sent). Under flush_lock. */
+    void (*seg_done)(void *ctx, struct eng *db, uint64_t seq);
+};
+int jr_intent(struct eng *db, enum jr_kind kind, const void *arg);
 static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
 {
     (void)db, (void)kind, (void)arg;
@@ -1672,6 +1690,8 @@ struct eng {
     size_t nflushing;
     bool wal_enabled;
     struct replica *rp; /* an engine opened as a replica (replica.c): the log arrives verbatim, rows apply at the commit point */
+    const struct jr_ops *jr;   /* the replicated backend of a leader (jr_intent), set before the engine is used */
+    pthread_mutex_t jr_serial; /* with jr: one large write at a time, lw_enter to lw_leave (marker order = block order) */
     int wal_fd;
     uint64_t wal_seq;
     uint64_t wal_off; /* bytes in segment wal_seq (the WAL writer role) */
@@ -2144,6 +2164,7 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
                   const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 int eng_optimize(eng *db);
 int eng_drop_before(eng *db, int64_t ts);
+int drop_retire(eng *db, int64_t ts); /* its part after the flush (also a replica's apply of a DROP) */
 int eng_get_stats(eng *db, tsdb_stats *st);
 int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs);
 

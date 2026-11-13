@@ -871,6 +871,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->wal_sync_lock, NULL);
     pthread_mutex_init(&db->manifest_lock, NULL);
     pthread_mutex_init(&db->publish_lock, NULL);
+    pthread_mutex_init(&db->jr_serial, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
     pthread_mutex_init(&db->tl_mu, NULL);
@@ -1181,6 +1182,7 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->wal_sync_lock);
     pthread_mutex_destroy(&db->manifest_lock);
     pthread_mutex_destroy(&db->publish_lock);
+    pthread_mutex_destroy(&db->jr_serial);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);
     pthread_mutex_destroy(&db->tl_mu);
@@ -1451,12 +1453,22 @@ int eng_drop_before(eng *db, int64_t ts)
 {
     if (db->opt.read_only || db->rp)
         return TSDB_ERR_READONLY;
-    /* memtable rows become parts first, so they are dropped with them */
+    /* memtable rows become parts first, so they are dropped with them. A replicated leader's jr_intent does it: its
+     * marker is the first record of the segment after the flush, and rows written since are not flushed here (a
+     * replica has them in its active memtable too, and keeps them) */
     int rc = jr_intent(db, JR_DROP, &ts);
-    if (rc == 0)
+    if (rc == 0 && !db->jr)
         rc = eng_flush(db);
     if (rc)
         return rc;
+    return drop_retire(db, ts);
+}
+
+/* The part of tsdb_drop_before after the flush: retires every partition that ends at or before ts. A replica runs
+ * it when it applies the DROP marker (replica.c), after it has flushed its sealed memtables. */
+int drop_retire(eng *db, int64_t ts)
+{
+    int rc;
     pthread_mutex_lock(&db->lock);
     /* A merge of a partition being dropped names its output (durably) before it takes db->lock to list it. Dropped
      * meanwhile, its sources are gone and the output is the only part with their rows: a crash after the

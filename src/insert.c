@@ -628,7 +628,8 @@ int parts_publish(eng *db, part **ps, size_t n)
 {
     if (n == 0)
         return 0;
-    int rc = jr_intent(db, JR_COMMIT, ps);
+    struct jr_commit_arg ja = {ps, n, MK_OP_INSERT};
+    int rc = jr_intent(db, JR_COMMIT, &ja);
     if (rc != 0)
         return rc;
     pthread_mutex_lock(&db->publish_lock);
