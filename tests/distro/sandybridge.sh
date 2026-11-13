@@ -59,7 +59,7 @@ emu() {
     for try in 1 2; do
         local args=()
         case $t in test_levels) ;; test_*) args=("$(mktemp -d "$scratch/$t.XXXXXX")") ;; esac
-        run in_time "$qemu" -cpu "$cpu" "$b/$t" "${args[@]}"
+        TSDB_RS_QUICK=1 run in_time "$qemu" -cpu "$cpu" "$b/$t" "${args[@]}"
         case $rc in 124 | 137) ;; *) return ;; esac
         if [ "$try" = 1 ]; then
             echo "=== HUNG: killed after $emu_timeout s (qemu-user can deadlock after a fork); once more"
@@ -70,7 +70,7 @@ emu() {
     done
 }
 export TSDBD=$b/tsdbd
-for t in test_levels test_tsdb test_types codec-bench type-bench; do
+for t in test_levels test_rs test_tsdb test_types codec-bench type-bench; do
     args=()
     case $t in test_*) [ $t != test_levels ] && args=("$scratch") ;; esac
     TSDB_CPU=v2 run "$b/$t" "${args[@]}"
@@ -80,7 +80,7 @@ if [ -z "$qemu" ] || ! [ -x "$qemu" ]; then
 else
     for cpu in Westmere SandyBridge; do
         $qemu -cpu help | grep -qw $cpu || { echo "sandybridge: $qemu has no $cpu model"; exit 1; }
-        for t in test_levels test_tsdb test_types codec-bench type-bench; do
+        for t in test_levels test_rs test_tsdb test_types codec-bench type-bench; do
             emu $cpu $t
         done
     done

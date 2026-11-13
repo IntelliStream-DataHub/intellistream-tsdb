@@ -82,6 +82,20 @@ ifneq ($(strip $(CPU_LEVELS)),)
 override CFLAGS += -DTSDB_LEVELS $(foreach l,$(CPU_LEVELS),-DTSDB_HAVE_$(l))
 OBJ := $(filter-out $(LV_SRC:%=$(B)/%.o),$(OBJ)) $(foreach l,base $(CPU_LEVELS),$(LV_SRC:%=$(B)/%.$(l).o))
 endif
+# The erasure codec (src/ec, docs/design-cluster-data.md E32): intellistream-objects' src/codec copied unchanged
+# (tools/sync-ec.sh), in libtsdb. It is x86-64 code (SSSE3 and wider kernels behind runtime dispatch; no scalar port of
+# the copy is needed, since the scalar kernel is in it): other machines build without it. -DISO_GF256_NO_BOOT leaves
+# out gf256.c's constructor; src/cpu.c calls tsdb_ec_select() instead (AGENTS.md "CPU levels"). Compiled once, at the
+# baseline of $(ARCH): the AVX2, AVX-512 and GFNI kernels carry target attributes and run only where src/ec/compat.c's
+# iso_cpu_has() says so (tools/check-isa.sh checks that nothing else in them goes beyond x86-64-v2).
+ifeq ($(shell uname -m),x86_64)
+EC_OBJ := $(B)/ec_gf256.o $(B)/ec_gf256_avx2.o $(B)/ec_gf256_avx512.o $(B)/ec_rs.o $(B)/ec_compat.o
+OBJ  += $(EC_OBJ)
+override CFLAGS += -DTSDB_EC
+endif
+EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
+$(B)/ec_%.o: src/ec/%.c $(EC_HDR) src/internal.h | $(B)
+	$(CC) $(CFLAGS) -Isrc/ec/compat -DISO_GF256_NO_BOOT -c -o $@ $<
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
@@ -301,7 +315,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
-test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
+test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(or $(TMPDIR),/tmp)
 	B=$(B) tests/test_config.sh $(TMPDIR)
 	./$(B)/test_group
@@ -320,6 +334,11 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_classes
 	./$(B)/test_follow
 	./$(B)/test_volumes
+	./$(B)/test_rs $(or $(TMPDIR),/tmp)
+	for m in coef kernel guard; do ! ./$(B)/test_rs --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	tools/sync-ec.sh --check
+	B=$(B) tools/check-ec-symbols.sh
+	! B=$(B) tools/check-ec-symbols.sh --lib $(LIB) >/dev/null 2>&1 # the engine's library holds the codec: the check must fail on it
 	./$(B)/test_crypto
 	./$(B)/test_users
 	B=$(B) tests/test_cli_users.sh
@@ -498,7 +517,7 @@ GLIBC_MAX  ?= 2.34
 DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tools/glibc-compat.h" \
               CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
 DIST_BINS   = tsdbd tsdb codec-bench type-bench twa-bench fold-bench tsdb-bench insert-bench tsdbc-bench scale-bench
-DIST_TESTS  = test_tsdb test_types test_levels test_group test_lttb test_twa test_spread test_limits test_follow test_volumes test_server test_stability test_ports
+DIST_TESTS  = test_tsdb test_types test_levels test_rs test_group test_lttb test_twa test_spread test_limits test_follow test_volumes test_server test_stability test_ports
 DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS) libcrashfs.so)
 
 DIST_SIG    = $$($(CC) --version | head -n 1) | $(CC) | $(CFLAGS) | $(subst ",,$(DIST_VARS)) | $(LV_FLAGS_v3) | $(LV_FLAGS_v4) \
@@ -850,6 +869,9 @@ $(B)/test_types: tests/test_types.c src/internal.h $(LIB)
 
 $(B)/test_delete: tests/test_delete.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+$(B)/test_rs: tests/test_rs.c src/internal.h $(EC_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
 
 $(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
