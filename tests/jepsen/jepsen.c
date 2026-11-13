@@ -2427,7 +2427,8 @@ static void *nemesis_thread(void *arg)
  *   idle time in the fault steps (the time before the signal in a kill, power or eio step, less the CPU wait): 0.00 s in every honest run (bound 5% of the run)
  * A nemesis that works at a third of the honest rate, at half of it (slow:MS), stops at three quarters of the run (hole:15:100) or
  * sees no server die in its naps (blind:MS) is failed by the selftest of the Makefile, 10 of 10 runs in each of the four conditions
- * (/tmp and /var/tmp, quiet and with 16 busy loops).
+ * (/tmp and /var/tmp, quiet and with 16 busy loops; round 8 on the final code, with the cases added in it: starve:800 valid, the kill, power
+ * and eio steps that sleep 400 ms with the server live, the slow mark of the shim, a reader of a mapping the power loss cuts).
  * What passes, on purpose, and is not a failure of the check: (1) a nemesis at half the honest rate (slow:MS: the floor is half the honest
  * least, so such a run is at the floor and about one in four fails to fail: eio slow:1600 over 60 s passed 1 of 4 runs under load; at a
  * third of the rate, 0 of 16); (2) a nemesis that stops working at nine tenths of a run (the gap bound is a tenth of the run, 2 s of 20), or at
