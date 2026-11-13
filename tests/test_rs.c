@@ -33,6 +33,14 @@
  */
 #include "internal.h"
 
+#ifndef TSDB_EC /* Apple silicon and other machines that are not x86-64: the Makefile builds no src/ec there */
+#include <stdio.h>
+int main(void)
+{
+    printf("test_rs: SKIPPED (this build has no erasure codec: it is x86-64 only)\n");
+    return 0;
+}
+#else
 #include "ec/gf256.h"
 #include "ec/rs.h"
 
@@ -608,3 +616,4 @@ int main(int argc, char **argv)
     printf("test_rs: ok\n");
     return 0;
 }
+#endif /* TSDB_EC */

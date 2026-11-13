@@ -91,6 +91,7 @@ endif
 ifeq ($(shell uname -m),x86_64)
 EC_OBJ := $(B)/ec_gf256.o $(B)/ec_gf256_avx2.o $(B)/ec_gf256_avx512.o $(B)/ec_rs.o $(B)/ec_compat.o
 OBJ  += $(EC_OBJ)
+EC_BENCH := $(B)/ec-bench
 override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
@@ -99,7 +100,7 @@ $(B)/ec_%.o: src/ec/%.c $(EC_HDR) src/internal.h | $(B)
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench
+all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench $(EC_BENCH)
 
 $(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -335,10 +336,10 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_follow
 	./$(B)/test_volumes
 	./$(B)/test_rs $(or $(TMPDIR),/tmp)
-	for m in coef kernel guard; do ! ./$(B)/test_rs --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	$(if $(EC_OBJ),for m in coef kernel guard; do ! ./$(B)/test_rs --mutant $$m >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	tools/sync-ec.sh --check
 	B=$(B) tools/check-ec-symbols.sh
-	! B=$(B) tools/check-ec-symbols.sh --lib $(LIB) >/dev/null 2>&1 # the engine's library holds the codec: the check must fail on it
+	$(if $(EC_OBJ),! B=$(B) tools/check-ec-symbols.sh --lib $(LIB) >/dev/null 2>&1) # the engine's library holds the codec: the check must fail on it
 	./$(B)/test_crypto
 	./$(B)/test_users
 	B=$(B) tests/test_cli_users.sh
@@ -795,6 +796,11 @@ $(B)/fold-bench: tools/fold-bench.c tools/common.h src/internal.h $(LIB)
 
 $(B)/decode-bench: tools/decode-bench.c tools/common.h src/internal.h src/bitpack.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+ifneq ($(EC_OBJ),)
+$(B)/ec-bench: tools/ec-bench.c tools/common.h src/internal.h $(EC_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
+endif
 
 $(B)/threads-bench: tools/threads-bench.c tools/common.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)

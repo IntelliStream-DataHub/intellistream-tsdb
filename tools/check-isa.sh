@@ -5,7 +5,10 @@
 # dispatched functions), or uses instructions beyond x86-64-v2 outside the code
 # that is only reached after a CPU check: the per-level compiles (*.v3.o,
 # *.v4.o, functions *_v3/_v4), simd.c's kernels (functions *_avx/*_avx2/*_avx512,
-# and GCC's .part/.constprop clones of them), and zstd's BMI2 variants. An
+# and GCC's .part/.constprop clones of them), the GF(256) kernels of the erasure
+# codec (src/ec: iso_gf256_mul_add_avx2/_avx512/_gfni256/_gfni512, which carry
+# target attributes and which src/ec/compat.c's iso_cpu_has() lets run only at
+# the CPU level src/cpu.c picked), and zstd's BMI2 variants. An
 # emulator finds most such slips (qemu -cpu SandyBridge raises SIGILL), but not
 # LZCNT: older CPUs run it as BSR and silently get another result. So this
 # reads the machine code.
@@ -36,7 +39,7 @@ trap 'rm -rf "$tmp"' EXIT
 # 0. a level object must not run anything by itself: a constructor (or any
 #    .init_array/.ctors entry) of a v3/v4 copy runs at startup on every CPU,
 #    before the dispatch, and dies with SIGILL on one without that level
-for o in "$dir"/*.v3.o "$dir"/*.v4.o; do
+for o in "$dir"/*.v3.o "$dir"/*.v4.o "$dir"/ec_*.o; do
     [ -e "$o" ] || continue
     if objdump -h "$o" | awk '{print $2}' | grep -Eq '^\.(init_array|preinit_array|ctors|init)(\.|$)'; then
         echo "$o: has startup code (.init_array/.ctors): it would run unchecked on every CPU" >&2
@@ -71,6 +74,14 @@ for o in "$dir"/*.o; do
         # simd.c's kernels carry their own targets (*_avx, *_avx2, *_avx512); GCC may split one (agg_avx2.part.0):
         # the piece keeps its target and only the kernel calls it
         case "$(basename "$o"):${fn%%.*}" in simd.o:*_avx | simd.o:*_avx2 | simd.o:*_avx512) continue ;; esac
+        # src/ec's wide kernels: two objects (ec_gf256_avx2.o; ec_gf256_avx512.o, which also holds the 256-bit GFNI
+        # one), each entered only through iso_gf256_mul_add's pointer, which iso_gf256_init sets from iso_cpu_has
+        # (capped at the level src/cpu.c picked)
+        case "$(basename "$o"):${fn%%.*}" in
+        ec_gf256_avx2.o:iso_gf256_mul_add_avx2 | ec_gf256_avx2.o:iso_gf256_mul_add_gfni256) continue ;;
+        ec_gf256_avx512.o:iso_gf256_mul_add_avx512 | ec_gf256_avx512.o:iso_gf256_mul_add_gfni256 | \
+            ec_gf256_avx512.o:iso_gf256_mul_add_gfni512) continue ;;
+        esac
         echo "$o: $fn: $cnt instructions beyond x86-64-v2" >&2
         echo x >>"$tmp/bad"
     done
@@ -85,6 +96,10 @@ done | sort -u >"$tmp/level_fns"
 # _avx2 is not let through
 nm --defined-only "$dir/simd.o" | awk '$2 ~ /^[tT]$/ {sub(/\..*/, "", $3); print $3}' |
     grep -E '_avx$|_avx2$|_avx512$' | sort -u >"$tmp/simd_fns"
+# the erasure codec's wide kernels, by name and by the object that defines them
+for o in ec_gf256_avx2.o ec_gf256_avx512.o; do
+    [ -e "$dir/$o" ] && nm --defined-only "$dir/$o" | awk '$2 ~ /^[tT]$/ {sub(/\..*/, "", $3); print $3}'
+done | grep -E '^iso_gf256_mul_add_(avx2|avx512|gfni256|gfni512)$' | sort -u >"$tmp/ec_fns"
 for b in "$@"; do
     above_v2 "$b" | while read -r fn cnt; do
         base=${fn%%.*} # foo.part.0, foo.constprop.0
@@ -93,6 +108,7 @@ for b in "$@"; do
         HUF_*_bmi2 | FSE_*_bmi2 | ZSTD_*_bmi2 | HUF_*_fast | HUF_*_fast_c_loop | HUF_*_fast_asm_loop) continue ;;
         esac
         grep -qx "$base" "$tmp/simd_fns" && continue
+        grep -qx "$base" "$tmp/ec_fns" && continue
         grep -qx "$fn" "$tmp/level_fns" && continue # a static helper of a level compile (its base copy is step 1's)
         echo "$b: $fn: $cnt instructions beyond x86-64-v2" >&2
         echo x >>"$tmp/bad"

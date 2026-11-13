@@ -8,6 +8,18 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**The erasure codec of the cluster's data path is in the tree (`src/ec`), nothing calls it yet; no format or protocol
+change.** Reed-Solomon over GF(2^8) with SSSE3, AVX2, AVX-512 and GFNI kernels, copied unchanged from
+intellistream-objects (`tools/sync-ec.sh`; `src/ec/UPSTREAM` names the commit), AGPL-3.0-only like the engine, in
+`libtsdb` on x86-64 and never in a client library. The kernels run only at the CPU level `src/cpu.c` picked (a
+`TSDB_CPU=v2` process never executes an AVX instruction: `tools/check-isa.sh` allows them only in those kernels).
+
+- Tests: `test_rs` (4+2, 8+2, 8+4, 16+4 and the small ones; every erasure pattern up to m for the first three,
+  sampled for 16+4; lengths from 1 byte to several MB, unaligned buffers; every kernel of every level; the mutants
+  `coef`, `kernel` and `guard` must fail), `test_levels` (the same parity and the same rebuilt data at every level),
+  `tools/check-ec-symbols.sh`, and `tools/sync-ec.sh --check`. `build/ec-bench` measures encode and decode per
+  geometry, level and kernel (docs/tasks/ec-bench.md).
+
 **Appends without an fsync per call are faster again, no format change.** 0.10.0 lost speed on one-row appends with
 `wal_sync_ms` above 0 when many threads append (16 to 17% less than 0.9.1 at 16 and 64 threads, measured; nothing
 measurable at one thread or with an fsync per call). The branch gets back about half of it (+10 to 11% over 0.10.0, 7.7%

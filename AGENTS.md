@@ -166,6 +166,13 @@ cgroup, so `nice` does not keep your work out of its way.
   the cluster thread; the hard-state save stays on the cluster thread (its slot sequence is shared with the durable
   floor, which the copied log does not lock). `tests/jepsen/crashfs.c` follows dup'ed descriptors (the Raft log syncs
   duplicates of its segments).
+- `src/ec/`: the erasure codec (Reed-Solomon over GF(2^8); `gf256*.c`, `rs.[ch]`) copied from intellistream-objects
+  (`UPSTREAM`; `tools/sync-ec.sh` copies it again, `--check` compares; never edit the copies; `compat.[ch]` and
+  `compat/` are tsdb's own). Built without gf256's constructor (`-DISO_GF256_NO_BOOT`): `src/cpu.c` hands the level to
+  `tsdb_ec_select`, which caps what `iso_cpu_has` says, so a `TSDB_CPU=v2` process never runs an AVX kernel
+  (`tools/check-isa.sh` allows the wide kernels by name). In `libtsdb` on x86-64 only, never in a client library
+  (`tools/check-ec-symbols.sh`). `tests/test_rs.c` (exhaustive erasure patterns, every level and kernel, mutants via
+  `--mutant coef|kernel|guard`), `tests/test_levels.c`, `build/ec-bench`.
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
