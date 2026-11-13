@@ -1416,7 +1416,9 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
     }
     if (rc == 0) {
         db->wal_off += len;
+        pthread_mutex_lock(&db->buf_lock); /* manifest_publish reads it under buf_lock (the flusher's thread) */
         db->fno_next = next;
+        pthread_mutex_unlock(&db->buf_lock);
         if (eng_test_mutant == MUT_REPLICA_ACK_UNSYNCED) /* planted: acknowledge what is not synced */
             rp->durable_next = next;
         pthread_mutex_lock(&rp->segs_mu);
@@ -1607,7 +1609,9 @@ int replica_cut(eng *db, uint64_t last)
         if (t >= 0)
             rp->segs[t].len = off_cut;
         pthread_mutex_unlock(&rp->segs_mu);
+        pthread_mutex_lock(&db->buf_lock);
         db->fno_next = last + 1;
+        pthread_mutex_unlock(&db->buf_lock);
         for (size_t i = rp->ncm; i-- > 0;) /* the COMMIT markers above the cut never happened: their files go */
             if (rp->cm[i].first > last)
                 cm_remove(db, rp, i);
