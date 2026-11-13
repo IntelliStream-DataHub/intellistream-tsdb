@@ -80,5 +80,6 @@ What it shows:
   reads and writes memory. The claim holds when the stripe is cache-sized and misses by 8 percent when it is not. The 4 MiB rows are the mean of 2
   runs (1 MiB: 3), so read them as 7.0 to 7.8 GB/s for every kernel (ssse3 7.75, gfni256 at v3 7.59, v4 7.40): the spread is
   inside the sd, and no kernel is the best there.
+  The user accepted this on 2026-11-13: 7.4 GB/s a core at 4 MiB shards is enough; the claim stands as measured.
 - Memory bound at 4 MiB: 16+4 reads 16 and writes 4 shards of 4 MiB per stripe, 7.4 GB/s of data is about 9.3 GB/s of
   memory traffic a core; the kernels have run out of what one core's memory path gives.
