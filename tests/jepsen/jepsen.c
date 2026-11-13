@@ -2281,13 +2281,23 @@ static void *nemesis_thread(void *arg)
                     if (getenv("JEPSEN_FAULT_TRACE"))
                         fprintf(stderr, "jepsen: shim's own EIO at %.3f s, server %s\n", (double)(now_ns() - nem_t0_ns) / 1e9, gone ? "gone" : "alive");
                 }
+                /* the shim creates the mark and writes its line a moment later: a reader that comes between (a shim thread that waits for a
+                 * CPU for tens of ms) finds an empty name, which is no part (tmp_) and so a file the server must have stopped on: an honest
+                 * run failed with "after EIO on  the server is still running after 20 s". The line is whole when it ends in a newline. */
                 char failed[PATH_MAX] = "";
-                FILE *m = fopen(markpath, "r");
-                if (m) {
-                    if (fgets(failed, sizeof failed, m))
-                        failed[strcspn(failed, "\n")] = 0;
-                    fclose(m);
+                for (int w = 0; w < 1000; w++) {
+                    failed[0] = 0;
+                    FILE *m = fopen(markpath, "r");
+                    bool whole = false;
+                    if (m) {
+                        whole = fgets(failed, sizeof failed, m) && strchr(failed, '\n');
+                        fclose(m);
+                    }
+                    if (whole)
+                        break;
+                    usleep(10000);
                 }
+                failed[strcspn(failed, "\n")] = 0;
                 const char *base = strrchr(failed, '/') ? strrchr(failed, '/') + 1 : failed;
                 /* A file the engine relies on (the WAL, MANIFEST, the dictionaries, a directory) must fail-stop the server. That takes
                  * about 220 ms on a quiet machine and seconds with 16 busy loops on 4 CPUs (an honest loaded run ended on a bound of

@@ -169,6 +169,7 @@ static int md_files; /* 0: every file, 1: parts only, 2: all but parts */
 static char md_log[PATH_MAX];
 static char lying_dir[PATH_MAX]; /* a directory whose syncs lie after the error */
 static char mark[PATH_MAX], eio_only[64], eio_on[16];
+static unsigned mark_slow_ms; /* CRASHFS_MARK_SLOW_MS: the mark file is created this long before its line is written (a thread that waits for a CPU does the same) */
 static char *fdpath[MAX_FDS];
 static file *files;
 static size_t nfiles;
@@ -296,6 +297,8 @@ __attribute__((constructor)) static void init(void)
         snprintf(eio_on, sizeof eio_on, "%s", getenv("CRASHFS_EIO_ON"));
     if (getenv("CRASHFS_MARK"))
         snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
+    if (getenv("CRASHFS_MARK_SLOW_MS"))
+        mark_slow_ms = (unsigned)atoi(getenv("CRASHFS_MARK_SLOW_MS"));
     tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
     rewrite_old = getenv("CRASHFS_REWRITE") && !strcmp(getenv("CRASHFS_REWRITE"), "old");
     loss_at_exit = getenv("CRASHFS_AT_EXIT") && atoi(getenv("CRASHFS_AT_EXIT")) != 0;
@@ -692,6 +695,8 @@ static bool eio_now(int fd, const char *what)
     if (mark[0]) {
         int m = real_open(mark, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (m >= 0) {
+            if (mark_slow_ms)
+                usleep(mark_slow_ms * 1000);
             n = snprintf(msg, sizeof msg, "%s\n", fdpath[fd]);
             if (real_write(m, msg, (size_t)n) < 0) {
             }

@@ -1167,6 +1167,10 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^valid$$' || \
 	       ! echo "$$out" | grep -q 'longest dead stretch [3-9][0-9][0-9] ms before\|longest dead stretch [0-9][0-9][0-9][0-9] ms before'; then \
 	        echo "jepsen-selftest: a nemesis starved of the CPU (a server dead 800 ms before it was reaped) was called idle, or left none dead (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(CRASHFS_EIO_ONLY=tmp_ CRASHFS_MARK_SLOW_MS=300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis eio --seconds 20 \
+	    --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^valid$$'; then \
+	        echo "jepsen-selftest: a shim slow to write its mark (the nemesis found it empty: an unpublished part's EIO read as the WAL's) made an honest eio run fail (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(JEPSEN_TSDBD=tests/jepsen/hang-tsdbd.sh timeout 300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'it is hung'; then \
