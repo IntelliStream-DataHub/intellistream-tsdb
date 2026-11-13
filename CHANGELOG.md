@@ -8,6 +8,24 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**Statistics over the network, protocol 15 (floor stays 12).** Everything of `docs/design-stats.md` that was embedded-only
+is now a request to `tsdbd`: the storage numbers of series, and the numbers, hot series and request costs of tenants.
+Older clients keep working (new ops only); the clients send them only to a server that says 15 or more.
+
+- Two ops: STATS_SERIES (46) and STATS_TENANTS (47), with `auth_ops` rows: a user sees the series it may read (a denied
+  and a missing series look alike) and, as a tenant admin, its own tenant; a user who reads everything sees all
+  tenants, "(none)" and the hot lists' error bounds. Replies obey a work budget (series) and 64 MB (tenants) and carry
+  a cursor; CANCEL works on both. Per-tenant numbers are never on the metrics port.
+- `tsdbd` keeps a tenant list and counts each tenant's own requests (per request, not per row, off the append path):
+  `--tenants FILE` (SIGHUP reloads it; `tenants.file`), else the `prefix:` selectors that tenant admins hold `admin`
+  on; a changed list applies after `--tenants-settle` seconds (`tenants.settle`, 30).
+- Clients: C `tsdbc_series_stats` and `tsdbc_tenant_stats`; Rust, Python and Java `series_stats`/`tenant_stats`
+  (`seriesStats`/`tenantStats`); the embedded bindings got the same calls plus `set_tenants` and `stats_settle`.
+- CLI: `tsdb stats series|tenants|hot ... --server HOST:PORT --login NAME --login-password-file FILE` asks a running
+  server as that user (also from the `client.*` keys of the configuration file).
+- The change feed's planned protocol number is now 16 (statistics landed first).
+- Tests: `tests/test_stats_net.c`, `tests/test_cli_stats_net.sh`, fuzz seeds for both ops, tests in the four clients.
+
 **Appends without an fsync per call are faster again, no format change.** 0.10.0 lost speed on one-row appends with
 `wal_sync_ms` above 0 when many threads append (16 to 17% less than 0.9.1 at 16 and 64 threads, measured; nothing
 measurable at one thread or with an fsync per call). The branch gets back about half of it (+10 to 11% over 0.10.0, 7.7%

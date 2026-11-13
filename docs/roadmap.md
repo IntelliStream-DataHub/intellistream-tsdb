@@ -96,10 +96,11 @@ otherwise:
 What comes after 0.10.0, in the order it is likely to be done. The format and the protocol freeze at 1.0, so what
 changes them goes before it:
 
-1. The change feed's reader (docs/design-cdc.md, step F2 and on): a wire op (protocol 15) and the clients, on top of the
+1. The change feed's reader (docs/design-cdc.md, step F2 and on): a wire op (protocol 16) and the clients, on top of the
    segments that F1 keeps. Until then the feed is off by default and has no consumer.
-2. Statistics over the wire (docs/design-stats.md; protocol 16): tenants, hot series and residency are in the embedded
-   API and the CLI only today, and the metrics port carries no per-tenant numbers on purpose.
+2. Statistics over the wire (docs/design-stats.md; protocol 15, built in step 5): tenants, hot series and residency are in
+   the embedded API, the CLI and over the network (STATS_SERIES, STATS_TENANTS); the metrics port carries no per-tenant
+   numbers on purpose.
 3. The cluster beyond its metadata group (docs/design-cluster.md, docs/design-ha-modes.md): the proposer's rules and
    the time rules (N7), data replication, failover and placement. It must not need another format or protocol
    change after 1.0: what 1.0 needs of it is in docs/design-cluster.md section 11.

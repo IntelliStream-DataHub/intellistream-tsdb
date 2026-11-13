@@ -3,7 +3,7 @@
 Status: steps 1 and 2 (§9) are on main (query counters, event ring, sweeper, `tsdb_series_stats`, the metrics and
 `tsdb DIR stats [series]`); steps 3 and 4 are built on branch `stats-s34` (tenants, hot lists, residency, the C API
 and `tsdb DIR stats tenants|hot`; "Steps 3 and 4 as built" in §8 lists where they differ from the text below); step 5
-(the server ops and the clients) is not. Design as written: Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
+(the server ops, the clients and `tsdb stats ... --server`) is built on branch `stats-s5` ("Step 5 as built" in §8). Design as written: Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
 same day after an adversarial review (findings H1-H4, M1-M10, L1-L10; §11 says where each one is answered).
 Code references are `file:line` at e33d87f.
 
@@ -13,7 +13,7 @@ here".
 
 Related designs: [design-auth.md](design-auth.md) (tenants are name prefixes, tenant admins, rights),
 [design-latest.md](design-latest.md) (the latest-value table and its hit counters, protocol 14),
-[design-cdc.md](design-cdc.md) (feed slots and their lag, protocol 15), [design-ha-modes.md](design-ha-modes.md) and
+[design-cdc.md](design-cdc.md) (feed slots and their lag, protocol 16), [design-ha-modes.md](design-ha-modes.md) and
 [design-cluster.md](design-cluster.md) (volumes on failover pairs and on replicas; format 9 in step S0),
 [metrics.md](metrics.md) (the Prometheus port).
 
@@ -63,7 +63,7 @@ Related designs: [design-auth.md](design-auth.md) (tenants are name prefixes, te
 | `part_open` hashes the header, the whole index and the trailer, so the open already reads every index | src/part.c:222, `part_hash` :60-67 |
 | The `STATS` op (10): `tsdb_stats` as 8 x u64, superuser or read on `all` | include/tsdb_protocol.h:40, 212; server/auth.c:85, 910; server/tsdbd.c:1833-1840 |
 | The CLI's `stats` assumes 12 bytes per raw row (float32) for every type; the CLI opens read-only for commands that do not write, so it runs beside a running tsdbd | tools/tsdb-cli.c:818-829; :759-764 |
-| Protocol 13 (HA bodies, TOPOLOGY 48 and STATUS 49), ops 1-38 as before; design-latest takes 39 and protocol 14; design-cdc takes 40-45 and protocol 15 | include/tsdb_protocol.h:192, 204-239; design-latest.md L14; design-cdc.md:744-784 |
+| Protocol 13 (HA bodies, TOPOLOGY 48 and STATUS 49), ops 1-38 as before; design-latest takes 39 and protocol 14; design-cdc takes 40-45 and protocol 16 (statistics took 15 and ops 46-47 when they landed first) | include/tsdb_protocol.h:192, 204-239; design-latest.md L14; design-cdc.md:744-784 |
 | The largest frame is 256 MB; a larger reply closes the connection | include/tsdb_protocol.h:195; server/tsdbd.c:647-651 |
 | The metrics thread: global atomic counters, hooks that return at once when the port is off | server/metrics.c:68-80, 110-190; server/metrics.h:37-51 |
 | Metrics never carry user or series names; per-volume gauges carry the path | docs/metrics.md:5-7; design-auth.md A21 |
@@ -326,7 +326,9 @@ day partitions x 10^4 tenants all present in every partition x 56 B = 204 MB per
   - A user holding `admin` on `prefix:Q` sees each tenant whose prefix starts with Q, and gets that tenant's own
     `progress` and `stale_s`. A tenant it names that starts with Q but is not in the list is `NOTFOUND`; anything
     else it names is `DENIED`.
-  - Everyone else: `DENIED`. With `--no-auth` every tenant is visible, as data ops are.
+  - Everyone else sees no tenant: a listing (no prefix named) answers status 0 with no rows, and a tenant it names is
+    `DENIED` in its row. The list's `generation` and `list_hash` go to every user that is logged in (they say nothing about
+    the data). With `--no-auth` every tenant is visible, as data ops are.
 
 ## 5. Exposure
 
@@ -575,6 +577,42 @@ Where the code differs from the text above:
 - **Tenant numbers are process-wide** and never reused (`tenant_intern`); `tsdb_tenant_stats_get` is named so because
   the struct has the design's name. `TSDB_ABI_VERSION` is 6; the bindings carry the new `tsdb_options` fields (the
   tenant list itself is not offered in them before step 5).
+
+### Step 5 as built (`server/tenants.[ch]`, `server/tsdbd.c`, the clients, `tests/test_stats_net.c`)
+
+- **Protocol 15**, ops STATS_SERIES 46 and STATS_TENANTS 47 as in §5.1 (floor still 12, a client sends them only when
+  HELLO says 15 or more, else `TSDB_ERR_INVALID` and nothing is sent). The feed's protocol number moved to 16
+  (AGENTS.md, design-cdc.md).
+- **The tenant list in tsdbd** (`server/tenants.c`): `--tenants FILE` (SIGHUP reads it again) or, without it and with
+  login on, the `prefix:` selectors that users hold `admin` on; keys `tenants.file` and `tenants.settle`
+  (`--tenants-settle`, 30 s: a changed set must stay the same that long before the server and the engine apply it,
+  `tsdb_set_tenants`). A slot per prefix, never reused; slot 0 is "(none)".
+- **The by-caller counters** are per thread and per tenant slot (a block of pages written with relaxed stores, no
+  read-modify-write, the way the query counters are); one count per request, never per row. A user's tenant is the
+  longest list prefix that its name starts with and that holds every one of its grants; a superuser and everyone else
+  is "(none)". The block is on the summed row of a request with CALLER. Statistics requests count as `other`.
+- **Rights** (`auth_ops` rows): `read` on the series for STATS_SERIES (denied and missing alike), and for
+  STATS_TENANTS a tenant is visible to a superuser, to a user with `read` on all series, and to a tenant admin for its
+  own prefix only; "(none)", the hot lists' threshold, `parts_counted` and the error bounds are for those who read
+  everything. A tenant not in the list or not visible is DENIED or NOTFOUND by the rule of AGENTS.md. Per-tenant
+  numbers are never on the metrics port.
+- **Budgets**: STATS_SERIES stops at its work budget and the client asks again for the rest (`done`); a STATS_TENANTS
+  reply stops at 64 MB and gives a cursor; the clients loop on both and restart (at most 3 times) when the list's
+  generation changes in the middle. CANCEL names either op as it does a QUERY_MULTI.
+- **Clients**: C `tsdbc_series_stats`, `tsdbc_tenant_stats` (+ `tsdbc_tenant_result_free`); Rust `Client::series_stats`,
+  `tenant_stats`; Python `series_stats`, `tenant_stats`; Java `seriesStats`, `tenantStats`. The embedded bindings have the
+  same calls over `tsdb_series_stats` and `tsdb_tenant_stats_get` plus `set_tenants` and `stats_settle`, and their tests
+  compare them with tsdbd's answers.
+- **CLI**: `tsdb stats series|tenants|hot ... --server HOST:PORT [--login NAME --login-password-file F]` (the server
+  and login may come from the configuration file's `client.*` keys; a password is never an argument).
+  `tenants` takes `--volumes`, `--caller` and `--hot K`; `hot` takes `reads|writes|bytes` and `-k N`.
+- **Tests**: `tests/test_stats_net.c` (login on and off, oracle against the engine, rights, hot lists and caller
+  counters, malformed frames, the 64 MB cap and the cursor, CANCEL, fake servers for a list change and an old
+  protocol), `tests/test_cli_stats_net.sh`, fuzz seeds `tests/fuzz/frames/stats-*` (the frames harness runs with a
+  tenant list), client tests in all four languages. Mutations that each fail a test: a record field off by one,
+  DENIED turned into NOTFOUND for a denied id, a tenant visible to a non-admin.
+- **Not built**: `TSDB_STATS_EXACT_ROWS` (reserved, INVALID), the INGEST_APPROX flag is set only by the engine's ring
+  overflow counter.
 
 **Benchmarks** (stats on against `--no-stats`, same binaries, Ryzen 9 7950X, `flock -o -x BENCH.lock`, `sync` and a
 20 s pause before every run so one mode's dirty pages are not written back during the next).

@@ -502,7 +502,10 @@ cgroup, so `nice` does not keep your work out of its way.
   own nested jobs (a fork/join tree), never for a lock another job's worker may hold while waiting for helpers.
   tsdbd's login (`server/auth.c`): `users_mu` (the USERS state; held across USERS's I/O and its OFD lock, so on NFS
   as long as a server is away) > `auth_mu` (the published snapshot of the users and the registry of logged-in
-  users; a leaf, never held across I/O). Logins and requests take only `auth_mu`, never `users_mu`, and no engine
+  users; never held across I/O) > `tn_mu` (`server/tenants.c`: the tenant list, its slots and the pending list; auth_mu takes
+  it to find a user's tenant (`tn_slot_user`) and a failed login to count under one, and USERS's publish calls `tn_offer`
+  with `users_mu` held; a leaf, never held across I/O or an engine call: the tick thread lets go of it around
+  `tsdb_set_tenants`) and `blk_mu` (the registry of the counter blocks, a leaf that a counting thread never takes). Logins and requests take only `auth_mu`, never `users_mu`, and no engine
   lock is taken under either; a user's rights index is built before it is shared and read without a lock.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
@@ -562,7 +565,8 @@ cgroup, so `nice` does not keep your work out of its way.
   `DROPPED` -13 with their bodies, the ops TOPOLOGY (48) and STATUS (49); floor still 12. The four clients retry
   UNAVAILABLE after `retry_after` and follow MOVED within a time budget (`tsdbc_set_retry`, 30 s by default), and
   connect to a list of nodes; tsdbd sends only UNAVAILABLE (MOVED, PARTIAL and DROPPED wait for the cluster).
-  The planned protocols moved up: QUERY_LATEST 14, the change feed 15, statistics 16.
+  14 QUERY_LATEST (39). 15 statistics (STATS_SERIES 46, STATS_TENANTS 47; docs/design-stats.md 5; `server/tenants.[ch]`:
+  tsdbd's tenant list and per-caller counters; floor still 12). The change feed is planned as 16.
   All four clients speak 13 and no call is gated on a version below the floor;
   the embedded bindings (Rust `tsdb_embedded::Db`, Python `tsdb_embedded.Db`, Java `EmbeddedDb`) have the
   same operations, and their tests compare them with tsdbd's answers.
