@@ -19,7 +19,8 @@
  *    the open that replays a segment of markers only, every number a caller was told is below the next one.
  *
  *   ./build/test_fno [scratch dir]                run from the source directory is not needed
- *   ./build/test_fno --mutant reuse|manifest|markers|nosync [scratch dir]    must fail (nosync: in the power-loss sweeps)
+ *   ./build/test_fno --mutant reuse|manifest|markers|nosync|flushclose [scratch dir]    must fail
+ *                                                  (nosync: in the power-loss sweeps; flushclose: a flush leaves a record open)
  *   ./build/test_fno --child KIND DIR ACKFILE     (internal: a process the shim kills)
  */
 #define _GNU_SOURCE
@@ -588,6 +589,275 @@ static void test_replay_markers(void)
            "fails the open\n");
 }
 
+/* The WAL's bytes and the parts' ranges do not depend on how the append path keeps its books (src/memtable.c:
+ * wal_rec_close, fno_rows_hi): appends join one rows record whose header holds the final count and the first number;
+ * a marker ends it, and so does a flush; a part's range is the first and the last number of its ROWS (never a
+ * marker's, even one that comes last). The layout of the hot fields (internal.h, buf_lock) is checked too: a change
+ * that spreads them over more lines again costs the 16-thread append loop its few percent without failing anything
+ * else. */
+static int sync_far(const char *dir, eng **db)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.buffer_rows = 1u << 24; /* no flush: the segment stays */
+    o.wal_sync_ms = 3600000; /* nothing syncs behind the test's back: the buffer holds what the calls appended */
+    return eng_open(dir, &o, db);
+}
+
+static uint64_t wal_flush_now(eng *db)
+{
+    pthread_mutex_lock(&db->buf_lock);
+    uint64_t upto = db->wal_appended;
+    pthread_mutex_unlock(&db->buf_lock);
+    CHECK(wal_commit(db, upto) == 0);
+    return upto;
+}
+
+/* the records of segment 1: {kind, count (rows) or payload length, first number} until the end of the file */
+typedef struct rec {
+    unsigned kind;
+    uint32_t n;
+    uint64_t fno;
+    uint32_t span; /* the numbers it takes: a marker's, else its rows */
+} rec;
+
+static size_t read_records(const char *dir, rec *out, size_t cap)
+{
+    char seg[PATH_MAX + 64];
+    snprintf(seg, sizeof seg, "%s/wal_0000000000000001.log", dir);
+    int fd = open(seg, O_RDONLY);
+    CHECK(fd >= 0);
+    size_t k = 0;
+    off_t pos = 0;
+    for (; fd >= 0 && k < cap; k++) {
+        uint8_t h[32];
+        if (pread(fd, h, sizeof h, pos) != (ssize_t)sizeof h)
+            break;
+        uint32_t w;
+        memcpy(&w, h, 4);
+        out[k].kind = w >> 28;
+        out[k].n = w & 0x0fffffffu;
+        memcpy(&out[k].fno, h + 16, 8);
+        out[k].span = out[k].n;
+        if (out[k].kind == WAL_KIND_MARKER && pread(fd, &out[k].span, 4, pos + 32 + 4) != 4)
+            break;
+        pos += 32 + (off_t)out[k].n * (out[k].kind == WAL_KIND_ROWS ? WAL_ROW : 1);
+    }
+    off_t end = fd >= 0 ? lseek(fd, 0, SEEK_END) : 0;
+    CHECK(end == pos); /* the records account for every byte of the file */
+    if (fd >= 0)
+        close(fd);
+    return k;
+}
+
+static void part_range(eng *db, uint64_t lo, uint64_t hi, const char *what)
+{
+    bool found = false;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++)
+        if (db->parts[i]->fno_lo == lo && db->parts[i]->fno_hi == hi)
+            found = true;
+    pthread_mutex_unlock(&db->lock);
+    if (!found) {
+        fprintf(stderr, "no part with the range %" PRIu64 "..%" PRIu64 " (%s)\n", lo, hi, what);
+        failures++;
+    }
+}
+
+static void test_wal_books(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("walbooks", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(sync_far(dir, &db) == 0);
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 1);
+    rows(db, s, T0 + 10, 3);
+    rows(db, s, T0 + 20, 1); /* 5 rows, numbers 1..5, one record */
+    CHECK(marker(db, 1) == 6); /* ends it; the call commits what the buffer holds */
+    rows(db, s, T0 + 30, 2);
+    rows(db, s, T0 + 40, 1); /* 3 rows, 7..9 */
+    wal_flush_now(db);
+    rec r[8];
+    size_t k = read_records(dir, r, 8);
+    CHECK(k == 3);
+    if (k == 3) {
+        CHECK(r[0].kind == WAL_KIND_ROWS && r[0].n == 5 && r[0].fno == 1);
+        CHECK(r[1].kind == WAL_KIND_MARKER && r[1].fno == 6);
+        CHECK(r[2].kind == WAL_KIND_ROWS && r[2].n == 3 && r[2].fno == 7);
+    }
+    /* a flush: the part's range is its rows' first and last number, and the next rows start a record of their own in
+       the new segment, numbered on from the marker */
+    CHECK(mt_flush(db) == 0);
+    part_range(db, 1, 9, "rows 1..5, a marker, rows 7..9");
+    rows(db, s, T0 + 50, 2);
+    rows(db, s, T0 + 60, 2); /* 10..13 */
+    CHECK(marker(db, 1) == 14); /* the last number the WAL took is a marker's: not in the next part's range */
+    CHECK(mt_flush(db) == 0);
+    part_range(db, 10, 13, "rows 10..13 and a marker after them");
+    rows(db, s, T0 + 70, 1); /* 15 */
+    CHECK(mt_flush(db) == 0);
+    part_range(db, 15, 15, "one row");
+    CHECK(fno_of(db) == 16);
+    CHECK(eng_close(db) == 0);
+    /* the rows are all there after a reopen, and the numbers go on */
+    CHECK(open_eng(dir, false, false, &db) == 0);
+    CHECK(rows_of(db) == 13 && fno_of(db) == 16);
+    CHECK(eng_close(db) == 0);
+
+#if defined(__x86_64__) && defined(__GLIBC__)
+    /* the layout: the mutex and what is stored under it in two lines nothing else writes, and the engine's reference
+       count (stored on every call) on a line other than the failure flag (read on every call). Only where the mutex
+       is 40 bytes (glibc, x86-64): other ABIs size it otherwise and the first line holds fewer fields there. */
+    CHECK(_Alignof(eng) == 64);
+    CHECK(offsetof(eng, buf_lock) % 64 == 0);
+    CHECK(offsetof(eng, wal_appended) + sizeof(uint64_t) - offsetof(eng, buf_lock) == 64);
+    CHECK(offsetof(eng, wal_buf) % 64 == 0);
+    CHECK(offsetof(eng, wal_rec_open) + 1 - offsetof(eng, wal_buf) <= 64);
+    CHECK(offsetof(eng, failed) / 64 != offsetof(eng, refs) / 64);
+#endif
+    printf("  appends join a record whose header is final once it closes; markers and flushes end it; a part's "
+           "range is its rows'; the hot fields lie in their own cache lines\n");
+}
+
+/* Rows from other threads while markers are appended: a marker ends the open rows record under buf_lock, so rows
+ * that follow it start a record of their own. A marker that left the record open (the commit that follows it is
+ * after buf_lock is released) would let rows join a record that lies before the marker: its count would then be
+ * the wrong one, and the records would no longer add up to the file or to contiguous numbers. */
+typedef struct racer {
+    eng *db;
+    uint32_t series;
+    int64_t t0;
+    atomic_bool *stop;
+    uint64_t n; /* rows appended */
+} racer;
+
+static void *racer_run(void *arg)
+{
+    racer *r = arg;
+    while (!atomic_load(r->stop) && r->n < 400000)
+        rows(r->db, r->series, r->t0 + (int64_t)r->n++, 1);
+    return NULL;
+}
+
+/* A flush hands the open record over: the old segment's tail, written by the flush, parses (its header holds the
+ * count). That tail is what keeps the rows durable until their part is listed, and the feed serves it as it is. A
+ * failed unlink (eng_test_retire_fail) keeps the segment so that the test can read it; the mutant "flushclose" leaves
+ * the record open (the flush then crashes in the seal, or writes a header with no count). */
+static int keep_segment(const char *name)
+{
+    (void)name;
+    return EIO;
+}
+
+static void test_wal_flush_tail(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("walflushtail", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(sync_far(dir, &db) == 0);
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 2);
+    rows(db, s, T0 + 10, 1); /* one open record of 3 rows, still in the buffer */
+    eng_test_retire_fail = keep_segment;
+    CHECK(mt_flush(db) == 0);
+    eng_test_retire_fail = NULL;
+    rec r[4];
+    size_t k = read_records(dir, r, 4);
+    CHECK(k == 1);
+    if (k == 1)
+        CHECK(r[0].kind == WAL_KIND_ROWS && r[0].n == 3 && r[0].fno == 1);
+    CHECK(eng_close(db) == 0);
+    if (open_eng(dir, false, false, &db) == 0) { /* the kept segment replays into no second copy */
+        CHECK(rows_of(db) == 3 && fno_of(db) == 4);
+        CHECK(eng_close(db) == 0);
+    } else {
+        failures++;
+    }
+    printf("  a flush ends the open record: the old segment's tail parses, and a reopen has the rows once\n");
+}
+
+/* A record that reaches the row cap is closed before the next one opens: its header holds its count, so the buffer
+ * parses and every row is there after a reopen. The cap is lowered to make a few rows reach it. */
+static void test_wal_split(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("walsplit", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    atomic_store(&wal_rec_max_rows, 10);
+    CHECK(sync_far(dir, &db) == 0);
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 4);
+    rows(db, s, T0 + 10, 4);
+    rows(db, s, T0 + 20, 4); /* 8 + 4 would pass the cap: a second record */
+    rows(db, s, T0 + 30, 3);
+    rows(db, s, T0 + 40, 9); /* 7 + 9: a third */
+    wal_flush_now(db);
+    rec r[8];
+    size_t k = read_records(dir, r, 8);
+    CHECK(k == 3);
+    if (k == 3) {
+        CHECK(r[0].kind == WAL_KIND_ROWS && r[0].n == 8 && r[0].fno == 1);
+        CHECK(r[1].kind == WAL_KIND_ROWS && r[1].n == 7 && r[1].fno == 9);
+        CHECK(r[2].kind == WAL_KIND_ROWS && r[2].n == 9 && r[2].fno == 16);
+    }
+    CHECK(eng_close(db) == 0);
+    CHECK(open_eng(dir, false, false, &db) == 0);
+    CHECK(rows_of(db) == 24 && fno_of(db) == 25);
+    CHECK(eng_close(db) == 0);
+    atomic_store(&wal_rec_max_rows, 1u << 28);
+    printf("  a rows record that reaches its cap is closed: the buffer parses and a reopen has every row\n");
+}
+
+static void test_wal_races(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("walraces", dir, sizeof dir);
+    eng *db;
+    uint32_t s[3];
+    CHECK(sync_far(dir, &db) == 0);
+    pthread_t th[3];
+    racer rc[3];
+    atomic_bool stop = false;
+    for (int i = 0; i < 3; i++) {
+        char name[16];
+        snprintf(name, sizeof name, "s%d", i);
+        CHECK(eng_series(db, name, TSDB_FLOAT32, &s[i]) == 0);
+        rc[i] = (racer){db, s[i], T0 + i * 100000000LL, &stop, 0};
+        pthread_create(&th[i], NULL, racer_run, &rc[i]);
+    }
+    for (int i = 0; i < 600; i++)
+        marker(db, 1);
+    atomic_store(&stop, true);
+    uint64_t total = 0;
+    for (int i = 0; i < 3; i++)
+        pthread_join(th[i], NULL), total += rc[i].n;
+    wal_flush_now(db);
+    static rec r[100000];
+    size_t k = read_records(dir, r, 100000);
+    CHECK(k > 600 && k < 100000);
+    uint64_t next = 1, nrows = 0, nmarkers = 0;
+    bool contiguous = true;
+    for (size_t i = 0; i < k; i++) {
+        contiguous &= r[i].fno == next;
+        next = r[i].fno + r[i].span;
+        if (r[i].kind == WAL_KIND_ROWS)
+            nrows += r[i].n;
+        else
+            nmarkers++;
+    }
+    CHECK(contiguous);
+    CHECK(nrows == total && nmarkers == 600);
+    CHECK(fno_of(db) == total + 601);
+    CHECK(eng_close(db) == 0);
+    printf("  rows racing with markers: %zu records add up to the file, and their numbers are contiguous\n", k);
+}
+
 /* ------------------------------------------------------------ the children */
 
 static void ack(const char *file, uint64_t n)
@@ -722,6 +992,7 @@ static void set_mutant(const char *mutant)
                       : strcmp(mutant, "manifest") == 0 ? MUT_FNO_MANIFEST_ONLY
                       : strcmp(mutant, "markers") == 0  ? MUT_MARKER_ROWS
                       : strcmp(mutant, "nosync") == 0   ? MUT_FNO_NOSYNC
+                      : strcmp(mutant, "flushclose") == 0 ? MUT_FLUSH_NOCLOSE
                                                         : MUT_NONE;
     if (eng_test_mutant == MUT_NONE) {
         fprintf(stderr, "unknown mutant %s\n", mutant);
@@ -765,6 +1036,10 @@ int main(int argc, char **argv)
         test_reopen();
         test_history();
         test_replay_markers();
+        test_wal_books();
+        test_wal_split();
+        test_wal_flush_tail();
+        test_wal_races();
         if (!mutant) {
             test_slots();
             test_damaged_newest();

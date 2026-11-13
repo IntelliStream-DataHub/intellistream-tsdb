@@ -295,6 +295,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	tests/expect_fail.sh 'next == 1001' ./$(B)/test_fno --mutant manifest $(SCRATCH)
 	tests/expect_fail.sh 'a segment of markers replays' ./$(B)/test_fno --mutant markers $(SCRATCH)
 	tests/expect_fail.sh 'f > mx' ./$(B)/test_fno --mutant nosync $(SCRATCH)
+	! ./$(B)/test_fno --mutant flushclose $(SCRATCH) >/dev/null 2>&1 # a flush that leaves a record open crashes in the seal (status 139): the one planted bug whose symptom is a crash
 	./$(B)/test_feedstore $(SCRATCH)
 	tests/expect_fail.sh 'renamed before its data was synced' ./$(B)/test_feedstore --mutant noseal $(SCRATCH) # a replayed segment renamed without its fdatasync must fail it
 	tests/expect_fail.sh 'removed before the floor was durable' ./$(B)/test_feedstore --mutant latefloor $(SCRATCH) # the cleaner's floor set after its unlinks must fail it
