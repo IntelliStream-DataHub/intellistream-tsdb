@@ -309,6 +309,58 @@ int tsdbc_latest(tsdbc *c, const tsdb_sid *ids, size_t n, const tsdb_latest_opts
 int tsdbc_latest_by_name(tsdbc *c, const char *const *names, size_t n, const tsdb_latest_opts *opts,
                          tsdb_latest_result *out);
 
+/* ---- statistics over the network (protocol 15, docs/design-stats.md 5.1; the calls need a server that speaks 15:
+ * against an older one they fail with TSDB_ERR_INVALID and send nothing) ----
+ * The storage numbers of series, as tsdb_series_stats (tsdb.h; out[i] for ids[i]). Any n: the call sends up to 65,536 ids
+ * (1,024 with TSDB_SSTAT_REQ_RESIDENT) at a time and asks again for what the server's work budget left. A series the
+ * user may not read is TSDB_ERR_DENIED in its record, whether it exists or not. */
+int tsdbc_series_stats(tsdbc *c, const tsdb_sid *ids, size_t n, int flags, tsdb_series_stat *out);
+
+/* One hot-list entry of a tenant row: kind TSDB_HOT_READS, _WRITES or _BYTES_PER_ROW; id 0 is the threshold (the
+ * `estimate` an unlisted series weighs at most), which only a user who reads everything gets, with the error bounds. */
+typedef struct tsdbc_hot {
+    uint8_t kind;
+    tsdb_sid id;
+    uint64_t estimate, error;
+} tsdbc_hot;
+
+/* What a tenant admin's own requests cost, per tenant (the CALLER numbers of the summed row, in the wire's order). */
+typedef struct tsdbc_tenant_caller {
+    uint64_t requests_query, requests_insert, requests_delete, requests_admin, requests_other;
+    uint64_t rows_decoded, rows_from_stats, rows_from_memtable, bytes_read, result_rows, query_us;
+    uint64_t inserted_rows, inserted_bytes;
+    uint64_t errors_invalid, errors_notfound, errors_io, errors_other;
+    uint64_t denied_requests, denied_series, failed_logins;
+} tsdbc_tenant_caller;
+
+typedef struct tsdbc_tenant_row {
+    int32_t status;       /* 0, TSDB_ERR_DENIED, TSDB_ERR_NOTFOUND (a tenant not in the list), or INVALID (a volume) */
+    uint32_t volume;      /* TSDB_TENANT_VOLUME_SUM for the tenant's summed row, else a volume's number */
+    char *prefix;         /* NUL-terminated; "" is the tenant "(none)" */
+    size_t prefix_len;
+    tsdb_tenant_stats st; /* flags (TSDB_TENANT_PARTIAL), generation and list_hash from the reply; 0 when status is not 0 */
+    int has_caller;       /* the summed row of a request with TSDB_TSTATS_CALLER */
+    tsdbc_tenant_caller caller;
+    tsdbc_hot *hot;       /* the summed row of a request with TSDB_TSTATS_HOT */
+    size_t nhot;
+} tsdbc_tenant_row;
+
+typedef struct tsdbc_tenant_result {
+    uint32_t flags;       /* TSDB_TSTATS_PARTIAL, TSDB_TSTATS_INGEST_APPROX */
+    uint32_t generation;  /* of the tenant list */
+    uint64_t list_hash;
+    uint64_t parts_counted, parts_listed; /* 0 unless the user is a superuser or reads all series */
+    tsdbc_tenant_row *rows;
+    size_t nrows;
+} tsdbc_tenant_result;
+
+/* The per-tenant statistics (tsdb_tenant_stats_get, tsdb_hot_series). prefixes[0..n): the tenants asked for (NULL or ""
+ * is "(none)"); n = 0 asks for every tenant the user may see. flags: TSDB_TSTATS_VOLUMES, _HOT, _CALLER; k: hot entries
+ * per kind (at most 256). The call follows the server's cursor, so the result holds every row (a reply stops at 64 MB).
+ * Free it with tsdbc_tenant_result_free. */
+int tsdbc_tenant_stats(tsdbc *c, const char *const *prefixes, size_t n, int flags, unsigned k, tsdbc_tenant_result *out);
+void tsdbc_tenant_result_free(tsdbc_tenant_result *r);
+
 int tsdbc_commit(tsdbc *c);
 int tsdbc_flush(tsdbc *c);
 int tsdbc_optimize(tsdbc *c);

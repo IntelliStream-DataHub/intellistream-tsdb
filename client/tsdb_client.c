@@ -3292,6 +3292,218 @@ int tsdbc_latest(tsdbc *c, const tsdb_sid *ids, size_t n, const tsdb_latest_opts
                        opts && opts->with_nulls, opts ? opts->threads : 0, out);
 }
 
+/* ------------------------------------------------------- statistics (protocol 15) */
+
+int tsdbc_series_stats(tsdbc *c, const tsdb_sid *ids, size_t n, int flags, tsdb_series_stat *out)
+{
+    int rc = tsdbc_wait(c);
+    if (rc)
+        return rc;
+    if ((flags & ~TSDB_SSTAT_REQ_RESIDENT) || (n && (!ids || !out)))
+        return TSDB_ERR_INVALID;
+    if (n == 0)
+        return 0;
+    if (server_version(c) < 15) /* an older server does not know the op: nothing is sent */
+        return c->broken ? TSDB_ERR_IO : TSDB_ERR_INVALID;
+    _Static_assert(sizeof(tsdb_series_stat) == TSDB_STATS_SERIES_REC, "the record is the wire record");
+    size_t chunk = (flags & TSDB_SSTAT_REQ_RESIDENT) ? TSDB_STATS_SERIES_RESIDENT_MAX : TSDB_STATS_SERIES_MAX_IDS;
+    for (size_t at = 0; at < n;) {
+        size_t m = n - at < chunk ? n - at : chunk;
+        uint32_t h[2] = {(uint32_t)m, (flags & TSDB_SSTAT_REQ_RESIDENT) ? TSDB_STATS_RESIDENT : 0};
+        const uint8_t *b;
+        size_t len;
+        if ((rc = call(c, TSDB_OP_STATS_SERIES, h, sizeof h, ids + at, m * 8, &b, &len)) != 0) {
+            if (rc > 0)
+                rc = TSDB_ERR_CORRUPT;
+            return rc;
+        }
+        uint32_t done, z;
+        if (len < 8)
+            goto corrupt;
+        memcpy(&done, b, 4);
+        memcpy(&z, b + 4, 4);
+        if (z || done == 0 || done > m || len != 8 + (size_t)done * TSDB_STATS_SERIES_REC)
+            goto corrupt;
+        memcpy(out + at, b + 8, (size_t)done * TSDB_STATS_SERIES_REC);
+        at += done; /* the server's work budget may have stopped it early: ask again for the rest */
+    }
+    return 0;
+corrupt:
+    c->broken = true;
+    return TSDB_ERR_CORRUPT;
+}
+
+void tsdbc_tenant_result_free(tsdbc_tenant_result *r)
+{
+    if (!r)
+        return;
+    for (size_t i = 0; i < r->nrows; i++) {
+        free(r->rows[i].prefix);
+        free(r->rows[i].hot);
+    }
+    free(r->rows);
+    memset(r, 0, sizeof *r);
+}
+
+/* Decodes the rows of one STATS_TENANTS reply (header already read) into r; false when the frame is malformed. */
+static bool tenant_rows(const uint8_t *b, size_t len, uint32_t count, int want, tsdbc_tenant_result *r)
+{
+    size_t o = TSDB_TSTATS_HEADER;
+    for (uint32_t i = 0; i < count; i++) {
+        if (len - o < TSDB_TSTATS_ROW_HEAD)
+            return false;
+        tsdbc_tenant_row row = {0};
+        uint32_t rflags;
+        uint16_t pl, nhot;
+        memcpy(&row.status, b + o, 4);
+        memcpy(&row.volume, b + o + 4, 4);
+        memcpy(&rflags, b + o + 8, 4);
+        memcpy(&pl, b + o + 12, 2);
+        memcpy(&nhot, b + o + 14, 2);
+        o += TSDB_TSTATS_ROW_HEAD;
+        size_t padded = ((size_t)pl + 7) & ~(size_t)7;
+        bool sum = row.volume == TSDB_TSTATS_VOLUME_SUM;
+        size_t need = padded + TSDB_TSTATS_DATA_FIELDS * 8 +
+                      (sum && (want & TSDB_TSTATS_CALLER) ? TSDB_TSTATS_CALLER_FIELDS * 8 : 0) +
+                      (size_t)nhot * TSDB_TSTATS_HOT_REC;
+        if (len - o < need || (!sum && nhot))
+            return false;
+        row.prefix = malloc((size_t)pl + 1);
+        if (!row.prefix)
+            return false;
+        memcpy(row.prefix, b + o, pl);
+        row.prefix[pl] = 0;
+        row.prefix_len = pl;
+        o += padded;
+        row.st.flags = rflags;
+        row.st.generation = r->generation;
+        row.st.list_hash = r->list_hash;
+        memcpy(&row.st.series, b + o, TSDB_TSTATS_DATA_FIELDS * 8);
+        o += TSDB_TSTATS_DATA_FIELDS * 8;
+        if (sum && (want & TSDB_TSTATS_CALLER)) {
+            _Static_assert(sizeof(tsdbc_tenant_caller) == TSDB_TSTATS_CALLER_FIELDS * 8, "the wire's 20 counters");
+            memcpy(&row.caller, b + o, sizeof row.caller);
+            row.has_caller = 1;
+            o += sizeof row.caller;
+        }
+        if (nhot) {
+            row.hot = malloc((size_t)nhot * sizeof *row.hot);
+            if (!row.hot) {
+                free(row.prefix);
+                return false;
+            }
+            for (uint16_t j = 0; j < nhot; j++, o += TSDB_TSTATS_HOT_REC) {
+                row.hot[j].kind = b[o];
+                memcpy(&row.hot[j].id, b + o + 8, 8);
+                memcpy(&row.hot[j].estimate, b + o + 16, 8);
+                memcpy(&row.hot[j].error, b + o + 24, 8);
+            }
+            row.nhot = nhot;
+        }
+        tsdbc_tenant_row *nr = realloc(r->rows, (r->nrows + 1) * sizeof *nr);
+        if (!nr) {
+            free(row.prefix);
+            free(row.hot);
+            return false;
+        }
+        r->rows = nr;
+        r->rows[r->nrows++] = row;
+    }
+    return o == len;
+}
+
+int tsdbc_tenant_stats(tsdbc *c, const char *const *prefixes, size_t n, int flags, unsigned k, tsdbc_tenant_result *out)
+{
+    int rc = tsdbc_wait(c);
+    if (rc)
+        return rc;
+    if (!out || (n && !prefixes) || n > 65535 || k > TSDB_TSTATS_MAX_K ||
+        (flags & ~(TSDB_TSTATS_VOLUMES | TSDB_TSTATS_HOT | TSDB_TSTATS_CALLER)))
+        return TSDB_ERR_INVALID;
+    memset(out, 0, sizeof *out);
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t l = prefixes[i] ? strlen(prefixes[i]) : 0;
+        if (l > 65535)
+            return TSDB_ERR_INVALID;
+        total += 2 + l;
+    }
+    if (server_version(c) < 15)
+        return c->broken ? TSDB_ERR_IO : TSDB_ERR_INVALID;
+    uint8_t *names = malloc(total + 1);
+    if (!names)
+        return TSDB_ERR_NOMEM;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint16_t l = prefixes[i] ? (uint16_t)strlen(prefixes[i]) : 0;
+        memcpy(names + o, &l, 2);
+        memcpy(names + o + 2, prefixes[i], l);
+        o += 2 + l;
+    }
+    uint32_t cursor = 0;
+    int restarts = 0;
+    for (;;) {
+        uint8_t h[16] = {0};
+        uint16_t f = (uint16_t)flags, k16 = (uint16_t)k;
+        uint32_t n32 = (uint32_t)n;
+        memcpy(h, &f, 2);
+        memcpy(h + 2, &k16, 2);
+        memcpy(h + 4, &n32, 4);
+        memcpy(h + 8, &cursor, 4);
+        const uint8_t *b;
+        size_t len;
+        rc = call(c, TSDB_OP_STATS_TENANTS, h, sizeof h, names, total, &b, &len);
+        if (rc) {
+            if (rc > 0)
+                rc = TSDB_ERR_CORRUPT;
+            goto fail;
+        }
+        uint32_t count, rflags, next, gen;
+        uint64_t hash, counted, listed;
+        if (len < TSDB_TSTATS_HEADER)
+            goto corrupt;
+        memcpy(&count, b, 4);
+        memcpy(&rflags, b + 4, 4);
+        memcpy(&next, b + 8, 4);
+        memcpy(&gen, b + 12, 4);
+        memcpy(&hash, b + 16, 8);
+        memcpy(&counted, b + 24, 8);
+        memcpy(&listed, b + 32, 8);
+        if (cursor && (gen != out->generation || hash != out->list_hash)) {
+            /* the tenant list changed between two replies (a SIGHUP or a settle): a cursor into the old list means
+             * nothing, so ask again from the start, a few times at most */
+            tsdbc_tenant_result_free(out);
+            if (++restarts > 3) {
+                rc = TSDB_ERR_IO;
+                goto fail;
+            }
+            cursor = 0;
+            continue;
+        }
+        out->flags |= rflags;
+        out->generation = gen;
+        out->list_hash = hash;
+        out->parts_counted = counted;
+        out->parts_listed = listed;
+        if (!tenant_rows(b, len, count, flags, out))
+            goto corrupt;
+        if (next == TSDB_TSTATS_DONE)
+            break;
+        if (next <= cursor || (count == 0 && next == cursor))
+            goto corrupt;
+        cursor = next;
+    }
+    free(names);
+    return 0;
+corrupt:
+    c->broken = true;
+    rc = TSDB_ERR_CORRUPT;
+fail:
+    free(names);
+    tsdbc_tenant_result_free(out);
+    return rc;
+}
+
 static uint64_t name_hash(const char *s) /* FNV-1a */
 {
     uint64_t h = 1469598103934665603ull;

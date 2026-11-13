@@ -175,6 +175,10 @@ $(B)/test_auth_ops: tests/test_auth_ops.c tests/harness.h tests/auth_harness.h s
                     server/users.h include/tsdb_protocol.h $(B)/users.o $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c server/tenants.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
 
+# STATS_SERIES and STATS_TENANTS over the network: tsdbd with login on and off, the C client, a fake server
+$(B)/test_stats_net: tests/test_stats_net.c tests/harness.h tests/auth_harness.h server/users.h $(B)/users.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
+
 # includes server/users.c (its record builders) and defines write/fdatasync/fsync/rename to inject errors into it
 $(B)/test_users: tests/test_users.c server/users.c server/users.h $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
@@ -338,7 +342,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
 	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
 
-test-net: $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stability $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
+test-net: $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/test_stability $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	./$(B)/test_wire tests/data/wire13-vectors.txt
@@ -347,12 +351,13 @@ test-net: $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server_multi && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth_ops && \
+	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stats_net && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stability || exit 1; done
 
 # the portability headers (macOS shims) are part of these tests and of the server
 $(B)/test_classes $(B)/test_damage $(B)/test_export $(B)/test_failstop $(B)/test_follow $(B)/test_group $(B)/test_sched \
 $(B)/test_server_multi $(B)/test_server $(B)/test_spread $(B)/test_stability $(B)/test_tsdb $(B)/test_volumes \
-$(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_ports $(B)/test_out_send $(B)/fuzz_frames $(B)/tsdbd $(B)/users.o $(B)/tsdb: \
+$(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/test_ports $(B)/test_out_send $(B)/fuzz_frames $(B)/tsdbd $(B)/users.o $(B)/tsdb: \
     tests/portable.h src/compat.h server/epoll_compat.h
 
 # ------------------------------------------------------------------ fuzzing
