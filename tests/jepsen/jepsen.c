@@ -1354,6 +1354,18 @@ static void *client(void *arg)
 /* Where the j-th third of the run starts (j = 3: its end). */
 static int64_t nem_third_start(int j) { return nem_t0_ns + (int64_t)(seconds * 1e9) * j / 3; }
 
+/* A plug the nemesis pulled that the shim did not log (the server had died of its own odds just before the signal could reach
+ * it): not a fault, but the nemesis was at work for that long, and a third of the run it was at work in is not one it left
+ * idle. It counts for the spread of the run only, never for the floor (a shim that ignores the signal, a nemesis that
+ * does not pull: no attempts, or no faults). */
+static bool nem_att_third[3];
+static void nem_attempt_span(int64_t t, int64_t end)
+{
+    for (int j = 0; j < 3; j++)
+        if (t < nem_third_start(j + 1) && end >= nem_third_start(j))
+            nem_att_third[j] = true;
+}
+
 /* Whether the server of server_pid is running: a child that has exited and not been reaped (WNOWAIT leaves it for the
  * nemesis), one that has been reaped (ECHILD) and no pid at all are not. Stopped (SIGSTOP) is running. */
 static bool server_running(void)
@@ -2061,6 +2073,8 @@ static void *nemesis_thread(void *arg)
                 waited += now_ns() - w0;
                 if (gone && WIFEXITED(st) && WEXITSTATUS(st) == 99 && pull_logged(pid)) /* counted when the shim says the signal reached it and the server lost power (its exit 99), stamped when it was asked */
                     nem_fault_span(issued, now_ns());
+                else if (gone)
+                    nem_attempt_span(issued, now_ns());
                 if (!gone) { /* the clients write all the time: a server that does not die has hung (a correctness failure) */
                     hang_problems++;
                     fprintf(stderr, "  the server (pid %d) was still alive %d s after SIGUSR2 (a power loss at its next file "
@@ -2306,6 +2320,8 @@ static int nemesis_check(void)
             if (nem_fault_ns[i] < nem_third_start(j + 1) && nem_fault_end_ns[i] >= nem_third_start(j))
                 covered[j] = true;
         }
+    for (int j = 0; j < 3; j++)
+        covered[j] |= nem_att_third[j];
     /* a third in which a server was listening for less than half of it (servers that take seconds to start: the nemesis waits
      * for them) is not judged for its spread; the rest of the run's floor and the watcher's dead time still are */
     bool judged[3];

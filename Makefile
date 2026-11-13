@@ -1122,6 +1122,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 	    'kill@20@killslowstep:1000@-@the nemesis issued [0-9]* faults in 20 s.*it was idle@a kill whose step dawdles with the server live (a third of the honest rate, in time that is no free time) slipped past the floor' \
 	    'kill@20@hole:15:100@-@listening for [0-9.]* s with no fault issued or in progress@a kill nemesis that stops at three quarters of the run' \
 	    'pause@10@hole:6:100@-@listening for [0-9.]* s with no fault issued or in progress@a pause nemesis that stops at seven tenths of the run' \
+	    'pause@20@hole:16:100@-@listening for [0-9.]* s with no fault issued or in progress@a pause nemesis that stops at four fifths of the run (the length of the pause runs of make jepsen; of 10 s it was not caught)' \
 	    'power@20@hole:15:100@-@was idle@a power nemesis that stops at three quarters of the run' \
 	    'eio@20@hole:15:100@-@was idle@an eio nemesis that stops at three quarters of the run' \
 	    'power@20@blind:1000@JEPSEN_PULL_PROB=0.003,JEPSEN_CRASH_PROB=0.003@a server lay dead for@a blind power nemesis (no server made to die in its naps: the shim kills them)' \
