@@ -332,8 +332,10 @@ static void unlink_due(eng *db)
         pthread_mutex_lock(&rp->unl_mu);
         while (n < rp->nunl && n < 64 && rp->unl[n].fno_end - 1 <= floor)
             seqs[n] = rp->unl[n].seq, n++;
-        memmove(rp->unl, rp->unl + n, (rp->nunl - n) * sizeof *rp->unl);
-        rp->nunl -= n;
+        if (n > 0) { /* rp->unl is NULL while the list was never used: memmove(NULL, ...) is undefined */
+            memmove(rp->unl, rp->unl + n, (rp->nunl - n) * sizeof *rp->unl);
+            rp->nunl -= n;
+        }
         pthread_mutex_unlock(&rp->unl_mu);
         if (n == 0)
             return;
@@ -778,7 +780,7 @@ int replica_cut(eng *db, uint64_t last)
         pthread_mutex_lock(&rp->segs_mu);
         n = rp->nsegs;
         ss = malloc((n ? n : 1) * sizeof *ss);
-        if (ss)
+        if (ss && n)
             memcpy(ss, rp->segs, n * sizeof *ss);
         pthread_mutex_unlock(&rp->segs_mu);
         if (!ss)
