@@ -2409,16 +2409,22 @@ static void *nemesis_thread(void *arg)
  * outage nemesis' fault is one long step, 0.33 to 0.4 per listening second, a third of that is asked). A nemesis at half the honest
  * rate is what the check cannot tell from an honest one under load; one at a third of it, or less, fails.
  *
- * Calibration of every bound (2026-11-13: 12 full `make jepsen` runs of this tree: JEPSEN_DIR on /tmp, tmpfs, and on /var/tmp, ext4, each quiet
- * and with 16 busy loops on the 4 CPUs of the run, 3 runs each, both backends, kv and classes, login and feed; plus 6 eio and 6 power
- * runs of 20 s on /tmp with 16 busy loops, and 6 kill and 4 pause runs with 48 busy loops on 4 CPUs; before them 12 eio, 6 kill and 6 power
- * runs with 48 busy loops, 12 full runs and 300-second runs with a load average of 90), the honest worst against the bound, margin in brackets:
- *   rate per free listening second, least:    kill 1.80 (floor 1.0, 1.8x)  pause 1.75 (0.9, 1.9x)  power 1.05 (0.55, 1.9x)  eio 0.88 (0.4, 2.2x)
- *   faults against the floor, least:          kill 1.8x  pause 1.85x  power 1.7x  eio 2.0x
- *   longest listening stretch with no fault:  0.92 s (pause), 0.86 s (kill, power), 0.82 s (eio) (bound 2.0 s for runs of 10 and 20 s, 2.2x)
- *   longest dead stretch: 150 ms in a run of 300 with a load average of 90 (bound 250 ms, 1.7x; 104 ms in the 12 runs)
- *   longest stop: 410 ms (bound 1500 ms, 3.7x)
- *   longest listening stretch in a kill step: 200 ms (bound 400 ms, 2x; 106 ms with 48 busy loops)
+ * Calibration of every bound (2026-11-13, round 8: 16 full `make jepsen` runs, all valid: JEPSEN_DIR on /tmp, tmpfs, and on /var/tmp, ext4, quiet
+ * (3 each), with 16 busy loops on the 4 CPUs of the run (3 each) and with 48 (3 on /var/tmp), both backends, kv and classes, login and feed, on a
+ * machine whose load average was 45 to 197 (the other lanes of the calibration, other tracks' fuzzers and tests); plus 72 honest classes/power runs
+ * on epoll (48 with 16 busy loops, 24 with 48) and 6 eio and 6 power runs of 20 s on /tmp with 16 busy loops, all valid; 4 more runs of `make jepsen`
+ * were lost to the machine (tsdbd: io_uring: Cannot allocate memory, 3) and to a race in reading the shim's mark (1, fixed: see the eio step));
+ * before them 12 eio, 6 kill and 6 power runs with 48 busy loops, 12 full runs and 300-second runs with a load average of 90), the honest worst
+ * against the bound, margin in brackets:
+ *   rate per free listening second, least:    kill 1.92 (floor 1.0, 1.9x)  pause 1.82 (0.9, 2.0x)  power 1.21 (0.55, 2.2x)  eio 0.85 (0.4, 2.1x)
+ *   faults against the floor, least:          kill 1.86x  pause 1.92x  power 2.0x  eio 2.0x
+ *   longest listening stretch with no fault:  0.80 s (pause), 0.77 s (power, eio), 0.76 s (kill) (bound 2.0 s for runs of 10 and 20 s, 2.5x)
+ *   longest dead stretch, as the check takes it (less the CPU wait): 199 ms, in a kill run on /var/tmp with 16 busy loops at a load average of
+ *     150 (bound 250 ms, 1.26x: the thinnest margin, and a server that waits for a CPU in the fork is not the nemesis' wait to excuse); 149 ms
+ *     (power), 99 ms (eio) otherwise; raw, without the CPU wait taken off, the blocker run of round 7 had 453 ms
+ *   longest stop: 413 ms (bound 1500 ms, 3.6x)
+ *   longest listening stretch in a kill step: 491 ms with 16 busy loops, 1002 ms with 48 (it decides only when the time counts as free, 400 ms)
+ *   idle time in the fault steps (the time before the signal in a kill, power or eio step, less the CPU wait): 0.00 s in every honest run (bound 5% of the run)
  * A nemesis that works at a third of the honest rate, at half of it (slow:MS), stops at three quarters of the run (hole:15:100) or
  * sees no server die in its naps (blind:MS) is failed by the selftest of the Makefile, 10 of 10 runs in each of the four conditions
  * (/tmp and /var/tmp, quiet and with 16 busy loops).

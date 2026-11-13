@@ -965,6 +965,10 @@ $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)
 $(B)/liboutagefs.so: tests/jepsen/outagefs.c | $(B)
 	$(CC) -O2 -g -std=gnu11 -Wall $(ARCH) -fPIC -shared -o $@ $< -ldl -lpthread
 
+# a reader of a mapping that the shim's power loss cuts: the process must end with the loss's status (jepsen-selftest)
+$(B)/test_crashfs_bus: tests/test_crashfs_bus.c | $(B)
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
+
 $(B)/test_outagefs: tests/test_outagefs.c tests/outagefs_ctl.h | $(B)
 	$(CC) $(CFLAGS) -o $@ $< -lpthread
 
@@ -1070,7 +1074,11 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # are not starved. `jepsen --sched-selftest` checks that the account is read right (a thread sharing a CPU with three spinners).
 # What passes on purpose is listed at the end of the comment of nemesis_check.
 # What each bound is set to, and the honest worst under load on tmpfs and disk, is in the comments of nemesis_check (jepsen.c).
-jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
+jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $(B)/test_crashfs_bus
+	@d=$$(mktemp -d $(JEPSEN_DIR)-bus.XXXXXX) || exit 1; \
+	    LD_PRELOAD=$(CURDIR)/$(B)/libcrashfs.so CRASHFS_ROOT=$$d CRASHFS_PROB=0 ./$(B)/test_crashfs_bus $$d; rc=$$?; rm -r $$d; \
+	    if [ $$rc -ne 99 ]; then \
+	        echo "jepsen-selftest: a thread that read a mapping the shim's power loss cut ended the process with status $$rc, not the loss's 99"; exit 1; fi
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || [ $$rc -eq 124 ] || \

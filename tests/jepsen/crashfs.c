@@ -201,6 +201,7 @@ REAL(mkdir);
 REAL(mkdirat);
 REAL(ftruncate);
 
+static volatile sig_atomic_t power_losing; /* the power loss is rolling files back: another thread that reads a mapping of one gets SIGBUS */
 static volatile sig_atomic_t usr2_seen; /* only a SIGUSR2 sets it: the power loss line says so (jepsen counts the nemesis's own) */
 static char pull_file[PATH_MAX];        /* $CRASHFS_PULL_FILE: a line per power loss that a SIGUSR2 asked for, written by the shim */
 static int ignore_usr2;                 /* $CRASHFS_IGNORE_USR2: 1: a shim that does not honour the pull, 2: one that honours it and does not log it (jepsen's self-test of its count) */
@@ -234,6 +235,8 @@ static void log_pull_delivered(void)
         syscall(SYS_close, fd);
     }
 }
+
+static void on_bus(int sig);
 
 static void on_usr2(int sig)
 {
@@ -315,6 +318,7 @@ __attribute__((constructor)) static void init(void)
         snprintf(pull_file, sizeof pull_file, "%s", getenv("CRASHFS_PULL_FILE"));
     ignore_usr2 = getenv("CRASHFS_IGNORE_USR2") ? atoi(getenv("CRASHFS_IGNORE_USR2")) : 0;
     signal(SIGUSR2, on_usr2);
+    signal(SIGBUS, on_bus);
     active = files && dops;
 }
 
@@ -634,8 +638,20 @@ static void rollback(void)
             rm_tree(dops[i].saved);
 }
 
+/* A thread that reads a part it mapped, while the rollback cuts the file back, dies of SIGBUS before the thread that rolls back reaches
+ * its _exit: the power went out under it, which is what a power loss is (the process is gone, status 99), not a crash of the server
+ * (an honest run was failed "ended with status 0x87, not a power loss": a worker in part_open_as read a tmp part that the rollback had cut).
+ * Any other SIGBUS keeps its default action. */
+static void on_bus(int sig)
+{
+    if (power_losing)
+        _exit(99);
+    signal(sig, SIG_DFL); /* the instruction faults again: the default action */
+}
+
 __attribute__((noreturn)) static void power_loss(void)
 {
+    power_losing = 1;
     rollback();
     char msg[200];
     /* "requested by SIGUSR2": the harness (tests/jepsen/jepsen.c) pulled the plug; without it the loss was drawn by the
