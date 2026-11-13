@@ -42,10 +42,19 @@
 
 #define ISO_GF256_POLY 0x11d
 
-/* Builds the field tables (once) and dispatches to the top of the ladder, unchecked. gf256.c calls
- * it from a constructor unless it is compiled with -DISO_GF256_NO_BOOT, as a program with no
- * startup code allowed does; that program calls it itself, before any thread and before the first
- * product. Calling it again picks the ladder again (iso_cpu_has() may say something else by then). */
+/* Builds the field tables (once) and dispatches to the top of the ladder, unchecked. Idempotent:
+ * the tables are built by the first call and only read after; EVERY call picks the ladder again
+ * from what iso_cpu_has() says then, so a caller that narrows the permitted features later calls
+ * it again and gets a kernel within the cap. Not thread-safe: before any thread and before the
+ * first product, as iso_gf256_use() is.
+ *
+ * gf256.c calls it from a constructor (priority 150, after cpu.c's 101), so a program that links
+ * this repository's library never calls it. Compiled with -DISO_GF256_NO_BOOT the constructor is
+ * not there (the object has no .init_array entry), and the program calls it itself: that is for a
+ * program that copies this file into a binary which may have no startup code, as tsdb does (one
+ * copy per CPU level; a constructor in a copy for a wider level would run on a CPU without its
+ * instructions). Without the constructor and before the call the field tables are empty and every
+ * product is 0, so a program built that way must call this before its first use. */
 void iso_gf256_init(void);
 
 /* ------------------------------------------------------------------ scalar field ops */

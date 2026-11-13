@@ -470,13 +470,30 @@ void iso_gf256_check(const iso_gf256_kernel *k, size_t n, iso_kcheck *out)
 	out->ns = iso_now_ns() - t0;
 }
 
-/* The tables and the top of the ladder, unchecked: a process that never runs the check -- a test, a
- * tool, a benchmark -- runs what the CPU says it has, as it always did; `isod` checks before it
- * serves. Idempotent; called once before any thread, by the constructor below or, where that is
- * compiled out, by the program itself: tsdb copies this file, compiles it once per CPU level
- * with -DISO_GF256_NO_BOOT (a constructor there would run on a CPU without the instructions) and
- * calls this after it has told iso_cpu_has() what the CPU may use, and again when that changes:
- * the second call picks the ladder again. */
+/*
+ * iso_gf256_init
+ *		Build the field tables (once) and dispatch to the top of the ladder, unchecked.
+ *
+ * The top of the ladder, unchecked: a process that never runs the check -- a test, a tool, a
+ * benchmark -- runs what the CPU says it has, as it always did; `isod` checks before it serves.
+ *
+ * Idempotent, and not thread-safe: call it before any thread, and before the first product. The
+ * tables are written the first time and only read after. The ladder is picked again on EVERY call,
+ * from what iso_cpu_has() says at that moment, so a caller that narrows the permitted features
+ * later (tsdb caps them by the CPU level it chose, which it knows only after the CPU is
+ * probed) calls this again and gets a kernel within the cap, never one the cap forbids.
+ *
+ * Who calls it: the constructor below in this repository. A program that copies this file into a
+ * binary that may have no startup code compiles it with -DISO_GF256_NO_BOOT and calls this itself.
+ * tsdb is that program: it compiles its copy once per CPU level (x86-64-v2, v3, v4 in one binary)
+ * and a constructor in a v3 or v4 copy would run on every CPU before the dispatch has chosen a
+ * level, which is SIGILL on a CPU without AVX. It also keeps the copy byte for byte, so it cannot
+ * patch the constructor out: the flag is how the file says so itself.
+ *
+ * NOTE: the constructor is in this file and not in a file of its own on purpose. A static
+ * archive pulls a member only to resolve an undefined symbol, so a boot file nothing references
+ * is never linked and the constructor would silently vanish (tables empty, every product 0).
+ */
 void iso_gf256_init(void)
 {
 	static bool tables_done;
@@ -489,7 +506,9 @@ void iso_gf256_init(void)
 }
 
 #ifndef ISO_GF256_NO_BOOT
-/* Priority 150: after cpu.c (101), before anything that encodes at start-up. */
+/* Priority 150: after cpu.c (101), which iso_gf256_init() asks what the CPU may use, and before
+ * anything that encodes at start-up. Compiled out under -DISO_GF256_NO_BOOT, so that the object
+ * has no .init_array entry at all (tests/codec/gf256_noboot_obj.sh checks the object). */
 __attribute__((constructor(150))) static void gf256_boot(void)
 {
 	iso_gf256_init();

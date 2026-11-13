@@ -1,12 +1,12 @@
 repository: intellistream-objects (git@repo.intellistream.ai:olavgg/intellistream-objects.git), directory src/codec
-commit: be940646622851d191528d98441c5b968982e657
+commit: ab1372156b51196bf6d0b4f6f201f482874260bc
 files: gf256.h gf256.c gf256_avx2.c gf256_avx512.c rs.h rs.c
 license: AGPL-3.0-only, as intellistream-objects (LICENSE there); the owner is IntelliStream AS, as tsdb's, so no grant is needed.
 local: compat.h and compat.c (what the files include from isod's src/common: the CPU features capped by tsdb's level,
   the error codes, the allocators, the clock), and the one-line headers under compat/ that point there; tsdb's own, not synced.
 built: with -DISO_GF256_NO_BOOT (no constructor: src/cpu.c calls tsdb_ec_select(), which calls iso_gf256_init()).
-sha256 gf256.h: eb06e8db7a394e5796ee68494d983f764c3b9a7844e511357a766c866639b82b
-sha256 gf256.c: 90560ed0beeecd7a842bdcc97d6f63ede0cfb3c9895f4bb42f72dd6b95ecb9d7
+sha256 gf256.h: c35dc2498c1f253390e9fd1786170921c6d4b1eee934f740dab06528cd19107c
+sha256 gf256.c: 6db38e191d8c930bb729a9454be3d126312d532d40ffc50624630a920af5b60d
 sha256 gf256_avx2.c: 5f7d9d4f86f8adbe1072c5de5fa85cba8433c32e200868afb0e14873fb180895
 sha256 gf256_avx512.c: eaf8caf5afacd0731ff2ebb7a7e372c324ee3e266a0130e7e1aa68441d13dd41
 sha256 rs.h: 81c7a81a49b72db7e3056c8d189596f78fc40f96ed6895100131bef9caaf66d5
