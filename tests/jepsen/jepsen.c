@@ -139,6 +139,7 @@
 #include <string.h>
 #include <sys/file.h>
 #ifdef __linux__
+#include <sched.h>
 #include <sys/prctl.h>
 #endif
 #include <sys/stat.h>
@@ -260,12 +261,17 @@ static _Atomic int64_t nem_act_ns;     /* when the last fault was issued or over
 static atomic_int nem_inprog;          /* faults being carried out now (a plug asked for and the server still alive, an EIO asked for and no mark yet) */
 static int64_t nem_t0_ns;              /* when the nemesis started */
 static bool nem_clock;                 /* the nemesis is running (the setup and the final checks are not its time) */
-static int64_t nem_idle_ns;            /* power: time inside the fault step that was neither a server starting nor the wait for a pulled one to die */
+static int64_t nem_idle_ns;            /* power, kill, eio: time inside the fault step that was neither a server starting nor the wait for a pulled one to die
+                                       * (kill and eio: the time before the signal), less the CPU time the nemesis thread waited for */
 static _Atomic int64_t stop_ns;        /* when the run's time was up (0: not yet) */
 static pthread_t watch_th;
 static bool watch_started;
 static atomic_bool watch_excused;      /* the checker's own work while the server is dead (feed_check): not the nemesis lying idle */
 static int64_t watch_dead_total_ns, watch_dead_worst_ns, watch_live_ns; /* written by the watcher only */
+static int64_t watch_dead_raw_ns;      /* the longest dead stretch before the CPU time the nemesis thread and the watcher were starved in it is taken
+                                       * off (watch_dead_worst_ns is the stretch after it: what the bound is about) */
+static atomic_int nem_sched_fd = -1;   /* the nemesis thread's /proc/thread-self/schedstat (sched_delay_ns) */
+static _Atomic int64_t nem_sched_fake_ns; /* --mutant-nemesis starve:MS: run delay the mutant reports for time it sleeps in place of being starved */
 static int64_t watch_free_ns;          /* the part of the listening time in which the nemesis was carrying no fault out (a plug pulled that
                                        * the server takes seconds to feel is the nemesis at work, not an opportunity it let go) */
 static int64_t watch_step_worst_ns;    /* the longest stretch a server was listening with a fault step of the nemesis in progress (kill: it is over when the server
@@ -298,6 +304,10 @@ static const char *nem_mutant;   /* --mutant-nemesis: nothing, once, burst:S, ho
                                   * pausenoeffect (pause: signals nothing), slow:MS (a nap longer by MS: works at a fraction of the honest rate),
                                   * lastpull (power: an honest nemesis that pulls its last plug after the run's time is up),
                                   * killslowstep:MS (kill: the step sleeps MS with the server live before it kills),
+                                  * powerslowstep:MS, eioslowstep:MS (the same in the pull step of power and eio, the fault in progress),
+                                  * starve:MS (power, an HONEST nemesis, valid: for its first four pulls it does not reap the server for MS and
+                                  * reports the time as CPU time it waited for, as the kernel's account of a starved thread does on a machine with a
+                                  * load average of 60: the check must not fail it; the reading of the kernel's account is `--sched-selftest`),
                                   * blind:MS (naps that do not look at the server, as nap:MS, but no server is made to die in them: the shim's own
                                   * odds do that) (the check must fail) */
 static bool slow_create;            /* --mutant-slowcreate: waits 1 s before it creates the series (a server that crashed
@@ -466,6 +476,45 @@ static int64_t now_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/* How long a thread has been runnable and waiting for a CPU, from the kernel's own account (/proc/thread-self/schedstat, second
+ * field, in ns: the descriptor is opened by the thread it belongs to and may be read by any other). On a machine with a load average
+ * of 60 and more a nice 19 thread is starved for a quarter of a second at a time: that is the machine's, not a nemesis that lies
+ * idle, which sleeps (and sleeping is no run delay). -1 for no descriptor or a kernel without the file: nothing is then excused. */
+static int sched_open(void)
+{
+    return open("/proc/thread-self/schedstat", O_RDONLY | O_CLOEXEC);
+}
+
+static int64_t sched_delay_ns(int fd)
+{
+    char buf[96];
+    unsigned long long run, delay;
+    if (fd < 0)
+        return -1;
+    ssize_t n = pread(fd, buf, sizeof buf - 1, 0);
+    if (n <= 0)
+        return -1;
+    buf[n] = 0;
+    return sscanf(buf, "%llu %llu", &run, &delay) == 2 ? (int64_t)delay : -1;
+}
+
+static int64_t nem_delay_now(void)
+{
+    int64_t a = sched_delay_ns(atomic_load(&nem_sched_fd));
+    return (a > 0 ? a : 0) + atomic_load(&nem_sched_fake_ns);
+}
+
+/* The time a nemesis step spent on nothing the fault needs (a sleep with the server live before its signal or its kill: an honest step does
+ * that in microseconds), from `t0` to now less what the thread waited for a CPU since `delay0` (nem_delay_now): the kernel's account of a
+ * starved thread is the machine's, a sleep has none. It goes into nem_idle_ns, whose bound is NEM_IDLE_SHARE of the run. */
+static void nem_idle_since(int64_t t0, int64_t delay0)
+{
+    int64_t idle = now_ns() - t0, starved = nem_delay_now() - delay0;
+    if (starved > 0)
+        idle = starved < idle ? idle - starved : 0;
+    nem_idle_ns += idle;
 }
 
 static uint64_t mix(uint64_t x)
@@ -810,11 +859,12 @@ static bool kill_and_restart(int sig, bool faulty)
         start_server(faulty);
         return false;
     }
-    int64_t issued = now_ns();
+    int64_t issued = now_ns(), delay0 = nem_delay_now();
     int st = 0;
     atomic_fetch_add(&nem_inprog, 1);
     if (nem_mutant && !strncmp(nem_mutant, "killslowstep:", 13)) /* --mutant-nemesis killslowstep:MS: the step dawdles with the server live */
         usleep((useconds_t)atoi(nem_mutant + 13) * 1000);
+    nem_idle_since(issued, delay0); /* the time before the signal is the step's idle time, as the power step's */
     bool died = false;
     if (sig) {
         died = stop_server_st(sig, &st) && WIFSIGNALED(st) && WTERMSIG(st) == sig;
@@ -1397,6 +1447,25 @@ static bool pid_stopped(pid_t pid)
     return p && p[1] == ' ' && p[2] == 'T';
 }
 
+/* A server lay dead from `since` to `tt`, and the nemesis thread and the watcher were runnable and waiting for a CPU for `starved` of
+ * it (sched_delay_ns): the nemesis has to reap the server and start another, and the watcher to see it, so that time is the machine's
+ * (a load average of 69: 250 to 280 ms at a time, 453 ms of dead time in an honest run). What is left, the restart, is the nemesis'. */
+static void dead_stretch(int64_t since, int64_t tt, int64_t starved)
+{
+    int64_t len = tt - since, left = len - (starved > 0 ? (starved < len ? starved : len) : 0);
+    watch_dead_total_ns += len;
+    if (len > watch_dead_raw_ns)
+        watch_dead_raw_ns = len;
+    if (left > watch_dead_worst_ns)
+        watch_dead_worst_ns = left;
+}
+
+static int64_t starved_now(int wfd)
+{
+    int64_t a = sched_delay_ns(atomic_load(&nem_sched_fd)), b = sched_delay_ns(wfd);
+    return (a > 0 ? a : 0) + (b > 0 ? b : 0) + atomic_load(&nem_sched_fake_ns);
+}
+
 /* An independent clock on the servers while the nemesis runs, until the run's time is up (stop_ns): every WATCH_POLL_MS it
  * stamps the death of a server (the first poll that finds none running) and the restart (the first that finds one), and
  * keeps the longest and the total of the stretches in between and the time a server was up and listening (port set, not
@@ -1408,10 +1477,13 @@ static void *watcher(void *arg)
 {
     (void)arg;
     bool dead = false, prev_serving = false;
-    int64_t since = 0, last = now_ns(), gap = 0, stop_since = 0, step_run = 0;
+    int64_t since = 0, last = now_ns(), gap = 0, stop_since = 0, step_run = 0, starved0 = 0, nem_delay_last = nem_delay_now();
+    int wfd = sched_open();
     for (;;) {
         usleep(WATCH_POLL_MS * 1000);
         int64_t t = now_ns(), lim = atomic_load(&stop_ns);
+        int64_t nd = nem_delay_now(), starved_poll = nd - nem_delay_last; /* the time the nemesis thread waited for a CPU since the last poll */
+        nem_delay_last = nd;
         bool end = lim && t >= lim;
         int64_t tt = end ? lim : t; /* what happens after the run's time is not the nemesis's */
         bool running = server_running();
@@ -1422,8 +1494,10 @@ static void *watcher(void *arg)
              * still ends the stretch before it: left out, the stretches before each of them add up across every kill */
             if (fresh || atomic_load(&nem_inprog) > 0)
                 gap = 0;
-            if (dead)
+            if (dead) {
                 since = tt;
+                starved0 = starved_now(wfd);
+            }
             prev_serving = false;
             last = tt;
         } else {
@@ -1434,7 +1508,7 @@ static void *watcher(void *arg)
             if (!inprog)
                 step_run = 0;
             else if (prev_serving && tt > last) {
-                step_run += tt - last;
+                step_run += tt - last - (starved_poll > 0 ? (starved_poll < tt - last ? starved_poll : tt - last) : 0);
                 if (step_run > watch_step_worst_ns)
                     watch_step_worst_ns = step_run;
             }
@@ -1459,7 +1533,7 @@ static void *watcher(void *arg)
                 gap = prev_serving && tt > act ? tt - act : 0;
             }
             else if (prev_serving && tt > last)
-                gap += tt - last;
+                gap += tt - last - (starved_poll > 0 ? (starved_poll < tt - last ? starved_poll : tt - last) : 0); /* a nemesis that waits for a CPU is no idler */
             if (gap > watch_gap_worst_ns)
                 watch_gap_worst_ns = gap;
             bool stopped = running && pid_stopped(atomic_load(&server_pid));
@@ -1477,15 +1551,13 @@ static void *watcher(void *arg)
             if (!running && !dead) {
                 dead = true;
                 since = tt;
+                starved0 = starved_now(wfd);
                 watch_deaths++;
             } else if (running && dead) {
                 dead = false;
                 watch_restarts++;
-                if (tt > since) {
-                    watch_dead_total_ns += tt - since;
-                    if (tt - since > watch_dead_worst_ns)
-                        watch_dead_worst_ns = tt - since;
-                }
+                if (tt > since)
+                    dead_stretch(since, tt, starved_now(wfd) - starved0);
             }
             prev_serving = running && !stopped && atomic_load(&port) > 0;
             last = tt;
@@ -1494,11 +1566,10 @@ static void *watcher(void *arg)
             watch_tail_ns = gap; /* the listening time since the last fault, as the run's time was up */
             if (stop_since && lim > stop_since && lim - stop_since > watch_stop_worst_ns) /* stopped as the time was up */
                 watch_stop_worst_ns = lim - stop_since;
-            if (dead && lim > since) { /* no server as the time was up: dead since its death, to the end of the run */
-                watch_dead_total_ns += lim - since;
-                if (lim - since > watch_dead_worst_ns)
-                    watch_dead_worst_ns = lim - since;
-            }
+            if (dead && lim > since) /* no server as the time was up: dead since its death, to the end of the run */
+                dead_stretch(since, lim, starved_now(wfd) - starved0);
+            if (wfd >= 0)
+                close(wfd);
             return NULL;
         }
     }
@@ -1991,10 +2062,68 @@ static void outage_tick(uint64_t r)
     outage_await_recovery(v, now_ns(), what);
 }
 
+/* --sched-selftest: that the kernel's account of the time a thread waited for a CPU (sched_delay_ns) is read right. A probe thread
+ * and three others spin for 400 ms on one CPU: the probe is runnable and waiting for about three quarters of it (100 ms is asked; the
+ * account is monotone, and it is zero for a thread that sleeps). Prints what it saw; 0 when it is right or the kernel has no such file. */
+struct spin_arg {
+    int cpu;
+    int64_t until;
+    int64_t delay0, delay1;
+    bool probe;
+};
+
+static void *spin_th(void *p)
+{
+    struct spin_arg *a = p;
+#ifdef __linux__
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(a->cpu, &one);
+    sched_setaffinity(0, sizeof one, &one);
+#endif
+    int fd = a->probe ? sched_open() : -1;
+    a->delay0 = sched_delay_ns(fd);
+    while (now_ns() < a->until)
+        ;
+    a->delay1 = sched_delay_ns(fd);
+    if (fd >= 0)
+        close(fd);
+    return NULL;
+}
+
+static int sched_selftest(void)
+{
+#ifdef __linux__
+    struct spin_arg a[4];
+    pthread_t th[4];
+    int cpu = sched_getcpu();
+    int64_t until = now_ns() + 400000000LL;
+    for (int i = 0; i < 4; i++) {
+        a[i] = (struct spin_arg){.cpu = cpu, .until = until, .probe = i == 0};
+        if (pthread_create(&th[i], NULL, spin_th, &a[i]) != 0)
+            return 1;
+    }
+    for (int i = 0; i < 4; i++)
+        pthread_join(th[i], NULL);
+    if (a[0].delay0 < 0 || a[0].delay1 < 0) {
+        printf("sched-selftest: skipped (no /proc/thread-self/schedstat)\n");
+        return 0;
+    }
+    int64_t d = a[0].delay1 - a[0].delay0;
+    printf("sched-selftest: a thread sharing CPU %d with three spinners for 400 ms waited %.0f ms for it\n", cpu, (double)d / 1e6);
+    return d >= 100000000LL ? 0 : 1;
+#else
+    printf("sched-selftest: skipped (not Linux)\n");
+    return 0;
+#endif
+}
+
 static void *nemesis_thread(void *arg)
 {
     (void)arg;
     int mut_pulls = 0, mut_iter = 0;
+    int sfd = sched_open(); /* kept open for the run: the watcher reads it (a descriptor it closed could be another file's) */
+    atomic_store(&nem_sched_fd, sfd);
     uint64_t r = mix(seed + 77);
     bool late_done = false;
     while ((!atomic_load(&stop) && !atomic_load(&nem_stop)) || (nem_mutant && !strcmp(nem_mutant, "lastpull") && !late_done)) {
@@ -2045,6 +2174,7 @@ static void *nemesis_thread(void *arg)
             int st;
             bool killed = false;
             int64_t step0 = now_ns(), waited = 0; /* the step's time that is not a start or a wait for the pulled server to die */
+            int64_t starved0 = sched_delay_ns(sfd); /* the time this thread waits for a CPU in the step is the machine's, not its idling */
             bool dead = waitpid(pid, &st, WNOHANG) == pid; /* it died by itself (the shim's own odds): nothing to pull */
             if (!dead && (!strcmp(mm, "never") || (!strcmp(mm, "oncereact") && mut_pulls >= 1))) {
                 pthread_mutex_unlock(&server_lock); /* never pulls the plug: leaves a live server alone */
@@ -2055,11 +2185,18 @@ static void *nemesis_thread(void *arg)
                 pulls_issued++;
                 int64_t issued = now_ns();
                 atomic_fetch_add(&nem_inprog, 1);
+                if (!strncmp(mm, "powerslowstep:", 14)) /* the pull step dawdles with the server live and the fault in progress */
+                    usleep((useconds_t)atoi(mm + 14) * 1000);
                 signal_pid(pid, SIGUSR2);
                 bool gone = false;
                 int64_t w0 = now_ns();
                 int wait_s = PULL_WAIT_S;
-                for (int i = 0; i < wait_s * 100 && !(gone = waitpid(pid, &st, WNOHANG) == pid); i++) {
+                if (!strncmp(mm, "starve:", 7) && mut_pulls <= 4) {
+                    int ms = atoi(mm + 7);
+                    usleep((useconds_t)ms * 1000);
+                    atomic_fetch_add(&nem_sched_fake_ns, (int64_t)ms * 1000000LL); /* after the server's death, which the watcher has seen by then */
+                }
+                for (int i = 0; !gone && i < wait_s * 100 && !(gone = waitpid(pid, &st, WNOHANG) == pid); i++) {
                     usleep(10000);
                     if (atomic_load(&stop_ns) && now_ns() - atomic_load(&stop_ns) > 1000000000LL && i % 100 == 0)
                         poke_server(pid); /* the clients are gone: no traffic brings the file operation the power loss waits for */
@@ -2100,7 +2237,8 @@ static void *nemesis_thread(void *arg)
             nem_touch();
             if (!strncmp(mm, "busysleep:", 10)) /* sleeps inside the fault step with the new server up (and maybe dead) */
                 usleep((useconds_t)atoi(mm + 10) * 1000);
-            nem_idle_ns += now_ns() - step0 - waited;
+            int64_t idle = now_ns() - step0 - waited, starved = sched_delay_ns(sfd) - starved0;
+            nem_idle_ns += starved > 0 && starved < idle ? idle - starved : starved > 0 ? 0 : idle;
         } else if (!strcmp(nemesis, "eio")) {
             pid_t pid = atomic_load(&server_pid);
             int st = 0;
@@ -2120,8 +2258,12 @@ static void *nemesis_thread(void *arg)
                 continue;
             }
             if (!gone && access(markpath, F_OK) != 0 && strcmp(mm, "eionosig")) { /* the next write or sync fails */
+                int64_t step0 = now_ns(), delay0 = nem_delay_now();
                 atomic_fetch_add(&nem_inprog, 1);
+                if (!strncmp(mm, "eioslowstep:", 12)) /* the eio step dawdles with the server live and the fault in progress */
+                    usleep((useconds_t)atoi(mm + 12) * 1000);
                 fault_t0 = now_ns();
+                nem_idle_since(step0, delay0); /* what it did before its signal is idle time (the wait for the server to stop is the fault's) */
                 signal_pid(pid, SIGUSR2);
                 sent = true;
                 for (int i = 0; i < 100 && access(markpath, F_OK) != 0; i++)
@@ -2270,11 +2412,25 @@ static void *nemesis_thread(void *arg)
  * A nemesis that works at a third of the honest rate, at half of it (slow:MS), stops at three quarters of the run (hole:15:100) or
  * sees no server die in its naps (blind:MS) is failed by the selftest of the Makefile, 10 of 10 runs in each of the four conditions
  * (/tmp and /var/tmp, quiet and with 16 busy loops).
- * What passes, on purpose, and is not a failure of the check: (1) a kill step that dawdles up to 400 ms with the server live (the bound above;
- * killslowstep:1000 makes 13 faults against a floor of 15 and fails); (2) a nemesis that stops working at nine tenths of a run (the gap bound is a tenth of the
- * run, 2 s of 20), or at four fifths of one of 10 s (the pause runs of make jepsen are 20 s for that reason); (3) any run whose fault count passes only because restarts and pulls the nemesis waits for count as work, so a
- * nemesis that always waits as long as the honest one under load can do is not told from it. A bound is never widened to make a mutant
- * fail: honest runs come first.
+ * What passes, on purpose, and is not a failure of the check: (1) a nemesis at half the honest rate (slow:MS: the floor is half the honest
+ * least, so such a run is at the floor and about one in four fails to fail: eio slow:1600 over 60 s passed 1 of 4 runs under load; at a
+ * third of the rate, 0 of 16); (2) a nemesis that stops working at nine tenths of a run (the gap bound is a tenth of the run, 2 s of 20), or at
+ * four fifths of one of 10 s (the pause runs of make jepsen are 20 s for that reason); (3) any run whose fault count passes only because
+ * restarts and pulls the nemesis waits for count as work, so a nemesis that always waits as long as the honest one under load can do is
+ * not told from it; (4) a nemesis that does not look at the server in its naps (blind:MS, blindafter:S of the verifier) when the shim's own
+ * odds are what must kill a server in one: the eio shim fails a file that kills the server in 4 to 8 naps of 20 s, the dead stretch it
+ * leaves is what remains of the nap (uniform to 750 ms), and about half of the runs leave none above 250 ms (6 of 14 runs failed to fail;
+ * a power nemesis, 100%: its plugs and the shim's odds kill 17 servers in 20 s), hence the selftest case with raised odds. A step of the
+ * kill, power or eio nemesis that sleeps with the server live before its signal is NOT such a pass: that time is idle time of the step
+ * (nem_idle_since; an honest step has none, 0.00 s in every run, and a sleep is no CPU wait), whose bound is 5% of the run, so a step that
+ * dawdles 40 ms on average fails (killslowstep, powerslowstep and eioslowstep 200 to 3000 ms: 78 runs, none passed, quiet and with 16 busy loops).
+ * A bound is never widened to make a mutant fail: honest runs come first.
+ * Starvation: the dead stretch, the step's idle time, the gap and a kill step's listening time leave out what the nemesis thread and the
+ * watcher waited for a CPU in them (the kernel's run delay of the thread, sched_delay_ns). A machine with a load average of 60 and more
+ * starved the nemesis for 250 to 280 ms at a time (one honest run in 13 lay dead 453 ms, 250 ms of it before the thread got to reap the
+ * pulled server); a nemesis that sleeps in a step has no run delay, so the mutants above stay failed. Without the account (a kernel
+ * without /proc/thread-self/schedstat) nothing is excused. `--mutant-nemesis starve:MS` is an honest nemesis that reports MS of CPU wait
+ * for a reap it does not do for that long: it must be valid, and fails on the check as it was before.
  * Measured and caught, so not a pass: a blind power nemesis (naps that never look at the server, blind:1000) at the shim's default odds,
  * 16 of 16 runs (8 quiet, 8 with 16 busy loops on /tmp), by the dead stretch of 1 to 3 s its naps leave and by the floor; the odds of the
  * Makefile case are raised only to make the shim kill servers at all in 20 s. */
@@ -2339,10 +2495,10 @@ static int nemesis_check(void)
         judged[j] = watch_live3_ns[j] * 2 >= nem_third_start(j + 1) - nem_third_start(j);
     printf("nemesis %s: %d faults in %.0f s (%.1f s with a server listening, %.1f s of it with no fault being carried out; at least %d expected; by third of the run %d/%d/%d; "
            "%d plugs asked for), %d deaths and %d restarts seen, servers dead %.1f s in all, longest %.0f ms, %.2f s idle in its fault steps, "
-           "longest listening stretch without a fault %.2f s, %.2f s at the end, longest stop %.0f ms, longest listening stretch in a fault step %.0f ms, %d marks of the shim's own odds not counted\n",
+           "longest listening stretch without a fault %.2f s, %.2f s at the end, longest stop %.0f ms, longest listening stretch in a fault step %.0f ms, %d marks of the shim's own odds not counted, longest dead stretch %.0f ms before the CPU time the nemesis and the watcher waited for is taken off\n",
            nemesis, nem_faults, seconds, live, (double)watch_free_ns / 1e9, want, third[0], third[1], third[2], pulls_issued, watch_deaths, watch_restarts,
            (double)watch_dead_total_ns / 1e9, (double)watch_dead_worst_ns / 1e6, (double)nem_idle_ns / 1e9,
-           (double)watch_gap_worst_ns / 1e9, (double)watch_tail_ns / 1e9, (double)watch_stop_worst_ns / 1e6, (double)watch_step_worst_ns / 1e6, eio_own);
+           (double)watch_gap_worst_ns / 1e9, (double)watch_tail_ns / 1e9, (double)watch_stop_worst_ns / 1e6, (double)watch_step_worst_ns / 1e6, eio_own, (double)watch_dead_raw_ns / 1e6);
     if (nem_faults < want) {
         fprintf(stderr, "  the nemesis issued %d faults in %.0f s, %.1f s of it with a server listening (at least %d expected)%s: it was idle\n",
                 nem_faults, seconds, live, want, !strcmp(nemesis, "power") && pulls_issued > nem_faults ?
@@ -2371,8 +2527,9 @@ static int nemesis_check(void)
         bad++;
     }
     if (watch_dead_worst_ns > NEM_DEAD_MAX_MS * 1000000LL) {
-        fprintf(stderr, "  a server lay dead for %.0f ms (at most %d ms expected, the watcher polls every %d ms): the nemesis "
-                "was idle\n", (double)watch_dead_worst_ns / 1e6, NEM_DEAD_MAX_MS, WATCH_POLL_MS);
+        fprintf(stderr, "  a server lay dead for %.0f ms (at most %d ms expected, the watcher polls every %d ms; %.0f ms before the CPU time "
+                "the nemesis and the watcher waited for is taken off): the nemesis was idle\n", (double)watch_dead_worst_ns / 1e6,
+                NEM_DEAD_MAX_MS, WATCH_POLL_MS, (double)watch_dead_raw_ns / 1e6);
         bad++;
     }
     if (seconds >= 10 && (double)nem_idle_ns > NEM_IDLE_SHARE * seconds * 1e9) {
@@ -3664,6 +3821,7 @@ int main(int argc, char **argv)
                                    {"mutant-longnap", no_argument, 0, 'L'},
                                    {"mutant-nemesis", required_argument, 0, 'M'},
                                    {"mutant-slowcreate", no_argument, 0, 'C'},
+                                   {"sched-selftest", no_argument, 0, 'Z'},
                                    {"scan-slow-probes", required_argument, 0, 'P'},
                                    {0, 0, 0, 0}};
     int ch;
@@ -3687,6 +3845,7 @@ int main(int argc, char **argv)
         case 'L': idle_mutant_long = true; break;
         case 'M': nem_mutant = optarg; break;
         case 'C': slow_create = true; break;
+        case 'Z': return sched_selftest();
         case 'P': { /* the self-test of slow_probe_since: FILE,DOMAIN,SINCE prints the time of the latest line, or 0 */
             char *a = strdup(optarg), *c2 = strrchr(a, ','), *c1 = c2 ? (*c2 = 0, strrchr(a, ',')) : NULL;
             if (!c1)

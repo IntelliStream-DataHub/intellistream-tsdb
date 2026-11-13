@@ -1059,10 +1059,16 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # a longer nap, works at half or two thirds of it), its gap bound a tenth of the run (2 to 5 s, the stretch to the end of the run
 # included: hole:15:100 stops at three quarters of a run of 20 s, hole:6:100 at six tenths of one of 10 s), and the dead bound
 # catches a nemesis that does not look at the server when the shim, with high odds, is what kills it (blind:1000, no forced death).
-# A kill step that dawdles with the server live (killslowstep:1000) works at a third of the honest rate in time that is no free time:
-# the time a server listens in a kill step counts as free past 400 ms. A pause run is 20 s (hole:16:100, four fifths of it, fails; of
+# A step of the kill, power or eio nemesis that dawdles with the server live before its signal (killslowstep, powerslowstep,
+# eioslowstep: 400 ms each) is idle time of the step (an honest step has microseconds of it, 0.00 s in every run measured), whatever
+# the rate it leaves: 5% of the run is the bound. A pause run is 20 s (hole:16:100, four fifths of it, fails; of
 # 10 s it did not), and a plug pulled when the clients are gone (lastpull) is an honest run: the harness gives the server a row to
-# fail on (poke_server) and the case must pass. What passes on purpose is listed at the end of the comment of nemesis_check.
+# fail on (poke_server) and the case must pass. So is a nemesis starved of the CPU (starve:800: it does not reap a pulled server for
+# 800 ms and reports the time as CPU time it waited for): on a machine with a load average of 60 and more an honest nemesis thread
+# waited 250 to 280 ms at a time, the dead stretch was 453 ms and the run failed (1 in 12); the kernel's account of that time is taken off
+# the stretch (sched_delay_ns), and what is left is the nemesis' own: deadsleep, busysleep, powerslowstep and eioslowstep sleep and
+# are not starved. `jepsen --sched-selftest` checks that the account is read right (a thread sharing a CPU with three spinners).
+# What passes on purpose is listed at the end of the comment of nemesis_check.
 # What each bound is set to, and the honest worst under load on tmpfs and disk, is in the comments of nemesis_check (jepsen.c).
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
@@ -1124,6 +1130,9 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 	    'kill@20@slow:1500@-@the nemesis issued [0-9]* faults in 20 s.*it was idle@a kill nemesis at half the honest rate slipped past the floor' \
 	    'pause@10@slow:1200@-@the nemesis issued [0-9]* faults in 10 s.*it was idle@a pause nemesis at two thirds of the honest rate slipped past the floor' \
 	    'kill@20@killslowstep:1000@-@the nemesis issued [0-9]* faults in 20 s.*it was idle@a kill whose step dawdles with the server live (a third of the honest rate, in time that is no free time) slipped past the floor' \
+	    'kill@20@killslowstep:400@-@the nemesis was idle in it@a kill whose step dawdles 400 ms with the server live (its time before the signal is idle time, which an honest step has none of)' \
+	    'power@20@powerslowstep:400@-@the nemesis was idle in it@a power step that dawdles 400 ms with the server live and the fault in progress' \
+	    'eio@20@eioslowstep:400@-@the nemesis was idle in it@an eio step that dawdles 400 ms with the server live and the fault in progress' \
 	    'kill@20@hole:15:100@-@listening for [0-9.]* s with no fault issued or in progress@a kill nemesis that stops at three quarters of the run' \
 	    'pause@10@hole:6:100@-@listening for [0-9.]* s with no fault issued or in progress@a pause nemesis that stops at seven tenths of the run' \
 	    'pause@20@hole:16:100@-@listening for [0-9.]* s with no fault issued or in progress@a pause nemesis that stops at four fifths of the run (the length of the pause runs of make jepsen; of 10 s it was not caught)' \
@@ -1150,6 +1159,14 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 	    --mutant-nemesis lastpull 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^valid$$'; then \
 	        echo "jepsen-selftest: a plug pulled when the clients are gone (no traffic for the power loss to wait on) was called a hung server (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(./$(B)/jepsen --sched-selftest 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ]; then \
+	        echo "jepsen-selftest: the time a thread waits for a CPU was not read right (rc $$rc)"; echo "$$out" | tail -n 5; exit 1; fi; \
+	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so \
+	    --mutant-nemesis starve:800 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^valid$$' || \
+	       ! echo "$$out" | grep -q 'longest dead stretch [3-9][0-9][0-9] ms before\|longest dead stretch [0-9][0-9][0-9][0-9] ms before'; then \
+	        echo "jepsen-selftest: a nemesis starved of the CPU (a server dead 800 ms before it was reaped) was called idle, or left none dead (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(JEPSEN_TSDBD=tests/jepsen/hang-tsdbd.sh timeout 300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'it is hung'; then \
