@@ -1625,7 +1625,7 @@ static int power_child(const char *dir, const char *ackfile)
     return 0;
 }
 
-static int run_power_child(const char *dir, const char *ackfile, int warmup, int seed)
+static int run_power_child_as(const char *mode, const char *dir, const char *root, const char *ackfile, int warmup, int seed)
 {
     pid_t pid = fork();
     if (pid == 0) {
@@ -1637,7 +1637,7 @@ static int run_power_child(const char *dir, const char *ackfile, int warmup, int
         snprintf(w, sizeof w, "%d", warmup);
         snprintf(sd, sizeof sd, "%d", seed);
         setenv("LD_PRELOAD", SHIM, 1);
-        setenv("CRASHFS_ROOT", dir, 1);
+        setenv("CRASHFS_ROOT", root, 1);
         setenv("CRASHFS_PROB", "1", 1);
         setenv("CRASHFS_WARMUP", w, 1);
         setenv("CRASHFS_AT_EXIT", "1", 1);
@@ -1646,13 +1646,18 @@ static int run_power_child(const char *dir, const char *ackfile, int warmup, int
         int null = open("/dev/null", O_WRONLY);
         if (null >= 0 && !getenv("TEST_REPLICA_CHILD_OUTPUT")) /* (set it to see why a child ended) */
             dup2(null, 1), dup2(null, 2);
-        execl(SELF, SELF, "--power", dir, ackfile, MUTNAME ? MUTNAME : "none", (char *)NULL);
+        execl(SELF, SELF, mode, dir, ackfile, MUTNAME ? MUTNAME : "none", (char *)NULL);
         _exit(127);
     }
     int st = -1;
     if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
         return -1;
     return WEXITSTATUS(st);
+}
+
+static int run_power_child(const char *dir, const char *ackfile, int warmup, int seed)
+{
+    return run_power_child_as("--power", dir, dir, ackfile, warmup, seed);
 }
 
 /* (the ack files are named so that no root of crashfs, a path prefix, covers them: S/pl is the root) */
@@ -2152,6 +2157,159 @@ static void case_commit_random(unsigned seed)
 #undef RND
 }
 
+/* ------------------------------------------------------------ Q: power lost while COMMITs are applied
+ * A leader engine (outside the crashfs root) and a replica (inside it) run a fixed script of small and large writes,
+ * deletes, replaces and flushes through the K transport; the power fails at every file system step of the replica. What
+ * the leader was told (every step it finished: the replica had the staged files and the markers durable) must be there
+ * afterwards: the durable end covers it, the log applies, and the replica answers as the leader did after some step
+ * at or beyond the last finished one (an oracle run of the same script with no replica gives the answers). */
+#define QSTEPS 18
+
+static void q_step(xport *x, int i)
+{
+    float b = (float)(i * 100);
+    switch (i) {
+    case 0: xp_rows(x, 0, 0, 10, b); break;
+    case 1: xp_rows(x, 1, 0, 5, b); break;
+    case 2: xp_rows(x, 0, 5, 40, b); break;
+    case 3: xp_rows(x, 0, 40, 10, b); break;
+    case 4: CHECK_EQ(eng_delete_range(x->ld, 1, T0 + 1000, T0 + 3000), 0); break;
+    case 5: CHECK_EQ(eng_flush(x->ld), 0); break;
+    case 6: xp_rows(x, 1, 0, 30, b); break;
+    case 7: xp_replace(x, 0, 10, 20, 5, b); break;
+    case 8: xp_rows(x, 1, 10, 3, b); break;
+    case 9: xp_rows(x, 1, 20, 30, b); break;
+    case 10: CHECK_EQ(eng_flush(x->ld), 0); break;
+    case 11: xp_rows(x, 0, 2, 4, b); break;
+    case 12: CHECK_EQ(eng_delete_range(x->ld, 0, T0 + 4000, T0 + 30000), 0); break;
+    case 13: xp_rows(x, 0, 3, 25, b); break;
+    case 14: xp_replace(x, 1, 4, 14, 4, b); break;
+    case 15: CHECK_EQ(eng_flush(x->ld), 0); break;
+    case 16: xp_rows(x, 1, 8, 20, b); break;
+    default: xp_rows(x, 0, 30, 3, b); break;
+    }
+    CHECK_EQ(xp_pump(x, ld_last(x)), 0);
+}
+
+static uint64_t q_digest(eng *db)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t s = 0; s < NS; s++) {
+        qctx q = {.n = 0};
+        if (eng_query_raw_ex(db, s, T0 - 1000, T0 + 1000LL * (NT + 1), false, 0, qfn, &q) != 0)
+            return 0;
+        h = (h ^ q.n) * 1099511628211ULL;
+        for (size_t i = 0; i < q.n; i++) {
+            uint32_t bits;
+            memcpy(&bits, &q.v[i], 4);
+            h = (h ^ (uint64_t)q.ts[i]) * 1099511628211ULL;
+            h = (h ^ bits) * 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
+static int powerq_child(const char *ldir, const char *ackfile)
+{
+    xport x;
+    memset(&x, 0, sizeof x);
+    char rd[PATH_MAX + 8];
+    snprintf(x.ldir, sizeof x.ldir, "%s", ldir);
+    snprintf(rd, sizeof rd, "%s_r", ldir);
+    if (open_replica(rd, 0, &x.rep) != 0)
+        return 2;
+    xp_open_leader(&x);
+    for (int i = 0; i < QSTEPS; i++) {
+        q_step(&x, i);
+        if (failures)
+            return 3;
+        write_ack(ackfile, (uint64_t)i + 1);
+    }
+    return 0;
+}
+
+static void case_power_commit(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  power loss in COMMITs: skipped (no %s)\n", SHIM);
+        return;
+    }
+    /* the oracle: the same script, a leader alone */
+    uint64_t D[QSTEPS + 1], P[QSTEPS + 1];
+    {
+        xport o;
+        xp_start(&o, "pqo");
+        eng_close(o.rep);
+        o.rep = NULL;
+        D[0] = q_digest(o.ld);
+        P[0] = ld_last(&o);
+        for (int i = 0; i < QSTEPS; i++) {
+            q_step(&o, i);
+            D[i + 1] = q_digest(o.ld);
+            P[i + 1] = ld_last(&o);
+        }
+        xp_stop(&o);
+    }
+    char ack[PATH_MAX + 16];
+    snprintf(ack, sizeof ack, "%s/acks-of-pq.ack", S);
+    int crashes = 0;
+    bool finished = false;
+    for (int k = 0; k < 4000 && !finished; k++) {
+        char ld[PATH_MAX], rd[PATH_MAX + 8];
+        fresh(ld, "pq");
+        snprintf(rd, sizeof rd, "%s_r", ld);
+        sh("rm -rf '%s' && cp -a '%s' '%s'", rd, ld, rd);
+        unlink(ack);
+        int code = run_power_child_as("--powerq", ld, rd, ack, k, k + 1);
+        if (code != 99 && code != 0)
+            fprintf(stderr, "Q: step %d: the child ended with status %d\n", k, code);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += code == 99;
+        finished = code == 0;
+        uint64_t done = 0;
+        FILE *f = fopen(ack, "r");
+        if (f) {
+            if (fscanf(f, "%" SCNu64, &done) != 1)
+                done = 0;
+            fclose(f);
+        }
+        eng *db;
+        int rc = open_replica(rd, 0, &db);
+        if (rc != 0) {
+            fprintf(stderr, "Q: step %d: the open failed: %d\n", k, rc);
+            failures++;
+            continue;
+        }
+        if (replica_durable_end(db) < P[done]) {
+            fprintf(stderr, "Q: step %d: the leader finished step %" PRIu64 " (position %" PRIu64
+                    "), the replica's durable end is %" PRIu64 "\n", k, done, P[done], replica_durable_end(db));
+            failures++;
+        }
+        if (replica_apply(db, replica_durable_end(db)) != 0) {
+            fprintf(stderr, "Q: step %d: the durable log does not apply\n", k);
+            failures++;
+        } else {
+            uint64_t d = q_digest(db);
+            bool ok = false;
+            for (int j = (int)done; j <= QSTEPS; j++)
+                ok |= D[j] == d;
+            if (!ok) {
+                fprintf(stderr, "Q: step %d: the replica (applied to %" PRIu64 ") answers as the leader did after no step "
+                        "from %" PRIu64 " on\n", k, replica_applied_end(db), done);
+                failures++;
+            }
+        }
+        eng_close(db);
+        if (failures)
+            break;
+    }
+    CHECK(finished && crashes > 100);
+    printf("  power lost at each of %d steps of a replica applying COMMITs (staged files, hold, RSTATE): what the "
+           "leader was told is durable, the answers are the leader's\n", crashes);
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -2195,6 +2353,11 @@ int main(int argc, char **argv)
             eng_test_mutant = mutant_of(argv[4]);
         return power_child(argv[2], argv[3]);
     }
+    if (argc >= 4 && strcmp(argv[1], "--powerq") == 0) {
+        if (argc >= 5)
+            eng_test_mutant = mutant_of(argv[4]);
+        return powerq_child(argv[2], argv[3]);
+    }
     if (a + 1 < argc && strcmp(argv[a], "--mutant") == 0) {
         const char *m = argv[a + 1];
         eng_test_mutant = mutant_of(m);
@@ -2236,6 +2399,7 @@ int main(int argc, char **argv)
     for (unsigned seed = 1; seed <= 12; seed++)
         case_commit_random(seed);
     case_power();
+    case_power_commit();
     for (unsigned seed = 1; seed <= 20; seed++) {
         int f0 = failures;
         case_random(seed);
