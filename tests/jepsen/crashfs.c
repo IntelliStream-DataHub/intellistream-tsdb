@@ -33,8 +33,10 @@
  * or syncfs). If $CRASHFS_MARK is set, the path of the
  * file that failed is written there, so a harness knows the fault happened.
  *
- * $CRASHFS_PULL_FILE: a power loss that a SIGUSR2 asked for appends "pid N power loss requested by SIGUSR2" there before
- * the process exits (99), so a harness counts the plugs it pulled from what the shim did, not from what it sent.
+ * $CRASHFS_PULL_FILE: a SIGUSR2 that reaches the shim appends "pid N power loss requested by SIGUSR2" there as it is
+ * delivered (the process loses power at its next file operation, or by its own odds just before: exit 99), so a harness counts the
+ * plugs it pulled from what the shim did, not from what it sent, and a loss that the shim's own odds drew in the same moment
+ * is not lost to the count.
  * $CRASHFS_IGNORE_USR2=1 makes the shim ignore SIGUSR2 (a self-test of that count); =2 makes it honour the signal and not log the
  * plug (the loss is as sudden as ever, the harness has no proof of it: whatever the speed of the file system, the plug is there and not counted).
  *
@@ -202,13 +204,46 @@ static volatile sig_atomic_t usr2_seen; /* only a SIGUSR2 sets it: the power los
 static char pull_file[PATH_MAX];        /* $CRASHFS_PULL_FILE: a line per power loss that a SIGUSR2 asked for, written by the shim */
 static int ignore_usr2;                 /* $CRASHFS_IGNORE_USR2: 1: a shim that does not honour the pull, 2: one that honours it and does not log it (jepsen's self-test of its count) */
 
+/* The harness's proof of a plug it pulled is written where the signal is delivered, not where the process dies of it: a loss
+ * drawn by the shim's own odds on another thread can win the race to the exit (the signal arriving while that loss is rolling
+ * back, 2 of 17 pulls of a classes run), and the harness then saw a server that lost power with the pull's line missing.
+ * The server loses power either way, and a signal the shim ignored (=1) or a server that was dead (never delivered) leaves no
+ * line. Async-signal-safe: raw system calls, the line built by hand. */
+static void log_pull_delivered(void)
+{
+    if (!pull_file[0] || ignore_usr2 == 2)
+        return;
+    char line[64], digits[16];
+    int nd = 0, n = 0;
+    long pid = (long)getpid();
+    do
+        digits[nd++] = (char)('0' + pid % 10);
+    while ((pid /= 10) > 0);
+    static const char head[] = "pid ", tail[] = " power loss requested by SIGUSR2\n";
+    for (size_t i = 0; i < sizeof head - 1; i++)
+        line[n++] = head[i];
+    while (nd > 0)
+        line[n++] = digits[--nd];
+    for (size_t i = 0; i < sizeof tail - 1; i++)
+        line[n++] = tail[i];
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, pull_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        if (syscall(SYS_write, fd, line, (size_t)n) < 0) {
+        }
+        syscall(SYS_close, fd);
+    }
+}
+
 static void on_usr2(int sig)
 {
     (void)sig;
     if (ignore_usr2 == 1)
         return;
+    int saved = errno;
     usr2_seen = 1;
+    log_pull_delivered();
     crash_requested = 1;
+    errno = saved;
 }
 
 /* 16 GB of address space, touched only as far as used. Not calloc: a sanitizer's allocator
@@ -609,16 +644,6 @@ __attribute__((noreturn)) static void power_loss(void)
                             by, tear_prefix, tear_garbage, tear_old, tear_kept)
                  : snprintf(msg, sizeof msg, "crashfs: power loss%s\n", by);
     if (real_write(2, msg, (size_t)n) < 0) {
-    }
-    if (usr2_seen && pull_file[0] && ignore_usr2 != 2) { /* the harness's count of the plugs it pulled: only a loss this shim made on request is in it */
-        char line[64];
-        int m = snprintf(line, sizeof line, "pid %d power loss requested by SIGUSR2\n", (int)getpid());
-        int fd = (int)syscall(SYS_openat, AT_FDCWD, pull_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd >= 0) {
-            if (syscall(SYS_write, fd, line, (size_t)m) < 0) {
-            }
-            syscall(SYS_close, fd);
-        }
     }
     _exit(99);
 }

@@ -1890,6 +1890,21 @@ static void nz_part(void *ctx, const tsdb_part_info *p)
     s->rows += p->rows;
 }
 
+/* A background merge is parked in the merge hook until the test lets it go (nz_hold 0): a scan lists the parts and then opens
+ * each one by name, and a merge that commits between the two retires a part that is on the list (part_open: not found; seen
+ * once under tsan with a busy machine). The scans run while every merge is parked before it names its output (hook point 0,
+ * so no part has been retired) or after the last one is done, never while one can commit. */
+static atomic_int nz_hold, nz_parked; /* nz_hold: 0 off, 1 park merges before they name their output, 2 after (named, not committed) */
+static void nz_hook(int at)
+{
+    int h = atomic_load(&nz_hold);
+    if (h == 0 || at != h - 1)
+        return;
+    atomic_fetch_add(&nz_parked, 1);
+    while (atomic_load(&nz_hold) == h)
+        usleep(1000);
+}
+
 static int64_t nz_missing(const char *dir, const char *name, codec_ctx *cc, uint64_t *blocks)
 {
     int dfd = open(dir, O_RDONLY | O_DIRECTORY);
@@ -1963,6 +1978,68 @@ static void nz_check_rows(tsdb *db, tsdb_sid id, int64_t t0, int n)
     tsdb_points_free(&p);
     free(ts);
     free(v);
+}
+
+/* The race test_insert_nozstd's scans must stay clear of, made to happen: a part listed before a merge commits is gone from the
+ * directory after it (retired), so a scan that lists and then opens by name fails with "not found". The merge is parked after
+ * it named its output (hook point 1), the list is taken, the merge goes on and commits, and the listed name no longer opens.
+ * With the scans of test_insert_nozstd as they were (list, open, merges running) this is what a merge between the two did. */
+static void test_nz_stale_listing(const char *base)
+{
+    enum { G = 1024, N = 2 * G };
+    const int64_t t0 = 1700006400000;
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-nzstale-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.granule_rows = G;
+    o.fsync = 0;
+    o.wal_max_batch_rows = 100;
+    o.flush_interval_ms = 1000000;
+    o.merge_idle_s = 1;
+    tsdb *db;
+    tsdb_sid id;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "s", &id));
+    int64_t ts[N];
+    float v[N];
+    nz_rows(t0, 0, N, ts, v);
+    atomic_store(&nz_parked, 0);
+    atomic_store(&nz_hold, 2);
+    atomic_store(&merge_hook, nz_hook);
+    OK(tsdb_insert_series(db, id, ts, v, N));
+    for (int tries = 0; tries < 300 && atomic_load(&nz_parked) == 0; tries++)
+        usleep(100000);
+    CHECK(atomic_load(&nz_parked) == 1); /* the rewrite of the lone part named its output and waits */
+    nz_parts ps;
+    memset(&ps, 0, sizeof ps);
+    OK(tsdb_foreach_part(db, nz_part, &ps));
+    CHECK(ps.n == 1 && ps.level[0] == 0);
+    char old[128];
+    snprintf(old, sizeof old, "%s", ps.names[0]);
+    atomic_store(&nz_hold, 0);
+    for (int tries = 0; tries < 300; tries++) {
+        memset(&ps, 0, sizeof ps);
+        OK(tsdb_foreach_part(db, nz_part, &ps));
+        if (ps.n == 1 && ps.level[0])
+            break;
+        usleep(100000);
+    }
+    CHECK(ps.n == 1 && ps.level[0] > 0);
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    CHECK(dfd >= 0);
+    for (int tries = 0; tries < 100 && faccessat(dfd, old, F_OK, 0) == 0; tries++)
+        usleep(50000);
+    part *p = NULL;
+    int rc = part_open(dfd, old, false, &p);
+    CHECK(rc != 0); /* the part the stale list names is gone */
+    if (rc == 0)
+        part_unref(p);
+    close(dfd);
+    atomic_store(&merge_hook, NULL);
+    OK(tsdb_close(db));
+    rm_rf(dir);
 }
 
 /* Inserts and memtable flushes write blocks without zstd by default (insert_zstd_level 0); merges write at
@@ -2054,14 +2131,27 @@ static void test_insert_nozstd(const char *base)
         /* a part alone in its partition, rewritten in the background once the partition is idle */
         o.merge_idle_s = 1;
         OK(tsdb_open(dir, &o, &db));
+        atomic_store(&nz_parked, 0);
+        atomic_store(&nz_hold, 1);
+        atomic_store(&merge_hook, nz_hook);
         nz_rows(later, 0, N, ts, v);
         OK(tsdb_insert_series(db, id, ts, v, N));
-        for (int tries = 0; tries < 100; tries++) {
-            merged = nz_scan(db, dir, &ps, &raw0);
+        for (int tries = 0; tries < 300 && atomic_load(&nz_parked) == 0; tries++) /* the idle rewrite is under way */
+            usleep(100000);
+        CHECK(atomic_load(&nz_parked) == 1);
+        merged = nz_scan(db, dir, &ps, &raw0); /* with it parked nothing is retired while the scan lists and opens */
+        CHECK(ps.n == 2 && (ps.level[0] > 0) != (ps.level[1] > 0) && merged == 0 && (mode ? raw0 == 0 : raw0 > 0));
+        atomic_store(&nz_hold, 0);
+        for (int tries = 0; tries < 300; tries++) { /* only the listing, no opens: until the rewrite is listed */
+            memset(&ps, 0, sizeof ps);
+            OK(tsdb_foreach_part(db, nz_part, &ps));
             if (ps.n == 2 && ps.level[0] && ps.level[1])
                 break;
             usleep(100000);
         }
+        CHECK(ps.n == 2 && ps.level[0] && ps.level[1]);
+        merged = nz_scan(db, dir, &ps, &raw0); /* nothing is left to merge: the parts listed now are the parts at rest */
+        atomic_store(&merge_hook, NULL);
         CHECK(ps.n == 2 && ps.level[0] && ps.level[1] && merged == 0 && raw0 == 0);
         nz_check_rows(db, id, t0, 3 * N + A);
         nz_check_rows(db, id, later, N);
@@ -2936,6 +3026,7 @@ int main(int argc, char **argv)
     }
     if (argc > 2 && strcmp(argv[2], "nozstd") == 0) {
         test_insert_nozstd(base);
+        test_nz_stale_listing(base);
         printf(failures ? "FAILED: %d checks\n" : "all tests passed\n", failures);
         return failures != 0;
     }
@@ -2962,6 +3053,7 @@ int main(int argc, char **argv)
     test_solo_rewrite(base);
     printf("inserts without zstd, compressed by merges\n");
     test_insert_nozstd(base);
+    test_nz_stale_listing(base);
     test_solo_after_retention(base);
     test_optimize_waits_for_solo(base);
     test_drop_stays_dropped(base);
