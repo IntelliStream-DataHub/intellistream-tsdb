@@ -1460,7 +1460,9 @@ int main(int argc, char **argv)
             }
             if (!server || (pwfile && !login))
                 usage();
-            return stats_online(server, login, pwfile, argv[2], nr, rest);
+            int rc = stats_online(server, login, pwfile, argv[2], nr, rest);
+            free(rest);
+            return rc;
         }
     }
     const char *dir = argv[1], *cmd = argv[2];

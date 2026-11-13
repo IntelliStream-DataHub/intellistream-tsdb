@@ -216,9 +216,10 @@ static long tl_find(const tlst *t, const char *p, size_t len)
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         const char *s = t->s[mid];
-        int c = strncmp(s, p, len);
+        size_t sl = strlen(s); /* p may hold a NUL (it comes from a frame): byte strings, never read s past its end */
+        int c = memcmp(s, p, len < sl ? len : sl);
         if (c == 0)
-            c = s[len] ? 1 : 0; /* s is longer than p */
+            c = sl > len ? 1 : sl < len ? -1 : 0;
         if (c == 0)
             return (long)mid;
         if (c < 0)
@@ -231,10 +232,12 @@ static long tl_find(const tlst *t, const char *p, size_t len)
 
 static int slot_cmp_key(const char *p, size_t len, uint16_t slot)
 {
+    /* p is len bytes from a frame and may hold a NUL: compare as byte strings, never read s past its end */
     const char *s = slot_str[slot];
-    int c = strncmp(p, s, len);
+    size_t sl = strlen(s);
+    int c = memcmp(p, s, len < sl ? len : sl);
     if (c == 0)
-        c = s[len] ? -1 : 0;
+        c = len < sl ? -1 : len > sl ? 1 : 0;
     return c;
 }
 
