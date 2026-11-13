@@ -83,7 +83,7 @@ static int add_tomb_part(eng *db, uint32_t series, int64_t partition, int64_t st
 int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
                       const void *v, size_t n)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp) /* a replica gets deletes as markers (replica.c) */
         return TSDB_ERR_READONLY;
     int st = eng_series_type(db, series);
     if (st < 0 || (n && (type != st || !ts || !v)))

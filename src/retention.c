@@ -226,7 +226,7 @@ int64_t eng_cutoff(eng *db, uint32_t series)
 
 int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp)
         return TSDB_ERR_READONLY;
     if (limit_ms < 0 || series >= eng_series_count(db))
         return TSDB_ERR_INVALID;

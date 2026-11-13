@@ -967,7 +967,7 @@ uint64_t cls_gen_now(eng *db) { return atomic_load_explicit(&db->cls_gen, memory
 
 int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp) /* only the leader decides a switch (design-cluster.md 5.4) */
         return TSDB_ERR_READONLY;
     if (!db->cls_on || cls < 0 || cls >= PART_CLASSES || series >= eng_series_count(db))
         return TSDB_ERR_INVALID;

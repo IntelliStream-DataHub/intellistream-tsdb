@@ -1370,6 +1370,33 @@ int wal_open(struct eng *db, int (*before_replay)(struct eng *));
 void wal_close(struct eng *db);
 void *flusher_main(void *arg);
 
+/* What the replica engine (replica.c, docs/design-cluster.md 4-5) shares with the writer's WAL code. */
+typedef struct wal_seg {
+    uint64_t seq;
+    uint64_t fno_first, fno_end; /* the first number of its first valid record (0: none) and where the numbers end */
+    size_t end; /* a writer's open: where the valid records end, as wal_check_segment found */
+    size_t len; /* and the segment's size */
+    char name[256];
+} wal_seg;
+struct memtable;
+void wal_name(char *buf, size_t len, uint64_t seq);
+int wal_open_segment(struct eng *db, uint64_t seq, int *fd);
+int write_full(int fd, const void *buf, size_t len);
+uint64_t partition_wal_seq(struct eng *db, int64_t partition);
+int read_file(int dirfd, const char *name, uint8_t **out, size_t *len);
+int wal_check_segment(struct eng *db, wal_seg *s);
+int wal_check_order(const wal_seg *segs, size_t nseg, uint64_t parts_seq);
+int wal_open_numbers(struct eng *db, const wal_seg *segs, size_t nseg);
+int cmp_seg(const void *a, const void *b);
+int flush_waiting(struct eng *db); /* flush_lock held */
+int mt_reserve_rows(struct memtable *m, const uint32_t *series, uint32_t cs, size_t n);
+struct replica;
+int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, struct eng **out);
+int replica_open_log(struct eng *db, uint64_t floor, int (*cut_tails)(struct eng *)); /* instead of wal_open; sets db->rp */
+void replica_free(struct eng *db);                     /* wal_close */
+int replica_flush(struct eng *db);                     /* mt_flush of a replica */
+void replica_flushed(struct eng *db, uint64_t seq, uint64_t fno_end); /* flush_waiting: seq is in parts (flush_lock held) */
+
 #define MAX_FLUSHING 4
 
 /* ---- manifest and following (manifest.c) ---- */
@@ -1639,6 +1666,7 @@ struct eng {
     memtable *flushing[MAX_FLUSHING]; /* oldest first; guarded by db->lock */
     size_t nflushing;
     bool wal_enabled;
+    struct replica *rp; /* an engine opened as a replica (replica.c): the log arrives verbatim, rows apply at the commit point */
     int wal_fd;
     uint64_t wal_seq;
     uint64_t wal_off; /* bytes in segment wal_seq (the WAL writer role) */

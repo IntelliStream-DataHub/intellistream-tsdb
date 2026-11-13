@@ -769,6 +769,19 @@ static int load_parts(eng *db, bool read_only)
 
 int eng_open(const char *dir, const tsdb_options *opts, eng **out) { return eng_open_sched(dir, opts, NULL, out); }
 
+/* eng_open_replica asks the open below for a replica (replica.c): taken at its start, so a failed open never leaves it set */
+static __thread bool replica_want;
+static __thread uint64_t replica_floor;
+
+/* Opens dir as a replica of a cluster volume (replica.c): `floor` is the commit floor the driver saved (every log
+ * position up to it is applied at the open). */
+int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, eng **out)
+{
+    replica_want = true;
+    replica_floor = floor;
+    return eng_open_sched(dir, opts, NULL, out);
+}
+
 static __thread int adopt_lockfd = -1;
 /* A check of the opened engine (eng_reopen), run by the open once nothing can fail any more and before the engine's
  * own threads start: they change the parts list (a merge, a flush), which the check reads without a lock. */
@@ -805,6 +818,9 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     *out = NULL;
     feed_opts feed_wanted; /* taken before any failure point: see eng_take_open_feed_want */
     int feed_want = eng_take_open_feed_want(&feed_wanted);
+    bool replica = replica_want;
+    uint64_t floor = replica_floor;
+    replica_want = false;
     simd_init();
     /* 64-byte aligned: the hot fields of the write path are laid out in whole cache lines (internal.h, buf_lock) */
     _Static_assert(_Alignof(eng) == 64, "eng is aligned to a cache line");
@@ -839,7 +855,11 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     db->dirfd = db->lockfd = db->wal_fd = db->fno_fd = -1;
     db->fno_next = 1;
     db->series.fd = -1;
-    db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0;
+    if (replica && (ro || db->opt.wal_sync_ms != 0)) { /* a periodic sync would acknowledge before durability (5.1) */
+        free(db);
+        return TSDB_ERR_INVALID;
+    }
+    db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0 && !replica;
     if (latest_open(db) != 0) { /* the latest table (latest.c); a writer's only */
         free(db);
         return TSDB_ERR_NOMEM;
@@ -937,7 +957,9 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             goto fail;
         /* a follower takes WAL rows from the writer's manifest once there is one; a writer cuts torn tails only
            after the WAL's checks too, just before the replay writes anything */
-        if (!db->opt.follow)
+        if (replica)
+            rc = replica_open_log(db, floor, open_cut_tails);
+        else if (!db->opt.follow)
             rc = wal_open(db, ro ? NULL : open_cut_tails);
         else if (!ro)
             rc = open_cut_tails(db);
@@ -945,7 +967,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             goto fail;
     }
     if (!ro) {
-        db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
+        if (!db->rp)
+            db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
         /* and unlinked them, with a directory fsync: all but the ones a failed unlink or rename left (wal_open) */
         db->wal_removed = db->wal_removed_synced = db->wal_open_removed;
         if ((rc = manifest_publish(db)) != 0)
@@ -1325,7 +1348,7 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
 
 int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *values, size_t n)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp)
         return TSDB_ERR_READONLY;
     if (n && (!series || !ts || !values))
         return TSDB_ERR_INVALID;
@@ -1339,7 +1362,7 @@ int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, con
 
 int eng_insert_series(eng *db, int type, uint32_t series, const int64_t *ts, const void *values, size_t n)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp)
         return TSDB_ERR_READONLY;
     int ucls = -1;
     uint64_t gen = cls_gen_now(db);
@@ -1377,7 +1400,7 @@ int eng_flush(eng *db)
 
 int eng_drop_before(eng *db, int64_t ts)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp)
         return TSDB_ERR_READONLY;
     /* memtable rows become parts first, so they are dropped with them */
     int rc = jr_intent(db, JR_DROP, &ts);
