@@ -478,17 +478,28 @@ void iso_gf256_check(const iso_gf256_kernel *k, size_t n, iso_kcheck *out)
  * benchmark -- runs what the CPU says it has, as it always did; `isod` checks before it serves.
  *
  * Idempotent, and not thread-safe: call it before any thread, and before the first product. The
- * tables are written the first time and only read after. The ladder is picked again on EVERY call,
- * from what iso_cpu_has() says at that moment, so a caller that narrows the permitted features
- * later (tsdb caps them by the CPU level it chose, which it knows only after the CPU is
- * probed) calls this again and gets a kernel within the cap, never one the cap forbids.
+ * tables are written the first time and only read after: a later call must not touch them (a
+ * rebuild writes the same bytes back, so only a sentinel written through iso_gf256_row() shows
+ * it; the unit test and tests/codec/gf256_noboot.c plant one). The ladder is picked again on
+ * EVERY call, from what iso_cpu_has() says at that moment, so a caller whose features change
+ * after the first call calls this again and gets the kernel for the new answer, within any cap.
  *
- * Who calls it: the constructor below in this repository. A program that copies this file into a
- * binary that may have no startup code compiles it with -DISO_GF256_NO_BOOT and calls this itself.
- * tsdb is that program: it compiles its copy once per CPU level (x86-64-v2, v3, v4 in one binary)
- * and a constructor in a v3 or v4 copy would run on every CPU before the dispatch has chosen a
- * level, which is SIGILL on a CPU without AVX. It also keeps the copy byte for byte, so it cannot
- * patch the constructor out: the flag is how the file says so itself.
+ * Who calls it: the constructor below in this repository. A program that copies this file into
+ * a binary that must have no startup code compiles it with -DISO_GF256_NO_BOOT and calls this
+ * itself. tsdb is that program, and three things make the public entry point necessary there:
+ *
+ *   - tsdb allows no startup code in the objects of its codecs, and checks the objects for an
+ *     .init_array entry. The rule exists for the codecs it compiles once per CPU level, where a
+ *     constructor of a v3 or v4 copy would run on every CPU before the level is chosen (SIGILL
+ *     on one without AVX); this file is not built per level there, but the rule has no exception.
+ *   - Which kernels may run follows the level tsdb picks at start, from the CPU and an override,
+ *     after this file's constructor would have run, and can be picked again later. The program
+ *     must say when the kernel is chosen, and choose again.
+ *   - The table builder is static, so once the constructor is gone nothing else can build the
+ *     tables.
+ *
+ * The copy is kept byte for byte what this repository has, so tsdb cannot patch the constructor
+ * out: the flag is how the file says so itself.
  *
  * NOTE: the constructor is in this file and not in a file of its own on purpose. A static
  * archive pulls a member only to resolve an undefined symbol, so a boot file nothing references

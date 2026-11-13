@@ -10,10 +10,12 @@
  *
  *  - Names. src/raft/compat.c defines iso_xmalloc, iso_strlcpy and iso_now_ns for the Raft copy, and both live in
  *    tsdbd, so the functions of this file are named tsdb_ec_* and the copies' names are macros for them.
- *  - The CPU. isod reads CPUID in a constructor; tsdb forbids startup code in code that is compiled per level
- *    (AGENTS.md "CPU levels"), so `iso_cpu_has` asks the compiler's __builtin_cpu_supports and answers no to
- *    anything above the level src/cpu.c selected (tsdb_ec_select): a TSDB_CPU=v2 process never executes an AVX
- *    instruction, v3 never an AVX-512 one. gf256.c's dispatch looks only at iso_cpu_has, so this is the whole cap.
+ *  - The CPU. isod reads CPUID in a constructor; tsdb allows no startup code in its codec objects (check-isa.sh
+ *    refuses an .init_array in ec_*.o; the rule comes from the codecs built once per level, AGENTS.md "CPU levels"),
+ *    and the kernels must follow the level src/cpu.c picks. So `iso_cpu_has` asks the compiler's
+ *    __builtin_cpu_supports and answers no to anything above the level src/cpu.c selected (tsdb_ec_select): a
+ *    TSDB_CPU=v2 process never executes an AVX instruction, v3 never an AVX-512 one. gf256.c's dispatch looks only
+ *    at iso_cpu_has, so this is the whole cap.
  *  - Panics. A failed ISO_ASSERT or ISO_PANIC (a coefficient of 0 divided by, a singular Cauchy submatrix) is a bug
  *    of the caller or of the code: it logs and aborts, as upstream.
  *
