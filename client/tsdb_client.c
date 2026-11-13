@@ -3437,7 +3437,8 @@ int tsdbc_tenant_stats(tsdbc *c, const char *const *prefixes, size_t n, int flag
     for (size_t i = 0; i < n; i++) {
         uint16_t l = prefixes[i] ? (uint16_t)strlen(prefixes[i]) : 0;
         memcpy(names + o, &l, 2);
-        memcpy(names + o + 2, prefixes[i], l);
+        if (l)
+            memcpy(names + o + 2, prefixes[i], l);
         o += 2 + l;
     }
     uint32_t cursor = 0;
