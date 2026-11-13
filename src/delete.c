@@ -144,8 +144,10 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         if (!mp) {
             rc = TSDB_ERR_NOMEM;
         } else {
-            memcpy(mp, all.p, all.n * sizeof *mp);
-            memcpy(mp + all.n, rows.p, rows.n * sizeof *mp);
+            if (all.n) /* memcpy of a null pointer is undefined even for 0 bytes */
+                memcpy(mp, all.p, all.n * sizeof *mp);
+            if (rows.n)
+                memcpy(mp + all.n, rows.p, rows.n * sizeof *mp);
             struct jr_commit_arg ja = {mp, all.n + rows.n, rows.n ? MK_OP_REPLACE : MK_OP_DELETE};
             rc = jr_intent(db, JR_COMMIT, &ja);
             free(mp);

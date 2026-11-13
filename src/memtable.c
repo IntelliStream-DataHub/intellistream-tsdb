@@ -1402,11 +1402,15 @@ void *flusher_main(void *arg)
         int64_t now = mono_ms();
         bool flush = db->active->rows &&
                      (db->active->rows >= db->opt.buffer_rows || now - db->active->created_ms >= interval);
-        if (db->rp && db->nflushing) /* a replica's memtable of a finished leader segment waits to be written */
-            flush = true;
         bool sync = db->opt.wal_sync_ms > 0 && now - db->last_wal_sync_ms >= db->opt.wal_sync_ms;
         uint64_t target = db->wal_appended;
         pthread_mutex_unlock(&db->buf_lock);
+        if (db->rp && !flush) { /* a replica's memtable of a finished leader segment waits to be written; nflushing is
+                                   db->lock's, which the flusher may not take under buf_lock */
+            pthread_mutex_lock(&db->lock);
+            flush = db->nflushing > 0;
+            pthread_mutex_unlock(&db->lock);
+        }
         int rc = eng_check(db); /* a failed engine writes nothing more */
         if (rc == 0 && sync) {
             rc = wal_commit(db, target);
