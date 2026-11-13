@@ -9,6 +9,8 @@ use ::tsdb_embedded as te;
 use tc::{Latest, LatestOpts};
 use tsdb_client_python_common::latest::LatestTarget;
 use tsdb_client_python_common::multi::MultiCalls;
+use tsdb_client_python_common::stats::StatsTarget;
+use tc::{SeriesStat, TenantOpts, TenantStats};
 
 pub(crate) struct DbCalls<'a>(pub(crate) &'a te::Db);
 
@@ -18,6 +20,15 @@ impl LatestTarget for DbCalls<'_> {
     }
     fn latest_by_name(&self, names: &[&str], opts: &LatestOpts) -> tc::Result<Vec<Latest>> {
         self.0.latest_by_name(names, opts)
+    }
+}
+
+impl StatsTarget for DbCalls<'_> {
+    fn series_stats(&self, ids: &[u64], resident: bool) -> tc::Result<Vec<SeriesStat>> {
+        self.0.series_stats(ids, resident)
+    }
+    fn tenant_stats(&self, prefixes: &[&str], opts: &TenantOpts) -> tc::Result<TenantStats> {
+        self.0.tenant_stats(prefixes, opts)
     }
 }
 

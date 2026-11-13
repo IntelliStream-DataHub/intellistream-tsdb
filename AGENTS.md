@@ -166,11 +166,23 @@ cgroup, so `nice` does not keep your work out of its way.
   the cluster thread; the hard-state save stays on the cluster thread (its slot sequence is shared with the durable
   floor, which the copied log does not lock). `tests/jepsen/crashfs.c` follows dup'ed descriptors (the Raft log syncs
   duplicates of its segments).
+- `src/ec/`: the erasure codec (Reed-Solomon over GF(2^8); `gf256*.c`, `rs.[ch]`) copied from intellistream-objects
+  (`UPSTREAM`; `tools/sync-ec.sh` copies it again, `--check` compares; never edit the copies; `compat.[ch]` and
+  `compat/` are tsdb's own). Built without gf256's constructor (`-DISO_GF256_NO_BOOT`): `src/cpu.c` hands the level to
+  `tsdb_ec_select`, which caps what `iso_cpu_has` says, so a `TSDB_CPU=v2` process never runs an AVX kernel
+  (`tools/check-isa.sh` allows the wide kernels by name). In `libtsdb` on x86-64 only, never in a client library
+  (`tools/check-ec-symbols.sh`). `tests/test_rs.c` (exhaustive erasure patterns, every level and kernel, mutants via
+  `--mutant coef|kernel|guard`; it also checks that the ladder picks the widest kernel the level allows),
+  `tests/test_levels.c`, `build/ec-bench`; `tools/check-exports.sh` (libtsdb.so exports the public headers' names only:
+  `tsdb_ec_*` are `local:` in the map) and `tools/check-ec-baseline.sh` (no SSSE3 outside its kernel in a generic build).
+  The embedded bindings' crates (`client/rust-sys` build.rs, `vendor.sh`) copy `src/*.c` only and build without `src/ec`
+  and without `TSDB_EC`: an engine caller of `iso_rs_*` needs an `#ifdef TSDB_EC` or those crates stop linking.
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
   `killall`, `kill` with pid -1 or 0, `docker`) and `hooks/guard-push.sh` (refuses a push while unpushed
-  commits carry a session link); `skills/tsdb-tracks/` is how changes are built, reviewed, gated and merged
+  commits carry a session link, or match a line of a private pattern file kept outside the repository,
+  `~/.config/claude-private-patterns`: internal hosts and the like never reach GitHub); `skills/tsdb-tracks/` is how changes are built, reviewed, gated and merged
   with subagents; `skills/subagent-economy/` keeps those subagents cheap (detached runs, a waiter, checkpoints;
   copy it to `~/.claude/skills/` to use it in other projects); `skills/jepsen-review/` is the adversarial
   review of durability, recovery and failover code in the Jepsen style (claims, faults, histories, a checker,
@@ -502,7 +514,10 @@ cgroup, so `nice` does not keep your work out of its way.
   own nested jobs (a fork/join tree), never for a lock another job's worker may hold while waiting for helpers.
   tsdbd's login (`server/auth.c`): `users_mu` (the USERS state; held across USERS's I/O and its OFD lock, so on NFS
   as long as a server is away) > `auth_mu` (the published snapshot of the users and the registry of logged-in
-  users; a leaf, never held across I/O). Logins and requests take only `auth_mu`, never `users_mu`, and no engine
+  users; never held across I/O) > `tn_mu` (`server/tenants.c`: the tenant list, its slots and the pending list; auth_mu takes
+  it to find a user's tenant (`tn_slot_user`) and a failed login to count under one, and USERS's publish calls `tn_offer`
+  with `users_mu` held; a leaf, never held across I/O or an engine call: the tick thread lets go of it around
+  `tsdb_set_tenants`) and `blk_mu` (the registry of the counter blocks, a leaf that a counting thread never takes). Logins and requests take only `auth_mu`, never `users_mu`, and no engine
   lock is taken under either; a user's rights index is built before it is shared and read without a lock.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
@@ -562,7 +577,8 @@ cgroup, so `nice` does not keep your work out of its way.
   `DROPPED` -13 with their bodies, the ops TOPOLOGY (48) and STATUS (49); floor still 12. The four clients retry
   UNAVAILABLE after `retry_after` and follow MOVED within a time budget (`tsdbc_set_retry`, 30 s by default), and
   connect to a list of nodes; tsdbd sends only UNAVAILABLE (MOVED, PARTIAL and DROPPED wait for the cluster).
-  The planned protocols moved up: QUERY_LATEST 14, the change feed 15, statistics 16.
+  14 QUERY_LATEST (39). 15 statistics (STATS_SERIES 46, STATS_TENANTS 47; docs/design-stats.md 5; `server/tenants.[ch]`:
+  tsdbd's tenant list and per-caller counters; floor still 12). The change feed is planned as 16.
   All four clients speak 13 and no call is gated on a version below the floor;
   the embedded bindings (Rust `tsdb_embedded::Db`, Python `tsdb_embedded.Db`, Java `EmbeddedDb`) have the
   same operations, and their tests compare them with tsdbd's answers.

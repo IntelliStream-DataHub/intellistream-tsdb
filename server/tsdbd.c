@@ -67,7 +67,8 @@
  * beyond that wait in their connection's queue.
  *
  * Signals: SIGTERM and SIGINT stop it cleanly (requests in progress finish,
- * the memtable is flushed, exit status 0); SIGHUP and SIGPIPE are ignored.
+ * the memtable is flushed, exit status 0); SIGPIPE is ignored, and so is SIGHUP unless --tenants names a file, which
+ * it reads again.
  * With --exit-with-parent it stops the same way once its parent process is gone: a test's server must not outlive
  * the test (killed tests left servers holding io_uring rings for hours). The tick compares getppid() with the
  * parent at start; not PR_SET_PDEATHSIG, which fires when the spawning thread ends, and Rust, Java and Python
@@ -117,6 +118,7 @@
 #include "../client/tsdb_crypto.h"
 #include "metrics.h"
 #include "auth.h"
+#include "tenants.h"
 #include "cluster.h"
 #include "../tools/cfg.h" /* configuration files: docs/config.md */
 #include "tsdbd_keys.h"
@@ -183,7 +185,11 @@
  * CANCEL costs the loop is bounded by this and the multis of one receive buffer, not by the queue's length. */
 #define MULTI_QUEUED 16
 /* the ops a CANCEL can name (and MULTI_QUEUED counts): the ones that answer in pieces */
-static inline bool cancelable(uint8_t op) { return op == TSDB_OP_QUERY_MULTI || op == TSDB_OP_QUERY_LATEST; }
+static inline bool cancelable(uint8_t op)
+{
+    return op == TSDB_OP_QUERY_MULTI || op == TSDB_OP_QUERY_LATEST || op == TSDB_OP_STATS_SERIES ||
+           op == TSDB_OP_STATS_TENANTS;
+}
 /* A receive buffer up to this size is not counted in the request memory; a frame larger than it gets a buffer of
  * its own size, which is (see the file header). */
 #define IN_KEEP (64u << 10)
@@ -819,6 +825,43 @@ static bool ob_flush(obatch *ob)
     return out_put(ob->c, &v, 1);
 }
 
+/* Per-tenant request counters (server/tenants.c, docs/design-stats.md 3.4), by the tenant of the user the connection
+ * is logged in as, counted on the worker that runs the request (the event loop thread counts nothing: it may reply
+ * while a worker still sets the login up). */
+static __thread bool tn_worker;
+
+static void tn_error(conn *c, int32_t status, bool per_series)
+{
+    if (!tn_worker)
+        return;
+    int k = TN_ERR_OTHER;
+    switch (status) {
+    case TSDB_ERR_DENIED: k = per_series ? TN_DENIED_SERIES : TN_DENIED_REQUESTS; break;
+    case TSDB_ERR_INVALID: k = TN_ERR_INVALID; break;
+    case TSDB_ERR_NOTFOUND: k = TN_ERR_NOTFOUND; break;
+    case TSDB_ERR_IO: k = TN_ERR_IO; break;
+    default: break;
+    }
+    tn_count(auth_tenant(&c->auth), k, 1);
+}
+
+/* The op groups of the by-caller block: queries, inserts, deletes (and replaces and retention), user admin and
+ * maintenance, everything else (login, series lookups and creation, WHOAMI, STATS, TOPOLOGY...). */
+static int tn_group(uint8_t op)
+{
+    switch (op) {
+    case TSDB_OP_QUERY_RAW: case TSDB_OP_QUERY_VALUES: case TSDB_OP_QUERY_LTTB: case TSDB_OP_QUERY_BUCKETS:
+    case TSDB_OP_QUERY_BOUNDS: case TSDB_OP_QUERY_TWA: case TSDB_OP_QUERY_MULTI: case TSDB_OP_QUERY_LATEST:
+        return TN_REQ_QUERY;
+    case TSDB_OP_INSERT: case TSDB_OP_INSERT_VALUES: return TN_REQ_INSERT;
+    case TSDB_OP_DELETE_RANGE: case TSDB_OP_REPLACE_RANGE: case TSDB_OP_SET_RETENTION: return TN_REQ_DELETE;
+    case TSDB_OP_USER_CREATE: case TSDB_OP_USER_DROP: case TSDB_OP_USER_ALTER: case TSDB_OP_USER_PASSWORD:
+    case TSDB_OP_GRANT: case TSDB_OP_REVOKE: case TSDB_OP_USER_LIST: case TSDB_OP_FLUSH: case TSDB_OP_OPTIMIZE:
+        return TN_REQ_ADMIN;
+    default: return TN_REQ_OTHER;
+    }
+}
+
 /* One reply frame: status, the u32 index of a QUERY_MULTI series when ix is not NULL, then up to three pieces of
  * body. With ob, a small frame is gathered there. Returns false when the connection is going away. */
 static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const uint32_t *ix, const void *a,
@@ -839,8 +882,10 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
         shutdown(c->fd, SHUT_RDWR);
         return false;
     }
-    if (status)
+    if (status) {
         metrics_error(status);
+        tn_error(c, status, ix != NULL);
+    }
     uint8_t hdr[17];
     put32(hdr, (uint32_t)body);
     put32(hdr + 4, id);
@@ -1642,6 +1687,369 @@ static void handle_latest(conn *c, req *r)
     free(denied);
 }
 
+/* ------------------------------------------------------------ STATS_SERIES and STATS_TENANTS */
+
+/* Statistics over the network (protocol 15, docs/design-stats.md 5.1). STATS_SERIES checks every id here, as
+ * QUERY_MULTI does (a denied id is asked as TSDB_SID_NONE and answered DENIED, A16, A17) and runs the engine's bounded
+ * walk once: it stops at its own work budget with `done` < n, and a CANCEL is looked at before and after it.
+ * Every reply that is not a success is a bare status. */
+static void handle_stats_series(conn *c, req *r)
+{
+    const uint8_t *p = r->payload;
+    int rc = 0;
+    uint32_t n = 0, flags = 0;
+    if (r->len < 8) {
+        rc = TSDB_ERR_INVALID;
+    } else {
+        memcpy(&n, p, 4);
+        memcpy(&flags, p + 4, 4);
+        if (n == 0 || n > TSDB_STATS_SERIES_MAX_IDS || (flags & ~(uint32_t)TSDB_STATS_RESIDENT) ||
+            ((flags & TSDB_STATS_RESIDENT) && n > TSDB_STATS_SERIES_RESIDENT_MAX) || r->len != 8 + (size_t)n * 8)
+            rc = TSDB_ERR_INVALID; /* EXACT_ROWS (2) is reserved: not built */
+    }
+    if (rc) {
+        reply_status(c, r->id, rc);
+        return;
+    }
+    const tsdb_sid *ids = (const tsdb_sid *)(const void *)(p + 8); /* 8-aligned in the malloc'd payload */
+    tsdb_sid *own = NULL;
+    uint8_t *denied = NULL;
+    bool bounds = auth_all(&c->auth, R_READ); /* the error bounds of the hot lists: whoever reads everything */
+    if (!bounds) {
+        own = malloc((size_t)n * sizeof *own);
+        denied = calloc(((size_t)n + 7) / 8, 1);
+        if (!own || !denied)
+            rc = TSDB_ERR_NOMEM;
+        for (uint32_t i = 0; rc == 0 && i < n; i++) {
+            bool no = auth_id(&c->auth, ids[i], R_READ) != 0;
+            own[i] = no ? TSDB_SID_NONE : ids[i];
+            denied[i >> 3] |= (uint8_t)(no << (i & 7));
+        }
+        ids = own;
+    }
+    tsdb_series_stat *out = rc ? NULL : malloc((size_t)n * sizeof *out);
+    if (rc == 0 && !out)
+        rc = TSDB_ERR_NOMEM;
+    size_t done = 0;
+    if (rc == 0 && (atomic_load_explicit(&c->cancel_running, memory_order_relaxed) || atomic_load(&c->closing)))
+        rc = TSDB_ERR_STOPPED;
+    if (rc == 0)
+        rc = tsdb_series_stats(db, ids, n, (flags & TSDB_STATS_RESIDENT) ? TSDB_SSTAT_REQ_RESIDENT : 0, out, &done);
+    if (rc == 0 && (atomic_load_explicit(&c->cancel_running, memory_order_relaxed) || atomic_load(&c->closing)))
+        rc = TSDB_ERR_STOPPED;
+    if (rc == 0) {
+        uint64_t nd = 0;
+        for (size_t i = 0; i < done; i++) {
+            if (denied && (denied[i >> 3] >> (i & 7) & 1)) {
+                memset(&out[i], 0, sizeof out[i]);
+                out[i].status = TSDB_ERR_DENIED;
+                nd++;
+            } else if (!bounds) { /* a threshold-free number: the sampling error would tell the load of the server */
+                out[i].reads_err = out[i].writes_err = 0;
+                out[i].flags |= TSDB_STATS_NO_BOUND;
+            }
+        }
+        if (nd)
+            tn_count(auth_tenant(&c->auth), TN_DENIED_SERIES, nd);
+        uint32_t h[2] = {(uint32_t)done, 0};
+        reply(c, r->id, 0, h, sizeof h, out, done * sizeof *out, NULL, 0);
+    } else {
+        reply_status(c, r->id, rc);
+    }
+    free(out);
+    free(own);
+    free(denied);
+}
+
+typedef struct sbuf {
+    uint8_t *p;
+    size_t len, cap;
+    bool oom;
+} sbuf;
+
+static void sb_put(sbuf *b, const void *d, size_t n)
+{
+    if (b->oom)
+        return;
+    if (b->len + n > b->cap) {
+        size_t cap = b->cap ? b->cap : 4096;
+        while (cap < b->len + n)
+            cap *= 2;
+        uint8_t *np = realloc(b->p, cap);
+        if (!np) {
+            b->oom = true;
+            return;
+        }
+        b->p = np;
+        b->cap = cap;
+    }
+    if (n)
+        memcpy(b->p + b->len, d, n);
+    b->len += n;
+}
+
+typedef struct hotset {
+    tsdb_hot e[3][TSDB_TSTATS_MAX_K];
+    uint16_t slot[3][TSDB_TSTATS_MAX_K]; /* the tenant of each entry's series, found once per request: 0xffff for none */
+    size_t n[3];
+    uint64_t thr[3];
+} hotset;
+
+/* The hot entries of one tenant: the global lists, filtered to its series that the user may read, at most k per kind;
+ * the error bounds and the thresholds only for whoever reads everything (L5, decision 6). */
+static void hot_put(sbuf *b, conn *c, const hotset *h, uint16_t slot, uint32_t k, bool full, uint16_t *nhot)
+{
+    for (int kind = 0; kind < 3; kind++) {
+        uint32_t m = 0;
+        for (size_t i = 0; i < h->n[kind] && m < k; i++) {
+            const tsdb_hot *e = &h->e[kind][i];
+            if (h->slot[kind][i] != slot || auth_id(&c->auth, e->id, R_READ) != 0)
+                continue;
+            uint8_t rec[TSDB_TSTATS_HOT_REC] = {(uint8_t)(kind + 1)};
+            uint64_t err = full ? e->error : 0;
+            memcpy(rec + 8, &e->id, 8);
+            memcpy(rec + 16, &e->estimate, 8);
+            memcpy(rec + 24, &err, 8);
+            sb_put(b, rec, sizeof rec);
+            m++;
+        }
+        if (full) { /* the threshold: an id that is not listed weighs at most this */
+            uint8_t rec[TSDB_TSTATS_HOT_REC] = {(uint8_t)(kind + 1)};
+            memcpy(rec + 16, &h->thr[kind], 8);
+            sb_put(b, rec, sizeof rec);
+            m++;
+        }
+        *nhot = (uint16_t)(*nhot + m);
+    }
+}
+
+/* One row of the reply. ts NULL: the numbers are 0 (a status that is not 0). */
+static void tenant_row(sbuf *b, conn *c, int32_t status, uint32_t volume, uint32_t flags, const char *pre, size_t plen,
+                       const tsdb_tenant_stats *ts, uint32_t want, uint32_t k, const hotset *hs, bool full)
+{
+    size_t at = b->len;
+    uint8_t head[TSDB_TSTATS_ROW_HEAD] = {0};
+    memcpy(head, &status, 4);
+    memcpy(head + 4, &volume, 4);
+    memcpy(head + 8, &flags, 4);
+    uint16_t pl = (uint16_t)plen, nhot = 0;
+    memcpy(head + 12, &pl, 2);
+    sb_put(b, head, sizeof head);
+    sb_put(b, pre, plen);
+    static const uint8_t zero[8] = {0};
+    sb_put(b, zero, (8 - plen % 8) % 8);
+    uint64_t data[TSDB_TSTATS_DATA_FIELDS] = {0};
+    if (ts)
+        memcpy(data, &ts->series, sizeof data); /* the engine's struct is these 18 in the wire's order */
+    sb_put(b, data, sizeof data);
+    if (volume == TSDB_TSTATS_VOLUME_SUM) {
+        int slot = plen ? tn_slot_find(pre, plen) : 0;
+        if (want & TSDB_TSTATS_CALLER) {
+            uint64_t cb[TN_NC] = {0};
+            if (slot >= 0 && status == 0)
+                tn_read((uint16_t)slot, cb);
+            sb_put(b, cb, sizeof cb);
+        }
+        if ((want & TSDB_TSTATS_HOT) && status == 0 && slot >= 0)
+            hot_put(b, c, hs, (uint16_t)slot, k, full, &nhot);
+    }
+    if (!b->oom)
+        memcpy(b->p + at + 14, &nhot, 2);
+}
+
+/* The most one tenant's rows can add to a reply: a row per volume and one for the sum (head, the name padded to 8,
+ * the 18 numbers), the caller's block and the hot entries (k per kind and a threshold) on the sum row. */
+static size_t tenant_group_max(size_t plen, uint32_t want, uint32_t k)
+{
+    size_t row = TSDB_TSTATS_ROW_HEAD + ((plen + 7) & ~(size_t)7) + TSDB_TSTATS_DATA_FIELDS * 8;
+    size_t rows = 1 + ((want & TSDB_TSTATS_VOLUMES) ? tsdb_volume_count(db) : 0);
+    size_t extra = ((want & TSDB_TSTATS_CALLER) ? (size_t)TN_NC * 8 : 0) +
+                   ((want & TSDB_TSTATS_HOT) ? 3 * ((size_t)k + 1) * TSDB_TSTATS_HOT_REC : 0);
+    return rows * row + extra;
+}
+
+static void handle_stats_tenants(conn *c, req *r)
+{
+    const uint8_t *p = r->payload;
+    int rc = 0;
+    uint16_t want16 = 0, k = 0;
+    uint32_t n = 0, cursor = 0, zero = 0;
+    if (r->len < 16) {
+        rc = TSDB_ERR_INVALID;
+    } else {
+        memcpy(&want16, p, 2);
+        memcpy(&k, p + 2, 2);
+        memcpy(&n, p + 4, 4);
+        memcpy(&cursor, p + 8, 4);
+        memcpy(&zero, p + 12, 4);
+        if (zero || (want16 & ~(unsigned)(TSDB_TSTATS_VOLUMES | TSDB_TSTATS_HOT | TSDB_TSTATS_CALLER)) ||
+            k > TSDB_TSTATS_MAX_K || n > 65535u)
+            rc = TSDB_ERR_INVALID;
+    }
+    const uint8_t **np = NULL;
+    uint16_t *nl = NULL;
+    if (rc == 0 && n) { /* the names: u16 len, bytes, exactly to the end */
+        np = malloc((size_t)n * sizeof *np);
+        nl = malloc((size_t)n * sizeof *nl);
+        if (!np || !nl)
+            rc = TSDB_ERR_NOMEM;
+        size_t o = 16;
+        for (uint32_t i = 0; rc == 0 && i < n; i++) {
+            if (o + 2 > r->len) {
+                rc = TSDB_ERR_INVALID;
+                break;
+            }
+            memcpy(&nl[i], p + o, 2);
+            o += 2;
+            if (o + nl[i] > r->len) {
+                rc = TSDB_ERR_INVALID;
+                break;
+            }
+            np[i] = p + o;
+            o += nl[i];
+        }
+        if (rc == 0 && o != r->len)
+            rc = TSDB_ERR_INVALID;
+    } else if (rc == 0 && r->len != 16) {
+        rc = TSDB_ERR_INVALID;
+    }
+    bool full = auth_tenants_full(&c->auth);
+    tsdb_tenant_stats none;
+    if (rc == 0 && (rc = tsdb_tenant_stats_get(db, NULL, TSDB_TENANT_VOLUME_SUM, &none)) != 0)
+        rc = TSDB_ERR_INVALID; /* --no-stats: nothing is counted */
+    hotset *hs = NULL;
+    if (rc == 0 && (want16 & TSDB_TSTATS_HOT)) {
+        hs = calloc(1, sizeof *hs);
+        if (!hs)
+            rc = TSDB_ERR_NOMEM;
+        for (int kind = 0; hs && kind < 3; kind++)
+            tsdb_hot_series(db, kind + 1, hs->e[kind], TSDB_TSTATS_MAX_K, &hs->n[kind], &hs->thr[kind]);
+        for (int kind = 0; hs && kind < 3; kind++)
+            for (size_t i = 0; i < hs->n[kind]; i++) {
+                const char *name = tsdb_series_name(db, hs->e[kind][i].id);
+                hs->slot[kind][i] = name ? tn_slot_name(name, strlen(name)) : 0xffff;
+            }
+    }
+    sbuf b = {0};
+    uint8_t header[TSDB_TSTATS_HEADER] = {0};
+    if (rc == 0)
+        sb_put(&b, header, sizeof header);
+    uint32_t count = 0, flags = 0, next = TSDB_TSTATS_DONE;
+    uint32_t pos = cursor;
+    for (; rc == 0 && !b.oom; pos++) {
+        if (atomic_load_explicit(&c->cancel_running, memory_order_relaxed) || atomic_load(&c->closing)) {
+            rc = TSDB_ERR_STOPPED;
+            break;
+        }
+        char *own = NULL;
+        const char *pre;
+        size_t plen;
+        if (n) {
+            if (pos >= n)
+                break;
+            pre = (const char *)np[pos];
+            plen = nl[pos];
+        } else {
+            int len;
+            if (full && pos == 0) {
+                pre = "";
+                plen = 0;
+            } else {
+                size_t i = pos - (full ? 1 : 0);
+                if ((len = tsdb_tenant_prefix(db, i, NULL, 0)) < 0)
+                    break; /* past the end */
+                own = malloc((size_t)len + 1);
+                if (!own) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                tsdb_tenant_prefix(db, i, own, (size_t)len + 1);
+                pre = own;
+                plen = (size_t)len;
+                if (!auth_tenant_visible(&c->auth, pre, plen)) {
+                    free(own);
+                    continue;
+                }
+            }
+        }
+        /* the cap, from the most this group can take (its rows of every volume, the hot lists of the sum row): go on
+         * from here; the first group of a reply is always sent */
+        if (count > 0 && b.len + tenant_group_max(plen, want16, k) > TSDB_TSTATS_MAX_REPLY) {
+            free(own);
+            next = pos;
+            break;
+        }
+        int32_t st = 0;
+        tsdb_tenant_stats ts;
+        char *z = NULL;
+        if (!auth_tenant_visible(&c->auth, pre, plen)) {
+            st = TSDB_ERR_DENIED;
+        } else if (plen && memchr(pre, 0, plen)) {
+            st = TSDB_ERR_NOTFOUND; /* no tenant and no series name holds a NUL: never strndup it down to another prefix */
+        } else if (plen) {
+            z = own ? own : strndup(pre, plen);
+            if (!z)
+                rc = TSDB_ERR_NOMEM;
+            else if ((st = tsdb_tenant_stats_get(db, z, TSDB_TENANT_VOLUME_SUM, &ts)) != 0)
+                st = st == TSDB_ERR_NOTFOUND ? TSDB_ERR_NOTFOUND : TSDB_ERR_INVALID;
+        } else {
+            st = tsdb_tenant_stats_get(db, NULL, TSDB_TENANT_VOLUME_SUM, &ts);
+        }
+        if (rc == 0) {
+            tenant_row(&b, c, st, TSDB_TSTATS_VOLUME_SUM, st ? 0 : ts.flags, pre, plen, st ? NULL : &ts, want16, k, hs,
+                       full);
+            flags |= st ? 0 : (ts.flags & TSDB_TENANT_PARTIAL ? TSDB_TSTATS_PARTIAL : 0);
+            count++;
+            if (st == 0 && (want16 & TSDB_TSTATS_VOLUMES)) {
+                uint32_t nv = tsdb_volume_count(db);
+                for (uint32_t v = 0; v < nv; v++) {
+                    tsdb_tenant_stats tv;
+                    int vs = tsdb_tenant_stats_get(db, plen ? z : NULL, v, &tv);
+                    tenant_row(&b, c, vs ? TSDB_ERR_INVALID : 0, v, vs ? 0 : tv.flags, pre, plen, vs ? NULL : &tv,
+                               want16, k, hs, full);
+                    count++;
+                }
+            }
+        }
+        if (z != own)
+            free(z);
+        free(own);
+    }
+    if (rc == 0 && b.oom)
+        rc = TSDB_ERR_NOMEM;
+    if (rc == 0) {
+        uint64_t counted = 0, listed = 0;
+        if (full) {
+            uint32_t nv = tsdb_volume_count(db);
+            for (uint32_t v = 0; v < nv; v++) {
+                tsdb_volume_stats vs;
+                if (tsdb_get_volume_stats(db, v, &vs) == 0) {
+                    counted += vs.stats_parts_counted;
+                    listed += vs.stats_parts_listed;
+                    if (vs.stats_ring_overflows)
+                        flags |= TSDB_TSTATS_INGEST_APPROX;
+                }
+            }
+            if (counted < listed)
+                flags |= TSDB_TSTATS_PARTIAL;
+        }
+        memcpy(b.p, &count, 4);
+        memcpy(b.p + 4, &flags, 4);
+        memcpy(b.p + 8, &next, 4);
+        memcpy(b.p + 12, &none.generation, 4);
+        memcpy(b.p + 16, &none.list_hash, 8);
+        memcpy(b.p + 24, &counted, 8);
+        memcpy(b.p + 32, &listed, 8);
+        reply(c, r->id, 0, b.p, b.len, NULL, 0, NULL, 0);
+    } else {
+        reply_status(c, r->id, rc);
+    }
+    free(b.p);
+    free(hs);
+    free(np);
+    free(nl);
+}
+
 /* An error in the shape the op's replies have, so a client reads it as it reads that op's errors. */
 static void reply_error(conn *c, uint32_t id, uint8_t op, int32_t status)
 {
@@ -2287,6 +2695,8 @@ static void handle_op(req *r)
         break;
     case TSDB_OP_QUERY_MULTI: handle_multi(c, r); return;
     case TSDB_OP_QUERY_LATEST: handle_latest(c, r); return;
+    case TSDB_OP_STATS_SERIES: handle_stats_series(c, r); return;
+    case TSDB_OP_STATS_TENANTS: handle_stats_tenants(c, r); return;
     case TSDB_OP_DELETE_RANGE: {
         tsdb_sid s;
         int64_t start, end;
@@ -2369,6 +2779,9 @@ static void handle_op(req *r)
         uint32_t n;
         memcpy(&n, p, 4); /* the length was checked: it has the row count */
         metrics_rows_inserted(n);
+        uint16_t ts = auth_tenant(&c->auth);
+        tn_count(ts, TN_INSERTED_ROWS, n);
+        tn_count(ts, TN_INSERTED_BYTES, len);
     }
     reply_status(c, r->id, rc);
 }
@@ -2376,6 +2789,7 @@ static void handle_op(req *r)
 static void *worker_main(void *arg)
 {
     bool extra = arg != NULL; /* started while every worker waited: leaves when idle and another is free */
+    tn_worker = true;
     for (;;) {
         pthread_mutex_lock(&work_lock);
         while (!work_head && !work_stop && (!extra || running_workers - waiting_workers <= 1))
@@ -2394,11 +2808,19 @@ static void *worker_main(void *arg)
         int64_t began = metrics_request_begin();
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
         metrics_request_end(r->op, began);
+        tn_count(auth_tenant(&r->c->auth), tn_group(r->op), 1);
         if (r->op == TSDB_OP_QUERY_RAW || r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS ||
             r->op == TSDB_OP_QUERY_BOUNDS || r->op == TSDB_OP_QUERY_LTTB || r->op == TSDB_OP_QUERY_TWA ||
             r->op == TSDB_OP_QUERY_MULTI) {
             tsdb_query_stats st;
             tsdb_last_query_stats(&st); /* this worker ran it */
+            uint16_t ts = auth_tenant(&r->c->auth);
+            tn_count(ts, TN_ROWS_DECODED, st.rows_decoded);
+            tn_count(ts, TN_ROWS_STATS, st.rows_from_stats);
+            tn_count(ts, TN_ROWS_MEMTABLE, st.memtable_rows);
+            tn_count(ts, TN_BYTES_READ, st.bytes_read);
+            tn_count(ts, TN_RESULT_ROWS, st.result_rows);
+            tn_count(ts, TN_QUERY_US, (uint64_t)(st.elapsed_s * 1e6));
             pthread_mutex_lock(&r->c->lock);
             r->c->last_stats = st;
             pthread_mutex_unlock(&r->c->lock);
@@ -3490,6 +3912,12 @@ static void *failwatch_main(void *arg)
     return NULL;
 }
 
+static void on_hup(int sig)
+{
+    (void)sig;
+    tn_hup();
+}
+
 static void on_signal(int sig)
 {
     (void)sig;
@@ -3664,6 +4092,8 @@ int main(int argc, char **argv)
                                    {"health-domain", required_argument, 0, 0x100},
                                    {"no-stats", no_argument, 0, 0x101},
                                    {"latest-cache", required_argument, 0, 0x107},
+                                   {"tenants", required_argument, 0, 0x10c},
+                                   {"tenants-settle", required_argument, 0, 0x10d},
                                    {"cluster", no_argument, 0, 'c'},
                                    {"peer-port", required_argument, 0, 'y'},
                                    {"peer-listen", required_argument, 0, 'Y'},
@@ -3686,7 +4116,8 @@ int main(int argc, char **argv)
     int nhealth = 0;
     const char *peer_addr = NULL, *advertise = NULL, *rack = "", *secret_file = NULL;
     const char *state_dir = NULL, *power_feed = "", *bmc = "";
-    const char *metrics_addr = NULL;
+    const char *metrics_addr = NULL, *tenants_file = NULL;
+    int tenants_settle = 30;
     long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page > 0 && (size_t)pages / 8 * (size_t)page > req_budget)
         req_budget = (size_t)pages / 8 * (size_t)page; /* 1024 MB slowed 32 connections loading at full speed */
@@ -3826,6 +4257,8 @@ int main(int argc, char **argv)
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'A': no_auth = 1; break;
         case 0x101: o.stats = -1; break;
+        case 0x10c: tenants_file = optarg; break;
+        case 0x10d: tenants_settle = (int)num_arg("tenants-settle", optarg, 0, 86400); break;
         case 0x107: o.latest_cache = (size_t)num_arg("latest-cache", optarg, 0, LLONG_MAX); break;
         case 'c': cluster_on = 1; break;
         case 'y': peer_port = (int)num_arg("peer-port", optarg, 0, 65535); cluster_opts = 1; break;
@@ -3925,6 +4358,7 @@ int main(int argc, char **argv)
                         "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
                         "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n"
                         "             [--health-domain PREFIX]... [--no-stats] [--latest-cache BYTES]\n"
+                        "             [--tenants FILE] [--tenants-settle 30]\n"
                         "             [--cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
                         "              [--peer-listen ADDR] [--advertise HOST] [--rack NAME] [--power-feed NAME]\n"
                         "              [--bmc ADDR] [--read-barrier on|off]]\n"
@@ -3998,9 +4432,21 @@ int main(int argc, char **argv)
     }
     if (port_file)
         unlink(port_file);
+    /* The tenants (docs/design-stats.md 4): the engine opens with the list, so it counts under it from the start */
+    char **tn_list = NULL;
+    size_t tn_n = 0;
+    if (tn_init(dir, tenants_file, !no_auth, tenants_settle, &tn_list, &tn_n) != 0)
+        return 1;
+    o.tenants = (const char *const *)tn_list;
+    o.ntenants = tn_n;
     int rc = tsdb_open(dir, &o, &db);
+    tn_free_list(tn_list, tn_n);
     if (rc) {
         fprintf(stderr, "tsdbd: %s: %s\n", dir, tsdb_strerror(rc));
+        return 1;
+    }
+    if (tn_start(db) != 0) {
+        tsdb_close(db);
         return 1;
     }
     /* A13: login unless --no-auth, and then a superuser must exist; USERS is read before anyone connects */
@@ -4014,11 +4460,13 @@ int main(int argc, char **argv)
     }
     g_reader_only = o.read_only || o.follow;
     if (auth_init(dir, !no_auth, !o.read_only && !o.follow, db) != 0) {
+        tn_stop();
         tsdb_close(db);
         return 1;
     }
     tsdb_set_write_wait_hook(db, write_on_wait, NULL); /* before the workers start */
     if (dom_init(db, health_domains, nhealth, dom_waits) != 0) {
+        tn_stop();
         tsdb_close(db);
         return 1;
     }
@@ -4106,7 +4554,9 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN); /* a client that went away is a send error, not a death */
-    signal(SIGHUP, SIG_IGN);  /* nothing to reload; a closing terminal must not take the server down */
+    /* SIGHUP reads the --tenants file again; without one there is nothing to reload, and a closing terminal must not
+     * take the server down */
+    signal(SIGHUP, tenants_file ? on_hup : SIG_IGN);
     pthread_t *workers = calloc((size_t)nworkers, sizeof *workers);
     base_workers = running_workers = nworkers;
     if (mfd >= 0) {
@@ -4215,6 +4665,7 @@ int main(int argc, char **argv)
     }
     free(fd_conn);
     auth_shutdown(); /* after the connections, whose states it frees */
+    tn_stop(); /* before the engine it sets tenants on */
     for (size_t i = 0; i < nnew; i++)
         close(new_fds[i]);
     free(new_fds);

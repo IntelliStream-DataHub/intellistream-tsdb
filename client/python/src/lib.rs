@@ -1501,6 +1501,54 @@ impl Client {
         q.finish(py, a)
     }
 
+    /// The storage numbers of series, computed by the server from the granule index and the memtables
+    /// (tsdbd protocol 15).
+    ///
+    /// Args:
+    ///     series: Series ids: a list of ints, or a uint64 or int64 array. Any number: they go in
+    ///         requests of up to 65,536 (1,024 with resident=True).
+    ///     resident: Fill resident_bytes (bytes of the series' granules in the page cache now).
+    ///     errors: "raise" raises TsdbError (with .index and .code) for the first series that was NOTFOUND
+    ///         or DENIED (a denied series looks like a missing one); "status" returns every dict, whose
+    ///         "status" says which failed.
+    ///
+    /// Returns:
+    ///     One dict per series, in the order asked.
+    ///
+    /// Raises:
+    ///     TsdbError: A series failed (errors="raise"), or the whole request failed (a server below
+    ///         protocol 15, or one started with --no-stats, answers INVALID).
+    #[pyo3(signature = (series, *, resident = false, errors = "raise"))]
+    fn series_stats<'py>(&self, py: Python<'py>, series: &Bound<'py, PyAny>, resident: bool, errors: &str) -> PyResult<Bound<'py, PyList>> {
+        let q = stats::SeriesReq::new(series, resident, errors)?;
+        let a = self.with(py, |c| q.run_client(c))?;
+        q.finish(py, a)
+    }
+
+    /// The numbers of tenants (tsdbd protocol 15).
+    ///
+    /// A superuser, or a user with read on every series, sees every tenant; a tenant admin (admin on
+    /// prefix:Q) the tenants whose prefix starts with Q. A tenant that may not be seen is a row with
+    /// status ERR_DENIED, whether or not it exists.
+    ///
+    /// Args:
+    ///     prefixes: The tenants asked for ("" is the tenant "(none)"); None for every tenant the user
+    ///         may see.
+    ///     volumes: A row per volume after each tenant's summed row.
+    ///     hot: Hot-list entries per kind (reads, writes, bytes per row) on the summed row, at most 256.
+    ///     caller: The tenant's own request counters on the summed row.
+    ///
+    /// Raises:
+    ///     TsdbError: The request failed (a server below protocol 15, or one started with --no-stats,
+    ///         answers INVALID). A user who may see no tenant gets no rows when it names
+    ///         none, and a row with status DENIED for each tenant it names.
+    #[pyo3(signature = (prefixes = None, *, volumes = false, hot = 0, caller = false))]
+    fn tenant_stats<'py>(&self, py: Python<'py>, prefixes: Option<Vec<String>>, volumes: bool, hot: u16, caller: bool) -> PyResult<Bound<'py, PyDict>> {
+        let q = stats::TenantReq::new(prefixes, volumes, hot, caller)?;
+        let t = self.with(py, |c| q.run_client(c))?;
+        q.finish(py, t)
+    }
+
     /// As latest(), by name: the newest row of many series, asked by name (tsdbd protocol 14).
     ///
     /// The server answers a series from an in-memory table of each series' newest value, so the cost does

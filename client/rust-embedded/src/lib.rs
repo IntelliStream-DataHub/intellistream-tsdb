@@ -38,6 +38,7 @@ mod batch;
 mod database;
 mod latest;
 mod multi;
+mod stats;
 
 /// How the engine encodes float values (`TSDB_VALUES_*`); all are lossless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

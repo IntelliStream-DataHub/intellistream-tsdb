@@ -750,6 +750,105 @@ unsafe extern "C" {
     pub fn tsdb_get_latest_stats(db: *mut tsdb, volume: u32, st: *mut tsdb_latest_stats) -> c_int;
 }
 
+/// The storage numbers of one series (`tsdb_series_stat`, 176 bytes: the wire record of STATS_SERIES).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct tsdb_series_stat {
+    pub status: i32,
+    pub cls: u8,
+    pub type_: u8,
+    pub flags: u16,
+    pub rows: u64,
+    pub nulls: u64,
+    pub memtable_rows: u64,
+    pub logical_bytes: u64,
+    pub ts_bytes: u64,
+    pub value_bytes: u64,
+    pub index_bytes: u64,
+    pub tomb_bytes: u64,
+    pub parts: u64,
+    pub partitions: u64,
+    pub granules: u64,
+    pub full_granules: u64,
+    pub first_ts: i64,
+    pub last_ts: i64,
+    pub last_write_ms: i64,
+    pub resident_bytes: u64,
+    pub reads_est: u64,
+    pub reads_err: u64,
+    pub writes_est: u64,
+    pub writes_err: u64,
+    pub live_rows: u64,
+}
+
+/// One tenant's numbers in one volume or summed (`tsdb_tenant_stats`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct tsdb_tenant_stats {
+    pub flags: u32,
+    pub generation: u32,
+    pub list_hash: u64,
+    pub series: u64,
+    pub series_created: u64,
+    pub active_series_cur: u64,
+    pub active_series_prev: u64,
+    pub rows: u64,
+    pub nulls: u64,
+    pub logical_bytes: u64,
+    pub ts_bytes: u64,
+    pub value_bytes: u64,
+    pub index_bytes: u64,
+    pub granules: u64,
+    pub ingested_rows: u64,
+    pub ingested_bytes: u64,
+    pub merged_rows: u64,
+    pub merge_removed_rows: u64,
+    pub retention_dropped_rows: u64,
+    pub resident_bytes: u64,
+    pub stale_s: u64,
+}
+
+/// One hot-list entry (`tsdb_hot`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct tsdb_hot {
+    pub id: tsdb_sid,
+    pub estimate: u64,
+    pub error: u64,
+}
+
+pub const TSDB_TENANT_PARTIAL: u32 = 1;
+pub const TSDB_TENANT_VOLUME_SUM: u32 = 0xffff_ffff;
+pub const TSDB_SSTAT_REQ_RESIDENT: c_int = 1;
+
+unsafe extern "C" {
+    pub fn tsdb_series_stats(
+        db: *mut tsdb,
+        ids: *const tsdb_sid,
+        n: usize,
+        flags: c_int,
+        out: *mut tsdb_series_stat,
+        done: *mut usize,
+    ) -> c_int;
+    pub fn tsdb_stats_settle(db: *mut tsdb, timeout_ms: c_int) -> c_int;
+    pub fn tsdb_set_tenants(db: *mut tsdb, prefixes: *const *const c_char, n: usize) -> c_int;
+    pub fn tsdb_tenant_prefix(db: *mut tsdb, i: usize, out: *mut c_char, cap: usize) -> c_int;
+    pub fn tsdb_tenant_stats_get(
+        db: *mut tsdb,
+        prefix: *const c_char,
+        volume: u32,
+        out: *mut tsdb_tenant_stats,
+    ) -> c_int;
+    pub fn tsdb_hot_series(
+        db: *mut tsdb,
+        kind: c_int,
+        out: *mut tsdb_hot,
+        k: usize,
+        n: *mut usize,
+        threshold: *mut u64,
+    ) -> c_int;
+}
+
 /// For tests/layout.rs: sizes and field offsets as the C compiler sees them (layout.c).
 #[doc(hidden)]
 pub mod layout {

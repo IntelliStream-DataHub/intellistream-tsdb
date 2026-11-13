@@ -1,8 +1,18 @@
 /* Exported symbols of libtsdb.so: the public API of include/tsdb.h and
- * include/tsdb_calendar.h, nothing internal. */
+ * include/tsdb_calendar.h, nothing internal (and the tsdb_test_* hooks of the tests, which link against the .so).
+ * The tsdb_ec_* functions are the erasure codec's glue (src/ec/compat.c): internal, and a caller could lift the CPU
+ * level cap with tsdb_ec_select. They are named one by one, because an exact name beats the tsdb_* pattern (a pattern
+ * does not); a new one fails tools/check-exports.sh (make test) until it is listed here or declared in a public header. */
 {
     global:
         tsdb_*;
     local:
+        tsdb_ec_cpu_has;
+        tsdb_ec_now_ns;
+        tsdb_ec_panic;
+        tsdb_ec_prefer_512;
+        tsdb_ec_select;
+        tsdb_ec_strlcpy;
+        tsdb_ec_xmalloc;
         *;
 };

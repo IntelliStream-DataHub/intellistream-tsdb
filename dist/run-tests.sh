@@ -4,7 +4,8 @@
 #
 #   tests/run-tests.sh [scratch-dir]     (from the unpacked tarball; default /tmp)
 #
-# test_levels compares every CPU level and kernel this CPU has; test_tsdb,
+# test_levels compares every CPU level and kernel this CPU has, test_rs the erasure codec's kernels (and that no level
+# runs an instruction above it); test_tsdb,
 # test_types and test_group then run once per level (TSDB_CPU), the way the
 # same binary runs on an older CPU. A level the CPU lacks is skipped.
 set -u
@@ -20,6 +21,7 @@ run() {
 echo "glibc: $(getconf GNU_LIBC_VERSION 2>/dev/null); kernel: $(uname -r)"
 grep -m1 "model name" /proc/cpuinfo 2>/dev/null
 run "$here/test_levels"
+run "$here/test_rs" "$scratch"
 for level in v2 v3 v4; do
     for t in test_tsdb test_types test_group; do
         TSDB_CPU=$level run "$here/$t" "$scratch"
