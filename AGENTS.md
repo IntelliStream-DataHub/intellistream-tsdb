@@ -181,7 +181,8 @@ cgroup, so `nice` does not keep your work out of its way.
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
   `killall`, `kill` with pid -1 or 0, `docker`) and `hooks/guard-push.sh` (refuses a push while unpushed
-  commits carry a session link); `skills/tsdb-tracks/` is how changes are built, reviewed, gated and merged
+  commits carry a session link, or match a line of a private pattern file kept outside the repository,
+  `~/.config/claude-private-patterns`: internal hosts and the like never reach GitHub); `skills/tsdb-tracks/` is how changes are built, reviewed, gated and merged
   with subagents; `skills/subagent-economy/` keeps those subagents cheap (detached runs, a waiter, checkpoints;
   copy it to `~/.claude/skills/` to use it in other projects); `skills/jepsen-review/` is the adversarial
   review of durability, recovery and failover code in the Jepsen style (claims, faults, histories, a checker,
