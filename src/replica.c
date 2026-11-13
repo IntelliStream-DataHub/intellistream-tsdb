@@ -370,6 +370,15 @@ void replica_free(eng *db)
 
 /* ---------------------------------------------------------------- memtables */
 
+/* The list's length changes under db->lock (a flush removes, the apply thread adds): read it there (tsan). */
+static size_t nflushing_now(eng *db)
+{
+    pthread_mutex_lock(&db->lock);
+    size_t n = db->nflushing;
+    pthread_mutex_unlock(&db->lock);
+    return n;
+}
+
 /* The active memtable must hold segment `seq`: the first record of a new segment seals the old one (all of its records
  * are applied: the cursor passed its end) and starts the next. */
 static int switch_memtable(eng *db, struct replica *rp, uint64_t seq)
@@ -383,16 +392,17 @@ static int switch_memtable(eng *db, struct replica *rp, uint64_t seq)
         rp->act_seq = seq;
         return 0;
     }
-    if (db->nflushing >= MAX_FLUSHING) { /* only this thread (under rp->mu) adds to the list */
+    if (nflushing_now(db) >= MAX_FLUSHING) { /* only this thread (under rp->mu) adds to the list */
         int rc = replica_flush(db);
         if (rc)
             return rc;
-        if (db->nflushing >= MAX_FLUSHING)
+        if (nflushing_now(db) >= MAX_FLUSHING)
             return TSDB_ERR_IO;
     }
     memtable *nm = mt_new(seq);
     if (!nm)
         return TSDB_ERR_NOMEM;
+    pthread_mutex_lock(&db->flush_lock); /* flush_waiting reads the list under flush_lock alone (tsan): add under it too */
     pthread_mutex_lock(&db->lock);
     pthread_mutex_lock(&db->buf_lock);
     memtable *m = db->active;
@@ -402,6 +412,7 @@ static int switch_memtable(eng *db, struct replica *rp, uint64_t seq)
     pthread_cond_signal(&db->flush_cv);
     pthread_mutex_unlock(&db->buf_lock);
     pthread_mutex_unlock(&db->lock);
+    pthread_mutex_unlock(&db->flush_lock);
     rp->sealed_seq = MAX(rp->sealed_seq, rp->act_seq);
     rp->act_seq = seq;
     return 0;
@@ -1840,7 +1851,7 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
         rc = TSDB_ERR_INVALID; /* a later EPOCH marker is applied: the caller's is not the last */
     if (rc == 0 && db->active && db->active->rows != 0 && eng_test_mutant != MUT_REPLICA_PROMOTE_UNAPPLIED)
         rc = TSDB_ERR_INVALID;
-    if (rc == 0 && (rc = replica_flush(db)) == 0 && db->nflushing != 0)
+    if (rc == 0 && (rc = replica_flush(db)) == 0 && nflushing_now(db) != 0)
         rc = TSDB_ERR_IO;
     uint64_t end = db->fno_next;
     if (rc == 0)
