@@ -19,12 +19,13 @@
 //! which mechanisms the server offers; AUTH_START and AUTH_CONTINUE carry the exchange (`auth.rs`), and the
 //! user admin ops (WHOAMI to USER_LIST) follow.
 //! Version 13: the bodies of the HA statuses (`ha.rs`: UNAVAILABLE, MOVED, PARTIAL, DROPPED), TOPOLOGY and STATUS.
-//! Version 14: QUERY_LATEST (`client/latest.rs`). The floor stays 12.
+//! Version 14: QUERY_LATEST (`client/latest.rs`). Version 15: statistics, STATS_SERIES and STATS_TENANTS
+//! (`client/stats.rs`). The floor stays 12.
 
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 /// The oldest server version this client talks to (`TSDB_PROTOCOL_MIN`): version 11 widened every series id,
 /// 12 added login; tsdbd refuses a client below 12, as this client refuses such a server.
 pub(crate) const PROTOCOL_MIN: u32 = 12;
@@ -39,6 +40,21 @@ pub const DEFAULT_PORT: u16 = 7070;
 
 /// Largest frame either side accepts (`TSDB_MAX_FRAME`), counted like `len`.
 pub(crate) const MAX_FRAME: usize = 256 << 20;
+/// STATS_SERIES: ids in one request, with `resident` (`TSDB_STATS_SERIES_MAX_IDS`, `_RESIDENT_MAX`) and its flag.
+pub(crate) const STATS_SERIES_MAX_IDS: usize = 65_536;
+pub(crate) const STATS_SERIES_RESIDENT_MAX: usize = 1024;
+pub(crate) const STATS_RESIDENT: u32 = 1;
+/// STATS_TENANTS: the request flags, the reply's shape (`TSDB_TSTATS_*`).
+pub(crate) const TSTATS_VOLUMES: u16 = 1;
+pub(crate) const TSTATS_HOT: u16 = 2;
+pub(crate) const TSTATS_CALLER: u16 = 4;
+pub(crate) const TSTATS_ROW_HEAD: usize = 16;
+pub(crate) const TSTATS_DATA_FIELDS: usize = 18;
+pub(crate) const TSTATS_CALLER_FIELDS: usize = 20;
+pub(crate) const TSTATS_HOT_REC: usize = 32;
+pub(crate) const TSTATS_MAX_K: u32 = 256;
+pub(crate) const TSTATS_VOLUME_SUM: u32 = 0xffff_ffff;
+pub(crate) const TSTATS_DONE: u32 = 0xffff_ffff;
 /// The series field of an INSERT whose rows carry their own series.
 pub(crate) const MANY_SERIES: u64 = u64::MAX;
 
@@ -125,6 +141,8 @@ pub(crate) enum Op {
     Revoke = 37,
     UserList = 38,
     QueryLatest = 39,
+    StatsSeries = 46,
+    StatsTenants = 47,
     Topology = 48,
     Status = 49,
 }

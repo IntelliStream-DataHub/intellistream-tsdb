@@ -67,7 +67,7 @@ class AuthTest {
         try (TsdbClient c = login("root", ROOT_PW)) {
             User me = c.whoami();
             assertEquals(new User("root", true, List.of()), me);
-            assertEquals(14, c.hello());
+            assertEquals(15, c.hello());
             long id = c.series("plant/a");
             c.insert(id, new long[] {T0}, new float[] {1.5f});
 

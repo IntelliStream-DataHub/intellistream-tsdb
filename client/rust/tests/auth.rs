@@ -24,7 +24,7 @@ fn login_with_the_right_password_wrong_password_and_unknown_user() {
     let mut c = root(&srv);
     let me = c.whoami().unwrap();
     assert_eq!((me.name.as_str(), me.superuser, me.grants.len()), ("root", true, 0));
-    assert_eq!(c.protocol_version().unwrap(), 14);
+    assert_eq!(c.protocol_version().unwrap(), 15);
     let id = c.series("plant/a").unwrap();
     c.insert_series(id, &[T0], &[1.5]).unwrap();
 

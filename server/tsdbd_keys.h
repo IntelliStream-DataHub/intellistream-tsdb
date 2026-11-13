@@ -86,6 +86,9 @@ static const struct cfg_key tsdbd_keys[] = {
     CK_S("metrics.bind", "metrics-bind", "", "The address of the metrics port. Default: server.listen."),
     /* stats and the latest table */
     CK_N("stats.enabled", "no-stats", "true", "false turns the statistics (docs/design-stats.md) off."),
+    CK_S("tenants.file", "tenants", "",
+       "The tenant list (docs/design-stats.md, section 2.1). Default: the prefix: grants that tenant admins hold admin on."),
+    CK_D("tenants.settle", "tenants-settle", "s", "30s", "How long a changed tenant list takes to settle before it applies."),
     CK_Z("latest.cache", "latest-cache", "B", "", "Memory of the latest-value table. Default: a sixteenth of the RAM."),
     /* health */
     CK_L("health.domains", "health-domain", "",

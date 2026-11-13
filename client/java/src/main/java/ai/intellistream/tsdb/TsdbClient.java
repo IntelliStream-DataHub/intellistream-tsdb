@@ -3456,6 +3456,189 @@ public final class TsdbClient implements AutoCloseable {
         return new TsdbException(status, detail, cause);
     }
 
+    // ------------------------------------------------------------------ statistics
+
+    /**
+     * The storage numbers of series (protocol 15), computed by the server from the granule index and the memtables.
+     * Any number of ids: they go in requests of up to 65,536 (1,024 with {@code resident}), and the call asks again
+     * for what the server's work budget left. A series the user may not read fails in its own entry
+     * ({@link Status#ERR_DENIED}, whether or not it exists); one that does not exist, for a user who reads every
+     * series, with {@link Status#ERR_NOTFOUND}.
+     *
+     * @param ids series ids
+     * @param resident fill {@link SeriesStat#residentBytes()} (bytes of the series' granules in the page cache now)
+     * @return one result per id, in order
+     * @throws TsdbException the request failed; {@link Status#ERR_INVALID} also when the server speaks less than
+     *     protocol 15 or runs with {@code --no-stats} (nothing was sent to the former)
+     */
+    public List<SeriesResult<SeriesStat>> seriesStats(long[] ids, boolean resident) throws TsdbException {
+        Objects.requireNonNull(ids, "ids");
+        if (ids.length == 0)
+            return List.of();
+        statsVersion();
+        int chunk = resident ? Protocol.STATS_SERIES_RESIDENT_MAX : Protocol.STATS_SERIES_MAX_IDS;
+        List<SeriesResult<SeriesStat>> res = new ArrayList<>(ids.length);
+        while (res.size() < ids.length) {
+            int at = res.size(), m = Math.min(chunk, ids.length - at);
+            request();
+            begin(Protocol.OP_STATS_SERIES, 8 + (long) m * Long.BYTES);
+            out.putInt(m).putInt(resident ? Protocol.STATS_RESIDENT : 0);
+            putLongs(ids, at, m);
+            send();
+            int st = frame();
+            if (st != Status.OK) {
+                endReply();
+                throw error(st);
+            }
+            int p = in.position();
+            int done = bodyLen >= 8 ? in.getInt(p) : -1;
+            if (done < 1 || done > m || in.getInt(p + 4) != 0
+                    || bodyLen != 8 + (long) done * SeriesStat.WIRE_LEN)
+                throw lost(Status.ERR_CORRUPT, "STATS_SERIES reply: " + done + " of " + m + " records in " + bodyLen
+                        + " bytes");
+            for (int i = 0, q = p + 8; i < done; i++, q += SeriesStat.WIRE_LEN) {
+                int rs = in.getInt(q);
+                SeriesStat s = SeriesStat.of(in, q);
+                if (s == null && rs == 0)
+                    throw lost(Status.ERR_CORRUPT, "STATS_SERIES record out of shape");
+                res.add(rs == 0 ? SeriesResult.of(s) : SeriesResult.failed(rs, null));
+            }
+            endReply();
+        }
+        return Collections.unmodifiableList(res);
+    }
+
+    /**
+     * The numbers of tenants (protocol 15). A superuser, or a user with {@code read} on every series, sees every
+     * tenant; a tenant admin ({@code admin} on {@code prefix:Q}) each tenant whose prefix starts with Q. The call
+     * follows the server's cursor, so the answer holds every row.
+     *
+     * @param prefixes the tenants asked for ("" is the tenant "(none)"); null or empty: every tenant the user may see
+     * @param o what to include
+     * @return the tenants; a row whose tenant may not be seen has status {@link Status#ERR_DENIED}, a prefix that
+     *     is not in the list {@link Status#ERR_NOTFOUND}
+     * @throws TsdbException the request failed; {@link Status#ERR_INVALID} also when the server speaks less than
+     *     protocol 15 or runs with {@code --no-stats} (nothing was sent to the former)
+     */
+    public TenantStats tenantStats(String[] prefixes, TenantOptions o) throws TsdbException {
+        Objects.requireNonNull(o, "options");
+        String[] pre = prefixes == null ? new String[0] : prefixes;
+        if (pre.length > 65535)
+            throw new IllegalArgumentException(pre.length + " prefixes (at most 65535)");
+        byte[][] names = new byte[pre.length][];
+        long total = 0;
+        for (int i = 0; i < pre.length; i++) {
+            names[i] = Objects.requireNonNull(pre[i], "prefix").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            if (names[i].length > 65535)
+                throw new IllegalArgumentException("a prefix of " + names[i].length + " bytes (at most 65535)");
+            total += 2 + names[i].length;
+        }
+        statsVersion();
+        int flags = (o.volumes() ? Protocol.TSTATS_VOLUMES : 0) | (o.hot() > 0 ? Protocol.TSTATS_HOT : 0)
+                | (o.caller() ? Protocol.TSTATS_CALLER : 0);
+        List<TenantStats.Row> rows = new ArrayList<>();
+        boolean partial = false, approx = false;
+        int generation = 0, cursor = 0, restarts = 0;
+        long hash = 0, counted = 0, listed = 0;
+        for (;;) {
+            request();
+            begin(Protocol.OP_STATS_TENANTS, 16 + total);
+            out.putShort((short) flags).putShort((short) o.hot()).putInt(pre.length).putInt(cursor).putInt(0);
+            for (byte[] nm : names) {
+                if (out.remaining() < 2 + nm.length)
+                    send();
+                out.putShort((short) nm.length).put(nm);
+            }
+            send();
+            int st = frame();
+            if (st != Status.OK) {
+                endReply();
+                throw error(st);
+            }
+            int p = in.position();
+            if (bodyLen < Protocol.TSTATS_HEADER)
+                throw lost(Status.ERR_CORRUPT, "STATS_TENANTS reply of " + bodyLen + " bytes");
+            int count = in.getInt(p), rflags = in.getInt(p + 4), next = in.getInt(p + 8), gen = in.getInt(p + 12);
+            long h = in.getLong(p + 16);
+            if (cursor != 0 && (gen != generation || h != hash)) {
+                /* the tenant list changed between two replies: a cursor into the old list means nothing */
+                endReply();
+                if (++restarts > 3)
+                    throw lost(Status.ERR_IO, "the tenant list kept changing");
+                rows.clear();
+                partial = false;
+                approx = false;
+                cursor = 0;
+                continue;
+            }
+            partial |= (rflags & 1) != 0;
+            approx |= (rflags & 2) != 0;
+            generation = gen;
+            hash = h;
+            counted = in.getLong(p + 24);
+            listed = in.getLong(p + 32);
+            int q = p + Protocol.TSTATS_HEADER, end = p + bodyLen;
+            for (int i = 0; i < count; i++) {
+                if (end - q < Protocol.TSTATS_ROW_HEAD)
+                    throw lost(Status.ERR_CORRUPT, "STATS_TENANTS row cut short");
+                int rs = in.getInt(q), vol = in.getInt(q + 4), rf = in.getInt(q + 8);
+                int plen = in.getShort(q + 12) & 0xffff, nhot = in.getShort(q + 14) & 0xffff;
+                boolean sum = vol == Protocol.TSTATS_VOLUME_SUM;
+                int padded = (plen + 7) & ~7;
+                long need = (long) padded + Protocol.TSTATS_DATA_FIELDS * 8L
+                        + (sum && o.caller() ? Protocol.TSTATS_CALLER_FIELDS * 8L : 0)
+                        + (long) nhot * Protocol.TSTATS_HOT_REC;
+                q += Protocol.TSTATS_ROW_HEAD;
+                if (end - q < need || (!sum && nhot != 0))
+                    throw lost(Status.ERR_CORRUPT, "STATS_TENANTS row out of shape");
+                byte[] pb = new byte[plen];
+                in.get(q, pb);
+                q += padded;
+                long[] d = new long[Protocol.TSTATS_DATA_FIELDS];
+                for (int k = 0; k < d.length; k++, q += 8)
+                    d[k] = in.getLong(q);
+                TenantStats.Numbers n = new TenantStats.Numbers(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8],
+                        d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17]);
+                TenantStats.Caller c = null;
+                if (sum && o.caller()) {
+                    long[] x = new long[Protocol.TSTATS_CALLER_FIELDS];
+                    for (int k = 0; k < x.length; k++, q += 8)
+                        x[k] = in.getLong(q);
+                    c = new TenantStats.Caller(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9], x[10], x[11],
+                            x[12], x[13], x[14], x[15], x[16], x[17], x[18], x[19]);
+                }
+                List<TenantStats.Hot> hot = new ArrayList<>(nhot);
+                for (int k = 0; k < nhot; k++, q += Protocol.TSTATS_HOT_REC) {
+                    int kind = in.get(q) & 0xff;
+                    if (kind < 1 || kind > 3)
+                        throw lost(Status.ERR_CORRUPT, "STATS_TENANTS hot kind " + kind);
+                    hot.add(new TenantStats.Hot(TenantStats.HotKind.values()[kind - 1], in.getLong(q + 8),
+                            in.getLong(q + 16), in.getLong(q + 24)));
+                }
+                rows.add(new TenantStats.Row(rs, sum ? TenantStats.VOLUME_SUM : vol,
+                        new String(pb, java.nio.charset.StandardCharsets.UTF_8), (rf & 1) != 0, n, c,
+                        Collections.unmodifiableList(hot)));
+            }
+            if (q != end)
+                throw lost(Status.ERR_CORRUPT, "STATS_TENANTS reply with " + (end - q) + " bytes left over");
+            endReply();
+            if (next == Protocol.TSTATS_DONE)
+                break;
+            if (Integer.compareUnsigned(next, cursor) <= 0 || count == 0)
+                throw lost(Status.ERR_CORRUPT, "STATS_TENANTS cursor does not advance");
+            cursor = next;
+        }
+        return new TenantStats(partial, approx, generation, hash, counted, listed,
+                Collections.unmodifiableList(rows));
+    }
+
+    /** The server must speak 15: an older one does not know the ops, and nothing is sent to it. */
+    private void statsVersion() throws TsdbException {
+        if (serverVersion < 15)
+            throw new TsdbException(Status.ERR_INVALID, "statistics need protocol 15; the server speaks "
+                    + serverVersion, null);
+    }
+
     // ------------------------------------------------------------------ latest
 
     /**

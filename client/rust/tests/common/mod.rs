@@ -82,6 +82,11 @@ impl Server {
 
     /// Starts tsdbd on `dir`, with login required (`auth`) or `--no-auth`.
     pub fn spawn(dir: PathBuf, auth: bool) -> Server {
+        Server::spawn_args(dir, auth, &[])
+    }
+
+    /// [`spawn`](Server::spawn) with more tsdbd arguments (`--tenants FILE`).
+    pub fn spawn_args(dir: PathBuf, auth: bool, extra: &[&str]) -> Server {
         let bin = tsdbd();
         assert!(bin.exists(), "{} is missing: run make in the repository root", bin.display());
         // tsdbd picks its port (--port 0) and writes "PORT PID" to this file once it serves: no port is
@@ -97,6 +102,7 @@ impl Server {
             // watches the process, not the thread that spawned it, which may end first; =PID: and it refuses to
             // start when this process is gone already
             .args(["--no-fsync", "--workers", "4"])
+            .args(extra)
             .arg(format!("--exit-with-parent={}", std::process::id()))
             .args(if auth { &[][..] } else { &["--no-auth"][..] })
             .stdin(Stdio::null())

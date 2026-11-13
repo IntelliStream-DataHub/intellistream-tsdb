@@ -16,7 +16,7 @@ use std::sync::{Mutex, RwLock};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use ::tsdb_client as tc;
 use ::tsdb_embedded as te;
@@ -28,7 +28,7 @@ use tsdb_client_python_common::arrays::{
 };
 
 use tsdb_client_python_common::{
-    Buckets, QueryStats, Stats, TwaBuckets, buckets, closed, column_to_py, f32_column, group, latest, multi,
+    Buckets, QueryStats, Stats, TwaBuckets, buckets, closed, column_to_py, f32_column, group, latest, multi, stats,
     numpy_module, opts, points_to_py, py_column, range, rows_to_py, series_column, to_pyerr, ts_column, ts_to_py,
     twa_opts, value_type, values_column,
 };
@@ -997,6 +997,41 @@ impl Db {
     /// reached the disk, what failed (writes then fail until reopened).
     fn failed(&self, py: Python<'_>) -> PyResult<Option<String>> {
         self.with(py, |d| Ok(d.failed()))
+    }
+
+    /// As Client.series_stats(), in this process: the numbers computed from the granule index and the memtables.
+    #[pyo3(signature = (series, *, resident = false, errors = "raise"))]
+    fn series_stats<'py>(&self, py: Python<'py>, series: &Bound<'py, PyAny>, resident: bool, errors: &str) -> PyResult<Bound<'py, PyList>> {
+        let q = stats::SeriesReq::new(series, resident, errors)?;
+        let a = self.query(py, |d| q.run(&DbCalls(d)))?;
+        q.finish(py, a)
+    }
+
+    /// As Client.tenant_stats(), in this process, for a user who may see everything: the caller counters are None.
+    #[pyo3(signature = (prefixes = None, *, volumes = false, hot = 0, caller = false))]
+    fn tenant_stats<'py>(&self, py: Python<'py>, prefixes: Option<Vec<String>>, volumes: bool, hot: u16, caller: bool) -> PyResult<Bound<'py, PyDict>> {
+        let q = stats::TenantReq::new(prefixes, volumes, hot, caller)?;
+        let t = self.query(py, |d| q.run(&DbCalls(d)))?;
+        q.finish(py, t)
+    }
+
+    /// Sets the tenant list: a series belongs to the tenant with the longest prefix its name starts
+    /// with, else to "(none)". Empty strings and duplicates are dropped.
+    fn set_tenants(&self, py: Python<'_>, prefixes: Vec<String>) -> PyResult<()> {
+        self.query(py, |d| {
+            let v: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+            d.set_tenants(&v)
+        })
+    }
+
+    /// Waits until the statistics sweeper has handled the parts listed before the call, for at most
+    /// timeout_ms.
+    ///
+    /// Raises:
+    ///     TsdbError: Time ran out (UNAVAILABLE).
+    #[pyo3(signature = (timeout_ms = 30000))]
+    fn stats_settle(&self, py: Python<'_>, timeout_ms: i32) -> PyResult<()> {
+        self.query(py, |d| d.stats_settle(timeout_ms))
     }
 
     /// As Client.latest(), in this process.
