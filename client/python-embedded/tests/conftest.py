@@ -51,7 +51,7 @@ def plain(x):
 
 
 class Server:
-    def __init__(self, base, dir=None, root_password=None, root="root"):
+    def __init__(self, base, dir=None, root_password=None, root="root", extra_args=()):
         """Serves dir (an existing database: test_embedded), or a new directory under base. With root_password the
         server requires a login, and USERS holds the superuser root (a name) with that password (made by the CLI);
         without, it runs with --no-auth."""
@@ -64,7 +64,8 @@ class Server:
             # --exit-with-parent: a test run killed by a timeout leaves no server behind
             [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4",
              "--exit-with-parent=%d" % os.getpid()]
-            + ([] if root_password is not None else ["--no-auth"]),
+            + ([] if root_password is not None else ["--no-auth"])
+            + list(extra_args),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -137,11 +138,11 @@ def readme_server():
         yield srv
 
 
-def serve(root_password=None, root="root"):
+def serve(root_password=None, root="root", extra_args=()):
     if not os.access(TSDBD, os.X_OK):
         pytest.fail(f"{TSDBD} is missing: run make in the repository root")
     base = os.environ.get("TSDB_TEST_DIR")
-    srv = Server(base, root_password=root_password, root=root)
+    srv = Server(base, root_password=root_password, root=root, extra_args=extra_args)
     try:
         yield srv
     finally:
