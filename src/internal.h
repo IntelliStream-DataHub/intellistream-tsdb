@@ -55,7 +55,9 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_NO_OPEN_SYNC, MUT_REPLICA_NO_GAP_CHECK, MUT_REPLICA_NO_TORN_CUT, MUT_REPLICA_NO_FLOOR_CHECK,
        MUT_REPLICA_NO_DURABLE_GATE, MUT_REPLICA_NO_APPLY_CONTIG, MUT_REPLICA_NO_SEALED_RULE, MUT_REPLICA_NO_ROT_SYNC,
        MUT_REPLICA_NO_CUT_GEN, MUT_REPLICA_NO_CUT_SYNC, MUT_REPLICA_NO_CUT_DIRSYNC, MUT_REPLICA_NO_REPLAY_SKIP,
-       MUT_REPLICA_NO_NOW_MARKER, MUT_REPLICA_COMMIT_CLOCK, MUT_REPLICA_EARLY_SEAL };
+       MUT_REPLICA_NO_NOW_MARKER, MUT_REPLICA_COMMIT_CLOCK, MUT_REPLICA_EARLY_SEAL,
+       MUT_REPLICA_NO_STAGE_HOLD, MUT_REPLICA_NO_COMMIT_FLUSH, MUT_REPLICA_NO_DONE_SKIP, MUT_REPLICA_KEEP_STAGED,
+       MUT_REPLICA_NO_DROP_SKIP, MUT_REPLICA_NO_DROP_FLUSH, MUT_REPLICA_NO_STAGE_SYNC };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1355,9 +1357,10 @@ struct jr_commit_arg {
  * The callbacks run on the writer's thread with no engine lock held except where said. */
 struct jr_ops {
     void *ctx;
-    /* sends the pending file `name` (the leader's tmp name, `size` bytes, in the volume directory) to every replica of
-     * the ISR, which stages and syncs it (replica_stage); returns when they have */
-    int (*ship)(void *ctx, struct eng *db, const char *name, uint64_t size);
+    /* sends the pending file `file` (the leader's tmp name, `size` bytes, in the volume directory) to every replica of
+     * the ISR, which stages and syncs it under `mname` (replica_stage): the name the marker carries, a part name
+     * p<partition>_<pid>_<n>_0.part (the partition is in no part file); returns when they have */
+    int (*ship)(void *ctx, struct eng *db, const char *file, const char *mname, uint64_t size);
     /* the marker whose last position is `last` is durable at the leader: returns once the commit point passed it and the
      * replicas applied it (the leader's own apply follows), or an error (nothing is then published) */
     int (*wait)(void *ctx, struct eng *db, uint64_t last);

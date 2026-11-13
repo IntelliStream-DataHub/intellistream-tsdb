@@ -66,11 +66,37 @@ struct replica {
     size_t rcap;
     /* the sender's cursor (replica_read): where the last read ended */
     uint64_t rd_seq, rd_off, rd_next;
+    /* files the leader shipped for its COMMIT markers (replica_stage), and the COMMIT markers appended and not yet
+     * applied: a marker's positions are not durable here until every file it names is staged (hold_cap) */
+    struct rstg {
+        uint64_t key, size, xxh;
+    } *stg;
+    size_t nstg, capstg;
+    struct rcm {
+        uint64_t first, last;
+        uint32_t nf;
+        struct rcf {
+            uint64_t key, size, xxh;
+            char name[64];
+        } *f;
+    } *cm; /* ascending by first */
+    size_t ncm, capcm;
+    struct {
+        uint64_t done; /* the last position of the last COMMIT or DROP applied */
+        uint64_t doing_pos, doing_b0, doing_n; /* a COMMIT being published: its position, first block, parts (0: none) */
+        struct rdrop {
+            uint64_t pos;  /* the DROP's position */
+            int64_t until; /* dropped_before */
+        } *drops;
+        size_t ndrops;
+    } rs; /* the RSTATE file */
 };
 
 #define RP_CHUNK ((size_t)1 << 20)
 
 static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit);
+static int rs_load(eng *db, struct replica *rp);
+static int open_scan(eng *db, struct replica *rp);
 
 void replica_now_advance(eng *db, int64_t ms)
 {
@@ -310,6 +336,10 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
                         "records the floor says were applied\n", db->dir, floor, db->fno_next - 1);
         return TSDB_ERR_CORRUPT;
     }
+    if ((rc = rs_load(db, rp)) == 0)
+        rc = open_scan(db, rp);
+    if (rc)
+        return rc;
     pthread_mutex_lock(&rp->mu);
     rc = replica_apply_locked(db, rp, floor);
     pthread_mutex_unlock(&rp->mu);
@@ -325,6 +355,11 @@ void replica_free(eng *db)
     free(rp->rbuf);
     free(rp->segs);
     free(rp->unl);
+    free(rp->stg);
+    for (size_t i = 0; i < rp->ncm; i++)
+        free(rp->cm[i].f);
+    free(rp->cm);
+    free(rp->rs.drops);
     pthread_mutex_destroy(&rp->mu);
     pthread_mutex_destroy(&rp->segs_mu);
     pthread_mutex_destroy(&rp->unl_mu);
@@ -488,6 +523,524 @@ int replica_floor_saved(eng *db, uint64_t floor)
     return 0;
 }
 
+/* ------------------------------------------- staged files, RSTATE, COMMIT and DROP (design-cluster.md 5.2-5.3) */
+/*
+ * COMMIT (an insert, replace or delete that goes to parts): the leader ships its pending part files before it appends
+ * the marker. A replica keeps each as `stage_<xxh64 of the leader's name>.part` (file and directory synced) and the
+ * marker's positions are not durable here (hold_cap: not acknowledged, not applied) until every file it names is
+ * staged with the size and xxh64 the marker says. The apply flushes every sealed memtable (the leader flushed its own
+ * before the marker: last write wins), links the staged files to tmp_0_<n>.part (pid 0 is never a writer's), and
+ * commits them like a large insert (parts_commit under publish_lock). A crash anywhere leaves the stage_ files (the
+ * link is swept, the stage stays) and RSTATE says whether the commit happened (see rs_committed).
+ * RSTATE is rewritten whole (tmp, fsync, rename, fsync of the directory): `done` is the last position of the last COMMIT
+ * or DROP applied (a replay skips markers up to it), `doing` the COMMIT being published (position, first block, parts),
+ * `drops` the DROPs applied, which a replay needs to keep the rows of dropped partitions out of the memtable again.
+ */
+#define RS_FILE "RSTATE"
+#define RS_MAGIC UINT64_C(0x5453544154535231)
+
+static uint64_t stage_key(const char *name) { return xxh64(name, strlen(name), 0); }
+
+static void stage_path(char *buf, size_t cap, uint64_t key) { snprintf(buf, cap, "stage_%016" PRIx64 ".part", key); }
+
+static void put64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
+
+static uint64_t get64(const uint8_t *p)
+{
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+
+static struct rstg *stg_find(struct replica *rp, uint64_t key)
+{
+    for (size_t i = 0; i < rp->nstg; i++)
+        if (rp->stg[i].key == key)
+            return &rp->stg[i];
+    return NULL;
+}
+
+static int stg_put(struct replica *rp, uint64_t key, uint64_t size, uint64_t xxh)
+{
+    struct rstg *s = stg_find(rp, key);
+    if (!s) {
+        if (rp->nstg == rp->capstg) {
+            size_t c = rp->capstg ? rp->capstg * 2 : 16;
+            struct rstg *x = realloc(rp->stg, c * sizeof *x);
+            if (!x)
+                return TSDB_ERR_NOMEM;
+            rp->stg = x;
+            rp->capstg = c;
+        }
+        s = &rp->stg[rp->nstg++];
+    }
+    *s = (struct rstg){key, size, xxh};
+    return 0;
+}
+
+static void stg_del(struct replica *rp, uint64_t key)
+{
+    struct rstg *s = stg_find(rp, key);
+    if (s)
+        *s = rp->stg[--rp->nstg];
+}
+
+static bool cm_satisfied(struct replica *rp, const struct rcm *c)
+{
+    for (uint32_t i = 0; i < c->nf; i++) {
+        const struct rstg *s = stg_find(rp, c->f[i].key);
+        if (!s || s->size != c->f[i].size || s->xxh != c->f[i].xxh)
+            return false;
+    }
+    return true;
+}
+
+/* The lowest position that is not durable here for want of a staged file: durable_next never passes the first COMMIT
+ * marker whose files are not all staged (UINT64_MAX: no hold). rp->mu held. */
+static uint64_t hold_cap(struct replica *rp)
+{
+    if (eng_test_mutant == MUT_REPLICA_NO_STAGE_HOLD)
+        return UINT64_MAX;
+    for (size_t i = 0; i < rp->ncm; i++)
+        if (!cm_satisfied(rp, &rp->cm[i]))
+            return rp->cm[i].first;
+    return UINT64_MAX;
+}
+
+static void durable_raise(struct replica *rp, uint64_t v)
+{
+    uint64_t cap = hold_cap(rp);
+    if (v > cap)
+        v = cap;
+    if (v > rp->durable_next)
+        rp->durable_next = v;
+}
+
+/* a COMMIT marker that arrived (appended, or found at open): remembered until it is applied or cut */
+static int cm_add(struct replica *rp, const wal_rec *wr, const mk *m)
+{
+    const mk_commit *c = &m->u.commit;
+    uint64_t last = wr->fno + wr->span - 1;
+    if (last <= rp->rs.done)
+        return 0; /* applied already (RSTATE): nothing to stage */
+    if (rp->ncm == rp->capcm) {
+        size_t cap = rp->capcm ? rp->capcm * 2 : 8;
+        struct rcm *x = realloc(rp->cm, cap * sizeof *x);
+        if (!x)
+            return TSDB_ERR_NOMEM;
+        rp->cm = x;
+        rp->capcm = cap;
+    }
+    struct rcm *x = &rp->cm[rp->ncm];
+    memset(x, 0, sizeof *x);
+    x->first = wr->fno;
+    x->last = last;
+    x->f = calloc(c->nfiles ? c->nfiles : 1, sizeof *x->f);
+    if (!x->f)
+        return TSDB_ERR_NOMEM;
+    size_t pos = 0;
+    mk_file f;
+    while (x->nf < c->nfiles && mk_file_next(c, &pos, &f)) {
+        struct rcf *e = &x->f[x->nf];
+        if (f.name_len == 0 || f.name_len >= sizeof e->name) {
+            free(x->f);
+            return TSDB_ERR_CORRUPT;
+        }
+        memcpy(e->name, f.name, f.name_len);
+        e->name[f.name_len] = 0;
+        e->key = stage_key(e->name);
+        e->size = f.size;
+        e->xxh = f.xxh64;
+        x->nf++;
+    }
+    for (uint32_t i = 0; i < x->nf; i++)
+        if (!part_file_name(x->f[i].name)) {
+            free(x->f);
+            return TSDB_ERR_CORRUPT;
+        }
+    if (x->nf != c->nfiles) {
+        free(x->f);
+        return TSDB_ERR_CORRUPT;
+    }
+    rp->ncm++;
+    return 0;
+}
+
+/* forgets the i-th COMMIT marker and removes the files it staged (applied, or cut) */
+static void cm_remove(eng *db, struct replica *rp, size_t i)
+{
+    struct rcm *x = &rp->cm[i];
+    for (uint32_t k = 0; k < x->nf; k++) {
+        char sp[40];
+        stage_path(sp, sizeof sp, x->f[k].key);
+        if (eng_test_mutant != MUT_REPLICA_KEEP_STAGED)
+            unlinkat(db->dirfd, sp, 0);
+        stg_del(rp, x->f[k].key);
+    }
+    free(x->f);
+    memmove(x, x + 1, (rp->ncm - i - 1) * sizeof *x);
+    rp->ncm--;
+}
+
+int replica_stage(eng *db, const char *name, const void *buf, size_t len)
+{
+    struct replica *rp = db->rp;
+    if (!rp || !name || !part_file_name(name) || strlen(name) >= 64 || len == 0)
+        return TSDB_ERR_INVALID;
+    uint64_t key = stage_key(name);
+    char sp[40];
+    stage_path(sp, sizeof sp, key);
+    int fd = openat(db->dirfd, sp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int rc = 0;
+    if (fd < 0 || write_full(fd, buf, len) != 0 ||
+        (db->opt.fsync && eng_test_mutant != MUT_REPLICA_NO_STAGE_SYNC && tsdb_fdatasync(fd) != 0))
+        rc = TSDB_ERR_IO;
+    if (fd >= 0)
+        close(fd);
+    if (rc == 0 && db->opt.fsync && eng_test_mutant != MUT_REPLICA_NO_STAGE_SYNC && tsdb_fsync(db->dirfd) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc) {
+        unlinkat(db->dirfd, sp, 0);
+        return rc;
+    }
+    pthread_mutex_lock(&rp->mu);
+    rc = stg_put(rp, key, len, xxh64(buf, len, 0));
+    pthread_mutex_unlock(&rp->mu);
+    return rc;
+}
+
+int replica_missing(eng *db, char *name, size_t cap, uint64_t *size)
+{
+    struct replica *rp = db->rp;
+    if (!rp)
+        return 0;
+    int found = 0;
+    pthread_mutex_lock(&rp->mu);
+    for (size_t i = 0; i < rp->ncm && !found; i++)
+        for (uint32_t k = 0; k < rp->cm[i].nf; k++) {
+            const struct rcf *f = &rp->cm[i].f[k];
+            const struct rstg *s = stg_find(rp, f->key);
+            if (s && s->size == f->size && s->xxh == f->xxh)
+                continue;
+            snprintf(name, cap, "%s", f->name);
+            *size = f->size;
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&rp->mu);
+    return found;
+}
+
+/* ---- RSTATE ---- */
+
+static int rs_save(eng *db, struct replica *rp)
+{
+    size_t n = 8 + 4 * 8 + 8 + rp->rs.ndrops * 16 + 8, o = 0;
+    uint8_t *b = malloc(n);
+    if (!b)
+        return TSDB_ERR_NOMEM;
+    put64(b + o, RS_MAGIC), o += 8;
+    put64(b + o, rp->rs.done), o += 8;
+    put64(b + o, rp->rs.doing_pos), o += 8;
+    put64(b + o, rp->rs.doing_b0), o += 8;
+    put64(b + o, rp->rs.doing_n), o += 8;
+    put64(b + o, rp->rs.ndrops), o += 8;
+    for (size_t i = 0; i < rp->rs.ndrops; i++) {
+        put64(b + o, rp->rs.drops[i].pos), o += 8;
+        put64(b + o, (uint64_t)rp->rs.drops[i].until), o += 8;
+    }
+    put64(b + o, xxh64(b, o, 0));
+    int fd = openat(db->dirfd, RS_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int rc = fd < 0 || write_full(fd, b, n) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+    if (fd >= 0)
+        close(fd);
+    free(b);
+    if (rc == 0 && renameat(db->dirfd, RS_FILE ".tmp", db->dirfd, RS_FILE) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && db->opt.fsync && tsdb_fsync(db->dirfd) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc)
+        eng_fail(db, "saving RSTATE", errno);
+    return rc;
+}
+
+static int rs_load(eng *db, struct replica *rp)
+{
+    uint8_t *b;
+    size_t len;
+    if (faccessat(db->dirfd, RS_FILE, F_OK, 0) != 0 && errno == ENOENT)
+        return 0; /* never applied a COMMIT or a DROP */
+    int rc = read_file(db->dirfd, RS_FILE, &b, &len);
+    if (rc)
+        return rc;
+    bool ok = len >= 56 && get64(b) == RS_MAGIC && get64(b + len - 8) == xxh64(b, len - 8, 0);
+    uint64_t nd = ok ? get64(b + 40) : 0;
+    ok = ok && nd <= (len - 56) / 16 && len == 56 + nd * 16;
+    if (!ok) {
+        free(b);
+        fprintf(stderr, "tsdb: %s: RSTATE is damaged: the replica's state is lost, rebuild it\n", db->dir);
+        return TSDB_ERR_CORRUPT;
+    }
+    rp->rs.done = get64(b + 8);
+    rp->rs.doing_pos = get64(b + 16);
+    rp->rs.doing_b0 = get64(b + 24);
+    rp->rs.doing_n = get64(b + 32);
+    if (nd) {
+        rp->rs.drops = malloc(nd * sizeof *rp->rs.drops);
+        if (!rp->rs.drops) {
+            free(b);
+            return TSDB_ERR_NOMEM;
+        }
+        for (uint64_t i = 0; i < nd; i++) {
+            rp->rs.drops[i].pos = get64(b + 48 + i * 16);
+            rp->rs.drops[i].until = (int64_t)get64(b + 56 + i * 16);
+        }
+        rp->rs.ndrops = nd;
+    }
+    free(b);
+    return 0;
+}
+
+/* A drop whose position lies below every retained record cannot matter to a replay any more */
+static void rs_prune_drops(struct replica *rp)
+{
+    uint64_t lo = UINT64_MAX;
+    pthread_mutex_lock(&rp->segs_mu);
+    for (size_t i = 0; i < rp->nsegs; i++)
+        if (rp->segs[i].first) {
+            lo = rp->segs[i].first;
+            break;
+        }
+    pthread_mutex_unlock(&rp->segs_mu);
+    size_t k = 0;
+    for (size_t i = 0; i < rp->rs.ndrops; i++)
+        if (rp->rs.drops[i].pos > lo || lo == UINT64_MAX)
+            rp->rs.drops[k++] = rp->rs.drops[i];
+    rp->rs.ndrops = k;
+}
+
+/* Whether the COMMIT in `doing` reached the parts: a listed part covers its first block (a merge keeps the range of
+ * its sources; blocks are never reused). intents_recover ran at the open, so the parts are all or none. */
+static bool rs_committed(eng *db, struct replica *rp)
+{
+    bool yes = false;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts && !yes; i++)
+        yes = db->parts[i]->min_block <= rp->rs.doing_b0 && rp->rs.doing_b0 <= db->parts[i]->max_block;
+    pthread_mutex_unlock(&db->lock);
+    return yes;
+}
+
+static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr, const mk *m)
+{
+    const mk_commit *c = &m->u.commit;
+    uint64_t last = wr->fno + wr->span - 1;
+    size_t ci = rp->ncm;
+    for (size_t i = 0; i < rp->ncm; i++)
+        if (rp->cm[i].last == last)
+            ci = i;
+    if (last <= rp->rs.done && eng_test_mutant != MUT_REPLICA_NO_DONE_SKIP)
+        return 0; /* a replay: its parts are listed */
+    if (rp->rs.doing_pos == last && eng_test_mutant != MUT_REPLICA_NO_DONE_SKIP && rs_committed(db, rp)) {
+        rp->rs.done = last;
+        rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
+        int rc = rs_save(db, rp);
+        if (rc == 0 && ci < rp->ncm)
+            cm_remove(db, rp, ci);
+        return rc;
+    }
+    if (c->flush_through >= seq || c->nfiles == 0 || ci == rp->ncm) {
+        fprintf(stderr, "tsdb: %s: the COMMIT at position %" PRIu64 " (flush through %" PRIu64 ", segment %" PRIx64 ") is "
+                        "not one this replica can apply\n", db->dir, wr->fno, c->flush_through, seq);
+        return TSDB_ERR_CORRUPT;
+    }
+    int rc = 0;
+    if (eng_test_mutant != MUT_REPLICA_NO_COMMIT_FLUSH)
+        rc = replica_flush(db); /* every sealed memtable (the leader flushed through F before it wrote) is in parts */
+    size_t n = c->nfiles;
+    part **ps = calloc(n, sizeof *ps);
+    if (!ps)
+        return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        const struct rcf *f = &rp->cm[ci].f[i];
+        char sp[40], tp[64];
+        stage_path(sp, sizeof sp, f->key);
+        snprintf(tp, sizeof tp, "tmp_0_%" PRIu64 ".part", f->key);
+        uint8_t *fb;
+        size_t flen;
+        if ((rc = read_file(db->dirfd, sp, &fb, &flen)) != 0) {
+            fprintf(stderr, "tsdb: %s: staged file %s of the COMMIT at position %" PRIu64 " is not readable\n", db->dir, sp,
+                    wr->fno);
+            break;
+        }
+        bool good = flen == f->size && xxh64(fb, flen, 0) == f->xxh;
+        free(fb);
+        if (!good) {
+            fprintf(stderr, "tsdb: %s: staged file %s does not match the COMMIT at position %" PRIu64 "\n", db->dir, sp,
+                    wr->fno);
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        unlinkat(db->dirfd, tp, 0);
+        if (linkat(db->dirfd, sp, db->dirfd, tp, 0) != 0) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        part *p;
+        if ((rc = part_open_as(db->dirfd, tp, f->name, db->opt.pin_index, db->parts_v8, &p)) != 0)
+            break;
+        ps[i] = p;
+        mk_file mf;
+        size_t pos = 0;
+        uint64_t hc = 0;
+        for (size_t k = 0; k <= i && mk_file_next(c, &pos, &mf); k++)
+            hc = mf.header_check;
+        if (p->index_hash != hc || p->grows != db->granule_rows) {
+            fprintf(stderr, "tsdb: %s: staged file %s does not have the header the COMMIT at position %" PRIu64 " names\n",
+                    db->dir, sp, wr->fno);
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        p->verify = db->opt.verify_checksums;
+        snprintf(p->pending, sizeof p->pending, "%s", tp);
+    }
+    if (rc == 0) {
+        pthread_mutex_lock(&db->publish_lock);
+        rp->rs.doing_pos = last;
+        rp->rs.doing_b0 = atomic_load(&db->next_block);
+        rp->rs.doing_n = n;
+        rc = rs_save(db, rp);
+        if (rc == 0)
+            rc = parts_commit(db, ps, n);
+        if (rc == 0) {
+            pthread_mutex_lock(&db->lock);
+            for (size_t i = 0; i < n; i++)
+                db_parts_insert_locked(db, ps[i]);
+            pthread_cond_signal(&db->merge_cv);
+            pthread_mutex_unlock(&db->lock);
+        }
+        pthread_mutex_unlock(&db->publish_lock);
+    }
+    if (rc) {
+        for (size_t i = 0; i < n; i++)
+            if (ps[i])
+                part_unref(ps[i]); /* the files stay: the engine fails, the next open sorts them out */
+        free(ps);
+        return rc;
+    }
+    free(ps);
+    rc = manifest_publish(db);
+    rp->rs.done = last;
+    rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
+    if (rc == 0)
+        rc = rs_save(db, rp);
+    if (rc == 0)
+        cm_remove(db, rp, ci);
+    return rc;
+}
+
+static int apply_drop(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr, const mk *m)
+{
+    (void)seq;
+    uint64_t last = wr->fno + wr->span - 1;
+    int64_t ts = m->u.drop.dropped_before;
+    if (m->u.drop.partition != MK_NO_PARTITION) {
+        fprintf(stderr, "tsdb: %s: a DROP of one partition (position %" PRIu64 ") is not applied by this replica\n", db->dir,
+                wr->fno);
+        return TSDB_ERR_INVALID;
+    }
+    if (last <= rp->rs.done)
+        return 0;
+    pthread_mutex_lock(&db->buf_lock);
+    size_t rows = db->active->rows;
+    pthread_mutex_unlock(&db->buf_lock);
+    if (rows != 0) { /* the leader's marker begins its segment: rows before it would be dropped with it or not by chance */
+        fprintf(stderr, "tsdb: %s: the DROP at position %" PRIu64 " found rows of its own segment before it\n", db->dir,
+                wr->fno);
+        return TSDB_ERR_CORRUPT;
+    }
+    int rc = 0;
+    if (eng_test_mutant != MUT_REPLICA_NO_DROP_FLUSH)
+        rc = replica_flush(db);
+    if (rc == 0)
+        rc = drop_retire(db, ts);
+    if (rc)
+        return rc;
+    rp->rs.done = last;
+    struct rdrop *d = realloc(rp->rs.drops, (rp->rs.ndrops + 1) * sizeof *d);
+    if (!d)
+        return TSDB_ERR_NOMEM;
+    rp->rs.drops = d;
+    rp->rs.drops[rp->rs.ndrops++] = (struct rdrop){last, ts};
+    rs_prune_drops(rp);
+    return rs_save(db, rp);
+}
+
+/* The open: the staged files that are on disk, the COMMIT markers above RSTATE's `done` (their files must be staged
+ * before their positions are durable), and the staged files no marker names (shipped for a marker that never arrived:
+ * the leader sends them again) removed. */
+static int open_scan(eng *db, struct replica *rp)
+{
+    DIR *d = fdopendir(dup(db->dirfd));
+    if (!d)
+        return TSDB_ERR_IO;
+    rewinddir(d);
+    struct dirent *e;
+    int rc = 0;
+    for (errno = 0; rc == 0 && (e = readdir(d)); errno = 0) {
+        uint64_t key;
+        int consumed = 0;
+        if (strncmp(e->d_name, "stage_", 6) != 0 || sscanf(e->d_name, "stage_%" SCNx64 ".part%n", &key, &consumed) != 1 ||
+            e->d_name[consumed])
+            continue;
+        uint8_t *fb;
+        size_t flen;
+        if ((rc = read_file(db->dirfd, e->d_name, &fb, &flen)) == 0) {
+            rc = stg_put(rp, key, flen, xxh64(fb, flen, 0));
+            free(fb);
+        }
+    }
+    if (errno != 0 && rc == 0)
+        rc = TSDB_ERR_IO;
+    closedir(d);
+    for (size_t k = 0; k < rp->nsegs && rc == 0; k++) {
+        char name[64];
+        uint8_t *fb;
+        size_t flen;
+        wal_name(name, sizeof name, rp->segs[k].seq);
+        if ((rc = read_file(db->dirfd, name, &fb, &flen)) != 0)
+            break;
+        for (size_t pos = 0; pos < flen && pos < rp->segs[k].len && rc == 0;) {
+            wal_rec wr;
+            size_t sz = wal_record(fb + pos, flen - pos, rp->segs[k].seq, pos, &wr);
+            if (sz == 0)
+                break;
+            mk m;
+            if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_COMMIT && (rc = mk_decode(wr.payload, wr.n, &m)) == 0 &&
+                m.type == MK_COMMIT)
+                rc = cm_add(rp, &wr, &m);
+            pos += sz;
+        }
+        free(fb);
+    }
+    for (size_t i = rp->nstg; rc == 0 && i-- > 0;) {
+        bool named = false;
+        for (size_t c = 0; c < rp->ncm && !named; c++)
+            for (uint32_t f = 0; f < rp->cm[c].nf; f++)
+                named |= rp->cm[c].f[f].key == rp->stg[i].key;
+        if (!named) {
+            char sp[40];
+            stage_path(sp, sizeof sp, rp->stg[i].key);
+            unlinkat(db->dirfd, sp, 0);
+            stg_del(rp, rp->stg[i].key);
+        }
+    }
+    uint64_t cap = hold_cap(rp);
+    if (rc == 0 && rp->durable_next > cap)
+        rp->durable_next = cap;
+    return rc;
+}
+
 /* ------------------------------------------------------------------ apply */
 
 static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr, uint64_t pmax)
@@ -524,6 +1077,15 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
     const uint8_t *r = wr->payload;
     size_t k = 0;
     int rc = 0;
+    /* rows older than a DROP that this replica applied already, in partitions that DROP retired, must not come back
+     * from a segment a replay reads again (the part that would have said so is gone with the partition) */
+    int64_t dmax = INT64_MIN;
+    bool dropped = false;
+    for (size_t i = 0; i < rp->rs.ndrops && eng_test_mutant != MUT_REPLICA_NO_DROP_SKIP; i++)
+        if (wr->fno + wr->span - 1 < rp->rs.drops[i].pos) {
+            dmax = dropped ? MAX(dmax, rp->rs.drops[i].until) : rp->rs.drops[i].until;
+            dropped = true;
+        }
     for (size_t i = 0; i < wr->n; i++, r += WAL_ROW) {
         uint32_t id;
         int64_t t;
@@ -534,6 +1096,12 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
                             "SERIES lacks\n", db->dir, wr->fno, id);
             free(heap);
             return TSDB_ERR_CORRUPT;
+        }
+        if (dropped) {
+            int64_t lo, end;
+            partition_range(db, partition_of(db, id, t), &lo, &end);
+            if (end <= dmax)
+                continue;
         }
         if (seq <= pmax) { /* a replay: rows a part of this segment holds already must not come back */
             int64_t p = partition_of(db, id, t);
@@ -567,7 +1135,6 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
             eng_fail(db, "applying a committed record to the memtable", ENOMEM);
     }
     free(heap);
-    (void)rp;
     return rc;
 }
 
@@ -579,7 +1146,6 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
  * and unknown ones are skipped, as every replay does. */
 static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr)
 {
-    (void)seq;
     mk m;
     int rc = mk_decode(wr->payload, wr->n, &m);
     if (rc != 0) {
@@ -606,12 +1172,10 @@ static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec
     case MK_CLASS:
         return cls_apply(db, m.u.cls.series, (int)m.u.cls.cls, m.u.cls.at, m.u.cls.record_off);
     case MK_COMMIT:
+        return apply_commit(db, rp, seq, wr, &m);
     case MK_DROP:
-        fprintf(stderr, "tsdb: %s: the %s marker at position %" PRIu64 " is not applied by this replica yet\n", db->dir,
-                mk_type_name(m.type), wr->fno);
-        return TSDB_ERR_INVALID;
+        return apply_drop(db, rp, seq, wr, &m);
     default:
-        (void)rp;
         return 0; /* EPOCH (step 4), the reserved types and unknown ones */
     }
 }
@@ -808,7 +1372,7 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
                 eng_fail(db, "replica WAL fdatasync", errno);
                 rc = TSDB_ERR_IO;
             } else {
-                rp->durable_next = MAX(rp->durable_next, first);
+                durable_raise(rp, first);
                 close(db->wal_fd);
                 db->wal_fd = -1;
             }
@@ -838,6 +1402,18 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
         s->len = db->wal_off;
         pthread_mutex_unlock(&rp->segs_mu);
         atomic_fetch_add_explicit(&db->st_wal_bytes, len, memory_order_relaxed);
+        /* COMMIT markers among them: their files must be staged before their positions count as durable */
+        for (size_t pos = 0; pos < len && rc == 0;) {
+            wal_rec wr;
+            size_t sz = wal_record(p + pos, len - pos, seq, off + pos, &wr);
+            mk m;
+            if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_COMMIT && (rc = mk_decode(wr.payload, wr.n, &m)) == 0 &&
+                m.type == MK_COMMIT)
+                rc = cm_add(rp, &wr, &m);
+            pos += sz;
+        }
+        if (rc)
+            eng_fail(db, "a COMMIT marker that cannot be tracked", EIO);
     }
     pthread_mutex_unlock(&rp->mu);
     return rc;
@@ -875,7 +1451,7 @@ int replica_sync(eng *db)
     /* gaps 9 and 12: a sync that began before a cut does not cover what was written again after it */
     uint64_t end = rp->cut_gen == gen || eng_test_mutant == MUT_REPLICA_NO_CUT_GEN ? target : MIN(target, rp->last_cut_next);
     end = MIN(end, db->fno_next);
-    rp->durable_next = MAX(rp->durable_next, end);
+    durable_raise(rp, end);
     pthread_mutex_unlock(&rp->mu);
     return 0;
 }
@@ -1008,6 +1584,9 @@ int replica_cut(eng *db, uint64_t last)
             rp->segs[t].len = off_cut;
         pthread_mutex_unlock(&rp->segs_mu);
         db->fno_next = last + 1;
+        for (size_t i = rp->ncm; i-- > 0;) /* the COMMIT markers above the cut never happened: their files go */
+            if (rp->cm[i].first > last)
+                cm_remove(db, rp, i);
         rp->durable_next = last + 1; /* what stays was synced (the cut's own sync, the rotations') */
         rp->cut_gen++;
         rp->last_cut_next = last + 1;
@@ -1211,10 +1790,18 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
             rc = TSDB_ERR_INVALID; /* not a pending part */
             break;
         }
-        mk_file f = {.name = p->pending, .name_len = (uint32_t)strlen(p->pending), .size = p->map_len,
+        int pid;
+        unsigned cnt;
+        char mname[96];
+        if (sscanf(p->pending, "tmp_%d_%u.part", &pid, &cnt) != 2) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        snprintf(mname, sizeof mname, "p%" PRId64 "_%d_%u_0.part", p->partition, pid, cnt);
+        mk_file f = {.name = mname, .name_len = (uint32_t)strlen(mname), .size = p->map_len,
                      .xxh64 = xxh64(p->map, p->map_len, 0), .header_check = p->index_hash};
         len += mk_file_put(files + len, &f);
-        rc = jr->ship(jr->ctx, db, p->pending, p->map_len);
+        rc = jr->ship(jr->ctx, db, p->pending, mname, p->map_len);
     }
     if (rc) {
         free(files);

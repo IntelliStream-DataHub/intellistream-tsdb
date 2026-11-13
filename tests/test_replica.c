@@ -1723,6 +1723,435 @@ static void case_power(void)
 }
 
 
+/* ------------------------------------------------------------ K: a leader engine with COMMIT and DROP markers
+ * The leader is a plain engine whose jr_ops (db->jr) ship its pending part files and wait for the replica to apply
+ * its markers; the transport reads the leader's segment files (a segment about to be unlinked is read first). The oracle
+ * is the leader's own answers: after every step the replica answers the same. */
+
+typedef struct xport {
+    eng *ld, *rep;
+    char ldir[PATH_MAX];
+    uint64_t cseq, coff;   /* what the replica has been handed of the leader's log */
+    bool withhold;         /* ship keeps the file instead of staging it */
+    bool noapply;          /* wait ships the log but the replica applies nothing */
+    uint8_t *held;         /* the last file shipped */
+    size_t held_len;
+    char held_name[64];
+    uint64_t saved;        /* the commit floor the "driver" saved */
+} xport;
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int xp_ship_logs(xport *x)
+{
+    if (!x->rep)
+        return 0;
+    uint64_t seqs[512];
+    size_t n = 0;
+    DIR *d = opendir(x->ldir);
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        uint64_t seq;
+        int consumed = 0;
+        if (wal_file_name(e->d_name) && sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &consumed) == 1 && n < 512)
+            seqs[n++] = seq;
+    }
+    if (d)
+        closedir(d);
+    qsort(seqs, n, sizeof *seqs, cmp_u64);
+    int dfd = open(x->ldir, O_RDONLY | O_DIRECTORY);
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        if (seqs[i] < x->cseq)
+            continue;
+        char nm[64];
+        uint8_t *b;
+        size_t len;
+        wal_name(nm, sizeof nm, seqs[i]);
+        if (read_file(dfd, nm, &b, &len) != 0)
+            continue; /* unlinked meanwhile */
+        uint64_t off = seqs[i] == x->cseq ? x->coff : 0;
+        if (len > off) {
+            rc = replica_append(x->rep, seqs[i], off, b + off, len - off);
+            x->cseq = seqs[i];
+            x->coff = len;
+        }
+        free(b);
+    }
+    close(dfd);
+    if (rc == 0)
+        rc = replica_sync(x->rep);
+    return rc;
+}
+
+static uint64_t ld_last(xport *x) { return x->ld->fno_next - 1; }
+
+static int xp_pump(xport *x, uint64_t commit)
+{
+    int rc = xp_ship_logs(x);
+    if (rc == 0 && x->rep && !x->noapply)
+        rc = replica_apply(x->rep, commit);
+    return rc;
+}
+
+static int xp_ship(void *ctx, eng *db, const char *name, const char *mname, uint64_t size)
+{
+    xport *x = ctx;
+    uint8_t *b;
+    size_t len;
+    if (read_file(db->dirfd, name, &b, &len) != 0 || len != size)
+        return TSDB_ERR_IO;
+    free(x->held);
+    x->held = b;
+    x->held_len = len;
+    snprintf(x->held_name, sizeof x->held_name, "%s", mname);
+    if (!x->rep || x->withhold)
+        return 0;
+    return replica_stage(x->rep, mname, b, len);
+}
+
+static int xp_wait(void *ctx, eng *db, uint64_t last)
+{
+    (void)db;
+    return xp_pump(ctx, last);
+}
+
+static void xp_seg_done(void *ctx, eng *db, uint64_t seq)
+{
+    (void)db, (void)seq;
+    xp_ship_logs(ctx); /* before the file goes */
+}
+
+static struct jr_ops XOPS;
+
+static void xp_open_leader(xport *x)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 0;
+    o.wal_max_batch_rows = 16; /* more rows than this go straight to parts: a COMMIT marker */
+    if (eng_open(x->ldir, &o, &x->ld) != 0)
+        exit(2);
+    XOPS = (struct jr_ops){.ctx = x, .ship = xp_ship, .wait = xp_wait, .seg_done = xp_seg_done};
+    x->ld->jr = &XOPS;
+}
+
+static bool eq_range(eng *a, eng *b, uint32_t s, int64_t lo, int64_t hi, const char *what)
+{
+    qctx qa = {.n = 0}, qb = {.n = 0};
+    int ra = eng_query_raw_ex(a, s, lo, hi, false, 0, qfn, &qa);
+    int rb = eng_query_raw_ex(b, s, lo, hi, false, 0, qfn, &qb);
+    if (ra != 0 || rb != 0) {
+        fprintf(stderr, "%s: series %u: query failed (%d, %d)\n", what, s, ra, rb);
+        return false;
+    }
+    if (qa.n != qb.n || memcmp(qa.ts, qb.ts, qa.n * sizeof qa.ts[0]) != 0 || memcmp(qa.v, qb.v, qa.n * sizeof qa.v[0]) != 0) {
+        fprintf(stderr, "%s: series %u: the leader has %zu rows, the replica %zu\n", what, s, qa.n, qb.n);
+        return false;
+    }
+    return true;
+}
+
+#define DAY_MS 86400000LL
+static bool xp_same(xport *x, const char *what)
+{
+    bool ok = true;
+    for (uint32_t s = 0; s < NS; s++)
+        ok &= eq_range(x->ld, x->rep, s, T0 - 1000, T0 + 1000LL * (NT + 1), what);
+    return ok;
+}
+
+static void xp_step(xport *x, const char *what)
+{
+    CHECK_EQ(xp_pump(x, ld_last(x)), 0);
+    CHECK(eng_check(x->rep) == 0);
+    CHECK_EQ(replica_applied_end(x->rep), ld_last(x));
+    CHECK(xp_same(x, what));
+}
+
+static void xp_rows(xport *x, uint32_t s, int t0, int n, float base)
+{
+    int64_t ts[NT];
+    float v[NT];
+    for (int i = 0; i < n; i++) {
+        ts[i] = T0 + 1000LL * (t0 + i);
+        v[i] = base + (float)i;
+    }
+    CHECK_EQ(eng_insert_series(x->ld, TSDB_FLOAT32, s, ts, v, (size_t)n), 0);
+}
+
+static void xp_replace(xport *x, uint32_t s, int a, int b, int n, float base)
+{
+    int64_t ts[NT];
+    float v[NT];
+    for (int i = 0; i < n; i++) {
+        ts[i] = T0 + 1000LL * (a + 2 * i);
+        v[i] = base + (float)i;
+    }
+    CHECK_EQ(eng_replace_range(x->ld, TSDB_FLOAT32, s, T0 + 1000LL * a, T0 + 1000LL * b, ts, v, (size_t)n), 0);
+}
+
+static void xp_start(xport *x, const char *name)
+{
+    char rd[PATH_MAX];
+    memset(x, 0, sizeof *x);
+    char ld[PATH_MAX];
+    fresh(ld, name);
+    snprintf(x->ldir, sizeof x->ldir, "%s", ld);
+    snprintf(rd, sizeof rd, "%s_r", ld);
+    sh("rm -rf '%s' && cp -a '%s' '%s'", rd, ld, rd);
+    CHECK_EQ(open_replica(rd, 0, &x->rep), 0);
+    xp_open_leader(x);
+}
+
+static void xp_reopen(xport *x, const char *rd, uint64_t floor)
+{
+    eng_close(x->rep);
+    x->rep = NULL;
+    CHECK_EQ(open_replica(rd, floor, &x->rep), 0);
+}
+
+static void xp_stop(xport *x)
+{
+    eng_close(x->ld);
+    if (x->rep)
+        eng_close(x->rep);
+    free(x->held);
+}
+
+static void rdir(char *out, size_t cap, const xport *x) { snprintf(out, cap, "%s_r", x->ldir); }
+
+static void case_commit(void)
+{
+    xport x;
+    char rd[PATH_MAX];
+    xp_start(&x, "kc");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100), xp_rows(&x, 1, 0, 5, 300);
+    xp_step(&x, "K: small rows");
+    xp_rows(&x, 0, 5, 40, 2000); /* a large insert over rows still in the memtable */
+    xp_step(&x, "K: large insert");
+    xp_rows(&x, 0, 40, 10, 3000); /* a small write after it wins */
+    xp_step(&x, "K: small after large");
+    CHECK_EQ(eng_delete_range(x.ld, 1, T0 + 1000, T0 + 3000), 0);
+    xp_step(&x, "K: delete");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    xp_rows(&x, 1, 10, 5, 400);
+    xp_step(&x, "K: flush");
+    xp_rows(&x, 1, 0, 30, 5000);
+    xp_replace(&x, 0, 10, 20, 5, 7000);
+    xp_step(&x, "K: large and replace");
+    CHECK_EQ(count_files(rd, "stage_"), 0); /* applied: the staged files are gone */
+    CHECK_EQ(count_files(rd, "tmp_"), 0);
+    /* a restart replays the log from the segments it holds: the COMMITs are not applied twice */
+    xp_reopen(&x, rd, 0);
+    xp_step(&x, "K: reopen floor 0");
+    CHECK_EQ(replica_floor_saved(x.rep, replica_applied_end(x.rep)), 0);
+    xp_reopen(&x, rd, replica_applied_end(x.rep));
+    xp_rows(&x, 0, 20, 30, 9000);
+    xp_step(&x, "K: reopen at the end");
+    CHECK_EQ(count_files(rd, "stage_"), 0);
+    xp_stop(&x);
+}
+
+/* a COMMIT whose files are not staged: not acknowledged, not applied, until they are */
+static void case_commit_hold(void)
+{
+    xport x;
+    char rd[PATH_MAX], name[64];
+    uint64_t sz;
+    xp_start(&x, "kh");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "K: before");
+    x.withhold = true;
+    xp_rows(&x, 0, 5, 40, 2000);
+    uint64_t last = ld_last(&x);
+    CHECK(replica_durable_end(x.rep) < last);
+    CHECK(replica_applied_end(x.rep) < last);
+    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 1);
+    CHECK(strcmp(name, x.held_name) == 0);
+    CHECK_EQ(sz, x.held_len);
+    {
+        qctx q = {.n = 0};
+        CHECK_EQ(eng_query_raw_ex(x.rep, 0, T0 - 1000, T0 + 1000LL * (NT + 1), false, 0, qfn, &q), 0);
+        CHECK_EQ(q.n, 10); /* the insert is not shown without its file */
+    }
+    x.withhold = false;
+    /* a restart with the marker in the log and no file: still held */
+    xp_reopen(&x, rd, 0);
+    CHECK(replica_durable_end(x.rep) < last);
+    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 1);
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
+    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 0);
+    xp_step(&x, "K: staged late");
+    /* a file with the wrong content is no file */
+    x.withhold = true;
+    xp_rows(&x, 1, 0, 40, 4000);
+    uint8_t *bad = malloc(x.held_len);
+    memcpy(bad, x.held, x.held_len);
+    bad[x.held_len / 2] ^= 1;
+    CHECK_EQ(replica_stage(x.rep, x.held_name, bad, x.held_len), 0);
+    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 1);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK(replica_durable_end(x.rep) < ld_last(&x));
+    free(bad);
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
+    x.withhold = false;
+    xp_step(&x, "K: staged right");
+    xp_stop(&x);
+}
+
+/* a cut removes the files of the markers it removes */
+static void case_commit_cut(void)
+{
+    xport x;
+    char rd[PATH_MAX], name[64];
+    uint64_t sz;
+    xp_start(&x, "kk");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "K: before");
+    x.noapply = true;
+    xp_rows(&x, 0, 5, 40, 2000);
+    uint64_t last = ld_last(&x);
+    CHECK_EQ(replica_durable_end(x.rep), last); /* staged and appended: acknowledged */
+    CHECK_EQ(count_files(rd, "stage_"), 1);
+    CHECK_EQ(replica_cut(x.rep, last - 1), 0);
+    CHECK_EQ(count_files(rd, "stage_"), 0);
+    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 0);
+    CHECK_EQ(replica_log_end(x.rep), last - 1);
+    /* the same marker again (a new leader would send another; here the old one is sent again) */
+    x.coff = 0;
+    {
+        char p[PATH_MAX];
+        DIR *d = opendir(rd);
+        struct dirent *e;
+        uint64_t best = 0;
+        while (d && (e = readdir(d))) {
+            uint64_t seq;
+            int c = 0;
+            if (wal_file_name(e->d_name) && sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &c) == 1 && seq >= best)
+                best = seq;
+        }
+        if (d)
+            closedir(d);
+        char nm[64];
+        wal_name(nm, sizeof nm, best);
+        snprintf(p, sizeof p, "%s/%s", rd, nm);
+        struct stat st;
+        CHECK_EQ(stat(p, &st), 0);
+        x.cseq = best;
+        x.coff = (uint64_t)st.st_size;
+    }
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 1);
+    CHECK(replica_durable_end(x.rep) < last);
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
+    x.noapply = false;
+    xp_step(&x, "K: re-sent");
+    xp_stop(&x);
+}
+
+/* DROP: the retired partitions stay retired when a restart reads the log again */
+static void case_drop(void)
+{
+    xport x;
+    char rd[PATH_MAX];
+    xp_start(&x, "kd");
+    rdir(rd, sizeof rd, &x);
+    int64_t far = T0 + 40 * DAY_MS;
+    xp_rows(&x, 0, 0, 10, 100);
+    for (int i = 0; i < 5; i++) {
+        float v = (float)i;
+        int64_t t = far + 1000LL * i;
+        CHECK_EQ(eng_insert_series(x.ld, TSDB_FLOAT32, 1, &t, &v, 1), 0);
+    }
+    xp_step(&x, "K: rows");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    xp_rows(&x, 0, 20, 5, 500);
+    xp_step(&x, "K: flushed");
+    CHECK_EQ(eng_drop_before(x.ld, T0 + 10 * DAY_MS), 0);
+    xp_step(&x, "K: drop");
+    CHECK(eq_range(x.ld, x.rep, 1, far - 1000, far + 10000, "K: far series"));
+    qctx q0 = {.n = 0}, q1 = {.n = 0};
+    CHECK_EQ(eng_query_raw_ex(x.ld, 0, T0 - 1000, T0 + 1000LL * (NT + 1), false, 0, qfn, &q0), 0);
+    CHECK_EQ(eng_query_raw_ex(x.ld, 1, far - 1000, far + 10000, false, 0, qfn, &q1), 0);
+    CHECK_EQ(q0.n, 0);
+    CHECK_EQ(q1.n, 5);
+    xp_reopen(&x, rd, 0);
+    xp_step(&x, "K: reopen after the drop");
+    CHECK(eq_range(x.ld, x.rep, 1, far - 1000, far + 10000, "K: far series after reopen"));
+    xp_rows(&x, 1, 0, 3, 77); /* rows below the drop are refused or hidden the same way on both: still equal */
+    xp_stop(&x);
+}
+
+static int rnd(unsigned *r, int n)
+{
+    *r = *r * 1103515245u + 12345u;
+    return (int)((*r >> 16) % (unsigned)(n > 0 ? n : 1));
+}
+
+static void case_commit_random(unsigned seed)
+{
+    xport x;
+    char rd[PATH_MAX], nm[32];
+    unsigned rng = seed * 2654435761u + 1;
+#define RND(n) rnd(&rng, (n))
+    snprintf(nm, sizeof nm, "kr%u", seed);
+    xp_start(&x, nm);
+    rdir(rd, sizeof rd, &x);
+    for (int step = 0; step < 90; step++) {
+        uint32_t s = (uint32_t)RND(NS);
+        float base = (float)(step * 100);
+        switch (RND(9)) {
+        case 0:
+        case 1:
+            xp_rows(&x, s, RND(NT - 12), 1 + RND(10), base);
+            break;
+        case 2:
+        case 3: /* more rows than a WAL batch takes: a COMMIT */
+            xp_rows(&x, s, RND(NT - 40), 17 + RND(24), base);
+            break;
+        case 4: {
+            int a = RND(NT - 4), b = a + 1 + RND(NT - a - 1);
+            CHECK_EQ(eng_delete_range(x.ld, s, T0 + 1000LL * a, T0 + 1000LL * b), 0);
+            break;
+        }
+        case 5: {
+            int span = 2 * (1 + RND(8));
+            xp_replace(&x, s, 10, 10 + span, 1 + RND(span / 2 > 4 ? 4 : span / 2), base);
+            break;
+        }
+        case 6:
+            CHECK_EQ(eng_flush(x.ld), 0);
+            break;
+        case 7:
+            if (x.rep) {
+                CHECK_EQ(replica_floor_saved(x.rep, replica_applied_end(x.rep)), 0);
+                x.saved = replica_applied_end(x.rep);
+            }
+            break;
+        default:
+            xp_reopen(&x, rd, RND(2) ? x.saved : 0);
+            break;
+        }
+        char what[64];
+        snprintf(what, sizeof what, "K random %u step %d", seed, step);
+        xp_step(&x, what);
+        if (failures)
+            break;
+    }
+    xp_stop(&x);
+#undef RND
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -1746,7 +2175,14 @@ static int mutant_of(const char *m)
                         : strcmp(m, "commitclock") == 0 ? MUT_REPLICA_COMMIT_CLOCK
                         : strcmp(m, "sealedrule") == 0 ? MUT_REPLICA_NO_SEALED_RULE
                         : strcmp(m, "cutgen") == 0 ? MUT_REPLICA_NO_CUT_GEN
-                        : strcmp(m, "earlyseal") == 0 ? MUT_REPLICA_EARLY_SEAL : 0;
+                        : strcmp(m, "earlyseal") == 0 ? MUT_REPLICA_EARLY_SEAL
+                        : strcmp(m, "nostagehold") == 0 ? MUT_REPLICA_NO_STAGE_HOLD
+                        : strcmp(m, "nocommitflush") == 0 ? MUT_REPLICA_NO_COMMIT_FLUSH
+                        : strcmp(m, "nodoneskip") == 0 ? MUT_REPLICA_NO_DONE_SKIP
+                        : strcmp(m, "keepstaged") == 0 ? MUT_REPLICA_KEEP_STAGED
+                        : strcmp(m, "nodropskip") == 0 ? MUT_REPLICA_NO_DROP_SKIP
+                        : strcmp(m, "nodropflush") == 0 ? MUT_REPLICA_NO_DROP_FLUSH
+                        : strcmp(m, "nostagesync") == 0 ? MUT_REPLICA_NO_STAGE_SYNC : 0;
 }
 
 int main(int argc, char **argv)
@@ -1793,6 +2229,12 @@ int main(int argc, char **argv)
     case_read();
     case_sync_cut();
     case_sealed_open();
+    case_commit();
+    case_commit_hold();
+    case_commit_cut();
+    case_drop();
+    for (unsigned seed = 1; seed <= 12; seed++)
+        case_commit_random(seed);
     case_power();
     for (unsigned seed = 1; seed <= 20; seed++) {
         int f0 = failures;

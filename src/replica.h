@@ -42,6 +42,14 @@ int replica_floor_saved(struct eng *db, uint64_t floor);
  * segments are removed, the cut is durable before it returns. TSDB_ERR_CORRUPT (nothing changed) when `last` is below
  * the applied end (the core never asks: damage or a bug) or is not a record end. */
 int replica_cut(struct eng *db, uint64_t last);
+/* The leader shipped the pending part file `name` (its tmp name, `len` bytes) for a COMMIT marker: it is kept, synced
+ * (file and directory), until the marker is applied or cut. The positions of a COMMIT marker are not durable here (not
+ * acknowledged, not applied) until every file it names is staged with the size and xxh64 it says: call replica_sync
+ * after the last replica_stage of a marker. */
+int replica_stage(struct eng *db, const char *name, const void *buf, size_t len);
+/* The first file of an appended, unapplied COMMIT marker that is not staged (or staged wrongly): its leader name and
+ * size, for the driver to fetch and replica_stage. Returns 1, or 0 when none is missing. */
+int replica_missing(struct eng *db, char *name, size_t cap, uint64_t *size);
 /* The records from the one that starts at position `from` (a record start; the end of the log + 1 gives len 0):
  * whole records of one segment, at most cap bytes unless the first one is larger (then it alone). *seq and *off say
  * where they lie, *last the last position covered. TSDB_ERR_NOTFOUND: the log no longer holds `from` (it is in
