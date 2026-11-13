@@ -656,6 +656,31 @@ thread; the longer run with a warm-up does not repeat it, so it was an order eff
 tenants: 20.1 MB (2.01 bytes a series), filled 0.1 s after the last creation; created in runs per tenant: 2.0 MB
 (0.20 bytes a series, whole pages of one tenant are only a table entry). Planning number: 2 GB per 10^9 series.
 
+**Step 5's per-request counting in tsdbd** (2026-11-13, Intel i5-13400, a second machine that ran nothing else,
+governor `performance`, 5 rounds that alternate the order). tsdbd has no switch for the by-caller counters, so "on" is
+main with the step merged (c2fb40a) and "off" its first parent (3f71320), each built from `git archive` with the
+Makefile's optimized flags; `git diff OFF ON -- src` is empty, so the engine is the same. Both run with login on as a
+non-superuser with `read,insert` on `all` (it counts under "(none)": `tsdbc-bench` names have no common prefix; the
+work of `tn_count` does not depend on the slot), the same database (100 x 1 M rows, optimized, copied per side) and
+one `tsdbc-bench` binary as the client. 8 s per class; queries/s, mean of 5:
+
+| class | on | off | on / off |
+|---|---:|---:|---:|
+| raw 3600 samples, 1 connection | 26,582 | 26,339 | +0.9 % |
+| agg 86,400 in buckets of 300, 1 connection | 11,591 | 11,692 | -0.9 % |
+| agg 604,800 in buckets of 3600, 1 connection | 10,874 | 10,969 | -0.9 % |
+| twa 604,800 in buckets of 3600, 1 connection | 3,852 | 3,882 | -0.8 % |
+| whole range, 1 bucket, 1 connection | 47,502 | 47,266 | +0.5 % |
+| raw 3600 samples, 32 connections | 245,784 | 246,423 | -0.3 % |
+| agg 86,400 in buckets of 300, 32 connections | 43,678 | 43,752 | -0.2 % |
+| agg 604,800 in buckets of 3600, 32 connections | 24,358 | 24,354 | +0.0 % |
+| twa 604,800 in buckets of 3600, 32 connections | 5,356 | 5,322 | +0.6 % |
+| whole range, 1 bucket, 32 connections | 421,210 | 423,023 | -0.4 % |
+| load over 4 connections, M rows/s | 72.62 | 72.68 | -0.1 % |
+
+Every class is within 1 % and the signs go both ways: the counting costs nothing measurable, and the budget holds.
+Not measured: p99 (`tsdbc-bench query` prints none) and a user inside a tenant prefix.
+
 ## 9. Build plan
 
 | Step | What | Gate | Effort (days) |
