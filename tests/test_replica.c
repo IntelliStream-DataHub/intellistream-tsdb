@@ -1022,6 +1022,24 @@ static void log_other_name(leader *l) { m_series(l, 0, "s0", TSDB_FLOAT32), m_se
 static void log_other_type(leader *l) { m_series(l, 0, "s0", TSDB_FLOAT32), m_series(l, 0, "s0", TSDB_INT64); }
 static void log_state_gap(leader *l) { m_state(l, 3, "RUN"); }
 static void log_ret_gap(leader *l) { m_series(l, 0, "s0", TSDB_FLOAT32), m_ret(l, 0, 1000, 16); }
+static lrec *m_epoch(leader *l, uint64_t epoch)
+{
+    mk m = {.type = MK_EPOCH};
+    m.u.epoch = (mk_epoch){.epoch = epoch, .owner = "n1", .owner_len = 2};
+    return leader_marker(l, &m, T0 + (int64_t)l->next);
+}
+static void log_epoch_ok(leader *l)
+{
+    m_series(l, 0, "s0", TSDB_FLOAT32);
+    l->seq = (uint64_t)1 << 40, l->off = 0;
+    m_epoch(l, 1);
+}
+static void log_epoch_seg(leader *l) /* the marker's epoch is not its segment's */
+{
+    m_series(l, 0, "s0", TSDB_FLOAT32);
+    l->seq = (uint64_t)3 << 40, l->off = 0;
+    m_epoch(l, 2);
+}
 static void log_class_gap(leader *l) { m_series(l, 0, "s0", TSDB_FLOAT32), m_class(l, 0, 1, T0, 24); }
 
 static void case_dicts(void)
@@ -1085,6 +1103,10 @@ static void case_dicts(void)
     CHECK_EQ(run_log("g5", log_ret_gap, &failed), TSDB_ERR_CORRUPT);
     CHECK(failed);
     CHECK_EQ(run_log("g6", log_class_gap, &failed), TSDB_ERR_CORRUPT);
+    CHECK(failed);
+    CHECK_EQ(run_log("g7", log_epoch_ok, &failed), 0);
+    CHECK(!failed);
+    CHECK_EQ(run_log("g8", log_epoch_seg, &failed), TSDB_ERR_CORRUPT);
     CHECK(failed);
 }
 
@@ -2097,6 +2119,158 @@ static void case_drop(void)
     xp_stop(&x);
 }
 
+/* the log of src from the end of dst's on (a new leader sending its log to a member: 6.2 step 3) */
+static int ship_from(eng *src, eng *dst)
+{
+    uint64_t from = replica_log_end(dst) + 1;
+    for (;;) {
+        uint8_t *b;
+        size_t len;
+        uint64_t seq, off, last;
+        int rc = replica_read(src, from, &b, &len, (size_t)1 << 20, &seq, &off, &last);
+        if (rc) {
+            free(b);
+            return rc;
+        }
+        if (len == 0) {
+            free(b);
+            break;
+        }
+        rc = replica_append(dst, seq, off, b, len);
+        free(b);
+        if (rc)
+            return rc;
+        from = last + 1;
+    }
+    return replica_sync(dst);
+}
+
+/* Promotion: the replica with the log (tail included) writes an EPOCH marker, the commit point passes it, and the engine
+ * is a writer that continues the numbers; the other member follows it. variant 0: nothing above the commit point, 1: a
+ * tail of small rows, 2: a tail with a large insert (a COMMIT with a staged file). The history holds a drop, whose rows
+ * the replica's retained segments still hold: a writer that replayed them would bring them back. */
+static void case_promote(int variant)
+{
+    xport x;
+    char rd[PATH_MAX], bd[PATH_MAX], nm[32];
+    snprintf(nm, sizeof nm, "kp%d", variant);
+    xp_start(&x, nm);
+    rdir(rd, sizeof rd, &x);
+    snprintf(bd, sizeof bd, "%s_b", x.ldir);
+    int64_t far = T0 + 40 * DAY_MS;
+    xp_rows(&x, 0, 0, 10, 100);
+    for (int i = 0; i < 5; i++) {
+        float v = (float)i;
+        int64_t t = far + 1000LL * i;
+        CHECK_EQ(eng_insert_series(x.ld, TSDB_FLOAT32, 1, &t, &v, 1), 0);
+    }
+    xp_step(&x, "P: rows");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    xp_rows(&x, 0, 20, 5, 500);
+    xp_step(&x, "P: flushed");
+    CHECK_EQ(eng_drop_before(x.ld, T0 + 10 * DAY_MS), 0);
+    xp_step(&x, "P: drop");
+    xp_rows(&x, 0, 30, 40, 2000); /* large */
+    xp_step(&x, "P: large");
+    if (variant >= 1) {
+        x.noapply = true;
+        xp_rows(&x, 0, 5, 3, 900);
+        if (variant >= 2)
+            xp_rows(&x, 0, 10, 40, 4000);
+        CHECK_EQ(xp_ship_logs(&x), 0); /* the tail reaches the replica, and is not applied */
+    }
+    sh("rm -rf '%s' && cp -a '%s' '%s'", bd, rd, bd);
+    eng *b = NULL;
+    CHECK_EQ(open_replica(bd, 0, &b), 0);
+    uint64_t lastpos = ld_last(&x), pos = 0;
+    CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), 0);
+    CHECK_EQ(pos, lastpos + 1);
+    CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), TSDB_ERR_INVALID); /* the same epoch again */
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(ship_from(x.rep, b), 0);
+    CHECK_EQ(replica_log_end(b), pos);
+    eng *n = NULL;
+    if (variant >= 1) { /* the marker is not committed yet: the tail is not applied */
+        CHECK_EQ(replica_promote(&x.rep, pos, &n), TSDB_ERR_INVALID);
+        CHECK(x.rep != NULL && n == NULL);
+        if (!x.rep)
+            exit(2);
+    }
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    CHECK_EQ(replica_apply(b, pos), 0);
+    CHECK_EQ(replica_applied_end(x.rep), pos);
+    for (uint32_t s = 0; s < NS; s++) {
+        CHECK(eq_range(x.ld, x.rep, s, T0 - 1000, far + 10000, "P: promoted candidate"));
+        CHECK(eq_range(x.ld, b, s, T0 - 1000, far + 10000, "P: other member"));
+    }
+    CHECK_EQ(replica_promote(&x.rep, pos, &n), 0);
+    CHECK(x.rep == NULL && n != NULL);
+    if (!n)
+        exit(2);
+    CHECK_EQ(eng_check(n), 0);
+    CHECK_EQ(n->fno_next, pos + 1); /* the numbers go on */
+    for (uint32_t s = 0; s < NS; s++)
+        CHECK(eq_range(x.ld, n, s, T0 - 1000, far + 10000, "P: new writer"));
+    /* the old leader is gone: the writer leads, the other member follows */
+    eng_close(x.ld);
+    x.ld = n;
+    snprintf(x.ldir, sizeof x.ldir, "%s", rd);
+    x.rep = b;
+    x.cseq = x.coff = 0;
+    x.noapply = false;
+    n->opt.wal_max_batch_rows = 16;
+    n->jr = &XOPS;
+    xp_rows(&x, 0, 50, 6, 70);
+    xp_step(&x, "P: small after promotion");
+    xp_rows(&x, 1, 0, 40, 800);
+    xp_step(&x, "P: large after promotion");
+    CHECK_EQ(eng_delete_range(x.ld, 0, T0 + 1000, T0 + 3000), 0);
+    xp_step(&x, "P: delete after promotion");
+    xp_rows(&x, 0, 40, 10, 3000);
+    CHECK_EQ(eng_drop_before(x.ld, T0 + 20 * DAY_MS), 0);
+    xp_step(&x, "P: drop after promotion");
+    for (uint32_t s = 0; s < NS; s++)
+        CHECK(eq_range(x.ld, x.rep, s, T0 - 1000, far + 10000, "P: far"));
+    xp_reopen(&x, bd, 0);
+    xp_step(&x, "P: member reopened");
+    xp_stop(&x);
+}
+
+static void promote_hook_exit(void) { _exit(77); }
+
+/* the process dies after promotion removed the old segments and before it opened the writer: the rows the replica held
+ * are in parts, so a writer's open of the directory has what the old leader had (the order flush, then unlink) */
+static void case_promote_crash(void)
+{
+    char ld[PATH_MAX], rd[PATH_MAX];
+    pid_t pid = fork();
+    if (pid == 0) {
+        replica_test_promote_hook = promote_hook_exit;
+        case_promote(3);
+        _exit(1); /* the hook did not fire */
+    }
+    int st = 0;
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 77);
+    snprintf(ld, sizeof ld, "%s/kp3", S);
+    snprintf(rd, sizeof rd, "%s/kp3_r", S);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 0;
+    eng *a = NULL, *b = NULL;
+    CHECK_EQ(eng_open(ld, &o, &a), 0);
+    CHECK_EQ(eng_open(rd, &o, &b), 0);
+    if (a && b)
+        for (uint32_t s = 0; s < NS; s++)
+            CHECK(eq_range(a, b, s, T0 - 1000, T0 + 40 * DAY_MS + 10000, "P: a writer's open after the crash"));
+    if (a)
+        eng_close(a);
+    if (b)
+        eng_close(b);
+}
+
 static int rnd(unsigned *r, int n)
 {
     *r = *r * 1103515245u + 12345u;
@@ -2340,7 +2514,10 @@ static int mutant_of(const char *m)
                         : strcmp(m, "keepstaged") == 0 ? MUT_REPLICA_KEEP_STAGED
                         : strcmp(m, "nodropskip") == 0 ? MUT_REPLICA_NO_DROP_SKIP
                         : strcmp(m, "nodropflush") == 0 ? MUT_REPLICA_NO_DROP_FLUSH
-                        : strcmp(m, "nostagesync") == 0 ? MUT_REPLICA_NO_STAGE_SYNC : 0;
+                        : strcmp(m, "nostagesync") == 0 ? MUT_REPLICA_NO_STAGE_SYNC
+                        : strcmp(m, "promoteunapplied") == 0 ? MUT_REPLICA_PROMOTE_UNAPPLIED
+                        : strcmp(m, "promotekeepsegs") == 0 ? MUT_REPLICA_PROMOTE_KEEP_SEGS
+                        : strcmp(m, "epochseg") == 0 ? MUT_REPLICA_EPOCH_SEG : 0;
 }
 
 int main(int argc, char **argv)
@@ -2396,6 +2573,14 @@ int main(int argc, char **argv)
     case_commit_hold();
     case_commit_cut();
     case_drop();
+    for (int v = 0; v < 3; v++)
+        case_promote(v);
+    case_promote_crash();
+    if (getenv("TEST_REPLICA_PROMOTE_ONLY")) { /* the quick run while working on promotion */
+        sh("rm -rf '%s'", S);
+        printf("test_replica: promote only: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
+    }
     for (unsigned seed = 1; seed <= 12; seed++)
         case_commit_random(seed);
     case_power();

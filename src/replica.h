@@ -59,4 +59,12 @@ extern void (*replica_test_sync_hook)(struct eng *db); /* test hook: between a s
 int replica_read(struct eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
                  uint64_t *last);
 
+/* Promotion (design-cluster.md 6.2): the new leader appends its EPOCH marker (epoch >= 1: the segment epoch << 40, above
+ * every segment of the log; its position is *pos) after the log it holds, tail included; the driver ships the log and
+ * syncs, and when the commit point has passed the marker and replica_apply has applied it (to the end of the log)
+ * replica_promote closes *dbp (set to NULL) and opens the directory as a writer in *out: see the function. */
+int replica_epoch_begin(struct eng *db, uint64_t epoch, const char *owner, uint64_t *pos);
+extern void (*replica_test_promote_hook)(void); /* test hook: after the segments are removed, before the engine closes */
+int replica_promote(struct eng **dbp, uint64_t epoch_pos, struct eng **out);
+
 #endif

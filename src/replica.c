@@ -54,6 +54,7 @@ struct replica {
     uint64_t sealed_seq; /* the highest segment whose memtable was sealed: records of it or below are refused */
     uint64_t durable_next; /* positions below this are durable */
     uint64_t cut_gen, last_cut_next;
+    uint64_t epoch, epoch_pos; /* the newest EPOCH marker applied (0: none): its epoch and position */
     _Atomic uint64_t floor_saved;
     _Atomic int64_t now_ms; /* the replicated retention clock: the newest commit_ms / NOW applied, never the wall clock */
     struct {
@@ -1175,8 +1176,20 @@ static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec
         return apply_commit(db, rp, seq, wr, &m);
     case MK_DROP:
         return apply_drop(db, rp, seq, wr, &m);
+    case MK_EPOCH:
+        /* The marker sits in the segment its epoch names, (e << 40) (6.2 step 3): segments only go up, so epochs do too,
+         * and a record of a lower epoch's leader cannot pass as the new one's. */
+        if ((seq >> 40) != m.u.epoch.epoch && eng_test_mutant != MUT_REPLICA_EPOCH_SEG) {
+            fprintf(stderr, "tsdb: %s: the EPOCH marker at position %" PRIu64 " names epoch %" PRIu64 " (the log was at %" PRIu64
+                            ", the marker is in segment %" PRIx64 "): the replica's log is damaged\n", db->dir, wr->fno,
+                    m.u.epoch.epoch, rp->epoch, seq);
+            return TSDB_ERR_CORRUPT;
+        }
+        rp->epoch = m.u.epoch.epoch;
+        rp->epoch_pos = wr->fno;
+        return 0;
     default:
-        return 0; /* EPOCH (step 4), the reserved types and unknown ones */
+        return 0; /* the reserved types and unknown ones */
     }
 }
 
@@ -1749,6 +1762,136 @@ int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap,
         free(out);
     }
     pthread_mutex_unlock(&rp->mu);
+    return rc;
+}
+
+/* -------------------------------------------------------------------- promotion (design-cluster.md 6.2 steps 3-4) */
+
+/* The new leader's first record: an EPOCH marker as the first record of the segment `epoch << 40`, at the end of the log
+ * it has (the old epoch's tail included: it keeps every record, as Raft does). The only record a replica engine makes
+ * itself, and its number is the next one of the log, never a new sequence. The driver ships the log to the other
+ * members, and when the commit point passes the marker (and so the tail) calls replica_apply and then replica_promote. */
+int replica_epoch_begin(eng *db, uint64_t epoch, const char *owner, uint64_t *pos)
+{
+    struct replica *rp = db->rp;
+    size_t ol = owner ? strlen(owner) : 0;
+    if (!rp || epoch == 0 || epoch >= ((uint64_t)1 << 22) || ol > MK_NAME_MAX)
+        return TSDB_ERR_INVALID;
+    uint64_t seq = epoch << 40;
+    pthread_mutex_lock(&rp->mu);
+    int rc = eng_check(db);
+    uint64_t fno = db->fno_next;
+    /* the segment must be above every one the log has and every one in parts: a lower epoch's leader is not ours */
+    if (rc == 0 && ((db->wal_fd >= 0 && seq <= db->wal_seq) || seq <= rp->sealed_seq || seq <= rp->act_seq))
+        rc = TSDB_ERR_INVALID;
+    pthread_mutex_unlock(&rp->mu);
+    if (rc)
+        return rc;
+    mk m = {.type = MK_EPOCH, .span = 1};
+    m.u.epoch = (mk_epoch){.epoch = epoch, .owner = owner, .owner_len = (uint32_t)ol};
+    uint8_t *pl;
+    size_t pn;
+    if ((rc = mk_encode(&m, &pl, &pn)) != 0)
+        return rc;
+    size_t sz = WAL_HDR + pn;
+    uint8_t *rec = calloc(1, sz);
+    if (!rec) {
+        free(pl);
+        return TSDB_ERR_NOMEM;
+    }
+    uint32_t w = (uint32_t)pn | (uint32_t)WAL_KIND_MARKER << 28;
+    int64_t now = eng_wall_ms();
+    memcpy(rec, &w, 4);
+    memcpy(rec + 16, &fno, 8);
+    memcpy(rec + 24, &now, 8);
+    memcpy(rec + WAL_HDR, pl, pn);
+    free(pl);
+    wal_reseal(rec, seq, 0);
+    rc = replica_append(db, seq, 0, rec, sz);
+    free(rec);
+    if (rc == 0 && pos)
+        *pos = fno;
+    return rc;
+}
+
+/* Turns the replica engine into a writer: `*dbp` is closed and its directory opened again as a leader's, which the
+ * caller then equips (db->jr). Only when nothing uncommitted can be in the way: the EPOCH marker at `epoch_pos` and
+ * everything before it is applied, the log is applied to its end and durable, no COMMIT is waiting for its files and
+ * the active memtable is empty. Everything applied is put into parts and the replica's segments are removed (FNO holds
+ * the log's end first, so numbers go on from it), as a writer's open would do with a log it replays: the new writer
+ * never meets a segment whose rows a drop has taken out of parts; the newest (the epoch's, with no rows) stays for the
+ * writer's open to replay and remove, which keeps its own segment numbers above it. The numbers continue (fno_next = the log end + 1), the
+ * writer's first segment is above the epoch's. A failure leaves the replica as it was, or (a crash in the middle)
+ * with a log from which a replica open or a writer's open recovers; TSDB_ERR_INVALID: a precondition does not hold. */
+void (*replica_test_promote_hook)(void); /* test hook: after the segments are removed, before the engine is closed */
+
+int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
+{
+    eng *db = *dbp;
+    struct replica *rp = db->rp;
+    if (!rp || epoch_pos == 0)
+        return TSDB_ERR_INVALID;
+    pthread_mutex_lock(&rp->mu);
+    int rc = eng_check(db);
+    if (rc == 0 && eng_test_mutant != MUT_REPLICA_PROMOTE_UNAPPLIED &&
+        (rp->apply_next <= epoch_pos || rp->apply_next != db->fno_next || rp->durable_next < db->fno_next || rp->ncm != 0))
+        rc = TSDB_ERR_INVALID;
+    if (rc == 0 && rp->epoch_pos != 0 && rp->epoch_pos > epoch_pos)
+        rc = TSDB_ERR_INVALID; /* a later EPOCH marker is applied: the caller's is not the last */
+    if (rc == 0 && db->active && db->active->rows != 0 && eng_test_mutant != MUT_REPLICA_PROMOTE_UNAPPLIED)
+        rc = TSDB_ERR_INVALID;
+    if (rc == 0 && (rc = replica_flush(db)) == 0 && db->nflushing != 0)
+        rc = TSDB_ERR_IO;
+    uint64_t end = db->fno_next;
+    if (rc == 0)
+        rc = fno_require(db, end); /* the epoch's segment holds it too; the bound is not left to that */
+    uint64_t *seqs = NULL;
+    size_t ns = 0;
+    if (rc == 0) {
+        pthread_mutex_lock(&rp->segs_mu);
+        ns = rp->nsegs;
+        seqs = ns ? malloc(ns * sizeof *seqs) : NULL;
+        if (ns && !seqs)
+            rc = TSDB_ERR_NOMEM;
+        for (size_t i = 0; seqs && i < ns; i++)
+            seqs[i] = rp->segs[i].seq;
+        pthread_mutex_unlock(&rp->segs_mu);
+    }
+    pthread_mutex_unlock(&rp->mu);
+    if (rc) {
+        free(seqs);
+        return rc;
+    }
+    tsdb_options opt = db->opt;
+    char *dir = strdup(db->dir);
+    if (!dir) {
+        free(seqs);
+        return TSDB_ERR_NOMEM;
+    }
+    /* oldest first: a crash leaves a log that starts later, which a replica's open accepts */
+    for (size_t i = 0; i + 1 < ns && eng_test_mutant != MUT_REPLICA_PROMOTE_KEEP_SEGS; i++) { /* not the newest: the epoch's */
+        char nm[64];
+        wal_name(nm, sizeof nm, seqs[i]);
+        if (unlinkat(db->dirfd, nm, 0) != 0 && errno != ENOENT) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        if (eng_sync_dir(db, "fsync of the directory after removing a replica's segment") != 0) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+    }
+    free(seqs);
+    if (rc == 0 && replica_test_promote_hook)
+        replica_test_promote_hook();
+    if (rc == 0) {
+        unlinkat(db->dirfd, RS_FILE, 0); /* a writer has no use for it; the positions it holds are below the new ones */
+        tsdb_fsync(db->dirfd);
+        eng_close(db);
+        *dbp = NULL;
+        rc = eng_open(dir, &opt, out);
+    }
+    free(dir);
     return rc;
 }
 
