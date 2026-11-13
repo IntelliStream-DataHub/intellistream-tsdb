@@ -2484,6 +2484,163 @@ static void case_power_commit(void)
            "leader was told is durable, the answers are the leader's\n", crashes);
 }
 
+
+/* ------------------------------------------------------------ N: review round 2 (drop ordering, staged files, promotion) */
+
+/* A drop on the leader while a large write waits for its commit point (a second thread, as tsdbd's request threads):
+ * the drop's marker must not come after the COMMIT in the log while the leader retires the partition before the
+ * publish. The drop waits for the large write (jr_serial), so leader and replica hold the same rows at every commit
+ * point (mutant nodropserial: the leader keeps the rows, the replica drops them). */
+static xport *DR_X;
+static pthread_t DR_T;
+static bool DR_STARTED;
+static void *dr_thread(void *a)
+{
+    (void)a;
+    CHECK_EQ(eng_drop_before(DR_X->ld, T0 + 3 * DAY_MS), 0);
+    return NULL;
+}
+
+static int dr_wait(void *ctx, eng *db, uint64_t last)
+{
+    if (!DR_STARTED) {
+        DR_STARTED = true;
+        CHECK_EQ(pthread_create(&DR_T, NULL, dr_thread, NULL), 0);
+        usleep(400000); /* the drop runs now, or waits for the large write */
+    }
+    return xp_wait(ctx, db, last);
+}
+
+static size_t count_rows(eng *db, uint32_t s)
+{
+    qctx q = {.n = 0};
+    eng_query_raw_ex(db, s, T0 - 10 * DAY_MS, T0 + 10 * DAY_MS, false, 0, qfn, &q);
+    return q.n;
+}
+
+static void case_drop_race(void)
+{
+    xport x;
+    xp_start(&x, "kdr");
+    DR_X = &x;
+    DR_STARTED = false;
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "N: before");
+    XOPS.wait = dr_wait;
+    xp_rows(&x, 1, 0, 40, 500); /* > wal_max_batch_rows: a COMMIT */
+    XOPS.wait = xp_wait;
+    CHECK(DR_STARTED);
+    pthread_join(DR_T, NULL);
+    CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
+    for (uint32_t s = 0; s < 2; s++)
+        CHECK_EQ(count_rows(x.ld, s), count_rows(x.rep, s));
+    CHECK(xp_same(&x, "N: after the race"));
+    xp_stop(&x);
+}
+
+/* The driver sends a file again (a lost acknowledgement) and the process dies in the middle: the staged file under an
+ * acknowledged marker is never torn, and what is durable never goes back. A stage after the marker was applied is an
+ * orphan that the next open removes (and a promotion). */
+static void case_restage(void)
+{
+    xport x;
+    char rd[PATH_MAX], name[64];
+    uint64_t sz;
+    xp_start(&x, "krs");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "N: before");
+    x.noapply = true;
+    xp_rows(&x, 0, 5, 40, 2000);
+    uint64_t last = ld_last(&x), d0 = replica_durable_end(x.rep);
+    CHECK_EQ(d0, last);
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len / 2), TSDB_ERR_INVALID); /* other bytes, same name */
+    CHECK_EQ(replica_durable_end(x.rep), d0);
+    xp_reopen(&x, rd, 0);
+    CHECK_EQ(replica_durable_end(x.rep), d0); /* mutant stagetrunc: below it */
+    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 0);
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0); /* the same bytes again: nothing to do */
+    CHECK_EQ(count_files(rd, "stage_"), 1);
+    x.noapply = false;
+    xp_step(&x, "N: restaged");
+    CHECK_EQ(count_files(rd, "stage_"), 0); /* applied: removed */
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0); /* late: an orphan */
+    CHECK_EQ(count_files(rd, "stage_"), 1);
+    xp_reopen(&x, rd, 0);
+    CHECK_EQ(count_files(rd, "stage_"), 0);
+    xp_step(&x, "N: orphan gone at open");
+    /* and at a promotion: the orphan of a late send */
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
+    CHECK_EQ(count_files(rd, "stage_"), 1);
+    uint64_t pos = 0;
+    eng *n = NULL;
+    CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), 0);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    CHECK_EQ(replica_promote(&x.rep, pos, &n), 0);
+    CHECK_EQ(count_files(rd, "stage_"), 0); /* mutant noorphans */
+    if (n)
+        eng_close(n);
+    eng_close(x.ld);
+    free(x.held);
+}
+
+/* A staged file damaged at rest between its stage and its apply is refused (never adopted silently). */
+static void case_stage_damage(void)
+{
+    xport x;
+    char rd[PATH_MAX];
+    xp_start(&x, "ksd");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "N: before");
+    x.noapply = true;
+    xp_rows(&x, 0, 5, 40, 2000);
+    CHECK(x.held_len > 64);
+    sh("f=$(ls '%s'/stage_*.part) && printf '\\377' | dd of=\"$f\" bs=1 seek=%d conv=notrunc 2>/dev/null", rd,
+       200);
+    x.noapply = false;
+    CHECK(xp_pump(&x, ld_last(&x)) != 0); /* (part_open_as checks the whole file too: the apply's own checksum has no mutant of its own) */
+    xp_stop(&x);
+}
+
+/* A replica promotes only with everything durable and applied, and no COMMIT waiting for its files. */
+static void case_promote_refused(void)
+{
+    xport x;
+    uint64_t pos = 0;
+    eng *n = NULL;
+    xp_start(&x, "kpr");
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "N: before");
+    CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), 0);
+    CHECK_EQ(replica_epoch_begin(x.rep, 0, "node-b", &pos), TSDB_ERR_INVALID); /* an epoch whose segment is behind */
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    CHECK_EQ(replica_promote(&x.rep, pos, &n), TSDB_ERR_INVALID); /* not synced (the guards against it overlap: apply_next, durable_next and ncm; no mutant of one alone is caught) */
+    CHECK(x.rep && !n);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    CHECK_EQ(replica_promote(&x.rep, pos, &n), 0);
+    if (n)
+        eng_close(n);
+    eng_close(x.ld);
+    free(x.held);
+
+    xp_start(&x, "kpw");
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "N: before");
+    x.withhold = true;
+    x.noapply = true;
+    xp_rows(&x, 0, 5, 40, 2000); /* its file is withheld: the marker waits for it */
+    CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), 0);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    n = NULL;
+    CHECK_EQ(replica_promote(&x.rep, pos, &n), TSDB_ERR_INVALID);
+    CHECK(x.rep && !n);
+    xp_stop(&x);
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -2517,6 +2674,9 @@ static int mutant_of(const char *m)
                         : strcmp(m, "nostagesync") == 0 ? MUT_REPLICA_NO_STAGE_SYNC
                         : strcmp(m, "promoteunapplied") == 0 ? MUT_REPLICA_PROMOTE_UNAPPLIED
                         : strcmp(m, "promotekeepsegs") == 0 ? MUT_REPLICA_PROMOTE_KEEP_SEGS
+                        : strcmp(m, "nodropserial") == 0 ? MUT_REPLICA_NO_DROP_SERIAL
+                        : strcmp(m, "stagetrunc") == 0 ? MUT_REPLICA_STAGE_TRUNC
+                        : strcmp(m, "noorphans") == 0 ? MUT_REPLICA_NO_STAGE_ORPHANS
                         : strcmp(m, "epochseg") == 0 ? MUT_REPLICA_EPOCH_SEG : 0;
 }
 
@@ -2573,6 +2733,10 @@ int main(int argc, char **argv)
     case_commit_hold();
     case_commit_cut();
     case_drop();
+    case_drop_race();
+    case_restage();
+    case_stage_damage();
+    case_promote_refused();
     for (int v = 0; v < 3; v++)
         case_promote(v);
     case_promote_crash();

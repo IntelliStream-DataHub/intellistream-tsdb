@@ -1458,12 +1458,21 @@ int eng_drop_before(eng *db, int64_t ts)
     /* memtable rows become parts first, so they are dropped with them. A replicated leader's jr_intent does it: its
      * marker is the first record of the segment after the flush, and rows written since are not flushed here (a
      * replica has them in its active memtable too, and keeps them) */
+    /* On a leader the drop is ordered with the large writes (jr_serial, above flush_lock): one that has appended its
+     * COMMIT and waits for its commit point publishes its parts first, or this DROP's marker would come after the
+     * COMMIT in every replica's log while the leader retired the partition before the publish (a replica would drop
+     * the rows the leader keeps) */
+    const bool serial = db->jr && eng_test_mutant != MUT_REPLICA_NO_DROP_SERIAL;
+    if (serial)
+        pthread_mutex_lock(&db->jr_serial);
     int rc = jr_intent(db, JR_DROP, &ts);
     if (rc == 0 && !db->jr)
         rc = eng_flush(db);
-    if (rc)
-        return rc;
-    return drop_retire(db, ts);
+    if (rc == 0)
+        rc = drop_retire(db, ts);
+    if (serial)
+        pthread_mutex_unlock(&db->jr_serial);
+    return rc;
 }
 
 /* The part of tsdb_drop_before after the flush: retires every partition that ends at or before ts. A replica runs

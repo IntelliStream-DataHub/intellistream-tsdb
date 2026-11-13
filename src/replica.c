@@ -45,6 +45,7 @@ struct replica {
     pthread_mutex_t mu;
     pthread_mutex_t segs_mu;
     pthread_mutex_t unl_mu;
+    pthread_mutex_t stage_mu; /* one replica_stage at a time (outermost: taken before mu, held across the file's I/O) */
     rseg *segs; /* the wal_ segments present, ascending by seq (segs_mu) */
     size_t nsegs, capsegs;
     /* the apply cursor: the next record to apply is at apply_off of segment apply_seq (0: before the first segment) */
@@ -193,6 +194,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     pthread_mutex_init(&rp->mu, NULL);
     pthread_mutex_init(&rp->segs_mu, NULL);
     pthread_mutex_init(&rp->unl_mu, NULL);
+    pthread_mutex_init(&rp->stage_mu, NULL);
     rp->rfd = -1;
     db->rp = rp; /* from here wal_check_segment lets rows name series that SERIES does not hold yet */
 
@@ -364,6 +366,7 @@ void replica_free(eng *db)
     pthread_mutex_destroy(&rp->mu);
     pthread_mutex_destroy(&rp->segs_mu);
     pthread_mutex_destroy(&rp->unl_mu);
+    pthread_mutex_destroy(&rp->stage_mu);
     free(rp);
     db->rp = NULL;
 }
@@ -694,30 +697,70 @@ static void cm_remove(eng *db, struct replica *rp, size_t i)
     rp->ncm--;
 }
 
+/* Whether a COMMIT marker still to be applied names `key` with exactly this size and checksum: the staged file is
+ * what an acknowledged position relies on (rp->mu held). */
+static bool stage_wanted(struct replica *rp, uint64_t key, uint64_t size, uint64_t xxh)
+{
+    for (size_t i = 0; i < rp->ncm; i++)
+        for (uint32_t k = 0; k < rp->cm[i].nf; k++) {
+            const struct rcf *f = &rp->cm[i].f[k];
+            if (f->key == key && f->size == size && f->xxh == xxh)
+                return true;
+        }
+    return false;
+}
+
+/* A file is never written in place: the driver sends one again after a lost acknowledgement, and the process can die in
+ * the middle of that (a torn file under a marker whose positions were acknowledged). The new bytes go to
+ * stage_<key>.tmp, are synced and renamed over the name; a stage of what is staged already does nothing, and a file
+ * that a pending marker relies on is not replaced by other bytes under the same name (names repeat across leader
+ * incarnations: the new bytes can only be for a later marker, which the leader sends again once this one is applied).
+ * Never O_TRUNC the staged name either: between the link to tmp_0_ and the removal after the apply it is a name of a
+ * published part (a mapped file). */
 int replica_stage(eng *db, const char *name, const void *buf, size_t len)
 {
     struct replica *rp = db->rp;
     if (!rp || !name || !part_file_name(name) || strlen(name) >= 64 || len == 0)
         return TSDB_ERR_INVALID;
-    uint64_t key = stage_key(name);
-    char sp[40];
+    const bool trunc = eng_test_mutant == MUT_REPLICA_STAGE_TRUNC;
+    uint64_t key = stage_key(name), xx = xxh64(buf, len, 0);
+    char sp[40], tp[48];
     stage_path(sp, sizeof sp, key);
-    int fd = openat(db->dirfd, sp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    snprintf(tp, sizeof tp, "stage_%016" PRIx64 ".tmp", key);
+    pthread_mutex_lock(&rp->stage_mu);
     int rc = 0;
+    if (!trunc) {
+        pthread_mutex_lock(&rp->mu);
+        const struct rstg *old = stg_find(rp, key);
+        if (old && old->size == len && old->xxh == xx)
+            rc = 1; /* staged already */
+        else if (old && stage_wanted(rp, key, old->size, old->xxh))
+            rc = TSDB_ERR_INVALID;
+        pthread_mutex_unlock(&rp->mu);
+        if (rc) {
+            pthread_mutex_unlock(&rp->stage_mu);
+            return rc == 1 ? 0 : rc;
+        }
+    }
+    int fd = openat(db->dirfd, trunc ? sp : tp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0 || write_full(fd, buf, len) != 0 ||
         (db->opt.fsync && eng_test_mutant != MUT_REPLICA_NO_STAGE_SYNC && tsdb_fdatasync(fd) != 0))
         rc = TSDB_ERR_IO;
     if (fd >= 0)
         close(fd);
+    if (rc == 0 && !trunc && renameat(db->dirfd, tp, db->dirfd, sp) != 0)
+        rc = TSDB_ERR_IO;
     if (rc == 0 && db->opt.fsync && eng_test_mutant != MUT_REPLICA_NO_STAGE_SYNC && tsdb_fsync(db->dirfd) != 0)
         rc = TSDB_ERR_IO;
     if (rc) {
-        unlinkat(db->dirfd, sp, 0);
+        unlinkat(db->dirfd, trunc ? sp : tp, 0); /* the name that held the old bytes is untouched (not so in place) */
+        pthread_mutex_unlock(&rp->stage_mu);
         return rc;
     }
     pthread_mutex_lock(&rp->mu);
-    rc = stg_put(rp, key, len, xxh64(buf, len, 0));
+    rc = stg_put(rp, key, len, xx);
     pthread_mutex_unlock(&rp->mu);
+    pthread_mutex_unlock(&rp->stage_mu);
     return rc;
 }
 
@@ -1002,6 +1045,11 @@ static int open_scan(eng *db, struct replica *rp)
     for (errno = 0; rc == 0 && (e = readdir(d)); errno = 0) {
         uint64_t key;
         int consumed = 0;
+        size_t nl = strlen(e->d_name);
+        if (strncmp(e->d_name, "stage_", 6) == 0 && nl > 4 && strcmp(e->d_name + nl - 4, ".tmp") == 0) {
+            unlinkat(db->dirfd, e->d_name, 0); /* a stage that did not finish: the leader sends the file again */
+            continue;
+        }
         if (strncmp(e->d_name, "stage_", 6) != 0 || sscanf(e->d_name, "stage_%" SCNx64 ".part%n", &key, &consumed) != 1 ||
             e->d_name[consumed])
             continue;
@@ -1153,9 +1201,8 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
 /* One marker, in position order, once committed. Every type is applied in a way a replay can repeat: a restart applies
  * the markers of the segments it still holds again, from the floor. SERIES and STATE entries the dictionary holds
  * already are checked and skipped, RETENTION and CLASS records by the offset they have in their file, NOW only
- * moves the clock up. A type that carries data (COMMIT, DROP) or means a role (EPOCH) is not applied yet (steps 3
- * and 4 of the replica): the engine fails rather than skip something a read would have to show. The reserved types
- * and unknown ones are skipped, as every replay does. */
+ * moves the clock up. COMMIT and DROP are applied by apply_commit and apply_drop (staged files, RSTATE), EPOCH sets the
+ * epoch and its position. The reserved types and unknown ones are skipped, as every replay does. */
 static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr)
 {
     mk m;
@@ -1849,7 +1896,8 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
     pthread_mutex_lock(&rp->mu);
     int rc = eng_check(db);
     if (rc == 0 && eng_test_mutant != MUT_REPLICA_PROMOTE_UNAPPLIED &&
-        (rp->apply_next <= epoch_pos || rp->apply_next != db->fno_next || rp->durable_next < db->fno_next || rp->ncm != 0))
+        (rp->apply_next <= epoch_pos || rp->apply_next != db->fno_next ||
+         rp->durable_next < db->fno_next || rp->ncm != 0))
         rc = TSDB_ERR_INVALID;
     if (rc == 0 && rp->epoch_pos != 0 && rp->epoch_pos > epoch_pos)
         rc = TSDB_ERR_INVALID; /* a later EPOCH marker is applied: the caller's is not the last */
@@ -1860,6 +1908,14 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
     uint64_t end = db->fno_next;
     if (rc == 0)
         rc = fno_require(db, end); /* the epoch's segment holds it too; the bound is not left to that */
+    /* no COMMIT is waiting (ncm == 0): every file still staged was sent after its marker was applied, or for one that
+     * never came, and the old leader sends nothing more */
+    for (size_t i = rp->nstg; rc == 0 && i-- > 0 && eng_test_mutant != MUT_REPLICA_NO_STAGE_ORPHANS;) {
+        char sp[40];
+        stage_path(sp, sizeof sp, rp->stg[i].key);
+        unlinkat(db->dirfd, sp, 0);
+        stg_del(rp, rp->stg[i].key);
+    }
     uint64_t *seqs = NULL;
     size_t ns = 0;
     if (rc == 0) {
@@ -1901,7 +1957,10 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
         replica_test_promote_hook();
     if (rc == 0) {
         unlinkat(db->dirfd, RS_FILE, 0); /* a writer has no use for it; the positions it holds are below the new ones */
-        tsdb_fsync(db->dirfd);
+        if (tsdb_fsync(db->dirfd) != 0) {
+            free(dir);
+            return TSDB_ERR_IO; /* the replica goes on as it was: its RSTATE is not gone for sure */
+        }
         eng_close(db);
         *dbp = NULL;
         rc = eng_open(dir, &opt, out);

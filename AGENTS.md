@@ -477,7 +477,7 @@ cgroup, so `nice` does not keep your work out of its way.
   loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
   `latest_rw` is held across no I/O but `tsdb_drop_before`'s renames of the partitions it retires (`db_retire_locked`,
   in its write section; `db->lock` was held across them already), and never across a lookup's reads of granules. Followers have no table.
-- **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
+- **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; a replica's `stage_mu` is outermost of the replica's own locks) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf, and so is the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
   sweeper takes `db->lock` only with it released). The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
