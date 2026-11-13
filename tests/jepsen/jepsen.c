@@ -280,8 +280,8 @@ static int watch_deaths, watch_restarts;
                                * restarts at once (honest: 50 ms, one poll to the next, 100 to 150 ms in a few of 300 runs with a load average of 90) */
 #define NEM_STOP_MAX_MS 1500  /* no server may lie stopped longer than this (the pause nemesis stops one for 100 to 400 ms): a nemesis that
                                * never continues it leaves every client waiting */
-#define NEM_KILL_STEP_MAX_MS 300 /* kill: how long a server may be listening while a kill step is in progress before the time counts as free (not as
-                               * the nemesis at work): the step is a SIGKILL and a start, in which a server listens for a poll or two (honest: see nemesis_check) */
+#define NEM_KILL_STEP_MAX_MS 400 /* kill: how long a server may be listening while a kill step is in progress before the time counts as free (not as
+                               * the nemesis at work): the step is a SIGKILL and a start, in which a server listens for a poll or two (honest worst 200 ms in 96 runs, 106 ms with 48 busy loops: see nemesis_check) */
 #define NEM_GAP_SHARE 0.1     /* the bound on a listening stretch with no fault: this share of the run, between NEM_GAP_MIN_S and NEM_GAP_MAX_S */
 #define NEM_GAP_MIN_S 2.0
 #define NEM_GAP_MAX_S 5.0
@@ -2257,17 +2257,27 @@ static void *nemesis_thread(void *arg)
  * outage nemesis' fault is one long step, 0.33 to 0.4 per listening second, a third of that is asked). A nemesis at half the honest
  * rate is what the check cannot tell from an honest one under load; one at a third of it, or less, fails.
  *
- * Calibration of every bound (12 full `make jepsen` runs of this tree: JEPSEN_DIR on /tmp, tmpfs, and on /var/tmp, ext4, each quiet
- * and with 16 busy loops on the 4 CPUs of the run, 3 runs each, both backends, kv and classes, login and feed; plus 12 eio, 6 kill and
- * 6 power runs with 48 busy loops on 4 CPUs), the honest worst against the bound, margin in brackets:
- *   rate per free listening second, least:    kill 2.00 (floor 1.0, 2.0x)  pause 1.74 (0.9, 1.9x)  power 1.05 (0.55, 1.9x)  eio 0.88 (0.4, 2.2x)
- *   faults against the floor, least:          kill 1.9x  pause 1.7x  power 1.7x  eio 2.2x
- *   longest listening stretch with no fault:  0.90 s (bound 2.0 s for runs of 10 and 20 s, 2.2x; eio had 1.63 s before its survive path
- *                                             counted as a fault in progress)
- *   longest dead stretch: 150 ms in a run of 300 with a load average of 90 (bound 250 ms, 1.7x; 101 ms in the 12 runs)
- *   longest stop: 408 ms (bound 1500 ms, 3.7x)
+ * Calibration of every bound (2026-11-13: 12 full `make jepsen` runs of this tree: JEPSEN_DIR on /tmp, tmpfs, and on /var/tmp, ext4, each quiet
+ * and with 16 busy loops on the 4 CPUs of the run, 3 runs each, both backends, kv and classes, login and feed; plus 6 eio and 6 power
+ * runs of 20 s on /tmp with 16 busy loops, and 6 kill and 4 pause runs with 48 busy loops on 4 CPUs; before them 12 eio, 6 kill and 6 power
+ * runs with 48 busy loops, 12 full runs and 300-second runs with a load average of 90), the honest worst against the bound, margin in brackets:
+ *   rate per free listening second, least:    kill 1.80 (floor 1.0, 1.8x)  pause 1.75 (0.9, 1.9x)  power 1.05 (0.55, 1.9x)  eio 0.88 (0.4, 2.2x)
+ *   faults against the floor, least:          kill 1.8x  pause 1.85x  power 1.7x  eio 2.0x
+ *   longest listening stretch with no fault:  0.92 s (pause), 0.86 s (kill, power), 0.82 s (eio) (bound 2.0 s for runs of 10 and 20 s, 2.2x)
+ *   longest dead stretch: 150 ms in a run of 300 with a load average of 90 (bound 250 ms, 1.7x; 104 ms in the 12 runs)
+ *   longest stop: 410 ms (bound 1500 ms, 3.7x)
+ *   longest listening stretch in a kill step: 200 ms (bound 400 ms, 2x; 106 ms with 48 busy loops)
  * A nemesis that works at a third of the honest rate, at half of it (slow:MS), stops at three quarters of the run (hole:15:100) or
- * sees no server die in its naps (blind:MS) is failed by the selftest of the Makefile, 10 of 10 runs in each of the four conditions. */
+ * sees no server die in its naps (blind:MS) is failed by the selftest of the Makefile, 10 of 10 runs in each of the four conditions
+ * (/tmp and /var/tmp, quiet and with 16 busy loops).
+ * What passes, on purpose, and is not a failure of the check: (1) a kill step that dawdles up to 400 ms with the server live (the bound above;
+ * killslowstep:1000 makes 13 faults against a floor of 15 and fails); (2) a nemesis that stops working at nine tenths of a run (the gap bound is a tenth of the
+ * run, 2 s of 20), or at four fifths of one of 10 s (the pause runs of make jepsen are 20 s for that reason); (3) any run whose fault count passes only because restarts and pulls the nemesis waits for count as work, so a
+ * nemesis that always waits as long as the honest one under load can do is not told from it. A bound is never widened to make a mutant
+ * fail: honest runs come first.
+ * Measured and caught, so not a pass: a blind power nemesis (naps that never look at the server, blind:1000) at the shim's default odds,
+ * 16 of 16 runs (8 quiet, 8 with 16 busy loops on /tmp), by the dead stretch of 1 to 3 s its naps leave and by the floor; the odds of the
+ * Makefile case are raised only to make the shim kill servers at all in 20 s. */
 static double nem_rate(void)
 {
     if (outage)

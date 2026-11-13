@@ -1059,6 +1059,10 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # a longer nap, works at half or two thirds of it), its gap bound a tenth of the run (2 to 5 s, the stretch to the end of the run
 # included: hole:15:100 stops at three quarters of a run of 20 s, hole:6:100 at six tenths of one of 10 s), and the dead bound
 # catches a nemesis that does not look at the server when the shim, with high odds, is what kills it (blind:1000, no forced death).
+# A kill step that dawdles with the server live (killslowstep:1000) works at a third of the honest rate in time that is no free time:
+# the time a server listens in a kill step counts as free past 400 ms. A pause run is 20 s (hole:16:100, four fifths of it, fails; of
+# 10 s it did not), and a plug pulled when the clients are gone (lastpull) is an honest run: the harness gives the server a row to
+# fail on (poke_server) and the case must pass. What passes on purpose is listed at the end of the comment of nemesis_check.
 # What each bound is set to, and the honest worst under load on tmpfs and disk, is in the comments of nemesis_check (jepsen.c).
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
