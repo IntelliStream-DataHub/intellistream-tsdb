@@ -15,14 +15,21 @@ agree, with the Raft protocol, on a list of facts about the cluster:
 
 A **witness** is a member with no data. It only keeps the list and can vote. It is a cheap third or fifth vote.
 
+Release 0.11.0 adds **cluster volumes**: `tsdb cluster volume add` makes a volume that the group places on N servers
+(its **copies**, one per rack where it can), and every one of them makes the volume's directory and opens it. Data in
+a cluster lives in such volumes only, never in a server's own directory.
+
 What the preview does **not** do yet. Please do not skip this list:
 
-- **It does not copy your data.** A row you write to one server stays on that server. Step 6 shows it.
+- **It does not copy your data.** A volume has copies on three servers, but a row you write to the volume's leader
+  stays on that server: the others stay empty. Writes are off unless the servers start with `TSDB_CLUSTER_WRITES=1`
+  (step 3 does), a switch for trying it out that will go once copying works. Step 6 shows it.
 - **It does not fail over.** If a server dies, nothing takes over its data. The group notices (it marks the server
   down) and that is all.
-- **It does not move volumes**, and you cannot add a volume or a user to the cluster yet.
-- **It changes nothing for clients.** The client port, the protocol and every request work exactly as without
-  `--cluster`. A client talks to one server, as before. Logins are still per server (`tsdb DIR user ...`).
+- **It does not move volumes**, and you cannot add a user to the cluster yet.
+- **Clients name the volume.** The client port and the protocol are as without `--cluster`, but a series is made in
+  a cluster volume, named like any volume (`tsdbc_series_at` with the volume's name), and a client talks to the
+  volume's leader. Logins are still per server (`tsdb DIR user ...`).
 - **It is not for production.** The format of the metadata and the peer protocol may change in a later 0.x
   release. A build of the preview does not talk to a build from before such a change: you start the cluster again
   with `tsdb cluster init`, you do not upgrade it.
@@ -62,6 +69,8 @@ build/tsdb cluster secret $D/secret
 #    The state directory holds the cluster's own files and must be on a local disk, never on NFS.
 #    Node N listens for clients on port 1708N and for the other servers on port 1709N (the two lines marked ports).
 #    --no-auth: no login, because users are still per server in the preview. Fine on 127.0.0.1, nowhere else.
+#    TSDB_CLUSTER_WRITES=1: a preview switch that lets a volume's leader take writes (step 6), though nothing is
+#    copied yet. Without it every cluster volume refuses writes.
 #    A witness (node 4) has no data directory and no client port.
 port() { echo 1708$1; }                    # ports: the client port of node N
 pport() { echo 1709$1; }                   # ports: the peer port of node N
@@ -70,7 +79,7 @@ start_node() {                             # start_node N [witness]: start a ser
     mkdir -p $D/n$1/state
     if [ "${2:-}" = witness ]; then role="--witness --advertise 127.0.0.1"
     else mkdir -p $D/n$1/data; role="--dir $D/n$1/data --no-auth --port $(port $1)"; fi
-    build/tsdbd $role --state-dir $D/n$1/state --peer-port $(pport $1) \
+    TSDB_CLUSTER_WRITES=1 build/tsdbd $role --state-dir $D/n$1/state --peer-port $(pport $1) \
         --cluster --cluster-secret-file $D/secret --rack rack$1 >> $D/n$1/log 2>&1 &
     echo $! > $D/n$1/pid
 }
@@ -93,11 +102,18 @@ build/tsdb cluster node add $(peer 1) $(peer 3) --secret-file $D/secret
 wait_for 2 '^group voters 1,2,3 '
 status 2
 
-# 6. Nothing changed for clients, and nothing is copied. Write a day of readings to node 1 as if it were
-#    a lone server, then list the series in node 1's directory and in node 2's.
-build/client-example 127.0.0.1 $(port 1)
-build/tsdb $D/n1/data series | cut -f1,2
-echo "node 2 has $(build/tsdb $D/n2/data series | wc -l) series"
+# 6. A volume: in a cluster, data lives in volumes the group places, never in a server's own directory. Add one
+#    named plant with three copies, one per node, and wait until every node has made its directory (n1/data/v1, ...)
+#    and the group has recorded that it opened it (open_gen). Then write a day of readings into plant through its
+#    leader (the first of the three; only it takes writes) and read them back. The preview copies nothing yet:
+#    the other two copies stay empty.
+build/tsdb cluster volume add $(peer 1) plant --replicas 3 --secret-file $D/secret
+for n in 1 2 3; do wait_for 1 "^replica volume 1 node $n rid [0-9a-f]* open_gen 1$"; done
+status 1 | grep '^volume\|^replica'
+leads=$(status 1 | awk '$1 == "volume" && $4 == "plant" { print $8 }')
+echo "node $leads leads volume plant"
+TSDB_VOLUME=plant build/client-example 127.0.0.1 $(port $leads)
+ls -d $D/n[123]/data/v1
 
 # 7. Kill the leader, as a crash would (kill -9, by its process id). The others elect a new leader, and once that
 #    one has led for three seconds (node_timeout_ms) without a heartbeat from the dead node, it marks the node down.
@@ -168,6 +184,7 @@ and `status 2` shows the cluster, asked of node 2, which follows:
 ```
 node 2 mode core role follower term 1 leader 1 commit 8 applied 8
 cluster 875bd313f7abb7b8c0ca9b6b59e6c292 replication 3 min_isr 1 node_timeout_ms 3000 heartbeat_ms 500 voter_replace_s 600 voters_max 5 mode replicated failover lease read_barrier on lease_s 10 restore_gen 0
+replicated lease_ms 2000 drift_ppm 500 unanswered_ms 1000 commit_interval_ms 5 repl_retain_mb 4096 repl_retain_s 1800 idle_seal_ms 1000
 group voters 1,2,3 learners -
 member 1 up incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 457ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
@@ -175,19 +192,37 @@ member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 h
 volumes 0 users 0
 ```
 
-Step 6: the client example is the one of the [quick start](../README.md#quick-start-5-minutes-one-machine), pointed at
-node 1. Its answer is the same as there. Node 1 has the series, node 2 has none:
+Step 6: `volume add` answers with the volume's number. All three nodes hold a copy, node 1 leads it (`leader 1`, the
+first of `replicas`), and each copy has a replica id (`rid`, drawn once when its directory is made) and an open
+generation (`open_gen`, one more at every start of its server; the group records it before the copy answers anyone).
+The client example is the one of the [quick start](../README.md#quick-start-5-minutes-one-machine), pointed at the
+volume's leader and told the volume's name (`TSDB_VOLUME=plant`). Its answer is the same as there:
 
 <!-- cluster-tutorial-output -->
 ```
+added volume plant: number 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
+replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
+replica volume 1 node 3 rid d55421a420347a3b open_gen 1
+volumes 1 users 0
+node 1 leads volume plant
 wrote 1440 rows
 read 1440 rows, the first: 1717200000000 50.00
 24 hours, the first average: 51.28
 Oslo day 1: 1320 rows, average 50.23
 Oslo day 2: 120 rows, average 47.47
-pump7.flow	float32
-node 2 has 0 series
+/tmp/tsdb-cluster/n1/data/v1
+/tmp/tsdb-cluster/n2/data/v1
+/tmp/tsdb-cluster/n3/data/v1
 ```
+
+What a cluster node refuses, so that no row ever lands outside a volume the group knows: a series in the server's own
+directory (`tsdbc_series` without a volume: `invalid argument`), a local `tsdb DIR volume add` while it runs, and a
+start on a directory that already has series or `VOLUMES` lines in it (the server names them and stops). A write to a
+copy that does not lead is `UNAVAILABLE` with the reason `fenced`, and a write to any volume of a server started
+without `TSDB_CLUSTER_WRITES=1` too. A copy that is older than the group's record of it (`open_gen` above the one in
+its directory, say a directory restored from a backup) is refused, naming both numbers.
 
 Step 7: after the kill. Node 2 (a survivor) sees a new term, a leader, and the dead node 1 as `down`:
 
@@ -199,13 +234,18 @@ group voters 1,2,3 learners -
 member 1 down incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 5482ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 377ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volumes 0 users 0
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
+replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
+replica volume 1 node 3 rid d55421a420347a3b open_gen 1
+volumes 1 users 0
 ```
 
 Your shell may also print a line like `Killed  build/tsdbd ...` about the process you killed. That is the shell, not
 tsdb.
 
-Step 8: node 1 is back, as a follower of the new leader, with `incarnation 2`:
+Step 8: node 1 is back, as a follower of the new leader, with `incarnation 2`. Its copy of plant shows `open_gen 2`
+once the group has recorded the new start, a moment later:
 
 <!-- cluster-tutorial-output -->
 ```
@@ -215,7 +255,11 @@ group voters 1,2,3 learners -
 member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volumes 0 users 0
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
+replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
+replica volume 1 node 3 rid d55421a420347a3b open_gen 1
+volumes 1 users 0
 ```
 
 Step 9: the witness. It is `mode watch`, has no client port (`addr ...:0`) and `volumes_ok 0`: it will never hold a
@@ -230,7 +274,11 @@ member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 h
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 4 up incarnation 1 addr 127.0.0.1:0 peer 127.0.0.1:17094 rack rack4 heard 0ms feed - voter_ok 1 volumes_ok 0 core_dropped 0 read_barrier on
-volumes 0 users 0
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
+replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
+replica volume 1 node 3 rid d55421a420347a3b open_gen 1
+volumes 1 users 0
 ```
 
 Step 10 prints what the servers logged about leaders and members. Only the new leader proposes a change, so a line shows
@@ -260,8 +308,11 @@ line until the group has confirmed it.
 | `cluster UUID replication ... lease_s ...` | The cluster's id and its settings (`init` fixes them; see the reference below). |
 | `group voters 1,2,3 learners -` | Who votes, and who is catching up to join the vote. |
 | `member N STATE incarnation I addr A peer P rack R heard H feed F voter_ok V volumes_ok W core_dropped D read_barrier B` | One line per member. `STATE`: `up` or `down` (the group also knows `draining` and `out`, which nothing sets in the preview). `I`: how many times this member has started (it goes up at every restart). `A`: where clients reach it. `P`: where servers reach it. `R`, `F`: its `--rack` and `--power-feed`, `-` for none. `H`: how long ago the server you asked last heard from it. `V`, `W`: whether it may vote and may hold volumes (1/0; a witness has `volumes_ok 0`). `D`: 1 when its Raft core was dropped after a log fault (it goes on as a watcher). `B`: its read barrier setting; `?` when you have not heard it yet. |
-| `volume-report ...`, `domain-report ...` | Per member, what it says about its volumes and storage domains. Empty in the preview: no volumes exist. |
-| `volumes N users M` | How many volumes and users the group holds. Always 0 in the preview. |
+| `replicated lease_ms ...` | The settings of replicated volumes (`init` fixes them; stored, not acted on yet). |
+| `volume-report ...`, `domain-report ...` | Per member, what it says about its volumes and storage domains. |
+| `volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I` | One line per cluster volume: its number and name, the node that leads it, and the nodes that hold its copies. |
+| `replica volume N node X rid R open_gen G` | One line per copy: the copy's replica id (drawn once, when its directory is made; a new id means a new, empty copy) and its open generation (one more at every start of its server, recorded by the group before the copy answers). |
+| `volumes N users M` | How many volumes and users the group holds (users: always 0 in the preview). |
 
 How many voters? The group has one voter with one or two members, three with three or four, and five with five or
 more (at most `--voters`). A member that does not vote watches.
@@ -308,6 +359,8 @@ Everything below is off without `--cluster`.
 | `--power-feed NAME` | The server's power feed, the same. Shown by `status`. |
 | `--bmc ADDR` | The address of the server's management controller, for the `bmc` failover. Stored; nothing uses it yet. |
 | `--read-barrier on\|off` | This server's own read barrier setting, for shared volumes. Default `on`. |
+| `--wal-sync-ms` | Must stay 0 (sync every write before its answer, the default) with `--cluster`: the server refuses to start otherwise. |
+| `TSDB_CLUSTER_WRITES=1` | In the environment, not an option: lets the leader of a cluster volume take writes in the preview, though nothing is copied. Without it every cluster volume refuses writes (`UNAVAILABLE`). |
 | `--witness` | A member without data: needs `--cluster`, takes no `--dir` (and has no client port). Give it `--advertise`, the host the others reach it at. It votes and keeps the group's state. |
 
 The client port, `--dir` and every other option work as without `--cluster`. For a script: with `--port-file F` the
@@ -325,6 +378,7 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 | `tsdb cluster secret FILE` | Make a new secret: 32 random bytes as hex, mode 0600. Never overwrites a file. |
 | `tsdb cluster init PEER --secret-file F [options]` | Make the cluster on one server that is in no cluster yet. It becomes node 1 and the leader. The options fix the settings (below). |
 | `tsdb cluster node add PEER NEW_PEER --secret-file F` | Add the server at `NEW_PEER` (running with `--cluster`, in no cluster yet). `PEER` is any member; the command follows to the leader. A server that is already a member is added again without harm (the same number). |
+| `tsdb cluster volume add PEER NAME [--replicas N] --secret-file F` | Add a cluster volume called `NAME` on `N` servers (default: the cluster's `--replication`), in different racks where it can. Answers with its number. Refused when fewer than `N` members are up and may hold volumes. A name is never used twice. |
 | `tsdb cluster status PEER --secret-file F` | What that server knows (see above). |
 
 Options of `init`. Each number is a whole number above 0. The settings are stored and shown; in the preview nothing acts on
@@ -346,8 +400,15 @@ for later.
 | `--failover lease\|attested\|bmc` | lease | How a dead owner is replaced in shared mode. |
 | `--read-barrier on\|off` | on | Owners answer reads only behind a fenced write (shared mode). |
 | `--lease-s S` | 10 | The lease of a shared volume. |
+| `--lease-ms MS` | 2000 | A replicated volume's leader read lease. |
+| `--drift-ppm N` | 500 | The clock drift every lease allows for. |
+| `--unanswered-ms MS` | 1000 | A copy kept in sync that does not answer a promotion is dropped after this. |
+| `--commit-interval-ms MS` | 5 | The commit point reaches the copies within this. |
+| `--repl-retain-mb MB` | 4096 | Log kept for a copy that fell behind, at most. |
+| `--repl-retain-s S` | 1800 | And for at most this long. |
+| `--idle-seal-ms MS` | 1000 | An idle leader closes its log segment after this. |
 
-The design lists more commands (`node drain` and `out`, `volume add` and `move`, `user`, `restore`, `adopt` and
+The design lists more commands (`node drain` and `out`, `volume move`, `user`, `restore`, `adopt` and
 others). They are not built: `tsdb cluster` prints what exists.
 
 ## What's next
