@@ -560,7 +560,7 @@ static int decide_fresh(eng *db, const fstat_ *st, size_t n)
         if (cls_byte(db, st[i].s) & CLS_DECIDED)
             continue; /* a flush or another insert was first */
         double rate = rate_of(st[i].n, st[i].tmin, st[i].tmax);
-        int c = rate < 0 ? 0 : class_choose(db, rate, class_cap(db, st[i].s));
+        int c = rate < 0 || db->rp ? 0 : class_choose(db, rate, class_cap(db, st[i].s)); /* a replica: the leader's CLASS */
         if (c)
             r[k++] = (cls_rec){st[i].s, INT64_MIN, c};
         else {
@@ -880,6 +880,8 @@ typedef struct sw {
     uint32_t s;
     int cls;
     const int64_t *at; /* test hook: this T instead of the computed one */
+    bool pos;          /* a replica applying the leader's record: it goes to CLASSES at offset `off` (see cls_apply) */
+    uint64_t off;
 } sw;
 
 #define CLS_FAR_MS (366 * 86400000LL) /* a T further ahead of now than this is not written (file comment) */
@@ -901,11 +903,21 @@ static int switch_locked(eng *db, const sw *w, size_t n)
     pthread_mutex_lock(&db->class_lock);
     size_t k = 0;
     int64_t far = sat_add(eng_now_ms(db), CLS_FAR_MS);
+    bool bad = false;
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < n; i++) {
         uint32_t s = w[i].s;
         uint8_t b = cls_byte(db, s);
-        if ((int)(b & CLS_MASK) == w[i].cls && (b & CLS_DECIDED))
+        if (w[i].pos) { /* the leader's record: its place in the file says whether it is done, due or missing */
+            if (eng_test_mutant != MUT_REPLICA_NO_POS) { /* planted: a replay appends again */
+                if (w[i].off < db->cls_off)
+                    continue;
+                if (w[i].off > db->cls_off) {
+                    bad = true;
+                    break;
+                }
+            }
+        } else if ((int)(b & CLS_MASK) == w[i].cls && (b & CLS_DECIDED))
             continue;
         int64_t newest = wal_newest_locked(db, s);
         for (size_t j = 0; j < db->nparts; j++)
@@ -919,7 +931,7 @@ static int switch_locked(eng *db, const sw *w, size_t n)
         /* rows of dropped partitions are no longer listed, but their removal may not be durable yet: a power loss
          * brings them back, and they must still lie before T */
         T = MAX(T, db->cls_dropped_end);
-        if (T == INT64_MAX)
+        if (T == INT64_MAX && !w[i].pos)
             continue; /* rows at the end of time: nothing can come after them */
         if (b & CLS_HIST) {
             pthread_mutex_lock(&db->cls_mu);
@@ -936,10 +948,15 @@ static int switch_locked(eng *db, const sw *w, size_t n)
                             "until the row is gone\n", s, newest, (int)(b & CLS_MASK));
             continue;
         }
+        if (w[i].pos && eng_test_mutant == MUT_REPLICA_CLASS_AT) /* planted: the leader's T, not the one this replica's rows allow */
+            T = *w[i].at;
         r[k++] = (cls_rec){s, w[i].at && *w[i].at > T ? *w[i].at : T, w[i].cls};
     }
     pthread_mutex_unlock(&db->lock);
-    int rc = append_locked(db, r, k);
+    int rc = bad ? TSDB_ERR_CORRUPT : append_locked(db, r, k);
+    if (bad)
+        fprintf(stderr, "tsdb: %s: the leader's CLASSES record is at offset %" PRIu64 ", this replica's file ends at %" PRIu64
+                        ": its history is not the leader's\n", db->dir, w[0].off, db->cls_off);
     if (rc == 0 && k) /* after the records were applied, under cls_rw: a placement that reads it later sees them */
         atomic_fetch_add_explicit(&db->cls_gen, k, memory_order_release);
     pthread_mutex_unlock(&db->class_lock);
@@ -967,17 +984,29 @@ uint64_t cls_gen_now(eng *db) { return atomic_load_explicit(&db->cls_gen, memory
 
 int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp) /* only the leader decides a switch (design-cluster.md 5.4) */
         return TSDB_ERR_READONLY;
     if (!db->cls_on || cls < 0 || cls >= PART_CLASSES || series >= eng_series_count(db))
         return TSDB_ERR_INVALID;
-    sw w = {series, cls, at};
+    sw w = {.s = series, .cls = cls, .at = at};
+    return switch_retry(db, &w, 1);
+}
+
+/* A replica applies a switch the leader decided (a CLASS record): at `at`, or later where this replica's own rows
+ * need it (T past every row of the series in its parts, memtables and the WAL segments that may still replay: the
+ * rule of AGENTS.md, judged on its state, which can hold fewer or more rows than the leader's at that moment). The
+ * leader's record has offset `record_off` in CLASSES: one the file is past was applied before a restart. */
+int cls_apply(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off)
+{
+    if (!db->cls_on || cls < 0 || cls >= PART_CLASSES || series >= eng_series_count(db))
+        return TSDB_ERR_INVALID;
+    sw w = {.s = series, .cls = cls, .at = &at, .pos = true, .off = record_off};
     return switch_retry(db, &w, 1);
 }
 
 int cls_flush_guard(eng *db, const memtable *m)
 {
-    if (!db->cls_on)
+    if (!db->cls_on || db->rp) /* only the leader decides */
         return 0;
     sw *w = NULL;
     size_t k = 0;
@@ -997,7 +1026,7 @@ int cls_flush_guard(eng *db, const memtable *m)
             continue;
         if (!w && !(w = malloc(m->nids * sizeof *w)))
             return TSDB_ERR_NOMEM;
-        w[k++] = (sw){id, to, NULL};
+        w[k++] = (sw){.s = id, .cls = to};
     }
     int rc = switch_locked(db, w, k);
     free(w);
@@ -1018,7 +1047,7 @@ static int64_t newest_from(eng *db, uint32_t s, uint8_t b)
 
 int cls_observe(eng *db, part *p)
 {
-    if (!db->cls_on || db->opt.read_only || p->ng == 0)
+    if (!db->cls_on || db->opt.read_only || db->rp || p->ng == 0)
         return 0;
     /* the checks below catch a run table that damage made impossible, not one that names another valid series in
      * order: only the checksum does, and a class record is for good */
@@ -1056,7 +1085,7 @@ int cls_observe(eng *db, part *p)
             continue;
         if (!w && !(w = malloc(p->ng * sizeof *w)))
             return TSDB_ERR_NOMEM;
-        w[k++] = (sw){s, to, NULL};
+        w[k++] = (sw){.s = s, .cls = to};
     }
     int rc = 0;
     if (k)

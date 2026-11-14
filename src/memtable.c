@@ -237,7 +237,7 @@ static void mt_unreserve(memtable *m, const uint32_t *series, size_t n)
         m->s[series[k]].pend = 0;
 }
 
-static int mt_reserve_rows(memtable *m, const uint32_t *series, uint32_t cs, size_t n)
+int mt_reserve_rows(memtable *m, const uint32_t *series, uint32_t cs, size_t n)
 {
     uint32_t nids0 = m->nids;
     int rc = 0;
@@ -501,9 +501,9 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
 
 /* ------------------------------------------------------------------ WAL */
 
-static void wal_name(char *buf, size_t len, uint64_t seq) { snprintf(buf, len, "wal_%016" PRIx64 ".log", seq); }
+void wal_name(char *buf, size_t len, uint64_t seq) { snprintf(buf, len, "wal_%016" PRIx64 ".log", seq); }
 
-static int wal_open_segment(eng *db, uint64_t seq, int *fd)
+int wal_open_segment(eng *db, uint64_t seq, int *fd)
 {
     char name[64];
     wal_name(name, sizeof name, seq);
@@ -520,7 +520,7 @@ static int wal_open_segment(eng *db, uint64_t seq, int *fd)
 }
 
 /* errno tells why on failure */
-static int write_full(int fd, const void *buf, size_t len)
+int write_full(int fd, const void *buf, size_t len)
 {
     const uint8_t *p = buf;
     while (len) {
@@ -730,13 +730,13 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
 
 /* A marker record: appended to the same buffer as the rows, in order, and made durable before it returns (markers
  * are rare). body_len is a multiple of 4 (the record is 4-byte aligned). */
-int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void *body, size_t body_len,
-               uint64_t *fno)
+/* Appends the marker record to the WAL buffer: buf_lock held. *lsn is its commit target (wal_commit). */
+static int wal_marker_locked(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void *body, size_t body_len,
+                             uint64_t *fno, uint64_t *lsn_out)
 {
     if (!db->wal_enabled || span == 0 || body_len % 4 != 0 || body_len > ((size_t)1 << 27))
         return TSDB_ERR_INVALID;
     size_t plen = WAL_MARKER_HDR + body_len;
-    pthread_mutex_lock(&db->buf_lock);
     int rc = eng_check(db);
     if (rc == 0 && db->fno_next >= FNO_BOUND_MAX - span) {
         eng_fail(db, "WAL numbers", EOVERFLOW);
@@ -769,6 +769,18 @@ int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void
         db->wal_len += WAL_HDR + plen;
         lsn = ++db->wal_appended;
     }
+    *lsn_out = lsn;
+    return rc;
+}
+
+int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void *body, size_t body_len,
+               uint64_t *fno)
+{
+    if (!db->wal_enabled || span == 0 || body_len % 4 != 0 || body_len > ((size_t)1 << 27))
+        return TSDB_ERR_INVALID;
+    uint64_t lsn = 0;
+    pthread_mutex_lock(&db->buf_lock);
+    int rc = wal_marker_locked(db, type, flags, span, body, body_len, fno, &lsn);
     pthread_mutex_unlock(&db->buf_lock);
     return rc ? rc : wal_commit(db, lsn);
 }
@@ -978,6 +990,8 @@ void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end)
 
 bool lw_enter(eng *db, lw_fence *f)
 {
+    if (db->jr) /* a leader of a replicated volume: marker order is block order (design-cluster.md 5.2) */
+        pthread_mutex_lock(&db->jr_serial);
     pthread_mutex_lock(&db->lock); /* nflushing changes under db->lock, the active memtable under both */
     pthread_cond_init(&f->cv, NULL);
     pthread_mutex_lock(&db->buf_lock);
@@ -1008,6 +1022,8 @@ void lw_leave(eng *db, lw_fence *f)
         free(f->r);
     else if (f->r)
         lw_table_put(); /* no one reads it any more: unlinked under buf_lock */
+    if (db->jr)
+        pthread_mutex_unlock(&db->jr_serial);
     f->r = NULL;
     f->r_heap = false;
 }
@@ -1045,6 +1061,8 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
      * flushes keep failing every write is refused here, so the memtable stops at the size it had. No lock is held,
      * as for the flush this replaces; the flush takes flush_lock and the WAL writer role, which this writer does
      * not hold, having appended nothing. */
+    if (db->rp) /* a replica's rows come from the leader's log, as records (replica.c) */
+        return TSDB_ERR_READONLY;
     pthread_mutex_lock(&db->buf_lock);
     if (db->active->rows >= 2 * db->opt.buffer_rows) {
         pthread_mutex_unlock(&db->buf_lock);
@@ -1159,6 +1177,8 @@ static void wal_unlink_upto(eng *db, uint64_t seq, const fseg *info)
     if (db->wal_enabled) {
         bool feed = atomic_load(&db->feed_on); /* changed only under flush_lock */
         for (uint64_t s = db->wal_unlink_next ? db->wal_unlink_next : seq; s <= seq; s++) {
+            if (db->jr && db->jr->seg_done) /* a leader's driver reads what it still has to send of it */
+                db->jr->seg_done(db->jr->ctx, db, s);
             if (wal_retire_name(db, s, feed, s == seq ? info : NULL) != 0 && errno != ENOENT) {
                 char name[64];
                 wal_name(name, sizeof name, s);
@@ -1180,7 +1200,7 @@ static void wal_unlink_upto(eng *db, uint64_t seq, const fseg *info)
 
 /* Writes every memtable waiting to be flushed, oldest first; one whose write
  * failed stays in the list to be retried. Called with flush_lock held. */
-static int flush_waiting(eng *db)
+int flush_waiting(eng *db)
 {
     int rc = 0;
     for (size_t i = 0; i < db->nflushing && rc == 0;) {
@@ -1226,7 +1246,9 @@ static int flush_waiting(eng *db)
         free(pl.p);
         if (mrc == 0) /* the numbers of the segment stay used after it is gone (fno.c) */
             mrc = fno_require(db, m->fno_end);
-        if (mrc == 0)
+        if (mrc == 0 && db->rp) /* a replica unlinks at or below its saved commit floor only (replica.c) */
+            replica_flushed(db, m->wal_seq, m->fno_end);
+        else if (mrc == 0)
             wal_unlink_upto(db, m->wal_seq, NULL); /* else MANIFEST may still name it: a follower would tail it */
         if (mrc == 0)
             mrc = cls_flush_guard(db, m); /* a series of a long class that got fast moves on now */
@@ -1243,15 +1265,32 @@ static int flush_waiting(eng *db)
  * behind), any other value is the flush's error, as a failed allocation or a tmp part that cannot be written gives */
 int (*mt_test_flush_fail)(void);
 
-int mt_flush(eng *db)
+int mt_flush(eng *db) { return mt_flush_ex(db, NULL, NULL); }
+
+/* mt_flush; with `marker`, that marker record is also appended and made durable, as the first record of the segment
+ * the flush starts (the rows before it are in the sealed segments the flush writes; nothing a writer appends after
+ * it is flushed here): a replica that applies it has sealed and flushes exactly the memtables the leader flushed
+ * (the DROP marker, design-cluster.md 5.2). With an empty active memtable there is no new segment: the marker
+ * goes into the current one, and the replica checks that its memtable holds no rows then. *fno: its first number. */
+int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
 {
     if (db->opt.read_only)
         return 0;
+    if (db->rp) /* the replica's rows live in the memtable of their leader segment; sealed ones flush (replica.c) */
+        return replica_flush(db);
     int (*hook)(void) = __atomic_load_n(&mt_test_flush_fail, __ATOMIC_RELAXED); /* the tests set it while threads run */
     if (hook) {
         int hr = hook();
         if (hr)
             return hr == INT_MIN ? 0 : hr;
+    }
+    uint8_t *mbody = NULL; /* the marker's encoded payload */
+    size_t mlen = 0;
+    uint64_t mlsn = 0;
+    if (marker) {
+        int mrc = mk_encode(marker, &mbody, &mlen);
+        if (mrc)
+            return mrc;
     }
     pthread_mutex_lock(&db->flush_lock);
     /* a memtable whose write failed earlier holds older rows than the active
@@ -1261,6 +1300,12 @@ int mt_flush(eng *db)
     wal_writer_enter(db); /* no commit may write to the segment being retired */
     pthread_mutex_lock(&db->buf_lock);
     bool empty = db->active->rows == 0;
+    if (marker && rc == 0 && empty && eng_check(db) == 0) { /* in the same hold as the check: no row slips in before it */
+        uint32_t span;
+        memcpy(&span, mbody + 4, 4);
+        rc = wal_marker_locked(db, marker->type, marker->flags, span, mbody + MK_HDR, mlen - MK_HDR, fno, &mlsn);
+        marker = NULL; /* done */
+    }
     pthread_mutex_unlock(&db->buf_lock);
     if (rc == 0)
         rc = eng_check(db); /* rows of a failed engine may not be durable: none become parts */
@@ -1295,6 +1340,12 @@ int mt_flush(eng *db)
             db->wal_fd = newfd;
             db->wal_seq = seq;
             db->flushing[db->nflushing++] = m;
+            if (marker) { /* the first record of the new segment */
+                uint32_t span;
+                memcpy(&span, mbody + 4, 4);
+                rc = wal_marker_locked(db, marker->type, marker->flags, span, mbody + MK_HDR, mlen - MK_HDR, fno, &mlsn);
+                marker = NULL;
+            }
             pthread_mutex_unlock(&db->buf_lock);
             pthread_mutex_unlock(&db->lock);
             if (db->wal_enabled) {
@@ -1309,11 +1360,18 @@ int mt_flush(eng *db)
             manifest_publish(db); /* followers start tailing the new segment */
         }
     }
+    if (marker && rc == 0)
+        rc = TSDB_ERR_IO; /* no marker was appended (a memtable still waiting to flush): the caller must not go on */
     wal_writer_leave(db);
 
     if (rc == 0)
         rc = flush_waiting(db);
     pthread_mutex_unlock(&db->flush_lock);
+    free(mbody);
+    if (mlsn && rc == 0)
+        rc = wal_commit(db, mlsn); /* the marker is durable before the caller goes on */
+    else if (mlsn)
+        wal_commit(db, mlsn);
     return rc;
 }
 
@@ -1347,6 +1405,12 @@ void *flusher_main(void *arg)
         bool sync = db->opt.wal_sync_ms > 0 && now - db->last_wal_sync_ms >= db->opt.wal_sync_ms;
         uint64_t target = db->wal_appended;
         pthread_mutex_unlock(&db->buf_lock);
+        if (db->rp && !flush) { /* a replica's memtable of a finished leader segment waits to be written; nflushing is
+                                   db->lock's, which the flusher may not take under buf_lock */
+            pthread_mutex_lock(&db->lock);
+            flush = db->nflushing > 0;
+            pthread_mutex_unlock(&db->lock);
+        }
         int rc = eng_check(db); /* a failed engine writes nothing more */
         if (rc == 0 && sync) {
             rc = wal_commit(db, target);
@@ -1366,22 +1430,15 @@ void *flusher_main(void *arg)
 
 /* ----------------------------------------------------------------- open */
 
-typedef struct seg {
-    uint64_t seq;
-    uint64_t fno_first, fno_end; /* the first number of its first valid record (0: none) and where the numbers end */
-    size_t end; /* a writer's open: where the valid records end, as wal_check_segment found */
-    size_t len; /* and the segment's size */
-    char name[256];
-} seg;
 
-static int cmp_seg(const void *a, const void *b)
+int cmp_seg(const void *a, const void *b)
 {
-    uint64_t x = ((const seg *)a)->seq, y = ((const seg *)b)->seq;
+    uint64_t x = ((const wal_seg *)a)->seq, y = ((const wal_seg *)b)->seq;
     return (x > y) - (x < y);
 }
 
 /* Highest WAL sequence already stored in a partition's parts. Caller holds no locks; open is single threaded. */
-static uint64_t partition_wal_seq(eng *db, int64_t partition)
+uint64_t partition_wal_seq(eng *db, int64_t partition)
 {
     uint64_t best = 0;
     for (size_t i = 0; i < db->nparts; i++)
@@ -1390,7 +1447,7 @@ static uint64_t partition_wal_seq(eng *db, int64_t partition)
     return best;
 }
 
-static int read_file(int dirfd, const char *name, uint8_t **out, size_t *len)
+int read_file(int dirfd, const char *name, uint8_t **out, size_t *len)
 {
     int fd = openat(dirfd, name, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
@@ -1428,7 +1485,7 @@ static int read_file(int dirfd, const char *name, uint8_t **out, size_t *len)
  * (with its torn tail), so a refusal found in a later segment would come after the earlier ones were changed. The
  * checks are the replay's own: records out of order, a row of a series SERIES lacks, a tail that reads otherwise
  * the second time. s->end is where the valid records end. */
-static int wal_check_segment(eng *db, seg *s)
+int wal_check_segment(eng *db, wal_seg *s)
 {
     uint8_t *buf;
     size_t len, pos = 0, rec;
@@ -1462,7 +1519,8 @@ static int wal_check_segment(eng *db, seg *s)
             int64_t ts;
             uint64_t slot;
             wal_row(r, &id, &ts, &slot);
-            if (id >= count) {
+            /* a replica's log runs ahead of its dictionaries: a SERIES marker above its commit floor creates the id */
+            if (id >= count && !db->rp) {
                 fprintf(stderr,
                         "tsdb: WAL segment %s names series %" PRIu32 " in the record at offset %zu, but SERIES has "
                         "only %" PRIu32 ": SERIES is damaged. Nothing was changed: restore SERIES from a backup or "
@@ -1499,7 +1557,7 @@ static int wal_check_segment(eng *db, seg *s)
  * of k with records after it is damage at rest to acknowledged rows, unless parts hold k's rows already (flushes go in
  * segment order and give their parts the segment's number; large inserts give 0). With fsync = 0 nothing above is
  * synced, and a power loss looks like this damage, as it does elsewhere: the open fails. */
-static int wal_check_order(const seg *segs, size_t nseg, uint64_t parts_seq)
+int wal_check_order(const wal_seg *segs, size_t nseg, uint64_t parts_seq)
 {
     for (size_t k = 0; k + 1 < nseg; k++) {
         if (segs[k].end == segs[k].len || parts_seq >= segs[k].seq)
@@ -1530,7 +1588,7 @@ bool wal_file_name(const char *name)
  * then calls before_replay (the open's cuts of torn tails), so nothing is written or cut until all checks passed. */
 /* A writer's open: the next number is the largest of FNO's valid slot, the end of every valid record of every segment
  * and 1 + the largest part range (design-cdc.md 2.1). Numbers also go up from segment to segment. */
-static int wal_open_numbers(eng *db, const seg *segs, size_t nseg)
+int wal_open_numbers(eng *db, const wal_seg *segs, size_t nseg)
 {
     uint64_t next = 1, prev_end = 0;
     for (size_t k = 0; k < nseg; k++) {
@@ -1638,7 +1696,7 @@ static int wal_seal_replayed(eng *db, const char *name, size_t valid, size_t len
 int wal_open(eng *db, int (*before_replay)(eng *))
 {
     bool ro = db->opt.read_only;
-    seg *segs = NULL;
+    wal_seg *segs = NULL;
     size_t nseg = 0, cap = 0;
     uint64_t max_fwal = 0;
     DIR *d = fdopendir(dup(db->dirfd));
@@ -1656,7 +1714,7 @@ int wal_open(eng *db, int (*before_replay)(eng *))
             continue;
         if (nseg == cap) {
             cap = cap ? cap * 2 : 16;
-            seg *s = realloc(segs, cap * sizeof *s);
+            wal_seg *s = realloc(segs, cap * sizeof *s);
             if (!s) {
                 closedir(d);
                 free(segs);
@@ -1831,7 +1889,9 @@ void wal_close(eng *db)
     if (db->wal_fd >= 0) {
         close(db->wal_fd);
         db->wal_fd = -1;
-        if (db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db) && !db->retiring) {
+        /* a replica's log is the leader's: no empty segment is dropped, no exact next number stored (a cut can still
+         * lower the log end after a reopen) */
+        if (!db->rp && db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db) && !db->retiring) {
             /* a clean close holds the exact next number; an empty segment carries none, so FNO must before it goes */
             if (fno_require(db, db->fno_next) == 0) {
                 char name[64];
@@ -1852,6 +1912,7 @@ void wal_close(eng *db)
     db->nflushing = 0;
     mt_unref(db->active);
     db->active = NULL;
+    replica_free(db);
     free(db->wal_buf);
     free(db->wal_spare);
     db->wal_buf = db->wal_spare = NULL;

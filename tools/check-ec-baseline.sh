@@ -4,8 +4,8 @@
 # -mssse3 (its kernel has no target attribute and the copy is never edited), and the compiler vectorised iso_gf256_init
 # with pshufb, which runs in every process that loads libtsdb before the CPU is asked. The Makefile's EC_CFLAGS keep
 # that out (-fno-tree-vectorize); this compiles the three files with those flags and no -march and fails when an
-# SSSE3 instruction (pshufb, palignr, pmaddubsw, pabs*, phadd*, psign*) is in any function but iso_gf256_mul_add_ssse3
-# (and mul_set's, if upstream has one). x86-64 only.
+# SSSE3 instruction (pshufb, palignr, pmaddubsw, pabs*, phadd*, psign*) is in any function but the SSSE3 kernels
+# (iso_gf256_mul_add_ssse3, and mul_set's and dot's if upstream has them). x86-64 only.
 #
 #   EC_CFLAGS='-mssse3 -fno-tree-vectorize' CC=cc tools/check-ec-baseline.sh
 set -eu
@@ -20,7 +20,7 @@ for f in gf256 rs compat; do
         -c -o "$t/$f.o" "src/ec/$f.c"
     objdump -d "$t/$f.o" | awk -v f="$f" '
         /^[0-9a-f]+ <.*>:/ { fn = $2 }
-        /[ \t](pshufb|palignr|pmaddubsw|pabs[bwd]|phadd[wd]|phaddsw|psign[bwd]|pmulhrsw)[ \t]/ && fn !~ /^<iso_gf256_mul_(add|set)_ssse3>:/ {
+        /[ \t](pshufb|palignr|pmaddubsw|pabs[bwd]|phadd[wd]|phaddsw|psign[bwd]|pmulhrsw)[ \t]/ && fn !~ /^<iso_gf256_(mul_(add|set)|dot)_ssse3>:/ {
             print "check-ec-baseline: src/ec/" f ".c: SSSE3 in " fn ": " $0; bad = 1 }
         END { exit bad }' || bad=1
 done

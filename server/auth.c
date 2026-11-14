@@ -33,6 +33,7 @@
  */
 #define _GNU_SOURCE
 #include "auth.h"
+#include "tenants.h"
 #include "tsdb_protocol.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/compat.h" /* tsdb_thread_create (macOS: an 8 MB stack); nothing new on Linux */
@@ -78,6 +79,8 @@ const auth_op auth_ops[256] = {
     [TSDB_OP_QUERY_TWA] = ID0(R_READ, S_STATUS),
     [TSDB_OP_QUERY_MULTI] = {P_SERIES, W_MULTI, S_MULTI, R_READ, 0},
     [TSDB_OP_QUERY_LATEST] = {P_SERIES, W_MULTI, S_LATEST, R_READ, 0}, /* the ids are checked in the handler */
+    [TSDB_OP_STATS_SERIES] = {P_SERIES, W_MULTI, S_STATUS, R_READ, 0},   /* every id, in the handler (DENIED per series) */
+    [TSDB_OP_STATS_TENANTS] = {P_LOGIN, W_NONE, S_STATUS, 0, 0},         /* each tenant, in the handler (section 4) */
     [TSDB_OP_DELETE_RANGE] = ID0(R_DELETE, S_STATUS),
     [TSDB_OP_SET_RETENTION] = ID0(R_DELETE, S_STATUS),
     [TSDB_OP_REPLACE_RANGE] = {P_SERIES, W_ID8, S_STATUS, R_INSERT | R_DELETE, 0},
@@ -117,6 +120,9 @@ struct auth_user {
     uint8_t all;      /* rights on every series (R_EVERY for a superuser), admin expanded */
     bool superuser;
     bool writer;      /* insert or delete on some selector (COMMIT) */
+    uint16_t tslot;   /* the user's tenant (ST6), under the tenant list of generation tgen: a state made under
+                       * another generation is rebuilt (reg_sync) */
+    uint32_t tgen;
     user *u;          /* its index built (user_index_build): rights_of only reads it */
     _Atomic(map_vlo *) vhi[256];
     atomic_size_t map_bytes;
@@ -335,6 +341,7 @@ static auth_user *au_get(uint32_t uid)
     }
     au->all = au->superuser || (all & R_ADMIN) ? R_EVERY : all;
     au->writer |= au->superuser;
+    au->tslot = tn_slot_user(u, &au->tgen);
     reg[nreg++] = au;
     return au;
 }
@@ -354,7 +361,7 @@ static void reg_sync(void)
     for (size_t i = 0; i < nreg;) {
         auth_user *au = reg[i];
         const user *u = snap_by_uid(snap, au->uid);
-        if (u && u->batch == au->batch && !unheld(au)) {
+        if (u && u->batch == au->batch && au->tgen == tn_gen() && !unheld(au)) {
             i++;
             continue;
         }
@@ -393,6 +400,14 @@ static int publish(void)
     if (s)
         snap_free(old, taken); /* no reader left: they read snap only under auth_mu */
     free(taken);
+    if (s) { /* the default tenants (ST5): the prefixes that someone holds admin on, applied once they stay */
+        char **v;
+        size_t n;
+        if (tn_from_users(&us, &v, &n) == 0) {
+            tn_offer(v, n);
+            tn_free_list(v, n);
+        }
+    }
     return 0;
 }
 
@@ -553,6 +568,7 @@ static int login_failed(auth_conn *a, const char *peer, const char *why)
                 peer ? peer : "?", why);
     scram_clear(a);
     a->state = AS_FAILED;
+    tn_count(tn_slot_name(a->name, strlen(a->name)), TN_FAILED_LOGINS, 1); /* by the name tried, not by a user */
     return TSDB_ERR_AUTH;
 }
 
@@ -757,6 +773,27 @@ int auth_fresh(auth_conn *a)
 }
 
 static bool enough(uint8_t have, uint8_t need) { return need == NEED_ANY ? (have & R_EVERY) != 0 : (have & need) == need; }
+
+uint16_t auth_tenant(const auth_conn *a) { return a->au ? a->au->tslot : 0; }
+
+bool auth_tenants_full(const auth_conn *a)
+{
+    return !a->au || a->au->superuser || (a->au->all & R_READ);
+}
+
+bool auth_tenant_visible(const auth_conn *a, const char *prefix, size_t len)
+{
+    if (auth_tenants_full(a))
+        return true;
+    if (len == 0)
+        return false; /* "(none)" is the whole server's rest: for those who see everything */
+    for (uint32_t i = 0; i < a->au->u->ng; i++) {
+        const user_grant *g = &a->au->u->g[i];
+        if (g->kind == SEL_PREFIX && (g->rights & R_ADMIN) && g->len <= len && memcmp(g->sel, prefix, g->len) == 0)
+            return true;
+    }
+    return false;
+}
 
 bool auth_all(const auth_conn *a, uint8_t need) { return !a->au || enough(a->au->all, need); }
 

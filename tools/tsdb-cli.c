@@ -4,6 +4,7 @@
 #include "common.h"
 #include "dump.h"
 #include "tsdb.h"
+#include "../client/tsdb_client.h"
 #include "tsdb_calendar.h"
 
 #include <errno.h>
@@ -92,6 +93,11 @@ static void usage(void)
             "                                     from the arguments and FILE (one per line, # comments)\n"
             "  stats hot [reads|writes|bytes] [-k N]  the series with the most bytes per row (reads and writes\n"
             "                                     are counted by a running server, so they are empty here)\n"
+            "  stats series|tenants|hot ... --server HOST:PORT [--login NAME [--login-password-file F]]\n"
+            "                                     the same through a running tsdbd (no directory), as the user\n"
+            "                                     who logs in: only the tenants and series that user may see;\n"
+            "                                     tenants also takes --caller (what its own requests cost) and\n"
+            "                                     --hot K (its hottest series); hot takes reads|writes|bytes -k N\n"
             "  parts                              list active parts (partition class and range)\n"
             "  optimize                           merge every partition into one part\n"
             "  drop-before <time>                 drop whole partitions ending before <time>\n"
@@ -115,6 +121,7 @@ static void usage(void)
 
 int user_main(const char *dir, int argc, char **argv); /* tools/users-cli.c */
 int cluster_cli(int argc, char **argv);                /* tools/cluster-cli.c */
+int cli_connect(const char *server, const char *login, const char *login_pwfile, tsdbc **out); /* users-cli.c */
 
 static void die(const char *what, int rc)
 {
@@ -781,6 +788,27 @@ static int cmd_stats(tsdb *db)
     return 0;
 }
 
+/* One line of `stats series`, from a local or a remote record. */
+static void print_series_stat(const char *name, const tsdb_series_stat *s)
+{
+    char a[40] = "-", b[40] = "-", lw[40] = "-";
+    if (s->status != 0)
+        die(name, s->status);
+    if (!(s->flags & TSDB_SSTAT_NO_RANGE)) {
+        format_time(s->first_ts, a, sizeof a);
+        format_time(s->last_ts, b, sizeof b);
+    }
+    if (s->last_write_ms)
+        format_time(s->last_write_ms, lw, sizeof lw);
+    put_name(stdout, name);
+    printf("\t%s\tclass %d\t%" PRIu64 " rows (%" PRIu64 " in memtables, %" PRIu64 " nulls)\t%" PRIu64
+           " bytes (%" PRIu64 " ts, %" PRIu64 " values, %" PRIu64 " index, %" PRIu64 " tombstones)\t%" PRIu64
+           " parts, %" PRIu64 " partitions, %" PRIu64 " granules (%" PRIu64 " full)\t%s .. %s\twritten %s\n",
+           type_names[s->type], s->cls, s->rows, s->memtable_rows, s->nulls,
+           s->ts_bytes + s->value_bytes + s->index_bytes + s->tomb_bytes, s->ts_bytes, s->value_bytes,
+           s->index_bytes, s->tomb_bytes, s->parts, s->partitions, s->granules, s->full_granules, a, b, lw);
+}
+
 /* `tsdb DIR stats series NAME...`: one line per series, from the granule index (rows and bytes as stored, which
  * include rows a newer write or a tombstone hides until a merge removes them). */
 static int cmd_stats_series(tsdb *db, int n, char **names)
@@ -804,25 +832,8 @@ static int cmd_stats_series(tsdb *db, int n, char **names)
             die("stats series", rc);
         done += d;
     }
-    for (int i = 0; i < n; i++) {
-        const tsdb_series_stat *s = &out[i];
-        char a[40] = "-", b[40] = "-", lw[40] = "-";
-        if (s->status != 0)
-            die(names[i], s->status);
-        if (!(s->flags & TSDB_SSTAT_NO_RANGE)) {
-            format_time(s->first_ts, a, sizeof a);
-            format_time(s->last_ts, b, sizeof b);
-        }
-        if (s->last_write_ms)
-            format_time(s->last_write_ms, lw, sizeof lw);
-        put_name(stdout, names[i]);
-        printf("\t%s\tclass %d\t%" PRIu64 " rows (%" PRIu64 " in memtables, %" PRIu64 " nulls)\t%" PRIu64
-               " bytes (%" PRIu64 " ts, %" PRIu64 " values, %" PRIu64 " index, %" PRIu64 " tombstones)\t%" PRIu64
-               " parts, %" PRIu64 " partitions, %" PRIu64 " granules (%" PRIu64 " full)\t%s .. %s\twritten %s\n",
-               type_names[s->type], s->cls, s->rows, s->memtable_rows, s->nulls,
-               s->ts_bytes + s->value_bytes + s->index_bytes + s->tomb_bytes, s->ts_bytes, s->value_bytes,
-               s->index_bytes, s->tomb_bytes, s->parts, s->partitions, s->granules, s->full_granules, a, b, lw);
-    }
+    for (int i = 0; i < n; i++)
+        print_series_stat(names[i], &out[i]);
     free(ids);
     free(out);
     return 0;
@@ -1060,6 +1071,128 @@ static int cmd_stats_hot(tsdb *db, int argc, char **argv)
     return 0;
 }
 
+/* `tsdb stats series|tenants|hot ... --server HOST:PORT [--login NAME [--login-password-file F]]`: the same numbers
+ * from a running tsdbd (protocol 15), as the user who logs in, so a tenant admin needs no shell on the server. What
+ * the user may not see is refused or left out by the server: the "(none)" tenant, the threshold of a hot list and
+ * the hot lists of tenants the user does not administer. A password is never an argument. */
+static int stats_online(const char *server, const char *login, const char *pwfile, const char *what, int n,
+                        char **a)
+{
+    bool volumes = false, caller = false, tenants = strcmp(what, "tenants") == 0, hotcmd = strcmp(what, "hot") == 0;
+    int kind = TSDB_HOT_BYTES_PER_ROW, hot = 0;
+    long k = 20;
+    const char **names = calloc((size_t)(n > 0 ? n : 1), sizeof *names);
+    int nn = 0;
+    if (!names)
+        die("stats", TSDB_ERR_NOMEM);
+    for (int i = 0; i < n; i++) {
+        char *end;
+        if (tenants && strcmp(a[i], "--volumes") == 0) {
+            volumes = true;
+        } else if (tenants && strcmp(a[i], "--caller") == 0) {
+            caller = true;
+        } else if ((tenants && strcmp(a[i], "--hot") == 0) || (hotcmd && strcmp(a[i], "-k") == 0)) {
+            if (i + 1 >= n)
+                usage();
+            k = strtol(a[++i], &end, 10);
+            if (*end || k < 1 || k > 256)
+                usage();
+            hot = 1;
+        } else if (hotcmd && strcmp(a[i], "reads") == 0) {
+            kind = TSDB_HOT_READS;
+        } else if (hotcmd && strcmp(a[i], "writes") == 0) {
+            kind = TSDB_HOT_WRITES;
+        } else if (hotcmd && strcmp(a[i], "bytes") == 0) {
+            kind = TSDB_HOT_BYTES_PER_ROW;
+        } else if ((a[i][0] == '-' && a[i][1] == '-') || hotcmd || !a[i][0]) {
+            usage();
+        } else {
+            names[nn++] = a[i];
+        }
+    }
+    if (strcmp(what, "series") == 0 && nn < 1)
+        usage();
+    tsdbc *c;
+    int rc = cli_connect(server, login, pwfile, &c);
+    if (rc)
+        exit(rc);
+    if (strcmp(what, "series") == 0) {
+        tsdb_sid *ids = malloc((size_t)nn * sizeof *ids);
+        tsdb_series_stat *out = malloc((size_t)nn * sizeof *out);
+        if (!ids || !out)
+            die("stats series", TSDB_ERR_NOMEM);
+        for (int i = 0; i < nn; i++)
+            if ((rc = tsdbc_series(c, names[i], 0, &ids[i])) != 0)
+                die(names[i], rc);
+        if ((rc = tsdbc_series_stats(c, ids, (size_t)nn, 0, out)) != 0)
+            die("stats series", rc);
+        for (int i = 0; i < nn; i++)
+            print_series_stat(names[i], &out[i]);
+        free(ids);
+        free(out);
+        tsdbc_close(c);
+        free(names);
+        return 0;
+    }
+    tsdbc_tenant_result r;
+    int flags = (volumes ? TSDB_TSTATS_VOLUMES : 0) | (caller ? TSDB_TSTATS_CALLER : 0) |
+                ((hot || hotcmd) ? TSDB_TSTATS_HOT : 0);
+    if ((rc = tsdbc_tenant_stats(c, names, (size_t)nn, flags, (unsigned)k, &r)) != 0)
+        die(what, rc);
+    static const char *const kn[] = {"?", "reads", "writes", "bytes"};
+    for (size_t i = 0; i < r.nrows; i++) {
+        const tsdbc_tenant_row *t = &r.rows[i];
+        char where[32] = "all";
+        const char *label = t->prefix_len ? t->prefix : "(none)";
+        if (t->volume != TSDB_TENANT_VOLUME_SUM)
+            snprintf(where, sizeof where, "volume %u", t->volume);
+        if (t->status != 0)
+            die(label, t->status);
+        if (tenants) {
+            print_tenant(label, &t->st, where);
+            if (t->st.flags & TSDB_TENANT_PARTIAL)
+                fprintf(stderr, "tsdb: the numbers of %s are stale\n", label);
+        }
+        if (tenants && t->has_caller) {
+            const tsdbc_tenant_caller *q = &t->caller;
+            put_name(stdout, label);
+            printf("\tcaller\t%" PRIu64 " queries, %" PRIu64 " inserts, %" PRIu64 " deletes, %" PRIu64 " admin, %" PRIu64
+                   " other\t%" PRIu64 " rows decoded, %" PRIu64 " from statistics, %" PRIu64 " from memtables\t%" PRIu64
+                   " rows inserted\t%" PRIu64 " denied requests, %" PRIu64 " denied series, %" PRIu64
+                   " failed logins\n",
+                   q->requests_query, q->requests_insert, q->requests_delete, q->requests_admin, q->requests_other,
+                   q->rows_decoded, q->rows_from_stats, q->rows_from_memtable, q->inserted_rows, q->denied_requests,
+                   q->denied_series, q->failed_logins);
+        }
+        for (size_t j = 0; j < t->nhot; j++) {
+            const tsdbc_hot *h = &t->hot[j];
+            if (hotcmd && (h->kind != (uint8_t)kind || h->id == 0))
+                continue;
+            if (hotcmd) {
+                char nm[4096];
+                if (tsdbc_series_name(c, h->id, nm, sizeof nm) != 0)
+                    snprintf(nm, sizeof nm, "#%" PRIu64, h->id);
+                put_name(stdout, nm);
+            } else {
+                put_name(stdout, label);
+                printf("\thot %s\t", h->kind < 4 ? kn[h->kind] : "?");
+                if (h->id == 0)
+                    printf("threshold");
+                else
+                    printf("series %" PRIu64, h->id);
+            }
+            if (h->kind == TSDB_HOT_BYTES_PER_ROW)
+                printf("\t%.3f bytes/row\n", (double)h->estimate / 1000.0);
+            else
+                printf("\t%" PRIu64 " (+- %" PRIu64 ")\n", h->estimate, h->error);
+        }
+    }
+    tsdbc_tenant_result_free(&r);
+    tsdbc_close(c);
+    free(names);
+    return 0;
+}
+
 /* `tsdb DIR latest NAME... [--with-nulls] [--end TIME]`: tsdb_latest for the named series, one TSV line each. */
 static int cmd_latest(tsdb *db, int argc, char **argv)
 {
@@ -1130,13 +1263,13 @@ static int cmd_latest(tsdb *db, int argc, char **argv)
 }
 
 /* Configuration file (docs/config.md): the settings of the commands that talk to a server, so that a login and a
- * cluster secret need not be typed each time. Only `tsdb user ... --server` and `tsdb cluster` read it; the commands
+ * cluster secret need not be typed each time. Only `tsdb user ... --server`, `tsdb stats ... --server` and `tsdb cluster` read it; the commands
  * on a directory take nothing from it. `tsdb --config FILE` names it, `--no-config` reads none, otherwise
  * $XDG_CONFIG_HOME/tsdb/tsdb.properties, ~/.config/tsdb/tsdb.properties or /etc/tsdb/tsdb.properties, the first that
  * exists. The command line wins: an option that is on it is not taken from the file. */
 static const struct cfg_key cli_keys[] = {
-    {"client.server", "server", CFG_STR, 0, NULL, "", "HOST:PORT of a running tsdbd: `tsdb user VERB ... ` goes through it "
-                                                      "(even without --server) and logs in as client.login."},
+    {"client.server", "server", CFG_STR, 0, NULL, "", "HOST:PORT of a running tsdbd: `tsdb user VERB ... ` and `tsdb stats series`, `tenants` and `hot` go "
+                                                      "through it (even without --server) and log in as client.login."},
     {"client.login", "login", CFG_STR, 0, NULL, "", "The user to log in as."},
     {"client.login.password.file", "login-password-file", CFG_STR, 0, NULL, "",
      "A file with that user's password (mode 600). Passwords are never written in the configuration file itself."},
@@ -1287,6 +1420,49 @@ int main(int argc, char **argv)
             if (have_cfg)
                 argv = cli_with_cfg(&cfg, &argc, argv, "client.");
             return user_main(NULL, argc - 2, argv + 2);
+        }
+    }
+    if (strcmp(argv[1], "stats") == 0 &&
+        (strcmp(argv[2], "series") == 0 || strcmp(argv[2], "tenants") == 0 || strcmp(argv[2], "hot") == 0)) {
+        /* `tsdb stats VERB ... --server HOST:PORT`: through a running tsdbd, no directory (no database is named
+         * "stats" with one of these as its command: they are none of the commands on a directory) */
+        int online = 0;
+        for (int i = 3; i < argc; i++)
+            if (strcmp(argv[i], "--server") == 0)
+                online = 1;
+        if (!cfg_tried)
+            have_cfg = cli_cfg_load(&cfg, NULL, no_config), cfg_tried = 1;
+        for (size_t i = 0; have_cfg && !online && i < cfg.n; i++)
+            online = strcmp(cfg.s[i].k->opt, "server") == 0;
+        if (online) {
+            if (have_cfg)
+                argv = cli_with_cfg(&cfg, &argc, argv, "client.");
+            const char *server = NULL, *login = NULL, *pwfile = NULL;
+            char **rest = malloc((size_t)argc * sizeof *rest);
+            int nr = 0;
+            if (!rest)
+                die("stats", TSDB_ERR_NOMEM);
+            for (int i = 3; i < argc; i++) {
+                if (strcmp(argv[i], "--server") == 0 && i + 1 < argc)
+                    server = argv[++i];
+                else if (strcmp(argv[i], "--login") == 0 && i + 1 < argc)
+                    login = argv[++i];
+                else if ((strcmp(argv[i], "--login-password-file") == 0 || strcmp(argv[i], "--password-file") == 0) &&
+                         i + 1 < argc)
+                    pwfile = argv[++i];
+                else if (strncmp(argv[i], "--password", 10) == 0 && strcmp(argv[i], "--password-file") != 0) {
+                    fprintf(stderr, "tsdb: a password is never taken from the command line (ps shows it to every "
+                                    "user):\n      use --login-password-file FILE, TSDB_LOGIN_PASSWORD or the "
+                                    "prompt\n");
+                    return 2;
+                } else
+                    rest[nr++] = argv[i];
+            }
+            if (!server || (pwfile && !login))
+                usage();
+            int rc = stats_online(server, login, pwfile, argv[2], nr, rest);
+            free(rest);
+            return rc;
         }
     }
     const char *dir = argv[1], *cmd = argv[2];

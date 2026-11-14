@@ -44,6 +44,14 @@ fn structs_match_the_c_header() {
             on_deferred, hook_ctx }
         tsdb_latest_result { status, kind, type_, ts, v }
         tsdb_latest_opts { end, ends, with_nulls, threads }
+        tsdb_series_stat { status, cls, type_, flags, rows, nulls, memtable_rows, logical_bytes, ts_bytes, value_bytes,
+            index_bytes, tomb_bytes, parts, partitions, granules, full_granules, first_ts, last_ts, last_write_ms,
+            resident_bytes, reads_est, reads_err, writes_est, writes_err, live_rows }
+        tsdb_tenant_stats { flags, generation, list_hash, series, series_created, active_series_cur,
+            active_series_prev, rows, nulls, logical_bytes, ts_bytes, value_bytes, index_bytes, granules,
+            ingested_rows, ingested_bytes, merged_rows, merge_removed_rows, retention_dropped_rows, resident_bytes,
+            stale_s }
+        tsdb_hot { id, estimate, error }
         tsdb_latest_stats { table, searched, floor_reads, fills_stored, fills_refused, unknown, table_bytes, capped,
             enabled }
     };

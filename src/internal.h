@@ -50,7 +50,17 @@ typedef struct eng eng;
 /* Planted mutations: a test sets eng_test_mutant (tests link the engine) and must then fail, to show that it
  * catches the bug; nothing in the library or the server ever sets it. */
 enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR,
-       MUT_FLUSH_NOCLOSE };
+       MUT_FLUSH_NOCLOSE,
+       MUT_REPLICA_APPLY_ALL, MUT_REPLICA_ACK_UNSYNCED, MUT_REPLICA_KEEP_CUT, MUT_REPLICA_NO_FLOOR, MUT_REPLICA_WALL_CLOCK, MUT_REPLICA_NO_POS, MUT_REPLICA_CLASS_AT,
+       MUT_REPLICA_NO_OPEN_SYNC, MUT_REPLICA_NO_GAP_CHECK, MUT_REPLICA_NO_TORN_CUT, MUT_REPLICA_NO_FLOOR_CHECK,
+       MUT_REPLICA_NO_DURABLE_GATE, MUT_REPLICA_NO_APPLY_CONTIG, MUT_REPLICA_NO_SEALED_RULE, MUT_REPLICA_NO_ROT_SYNC,
+       MUT_REPLICA_NO_CUT_GEN, MUT_REPLICA_NO_CUT_SYNC, MUT_REPLICA_NO_CUT_DIRSYNC, MUT_REPLICA_NO_REPLAY_SKIP,
+       MUT_REPLICA_NO_NOW_MARKER, MUT_REPLICA_COMMIT_CLOCK, MUT_REPLICA_EARLY_SEAL,
+       MUT_REPLICA_NO_STAGE_HOLD, MUT_REPLICA_NO_COMMIT_FLUSH, MUT_REPLICA_NO_DONE_SKIP, MUT_REPLICA_KEEP_STAGED,
+       MUT_REPLICA_NO_DROP_SKIP, MUT_REPLICA_NO_DROP_FLUSH, MUT_REPLICA_NO_STAGE_SYNC,
+       MUT_REPLICA_PROMOTE_UNAPPLIED, MUT_REPLICA_PROMOTE_KEEP_SEGS, MUT_REPLICA_EPOCH_SEG,
+       MUT_REPLICA_NO_DROP_SERIAL, MUT_REPLICA_STAGE_TRUNC,
+       MUT_REPLICA_NO_STAGE_ORPHANS };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1288,6 +1298,7 @@ int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t 
 void mem_run_free(mem_run *r);
 void mt_note_fno(memtable *m, uint64_t first, size_t n);
 int mt_flush(struct eng *db);
+int mt_flush_ex(struct eng *db, const mk *marker, uint64_t *fno); /* mt_flush with a marker as the new segment's first record */
 int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
                size_t n, int type);
 /* WAL records, version 2 (format 9, docs/design-cdc.md 2.1):
@@ -1338,11 +1349,29 @@ enum jr_kind {
     JR_RETENTION,  /* a retention limit was appended */
     JR_DICT,       /* a SERIES, STATE or CLASSES record was appended */
 };
-static inline int jr_intent(struct eng *db, enum jr_kind kind, const void *arg)
-{
-    (void)db, (void)kind, (void)arg;
-    return 0;
-}
+/* JR_COMMIT's `arg`: the pending parts of the insert, replace or delete (op: enum mk_op of marker.h). */
+struct jr_commit_arg {
+    struct part **ps;
+    size_t n;
+    int op;
+};
+/* The replicated backend (replica.c, "the leader side"; design-cluster.md 5.2): installed on a leader's engine by the
+ * driver (tsdbd's cluster thread in R3, tests/test_replica.c here), NULL otherwise (then jr_intent does nothing).
+ * The callbacks run on the writer's thread with no engine lock held except where said. */
+struct jr_ops {
+    void *ctx;
+    /* sends the pending file `file` (the leader's tmp name, `size` bytes, in the volume directory) to every replica of
+     * the ISR, which stages and syncs it under `mname` (replica_stage): the name the marker carries, a part name
+     * p<partition>_<pid>_<n>_0.part (the partition is in no part file); returns when they have */
+    int (*ship)(void *ctx, struct eng *db, const char *file, const char *mname, uint64_t size);
+    /* the marker whose last position is `last` is durable at the leader: returns once the commit point passed it and the
+     * replicas applied it (the leader's own apply follows), or an error (nothing is then published) */
+    int (*wait)(void *ctx, struct eng *db, uint64_t last);
+    /* a flushed WAL segment is about to be removed: the driver reads what it still needs (the records of the segment
+     * not yet sent). Under flush_lock. */
+    void (*seg_done)(void *ctx, struct eng *db, uint64_t seq);
+};
+int jr_intent(struct eng *db, enum jr_kind kind, const void *arg);
 static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
 {
     (void)db, (void)kind, (void)arg;
@@ -1369,6 +1398,33 @@ int wal_commit(struct eng *db, uint64_t target);
 int wal_open(struct eng *db, int (*before_replay)(struct eng *));
 void wal_close(struct eng *db);
 void *flusher_main(void *arg);
+
+/* What the replica engine (replica.c, docs/design-cluster.md 4-5) shares with the writer's WAL code. */
+typedef struct wal_seg {
+    uint64_t seq;
+    uint64_t fno_first, fno_end; /* the first number of its first valid record (0: none) and where the numbers end */
+    size_t end; /* a writer's open: where the valid records end, as wal_check_segment found */
+    size_t len; /* and the segment's size */
+    char name[256];
+} wal_seg;
+struct memtable;
+void wal_name(char *buf, size_t len, uint64_t seq);
+int wal_open_segment(struct eng *db, uint64_t seq, int *fd);
+int write_full(int fd, const void *buf, size_t len);
+uint64_t partition_wal_seq(struct eng *db, int64_t partition);
+int read_file(int dirfd, const char *name, uint8_t **out, size_t *len);
+int wal_check_segment(struct eng *db, wal_seg *s);
+int wal_check_order(const wal_seg *segs, size_t nseg, uint64_t parts_seq);
+int wal_open_numbers(struct eng *db, const wal_seg *segs, size_t nseg);
+int cmp_seg(const void *a, const void *b);
+int flush_waiting(struct eng *db); /* flush_lock held */
+int mt_reserve_rows(struct memtable *m, const uint32_t *series, uint32_t cs, size_t n);
+struct replica;
+int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, struct eng **out);
+int replica_open_log(struct eng *db, uint64_t floor, int (*cut_tails)(struct eng *)); /* instead of wal_open; sets db->rp */
+void replica_free(struct eng *db);                     /* wal_close */
+int replica_flush(struct eng *db);                     /* mt_flush of a replica */
+void replica_flushed(struct eng *db, uint64_t seq, uint64_t fno_end); /* flush_waiting: seq is in parts (flush_lock held) */
 
 #define MAX_FLUSHING 4
 
@@ -1639,6 +1695,9 @@ struct eng {
     memtable *flushing[MAX_FLUSHING]; /* oldest first; guarded by db->lock */
     size_t nflushing;
     bool wal_enabled;
+    struct replica *rp; /* an engine opened as a replica (replica.c): the log arrives verbatim, rows apply at the commit point */
+    const struct jr_ops *jr;   /* the replicated backend of a leader (jr_intent), set before the engine is used */
+    pthread_mutex_t jr_serial; /* with jr: one large write at a time, lw_enter to lw_leave (marker order = block order) */
     int wal_fd;
     uint64_t wal_seq;
     uint64_t wal_off; /* bytes in segment wal_seq (the WAL writer role) */
@@ -1917,6 +1976,13 @@ bool part_beyond_series(const part *p, uint32_t n, uint32_t *s);
 const char *eng_series_name(eng *db, uint32_t id);
 int eng_series_type(eng *db, uint32_t id);
 int eng_state(eng *db, const char *name, bool create, uint32_t *code);
+/* A replica's clock (replica.c): the newest commit_ms or NOW it applied, from parts at open; never the wall clock. */
+int64_t replica_now_ms(eng *db);
+void replica_now_advance(eng *db, int64_t ms);
+/* Replica only (replica.c): the leader's SERIES and STATE records. The id must be the dictionary's next one or an
+ * entry that is there already with this name (and type); anything else is TSDB_ERR_CORRUPT. */
+int eng_series_apply(eng *db, const char *name, size_t len, int type, uint32_t id);
+int eng_state_apply(eng *db, const char *name, size_t len, uint32_t id);
 const char *eng_state_name(eng *db, uint32_t code);
 /* v: slots of `type`; every series must be of that type */
 int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n);
@@ -2104,6 +2170,7 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
                   const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 int eng_optimize(eng *db);
 int eng_drop_before(eng *db, int64_t ts);
+int drop_retire(eng *db, int64_t ts); /* its part after the flush (also a replica's apply of a DROP) */
 int eng_get_stats(eng *db, tsdb_stats *st);
 int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs);
 
@@ -2164,6 +2231,8 @@ int eng_series_class(eng *db, uint32_t series, int *cls);
 uint64_t cls_gen_now(eng *db);
 /* test hook: switch series to cls at the computed T, or at *at when that is later */
 int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at);
+/* Replica only (replica.c): the leader's CLASS record (classes.c cls_apply). */
+int cls_apply(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off);
 int tsdb_test_class_switch(struct tsdb *t, tsdb_sid series, int cls, const int64_t *at); /* through the volumes */
 /* An id no volume can have by its bits: a zero volume field (an id cut to 32 bits) or bits 48-63 set. Queries answer
  * TSDB_ERR_INVALID for it, so a truncated id does not look like an empty range; a well formed id that is unknown
@@ -2210,6 +2279,8 @@ int64_t eng_retention(eng *db, uint32_t series);
 int64_t eng_cutoff(eng *db, uint32_t series); /* rows before it have expired; INT64_MIN when none */
 int64_t eng_cutoff_at(eng *db, uint32_t series, int64_t now);
 int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms);
+/* Replica only: the leader's RETENTION record for `series`, which has record_off in the leader's file (replica.c). */
+int eng_retention_apply(eng *db, uint32_t series, int64_t limit_ms, uint64_t record_off);
 /* delete.c */
 int eng_delete_range(eng *db, uint32_t series, int64_t start, int64_t end);
 int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t end, const int64_t *ts,

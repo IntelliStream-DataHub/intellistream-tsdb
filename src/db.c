@@ -769,6 +769,19 @@ static int load_parts(eng *db, bool read_only)
 
 int eng_open(const char *dir, const tsdb_options *opts, eng **out) { return eng_open_sched(dir, opts, NULL, out); }
 
+/* eng_open_replica asks the open below for a replica (replica.c): taken at its start, so a failed open never leaves it set */
+static __thread bool replica_want;
+static __thread uint64_t replica_floor;
+
+/* Opens dir as a replica of a cluster volume (replica.c): `floor` is the commit floor the driver saved (every log
+ * position up to it is applied at the open). */
+int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, eng **out)
+{
+    replica_want = true;
+    replica_floor = floor;
+    return eng_open_sched(dir, opts, NULL, out);
+}
+
 static __thread int adopt_lockfd = -1;
 /* A check of the opened engine (eng_reopen), run by the open once nothing can fail any more and before the engine's
  * own threads start: they change the parts list (a merge, a flush), which the check reads without a lock. */
@@ -805,6 +818,9 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     *out = NULL;
     feed_opts feed_wanted; /* taken before any failure point: see eng_take_open_feed_want */
     int feed_want = eng_take_open_feed_want(&feed_wanted);
+    bool replica = replica_want;
+    uint64_t floor = replica_floor;
+    replica_want = false;
     simd_init();
     /* 64-byte aligned: the hot fields of the write path are laid out in whole cache lines (internal.h, buf_lock) */
     _Static_assert(_Alignof(eng) == 64, "eng is aligned to a cache line");
@@ -839,7 +855,13 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     db->dirfd = db->lockfd = db->wal_fd = db->fno_fd = -1;
     db->fno_next = 1;
     db->series.fd = -1;
-    db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0;
+    if (replica && (ro || db->opt.wal_sync_ms != 0)) { /* a periodic sync would acknowledge before durability (5.1) */
+        free(db);
+        return TSDB_ERR_INVALID;
+    }
+    db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0 && !replica;
+    if (replica)
+        db->opt.latest_cache = 0; /* its parts arrive whole (COMMIT): no fold lists to build the table from */
     if (latest_open(db) != 0) { /* the latest table (latest.c); a writer's only */
         free(db);
         return TSDB_ERR_NOMEM;
@@ -851,6 +873,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->wal_sync_lock, NULL);
     pthread_mutex_init(&db->manifest_lock, NULL);
     pthread_mutex_init(&db->publish_lock, NULL);
+    pthread_mutex_init(&db->jr_serial, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
     pthread_mutex_init(&db->tl_mu, NULL);
@@ -937,7 +960,9 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             goto fail;
         /* a follower takes WAL rows from the writer's manifest once there is one; a writer cuts torn tails only
            after the WAL's checks too, just before the replay writes anything */
-        if (!db->opt.follow)
+        if (replica)
+            rc = replica_open_log(db, floor, open_cut_tails);
+        else if (!db->opt.follow)
             rc = wal_open(db, ro ? NULL : open_cut_tails);
         else if (!ro)
             rc = open_cut_tails(db);
@@ -945,7 +970,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             goto fail;
     }
     if (!ro) {
-        db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
+        if (!db->rp)
+            db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
         /* and unlinked them, with a directory fsync: all but the ones a failed unlink or rename left (wal_open) */
         db->wal_removed = db->wal_removed_synced = db->wal_open_removed;
         if ((rc = manifest_publish(db)) != 0)
@@ -1158,6 +1184,7 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->wal_sync_lock);
     pthread_mutex_destroy(&db->manifest_lock);
     pthread_mutex_destroy(&db->publish_lock);
+    pthread_mutex_destroy(&db->jr_serial);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);
     pthread_mutex_destroy(&db->tl_mu);
@@ -1251,8 +1278,54 @@ static int dict_get(eng *db, series_dict *d, const char *what, const char *name,
     return rc;
 }
 
+/* A replica makes names only as its log says (replica.c): the entry with this id is the next one of the dictionary, or
+ * one it holds already (a replay after a restart); anything else means its history is not the leader's. */
+static int dict_apply(eng *db, series_dict *d, const char *what, const char *name, size_t len, int type, bool is_state,
+                      uint32_t id)
+{
+    char *s = malloc(len + 1);
+    if (!s)
+        return TSDB_ERR_NOMEM;
+    memcpy(s, name, len);
+    s[len] = 0;
+    uint32_t have = 0;
+    int rc;
+    uint32_t count = atomic_load(&d->count);
+    if (id < count) {
+        rc = series_get(d, s, false, 0, &have);
+        rc = rc == 0 && (have != id || (!is_state && series_type(d, id) != type)) ? TSDB_ERR_CORRUPT
+             : rc == TSDB_ERR_NOTFOUND                                          ? TSDB_ERR_CORRUPT
+                                                                                : rc;
+    } else if (id == count) {
+        rc = dict_get(db, d, what, s, true, is_state ? 0 : type, &have);
+        if (rc == 0 && have != id)
+            rc = TSDB_ERR_CORRUPT;
+    } else {
+        rc = TSDB_ERR_CORRUPT;
+    }
+    if (rc == TSDB_ERR_CORRUPT)
+        fprintf(stderr, "tsdb: %s: the %s entry %" PRIu32 " (\"%s\") does not follow this replica's dictionary of %" PRIu32
+                        " entries: its history is not the leader's\n", db->dir, is_state ? "STATES" : "SERIES", id, s, count);
+    free(s);
+    return rc;
+}
+
+int eng_series_apply(eng *db, const char *name, size_t len, int type, uint32_t id)
+{
+    return dict_apply(db, &db->series, "append to the series dictionary", name, len, type, false, id);
+}
+
+int eng_state_apply(eng *db, const char *name, size_t len, uint32_t id)
+{
+    return dict_apply(db, &db->states, "append to the state dictionary", name, len, 0, true, id);
+}
+
 int eng_series(eng *db, const char *name, int type, uint32_t *id)
 {
+    if (db->rp) { /* names are made by the leader's SERIES records */
+        int rc = series_get(&db->series, name, false, type, id);
+        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_READONLY : rc == 0 && series_type(&db->series, *id) != type ? TSDB_ERR_INVALID : rc;
+    }
     return dict_get(db, &db->series, "append to the series dictionary", name, true, type, id);
 }
 int eng_series_lookup(eng *db, const char *name, uint32_t *id) { return series_get(&db->series, name, false, 0, id); }
@@ -1264,7 +1337,10 @@ int eng_series_type(eng *db, uint32_t id) { return series_type(&db->series, id);
 int eng_state(eng *db, const char *name, bool create, uint32_t *code)
 {
     uint32_t id;
-    int rc = dict_get(db, &db->states, "append to the state dictionary", name, create, 0, &id);
+    bool refuse = create && db->rp; /* a replica's names come from STATE records */
+    int rc = dict_get(db, &db->states, "append to the state dictionary", name, create && !db->rp, 0, &id);
+    if (refuse && rc == TSDB_ERR_NOTFOUND)
+        return TSDB_ERR_READONLY;
     if (rc == TSDB_ERR_NOTFOUND && db->opt.read_only) {
         series_reload(&db->states, db->dirfd); /* the writer may have made it a moment ago */
         rc = series_get(&db->states, name, false, 0, &id);
@@ -1325,7 +1401,7 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
 
 int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *values, size_t n)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp)
         return TSDB_ERR_READONLY;
     if (n && (!series || !ts || !values))
         return TSDB_ERR_INVALID;
@@ -1339,7 +1415,7 @@ int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, con
 
 int eng_insert_series(eng *db, int type, uint32_t series, const int64_t *ts, const void *values, size_t n)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp)
         return TSDB_ERR_READONLY;
     int ucls = -1;
     uint64_t gen = cls_gen_now(db);
@@ -1377,14 +1453,33 @@ int eng_flush(eng *db)
 
 int eng_drop_before(eng *db, int64_t ts)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp)
         return TSDB_ERR_READONLY;
-    /* memtable rows become parts first, so they are dropped with them */
+    /* memtable rows become parts first, so they are dropped with them. A replicated leader's jr_intent does it: its
+     * marker is the first record of the segment after the flush, and rows written since are not flushed here (a
+     * replica has them in its active memtable too, and keeps them) */
+    /* On a leader the drop is ordered with the large writes (jr_serial, above flush_lock): one that has appended its
+     * COMMIT and waits for its commit point publishes its parts first, or this DROP's marker would come after the
+     * COMMIT in every replica's log while the leader retired the partition before the publish (a replica would drop
+     * the rows the leader keeps) */
+    const bool serial = db->jr && eng_test_mutant != MUT_REPLICA_NO_DROP_SERIAL;
+    if (serial)
+        pthread_mutex_lock(&db->jr_serial);
     int rc = jr_intent(db, JR_DROP, &ts);
-    if (rc == 0)
+    if (rc == 0 && !db->jr)
         rc = eng_flush(db);
-    if (rc)
-        return rc;
+    if (rc == 0)
+        rc = drop_retire(db, ts);
+    if (serial)
+        pthread_mutex_unlock(&db->jr_serial);
+    return rc;
+}
+
+/* The part of tsdb_drop_before after the flush: retires every partition that ends at or before ts. A replica runs
+ * it when it applies the DROP marker (replica.c), after it has flushed its sealed memtables. */
+int drop_retire(eng *db, int64_t ts)
+{
+    int rc;
     pthread_mutex_lock(&db->lock);
     /* A merge of a partition being dropped names its output (durably) before it takes db->lock to list it. Dropped
      * meanwhile, its sources are gone and the output is the only part with their rows: a crash after the

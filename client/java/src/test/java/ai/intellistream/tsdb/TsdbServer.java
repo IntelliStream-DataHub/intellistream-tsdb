@@ -77,6 +77,11 @@ final class TsdbServer implements AutoCloseable {
 
     /** Starts the server on {@code dir}, with login required ({@code auth}) or {@code --no-auth}. */
     static TsdbServer start(Path dir, boolean auth) throws IOException, InterruptedException {
+        return start(dir, auth, new String[0]);
+    }
+
+    /** {@link #start(Path, boolean)} with more tsdbd arguments ({@code --tenants FILE}). */
+    static TsdbServer start(Path dir, boolean auth, String... extra) throws IOException, InterruptedException {
         Path bin = binary();
         if (!Files.isExecutable(bin))
             throw new IllegalStateException(bin + " is missing: run make in the repository root first");
@@ -89,6 +94,7 @@ final class TsdbServer implements AutoCloseable {
                 "--exit-with-parent=" + ProcessHandle.current().pid()));
         if (!auth)
             cmd.add("--no-auth");
+        cmd.addAll(java.util.List.of(extra));
         Process p = new ProcessBuilder(cmd)
                 .redirectErrorStream(true)
                 .redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()))

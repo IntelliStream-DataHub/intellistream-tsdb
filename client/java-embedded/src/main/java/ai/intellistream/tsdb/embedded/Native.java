@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
+import static java.lang.foreign.ValueLayout.JAVA_SHORT;
 import static java.lang.foreign.ValueLayout.JAVA_DOUBLE;
 import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
@@ -246,6 +247,38 @@ final class Native {
             PTR.withName("ends"),
             JAVA_INT.withName("with_nulls"),
             JAVA_INT.withName("threads")).withName("tsdb_latest_opts");
+
+    /** tsdb_series_stat: the 176-byte record of the wire (read through SeriesStat.of). */
+    static final StructLayout SERIES_STAT = MemoryLayout.structLayout(
+            JAVA_INT.withName("status"),
+            JAVA_BYTE.withName("cls"),
+            JAVA_BYTE.withName("type"),
+            JAVA_SHORT.withName("flags"),
+            JAVA_LONG.withName("rows"), JAVA_LONG.withName("nulls"), JAVA_LONG.withName("memtable_rows"),
+            JAVA_LONG.withName("logical_bytes"), JAVA_LONG.withName("ts_bytes"), JAVA_LONG.withName("value_bytes"),
+            JAVA_LONG.withName("index_bytes"), JAVA_LONG.withName("tomb_bytes"), JAVA_LONG.withName("parts"),
+            JAVA_LONG.withName("partitions"), JAVA_LONG.withName("granules"), JAVA_LONG.withName("full_granules"),
+            JAVA_LONG.withName("first_ts"), JAVA_LONG.withName("last_ts"), JAVA_LONG.withName("last_write_ms"),
+            JAVA_LONG.withName("resident_bytes"), JAVA_LONG.withName("reads_est"), JAVA_LONG.withName("reads_err"),
+            JAVA_LONG.withName("writes_est"), JAVA_LONG.withName("writes_err"), JAVA_LONG.withName("live_rows"))
+            .withName("tsdb_series_stat");
+
+    /** tsdb_tenant_stats: flags, generation, list_hash, then 18 counters in the wire's order. */
+    static final StructLayout TENANT_STATS = MemoryLayout.structLayout(
+            JAVA_INT.withName("flags"), JAVA_INT.withName("generation"), JAVA_LONG.withName("list_hash"),
+            JAVA_LONG.withName("series"), JAVA_LONG.withName("series_created"),
+            JAVA_LONG.withName("active_series_cur"), JAVA_LONG.withName("active_series_prev"),
+            JAVA_LONG.withName("rows"), JAVA_LONG.withName("nulls"), JAVA_LONG.withName("logical_bytes"),
+            JAVA_LONG.withName("ts_bytes"), JAVA_LONG.withName("value_bytes"), JAVA_LONG.withName("index_bytes"),
+            JAVA_LONG.withName("granules"), JAVA_LONG.withName("ingested_rows"),
+            JAVA_LONG.withName("ingested_bytes"), JAVA_LONG.withName("merged_rows"),
+            JAVA_LONG.withName("merge_removed_rows"), JAVA_LONG.withName("retention_dropped_rows"),
+            JAVA_LONG.withName("resident_bytes"), JAVA_LONG.withName("stale_s")).withName("tsdb_tenant_stats");
+
+    /** tsdb_hot: id, estimate, error. */
+    static final StructLayout HOT = MemoryLayout.structLayout(
+            JAVA_LONG.withName("id"), JAVA_LONG.withName("estimate"), JAVA_LONG.withName("error"))
+            .withName("tsdb_hot");
 
     /* tsdb_multi_kind and the trim flags */
     static final int MULTI_VALUES = 1, MULTI_BUCKETS = 2, MULTI_SPREAD = 3, MULTI_TWA = 4, MULTI_LTTB = 5;
@@ -495,6 +528,12 @@ final class Native {
             i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
     static final MethodHandle QUERY_MULTI_COLLECT = fn("tsdb_query_multi_collect", i(PTR, PTR, PTR, SIZE_T, PTR, PTR));
     static final MethodHandle LATEST_CALL = fn("tsdb_latest", i(PTR, PTR, SIZE_T, PTR, PTR));
+    static final MethodHandle SERIES_STATS = fn("tsdb_series_stats", i(PTR, PTR, SIZE_T, JAVA_INT, PTR, PTR));
+    static final MethodHandle STATS_SETTLE = fn("tsdb_stats_settle", i(PTR, JAVA_INT));
+    static final MethodHandle SET_TENANTS = fn("tsdb_set_tenants", i(PTR, PTR, SIZE_T));
+    static final MethodHandle TENANT_PREFIX = fn("tsdb_tenant_prefix", i(PTR, SIZE_T, PTR, SIZE_T));
+    static final MethodHandle TENANT_STATS_GET = fn("tsdb_tenant_stats_get", i(PTR, PTR, JAVA_INT, PTR));
+    static final MethodHandle HOT_SERIES = fn("tsdb_hot_series", i(PTR, JAVA_INT, PTR, SIZE_T, PTR, PTR));
     static final MethodHandle SERIES_RESULTS_FREE = fn("tsdb_series_results_free",
             FunctionDescriptor.ofVoid(PTR, SIZE_T));
     static final MethodHandle QUERY_LTTB_EX = fn("tsdb_query_lttb_ex",

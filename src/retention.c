@@ -20,6 +20,8 @@
  * wrote its part after it read the clock). A clock stepped forward expires rows
  * early, and for good once a merge has dropped them.
  */
+#include <inttypes.h>
+
 #include "internal.h"
 
 #include <errno.h>
@@ -174,6 +176,15 @@ void ret_close(eng *db)
 void ret_clock_init(eng *db)
 {
     int64_t floor = 0;
+    if (db->rp) { /* the replica's clock is the log's: the newest written_ms of its parts, then what it applies */
+        pthread_mutex_lock(&db->lock);
+        for (size_t i = 0; i < db->nparts; i++)
+            floor = MAX(floor, db->parts[i]->written_ms);
+        pthread_mutex_unlock(&db->lock);
+        replica_now_advance(db, floor);
+        atomic_store(&db->clock_floor, floor);
+        return;
+    }
     if (db->opt.clock_ms) { /* a test clock: part mtimes are on another time line */
         atomic_store(&db->clock_floor, floor);
         return;
@@ -188,7 +199,9 @@ void ret_clock_init(eng *db)
 int64_t eng_now_ms(eng *db)
 {
     int64_t now;
-    if (db->opt.clock_ms) {
+    if (db->rp) { /* never the replica's own clock (design-cluster.md 5.4): the leader's, as the log carries it */
+        now = replica_now_ms(db);
+    } else if (db->opt.clock_ms) {
         now = db->opt.clock_ms(db->opt.clock_arg);
     } else {
         struct timespec ts;
@@ -224,18 +237,28 @@ int64_t eng_cutoff(eng *db, uint32_t series)
     return eng_cutoff_at(db, series, eng_now_ms(db));
 }
 
-int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
+/* The limit's record goes to RETENTION at ret_off. A replica (apply: the leader's RETENTION record, which names the
+ * offset it has there): a record at an offset the file is past was applied before a restart, one beyond the end means
+ * this replica lacks records the leader has. */
+static int ret_set(eng *db, uint32_t series, int64_t limit_ms, bool apply, uint64_t record_off)
 {
-    if (db->opt.read_only)
-        return TSDB_ERR_READONLY;
     if (limit_ms < 0 || series >= eng_series_count(db))
         return TSDB_ERR_INVALID;
     int rc = eng_check(db);
     if (rc)
         return rc;
-    if ((rc = jr_intent(db, JR_RETENTION, &series)) != 0)
+    if (!apply && (rc = jr_intent(db, JR_RETENTION, &series)) != 0)
         return rc;
     pthread_mutex_lock(&db->ret_lock);
+    if (apply && eng_test_mutant != MUT_REPLICA_NO_POS /* planted: a replay appends again */ && record_off != db->ret_off) {
+        pthread_mutex_unlock(&db->ret_lock);
+        if (record_off > db->ret_off) {
+            fprintf(stderr, "tsdb: %s: the leader's RETENTION record is at offset %" PRIu64 ", this replica's file ends at %" PRIu64
+                            ": its history is not the leader's\n", db->dir, record_off, db->ret_off);
+            return TSDB_ERR_CORRUPT;
+        }
+        return 0; /* applied before */
+    }
     if (db->ret_broken) {
         pthread_mutex_unlock(&db->ret_lock);
         return TSDB_ERR_IO;
@@ -277,7 +300,7 @@ int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
     if (lowered)
         lt_retention_lowered(db, &lsec, series, oldc);
     lt_end(db, &lsec);
-    if (rc == 0)
+    if (rc == 0 && !apply)
         jr_commit(db, JR_RETENTION, &series);
     pthread_mutex_unlock(&db->ret_lock);
     if (rc == 0) {
@@ -287,4 +310,16 @@ int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
         rc = manifest_publish(db); /* a new MANIFEST version: followers read RETENTION again */
     }
     return rc;
+}
+
+int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
+{
+    if (db->opt.read_only || db->rp)
+        return TSDB_ERR_READONLY;
+    return ret_set(db, series, limit_ms, false, 0);
+}
+
+int eng_retention_apply(eng *db, uint32_t series, int64_t limit_ms, uint64_t record_off)
+{
+    return ret_set(db, series, limit_ms, true, record_off);
 }

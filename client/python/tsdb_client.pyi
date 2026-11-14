@@ -21,7 +21,7 @@ import os
 import pathlib
 from collections.abc import Sequence
 from types import TracebackType
-from typing import Any, Literal, final, overload
+from typing import Any, Literal, TypedDict, final, overload
 from zoneinfo import ZoneInfo
 
 from typing_extensions import Buffer
@@ -487,6 +487,137 @@ class User:
         """The grants as (selector, rights) pairs of strings, e.g. ("prefix:acme/", "read,insert"). A user's rights
         on a series are the union of those whose selector matches its name. The rights read back in grant(); a
         selector of a kind this client does not know (a later server's) shows as "kind#N:TEXT" and does not."""
+
+# The storage numbers of one series (Client.series_stats()): "physical", rows and bytes as stored, including rows a newer write, a tombstone or retention hides until a merge removes them. Every number after "flags" is 0 when "status" is not 0.
+#   status: 0, ERR_NOTFOUND (no such series, for a user who reads every series) or ERR_DENIED (no read right on it, whether or not it exists).
+#   cls: The partition class, 0 to 3.
+#   type: "float32", "float64", "int64", "bool" or "state"; None when status is not 0.
+#   flags: Bit 2: no stored row at or after the retention cutoff (first_ts and last_ts are 0); 4: last_write_ms comes from a file time; 8: reads_err and writes_err are 0, the user does not read every series.
+#   logical_bytes: Part rows times (8 + the width of the type).
+#   resident_bytes: Bytes of its granules in the page cache, with resident=True; else 0.
+#   reads_est: Queries in the last 60 to 120 seconds (sampled), 0 when the series is not in the hot-reads list.
+#   live_rows: Reserved: 0.
+SeriesStat = TypedDict(
+    "SeriesStat",
+    {
+        "series": int,
+        "status": int,
+        "cls": int,
+        "type": str | None,
+        "flags": int,
+        "rows": int,
+        "nulls": int,
+        "memtable_rows": int,
+        "logical_bytes": int,
+        "ts_bytes": int,
+        "value_bytes": int,
+        "index_bytes": int,
+        "tomb_bytes": int,
+        "parts": int,
+        "partitions": int,
+        "granules": int,
+        "full_granules": int,
+        "first_ts": int,
+        "last_ts": int,
+        "last_write_ms": int,
+        "resident_bytes": int,
+        "reads_est": int,
+        "reads_err": int,
+        "writes_est": int,
+        "writes_err": int,
+        "live_rows": int,
+    },
+)
+
+# What a tenant's own requests cost (the counters of one tenant, per request, never per row).
+TenantCaller = TypedDict(
+    "TenantCaller",
+    {
+        "requests_query": int,
+        "requests_insert": int,
+        "requests_delete": int,
+        "requests_admin": int,
+        "requests_other": int,
+        "rows_decoded": int,
+        "rows_from_stats": int,
+        "rows_from_memtable": int,
+        "bytes_read": int,
+        "result_rows": int,
+        "query_us": int,
+        "inserted_rows": int,
+        "inserted_bytes": int,
+        "errors_invalid": int,
+        "errors_notfound": int,
+        "errors_io": int,
+        "errors_other": int,
+        "denied_requests": int,
+        "denied_series": int,
+        "failed_logins": int,
+    },
+)
+
+# One entry of a hot list; series 0 is the threshold (what a series not in the list weighs at most).
+HotEntry = TypedDict(
+    "HotEntry",
+    {
+        "kind": Literal["reads", "writes", "bytes_per_row"],
+        "series": int,
+        "estimate": int,
+        "error": int,
+    },
+)
+
+# One row of TenantStats: a tenant, summed over the volumes or in one volume.
+#   status: 0, ERR_NOTFOUND (a prefix that is not in the tenant list) or ERR_DENIED.
+#   volume: None: the sum over the volumes.
+#   prefix: "" is the tenant "(none)".
+#   caller: With caller=True, on the summed row.
+#   hot: With hot > 0, on the summed row.
+TenantRow = TypedDict(
+    "TenantRow",
+    {
+        "status": int,
+        "volume": int | None,
+        "prefix": str,
+        "partial": bool,
+        "series": int,
+        "series_created": int,
+        "active_series_cur": int,
+        "active_series_prev": int,
+        "rows": int,
+        "nulls": int,
+        "logical_bytes": int,
+        "ts_bytes": int,
+        "value_bytes": int,
+        "index_bytes": int,
+        "granules": int,
+        "ingested_rows": int,
+        "ingested_bytes": int,
+        "merged_rows": int,
+        "merge_removed_rows": int,
+        "retention_dropped_rows": int,
+        "resident_bytes": int,
+        "stale_s": int,
+        "caller": TenantCaller | None,
+        "hot": list[HotEntry],
+    },
+)
+
+# The answer of Client.tenant_stats().
+#   generation: Of the tenant list: one more at every change.
+TenantStats = TypedDict(
+    "TenantStats",
+    {
+        "partial": bool,
+        "ingest_approx": bool,
+        "generation": int,
+        "list_hash": int,
+        "parts_counted": int,
+        "parts_listed": int,
+        "rows": list[TenantRow],
+    },
+)
+
 
 @final
 class Stats:
@@ -1336,6 +1467,59 @@ class Client:
             ValueError: A selector or rights it cannot read.
             TsdbError: As grant().
         """
+    def series_stats(
+        self,
+        series: _SeriesIds,
+        *,
+        resident: bool = False,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> list[SeriesStat]:
+        """The storage numbers of series, computed by the server from the granule index and the memtables
+        (tsdbd protocol 15).
+
+        Args:
+            series: Series ids: a list of ints, or a uint64 or int64 array. Any number: they go in
+                requests of up to 65,536 (1,024 with resident=True).
+            resident: Fill resident_bytes (bytes of the series' granules in the page cache now).
+            errors: "raise" raises TsdbError (with .index and .code) for the first series that was NOTFOUND
+                or DENIED (a denied series looks like a missing one); "status" returns every dict, whose
+                "status" says which failed.
+
+        Returns:
+            One dict per series, in the order asked.
+
+        Raises:
+            TsdbError: A series failed (errors="raise"), or the whole request failed (a server below
+                protocol 15, or one started with --no-stats, answers INVALID).
+        """
+
+    def tenant_stats(
+        self,
+        prefixes: Sequence[str] | None = None,
+        *,
+        volumes: bool = False,
+        hot: int = 0,
+        caller: bool = False,
+    ) -> TenantStats:
+        """The numbers of tenants (tsdbd protocol 15).
+
+        A superuser, or a user with read on every series, sees every tenant; a tenant admin (admin on
+        prefix:Q) the tenants whose prefix starts with Q. A tenant that may not be seen is a row with
+        status ERR_DENIED, whether or not it exists.
+
+        Args:
+            prefixes: The tenants asked for ("" is the tenant "(none)"); None for every tenant the user
+                may see.
+            volumes: A row per volume after each tenant's summed row.
+            hot: Hot-list entries per kind (reads, writes, bytes per row) on the summed row, at most 256.
+            caller: The tenant's own request counters on the summed row.
+
+        Raises:
+            TsdbError: The request failed (a server below protocol 15, or one started with --no-stats,
+                answers INVALID). A user who may see no tenant gets no rows when it names
+                none, and a row with status DENIED for each tenant it names.
+        """
+
     def latest(
         self,
         series: _SeriesIds,
@@ -1675,6 +1859,25 @@ class Pool:
                 found before inserting, as in Db.insert_many(), insert nothing).
                 An insert whose connection broke is not retried.
         """
+    def series_stats(
+        self,
+        series: _SeriesIds,
+        *,
+        resident: bool = False,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> list[SeriesStat]:
+        """As Client.series_stats() (on one of the connections)."""
+
+    def tenant_stats(
+        self,
+        prefixes: Sequence[str] | None = None,
+        *,
+        volumes: bool = False,
+        hot: int = 0,
+        caller: bool = False,
+    ) -> TenantStats:
+        """As Client.tenant_stats() (on one of the connections)."""
+
     def latest(
         self,
         series: _SeriesIds,

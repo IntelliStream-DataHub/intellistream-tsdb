@@ -79,6 +79,25 @@ void fuzz_seeds(const char *dir)
     m.u.epoch.owner_len = 0;
     seed(dir, "seed-epoch-noowner", &m);
 
+    memset(&m, 0, sizeof m);
+    m.type = MK_CLASS;
+    m.u.cls = (mk_class){.series = 4, .cls = 2, .at = 1700000000000, .record_off = 48};
+    seed(dir, "seed-class", &m);
+    m.u.cls.at = INT64_MIN;
+    seed(dir, "seed-class-fresh", &m);
+    memset(&m, 0, sizeof m);
+    m.type = MK_SERIES;
+    m.u.series = (mk_series){.id = 9, .vtype = TSDB_FLOAT64, .name = "plant/boiler 3/temp", .name_len = 19};
+    seed(dir, "seed-series", &m);
+    memset(&m, 0, sizeof m);
+    m.type = MK_STATE;
+    m.u.state = (mk_state){.id = 2, .name = "RUNNING", .name_len = 7};
+    seed(dir, "seed-state", &m);
+    memset(&m, 0, sizeof m);
+    m.type = MK_NOW;
+    m.u.now.now_ms = 1700000000123;
+    seed(dir, "seed-now", &m);
+
     uint8_t files[256];
     mk_file f1 = {"p0_5_5_0.part", 13, 4096, 0x1122334455667788ull, 0x99aabbccddeeff00ull};
     mk_file f2 = {"p1_6_6_0.part", 13, 8192, 3, 4};

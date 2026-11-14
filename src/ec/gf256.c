@@ -25,6 +25,7 @@
  *   exp/log      the discrete logarithm base 2 (2 is primitive for 0x11d)
  *   mul_table    full 256x256 product table, 64 KiB; a row is 256 bytes and stays in L1
  *   shuf_lo/hi   nibble tables for PSHUFB: c*x split as c*(x & 0xf) ^ c*(x >> 4 << 4)
+ *   gfni_mat     the VGF2P8AFFINEQB matrix of every multiplier, for the dot kernels
  */
 
 static uint8_t gf_exp[512];
@@ -32,6 +33,7 @@ static uint8_t gf_log[256];
 static uint8_t gf_mul_table[256][256];
 static uint8_t gf_shuf_lo[256][16];
 static uint8_t gf_shuf_hi[256][16];
+static uint64_t gf_gfni_mat[256];
 
 /* Carry-less multiply followed by reduction modulo the primitive polynomial. Used only to build
  * the tables, so clarity beats speed. */
@@ -49,6 +51,40 @@ static uint8_t mul_slow(uint8_t a, uint8_t b)
 			r ^= (unsigned)ISO_GF256_POLY << (bit - 8);
 	}
 	return (uint8_t)r;
+}
+
+/* ------------------------------------------------------------------ GFNI matrix (built with the tables)
+ *
+ * VGF2P8AFFINEQB computes, per byte of the data operand, output bit k as
+ *
+ *     parity( data_byte AND matrix.byte[7 - k] )
+ *
+ * so the matrix row selecting which input bits contribute to output bit k lives in byte (7 - k).
+ * Multiplication by c is GF(2)-linear, so row k has bit j set exactly when bit k of c * 2^j is
+ * set -- the multiplier's action on each basis element, transposed.
+ */
+static uint64_t gfni_matrix_build(uint8_t c)
+{
+	uint64_t m = 0;
+	for (unsigned k = 0; k < 8; k++) {
+		uint8_t row = 0;
+		for (unsigned j = 0; j < 8; j++) {
+			if ((gf_mul_table[c][1u << j] >> k) & 1u)
+				row |= (uint8_t)(1u << j);
+		}
+		m |= (uint64_t)row << (8 * (7 - k));
+	}
+	return m;
+}
+
+uint64_t iso_gf256_gfni_matrix(uint8_t c)
+{
+	return gfni_matrix_build(c);
+}
+
+const uint64_t *iso_gf256_gfni_matrices(void)
+{
+	return gf_gfni_mat;
 }
 
 static void gf256_tables_init(void)
@@ -74,6 +110,7 @@ static void gf256_tables_init(void)
 			gf_shuf_lo[c][n] = gf_mul_table[c][n];
 			gf_shuf_hi[c][n] = gf_mul_table[c][n << 4];
 		}
+		gf_gfni_mat[c] = gfni_matrix_build((uint8_t)c);
 	}
 }
 
@@ -95,30 +132,6 @@ const uint8_t *iso_gf256_shuf_hi(uint8_t c)
 uint8_t iso_gf256_mul(uint8_t a, uint8_t b)
 {
 	return gf_mul_table[a][b];
-}
-
-/* ------------------------------------------------------------------ GFNI matrix
- *
- * VGF2P8AFFINEQB computes, per byte of the data operand, output bit k as
- *
- *     parity( data_byte AND matrix.byte[7 - k] )
- *
- * so the matrix row selecting which input bits contribute to output bit k lives in byte (7 - k).
- * Multiplication by c is GF(2)-linear, so row k has bit j set exactly when bit k of c * 2^j is
- * set -- the multiplier's action on each basis element, transposed.
- */
-uint64_t iso_gf256_gfni_matrix(uint8_t c)
-{
-	uint64_t m = 0;
-	for (unsigned k = 0; k < 8; k++) {
-		uint8_t row = 0;
-		for (unsigned j = 0; j < 8; j++) {
-			if ((gf_mul_table[c][1u << j] >> k) & 1u)
-				row |= (uint8_t)(1u << j);
-		}
-		m |= (uint64_t)row << (8 * (7 - k));
-	}
-	return m;
 }
 
 uint8_t iso_gf256_gfni_affine_ref(uint64_t matrix, uint8_t x)
@@ -239,11 +252,145 @@ void iso_gf256_mul_add_ssse3(uint8_t *dst, const uint8_t *src, size_t len, uint8
 		iso_gf256_mul_add_scalar(dst + i, src + i, len - i, c);
 }
 
+/* ------------------------------------------------------------------ dot kernels
+ *
+ * dst[i][x] = XOR_j coef[i][j] * src[j][x]: the sum encoding and decoding are made of, for m
+ * outputs at once. The mul_add kernels above compute it one product at a time, so every output
+ * is read and written once per source and every source is read once per output. A dot kernel
+ * keeps a group of up to DOT_G output vectors in registers, runs through all k sources for one
+ * vector position, and stores the group once: each source vector is loaded once per group, each
+ * output vector is written once and never read. What that buys is memory traffic -- on shards
+ * that do not stay in cache the mul_add loop was 4+ times slower per byte than the multiply
+ * (docs/tasks/ec-bench.md of tsdb) -- and the arithmetic per product is the same.
+ *
+ * The shape is the same in every family (this file: scalar and ssse3; gf256_avx2.c; gf256_avx512.c):
+ * a loop over groups of outputs, inside it a loop over vector positions, inside it a loop over
+ * the sources; the bytes after the last whole vector go to the next narrower kernel for all m
+ * outputs, with `off` moved up. The group size is 4 in every family: it is the most outputs
+ * whose accumulators, with a source vector, its two nibbles, a mask and two tables, fit the 16
+ * registers of SSE and AVX2 (the AVX-512 and GFNI kernels have room for two vectors of each at
+ * once and use it), and it is the largest m the library has (ISO_RS_MAX_M), so one pass is all
+ * an encode needs. A coefficient of 0 or 1 is not special-cased: its table gives 0 or x, and a
+ * branch in the loop would cost more than the product it skips.
+ */
+
+#define DOT_G 4
+
+void iso_gf256_dot_scalar(uint8_t *const *dst, unsigned m, const uint8_t *const *src, unsigned k,
+			  const uint8_t *coef, size_t off, size_t len)
+{
+	for (unsigned i = 0; i < m; i++) {
+		uint8_t *out = dst[i] + off;
+		if (k == 0) {
+			memset(out, 0, len);
+			continue;
+		}
+		const uint8_t *row = gf_mul_table[coef[(size_t)i * k]];
+		const uint8_t *in = src[0] + off;
+		for (size_t x = 0; x < len; x++)
+			out[x] = row[in[x]];
+		for (unsigned j = 1; j < k; j++) {
+			row = gf_mul_table[coef[(size_t)i * k + j]];
+			in = src[j] + off;
+			for (size_t x = 0; x < len; x++)
+				out[x] ^= row[in[x]];
+		}
+	}
+}
+
+/* One group of G outputs (G a constant at every call, so the accumulators are registers) over the
+ * 16-byte vectors from `from` up to `end`. `coef` is the group's first row, rows k apart. */
+static inline __attribute__((always_inline)) void
+dot_ssse3_group(uint8_t *const *dst, const uint8_t *const *src, unsigned k, const uint8_t *coef,
+		size_t from, size_t end, const unsigned G)
+{
+	const __m128i mask = _mm_set1_epi8(0x0f);
+	for (size_t x = from; x < end; x += 16) {
+		__m128i acc[DOT_G];
+#pragma GCC unroll 4
+		for (unsigned i = 0; i < G; i++)
+			acc[i] = _mm_setzero_si128();
+		for (unsigned j = 0; j < k; j++) {
+			__m128i s = _mm_loadu_si128((const __m128i *)(src[j] + x));
+			__m128i lo = _mm_and_si128(s, mask);
+			__m128i hi = _mm_and_si128(_mm_srli_epi64(s, 4), mask);
+#pragma GCC unroll 4
+			for (unsigned i = 0; i < G; i++) {
+				size_t c16 = (size_t)coef[(size_t)i * k + j] << 4;
+				__m128i tl = _mm_loadu_si128((const __m128i *)(&gf_shuf_lo[0][0] + c16));
+				__m128i th = _mm_loadu_si128((const __m128i *)(&gf_shuf_hi[0][0] + c16));
+				acc[i] = _mm_xor_si128(acc[i], _mm_xor_si128(_mm_shuffle_epi8(tl, lo),
+									     _mm_shuffle_epi8(th, hi)));
+			}
+		}
+#pragma GCC unroll 4
+		for (unsigned i = 0; i < G; i++)
+			_mm_storeu_si128((__m128i *)(dst[i] + x), acc[i]);
+	}
+}
+
+void iso_gf256_dot_ssse3(uint8_t *const *dst, unsigned m, const uint8_t *const *src, unsigned k,
+			 const uint8_t *coef, size_t off, size_t len)
+{
+	size_t body = len & ~(size_t)15;
+	if (body) {
+		for (unsigned g = 0; g < m; g += DOT_G) {
+			unsigned n = m - g < DOT_G ? m - g : DOT_G;
+			const uint8_t *rows = coef + (size_t)g * k;
+			switch (n) {
+			case 1:
+				dot_ssse3_group(dst + g, src, k, rows, off, off + body, 1);
+				break;
+			case 2:
+				dot_ssse3_group(dst + g, src, k, rows, off, off + body, 2);
+				break;
+			case 3:
+				dot_ssse3_group(dst + g, src, k, rows, off, off + body, 3);
+				break;
+			default:
+				dot_ssse3_group(dst + g, src, k, rows, off, off + body, 4);
+				break;
+			}
+		}
+	}
+	if (body < len)
+		iso_gf256_dot_scalar(dst, m, src, k, coef, off + body, len - body);
+}
+
 /* ------------------------------------------------------------------ dispatch */
 
 static void (*mul_add_impl)(uint8_t *, const uint8_t *, size_t, uint8_t) =
 	iso_gf256_mul_add_scalar;
 static const char *mul_add_name = "scalar";
+/* NULL: the sum is made of mul_set and mul_add (a kernel without a dot kernel; the state before
+ * the first iso_gf256_use). */
+static iso_gf256_dot_fn dot_impl;
+
+/* The sum of dot kernels made of the mul_add kernel in force: what a kernel with no dot kernel
+ * of its own gets, and what the codec did before there were any. */
+static void dot_compose(uint8_t *const *dst, unsigned m, const uint8_t *const *src, unsigned k,
+			const uint8_t *coef, size_t off, size_t len)
+{
+	for (unsigned i = 0; i < m; i++) {
+		uint8_t *out = dst[i] + off;
+		if (k == 0) {
+			memset(out, 0, len);
+			continue;
+		}
+		iso_gf256_mul_set(out, src[0] + off, len, coef[(size_t)i * k]);
+		for (unsigned j = 1; j < k; j++)
+			iso_gf256_mul_add(out, src[j] + off, len, coef[(size_t)i * k + j]);
+	}
+}
+
+void iso_gf256_dot(uint8_t *const *dst, unsigned m, const uint8_t *const *src, unsigned k,
+		   const uint8_t *coef, size_t off, size_t len)
+{
+	if (dot_impl)
+		dot_impl(dst, m, src, k, coef, off, len);
+	else
+		dot_compose(dst, m, src, k, coef, off, len);
+}
 
 void iso_gf256_mul_add(uint8_t *dst, const uint8_t *src, size_t len, uint8_t c)
 {
@@ -278,19 +425,25 @@ void iso_gf256_use(const iso_gf256_kernel *k)
 {
 	mul_add_impl = k ? k->fn : iso_gf256_mul_add_scalar;
 	mul_add_name = k ? k->name : "scalar";
+	/* NULL for no kernel (the scalar one, as above) and for a kernel without a dot kernel: the
+	 * sum is then composed from the mul_add kernel just set. */
+	dot_impl = k ? k->dot : NULL;
 }
 
 size_t iso_gf256_kernels(iso_gf256_kernel *out)
 {
 	const iso_gf256_kernel all[] = {
-		{ "scalar", iso_gf256_mul_add_scalar, true, 1 },
-		{ "ssse3", iso_gf256_mul_add_ssse3, iso_cpu_has(ISO_CPU_SSSE3), 16 },
-		{ "avx2", iso_gf256_mul_add_avx2, iso_cpu_has(ISO_CPU_AVX2), 32 },
-		{ "avx512", iso_gf256_mul_add_avx512, have_avx512bw(), 64 },
+		{ "scalar", iso_gf256_mul_add_scalar, true, 1, iso_gf256_dot_scalar },
+		{ "ssse3", iso_gf256_mul_add_ssse3, iso_cpu_has(ISO_CPU_SSSE3), 16,
+		  iso_gf256_dot_ssse3 },
+		{ "avx2", iso_gf256_mul_add_avx2, iso_cpu_has(ISO_CPU_AVX2), 32,
+		  iso_gf256_dot_avx2 },
+		{ "avx512", iso_gf256_mul_add_avx512, have_avx512bw(), 64, iso_gf256_dot_avx512 },
 		{ "gfni256", iso_gf256_mul_add_gfni256,
-		  iso_cpu_has(ISO_CPU_GFNI) && iso_cpu_has(ISO_CPU_AVX2), 32 },
+		  iso_cpu_has(ISO_CPU_GFNI) && iso_cpu_has(ISO_CPU_AVX2), 32,
+		  iso_gf256_dot_gfni256 },
 		{ "gfni512", iso_gf256_mul_add_gfni512,
-		  iso_cpu_has(ISO_CPU_GFNI) && have_avx512bw(), 64 },
+		  iso_cpu_has(ISO_CPU_GFNI) && have_avx512bw(), 64, iso_gf256_dot_gfni512 },
 	};
 	ISO_STATIC_ASSERT(ISO_ARRAY_LEN(all) == ISO_GF256_MAX_KERNELS,
 			  "kernel table and ISO_GF256_MAX_KERNELS disagree");
@@ -309,12 +462,14 @@ size_t iso_gf256_ladder(iso_gf256_kernel *out)
 	bool wide = avx512bw && iso_cpu_prefer_512();
 	bool gfni = iso_cpu_has(ISO_CPU_GFNI);
 	const iso_gf256_kernel all[] = {
-		{ "gfni512", iso_gf256_mul_add_gfni512, gfni && wide, 64 },
-		{ "gfni256", iso_gf256_mul_add_gfni256, gfni && iso_cpu_has(ISO_CPU_AVX2), 32 },
-		{ "avx512", iso_gf256_mul_add_avx512, wide, 64 },
-		{ "avx2", iso_gf256_mul_add_avx2, iso_cpu_has(ISO_CPU_AVX2), 32 },
-		{ "ssse3", iso_gf256_mul_add_ssse3, iso_cpu_has(ISO_CPU_SSSE3), 16 },
-		{ "scalar", iso_gf256_mul_add_scalar, true, 1 },
+		{ "gfni512", iso_gf256_mul_add_gfni512, gfni && wide, 64, iso_gf256_dot_gfni512 },
+		{ "gfni256", iso_gf256_mul_add_gfni256, gfni && iso_cpu_has(ISO_CPU_AVX2), 32,
+		  iso_gf256_dot_gfni256 },
+		{ "avx512", iso_gf256_mul_add_avx512, wide, 64, iso_gf256_dot_avx512 },
+		{ "avx2", iso_gf256_mul_add_avx2, iso_cpu_has(ISO_CPU_AVX2), 32, iso_gf256_dot_avx2 },
+		{ "ssse3", iso_gf256_mul_add_ssse3, iso_cpu_has(ISO_CPU_SSSE3), 16,
+		  iso_gf256_dot_ssse3 },
+		{ "scalar", iso_gf256_mul_add_scalar, true, 1, iso_gf256_dot_scalar },
 	};
 	ISO_STATIC_ASSERT(ISO_ARRAY_LEN(all) == ISO_GF256_MAX_KERNELS,
 			  "the ladder and ISO_GF256_MAX_KERNELS disagree");
@@ -405,6 +560,112 @@ static bool gf_check_kernel(const iso_gf256_kernel *k, const iso_gf256_kernel *r
 	return true;
 }
 
+/* ------------------------------------------------------------------ the check of a dot kernel
+ *
+ * The same idea as above, for the sums: the dot kernel against the reference's, over the shapes
+ * a bug of a dot kernel hides in. A group is four outputs, so m runs to five (a second group, and
+ * one of a single output); the sources are read one at a time, so k takes one, a few, and one
+ * past the 16 the library has; the vector steps are 16 to 128 bytes, so the lengths are every one
+ * up to 40 and then the steps' edges, and the buffers start at unaligned addresses a different
+ * amount apart, with `off` moving the range further in. A long range runs the loops long, and
+ * four calls with every coefficient in a matrix (64 of them a call) cover all 256 in the dot path,
+ * where a table index could be wrong for a few of them only. The bytes before the range and a
+ * guard after it are filled and must come back as they were. */
+
+#define GF_DOT_MAXM 5
+#define GF_DOT_MAXK 17
+#define GF_DOT_BUF 5200u
+#define GF_DOT_LONG 5003u
+
+typedef struct {
+	uint8_t *src[GF_DOT_MAXK], *dst[GF_DOT_MAXM], *want[GF_DOT_MAXM];
+} gf_dot_bufs;
+
+static bool gf_dot_one(const iso_gf256_kernel *k, iso_gf256_dot_fn ref, const iso_gf256_kernel *refk,
+		       const gf_dot_bufs *b, const uint8_t *dst0, unsigned m, unsigned kk,
+		       const uint8_t *coef, size_t off, size_t len, iso_kcheck *out)
+{
+	const uint8_t *src[GF_DOT_MAXK];
+	uint8_t *got[GF_DOT_MAXM], *want[GF_DOT_MAXM];
+	for (unsigned j = 0; j < kk; j++)
+		src[j] = b->src[j] + ((j * 3 + 1) & 7);
+	size_t span = off + len + GF_CHECK_GUARD;
+	for (unsigned i = 0; i < m; i++) {
+		size_t d = (i * 5 + 2) & 7;
+		got[i] = b->dst[i] + d;
+		want[i] = b->want[i] + d;
+		memcpy(got[i], dst0 + i * GF_DOT_BUF, span);
+		memcpy(want[i], dst0 + i * GF_DOT_BUF, span);
+	}
+	ref(want, m, src, kk, coef, off, len);
+	k->dot(got, m, src, kk, coef, off, len);
+	for (unsigned i = 0; i < m; i++) {
+		if (memcmp(got[i], want[i], span) == 0)
+			continue;
+		size_t at = 0;
+		while (at < span && got[i][at] == want[i][at])
+			at++;
+		if (!out->why[0]) {
+			if (at >= off && at < off + len)
+				snprintf(out->why, sizeof out->why,
+					 "the %s GF(256) dot kernel disagrees with the %s one: %u outputs "
+					 "of %u sources over %zu bytes from %zu, output %u byte %zu is "
+					 "0x%02x and not 0x%02x",
+					 k->name, refk->name, m, kk, len, off, i, at - off, got[i][at],
+					 want[i][at]);
+			else
+				snprintf(out->why, sizeof out->why,
+					 "the %s GF(256) dot kernel writes outside its range: %u outputs "
+					 "of %u sources over %zu bytes from %zu, output %u byte %zu",
+					 k->name, m, kk, len, off, i, at);
+		}
+		return false;
+	}
+	return true;
+}
+
+static bool gf_check_dot(const iso_gf256_kernel *k, const iso_gf256_kernel *refk,
+			 const gf_dot_bufs *b, const uint8_t *dst0, iso_kcheck *out)
+{
+	iso_gf256_dot_fn ref = refk->dot ? refk->dot : iso_gf256_dot_scalar;
+	static const unsigned ks[] = { 1, 2, 3, 5, 16, 17 };
+	static const size_t big[] = { 47, 48, 49, 63, 64, 65, 95, 96, 97, 127, 128, 129, 130,
+				      191, 192, 193, 255, 256, 257 };
+	static const uint8_t edge[] = { 0x00, 0x01, 0x80, 0xff, 0x02, 0x8e, 0x1d };
+	uint8_t coef[GF_DOT_MAXM * GF_DOT_MAXK];
+	uint64_t seed = 0x2545f4914f6cdd1dull;
+	unsigned round = 0;
+
+	for (unsigned m = 1; m <= GF_DOT_MAXM; m++) {
+		for (size_t ki = 0; ki < ISO_ARRAY_LEN(ks); ki++) {
+			unsigned kk = ks[ki];
+			gf_fill(coef, (size_t)m * kk, seed + m * 977 + kk);
+			/* Edge multipliers where a short-circuit would sit: a whole row of ones, and
+			 * 0, 1, 0x80 and 0xff spread over the rest. */
+			for (unsigned j = 0; j < kk; j++)
+				coef[j] = 1;
+			for (size_t n = 1; n < (size_t)m * kk; n += 3)
+				coef[n] = edge[(n + m) % ISO_ARRAY_LEN(edge)];
+			for (size_t li = 0; li < 41 + ISO_ARRAY_LEN(big); li++) {
+				size_t len = li < 41 ? li : big[li - 41];
+				size_t off = (round++ % 5) * 3;
+				if (!gf_dot_one(k, ref, refk, b, dst0, m, kk, coef, off, len, out))
+					return false;
+			}
+		}
+	}
+	/* Every multiplier in the dot path: 4 outputs of 16 sources are 64 of them a call. */
+	for (unsigned t = 0; t < 4; t++) {
+		for (unsigned n = 0; n < 64; n++)
+			coef[n] = (uint8_t)(t * 64 + n);
+		if (!gf_dot_one(k, ref, refk, b, dst0, 4, 16, coef, 1, 129, out))
+			return false;
+	}
+	/* A long range, through two groups of outputs. */
+	gf_fill(coef, sizeof coef, seed ^ 0x5bd1e995);
+	return gf_dot_one(k, ref, refk, b, dst0, GF_DOT_MAXM, 16, coef, 7, GF_DOT_LONG, out);
+}
+
 /* The reference, held to the field itself: x^8 = x^4 + x^3 + x^2 + 1 under 0x11d, so twice 0x80
  * is 0x1d, twice 0xff is 0xe3, and 0x8e is the inverse of 2 -- products that hold for any correct
  * implementation of this field and are not read from the tables the kernels use. */
@@ -427,6 +688,23 @@ static bool gf_known_answers(const iso_gf256_kernel *ref, iso_kcheck *out)
 			return false;
 		}
 	}
+	/* The same products summed through the reference's dot kernel (two outputs of two sources, both
+	 * sources the same bytes): row 0 is 2 and 0x8e, row 1 is 1 and 2, so the sums are the XORs of
+	 * the cases above. Without it only the dot kernels' agreement with the reference stands, and a
+	 * reference dot that is wrong the way every faster one is not would be the one chosen. */
+	static const uint8_t drow[4] = { 0x02, 0x8e, 0x01, 0x02 };
+	static const uint8_t dwant[2][5] = { { 0x5d, 0xa0, 0x12, 0x46, 0x8c },
+					     { 0x9d, 0xc0, 0x1c, 0x8f, 0x03 } };
+	uint8_t d0[5] = { 0 }, d1[5] = { 0 };
+	uint8_t *dd[2] = { d0, d1 };
+	const uint8_t *ds[2] = { src, src };
+	(ref->dot ? ref->dot : iso_gf256_dot_scalar)(dd, 2, ds, 2, drow, 0, sizeof d0);
+	if (memcmp(d0, dwant[0], sizeof d0) != 0 || memcmp(d1, dwant[1], sizeof d1) != 0) {
+		if (!out->why[0])
+			snprintf(out->why, sizeof out->why,
+				 "the %s GF(256) dot kernel is wrong about the field itself", ref->name);
+		return false;
+	}
 	return true;
 }
 
@@ -434,7 +712,8 @@ void iso_gf256_check(const iso_gf256_kernel *k, size_t n, iso_kcheck *out)
 {
 	uint64_t t0 = iso_now_ns();
 	memset(out, 0, sizeof *out);
-	static const iso_gf256_kernel scalar = { "scalar", iso_gf256_mul_add_scalar, true, 1 };
+	static const iso_gf256_kernel scalar = { "scalar", iso_gf256_mul_add_scalar, true, 1,
+						 iso_gf256_dot_scalar };
 	/* The last entry is the reference, as the ladder puts the scalar kernel last. */
 	const iso_gf256_kernel *ref = n ? &k[n - 1] : &scalar;
 	iso_strlcpy(out->family, "gf256", sizeof out->family);
@@ -451,9 +730,29 @@ void iso_gf256_check(const iso_gf256_kernel *k, size_t n, iso_kcheck *out)
 			buf[i] = iso_xmalloc(GF_CHECK_LONG + GF_CHECK_PAD);
 		gf_fill(buf[0], GF_CHECK_LONG + GF_CHECK_PAD, 0x9e3779b97f4a7c15ull);
 		gf_fill(buf[1], GF_CHECK_LONG + GF_CHECK_PAD, 0xd1b54a32d192ed03ull);
+		/* The dot kernels' buffers, made when the first kernel that has one is reached. */
+		gf_dot_bufs db;
+		uint8_t *dot_mem = NULL, *dst0 = NULL;
 		for (size_t i = 0; i + 1 < n; i++) {
 			out->n_checked++;
-			if (gf_check_kernel(&k[i], ref, buf, out)) {
+			bool ok = gf_check_kernel(&k[i], ref, buf, out);
+			if (ok && k[i].dot) {
+				if (!dot_mem) {
+					size_t per = GF_DOT_BUF;
+					dot_mem = iso_xmalloc(per * (GF_DOT_MAXK + 3 * GF_DOT_MAXM));
+					for (unsigned j = 0; j < GF_DOT_MAXK; j++)
+						db.src[j] = dot_mem + per * j;
+					for (unsigned j = 0; j < GF_DOT_MAXM; j++) {
+						db.dst[j] = dot_mem + per * (GF_DOT_MAXK + j);
+						db.want[j] = dot_mem + per * (GF_DOT_MAXK + GF_DOT_MAXM + j);
+					}
+					dst0 = dot_mem + per * (GF_DOT_MAXK + 2 * GF_DOT_MAXM);
+					gf_fill(dot_mem, per * GF_DOT_MAXK, 0x6a09e667f3bcc909ull);
+					gf_fill(dst0, per * GF_DOT_MAXM, 0xbb67ae8584caa73bull);
+				}
+				ok = gf_check_dot(&k[i], ref, &db, dst0, out);
+			}
+			if (ok) {
 				out->chosen_index = (unsigned)i;
 				break;
 			}
@@ -461,6 +760,7 @@ void iso_gf256_check(const iso_gf256_kernel *k, size_t n, iso_kcheck *out)
 				iso_strlcpy(out->failed[out->n_failed++], k[i].name,
 					    sizeof out->failed[0]);
 		}
+		free(dot_mem);
 		for (unsigned i = 0; i < 4; i++)
 			free(buf[i]);
 	}
