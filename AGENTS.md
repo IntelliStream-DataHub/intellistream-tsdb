@@ -30,7 +30,7 @@ make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBS
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
                           # with an output buffer of exactly n values, part, manifest, wal, dict, volumes, tz, import = the
-                          # export stream, users = USERS, classes = CLASSES, marker = WAL marker payloads) under ASan+UBSan in build-fuzz/; make test
+                          # export stream, users = USERS, classes = CLASSES, marker = WAL marker payloads, chunk = a chunk file, ec = the decode path of objects and the codec) under ASan+UBSan in build-fuzz/; make test
                           # replays tests/fuzz/corpus/<name>/ (codecx uses codec's). A crash-* input, once fixed, goes there.
                           # At a CPU level: make fuzz FUZZ_ARCH=-march=x86-64-v4 (or -v3; its own dir build-fuzz-v4, and a changed level in a FUZZ_B you name
                           # empties it; make fuzz-v4-check replays part and codecx at v4 under ASan with use-after-return on; the
@@ -185,6 +185,30 @@ cgroup, so `nice` does not keep your work out of its way.
   `tsdb_ec_*` are `local:` in the map) and `tools/check-ec-baseline.sh` (no SSSE3 outside its kernel in a generic build).
   The embedded bindings' crates (`client/rust-sys` build.rs, `vendor.sh`) copy `src/*.c` only and build without `src/ec`
   and without `TSDB_EC`: an engine caller of `iso_rs_*` needs an `#ifdef TSDB_EC` or those crates stop linking.
+- `src/chunk.h` (the API; internal, the engine does not call it yet: R7 does), `src/chunk.c` (the geometry of an object,
+  the chunk file format, the encoder), `src/chunkstore.c` (chunk stores: META with the store id, `s<volume>/EPOCH`, the
+  fences, the directory backend), `src/chunkread.c` (reads of any byte range with decode): design-cluster-data.md R6.
+  The geometry (k', m, cell, length) is recorded in the object and in every chunk header and never taken from settings
+  (E2); a chunk whose header, size, sums table, footer or identity is wrong, or whose cell fails its sum, is an erasure,
+  never decoder input, and a short read is an error, never the end (`CHUNK_MUT_EOF`). The rebuilt cell of a decode is
+  checked against the object record's sum when the caller has it. A temporary file is always a new inode (`tmp_*`,
+  removed at open): one that a failed write or sync left may have had its pages dropped. A put or delete below a volume's
+  EPOCH (two checksummed slots, FNO's scheme, fail-stop) is refused; a failed directory fsync after a name appeared or
+  went, or any failed EPOCH write or sync, fails the store (`chunk_store_failed`: it acknowledges nothing more, reads
+  go on). A store directory has one owner: `chunk_store_open` takes a `flock` (a second open is `CHUNK_ERR_BUSY`),
+  because two owners would each keep their own epoch and one would write it back lower. A volume with one damaged EPOCH
+  slot opens "unsure" (a torn store and rot look alike): puts and deletes are refused (`CHUNK_ERR_EPOCH_UNSURE`) until
+  `chunk_store_raise` / `chunk_be_see_epoch` is given the epoch the metadata group holds; a writer's own epoch never
+  stands in for the lost fence. A readdir error is an error, never the end of a directory. `chunk_be_open` takes a NULL
+  path for a store known to be down (its index stays; named stores must open). `tests/test_chunk.c` (exhaustive damage patterns for every geometry, power loss and EIO under crashfs, mutants
+  via `--mutant nosums|nofence|eof|settings|nosync|epochnosync`), `tests/fuzz/fuzz_chunk.c`, `tests/fuzz/fuzz_ec.c`.
+  The embedded bindings copy `src/*.c`: the files build without `TSDB_EC` (`chunk_encode` then says `TSDB_ERR_INVALID`).
+- `src/chunk*.c` (objects, chunk files, stores, the directory backend; R6): `chunkstore.c` (files, EPOCH, `chunk_be_open2` with
+  `min_up`: a store that is missing, has another id, a damaged META or EIO is DOWN and read around, BUSY and one store twice
+  always fail the open), `chunkread.c` (decode; UNAVAILABLE while stores are down, CORRUPT only when lost), `chunkheal.c`
+  (heal, repair, settle, attach, replace: rebuilt chunks are checked against the survivors' sums, written as new files at
+  the object's epoch, never from fewer than k' positions, never for what `live` says is deleted; a new store gets every
+  fence before its first chunk). `tests/test_chunk.c`, `tests/test_chunk_heal.c` (mutants in the Makefile).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
