@@ -47,7 +47,7 @@ LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
@@ -102,6 +102,11 @@ EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 EC_CFLAGS := -mssse3 -fno-tree-vectorize
 $(B)/ec_%.o: src/ec/%.c $(EC_HDR) src/internal.h | $(B)
 	$(CC) $(CFLAGS) $(EC_CFLAGS) -Isrc/ec/compat -DISO_GF256_NO_BOOT -c -o $@ $<
+# Objects, chunk files and stores (src/chunk*.c, docs/design-cluster-data.md R6): not part of the codec copy, but chunk.c and
+# chunkread.c include its rs.h, which wants the one-line headers of src/ec/compat.
+$(B)/chunk.o $(B)/chunkread.o: override CFLAGS += -Isrc/ec/compat
+$(B)/chunk.o $(B)/chunkstore.o $(B)/chunkread.o: src/chunk.h src/chunk_priv.h $(EC_HDR)
+$(B)/fuzz-ec: override CFLAGS += -Isrc/ec/compat
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
@@ -322,6 +327,7 @@ TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 te
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
+test-units-b: $(B)/test_chunk
 test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(or $(TMPDIR),/tmp)
 	B=$(B) tests/test_config.sh $(TMPDIR)
@@ -343,6 +349,8 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_volumes
 	./$(B)/test_rs $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in coef kernel guard; do ! ./$(B)/test_rs --quick --mutant $$m >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (--quick: seconds, not 20 s a run)
+	./$(B)/test_chunk $(or $(TMPDIR),/tmp)
+	$(if $(EC_OBJ),for m in nosums nofence eof settings nosync epochnosync; do ! ./$(B)/test_chunk --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	tests/test_sync_ec.sh
 	tools/sync-ec.sh --check
 	tests/test_check_ec_symbols.sh
@@ -402,7 +410,7 @@ FUZZ_ARCH      ?=
 # name yourself empties its objects and binaries (the libtsdb.a rule below records the flags in .flags).
 FUZZ_B         ?= build-fuzz$(subst -march=,-,$(subst -march=x86-64-,-,$(FUZZ_ARCH)))
 FUZZ_SAN       := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
-FUZZ_COMMON    := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off -Iinclude -Isrc -Iclient -Iserver
+FUZZ_COMMON    := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off -Iinclude -Isrc -Iclient -Iserver -Isrc/ec/compat
 ifeq ($(findstring clang,$(FUZZ_CC)),clang)
 FUZZ_COV  := -fsanitize=fuzzer-no-link
 FUZZ_LINK := -fsanitize=fuzzer
@@ -888,6 +896,11 @@ $(B)/test_delete: tests/test_delete.c src/internal.h $(LIB)
 
 $(B)/test_rs: tests/test_rs.c src/internal.h $(EC_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
+
+# objects, chunk files, stores and the directory backend (R6): every geometry, every damage pattern, range reads at every
+# boundary, epoch fences, power loss (crashfs) at every step of a chunk write and an EPOCH store; mutants must fail it
+$(B)/test_chunk: tests/test_chunk.c src/internal.h src/chunk.h $(EC_HDR) $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels.h $(EC_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS)
