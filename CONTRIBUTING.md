@@ -92,6 +92,9 @@ Ubuntu 24.04 runners with 4 CPUs and 16 GB. These checks should be green before 
 - **jepsen:** `make jepsen`, the fault injection with kill -9, simulated power loss, disk errors, pauses, misdirected
   reads and writes, and damage to files at rest (about 12 minutes). Once a week (Mondays) it runs longer: every run
   5 minutes (`JEPSEN_SECONDS=300`, about 2 hours). It also runs by hand from the Actions tab ("Run workflow").
+  A run whose own liveness check fails (the fault injection was too slow for its floor, a server lay dead too long on a
+  stalled machine) is INCONCLUSIVE, not a failure of your change: `make jepsen` runs it again with the next seed, up to
+  three times, prints every rerun and counts them at the end; only a violation, or three INCONCLUSIVE runs in a row, fails.
 - **integration mutants:** `make integration-mutants`, which plants 23 known bugs one at a time in a copy of the tree and
   requires the integration suite to catch each (about 40 minutes). Once a week (Mondays) and from the Actions tab.
 

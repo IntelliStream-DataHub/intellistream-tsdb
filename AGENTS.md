@@ -19,6 +19,13 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
                           # (kv also writes nulls and checks every QUERY_LATEST answer, and the final ones; tests/jepsen/mutant-latest.sh
                           # plants stale latest-table entries in tsdbd, which the check must fail: jepsen-selftest runs it)
+                          # jepsen exits 0 valid, 1 VIOLATION (a wrong answer of tsdb: never repeated), 2 harness failure, 3 INCONCLUSIVE
+                          # (a liveness or coverage check of the run itself failed: the nemesis too slow for its floor, a server dead
+                          # too long, a gap, a step that idled, the classes workload that switched nothing; says nothing about tsdb).
+                          # tests/jepsen/rerun.sh runs every gate's jepsen: an INCONCLUSIVE run is rerun with the next seed, twice at
+                          # most, printed each time; three in a row fail the gate with all three messages; the summary line at the
+                          # end of make jepsen counts the reruns. jepsen-selftest requires each planted nemesis to end in that failure
+                          # with its check named (tests/jepsen/expect.sh), the honest ones to end valid
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
@@ -615,9 +622,15 @@ cgroup, so `nice` does not keep your work out of its way.
   with its time (a kill, an EIO the shim logged in its mark file, a plug the shim logged in its pull file, a pause...):
   a floor from the time a server was listening (at least a third of an honest rate, never below 3), one in each third of
   the run, and from a watcher thread that polls the server pid every 50 ms on its own clock: no server dead for more than
-  300 ms, the final stretch up to the end of the run included; and no time idle inside its fault step.
-  `make jepsen-selftest` plants the idle nemeses (once, a burst and then asleep, naps that do not look, a shim that ignores
-  SIGUSR2) and a hung server and requires each to fail.
+  250 ms, the final stretch up to the end of the run included; and no time idle inside its fault step. A failed
+  check of that kind is INCONCLUSIVE (exit 3), never a violation: a machine that stalls a thread makes an honest run fail
+  it once in a few dozen, so `tests/jepsen/rerun.sh` repeats the run with the next seed (twice at most, three in a row
+  fail the gate) and no excuse is taken off a bound for time a thread waited for a CPU (a spinning nemesis and a starved
+  one look alike to the kernel); only a wrong answer of tsdb is a violation, and a violation is never repeated.
+  `make jepsen-selftest` plants the idle nemeses (once, a burst and then asleep, naps that do not look, steps and waits that
+  sleep or spin, a nemesis that never restarts the server, a shim that ignores SIGUSR2, clients that write nothing) and
+  requires each to end in the three-INCONCLUSIVE gate failure with its check named, the honest odd ones (a late last pull,
+  a slow mark) to end valid, and a hung server to be a violation at once.
 - New behaviour comes with a test, and with numbers if it is about speed or size
   (`build/codec-bench`, `build/tsdb-bench`, `build/insert-bench`, `build/tsdbc-bench`).
 - Comparisons with ClickHouse run it in **Podman** (never Docker), bound to
