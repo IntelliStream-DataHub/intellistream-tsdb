@@ -21,7 +21,10 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # plants stale latest-table entries in tsdbd, which the check must fail: jepsen-selftest runs it)
                           # jepsen exits 0 valid, 1 VIOLATION (a wrong answer of tsdb: never repeated), 2 harness failure, 3 INCONCLUSIVE
                           # (a liveness or coverage check of the run itself failed: the nemesis too slow for its floor, a server dead
-                          # too long, a gap, a step that idled, the classes workload that switched nothing; says nothing about tsdb).
+                          # too long, a gap, a step that idled, the kv or classes workload that wrote or switched too little, the healthy outage volume
+                          # slowed; says nothing about tsdb). The final state and the whole history are judged first, whatever the liveness
+                          # checks found: a lost, resurrected or wrong row is exit 1 on its own attempt, never an INCONCLUSIVE rerun
+                          # (tests/jepsen/mutant-loss.sh plants a loss in tsdbd beside a lazy nemesis; jepsen-selftest runs it).
                           # tests/jepsen/rerun.sh runs every gate's jepsen: an INCONCLUSIVE run is rerun with the next seed, twice at
                           # most, printed each time; three in a row fail the gate with all three messages; the summary line at the
                           # end of make jepsen counts the reruns. jepsen-selftest requires each planted nemesis to end in that failure
@@ -654,7 +657,8 @@ cgroup, so `nice` does not keep your work out of its way.
   `make jepsen-selftest` plants the idle nemeses (once, a burst and then asleep, naps that do not look, steps and waits that
   sleep or spin, a nemesis that never restarts the server, a shim that ignores SIGUSR2, clients that write nothing) and
   requires each to end in the three-INCONCLUSIVE gate failure with its check named, the honest odd ones (a late last pull,
-  a slow mark) to end valid, and a hung server to be a violation at once.
+  a slow mark) to end valid, and a hung server, or data lost beside a lazy nemesis (`tests/jepsen/mutant-loss.sh`), to be a
+  violation at once.
 - New behaviour comes with a test, and with numbers if it is about speed or size
   (`build/codec-bench`, `build/tsdb-bench`, `build/insert-bench`, `build/tsdbc-bench`).
 - Comparisons with ClickHouse run it in **Podman** (never Docker), bound to
