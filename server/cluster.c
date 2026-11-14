@@ -93,7 +93,8 @@
 #define FRAME_MAX (16u << 20)
 #define WB_MAX (64u << 20) /* queued to one peer; beyond it the link is dropped (Raft resends) */
 #define CL_MAGIC 0x43445354u /* "TSDC" */
-#define CL_VERSION 2 /* 2: heartbeat sections, flags in PROBE_REPLY; peers of version 1 are refused (no mixed versions) */
+#define CL_VERSION 3 /* 2: heartbeat sections, flags in PROBE_REPLY; 3: the R3 settings in INIT, VOLUME_ADD; peers of another
+                      * version are refused (no mixed versions) */
 #define RING 4096
 #define SNAP_EVERY 1000
 #define SYNC_STALL_NS (2000ull * 1000000) /* M11: a leader whose own sync is outstanding this long hands leadership on */
@@ -410,32 +411,36 @@ const char *cluster_strerror(int rc)
     case CLUSTER_ERR_REFUSED: return "the new server belongs to another cluster or has another id";
     case CLUSTER_ERR_RETRY: return "the outcome is unknown (the leader changed); look at the status and retry";
     case CLUSTER_ERR_STATE: return "the server is in no cluster";
+    case CLUSTER_ERR_FEW: return "fewer live members take volumes than the volume has replicas";
     default: return meta_strerror(rc);
     }
 }
 
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out)
 {
-    const uint32_t v[13] = {s->replication,     s->min_isr,       s->node_timeout_ms, s->heartbeat_ms,
-                            s->isr_lag_ms,      s->out_after_s,   s->voter_replace_s, s->voters,
-                            s->volumes_per_server, s->failover,   s->read_barrier,    s->lease_s,
-                            (uint32_t)mode};
-    for (int i = 0; i < 13; i++)
+    const uint32_t v[META_SETTINGS_WORDS + 1] = {
+        s->replication,   s->min_isr,          s->node_timeout_ms,    s->heartbeat_ms,   s->isr_lag_ms,
+        s->out_after_s,   s->voter_replace_s,  s->voters,             s->volumes_per_server, s->failover,
+        s->read_barrier,  s->lease_s,          s->lease_ms,           s->drift_ppm,      s->unanswered_ms,
+        s->commit_interval_ms, s->repl_retain_mb, s->repl_retain_s,   s->idle_seal_ms,   (uint32_t)mode};
+    for (int i = 0; i <= META_SETTINGS_WORDS; i++)
         for (int j = 0; j < 4; j++)
             out[i * 4 + j] = (uint8_t)(v[i] >> (8 * j));
-    return 52;
+    return 4 * (META_SETTINGS_WORDS + 1);
 }
 
 static int settings_decode(struct rd *r, struct meta_settings *s, int *mode)
 {
-    uint32_t v[13];
-    for (int i = 0; i < 13; i++)
+    uint32_t v[META_SETTINGS_WORDS + 1];
+    for (int i = 0; i <= META_SETTINGS_WORDS; i++)
         v[i] = get32(r);
     *s = (struct meta_settings){.replication = v[0], .min_isr = v[1], .node_timeout_ms = v[2], .heartbeat_ms = v[3],
                                 .isr_lag_ms = v[4], .out_after_s = v[5], .voter_replace_s = v[6], .voters = v[7],
                                 .volumes_per_server = v[8], .failover = (uint8_t)v[9],
-                                .read_barrier = (uint8_t)v[10], .lease_s = v[11]};
-    *mode = (int)v[12];
+                                .read_barrier = (uint8_t)v[10], .lease_s = v[11], .lease_ms = v[12],
+                                .drift_ppm = v[13], .unanswered_ms = v[14], .commit_interval_ms = v[15],
+                                .repl_retain_mb = v[16], .repl_retain_s = v[17], .idle_seal_ms = v[18]};
+    *mode = (int)v[META_SETTINGS_WORDS];
     return r->bad || v[9] > 255 || v[10] > 255 ? -1 : 0;
 }
 
@@ -854,6 +859,7 @@ struct pend {
     uint32_t reqid, member;
     uint64_t index, term;
     uint64_t join; /* a NODE_ADD's MEMBER_ADD: the link to the new server, which gets JOIN once it applied */
+    uint32_t volume; /* a VOLUME_ADD: its number + 1, the reply's body once committed (0: none) */
 };
 
 
@@ -946,6 +952,7 @@ static struct {
     int init_mode;
     uint32_t reserved_id;
     uint64_t pend_join; /* set around propose() by a NODE_ADD: the new server's link (struct pend) */
+    uint32_t pend_volume; /* set around propose() by a VOLUME_ADD: its number + 1 (struct pend) */
 
     uint64_t next_hb, next_manage, next_duty, watch_conn, watch_next_try;
     unsigned watch_rot;
@@ -1570,7 +1577,7 @@ static void pend_add(uint64_t conn, uint32_t reqid, uint32_t member, uint64_t in
         if (!C.pend)
             oom();
     }
-    C.pend[C.npend++] = (struct pend){conn, reqid, member, index, term, C.pend_join};
+    C.pend[C.npend++] = (struct pend){conn, reqid, member, index, term, C.pend_join, C.pend_volume};
 }
 
 static void send_join(struct conn *d, uint32_t id);
@@ -1585,7 +1592,11 @@ static void pend_applied(uint64_t index, uint64_t term, int rc0)
             struct conn *d = p->join ? conn_by_serial(p->join) : NULL;
             if (d && rc == 0)
                 send_join(d, p->member); /* committed: now the server may learn its id; it answers the CLI */
-            else if (p->conn)
+            else if (p->conn && p->volume && rc == 0) {
+                uint8_t nb[4] = {(uint8_t)(p->volume - 1), (uint8_t)((p->volume - 1) >> 8),
+                                 (uint8_t)((p->volume - 1) >> 16), (uint8_t)((p->volume - 1) >> 24)};
+                admin_reply(p->conn, p->reqid, 0, nb, 4);
+            } else if (p->conn)
                 admin_reply(p->conn, p->reqid, p->join && rc == 0 ? CLUSTER_ERR_UNREACHABLE : rc, NULL, 0);
             if (d && rc != 0)
                 d->dead = 1;
@@ -2767,6 +2778,159 @@ static const char *leader_peer(void)
     return m ? m->peer : "";
 }
 
+size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out)
+{
+    size_t n = strlen(name);
+    out[0] = (uint8_t)n;
+    out[1] = (uint8_t)(n >> 8);
+    memcpy(out + 2, name, n);
+    for (int j = 0; j < 4; j++)
+        out[2 + n + j] = (uint8_t)(replicas >> (8 * j));
+    return 2 + n + 4;
+}
+
+/* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
+static int text_ok_cl(const char *s)
+{
+    if (!strcmp(s, ".") || !strcmp(s, ".."))
+        return 0;
+    for (; *s; s++)
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') || *s == '_' ||
+              *s == '-' || *s == '.'))
+            return 0;
+    return 1;
+}
+
+/* A member a new volume may be placed on: up, taking volumes, and heard within node_timeout (the leader: itself). */
+static int placeable(const struct meta_member *mb, uint64_t now)
+{
+    if (mb->state != META_UP || !(mb->flags & META_MF_VOLUMES_OK))
+        return 0;
+    if (mb->id == C.id)
+        return 1;
+    const struct heard *h = heard_get(mb->id);
+    return h && h->ns && now - h->ns < (uint64_t)C.sm.set.node_timeout_ms * MS;
+}
+
+/* §3.2 rules 1-2, a deterministic greedy pass: the preferred leader (nodes[0]) is the live member that leads the
+ * fewest volumes (then holds the fewest, then the lowest id); each further replica the one that holds the fewest,
+ * on a rack not used yet while one is left (racks count only when every candidate has one and there are at least
+ * `n` of them). Returns 0 or -1 (fewer live members than n). */
+static int place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
+{
+    uint32_t cand[META_REPLICAS_MAX * 64], nc = 0, leads[META_REPLICAS_MAX * 64], holds[META_REPLICAS_MAX * 64];
+    for (uint32_t i = 0; i < C.sm.nmembers && nc < sizeof cand / sizeof cand[0]; i++) {
+        const struct meta_member *mb = &C.sm.members[i];
+        if (!placeable(mb, now))
+            continue;
+        leads[nc] = holds[nc] = 0;
+        for (uint32_t v = 0; v < C.sm.nvolumes; v++)
+            for (uint32_t k = 0; k < C.sm.volumes[v].nrep; k++)
+                if (C.sm.volumes[v].rep[k].node == mb->id) {
+                    holds[nc]++;
+                    leads[nc] += k == 0;
+                }
+        cand[nc++] = i;
+    }
+    if (nc < n)
+        return -1;
+    int racks = 1;
+    uint32_t distinct = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        const char *ri = C.sm.members[cand[i]].rack;
+        if (!ri[0])
+            racks = 0;
+        int seen = 0;
+        for (uint32_t j = 0; j < i; j++)
+            seen |= !strcmp(C.sm.members[cand[j]].rack, ri);
+        distinct += !seen;
+    }
+    racks = racks && distinct >= n;
+    uint8_t used[META_REPLICAS_MAX * 64] = {0};
+    for (uint32_t k = 0; k < n; k++) {
+        int best = -1;
+        for (uint32_t i = 0; i < nc; i++) {
+            if (used[i])
+                continue;
+            if (racks) {
+                int clash = 0;
+                for (uint32_t j = 0; j < k; j++)
+                    clash |= !strcmp(C.sm.members[cand[i]].rack, meta_member(&C.sm, nodes[j])->rack);
+                if (clash)
+                    continue;
+            }
+            if (best < 0)
+                best = (int)i;
+            else if (k == 0 ? (leads[i] < leads[best] || (leads[i] == leads[best] && holds[i] < holds[best]))
+                            : holds[i] < holds[best])
+                best = (int)i;
+        }
+        if (best < 0)
+            return -1;
+        used[best] = 1;
+        nodes[k] = C.sm.members[cand[best]].id;
+    }
+    return 0;
+}
+
+static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r)
+{
+    struct meta_volume_add a = {0};
+    getstr(r, a.name, sizeof a.name);
+    uint32_t n = get32(r);
+    if (r->bad || !a.name[0] || !text_ok_cl(a.name)) {
+        admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
+        return;
+    }
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised) {
+        const char *lp = leader_peer();
+        admin_reply(c->serial, reqid, C.sm.initialised || C.have_node ? CLUSTER_ERR_NOTLEADER : CLUSTER_ERR_STATE,
+                    lp, strlen(lp));
+        return;
+    }
+    if (!n)
+        n = C.sm.set.replication;
+    if (C.sm.mode != META_MODE_REPLICATED || n < 1 || n > META_REPLICAS_MAX) {
+        admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
+        return;
+    }
+    for (uint32_t i = 0; i < C.sm.nvolumes; i++)
+        if (!strcmp(C.sm.volumes[i].name, a.name)) {
+            admin_reply(c->serial, reqid, META_ERR_EXISTS, NULL, 0);
+            return;
+        }
+    /* the next free number; 0 is never a cluster volume's (a node's root keeps volume 0 for its USERS) */
+    a.number = C.sm.next_volume ? C.sm.next_volume : 1;
+    if (a.number > META_VOLUME_MAX) {
+        admin_reply(c->serial, reqid, META_ERR_RANGE, NULL, 0);
+        return;
+    }
+    if (place_volume(n, iso_now_ns(), a.nodes) != 0) {
+        say("volume add %s: fewer than %" PRIu32 " live members take volumes", a.name, n);
+        admin_reply(c->serial, reqid, CLUSTER_ERR_FEW, NULL, 0);
+        return;
+    }
+    a.n = n;
+    a.kind = META_VOL_REPLICATED;
+    a.min_isr = C.sm.set.min_isr < n ? C.sm.set.min_isr : n;
+    tsdb_random(a.uuid, sizeof a.uuid);
+    for (uint32_t i = 0; i < n; i++) {
+        int dup;
+        do {
+            tsdb_random(&a.rid[i], sizeof a.rid[i]);
+            dup = !a.rid[i];
+            for (uint32_t j = 0; j < i; j++)
+                dup |= a.rid[j] == a.rid[i];
+        } while (dup);
+    }
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_volume_add(&e, &a);
+    C.pend_volume = a.number + 1;
+    propose(&e, c->serial, reqid, 0);
+    C.pend_volume = 0;
+}
+
 static void admin_init(struct conn *c, uint32_t reqid, struct rd *r)
 {
     struct meta_settings s;
@@ -2976,6 +3140,7 @@ static void on_admin(struct conn *c, struct rd *r)
     switch (op) {
     case CLUSTER_OP_INIT: admin_init(c, reqid, r); break;
     case CLUSTER_OP_NODE_ADD: admin_node_add(c, reqid, r); break;
+    case CLUSTER_OP_VOLUME_ADD: admin_volume_add(c, reqid, r); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);

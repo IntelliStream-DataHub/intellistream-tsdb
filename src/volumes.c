@@ -501,8 +501,10 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
      * this release does not know, is not given a volume made by these rules (the open of the root refuses it too). */
     {
         char *vl = strstr(txt, "version="), unknown[96];
-        meta_requires_parse(txt, &root_feed, unknown, sizeof unknown);
-        if ((vl ? atoi(vl + 8) : 0) != FORMAT_VERSION || unknown[0]) {
+        unsigned feats;
+        meta_requires_parse(txt, &feats, unknown, sizeof unknown);
+        root_feed = feats & META_REQ_FEED;
+        if ((vl ? atoi(vl + 8) : 0) != FORMAT_VERSION || unknown[0] || (feats & META_REQ_CLUSTER)) {
             fprintf(stderr, "tsdb: the root META says format %d%s%s: a volume is added only to a database of format "
                             "%d without unknown requirements\n", vl ? atoi(vl + 8) : 0, unknown[0] ? ", " : "",
                     unknown[0] ? "with requires=" : "", FORMAT_VERSION);

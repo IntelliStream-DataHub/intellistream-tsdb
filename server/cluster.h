@@ -37,9 +37,12 @@ void cluster_stop(void);
 /* ---- the admin ops (`tsdb cluster ...`), sent to a server's peer address */
 
 enum cluster_admin_op {
-    CLUSTER_OP_INIT = 1,     /* body: struct meta_settings (12 u32) and the mode (u32); on a server in no cluster */
+    CLUSTER_OP_INIT = 1,     /* body: struct meta_settings (META_SETTINGS_WORDS u32) and the mode (u32); on a server in
+                              * no cluster */
     CLUSTER_OP_NODE_ADD = 2, /* body: the new server's peer address; on the Raft leader */
     CLUSTER_OP_STATUS = 3,   /* no body; on any server */
+    CLUSTER_OP_VOLUME_ADD = 4, /* body: u16 name length, the name, u32 replicas (0: the cluster's replication); on the
+                                * Raft leader, which picks the number, uuid, servers and rids. Reply: u32 number */
 };
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
@@ -50,6 +53,7 @@ enum cluster_err {
     CLUSTER_ERR_REFUSED = -103,   /* NODE_ADD: the new server belongs to another cluster or has another id */
     CLUSTER_ERR_RETRY = -104,     /* the entry's outcome is unknown here (a snapshot replaced it, a new leader) */
     CLUSTER_ERR_STATE = -105,     /* not now (the server is in no cluster) */
+    CLUSTER_ERR_FEW = -106,       /* VOLUME_ADD: fewer live members that take volumes than replicas */
 };
 const char *cluster_strerror(int rc);
 
@@ -143,7 +147,10 @@ int cluster_make_secret(const char *path, char *err, size_t errn);
 void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *const *part, const size_t *len,
                         uint8_t out[32]);
 
-/* The INIT body for `s` and the deployment's mode, an enum meta_mode (52 bytes). */
+/* The VOLUME_ADD body (at most 2 + META_NAME_MAX + 4 bytes). */
+size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out);
+
+/* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);
 
 #endif

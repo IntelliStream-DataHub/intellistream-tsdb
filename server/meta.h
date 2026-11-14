@@ -116,7 +116,16 @@ struct meta_settings {
     uint8_t failover;            /* enum meta_failover (lease) */
     uint8_t read_barrier;        /* 1: owners answer reads only behind a fenced write (M24; a node may override) */
     uint32_t lease_s;            /* the shared volumes' lease (10); the proposer's clock, never apply's */
+    /* Replicated volumes (R3; design-cluster.md §4-§8): read only by the cluster layer, never by apply */
+    uint32_t lease_ms;           /* a replicated leader's read lease after each heartbeat answer (2000, §7.1) */
+    uint32_t drift_ppm;          /* the clock drift every lease is shortened by (500) */
+    uint32_t unanswered_ms;      /* an `unanswered` ISR member kept by a promotion is dropped after this (1000, §6.2) */
+    uint32_t commit_interval_ms; /* the commit point travels within this without records to carry it (5, §4.2) */
+    uint32_t repl_retain_mb;     /* WAL kept for a lagging replica, MB (4096, §8.2) */
+    uint32_t repl_retain_s;      /* and for at most this long (1800) */
+    uint32_t idle_seal_ms;       /* an idle leader seals its last segment after this (1000, item 13) */
 };
+#define META_SETTINGS_WORDS 19 /* the words of the INIT body before the mode (cluster_settings_encode) */
 void meta_settings_default(struct meta_settings *s);
 
 struct meta_member {

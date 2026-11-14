@@ -448,7 +448,7 @@ static void init_mode(int i, uint32_t replace_s, int mode)
     s.node_timeout_ms = 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
-    uint8_t req[64], *reply;
+    uint8_t req[128], *reply;
     size_t len;
     size_t rl = cluster_settings_encode(&s, mode, req);
     int rc = admin(i, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
@@ -776,7 +776,7 @@ static void scen_life(void)
     {
         struct meta_settings s;
         meta_settings_default(&s);
-        uint8_t req[64], *reply;
+        uint8_t req[128], *reply;
         size_t len, rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
         int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
         free(reply);
@@ -1017,7 +1017,7 @@ static void scen_initcrash(void)
     meta_settings_default(&s);
     s.node_timeout_ms = 1500;
     s.heartbeat_ms = 200;
-    uint8_t req[64], *rep = NULL;
+    uint8_t req[128], *rep = NULL;
     size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req), len;
     char addr[META_ADDR_MAX], err[1024];
     peer_of(0, addr, sizeof addr);
