@@ -23,6 +23,7 @@ use tc::{Column, ValueType, Values};
 pub mod arrays;
 pub mod latest;
 pub mod multi;
+pub mod stats;
 
 pub use arrays::{Buckets, Col, SidCol, TwaBuckets, values_column, vec_to_py};
 

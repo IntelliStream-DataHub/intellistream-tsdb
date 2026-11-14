@@ -9,6 +9,7 @@ use crate::SeriesId;
 use crate::client::Client;
 use crate::error::Result;
 use crate::latest::{Latest, LatestOpts};
+use crate::stats::{SeriesStat, TenantOpts, TenantStats};
 use crate::types::{
     Bucket, Buckets, Group, MultiOpts, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts,
 };
@@ -192,6 +193,8 @@ pub trait Database {
     fn last_query_stats(&mut self) -> Result<QueryStats>;
     fn latest(&mut self, ids: &[SeriesId], opts: &LatestOpts) -> Result<Vec<Latest>>;
     fn latest_by_name(&mut self, names: &[&str], opts: &LatestOpts) -> Result<Vec<Latest>>;
+    fn series_stats(&mut self, ids: &[SeriesId], resident: bool) -> Result<Vec<SeriesStat>>;
+    fn tenant_stats(&mut self, prefixes: &[&str], opts: &TenantOpts) -> Result<TenantStats>;
 }
 
 macro_rules! forward {
@@ -363,6 +366,12 @@ macro_rules! forward {
             }
             fn latest_by_name(&mut self, names: &[&str], opts: &LatestOpts) -> Result<Vec<Latest>> {
                 <$t>::latest_by_name(self, names, opts)
+            }
+            fn series_stats(&mut self, ids: &[SeriesId], resident: bool) -> Result<Vec<SeriesStat>> {
+                <$t>::series_stats(self, ids, resident)
+            }
+            fn tenant_stats(&mut self, prefixes: &[&str], opts: &TenantOpts) -> Result<TenantStats> {
+                <$t>::tenant_stats(self, prefixes, opts)
             }
         }
     };

@@ -2,11 +2,21 @@
  * include/tsdb_calendar.h, nothing internal. The test hooks (tsdb_test_*, declared in src/internal.h or in the tests
  * themselves) reach into the engine and can corrupt a database, so a binding must not find them. They match
  * tsdb_*, and the linker prefers a name written out in full to a pattern, so each is named below as local. A new
- * hook needs a line here: tests/test_shared.c fails on any exported name that no public header declares. */
+ * hook needs a line here: tests/test_shared.c fails on any exported name that no public header declares.
+ * The tsdb_ec_* functions are the erasure codec's glue (src/ec/compat.c): internal, and a caller could lift the CPU
+ * level cap with tsdb_ec_select. They are named one by one too; a new one fails tools/check-exports.sh (make test)
+ * until it is listed here or declared in a public header. */
 {
     global:
         tsdb_*;
     local:
+        tsdb_ec_cpu_has;
+        tsdb_ec_now_ns;
+        tsdb_ec_panic;
+        tsdb_ec_prefer_512;
+        tsdb_ec_select;
+        tsdb_ec_strlcpy;
+        tsdb_ec_xmalloc;
         tsdb_test_before_parts;
         tsdb_test_class_switch;
         tsdb_test_deferred_retires;

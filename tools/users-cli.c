@@ -237,10 +237,10 @@ static int ensure_dir(const char *dir)
     return rc;
 }
 
-/* The online verbs: the same changes through a running tsdbd, as the user who logs in (A9 decides what that user
- * may change; the server answers TSDB_ERR_DENIED otherwise). For tenant admins without shell access. */
-static int user_online(const char *server, const char *login, const char *login_pwfile, const char *verb,
-                       const char *const *args, int super, const char *pwfile, uint32_t iterations)
+/* Connect to a running tsdbd at "HOST:PORT" and log in as `login` (NULL: no login, for a server started with
+ * --no-auth). The password comes from the file, TSDB_LOGIN_PASSWORD or the prompt, never from argv. Prints the
+ * reason and returns the status the command should exit with (2: bad address, 1: refused) on failure. */
+int cli_connect(const char *server, const char *login, const char *login_pwfile, tsdbc **out)
 {
     char host[256];
     const char *colon = strrchr(server, ':');
@@ -257,16 +257,28 @@ static int user_online(const char *server, const char *login, const char *login_
         host[strlen(host) - 1] = '\0';
     }
     password lpw;
-    if (get_password_from(login_pwfile, "TSDB_LOGIN_PASSWORD", login, false, lpw) != 0)
+    memset(lpw, 0, sizeof lpw);
+    if (login && get_password_from(login_pwfile, "TSDB_LOGIN_PASSWORD", login, false, lpw) != 0)
         return 1;
-    tsdbc_options o = {.user = login, .password = lpw, .require_auth = 1};
-    tsdbc *c;
-    int rc = tsdbc_connect_opts(host, (int)port, &o, &c);
+    tsdbc_options o = {.user = login, .password = login ? lpw : NULL, .require_auth = login ? 1 : 0};
+    int rc = tsdbc_connect_opts(host, (int)port, &o, out);
     tsdb_wipe(lpw, sizeof lpw);
     if (rc) {
-        fprintf(stderr, "tsdb: %s as %s: %s\n", server, login, tsdbc_strerror(rc));
+        fprintf(stderr, "tsdb: %s%s%s: %s\n", server, login ? " as " : "", login ? login : "", tsdbc_strerror(rc));
         return 1;
     }
+    return 0;
+}
+
+/* The online verbs: the same changes through a running tsdbd, as the user who logs in (A9 decides what that user
+ * may change; the server answers TSDB_ERR_DENIED otherwise). For tenant admins without shell access. */
+static int user_online(const char *server, const char *login, const char *login_pwfile, const char *verb,
+                       const char *const *args, int super, const char *pwfile, uint32_t iterations)
+{
+    tsdbc *c;
+    int rc = cli_connect(server, login, login_pwfile, &c);
+    if (rc)
+        return rc;
     const char *name = args[0];
     if (strcmp(verb, "list") == 0 || strcmp(verb, "whoami") == 0) {
         tsdbc_user *u;

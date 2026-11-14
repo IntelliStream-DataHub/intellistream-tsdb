@@ -1460,7 +1460,7 @@ None open.
 
 ## Unverified assumptions
 
-- EU1: GFNI kernels encode k = 16, m = 4 above 8 GB/s a core on Zen 4/5 (R5 measures).
+- EU1: GFNI kernels encode k = 16, m = 4 above 8 GB/s a core on Zen 4/5. R5 measured the 7950X (Zen 4, 2026-11-13, `docs/tasks/ec-bench.md`): gfni256 16.1 GB/s a core with 1 MiB shards (cache-sized stripes), 7.4 GB/s with 4 MiB shards (memory bound), gfni512 slightly slower on Zen 4; the 9950X is still to be measured. Accepted by the user on 2026-11-13: 7.4 GB/s a core at 4 MiB shards is enough.
 - EU2: A cold-cache decode query costs one round trip per partition touched with pipelining (R11).
 - EU3: Young data is about one day of ingest per volume with `settle_grace_s` = 1 h and day partitions, plus the
   settle wait (EA2, §4).

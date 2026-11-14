@@ -376,6 +376,16 @@ impl Pool {
         self.one(|c| c.latest_by_name(names, opts))
     }
 
+    /// [`Client::series_stats`] on one of the pool's connections.
+    pub fn series_stats(&self, ids: &[SeriesId], resident: bool) -> Result<Vec<crate::SeriesStat>> {
+        self.one(|c| c.series_stats(ids, resident))
+    }
+
+    /// [`Client::tenant_stats`] on one of the pool's connections.
+    pub fn tenant_stats(&self, prefixes: &[&str], opts: &crate::TenantOpts) -> Result<crate::TenantStats> {
+        self.one(|c| c.tenant_stats(prefixes, opts))
+    }
+
     /// [`Client::query_lttb_multi`] on one of the pool's connections.
     pub fn query_lttb_multi(
         &self,

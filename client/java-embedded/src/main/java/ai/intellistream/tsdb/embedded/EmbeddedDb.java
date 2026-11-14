@@ -13,9 +13,12 @@ import ai.intellistream.tsdb.Points;
 import ai.intellistream.tsdb.QueryStats;
 import ai.intellistream.tsdb.RawConsumer;
 import ai.intellistream.tsdb.SeriesResult;
+import ai.intellistream.tsdb.SeriesStat;
 import ai.intellistream.tsdb.Stats;
 import ai.intellistream.tsdb.SpreadBucket;
 import ai.intellistream.tsdb.Status;
+import ai.intellistream.tsdb.TenantOptions;
+import ai.intellistream.tsdb.TenantStats;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.TsdbException;
 import ai.intellistream.tsdb.TwaBucket;
@@ -2039,6 +2042,251 @@ public final class EmbeddedDb implements AutoCloseable {
         stream(s, series, start, end, order, limit, LTTB, threshold);
         int n = s.fill;
         return new ValuePoints(Arrays.copyOf(s.ts, n), s.column(n, true));
+    }
+
+    // ------------------------------------------------------------------------------------------------ statistics
+
+    /**
+     * The tenant list: a series belongs to the tenant with the longest prefix its name starts with, else to "(none)".
+     * Empty strings and duplicates are dropped.
+     *
+     * @param prefixes the prefixes
+     * @throws TsdbException the call failed ({@link Status#ERR_INVALID} with statistics off)
+     */
+    public void setTenants(String... prefixes) throws TsdbException {
+        Objects.requireNonNull(prefixes, "prefixes");
+        MemorySegment d = enter();
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment v = a.allocate(Math.max(1, prefixes.length) * 8L, 8);
+            for (int i = 0; i < prefixes.length; i++)
+                v.setAtIndex(PTR, i, a.allocateFrom(Objects.requireNonNull(prefixes[i], "prefix")));
+            int rc;
+            try {
+                rc = (int) Native.SET_TENANTS.invokeExact(d, v, (long) prefixes.length);
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+            check(rc, "set tenants");
+        } finally {
+            exit();
+        }
+    }
+
+    /**
+     * Waits until the statistics sweeper has handled the parts listed before the call, for at most {@code timeoutMs}.
+     *
+     * @param timeoutMs the longest wait
+     * @throws TsdbException {@link Status#ERR_UNAVAILABLE} when time ran out
+     */
+    public void statsSettle(int timeoutMs) throws TsdbException {
+        MemorySegment d = enter();
+        try {
+            int rc;
+            try {
+                rc = (int) Native.STATS_SETTLE.invokeExact(d, timeoutMs);
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+            check(rc, "stats settle");
+        } finally {
+            exit();
+        }
+    }
+
+    /**
+     * The storage numbers of series, as {@link TsdbClient#seriesStats(long[], boolean)}, in this process (without the
+     * {@link Status#ERR_DENIED} answer). An id that names no series fails in its own entry
+     * ({@link Status#ERR_NOTFOUND}).
+     *
+     * @param ids series ids
+     * @param resident fill {@link SeriesStat#residentBytes()}
+     * @return one result per id, in order
+     * @throws TsdbException the call failed ({@link Status#ERR_INVALID} with statistics off)
+     */
+    public List<SeriesResult<SeriesStat>> seriesStats(long[] ids, boolean resident) throws TsdbException {
+        Objects.requireNonNull(ids, "ids");
+        int n = ids.length, chunk = resident ? 1024 : 65_536;
+        List<SeriesResult<SeriesStat>> list = new ArrayList<>(n);
+        MemorySegment d = enter();
+        try (Arena a = Arena.ofConfined()) {
+            long rec = Native.SERIES_STAT.byteSize();
+            while (list.size() < n) {
+                int at = list.size(), m = Math.min(chunk, n - at);
+                MemorySegment in = a.allocateFrom(JAVA_LONG, Arrays.copyOfRange(ids, at, at + m));
+                MemorySegment out = a.allocate(m * rec, 8).fill((byte) 0);
+                MemorySegment done = a.allocate(8, 8).fill((byte) 0);
+                int rc;
+                try {
+                    rc = (int) Native.SERIES_STATS.invokeExact(d, in, (long) m, resident ? 1 : 0, out, done);
+                } catch (Throwable t) {
+                    throw rethrow(t);
+                }
+                check(rc, "series stats");
+                long got = done.get(JAVA_LONG, 0);
+                if (got < 1 || got > m)
+                    throw new TsdbException(Status.ERR_CORRUPT, "tsdb_series_stats answered " + got + " of " + m, null);
+                java.nio.ByteBuffer bb = out.asByteBuffer().order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                for (int i = 0; i < got; i++) {
+                    int st = bb.getInt((int) (i * rec));
+                    SeriesStat one = SeriesStat.of(bb, (int) (i * rec));
+                    if (one == null && st == 0)
+                        throw new TsdbException(Status.ERR_CORRUPT, "tsdb_series_stats answered out of shape", null);
+                    list.add(st == 0 ? SeriesResult.of(one) : SeriesResult.failed(st, null));
+                }
+            }
+            return list;
+        } finally {
+            exit();
+        }
+    }
+
+    /**
+     * The numbers of tenants, as {@link TsdbClient#tenantStats(String[], TenantOptions)} answers a user who may see
+     * every tenant: no prefixes is every tenant, "(none)" first, then the list in its order; the hot lists are
+     * filtered to the tenant's series and end in the threshold (series 0). The request counters are null (nothing
+     * counts requests here), and {@code partsCounted} and {@code partsListed} are 0.
+     *
+     * @param prefixes the tenants asked for, or null or empty for all
+     * @param o what to include
+     * @return the tenants; a prefix that is not in the list has status {@link Status#ERR_NOTFOUND}
+     * @throws TsdbException the call failed ({@link Status#ERR_INVALID} with statistics off)
+     */
+    public TenantStats tenantStats(String[] prefixes, TenantOptions o) throws TsdbException {
+        Objects.requireNonNull(o, "options");
+        List<String> list = new ArrayList<>();
+        MemorySegment d = enter();
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment buf = a.allocate(4096, 1);
+            for (;;) {
+                int len;
+                try {
+                    len = (int) Native.TENANT_PREFIX.invokeExact(d, (long) list.size(), buf, 4096L);
+                } catch (Throwable t) {
+                    throw rethrow(t);
+                }
+                if (len < 0)
+                    break;
+                if (len >= 4096)
+                    throw new TsdbException(Status.ERR_INVALID, "a tenant prefix of " + len + " bytes", null);
+                list.add(new String(buf.asSlice(0, len).toArray(JAVA_BYTE), java.nio.charset.StandardCharsets.UTF_8));
+            }
+            MemorySegment st = a.allocate(Native.TENANT_STATS).fill((byte) 0);
+            check(tenantGet(d, MemorySegment.NULL, -1, st), "tenant stats");
+            int generation = st.get(JAVA_INT, 4);
+            long hash = st.get(JAVA_LONG, 8);
+            List<String> names = new ArrayList<>();
+            if (prefixes == null || prefixes.length == 0) {
+                names.add("");
+                names.addAll(list);
+            } else {
+                names.addAll(Arrays.asList(prefixes));
+            }
+            /* the hot lists, once: three kinds of up to 256 entries and their thresholds */
+            long[][][] hot = new long[3][][];
+            long[] thr = new long[3];
+            if (o.hot() > 0) {
+                for (int kind = 0; kind < 3; kind++) {
+                    MemorySegment raw = a.allocate(256 * Native.HOT.byteSize(), 8).fill((byte) 0);
+                    MemorySegment cnt = a.allocate(8, 8).fill((byte) 0), th = a.allocate(8, 8).fill((byte) 0);
+                    int rc;
+                    try {
+                        rc = (int) Native.HOT_SERIES.invokeExact(d, kind + 1, raw, 256L, cnt, th);
+                    } catch (Throwable t) {
+                        throw rethrow(t);
+                    }
+                    check(rc, "hot series");
+                    int m = (int) cnt.get(JAVA_LONG, 0);
+                    hot[kind] = new long[m][];
+                    for (int i = 0; i < m; i++)
+                        hot[kind][i] = new long[] {raw.get(JAVA_LONG, i * 24L), raw.get(JAVA_LONG, i * 24L + 8),
+                            raw.get(JAVA_LONG, i * 24L + 16)};
+                    thr[kind] = th.get(JAVA_LONG, 0);
+                }
+            }
+            int nv = volumeCountOf(d);
+            boolean partial = false;
+            List<TenantStats.Row> rows = new ArrayList<>();
+            for (String name : names) {
+                MemorySegment cn = name.isEmpty() ? MemorySegment.NULL : a.allocateFrom(name);
+                int rc = tenantGet(d, cn, -1, st);
+                if (rc != 0) {
+                    rows.add(new TenantStats.Row(rc == Status.ERR_NOTFOUND ? rc : Status.ERR_INVALID,
+                            TenantStats.VOLUME_SUM, name, false, tenantNumbers(null), null, List.of()));
+                    continue;
+                }
+                partial |= (st.get(JAVA_INT, 0) & 1) != 0;
+                List<TenantStats.Hot> hl = new ArrayList<>();
+                if (o.hot() > 0) {
+                    for (int kind = 0; kind < 3; kind++) {
+                        TenantStats.HotKind hk = TenantStats.HotKind.values()[kind];
+                        int taken = 0;
+                        for (long[] e : hot[kind]) {
+                            if (taken == o.hot())
+                                break;
+                            String sn;
+                            try {
+                                sn = seriesName(e[0]);
+                            } catch (TsdbException ex) {
+                                continue;
+                            }
+                            if (tenantOf(list, sn).equals(name)) {
+                                hl.add(new TenantStats.Hot(hk, e[0], e[1], e[2]));
+                                taken++;
+                            }
+                        }
+                        hl.add(new TenantStats.Hot(hk, 0, thr[kind], 0));
+                    }
+                }
+                rows.add(new TenantStats.Row(0, TenantStats.VOLUME_SUM, name, (st.get(JAVA_INT, 0) & 1) != 0,
+                        tenantNumbers(st), null, Collections.unmodifiableList(hl)));
+                if (o.volumes()) {
+                    for (int v = 0; v < nv; v++) {
+                        MemorySegment sv = a.allocate(Native.TENANT_STATS).fill((byte) 0);
+                        int vr = tenantGet(d, cn, v, sv);
+                        rows.add(new TenantStats.Row(vr == 0 ? 0 : Status.ERR_INVALID, v, name,
+                                vr == 0 && (sv.get(JAVA_INT, 0) & 1) != 0, tenantNumbers(vr == 0 ? sv : null), null,
+                                List.of()));
+                    }
+                }
+            }
+            return new TenantStats(partial, false, generation, hash, 0, 0, Collections.unmodifiableList(rows));
+        } finally {
+            exit();
+        }
+    }
+
+    private static int volumeCountOf(MemorySegment d) throws TsdbException {
+        try {
+            return (int) Native.VOLUME_COUNT.invokeExact(d);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    private int tenantGet(MemorySegment d, MemorySegment prefix, int volume, MemorySegment out) throws TsdbException {
+        try {
+            return (int) Native.TENANT_STATS_GET.invokeExact(d, prefix, volume, out);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** The tenant of a series name: the longest prefix of the list it starts with, else "(none)". */
+    private static String tenantOf(List<String> list, String name) {
+        String best = "";
+        for (String p : list)
+            if (!p.isEmpty() && name.startsWith(p) && p.length() > best.length())
+                best = p;
+        return best;
+    }
+
+    private static TenantStats.Numbers tenantNumbers(MemorySegment t) {
+        long[] x = new long[18];
+        if (t != null)
+            for (int i = 0; i < 18; i++)
+                x[i] = t.get(JAVA_LONG, 16 + i * 8L);
+        return new TenantStats.Numbers(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9], x[10], x[11], x[12],
+                x[13], x[14], x[15], x[16], x[17]);
     }
 
     // ------------------------------------------------------------------------------------------------- latest

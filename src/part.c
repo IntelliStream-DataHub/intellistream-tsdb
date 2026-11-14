@@ -351,7 +351,7 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     w->wal_seq = wal_seq;
     w->fno_lo = cur_fno_lo;
     w->fno_hi = cur_fno_hi;
-    w->written_ms = eng_wall_ms();
+    w->written_ms = db->rp ? replica_now_ms(db) : eng_wall_ms(); /* a replica has the leader's clock only */
     w->grows = db->granule_rows;
     int64_t cut = db->partition_ms * GRANULE_CUT; /* cls_len is partition_ms for every class without classes */
     w->cut_ms = db->cls_len[partition_class(db, partition)] > cut ? cut : 0;

@@ -219,6 +219,21 @@ static void db_start(void)
     o.wal_sync_ms = -1;
     o.partition_ms = 3600000;
     o.granule_rows = 64;
+    /* The tenants of STATS_TENANTS: the series' names start with "f", "i" or "st" (tn_init once per process: its
+     * slots are never reused; the thread that applies later lists is not started, the list never changes) */
+    static char **tn_names;
+    static size_t tn_count_;
+    if (!tn_names) {
+        char tf[4300];
+        snprintf(tf, sizeof tf, "%s/tenants", db_dir);
+        FILE *f = fopen(tf, "w");
+        if (!f || fputs("f\ni\nst\n", f) < 0 || fclose(f) != 0 || tn_init(NULL, tf, false, 0, &tn_names, &tn_count_) != 0) {
+            fprintf(stderr, "fuzz_frames: cannot make the tenants list\n");
+            exit(2);
+        }
+    }
+    o.tenants = (const char *const *)tn_names;
+    o.ntenants = tn_count_;
     if (tsdb_open(d, &o, &db) != 0) {
         fprintf(stderr, "fuzz_frames: cannot open %s\n", d);
         exit(2);
@@ -1078,6 +1093,47 @@ static int cmd_seeds(const char *dir)
     p32(&p, 1);
     frame(&f, TSDB_OP_CANCEL, &p);
     seed_write(dir, "query-latest-cancel", &f);
+    /* STATS_SERIES (version 15): u32 n, u32 flags, ids; the forms, and the headers it refuses */
+    SEED("stats-series", TSDB_OP_STATS_SERIES,
+         (p32(&p, 4), p32(&p, 0), psid(&p, 0), psid(&p, 1), psid(&p, 4), psid(&p, 77)));
+    SEED("stats-series-resident", TSDB_OP_STATS_SERIES,
+         (p32(&p, 2), p32(&p, TSDB_STATS_RESIDENT), psid(&p, 0), psid(&p, 0x100000001ull)));
+    SEED("stats-series-reserved-flag", TSDB_OP_STATS_SERIES, (p32(&p, 1), p32(&p, 2), psid(&p, 0)));
+    SEED("stats-series-n0", TSDB_OP_STATS_SERIES, (p32(&p, 0), p32(&p, 0)));
+    SEED("stats-series-n-big", TSDB_OP_STATS_SERIES, (p32(&p, 0x7fffffff), p32(&p, 0), psid(&p, 0)));
+    SEED("stats-series-short", TSDB_OP_STATS_SERIES, (p32(&p, 3), p32(&p, 0), psid(&p, 0)));
+    SEED("stats-series-resident-over", TSDB_OP_STATS_SERIES, ({
+             p32(&p, TSDB_STATS_SERIES_RESIDENT_MAX + 1), p32(&p, TSDB_STATS_RESIDENT);
+             for (uint32_t i = 0; i < TSDB_STATS_SERIES_RESIDENT_MAX + 1; i++)
+                 psid(&p, i % 5);
+         }));
+    /* many ids: the reply is one frame of records, and a CANCEL of one in flight names the request's id */
+    f.len = p.len = 0;
+    p32(&p, 20000), p32(&p, 0);
+    for (uint32_t i = 0; i < 20000; i++)
+        psid(&p, i % 7 == 0 ? 77 : i % 5);
+    frame(&f, TSDB_OP_STATS_SERIES, &p);
+    p.len = 0;
+    p32(&p, 1);
+    frame(&f, TSDB_OP_CANCEL, &p);
+    seed_write(dir, "stats-series-cancel", &f);
+    /* STATS_TENANTS: u16 flags, u16 k, u32 n, u32 cursor, u32 0, n x {u16 len, prefix} */
+    SEED("stats-tenants", TSDB_OP_STATS_TENANTS, (p16(&p, 0), p16(&p, 0), p32(&p, 0), p32(&p, 0), p32(&p, 0)));
+    SEED("stats-tenants-named", TSDB_OP_STATS_TENANTS,
+         (p16(&p, TSDB_TSTATS_VOLUMES | TSDB_TSTATS_CALLER), p16(&p, 0), p32(&p, 3), p32(&p, 0), p32(&p, 0),
+          pstr16(&p, "f"), p16(&p, 0), pstr16(&p, "nobody/")));
+    SEED("stats-tenants-hot", TSDB_OP_STATS_TENANTS,
+         (p16(&p, TSDB_TSTATS_HOT | TSDB_TSTATS_CALLER), p16(&p, 8), p32(&p, 0), p32(&p, 0), p32(&p, 0)));
+    SEED("stats-tenants-cursor", TSDB_OP_STATS_TENANTS,
+         (p16(&p, TSDB_TSTATS_VOLUMES), p16(&p, 0), p32(&p, 0), p32(&p, 1), p32(&p, 0)));
+    SEED("stats-tenants-cursor-far", TSDB_OP_STATS_TENANTS,
+         (p16(&p, 0), p16(&p, 0), p32(&p, 0), p32(&p, 0x7ffffff0), p32(&p, 0)));
+    SEED("stats-tenants-reserved-flag", TSDB_OP_STATS_TENANTS, (p16(&p, 8), p16(&p, 0), p32(&p, 0), p32(&p, 0), p32(&p, 0)));
+    SEED("stats-tenants-reserved-word", TSDB_OP_STATS_TENANTS, (p16(&p, 0), p16(&p, 0), p32(&p, 0), p32(&p, 0), p32(&p, 1)));
+    SEED("stats-tenants-k-over", TSDB_OP_STATS_TENANTS, (p16(&p, TSDB_TSTATS_HOT), p16(&p, 257), p32(&p, 0), p32(&p, 0), p32(&p, 0)));
+    SEED("stats-tenants-n-big", TSDB_OP_STATS_TENANTS, (p16(&p, 0), p16(&p, 0), p32(&p, 0x7fffffff), p32(&p, 0), p32(&p, 0)));
+    SEED("stats-tenants-short-prefix", TSDB_OP_STATS_TENANTS,
+         (p16(&p, 0), p16(&p, 0), p32(&p, 1), p32(&p, 0), p32(&p, 0), p16(&p, 40), p8(&p, 'f')));
     /* a pipeline: several requests in one input */
     f.len = 0;
     p.len = 0;

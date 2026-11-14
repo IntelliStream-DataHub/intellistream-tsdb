@@ -1,0 +1,14 @@
+repository: intellistream-objects (git@repo.intellistream.ai:olavgg/intellistream-objects.git), directory src/codec
+commit: dc0018b3bb803fe7803347578a372f074276c589
+files: gf256.h gf256.c gf256_avx2.c gf256_avx512.c rs.h rs.c
+license: AGPL-3.0-only, as intellistream-objects (LICENSE there); the owner is IntelliStream AS, as tsdb's, so no grant is needed.
+local: compat.h and compat.c (what the files include from isod's src/common: the CPU features capped by tsdb's level,
+  the error codes, the allocators, the clock), and the one-line headers under compat/ that point there; tsdb's own, not synced.
+built: with -DISO_GF256_NO_BOOT (no constructor: src/cpu.c calls tsdb_ec_select(), which calls iso_gf256_init()).
+sha256 gf256.h: 386506d895f8cd6e4e73ccb03f796dccc093ce94ba3c523281dfc847a6cfca6e
+sha256 gf256.c: ef3e1ad58136325aa48bdca9eaf0e08d117f312283562264e9a3154d67826eb1
+sha256 gf256_avx2.c: 6d05d1123c0c3c61fcb944c7a29afdda54e198d512e20c9d6b06c7b6802df912
+sha256 gf256_avx512.c: 26d7ac3fb1178d5787ff32a540d8398d5a52f142fe65b6ceddc7929491eb74ec
+sha256 rs.h: f92a8550f73fc851ea90b26ee6a5434b918d84dfc22e596f83c52f5e5021078d
+sha256 rs.c: e93537a41bd151faa3caf1e141da139e48eb7873f8f4925a5953e54801f7a97a
+sync: tools/sync-ec.sh [--repo DIR] COMMIT; tools/sync-ec.sh --check compares the copy with these hashes and this commit.

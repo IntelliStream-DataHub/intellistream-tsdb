@@ -21,7 +21,7 @@ from types import TracebackType
 from typing import Any, Literal, final, overload
 from zoneinfo import ZoneInfo
 
-from tsdb_client import TsdbError
+from tsdb_client import SeriesStat, TenantStats, TsdbError
 from typing_extensions import Buffer
 
 PROTOCOL_VERSION: int
@@ -963,6 +963,37 @@ class Db:
         """A read-only database: picks up what the writer published since the last refresh."""
     def stats(self) -> Stats:
         """Returns the storage statistics."""
+    def series_stats(
+        self,
+        series: _SeriesIds,
+        *,
+        resident: bool = False,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> list[SeriesStat]:
+        """As Client.series_stats(), in this process: the numbers computed from the granule index and the memtables."""
+
+    def tenant_stats(
+        self,
+        prefixes: Sequence[str] | None = None,
+        *,
+        volumes: bool = False,
+        hot: int = 0,
+        caller: bool = False,
+    ) -> TenantStats:
+        """As Client.tenant_stats(), in this process, for a user who may see everything: the caller counters are None."""
+
+    def set_tenants(self, prefixes: Sequence[str]) -> None:
+        """Sets the tenant list: a series belongs to the tenant with the longest prefix its name starts
+        with, else to "(none)". Empty strings and duplicates are dropped."""
+
+    def stats_settle(self, timeout_ms: int = 30000) -> None:
+        """Waits until the statistics sweeper has handled the parts listed before the call, for at most
+        timeout_ms.
+
+        Raises:
+            TsdbError: Time ran out (UNAVAILABLE).
+        """
+
     def latest(
         self,
         series: _SeriesIds,

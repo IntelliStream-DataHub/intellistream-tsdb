@@ -40,6 +40,7 @@ use crate::value::{Bitmap, Column, ColumnRef, Native, Value, ValueType};
 
 mod latest;
 mod multi;
+mod stats;
 
 /// Rows per INSERT frame: 8M rows of the many-series layout make 128 MiB,
 /// half of the largest frame the server accepts.

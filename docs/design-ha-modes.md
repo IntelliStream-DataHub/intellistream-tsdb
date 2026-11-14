@@ -721,7 +721,7 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 
 **S0, the wire half (built, branch s0-wire): protocol 13.** TOPOLOGY is op 48 and STATUS op 49 (ops 39-47 stay with
 the latest values, the feed and statistics); the protocols they plan move up one: `QUERY_LATEST` 14, the feed 15,
-statistics 16. Every body is in `include/tsdb_protocol.h` and `include/tsdb_wire.h` and described in ha.md §15.4.
+statistics 16 (since swapped: statistics landed first as 15, the feed is planned as 16). Every body is in `include/tsdb_protocol.h` and `include/tsdb_wire.h` and described in ha.md §15.4.
 tsdbd (single server) sends UNAVAILABLE with its body and answers TOPOLOGY (itself, every volume, health from the
 domains) and STATUS; MOVED, PARTIAL and DROPPED are encoded, decoded and fuzzed but sent by S1 and S2 only. Not in 13:
 sessions, streams, `seq`, `attempt` and `resend_from` on inserts (S2, S3); the clients' retry relies on "refused

@@ -15,8 +15,9 @@
  * The types the format knows by number (a replay or a follower skips a marker whose type it does not apply, and keeps
  * the numbering: `span` numbers belong to the record either way):
  *   COMMIT, DROP, RETENTION, EPOCH   payloads defined below
+ *   CLASS, SERIES, STATE, NOW        payloads defined below (the replica engine applies them, src/replica.c)
  *   FEED_SLOT                        number reserved for the change feed (its payload comes with the feed)
- *   CLASS .. COLD                    numbers reserved for the cluster (design-cluster.md 4.1; payloads come with it)
+ *   SLOT, COLD                       numbers reserved for the cluster (design-cluster.md 4.1; payloads come with it)
  * A type this binary does not know at all is MK_UNKNOWN: the record is intact and skipped.
  */
 #ifndef TSDB_MARKER_H
@@ -44,6 +45,7 @@ enum mk_type {
 
 #define MK_HDR 8 /* type, flags, span: the start of every marker payload (WAL_MARKER_HDR) */
 #define MK_NAME_MAX 255
+#define MK_SNAME_MAX 32767 /* a series or state name (series.c MAX_NAME) */
 #define MK_FILES_MAX 4096
 #define MK_BUCKETS 4096 /* the fence's table (LW_BUCKETS) */
 #define MK_NO_PARTITION INT64_MIN
@@ -93,6 +95,34 @@ typedef struct mk_epoch {
     uint32_t owner_len;
 } mk_epoch;
 
+/* CLASS: a series switches to a partition class at `at` (a leader's decision; a replica applies it at the first
+ * instant that is safe on its own state, never earlier than `at`). record_off is where the record goes in CLASSES. */
+typedef struct mk_class {
+    uint32_t series;     /* local id */
+    uint32_t cls;        /* 0 .. 3 */
+    int64_t at;          /* INT64_MIN: from the beginning of time (a fresh series' decision) */
+    uint64_t record_off;
+} mk_class;
+
+/* SERIES and STATE: the next entry of the dictionary. `id` is the dictionary index (a state's code is id + 1). */
+typedef struct mk_series {
+    uint32_t id;
+    uint32_t vtype; /* TSDB_FLOAT32 .. TSDB_STATE */
+    const char *name; /* not NUL terminated; 1 .. MK_SNAME_MAX bytes, no NUL */
+    uint32_t name_len;
+} mk_series;
+
+typedef struct mk_state {
+    uint32_t id;
+    const char *name;
+    uint32_t name_len;
+} mk_state;
+
+/* NOW: the leader's retention clock, in ms */
+typedef struct mk_now {
+    int64_t now_ms;
+} mk_now;
+
 typedef struct mk {
     uint16_t type;  /* enum mk_type, or the raw number of an unknown one (then mk_type_name gives NULL) */
     uint16_t flags;
@@ -102,6 +132,10 @@ typedef struct mk {
         mk_drop drop;
         mk_retention retention;
         mk_epoch epoch;
+        mk_class cls;
+        mk_series series;
+        mk_state state;
+        mk_now now;
     } u;
     const uint8_t *body; /* every type: the raw body (an unknown or reserved type has nothing else) */
     size_t body_len;

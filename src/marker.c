@@ -10,6 +10,10 @@
  *   DROP    u64 wm_gen, i64 dropped_before, u64 block, i64 partition (INT64_MIN: none)
  *   RETENTION u32 series, u32 0, i64 limit_ms, u64 record_off
  *   EPOCH   u64 epoch, u32 owner_len, owner, zeros to 4 bytes
+ *   CLASS   u32 series, u32 cls, i64 at, u64 record_off
+ *   SERIES  u32 id, u32 vtype, u32 name_len, name, zeros to 4 bytes
+ *   STATE   u32 id, u32 name_len, name, zeros to 4 bytes
+ *   NOW     i64 now_ms
  *
  * The decoder refuses what the encoder never writes (a non-zero reserved field or padding, a span other than the
  * type's, trailing bytes), so a payload has exactly one encoding and the fuzz harness compares both directions.
@@ -32,6 +36,12 @@ const char *mk_type_name(uint16_t type)
 bool mk_type_known(uint16_t type)
 {
     return type >= 1 && type <= MK_TYPE_LAST;
+}
+
+/* the types whose payload this file defines: their span is 1 (COMMIT: its events) */
+static bool defined(uint16_t t)
+{
+    return (t >= MK_COMMIT && t <= MK_EPOCH) || t == MK_CLASS || t == MK_SERIES || t == MK_STATE || t == MK_NOW;
 }
 
 uint32_t mk_span(const mk *m)
@@ -77,6 +87,11 @@ static bool zeros(const uint8_t *p, size_t from, size_t to)
         if (p[i])
             return false;
     return true;
+}
+
+static bool sname_ok(const char *s, size_t n)
+{
+    return n > 0 && n <= MK_SNAME_MAX && memchr(s, 0, n) == NULL;
 }
 
 static bool name_ok(const char *s, size_t n)
@@ -238,13 +253,57 @@ int mk_decode(const uint8_t *p, size_t n, mk *m)
         m->u.epoch.owner_len = ol;
         break;
     }
+    case MK_CLASS:
+        if (bn != 24)
+            return TSDB_ERR_CORRUPT;
+        memcpy(&m->u.cls.series, b, 4);
+        memcpy(&m->u.cls.cls, b + 4, 4);
+        m->u.cls.at = (int64_t)get64(b + 8);
+        m->u.cls.record_off = get64(b + 16);
+        if (m->u.cls.cls >= PART_CLASSES)
+            return TSDB_ERR_CORRUPT;
+        break;
+    case MK_SERIES: {
+        if (bn < 12)
+            return TSDB_ERR_CORRUPT;
+        uint32_t nl;
+        memcpy(&nl, b + 8, 4);
+        if (nl == 0 || nl > MK_SNAME_MAX || bn != 12 + pad4(nl) || !zeros(b, 12 + nl, bn) ||
+            !sname_ok((const char *)b + 12, nl))
+            return TSDB_ERR_CORRUPT;
+        memcpy(&m->u.series.id, b, 4);
+        memcpy(&m->u.series.vtype, b + 4, 4);
+        if (m->u.series.vtype > TSDB_STATE)
+            return TSDB_ERR_CORRUPT;
+        m->u.series.name = (const char *)b + 12;
+        m->u.series.name_len = nl;
+        break;
+    }
+    case MK_STATE: {
+        if (bn < 8)
+            return TSDB_ERR_CORRUPT;
+        uint32_t nl;
+        memcpy(&nl, b + 4, 4);
+        if (nl == 0 || nl > MK_SNAME_MAX || bn != 8 + pad4(nl) || !zeros(b, 8 + nl, bn) ||
+            !sname_ok((const char *)b + 8, nl))
+            return TSDB_ERR_CORRUPT;
+        memcpy(&m->u.state.id, b, 4);
+        m->u.state.name = (const char *)b + 8;
+        m->u.state.name_len = nl;
+        break;
+    }
+    case MK_NOW:
+        if (bn != 8)
+            return TSDB_ERR_CORRUPT;
+        m->u.now.now_ms = (int64_t)get64(b);
+        break;
     default:
         break; /* reserved and unknown types: the body is theirs */
     }
     if (rc != 0)
         return rc;
     uint32_t want = mk_span(m);
-    if (m->span == 0 || (mk_type_known(m->type) && m->type <= MK_EPOCH && m->span != want))
+    if (m->span == 0 || (defined(m->type) && m->span != want))
         return TSDB_ERR_CORRUPT;
     return 0;
 }
@@ -274,6 +333,24 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
             return TSDB_ERR_INVALID;
         bn = 12 + pad4(m->u.epoch.owner_len);
         break;
+    case MK_CLASS:
+        if (m->u.cls.cls >= PART_CLASSES)
+            return TSDB_ERR_INVALID;
+        bn = 24;
+        break;
+    case MK_SERIES:
+        if (m->u.series.name_len == 0 || m->u.series.name_len > MK_SNAME_MAX || !m->u.series.name)
+            return TSDB_ERR_INVALID;
+        bn = 12 + pad4(m->u.series.name_len);
+        break;
+    case MK_STATE:
+        if (m->u.state.name_len == 0 || m->u.state.name_len > MK_SNAME_MAX || !m->u.state.name)
+            return TSDB_ERR_INVALID;
+        bn = 8 + pad4(m->u.state.name_len);
+        break;
+    case MK_NOW:
+        bn = 8;
+        break;
     default:
         bn = m->body_len;
         if (bn % 4 != 0 || (bn && !m->body))
@@ -285,7 +362,7 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
     uint8_t *p = calloc(1, MK_HDR + bn);
     if (!p)
         return TSDB_ERR_NOMEM;
-    uint32_t span = mk_type_known(m->type) && m->type <= MK_EPOCH ? mk_span(m) : m->span; /* the defined types' span is a function of them */
+    uint32_t span = defined(m->type) ? mk_span(m) : m->span; /* the defined types' span is a function of them */
     put16(p, m->type);
     put16(p + 2, m->flags);
     memcpy(p + 4, &span, 4);
@@ -330,6 +407,26 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
         memcpy(b + 8, &m->u.epoch.owner_len, 4);
         if (m->u.epoch.owner_len)
             memcpy(b + 12, m->u.epoch.owner, m->u.epoch.owner_len);
+        break;
+    case MK_CLASS:
+        memcpy(b, &m->u.cls.series, 4);
+        memcpy(b + 4, &m->u.cls.cls, 4);
+        put64(b + 8, (uint64_t)m->u.cls.at);
+        put64(b + 16, m->u.cls.record_off);
+        break;
+    case MK_SERIES:
+        memcpy(b, &m->u.series.id, 4);
+        memcpy(b + 4, &m->u.series.vtype, 4);
+        memcpy(b + 8, &m->u.series.name_len, 4);
+        memcpy(b + 12, m->u.series.name, m->u.series.name_len);
+        break;
+    case MK_STATE:
+        memcpy(b, &m->u.state.id, 4);
+        memcpy(b + 4, &m->u.state.name_len, 4);
+        memcpy(b + 8, m->u.state.name, m->u.state.name_len);
+        break;
+    case MK_NOW:
+        put64(b, (uint64_t)m->u.now.now_ms);
         break;
     default:
         if (bn)

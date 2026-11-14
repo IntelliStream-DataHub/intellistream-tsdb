@@ -13,11 +13,18 @@
  * which is correct on every CPU this build runs on, so a call that comes
  * before the constructor below (another constructor) is still right; all
  * levels give identical results anyway, only speed differs.
+ *
+ * The erasure codec of src/ec has no constructor of its own either: cpu_pick and cpu_set_level hand it the level
+ * (tsdb_ec_select), which caps the CPU features its kernels may use and picks the dispatch again.
  */
 #include "internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+
+#ifdef TSDB_EC
+#include "ec/compat.h"
+#endif
 
 #if defined(TSDB_LEVELS) && !(defined(__x86_64__) || defined(__i386__))
 #error "CPU levels are x86-64 microarchitecture levels"
@@ -127,6 +134,9 @@ int cpu_set_level(int level)
     lv = lv_table[level];
 #endif
     simd_select(level);
+#ifdef TSDB_EC
+    tsdb_ec_select(level);
+#endif
     return 0;
 }
 
@@ -156,5 +166,8 @@ __attribute__((constructor)) static void cpu_pick(void)
     level_now = want;
 #ifdef TSDB_LEVELS
     lv = lv_table[want];
+#endif
+#ifdef TSDB_EC
+    tsdb_ec_select(want); /* the erasure codec's kernels, capped at the level (src/ec/compat.h) */
 #endif
 }

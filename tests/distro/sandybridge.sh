@@ -4,7 +4,8 @@
 # BMI1/2, FMA, LZCNT, MOVBE) and a Westmere (x86-64-v2 without AVX: the
 # oldest CPUs AlmaLinux's v2 build is for) run it: under `qemu-x86_64 -cpu
 # SandyBridge` and `-cpu Westmere`, which raise SIGILL on any instruction that
-# CPU lacks, and natively with TSDB_CPU=v2. LZCNT is the one slip qemu cannot show (an older CPU runs it as
+# CPU lacks, and natively with TSDB_CPU=v2. A Skylake client CPU (AVX2, no GFNI or AVX-512) runs the erasure
+# codec's tests too (-cpu Skylake-Client-v4). LZCNT is the one slip qemu cannot show (an older CPU runs it as
 # BSR); tools/check-isa.sh, which `make dist` runs, reads the code for it.
 #
 #   tests/distro/sandybridge.sh [build-dist]      QEMU=/path/to/qemu-x86_64   EMU_TIMEOUT=seconds (1200)
@@ -59,7 +60,7 @@ emu() {
     for try in 1 2; do
         local args=()
         case $t in test_levels) ;; test_*) args=("$(mktemp -d "$scratch/$t.XXXXXX")") ;; esac
-        run in_time "$qemu" -cpu "$cpu" "$b/$t" "${args[@]}"
+        TSDB_RS_QUICK=1 run in_time "$qemu" -cpu "$cpu" "$b/$t" "${args[@]}"
         case $rc in 124 | 137) ;; *) return ;; esac
         if [ "$try" = 1 ]; then
             echo "=== HUNG: killed after $emu_timeout s (qemu-user can deadlock after a fork); once more"
@@ -70,7 +71,7 @@ emu() {
     done
 }
 export TSDBD=$b/tsdbd
-for t in test_levels test_tsdb test_types codec-bench type-bench; do
+for t in test_levels test_rs test_tsdb test_types codec-bench type-bench; do
     args=()
     case $t in test_*) [ $t != test_levels ] && args=("$scratch") ;; esac
     TSDB_CPU=v2 run "$b/$t" "${args[@]}"
@@ -80,9 +81,17 @@ if [ -z "$qemu" ] || ! [ -x "$qemu" ]; then
 else
     for cpu in Westmere SandyBridge; do
         $qemu -cpu help | grep -qw $cpu || { echo "sandybridge: $qemu has no $cpu model"; exit 1; }
-        for t in test_levels test_tsdb test_types codec-bench type-bench; do
+        for t in test_levels test_rs test_tsdb test_types codec-bench type-bench; do
             emu $cpu $t
         done
+    done
+    # A Skylake client core (AVX2, BMI2, FMA; no GFNI, no AVX-512: an i9-10850K): the CPU the AVX2 kernels of the
+    # erasure codec are for. test_rs there takes the avx2 dot kernel, and a dot kernel paired with, or a tail handed
+    # to, a wider family dies with SIGILL, which no test on a CPU that has every feature can see.
+    cpu=Skylake-Client-v4
+    $qemu -cpu help | grep -qw $cpu || { echo "sandybridge: $qemu has no $cpu model"; exit 1; }
+    for t in test_levels test_rs; do
+        emu $cpu $t
     done
     # the CLI (its constructors run before main) creates a database, writes and aggregates; read-only
     # commands refuse a directory that does not exist, so it inserts first

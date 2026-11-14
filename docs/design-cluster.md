@@ -507,6 +507,33 @@ committed segments, and at the latest when a marker's `F` asks. Segment rotation
 new segment when the leader's next record names one. A replica removes a segment only after its rows are in its parts
 and every marker in it is applied durably, and keeps sealed segments for catch-up within the budget of §8.3.
 
+*Rules the engine's replica mode (`src/replica.c`, step 3) keeps, found by the review of step 3:*
+- **One memtable per leader segment, sealed by a committed record.** A segment's memtable is sealed (and may flush)
+  only when the first *committed* record of a later segment is applied, never when the cursor merely reaches that
+  record: it may still be cut. The consequence for a new leader: a replica cut at the end of segment s that applied no
+  record of s+1 has s unsealed, so a leader that had only s continues it. A new leader that came from a replica which
+  did apply s+1's first record holds that record too (committed), so it never needs to append into s.
+- **A flushed segment is never appended to.** Rows added to segment s after its memtable became parts with
+  `wal_seq = s` would be skipped by the next open's replay (`partition_wal_seq >= s`) and be lost. `replica_append`
+  refuses `seq <= sealed_seq` (the highest `wal_seq` of the parts, and of a flush of this run).
+- **The last segment's memtable is not sealed until a later segment starts.** An idle leader therefore leaves the rows
+  of its last segment in the replica's memory and that segment on disk. The driver (R3) needs a seal signal for this
+  (a `ROLL` marker, or the leader rotating its segment after an idle interval); not built in R2.
+- **The retention clock is the `NOW` markers only** (§5.4), not the `commit_ms` of records: the leader stamps
+  `commit_ms` with its wall clock, which its retention clock (`opt.clock_ms`, the floor) need not follow. After a
+  restart the clock restarts from the parts' `written_ms` and the replay up to the commit floor, so it may be lower
+  than before the restart until the apply catches up (retention "now" never going back holds for a leader, not across a
+  replica's restart); rows clamped before the restart may show again until then.
+- **`RETENTION` and `CLASSES` records are keyed by their file offset** (`record_off`), which makes a replay idempotent.
+  That ties a replica to files that hold exactly the leader's records: a snapshot (R4) must copy both whole, and a
+  replica never writes a class record of its own (a fresh series' class-0 decision stays in memory).
+- **A volume with a change feed cannot be opened as a replica yet** (retained `fwal_` segments are not designed for
+  it): the open is refused with `TSDB_ERR_INVALID`.
+- **The log is contiguous and its durable end is what was synced.** The open refuses a missing middle segment and an
+  `FNO` above the log's end (`TSDB_ERR_CORRUPT`), and fdatasyncs every segment (and the directory) before it claims
+  their positions: bytes read back after a process kill are the page cache's. A cut syncs the directory after each
+  unlink (newest first), so a crash leaves a prefix of the log.
+
 ### 5.4 Clocks and classes
 
 - **Retention clock.** A replica never reads its own wall clock for retention. The leader appends a `NOW` marker

@@ -33,7 +33,7 @@ The user's answers of 2026-11-06 to the first version's questions:
 | F5 | **Followers serve the feed in v1** (user, question 5): NFS followers through `FEEDPOS` (§2.8), and in replicated mode replicas up to their commit point (§2.9). | The writer only | Production reads from followers over NFS. |
 | F6 | **At least once, with a dedup key per event: `(volume, event)`** (user, question 6). No `EFFECTIVELY_ONCE`; the source refuses it, as the sink does (TsdbSink.java:88-101). | Broker deduplication through `EFFECTIVELY_ONCE` | Pulsar's effectively-once for connectors was unverified on Pulsar 5 and scalable topics, and the sink already runs only `ATLEAST_ONCE`; every duplicate is an identical copy with the same key, which a consumer drops by comparing numbers. |
 | F7 | **Avro first** (user, question 7): the source publishes Avro records with a registered schema (§4.3); JSON is the option. The sink learns to read them, so a tsdb-to-tsdb mirror through Pulsar works (§4.7, step F9). | The sink's JSON first | A schema in Pulsar's registry is what downstream consumers (Flink, other sinks) expect, with evolution rules the broker enforces. |
-| F8 | **Protocol 15** (settled: 12 is login, 13 the HA bodies, 14 latest values). **The disk side is format 9, built in S0** (design-ha-modes.md §7, design-cluster.md step 0); §5 lists exactly what of S0 the feed needs. The feed's own files sit behind `requires=feed` in META, so the feed needs no format bump of its own. | Protocol 12 (the first version) | Both numbers were taken by work that merged first. |
+| F8 | **Protocol 16** (settled: 12 is login, 13 the HA bodies, 14 latest values, 15 statistics, which landed first; the feed's number was 15 in the first version). **The disk side is format 9, built in S0** (design-ha-modes.md §7, design-cluster.md step 0); §5 lists exactly what of S0 the feed needs. The feed's own files sit behind `requires=feed` in META, so the feed needs no format bump of its own. | Protocol 12 (the first version) | Both numbers were taken by work that merged first. |
 | F9 | **One WAL format: +16 bytes per WAL record even with the feed off** (user, question 9). A record is one group commit, not one row. | Two record formats | One replay path, and the cluster uses the same record (C6). |
 | F10 | **Compression of retained segments later, measured first** (user, question 10): step L1 of §8. | In v1 | The production ingest rate decides whether 64 GiB holds 24 h; measure before building. |
 
@@ -61,7 +61,7 @@ recommendations). Two were taken as defaults and the user may still change them 
 | F22 | **Slot caps and free space** (user, 2026-11-06, question 1): a slot holds back at most 7 days and 256 GiB per volume; below 10% free space (`feed_min_free_pct`) slots are invalidated first, then the feed's own 24 h / 64 GiB retention is trimmed too (F18). Each slot sets its own age and bytes, the floor is a database setting. | Keeping the base retention whole under pressure | The feed never pushes the WAL toward ENOSPC; N volumes on one pool could otherwise hold N x 64 GiB (§2.6, §2.7). |
 | F23 | **Who creates slots** (user, 2026-11-06, question 2): superusers, and tenant admins for slot names under their own prefix (§3.2, A9's rule for user names). | Superusers only | A tenant runs its own source without a superuser. |
 | F24 | **When the last-write-wins check fails: repair and alert** (default taken, 2026-11-06, question 3; the user may change it): the reader sends `REASSERT` events, logs once and counts `tsdb_feed_lww_violations_total` (§1.6). | Ending the volume's stream with `CORRUPT` | A mirror stays right while the engine bug is found; the counter and the jepsen checker still fail on any violation. |
-| F25 | **The Pulsar sink skips `drop_before` in mirrors** (user, 2026-11-06, question 4): it counts and logs the `drop` event; mirrors keep the rows, as with expiry. **No new wire op** in protocol 15 (§4.7). | A superuser `DROP_BEFORE` op so the sink can apply it | A mirror's retention is its own business (the sink can `SET_RETENTION`); a volume-wide destructive op in the protocol for this one case is not worth its rights surface. |
+| F25 | **The Pulsar sink skips `drop_before` in mirrors** (user, 2026-11-06, question 4): it counts and logs the `drop` event; mirrors keep the rows, as with expiry. **No new wire op** in protocol 16 (§4.7). | A superuser `DROP_BEFORE` op so the sink can apply it | A mirror's retention is its own business (the sink can `SET_RETENTION`); a volume-wide destructive op in the protocol for this one case is not worth its rights surface. |
 | F26 | **Rollback detection on a single server uses both** (default taken, 2026-11-06, question 5; the user may change it): the operator's `feed new-id` in the restore steps and the source's `seen` high-water read from Pulsar at each source start (F19, §4.5). | The operator's step alone | The read costs a seek and a few seconds of messages at each start, and catches a rollback the operator does not notice, such as a lost SLOG. |
 | F27 | **Rights changes on a running stream apply at once and the source stops by default** (user, 2026-11-06, question 6): `GRANTED` / `REVOKED` frames on the stream (§3.2), and the source's `onRightsChange` defaults to `fail` (§4.2). `resync` stays an option. | `resync` as the default; rights checked only at subscribe | A revoke must reach a stream that lives for days, and a mirror that silently lacks a series is worse than a stopped source. |
 
@@ -95,7 +95,7 @@ recommendations). Two were taken as defaults and the user may still change them 
   days, 256 GiB per volume, 10% free space). At the cap the slot is invalidated: its consumer gets `FEED_GONE` and
   resyncs; writes never wait. Below the free-space floor the base retention gives way too (F18), so the feed never
   fills the disk. Slots survive restarts, power loss (F16), takeovers and failovers.
-- **Protocol 15.** `FEED_SUBSCRIBE` (selectors, volumes, a slot, cursors) answered by a stream (`HEAD`, `SERIES`,
+- **Protocol 16.** `FEED_SUBSCRIBE` (selectors, volumes, a slot, cursors) answered by a stream (`HEAD`, `SERIES`,
   `STATE`, `ROWS`, `DELETE`, `RETENTION`, `DROP`, `POS`, `VOLUME_END`, `END`), `FEED_ADVANCE` (on the stream),
   `FEED_INFO`, `FEED_SLOT_CREATE`, `_DROP`, `_LIST`; each with a row in `auth_ops`. tsdbd runs streams on feed pump
   threads that never wait; writers never wait for consumers.
@@ -776,11 +776,11 @@ every volume a new `feed_id`, so consumers get `FEED_RESET` and resync, and rais
 consumers that compare numbers without the `feed_id`). docs/feed.md puts it in the restore steps;
 a consumer that sends `seen` (§1.2) is protected when the operator forgets it.
 
-## 3. Protocol 15, server and clients
+## 3. Protocol 16, server and clients
 
 ### 3.1 Ops
 
-`TSDB_PROTOCOL_VERSION` 15; the floor stays 12 (new ops only, as protocol 14 did): clients send these only to a
+`TSDB_PROTOCOL_VERSION` 16; the floor stays 12 (new ops only, as protocols 14 and 15 did): clients send these only to a
 server whose HELLO says 14 or more, and an older server answers them `TSDB_ERR_INVALID`. The numbers follow
 `QUERY_LATEST` (39) and are final when protocol 14 has landed.
 
@@ -1324,11 +1324,11 @@ disk, `make test-clients` and `make integration-tests` for client changes. Track
 | F3 | Reader `src/feed.c`, the embedded API, the deliverable-position hook, the §1.6 check with its counter and hooks; `tests/test_feed.c` | jepsen kill (a feed smoke check) | 2-3 |
 | F4 | Slots: markers, `FEEDSLOTS` with anchor and scratch (F16), registry in the root volume (`creating`, `ready`), durable create and reset, `resyncing`, seeding of added volumes, caps and invalidation, coalesced and no-op advances, the cleaner's holds, slot metrics hooks, CLI | jepsen power, eio | 2.5-3.5 |
 | F5 | NFS followers: `FEEDPOS` writer and follower reading, slots read-only | follower tests | 1 |
-| F6 | Protocol 15 and tsdbd: the six ops, `auth_ops` rows and the rights of §3.2, pumps, admission, `CANCEL` and `FEED_ADVANCE` in `parse()`, metrics, `docs/metrics.md`; server and auth tests, fuzz seeds | `fuzz-frames` 600 s, `test_auth_ops` | 2-3 |
+| F6 | Protocol 16 and tsdbd: the six ops, `auth_ops` rows and the rights of §3.2, pumps, admission, `CANCEL` and `FEED_ADVANCE` in `parse()`, metrics, `docs/metrics.md`; server and auth tests, fuzz seeds | `fuzz-frames` 600 s, `test_auth_ops` | 2-3 |
 | F7 | Clients: C, Rust, Python, Java and the embedded bindings, one commit | `test-clients`, `integration-tests` | 2 |
 | F8 | Jepsen `feed` workload and checker (§6.3), with `--auth` | `make jepsen JEPSEN_WORKLOADS=feed`, 300 s per nemesis | 2 |
 | F9 | Pulsar source (Avro and JSON), the high-water read, the resync in the order of §2.6, `onRightsChange`; the sink's `Event` reader (§4.7, snapshots as replaces); `mvn test`, `integration.sh MODE=source` (the mirror check, with a resync) | `mvn test`, `integration.sh MODE=source` | 3.5 |
-| F10 | Docs: `docs/feed.md` (operators: enabling, retention, slots, alerts, the Avro schema and its evolution), `CHANGELOG.md` (protocol 15, `requires=feed`), AGENTS.md invariants (retained segments are not WAL; markers in block order and before `lw_leave`, the drop's too; delivery only up to the deliverable position; links; slot caps; the `FEEDSLOTS` anchor is never written), the restore steps with `feed new-id`, "no gaps only while rights are unchanged", per-key deduplication on Pulsar, the connector README | none | 1 |
+| F10 | Docs: `docs/feed.md` (operators: enabling, retention, slots, alerts, the Avro schema and its evolution), `CHANGELOG.md` (protocol 16, `requires=feed`), AGENTS.md invariants (retained segments are not WAL; markers in block order and before `lw_leave`, the drop's too; delivery only up to the deliverable position; links; slot caps; the `FEEDSLOTS` anchor is never written), the restore steps with `feed new-id`, "no gaps only while rights are unchanged", per-key deduplication on Pulsar, the connector README | none | 1 |
 | H1 | Shared mode (after N4 and N7): the feed's call sites in the journal hook, `COMMIT` from the ledger, the compaction rule, chained `FEED`/`FEEDSLOTS`/`FEEDPOS`, delivery at the ack gate, registry in the metadata group, `MOVED` on takeover, `fno` above the reported high-water and a new `feed_id` on DIVERGED (F19) | `make jepsen-ha` with the feed workload | 2-3 |
 | H2 | Replicated mode (after R3): the cluster's `COMMIT` as the feed's marker, delivery at the commit point, retention on every replica, the ISR's lowest free space and the `NOW` clock for caps, a replica's local trim (M4), `REPLICA_OK` streams | `make jepsen-cluster` with the feed workload | 2-2.5 |
 | L1 | Later, by measurement (F10): compressed sealed segments, once the production ingest rate is known and a benchmark shows what 64 GiB holds | benchmarks on a quiet machine, several runs, the mean | 2 |

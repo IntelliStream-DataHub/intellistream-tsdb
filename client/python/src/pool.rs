@@ -11,13 +11,13 @@ use std::sync::{Mutex, RwLock};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList};
 
 use ::tsdb_client as tc;
 use tc::ValueType;
 
 use crate::arrays::{BucketsMany, agg_queries, inserts, many_cols, points_list, range_queries, with_batches};
-use crate::{closed, connect, connect_options, latest, multi, opts, retry_budget, to_pyerr};
+use crate::{closed, connect, connect_options, latest, multi, opts, retry_budget, stats, to_pyerr};
 
 /// A pool of connections to tsdbd for batch calls that use them all at once.
 ///
@@ -226,6 +226,22 @@ impl Pool {
     fn insert_many(&self, py: Python<'_>, batches: &Bound<'_, PyAny>, value_type: Option<&str>) -> PyResult<()> {
         let b = inserts(batches, value_type.map(crate::value_type).transpose()?, |ids| self.types(py, ids))?;
         self.with(py, |p| with_batches(&b, |b| p.insert_many(b)))
+    }
+
+    /// As Client.series_stats() (on one of the connections).
+    #[pyo3(signature = (series, *, resident = false, errors = "raise"))]
+    fn series_stats<'py>(&self, py: Python<'py>, series: &Bound<'py, PyAny>, resident: bool, errors: &str) -> PyResult<Bound<'py, PyList>> {
+        let q = stats::SeriesReq::new(series, resident, errors)?;
+        let a = self.with(py, |p| q.run(p))?;
+        q.finish(py, a)
+    }
+
+    /// As Client.tenant_stats() (on one of the connections).
+    #[pyo3(signature = (prefixes = None, *, volumes = false, hot = 0, caller = false))]
+    fn tenant_stats<'py>(&self, py: Python<'py>, prefixes: Option<Vec<String>>, volumes: bool, hot: u16, caller: bool) -> PyResult<Bound<'py, PyDict>> {
+        let q = stats::TenantReq::new(prefixes, volumes, hot, caller)?;
+        let t = self.with(py, |p| q.run(p))?;
+        q.finish(py, t)
     }
 
     /// As Client.latest() (on one of the connections).

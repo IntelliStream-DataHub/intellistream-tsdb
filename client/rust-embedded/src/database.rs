@@ -7,7 +7,7 @@ use std::ops::{ControlFlow, RangeBounds};
 use tsdb_client::__private::{Column, ColumnRef, Value};
 use tsdb_client::{
     Bucket, Buckets, Database, Group, Latest, LatestOpts, MultiOpts, Points, QueryOpts, QueryStats, Result, Rows,
-    SeriesId, SpreadBucket, Stats, TwaBucket, TwaOpts, ValueType,
+    SeriesId, SeriesStat, SpreadBucket, Stats, TenantOpts, TenantStats, TwaBucket, TwaOpts, ValueType,
 };
 
 use crate::Db;
@@ -268,5 +268,11 @@ impl Database for Db {
     }
     fn latest_by_name(&mut self, names: &[&str], opts: &LatestOpts) -> Result<Vec<Latest>> {
         Db::latest_by_name(self, names, opts)
+    }
+    fn series_stats(&mut self, ids: &[SeriesId], resident: bool) -> Result<Vec<SeriesStat>> {
+        Db::series_stats(self, ids, resident)
+    }
+    fn tenant_stats(&mut self, prefixes: &[&str], opts: &TenantOpts) -> Result<TenantStats> {
+        Db::tenant_stats(self, prefixes, opts)
     }
 }

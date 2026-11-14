@@ -88,10 +88,30 @@ ifneq ($(strip $(CPU_LEVELS)),)
 override CFLAGS += -DTSDB_LEVELS $(foreach l,$(CPU_LEVELS),-DTSDB_HAVE_$(l))
 OBJ := $(filter-out $(LV_SRC:%=$(B)/%.o),$(OBJ)) $(foreach l,base $(CPU_LEVELS),$(LV_SRC:%=$(B)/%.$(l).o))
 endif
+# The erasure codec (src/ec, docs/design-cluster-data.md E32): intellistream-objects' src/codec copied unchanged
+# (tools/sync-ec.sh), in libtsdb. It is x86-64 code (SSSE3 and wider kernels behind runtime dispatch; no scalar port of
+# the copy is needed, since the scalar kernel is in it): other machines build without it. -DISO_GF256_NO_BOOT leaves
+# out gf256.c's constructor; src/cpu.c calls tsdb_ec_select() instead (AGENTS.md "CPU levels"). Compiled once, at the
+# baseline of $(ARCH): the AVX2, AVX-512 and GFNI kernels carry target attributes and run only where src/ec/compat.c's
+# iso_cpu_has() says so (tools/check-isa.sh checks that nothing else in them goes beyond x86-64-v2).
+ifeq ($(shell uname -m),x86_64)
+EC_OBJ := $(B)/ec_gf256.o $(B)/ec_gf256_avx2.o $(B)/ec_gf256_avx512.o $(B)/ec_rs.o $(B)/ec_compat.o
+OBJ  += $(EC_OBJ)
+EC_BENCH := $(B)/ec-bench
+override CFLAGS += -DTSDB_EC
+endif
+EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
+# -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
+# make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
+# using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
+# the CPU is asked: a generic build stays x86-64 baseline there (tools/check-isa.sh checks the objects).
+EC_CFLAGS := -mssse3 -fno-tree-vectorize
+$(B)/ec_%.o: src/ec/%.c $(EC_HDR) src/internal.h | $(B)
+	$(CC) $(CFLAGS) $(EC_CFLAGS) -Isrc/ec/compat -DISO_GF256_NO_BOOT -c -o $@ $<
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench
+all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench $(EC_BENCH)
 
 $(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -174,14 +194,18 @@ $(B)/tsdb_client_hooks.o: client/tsdb_client.c client/tsdb_client.h client/tsdb_
 
 # starts tsdbd (login on) and links server/auth.c for the RFC 7677 exchange on the server side in this process
 $(B)/test_auth: tests/test_auth.c tests/harness.h tests/auth_harness.h tests/rfc7677.h tests/client_hooks.h \
-                server/auth.c server/auth.h server/users.h $(B)/users.o $(B)/tsdb_client_hooks.o $(CLIB) $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c $(B)/users.o $(B)/tsdb_client_hooks.o $(CLIB) $(LIB) \
+                server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h $(B)/users.o $(B)/tsdb_client_hooks.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c server/tenants.c $(B)/users.o $(B)/tsdb_client_hooks.o $(CLIB) $(LIB) \
 	    $(LDLIBS)
 
 # every op of TSDB_OPS across tenants (links server/auth.c for its table, makes USERS with server/users.c)
 $(B)/test_auth_ops: tests/test_auth_ops.c tests/harness.h tests/auth_harness.h server/auth.c server/auth.h \
                     server/users.h include/tsdb_protocol.h $(B)/users.o $(CLIB) $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c server/tenants.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
+
+# STATS_SERIES and STATS_TENANTS over the network: tsdbd with login on and off, the C client, a fake server
+$(B)/test_stats_net: tests/test_stats_net.c tests/harness.h tests/auth_harness.h server/users.h $(B)/users.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
 
 # tsdbd --read-only, op by op (the frames of test_auth_ops; links server/users.c for the harness's login helpers)
 $(B)/test_readonly: tests/test_readonly.c tests/harness.h tests/auth_harness.h server/users.h include/tsdb_protocol.h \
@@ -255,6 +279,10 @@ $(B)/test_upgrade: tests/test_upgrade.c src/internal.h $(LIB)
 $(B)/test_fno: tests/test_fno.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+# the engine as a replica (src/replica.c, design-cluster.md step 3): the mutant runs plant the bugs it guards against
+$(B)/test_replica: tests/test_replica.c src/replica.h src/internal.h $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 # the change feed's disk side (design-cdc.md step F1): FEED, requires=feed, retained segments, the cleaner
 $(B)/test_feedstore: tests/test_feedstore.c tests/jepsen/feedcheck.c src/internal.h src/feed.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_feedstore.c tests/jepsen/feedcheck.c $(LIB) $(LDLIBS)
@@ -272,7 +300,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replica $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
 	./$(B)/test_tsdb $(SCRATCH)
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched $(SCRATCH)
@@ -296,6 +324,8 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	tests/expect_fail.sh 'a segment of markers replays' ./$(B)/test_fno --mutant markers $(SCRATCH)
 	tests/expect_fail.sh 'f > mx' ./$(B)/test_fno --mutant nosync $(SCRATCH)
 	! ./$(B)/test_fno --mutant flushclose $(SCRATCH) >/dev/null 2>&1 # a flush that leaves a record open crashes in the seal (status 139): the one planted bug whose symptom is a crash
+	./$(B)/test_replica $(SCRATCH)
+	for m in applyall ackunsynced keepcut nofloor walclock nopos classat opensync gapcheck torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans; do ! ./$(B)/test_replica --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done
 	./$(B)/test_feedstore $(SCRATCH)
 	tests/expect_fail.sh 'renamed before its data was synced' ./$(B)/test_feedstore --mutant noseal $(SCRATCH) # a replayed segment renamed without its fdatasync must fail it
 	tests/expect_fail.sh 'removed before the floor was durable' ./$(B)/test_feedstore --mutant latefloor $(SCRATCH) # the cleaner's floor set after its unlinks must fail it
@@ -304,6 +334,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_flush_tail
 	./$(B)/test_stats $(SCRATCH)
 	./$(B)/test_tenants $(SCRATCH)
+	./$(B)/test_tn_race $(SCRATCH)
 	./$(B)/test_tzfiles $(SCRATCH)
 	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
 	tests/test_fuzz_replay.sh $(B) $(SCRATCH) # a replay of nothing, or of a missing corpus, fails
@@ -319,7 +350,8 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
-test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
+test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
+test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(or $(TMPDIR),/tmp)
 	B=$(B) tests/test_config.sh $(TMPDIR)
 	./$(B)/test_watchdog
@@ -339,6 +371,15 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	./$(B)/test_classes $(SCRATCH)
 	./$(B)/test_follow $(SCRATCH)
 	./$(B)/test_volumes $(SCRATCH)
+	./$(B)/test_rs $(SCRATCH)
+	$(if $(EC_OBJ),for m in coef kernel guard; do ! ./$(B)/test_rs --quick --mutant $$m >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (--quick: seconds, not 20 s a run)
+	tests/test_sync_ec.sh
+	tools/sync-ec.sh --check
+	tests/test_check_ec_symbols.sh
+	$(if $(EC_OBJ),EC_CFLAGS='$(EC_CFLAGS)' CC='$(CC)' tools/check-ec-baseline.sh)
+	B=$(B) tools/check-ec-symbols.sh
+	$(if $(EC_OBJ),! B=$(B) tools/check-ec-symbols.sh --lib $(LIB) >/dev/null 2>&1) # the engine's library holds the codec: the check must fail on it
+	$(if $(filter Linux,$(UNAME_S)),B=$(B) tools/check-exports.sh && tests/test_check_exports.sh)
 	./$(B)/test_crypto
 	./$(B)/test_users $(SCRATCH)
 	B=$(B) tests/test_cli_users.sh
@@ -357,7 +398,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
 	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
 
-test-net: $(B)/test_readonly $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stability $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
+test-net: $(B)/test_readonly $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_server $(B)/test_server_multi $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/test_stability $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	./$(B)/test_wire tests/data/wire13-vectors.txt
@@ -367,12 +408,13 @@ test-net: $(B)/test_readonly $(B)/test_ports $(B)/test_client $(B)/test_wire $(B
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth_ops && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_readonly $(SCRATCH) && \
+	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stats_net && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stability || exit 1; done
 
 # the portability headers (macOS shims) are part of these tests and of the server
 $(B)/test_classes $(B)/test_damage $(B)/test_export $(B)/test_failstop $(B)/test_follow $(B)/test_group $(B)/test_sched \
 $(B)/test_server_multi $(B)/test_server $(B)/test_spread $(B)/test_stability $(B)/test_tsdb $(B)/test_volumes \
-$(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_ports $(B)/test_out_send $(B)/fuzz_frames $(B)/tsdbd $(B)/users.o $(B)/tsdb: \
+$(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/test_ports $(B)/test_out_send $(B)/fuzz_frames $(B)/tsdbd $(B)/users.o $(B)/tsdb: \
     tests/portable.h src/compat.h server/epoll_compat.h
 
 # ------------------------------------------------------------------ fuzzing
@@ -519,7 +561,7 @@ GLIBC_MAX  ?= 2.34
 DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tools/glibc-compat.h" \
               CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
 DIST_BINS   = tsdbd tsdb codec-bench type-bench twa-bench fold-bench tsdb-bench insert-bench tsdbc-bench scale-bench
-DIST_TESTS  = test_tsdb test_types test_levels test_group test_lttb test_twa test_spread test_limits test_follow test_volumes test_server test_stability test_ports
+DIST_TESTS  = test_tsdb test_types test_levels test_rs test_group test_lttb test_twa test_spread test_limits test_follow test_volumes test_server test_stability test_ports
 DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS) libcrashfs.so)
 
 DIST_SIG    = $$($(CC) --version | head -n 1) | $(CC) | $(CFLAGS) | $(subst ",,$(DIST_VARS)) | $(LV_FLAGS_v3) | $(LV_FLAGS_v4) \
@@ -697,7 +739,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants test-cli-stats test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -760,10 +802,10 @@ meta-mutants: $(B)/test_meta_mut
 meta-soak: $(B)/test_meta
 	./$(B)/test_meta $(SCRATCH) --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
-TSDBD_SRC := server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/users.h \
+TSDBD_SRC := server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c \
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
 
 # A server with a bug planted in the Raft log (the copy in src/raft is upstream's and stays unedited, so the mutant is
@@ -797,7 +839,7 @@ endif
 # is always set).
 $(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                   $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c $(B)/tsdb_pack.o \
+	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c $(B)/tsdb_pack.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
@@ -843,6 +885,11 @@ $(B)/fold-bench: tools/fold-bench.c tools/common.h src/internal.h $(LIB)
 $(B)/decode-bench: tools/decode-bench.c tools/common.h src/internal.h src/bitpack.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+ifneq ($(EC_OBJ),)
+$(B)/ec-bench: tools/ec-bench.c tools/common.h src/internal.h $(EC_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
+endif
+
 $(B)/threads-bench: tools/threads-bench.c tools/common.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
@@ -867,7 +914,7 @@ $(B)/test_wire: tests/test_wire.c include/tsdb_wire.h $(CLIB)
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
 $(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                     $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c $(B)/tsdb_pack.o $(B)/users.o \
+	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c $(B)/tsdb_pack.o $(B)/users.o \
 	    $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)
@@ -904,6 +951,10 @@ $(B)/test_flush_tail: tests/test_flush_tail.c src/internal.h src/compat.h $(LIB)
 $(B)/test_stats: tests/test_stats.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
 
+# the tenant list of tsdbd when its source changes its mind while the engine takes a list (a hook in server/tenants.c)
+$(B)/test_tn_race: tests/test_tn_race.c tests/harness.h server/tenants.c server/tenants.h server/users.h $(B)/users.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/tenants.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
+
 # Tenants, hot lists and residency (docs/design-stats.md steps 3 and 4)
 $(B)/test_tenants: tests/test_tenants.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
@@ -917,8 +968,11 @@ $(B)/test_types: tests/test_types.c src/internal.h $(LIB)
 $(B)/test_delete: tests/test_delete.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels.h $(LIB)
-	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+$(B)/test_rs: tests/test_rs.c src/internal.h $(EC_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
+
+$(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels.h $(EC_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS)
 
 # links against libtsdb.so, as the embedded bindings do; run with LD_LIBRARY_PATH=$(B)
 $(B)/test_compat: tests/test_compat.c src/compat.h tests/portable.h
@@ -1227,7 +1281,7 @@ $(B)/client-example: examples/client.c client/tsdb_client.h include/tsdb_calenda
 all: $(B)/embedded-example $(B)/client-example
 
 # Runs the README's quick start, word for word, in a scratch directory.
-test: test-quickstart test-seeds-selftest test-cli-stats test-cli-cluster test-cluster-tutorial
+test: test-quickstart test-seeds-selftest test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial
 # The random-heavy tests under a seed that is not their constant (tests/seed.h): `make test-seeds` picks one and prints it,
 # `make test-seeds TSDB_TEST_SEED=N` repeats a run. A failure is rerun with the same N on the one test.
 SEED_TESTS = test_users test_latest test_buckets test_delete test_limits
@@ -1241,6 +1295,8 @@ test-seeds-selftest: $(B)/test_wire
 	B=$(B) tests/test_seeds.sh
 test-cli-stats: $(B)/tsdb
 	B=$(B) tests/test_cli_stats.sh $(TMPDIR)
+test-cli-stats-net: $(B)/tsdb $(B)/tsdbd
+	B=$(B) tests/test_cli_stats_net.sh $(TMPDIR)
 test-cli-cluster: $(B)/tsdb
 	B=$(B) tests/test_cli_cluster.sh $(TMPDIR)
 # The cluster tutorial's command block, word for word (docs/cluster-preview.md), on ports the kernel picks.

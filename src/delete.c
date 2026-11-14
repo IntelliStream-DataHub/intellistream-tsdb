@@ -83,7 +83,7 @@ static int add_tomb_part(eng *db, uint32_t series, int64_t partition, int64_t st
 int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
                       const void *v, size_t n)
 {
-    if (db->opt.read_only)
+    if (db->opt.read_only || db->rp) /* a replica gets deletes as markers (replica.c) */
         return TSDB_ERR_READONLY;
     int st = eng_series_type(db, series);
     if (st < 0 || (n && (type != st || !ts || !v)))
@@ -139,16 +139,34 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         rc = add_tomb_part(db, series, before[i], start, end, &all);
     if (rc == 0 && db->test_precommit)
         db->test_precommit(db->test_precommit_arg);
-    if (rc == 0)
-        rc = jr_intent(db, JR_COMMIT, &all);
+    if (rc == 0 && db->jr) { /* the replicated backend: the marker names every file, tombstones first, then the rows */
+        part **mp = malloc((all.n + rows.n + 1) * sizeof *mp);
+        if (!mp) {
+            rc = TSDB_ERR_NOMEM;
+        } else {
+            if (all.n) /* memcpy of a null pointer is undefined even for 0 bytes */
+                memcpy(mp, all.p, all.n * sizeof *mp);
+            if (rows.n)
+                memcpy(mp + all.n, rows.p, rows.n * sizeof *mp);
+            struct jr_commit_arg ja = {mp, all.n + rows.n, rows.n ? MK_OP_REPLACE : MK_OP_DELETE};
+            rc = jr_intent(db, JR_COMMIT, &ja);
+            free(mp);
+        }
+    }
     pthread_mutex_lock(&db->publish_lock);
     if (rc == 0)
         rc = range_partitions(db, series, start, end, &now, &nn);
     for (size_t i = 0, j = 0; rc == 0 && i < nn; i++) { /* both sorted */
         while (j < nb && before[j] < now[i])
             j++;
-        if (j == nb || before[j] != now[i])
-            rc = add_tomb_part(db, series, now[i], start, end, &all);
+        if (j == nb || before[j] != now[i]) {
+            if (db->jr) { /* its marker is out already (jr_serial makes this impossible: a bug) */
+                eng_fail(db, "a partition appeared between a replicated delete's marker and its commit", EIO);
+                rc = TSDB_ERR_IO;
+            } else {
+                rc = add_tomb_part(db, series, now[i], start, end, &all);
+            }
+        }
     }
     if (rc == 0 && all.n + rows.n > all.cap) {
         part **x = realloc(all.p, (all.n + rows.n) * sizeof *x);

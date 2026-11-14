@@ -3,8 +3,9 @@ package ai.intellistream.tsdb;
 
 /** Constants of the wire protocol; the authoritative description is {@code include/tsdb_protocol.h}. */
 final class Protocol {
-    /* HELLO answers the lower of both versions; 12 (login) is the floor, 13 adds the HA bodies, 14 QUERY_LATEST */
-    static final int VERSION = 14;
+    /* HELLO answers the lower of both versions; 12 (login) is the floor, 13 adds the HA bodies, 14 QUERY_LATEST,
+     * 15 statistics (STATS_SERIES, STATS_TENANTS) */
+    static final int VERSION = 15;
     static final int MIN_VERSION = 12;     /* the oldest server the client connects to */
     static final int DEFAULT_PORT = 7070;
     static final int MAX_FRAME = 256 << 20;
@@ -78,6 +79,25 @@ final class Protocol {
     static final byte OP_GRANT = 36;
     static final byte OP_REVOKE = 37;
     static final byte OP_USER_LIST = 38;
+    /* STATS_SERIES (v15): u32 n, u32 flags, u64 ids[n]; the reply is u32 done, u32 0, then done records of 176 bytes.
+     * STATS_TENANTS: u16 flags, u16 k, u32 n, u32 cursor, u32 0, n x {u16 len, prefix}; the reply is a 40-byte header
+     * (u32 count, flags, next cursor, generation; u64 list_hash, parts_counted, parts_listed) and count rows */
+    static final int STATS_SERIES_MAX_IDS = 65536;
+    static final int STATS_SERIES_RESIDENT_MAX = 1024;
+    static final int STATS_RESIDENT = 1;
+    static final int TSTATS_VOLUMES = 1;
+    static final int TSTATS_HOT = 2;
+    static final int TSTATS_CALLER = 4;
+    static final int TSTATS_HEADER = 40;
+    static final int TSTATS_ROW_HEAD = 16;
+    static final int TSTATS_DATA_FIELDS = 18;
+    static final int TSTATS_CALLER_FIELDS = 20;
+    static final int TSTATS_HOT_REC = 32;
+    static final int TSTATS_VOLUME_SUM = 0xffffffff;
+    static final int TSTATS_DONE = 0xffffffff;
+
+    static final byte OP_STATS_SERIES = 46;   /* version 15: the storage numbers of series */
+    static final byte OP_STATS_TENANTS = 47;  /* version 15: the numbers of tenants */
     static final byte OP_QUERY_LATEST = 39;   /* version 14: the newest value of each of many series */
     static final byte OP_TOPOLOGY = 48;       /* version 13: the nodes and volumes of the server */
     static final byte OP_STATUS = 49;         /* version 13: key=value lines, a superuser */

@@ -84,6 +84,7 @@ mod keepalive;
 mod latest;
 mod pack;
 mod protocol;
+mod stats;
 mod types;
 mod value;
 
@@ -103,6 +104,10 @@ pub use ha::{
 pub use keepalive::KeepAlive;
 pub use latest::{Latest, LatestKind, LatestOpts, LatestValue};
 pub use protocol::{DEFAULT_PORT, PROTOCOL_VERSION};
+pub use stats::{
+    Hot, HotKind, SSTAT_NO_BOUND, SSTAT_NO_RANGE, SSTAT_WRITE_FROM_MTIME, SeriesStat, TenantCaller, TenantNumbers,
+    TenantOpts, TenantRow, TenantStats,
+};
 pub use types::{
     Bucket, Buckets, Group, MultiOpts, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket,
     TwaMethod, TwaOpts, Unit,

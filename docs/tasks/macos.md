@@ -141,7 +141,12 @@ Run them in order, in the same shell, from the checkout. Each writes a log into 
    `F_FULLFSYNC calls:` line at all, macOS did not load the library: say so.
 
 8. **An Intel Mac**, if you have one: steps 1 to 5 again into another directory (`~/tsdb-mac-report-intel`). There
-   the AVX kernels are chosen at startup as on Linux, which has never run on macOS.
+   the AVX kernels are chosen at startup as on Linux, which has never run on macOS. The erasure codec (`src/ec`, the
+   cluster's data path, built since `r5-ec`) is x86-64 code behind `uname -m` in the Makefile: on Apple silicon it is
+   left out (the Makefile defines no `TSDB_EC`, `tests/test_rs` and `tests/test_levels`' codec block are not built, the
+   step 2 build must show no `ec_` objects); on an Intel Mac `make` builds it with clang, and `build/test_rs --quick`
+   must pass there (it uses `__builtin_cpu_supports` and function target attributes, which clang has, but nobody has
+   tried). Add `build/test_rs --quick` and `build/test_levels` output to `~/tsdb-mac-report-intel`.
 
 9. **The send timeout on macOS** (added in 0.9.1 after this port: the server reads the socket's unsent bytes with
    `SO_NWRITE` where Linux uses `SIOCOUTQ`, and a portable monotonic clock): step 3's `make test IO=epoll` runs it
