@@ -986,8 +986,10 @@ static struct {
     uint64_t sync_since; /* core thread: when the sync round now outstanding was handed to the worker; 0: none */
     int snap_out;        /* core thread: a snapshot write is outstanding */
     uint64_t stall_ns, xfer_for, xfer_next; /* a leader whose sync is outstanding this long hands leadership on */
+    int hold_opens;      /* TSDB_CLUSTER_TEST hold_opens_file=1: no REPLICA_OPEN proposed while <state-dir>/holdopens is */
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
+    char holdopensfile[1100];
     unsigned sync_delay_ms; /* TSDB_CLUSTER_TEST sync_delay_ms=N: the worker waits N ms before each sync round */
     int fail_file;       /* TSDB_CLUSTER_TEST fail_sync_file=1: a sync fails with EIO while <state-dir>/failsync exists */
     char failfile[1100];
@@ -1212,6 +1214,8 @@ static void test_knobs(void)
             C.fail_copy_dirsync = v != 0;
         else if (sscanf(p, "fail_pend_dirsync=%llu", &v) == 1)
             C.fail_pend_dirsync = v != 0;
+        else if (sscanf(p, "hold_opens_file=%llu", &v) == 1)
+            C.hold_opens = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
             C.stall_file = v != 0;
         else if (sscanf(p, "sync_delay_ms=%llu", &v) == 1)
@@ -3802,6 +3806,8 @@ static void propose_opens(uint64_t now)
     if (since(now, opens_ns) < 1000 * MS && opens_ns)
         return;
     opens_ns = now;
+    if (C.hold_opens && access(C.holdopensfile, F_OK) == 0)
+        return; /* tests: a replica that opened before the group recorded its generation is caught here */
     static struct cluster_report own;
     int have_own = 0;
     for (uint32_t i = 0; i < C.sm.nvolumes && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
@@ -4140,6 +4146,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.copyfile, sizeof C.copyfile, "%s/copy", C.metadir);
     snprintf(C.retiredfile, sizeof C.retiredfile, "%s/retired", C.metadir);
     snprintf(C.stallfile, sizeof C.stallfile, "%s/stall", C.metadir);
+    snprintf(C.holdopensfile, sizeof C.holdopensfile, "%s/holdopens", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     meta_init(&C.sm);

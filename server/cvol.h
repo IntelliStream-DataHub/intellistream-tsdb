@@ -22,5 +22,8 @@ void cvol_stop(void);
 int cvol_why(uint32_t v);
 /* 1 once cvol_start ran: an engine's READONLY on a cluster volume becomes UNAVAILABLE (FENCED). */
 int cvol_active(void);
+/* 1 once the manager went through the volume records of a metadata copy: before that a volume name it does not know
+ * may be one the copy has not shown it yet (UNAVAILABLE, RECOVERING, rather than NOTFOUND). */
+int cvol_synced(void);
 
 #endif

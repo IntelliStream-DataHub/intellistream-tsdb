@@ -34,6 +34,7 @@
 #include "meta.h"
 #include "raft/raft.h"
 #include "raft/raft_log.h"
+#include "tsdb_client.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -121,7 +122,11 @@ static uint64_t now_ms(void)
 
 static void server_dir(int i, char *out, size_t n) { snprintf(out, n, "%s/n%d", base, i); }
 
-static void start(int i)
+static int auth_on[N]; /* server i runs with login (no --no-auth): its root has USERS */
+static int cports[N];  /* the client port of server i */
+
+/* Starts server i; returns th_await's answer (the client port, or TH_EXITED with th_status, or TH_BAD). */
+static int start_try(int i)
 {
     char dir[PATH_MAX + 80], pf[PATH_MAX + 128], log[PATH_MAX + 80], flag[64];
     server_dir(i, dir, sizeof dir);
@@ -154,7 +159,8 @@ static void start(int i)
         const char *argv[40];
         int n = 0;
         argv[n++] = "tsdbd";
-        argv[n++] = "--no-auth";
+        if (!auth_on[i])
+            argv[n++] = "--no-auth";
         argv[n++] = flag;
         if (is_witness[i])
             argv[n++] = "--witness";
@@ -181,8 +187,18 @@ static void start(int i)
     }
     pids[i] = pid;
     stopped[i] = 0;
-    if (th_await(pf, pid, 20000) <= 0)
+    int port = th_await(pf, pid, 20000);
+    if (port == TH_EXITED)
+        pids[i] = 0; /* reaped */
+    return port;
+}
+
+static void start(int i)
+{
+    int port = start_try(i);
+    if (port <= 0)
         die("server %d: %s", i, th_why);
+    cports[i] = port;
     if (!th_pport)
         die("server %d: the port file names no peer port", i);
     pports[i] = th_pport;
@@ -254,6 +270,7 @@ static void scenario(const char *name)
     memset(xargs, 0, sizeof xargs);
     memset(penv, 0, sizeof penv);
     memset(is_witness, 0, sizeof is_witness);
+    memset(auth_on, 0, sizeof auth_on);
     snprintf(base, sizeof base, "%s/%s", root, name);
     if (mkdir(base, 0755) != 0)
         die("mkdir %s: %s", base, strerror(errno));
@@ -2045,6 +2062,451 @@ static void scen_copyfault(void)
     printf("  shared mode: a copy file that cannot be synced is logged, tsdbd goes on\n");
 }
 
+/* ---- replicated volumes (r3c-volumes; design-cluster.md 3.1, 8.5, DECISION D2) ---- */
+
+/* a client library result, printed (the engine's tsdb_strerror is not linked here) */
+static const char *ers(int rc)
+{
+    static char b[4][24];
+    static int k;
+    k = (k + 1) & 3;
+    snprintf(b[k], sizeof b[k], "error %d", rc);
+    return b[k];
+}
+
+static int vol_add(int i, const char *name, uint32_t replicas, uint32_t *number)
+{
+    uint8_t req[2 + META_NAME_MAX + 4], *reply;
+    size_t len, rl = cluster_volume_add_encode(name, replicas, req);
+    int rc = admin(i, CLUSTER_OP_VOLUME_ADD, req, rl, 1, &reply, &len);
+    *number = 0;
+    for (size_t k = 0; rc == 0 && k < 4 && k < len; k++)
+        *number |= (uint32_t)reply[k] << (8 * k);
+    free(reply);
+    return rc;
+}
+
+/* volume `name` in server i's copy, or NULL (copied out: the view is freed) */
+static int vol_rec(int i, const char *name, struct meta_volume *out)
+{
+    struct view v;
+    view(i, &v);
+    int found = 0;
+    for (uint32_t k = 0; k < v.m.nvolumes && !found; k++)
+        if (!strcmp(v.m.volumes[k].name, name)) {
+            *out = v.m.volumes[k];
+            out->hist = NULL;
+            out->nhist = 0;
+            found = 1;
+        }
+    view_free(&v);
+    return found;
+}
+
+static const struct meta_replica *rep_of(const struct meta_volume *v, int i)
+{
+    for (uint32_t k = 0; k < v->nrep; k++)
+        if (v->rep[k].node == ids[i])
+            return &v->rep[k];
+    return NULL;
+}
+
+static int server_of(uint32_t node)
+{
+    for (int i = 0; i < N; i++)
+        if (ids[i] == node)
+            return i;
+    return -1;
+}
+
+/* waits until server `via`'s copy records open generation >= gen for server i (rid unchanged when rid != 0) */
+static void await_open_gen(int via, const char *name, int i, uint64_t gen, uint64_t rid)
+{
+    uint64_t t0 = now_ms();
+    struct meta_volume v;
+    while (now_ms() - t0 < 30000) {
+        const struct meta_replica *r;
+        if (vol_rec(via, name, &v) && (r = rep_of(&v, i)) && r->open_gen >= gen) {
+            if (rid && r->rid != rid)
+                die("server %d's replica of %s changed rid %016" PRIx64 " -> %016" PRIx64, i, name, rid, r->rid);
+            return;
+        }
+        usleep(100000);
+    }
+    die("server %d's open generation %" PRIu64 " of %s was not recorded", i, gen, name);
+}
+
+static int log_count(int i, const char *needle)
+{
+    char path[PATH_MAX + 80], line[4096];
+    snprintf(path, sizeof path, "%s/n%d.log", base, i);
+    FILE *f = fopen(path, "r");
+    int hits = 0;
+    while (f && fgets(line, sizeof line, f))
+        hits += strstr(line, needle) != NULL;
+    if (f)
+        fclose(f);
+    return hits;
+}
+
+static void await_log_count(int i, const char *needle, int want, int ms)
+{
+    uint64_t t0 = now_ms();
+    while (log_count(i, needle) < want) {
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("server %d: no %d lines with \"%s\" in %d ms", i, want, needle, ms);
+        usleep(50000);
+    }
+}
+
+static void slurp(const char *path, char *buf, size_t n)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        die("%s: %s", path, strerror(errno));
+    size_t got = fread(buf, 1, n - 1, f);
+    buf[got] = 0;
+    fclose(f);
+}
+
+/* the REPL file of server i's v<number>: rid and gen */
+static void repl_of(int i, uint32_t number, uint64_t *rid, uint64_t *gen)
+{
+    char dir[PATH_MAX + 80], path[PATH_MAX + 160], buf[512];
+    server_dir(i, dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/v%" PRIu32 "/REPL", dir, number);
+    slurp(path, buf, sizeof buf);
+    char *r = strstr(buf, "rid="), *g = strstr(buf, "gen=");
+    if (!r || !g)
+        die("%s: no rid= or gen= in \"%s\"", path, buf);
+    *rid = strtoull(r + 4, NULL, 16);
+    *gen = strtoull(g + 4, NULL, 10);
+}
+
+static int nrows;
+static int count_rows(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ctx, (void)ts, (void)v;
+    nrows += (int)n;
+    return 0;
+}
+
+static tsdbc *client(int i)
+{
+    tsdbc *c;
+    int rc = tsdbc_connect("127.0.0.1", cports[i], &c);
+    if (rc != 0)
+        die("connect to server %d: %s", i, ers(rc));
+    tsdbc_set_retry(c, 0); /* the test looks at every UNAVAILABLE */
+    return c;
+}
+
+/* rc is UNAVAILABLE and its body names volume `vol` (TSDB_VOL_ANY: any) and reason `why` */
+static void expect_unavail(tsdbc *c, int rc, uint16_t vol, int why, const char *what)
+{
+    tsdb_unavail e;
+    unsigned n = 0;
+    if (rc != TSDB_ERR_UNAVAILABLE)
+        die("%s: %s, not UNAVAILABLE", what, ers(rc));
+    if (tsdbc_unavailable(c, &e, 1, &n) != 0 || n != 1 || (vol != TSDB_VOL_ANY && e.vol != vol) || e.reason != why)
+        die("%s: UNAVAILABLE names volume %u reason %u (%u entries), not volume %u reason %d", what, n ? e.vol : 0,
+            n ? e.reason : 0, n, vol, why);
+}
+
+/* series pump7.flow in `vol` on server i: made, written and read back (returns its id) */
+static tsdb_sid write_read(tsdbc *c, const char *vol, int64_t t0)
+{
+    tsdb_sid id = 0;
+    int rc = tsdbc_series_at(c, "pump7.flow", vol, &id);
+    if (rc != 0)
+        die("series pump7.flow in %s: %s", vol, ers(rc));
+    int64_t ts[3] = {t0, t0 + 1000, t0 + 2000};
+    float v[3] = {1, 2, 3};
+    if ((rc = tsdbc_insert_series(c, id, ts, v, 3)) != 0)
+        die("insert into %s: %s", vol, ers(rc));
+    return id;
+}
+
+static int rows_of(tsdbc *c, tsdb_sid id)
+{
+    nrows = 0;
+    int rc = tsdbc_query_raw(c, id, 0, INT64_MAX / 2, count_rows, NULL);
+    if (rc != 0)
+        die("query: %s", ers(rc));
+    return nrows;
+}
+
+static int cli_run(const char *args, const char *in, char *out, size_t n)
+{
+    const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
+    char cmd[PATH_MAX * 3 + 256];
+    snprintf(cmd, sizeof cmd, "%s%s%s %s 2>&1", in ? in : "", in ? " | " : "", cli, args);
+    FILE *p = popen(cmd, "r");
+    if (!p)
+        die("popen %s: %s", cmd, strerror(errno));
+    size_t got = fread(out, 1, n - 1, p);
+    out[got] = 0;
+    int st = pclose(p);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+}
+
+/* 3 servers, a volume of 3 replicas: every server makes v1 with the right META and REPL and opens it once the
+ * metadata group recorded its open generation; the leader (TSDB_CLUSTER_WRITES=1) takes writes, the replicas
+ * refuse them (UNAVAILABLE, FENCED, naming the volume); a restart keeps the rid and raises the generation, which is
+ * registered; a copy of the directory from before is refused; with no quorum a restarted server does not open its
+ * volume (the generation cannot be recorded). Mutants: TSDB_CVOL_MUTANT=samerid and noopengen must fail here. */
+static void scen_volumes(void)
+{
+    scenario("volumes");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_CLUSTER_WRITES=1";
+        envs[i] = "hold_opens_file=1";
+        start(i);
+    }
+    init_cluster(0, 600); /* restarts take seconds: no voter is replaced meanwhile */
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc = vol_add(1, "big", 4, &num); /* through a follower: the request is followed to the leader */
+    if (rc != CLUSTER_ERR_FEW)
+        die("a volume of 4 replicas on 3 servers: %s, not CLUSTER_ERR_FEW", cluster_strerror(rc));
+    if ((rc = vol_add(1, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    if ((rc = vol_add(0, "plant", 3, &num)) == 0)
+        die("a second volume named plant was added (number %" PRIu32 ")", num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    for (int i = 0; i < 3; i++)
+        await_log_count(i, "(plant): open as the", 1, 10000);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v) || v.nrep != 3 || v.number != 1)
+        die("the record of plant is missing or has %u replicas", v.nrep);
+    char hex[33];
+    for (int k = 0; k < 16; k++)
+        snprintf(hex + 2 * k, 3, "%02x", v.uuid[k]);
+    uint64_t rids[3];
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX + 80], path[PATH_MAX + 160], meta[2048], need[96];
+        server_dir(i, dir, sizeof dir);
+        snprintf(path, sizeof path, "%s/v1/META", dir);
+        slurp(path, meta, sizeof meta);
+        snprintf(need, sizeof need, "volume_uuid=%s\n", hex);
+        if (!strstr(meta, "\nvolume=1\n") || !strstr(meta, need) || !strstr(meta, "\ncluster=") ||
+            !strstr(meta, "requires=cluster,replica\n"))
+            die("server %d: %s lacks volume=1, %s, cluster= or requires=cluster,replica:\n%s", i, path, need, meta);
+        uint64_t rid, gen;
+        repl_of(i, 1, &rid, &gen);
+        const struct meta_replica *r = rep_of(&v, i);
+        if (!r || rid != r->rid || gen != 1)
+            die("server %d: REPL rid %016" PRIx64 " gen %" PRIu64 ", the record rid %016" PRIx64, i, rid, gen,
+                r ? r->rid : 0);
+        rids[i] = rid;
+    }
+    if (rids[0] == rids[1] || rids[1] == rids[2] || rids[0] == rids[2])
+        die("two replicas share a rid");
+    char out[8192];
+    char args[PATH_MAX * 3 + 256];
+    snprintf(args, sizeof args, "cluster status 127.0.0.1:%d --secret-file %s", pports[2], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "\nvolume 1 name plant ") ||
+        !strstr(out, "replica volume 1 node 1 ") || !strstr(out, "replica volume 1 node 3 "))
+        die("`tsdb %s` does not list the volume and its replicas:\n%s", args, out);
+    printf("  volume 1 on 3 servers: META, REPL and the open generations recorded\n");
+
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = write_read(c, "plant", 1000);
+    if (TSDB_SID_VOLUME(id) != 1 || rows_of(c, id) != 3)
+        die("the leader: id %" PRIx64 " or the rows read back are wrong", (uint64_t)id);
+    tsdb_sid x;
+    if ((rc = tsdbc_series_at(c, "pump7.flow", "nosuch", &x)) != TSDB_ERR_NOTFOUND)
+        die("a series in an unknown volume: %s, not NOTFOUND", ers(rc));
+    if ((rc = tsdbc_series(c, "pump7.flow2", 1, &x)) == 0)
+        die("a series was made in the root of a cluster node (id %" PRIx64 ")", (uint64_t)x);
+    tsdbc_close(c);
+    for (int i = 0; i < 3; i++) {
+        if (i == L)
+            continue;
+        c = client(i);
+        rc = tsdbc_series_at(c, "pump7.flow", "plant", &x);
+        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "series made on a replica");
+        int64_t ts = 5000;
+        float val = 5;
+        rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "insert on a replica");
+        tsdbc_close(c);
+    }
+    printf("  the leader takes writes and reads them back, the replicas refuse them (FENCED)\n");
+
+    /* restarts: the same rid, the generation raised, saved and recorded; the leader's rows are still there */
+    char dir1[PATH_MAX + 80], v1[PATH_MAX + 120], old1[PATH_MAX + 120], cmd[PATH_MAX * 4];
+    server_dir(1, dir1, sizeof dir1);
+    snprintf(v1, sizeof v1, "%s/v1", dir1);
+    snprintf(old1, sizeof old1, "%s/v1.gen1", dir1);
+    for (int i = 0; i < 3; i++) {
+        stop(i, SIGTERM);
+        if (i == 1) { /* the directory as it was at generation 1, for later */
+            snprintf(cmd, sizeof cmd, "cp -a %s %s", v1, old1);
+            if (system(cmd) != 0)
+                die("%s failed", cmd);
+        }
+        start(i);
+        await_open_gen(i == 0 ? 1 : 0, "plant", i, 2, rids[i]);
+        await_log_count(i, "(plant): open as the", 2, 30000);
+        uint64_t rid, gen;
+        repl_of(i, 1, &rid, &gen);
+        if (rid != rids[i] || gen != 2)
+            die("server %d after a restart: REPL rid %016" PRIx64 " gen %" PRIu64 " (rid %016" PRIx64 ", gen 2)", i, rid,
+                gen, rids[i]);
+    }
+    c = client(L);
+    if (rows_of(c, id) != 3)
+        die("the leader lost its rows across a restart");
+    tsdbc_close(c);
+    printf("  every restart keeps the rid, raises the generation to 2 and the group records it\n");
+
+    /* an older copy of the directory (generation 1 < the recorded 2) is refused, naming both */
+    stop(1, SIGTERM);
+    snprintf(cmd, sizeof cmd, "rm -rf %s && mv %s %s", v1, old1, v1);
+    if (system(cmd) != 0)
+        die("%s failed", cmd);
+    start(1);
+    await_log_count(1, "is at open generation 1, below the 2 the metadata group recorded", 1, 40000);
+    c = client(1);
+    expect_unavail(c, tsdbc_series_at(c, "pump7.flow", "plant", &x), 1, TSDB_WHY_RECOVERING, "an old copy");
+    tsdbc_close(c);
+    if (log_count(1, "(plant): open as the") != 2)
+        die("server 1 opened its old copy of v1");
+    printf("  a copy from generation 1 is refused, naming both generations\n");
+
+    /* a volume added while the leader proposes no REPLICA_OPEN (hold_opens_file) stays closed everywhere: no server
+     * serves before the group recorded its generation (mutant noopengen) */
+    for (int i = 0; i < 3; i++) {
+        char hold[PATH_MAX + 96];
+        server_dir(i, hold, sizeof hold);
+        strcat(hold, "/state/holdopens");
+        FILE *h = fopen(hold, "w");
+        if (!h || fclose(h) != 0)
+            die("%s: %s", hold, strerror(errno));
+    }
+    if ((rc = vol_add(0, "tank", 3, &num)) != 0 || num != 2)
+        die("volume add tank: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_log_count(i, "(tank): open generation 1, waiting", 1, 20000);
+    usleep(2500000);
+    for (int i = 0; i < 3; i++) {
+        if (log_count(i, "(tank): open as the"))
+            die("server %d opened tank before the group recorded its open generation", i);
+        c = client(i);
+        expect_unavail(c, tsdbc_series_at(c, "pump7.flow", "tank", &x), 2, TSDB_WHY_RECOVERING, "tank held");
+        tsdbc_close(c);
+    }
+    for (int i = 0; i < 3; i++) {
+        char hold[PATH_MAX + 96];
+        server_dir(i, hold, sizeof hold);
+        strcat(hold, "/state/holdopens");
+        unlink(hold);
+    }
+    for (int i = 0; i < 3; i++)
+        await_log_count(i, "(tank): open as the", 1, 20000);
+    printf("  a volume whose open generations are not recorded stays closed (RECOVERING), then opens\n");
+
+    /* without a quorum a restarted server answers RECOVERING, never NOTFOUND, and opens nothing */
+    int s = L == 2 ? 1 : 2;
+    for (int i = 0; i < 3; i++)
+        stop(i, SIGTERM);
+    start(s);
+    usleep(3000000);
+    c = client(s);
+    /* its copy is stale (no core caught up): plant may not be declared yet, still never NOTFOUND */
+    expect_unavail(c, tsdbc_series_at(c, "pump7.flow", "plant", &x), TSDB_VOL_ANY, TSDB_WHY_RECOVERING, "no quorum");
+    tsdbc_close(c);
+    if (log_count(s, "(plant): open as the") != 2)
+        die("server %d opened plant before the metadata group recorded its generation", s);
+    printf("  with no quorum a restarted server keeps its volume closed\n");
+    stop(s, SIGTERM);
+
+    /* outside a cluster the directory is refused (requires=cluster), and so is a feed */
+    char vdir[PATH_MAX + 128];
+    server_dir(0, vdir, sizeof vdir);
+    strcat(vdir, "/v1");
+    snprintf(args, sizeof args, "%s query pump7.flow 0 10000", vdir);
+    if (cli_run(args, NULL, out, sizeof out) == 0 || !strstr(out, "cluster"))
+        die("`tsdb %s` opened a cluster volume outside the cluster:\n%s", args, out);
+    snprintf(args, sizeof args, "%s feed enable", vdir);
+    if (cli_run(args, NULL, out, sizeof out) == 0 || !strstr(out, "cluster"))
+        die("`tsdb %s` was not refused:\n%s", args, out);
+    printf("  the CLI refuses a cluster volume (requires=cluster) and a feed on it\n");
+}
+
+/* A node refuses to start with --wal-sync-ms other than 0, with series in its root or with VOLUMES (DECISION D2:
+ * the root holds USERS only); login stays per node (USERS in the root). */
+static void scen_volrefuse(void)
+{
+    scenario("volrefuse");
+    char out[8192], args[PATH_MAX * 3 + 256], dir[PATH_MAX + 80], in[PATH_MAX + 80];
+    xargs[0] = "--wal-sync-ms 10";
+    int rc = start_try(0);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 2 ||
+        !log_has(0, "--cluster needs --wal-sync-ms 0"))
+        die("--cluster with --wal-sync-ms 10 was not refused with status 2 (%d, 0x%x)", rc, th_status);
+
+    server_dir(1, dir, sizeof dir);
+    snprintf(args, sizeof args, "%s insert pump7.flow", dir);
+    if (cli_run(args, "echo 1000,1", out, sizeof out) != 0)
+        die("`tsdb %s`: %s", args, out);
+    rc = start_try(1);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 ||
+        !log_has(1, "the root holds 1 series"))
+        die("a node with a series in its root started (%d, 0x%x)", rc, th_status);
+
+    server_dir(2, dir, sizeof dir);
+    start(2); /* a node that ran once (its root exists), then a volume added to it locally while it was down */
+    stop(2, SIGTERM);
+    snprintf(in, sizeof in, "%s/n2-local", base);
+    if (mkdir(in, 0755) != 0)
+        die("mkdir %s: %s", in, strerror(errno));
+    snprintf(args, sizeof args, "%s volume add %s", dir, in);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("`tsdb %s`: %s", args, out);
+    rc = start_try(2);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 || !log_has(2, "VOLUMES lists volume 1"))
+        die("a node with a local volume started (%d, 0x%x)", rc, th_status);
+    printf("  --wal-sync-ms 10, a series in the root and a local volume are refused at start, naming them\n");
+
+    /* login per node: a superuser in the root's USERS writes to a volume of 1 replica */
+    server_dir(3, dir, sizeof dir);
+    snprintf(in, sizeof in, "%s/pw", base);
+    FILE *f = fopen(in, "w");
+    if (!f || fputs("s3cret-pw\n", f) < 0 || fclose(f) != 0)
+        die("%s: %s", in, strerror(errno));
+    snprintf(args, sizeof args, "%s user add admin --superuser --password-file %s", dir, in);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("`tsdb %s`: %s", args, out);
+    auth_on[3] = 1;
+    penv[3] = "TSDB_CLUSTER_WRITES=1";
+    start(3);
+    init_fast(3);
+    uint32_t num;
+    if ((rc = vol_add(3, "solo", 1, &num)) != 0 || num != 1)
+        die("volume add solo: %s", cluster_strerror(rc));
+    await_open_gen(3, "solo", 3, 1, 0);
+    await_log_count(3, "(solo): open as the writer", 1, 10000);
+    tsdbc *c;
+    if ((rc = tsdbc_connect_auth("127.0.0.1", cports[3], "admin", "wrong", &c)) != TSDB_ERR_AUTH)
+        die("a wrong password: %s, not AUTH", ers(rc));
+    if ((rc = tsdbc_connect_auth("127.0.0.1", cports[3], "admin", "s3cret-pw", &c)) != 0)
+        die("login: %s", ers(rc));
+    tsdb_sid id = write_read(c, "solo", 1000);
+    if (rows_of(c, id) != 3)
+        die("the rows written with a login are not read back");
+    tsdbc_close(c);
+    printf("  login on a cluster node uses its own USERS; a volume of 1 replica takes writes\n");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -2074,7 +2536,8 @@ int main(int argc, char **argv)
                {"witness", scen_witness},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
-               {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault}};
+               {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;

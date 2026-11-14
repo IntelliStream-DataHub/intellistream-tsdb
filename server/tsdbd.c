@@ -560,6 +560,11 @@ static tsdb_unavail unav_entry(uint16_t vol)
     uint8_t health, reason;
     uint16_t dom_idx;
     uint32_t retry;
+    if (vol == TSDB_VOL_ANY && cvol_active() && !cvol_synced()) { /* a cluster node before its volume records */
+        e.reason = TSDB_WHY_RECOVERING;
+        e.retry_after_ms = unav_jitter(1000);
+        return e;
+    }
     if (vol == TSDB_VOL_ANY) { /* the first domain that is not UP, else nothing is known */
         size_t nvol = dom.db ? tsdb_volume_count(dom.db) : 0;
         for (size_t v = 1; v < DOM_MAX_VOLS && v < nvol; v++) {
@@ -1065,6 +1070,8 @@ static const tsdb_sid *frame_ids(const uint8_t *p, size_t len, size_t end, uint3
 }
 
 /* A packed INSERT_VALUES: unzstd, unshape into plain arrays, insert. */
+static int cvol_refuse_ids(const tsdb_sid *ids, size_t n);
+
 static int insert_packed(auth_conn *a, const uint8_t *p, size_t len, uint32_t n, tsdb_sid s)
 {
     unsigned type = p[4];
@@ -1100,6 +1107,7 @@ static int insert_packed(auth_conn *a, const uint8_t *p, size_t len, uint32_t n,
             rc = TSDB_ERR_INVALID;
         } else if (many && (rc = auth_ids(a, series, n, R_INSERT)) != 0) {
             /* one row of a series the user may not insert into refuses the whole frame (A16) */
+        } else if (many && (rc = cvol_refuse_ids(series, n)) != 0) {
         } else {
             tsdb_values col = {(tsdb_type)type, vals, valid ? bits : NULL};
             uint16_t list[DOM_MAX_VOLS];
@@ -2133,6 +2141,34 @@ static uint16_t req_volume(uint8_t op, const uint8_t *p, size_t len)
     return (uint16_t)TSDB_SID_VOLUME(id);
 }
 
+/* The cluster volume a series op names by its path (the body of its UNAVAILABLE says which), else TSDB_VOL_ANY. */
+static uint16_t path_volume(const char *path)
+{
+    uint32_t v;
+    if (!path || !*path || !cvol_active() || tsdb_cvol_find(db, path, &v) != 0 || v >= TSDB_VOL_ANY)
+        return TSDB_VOL_ANY;
+    return (uint16_t)v;
+}
+
+/* Writes to a cluster volume held here as a replica or not open yet are refused (FENCED / RECOVERING) whether the
+ * series is known here or not: a replica's dictionary lags the leader's, and an id it does not know yet must not
+ * answer INVALID. The first such volume is named in the UNAVAILABLE body. */
+static int cvol_refuse_ids(const tsdb_sid *ids, size_t n)
+{
+    if (!cvol_active())
+        return 0;
+    for (size_t i = 0; i < n; i++) {
+        tsdb_sid id = ids[i];
+        if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY)
+            continue; /* the library refuses it */
+        if (cvol_why((uint32_t)TSDB_SID_VOLUME(id)) >= 0) {
+            unav_vol = (uint16_t)TSDB_SID_VOLUME(id);
+            return TSDB_ERR_UNAVAILABLE;
+        }
+    }
+    return 0;
+}
+
 static bool g_reader_only; /* --follow or --read-only: every volume is a FOLLOWER in TOPOLOGY */
 
 /* TOPOLOGY of a server without a cluster (protocol 13): itself as node 1, every volume it has, owned by it, with
@@ -2264,6 +2300,11 @@ static void handle(req *r)
         return;
     }
     unav_vol = req_volume(r->op, p, len);
+    if (unav_vol != TSDB_VOL_ANY && !(auth_ops[r->op].need & NEED_ANY) && (auth_ops[r->op].need & R_WRITE) &&
+        cvol_active() && cvol_why(unav_vol) >= 0) { /* a write to a cluster volume this server does not lead */
+        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+        return;
+    }
     int dv = dom_volume_of(r->op, p, len); /* a volume of a storage domain: at most DOM_CAP requests inside */
     if (dv >= 0) {
         if ((rc = dom_enter(dv)) != 0) {
@@ -2425,6 +2466,10 @@ static void handle_op(req *r)
             rc = tsdb_series_lookup(db, name, &id);
         else
             rc = tsdb_series_at(db, name, path && *path ? path : NULL, &id);
+        if (rc == TSDB_ERR_NOTFOUND && path && *path && cvol_active() && !cvol_synced())
+            rc = TSDB_ERR_UNAVAILABLE; /* a volume the metadata copy has not shown this server yet (RECOVERING) */
+        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_READONLY) /* READONLY: a replica's, sent as UNAVAILABLE */
+            unav_vol = path_volume(path);
         free(name);
         free(path);
         if (rc == 0) {
@@ -2467,6 +2512,8 @@ static void handle_op(req *r)
         }
         if (many && (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0)
             break; /* all or nothing (A16) */
+        if (many && (rc = cvol_refuse_ids(ids, n)) != 0)
+            break;
         const int64_t *ts = (const int64_t *)(const void *)(p + 16); /* the payload is malloc'd: 16-aligned */
         const float *v = (const float *)(const void *)(p + 16 + (size_t)n * 8);
         rc = many ? tsdb_insert(db, ids, ts, v, n) : tsdb_insert_series(db, s, ts, v, n);
@@ -2522,6 +2569,10 @@ static void handle_op(req *r)
         char *path = pn ? strndup((const char *)p + 5 + n, pn) : NULL;
         tsdb_sid id = 0;
         rc = !name || (pn && !path) ? TSDB_ERR_NOMEM : tsdb_series_create(db, name, (tsdb_type)p[0], path, &id);
+        if (rc == TSDB_ERR_NOTFOUND && path && *path && cvol_active() && !cvol_synced())
+            rc = TSDB_ERR_UNAVAILABLE; /* a volume the metadata copy has not shown this server yet (RECOVERING) */
+        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_READONLY) /* READONLY: a replica's, sent as UNAVAILABLE */
+            unav_vol = path_volume(path);
         free(name);
         free(path);
         if (rc == 0) {
@@ -2571,6 +2622,8 @@ static void handle_op(req *r)
         }
         if (many && (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0)
             break; /* all or nothing (A16) */
+        if (many && (rc = cvol_refuse_ids(ids, n)) != 0)
+            break;
         const int64_t *ts = (const int64_t *)(const void *)(p + TSDB_VALUES_HEADER); /* the payload is 8-aligned */
         const uint8_t *vals = p + TSDB_VALUES_HEADER + (size_t)n * 8;
         tsdb_values col = {(tsdb_type)p[4], vals, valid ? vals + vb : NULL};

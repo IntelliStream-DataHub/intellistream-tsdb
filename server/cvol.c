@@ -57,6 +57,7 @@ static struct {
     pthread_cond_t cv;
     pthread_t th;
     int started, stop, dirty, active;
+    int synced; /* the manager has gone through the volume records of a metadata copy once (every one declared) */
     tsdb *t;
     char dir[4096];
     uint32_t self;
@@ -327,6 +328,7 @@ static void *mgr_main(void *arg)
                 open_engine(r, m);
         }
         pthread_mutex_lock(&M.mu);
+        M.synced = 1;
     }
     pthread_mutex_unlock(&M.mu);
     return NULL;
@@ -379,6 +381,14 @@ int cvol_why(uint32_t v)
 }
 
 int cvol_active(void) { return M.active; }
+
+int cvol_synced(void)
+{
+    pthread_mutex_lock(&M.mu);
+    int s = M.synced;
+    pthread_mutex_unlock(&M.mu);
+    return s;
+}
 
 int cvol_start(tsdb *t, const char *dir)
 {
