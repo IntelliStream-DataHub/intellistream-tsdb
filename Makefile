@@ -769,7 +769,7 @@ META_SOAK_FIRST   ?= 1000
 # tsdbd --cluster end to end: five servers, init, node add, a leader killed and restarted (the cluster thread polls:
 # one run covers both IO backends)
 $(B)/test_cluster: tests/test_cluster.c tests/harness.h server/cluster.h server/meta.h $(CLUSTER_OBJ) $(B)/tsdb_crypto.o \
-    $(CLIB) $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
+    $(B)/libtsdbclient.a $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) \
 	    $(ZSTD_LIB) -lpthread -lm
 meta-mutants: $(B)/test_meta_mut

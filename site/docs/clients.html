@@ -100,7 +100,9 @@ and the sum per day where days begin at midnight in Oslo.</p>
  *   build/client-example 127.0.0.1 17070 admin /tmp/tsdb-qs/password
  *
  * The last two arguments are the user and a file whose first line is the password. Leave them out for a
- * tsdbd started with --no-auth. The C client does not link the storage engine; it only talks to the server. */
+ * tsdbd started with --no-auth. The C client does not link the storage engine; it only talks to the server.
+ * With TSDB_VOLUME=NAME in the environment the series goes into that volume (tsdbc_series_at): a volume an operator
+ * added, or on a cluster node a cluster volume, by its name (docs/cluster-preview.md, step 6). */
 #include &lt;inttypes.h&gt;
 #include &lt;math.h&gt;
 #include &lt;stdio.h&gt;
@@ -155,7 +157,11 @@ int main(int argc, char **argv)
     CHECK(tsdbc_connect_opts(host, port, &amp;login, &amp;c)); /* on an error, CHECK prints it and jumps to done: below */
 
     tsdb_sid flow;
-    CHECK(tsdbc_series(c, "pump7.flow", 1, &amp;flow)); /* 1: create the series if it is missing */
+    const char *volume = getenv("TSDB_VOLUME");
+    if (volume &amp;&amp; volume[0])
+        CHECK(tsdbc_series_at(c, "pump7.flow", volume, &amp;flow)); /* the series in that volume, made if missing */
+    else
+        CHECK(tsdbc_series(c, "pump7.flow", 1, &amp;flow)); /* 1: create the series if it is missing */
 
     static int64_t times[N];
     static float values[N];
@@ -736,7 +742,7 @@ machine an operator does the same with <a href="cli.html#users"><code>tsdb DIR u
 </div>
 <div class="tabpanel" role="tabpanel" data-key="c">
 <p>The login is part of the connect options:</p>
-<pre><code class="language-c" data-src="examples/client.c#L51-L53">tsdbc_options login = {0};
+<pre><code class="language-c" data-src="examples/client.c#L53-L55">tsdbc_options login = {0};
 login.user = argc &gt; 3 ? argv[3] : NULL;          /* NULL: no login */
 login.password_file = argc &gt; 4 ? argv[4] : NULL; /* never the password itself: argv is visible in ps */</code></pre>
 <p>and the calls for users are in <code>client/tsdb_client.h</code> (the kinds of selector are
