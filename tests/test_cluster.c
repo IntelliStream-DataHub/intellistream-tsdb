@@ -61,7 +61,7 @@
 
 static char root[PATH_MAX], base[PATH_MAX + 64], secret_path[PATH_MAX + 16];
 static const char *scen = "";
-static uint8_t secret[64];
+static uint8_t secret[128];
 static size_t secret_len;
 static pid_t pids[N];
 static int pports[N], stopped[N];
@@ -2052,12 +2052,11 @@ int main(int argc, char **argv)
     }
     snprintf(base, sizeof base, "%s", root);
     snprintf(secret_path, sizeof secret_path, "%s/cluster.secret", root);
-    secret_len = 32;
-    memcpy(secret, "test-cluster-secret-0123456789ab", secret_len);
-    FILE *f = fopen(secret_path, "w");
-    if (!f || fwrite(secret, 1, secret_len, f) != secret_len || fclose(f) != 0)
-        die("writing %s", secret_path);
-    chmod(secret_path, 0600);
+    /* a secret of its own per run (the one a worktree running at the same time shares would no longer separate runs) */
+    char serr[256];
+    if (cluster_make_secret(secret_path, serr, sizeof serr) != 0 ||
+        cluster_read_secret(secret_path, secret, sizeof secret, &secret_len, serr, sizeof serr) != 0)
+        die("the cluster secret %s: %s", secret_path, serr);
 
     static const struct {
         const char *name;

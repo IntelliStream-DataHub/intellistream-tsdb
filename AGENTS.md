@@ -19,6 +19,10 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
                           # (kv also writes nulls and checks every QUERY_LATEST answer, and the final ones; tests/jepsen/mutant-latest.sh
                           # plants stale latest-table entries in tsdbd, which the check must fail: jepsen-selftest runs it)
+make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every peer port) under kill, partition, pause, midcommit
+                          # (crash points: server/crashpt.h, TSDB_CRASH_AT=name[:n] -> _exit(99)) and power (crashfs), workloads meta
+                          # and kv-local; JEPSEN_SECONDS, JEPSEN_NEMESES, JEPSEN_SEED, JEPSEN_NODES, both IO backends; tests/jepsen/
+                          # jepsen_cluster.c; make jepsen-cluster-selftest plants what it must catch (not part of jepsen-cluster)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
