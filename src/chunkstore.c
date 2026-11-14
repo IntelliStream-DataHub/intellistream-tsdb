@@ -586,6 +586,32 @@ void chunk_store_close(chunk_store *st)
 }
 
 const uint8_t *chunk_store_id(const chunk_store *st) { return st->id; }
+/* Test hooks (tests/test_chunk_heal.c): a store that failed in service, as an EIO on a directory fsync makes it (that path
+ * is test_chunk.c's), and one flipped byte in the first cell of a chunk, as a write that landed wrong. */
+void chunk_store_test_fail(chunk_store *st) { store_fail(st, "test hook", EIO); }
+
+int chunk_store_test_flip(chunk_store *st, const chunk_ident *id)
+{
+    char name[80];
+    chunk_name(name, sizeof name, id->oid, id->pos);
+    pthread_mutex_lock(&st->mu);
+    vol_state *v;
+    int rc = vol_get(st, id->volume, false, &v);
+    int fd = rc == 0 ? openat(v->dirfd, name, O_RDWR | O_CLOEXEC) : -1;
+    pthread_mutex_unlock(&st->mu);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    uint8_t b;
+    rc = pread(fd, &b, 1, CHUNK_HDR_BYTES) == 1 ? 0 : TSDB_ERR_IO;
+    b ^= 0x5a;
+    if (rc == 0 && pwrite(fd, &b, 1, CHUNK_HDR_BYTES) != 1)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && fsync(fd) != 0)
+        rc = TSDB_ERR_IO;
+    close(fd);
+    return rc;
+}
+
 bool chunk_store_failed(const chunk_store *st) { return atomic_load(&((chunk_store *)st)->failed) != 0; }
 
 uint64_t chunk_store_epoch(chunk_store *st, uint32_t volume)

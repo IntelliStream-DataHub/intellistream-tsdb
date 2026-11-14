@@ -24,6 +24,8 @@ int chunk_store_volumes(chunk_store *st, uint32_t **vols, uint64_t **epochs, siz
 
 /* True while the volume's EPOCH lost a slot at open and has not been raised since (puts and deletes are refused). */
 bool chunk_store_epoch_unsure(chunk_store *st, uint32_t volume);
+void chunk_store_test_fail(chunk_store *st);                    /* test hook: the store failed in service */
+int chunk_store_test_flip(chunk_store *st, const chunk_ident *id); /* test hook: one byte of the first cell flipped */
 
 /* A backend's stores (chunkstore.c) as the heal code (chunkheal.c) needs them. */
 struct chunk_backend {

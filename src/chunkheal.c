@@ -102,6 +102,25 @@ static bool is_live(const heal_ctx *h, const uint8_t oid[16])
     return h->o->live(h->o->live_ctx, oid) != 0;
 }
 
+/* A store that is away and not being refilled: what it holds may still come back and make an object readable. A
+ * REPLACING store (the target of this very heal, or another one being replaced) is not such a store: what it lacks is
+ * what a heal rebuilds, so it never makes a lost object "unavailable". */
+static bool store_gone(chunk_backend *be, int i)
+{
+    int st = chunk_be_store_state(be, i);
+    return st != CHUNK_STORE_UP && st != CHUNK_STORE_REPLACING;
+}
+
+static bool any_gone(chunk_backend *be, int except)
+{
+    if (chunk_mutant == CHUNK_MUT_HEAL_COUNT_TARGET) /* planted: the target's own absent positions are "away" too */
+        return true;
+    for (int i = 0; i < be->n; i++)
+        if (i != except && store_gone(be, i))
+            return true;
+    return false;
+}
+
 /* Heals the positions of the object that are placed on the target store (only_pos >= 0: just that one, always with a
  * scrub). Counts into the report; returns non-zero only for what stops the whole heal (the store failed, no memory). */
 static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[16], const chunk_geom *g, uint64_t epoch,
@@ -136,8 +155,13 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
             uint64_t nbad = 0;
             if (memcmp(&hd->g, g, sizeof *g) != 0)
                 rc = TSDB_ERR_CORRUPT; /* another encoding's chunk under this name */
-            else if ((scrub || only_pos >= 0) && chunk_rd_scrub(r, &nbad) == 0 && nbad > 0)
-                rc = TSDB_ERR_CORRUPT;
+            else if (scrub || only_pos >= 0) {
+                int sr = chunk_rd_scrub(r, &nbad);
+                if (sr)
+                    rc = sr; /* a cell that could not be read is not a whole one: counted failed below, never ok */
+                else if (nbad > 0)
+                    rc = TSDB_ERR_CORRUPT;
+            }
             chunk_rd_close(r);
             if (rc == 0) {
                 rep->chunks_ok++;
@@ -163,7 +187,9 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
     chunk_obj *ob = NULL;
     int rc = chunk_obj_open(h->be, h->vol, vuuid, oid, g, NULL, &ob);
     if (rc) {
-        if (rc == TSDB_ERR_UNAVAILABLE)
+        /* UNAVAILABLE only when a store that is away could still make the object readable: the target's own
+         * positions (REPLACING reads them as DOWN) are what this heal makes, never a way back for the object */
+        if (rc == TSDB_ERR_UNAVAILABLE && any_gone(h->be, h->store))
             rep->unavailable++;
         else
             rep->unrecoverable++;
@@ -176,7 +202,8 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
     for (unsigned p = 0; p < np; p++) {
         int st = chunk_obj_pos_status(ob, p);
         navail += st == CHUNK_ST_OK;
-        ndown += st == CHUNK_ST_DOWN;
+        ndown += st == CHUNK_ST_DOWN && (chunk_mutant == CHUNK_MUT_HEAL_COUNT_TARGET ||
+                                         store_gone(h->be, chunk_be_pos_store(h->be, oid, p)));
     }
     unsigned want = chunk_mutant == CHUNK_MUT_HEAL_KMINUS1 ? k - 1 : k;
     if (navail < want) {
@@ -228,9 +255,9 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
             r = 0;
         }
         if (r) {
-            if (r == TSDB_ERR_UNAVAILABLE)
+            if (r == TSDB_ERR_UNAVAILABLE && any_gone(h->be, h->store))
                 rep->unavailable++;
-            else if (r == TSDB_ERR_CORRUPT)
+            else if (r == TSDB_ERR_CORRUPT || r == TSDB_ERR_UNAVAILABLE)
                 rep->unrecoverable++;
             else
                 rep->failed++;
@@ -273,6 +300,12 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
         }
         rep->bytes += chunk_file_size(g, p);
         bool ok = true;
+        if (chunk_fault_heal_flip > 0 && --chunk_fault_heal_flip == 0) { /* test hook: a write that landed wrong */
+            chunk_ident fid = {.volume = h->vol, .pos = (uint16_t)p};
+            memcpy(fid.vuuid, vuuid, 16);
+            memcpy(fid.oid, oid, 16);
+            (void)chunk_store_test_flip(h->tgt, &fid);
+        }
         if (chunk_mutant != CHUNK_MUT_HEAL_NOVERIFY) { /* planted: no read-back */
             chunk_ident id = {.volume = h->vol, .pos = (uint16_t)p};
             memcpy(id.vuuid, vuuid, 16);
@@ -382,7 +415,7 @@ int chunk_be_repair(chunk_backend *be, const chunk_ident *id, const chunk_heal_o
     chunk_obj *ob = NULL;
     rc = chunk_obj_open(be, id->volume, id->vuuid, id->oid, NULL, NULL, &ob);
     if (rc) { /* nothing of the object can be read: say which kind of nothing */
-        if (rc == TSDB_ERR_UNAVAILABLE)
+        if (rc == TSDB_ERR_UNAVAILABLE && any_gone(be, store))
             rep->unavailable++;
         else
             rep->unrecoverable++;
@@ -407,11 +440,13 @@ static int volumes_of(chunk_backend *be, uint32_t **out, size_t *nout)
     for (size_t i = 0; i < be->nf; i++) {
         if (n == cap) {
             cap = cap ? 2 * cap : 8;
-            v = realloc(v, cap * sizeof *v);
-            if (!v) {
+            uint32_t *nvv = realloc(v, cap * sizeof *v);
+            if (!nvv) {
                 pthread_mutex_unlock(&be->mu);
+                free(v);
                 return TSDB_ERR_NOMEM;
             }
+            v = nvv;
         }
         v[n++] = be->f[i].vol;
     }
@@ -489,7 +524,10 @@ int chunk_be_settle(chunk_backend *be, int store, const chunk_heal_opts *o, chun
     if (rc)
         return rc;
     if (chunk_be_store_state(be, store) == CHUNK_STORE_REPLACING) {
-        if (rep->failed == 0 && rep->unavailable == 0) {
+        /* objects that only a store that is away lists were never seen: nothing is known about them, so the store
+         * is not promoted while any other store is gone (a REPLACING one is open and was listed) */
+        if (chunk_mutant == CHUNK_MUT_SETTLE_UP_ALWAYS ||
+            (rep->failed == 0 && rep->unavailable == 0 && !any_gone(be, store))) {
             atomic_store(&be->state[store], CHUNK_STORE_UP);
             fprintf(stderr, "tsdb: chunk backend: store %d (%s) is UP: %llu chunks rebuilt, %llu objects past repair\n",
                     store, be->path[store] ? be->path[store] : "-",
@@ -588,9 +626,9 @@ int chunk_be_attach(chunk_backend *be, int index, const char *path, const uint8_
     uint64_t *eps;
     size_t nv;
     rc = chunk_store_volumes(ns, &vols, &eps, &nv);
-    for (size_t i = 0; i < nv && rc == 0; i++)
-        rc = chunk_be_see_epoch(be, vols[i], eps[i]); /* it may have seen an epoch the others have not */
-    if (rc == 0) {
+    if (rc == 0) { /* (on an error chunk_store_volumes has freed them) */
+        for (size_t i = 0; i < nv && rc == 0; i++)
+            rc = chunk_be_see_epoch(be, vols[i], eps[i]); /* it may have seen an epoch the others have not */
         free(vols);
         free(eps);
     }

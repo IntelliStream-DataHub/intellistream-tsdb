@@ -274,8 +274,9 @@ typedef struct chunk_heal_report {
     uint64_t unrecoverable;    /* objects that need a rebuild and have fewer than k' good positions even counting the
                                 * positions on DOWN stores: nothing is written for them, what is there is kept. This also
                                 * counts the remains of a deleted object (E14's orphans: never rebuilt) */
-    uint64_t unavailable;      /* objects that need a rebuild and could have it once a DOWN or REPLACING store is back:
-                                * E15's unavailable, not lost */
+    uint64_t unavailable;      /* objects that need a rebuild and could have it once a DOWN store (one other than the
+                                * target, and not a REPLACING one: what those lack is what heals make) is back: E15's
+                                * unavailable, not lost */
     uint64_t not_live;         /* objects the caller's `live` does not have: skipped */
     uint64_t failed;           /* chunks or objects that failed (I/O, the chunks disagree, the read-back differed): the
                                 * old file is still there, a second heal retries */
@@ -289,13 +290,19 @@ typedef struct chunk_heal_report {
  * counted unrecoverable or rebuilt twice with the same bytes. A deletion in flight must be the caller's to order
  * (`live`). Never fabricated, never resurrected: an object with fewer than k' good positions is not rebuilt (the remains
  * of an object deleted while a store was away are orphans, E14's), but for k' = 1 a single copy decodes, so the layer
- * cannot tell an orphan from a survivor: a caller that deletes objects passes `live`. */
+ * cannot tell an orphan from a survivor: a caller that deletes objects passes `live`.
+ * The listing is taken once, from the stores that are open: an object that only a DOWN store lists is not seen (it is
+ * neither unavailable nor unrecoverable here; chunk_be_settle therefore does not promote while another store is DOWN),
+ * and a degraded put (a posmask that skipped this store) that lands after the listing is not seen either: whoever
+ * puts degraded heals the store again after it is UP. */
 int chunk_be_heal(chunk_backend *be, uint32_t volume, int store, const chunk_heal_opts *o, chunk_heal_report *rep);
 /* The chunk `id` (volume, vuuid, oid, pos) in the store its position is placed on, which a read or a scrub found
  * damaged: always checks its cells. 0 with rep->chunks_ok = 1 if it is whole, else as heal. */
 int chunk_be_repair(chunk_backend *be, const chunk_ident *id, const chunk_heal_opts *o, chunk_heal_report *rep);
 /* Heals every volume the backend knows on the store; a REPLACING store becomes UP only if nothing was unavailable
- * or failed (objects past repair, `unrecoverable`, do not hold it back: a full set of other stores could not give
+ * or failed and no other store is DOWN (objects that only that store lists were never seen; a REPLACING one does not
+ * hold it back, so two stores replaced in turn settle: call settle on the first again once the second is UP;
+ * objects past repair, `unrecoverable`, do not hold it back: a full set of other stores could not give
  * them either). opts->epoch 0 means each volume's current fence (the backend acting on its own account). 0 when the
  * store is UP at the end; TSDB_ERR_UNAVAILABLE when it is still REPLACING (filled as far as the other stores allow). */
 int chunk_be_settle(chunk_backend *be, int store, const chunk_heal_opts *o, chunk_heal_report *rep);
@@ -312,7 +319,9 @@ int chunk_be_attach(chunk_backend *be, int index, const char *path, const uint8_
  * (the TIERS file, later the metadata group); the index is unchanged, so the new store takes exactly the old one's
  * positions. Refused (TSDB_ERR_INVALID) for a store that is UP. 0 when it is UP at the end; TSDB_ERR_UNAVAILABLE when
  * it was filled as far as the other stores allow and stays REPLACING (call chunk_be_settle again later); the id is
- * given in both cases. A replace that died halfway leaves new_path behind: replace again at another path. */
+ * given in both cases. The new store holds every fence in its chunk writes from the first byte; its EPOCH file may be
+ * one fence behind for the moment between the raise and the install (a chunk_be_see_epoch in between reaches the open
+ * stores only), which nothing relies on: wr_open raises it before a chunk is written. A replace that died halfway leaves new_path behind: replace again at another path. */
 int chunk_be_replace(chunk_backend *be, int index, const char *new_path, uint8_t new_id_out[16], const chunk_heal_opts *o,
                      chunk_heal_report *rep);
 
@@ -386,12 +395,16 @@ enum { CHUNK_MUT_NONE = 0, CHUNK_MUT_NOSUMS, CHUNK_MUT_NOFENCE, CHUNK_MUT_EOF, C
        CHUNK_MUT_OPEN_BUSY_DOWN,   /* a store another owner holds is taken as DOWN */
        CHUNK_MUT_OPEN_ID_UP,       /* a store with another id is taken as UP */
        CHUNK_MUT_HEAL_KMINUS1,     /* a rebuild from k' - 1 good positions is attempted */
-       CHUNK_MUT_HEAL_RESURRECT    /* the caller's `live` is never asked */ };
+       CHUNK_MUT_HEAL_RESURRECT,   /* the caller's `live` is never asked */
+       CHUNK_MUT_HEAL_COUNT_TARGET, /* the target's own absent positions count as a store that is away */
+       CHUNK_MUT_SETTLE_UP_ALWAYS  /* a REPLACING store goes UP whatever the heal said */ };
 extern int chunk_mutant;
 /* Non-zero: chunk_read_range and chunk_obj_open do not log (a fuzz harness provokes the refusal by the million). */
 extern int chunk_log_quiet;
 /* Fault injection for tests: the nth following pread of the chunk files / the nth readdir fails with EIO (0: off). */
 extern int chunk_fault_read, chunk_fault_readdir;
+/* The nth chunk a heal has just rebuilt gets one byte of its first cell flipped before the read-back (0: off). */
+extern int chunk_fault_heal_flip;
 /* "Today's settings", used only by CHUNK_MUT_SETTINGS (a reader that takes k and m from them, not from the object). */
 extern unsigned chunk_settings_k, chunk_settings_m;
 

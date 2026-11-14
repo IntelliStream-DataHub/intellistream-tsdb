@@ -26,7 +26,7 @@
  *   test_chunk_heal [DIR]             DIR is the scratch directory of the other tests
  *   test_chunk_heal --quick           coarser power-loss sweeps
  *   test_chunk_heal --mutant NAME     plants heal_noverify | heal_epoch0 | replace_late | open_busy_down | open_id_up |
- *                                     heal_kminus1 | heal_resurrect: must fail
+ *                                     heal_kminus1 | heal_resurrect | heal_count_target | settle_up_always: must fail
  */
 #include "internal.h"
 #include "chunk.h"
@@ -844,6 +844,353 @@ static void test_attach(void)
     printf("  attach: a store that was away (puts refused meanwhile) is filled before it is UP, wrong id refused\n");
 }
 
+/* ---------------------------------------------------------------- review rounds: what a heal may not get wrong */
+static int live_twice_count;
+/* The first answer says "live", the second (asked just before a name is made) says a delete came in meanwhile. */
+static int live_then_deleted(void *ctx, const uint8_t oid[16])
+{
+    (void)ctx, (void)oid;
+    return ++live_twice_count == 1;
+}
+
+/* An object that really is lost (fewer than k' good positions on the stores that are UP) must not hold a replacement
+ * in REPLACING for ever: the target's own absent positions are what the heal makes, never a way back for the object
+ * (replace and attach). Every other store is UP, so the store ends UP and the object is counted unrecoverable. */
+static void test_lost_object_settles(bool attach)
+{
+    world w;
+    world_build(&w, attach ? "lostat" : "lostrep");
+    const obj *o = &w.o[2]; /* k' = 2, m = 2: four positions */
+    int t = place(o->oid, 0);
+    char f[3 * PATH_MAX];
+    imgs mine;
+    imgs_take(&mine, w.path[t]);
+    world_close(&w);
+    if (!attach)
+        sh("rm -rf '%s'", w.path[t]);
+    else {
+        chunk_file(&w, o, t, f, sizeof f);
+        unlink(f); /* the store that comes back lacks it too */
+    }
+    for (unsigned p = 1; p <= 2; p++) { /* two of the three positions elsewhere are gone: one left, k' = 2 */
+        chunk_file(&w, o, place(o->oid, p), f, sizeof f);
+        CHECK(unlink(f) == 0);
+    }
+    CHECK(world_open(&w, attach ? 1u << t : 0, NST - 2, NULL) == 0);
+    char np[PATH_MAX + 64];
+    snprintf(np, sizeof np, "%s/new_t", w.dir);
+    uint8_t newid[16];
+    chunk_heal_report rep;
+    chunk_heal_opts ho = {.epoch = 5};
+    int rc = attach ? chunk_be_attach(w.be, t, w.path[t], w.ids + 16 * t, &ho, &rep)
+                    : chunk_be_replace(w.be, t, np, newid, &ho, &rep);
+    CHECK(rc == 0);
+    CHECK(chunk_be_store_state(w.be, t) == CHUNK_STORE_UP);
+    CHECK(rep.unrecoverable == 1 && rep.unavailable == 0 && rep.failed == 0);
+    CHECK(read_is(w.be, o, TSDB_ERR_CORRUPT)); /* lost is lost, and never rebuilt from nothing */
+    for (int i = 0; i < w.no; i++)
+        if (&w.o[i] != o)
+            CHECK(read_is(w.be, &w.o[i], 0));
+    imgs_free(&mine);
+    world_free(&w);
+}
+
+/* F3, F10: while another store is DOWN the objects only it lists were never seen, so a REPLACING store is not promoted:
+ * settle says UNAVAILABLE and the state stays REPLACING (reads go around). When that store is back (attach) and then the
+ * first settles again, both are UP and every object reads exactly. */
+static void test_settle_waits_for_down_stores(void)
+{
+    world w;
+    world_build(&w, "settlewait");
+    int t = 4, u = 1;
+    imgs good;
+    imgs_take(&good, w.path[t]);
+    world_close(&w);
+    sh("rm -rf '%s'", w.path[t]);
+    CHECK(world_open(&w, 1u << u, NST - 2, NULL) == 0);
+    CHECK(chunk_be_store_state(w.be, t) == CHUNK_STORE_DOWN_MISSING || chunk_be_store_state(w.be, t) == CHUNK_STORE_UP);
+    CHECK(chunk_be_store_state(w.be, u) != CHUNK_STORE_UP);
+    char np[PATH_MAX + 64];
+    snprintf(np, sizeof np, "%s/new_t", w.dir);
+    uint8_t newid[16];
+    chunk_heal_report rep;
+    chunk_heal_opts ho = {.epoch = 5};
+    CHECK(chunk_be_replace(w.be, t, np, newid, &ho, &rep) == TSDB_ERR_UNAVAILABLE);
+    CHECK(chunk_be_store_state(w.be, t) == CHUNK_STORE_REPLACING);
+    CHECK(rep.rebuilt_missing > 0 && rep.failed == 0);
+    CHECK(reads_exact(w.be, &w));
+    CHECK(chunk_be_settle(w.be, t, &ho, &rep) == TSDB_ERR_UNAVAILABLE && chunk_be_store_state(w.be, t) == CHUNK_STORE_REPLACING);
+    CHECK(chunk_be_attach(w.be, u, w.path[u], w.ids + 16 * u, &ho, &rep) == 0); /* a REPLACING store does not hold it back */
+    CHECK(chunk_be_store_state(w.be, u) == CHUNK_STORE_UP);
+    CHECK(chunk_be_store_state(w.be, t) == CHUNK_STORE_REPLACING);
+    CHECK(chunk_be_settle(w.be, t, &ho, &rep) == 0 && chunk_be_store_state(w.be, t) == CHUNK_STORE_UP);
+    CHECK(imgs_diff(&good, np) == 0 && count_chunks(np) == good.n);
+    CHECK(reads_exact(w.be, &w));
+    imgs_free(&good);
+    world_free(&w);
+}
+
+/* F2: an I/O error while scrubbing a chunk is never "whole". One object is left, so that after the first reads (which
+ * peek at a header of another store, where an error is harmless) every read of a heal with scrub is of the target's
+ * chunk: from the first fault that is counted, every later one must be counted too (old code: the scrub's own errors
+ * were counted as chunks_ok). A clean repair afterwards finds the chunk whole. */
+static void test_scrub_eio(void)
+{
+    world w;
+    world_build(&w, "scrubeio");
+    int t = 2;
+    const obj *o = NULL;
+    for (int i = 0; i < w.no && !o; i++)
+        if (pos_on(&w.o[i], t) >= 0 && chunk_pos_cells(&w.o[i].g, (unsigned)pos_on(&w.o[i], t)) >= 3)
+            o = &w.o[i];
+    CHECK(o != NULL);
+    for (int i = 0; i < w.no; i++)
+        if (&w.o[i] != o)
+            for (int s = 0; s < NST; s++)
+                if (pos_on(&w.o[i], s) >= 0) {
+                    char f[3 * PATH_MAX];
+                    chunk_file(&w, &w.o[i], s, f, sizeof f);
+                    unlink(f);
+                }
+    int first = 0, counted = 0;
+    for (int n = 1; n <= 40; n++) {
+        chunk_heal_report rep;
+        chunk_heal_opts ho = {.epoch = 5, .scrub = true};
+        chunk_fault_read = n;
+        CHECK(chunk_be_heal(w.be, VOL, t, &ho, &rep) == 0);
+        int fired = chunk_fault_read == 0;
+        chunk_fault_read = 0;
+        if (!fired)
+            break;
+        bool seen = rep.failed + rep.rebuilt_damaged >= 1;
+        CHECK(!seen || rep.chunks_ok == 0);
+        counted += seen;
+        if (seen && !first)
+            first = n;
+        if (first)
+            CHECK(seen); /* a fault in the scrub is not a whole chunk */
+    }
+    CHECK(first > 0 && first <= 12 && counted >= 4);
+    chunk_ident id = {.volume = VOL, .pos = (uint16_t)pos_on(o, t)};
+    memcpy(id.vuuid, VU, 16);
+    memcpy(id.oid, o->oid, 16);
+    chunk_heal_report rep;
+    chunk_heal_opts ho = {.epoch = 5, .scrub = true};
+    CHECK(chunk_be_repair(w.be, &id, &ho, &rep) == 0 && rep.chunks_ok == 1 && rep.failed == 0);
+    world_free(&w);
+}
+
+/* F5: the caller's `live` is asked again right before a name is made: a delete that came in while the heal decoded
+ * means nothing is written. F5b: a self-consistent chunk of the same object under another geometry is replaced. */
+static void test_heal_last_checks(void)
+{
+    world w;
+    world_build(&w, "lastchecks");
+    int t = 3;
+    const obj *o = &w.o[0];
+    char p[3 * PATH_MAX];
+    chunk_file(&w, o, t, p, sizeof p);
+    imgs one;
+    size_t n = 0;
+    uint8_t *orig = slurp(p, &n);
+    CHECK(orig != NULL);
+    unlink(p);
+    chunk_ident id = {.volume = VOL, .pos = (uint16_t)pos_on(o, t)};
+    memcpy(id.vuuid, VU, 16);
+    memcpy(id.oid, o->oid, 16);
+    chunk_heal_report rep;
+    live_twice_count = 0;
+    chunk_heal_opts ho = {.epoch = 5, .live = live_then_deleted};
+    CHECK(chunk_be_repair(w.be, &id, &ho, &rep) == 0);
+    CHECK(live_twice_count == 2 && rep.not_live == 1 && rep.rebuilt_missing == 0 && access(p, F_OK) != 0);
+    chunk_heal_opts ho2 = {.epoch = 5};
+    CHECK(chunk_be_repair(w.be, &id, &ho2, &rep) == 0 && rep.rebuilt_missing == 1);
+    size_t n2 = 0;
+    uint8_t *again = slurp(p, &n2);
+    CHECK(again && n2 == n && memcmp(again, orig, n) == 0);
+    free(again);
+    (void)one;
+
+    /* the same object and position, another cell size, whole and self-consistent, written by another world */
+    world v;
+    world_build(&v, "geomalt");
+    obj alt = *o;
+    CHECK(chunk_geom_make(&alt.g, o->g.k, o->g.m, 50, o->g.len) == 0);
+    CHECK(put_obj(v.be, &alt, 5, ~0u) == 0);
+    char q[3 * PATH_MAX];
+    chunk_file(&v, &alt, t, q, sizeof q);
+    size_t an = 0;
+    uint8_t *ab = slurp(q, &an);
+    CHECK(ab && an != n);
+    spit(p, ab, an);
+    free(ab);
+    world_free(&v);
+    chunk_heal_opts hs = {.epoch = 5};
+    CHECK(chunk_be_heal(w.be, VOL, t, &hs, &rep) == 0);
+    CHECK(rep.rebuilt_damaged == 1 && rep.failed == 0 && rep.chunks_ok + 1 + rep.rebuilt_missing >= 1);
+    again = slurp(p, &n2);
+    CHECK(again && n2 == n && memcmp(again, orig, n) == 0); /* the other encoding's chunk is gone */
+    free(again);
+    CHECK(reads_exact(w.be, &w));
+    free(orig);
+    world_free(&w);
+}
+
+/* F11, F10: a rebuilt chunk that landed wrong is found by the read-back: counted failed, the store stays REPLACING
+ * (UNAVAILABLE), and a settle that scrubs replaces it and goes UP. */
+static void test_readback_catches_bad_write(void)
+{
+    world w;
+    world_build(&w, "readback");
+    int t = 4;
+    imgs good;
+    imgs_take(&good, w.path[t]);
+    world_close(&w);
+    sh("rm -rf '%s'", w.path[t]);
+    CHECK(world_open(&w, 0, NST - 2, NULL) == 0);
+    char np[PATH_MAX + 64];
+    snprintf(np, sizeof np, "%s/new_t", w.dir);
+    uint8_t newid[16];
+    chunk_heal_report rep;
+    chunk_heal_opts ho = {.epoch = 5};
+    chunk_fault_heal_flip = 2;
+    CHECK(chunk_be_replace(w.be, t, np, newid, &ho, &rep) == TSDB_ERR_UNAVAILABLE);
+    chunk_fault_heal_flip = 0;
+    CHECK(rep.failed == 1 && chunk_be_store_state(w.be, t) == CHUNK_STORE_REPLACING);
+    CHECK(reads_exact(w.be, &w));
+    ho.scrub = true;
+    CHECK(chunk_be_settle(w.be, t, &ho, &rep) == 0 && chunk_be_store_state(w.be, t) == CHUNK_STORE_UP);
+    CHECK(rep.rebuilt_damaged == 1 && rep.failed == 0);
+    CHECK(imgs_diff(&good, np) == 0 && count_chunks(np) == good.n);
+    imgs_free(&good);
+    world_free(&w);
+}
+
+/* A store left REPLACING with every other store UP (a rebuilt chunk failed its read-back): an object that cannot be
+ * read from the others is unrecoverable, not "unavailable" because the target's own absent positions read as DOWN.
+ * (a) no chunk of the object is readable but the target's own is gone too; (b) every position is present but two
+ * cells of one stripe are damaged, so the stripe is short of k'. */
+static void test_replacing_lost_objects(void)
+{
+    world w;
+    world_build(&w, "replost");
+    int t = place(w.o[2].oid, 0);
+    world_close(&w);
+    sh("rm -rf '%s'", w.path[t]);
+    CHECK(world_open(&w, 0, NST - 2, NULL) == 0);
+    char np[PATH_MAX + 64], f[3 * PATH_MAX];
+    snprintf(np, sizeof np, "%s/new_t", w.dir);
+    uint8_t newid[16];
+    chunk_heal_report rep;
+    chunk_heal_opts ho = {.epoch = 5};
+    chunk_fault_heal_flip = 1;
+    CHECK(chunk_be_replace(w.be, t, np, newid, &ho, &rep) == TSDB_ERR_UNAVAILABLE);
+    chunk_fault_heal_flip = 0;
+    CHECK(chunk_be_store_state(w.be, t) == CHUNK_STORE_REPLACING);
+    strcpy(w.path[t], np); /* where the store is now */
+    for (int which = 0; which < 2; which++) {
+        const obj *o = &w.o[which ? 0 : 2];
+        chunk_file(&w, o, t, f, sizeof f);
+        unlink(f);
+        int hit = 0;
+        for (unsigned p = 0; p < chunk_npos(&o->g); p++) {
+            int s = place(o->oid, p);
+            if (s == t || (which && hit >= 2))
+                continue;
+            chunk_file(&w, o, s, f, sizeof f);
+            damage(f, which ? D_CELL : D_FOOTER); /* (a) listed (the header reads), unreadable (the footer does not) */
+            hit++;
+        }
+        chunk_ident id = {.volume = VOL, .pos = (uint16_t)pos_on(o, t)};
+        memcpy(id.vuuid, VU, 16);
+        memcpy(id.oid, o->oid, 16);
+        chunk_heal_opts ro = {.epoch = 5};
+        CHECK(chunk_be_repair(w.be, &id, &ro, &rep) == 0);
+        CHECK(rep.unrecoverable == 1 && rep.unavailable == 0 && rep.rebuilt_missing == 0);
+        if (!which) { /* the same through a heal of the store, whose listing does name the object */
+            CHECK(chunk_be_heal(w.be, VOL, t, &ro, &rep) == 0);
+            CHECK(rep.unrecoverable == 1 && rep.unavailable == 0 && rep.failed == 0);
+        }
+    }
+    world_free(&w);
+}
+
+/* F12: a store that came back having seen a newer epoch than the backend holds: the backend takes it (a put at the
+ * old epoch is fenced). F13: a copy of another index's store (same id) is not attached, nothing is written to it. */
+static void test_attach_epoch_and_copy(void)
+{
+    world w;
+    world_build(&w, "attachep");
+    int t = 1;
+    world_close(&w);
+    chunk_store *st = NULL;
+    CHECK(chunk_store_open(w.path[t], w.ids + 16 * t, &st) == 0);
+    CHECK(chunk_store_raise(st, VOL, 9) == 0);
+    chunk_store_close(st);
+    CHECK(world_open(&w, 1u << t, NST - 1, NULL) == 0);
+    CHECK(chunk_be_epoch(w.be, VOL) == 5);
+    /* F13 first: a copy of store 0's directory at the DOWN index 1 */
+    char cp[PATH_MAX + 64];
+    snprintf(cp, sizeof cp, "%s/copy0", w.dir);
+    sh("cp -a '%s' '%s'", w.path[0], cp);
+    imgs before;
+    imgs_take(&before, cp);
+    chunk_heal_report rep;
+    chunk_heal_opts ho = {.epoch = 9};
+    CHECK(chunk_be_attach(w.be, t, cp, NULL, &ho, &rep) == TSDB_ERR_INVALID);
+    CHECK(chunk_be_store_state(w.be, t) != CHUNK_STORE_UP && chunk_be_store_state(w.be, t) != CHUNK_STORE_REPLACING);
+    CHECK(imgs_diff(&before, cp) == 0 && count_chunks(cp) == before.n && count_chunks(w.path[t]) > 0);
+    imgs_free(&before);
+    /* F12: the backend acts on its own account (epoch 0: each volume's fence it holds), so the epoch it ends at is
+     * the store's only if attach took it from the store */
+    chunk_heal_opts own = {.epoch = 0};
+    CHECK(chunk_be_attach(w.be, t, w.path[t], w.ids + 16 * t, &own, &rep) == 0);
+    CHECK(chunk_be_epoch(w.be, VOL) == 9);
+    obj late;
+    obj_make(&late, 4, 2, 64, 64 * 4);
+    CHECK(put_obj(w.be, &late, 5, ~0u) == CHUNK_ERR_FENCED);
+    CHECK(put_obj(w.be, &late, 9, ~0u) == 0);
+    free(late.data);
+    world_free(&w);
+}
+
+/* F14: a store that failed in service reads as DOWN_IOERR, reads go around it, and it can be replaced. */
+static void test_failed_store_is_down(void)
+{
+    world w;
+    world_build(&w, "failedstore");
+    int f = 3;
+    chunk_store_test_fail(chunk_be_store(w.be, f));
+    CHECK(chunk_be_store_state(w.be, f) == CHUNK_STORE_DOWN_IOERR);
+    CHECK(chunk_be_store_state(w.be, 0) == CHUNK_STORE_UP);
+    CHECK(reads_exact(w.be, &w));
+    chunk_heal_report rep;
+    chunk_heal_opts ho = {.epoch = 5};
+    CHECK(chunk_be_heal(w.be, VOL, f, &ho, &rep) < 0);
+    char np[PATH_MAX + 64];
+    snprintf(np, sizeof np, "%s/new_f", w.dir);
+    uint8_t newid[16];
+    CHECK(chunk_be_replace(w.be, f, np, newid, &ho, &rep) == 0);
+    CHECK(chunk_be_store_state(w.be, f) == CHUNK_STORE_UP && rep.failed == 0);
+    CHECK(reads_exact(w.be, &w));
+    world_free(&w);
+}
+
+static void test_review(void)
+{
+    test_lost_object_settles(false);
+    test_lost_object_settles(true);
+    test_settle_waits_for_down_stores();
+    test_scrub_eio();
+    test_heal_last_checks();
+    test_readback_catches_bad_write();
+    test_replacing_lost_objects();
+    test_attach_epoch_and_copy();
+    test_failed_store_is_down();
+    printf("  review rounds: a lost object settles, settle waits for DOWN stores, scrub EIO is not whole, the last live check, "
+           "geometry, read-back, attach epoch and copy, a failed store is DOWN\n");
+}
+
 /* ---------------------------------------------------------------- power loss */
 static int run_child(const char *dir, const char *mode, int warmup, int seed, int t)
 {
@@ -1138,6 +1485,82 @@ static void test_threads(void)
            rounds, s.nextra);
 }
 
+/* F7: a store is replaced (and a returning store attached) while readers and a writer run: reads exact throughout, the
+ * end whole. The writer skips the position on the store that is away (a degraded put, as chunk.h advises); a put it
+ * lands after the heal's listing is healed by one more heal once the store is UP (documented in chunk.h). */
+static int th_store;
+static void *th_writer_degraded(void *arg)
+{
+    th *t = arg;
+    for (int i = 0; i < t->nextra; i++) {
+        unsigned mask = ~0u;
+        int pt = pos_on(&t->extra[i], th_store);
+        if (pt >= 0)
+            mask &= ~(1u << pt);
+        if (put_obj(t->w->be, &t->extra[i], 5, mask) != 0)
+            atomic_fetch_add(&t->errors, 1);
+        atomic_fetch_add(&t->written, 1);
+    }
+    return NULL;
+}
+
+static void test_threads_replace(void)
+{
+    world w;
+    world_build(&w, "threadsrep");
+    int t = 2;
+    th_store = t;
+    imgs good;
+    imgs_take(&good, w.path[t]);
+    world_close(&w);
+    sh("rm -rf '%s'", w.path[t]);
+    CHECK(world_open(&w, 0, NST - 2, NULL) == 0);
+    th s;
+    memset(&s, 0, sizeof s);
+    s.w = &w;
+    s.nextra = quick ? 20 : 60;
+    s.extra = calloc((size_t)s.nextra, sizeof *s.extra);
+    for (int i = 0; i < s.nextra; i++)
+        obj_make(&s.extra[i], 4, 2, 64, 64 * 4 * 2 + 5);
+    pthread_t rt[3], wt;
+    for (int i = 0; i < 3; i++)
+        CHECK(pthread_create(&rt[i], NULL, th_reader, &s) == 0);
+    CHECK(pthread_create(&wt, NULL, th_writer_degraded, &s) == 0);
+    char np[PATH_MAX + 64];
+    snprintf(np, sizeof np, "%s/new_t", w.dir);
+    uint8_t newid[16];
+    chunk_heal_report rep;
+    chunk_heal_opts ho = {.epoch = 5};
+    CHECK(chunk_be_replace(w.be, t, np, newid, &ho, &rep) == 0);
+    CHECK(chunk_be_store_state(w.be, t) == CHUNK_STORE_UP);
+    pthread_join(wt, NULL);
+    atomic_store(&s.stop, 1);
+    for (int i = 0; i < 3; i++)
+        pthread_join(rt[i], NULL);
+    CHECK(chunk_be_heal(w.be, VOL, t, &ho, &rep) == 0 && rep.failed == 0 && rep.unrecoverable == 0);
+    CHECK(rep.chunks_ok + rep.rebuilt_missing > 0);
+    CHECK(reads_exact(w.be, &w));
+    for (int i = 0; i < s.nextra; i++)
+        CHECK(read_is(w.be, &s.extra[i], 0));
+    CHECK(atomic_load(&s.errors) == 0 && atomic_load(&s.reads) > 0);
+    CHECK(count_chunks(np) >= good.n);
+    /* the store alone with two others down still gives every object (the degraded puts were healed in) */
+    world_close(&w);
+    strcpy(w.path[t], np);
+    memcpy(w.ids + 16 * t, newid, 16);
+    CHECK(world_open(&w, 1u << ((t + 1) % NST) | 1u << ((t + 3) % NST), NST - 2, NULL) == 0);
+    CHECK(reads_exact(w.be, &w));
+    for (int i = 0; i < s.nextra; i++)
+        CHECK(read_is(w.be, &s.extra[i], 0));
+    for (int i = 0; i < s.nextra; i++)
+        free(s.extra[i].data);
+    free(s.extra);
+    imgs_free(&good);
+    world_free(&w);
+    printf("  threads: a store replaced under 3 readers and a degraded writer of %d objects, then healed once more: whole\n",
+           s.nextra);
+}
+
 /* ---------------------------------------------------------------- main */
 static void set_mutant(const char *m)
 {
@@ -1155,6 +1578,10 @@ static void set_mutant(const char *m)
         chunk_mutant = CHUNK_MUT_HEAL_KMINUS1;
     else if (!strcmp(m, "heal_resurrect"))
         chunk_mutant = CHUNK_MUT_HEAL_RESURRECT;
+    else if (!strcmp(m, "heal_count_target"))
+        chunk_mutant = CHUNK_MUT_HEAL_COUNT_TARGET;
+    else if (!strcmp(m, "settle_up_always"))
+        chunk_mutant = CHUNK_MUT_SETTLE_UP_ALWAYS;
     else {
         fprintf(stderr, "test_chunk_heal: no mutant %s\n", m);
         exit(2);
@@ -1211,7 +1638,9 @@ int main(int argc, char **argv)
     test_heal_refusals();
     test_replace();
     test_attach();
+    test_review();
     test_threads();
+    test_threads_replace();
     test_crashfs();
     if (failures) {
         fprintf(ERR, "test_chunk_heal: %d check(s) failed (scratch %s)\n", failures, S);

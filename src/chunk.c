@@ -30,7 +30,7 @@
 #endif
 
 int chunk_mutant;
-int chunk_fault_read, chunk_fault_readdir;
+int chunk_fault_read, chunk_fault_readdir, chunk_fault_heal_flip;
 int chunk_log_quiet;
 unsigned chunk_settings_k, chunk_settings_m;
 
