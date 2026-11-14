@@ -1598,7 +1598,11 @@ static void scen_retired(void)
         usleep(100000);
     if (!log_has(2, "ends the voter role only"))
         die("server 2 did not end its voter role on a failed log sync");
+    /* the log line comes before core_stop and the mark's write: wait for the mark, not just the line */
     snprintf(path, sizeof path, "%s/n2/state/retired", base);
+    t0 = now_ms();
+    while (access(path, F_OK) != 0 && now_ms() - t0 < 10000)
+        usleep(50000);
     if (access(path, F_OK) != 0)
         die("server 2 wrote no retired mark");
     int rc = waitpid(pids[2], NULL, WNOHANG);
