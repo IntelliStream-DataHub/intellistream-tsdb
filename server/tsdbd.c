@@ -120,6 +120,8 @@
 #include "auth.h"
 #include "tenants.h"
 #include "cluster.h"
+#include "cvol.h"
+#include "../src/cvol.h"
 #include "../tools/cfg.h" /* configuration files: docs/config.md */
 #include "tsdbd_keys.h"
 
@@ -500,6 +502,12 @@ static void vol_health(size_t v, uint8_t *health, uint8_t *reason, int64_t *sinc
     *outage_id = 0;
     *retry_ms = 1000;
     *domain = 0xffff;
+    int cw = cvol_why((uint32_t)v); /* a cluster volume: a replica (FENCED) or one not open yet (RECOVERING) */
+    if (cw >= 0) {
+        *health = TSDB_HEALTH_UNAVAILABLE;
+        *reason = (uint8_t)cw;
+        return;
+    }
     int d = dom_of(v);
     if (d < 0 || !dom.health)
         return;
@@ -870,6 +878,11 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
     size_t pre = ix ? TSDB_MULTI_PREFIX : 0;
     uint8_t ub[2 + TSDB_UNAVAIL_ENTRY]; /* the body of UNAVAILABLE (protocol 13), after the op's own error shape */
     size_t ulen = 0;
+    /* a cluster volume this server only replicates (or leads before replication is wired) refuses writes as
+     * UNAVAILABLE (FENCED), the engine's READONLY; a cluster node has no other read-only volume (--cluster refuses
+     * --read-only and --follow) */
+    if (status == TSDB_ERR_READONLY && cvol_active())
+        status = TSDB_ERR_UNAVAILABLE;
     /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
      * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
     if (status == TSDB_ERR_UNAVAILABLE && atomic_load(&c->proto) >= 13 && (!ix || *ix == TSDB_MULTI_END)) {
@@ -4334,6 +4347,11 @@ int main(int argc, char **argv)
                         "and a writer (not --read-only or --follow)\n");
         return 2;
     }
+    if (cluster_on && o.wal_sync_ms != 0) { /* design-cluster.md §5.1: a periodic sync acknowledges before durability */
+        fprintf(stderr, "tsdbd: --cluster needs --wal-sync-ms 0 (every write synced before it is acknowledged), not "
+                        "%d\n", o.wal_sync_ms);
+        return 2;
+    }
     if (witness && (!cluster_on || dir)) {
         fprintf(stderr, "tsdbd: --witness is a cluster member without volumes: it needs --cluster, and takes no "
                         "--dir\n");
@@ -4443,6 +4461,11 @@ int main(int argc, char **argv)
     tn_free_list(tn_list, tn_n);
     if (rc) {
         fprintf(stderr, "tsdbd: %s: %s\n", dir, tsdb_strerror(rc));
+        return 1;
+    }
+    if (cluster_on && (rc = tsdb_cvol_mode(db)) != 0) { /* DECISION D2: the root holds USERS only; it names what */
+        fprintf(stderr, "tsdbd: %s cannot be a cluster node's data directory: %s\n", dir, tsdb_strerror(rc));
+        tsdb_close(db);
         return 1;
     }
     if (tn_start(db) != 0) {
@@ -4600,7 +4623,7 @@ int main(int argc, char **argv)
         struct cluster_cfg cc = {.state_dir = state_dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
                                  .rack = rack, .power_feed = power_feed, .bmc = bmc, .read_barrier_off = rb_off,
                                  .secret = secret, .secret_len = secret_len};
-        if (cluster_start(&cc) != 0)
+        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0)
             return 1;
         tsdb_wipe(secret, sizeof secret);
         fprintf(stderr, "tsdbd: cluster peer port on %s:%d (advertised as %s)\n", peer_addr ? peer_addr : addr,
@@ -4631,8 +4654,10 @@ int main(int argc, char **argv)
     close(lfd);
     if (mfd >= 0)
         metrics_stop(); /* before tsdb_close: it reads the database */
-    if (cluster_on)
+    if (cluster_on) {
         cluster_stop();
+        cvol_stop(); /* after the cluster thread: no push or report reaches it any more */
+    }
     pthread_mutex_lock(&work_lock);
     work_stop = true;
     pthread_cond_broadcast(&work_cv);

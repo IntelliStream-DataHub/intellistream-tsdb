@@ -499,6 +499,8 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
             v->fenced_age_ms = get64(&r);
             v->wal_seg = get64(&r);
             v->wal_off = get64(&r);
+            v->rid = get64(&r);
+            v->open_gen = get64(&r);
             h->vols[j].local_fault_s = get64(&r);
         }
         h->ndoms = get32(&r);
@@ -1469,6 +1471,16 @@ void cluster_set_reporter(cluster_report_fn fn, void *arg)
     g_reporter_arg = arg;
 }
 
+static cluster_vol_watch_fn g_vwatch;
+static void *g_vwatch_arg;
+static uint64_t g_vwatch_applied = UINT64_MAX; /* the metadata index last pushed (UINT64_MAX: none yet) */
+
+void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg)
+{
+    g_vwatch = fn;
+    g_vwatch_arg = arg;
+}
+
 /* The sections of a heartbeat from r->off on, into h. Sets r->bad on a malformed one. An unknown type is skipped. */
 static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
 {
@@ -1517,6 +1529,8 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
                 v->fenced_age_ms = get64(&s);
                 v->wal_seg = get64(&s);
                 v->wal_off = get64(&s);
+                v->rid = get64(&s);
+                v->open_gen = get64(&s);
                 if (v->health == CL_HEALTH_OK)
                     continue;
                 /* the timer of a (volume, domain) fault runs from the first report of it and breaks on a report
@@ -2719,6 +2733,8 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now)
         put64(b, v->fenced_age_ms);
         put64(b, v->wal_seg);
         put64(b, v->wal_off);
+        put64(b, v->rid);
+        put64(b, v->open_gen);
         put64(b, h->vols[i].fault_ns ? since(now, h->vols[i].fault_ns) / (1000 * MS) : 0);
     }
     put32(b, h ? h->ndoms : 0);
@@ -3500,6 +3516,8 @@ static void put_sections(struct buf *b)
         put64(b, v->fenced_age_ms);
         put64(b, v->wal_seg);
         put64(b, v->wal_off);
+        put64(b, v->rid);
+        put64(b, v->open_gen);
     }
     sec_end(b, at);
     at = sec_begin(b, HBS_DOMAINS);
@@ -3744,6 +3762,83 @@ static void manage_voters(uint64_t now)
     }
 }
 
+/* Pushes this server's replicated volume records to the volume manager whenever the metadata copy moved. */
+static void vol_watch_duty(void)
+{
+    if (!g_vwatch || !C.sm.initialised || C.sm.applied == g_vwatch_applied)
+        return;
+    g_vwatch_applied = C.sm.applied;
+    static struct cluster_vol_rec recs[CLUSTER_REPORT_VOLS];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < C.sm.nvolumes && n < CLUSTER_REPORT_VOLS; i++) {
+        const struct meta_volume *v = &C.sm.volumes[i];
+        if (v->kind != META_VOL_REPLICATED)
+            continue;
+        for (uint32_t k = 0; k < v->nrep; k++) {
+            if (v->rep[k].node != C.id)
+                continue;
+            struct cluster_vol_rec *r = &recs[n++];
+            memset(r, 0, sizeof *r);
+            r->number = v->number;
+            snprintf(r->name, sizeof r->name, "%s", v->name);
+            memcpy(r->uuid, v->uuid, 16);
+            memcpy(r->cluster, C.uuid, 16);
+            r->leader = v->leader;
+            r->epoch = v->epoch;
+            r->rid = v->rep[k].rid;
+            r->open_gen = v->rep[k].open_gen;
+            break;
+        }
+    }
+    g_vwatch(g_vwatch_arg, C.id, recs, n);
+}
+
+/* REPLICA_OPEN (§8.5): a replica raises its directory's generation at every open and reports it; the leader commits
+ * it, and the replica serves only once its copy shows the generation. A proposal is retried once a second while the
+ * report stays above the record (a lost leadership or a full pipeline drops it); the apply refuses a stale one. */
+static uint64_t opens_ns;
+static void propose_opens(uint64_t now)
+{
+    if (since(now, opens_ns) < 1000 * MS && opens_ns)
+        return;
+    opens_ns = now;
+    static struct cluster_report own;
+    int have_own = 0;
+    for (uint32_t i = 0; i < C.sm.nvolumes && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
+        const struct meta_volume *v = &C.sm.volumes[i];
+        if (v->kind != META_VOL_REPLICATED)
+            continue;
+        for (uint32_t k = 0; k < v->nrep; k++) {
+            const struct meta_replica *rp = &v->rep[k];
+            const struct cluster_vol_report *vr = NULL;
+            if (rp->node == C.id) {
+                if (!have_own) {
+                    memset(&own, 0, sizeof own);
+                    if (g_reporter)
+                        g_reporter(g_reporter_arg, &own);
+                    have_own = 1;
+                }
+                for (uint32_t j = 0; j < own.nvols && !vr; j++)
+                    if (own.vols[j].volume == v->number)
+                        vr = &own.vols[j];
+            } else {
+                struct heard *h = heard_get(rp->node);
+                for (uint32_t j = 0; h && j < h->nvols && !vr; j++)
+                    if (h->vols[j].v.volume == v->number)
+                        vr = &h->vols[j].v;
+            }
+            if (!vr || vr->rid != rp->rid || vr->open_gen <= rp->open_gen)
+                continue;
+            struct meta_entry e;
+            meta_entry_init(&e);
+            meta_op_replica_open(&e, v->number, rp->node, rp->rid, vr->open_gen);
+            if (propose(&e, 0, 0, 0) == ISO_OK)
+                say("proposes volume %" PRIu32 " replica on node %" PRIu32 " open generation %" PRIu64, v->number,
+                    rp->node, vr->open_gen);
+        }
+    }
+}
+
 static void leader_duties(uint64_t now)
 {
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
@@ -3766,6 +3861,7 @@ static void leader_duties(uint64_t now)
     if (!C.sm.initialised)
         return;
     member_states(now);
+    propose_opens(now);
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
@@ -3921,6 +4017,7 @@ static void *cluster_main(void *arg)
             C.next_duty = now + 100 * MS;
             leader_duties(now);
             watch_duty(now);
+            vol_watch_duty();
             seeds_refresh(now);
             for (size_t i = 0; i < C.nconns; i++) {
                 struct conn *c = C.conns[i];

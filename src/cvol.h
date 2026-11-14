@@ -37,6 +37,8 @@ int tsdb_cvol_declare(tsdb *t, uint32_t number, const char *name);
  * floor is `floor` (the REPL file's). TSDB_ERR_INVALID if it is open already. */
 int tsdb_cvol_open(tsdb *t, uint32_t number, const char *dir, bool replica, uint64_t floor);
 /* The number of a declared volume by its cluster name (TSDB_ERR_NOTFOUND). */
+/* FNO in a new cluster volume directory (synced with it); 0 or TSDB_ERR_IO */
+int tsdb_cvol_fno_create(const char *dir);
 int tsdb_cvol_find(tsdb *t, const char *name, uint32_t *number);
 /* CVOL_NONE (not held, or not open), CVOL_WRITER or CVOL_REPLICA. */
 int tsdb_cvol_role(tsdb *t, uint32_t number);

@@ -76,6 +76,8 @@ struct cluster_vol_report { /* a volume this server owns */
     uint64_t series_len, states_len;   /* the dictionaries' lengths */
     uint64_t fenced_age_ms;            /* age of the oldest fenced call still outstanding (the stuck-release rule) */
     uint64_t wal_seg, wal_off;         /* positions as the owner last made them durable */
+    uint64_t rid, open_gen;            /* replicated: the directory's replica instance and the generation its last
+                                        * open saved (§8.5); the leader proposes REPLICA_OPEN for a higher one */
 };
 struct cluster_dom_report {
     char name[META_DOMAIN_MAX];
@@ -94,6 +96,20 @@ void cluster_set_reporter(cluster_report_fn fn, void *arg);
  * its own (the state disk, the storage), 1 once they work again. It goes into the heartbeat's flags (claim_ok), and
  * the leader lifts a CLAIM_FAILED bar only on the 0 -> 1 change. */
 void cluster_set_claim_ok(int ok);
+
+/* ---- this server's replicated volumes as its metadata copy holds them (server/cvol.c) */
+struct cluster_vol_rec {
+    uint32_t number;
+    char name[META_NAME_MAX];
+    uint8_t uuid[16], cluster[16];
+    uint32_t leader; /* the record's leader (rep[0] at VOLUME_ADD): the writer */
+    uint64_t epoch;
+    uint64_t rid, open_gen; /* this server's replica: its instance and the last REPLICA_OPEN generation committed */
+};
+/* Called on the cluster thread after the metadata copy changed (and once at start), with every replicated volume
+ * that names this server (`self`) as a replica, ascending by number; it must copy what it keeps and not block. */
+typedef void (*cluster_vol_watch_fn)(void *arg, uint32_t self, const struct cluster_vol_rec *v, uint32_t n);
+void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg);
 
 struct cluster_vol_status {
     struct cluster_vol_report v;

@@ -4090,3 +4090,15 @@ int tsdb_cvol_promote(tsdb *t, uint32_t number, uint64_t epoch_pos)
         return TSDB_ERR_INVALID;
     return tsdb_cvol_replace(t, number, cvol_promote_fn, &epoch_pos, CVOL_WRITER);
 }
+
+/* The FNO of a cluster volume's new directory (tsdbd's manager makes it whole in a tmp directory before the rename,
+ * server/cvol.c): META then says format 9, and a format-9 volume without FNO is damage at open. */
+int tsdb_cvol_fno_create(const char *dir)
+{
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    int rc = !fno_file_intact(fd) && fno_create(fd, 1, true) != 0 ? TSDB_ERR_IO : 0;
+    close(fd);
+    return rc;
+}
