@@ -2528,9 +2528,9 @@ static void case_drop_race(void)
     xp_step(&x, "N: before");
     XOPS.wait = dr_wait;
     xp_rows(&x, 1, 0, 40, 500); /* > wal_max_batch_rows: a COMMIT */
-    XOPS.wait = xp_wait;
     CHECK(DR_STARTED);
     pthread_join(DR_T, NULL);
+    XOPS.wait = xp_wait; /* after the join: the drop's thread reads XOPS.wait in leader_drop (tsan found it) */
     CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
     for (uint32_t s = 0; s < 2; s++)
         CHECK_EQ(count_rows(x.ld, s), count_rows(x.rep, s));
