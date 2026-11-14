@@ -4008,6 +4008,12 @@ int main(int argc, char **argv)
                 outage_keep_log();
             if (system(cmd) != 0)
                 return 2;
+            if (!strcmp(nemesis, "power") && death_problems + hang_problems) {
+                /* a server that hung, or ended another way than a power loss, is a fault of the system under test that the
+                 * nemesis found: a violation, not a lazy run (the hung server also starves the fault floor) */
+                printf("FAILED: %d violations\n", death_problems + hang_problems);
+                return 1;
+            }
             return inconclusive_exit(false);
         }
     }
