@@ -38,6 +38,9 @@
 #define CHUNK_CELL_MAX (1u << 20)
 #define CHUNK_CELL_LIMIT (64u << 20)
 #define CHUNK_OBJ_MAX (1ull << 40) /* a sanity bound on object_len */
+#define CHUNK_NCELLS_MAX (1ull << 26) /* data cells of an object: a sums table is 8 bytes a cell, and a damaged header
+                                       * must not make a reader allocate gigabytes (it also keeps the footer's 32-bit
+                                       * cell count honest) */
 #define CHUNK_HDR_BYTES 96
 #define CHUNK_FTR_BYTES 16
 #define CHUNK_VERSION 1u
@@ -48,6 +51,10 @@
 #define CHUNK_ERR_FENCED (-101)   /* a put or delete below the volume's epoch, or a delete below the chunk's own (E14) */
 #define CHUNK_ERR_STORE_ID (-102) /* the store's META names another store than the one the caller was told (E27) */
 #define CHUNK_ERR_FULL (-103)     /* ENOSPC while writing a chunk (the call failed; nothing was acknowledged) */
+#define CHUNK_ERR_BUSY (-104)     /* another opener holds the store directory (two owners would let EPOCH go back) */
+#define CHUNK_ERR_EPOCH_UNSURE (-105) /* one EPOCH slot of the volume was damaged at open: the fence may be lower than it
+                                       * was, so puts and deletes of the volume are refused until chunk_store_raise
+                                       * (or chunk_be_see_epoch) is given the authoritative epoch; reads go on */
 
 /* What a chunk (or a cell of one) is, as a reader found it. */
 enum { CHUNK_ST_OK = 0, CHUNK_ST_ABSENT, CHUNK_ST_DAMAGED, CHUNK_ST_IOERR, CHUNK_ST_VIRTUAL /* zero padding */ };
@@ -119,14 +126,21 @@ typedef struct chunk_wr chunk_wr;
 int chunk_store_init(const char *path, const uint8_t *id, uint8_t id_out[16]);
 /* Opens it. expect_id (16 bytes) names the store the caller believes this directory to be: another id is
  * CHUNK_ERR_STORE_ID (a disk that came back as another one: a lost disk, E27); no META is TSDB_ERR_NOTFOUND; a
- * damaged one TSDB_ERR_CORRUPT. Volumes found are loaded with their EPOCH, leftover tmp_* files removed. */
+ * damaged one TSDB_ERR_CORRUPT. Volumes found are loaded with their EPOCH, leftover tmp_* files removed. The directory
+ * is locked (flock, held until close): a second open of it, in this process or another, is CHUNK_ERR_BUSY, because two
+ * owners each hold their own in-memory epoch and one of them would write it back lower. A volume with exactly one
+ * damaged EPOCH slot (a torn store and rot look alike) opens with the older slot's epoch, logs it, and refuses puts and
+ * deletes (CHUNK_ERR_EPOCH_UNSURE) until chunk_store_raise gives it the epoch the metadata group holds. A readdir that
+ * fails is an error, never the end of the directory. */
 int chunk_store_open(const char *path, const uint8_t *expect_id, chunk_store **out);
 void chunk_store_close(chunk_store *st);
 const uint8_t *chunk_store_id(const chunk_store *st);
 bool chunk_store_failed(const chunk_store *st); /* a failed write or sync: it acknowledges nothing more (reads go on) */
 /* The volume's epoch in this store (0 if it has none). */
 uint64_t chunk_store_epoch(chunk_store *st, uint32_t volume);
-/* Raises the volume's EPOCH to at least e, durably, before returning (E14: before acting on a higher one). */
+/* Raises the volume's EPOCH to at least e, durably, before returning (E14: before acting on a higher one). This is
+ * the authoritative call (the epoch comes from the metadata group): it also rewrites the damaged slot of an unsure
+ * volume (e >= the epoch read) and clears that state. */
 int chunk_store_raise(chunk_store *st, uint32_t volume, uint64_t e);
 
 /* One put, piece by piece. The fence is checked at open (epoch >= the store's: else CHUNK_ERR_FENCED, nothing made)
@@ -172,13 +186,20 @@ int chunk_store_list(chunk_store *st, uint32_t volume, bool verify, chunk_list_f
 /* ---------------------------------------------------------------- the directory backend */
 typedef struct chunk_backend chunk_backend;
 /* The stores at paths[0..n); ids (n x 16 bytes) or NULL as chunk_store_open's expect_id. The fence of a volume is the
- * maximum over the stores, kept in memory and taken over the stores present at open. */
+ * maximum over the stores, kept in memory and taken over the stores present at open. A path that is NULL is a store
+ * the caller knows is down (a lost disk): the index keeps its place (placement is by index), puts to it are
+ * TSDB_ERR_UNAVAILABLE, reads, deletes, listings and epoch raises skip it. Any path that is named must open, so a disk
+ * that came back as another one, or is damaged, fails the open and is never dropped quietly. The same directory or
+ * the same store id twice is refused (CHUNK_ERR_BUSY, TSDB_ERR_INVALID). */
 int chunk_be_open(chunk_backend **out, const char *const *paths, int n, const uint8_t *ids);
 void chunk_be_close(chunk_backend *be);
 int chunk_be_nstores(const chunk_backend *be);
 chunk_store *chunk_be_store(chunk_backend *be, int i);
 uint64_t chunk_be_epoch(chunk_backend *be, uint32_t volume);
-/* A request showed epoch e: the fence is at least e, durable in every store before it returns. */
+/* A request showed epoch e: the fence is at least e, durable in every store before it returns. If a store fails to
+ * store it, the first such error is returned even though the others hold it (the fence is in memory and in the stores
+ * that succeeded; the caller retries or reopens: a failed store acknowledges nothing, so it is skipped from then on).
+ * Authoritative like chunk_store_raise: it clears an unsure volume. */
 int chunk_be_see_epoch(chunk_backend *be, uint32_t volume, uint64_t e);
 /* The store a chunk is put in when the caller names none: (hash of oid + pos) mod n. */
 int chunk_be_place(const chunk_backend *be, const uint8_t oid[16], unsigned pos);
@@ -199,8 +220,9 @@ typedef int (*chunk_cell_fn)(void *ctx, unsigned pos, uint64_t idx, const uint8_
  * entries, or NULL) gets the object record's sums. TSDB_ERR_INVALID without an erasure codec in this build. */
 int chunk_encode(const chunk_geom *g, const uint8_t *obj, chunk_cell_fn fn, void *ctx, uint64_t *sums_out);
 /* Encodes and puts every position whose bit is set in posmask (all: ~0u) through the backend, position p in store
- * (chunk_be_place + p) mod n; each chunk is durable when this returns 0, and a failure aborts the unfinished ones
- * (those already committed stay: chunks are immutable and an orphan is E14's business). */
+ * (chunk_be_place + p) mod n (with fewer stores than k' + m positions share a store, and losing it loses more than m
+ * of them: only tests do that; R7 passes at least k' + m). Each chunk is durable when this returns 0, and a failure
+ * aborts the unfinished ones (those already committed stay: chunks are immutable and an orphan is E14's business). */
 int chunk_be_put_object(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
                         const chunk_geom *g, uint64_t epoch, const uint8_t *obj, unsigned posmask, uint64_t *sums_out);
 
@@ -252,6 +274,8 @@ enum { CHUNK_MUT_NONE = 0, CHUNK_MUT_NOSUMS, CHUNK_MUT_NOFENCE, CHUNK_MUT_EOF, C
 extern int chunk_mutant;
 /* Non-zero: chunk_read_range and chunk_obj_open do not log (a fuzz harness provokes the refusal by the million). */
 extern int chunk_log_quiet;
+/* Fault injection for tests: the nth following pread of the chunk files / the nth readdir fails with EIO (0: off). */
+extern int chunk_fault_read, chunk_fault_readdir;
 /* "Today's settings", used only by CHUNK_MUT_SETTINGS (a reader that takes k and m from them, not from the object). */
 extern unsigned chunk_settings_k, chunk_settings_m;
 

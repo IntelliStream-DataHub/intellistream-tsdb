@@ -30,6 +30,7 @@
 #endif
 
 int chunk_mutant;
+int chunk_fault_read, chunk_fault_readdir;
 int chunk_log_quiet;
 unsigned chunk_settings_k, chunk_settings_m;
 
@@ -39,7 +40,8 @@ bool chunk_geom_valid(const chunk_geom *g)
     if (g->k < 1 || g->k > CHUNK_K_MAX || g->m < 1 || g->m > CHUNK_M_MAX || g->cell < 1 || g->cell > CHUNK_CELL_LIMIT ||
         g->len < 1 || g->len > CHUNK_OBJ_MAX)
         return false;
-    return g->k <= (g->len + g->cell - 1) / g->cell;
+    uint64_t cells = (g->len + g->cell - 1) / g->cell;
+    return g->k <= cells && cells <= CHUNK_NCELLS_MAX;
 }
 
 int chunk_geom_make(chunk_geom *g, unsigned k, unsigned m, uint32_t cell, uint64_t len)

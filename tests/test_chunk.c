@@ -47,6 +47,8 @@ int main(void)
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -841,6 +843,13 @@ static void test_args_and_writer(void)
     CHECK(chunk_wr_commit(w) != 0);
     chunk_rd *rd = NULL;
     CHECK(chunk_rd_open(st, &id, &rd) == TSDB_ERR_NOTFOUND);
+    /* a cell refused for its sum poisons the writer: the cells that follow cannot make up a whole chunk without it */
+    CHECK(chunk_wr_open(st, &id, &f.g, 1, &w) == 0);
+    CHECK(chunk_wr_cell(w, cell, 50, true, xxh64(cell, 50, 0) ^ 1) == TSDB_ERR_CORRUPT);
+    for (int i = 0; i < 3; i++)
+        CHECK(chunk_wr_cell(w, cell, 50, false, 0) != 0);
+    CHECK(chunk_wr_commit(w) != 0);
+    CHECK(chunk_rd_open(st, &id, &rd) == TSDB_ERR_NOTFOUND);
     CHECK(chunk_wr_open(st, &id, &f.g, 1, &w) == 0);
     CHECK(chunk_wr_cell(w, cell, 50, true, xxh64(cell, 50, 0)) == 0);
     CHECK(chunk_wr_commit(w) == TSDB_ERR_INVALID); /* only one cell of three */
@@ -1083,6 +1092,8 @@ static void test_fences(void)
     uint8_t ids[3 * 16];
     for (int i = 0; i < 3; i++)
         memcpy(ids + 16 * i, chunk_store_id(chunk_be_store(f.be, i)), 16);
+    chunk_be_close(f.be); /* a store has one owner at a time */
+    f.be = NULL;
     chunk_backend *be2;
     CHECK(chunk_be_open(&be2, f.pp, 3, ids) == 0);
     chunk_be_close(be2);
@@ -1093,6 +1104,578 @@ static void test_fences(void)
     fx_free(&f);
     printf("  fences: a put or delete below the epoch refused, above it raises every store, a delete below the chunk's "
            "epoch refused, the maximum over the stores, store ids\n");
+}
+
+
+/* ---------------------------------------------------------------- review round: lock, unsure EPOCH, faults */
+static void test_store_lock(void)
+{
+    char dir[PATH_MAX + 32], sp[PATH_MAX + 64], cp[PATH_MAX + 64];
+    fresh("lock", dir, sizeof dir);
+    snprintf(sp, sizeof sp, "%s/a", dir);
+    snprintf(cp, sizeof cp, "%s/b", dir);
+    uint8_t id[16];
+    CHECK(chunk_store_init(sp, NULL, id) == 0);
+    chunk_store *s1 = NULL, *s2 = NULL;
+    CHECK(chunk_store_open(sp, id, &s1) == 0);
+    CHECK(chunk_store_raise(s1, 5, 5) == 0);
+    quiet(true);
+    CHECK(chunk_store_open(sp, id, &s2) == CHUNK_ERR_BUSY); /* a second owner would keep its own epoch and lower it */
+    const char *twice[2] = {sp, sp};
+    chunk_backend *be = NULL;
+    CHECK(chunk_be_open(&be, twice, 2, NULL) == CHUNK_ERR_BUSY || be == NULL);
+    quiet(false);
+    pid_t pid = fork(); /* another process, the same directory */
+    if (pid == 0) {
+        chunk_store *c = NULL;
+        quiet(true);
+        int rc = chunk_store_open(sp, id, &c);
+        _exit(rc == CHUNK_ERR_BUSY ? 0 : 1);
+    }
+    int st = -1;
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(chunk_store_epoch(s1, 5) == 5);
+    chunk_store_close(s1); /* the lock goes with the store */
+    CHECK(chunk_store_open(sp, id, &s2) == 0 && chunk_store_epoch(s2, 5) == 5);
+    chunk_store_close(s2);
+    /* a copy of a store is the same store id twice: refused by the backend */
+    sh("cp -r '%s' '%s'", sp, cp);
+    const char *two[2] = {sp, cp};
+    quiet(true);
+    CHECK(chunk_be_open(&be, two, 2, NULL) == TSDB_ERR_INVALID);
+    quiet(false);
+    printf("  stores: one owner at a time (same process and another), a copy of a store refused\n");
+}
+
+/* One EPOCH slot damaged: the epoch read may be lower than the fence this store held: refuse writers until the owner
+ * raises it (a torn store and rot look alike). */
+static void test_unsure_epoch(void)
+{
+    char dir[PATH_MAX + 32], sp[PATH_MAX + 64];
+    fresh("unsure", dir, sizeof dir);
+    snprintf(sp, sizeof sp, "%s/a", dir);
+    uint8_t id[16];
+    chunk_store *st = NULL;
+    CHECK(chunk_store_init(sp, NULL, id) == 0 && chunk_store_open(sp, id, &st) == 0);
+    CHECK(chunk_store_raise(st, 5, 5) == 0 && chunk_store_raise(st, 5, 9) == 0); /* slot 1 holds 5, slot 0 holds 9 */
+    chunk_store_close(st);
+    epoch_page_flip(sp, 5, 0);
+    quiet(true);
+    CHECK(chunk_store_open(sp, id, &st) == 0);
+    quiet(false);
+    CHECK(chunk_store_epoch(st, 5) == 5 && chunk_store_epoch_unsure(st, 5));
+    chunk_geom g;
+    CHECK(chunk_geom_make(&g, 2, 1, 16, 40) == 0);
+    chunk_ident ci = {.volume = 5, .pos = 0};
+    memset(ci.vuuid, 5, 16);
+    memset(ci.oid, 6, 16);
+    uint8_t cells[256]; /* the backend case below puts 3 cells of 32 bytes */
+    fill(cells, sizeof cells);
+    chunk_wr *w = NULL;
+    CHECK(chunk_store_put(st, &ci, &g, 3, cells, NULL) == CHUNK_ERR_FENCED); /* below what is known stays fenced */
+    CHECK(chunk_store_put(st, &ci, &g, 5, cells, NULL) == CHUNK_ERR_EPOCH_UNSURE);
+    CHECK(chunk_store_put(st, &ci, &g, 9, cells, NULL) == CHUNK_ERR_EPOCH_UNSURE); /* the lost fence may be 9 */
+    CHECK(chunk_store_put(st, &ci, &g, 100, cells, NULL) == CHUNK_ERR_EPOCH_UNSURE);
+    CHECK(chunk_wr_open(st, &ci, &g, 100, &w) == CHUNK_ERR_EPOCH_UNSURE);
+    CHECK(chunk_store_del(st, &ci, 100) == CHUNK_ERR_EPOCH_UNSURE);
+    CHECK(chunk_store_epoch(st, 5) == 5); /* a writer's epoch is not taken for the fence */
+    chunk_rd *rd = NULL;
+    CHECK(chunk_rd_open(st, &ci, &rd) == TSDB_ERR_NOTFOUND); /* reads go on */
+    CHECK(chunk_store_raise(st, 5, 9) == 0 && !chunk_store_epoch_unsure(st, 5) && chunk_store_epoch(st, 5) == 9);
+    CHECK(chunk_store_put(st, &ci, &g, 9, cells, NULL) == 0);
+    chunk_store_close(st);
+    CHECK(chunk_store_open(sp, id, &st) == 0 && chunk_store_epoch(st, 5) == 9 && !chunk_store_epoch_unsure(st, 5));
+    chunk_store_close(st);
+    /* the older slot damaged: the epoch read is right but cannot be told from the other case; raising to it clears */
+    epoch_page_flip(sp, 5, 1);
+    quiet(true);
+    CHECK(chunk_store_open(sp, id, &st) == 0);
+    quiet(false);
+    CHECK(chunk_store_epoch(st, 5) == 9 && chunk_store_epoch_unsure(st, 5));
+    CHECK(chunk_store_put(st, &ci, &g, 9, cells, NULL) == CHUNK_ERR_EPOCH_UNSURE);
+    CHECK(chunk_store_raise(st, 5, 9) == 0 && !chunk_store_epoch_unsure(st, 5));
+    chunk_store_close(st);
+    CHECK(chunk_store_open(sp, id, &st) == 0 && !chunk_store_epoch_unsure(st, 5)); /* the slot was rewritten */
+    chunk_store_close(st);
+
+    /* through the backend: a put at a higher epoch does not stand in for the lost fence; see_epoch does */
+    fx f;
+    fx_make(&f, "fx-unsure", 1, 2, 1, 32, 32 * 5, 4);
+    chunk_be_close(f.be);
+    f.be = NULL;
+    epoch_page_flip(f.paths[0], f.vol, 1); /* store epoch 4 sits in slot 1 (slot 0 holds the initial 0) */
+    quiet(true);
+    CHECK(chunk_be_open(&f.be, f.pp, 1, NULL) == 0);
+    quiet(false);
+    CHECK(chunk_be_epoch(f.be, f.vol) == 0);
+    chunk_ident id2 = {.volume = f.vol, .pos = 0};
+    memcpy(id2.vuuid, f.vuuid, 16);
+    chunk_random(id2.oid, 16);
+    CHECK(chunk_be_put(f.be, -1, &id2, &f.g, 7, cells, NULL) == CHUNK_ERR_EPOCH_UNSURE);
+    CHECK(chunk_be_put(f.be, -1, &id2, &f.g, 0, cells, NULL) == CHUNK_ERR_EPOCH_UNSURE);
+    CHECK(chunk_be_del(f.be, &id2, 7) == CHUNK_ERR_EPOCH_UNSURE);
+    CHECK(chunk_be_epoch(f.be, f.vol) == 0);
+    CHECK(chunk_be_see_epoch(f.be, f.vol, 4) == 0);
+    CHECK(chunk_be_put(f.be, -1, &id2, &f.g, 4, cells, NULL) == 0);
+    /* the older slot damaged: the fence is right (4) but unproven, and see_epoch at that very epoch makes it sure */
+    chunk_be_close(f.be);
+    f.be = NULL;
+    epoch_page_flip(f.paths[0], f.vol, 0);
+    quiet(true);
+    CHECK(chunk_be_open(&f.be, f.pp, 1, NULL) == 0);
+    quiet(false);
+    CHECK(chunk_be_epoch(f.be, f.vol) == 4);
+    CHECK(chunk_be_put(f.be, -1, &id2, &f.g, 4, cells, NULL) == CHUNK_ERR_EPOCH_UNSURE);
+    CHECK(chunk_be_see_epoch(f.be, f.vol, 4) == 0 && !chunk_store_epoch_unsure(chunk_be_store(f.be, 0), f.vol));
+    CHECK(chunk_be_put(f.be, -1, &id2, &f.g, 4, cells, NULL) == 0);
+    fx_free(&f);
+    printf("  a damaged EPOCH slot: puts and deletes refused until the epoch is raised (store and backend)\n");
+}
+
+static void test_readdir_faults(void)
+{
+    char dir[PATH_MAX + 32], sp[PATH_MAX + 64];
+    fresh("rdfault", dir, sizeof dir);
+    snprintf(sp, sizeof sp, "%s/a", dir);
+    uint8_t id[16];
+    chunk_store *st = NULL;
+    CHECK(chunk_store_init(sp, NULL, id) == 0 && chunk_store_open(sp, id, &st) == 0);
+    chunk_geom g;
+    CHECK(chunk_geom_make(&g, 2, 1, 16, 40) == 0);
+    chunk_ident ci = {.volume = 7, .pos = 0};
+    memset(ci.vuuid, 5, 16);
+    memset(ci.oid, 6, 16);
+    uint8_t cells[64];
+    fill(cells, sizeof cells);
+    CHECK(chunk_store_put(st, &ci, &g, 3, cells, NULL) == 0);
+    chunk_store_close(st);
+    char ep[PATH_MAX + 80], sv[PATH_MAX + 80];
+    snprintf(ep, sizeof ep, "%s/s7/EPOCH", sp);
+    snprintf(sv, sizeof sv, "%s/s7/EPOCH.saved", sp);
+    CHECK(rename(ep, sv) == 0);
+    /* chunks but no EPOCH: the open fails, wherever a readdir fails; a failing readdir must not make the volume look new */
+    quiet(true);
+    for (int n = 0; n <= 14; n++) {
+        chunk_fault_readdir = n;
+        int rc = chunk_store_open(sp, id, &st);
+        CHECK(rc != 0);
+        if (rc == 0)
+            chunk_store_close(st);
+    }
+    chunk_fault_readdir = 0;
+    quiet(false);
+    CHECK(rename(sv, ep) == 0);
+    quiet(true);
+    for (int n = 1; n <= 14; n++) { /* the open itself: a failing readdir is an error, not an empty store */
+        chunk_fault_readdir = n;
+        int rc = chunk_store_open(sp, id, &st);
+        bool fired = chunk_fault_readdir == 0;
+        chunk_fault_readdir = 0;
+        if (rc == 0) {
+            CHECK(!fired);
+            chunk_store_close(st);
+        } else
+            CHECK(fired && rc == TSDB_ERR_IO);
+    }
+    quiet(false);
+    CHECK(chunk_store_open(sp, id, &st) == 0);
+    for (int n = 1; n <= 6; n++) { /* the listing: also where the failing call is the one that would have ended it */
+        int listed = 0;
+        chunk_fault_readdir = n;
+        int rc = chunk_store_list(st, 7, false, count_listed, &listed);
+        bool fired = chunk_fault_readdir == 0;
+        chunk_fault_readdir = 0;
+        CHECK(fired ? rc == TSDB_ERR_IO : (rc == 0 && listed == 1));
+    }
+    chunk_store_close(st);
+    printf("  a failing readdir is an error (open, volume scan, list), never the end of the directory\n");
+}
+
+/* The file reader (rd_load), through chunk_rd_open and the listing: misdirected files, size, footer, the verify flag. */
+static int count_status(void *ctx, const chunk_listed *c)
+{
+    int *n = ctx;
+    *n += c->status == CHUNK_ST_OK ? 1 : 1000;
+    return 0;
+}
+
+static void test_file_reader(void)
+{
+    fx f;
+    fx_make(&f, "fx-rd", 1, 3, 1, 32, 32 * 7 + 5, 1);
+    chunk_store *st = chunk_be_store(f.be, 0);
+    chunk_ident id0 = {.volume = f.vol, .pos = 0};
+    memcpy(id0.vuuid, f.vuuid, 16);
+    memcpy(id0.oid, f.oid, 16);
+    char p0[PATH_MAX + 128], p1[PATH_MAX + 128], hex[33], other[PATH_MAX + 160];
+    fx_path(&f, 0, p0, sizeof p0);
+    fx_path(&f, 1, p1, sizeof p1);
+    size_t n0, n1;
+    uint8_t *b0 = slurp(p0, &n0), *b1 = slurp(p1, &n1);
+    chunk_rd *rd = NULL;
+    int listed;
+    CHECK(chunk_rd_open(st, &id0, &rd) == 0);
+    chunk_rd_close(rd);
+    /* another position's file under this name; another object's file under a name of this one's */
+    spit(p0, b1, n1);
+    CHECK(chunk_rd_open(st, &id0, &rd) == TSDB_ERR_CORRUPT);
+    listed = 0;
+    CHECK(chunk_store_list(st, f.vol, false, count_status, &listed) == 0 && listed == 1000 + 3);
+    spit(p0, b0, n0);
+    chunk_ident idx = id0;
+    chunk_random(idx.oid, 16);
+    chunk_oid_hex(idx.oid, hex);
+    snprintf(other, sizeof other, "%s/s%u/o%s.0.chunk", f.paths[0], f.vol, hex);
+    spit(other, b0, n0);
+    CHECK(chunk_rd_open(st, &idx, &rd) == TSDB_ERR_CORRUPT);
+    listed = 0;
+    CHECK(chunk_store_list(st, f.vol, false, count_status, &listed) == 0 && listed == 1000 + 4); /* its 4 and this one */
+    CHECK(unlink(other) == 0);
+    /* the volume uuid of the header */
+    chunk_ident idv = id0;
+    idv.vuuid[3] ^= 1;
+    CHECK(chunk_rd_open(st, &idv, &rd) == TSDB_ERR_CORRUPT);
+    /* a file one byte short or long is not the size its header says (not a short read, not a pass) */
+    spit(p0, b0, n0 - 1);
+    CHECK(chunk_rd_open(st, &id0, &rd) == TSDB_ERR_CORRUPT);
+    listed = 0;
+    CHECK(chunk_store_list(st, f.vol, false, count_status, &listed) == 0 && listed == 1000 + 3);
+    uint8_t *longer = malloc(n0 + 1);
+    memcpy(longer, b0, n0);
+    longer[n0] = 0;
+    spit(p0, longer, n0 + 1);
+    free(longer);
+    CHECK(chunk_rd_open(st, &id0, &rd) == TSDB_ERR_CORRUPT);
+    spit(p0, b0, n0);
+    /* the sums table and the footer: every byte, at open */
+    uint64_t body = CHUNK_HDR_BYTES + chunk_pos_len(&f.g, 0);
+    for (size_t i = body; i < n0; i++) {
+        b0[i] ^= 0x01;
+        spit(p0, b0, n0);
+        CHECK(chunk_rd_open(st, &id0, &rd) == TSDB_ERR_CORRUPT);
+        b0[i] ^= 0x01;
+    }
+    /* a damaged sums table: the verifying listing says so, the header-only one does not */
+    b0[body] ^= 0x01;
+    spit(p0, b0, n0);
+    listed = 0;
+    CHECK(chunk_store_list(st, f.vol, true, count_status, &listed) == 0 && listed == 1000 + 3);
+    listed = 0;
+    CHECK(chunk_store_list(st, f.vol, false, count_status, &listed) == 0 && listed == 3 + 1);
+    /* a damaged chunk and nothing else anywhere: the backend says damaged, not absent; a failed read says IO */
+    CHECK(chunk_be_rd_open(f.be, &id0, &rd) == TSDB_ERR_CORRUPT);
+    b0[body] ^= 0x01;
+    spit(p0, b0, n0);
+    chunk_fault_read = 1;
+    CHECK(chunk_be_rd_open(f.be, &id0, &rd) == TSDB_ERR_IO);
+    chunk_fault_read = 0;
+    /* a delete whose header cannot be read is an error, not a pass; one too short to hold a header may go */
+    chunk_fault_read = 1;
+    CHECK(chunk_store_del(st, &id0, 1) == TSDB_ERR_IO);
+    chunk_fault_read = 0;
+    CHECK(access(p0, F_OK) == 0);
+    spit(p0, b0, 10);
+    CHECK(chunk_store_del(st, &id0, 1) == 0 && access(p0, F_OK) != 0);
+    free(b0);
+    free(b1);
+    fx_free(&f);
+    printf("  the file reader: misdirected files, size, volume uuid, every footer byte, verify, EIO is not absent\n");
+}
+
+static void test_format_details(void)
+{
+    chunk_hdr h;
+    memset(&h, 0, sizeof h);
+    CHECK(chunk_geom_make(&h.g, 3, 2, 40, 40 * 7) == 0);
+    h.pos = 1;
+    h.chunk_len = chunk_pos_len(&h.g, 1);
+    uint8_t img[CHUNK_HDR_BYTES];
+    chunk_hdr_encode(&h, img);
+    chunk_hdr back;
+    CHECK(chunk_hdr_decode(img, &back) == 0);
+    /* version 1 says these bytes are zero (or the version): any other value is another format */
+    static const unsigned ranges[][2] = {{8, 12}, {12, 16}, {56, 64}, {70, 72}, {76, 80}};
+    for (size_t r = 0; r < sizeof ranges / sizeof ranges[0]; r++)
+        for (unsigned i = ranges[r][0]; i < ranges[r][1]; i++) {
+            uint8_t c[CHUNK_HDR_BYTES];
+            memcpy(c, img, sizeof c);
+            c[i] ^= 0x80;
+            CHECK(chunk_hdr_decode(c, &back) == TSDB_ERR_CORRUPT);
+        }
+    /* E7: the cell is rounded up to 4 KiB */
+    chunk_geom g;
+    CHECK(chunk_geom_derive(&g, 4, 2, 4 * 8 * 100000ull) == 0 && g.cell == 102400);
+    CHECK(chunk_geom_derive(&g, 4, 2, 4 * 8 * 65537ull) == 0 && g.cell == 69632);
+    /* a cell count the footer and a sums table can carry */
+    CHECK(chunk_geom_make(&g, 4, 2, 1, CHUNK_NCELLS_MAX) == 0);
+    CHECK(chunk_geom_make(&g, 4, 2, 1, CHUNK_NCELLS_MAX + 1) == TSDB_ERR_INVALID);
+    CHECK(chunk_geom_make(&g, 1, 1, 1, 1ull << 33) == TSDB_ERR_INVALID);
+    CHECK(chunk_geom_make(&g, 4, 2, 64 << 10, CHUNK_OBJ_MAX) == 0);
+    printf("  format details: reserved header bytes, E7 rounding, the cell count bound\n");
+}
+
+/* A writer's fence is checked when it opens, when it renames, and by a delete: each alone. */
+static void test_stale_writers(void)
+{
+    fx f;
+    fx_make(&f, "fx-stale", 1, 2, 1, 32, 32 * 5, 4);
+    chunk_store *st = chunk_be_store(f.be, 0);
+    chunk_ident idf = {.volume = f.vol, .pos = 0};
+    memcpy(idf.vuuid, f.vuuid, 16);
+    memcpy(idf.oid, f.oid, 16);
+    chunk_ident id2 = idf;
+    chunk_random(id2.oid, 16);
+    chunk_wr *w = NULL;
+    CHECK(chunk_wr_open(st, &id2, &f.g, 3, &w) == CHUNK_ERR_FENCED); /* at open */
+    uint8_t cell[32];
+    fill(cell, sizeof cell);
+    CHECK(chunk_wr_open(st, &id2, &f.g, 4, &w) == 0);
+    for (uint64_t i = 0; i < chunk_pos_cells(&f.g, 0); i++)
+        CHECK(chunk_wr_cell(w, cell, (size_t)chunk_pos_cell_len(&f.g, 0, i), false, 0) == 0);
+    CHECK(chunk_store_raise(st, f.vol, 6) == 0); /* another owner's epoch arrives while the chunk is written */
+    CHECK(chunk_wr_commit(w) == CHUNK_ERR_FENCED); /* at the rename */
+    chunk_rd *rd = NULL;
+    CHECK(chunk_rd_open(st, &id2, &rd) == TSDB_ERR_NOTFOUND);
+    char vdir[PATH_MAX + 160];
+    snprintf(vdir, sizeof vdir, "%s/s%u", f.paths[0], f.vol);
+    DIR *d = opendir(vdir);
+    int tmps = 0;
+    for (struct dirent *e; d && (e = readdir(d));)
+        tmps += strncmp(e->d_name, "tmp_", 4) == 0;
+    if (d)
+        closedir(d);
+    CHECK(tmps == 0);
+    /* a delete below the store's epoch, straight at the store: refused, the chunk stays */
+    CHECK(chunk_store_del(st, &idf, 5) == CHUNK_ERR_FENCED);
+    CHECK(chunk_rd_open(st, &idf, &rd) == 0);
+    chunk_rd_close(rd);
+    CHECK(chunk_store_del(st, &idf, 6) == 0);
+    fx_free(&f);
+    printf("  a stale writer is fenced at open, at the rename, and a stale delete at the store\n");
+}
+
+/* Chunks of another encoding, or of another geometry, under the names of this object's. */
+static void test_two_encodings(void)
+{
+    fx f;
+    fx_make(&f, "fx-enc2", 3, 4, 2, 32, 32 * 8, 1);
+    uint64_t *rec1 = malloc((chunk_sums_total(&f.g) + 1) * 8);
+    memcpy(rec1, f.rec, (chunk_sums_total(&f.g) + 1) * 8);
+    char path[CHUNK_POS_MAX][PATH_MAX + 128];
+    uint8_t *e1[CHUNK_POS_MAX];
+    size_t n1[CHUNK_POS_MAX];
+    for (unsigned p = 0; p < chunk_npos(&f.g); p++) {
+        fx_path(&f, p, path[p], sizeof path[p]);
+        e1[p] = slurp(path[p], &n1[p]);
+    }
+    /* the second encoding of the same oid (an overwrite of every chunk), then the parity chunk 4 goes back to the first */
+    uint8_t *obj2 = malloc(f.g.len);
+    fill(obj2, f.g.len);
+    uint64_t *rec2 = calloc(chunk_sums_total(&f.g) + 1, 8);
+    CHECK(chunk_be_put_object(f.be, f.vol, f.vuuid, f.oid, &f.g, 2, obj2, ~0u, rec2) == 0);
+    spit(path[4], e1[4], n1[4]);
+    /* a record that agrees with chunk 4's own sums (so the chunk passes) but is the second encoding elsewhere */
+    uint64_t *rec = malloc((chunk_sums_total(&f.g) + 1) * 8);
+    memcpy(rec, rec2, (chunk_sums_total(&f.g) + 1) * 8);
+    for (uint64_t i = 0; i < chunk_pos_cells(&f.g, 4); i++)
+        rec[chunk_sums_base(&f.g, 4) + i] = rec1[chunk_sums_base(&f.g, 4) + i];
+    CHECK(unlink(path[0]) == 0 && unlink(path[5]) == 0); /* position 0 must be rebuilt from parity 4 and the data of 2 */
+    chunk_obj *o = NULL;
+    CHECK(chunk_obj_open(f.be, f.vol, f.vuuid, f.oid, NULL, rec, &o) == 0);
+    uint8_t *buf = malloc(f.g.len);
+    quiet(true);
+    CHECK(chunk_obj_read(o, 0, f.g.len, buf, 0, NULL) == TSDB_ERR_CORRUPT); /* rebuilt cells fail the record: never wrong bytes */
+    quiet(false);
+    chunk_obj_close(o);
+    /* chunks of another geometry: erasures, the object reads exactly from the others */
+    for (unsigned p = 0; p < chunk_npos(&f.g); p++)
+        spit(path[p], e1[p], n1[p]);
+    chunk_geom g2; /* 2+4: its position 2 is a parity chunk of the same shape as a data chunk, with sums of its own */
+    CHECK(chunk_geom_make(&g2, 2, 4, 32, 32 * 8) == 0);
+    uint8_t *objg = malloc(g2.len);
+    fill(objg, g2.len);
+    CHECK(chunk_be_put_object(f.be, f.vol, f.vuuid, f.oid, &g2, 3, objg, ~0u, NULL) == 0);
+    size_t ng;
+    uint8_t *bg = slurp(path[2], &ng);
+    for (unsigned p = 0; p < chunk_npos(&f.g); p++)
+        spit(path[p], e1[p], n1[p]);
+    spit(path[2], bg, ng);
+    for (int expect = 0; expect < 2; expect++) {
+        chunk_report rep;
+        /* no record's sums: the chunk's own table passes its cells, so the header's geometry is the only guard */
+        CHECK(chunk_obj_open(f.be, f.vol, f.vuuid, f.oid, expect ? &f.g : NULL, NULL, &o) == 0);
+        CHECK(chunk_obj_read(o, 0, f.g.len, buf, 0, &rep) == 0 && memcmp(buf, f.obj, f.g.len) == 0);
+        CHECK(rep.decoded_cells > 0);
+        chunk_obj_close(o);
+    }
+    free(bg);
+    free(objg);
+    free(buf);
+    free(rec);
+    free(rec1);
+    free(rec2);
+    free(obj2);
+    for (unsigned p = 0; p < chunk_npos(&f.g); p++)
+        free(e1[p]);
+    fx_free(&f);
+    printf("  chunks of another encoding (caught after the rebuild) or another geometry are not this object's\n");
+}
+
+static void test_degraded_backend(void)
+{
+    fx f;
+    fx_make(&f, "fx-down", 3, 4, 2, 32, 32 * 8, 2);
+    chunk_be_close(f.be);
+    f.be = NULL;
+    const char *pp[3] = {f.paths[0], NULL, f.paths[2]}; /* store 1 is a lost disk: its place stays */
+    CHECK(chunk_be_open(&f.be, pp, 3, NULL) == 0);
+    CHECK(chunk_be_nstores(f.be) == 3 && chunk_be_store(f.be, 1) == NULL && chunk_be_epoch(f.be, f.vol) == 2);
+    chunk_ident id = {.volume = f.vol, .pos = 0};
+    memcpy(id.vuuid, f.vuuid, 16);
+    chunk_random(id.oid, 16);
+    uint8_t cells[256];
+    fill(cells, sizeof cells);
+    CHECK(chunk_be_put(f.be, 1, &id, &f.g, 2, cells, NULL) == TSDB_ERR_UNAVAILABLE);
+    CHECK(chunk_be_put(f.be, 2, &id, &f.g, 2, cells, NULL) == 0);
+    CHECK(chunk_be_see_epoch(f.be, f.vol, 3) == 0 && chunk_store_epoch(chunk_be_store(f.be, 0), f.vol) == 3);
+    chunk_rd *rd = NULL;
+    CHECK(chunk_be_rd_open(f.be, &id, &rd) == 0);
+    chunk_rd_close(rd);
+    int listed = 0;
+    CHECK(chunk_be_list(f.be, f.vol, true, count_status, &listed) == 0 && listed > 0 && listed < 1000);
+    CHECK(chunk_be_del(f.be, &id, 3) == 0);
+    /* an object with the lost disk's chunks missing still reads (6 positions, 2 stores left: 4 of them there) */
+    chunk_obj *o = NULL;
+    CHECK(chunk_obj_open(f.be, f.vol, f.vuuid, f.oid, NULL, f.rec, &o) == 0);
+    chunk_obj_close(o);
+    chunk_be_close(f.be);
+    f.be = NULL;
+    /* a store that is named must open: a missing one is not dropped quietly */
+    char gone[PATH_MAX + 64];
+    snprintf(gone, sizeof gone, "%s/nowhere", f.dir);
+    const char *pq[3] = {f.paths[0], gone, f.paths[2]};
+    CHECK(chunk_be_open(&f.be, pq, 3, NULL) == TSDB_ERR_NOTFOUND);
+    f.be = NULL;
+    CHECK(chunk_be_open(&f.be, f.pp, 3, NULL) == 0);
+    fx_free(&f);
+    printf("  a backend opened with a store down: placement keeps its index, puts there are UNAVAILABLE, a named store must open\n");
+}
+
+/* Writers at epoch 1 against a raise to 2 and a lister: a commit that starts after the raise returned never succeeds,
+ * and what is visible at the end is exactly what was acknowledged (and run under tsan, which the rest cannot). */
+#define TW_WRITERS 4
+typedef struct tw {
+    chunk_store *st;
+    chunk_geom g;
+    uint8_t vuuid[16];
+    atomic_int raised, stop;
+    atomic_long acked, fenced, violations, done;
+    int per_writer;
+} tw;
+
+static void *tw_writer(void *arg)
+{
+    tw *t = arg;
+    uint8_t cell[32];
+    memset(cell, 0x5a, sizeof cell);
+    unsigned seed = (unsigned)(uintptr_t)&cell; /* the shared rnd() is not thread safe */
+    for (int i = 0; i < t->per_writer && !atomic_load(&t->stop); i++) {
+        chunk_ident id = {.volume = 1, .pos = 0};
+        memcpy(id.vuuid, t->vuuid, 16);
+        chunk_random(id.oid, 16);
+        chunk_wr *w = NULL;
+        int before_open = atomic_load(&t->raised);
+        int rc = chunk_wr_open(t->st, &id, &t->g, 1, &w);
+        if (rc == 0) {
+            if (before_open)
+                atomic_fetch_add(&t->violations, 1); /* opened at 1 after 2 was acknowledged */
+            for (uint64_t c = 0; c < chunk_pos_cells(&t->g, 0) && rc == 0; c++)
+                rc = chunk_wr_cell(w, cell, (size_t)chunk_pos_cell_len(&t->g, 0, c), false, 0);
+            if (rc == 0 && (i & 1))
+                usleep(100 + (seed = seed * 1103515245u + 12345u) / 65536 % 256); /* the raise lands between the open and the rename */
+            int before_commit = atomic_load(&t->raised);
+            rc = rc == 0 ? chunk_wr_commit(w) : (chunk_wr_abort(w), rc);
+            if (rc == 0) {
+                atomic_fetch_add(&t->acked, 1);
+                if (before_commit)
+                    atomic_fetch_add(&t->violations, 1); /* a rename after the raise returned was acknowledged */
+            } else if (rc == CHUNK_ERR_FENCED)
+                atomic_fetch_add(&t->fenced, 1);
+        } else if (rc == CHUNK_ERR_FENCED)
+            atomic_fetch_add(&t->fenced, 1);
+        atomic_fetch_add(&t->done, 1);
+    }
+    return NULL;
+}
+
+static void *tw_raiser(void *arg)
+{
+    tw *t = arg;
+    while (atomic_load(&t->done) < 3 * t->per_writer / 2 && !atomic_load(&t->stop))
+        usleep(200);
+    if (chunk_store_raise(t->st, 1, 2) == 0)
+        atomic_store(&t->raised, 1);
+    return NULL;
+}
+
+static int tw_list(void *ctx, const chunk_listed *c)
+{
+    tw *t = ctx;
+    if (c->status != CHUNK_ST_OK || c->epoch != 1)
+        atomic_fetch_add(&t->violations, 1);
+    return 0;
+}
+
+static void *tw_lister(void *arg)
+{
+    tw *t = arg;
+    while (!atomic_load(&t->stop)) {
+        if (chunk_store_list(t->st, 1, true, tw_list, t) != 0)
+            atomic_fetch_add(&t->violations, 1);
+        (void)chunk_store_epoch(t->st, 1);
+        usleep(500);
+    }
+    return NULL;
+}
+
+static int tw_count(void *ctx, const chunk_listed *c)
+{
+    (void)c;
+    ++*(long *)ctx;
+    return 0;
+}
+
+static void test_threads(void)
+{
+    char dir[PATH_MAX + 32], sp[PATH_MAX + 64];
+    fresh("threads", dir, sizeof dir);
+    snprintf(sp, sizeof sp, "%s/a", dir);
+    tw *t = calloc(1, sizeof *t);
+    CHECK(chunk_store_init(sp, NULL, NULL) == 0 && chunk_store_open(sp, NULL, &t->st) == 0);
+    CHECK(chunk_geom_make(&t->g, 2, 1, 32, 64) == 0);
+    memset(t->vuuid, 9, 16);
+    t->per_writer = quick ? 60 : 150;
+    pthread_t wt[TW_WRITERS], rt, lt;
+    CHECK(chunk_store_raise(t->st, 1, 1) == 0);
+    for (int i = 0; i < TW_WRITERS; i++)
+        CHECK(pthread_create(&wt[i], NULL, tw_writer, t) == 0);
+    CHECK(pthread_create(&rt, NULL, tw_raiser, t) == 0);
+    CHECK(pthread_create(&lt, NULL, tw_lister, t) == 0);
+    for (int i = 0; i < TW_WRITERS; i++)
+        pthread_join(wt[i], NULL);
+    atomic_store(&t->stop, 1);
+    pthread_join(rt, NULL);
+    pthread_join(lt, NULL);
+    long visible = 0;
+    CHECK(chunk_store_list(t->st, 1, true, tw_count, &visible) == 0);
+    CHECK(atomic_load(&t->raised) == 1 && chunk_store_epoch(t->st, 1) == 2);
+    CHECK(atomic_load(&t->violations) == 0);
+    CHECK(visible == atomic_load(&t->acked)); /* nothing acknowledged is missing, nothing refused is visible */
+    CHECK(atomic_load(&t->fenced) > 0 && atomic_load(&t->acked) > 0);
+    chunk_store_close(t->st);
+    free(t);
+    printf("  threads: %d writers against a raise and a lister: fenced at the instant of the rename, nothing half-visible\n",
+           TW_WRITERS);
 }
 
 /* ---------------------------------------------------------------- power loss and I/O errors (crashfs) */
@@ -1135,8 +1718,20 @@ static void wl_make(wl *w)
 /* The workload: epoch 3, object 0 at epoch 3, epoch 5, object 1 at epoch 5, delete object 0 at epoch 5. Every
  * acknowledged step goes to the ack file, which is outside the shim's root. With a single store (eio) the child also
  * checks that nothing succeeds once the store reports it failed. */
+static int child_init(const char *dir, const char *ackf)
+{
+    char p[PATH_MAX + 96];
+    snprintf(p, sizeof p, "%s/st0", dir);
+    if (chunk_store_init(p, NULL, NULL) != 0)
+        return 2;
+    ack(ackf, "I 0"); /* acknowledged: the store must exist after any power loss */
+    return 0;
+}
+
 static int child_workload(const char *dir, const char *ackf, int nstores)
 {
+    if (nstores < 0)
+        return child_init(dir, ackf);
     char p[2][PATH_MAX + 96];
     const char *pp[2] = {p[0], p[1]};
     for (int i = 0; i < nstores; i++)
@@ -1261,6 +1856,12 @@ static void check_after(const char *dir, const char *ackf, int nstores, int k, c
                 chunk_be_epoch(be, 1), max_e);
         CHECK(false);
     }
+    for (int i = 0; i < nstores; i++) /* every store, not the maximum over them: one going back is masked there */
+        if (chunk_store_epoch(chunk_be_store(be, i), 1) < max_e) {
+            fprintf(stderr, "  %s step %d: store %d has EPOCH %" PRIu64 " after an acknowledged %" PRIu64 "\n", what, k, i,
+                    chunk_store_epoch(chunk_be_store(be, i), 1), max_e);
+            CHECK(false);
+        }
     for (int o = 0; o < 2; o++)
         for (unsigned pos = 0; pos < chunk_npos(&w.g); pos++) {
             chunk_ident id = {.volume = 1, .pos = (uint16_t)pos};
@@ -1348,12 +1949,54 @@ static void sweep(const char *mode, int nstores, int stride)
            steps, nstores, nstores == 1 ? "" : "s");
 }
 
+/* chunk_store_init under power loss: once it returned, the store (its directory, its META) survives. */
+static void sweep_init(int stride)
+{
+    char dir[PATH_MAX + 32], ackf[PATH_MAX + 32];
+    snprintf(ackf, sizeof ackf, "%s/init.ack", S);
+    int steps = 0, crashes = 0, extra = 0;
+    bool finished = false;
+    /* a finished child still loses power right after it exits (crashfs's at-exit loss keeps a random subset of the
+       directory operations nobody synced), so once past the last step the run goes on with other seeds */
+    for (int k = 0, last = -1; k < 400 && extra < (quick ? 12 : 40); k += (finished ? 0 : stride)) {
+        fresh("init", dir, sizeof dir);
+        unlink(ackf);
+        int code = run_child(dir, ackf, "power", finished ? last : k, k + 1 + extra * 7, -1);
+        if (finished)
+            extra++;
+        CHECK(code == 0 || code == 99);
+        if (code != 0 && code != 99)
+            break;
+        crashes += code == 99;
+        bool acked = count_lines(ackf) > 0;
+        char sp[PATH_MAX + 64];
+        snprintf(sp, sizeof sp, "%s/st0", dir);
+        chunk_store *st = NULL;
+        int rc = chunk_store_open(sp, NULL, &st);
+        if (acked && rc != 0) {
+            fprintf(stderr, "  init step %d: the store was acknowledged but does not open (%d)\n", k, rc);
+            CHECK(false);
+            break;
+        }
+        if (rc == 0)
+            chunk_store_close(st);
+        steps++;
+        if (code == 0 && !finished) {
+            finished = true;
+            last = k;
+        }
+    }
+    CHECK(finished && crashes > 3);
+    printf("  init: %d fault points in chunk_store_init, an acknowledged store always opens\n", steps);
+}
+
 static void test_crashfs(void)
 {
     if (access(SHIM, R_OK) != 0) {
         printf("  power loss: skipped (no %s)\n", SHIM);
         return;
     }
+    sweep_init(1);
     sweep("power", 2, quick ? 4 : 1);
     sweep("eio", 1, quick ? 3 : 1);
 }
@@ -1428,6 +2071,15 @@ int main(int argc, char **argv)
     test_args_and_writer();
     test_stores();
     test_fences();
+    test_store_lock();
+    test_unsure_epoch();
+    test_readdir_faults();
+    test_file_reader();
+    test_format_details();
+    test_stale_writers();
+    test_two_encodings();
+    test_degraded_backend();
+    test_threads();
     test_crashfs();
     if (failures) {
         fprintf(stderr, "test_chunk: %d check(s) failed (scratch %s)\n", failures, S);

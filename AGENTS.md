@@ -187,7 +187,12 @@ cgroup, so `nice` does not keep your work out of its way.
   removed at open): one that a failed write or sync left may have had its pages dropped. A put or delete below a volume's
   EPOCH (two checksummed slots, FNO's scheme, fail-stop) is refused; a failed directory fsync after a name appeared or
   went, or any failed EPOCH write or sync, fails the store (`chunk_store_failed`: it acknowledges nothing more, reads
-  go on). `tests/test_chunk.c` (exhaustive damage patterns for every geometry, power loss and EIO under crashfs, mutants
+  go on). A store directory has one owner: `chunk_store_open` takes a `flock` (a second open is `CHUNK_ERR_BUSY`),
+  because two owners would each keep their own epoch and one would write it back lower. A volume with one damaged EPOCH
+  slot opens "unsure" (a torn store and rot look alike): puts and deletes are refused (`CHUNK_ERR_EPOCH_UNSURE`) until
+  `chunk_store_raise` / `chunk_be_see_epoch` is given the epoch the metadata group holds; a writer's own epoch never
+  stands in for the lost fence. A readdir error is an error, never the end of a directory. `chunk_be_open` takes a NULL
+  path for a store known to be down (its index stays; named stores must open). `tests/test_chunk.c` (exhaustive damage patterns for every geometry, power loss and EIO under crashfs, mutants
   via `--mutant nosums|nofence|eof|settings|nosync|epochnosync`), `tests/fuzz/fuzz_chunk.c`, `tests/fuzz/fuzz_ec.c`.
   The embedded bindings copy `src/*.c`: the files build without `TSDB_EC` (`chunk_encode` then says `TSDB_ERR_INVALID`).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs

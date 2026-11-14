@@ -19,4 +19,7 @@ int chunk_wr_cell_trusted(chunk_wr *w, const void *data, size_t len, uint64_t su
 /* The volumes a store has an EPOCH for (malloc'ed, caller frees), with their epochs. */
 int chunk_store_volumes(chunk_store *st, uint32_t **vols, uint64_t **epochs, size_t *n);
 
+/* True while the volume's EPOCH lost a slot at open and has not been raised since (puts and deletes are refused). */
+bool chunk_store_epoch_unsure(chunk_store *st, uint32_t volume);
+
 #endif
