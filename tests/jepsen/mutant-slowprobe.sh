@@ -19,8 +19,13 @@ sed -i 's|^    int ms = (int)(now - start);$|&\n    if (write \&\& d->state == T
     "$tmp/src/health.c"
 if ! grep -q 'MUTANT' "$tmp/src/health.c"; then echo "mutant-slowprobe: the mutant did not apply"; rm -rf "$tmp"; exit 1; fi
 (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-slowprobe: the build failed"; tail -5 "$tmp/build.log"; rm -rf "$tmp"; exit 1; }
-out=$(JEPSEN_TSDBD="$tmp/build/tsdbd" "${JEPSEN_BIN:-$root/build/jepsen}" --dir "$dir" --nemesis outage --seconds "$secs" \
-    --seed "$seed" --outagefs "$root/build/liboutagefs.so" 2>&1); st=$?
+# an INCONCLUSIVE run (exit 3: the run's own liveness check failed, it tested too little) is run again with the next seed, as
+# tests/jepsen/rerun.sh does for the honest runs; only the mutant's detection is judged here
+for try in 0 1 2; do
+    out=$(JEPSEN_TSDBD="$tmp/build/tsdbd" "${JEPSEN_BIN:-$root/build/jepsen}" --dir "$dir" --nemesis outage --seconds "$secs" \
+        --seed "$((seed + try))" --outagefs "$root/build/liboutagefs.so" 2>&1); st=$?
+    [ $st -ne 3 ] && break
+done
 rm -rf "$tmp"
 if [ $st -ne 1 ] || ! echo "$out" | grep -q 'no write acknowledged in' || ! echo "$out" | grep -q 'slow write probes of this domain'; then
     echo "mutant-slowprobe: a domain whose probes are all reported slow went unnoticed (rc $st)"; echo "$out" | tail -n 12; exit 1

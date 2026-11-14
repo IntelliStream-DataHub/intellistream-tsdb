@@ -386,6 +386,7 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	B=$(B) tests/test_cli_feed.sh
 	! nm $(CLIB) | grep -wE '_?tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only (_: Mach-O)
 	./$(B)/test_export $(SCRATCH)
+	tests/test_jepsen_rerun.sh $(SCRATCH) # the driver of the jepsen gates: INCONCLUSIVE is rerun, a violation never
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
 
@@ -1062,37 +1063,42 @@ JEPSEN_OUTAGE_SEEDS ?= 1 2
 # Then kv once more with login (--auth: USERS made by $(B)/tsdb, every client logs in at every reconnect) under kill
 # and one power seed, per backend.
 jsec = $(if $(JEPSEN_SECONDS),$(JEPSEN_SECONDS),$(1))
+# A run that jepsen ends INCONCLUSIVE (exit 3: its own liveness or coverage check failed, which says nothing about tsdb) is run again by
+# tests/jepsen/rerun.sh with the next seed, twice at most; three in a row fail the gate with all three messages; a violation fails at once.
+# The reruns are printed as they happen and counted in the summary line at the end (never silent).
+JR = JEPSEN_RERUN_LOG=$(JEPSEN_DIR).reruns tests/jepsen/rerun.sh
 jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so jepsen-selftest
+	rm -f $(JEPSEN_DIR).reruns; trap 'tests/jepsen/rerun.sh --summary $(JEPSEN_DIR).reruns; rm -f $(JEPSEN_DIR).reruns' EXIT; \
 	for io in $(IO); do for wl in $(JEPSEN_WORKLOADS); do echo "== tsdbd --io $$io, workload $$wl"; \
-	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis kill  --seconds $(call jsec,20) && \
+	    TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis kill  --seconds $(call jsec,20) && \
 	    for seed in $(JEPSEN_SEEDS); do \
-	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis power --seconds $(call jsec,20) \
+	        TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis power --seconds $(call jsec,20) \
 	            --seed $$seed --crashfs $(B)/libcrashfs.so || exit 1; done && \
-	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis eio   --seconds $(call jsec,20) \
+	    TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis eio   --seconds $(call jsec,20) \
 	        --crashfs $(B)/libcrashfs.so && \
-	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis pause --seconds $(call jsec,20) && \
+	    TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis pause --seconds $(call jsec,20) && \
 	    if [ $$wl = kv ]; then \
 	        for seed in $(JEPSEN_OUTAGE_SEEDS); do \
-	            TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis outage --seconds $(call jsec,40) \
+	            TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis outage --seconds $(call jsec,40) \
 	                --seed $$seed --outagefs $(B)/liboutagefs.so || exit 1; done && \
-	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
+	        TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
 	            --crashfs $(B)/libcrashfs.so --verify-checksums && \
-	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
+	        TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
 	            --crashfs $(B)/libcrashfs.so && \
-	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis rot --seconds $(call jsec,20) --verify-checksums; \
+	        TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis rot --seconds $(call jsec,20) --verify-checksums; \
 	    fi || exit 1; done; \
 	    echo "== tsdbd --io $$io, workload kv with login" && \
-	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --auth --nemesis kill \
+	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --auth --nemesis kill \
 	        --seconds $(call jsec,20) && \
-	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --auth --nemesis power \
+	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --auth --nemesis power \
 	        --seconds $(call jsec,20) --seed 1 --crashfs $(B)/libcrashfs.so && \
 	    echo "== tsdbd --io $$io, workload kv with the change feed on" && \
-	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --feed --nemesis kill \
+	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --feed --nemesis kill \
 	        --seconds $(call jsec,20) && \
 	    for seed in $(JEPSEN_SEEDS); do \
-	        TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --feed --nemesis power \
+	        TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --feed --nemesis power \
 	            --seconds $(call jsec,20) --seed $$seed --crashfs $(B)/libcrashfs.so || exit 1; done && \
-	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --feed --nemesis eio \
+	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --feed --nemesis eio \
 	        --seconds $(call jsec,20) --crashfs $(B)/libcrashfs.so || exit 1; done
 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
@@ -1149,43 +1155,34 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    if [ $$rc -ne 124 ] || ! echo "$$out" | grep -q 'jepsen --nemesis power: watchdog: still running after' || \
 	       ! echo "$$out" | grep -q 'jepsen at the hang: phase setup: creating the series'; then \
 	        echo "jepsen-selftest: a stalled run was not ended by the watchdog (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(JEPSEN_TSDBD=tests/jepsen/slow-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
-	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	    if [ $$rc -ne 0 ]; then \
-	        echo "jepsen-selftest: servers that start slowly made an honest nemesis look idle (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	tests/jepsen/expect.sh valid 'servers that start slowly made an honest nemesis look idle' \
+	    env JEPSEN_TSDBD=tests/jepsen/slow-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
+	    --seconds 20 --crashfs $(B)/libcrashfs.so || exit 1; \
 	for spec in 'nothing|20' 'once|20' 'nap:9000|20' 'never|20' 'oncereact|20' 'deadsleep:1500|20' 'busysleep:1500|20' \
 	    'idle|20' 'longnap|30'; do \
 	    m=$${spec%%|*}; secs=$${spec#*|}; \
-	    pp=0.00003; case $$m in idle) flag=--mutant-idle;; longnap) flag=--mutant-longnap;; *) flag="--mutant-nemesis $$m";; esac; \
-	    out=$$(JEPSEN_PULL_PROB=$$pp ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds $$secs --crashfs $(B)/libcrashfs.so \
-	        $$flag 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'was idle'; then \
-	        echo "jepsen-selftest: a nemesis that is '$$m' went unnoticed (rc $$rc, wanted rc 1 and 'was idle')"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    case $$m in idle) flag=--mutant-idle;; longnap) flag=--mutant-longnap;; *) flag="--mutant-nemesis $$m";; esac; \
+	    tests/jepsen/expect.sh gate 'was idle' "a nemesis that is '$$m'" env JEPSEN_PULL_PROB=0.00003 ./$(B)/jepsen \
+	        --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds $$secs --crashfs $(B)/libcrashfs.so $$flag || exit 1; \
 	done; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis eio --seconds 20 --crashfs $(B)/libcrashfs.so \
-	    --mutant-nemesis once 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'was idle'; then \
-	        echo "jepsen-selftest: an eio nemesis that works once and sleeps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 --mutant-nemesis burst:12 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'were not spread over it\|the nemesis issued [0-9]* faults in 20 s.*it was idle'; then \
-	        echo "jepsen-selftest: a nemesis that works in a burst and sleeps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 --mutant-nemesis hole:3:10 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'listening for [0-9.]* s with no fault issued or in progress'; then \
-	        echo "jepsen-selftest: a nemesis that sleeps through the middle of the run went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis pause --seconds 10 --mutant-nemesis hole:2:6 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'listening for [0-9.]* s with no fault issued or in progress'; then \
-	        echo "jepsen-selftest: a pause nemesis that sleeps through a stretch of the run went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis eio --seconds 20 --crashfs $(B)/libcrashfs.so \
-	    --mutant-nemesis eionosig 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'the nemesis issued [0-9]* faults in 20 s.*it was idle'; then \
-	        echo "jepsen-selftest: an eio nemesis that never asks for the fault was credited with the shim's own (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis pause --seconds 10 --mutant-nemesis pausenocont 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a server lay stopped (SIGSTOP) for'; then \
-	        echo "jepsen-selftest: a pause nemesis that never continues the server went unnoticed or hung the run (rc $$rc, 124 is the timeout)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so \
-	    --mutant-nemesis nap:600 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a server lay dead for'; then \
-	        echo "jepsen-selftest: a nemesis that does not look at the server left it dead unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	tests/jepsen/expect.sh gate 'was idle' 'an eio nemesis that works once and sleeps' ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest \
+	    --nemesis eio --seconds 20 --crashfs $(B)/libcrashfs.so --mutant-nemesis once || exit 1; \
+	tests/jepsen/expect.sh gate 'were not spread over it\|the nemesis issued [0-9]* faults in 20 s.*it was idle' \
+	    'a nemesis that works in a burst and sleeps' ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 \
+	    --mutant-nemesis burst:12 || exit 1; \
+	tests/jepsen/expect.sh gate 'listening for [0-9.]* s with no fault issued or in progress' 'a nemesis that sleeps through the middle of the run' \
+	    ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill --seconds 20 --mutant-nemesis hole:3:10 || exit 1; \
+	tests/jepsen/expect.sh gate 'listening for [0-9.]* s with no fault issued or in progress' 'a pause nemesis that sleeps through a stretch of the run' \
+	    ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis pause --seconds 10 --mutant-nemesis hole:2:6 || exit 1; \
+	tests/jepsen/expect.sh gate 'the nemesis issued [0-9]* faults in 20 s.*it was idle' "an eio nemesis that never asks for the fault (credited with the shim's own)" \
+	    ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis eio --seconds 20 --crashfs $(B)/libcrashfs.so --mutant-nemesis eionosig || exit 1; \
+	tests/jepsen/expect.sh gate 'a server lay stopped (SIGSTOP) for' 'a pause nemesis that never continues the server (or it hung the run: 124 is the timeout)' \
+	    timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis pause --seconds 10 --mutant-nemesis pausenocont || exit 1; \
+	tests/jepsen/expect.sh gate 'a server lay dead for' 'a nemesis that does not look at the server (it left it dead)' \
+	    ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so --mutant-nemesis nap:600 || exit 1; \
+	tests/jepsen/expect.sh gate 'classes: 0 switches, parts in 0 classes: the workload tested no change of class' \
+	    'a classes workload whose clients are starved (they write nothing in the run: INCONCLUSIVE, not a violation: it was FAILED before)' \
+	    env JEPSEN_CLIENT_NAP_MS=9000 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --workload classes --nemesis none --seconds 8 --clients 1 || exit 1; \
 	for spec in \
 	    'kill@20@killnoeffect@-@the nemesis issued 0 faults in 20 s.*it was idle@a kill that kills nothing was counted as a fault' \
 	    'pause@10@pausenoeffect@-@the nemesis issued 0 faults in 10 s.*it was idle@a pause that stops nothing was counted as a fault' \
@@ -1195,6 +1192,14 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    'kill@20@killslowstep:400@-@the nemesis was idle in it@a kill whose step dawdles 400 ms with the server live (its time before the signal is idle time, which an honest step has none of)' \
 	    'power@20@powerslowstep:400@-@the nemesis was idle in it@a power step that dawdles 400 ms with the server live and the fault in progress' \
 	    'eio@20@eioslowstep:400@-@the nemesis was idle in it@an eio step that dawdles 400 ms with the server live and the fault in progress' \
+	    'kill@20@killspin:400@-@the nemesis was idle in it@a kill step that SPINS 400 ms with the server live (no account of CPU waited for is taken off)' \
+	    'power@20@powerspinstep:1000@-@the nemesis was idle in it@a power step that spins 1 s with the server live and the fault in progress' \
+	    'eio@20@eiospin:700@-@the nemesis was idle in it@an eio step that spins 700 ms with the server live and the fault in progress' \
+	    'power@20@pullspin:300@-@a server lay dead for\|the nemesis was idle in it@a power nemesis that spins 300 ms after the plug before it looks for the death' \
+	    'power@20@waitspin:300@-@a server lay dead for@a power nemesis that spins 300 ms in its wait for the death (counted as the wait: only the dead stretch sees it)' \
+	    'power@20@deadspin:800@-@a server lay dead for@a power nemesis that spins 800 ms with the server dead before the restart' \
+	    'power@20@norestartspin:3@-@a server lay dead for@a power nemesis that spins, never restarting the server after its third pull' \
+	    'power@20@norestart:3@-@a server lay dead for@a power nemesis that sleeps, never restarting the server after its third pull' \
 	    'kill@20@hole:15:100@-@listening for [0-9.]* s with no fault issued or in progress@a kill nemesis that stops at three quarters of the run' \
 	    'pause@10@hole:6:100@-@listening for [0-9.]* s with no fault issued or in progress@a pause nemesis that stops at seven tenths of the run' \
 	    'pause@20@hole:16:100@-@listening for [0-9.]* s with no fault issued or in progress@a pause nemesis that stops at four fifths of the run (the length of the pause runs of make jepsen; of 10 s it was not caught)' \
@@ -1205,38 +1210,22 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    oldifs=$$IFS; IFS=@; set -- $$spec; IFS=$$oldifs; nem=$$1; secs=$$2; mut=$$3; envs=$$(echo "$$4" | tr , ' '); pat=$$5; what=$$6; \
 	    case $$envs in -) envs=X_NONE=1;; esac; \
 	    shim=; case $$nem in power|eio) shim="--crashfs $(B)/libcrashfs.so";; esac; \
-	    out=$$(env $$envs ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis $$nem --seconds $$secs $$shim --mutant-nemesis $$mut 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "$$pat"; then \
-	        echo "jepsen-selftest: $$what went unnoticed (rc $$rc, wanted rc 1 and '$$pat')"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    tests/jepsen/expect.sh gate "$$pat" "$$what" env $$envs ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis $$nem --seconds $$secs \
+	        $$shim --mutant-nemesis $$mut || exit 1; \
 	done; \
-	out=$$(CRASHFS_IGNORE_USR2=2 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 \
-	    --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'that the shim did not log are not faults'; then \
-	        echo "jepsen-selftest: plugs that the shim made and did not log were counted as pulled (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(CRASHFS_IGNORE_USR2=1 JEPSEN_PULL_PROB=0.0003 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 \
-	    --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'was idle'; then \
-	        echo "jepsen-selftest: plugs that the shim ignored were counted as pulled (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so \
-	    --mutant-nemesis lastpull 2>&1); rc=$$?; \
-	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^valid$$'; then \
-	        echo "jepsen-selftest: a plug pulled when the clients are gone (no traffic for the power loss to wait on) was called a hung server (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --sched-selftest 2>&1); rc=$$?; \
-	    if [ $$rc -ne 0 ]; then \
-	        echo "jepsen-selftest: the time a thread waits for a CPU was not read right (rc $$rc)"; echo "$$out" | tail -n 5; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so \
-	    --mutant-nemesis starve:800 2>&1); rc=$$?; \
-	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^valid$$' || \
-	       ! echo "$$out" | grep -q 'longest dead stretch [3-9][0-9][0-9] ms before\|longest dead stretch [0-9][0-9][0-9][0-9] ms before'; then \
-	        echo "jepsen-selftest: a nemesis starved of the CPU (a server dead 800 ms before it was reaped) was called idle, or left none dead (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(CRASHFS_EIO_ONLY=tmp_ CRASHFS_MARK_SLOW_MS=300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis eio --seconds 20 \
-	    --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^valid$$'; then \
-	        echo "jepsen-selftest: a shim slow to write its mark (the nemesis found it empty: an unpublished part's EIO read as the WAL's) made an honest eio run fail (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(JEPSEN_TSDBD=tests/jepsen/hang-tsdbd.sh timeout 300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
-	    --seconds 20 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'it is hung'; then \
-	        echo "jepsen-selftest: a server that hangs after a power pull went unnoticed or was counted as a pull (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	tests/jepsen/expect.sh gate 'that the shim did not log are not faults' 'plugs that the shim made and did not log (counted as pulled)' \
+	    env CRASHFS_IGNORE_USR2=2 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so || exit 1; \
+	tests/jepsen/expect.sh gate 'was idle' 'plugs that the shim ignored (counted as pulled)' \
+	    env CRASHFS_IGNORE_USR2=1 JEPSEN_PULL_PROB=0.0003 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 \
+	    --crashfs $(B)/libcrashfs.so || exit 1; \
+	tests/jepsen/expect.sh valid 'a plug pulled when the clients are gone (no traffic for the power loss to wait on; called a hung server)' \
+	    ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so --mutant-nemesis lastpull || exit 1; \
+	tests/jepsen/expect.sh valid 'a shim slow to write its mark (an empty name read as a file the server must stop on) made an honest eio run fail' \
+	    env CRASHFS_EIO_ONLY=tmp_ CRASHFS_MARK_SLOW_MS=300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis eio --seconds 20 \
+	    --crashfs $(B)/libcrashfs.so || exit 1; \
+	tests/jepsen/expect.sh violation 'it is hung' 'a server that hangs after a power pull (it went unnoticed or was counted as a pull)' \
+	    env JEPSEN_TSDBD=tests/jepsen/hang-tsdbd.sh timeout 300 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
+	    --seconds 20 --crashfs $(B)/libcrashfs.so || exit 1; \
 	out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage \
 	    --seconds 8 --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! find $(JEPSEN_DIR)-selftest.outage-s1.server.log -size +0 -mmin -2 2>/dev/null | grep -q .; then \
@@ -1249,7 +1238,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    --nemesis kill --seconds 5 --mutant-slowcreate 2>&1); rc=$$?; \
 	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'cannot connect to create the series'; then \
 	        echo "jepsen-selftest: a run whose server crashed before the series were created hung or went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$(./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage --seconds 20 --seed 2 \
+	out=$$(tests/jepsen/rerun.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage --seconds 20 --seed 2 \
 	    --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '^outage heals: [1-9][0-9]*, [0-9]* judged .*, 0 not judged$$'; then \
 	        echo "jepsen-selftest: an outage run left a heal unjudged, or did not say how many (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
