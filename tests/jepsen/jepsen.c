@@ -422,6 +422,31 @@ static bool proc_exiting(pid_t pid)
         closedir(d);
     return exiting && !stopped;
 }
+/* Whether a thread of process `pid` is stopped (SIGSTOP): a signal sent to it stays pending, the shim never sees it. */
+static bool proc_stopped(pid_t pid)
+{
+    char path[320], buf[64];
+    snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+    DIR *d = opendir(path);
+    struct dirent *e;
+    bool stopped = false;
+    while (d && (e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9')
+            continue;
+        snprintf(path, sizeof path, "/proc/%d/task/%s/stat", (int)pid, e->d_name);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            size_t n = fread(buf, 1, sizeof buf - 1, f);
+            buf[n] = 0;
+            fclose(f);
+            const char *p = strrchr(buf, ')');
+            stopped |= p && p[1] == ' ' && (p[2] == 'T' || p[2] == 't');
+        }
+    }
+    if (d)
+        closedir(d);
+    return stopped;
+}
 static int failstops, eio_problems;
 static int lives_faulty, lives_clean, lives_died_starting; /* servers started under the nemesis, by kind */
 static int death_problems;       /* power: a server that ended any way but a power loss (exit 99) or our kill */
@@ -2154,9 +2179,14 @@ static void *nemesis_thread(void *arg)
                 else if (gone)
                     nem_attempt_span(issued, now_ns());
                 if (!gone) { /* the clients write all the time: a server that does not die has hung (a correctness failure) */
-                    hang_problems++;
+                    /* when the shim saw the signal (its line) or the server is stopped, the server was asked and did not die: hung. A
+                     * live server whose shim never saw the signal (one that ignores it) shows nothing about the server: a plug that was
+                     * not pulled, which the fault floor judges (inconclusive) */
+                    bool hung = pull_logged(pid) || proc_stopped(pid);
+                    if (hung)
+                        hang_problems++;
                     fprintf(stderr, "  the server (pid %d) was still alive %d s after SIGUSR2 (a power loss at its next file "
-                            "operation): it is hung\n", (int)pid, wait_s);
+                            "operation): %s\n", (int)pid, wait_s, hung ? "it is hung" : "the shim never saw the signal, not a plug");
                     print_tail(slogpath);
                     print_proc_state(pid);
                     errno = 0;
