@@ -1151,7 +1151,9 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # tests/jepsen/expect.sh gate requires: a non-zero exit is not enough), and so does one that SPINS where an honest one sleeps (killspin,
 # powerspinstep, eiospin, pullspin, waitspin, deadspin, norestartspin: no bound takes off the time a thread waits for the CPU, so a
 # machine that starves the thread cannot hide a spinner). A hung server, a crash or a wrong answer is a VIOLATION (exit 1), at the
-# first attempt (expect.sh violation).
+# first attempt (expect.sh violation), also beside a lazy nemesis: the history is
+# always judged (mutant-loss.sh plants a loss in a copy of tsdbd and runs it with a spinning nemesis; before round 10 that ended rc 3,
+# three times, with the history unjudged).
 # What passes on purpose is listed at the end of the comment of nemesis_check.
 # What each bound is set to, and the honest worst under load on tmpfs and disk, is in the comments of nemesis_check (jepsen.c).
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $(B)/test_crashfs_bus
@@ -1203,6 +1205,9 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	tests/jepsen/expect.sh gate 'classes: 0 switches, parts in 0 classes: the workload tested no change of class' \
 	    'a classes workload whose clients are starved (they write nothing in the run: INCONCLUSIVE, not a violation: it was FAILED before)' \
 	    env JEPSEN_CLIENT_NAP_MS=9000 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --workload classes --nemesis none --seconds 8 --clients 1 || exit 1; \
+	tests/jepsen/expect.sh gate 'the clients made [0-9]* acknowledged writes in 12 s (at least 100 expected)' \
+	    'a kv workload whose clients are starved (8 acknowledged writes in a run: a tsdbd that drops every 20th would pass it)' \
+	    env JEPSEN_CLIENT_NAP_MS=3000 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis none --seconds 12 --clients 2 || exit 1; \
 	for spec in \
 	    'kill@20@killnoeffect@-@the nemesis issued 0 faults in 20 s.*it was idle@a kill that kills nothing was counted as a fault' \
 	    'pause@10@pausenoeffect@-@the nemesis issued 0 faults in 10 s.*it was idle@a pause that stops nothing was counted as a fault' \
@@ -1272,6 +1277,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    if [ "$$a" != 150.750 ] || [ "$$b" != 0.000 ] || [ "$$c" != 140.250 ]; then \
 	        echo "jepsen-selftest: the scan of slow write probes in a server log is wrong ($$a $$b $$c)"; exit 1; fi; \
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
+	    tests/jepsen/mutant-loss.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: data loss beside a lazy nemesis was hidden behind INCONCLUSIVE or went unnoticed"; exit 1; }; \
 	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 

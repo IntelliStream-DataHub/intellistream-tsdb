@@ -288,6 +288,8 @@ static int watch_deaths, watch_restarts;
 #define NEM_GAP_MIN_S 2.0
 #define NEM_GAP_MAX_S 5.0
 #define NEM_IDLE_SHARE 0.05   /* the idle time inside the fault steps stays below this share of the run */
+#define KV_MIN_WRITES 100     /* the least acknowledged writes of a run of 10 s or more (see the kv coverage check) */
+#define KV_MIN_DELREP 5       /* the least acknowledged deletes and replaces together */
 #define NEM_MIN_FAULTS 3      /* the least faults of any run of 10 s or more */
 #define EIO_STOP_WAIT_S 20    /* the longest an honest server takes to fail-stop after a file the engine relies on failed (EIO) */
 #define PULL_WAIT_S 30        /* a server that has been sent SIGUSR2 and is still alive after this long is hung: a failure, unless it is
@@ -518,7 +520,9 @@ static void nem_idle_since(int64_t t0)
  * run is one whose own liveness or coverage check failed (the nemesis was too slow for its floor, a server lay dead too long, a gap with
  * no fault, a step that idled, the workload wrote or switched too little): the run tested less than it says, which says nothing about the
  * system under test. It exits 3 with the name of every check that failed and the numbers, and tests/jepsen/rerun.sh repeats it with the
- * next seed, twice at most; three in a row fail the gate with all three messages. A run that has both is a violation. */
+ * next seed, twice at most; three in a row fail the gate with all three messages. A run that has both is a violation, and the run
+ * always gets to say so: whatever the liveness checks found, main goes on to the final state and judges the whole history (every safety
+ * check) before it picks the exit code: 1 if anything is violated, else 3 if a liveness or coverage check failed, else 0. */
 static int inconclusive;
 static char inc_checks[256];
 static void inc_note(const char *check)
@@ -2414,8 +2418,9 @@ static void *nemesis_thread(void *arg)
  * (/tmp and /var/tmp, quiet and with 16 busy loops; round 8 on the code of that round, with the cases added in it: the kill, power
  * and eio steps that sleep 400 ms with the server live, the slow mark of the shim, a reader of a mapping the power loss cuts).
  * What passes, on purpose, and is not a failure of the check: (1) a nemesis at half the honest rate (slow:MS: the floor is half the honest
- * least, so such a run is at the floor and about one in four fails to fail: eio slow:1600 over 60 s passed 1 of 4 runs under load; at a
- * third of the rate, 0 of 16); (2) a nemesis that stops working at nine tenths of a run (the gap bound is a tenth of the run, 2 s of 20), or at
+ * least, so such a run is at the floor and about one attempt in four passes (fails to fail): eio slow:1600 over 60 s passed 1 of 4 runs under load; at a
+ * third of the rate, 0 of 16. A gate has three attempts (rerun.sh), so such a nemesis passes a gate far more often: 1-(3/4)^3, about 58%,
+ * at half the rate; the selftest and the bounds therefore rest on the nemeses at a third of the rate and below); (2) a nemesis that stops working at nine tenths of a run (the gap bound is a tenth of the run, 2 s of 20), or at
  * four fifths of one of 10 s (the pause runs of make jepsen are 20 s for that reason); (3) any run whose fault count passes only because
  * restarts and pulls the nemesis waits for count as work, so a nemesis that always waits as long as the honest one under load can do is
  * not told from it; (4) a nemesis that does not look at the server in its naps (blind:MS, blindafter:S of the verifier) when the shim's own
@@ -4025,34 +4030,13 @@ int main(int argc, char **argv)
         pthread_join(fr, NULL);
     if (watch_started)
         pthread_join(watch_th, NULL); /* it ends at the first poll after stop_ns */
-    /* The nemesis is judged here, before the final state and the checker (which takes minutes on a long kv run): a run whose
-     * nemesis was idle tested less than it says and ends at once, whatever the history shows. */
-    if (strcmp(nemesis, "none") && !(md || rot)) {
-        int nv = nemesis_check();
-        if (nv) {
-            JP_PHASE("the nemesis failed its check: ending");
-            pthread_mutex_lock(&server_lock);
-            stop_server(SIGKILL);
-            pthread_mutex_unlock(&server_lock);
-            unlink(markpath);
-            unlink(pullpath);
-            if (samp_on) {
-                atomic_store(&samp_stop, true);
-                pthread_join(samp_th, NULL);
-            }
-            if (outage)
-                outage_keep_log();
-            if (system(cmd) != 0)
-                return 2;
-            if (!strcmp(nemesis, "power") && death_problems + hang_problems) {
-                /* a server that hung, or ended another way than a power loss, is a fault of the system under test that the
-                 * nemesis found: a violation, not a lazy run (the hung server also starves the fault floor) */
-                printf("FAILED: %d violations\n", death_problems + hang_problems);
-                return 1;
-            }
-            return inconclusive_exit(false);
-        }
-    }
+    /* The nemesis is judged here, and the run goes on whatever the verdict: a lazy nemesis makes the run INCONCLUSIVE (exit 3, it
+     * tested less than it says), but the final state and the whole history are always judged too, every safety check, and a loss
+     * there is a VIOLATION (exit 1) on the attempt where it happened, never hidden behind a rerun (the user's scope, 2026-11-14:
+     * the point of these runs is that no data is lost or corrupted, also under heavy load). A server that hangs or dies other than
+     * by the planned power loss is counted in death_problems and hang_problems and ends the run in the same place (v). */
+    if (strcmp(nemesis, "none") && !(md || rot))
+        (void)nemesis_check();
     JP_PHASE("the final state");
 
     /* the final state, from a server without faults, and again after a clean restart */
@@ -4102,6 +4086,22 @@ int main(int argc, char **argv)
                "%u deletes and %u replaces ok\n",
                nemesis, seconds, nclients, restarts, ok, info, fail, rok, dels, reps);
     }
+    /* kv coverage (every workload but misdirect and rot, which count epochs): a run whose clients were starved wrote almost nothing
+     * (8 acknowledged writes and no delete in 20 s, in a run with 40 busy loops on 4 CPUs), and a tsdbd that drops every 20th write
+     * then passes it, because the bug never fired. Too few acknowledged writes, or too few of the deletes and replaces the workload
+     * mixes in (6% of its operations), is INCONCLUSIVE: the history is judged all the same, and a loss in it is a violation. The
+     * floors are far below what an honest run makes (least in about 1,000 gate runs: 1,622 writes and 162 deletes and replaces in 20 s, with
+     * 16 busy loops on 4 CPUs on ext4; 24,600 and 2,500 on tmpfs; 8 and 0 only with 40 busy loops besides): 100 writes are five times
+     * what a server that drops every 20th needs to lose one. */
+    if (!(md || rot) && seconds >= 10) {
+        if (ok < KV_MIN_WRITES) {
+            INCONCLUSIVE("kv-coverage", "the clients made %u acknowledged writes in %.0f s (at least %d expected): the run tested almost nothing\n",
+                         ok, seconds, KV_MIN_WRITES);
+        } else if (dels + reps < KV_MIN_DELREP) {
+            INCONCLUSIVE("kv-coverage", "the clients made %u acknowledged deletes and replaces in %.0f s (at least %d expected): the delete "
+                         "path was not tested\n", dels + reps, seconds, KV_MIN_DELREP);
+        }
+    }
     if (feed)
         printf("feed: %d directory checks (retained segments whole, numbers increasing, nothing lost above the floor)\n",
                feed_checks);
@@ -4133,9 +4133,9 @@ int main(int argc, char **argv)
         printf("outage: %d volume faults and %d kills; the other volume wrote %.0f/s during outages (%.0f/s before)\n",
                outage_faults, outage_kills, rate, base);
         if (healthy_secs > 5 && rate < 0.8 * base) {
-            fprintf(stderr, "  the healthy volume kept %.0f%% of its writes per second during outages (at least 80%% expected)\n",
-                    base > 0 ? 100 * rate / base : 0);
-            v++;
+            /* speed, not data: a busy machine slows the healthy volume whatever the faulty one does, so it is a liveness check */
+            INCONCLUSIVE("outage-throughput", "the healthy volume kept %.0f%% of its writes per second during outages (at least 80%% expected)\n",
+                         base > 0 ? 100 * rate / base : 0);
         }
         printf("outage heals: %d, %d judged (%d of a flapping domain, %d of them held back by a slow write probe the server logged; "
                "slowest %.1f s, slowest flapping %.1f s), %d not judged\n",
