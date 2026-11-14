@@ -2369,6 +2369,16 @@ static void scen_volumes(void)
     printf("  every restart keeps the rid, raises the generation to 2 and the group records it\n");
 
     /* an older copy of the directory (generation 1 < the recorded 2) is refused, naming both */
+    uint64_t inc1;
+    {
+        struct view w;
+        view(0, &w);
+        const struct meta_member *mb = meta_member(&w.m, ids[1]);
+        if (!mb)
+            die("server 1 is not a member");
+        inc1 = mb->incarnation;
+        view_free(&w);
+    }
     stop(1, SIGTERM);
     snprintf(cmd, sizeof cmd, "rm -rf %s && mv %s %s", v1, old1, v1);
     if (system(cmd) != 0)
@@ -2381,6 +2391,9 @@ static void scen_volumes(void)
     if (log_count(1, "(plant): open as the") != 2)
         die("server 1 opened its old copy of v1");
     printf("  a copy from generation 1 is refused, naming both generations\n");
+    /* its log line comes from the server's own copy, before it rejoined: the volume added next needs all three up */
+    struct state_want up1 = {ids[1], META_UP, inc1 + 1};
+    await_view_ms(0, p_member_state, &up1, "server 1 up again after the refused copy", 40000);
 
     /* a volume added while the leader proposes no REPLICA_OPEN (hold_opens_file) stays closed everywhere: no server
      * serves before the group recorded its generation (mutant noopengen) */
