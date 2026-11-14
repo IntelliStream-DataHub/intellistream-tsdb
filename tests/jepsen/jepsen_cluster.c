@@ -33,7 +33,7 @@
  *
  * Workloads. meta: sampled STATUS of every node; a term has at most one leader (election safety), every node gets
  * back, every member UP after each heal, the metadata equal on every node. kv-local: per node, one writer and one
- * reader on that node's own series (target: kv_resolve), a history of writes (acknowledged / definitely failed /
+ * reader on that node's own series, in a cluster volume of one replica on that node (kv_setup, kv_resolve), a history of writes (acknowledged / definitely failed /
  * indeterminate) and reads, and a checker, as in jepsen.c, with writes that are totally ordered by their one writer:
  *  1 durability: the final value of a key is not from a write that completed before an applied write of the key began;
  *  2 validity: a value seen was written at that key by a write that had begun and did not definitely fail;
@@ -578,9 +578,10 @@ static int start_node(int i, const char *crash_at, int *status)
     int ne = 0;
     for (char **e = environ; *e && ne < 500; e++)
         if (strncmp(*e, "TSDB_CLUSTER_TEST=", 18) && strncmp(*e, "TSDB_CRASH_AT=", 14) && strncmp(*e, "LD_PRELOAD=", 11) &&
-            strncmp(*e, "CRASHFS_", 8))
+            strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20))
             envp[ne++] = *e;
     char e1[256], e2[PATH_MAX + 64], e3[PATH_MAX + 64];
+    envp[ne++] = "TSDB_CLUSTER_WRITES=1"; /* the leader of a cluster volume takes writes (kv-local) */
     if (crash_at) {
         snprintf(e1, sizeof e1, "TSDB_CRASH_AT=%s", crash_at);
         envp[ne++] = e1;
@@ -1083,12 +1084,16 @@ static struct rd *hist_read_slot(struct hist *h, int sess)
     return r;
 }
 
-/* The one place that says where kv-local's series live (r3c-volumes moves them to a per-node cluster volume). */
+/* The one place that says where kv-local's series live: node i's series is in a cluster volume of one replica that the
+ * group placed on node i (kv_vol[i], made by kv_setup, which also creates the series there; a node's root takes no
+ * series). The workload looks it up by name: a node that has not opened its volume yet (a restart waits for the group
+ * to record the open) says NOTFOUND or UNAVAILABLE, and the client tries again. */
+static char kv_vol[MAXN][META_NAME_MAX];
 static int kv_resolve(tsdbc *c, int node, tsdb_sid *sid)
 {
     char name[48];
     snprintf(name, sizeof name, "kvl.n%d", node);
-    return tsdbc_series(c, name, 1, sid);
+    return tsdbc_series(c, name, 0, sid);
 }
 
 static int64_t key_ts(int k) { return KV_BASE_TS + (int64_t)k * 1000; }
@@ -1218,17 +1223,62 @@ static void *kv_reader(void *arg)
     return NULL;
 }
 
-/* creates every node's series before the first fault */
+/* Before the first fault: one cluster volume of one replica per node (the group places a new volume on the node that
+ * leads the fewest, so nn volumes land one on each node), then every node's series in the volume it holds, created
+ * through that node (TSDB_CLUSTER_WRITES=1 lets the leader of a volume take writes). */
 static void kv_setup(void)
 {
     for (int i = 0; i < nn; i++) {
+        char vn[16];
+        uint8_t req[META_NAME_MAX + 8];
+        snprintf(vn, sizeof vn, "kvl%d", i);
+        size_t rl = cluster_volume_add_encode(vn, 1, req);
+        int rc = admin_real(0, CLUSTER_OP_VOLUME_ADD, req, rl, 1, 15000);
+        if (rc != 0)
+            die(1, "volume add %s: %s", vn, cluster_strerror(rc));
+    }
+    int64_t t0 = now_ms();
+    for (int placed = 0; !placed;) {
+        struct view v;
+        if (view_get(0, &v, 2000) == 0) {
+            placed = 1;
+            for (int i = 0; i < nn && placed; i++) {
+                uint32_t id = atomic_load(&nodes[i].id);
+                kv_vol[i][0] = 0;
+                for (uint32_t k = 0; k < v.m.nvolumes; k++) {
+                    const struct meta_volume *mv = &v.m.volumes[k];
+                    if (!strncmp(mv->name, "kvl", 3) && mv->nrep == 1 && mv->rep[0].node == id && mv->rep[0].open_gen >= 1)
+                        snprintf(kv_vol[i], sizeof kv_vol[i], "%s", mv->name);
+                }
+                placed = kv_vol[i][0] != 0;
+            }
+            view_free(&v);
+        }
+        if (!placed && now_ms() - t0 > 60000)
+            die(1, "kv-local: the volumes kvl0..kvl%d were not placed one on each node and opened", nn - 1);
+        if (!placed)
+            usleep(200000);
+    }
+    for (int i = 0; i < nn; i++) {
         snprintf(hists[i].name, sizeof hists[i].name, "kvl.n%d", i);
         pthread_mutex_init(&hists[i].mu, NULL);
-        tsdbc *c = NULL;
-        tsdb_sid sid;
-        if (connect_node(i, 1, &c) != 0 || kv_resolve(c, i, &sid) != 0)
-            die(1, "node %d: cannot create the series of kv-local", i);
-        tsdbc_close(c);
+        /* the group has recorded the open; the node opens its volume once it applied that too */
+        for (int64_t t1 = now_ms();; usleep(100000)) {
+            tsdbc *c = NULL;
+            tsdb_sid sid = 0;
+            int rc = connect_node(i, 1, &c);
+            if (rc == 0)
+                rc = tsdbc_series_at(c, hists[i].name, kv_vol[i], &sid);
+            if (c)
+                tsdbc_close(c);
+            if (rc == 0 && TSDB_SID_VOLUME(sid) == 0)
+                die(1, "node %d: series %s went to the root, not to volume %s", i, hists[i].name, kv_vol[i]);
+            if (rc == 0)
+                break;
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_NOTFOUND) || now_ms() - t1 > 30000)
+                die(1, "node %d: cannot create the series of kv-local in volume %s: %s", i, kv_vol[i],
+                    tsdbc_strerror(rc));
+        }
     }
 }
 
@@ -1891,6 +1941,13 @@ static void takeover_event(void)
         die(2, "selftest setup failed");
     }
     foreign_pid = pid;
+    /* the foreign server holds a series of node 0's name (in its root, as any plain tsdbd would), so a client that
+     * does not check the port it reached writes there and is answered */
+    tsdbc *fc = NULL;
+    tsdb_sid fsid;
+    if (tsdbc_connect("127.0.0.1", old, &fc) != 0 || tsdbc_series(fc, "kvl.n0", 1, &fsid) != 0)
+        die(2, "selftest setup failed: the foreign server does not take series kvl.n0");
+    tsdbc_close(fc);
     pthread_mutex_lock(&tbl_mu);
     nodes[0].cport_stale = old; /* the planted stale table: the workload's clients keep this port */
     pthread_mutex_unlock(&tbl_mu);
