@@ -1107,7 +1107,7 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # pulls the plug (never, oncereact), sleeps through its naps (--mutant-idle, --mutant-longnap) or sleeps inside its fault
 # step, with the server dead or with the new one up (deadsleep:MS, busysleep:MS; the idle one has a server die at the start of
 # each long nap, as the shim's own odds do in a real run: left to those odds the mutant slipped past in 1 of 20 runs under 16
-# busy loops). Each runs once and must fail: no case is repeated until it does. Also an eio nemesis that works once and sleeps, a burst (burst:10: faults enough for the floor, also under load, but none in the last third) and then asleep, naps that do
+# busy loops). Each must fail (a lazy one as the gate failure of three INCONCLUSIVE attempts, a crash or hang as a violation at once). Also an eio nemesis that works once and sleeps, a burst (burst:10: faults enough for the floor, also under load, but none in the last third) and then asleep, naps that do
 # not look at the server (nap:600: a server that died lies dead; one dies at the start of each nap, since left to the shim's own odds the case
 # slipped past in 1 of 10 runs under 16 busy loops), and a shim that ignores SIGUSR2 (CRASHFS_IGNORE_USR2:
 # the plugs are not counted), a nemesis that is asleep in the middle of the run with every third and the floor still met
@@ -1127,11 +1127,12 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # eioslowstep: 400 ms each) is idle time of the step (an honest step has microseconds of it, 0.00 s in every run measured), whatever
 # the rate it leaves: 5% of the run is the bound. A pause run is 20 s (hole:16:100, four fifths of it, fails; of
 # 10 s it did not), and a plug pulled when the clients are gone (lastpull) is an honest run: the harness gives the server a row to
-# fail on (poke_server) and the case must pass. So is a nemesis starved of the CPU (starve:800: it does not reap a pulled server for
-# 800 ms and reports the time as CPU time it waited for): on a machine with a load average of 60 and more an honest nemesis thread
-# waited 250 to 280 ms at a time, the dead stretch was 453 ms and the run failed (1 in 12); the kernel's account of that time is taken off
-# the stretch (sched_delay_ns), and what is left is the nemesis' own: deadsleep, busysleep, powerslowstep and eioslowstep sleep and
-# are not starved. `jepsen --sched-selftest` checks that the account is read right (a thread sharing a CPU with three spinners).
+# fail on (poke_server) and the case must pass. A failed liveness check of a run is INCONCLUSIVE (exit 3), which tests/jepsen/rerun.sh
+# repeats with the next seed, twice at most; a lazy nemesis fails all three attempts (the gate failure naming its check, which
+# tests/jepsen/expect.sh gate requires: a non-zero exit is not enough), and so does one that SPINS where an honest one sleeps (killspin,
+# powerspinstep, eiospin, pullspin, waitspin, deadspin, norestartspin: no bound takes off the time a thread waits for the CPU, so a
+# machine that starves the thread cannot hide a spinner). A hung server, a crash or a wrong answer is a VIOLATION (exit 1), at the
+# first attempt (expect.sh violation).
 # What passes on purpose is listed at the end of the comment of nemesis_check.
 # What each bound is set to, and the honest worst under load on tmpfs and disk, is in the comments of nemesis_check (jepsen.c).
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $(B)/test_crashfs_bus

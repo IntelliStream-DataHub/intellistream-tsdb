@@ -2403,15 +2403,15 @@ static void *nemesis_thread(void *arg)
  *   rate per free listening second, least:    kill 1.92 (floor 1.0, 1.9x)  pause 1.82 (0.9, 2.0x)  power 1.21 (0.55, 2.2x)  eio 0.85 (0.4, 2.1x)
  *   faults against the floor, least:          kill 1.86x  pause 1.92x  power 2.0x  eio 2.0x
  *   longest listening stretch with no fault:  0.80 s (pause), 0.77 s (power, eio), 0.76 s (kill) (bound 2.0 s for runs of 10 and 20 s, 2.5x)
- *   longest dead stretch, as the check takes it (less the CPU wait): 199 ms, in a kill run on /var/tmp with 16 busy loops at a load average of
+ *   longest dead stretch (round 8, with a CPU wait taken off that round 9 no longer takes): 199 ms, in a kill run on /var/tmp with 16 busy loops at a load average of
  *     150 (bound 250 ms, 1.26x: the thinnest margin, and a server that waits for a CPU in the fork is not the nemesis' wait to excuse); 149 ms
  *     (power), 99 ms (eio) otherwise; raw, without the CPU wait taken off, the blocker run of round 7 had 453 ms
  *   longest stop: 413 ms (bound 1500 ms, 3.6x)
  *   longest listening stretch in a kill step: 491 ms with 16 busy loops, 1002 ms with 48 (it decides only when the time counts as free, 400 ms)
- *   idle time in the fault steps (the time before the signal in a kill, power or eio step, less the CPU wait): 0.00 s in every honest run (bound 5% of the run)
+ *   idle time in the fault steps (the time before the signal in a kill, power or eio step): 0.00 s in every honest run (bound 5% of the run)
  * A nemesis that works at a third of the honest rate, at half of it (slow:MS), stops at three quarters of the run (hole:15:100) or
  * sees no server die in its naps (blind:MS) is failed by the selftest of the Makefile, 10 of 10 runs in each of the four conditions
- * (/tmp and /var/tmp, quiet and with 16 busy loops; round 8 on the final code, with the cases added in it: starve:800 valid, the kill, power
+ * (/tmp and /var/tmp, quiet and with 16 busy loops; round 8 on the code of that round, with the cases added in it: the kill, power
  * and eio steps that sleep 400 ms with the server live, the slow mark of the shim, a reader of a mapping the power loss cuts).
  * What passes, on purpose, and is not a failure of the check: (1) a nemesis at half the honest rate (slow:MS: the floor is half the honest
  * least, so such a run is at the floor and about one in four fails to fail: eio slow:1600 over 60 s passed 1 of 4 runs under load; at a
@@ -2426,12 +2426,18 @@ static void *nemesis_thread(void *arg)
  * (nem_idle_since; an honest step has none, 0.00 s in every run, and a sleep is no CPU wait), whose bound is 5% of the run, so a step that
  * dawdles 40 ms on average fails (killslowstep, powerslowstep and eioslowstep 200 to 3000 ms: 78 runs, none passed, quiet and with 16 busy loops).
  * A bound is never widened to make a mutant fail: honest runs come first.
- * Starvation: the dead stretch, the step's idle time, the gap and a kill step's listening time leave out what the nemesis thread and the
- * watcher waited for a CPU in them (the kernel's run delay of the thread, sched_delay_ns). A machine with a load average of 60 and more
- * starved the nemesis for 250 to 280 ms at a time (one honest run in 13 lay dead 453 ms, 250 ms of it before the thread got to reap the
- * pulled server); a nemesis that sleeps in a step has no run delay, so the mutants above stay failed. Without the account (a kernel
- * without /proc/thread-self/schedstat) nothing is excused. `--mutant-nemesis starve:MS` is an honest nemesis that reports MS of CPU wait
- * for a reap it does not do for that long: it must be valid, and fails on the check as it was before.
+ * Round 9 (what these checks are for). Two kinds of failure: a SAFETY anomaly (lost, resurrected or wrong data, a server that hangs or ends
+ * any way but a power loss) is a VIOLATION, exit 1, never repeated. A failed LIVENESS or COVERAGE check of the test itself (every check below,
+ * the classes workload's "0 switches" and the latest coverage) is INCONCLUSIVE, exit 3: the run tested too little, and says nothing about the
+ * data. tests/jepsen/rerun.sh (make jepsen, the honest cases of the selftest) repeats it with the next seed, at most twice more; three in a
+ * row fail the gate with all three messages, and every repeat is printed and counted. Rounds 7 and 8 each tightened or excused one timing
+ * bound and each time an honest run was broken by a machine stall (a thread blocked 650 ms in reclaim, which no run-delay account sees; the
+ * classes clients starved to 12 writes in 20 s), while the excuse (the kernel's run delay of the thread) let a nemesis that SPINS where it
+ * should sleep pass under load. No account of the kernel's tells a spinner from a starved thread, so none is taken: no bound has an excuse
+ * and a stall fails one attempt, never the gate. The spin mutants (killspin, powerspinstep, eiospin, pullspin, waitspin, deadspin,
+ * norestartspin) and the sleeping ones fail all three attempts, quiet and loaded: the selftest requires that outcome, not just a non-zero
+ * exit (expect.sh gate PATTERN: three INCONCLUSIVE and the named check). lastpull is an honest nemesis and must be valid. A server that
+ * the shim never sent the signal to (CRASHFS_IGNORE_USR2) lives on: that is a plug not pulled (the floor), not a hung server.
  * Measured and caught, so not a pass: a blind power nemesis (naps that never look at the server, blind:1000) at the shim's default odds,
  * 16 of 16 runs (8 quiet, 8 with 16 busy loops on /tmp), by the dead stretch of 1 to 3 s its naps leave and by the floor; the odds of the
  * Makefile case are raised only to make the shim kill servers at all in 20 s. */
