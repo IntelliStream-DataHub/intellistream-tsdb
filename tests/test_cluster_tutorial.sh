@@ -144,8 +144,12 @@ expect 1 '^read 1440 rows, the first: 1717200000000 50\.00$'
 expect 3 '/n[123]/data/v1$'                                   # every node made the volume's directory
 [ "$(grep -cE '^replica volume 1 node [123] rid [0-9a-f]{16} open_gen 1$' "$scratch/out")" -ge 3 ] \
     || fail "step 6 does not show the three copies of plant with their open generation 1"
-# steps 7 and 8 answer at a term above 1 (an election happened)
-expect 2 '^node [123] mode core role (leader|follower) term [2-9][0-9]* leader [123] '
+# steps 5, 7 and 8 ask a voter; 7 and 8 (the last two) answer at a term above 1 (an election happened). Step 5 may too:
+# on a loaded machine (ASan beside a test run) the group can hold an election before step 7, as the killed node allows.
+expect 3 '^node [123] mode core role (leader|follower) term [0-9]+ leader [123] '
+[ "$(grep -E '^node [123] mode core ' "$scratch/out" | tail -n 2 \
+     | grep -cE '^node [123] mode core role (leader|follower) term ([2-9]|[1-9][0-9]+) leader [123] ')" -eq 2 ] \
+    || fail "steps 7 and 8 do not both answer at a term above 1"
 grep -q 'proposes node [123] down' "$scratch/out" || fail "the logs (step 10) has no 'proposes node [123] down'"
 grep -q 'proposes node [123] up (incarnation 2)' "$scratch/out" || fail "the logs (step 10) has no 'proposes node [123] up (incarnation 2)'"
 grep -q 'leads the metadata group' "$scratch/out" || fail "the logs (step 10) has no 'leads the metadata group'"
