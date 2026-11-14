@@ -44,6 +44,8 @@
  * read again later.
  */
 #include "internal.h"
+#include "cvol.h"
+#include "replica.h"
 #include "stats_priv.h"
 
 #include <dirent.h>
@@ -89,6 +91,12 @@ struct tsdb {
     eng **vols;
     char **paths; /* canonical, [0] is the root */
     size_t nvols, vols_cap;
+    /* A cluster node's handle (cvol.h): volumes are numbered by the metadata group, so vols[] has holes (NULL: a
+     * volume this server does not hold, or no volume) and cnames[v] is the cluster name of every volume declared;
+     * crole[v] what this server is for it. No series in the root, no VOLUMES. All under `lock`. */
+    bool cluster;
+    char **cnames;
+    uint8_t *crole;
     pthread_mutex_t create_lock; /* one volume add or resolve at a time */
     /* A follower's opens of new volumes, one thread at a time (volume_at): the others wait for it and find the
      * volume listed, rather than each run a full open of it. Lookups and routes to open volumes never take it. */
@@ -783,6 +791,20 @@ static int vols_grow(tsdb *t)
     if (!p)
         return TSDB_ERR_NOMEM;
     t->paths = p;
+    if (t->cluster) {
+        char **c = realloc(t->cnames, cap * sizeof *c);
+        if (!c)
+            return TSDB_ERR_NOMEM;
+        t->cnames = c;
+        uint8_t *r = realloc(t->crole, cap);
+        if (!r)
+            return TSDB_ERR_NOMEM;
+        t->crole = r;
+        memset(t->cnames + t->vols_cap, 0, (cap - t->vols_cap) * sizeof *c);
+        memset(t->crole + t->vols_cap, 0, cap - t->vols_cap);
+    }
+    memset(t->vols + t->vols_cap, 0, (cap - t->vols_cap) * sizeof *v);
+    memset(t->paths + t->vols_cap, 0, (cap - t->vols_cap) * sizeof *p);
     t->vols_cap = cap;
     return 0;
 }
@@ -1078,6 +1100,10 @@ int tsdb_close(tsdb *t)
     tlist_unref(t->tl);
     pthread_mutex_destroy(&t->tl_mu);
     pthread_mutex_destroy(&t->set_mu);
+    for (size_t i = 0; t->cnames && i < t->vols_cap; i++)
+        free(t->cnames[i]);
+    free(t->cnames);
+    free(t->crole);
     free(t->vols);
     free(t->paths);
     free(t->meta_bad_path);
@@ -1200,7 +1226,10 @@ static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
         return false;
     pthread_rwlock_rdlock(&t->lock);
     bool ok = (size_t)v < t->nvols;
-    if (ok && live && atomic_load_explicit(&t->vols[v]->quiesced, memory_order_acquire)) {
+    if (ok && !t->vols[v]) { /* a cluster volume this server does not hold (or no volume) */
+        route_rc = t->cluster && t->cnames[v] ? TSDB_ERR_UNAVAILABLE : 0;
+        ok = false;
+    } else if (ok && live && atomic_load_explicit(&t->vols[v]->quiesced, memory_order_acquire)) {
         route_rc = TSDB_ERR_UNAVAILABLE;
         ok = false;
     } else if (ok) {
@@ -1303,11 +1332,11 @@ static int lookup_from(tsdb *t, const char *name, size_t hint, tsdb_sid *id)
     size_t n = t->nvols, v;
     uint32_t local, other;
     for (v = 0; v < n && rc == TSDB_ERR_NOTFOUND; v++) {
-        rc = eng_series_lookup(t->vols[v], name, &local);
+        rc = t->vols[v] ? eng_series_lookup(t->vols[v], name, &local) : TSDB_ERR_NOTFOUND;
         if (rc == 0)
             *id = TSDB_SID(v, local);
     }
-    if (rc == 0 && hint >= v && hint < n && eng_series_lookup(t->vols[hint], name, &other) == 0 &&
+    if (rc == 0 && hint >= v && hint < n && t->vols[hint] && eng_series_lookup(t->vols[hint], name, &other) == 0 &&
         !atomic_exchange(&t->dup_logged, true))
         fprintf(stderr, "tsdb: series \"%.200s\" is in volume %zu and in volume %zu; volume %zu's is used\n", name,
                 v - 1, hint, v - 1);
@@ -1384,7 +1413,7 @@ static bool volume_find(tsdb *t, const char *canon, uint32_t *vol)
     pthread_rwlock_rdlock(&t->lock);
     bool found = false;
     for (size_t v = 0; v < t->nvols && !found; v++)
-        if (strcmp(t->paths[v], canon) == 0) {
+        if (t->paths[v] && strcmp(t->paths[v], canon) == 0) {
             *vol = (uint32_t)v;
             found = true;
         }
@@ -1454,6 +1483,8 @@ int tsdb_volume_add(tsdb *t, const char *path, uint32_t *index)
 {
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
+    if (t->cluster)
+        return TSDB_ERR_INVALID; /* a cluster node's volumes are numbered by the metadata group only (cvol.h) */
     if (eng_check(t->vols[0]))
         return TSDB_ERR_IO; /* VOLUMES takes no more lines */
     pthread_mutex_lock(&t->create_lock);
@@ -1474,7 +1505,7 @@ static int feed_engines(tsdb *t, eng ***out, bool **live, size_t *n)
     if (v && lv) {
         memcpy(v, t->vols, *n * sizeof *v);
         for (size_t i = 0; i < *n; i++)
-            if ((lv[i] = !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
+            if ((lv[i] = v[i] && !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
                 eng_ref(v[i]);
     }
     pthread_rwlock_unlock(&t->lock);
@@ -1639,11 +1670,45 @@ static int series_found(tsdb *t, int type, tsdb_sid id)
     return type < 0 || (tsdb_series_type(t, id, &have) == 0 && (int)have == type) ? 0 : TSDB_ERR_INVALID;
 }
 
+/* A cluster node (cvol.h): a series is made in the volume the request names by its cluster name, and looked up there
+ * only (names are unique per volume); none in the root. A volume this server does not hold, or one being swapped, is
+ * UNAVAILABLE. */
+static int cvol_series_make(tsdb *t, const char *name, int type, const char *vname, tsdb_sid *id)
+{
+    if (!name || !*name || (type >= 0 && !type_valid(type)) || !vname || !*vname)
+        return TSDB_ERR_INVALID; /* no volume named: the root holds no series */
+    uint32_t v;
+    int rc = tsdb_cvol_find(t, vname, &v);
+    if (rc)
+        return rc;
+    pthread_rwlock_rdlock(&t->lock);
+    eng *e EREF = t->vols[v] && !atomic_load_explicit(&t->vols[v]->quiesced, memory_order_acquire)
+                      ? eng_ref(t->vols[v]) : NULL;
+    pthread_rwlock_unlock(&t->lock);
+    if (!e)
+        return TSDB_ERR_UNAVAILABLE;
+    uint32_t local = 0;
+    rc = eng_series_lookup(e, name, &local);
+    if (rc == 0) {
+        *id = TSDB_SID(v, local);
+        return series_found(t, type, *id);
+    }
+    if (rc != TSDB_ERR_NOTFOUND && rc != TSDB_ERR_INVALID)
+        return rc;
+    if (t->opt.read_only)
+        return TSDB_ERR_READONLY;
+    if ((rc = eng_series(e, name, type < 0 ? TSDB_FLOAT32 : type, &local)) == 0) /* gets or appends, in the volume */
+        *id = TSDB_SID(v, local);
+    return rc;
+}
+
 /* Gets or creates a series. type < 0: any existing type, else created as
  * float32; otherwise an existing series must have this type. An existing name
  * stays in the volume it was created in, whatever path is asked for. */
 static int series_make(tsdb *t, const char *name, int type, const char *path, tsdb_sid *id)
 {
+    if (t->cluster)
+        return cvol_series_make(t, name, type, path, id);
     if (!name || !*name || (type >= 0 && !type_valid(type)))
         return TSDB_ERR_INVALID;
     char norm[PATH_MAX], canon[PATH_MAX];
@@ -1713,7 +1778,7 @@ int tsdb_series_create(tsdb *t, const char *name, tsdb_type type, const char *pa
 uint32_t tsdb_volume_series_count(tsdb *t, uint32_t volume)
 {
     pthread_rwlock_rdlock(&t->lock);
-    uint32_t n = volume < t->nvols ? eng_series_count(t->vols[volume]) : 0;
+    uint32_t n = volume < t->nvols && t->vols[volume] ? eng_series_count(t->vols[volume]) : 0;
     pthread_rwlock_unlock(&t->lock);
     return n;
 }
@@ -1723,7 +1788,7 @@ uint64_t tsdb_series_count(tsdb *t)
     pthread_rwlock_rdlock(&t->lock);
     uint64_t n = 0;
     for (size_t v = 0; v < t->nvols; v++)
-        n += eng_series_count(t->vols[v]);
+        n += t->vols[v] ? eng_series_count(t->vols[v]) : 0;
     pthread_rwlock_unlock(&t->lock);
     return n;
 }
@@ -1757,7 +1822,9 @@ int tsdb_series_type(tsdb *t, tsdb_sid id, tsdb_type *type)
 {
     eng *e EREFM = NULL;
     uint32_t local;
-    int ty = route_meta(t, id, &e, &local) ? eng_series_type(e, local) : -1;
+    if (!route_meta(t, id, &e, &local))
+        return route_fail(TSDB_ERR_NOTFOUND); /* UNAVAILABLE: a cluster volume held elsewhere, or being swapped */
+    int ty = eng_series_type(e, local);
     if (ty < 0)
         return TSDB_ERR_NOTFOUND;
     *type = (tsdb_type)ty;
@@ -1768,7 +1835,7 @@ int tsdb_series_class(tsdb *t, tsdb_sid id, int *cls)
 {
     eng *e EREFM = NULL;
     uint32_t local;
-    return route_meta(t, id, &e, &local) ? eng_series_class(e, local, cls) : TSDB_ERR_NOTFOUND;
+    return route_meta(t, id, &e, &local) ? eng_series_class(e, local, cls) : route_fail(TSDB_ERR_NOTFOUND);
 }
 
 /* tests/test_damage.c: cls_observe on every part of the root volume, as the merge thread does on an idle partition */
@@ -1796,6 +1863,8 @@ void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg)
     t->test_precommit = fn;
     t->test_precommit_arg = arg;
     for (size_t i = 0; i < t->nvols; i++) {
+        if (!t->vols[i])
+            continue;
         t->vols[i]->test_precommit_arg = arg;
         t->vols[i]->test_precommit = fn;
     }
@@ -1807,6 +1876,8 @@ uint64_t tsdb_test_fence_wakeups(tsdb *t)
     uint64_t n = 0;
     pthread_rwlock_rdlock(&t->lock);
     for (size_t i = 0; i < t->nvols; i++) {
+        if (!t->vols[i])
+            continue;
         pthread_mutex_lock(&t->vols[i]->buf_lock);
         n += t->vols[i]->lw_wakeups;
         pthread_mutex_unlock(&t->vols[i]->buf_lock);
@@ -1820,7 +1891,7 @@ uint64_t tsdb_test_fence_wakeups(tsdb *t)
 int tsdb_volume_quiesce(tsdb *t, size_t vol)
 {
     pthread_rwlock_wrlock(&t->lock); /* after this no reader of the lock can still be about to take a reference */
-    int rc = vol < t->nvols ? 0 : TSDB_ERR_INVALID;
+    int rc = vol < t->nvols && t->vols[vol] ? 0 : TSDB_ERR_INVALID;
     if (rc == 0)
         atomic_store_explicit(&t->vols[vol]->quiesced, true, memory_order_release);
     pthread_rwlock_unlock(&t->lock);
@@ -1830,7 +1901,7 @@ int tsdb_volume_quiesce(tsdb *t, size_t vol)
 int tsdb_volume_resume(tsdb *t, size_t vol)
 {
     pthread_rwlock_wrlock(&t->lock);
-    int rc = vol < t->nvols ? 0 : TSDB_ERR_INVALID;
+    int rc = vol < t->nvols && t->vols[vol] ? 0 : TSDB_ERR_INVALID;
     if (rc == 0)
         atomic_store_explicit(&t->vols[vol]->quiesced, false, memory_order_release);
     pthread_rwlock_unlock(&t->lock);
@@ -2040,6 +2111,8 @@ void tsdb_set_write_wait_hook(tsdb *t, void (*on_wait)(void *ctx, int delta), vo
     t->wait_fn = on_wait;
     t->wait_ctx = ctx;
     for (size_t i = 0; i < t->nvols; i++) { /* waits read it under buf_lock, and keep what they counted with */
+        if (!t->vols[i])
+            continue;
         pthread_mutex_lock(&t->vols[i]->buf_lock);
         t->vols[i]->wait_fn = on_wait;
         t->vols[i]->wait_ctx = ctx;
@@ -2053,6 +2126,8 @@ void tsdb_test_dict_fault(tsdb *t, int (*fn)(void *arg, int point, const char *n
 {
     pthread_rwlock_rdlock(&t->lock);
     for (size_t i = 0; i < t->nvols; i++) {
+        if (!t->vols[i])
+            continue;
         series_dict *ds[2] = {&t->vols[i]->series, &t->vols[i]->states};
         for (int k = 0; k < 2; k++) {
             __atomic_store_n(&ds[k]->test_fault_arg, arg, __ATOMIC_RELEASE);
@@ -2085,6 +2160,8 @@ bool tsdb_test_latest_wr_held(tsdb *t)
 void tsdb_test_midplace(tsdb *t, void (*fn)(void *), void *arg)
 {
     for (size_t i = 0; i < t->nvols; i++) {
+        if (!t->vols[i])
+            continue;
         t->vols[i]->test_midplace_arg = arg;
         t->vols[i]->test_midplace = fn;
     }
@@ -2235,6 +2312,10 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
         }
         int64_t v0 = sid_volume(series[0]);
         one = diff == 0;
+        if (one && v0 >= 0 && (size_t)v0 < nv && !t->vols[v0]) {
+            pthread_rwlock_unlock(&t->lock);
+            return t->cluster && t->cnames[v0] ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_INVALID;
+        }
         if (one && (v0 < 0 || (size_t)v0 >= nv || top >= eng_series_count(t->vols[v0]))) {
             pthread_rwlock_unlock(&t->lock);
             return TSDB_ERR_INVALID;
@@ -2246,9 +2327,10 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
     for (size_t i = 0; !one && i < n; i++) {
         int64_t v = sid_volume(series[i]);
         if (v != lastv) {
-            if (v < 0 || (size_t)v >= nv) {
+            if (v < 0 || (size_t)v >= nv || !t->vols[v]) {
+                bool held_elsewhere = v >= 0 && (size_t)v < nv && t->cluster && t->cnames[v];
                 pthread_rwlock_unlock(&t->lock);
-                return TSDB_ERR_INVALID;
+                return held_elsewhere ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_INVALID;
             }
             lim = eng_series_count(t->vols[v]);
             lastv = v;
@@ -2417,7 +2499,7 @@ static int each(tsdb *t, int (*fn)(eng *))
     if (v && live) {
         memcpy(v, t->vols, n * sizeof *v);
         for (size_t i = 0; i < n; i++)
-            if ((live[i] = !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
+            if ((live[i] = v[i] && !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
                 eng_ref(v[i]);
     }
     pthread_rwlock_unlock(&t->lock);
@@ -2428,7 +2510,7 @@ static int each(tsdb *t, int (*fn)(eng *))
     }
     int rc = 0;
     for (size_t i = 0; i < n; i++) {
-        int r = live[i] ? fn(v[i]) : TSDB_ERR_UNAVAILABLE; /* a volume in recovery is not flushed or merged now */
+        int r = live[i] ? fn(v[i]) : v[i] ? TSDB_ERR_UNAVAILABLE : 0; /* a volume in recovery is not flushed or merged now */
         rc = rc ? rc : r;
         if (live[i])
             eng_unref(&v[i]);
@@ -2447,7 +2529,7 @@ int tsdb_failed(tsdb *t, char *msg, size_t len)
     pthread_rwlock_rdlock(&t->lock);
     int rc = 0;
     for (size_t i = 0; i < t->nvols && rc == 0; i++)
-        rc = eng_failed_msg(t->vols[i], msg, len);
+        rc = t->vols[i] ? eng_failed_msg(t->vols[i], msg, len) : 0;
     pthread_rwlock_unlock(&t->lock);
     return rc;
 }
@@ -2456,7 +2538,7 @@ int tsdb_volume_failed(tsdb *t, uint32_t volume, char *msg, size_t len)
     if (msg && len)
         msg[0] = '\0';
     pthread_rwlock_rdlock(&t->lock);
-    int rc = volume < t->nvols ? eng_failed_msg(t->vols[volume], msg, len) : TSDB_ERR_INVALID;
+    int rc = volume < t->nvols && t->vols[volume] ? eng_failed_msg(t->vols[volume], msg, len) : TSDB_ERR_INVALID;
     pthread_rwlock_unlock(&t->lock);
     return rc;
 }
@@ -3113,6 +3195,8 @@ int tsdb_get_stats(tsdb *t, tsdb_stats *st)
     pthread_rwlock_rdlock(&t->lock);
     for (size_t i = 0; i < t->nvols; i++) {
         tsdb_stats s;
+        if (!t->vols[i])
+            continue;
         eng_get_stats(t->vols[i], &s);
         st->parts += s.parts;
         st->partitions += s.partitions;
@@ -3132,7 +3216,7 @@ int tsdb_get_stats(tsdb *t, tsdb_stats *st)
 int tsdb_get_volume_stats(tsdb *t, uint32_t volume, tsdb_volume_stats *st)
 {
     pthread_rwlock_rdlock(&t->lock);
-    int rc = volume < t->nvols ? eng_get_volume_stats(t->vols[volume], st) : TSDB_ERR_INVALID;
+    int rc = volume < t->nvols && t->vols[volume] ? eng_get_volume_stats(t->vols[volume], st) : TSDB_ERR_INVALID;
     pthread_rwlock_unlock(&t->lock);
     return rc;
 }
@@ -3141,7 +3225,7 @@ int tsdb_get_latest_stats(tsdb *t, uint32_t volume, tsdb_latest_stats *st)
 {
     pthread_rwlock_rdlock(&t->lock);
     int rc = TSDB_ERR_INVALID;
-    if (volume < t->nvols) {
+    if (volume < t->nvols && t->vols[volume]) {
         latest_info(t->vols[volume], st);
         rc = 0;
     }
@@ -3155,13 +3239,13 @@ int tsdb_stats_settle(tsdb *t, int timeout_ms)
     size_t n = t->nvols;
     eng **es = malloc((n ? n : 1) * sizeof *es);
     for (size_t i = 0; es && i < n; i++)
-        es[i] = eng_ref(t->vols[i]);
+        es[i] = t->vols[i] ? eng_ref(t->vols[i]) : NULL;
     pthread_rwlock_unlock(&t->lock);
     if (!es)
         return TSDB_ERR_NOMEM;
     int rc = 0;
     for (size_t i = 0; i < n; i++) {
-        int r = rc ? 0 : stats_settle(es[i], timeout_ms);
+        int r = rc || !es[i] ? 0 : stats_settle(es[i], timeout_ms);
         rc = rc ? rc : r;
         eng_unref(&es[i]);
     }
@@ -3258,7 +3342,8 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
                 qreg_hot_collect(t->reg, ar);
             pthread_rwlock_rdlock(&t->lock);
             for (size_t v = 0; v < t->nvols; v++)
-                eng_hot_collect(t->vols[v], aw, NULL, (uint64_t)(v + 1) << 32);
+                if (t->vols[v])
+                    eng_hot_collect(t->vols[v], aw, NULL, (uint64_t)(v + 1) << 32);
             pthread_rwlock_unlock(&t->lock);
             for (size_t i = 0; i < *done; i++)
                 if (out[i].status == 0) {
@@ -3291,7 +3376,8 @@ int tsdb_set_tenants(tsdb *t, const char *const *prefixes, size_t n)
     pthread_mutex_unlock(&t->tl_mu);
     pthread_rwlock_rdlock(&t->lock);
     for (size_t i = 0; i < t->nvols; i++)
-        eng_set_tenants(t->vols[i], (const char *const *)nl->s, nl->n);
+        if (t->vols[i])
+            eng_set_tenants(t->vols[i], (const char *const *)nl->s, nl->n);
     pthread_rwlock_unlock(&t->lock);
     pthread_mutex_unlock(&t->set_mu);
     tlist_unref(old);
@@ -3335,7 +3421,7 @@ int tsdb_tenant_stats_get(tsdb *t, const char *prefix, uint32_t volume, tsdb_ten
         pthread_rwlock_rdlock(&t->lock);
         size_t lo = 0, hi = t->nvols;
         if (volume != TSDB_TENANT_VOLUME_SUM) {
-            if (volume >= t->nvols)
+            if (volume >= t->nvols || !t->vols[volume])
                 rc = TSDB_ERR_INVALID;
             lo = volume;
             hi = (size_t)volume + 1;
@@ -3343,6 +3429,8 @@ int tsdb_tenant_stats_get(tsdb *t, const char *prefix, uint32_t volume, tsdb_ten
         for (size_t v = lo; rc == 0 && v < hi; v++) {
             uint64_t x[17], stale;
             uint32_t fl;
+            if (!t->vols[v])
+                continue;
             if ((rc = eng_tenant_fill(t->vols[v], no, x, &fl, &stale)) != 0)
                 break;
             for (int i = 0; i < 17; i++)
@@ -3376,7 +3464,8 @@ int tsdb_hot_series(tsdb *t, int kind, tsdb_hot *out, size_t k, size_t *n, uint6
     } else {
         pthread_rwlock_rdlock(&t->lock);
         for (size_t v = 0; v < t->nvols; v++)
-            eng_hot_collect(t->vols[v], kind == TSDB_HOT_WRITES ? a : NULL, kind == TSDB_HOT_BYTES_PER_ROW ? a : NULL,
+            if (t->vols[v])
+                eng_hot_collect(t->vols[v], kind == TSDB_HOT_WRITES ? a : NULL, kind == TSDB_HOT_BYTES_PER_ROW ? a : NULL,
                             (uint64_t)(v + 1) << 32);
         pthread_rwlock_unlock(&t->lock);
     }
@@ -3390,7 +3479,7 @@ int tsdb_foreach_part(tsdb *t, void (*fn)(void *ctx, const tsdb_part_info *info)
     pthread_rwlock_rdlock(&t->lock);
     int rc = 0;
     for (size_t i = 0; i < t->nvols && rc == 0; i++)
-        rc = eng_foreach_part(t->vols[i], fn, ctx);
+        rc = t->vols[i] ? eng_foreach_part(t->vols[i], fn, ctx) : 0;
     pthread_rwlock_unlock(&t->lock);
     return rc;
 }
@@ -3685,4 +3774,319 @@ int tsdb_upgrade(const char *dir)
         close(vfd);
     close(rootfd);
     return rc ? rc : done;
+}
+
+/* ------------------------------------------------------------ cluster volumes (cvol.h) */
+
+void (*tsdb_cvol_test_replace_hook)(void *arg);
+void *tsdb_cvol_test_replace_arg;
+
+static int vols_reserve(tsdb *t, size_t n)
+{
+    while (t->vols_cap < n) {
+        size_t keep = t->nvols;
+        t->nvols = t->vols_cap; /* vols_grow grows a full table */
+        int rc = vols_grow(t);
+        t->nvols = keep;
+        if (rc)
+            return rc;
+    }
+    return 0;
+}
+
+int tsdb_cvol_mode(tsdb *t)
+{
+    if (t->opt.read_only)
+        return TSDB_ERR_READONLY;
+    pthread_rwlock_wrlock(&t->lock);
+    int rc = 0;
+    for (size_t v = 1; v < t->nvols; v++) {
+        fprintf(stderr, "tsdb: %s: VOLUMES lists volume %zu at %s; a cluster node's volumes come from the metadata "
+                        "group only (a node of the 0.10.0 preview is initialised again, not upgraded)\n",
+                t->dir, v, t->paths[v] ? t->paths[v] : "?");
+        rc = TSDB_ERR_INVALID;
+    }
+    uint32_t ns = eng_series_count(t->vols[0]);
+    if (ns) {
+        fprintf(stderr, "tsdb: %s: the root holds %u series; a cluster node keeps series in cluster volumes only "
+                        "(a node of the 0.10.0 preview is initialised again, not upgraded)\n", t->dir, ns);
+        rc = TSDB_ERR_INVALID;
+    }
+    if (rc == 0 && !t->cluster) {
+        t->cnames = calloc(t->vols_cap, sizeof *t->cnames);
+        t->crole = calloc(t->vols_cap, 1);
+        if (!t->cnames || !t->crole) {
+            free(t->cnames);
+            free(t->crole);
+            t->cnames = NULL;
+            t->crole = NULL;
+            rc = TSDB_ERR_NOMEM;
+        } else {
+            t->cluster = true;
+        }
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
+
+int tsdb_cvol_declare(tsdb *t, uint32_t number, const char *name)
+{
+    if (!t->cluster || number == 0 || number >= MAX_VOLUMES || !name || !*name || strlen(name) > 255)
+        return TSDB_ERR_INVALID;
+    char *dup = strdup(name);
+    if (!dup)
+        return TSDB_ERR_NOMEM;
+    pthread_rwlock_wrlock(&t->lock);
+    int rc = vols_reserve(t, (size_t)number + 1);
+    for (size_t v = 1; rc == 0 && v < t->nvols; v++)
+        if (v != number && t->cnames[v] && strcmp(t->cnames[v], name) == 0)
+            rc = TSDB_ERR_INVALID; /* the metadata group never gives one name twice */
+    if (rc == 0 && t->cnames[number] && strcmp(t->cnames[number], name) != 0)
+        rc = TSDB_ERR_INVALID; /* names never change */
+    if (rc == 0 && !t->cnames[number]) {
+        t->cnames[number] = dup;
+        dup = NULL;
+        if (t->nvols <= number)
+            t->nvols = (size_t)number + 1;
+    }
+    pthread_rwlock_unlock(&t->lock);
+    free(dup);
+    return rc;
+}
+
+int tsdb_cvol_find(tsdb *t, const char *name, uint32_t *number)
+{
+    if (!t->cluster || !name)
+        return TSDB_ERR_NOTFOUND;
+    pthread_rwlock_rdlock(&t->lock);
+    int rc = TSDB_ERR_NOTFOUND;
+    for (size_t v = 1; v < t->nvols && rc; v++)
+        if (t->cnames[v] && strcmp(t->cnames[v], name) == 0) {
+            *number = (uint32_t)v;
+            rc = 0;
+        }
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
+
+int tsdb_cvol_role(tsdb *t, uint32_t number)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    int r = t->cluster && number < t->nvols && t->vols[number] ? t->crole[number] : CVOL_NONE;
+    pthread_rwlock_unlock(&t->lock);
+    return r;
+}
+
+eng *tsdb_cvol_ref(tsdb *t, uint32_t number)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    eng *e = t->cluster && number < t->nvols ? t->vols[number] : NULL;
+    if (e && atomic_load_explicit(&e->quiesced, memory_order_acquire))
+        e = NULL;
+    if (e)
+        eng_ref(e);
+    pthread_rwlock_unlock(&t->lock);
+    return e;
+}
+
+void tsdb_cvol_unref(eng **e) { eng_unref(e); }
+
+/* Lists e as volume `number` unless another engine is there (then 0 and e is not listed: the caller closes it). */
+static bool cvol_list(tsdb *t, uint32_t number, eng *e, char *path, int role, int expect)
+{
+    pthread_rwlock_wrlock(&t->lock);
+    bool listed = number < t->nvols && !t->vols[number] && t->crole[number] == expect;
+    if (listed) {
+        e->wait_fn = t->wait_fn; /* before anyone can write to it */
+        e->wait_ctx = t->wait_ctx;
+        e->test_precommit = t->test_precommit;
+        e->test_precommit_arg = t->test_precommit_arg;
+        t->vols[number] = e;
+        if (path) {
+            free(t->paths[number]);
+            t->paths[number] = path;
+        }
+        t->crole[number] = (uint8_t)role;
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return listed;
+}
+
+int tsdb_cvol_open(tsdb *t, uint32_t number, const char *dir, bool replica, uint64_t floor)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    bool ok = t->cluster && number < t->nvols && t->cnames[number] && !t->vols[number] && t->crole[number] == CVOL_NONE;
+    pthread_rwlock_unlock(&t->lock);
+    if (!ok || !dir)
+        return TSDB_ERR_INVALID;
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    char *txt;
+    size_t len;
+    int rc = read_file_all(dfd, "META", &txt, &len);
+    close(dfd);
+    if (rc)
+        return rc;
+    long mv = meta_volume(txt);
+    free(txt);
+    if (mv != (long)number) { /* the number is inside the ids clients keep: one directory, one number */
+        fprintf(stderr, "tsdb: %s/META says volume=%ld, but the metadata group holds it as volume %u: not opened\n",
+                dir, mv, number);
+        return TSDB_ERR_CORRUPT;
+    }
+    char *p = strdup(dir);
+    if (!p)
+        return TSDB_ERR_NOMEM;
+    tsdb_options o;
+    tlist *hold;
+    uint32_t tlgen;
+    opts_with_tenants(t, &o, &hold, &tlgen);
+    eng *e = NULL;
+    meta_cluster_open_allow(true);
+    if (replica) {
+        rc = eng_open_replica(dir, &o, floor, &e);
+    } else {
+        eng_set_open_feed_want(0, NULL); /* a cluster volume has no feed (design-cluster.md 5.3) */
+        rc = eng_open_sched(dir, &o, t->sched, &e);
+    }
+    meta_cluster_open_allow(false);
+    tlist_unref(hold);
+    if (rc) {
+        free(p);
+        return rc;
+    }
+    pthread_mutex_lock(&t->set_mu); /* from the catch-up to the listing: a set in between would miss it */
+    tenants_catch_up(t, e, tlgen);
+    bool listed = cvol_list(t, number, e, p, replica ? CVOL_REPLICA : CVOL_WRITER, CVOL_NONE);
+    pthread_mutex_unlock(&t->set_mu);
+    if (!listed) {
+        eng_close(e);
+        free(p);
+        return TSDB_ERR_INVALID;
+    }
+    return 0;
+}
+
+/* The name strings of an engine about to be closed by someone else's call (replica_promote's eng_close): with
+ * `retiring` set the close keeps them, and these pointers go to kept_names once it has run. */
+static void names_snapshot(series_dict *d, char ***v, size_t *n, size_t *cap)
+{
+    if (!d->file)
+        return;
+    pthread_mutex_lock(&d->lock);
+    uint32_t cnt = atomic_load(&d->count);
+    if (*n + cnt > *cap) {
+        size_t nc = *n + cnt;
+        char **x = realloc(*v, (nc ? nc : 1) * sizeof *x);
+        if (!x) {
+            pthread_mutex_unlock(&d->lock);
+            return; /* the strings are never freed: a leak of a few bytes, not a dangling name */
+        }
+        *v = x;
+        *cap = nc;
+    }
+    for (uint32_t i = 0; i < cnt; i++)
+        (*v)[(*n)++] = d->names[i];
+    pthread_mutex_unlock(&d->lock);
+}
+
+int tsdb_cvol_replace(tsdb *t, uint32_t number, int (*fn)(void *ctx, eng **old, eng **neu), void *ctx, int role)
+{
+    /* Out of the table first: a request that routes here now finds a declared volume without an engine and gets
+     * UNAVAILABLE, a name or type lookup included (route_meta would otherwise keep taking references on a
+     * quiesced engine, and the swap could wait for ever). */
+    pthread_rwlock_wrlock(&t->lock);
+    eng *old = t->cluster && number < t->nvols ? t->vols[number] : NULL;
+    bool was_q = old && atomic_load_explicit(&old->quiesced, memory_order_acquire);
+    int old_role = old ? t->crole[number] : CVOL_NONE;
+    if (old) {
+        atomic_store_explicit(&old->quiesced, true, memory_order_release);
+        t->vols[number] = NULL;
+        t->crole[number] = CVOL_SWAP; /* no tsdb_cvol_open lists into the empty slot meanwhile */
+    }
+    pthread_rwlock_unlock(&t->lock);
+    if (!old)
+        return TSDB_ERR_INVALID;
+    if (tsdb_cvol_test_replace_hook)
+        tsdb_cvol_test_replace_hook(tsdb_cvol_test_replace_arg);
+    /* Every call inside, every lookup, and every multi call's cut (it holds parts of the engine; eng_cut_drop does not
+     * signal, hence the timed wait) */
+    pthread_mutex_lock(&idle_mu);
+    while (atomic_load_explicit(&old->refs, memory_order_acquire) > 0 ||
+           atomic_load_explicit(&old->mrefs, memory_order_acquire) > 0 || old->crefs > 0) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 10 * 1000000L;
+        if (until.tv_nsec >= 1000000000L) {
+            until.tv_sec++;
+            until.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&idle_cv, &idle_mu, &until);
+    }
+    pthread_mutex_unlock(&idle_mu);
+    char **names = NULL;
+    size_t nn = 0, cap = 0;
+    names_snapshot(&old->series, &names, &nn, &cap);
+    names_snapshot(&old->states, &names, &nn, &cap);
+    old->retiring = true; /* its close writes nothing and keeps the names: tsdb_series_name pointers outlive it */
+    eng *o = old, *neu = NULL;
+    meta_cluster_open_allow(true);
+    int rc = fn(ctx, &o, &neu);
+    meta_cluster_open_allow(false);
+    if (o) { /* not closed: the old engine goes on */
+        old->retiring = false;
+        free(names);
+        if (neu)
+            eng_close(neu); /* fn's contract says never; nothing listed it */
+        pthread_rwlock_wrlock(&t->lock);
+        t->vols[number] = old;
+        t->crole[number] = (uint8_t)old_role;
+        atomic_store_explicit(&old->quiesced, was_q, memory_order_release);
+        pthread_rwlock_unlock(&t->lock);
+        return rc ? rc : TSDB_ERR_INVALID;
+    }
+    pthread_mutex_lock(&t->kept_mu);
+    if (t->nkept + nn > t->capkept) {
+        size_t nc = (t->nkept + nn) * 2;
+        char **x = realloc(t->kept_names, nc * sizeof *x);
+        if (x) {
+            t->kept_names = x;
+            t->capkept = nc;
+        }
+    }
+    for (size_t i = 0; i < nn && t->nkept < t->capkept; i++) /* without room: leaked, never dangling */
+        t->kept_names[t->nkept++] = names[i];
+    pthread_mutex_unlock(&t->kept_mu);
+    free(names);
+    if (!neu) {
+        pthread_rwlock_wrlock(&t->lock);
+        t->crole[number] = CVOL_NONE;
+        pthread_rwlock_unlock(&t->lock);
+        return rc ? rc : TSDB_ERR_IO;
+    }
+    pthread_mutex_lock(&t->tl_mu);
+    uint32_t gen = t->tlgen + 1; /* not the current one: the catch-up pushes the list (fn opened without it) */
+    pthread_mutex_unlock(&t->tl_mu);
+    pthread_mutex_lock(&t->set_mu);
+    tenants_catch_up(t, neu, gen);
+    bool listed = cvol_list(t, number, neu, NULL, role, CVOL_SWAP);
+    pthread_mutex_unlock(&t->set_mu);
+    if (!listed) { /* never: the slot is CVOL_SWAP, which only this call lists into */
+        eng_close(neu);
+        return TSDB_ERR_INVALID;
+    }
+    return rc;
+}
+
+static int cvol_promote_fn(void *ctx, eng **old, eng **neu)
+{
+    return replica_promote(old, *(const uint64_t *)ctx, neu);
+}
+
+int tsdb_cvol_promote(tsdb *t, uint32_t number, uint64_t epoch_pos)
+{
+    if (tsdb_cvol_role(t, number) != CVOL_REPLICA)
+        return TSDB_ERR_INVALID;
+    return tsdb_cvol_replace(t, number, cvol_promote_fn, &epoch_pos, CVOL_WRITER);
 }
