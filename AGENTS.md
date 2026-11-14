@@ -195,6 +195,12 @@ cgroup, so `nice` does not keep your work out of its way.
   path for a store known to be down (its index stays; named stores must open). `tests/test_chunk.c` (exhaustive damage patterns for every geometry, power loss and EIO under crashfs, mutants
   via `--mutant nosums|nofence|eof|settings|nosync|epochnosync`), `tests/fuzz/fuzz_chunk.c`, `tests/fuzz/fuzz_ec.c`.
   The embedded bindings copy `src/*.c`: the files build without `TSDB_EC` (`chunk_encode` then says `TSDB_ERR_INVALID`).
+- `src/chunk*.c` (objects, chunk files, stores, the directory backend; R6): `chunkstore.c` (files, EPOCH, `chunk_be_open2` with
+  `min_up`: a store that is missing, has another id, a damaged META or EIO is DOWN and read around, BUSY and one store twice
+  always fail the open), `chunkread.c` (decode; UNAVAILABLE while stores are down, CORRUPT only when lost), `chunkheal.c`
+  (heal, repair, settle, attach, replace: rebuilt chunks are checked against the survivors' sums, written as new files at
+  the object's epoch, never from fewer than k' positions, never for what `live` says is deleted; a new store gets every
+  fence before its first chunk). `tests/test_chunk.c`, `tests/test_chunk_heal.c` (mutants in the Makefile).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,

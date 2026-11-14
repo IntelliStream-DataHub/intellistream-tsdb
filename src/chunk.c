@@ -325,6 +325,44 @@ void *chunk_rs_get(unsigned k, unsigned m)
 }
 #endif
 
+#ifdef TSDB_EC
+/* Stripe s: `cells` points at the bytes of its first data cell (cell s * k); mem is (k + m) * cap bytes of scratch. */
+static int encode_stripe(const chunk_geom *g, iso_rs *rs, uint64_t s, const uint8_t *cells, uint8_t *mem, size_t cap,
+                         chunk_cell_fn fn, void *ctx, uint64_t *sums_out, const uint64_t *bases)
+{
+    unsigned k = g->k, m = g->m;
+    uint64_t ncells = chunk_ncells(g);
+    size_t ls = (size_t)chunk_stripe_len(g, s);
+    uint8_t *shards[CHUNK_POS_MAX];
+    for (unsigned i = 0; i < k; i++) {
+        uint64_t c = s * k + i, cl = chunk_cell_len(g, c);
+        if (c < ncells && cl == ls) { /* a full-length cell is read in place */
+            shards[i] = (uint8_t *)(uintptr_t)(cells + (size_t)i * g->cell);
+            continue;
+        }
+        shards[i] = mem + (size_t)i * cap;
+        if (cl)
+            memcpy(shards[i], cells + (size_t)i * g->cell, (size_t)cl);
+        memset(shards[i] + cl, 0, ls - (size_t)cl); /* the padding of a short or missing cell: zeros, never stored */
+    }
+    for (unsigned j = 0; j < m; j++)
+        shards[k + j] = mem + (size_t)(k + j) * cap;
+    iso_rs_encode(rs, shards, ls);
+    int rc = 0;
+    for (unsigned p = 0; p < k + m && rc == 0; p++) {
+        size_t len = p < k ? (size_t)chunk_cell_len(g, s * k + p) : ls;
+        if (len == 0)
+            continue; /* a data cell past the end of the object */
+        uint64_t sum = xxh64(shards[p], len, 0);
+        if (sums_out)
+            sums_out[bases[p] + s] = sum;
+        if (fn)
+            rc = fn(ctx, p, s, shards[p], len, sum);
+    }
+    return rc;
+}
+#endif
+
 int chunk_encode(const chunk_geom *g, const uint8_t *obj, chunk_cell_fn fn, void *ctx, uint64_t *sums_out)
 {
 #ifndef TSDB_EC
@@ -337,7 +375,7 @@ int chunk_encode(const chunk_geom *g, const uint8_t *obj, chunk_cell_fn fn, void
     iso_rs *rs = chunk_rs_get(k, m);
     if (!rs)
         return TSDB_ERR_NOMEM;
-    uint64_t ncells = chunk_ncells(g), ns = chunk_nstripes(g), bases[CHUNK_POS_MAX];
+    uint64_t ns = chunk_nstripes(g), bases[CHUNK_POS_MAX];
     for (unsigned p = 0; p < k + m; p++)
         bases[p] = chunk_sums_base(g, p);
     size_t cap = g->cell > g->len ? (size_t)g->len : g->cell; /* the longest cell */
@@ -345,34 +383,29 @@ int chunk_encode(const chunk_geom *g, const uint8_t *obj, chunk_cell_fn fn, void
     if (!mem)
         return TSDB_ERR_NOMEM;
     int rc = 0;
-    for (uint64_t s = 0; s < ns && rc == 0; s++) {
-        size_t ls = (size_t)chunk_stripe_len(g, s);
-        uint8_t *shards[CHUNK_POS_MAX];
-        for (unsigned i = 0; i < k; i++) {
-            uint64_t c = s * k + i, cl = chunk_cell_len(g, c);
-            if (c < ncells && cl == ls) { /* a full-length cell is read in place */
-                shards[i] = (uint8_t *)(uintptr_t)(obj + c * g->cell);
-                continue;
-            }
-            shards[i] = mem + (size_t)i * cap;
-            if (cl)
-                memcpy(shards[i], obj + c * g->cell, (size_t)cl);
-            memset(shards[i] + cl, 0, ls - (size_t)cl); /* the padding of a short or missing cell: zeros, never stored */
-        }
-        for (unsigned j = 0; j < m; j++)
-            shards[k + j] = mem + (size_t)(k + j) * cap;
-        iso_rs_encode(rs, shards, ls);
-        for (unsigned p = 0; p < k + m && rc == 0; p++) {
-            size_t len = p < k ? (size_t)chunk_cell_len(g, s * k + p) : ls;
-            if (len == 0)
-                continue; /* a data cell past the end of the object */
-            uint64_t sum = xxh64(shards[p], len, 0);
-            if (sums_out)
-                sums_out[bases[p] + s] = sum;
-            if (fn)
-                rc = fn(ctx, p, s, shards[p], len, sum);
-        }
-    }
+    for (uint64_t s = 0; s < ns && rc == 0; s++)
+        rc = encode_stripe(g, rs, s, obj + s * k * g->cell, mem, cap, fn, ctx, sums_out, bases);
+    free(mem);
+    return rc;
+#endif
+}
+
+int chunk_encode_stripe(const chunk_geom *g, uint64_t s, const uint8_t *stripe, chunk_cell_fn fn, void *ctx)
+{
+#ifndef TSDB_EC
+    (void)g, (void)s, (void)stripe, (void)fn, (void)ctx;
+    return TSDB_ERR_INVALID;
+#else
+    if (!chunk_geom_valid(g) || s >= chunk_nstripes(g))
+        return TSDB_ERR_INVALID;
+    iso_rs *rs = chunk_rs_get(g->k, g->m);
+    if (!rs)
+        return TSDB_ERR_NOMEM;
+    size_t cap = g->cell > g->len ? (size_t)g->len : g->cell;
+    uint8_t *mem = malloc((size_t)(g->k + g->m) * cap);
+    if (!mem)
+        return TSDB_ERR_NOMEM;
+    int rc = encode_stripe(g, rs, s, stripe, mem, cap, fn, ctx, NULL, NULL);
     free(mem);
     return rc;
 #endif

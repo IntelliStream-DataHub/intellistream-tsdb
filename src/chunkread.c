@@ -155,14 +155,19 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
         unsigned absent = 0, damaged = 0, io = 0;
         for (unsigned p = 0; p < k + m; p++)
             absent += sts[p] == CHUNK_ST_ABSENT, damaged += sts[p] == CHUNK_ST_DAMAGED, io += sts[p] == CHUNK_ST_IOERR;
-        unsigned nbad = 0;
-        for (unsigned p = 0; p < k + m; p++)
+        unsigned nbad = 0, down = 0;
+        for (unsigned p = 0; p < k + m; p++) {
             nbad += isbad[p] || sts[p];
+            /* a position whose store is merely away: the cell may be fine (E15: unavailable, never lost) */
+            down += (sts[p] ? sts[p] : isbad[p] ? r->rep->st[p] : 0) == CHUNK_ST_DOWN;
+        }
+        bool away = ngood + down >= k;
         if (!chunk_log_quiet)
             fprintf(stderr, "tsdb: object %s: stripe %llu has %u good chunks of the %u it needs (%u of %u positions "
-                        "unusable: %u absent, %u damaged, %u unreadable): not readable\n", r->src->name,
-                (unsigned long long)s, ngood, k, nbad, k + m, absent, damaged, io);
-        return TSDB_ERR_CORRUPT;
+                        "unusable: %u absent, %u damaged, %u unreadable, %u on stores that are down): %s\n",
+                    r->src->name, (unsigned long long)s, ngood, k, nbad, k + m, absent, damaged, io, down,
+                    away ? "unavailable while they are" : "not readable");
+        return away ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
     }
     /* the buffers the decode fills: every absent data position gets one of its own */
     for (unsigned p = 0; p < k + m; p++)
@@ -333,12 +338,24 @@ int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], 
         if (!have && o->st[p] == CHUNK_ST_ABSENT && p + 1 >= CHUNK_POS_MAX)
             break;
     }
+    bool away = false; /* a store that is not UP: what it holds may be what this object lacks */
+    for (int i = 0; i < chunk_be_nstores(be); i++)
+        away |= chunk_be_store_state(be, i) != CHUNK_STORE_UP;
     if (!alive || !have) {
-        if (worst != TSDB_ERR_NOTFOUND && !chunk_log_quiet)
+        if (away && !chunk_log_quiet && worst != TSDB_ERR_NOTFOUND)
+            fprintf(stderr, "tsdb: object %s: no chunk of it can be read while a store is down: unavailable\n", o->name);
+        else if (worst != TSDB_ERR_NOTFOUND && !chunk_log_quiet)
             fprintf(stderr, "tsdb: object %s: no chunk of it can be read: not readable\n", o->name);
         chunk_obj_close(o);
+        if (away)
+            return TSDB_ERR_UNAVAILABLE;
         return worst == TSDB_ERR_NOTFOUND ? TSDB_ERR_NOTFOUND : TSDB_ERR_CORRUPT;
     }
+    if (away)
+        for (unsigned p = 0; p < chunk_npos(&o->g); p++)
+            if (!o->rd[p] && o->st[p] == CHUNK_ST_ABSENT &&
+                chunk_be_store_state(be, chunk_be_pos_store(be, oid, p)) != CHUNK_STORE_UP)
+                o->st[p] = CHUNK_ST_DOWN; /* it may be there: it comes back with its store (or its heal) */
     if (chunk_mutant == CHUNK_MUT_SETTINGS) { /* planted: the layout taken from today's settings, not from the object */
         chunk_geom t;
         if (chunk_geom_derive(&t, chunk_settings_k, chunk_settings_m, o->g.len) == 0)
@@ -358,6 +375,25 @@ void chunk_obj_close(chunk_obj *o)
 }
 
 const chunk_geom *chunk_obj_geom(const chunk_obj *o) { return &o->g; }
+
+const uint64_t *chunk_obj_pos_sums(const chunk_obj *o, unsigned pos)
+{
+    return pos < CHUNK_POS_MAX && o->rd[pos] ? chunk_rd_sums(o->rd[pos]) : NULL;
+}
+
+int chunk_obj_pos_status(const chunk_obj *o, unsigned pos)
+{
+    return pos >= CHUNK_POS_MAX ? CHUNK_ST_ABSENT : o->rd[pos] ? CHUNK_ST_OK : o->st[pos];
+}
+
+uint64_t chunk_obj_epoch(const chunk_obj *o)
+{
+    uint64_t e = 0;
+    for (unsigned p = 0; p < CHUNK_POS_MAX; p++)
+        if (o->rd[p] && chunk_rd_hdr(o->rd[p])->epoch > e)
+            e = chunk_rd_hdr(o->rd[p])->epoch;
+    return e;
+}
 
 int chunk_obj_source(chunk_obj *o, chunk_source *src)
 {

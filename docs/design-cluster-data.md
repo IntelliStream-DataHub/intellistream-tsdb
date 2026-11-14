@@ -561,6 +561,20 @@ and fills it. Time: D/disks instead of D, at the same rates as §5.3. On a compu
 is design-cluster.md §8.5's replaced disk: its log replicas become learners and are rebuilt. *2026-11-11*: which disk
 holds what follows from its class (E47-E50), and a lost fast disk leaves the server's chunk stores serving (E54, §15.6).
 
+*2026-11-14* (R6, `src/chunkstore.c`, `src/chunkheal.c`): the directory backend opens **degraded**: a store that is not
+there, has another id (a disk that came back as another one), has a damaged META or fails with EIO is DOWN with its
+reason (one log line), and the open fails (`TSDB_ERR_UNAVAILABLE`, naming them) only when fewer than the caller's
+`min_up` (stores minus m) are UP; another owner of a store (BUSY) and one store reached twice always fail it. Reads go
+around a DOWN store by decoding; an object short of k' readable positions is UNAVAILABLE while a store is merely down,
+CORRUPT only when its chunks are really gone (E15). **Heal** (`chunk_be_heal`, `chunk_be_repair`) rebuilds a chunk that is
+missing or damaged from k' good positions, checks the re-encode against the sums table of every surviving chunk, and
+writes a new file (tmp, fsync, rename, directory fsync) at the object's own writer epoch, then reads it back; it never
+fabricates from fewer than k' positions and never resurrects what the caller's `live` says is deleted (for k' = 1 a copy
+decodes alone, so only `live` can tell). **Replace** (`chunk_be_replace`) makes a fresh store at a new path, gives it
+every volume's fence durably before the first chunk, and fills it by heal while reads treat what it lacks as DOWN;
+**attach** (`chunk_be_attach`) does the same for a store that was away. A put whose position is placed on a DOWN store is
+refused (`UNAVAILABLE`); E10's degraded settle is the cluster's rule, not made here.
+
 ### 5.6 Disks full
 
 A server stops being a placement candidate at its fill mark, `full × (1 − the largest domain's share)`, which keeps
