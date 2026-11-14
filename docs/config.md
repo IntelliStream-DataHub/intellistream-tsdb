@@ -147,6 +147,7 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `cluster.peer.port` | `--peer-port` | integer | unset | The port of the other members. Default: server.port + 1. |
 | `cluster.peer.listen` | `--peer-listen` | string | unset | The address of the peer port. Default: server.listen. |
 | `cluster.advertise` | `--advertise` | string | unset | The host name other members and clients use for this one. |
+| `cluster.peer.advertise` | `--peer-advertise` | string | unset | The peer address (host:port) put in the metadata instead of the advertised host and the real peer port, for a proxy or NAT in front of the peer port. |
 | `cluster.rack` | `--rack` | string | unset | The failure domain of this node (a rack name). |
 | `cluster.secret.file` | `--cluster-secret-file` | string | unset | The file with the cluster's shared secret (mode 600). |
 | `cluster.state.dir` | `--state-dir` | string | unset | Where the metadata group keeps its state (a local disk, never storage.dir). |

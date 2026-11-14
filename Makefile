@@ -750,7 +750,9 @@ $(B)/cluster.o: server/cluster.c server/cluster.h server/meta.h client/tsdb_cryp
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
 $(B)/repl.o: src/repl.c src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
-CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(RAFT_OBJ)
+$(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(RAFT_OBJ)
 $(B)/tsdb: $(B)/cluster-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
@@ -1087,6 +1089,96 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
+
+# jepsen-cluster (tests/jepsen/jepsen_cluster.c, docs/design-cluster.md 13.2): 3-8 tsdbd with a proxy of the harness in
+# front of every peer port, nemeses kill, partition, pause, midcommit (crash points, server/crashpt.h) and power
+# (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
+# each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
+$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/harness.h server/cluster.h server/meta.h server/crashpt.h \
+    $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) $(LIB) \
+	    $(LDLIBS)
+# on a disk, never /tmp (a tmpfs: a failing run keeps the state of five nodes there, and a power run never syncs)
+JEPSEN_CLUSTER_DIR ?= /var/tmp/tsdb-jepsen-cluster-$(shell printf %s "$(CURDIR)" | cksum | cut -d" " -f1)
+JEPSEN_NEMESES ?= kill partition pause midcommit power
+JEPSEN_SEED ?= 1
+JEPSEN_NODES ?= 5
+jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
+	for io in $(IO); do for nem in $(JEPSEN_NEMESES); do echo "== tsdbd --io $$io, nemesis $$nem"; \
+	    TSDBD=./$(B)/tsdbd TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
+	        --nemesis $$nem --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so || exit 1; \
+	    done; done
+
+# The harness has to notice what it is meant to: a port file that names another pid, a client that skips the check
+# of the port it connected to while a foreign server holds the node's old one (and the same client with the check:
+# refused, the run passes), a partition that is not applied, an armed crash point that never fires, a nemesis that
+# sleeps through its naps, a write missing from the final state; and the comparison of replicas finds a row only one
+# has. A crash point that fires is counted.
+# Each check of the histories (validity, durability, atomic visibility, stale and monotonic reads) and the election
+# check are fed a history made here with one thing wrong (--selftest-checker). A nemesis that does nothing (a kill that
+# kills nobody, a pause that stops nobody, a delay that delays nothing, a heal that resumes held links) fails the run.
+jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
+	@d=$(JEPSEN_CLUSTER_DIR)-selftest; j="env TSDBD=./$(B)/tsdbd ./$(B)/jepsen_cluster --dir $$d"; \
+	out=$$($$j --mutant foreign-pid --seconds 5 --nemesis kill 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'names pid'; then \
+	        echo "jepsen-cluster-selftest: a port file that names another pid went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant takeover --seconds 30 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'durability'; then \
+	        echo "jepsen-cluster-selftest: writes that went to a foreign server on the node's old port went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant takeover-checked --seconds 30 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '[1-9][0-9]* refused for a port the node does not hold'; then \
+	        echo "jepsen-cluster-selftest: the check of the port a client connected to did not refuse the foreign server (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant noop-partition --seconds 20 --nemesis partition 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'while the pair was cut'; then \
+	        echo "jepsen-cluster-selftest: a partition that was not applied went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant unfired --seconds 15 --nemesis midcommit 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'never fired on node'; then \
+	        echo "jepsen-cluster-selftest: an armed crash point that never fired went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --seconds 20 --nemesis midcommit 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q 'crash points hit [1-9]'; then \
+	        echo "jepsen-cluster-selftest: a crash point that fires was not counted (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant idle --seconds 25 --nemesis kill 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'the nemesis was idle'; then \
+	        echo "jepsen-cluster-selftest: a nemesis that sleeps through its naps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant lost-write --seconds 12 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a lost write'; then \
+	        echo "jepsen-cluster-selftest: a write missing from the final state went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --selftest-checker 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ]; then \
+	        echo "jepsen-cluster-selftest: a check of the histories or the election check does not find what it is for (rc $$rc)"; echo "$$out" | tail -n 30; exit 1; fi; \
+	out=$$($$j --mutant nokill --seconds 15 --nemesis kill 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'kill nemesis.*had no effect'; then \
+	        echo "jepsen-cluster-selftest: a kill that kills nobody went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant nopause --seconds 20 --nemesis pause 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'pause nemesis.*had no effect'; then \
+	        echo "jepsen-cluster-selftest: a pause that stops nobody went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant nodelay --seconds 20 --nemesis partition 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'partition nemesis.*had no effect'; then \
+	        echo "jepsen-cluster-selftest: a delay that delays nothing went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant noreset --seconds 60 --nemesis partition 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'must be reset at the heal'; then \
+	        echo "jepsen-cluster-selftest: a heal that resumes held links instead of resetting them went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ]; then \
+	        echo "jepsen-cluster-selftest: the comparison of replicas is wrong (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    echo "jepsen-cluster-selftest: ok"
+
+# The harness itself (one thread per proxied link, a sampler, the workloads) under ThreadSanitizer and under ASan+UBSan,
+# against the normal tsdbd: a short run of the kill, partition and pause nemeses (JEPSEN_SANITIZE_SECONDS). The objects
+# of the sanitized builds go to build-jc-tsan/ and build-jc-asan/.
+JEPSEN_SANITIZE_SECONDS ?= 45
+jepsen-cluster-sanitized: $(B)/tsdbd
+	$(MAKE) B=build-jc-tsan ARCH= CFLAGS="-O1 -g -fsanitize=thread -fno-omit-frame-pointer" LDFLAGS="-fsanitize=thread" \
+	    build-jc-tsan/jepsen_cluster
+	$(MAKE) B=build-jc-asan ARCH= CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	    LDFLAGS="-fsanitize=address,undefined" build-jc-asan/jepsen_cluster
+	@set -e; for k in tsan asan; do \
+	    out=$$(TSAN_OPTIONS="halt_on_error=0 second_deadlock_stack=1" ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+	        TSDBD=./$(B)/tsdbd ./build-jc-$$k/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR)-$$k --nemesis kill,partition,pause \
+	        --seconds $(JEPSEN_SANITIZE_SECONDS) 2>&1) && rc=0 || rc=$$?; \
+	    if [ $$rc -ne 0 ] || echo "$$out" | grep -qE 'WARNING: ThreadSanitizer|ERROR: AddressSanitizer|runtime error'; then \
+	        echo "jepsen-cluster-sanitized ($$k): rc $$rc"; echo "$$out" | tail -n 40; exit 1; fi; \
+	    echo "jepsen-cluster-sanitized ($$k): ok"; done
 
 # Build and test on AlmaLinux 10 (the main target OS) in Podman; takes minutes, logs in $LOGDIR.
 # URING=0 keeps Podman's stock seccomp profile, which blocks io_uring as production does: tsdbd then runs on epoll.

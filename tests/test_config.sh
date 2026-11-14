@@ -399,6 +399,14 @@ else
     stop_srv "$srv"
     srv=""
 fi
+# --peer-advertise longer than the metadata's address field (META_ADDR_MAX 128) is refused at the option, not later in cluster_start
+"$B/tsdb" cluster secret "$dir/pa.secret" > /dev/null 2>&1 || fail "tsdb cluster secret"
+long=$(printf 'h%.0s' $(seq 130))
+out=$("$B/tsdbd" --dir "$dir/pa-db" --no-auth --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" \
+    --peer-advertise "$long:1" 2>&1)
+rc=$?
+[ $rc = 1 ] && echo "$out" | grep -q -- '--peer-advertise wants HOST:PORT' \
+    || fail "a 132 byte --peer-advertise: exit $rc, message '$out'"
 cfg cli-bad.properties 'client.server = x' 'client.nope = 1'
 refused "CLI unknown key" 'cli-bad.properties:2' "$B/tsdb" --config "$dir/cli-bad.properties" --check-config
 

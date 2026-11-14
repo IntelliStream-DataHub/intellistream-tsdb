@@ -37,7 +37,8 @@
  * --cluster runs the cluster thread (cluster.c, docs/design-cluster.md): the metadata group on a peer port of its
  * own (--peer-port, default the client port + 1; bound to --peer-listen, default --listen), with its files in
  * DIR/meta/. --advertise is the host other servers and clients reach this one at (default --listen, which must then
- * not be a wildcard). Step 1 of the design: the engine and the client port are unchanged.
+ * not be a wildcard). --peer-advertise HOST:PORT is the peer address put in the metadata instead of that host and the
+ * real peer port (a proxy in front of the peer port: tests/jepsen/jepsen_cluster.c). Step 1 of the design: the engine and the client port are unchanged.
  *
  * --no-stats turns the statistics of what is stored off (no sweeper thread, no query counters, no column totals
  * in the metrics; docs/design-stats.md). On by default: the sweeper follows the open.
@@ -122,6 +123,7 @@
 #include "cluster.h"
 #include "cvol.h"
 #include "../src/cvol.h"
+#include "crashpt.h"
 #include "../tools/cfg.h" /* configuration files: docs/config.md */
 #include "tsdbd_keys.h"
 
@@ -4164,6 +4166,7 @@ int main(int argc, char **argv)
                                    {"peer-port", required_argument, 0, 'y'},
                                    {"peer-listen", required_argument, 0, 'Y'},
                                    {"advertise", required_argument, 0, 'a'},
+                                   {"peer-advertise", required_argument, 0, 0x10e},
                                    {"rack", required_argument, 0, 'k'},
                                    {"cluster-secret-file", required_argument, 0, 'S'},
                                    {"state-dir", required_argument, 0, 0x102},
@@ -4180,7 +4183,7 @@ int main(int argc, char **argv)
     int witness = 0, rb_off = 0;
     char *health_domains[DOM_MAX];
     int nhealth = 0;
-    const char *peer_addr = NULL, *advertise = NULL, *rack = "", *secret_file = NULL;
+    const char *peer_addr = NULL, *advertise = NULL, *peer_advertise = NULL, *rack = "", *secret_file = NULL;
     const char *state_dir = NULL, *power_feed = "", *bmc = "";
     const char *metrics_addr = NULL, *tenants_file = NULL;
     int tenants_settle = 30;
@@ -4330,6 +4333,7 @@ int main(int argc, char **argv)
         case 'y': peer_port = (int)num_arg("peer-port", optarg, 0, 65535); cluster_opts = 1; break;
         case 'Y': peer_addr = optarg; cluster_opts = 1; break;
         case 'a': advertise = optarg; cluster_opts = 1; break;
+        case 0x10e: peer_advertise = optarg; cluster_opts = 1; break;
         case 'k': rack = optarg; cluster_opts = 1; break;
         case 'S': secret_file = optarg; cluster_opts = 1; break;
         case 0x102: state_dir = optarg; cluster_opts = 1; break;
@@ -4431,7 +4435,8 @@ int main(int argc, char **argv)
                         "             [--health-domain PREFIX]... [--no-stats] [--latest-cache BYTES]\n"
                         "             [--tenants FILE] [--tenants-settle 30]\n"
                         "             [--cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
-                        "              [--peer-listen ADDR] [--advertise HOST] [--rack NAME] [--power-feed NAME]\n"
+                        "              [--peer-listen ADDR] [--advertise HOST] [--peer-advertise HOST:PORT] [--rack NAME]\n"
+                        "              [--power-feed NAME]\n"
                         "              [--bmc ADDR] [--read-barrier on|off]]\n"
                         "       tsdbd --witness --cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
                         "             [--peer-listen ADDR] --advertise HOST [--rack NAME] [--power-feed NAME]\n",
@@ -4456,6 +4461,15 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    if (peer_advertise) {
+        const char *colon = strrchr(peer_advertise, ':');
+        char *end = NULL;
+        long pp = colon ? strtol(colon + 1, &end, 10) : 0;
+        if (!colon || colon == peer_advertise || !colon[1] || *end || pp < 1 || pp > 65535 || strlen(peer_advertise) >= META_ADDR_MAX) {
+            fprintf(stderr, "tsdbd: --peer-advertise wants HOST:PORT, not '%s'\n", peer_advertise);
+            return 1;
+        }
+    }
     if (witness) {
         /* A witness (design-ha-modes.md §7.1 item 7): the cluster thread and nothing else. No --dir, no engine, no
          * client port, volumes_ok 0 (never in placement); a voter candidate on any small machine with a local disk.
@@ -4477,6 +4491,8 @@ int main(int argc, char **argv)
         char cadv[256], padv[256];
         snprintf(cadv, sizeof cadv, "%s%s%s:0", lb, host, rb);
         snprintf(padv, sizeof padv, "%s%s%s:%d", lb, host, rb, peer_port);
+        if (peer_advertise)
+            snprintf(padv, sizeof padv, "%s", peer_advertise);
         struct cluster_cfg wc = {.state_dir = state_dir, .peer_fd = wfd, .advertise = cadv, .peer_advertise = padv,
                                  .rack = rack, .power_feed = power_feed, .bmc = bmc, .witness = 1,
                                  .secret = secret, .secret_len = secret_len};
@@ -4673,11 +4689,14 @@ int main(int argc, char **argv)
         char cadv[256], padv[256];
         snprintf(cadv, sizeof cadv, "%s%s%s:%d", lb, host, rb, port);
         snprintf(padv, sizeof padv, "%s%s%s:%d", lb, host, rb, peer_port);
+        if (peer_advertise) /* what the metadata says, not the real peer port (a proxy in front of it, a NAT) */
+            snprintf(padv, sizeof padv, "%s", peer_advertise);
         struct cluster_cfg cc = {.state_dir = state_dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
                                  .rack = rack, .power_feed = power_feed, .bmc = bmc, .read_barrier_off = rb_off,
                                  .secret = secret, .secret_len = secret_len};
         if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0)
             return 1;
+        crash_point(CP_CLUSTER_STARTED); /* the harness restarts the node and counts the hit (tests/jepsen) */
         tsdb_wipe(secret, sizeof secret);
         fprintf(stderr, "tsdbd: cluster peer port on %s:%d (advertised as %s)\n", peer_addr ? peer_addr : addr,
                 peer_port, padv);
@@ -4693,6 +4712,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: cannot write %s: %s\n", port_file, strerror(errno));
         return 1;
     }
+    crash_point(CP_SERVING); /* the node is known to its clients now: the harness sees it end while it serves */
 #ifndef TSDBD_NO_URING
     if (io == IO_URING)
         uring_loop();
