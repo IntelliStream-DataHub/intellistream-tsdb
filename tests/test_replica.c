@@ -3717,6 +3717,56 @@ static void case_depose(void)
     xp_stop(&x);
 }
 
+
+static bool seg_exists(const char *dir, uint64_t seq)
+{
+    char name[64], p[PATH_MAX + 80];
+    wal_name(name, sizeof name, seq);
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return access(p, F_OK) == 0;
+}
+
+/* Item 1 (design-cluster.md 8.3): a leader's flushed segments are the replicas' catch-up source, so they stay until
+ * the driver's keep bound passes their last position. Two flushed segments survive their flush (mutant keepignored:
+ * they go at once); a bound one below the first's last position removes nothing; at that position the first goes,
+ * with FNO holding its end first, and the second stays; a bound past both removes the second; a bound moved back
+ * keeps the next one. */
+static void case_leader_keep(void)
+{
+    xport x;
+    xp_start(&x, "lkeep");
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "LK: rows 1");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    xp_rows(&x, 1, 0, 10, 200);
+    xp_step(&x, "LK: rows 2");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    CHECK_EQ(x.ld->nlk, 2); /* mutant keepignored: both went at their flush */
+    if (x.ld->nlk != 2) {
+        xp_stop(&x);
+        return;
+    }
+    struct lkseg a = x.ld->lk[0], b = x.ld->lk[1];
+    CHECK(seg_exists(x.ldir, a.seq) && seg_exists(x.ldir, b.seq));
+    eng_leader_keep(x.ld, a.fno_end - 2);
+    CHECK(seg_exists(x.ldir, a.seq) && seg_exists(x.ldir, b.seq));
+    eng_leader_keep(x.ld, a.fno_end - 1);
+    CHECK(!seg_exists(x.ldir, a.seq) && seg_exists(x.ldir, b.seq));
+    CHECK(atomic_load(&x.ld->fno_durable) >= a.fno_end); /* FNO held its end before it went */
+    eng_leader_keep(x.ld, UINT64_MAX);
+    CHECK(!seg_exists(x.ldir, b.seq));
+    CHECK_EQ(x.ld->nlk, 0);
+    eng_leader_keep(x.ld, 0); /* a replica rejoins far behind: what is gone stays gone, the next one stays */
+    xp_rows(&x, 0, 20, 10, 300);
+    xp_step(&x, "LK: rows 3");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    CHECK_EQ(x.ld->nlk, 1);
+    if (x.ld->nlk == 1)
+        CHECK(seg_exists(x.ldir, x.ld->lk[0].seq));
+    CHECK(same_all(x.ld, x.rep, T0 + DAY_MS, "LK: the replica"));
+    xp_stop(&x);
+    printf("  a leader keeps its flushed segments until the driver's bound passes their end, FNO first\n");
+}
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -3767,7 +3817,8 @@ static int mutant_of(const char *m)
                         : strcmp(m, "dropnorsave") == 0 ? MUT_REPLICA_DROP_NO_SAVE
                         : strcmp(m, "leaderclose") == 0 ? MUT_LEADER_CLOSE_FLUSH
                         : strcmp(m, "leadernorstate") == 0 ? MUT_LEADER_NO_RSTATE
-                        : strcmp(m, "closewait") == 0 ? MUT_LEADER_CLOSE_WAIT : 0;
+                        : strcmp(m, "closewait") == 0 ? MUT_LEADER_CLOSE_WAIT
+                        : strcmp(m, "keepignored") == 0 ? MUT_LEADER_KEEP_IGNORED : 0;
 }
 
 int main(int argc, char **argv)
@@ -3821,6 +3872,7 @@ int main(int argc, char **argv)
     if (getenv("TEST_REPLICA_DEPOSE_ONLY")) { /* the quick run of the deposed leader's cases */
         case_close_bound();
         case_depose();
+        case_leader_keep();
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
     }
@@ -3871,6 +3923,7 @@ int main(int argc, char **argv)
     case_leader_guards();
     case_close_bound();
     case_depose();
+    case_leader_keep();
     case_promote_refused();
     for (int v = 0; v < 3; v++)
         case_promote(v);

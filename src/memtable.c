@@ -1321,6 +1321,49 @@ static void wal_unlink_upto(eng *db, uint64_t seq, const fseg *info)
         feed_cleaner_wake(db);
 }
 
+/* A leader's kept segments whose last position is at or below min(keep bound, commit point) go, oldest first; one
+ * whose unlink fails stays at the head (wal_unlink_upto retries it). flush_lock held. */
+static void leader_unlink_due(eng *db)
+{
+    uint64_t bound = atomic_load(&db->lead_keep), c = atomic_load(&db->lead_commit);
+    bound = MIN(bound, c);
+    if (eng_test_mutant == MUT_LEADER_KEEP_IGNORED) /* planted: a flushed segment goes at once */
+        bound = UINT64_MAX - 1;
+    size_t n = 0;
+    while (!db->lk_stuck && n < db->nlk && db->lk[n].fno_end - 1 <= bound) {
+        wal_unlink_upto(db, db->lk[n].seq, NULL);
+        if (db->wal_unlink_next != 0)
+            break; /* it failed: it stays, and every later one behind it */
+        n++;
+    }
+    memmove(db->lk, db->lk + n, (db->nlk - n) * sizeof *db->lk);
+    db->nlk -= n;
+}
+
+static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
+{
+    if (db->nlk == db->caplk) {
+        size_t c = db->caplk ? 2 * db->caplk : 16;
+        void *p = realloc(db->lk, c * sizeof *db->lk);
+        if (!p) {
+            db->lk_stuck = true; /* the segment stays; a later one must not go before it */
+            return;
+        }
+        db->lk = p;
+        db->caplk = c;
+    }
+    db->lk[db->nlk++] = (struct lkseg){seq, fno_end};
+    leader_unlink_due(db);
+}
+
+void eng_leader_keep(eng *db, uint64_t pos)
+{
+    pthread_mutex_lock(&db->flush_lock);
+    atomic_store(&db->lead_keep, pos);
+    leader_unlink_due(db);
+    pthread_mutex_unlock(&db->flush_lock);
+}
+
 /* Writes every memtable waiting to be flushed, oldest first; one whose write
  * failed stays in the list to be retried. Called with flush_lock held. */
 int flush_waiting(eng *db)
@@ -1380,6 +1423,8 @@ int flush_waiting(eng *db)
             mrc = fno_require(db, m->fno_end);
         if (mrc == 0 && db->rp) /* a replica unlinks at or below its saved commit floor only (replica.c) */
             replica_flushed(db, m->wal_seq, m->fno_end);
+        else if (mrc == 0 && eng_jr(db)) /* a leader keeps it for the replicas (eng_leader_keep) */
+            leader_flushed(db, m->wal_seq, m->fno_end);
         else if (mrc == 0)
             wal_unlink_upto(db, m->wal_seq, NULL); /* else MANIFEST may still name it: a follower would tail it */
         if (mrc == 0)

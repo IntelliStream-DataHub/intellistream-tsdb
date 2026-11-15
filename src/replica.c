@@ -361,6 +361,9 @@ void replica_free(eng *db)
         free(db->lrs);
         db->lrs = NULL;
     }
+    free(db->lk); /* the leader's kept segments: they stay on disk */
+    db->lk = NULL;
+    db->nlk = db->caplk = 0;
     struct replica *rp = db->rp;
     if (!rp)
         return;
