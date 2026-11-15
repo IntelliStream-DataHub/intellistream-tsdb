@@ -1291,6 +1291,19 @@ static int wal_retire_name(eng *db, uint64_t s, bool feed, const fseg *info)
     return 0;
 }
 
+/* wal_removed moves on to seq, but never past a segment still on disk that an open would replay (wal_unlink_next, the
+ * first one whose removal failed) or that is kept (db->lk, oldest first). flush_lock held (or the open). */
+static void wal_removed_raise(eng *db, uint64_t seq)
+{
+    if (db->wal_unlink_next)
+        seq = MIN(seq, db->wal_unlink_next - 1);
+    if (db->nlk)
+        seq = MIN(seq, db->lk[0].seq - 1);
+    pthread_mutex_lock(&db->lock);
+    db->wal_removed = MAX(db->wal_removed, seq);
+    pthread_mutex_unlock(&db->lock);
+}
+
 /* Unlinks (with the feed on: renames to fwal_) the WAL segments up to seq, now in parts, and moves wal_removed on over
  * those that are gone. One whose unlink fails (an I/O error, say) stays, and so does every later one, to be tried
  * again at the next flush: wal_removed must not pass a segment that a reopen would replay (its empty parts and the
@@ -1315,30 +1328,53 @@ static void wal_unlink_upto(eng *db, uint64_t seq, const fseg *info)
         }
         db->wal_unlink_next = 0;
     }
-    pthread_mutex_lock(&db->lock);
-    db->wal_removed = MAX(db->wal_removed, seq);
-    pthread_mutex_unlock(&db->lock);
+    wal_removed_raise(db, seq);
     if (atomic_load(&db->feed_on))
         feed_cleaner_wake(db);
 }
 
-/* Kept segments whose last position is at or below `bound` go, oldest first, FNO holding their end first; one whose
- * unlink fails stays at the head (wal_unlink_upto retries it). flush_lock held. */
+/* Kept segments whose last position is at or below `bound` go, oldest first, FNO holding their end first. Their numbers
+ * are not consecutive (a promotion jumps to epoch << 40), so each goes by its own name and never through
+ * wal_unlink_next, which retries a run of consecutive ones: one whose removal fails stays at the head and is tried
+ * again at the next call, and so is every later one. A run that the open or a flush failed to remove (wal_unlink_next)
+ * below the head goes first. flush_lock held. */
 static void lk_unlink_upto(eng *db, uint64_t bound)
 {
     size_t n = 0;
+    bool feed = atomic_load(&db->feed_on); /* changed only under flush_lock */
     while (!db->lk_stuck && n < db->nlk && db->lk[n].fno_end - 1 <= bound) {
+        uint64_t s = db->lk[n].seq;
+        if (db->wal_unlink_next && db->wal_unlink_next < s) {
+            wal_unlink_upto(db, s - 1, NULL); /* in parts (the open replayed them, or a flush wrote them) */
+            if (db->wal_unlink_next != 0)
+                break;
+        }
         if (fno_require(db, db->lk[n].fno_end) != 0)
             break; /* the engine failed */
-        wal_unlink_upto(db, db->lk[n].seq, NULL);
-        if (db->wal_unlink_next != 0)
-            break; /* it failed: it stays, and every later one behind it */
+        const struct jr_ops *jr = eng_jr(db);
+        if (jr && jr->seg_done)
+            jr->seg_done(jr->ctx, db, s);
+        if (wal_retire_name(db, s, feed, NULL) != 0 && errno != ENOENT) {
+            if (db->lk_failed != s) {
+                char name[64];
+                wal_name(name, sizeof name, s);
+                fprintf(stderr, "tsdb: removing %s failed (%s): it stays until a later flush removes it\n", name,
+                        strerror(errno));
+            }
+            db->lk_failed = s;
+            break;
+        }
         n++;
     }
-    if (n)
-        leader_links_drop(db, db->lk[n - 1].fno_end); /* the files their COMMIT markers named go with them */
+    if (n == 0)
+        return;
+    uint64_t last = db->lk[n - 1].seq;
+    leader_links_drop(db, db->lk[n - 1].fno_end); /* the files their COMMIT markers named go with them */
     memmove(db->lk, db->lk + n, (db->nlk - n) * sizeof *db->lk);
     db->nlk -= n;
+    wal_removed_raise(db, last);
+    if (feed)
+        feed_cleaner_wake(db);
 }
 
 /* A leader's kept segments go once their last position is at or below min(keep bound, commit point) */
@@ -1447,9 +1483,11 @@ int flush_waiting(eng *db)
         else if (mrc == 0 && eng_jr(db)) /* a leader keeps it for the replicas (eng_leader_keep) */
             leader_flushed(db, m->wal_seq, m->fno_end);
         else if (mrc == 0) {
-            wal_unlink_upto(db, m->wal_seq, NULL); /* else MANIFEST may still name it: a follower would tail it */
-            if (db->nlk) /* kept segments a writer's open found (RSTATE's `kept`), with no leader to keep them for */
+            /* kept segments a writer's open found (RSTATE's `kept`), with no leader to keep them for: they go first,
+             * all below the flushed one (wal_removed passes none still on disk) */
+            if (db->nlk)
                 lk_unlink_upto(db, UINT64_MAX - 1);
+            wal_unlink_upto(db, m->wal_seq, NULL); /* else MANIFEST may still name it: a follower would tail it */
         }
         if (mrc == 0)
             mrc = cls_flush_guard(db, m); /* a series of a long class that got fast moves on now */
@@ -1981,8 +2019,8 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         if (segs[k].seq <= kept) {
             /* not replayed: a drop after their flush took rows out of parts, which a replay would bring back; kept
              * for the leader's replicas (eng_leader_keep), removed by a writer that is not one at its next flush */
-            if (!ro)
-                rc = lk_push(db, segs[k].seq, segs[k].fno_end ? segs[k].fno_end : 1);
+            if (!ro && (rc = lk_push(db, segs[k].seq, segs[k].fno_end ? segs[k].fno_end : 1)) == 0)
+                db->wal_open_removed = MIN(db->wal_open_removed, db->lk[0].seq - 1); /* wal_removed passes none */
             continue;
         }
         if ((rc = read_file(db->dirfd, segs[k].name, &buf, &len)) != 0)
@@ -2089,7 +2127,7 @@ int wal_open(eng *db, int (*before_replay)(eng *))
                                 "it\n", db->dir, segs[k].name, strerror(errno));
                 stuck = true;
                 db->wal_unlink_next = segs[k].seq;
-                db->wal_open_removed = segs[k].seq - 1;
+                db->wal_open_removed = MIN(db->wal_open_removed, segs[k].seq - 1);
             }
         }
     }

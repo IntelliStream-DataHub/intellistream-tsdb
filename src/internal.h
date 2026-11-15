@@ -65,7 +65,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_BYTES_AFTER_SYNC, MUT_LEADER_MARKER_RC, MUT_LEADER_GATE_NOHOOK,
        MUT_LEADER_NO_SYNCED, MUT_REPLICA_RS_COMMITTED_TRUE, MUT_REPLICA_RS_COMMITTED_FALSE, MUT_REPLICA_DROP_NO_SAVE,
        MUT_LEADER_CLOSE_FLUSH, MUT_LEADER_NO_RSTATE, MUT_LEADER_CLOSE_WAIT, MUT_LEADER_KEEP_IGNORED,
-       MUT_LEADER_NO_HARDLINK, MUT_PROMOTE_NO_CARRY, MUT_KEPT_REPLAYED, MUT_LEADER_KEPT_NOSAVE };
+       MUT_LEADER_NO_HARDLINK, MUT_PROMOTE_NO_CARRY, MUT_KEPT_REPLAYED, MUT_LEADER_KEPT_NOSAVE,
+       MUT_LEADER_READ_NO_GAP };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1460,10 +1461,10 @@ int eng_leader_attach(struct eng *db, const struct jr_ops *ops);
 void eng_leader_commit(struct eng *db, uint64_t pos);
 uint64_t eng_wal_durable_fno(struct eng *db);
 void eng_leader_depose(struct eng *db);
-/* The driver's keep bound (design-cluster.md 8.3): the lowest position any replica still needs, at most the commit
- * floor the driver saved. A leader's flushed segment stays (a catch-up source, replica_read) until its last position is
- * at or below min(pos, the commit point); then it goes as a writer's would (wal_unlink_upto: FNO already holds its
- * end). Before the first call the bound is 0: nothing goes. The bound may move back (a replica rejoins); what is gone
+/* The driver's keep bound (design-cluster.md 8.3), inclusive: the highest position every replica has (one below the
+ * lowest position any replica still needs: a replica's next `from` minus 1), at most the commit floor the driver saved.
+ * A leader's flushed segment stays (a catch-up source, replica_read) until its last position is at or below
+ * min(pos, the commit point); then it goes by its own name (lk_unlink_upto: FNO holds its end first). Before the first call the bound is 0: nothing goes. The bound may move back (a replica rejoins); what is gone
  * stays gone. Takes flush_lock (waits for a flush in progress). */
 void eng_leader_keep(struct eng *db, uint64_t pos);
 /* A file a COMMIT marker of this leader names (`name`: the marker's name, p<partition>_<pid>_<n>_0.part), for a replica
@@ -1796,6 +1797,7 @@ struct eng {
             * below RSTATE's `kept` (a writer that is not a leader removes them at its next flush) */
     size_t nlk, caplk;
     bool lk_stuck;               /* a push failed: no segment goes until a reopen (wal_removed must not pass one) */
+    uint64_t lk_failed;          /* the kept segment whose removal failed last (its message is printed once) */
     struct lkfile {
         uint64_t fno, key;
     } *lf;                       /* with jr: the stage_ links of COMMIT markers in the log (leader_commit; lead_mu) */

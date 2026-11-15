@@ -2353,6 +2353,26 @@ static void case_promote(int variant)
     /* item 6: the promoted leader has the latest table (a replica runs without one) and keeps the replica's RSTATE,
      * which holds the DROP it applied (mutant promotenocarry: no table, RSTATE removed) */
     CHECK(n->lt != NULL);
+    { /* the promoted leader serves its log from the kept segments below the epoch's jump of numbers (mutant readgap:
+       * NOTFOUND at the first missing number, a snapshot for every member behind the promotion) */
+        uint8_t *rb = NULL;
+        size_t rl = 0;
+        uint64_t rsq = 0, roff = 0, rlast = 0, first = 0;
+        for (size_t i = 0; i + 1 < nold && first == 0; i++) { /* the first position of a kept replica-era segment */
+            char p[PATH_MAX + 64], nm2[64];
+            wal_name(nm2, sizeof nm2, old[i]);
+            snprintf(p, sizeof p, "%s/%s", rd, nm2);
+            int fd = open(p, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0 && pread(fd, &first, 8, 16) != 8)
+                first = 0;
+            if (fd >= 0)
+                close(fd);
+        }
+        CHECK(first > 0 && old[nold - 2] < old[nold - 1] - 1); /* the numbers jump at the epoch */
+        CHECK_EQ(replica_read(n, first, &rb, &rl, 1 << 20, &rsq, &roff, &rlast), 0);
+        CHECK(rl > 0 && rsq < old[nold - 1] && roff == 0 && rlast >= first);
+        free(rb);
+    }
     {
         char rs[PATH_MAX + 16];
         snprintf(rs, sizeof rs, "%s/RSTATE", rd);
@@ -2428,6 +2448,79 @@ static void case_promote_crash(void)
         eng_close(a);
     if (b)
         eng_close(b);
+}
+
+static uint64_t unlink_fail_seq;
+static int unlink_fail(const char *name)
+{
+    char want[64];
+    wal_name(want, sizeof want, unlink_fail_seq);
+    return strcmp(name, want) == 0 ? EIO : 0;
+}
+
+/* A writer that is not a leader, with kept segments (a promoted directory opened as a plain writer), whose removals
+ * fail: a kept one that fails stays at the head and is tried again, and wal_removed stays below it; its own segment's
+ * failed unlink is retried at the next flush, and wal_removed never passes it while it is on disk (a reopen would
+ * replay it). Before the fix the kept ones went through wal_unlink_upto's run of consecutive numbers: a call with a
+ * lower number dropped the retry of the failed one and took a kept segment for removed while it stayed on disk. */
+static void case_unlink_kept(void)
+{
+    char rd[PATH_MAX];
+    pid_t pid = fork();
+    if (pid == 0) {
+        replica_test_promote_hook = promote_hook_exit;
+        case_promote(3);
+        _exit(1);
+    }
+    int st = 0;
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 77);
+    snprintf(rd, sizeof rd, "%s/kp3_r", S);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 0;
+    eng *b = NULL;
+    CHECK_EQ(eng_open(rd, &o, &b), 0);
+    if (!b)
+        return;
+    uint64_t sq[256];
+    size_t n0 = wal_seqs(rd, sq, 256);
+    CHECK(n0 >= 3 && b->nlk == n0 - 1);
+    uint64_t k0 = sq[0];
+    CHECK(b->wal_removed < k0); /* the open passes no kept segment */
+    float v = 1;
+    int64_t t = T0 + 41 * DAY_MS;
+    /* 1: the oldest kept segment fails: it and every later kept one stay, the flushed one goes */
+    unlink_fail_seq = k0;
+    eng_test_retire_fail = unlink_fail;
+    CHECK_EQ(eng_insert_series(b, TSDB_FLOAT32, 0, &t, &v, 1), 0);
+    CHECK_EQ(eng_flush(b), 0);
+    CHECK(seg_exists(rd, k0));
+    CHECK_EQ(b->nlk, n0 - 1);
+    CHECK(b->wal_removed < k0);
+    /* 2: the kept ones go now; the writer's own segment fails: it is tried again, and wal_removed stays below it */
+    uint64_t w = b->wal_seq;
+    unlink_fail_seq = w;
+    t += 1000;
+    CHECK_EQ(eng_insert_series(b, TSDB_FLOAT32, 0, &t, &v, 1), 0);
+    CHECK_EQ(eng_flush(b), 0);
+    CHECK_EQ(b->nlk, 0);
+    CHECK(!seg_exists(rd, k0));
+    CHECK(seg_exists(rd, w));
+    CHECK_EQ(b->wal_unlink_next, w);
+    CHECK(b->wal_removed < w);
+    /* 3: no failure: everything but the writer's current segment is gone */
+    eng_test_retire_fail = NULL;
+    t += 1000;
+    CHECK_EQ(eng_insert_series(b, TSDB_FLOAT32, 0, &t, &v, 1), 0);
+    CHECK_EQ(eng_flush(b), 0);
+    CHECK(!seg_exists(rd, w));
+    CHECK_EQ(b->wal_unlink_next, 0);
+    CHECK_EQ(wal_seqs(rd, sq, 256), 1);
+    CHECK(b->wal_removed >= w);
+    eng_close(b);
 }
 
 static int rnd(unsigned *r, int n)
@@ -3494,6 +3587,40 @@ static void case_leader_marker_refused(void)
            "equal\n");
 }
 
+/* R2: a leader whose COMMIT marker is committed and whose publish then fails (here: the request is abandoned, as
+ * tsdbd does for one parked on a stuck volume) fails the engine: the replicas list the files, so a leader that went on
+ * without them would answer otherwise, and its next COMMIT's `done` would pass this one for good. For an insert and
+ * for a delete; a refusal before the marker leaves the engine healthy. */
+static void case_leader_abandon(void)
+{
+    for (int del = 0; del < 2; del++) {
+        xport x;
+        xp_start(&x, del ? "labd" : "labi");
+        xp_rows(&x, 0, 0, 10, 100);
+        CHECK_EQ(eng_flush(x.ld), 0);
+        xp_step(&x, "R2: rows");
+        uint64_t before = ld_last(&x);
+        volatile int flag = 1;
+        tsdb_set_abandon_flag(&flag);
+        int rc;
+        if (del) {
+            rc = eng_delete_range(x.ld, 0, T0, T0 + 5000);
+        } else {
+            int64_t ts[40];
+            float v[40];
+            for (int i = 0; i < 40; i++)
+                ts[i] = T0 + 1000LL * (30 + i), v[i] = (float)i;
+            rc = eng_insert_series(x.ld, TSDB_FLOAT32, 0, ts, v, 40);
+        }
+        tsdb_set_abandon_flag(NULL);
+        CHECK_EQ(rc, TSDB_ERR_ABANDONED);
+        CHECK(ld_last(&x) > before); /* the marker went out before the abandoned publish */
+        CHECK(eng_check(x.ld) != 0); /* fail-stop */
+        xp_stop(&x); /* a failed engine closes without a flush */
+    }
+    printf("  a leader whose publish fails after its COMMIT marker is committed fails the engine\n");
+}
+
 static void stop_flusher(eng *db) /* eng_halt's first step: no flush of the flusher's own from here on */
 {
     pthread_mutex_lock(&db->buf_lock);
@@ -4059,7 +4186,8 @@ static int mutant_of(const char *m)
                         : strcmp(m, "nohardlink") == 0 ? MUT_LEADER_NO_HARDLINK
                         : strcmp(m, "promotenocarry") == 0 ? MUT_PROMOTE_NO_CARRY
                         : strcmp(m, "keptreplayed") == 0 ? MUT_KEPT_REPLAYED
-                        : strcmp(m, "leaderkeptnosave") == 0 ? MUT_LEADER_KEPT_NOSAVE : 0;
+                        : strcmp(m, "leaderkeptnosave") == 0 ? MUT_LEADER_KEPT_NOSAVE
+                        : strcmp(m, "readgap") == 0 ? MUT_LEADER_READ_NO_GAP : 0;
 }
 
 int main(int argc, char **argv)
@@ -4119,6 +4247,7 @@ int main(int argc, char **argv)
         for (int v = 0; v < 3; v++)
             case_promote(v);
         case_promote_crash();
+        case_unlink_kept();
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
     }
@@ -4131,6 +4260,7 @@ int main(int argc, char **argv)
         case_leader_deposed_refusals();
         case_leader_flusher_deposed();
         case_leader_guards();
+        case_leader_abandon();
         if (strcmp(getenv("TEST_REPLICA_LEADER_ONLY"), "power") == 0)
             case_leader_power();
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
@@ -4167,6 +4297,7 @@ int main(int argc, char **argv)
     case_leader_deposed_refusals();
     case_leader_flusher_deposed();
     case_leader_guards();
+    case_leader_abandon();
     case_close_bound();
     case_depose();
     case_leader_keep();
@@ -4176,6 +4307,7 @@ int main(int argc, char **argv)
     for (int v = 0; v < 3; v++)
         case_promote(v);
     case_promote_crash();
+    case_unlink_kept();
     if (getenv("TEST_REPLICA_PROMOTE_ONLY")) { /* the quick run while working on promotion */
         sh("rm -rf '%s'", S);
         printf("test_replica: promote only: %s\n", failures ? "FAILED" : "ok");

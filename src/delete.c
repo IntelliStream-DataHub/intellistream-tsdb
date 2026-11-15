@@ -139,6 +139,7 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         rc = add_tomb_part(db, series, before[i], start, end, &all);
     if (rc == 0 && db->test_precommit)
         db->test_precommit(db->test_precommit_arg);
+    bool marked = false; /* a leader's COMMIT marker is committed: from here a failure is fail-stop (parts_publish) */
     if (rc == 0 && eng_jr(db)) { /* the replicated backend: the marker names every file, tombstones first, then rows */
         part **mp = malloc((all.n + rows.n + 1) * sizeof *mp);
         if (!mp) {
@@ -150,6 +151,7 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
                 memcpy(mp + all.n, rows.p, rows.n * sizeof *mp);
             struct jr_commit_arg ja = {mp, all.n + rows.n, rows.n ? MK_OP_REPLACE : MK_OP_DELETE};
             rc = jr_intent(db, JR_COMMIT, &ja);
+            marked = rc == 0;
             free(mp);
         }
     }
@@ -199,6 +201,8 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         pthread_cond_signal(&db->merge_cv);
         pthread_mutex_unlock(&db->lock);
         lt_end(db, &lsec);
+    } else if (marked) {
+        eng_fail(db, "a publish after its committed COMMIT marker", rc == TSDB_ERR_ABANDONED ? ECANCELED : EIO);
     }
     pthread_mutex_unlock(&db->publish_lock);
     lw_leave(db, &f); /* published (newer small writes win from now on) or failed */

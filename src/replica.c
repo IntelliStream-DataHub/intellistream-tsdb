@@ -1820,11 +1820,36 @@ static int seg_scan(eng *db, struct segrd *r)
     return rc;
 }
 
+/* The newest WAL segment below `below` that is on disk (0: none), by a listing: a leader's kept segments need not
+ * follow one another (a promotion begins the new leader's log at epoch << 40, above the replica's own segments) */
+static int seg_below(eng *db, uint64_t below, uint64_t *prev)
+{
+    *prev = 0;
+    DIR *d = fdopendir(dup(db->dirfd));
+    if (!d)
+        return TSDB_ERR_IO;
+    rewinddir(d);
+    struct dirent *e;
+    for (errno = 0; (e = readdir(d)); errno = 0) {
+        uint64_t sq;
+        int consumed = 0;
+        if (!wal_file_name(e->d_name) || sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &sq, &consumed) != 1 ||
+            e->d_name[consumed])
+            continue;
+        if (sq < below && sq > *prev)
+            *prev = sq;
+    }
+    int rc = errno ? TSDB_ERR_IO : 0; /* a readdir error is an error, never the end of the directory */
+    closedir(d);
+    return rc;
+}
+
 /* A writer's (a leader's) log by position: what it keeps of it (its retained segments, eng_leader_keep, and the ones
  * not flushed yet) and the current segment as far as the WAL writer role has written it, which is what the driver's
- * `bytes` hook has been handed already or is about to be. Segment numbers follow one another, so the one that holds
- * `from` is the newest whose first record is at or below it; a segment that is gone below that means the position is
- * in parts (TSDB_ERR_NOTFOUND: a snapshot). The two newest segments may end in a record still being written (the
+ * `bytes` hook has been handed already or is about to be. The segment that holds `from` is the newest whose first
+ * record is at or below it. Numbers follow one another except where a promotion jumped to the epoch's (seg_below finds
+ * the kept ones under the jump); no segment below that means the position is in parts (TSDB_ERR_NOTFOUND: a
+ * snapshot). The two newest segments may end in a record still being written (the
  * current one, and the one a rotation is finishing): their bytes end at the first record that does not parse. */
 static int leader_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
                        uint64_t *last)
@@ -1839,8 +1864,18 @@ static int leader_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_
         char name[64];
         wal_name(name, sizeof name, sq);
         int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
+        if (fd < 0 && errno == ENOENT) {
+            uint64_t prev;
+            int lrc = eng_test_mutant == MUT_LEADER_READ_NO_GAP ? (prev = 0, 0) : seg_below(db, sq, &prev);
+            if (lrc)
+                return lrc;
+            if (prev == 0)
+                return TSDB_ERR_NOTFOUND; /* gone below `from`'s segment: in parts */
+            sq = prev + 1; /* the loop steps to it */
+            continue;
+        }
         if (fd < 0)
-            return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO; /* gone below `from`'s segment: in parts */
+            return TSDB_ERR_IO;
         struct stat st;
         uint8_t h[WAL_HDR];
         uint64_t first = 0;
