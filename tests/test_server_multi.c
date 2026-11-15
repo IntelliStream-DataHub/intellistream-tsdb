@@ -912,7 +912,10 @@ static void test_stall_buckets(pid_t pid)
             raw_send(fd, 11, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_BUCKETS, 0, 1, &big_id, t, 48));
         else
             raw_send(fd, 11, TSDB_OP_QUERY_BUCKETS, t, 48);
-        long grown = settled_growth_kb(pid, fd, before, result_kb / 2, "stalled reader, a full frame of buckets"),
+        /* under a sanitizer the allocator gives memory back to the OS on its own clock (ASan every 5 s), so the growth
+         * may be negative while the reply is queued (tt10d: -176 MiB): the lower bound means nothing there */
+        long grown = settled_growth_kb(pid, fd, before, SANITIZED ? 0 : result_kb / 2,
+                                       "stalled reader, a full frame of buckets"),
              peak = hwm ? status_kb(pid, "VmHWM") - hwm0 : -1;
         fprintf(stderr, "stalled reader, a full frame of buckets (%s, io %s): server anonymous memory grew %ld KiB, "
                         "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS",
