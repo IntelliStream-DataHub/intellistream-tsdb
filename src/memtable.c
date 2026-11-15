@@ -1001,6 +1001,11 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
 {
     if (!db->wal_enabled || db->opt.wal_sync_ms != 0 || db->rp || db->opt.read_only)
         return TSDB_ERR_INVALID;
+    int rc = db->lrs ? 0 : leader_rs_open(db); /* RSTATE before the first marker */
+    if (rc)
+        return rc;
+    if (eng_test_mutant != MUT_LEADER_NO_SWEEP)
+        leader_links_sweep(db); /* an earlier leadership's links, or a promoted replica's stages: no marker here needs them */
     pthread_mutex_lock(&db->lock); /* rows of positions below the log end at the attach are in no wtail entry */
     pthread_mutex_lock(&db->buf_lock);
     db->wtail_from = MAX(db->wtail_from, db->fno_next);
@@ -1345,6 +1350,19 @@ static int wal_retire_name(eng *db, uint64_t s, bool feed, const fseg *info)
     return 0;
 }
 
+/* wal_removed moves on to seq, but never past a segment still on disk that an open would replay (wal_unlink_next, the
+ * first one whose removal failed) or that is kept (db->lk, oldest first). flush_lock held (or the open). */
+static void wal_removed_raise(eng *db, uint64_t seq)
+{
+    if (db->wal_unlink_next)
+        seq = MIN(seq, db->wal_unlink_next - 1);
+    if (db->nlk)
+        seq = MIN(seq, db->lk[0].seq - 1);
+    pthread_mutex_lock(&db->lock);
+    db->wal_removed = MAX(db->wal_removed, seq);
+    pthread_mutex_unlock(&db->lock);
+}
+
 /* Unlinks (with the feed on: renames to fwal_) the WAL segments up to seq, now in parts, and moves wal_removed on over
  * those that are gone. One whose unlink fails (an I/O error, say) stays, and so does every later one, to be tried
  * again at the next flush: wal_removed must not pass a segment that a reopen would replay (its empty parts and the
@@ -1369,11 +1387,97 @@ static void wal_unlink_upto(eng *db, uint64_t seq, const fseg *info)
         }
         db->wal_unlink_next = 0;
     }
-    pthread_mutex_lock(&db->lock);
-    db->wal_removed = MAX(db->wal_removed, seq);
-    pthread_mutex_unlock(&db->lock);
+    wal_removed_raise(db, seq);
     if (atomic_load(&db->feed_on))
         feed_cleaner_wake(db);
+}
+
+/* Kept segments whose last position is at or below `bound` go, oldest first, FNO holding their end first. Their numbers
+ * are not consecutive (a promotion jumps to epoch << 40), so each goes by its own name and never through
+ * wal_unlink_next, which retries a run of consecutive ones: one whose removal fails stays at the head and is tried
+ * again at the next call, and so is every later one. A run that the open or a flush failed to remove (wal_unlink_next)
+ * below the head goes first. flush_lock held. */
+static void lk_unlink_upto(eng *db, uint64_t bound)
+{
+    size_t n = 0;
+    bool feed = atomic_load(&db->feed_on); /* changed only under flush_lock */
+    while (!db->lk_stuck && n < db->nlk && db->lk[n].fno_end - 1 <= bound) {
+        uint64_t s = db->lk[n].seq;
+        if (db->wal_unlink_next && db->wal_unlink_next < s) {
+            wal_unlink_upto(db, s - 1, NULL); /* in parts (the open replayed them, or a flush wrote them) */
+            if (db->wal_unlink_next != 0)
+                break;
+        }
+        if (fno_require(db, db->lk[n].fno_end) != 0)
+            break; /* the engine failed */
+        const struct jr_ops *jr = eng_jr(db);
+        if (jr && jr->seg_done)
+            jr->seg_done(jr->ctx, db, s);
+        if (wal_retire_name(db, s, feed, NULL) != 0 && errno != ENOENT) {
+            if (db->lk_failed != s) {
+                char name[64];
+                wal_name(name, sizeof name, s);
+                fprintf(stderr, "tsdb: removing %s failed (%s): it stays until a later flush removes it\n", name,
+                        strerror(errno));
+            }
+            db->lk_failed = s;
+            break;
+        }
+        n++;
+    }
+    if (n == 0)
+        return;
+    uint64_t last = db->lk[n - 1].seq;
+    leader_links_drop(db, db->lk[n - 1].fno_end); /* the files their COMMIT markers named go with them */
+    memmove(db->lk, db->lk + n, (db->nlk - n) * sizeof *db->lk);
+    db->nlk -= n;
+    wal_removed_raise(db, last);
+    if (feed)
+        feed_cleaner_wake(db);
+}
+
+/* A leader's kept segments go once their last position is at or below min(keep bound, commit point) */
+static void leader_unlink_due(eng *db)
+{
+    uint64_t bound = atomic_load(&db->lead_keep), c = atomic_load(&db->lead_commit);
+    bound = MIN(bound, c);
+    if (eng_test_mutant == MUT_LEADER_KEEP_IGNORED) /* planted: a flushed segment goes at once */
+        bound = UINT64_MAX - 1;
+    lk_unlink_upto(db, bound);
+}
+
+static int lk_push(eng *db, uint64_t seq, uint64_t fno_end)
+{
+    if (db->nlk == db->caplk) {
+        size_t c = db->caplk ? 2 * db->caplk : 16;
+        void *p = realloc(db->lk, c * sizeof *db->lk);
+        if (!p)
+            return TSDB_ERR_NOMEM;
+        db->lk = p;
+        db->caplk = c;
+    }
+    db->lk[db->nlk++] = (struct lkseg){seq, fno_end};
+    return 0;
+}
+
+static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
+{
+    /* RSTATE names it as holding nothing outside the parts before it can outlive a drop of its rows: a writer's open
+     * neither replays nor removes it (fails the engine on error) */
+    leader_rs_kept(db, seq);
+    if (lk_push(db, seq, fno_end) != 0) {
+        db->lk_stuck = true; /* the segment stays; a later one must not go before it */
+        return;
+    }
+    leader_unlink_due(db);
+}
+
+void eng_leader_keep(eng *db, uint64_t pos)
+{
+    pthread_mutex_lock(&db->flush_lock);
+    atomic_store(&db->lead_keep, pos);
+    leader_unlink_due(db);
+    pthread_mutex_unlock(&db->flush_lock);
 }
 
 /* Writes every memtable waiting to be flushed, oldest first; one whose write
@@ -1435,8 +1539,15 @@ int flush_waiting(eng *db)
             mrc = fno_require(db, m->fno_end);
         if (mrc == 0 && db->rp) /* a replica unlinks at or below its saved commit floor only (replica.c) */
             replica_flushed(db, m->wal_seq, m->fno_end);
-        else if (mrc == 0)
+        else if (mrc == 0 && eng_jr(db)) /* a leader keeps it for the replicas (eng_leader_keep) */
+            leader_flushed(db, m->wal_seq, m->fno_end);
+        else if (mrc == 0) {
+            /* kept segments a writer's open found (RSTATE's `kept`), with no leader to keep them for: they go first,
+             * all below the flushed one (wal_removed passes none still on disk) */
+            if (db->nlk)
+                lk_unlink_upto(db, UINT64_MAX - 1);
             wal_unlink_upto(db, m->wal_seq, NULL); /* else MANIFEST may still name it: a follower would tail it */
+        }
         if (mrc == 0)
             mrc = cls_flush_guard(db, m); /* a series of a long class that got fast moves on now */
         mt_unref(m);
@@ -1965,9 +2076,19 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         rc = feed_open_numbers(db); /* enable or renew FEED before the first FNO store (and so before the replay) */
     if (rc == 0 && before_replay)
         rc = before_replay(db);
+    uint64_t kept = 0; /* segments up to it hold nothing outside the parts (a leader's or a promoted replica's) */
+    if (rc == 0 && nseg)
+        rc = rs_kept_seq(db, &kept);
     for (size_t k = 0; k < nseg && rc == 0; k++) {
         uint8_t *buf;
         size_t len;
+        if (segs[k].seq <= kept) {
+            /* not replayed: a drop after their flush took rows out of parts, which a replay would bring back; kept
+             * for the leader's replicas (eng_leader_keep), removed by a writer that is not one at its next flush */
+            if (!ro && (rc = lk_push(db, segs[k].seq, segs[k].fno_end ? segs[k].fno_end : 1)) == 0)
+                db->wal_open_removed = MIN(db->wal_open_removed, db->lk[0].seq - 1); /* wal_removed passes none */
+            continue;
+        }
         if ((rc = read_file(db->dirfd, segs[k].name, &buf, &len)) != 0)
             break;
         /* the segment's rows go into a memtable of their own (the active one
@@ -2072,7 +2193,7 @@ int wal_open(eng *db, int (*before_replay)(eng *))
                                 "it\n", db->dir, segs[k].name, strerror(errno));
                 stuck = true;
                 db->wal_unlink_next = segs[k].seq;
-                db->wal_open_removed = segs[k].seq - 1;
+                db->wal_open_removed = MIN(db->wal_open_removed, segs[k].seq - 1);
             }
         }
     }
@@ -2085,6 +2206,12 @@ int wal_open(eng *db, int (*before_replay)(eng *))
 }
 
 /* Called by close after the final flush. */
+/* A deposed leader (eng_close deposes every leader): its close leaves the log as it is */
+static bool lead_closing(eng *db)
+{
+    return eng_jr(db) && atomic_load(&db->lead_deposed) && eng_test_mutant != MUT_LEADER_CLOSE_FLUSH;
+}
+
 void wal_close(eng *db)
 {
     if (db->wal_fd >= 0) {
@@ -2092,7 +2219,8 @@ void wal_close(eng *db)
         db->wal_fd = -1;
         /* a replica's log is the leader's: no empty segment is dropped, no exact next number stored (a cut can still
          * lower the log end after a reopen) */
-        if (!db->rp && db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db) && !db->retiring) {
+        if (!db->rp && db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db) && !db->retiring &&
+            !lead_closing(db)) {
             /* a clean close holds the exact next number; an empty segment carries none, so FNO must before it goes */
             if (fno_require(db, db->fno_next) == 0) {
                 char name[64];
@@ -2106,7 +2234,9 @@ void wal_close(eng *db)
             }
         }
     }
-    if (db->wal_enabled && !eng_check(db) && !db->retiring)
+    /* not a deposed leader's: its log end may be above the commit point, which a replica_cut takes back (FNO above the
+     * log end fails a replica's open) */
+    if (db->wal_enabled && !eng_check(db) && !db->retiring && !lead_closing(db))
         fno_require(db, db->fno_next); /* a failure fails the engine; the segments stay and the open finds the end */
     for (size_t i = 0; i < db->nflushing; i++)
         mt_unref(db->flushing[i]);

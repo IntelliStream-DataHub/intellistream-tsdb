@@ -53,7 +53,9 @@ int replica_missing(struct eng *db, char *name, size_t cap, uint64_t *size);
 /* The records from the one that starts at position `from` (a record start; the end of the log + 1 gives len 0):
  * whole records of one segment, at most cap bytes unless the first one is larger (then it alone). *seq and *off say
  * where they lie, *last the last position covered. TSDB_ERR_NOTFOUND: the log no longer holds `from` (it is in
- * parts: a snapshot is needed). For a sender (catch-up, tests). A record the buffer cannot take is returned alone. */
+ * parts: a snapshot is needed). For a sender (catch-up, tests). A record the buffer cannot take is returned alone.
+ * On a writer (a leader) it reads the segments it keeps and the current one as far as it is written (len 0: `from` is
+ * not written yet). */
 extern size_t replica_read_win_min; /* test hook */
 extern void (*replica_test_sync_hook)(struct eng *db); /* test hook: between a sync's fdatasync and its bookkeeping */
 int replica_read(struct eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,

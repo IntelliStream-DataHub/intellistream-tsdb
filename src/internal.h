@@ -66,7 +66,12 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_NO_SYNCED, MUT_LEADER_DICT_EARLY, MUT_REPLICA_CLASS_MAX, MUT_LEADER_WTAIL_LOCAL,
        MUT_REPLICA_NO_CLASS_PURGE, MUT_LEADER_CLASS_MARKER_LATE, MUT_LEADER_NO_WTAIL_FROM, MUT_LEADER_MARKERS_SPLIT,
        MUT_DROPPED_GLOBAL, MUT_WTAIL_NOCAP, MUT_LEADER_NO_CUTOFF, MUT_LEADER_ZERO_RATE, MUT_LEADER_NO_RAISE_FROM,
-       MUT_LEADER_PRUNE_OFF1, MUT_REPLICA_FRESH_UNCHECKED };
+       MUT_LEADER_PRUNE_OFF1, MUT_REPLICA_FRESH_UNCHECKED,
+       MUT_REPLICA_RS_COMMITTED_TRUE, MUT_REPLICA_RS_COMMITTED_FALSE, MUT_REPLICA_DROP_NO_SAVE,
+       MUT_LEADER_CLOSE_FLUSH, MUT_LEADER_NO_RSTATE, MUT_LEADER_CLOSE_WAIT, MUT_LEADER_KEEP_IGNORED,
+       MUT_LEADER_NO_HARDLINK, MUT_PROMOTE_NO_CARRY, MUT_KEPT_REPLAYED, MUT_LEADER_KEPT_NOSAVE,
+       MUT_LEADER_READ_NO_GAP, MUT_LEADER_READ_CURSOR_ANY, MUT_LEADER_READ_TAILOK_SEALED,
+       MUT_LEADER_READ_NOTFOUND_SEALED, MUT_LEADER_NO_SWEEP, MUT_LEADER_B0_OFF };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1430,10 +1435,20 @@ struct jr_ret_arg {
 int jr_markers(struct eng *db, const mk *m, size_t n, const char *what);
 int jr_dict_series(void *db, uint32_t id, const char *name, size_t len, int type);
 int jr_dict_state(void *db, uint32_t id, const char *name, size_t len, int type);
-static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
-{
-    (void)db, (void)kind, (void)arg;
-}
+/* jr_commit: a leader's JR_COMMIT records the published COMMIT in its RSTATE (replica.c; the other kinds do nothing).
+ * jr_precommit: under publish_lock right before the parts_commit of a COMMIT whose marker this thread appended: records
+ * the COMMIT as `doing` (position, first block) in RSTATE. leader_rs_drop: after a leader's DROP retired its
+ * partitions (eng_drop_before; drop_retire's jr_commit runs under db->lock, where no I/O belongs). Fail the engine on
+ * a failed save. leader_rs_open: eng_leader_attach loads RSTATE (a promoted replica's) into db->lrs. leader_rs_kept:
+ * after a leader's flush of segment `seq` (flush_lock): RSTATE's `kept` says that segments up to it hold nothing outside
+ * the parts. rs_kept_seq: wal_open reads that bound (0 without RSTATE): it neither replays nor removes those segments
+ * (a drop after their flush took their rows out of parts) and puts them on db->lk. */
+void jr_commit(struct eng *db, enum jr_kind kind, const void *arg);
+int jr_precommit(struct eng *db, size_t n);
+int leader_rs_drop(struct eng *db, int64_t ts);
+int leader_rs_open(struct eng *db);
+int leader_rs_kept(struct eng *db, uint64_t seq);
+int rs_kept_seq(struct eng *db, uint64_t *seq);
 
 #define FNO_FILE "FNO"
 /* Log numbers stay below FNO_LIMIT (a record at or above it is not one: wal_record). A bound read at open (a slot, a
@@ -1467,8 +1482,10 @@ int wal_commit(struct eng *db, uint64_t target);
  * (no buf_lock), so it may be called from anywhere: from jr_ops.admit (which then refuses the record itself) or under
  * the driver's core mutex. A record whose admission was running meanwhile may still be buffered; its wait ends
  * indeterminate like any other (whoever needs the final log end takes buf_lock after the depose).
- * A leader's close or halt flushes, and the flush waits for the commit point: a driver whose commit point can no longer
- * move (the ISR is gone) deposes the leader first, or the close waits until it moves. */
+ * A leader's close deposes it first (eng_close): it never flushes, and never stores a number of its log in FNO beyond
+ * what a flush made durable, so a close cannot wait for a commit point that no longer moves (the ISR is gone), and the
+ * directory opens as a replica (eng_open_replica) whose replica_cut drops the uncommitted tail (design-cluster.md 6.3).
+ * A halt (eng_halt) stops the flusher, whose flush waits for the commit point: depose first where it may not move. */
 int eng_leader_attach(struct eng *db, const struct jr_ops *ops);
 void eng_leader_commit(struct eng *db, uint64_t pos);
 uint64_t eng_wal_durable_fno(struct eng *db);
@@ -1481,6 +1498,22 @@ void eng_leader_replay_floor(struct eng *db, uint64_t floor);
 extern void (*cls_test_after_switch)(struct eng *db);
 /* test hook: called by a leader's flush after cls_classify_active, before the seal (src/memtable.c) */
 extern void (*mt_test_before_seal)(struct eng *db);
+/* The driver's keep bound (design-cluster.md 8.3), inclusive: the highest position every replica has (one below the
+ * lowest position any replica still needs: a replica's next `from` minus 1), at most the commit floor the driver saved.
+ * A leader's flushed segment stays (a catch-up source, replica_read) until its last position is at or below
+ * min(pos, the commit point); then it goes by its own name (lk_unlink_upto: FNO holds its end first). Before the first call the bound is 0: nothing goes. The bound may move back (a replica rejoins); what is gone
+ * stays gone. Takes flush_lock (waits for a flush in progress). */
+void eng_leader_keep(struct eng *db, uint64_t pos);
+/* A file a COMMIT marker of this leader names (`name`: the marker's name, p<partition>_<pid>_<n>_0.part), for a replica
+ * that missed it: the leader keeps each hard linked as stage_<xxh64 of the name>.part (the name a replica stages it
+ * under) from before its marker is appended until the retained segment that holds the marker goes (eng_leader_keep),
+ * whatever merges did to the part since. An fd open for reading, or TSDB_ERR_NOTFOUND (the segment went: the replica
+ * needs a snapshot). */
+int eng_leader_file_open(struct eng *db, const char *name);
+/* replica.c: the links of the files of COMMIT markers whose position is below fno_end go (their segment went;
+ * flush_lock held); every stage_ file goes (eng_leader_attach: a writer keeps no stage of its own) */
+void leader_links_drop(struct eng *db, uint64_t fno_end);
+void leader_links_sweep(struct eng *db);
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
@@ -1515,6 +1548,7 @@ int cmp_seg(const void *a, const void *b);
 int flush_waiting(struct eng *db); /* flush_lock held */
 int mt_reserve_rows(struct memtable *m, const uint32_t *series, uint32_t cs, size_t n);
 struct replica;
+struct rstate;
 int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, struct eng **out);
 int replica_open_log(struct eng *db, uint64_t floor, int (*cut_tails)(struct eng *)); /* instead of wal_open; sets db->rp */
 void replica_free(struct eng *db);                     /* wal_close */
@@ -1802,6 +1836,21 @@ struct eng {
     bool wal_enabled;
     struct replica *rp; /* an engine opened as a replica (replica.c): the log arrives verbatim, rows apply at the commit point */
     const struct jr_ops *jr;   /* the replicated backend of a leader (jr_intent): eng_leader_attach, read with eng_jr */
+    struct rstate *lrs;        /* with jr: the leader's RSTATE (replica.c, leader_rs_open), written under publish_lock */
+    size_t latest_cache_asked; /* the caller's opt.latest_cache (a replica runs with 0; replica_promote restores it) */
+    struct lkseg {
+        uint64_t seq, fno_end;
+    } *lk; /* flushed segments kept for the replicas, oldest first (flush_lock); also those a writer's open found at or
+            * below RSTATE's `kept` (a writer that is not a leader removes them at its next flush) */
+    size_t nlk, caplk;
+    bool lk_stuck;               /* a push failed: no segment goes until a reopen (wal_removed must not pass one) */
+    uint64_t lk_failed;          /* the kept segment whose removal failed last (its message is printed once) */
+    struct lkfile {
+        uint64_t fno, key;
+    } *lf;                       /* with jr: the stage_ links of COMMIT markers in the log (leader_commit; lead_mu) */
+    size_t nlf, caplf;
+    uint64_t lrd_seq, lrd_off, lrd_next; /* where the last read of the log by position ended (replica_read; lead_mu) */
+    atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
     atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */
     pthread_mutex_t lead_mu;          /* a leaf: waits for the commit point (lead_cv), its moves, depose, eng_fail */

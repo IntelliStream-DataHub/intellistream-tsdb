@@ -636,10 +636,17 @@ int parts_publish(eng *db, part **ps, size_t n)
     /* a request parked on a stuck volume (cur_abandon): no block number is taken for it; the caller discards */
     rc = eng_abandoned();
     if (rc == 0)
+        rc = jr_precommit(db, n); /* a leader: RSTATE says `doing` before a block is taken (replica.c) */
+    if (rc == 0)
         rc = parts_commit(db, ps, n);
     if (rc == 0) {
         jr_commit(db, JR_COMMIT, ps);
         db_add_parts(db, ps, n); /* published: whatever happens to MANIFEST, the caller must not discard them */
+    } else if (eng_jr(db)) {
+        /* a leader: the COMMIT marker is committed, so the replicas list these files; a leader without them would
+         * answer otherwise, and a later COMMIT's `done` would pass this one for good (an ex-leader reopened as a
+         * replica skips it). Only a reopen, which takes the log from the replicas, is safe: fail-stop. */
+        eng_fail(db, "a publish after its committed COMMIT marker", rc == TSDB_ERR_ABANDONED ? ECANCELED : EIO);
     }
     pthread_mutex_unlock(&db->publish_lock);
     return rc;

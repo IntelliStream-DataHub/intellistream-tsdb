@@ -867,6 +867,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         return TSDB_ERR_INVALID;
     }
     db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0 && !replica;
+    db->latest_cache_asked = db->opt.latest_cache; /* replica_promote opens the writer with it */
     if (replica)
         db->opt.latest_cache = 0; /* its parts arrive whole (COMMIT): no fold lists to build the table from */
     if (latest_open(db) != 0) { /* the latest table (latest.c); a writer's only */
@@ -1128,6 +1129,11 @@ int eng_close(eng *db)
     if (!db)
         return 0;
     int rc = 0;
+    /* A leader steps down before it closes: its flushes wait for the commit point, which may never move again (the ISR
+     * is gone), and what it holds above the commit point is not its to make durable in parts (C7). The WAL keeps every
+     * row; the directory opens as a replica (or a writer again) and replays it (internal.h, eng_leader_attach). */
+    if (eng_jr(db) && eng_test_mutant != MUT_LEADER_CLOSE_WAIT)
+        eng_leader_depose(db);
     if (db->has_flusher) {
         pthread_mutex_lock(&db->buf_lock);
         db->flusher_stop = true;
@@ -1144,7 +1150,8 @@ int eng_close(eng *db)
     }
     feed_cleaner_stop(db); /* before the final flush and wal_close: it unlinks and syncs the directory */
     /* a retired engine writes nothing: its replacement owns the directory */
-    if (!db->opt.read_only && db->active && !db->retiring)
+    bool deposed = eng_jr(db) && atomic_load(&db->lead_deposed) && eng_test_mutant != MUT_LEADER_CLOSE_FLUSH;
+    if (!db->opt.read_only && db->active && !db->retiring && !deposed)
         rc = eng_flush(db);
 
     pthread_mutex_lock(&db->lock);
@@ -1499,6 +1506,8 @@ int eng_drop_before(eng *db, int64_t ts)
         rc = eng_flush(db);
     if (rc == 0)
         rc = drop_retire(db, ts);
+    if (rc == 0 && eng_jr(db))
+        rc = leader_rs_drop(db, ts); /* RSTATE says the DROP is done (replica.c) */
     if (serial)
         pthread_mutex_unlock(&db->jr_serial);
     return rc;

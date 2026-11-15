@@ -374,7 +374,12 @@ cgroup, so `nice` does not keep your work out of its way.
   writes the new FEED before FNO is raised. Tests: `tests/test_feedstore.c`, `tests/test_cli_feed.sh`, `jepsen --feed`
   with `tests/jepsen/feedcheck.c`.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
-  only into partitions without a part from that segment.
+  only into partitions without a part from that segment: a replicated leader keeps its flushed
+  segments for the replicas (`eng_leader_keep`): one goes only once its last position is at or below min(the driver's
+  keep bound, the commit point), after `fno_require`, by its own name (`lk_unlink_upto`: kept numbers jump at a promotion,
+  so never through `wal_unlink_upto`'s run of consecutive ones); `wal_removed` never passes one still on disk.
+  Kept segments (a leader's flushed ones, a promoted replica's) are named in RSTATE (`kept`, saved before a drop can
+  take their rows out of parts): a writer's open neither replays nor removes a segment at or below it.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
