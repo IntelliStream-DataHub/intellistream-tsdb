@@ -3668,8 +3668,8 @@ static void case_close_bound(void)
 /* A deposed leader holds committed rows, two committed large inserts (COMMIT markers it published itself), a committed
  * DROP and, above the commit point, rows and a marker. It is closed (no flush: mutant leaderclose flushes and stores its
  * log end in FNO) and reopened as a replica at the commit floor, then cut at the commit point: the open skips the
- * COMMITs and the DROP it published (its RSTATE says so; mutant leadernorstate: the open takes its own COMMIT for one
- * to apply, whose files it never staged, and stops below it), the cut drops what was never committed, a second open accepts the log (FNO not past its end), and it
+ * COMMITs and the DROP it published (its RSTATE says so; mutant leadernorstate: the open takes its own COMMITs for ones
+ * to apply, and stops below one or lists its file again), the cut drops what was never committed, a second open accepts the log (FNO not past its end), and it
  * answers exactly as the replica that never led. */
 static void case_depose(void)
 {
@@ -3710,7 +3710,10 @@ static void case_depose(void)
         xp_stop(&x);
         return;
     }
-    CHECK_EQ(replica_applied_end(ex), commit); /* mutant leadernorstate: held below its own first COMMIT */
+    /* mutant leadernorstate: its own COMMITs taken for ones to apply, from the files it keeps linked for its replicas
+     * (held below the first, or each COMMIT's file listed a second time) */
+    CHECK_EQ(replica_applied_end(ex), commit);
+    CHECK(!parts_twice(ex));
     CHECK_EQ(replica_cut(ex, commit), 0);
     CHECK_EQ(replica_log_end(ex), commit);
     CHECK(same_all(ex, x.rep, hi, "D: the deposed leader as a replica"));
