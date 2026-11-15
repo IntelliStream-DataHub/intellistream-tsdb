@@ -1911,8 +1911,11 @@ static int xp_ship(void *ctx, eng *db, const char *name, const char *mname, uint
 
 static int xp_wait(void *ctx, eng *db, uint64_t last)
 {
-    (void)db;
-    return xp_pump(ctx, last);
+    xport *x = ctx;
+    /* a replica applies only what the leader committed: with `manual` the test holds the commit point, and a replica
+     * that applied past it would hold records a depose leaves uncommitted (L1b) */
+    uint64_t c = atomic_load(&db->lead_commit);
+    return xp_pump(x, x->manual && c < last ? c : last);
 }
 
 static void xp_seg_done(void *ctx, eng *db, uint64_t seq)
@@ -3030,6 +3033,8 @@ static void case_dict_commit(void)
         size_t la = 0, lb = 0;
         CHECK_EQ(read_file(ld->dirfd, files[k], &a, &la), 0);
         CHECK_EQ(read_file(x.rep->dirfd, files[k], &b, &lb), 0);
+        if (!(la == lb && la > 0 && a && b && memcmp(a, b, la) == 0))
+            fprintf(stderr, "L1b: %s: leader %zu bytes, replica %zu bytes\n", files[k], la, lb);
         CHECK(la == lb && la > 0 && a && b && memcmp(a, b, la) == 0);
         free(a);
         free(b);
