@@ -1713,6 +1713,161 @@ int replica_cut(eng *db, uint64_t last)
 
 size_t replica_read_win_min = 65536; /* test hook: the smallest read window, so a test reaches the growth of the window */
 
+/* One read of segment r->seq (r->flen bytes of it are the log's) from position r->from: whole records from the one that
+ * starts there, at most r->cap bytes unless the first is larger, scanned from byte r->pos0 (a record start at or
+ * before it) in windows, never the whole segment: a catch-up in chunks costs the bytes it sends, not a square of the
+ * segment. r->found says whether a record starts at r->from; r->tail_ok: a record that does not parse at the end is
+ * where the writer's bytes end (a leader's newest segments, written while this reads), not damage. */
+struct segrd {
+    uint64_t seq, from, last;
+    size_t flen, pos0, cap, start, next_off, outlen;
+    bool tail_ok, found;
+    uint8_t *out;
+};
+
+static int seg_scan(eng *db, struct segrd *r)
+{
+    char name[64];
+    wal_name(name, sizeof name, r->seq);
+    int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    size_t flen = r->flen, pos0 = r->pos0, cap = r->cap;
+    uint64_t from = r->from;
+    size_t win = MAX(cap, replica_read_win_min);
+    uint8_t *fb = NULL;
+    size_t blen = 0, outcap = 0;
+    bool done = false;
+    int rc = 0;
+    while (rc == 0 && !done && pos0 < flen) {
+        size_t want = MIN(win, flen - pos0);
+        uint8_t *nb = realloc(fb, want);
+        if (!nb) {
+            rc = TSDB_ERR_NOMEM;
+            break;
+        }
+        fb = nb;
+        ssize_t got = pread(fd, fb, want, (off_t)pos0);
+        if (got < 0 || (size_t)got != want) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        blen = want;
+        size_t pos = 0;
+        bool window_end = pos0 + blen < flen; /* the file goes on beyond this window */
+        while (pos < blen) {
+            wal_rec wr;
+            size_t sz = wal_record(fb + pos, blen - pos, r->seq, pos0 + pos, &wr);
+            if (sz == 0) {
+                if (window_end)
+                    break; /* a record that does not fit the window: read from here with a larger one */
+                if (r->tail_ok)
+                    done = true; /* what the writer has written so far ends here */
+                else
+                    rc = TSDB_ERR_CORRUPT;
+                break;
+            }
+            if (!r->found) {
+                if (wr.fno == from)
+                    r->found = true, r->start = pos0 + pos;
+                else if (wr.fno > from) {
+                    rc = TSDB_ERR_INVALID; /* from is inside a record */
+                    break;
+                }
+            }
+            if (r->found) {
+                if (r->outlen > 0 && r->outlen + sz > cap) {
+                    done = true;
+                    break;
+                }
+                if (r->outlen + sz > outcap) {
+                    size_t nc = MAX(r->outlen + sz, outcap * 2);
+                    uint8_t *no = realloc(r->out, nc);
+                    if (!no) {
+                        rc = TSDB_ERR_NOMEM;
+                        break;
+                    }
+                    r->out = no, outcap = nc;
+                }
+                memcpy(r->out + r->outlen, fb + pos, sz);
+                r->outlen += sz;
+                r->last = wr.fno + wr.span - 1;
+                r->next_off = pos0 + pos + sz;
+            }
+            pos += sz;
+        }
+        if (rc || done)
+            break;
+        if (pos == 0 && window_end)
+            win *= 2; /* one record is larger than the window */
+        pos0 += pos;
+    }
+    free(fb);
+    close(fd);
+    return rc;
+}
+
+/* A writer's (a leader's) log by position: what it keeps of it (its retained segments, eng_leader_keep, and the ones
+ * not flushed yet) and the current segment as far as the WAL writer role has written it, which is what the driver's
+ * `bytes` hook has been handed already or is about to be. Segment numbers follow one another, so the one that holds
+ * `from` is the newest whose first record is at or below it; a segment that is gone below that means the position is
+ * in parts (TSDB_ERR_NOTFOUND: a snapshot). The two newest segments may end in a record still being written (the
+ * current one, and the one a rotation is finishing): their bytes end at the first record that does not parse. */
+static int leader_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
+                       uint64_t *last)
+{
+    pthread_mutex_lock(&db->buf_lock);
+    uint64_t cur = db->wal_seq, next = db->fno_next;
+    pthread_mutex_unlock(&db->buf_lock);
+    if (from == 0 || from > next)
+        return TSDB_ERR_INVALID;
+    *last = from - 1, *seq = cur, *off = 0;
+    for (uint64_t sq = cur; sq > 0; sq--) {
+        char name[64];
+        wal_name(name, sizeof name, sq);
+        int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO; /* gone below `from`'s segment: in parts */
+        struct stat st;
+        uint8_t h[WAL_HDR];
+        uint64_t first = 0;
+        bool newest = sq + 1 >= cur;
+        int rc = 0;
+        if (fstat(fd, &st) != 0)
+            rc = TSDB_ERR_IO;
+        else if ((size_t)st.st_size >= WAL_HDR && pread(fd, h, WAL_HDR, 0) == WAL_HDR)
+            memcpy(&first, h + 16, 8);
+        else if (!newest)
+            rc = TSDB_ERR_CORRUPT; /* a sealed segment without a record */
+        close(fd);
+        if (rc)
+            return rc;
+        if (first == 0 || first > from)
+            continue; /* empty (just begun), or it starts above `from` */
+        pthread_mutex_lock(&db->lead_mu);
+        size_t pos0 = db->lrd_seq == sq && db->lrd_next && db->lrd_next <= from && db->lrd_off <= (uint64_t)st.st_size
+                          ? (size_t)db->lrd_off
+                          : 0;
+        pthread_mutex_unlock(&db->lead_mu);
+        struct segrd r = {.seq = sq, .flen = (size_t)st.st_size, .pos0 = pos0, .from = from, .cap = cap, .tail_ok = newest};
+        rc = seg_scan(db, &r);
+        if (rc == 0 && !r.found && !newest)
+            rc = TSDB_ERR_INVALID; /* a sealed segment that has the position inside a record, or not at all */
+        if (rc) {
+            free(r.out);
+            return rc;
+        }
+        if (!r.found)
+            return 0; /* not written yet */
+        *buf = r.out, *len = r.outlen, *seq = sq, *off = r.start, *last = r.last;
+        pthread_mutex_lock(&db->lead_mu);
+        db->lrd_seq = sq, db->lrd_off = r.next_off, db->lrd_next = r.last + 1;
+        pthread_mutex_unlock(&db->lead_mu);
+        return 0;
+    }
+    return TSDB_ERR_NOTFOUND;
+}
+
 int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
                  uint64_t *last)
 {
@@ -1720,7 +1875,8 @@ int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap,
     *buf = NULL;
     *len = 0;
     if (!rp)
-        return TSDB_ERR_INVALID;
+        return db->wal_enabled && !db->opt.read_only ? leader_read(db, from, buf, len, cap, seq, off, last)
+                                                     : TSDB_ERR_INVALID;
     pthread_mutex_lock(&rp->mu);
     int rc = 0;
     if (from > db->fno_next || from == 0) {
@@ -1748,100 +1904,22 @@ int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap,
         pthread_mutex_unlock(&rp->mu);
         return TSDB_ERR_NOTFOUND; /* below the log's start: it is in parts, a snapshot is needed */
     }
-    /* pread from where the last read of this segment ended (rd_*: the sender walks the log in order), in windows, never
-     * the whole segment: a catch-up in chunks costs the bytes it sends, not a square of the segment. The segment is
+    /* pread from where the last read of this segment ended (rd_*: the sender walks the log in order). The segment is
      * append-only between cuts, and a cut holds rp->mu like this does. */
-    char name[64];
-    wal_name(name, sizeof name, s.seq);
-    int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        pthread_mutex_unlock(&rp->mu);
-        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
-    }
-    size_t flen = (size_t)s.len;
-    size_t pos0 = rp->rd_seq == s.seq && rp->rd_next && rp->rd_next <= from && rp->rd_off <= flen ? (size_t)rp->rd_off : 0;
-    size_t win = MAX(cap, replica_read_win_min);
-    uint8_t *fb = NULL;
-    size_t start = 0, blen = 0;
-    bool found = false, done = false;
-    uint64_t lastpos = 0, next_fno = 0;
-    size_t next_off = 0;
-    uint8_t *out = NULL;
-    size_t outlen = 0, outcap = 0;
-    while (rc == 0 && !done && pos0 < flen) {
-        size_t want = MIN(win, flen - pos0);
-        uint8_t *nb = realloc(fb, want);
-        if (!nb) {
-            rc = TSDB_ERR_NOMEM;
-            break;
-        }
-        fb = nb;
-        ssize_t got = pread(fd, fb, want, (off_t)pos0);
-        if (got < 0 || (size_t)got != want) {
-            rc = TSDB_ERR_IO;
-            break;
-        }
-        blen = want;
-        size_t pos = 0;
-        bool window_end = pos0 + blen < flen; /* the file goes on beyond this window */
-        while (pos < blen) {
-            wal_rec wr;
-            size_t sz = wal_record(fb + pos, blen - pos, s.seq, pos0 + pos, &wr);
-            if (sz == 0) {
-                if (window_end)
-                    break; /* a record that does not fit the window: read from here with a larger one */
-                rc = TSDB_ERR_CORRUPT;
-                break;
-            }
-            if (!found) {
-                if (wr.fno == from)
-                    found = true, start = pos0 + pos;
-                else if (wr.fno > from) {
-                    rc = TSDB_ERR_INVALID; /* from is inside a record */
-                    break;
-                }
-            }
-            if (found) {
-                if (outlen > 0 && outlen + sz > cap) {
-                    done = true;
-                    break;
-                }
-                if (outlen + sz > outcap) {
-                    size_t nc = MAX(outlen + sz, outcap * 2);
-                    uint8_t *no = realloc(out, nc);
-                    if (!no) {
-                        rc = TSDB_ERR_NOMEM;
-                        break;
-                    }
-                    out = no, outcap = nc;
-                }
-                memcpy(out + outlen, fb + pos, sz);
-                outlen += sz;
-                lastpos = wr.fno + wr.span - 1;
-                next_fno = lastpos + 1;
-                next_off = pos0 + pos + sz;
-            }
-            pos += sz;
-        }
-        if (rc || done)
-            break;
-        if (pos == 0 && window_end)
-            win *= 2; /* one record is larger than the window */
-        pos0 += pos;
-    }
-    free(fb);
-    close(fd);
-    if (rc == 0 && !found)
+    size_t pos0 = rp->rd_seq == s.seq && rp->rd_next && rp->rd_next <= from && rp->rd_off <= s.len ? (size_t)rp->rd_off : 0;
+    struct segrd r = {.seq = s.seq, .flen = (size_t)s.len, .pos0 = pos0, .from = from, .cap = cap};
+    rc = seg_scan(db, &r);
+    if (rc == 0 && !r.found)
         rc = TSDB_ERR_INVALID;
     if (rc == 0) {
-        *buf = out;
-        *len = outlen;
+        *buf = r.out;
+        *len = r.outlen;
         *seq = s.seq;
-        *off = start;
-        *last = lastpos;
-        rp->rd_seq = s.seq, rp->rd_off = next_off, rp->rd_next = next_fno;
+        *off = r.start;
+        *last = r.last;
+        rp->rd_seq = s.seq, rp->rd_off = r.next_off, rp->rd_next = r.last + 1;
     } else {
-        free(out);
+        free(r.out);
     }
     pthread_mutex_unlock(&rp->mu);
     return rc;

@@ -1793,6 +1793,7 @@ struct eng {
         uint64_t fno, key;
     } *lf;                       /* with jr: the stage_ links of COMMIT markers in the log (leader_commit; lead_mu) */
     size_t nlf, caplf;
+    uint64_t lrd_seq, lrd_off, lrd_next; /* where the last read of the log by position ended (replica_read; lead_mu) */
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
     atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */

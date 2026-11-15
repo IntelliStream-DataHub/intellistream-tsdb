@@ -3844,6 +3844,96 @@ static void case_hardlink(void)
     printf("  a leader keeps its COMMITs' files linked while their segment is retained; a power loss before the publish keeps them\n");
 }
 
+/* Feeds dst from the leader's log by position only (replica_read on the writer, `cap` bytes a read), then fetches every
+ * file a COMMIT names that dst misses from the leader (eng_leader_file_open), syncs and applies to `commit`. */
+static int feed_from_leader(eng *ld, eng *dst, size_t cap, uint64_t commit)
+{
+    uint64_t from = replica_log_end(dst) + 1;
+    int rc = 0;
+    for (;;) {
+        uint8_t *b;
+        size_t len;
+        uint64_t seq, off, last;
+        rc = replica_read(ld, from, &b, &len, cap, &seq, &off, &last);
+        if (rc == 0 && len)
+            rc = replica_append(dst, seq, off, b, len);
+        free(b);
+        if (rc || len == 0)
+            break;
+        from = last + 1;
+    }
+    char name[64];
+    uint64_t size;
+    while (rc == 0 && replica_missing(dst, name, sizeof name, &size) == 1) {
+        int fd = eng_leader_file_open(ld, name);
+        uint8_t *b = fd >= 0 ? malloc(size ? size : 1) : NULL;
+        rc = fd < 0 ? fd : !b || pread(fd, b, size, 0) != (ssize_t)size ? TSDB_ERR_IO : replica_stage(dst, name, b, size);
+        free(b);
+        if (fd >= 0)
+            close(fd);
+    }
+    if (rc == 0)
+        rc = replica_sync(dst);
+    return rc ? rc : replica_apply(dst, commit);
+}
+
+/* Item 3: a leader serves its log by position (replica_read on a writer) from its retained segments, the segments not
+ * flushed yet and the live tail of the current one. A replica fed only by such reads, in chunks of 300 bytes and of
+ * 1 MiB, with the files of the COMMITs it misses fetched from the leader's links, ends at the leader's log end and
+ * answers as the replica fed the segment files; a read at the end + 1 is empty, beyond it INVALID; once the keep bound
+ * lets the flushed segments go, a position in them is NOTFOUND (a snapshot is needed). */
+static void case_leader_read(void)
+{
+    xport x;
+    char fa[PATH_MAX + 8], fb[PATH_MAX + 8];
+    xp_start(&x, "lread");
+    snprintf(fa, sizeof fa, "%s_fa", x.ldir);
+    snprintf(fb, sizeof fb, "%s_fb", x.ldir);
+    sh("rm -rf '%s' '%s' && cp -a '%s_r' '%s' && cp -a '%s_r' '%s'", fa, fb, x.ldir, fa, x.ldir, fb);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_rows(&x, 1, 0, 8, 200);
+    xp_step(&x, "LR: rows");
+    CHECK_EQ(eng_flush(x.ld), 0); /* a retained segment */
+    xp_rows(&x, 0, 10, 40, 1000); /* a large insert: a COMMIT */
+    xp_rows(&x, 1, 8, 6, 300);
+    xp_step(&x, "LR: large insert");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    xp_rows(&x, 0, 60, 5, 400); /* the live tail of the current segment */
+    xp_rows(&x, 1, 60, 40, 500);
+    xp_rows(&x, 1, 100, 3, 600);
+    xp_step(&x, "LR: tail");
+    uint64_t end = ld_last(&x);
+    eng *a = NULL, *b = NULL;
+    CHECK_EQ(open_replica(fa, 0, &a), 0);
+    CHECK_EQ(open_replica(fb, 0, &b), 0);
+    if (a && b) {
+        CHECK_EQ(feed_from_leader(x.ld, a, 300, end), 0);
+        CHECK_EQ(feed_from_leader(x.ld, b, (size_t)1 << 20, end), 0);
+        CHECK_EQ(replica_log_end(a), end);
+        CHECK_EQ(replica_applied_end(a), end);
+        CHECK_EQ(replica_applied_end(b), end);
+        CHECK(same_all(a, x.rep, T0 + DAY_MS, "LR: fed by reads of 300 bytes"));
+        CHECK(same_all(b, x.rep, T0 + DAY_MS, "LR: fed by reads of 1 MiB"));
+    }
+    uint8_t *buf;
+    size_t len;
+    uint64_t seq, off, last;
+    CHECK_EQ(replica_read(x.ld, end + 1, &buf, &len, 100, &seq, &off, &last), 0);
+    CHECK_EQ(len, 0);
+    free(buf);
+    CHECK_EQ(replica_read(x.ld, end + 2, &buf, &len, 100, &seq, &off, &last), TSDB_ERR_INVALID);
+    free(buf);
+    eng_leader_keep(x.ld, UINT64_MAX);
+    CHECK_EQ(replica_read(x.ld, 1, &buf, &len, 100, &seq, &off, &last), TSDB_ERR_NOTFOUND);
+    free(buf);
+    if (a)
+        eng_close(a);
+    if (b)
+        eng_close(b);
+    xp_stop(&x);
+    printf("  a leader serves its log by position from its retained segments and the live tail\n");
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -3952,6 +4042,7 @@ int main(int argc, char **argv)
         case_depose();
         case_leader_keep();
         case_hardlink();
+        case_leader_read();
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
     }
@@ -4004,6 +4095,7 @@ int main(int argc, char **argv)
     case_depose();
     case_leader_keep();
     case_hardlink();
+    case_leader_read();
     case_promote_refused();
     for (int v = 0; v < 3; v++)
         case_promote(v);
