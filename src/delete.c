@@ -101,7 +101,7 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
      * from here until they are published (lw_fence) */
     lw_fence f;
     lw_fence_range(&f, series, start, end);
-    if (lw_enter(db, &f) && (rc = mt_flush(db)) != 0) {
+    if (lw_enter(db, &f) && (rc = leader_unappended(mt_flush(db))) != 0) { /* nothing of this call appended yet */
         lw_leave(db, &f);
         return rc;
     }
@@ -139,7 +139,7 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         rc = add_tomb_part(db, series, before[i], start, end, &all);
     if (rc == 0 && db->test_precommit)
         db->test_precommit(db->test_precommit_arg);
-    if (rc == 0 && db->jr) { /* the replicated backend: the marker names every file, tombstones first, then the rows */
+    if (rc == 0 && eng_jr(db)) { /* the replicated backend: the marker names every file, tombstones first, then rows */
         part **mp = malloc((all.n + rows.n + 1) * sizeof *mp);
         if (!mp) {
             rc = TSDB_ERR_NOMEM;
@@ -160,7 +160,7 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         while (j < nb && before[j] < now[i])
             j++;
         if (j == nb || before[j] != now[i]) {
-            if (db->jr) { /* its marker is out already (jr_serial makes this impossible: a bug) */
+            if (eng_jr(db)) { /* its marker is out already (jr_serial makes this impossible: a bug) */
                 eng_fail(db, "a partition appeared between a replicated delete's marker and its commit", EIO);
                 rc = TSDB_ERR_IO;
             } else {

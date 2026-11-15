@@ -1993,7 +1993,7 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
  * marker, so the leader must not go on as if nothing happened. */
 static int leader_marker_wait(eng *db, uint64_t last, const char *what)
 {
-    const struct jr_ops *jr = db->jr;
+    const struct jr_ops *jr = eng_jr(db);
     int rc = jr->wait ? jr->wait(jr->ctx, db, last) : 0;
     if (rc == 0)
         rc = eng_leader_wait(db, last, false);
@@ -2007,7 +2007,7 @@ static int leader_marker_wait(eng *db, uint64_t last, const char *what)
 
 static int leader_commit(eng *db, const struct jr_commit_arg *ja)
 {
-    const struct jr_ops *jr = db->jr;
+    const struct jr_ops *jr = eng_jr(db);
     if (ja->n == 0)
         return 0;
     if (ja->n > MK_FILES_MAX)
@@ -2064,13 +2064,15 @@ static int leader_drop(eng *db, int64_t ts)
     uint64_t fno = 0;
     int rc = mt_flush_ex(db, &m, &fno);
     if (rc)
-        return rc;
+        return fno ? rc : leader_unappended(rc); /* no marker in the log: definitely not applied */
+    if (fno == 0) /* a backstop: never retire without the marker */
+        return TSDB_ERR_IO;
     return leader_marker_wait(db, fno, "a DROP marker was appended but its commit point did not come");
 }
 
 int jr_intent(eng *db, enum jr_kind kind, const void *arg)
 {
-    if (!db->jr)
+    if (!eng_jr(db))
         return 0;
     switch (kind) {
     case JR_COMMIT:

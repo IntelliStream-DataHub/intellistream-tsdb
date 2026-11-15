@@ -469,10 +469,16 @@ On the leader, one group commit:
 *The engine's hooks (r3a-gate; `struct jr_ops`, src/internal.h).* Step 1: `admit(fno, span)` runs under `buf_lock`
 for every record (a batch of rows, which may join the open rows record, or a marker) before it is buffered and after
 everything that can fail; a non-zero return refuses the write with nothing buffered (min_isr, not leading). The driver
-calls `repl_write` there under its core mutex, a leaf below `buf_lock`, and fails the volume if the core's position is
-not the engine's fno. Step 2: `bytes(seq, off, buf, len, first, last)` runs in the WAL writer role after its `write()`
-and before its `fdatasync`, with the sealed bytes of whole records; it must not block. Step 4: the driver calls
-`eng_leader_commit(pos)`.
+calls `repl_write` there under its core mutex, which comes below `buf_lock` (and above `lead_mu`: under it the driver
+may call `eng_leader_commit`, `eng_leader_depose`, which takes no `buf_lock` and so may be called from `admit` itself,
+and `eng_fail`), and fails the volume if the core's position is not the engine's fno. A marker refused there fails its
+call (a DROP retires nothing). Step 2: `bytes(seq, off, buf, len, first, last)` runs in the WAL writer role after its
+`write()` and before its `fdatasync`, with the sealed bytes of whole records; it must not block. Step 3: `synced(last)`
+runs in the WAL writer role after every sync of the leader's log, in position order (the driver's `repl_synced`, no
+polling). Step 4: the driver calls `eng_leader_commit(pos)`. A deposed leader answers a call whose own record was never
+appended (a write refused before its append, a flush, a large insert, delete or DROP whose first flush the gate ends)
+with UNAVAILABLE; only a call whose record is in the log gets the indeterminate result. A leader's close flushes and
+waits for the commit point: a driver whose commit point can no longer move deposes the leader first.
 
 Latency: `max(leader fdatasync, one-way + replica fdatasync + one-way)`; on A4's hardware about 0.85 ms against
 0.68 ms today. Throughput: group commit amortises both the local and the remote syncs, as it does today for

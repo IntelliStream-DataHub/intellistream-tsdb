@@ -62,7 +62,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_NO_DROP_SERIAL, MUT_REPLICA_STAGE_TRUNC,
        MUT_REPLICA_NO_STAGE_ORPHANS,
        MUT_LEADER_VISIBLE_DURABLE, MUT_LEADER_FLUSH_UNCOMMITTED, MUT_LEADER_DEPOSE_FAILS, MUT_LEADER_ADMIT_AFTER,
-       MUT_LEADER_BYTES_AFTER_SYNC };
+       MUT_LEADER_BYTES_AFTER_SYNC, MUT_LEADER_MARKER_RC, MUT_LEADER_GATE_NOHOOK,
+       MUT_LEADER_NO_SYNCED };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1382,7 +1383,9 @@ struct jr_ops {
      * after everything that can fail has (nothing can refuse the record once this returned 0). Non-zero refuses the
      * write with nothing buffered and the numbers not advanced; the code is the write's (definitely not applied: the
      * driver answers min_isr, not leading). The driver hands out the core's positions here (repl_write) under its core
-     * mutex, which is a leaf below buf_lock, and fails the volume if they are not `fno`. Must not block. May be NULL. */
+     * mutex, which comes below buf_lock (buf_lock > core mutex > lead_mu, fail_lock: under it the driver may call
+     * eng_leader_commit, eng_leader_depose and eng_fail, never anything that takes an engine lock above them), and
+     * fails the volume if they are not `fno`. Must not block. May be NULL. */
     int (*admit)(void *ctx, struct eng *db, uint64_t fno, uint32_t span);
     /* the bytes of records just written to segment `seq` at offset `off` (whole records, sealed: byte for byte what the
      * segment holds), positions first .. last, called by the WAL writer role after its write() and before its
@@ -1390,6 +1393,11 @@ struct jr_ops {
      * buffer is the engine's. May be NULL. */
     void (*bytes)(void *ctx, struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len, uint64_t first,
                   uint64_t last);
+    /* the leader's own log is durable up to position `last` (its fdatasync returned; eng_wal_durable_fno says it from
+     * now on): called by the WAL writer role after every sync of a leader's write, in position order, so the driver
+     * counts the leader's durable end into the commit point (repl_synced) without polling. Must not block; may call
+     * eng_leader_commit. May be NULL. */
+    void (*synced)(void *ctx, struct eng *db, uint64_t last);
     /* a flushed WAL segment is about to be removed: the driver reads what it still needs (the records of the segment
      * not yet sent). Under flush_lock. */
     void (*seg_done)(void *ctx, struct eng *db, uint64_t seq);
@@ -1424,10 +1432,16 @@ int wal_commit(struct eng *db, uint64_t target);
  * appended (and shipped by the bytes callback), never on an engine lock: a wait for it may hold flush_lock, cls_rw
  * or jr_serial (a flush, a large write's lw_enter, a DROP) without blocking its progress.
  * eng_leader_attach: installs ops; TSDB_ERR_INVALID without the WAL or with wal_sync_ms != 0 (a periodic sync would
- * acknowledge before durability). eng_leader_commit: the driver's commit point moved to pos (never back).
- * eng_wal_durable_fno: the last position durable in the leader's own log (the core's own durable end).
- * eng_leader_depose: refuses every write from now on (TSDB_ERR_UNAVAILABLE, nothing buffered) and wakes every wait
- * for the commit point with TSDB_ERR_INDETERMINATE; the engine is not failed. */
+ * acknowledge before durability). Called right after eng_open, before any write; the background threads read db->jr
+ * through eng_jr (acquire). eng_leader_commit: the driver's commit point moved to pos (never back).
+ * eng_wal_durable_fno: the last position durable in the leader's own log (the core's own durable end; jr_ops.synced
+ * reports each move). eng_leader_depose: refuses every write from now on (TSDB_ERR_UNAVAILABLE, nothing buffered) and
+ * wakes every wait for the commit point with TSDB_ERR_INDETERMINATE; the engine is not failed. It takes lead_mu only
+ * (no buf_lock), so it may be called from anywhere: from jr_ops.admit (which then refuses the record itself) or under
+ * the driver's core mutex. A record whose admission was running meanwhile may still be buffered; its wait ends
+ * indeterminate like any other (whoever needs the final log end takes buf_lock after the depose).
+ * A leader's close or halt flushes, and the flush waits for the commit point: a driver whose commit point can no longer
+ * move (the ISR is gone) deposes the leader first, or the close waits until it moves. */
 int eng_leader_attach(struct eng *db, const struct jr_ops *ops);
 void eng_leader_commit(struct eng *db, uint64_t pos);
 uint64_t eng_wal_durable_fno(struct eng *db);
@@ -1436,6 +1450,9 @@ void eng_leader_depose(struct eng *db);
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
 int eng_leader_wait(struct eng *db, uint64_t pos, bool hook);
+/* The answer of a call whose own record was never appended, when a flush it needed first ended indeterminate (a
+ * deposed leader): definitely not applied, TSDB_ERR_UNAVAILABLE (the client may retry on the new leader). */
+static inline int leader_unappended(int rc) { return rc == TSDB_ERR_INDETERMINATE ? TSDB_ERR_UNAVAILABLE : rc; }
 /* test hook: called by the WAL writer role just before the leader's fdatasync of a write (tests/test_replica.c) */
 extern void (*wal_test_sync_hook)(struct eng *db);
 int wal_open(struct eng *db, int (*before_replay)(struct eng *));
@@ -1739,7 +1756,7 @@ struct eng {
     size_t nflushing;
     bool wal_enabled;
     struct replica *rp; /* an engine opened as a replica (replica.c): the log arrives verbatim, rows apply at the commit point */
-    const struct jr_ops *jr;   /* the replicated backend of a leader (jr_intent), set before the engine is used */
+    const struct jr_ops *jr;   /* the replicated backend of a leader (jr_intent): eng_leader_attach, read with eng_jr */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
     atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */
     pthread_mutex_t lead_mu;          /* a leaf: waits for the commit point (lead_cv), its moves, depose, eng_fail */
@@ -1882,10 +1899,11 @@ static inline int eng_check(struct eng *db)
 }
 /* The last position a reader may see: in sync mode what is durable, and on a leader no further than the commit point
  * (C7: a leader applies only up to it, as every replica does). Unchanged for every other engine. */
+static inline const struct jr_ops *eng_jr(struct eng *db) { return __atomic_load_n(&db->jr, __ATOMIC_ACQUIRE); }
 static inline uint64_t eng_visible(struct eng *db)
 {
     uint64_t v = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
-    if (db->jr && eng_test_mutant != MUT_LEADER_VISIBLE_DURABLE) {
+    if (eng_jr(db) && eng_test_mutant != MUT_LEADER_VISIBLE_DURABLE) {
         uint64_t c = atomic_load(&db->lead_commit);
         v = c < v ? c : v;
     }
