@@ -566,13 +566,29 @@ and every marker in it is applied durably, and keeps sealed segments for catch-u
   that asked for a replica.
 - **Merges** drop expired rows with the replica's clock; queries clamp to the cutoff anyway, so the answer is the
   same.
-- **Partition classes.** Only the leader decides switches (at its flushes and idle merges, as today). It takes `cls_rw`
-  for writing, appends a `CLASS` marker, waits for the commit point (about 1 ms), appends to CLASSES and releases
-  `cls_rw`. A replica, before it appends a `CLASS` record, checks the rule of AGENTS.md on its own state: T past every
-  row of the series in its memtables and in WAL segments that may still replay (`db->wtail`). Its WAL is the leader's,
-  but it may keep a segment longer than the leader did, and a deleted row in such a segment would replay under the
-  new key. If the check fails, the replica first flushes and unlinks the segments in question and syncs the directory
-  (`wal_removed_synced`), then appends. A replica never decides a switch itself (engine option `replica = 1`).
+- **Partition classes.** Only the leader decides switches (at its flushes and idle merges, as today, and a fresh
+  series' class with `at = INT64_MIN`). Inside the switch, under `flush_lock`, `cls_rw` (write) and `class_lock`, it
+  appends a `CLASS` marker, waits for the commit point and only then appends to CLASSES (`append_locked`, one marker
+  per record). The marker cannot go later: rows the leader places under the new history right after the switch would
+  precede it in the log, and a replica that seals and flushes their segment before it applies the marker puts them
+  under the old one. For the same reason a replicated leader classifies its active memtable's fresh series before it
+  seals the memtable (`cls_classify_active`), so their markers lie in the segment of their rows.
+  **A replica takes the leader's T exactly** (user decision 2026-11-14, R2 REVIEW H4), never `max(T, its own)`: both
+  must place every row under the same key. So the leader's T lies past every row any member may still replay: its
+  `wtail` (the newest row per series of every flushed WAL segment, with the segment's `fno_end`) is pruned by the
+  **replay floor** L, the lowest log start of the members (`start` in ACK and FENCE_REPLY, `repl_replay_floor`, handed
+  to the engine by `eng_leader_replay_floor`; 0 while a member has not been heard from in this epoch), never by the
+  leader's own removed segments. After an open or a promotion the leader knows no rows of segments the members may
+  still hold: `wtail_from` is its log end at the attach, raised to the `fno_end` of every pruned entry, and a switch
+  while `L < wtail_from` waits (the explicit `eng_class_switch` answers `TSDB_ERR_UNAVAILABLE`; the flush guard and
+  the merge's `cls_observe` ask again later and never fail). T is also no earlier than the partition edge after the
+  series' retention cutoff (a replica's clock lags, so it may still hold rows the leader has expired).
+  A replica, applying a `CLASS` record, first merges the partitions where its parts hold rows of the series at or past
+  T (the leader's merges may have removed rows hidden by tombstones or expired, which its own merges have not yet;
+  outside `flush_lock`), then checks T against its parts and the WAL segments it may replay (`db->wtail`, the
+  dropped partitions' end): a row past T is `TSDB_ERR_CORRUPT` with a log line (its history is not the leader's).
+  Its memtable rows are not checked: they came before the marker in the log, so the leader held them in memtables
+  when it took T, and both place them under the new history at their flush. A replica never decides a switch itself.
 
 ### 5.5 Dictionaries and creation
 
@@ -582,6 +598,11 @@ and every marker in it is applied durably, and keeps sealed segments for catch-u
   the new leader may give it to another name, so "ids are never reused" holds for every id a client has seen.
 - **Retention limits, drops**: `RETENTION` and `DROP` markers, applied in order. ha.md's drop watermark (D33) carries
   over: rows below it are refused (`TSDB_ERR_DROPPED`), so a resend after a drop cannot bring a partition back.
+- **The order on the leader** for every dictionary (SERIES, STATE, RETENTION, CLASS): marker, commit point
+  (`jr_markers`), then the file; the record is held in memory until then, and a new id is not visible. A replica
+  applies RETENTION and CLASS records by offset and skips an offset below its file's end (a replay), so a deposed
+  leader's record that reached its file uncommitted would hide the next leader's different record at that offset;
+  deposed while it waits, the leader answers `TSDB_ERR_INDETERMINATE` and its file stays as it was.
 - **Users**: in the metadata group (C22).
 
 ### 5.6 Merges

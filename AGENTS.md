@@ -439,6 +439,10 @@ cgroup, so `nice` does not keep your work out of its way.
   replace classifies a fresh series like a large insert. `CLASSES` is append-only (24-byte checksummed records),
   synced (and its directory, when new) before anything relies on a record, fail-stop on error, torn tail cut,
   loaded before the WAL replay.
+  On a replicated volume (design-cluster 5.4) a replica takes the leader's T exactly, so the leader's T lies past every
+  row any member may still replay (its WAL tails are pruned by the members' replay floor, never by its own removed
+  segments, and a switch waits while that floor is unknown or below its open), and the CLASS marker precedes the
+  CLASSES record inside the switch.
   `tsdb_part_info.partition` stays the base partition number (where the partition starts); `cls`, `start_ms`,
   `end_ms` say the rest. Tests that count parts per base partition or name `p<N>_` files set
   `partition_classes = 0`.
