@@ -111,6 +111,11 @@
  * then fix every series' rows, and the final server must answer the latest of each exactly (final_latest, also after
  * the clean restart, which builds the table anew). tests/jepsen/mutant-latest.sh plants stale table entries in
  * tsdbd: the check must fail them.
+ * Not a wrong answer but the server itself (round 11; the same verdict, VIOLATION, under every nemesis and under none): a tsdbd that
+ * ends by itself (a crash, an exit of its own; end_report: only what the harness sent, or the shim's power loss, or an EIO's fail-stop
+ * is expected) or that stops answering (every request has a deadline, REQ_DEADLINE_DEFAULT_S) or whose stop never ends; a tsdbd that
+ * will not start is the environment (exit 2) unless its log says that the data is damaged (exit 1). Liveness, how soon things
+ * resume after a fault, is INCONCLUSIVE (exit 3) and never a violation.
  * Deletes and replaces clear a key range of one series (a replace writes its
  * keys in that range in the same step). A key may then be absent where the
  * checks above want a value, if a delete covering it that did not definitely
