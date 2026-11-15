@@ -71,6 +71,8 @@ build/tsdb cluster secret $D/secret
 #    The state directory holds the cluster's own files and must be on a local disk, never on NFS.
 #    Node N listens for clients on port 1708N and for the other servers on port 1709N (the two lines marked ports).
 #    --no-auth: no login, because users are still per server in the preview. Fine on 127.0.0.1, nowhere else.
+#    TSDB_CLUSTER_WRITES=1: a preview switch that lets a volume's leader take writes (step 6), though nothing is
+#    copied yet. Without it every cluster volume refuses writes.
 #    A witness (node 4) has no data directory and no client port.
 port() { echo 1708$1; }                    # ports: the client port of node N
 pport() { echo 1709$1; }                   # ports: the peer port of node N
@@ -79,7 +81,7 @@ start_node() {                             # start_node N [witness]: start a ser
     mkdir -p $D/n$1/state
     if [ "${2:-}" = witness ]; then role="--witness --advertise 127.0.0.1"
     else mkdir -p $D/n$1/data; role="--dir $D/n$1/data --no-auth --port $(port $1)"; fi
-    build/tsdbd $role --state-dir $D/n$1/state --peer-port $(pport $1) \
+    TSDB_CLUSTER_WRITES=1 build/tsdbd $role --state-dir $D/n$1/state --peer-port $(pport $1) \
         --cluster --cluster-secret-file $D/secret --rack rack$1 &gt;&gt; $D/n$1/log 2&gt;&amp;1 &amp;
     echo $! &gt; $D/n$1/pid
 }
@@ -102,11 +104,18 @@ build/tsdb cluster node add $(peer 1) $(peer 3) --secret-file $D/secret
 wait_for 2 '^group voters 1,2,3 '
 status 2
 
-# 6. Nothing changed for clients, and nothing is copied. Write a day of readings to node 1 as if it were
-#    a lone server, then list the series in node 1's directory and in node 2's.
-build/client-example 127.0.0.1 $(port 1)
-build/tsdb $D/n1/data series | cut -f1,2
-echo "node 2 has $(build/tsdb $D/n2/data series | wc -l) series"
+# 6. A volume: in a cluster, data lives in volumes the group places, never in a server's own directory. Add one
+#    named plant with three copies, one per node, and wait until every node has made its directory (n1/data/v1, ...)
+#    and the group has recorded that it opened it (open_gen). Then write a day of readings into plant through its
+#    leader (the first of the three; only it takes writes) and read them back. The preview copies nothing yet:
+#    the other two copies stay empty.
+build/tsdb cluster volume add $(peer 1) plant --replicas 3 --secret-file $D/secret
+for n in 1 2 3; do wait_for 1 "^replica volume 1 node $n rid [0-9a-f]* open_gen 1$"; done
+status 1 | grep '^volume\|^replica'
+leads=$(status 1 | awk '$1 == "volume" &amp;&amp; $4 == "plant" { print $8 }')
+echo "node $leads leads volume plant"
+TSDB_VOLUME=plant build/client-example 127.0.0.1 $(port $leads)
+ls -d $D/n[123]/data/v1
 
 # 7. Kill the leader, as a crash would (kill -9, by its process id). The others elect a new leader, and once that
 #    one has led for three seconds (node_timeout_ms) without a heartbeat from the dead node, it marks the node down.
@@ -155,6 +164,7 @@ added 127.0.0.1:17093</code></pre>
 <p>and <code>status 2</code> shows the cluster, asked of node 2, which follows:</p>
 <pre><code data-lang="plain" data-block="4" data-src="docs/cluster-preview.md#What you should see">node 2 mode core role follower term 1 leader 1 commit 8 applied 8
 cluster 875bd313f7abb7b8c0ca9b6b59e6c292 replication 3 min_isr 1 node_timeout_ms 3000 heartbeat_ms 500 voter_replace_s 600 voters_max 5 mode replicated failover lease read_barrier on lease_s 10 restore_gen 0
+replicated lease_ms 2000 drift_ppm 500 unanswered_ms 1000 commit_interval_ms 5 repl_retain_mb 4096 repl_retain_s 1800 idle_seal_ms 1000
 group voters 1,2,3 learners -
 member 1 up incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 457ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
@@ -162,13 +172,21 @@ member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 h
 volumes 0 users 0</code></pre>
 <p>Step 6: the client example is the one of the <a href="quickstart.html">quick start</a>, pointed at node 1. Node 1 has
 the series, node 2 has none:</p>
-<pre><code data-lang="plain" data-block="5" data-src="docs/cluster-preview.md#What you should see">wrote 1440 rows
+<pre><code data-lang="plain" data-block="5" data-src="docs/cluster-preview.md#What you should see">added volume plant: number 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
+replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
+replica volume 1 node 3 rid d55421a420347a3b open_gen 1
+volumes 1 users 0
+node 1 leads volume plant
+wrote 1440 rows
 read 1440 rows, the first: 1717200000000 50.00
 24 hours, the first average: 51.28
 Oslo day 1: 1320 rows, average 50.23
 Oslo day 2: 120 rows, average 47.47
-pump7.flow	float32
-node 2 has 0 series</code></pre>
+/tmp/tsdb-cluster/n1/data/v1
+/tmp/tsdb-cluster/n2/data/v1
+/tmp/tsdb-cluster/n3/data/v1</code></pre>
 <p>Step 7: after the kill, a survivor sees a new term, a leader, and the dead node 1 as <code>down</code>:</p>
 <pre><code data-lang="plain" data-block="6" data-src="docs/cluster-preview.md#What you should see">node 2 mode core role leader term 2 leader 2 commit 10 applied 10
 cluster ... (the settings, as before)
@@ -176,7 +194,11 @@ group voters 1,2,3 learners -
 member 1 down incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 5482ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 377ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volumes 0 users 0</code></pre>
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
+replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
+replica volume 1 node 3 rid d55421a420347a3b open_gen 1
+volumes 1 users 0</code></pre>
 <p>Your shell may print a line like <code>Killed  build/tsdbd ...</code> about the process you killed. That is the shell,
 not tsdb.</p>
 <p>Step 8: node 1 is back, a follower of the new leader, with <code>incarnation 2</code>:</p>
@@ -186,7 +208,11 @@ group voters 1,2,3 learners -
 member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volumes 0 users 0</code></pre>
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
+replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
+replica volume 1 node 3 rid d55421a420347a3b open_gen 1
+volumes 1 users 0</code></pre>
 <p>Step 9: the witness. It is <code>mode watch</code>, has no client port (<code>addr ...:0</code>) and
 <code>volumes_ok 0</code>: it will never hold a volume. It has not heard from the others as a voter does, so
 <code>heard</code> says <code>never</code> for them.</p>
@@ -197,7 +223,11 @@ member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 h
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 4 up incarnation 1 addr 127.0.0.1:0 peer 127.0.0.1:17094 rack rack4 heard 0ms feed - voter_ok 1 volumes_ok 0 core_dropped 0 read_barrier on
-volumes 0 users 0</code></pre>
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
+replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
+replica volume 1 node 3 rid d55421a420347a3b open_gen 1
+volumes 1 users 0</code></pre>
 <p>Step 10 prints what the servers logged about leaders and members. Only the new leader proposes a change, so a line
 shows in one log only. For example:</p>
 <pre><code data-lang="plain" data-block="9" data-src="docs/cluster-preview.md#What you should see">tsdbd: cluster: node 2 leads the metadata group (term 2)

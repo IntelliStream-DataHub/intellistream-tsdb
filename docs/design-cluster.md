@@ -412,6 +412,15 @@ Consequences:
   write and the leader applied it, so a client reads its own write on the leader.
 - In sync mode today, a row is visible once the WAL is synced up to it. The cluster replaces "synced" by
   "committed": the same `visible` boundary in `mt_collect`, fed by the commit point instead of `wal_durable`.
+  *Built (r3a-gate):* on a leader (`db->jr`, installed by `eng_leader_attach`, which refuses `wal_sync_ms != 0`) the
+  boundary is `eng_visible` = min(`wal_durable`, the commit point the driver gives `eng_leader_commit`). A memtable
+  row's lsn is its log number (fno) wherever the WAL is on, a marker's its last one, so `wal_durable` and the commit
+  point compare directly (`eng_wal_durable_fno` is the leader's own durable end). `mem_insert` acknowledges once the
+  commit point passed its batch (the wait goes through the write wait hook, so tsdbd starts another worker);
+  `flush_waiting` writes a sealed memtable only once the commit point passed its last position. `eng_leader_depose`
+  refuses every write before it is buffered and ends every wait with an indeterminate result, which is never sent as
+  UNAVAILABLE or MOVED (both promise "not applied"), and does not fail the engine. A relog (ha.md 15.5) is refused on
+  a leader.
 
 **Driver contracts** (*corrected 2026-11-06, gaps 9 and 12*). The replication core is sans-IO; the engine (step 3)
 and tsdbd (step 4) that drive it must keep three rules, which the simulator's naive driver breaks on purpose:
@@ -457,12 +466,70 @@ On the leader, one group commit:
 4. When the lowest log end over the ISR passes the record, the leader advances the commit point, makes the rows
    visible and answers the clients whose rows it covered.
 
+*The engine's hooks (r3a-gate; `struct jr_ops`, src/internal.h).* Step 1: `admit(fno, span)` runs under `buf_lock`
+for every record (a batch of rows, which may join the open rows record, or a marker) before it is buffered and after
+everything that can fail; a non-zero return refuses the write with nothing buffered (min_isr, not leading). The driver
+calls `repl_write` there under its core mutex, which comes below `buf_lock` (and above `lead_mu`: under it the driver
+may call `eng_leader_commit`, `eng_leader_depose`, which takes no `buf_lock` and so may be called from `admit` itself,
+and `eng_fail`), and fails the volume if the core's position is not the engine's fno. A marker refused there fails its
+call (a DROP retires nothing). Step 2: `bytes(seq, off, buf, len, first, last)` runs in the WAL writer role after its
+`write()` and before its `fdatasync`, with the sealed bytes of whole records; it must not block. Step 3: `synced(last)`
+runs in the WAL writer role after every sync of the leader's log, in position order (the driver's `repl_synced`, no
+polling). Step 4: the driver calls `eng_leader_commit(pos)`. A deposed leader answers a call whose own record was never
+appended (a write refused before its append, a flush, a large insert, delete or DROP whose first flush the gate ends)
+with UNAVAILABLE; only a call whose record is in the log gets the indeterminate result. A leader's close flushes and
+waits for the commit point: a driver whose commit point can no longer move deposes the leader first.
+
 Latency: `max(leader fdatasync, one-way + replica fdatasync + one-way)`; on A4's hardware about 0.85 ms against
 0.68 ms today. Throughput: group commit amortises both the local and the remote syncs, as it does today for
 concurrent writers. The wire carries 20 bytes a row before zstd-1 (C25); time series compress 3 to 6 times on it.
 
 `wal_sync_ms > 0` (periodic sync) is refused in a cluster, as ha.md D15 refuses it: an acknowledgement would come
 before durability.
+
+#### 5.1.1 Data links (C25; `server/peerlink.h`, `server/peerlink.c`)
+
+Per pair of servers, one **log link** and one **bulk link**, each a TCP connection of its own to the peer port (so a
+proxy or a firewall sees one port). The dialer sends the cluster HELLO (protocol version 4) with a trailing link kind
+(0 metadata, 1 log, 2 bulk); the cluster thread's acceptor checks what it checks for any member (cluster uuid, member
+id, identity) and hands the socket and the HELLO body to `peerlink_adopt`, after which a thread of that link answers
+the handshake and runs it: the cluster thread never reads or writes a data link. The handshake is the metadata link's
+under its own labels (`tsdb-link-s`, `-c`, `-k>`, `-k<`), so the key of a data link is never that of a metadata link
+of the same pair. The accepted connection answers the handshake first, touching nothing else (an id, uuid and identity
+travel in the clear, so a peer without the secret can claim any); only a peer that passed AUTH takes the (peer, kind)
+link over from the connection that runs it, which leaves, and closes a connection of the same peer that was still
+waiting for the link. At most one connection runs and one waits per link, and no thread ever joins another: a driver
+callback stuck on a volume that is away holds its own thread and descriptor, however often the peer redials. The
+handshakes in flight are capped (64), and `peerlink_free` waits for every adopt thread (the acceptor is stopped first).
+`plink_send_gen` sends on one connection only (`plink_gen`, or the generation `on_link(up)` ran for); sends are
+`PL_E_DOWN` until `on_link(up)` has returned, except from inside it, so the driver's resume logic goes first.
+
+From AUTH on a frame is `[u32 len][u8 type][payload][tag 32]`, the tag `HMAC-SHA256(key of that direction, seq u64 |
+type | payload)`, the sequence counting per direction from 0: a frame that was changed, dropped, repeated or reordered
+ends the link. Types 1 to 0x6f belong to the driver (replication, r3d-stream) and are opaque to the link; 0x70 and up
+are the link's own. Bit 0x80 of a log frame's type says the payload is `[u32 raw length][zstd-1 frame]`; the decoded
+size must equal the raw length, which is at most 8 MiB. A frame that is not well formed ends the link
+(`tests/fuzz/fuzz_replframe.c`).
+
+Back-pressure: every link has a bounded send queue (8 MiB by default); `plink_send` copies the payload and returns
+`PL_E_FULL` (or waits a given time, then returns it) when the queue is full, so a peer that stops reading never makes
+the sender's memory grow: its reader thread blocks in the callback, TCP stops the sender, the sender's queue fills.
+A sender held back that way (its bytes wait in the socket) is not counted silent, and a receiver never counts its own
+callbacks' time against the peer; a sender with nothing queued hears nothing from a receiver whose callback blocks, so
+a callback must not block longer than `dead_ms` (the driver gives a slow disk its own queue and thread). A resume
+prefix is hashed a megabyte per turn of the link's loop, so PINGs go on meanwhile. A receiver whose data callback fails
+tells the sender `DONE{PL_E_IO}` at once: the transfer stops (chunks in flight are ignored) and is not retried, since
+the receiver's disk is not a link fault.
+A dialed link reconnects with backoff (50 ms doubling to 2 s) after any failure or when nothing was heard for
+`dead_ms` (PING every `ping_ms`); the queue of a link that went down is dropped and `on_link` tells the driver, which
+resumes from its own state.
+
+Bulk: a file is `fd[base, base + length)`, sent as `BEGIN{file, total, meta}`; the receiver answers `RESUME{offset}`
+with the bytes it already holds from the start of that file (it hashes them back from its own copy, so the xxh64 at
+the end covers resumed bytes too); then `CHUNK{file, offset, bytes}` of 256 KiB at the rate of a node-wide token bucket
+(a constant, 256 MiB/s, until r3d-stream gives it a setting); `END{total, xxh64}`; `DONE{status}`. After a reconnect
+the job goes back to the head of the queue and starts from the receiver's offset, at most `max_attempts` connections.
+One file at a time per link.
 
 ### 5.2 Large inserts, deletes and replaces
 
@@ -866,8 +933,14 @@ Time: a server's hot replicas are rebuilt on all the others at once. With 2 TB o
   system can see a restore, it enforces the rule: REPL holds an **open generation**, raised (and synced) at every
   open and registered with the metadata group (`REPLICA_OPEN(v, node, rid, gen)`, conditional on gen being above the
   recorded one) before the replica answers a fence, sends an ACK or leads; a directory whose generation is below the
-  record's is refused at open with a message that names both. That catches a restore of any copy taken before the
-  replica's last open. It cannot catch a copy of the running directory restored before the next open (the copy then
+  record's is refused at open with a message that names both. Each open also draws a random **nonce**, saved in REPL
+  with the generation and carried by `REPLICA_OPEN`: the replica serves only once the record holds exactly its own
+  (generation, nonce), so a copy taken after an open that was never recorded, which saves the same generation again,
+  is refused too ("saved open generation G in another open"), as is an open that finds a record of its generation
+  from another open. The volume manager judges a directory only against a metadata copy that holds this run's own
+  incarnation (the leader's `MEMBER_STATE` up for it), so every `REPLICA_OPEN` committed before the restart is in it:
+  a local copy that has not caught up must not let an older directory pass. That catches a restore of any copy taken
+  before the replica's last open. It cannot catch a copy of the running directory restored before the next open (the copy then
   carries the current generation), which is why the rule is the operator's: replica directories are never restored
   in place; backups serve disaster recovery of the whole cluster (`tsdb cluster restore`, design-ha-modes.md §8.1).
   The core fails a follower that sees two records of one epoch at one position, so a double lead is never silent.

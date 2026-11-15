@@ -167,11 +167,11 @@ static char *slurp(const char *dir, const char *name, size_t *len)
 static bool meta_has_feed(const char *dir)
 {
     char *t = slurp(dir, "META", NULL);
-    bool f = false;
+    unsigned f = 0;
     if (t)
         meta_requires_parse(t, &f, NULL, 0);
     free(t);
-    return f;
+    return f & META_REQ_FEED;
 }
 
 /* Walks a retained segment: every byte is a valid record (a sealed segment has no torn tail). *first and *last: the

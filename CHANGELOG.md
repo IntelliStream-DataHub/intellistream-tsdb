@@ -8,6 +8,37 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**Cluster volumes (preview, R3): `tsdb cluster volume add`; a cluster node keeps data in cluster volumes only.** This
+changes what a node of the 0.10.0 preview accepts, and its metadata snapshot (version 3) and peer protocol (version 3):
+a cluster made with 0.10.0 is initialised again, not upgraded (as for every change of the preview).
+
+- Data links on the peer port (transport only; nothing sends over them yet): the peer protocol is now version 4, whose
+  HELLO ends with a link kind (metadata, log, bulk). Per pair of servers a log link (small frames, zstd-1) and a bulk
+  link (part files in throttled chunks, resumable from the receiver's offset, an xxh64 per file) have sockets of their
+  own, so a large file never delays a small insert; every frame carries a tag under a key of its own link, and a
+  slow peer meets a bounded queue; an accepted connection replaces a live link only after it passed AUTH.
+  `server/peerlink.[ch]`, `docs/design-cluster.md` 5.1.1.
+- `tsdb cluster volume add PEER NAME [--replicas N]`: the group gives the volume the next number, places its copies on
+  N members that are up and may hold volumes (one per rack where it can; fewer is refused) and records it. Each of
+  those servers makes `<dir>/v<N>` (`META` with `volume=`, `volume_uuid=`, `cluster=` and `requires=cluster,replica`,
+  `FNO`, the copy's replica id), raises the copy's open generation at every start, and serves it only once the group has
+  recorded that generation and the open's random nonce (`REPLICA_OPEN`), judged against a metadata copy that has
+  caught up with the server's own start; a directory whose generation is below the record's, that saved the record's
+  generation in another open, or whose replica id differs, is refused, naming both. A `v<N>.tmp` left by a crash is
+  removed and made again; a server makes at most 256 cluster volumes and says so in its log when given more. `status` prints `volume ...` and `replica volume ...` lines.
+- A server started with `--cluster` refuses to start with series in its own directory or lines in `VOLUMES` (naming
+  them), and with `--wal-sync-ms` other than 0; while it runs, a series in its own directory and `tsdb DIR volume add`
+  are refused (`TSDB_ERR_INVALID`). A directory whose `META` says `requires=cluster` opens only inside a cluster
+  server, and `feed enable` refuses it.
+- Clients name a cluster volume like any volume (`tsdbc_series_at` with its name). Nothing is copied yet: a copy that
+  does not lead refuses writes (`UNAVAILABLE`, reason `fenced`), and so does the leader unless its server runs with
+  `TSDB_CLUSTER_WRITES=1` (for trying it out; it goes when copying works). The example client takes `TSDB_VOLUME=NAME`.
+- `tsdb cluster init` stores the settings of replicated volumes (`--lease-ms`, `--drift-ppm`, `--unanswered-ms`,
+  `--commit-interval-ms`, `--repl-retain-mb`, `--repl-retain-s`, `--idle-seal-ms`; nothing acts on them yet).
+- The cluster tutorial's step 6 adds a volume and writes to it through its leader. Tests: `tests/test_cvol.c` (cluster
+  volumes in a handle: holes, routing, the engine swap under readers), `test_cluster` `volumes` and `volrefuse`, with
+  the mutants `TSDB_CVOL_MUTANT=noopengen|samerid|anynonce|replnonce`.
+
 **Statistics over the network, protocol 15 (floor stays 12).** Everything of `docs/design-stats.md` that was embedded-only
 is now a request to `tsdbd`: the storage numbers of series, and the numbers, hot series and request costs of tenants.
 Older clients keep working (new ops only); the clients send them only to a server that says 15 or more.

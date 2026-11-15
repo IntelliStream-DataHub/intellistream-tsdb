@@ -116,7 +116,7 @@ int cut_take(eng *db, qcut *c)
         mt_ref(db->flushing[i]);
         c->ms[c->nms++] = db->flushing[i];
     }
-    uint64_t visible = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
+    uint64_t visible = eng_visible(db); /* a leader: no further than its commit point */
     pthread_mutex_lock(&db->buf_lock);
     c->visible = MIN(visible, db->wal_appended);
     if (db->active) {
@@ -229,7 +229,7 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
      * no reader sees a write that a power failure could still take back. That
      * includes the flushing memtables: a flush rotates the active one before
      * it writes and syncs the rest of its segment. */
-    uint64_t visible = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
+    uint64_t visible = eng_visible(db); /* a leader: no further than its commit point */
     s->parts = malloc((db->nparts ? db->nparts : 1) * sizeof *s->parts);
     if (s->parts) {
         for (size_t i = 0; i < db->nparts; i++) {

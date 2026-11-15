@@ -17,11 +17,15 @@
  *     applied once, by their offset in the file, across a restart;
  *  I  CLASS markers: T is moved past the replica's own rows (a part already holds them), a replay appends nothing,
  *     a reopen checks every part against CLASSES;
- *  F  a process killed (kill -9) after the sync reported a position: every reported position is still there.
+ *  F  a process killed (kill -9) after the sync reported a position: every reported position is still there;
+ *  L  a leader's commit point (C7): it shows, acknowledges and flushes only up to it; depose ends its waits as
+ *     indeterminate without failing it; admission and the bytes before the fdatasync; power loss of a leader.
  * Planted mutations (--mutant NAME) must make it fail: applyall (apply ignores the commit point), ackunsynced
  * (the durable end reports what was not synced), keepcut (a cut leaves the records), nofloor (a segment goes
  * before the floor is saved), walclock (retention reads the replica's own clock), nopos (a replayed RETENTION or CLASS
- * record is appended again), classat (a CLASS record takes the leader's T whatever this replica's parts hold).
+ * record is appended again), classat (a CLASS record takes the leader's T whatever this replica's parts hold);
+ * the leader's: leadervisible, leaderflush, deposefails, admitafter, bytesaftersync, markerrc, gatenohook, nosynced
+ * (the Makefile runs every name).
  *
  *   ./build/test_replica [scratch dir]
  *   ./build/test_replica --mutant applyall|ackunsynced|keepcut|nofloor|walclock|nopos|classat [scratch dir]    must fail
@@ -63,6 +67,17 @@ static int failures;
             failures++;                                                                                       \
         }                                                                                                     \
     } while (0)
+
+/* A check whose failure leaves the engine in a state the rest of the run cannot get out of (rows in the WAL buffer that
+ * no memtable holds, which a later flush or close then waits on): the run stops there, failed, rather than hang. */
+static void stop_if_failed(const char *what)
+{
+    if (failures) {
+        fprintf(stderr, "test_replica: FAILED (%s; the rest would wait on it)\n", what);
+        fflush(stderr);
+        _exit(1);
+    }
+}
 
 #define T0 1700000000000LL
 #define NS 2    /* series */
@@ -1765,6 +1780,20 @@ typedef struct xport {
     size_t held_len;
     char held_name[64];
     uint64_t saved;        /* the commit floor the "driver" saved */
+    /* the leader's commit point (eng_leader_commit): by default it follows the bytes the WAL writer hands over (a
+     * replica that has every byte at once); with `manual` only the test moves it */
+    bool manual;
+    int refuse;            /* admit refuses with this code (0: admits) */
+    bool depose_in_admit;  /* admit deposes the leader and refuses (a driver whose core says it is not leading) */
+    bool rec;              /* record admissions and bytes */
+    uint64_t adm_fno[512];
+    uint32_t adm_span[512];
+    size_t nadm;
+    size_t nbytes, bytes_bad, bytes_late; /* bytes callbacks; ones unlike the segment; syncs without fresh bytes */
+    uint64_t bytes_last;   /* the last position handed over */
+    bool bytes_fresh;      /* bytes came since the last sync */
+    uint64_t synced_last;  /* the last position jr_ops.synced reported */
+    size_t synced_bad;     /* reports that went back, or that were not the durable end at the time */
 } xport;
 
 static int cmp_u64(const void *a, const void *b)
@@ -1853,6 +1882,66 @@ static void xp_seg_done(void *ctx, eng *db, uint64_t seq)
     xp_ship_logs(ctx); /* before the file goes */
 }
 
+static int xp_admit(void *ctx, eng *db, uint64_t fno, uint32_t span)
+{
+    xport *x = ctx;
+    if (x->depose_in_admit) {
+        eng_leader_depose(db); /* under buf_lock: the depose must not take it (REVIEW M2) */
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    if (x->refuse)
+        return x->refuse;
+    if (x->rec && x->nadm < 512)
+        x->adm_fno[x->nadm] = fno, x->adm_span[x->nadm++] = span;
+    return 0;
+}
+
+static void xp_bytes(void *ctx, eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len, uint64_t first,
+                     uint64_t last)
+{
+    xport *x = ctx;
+    if (x->rec) {
+        /* the bytes are the segment's at that place: what a replica appends is what the leader's file holds */
+        char nm[64];
+        wal_name(nm, sizeof nm, seq);
+        int fd = openat(db->dirfd, nm, O_RDONLY);
+        uint8_t *b = malloc(len);
+        if (fd < 0 || !b || pread(fd, b, len, (off_t)off) != (ssize_t)len || memcmp(b, buf, len) != 0)
+            x->bytes_bad++;
+        uint64_t f0;
+        memcpy(&f0, (const uint8_t *)buf + 16, 8);
+        if (f0 != first || last < first || (x->bytes_last && first != x->bytes_last + 1))
+            x->bytes_bad++; /* positions continue the log without a gap */
+        x->bytes_last = last;
+        free(b);
+        if (fd >= 0)
+            close(fd);
+        x->nbytes++;
+        x->bytes_fresh = true;
+    }
+    if (!x->manual)
+        eng_leader_commit(db, last);
+}
+
+static void xp_synced(void *ctx, eng *db, uint64_t last)
+{
+    xport *x = ctx;
+    if (last < x->synced_last || last != eng_wal_durable_fno(db))
+        x->synced_bad++;
+    x->synced_last = last;
+}
+
+static xport *SYNC_X; /* the leader whose syncs wal_test_sync_hook watches */
+static void xp_sync_hook(eng *db)
+{
+    xport *x = SYNC_X;
+    if (!x || db != x->ld)
+        return;
+    if (!x->bytes_fresh) /* the write being synced was not handed over first */
+        x->bytes_late++;
+    x->bytes_fresh = false;
+}
+
 static struct jr_ops XOPS;
 
 static void xp_open_leader(xport *x)
@@ -1865,8 +1954,10 @@ static void xp_open_leader(xport *x)
     o.wal_max_batch_rows = 16; /* more rows than this go straight to parts: a COMMIT marker */
     if (eng_open(x->ldir, &o, &x->ld) != 0)
         exit(2);
-    XOPS = (struct jr_ops){.ctx = x, .ship = xp_ship, .wait = xp_wait, .seg_done = xp_seg_done};
-    x->ld->jr = &XOPS;
+    XOPS = (struct jr_ops){.ctx = x, .ship = xp_ship, .wait = xp_wait, .seg_done = xp_seg_done, .admit = xp_admit,
+                           .bytes = xp_bytes, .synced = xp_synced};
+    if (eng_leader_attach(x->ld, &XOPS) != 0)
+        exit(2);
 }
 
 static bool eq_range(eng *a, eng *b, uint32_t s, int64_t lo, int64_t hi, const char *what)
@@ -2219,7 +2310,7 @@ static void case_promote(int variant)
     x.cseq = x.coff = 0;
     x.noapply = false;
     n->opt.wal_max_batch_rows = 16;
-    n->jr = &XOPS;
+    CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
     xp_rows(&x, 0, 50, 6, 70);
     xp_step(&x, "P: small after promotion");
     xp_rows(&x, 1, 0, 40, 800);
@@ -2530,7 +2621,7 @@ static void case_drop_race(void)
     xp_rows(&x, 1, 0, 40, 500); /* > wal_max_batch_rows: a COMMIT */
     CHECK(DR_STARTED);
     pthread_join(DR_T, NULL);
-    XOPS.wait = xp_wait; /* after the join: the drop's thread reads XOPS.wait in leader_drop (tsan found it) */
+    XOPS.wait = xp_wait; /* only now: the drop's marker wait reads it (dr_wait goes on to xp_wait meanwhile) */
     CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
     for (uint32_t s = 0; s < 2; s++)
         CHECK_EQ(count_rows(x.ld, s), count_rows(x.rep, s));
@@ -2641,6 +2732,698 @@ static void case_promote_refused(void)
     xp_stop(&x);
 }
 
+/* ------------------------------------------------------------ L: the leader's commit point (C7, design-cluster.md 5.1)
+ * A leader applies only up to its commit point, as every replica does: rows durable on the leader stay invisible, out of
+ * parts and unacknowledged until the driver moves it (eng_leader_commit); a deposed leader ends every wait with an
+ * indeterminate result. The K transport runs with `manual` here where the test moves the commit point itself. */
+
+static atomic_int HOOK_N; /* the write wait hook's count: writes the server would see held */
+static void count_hook(void *ctx, int d)
+{
+    (void)ctx;
+    atomic_fetch_add(&HOOK_N, d);
+}
+
+static void set_count_hook(eng *db)
+{
+    atomic_store(&HOOK_N, 0);
+    pthread_mutex_lock(&db->buf_lock);
+    db->wait_fn = count_hook, db->wait_ctx = NULL;
+    db->opt.flush_interval_ms = 3600000; /* no flush of the flusher's own between the steps */
+    pthread_mutex_unlock(&db->buf_lock);
+}
+
+static void wait_hook(int k)
+{
+    for (int i = 0; i < 2500 && atomic_load(&HOOK_N) < k; i++)
+        usleep(2000);
+    CHECK_EQ(atomic_load(&HOOK_N), k);
+}
+
+/* joins a job thread that must end within 10 s (a lost wake-up shows as a failed check, not as a hang of the run) */
+static void join_within(pthread_t t, atomic_bool *done, const char *what)
+{
+    for (int i = 0; i < 5000 && !atomic_load(done); i++)
+        usleep(2000);
+    if (!atomic_load(done)) {
+        fprintf(stderr, "test_replica: FAILED (%s)\n", what);
+        fflush(stderr);
+        _exit(1);
+    }
+    pthread_join(t, NULL);
+}
+
+typedef struct ljob {
+    eng *db;
+    bool flush;
+    uint32_t s;
+    int t0, n;
+    int rc;
+    atomic_bool done;
+} ljob;
+
+static void *ljob_main(void *a)
+{
+    ljob *j = a;
+    if (j->flush) {
+        j->rc = eng_flush(j->db);
+    } else {
+        int64_t ts[NT];
+        float v[NT];
+        for (int i = 0; i < j->n; i++)
+            ts[i] = T0 + 1000LL * (j->t0 + i), v[i] = (float)(j->t0 + i);
+        j->rc = eng_insert_series(j->db, TSDB_FLOAT32, j->s, ts, v, (size_t)j->n);
+    }
+    atomic_store(&j->done, true);
+    return NULL;
+}
+
+static int cnt_fn(void *c, const int64_t *ts, const void *vals, size_t n)
+{
+    (void)ts, (void)vals;
+    *(size_t *)c += n;
+    return 0;
+}
+
+static size_t lrows(eng *db, uint32_t s)
+{
+    size_t n = 0;
+    CHECK_EQ(eng_query_raw_ex(db, s, T0 - 1000, T0 + 1000000000LL, false, 0, cnt_fn, &n), 0);
+    return n;
+}
+
+/* the newest row of series s by the latest table (eng_latest: its lookup bounds memtable rows itself) or by a search on
+ * one cut (cut_take: what tsdb_query_multi reads too); -1: none */
+static int64_t latest_ts(eng *db, uint32_t s, bool search)
+{
+    latest_row r;
+    int rc = search ? eng_latest_search(db, &s, 1, NULL, INT64_MAX, false, &r)
+                    : eng_latest(db, &s, 1, NULL, INT64_MAX, false, &r);
+    CHECK_EQ(rc, 0);
+    CHECK_EQ(r.status, 0);
+    return r.kind == TSDB_LATEST_NONE ? -1 : r.ts;
+}
+
+static uint64_t parts_fno_hi(eng *db) /* the highest position any listed part holds */
+{
+    uint64_t m = 0;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++)
+        m = MAX(m, db->parts[i]->fno_hi);
+    pthread_mutex_unlock(&db->lock);
+    return m;
+}
+
+/* L1: rows durable on the leader past its commit point are not visible to its queries (mutant leadervisible: visible =
+ * wal_durable) and a flush does not write them into parts (mutant leaderflush): a failover that loses them must not
+ * have shown them, nor left them where no cut reaches. A partial commit point shows exactly the batch below it; the
+ * writes are acknowledged in the same order. */
+static void case_leader_gate(void)
+{
+    xport x;
+    xp_start(&x, "lgate");
+    x.manual = true;
+    eng *ld = x.ld;
+    set_count_hook(ld);
+    uint64_t c0 = eng_wal_durable_fno(ld);
+    eng_leader_commit(ld, c0);
+    ljob a = {.db = ld, .s = 0, .t0 = 0, .n = 5}, b = {.db = ld, .s = 1, .t0 = 0, .n = 6}, f = {.db = ld, .flush = true};
+    pthread_t ta, tb, tf;
+    pthread_create(&ta, NULL, ljob_main, &a);
+    wait_hook(1); /* a holds c0 + 1 .. c0 + 5 */
+    pthread_create(&tb, NULL, ljob_main, &b);
+    wait_hook(2);
+    CHECK(!atomic_load(&a.done) && !atomic_load(&b.done)); /* durable, but not acknowledged */
+    CHECK(eng_wal_durable_fno(ld) >= c0 + 11);
+    CHECK_EQ(lrows(ld, 0), 0); /* mutant leadervisible */
+    CHECK_EQ(lrows(ld, 1), 0);
+    CHECK(ld->lt != NULL); /* the latest table is on: its own lookup is judged */
+    CHECK_EQ(latest_ts(ld, 0, false), -1); /* the latest table's lookup (ltab.c) bounds by the commit point */
+    CHECK_EQ(latest_ts(ld, 0, true), -1);  /* and so does a cut (cut_take) */
+    pthread_create(&tf, NULL, ljob_main, &f);
+    usleep(200000);
+    CHECK(!atomic_load(&f.done)); /* mutant leaderflush: the flush wrote them */
+    CHECK(parts_fno_hi(ld) <= c0);
+    eng_leader_commit(ld, c0 + 5); /* a only */
+    pthread_join(ta, NULL);
+    CHECK_EQ(a.rc, 0);
+    CHECK_EQ(lrows(ld, 0), 5);
+    CHECK_EQ(lrows(ld, 1), 0); /* b is past the commit point */
+    CHECK_EQ(latest_ts(ld, 0, false), T0 + 4000);
+    CHECK_EQ(latest_ts(ld, 1, false), -1);
+    CHECK_EQ(latest_ts(ld, 0, true), T0 + 4000);
+    CHECK_EQ(latest_ts(ld, 1, true), -1);
+    usleep(50000);
+    CHECK(!atomic_load(&b.done) && !atomic_load(&f.done)); /* the sealed memtable holds b: still not flushed */
+    CHECK(parts_fno_hi(ld) <= c0 + 5);
+    eng_leader_commit(ld, eng_wal_durable_fno(ld));
+    pthread_join(tb, NULL);
+    pthread_join(tf, NULL);
+    CHECK_EQ(b.rc, 0);
+    CHECK_EQ(f.rc, 0);
+    CHECK_EQ(lrows(ld, 0), 5);
+    CHECK_EQ(lrows(ld, 1), 6);
+    CHECK(parts_fno_hi(ld) >= c0 + 11 && parts_fno_hi(ld) <= atomic_load(&ld->lead_commit)); /* flushed now */
+    CHECK_EQ(atomic_load(&HOOK_N), 0); /* every +1 has its -1 */
+    CHECK_EQ(eng_check(ld), 0);
+    x.manual = false;
+    xp_step(&x, "L1: the replica has what the leader committed");
+    xp_stop(&x);
+    printf("  a leader shows, acknowledges and flushes rows only up to its commit point\n");
+}
+
+/* L2: a deposed leader ends every wait for the commit point with TSDB_ERR_INDETERMINATE (the record is in its log and a
+ * replica may hold it) and is not failed: fail-stop would end tsdbd and every volume with it (mutant deposefails: a
+ * large write's COMMIT wait fails the engine). After that every write is refused before it is buffered
+ * (TSDB_ERR_UNAVAILABLE: definitely not applied), and a flush of the uncommitted rows is indeterminate too, with no
+ * part past the commit point. */
+static void case_leader_ack(void)
+{
+    xport x;
+    xp_start(&x, "lack");
+    x.manual = true;
+    eng *ld = x.ld;
+    set_count_hook(ld);
+    uint64_t c0 = eng_wal_durable_fno(ld);
+    eng_leader_commit(ld, c0);
+    ljob big = {.db = ld, .s = 1, .t0 = 0, .n = 40}, small = {.db = ld, .s = 0, .t0 = 0, .n = 5};
+    pthread_t tg, ts;
+    pthread_create(&tg, NULL, ljob_main, &big); /* more than wal_max_batch_rows: parts and a COMMIT marker */
+    for (int i = 0; i < 2500 && eng_wal_durable_fno(ld) <= c0; i++) /* its marker is durable: it waits next */
+        usleep(2000);
+    CHECK(eng_wal_durable_fno(ld) > c0);
+    pthread_create(&ts, NULL, ljob_main, &small);
+    wait_hook(1);
+    usleep(100000);
+    CHECK(!atomic_load(&big.done) && !atomic_load(&small.done));
+    eng_leader_depose(ld);
+    join_within(tg, &big.done, "L2: the depose did not end a large write's commit wait");
+    join_within(ts, &small.done, "L2: the depose did not end a small write's commit wait");
+    CHECK_EQ(big.rc, TSDB_ERR_INDETERMINATE);
+    CHECK_EQ(small.rc, TSDB_ERR_INDETERMINATE);
+    CHECK_EQ(eng_check(ld), 0); /* mutant deposefails */
+    CHECK_EQ(atomic_load(&HOOK_N), 0);
+    pthread_mutex_lock(&ld->buf_lock);
+    uint64_t f = ld->fno_next;
+    pthread_mutex_unlock(&ld->buf_lock);
+    int64_t t1[3] = {T0 + 50000, T0 + 51000, T0 + 52000};
+    float v1[3] = {1, 2, 3};
+    CHECK_EQ(eng_insert_series(ld, TSDB_FLOAT32, 0, t1, v1, 3), TSDB_ERR_UNAVAILABLE);
+    pthread_mutex_lock(&ld->buf_lock);
+    CHECK_EQ(ld->fno_next, f); /* nothing buffered */
+    pthread_mutex_unlock(&ld->buf_lock);
+    stop_if_failed("a deposed leader buffered a refused write");
+    CHECK_EQ(eng_flush(ld), TSDB_ERR_UNAVAILABLE); /* the flush did not happen: a request of its own, refused */
+    CHECK(parts_fno_hi(ld) <= c0);
+    CHECK_EQ(lrows(ld, 0), 0);
+    CHECK_EQ(eng_check(ld), 0);
+    xp_stop(&x); /* (the close's flush is refused the same way; the close of a deposed leader is r3a2's) */
+    printf("  a deposed leader ends its waits as indeterminate, refuses writes and is not failed\n");
+}
+
+/* L3: admission (jr_ops.admit) sees every record before it is buffered, with the positions it then gets: the admitted
+ * ranges tile the log the replica received exactly (rows batches, which may share a record, and markers). A refusal
+ * leaves nothing buffered and the numbers where they were (mutant admitafter: refused after buffering), and the log
+ * goes on without a gap. */
+static void case_leader_admit(void)
+{
+    xport x;
+    xp_start(&x, "ladmit");
+    eng *ld = x.ld;
+    set_count_hook(ld);
+    x.rec = true;
+    xp_rows(&x, 0, 0, 5, 1);
+    xp_rows(&x, 0, 5, 5, 2);
+    xp_rows(&x, 1, 0, 40, 3); /* a COMMIT marker */
+    CHECK_EQ(eng_delete_range(ld, 1, T0 + 1000, T0 + 3000), 0);
+    CHECK_EQ(eng_flush(ld), 0);
+    xp_rows(&x, 0, 10, 3, 4);
+    pthread_mutex_lock(&ld->buf_lock);
+    uint64_t f = ld->fno_next;
+    pthread_mutex_unlock(&ld->buf_lock);
+    size_t nadm = x.nadm;
+    x.refuse = TSDB_ERR_UNAVAILABLE;
+    int64_t t1[40];
+    float v1[40];
+    for (int i = 0; i < 40; i++)
+        t1[i] = T0 + 1000LL * (20 + i), v1[i] = (float)i;
+    CHECK_EQ(eng_insert_series(ld, TSDB_FLOAT32, 0, t1, v1, 3), TSDB_ERR_UNAVAILABLE);
+    CHECK_EQ(eng_insert_series(ld, TSDB_FLOAT32, 1, t1, v1, 40), TSDB_ERR_UNAVAILABLE); /* its marker refused */
+    pthread_mutex_lock(&ld->buf_lock);
+    CHECK_EQ(ld->fno_next, f); /* mutant admitafter */
+    pthread_mutex_unlock(&ld->buf_lock);
+    stop_if_failed("a refused admission left its batch buffered");
+    CHECK_EQ(x.nadm, nadm);
+    CHECK_EQ(eng_check(ld), 0);
+    x.refuse = 0;
+    xp_rows(&x, 0, 20, 3, 5);
+    xp_step(&x, "L3: after a refusal"); /* the replica checks that the numbers continue without a gap */
+    uint64_t from = 1, pos = 1;
+    size_t k = 0;
+    for (;;) {
+        uint8_t *buf = NULL;
+        size_t len = 0;
+        uint64_t seq, off, last;
+        if (replica_read(x.rep, from, &buf, &len, 1, &seq, &off, &last) != 0 || len == 0) {
+            free(buf);
+            break;
+        }
+        while (k < x.nadm && x.adm_fno[k] == pos && pos <= last) /* the admissions that make up this record */
+            pos += x.adm_span[k++];
+        CHECK_EQ(pos, last + 1);
+        free(buf);
+        from = pos = last + 1;
+    }
+    CHECK_EQ(k, x.nadm);
+    CHECK_EQ(pos, ld_last(&x) + 1);
+    xp_stop(&x);
+    printf("  admission sees every record before it is buffered, with its positions; a refusal buffers nothing\n");
+}
+
+/* L4: the WAL writer hands a leader's bytes to the sender after its write() and before its fdatasync (5.1 step 2):
+ * byte for byte what the segment holds there, the positions continuing without a gap (mutant bytesaftersync: handed
+ * over after the sync). */
+static void case_leader_bytes(void)
+{
+    xport x;
+    xp_start(&x, "lbytes");
+    eng *ld = x.ld;
+    set_count_hook(ld);
+    x.rec = true;
+    pthread_mutex_lock(&ld->buf_lock);
+    x.bytes_last = ld->fno_next - 1;
+    pthread_mutex_unlock(&ld->buf_lock);
+    SYNC_X = &x;
+    __atomic_store_n(&wal_test_sync_hook, xp_sync_hook, __ATOMIC_RELAXED);
+    xp_rows(&x, 0, 0, 5, 1);
+    xp_rows(&x, 1, 0, 40, 3); /* a COMMIT marker */
+    xp_rows(&x, 0, 5, 5, 2);
+    CHECK_EQ(eng_flush(ld), 0); /* the sealed segment's rest */
+    xp_rows(&x, 0, 10, 3, 4);
+    __atomic_store_n(&wal_test_sync_hook, NULL, __ATOMIC_RELAXED);
+    SYNC_X = NULL;
+    CHECK(x.nbytes >= 4);
+    CHECK_EQ(x.bytes_bad, 0);
+    CHECK_EQ(x.bytes_late, 0); /* mutant bytesaftersync */
+    CHECK_EQ(x.bytes_last, ld_last(&x));
+    /* jr_ops.synced: every move of the leader's durable end, the rotation's sync of the old segment included, in
+     * order (mutant nosynced: never told; a driver would have to poll) */
+    CHECK_EQ(x.synced_bad, 0);
+    CHECK(x.synced_last > 0);
+    CHECK_EQ(x.synced_last, eng_wal_durable_fno(ld));
+    CHECK_EQ(x.synced_last, ld_last(&x));
+    xp_step(&x, "L4");
+    xp_stop(&x);
+    printf("  a leader's WAL bytes reach the sender before its fdatasync, as the segment holds them; each sync is "
+           "reported after it\n");
+}
+
+/* L5: power lost at every step of a leader with the gate. The driver (the main thread) saves the commit point (the
+ * .hi file, outside the crashfs root) before it hands it to the engine; a writer thread acknowledges batches and
+ * flushes now and then. After the power loss every acknowledged row is there (acknowledged = committed and durable),
+ * and no part holds a position past the saved commit point (the flush gate). */
+#define PL_BATCHES 30
+
+typedef struct plw {
+    eng *db;
+    const char *ack;
+    atomic_int done;
+    int rc;
+} plw;
+
+static void *plw_main(void *a)
+{
+    plw *w = a;
+    for (int i = 0; i < PL_BATCHES && w->rc == 0; i++) {
+        int64_t ts[4];
+        float v[4];
+        for (int k = 0; k < 4; k++)
+            ts[k] = T0 + 1000LL * (4 * i + k), v[k] = (float)i;
+        w->rc = eng_insert_series(w->db, TSDB_FLOAT32, 0, ts, v, 4);
+        if (w->rc == 0)
+            write_ack(w->ack, (uint64_t)i + 1);
+        if (w->rc == 0 && i % 7 == 6)
+            w->rc = eng_flush(w->db);
+    }
+    atomic_store(&w->done, 1);
+    return NULL;
+}
+
+static atomic_uint_fast64_t POWERL_SYNCED;
+static void powerl_synced(void *ctx, eng *db, uint64_t last)
+{
+    (void)ctx, (void)db;
+    atomic_store(&POWERL_SYNCED, last);
+}
+
+static int powerl_child(const char *dir, const char *ackfile)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 0;
+    eng *db;
+    if (eng_open(dir, &o, &db) != 0)
+        return 2;
+    /* nothing to ship: the driver only moves the commit point, to the durable end jr_ops.synced reported a tick (1 ms)
+     * earlier, so the commit point lags the leader's log as it does behind a replica's round trip: rows durable but not
+     * committed are in the log at most power losses */
+    static struct jr_ops ops = {.synced = powerl_synced};
+    if (eng_leader_attach(db, &ops) != 0)
+        return 2;
+    char hi[PATH_MAX + 8];
+    snprintf(hi, sizeof hi, "%s.hi", ackfile);
+    plw w = {.db = db, .ack = ackfile};
+    pthread_t t;
+    pthread_create(&t, NULL, plw_main, &w);
+    uint64_t prev = atomic_load(&POWERL_SYNCED);
+    for (int tick = 0;; tick++) {
+        bool last = atomic_load(&w.done);
+        uint64_t now = atomic_load(&POWERL_SYNCED);
+        uint64_t c = last ? now : prev;
+        write_ack(hi, c); /* saved before the engine is told */
+        eng_leader_commit(db, c);
+        prev = now;
+        if (last)
+            break;
+        if (tick > 60000) /* a minute: the durable end is not reported (mutant nosynced) */
+            return 4;
+        usleep(1000);
+    }
+    pthread_join(t, NULL);
+    if (w.rc)
+        return 3;
+    eng_close(db);
+    return 0;
+}
+
+static uint64_t read_u64_file(const char *p)
+{
+    uint64_t v = 0;
+    FILE *f = fopen(p, "r");
+    if (f) {
+        if (fscanf(f, "%" SCNu64, &v) != 1)
+            v = 0;
+        fclose(f);
+    }
+    return v;
+}
+
+static void case_leader_power(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  power loss of a leader: skipped (no %s)\n", SHIM);
+        return;
+    }
+    char dir[PATH_MAX], ack[PATH_MAX + 16], hif[PATH_MAX + 24];
+    snprintf(ack, sizeof ack, "%s/acks-of-lp.ack", S);
+    snprintf(hif, sizeof hif, "%s.hi", ack);
+    int crashes = 0;
+    bool finished = false;
+    for (int k = 0; k < 900 && !finished; k++) {
+        fresh(dir, "lp");
+        unlink(ack);
+        unlink(hif);
+        int code = run_power_child_as("--powerl", dir, dir, ack, k, k + 1);
+        if (code != 99 && code != 0)
+            fprintf(stderr, "L5: step %d: the child ended with status %d\n", k, code);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += code == 99;
+        finished = code == 0;
+        uint64_t acked = read_u64_file(ack), hi = read_u64_file(hif);
+        tsdb_options o;
+        tsdb_options_init(&o);
+        o.merge_threads = 0;
+        o.create_volumes = 0;
+        /* the parts the leader wrote: the open puts the replayed WAL into parts of its own (a deposed leader reopens as
+         * a replica instead, which cuts its log first: r3a2-depose), so only parts named before the open are judged */
+        char names[64][96];
+        size_t nn = 0;
+        DIR *d = opendir(dir);
+        for (struct dirent *e; d && (e = readdir(d)) != NULL;) {
+            size_t l = strlen(e->d_name);
+            if (e->d_name[0] == 'p' && l > 5 && l < 96 && strcmp(e->d_name + l - 5, ".part") == 0 && nn < 64)
+                snprintf(names[nn++], 96, "%s", e->d_name);
+        }
+        if (d)
+            closedir(d);
+        eng *db;
+        int rc = eng_open(dir, &o, &db);
+        if (rc != 0) {
+            fprintf(stderr, "L5: step %d: the open failed: %d\n", k, rc);
+            failures++;
+            continue;
+        }
+        size_t n = 0;
+        CHECK_EQ(eng_query_raw_ex(db, 0, T0, T0 + 4000LL * (int64_t)acked, false, 0, cnt_fn, &n), 0);
+        if (n != 4 * acked) {
+            fprintf(stderr, "L5: step %d: %" PRIu64 " batches acknowledged, %zu rows of them there\n", k, acked, n);
+            failures++;
+        }
+        for (size_t i = 0; i < db->nparts; i++)
+            for (size_t j = 0; j < nn; j++)
+                if (strcmp(db->parts[i]->name, names[j]) == 0 && db->parts[i]->fno_hi > hi) {
+                    fprintf(stderr, "L5: step %d: part %s holds position %" PRIu64 ", the commit point was %" PRIu64 "\n",
+                            k, names[j], db->parts[i]->fno_hi, hi);
+                    failures++;
+                }
+        eng_close(db);
+    }
+    CHECK(finished && crashes > 20);
+    printf("  power lost at each of %d steps of a leader with the gate: what it acknowledged is there, no part past "
+           "its commit point\n", crashes);
+}
+
+typedef struct dropjob {
+    eng *db;
+    int64_t ts;
+    int rc;
+    atomic_bool done;
+} dropjob;
+static void *drop_main(void *a)
+{
+    dropjob *j = a;
+    j->rc = eng_drop_before(j->db, j->ts);
+    atomic_store(&j->done, true);
+    return NULL;
+}
+
+/* L6: a DROP marker refused by admission (min_isr, not leading) while the active memtable holds rows: the refusal
+ * reaches the caller, nothing is retired and the leader keeps what the replicas keep (REVIEW H1: the rotation's write
+ * of the old segment overwrote the marker's result, leader_drop waited for position 0 and retired the partitions with
+ * no marker in the log; mutant markerrc). A leader whose driver deposes it from inside the admission (its core is not
+ * leading; the depose must not take buf_lock, which admission holds: REVIEW M2) is refused the same way, its commit
+ * point past everything. A retry once admission accepts drops on both. */
+static void case_leader_marker_refused(void)
+{
+    for (int deposed = 0; deposed < 2; deposed++) {
+        xport x;
+        xp_start(&x, deposed ? "lmrefd" : "lmref");
+        xp_rows(&x, 0, 0, 10, 100);
+        CHECK_EQ(eng_flush(x.ld), 0);
+        xp_rows(&x, 0, 20, 5, 500); /* the active memtable is not empty: the rotation branch */
+        xp_step(&x, "L6: rows");
+        uint64_t before = ld_last(&x);
+        if (deposed) /* the driver's core says it is not leading: it deposes from inside the admission */
+            x.depose_in_admit = true;
+        else
+            x.refuse = TSDB_ERR_UNAVAILABLE; /* the driver refuses the marker (REPL_E_ISR) */
+        dropjob dj = {.db = x.ld, .ts = T0 + 10 * DAY_MS};
+        pthread_t td;
+        pthread_create(&td, NULL, drop_main, &dj);
+        join_within(td, &dj.done, "L6: the DROP did not return (a depose from admit under buf_lock?)");
+        CHECK_EQ(dj.rc, TSDB_ERR_UNAVAILABLE);
+        CHECK(!deposed || atomic_load(&x.ld->lead_deposed));
+        x.depose_in_admit = false;
+        CHECK_EQ(ld_last(&x), before); /* no marker */
+        CHECK_EQ(eng_check(x.ld), 0);
+        CHECK_EQ(lrows(x.ld, 0), 15); /* nothing retired */
+        CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
+        CHECK(xp_same(&x, "L6: after the refused DROP"));
+        if (!deposed) {
+            x.refuse = 0;
+            CHECK_EQ(eng_drop_before(x.ld, T0 + 10 * DAY_MS), 0);
+            CHECK_EQ(lrows(x.ld, 0), 0);
+            xp_step(&x, "L6: the DROP after the refusal");
+            CHECK_EQ(lrows(x.rep, 0), 0);
+        }
+        xp_stop(&x);
+    }
+    printf("  a DROP whose marker admission refuses is refused, retires nothing, and the leader stays the replicas' "
+           "equal\n");
+}
+
+static void stop_flusher(eng *db) /* eng_halt's first step: no flush of the flusher's own from here on */
+{
+    pthread_mutex_lock(&db->buf_lock);
+    db->flusher_stop = true;
+    pthread_cond_broadcast(&db->flush_cv);
+    pthread_mutex_unlock(&db->buf_lock);
+    pthread_join(db->flusher, NULL);
+    db->has_flusher = false;
+}
+
+/* L7: a small write's backpressure flush that waits in the flush gate holds its (server) thread: the wait is reported
+ * through the write wait hook (REVIEW L4; mutant gatenohook). A depose ends it: that write was never appended, so it is
+ * refused (UNAVAILABLE, definitely not applied), and so are a flush, a large insert, a delete and a DROP whose flush
+ * the gate refuses (REVIEW M3: nothing of theirs was appended). The waits end within a deadline (a lost wake-up is a
+ * failed check, not a hang). */
+static void case_leader_deposed_refusals(void)
+{
+    xport x;
+    xp_start(&x, "ldref");
+    x.manual = true;
+    eng *ld = x.ld;
+    set_count_hook(ld);
+    stop_flusher(ld);
+    uint64_t c0 = eng_wal_durable_fno(ld);
+    eng_leader_commit(ld, c0);
+    pthread_mutex_lock(&ld->buf_lock);
+    ld->opt.buffer_rows = 4; /* 8 rows in the active memtable: the next write flushes first */
+    pthread_mutex_unlock(&ld->buf_lock);
+    ljob a = {.db = ld, .s = 0, .t0 = 0, .n = 10}, b = {.db = ld, .s = 1, .t0 = 0, .n = 3};
+    pthread_t ta, tb;
+    pthread_create(&ta, NULL, ljob_main, &a);
+    wait_hook(1); /* a: appended, waiting for its commit point */
+    pthread_create(&tb, NULL, ljob_main, &b);
+    wait_hook(2); /* b: in its backpressure flush, waiting in the gate for a's rows (mutant gatenohook) */
+    pthread_mutex_lock(&ld->lock);
+    CHECK_EQ(ld->nflushing, 1);
+    pthread_mutex_unlock(&ld->lock);
+    CHECK(!atomic_load(&a.done) && !atomic_load(&b.done));
+    eng_leader_depose(ld);
+    join_within(ta, &a.done, "L7: the depose did not end a commit wait");
+    join_within(tb, &b.done, "L7: the depose did not end a wait in the flush gate");
+    CHECK_EQ(a.rc, TSDB_ERR_INDETERMINATE);  /* appended: a replica may have it */
+    CHECK_EQ(b.rc, TSDB_ERR_UNAVAILABLE);    /* never appended */
+    CHECK_EQ(atomic_load(&HOOK_N), 0);
+    stop_if_failed("L7: a deposed leader's waits");
+    CHECK_EQ(eng_flush(ld), TSDB_ERR_UNAVAILABLE);
+    int64_t ts[40];
+    float v[40];
+    for (int i = 0; i < 40; i++)
+        ts[i] = T0 + 1000LL * (100 + i), v[i] = (float)i;
+    CHECK_EQ(eng_insert_series(ld, TSDB_FLOAT32, 0, ts, v, 40), TSDB_ERR_UNAVAILABLE); /* a large insert */
+    CHECK_EQ(eng_delete_range(ld, 0, T0, T0 + 3000), TSDB_ERR_UNAVAILABLE);
+    CHECK_EQ(eng_drop_before(ld, T0 + 10 * DAY_MS), TSDB_ERR_UNAVAILABLE);
+    CHECK(parts_fno_hi(ld) <= c0);
+    CHECK_EQ(lrows(ld, 0), 0);
+    CHECK_EQ(eng_check(ld), 0);
+    xp_stop(&x);
+    printf("  a deposed leader refuses what it never appended (a write's backpressure flush, reported while it waits; "
+           "flush, large insert, delete, DROP)\n");
+}
+
+/* L8: the flusher's flush that a depose ends indeterminate is not recorded as the engine's background error (which the
+ * next write would return: INDETERMINATE for a write never appended; mutant bgerror in REVIEW). */
+static void case_leader_flusher_deposed(void)
+{
+    xport x;
+    xp_start(&x, "lfdep");
+    x.manual = true;
+    eng *ld = x.ld;
+    set_count_hook(ld);
+    uint64_t c0 = eng_wal_durable_fno(ld);
+    eng_leader_commit(ld, c0);
+    ljob a = {.db = ld, .s = 0, .t0 = 0, .n = 5};
+    pthread_t ta;
+    pthread_create(&ta, NULL, ljob_main, &a);
+    wait_hook(1);
+    pthread_mutex_lock(&ld->buf_lock);
+    ld->opt.flush_interval_ms = 10; /* the flusher seals a's rows and waits in the gate */
+    pthread_cond_broadcast(&ld->flush_cv);
+    pthread_mutex_unlock(&ld->buf_lock);
+    size_t nf = 0;
+    for (int i = 0; i < 2500 && nf == 0; i++) {
+        usleep(2000);
+        pthread_mutex_lock(&ld->lock);
+        nf = ld->nflushing;
+        pthread_mutex_unlock(&ld->lock);
+    }
+    CHECK_EQ(nf, 1);
+    usleep(50000);
+    eng_leader_depose(ld);
+    join_within(ta, &a.done, "L8: the depose did not end a commit wait");
+    CHECK_EQ(a.rc, TSDB_ERR_INDETERMINATE);
+    usleep(100000); /* the flusher's flush ends refused */
+    pthread_mutex_lock(&ld->buf_lock);
+    CHECK_EQ(ld->bg_error, 0);
+    pthread_mutex_unlock(&ld->buf_lock);
+    int64_t t1[2] = {T0 + 50000, T0 + 51000};
+    float v1[2] = {1, 2};
+    CHECK_EQ(eng_insert_series(ld, TSDB_FLOAT32, 1, t1, v1, 2), TSDB_ERR_UNAVAILABLE);
+    CHECK_EQ(eng_check(ld), 0);
+    xp_stop(&x);
+    printf("  a deposed leader's flusher records no background error\n");
+}
+
+typedef struct failjob {
+    eng *db;
+    atomic_bool done;
+} failjob;
+static void *fail_main(void *a)
+{
+    failjob *j = a;
+    eng_fail(j->db, "test: the engine fails beside a commit wait", EIO);
+    atomic_store(&j->done, true);
+    return NULL;
+}
+
+/* L9: the guards of the leader's contract (REVIEW L5): attach refuses an engine with a periodic WAL sync (it would
+ * acknowledge before durability), a leader refuses a relog (its rows past the commit point were shipped), the commit
+ * point never goes back, and a failure of the engine from another thread ends a commit wait (indeterminate; the
+ * engine stays failed). */
+static void case_leader_guards(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "lasync");
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 10;
+    eng *db;
+    CHECK_EQ(eng_open(dir, &o, &db), 0);
+    static struct jr_ops none;
+    CHECK_EQ(eng_leader_attach(db, &none), TSDB_ERR_INVALID);
+    CHECK(eng_jr(db) == NULL);
+    eng_close(db);
+
+    xport x;
+    xp_start(&x, "lguard");
+    x.manual = true;
+    eng *ld = x.ld;
+    set_count_hook(ld);
+    uint64_t c0 = eng_wal_durable_fno(ld);
+    eng_leader_commit(ld, c0 + 5);
+    eng_leader_commit(ld, c0); /* back: ignored */
+    CHECK_EQ(atomic_load(&ld->lead_commit), c0 + 5);
+    eng_leader_commit(ld, c0);
+    uint64_t rows = 0;
+    char rd[PATH_MAX + 8];
+    snprintf(rd, sizeof rd, "%s_relog", x.ldir);
+    CHECK_EQ(wal_relog(ld, rd, &rows), TSDB_ERR_INVALID);
+    CHECK_EQ(rows, 0);
+    ljob a = {.db = ld, .s = 0, .t0 = 0, .n = 7};
+    pthread_t ta, tf;
+    pthread_create(&ta, NULL, ljob_main, &a);
+    wait_hook(1);
+    CHECK(!atomic_load(&a.done));
+    failjob fj = {.db = ld};
+    pthread_create(&tf, NULL, fail_main, &fj);
+    join_within(tf, &fj.done, "L9: eng_fail did not return");
+    join_within(ta, &a.done, "L9: a failure of the engine did not end a commit wait");
+    CHECK_EQ(a.rc, TSDB_ERR_INDETERMINATE);
+    CHECK(eng_check(ld) != 0);
+    CHECK_EQ(atomic_load(&HOOK_N), 0);
+    xp_stop(&x);
+    printf("  attach refuses a periodic sync, a leader refuses a relog, the commit point never goes back, a failure "
+           "ends a commit wait\n");
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -2677,7 +3460,15 @@ static int mutant_of(const char *m)
                         : strcmp(m, "nodropserial") == 0 ? MUT_REPLICA_NO_DROP_SERIAL
                         : strcmp(m, "stagetrunc") == 0 ? MUT_REPLICA_STAGE_TRUNC
                         : strcmp(m, "noorphans") == 0 ? MUT_REPLICA_NO_STAGE_ORPHANS
-                        : strcmp(m, "epochseg") == 0 ? MUT_REPLICA_EPOCH_SEG : 0;
+                        : strcmp(m, "epochseg") == 0 ? MUT_REPLICA_EPOCH_SEG
+                        : strcmp(m, "leadervisible") == 0 ? MUT_LEADER_VISIBLE_DURABLE
+                        : strcmp(m, "leaderflush") == 0 ? MUT_LEADER_FLUSH_UNCOMMITTED
+                        : strcmp(m, "deposefails") == 0 ? MUT_LEADER_DEPOSE_FAILS
+                        : strcmp(m, "admitafter") == 0 ? MUT_LEADER_ADMIT_AFTER
+                        : strcmp(m, "bytesaftersync") == 0 ? MUT_LEADER_BYTES_AFTER_SYNC
+                        : strcmp(m, "markerrc") == 0 ? MUT_LEADER_MARKER_RC
+                        : strcmp(m, "gatenohook") == 0 ? MUT_LEADER_GATE_NOHOOK
+                        : strcmp(m, "nosynced") == 0 ? MUT_LEADER_NO_SYNCED : 0;
 }
 
 int main(int argc, char **argv)
@@ -2689,6 +3480,11 @@ int main(int argc, char **argv)
         if (argc >= 5) /* the mutant of the parent run: the child is a process of its own */
             eng_test_mutant = mutant_of(argv[4]);
         return power_child(argv[2], argv[3]);
+    }
+    if (argc >= 4 && strcmp(argv[1], "--powerl") == 0) {
+        if (argc >= 5)
+            eng_test_mutant = mutant_of(argv[4]);
+        return powerl_child(argv[2], argv[3]);
     }
     if (argc >= 4 && strcmp(argv[1], "--powerq") == 0) {
         if (argc >= 5)
@@ -2709,6 +3505,24 @@ int main(int argc, char **argv)
     sh("rm -rf '%s' && mkdir -p '%s'", S, S);
     if (!realpath(argv[0], SELF))
         snprintf(SELF, sizeof SELF, "%s", argv[0]);
+    {
+        char *slash = strrchr(SELF, '/');
+        snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
+    }
+    if (getenv("TEST_REPLICA_LEADER_ONLY")) { /* the quick run of the leader's cases (L1-L9, the power loss last) */
+        case_leader_gate();
+        case_leader_ack();
+        case_leader_admit();
+        case_leader_bytes();
+        case_leader_marker_refused();
+        case_leader_deposed_refusals();
+        case_leader_flusher_deposed();
+        case_leader_guards();
+        if (strcmp(getenv("TEST_REPLICA_LEADER_ONLY"), "power") == 0)
+            case_leader_power();
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
+    }
     case_basic();
     case_cut();
     case_refused();
@@ -2716,10 +3530,6 @@ int main(int argc, char **argv)
     case_dicts();
     case_clock();
     case_classes();
-    {
-        char *slash = strrchr(SELF, '/');
-        snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
-    }
     case_open_checks();
     case_seal();
     case_replay_skip();
@@ -2736,6 +3546,14 @@ int main(int argc, char **argv)
     case_drop_race();
     case_restage();
     case_stage_damage();
+    case_leader_gate();
+    case_leader_ack();
+    case_leader_admit();
+    case_leader_bytes();
+    case_leader_marker_refused();
+    case_leader_deposed_refusals();
+    case_leader_flusher_deposed();
+    case_leader_guards();
     case_promote_refused();
     for (int v = 0; v < 3; v++)
         case_promote(v);
@@ -2749,6 +3567,7 @@ int main(int argc, char **argv)
         case_commit_random(seed);
     case_power();
     case_power_commit();
+    case_leader_power();
     for (unsigned seed = 1; seed <= 20; seed++) {
         int f0 = failures;
         case_random(seed);

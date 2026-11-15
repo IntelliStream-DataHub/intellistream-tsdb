@@ -6,7 +6,9 @@
  *   build/client-example 127.0.0.1 17070 admin /tmp/tsdb-qs/password
  *
  * The last two arguments are the user and a file whose first line is the password. Leave them out for a
- * tsdbd started with --no-auth. The C client does not link the storage engine; it only talks to the server. */
+ * tsdbd started with --no-auth. The C client does not link the storage engine; it only talks to the server.
+ * With TSDB_VOLUME=NAME in the environment the series goes into that volume (tsdbc_series_at): a volume an operator
+ * added, or on a cluster node a cluster volume, by its name (docs/cluster-preview.md, step 6). */
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -61,7 +63,11 @@ int main(int argc, char **argv)
     CHECK(tsdbc_connect_opts(host, port, &login, &c)); /* on an error, CHECK prints it and jumps to done: below */
 
     tsdb_sid flow;
-    CHECK(tsdbc_series(c, "pump7.flow", 1, &flow)); /* 1: create the series if it is missing */
+    const char *volume = getenv("TSDB_VOLUME");
+    if (volume && volume[0])
+        CHECK(tsdbc_series_at(c, "pump7.flow", volume, &flow)); /* the series in that volume, made if missing */
+    else
+        CHECK(tsdbc_series(c, "pump7.flow", 1, &flow)); /* 1: create the series if it is missing */
 
     static int64_t times[N];
     static float values[N];

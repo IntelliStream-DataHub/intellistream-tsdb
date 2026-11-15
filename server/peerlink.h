@@ -1,0 +1,257 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/*
+ * Data links between servers (docs/design-cluster.md C25, section 5.1): per pair of servers a **log link** (small
+ * frames, latency first, zstd-1) and a **bulk link** (part files in throttled chunks) of their own, each its own TCP
+ * connection to the peer port, so a 100 MB part never delays a small insert. Transport only: the frames are typed
+ * opaque payloads of the driver (r3d-stream); nothing here knows a replication message.
+ *
+ * Wire (server/cluster.c's header has the metadata side): the dialer sends the cluster HELLO with its link kind
+ * (PL_KIND_LOG or PL_KIND_BULK; the metadata kind is 0) after the peer address, the acceptor answers HELLO_ACK, the
+ * dialer AUTH, the MACs and keys exactly as there but under their own labels ("tsdb-link-..."), so a metadata
+ * link's key is never a data link's. From AUTH on every frame is [u32 len][u8 type][payload][tag 32], len counting
+ * all after itself, tag = HMAC-SHA256(key of that direction, seq u64 | type | payload), seq counting from 0 per
+ * direction: a frame that was changed, dropped, repeated or reordered ends the link.
+ *
+ * Frame types: 1..0x6f the driver's (opaque, at most PL_FRAME_MAX); 0x70.. are the link's own (BEGIN, RESUME, CHUNK,
+ * END, DONE, PING, PONG; peerlink.c lists them). Bit 0x80 on a log link's frame says its payload is [u32 raw
+ * length][zstd frame] (raw length at most PL_FRAME_MAX, and the decoded size must equal it).
+ *
+ * Threads. One I/O thread per link connection (never the cluster thread): the cluster thread's acceptor reads the
+ * HELLO, checks the claims it can (uuid, member, identity), and hands the socket over (peerlink_adopt); the thread
+ * answers the handshake. Callbacks run on that thread: a slow one stops the reads, TCP stops the peer, and the peer's
+ * bounded queue answers PL_E_FULL: a slow peer never grows memory without bound. A peer that is being held back that
+ * way (its bytes wait in our socket, the window shut) is not counted silent, so a callback of any length is fine while
+ * the peer has more to send. When it has nothing queued it hears nothing back (a callback sends no PONG), and a
+ * callback that blocks longer than dead_ms ends the link: the driver's callbacks must not block that long (a slow
+ * disk gets a queue and a thread of the driver's own). The receiver never counts its own callbacks' time against
+ * the peer. A host that vanishes while the sender is held back by its shut window is found only by the kernel's own
+ * retransmission limit (minutes), since from outside that looks the same as a slow reader.
+ *
+ * Accepting. The handshake is answered first, before the connection touches anything (a peer that fails AUTH changes
+ * nothing, whatever id it claims). Then it takes the (peer, kind) link over from the connection that runs it, which
+ * leaves; a connection of the same peer that is still waiting for the link is closed by the newer one, so a stuck
+ * callback costs one thread and one descriptor, never one per redial. No thread joins another.
+ *
+ * Shutdown order: stop what hands sockets over (cluster_set_peerlink(NULL) and the cluster thread stopped, or
+ * cluster_stop) before peerlink_free; peerlink_free waits for the adopt threads it knows of and refuses new ones, but
+ * a peerlink_adopt that starts after it returned would use freed memory. A callback must return for peerlink_free
+ * to return.
+ *
+ * A dialed link (peerlink_dial) is persistent: it connects, and after any failure or a silent peer (PING, dead_ms)
+ * reconnects with backoff, until peerlink_free. An accepted link is one connection; a new connection of the same
+ * (peer, kind) replaces it. The queue of a link that went down is dropped (the driver's protocol resumes from its own
+ * state, on_link tells it); bulk jobs stay and are retried from the receiver's offset.
+ */
+#ifndef TSDB_PEERLINK_H
+#define TSDB_PEERLINK_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define PL_CL_MAGIC 0x43445354u /* "TSDC": the cluster HELLO's magic (cluster.c) */
+#define PL_CL_VERSION 4         /* the cluster protocol version; 4 adds the link kind to HELLO */
+
+enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2 };
+
+enum {
+    PL_OK = 0,
+    PL_E_FULL = -1,    /* the queue is full (nothing was queued) */
+    PL_E_DOWN = -2,    /* no connection now */
+    PL_E_TOOBIG = -3,  /* payload above PL_FRAME_MAX */
+    PL_E_INVALID = -4, /* a bad argument, or a type the driver may not use */
+    PL_E_HASH = -5,    /* the file's xxh64 did not match at the receiver */
+    PL_E_REFUSED = -6, /* the receiver refused the file */
+    PL_E_IO = -7,      /* reading or writing the file failed */
+    PL_E_CLOSED = -8,  /* the link or the peerlink is being closed */
+    PL_E_GIVEUP = -9,  /* the job failed in max_attempts connections */
+};
+
+#define PL_USER_TYPE_MAX 0x6f
+#define PL_FRAME_MAX (8u << 20)       /* a payload, raw */
+#define PL_BULK_CHUNK (256u << 10)    /* default chunk of a file */
+#define PL_META_MAX 4096              /* the opaque meta of a bulk file */
+#define PL_QUEUE_BYTES (8u << 20)     /* default queue bound per link */
+/* TODO(r3d-stream): the bulk rate is a node-wide cap shared by every bulk link; wire it to a setting. */
+#define PL_BULK_RATE_DEFAULT (256ull << 20)
+#define PL_RATE_UNLIMITED (~0ull)
+
+struct peerlink;
+struct plink;
+
+struct pl_self {
+    uint32_t id;
+    uint8_t uuid[16];
+    uint8_t ident[16];
+};
+
+/* The receiving side of bulk files, called on the link's thread. */
+struct pl_bulk_in {
+    /* A file begins (or begins again after a reconnect). Set *resume to the bytes the receiver already holds of it
+     * from offset 0 (they are hashed by reading `*prefix_fd`, which must stay valid until end; -1 with *resume > 0
+     * starts over), return 0, or a negative value to refuse it. */
+    int (*open)(void *arg, struct plink *l, uint64_t file, const void *meta, size_t meta_len, uint64_t total,
+                uint64_t *resume, int *prefix_fd);
+    /* The bytes [off, off + n) of the file, in order. A negative return aborts the transfer (PL_E_IO to the sender, which stops;
+     * bytes still in flight for the file are ignored). */
+    int (*data)(void *arg, struct plink *l, uint64_t file, uint64_t off, const void *p, size_t n);
+    /* The file ended: status PL_OK (every byte and its xxh64 arrived) or why not (PL_E_HASH, a lost link: PL_E_DOWN). */
+    void (*end)(void *arg, struct plink *l, uint64_t file, int status);
+};
+
+struct pl_cfg {
+    struct pl_self self;
+    const uint8_t *secret; /* the cluster secret (copied) */
+    size_t secret_len;
+    char advertise[128]; /* this server's peer address, for the HELLO ("" if none) */
+    void *arg;
+    /* a data link came up or went down (on its thread) */
+    void (*on_link)(void *arg, struct plink *l, int up);
+    /* a frame of the driver's (on the link's thread; the payload is valid during the call) */
+    void (*on_frame)(void *arg, struct plink *l, uint8_t type, const uint8_t *p, size_t n);
+    struct pl_bulk_in bulk;
+    uint32_t queue_bytes; /* per link; 0: PL_QUEUE_BYTES */
+    uint32_t bulk_chunk;  /* 0: PL_BULK_CHUNK */
+    uint64_t bulk_rate;   /* bytes/s across every bulk link of this peerlink; 0: PL_BULK_RATE_DEFAULT */
+    uint32_t ping_ms;     /* an idle link sends a PING this often; 0: 1000 */
+    uint32_t dead_ms;     /* nothing heard for this long ends a link; 0: 5000 */
+    uint32_t backoff_min_ms, backoff_max_ms; /* redial gap, doubled up to the max; 0: 50 and 2000 */
+    uint32_t hs_ms;                          /* the handshake's deadline; 0: 5000 */
+};
+
+struct peerlink *peerlink_new(const struct pl_cfg *cfg);
+/* Stops every link, joins their threads and frees everything (a pending bulk job is completed with PL_E_CLOSED). */
+void peerlink_free(struct peerlink *pl);
+void peerlink_set_bulk_rate(struct peerlink *pl, uint64_t bytes_per_s);
+
+/* A link to `addr` (host:port, the peer's peer port), persistent. want_id: the node id the peer must answer as (0:
+ * any). The result lives until peerlink_free. */
+struct plink *peerlink_dial(struct peerlink *pl, uint32_t want_id, const char *addr, int kind);
+
+/* The cluster thread's hand-off: `fd` (nonblocking, accepted) whose HELLO frame body (after [len][type]) is `hello`.
+ * `self` is what the HELLO_ACK says. 0: the link owns the fd; -1: the caller closes it. Never blocks. */
+int peerlink_adopt(struct peerlink *pl, int fd, const uint8_t *hello, size_t hello_len, const struct pl_self *self);
+/* The kind a HELLO body asks for (PL_KIND_*), or -1 when it is not a well formed HELLO. */
+int peerlink_hello_kind(const uint8_t *hello, size_t len);
+
+/* The accepted link of (peer, kind), or NULL. */
+struct plink *peerlink_find(struct peerlink *pl, uint32_t peer, int kind);
+
+/* A standalone listener (tests, tools): accepts on 127.0.0.1:port (0: any; the port is returned), reads each HELLO
+ * itself and adopts. -1 on failure. The cluster's acceptor does this in tsdbd. */
+int peerlink_listen(struct peerlink *pl, int port);
+
+uint32_t plink_peer(const struct plink *l); /* the peer's node id, once connected */
+int plink_kind(const struct plink *l);
+int plink_up(const struct plink *l);
+uint64_t plink_gen(const struct plink *l); /* counts connections of this link (from 1); valid from on_link(up) on */
+void plink_set_arg(struct plink *l, void *arg);
+void *plink_arg(const struct plink *l);
+
+/* Queues a frame. The payload is copied. timeout_ms 0: PL_E_FULL at once when the queue is full; else waits that
+ * long for room. PL_E_DOWN while there is no connection. Safe from any thread. */
+int plink_send(struct plink *l, uint8_t type, const void *p, size_t n, int timeout_ms);
+/* The same, for connection number `gen` only (plink_gen, or the one on_link(up) ran for): PL_E_DOWN when the link is on
+ * another connection now or none, so a frame of the driver's protocol state at gen G never goes out on G + 1. gen 0 is
+ * PL_E_INVALID. Sends are PL_E_DOWN until on_link(up) has returned, except from the thread inside it (the link's own
+ * thread), so the driver's resume logic in on_link goes first on a new connection. */
+int plink_send_gen(struct plink *l, uint64_t gen, uint8_t type, const void *p, size_t n, int timeout_ms);
+/* bytes now queued (for the driver's own decisions) */
+size_t plink_queued(struct plink *l);
+
+struct pl_job {
+    uint64_t file;           /* the driver's id of this file, unique per link while the job lives */
+    int fd;                  /* read with pread; the caller keeps it open until done is called */
+    uint64_t base, length;   /* the file is fd[base, base + length) */
+    const void *meta;        /* opaque to the link (a name, a volume): at most PL_META_MAX, copied */
+    size_t meta_len;
+    int max_attempts;        /* connections the job may use; 0: 5 */
+    void (*done)(void *arg, uint64_t file, int status, uint64_t sent);
+    void *arg;
+};
+/* Queues a file for the link's receiver. Asynchronous; `done` runs once, on the link's thread. A call that returns
+ * PL_E_FULL, PL_E_CLOSED or PL_E_INVALID did not queue the job and never calls `done`. One file at a time per link, in
+ * order. A failure of the receiver's data callback is PL_E_IO to `done` at once (the job is not retried: the receiver's
+ * disk is not a link fault); a lost link retries the job from the receiver's offset, max_attempts times. */
+int plink_bulk_send(struct plink *l, const struct pl_job *job);
+
+struct pl_stats {
+    uint64_t frames_out, frames_in, bytes_out, bytes_in; /* wire bytes of the driver's frames, all links */
+    uint64_t raw_out;                                    /* the same frames' payloads before zstd */
+    uint64_t connects, drops, auth_failures;
+    uint64_t bulk_files, bulk_bytes; /* files finished, payload bytes sent by this side */
+};
+void peerlink_stats(struct peerlink *pl, struct pl_stats *st);
+
+/* ---------------------------------------------------------------- wire (exported for the tests and the fuzzer) */
+
+enum {
+    PLT_BEGIN = 0x70,  /* tx->rx: u64 file, u64 total, u32 meta_len, meta */
+    PLT_RESUME = 0x71, /* rx->tx: u64 file, i32 status, u64 offset */
+    PLT_CHUNK = 0x72,  /* tx->rx: u64 file, u64 offset, bytes */
+    PLT_END = 0x73,    /* tx->rx: u64 file, u64 total, u64 xxh64 */
+    PLT_DONE = 0x74,   /* rx->tx: u64 file, i32 status */
+    PLT_PING = 0x75,
+    PLT_PONG = 0x76,
+};
+
+struct pl_msg {
+    uint8_t type; /* without the compression bit */
+    const uint8_t *p;
+    size_t n; /* the payload (decompressed) */
+    uint64_t file, a, b, c;
+    int32_t status;
+    const uint8_t *data; /* BEGIN: meta; CHUNK: the bytes */
+    size_t data_len;
+};
+
+/* Decodes one frame's body (type and payload, tag already checked): decompresses when bit 0x80 is set into *own (a
+ * malloc'ed buffer the caller frees; NULL when not needed) and parses the link's own types. 0, or -1 when the body is
+ * not well formed (a frame of another length than its type has, a bad zstd frame, a raw length that is not the
+ * decoded size). Reads exactly n bytes of p. */
+int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, uint8_t **own);
+/* Encodes a driver frame: [u32 len][type][payload][tag] into *out (malloc'ed); compresses when `compress` and it pays.
+ * key/seq as a link's; returns the length, or 0 on failure. Used by the tests. */
+size_t pl_frame_encode(const uint8_t key[32], uint64_t *seq, int compress, uint8_t type, const void *p, size_t n,
+                       uint8_t **out);
+
+/* A streaming splitter of the frames of one direction (what a link's reader does): feed bytes, each complete frame is
+ * checked against its tag (unless skip_tag, for the fuzzer) and passed on. */
+struct pl_reader;
+struct pl_reader *pl_reader_new(const uint8_t key[32], int skip_tag);
+void pl_reader_free(struct pl_reader *r);
+/* 0 while the stream is good; -1 once it is not (a bad length, tag or body, or fn returned negative): nothing more is
+ * accepted. Frames are decoded through pl_msg_decode and handed to fn (m is valid during the call). */
+int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(void *arg, const struct pl_msg *m),
+                   void *arg);
+
+/* A streaming xxh64 (the one-shot is xxh64() of src/internal.h; they agree). */
+struct pl_xxh {
+    uint64_t v[4], total;
+    uint8_t buf[32];
+    size_t nbuf;
+};
+void pl_xxh_init(struct pl_xxh *s);
+void pl_xxh_update(struct pl_xxh *s, const void *p, size_t n);
+uint64_t pl_xxh_final(const struct pl_xxh *s);
+
+/* test hooks: a planted bug (tests/test_peerlink.c --mutant) */
+enum {
+    PL_MUT_NONE = 0,
+    PL_MUT_NOTAG = 1,
+    PL_MUT_SHAREDSOCKET = 2,
+    PL_MUT_NOBACKPRESSURE = 3,
+    PL_MUT_ACCAUTH = 4,     /* the acceptor does not check AUTH */
+    PL_MUT_UUID = 5,        /* the acceptor does not compare the cluster uuid */
+    PL_MUT_ENDHASH = 6,     /* the file's xxh64 is not compared */
+    PL_MUT_NOTHROTTLE = 7,  /* the token bucket lets everything through */
+    PL_MUT_ZSTDSIZE = 8,    /* a zstd frame whose size is not the declared raw length is accepted */
+    PL_MUT_CHUNKOFF = 9,    /* a CHUNK at another offset than the next is accepted */
+    PL_MUT_RESUMEBOUND = 10, /* a receiver's resume offset beyond the file is accepted */
+    PL_MUT_NOKICK = 11,     /* a new connection of the same peer does not take the accepted link over */
+};
+/* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
+ * and misbehaves. */
+int plink_test_ctl(struct plink *l, uint8_t type, const void *p, size_t n);
+extern int peerlink_mutant;
+
+#endif

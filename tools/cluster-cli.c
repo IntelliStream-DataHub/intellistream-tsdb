@@ -31,6 +31,7 @@ static const char cl_help[] =
     "usage: tsdb cluster secret FILE\n"
     "       tsdb cluster init PEER --secret-file F [options]\n"
     "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
+    "       tsdb cluster volume add PEER NAME [--replicas N] --secret-file F\n"
     "       tsdb cluster status PEER --secret-file F\n"
     "       tsdb cluster help\n"
     "\n"
@@ -46,6 +47,11 @@ static const char cl_help[] =
     "                      cluster that PEER belongs to; PEER may be any member. The members vote\n"
     "                      in groups of 1, 3 or 5 (at most --voters); the rest watch and take a voter's place when\n"
     "                      one is lost. A witness (tsdbd --witness) is added the same way.\n"
+    "  volume add PEER NAME  a replicated volume called NAME on N servers (the cluster's --replication by default).\n"
+    "                      The leader of the group picks its number and its servers; each of them makes the\n"
+    "                      volume's directory (v<number> in its --dir) and opens it. Clients create and find\n"
+    "                      series inside the volume they name (in this preview only its first server takes writes,\n"
+    "                      and only with TSDB_CLUSTER_WRITES=1: replication is not built yet).\n"
     "  status PEER         what that server knows: its role, the leader, the settings, every member (up or down,\n"
     "                      incarnation, when it was last heard), the volumes and users. One fact a line.\n"
     "\n"
@@ -63,6 +69,13 @@ static const char cl_help[] =
     "    --failover lease|attested|bmc   how a dead owner is replaced in shared mode [lease]\n"
     "    --read-barrier on|off   owners answer reads only behind a fenced write [on]\n"
     "    --lease-s S             the lease of a shared volume [10]\n"
+    "    --lease-ms MS           a replicated volume's leader read lease [2000]\n"
+    "    --drift-ppm N           the clock drift every lease allows for [500]\n"
+    "    --unanswered-ms MS      a copy kept in sync without answering a promotion is dropped after this [1000]\n"
+    "    --commit-interval-ms MS the commit point reaches the copies within this [5]\n"
+    "    --repl-retain-mb MB     log kept for a copy that fell behind, at most [4096]\n"
+    "    --repl-retain-s S       and for at most this long [1800]\n"
+    "    --idle-seal-ms MS       an idle leader closes its log segment after this [1000]\n"
     "  In this preview the settings are stored and shown by status; nothing acts on the replication, failover and\n"
     "  volume ones yet.\n";
 
@@ -118,6 +131,12 @@ static void print_status(const struct cluster_status *st)
                m.set.failover == META_FAILOVER_BMC ? "bmc" : m.set.failover == META_FAILOVER_ATTESTED ? "attested"
                                                                                                      : "lease",
                m.set.read_barrier ? "on" : "off", m.set.lease_s, m.restore_gen);
+    if (m.initialised)
+        printf("replicated lease_ms %" PRIu32 " drift_ppm %" PRIu32 " unanswered_ms %" PRIu32
+               " commit_interval_ms %" PRIu32 " repl_retain_mb %" PRIu32 " repl_retain_s %" PRIu32
+               " idle_seal_ms %" PRIu32 "\n",
+               m.set.lease_ms, m.set.drift_ppm, m.set.unanswered_ms, m.set.commit_interval_ms,
+               m.set.repl_retain_mb, m.set.repl_retain_s, m.set.idle_seal_ms);
     else
         printf("cluster %s (not initialised)\n", u);
     raft_config cfg = {0};
@@ -165,6 +184,23 @@ static void print_status(const struct cluster_status *st)
             printf("domain-report node %" PRIu32 " %s %s\n", mb->id, h->doms[j].name,
                    h->doms[j].state == CL_DOM_OK ? "ok" : h->doms[j].state == CL_DOM_SLOW ? "slow" : "fault");
     }
+    for (uint32_t i = 0; i < m.nvolumes; i++) {
+        const struct meta_volume *v = &m.volumes[i];
+        char vu[33];
+        for (int k = 0; k < 16; k++)
+            sprintf(vu + 2 * k, "%02x", v->uuid[k]);
+        printf("volume %" PRIu32 " name %s uuid %s leader %" PRIu32 " epoch %" PRIu64 " min_isr %" PRIu32
+               " replicas", v->number, v->name, vu, v->leader, v->epoch, v->min_isr);
+        for (uint32_t k = 0; k < v->nrep; k++)
+            printf("%s%" PRIu32 "%s", k ? "," : " ", v->rep[k].node, v->rep[k].learner ? "(learner)" : "");
+        printf(" isr");
+        for (uint32_t k = 0; k < v->nisr; k++)
+            printf("%s%" PRIu32, k ? "," : " ", v->isr[k]);
+        printf("%s isr_version %" PRIu64 "\n", v->nisr ? "" : " -", v->isr_version);
+        for (uint32_t k = 0; k < v->nrep; k++)
+            printf("replica volume %" PRIu32 " node %" PRIu32 " rid %016" PRIx64 " open_gen %" PRIu64 "\n",
+                   v->number, v->rep[k].node, v->rep[k].rid, v->rep[k].open_gen);
+    }
     printf("volumes %" PRIu32 " users %" PRIu32 "\n", m.nvolumes, m.nusers);
     meta_free(&m);
 }
@@ -198,6 +234,12 @@ int cluster_cli(int argc, char **argv)
         addr = argv[3];
         newpeer = argv[4];
         i = 5;
+    } else if (!strcmp(verb, "volume")) {
+        if (argc < 5 || strcmp(argv[2], "add") != 0)
+            return cl_usage();
+        addr = argv[3];
+        newpeer = argv[4]; /* the volume's name */
+        i = 5;
     } else if (!strcmp(verb, "init") || !strcmp(verb, "status")) {
         addr = argv[2];
         i = 3;
@@ -207,6 +249,7 @@ int cluster_cli(int argc, char **argv)
     struct meta_settings s;
     meta_settings_default(&s);
     int mode = META_MODE_REPLICATED;
+    uint32_t replicas = 0; /* volume add: 0 takes the cluster's replication */
     struct {
         const char *flag;
         uint32_t *v;
@@ -219,7 +262,14 @@ int cluster_cli(int argc, char **argv)
                 {"--voter-replace-s", &s.voter_replace_s},
                 {"--voters", &s.voters},
                 {"--volumes-per-server", &s.volumes_per_server},
-                {"--lease-s", &s.lease_s}};
+                {"--lease-s", &s.lease_s},
+                {"--lease-ms", &s.lease_ms},
+                {"--drift-ppm", &s.drift_ppm},
+                {"--unanswered-ms", &s.unanswered_ms},
+                {"--commit-interval-ms", &s.commit_interval_ms},
+                {"--repl-retain-mb", &s.repl_retain_mb},
+                {"--repl-retain-s", &s.repl_retain_s},
+                {"--idle-seal-ms", &s.idle_seal_ms}};
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--secret-file") && i + 1 < argc) {
             secret_file = argv[++i];
@@ -239,6 +289,12 @@ int cluster_cli(int argc, char **argv)
                          : !strcmp(argv[i + 1], "bmc") ? META_FAILOVER_BMC : 99;
             if (s.failover == 99)
                 return cl_usage();
+            i++;
+            continue;
+        }
+        if (!strcmp(verb, "volume") && i + 1 < argc && !strcmp(argv[i], "--replicas")) {
+            if (num(argv[i], argv[i + 1], &replicas) != 0)
+                return 2;
             i++;
             continue;
         }
@@ -293,6 +349,14 @@ int cluster_cli(int argc, char **argv)
         req[1] = (uint8_t)(n >> 8);
         memcpy(req + 2, newpeer, n);
         rl = 2 + n;
+    } else if (!strcmp(verb, "volume")) {
+        op = CLUSTER_OP_VOLUME_ADD;
+        size_t n = strlen(newpeer);
+        if (n == 0 || n >= META_NAME_MAX) {
+            fprintf(stderr, "tsdb cluster: %s: a volume name is 1 to %d bytes\n", newpeer, META_NAME_MAX - 1);
+            return 2;
+        }
+        rl = cluster_volume_add_encode(newpeer, replicas, req);
     } else {
         op = CLUSTER_OP_STATUS;
     }
@@ -326,6 +390,11 @@ int cluster_cli(int argc, char **argv)
             }
             print_status(&st);
             cluster_status_free(&st);
+        } else if (op == CLUSTER_OP_VOLUME_ADD) {
+            uint32_t number = 0;
+            for (size_t k = 0; k < 4 && k < len; k++)
+                number |= (uint32_t)reply[k] << (8 * k);
+            printf("added volume %s: number %" PRIu32 "\n", newpeer, number);
         } else if (op == CLUSTER_OP_INIT) {
             printf("initialised: node 1 at %s\n", target);
         } else {

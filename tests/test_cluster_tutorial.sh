@@ -18,8 +18,10 @@
 #
 # Then: every line the page shows after a "<!-- cluster-tutorial-output -->" marker is in the real output once the
 # parts that differ from run to run are replaced by placeholders on both sides (ports, the cluster id, "heard" times,
-# term and commit numbers, the leader's number, the scratch directory), and the facts the page claims are checked
-# on the real output: three voters, node 1 down and then up with incarnation 2, the data on node 1 only, the witness
+# term and commit numbers, the leader's number, a volume's id, leader and copies' rid and open generation (a restarted
+# node's copy registers its new one a moment later), the scratch directory), and the facts the page claims are checked
+# on the real output: three voters, node 1 down and then up with incarnation 2, a cluster volume on all three nodes
+# written through its leader, the witness
 # a watcher with no volumes. If the page's commands are wrong, this fails: that is its point.
 set -u
 cd "$(dirname "$0")/.."
@@ -100,7 +102,10 @@ norm() {
         -e 's/^node [0-9]+ mode ([a-z]+) role ([a-z-]+) term [0-9]+ leader [0-9]+ commit [0-9]+ applied [0-9]+$/node N mode \1 role R term T leader L commit C applied A/' \
         -e 's/read_barrier (on|off|\?)$/read_barrier X/' \
         -e 's/^member [0-9]+ (up|down) incarnation/member M \1 incarnation/' \
-        -e 's/ rack rack[0-9]+ / rack rackM /'
+        -e 's/ rack rack[0-9]+ / rack rackM /' \
+        -e 's/^volume ([0-9]+) name ([a-z]+) uuid [0-9a-f]{32} leader [0-9]+ /volume \1 name \2 uuid UUID leader L /' \
+        -e 's/^replica volume ([0-9]+) node ([0-9]+) rid [0-9a-f]{16} open_gen [0-9]+$/replica volume \1 node \2 rid RID open_gen G/' \
+        -e 's/^node [0-9]+ leads volume /node L leads volume /'
 }
 # The killed node is the leader of the moment, and an election before step 7 can make it node 2 or 3, not node 1: the
 # page's member lines (it names member 1, rack1) must match whichever member the run killed.
@@ -133,11 +138,18 @@ expect 1 '^member [123] down incarnation 1 '                # the killed leader 
 expect 2 '^member [123] up incarnation 2 '                  # step 8, and step 9 (the witness sees the new incarnation)
 expect 1 '^node 4 mode watch role - '
 expect 1 '^member 4 up incarnation 1 .* volumes_ok 0 '
-expect 1 '^node 2 has 0 series$'
-expect 1 '^pump7\.flow	float32$'
-expect 1 '^wrote 1440 rows$'
-# steps 7 and 8 answer at a term above 1 (an election happened)
-expect 2 '^node [123] mode core role (leader|follower) term [2-9][0-9]* leader [123] '
+expect 1 '^node [123] leads volume plant$'                    # step 6: the cluster volume and its leader
+expect 1 '^wrote 1440 rows$'                                  # written into plant, through its leader
+expect 1 '^read 1440 rows, the first: 1717200000000 50\.00$'
+expect 3 '/n[123]/data/v1$'                                   # every node made the volume's directory
+[ "$(grep -cE '^replica volume 1 node [123] rid [0-9a-f]{16} open_gen 1$' "$scratch/out")" -ge 3 ] \
+    || fail "step 6 does not show the three copies of plant with their open generation 1"
+# steps 5, 7 and 8 ask a voter; 7 and 8 (the last two) answer at a term above 1 (an election happened). Step 5 may too:
+# on a loaded machine (ASan beside a test run) the group can hold an election before step 7, as the killed node allows.
+expect 3 '^node [123] mode core role (leader|follower) term [0-9]+ leader [123] '
+[ "$(grep -E '^node [123] mode core ' "$scratch/out" | tail -n 2 \
+     | grep -cE '^node [123] mode core role (leader|follower) term ([2-9]|[1-9][0-9]+) leader [123] ')" -eq 2 ] \
+    || fail "steps 7 and 8 do not both answer at a term above 1"
 grep -q 'proposes node [123] down' "$scratch/out" || fail "the logs (step 10) has no 'proposes node [123] down'"
 grep -q 'proposes node [123] up (incarnation 2)' "$scratch/out" || fail "the logs (step 10) has no 'proposes node [123] up (incarnation 2)'"
 grep -q 'leads the metadata group' "$scratch/out" || fail "the logs (step 10) has no 'leads the metadata group'"

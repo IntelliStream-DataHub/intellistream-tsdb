@@ -99,6 +99,8 @@ static const struct cfg_key tsdbd_keys[] = {
     CK_I("cluster.peer.port", "peer-port", "", "The port of the other members. Default: server.port + 1."),
     CK_S("cluster.peer.listen", "peer-listen", "", "The address of the peer port. Default: server.listen."),
     CK_S("cluster.advertise", "advertise", "", "The host name other members and clients use for this one."),
+    CK_S("cluster.peer.advertise", "peer-advertise", "", "The peer address (host:port) put in the metadata instead of the "
+         "advertised host and the real peer port, for a proxy or NAT in front of the peer port."),
     CK_S("cluster.rack", "rack", "", "The failure domain of this node (a rack name)."),
     CK_S("cluster.secret.file", "cluster-secret-file", "", "The file with the cluster's shared secret (mode 600)."),
     CK_S("cluster.state.dir", "state-dir", "", "Where the metadata group keeps its state (a local disk, never storage.dir)."),
