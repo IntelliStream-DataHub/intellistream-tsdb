@@ -41,6 +41,8 @@ struct replfile_state {
     uint64_t incarnation;         /* of the server run that last saved */
     uint64_t rid;                 /* replica instance, never 0, drawn at create and never changed */
     uint64_t open_gen;            /* raised (and saved) at every open */
+    uint64_t open_nonce;          /* the draw of the open that saved open_gen (0: none, as in a fresh directory): two opens
+                                   * that saved one generation differ here (server/cvol.c); free to change at a save */
     uint64_t fence;               /* the highest epoch this replica has saved */
     uint64_t led;                 /* the highest epoch it has led */
     uint64_t floor;               /* the commit floor */

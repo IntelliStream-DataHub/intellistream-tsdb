@@ -5,14 +5,14 @@
  * The cluster thread pushes the replicated volume records that name this server (cluster_set_volume_watch, a copy
  * under `mu`, never blocking); this thread does the I/O. For each record:
  *
- *   1. The directory <dir>/v<N>. A new one is made whole or not at all: <dir>/v<N>.tmp (removed first if a crash
- *      left one), META (the root's format lines, volume=N, volume_uuid=, cluster=, requires=cluster,replica) and REPL
- *      (the replica instance `rid` from the record, generation 0), each fsynced, the directory fsynced, renamed to
- *      v<N>, the root fsynced. An existing one must hold the record's rid (else it is another instance of the
+ *   1. The directory <dir>/v<N> (server/cvolfs.c does the disk side of steps 1 and 2). A new one is made whole or
+ *      not at all: <dir>/v<N>.tmp (removed first if a crash left one), META (the root's format lines, volume=N,
+ *      volume_uuid=, cluster=, requires=cluster,replica), REPL (src/replfile.c: the replica instance `rid` from the
+ *      record, generation 0) and FNO, each fsynced, the directory fsynced, renamed to v<N>, the root fsynced. An existing one must hold the record's rid (else it is another instance of the
  *      replica: refused, naming both) and a generation at or above the record's open_gen (else it is an older copy
  *      of the directory: refused, naming both).
- *   2. The open generation: REPL's generation + 1 and a random nonce of this open, saved (tmp, fsync, rename,
- *      directory fsync) before they are reported. The heartbeat carries (rid, gen, nonce); the metadata leader commits
+ *   2. The open generation: REPL's generation + 1 and a random nonce of this open, saved (replfile_save: the older
+ *      slot, fdatasync) before they are reported. The heartbeat carries (rid, gen, nonce); the metadata leader commits
  *      REPLICA_OPEN (cluster.c, propose_opens) when gen is above the record's. Until this server's copy shows exactly
  *      this open (gen and nonce) the volume is declared but not open: requests get UNAVAILABLE (RECOVERING), so
  *      nothing answers, acknowledges or leads under a generation the group has not recorded. The nonce is what tells
@@ -25,10 +25,14 @@
  *      replica too, unless the test switch TSDB_CLUSTER_WRITES=1 (environment, read once at start) says otherwise.
  *      A replica's engine answers READONLY; tsdbd turns that into UNAVAILABLE with TSDB_WHY_FENCED (cvol_why).
  *
- * REPL is a stub (key=value lines: rid, gen) until r3c2-replfile's server/replfile.* is merged.
- * Mutants (TSDB_CVOL_MUTANT, tests only): `noopengen` opens the engine before REPLICA_OPEN commits; `samerid` draws
- * a new rid at every open instead of keeping the directory's; `anynonce` opens under a record of the right generation
- * whatever its nonce; `replnonce` ignores the nonce in REPL. Test switch: TSDB_CLUSTER_TEST stale_first_watch=1
+ * A REPL that is missing, has no valid slot or cannot be read, one that belongs to another volume, cluster or node, and
+ * a failed save (fail-stop for the volume: the handle is dropped, never retried) refuse the volume with a line naming
+ * the path. A torn REPL (one slot damaged) is "unsure": its fence, led, floor and log start are not trusted (none is
+ * used yet: the replica driver is not wired), and replfile skips a belt in the open generation, so the rule above
+ * holds whatever the lost save carried.
+ * Mutants (TSDB_CVOL_MUTANT, tests only): `noopengen` opens the engine before REPLICA_OPEN commits; `anynonce` opens
+ * under a record of the right generation whatever its nonce; the others are in cvolfs.h (`samerid`, `replnonce`,
+ * `nononce`, `trustunsure`, `nodirsync`). Test switch: TSDB_CLUSTER_TEST stale_first_watch=1
  * lowers this server's open generations in the first push of its metadata copy by one (a copy one REPLICA_OPEN
  * behind, as when the log catch-up after a restart applies in steps).
  */
@@ -46,6 +50,7 @@
 #include <unistd.h>
 
 #include "cvol.h"
+#include "cvolfs.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/cvol.h"
 #include "tsdb_protocol.h"
@@ -71,175 +76,17 @@ static struct {
     tsdb *t;
     char dir[4096];
     uint32_t self;
+    uint64_t incarnation; /* of this run: REPL says which run saved last (cvolfs.c) */
     struct cluster_vol_rec recs[CLUSTER_REPORT_VOLS]; /* the latest push */
     uint32_t nrecs;
     struct mvol vols[CLUSTER_REPORT_VOLS]; /* what this manager made of them; under mu */
     uint32_t nvols;
     int writes;  /* TSDB_CLUSTER_WRITES=1 */
-    int mutant;  /* 1 noopengen, 2 samerid, 3 anynonce, 4 replnonce */
+    int mutant;  /* 1 noopengen, 3 anynonce (the others are cvolfs.h's) */
     int stale_first; /* TSDB_CLUSTER_TEST stale_first_watch=1, until the first push */
 } M = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
-static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void say(const char *fmt, ...)
-{
-    char line[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(line, sizeof line, fmt, ap);
-    va_end(ap);
-    fprintf(stderr, "tsdbd: volumes: %s\n", line);
-}
-
-static void hex16(const uint8_t *b, char *out)
-{
-    for (int i = 0; i < 16; i++)
-        snprintf(out + 2 * i, 3, "%02x", b[i]);
-}
-
-static int sync_dir(const char *d)
-{
-    int fd = open(d, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0)
-        return -1;
-    int rc = fsync(fd);
-    close(fd);
-    return rc;
-}
-
-/* a new file in `dir`, whole: written, fsynced; the caller syncs the directory */
-static int write_new(const char *dir, const char *name, const char *txt)
-{
-    char p[4300];
-    snprintf(p, sizeof p, "%s/%s", dir, name);
-    /* always a new inode: a file a failed write or sync left may have had its pages dropped */
-    if (unlink(p) != 0 && errno != ENOENT)
-        return -1;
-    int fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-    if (fd < 0)
-        return -1;
-    size_t len = strlen(txt);
-    int rc = write(fd, txt, len) == (ssize_t)len && fsync(fd) == 0 ? 0 : -1;
-    if (close(fd) != 0)
-        rc = -1;
-    return rc;
-}
-
-static int repl_save(const char *vdir, uint64_t rid, uint64_t gen, uint64_t nonce)
-{
-    char txt[160];
-    snprintf(txt, sizeof txt, "rid=%016" PRIx64 "\ngen=%" PRIu64 "\nnonce=%016" PRIx64 "\n", rid, gen, nonce);
-    char a[4300], b[4300];
-    snprintf(a, sizeof a, "%s/REPL.tmp", vdir);
-    snprintf(b, sizeof b, "%s/REPL", vdir);
-    if (write_new(vdir, "REPL.tmp", txt) != 0 || rename(a, b) != 0 || sync_dir(vdir) != 0)
-        return -1;
-    return 0;
-}
-
-/* 0, 1 when there is no REPL, -1 when it cannot be read or does not parse */
-static int repl_load(const char *vdir, uint64_t *rid, uint64_t *gen, uint64_t *nonce)
-{
-    char p[4300], buf[256];
-    snprintf(p, sizeof p, "%s/REPL", vdir);
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return errno == ENOENT ? 1 : -1;
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    close(fd);
-    if (n <= 0)
-        return -1;
-    buf[n] = 0;
-    char *r = strstr(buf, "rid="), *g = strstr(buf, "gen="), *nc = strstr(buf, "nonce=");
-    if (!r || !g)
-        return -1;
-    *rid = strtoull(r + 4, NULL, 16);
-    *gen = strtoull(g + 4, NULL, 10);
-    *nonce = nc ? strtoull(nc + 6, NULL, 16) : 0; /* a new directory's REPL (generation 0) has none */
-    return 0;
-}
-
-/* the root's format lines (version, partition_ms, granule_rows, partition_classes), so every volume has its layout */
-static int root_format(char *out, size_t cap)
-{
-    char p[4200], buf[4096];
-    snprintf(p, sizeof p, "%s/META", M.dir);
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return -1;
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    close(fd);
-    if (n <= 0)
-        return -1;
-    buf[n] = 0;
-    size_t o = 0;
-    static const char *keys[] = {"version=", "partition_ms=", "granule_rows=", "partition_classes="};
-    for (char *l = buf; *l;) {
-        char *e = strchr(l, '\n');
-        size_t ll = e ? (size_t)(e - l) : strlen(l);
-        for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++)
-            if (!strncmp(l, keys[k], strlen(keys[k])) && o + ll + 2 < cap) {
-                memcpy(out + o, l, ll);
-                o += ll;
-                out[o++] = '\n';
-            }
-        l = e ? e + 1 : l + ll;
-    }
-    out[o] = 0;
-    return strstr(out, "version=") ? 0 : -1;
-}
-
-/* makes <dir>/v<N> whole (module comment, step 1); 0 or -1 with a line said */
-static int make_dir(const struct cluster_vol_rec *r, const char *vdir)
-{
-    char tmp[4300], meta[4096], u[33], c[33];
-    snprintf(tmp, sizeof tmp, "%s.tmp", vdir);
-    /* a crash may have left a tmp directory: every file in it (META, REPL, FNO and their tmps, whatever step the
-     * crash came at), then itself; nothing in it was ever relied on */
-    DIR *d = opendir(tmp);
-    if (!d && errno != ENOENT) {
-        say("volume %" PRIu32 ": cannot read the leftover %s: %s", r->number, tmp, strerror(errno));
-        return -1;
-    }
-    for (struct dirent *e; d && (errno = 0, e = readdir(d));) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
-            continue;
-        char f[4600];
-        snprintf(f, sizeof f, "%s/%s", tmp, e->d_name);
-        if (unlink(f) != 0 && errno != ENOENT)
-            break; /* rmdir names it below */
-        errno = 0;
-    }
-    if (d && errno) { /* a readdir error is an error, never the end of the directory */
-        say("volume %" PRIu32 ": cannot read the leftover %s: %s", r->number, tmp, strerror(errno));
-        closedir(d);
-        return -1;
-    }
-    if (d)
-        closedir(d);
-    if (rmdir(tmp) != 0 && errno != ENOENT) {
-        say("volume %" PRIu32 ": cannot remove the leftover %s: %s", r->number, tmp, strerror(errno));
-        return -1;
-    }
-    if (root_format(meta, sizeof meta - 256) != 0) {
-        say("volume %" PRIu32 ": cannot read the format lines of %s/META", r->number, M.dir);
-        return -1;
-    }
-    hex16(r->uuid, u);
-    hex16(r->cluster, c);
-    size_t o = strlen(meta);
-    snprintf(meta + o, sizeof meta - o, "volume=%" PRIu32 "\nvolume_uuid=%s\ncluster=%s\nrequires=cluster,replica\n",
-             r->number, u, c);
-    char rp[128];
-    snprintf(rp, sizeof rp, "rid=%016" PRIx64 "\ngen=0\n", r->rid);
-    if (mkdir(tmp, 0755) != 0 || write_new(tmp, "META", meta) != 0 || write_new(tmp, "REPL", rp) != 0 ||
-        tsdb_cvol_fno_create(tmp) != 0 || sync_dir(tmp) != 0 || rename(tmp, vdir) != 0 || sync_dir(M.dir) != 0) {
-        say("volume %" PRIu32 ": cannot make %s: %s", r->number, vdir, strerror(errno));
-        return -1;
-    }
-    say("volume %" PRIu32 " (%s): made %s, replica %016" PRIx64, r->number, r->name, vdir, r->rid);
-    return 0;
-}
+#define say cvolfs_say
 
 static struct mvol *mv_get(uint32_t number)
 {
@@ -249,66 +96,38 @@ static struct mvol *mv_get(uint32_t number)
     return NULL;
 }
 
-/* step 1 and 2 for a record not seen yet; the new state under mu */
+/* step 1 and 2 for a record not seen yet (the disk side is cvolfs_prepare); the new state under mu */
 static void prepare(const struct cluster_vol_rec *r)
 {
-    char vdir[4200];
-    snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, M.dir, r->number);
     struct mvol m = {.number = r->number, .state = MV_REFUSED, .epoch = r->epoch};
-    struct stat st;
-    uint64_t rid = 0, gen = 0, nonce = 0, draw = 0;
+    pthread_mutex_lock(&M.mu);
+    uint32_t self = M.self;
+    int stale_first = M.stale_first;
+    pthread_mutex_unlock(&M.mu);
     int rc = tsdb_cvol_declare(M.t, r->number, r->name);
     if (rc != 0) {
         say("volume %" PRIu32 " (%s): cannot be declared: %s", r->number, r->name, tsdb_strerror(rc));
-        goto out;
+    } else {
+        struct cvolfs_rec fr = {.number = r->number,
+                                .node = self,
+                                .incarnation = M.incarnation,
+                                .rid = r->rid,
+                                .open_gen = r->open_gen,
+                                .open_nonce = r->open_nonce,
+                                .stale_first = stale_first};
+        struct cvolfs_open o;
+        snprintf(fr.name, sizeof fr.name, "%s", r->name);
+        memcpy(fr.uuid, r->uuid, 16);
+        memcpy(fr.cluster, r->cluster, 16);
+        if (cvolfs_prepare(M.dir, &fr, &o) == 0) {
+            m.rid = o.rid;
+            m.gen = o.gen;
+            m.nonce = o.nonce;
+            m.state = MV_WAIT;
+            say("volume %" PRIu32 " (%s): open generation %" PRIu64 ", waiting for the metadata group to record it",
+                r->number, r->name, m.gen);
+        }
     }
-    if (stat(vdir, &st) != 0) {
-        if (errno != ENOENT || make_dir(r, vdir) != 0)
-            goto out;
-    }
-    int lr = repl_load(vdir, &rid, &gen, &nonce);
-    if (lr != 0) {
-        say("volume %" PRIu32 ": %s/REPL %s: the volume is not opened", r->number, vdir,
-            lr > 0 ? "is missing" : "cannot be read");
-        goto out;
-    }
-    if (M.mutant == 2) /* samerid: a new instance at every open */
-        rid = r->rid ^ (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
-    if (rid != r->rid) {
-        say("volume %" PRIu32 ": %s holds replica %016" PRIx64 ", the metadata group names %016" PRIx64
-            " for this server: another instance of the directory, not opened",
-            r->number, vdir, rid, r->rid);
-        if (M.mutant != 2)
-            goto out;
-    }
-    if (gen < r->open_gen) {
-        say("volume %" PRIu32 ": %s is at open generation %" PRIu64 ", below the %" PRIu64
-            " the metadata group recorded: an older copy of the directory, not opened",
-            r->number, vdir, gen, r->open_gen);
-        goto out;
-    }
-    /* the test switch's copy one open behind shows this directory's own last open, nonce included */
-    uint64_t rec_nonce = M.stale_first && gen == r->open_gen ? nonce : r->open_nonce;
-    if (gen == r->open_gen && gen > 0 && nonce != rec_nonce && M.mutant != 4) {
-        say("volume %" PRIu32 ": %s saved open generation %" PRIu64 " in another open than the one the metadata group"
-            " recorded (nonce %016" PRIx64 ", recorded %016" PRIx64 "): an older copy of the directory, not opened",
-            r->number, vdir, gen, nonce, rec_nonce);
-        goto out;
-    }
-    while (draw == 0 && tsdb_random(&draw, sizeof draw) == 0)
-        ; /* 0 is a REPL's without one */
-    if (draw == 0 || repl_save(vdir, rid, gen + 1, draw) != 0) {
-        say("volume %" PRIu32 ": cannot save open generation %" PRIu64 " in %s/REPL: %s", r->number, gen + 1, vdir,
-            strerror(errno));
-        goto out;
-    }
-    m.rid = rid;
-    m.gen = gen + 1;
-    m.nonce = draw;
-    m.state = MV_WAIT;
-    say("volume %" PRIu32 " (%s): open generation %" PRIu64 ", waiting for the metadata group to record it",
-        r->number, r->name, m.gen);
-out:
     pthread_mutex_lock(&M.mu);
     if (M.nvols < CLUSTER_REPORT_VOLS)
         M.vols[M.nvols++] = m;
@@ -457,18 +276,22 @@ int cvol_start(tsdb *t, const char *dir)
     snprintf(M.dir, sizeof M.dir, "%s", dir);
     const char *w = getenv("TSDB_CLUSTER_WRITES");
     M.writes = w && !strcmp(w, "1");
+    while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
+        ;
     const char *mu = getenv("TSDB_CVOL_MUTANT");
-    M.mutant = !mu                         ? 0
-               : !strcmp(mu, "noopengen") ? 1
-               : !strcmp(mu, "samerid")   ? 2
-               : !strcmp(mu, "anynonce")  ? 3
-               : !strcmp(mu, "replnonce") ? 4
-                                          : 0;
+    M.mutant = mu && !strcmp(mu, "noopengen") ? 1 : mu && !strcmp(mu, "anynonce") ? 3 : 0;
+    cvolfs_test_mutant = !mu                         ? CVOLFS_MUT_NONE
+                         : !strcmp(mu, "samerid")     ? CVOLFS_MUT_SAMERID
+                         : !strcmp(mu, "replnonce")   ? CVOLFS_MUT_REPLNONCE
+                         : !strcmp(mu, "nononce")     ? CVOLFS_MUT_NONONCE
+                         : !strcmp(mu, "trustunsure") ? CVOLFS_MUT_TRUSTUNSURE
+                         : !strcmp(mu, "nodirsync")   ? CVOLFS_MUT_NODIRSYNC
+                                                      : CVOLFS_MUT_NONE;
     const char *ct = getenv("TSDB_CLUSTER_TEST");
     M.stale_first = ct && strstr(ct, "stale_first_watch=1");
     if (M.writes)
         say("TSDB_CLUSTER_WRITES=1: a volume's leader takes writes before replication is wired (tests only)");
-    if (M.mutant)
+    if (M.mutant || cvolfs_test_mutant)
         say("MUTANT %s (tests only)", mu);
     if (pthread_create(&M.th, NULL, mgr_main, NULL) != 0) {
         say("cannot start the volume manager thread");

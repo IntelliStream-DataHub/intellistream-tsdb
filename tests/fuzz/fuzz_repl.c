@@ -33,7 +33,7 @@ static void roundtrip(const uint8_t *p, size_t n)
     struct replfile_state again;
     uint64_t g2;
     if (!replfile_parse(page, sizeof page, &again, &g2) || g2 != gen || again.nhist != st.nhist ||
-        memcmp(again.volume_uuid, st.volume_uuid, 16) != 0 || again.rid != st.rid || again.fence != st.fence ||
+        memcmp(again.volume_uuid, st.volume_uuid, 16) != 0 || again.rid != st.rid || again.open_nonce != st.open_nonce || again.fence != st.fence ||
         (st.nhist && memcmp(again.hist, st.hist, st.nhist * sizeof *st.hist) != 0))
         abort();
     struct repl_durable d;
@@ -87,7 +87,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             n = REPLFILE_PAGE;
         if (n < 136)
             continue;
-        uint64_t magic = 0x31504552425f5344ull;
+        uint64_t magic = 0x32504552425f5344ull;
         memcpy(q, &magic, 8);
         uint32_t nh;
         memcpy(&nh, q + 20, 4);
@@ -111,7 +111,7 @@ static void seed(const char *dir, const char *name, int nhist, int slots)
     memset(&st, 0, sizeof st);
     for (int i = 0; i < 16; i++)
         st.volume_uuid[i] = (uint8_t)(1 + i), st.cluster_uuid[i] = (uint8_t)(0x80 + i);
-    st.node = 3, st.incarnation = 12, st.rid = 0xfeedfacecafebeefull, st.open_gen = 9, st.fence = 40, st.led = 38;
+    st.node = 3, st.incarnation = 12, st.rid = 0xfeedfacecafebeefull, st.open_gen = 9, st.open_nonce = 0x0123456789abcdefull, st.fence = 40, st.led = 38;
     st.floor = 500, st.log_start = 101;
     st.nhist = (uint32_t)nhist;
     st.hist = calloc((size_t)nhist + 1, sizeof *st.hist);

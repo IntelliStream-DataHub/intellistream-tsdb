@@ -4,7 +4,7 @@
  *
  * A slot is one 4 KiB page:
  *   head (128 bytes): magic, generation, len, nhist, the two uuids, node, incarnation, rid, open_gen, fence, led, floor,
- *                     log_start; then nhist entries of (epoch, start), then an xxh64 of everything before it.
+ *                     log_start, open_nonce; then nhist entries of (epoch, start), then an xxh64 of everything before it.
  * `len` is the byte count up to and including the checksum; the rest of the page is zero and not read. A slot whose
  * checksum is right but whose content cannot be (rid 0, a history out of order) is as bad as a torn one: the decoder
  * the core feeds must never see it.
@@ -19,7 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#define RF_MAGIC 0x31504552425f5344ull /* "DS_BREP1" little endian: a tag, never read as text */
+#define RF_MAGIC 0x32504552425f5344ull /* "DS_BREP2" little endian: a tag, never read as text; the digit is the format
+                                          * version (2: the open nonce in the last head word, 1 had it reserved) */
 #define RF_HEAD 128u
 #define RF_FILE (2 * REPLFILE_PAGE)
 
@@ -82,6 +83,7 @@ int replfile_encode(uint8_t *page, const struct replfile_state *st, uint64_t gen
     put64(page + 96, st->led);
     put64(page + 104, st->floor);
     put64(page + 112, st->log_start);
+    put64(page + 120, st->open_nonce);
     for (uint32_t i = 0; i < st->nhist; i++) {
         put64(page + RF_HEAD + i * 16, st->hist[i].epoch);
         put64(page + RF_HEAD + i * 16 + 8, st->hist[i].start);
@@ -98,8 +100,7 @@ static int parse_slot(const uint8_t *page, size_t n, struct replfile_state *st, 
     if (n < RF_HEAD + 8 || n > REPLFILE_PAGE || get64(page) != RF_MAGIC)
         return PARSE_BAD;
     uint32_t len = get32(page + 16), nh = get32(page + 20);
-    if (nh > REPLFILE_MAX_HIST || len != RF_HEAD + nh * 16 + 8 || len > n || get32(page + 60) != 0 ||
-        get64(page + 120) != 0)
+    if (nh > REPLFILE_MAX_HIST || len != RF_HEAD + nh * 16 + 8 || len > n || get32(page + 60) != 0)
         return PARSE_BAD;
     if (replfile_test_mutant != REPLFILE_MUT_NOCHECKSUM && get64(page + len - 8) != xxh64(page, len - 8, 0))
         return PARSE_BAD;
@@ -115,6 +116,7 @@ static int parse_slot(const uint8_t *page, size_t n, struct replfile_state *st, 
     s.led = get64(page + 96);
     s.floor = get64(page + 104);
     s.log_start = get64(page + 112);
+    s.open_nonce = get64(page + 120);
     if (s.rid == 0)
         return PARSE_BAD;
     if (nh) {
