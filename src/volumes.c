@@ -2376,11 +2376,14 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
     bool *refd = calloc(nv, sizeof *refd);
     if (vols && refd)
         memcpy(vols, t->vols, nv * sizeof *vols);
-    /* a reference on every volume that has rows; one quiesced refuses the call before any volume is written */
+    /* a reference on every volume that has rows; one quiesced, or a cluster volume held here as a replica (it takes
+     * records only), refuses the call before any volume is written */
     for (size_t v = 0; vols && refd && v < nv; v++) {
         if (cnt[v + 1] == cnt[v])
             continue;
-        if (atomic_load_explicit(&vols[v]->quiesced, memory_order_acquire))
+        if (t->crole && t->crole[v] == CVOL_REPLICA)
+            rc = rc ? rc : TSDB_ERR_READONLY;
+        else if (atomic_load_explicit(&vols[v]->quiesced, memory_order_acquire))
             rc = rc ? rc : TSDB_ERR_UNAVAILABLE;
         else
             eng_ref(vols[v]), refd[v] = true;

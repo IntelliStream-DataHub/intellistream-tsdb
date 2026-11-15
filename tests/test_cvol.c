@@ -249,6 +249,11 @@ static void test_cluster(void)
     CHECK_EQ(qcount(t, b0, &n), TSDB_ERR_UNAVAILABLE);
     CHECK_EQ(tsdb_insert(t, &b0, &ts, &val, 1), TSDB_ERR_UNAVAILABLE);
     CHECK_EQ(tsdb_insert(t, mix, tss, vs, 2), TSDB_ERR_UNAVAILABLE);
+    /* a writer's row and a replica's in one call: refused before the writer's row is written (all or nothing) */
+    tsdb_sid wr[2] = {a2, r0};
+    CHECK_EQ(tsdb_insert(t, wr, tss, vs, 2), TSDB_ERR_READONLY);
+    CHECK_EQ(qcount(t, a2, &n), 0);
+    CHECK_EQ(n, 1);
     CHECK_EQ(qcount(t, TSDB_SID(6, 0), &n), 0); /* no such volume: nothing */
     CHECK_EQ(n, 0);
     CHECK_EQ(tsdb_flush(t), 0); /* the holes are skipped */
