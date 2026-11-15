@@ -1986,6 +1986,25 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
  * DROP: the marker is the first record of the segment the flush starts (mt_flush_ex), so the replica that applies it
  * has sealed every memtable the leader flushed, and none of the rows written after it.
  */
+/* The wait of a marker the leader appended (`what` names it): the driver's (jr_ops.wait, which a test transport pumps
+ * in), then the engine's own copy of the commit point. A deposed leader's failed wait is indeterminate and leaves the
+ * engine running (fail-stop would end tsdbd and every volume with it; the close and reopen as a replica that follows
+ * cut what the new leader's history does not hold). Any other failure fails the engine: a replica may apply the
+ * marker, so the leader must not go on as if nothing happened. */
+static int leader_marker_wait(eng *db, uint64_t last, const char *what)
+{
+    const struct jr_ops *jr = db->jr;
+    int rc = jr->wait ? jr->wait(jr->ctx, db, last) : 0;
+    if (rc == 0)
+        rc = eng_leader_wait(db, last, false);
+    if (rc == 0)
+        return 0;
+    if (atomic_load(&db->lead_deposed) && eng_test_mutant != MUT_LEADER_DEPOSE_FAILS)
+        return TSDB_ERR_INDETERMINATE;
+    eng_fail(db, what, EIO);
+    return rc;
+}
+
 static int leader_commit(eng *db, const struct jr_commit_arg *ja)
 {
     const struct jr_ops *jr = db->jr;
@@ -2035,27 +2054,18 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
     free(files);
     if (rc)
         return rc; /* the marker may be in the log (a failed sync): the engine is failed by the WAL's own rules */
-    rc = jr->wait(jr->ctx, db, fno);
-    if (rc) {
-        eng_fail(db, "a COMMIT marker was appended but its commit point did not come", EIO);
-        return rc;
-    }
-    return 0;
+    return leader_marker_wait(db, fno, "a COMMIT marker was appended but its commit point did not come");
 }
 
 static int leader_drop(eng *db, int64_t ts)
 {
-    const struct jr_ops *jr = db->jr;
     mk m = {.type = MK_DROP, .span = 1};
     m.u.drop = (mk_drop){.dropped_before = ts, .partition = MK_NO_PARTITION};
     uint64_t fno = 0;
     int rc = mt_flush_ex(db, &m, &fno);
     if (rc)
         return rc;
-    rc = jr->wait(jr->ctx, db, fno);
-    if (rc)
-        eng_fail(db, "a DROP marker was appended but its commit point did not come", EIO);
-    return rc;
+    return leader_marker_wait(db, fno, "a DROP marker was appended but its commit point did not come");
 }
 
 int jr_intent(eng *db, enum jr_kind kind, const void *arg)

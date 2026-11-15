@@ -874,6 +874,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->manifest_lock, NULL);
     pthread_mutex_init(&db->publish_lock, NULL);
     pthread_mutex_init(&db->jr_serial, NULL);
+    pthread_mutex_init(&db->lead_mu, NULL);
+    pthread_cond_init(&db->lead_cv, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
     pthread_mutex_init(&db->tl_mu, NULL);
@@ -969,6 +971,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         if (rc != 0)
             goto fail;
     }
+    if (db->wal_enabled) /* positions are log numbers: what the open found is the durable end (eng_leader_commit) */
+        db->wal_appended = db->fno_next - 1, atomic_store(&db->wal_durable, db->fno_next - 1);
     if (!ro) {
         if (!db->rp)
             db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
@@ -1185,6 +1189,8 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->manifest_lock);
     pthread_mutex_destroy(&db->publish_lock);
     pthread_mutex_destroy(&db->jr_serial);
+    pthread_mutex_destroy(&db->lead_mu);
+    pthread_cond_destroy(&db->lead_cv);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);
     pthread_mutex_destroy(&db->tl_mu);
@@ -1215,6 +1221,11 @@ void eng_fail(eng *db, const char *what, int err)
         atomic_store_explicit(&db->failed, true, memory_order_release);
     }
     pthread_mutex_unlock(&db->fail_lock);
+    if (db->jr) { /* a leader's waits for the commit point end (indeterminate); lead_mu is a leaf, taken after the store */
+        pthread_mutex_lock(&db->lead_mu);
+        pthread_cond_broadcast(&db->lead_cv);
+        pthread_mutex_unlock(&db->lead_mu);
+    }
 }
 
 /* Every WAL segment unlinked before a directory fsync stays unlinked after a power loss: wal_removed_synced

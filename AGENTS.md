@@ -520,7 +520,11 @@ cgroup, so `nice` does not keep your work out of its way.
   `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
   that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
   the warmer take `latest_rw` (read) > `db->lock`, a lookup then `buf_lock` in sub-holds. The window's `pmu`/`pcv` (a writer
-  waits there with no other lock, `lt_end` takes `pmu` under `latest_rw`) and the warmer's hint mutex are leaves. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
+  waits there with no other lock, `lt_end` takes `pmu` under `latest_rw`) and the warmer's hint mutex are leaves. A leader's
+  `lead_mu` (its commit point, `eng_leader_wait`; src/memtable.c) is a leaf: `eng_fail` takes it last to wake the
+  waiters; a wait for the commit point may hold `flush_lock`, `cls_rw` or `jr_serial`, because the commit point moves on
+  positions already appended and needs no engine lock. A driver's `jr_ops.admit` runs under `buf_lock` (its core mutex
+  is a leaf below it). A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
   not yet appended anything, so nothing a registered large write waits for (a flush, the WAL writer role,
   `publish_lock`, `cls_rw`) waits for it. The write wait hook (`tsdb_set_write_wait_hook`) is a leaf: its +1 and
   the waiter's -1 run with no engine lock, the large write's -1 (`lw_leave`) with `cls_rw` held for reading; tsdbd's

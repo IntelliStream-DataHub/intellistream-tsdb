@@ -60,7 +60,9 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_NO_DROP_SKIP, MUT_REPLICA_NO_DROP_FLUSH, MUT_REPLICA_NO_STAGE_SYNC,
        MUT_REPLICA_PROMOTE_UNAPPLIED, MUT_REPLICA_PROMOTE_KEEP_SEGS, MUT_REPLICA_EPOCH_SEG,
        MUT_REPLICA_NO_DROP_SERIAL, MUT_REPLICA_STAGE_TRUNC,
-       MUT_REPLICA_NO_STAGE_ORPHANS };
+       MUT_REPLICA_NO_STAGE_ORPHANS,
+       MUT_LEADER_VISIBLE_DURABLE, MUT_LEADER_FLUSH_UNCOMMITTED, MUT_LEADER_DEPOSE_FAILS, MUT_LEADER_ADMIT_AFTER,
+       MUT_LEADER_BYTES_AFTER_SYNC };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1076,6 +1078,11 @@ bool series_check(series_dict *d, const uint32_t *series, uint32_t cs, size_t n,
  * (bucket accumulators, collected rows) it gives up with TSDB_ERR_DEFER and is run again at its turn, streaming,
  * as a single request. NULL on single-series paths. */
 #define TSDB_ERR_DEFER (-100)
+/* A leader's write whose outcome is unknown: it was appended (and may be committed and applied by the replicas), but
+ * the leader was deposed or its engine failed while it waited for the commit point. Engine-internal: never sent as
+ * UNAVAILABLE or MOVED, which promise "definitely not applied"; tsdbd answers it as a crash does (PLAN D12: the
+ * request's connection is closed without an answer). */
+#define TSDB_ERR_INDETERMINATE (-110)
 typedef struct qbudget {
     size_t bytes;
 } qbudget;
@@ -1364,9 +1371,25 @@ struct jr_ops {
      * the ISR, which stages and syncs it under `mname` (replica_stage): the name the marker carries, a part name
      * p<partition>_<pid>_<n>_0.part (the partition is in no part file); returns when they have */
     int (*ship)(void *ctx, struct eng *db, const char *file, const char *mname, uint64_t size);
-    /* the marker whose last position is `last` is durable at the leader: returns once the commit point passed it and the
-     * replicas applied it (the leader's own apply follows), or an error (nothing is then published) */
+    /* the marker whose last position is `last` is durable at the leader: returns once the commit point passed it (the
+     * driver's view), or an error (nothing is then published). May be NULL. The engine then waits for its own copy of
+     * the commit point (eng_leader_commit) in any case: that wait is what a deposed leader ends (eng_leader_depose).
+     * A driver that fails this wait because the leader was deposed calls eng_leader_depose first: a failed wait on a
+     * leader that is not deposed fails the engine (the marker may be applied by a replica). */
     int (*wait)(void *ctx, struct eng *db, uint64_t last);
+    /* admission (design-cluster.md 5.1 step 1): under buf_lock, for every record before it is buffered (rows: a batch of
+     * `span` rows numbered fno .. fno + span - 1, which may join the open rows record; a marker: its fno and span),
+     * after everything that can fail has (nothing can refuse the record once this returned 0). Non-zero refuses the
+     * write with nothing buffered and the numbers not advanced; the code is the write's (definitely not applied: the
+     * driver answers min_isr, not leading). The driver hands out the core's positions here (repl_write) under its core
+     * mutex, which is a leaf below buf_lock, and fails the volume if they are not `fno`. Must not block. May be NULL. */
+    int (*admit)(void *ctx, struct eng *db, uint64_t fno, uint32_t span);
+    /* the bytes of records just written to segment `seq` at offset `off` (whole records, sealed: byte for byte what the
+     * segment holds), positions first .. last, called by the WAL writer role after its write() and before its
+     * fdatasync (5.1 step 2), so the sender ships them while the leader syncs. Must not block (copy or queue); the
+     * buffer is the engine's. May be NULL. */
+    void (*bytes)(void *ctx, struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len, uint64_t first,
+                  uint64_t last);
     /* a flushed WAL segment is about to be removed: the driver reads what it still needs (the records of the segment
      * not yet sent). Under flush_lock. */
     void (*seg_done)(void *ctx, struct eng *db, uint64_t seq);
@@ -1395,6 +1418,26 @@ int fno_require(struct eng *db, uint64_t v);
 #include "feed.h"
 void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot);
 int wal_commit(struct eng *db, uint64_t target);
+/* A leader (db->jr) and its commit point (design-cluster.md C7, 4.2, 5.1). Positions are log numbers: with the WAL on,
+ * a memtable row's lsn is its fno and a marker's is its last fno (fno + span - 1), so wal_appended and wal_durable are
+ * positions too and compare with the commit point directly. The commit point depends only on positions already
+ * appended (and shipped by the bytes callback), never on an engine lock: a wait for it may hold flush_lock, cls_rw
+ * or jr_serial (a flush, a large write's lw_enter, a DROP) without blocking its progress.
+ * eng_leader_attach: installs ops; TSDB_ERR_INVALID without the WAL or with wal_sync_ms != 0 (a periodic sync would
+ * acknowledge before durability). eng_leader_commit: the driver's commit point moved to pos (never back).
+ * eng_wal_durable_fno: the last position durable in the leader's own log (the core's own durable end).
+ * eng_leader_depose: refuses every write from now on (TSDB_ERR_UNAVAILABLE, nothing buffered) and wakes every wait
+ * for the commit point with TSDB_ERR_INDETERMINATE; the engine is not failed. */
+int eng_leader_attach(struct eng *db, const struct jr_ops *ops);
+void eng_leader_commit(struct eng *db, uint64_t pos);
+uint64_t eng_wal_durable_fno(struct eng *db);
+void eng_leader_depose(struct eng *db);
+/* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
+ * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
+ * held). Takes lead_mu only (a leaf). */
+int eng_leader_wait(struct eng *db, uint64_t pos, bool hook);
+/* test hook: called by the WAL writer role just before the leader's fdatasync of a write (tests/test_replica.c) */
+extern void (*wal_test_sync_hook)(struct eng *db);
 int wal_open(struct eng *db, int (*before_replay)(struct eng *));
 void wal_close(struct eng *db);
 void *flusher_main(void *arg);
@@ -1678,7 +1721,7 @@ struct eng {
     _Alignas(64) pthread_mutex_t buf_lock; /* active memtable and pending WAL bytes */
     struct lw_fence *lw_head;      /* large writes between their memtable flush and their publish (buf_lock) */
     memtable *active;
-    uint64_t wal_appended;         /* rows (and one per marker) appended (buf_lock) */
+    uint64_t wal_appended;         /* the last position appended: an fno with the WAL on, else a count (buf_lock) */
     _Alignas(64) uint8_t *wal_buf; /* the pending WAL bytes: this field and the five below, under buf_lock */
     size_t wal_len, wal_cap;
     uint64_t fno_next;             /* the next record number to assign */
@@ -1697,6 +1740,10 @@ struct eng {
     bool wal_enabled;
     struct replica *rp; /* an engine opened as a replica (replica.c): the log arrives verbatim, rows apply at the commit point */
     const struct jr_ops *jr;   /* the replicated backend of a leader (jr_intent), set before the engine is used */
+    atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
+    atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */
+    pthread_mutex_t lead_mu;          /* a leaf: waits for the commit point (lead_cv), its moves, depose, eng_fail */
+    pthread_cond_t lead_cv;
     pthread_mutex_t jr_serial; /* with jr: one large write at a time, lw_enter to lw_leave (marker order = block order) */
     int wal_fd;
     uint64_t wal_seq;
@@ -1714,7 +1761,7 @@ struct eng {
     atomic_uint_fast64_t st_fno_syncs;
     bool parts_v8;                    /* META said parts_v8=1 at open: format-8 part headers are valid here (upgrade) */
     bool v8_meta;                     /* META still says it (db->lock): v8_parts_account takes it out when none is left */
-    atomic_uint_fast64_t wal_durable; /* rows durable */
+    atomic_uint_fast64_t wal_durable; /* the last position durable (with the WAL on: an fno; see eng_leader_commit) */
     int64_t last_wal_sync_ms;
     int bg_error;
     bool flusher_stop;
@@ -1832,6 +1879,17 @@ int eng_sync_dir(struct eng *db, const char *what);
 static inline int eng_check(struct eng *db)
 {
     return atomic_load_explicit(&db->failed, memory_order_acquire) ? TSDB_ERR_IO : 0;
+}
+/* The last position a reader may see: in sync mode what is durable, and on a leader no further than the commit point
+ * (C7: a leader applies only up to it, as every replica does). Unchanged for every other engine. */
+static inline uint64_t eng_visible(struct eng *db)
+{
+    uint64_t v = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
+    if (db->jr && eng_test_mutant != MUT_LEADER_VISIBLE_DURABLE) {
+        uint64_t c = atomic_load(&db->lead_commit);
+        v = c < v ? c : v;
+    }
+    return v;
 }
 /* The abandon flag of the request this thread runs (tsdb_set_abandon_flag; ha.md 15.3): a request parked on a stuck
  * volume is told to discard its work. Checked at the two places where a request's effects become visible or
