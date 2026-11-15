@@ -1322,16 +1322,14 @@ static void wal_unlink_upto(eng *db, uint64_t seq, const fseg *info)
         feed_cleaner_wake(db);
 }
 
-/* A leader's kept segments whose last position is at or below min(keep bound, commit point) go, oldest first; one
- * whose unlink fails stays at the head (wal_unlink_upto retries it). flush_lock held. */
-static void leader_unlink_due(eng *db)
+/* Kept segments whose last position is at or below `bound` go, oldest first, FNO holding their end first; one whose
+ * unlink fails stays at the head (wal_unlink_upto retries it). flush_lock held. */
+static void lk_unlink_upto(eng *db, uint64_t bound)
 {
-    uint64_t bound = atomic_load(&db->lead_keep), c = atomic_load(&db->lead_commit);
-    bound = MIN(bound, c);
-    if (eng_test_mutant == MUT_LEADER_KEEP_IGNORED) /* planted: a flushed segment goes at once */
-        bound = UINT64_MAX - 1;
     size_t n = 0;
     while (!db->lk_stuck && n < db->nlk && db->lk[n].fno_end - 1 <= bound) {
+        if (fno_require(db, db->lk[n].fno_end) != 0)
+            break; /* the engine failed */
         wal_unlink_upto(db, db->lk[n].seq, NULL);
         if (db->wal_unlink_next != 0)
             break; /* it failed: it stays, and every later one behind it */
@@ -1343,19 +1341,39 @@ static void leader_unlink_due(eng *db)
     db->nlk -= n;
 }
 
-static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
+/* A leader's kept segments go once their last position is at or below min(keep bound, commit point) */
+static void leader_unlink_due(eng *db)
+{
+    uint64_t bound = atomic_load(&db->lead_keep), c = atomic_load(&db->lead_commit);
+    bound = MIN(bound, c);
+    if (eng_test_mutant == MUT_LEADER_KEEP_IGNORED) /* planted: a flushed segment goes at once */
+        bound = UINT64_MAX - 1;
+    lk_unlink_upto(db, bound);
+}
+
+static int lk_push(eng *db, uint64_t seq, uint64_t fno_end)
 {
     if (db->nlk == db->caplk) {
         size_t c = db->caplk ? 2 * db->caplk : 16;
         void *p = realloc(db->lk, c * sizeof *db->lk);
-        if (!p) {
-            db->lk_stuck = true; /* the segment stays; a later one must not go before it */
-            return;
-        }
+        if (!p)
+            return TSDB_ERR_NOMEM;
         db->lk = p;
         db->caplk = c;
     }
     db->lk[db->nlk++] = (struct lkseg){seq, fno_end};
+    return 0;
+}
+
+static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
+{
+    /* RSTATE names it as holding nothing outside the parts before it can outlive a drop of its rows: a writer's open
+     * neither replays nor removes it (fails the engine on error) */
+    leader_rs_kept(db, seq);
+    if (lk_push(db, seq, fno_end) != 0) {
+        db->lk_stuck = true; /* the segment stays; a later one must not go before it */
+        return;
+    }
     leader_unlink_due(db);
 }
 
@@ -1428,8 +1446,11 @@ int flush_waiting(eng *db)
             replica_flushed(db, m->wal_seq, m->fno_end);
         else if (mrc == 0 && eng_jr(db)) /* a leader keeps it for the replicas (eng_leader_keep) */
             leader_flushed(db, m->wal_seq, m->fno_end);
-        else if (mrc == 0)
+        else if (mrc == 0) {
             wal_unlink_upto(db, m->wal_seq, NULL); /* else MANIFEST may still name it: a follower would tail it */
+            if (db->nlk) /* kept segments a writer's open found (RSTATE's `kept`), with no leader to keep them for */
+                lk_unlink_upto(db, UINT64_MAX - 1);
+        }
         if (mrc == 0)
             mrc = cls_flush_guard(db, m); /* a series of a long class that got fast moves on now */
         mt_unref(m);
@@ -1951,9 +1972,19 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         rc = feed_open_numbers(db); /* enable or renew FEED before the first FNO store (and so before the replay) */
     if (rc == 0 && before_replay)
         rc = before_replay(db);
+    uint64_t kept = 0; /* segments up to it hold nothing outside the parts (a leader's or a promoted replica's) */
+    if (rc == 0 && nseg)
+        rc = rs_kept_seq(db, &kept);
     for (size_t k = 0; k < nseg && rc == 0; k++) {
         uint8_t *buf;
         size_t len;
+        if (segs[k].seq <= kept) {
+            /* not replayed: a drop after their flush took rows out of parts, which a replay would bring back; kept
+             * for the leader's replicas (eng_leader_keep), removed by a writer that is not one at its next flush */
+            if (!ro)
+                rc = lk_push(db, segs[k].seq, segs[k].fno_end ? segs[k].fno_end : 1);
+            continue;
+        }
         if ((rc = read_file(db->dirfd, segs[k].name, &buf, &len)) != 0)
             break;
         /* the segment's rows go into a memtable of their own (the active one

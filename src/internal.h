@@ -65,7 +65,7 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_BYTES_AFTER_SYNC, MUT_LEADER_MARKER_RC, MUT_LEADER_GATE_NOHOOK,
        MUT_LEADER_NO_SYNCED, MUT_REPLICA_RS_COMMITTED_TRUE, MUT_REPLICA_RS_COMMITTED_FALSE, MUT_REPLICA_DROP_NO_SAVE,
        MUT_LEADER_CLOSE_FLUSH, MUT_LEADER_NO_RSTATE, MUT_LEADER_CLOSE_WAIT, MUT_LEADER_KEEP_IGNORED,
-       MUT_LEADER_NO_HARDLINK, MUT_PROMOTE_NO_CARRY };
+       MUT_LEADER_NO_HARDLINK, MUT_PROMOTE_NO_CARRY, MUT_KEPT_REPLAYED, MUT_LEADER_KEPT_NOSAVE };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1409,11 +1409,16 @@ int jr_intent(struct eng *db, enum jr_kind kind, const void *arg);
  * jr_precommit: under publish_lock right before the parts_commit of a COMMIT whose marker this thread appended: records
  * the COMMIT as `doing` (position, first block) in RSTATE. leader_rs_drop: after a leader's DROP retired its
  * partitions (eng_drop_before; drop_retire's jr_commit runs under db->lock, where no I/O belongs). Fail the engine on
- * a failed save. leader_rs_open: eng_leader_attach loads RSTATE (a promoted replica's) into db->lrs. */
+ * a failed save. leader_rs_open: eng_leader_attach loads RSTATE (a promoted replica's) into db->lrs. leader_rs_kept:
+ * after a leader's flush of segment `seq` (flush_lock): RSTATE's `kept` says that segments up to it hold nothing outside
+ * the parts. rs_kept_seq: wal_open reads that bound (0 without RSTATE): it neither replays nor removes those segments
+ * (a drop after their flush took their rows out of parts) and puts them on db->lk. */
 void jr_commit(struct eng *db, enum jr_kind kind, const void *arg);
 int jr_precommit(struct eng *db, size_t n);
 int leader_rs_drop(struct eng *db, int64_t ts);
 int leader_rs_open(struct eng *db);
+int leader_rs_kept(struct eng *db, uint64_t seq);
+int rs_kept_seq(struct eng *db, uint64_t *seq);
 
 #define FNO_FILE "FNO"
 /* Log numbers stay below FNO_LIMIT (a record at or above it is not one: wal_record). A bound read at open (a slot, a
@@ -1787,7 +1792,8 @@ struct eng {
     size_t latest_cache_asked; /* the caller's opt.latest_cache (a replica runs with 0; replica_promote restores it) */
     struct lkseg {
         uint64_t seq, fno_end;
-    } *lk;                       /* with jr: flushed segments kept for the replicas, oldest first (flush_lock) */
+    } *lk; /* flushed segments kept for the replicas, oldest first (flush_lock); also those a writer's open found at or
+            * below RSTATE's `kept` (a writer that is not a leader removes them at its next flush) */
     size_t nlk, caplk;
     bool lk_stuck;               /* a push failed: no segment goes until a reopen (wal_removed must not pass one) */
     struct lkfile {

@@ -52,6 +52,8 @@ struct rstate {
         int64_t until; /* dropped_before */
     } *drops;
     size_t ndrops;
+    uint64_t kept; /* the wal_ segments up to this seq hold no row outside the parts: a writer's open neither replays nor
+                    * removes them (a leader's flushed segments kept for its replicas, a promoted replica's) */
 };
 
 struct replica {
@@ -806,7 +808,7 @@ int replica_missing(eng *db, char *name, size_t cap, uint64_t *size)
 
 static int rs_save(eng *db, struct rstate *rs)
 {
-    size_t n = 8 + 4 * 8 + 8 + rs->ndrops * 16 + 8, o = 0;
+    size_t n = 8 + 4 * 8 + 8 + rs->ndrops * 16 + 8 + 8, o = 0;
     uint8_t *b = malloc(n);
     if (!b)
         return TSDB_ERR_NOMEM;
@@ -820,6 +822,7 @@ static int rs_save(eng *db, struct rstate *rs)
         put64(b + o, rs->drops[i].pos), o += 8;
         put64(b + o, (uint64_t)rs->drops[i].until), o += 8;
     }
+    put64(b + o, rs->kept), o += 8;
     put64(b + o, xxh64(b, o, 0));
     int fd = openat(db->dirfd, RS_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int rc = fd < 0 || write_full(fd, b, n) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
@@ -844,9 +847,9 @@ static int rs_load(eng *db, struct rstate *rs)
     int rc = read_file(db->dirfd, RS_FILE, &b, &len);
     if (rc)
         return rc;
-    bool ok = len >= 56 && get64(b) == RS_MAGIC && get64(b + len - 8) == xxh64(b, len - 8, 0);
+    bool ok = len >= 64 && get64(b) == RS_MAGIC && get64(b + len - 8) == xxh64(b, len - 8, 0);
     uint64_t nd = ok ? get64(b + 40) : 0;
-    ok = ok && nd <= (len - 56) / 16 && len == 56 + nd * 16;
+    ok = ok && nd <= (len - 64) / 16 && len == 64 + nd * 16;
     if (!ok) {
         free(b);
         fprintf(stderr, "tsdb: %s: RSTATE is damaged: the replica's state is lost, rebuild it\n", db->dir);
@@ -868,8 +871,18 @@ static int rs_load(eng *db, struct rstate *rs)
         }
         rs->ndrops = nd;
     }
+    rs->kept = get64(b + 48 + nd * 16);
     free(b);
     return 0;
+}
+
+int rs_kept_seq(eng *db, uint64_t *seq)
+{
+    struct rstate rs = {0};
+    int rc = rs_load(db, &rs);
+    free(rs.drops);
+    *seq = rc == 0 && eng_test_mutant != MUT_KEPT_REPLAYED ? rs.kept : 0;
+    return rc;
 }
 
 /* A drop whose position lies below every retained record cannot matter to a replay any more */
@@ -1977,14 +1990,15 @@ int replica_epoch_begin(eng *db, uint64_t epoch, const char *owner, uint64_t *po
 /* Turns the replica engine into a writer: `*dbp` is closed and its directory opened again as a leader's, which the
  * caller then equips (db->jr). Only when nothing uncommitted can be in the way: the EPOCH marker at `epoch_pos` and
  * everything before it is applied, the log is applied to its end and durable, no COMMIT is waiting for its files and
- * the active memtable is empty. Everything applied is put into parts and the replica's segments are removed (FNO holds
- * the log's end first, so numbers go on from it), as a writer's open would do with a log it replays: the new writer
- * never meets a segment whose rows a drop has taken out of parts; the newest (the epoch's, with no rows) stays for the
- * writer's open to replay and remove, which keeps its own segment numbers above it. The numbers continue (fno_next = the log end + 1), the
- * writer's first segment is above the epoch's. A failure leaves the replica as it was, or (a crash in the middle)
- * with a log from which a replica open or a writer's open recovers; TSDB_ERR_INVALID: a precondition does not hold.
+ * the active memtable is empty. Everything applied is put into parts (FNO holds the log's end first, so numbers go on
+ * from it) and the replica's segments stay, named in RSTATE (`kept`) as holding nothing outside the parts: the writer's
+ * open neither replays them (rows a drop took out of parts would come back) nor removes them, and the leader keeps them
+ * for its replicas until the driver's keep bound passes them (eng_leader_keep). The numbers continue (fno_next = the
+ * log end + 1), the writer's first segment is above the epoch's. A failure leaves the replica as it was, or (a crash
+ * after RSTATE was saved) a directory a replica open or a writer's open recovers; TSDB_ERR_INVALID: a precondition does
+ * not hold.
  * The writer gets the caller's latest_cache (a replica runs without the table) and the replica's RSTATE. */
-void (*replica_test_promote_hook)(void); /* test hook: after the segments are removed, before the engine is closed */
+void (*replica_test_promote_hook)(void); /* test hook: after RSTATE names the kept segments, before the engine is closed */
 
 int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
 {
@@ -2040,18 +2054,14 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
         free(seqs);
         return TSDB_ERR_NOMEM;
     }
-    /* oldest first: a crash leaves a log that starts later, which a replica's open accepts */
-    for (size_t i = 0; i + 1 < ns && eng_test_mutant != MUT_REPLICA_PROMOTE_KEEP_SEGS; i++) { /* not the newest: the epoch's */
-        char nm[64];
-        wal_name(nm, sizeof nm, seqs[i]);
-        if (unlinkat(db->dirfd, nm, 0) != 0 && errno != ENOENT) {
-            rc = TSDB_ERR_IO;
-            break;
-        }
-        if (eng_sync_dir(db, "fsync of the directory after removing a replica's segment") != 0) {
-            rc = TSDB_ERR_IO;
-            break;
-        }
+    /* Every segment stays (the catch-up source of the new leader's replicas, eng_leader_keep): none holds a row outside
+     * the parts, which RSTATE says before the writer's open sees them, so the open neither replays them (a drop's rows
+     * would come back) nor removes them; the newest is the epoch's, and the writer's first segment is above it. */
+    if (ns && eng_test_mutant != MUT_REPLICA_PROMOTE_KEEP_SEGS) { /* planted: the segments stay, unnamed in RSTATE */
+        pthread_mutex_lock(&rp->mu);
+        rp->rs.kept = MAX(rp->rs.kept, seqs[ns - 1]);
+        rc = rs_save(db, &rp->rs);
+        pthread_mutex_unlock(&rp->mu);
     }
     free(seqs);
     if (rc == 0 && replica_test_promote_hook)
@@ -2317,6 +2327,21 @@ int leader_rs_open(eng *db)
     }
     db->lrs = rs;
     return 0;
+}
+
+int leader_rs_kept(eng *db, uint64_t seq)
+{
+    struct rstate *rs = db->lrs;
+    if (!rs || eng_test_mutant == MUT_LEADER_KEPT_NOSAVE)
+        return 0;
+    pthread_mutex_lock(&db->publish_lock); /* RSTATE's other writers (jr_precommit, jr_commit, leader_rs_drop) hold it */
+    int rc = 0;
+    if (seq > rs->kept) {
+        rs->kept = seq;
+        rc = rs_save(db, rs);
+    }
+    pthread_mutex_unlock(&db->publish_lock);
+    return rc;
 }
 
 int jr_precommit(eng *db, size_t n)

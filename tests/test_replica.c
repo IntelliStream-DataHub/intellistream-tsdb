@@ -2237,10 +2237,35 @@ static int ship_from(eng *src, eng *dst)
     return replica_sync(dst);
 }
 
+static bool seg_exists(const char *dir, uint64_t seq);
+
+/* the seqs of the wal_ segments in dir, ascending */
+static size_t wal_seqs(const char *dir, uint64_t *out, size_t cap)
+{
+    DIR *d = opendir(dir);
+    size_t n = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)))
+        if (wal_file_name(e->d_name) && n < cap)
+            sscanf(e->d_name, "wal_%" SCNx64 ".log", &out[n++]);
+    if (d)
+        closedir(d);
+    for (size_t i = 1; i < n; i++)
+        for (size_t j = i; j > 0 && out[j - 1] > out[j]; j--) {
+            uint64_t t = out[j];
+            out[j] = out[j - 1];
+            out[j - 1] = t;
+        }
+    return n;
+}
+
 /* Promotion: the replica with the log (tail included) writes an EPOCH marker, the commit point passes it, and the engine
  * is a writer that continues the numbers; the other member follows it. variant 0: nothing above the commit point, 1: a
  * tail of small rows, 2: a tail with a large insert (a COMMIT with a staged file). The history holds a drop, whose rows
- * the replica's retained segments still hold: a writer that replayed them would bring them back. */
+ * the replica's retained segments still hold: a writer that replayed them would bring them back. Item 6: those segments
+ * stay, through the promotion and a reopen of the leader, which does not replay them (mutants promotekeepsegs: RSTATE
+ * does not name them, keptreplayed: the open ignores it; the first drop's rows come back), until the keep bound passes
+ * them. */
 static void case_promote(int variant)
 {
     xport x;
@@ -2295,10 +2320,15 @@ static void case_promote(int variant)
         CHECK(eq_range(x.ld, x.rep, s, T0 - 1000, far + 10000, "P: promoted candidate"));
         CHECK(eq_range(x.ld, b, s, T0 - 1000, far + 10000, "P: other member"));
     }
+    uint64_t old[256];
+    size_t nold = wal_seqs(rd, old, 256);
+    CHECK(nold >= 2 && nold < 256);
     CHECK_EQ(replica_promote(&x.rep, pos, &n), 0);
     CHECK(x.rep == NULL && n != NULL);
     if (!n)
         exit(2);
+    for (size_t i = 0; i < nold; i++)
+        CHECK(seg_exists(rd, old[i])); /* the replica's segments stay: the new leader's replicas catch up from them */
     CHECK_EQ(eng_check(n), 0);
     CHECK_EQ(n->fno_next, pos + 1); /* the numbers go on */
     for (uint32_t s = 0; s < NS; s++)
@@ -2308,7 +2338,15 @@ static void case_promote(int variant)
     x.ld = n;
     snprintf(x.ldir, sizeof x.ldir, "%s", rd);
     x.rep = b;
-    x.cseq = x.coff = 0;
+    { /* b holds the log up to the epoch's segment (ship_from), which the writer kept: shipping goes on after it */
+        struct stat st;
+        char p[PATH_MAX + 64], nm2[64];
+        wal_name(nm2, sizeof nm2, old[nold - 1]);
+        snprintf(p, sizeof p, "%s/%s", rd, nm2);
+        CHECK_EQ(stat(p, &st), 0);
+        x.cseq = old[nold - 1];
+        x.coff = (uint64_t)st.st_size;
+    }
     x.noapply = false;
     n->opt.wal_max_batch_rows = 16;
     CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
@@ -2331,6 +2369,17 @@ static void case_promote(int variant)
     xp_step(&x, "P: drop after promotion");
     for (uint32_t s = 0; s < NS; s++)
         CHECK(eq_range(x.ld, x.rep, s, T0 - 1000, far + 10000, "P: far"));
+    /* the leader reopened: the kept segments are neither replayed nor removed; the keep bound past them removes them */
+    eng_close(x.ld);
+    xp_open_leader(&x);
+    for (uint32_t s = 0; s < NS; s++)
+        CHECK(eq_range(x.ld, x.rep, s, T0 - 1000, far + 10000, "P: leader reopened"));
+    for (size_t i = 0; i < nold; i++)
+        CHECK(seg_exists(rd, old[i]));
+    eng_leader_commit(x.ld, ld_last(&x));
+    eng_leader_keep(x.ld, ld_last(&x));
+    for (size_t i = 0; i < nold; i++)
+        CHECK(!seg_exists(rd, old[i]));
     xp_reopen(&x, bd, 0);
     xp_step(&x, "P: member reopened");
     xp_stop(&x);
@@ -2338,8 +2387,9 @@ static void case_promote(int variant)
 
 static void promote_hook_exit(void) { _exit(77); }
 
-/* the process dies after promotion removed the old segments and before it opened the writer: the rows the replica held
- * are in parts, so a writer's open of the directory has what the old leader had (the order flush, then unlink) */
+/* the process dies after promotion named the kept segments in RSTATE and before it opened the writer: the rows the
+ * replica held are in parts, so a writer's open of the directory, which does not replay those segments, has what the
+ * old leader had (the order flush, then RSTATE) */
 static void case_promote_crash(void)
 {
     char ld[PATH_MAX], rd[PATH_MAX];
@@ -2365,6 +2415,15 @@ static void case_promote_crash(void)
     if (a && b)
         for (uint32_t s = 0; s < NS; s++)
             CHECK(eq_range(a, b, s, T0 - 1000, T0 + 40 * DAY_MS + 10000, "P: a writer's open after the crash"));
+    if (b) { /* a writer that is not a leader removes the kept segments at its first flush */
+        uint64_t sq[256];
+        CHECK(wal_seqs(rd, sq, 256) >= 3); /* the kept ones and the writer's own */
+        float v = 1;
+        int64_t t = T0 + 41 * DAY_MS;
+        CHECK_EQ(eng_insert_series(b, TSDB_FLOAT32, 0, &t, &v, 1), 0);
+        CHECK_EQ(eng_flush(b), 0);
+        CHECK_EQ(wal_seqs(rd, sq, 256), 1);
+    }
     if (a)
         eng_close(a);
     if (b)
@@ -3998,7 +4057,9 @@ static int mutant_of(const char *m)
                         : strcmp(m, "closewait") == 0 ? MUT_LEADER_CLOSE_WAIT
                         : strcmp(m, "keepignored") == 0 ? MUT_LEADER_KEEP_IGNORED
                         : strcmp(m, "nohardlink") == 0 ? MUT_LEADER_NO_HARDLINK
-                        : strcmp(m, "promotenocarry") == 0 ? MUT_PROMOTE_NO_CARRY : 0;
+                        : strcmp(m, "promotenocarry") == 0 ? MUT_PROMOTE_NO_CARRY
+                        : strcmp(m, "keptreplayed") == 0 ? MUT_KEPT_REPLAYED
+                        : strcmp(m, "leaderkeptnosave") == 0 ? MUT_LEADER_KEPT_NOSAVE : 0;
 }
 
 int main(int argc, char **argv)
@@ -4055,6 +4116,9 @@ int main(int argc, char **argv)
         case_leader_keep();
         case_hardlink();
         case_leader_read();
+        for (int v = 0; v < 3; v++)
+            case_promote(v);
+        case_promote_crash();
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
     }
