@@ -48,6 +48,8 @@ static const row rows[] = {
     {TSDB_OP_QUERY_TWA, R, 0, "query_twa"},
     {TSDB_OP_QUERY_MULTI, R, 0, "query_multi"},
     {TSDB_OP_QUERY_LATEST, R, 0, "query_latest"},
+    {TSDB_OP_STATS_SERIES, R, 0, "stats_series"},
+    {TSDB_OP_STATS_TENANTS, R, 0, "stats_tenants"},
     {TSDB_OP_STATE, F, 1, "state create"},
     {TSDB_OP_STATE, R, 0, "state lookup"},
     {TSDB_OP_STATE_NAME, R, 0, "state_name"},
@@ -117,6 +119,8 @@ static size_t build(const row *s, uint8_t *b)
         b[0] = TSDB_OP_QUERY_VALUES; put32(b + 4, 1); put32(b + 16, 24); put64(b + 24, id);
         put64(b + 32, TSDB_MANY_SERIES); put64(b + 40, t0); put64(b + 48, t1); return 56;
     case TSDB_OP_QUERY_LATEST: put32(b + 4, 1); put64(b + 8, (uint64_t)INT64_MAX); put64(b + 16, id); return 24;
+    case TSDB_OP_STATS_SERIES: put32(b, 1); put64(b + 8, id); return 16; /* u32 n, u32 flags, the id */
+    case TSDB_OP_STATS_TENANTS: return 16; /* flags 0, k 0, n 0, cursor 0 */
     default: return 0;
     }
 }
