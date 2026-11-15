@@ -845,7 +845,7 @@ static void lookup_hold(eng *db, const uint32_t *local, size_t m, const int64_t 
     pthread_rwlock_rdlock(&t->rw);
     pthread_mutex_lock(&db->lock);
     pthread_mutex_lock(&db->buf_lock);
-    visible = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
+    visible = eng_visible(db); /* a leader: no further than its commit point */
     if (db->active) {
         act = db->active;
         mt_ref(act);

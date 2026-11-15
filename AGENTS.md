@@ -114,7 +114,10 @@ cgroup, so `nice` does not keep your work out of its way.
 - `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable. Nothing that holds `buf_lock` may touch a large block of fresh memory (the series array is a lazily touched
   mapping, `mt_s_grow`), and big buffers freed on the flush path go through `tsdb_free_big` (`src/compat.h`): a `munmap`
   or a memset of tens of MB stalls every append and lookup for ms (`tests/test_flush_tail.c`). `src/fno.c`: the `FNO` file (the
-  durable bound of the WAL's log numbers). `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
+  durable bound of the WAL's log numbers). `src/replfile.c`: a replica directory's REPL file (rid, open generation,
+  fence, `led`, epoch history, log start, commit floor; FNO's two-slot scheme; a load with one bad slot is "unsure": the
+  open generation skips a belt and the caller takes fence, `led` and log start from the metadata group, never from the
+  surviving slot; `tests/test_replfile.c`, `fuzz_repl`). `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
   decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
 - `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
   per-partition vectors, the HyperLogLogs of active series, the hot lists (reads, writes, bytes per row) and the
@@ -524,7 +527,13 @@ cgroup, so `nice` does not keep your work out of its way.
   `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
   that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
   the warmer take `latest_rw` (read) > `db->lock`, a lookup then `buf_lock` in sub-holds. The window's `pmu`/`pcv` (a writer
-  waits there with no other lock, `lt_end` takes `pmu` under `latest_rw`) and the warmer's hint mutex are leaves. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
+  waits there with no other lock, `lt_end` takes `pmu` under `latest_rw`) and the warmer's hint mutex are leaves. A leader's
+  `lead_mu` (its commit point, `eng_leader_wait`; src/memtable.c) is a leaf: `eng_fail` takes it last to wake the
+  waiters; a wait for the commit point may hold `flush_lock`, `cls_rw` or `jr_serial`, because the commit point moves on
+  positions already appended and needs no engine lock. A driver's `jr_ops.admit` runs under `buf_lock`, so `buf_lock` >
+  the driver's core mutex > `lead_mu`, `fail_lock` (under its mutex the driver may call `eng_leader_commit`,
+  `eng_leader_depose`, `eng_fail`, which take only those; `eng_leader_depose` takes no `buf_lock`: admit may call it).
+  A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
   not yet appended anything, so nothing a registered large write waits for (a flush, the WAL writer role,
   `publish_lock`, `cls_rw`) waits for it. The write wait hook (`tsdb_set_write_wait_hook`) is a leaf: its +1 and
   the waiter's -1 run with no engine lock, the large write's -1 (`lw_leave`) with `cls_rw` held for reading; tsdbd's

@@ -881,6 +881,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->manifest_lock, NULL);
     pthread_mutex_init(&db->publish_lock, NULL);
     pthread_mutex_init(&db->jr_serial, NULL);
+    pthread_mutex_init(&db->lead_mu, NULL);
+    pthread_cond_init(&db->lead_cv, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
     pthread_mutex_init(&db->tl_mu, NULL);
@@ -976,6 +978,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         if (rc != 0)
             goto fail;
     }
+    if (db->wal_enabled) /* positions are log numbers: what the open found is the durable end (eng_leader_commit) */
+        db->wal_appended = db->fno_next - 1, atomic_store(&db->wal_durable, db->fno_next - 1);
     if (!ro) {
         if (!db->rp)
             db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
@@ -1192,6 +1196,8 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->manifest_lock);
     pthread_mutex_destroy(&db->publish_lock);
     pthread_mutex_destroy(&db->jr_serial);
+    pthread_mutex_destroy(&db->lead_mu);
+    pthread_cond_destroy(&db->lead_cv);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);
     pthread_mutex_destroy(&db->tl_mu);
@@ -1222,6 +1228,11 @@ void eng_fail(eng *db, const char *what, int err)
         atomic_store_explicit(&db->failed, true, memory_order_release);
     }
     pthread_mutex_unlock(&db->fail_lock);
+    if (eng_jr(db)) { /* a leader's waits for the commit point end (indeterminate); lead_mu, a leaf, after the store */
+        pthread_mutex_lock(&db->lead_mu);
+        pthread_cond_broadcast(&db->lead_cv);
+        pthread_mutex_unlock(&db->lead_mu);
+    }
 }
 
 /* Every WAL segment unlinked before a directory fsync stays unlinked after a power loss: wal_removed_synced
@@ -1394,7 +1405,7 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
     lw_fence f;
     if ((rc = lw_fence_rows(&f, series, cs, ts, n)) != 0)
         return rc;
-    rc = lw_enter(db, &f) ? mt_flush(db) : 0;
+    rc = lw_enter(db, &f) ? leader_unappended(mt_flush(db)) : 0; /* nothing of this insert is appended yet */
     if (rc == 0 && ucls == -2) { /* fresh series: their class comes from these rows */
         rc = cls_classify_insert(db, series, cs, ts, n);
         ucls = -1;
@@ -1452,7 +1463,7 @@ int eng_flush(eng *db)
     if (db->opt.read_only)
         return 0;
     int rc = eng_commit(db);
-    int rc2 = mt_flush(db);
+    int rc2 = leader_unappended(mt_flush(db)); /* a flush is a request of its own: refused, not indeterminate */
     return rc ? rc : rc2;
 }
 
@@ -1469,11 +1480,11 @@ int eng_drop_before(eng *db, int64_t ts)
      * COMMIT and waits for its commit point publishes its parts first, or this DROP's marker would come after the
      * COMMIT in every replica's log while the leader retired the partition before the publish (a replica would drop
      * the rows the leader keeps) */
-    const bool serial = db->jr && eng_test_mutant != MUT_REPLICA_NO_DROP_SERIAL;
+    const bool serial = eng_jr(db) && eng_test_mutant != MUT_REPLICA_NO_DROP_SERIAL;
     if (serial)
         pthread_mutex_lock(&db->jr_serial);
     int rc = jr_intent(db, JR_DROP, &ts);
-    if (rc == 0 && !db->jr)
+    if (rc == 0 && !eng_jr(db))
         rc = eng_flush(db);
     if (rc == 0)
         rc = drop_retire(db, ts);

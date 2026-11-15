@@ -679,6 +679,18 @@ static void wal_rec_close(eng *db)
     }
 }
 
+/* A leader's admission of a record before it is buffered (jr_ops.admit; buf_lock held): a deposed leader refuses
+ * every write, definitely not applied (the request may go to the new leader). */
+static int leader_admit(eng *db, uint64_t fno, uint32_t span)
+{
+    const struct jr_ops *jr = eng_jr(db);
+    if (!jr)
+        return 0;
+    if (atomic_load(&db->lead_deposed))
+        return TSDB_ERR_UNAVAILABLE;
+    return jr->admit ? jr->admit(jr->ctx, db, fno, span) : 0;
+}
+
 /* Appends rows to the pending WAL buffer and numbers them (*fno0 gets the first); caller holds buf_lock. Rows of
  * successive batches join one record while no marker comes between them (their numbers stay contiguous). Fails
  * without side effects. */
@@ -701,6 +713,10 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
         db->wal_buf = b;
         db->wal_cap = cap;
     }
+    /* a leader admits the batch last: after it, nothing may fail (its driver has handed out the positions) */
+    int arc = eng_test_mutant == MUT_LEADER_ADMIT_AFTER ? 0 : leader_admit(db, db->fno_next, (uint32_t)n);
+    if (arc)
+        return arc;
     if (!extend) {
         wal_rec_close(db); /* a record that reached its cap ends here: its count must be in its header */
         uint8_t *h = db->wal_buf + db->wal_len;
@@ -725,6 +741,8 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
         memcpy(p + 12, &x, 8);
     }
     db->wal_len = need;
+    if (eng_test_mutant == MUT_LEADER_ADMIT_AFTER) /* planted: the refusal comes with the batch already buffered */
+        return leader_admit(db, *fno0, (uint32_t)n);
     return 0;
 }
 
@@ -752,6 +770,8 @@ static int wal_marker_locked(eng *db, uint16_t type, uint16_t flags, uint32_t sp
             db->wal_buf = b, db->wal_cap = cap;
     }
     uint64_t lsn = 0;
+    if (rc == 0)
+        rc = leader_admit(db, db->fno_next, span); /* last: nothing below fails */
     if (rc == 0) {
         wal_rec_close(db); /* the marker follows the rows record: it takes no more rows */
         uint8_t *h = db->wal_buf + db->wal_len;
@@ -767,7 +787,7 @@ static int wal_marker_locked(eng *db, uint16_t type, uint16_t flags, uint32_t sp
             *fno = db->fno_next;
         db->fno_next += span;
         db->wal_len += WAL_HDR + plen;
-        lsn = ++db->wal_appended;
+        lsn = db->wal_appended = db->fno_next - 1; /* its last position (eng_leader_commit) */
     }
     *lsn_out = lsn;
     return rc;
@@ -820,7 +840,10 @@ static void wal_writer_leave(eng *db)
 /* Writes a record of the rows in buf (WAL_HDR spare bytes first) to fd and
  * syncs it. On failure the engine is failed (eng_fail) before it returns:
  * the caller holds the writer role and has not woken anyone yet. */
-static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t *buf, size_t len)
+void (*wal_test_sync_hook)(eng *db);
+
+/* `last`: the last position in buf (a leader's bytes callback gets it; the first is in the first record's header). */
+static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t *buf, size_t len, uint64_t last)
 {
     if (len == 0)
         return 0;
@@ -831,6 +854,18 @@ static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t 
         eng_fail(db, "WAL write", errno);
         return TSDB_ERR_IO;
     }
+    /* a leader hands the bytes to its sender before it syncs (design-cluster.md 5.1 step 2): the replicas write and
+     * sync them while it does, and the commit point needs only both */
+    const struct jr_ops *jr = eng_jr(db);
+    bool bytes = jr && jr->bytes;
+    uint64_t first = 0;
+    if (bytes)
+        memcpy(&first, buf + 16, 8);
+    if (bytes && eng_test_mutant != MUT_LEADER_BYTES_AFTER_SYNC)
+        jr->bytes(jr->ctx, db, seq, *off, buf, len, first, last);
+    void (*sh)(eng *) = __atomic_load_n(&wal_test_sync_hook, __ATOMIC_RELAXED);
+    if (sh)
+        sh(db);
     if (db->opt.fsync) {
         if (tsdb_fdatasync(fd) != 0) {
             eng_fail(db, "WAL fdatasync", errno);
@@ -838,12 +873,24 @@ static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t 
         }
         atomic_fetch_add_explicit(&db->st_wal_syncs, 1, memory_order_relaxed);
     }
+    if (bytes && eng_test_mutant == MUT_LEADER_BYTES_AFTER_SYNC) /* planted: shipped only after the sync */
+        jr->bytes(jr->ctx, db, seq, *off, buf, len, first, last);
     atomic_fetch_add_explicit(&db->st_wal_bytes, len, memory_order_relaxed);
     /* the last record of the write: what the revalidation reads again */
     db->wal_last_seq = seq, db->wal_last_off = *off + last_pos, db->wal_last_len = len - last_pos;
     db->wal_last_hash = last_hash;
     *off += len;
     return 0;
+}
+
+/* The WAL writer role made the log durable up to `upto`: readers and waiters see it, and a leader's driver is told
+ * (jr_ops.synced), in position order because the role is held by one thread at a time. */
+static void wal_durable_set(eng *db, uint64_t upto)
+{
+    atomic_store(&db->wal_durable, upto);
+    const struct jr_ops *jr = eng_jr(db);
+    if (jr && jr->synced && eng_test_mutant != MUT_LEADER_NO_SYNCED)
+        jr->synced(jr->ctx, db, upto);
 }
 
 /* Makes every row appended up to `target` durable: group commit. Returns 0
@@ -880,17 +927,79 @@ int wal_commit(eng *db, uint64_t target)
         db->wal_len = 0;
         pthread_mutex_unlock(&db->buf_lock);
 
-        rc = wal_write_sync(db, fd, seq, &db->wal_off, buf, len);
+        rc = wal_write_sync(db, fd, seq, &db->wal_off, buf, len, upto);
         db->wal_spare = buf;
         db->wal_spare_cap = cap;
         if (rc == 0)
-            atomic_store(&db->wal_durable, upto);
+            wal_durable_set(db, upto);
 
         pthread_mutex_lock(&db->wal_sync_lock);
         db->wal_writing = false;
         pthread_cond_broadcast(&db->wal_cv);
     }
     pthread_mutex_unlock(&db->wal_sync_lock);
+    return rc;
+}
+
+/* ------------------------------------------------------- a leader's commit point (internal.h, eng_leader_attach) */
+
+/* set by mem_insert around its backpressure flush: the flush gate's wait holds a (server) writer's thread */
+static __thread bool gate_hook;
+
+int eng_leader_attach(eng *db, const struct jr_ops *ops)
+{
+    if (!db->wal_enabled || db->opt.wal_sync_ms != 0 || db->rp || db->opt.read_only)
+        return TSDB_ERR_INVALID;
+    __atomic_store_n(&db->jr, ops, __ATOMIC_RELEASE); /* the flusher, warmer and merges are running already */
+    return 0;
+}
+
+void eng_leader_commit(eng *db, uint64_t pos)
+{
+    pthread_mutex_lock(&db->lead_mu);
+    if (pos > atomic_load(&db->lead_commit)) /* never back: the core's commit point does not go back either */
+        atomic_store(&db->lead_commit, pos);
+    pthread_cond_broadcast(&db->lead_cv);
+    pthread_mutex_unlock(&db->lead_mu);
+}
+
+uint64_t eng_wal_durable_fno(eng *db) { return atomic_load(&db->wal_durable); }
+
+void eng_leader_depose(eng *db)
+{
+    /* no buf_lock: the driver may depose from admit (under buf_lock) or under its core mutex (below buf_lock) */
+    atomic_store(&db->lead_deposed, true);
+    pthread_mutex_lock(&db->lead_mu);
+    pthread_cond_broadcast(&db->lead_cv);
+    pthread_mutex_unlock(&db->lead_mu);
+}
+
+int eng_leader_wait(eng *db, uint64_t pos, bool hook)
+{
+    if (atomic_load(&db->lead_commit) >= pos)
+        return 0;
+    void (*fn)(void *, int) = NULL;
+    void *ctx = NULL;
+    if (hook) {
+        pthread_mutex_lock(&db->buf_lock);
+        fn = db->wait_fn, ctx = db->wait_ctx;
+        pthread_mutex_unlock(&db->buf_lock);
+        if (fn)
+            fn(ctx, 1);
+    }
+    int rc = 0;
+    pthread_mutex_lock(&db->lead_mu);
+    while (atomic_load(&db->lead_commit) < pos) {
+        /* eng_fail and eng_leader_depose broadcast under lead_mu after their store: no wake-up is lost */
+        if (atomic_load(&db->lead_deposed) || eng_check(db)) {
+            rc = TSDB_ERR_INDETERMINATE;
+            break;
+        }
+        pthread_cond_wait(&db->lead_cv, &db->lead_mu);
+    }
+    pthread_mutex_unlock(&db->lead_mu);
+    if (fn)
+        fn(ctx, -1);
     return rc;
 }
 
@@ -990,7 +1099,7 @@ void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end)
 
 bool lw_enter(eng *db, lw_fence *f)
 {
-    if (db->jr) /* a leader of a replicated volume: marker order is block order (design-cluster.md 5.2) */
+    if (eng_jr(db)) /* a leader of a replicated volume: marker order is block order (design-cluster.md 5.2) */
         pthread_mutex_lock(&db->jr_serial);
     pthread_mutex_lock(&db->lock); /* nflushing changes under db->lock, the active memtable under both */
     pthread_cond_init(&f->cv, NULL);
@@ -1022,7 +1131,7 @@ void lw_leave(eng *db, lw_fence *f)
         free(f->r);
     else if (f->r)
         lw_table_put(); /* no one reads it any more: unlinked under buf_lock */
-    if (db->jr)
+    if (eng_jr(db))
         pthread_mutex_unlock(&db->jr_serial);
     f->r = NULL;
     f->r_heap = false;
@@ -1067,8 +1176,11 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     if (db->active->rows >= 2 * db->opt.buffer_rows) {
         pthread_mutex_unlock(&db->buf_lock);
         int frc = eng_abandoned(); /* a parked request starts no flush on a stuck volume */
-        if (frc == 0)
-            frc = mt_flush(db);
+        if (frc == 0) {
+            gate_hook = true; /* this thread may be a server's: its wait in the flush gate is reported */
+            frc = leader_unappended(mt_flush(db)); /* a deposed leader's flush: this write was not appended */
+            gate_hook = false;
+        }
         if (frc)
             return frc;
         pthread_mutex_lock(&db->buf_lock);
@@ -1108,8 +1220,8 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
      * write would become visible. After the fence wait, so a request parked behind a large write sees the flag. */
     if (rc == 0)
         rc = eng_abandoned();
-    /* wal_appended counts rows the WAL holds: a refusal before the append adds none, or a flush would wait for
-     * rows that never come (wal_durable never reaches them) */
+    /* wal_appended is the last position the WAL holds: a refusal before the append adds none, or a flush would wait
+     * for rows that never come (wal_durable never reaches them) */
     if (rc == 0)
         rc = mt_reserve_rows(db->active, series, cs, n); /* before the WAL: after it, nothing may fail */
     bool counted = rc == 0;
@@ -1121,7 +1233,7 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
             mt_unreserve(db->active, series, n); /* no mt_add clears the counts */
     }
     if (rc == 0) {
-        rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_appended + 1, type);
+        rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_enabled ? fno0 : db->wal_appended + 1, type);
         if (rc && db->wal_enabled)
             eng_fail(db, "adding a write the WAL holds to the memtable", ENOMEM); /* cannot happen: room reserved */
     }
@@ -1129,8 +1241,8 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
      * when it is sealed (mt_flush: db->fno_rows_hi), not a store of both on the memtable's line with every call */
     if (rc == 0 && fno0 && !db->active->fno_lo)
         db->active->fno_lo = fno0;
-    if (counted)
-        db->wal_appended += n;
+    if (counted) /* the last position: with the WAL on, the batch's last fno (the leader's commit point is one too) */
+        db->wal_appended = db->wal_enabled ? fno0 + n - 1 : db->wal_appended + n;
     uint64_t lsn = db->wal_appended;
     size_t rows = db->active->rows;
     if (rows >= db->opt.buffer_rows)
@@ -1140,6 +1252,13 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         hook(hook_ctx, -1);
     if (rc == 0 && db->wal_enabled && db->opt.wal_sync_ms == 0)
         rc = wal_commit(db, lsn); /* a failure is eng_fail: indeterminate, and the server exits */
+    /* A leader acknowledges once the commit point passed the batch (C7): a failover keeps what it acknowledged. The
+     * wait holds a server thread for a replica's round trip and fdatasync (about one fdatasync longer than a write on
+     * a plain engine), so it is reported through the write wait hook like a fence wait: tsdbd starts another worker
+     * rather than run out of them while writes wait for replicas. Deposed or failed: TSDB_ERR_INDETERMINATE (the batch
+     * is in the log, and a replica may have it). */
+    if (rc == 0 && eng_jr(db) && counted)
+        rc = eng_leader_wait(db, lsn, true);
     return rc; /* an applied write is a success: the flush that backpressure wants comes before the next write */
 }
 
@@ -1177,8 +1296,9 @@ static void wal_unlink_upto(eng *db, uint64_t seq, const fseg *info)
     if (db->wal_enabled) {
         bool feed = atomic_load(&db->feed_on); /* changed only under flush_lock */
         for (uint64_t s = db->wal_unlink_next ? db->wal_unlink_next : seq; s <= seq; s++) {
-            if (db->jr && db->jr->seg_done) /* a leader's driver reads what it still has to send of it */
-                db->jr->seg_done(db->jr->ctx, db, s);
+            const struct jr_ops *jr = eng_jr(db);
+            if (jr && jr->seg_done) /* a leader's driver reads what it still has to send of it */
+                jr->seg_done(jr->ctx, db, s);
             if (wal_retire_name(db, s, feed, s == seq ? info : NULL) != 0 && errno != ENOENT) {
                 char name[64];
                 wal_name(name, sizeof name, s);
@@ -1207,6 +1327,15 @@ int flush_waiting(eng *db)
         memtable *m = db->flushing[i]; /* only flush_lock holders change the list's members */
         part_list pl = {0};
         if ((rc = eng_check(db)) != 0) /* e.g. the MANIFEST rewrite in mt_flush failed */
+            break;
+        /* A leader writes rows into parts only once they are committed (C7): no part has fno_hi above the commit point,
+         * and a deposed leader has nothing uncommitted outside its log, which the new leader's history cuts. Deposed:
+         * TSDB_ERR_INDETERMINATE, and m stays in flushing (the retry rule). Holding flush_lock is safe: the commit
+         * point needs no engine lock (eng_leader_wait). The write wait hook is told only for a small write's
+         * backpressure flush (gate_hook): the flusher is not a server thread, and a large write's thread may be
+         * counted already by a small write waiting on its fence (lw_fence held). */
+        if (eng_jr(db) && db->wal_enabled && eng_test_mutant != MUT_LEADER_FLUSH_UNCOMMITTED &&
+            (rc = eng_leader_wait(db, m->fno_end - 1, gate_hook && eng_test_mutant != MUT_LEADER_GATE_NOHOOK)) != 0)
             break;
         cls_freeze(db); /* one history from placing its rows until they are listed (classes.c) */
         rc = mt_write(db, m, &pl);
@@ -1340,10 +1469,12 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
             db->wal_fd = newfd;
             db->wal_seq = seq;
             db->flushing[db->nflushing++] = m;
+            int mrc = 0; /* the marker's own result: the old segment's write below must not hide a refusal (admit) */
             if (marker) { /* the first record of the new segment */
                 uint32_t span;
                 memcpy(&span, mbody + 4, 4);
-                rc = wal_marker_locked(db, marker->type, marker->flags, span, mbody + MK_HDR, mlen - MK_HDR, fno, &mlsn);
+                mrc = wal_marker_locked(db, marker->type, marker->flags, span, mbody + MK_HDR, mlen - MK_HDR, fno,
+                                        &mlsn);
                 marker = NULL;
             }
             pthread_mutex_unlock(&db->buf_lock);
@@ -1351,13 +1482,18 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
             if (db->wal_enabled) {
                 /* the rest of the old segment; a part will hold these rows, but
                  * until then the segment is what makes them durable */
-                rc = wal_write_sync(db, oldfd, oldseq, &oldoff, buf, len);
+                rc = wal_write_sync(db, oldfd, oldseq, &oldoff, buf, len, upto);
                 close(oldfd);
                 if (rc == 0)
-                    atomic_store(&db->wal_durable, upto);
+                    wal_durable_set(db, upto);
             }
             free(buf);
             manifest_publish(db); /* followers start tailing the new segment */
+            /* a marker refused here (a leader's admission: min_isr, not leading, deposed) was not appended: the call
+             * fails, the sealed memtable stays in flushing for the next flush (a DROP never retires without its
+             * marker) */
+            if (rc == 0 && eng_test_mutant != MUT_LEADER_MARKER_RC)
+                rc = mrc;
         }
     }
     if (marker && rc == 0)
@@ -1421,7 +1557,7 @@ void *flusher_main(void *arg)
         if (rc == 0)
             graveyard_purge(db, false);
         pthread_mutex_lock(&db->buf_lock);
-        if (rc && !db->bg_error)
+        if (rc && !db->bg_error && rc != TSDB_ERR_INDETERMINATE) /* a deposed leader refuses writes on its own */
             db->bg_error = rc;
     }
     pthread_mutex_unlock(&db->buf_lock);
@@ -2021,6 +2157,10 @@ int wal_relog(eng *db, const char *dir, uint64_t *rows_out)
     *rows_out = 0;
     if (!db->wal_enabled)
         return 0;
+    /* a leader's rows past the commit point were shipped: a relog that drops them (unacknowledged in sync mode) would
+     * leave positions the replicas hold and the leader does not; a leader that loses its storage is deposed instead */
+    if (eng_jr(db))
+        return TSDB_ERR_INVALID;
     uint64_t visible = db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
     int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dirfd < 0)

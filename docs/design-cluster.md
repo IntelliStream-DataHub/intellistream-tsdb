@@ -412,6 +412,15 @@ Consequences:
   write and the leader applied it, so a client reads its own write on the leader.
 - In sync mode today, a row is visible once the WAL is synced up to it. The cluster replaces "synced" by
   "committed": the same `visible` boundary in `mt_collect`, fed by the commit point instead of `wal_durable`.
+  *Built (r3a-gate):* on a leader (`db->jr`, installed by `eng_leader_attach`, which refuses `wal_sync_ms != 0`) the
+  boundary is `eng_visible` = min(`wal_durable`, the commit point the driver gives `eng_leader_commit`). A memtable
+  row's lsn is its log number (fno) wherever the WAL is on, a marker's its last one, so `wal_durable` and the commit
+  point compare directly (`eng_wal_durable_fno` is the leader's own durable end). `mem_insert` acknowledges once the
+  commit point passed its batch (the wait goes through the write wait hook, so tsdbd starts another worker);
+  `flush_waiting` writes a sealed memtable only once the commit point passed its last position. `eng_leader_depose`
+  refuses every write before it is buffered and ends every wait with an indeterminate result, which is never sent as
+  UNAVAILABLE or MOVED (both promise "not applied"), and does not fail the engine. A relog (ha.md 15.5) is refused on
+  a leader.
 
 **Driver contracts** (*corrected 2026-11-06, gaps 9 and 12*). The replication core is sans-IO; the engine (step 3)
 and tsdbd (step 4) that drive it must keep three rules, which the simulator's naive driver breaks on purpose:
@@ -456,6 +465,20 @@ On the leader, one group commit:
    `fdatasync`, and returns `ACK(log end)`.
 4. When the lowest log end over the ISR passes the record, the leader advances the commit point, makes the rows
    visible and answers the clients whose rows it covered.
+
+*The engine's hooks (r3a-gate; `struct jr_ops`, src/internal.h).* Step 1: `admit(fno, span)` runs under `buf_lock`
+for every record (a batch of rows, which may join the open rows record, or a marker) before it is buffered and after
+everything that can fail; a non-zero return refuses the write with nothing buffered (min_isr, not leading). The driver
+calls `repl_write` there under its core mutex, which comes below `buf_lock` (and above `lead_mu`: under it the driver
+may call `eng_leader_commit`, `eng_leader_depose`, which takes no `buf_lock` and so may be called from `admit` itself,
+and `eng_fail`), and fails the volume if the core's position is not the engine's fno. A marker refused there fails its
+call (a DROP retires nothing). Step 2: `bytes(seq, off, buf, len, first, last)` runs in the WAL writer role after its
+`write()` and before its `fdatasync`, with the sealed bytes of whole records; it must not block. Step 3: `synced(last)`
+runs in the WAL writer role after every sync of the leader's log, in position order (the driver's `repl_synced`, no
+polling). Step 4: the driver calls `eng_leader_commit(pos)`. A deposed leader answers a call whose own record was never
+appended (a write refused before its append, a flush, a large insert, delete or DROP whose first flush the gate ends)
+with UNAVAILABLE; only a call whose record is in the log gets the indeterminate result. A leader's close flushes and
+waits for the commit point: a driver whose commit point can no longer move deposes the leader first.
 
 Latency: `max(leader fdatasync, one-way + replica fdatasync + one-way)`; on A4's hardware about 0.85 ms against
 0.68 ms today. Throughput: group commit amortises both the local and the remote syncs, as it does today for
