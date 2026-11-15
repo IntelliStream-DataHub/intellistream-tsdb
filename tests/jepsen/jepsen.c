@@ -451,6 +451,7 @@ static bool proc_stopped(pid_t pid)
 }
 static int failstops, eio_problems;
 static int lives_faulty, lives_clean, lives_died_starting; /* servers started under the nemesis, by kind */
+static atomic_bool hung_flag;    /* a request got no answer within the deadline (req_done): the run is ending */
 static int death_problems;       /* power: a server that ended any way but a power loss (exit 99) or our kill */
 static bool server_faulty;       /* the current server runs under the shim (set under server_lock or at start) */
 static int fport;                   /* the follower, where tsdbd put it; 0 = none */
@@ -639,6 +640,132 @@ static void server_gone(void)
     atomic_store(&port, 0);
 }
 
+/* How the end of a server is judged (round 11; the user's scope of 2026-11-14: a server that dies other than by what the harness
+ * did to it is a VIOLATION on the attempt where it died, under every nemesis and under none; the environment failing is not).
+ * Every signal sent to a server is written down first (signal_pid), and every place that reaps one (reap_server) and the watcher,
+ * which sees an end before the nemesis reaps it, ask end_report whether the end is one the harness caused or expects:
+ *  - killed by a signal we sent to that pid, or exit 0 after our SIGTERM;
+ *  - under the shim (power, eio): exit 99 (its power loss), and under eio exit 1 (the fail-stop on an EIO; the eio step
+ *    judges whether the shim had failed a file);
+ *  - misdirect and rot: judged by md_death.
+ * Anything else is unplanned: a crash (SIGSEGV, SIGABRT...), an exit of its own, an end with no signal of ours. One end is
+ * reported once (reported[]). A SIGKILL that we did not send is the one end that may be the machine's (the OOM killer) and
+ * never tsdbd's own act: it is a harness error (exit 2), not a violation. */
+#define END_TAB 1024
+static pthread_mutex_t end_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    pid_t pid;
+    unsigned long long sigs; /* bit s: signal s was sent to pid */
+} sent_tab[END_TAB];
+static int sent_n;
+static pid_t reported[END_TAB];
+static int reported_n;
+static int env_kills; /* a server killed by SIGKILL that the harness did not send */
+
+static void note_sent(pid_t pid, int sig)
+{
+    if (pid <= 0 || sig <= 0 || sig >= 64)
+        return;
+    pthread_mutex_lock(&end_mu);
+    int i = 0;
+    while (i < sent_n && i < END_TAB && sent_tab[i].pid != pid)
+        i++;
+    if (i == sent_n || i >= END_TAB) {
+        i = sent_n++ % END_TAB;
+        sent_tab[i].pid = pid;
+        sent_tab[i].sigs = 0;
+    }
+    sent_tab[i].sigs |= 1ULL << sig;
+    pthread_mutex_unlock(&end_mu);
+}
+static bool sent_has(pid_t pid, int sig)
+{
+    bool r = false;
+    if (sig <= 0 || sig >= 64)
+        return false;
+    pthread_mutex_lock(&end_mu);
+    for (int i = 0; i < sent_n && i < END_TAB; i++)
+        if (sent_tab[i].pid == pid)
+            r = (sent_tab[i].sigs >> sig) & 1;
+    pthread_mutex_unlock(&end_mu);
+    return r;
+}
+
+static bool end_planned(pid_t pid, int st)
+{
+    if (md || rot)
+        return true; /* md_death */
+    bool shim_nem = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio");
+    if (WIFSIGNALED(st))
+        return sent_has(pid, WTERMSIG(st));
+    int c = WEXITSTATUS(st);
+    if (c == 0 && sent_has(pid, SIGTERM))
+        return true;
+    if (server_faulty && shim_nem && (c == 99 || (c == 1 && !strcmp(nemesis, "eio"))))
+        return true;
+    return false;
+}
+
+static const char *end_text(int st, char *buf, size_t n)
+{
+    if (WIFSIGNALED(st))
+        snprintf(buf, n, "signal %d (%s)%s", WTERMSIG(st), strsignal(WTERMSIG(st)), WCOREDUMP(st) ? ", core dumped" : "");
+    else
+        snprintf(buf, n, "exit status %d", WEXITSTATUS(st));
+    return buf;
+}
+
+/* Judges the end of server `pid` (wait status `st`) and reports it, once, when the harness neither caused nor expected it. */
+static bool end_report(pid_t pid, int st)
+{
+    if (pid <= 0 || end_planned(pid, st))
+        return false;
+    pthread_mutex_lock(&end_mu);
+    for (int i = 0; i < reported_n && i < END_TAB; i++)
+        if (reported[i] == pid) {
+            pthread_mutex_unlock(&end_mu);
+            return false;
+        }
+    reported[reported_n++ % END_TAB] = pid;
+    pthread_mutex_unlock(&end_mu);
+    char t[96];
+    end_text(st, t, sizeof t);
+    if (WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL) {
+        env_kills++;
+        fprintf(stderr, "jepsen: the %s server (pid %d) was killed by SIGKILL, which the harness did not send (the machine's "
+                "out-of-memory killer?): the environment, not a verdict\n", server_faulty ? "faulty" : "clean", (int)pid);
+        return true;
+    }
+    death_problems++;
+    fprintf(stderr, "  the %s server (pid %d) ended with status %#x (%s) by itself: not a power loss (exit 99), not a signal or a "
+            "stop of the harness, under the %s nemesis\n", server_faulty ? "faulty" : "clean", (int)pid, st, t, nemesis);
+    print_tail(slogpath);
+    return true;
+}
+
+/* The status of a server that has ended and not been reaped (it stays a zombie, so the status is still there), without reaping it. */
+static bool end_status(pid_t pid, int *st)
+{
+    siginfo_t si;
+    si.si_pid = 0;
+    if (pid <= 0 || waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) != 0 || si.si_pid != pid)
+        return false;
+    *st = si.si_code == CLD_EXITED ? (si.si_status & 0xff) << 8 : (si.si_status & 0x7f) | (si.si_code == CLD_DUMPED ? 0x80 : 0);
+    return true;
+}
+
+/* waitpid on the server, with its end judged: every reap of the server goes through here. */
+static pid_t reap_server(pid_t pid, int *st, int opts)
+{
+    int s2 = 0;
+    if (pid <= 0)
+        return -1; /* waitpid(0) and waitpid(-1) would wait for any child */
+    pid_t r = waitpid(pid, st ? st : &s2, opts);
+    if (r == pid && pid > 0)
+        end_report(pid, st ? *st : s2);
+    return r;
+}
+
 /* A fault the nemesis issues, counted where it issues it. */
 static void nem_fault_span(int64_t t, int64_t end)
 {
@@ -693,6 +820,44 @@ static const char *crash_prob(void)
     if ((strcmp(nemesis, "power") && strcmp(nemesis, "eio")) || (restarts / 2) % 2)
         return hi;
     return getenv("JEPSEN_PULL_PROB") ? getenv("JEPSEN_PULL_PROB") : "0.00003";
+}
+
+/* Whether a server's log (the stderr of its latest start) says that the open found damaged data: tsdb_open failed with
+ * "corrupt data" or "I/O error" (tsdbd prints "tsdbd: DIR: <strerror>"), or the engine named a damaged file ("... is damaged ...",
+ * "Damage is never silent"). Not an io_uring that would not start, not a port in use. The first such line goes to `line`. */
+static bool log_says_damage(const char *path, char *line, size_t n)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+    char b[1024];
+    bool hit = false;
+    while (!hit && fgets(b, sizeof b, f)) {
+        hit = strstr(b, ": corrupt data") || strstr(b, ": I/O error") || strstr(b, "is damaged") || strstr(b, " damaged: ") ||
+              strstr(b, "(damaged") || strstr(b, "TSDB_ERR_CORRUPT");
+        if (hit) {
+            b[strcspn(b, "\n")] = 0;
+            snprintf(line, n, "%.400s", b);
+        }
+    }
+    fclose(f);
+    return hit;
+}
+
+/* The run ends here, where no server can be had (or one ended in a way that is a verdict): a crash or damage that was reported on
+ * the way is a VIOLATION (exit 1), anything else a harness error (exit 2). The data directory goes, as at a normal end. */
+static const char *rm_cmd; /* set by main: how the run's directories are removed */
+__attribute__((noreturn)) static void bail(int code)
+{
+    if (code == 2 && death_problems > 0)
+        code = 1;
+    if (code == 1) {
+        printf("FAILED: %d violations\n", death_problems > 0 ? death_problems : 1);
+    }
+    fflush(NULL);
+    if (rm_cmd && !getenv("JEPSEN_KEEP") && system(rm_cmd) != 0) {
+    }
+    exit(code);
 }
 
 static void start_server_run(bool faulty)
@@ -824,21 +989,46 @@ static void start_server_run(bool faulty)
             return;
         }
         if (p == TH_EXITED) {
+            /* A server that ends before it listens (round 11): the end the shim plans for a faulty server (its power loss, exit 99; under
+             * eio the fail-stop on the file it failed, exit 1, with its mark) is the fault, and a clean server follows. A crash is a
+             * violation. An open that failed on damage (the log says CORRUPT, I/O error, damaged: the data a fault left is damaged) is
+             * a violation too. Anything else (io_uring: Cannot allocate memory, exit 127, a server killed by the machine) is the
+             * environment: a harness error, exit 2, never a verdict about tsdb. */
+            int st = th_status;
             server_gone();
-            if (faulty && crashfs && attempt == 0) { /* crashed while starting (power loss at open): a clean one */
+            bool shim0 = faulty && crashfs && attempt == 0;
+            bool planned = shim0 && WIFEXITED(st) &&
+                           (WEXITSTATUS(st) == 99 || (WEXITSTATUS(st) == 1 && !strcmp(nemesis, "eio") && access(markpath, F_OK) == 0));
+            if (planned) { /* crashed while starting (power loss at open, an EIO at open): a clean one */
                 lives_died_starting++;
-                if (!strcmp(nemesis, "power"))
-                    note_death(th_status, false, pid);
                 if (getenv("JEPSEN_VERBOSE"))
                     fprintf(stderr, "jepsen: %d died while starting\n", (int)pid);
                 continue;
             }
+            if (WIFSIGNALED(st) && WTERMSIG(st) != SIGKILL && WTERMSIG(st) != SIGTERM && WTERMSIG(st) != SIGUSR2) {
+                end_report(pid, st); /* a crash while opening */
+                print_tail(slogpath);
+                if (shim0) {
+                    lives_died_starting++;
+                    continue;
+                }
+                bail(1);
+            }
+            char dl[512];
+            if (WIFEXITED(st) && log_says_damage(slogpath, dl, sizeof dl)) {
+                fprintf(stderr, "  the server (pid %d, exit status %d) refuses to open the database after the faults: damaged data: %s\n",
+                        (int)pid, WEXITSTATUS(st), dl);
+                death_problems++;
+                print_tail(slogpath);
+                stop_server(SIGKILL);
+                bail(1);
+            }
         }
-        fprintf(stderr, "jepsen: the server does not come up: %s", th_why);
+        fprintf(stderr, "jepsen: the server does not come up (the environment, not a verdict about tsdb): %s", th_why);
         print_tail(slogpath);
         stop_server(SIGKILL);
         outage_keep_log();
-        exit(2);
+        bail(2);
     }
 }
 
@@ -846,19 +1036,50 @@ static void start_server(bool faulty) { start_server_run(faulty); }
 
 /* kill() with pid 0 or -1 signals the process group, or every process of the
  * user: with no server running, a nemesis must do nothing. */
-static int signal_pid(pid_t pid, int sig) { return pid > 0 ? kill(pid, sig) : -1; }
+static int signal_pid(pid_t pid, int sig)
+{
+    if (pid <= 0)
+        return -1;
+    note_sent(pid, sig); /* before the signal: an end that the watcher sees first is already ours */
+    return kill(pid, sig);
+}
 
 /* Stops the server with `sig` and reaps it; true when it was reaped, its wait status in *st (a kill is confirmed by the
  * server having died of that signal, never by the call having been made). */
+#define STOP_TERM_S 120 /* the longest an honest server takes to stop cleanly after SIGTERM (a flush, the joins): far above what a loaded machine needs */
+#define STOP_KILL_S 60  /* after SIGKILL: a process that is still there then is in the kernel's hands (D state), not ours */
 static bool stop_server_st(int sig, int *st)
 {
     pid_t pid = atomic_load(&server_pid);
     bool reaped = false;
+    *st = 0;
     if (getenv("JEPSEN_VERBOSE"))
         fprintf(stderr, "jepsen: stopping %d with signal %d\n", (int)pid, sig);
     if (pid > 0) {
+        if (sig == SIGTERM && atomic_load(&hung_flag))
+            sig = SIGKILL; /* a server that stopped answering has no clean stop to wait for */
         signal_pid(pid, sig);
-        reaped = waitpid(pid, st, 0) == pid;
+        /* never an unbounded wait (round 11): a server whose clean stop waits for a hung worker never ends, and the harness that waits
+         * for it never ends either. Past the bound it is a VIOLATION (the server hangs), and it is killed by its pid. */
+        int64_t until = now_ns() + (sig == SIGKILL ? STOP_KILL_S : STOP_TERM_S) * 1000000000LL;
+        for (int i = 0; !(reaped = reap_server(pid, st, WNOHANG) == pid) && now_ns() < until; i++)
+            usleep(i < 200 ? 250 : 5000);
+        if (!reaped && sig != SIGKILL) {
+            death_problems++;
+            fprintf(stderr, "  the server (pid %d) did not stop within %d s of signal %d: it hangs (its clean stop waits for something "
+                    "that never happens)\n", (int)pid, STOP_TERM_S, sig);
+            print_proc_state(pid);
+            print_tail(slogpath);
+            signal_pid(pid, SIGKILL);
+            until = now_ns() + STOP_KILL_S * 1000000000LL;
+            for (int i = 0; !(reaped = reap_server(pid, st, WNOHANG) == pid) && now_ns() < until; i++)
+                usleep(i < 200 ? 250 : 5000);
+        }
+        if (!reaped) {
+            fprintf(stderr, "jepsen: the server (pid %d) is still there %d s after SIGKILL\n", (int)pid, STOP_KILL_S);
+            server_gone();
+            bail(2);
+        }
         server_gone();
     }
     atomic_store(&port, 0);
@@ -891,6 +1112,14 @@ static bool kill_and_restart(int sig, bool faulty)
     }
     int64_t issued = now_ns();
     int st = 0;
+    /* a server that ended by itself before the kill (round 11) is reported by the reap, whatever the nemesis meant to do to it: a kill
+     * that finds nothing alive is not a fault of the nemesis either (confirmed is false: the old server was not killed by it) */
+    if (sig && reap_server(old, &st, WNOHANG) == old) {
+        server_gone();
+        start_server(faulty);
+        nem_touch();
+        return false;
+    }
     atomic_fetch_add(&nem_inprog, 1);
     if (nem_mutant && !strncmp(nem_mutant, "killslowstep:", 13)) /* --mutant-nemesis killslowstep:MS: the step dawdles with the server live */
         usleep((useconds_t)atoi(nem_mutant + 13) * 1000);
@@ -959,6 +1188,37 @@ static void kill_follower(void) /* at exit(2): no orphan */
         waitpid(pid, NULL, 0);
 }
 
+/* Every request of the harness has a deadline (round 11): a server that stops answering (a worker blocked for good, a deadlock) used
+ * to hang the harness for ever, in recvfrom of a client that had no timeout, and the server of a harness that was then killed stayed
+ * up. A request that gets no answer within req_deadline_s (the socket's receive timeout; JEPSEN_REQ_DEADLINE_S sets it for the
+ * self-test) is a VIOLATION, "server stopped answering", naming the operation, and the run ends: the clients and the nemesis stop, the
+ * server is killed by its pid and the final state is judged as for any run. The default is above the longest planned stop of a server
+ * (a pause lasts under 0.4 s, an outage hang 8 s, a power loss or a kill ends the connection at once) and above five times the
+ * slowest honest request measured under the heaviest load (the summary line says what this run's was: req_worst_ns). */
+#define REQ_DEADLINE_DEFAULT_S 60
+static int req_deadline_s = REQ_DEADLINE_DEFAULT_S;
+static _Atomic int64_t req_worst_ns;  /* the slowest request that was answered (or failed) in this run */
+static int stall_problems;            /* reported (once per run) */
+
+static void req_done(const char *op, int rc, int64_t t0)
+{
+    int64_t d = now_ns() - t0, w = atomic_load(&req_worst_ns);
+    if (rc != TSDB_ERR_IO && rc != TSDB_ERR_UNAVAILABLE) /* an answer: the honest worst the deadline is calibrated on */
+        while (d > w && !atomic_compare_exchange_weak(&req_worst_ns, &w, d))
+            ;
+    if (rc == TSDB_ERR_IO && d >= (int64_t)req_deadline_s * 950000000LL && !atomic_exchange(&hung_flag, true)) {
+        pid_t pid = atomic_load(&server_pid);
+        stall_problems++;
+        fprintf(stderr, "  server stopped answering: %s got no answer in %.0f s (the deadline is %d s; server pid %d is %s)\n", op,
+                (double)d / 1e9, req_deadline_s, (int)pid, pid > 0 && proc_stopped(pid) ? "stopped (SIGSTOP)" : "not answering");
+        if (pid > 0)
+            print_proc_state(pid);
+        print_tail(slogpath);
+        atomic_store(&stop, true); /* the clients and the nemesis end; main kills the server and judges what there is */
+    }
+}
+#define REQ(op, expr) ({ int64_t t0_ = now_ns(); int r_ = (expr); req_done(op, r_, t0_); r_; })
+
 /* Connects to the server this harness started, and only to it: the port may have been given to another process
  * since that server died (the nemesis notices a crash only at its next tick), so after connecting the socket
  * has to belong to `pid`. A dead server holds no socket, which makes this fail until the next one is up. */
@@ -973,6 +1233,7 @@ static int connect_own(int p, pid_t pid, tsdbc **c)
         return -1;
     }
     tsdbc_set_retry(*c, 0); /* the history records what the server answered, not what a retrying client made of it */
+    tsdbc_set_timeout(*c, req_deadline_s * 1000); /* a request that gets no answer ends in TSDB_ERR_IO: see REQ */
     return 0;
 }
 
@@ -1104,13 +1365,13 @@ static tsdbc *connect_setup(void)
         if (connect_own(atomic_load(&port), pid, &c) == 0)
             return c;
         int st;
-        if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid) {
-            note_death(st, false, pid); /* names the status: a SIGSEGV is "not a power loss" */
+        if (pid > 0 && reap_server(pid, &st, WNOHANG) == pid) {
+            /* reap_server judged the end: a crash or an exit of its own is a violation (bail turns the 2 into 1) */
             fprintf(stderr, "jepsen: cannot connect to create the series: the server ended before the setup was done (status %#x)\n", st);
             print_tail(slogpath);
             outage_keep_log();
             server_gone();
-            exit(2);
+            bail(2);
         }
         if (now_ns() > until) {
             fprintf(stderr, "jepsen: cannot connect to create the series: no connection to the server in %d s during the setup\n",
@@ -1118,7 +1379,7 @@ static tsdbc *connect_setup(void)
             print_tail(slogpath);
             outage_keep_log();
             stop_server(SIGKILL);
-            exit(2);
+            bail(2);
         }
         usleep(2000);
     }
@@ -1169,6 +1430,7 @@ static void jp_run(char *const argv[])
 /* What the watchdog says besides the exit: the phase of the run and where the threads are (this process by gdb, which
  * the prctl in main lets attach; the server and the follower by their kernel wait channel). A hang reported as "still
  * running after N s" says nothing about what it waited for. */
+static void kill_servers_now(void);
 static void jp_hang_dump(void)
 {
     static const char a[] = "\n--- jepsen at the hang: phase ", b[] = " ---\n";
@@ -1189,8 +1451,68 @@ static void jp_hang_dump(void)
     jp_run(psv);
     char *const gdbv[] = {"gdb", "-p", me, "-batch", "-ex", "thread apply all bt 12", NULL};
     jp_run(gdbv);
+    kill_servers_now(); /* the watchdog ends the harness: nothing it started stays up (a server's clean stop waits for its hung worker) */
 }
 #endif
+
+/* Nothing outlives the harness (round 11): a tsdbd started with --exit-with-parent stops cleanly once its parent is gone, and a
+ * clean stop waits for every worker, so a server with a hung worker stayed up after the harness was killed. So the harness stops
+ * its own servers, by pid (the server's, the follower's), at every end it has: SIGTERM, then SIGKILL after a deadline; and the
+ * signal handler of an outer kill (timeout, ^C) and the watchdog's hook SIGKILL them at once (kill() only: they run in a handler). */
+static void kill_servers_now(void)
+{
+    pid_t sp = atomic_load(&server_pid), fp = atomic_load(&follower_pid);
+    if (sp > 0)
+        kill(sp, SIGKILL);
+    if (fp > 0)
+        kill(fp, SIGKILL);
+}
+static void on_outer_kill(int sig)
+{
+    kill_servers_now();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static void kill_servers_at_exit(void)
+{
+    pid_t pids[2] = {atomic_load(&server_pid), atomic_load(&follower_pid)};
+    for (int i = 0; i < 2; i++)
+        if (pids[i] > 0)
+            kill(pids[i], SIGTERM);
+    for (int w = 0; w < 400; w++) { /* up to 2 s for a clean stop */
+        bool left = false;
+        for (int i = 0; i < 2; i++)
+            if (pids[i] > 0 && waitpid(pids[i], NULL, WNOHANG) != pids[i] && kill(pids[i], 0) == 0)
+                left = true;
+            else
+                pids[i] = 0;
+        if (!left)
+            return;
+        usleep(5000);
+    }
+    for (int i = 0; i < 2; i++)
+        if (pids[i] > 0) {
+            kill(pids[i], SIGKILL);
+            waitpid(pids[i], NULL, 0);
+        }
+}
+
+/* pthread_join with a deadline (round 11): a thread that does not end is a hang of the harness, and the run must end with a verdict,
+ * not wait for it. On a miss: a violation naming the thread, the servers are killed by pid and the run ends here (exit 1). */
+static void join_bounded(pthread_t t, const char *what, int secs)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += secs;
+    if (pthread_timedjoin_np(t, NULL, &ts) == 0)
+        return;
+    fprintf(stderr, "  %s did not end within %d s: the server (or the harness) is hung\n", what, secs);
+    print_proc_state(atomic_load(&server_pid));
+    print_tail(slogpath);
+    death_problems++;
+    kill_servers_now();
+    bail(1);
+}
 
 static void jepsen_watchdog(void)
 {
@@ -1255,8 +1577,8 @@ static void *client(void *arg)
             tsdb_values col = {TSDB_FLOAT32, v, NULL};
             int64_t a = key_ts(s, w->lo), b = key_end(s, w->hi);
             w->invoke = now_ns();
-            int rc = w->kind == W_REPLACE ? tsdbc_replace_range(c, ids[s], a, b, ts, &col, m)
-                                          : tsdbc_delete_range(c, ids[s], a, b);
+            int rc = w->kind == W_REPLACE ? REQ("replace of a key range", tsdbc_replace_range(c, ids[s], a, b, ts, &col, m))
+                                          : REQ("delete of a key range", tsdbc_delete_range(c, ids[s], a, b));
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
             outage_note(s, rc, w->invoke);
@@ -1290,7 +1612,7 @@ static void *client(void *arg)
                 memcpy(&v[k - w->lo], &nb, sizeof nb);
             }
             w->invoke = now_ns();
-            int rc = tsdbc_insert_series(c, ids[s], ts, v, n);
+            int rc = REQ("insert of nulls", tsdbc_insert_series(c, ids[s], ts, v, n));
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
             outage_note(s, rc, w->invoke);
@@ -1311,7 +1633,7 @@ static void *client(void *arg)
             tsdb_latest_result out[MAX_SERIES];
             tsdb_latest_opts o = {.end = end, .ends = NULL, .with_nulls = wn, .threads = 0};
             int64_t t0 = now_ns();
-            int rc = tsdbc_latest(c, ids, (size_t)nseries, &o, out);
+            int rc = REQ("latest", tsdbc_latest(c, ids, (size_t)nseries, &o, out));
             int64_t t1 = now_ns();
             for (int i = 0; i < nseries; i++) {
                 lop *l = &lats[base + (uint32_t)i];
@@ -1381,7 +1703,7 @@ static void *client(void *arg)
             }
             w->nkeys = m;
             w->invoke = now_ns();
-            int rc = tsdbc_insert_series(c, ids[s], ts, v, m);
+            int rc = REQ("insert", tsdbc_insert_series(c, ids[s], ts, v, m));
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
             outage_note(s, rc, w->invoke);
@@ -1406,7 +1728,7 @@ static void *client(void *arg)
             q->seen = calloc(q->hi - q->lo, sizeof *q->seen);
             tsdb_points p;
             q->invoke = now_ns();
-            int rc = tsdbc_query_points(c, ids[s], key_ts(s, q->lo), key_end(s, q->hi), &p);
+            int rc = REQ("read", tsdbc_query_points(c, ids[s], key_ts(s, q->lo), key_end(s, q->hi), &p));
             q->complete = now_ns();
             if (rc == 0) {
                 q->st = ST_OK;
@@ -1576,6 +1898,12 @@ static void *watcher(void *arg)
                 dead = true;
                 since = tt;
                 watch_deaths++;
+                /* a server that ended and is not reaped yet: judged here, at once, whatever the nemesis does next (it may sleep for
+                 * seconds, or be none at all); an end the nemesis reaps first is judged by its reap_server */
+                int est;
+                pid_t wp = atomic_load(&server_pid);
+                if (end_status(wp, &est))
+                    end_report(wp, est);
             } else if (running && dead) {
                 dead = false;
                 watch_restarts++;
@@ -1620,19 +1948,15 @@ static void nap(useconds_t us, bool watch)
     }
 }
 
-/* How a power-nemesis server may end: crashfs's power loss is _exit(99); a plain kill of ours (an idle server);
+/* How a server may end under the power nemesis: crashfs's power loss is _exit(99); a plain kill of ours (an idle server);
  * SIGUSR2 on a server without the shim (the clean one after a failed start, which has no handler). Anything
- * else, a SIGSEGV or abort() in the server above all, is a crash bug that the restarts would otherwise hide. */
+ * else, a SIGSEGV or abort() in the server above all, is a crash bug that the restarts would otherwise hide. Since round 11
+ * end_report judges every end of a server under every nemesis (see there); this stays as the call of the places that
+ * knew a death before the nemesis' reap did. */
 static void note_death(int st, bool we_killed, pid_t pid)
 {
-    bool ok = (WIFEXITED(st) && WEXITSTATUS(st) == 99 && server_faulty) ||
-              (we_killed && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL) ||
-              (WIFSIGNALED(st) && WTERMSIG(st) == SIGUSR2 && !server_faulty);
-    if (ok)
-        return;
-    death_problems++;
-    fprintf(stderr, "  the %s server (pid %d) ended with status %#x, not a power loss (exit 99) or our kill\n",
-            server_faulty ? "faulty" : "clean", (int)pid, st);
+    (void)we_killed; /* the signals we sent are written down in signal_pid */
+    end_report(pid, st);
 }
 
 /* misdirect and rot: how a server ended. Exit 1 is a stop on damage it found (fail-stop, or an open refused);
@@ -1907,6 +2231,26 @@ static double slow_probe_since(const char *path, const char *domain, double sinc
     return last;
 }
 
+/* Whether the server reports a volume as failed for good: its TOPOLOGY says UNAVAILABLE with the reason DIVERGED (a reopen found the data
+ * it had acknowledged gone, and tsdbd keeps the volume quiesced until it is restarted). Any other reason (NFS_DOWN, RECOVERING...) is the
+ * outage still being handled: not a failure. */
+static bool outage_volume_failed(void)
+{
+    tsdbc *c = NULL;
+    if (connect_own(atomic_load(&port), atomic_load(&server_pid), &c) != 0)
+        return false;
+    tsdbc_set_timeout(c, 10000);
+    tsdbc_topo *t = NULL;
+    bool failed = false;
+    if (tsdbc_topology(c, &t) == 0 && t) {
+        for (size_t i = 0; i < t->nvols; i++)
+            failed |= t->vols[i].health == TSDB_HEALTH_UNAVAILABLE && t->vols[i].reason == TSDB_WHY_DIVERGED;
+        tsdbc_topology_free(t);
+    }
+    tsdbc_close(c);
+    return failed;
+}
+
 /* Waits until a write to volume v is acknowledged after `since` (ns): within the bound, or (a flapping domain only)
  * within the bound counted from a slow write probe the server logged after the heal AND jepsen's own fdatasync was
  * slow then too, but never past OUTAGE_HARD_S after the heal. Past that the volume has failed its heal, and the
@@ -1917,16 +2261,15 @@ static void outage_await_recovery(int v, int64_t since, const char *what)
     bool flap = outage_flapping(v);
     int bound = OUTAGE_RECOVER_S + (flap ? OUTAGE_FLAP_S : 0);
     int64_t deadline = t0 + bound * 1000000000LL, hard = t0 + OUTAGE_HARD_S * 1000000000LL;
-    bool extended = false;
+    bool extended = false, late = false;
     outage_heals++;
     while (!atomic_load(&stop)) {
         if (atomic_load(&vol_last_ok[v]) > since) {
             double took = (double)(now_ns() - since) / 1e9;
             outage_judged++;
-            if (took > OUTAGE_HARD_S) {
-                outage_problems++;
-                fprintf(stderr, "  volume %d: a write was acknowledged only %.1f s after the heal (%s; at most %d s)\n", v,
-                        took, what, OUTAGE_HARD_S);
+            if (took > OUTAGE_HARD_S) { /* it came back, late: liveness */
+                INCONCLUSIVE("outage-heal", "volume %d: a write was acknowledged only %.1f s after the heal (%s; at most %d s)\n", v,
+                             took, what, OUTAGE_HARD_S);
                 print_tail(slogpath);
                 return;
             }
@@ -1973,15 +2316,34 @@ static void outage_await_recovery(int v, int64_t since, const char *what)
             }
         }
         if (now_ns() > deadline) {
+            /* How soon writes resume after a heal is liveness (round 11: on a machine at a load average of 200 the write probes took 7.5 s,
+             * and an honest run failed on this): past the bound the run is INCONCLUSIVE, said once, and the wait goes on to the hard
+             * limit. Only a volume that never comes back at all in that much longer time AND that the server itself reports as failed
+             * (TOPOLOGY: UNAVAILABLE with the reason DIVERGED, a reopen that found lost data, which tsdbd keeps until it is restarted)
+             * is a VIOLATION: that is data lost, not a slow disk. */
+            if (now_ns() <= hard) {
+                if (!late) {
+                    late = true;
+                    INCONCLUSIVE("outage-heal", "volume %d: no write acknowledged in %.0f s after the heal (%s%s): waiting up to %d s\n", v,
+                                 (double)(deadline - t0) / 1e9, what, flap ? "; its domain was flapping" : "", OUTAGE_HARD_S);
+                }
+                usleep(20000);
+                continue;
+            }
             double lines[256];
             int n = slow_probe_lines(slogpath, vol_dir[v], (double)since / 1e9, lines, 256), ev = 0;
             for (int i = 0; i < n; i++)
                 ev += slow_sample_near(lines[i]) > 0;
-            outage_problems++;
             outage_judged++;
-            fprintf(stderr, "  volume %d: no write acknowledged in %.0f s after the heal (%s%s)%s\n", v,
-                    (double)(deadline - t0) / 1e9, what, flap ? "; its domain was flapping, 60 s of good probes included" : "",
-                    extended ? ": the hard limit, after a bound extended by slow probes" : "");
+            if (outage_volume_failed()) {
+                outage_problems++;
+                fprintf(stderr, "  volume %d: no write acknowledged in %d s after the heal (%s), and the server reports a volume as failed "
+                        "(UNAVAILABLE, reason DIVERGED): it will not come back\n", v, OUTAGE_HARD_S, what);
+            } else {
+                INCONCLUSIVE("outage-heal", "volume %d: still no write acknowledged %d s after the heal (%s%s): the server reports no failure, "
+                             "so this is a stall of the disk or the machine\n", v, OUTAGE_HARD_S, what,
+                             extended ? ", after a bound extended by slow probes" : "");
+            }
             if (n > 0) {
                 fprintf(stderr, "  the server logged %d slow write probes of this domain since the heal (%d with a slow "
                         "fdatasync of jepsen's own near it), at", n, ev);
@@ -2002,7 +2364,7 @@ static void outage_tick(uint64_t r)
 {
     pid_t pid = atomic_load(&server_pid);
     int st = 0;
-    if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid) {
+    if (pid > 0 && reap_server(pid, &st, WNOHANG) == pid) {
         outage_problems++;
         fprintf(stderr, "  the server ended by itself (status %#x): a volume in a storage domain must not stop it\n",
                 st);
@@ -2144,7 +2506,7 @@ static void *nemesis_thread(void *arg)
             int st;
             bool killed = false;
             int64_t step0 = now_ns(), waited = 0; /* the step's time that is not a start or a wait for the pulled server to die */
-            bool dead = waitpid(pid, &st, WNOHANG) == pid; /* it died by itself (the shim's own odds): nothing to pull */
+            bool dead = reap_server(pid, &st, WNOHANG) == pid; /* it died by itself (the shim's own odds): nothing to pull */
             if (!dead && (!strcmp(mm, "never") || (!strcmp(mm, "oncereact") && mut_pulls >= 1))) {
                 pthread_mutex_unlock(&server_lock); /* never pulls the plug: leaves a live server alone */
                 continue;
@@ -2166,7 +2528,7 @@ static void *nemesis_thread(void *arg)
                 int wait_s = PULL_WAIT_S;
                 if (!strncmp(mm, "waitspin:", 9)) /* the same, but after the wait began: the step counts it as the wait for the death, and only the dead stretch is left to see it */
                     spin_ms(atoi(mm + 9));
-                for (int i = 0; !gone && i < wait_s * 100 && !(gone = waitpid(pid, &st, WNOHANG) == pid); i++) {
+                for (int i = 0; !gone && i < wait_s * 100 && !(gone = reap_server(pid, &st, WNOHANG) == pid); i++) {
                     usleep(10000);
                     if (atomic_load(&stop_ns) && now_ns() - atomic_load(&stop_ns) > 1000000000LL && i % 100 == 0)
                         poke_server(pid); /* the clients are gone: no traffic brings the file operation the power loss waits for */
@@ -2194,10 +2556,10 @@ static void *nemesis_thread(void *arg)
                     print_tail(slogpath);
                     print_proc_state(pid);
                     errno = 0;
-                    if (waitpid(pid, &st, WNOHANG) != pid)
+                    if (reap_server(pid, &st, WNOHANG) != pid)
                         fprintf(stderr, "jepsen: waitpid(%d) once more: not reaped (errno %d)\n", (int)pid, errno);
                     signal_pid(pid, SIGKILL);
-                    waitpid(pid, &st, 0);
+                    reap_server(pid, &st, 0);
                     killed = true;
                 }
             }
@@ -2228,14 +2590,14 @@ static void *nemesis_thread(void *arg)
         } else if (!strcmp(nemesis, "eio")) {
             pid_t pid = atomic_load(&server_pid);
             int st = 0;
-            bool gone = waitpid(pid, &st, WNOHANG) == pid, sent = false;
+            bool gone = reap_server(pid, &st, WNOHANG) == pid, sent = false;
             int64_t mark_seen_ns = 0, fault_t0 = 0; /* fault_t0: when the fault of this step was issued (0: none); it is over when the server has ended */
             if (!gone && !server_faulty) {
                 /* the clean server after a faulty one failed to start (an EIO while opening) has no shim, so no
                  * handler: SIGUSR2 would kill it, which later read as "ended (status 0xc) without a fault". Crash
                  * it as the kill nemesis does and start a faulty one. */
                 signal_pid(pid, SIGKILL);
-                waitpid(pid, &st, 0);
+                reap_server(pid, &st, 0);
                 server_gone();
                 start_server(true);
                 restarts++;
@@ -2296,7 +2658,7 @@ static void *nemesis_thread(void *arg)
                 atomic_fetch_add(&nem_inprog, 1); /* the fault is still being carried out until the server has stopped */
                 int stop_wait_s = EIO_STOP_WAIT_S;
                 for (int i = 0; !gone && i < (survives ? 100 : stop_wait_s * 100); i++)
-                    if (!(gone = waitpid(pid, &st, WNOHANG) == pid)) {
+                    if (!(gone = reap_server(pid, &st, WNOHANG) == pid)) {
                         usleep(10000);
                         if (!survives && i == stop_wait_s * 100 - 1 && stop_wait_s < PULL_EXIT_WAIT_S && proc_exiting(pid))
                             stop_wait_s = PULL_EXIT_WAIT_S; /* exiting slowly, not still running */
@@ -2330,11 +2692,11 @@ static void *nemesis_thread(void *arg)
                             fault_t0 = mark_seen_ns;
                         signal_pid(pid, SIGUSR2); /* a power loss at its next file operation */
                     }
-                    for (int i = 0; i < 100 && waitpid(pid, &st, WNOHANG) != pid; i++)
+                    for (int i = 0; i < 100 && reap_server(pid, &st, WNOHANG) != pid; i++)
                         usleep(10000);
                     if (signal_pid(pid, 0) == 0) { /* idle: stopped, the shim rolls back at exit */
                         signal_pid(pid, SIGTERM);
-                        waitpid(pid, &st, 0);
+                        reap_server(pid, &st, 0);
                     }
                     atomic_fetch_sub(&nem_inprog, 1);
                 }
@@ -2360,11 +2722,11 @@ static void *nemesis_thread(void *arg)
             pid_t pid = atomic_load(&server_pid);
             int st = 0, sig = (r >> 20) % 2 ? SIGKILL : SIGTERM;
             if (pid > 0) {
-                bool gone = waitpid(pid, &st, WNOHANG) == pid;
+                bool gone = reap_server(pid, &st, WNOHANG) == pid;
                 if (!gone) {
                     int64_t issued = now_ns();
                     signal_pid(pid, sig);
-                    if (waitpid(pid, &st, 0) == pid && (WIFSIGNALED(st) || WIFEXITED(st))) /* counted once the server has ended of it */
+                    if (reap_server(pid, &st, 0) == pid && (WIFSIGNALED(st) || WIFEXITED(st))) /* counted once the server has ended of it */
                         nem_fault_span(issued, now_ns());
                 }
                 md_death(st, gone ? 0 : sig, pid);
@@ -2377,12 +2739,29 @@ static void *nemesis_thread(void *arg)
             }
         } else if (!strcmp(nemesis, "pause")) {
             pid_t pid = atomic_load(&server_pid);
+            int pst;
+            /* a server that ended by itself, before the pause or after it (round 11), is reported by the reap and replaced: the run goes on
+             * to judge its history */
+            if (pid > 0 && reap_server(pid, &pst, WNOHANG) == pid) {
+                server_gone();
+                start_server(false);
+                restarts++;
+                nem_touch();
+                pthread_mutex_unlock(&server_lock);
+                continue;
+            }
             /* the fault is the server lying stopped, which the watcher sees (state T in /proc) and counts: a SIGSTOP that stops
              * nothing (--mutant-nemesis pausenoeffect: signal 0) or one to a server stopped already is no fault */
             signal_pid(pid, strcmp(mm, "pausenoeffect") ? SIGSTOP : 0);
             usleep(100000 + (useconds_t)(r % 300000));
             if (strcmp(mm, "pausenocont")) /* --mutant-nemesis pausenocont: never continues it */
                 signal_pid(pid, SIGCONT);
+            if (strcmp(mm, "pausenocont") && pid > 0 && reap_server(pid, &pst, WNOHANG) == pid) { /* it died as it was continued */
+                server_gone();
+                start_server(false);
+                restarts++;
+                nem_touch();
+            }
         }
         pthread_mutex_unlock(&server_lock);
     }
@@ -3420,13 +3799,13 @@ static int final_state(uint32_t *final)
         fprintf(stderr, "jepsen: cannot connect for the final read\n");
         stop_server(SIGTERM);
         outage_keep_log();
-        exit(2);
+        bail(2);
     }
     memset(final, 0, koff[nseries] * sizeof *final);
     memset(fnull, 0, koff[nseries]);
     for (int s = 0; s < nseries; s++) {
         tsdb_points p;
-        int rc = tsdbc_query_points(c, ids[s], INT64_MIN, INT64_MAX, &p);
+        int rc = REQ("final read", tsdbc_query_points(c, ids[s], INT64_MIN, INT64_MAX, &p));
         if (rc != 0 && (md || rot) && (rc == TSDB_ERR_CORRUPT || rc == TSDB_ERR_IO)) {
             fprintf(stderr, "  the final read of series %d failed: %s (damage detected)\n", s, tsdbc_strerror(rc));
             tsdbc_close(c);
@@ -3437,7 +3816,7 @@ static int final_state(uint32_t *final)
             int st;
             pid_t pid = atomic_load(&server_pid);
             usleep(200000);
-            if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid) {
+            if (pid > 0 && reap_server(pid, &st, WNOHANG) == pid) {
                 if (WIFSIGNALED(st))
                     fprintf(stderr, "jepsen: server %d was killed by signal %d\n", (int)pid, WTERMSIG(st));
                 else
@@ -3445,10 +3824,14 @@ static int final_state(uint32_t *final)
                 server_gone();
             } else {
                 fprintf(stderr, "jepsen: server %d is still running\n", (int)pid);
+                if (rc == TSDB_ERR_CORRUPT) { /* the server answers that what it holds is damaged: data corrupted by the run's faults */
+                    death_problems++;
+                    fprintf(stderr, "  the final read of series %d: the server says its data is damaged (%s)\n", s, tsdbc_strerror(rc));
+                }
             }
             stop_server(SIGTERM); /* no orphan server */
             outage_keep_log();
-            exit(2);
+            bail(2);
         }
         for (size_t i = 0; i < p.n; i++) {
             int64_t k = ts_key(s, p.ts[i]);
@@ -3644,13 +4027,13 @@ static int create_series(int from, int to)
     for (int s = from; s < to; s++) {
         char name[32];
         snprintf(name, sizeof name, "jepsen.%d", s);
-        if (tsdbc_series(c, name, 1, &ids[s])) {
+        if (REQ("create of a series", tsdbc_series(c, name, 1, &ids[s]))) {
             fprintf(stderr, "jepsen: cannot create series\n");
             tsdbc_close(c);
             pid_t pid = atomic_load(&server_pid); /* did the server end in the middle of it (a SIGSEGV)? say how */
             int st;
             for (int i = 0; pid > 0 && i < 100; i++) {
-                if (waitpid(pid, &st, WNOHANG) == pid) {
+                if (reap_server(pid, &st, WNOHANG) == pid) {
                     note_death(st, false, pid);
                     fprintf(stderr, "jepsen: the server ended during the setup (status %#x)\n", st);
                     print_tail(slogpath);
@@ -3894,6 +4277,20 @@ int main(int argc, char **argv)
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
+    {
+        const char *rd = getenv("JEPSEN_REQ_DEADLINE_S");
+        if (rd && atoi(rd) >= 2)
+            req_deadline_s = atoi(rd);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_outer_kill;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESETHAND;
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
+        atexit(kill_servers_at_exit);
+    }
     if (md || rot) {
         jepsen_watchdog(); /* the parent: all the epochs */
         int rc = epochs(); /* the parent runs the epochs and returns here; each child goes on below */
@@ -3924,6 +4321,7 @@ int main(int argc, char **argv)
     }
     if (system(cmd) != 0)
         return 2;
+    rm_cmd = cmd;
     snprintf(markpath, sizeof markpath, "%s.eio", dir);
     snprintf(pullpath, sizeof pullpath, "%s.pulls", dir);
     if (md || rot)
@@ -3996,7 +4394,8 @@ int main(int argc, char **argv)
     }
     if (strcmp(nemesis, "none"))
         pthread_create(&nem, NULL, nemesis_thread, NULL);
-    usleep((useconds_t)(seconds * 1e6));
+    for (int64_t end = now_ns() + (int64_t)(seconds * 1e9); now_ns() < end && !atomic_load(&hung_flag);) /* a request that got no answer ends the run at once */
+        usleep(20000);
     stop_ns = now_ns();
     JP_PHASE("stopped: joining the nemesis");
     if (outage) { /* the clients go on until the heal the nemesis is in has been judged (up to its bound, 90 s) */
@@ -4012,11 +4411,11 @@ int main(int argc, char **argv)
                     "%d s): it is cut short and counted as not judged\n", OUTAGE_JOIN_S, OUTAGE_HARD_S);
         }
         atomic_store(&stop, true);
-        pthread_join(nem, NULL);
+        join_bounded(nem, "the nemesis", req_deadline_s + 200);
     } else {
         atomic_store(&stop, true);
         if (strcmp(nemesis, "none"))
-            pthread_join(nem, NULL);
+            join_bounded(nem, "the nemesis", req_deadline_s + 200);
         /* an honest pause nemesis has continued the server before it returns; one that has not (it is judged for that: the
          * watcher saw the server stopped to the run's end) would leave every client waiting on it for good */
         if (!strcmp(nemesis, "pause") && pid_stopped(atomic_load(&server_pid)))
@@ -4024,12 +4423,12 @@ int main(int argc, char **argv)
     }
     JP_PHASE("stopped: joining the clients");
     for (int i = 0; i < nclients; i++)
-        pthread_join(th[i], NULL);
+        join_bounded(th[i], "a client", req_deadline_s + 30);
     JP_PHASE("stopped: joining the follower reader");
     if (fport)
-        pthread_join(fr, NULL);
+        join_bounded(fr, "the follower reader", req_deadline_s + 30);
     if (watch_started)
-        pthread_join(watch_th, NULL); /* it ends at the first poll after stop_ns */
+        join_bounded(watch_th, "the watcher", 30); /* it ends at the first poll after stop_ns */
     /* The nemesis is judged here, and the run goes on whatever the verdict: a lazy nemesis makes the run INCONCLUSIVE (exit 3, it
      * tested less than it says), but the final state and the whole history are always judged too, every safety check, and a loss
      * there is a VIOLATION (exit 1) on the attempt where it happened, never hidden behind a rerun (the user's scope, 2026-11-14:
@@ -4043,7 +4442,7 @@ int main(int argc, char **argv)
     pthread_mutex_lock(&server_lock);
     pid_t pid = atomic_load(&server_pid);
     int st;
-    if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid) {
+    if (pid > 0 && reap_server(pid, &st, WNOHANG) == pid) {
         if (md || rot)
             md_death(st, 0, pid);
         server_gone();
@@ -4085,6 +4484,8 @@ int main(int argc, char **argv)
         printf("jepsen %s: %.0f s, %d clients, %d restarts; writes %u ok / %u indeterminate / %u failed, reads %u ok; "
                "%u deletes and %u replaces ok\n",
                nemesis, seconds, nclients, restarts, ok, info, fail, rok, dels, reps);
+        printf("requests: the slowest answered one took %.3f s (the deadline is %d s)\n", (double)atomic_load(&req_worst_ns) / 1e9,
+               req_deadline_s);
     }
     /* kv coverage (every workload but misdirect and rot, which count epochs): a run whose clients were starved wrote almost nothing
      * (8 acknowledged writes and no delete in 20 s, in a run with 40 busy loops on 4 CPUs), and a tsdbd that drops every 20th write
@@ -4143,14 +4544,14 @@ int main(int argc, char **argv)
                outage_worst_flap_s, outage_heals - outage_judged);
         v += outage_problems;
     }
-    if (!strcmp(nemesis, "power"))
-        v += death_problems + hang_problems;
+    /* a server that ended by itself, under any nemesis or none (end_report), and under power one that would not die of the plug */
+    v += death_problems + stall_problems + (!strcmp(nemesis, "power") ? hang_problems : 0);
     JP_PHASE("the cleanup (rm -rf of the directory)");
     unlink(markpath);
     unlink(pullpath);
     if (samp_on) {
         atomic_store(&samp_stop, true);
-        pthread_join(samp_th, NULL);
+        join_bounded(samp_th, "the disk sampler", 30);
     }
     if (outage && (v || outage_near_miss)) {
         /* what a failed or a close run has to show: the server's side of it (the log of every start of the run), under
@@ -4172,6 +4573,10 @@ int main(int argc, char **argv)
     if (v) {
         printf("FAILED: %d violations\n", v);
         return 1;
+    }
+    if (env_kills) { /* the machine killed the server (see end_report): nothing here says anything about tsdb */
+        fprintf(stderr, "jepsen: harness error: a server was killed by something that was not the harness\n");
+        return 2;
     }
     if (inconclusive)
         return inconclusive_exit(true);

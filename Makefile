@@ -1192,12 +1192,12 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || [ $$rc -eq 124 ] || \
-	       ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss\|died of signal 11 before it listened'; then \
+	       ! echo "$$out" | grep -q 'ended with status 0x8\?b (signal 11\|died of signal 11 before it listened'; then \
 	        echo "jepsen-selftest: a SIGSEGV in the server went unnoticed (rc $$rc, 124 is the timeout)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh JEPSEN_SETUP_PAUSE_MS=1500 timeout 120 ./$(B)/jepsen \
 	    --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	    if [ $$rc -ne 2 ] || \
-	       ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss\|died of signal 11 before it listened'; then \
+	    if [ $$rc -ne 1 ] || \
+	       ! echo "$$out" | grep -q 'ended with status 0x8\?b (signal 11\|died of signal 11 before it listened'; then \
 	        echo "jepsen-selftest: a server that died before the setup connected hung or went unnoticed (rc $$rc, 124 is the timeout)"; \
 	        echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(JEPSEN_SETUP_PAUSE_MS=100000 JEPSEN_WATCHDOG_S=5 timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest \
@@ -1289,7 +1289,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	        echo "jepsen-selftest: an outage run that ended at a server that never started did not keep its log (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(JEPSEN_TSDBD=tests/jepsen/early-segv-tsdbd.sh timeout 120 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest \
 	    --nemesis kill --seconds 5 --mutant-slowcreate 2>&1); rc=$$?; \
-	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'cannot connect to create the series'; then \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'cannot connect to create the series'; then \
 	        echo "jepsen-selftest: a run whose server crashed before the series were created hung or went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(tests/jepsen/rerun.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis outage --seconds 20 --seed 2 \
 	    --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
@@ -1306,6 +1306,19 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	        echo "jepsen-selftest: the scan of slow write probes in a server log is wrong ($$a $$b $$c)"; exit 1; fi; \
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    tests/jepsen/mutant-loss.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: data loss beside a lazy nemesis was hidden behind INCONCLUSIVE or went unnoticed"; exit 1; }; \
+	    tests/jepsen/mutant-crash.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a server that dies by itself or stops answering was hidden behind INCONCLUSIVE, a rerun or a pass, or hung the harness"; exit 1; }; \
+	for spec in 'kill@3@--nemesis kill --seconds 5' 'power@4@--nemesis power --seconds 8 --crashfs $(B)/libcrashfs.so'; do \
+	    oldifs=$$IFS; IFS=@; set -- $$spec; IFS=$$oldifs; nem=$$1; at=$$2; args=$$3; \
+	    rm -f $(JEPSEN_DIR)-selftest.failstart-count; \
+	    out=$$(FAILSTART_AT=$$at FAILSTART=env JEPSEN_TSDBD=tests/jepsen/failstart-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest $$args 2>&1); rc=$$?; \
+	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'the server does not come up (the environment, not a verdict about tsdb)' || echo "$$out" | grep -q 'FAILED'; then \
+	        echo "jepsen-selftest: a server that fails to start for want of memory under the $$nem nemesis was a verdict, not a harness error (rc $$rc, wanted 2)"; echo "$$out" | tail -n 12; exit 1; fi; \
+	    rm -f $(JEPSEN_DIR)-selftest.failstart-count; \
+	    tests/jepsen/expect.sh violation 'refuses to open the database after the faults: damaged data' \
+	        "a part file damaged before a restart under the $$nem nemesis (the open fails with corrupt data)" \
+	        env FAILSTART_AT=$$at FAILSTART=damage JEPSEN_TSDBD=tests/jepsen/failstart-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest $$args || exit 1; \
+	    rm -f $(JEPSEN_DIR)-selftest.failstart-count; \
+	done; \
 	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 
