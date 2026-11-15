@@ -26,10 +26,14 @@ sed -i 's|^    bool diverged = v < DOM_MAX_VOLS \&\& atomic_load(\&dom.vol\[v\].
     "$tmp.div/server/tsdbd.c"
 sed -i '0,/^#include <fcntl.h>$/s//#include <fcntl.h>\
 static _Atomic _Bool jv_div; \/* MUTANT: the first DOWN of a domain makes every volume DIVERGED for good, and every insert UNAVAILABLE *\//' "$tmp.div/server/tsdbd.c"
-sed -i 's/^    case TSDB_OP_INSERT: {$/&\
-        if (atomic_load(\&jv_div)) { rc = TSDB_ERR_UNAVAILABLE; break; } \/* MUTANT *\//; s/^    case TSDB_OP_INSERT_VALUES: {$/&\
+# every write the clients send is refused: an insert, a delete and a replace (jepsen counts a delete or replace as a write that a
+# volume takes, too, so a mutant that refused only inserts would look healed)
+sed -i 's/^    case TSDB_OP_\(INSERT\|INSERT_VALUES\|DELETE_RANGE\|REPLACE_RANGE\): {$/&\
         if (atomic_load(\&jv_div)) { rc = TSDB_ERR_UNAVAILABLE; break; } \/* MUTANT *\//' "$tmp.div/server/tsdbd.c"
-if [ "$(grep -c 'MUTANT' "$tmp.div/server/tsdbd.c")" -ne 4 ]; then echo "mutant-slowprobe: the DIVERGED mutant did not apply"; rm -rf "$tmp" "$tmp.div"; exit 1; fi
+# the insert the clients send is the packed one (INSERT_VALUES with TSDB_PACKED, through insert_packed): refuse there too
+sed -i '/^static int insert_packed(auth_conn \*a, const uint8_t \*p, size_t len, uint32_t n, tsdb_sid s)$/{n;s/^{$/{\
+    if (atomic_load(\&jv_div)) return TSDB_ERR_UNAVAILABLE; \/* MUTANT *\//}' "$tmp.div/server/tsdbd.c"
+if [ "$(grep -c 'MUTANT' "$tmp.div/server/tsdbd.c")" -ne 7 ]; then echo "mutant-slowprobe: the DIVERGED mutant did not apply"; rm -rf "$tmp" "$tmp.div"; exit 1; fi
 (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-slowprobe: the build failed"; tail -5 "$tmp/build.log"; rm -rf "$tmp" "$tmp.div"; exit 1; }
 (cd "$tmp.div" && make -j8 build/tsdbd >"$tmp.div/build.log" 2>&1) || { echo "mutant-slowprobe: the build failed"; tail -5 "$tmp.div/build.log"; rm -rf "$tmp" "$tmp.div"; exit 1; }
 out=$(JEPSEN_TSDBD="$tmp/build/tsdbd" "${JEPSEN_BIN:-$root/build/jepsen}" --dir "$dir" --nemesis outage --seconds "$secs" \
