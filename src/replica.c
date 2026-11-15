@@ -1893,13 +1893,15 @@ static int leader_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_
         if (first == 0 || first > from)
             continue; /* empty (just begun), or it starts above `from` */
         pthread_mutex_lock(&db->lead_mu);
-        size_t pos0 = db->lrd_seq == sq && db->lrd_next && db->lrd_next <= from && db->lrd_off <= (uint64_t)st.st_size
+        bool behind = db->lrd_next <= from || eng_test_mutant == MUT_LEADER_READ_CURSOR_ANY; /* the cursor is ours */
+        size_t pos0 = db->lrd_seq == sq && db->lrd_next && behind && db->lrd_off <= (uint64_t)st.st_size
                           ? (size_t)db->lrd_off
                           : 0;
         pthread_mutex_unlock(&db->lead_mu);
-        struct segrd r = {.seq = sq, .flen = (size_t)st.st_size, .pos0 = pos0, .from = from, .cap = cap, .tail_ok = newest};
+        struct segrd r = {.seq = sq, .flen = (size_t)st.st_size, .pos0 = pos0, .from = from, .cap = cap,
+                          .tail_ok = newest || eng_test_mutant == MUT_LEADER_READ_TAILOK_SEALED};
         rc = seg_scan(db, &r);
-        if (rc == 0 && !r.found && !newest)
+        if (rc == 0 && !r.found && !newest && eng_test_mutant != MUT_LEADER_READ_NOTFOUND_SEALED)
             rc = TSDB_ERR_INVALID; /* a sealed segment that has the position inside a record, or not at all */
         if (rc) {
             free(r.out);
@@ -2385,7 +2387,8 @@ int jr_precommit(eng *db, size_t n)
     if (!eng_jr(db) || !rs || !lead_pos || eng_test_mutant == MUT_LEADER_NO_RSTATE)
         return 0;
     rs->doing_pos = lead_pos;
-    rs->doing_b0 = atomic_load(&db->next_block); /* block numbers are taken under publish_lock: this commit's first */
+    /* block numbers are taken under publish_lock: this commit's first */
+    rs->doing_b0 = atomic_load(&db->next_block) + (eng_test_mutant == MUT_LEADER_B0_OFF ? 1000 : 0);
     rs->doing_n = n;
     return rs_save(db, rs);
 }

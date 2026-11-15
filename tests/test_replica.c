@@ -2857,7 +2857,9 @@ static void case_rstate_crash(void)
         snprintf(rd, sizeof rd, "%s_r", ld);
         sh("rm -rf '%s' && cp -a '%s' '%s'", rd, ld, rd);
         unlink(ack);
-        int code = run_power_child_as("--powerr", ld, rd, ack, k, k + 1);
+        /* crashfs's root is a path prefix: ld covers the leader and its replica (ld_r), so the power is lost at every
+         * sync of either, the leader's publish and RSTATE saves included */
+        int code = run_power_child_as("--powerr", ld, ld, ack, k, k + 1);
         if (code != 99 && code != 0)
             fprintf(stderr, "R: step %d: the child ended with status %d\n", k, code);
         CHECK(code == 99 || code == 0);
@@ -2900,12 +2902,42 @@ static void case_rstate_crash(void)
         }
         between += e > P[0];
         eng_close(db);
+        /* the leader of the same run, opened as a replica: power lost between its publish (parts_commit) and the
+         * RSTATE save of its COMMIT must not let the COMMIT's file be listed again (rs_committed reads doing_b0;
+         * mutant b0off) */
+        eng *ex;
+        rc = open_replica(ld, 0, &ex);
+        if (rc != 0) {
+            fprintf(stderr, "R: step %d: the ex-leader's open as a replica failed: %d\n", k, rc);
+            failures++;
+            continue;
+        }
+        uint64_t le = replica_durable_end(ex);
+        int lj = 0;
+        while (lj < RSTEPS && P[lj + 1] <= le)
+            lj++;
+        if (le < P[done] || le != P[lj]) {
+            fprintf(stderr, "R: step %d: the ex-leader's durable end %" PRIu64 " is not the end of a step from %" PRIu64
+                    " on\n", k, le, done);
+            failures++;
+        } else if (replica_apply(ex, le) != 0 || replica_applied_end(ex) != le) {
+            fprintf(stderr, "R: step %d: the ex-leader's durable log does not apply to %" PRIu64 " (a COMMIT's files "
+                    "are gone)\n", k, le);
+            failures++;
+        } else if (r_digest(ex) != D[lj]) {
+            fprintf(stderr, "R: step %d: the ex-leader applied to %" PRIu64 " does not answer as it did there\n", k, le);
+            failures++;
+        } else if (parts_twice(ex)) {
+            fprintf(stderr, "R: step %d: the ex-leader lists a COMMIT's file twice (mutant b0off)\n", k);
+            failures++;
+        }
+        eng_close(ex);
         if (failures)
             break;
     }
     CHECK(finished && crashes > 50 && between > 0);
     printf("  power lost at each of %d steps of a replica applying COMMITs and a DROP: applied to its durable end it "
-           "answers as the leader did there, each COMMIT's file listed once\n", crashes);
+           "answers as the leader did there, each COMMIT's file listed once, and so does the leader\n", crashes);
 }
 /* ------------------------------------------------------------ N: review round 2 (drop ordering, staged files, promotion) */
 
@@ -4043,22 +4075,31 @@ static void case_hardlink(void)
 
 /* Feeds dst from the leader's log by position only (replica_read on the writer, `cap` bytes a read), then fetches every
  * file a COMMIT names that dst misses from the leader (eng_leader_file_open), syncs and applies to `commit`. */
+static int feed_once(eng *ld, eng *dst, size_t cap) /* one read and its append: 1 bytes came, 0 the end, < 0 an error */
+{
+    uint8_t *b;
+    size_t len;
+    uint64_t seq, off, last;
+    int rc = replica_read(ld, replica_log_end(dst) + 1, &b, &len, cap, &seq, &off, &last);
+    if (rc == 0 && len)
+        rc = replica_append(dst, seq, off, b, len);
+    free(b);
+    return rc ? rc : len > 0;
+}
+
+static int feed_finish(eng *ld, eng *dst, uint64_t commit);
+
 static int feed_from_leader(eng *ld, eng *dst, size_t cap, uint64_t commit)
 {
-    uint64_t from = replica_log_end(dst) + 1;
+    int rc;
+    while ((rc = feed_once(ld, dst, cap)) > 0)
+        ;
+    return rc ? rc : feed_finish(ld, dst, commit);
+}
+
+static int feed_finish(eng *ld, eng *dst, uint64_t commit)
+{
     int rc = 0;
-    for (;;) {
-        uint8_t *b;
-        size_t len;
-        uint64_t seq, off, last;
-        rc = replica_read(ld, from, &b, &len, cap, &seq, &off, &last);
-        if (rc == 0 && len)
-            rc = replica_append(dst, seq, off, b, len);
-        free(b);
-        if (rc || len == 0)
-            break;
-        from = last + 1;
-    }
     char name[64];
     uint64_t size;
     while (rc == 0 && replica_missing(dst, name, sizeof name, &size) == 1) {
@@ -4082,11 +4123,14 @@ static int feed_from_leader(eng *ld, eng *dst, size_t cap, uint64_t commit)
 static void case_leader_read(void)
 {
     xport x;
-    char fa[PATH_MAX + 8], fb[PATH_MAX + 8];
+    char fa[PATH_MAX + 8], fb[PATH_MAX + 8], fc[PATH_MAX + 8], fd[PATH_MAX + 8];
     xp_start(&x, "lread");
     snprintf(fa, sizeof fa, "%s_fa", x.ldir);
     snprintf(fb, sizeof fb, "%s_fb", x.ldir);
-    sh("rm -rf '%s' '%s' && cp -a '%s_r' '%s' && cp -a '%s_r' '%s'", fa, fb, x.ldir, fa, x.ldir, fb);
+    snprintf(fc, sizeof fc, "%s_fc", x.ldir);
+    snprintf(fd, sizeof fd, "%s_fd", x.ldir);
+    sh("rm -rf '%s' '%s' '%s' '%s' && cp -a '%s_r' '%s' && cp -a '%s_r' '%s' && cp -a '%s_r' '%s' && cp -a '%s_r' '%s'", fa,
+       fb, fc, fd, x.ldir, fa, x.ldir, fb, x.ldir, fc, x.ldir, fd);
     xp_rows(&x, 0, 0, 10, 100);
     xp_rows(&x, 1, 0, 8, 200);
     xp_step(&x, "LR: rows");
@@ -4112,9 +4156,70 @@ static void case_leader_read(void)
         CHECK(same_all(a, x.rep, T0 + DAY_MS, "LR: fed by reads of 300 bytes"));
         CHECK(same_all(b, x.rep, T0 + DAY_MS, "LR: fed by reads of 1 MiB"));
     }
+    eng *c = NULL, *d = NULL; /* two replicas reading by turns, d behind c in the same segment: the leader's read cursor
+                                 is one per engine and must not carry d past its position (mutant cursoranyway) */
+    CHECK_EQ(open_replica(fc, 0, &c), 0);
+    CHECK_EQ(open_replica(fd, 0, &d), 0);
+    if (c && d) {
+        int rc_c = 1, rc_d = 1;
+        while (rc_c > 0 || rc_d > 0) {
+            if (rc_c > 0)
+                rc_c = feed_once(x.ld, c, 300);
+            if (rc_d > 0)
+                rc_d = feed_once(x.ld, d, 150);
+        }
+        CHECK_EQ(rc_c, 0);
+        CHECK_EQ(rc_d, 0);
+        CHECK_EQ(feed_finish(x.ld, c, end), 0);
+        CHECK_EQ(feed_finish(x.ld, d, end), 0);
+        CHECK_EQ(replica_applied_end(c), end);
+        CHECK_EQ(replica_applied_end(d), end);
+        CHECK(same_all(c, x.rep, T0 + DAY_MS, "LR: read by turns, ahead"));
+        CHECK(same_all(d, x.rep, T0 + DAY_MS, "LR: read by turns, behind"));
+    }
     uint8_t *buf;
     size_t len;
     uint64_t seq, off, last;
+    { /* a sealed segment's errors (damage is never silent): a position inside a record is INVALID, also inside the
+       * segment's last record (mutant notfoundsealed: "not written yet"), and a damaged record CORRUPT (mutant
+       * tailoksealed: a sealed segment read as if a writer were still in its last record) */
+        uint64_t s1 = 0, f = 1, mid = 0, lf = 0, ll = 0, loff = 0;
+        size_t llen = 0;
+        for (;;) { /* record by record (cap 1: one record a read) */
+            int rc = replica_read(x.ld, f, &buf, &len, 1, &seq, &off, &last);
+            free(buf);
+            if (rc || len == 0 || (s1 && seq != s1))
+                break;
+            s1 = seq;
+            if (last > f && !mid)
+                mid = f + 1;
+            lf = f, ll = last, loff = off, llen = len;
+            f = last + 1;
+        }
+        CHECK(s1 && s1 + 1 < x.ld->wal_seq); /* sealed */
+        CHECK(mid && ll > lf); /* records of several rows, the segment's last one too */
+        CHECK_EQ(replica_read(x.ld, mid, &buf, &len, 1 << 20, &seq, &off, &last), TSDB_ERR_INVALID);
+        free(buf);
+        CHECK_EQ(replica_read(x.ld, lf + 1, &buf, &len, 1 << 20, &seq, &off, &last), TSDB_ERR_INVALID);
+        free(buf);
+        char sp[PATH_MAX + 64];
+        snprintf(sp, sizeof sp, "%s/wal_%016" PRIx64 ".log", x.ldir, s1);
+        int sfd = open(sp, O_RDWR | O_CLOEXEC);
+        CHECK(sfd >= 0);
+        uint8_t was = 0, flip;
+        off_t at = (off_t)(loff + llen - 1);
+        if (sfd >= 0 && pread(sfd, &was, 1, at) == 1) {
+            flip = was ^ 0x5a;
+            CHECK(pwrite(sfd, &flip, 1, at) == 1);
+            CHECK_EQ(replica_read(x.ld, 1, &buf, &len, 1 << 20, &seq, &off, &last), TSDB_ERR_CORRUPT);
+            free(buf);
+            CHECK_EQ(replica_read(x.ld, lf, &buf, &len, 1 << 20, &seq, &off, &last), TSDB_ERR_CORRUPT);
+            free(buf);
+            CHECK(pwrite(sfd, &was, 1, at) == 1);
+        }
+        if (sfd >= 0)
+            close(sfd);
+    }
     CHECK_EQ(replica_read(x.ld, end + 1, &buf, &len, 100, &seq, &off, &last), 0);
     CHECK_EQ(len, 0);
     free(buf);
@@ -4127,8 +4232,31 @@ static void case_leader_read(void)
         eng_close(a);
     if (b)
         eng_close(b);
+    if (c)
+        eng_close(c);
+    if (d)
+        eng_close(d);
     xp_stop(&x);
-    printf("  a leader serves its log by position from its retained segments and the live tail\n");
+    printf("  a leader serves its log by position from its retained segments and the live tail, to readers by turns; "
+           "a sealed segment's damage is CORRUPT, a position inside a record INVALID\n");
+}
+
+/* A leader's attach removes stage_ files an earlier leadership (or a promoted replica) left: none of them is a file of a
+ * marker this leadership will serve, and one with a repeated name would be served for another (mutant nosweep) */
+static void case_link_sweep(void)
+{
+    xport x;
+    char ld[PATH_MAX], p[PATH_MAX + 64];
+    memset(&x, 0, sizeof x);
+    fresh(ld, "lsweep");
+    snprintf(x.ldir, sizeof x.ldir, "%s", ld);
+    snprintf(p, sizeof p, "%s/stage_0123456789abcdef.part", ld);
+    sh("echo stale > '%s'", p);
+    xp_open_leader(&x);
+    CHECK(access(p, F_OK) != 0);
+    eng_close(x.ld);
+    free(x.held);
+    printf("  a leader's attach removes the stage_ links of an earlier leadership\n");
 }
 
 static int mutant_of(const char *m)
@@ -4187,7 +4315,12 @@ static int mutant_of(const char *m)
                         : strcmp(m, "promotenocarry") == 0 ? MUT_PROMOTE_NO_CARRY
                         : strcmp(m, "keptreplayed") == 0 ? MUT_KEPT_REPLAYED
                         : strcmp(m, "leaderkeptnosave") == 0 ? MUT_LEADER_KEPT_NOSAVE
-                        : strcmp(m, "readgap") == 0 ? MUT_LEADER_READ_NO_GAP : 0;
+                        : strcmp(m, "readgap") == 0 ? MUT_LEADER_READ_NO_GAP
+                        : strcmp(m, "cursoranyway") == 0 ? MUT_LEADER_READ_CURSOR_ANY
+                        : strcmp(m, "tailoksealed") == 0 ? MUT_LEADER_READ_TAILOK_SEALED
+                        : strcmp(m, "notfoundsealed") == 0 ? MUT_LEADER_READ_NOTFOUND_SEALED
+                        : strcmp(m, "nosweep") == 0 ? MUT_LEADER_NO_SWEEP
+                        : strcmp(m, "b0off") == 0 ? MUT_LEADER_B0_OFF : 0;
 }
 
 int main(int argc, char **argv)
@@ -4244,6 +4377,7 @@ int main(int argc, char **argv)
         case_leader_keep();
         case_hardlink();
         case_leader_read();
+        case_link_sweep();
         for (int v = 0; v < 3; v++)
             case_promote(v);
         case_promote_crash();
@@ -4303,6 +4437,7 @@ int main(int argc, char **argv)
     case_leader_keep();
     case_hardlink();
     case_leader_read();
+    case_link_sweep();
     case_promote_refused();
     for (int v = 0; v < 3; v++)
         case_promote(v);

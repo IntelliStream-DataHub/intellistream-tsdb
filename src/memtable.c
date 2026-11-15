@@ -953,7 +953,8 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
     int rc = db->lrs ? 0 : leader_rs_open(db); /* RSTATE before the first marker */
     if (rc)
         return rc;
-    leader_links_sweep(db); /* an earlier leadership's links, or a promoted replica's stages: no marker here needs them */
+    if (eng_test_mutant != MUT_LEADER_NO_SWEEP)
+        leader_links_sweep(db); /* an earlier leadership's links, or a promoted replica's stages: no marker here needs them */
     __atomic_store_n(&db->jr, ops, __ATOMIC_RELEASE); /* the flusher, warmer and merges are running already */
     return 0;
 }
