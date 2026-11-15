@@ -353,7 +353,7 @@ int cls_open(eng *db, bool read_only)
     pthread_rwlock_init(&db->cls_rw, &ra);
     pthread_rwlockattr_destroy(&ra);
     db->cls_fd = -1;
-    db->cls_dropped_end = INT64_MIN;
+    db->cls_dropped = NULL;
     /* every series that exists now was decided (by a record, or class 0 without one) */
     uint32_t n = eng_series_count(db);
     pthread_mutex_lock(&db->cls_mu);
@@ -422,6 +422,11 @@ void cls_close(eng *db)
     }
     db->wtail = NULL;
     db->nwtail = 0;
+    for (struct cls_dropped *d = db->cls_dropped, *x; d; d = x) {
+        x = d->next;
+        free(d);
+    }
+    db->cls_dropped = NULL;
     pthread_mutex_destroy(&db->class_lock);
     pthread_mutex_destroy(&db->cls_mu);
     pthread_rwlock_destroy(&db->cls_rw);
@@ -764,7 +769,7 @@ int cls_classify_memtable(eng *db, const memtable *m)
         run_stats(ms, &st[k].tmin, &st[k].tmax);
         k++;
     }
-    int rc = k ? decide_fresh_ex(db, st, k, eng_jr(db) != NULL) : 0;
+    int rc = k ? decide_fresh_ex(db, st, k, eng_jr(db) != NULL && eng_test_mutant != MUT_LEADER_ZERO_RATE) : 0;
     tsdb_free_big(st, m->nids * sizeof *st);
     return rc;
 }
@@ -804,6 +809,60 @@ int cls_classify_active(eng *db)
 
 /* ---------------------------------------------------------- the switches */
 
+void cls_dropped_note(eng *db, const part *p)
+{
+    int64_t lo, end;
+    partition_range(db, p->partition, &lo, &end);
+    uint32_t n = p->ix.nruns;
+    struct cls_dropped *d = malloc(sizeof *d + (size_t)n * sizeof(uint32_t));
+    if (!d) { /* not counted per series: every series gets the bound, as before (never lower) */
+        n = 0;
+        d = malloc(sizeof *d);
+        if (!d) {
+            eng_fail(db, "the bound of a dropped partition", ENOMEM); /* a T below its rows could follow */
+            return;
+        }
+        d->n = UINT32_MAX;
+    } else {
+        d->n = n;
+        memcpy(d->ids, p->ix.rser, (size_t)n * sizeof(uint32_t));
+    }
+    d->end = end;
+    d->need = atomic_load(&db->dsync_started) + 1; /* after the rename: a later fsync covers it */
+    d->next = db->cls_dropped;
+    db->cls_dropped = d;
+}
+
+/* The lowest T series s may take for the dropped parts that are not durably gone (db->lock held; frees the rest). */
+static int64_t cls_dropped_bound_locked(eng *db, uint32_t s)
+{
+    uint64_t done = atomic_load(&db->dsync_done);
+    int64_t T = INT64_MIN;
+    for (struct cls_dropped **pp = &db->cls_dropped, *d; (d = *pp);) {
+        if (done >= d->need && eng_test_mutant != MUT_DROPPED_GLOBAL) {
+            *pp = d->next;
+            free(d);
+            continue;
+        }
+        bool has = d->n == UINT32_MAX || eng_test_mutant == MUT_DROPPED_GLOBAL;
+        if (!has) {
+            uint32_t lo = 0, hi = d->n;
+            while (lo < hi) {
+                uint32_t mid = lo + (hi - lo) / 2;
+                if (d->ids[mid] < s)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            has = lo < d->n && d->ids[lo] == s;
+        }
+        if (has)
+            T = MAX(T, d->end);
+        pp = &d->next;
+    }
+    return T;
+}
+
 /* Newest timestamp of series s in part p, or INT64_MIN. */
 static int64_t part_newest(const part *p, uint32_t s)
 {
@@ -820,6 +879,8 @@ static int64_t mt_newest(const memtable *m, uint32_t s)
     run_stats(&m->s[s], &a, &b);
     return b;
 }
+
+_Atomic size_t cls_wtail_cap = CLS_WTAIL_CAP;
 
 struct cls_wtail *cls_wal_tail_new(const memtable *m)
 {
@@ -844,8 +905,14 @@ struct cls_wtail *cls_wal_tail_new(const memtable *m)
 static bool wtail_gone(eng *db, uint64_t seq, uint64_t fno_end, uint64_t floor)
 {
     if (eng_jr(db) && !db->rp && eng_test_mutant != MUT_LEADER_WTAIL_LOCAL)
-        return fno_end <= floor;
+        return fno_end <= floor + (eng_test_mutant == MUT_LEADER_PRUNE_OFF1); /* planted: one too many */
     return seq <= atomic_load(&db->wal_removed_synced);
+}
+
+static void raise_from(eng *db, uint64_t fno_end)
+{
+    if (eng_test_mutant != MUT_LEADER_NO_RAISE_FROM) /* planted: wtail_from stays at the attach value */
+        db->wtail_from = MAX(db->wtail_from, fno_end);
 }
 
 void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fno_end, int64_t max_ts)
@@ -854,7 +921,7 @@ void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fn
     for (struct cls_wtail **pp = &db->wtail; *pp;) { /* drop what can no longer be replayed */
         struct cls_wtail *x = *pp;
         if (wtail_gone(db, x->seq, x->fno_end, floor)) {
-            db->wtail_from = MAX(db->wtail_from, x->fno_end); /* a lower floor later must not see it gone */
+            raise_from(db, x->fno_end); /* a lower floor later must not see it gone */
             *pp = x->next;
             free(x);
             db->nwtail--;
@@ -863,11 +930,11 @@ void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fn
         }
     }
     if (db->wtail_all_seq && wtail_gone(db, db->wtail_all_seq, db->wtail_all_fno, floor)) {
-        db->wtail_from = MAX(db->wtail_from, db->wtail_all_fno);
+        raise_from(db, db->wtail_all_fno);
         db->wtail_all_seq = 0, db->wtail_all_fno = 0, db->wtail_all_max = INT64_MIN;
     }
     if (wtail_gone(db, seq, fno_end, floor)) {
-        db->wtail_from = MAX(db->wtail_from, fno_end);
+        raise_from(db, fno_end);
         free(e);
         return;
     }
@@ -882,6 +949,25 @@ void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fn
     e->next = db->wtail;
     db->wtail = e;
     db->nwtail++;
+    /* A leader keeps its entries until the replay floor passes them, and the floor stays put while a replica is away
+     * (for hours, with a storage outage): past the cap the oldest entry is folded into the coarse bound for every
+     * series, which only moves a later switch's T further out, never below a row. */
+    size_t cap = atomic_load_explicit(&cls_wtail_cap, memory_order_relaxed);
+    while (db->nwtail > cap && eng_test_mutant != MUT_WTAIL_NOCAP) {
+        struct cls_wtail **pp = &db->wtail;
+        while ((*pp)->next)
+            pp = &(*pp)->next;
+        struct cls_wtail *x = *pp;
+        int64_t mx = INT64_MIN;
+        for (size_t i = 0; i < x->n; i++)
+            mx = MAX(mx, x->max[i]);
+        db->wtail_all_seq = MAX(db->wtail_all_seq, x->seq);
+        db->wtail_all_fno = MAX(db->wtail_all_fno, x->fno_end);
+        db->wtail_all_max = MAX(db->wtail_all_max, mx);
+        *pp = NULL;
+        free(x);
+        db->nwtail--;
+    }
 }
 
 static int cmp_tail(const void *a, const void *b)
@@ -1040,11 +1126,11 @@ static int switch_locked(eng *db, const sw *w, size_t n)
         /* rows of dropped partitions are no longer listed, but their removal may not be durable yet: a power loss
          * brings them back, and they must still lie before T. A fresh series' decision (INT64_MIN) has no rows. */
         if (!w[i].pos || *w[i].at != INT64_MIN)
-            T = MAX(T, db->cls_dropped_end);
+            T = MAX(T, cls_dropped_bound_locked(db, s));
         if (leader) {
             /* Expired rows a replica has not merged away yet (its clock lags the leader's): T is past them too */
             int64_t cut = eng_cutoff(db, s);
-            if (cut != INT64_MIN)
+            if (cut != INT64_MIN && eng_test_mutant != MUT_LEADER_NO_CUTOFF)
                 T = MAX(T, sat_mul(floor_div(cut, db->partition_ms) + 1, db->partition_ms));
         }
         if (T == INT64_MAX && !w[i].pos)
@@ -1064,7 +1150,8 @@ static int switch_locked(eng *db, const sw *w, size_t n)
                             "until the row is gone\n", s, newest, (int)(b & CLS_MASK));
             continue;
         }
-        if (w[i].pos && eng_test_mutant != MUT_REPLICA_CLASS_MAX && T > *w[i].at) {
+        if (w[i].pos && eng_test_mutant != MUT_REPLICA_CLASS_MAX && T > *w[i].at &&
+            !(eng_test_mutant == MUT_REPLICA_FRESH_UNCHECKED && *w[i].at == INT64_MIN)) {
             /* The leader's T is exact (design-cluster.md 5.4): a row this replica may replay, or one in its parts that
              * cls_apply's merge did not remove, lies past it. Its history is not the leader's: never silent. */
             fprintf(stderr, "tsdb: %s: series %u: the leader switches it to class %d at %" PRId64 ", below a row this "
@@ -1138,10 +1225,45 @@ int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at)
  * this replica's parts: the partitions where the series has rows at or past `at` are merged first (outside
  * flush_lock), so they go as they went on the leader. The leader's record has offset `record_off` in CLASSES: one the
  * file is past was applied before a restart. */
+/* A leader's record at an offset this replica's file is already past was applied before a restart: the record there
+ * must be the same one. An offset that is wrong (a bug, or a history that is not the leader's) would otherwise skip the
+ * record silently. A rare path (a replay), so it reads the file. */
+static int cls_same_at(eng *db, uint64_t off, uint32_t s, int64_t at, int cls)
+{
+    int fd = openat(db->dirfd, CLS_FILE, O_RDONLY | O_CLOEXEC);
+    uint8_t rec[CLS_REC];
+    ssize_t r = -1;
+    if (fd >= 0) {
+        do
+            r = pread(fd, rec, CLS_REC, (off_t)off);
+        while (r < 0 && errno == EINTR);
+        close(fd);
+    }
+    if (r != CLS_REC) {
+        fprintf(stderr, "tsdb: %s: cannot read the CLASSES record at offset %" PRIu64 ": %s\n", db->dir, off,
+                r < 0 ? strerror(errno) : "short read");
+        return TSDB_ERR_IO;
+    }
+    int64_t from;
+    memcpy(&from, rec + 8, 8);
+    uint32_t rs, rc_, chk;
+    memcpy(&chk, rec, 4);
+    memcpy(&rs, rec + 4, 4);
+    memcpy(&rc_, rec + 16, 4);
+    if (chk == rec_check(rec, off) && rs == s && from == at && rc_ == (uint32_t)cls)
+        return 0;
+    fprintf(stderr, "tsdb: %s: the leader's CLASSES record at offset %" PRIu64 " (series %u, class %d at %" PRId64 ") is "
+                    "not the one this replica holds there (series %u, class %u at %" PRId64 "): its history is not the "
+                    "leader's\n", db->dir, off, s, cls, at, rs, rc_, from);
+    return TSDB_ERR_CORRUPT;
+}
+
 int cls_apply(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off)
 {
     if (!db->cls_on || cls < 0 || cls >= PART_CLASSES || series >= eng_series_count(db))
         return TSDB_ERR_INVALID;
+    if (record_off < db->cls_off && eng_test_mutant != MUT_REPLICA_NO_POS) /* the applier is the only appender */
+        return cls_same_at(db, record_off, series, at, cls);
     if (record_off >= db->cls_off && eng_test_mutant != MUT_REPLICA_NO_CLASS_PURGE) {
         int64_t *keys = NULL;
         size_t nk = 0;

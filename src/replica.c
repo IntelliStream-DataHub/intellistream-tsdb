@@ -2074,18 +2074,22 @@ int jr_markers(eng *db, const mk *m, size_t n, const char *what)
 {
     if (!eng_jr(db) || db->rp || n == 0)
         return 0;
+    /* one unit: one admission for the whole batch (wal_markers_mk), so a refusal (min_isr, not leading) leaves none
+     * of them in the log and the write is simply refused; one sync for all of them */
     uint64_t fno = 0, last = 0;
-    int rc = 0;
-    for (size_t i = 0; i < n && rc == 0; i++) {
-        rc = wal_marker_mk(db, &m[i], &fno);
-        if (rc == 0)
-            last = fno + m[i].span - 1;
-    }
+    int rc = eng_test_mutant == MUT_LEADER_MARKERS_SPLIT ? 0 : wal_markers_mk(db, m, n, &fno, &last);
+    if (eng_test_mutant == MUT_LEADER_MARKERS_SPLIT) /* planted: one admission and one sync per marker */
+        for (size_t i = 0; i < n && rc == 0; i++) {
+            uint64_t l = 0;
+            rc = wal_markers_mk(db, &m[i], 1, &fno, &l);
+            if (l)
+                last = l;
+        }
     if (rc && last == 0)
         return leader_unappended(rc); /* none is in the log: definitely not applied */
     if (rc) {
-        /* the earlier markers may commit without the records they name: only a deposed leader (cut by the next
-         * one) may go on */
+        /* in the log (a failed sync fails the engine by the WAL's rules; a planted split may leave a prefix): the
+         * markers may commit without the records they name, so only a deposed leader (cut by the next one) goes on */
         if (!atomic_load(&db->lead_deposed))
             eng_fail(db, what, EIO);
         return TSDB_ERR_INDETERMINATE;

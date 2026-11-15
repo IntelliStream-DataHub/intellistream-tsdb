@@ -237,6 +237,37 @@ int64_t eng_cutoff(eng *db, uint32_t series)
     return eng_cutoff_at(db, series, eng_now_ms(db));
 }
 
+/* A leader's record at an offset this replica's file is already past (applied before a restart) must be the record
+ * there: a wrong offset would otherwise skip it silently. A rare path (a replay), so it reads the file. */
+static int ret_same_at(eng *db, uint64_t off, uint32_t series, int64_t limit_ms)
+{
+    int fd = openat(db->dirfd, RET_FILE, O_RDONLY | O_CLOEXEC);
+    uint8_t rec[RET_REC];
+    ssize_t r = -1;
+    if (fd >= 0) {
+        do
+            r = pread(fd, rec, RET_REC, (off_t)off);
+        while (r < 0 && errno == EINTR);
+        close(fd);
+    }
+    if (r != RET_REC) {
+        fprintf(stderr, "tsdb: %s: cannot read the RETENTION record at offset %" PRIu64 ": %s\n", db->dir, off,
+                r < 0 ? strerror(errno) : "short read");
+        return TSDB_ERR_IO;
+    }
+    uint32_t chk, s;
+    int64_t lim;
+    memcpy(&chk, rec, 4);
+    memcpy(&s, rec + 4, 4);
+    memcpy(&lim, rec + 8, 8);
+    if (chk == rec_check(rec, off) && s == series && lim == limit_ms)
+        return 0;
+    fprintf(stderr, "tsdb: %s: the leader's RETENTION record at offset %" PRIu64 " (series %u, limit %" PRId64 " ms) is not "
+                    "the one this replica holds there (series %u, limit %" PRId64 " ms): its history is not the leader's\n",
+            db->dir, off, series, limit_ms, s, lim);
+    return TSDB_ERR_CORRUPT;
+}
+
 /* The limit's record goes to RETENTION at ret_off. A replica (apply: the leader's RETENTION record, which names the
  * offset it has there): a record at an offset the file is past was applied before a restart, one beyond the end means
  * this replica lacks records the leader has. */
@@ -255,7 +286,7 @@ static int ret_set(eng *db, uint32_t series, int64_t limit_ms, bool apply, uint6
                             ": its history is not the leader's\n", db->dir, record_off, db->ret_off);
             return TSDB_ERR_CORRUPT;
         }
-        return 0; /* applied before */
+        return ret_same_at(db, record_off, series, limit_ms); /* applied before: the same record must be there */
     }
     if (db->ret_broken) {
         pthread_mutex_unlock(&db->ret_lock);

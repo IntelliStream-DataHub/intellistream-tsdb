@@ -748,20 +748,37 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
 
 /* A marker record: appended to the same buffer as the rows, in order, and made durable before it returns (markers
  * are rare). body_len is a multiple of 4 (the record is 4-byte aligned). */
-/* Appends the marker record to the WAL buffer: buf_lock held. *lsn is its commit target (wal_commit). */
-static int wal_marker_locked(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void *body, size_t body_len,
-                             uint64_t *fno, uint64_t *lsn_out)
+typedef struct wal_mrec {
+    uint16_t type, flags;
+    uint32_t span;
+    const void *body;
+    size_t body_len;
+} wal_mrec;
+
+/* Appends the marker records r[0..n) to the WAL buffer, consecutive, as one unit: buf_lock held. One admission covers
+ * all of them (their first number and total span), after everything that can fail, so either every record is buffered
+ * or none is: a leader never has the first markers of a batch in its log without the rest (a batch's dictionary
+ * records then go to their file all or none). *fno gets the first record's number, *lsn_out the last position (the
+ * commit target, wal_commit). */
+static int wal_markers_locked(eng *db, const wal_mrec *r, size_t n, uint64_t *fno, uint64_t *lsn_out)
 {
-    if (!db->wal_enabled || span == 0 || body_len % 4 != 0 || body_len > ((size_t)1 << 27))
+    uint64_t span = 0;
+    size_t bytes = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (r[i].span == 0 || r[i].body_len % 4 != 0 || r[i].body_len > ((size_t)1 << 27))
+            return TSDB_ERR_INVALID;
+        span += r[i].span;
+        bytes += WAL_HDR + WAL_MARKER_HDR + r[i].body_len;
+    }
+    if (!db->wal_enabled || n == 0 || span > UINT32_MAX || bytes > ((size_t)1 << 30))
         return TSDB_ERR_INVALID;
-    size_t plen = WAL_MARKER_HDR + body_len;
     int rc = eng_check(db);
     if (rc == 0 && db->fno_next >= FNO_BOUND_MAX - span) {
         eng_fail(db, "WAL numbers", EOVERFLOW);
         rc = TSDB_ERR_IO;
     }
-    if (rc == 0 && db->wal_len + WAL_HDR + plen > db->wal_cap) {
-        size_t cap = MAX(db->wal_len + WAL_HDR + plen, db->wal_cap * 2);
+    if (rc == 0 && db->wal_len + bytes > db->wal_cap) {
+        size_t cap = MAX(db->wal_len + bytes, db->wal_cap * 2);
         cap = MAX(cap, (size_t)65536);
         uint8_t *b = realloc(db->wal_buf, cap);
         if (!b)
@@ -771,26 +788,37 @@ static int wal_marker_locked(eng *db, uint16_t type, uint16_t flags, uint32_t sp
     }
     uint64_t lsn = 0;
     if (rc == 0)
-        rc = leader_admit(db, db->fno_next, span); /* last: nothing below fails */
+        rc = leader_admit(db, db->fno_next, (uint32_t)span); /* last: nothing below fails */
     if (rc == 0) {
         wal_rec_close(db); /* the marker follows the rows record: it takes no more rows */
-        uint8_t *h = db->wal_buf + db->wal_len;
-        memset(h, 0, WAL_HDR);
-        store32(h, (uint32_t)plen | (uint32_t)WAL_KIND_MARKER << 28);
-        memcpy(h + 16, &db->fno_next, 8);
-        memcpy(h + WAL_HDR, &type, 2);
-        memcpy(h + WAL_HDR + 2, &flags, 2);
-        store32(h + WAL_HDR + 4, span);
-        if (body_len)
-            memcpy(h + WAL_HDR + WAL_MARKER_HDR, body, body_len);
         if (fno)
             *fno = db->fno_next;
-        db->fno_next += span;
-        db->wal_len += WAL_HDR + plen;
+        for (size_t i = 0; i < n; i++) {
+            size_t plen = WAL_MARKER_HDR + r[i].body_len;
+            uint8_t *h = db->wal_buf + db->wal_len;
+            memset(h, 0, WAL_HDR);
+            store32(h, (uint32_t)plen | (uint32_t)WAL_KIND_MARKER << 28);
+            memcpy(h + 16, &db->fno_next, 8);
+            memcpy(h + WAL_HDR, &r[i].type, 2);
+            memcpy(h + WAL_HDR + 2, &r[i].flags, 2);
+            store32(h + WAL_HDR + 4, r[i].span);
+            if (r[i].body_len)
+                memcpy(h + WAL_HDR + WAL_MARKER_HDR, r[i].body, r[i].body_len);
+            db->fno_next += r[i].span;
+            db->wal_len += WAL_HDR + plen;
+        }
         lsn = db->wal_appended = db->fno_next - 1; /* its last position (eng_leader_commit) */
     }
     *lsn_out = lsn;
     return rc;
+}
+
+/* Appends one marker record to the WAL buffer: buf_lock held. *lsn is its commit target (wal_commit). */
+static int wal_marker_locked(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void *body, size_t body_len,
+                             uint64_t *fno, uint64_t *lsn_out)
+{
+    wal_mrec r = {.type = type, .flags = flags, .span = span, .body = body, .body_len = body_len};
+    return wal_markers_locked(db, &r, 1, fno, lsn_out);
 }
 
 int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void *body, size_t body_len,
@@ -807,16 +835,39 @@ int wal_marker(eng *db, uint16_t type, uint16_t flags, uint32_t span, const void
 
 int wal_marker_mk(eng *db, const mk *m, uint64_t *fno)
 {
-    uint8_t *p;
-    size_t n;
-    int rc = mk_encode(m, &p, &n);
-    if (rc != 0)
-        return rc;
-    uint32_t span;
-    memcpy(&span, p + 4, 4);
-    rc = wal_marker(db, m->type, m->flags, span, p + MK_HDR, n - MK_HDR, fno);
-    free(p);
-    return rc;
+    uint64_t last = 0;
+    return wal_markers_mk(db, m, 1, fno, &last);
+}
+
+int wal_markers_mk(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last)
+{
+    if (n == 0)
+        return TSDB_ERR_INVALID;
+    uint8_t **enc = calloc(n, sizeof *enc);
+    wal_mrec *r = calloc(n, sizeof *r);
+    int rc = enc && r ? 0 : TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        size_t len;
+        rc = mk_encode(&m[i], &enc[i], &len);
+        if (rc == 0) {
+            r[i] = (wal_mrec){.type = m[i].type, .flags = m[i].flags, .body = enc[i] + MK_HDR, .body_len = len - MK_HDR};
+            memcpy(&r[i].span, enc[i] + 4, 4);
+        }
+    }
+    uint64_t lsn = 0;
+    if (rc == 0) {
+        pthread_mutex_lock(&db->buf_lock);
+        rc = wal_markers_locked(db, r, n, fno, &lsn);
+        pthread_mutex_unlock(&db->buf_lock);
+    }
+    for (size_t i = 0; enc && i < n; i++)
+        free(enc[i]);
+    free(enc);
+    free(r);
+    if (rc)
+        return rc; /* nothing buffered */
+    *last = lsn;
+    return wal_commit(db, lsn); /* one sync for the batch */
 }
 
 /* Takes the single WAL writer role; waits while someone else holds it. */
@@ -1394,6 +1445,8 @@ int flush_waiting(eng *db)
     return rc;
 }
 
+void (*mt_test_before_seal)(eng *db);
+
 /* Turns the active memtable into parts. Rows stay visible throughout: the
  * memtable is moved to the flushing list and only leaves it together with
  * the publication of its parts. */
@@ -1435,6 +1488,9 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
     int rc = flush_waiting(db);
     if (rc == 0)
         rc = cls_classify_active(db); /* a leader's fresh series: their CLASS markers go before the seal */
+    void (*seal_hook)(eng *) = __atomic_load_n(&mt_test_before_seal, __ATOMIC_ACQUIRE);
+    if (rc == 0 && seal_hook)
+        seal_hook(db);
     wal_writer_enter(db); /* no commit may write to the segment being retired */
     pthread_mutex_lock(&db->buf_lock);
     bool empty = db->active->rows == 0;

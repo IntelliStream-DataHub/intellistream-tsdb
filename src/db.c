@@ -1253,16 +1253,23 @@ int eng_sync_dir(eng *db, const char *what)
     uint64_t removed = atomic_load(&db->wal_removed); /* unlinked before the fsync below */
     if (!db->opt.fsync) {
         int rc = eng_check(db);
-        if (rc == 0)
+        if (rc == 0) {
             removed_synced_to(db, removed);
+            pthread_mutex_lock(&db->dir_sync_lock);
+            atomic_store(&db->dsync_done, atomic_fetch_add(&db->dsync_started, 1) + 1);
+            pthread_mutex_unlock(&db->dir_sync_lock);
+        }
         return rc;
     }
     pthread_mutex_lock(&db->dir_sync_lock);
+    uint64_t seq = atomic_fetch_add(&db->dsync_started, 1) + 1; /* covers every rename made before this point */
     int rc = eng_check(db);
     if (rc == 0 && tsdb_fsync(db->dirfd) != 0) {
         eng_fail(db, what, errno);
         rc = TSDB_ERR_IO;
     }
+    if (rc == 0)
+        atomic_store(&db->dsync_done, seq); /* in order: dir_sync_lock is held */
     pthread_mutex_unlock(&db->dir_sync_lock);
     if (rc == 0)
         removed_synced_to(db, removed);

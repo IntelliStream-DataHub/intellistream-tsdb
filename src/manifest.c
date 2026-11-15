@@ -119,11 +119,8 @@ void db_retire_locked(eng *db, part *p)
 {
     char retired[sizeof p->name + sizeof RETIRED_PREFIX];
     snprintf(retired, sizeof retired, RETIRED_PREFIX "%s", p->name);
-    if (p->dropped) { /* no merged part covers its rows: see cls_dropped_end */
-        int64_t lo, end;
-        partition_range(db, p->partition, &lo, &end);
-        db->cls_dropped_end = MAX(db->cls_dropped_end, end);
-    }
+    if (p->dropped) /* no merged part covers its rows: see cls_dropped */
+        cls_dropped_note(db, p);
     if (renameat(db->dirfd, p->name, db->dirfd, retired) != 0) {
         /* still listed after a reopen: a dropped part would come back */
         eng_fail(db, "rename of a replaced part to retired_", errno);

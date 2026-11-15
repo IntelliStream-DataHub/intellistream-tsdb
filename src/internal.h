@@ -64,7 +64,9 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_VISIBLE_DURABLE, MUT_LEADER_FLUSH_UNCOMMITTED, MUT_LEADER_DEPOSE_FAILS, MUT_LEADER_ADMIT_AFTER,
        MUT_LEADER_BYTES_AFTER_SYNC, MUT_LEADER_MARKER_RC, MUT_LEADER_GATE_NOHOOK,
        MUT_LEADER_NO_SYNCED, MUT_LEADER_DICT_EARLY, MUT_REPLICA_CLASS_MAX, MUT_LEADER_WTAIL_LOCAL,
-       MUT_REPLICA_NO_CLASS_PURGE, MUT_LEADER_CLASS_MARKER_LATE, MUT_LEADER_NO_WTAIL_FROM };
+       MUT_REPLICA_NO_CLASS_PURGE, MUT_LEADER_CLASS_MARKER_LATE, MUT_LEADER_NO_WTAIL_FROM, MUT_LEADER_MARKERS_SPLIT,
+       MUT_DROPPED_GLOBAL, MUT_WTAIL_NOCAP, MUT_LEADER_NO_CUTOFF, MUT_LEADER_ZERO_RATE, MUT_LEADER_NO_RAISE_FROM,
+       MUT_LEADER_PRUNE_OFF1, MUT_REPLICA_FRESH_UNCHECKED };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1349,6 +1351,10 @@ int wal_marker(struct eng *db, uint16_t type, uint16_t flags, uint32_t span, con
                uint64_t *fno);
 /* Encodes `m` (marker.h) and appends it as one record (wal_marker); *fno gets its first number. */
 int wal_marker_mk(struct eng *db, const mk *m, uint64_t *fno);
+/* Encodes m[0..n) and appends them as consecutive records under one admission (all or none are buffered), then syncs
+ * them once; *fno gets the first number, *last the last position. A non-zero return before the sync means nothing of
+ * the batch is in the log. */
+int wal_markers_mk(struct eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last);
 
 /* The namespace-event hook (docs/design-ha-modes.md 2.1, M15): one call at each place a name or a file becomes
  * visible, in two phases. jr_intent runs before publish_lock is taken (a replicated backend appends the marker and
@@ -1473,6 +1479,8 @@ void eng_leader_depose(struct eng *db);
 void eng_leader_replay_floor(struct eng *db, uint64_t floor);
 /* test hook (tests/test_replica.c): called by a switch right after it released flush_lock */
 extern void (*cls_test_after_switch)(struct eng *db);
+/* test hook: called by a leader's flush after cls_classify_active, before the seal (src/memtable.c) */
+extern void (*mt_test_before_seal)(struct eng *db);
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
@@ -1706,9 +1714,13 @@ struct eng {
      * cls_gen counts the switches (changed under cls_rw held for writing). */
     pthread_rwlock_t cls_rw;
     _Atomic uint64_t cls_gen;
-    /* the end of the newest partition tsdb_drop_before or retention dropped in this process (db->lock): until the
-     * directory fsync its parts can come back after a power loss, so a switch never writes a T before it */
-    int64_t cls_dropped_end;
+    /* parts tsdb_drop_before or retention dropped whose removal may not be durable yet (db->lock): until a directory
+     * fsync that began after their rename, they can come back after a power loss, so a switch of a series with rows in
+     * one never writes a T before that partition's end (cls_dropped_bound_locked). Per series, and gone once durable:
+     * one global bound kept for the whole run would make a replica refuse a leader's exact T for a series that never
+     * had a row there (the leader's own bound is gone after a reopen or a promotion). */
+    struct cls_dropped *cls_dropped;
+    _Atomic uint64_t dsync_started, dsync_done; /* directory fsyncs begun, and the number of the last one that succeeded */
     void (*test_precommit)(void *); /* test hook: runs after a large insert placed its rows, before it commits */
     void *test_precommit_arg;
     void (*test_midplace)(void *); /* test hook: runs inside a placement, before rows are grouped into parts */
@@ -2321,6 +2333,21 @@ int cls_classify_memtable(eng *db, const memtable *m);
 /* A replicated leader decides the fresh series of its active memtable before mt_flush_ex seals it, so their CLASS
  * markers are in the segment their rows are in (a replica flushes a segment once a later one exists, and must know
  * the class first); at the flush itself a leader then decides class 0 only, as a replica does. flush_lock held. */
+struct cls_dropped {
+    struct cls_dropped *next;
+    int64_t end;    /* the dropped partition's end */
+    uint64_t need;  /* durable once dsync_done >= need */
+    uint32_t n;     /* ids[0..n): the part's series, ascending; UINT32_MAX: every series */
+    uint32_t ids[];
+};
+
+/* A dropped part p (db_retire_locked, db->lock held): its series keep the partition's end as a lower bound on a switch's T
+ * until a directory fsync begun after the rename succeeded. */
+void cls_dropped_note(struct eng *db, const struct part *p);
+/* At most this many flushed memtables are kept in the wtail list; older ones fold into the bound for every
+ * series (wtail_all_*). A test hook may lower it. */
+#define CLS_WTAIL_CAP 64
+extern _Atomic size_t cls_wtail_cap;
 int cls_classify_active(eng *db);
 /* eng_optimize of the partitions `keys` only, with no flush first (merge.c) */
 int eng_optimize_keys(eng *db, const int64_t *keys, size_t nkeys);
