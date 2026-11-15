@@ -88,9 +88,9 @@ for nem in kill pause none; do
     run_case "hang-$nem" "$HP" "a worker that hangs for ever on every 25th insert, $nem nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 -- \
         --nemesis "$nem" --seconds 10
 done
-for nem in eio power; do
-    run_case "hang-$nem" "$HP" "a worker that hangs for ever on every 25th insert, $nem nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 -- \
-        --nemesis "$nem" --seconds 10 --crashfs "$crashfs"
+for nem in eio power; do # the shim's own odds left out (0): the last server, which the quiet tail leaves to the clients, must live
+    run_case "hang-$nem" "$HP" "a worker that hangs for ever on every 25th insert, $nem nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 \
+        JEPSEN_PULL_PROB=0 JEPSEN_CRASH_PROB=0 -- --nemesis "$nem" --seconds 10 --crashfs "$crashfs"
 done
 run_case "hang-outage" "$HP" "a worker that hangs for ever on every 25th insert, outage nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 -- \
     --nemesis outage --seconds 20 --outagefs "$outagefs"

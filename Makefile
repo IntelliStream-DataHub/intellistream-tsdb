@@ -1182,6 +1182,11 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # first attempt (expect.sh violation), also beside a lazy nemesis: the history is
 # always judged (mutant-loss.sh plants a loss in a copy of tsdbd and runs it with a spinning nemesis; before round 10 that ended rc 3,
 # three times, with the history unjudged).
+# A tsdbd that dies by itself or stops answering is a violation under every nemesis (mutant-crash.sh: JV_CRASH aborts on every Nth
+# insert, JV_HANG blocks a worker for ever, each under kill, pause, none, eio, power, the hang also under outage, exit 1 at the first
+# attempt, no tsdbd left behind), a tsdbd that cannot start for want of memory is a harness error (exit 2) and one whose open
+# finds a damaged part a violation (failstart-tsdbd.sh), and the outage heal that takes long is INCONCLUSIVE unless the server reports the
+# volume DIVERGED (mutant-slowprobe.sh).
 # What passes on purpose is listed at the end of the comment of nemesis_check.
 # What each bound is set to, and the honest worst under load on tmpfs and disk, is in the comments of nemesis_check (jepsen.c).
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $(B)/test_crashfs_bus

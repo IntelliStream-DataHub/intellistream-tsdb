@@ -482,6 +482,11 @@ static int outage_problems, outage_faults, outage_kills;
  * run's end cuts short is counted, never silent. The nemesis stops starting faults at the end of the run's time
  * (nem_stop) and finishes the heal it is in before the clients stop, so the last heal is judged like the others. */
 static atomic_bool nem_stop, nem_done; /* nem_done: the nemesis thread has returned (main waits for it, bounded) */
+/* The quiet tail (round 11): when the run's time is up the nemesis finishes the step it is in and goes quiet (nem_quiet), and the clients go on for QUIET_TAIL_S against the last server, which nothing faults any more. A server that hangs one of its
+ * workers is cut short by the next kill or plug under a nemesis that restarts it every few hundred ms, and only a server that lives
+ * long enough shows that a request is never answered: this one has to, whatever the nemesis (the request deadline does the rest). */
+#define QUIET_TAIL_S 3
+static atomic_bool nem_quiet;
 static int outage_heals, outage_judged, outage_flap_judged, outage_slow_extended;
 static double outage_worst_s, outage_worst_flap_s;
 static char outage_keeppath[PATH_MAX + 64]; /* where a failed or close outage run's server log is kept */
@@ -1048,6 +1053,37 @@ static int signal_pid(pid_t pid, int sig)
  * server having died of that signal, never by the call having been made). */
 #define STOP_TERM_S 120 /* the longest an honest server takes to stop cleanly after SIGTERM (a flush, the joins): far above what a loaded machine needs */
 #define STOP_KILL_S 60  /* after SIGKILL: a process that is still there then is in the kernel's hands (D state), not ours */
+/* Signals `pid` (the server or a server of the harness) with `sig` and reaps it, within a bound: true when it was reaped, its wait status in *st.
+ * A server that does not stop within STOP_TERM_S of a SIGTERM (or any signal but SIGKILL) hangs: a VIOLATION, and it is killed. */
+static bool stop_pid(pid_t pid, int sig, int *st)
+{
+    bool reaped = false;
+    *st = 0;
+    if (sig == SIGTERM && atomic_load(&hung_flag))
+        sig = SIGKILL; /* a server that stopped answering has no clean stop to wait for */
+    signal_pid(pid, sig);
+    /* never an unbounded wait (round 11): a server whose clean stop waits for a hung worker never ends, and the harness that waits
+     * for it never ends either. Past the bound it is a VIOLATION (the server hangs), and it is killed by its pid. */
+    int64_t until = now_ns() + (sig == SIGKILL ? STOP_KILL_S : STOP_TERM_S) * 1000000000LL;
+    for (int i = 0; !(reaped = reap_server(pid, st, WNOHANG) == pid) && now_ns() < until; i++)
+        usleep(i < 200 ? 250 : 5000);
+    if (!reaped && sig != SIGKILL) {
+        death_problems++;
+        fprintf(stderr, "  the server (pid %d) did not stop within %d s of signal %d: it hangs (its clean stop waits for something "
+                "that never happens)\n", (int)pid, STOP_TERM_S, sig);
+        print_proc_state(pid);
+        print_tail(slogpath);
+        signal_pid(pid, SIGKILL);
+        until = now_ns() + STOP_KILL_S * 1000000000LL;
+        for (int i = 0; !(reaped = reap_server(pid, st, WNOHANG) == pid) && now_ns() < until; i++)
+            usleep(i < 200 ? 250 : 5000);
+    }
+    if (!reaped) {
+        fprintf(stderr, "jepsen: the server (pid %d) is still there %d s after SIGKILL\n", (int)pid, STOP_KILL_S);
+        bail(2);
+    }
+    return reaped;
+}
 static bool stop_server_st(int sig, int *st)
 {
     pid_t pid = atomic_load(&server_pid);
@@ -1056,30 +1092,7 @@ static bool stop_server_st(int sig, int *st)
     if (getenv("JEPSEN_VERBOSE"))
         fprintf(stderr, "jepsen: stopping %d with signal %d\n", (int)pid, sig);
     if (pid > 0) {
-        if (sig == SIGTERM && atomic_load(&hung_flag))
-            sig = SIGKILL; /* a server that stopped answering has no clean stop to wait for */
-        signal_pid(pid, sig);
-        /* never an unbounded wait (round 11): a server whose clean stop waits for a hung worker never ends, and the harness that waits
-         * for it never ends either. Past the bound it is a VIOLATION (the server hangs), and it is killed by its pid. */
-        int64_t until = now_ns() + (sig == SIGKILL ? STOP_KILL_S : STOP_TERM_S) * 1000000000LL;
-        for (int i = 0; !(reaped = reap_server(pid, st, WNOHANG) == pid) && now_ns() < until; i++)
-            usleep(i < 200 ? 250 : 5000);
-        if (!reaped && sig != SIGKILL) {
-            death_problems++;
-            fprintf(stderr, "  the server (pid %d) did not stop within %d s of signal %d: it hangs (its clean stop waits for something "
-                    "that never happens)\n", (int)pid, STOP_TERM_S, sig);
-            print_proc_state(pid);
-            print_tail(slogpath);
-            signal_pid(pid, SIGKILL);
-            until = now_ns() + STOP_KILL_S * 1000000000LL;
-            for (int i = 0; !(reaped = reap_server(pid, st, WNOHANG) == pid) && now_ns() < until; i++)
-                usleep(i < 200 ? 250 : 5000);
-        }
-        if (!reaped) {
-            fprintf(stderr, "jepsen: the server (pid %d) is still there %d s after SIGKILL\n", (int)pid, STOP_KILL_S);
-            server_gone();
-            bail(2);
-        }
+        reaped = stop_pid(pid, sig, st);
         server_gone();
     }
     atomic_store(&port, 0);
@@ -1938,7 +1951,7 @@ static void nap(useconds_t us, bool watch)
      * what is left of it, far above the dead bound */
     if ((idle_mutant || idle_mutant_long || (nem_mutant && !strncmp(nem_mutant, "nap:", 4))) && !watch && us >= 400000 && atomic_load(&server_pid) > 1)
         signal_pid(atomic_load(&server_pid), SIGUSR2);
-    for (useconds_t t = 0; t < us && !atomic_load(&stop) && !atomic_load(&nem_stop); t += 5000) {
+    for (useconds_t t = 0; t < us && !atomic_load(&stop) && !atomic_load(&nem_stop) && !atomic_load(&nem_quiet); t += 5000) {
         pid_t pid = atomic_load(&server_pid);
         siginfo_t si;
         si.si_pid = 0;
@@ -2495,6 +2508,10 @@ static void *nemesis_thread(void *arg)
                     md);
         if (!late && (atomic_load(&stop) || atomic_load(&nem_stop)))
             break;
+        if (!late && atomic_load(&nem_quiet)) { /* the quiet tail: no more faults, the last server is left to the clients until stop */
+            usleep(5000);
+            continue;
+        }
         if (!strcmp(mm, "nothing")) /* wakes, does nothing: no plug, no reaping, no restart */
             continue;
         pthread_mutex_lock(&server_lock);
@@ -2695,8 +2712,7 @@ static void *nemesis_thread(void *arg)
                     for (int i = 0; i < 100 && reap_server(pid, &st, WNOHANG) != pid; i++)
                         usleep(10000);
                     if (signal_pid(pid, 0) == 0) { /* idle: stopped, the shim rolls back at exit */
-                        signal_pid(pid, SIGTERM);
-                        reap_server(pid, &st, 0);
+                        stop_pid(pid, SIGTERM, &st);
                     }
                     atomic_fetch_sub(&nem_inprog, 1);
                 }
@@ -2725,8 +2741,7 @@ static void *nemesis_thread(void *arg)
                 bool gone = reap_server(pid, &st, WNOHANG) == pid;
                 if (!gone) {
                     int64_t issued = now_ns();
-                    signal_pid(pid, sig);
-                    if (reap_server(pid, &st, 0) == pid && (WIFSIGNALED(st) || WIFEXITED(st))) /* counted once the server has ended of it */
+                    if (stop_pid(pid, sig, &st) && (WIFSIGNALED(st) || WIFEXITED(st))) /* counted once the server has ended of it */
                         nem_fault_span(issued, now_ns());
                 }
                 md_death(st, gone ? 0 : sig, pid);
@@ -3739,7 +3754,14 @@ static int check_follower(const uint32_t *final)
     }
     free(view);
     signal_pid(pid, SIGTERM);
-    waitpid(pid, &st, 0);
+    bool fgone = false;
+    for (int i = 0; !(fgone = waitpid(pid, &st, WNOHANG) == pid) && i < STOP_TERM_S * 200; i++) /* bounded: a hung follower is a violation, not a hang of the harness */
+        usleep(5000);
+    if (!fgone) {
+        VIOLATION("the follower did not stop within %d s of SIGTERM, see %s\n", STOP_TERM_S, flogpath);
+        signal_pid(pid, SIGKILL);
+        waitpid(pid, &st, 0);
+    }
     atomic_store(&follower_pid, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
         VIOLATION("the follower ended with status %#x at SIGTERM, see %s\n", st, flogpath);
@@ -4397,6 +4419,19 @@ int main(int argc, char **argv)
     for (int64_t end = now_ns() + (int64_t)(seconds * 1e9); now_ns() < end && !atomic_load(&hung_flag);) /* a request that got no answer ends the run at once */
         usleep(20000);
     stop_ns = now_ns();
+    if (!outage && !(md || rot) && !atomic_load(&hung_flag)) {
+        JP_PHASE("the quiet tail");
+        atomic_store(&nem_quiet, true);
+        {   /* the nemesis finishes the step it is in (it holds server_lock for a step; bounded: a plug, a restart) */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 90;
+            if (pthread_mutex_timedlock(&server_lock, &ts) == 0)
+                pthread_mutex_unlock(&server_lock);
+        }
+        for (int64_t end = now_ns() + QUIET_TAIL_S * 1000000000LL; now_ns() < end && !atomic_load(&hung_flag);)
+            usleep(20000);
+    }
     JP_PHASE("stopped: joining the nemesis");
     if (outage) { /* the clients go on until the heal the nemesis is in has been judged (up to its bound, 90 s) */
         atomic_store(&nem_stop, true);

@@ -25,6 +25,12 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # slowed; says nothing about tsdb). The final state and the whole history are judged first, whatever the liveness
                           # checks found: a lost, resurrected or wrong row is exit 1 on its own attempt, never an INCONCLUSIVE rerun
                           # (tests/jepsen/mutant-loss.sh plants a loss in tsdbd beside a lazy nemesis; jepsen-selftest runs it).
+                          # A tsdbd that ends by itself (a crash, an exit of its own) or stops answering is a VIOLATION on that attempt under
+                          # every nemesis and under none: every request has a deadline (60 s; JEPSEN_REQ_DEADLINE_S), no answer is
+                          # "server stopped answering", joins and stops are bounded and the harness stops its servers by pid at every end.
+                          # How soon writes resume after an outage heal is liveness (INCONCLUSIVE). A tsdbd that does not start is a harness
+                          # error (exit 2) unless its log says the data is damaged (a violation). tests/jepsen/mutant-crash.sh plants a crash
+                          # (JV_CRASH) and a hang (JV_HANG) in a copy of tsdbd and requires exit 1 at the first attempt under each nemesis.
                           # tests/jepsen/rerun.sh runs every gate's jepsen: an INCONCLUSIVE run is rerun with the next seed, twice at
                           # most, printed each time; three in a row fail the gate with all three messages; the summary line at the
                           # end of make jepsen counts the reruns. jepsen-selftest requires each planted nemesis to end in that failure
