@@ -2577,6 +2577,176 @@ static void case_power_commit(void)
 }
 
 
+
+/* ------------------------------------------------------------ R: power lost between a publish and its RSTATE save
+ * A script in which every step is one record of the leader's log (small rows, a large insert's COMMIT, a DROP), the
+ * replica inside the crashfs root, power lost at every file system step. Case Q accepts any answer from the last
+ * acknowledged step on, which a COMMIT skipped in the crashed step passes; here the replica, applied to its durable
+ * end E, must answer exactly as the oracle did at E, and must list every COMMIT's file once. So a crash after RSTATE
+ * says `doing` and before the parts are listed must apply the COMMIT (mutant rscommittedtrue: the replica takes it for
+ * published and the rows are missing), one after they are listed and before `done` is saved must not list them again
+ * (rscommittedfalse: the same file listed twice). Mutant dropnorsave (a DROP carried out, RSTATE not saved) is
+ * equivalent, and this loop shows it: a DROP begins its segment, rows after it reach a part only through a flush that
+ * moves the parts' wal_seq past that segment, and the open applies from the first segment above it (replica_open_log), so
+ * a DROP whose `done` was lost is applied again only with nothing after it applied yet. Step 5 writes rows below the
+ * dropped bound after the DROP and step 6's COMMIT flushes them, the case where an extra DROP would remove them. */
+#define RSTEPS 8
+
+static void xp_rows_at(xport *x, uint32_t s, int64_t t0, int n, float base);
+
+static void r_step(xport *x, int i)
+{
+    int64_t far = T0 + 40 * DAY_MS;
+    float b = (float)(i * 100);
+    switch (i) {
+    case 0: xp_rows(x, 0, 0, 10, b); break;
+    case 1: xp_rows_at(x, 1, far, 5, b); break;
+    case 2: xp_rows(x, 0, 5, 40, b); break; /* a large insert: a COMMIT */
+    case 3: xp_rows_at(x, 0, far, 40, b); break;
+    case 4:
+        CHECK_EQ(eng_flush(x->ld), 0);
+        CHECK_EQ(eng_drop_before(x->ld, T0 + 10 * DAY_MS), 0); /* a DROP */
+        break;
+    case 5: xp_rows_at(x, 1, T0 + 5 * DAY_MS, 3, b); break; /* below the dropped bound, after the DROP */
+    case 6: /* the COMMIT's apply flushes step 5's rows into a part before its RSTATE save */
+        CHECK_EQ(eng_flush(x->ld), 0);
+        xp_rows_at(x, 0, far + 200000, 40, b);
+        break;
+    default: xp_rows_at(x, 1, far + 300000, 3, b); break;
+    }
+    CHECK_EQ(xp_pump(x, ld_last(x)), 0);
+}
+
+static uint64_t r_digest(eng *db)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t s = 0; s < NS; s++) {
+        qctx q = {.n = 0};
+        if (eng_query_raw_ex(db, s, T0 - 1000, T0 + 41 * DAY_MS, false, 0, qfn, &q) != 0)
+            return 0;
+        h = (h ^ q.n) * 1099511628211ULL;
+        for (size_t i = 0; i < q.n; i++) {
+            uint32_t bits;
+            memcpy(&bits, &q.v[i], 4);
+            h = (h ^ (uint64_t)q.ts[i]) * 1099511628211ULL;
+            h = (h ^ bits) * 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
+/* Two listed parts with the same index checksum: one COMMIT's file published twice */
+static bool parts_twice(eng *db)
+{
+    bool twice = false;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++)
+        for (size_t j = i + 1; j < db->nparts; j++)
+            twice |= db->parts[i]->index_hash == db->parts[j]->index_hash;
+    pthread_mutex_unlock(&db->lock);
+    return twice;
+}
+
+static int powerr_child(const char *ldir, const char *ackfile)
+{
+    xport x;
+    memset(&x, 0, sizeof x);
+    char rd[PATH_MAX + 8];
+    snprintf(x.ldir, sizeof x.ldir, "%s", ldir);
+    snprintf(rd, sizeof rd, "%s_r", ldir);
+    if (open_replica(rd, 0, &x.rep) != 0)
+        return 2;
+    xp_open_leader(&x);
+    for (int i = 0; i < RSTEPS; i++) {
+        r_step(&x, i);
+        if (failures)
+            return 3;
+        write_ack(ackfile, (uint64_t)i + 1);
+    }
+    return 0;
+}
+
+static void case_rstate_crash(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  power loss between a publish and its RSTATE save: skipped (no %s)\n", SHIM);
+        return;
+    }
+    uint64_t D[RSTEPS + 1], P[RSTEPS + 1];
+    {
+        xport o;
+        xp_start(&o, "pro");
+        eng_close(o.rep);
+        o.rep = NULL;
+        D[0] = r_digest(o.ld);
+        P[0] = ld_last(&o);
+        for (int i = 0; i < RSTEPS; i++) {
+            r_step(&o, i);
+            D[i + 1] = r_digest(o.ld);
+            P[i + 1] = ld_last(&o);
+        }
+        xp_stop(&o);
+    }
+    char ack[PATH_MAX + 16];
+    snprintf(ack, sizeof ack, "%s/acks-of-pr.ack", S);
+    int crashes = 0, between = 0;
+    bool finished = false;
+    for (int k = 0; k < 4000 && !finished; k++) {
+        char ld[PATH_MAX], rd[PATH_MAX + 8];
+        fresh(ld, "pr");
+        snprintf(rd, sizeof rd, "%s_r", ld);
+        sh("rm -rf '%s' && cp -a '%s' '%s'", rd, ld, rd);
+        unlink(ack);
+        int code = run_power_child_as("--powerr", ld, rd, ack, k, k + 1);
+        if (code != 99 && code != 0)
+            fprintf(stderr, "R: step %d: the child ended with status %d\n", k, code);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += code == 99;
+        finished = code == 0;
+        uint64_t done = 0;
+        FILE *f = fopen(ack, "r");
+        if (f) {
+            if (fscanf(f, "%" SCNu64, &done) != 1)
+                done = 0;
+            fclose(f);
+        }
+        eng *db;
+        int rc = open_replica(rd, 0, &db);
+        if (rc != 0) {
+            fprintf(stderr, "R: step %d: the open failed: %d\n", k, rc);
+            failures++;
+            continue;
+        }
+        uint64_t e = replica_durable_end(db);
+        int j = 0;
+        while (j < RSTEPS && P[j + 1] <= e)
+            j++;
+        if (e < P[done] || e != P[j]) {
+            fprintf(stderr, "R: step %d: the durable end %" PRIu64 " is not the end of a step from %" PRIu64 " on\n", k, e,
+                    done);
+            failures++;
+        } else if (replica_apply(db, e) != 0) {
+            fprintf(stderr, "R: step %d: the durable log does not apply\n", k);
+            failures++;
+        } else if (r_digest(db) != D[j]) {
+            fprintf(stderr, "R: step %d: the replica applied to %" PRIu64 " does not answer as the leader did there "
+                    "(mutant rscommittedtrue, dropnorsave)\n", k, e);
+            failures++;
+        } else if (parts_twice(db)) {
+            fprintf(stderr, "R: step %d: a COMMIT's file is listed twice (mutant rscommittedfalse)\n", k);
+            failures++;
+        }
+        between += e > P[0];
+        eng_close(db);
+        if (failures)
+            break;
+    }
+    CHECK(finished && crashes > 50 && between > 0);
+    printf("  power lost at each of %d steps of a replica applying COMMITs and a DROP: applied to its durable end it "
+           "answers as the leader did there, each COMMIT's file listed once\n", crashes);
+}
 /* ------------------------------------------------------------ N: review round 2 (drop ordering, staged files, promotion) */
 
 /* A drop on the leader while a large write waits for its commit point (a second thread, as tsdbd's request threads):
@@ -3615,6 +3785,11 @@ int main(int argc, char **argv)
             eng_test_mutant = mutant_of(argv[4]);
         return powerl_child(argv[2], argv[3]);
     }
+    if (argc >= 4 && strcmp(argv[1], "--powerr") == 0) {
+        if (argc >= 5)
+            eng_test_mutant = mutant_of(argv[4]);
+        return powerr_child(argv[2], argv[3]);
+    }
     if (argc >= 4 && strcmp(argv[1], "--powerq") == 0) {
         if (argc >= 5)
             eng_test_mutant = mutant_of(argv[4]);
@@ -3637,6 +3812,11 @@ int main(int argc, char **argv)
     {
         char *slash = strrchr(SELF, '/');
         snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
+    }
+    if (getenv("TEST_REPLICA_RSTATE_ONLY")) { /* the quick run of the RSTATE power loss */
+        case_rstate_crash();
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
     }
     if (getenv("TEST_REPLICA_DEPOSE_ONLY")) { /* the quick run of the deposed leader's cases */
         case_close_bound();
@@ -3704,6 +3884,7 @@ int main(int argc, char **argv)
         case_commit_random(seed);
     case_power();
     case_power_commit();
+    case_rstate_crash();
     case_leader_power();
     for (unsigned seed = 1; seed <= 20; seed++) {
         int f0 = failures;
