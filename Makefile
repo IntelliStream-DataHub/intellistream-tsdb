@@ -1,3 +1,6 @@
+# `make` alone builds `all`: a rule for single objects above its line (the chunk objects' headers) would otherwise
+# become the default goal (`make` built only build/chunk.o from R6 on; `make check-default-goal` tests it).
+.DEFAULT_GOAL := all
 CC      ?= cc
 UNAME_S := $(shell uname -s)
 # macOS is a developer platform (see docs/macos.md): no io_uring, no CPU levels, the portable scalar kernels on
@@ -715,7 +718,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1218,6 +1221,13 @@ test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/test_un
 	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage /tmp || exit 1; \
 	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_unavailable /tmp || exit 1; done
 endif
+
+# `make` with no target must build `all` (the .DEFAULT_GOAL line at the top): a rule for one object placed above
+# `all:` took the default once.
+test: check-default-goal
+check-default-goal:
+	@g=$$($(MAKE) --no-print-directory -pnq -f $(firstword $(MAKEFILE_LIST)) 2>/dev/null | sed -n 's/^\.DEFAULT_GOAL := //p' | tail -n 1); \
+	if [ "$$g" != all ]; then echo "check-default-goal: make alone builds '$$g', not all"; exit 1; fi
 
 # The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.
 test: check-version
