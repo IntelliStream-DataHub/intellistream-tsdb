@@ -3027,6 +3027,110 @@ static void case_dict_commit(void)
     printf("  a leader's dictionary records reach their files only past their commit point\n");
 }
 
+/* L1c: the leader's T lies past every row a member may still replay. Rows of series 0 on day D3 are flushed on both;
+ * the leader deletes [D3, end of time) and merges them away, so its parts hold none.
+ * floor: the replica still holds the segment with them (its floor was not saved: replay floor 1). The leader's T must
+ * be past D3 from the WAL tail it keeps for the replica (mutant wtaillocal: pruned when the leader's own segment went;
+ * T falls below D3 and the replica, which may replay those rows, is CORRUPT or brings them back).
+ * dead: the replica unlinked the segment (the floor passed it); its parts still hold the deleted rows, which its own
+ * merges never removed (merge_threads = 0): before it applies T it merges the series' partitions at or past T (mutant
+ * noclasspurge: CORRUPT). Either way the replica reopens cleanly with no row on D3. */
+static void case_class_floor(int dead)
+{
+    xport x;
+    xp_start(&x, dead ? "lcdead" : "lcfloor");
+    eng *ld = x.ld;
+    char rd[PATH_MAX];
+    rdir(rd, sizeof rd, &x);
+    int64_t d3 = DAY1 + 2 * DAY_MS, ts[5];
+    float v[5], f = 0;
+    for (int i = 0; i < 5; i++)
+        ts[i] = d3 + 1000LL * i, v[i] = (float)(i + 1);
+    CHECK_EQ(eng_insert_series(ld, TSDB_FLOAT32, 0, ts, v, 5), 0);
+    xp_step(&x, "L1c: rows on D3");
+    CHECK_EQ(mt_flush(ld), 0);
+    CHECK_EQ(mt_flush(x.rep), 0);
+    if (dead)
+        CHECK_EQ(replica_floor_saved(x.rep, replica_applied_end(x.rep)), 0);
+    CHECK_EQ(eng_delete_range(ld, 0, d3, INT64_MAX), 0);
+    xp_step(&x, "L1c: deleted");
+    CHECK_EQ(eng_optimize(ld), 0);
+    xp_step(&x, "L1c: the leader merged");
+    CHECK_EQ(count_query(ld, 0, d3, d3 + DAY_MS, &f), 0);
+    eng_leader_replay_floor(ld, dead ? ld->fno_next : 1);
+    CHECK_EQ(eng_class_switch(ld, 0, 2, NULL), 0);
+    xp_step(&x, "L1c: the replica applied the switch");
+    CHECK_EQ(mt_flush(x.rep), 0);
+    CHECK_EQ(replica_floor_saved(x.rep, replica_applied_end(x.rep)), 0);
+    xp_reopen(&x, rd, replica_applied_end(x.rep));
+    if (x.rep) {
+        CHECK_EQ(eng_check(x.rep), 0);
+        CHECK_EQ(count_query(x.rep, 0, d3, d3 + DAY_MS, &f), 0);
+        int c = -1;
+        CHECK(eng_series_class(x.rep, 0, &c) == 0 && c == 2);
+    }
+    xp_stop(&x);
+    printf("  the leader's class switch time is past every row a member may replay (%s)\n",
+           dead ? "the member's parts merged first" : "a WAL tail the member keeps");
+}
+
+/* L1d: rows the leader places under the new history right after a switch (here from the switching thread, as soon as
+ * it let go of flush_lock: cls_test_after_switch) and flushes, sealing their segment, while the replica flushes too.
+ * The CLASS marker went into the log inside the switch, before them, so the replica places them as the leader did
+ * (mutant classmarkerlate: the marker follows them; the replica put them under the old class, its parts hold rows
+ * past T, and the apply is CORRUPT). */
+static xport *ORDER_X;
+static int64_t ORDER_TS;
+
+static void order_hook(eng *db)
+{
+    xport *x = ORDER_X;
+    if (!x || db != x->ld)
+        return;
+    ORDER_X = NULL;
+    float v[3] = {5, 6, 7};
+    int64_t ts[3] = {ORDER_TS, ORDER_TS + 1000, ORDER_TS + 2000};
+    CHECK_EQ(eng_insert_series(db, TSDB_FLOAT32, 0, ts, v, 3), 0);
+    CHECK_EQ(mt_flush(db), 0);
+    int64_t t1 = T0 + 50000;
+    float v1 = 1;
+    CHECK_EQ(eng_insert_series(db, TSDB_FLOAT32, 1, &t1, &v1, 1), 0); /* a record in the next segment: the replica seals */
+    xp_ship_logs(x);
+    if (!x->noapply)
+        replica_apply(x->rep, ld_last(x));
+    CHECK_EQ(mt_flush(x->rep), 0);
+}
+
+static void case_class_order(void)
+{
+    xport x;
+    xp_start(&x, "lcorder");
+    eng *ld = x.ld;
+    char rd[PATH_MAX];
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 5, 1);
+    xp_step(&x, "L1d: rows on T0's day");
+    eng_leader_replay_floor(ld, ld->fno_next);
+    ORDER_TS = T0 + 3 * DAY_MS;
+    ORDER_X = &x;
+    __atomic_store_n(&cls_test_after_switch, order_hook, __ATOMIC_RELEASE);
+    CHECK_EQ(eng_class_switch(ld, 0, 2, NULL), 0);
+    __atomic_store_n(&cls_test_after_switch, NULL, __ATOMIC_RELEASE);
+    CHECK(ORDER_X == NULL); /* the hook ran */
+    xp_step(&x, "L1d: the replica applied the switch and the rows after it");
+    float f = 0;
+    CHECK_EQ(count_query(x.rep, 0, ORDER_TS, ORDER_TS + 10000, &f), 3);
+    CHECK_EQ(mt_flush(x.rep), 0);
+    CHECK_EQ(replica_floor_saved(x.rep, replica_applied_end(x.rep)), 0);
+    xp_reopen(&x, rd, replica_applied_end(x.rep)); /* the open checks every part against CLASSES */
+    if (x.rep) {
+        CHECK_EQ(eng_check(x.rep), 0);
+        CHECK_EQ(count_query(x.rep, 0, ORDER_TS, ORDER_TS + 10000, &f), 3);
+    }
+    xp_stop(&x);
+    printf("  a CLASS marker precedes the rows the leader places under it\n");
+}
+
 /* L2: a deposed leader ends every wait for the commit point with TSDB_ERR_INDETERMINATE (the record is in its log and a
  * replica may hold it) and is not failed: fail-stop would end tsdbd and every volume with it (mutant deposefails: a
  * large write's COMMIT wait fails the engine). After that every write is refused before it is buffered
@@ -3651,7 +3755,10 @@ int main(int argc, char **argv)
     }
     if (getenv("TEST_REPLICA_LEADER_ONLY")) { /* the quick run of the leader's cases (L1-L9, the power loss last) */
         case_leader_gate();
+        case_class_order();
         case_dict_commit();
+        case_class_floor(0);
+        case_class_floor(1);
         case_leader_ack();
         case_leader_admit();
         case_leader_bytes();
@@ -3689,7 +3796,10 @@ int main(int argc, char **argv)
     case_restage();
     case_stage_damage();
     case_leader_gate();
+    case_class_order();
     case_dict_commit();
+    case_class_floor(0);
+    case_class_floor(1);
     case_leader_ack();
     case_leader_admit();
     case_leader_bytes();
