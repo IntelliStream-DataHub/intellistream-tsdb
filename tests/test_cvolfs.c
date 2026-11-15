@@ -16,7 +16,7 @@
  *    the one reported, and the next prepare is accepted under a record at the acknowledged open.
  *
  *   ./build/test_cvolfs [scratch dir]
- *   ./build/test_cvolfs --mutant nosync|nodirsync|nononce|trustunsure|samerid [scratch dir]    must fail
+ *   ./build/test_cvolfs --mutant nosync|nodirsync|nononce|trustunsure|tornstale|samerid [scratch dir]    must fail
  *   ./build/test_cvolfs --child DIR ACKFILE      (internal: a process the shim kills)
  */
 #define _GNU_SOURCE
@@ -91,8 +91,11 @@ static void cap_end(char *out, size_t cap)
     size_t n = 0;
     if (cap_rd >= 0) {
         char junk[4096];
-        for (ssize_t r; (r = read(cap_rd, out && n + 1 < cap ? out + n : junk, out && n + 1 < cap ? cap - 1 - n : sizeof junk)) > 0;)
-            n += out && n + 1 < cap ? (size_t)r : 0;
+        bool room = out != NULL;
+        for (ssize_t r; (r = read(cap_rd, room ? out + n : junk, room ? cap - 1 - n : sizeof junk)) > 0;) {
+            n += room ? (size_t)r : 0;
+            room = out && n + 1 < cap;
+        }
         close(cap_rd);
         cap_rd = -1;
     }
@@ -360,9 +363,32 @@ static void test_unsure(void)
     CHECK(load_repl(root, 1, &st, &torn) == 0 && !torn && st.open_gen == o3.gen && st.open_nonce == o3.nonce);
     replfile_state_free(&st);
     /* what it saved is a clean REPL: the next open under the record of this one is an ordinary one */
+    /* clean to the load, but still unsure: the fence, led and log start it holds are those of the older slot (F2) */
+    CHECK(load_repl(root, 1, &st, &torn) == 0 && !torn && st.unsure);
+    replfile_state_free(&st);
     r = rec(1, o3.gen, o3.nonce);
     struct cvolfs_open o4;
-    CHECK(cvolfs_prepare(root, &r, &o4) == 0 && o4.gen == o3.gen + 1 && !o4.unsure);
+    CHECK(cvolfs_prepare(root, &r, &o4) == 0 && o4.gen == o3.gen + 1 && o4.unsure);
+    CHECK(load_repl(root, 1, &st, &torn) == 0 && !torn && st.unsure);
+    replfile_state_free(&st);
+
+    /* the save of the record followed a torn load, then the newest slot rots: the older slot is a belt and one open
+     * behind the record. The current copy: accepted, and reported above the record */
+    fresh("unsure3", root, sizeof root);
+    r = rec(1, 0, 0);
+    CHECK(cvolfs_prepare(root, &r, &o1) == 0);
+    r = rec(1, 1, o1.nonce);
+    CHECK(cvolfs_prepare(root, &r, &o2) == 0);
+    poke_slot(root, 1, newest_slot(root, 1), 80);
+    r = rec(1, 2, o2.nonce);
+    cap_begin();
+    CHECK(cvolfs_prepare(root, &r, &o3) == 0 && o3.unsure); /* saved o3.gen = 1 + belt + 1 over the damaged slot */
+    cap_end(NULL, 0);
+    poke_slot(root, 1, newest_slot(root, 1), 80);
+    r = rec(1, o3.gen, o3.nonce);
+    cap_begin();
+    CHECK(cvolfs_prepare(root, &r, &o4) == 0 && o4.unsure && o4.gen == o3.gen + 1);
+    cap_end(NULL, 0);
 
     /* the older copy is still refused beside it: a directory at generation 1 (both slots whole) under a record at 2,
      * and the same generation under another nonce */
@@ -373,7 +399,41 @@ static void test_unsure(void)
     CHECK(refused(root, &r, "older copy of the directory"));
     r = rec(1, 1, o1.nonce ^ 8);
     CHECK(refused(root, &r, "in another open than the one the metadata group recorded"));
-    printf("  a damaged newest REPL slot is unsure: the open skips a belt, the older copy is still refused\n");
+
+    /* the stale copy whose newest slot is damaged (F1): a copy of v1 taken at generation 3, put back under a record at
+     * 10. Its slots hold 2 and 3 (clean copy: refused above); with the newest damaged only 2 is left, and the belt
+     * the load adds must not hide that it is far behind. And the same generation as the record under another nonce */
+    fresh("unsure4", root, sizeof root);
+    char copy[PATH_MAX + 64];
+    snprintf(copy, sizeof copy, "%s.copy", root);
+    uint64_t g = 0, n = 0;
+    struct cvolfs_open o;
+    for (int i = 1; i <= 10; i++) {
+        r = rec(1, g, n);
+        CHECK(cvolfs_prepare(root, &r, &o) == 0);
+        g = o.gen, n = o.nonce;
+        if (i == 3)
+            sh("rm -rf '%s'; cp -a '%s/v1' '%s'", copy, root, copy);
+    }
+    sh("rm -rf '%s/v1'; cp -a '%s' '%s/v1'", root, copy, root);
+    poke_slot(root, 1, newest_slot(root, 1), 80);
+    r = rec(1, g, n);
+    CHECK(refused(root, &r, "older copy of the directory"));
+    /* one open behind (rot of the newest slot of the current copy looks the same): let in, unsure, above the record */
+    sh("rm -rf '%s/v1'; cp -a '%s' '%s/v1'", root, copy, root);
+    poke_slot(root, 1, newest_slot(root, 1), 80);
+    r = rec(1, 3, 0);
+    cap_begin();
+    CHECK(cvolfs_prepare(root, &r, &o) == 0 && o.unsure && o.gen == 3 + REPLFILE_OPEN_GEN_BELT);
+    cap_end(NULL, 0);
+    /* a torn slot at the record's generation under another nonce: refused */
+    sh("rm -rf '%s/v1'; cp -a '%s' '%s/v1'", root, copy, root);
+    poke_slot(root, 1, newest_slot(root, 1), 80);
+    r = rec(1, 2, 0x5151);
+    CHECK(refused(root, &r, "in another open than the one the metadata group recorded"));
+    sh("rm -rf '%s'", copy);
+    printf("  a damaged newest REPL slot is unsure, and stays so after the save; the open skips a belt; an older copy "
+           "is refused, damaged or not\n");
 }
 
 /* ------------------------------------------------------------ power loss */
@@ -468,6 +528,19 @@ static void check_after(const char *dir, const char *ackfile, int k)
             snprintf(m, sizeof m, "step %d: v1 exists without all of META, REPL and FNO", k);
             fail_at(__FILE__, __LINE__, m);
         }
+        /* META's content, not only its name: an unsynced file can be empty or torn after the rename (power loss) */
+        char mp[PATH_MAX * 2], mb[1024];
+        snprintf(mp, sizeof mp, "%s/v1/META", dir);
+        FILE *mf = fopen(mp, "r");
+        size_t mn = mf ? fread(mb, 1, sizeof mb - 1, mf) : 0;
+        if (mf)
+            fclose(mf);
+        mb[mn] = 0;
+        if (!strstr(mb, "version=9\n") || !strstr(mb, "\nvolume=1\n") || !strstr(mb, "\nvolume_uuid=") ||
+            !strstr(mb, "\ncluster=") || !strstr(mb, "\nrequires=cluster,replica\n")) {
+            snprintf(m, sizeof m, "step %d: v1/META is empty or torn (%zu bytes)", k, mn);
+            fail_at(__FILE__, __LINE__, m);
+        }
         struct replfile_state st;
         bool torn;
         cap_begin();
@@ -536,7 +609,9 @@ static void test_power_loss(void)
             int c2 = run_child(dir, ackf, (k * 7) % 31, k + 1000);
             /* crashfs's unlink moves a file aside until the process ends (to undo it at a crash), so the rmdir of a
              * leftover v1.tmp that follows its unlinks fails there with ENOTEMPTY: that run ends with 4 and the
-             * leftover, and check_after's prepare (on the real file system) is what shows it removed */
+             * leftover. So a power loss inside "remove a leftover v1.tmp, then make v1" is not exercised under the
+             * shim (a loss at an unlink, the rmdir or the make that follows it); check_after's prepare, on the real
+             * file system, is what shows the leftover removed and the make done */
             char t1[PATH_MAX + 40];
             snprintf(t1, sizeof t1, "%s/v1.tmp", dir);
             CHECK(c2 == 99 || c2 == 0 || (c2 == 4 && access(t1, F_OK) == 0));
@@ -560,6 +635,8 @@ static void set_mutant(const char *m)
         cvolfs_test_mutant = CVOLFS_MUT_NONONCE;
     else if (!strcmp(m, "trustunsure"))
         cvolfs_test_mutant = CVOLFS_MUT_TRUSTUNSURE;
+    else if (!strcmp(m, "tornstale"))
+        cvolfs_test_mutant = CVOLFS_MUT_TORNSTALE;
     else if (!strcmp(m, "samerid"))
         cvolfs_test_mutant = CVOLFS_MUT_SAMERID;
     else {
@@ -604,7 +681,8 @@ int main(int argc, char **argv)
     } else if (cvolfs_test_mutant == CVOLFS_MUT_SAMERID) {
         test_basic();
         test_refusals();
-    } else if (cvolfs_test_mutant == CVOLFS_MUT_NONONCE || cvolfs_test_mutant == CVOLFS_MUT_TRUSTUNSURE) {
+    } else if (cvolfs_test_mutant == CVOLFS_MUT_NONONCE || cvolfs_test_mutant == CVOLFS_MUT_TRUSTUNSURE ||
+               cvolfs_test_mutant == CVOLFS_MUT_TORNSTALE) {
         test_basic();
         test_unsure();
     }

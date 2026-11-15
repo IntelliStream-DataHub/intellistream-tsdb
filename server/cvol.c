@@ -8,7 +8,8 @@
  *   1. The directory <dir>/v<N> (server/cvolfs.c does the disk side of steps 1 and 2). A new one is made whole or
  *      not at all: <dir>/v<N>.tmp (removed first if a crash left one), META (the root's format lines, volume=N,
  *      volume_uuid=, cluster=, requires=cluster,replica), REPL (src/replfile.c: the replica instance `rid` from the
- *      record, generation 0) and FNO, each fsynced, the directory fsynced, renamed to v<N>, the root fsynced. An existing one must hold the record's rid (else it is another instance of the
+ *      record, generation 0) and FNO, each fsynced, the directory fsynced, renamed to v<N>, the root fsynced. An existing one must hold the record's
+ *      rid (else it is another instance of the
  *      replica: refused, naming both) and a generation at or above the record's open_gen (else it is an older copy
  *      of the directory: refused, naming both).
  *   2. The open generation: REPL's generation + 1 and a random nonce of this open, saved (replfile_save: the older
@@ -28,11 +29,15 @@
  * A REPL that is missing, has no valid slot or cannot be read, one that belongs to another volume, cluster or node, and
  * a failed save (fail-stop for the volume: the handle is dropped, never retried) refuse the volume with a line naming
  * the path. A torn REPL (one slot damaged) is "unsure": its fence, led, floor and log start are not trusted (none is
- * used yet: the replica driver is not wired), and replfile skips a belt in the open generation, so the rule above
- * holds whatever the lost save carried.
+ * used yet: the replica driver is not wired; the flag is saved with the next open, kept in `unsure` for r3a to gate on,
+ * and cleared only by a save that sets fence = led = the group's epoch), and replfile skips a belt in the open
+ * generation. The older-copy rule holds on the slot that was read, belt removed: a torn REPL is accepted only when
+ * that slot is one open behind the record (rot of the newest slot), one open and a belt behind (the save of the record
+ * followed a torn load) or at or above it. A copy exactly one open behind whose newest slot is damaged looks like rot
+ * of the current copy: it is let in, reported unsure.
  * Mutants (TSDB_CVOL_MUTANT, tests only): `noopengen` opens the engine before REPLICA_OPEN commits; `anynonce` opens
  * under a record of the right generation whatever its nonce; the others are in cvolfs.h (`samerid`, `replnonce`,
- * `nononce`, `trustunsure`, `nodirsync`). Test switch: TSDB_CLUSTER_TEST stale_first_watch=1
+ * `nononce`, `trustunsure`, `tornstale`, `nodirsync`). Test switch: TSDB_CLUSTER_TEST stale_first_watch=1
  * lowers this server's open generations in the first push of its metadata copy by one (a copy one REPLICA_OPEN
  * behind, as when the log catch-up after a restart applies in steps).
  */
@@ -64,6 +69,7 @@ struct mvol {
     uint64_t rid; /* the directory's */
     uint64_t gen; /* the generation this open saved */
     uint64_t nonce; /* and its draw */
+    int unsure;   /* REPL was unsure at this open: its fence, led and log start are not trusted (r3a gates on it) */
     uint64_t epoch;
 };
 
@@ -123,6 +129,7 @@ static void prepare(const struct cluster_vol_rec *r)
             m.rid = o.rid;
             m.gen = o.gen;
             m.nonce = o.nonce;
+            m.unsure = o.unsure;
             m.state = MV_WAIT;
             say("volume %" PRIu32 " (%s): open generation %" PRIu64 ", waiting for the metadata group to record it",
                 r->number, r->name, m.gen);
@@ -285,6 +292,7 @@ int cvol_start(tsdb *t, const char *dir)
                          : !strcmp(mu, "replnonce")   ? CVOLFS_MUT_REPLNONCE
                          : !strcmp(mu, "nononce")     ? CVOLFS_MUT_NONONCE
                          : !strcmp(mu, "trustunsure") ? CVOLFS_MUT_TRUSTUNSURE
+                         : !strcmp(mu, "tornstale")   ? CVOLFS_MUT_TORNSTALE
                          : !strcmp(mu, "nodirsync")   ? CVOLFS_MUT_NODIRSYNC
                                                       : CVOLFS_MUT_NONE;
     const char *ct = getenv("TSDB_CLUSTER_TEST");

@@ -224,6 +224,8 @@ int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_o
             PRIu32 "): not opened", r->number, vdir, st.node, r->node);
         goto out;
     }
+    /* a torn load added a belt to open_gen (replfile_load): the checks below are about what the slot held */
+    uint64_t raw = st.open_gen - (torn ? REPLFILE_OPEN_GEN_BELT : 0);
     if (torn) {
         say("volume %" PRIu32 ": %s/REPL was damaged (a torn save or rot): its fence, led and log start are not "
             "trusted, the open generation skips ahead", r->number, vdir);
@@ -241,20 +243,30 @@ int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_o
             goto out;
         st.rid = rid;
     }
-    if (gen < r->open_gen) {
+    /* The older slot of the current copy holds the open before the newest save: raw = rec - 1 (rot of the slot at rec),
+     * rec - 1 - belt (the save of rec followed a torn load) or at least rec (a save after rec the group never heard of,
+     * or a later save of the same open). Anything else is an older copy, whose slot rot has only made the belt hide.
+     * A copy exactly one open behind with a damaged newest slot looks like rot of the current one: it is let in, and
+     * reported unsure. */
+    uint64_t rec = r->open_gen;
+    bool back1 = rec >= 1 && raw == rec - 1;
+    bool back1belt = rec >= 1 + REPLFILE_OPEN_GEN_BELT && raw == rec - 1 - REPLFILE_OPEN_GEN_BELT;
+    if (raw < rec && !(torn && (back1 || back1belt || cvolfs_test_mutant == CVOLFS_MUT_TORNSTALE))) {
         say("volume %" PRIu32 ": %s is at open generation %" PRIu64 ", below the %" PRIu64
             " the metadata group recorded: an older copy of the directory, not opened",
-            r->number, vdir, gen, r->open_gen);
+            r->number, vdir, raw, rec);
         goto out;
     }
     /* the test switch's copy one open behind shows this directory's own last open, nonce included */
-    uint64_t rec_nonce = r->stale_first && gen == r->open_gen ? nonce : r->open_nonce;
-    if (gen == r->open_gen && gen > 0 && nonce != rec_nonce && cvolfs_test_mutant != CVOLFS_MUT_REPLNONCE) {
+    uint64_t rec_nonce = r->stale_first && raw == rec ? nonce : r->open_nonce;
+    if (raw == rec && rec > 0 && nonce != rec_nonce && cvolfs_test_mutant != CVOLFS_MUT_REPLNONCE) {
         say("volume %" PRIu32 ": %s saved open generation %" PRIu64 " in another open than the one the metadata group"
             " recorded (nonce %016" PRIx64 ", recorded %016" PRIx64 "): an older copy of the directory, not opened",
-            r->number, vdir, gen, nonce, rec_nonce);
+            r->number, vdir, raw, nonce, rec_nonce);
         goto out;
     }
+    if (gen < rec) /* the belt did not reach the record (back1belt): the report must be above it */
+        gen = rec;
     while (draw == 0 && tsdb_random(&draw, sizeof draw) == 0)
         ; /* 0 is a REPL's without one */
     st.open_gen = gen + 1;
@@ -270,7 +282,7 @@ int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_o
     out->rid = st.rid;
     out->gen = gen + 1;
     out->nonce = draw;
-    out->unsure = torn;
+    out->unsure = st.unsure;
     rc = 0;
 out:
     replfile_close(rf);

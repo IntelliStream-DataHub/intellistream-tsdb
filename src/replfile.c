@@ -20,7 +20,8 @@
 #include <unistd.h>
 
 #define RF_MAGIC 0x32504552425f5344ull /* "DS_BREP2" little endian: a tag, never read as text; the digit is the format
-                                          * version (2: the open nonce in the last head word, 1 had it reserved) */
+                                          * version (2: the open nonce in the last head word and the
+                                          * unsure flag in the word at 60, 1 had them reserved) */
 #define RF_HEAD 128u
 #define RF_FILE (2 * REPLFILE_PAGE)
 
@@ -76,6 +77,7 @@ int replfile_encode(uint8_t *page, const struct replfile_state *st, uint64_t gen
     memcpy(page + 24, st->volume_uuid, 16);
     memcpy(page + 40, st->cluster_uuid, 16);
     put32(page + 56, st->node);
+    put32(page + 60, st->unsure ? 1 : 0);
     put64(page + 64, st->incarnation);
     put64(page + 72, st->rid);
     put64(page + 80, st->open_gen);
@@ -100,7 +102,7 @@ static int parse_slot(const uint8_t *page, size_t n, struct replfile_state *st, 
     if (n < RF_HEAD + 8 || n > REPLFILE_PAGE || get64(page) != RF_MAGIC)
         return PARSE_BAD;
     uint32_t len = get32(page + 16), nh = get32(page + 20);
-    if (nh > REPLFILE_MAX_HIST || len != RF_HEAD + nh * 16 + 8 || len > n || get32(page + 60) != 0)
+    if (nh > REPLFILE_MAX_HIST || len != RF_HEAD + nh * 16 + 8 || len > n || get32(page + 60) > 1)
         return PARSE_BAD;
     if (replfile_test_mutant != REPLFILE_MUT_NOCHECKSUM && get64(page + len - 8) != xxh64(page, len - 8, 0))
         return PARSE_BAD;
@@ -109,6 +111,7 @@ static int parse_slot(const uint8_t *page, size_t n, struct replfile_state *st, 
     memcpy(s.volume_uuid, page + 24, 16);
     memcpy(s.cluster_uuid, page + 40, 16);
     s.node = get32(page + 56);
+    s.unsure = get32(page + 60) == 1;
     s.incarnation = get64(page + 64);
     s.rid = get64(page + 72);
     s.open_gen = get64(page + 80);
@@ -318,6 +321,7 @@ int replfile_load(int dirfd, struct replfile **out, struct replfile_state *st, b
         /* rot of the newest slot looks like a torn write, and the lost save may have carried an open generation that
          * is registered already: skip a belt ahead, as FNO does, so the next registration is higher whatever was lost */
         st->open_gen += REPLFILE_OPEN_GEN_BELT;
+        st->unsure = true; /* durable once saved: a restart after the save must not trust the older slot's fence */
     }
     struct replfile *rf = handle(fd, slot, gen, st);
     if (!rf) {
@@ -339,6 +343,9 @@ int replfile_save(struct replfile *rf, const struct replfile_state *st)
     if (memcmp(st->volume_uuid, c->volume_uuid, 16) != 0 || memcmp(st->cluster_uuid, c->cluster_uuid, 16) != 0 ||
         st->node != c->node || st->rid != c->rid || st->open_gen < c->open_gen || st->fence < c->fence ||
         st->led < c->led || st->floor < c->floor || st->log_start < c->log_start)
+        return TSDB_ERR_INVALID;
+    /* unsure goes only with the save that makes fence = led (the epoch the metadata group holds, the caller's word) */
+    if (c->unsure && !st->unsure && st->led != st->fence)
         return TSDB_ERR_INVALID;
     /* the state's own invariants: a caller's bug must fail here, not at the core's next open */
     if (st->led > st->fence || (st->log_start > 1 && st->log_start - 1 > st->floor) ||

@@ -2187,14 +2187,12 @@ static void repl_of(int i, uint32_t number, uint64_t *rid, uint64_t *gen)
     fclose(f);
     if (got != sizeof pg)
         die("%s: %zu bytes, not two slots", path, got);
-    uint64_t g[2], magic;
+    uint64_t g[2];
     for (int k = 0; k < 2; k++) {
-        memcpy(&magic, pg[k], 8);
         memcpy(&g[k], pg[k] + 8, 8);
         if (memcmp(pg[k], "DS_BREP2", 8) != 0)
             die("%s: slot %d has no REPL magic", path, k);
     }
-    (void)magic;
     int n = g[1] > g[0];
     memcpy(rid, pg[n] + 72, 8);
     memcpy(gen, pg[n] + 80, 8);

@@ -24,7 +24,8 @@ struct cvolfs_rec {
 /* What a prepare saved: the open to report in the heartbeat. */
 struct cvolfs_open {
     uint64_t rid, gen, nonce;
-    int unsure; /* REPL was torn on load: fence, led, floor, log start and history are not trusted (none is used yet) */
+    int unsure; /* REPL is unsure (torn on load now or on an earlier open: replfile.h): fence, led, floor, log start and
+                 * history are not trusted (none is used yet) */
 };
 
 /* Makes <root>/v<N> whole or not at all, if it does not exist yet; then loads its REPL, checks it against `r` (identity,
@@ -44,7 +45,8 @@ enum {
     CVOLFS_MUT_REPLNONCE,    /* the nonce in REPL is not compared */
     CVOLFS_MUT_NONONCE,      /* the nonce is reported but not saved (REPL keeps 0) */
     CVOLFS_MUT_TRUSTUNSURE,  /* a torn REPL is trusted: no skip of a belt in the open generation */
-    CVOLFS_MUT_NODIRSYNC     /* the new directory is renamed into place without the sync of the root (the rename can be lost after the ack) */
+    CVOLFS_MUT_TORNSTALE,    /* a torn REPL is never judged an older copy (only its belt-raised generation counts) */
+    CVOLFS_MUT_NODIRSYNC     /* the new directory is renamed into place without the sync of the root (lost after the ack) */
 };
 extern int cvolfs_test_mutant;
 

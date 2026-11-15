@@ -253,6 +253,48 @@ static void test_basic(void)
     printf("  create, alternating slots, load\n");
 }
 
+/* A torn load is "unsure" and the next save stores it: after a restart the load is clean, and the older slot's fence
+ * and led must still not look trusted. Only a save that sets led = fence clears it. */
+static void test_unsure_flag(void)
+{
+    char dir[PATH_MAX + 32];
+    struct replfile *rf;
+    struct replfile_state got;
+    bool torn;
+    quiet(true);
+    fresh("unsure", dir, sizeof dir);
+    make(dir, 4);
+    flip(dir, 88); /* the newest slot's fence */
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && torn && got.unsure);
+    CHECK(got.led != got.fence); /* so that clearing needs a reason */
+    CHECK(replfile_save(rf, &got) == 0); /* the open generation, the fence and the led as loaded */
+    replfile_close(rf);
+    replfile_state_free(&got);
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && !torn && got.unsure);
+    struct replfile_state w = got;
+    w.unsure = false;
+    CHECK(replfile_save(rf, &w) == TSDB_ERR_INVALID); /* led != fence: the epoch is not the group's yet */
+    w.led = w.fence;
+    w.unsure = true;
+    CHECK(replfile_save(rf, &w) == 0); /* led = fence alone does not clear it either */
+    replfile_close(rf);
+    replfile_state_free(&got);
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && !torn && got.unsure);
+    replfile_state_free(&got);
+    replfile_close(rf);
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && got.unsure && got.led == got.fence);
+    w = got;
+    w.unsure = false;
+    CHECK(replfile_save(rf, &w) == 0);
+    replfile_close(rf);
+    replfile_state_free(&got);
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && !torn && !got.unsure);
+    replfile_state_free(&got);
+    replfile_close(rf);
+    quiet(false);
+    printf("  a torn load is unsure, the next save stores it, only a save with led = fence clears it\n");
+}
+
 static void test_damage(void)
 {
     char dir[PATH_MAX + 32];
@@ -275,6 +317,7 @@ static void test_damage(void)
     state_of(&st, 5);
     CHECK(replfile_save(rf, &st) == TSDB_ERR_INVALID); /* the handle holds saves to the belted open generation */
     st.open_gen += REPLFILE_OPEN_GEN_BELT;
+    st.unsure = true; /* a save after a torn load keeps the flag (test_unsure_flag clears it) */
     CHECK(replfile_save(rf, &st) == 0);
     replfile_state_free(&st);
     replfile_close(rf);
@@ -404,6 +447,7 @@ static void test_unsure(void)
     state_of(&st, 4); /* what had been acknowledged: its open generation (2) is below the belted one */
     CHECK(replfile_save(rf, &st) == TSDB_ERR_INVALID);
     st.open_gen = 2 + REPLFILE_OPEN_GEN_BELT;
+    st.unsure = true;
     CHECK(replfile_save(rf, &st) == 0);
     replfile_state_free(&st);
     replfile_close(rf);
@@ -742,7 +786,7 @@ static void check_after(const char *dir, const char *ackfile, int k)
         struct replfile_state nx;
         state_of(&nx, found + 1);
         if (was_torn)
-            nx.open_gen += REPLFILE_OPEN_GEN_BELT;
+            nx.open_gen += REPLFILE_OPEN_GEN_BELT, nx.unsure = true;
         CHECK(replfile_save(rf, &nx) == 0);
         replfile_state_free(&nx);
         replfile_close(rf);
@@ -827,6 +871,7 @@ int main(int argc, char **argv)
     } else {
         test_basic();
         test_damage();
+        test_unsure_flag();
         test_unsure();
         test_trim_boundary();
         test_rules();

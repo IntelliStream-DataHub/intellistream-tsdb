@@ -49,6 +49,8 @@ struct replfile_state {
     uint64_t log_start;           /* first retained position (0 or 1: all of the log) */
     struct repl_epoch *hist;      /* malloc'd by create/load/from_durable; replfile_state_free */
     uint32_t nhist;
+    bool unsure;                  /* fence, led, floor, log_start may be older than what was acknowledged: set by a torn
+                                   * load, stored by every save, and cleared only by one that sets led = fence */
 };
 
 struct replfile;
@@ -73,7 +75,10 @@ int replfile_create(int dirfd, struct replfile_state *st, bool sync, struct repl
  * answer until it has the volume's current epoch from the metadata group and has saved fence = led = that epoch, and
  * log_start comes from the oldest segment on disk. Only open_gen is dealt with here: it is raised by
  * REPLFILE_OPEN_GEN_BELT (a gap, never a repeat, as FNO_BELT), so that a registration with the metadata group
- * (gen > recorded) cannot collide with one the lost save carried; the handle holds saves to that value. */
+ * (gen > recorded) cannot collide with one the lost save carried; the handle holds saves to that value.
+ * st->unsure is set by a torn load, and the next save stores it: after a restart the load is clean and the older
+ * slot's values would look trusted otherwise. *torn is the damage found on this load only; st->unsure also holds for
+ * a REPL an earlier open saved after a torn load. replfile_save clears the flag only in a save with led = fence. */
 int replfile_load(int dirfd, struct replfile **out, struct replfile_state *st, bool *torn);
 
 /* Stores *st in the older slot and fdatasyncs it (`sync` of create/load is not kept: a save always syncs). Returns 0

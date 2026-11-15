@@ -335,7 +335,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_replica $(or $(TMPDIR),/tmp)
 	./$(B)/test_cvol $(or $(TMPDIR),/tmp)
 	./$(B)/test_cvolfs $(or $(TMPDIR),/tmp)
-	for m in nosync nodirsync nononce trustunsure samerid; do ! ./$(B)/test_cvolfs --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	for m in nosync nodirsync nononce trustunsure tornstale samerid; do ! ./$(B)/test_cvolfs --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	for m in applyall ackunsynced keepcut nofloor walclock nopos classat opensync gapcheck torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced; do ! ./$(B)/test_replica --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done
 	./$(B)/test_feedstore $(or $(TMPDIR),/tmp)
 	! ./$(B)/test_feedstore --mutant noseal $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # a replayed segment renamed without its fdatasync must fail it

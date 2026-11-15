@@ -117,10 +117,11 @@ cgroup, so `nice` does not keep your work out of its way.
   durable bound of the WAL's log numbers). `src/replfile.c`: a replica directory's REPL file (rid, open generation and its
   nonce (format 2), fence, `led`, epoch history, log start, commit floor; FNO's two-slot scheme; a load with one bad slot is "unsure": the
   open generation skips a belt and the caller takes fence, `led` and log start from the metadata group, never from the
-  surviving slot; `tests/test_replfile.c`, `fuzz_repl`). tsdbd's volume manager keeps its replicas' open generation and
+  surviving slot (the `unsure` flag is stored by the next save and cleared only by one with `led` = `fence`: a restart does not make the older
+  slot's values trusted); `tests/test_replfile.c`, `fuzz_repl`). tsdbd's volume manager keeps its replicas' open generation and
   nonce in it: `server/cvolfs.c` (make `v<N>`: META, REPL, FNO in `v<N>.tmp`, renamed; load, check and raise REPL at every
   open; a missing, unreadable or CORRUPT REPL, another identity and a failed save refuse the volume with a line naming the
-  path; `tests/test_cvolfs.c`: power loss at every step under crashfs, mutants `nosync nodirsync nononce trustunsure samerid`,
+  path; `tests/test_cvolfs.c`: power loss at every step under crashfs, mutants `nosync nodirsync nononce trustunsure tornstale samerid`,
   also settable as `TSDB_CVOL_MUTANT` in tsdbd for `test_cluster volumes`), `server/cvol.c` the manager thread above it.
   `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
   decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
