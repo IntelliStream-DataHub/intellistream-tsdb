@@ -3023,6 +3023,17 @@ static void case_dict_commit(void)
     CHECK_EQ(j.rc, TSDB_ERR_INDETERMINATE);
     CHECK_EQ(fsize(x.ldir, "RETENTION"), before);
     CHECK_EQ(eng_check(ld), 0);
+    /* the deposed leader's files are byte for byte those of the replica, which applied up to the commit point only:
+     * a next leader's record at the same offset is not hidden by a record of this one that never committed */
+    for (int k = 2; k < 4; k++) {
+        uint8_t *a = NULL, *b = NULL;
+        size_t la = 0, lb = 0;
+        CHECK_EQ(read_file(ld->dirfd, files[k], &a, &la), 0);
+        CHECK_EQ(read_file(x.rep->dirfd, files[k], &b, &lb), 0);
+        CHECK(la == lb && la > 0 && a && b && memcmp(a, b, la) == 0);
+        free(a);
+        free(b);
+    }
     xp_stop(&x);
     printf("  a leader's dictionary records reach their files only past their commit point\n");
 }
