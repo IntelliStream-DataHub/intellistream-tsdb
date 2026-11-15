@@ -2312,6 +2312,14 @@ static void case_promote(int variant)
     x.noapply = false;
     n->opt.wal_max_batch_rows = 16;
     CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
+    /* item 6: the promoted leader has the latest table (a replica runs without one) and keeps the replica's RSTATE,
+     * which holds the DROP it applied (mutant promotenocarry: no table, RSTATE removed) */
+    CHECK(n->lt != NULL);
+    {
+        char rs[PATH_MAX + 16];
+        snprintf(rs, sizeof rs, "%s/RSTATE", rd);
+        CHECK(access(rs, F_OK) == 0);
+    }
     xp_rows(&x, 0, 50, 6, 70);
     xp_step(&x, "P: small after promotion");
     xp_rows(&x, 1, 0, 40, 800);
@@ -3986,7 +3994,8 @@ static int mutant_of(const char *m)
                         : strcmp(m, "leadernorstate") == 0 ? MUT_LEADER_NO_RSTATE
                         : strcmp(m, "closewait") == 0 ? MUT_LEADER_CLOSE_WAIT
                         : strcmp(m, "keepignored") == 0 ? MUT_LEADER_KEEP_IGNORED
-                        : strcmp(m, "nohardlink") == 0 ? MUT_LEADER_NO_HARDLINK : 0;
+                        : strcmp(m, "nohardlink") == 0 ? MUT_LEADER_NO_HARDLINK
+                        : strcmp(m, "promotenocarry") == 0 ? MUT_PROMOTE_NO_CARRY : 0;
 }
 
 int main(int argc, char **argv)

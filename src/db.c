@@ -867,6 +867,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         return TSDB_ERR_INVALID;
     }
     db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0 && !replica;
+    db->latest_cache_asked = db->opt.latest_cache; /* replica_promote opens the writer with it */
     if (replica)
         db->opt.latest_cache = 0; /* its parts arrive whole (COMMIT): no fold lists to build the table from */
     if (latest_open(db) != 0) { /* the latest table (latest.c); a writer's only */

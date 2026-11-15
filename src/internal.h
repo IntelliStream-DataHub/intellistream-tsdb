@@ -65,7 +65,7 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_BYTES_AFTER_SYNC, MUT_LEADER_MARKER_RC, MUT_LEADER_GATE_NOHOOK,
        MUT_LEADER_NO_SYNCED, MUT_REPLICA_RS_COMMITTED_TRUE, MUT_REPLICA_RS_COMMITTED_FALSE, MUT_REPLICA_DROP_NO_SAVE,
        MUT_LEADER_CLOSE_FLUSH, MUT_LEADER_NO_RSTATE, MUT_LEADER_CLOSE_WAIT, MUT_LEADER_KEEP_IGNORED,
-       MUT_LEADER_NO_HARDLINK };
+       MUT_LEADER_NO_HARDLINK, MUT_PROMOTE_NO_CARRY };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1784,6 +1784,7 @@ struct eng {
     struct replica *rp; /* an engine opened as a replica (replica.c): the log arrives verbatim, rows apply at the commit point */
     const struct jr_ops *jr;   /* the replicated backend of a leader (jr_intent): eng_leader_attach, read with eng_jr */
     struct rstate *lrs;        /* with jr: the leader's RSTATE (replica.c, leader_rs_open), written under publish_lock */
+    size_t latest_cache_asked; /* the caller's opt.latest_cache (a replica runs with 0; replica_promote restores it) */
     struct lkseg {
         uint64_t seq, fno_end;
     } *lk;                       /* with jr: flushed segments kept for the replicas, oldest first (flush_lock) */

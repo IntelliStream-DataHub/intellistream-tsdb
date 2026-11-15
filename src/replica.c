@@ -1982,7 +1982,8 @@ int replica_epoch_begin(eng *db, uint64_t epoch, const char *owner, uint64_t *po
  * never meets a segment whose rows a drop has taken out of parts; the newest (the epoch's, with no rows) stays for the
  * writer's open to replay and remove, which keeps its own segment numbers above it. The numbers continue (fno_next = the log end + 1), the
  * writer's first segment is above the epoch's. A failure leaves the replica as it was, or (a crash in the middle)
- * with a log from which a replica open or a writer's open recovers; TSDB_ERR_INVALID: a precondition does not hold. */
+ * with a log from which a replica open or a writer's open recovers; TSDB_ERR_INVALID: a precondition does not hold.
+ * The writer gets the caller's latest_cache (a replica runs without the table) and the replica's RSTATE. */
 void (*replica_test_promote_hook)(void); /* test hook: after the segments are removed, before the engine is closed */
 
 int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
@@ -2032,6 +2033,8 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
         return rc;
     }
     tsdb_options opt = db->opt;
+    if (eng_test_mutant != MUT_PROMOTE_NO_CARRY)
+        opt.latest_cache = db->latest_cache_asked; /* the replica ran without the latest table; the leader has one */
     char *dir = strdup(db->dir);
     if (!dir) {
         free(seqs);
@@ -2053,12 +2056,11 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
     free(seqs);
     if (rc == 0 && replica_test_promote_hook)
         replica_test_promote_hook();
+    if (rc == 0 && eng_test_mutant == MUT_PROMOTE_NO_CARRY)
+        unlinkat(db->dirfd, RS_FILE, 0); /* planted: the old promote's removal of RSTATE */
     if (rc == 0) {
-        unlinkat(db->dirfd, RS_FILE, 0); /* a writer has no use for it; the positions it holds are below the new ones */
-        if (tsdb_fsync(db->dirfd) != 0) {
-            free(dir);
-            return TSDB_ERR_IO; /* the replica goes on as it was: its RSTATE is not gone for sure */
-        }
+        /* RSTATE stays: the leader carries it on (leader_rs_open), and should it be deposed and reopened as a replica,
+         * the COMMITs and DROPs it applied as a replica are still in its `done` and `drops` */
         eng_close(db);
         *dbp = NULL;
         rc = eng_open(dir, &opt, out);
