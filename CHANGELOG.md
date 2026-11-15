@@ -16,8 +16,10 @@ a cluster made with 0.10.0 is initialised again, not upgraded (as for every chan
   N members that are up and may hold volumes (one per rack where it can; fewer is refused) and records it. Each of
   those servers makes `<dir>/v<N>` (`META` with `volume=`, `volume_uuid=`, `cluster=` and `requires=cluster,replica`,
   `FNO`, the copy's replica id), raises the copy's open generation at every start, and serves it only once the group has
-  recorded that generation (`REPLICA_OPEN`); a directory whose generation is below the record's, or whose replica id
-  differs, is refused, naming both. `status` prints `volume ...` and `replica volume ...` lines.
+  recorded that generation and the open's random nonce (`REPLICA_OPEN`), judged against a metadata copy that has
+  caught up with the server's own start; a directory whose generation is below the record's, that saved the record's
+  generation in another open, or whose replica id differs, is refused, naming both. A `v<N>.tmp` left by a crash is
+  removed and made again; a server makes at most 256 cluster volumes and says so in its log when given more. `status` prints `volume ...` and `replica volume ...` lines.
 - A server started with `--cluster` refuses to start with series in its own directory or lines in `VOLUMES` (naming
   them), and with `--wal-sync-ms` other than 0; while it runs, a series in its own directory and `tsdb DIR volume add`
   are refused (`TSDB_ERR_INVALID`). A directory whose `META` says `requires=cluster` opens only inside a cluster
@@ -29,7 +31,7 @@ a cluster made with 0.10.0 is initialised again, not upgraded (as for every chan
   `--commit-interval-ms`, `--repl-retain-mb`, `--repl-retain-s`, `--idle-seal-ms`; nothing acts on them yet).
 - The cluster tutorial's step 6 adds a volume and writes to it through its leader. Tests: `tests/test_cvol.c` (cluster
   volumes in a handle: holes, routing, the engine swap under readers), `test_cluster` `volumes` and `volrefuse`, with
-  the mutants `TSDB_CVOL_MUTANT=noopengen|samerid`.
+  the mutants `TSDB_CVOL_MUTANT=noopengen|samerid|anynonce|replnonce`.
 
 **Statistics over the network, protocol 15 (floor stays 12).** Everything of `docs/design-stats.md` that was embedded-only
 is now a request to `tsdbd`: the storage numbers of series, and the numbers, hot series and request costs of tenants.

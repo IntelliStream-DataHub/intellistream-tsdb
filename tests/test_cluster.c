@@ -2337,6 +2337,16 @@ static void scen_volumes(void)
         float val = 5;
         rc = tsdbc_insert_series(c, id, &ts, &val, 1);
         expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "insert on a replica");
+        /* the packed frames name a series per row: an id the replica's dictionary does not know yet (the leader made
+         * it, nothing replicates) is still FENCED naming the volume, never INVALID (cvol_refuse_ids) */
+        tsdb_sid ids2[2] = {id, id};
+        int64_t ts2[2] = {5000, 5001};
+        float val2[2] = {5, 6};
+        rc = tsdbc_insert(c, ids2, ts2, val2, 2);
+        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "a packed insert on a replica");
+        tsdb_values tv = {TSDB_FLOAT32, val2, NULL};
+        rc = tsdbc_insert_values(c, ids2, ts2, &tv, 2);
+        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "a packed typed insert on a replica");
         tsdbc_close(c);
     }
     printf("  the leader takes writes and reads them back, the replicas refuse them (FENCED)\n");
@@ -2426,6 +2436,66 @@ static void scen_volumes(void)
     for (int i = 0; i < 3; i++)
         await_log_count(i, "(tank): open as the", 1, 20000);
     printf("  a volume whose open generations are not recorded stays closed (RECOVERING), then opens\n");
+
+    /* a crash while making v3 leaves v3.tmp holding any of its files (META, REPL, FNO and their tmps): the next make
+     * removes it whole and makes v3 (one that left FNO behind refused the volume for good) */
+    char v3[PATH_MAX + 120], old3[PATH_MAX + 120];
+    snprintf(v3, sizeof v3, "%s/v3", dir1);
+    snprintf(old3, sizeof old3, "%s/v3.gen1", dir1);
+    {
+        char t3[PATH_MAX + 128];
+        snprintf(t3, sizeof t3, "%s.tmp", v3);
+        if (mkdir(t3, 0755) != 0)
+            die("%s: %s", t3, strerror(errno));
+        static const char *left[] = {"META", "REPL", "REPL.tmp", "FNO", "FNO.tmp"};
+        for (size_t k = 0; k < sizeof left / sizeof left[0]; k++) {
+            char f[PATH_MAX + 160];
+            snprintf(f, sizeof f, "%s/%s", t3, left[k]);
+            FILE *h = fopen(f, "w");
+            if (!h || fputs("left by a crash\n", h) < 0 || fclose(h) != 0)
+                die("%s: %s", f, strerror(errno));
+        }
+    }
+    if ((rc = vol_add(0, "pipe", 3, &num)) != 0 || num != 3)
+        die("volume add pipe: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_log_count(i, "(pipe): open as the", 1, 20000);
+    printf("  a v3.tmp left by a crash while making v3 is removed whole, and v3 is made and opened\n");
+
+    /* an older copy of v3 opened on a metadata copy one REPLICA_OPEN behind (stale_first_watch; the push waits for the
+     * copy to hold the run's incarnation, so this stands for a bug there): it saves generation 2, which the group holds
+     * from the open the copy predates. Neither that record (another nonce) nor, after a restart on a current copy,
+     * the REPL that open saved (generation 2 under its own nonce) lets it serve. Mutants anynonce, replnonce. */
+    stop(1, SIGTERM);
+    snprintf(cmd, sizeof cmd, "cp -a %s %s", v3, old3);
+    if (system(cmd) != 0)
+        die("%s failed", cmd);
+    start(1);
+    await_open_gen(0, "pipe", 1, 2, 0);
+    await_log_count(1, "(pipe): open as the", 2, 30000);
+    stop(1, SIGTERM);
+    snprintf(cmd, sizeof cmd, "rm -rf %s && mv %s %s", v3, old3, v3);
+    if (system(cmd) != 0)
+        die("%s failed", cmd);
+    envs[1] = "hold_opens_file=1,stale_first_watch=1";
+    start(1);
+    envs[1] = "hold_opens_file=1";
+    await_log_count(1, "(pipe): open generation 2, waiting", 2, 40000);
+    if ((rc = vol_add(0, "spare", 1, &num)) != 0) /* a commit: every copy moves and is pushed again */
+        die("volume add spare: %s", cluster_strerror(rc));
+    await_log_count(1, "(pipe): the metadata group recorded open generation 2 of another open", 1, 30000);
+    c = client(1);
+    expect_unavail(c, tsdbc_series_at(c, "pump7.flow", "pipe", &x), 3, TSDB_WHY_RECOVERING, "a stale open");
+    tsdbc_close(c);
+    if (log_count(1, "(pipe): open as the") != 2)
+        die("server 1 opened its older copy of v3 under the generation of the open it predates");
+    stop(1, SIGTERM);
+    start(1);
+    await_log_count(1, "saved open generation 2 in another open than the one the metadata group recorded", 1, 40000);
+    usleep(1500000);
+    if (log_count(1, "(pipe): open as the") != 2)
+        die("server 1 opened its older copy of v3 after a restart");
+    printf("  an older copy that saved the recorded generation in a stale open is refused, also after a restart\n");
 
     /* without a quorum a restarted server answers RECOVERING, never NOTFOUND, and opens nothing */
     int s = L == 2 ? 1 : 2;

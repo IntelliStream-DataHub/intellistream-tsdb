@@ -148,6 +148,8 @@ struct meta_replica {
     uint8_t claim_blocked; /* shared: a CLAIM_FAILED barred it from grants until its flags say it is well again */
     uint64_t rid;          /* the replica instance (replicated: new for every fresh directory; shared: 0) */
     uint64_t open_gen;     /* the last REPLICA_OPEN generation */
+    uint64_t open_nonce;   /* that open's draw: two opens of copies of one directory can save the same generation,
+                            * and the replica serves only under a record of its own open (gen and nonce, §8.5) */
 };
 
 struct meta_epoch {
@@ -415,7 +417,8 @@ void meta_op_slot_move_pending(struct meta_entry *e, uint32_t slot, uint32_t fro
 void meta_op_slot_freeze(struct meta_entry *e, uint32_t slot, uint32_t from, uint64_t from_epoch);
 void meta_op_slot_move(struct meta_entry *e, uint32_t slot, uint32_t to);
 void meta_op_slot_move_cancel(struct meta_entry *e, uint32_t slot);
-void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t rid, uint64_t gen);
+void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t rid, uint64_t gen,
+                          uint64_t nonce);
 void meta_op_restore(struct meta_entry *e, uint64_t gen);
 void meta_op_name_group(struct meta_entry *e); /* reserved: an empty body; applies as INVALID */
 

@@ -501,6 +501,7 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
             v->wal_off = get64(&r);
             v->rid = get64(&r);
             v->open_gen = get64(&r);
+            v->open_nonce = get64(&r);
             h->vols[j].local_fault_s = get64(&r);
         }
         h->ndoms = get32(&r);
@@ -1535,6 +1536,7 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
                 v->wal_off = get64(&s);
                 v->rid = get64(&s);
                 v->open_gen = get64(&s);
+                v->open_nonce = get64(&s);
                 if (v->health == CL_HEALTH_OK)
                     continue;
                 /* the timer of a (volume, domain) fault runs from the first report of it and breaks on a report
@@ -2739,6 +2741,7 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now)
         put64(b, v->wal_off);
         put64(b, v->rid);
         put64(b, v->open_gen);
+        put64(b, v->open_nonce);
         put64(b, h->vols[i].fault_ns ? since(now, h->vols[i].fault_ns) / (1000 * MS) : 0);
     }
     put32(b, h ? h->ndoms : 0);
@@ -3522,6 +3525,7 @@ static void put_sections(struct buf *b)
         put64(b, v->wal_off);
         put64(b, v->rid);
         put64(b, v->open_gen);
+        put64(b, v->open_nonce);
     }
     sec_end(b, at);
     at = sec_begin(b, HBS_DOMAINS);
@@ -3771,16 +3775,28 @@ static void vol_watch_duty(void)
 {
     if (!g_vwatch || !C.sm.initialised || C.sm.applied == g_vwatch_applied)
         return;
+    /* Only a copy that holds this run's own incarnation (the leader's MEMBER_STATE up for it, committed after this
+     * process started) is known to hold every REPLICA_OPEN committed before the restart: the volume manager judges a
+     * directory's generation against it (an older copy of v<N> must not pass on a copy that has not seen the open it
+     * predates), so nothing is pushed before. Without a quorum nothing is: the volumes stay RECOVERING. */
+    const struct meta_member *me = meta_member(&C.sm, C.id);
+    if (!me || me->incarnation != C.incarnation)
+        return;
     g_vwatch_applied = C.sm.applied;
     static struct cluster_vol_rec recs[CLUSTER_REPORT_VOLS];
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < C.sm.nvolumes && n < CLUSTER_REPORT_VOLS; i++) {
+    static uint32_t said_over;
+    uint32_t n = 0, over = 0;
+    for (uint32_t i = 0; i < C.sm.nvolumes; i++) {
         const struct meta_volume *v = &C.sm.volumes[i];
         if (v->kind != META_VOL_REPLICATED)
             continue;
         for (uint32_t k = 0; k < v->nrep; k++) {
             if (v->rep[k].node != C.id)
                 continue;
+            if (n == CLUSTER_REPORT_VOLS) {
+                over++;
+                break;
+            }
             struct cluster_vol_rec *r = &recs[n++];
             memset(r, 0, sizeof *r);
             r->number = v->number;
@@ -3791,9 +3807,14 @@ static void vol_watch_duty(void)
             r->epoch = v->epoch;
             r->rid = v->rep[k].rid;
             r->open_gen = v->rep[k].open_gen;
+            r->open_nonce = v->rep[k].open_nonce;
             break;
         }
     }
+    if (over > said_over) /* the heartbeat's report has room for this many: the rest are never made or opened here */
+        say("holds replicas of %" PRIu32 " volumes more than the %d this server makes, opens and reports; those past"
+            " volume %" PRIu32 " are not opened", over, CLUSTER_REPORT_VOLS, recs[n - 1].number);
+    said_over = over > said_over ? over : said_over;
     g_vwatch(g_vwatch_arg, C.id, recs, n);
 }
 
@@ -3837,7 +3858,7 @@ static void propose_opens(uint64_t now)
                 continue;
             struct meta_entry e;
             meta_entry_init(&e);
-            meta_op_replica_open(&e, v->number, rp->node, rp->rid, vr->open_gen);
+            meta_op_replica_open(&e, v->number, rp->node, rp->rid, vr->open_gen, vr->open_nonce);
             if (propose(&e, 0, 0, 0) == ISO_OK)
                 say("proposes volume %" PRIu32 " replica on node %" PRIu32 " open generation %" PRIu64, v->number,
                     rp->node, vr->open_gen);

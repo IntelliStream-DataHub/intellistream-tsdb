@@ -912,7 +912,8 @@ void meta_op_slot_move_cancel(struct meta_entry *e, uint32_t slot)
     op_end(e, st);
 }
 
-void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t rid, uint64_t gen)
+void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t rid, uint64_t gen,
+                          uint64_t nonce)
 {
     struct wr w;
     size_t st = op_begin(e, &w, META_OP_REPLICA_OPEN);
@@ -920,6 +921,7 @@ void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, 
     put32(&w, node);
     put64(&w, rid);
     put64(&w, gen);
+    put64(&w, nonce);
     op_end(e, st);
 }
 
@@ -1529,7 +1531,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
     }
     case META_OP_REPLICA_OPEN: {
         uint32_t number = get32(r), node = get32(r);
-        uint64_t rid = get64(r), gen = get64(r);
+        uint64_t rid = get64(r), gen = get64(r), nonce = get64(r);
         if (r->bad)
             return META_ERR_FORMAT;
         struct meta_volume *v;
@@ -1544,6 +1546,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         if (v->rep[i].rid != rid || gen <= v->rep[i].open_gen)
             return META_ERR_STALE; /* another instance of the directory, or a restored copy's older generation */
         v->rep[i].open_gen = gen;
+        v->rep[i].open_nonce = nonce;
         touched[(*ntouched)++] = number;
         return META_OK;
     }
@@ -1831,6 +1834,7 @@ static void put_volume(struct wr *w, const struct meta_volume *v)
         put8(w, v->rep[j].claim_blocked);
         put64(w, v->rep[j].rid);
         put64(w, v->rep[j].open_gen);
+        put64(w, v->rep[j].open_nonce);
     }
     put32(w, v->leader);
     put64(w, v->epoch);
@@ -1962,6 +1966,7 @@ static int get_volume(struct rd *r, struct meta_volume *v)
         v->rep[j].claim_blocked = get8(r);
         v->rep[j].rid = get64(r);
         v->rep[j].open_gen = get64(r);
+        v->rep[j].open_nonce = get64(r);
         if (v->rep[j].learner > 1 || v->rep[j].unanswered > 1 || v->rep[j].claim_blocked > 1)
             return -1;
     }

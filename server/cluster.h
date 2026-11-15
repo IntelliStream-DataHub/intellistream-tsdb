@@ -78,6 +78,7 @@ struct cluster_vol_report { /* a volume this server owns */
     uint64_t wal_seg, wal_off;         /* positions as the owner last made them durable */
     uint64_t rid, open_gen;            /* replicated: the directory's replica instance and the generation its last
                                         * open saved (§8.5); the leader proposes REPLICA_OPEN for a higher one */
+    uint64_t open_nonce;               /* that open's random draw, recorded with the generation */
 };
 struct cluster_dom_report {
     char name[META_DOMAIN_MAX];
@@ -105,9 +106,12 @@ struct cluster_vol_rec {
     uint32_t leader; /* the record's leader (rep[0] at VOLUME_ADD): the writer */
     uint64_t epoch;
     uint64_t rid, open_gen; /* this server's replica: its instance and the last REPLICA_OPEN generation committed */
+    uint64_t open_nonce;    /* and the nonce committed with it */
 };
-/* Called on the cluster thread after the metadata copy changed (and once at start), with every replicated volume
- * that names this server (`self`) as a replica, ascending by number; it must copy what it keeps and not block. */
+/* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
+ * holds every REPLICA_OPEN committed before this start), with every replicated volume that names this server (`self`)
+ * as a replica, ascending by number (at most CLUSTER_REPORT_VOLS; past that a line is logged); it must copy what it
+ * keeps and not block. */
 typedef void (*cluster_vol_watch_fn)(void *arg, uint32_t self, const struct cluster_vol_rec *v, uint32_t n);
 void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg);
 
