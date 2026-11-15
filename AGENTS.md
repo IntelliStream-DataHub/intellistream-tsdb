@@ -114,7 +114,10 @@ cgroup, so `nice` does not keep your work out of its way.
 - `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable. Nothing that holds `buf_lock` may touch a large block of fresh memory (the series array is a lazily touched
   mapping, `mt_s_grow`), and big buffers freed on the flush path go through `tsdb_free_big` (`src/compat.h`): a `munmap`
   or a memset of tens of MB stalls every append and lookup for ms (`tests/test_flush_tail.c`). `src/fno.c`: the `FNO` file (the
-  durable bound of the WAL's log numbers). `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
+  durable bound of the WAL's log numbers). `src/replfile.c`: a replica directory's REPL file (rid, open generation,
+  fence, `led`, epoch history, log start, commit floor; FNO's two-slot scheme; a load with one bad slot is "unsure": the
+  open generation skips a belt and the caller takes fence, `led` and log start from the metadata group, never from the
+  surviving slot; `tests/test_replfile.c`, `fuzz_repl`). `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
   decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
 - `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
   per-partition vectors, the HyperLogLogs of active series, the hot lists (reads, writes, bytes per row) and the
