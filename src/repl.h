@@ -80,7 +80,8 @@ struct repl_vmeta {
 
 enum repl_msg_type {
     REPL_M_APPEND = 1,            /* leader -> replica: records after prev_pos, and the commit point */
-    REPL_M_ACK,                   /* replica -> leader: durable and written ends of the verified prefix */
+    REPL_M_ACK,                   /* replica -> leader: durable and written ends of the verified prefix, and the
+                                     first position its log still holds (start) */
     REPL_M_REFUSE,                /* replica -> sender of an older epoch: `epoch` (and `leader` if known) */
     REPL_M_QUERY,                 /* replica -> leader: my last epoch (last_epoch) and log end (written); end = a
                                      query number */
@@ -88,7 +89,7 @@ enum repl_msg_type {
                                      last position of that epoch in its log; prev_epoch, prev_pos, end: the query's
                                      last_epoch, written and number, echoed */
     REPL_M_FENCE,                 /* metadata -> replica: refuse every epoch below `epoch` */
-    REPL_M_FENCE_REPLY,           /* replica -> metadata: durable, last_epoch, rid */
+    REPL_M_FENCE_REPLY,           /* replica -> metadata: durable, last_epoch, rid, start */
     REPL_M_META,                  /* metadata -> replica: the volume's record (meta) */
     REPL_M_ISR_REQ,               /* leader -> metadata: meta = the requested record (epoch, isr_version: the basis) */
     REPL_M_RESIGN,                /* replica -> metadata: I cannot lead `epoch` (I led it before a restart) */
@@ -107,6 +108,8 @@ struct repl_msg {
     const struct repl_rec *rec;   /* nrec descriptors, contiguous from prev_pos + 1 */
     /* ACK, FENCE_REPLY, QUERY, ANSWER */
     uint64_t durable, written, rid, last_epoch, end;
+    uint64_t start;               /* ACK, FENCE_REPLY: the first position the sender's log still holds (repl_log_start;
+                                     1: all of it): it may replay any position from there (the replay floor) */
     int resync;                   /* ACK: the leader should send from written + 1 */
     struct repl_vmeta meta;       /* META, ISR_REQ */
 };
@@ -197,6 +200,14 @@ void repl_recv(struct repl *r, const struct repl_msg *m);
 void repl_tick(struct repl *r);
 /* The next action, 1; or 0 if there is none. */
 int repl_next_action(struct repl *r, struct repl_action *a);
+/* The driver removed the log's positions below `start` (its segments went into parts and their removal is durable:
+ * a power loss cannot bring them back). Never lower; reported in every ACK and FENCE_REPLY from now on. */
+void repl_log_start(struct repl *r, uint64_t start);
+/* Leader: the lowest position any replica of the volume may still replay (its log start, from its ACKs in this
+ * epoch, and the leader's own), the replay floor of design-cluster.md 5.4; 0 (unknown) while a member has not
+ * acknowledged in this epoch, or on a node that is not leading. Rows at positions below it can never come back on
+ * any replica: a partition-class switch takes its T past every row at or above it (classes.c). */
+uint64_t repl_replay_floor(const struct repl *r);
 
 /* Introspection, for drivers and checkers. */
 int repl_is_leader(const struct repl *r);
