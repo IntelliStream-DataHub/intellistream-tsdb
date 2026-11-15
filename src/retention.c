@@ -247,8 +247,6 @@ static int ret_set(eng *db, uint32_t series, int64_t limit_ms, bool apply, uint6
     int rc = eng_check(db);
     if (rc)
         return rc;
-    if (!apply && (rc = jr_intent(db, JR_RETENTION, &series)) != 0)
-        return rc;
     pthread_mutex_lock(&db->ret_lock);
     if (apply && eng_test_mutant != MUT_REPLICA_NO_POS /* planted: a replay appends again */ && record_off != db->ret_off) {
         pthread_mutex_unlock(&db->ret_lock);
@@ -262,6 +260,14 @@ static int ret_set(eng *db, uint32_t series, int64_t limit_ms, bool apply, uint6
     if (db->ret_broken) {
         pthread_mutex_unlock(&db->ret_lock);
         return TSDB_ERR_IO;
+    }
+    /* A leader's RETENTION marker names the record's offset, so it is appended under ret_lock (ret_lock > the WAL writer
+     * role), and the record goes to the file only once the marker is committed (design-cluster.md 5.4): a deposed
+     * leader must not keep a record the new leader's file has something else at. */
+    struct jr_ret_arg ra = {series, limit_ms, db->ret_off};
+    if (!apply && (rc = jr_intent(db, JR_RETENTION, &ra)) != 0) {
+        pthread_mutex_unlock(&db->ret_lock);
+        return rc;
     }
     if (db->ret_fd < 0) {
         bool existed = faccessat(db->dirfd, RET_FILE, F_OK, 0) == 0;

@@ -349,6 +349,14 @@ static int dict_append(series_dict *d, const char *name, size_t len, int type, u
             errno = 0; /* broken: the creator whose append failed fails the engine, with its cause (dict_get) */
         return rc;
     }
+    /* A leader's marker and its commit point come before the record (jr_markers): the id stays untaken meanwhile,
+     * since only appends (append_lock) take one. A failure was handled where it happened (errno 0: dict_get does
+     * not fail the engine again). */
+    if (d->before_append && (rc = d->before_append(d->before_arg, atomic_load(&d->count), name, len, type)) != 0) {
+        pthread_mutex_unlock(&d->append_lock);
+        errno = 0;
+        return rc;
+    }
     size_t size = rec_size(len);
     uint8_t *rec = calloc(1, size);
     if (!rec) {

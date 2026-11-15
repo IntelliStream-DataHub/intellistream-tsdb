@@ -950,9 +950,16 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
 {
     if (!db->wal_enabled || db->opt.wal_sync_ms != 0 || db->rp || db->opt.read_only)
         return TSDB_ERR_INVALID;
+    pthread_mutex_lock(&db->lock); /* rows of positions below the log end at the attach are in no wtail entry */
+    pthread_mutex_lock(&db->buf_lock);
+    db->wtail_from = MAX(db->wtail_from, db->fno_next);
+    pthread_mutex_unlock(&db->buf_lock);
+    pthread_mutex_unlock(&db->lock);
     __atomic_store_n(&db->jr, ops, __ATOMIC_RELEASE); /* the flusher, warmer and merges are running already */
     return 0;
 }
+
+void eng_leader_replay_floor(eng *db, uint64_t floor) { atomic_store(&db->lead_floor, floor); }
 
 void eng_leader_commit(eng *db, uint64_t pos)
 {
@@ -1365,7 +1372,7 @@ int flush_waiting(eng *db)
         db->nflushing--;
         db->wal_flushed = MAX(db->wal_flushed, m->wal_seq); /* flushes go in segment order */
         if (db->cls_on)
-            cls_wal_tail_locked(db, wt, m->wal_seq, m->max_ts);
+            cls_wal_tail_locked(db, wt, m->wal_seq, m->fno_end, m->max_ts);
         pthread_cond_signal(&db->merge_cv);
         pthread_mutex_unlock(&db->lock);
         lt_end(db, &lsec);
@@ -1426,6 +1433,8 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
      * one: it is written first, and the active one after it all the same, or
      * a large insert that relies on this flush would be shadowed by it */
     int rc = flush_waiting(db);
+    if (rc == 0)
+        rc = cls_classify_active(db); /* a leader's fresh series: their CLASS markers go before the seal */
     wal_writer_enter(db); /* no commit may write to the segment being retired */
     pthread_mutex_lock(&db->buf_lock);
     bool empty = db->active->rows == 0;

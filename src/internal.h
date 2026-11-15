@@ -51,7 +51,7 @@ typedef struct eng eng;
  * catches the bug; nothing in the library or the server ever sets it. */
 enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR,
        MUT_FLUSH_NOCLOSE,
-       MUT_REPLICA_APPLY_ALL, MUT_REPLICA_ACK_UNSYNCED, MUT_REPLICA_KEEP_CUT, MUT_REPLICA_NO_FLOOR, MUT_REPLICA_WALL_CLOCK, MUT_REPLICA_NO_POS, MUT_REPLICA_CLASS_AT,
+       MUT_REPLICA_APPLY_ALL, MUT_REPLICA_ACK_UNSYNCED, MUT_REPLICA_KEEP_CUT, MUT_REPLICA_NO_FLOOR, MUT_REPLICA_WALL_CLOCK, MUT_REPLICA_NO_POS,
        MUT_REPLICA_NO_OPEN_SYNC, MUT_REPLICA_NO_GAP_CHECK, MUT_REPLICA_NO_TORN_CUT, MUT_REPLICA_NO_FLOOR_CHECK,
        MUT_REPLICA_NO_DURABLE_GATE, MUT_REPLICA_NO_APPLY_CONTIG, MUT_REPLICA_NO_SEALED_RULE, MUT_REPLICA_NO_ROT_SYNC,
        MUT_REPLICA_NO_CUT_GEN, MUT_REPLICA_NO_CUT_SYNC, MUT_REPLICA_NO_CUT_DIRSYNC, MUT_REPLICA_NO_REPLAY_SKIP,
@@ -63,7 +63,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_NO_STAGE_ORPHANS,
        MUT_LEADER_VISIBLE_DURABLE, MUT_LEADER_FLUSH_UNCOMMITTED, MUT_LEADER_DEPOSE_FAILS, MUT_LEADER_ADMIT_AFTER,
        MUT_LEADER_BYTES_AFTER_SYNC, MUT_LEADER_MARKER_RC, MUT_LEADER_GATE_NOHOOK,
-       MUT_LEADER_NO_SYNCED };
+       MUT_LEADER_NO_SYNCED, MUT_LEADER_DICT_EARLY, MUT_REPLICA_CLASS_MAX, MUT_LEADER_WTAIL_LOCAL,
+       MUT_REPLICA_NO_CLASS_PURGE, MUT_LEADER_CLASS_MARKER_LATE, MUT_LEADER_NO_WTAIL_FROM };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1054,6 +1055,11 @@ typedef struct series_dict {
      * fails that add as if memory ran out */
     int (*test_fault)(void *arg, int point, const char *name);
     void *test_fault_arg;
+    /* a leader's gate (db.c installs it; replica.c jr_dict_series/jr_dict_state): called under append_lock with the
+     * id the name will get, after every check and before the record is written (its marker, then the commit point);
+     * non-zero refuses the create with nothing written and the id not taken */
+    int (*before_append)(void *arg, uint32_t id, const char *name, size_t len, int type);
+    void *before_arg;
     bool keep_names;   /* series_close leaves the name strings: tsdb_series_name pointers outlive a retired engine */
 } series_dict;
 enum { DICT_AT_ADD = 1, DICT_AT_FAILED = 2, DICT_AT_RELOAD = 3 };
@@ -1258,6 +1264,7 @@ _Static_assert(sizeof(mt_series) == 40, "mt_series stays 40 bytes");
 struct cls_wtail {
     struct cls_wtail *next;
     uint64_t seq;
+    uint64_t fno_end; /* the end of its segment's positions: a leader keeps it while a replica may hold one below */
     size_t n;
     bool sorted; /* ids sorted (with max), done by the first switch that looks */
     uint32_t *ids;
@@ -1403,6 +1410,20 @@ struct jr_ops {
     void (*seg_done)(void *ctx, struct eng *db, uint64_t seq);
 };
 int jr_intent(struct eng *db, enum jr_kind kind, const void *arg);
+/* JR_RETENTION's `arg`, under ret_lock: the record that goes to RETENTION at `off` once its marker is committed */
+struct jr_ret_arg {
+    uint32_t series;
+    int64_t limit_ms;
+    uint64_t off;
+};
+/* A leader's dictionary changes (design-cluster.md C10, 5.4, 5.5): each is a marker, then the commit point, then the
+ * file append; until then the id or record is held in memory only (a lookup does not see it), so a deposed leader
+ * never has a record in its file that the new leader's history lacks at that place. jr_markers appends the n markers
+ * and waits for the last one's commit point (0 at once without a replicated backend, as on a replica); the caller
+ * holds the dictionary's own append lock across it. jr_dict_series and jr_dict_state are series_dict.before_append. */
+int jr_markers(struct eng *db, const mk *m, size_t n, const char *what);
+int jr_dict_series(void *db, uint32_t id, const char *name, size_t len, int type);
+int jr_dict_state(void *db, uint32_t id, const char *name, size_t len, int type);
 static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
 {
     (void)db, (void)kind, (void)arg;
@@ -1446,6 +1467,12 @@ int eng_leader_attach(struct eng *db, const struct jr_ops *ops);
 void eng_leader_commit(struct eng *db, uint64_t pos);
 uint64_t eng_wal_durable_fno(struct eng *db);
 void eng_leader_depose(struct eng *db);
+/* The driver's replay floor (repl_replay_floor; 0: unknown): no replica may replay a position below it. A partition-class
+ * switch on a leader takes its T past every row at or above it, and waits (eng_class_switch: TSDB_ERR_UNAVAILABLE; the
+ * automatic switches ask again later) while it is below the first position this run tracks (classes.c). */
+void eng_leader_replay_floor(struct eng *db, uint64_t floor);
+/* test hook (tests/test_replica.c): called by a switch right after it released flush_lock */
+extern void (*cls_test_after_switch)(struct eng *db);
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
@@ -1691,8 +1718,14 @@ struct eng {
      * entry could not be allocated, up to segment wtail_all_seq. */
     struct cls_wtail *wtail;
     size_t nwtail;
-    uint64_t wtail_all_seq;
+    uint64_t wtail_all_seq, wtail_all_fno;
     int64_t wtail_all_max;
+    /* A leader (design-cluster.md 5.4): a replica may replay any position at or above the replay floor (lead_floor,
+     * eng_leader_replay_floor; 0: unknown), so the leader keeps wtail entries until their positions fall below it.
+     * wtail_from: rows at positions below it are not tracked (before this run's open, or pruned): a switch waits
+     * while the floor is below it (db->lock). */
+    uint64_t wtail_from;
+    _Atomic uint64_t lead_floor;
     uint64_t wal_unlink_next; /* the first flushed segment whose unlink failed, to try again (flush_lock); 0: none */
     uint64_t wal_open_removed; /* wal_open: the segments up to this are gone (a failed unlink or rename at open stops it) */
     /* the change feed (feed.h, feedfile.c, feedclean.c). Lock order: feed_lock is a leaf, never held while an engine
@@ -2285,6 +2318,12 @@ void cls_close(eng *db);
 int cls_classify_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, size_t n);
 /* The same for the fresh series of a memtable about to be flushed (caller holds flush_lock). */
 int cls_classify_memtable(eng *db, const memtable *m);
+/* A replicated leader decides the fresh series of its active memtable before mt_flush_ex seals it, so their CLASS
+ * markers are in the segment their rows are in (a replica flushes a segment once a later one exists, and must know
+ * the class first); at the flush itself a leader then decides class 0 only, as a replica does. flush_lock held. */
+int cls_classify_active(eng *db);
+/* eng_optimize of the partitions `keys` only, with no flush first (merge.c) */
+int eng_optimize_keys(eng *db, const int64_t *keys, size_t nkeys);
 /* After a flush (flush_lock held): a series of a long class that got much faster moves to a shorter one. */
 int cls_flush_guard(eng *db, const memtable *m);
 /* After an idle merge left one part in its partition: series whose rate left their class's band move. */
@@ -2292,7 +2331,7 @@ int cls_observe(eng *db, part *p);
 /* A flushed memtable whose segment may still be replayed: its series' newest timestamps, built before the flush
  * takes its locks (NULL on ENOMEM), then added under db->lock (which also drops entries no longer replayable). */
 struct cls_wtail *cls_wal_tail_new(const memtable *m);
-void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, int64_t max_ts);
+void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fno_end, int64_t max_ts);
 /* Placements (large inserts, replaces, flushes) hold the class history frozen from their first class lookup until
  * their parts are listed; a switch waits a few ms for them, then tries later. Never nested, and never held while waiting for a flush or a
  * merge (a switch holds flush_lock and the merge thread switches). */

@@ -23,12 +23,17 @@
  * Planted mutations (--mutant NAME) must make it fail: applyall (apply ignores the commit point), ackunsynced
  * (the durable end reports what was not synced), keepcut (a cut leaves the records), nofloor (a segment goes
  * before the floor is saved), walclock (retention reads the replica's own clock), nopos (a replayed RETENTION or CLASS
- * record is appended again), classat (a CLASS record takes the leader's T whatever this replica's parts hold);
- * the leader's: leadervisible, leaderflush, deposefails, admitafter, bytesaftersync, markerrc, gatenohook, nosynced
+ * record is appended again), classmax (a CLASS record takes max(T, this replica's own T) instead of T exactly),
+ * noclasspurge (a replica applies a CLASS record without merging away the rows its parts hold past T first);
+ * the leader's: leadervisible, leaderflush, deposefails, admitafter, bytesaftersync, markerrc, gatenohook, nosynced,
+ * dictearly (a dictionary record is appended before its marker passed the commit point), wtaillocal (the leader
+ * prunes its WAL tails by its own removed segments, not by the replicas' log starts), classmarkerlate (the CLASS
+ * marker goes after the switch let go of flush_lock), nowtailfrom (a switch right after an open or a promotion
+ * does not wait for the replicas to report a log start past the leader's open)
  * (the Makefile runs every name).
  *
  *   ./build/test_replica [scratch dir]
- *   ./build/test_replica --mutant applyall|ackunsynced|keepcut|nofloor|walclock|nopos|classat [scratch dir]    must fail
+ *   ./build/test_replica --mutant applyall|ackunsynced|keepcut|nofloor|walclock|nopos|classmax|... [scratch dir]    must fail
  *   ./build/test_replica --child DIR ACKFILE      (internal)
  */
 #define _GNU_SOURCE
@@ -80,6 +85,7 @@ static void stop_if_failed(const char *what)
 }
 
 #define T0 1700000000000LL
+#define DAY1 ((T0 / 86400000LL + 1) * 86400000LL) /* the day edge after T0 */
 #define NS 2    /* series */
 #define NT 64   /* distinct times per series (a day holds them: one partition) */
 static char S[PATH_MAX - 64], SELF[PATH_MAX];
@@ -1211,7 +1217,9 @@ static void case_classes(void)
         leader_rows(&l, 5, &rng); /* segment 1: rows of both series on the day of T0 */
     leader_roll(&l);
     lrec *first2 = leader_row1(&l, 1, T0 + 70000, 99.0f, T0 + 1000);
-    lrec *cm = m_class(&l, 0, 2, T0, 0);
+    /* a replica takes the leader's T exactly (design-cluster 5.4): T lies past every row of series 0 it holds, here
+       the day edge after T0's day (class 0 partitions are days, and a flushed part reaches its partition's end) */
+    lrec *cm = m_class(&l, 0, 2, DAY1, 0);
     int64_t far = T0 + 3 * 86400000LL;
     lrec *fr = leader_row1(&l, 0, far, 7.0f, far);
     eng *db;
@@ -1250,6 +1258,37 @@ static void case_classes(void)
         eng_close(db);
     }
     leader_free(&l);
+}
+
+/* I2: a replica takes the leader's T exactly. A CLASS record whose T lies below rows this replica holds (in a part
+   here) says its history is not the leader's: the apply is CORRUPT, never "max(T, own T)" (mutant classmax), which
+   would place rows the leader placed under the new class under the old one, and the two would answer differently. */
+static void case_class_exact(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "i2");
+    leader l;
+    unsigned rng = 9;
+    leader_init(&l);
+    for (int i = 0; i < 4; i++)
+        leader_rows(&l, 5, &rng);
+    leader_roll(&l);
+    lrec *first2 = leader_row1(&l, 1, T0 + 70000, 99.0f, T0 + 1000);
+    lrec *cm = m_class(&l, 0, 2, T0, 0); /* T0: below the rows of series 0 on T0's day */
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, first2->last), 0);
+    CHECK_EQ(mt_flush(db), 0);
+    CHECK_EQ(replica_apply(db, cm->last), TSDB_ERR_CORRUPT);
+    CHECK(eng_check(db) != 0);
+    CHECK_EQ(db->cls_off, 0);
+    eng_close(db);
+    leader_free(&l);
+    printf("  a CLASS record below this replica's rows is CORRUPT\n");
 }
 
 /* ------------------------------------------------------------ J..O: what the review of steps 1-2 found */
@@ -2311,6 +2350,15 @@ static void case_promote(int variant)
     x.noapply = false;
     n->opt.wal_max_batch_rows = 16;
     CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
+    /* a switch right after the promotion: the new writer knows no rows of the segments the members may still replay
+       (mutant nowtailfrom), so it waits until every member's log starts past its open */
+    uint64_t from = n->fno_next;
+    CHECK_EQ(eng_class_switch(n, 0, 2, NULL), TSDB_ERR_UNAVAILABLE);
+    eng_leader_replay_floor(n, from - 1);
+    CHECK_EQ(eng_class_switch(n, 0, 2, NULL), TSDB_ERR_UNAVAILABLE);
+    eng_leader_replay_floor(n, from);
+    CHECK_EQ(eng_class_switch(n, 0, 2, NULL), 0);
+    xp_step(&x, "P: a class switch after promotion");
     xp_rows(&x, 0, 50, 6, 70);
     xp_step(&x, "P: small after promotion");
     xp_rows(&x, 1, 0, 40, 800);
@@ -2892,6 +2940,93 @@ static void case_leader_gate(void)
     printf("  a leader shows, acknowledges and flushes rows only up to its commit point\n");
 }
 
+/* L1b: a dictionary change on a leader (SERIES, STATE, RETENTION, CLASS) is a marker, the commit point, then the
+ * file: until the commit point passes the marker the file is unchanged and a new id is not visible (mutant dictearly:
+ * the record goes to the file at once). A replica applies RETENTION and CLASS by offset and skips an offset below its
+ * file's end: a deposed leader's record at offset X that never committed would hide the next leader's other record at
+ * X. Deposed with the marker uncommitted, the leader's file stays as it was. */
+typedef struct djob {
+    eng *db;
+    int kind; /* 0 SERIES, 1 STATE, 2 RETENTION, 3 CLASS */
+    int rc;
+    atomic_bool done;
+} djob;
+
+static void *djob_main(void *a)
+{
+    djob *j = a;
+    uint32_t id;
+    j->rc = j->kind == 0   ? eng_series(j->db, "dc_new", TSDB_FLOAT32, &id)
+            : j->kind == 1 ? eng_state(j->db, "dc_state", true, &id)
+            : j->kind == 2 ? eng_set_retention(j->db, 1, 30 * DAY_MS)
+                           : eng_class_switch(j->db, 0, 2, NULL);
+    atomic_store(&j->done, true);
+    return NULL;
+}
+
+static off_t fsize(const char *dir, const char *name)
+{
+    char p[PATH_MAX + 32];
+    struct stat st;
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return stat(p, &st) == 0 ? st.st_size : -1;
+}
+
+static void case_dict_commit(void)
+{
+    static const char *const files[] = {"SERIES", "STATES", "RETENTION", "CLASSES"};
+    xport x;
+    xp_start(&x, "ldict");
+    eng *ld = x.ld;
+    xp_rows(&x, 0, 0, 5, 1); /* rows of series 0 for the switch */
+    xp_step(&x, "L1b: rows");
+    for (int k = 0; k < 4; k++) {
+        eng_leader_replay_floor(ld, ld->fno_next); /* the members' logs start past every row: the switch may go */
+        x.manual = true;
+        uint64_t c = eng_wal_durable_fno(ld);
+        eng_leader_commit(ld, c);
+        off_t before = fsize(x.ldir, files[k]);
+        djob j = {.db = ld, .kind = k};
+        pthread_t t;
+        pthread_create(&t, NULL, djob_main, &j);
+        for (int i = 0; i < 2500 && eng_wal_durable_fno(ld) == c; i++)
+            usleep(2000);
+        CHECK(eng_wal_durable_fno(ld) > c); /* the marker is in the log */
+        usleep(100000);
+        CHECK(!atomic_load(&j.done));
+        CHECK_EQ(fsize(x.ldir, files[k]), before); /* mutant dictearly */
+        uint32_t id;
+        if (k == 0)
+            CHECK(eng_series_lookup(ld, "dc_new", &id) != 0); /* not visible before its commit point */
+        eng_leader_commit(ld, eng_wal_durable_fno(ld));
+        join_within(t, &j.done, "L1b: the commit point did not end a dictionary wait");
+        CHECK_EQ(j.rc, 0);
+        CHECK(fsize(x.ldir, files[k]) > before);
+        if (k == 0)
+            CHECK_EQ(eng_series_lookup(ld, "dc_new", &id), 0);
+        x.manual = false;
+        xp_step(&x, "L1b: the replica applied the dictionary change");
+    }
+    /* deposed with a RETENTION marker uncommitted: the wait ends indeterminate, the file is unchanged */
+    x.manual = true;
+    uint64_t c = eng_wal_durable_fno(ld);
+    eng_leader_commit(ld, c);
+    off_t before = fsize(x.ldir, "RETENTION");
+    djob j = {.db = ld, .kind = 2};
+    pthread_t t;
+    pthread_create(&t, NULL, djob_main, &j);
+    for (int i = 0; i < 2500 && eng_wal_durable_fno(ld) == c; i++)
+        usleep(2000);
+    usleep(50000);
+    eng_leader_depose(ld);
+    join_within(t, &j.done, "L1b: a depose did not end a RETENTION wait");
+    CHECK_EQ(j.rc, TSDB_ERR_INDETERMINATE);
+    CHECK_EQ(fsize(x.ldir, "RETENTION"), before);
+    CHECK_EQ(eng_check(ld), 0);
+    xp_stop(&x);
+    printf("  a leader's dictionary records reach their files only past their commit point\n");
+}
+
 /* L2: a deposed leader ends every wait for the commit point with TSDB_ERR_INDETERMINATE (the record is in its log and a
  * replica may hold it) and is not failed: fail-stop would end tsdbd and every volume with it (mutant deposefails: a
  * large write's COMMIT wait fails the engine). After that every write is refused before it is buffered
@@ -3432,7 +3567,8 @@ static int mutant_of(const char *m)
                         : strcmp(m, "nofloor") == 0 ? MUT_REPLICA_NO_FLOOR
                         : strcmp(m, "walclock") == 0 ? MUT_REPLICA_WALL_CLOCK
                         : strcmp(m, "nopos") == 0 ? MUT_REPLICA_NO_POS
-                        : strcmp(m, "classat") == 0 ? MUT_REPLICA_CLASS_AT
+                        : strcmp(m, "classmax") == 0 ? MUT_REPLICA_CLASS_MAX
+                        : strcmp(m, "noclasspurge") == 0 ? MUT_REPLICA_NO_CLASS_PURGE
                         : strcmp(m, "opensync") == 0 ? MUT_REPLICA_NO_OPEN_SYNC
                         : strcmp(m, "gapcheck") == 0 ? MUT_REPLICA_NO_GAP_CHECK
                         : strcmp(m, "torncut") == 0 ? MUT_REPLICA_NO_TORN_CUT
@@ -3468,7 +3604,11 @@ static int mutant_of(const char *m)
                         : strcmp(m, "bytesaftersync") == 0 ? MUT_LEADER_BYTES_AFTER_SYNC
                         : strcmp(m, "markerrc") == 0 ? MUT_LEADER_MARKER_RC
                         : strcmp(m, "gatenohook") == 0 ? MUT_LEADER_GATE_NOHOOK
-                        : strcmp(m, "nosynced") == 0 ? MUT_LEADER_NO_SYNCED : 0;
+                        : strcmp(m, "nosynced") == 0 ? MUT_LEADER_NO_SYNCED
+                        : strcmp(m, "dictearly") == 0 ? MUT_LEADER_DICT_EARLY
+                        : strcmp(m, "wtaillocal") == 0 ? MUT_LEADER_WTAIL_LOCAL
+                        : strcmp(m, "classmarkerlate") == 0 ? MUT_LEADER_CLASS_MARKER_LATE
+                        : strcmp(m, "nowtailfrom") == 0 ? MUT_LEADER_NO_WTAIL_FROM : 0;
 }
 
 int main(int argc, char **argv)
@@ -3511,6 +3651,7 @@ int main(int argc, char **argv)
     }
     if (getenv("TEST_REPLICA_LEADER_ONLY")) { /* the quick run of the leader's cases (L1-L9, the power loss last) */
         case_leader_gate();
+        case_dict_commit();
         case_leader_ack();
         case_leader_admit();
         case_leader_bytes();
@@ -3530,6 +3671,7 @@ int main(int argc, char **argv)
     case_dicts();
     case_clock();
     case_classes();
+    case_class_exact();
     case_open_checks();
     case_seal();
     case_replay_skip();
@@ -3547,6 +3689,7 @@ int main(int argc, char **argv)
     case_restage();
     case_stage_damage();
     case_leader_gate();
+    case_dict_commit();
     case_leader_ack();
     case_leader_admit();
     case_leader_bytes();

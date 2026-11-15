@@ -2070,6 +2070,58 @@ static int leader_drop(eng *db, int64_t ts)
     return leader_marker_wait(db, fno, "a DROP marker was appended but its commit point did not come");
 }
 
+int jr_markers(eng *db, const mk *m, size_t n, const char *what)
+{
+    if (!eng_jr(db) || db->rp || n == 0)
+        return 0;
+    uint64_t fno = 0, last = 0;
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        rc = wal_marker_mk(db, &m[i], &fno);
+        if (rc == 0)
+            last = fno + m[i].span - 1;
+    }
+    if (rc && last == 0)
+        return leader_unappended(rc); /* none is in the log: definitely not applied */
+    if (rc) {
+        /* the earlier markers may commit without the records they name: only a deposed leader (cut by the next
+         * one) may go on */
+        if (!atomic_load(&db->lead_deposed))
+            eng_fail(db, what, EIO);
+        return TSDB_ERR_INDETERMINATE;
+    }
+    if (eng_test_mutant == MUT_LEADER_DICT_EARLY) /* planted: the record goes to the file before the commit point */
+        return 0;
+    return leader_marker_wait(db, last, what);
+}
+
+static int jr_dict(eng *db, uint16_t type, uint32_t id, const char *name, size_t len, int vtype)
+{
+    mk m = {.type = type, .span = 1};
+    if (type == MK_SERIES)
+        m.u.series = (mk_series){.id = id, .vtype = (uint32_t)vtype, .name = name, .name_len = (uint32_t)len};
+    else
+        m.u.state = (mk_state){.id = id, .name = name, .name_len = (uint32_t)len};
+    return jr_markers(db, &m, 1, "a SERIES or STATE marker was appended but its commit point did not come");
+}
+
+int jr_dict_series(void *db, uint32_t id, const char *name, size_t len, int type)
+{
+    return jr_dict(db, MK_SERIES, id, name, len, type);
+}
+
+int jr_dict_state(void *db, uint32_t id, const char *name, size_t len, int type)
+{
+    return jr_dict(db, MK_STATE, id, name, len, type);
+}
+
+static int leader_retention(eng *db, const struct jr_ret_arg *ra)
+{
+    mk m = {.type = MK_RETENTION, .span = 1};
+    m.u.retention = (mk_retention){.series = ra->series, .limit_ms = ra->limit_ms, .record_off = ra->off};
+    return jr_markers(db, &m, 1, "a RETENTION marker was appended but its commit point did not come");
+}
+
 int jr_intent(eng *db, enum jr_kind kind, const void *arg)
 {
     if (!eng_jr(db))
@@ -2079,7 +2131,9 @@ int jr_intent(eng *db, enum jr_kind kind, const void *arg)
         return leader_commit(db, arg);
     case JR_DROP:
         return leader_drop(db, *(const int64_t *)arg);
+    case JR_RETENTION:
+        return leader_retention(db, arg);
     default:
-        return 0; /* the dictionary and retention markers are the driver's (it appends them with wal_marker_mk) */
+        return 0; /* SERIES, STATE and CLASS go through jr_markers from their dictionaries */
     }
 }

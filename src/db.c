@@ -935,6 +935,10 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0 ||
         (rc = ret_open(db, ro)) != 0 || (rc = cls_open(db, ro)) != 0) /* classes before the WAL replay */
         goto fail;
+    db->series.before_append = jr_dict_series; /* a leader's marker first (jr_markers); nothing without one */
+    db->series.before_arg = db;
+    db->states.before_append = jr_dict_state;
+    db->states.before_arg = db;
     if (db->opt.stats > 0)
         stats_start(db, false); /* follows the open: load_parts hands it each part as it reads it */
     bool has_manifest = faccessat(db->dirfd, "MANIFEST", F_OK, 0) == 0;
