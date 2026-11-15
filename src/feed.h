@@ -69,9 +69,18 @@ void fwal_name(char *buf, size_t len, uint64_t seq);
 /* The retained segments in a directory, counted from its files (for `feed info`, also of a read-only handle). */
 int feed_scan_retained(int dirfd, uint64_t *segments, uint64_t *bytes);
 
-/* META's requires= line: the words it lists. *feed: "feed" is among them; unknown (cap bytes, NUL-terminated, may be
- * NULL): the words this release does not know, comma separated. */
-void meta_requires_parse(const char *meta_text, bool *feed, char *unknown, size_t cap);
+/* META's requires= line: the words it lists. *feats (may be NULL): the META_REQ_* bits of the words this release
+ * knows; unknown (cap bytes, NUL-terminated, may be NULL): the words it does not know, comma separated. Known:
+ * "feed" (the change feed, this file), "cluster" (a cluster volume's directory: opened only by its tsdbd, never alone
+ * or as a local volume; design-cluster.md §11.1) and "replica" (the replica's own files beside the engine's: RSTATE,
+ * stage_*, REPL and what a deposed leader keeps, which an older binary would ignore; src/replica.h). */
+enum { META_REQ_FEED = 1, META_REQ_CLUSTER = 2, META_REQ_REPLICA = 4 };
+void meta_requires_parse(const char *meta_text, unsigned *feats, char *unknown, size_t cap);
+/* The cluster path's leave to open a directory whose META says requires=cluster: per thread, set around the open
+ * (tsdbd's cluster volumes, and checkers that open a replica directory in-process, read-only). Without it such an
+ * open is refused (TSDB_ERR_INVALID) with a line naming the word. */
+void meta_cluster_open_allow(bool on);
+bool meta_cluster_open_allowed(void);
 
 /* The files. Each returns 0 or a TSDB_ERR_*; NOTFOUND: no file; CORRUPT: a file that does not check. */
 int feed_cfg_read(int dirfd, feed_cfg *c);

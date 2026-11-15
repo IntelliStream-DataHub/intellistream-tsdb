@@ -1,3 +1,6 @@
+# `make` alone builds `all`: a rule for single objects above its line (the chunk objects' headers) would otherwise
+# become the default goal (`make` built only build/chunk.o from R6 on; `make check-default-goal` tests it).
+.DEFAULT_GOAL := all
 CC      ?= cc
 UNAME_S := $(shell uname -s)
 # macOS is a developer platform (see docs/macos.md): no io_uring, no CPU levels, the portable scalar kernels on
@@ -275,6 +278,10 @@ $(B)/test_fno: tests/test_fno.c src/internal.h $(LIB)
 $(B)/test_replica: tests/test_replica.c src/replica.h src/internal.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+# cluster volumes in a tsdb handle (src/cvol.h): holes, routing by the cluster name, the engine swap (promote)
+$(B)/test_cvol: tests/test_cvol.c src/cvol.h src/replica.h src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 # the change feed's disk side (design-cdc.md step F1): FEED, requires=feed, retained segments, the cleaner
 $(B)/test_feedstore: tests/test_feedstore.c tests/jepsen/feedcheck.c src/internal.h src/feed.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_feedstore.c tests/jepsen/feedcheck.c $(LIB) $(LDLIBS)
@@ -292,7 +299,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replica $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replica $(B)/test_cvol $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -313,6 +320,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_fno $(or $(TMPDIR),/tmp)
 	for m in reuse manifest markers nosync flushclose; do ! ./$(B)/test_fno --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_replica $(or $(TMPDIR),/tmp)
+	./$(B)/test_cvol $(or $(TMPDIR),/tmp)
 	for m in applyall ackunsynced keepcut nofloor walclock nopos classat opensync gapcheck torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced; do ! ./$(B)/test_replica --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done
 	./$(B)/test_feedstore $(or $(TMPDIR),/tmp)
 	! ./$(B)/test_feedstore --mutant noseal $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # a replayed segment renamed without its fdatasync must fail it
@@ -710,7 +718,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -745,7 +753,9 @@ $(B)/cluster.o: server/cluster.c server/cluster.h server/meta.h client/tsdb_cryp
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
 $(B)/repl.o: src/repl.c src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
-CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(RAFT_OBJ)
+$(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(RAFT_OBJ)
 $(B)/tsdb: $(B)/cluster-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
@@ -764,17 +774,18 @@ META_SOAK_FIRST   ?= 1000
 # tsdbd --cluster end to end: five servers, init, node add, a leader killed and restarted (the cluster thread polls:
 # one run covers both IO backends)
 $(B)/test_cluster: tests/test_cluster.c tests/harness.h server/cluster.h server/meta.h $(CLUSTER_OBJ) $(B)/tsdb_crypto.o \
-    $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
-	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o -lpthread -lm
+    $(B)/libtsdbclient.a $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
+	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) \
+	    $(ZSTD_LIB) -lpthread -lm
 meta-mutants: $(B)/test_meta_mut
 	tests/meta_mutants.sh $(B)/test_meta_mut
 meta-soak: $(B)/test_meta
 	./$(B)/test_meta /tmp --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
 TSDBD_SRC := server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
-             server/cluster.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
+             server/cluster.h server/cvol.h server/cvol.c src/cvol.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c \
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
 
 # tests/fuzz/fuzz_frames.c includes server/tsdbd.c (epoll only: no ring needed without sockets). FRAMES_COV is
@@ -783,7 +794,7 @@ $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_
 # is always set).
 $(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                   $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c $(B)/tsdb_pack.o \
+	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c $(B)/tsdb_pack.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
@@ -858,7 +869,7 @@ $(B)/test_wire: tests/test_wire.c include/tsdb_wire.h $(CLIB)
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
 $(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                     $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c $(B)/tsdb_pack.o $(B)/users.o \
+	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c $(B)/tsdb_pack.o $(B)/users.o \
 	    $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)
@@ -1082,6 +1093,96 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 
+# jepsen-cluster (tests/jepsen/jepsen_cluster.c, docs/design-cluster.md 13.2): 3-8 tsdbd with a proxy of the harness in
+# front of every peer port, nemeses kill, partition, pause, midcommit (crash points, server/crashpt.h) and power
+# (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
+# each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
+$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/harness.h server/cluster.h server/meta.h server/crashpt.h \
+    $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) $(LIB) \
+	    $(LDLIBS)
+# on a disk, never /tmp (a tmpfs: a failing run keeps the state of five nodes there, and a power run never syncs)
+JEPSEN_CLUSTER_DIR ?= /var/tmp/tsdb-jepsen-cluster-$(shell printf %s "$(CURDIR)" | cksum | cut -d" " -f1)
+JEPSEN_NEMESES ?= kill partition pause midcommit power
+JEPSEN_SEED ?= 1
+JEPSEN_NODES ?= 5
+jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
+	for io in $(IO); do for nem in $(JEPSEN_NEMESES); do echo "== tsdbd --io $$io, nemesis $$nem"; \
+	    TSDBD=./$(B)/tsdbd TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
+	        --nemesis $$nem --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so || exit 1; \
+	    done; done
+
+# The harness has to notice what it is meant to: a port file that names another pid, a client that skips the check
+# of the port it connected to while a foreign server holds the node's old one (and the same client with the check:
+# refused, the run passes), a partition that is not applied, an armed crash point that never fires, a nemesis that
+# sleeps through its naps, a write missing from the final state; and the comparison of replicas finds a row only one
+# has. A crash point that fires is counted.
+# Each check of the histories (validity, durability, atomic visibility, stale and monotonic reads) and the election
+# check are fed a history made here with one thing wrong (--selftest-checker). A nemesis that does nothing (a kill that
+# kills nobody, a pause that stops nobody, a delay that delays nothing, a heal that resumes held links) fails the run.
+jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
+	@d=$(JEPSEN_CLUSTER_DIR)-selftest; j="env TSDBD=./$(B)/tsdbd ./$(B)/jepsen_cluster --dir $$d"; \
+	out=$$($$j --mutant foreign-pid --seconds 5 --nemesis kill 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'names pid'; then \
+	        echo "jepsen-cluster-selftest: a port file that names another pid went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant takeover --seconds 30 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'durability'; then \
+	        echo "jepsen-cluster-selftest: writes that went to a foreign server on the node's old port went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant takeover-checked --seconds 30 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q '[1-9][0-9]* refused for a port the node does not hold'; then \
+	        echo "jepsen-cluster-selftest: the check of the port a client connected to did not refuse the foreign server (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant noop-partition --seconds 20 --nemesis partition 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'while the pair was cut'; then \
+	        echo "jepsen-cluster-selftest: a partition that was not applied went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant unfired --seconds 15 --nemesis midcommit 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'never fired on node'; then \
+	        echo "jepsen-cluster-selftest: an armed crash point that never fired went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --seconds 20 --nemesis midcommit 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -q 'crash points hit [1-9]'; then \
+	        echo "jepsen-cluster-selftest: a crash point that fires was not counted (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant idle --seconds 25 --nemesis kill 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'the nemesis was idle'; then \
+	        echo "jepsen-cluster-selftest: a nemesis that sleeps through its naps went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant lost-write --seconds 12 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a lost write'; then \
+	        echo "jepsen-cluster-selftest: a write missing from the final state went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --selftest-checker 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ]; then \
+	        echo "jepsen-cluster-selftest: a check of the histories or the election check does not find what it is for (rc $$rc)"; echo "$$out" | tail -n 30; exit 1; fi; \
+	out=$$($$j --mutant nokill --seconds 15 --nemesis kill 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'kill nemesis.*had no effect'; then \
+	        echo "jepsen-cluster-selftest: a kill that kills nobody went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant nopause --seconds 20 --nemesis pause 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'pause nemesis.*had no effect'; then \
+	        echo "jepsen-cluster-selftest: a pause that stops nobody went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant nodelay --seconds 20 --nemesis partition 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'partition nemesis.*had no effect'; then \
+	        echo "jepsen-cluster-selftest: a delay that delays nothing went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant noreset --seconds 60 --nemesis partition 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'must be reset at the heal'; then \
+	        echo "jepsen-cluster-selftest: a heal that resumes held links instead of resetting them went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ]; then \
+	        echo "jepsen-cluster-selftest: the comparison of replicas is wrong (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    echo "jepsen-cluster-selftest: ok"
+
+# The harness itself (one thread per proxied link, a sampler, the workloads) under ThreadSanitizer and under ASan+UBSan,
+# against the normal tsdbd: a short run of the kill, partition and pause nemeses (JEPSEN_SANITIZE_SECONDS). The objects
+# of the sanitized builds go to build-jc-tsan/ and build-jc-asan/.
+JEPSEN_SANITIZE_SECONDS ?= 45
+jepsen-cluster-sanitized: $(B)/tsdbd
+	$(MAKE) B=build-jc-tsan ARCH= CFLAGS="-O1 -g -fsanitize=thread -fno-omit-frame-pointer" LDFLAGS="-fsanitize=thread" \
+	    build-jc-tsan/jepsen_cluster
+	$(MAKE) B=build-jc-asan ARCH= CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	    LDFLAGS="-fsanitize=address,undefined" build-jc-asan/jepsen_cluster
+	@set -e; for k in tsan asan; do \
+	    out=$$(TSAN_OPTIONS="halt_on_error=0 second_deadlock_stack=1" ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+	        TSDBD=./$(B)/tsdbd ./build-jc-$$k/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR)-$$k --nemesis kill,partition,pause \
+	        --seconds $(JEPSEN_SANITIZE_SECONDS) 2>&1) && rc=0 || rc=$$?; \
+	    if [ $$rc -ne 0 ] || echo "$$out" | grep -qE 'WARNING: ThreadSanitizer|ERROR: AddressSanitizer|runtime error'; then \
+	        echo "jepsen-cluster-sanitized ($$k): rc $$rc"; echo "$$out" | tail -n 40; exit 1; fi; \
+	    echo "jepsen-cluster-sanitized ($$k): ok"; done
+
 # Build and test on AlmaLinux 10 (the main target OS) in Podman; takes minutes, logs in $LOGDIR.
 # URING=0 keeps Podman's stock seccomp profile, which blocks io_uring as production does: tsdbd then runs on epoll.
 test-almalinux10:
@@ -1120,6 +1221,13 @@ test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/test_un
 	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage /tmp || exit 1; \
 	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_unavailable /tmp || exit 1; done
 endif
+
+# `make` with no target must build `all` (the .DEFAULT_GOAL line at the top): a rule for one object placed above
+# `all:` took the default once.
+test: check-default-goal
+check-default-goal:
+	@g=$$($(MAKE) --no-print-directory -pnq -f $(firstword $(MAKEFILE_LIST)) 2>/dev/null | sed -n 's/^\.DEFAULT_GOAL := //p' | tail -n 1); \
+	if [ "$$g" != all ]; then echo "check-default-goal: make alone builds '$$g', not all"; exit 1; fi
 
 # The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.
 test: check-version

@@ -430,13 +430,20 @@ static int meta_load_or_create(eng *db, bool read_only)
         }
         {
             /* a feature this binary does not know changes what the files mean (markers to apply, links to keep):
-             * the open refuses and names it. Known: "feed" (the change feed, feed.h). */
+             * the open refuses and names it. Known: "feed", "cluster", "replica" (feed.h). */
             char feat[96];
-            meta_requires_parse(buf, &db->feed_req, feat, sizeof feat);
+            unsigned feats;
+            meta_requires_parse(buf, &feats, feat, sizeof feat);
+            db->feed_req = feats & META_REQ_FEED;
             if (feat[0]) {
                 fprintf(stderr,
                         "tsdb: META requires the feature(s) \"%s\", which tsdb %s does not know: the open "
                         "refuses (use a release that does)\n", feat, TSDB_VERSION);
+                return TSDB_ERR_INVALID;
+            }
+            if ((feats & META_REQ_CLUSTER) && !meta_cluster_open_allowed()) {
+                fprintf(stderr, "tsdb: META requires the feature \"cluster\": the directory is a cluster volume's, "
+                                "opened only by the tsdbd that holds it (--cluster), never alone or as a volume\n");
                 return TSDB_ERR_INVALID;
             }
         }

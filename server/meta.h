@@ -116,7 +116,16 @@ struct meta_settings {
     uint8_t failover;            /* enum meta_failover (lease) */
     uint8_t read_barrier;        /* 1: owners answer reads only behind a fenced write (M24; a node may override) */
     uint32_t lease_s;            /* the shared volumes' lease (10); the proposer's clock, never apply's */
+    /* Replicated volumes (R3; design-cluster.md §4-§8): read only by the cluster layer, never by apply */
+    uint32_t lease_ms;           /* a replicated leader's read lease after each heartbeat answer (2000, §7.1) */
+    uint32_t drift_ppm;          /* the clock drift every lease is shortened by (500) */
+    uint32_t unanswered_ms;      /* an `unanswered` ISR member kept by a promotion is dropped after this (1000, §6.2) */
+    uint32_t commit_interval_ms; /* the commit point travels within this without records to carry it (5, §4.2) */
+    uint32_t repl_retain_mb;     /* WAL kept for a lagging replica, MB (4096, §8.2) */
+    uint32_t repl_retain_s;      /* and for at most this long (1800) */
+    uint32_t idle_seal_ms;       /* an idle leader seals its last segment after this (1000, item 13) */
 };
+#define META_SETTINGS_WORDS 19 /* the words of the INIT body before the mode (cluster_settings_encode) */
 void meta_settings_default(struct meta_settings *s);
 
 struct meta_member {
@@ -139,6 +148,8 @@ struct meta_replica {
     uint8_t claim_blocked; /* shared: a CLAIM_FAILED barred it from grants until its flags say it is well again */
     uint64_t rid;          /* the replica instance (replicated: new for every fresh directory; shared: 0) */
     uint64_t open_gen;     /* the last REPLICA_OPEN generation */
+    uint64_t open_nonce;   /* that open's draw: two opens of copies of one directory can save the same generation,
+                            * and the replica serves only under a record of its own open (gen and nonce, §8.5) */
 };
 
 struct meta_epoch {
@@ -406,7 +417,8 @@ void meta_op_slot_move_pending(struct meta_entry *e, uint32_t slot, uint32_t fro
 void meta_op_slot_freeze(struct meta_entry *e, uint32_t slot, uint32_t from, uint64_t from_epoch);
 void meta_op_slot_move(struct meta_entry *e, uint32_t slot, uint32_t to);
 void meta_op_slot_move_cancel(struct meta_entry *e, uint32_t slot);
-void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t rid, uint64_t gen);
+void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t rid, uint64_t gen,
+                          uint64_t nonce);
 void meta_op_restore(struct meta_entry *e, uint64_t gen);
 void meta_op_name_group(struct meta_entry *e); /* reserved: an empty body; applies as INVALID */
 

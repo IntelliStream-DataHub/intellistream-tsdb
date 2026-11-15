@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SNAP_VERSION 2
+#define SNAP_VERSION 3 /* 3: the replicated volumes' settings (R3); a preview cluster is initialised again */
 
 /* tests/test_meta.c --mutant N plants bug N (MUT(n)) in a build with -DMETA_MUTANTS; the simulator and the unit tests
  * must catch every one (a checker that catches nothing proves nothing). Without the define, MUT is 0. */
@@ -74,6 +74,13 @@ void meta_settings_default(struct meta_settings *s)
     s->failover = META_FAILOVER_LEASE;
     s->read_barrier = 1;
     s->lease_s = 10;
+    s->lease_ms = 2000;
+    s->drift_ppm = 500;
+    s->unanswered_ms = 1000;
+    s->commit_interval_ms = 5;
+    s->repl_retain_mb = 4096;
+    s->repl_retain_s = 1800;
+    s->idle_seal_ms = 1000;
 }
 
 uint32_t meta_voter_target(const struct meta_settings *s, uint32_t servers)
@@ -462,7 +469,7 @@ static void op_end(struct meta_entry *e, size_t start)
 
 static void put_settings(struct wr *w, const struct meta_settings *s)
 {
-    put32(w, 12);
+    put32(w, META_SETTINGS_WORDS);
     put32(w, s->replication);
     put32(w, s->min_isr);
     put32(w, s->node_timeout_ms);
@@ -475,12 +482,19 @@ static void put_settings(struct wr *w, const struct meta_settings *s)
     put8(w, s->failover);
     put8(w, s->read_barrier);
     put32(w, s->lease_s);
+    put32(w, s->lease_ms);
+    put32(w, s->drift_ppm);
+    put32(w, s->unanswered_ms);
+    put32(w, s->commit_interval_ms);
+    put32(w, s->repl_retain_mb);
+    put32(w, s->repl_retain_s);
+    put32(w, s->idle_seal_ms);
 }
 
 static void get_settings(struct rd *r, struct meta_settings *s)
 {
     uint32_t n = get32(r);
-    if (n != 12) { /* the count of this build's fields: until 1.0 a change of them bumps the level (and re-inits), after it
+    if (n != META_SETTINGS_WORDS) { /* the count of this build's fields: until 1.0 a change of them bumps the level (and re-inits), after it
                     * a new field is a new op kind (the freeze rule at the head of this file) */
         r->bad = 1;
         return;
@@ -497,13 +511,21 @@ static void get_settings(struct rd *r, struct meta_settings *s)
     s->failover = get8(r);
     s->read_barrier = get8(r);
     s->lease_s = get32(r);
+    s->lease_ms = get32(r);
+    s->drift_ppm = get32(r);
+    s->unanswered_ms = get32(r);
+    s->commit_interval_ms = get32(r);
+    s->repl_retain_mb = get32(r);
+    s->repl_retain_s = get32(r);
+    s->idle_seal_ms = get32(r);
 }
 
 static int settings_valid(const struct meta_settings *s)
 {
     return s->replication >= 1 && s->replication <= META_REPLICAS_MAX && s->min_isr >= 1 &&
            s->min_isr <= s->replication && s->failover <= META_FAILOVER_BMC && s->read_barrier <= 1 &&
-           s->lease_s >= 1;
+           s->lease_s >= 1 && s->lease_ms >= 1 && s->drift_ppm < 1000000 && s->commit_interval_ms >= 1 &&
+           s->idle_seal_ms >= 1;
 }
 
 static void put_member(struct wr *w, const struct meta_member *mb)
@@ -890,7 +912,8 @@ void meta_op_slot_move_cancel(struct meta_entry *e, uint32_t slot)
     op_end(e, st);
 }
 
-void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t rid, uint64_t gen)
+void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t rid, uint64_t gen,
+                          uint64_t nonce)
 {
     struct wr w;
     size_t st = op_begin(e, &w, META_OP_REPLICA_OPEN);
@@ -898,6 +921,7 @@ void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, 
     put32(&w, node);
     put64(&w, rid);
     put64(&w, gen);
+    put64(&w, nonce);
     op_end(e, st);
 }
 
@@ -1507,7 +1531,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
     }
     case META_OP_REPLICA_OPEN: {
         uint32_t number = get32(r), node = get32(r);
-        uint64_t rid = get64(r), gen = get64(r);
+        uint64_t rid = get64(r), gen = get64(r), nonce = get64(r);
         if (r->bad)
             return META_ERR_FORMAT;
         struct meta_volume *v;
@@ -1522,6 +1546,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         if (v->rep[i].rid != rid || gen <= v->rep[i].open_gen)
             return META_ERR_STALE; /* another instance of the directory, or a restored copy's older generation */
         v->rep[i].open_gen = gen;
+        v->rep[i].open_nonce = nonce;
         touched[(*ntouched)++] = number;
         return META_OK;
     }
@@ -1809,6 +1834,7 @@ static void put_volume(struct wr *w, const struct meta_volume *v)
         put8(w, v->rep[j].claim_blocked);
         put64(w, v->rep[j].rid);
         put64(w, v->rep[j].open_gen);
+        put64(w, v->rep[j].open_nonce);
     }
     put32(w, v->leader);
     put64(w, v->epoch);
@@ -1940,6 +1966,7 @@ static int get_volume(struct rd *r, struct meta_volume *v)
         v->rep[j].claim_blocked = get8(r);
         v->rep[j].rid = get64(r);
         v->rep[j].open_gen = get64(r);
+        v->rep[j].open_nonce = get64(r);
         if (v->rep[j].learner > 1 || v->rep[j].unanswered > 1 || v->rep[j].claim_blocked > 1)
             return -1;
     }

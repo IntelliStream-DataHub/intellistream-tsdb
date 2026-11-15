@@ -93,7 +93,8 @@
 #define FRAME_MAX (16u << 20)
 #define WB_MAX (64u << 20) /* queued to one peer; beyond it the link is dropped (Raft resends) */
 #define CL_MAGIC 0x43445354u /* "TSDC" */
-#define CL_VERSION 2 /* 2: heartbeat sections, flags in PROBE_REPLY; peers of version 1 are refused (no mixed versions) */
+#define CL_VERSION 3 /* 2: heartbeat sections, flags in PROBE_REPLY; 3: the R3 settings in INIT, VOLUME_ADD; peers of another
+                      * version are refused (no mixed versions) */
 #define RING 4096
 #define SNAP_EVERY 1000
 #define SYNC_STALL_NS (2000ull * 1000000) /* M11: a leader whose own sync is outstanding this long hands leadership on */
@@ -410,32 +411,36 @@ const char *cluster_strerror(int rc)
     case CLUSTER_ERR_REFUSED: return "the new server belongs to another cluster or has another id";
     case CLUSTER_ERR_RETRY: return "the outcome is unknown (the leader changed); look at the status and retry";
     case CLUSTER_ERR_STATE: return "the server is in no cluster";
+    case CLUSTER_ERR_FEW: return "fewer live members take volumes than the volume has replicas";
     default: return meta_strerror(rc);
     }
 }
 
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out)
 {
-    const uint32_t v[13] = {s->replication,     s->min_isr,       s->node_timeout_ms, s->heartbeat_ms,
-                            s->isr_lag_ms,      s->out_after_s,   s->voter_replace_s, s->voters,
-                            s->volumes_per_server, s->failover,   s->read_barrier,    s->lease_s,
-                            (uint32_t)mode};
-    for (int i = 0; i < 13; i++)
+    const uint32_t v[META_SETTINGS_WORDS + 1] = {
+        s->replication,   s->min_isr,          s->node_timeout_ms,    s->heartbeat_ms,   s->isr_lag_ms,
+        s->out_after_s,   s->voter_replace_s,  s->voters,             s->volumes_per_server, s->failover,
+        s->read_barrier,  s->lease_s,          s->lease_ms,           s->drift_ppm,      s->unanswered_ms,
+        s->commit_interval_ms, s->repl_retain_mb, s->repl_retain_s,   s->idle_seal_ms,   (uint32_t)mode};
+    for (int i = 0; i <= META_SETTINGS_WORDS; i++)
         for (int j = 0; j < 4; j++)
             out[i * 4 + j] = (uint8_t)(v[i] >> (8 * j));
-    return 52;
+    return 4 * (META_SETTINGS_WORDS + 1);
 }
 
 static int settings_decode(struct rd *r, struct meta_settings *s, int *mode)
 {
-    uint32_t v[13];
-    for (int i = 0; i < 13; i++)
+    uint32_t v[META_SETTINGS_WORDS + 1];
+    for (int i = 0; i <= META_SETTINGS_WORDS; i++)
         v[i] = get32(r);
     *s = (struct meta_settings){.replication = v[0], .min_isr = v[1], .node_timeout_ms = v[2], .heartbeat_ms = v[3],
                                 .isr_lag_ms = v[4], .out_after_s = v[5], .voter_replace_s = v[6], .voters = v[7],
                                 .volumes_per_server = v[8], .failover = (uint8_t)v[9],
-                                .read_barrier = (uint8_t)v[10], .lease_s = v[11]};
-    *mode = (int)v[12];
+                                .read_barrier = (uint8_t)v[10], .lease_s = v[11], .lease_ms = v[12],
+                                .drift_ppm = v[13], .unanswered_ms = v[14], .commit_interval_ms = v[15],
+                                .repl_retain_mb = v[16], .repl_retain_s = v[17], .idle_seal_ms = v[18]};
+    *mode = (int)v[META_SETTINGS_WORDS];
     return r->bad || v[9] > 255 || v[10] > 255 ? -1 : 0;
 }
 
@@ -494,6 +499,9 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
             v->fenced_age_ms = get64(&r);
             v->wal_seg = get64(&r);
             v->wal_off = get64(&r);
+            v->rid = get64(&r);
+            v->open_gen = get64(&r);
+            v->open_nonce = get64(&r);
             h->vols[j].local_fault_s = get64(&r);
         }
         h->ndoms = get32(&r);
@@ -854,6 +862,7 @@ struct pend {
     uint32_t reqid, member;
     uint64_t index, term;
     uint64_t join; /* a NODE_ADD's MEMBER_ADD: the link to the new server, which gets JOIN once it applied */
+    uint32_t volume; /* a VOLUME_ADD: its number + 1, the reply's body once committed (0: none) */
 };
 
 
@@ -946,6 +955,7 @@ static struct {
     int init_mode;
     uint32_t reserved_id;
     uint64_t pend_join; /* set around propose() by a NODE_ADD: the new server's link (struct pend) */
+    uint32_t pend_volume; /* set around propose() by a VOLUME_ADD: its number + 1 (struct pend) */
 
     uint64_t next_hb, next_manage, next_duty, watch_conn, watch_next_try;
     unsigned watch_rot;
@@ -977,8 +987,10 @@ static struct {
     uint64_t sync_since; /* core thread: when the sync round now outstanding was handed to the worker; 0: none */
     int snap_out;        /* core thread: a snapshot write is outstanding */
     uint64_t stall_ns, xfer_for, xfer_next; /* a leader whose sync is outstanding this long hands leadership on */
+    int hold_opens;      /* TSDB_CLUSTER_TEST hold_opens_file=1: no REPLICA_OPEN proposed while <state-dir>/holdopens is */
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
+    char holdopensfile[1100];
     unsigned sync_delay_ms; /* TSDB_CLUSTER_TEST sync_delay_ms=N: the worker waits N ms before each sync round */
     int fail_file;       /* TSDB_CLUSTER_TEST fail_sync_file=1: a sync fails with EIO while <state-dir>/failsync exists */
     char failfile[1100];
@@ -1203,6 +1215,8 @@ static void test_knobs(void)
             C.fail_copy_dirsync = v != 0;
         else if (sscanf(p, "fail_pend_dirsync=%llu", &v) == 1)
             C.fail_pend_dirsync = v != 0;
+        else if (sscanf(p, "hold_opens_file=%llu", &v) == 1)
+            C.hold_opens = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
             C.stall_file = v != 0;
         else if (sscanf(p, "sync_delay_ms=%llu", &v) == 1)
@@ -1462,6 +1476,16 @@ void cluster_set_reporter(cluster_report_fn fn, void *arg)
     g_reporter_arg = arg;
 }
 
+static cluster_vol_watch_fn g_vwatch;
+static void *g_vwatch_arg;
+static uint64_t g_vwatch_applied = UINT64_MAX; /* the metadata index last pushed (UINT64_MAX: none yet) */
+
+void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg)
+{
+    g_vwatch = fn;
+    g_vwatch_arg = arg;
+}
+
 /* The sections of a heartbeat from r->off on, into h. Sets r->bad on a malformed one. An unknown type is skipped. */
 static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
 {
@@ -1510,6 +1534,9 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
                 v->fenced_age_ms = get64(&s);
                 v->wal_seg = get64(&s);
                 v->wal_off = get64(&s);
+                v->rid = get64(&s);
+                v->open_gen = get64(&s);
+                v->open_nonce = get64(&s);
                 if (v->health == CL_HEALTH_OK)
                     continue;
                 /* the timer of a (volume, domain) fault runs from the first report of it and breaks on a report
@@ -1570,7 +1597,7 @@ static void pend_add(uint64_t conn, uint32_t reqid, uint32_t member, uint64_t in
         if (!C.pend)
             oom();
     }
-    C.pend[C.npend++] = (struct pend){conn, reqid, member, index, term, C.pend_join};
+    C.pend[C.npend++] = (struct pend){conn, reqid, member, index, term, C.pend_join, C.pend_volume};
 }
 
 static void send_join(struct conn *d, uint32_t id);
@@ -1585,7 +1612,11 @@ static void pend_applied(uint64_t index, uint64_t term, int rc0)
             struct conn *d = p->join ? conn_by_serial(p->join) : NULL;
             if (d && rc == 0)
                 send_join(d, p->member); /* committed: now the server may learn its id; it answers the CLI */
-            else if (p->conn)
+            else if (p->conn && p->volume && rc == 0) {
+                uint8_t nb[4] = {(uint8_t)(p->volume - 1), (uint8_t)((p->volume - 1) >> 8),
+                                 (uint8_t)((p->volume - 1) >> 16), (uint8_t)((p->volume - 1) >> 24)};
+                admin_reply(p->conn, p->reqid, 0, nb, 4);
+            } else if (p->conn)
                 admin_reply(p->conn, p->reqid, p->join && rc == 0 ? CLUSTER_ERR_UNREACHABLE : rc, NULL, 0);
             if (d && rc != 0)
                 d->dead = 1;
@@ -2708,6 +2739,9 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now)
         put64(b, v->fenced_age_ms);
         put64(b, v->wal_seg);
         put64(b, v->wal_off);
+        put64(b, v->rid);
+        put64(b, v->open_gen);
+        put64(b, v->open_nonce);
         put64(b, h->vols[i].fault_ns ? since(now, h->vols[i].fault_ns) / (1000 * MS) : 0);
     }
     put32(b, h ? h->ndoms : 0);
@@ -2765,6 +2799,159 @@ static const char *leader_peer(void)
     uint32_t l = C.r ? raft_get_leader(C.r) : C.hint_leader;
     const struct meta_member *m = l ? meta_member(&C.sm, l) : NULL;
     return m ? m->peer : "";
+}
+
+size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out)
+{
+    size_t n = strlen(name);
+    out[0] = (uint8_t)n;
+    out[1] = (uint8_t)(n >> 8);
+    memcpy(out + 2, name, n);
+    for (int j = 0; j < 4; j++)
+        out[2 + n + j] = (uint8_t)(replicas >> (8 * j));
+    return 2 + n + 4;
+}
+
+/* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
+static int text_ok_cl(const char *s)
+{
+    if (!strcmp(s, ".") || !strcmp(s, ".."))
+        return 0;
+    for (; *s; s++)
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') || *s == '_' ||
+              *s == '-' || *s == '.'))
+            return 0;
+    return 1;
+}
+
+/* A member a new volume may be placed on: up, taking volumes, and heard within node_timeout (the leader: itself). */
+static int placeable(const struct meta_member *mb, uint64_t now)
+{
+    if (mb->state != META_UP || !(mb->flags & META_MF_VOLUMES_OK))
+        return 0;
+    if (mb->id == C.id)
+        return 1;
+    const struct heard *h = heard_get(mb->id);
+    return h && h->ns && now - h->ns < (uint64_t)C.sm.set.node_timeout_ms * MS;
+}
+
+/* §3.2 rules 1-2, a deterministic greedy pass: the preferred leader (nodes[0]) is the live member that leads the
+ * fewest volumes (then holds the fewest, then the lowest id); each further replica the one that holds the fewest,
+ * on a rack not used yet while one is left (racks count only when every candidate has one and there are at least
+ * `n` of them). Returns 0 or -1 (fewer live members than n). */
+static int place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
+{
+    uint32_t cand[META_REPLICAS_MAX * 64], nc = 0, leads[META_REPLICAS_MAX * 64], holds[META_REPLICAS_MAX * 64];
+    for (uint32_t i = 0; i < C.sm.nmembers && nc < sizeof cand / sizeof cand[0]; i++) {
+        const struct meta_member *mb = &C.sm.members[i];
+        if (!placeable(mb, now))
+            continue;
+        leads[nc] = holds[nc] = 0;
+        for (uint32_t v = 0; v < C.sm.nvolumes; v++)
+            for (uint32_t k = 0; k < C.sm.volumes[v].nrep; k++)
+                if (C.sm.volumes[v].rep[k].node == mb->id) {
+                    holds[nc]++;
+                    leads[nc] += k == 0;
+                }
+        cand[nc++] = i;
+    }
+    if (nc < n)
+        return -1;
+    int racks = 1;
+    uint32_t distinct = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        const char *ri = C.sm.members[cand[i]].rack;
+        if (!ri[0])
+            racks = 0;
+        int seen = 0;
+        for (uint32_t j = 0; j < i; j++)
+            seen |= !strcmp(C.sm.members[cand[j]].rack, ri);
+        distinct += !seen;
+    }
+    racks = racks && distinct >= n;
+    uint8_t used[META_REPLICAS_MAX * 64] = {0};
+    for (uint32_t k = 0; k < n; k++) {
+        int best = -1;
+        for (uint32_t i = 0; i < nc; i++) {
+            if (used[i])
+                continue;
+            if (racks) {
+                int clash = 0;
+                for (uint32_t j = 0; j < k; j++)
+                    clash |= !strcmp(C.sm.members[cand[i]].rack, meta_member(&C.sm, nodes[j])->rack);
+                if (clash)
+                    continue;
+            }
+            if (best < 0)
+                best = (int)i;
+            else if (k == 0 ? (leads[i] < leads[best] || (leads[i] == leads[best] && holds[i] < holds[best]))
+                            : holds[i] < holds[best])
+                best = (int)i;
+        }
+        if (best < 0)
+            return -1;
+        used[best] = 1;
+        nodes[k] = C.sm.members[cand[best]].id;
+    }
+    return 0;
+}
+
+static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r)
+{
+    struct meta_volume_add a = {0};
+    getstr(r, a.name, sizeof a.name);
+    uint32_t n = get32(r);
+    if (r->bad || !a.name[0] || !text_ok_cl(a.name)) {
+        admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
+        return;
+    }
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised) {
+        const char *lp = leader_peer();
+        admin_reply(c->serial, reqid, C.sm.initialised || C.have_node ? CLUSTER_ERR_NOTLEADER : CLUSTER_ERR_STATE,
+                    lp, strlen(lp));
+        return;
+    }
+    if (!n)
+        n = C.sm.set.replication;
+    if (C.sm.mode != META_MODE_REPLICATED || n < 1 || n > META_REPLICAS_MAX) {
+        admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
+        return;
+    }
+    for (uint32_t i = 0; i < C.sm.nvolumes; i++)
+        if (!strcmp(C.sm.volumes[i].name, a.name)) {
+            admin_reply(c->serial, reqid, META_ERR_EXISTS, NULL, 0);
+            return;
+        }
+    /* the next free number; 0 is never a cluster volume's (a node's root keeps volume 0 for its USERS) */
+    a.number = C.sm.next_volume ? C.sm.next_volume : 1;
+    if (a.number > META_VOLUME_MAX) {
+        admin_reply(c->serial, reqid, META_ERR_RANGE, NULL, 0);
+        return;
+    }
+    if (place_volume(n, iso_now_ns(), a.nodes) != 0) {
+        say("volume add %s: fewer than %" PRIu32 " live members take volumes", a.name, n);
+        admin_reply(c->serial, reqid, CLUSTER_ERR_FEW, NULL, 0);
+        return;
+    }
+    a.n = n;
+    a.kind = META_VOL_REPLICATED;
+    a.min_isr = C.sm.set.min_isr < n ? C.sm.set.min_isr : n;
+    tsdb_random(a.uuid, sizeof a.uuid);
+    for (uint32_t i = 0; i < n; i++) {
+        int dup;
+        do {
+            tsdb_random(&a.rid[i], sizeof a.rid[i]);
+            dup = !a.rid[i];
+            for (uint32_t j = 0; j < i; j++)
+                dup |= a.rid[j] == a.rid[i];
+        } while (dup);
+    }
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_volume_add(&e, &a);
+    C.pend_volume = a.number + 1;
+    propose(&e, c->serial, reqid, 0);
+    C.pend_volume = 0;
 }
 
 static void admin_init(struct conn *c, uint32_t reqid, struct rd *r)
@@ -2976,6 +3163,7 @@ static void on_admin(struct conn *c, struct rd *r)
     switch (op) {
     case CLUSTER_OP_INIT: admin_init(c, reqid, r); break;
     case CLUSTER_OP_NODE_ADD: admin_node_add(c, reqid, r); break;
+    case CLUSTER_OP_VOLUME_ADD: admin_volume_add(c, reqid, r); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -3335,6 +3523,9 @@ static void put_sections(struct buf *b)
         put64(b, v->fenced_age_ms);
         put64(b, v->wal_seg);
         put64(b, v->wal_off);
+        put64(b, v->rid);
+        put64(b, v->open_gen);
+        put64(b, v->open_nonce);
     }
     sec_end(b, at);
     at = sec_begin(b, HBS_DOMAINS);
@@ -3579,6 +3770,102 @@ static void manage_voters(uint64_t now)
     }
 }
 
+/* Pushes this server's replicated volume records to the volume manager whenever the metadata copy moved. */
+static void vol_watch_duty(void)
+{
+    if (!g_vwatch || !C.sm.initialised || C.sm.applied == g_vwatch_applied)
+        return;
+    /* Only a copy that holds this run's own incarnation (the leader's MEMBER_STATE up for it, committed after this
+     * process started) is known to hold every REPLICA_OPEN committed before the restart: the volume manager judges a
+     * directory's generation against it (an older copy of v<N> must not pass on a copy that has not seen the open it
+     * predates), so nothing is pushed before. Without a quorum nothing is: the volumes stay RECOVERING. */
+    const struct meta_member *me = meta_member(&C.sm, C.id);
+    if (!me || me->incarnation != C.incarnation)
+        return;
+    g_vwatch_applied = C.sm.applied;
+    static struct cluster_vol_rec recs[CLUSTER_REPORT_VOLS];
+    static uint32_t said_over;
+    uint32_t n = 0, over = 0;
+    for (uint32_t i = 0; i < C.sm.nvolumes; i++) {
+        const struct meta_volume *v = &C.sm.volumes[i];
+        if (v->kind != META_VOL_REPLICATED)
+            continue;
+        for (uint32_t k = 0; k < v->nrep; k++) {
+            if (v->rep[k].node != C.id)
+                continue;
+            if (n == CLUSTER_REPORT_VOLS) {
+                over++;
+                break;
+            }
+            struct cluster_vol_rec *r = &recs[n++];
+            memset(r, 0, sizeof *r);
+            r->number = v->number;
+            snprintf(r->name, sizeof r->name, "%s", v->name);
+            memcpy(r->uuid, v->uuid, 16);
+            memcpy(r->cluster, C.uuid, 16);
+            r->leader = v->leader;
+            r->epoch = v->epoch;
+            r->rid = v->rep[k].rid;
+            r->open_gen = v->rep[k].open_gen;
+            r->open_nonce = v->rep[k].open_nonce;
+            break;
+        }
+    }
+    if (over > said_over) /* the heartbeat's report has room for this many: the rest are never made or opened here */
+        say("holds replicas of %" PRIu32 " volumes more than the %d this server makes, opens and reports; those past"
+            " volume %" PRIu32 " are not opened", over, CLUSTER_REPORT_VOLS, recs[n - 1].number);
+    said_over = over > said_over ? over : said_over;
+    g_vwatch(g_vwatch_arg, C.id, recs, n);
+}
+
+/* REPLICA_OPEN (§8.5): a replica raises its directory's generation at every open and reports it; the leader commits
+ * it, and the replica serves only once its copy shows the generation. A proposal is retried once a second while the
+ * report stays above the record (a lost leadership or a full pipeline drops it); the apply refuses a stale one. */
+static uint64_t opens_ns;
+static void propose_opens(uint64_t now)
+{
+    if (since(now, opens_ns) < 1000 * MS && opens_ns)
+        return;
+    opens_ns = now;
+    if (C.hold_opens && access(C.holdopensfile, F_OK) == 0)
+        return; /* tests: a replica that opened before the group recorded its generation is caught here */
+    static struct cluster_report own;
+    int have_own = 0;
+    for (uint32_t i = 0; i < C.sm.nvolumes && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
+        const struct meta_volume *v = &C.sm.volumes[i];
+        if (v->kind != META_VOL_REPLICATED)
+            continue;
+        for (uint32_t k = 0; k < v->nrep; k++) {
+            const struct meta_replica *rp = &v->rep[k];
+            const struct cluster_vol_report *vr = NULL;
+            if (rp->node == C.id) {
+                if (!have_own) {
+                    memset(&own, 0, sizeof own);
+                    if (g_reporter)
+                        g_reporter(g_reporter_arg, &own);
+                    have_own = 1;
+                }
+                for (uint32_t j = 0; j < own.nvols && !vr; j++)
+                    if (own.vols[j].volume == v->number)
+                        vr = &own.vols[j];
+            } else {
+                struct heard *h = heard_get(rp->node);
+                for (uint32_t j = 0; h && j < h->nvols && !vr; j++)
+                    if (h->vols[j].v.volume == v->number)
+                        vr = &h->vols[j].v;
+            }
+            if (!vr || vr->rid != rp->rid || vr->open_gen <= rp->open_gen)
+                continue;
+            struct meta_entry e;
+            meta_entry_init(&e);
+            meta_op_replica_open(&e, v->number, rp->node, rp->rid, vr->open_gen, vr->open_nonce);
+            if (propose(&e, 0, 0, 0) == ISO_OK)
+                say("proposes volume %" PRIu32 " replica on node %" PRIu32 " open generation %" PRIu64, v->number,
+                    rp->node, vr->open_gen);
+        }
+    }
+}
+
 static void leader_duties(uint64_t now)
 {
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
@@ -3601,6 +3888,7 @@ static void leader_duties(uint64_t now)
     if (!C.sm.initialised)
         return;
     member_states(now);
+    propose_opens(now);
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
@@ -3756,6 +4044,7 @@ static void *cluster_main(void *arg)
             C.next_duty = now + 100 * MS;
             leader_duties(now);
             watch_duty(now);
+            vol_watch_duty();
             seeds_refresh(now);
             for (size_t i = 0; i < C.nconns; i++) {
                 struct conn *c = C.conns[i];
@@ -3878,6 +4167,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.copyfile, sizeof C.copyfile, "%s/copy", C.metadir);
     snprintf(C.retiredfile, sizeof C.retiredfile, "%s/retired", C.metadir);
     snprintf(C.stallfile, sizeof C.stallfile, "%s/stall", C.metadir);
+    snprintf(C.holdopensfile, sizeof C.holdopensfile, "%s/holdopens", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     meta_init(&C.sm);

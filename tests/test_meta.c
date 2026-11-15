@@ -291,14 +291,15 @@ static void test_state_machine(void)
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v = meta_volume(&m, 0);
     CHECK(v->nrep == 4 && v->rep[3].node == 5 && v->rep[3].learner && v->rep[3].rid == 5555);
-    meta_op_replica_open(&e, 0, 5, 5555, 1);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-    meta_op_replica_open(&e, 0, 5, 5555, 1); /* not above the recorded one: a restored copy */
+    meta_op_replica_open(&e, 0, 5, 5555, 1, 77);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_replica(meta_volume(&m, 0), 5)->open_nonce == 77);
+    meta_op_replica_open(&e, 0, 5, 5555, 1, 78); /* not above the recorded one: a restored copy, its own nonce */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
-    meta_op_replica_open(&e, 0, 5, 9999, 5); /* another instance of the directory */
+    meta_op_replica_open(&e, 0, 5, 9999, 5, 79); /* another instance of the directory */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
-    meta_op_replica_open(&e, 0, 5, 5555, 4);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_replica(meta_volume(&m, 0), 5)->open_gen == 4);
+    meta_op_replica_open(&e, 0, 5, 5555, 4, 80);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_replica(meta_volume(&m, 0), 5)->open_gen == 4 &&
+          meta_replica(meta_volume(&m, 0), 5)->open_nonce == 80);
     v = meta_volume(&m, 0);
     uint32_t isr45[2] = {4, 5};
     isr_chg(&e, meta_volume(&m, 0), 2, v->isr_version, isr45, 2, 0);
@@ -1740,7 +1741,8 @@ static void propose(struct msim *s, struct snode *nd)
                 meta_op_replica_remove(&e, v->number, epoch, node);
         } else if (what == 5 && v && !shared) {
             const struct meta_replica *r = &v->rep[rnd(s, 0, v->nrep - 1)];
-            meta_op_replica_open(&e, v->number, r->node, r->rid ^ (rnd(s, 0, 11) == 0), r->open_gen + rnd(s, 0, 2));
+            meta_op_replica_open(&e, v->number, r->node, r->rid ^ (rnd(s, 0, 11) == 0), r->open_gen + rnd(s, 0, 2),
+                                 rnd(s, 0, 1000));
         } else if (what == 6) {
             uint32_t id = m->members[rnd(s, 0, m->nmembers - 1)].id;
             uint64_t inc = meta_member(m, id)->incarnation + rnd(s, 0, 1);

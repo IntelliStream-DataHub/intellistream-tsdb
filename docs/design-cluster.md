@@ -889,8 +889,14 @@ Time: a server's hot replicas are rebuilt on all the others at once. With 2 TB o
   system can see a restore, it enforces the rule: REPL holds an **open generation**, raised (and synced) at every
   open and registered with the metadata group (`REPLICA_OPEN(v, node, rid, gen)`, conditional on gen being above the
   recorded one) before the replica answers a fence, sends an ACK or leads; a directory whose generation is below the
-  record's is refused at open with a message that names both. That catches a restore of any copy taken before the
-  replica's last open. It cannot catch a copy of the running directory restored before the next open (the copy then
+  record's is refused at open with a message that names both. Each open also draws a random **nonce**, saved in REPL
+  with the generation and carried by `REPLICA_OPEN`: the replica serves only once the record holds exactly its own
+  (generation, nonce), so a copy taken after an open that was never recorded, which saves the same generation again,
+  is refused too ("saved open generation G in another open"), as is an open that finds a record of its generation
+  from another open. The volume manager judges a directory only against a metadata copy that holds this run's own
+  incarnation (the leader's `MEMBER_STATE` up for it), so every `REPLICA_OPEN` committed before the restart is in it:
+  a local copy that has not caught up must not let an older directory pass. That catches a restore of any copy taken
+  before the replica's last open. It cannot catch a copy of the running directory restored before the next open (the copy then
   carries the current generation), which is why the rule is the operator's: replica directories are never restored
   in place; backups serve disaster recovery of the whole cluster (`tsdb cluster restore`, design-ha-modes.md §8.1).
   The core fails a follower that sees two records of one epoch at one position, so a double lead is never silent.

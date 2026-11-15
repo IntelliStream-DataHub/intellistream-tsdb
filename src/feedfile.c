@@ -383,10 +383,14 @@ int fslots_set_floor(struct eng *db, uint64_t floor_event, uint32_t floor_check)
 
 static const char *line_end(const char *l) { const char *e = strchr(l, '\n'); return e ? e : l + strlen(l); }
 
-void meta_requires_parse(const char *txt, bool *feed, char *unknown, size_t cap)
+static __thread bool cluster_open_ok;
+void meta_cluster_open_allow(bool on) { cluster_open_ok = on; }
+bool meta_cluster_open_allowed(void) { return cluster_open_ok; }
+
+void meta_requires_parse(const char *txt, unsigned *feats, char *unknown, size_t cap)
 {
-    if (feed)
-        *feed = false;
+    if (feats)
+        *feats = 0;
     if (unknown && cap)
         unknown[0] = '\0';
     size_t un = 0;
@@ -398,9 +402,13 @@ void meta_requires_parse(const char *txt, bool *feed, char *unknown, size_t cap)
             const char *c = memchr(w, ',', (size_t)(e - w));
             const char *we = c ? c : e;
             size_t wl = (size_t)(we - w);
-            if (wl == 4 && strncmp(w, "feed", 4) == 0) {
-                if (feed)
-                    *feed = true;
+            unsigned bit = wl == 4 && strncmp(w, "feed", 4) == 0      ? META_REQ_FEED
+                           : wl == 7 && strncmp(w, "cluster", 7) == 0 ? META_REQ_CLUSTER
+                           : wl == 7 && strncmp(w, "replica", 7) == 0 ? META_REQ_REPLICA
+                                                                      : 0;
+            if (bit) {
+                if (feats)
+                    *feats |= bit;
             } else if (wl && unknown && cap && un + wl + 2 < cap) {
                 if (un)
                     unknown[un++] = ',';
@@ -422,8 +430,16 @@ static int meta_word(const feed_dir *d, bool on)
     int rc = read_whole(d->dirfd, "META", &txt, &len);
     if (rc)
         return rc;
-    bool has;
-    meta_requires_parse((const char *)txt, &has, NULL, 0);
+    unsigned feats;
+    meta_requires_parse((const char *)txt, &feats, NULL, 0);
+    bool has = feats & META_REQ_FEED;
+    if (feats & (META_REQ_CLUSTER | META_REQ_REPLICA)) {
+        /* a replica cannot keep a feed (design-cluster.md §5.3): its log is the leader's; nor is this rewrite of the
+         * requires= line one that keeps those words */
+        fprintf(stderr, "tsdb: the directory is a cluster volume's (META requires=cluster): no change feed there\n");
+        free(txt);
+        return TSDB_ERR_INVALID;
+    }
     if (has == on) {
         free(txt);
         return 0;
@@ -500,7 +516,9 @@ int feed_dir_state(int dirfd, feed_state *s)
     size_t len;
     int rc = read_whole(dirfd, "META", &txt, &len);
     if (rc == 0) {
-        meta_requires_parse((const char *)txt, &s->word, NULL, 0);
+        unsigned feats;
+        meta_requires_parse((const char *)txt, &feats, NULL, 0);
+        s->word = feats & META_REQ_FEED;
         free(txt);
     } else if (rc != TSDB_ERR_NOTFOUND) {
         return rc;

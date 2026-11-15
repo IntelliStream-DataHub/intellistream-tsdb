@@ -37,7 +37,8 @@
  * --cluster runs the cluster thread (cluster.c, docs/design-cluster.md): the metadata group on a peer port of its
  * own (--peer-port, default the client port + 1; bound to --peer-listen, default --listen), with its files in
  * DIR/meta/. --advertise is the host other servers and clients reach this one at (default --listen, which must then
- * not be a wildcard). Step 1 of the design: the engine and the client port are unchanged.
+ * not be a wildcard). --peer-advertise HOST:PORT is the peer address put in the metadata instead of that host and the
+ * real peer port (a proxy in front of the peer port: tests/jepsen/jepsen_cluster.c). Step 1 of the design: the engine and the client port are unchanged.
  *
  * --no-stats turns the statistics of what is stored off (no sweeper thread, no query counters, no column totals
  * in the metrics; docs/design-stats.md). On by default: the sweeper follows the open.
@@ -120,6 +121,9 @@
 #include "auth.h"
 #include "tenants.h"
 #include "cluster.h"
+#include "cvol.h"
+#include "../src/cvol.h"
+#include "crashpt.h"
 #include "../tools/cfg.h" /* configuration files: docs/config.md */
 #include "tsdbd_keys.h"
 
@@ -500,6 +504,12 @@ static void vol_health(size_t v, uint8_t *health, uint8_t *reason, int64_t *sinc
     *outage_id = 0;
     *retry_ms = 1000;
     *domain = 0xffff;
+    int cw = cvol_why((uint32_t)v); /* a cluster volume: a replica (FENCED) or one not open yet (RECOVERING) */
+    if (cw >= 0) {
+        *health = TSDB_HEALTH_UNAVAILABLE;
+        *reason = (uint8_t)cw;
+        return;
+    }
     int d = dom_of(v);
     if (d < 0 || !dom.health)
         return;
@@ -552,6 +562,11 @@ static tsdb_unavail unav_entry(uint16_t vol)
     uint8_t health, reason;
     uint16_t dom_idx;
     uint32_t retry;
+    if (vol == TSDB_VOL_ANY && cvol_active() && !cvol_synced()) { /* a cluster node before its volume records */
+        e.reason = TSDB_WHY_RECOVERING;
+        e.retry_after_ms = unav_jitter(1000);
+        return e;
+    }
     if (vol == TSDB_VOL_ANY) { /* the first domain that is not UP, else nothing is known */
         size_t nvol = dom.db ? tsdb_volume_count(dom.db) : 0;
         for (size_t v = 1; v < DOM_MAX_VOLS && v < nvol; v++) {
@@ -870,6 +885,11 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
     size_t pre = ix ? TSDB_MULTI_PREFIX : 0;
     uint8_t ub[2 + TSDB_UNAVAIL_ENTRY]; /* the body of UNAVAILABLE (protocol 13), after the op's own error shape */
     size_t ulen = 0;
+    /* a cluster volume this server only replicates (or leads before replication is wired) refuses writes as
+     * UNAVAILABLE (FENCED), the engine's READONLY; a cluster node has no other read-only volume (--cluster refuses
+     * --read-only and --follow) */
+    if (status == TSDB_ERR_READONLY && cvol_active())
+        status = TSDB_ERR_UNAVAILABLE;
     /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
      * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
     if (status == TSDB_ERR_UNAVAILABLE && atomic_load(&c->proto) >= 13 && (!ix || *ix == TSDB_MULTI_END)) {
@@ -1052,6 +1072,8 @@ static const tsdb_sid *frame_ids(const uint8_t *p, size_t len, size_t end, uint3
 }
 
 /* A packed INSERT_VALUES: unzstd, unshape into plain arrays, insert. */
+static int cvol_refuse_ids(const tsdb_sid *ids, size_t n);
+
 static int insert_packed(auth_conn *a, const uint8_t *p, size_t len, uint32_t n, tsdb_sid s)
 {
     unsigned type = p[4];
@@ -1087,6 +1109,7 @@ static int insert_packed(auth_conn *a, const uint8_t *p, size_t len, uint32_t n,
             rc = TSDB_ERR_INVALID;
         } else if (many && (rc = auth_ids(a, series, n, R_INSERT)) != 0) {
             /* one row of a series the user may not insert into refuses the whole frame (A16) */
+        } else if (many && (rc = cvol_refuse_ids(series, n)) != 0) {
         } else {
             tsdb_values col = {(tsdb_type)type, vals, valid ? bits : NULL};
             uint16_t list[DOM_MAX_VOLS];
@@ -2120,6 +2143,34 @@ static uint16_t req_volume(uint8_t op, const uint8_t *p, size_t len)
     return (uint16_t)TSDB_SID_VOLUME(id);
 }
 
+/* The cluster volume a series op names by its path (the body of its UNAVAILABLE says which), else TSDB_VOL_ANY. */
+static uint16_t path_volume(const char *path)
+{
+    uint32_t v;
+    if (!path || !*path || !cvol_active() || tsdb_cvol_find(db, path, &v) != 0 || v >= TSDB_VOL_ANY)
+        return TSDB_VOL_ANY;
+    return (uint16_t)v;
+}
+
+/* Writes to a cluster volume held here as a replica or not open yet are refused (FENCED / RECOVERING) whether the
+ * series is known here or not: a replica's dictionary lags the leader's, and an id it does not know yet must not
+ * answer INVALID. The first such volume is named in the UNAVAILABLE body. */
+static int cvol_refuse_ids(const tsdb_sid *ids, size_t n)
+{
+    if (!cvol_active())
+        return 0;
+    for (size_t i = 0; i < n; i++) {
+        tsdb_sid id = ids[i];
+        if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY)
+            continue; /* the library refuses it */
+        if (cvol_why((uint32_t)TSDB_SID_VOLUME(id)) >= 0) {
+            unav_vol = (uint16_t)TSDB_SID_VOLUME(id);
+            return TSDB_ERR_UNAVAILABLE;
+        }
+    }
+    return 0;
+}
+
 static bool g_reader_only; /* --follow or --read-only: every volume is a FOLLOWER in TOPOLOGY */
 
 /* TOPOLOGY of a server without a cluster (protocol 13): itself as node 1, every volume it has, owned by it, with
@@ -2251,6 +2302,11 @@ static void handle(req *r)
         return;
     }
     unav_vol = req_volume(r->op, p, len);
+    if (unav_vol != TSDB_VOL_ANY && !(auth_ops[r->op].need & NEED_ANY) && (auth_ops[r->op].need & R_WRITE) &&
+        cvol_active() && cvol_why(unav_vol) >= 0) { /* a write to a cluster volume this server does not lead */
+        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+        return;
+    }
     int dv = dom_volume_of(r->op, p, len); /* a volume of a storage domain: at most DOM_CAP requests inside */
     if (dv >= 0) {
         if ((rc = dom_enter(dv)) != 0) {
@@ -2412,6 +2468,10 @@ static void handle_op(req *r)
             rc = tsdb_series_lookup(db, name, &id);
         else
             rc = tsdb_series_at(db, name, path && *path ? path : NULL, &id);
+        if (rc == TSDB_ERR_NOTFOUND && path && *path && cvol_active() && !cvol_synced())
+            rc = TSDB_ERR_UNAVAILABLE; /* a volume the metadata copy has not shown this server yet (RECOVERING) */
+        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_READONLY) /* READONLY: a replica's, sent as UNAVAILABLE */
+            unav_vol = path_volume(path);
         free(name);
         free(path);
         if (rc == 0) {
@@ -2454,6 +2514,8 @@ static void handle_op(req *r)
         }
         if (many && (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0)
             break; /* all or nothing (A16) */
+        if (many && (rc = cvol_refuse_ids(ids, n)) != 0)
+            break;
         const int64_t *ts = (const int64_t *)(const void *)(p + 16); /* the payload is malloc'd: 16-aligned */
         const float *v = (const float *)(const void *)(p + 16 + (size_t)n * 8);
         rc = many ? tsdb_insert(db, ids, ts, v, n) : tsdb_insert_series(db, s, ts, v, n);
@@ -2509,6 +2571,10 @@ static void handle_op(req *r)
         char *path = pn ? strndup((const char *)p + 5 + n, pn) : NULL;
         tsdb_sid id = 0;
         rc = !name || (pn && !path) ? TSDB_ERR_NOMEM : tsdb_series_create(db, name, (tsdb_type)p[0], path, &id);
+        if (rc == TSDB_ERR_NOTFOUND && path && *path && cvol_active() && !cvol_synced())
+            rc = TSDB_ERR_UNAVAILABLE; /* a volume the metadata copy has not shown this server yet (RECOVERING) */
+        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_READONLY) /* READONLY: a replica's, sent as UNAVAILABLE */
+            unav_vol = path_volume(path);
         free(name);
         free(path);
         if (rc == 0) {
@@ -2558,6 +2624,8 @@ static void handle_op(req *r)
         }
         if (many && (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0)
             break; /* all or nothing (A16) */
+        if (many && (rc = cvol_refuse_ids(ids, n)) != 0)
+            break;
         const int64_t *ts = (const int64_t *)(const void *)(p + TSDB_VALUES_HEADER); /* the payload is 8-aligned */
         const uint8_t *vals = p + TSDB_VALUES_HEADER + (size_t)n * 8;
         tsdb_values col = {(tsdb_type)p[4], vals, valid ? vals + vb : NULL};
@@ -4098,6 +4166,7 @@ int main(int argc, char **argv)
                                    {"peer-port", required_argument, 0, 'y'},
                                    {"peer-listen", required_argument, 0, 'Y'},
                                    {"advertise", required_argument, 0, 'a'},
+                                   {"peer-advertise", required_argument, 0, 0x10e},
                                    {"rack", required_argument, 0, 'k'},
                                    {"cluster-secret-file", required_argument, 0, 'S'},
                                    {"state-dir", required_argument, 0, 0x102},
@@ -4114,7 +4183,7 @@ int main(int argc, char **argv)
     int witness = 0, rb_off = 0;
     char *health_domains[DOM_MAX];
     int nhealth = 0;
-    const char *peer_addr = NULL, *advertise = NULL, *rack = "", *secret_file = NULL;
+    const char *peer_addr = NULL, *advertise = NULL, *peer_advertise = NULL, *rack = "", *secret_file = NULL;
     const char *state_dir = NULL, *power_feed = "", *bmc = "";
     const char *metrics_addr = NULL, *tenants_file = NULL;
     int tenants_settle = 30;
@@ -4264,6 +4333,7 @@ int main(int argc, char **argv)
         case 'y': peer_port = (int)num_arg("peer-port", optarg, 0, 65535); cluster_opts = 1; break;
         case 'Y': peer_addr = optarg; cluster_opts = 1; break;
         case 'a': advertise = optarg; cluster_opts = 1; break;
+        case 0x10e: peer_advertise = optarg; cluster_opts = 1; break;
         case 'k': rack = optarg; cluster_opts = 1; break;
         case 'S': secret_file = optarg; cluster_opts = 1; break;
         case 0x102: state_dir = optarg; cluster_opts = 1; break;
@@ -4334,6 +4404,11 @@ int main(int argc, char **argv)
                         "and a writer (not --read-only or --follow)\n");
         return 2;
     }
+    if (cluster_on && o.wal_sync_ms != 0) { /* design-cluster.md §5.1: a periodic sync acknowledges before durability */
+        fprintf(stderr, "tsdbd: --cluster needs --wal-sync-ms 0 (every write synced before it is acknowledged), not "
+                        "%d\n", o.wal_sync_ms);
+        return 2;
+    }
     if (witness && (!cluster_on || dir)) {
         fprintf(stderr, "tsdbd: --witness is a cluster member without volumes: it needs --cluster, and takes no "
                         "--dir\n");
@@ -4360,7 +4435,8 @@ int main(int argc, char **argv)
                         "             [--health-domain PREFIX]... [--no-stats] [--latest-cache BYTES]\n"
                         "             [--tenants FILE] [--tenants-settle 30]\n"
                         "             [--cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
-                        "              [--peer-listen ADDR] [--advertise HOST] [--rack NAME] [--power-feed NAME]\n"
+                        "              [--peer-listen ADDR] [--advertise HOST] [--peer-advertise HOST:PORT] [--rack NAME]\n"
+                        "              [--power-feed NAME]\n"
                         "              [--bmc ADDR] [--read-barrier on|off]]\n"
                         "       tsdbd --witness --cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
                         "             [--peer-listen ADDR] --advertise HOST [--rack NAME] [--power-feed NAME]\n",
@@ -4385,6 +4461,15 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    if (peer_advertise) {
+        const char *colon = strrchr(peer_advertise, ':');
+        char *end = NULL;
+        long pp = colon ? strtol(colon + 1, &end, 10) : 0;
+        if (!colon || colon == peer_advertise || !colon[1] || *end || pp < 1 || pp > 65535 || strlen(peer_advertise) >= META_ADDR_MAX) {
+            fprintf(stderr, "tsdbd: --peer-advertise wants HOST:PORT, not '%s'\n", peer_advertise);
+            return 1;
+        }
+    }
     if (witness) {
         /* A witness (design-ha-modes.md §7.1 item 7): the cluster thread and nothing else. No --dir, no engine, no
          * client port, volumes_ok 0 (never in placement); a voter candidate on any small machine with a local disk.
@@ -4406,6 +4491,8 @@ int main(int argc, char **argv)
         char cadv[256], padv[256];
         snprintf(cadv, sizeof cadv, "%s%s%s:0", lb, host, rb);
         snprintf(padv, sizeof padv, "%s%s%s:%d", lb, host, rb, peer_port);
+        if (peer_advertise)
+            snprintf(padv, sizeof padv, "%s", peer_advertise);
         struct cluster_cfg wc = {.state_dir = state_dir, .peer_fd = wfd, .advertise = cadv, .peer_advertise = padv,
                                  .rack = rack, .power_feed = power_feed, .bmc = bmc, .witness = 1,
                                  .secret = secret, .secret_len = secret_len};
@@ -4443,6 +4530,11 @@ int main(int argc, char **argv)
     tn_free_list(tn_list, tn_n);
     if (rc) {
         fprintf(stderr, "tsdbd: %s: %s\n", dir, tsdb_strerror(rc));
+        return 1;
+    }
+    if (cluster_on && (rc = tsdb_cvol_mode(db)) != 0) { /* DECISION D2: the root holds USERS only; it names what */
+        fprintf(stderr, "tsdbd: %s cannot be a cluster node's data directory: %s\n", dir, tsdb_strerror(rc));
+        tsdb_close(db);
         return 1;
     }
     if (tn_start(db) != 0) {
@@ -4597,11 +4689,14 @@ int main(int argc, char **argv)
         char cadv[256], padv[256];
         snprintf(cadv, sizeof cadv, "%s%s%s:%d", lb, host, rb, port);
         snprintf(padv, sizeof padv, "%s%s%s:%d", lb, host, rb, peer_port);
+        if (peer_advertise) /* what the metadata says, not the real peer port (a proxy in front of it, a NAT) */
+            snprintf(padv, sizeof padv, "%s", peer_advertise);
         struct cluster_cfg cc = {.state_dir = state_dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
                                  .rack = rack, .power_feed = power_feed, .bmc = bmc, .read_barrier_off = rb_off,
                                  .secret = secret, .secret_len = secret_len};
-        if (cluster_start(&cc) != 0)
+        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0)
             return 1;
+        crash_point(CP_CLUSTER_STARTED); /* the harness restarts the node and counts the hit (tests/jepsen) */
         tsdb_wipe(secret, sizeof secret);
         fprintf(stderr, "tsdbd: cluster peer port on %s:%d (advertised as %s)\n", peer_addr ? peer_addr : addr,
                 peer_port, padv);
@@ -4617,6 +4712,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: cannot write %s: %s\n", port_file, strerror(errno));
         return 1;
     }
+    crash_point(CP_SERVING); /* the node is known to its clients now: the harness sees it end while it serves */
 #ifndef TSDBD_NO_URING
     if (io == IO_URING)
         uring_loop();
@@ -4631,8 +4727,10 @@ int main(int argc, char **argv)
     close(lfd);
     if (mfd >= 0)
         metrics_stop(); /* before tsdb_close: it reads the database */
-    if (cluster_on)
+    if (cluster_on) {
         cluster_stop();
+        cvol_stop(); /* after the cluster thread: no push or report reaches it any more */
+    }
     pthread_mutex_lock(&work_lock);
     work_stop = true;
     pthread_cond_broadcast(&work_cv);

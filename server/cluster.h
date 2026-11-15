@@ -37,9 +37,12 @@ void cluster_stop(void);
 /* ---- the admin ops (`tsdb cluster ...`), sent to a server's peer address */
 
 enum cluster_admin_op {
-    CLUSTER_OP_INIT = 1,     /* body: struct meta_settings (12 u32) and the mode (u32); on a server in no cluster */
+    CLUSTER_OP_INIT = 1,     /* body: struct meta_settings (META_SETTINGS_WORDS u32) and the mode (u32); on a server in
+                              * no cluster */
     CLUSTER_OP_NODE_ADD = 2, /* body: the new server's peer address; on the Raft leader */
     CLUSTER_OP_STATUS = 3,   /* no body; on any server */
+    CLUSTER_OP_VOLUME_ADD = 4, /* body: u16 name length, the name, u32 replicas (0: the cluster's replication); on the
+                                * Raft leader, which picks the number, uuid, servers and rids. Reply: u32 number */
 };
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
@@ -50,6 +53,7 @@ enum cluster_err {
     CLUSTER_ERR_REFUSED = -103,   /* NODE_ADD: the new server belongs to another cluster or has another id */
     CLUSTER_ERR_RETRY = -104,     /* the entry's outcome is unknown here (a snapshot replaced it, a new leader) */
     CLUSTER_ERR_STATE = -105,     /* not now (the server is in no cluster) */
+    CLUSTER_ERR_FEW = -106,       /* VOLUME_ADD: fewer live members that take volumes than replicas */
 };
 const char *cluster_strerror(int rc);
 
@@ -72,6 +76,9 @@ struct cluster_vol_report { /* a volume this server owns */
     uint64_t series_len, states_len;   /* the dictionaries' lengths */
     uint64_t fenced_age_ms;            /* age of the oldest fenced call still outstanding (the stuck-release rule) */
     uint64_t wal_seg, wal_off;         /* positions as the owner last made them durable */
+    uint64_t rid, open_gen;            /* replicated: the directory's replica instance and the generation its last
+                                        * open saved (§8.5); the leader proposes REPLICA_OPEN for a higher one */
+    uint64_t open_nonce;               /* that open's random draw, recorded with the generation */
 };
 struct cluster_dom_report {
     char name[META_DOMAIN_MAX];
@@ -90,6 +97,23 @@ void cluster_set_reporter(cluster_report_fn fn, void *arg);
  * its own (the state disk, the storage), 1 once they work again. It goes into the heartbeat's flags (claim_ok), and
  * the leader lifts a CLAIM_FAILED bar only on the 0 -> 1 change. */
 void cluster_set_claim_ok(int ok);
+
+/* ---- this server's replicated volumes as its metadata copy holds them (server/cvol.c) */
+struct cluster_vol_rec {
+    uint32_t number;
+    char name[META_NAME_MAX];
+    uint8_t uuid[16], cluster[16];
+    uint32_t leader; /* the record's leader (rep[0] at VOLUME_ADD): the writer */
+    uint64_t epoch;
+    uint64_t rid, open_gen; /* this server's replica: its instance and the last REPLICA_OPEN generation committed */
+    uint64_t open_nonce;    /* and the nonce committed with it */
+};
+/* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
+ * holds every REPLICA_OPEN committed before this start), with every replicated volume that names this server (`self`)
+ * as a replica, ascending by number (at most CLUSTER_REPORT_VOLS; past that a line is logged); it must copy what it
+ * keeps and not block. */
+typedef void (*cluster_vol_watch_fn)(void *arg, uint32_t self, const struct cluster_vol_rec *v, uint32_t n);
+void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg);
 
 struct cluster_vol_status {
     struct cluster_vol_report v;
@@ -143,7 +167,10 @@ int cluster_make_secret(const char *path, char *err, size_t errn);
 void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *const *part, const size_t *len,
                         uint8_t out[32]);
 
-/* The INIT body for `s` and the deployment's mode, an enum meta_mode (52 bytes). */
+/* The VOLUME_ADD body (at most 2 + META_NAME_MAX + 4 bytes). */
+size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out);
+
+/* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);
 
 #endif

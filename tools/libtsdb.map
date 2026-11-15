@@ -1,8 +1,10 @@
 /* Exported symbols of libtsdb.so: the public API of include/tsdb.h and
  * include/tsdb_calendar.h, nothing internal (and the tsdb_test_* hooks of the tests, which link against the .so).
  * The tsdb_ec_* functions are the erasure codec's glue (src/ec/compat.c): internal, and a caller could lift the CPU
- * level cap with tsdb_ec_select. They are named one by one, because an exact name beats the tsdb_* pattern (a pattern
- * does not); a new one fails tools/check-exports.sh (make test) until it is listed here or declared in a public header. */
+ * level cap with tsdb_ec_select. The tsdb_cvol_* functions (src/cvol.h) are tsdbd's hold on cluster volumes (declare,
+ * open, swap, promote): internal as well; tsdbd and test_cvol link the static library. They are named one by one,
+ * because an exact name beats the tsdb_* pattern (a pattern does not); a new one fails tools/check-exports.sh
+ * (make test) until it is listed here or declared in a public header. */
 {
     global:
         tsdb_*;
@@ -14,5 +16,17 @@
         tsdb_ec_select;
         tsdb_ec_strlcpy;
         tsdb_ec_xmalloc;
+        tsdb_cvol_declare;
+        tsdb_cvol_find;
+        tsdb_cvol_fno_create;
+        tsdb_cvol_mode;
+        tsdb_cvol_open;
+        tsdb_cvol_promote;
+        tsdb_cvol_ref;
+        tsdb_cvol_replace;
+        tsdb_cvol_role;
+        tsdb_cvol_test_replace_arg;
+        tsdb_cvol_test_replace_hook;
+        tsdb_cvol_unref;
         *;
 };
