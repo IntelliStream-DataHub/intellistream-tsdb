@@ -64,7 +64,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_VISIBLE_DURABLE, MUT_LEADER_FLUSH_UNCOMMITTED, MUT_LEADER_DEPOSE_FAILS, MUT_LEADER_ADMIT_AFTER,
        MUT_LEADER_BYTES_AFTER_SYNC, MUT_LEADER_MARKER_RC, MUT_LEADER_GATE_NOHOOK,
        MUT_LEADER_NO_SYNCED, MUT_REPLICA_RS_COMMITTED_TRUE, MUT_REPLICA_RS_COMMITTED_FALSE, MUT_REPLICA_DROP_NO_SAVE,
-       MUT_LEADER_CLOSE_FLUSH, MUT_LEADER_NO_RSTATE, MUT_LEADER_CLOSE_WAIT, MUT_LEADER_KEEP_IGNORED };
+       MUT_LEADER_CLOSE_FLUSH, MUT_LEADER_NO_RSTATE, MUT_LEADER_CLOSE_WAIT, MUT_LEADER_KEEP_IGNORED,
+       MUT_LEADER_NO_HARDLINK };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1460,6 +1461,16 @@ void eng_leader_depose(struct eng *db);
  * end). Before the first call the bound is 0: nothing goes. The bound may move back (a replica rejoins); what is gone
  * stays gone. Takes flush_lock (waits for a flush in progress). */
 void eng_leader_keep(struct eng *db, uint64_t pos);
+/* A file a COMMIT marker of this leader names (`name`: the marker's name, p<partition>_<pid>_<n>_0.part), for a replica
+ * that missed it: the leader keeps each hard linked as stage_<xxh64 of the name>.part (the name a replica stages it
+ * under) from before its marker is appended until the retained segment that holds the marker goes (eng_leader_keep),
+ * whatever merges did to the part since. An fd open for reading, or TSDB_ERR_NOTFOUND (the segment went: the replica
+ * needs a snapshot). */
+int eng_leader_file_open(struct eng *db, const char *name);
+/* replica.c: the links of the files of COMMIT markers whose position is below fno_end go (their segment went;
+ * flush_lock held); every stage_ file goes (eng_leader_attach: a writer keeps no stage of its own) */
+void leader_links_drop(struct eng *db, uint64_t fno_end);
+void leader_links_sweep(struct eng *db);
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
@@ -1778,6 +1789,10 @@ struct eng {
     } *lk;                       /* with jr: flushed segments kept for the replicas, oldest first (flush_lock) */
     size_t nlk, caplk;
     bool lk_stuck;               /* a push failed: no segment goes until a reopen (wal_removed must not pass one) */
+    struct lkfile {
+        uint64_t fno, key;
+    } *lf;                       /* with jr: the stage_ links of COMMIT markers in the log (leader_commit; lead_mu) */
+    size_t nlf, caplf;
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
     atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */

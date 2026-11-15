@@ -3767,6 +3767,83 @@ static void case_leader_keep(void)
     xp_stop(&x);
     printf("  a leader keeps its flushed segments until the driver's bound passes their end, FNO first\n");
 }
+static bool leader_file_is(eng *db, const char *name, const uint8_t *b, size_t len)
+{
+    int fd = eng_leader_file_open(db, name);
+    if (fd < 0)
+        return false;
+    uint8_t *got = malloc(len + 1);
+    ssize_t r = got ? pread(fd, got, len + 1, 0) : -1;
+    bool ok = r == (ssize_t)len && memcmp(got, b, len) == 0;
+    free(got);
+    close(fd);
+    return ok;
+}
+
+/* Item 2 (design-cluster.md 5.2, M4): the files a leader's COMMIT marker names stay readable by the marker's names
+ * (stage_ hard links) while the segment holding the marker is retained, and go with it.
+ * (a) A large insert's file is the shipped bytes; it still is after a second large insert into the partition and a
+ *     merge of both (the part is gone, its retired name too: no lifetime); once the segment goes past the keep bound,
+ *     the file is NOTFOUND (a replica that far behind needs a snapshot).
+ * (b) A leader loses power after a COMMIT marker is durable and before its parts_commit (the writer waits for the
+ *     commit point): the copy of its directory then holds the marker and tmp_ files that an open removes (load_parts).
+ *     Opened as a replica at the marker (design-cluster.md 6.3), it applies the marker from the links and answers as
+ *     the replica that saw the COMMIT. Mutant nohardlink: no links, (a) finds no file and (b) holds below the marker. */
+static void case_hardlink(void)
+{
+    xport x;
+    char cp[PATH_MAX + 16];
+    xp_start(&x, "hlink");
+    snprintf(cp, sizeof cp, "%s.crash", x.ldir);
+    xp_rows(&x, 0, 0, 40, 1000); /* a large insert: a COMMIT */
+    xp_step(&x, "HL: large insert");
+    char name[64];
+    snprintf(name, sizeof name, "%s", x.held_name);
+    size_t len = x.held_len;
+    uint8_t *b = malloc(len);
+    memcpy(b, x.held, len);
+    CHECK(leader_file_is(x.ld, name, b, len)); /* mutant nohardlink: NOTFOUND */
+    xp_rows(&x, 0, 40, 40, 2000);
+    xp_step(&x, "HL: second large insert");
+    x.ld->opt.obsolete_part_lifetime_s = 0;
+    CHECK_EQ(eng_optimize(x.ld), 0);
+    CHECK(leader_file_is(x.ld, name, b, len)); /* the merge took the part, not the link */
+    xp_rows(&x, 1, 200, 5, 3000); /* rows, so that the flush seals the segment that holds the markers */
+    xp_step(&x, "HL: small rows");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    eng_leader_keep(x.ld, UINT64_MAX);
+    int fd = eng_leader_file_open(x.ld, name);
+    CHECK_EQ(fd, TSDB_ERR_NOTFOUND); /* gone with the segment */
+    if (fd >= 0)
+        close(fd);
+    free(b);
+
+    x.manual = true;
+    uint64_t before = ld_last(&x);
+    eng_leader_commit(x.ld, before);
+    ljob a = {.db = x.ld, .s = 1, .t0 = 100, .n = 40}; /* a large insert whose writer waits for the commit point */
+    pthread_t ta;
+    pthread_create(&ta, NULL, ljob_main, &a);
+    for (int i = 0; i < 5000 && eng_wal_durable_fno(x.ld) <= before; i++)
+        usleep(1000);
+    uint64_t m = eng_wal_durable_fno(x.ld);
+    CHECK(m > before);
+    sh("cp -a '%s' '%s'", x.ldir, cp); /* the power loss: the marker is durable, its parts are tmp_ files */
+    eng_leader_commit(x.ld, m);
+    pthread_join(ta, NULL);
+    CHECK_EQ(a.rc, 0);
+    xp_step(&x, "HL: the COMMIT");
+    eng *ex = NULL;
+    CHECK_EQ(open_replica(cp, m, &ex), 0);
+    if (ex) {
+        CHECK_EQ(replica_applied_end(ex), m); /* mutant nohardlink: held below the marker, its files are gone */
+        CHECK(same_all(ex, x.rep, T0 + DAY_MS, "HL: the leader that lost power, as a replica"));
+        eng_close(ex);
+    }
+    xp_stop(&x);
+    printf("  a leader keeps its COMMITs' files linked while their segment is retained; a power loss before the publish keeps them\n");
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -3818,7 +3895,8 @@ static int mutant_of(const char *m)
                         : strcmp(m, "leaderclose") == 0 ? MUT_LEADER_CLOSE_FLUSH
                         : strcmp(m, "leadernorstate") == 0 ? MUT_LEADER_NO_RSTATE
                         : strcmp(m, "closewait") == 0 ? MUT_LEADER_CLOSE_WAIT
-                        : strcmp(m, "keepignored") == 0 ? MUT_LEADER_KEEP_IGNORED : 0;
+                        : strcmp(m, "keepignored") == 0 ? MUT_LEADER_KEEP_IGNORED
+                        : strcmp(m, "nohardlink") == 0 ? MUT_LEADER_NO_HARDLINK : 0;
 }
 
 int main(int argc, char **argv)
@@ -3873,6 +3951,7 @@ int main(int argc, char **argv)
         case_close_bound();
         case_depose();
         case_leader_keep();
+        case_hardlink();
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
     }
@@ -3924,6 +4003,7 @@ int main(int argc, char **argv)
     case_close_bound();
     case_depose();
     case_leader_keep();
+    case_hardlink();
     case_promote_refused();
     for (int v = 0; v < 3; v++)
         case_promote(v);

@@ -953,6 +953,7 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
     int rc = db->lrs ? 0 : leader_rs_open(db); /* RSTATE before the first marker */
     if (rc)
         return rc;
+    leader_links_sweep(db); /* an earlier leadership's links, or a promoted replica's stages: no marker here needs them */
     __atomic_store_n(&db->jr, ops, __ATOMIC_RELEASE); /* the flusher, warmer and merges are running already */
     return 0;
 }
@@ -1336,6 +1337,8 @@ static void leader_unlink_due(eng *db)
             break; /* it failed: it stays, and every later one behind it */
         n++;
     }
+    if (n)
+        leader_links_drop(db, db->lk[n - 1].fno_end); /* the files their COMMIT markers named go with them */
     memmove(db->lk, db->lk + n, (db->nlk - n) * sizeof *db->lk);
     db->nlk -= n;
 }

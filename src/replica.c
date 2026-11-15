@@ -361,6 +361,9 @@ void replica_free(eng *db)
         free(db->lrs);
         db->lrs = NULL;
     }
+    free(db->lf); /* the links of its COMMITs' files: they stay on disk (removed at the next attach) */
+    db->lf = NULL;
+    db->nlf = db->caplf = 0;
     free(db->lk); /* the leader's kept segments: they stay on disk */
     db->lk = NULL;
     db->nlk = db->caplk = 0;
@@ -2026,6 +2029,87 @@ static int leader_marker_wait(eng *db, uint64_t last, const char *what)
  * publish that follows on the same thread records in the leader's RSTATE (jr_precommit, jr_commit, leader_rs_drop) */
 static __thread uint64_t lead_pos, lead_drop_pos;
 
+/* ---- the leader's links of its COMMITs' files (design-cluster.md 5.2, M4) ----
+ * Each file a leader's COMMIT marker names is hard linked as stage_<key>.part, the name a replica stages it under, so a
+ * replica that missed it can fetch it (eng_leader_file_open) after the leader merged the part away, and a deposed
+ * leader reopened as a replica finds the files of the markers it had not published (open_scan keeps the stage_ files
+ * that a marker above RSTATE's `done` names and removes the rest). The links go with the retained segment that holds
+ * their marker (leader_links_drop, from leader_unlink_due); the list is in memory only: links of an earlier leadership
+ * are removed at attach (leader_links_sweep). */
+static void leader_links_unlink(eng *db, const uint64_t *keys, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        char sp[40];
+        stage_path(sp, sizeof sp, keys[i]);
+        unlinkat(db->dirfd, sp, 0);
+    }
+}
+
+static void leader_links_note(eng *db, uint64_t fno, const uint64_t *keys, size_t n)
+{
+    pthread_mutex_lock(&db->lead_mu);
+    if (db->nlf + n > db->caplf) {
+        size_t c = db->caplf ? db->caplf : 16;
+        while (c < db->nlf + n)
+            c *= 2;
+        void *p = realloc(db->lf, c * sizeof *db->lf);
+        if (!p) {
+            pthread_mutex_unlock(&db->lead_mu);
+            return; /* they stay until the next attach: a leak, never a missing file */
+        }
+        db->lf = p;
+        db->caplf = c;
+    }
+    for (size_t i = 0; i < n; i++)
+        db->lf[db->nlf++] = (struct lkfile){fno, keys[i]};
+    pthread_mutex_unlock(&db->lead_mu);
+}
+
+void leader_links_drop(eng *db, uint64_t fno_end)
+{
+    uint64_t keys[64];
+    for (;;) {
+        size_t n = 0, k = 0;
+        pthread_mutex_lock(&db->lead_mu);
+        for (size_t i = 0; i < db->nlf; i++) {
+            if (db->lf[i].fno < fno_end && n < 64)
+                keys[n++] = db->lf[i].key;
+            else
+                db->lf[k++] = db->lf[i];
+        }
+        bool more = n == 64 && k < db->nlf;
+        db->nlf = k;
+        pthread_mutex_unlock(&db->lead_mu);
+        leader_links_unlink(db, keys, n); /* outside lead_mu, a leaf */
+        if (!more)
+            return;
+    }
+}
+
+void leader_links_sweep(eng *db)
+{
+    DIR *d = fdopendir(dup(db->dirfd));
+    if (!d)
+        return; /* the links stay: a leak, never a missing file */
+    rewinddir(d);
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        uint64_t key;
+        int consumed = 0;
+        if (sscanf(e->d_name, "stage_%" SCNx64 ".part%n", &key, &consumed) == 1 && !e->d_name[consumed])
+            unlinkat(db->dirfd, e->d_name, 0);
+    }
+    closedir(d);
+}
+
+int eng_leader_file_open(eng *db, const char *name)
+{
+    char sp[40];
+    stage_path(sp, sizeof sp, stage_key(name));
+    int fd = openat(db->dirfd, sp, O_RDONLY | O_CLOEXEC);
+    return fd >= 0 ? fd : errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+}
+
 static int leader_commit(eng *db, const struct jr_commit_arg *ja)
 {
     const struct jr_ops *jr = eng_jr(db);
@@ -2037,8 +2121,12 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
     for (size_t i = 0; i < ja->n; i++)
         cap += 24 + 8 + 64;
     uint8_t *files = malloc(cap);
-    if (!files)
+    uint64_t *keys = calloc(ja->n, sizeof *keys);
+    if (!files || !keys) {
+        free(files);
+        free(keys);
         return TSDB_ERR_NOMEM;
+    }
     size_t len = 0;
     int rc = 0;
     for (size_t i = 0; i < ja->n && rc == 0; i++) {
@@ -2059,9 +2147,24 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
                      .xxh64 = xxh64(p->map, p->map_len, 0), .header_check = p->index_hash};
         len += mk_file_put(files + len, &f);
         rc = jr->ship(jr->ctx, db, p->pending, mname, p->map_len);
+        keys[i] = stage_key(mname);
+        if (rc == 0 && eng_test_mutant != MUT_LEADER_NO_HARDLINK) {
+            char sp[40];
+            stage_path(sp, sizeof sp, keys[i]);
+            unlinkat(db->dirfd, sp, 0); /* left by a marker whose append failed, or an earlier leadership */
+            if (linkat(db->dirfd, p->pending, db->dirfd, sp, 0) != 0)
+                rc = TSDB_ERR_IO;
+        }
     }
+    /* The links are named before the marker can be durable anywhere: a leader that loses power after its marker and
+     * before parts_commit has its tmp_ files removed by the open (load_parts, db.c), and reopened as a replica
+     * (design-cluster.md 6.3) it applies the marker from these, as any replica does from what it staged. */
+    if (rc == 0 && eng_test_mutant != MUT_LEADER_NO_HARDLINK)
+        rc = eng_sync_dir(db, "the links of a COMMIT's files");
     if (rc) {
         free(files);
+        leader_links_unlink(db, keys, ja->n);
+        free(keys);
         return rc;
     }
     pthread_mutex_lock(&db->lock);
@@ -2073,6 +2176,11 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
     uint64_t fno = 0;
     rc = wal_marker_mk(db, &m, &fno);
     free(files);
+    if (fno)
+        leader_links_note(db, fno, keys, ja->n); /* in the log: they go with its segment */
+    else
+        leader_links_unlink(db, keys, ja->n); /* no marker names them */
+    free(keys);
     if (rc)
         return rc; /* the marker may be in the log (a failed sync): the engine is failed by the WAL's own rules */
     rc = leader_marker_wait(db, fno, "a COMMIT marker was appended but its commit point did not come");
