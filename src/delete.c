@@ -183,6 +183,8 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         rows.n = 0; /* `all` owns them now */
         rc = eng_abandoned(); /* see cur_abandon: before any block number is taken */
         if (rc == 0)
+            rc = jr_precommit(db, all.n); /* a leader: RSTATE says `doing` before a block is taken (replica.c) */
+        if (rc == 0)
             rc = parts_commit(db, all.p, all.n);
         if (rc == 0)
             jr_commit(db, JR_COMMIT, &all);

@@ -950,6 +950,9 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
 {
     if (!db->wal_enabled || db->opt.wal_sync_ms != 0 || db->rp || db->opt.read_only)
         return TSDB_ERR_INVALID;
+    int rc = db->lrs ? 0 : leader_rs_open(db); /* RSTATE before the first marker */
+    if (rc)
+        return rc;
     __atomic_store_n(&db->jr, ops, __ATOMIC_RELEASE); /* the flusher, warmer and merges are running already */
     return 0;
 }
@@ -2020,6 +2023,12 @@ int wal_open(eng *db, int (*before_replay)(eng *))
 }
 
 /* Called by close after the final flush. */
+/* A deposed leader (eng_close deposes every leader): its close leaves the log as it is */
+static bool lead_closing(eng *db)
+{
+    return eng_jr(db) && atomic_load(&db->lead_deposed) && eng_test_mutant != MUT_LEADER_CLOSE_FLUSH;
+}
+
 void wal_close(eng *db)
 {
     if (db->wal_fd >= 0) {
@@ -2027,7 +2036,8 @@ void wal_close(eng *db)
         db->wal_fd = -1;
         /* a replica's log is the leader's: no empty segment is dropped, no exact next number stored (a cut can still
          * lower the log end after a reopen) */
-        if (!db->rp && db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db) && !db->retiring) {
+        if (!db->rp && db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db) && !db->retiring &&
+            !lead_closing(db)) {
             /* a clean close holds the exact next number; an empty segment carries none, so FNO must before it goes */
             if (fno_require(db, db->fno_next) == 0) {
                 char name[64];
@@ -2041,7 +2051,9 @@ void wal_close(eng *db)
             }
         }
     }
-    if (db->wal_enabled && !eng_check(db) && !db->retiring)
+    /* not a deposed leader's: its log end may be above the commit point, which a replica_cut takes back (FNO above the
+     * log end fails a replica's open) */
+    if (db->wal_enabled && !eng_check(db) && !db->retiring && !lead_closing(db))
         fno_require(db, db->fno_next); /* a failure fails the engine; the segments stay and the open finds the end */
     for (size_t i = 0; i < db->nflushing; i++)
         mt_unref(db->flushing[i]);

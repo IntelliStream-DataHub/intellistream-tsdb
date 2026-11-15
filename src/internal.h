@@ -63,7 +63,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_NO_STAGE_ORPHANS,
        MUT_LEADER_VISIBLE_DURABLE, MUT_LEADER_FLUSH_UNCOMMITTED, MUT_LEADER_DEPOSE_FAILS, MUT_LEADER_ADMIT_AFTER,
        MUT_LEADER_BYTES_AFTER_SYNC, MUT_LEADER_MARKER_RC, MUT_LEADER_GATE_NOHOOK,
-       MUT_LEADER_NO_SYNCED };
+       MUT_LEADER_NO_SYNCED, MUT_REPLICA_RS_COMMITTED_TRUE, MUT_REPLICA_RS_COMMITTED_FALSE, MUT_REPLICA_DROP_NO_SAVE,
+       MUT_LEADER_CLOSE_FLUSH, MUT_LEADER_NO_RSTATE, MUT_LEADER_CLOSE_WAIT };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1403,10 +1404,15 @@ struct jr_ops {
     void (*seg_done)(void *ctx, struct eng *db, uint64_t seq);
 };
 int jr_intent(struct eng *db, enum jr_kind kind, const void *arg);
-static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
-{
-    (void)db, (void)kind, (void)arg;
-}
+/* jr_commit: a leader's JR_COMMIT records the published COMMIT in its RSTATE (replica.c; the other kinds do nothing).
+ * jr_precommit: under publish_lock right before the parts_commit of a COMMIT whose marker this thread appended: records
+ * the COMMIT as `doing` (position, first block) in RSTATE. leader_rs_drop: after a leader's DROP retired its
+ * partitions (eng_drop_before; drop_retire's jr_commit runs under db->lock, where no I/O belongs). Fail the engine on
+ * a failed save. leader_rs_open: eng_leader_attach loads RSTATE (a promoted replica's) into db->lrs. */
+void jr_commit(struct eng *db, enum jr_kind kind, const void *arg);
+int jr_precommit(struct eng *db, size_t n);
+int leader_rs_drop(struct eng *db, int64_t ts);
+int leader_rs_open(struct eng *db);
 
 #define FNO_FILE "FNO"
 /* Log numbers stay below FNO_LIMIT (a record at or above it is not one: wal_record). A bound read at open (a slot, a
@@ -1440,8 +1446,10 @@ int wal_commit(struct eng *db, uint64_t target);
  * (no buf_lock), so it may be called from anywhere: from jr_ops.admit (which then refuses the record itself) or under
  * the driver's core mutex. A record whose admission was running meanwhile may still be buffered; its wait ends
  * indeterminate like any other (whoever needs the final log end takes buf_lock after the depose).
- * A leader's close or halt flushes, and the flush waits for the commit point: a driver whose commit point can no longer
- * move (the ISR is gone) deposes the leader first, or the close waits until it moves. */
+ * A leader's close deposes it first (eng_close): it never flushes, and never stores a number of its log in FNO beyond
+ * what a flush made durable, so a close cannot wait for a commit point that no longer moves (the ISR is gone), and the
+ * directory opens as a replica (eng_open_replica) whose replica_cut drops the uncommitted tail (design-cluster.md 6.3).
+ * A halt (eng_halt) stops the flusher, whose flush waits for the commit point: depose first where it may not move. */
 int eng_leader_attach(struct eng *db, const struct jr_ops *ops);
 void eng_leader_commit(struct eng *db, uint64_t pos);
 uint64_t eng_wal_durable_fno(struct eng *db);
@@ -1480,6 +1488,7 @@ int cmp_seg(const void *a, const void *b);
 int flush_waiting(struct eng *db); /* flush_lock held */
 int mt_reserve_rows(struct memtable *m, const uint32_t *series, uint32_t cs, size_t n);
 struct replica;
+struct rstate;
 int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, struct eng **out);
 int replica_open_log(struct eng *db, uint64_t floor, int (*cut_tails)(struct eng *)); /* instead of wal_open; sets db->rp */
 void replica_free(struct eng *db);                     /* wal_close */
@@ -1757,6 +1766,7 @@ struct eng {
     bool wal_enabled;
     struct replica *rp; /* an engine opened as a replica (replica.c): the log arrives verbatim, rows apply at the commit point */
     const struct jr_ops *jr;   /* the replicated backend of a leader (jr_intent): eng_leader_attach, read with eng_jr */
+    struct rstate *lrs;        /* with jr: the leader's RSTATE (replica.c, leader_rs_open), written under publish_lock */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
     atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */
     pthread_mutex_t lead_mu;          /* a leaf: waits for the commit point (lead_cv), its moves, depose, eng_fail */

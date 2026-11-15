@@ -41,6 +41,19 @@ typedef struct rseg {
     uint64_t len;   /* its valid bytes */
 } rseg;
 
+/* The RSTATE file: which COMMIT and DROP markers are carried out already. A replica writes it as it applies them, a
+ * leader as it publishes its own (jr_precommit, jr_commit, leader_rs_drop), so a deposed leader reopened as a replica
+ * skips its own published markers instead of applying them again (design-cluster.md 6.3). */
+struct rstate {
+    uint64_t done; /* the last position of the last COMMIT or DROP applied */
+    uint64_t doing_pos, doing_b0, doing_n; /* a COMMIT being published: its position, first block, parts (0: none) */
+    struct rdrop {
+        uint64_t pos;  /* the DROP's position */
+        int64_t until; /* dropped_before */
+    } *drops;
+    size_t ndrops;
+};
+
 struct replica {
     pthread_mutex_t mu;
     pthread_mutex_t segs_mu;
@@ -83,21 +96,13 @@ struct replica {
         } *f;
     } *cm; /* ascending by first */
     size_t ncm, capcm;
-    struct {
-        uint64_t done; /* the last position of the last COMMIT or DROP applied */
-        uint64_t doing_pos, doing_b0, doing_n; /* a COMMIT being published: its position, first block, parts (0: none) */
-        struct rdrop {
-            uint64_t pos;  /* the DROP's position */
-            int64_t until; /* dropped_before */
-        } *drops;
-        size_t ndrops;
-    } rs; /* the RSTATE file */
+    struct rstate rs; /* the RSTATE file */
 };
 
 #define RP_CHUNK ((size_t)1 << 20)
 
 static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit);
-static int rs_load(eng *db, struct replica *rp);
+static int rs_load(eng *db, struct rstate *rs);
 static int open_scan(eng *db, struct replica *rp);
 
 void replica_now_advance(eng *db, int64_t ms)
@@ -339,7 +344,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
                         "records the floor says were applied\n", db->dir, floor, db->fno_next - 1);
         return TSDB_ERR_CORRUPT;
     }
-    if ((rc = rs_load(db, rp)) == 0)
+    if ((rc = rs_load(db, &rp->rs)) == 0)
         rc = open_scan(db, rp);
     if (rc)
         return rc;
@@ -351,6 +356,11 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
 
 void replica_free(eng *db)
 {
+    if (db->lrs) { /* a leader's RSTATE (the leader side, below) */
+        free(db->lrs->drops);
+        free(db->lrs);
+        db->lrs = NULL;
+    }
     struct replica *rp = db->rp;
     if (!rp)
         return;
@@ -788,21 +798,21 @@ int replica_missing(eng *db, char *name, size_t cap, uint64_t *size)
 
 /* ---- RSTATE ---- */
 
-static int rs_save(eng *db, struct replica *rp)
+static int rs_save(eng *db, struct rstate *rs)
 {
-    size_t n = 8 + 4 * 8 + 8 + rp->rs.ndrops * 16 + 8, o = 0;
+    size_t n = 8 + 4 * 8 + 8 + rs->ndrops * 16 + 8, o = 0;
     uint8_t *b = malloc(n);
     if (!b)
         return TSDB_ERR_NOMEM;
     put64(b + o, RS_MAGIC), o += 8;
-    put64(b + o, rp->rs.done), o += 8;
-    put64(b + o, rp->rs.doing_pos), o += 8;
-    put64(b + o, rp->rs.doing_b0), o += 8;
-    put64(b + o, rp->rs.doing_n), o += 8;
-    put64(b + o, rp->rs.ndrops), o += 8;
-    for (size_t i = 0; i < rp->rs.ndrops; i++) {
-        put64(b + o, rp->rs.drops[i].pos), o += 8;
-        put64(b + o, (uint64_t)rp->rs.drops[i].until), o += 8;
+    put64(b + o, rs->done), o += 8;
+    put64(b + o, rs->doing_pos), o += 8;
+    put64(b + o, rs->doing_b0), o += 8;
+    put64(b + o, rs->doing_n), o += 8;
+    put64(b + o, rs->ndrops), o += 8;
+    for (size_t i = 0; i < rs->ndrops; i++) {
+        put64(b + o, rs->drops[i].pos), o += 8;
+        put64(b + o, (uint64_t)rs->drops[i].until), o += 8;
     }
     put64(b + o, xxh64(b, o, 0));
     int fd = openat(db->dirfd, RS_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -819,7 +829,7 @@ static int rs_save(eng *db, struct replica *rp)
     return rc;
 }
 
-static int rs_load(eng *db, struct replica *rp)
+static int rs_load(eng *db, struct rstate *rs)
 {
     uint8_t *b;
     size_t len;
@@ -836,21 +846,21 @@ static int rs_load(eng *db, struct replica *rp)
         fprintf(stderr, "tsdb: %s: RSTATE is damaged: the replica's state is lost, rebuild it\n", db->dir);
         return TSDB_ERR_CORRUPT;
     }
-    rp->rs.done = get64(b + 8);
-    rp->rs.doing_pos = get64(b + 16);
-    rp->rs.doing_b0 = get64(b + 24);
-    rp->rs.doing_n = get64(b + 32);
+    rs->done = get64(b + 8);
+    rs->doing_pos = get64(b + 16);
+    rs->doing_b0 = get64(b + 24);
+    rs->doing_n = get64(b + 32);
     if (nd) {
-        rp->rs.drops = malloc(nd * sizeof *rp->rs.drops);
-        if (!rp->rs.drops) {
+        rs->drops = malloc(nd * sizeof *rs->drops);
+        if (!rs->drops) {
             free(b);
             return TSDB_ERR_NOMEM;
         }
         for (uint64_t i = 0; i < nd; i++) {
-            rp->rs.drops[i].pos = get64(b + 48 + i * 16);
-            rp->rs.drops[i].until = (int64_t)get64(b + 56 + i * 16);
+            rs->drops[i].pos = get64(b + 48 + i * 16);
+            rs->drops[i].until = (int64_t)get64(b + 56 + i * 16);
         }
-        rp->rs.ndrops = nd;
+        rs->ndrops = nd;
     }
     free(b);
     return 0;
@@ -878,6 +888,8 @@ static void rs_prune_drops(struct replica *rp)
  * its sources; blocks are never reused). intents_recover ran at the open, so the parts are all or none. */
 static bool rs_committed(eng *db, struct replica *rp)
 {
+    if (eng_test_mutant == MUT_REPLICA_RS_COMMITTED_TRUE || eng_test_mutant == MUT_REPLICA_RS_COMMITTED_FALSE)
+        return eng_test_mutant == MUT_REPLICA_RS_COMMITTED_TRUE; /* planted: the answer without looking */
     bool yes = false;
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < db->nparts && !yes; i++)
@@ -899,7 +911,7 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
     if (rp->rs.doing_pos == last && eng_test_mutant != MUT_REPLICA_NO_DONE_SKIP && rs_committed(db, rp)) {
         rp->rs.done = last;
         rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
-        int rc = rs_save(db, rp);
+        int rc = rs_save(db, &rp->rs);
         if (rc == 0 && ci < rp->ncm)
             cm_remove(db, rp, ci);
         return rc;
@@ -964,7 +976,7 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
         rp->rs.doing_pos = last;
         rp->rs.doing_b0 = atomic_load(&db->next_block);
         rp->rs.doing_n = n;
-        rc = rs_save(db, rp);
+        rc = rs_save(db, &rp->rs);
         if (rc == 0)
             rc = parts_commit(db, ps, n);
         if (rc == 0) {
@@ -988,7 +1000,7 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
     rp->rs.done = last;
     rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
     if (rc == 0)
-        rc = rs_save(db, rp);
+        rc = rs_save(db, &rp->rs);
     if (rc == 0)
         cm_remove(db, rp, ci);
     return rc;
@@ -1028,7 +1040,9 @@ static int apply_drop(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
     rp->rs.drops = d;
     rp->rs.drops[rp->rs.ndrops++] = (struct rdrop){last, ts};
     rs_prune_drops(rp);
-    return rs_save(db, rp);
+    if (eng_test_mutant == MUT_REPLICA_DROP_NO_SAVE)
+        return 0; /* planted: the DROP is carried out but RSTATE does not say so */
+    return rs_save(db, &rp->rs);
 }
 
 /* The open: the staged files that are on disk, the COMMIT markers above RSTATE's `done` (their files must be staged
@@ -2005,6 +2019,10 @@ static int leader_marker_wait(eng *db, uint64_t last, const char *what)
     return rc;
 }
 
+/* The position of the marker this thread's write appended and saw committed (leader_commit, leader_drop), which the
+ * publish that follows on the same thread records in the leader's RSTATE (jr_precommit, jr_commit, leader_rs_drop) */
+static __thread uint64_t lead_pos, lead_drop_pos;
+
 static int leader_commit(eng *db, const struct jr_commit_arg *ja)
 {
     const struct jr_ops *jr = eng_jr(db);
@@ -2054,7 +2072,9 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
     free(files);
     if (rc)
         return rc; /* the marker may be in the log (a failed sync): the engine is failed by the WAL's own rules */
-    return leader_marker_wait(db, fno, "a COMMIT marker was appended but its commit point did not come");
+    rc = leader_marker_wait(db, fno, "a COMMIT marker was appended but its commit point did not come");
+    lead_pos = rc == 0 ? fno : 0;
+    return rc;
 }
 
 static int leader_drop(eng *db, int64_t ts)
@@ -2067,7 +2087,9 @@ static int leader_drop(eng *db, int64_t ts)
         return fno ? rc : leader_unappended(rc); /* no marker in the log: definitely not applied */
     if (fno == 0) /* a backstop: never retire without the marker */
         return TSDB_ERR_IO;
-    return leader_marker_wait(db, fno, "a DROP marker was appended but its commit point did not come");
+    rc = leader_marker_wait(db, fno, "a DROP marker was appended but its commit point did not come");
+    lead_drop_pos = rc == 0 ? fno : 0;
+    return rc;
 }
 
 int jr_intent(eng *db, enum jr_kind kind, const void *arg)
@@ -2082,4 +2104,74 @@ int jr_intent(eng *db, enum jr_kind kind, const void *arg)
     default:
         return 0; /* the dictionary and retention markers are the driver's (it appends them with wal_marker_mk) */
     }
+}
+
+/* ---- the leader's RSTATE (design-cluster.md 6.3: a deposed leader reopened as a replica) ----
+ * A replica records in RSTATE the COMMIT and DROP markers it carried out (apply_commit, apply_drop), so a replay of its
+ * log skips them; a leader publishes its own markers' effects without applying them, and records them the same way:
+ * `doing` (the position and the first block) before parts_commit, `done` after it, a DROP with its `drops` entry after
+ * its retire. Reopened as a replica (eng_open_replica on the same directory), the deposed leader then skips every
+ * marker it published (its parts are listed: there are no staged files to apply them from) and settles one whose
+ * publish a crash interrupted by its first block (rs_committed), as a replica does. All writes under publish_lock. */
+int leader_rs_open(eng *db)
+{
+    struct rstate *rs = calloc(1, sizeof *rs);
+    if (!rs)
+        return TSDB_ERR_NOMEM;
+    int rc = rs_load(db, rs); /* a promoted replica's carries on (replica_promote keeps it) */
+    if (rc) {
+        free(rs->drops);
+        free(rs);
+        return rc;
+    }
+    db->lrs = rs;
+    return 0;
+}
+
+int jr_precommit(eng *db, size_t n)
+{
+    struct rstate *rs = db->lrs;
+    if (!eng_jr(db) || !rs || !lead_pos || eng_test_mutant == MUT_LEADER_NO_RSTATE)
+        return 0;
+    rs->doing_pos = lead_pos;
+    rs->doing_b0 = atomic_load(&db->next_block); /* block numbers are taken under publish_lock: this commit's first */
+    rs->doing_n = n;
+    return rs_save(db, rs);
+}
+
+void jr_commit(eng *db, enum jr_kind kind, const void *arg)
+{
+    (void)arg;
+    struct rstate *rs = db->lrs;
+    if (kind != JR_COMMIT || !eng_jr(db) || !rs || !lead_pos)
+        return;
+    uint64_t pos = lead_pos;
+    lead_pos = 0;
+    if (eng_test_mutant == MUT_LEADER_NO_RSTATE)
+        return;
+    rs->done = MAX(rs->done, pos);
+    rs->doing_pos = rs->doing_b0 = rs->doing_n = 0;
+    rs_save(db, rs); /* fails the engine on error: a replica reopened from here would apply the COMMIT again */
+}
+
+int leader_rs_drop(eng *db, int64_t ts)
+{
+    struct rstate *rs = db->lrs;
+    uint64_t pos = lead_drop_pos;
+    lead_drop_pos = 0;
+    if (!eng_jr(db) || !rs || !pos || eng_test_mutant == MUT_LEADER_NO_RSTATE)
+        return 0;
+    pthread_mutex_lock(&db->publish_lock);
+    struct rdrop *d = realloc(rs->drops, (rs->ndrops + 1) * sizeof *d);
+    int rc = d ? 0 : TSDB_ERR_NOMEM;
+    if (d) {
+        rs->drops = d;
+        rs->drops[rs->ndrops++] = (struct rdrop){pos, ts};
+        rs->done = MAX(rs->done, pos);
+        rc = rs_save(db, rs);
+    } else {
+        eng_fail(db, "recording a DROP in RSTATE", ENOMEM);
+    }
+    pthread_mutex_unlock(&db->publish_lock);
+    return rc;
 }

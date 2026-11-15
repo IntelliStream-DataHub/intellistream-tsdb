@@ -24,8 +24,9 @@
  * (the durable end reports what was not synced), keepcut (a cut leaves the records), nofloor (a segment goes
  * before the floor is saved), walclock (retention reads the replica's own clock), nopos (a replayed RETENTION or CLASS
  * record is appended again), classat (a CLASS record takes the leader's T whatever this replica's parts hold);
- * the leader's: leadervisible, leaderflush, deposefails, admitafter, bytesaftersync, markerrc, gatenohook, nosynced
- * (the Makefile runs every name).
+ * the leader's: leadervisible, leaderflush, deposefails, admitafter, bytesaftersync, markerrc, gatenohook, nosynced;
+ * a deposed leader's: leaderclose (its close flushes and stores its log end), leadernorstate (it keeps no RSTATE),
+ * closewait (a leader's close waits for a commit point that cannot move) (the Makefile runs every name).
  *
  *   ./build/test_replica [scratch dir]
  *   ./build/test_replica --mutant applyall|ackunsynced|keepcut|nofloor|walclock|nopos|classat [scratch dir]    must fail
@@ -3424,6 +3425,128 @@ static void case_leader_guards(void)
            "ends a commit wait\n");
 }
 
+/* ---- a deposed leader (design-cluster.md 6.3, C7): it only cuts a WAL tail ---- */
+
+static void xp_rows_at(xport *x, uint32_t s, int64_t t0, int n, float base)
+{
+    int64_t ts[NT];
+    float v[NT];
+    for (int i = 0; i < n; i++)
+        ts[i] = t0 + 1000LL * i, v[i] = base + (float)i;
+    CHECK_EQ(eng_insert_series(x->ld, TSDB_FLOAT32, s, ts, v, (size_t)n), 0);
+}
+
+static bool same_all(eng *a, eng *b, int64_t hi, const char *what)
+{
+    bool ok = true;
+    for (uint32_t s = 0; s < NS; s++)
+        ok &= eq_range(a, b, s, T0 - 1000, hi, what);
+    return ok;
+}
+
+typedef struct cjob {
+    eng *db;
+    atomic_bool done;
+} cjob;
+
+static void *close_main(void *a)
+{
+    cjob *j = a;
+    eng_close(j->db);
+    atomic_store(&j->done, true);
+    return NULL;
+}
+
+/* A marker above the commit point, durable at the leader and never committed (no writer waits for it) */
+static uint64_t uncommitted_now(xport *x, int64_t now)
+{
+    x->manual = true;
+    mk m = {.type = MK_NOW, .span = 1};
+    m.u.now.now_ms = now;
+    uint64_t pos = 0;
+    CHECK_EQ(wal_marker_mk(x->ld, &m, &pos), 0);
+    return pos;
+}
+
+/* L2: the close of a leader whose commit point can no longer move (the ISR is gone) returns: it deposes the leader and
+ * flushes nothing (mutant closewait: the close waits in its flush for a commit point that never comes, and the
+ * deadline of join_within fails the run) */
+static void case_close_bound(void)
+{
+    xport x;
+    xp_start(&x, "dclose");
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "DC: rows");
+    CHECK(uncommitted_now(&x, T0) > ld_last(&x) - 1);
+    cjob j = {.db = x.ld};
+    pthread_t t;
+    pthread_create(&t, NULL, close_main, &j);
+    join_within(t, &j.done, "DC: the close of a leader whose commit point cannot move returned (mutant closewait)");
+    x.ld = NULL;
+    eng_close(x.rep);
+    free(x.held);
+}
+
+/* A deposed leader holds committed rows, two committed large inserts (COMMIT markers it published itself), a committed
+ * DROP and, above the commit point, rows and a marker. It is closed (no flush: mutant leaderclose flushes and stores its
+ * log end in FNO) and reopened as a replica at the commit floor, then cut at the commit point: the open skips the
+ * COMMITs and the DROP it published (its RSTATE says so; mutant leadernorstate: the open takes its own COMMIT for one
+ * to apply, whose files it never staged, and stops below it), the cut drops what was never committed, a second open accepts the log (FNO not past its end), and it
+ * answers exactly as the replica that never led. */
+static void case_depose(void)
+{
+    xport x;
+    char od[PATH_MAX];
+    xp_start(&x, "dep");
+    snprintf(od, sizeof od, "%s", x.ldir);
+    int64_t far = T0 + 40 * DAY_MS, hi = far + DAY_MS;
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_rows_at(&x, 1, far, 5, 200);
+    xp_step(&x, "D: small rows");
+    xp_rows(&x, 0, 5, 40, 2000); /* a large insert: a COMMIT */
+    xp_step(&x, "D: large insert");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    CHECK_EQ(eng_drop_before(x.ld, T0 + 10 * DAY_MS), 0); /* a DROP */
+    xp_step(&x, "D: drop");
+    xp_rows_at(&x, 0, far, 40, 3000);        /* a large insert after the DROP */
+    xp_rows_at(&x, 1, far + 100000, 3, 400); /* small rows, in the WAL only */
+    xp_step(&x, "D: after the drop");
+    CHECK(same_all(x.ld, x.rep, hi, "D: before the depose"));
+    uint64_t commit = ld_last(&x);
+    /* above the commit point: a marker, and rows whose writer waits (indeterminate once deposed) */
+    CHECK(uncommitted_now(&x, far) > commit);
+    ljob a = {.db = x.ld, .s = 1, .t0 = 40 * 86400 + 200, .n = 4};
+    pthread_t ta;
+    pthread_create(&ta, NULL, ljob_main, &a);
+    for (int i = 0; i < 5000 && eng_wal_durable_fno(x.ld) < commit + 5; i++)
+        usleep(1000);
+    CHECK(eng_wal_durable_fno(x.ld) >= commit + 5); /* the rows are in the leader's log */
+    eng_leader_depose(x.ld);                         /* the driver: another node leads now */
+    pthread_join(ta, NULL);
+    CHECK_EQ(a.rc, TSDB_ERR_INDETERMINATE);
+    eng_close(x.ld);
+    x.ld = NULL;
+    eng *ex = NULL;
+    CHECK_EQ(open_replica(od, commit, &ex), 0);
+    if (!ex) {
+        xp_stop(&x);
+        return;
+    }
+    CHECK_EQ(replica_applied_end(ex), commit); /* mutant leadernorstate: held below its own first COMMIT */
+    CHECK_EQ(replica_cut(ex, commit), 0);
+    CHECK_EQ(replica_log_end(ex), commit);
+    CHECK(same_all(ex, x.rep, hi, "D: the deposed leader as a replica"));
+    eng_close(ex);
+    ex = NULL;
+    CHECK_EQ(open_replica(od, commit, &ex), 0); /* mutant leaderclose: FNO holds the uncut log end, CORRUPT */
+    if (ex) {
+        CHECK_EQ(replica_log_end(ex), commit);
+        CHECK(same_all(ex, x.rep, hi, "D: the deposed leader as a replica, reopened"));
+        eng_close(ex);
+    }
+    xp_stop(&x);
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -3468,7 +3591,13 @@ static int mutant_of(const char *m)
                         : strcmp(m, "bytesaftersync") == 0 ? MUT_LEADER_BYTES_AFTER_SYNC
                         : strcmp(m, "markerrc") == 0 ? MUT_LEADER_MARKER_RC
                         : strcmp(m, "gatenohook") == 0 ? MUT_LEADER_GATE_NOHOOK
-                        : strcmp(m, "nosynced") == 0 ? MUT_LEADER_NO_SYNCED : 0;
+                        : strcmp(m, "nosynced") == 0 ? MUT_LEADER_NO_SYNCED
+                        : strcmp(m, "rscommittedtrue") == 0 ? MUT_REPLICA_RS_COMMITTED_TRUE
+                        : strcmp(m, "rscommittedfalse") == 0 ? MUT_REPLICA_RS_COMMITTED_FALSE
+                        : strcmp(m, "dropnorsave") == 0 ? MUT_REPLICA_DROP_NO_SAVE
+                        : strcmp(m, "leaderclose") == 0 ? MUT_LEADER_CLOSE_FLUSH
+                        : strcmp(m, "leadernorstate") == 0 ? MUT_LEADER_NO_RSTATE
+                        : strcmp(m, "closewait") == 0 ? MUT_LEADER_CLOSE_WAIT : 0;
 }
 
 int main(int argc, char **argv)
@@ -3508,6 +3637,12 @@ int main(int argc, char **argv)
     {
         char *slash = strrchr(SELF, '/');
         snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
+    }
+    if (getenv("TEST_REPLICA_DEPOSE_ONLY")) { /* the quick run of the deposed leader's cases */
+        case_close_bound();
+        case_depose();
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
     }
     if (getenv("TEST_REPLICA_LEADER_ONLY")) { /* the quick run of the leader's cases (L1-L9, the power loss last) */
         case_leader_gate();
@@ -3554,6 +3689,8 @@ int main(int argc, char **argv)
     case_leader_deposed_refusals();
     case_leader_flusher_deposed();
     case_leader_guards();
+    case_close_bound();
+    case_depose();
     case_promote_refused();
     for (int v = 0; v < 3; v++)
         case_promote(v);
