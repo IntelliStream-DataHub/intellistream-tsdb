@@ -32,6 +32,7 @@
 #include "cluster.h"
 #include "harness.h"
 #include "meta.h"
+#include "peerlink.h"
 #include "raft/raft.h"
 #include "raft/raft_log.h"
 #include "tsdb_client.h"
@@ -703,12 +704,12 @@ static int relay(int target, int mode, const struct view *v, uint32_t cid)
     if (cli < 0 || raw_frame(cli, 5000, &f, &fl) != 0 || f[4] != W_HELLO || fl < 80)
         die("relay: no HELLO from the CLI");
     if (mode == RELAY_CLAIM) {
-        /* [len][type][magic 4][ver 1][id 4][uuid 16][ident 16][nonce 32][peer: u16 + bytes] */
+        /* [len][type][magic 4][ver 1][id 4][uuid 16][ident 16][nonce 32][peer: u16 + bytes][kind 1] */
         const struct meta_member *m = meta_member(&v->m, cid);
         if (!m)
             die("relay: no member %" PRIu32, cid);
         size_t pl = strlen(m->peer);
-        g = malloc(80 + pl);
+        g = malloc(81 + pl);
         if (!g)
             die("out of memory");
         memcpy(g, f, 10);
@@ -720,7 +721,8 @@ static int relay(int target, int mode, const struct view *v, uint32_t cid)
         g[78] = (uint8_t)pl;
         g[79] = (uint8_t)(pl >> 8);
         memcpy(g + 80, m->peer, pl);
-        gl = 80 + pl;
+        g[80 + pl] = f[fl - 1]; /* the link kind (HELLO of protocol 4 ends with it) */
+        gl = 81 + pl;
         frame_len(g, gl);
         free(f);
         f = g;
@@ -2605,6 +2607,170 @@ static void scen_volrefuse(void)
     printf("  login on a cluster node uses its own USERS; a volume of 1 replica takes writes\n");
 }
 
+
+/* links: the hand-off of data links in the cluster thread's acceptor (server/cluster.c handshake(), conn_handoff), in
+ * this process (cluster_start here, no tsdbd): a data link's HELLO is refused while no peerlink is set, and for a
+ * server that is no member of the cluster, one with another identity, another or no cluster uuid; a member's is handed
+ * to the peerlink, comes up on both sides and carries a frame; the metadata links go on working beside them. */
+static _Atomic int lk_ups[2], lk_frames[2];
+static void lk_on_link(void *arg, struct plink *l, int up)
+{
+    (void)l;
+    if (up)
+        atomic_fetch_add(&lk_ups[(intptr_t)arg], 1);
+}
+static void lk_on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p, size_t n)
+{
+    (void)l, (void)type, (void)p, (void)n;
+    atomic_fetch_add(&lk_frames[(intptr_t)arg], 1);
+}
+
+static struct peerlink *lk_peerlink(int which, uint32_t id, const uint8_t uuid[16], const uint8_t ident[16])
+{
+    struct pl_cfg c;
+    memset(&c, 0, sizeof c);
+    c.self.id = id;
+    memcpy(c.self.uuid, uuid, 16);
+    memcpy(c.self.ident, ident, 16);
+    c.secret = secret;
+    c.secret_len = secret_len;
+    c.arg = (void *)(intptr_t)which;
+    c.on_link = lk_on_link;
+    c.on_frame = lk_on_frame;
+    c.ping_ms = 100;
+    c.dead_ms = 1000;
+    c.backoff_min_ms = 20;
+    c.backoff_max_ms = 100;
+    struct peerlink *pl = peerlink_new(&c);
+    if (!pl)
+        die("peerlink_new");
+    return pl;
+}
+
+/* a dialer as (id, uuid, ident) to `addr`: does a link of `kind` come up within ms? */
+static int lk_dials(const char *addr, uint32_t id, const uint8_t uuid[16], const uint8_t ident[16], int kind, int ms)
+{
+    struct peerlink *b = lk_peerlink(1, id, uuid, ident);
+    int before = atomic_load(&lk_ups[1]);
+    struct plink *l = peerlink_dial(b, 0, addr, kind);
+    if (!l)
+        die("peerlink_dial");
+    int up = 0;
+    for (int t = 0; t < ms && !up; t += 20) {
+        up = atomic_load(&lk_ups[1]) > before && plink_up(l);
+        if (!up)
+            usleep(20 * 1000);
+    }
+    if (up) { /* a frame from the dialer reaches the server's peerlink */
+        int f0 = atomic_load(&lk_frames[0]);
+        if (plink_send(l, 1, "hello", 5, 1000) != PL_OK)
+            up = 0;
+        for (int t = 0; t < 3000 && atomic_load(&lk_frames[0]) == f0; t += 10)
+            usleep(10 * 1000);
+        if (atomic_load(&lk_frames[0]) == f0)
+            die("links: a frame over the data link did not arrive");
+    }
+    peerlink_free(b);
+    return up;
+}
+
+static void scen_links(void)
+{
+    scenario("links");
+    char sd[PATH_MAX + 128], padv[64], err[1024];
+    snprintf(sd, sizeof sd, "%s/state", base);
+    int pfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    int one = 1;
+    setsockopt(pfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (pfd < 0 || bind(pfd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(pfd, 64) != 0 ||
+        getsockname(pfd, (struct sockaddr *)&sa, &sl) != 0)
+        die("links: listener: %s", strerror(errno));
+    snprintf(padv, sizeof padv, "127.0.0.1:%d", ntohs(sa.sin_port));
+    struct cluster_cfg cc = {.state_dir = sd, .peer_fd = pfd, .advertise = "127.0.0.1:1", .peer_advertise = padv,
+                             .rack = "", .power_feed = "", .bmc = "", .secret = secret, .secret_len = secret_len};
+    if (cluster_start(&cc) != 0)
+        die("links: cluster_start");
+    struct meta_settings s;
+    meta_settings_default(&s);
+    uint8_t req[128], *rep = NULL;
+    size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req), len;
+    int rc;
+    if (cluster_admin(padv, secret, secret_len, CLUSTER_OP_INIT, req, rl, 10000, &rc, &rep, &len, err, sizeof err) != 0 ||
+        rc != 0)
+        die("links: init: %s", err);
+    free(rep);
+    struct cluster_self me;
+    if (cluster_self(&me) != 0 || me.id != 1)
+        die("links: cluster_self after init: have_node %d id %u", me.have_node, (unsigned)me.id);
+    /* a second member: a real tsdbd, added through this node (the leader) */
+    start(1);
+    char np[META_ADDR_MAX];
+    peer_of(1, np, sizeof np);
+    uint8_t areq[META_ADDR_MAX + 2];
+    size_t an = node_add_req(1, areq);
+    if (cluster_admin(padv, secret, secret_len, CLUSTER_OP_NODE_ADD, areq, an, 20000, &rc, &rep, &len, err, sizeof err) != 0 ||
+        rc != 0)
+        die("links: node add: %s", err);
+    free(rep);
+    uint32_t mid = 0;
+    uint8_t mident[16] = {0};
+    for (uint64_t t0 = now_ms(); !mid && now_ms() - t0 < WAIT_MS; usleep(100000)) {
+        struct view v;
+        view(1, &v);
+        const struct meta_member *m = v.st.self ? meta_member(&v.m, v.st.self) : NULL;
+        if (m && m->ident[0]) {
+            mid = m->id;
+            memcpy(mident, m->ident, 16);
+        }
+        view_free(&v);
+    }
+    if (!mid)
+        die("links: the second member did not show up");
+    uint8_t zero[16] = {0}, other[16], bad_ident[16], rnd[16];
+    memcpy(other, me.uuid, 16);
+    other[0] ^= 1;
+    memcpy(bad_ident, mident, 16);
+    bad_ident[3] ^= 1;
+    for (int i = 0; i < 16; i++)
+        rnd[i] = (uint8_t)(0x40 + i);
+
+    /* no peerlink set: refused (every other check passes) */
+    if (lk_dials(padv, mid, me.uuid, mident, PL_KIND_LOG, 1500))
+        die("links: a data link came up while no peerlink was set");
+    struct peerlink *srv = lk_peerlink(0, me.id, me.uuid, me.ident);
+    cluster_set_peerlink(srv);
+    if (lk_dials(padv, mid, me.uuid, bad_ident, PL_KIND_LOG, 1500))
+        die("links: a data link came up for a member's id with another identity");
+    if (lk_dials(padv, me.id, me.uuid, me.ident, PL_KIND_LOG, 1500))
+        die("links: a data link came up from this server's own identity");
+    if (lk_dials(padv, 7, me.uuid, rnd, PL_KIND_LOG, 1500))
+        die("links: a data link came up for an id that is no member");
+    if (lk_dials(padv, 0, me.uuid, rnd, PL_KIND_LOG, 1500))
+        die("links: a data link came up for id 0");
+    if (lk_dials(padv, mid, other, mident, PL_KIND_LOG, 1500))
+        die("links: a data link came up for another cluster's uuid");
+    if (lk_dials(padv, mid, zero, mident, PL_KIND_LOG, 1500))
+        die("links: a data link came up for a zero cluster uuid");
+    /* the member: both kinds come up */
+    if (!lk_dials(padv, mid, me.uuid, mident, PL_KIND_LOG, 10000))
+        die("links: a member's log link did not come up");
+    if (!lk_dials(padv, mid, me.uuid, mident, PL_KIND_BULK, 10000))
+        die("links: a member's bulk link did not come up");
+    /* the metadata port still serves its admin ops */
+    if (cluster_admin(padv, secret, secret_len, CLUSTER_OP_STATUS, NULL, 0, 5000, &rc, &rep, &len, err, sizeof err) != 0 ||
+        rc != 0)
+        die("links: status after the data links: %s", err);
+    free(rep);
+    cluster_set_peerlink(NULL);
+    cluster_stop();
+    peerlink_free(srv);
+    stop_all();
+    printf("  data links: refused without a peerlink, for a non-member, a wrong identity or uuid; a member's come up\n");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -2634,7 +2800,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}};
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
