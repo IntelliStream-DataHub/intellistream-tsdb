@@ -56,6 +56,12 @@
  * The secret is the cluster's (--cluster-secret-file, a file only its owner may read; `tsdb cluster secret` makes
  * one); it is never sent.
  *
+ * Data links (server/peerlink.h, design-cluster.md C25, section 5.1): HELLO ends with a u8 link kind (0 metadata, 1
+ * log, 2 bulk; protocol version 4). A HELLO of kind 1 or 2 gets the same checks (uuid, member id, identity) and is
+ * then handed, socket and HELLO body, to peerlink_adopt: from there a thread of the data link answers the handshake
+ * (under its own labels "tsdb-link-...", so no key is shared with a metadata link) and runs the connection. This
+ * thread never reads or writes a data link after the hand-off.
+ *
  * NODE_ADD (admin_node_add): PROBE to the new server (its identity), MEMBER_ADD committed with the next id and that
  * identity, then JOIN{uuid, id, identity}, on which the new server writes NODE. An id exists in the log before any
  * server holds it, so a leader that fails part way never lets the next one hand the same id to another server.
@@ -64,6 +70,7 @@
 #include "cluster.h"
 
 #include "meta.h"
+#include "peerlink.h"
 #include "raft/raft.h"
 #include "raft/raft_log.h"
 #include "raft/raft_wire.h"
@@ -92,8 +99,9 @@
 
 #define FRAME_MAX (16u << 20)
 #define WB_MAX (64u << 20) /* queued to one peer; beyond it the link is dropped (Raft resends) */
-#define CL_MAGIC 0x43445354u /* "TSDC" */
-#define CL_VERSION 3 /* 2: heartbeat sections, flags in PROBE_REPLY; 3: the R3 settings in INIT, VOLUME_ADD; peers of another
+#define CL_MAGIC PL_CL_MAGIC /* "TSDC" */
+#define CL_VERSION PL_CL_VERSION /* 2: heartbeat sections, flags in PROBE_REPLY; 3: the R3 settings in INIT, VOLUME_ADD; 4: the link
+                      * kind in HELLO (data links, peerlink.h); peers of another
                       * version are refused (no mixed versions) */
 #define RING 4096
 #define SNAP_EVERY 1000
@@ -704,6 +712,7 @@ int cluster_admin(const char *addr, const uint8_t *secret, size_t secret_len, in
     put(&b, zero, 16); /* no identity: not a server */
     put(&b, nc, 32);
     putstr(&b, "");
+    put8(&b, PL_KIND_META);
     frame_end(&b);
     trlen = b.len - 5;
     memcpy(tr, b.p + 5, trlen);
@@ -820,6 +829,7 @@ struct conn {
     uint8_t kin[32], kout[32]; /* the link's keys, from AUTH on */
     uint64_t seq_in, seq_out;
     struct buf rb, wb, q; /* q: frames queued before AUTH (untagged; tagged as they move to wb) */
+    int handoff;          /* a data link's HELLO passed the checks: conn_read hands the socket to peerlink */
     int watch_served;     /* it watches this server */
     int watch_ours;       /* this server's watch stream */
     int join;             /* NODE_ADD: 1 a PROBE sent, 2 a JOIN sent, not yet answered */
@@ -1407,6 +1417,7 @@ static void send_hello(struct conn *c)
     put(&C.fb, C.ident, 16);
     put(&C.fb, c->nc, 32);
     putstr(&C.fb, C.padv);
+    put8(&C.fb, PL_KIND_META);
     frame_end(&C.fb);
     c->trlen = C.fb.len - 5;
     memcpy(c->tr, C.fb.p + 5, c->trlen);
@@ -1478,6 +1489,28 @@ void cluster_set_reporter(cluster_report_fn fn, void *arg)
 
 static cluster_vol_watch_fn g_vwatch;
 static void *g_vwatch_arg;
+static _Atomic(struct peerlink *) g_pl_a; /* where data links go (cluster_set_peerlink) */
+#define g_pl atomic_load(&g_pl_a)
+
+void cluster_set_peerlink(struct peerlink *pl) { atomic_store(&g_pl_a, pl); }
+
+static pthread_mutex_t self_mu = PTHREAD_MUTEX_INITIALIZER; /* C.id, C.uuid, C.have_node for cluster_self */
+
+int cluster_self(struct cluster_self *out)
+{
+    memset(out, 0, sizeof *out);
+    pthread_mutex_lock(&self_mu);
+    out->have_node = C.have_node;
+    out->id = C.have_node ? C.id : 0;
+    memcpy(out->uuid, C.uuid, 16);
+    pthread_mutex_unlock(&self_mu);
+    memcpy(out->ident, C.ident, 16);
+    memcpy(out->secret, C.secret, C.secret_len);
+    out->secret_len = C.secret_len;
+    snprintf(out->advertise, sizeof out->advertise, "%s", C.padv);
+    return out->have_node ? 0 : -1;
+}
+
 static uint64_t g_vwatch_applied = UINT64_MAX; /* the metadata index last pushed (UINT64_MAX: none yet) */
 
 void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg)
@@ -2973,13 +3006,17 @@ static void admin_init(struct conn *c, uint32_t reqid, struct rd *r)
         say("finishing an init that stopped before its first snapshot");
     if (!C.have_node || unfinished) {
         /* the first server: id 1, a configuration of itself, written before the core starts on it */
+        pthread_mutex_lock(&self_mu);
         tsdb_random(C.uuid, sizeof C.uuid);
         C.id = 1;
+        pthread_mutex_unlock(&self_mu);
         C.incarnation = 1;
         snprintf(C.seeds, sizeof C.seeds, "%s", C.padv);
         if (node_save() != 0)
             fail_stop("cannot write %s: %s", C.nodefile, strerror(errno));
+        pthread_mutex_lock(&self_mu);
         C.have_node = 1;
+        pthread_mutex_unlock(&self_mu);
         meta_free(&C.sm);
         meta_init(&C.sm);
         raft_config cfg = {.n = 1, .m = {{.id = 1, .learner = false}}};
@@ -3191,13 +3228,17 @@ static void on_join(struct conn *c, struct rd *r)
     if (memcmp(ident, C.ident, 16) != 0) {
         rc = CLUSTER_ERR_REFUSED; /* the id was committed for another server */
     } else if (!C.have_node) {
+        pthread_mutex_lock(&self_mu);
         memcpy(C.uuid, uuid, 16);
         C.id = id;
+        pthread_mutex_unlock(&self_mu);
         C.incarnation = 1;
         snprintf(C.seeds, sizeof C.seeds, "%s", seeds);
         if (node_save() != 0)
             fail_stop("cannot write %s: %s", C.nodefile, strerror(errno));
+        pthread_mutex_lock(&self_mu);
         C.have_node = 1;
+        pthread_mutex_unlock(&self_mu);
         say("joined the cluster as node %" PRIu32, id);
     } else if (memcmp(uuid, C.uuid, 16) != 0 || id != C.id) {
         rc = CLUSTER_ERR_REFUSED;
@@ -3240,6 +3281,15 @@ static int claim_ok(uint32_t id, const uint8_t ident[16])
     return !m || zero16(m->ident) || !memcmp(m->ident, ident, 16);
 }
 
+/* the metadata (or its watched copy) names `id` as the server with this identity */
+static int member_ident_ok(uint32_t id, const uint8_t ident[16])
+{
+    const struct meta_member *m = meta_member(&C.sm, id);
+    if (!m && C.wsm_on)
+        m = meta_member(&C.wsm, id);
+    return m && !zero16(m->ident) && !memcmp(m->ident, ident, 16);
+}
+
 static void handshake(struct conn *c, uint8_t type, struct rd *r)
 {
     uint8_t uuid[16], ident[16], m[32], want[32], ns[32];
@@ -3253,6 +3303,7 @@ static void handshake(struct conn *c, uint8_t type, struct rd *r)
         getn(r, ident, 16);
         getn(r, c->nc, 32);
         getstr(r, c->peer, sizeof c->peer);
+        uint8_t kind = get8(r);
         if (r->bad || magic != CL_MAGIC || ver != CL_VERSION) {
             c->dead = 1;
             return;
@@ -3266,6 +3317,18 @@ static void handshake(struct conn *c, uint8_t type, struct rd *r)
             say("refused a server at %s that claims node %" PRIu32 " but is not the server that member is", c->peer,
                 id);
             c->dead = 1;
+            return;
+        }
+        if (kind != PL_KIND_META) {
+            /* a data link (peerlink.h): only a member of this cluster, by its id and identity; the handshake goes on
+             * on the link's own thread, and this thread never does data I/O */
+            if (kind > PL_KIND_BULK || !C.have_node || !g_pl || !id || zero16(uuid) || memcmp(uuid, C.uuid, 16) != 0 ||
+                !member_ident_ok(id, ident)) {
+                say("refused a data link from %s (node %" PRIu32 ", kind %u)", c->peer, id, (unsigned)kind);
+                c->dead = 1;
+                return;
+            }
+            c->handoff = 1;
             return;
         }
         c->id = id;
@@ -3370,6 +3433,19 @@ static void on_frame(struct conn *c, uint8_t type, const uint8_t *p, size_t n)
     }
 }
 
+/* the socket of a data link goes to peerlink with the HELLO it sent (c->tr); this connection ends either way */
+static void conn_handoff(struct conn *c)
+{
+    struct pl_self self = {.id = C.id};
+    memcpy(self.uuid, C.uuid, 16);
+    memcpy(self.ident, C.ident, 16);
+    struct peerlink *pl = g_pl;
+    c->handoff = 0;
+    if (pl && peerlink_adopt(pl, c->fd, c->tr, c->trlen, &self) == 0)
+        c->fd = -1; /* the link's thread owns it now */
+    c->dead = 1;
+}
+
 static void conn_read(struct conn *c)
 {
     size_t got_round = 0;
@@ -3417,6 +3493,10 @@ static void conn_read(struct conn *c)
             on_frame(c, f[0], f + 1, n - 1);
         }
         c->rb.off += 4 + (size_t)n;
+        if (c->handoff) {
+            conn_handoff(c);
+            break;
+        }
     }
 }
 
@@ -3441,7 +3521,8 @@ static void conn_free(struct conn *c)
 {
     if (c->serial == C.watch_conn)
         C.watch_conn = 0;
-    close(c->fd);
+    if (c->fd >= 0)
+        close(c->fd);
     buf_free(&c->rb);
     buf_free(&c->wb);
     buf_free(&c->q);

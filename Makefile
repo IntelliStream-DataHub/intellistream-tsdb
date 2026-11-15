@@ -50,10 +50,11 @@ LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl replframe
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
+FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -304,7 +305,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -395,9 +396,11 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
 
-test-meta: $(B)/test_meta $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
+test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	./$(B)/test_meta /tmp --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
+	./$(B)/test_peerlink $(or $(TMPDIR),/tmp)
+	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick; do ! ./$(B)/test_peerlink $(or $(TMPDIR),/tmp) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 
 # the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 17 runs of 2 minutes each under a sanitizer
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
@@ -455,6 +458,7 @@ $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuz
 	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
+$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o server/peerlink.h
 $(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
@@ -471,7 +475,7 @@ $(FUZZ_B)/libtsdb.a: FORCE
 	    rm -f $(FUZZ_B)/*.o $(FUZZ_B)/*.a $(FUZZ_B)/fuzz-*; printf '%s\n' "$(FUZZ_SIG)" >$(FUZZ_B)/.flags; \
 	fi
 	$(MAKE) B=$(FUZZ_B) CC=$(FUZZ_CC) ARCH="$(FUZZ_ARCH)" CFLAGS="$(FUZZ_SAN) $(FUZZ_COV)" $@ \
-	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o $(FUZZ_B)/props.o $(FUZZ_B)/cfg.o
+	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o $(FUZZ_B)/props.o $(FUZZ_B)/cfg.o $(FUZZ_B)/peerlink.o
 
 # the driver is built without coverage: it holds the hook
 $(FUZZ_B)/driver.o: tests/fuzz/driver.c $(FUZZ_B)/libtsdb.a
@@ -755,17 +759,23 @@ $(B)/meta.o: server/meta.c server/meta.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # tsdbd's cluster thread (and the CLI's side of the admin ops); CLUSTER_OBJ goes into tsdbd, every binary that
 # includes tsdbd.c, and the CLI
-$(B)/cluster.o: server/cluster.c server/cluster.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
+$(B)/cluster.o: server/cluster.c server/cluster.h server/peerlink.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
+# the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it
+$(B)/peerlink.o: server/peerlink.c server/peerlink.h client/tsdb_crypto.h src/compat.h | $(B)
+	$(CC) $(CFLAGS) -Iclient -c -o $@ $<
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
 $(B)/repl.o: src/repl.c src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(RAFT_OBJ)
+CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(RAFT_OBJ)
 $(B)/tsdb: $(B)/cluster-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
+# the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
+$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 $(B)/test_meta: tests/test_meta.c server/meta.h $(B)/meta.o $(B)/repl.o $(RAFT_OBJ) $(B)/raft_raft_sim.o
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -o $@ $< $(B)/meta.o $(B)/repl.o $(RAFT_OBJ) $(B)/raft_raft_sim.o -lm
 # test_meta with bugs planted in meta.c (MUT(n), -DMETA_MUTANTS): tests/meta_mutants.sh runs each with --mutant n and
@@ -780,7 +790,7 @@ META_SOAK_SECONDS ?= 30
 META_SOAK_FIRST   ?= 1000
 # tsdbd --cluster end to end: five servers, init, node add, a leader killed and restarted (the cluster thread polls:
 # one run covers both IO backends)
-$(B)/test_cluster: tests/test_cluster.c tests/harness.h server/cluster.h server/meta.h $(CLUSTER_OBJ) $(B)/tsdb_crypto.o \
+$(B)/test_cluster: tests/test_cluster.c tests/harness.h server/cluster.h server/meta.h server/peerlink.h $(CLUSTER_OBJ) $(B)/tsdb_crypto.o \
     $(B)/libtsdbclient.a $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) \
 	    $(ZSTD_LIB) -lpthread -lm

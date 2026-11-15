@@ -98,6 +98,23 @@ void cluster_set_reporter(cluster_report_fn fn, void *arg);
  * the leader lifts a CLAIM_FAILED bar only on the 0 -> 1 change. */
 void cluster_set_claim_ok(int ok);
 
+/* ---- data links (server/peerlink.h): the acceptor hands a data link's socket to this peerlink after the HELLO (a
+ * member of this cluster, by id and identity); NULL (the default) refuses them. Any thread. Shutdown: cluster_set_peerlink(NULL),
+ * then cluster_stop() (no hand-off is under way after it), and only then peerlink_free. */
+struct peerlink;
+void cluster_set_peerlink(struct peerlink *pl);
+/* What a peerlink needs to dial and answer as this server (any thread, after cluster_start). 0, or -1 while this
+ * server is in no cluster yet (id 0). */
+struct cluster_self {
+    int have_node;
+    uint32_t id;
+    uint8_t uuid[16], ident[16];
+    uint8_t secret[CLUSTER_SECRET_MAX];
+    size_t secret_len;
+    char advertise[128]; /* the peer address this server advertises */
+};
+int cluster_self(struct cluster_self *out);
+
 /* ---- this server's replicated volumes as its metadata copy holds them (server/cvol.c) */
 struct cluster_vol_rec {
     uint32_t number;

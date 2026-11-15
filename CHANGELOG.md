@@ -12,6 +12,12 @@ disk format and the wire protocol.
 changes what a node of the 0.10.0 preview accepts, and its metadata snapshot (version 3) and peer protocol (version 3):
 a cluster made with 0.10.0 is initialised again, not upgraded (as for every change of the preview).
 
+- Data links on the peer port (transport only; nothing sends over them yet): the peer protocol is now version 4, whose
+  HELLO ends with a link kind (metadata, log, bulk). Per pair of servers a log link (small frames, zstd-1) and a bulk
+  link (part files in throttled chunks, resumable from the receiver's offset, an xxh64 per file) have sockets of their
+  own, so a large file never delays a small insert; every frame carries a tag under a key of its own link, and a
+  slow peer meets a bounded queue; an accepted connection replaces a live link only after it passed AUTH.
+  `server/peerlink.[ch]`, `docs/design-cluster.md` 5.1.1.
 - `tsdb cluster volume add PEER NAME [--replicas N]`: the group gives the volume the next number, places its copies on
   N members that are up and may hold volumes (one per rack where it can; fewer is refused) and records it. Each of
   those servers makes `<dir>/v<N>` (`META` with `volume=`, `volume_uuid=`, `cluster=` and `requires=cluster,replica`,
