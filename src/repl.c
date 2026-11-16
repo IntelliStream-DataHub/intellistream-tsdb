@@ -37,6 +37,7 @@ struct peer {
     uint64_t acked;     /* written end it last reported */
     uint64_t rid;       /* the instance its ACKs came from; 0: none yet in this epoch */
     uint64_t last_send, last_ack;
+    uint64_t last_heard; /* the tick of its last ACK in this epoch (last_ack also moves when a resend goes back) */
     uint64_t snap_sent; /* when it was last told to install a snapshot (its next position is not retained) */
     uint64_t start;     /* the first position its log holds, from its last ACK in this epoch (heard: one came) */
     int heard;
@@ -594,6 +595,9 @@ static void isr_check(struct repl *r)
         const struct peer *p = &r->peer[i];
         if ((p->rid && p->rid != r->meta.rid[i]) ||
             (lagged && !MUT(29) && (p->rid != r->meta.rid[i] || p->match < old)) ||
+            /* silent for isr_lag (its stream broke, or it stopped): it goes even while nothing is written, so an
+             * idle volume's ISR (and min_isr) says who is there; heartbeats keep a live member heard */
+            (lagged && !MUT(29) && !MUT(40) && r->now - p->last_heard >= r->cfg.isr_lag_ticks) ||
             (grace && (r->unans & (1u << i)) && !p->rid)) {
             isr_request(r, isr & ~(1u << i), -1, 0);
             return;
@@ -635,7 +639,7 @@ static void lead(struct repl *r, const struct repl_vmeta *v)
     r->npend = r->hpend = 0;
     memset(r->peer, 0, sizeof r->peer);
     for (int i = 0; i < r->cfg.nnodes; i++)
-        r->peer[i].last_ack = r->now;
+        r->peer[i].last_ack = r->peer[i].last_heard = r->now;
     r->lead_tick = r->now;
     for (uint32_t i = 0; i < r->nwend; i++)
         r->wend[i] = r->written;
@@ -721,6 +725,7 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
         p->match = m->durable;
     p->acked = m->written;
     p->last_ack = r->now;
+    p->last_heard = r->now;
     p->start = m->start;
     p->heard = 1;
     if (m->resync || !p->next)

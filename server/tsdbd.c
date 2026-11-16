@@ -485,6 +485,9 @@ static void write_on_wait(void *ctx, int delta)
  * frame_put, so every path that answers TSDB_ERR_UNAVAILABLE (the admission, a quiesced volume under an engine
  * call) sends the same body. */
 static __thread uint16_t unav_vol = TSDB_VOL_ANY;
+/* The request in hand writes (auth_ops' R_WRITE): a volume led here with fewer in-sync replicas than its min_isr
+ * refuses it as UNAVAILABLE (UNREACHABLE: its replicas cannot be reached) while its reads are served (D9). */
+static __thread bool unav_write;
 /* A read admitted under the lease (§7.1) checks it again at its first reply frame, which comes after its snapshot: a
  * process paused between admission and snapshot would otherwise answer from a snapshot taken after the lease ended.
  * A lapse in between (cluster_lease_still) on a volume led here drops every frame and handle() answers UNAVAILABLE. */
@@ -599,6 +602,11 @@ static tsdb_unavail unav_entry(uint16_t vol)
         return e;
     }
     vol_health(vol, &health, &reason, &e.since_ms, &e.outage_id, &retry, &dom_idx);
+    if (health == TSDB_HEALTH_AVAILABLE && unav_write && cvol_active() && repld_isr_short(vol)) {
+        e.reason = TSDB_WHY_UNREACHABLE; /* min_isr (REPL_E_ISR): the replicas come back or a shrink is undone */
+        e.retry_after_ms = unav_jitter(1000);
+        return e;
+    }
 found:
     e.reason = health == TSDB_HEALTH_AVAILABLE ? (dom_idx == 0xffff ? TSDB_WHY_NONE : TSDB_WHY_RECOVERING) : reason;
     e.retry_after_ms = unav_jitter(retry);
@@ -2403,9 +2411,13 @@ static void handle_in(req *r)
         return;
     }
     unav_vol = req_volume(r->op, p, len);
-    if (unav_vol != TSDB_VOL_ANY && !(auth_ops[r->op].need & NEED_ANY) && (auth_ops[r->op].need & R_WRITE) &&
-        cvol_active() && cvol_why(unav_vol) >= 0) { /* a write to a cluster volume this server does not lead */
-        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+    unav_write = !(auth_ops[r->op].need & NEED_ANY) && (auth_ops[r->op].need & R_WRITE);
+    if (unav_vol != TSDB_VOL_ANY && unav_write && cvol_active() && cvol_why(unav_vol) >= 0) {
+        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE); /* a write to a cluster volume this server does not lead */
+        return;
+    }
+    if (unav_vol != TSDB_VOL_ANY && unav_write && cvol_active() && repld_isr_short(unav_vol)) {
+        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE); /* min_isr: refused before anything is written (D9) */
         return;
     }
     if (unav_vol != TSDB_VOL_ANY && cvol_active()) {

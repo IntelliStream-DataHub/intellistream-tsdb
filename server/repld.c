@@ -39,7 +39,9 @@
  *
  * Mutants (TSDB_REPLD_MUTANT, tests only; NOTES of r3d-stream says which test catches each): `commitbyleader` commits
  * at the writer's own durable end, `ackbeforesync` has a follower report its written end as durable without a sync,
- * `floornotsaved` skips the REPL file's SAVE. Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
+ * `floornotsaved` skips the REPL file's SAVE (test_cluster replicate, replindet); `commitpastremoved` takes an ISR
+ * request as the record at once, before the metadata group commits it (isr), `nominisr` never checks min_isr (minisr),
+ * `ackbelowminisr` hands the writer a commit point reached after a shrink below min_isr (minisr). Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
  * bulk file this process receives taken as staged but not kept, so its COMMIT marker finds the file missing and
  * FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER (writes then reach
  * the new writer while the driver still promotes: they must be refused for a retry, never depose it).
@@ -130,9 +132,15 @@ struct rvol {
     int isr_want;
     struct repl_vmeta isr_req;
     uint64_t resigned; /* the epoch a RESIGN was said for */
+    /* min_isr after the append: a write admitted while the ISR was large enough, whose commit point is reached only
+     * after a shrink below min_isr, is not acknowledged (the core's REPLY waits the same way, but the writer's waiters
+     * go by APPLY): the commit point is held here and handed to the engine once the ISR is back at min_isr */
+    uint64_t held_commit;
+    int short_said;
 };
 
-enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR };
+enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
+       RM_ACKBELOWMINISR };
 
 static struct {
     pthread_mutex_t mu;
@@ -874,6 +882,8 @@ static void log_start_check(struct rvol *rv)
     }
 }
 
+static int isr_short_locked(const struct rvol *rv);
+
 static void exec(struct rvol *rv, struct repl_action *a)
 {
     struct eng *db = NULL;
@@ -1006,6 +1016,11 @@ static void exec(struct rvol *rv, struct repl_action *a)
         if (!db)
             break;
         if (rv->mode == M_WRITER) {
+            if (isr_short_locked(rv) && G.mutant != RM_ACKBELOWMINISR) {
+                if (a->pos > rv->held_commit)
+                    rv->held_commit = a->pos; /* handed over by isr_meta once the ISR is back at min_isr */
+                break;
+            }
             eng_leader_commit(db, a->pos);
             break;
         }
@@ -1029,6 +1044,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
             }
             rv->mode = M_WRITER;
             rv->synced_rep = a->pos;
+            rv->held_commit = 0;
             say("volume %" PRIu32 ": leads epoch %" PRIu64 " from position %" PRIu64, rv->number, rv->epoch,
                 rv->epoch_pos);
         }
@@ -1059,6 +1075,40 @@ static void drain(struct rvol *rv)
 
 /* ------------------------------------------------------------------ events */
 
+/* The ISR is below min_isr (rv->mu held): the record's view, which the core gets next (META), so a write the core
+ * still admitted under the larger ISR is held, never acknowledged, while the record says too few */
+static int isr_short_locked(const struct rvol *rv)
+{
+    return G.mutant != RM_NOMINISR && rv->rec.min_isr > 1 && rv->rec.nisr < rv->rec.min_isr;
+}
+
+/* After a META on the writer (rv->mu held): says when the ISR fell below min_isr and when it is back, and hands a
+ * held commit point to the engine once it is (every member of the larger ISR has the held positions: the core grows
+ * the ISR only by a member at the commit point). */
+static void isr_meta(struct rvol *rv)
+{
+    if (rv->mode != M_WRITER || rv->failed)
+        return;
+    if (isr_short_locked(rv)) {
+        if (!rv->short_said)
+            say("volume %" PRIu32 ": an ISR of %" PRIu32 " members, below min_isr %" PRIu32
+                ": writes are refused until it grows", rv->number, rv->rec.nisr, rv->rec.min_isr);
+        rv->short_said = 1;
+        return;
+    }
+    if (rv->short_said)
+        say("volume %" PRIu32 ": the ISR is back at %" PRIu32 " members (min_isr %" PRIu32 "): writes are taken",
+            rv->number, rv->rec.nisr, rv->rec.min_isr);
+    rv->short_said = 0;
+    if (rv->held_commit) {
+        struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+        if (db)
+            eng_leader_commit(db, rv->held_commit);
+        tsdb_cvol_unref(&db);
+        rv->held_commit = 0;
+    }
+}
+
 static struct repl_vmeta vmeta_of(const struct rvol *rv)
 {
     struct repl_vmeta m = {.epoch = rv->rec.epoch, .isr_version = rv->rec.isr_version, .leader = -1};
@@ -1081,6 +1131,7 @@ static void handle(struct rvol *rv, struct item *it)
         m.epoch = m.meta.epoch;
         repl_recv(rv->core, &m);
         drain(rv);
+        isr_meta(rv);
         return;
     }
     int from = node_index(rv, it->node);
@@ -1298,6 +1349,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "floornotsaved")  ? RM_FLOORNOTSAVED
                : !strcmp(mu, "commitpastremoved") ? RM_COMMITPASTREMOVED
                : !strcmp(mu, "nominisr")       ? RM_NOMINISR
+               : !strcmp(mu, "ackbelowminisr") ? RM_ACKBELOWMINISR
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1455,7 +1507,7 @@ int repld_isr_short(uint32_t v)
     if (!rv)
         return 0;
     pthread_mutex_lock(&rv->mu);
-    int s = rv->mode == M_WRITER && !rv->failed && rv->rec.min_isr > 1 && rv->rec.nisr < rv->rec.min_isr;
+    int s = rv->mode == M_WRITER && !rv->failed && isr_short_locked(rv);
     pthread_mutex_unlock(&rv->mu);
     return s;
 }

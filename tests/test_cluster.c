@@ -2814,8 +2814,11 @@ static void rep_same(const uint64_t *want, const char *what)
             snprintf(a, sizeof a, "%s/n0/v1/%s", base, files[f]);
             snprintf(b, sizeof b, "%s/n%d/v1/%s", base, i, files[f]);
             snprintf(cmd, sizeof cmd, "cmp -s '%s' '%s'", a, b);
-            if (access(a, F_OK) != 0)
-                die("%s: server 0 has no %s", what, files[f]);
+            if (access(a, F_OK) != 0) { /* CLASSES comes with a series' first class switch */
+                if (f == 0 || access(b, F_OK) == 0)
+                    die("%s: server 0 has no %s%s", what, files[f], f ? " and another server has" : "");
+                continue;
+            }
             if (system(cmd) != 0)
                 die("%s: server %d's %s differs from server 0's", what, i, files[f]);
         }
@@ -3175,14 +3178,20 @@ static void scen_isr(void)
     printf("  a stopped replica leaves the ISR and joins again once it runs; every replica holds the leader's rows\n");
 }
 
-/* minisr: with min_isr 2, a leader whose replicas are both gone refuses a write before anything is written
- * (REPL_E_ISR: UNAVAILABLE), and takes writes again once they are back (mutant nominisr). */
+/* minisr: with min_isr 3, a leader whose ISR shrank to 2 refuses a write before anything is written (REPL_E_ISR:
+ * UNAVAILABLE, WHY UNREACHABLE), serves reads, and takes writes again once the replica is back in the ISR (mutant
+ * nominisr). A write admitted while the ISR was 3 whose commit point comes only after the shrink is not acknowledged
+ * until the ISR is back (mutant ackbelowminisr). The second kill happens while nothing is written: a silent member
+ * goes after isr_lag (repl.c MUT(40)). With three nodes min_isr 3 stands for "two of three replicas down": two down
+ * would take the metadata group's quorum, and with it every ISR change. */
 static void scen_minisr(void)
 {
     scenario("minisr");
-    init_min_isr = 2;
-    for (int i = 0; i < 3; i++)
+    init_min_isr = 3;
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "hold_isr_file=1";
         start(i);
+    }
     init_cluster(0, 600);
     init_min_isr = 0;
     node_add(0, 1);
@@ -3195,9 +3204,9 @@ static void scen_minisr(void)
         die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
     for (int i = 0; i < 3; i++)
         await_open_gen(0, "plant", i, 1, 0);
-    struct meta_volume v;
-    if (!vol_rec(0, "plant", &v) || v.min_isr != 2)
-        die("plant has no record or min_isr %" PRIu32 ", not 2", v.min_isr);
+    struct meta_volume v = {0};
+    if (!vol_rec(0, "plant", &v) || v.min_isr != 3)
+        die("plant has no record or min_isr %" PRIu32 ", not 3", v.min_isr);
     int L = server_of(v.leader);
     tsdbc *c = client(L);
     tsdbc_set_retry(c, 0);
@@ -3206,15 +3215,31 @@ static void scen_minisr(void)
     float val = 1;
     if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
         die("a write with every replica up: %s", ers(rc));
-    int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
-    stop(R1, SIGKILL);
-    /* one replica gone: the ISR shrinks to 2 = min_isr, and writes go on */
     ts = 2000;
     if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
-        die("a write with one of two replicas gone (min_isr 2): %s", ers(rc));
-    await_isr(0, "plant", 2, 10000, "one replica killed");
-    stop(R2, SIGKILL);
-    await_isr(0, "plant", 1, 10000, "both replicas killed");
+        die("a second write with every replica up: %s", ers(rc));
+    await_isr(0, "plant", 3, 5000, "every replica up");
+    int R1 = (L + 1) % 3;
+    /* a write admitted with the ISR at 3, its commit point reached only once the shrink to 2 committed: held */
+    hold_isr(1);
+    stop(R1, SIGKILL);
+    struct rep_writer w = {cports[L], id, 2500, 1, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    struct timespec s2 = {2, 0};
+    nanosleep(&s2, NULL);
+    hold_isr(0);
+    await_isr(0, "plant", 2, 10000, "a replica killed");
+    uint64_t tw = now_ms();
+    while (!log_has(L, "below min_isr 3: writes are refused")) {
+        if (now_ms() - tw > 5000)
+            die("the leader never said that its ISR is below min_isr");
+        nanosleep(&(struct timespec){0, 20000000}, NULL);
+    }
+    nanosleep(&s2, NULL);
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
+        die("a write committed only after the ISR shrank below min_isr was answered (rc %d)", w.rc);
     for (int j = 0; j < 5; j++) {
         uint64_t t0 = now_ms();
         ts = 3000 + 1000LL * j;
@@ -3227,22 +3252,27 @@ static void scen_minisr(void)
         unsigned nu = 0;
         if (tsdbc_unavailable(c, u, 4, &nu) != 0 || nu < 1 || u[0].reason == TSDB_WHY_NONE)
             die("a write below min_isr was refused without a reason (%u entries)", nu);
+        if (u[0].reason != TSDB_WHY_UNREACHABLE)
+            die("a write below min_isr was refused with reason %u, not UNREACHABLE", u[0].reason);
     }
     if (rows_of(c, id) != 2)
         die("the leader reads %d rows after the refused writes, not 2", rows_of(c, id));
     start(R1);
-    start(R2);
-    await_isr(0, "plant", 3, 30000, "both replicas back");
+    await_isr(0, "plant", 3, 30000, "the replica back");
+    await_writer(&w, th, 10000, "the write held below min_isr, once the replica is back");
     ts = 9000;
     if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
         die("a write once the replicas are back: %s", ers(rc));
-    if (rows_of(c, id) != 3)
-        die("the leader reads %d rows, not 3 (a refused write was written)", rows_of(c, id));
+    if (rows_of(c, id) != 4)
+        die("the leader reads %d rows, not 4 (a refused write was written)", rows_of(c, id));
     tsdbc_close(c);
     stop_all();
-    uint64_t wantr[REP_NAMES] = {3, 0, 0, 0};
+    for (int i = 0; i < 3; i++)
+        envs[i] = NULL;
+    uint64_t wantr[REP_NAMES] = {4, 0, 0, 0};
     rep_same(wantr, "after a clean stop");
-    printf("  below min_isr a write is refused at once with a reason and nothing written; above it writes go on\n");
+    printf("  below min_isr a write is refused at once with a reason and nothing written, one committed only after the"
+           " shrink waits for the ISR to grow; above it writes go on\n");
 }
 
 /* replindet (D12): a replicated write whose outcome is unknown (appended on the leader, which then stops, deposing

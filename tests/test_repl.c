@@ -12,6 +12,9 @@
  *               it, and a loss of the promoted member's disk then stranded the volume: sim seed 76).
  *   unanswered  the new leader drops a kept member that does not ACK within unanswered_ticks, long before isr_lag
  *               (MUT(37)); the simulator cannot see this: it costs time, not safety.
+ *   idle_shrink a member that stops acknowledging leaves the ISR after isr_lag although nothing is written (MUT(40):
+ *               only a member behind the log end isr_lag ago went, so an idle volume kept a dead member, and min_isr
+ *               never refused).
  *   round       a cut can fall inside a record: a replica whose last epoch the leader lacks cuts at the end of the
  *               leader's epoch before it, inside an older epoch's record that only the replica has.
  *   replay_floor the leader's replay floor: the lowest log start of itself and every member, unknown until each has
@@ -336,6 +339,47 @@ static void unanswered(void)
     repl_free(r);
 }
 
+static void idle_shrink(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(0, &d);
+    c.isr_lag_ticks = 50;
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 100, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    struct repl_msg m = meta_msg(0, 2, 0, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    /* both members ACK the EPOCH marker (position 101); then node 1 goes silent and nothing more is written */
+    struct repl_msg k1 = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 2, .leader = -1, .durable = 101,
+                          .written = 101, .rid = 22, .resync = 1};
+    struct repl_msg k2 = {.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = 2, .leader = -1, .durable = 101,
+                          .written = 101, .rid = 33, .resync = 1};
+    repl_recv(r, &k1);
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    const struct repl_action *q = NULL;
+    int t;
+    for (t = 1; t <= 3 * (int)c.isr_lag_ticks && !q; t++) {
+        repl_recv(r, &k2); /* node 2 answers every heartbeat */
+        drain(r, &d, NULL);
+        if ((q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ)) != NULL)
+            break;
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    }
+    CHECK(q && q->msg.meta.isr == 0x5, "a silent member of an idle volume stayed in the ISR for %d ticks (isr_lag %u)",
+          t, c.isr_lag_ticks);
+    CHECK(!q || t <= (int)c.isr_lag_ticks + 3, "dropped only after %d ticks (isr_lag %u)", t, c.isr_lag_ticks);
+    repl_free(r);
+}
+
 static void round_cut(void)
 {
     static struct drv d;
@@ -457,6 +501,7 @@ int main(int argc, char **argv)
     sync_cut();
     promote();
     unanswered();
+    idle_shrink();
     round_cut();
     replay_floor();
     if (failures) {
