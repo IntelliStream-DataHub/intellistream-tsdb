@@ -706,8 +706,8 @@ static bool end_planned(pid_t pid, int st)
     if (md || rot)
         return true; /* md_death */
     bool shim_nem = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio");
-    if (WIFSIGNALED(st))
-        return sent_has(pid, WTERMSIG(st));
+    if (WIFSIGNALED(st)) /* a signal we sent, and no core: a SIGKILL cannot dump one, so a core is a crash that the kill met */
+        return sent_has(pid, WTERMSIG(st)) && !WCOREDUMP(st);
     int c = WEXITSTATUS(st);
     if (c == 0 && sent_has(pid, SIGTERM))
         return true;
@@ -1044,12 +1044,106 @@ static void start_server_run(bool faulty)
 
 static void start_server(bool faulty) { start_server_run(faulty); }
 
+/* A server that is crashing when the harness kills it (round 12; VERIFY11 (A), the blocker). A process that dies of SIGABRT or
+ * SIGSEGV is not a zombie while the kernel writes its core (systemd-coredump takes 0.1 to several seconds, longer under load; a
+ * core file limit of 0 does not stop a pipe handler) or while it tears its address space down: waitpid finds nothing, the nemesis'
+ * SIGKILL goes in, and the end becomes "killed by SIGKILL", which the harness sent: a crash hidden as the harness' own kill, passed
+ * VALID. So before every SIGKILL of a process of the harness its /proc state is read: CoreDumping: 1, or a pending fatal signal
+ * (SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGXCPU, SIGXFSZ, SIGSYS) that the harness did not send, in any
+ * thread or the process, is a crash: a violation at once, naming the signal when the end is still visible (a dump is given up to
+ * CRASH_DUMP_WAIT_S to finish, which shows the signal in the wait status; the kill follows either way). What remains is the window
+ * of microseconds between the kernel taking the fatal signal off the queue and setting CoreDumping: a crash in that window, at the
+ * very moment of a kill, is not seen. */
+#define CRASH_DUMP_WAIT_S 10
+static bool fatal_pending_unsent(pid_t pid, int *sigp)
+{
+    const unsigned long long fatal = (1ULL << (SIGQUIT - 1)) | (1ULL << (SIGILL - 1)) | (1ULL << (SIGTRAP - 1)) |
+                                     (1ULL << (SIGABRT - 1)) | (1ULL << (SIGBUS - 1)) | (1ULL << (SIGFPE - 1)) |
+                                     (1ULL << (SIGSEGV - 1)) | (1ULL << (SIGXCPU - 1)) | (1ULL << (SIGXFSZ - 1)) |
+                                     (1ULL << (SIGSYS - 1));
+    char path[320], line[256];
+    unsigned long long pend = 0;
+    bool dumping = false;
+    snprintf(path, sizeof path, "/proc/%d/status", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long v;
+        if (!strncmp(line, "CoreDumping:", 12) && atoi(line + 12) == 1)
+            dumping = true;
+        else if ((!strncmp(line, "ShdPnd:", 7) || !strncmp(line, "SigPnd:", 7)) && sscanf(line + 7, "%llx", &v) == 1)
+            pend |= v;
+    }
+    fclose(f);
+    snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+    DIR *d = opendir(path);
+    struct dirent *e;
+    while (d && (e = readdir(d))) { /* SigPnd of the other threads: the signal of abort() is queued to the thread that raised it */
+        if (e->d_name[0] < '0' || e->d_name[0] > '9')
+            continue;
+        snprintf(path, sizeof path, "/proc/%d/task/%s/status", (int)pid, e->d_name);
+        if (!(f = fopen(path, "r")))
+            continue;
+        while (fgets(line, sizeof line, f)) {
+            unsigned long long v;
+            if (!strncmp(line, "CoreDumping:", 12) && atoi(line + 12) == 1)
+                dumping = true;
+            else if (!strncmp(line, "SigPnd:", 7) && sscanf(line + 7, "%llx", &v) == 1)
+                pend |= v;
+        }
+        fclose(f);
+    }
+    if (d)
+        closedir(d);
+    int s = 0;
+    for (int n = 1; n < 64; n++)
+        if (((pend & fatal) >> (n - 1) & 1) && !sent_has(pid, n)) {
+            s = n;
+            break;
+        }
+    *sigp = s;
+    return dumping || s;
+}
+
+static void crash_check(pid_t pid, int sig)
+{
+    int s = 0;
+    if (sig != SIGKILL || pid <= 0 || !fatal_pending_unsent(pid, &s))
+        return;
+    pthread_mutex_lock(&end_mu);
+    for (int i = 0; i < reported_n && i < END_TAB; i++)
+        if (reported[i] == pid) {
+            pthread_mutex_unlock(&end_mu);
+            return;
+        }
+    reported[reported_n++ % END_TAB] = pid;
+    pthread_mutex_unlock(&end_mu);
+    int st = 0;
+    bool seen = false;
+    for (int64_t until = now_ns() + (int64_t)CRASH_DUMP_WAIT_S * 1000000000LL; now_ns() < until && !(seen = end_status(pid, &st));)
+        usleep(5000); /* the dump finishing shows the signal the server died of */
+    death_problems++;
+    char t[96];
+    if (seen && WIFSIGNALED(st))
+        end_text(st, t, sizeof t);
+    else if (s)
+        snprintf(t, sizeof t, "signal %d (%s) on its way", s, strsignal(s));
+    else
+        snprintf(t, sizeof t, "writing a core dump; the signal is not visible any more");
+    fprintf(stderr, "  the %s server (pid %d) was crashing when the harness killed it: it ended with %s (%s) by itself: not a "
+            "power loss (exit 99), not a signal or a stop of the harness, under the %s nemesis\n",
+            server_faulty ? "faulty" : "clean", (int)pid, seen ? "a status of its own" : "a core dump in progress", t, nemesis);
+    print_tail(slogpath);
+}
+
 /* kill() with pid 0 or -1 signals the process group, or every process of the
  * user: with no server running, a nemesis must do nothing. */
 static int signal_pid(pid_t pid, int sig)
 {
     if (pid <= 0)
         return -1;
+    crash_check(pid, sig); /* before note_sent: a crash is not ended by a kill that hides it */
     note_sent(pid, sig); /* before the signal: an end that the watcher sees first is already ours */
     return kill(pid, sig);
 }

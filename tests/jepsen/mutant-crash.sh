@@ -4,7 +4,11 @@
 # and under none (the user's scope of 2026-11-14: a server that hangs or dies other than by the planned kill or power loss is found
 # and reported, never hidden behind INCONCLUSIVE, a rerun or a pass; round 11). Builds, from a copy of the tree (git archive of HEAD,
 # under $TMPDIR or /var/tmp; the working tree and the shipped tsdbd are never touched), a tsdbd with two test-only mutants:
-#   JV_CRASH=N   abort() on every Nth insert request (a crash of its own: SIGABRT)
+#   JV_CRASH=N   abort() on every Nth insert request (a crash of its own: SIGABRT), with the core dump the machine takes (RLIMIT_CORE is
+#                left alone: a core handler that is a pipe, systemd-coredump here, dumps whatever the limit says, and the dump keeps the
+#                process alive, not yet a zombie, for 0.1 s to seconds: the window in which a nemesis' SIGKILL used to hide the crash)
+#   JV_CRASHONCE=N  the same, once per gate (JV_ONCEFILE names the file whose creation says it happened)
+#   JV_CRASH_MB=M   before the abort, touch M MB: a dump that takes long on every core handler, so the nemesis' kill is certain to land in it
 #   JV_HANG=N    a worker pause()s for ever on every Nth insert request (the server is up and stops answering)
 # and runs them through tests/jepsen/rerun.sh:
 #   crash under kill, pause, none, eio and power: exit 1 at the FIRST attempt (no "jepsen-rerun: attempt" line, never 0 or 3), naming the
@@ -25,20 +29,39 @@ tmp=$(mktemp -d "${TMPDIR:-/var/tmp}/mutant-crash.XXXXXX") || exit 2
 git -C "$root" archive HEAD | tar -x -C "$tmp" || exit 2
 f=$tmp/server/tsdbd.c
 sed -i '0,/^#include <fcntl.h>$/s//#include <fcntl.h>\
-#include <sys\/resource.h>\
 static _Atomic unsigned jv_cnt; \/* test-only mutants of tests\/jepsen\/mutant-crash.sh *\/\
 static int jv_every(const char *k)\
 {\
     const char *e = getenv(k);\
     int n = e ? atoi(e) : 0;\
     return n > 0 \&\& atomic_fetch_add(\&jv_cnt, 1) % (unsigned)n == (unsigned)n - 1;\
+}\
+static void jv_crash(void)\
+{\
+    const char *m = getenv("JV_CRASH_MB");\
+    size_t mb = m ? (size_t)atol(m) : 0;\
+    if (mb) {\
+        volatile char *p = malloc(mb << 20);\
+        for (size_t i = 0; p \&\& i < (mb << 20); i += 4096)\
+            p[i] = 1;\
+    }\
+    abort();\
+}\
+static void jv_once(void)\
+{\
+    const char *f = getenv("JV_ONCEFILE");\
+    int fd = f ? open(f, O_WRONLY | O_CREAT | O_EXCL, 0644) : -1;\
+    if (fd >= 0)\
+        jv_crash();\
 }/' "$f"
 sed -i 's/^    case TSDB_OP_INSERT: {$/&\
-        if (jv_every("JV_CRASH")) { struct rlimit z = {0, 0}; setrlimit(RLIMIT_CORE, \&z); abort(); }\
+        if (jv_every("JV_CRASH")) jv_crash();\
+        if (jv_every("JV_CRASHONCE")) jv_once();\
         if (jv_every("JV_HANG")) for (;;) pause();/; s/^    case TSDB_OP_INSERT_VALUES: {$/&\
-        if (jv_every("JV_CRASH")) { struct rlimit z = {0, 0}; setrlimit(RLIMIT_CORE, \&z); abort(); }\
+        if (jv_every("JV_CRASH")) jv_crash();\
+        if (jv_every("JV_CRASHONCE")) jv_once();\
         if (jv_every("JV_HANG")) for (;;) pause();/' "$f"
-if [ "$(grep -c 'jv_every(' "$f")" -ne 5 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
+if [ "$(grep -c 'jv_every(' "$f")" -ne 7 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
 (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-crash: build failed"; tail -5 "$tmp/build.log"; rm -rf "$tmp"; exit 1; }
 mut=$tmp/build/tsdbd
 crashfs=$root/build/libcrashfs.so
@@ -82,6 +105,17 @@ done
 for nem in eio power; do
     run_case "crash-$nem" "$CR" "a server that aborts on every 40th insert, $nem nemesis" JV_CRASH=40 -- --nemesis "$nem" --seconds 12 \
         --crashfs "$crashfs"
+done
+# one abort per gate, with a dump that takes long (CRASH_MB, 512 by default; the machine's core handler, whatever it is): the kill
+# nemesis' SIGKILL meets a server that is not a zombie yet. Under kv and under classes, the kill and the clkill nemeses never hid it
+# before round 12 (7 of 10 kv kill gates passed VALID at load 125, 3 of 6 quiet; VERIFY11 (A)).
+for wl in kv classes; do
+    for i in 1 2 3; do
+        rm -f "$tmp/once-$wl-$i"
+        run_case "crashonce-$wl-kill-$i" "$CR\|was crashing when the harness killed it" \
+            "one abort per gate with a core dump of ${CRASH_MB:-512} MB, kill nemesis, $wl workload" JV_CRASHONCE=${CRASH_ONCE_N:-20} \
+            JV_CRASH_MB=${CRASH_MB:-512} JV_ONCEFILE="$tmp/once-$wl-$i" -- --nemesis kill --workload $wl --seconds 12
+    done
 done
 HP='server stopped answering'
 for nem in kill pause none; do
