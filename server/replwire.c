@@ -209,7 +209,7 @@ static int name_ok(const char *s, size_t len)
     return !(len <= 2 && s[0] == '.' && (len == 1 || s[1] == '.'));
 }
 
-size_t rw_encode_fetch(uint8_t *out, size_t cap, uint32_t volume, const char *name)
+size_t rw_encode_fetch(uint8_t *out, size_t cap, uint32_t volume, uint64_t pos, const char *name)
 {
     size_t len = strlen(name);
     if (!name_ok(name, len))
@@ -217,6 +217,7 @@ size_t rw_encode_fetch(uint8_t *out, size_t cap, uint32_t volume, const char *na
     struct wr w = {.p = out, .cap = cap};
     w8(&w, RW_VERSION);
     w32(&w, volume);
+    w64(&w, pos);
     w16(&w, (uint16_t)len);
     wbytes(&w, name, len);
     return w.n <= cap ? w.n : 0;
@@ -233,12 +234,13 @@ static int rname(struct rd *r, char *name, size_t cap)
     return 0;
 }
 
-int rw_decode_fetch(const uint8_t *p, size_t n, uint32_t *volume, char *name, size_t cap)
+int rw_decode_fetch(const uint8_t *p, size_t n, uint32_t *volume, uint64_t *pos, char *name, size_t cap)
 {
     struct rd r = {.p = p, .n = n};
     if (r8(&r) != RW_VERSION)
         return -1;
     *volume = r32(&r);
+    *pos = r64(&r);
     if (rname(&r, name, cap) != 0 || r.bad || r.at != n)
         return -1;
     return 0;

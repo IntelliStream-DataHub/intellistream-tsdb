@@ -39,7 +39,8 @@
  *
  * Mutants (TSDB_REPLD_MUTANT, tests only; NOTES of r3d-stream says which test catches each): `commitbyleader` commits
  * at the writer's own durable end, `ackbeforesync` has a follower report its written end as durable without a sync,
- * `floornotsaved` skips the REPL file's SAVE.
+ * `floornotsaved` skips the REPL file's SAVE. A fault for tests: TSDB_REPLD_TEST=dropbulk has the first bulk file this
+ * process receives taken as staged but not kept, so its COMMIT marker finds the file missing and FETCHes it.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -140,6 +141,7 @@ static struct {
     uint32_t nvols;
     uint64_t fileno;
     int mutant; /* RM_*: tests only */
+    int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -688,6 +690,13 @@ static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, con
     struct rvol *rv = vol_find(r->volume);
     if (!rv)
         return -1;
+    pthread_mutex_lock(&G.mu);
+    int drop = G.drop_bulk > 0 ? G.drop_bulk-- : 0;
+    pthread_mutex_unlock(&G.mu);
+    if (drop) {
+        say("TEST: volume %" PRIu32 ": %s received and not staged (dropbulk)", r->volume, r->name);
+        return 0;
+    }
     struct eng *db = tsdb_cvol_ref(G.t, r->volume);
     int rc = db ? replica_stage(db, r->name, r->buf, r->total) : TSDB_ERR_UNAVAILABLE;
     tsdb_cvol_unref(&db);
@@ -1014,10 +1023,11 @@ static void handle(struct rvol *rv, struct item *it)
     if (it->kind == IN_FETCH) {
         char name[RW_NAME_MAX + 1];
         uint32_t vol;
-        if (rw_decode_fetch(it->data, it->n, &vol, name, sizeof name) != 0 || rv->mode != M_WRITER)
+        uint64_t mpos;
+        if (rw_decode_fetch(it->data, it->n, &vol, &mpos, name, sizeof name) != 0 || rv->mode != M_WRITER)
             return;
         struct eng *db = tsdb_cvol_ref(G.t, rv->number);
-        int fd = db ? eng_leader_file_open(db, name) : TSDB_ERR_UNAVAILABLE;
+        int fd = db ? eng_leader_file_open(db, mpos, name) : TSDB_ERR_UNAVAILABLE;
         tsdb_cvol_unref(&db);
         struct stat sb;
         struct shipwait *w = fd >= 0 && fstat(fd, &sb) == 0 ? ship_new(fd) : NULL;
@@ -1027,8 +1037,8 @@ static void handle(struct rvol *rv, struct item *it)
         } else if (fd >= 0) {
             close(fd);
         } else if (fd == TSDB_ERR_NOTFOUND) {
-            say("volume %" PRIu32 ": node %" PRIu32 " asks for %s, whose segment went: it needs a snapshot",
-                rv->number, it->node, name);
+            say("volume %" PRIu32 ": node %" PRIu32 " asks for %s of the marker at %" PRIu64
+                ", which no kept segment names: it needs a snapshot", rv->number, it->node, name, mpos);
         }
         return;
     }
@@ -1083,8 +1093,8 @@ static void do_sync(struct rvol *rv)
     int rc = ab ? 0 : replica_sync(db);
     uint64_t d = replica_durable_end(db), w = replica_log_end(db);
     char name[RW_NAME_MAX + 1] = "";
-    uint64_t size = 0;
-    int missing = d < w && replica_missing(db, name, sizeof name, &size) == 1;
+    uint64_t size = 0, mpos = 0;
+    int missing = d < w && replica_missing(db, &mpos, name, sizeof name, &size) == 1;
     if (ab && !missing)
         d = w; /* written, never synced, reported durable */
     tsdb_cvol_unref(&db);
@@ -1097,8 +1107,11 @@ static void do_sync(struct rvol *rv)
     if (missing && (strcmp(name, rv->fetch_name) || now_ms() - rv->fetch_ms >= 1000)) {
         int ld = node_index(rv, rv->rec.leader);
         struct plink *l = ld >= 0 ? link_of(rv->rec.rep[ld].node, 0) : NULL;
-        uint8_t b[RW_NAME_MAX + 16];
-        size_t n = rw_encode_fetch(b, sizeof b, rv->number, name);
+        uint8_t b[RW_NAME_MAX + 24];
+        size_t n = rw_encode_fetch(b, sizeof b, rv->number, mpos, name);
+        if (l && n && strcmp(name, rv->fetch_name) != 0)
+            say("volume %" PRIu32 ": fetches %s (the marker at %" PRIu64 ") from node %" PRIu32, rv->number, name, mpos,
+                rv->rec.leader);
         if (l && n)
             plink_send(l, RW_T_FETCH, b, n, 0);
         snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
@@ -1219,6 +1232,8 @@ void repld_init(tsdb *t, const char *dir)
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
+    const char *te = getenv("TSDB_REPLD_TEST");
+    G.drop_bulk = te && !strcmp(te, "dropbulk");
     G.t = t;
     snprintf(G.dir, sizeof G.dir, "%s", dir);
 }

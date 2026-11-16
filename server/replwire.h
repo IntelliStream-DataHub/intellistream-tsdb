@@ -14,8 +14,9 @@
  * prev_pos + 1, every n and len at least 1, positions below 2^62, and the lengths must add up to the bytes exactly.
  * Any other type has nrec 0 and nothing after it.
  *
- * Log link, frame type RW_T_FETCH (replica -> leader): u8 version, u32 volume, u16 len, the name a COMMIT marker gives
- * a file the replica could not stage (replica_missing); the leader sends it over the bulk link (eng_leader_file_open)
+ * Log link, frame type RW_T_FETCH (replica -> leader): u8 version, u32 volume, u64 pos (the position of the COMMIT
+ * marker), u16 len, the name that marker gives a file the replica could not stage (replica_missing); the leader sends
+ * it over the bulk link (eng_leader_file_open serves a name only for the marker that named it)
  * or, when its segment went, a REPL_M_SNAPSHOT.
  *
  * Bulk link, the opaque meta of a file (pl_job.meta): u8 version, u32 volume, u64 size, u16 len, the marker's name.
@@ -60,9 +61,9 @@ size_t rw_encode_msg(uint8_t *out, size_t cap, uint32_t volume, const struct rep
  * bytes are not a well formed message. Pointers in *out point into p. */
 int rw_decode_msg(const uint8_t *p, size_t n, struct rw_msg *out, struct repl_rec *recs, uint32_t *lens, uint32_t cap);
 
-size_t rw_encode_fetch(uint8_t *out, size_t cap, uint32_t volume, const char *name);
+size_t rw_encode_fetch(uint8_t *out, size_t cap, uint32_t volume, uint64_t pos, const char *name);
 /* name gets a NUL-terminated copy (cap >= RW_NAME_MAX + 1). 0 or -1. */
-int rw_decode_fetch(const uint8_t *p, size_t n, uint32_t *volume, char *name, size_t cap);
+int rw_decode_fetch(const uint8_t *p, size_t n, uint32_t *volume, uint64_t *pos, char *name, size_t cap);
 
 size_t rw_encode_bulk_meta(uint8_t *out, size_t cap, uint32_t volume, uint64_t size, const char *name);
 int rw_decode_bulk_meta(const uint8_t *p, size_t n, uint32_t *volume, uint64_t *size, char *name, size_t cap);

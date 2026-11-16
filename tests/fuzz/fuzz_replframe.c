@@ -148,8 +148,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         uint64_t size;
         char name[RW_NAME_MAX + 1];
         uint8_t back[RW_NAME_MAX + 32];
-        if (rw_decode_fetch(p, n, &vol, name, sizeof name) == 0) {
-            size_t bl = rw_encode_fetch(back, sizeof back, vol, name);
+        uint64_t fpos;
+        if (rw_decode_fetch(p, n, &vol, &fpos, name, sizeof name) == 0) {
+            size_t bl = rw_encode_fetch(back, sizeof back, vol, fpos, name);
             if (bl != n || memcmp(back, p, n) != 0)
                 abort();
         }
@@ -247,7 +248,7 @@ void fuzz_seeds(const char *dir)
     put_frame(dir, "seed-rw-append", 5, 0, mb, ml);
     put_frame(dir, "seed-rw-append-cap1", 7, 1, mb, ml);
     uint8_t fb[64];
-    size_t fl2 = rw_encode_fetch(fb, sizeof fb, 4, "p19000_1_2_0.part");
+    size_t fl2 = rw_encode_fetch(fb, sizeof fb, 4, 4242, "p19000_1_2_0.part");
     if (!fl2)
         abort();
     put_frame(dir, "seed-rw-fetch", 6, 0, fb, fl2);
