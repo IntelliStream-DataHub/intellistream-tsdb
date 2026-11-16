@@ -457,6 +457,10 @@ static bool proc_stopped(pid_t pid)
 static int failstops, eio_problems;
 static int lives_faulty, lives_clean, lives_died_starting; /* servers started under the nemesis, by kind */
 static atomic_bool hung_flag;    /* a request got no answer within the deadline (req_done): the run is ending */
+/* A server that has been forked and has not yet listened (start_server_run): if it ends, that function judges the end (a crash, damage,
+ * or the environment: io_uring without memory, no port file in time), never the watcher, which would count a server that never came up
+ * as a death and turn the harness error that follows (exit 2) into a verdict (exit 1; round 12, VERIFY11 (B)). */
+static _Atomic bool server_starting;
 static int death_problems;       /* power: a server that ended any way but a power loss (exit 99) or our kill */
 static bool server_faulty;       /* the current server runs under the shim (set under server_lock or at start) */
 static int fport;                   /* the follower, where tsdbd put it; 0 = none */
@@ -964,6 +968,7 @@ static void start_server_run(bool faulty)
             execv(tsdbd_path(), (char **)av);
             _exit(127);
         }
+        atomic_store(&server_starting, true); /* before the pid: the watcher leaves the end of a server that is not up to this function */
         atomic_store(&server_pid, pid);
         server_faulty = attempt == 0 && faulty && crashfs;
         if (faulty && crashfs && !server_faulty)
@@ -972,6 +977,7 @@ static void start_server_run(bool faulty)
             fprintf(stderr, "jepsen: started %d (%s)\n", (int)pid, attempt == 0 && faulty ? "faulty" : "clean");
         int p = th_await(pf, pid, 30000);
         unlink(pf);
+        atomic_store(&server_starting, false);
         if (p > 0) {
             atomic_store(&port, p);
             if (server_faulty)
@@ -2014,7 +2020,7 @@ static void *watcher(void *arg)
                  * seconds, or be none at all); an end the nemesis reaps first is judged by its reap_server */
                 int est;
                 pid_t wp = atomic_load(&server_pid);
-                if (end_status(wp, &est))
+                if (!atomic_load(&server_starting) && end_status(wp, &est))
                     end_report(wp, est);
             } else if (running && dead) {
                 dead = false;
