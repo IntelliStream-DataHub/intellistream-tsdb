@@ -3041,6 +3041,16 @@ static void scen_replindet(void)
 static void scen_replfail(void)
 {
     scenario("replfail");
+    /* the ASan runtime must come first in the library list: with crashfs preloaded the server refuses to start */
+#if defined(__SANITIZE_ADDRESS__)
+    printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
+    return;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
+    return;
+#endif
+#endif
     const char *so = getenv("CRASHFS_SO") ? getenv("CRASHFS_SO") : "./build/libcrashfs.so";
     static char pe[3][PATH_MAX * 3 + 256];
     char mark[3][PATH_MAX + 80];

@@ -1297,6 +1297,8 @@ int repld_open(const struct cluster_vol_rec *r)
         goto fail;
     }
     rv->epoch = repl_epoch(rv->core);
+    /* what the line below logs, read before the thread starts: from then on rv->st and log_start are its (under mu) */
+    uint64_t said_start = rv->log_start, said_floor = rv->st.floor, said_fence = rv->st.fence;
     pthread_mutex_lock(&G.mu);
     int room = G.nvols < CLUSTER_REPORT_VOLS;
     if (room)
@@ -1309,7 +1311,7 @@ int repld_open(const struct cluster_vol_rec *r)
     rv->started = 1;
     post(rv, IN_META, 0, NULL, 0);
     say("volume %" PRIu32 ": replica %d of %d, log %" PRIu64 "..%" PRIu64 ", floor %" PRIu64 ", fence %" PRIu64,
-        r->number, rv->self, rv->nnodes, rv->log_start, log_end, rv->st.floor, rv->st.fence);
+        r->number, rv->self, rv->nnodes, said_start, log_end, said_floor, said_fence);
     return 0;
 fail:
     if (rv->rf)
