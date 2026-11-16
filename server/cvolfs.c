@@ -65,7 +65,10 @@ static int sync_dir(const char *d)
 static int write_new(const char *dir, const char *name, const char *txt)
 {
     char p[4300];
-    snprintf(p, sizeof p, "%s/%s", dir, name);
+    if ((size_t)snprintf(p, sizeof p, "%s/%s", dir, name) >= sizeof p) {
+        errno = ENAMETOOLONG; /* never a cut name: that would be another file */
+        return -1;
+    }
     /* always a new inode: a file a failed write or sync left may have had its pages dropped */
     if (unlink(p) != 0 && errno != ENOENT)
         return -1;
@@ -83,7 +86,8 @@ static int write_new(const char *dir, const char *name, const char *txt)
 static int root_format(const char *root, char *out, size_t cap)
 {
     char p[4200], buf[4096];
-    snprintf(p, sizeof p, "%s/META", root);
+    if ((size_t)snprintf(p, sizeof p, "%s/META", root) >= sizeof p)
+        return -1;
     int fd = open(p, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return -1;
@@ -190,7 +194,10 @@ static int make_dir(const char *root, const struct cvolfs_rec *r, const char *vd
 int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_open *out)
 {
     char vdir[4200];
-    snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, r->number);
+    if ((size_t)snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, r->number) >= sizeof vdir) {
+        say("volume %" PRIu32 ": the path of %s is too long", r->number, root);
+        return -1;
+    }
     struct stat sb;
     if (stat(vdir, &sb) != 0) {
         if (errno != ENOENT) {
