@@ -4630,6 +4630,126 @@ static uint64_t uncommitted_now(xport *x, int64_t now)
     return pos;
 }
 
+/* r3b M4 (two of its tests): a leader is deposed with a CLASS marker above its commit point (a switch whose writer
+ * waits for the commit point) and rows above it; the member that never received that tail is promoted, and its EPOCH
+ * marker, a class switch to another class and rows at the same timestamps with other values take the same positions.
+ * The deposed leader's switch is indeterminate and never reaches its CLASSES (the record goes to the file only once
+ * the commit point passed the marker); reopened as a replica it cuts at the commit point and applies the new leader's
+ * records: it then answers, and holds CLASSES, exactly as the new leader, also after a reopen. */
+typedef struct swjob {
+    eng *db;
+    int rc;
+    atomic_bool done;
+} swjob;
+
+static void *swjob_main(void *a)
+{
+    swjob *j = a;
+    j->rc = eng_class_switch(j->db, 0, 2, NULL);
+    atomic_store(&j->done, true);
+    return NULL;
+}
+
+static void case_depose_rejoin(void)
+{
+    xport x;
+    char od[PATH_MAX], rd[PATH_MAX];
+    xp_start(&x, "drj");
+    snprintf(od, sizeof od, "%s", x.ldir);
+    rdir(rd, sizeof rd, &x);
+    int64_t far = T0 + 40 * DAY_MS, hi = far + DAY_MS;
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_rows_at(&x, 1, far, 5, 200);
+    xp_step(&x, "DR: rows");
+    xp_rows(&x, 0, 5, 40, 2000); /* a COMMIT */
+    xp_step(&x, "DR: large insert");
+    uint64_t commit = ld_last(&x), cls_before = x.ld->cls_off;
+    x.manual = true; /* the commit point stays at `commit` */
+    x.noship = true; /* and the member never receives what lies above it */
+    eng_leader_replay_floor(x.ld, x.ld->fno_next);
+    swjob sw = {.db = x.ld};
+    pthread_t tsw;
+    pthread_create(&tsw, NULL, swjob_main, &sw);
+    for (int i = 0; i < 5000 && eng_wal_durable_fno(x.ld) < commit + 1; i++)
+        usleep(1000);
+    CHECK(eng_wal_durable_fno(x.ld) >= commit + 1); /* the CLASS marker is in the leader's log, not committed */
+    CHECK(!atomic_load(&sw.done));
+    eng_leader_depose(x.ld);
+    pthread_join(tsw, NULL);
+    CHECK_EQ(sw.rc, TSDB_ERR_INDETERMINATE);
+    CHECK_EQ(x.ld->cls_off, cls_before); /* the record never went to CLASSES */
+    ljob a = {.db = x.ld, .s = 1, .t0 = 40 * 86400 + 200, .n = 4};
+    pthread_t ta;
+    pthread_create(&ta, NULL, ljob_main, &a);
+    pthread_join(ta, NULL);
+    CHECK(a.rc != 0); /* deposed: refused or indeterminate, never acknowledged */
+    eng_close(x.ld);
+    x.ld = NULL;
+    /* the member, which has the log to `commit`, is promoted: its EPOCH marker takes the CLASS marker's position */
+    CHECK_EQ(replica_log_end(x.rep), commit);
+    eng *ex = NULL;
+    CHECK_EQ(open_replica(od, commit, &ex), 0);
+    if (!ex) {
+        xp_stop(&x);
+        return;
+    }
+    CHECK_EQ(ex->cls_off, cls_before);
+    CHECK_EQ(replica_cut(ex, commit), 0);
+    CHECK_EQ(replica_log_end(ex), commit);
+    uint64_t pos = 0;
+    CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-b", &pos), 0);
+    CHECK_EQ(pos, commit + 1);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(ship_from(x.rep, ex), 0);
+    CHECK_EQ(replica_log_end(ex), pos);
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    CHECK_EQ(replica_apply(ex, pos), 0);
+    uint64_t old[256];
+    size_t nold = wal_seqs(rd, old, 256);
+    CHECK(nold >= 1 && nold < 256);
+    eng *n = NULL;
+    CHECK_EQ(replica_promote(&x.rep, pos, &n), 0);
+    if (!n)
+        exit(2);
+    x.ld = n;
+    snprintf(x.ldir, sizeof x.ldir, "%s", rd);
+    x.rep = ex;
+    {
+        struct stat st;
+        char p[PATH_MAX + 64], nm[64];
+        wal_name(nm, sizeof nm, old[nold - 1]);
+        snprintf(p, sizeof p, "%s/%s", rd, nm);
+        CHECK_EQ(stat(p, &st), 0);
+        x.cseq = old[nold - 1];
+        x.coff = (uint64_t)st.st_size;
+    }
+    x.noship = x.manual = false;
+    n->opt.wal_max_batch_rows = 16;
+    CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
+    eng_leader_replay_floor(n, n->fno_next);
+    CHECK_EQ(eng_class_switch(n, 0, 1, NULL), 0); /* another class than the deposed leader's switch */
+    xp_rows_at(&x, 1, T0 + 1000LL * (40 * 86400 + 200), 4, 7000); /* the timestamps of the indeterminate rows */
+    xp_rows(&x, 0, 60, 3, 50);
+    xp_step(&x, "DR: the new leader's records");
+    CHECK(same_all(n, ex, hi, "DR: the deposed leader as a replica of the new one"));
+    CHECK_EQ(ex->cls_off, n->cls_off);
+    CHECK(ex->cls_off > cls_before);
+    uint64_t fl = replica_applied_end(ex);
+    CHECK_EQ(mt_flush(ex), 0);
+    CHECK_EQ(replica_floor_saved(ex, fl), 0);
+    xp_reopen(&x, od, fl); /* the open checks every part against CLASSES */
+    if (x.rep) {
+        CHECK_EQ(eng_check(x.rep), 0);
+        CHECK_EQ(replica_applied_end(x.rep), fl);
+        CHECK_EQ(x.rep->cls_off, n->cls_off);
+        CHECK(same_all(n, x.rep, hi, "DR: reopened"));
+        xp_rows(&x, 0, 70, 2, 60);
+        xp_step(&x, "DR: after the reopen");
+    }
+    xp_stop(&x);
+    printf("  a leader deposed with a CLASS marker above its commit point rejoins as a replica of the new leader\n");
+}
+
 /* L2: the close of a leader whose commit point can no longer move (the ISR is gone) returns: it deposes the leader and
  * flushes nothing (mutant closewait: the close waits in its flush for a commit point that never comes, and the
  * deadline of join_within fails the run) */
@@ -5256,9 +5376,19 @@ int main(int argc, char **argv)
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
     }
+    if (getenv("TEST_REPLICA_POWER_ONLY")) { /* the power losses alone (they need libcrashfs.so beside the binary) */
+        case_power();
+        case_power_commit();
+        case_rstate_crash();
+        case_promote_crash();
+        case_leader_power();
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
+    }
     if (getenv("TEST_REPLICA_DEPOSE_ONLY")) { /* the quick run of the deposed leader's cases */
         case_close_bound();
         case_depose();
+        case_depose_rejoin();
         case_leader_keep();
         case_hardlink();
         case_link_pos();
@@ -5347,6 +5477,7 @@ int main(int argc, char **argv)
     case_leader_abandon();
     case_close_bound();
     case_depose();
+    case_depose_rejoin();
     case_leader_keep();
     case_hardlink();
     case_link_pos();
