@@ -1564,7 +1564,11 @@ static void *dial_main(void *arg)
     uint64_t gap = lo;
     while (!atomic_load(&pl->closing)) {
         uint64_t hs = (uint64_t)(pl->cfg.hs_ms ? pl->cfg.hs_ms : 5000) * MS;
-        int fd = dial_fd(pl, l->addr, now_ns() + hs);
+        char addr[sizeof l->addr];
+        pthread_mutex_lock(&pl->mu); /* plink_set_addr may change it */
+        memcpy(addr, l->addr, sizeof addr);
+        pthread_mutex_unlock(&pl->mu);
+        int fd = dial_fd(pl, addr, now_ns() + hs);
         struct keys k;
         if (fd >= 0 && hs_dial(l, fd, &k) == 0) {
             gap = lo;
@@ -1748,6 +1752,17 @@ struct plink *peerlink_dial(struct peerlink *pl, uint32_t want_id, const char *a
     pl->links = l;
     pthread_mutex_unlock(&pl->mu);
     return l;
+}
+
+int plink_set_addr(struct plink *l, const char *addr)
+{
+    struct peerlink *pl = l->pl;
+    if (!l->dialed || strlen(addr) >= sizeof l->addr)
+        return -1;
+    pthread_mutex_lock(&pl->mu);
+    snprintf(l->addr, sizeof l->addr, "%s", addr);
+    pthread_mutex_unlock(&pl->mu);
+    return 0;
 }
 
 /* ---- the standalone listener */

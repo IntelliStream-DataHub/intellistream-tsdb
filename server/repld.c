@@ -1175,8 +1175,18 @@ static int links_up(const struct cluster_vol_rec *r)
         uint32_t i = 0;
         while (i < G.nn && G.nodes[i].node != r->rep[k].node)
             i++;
-        if (i < G.nn || G.nn == MAX_NODES)
-            continue; /* dialed already (a changed address: TODO, a node keeps its peer address) */
+        if (i < G.nn) { /* dialed already: a node that came back on another peer port is dialed there */
+            if (strcmp(G.nodes[i].addr, r->rep[k].peer) != 0) {
+                snprintf(G.nodes[i].addr, sizeof G.nodes[i].addr, "%s", r->rep[k].peer);
+                if (G.nodes[i].log)
+                    plink_set_addr(G.nodes[i].log, r->rep[k].peer);
+                if (G.nodes[i].bulk)
+                    plink_set_addr(G.nodes[i].bulk, r->rep[k].peer);
+            }
+            continue;
+        }
+        if (G.nn == MAX_NODES)
+            continue;
         G.nodes[i].node = r->rep[k].node;
         snprintf(G.nodes[i].addr, sizeof G.nodes[i].addr, "%s", r->rep[k].peer);
         G.nodes[i].log = peerlink_dial(G.pl, r->rep[k].node, r->rep[k].peer, PL_KIND_LOG);

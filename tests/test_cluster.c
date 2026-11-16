@@ -44,6 +44,7 @@
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -2773,8 +2774,8 @@ static void scen_links(void)
 
 /* replicate: a volume of 3 replicas with the replication driver (server/repld.c; no TSDB_CLUSTER_WRITES): the leader
  * promotes itself once its EPOCH marker is committed, takes writes, and every replica holds the same rows. */
-static const char *const rep_names[] = {"pump1.flow", "pump2.flow", "pump3.big"};
-#define REP_NAMES 3
+static const char *const rep_names[] = {"pump1.flow", "pump2.flow", "pump3.big", "pump4.slow"};
+#define REP_NAMES 4
 
 /* waits until the leader takes a series creation in vol (it is still promoting: UNAVAILABLE) */
 static tsdb_sid rep_series(tsdbc *c, const char *name, const char *vol, int ms)
@@ -2803,6 +2804,17 @@ static void rep_same(const uint64_t *want, const char *what)
         int rc = cvol_digest(v, rep_names, REP_NAMES, rows[i], h[i]);
         if (rc != 0)
             die("%s: open %s read-only: %s", what, v, ers(rc));
+        static const char *const files[] = {"SERIES", "CLASSES", "RETENTION"};
+        for (int f = 0; i && f < 3; f++) {
+            char a[PATH_MAX + 160], b[PATH_MAX + 160], cmd[2 * PATH_MAX + 400];
+            snprintf(a, sizeof a, "%s/n0/v1/%s", base, files[f]);
+            snprintf(b, sizeof b, "%s/n%d/v1/%s", base, i, files[f]);
+            snprintf(cmd, sizeof cmd, "cmp -s '%s' '%s'", a, b);
+            if (access(a, F_OK) != 0)
+                die("%s: server 0 has no %s", what, files[f]);
+            if (system(cmd) != 0)
+                die("%s: server %d's %s differs from server 0's", what, i, files[f]);
+        }
         for (int k = 0; k < REP_NAMES; k++) {
             if (rows[i][k] != want[k])
                 die("%s: server %d holds %" PRIu64 " rows of %s, not %" PRIu64, what, i, rows[i][k], rep_names[k],
@@ -2811,6 +2823,32 @@ static void rep_same(const uint64_t *want, const char *what)
                 die("%s: server %d's rows of %s differ from server 0's", what, i, rep_names[k]);
         }
     }
+}
+
+struct rep_writer {
+    int port;
+    tsdb_sid id;
+    int64_t t0;
+    int count, done, rc;
+};
+
+/* small writes of one row each from another connection, while the main thread kills and restarts a replica */
+static void *rep_write_thread(void *a)
+{
+    struct rep_writer *w = a;
+    tsdbc *c;
+    w->rc = tsdbc_connect("127.0.0.1", w->port, &c);
+    if (w->rc == 0) {
+        tsdbc_set_retry(c, 0);
+        for (int j = 0; j < w->count && w->rc == 0; j++) {
+            int64_t ts = w->t0 + 1000LL * j;
+            float val = (float)j;
+            w->rc = tsdbc_insert_series(c, w->id, &ts, &val, 1);
+        }
+        tsdbc_close(c);
+    }
+    __atomic_store_n(&w->done, 1, __ATOMIC_RELEASE);
+    return NULL;
 }
 
 static void scen_replicate(void)
@@ -2839,7 +2877,7 @@ static void scen_replicate(void)
     tsdb_sid id[REP_NAMES];
     for (int k = 0; k < REP_NAMES; k++)
         id[k] = rep_series(c, rep_names[k], "plant", 30000);
-    uint64_t n[REP_NAMES] = {0, 0, 0};
+    uint64_t n[REP_NAMES] = {0};
     /* small writes, one row each: the log stream and the commit point */
     for (int j = 0; j < 200; j++) {
         int64_t ts = 1000 + 1000LL * j;
@@ -2881,14 +2919,67 @@ static void scen_replicate(void)
         free(ts);
         free(val);
     }
+    /* a slow fresh series: its first flush (flush_interval_ms 5 s) gives it a class of its own (a CLASS marker) */
+    {
+        int64_t ts[200];
+        float val[200];
+        for (int j = 0; j < 200; j++)
+            ts[j] = 3600000LL * j, val[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c, id[3], ts, val, 200)) != 0)
+            die("insert of the slow series: %s", ers(rc));
+        n[3] = 200;
+        /* RETENTION: a limit that keeps every row (the rows are from 1970) */
+        if ((rc = tsdbc_set_retention(c, id[0], 100LL * 366 * 86400000)) != 0)
+            die("retention: %s", ers(rc));
+        char cls[PATH_MAX + 120];
+        snprintf(cls, sizeof cls, "%s/n%d/v1/CLASSES", base, L);
+        uint64_t t0 = now_ms();
+        while (access(cls, F_OK) != 0) {
+            if (now_ms() - t0 > 30000)
+                die("the slow series got no class of its own (no %s)", cls);
+            struct timespec w = {0, 100000000};
+            nanosleep(&w, NULL);
+        }
+        int64_t t1 = 3600000LL * 200;
+        float v1 = 7;
+        if ((rc = tsdbc_insert_series(c, id[3], &t1, &v1, 1)) != 0) /* after the switch */
+            die("insert after the class switch: %s", ers(rc));
+        n[3]++;
+    }
     for (int k = 0; k < REP_NAMES; k++)
         if ((uint64_t)rows_of(c, id[k]) != n[k])
             die("the leader reads %d rows of %s, not %" PRIu64, rows_of(c, id[k]), rep_names[k], n[k]);
+    printf("  the leader promoted itself and took small and large writes, a delete, a replace, a retention limit and a class switch\n");
+
+    /* a replica killed while the leader takes writes: restarted, it catches up from the leader's log (a restart of
+     * every server would come back on new peer ports, which the metadata group does not know) */
+    int R = (L + 1) % 3;
+    stop(R, SIGKILL);
+    struct rep_writer w = {cports[L], id[0], 10000000, 300, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    struct timespec pause = {1, 500000000};
+    nanosleep(&pause, NULL);
+    start(R);
+    uint64_t t0 = now_ms();
+    while (!__atomic_load_n(&w.done, __ATOMIC_ACQUIRE)) {
+        if (now_ms() - t0 > 60000)
+            die("300 small writes with a replica down and back did not finish in 60 s");
+        struct timespec ms = {0, 10000000};
+        nanosleep(&ms, NULL);
+    }
+    pthread_join(th, NULL);
+    if (w.rc != 0)
+        die("a small write with a replica down: %s", ers(w.rc));
+    n[0] += 300;
+    await_open_gen(L, "plant", R, 2, 0);
+    if ((uint64_t)rows_of(c, id[0]) != n[0])
+        die("the leader reads %d rows of %s, not %" PRIu64, rows_of(c, id[0]), rep_names[0], n[0]);
     tsdbc_close(c);
-    printf("  the leader promoted itself and took small and large writes, a delete and a replace\n");
     stop_all();
-    rep_same(n, "small writes");
-    printf("  every replica holds the leader's rows after a clean stop\n");
+    rep_same(n, "after a clean stop");
+    printf("  a replica killed under writes and restarted catches up; every replica holds the leader's rows\n");
 }
 
 int main(int argc, char **argv)
