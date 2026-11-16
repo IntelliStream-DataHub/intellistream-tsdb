@@ -278,8 +278,13 @@ The core (intellistream-objects `src/raft`, read at c9c938e9) is a fit:
 - **What it offers that we use**: pre-vote and check-quorum (a flapping server does not depose the leader), learners
   (voter replacement), leader transfer (draining a voter), `raft_read_index` (a Raft-leader read confirmed by a
   quorum, used for the rare decisions that must see the latest state), snapshots (`raft_compact`, RESTORE).
-- **What we do not use**: lease reads of the core (`lease_reads` off): metadata reads are served from the applied copy
-  and fenced by epochs instead.
+- **The core's leader lease** (`lease_reads` on, `max_clock_drift_ppm` = the cluster's `drift_ppm`): metadata reads
+  still come from the applied copy and are fenced by epochs, but `raft_read_lease` tells the Raft leader that no other
+  Raft leader can exist yet, and it grants the volume leaders' leases (§7.1) only while that holds, asked on the clock
+  read as the heartbeat is handled (the core answers against the last time it was given, from before any stall of the
+  cluster thread). A node that joins boots its core before INIT's settings are applied, with 500 ppm; its lease is
+  shortened to the cluster's `drift_ppm` when it grants (`core_lease_until`). The clock is `CLOCK_BOOTTIME` (a suspend
+  counts). The core then keeps a restarted voter quiet (no votes) for one election timeout.
 - **The simulator** (`raft_sim.c`) runs the real core against a fake disk, clock and network. tsdb's metadata state
   machine is plugged into it (§13.1).
 - **Limits**: `RAFT_MEMBERS_MAX` is 16, which is why non-voters follow a watch stream rather than join as learners.
@@ -704,10 +709,16 @@ at once; the Raft leader sees the volume reported failed in the next heartbeat a
   open it **resigns** (`RESIGN(v, e)` to the metadata group) and follows; the metadata group promotes as for a dead
   leader (§6.2), at e+1, and the restarted server may be chosen again under the new epoch. It happens before the
   node timeout would, so a quick restart costs one promotion, not 3 s.
-- **Known gap until step 4.** In step 1 heartbeats come from the cluster thread (`server/cluster.c`, its own poll
-  loop beside the request loop), so a tsdbd whose request loop or engine hangs keeps heartbeating and is not marked
-  down. Step 4 moves the heartbeat onto the loop that serves the volumes, which closes it; until then nothing fails
-  over on a heartbeat anyway (no volume is replicated before step 4).
+- **The serving loop's stamp** (closed the known gap of step 1, 2026-11-16). Heartbeats are still sent by the
+  cluster thread (`server/cluster.c`, its own poll loop), but the loop that serves the volumes stores a monotonic
+  stamp every round and every tick (`cluster_loop_stamp`, at least once a second), and the cluster thread sends no
+  heartbeat while the stamp is older than 2.5 s (`CLUSTER_LOOP_STALE_MS`). A tsdbd whose I/O loop (io_uring or epoll)
+  hangs therefore goes down after `node_timeout` although its cluster thread still answers (`test_cluster hungloop`;
+  mutant `stampignored`). The stamp covers that loop only: request workers that all hang inside requests (a stuck
+  NFS call, an engine lock) while the loop runs keep the member up, and its lease too; that needs a stamp from the
+  workers (open). A heartbeat also carries the volumes the server cannot fail over by itself: led volumes with their
+  epochs, failed volumes (a volume r3d's fail-stop stopped is reported as LOCAL_FAULT in the next beat), and the
+  peers it shares a volume with but has not heard on a data link for a second (`HBS_UNREACH`).
 
 ### 6.2 Promotion
 
@@ -850,8 +861,20 @@ A leader serves reads while it holds a **lease**: each heartbeat answer from the
 does not promote another leader for the volume before `lease_ms × (1 + drift)` after the last answer it gave, and
 `node_timeout` (3 s) is longer than the lease anyway. A leader whose lease ran out answers reads with UNAVAILABLE and
 retry, and the client refreshes TOPOLOGY. So while the Raft majority is lost, no leader reads are served after
-`lease_ms`, though writes go on (§6.7); clients that accept it read with `REPLICA_OK` (§7.2). A read lease granted by
+`lease_ms`; clients that accept it read with `REPLICA_OK` (§7.2). A read lease granted by
 the ISR instead, which would keep leader reads going, is under "Later".
+
+As built (r3e, 2026-11-16): the Raft leader grants only while its core's own check-quorum lease holds
+(`raft_read_lease`), so no grant is given after another Raft leader could have been elected; the send time travels in
+the heartbeat (`HBS_LEASE`) and comes back in HB_ACK, and only an ack whose sender is the Raft leader it names
+extends the lease (mutant `leaseanyvoter`); the drift margin is taken both ways (mutant `nodrift`). An expired lease
+refuses **writes too** on the volumes the server leads (UNAVAILABLE, WHY `UNREACHABLE`, retry after 200 ms; the
+writer's admit path in `server/repld.c` as well): a leader that lost the Raft leader cannot know it is still the
+leader, and C13 keeps writes safe either way, but a refused write is simpler for clients than one that a fenced
+replica later refuses. So "writes go on while ISRs answer" of §6.7 holds only with the ISR lease of "Later".
+`test_cluster lease` pauses the Raft leader and checks with timestamped reads that the volume leader answers nothing
+from `lease_ms × (1 − drift)` after it, and that a paused volume leader answers nothing once it comes back while no
+one renews its lease.
 
 Leader reads see every acknowledged write (C7): read-your-writes, and monotonic reads within a session as long as
 the leader does not change. After a failover the new leader has every acknowledged write, so it stays so.

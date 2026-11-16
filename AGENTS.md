@@ -178,7 +178,8 @@ cgroup, so `nice` does not keep your work out of its way.
   (`make repld-mutants`); `test_cluster replicate|replindet|replfail` its end-to-end tests. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
-  disk, power loss under crashfs). The metadata state (NODE, IDENT, `raft/`, snapshot, `copy`, `retired`) lives in
+  disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants
+  `make lease-mutants` plants). The metadata state (NODE, IDENT, `raft/`, snapshot, `copy`, `retired`) lives in
   `--state-dir` on a local file system; log syncs and snapshot writes run on a disk worker thread (`dw_*`), never on
   the cluster thread; the hard-state save stays on the cluster thread (its slot sequence is shared with the durable
   floor, which the copied log does not lock). `tests/jepsen/crashfs.c` follows dup'ed descriptors (the Raft log syncs
