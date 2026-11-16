@@ -1864,6 +1864,7 @@ typedef struct xport {
     size_t nbytes, bytes_bad, bytes_late; /* bytes callbacks; ones unlike the segment; syncs without fresh bytes */
     uint64_t bytes_last;   /* the last position handed over */
     bool bytes_fresh;      /* bytes came since the last sync */
+    uint32_t max_span;     /* the most rows in one record handed over (jr_rec_max_rows) */
     uint64_t synced_last;  /* the last position jr_ops.synced reported */
     size_t synced_bad;     /* reports that went back, or that were not the durable end at the time */
 } xport;
@@ -1976,6 +1977,15 @@ static void xp_bytes(void *ctx, eng *db, uint64_t seq, uint64_t off, const void 
                      uint64_t last)
 {
     xport *x = ctx;
+    for (size_t o = 0; o < len;) {
+        wal_rec wr;
+        size_t sz = wal_record((const uint8_t *)buf + o, len - o, seq, off + o, &wr);
+        if (!sz)
+            break;
+        if (wr.span > x->max_span)
+            x->max_span = (uint32_t)wr.span;
+        o += sz;
+    }
     if (x->rec) {
         /* the bytes are the segment's at that place: what a replica appends is what the leader's file holds */
         char nm[64];
@@ -5154,6 +5164,63 @@ static void case_leader_keep(void)
     xp_stop(&x);
     printf("  a leader keeps its flushed segments until the driver's bound passes their end, FNO first\n");
 }
+struct rcap_arg {
+    eng *db;
+    uint32_t s;
+    int64_t t0;
+    atomic_int bad;
+};
+
+static void *rcap_thread(void *a)
+{
+    struct rcap_arg *r = a;
+    int64_t ts[40];
+    float v[40];
+    for (int k = 0; k < 30; k++) {
+        for (int i = 0; i < 40; i++) {
+            ts[i] = r->t0 + 1000LL * (k * 40 + i);
+            v[i] = (float)(k + i);
+        }
+        if (eng_insert_series(r->db, TSDB_FLOAT32, r->s, ts, v, 40) != 0)
+            atomic_fetch_add(&r->bad, 1);
+    }
+    return NULL;
+}
+
+/* A replicated leader's rows record fits one peer frame: tsdbd's driver sends whole records in one frame and refused a
+ * larger one for ever (the commit point never passed it and every write of the volume waited). Batches buffered
+ * while the writer syncs stop joining below jr_rec_max_rows, and a batch of as many rows goes to parts. */
+static void case_leader_rec_cap(void)
+{
+    xport x;
+    xp_start(&x, "reccap");
+    x.ld->opt.wal_max_batch_rows = 1 << 22; /* the cap alone decides what goes through the WAL */
+    atomic_store(&jr_rec_max_rows, 64);
+    struct rcap_arg ra[4];
+    pthread_t th[4];
+    for (int i = 0; i < 4; i++) {
+        ra[i] = (struct rcap_arg){.db = x.ld, .s = (uint32_t)(i % 2), .t0 = T0 + 10 * DAY_MS + i * 2000000LL};
+        atomic_init(&ra[i].bad, 0);
+        CHECK_EQ(pthread_create(&th[i], NULL, rcap_thread, &ra[i]), 0);
+    }
+    for (int i = 0; i < 4; i++) {
+        pthread_join(th[i], NULL);
+        CHECK_EQ(atomic_load(&ra[i].bad), 0);
+    }
+    CHECK(x.max_span > 0 && x.max_span < 64); /* without the cap, batches buffered during a sync join past it */
+    int64_t ts[100];
+    float v[100];
+    for (int i = 0; i < 100; i++)
+        ts[i] = T0 + 20 * DAY_MS + 1000LL * i, v[i] = (float)i;
+    CHECK_EQ(eng_insert_series(x.ld, TSDB_FLOAT32, 0, ts, v, 100), 0);
+    CHECK(x.max_span < 64); /* a batch of the cap or more is a large write: parts, not one oversized record */
+    atomic_store(&jr_rec_max_rows, 1u << 18);
+    x.ld->opt.wal_max_batch_rows = 16;
+    xp_step(&x, "RC: rows");
+    xp_stop(&x);
+    printf("  a replicated leader's rows records stay below jr_rec_max_rows (one peer frame)\n");
+}
+
 static bool leader_file_is(eng *db, uint64_t pos, const char *name, const uint8_t *b, size_t len)
 {
     int fd = eng_leader_file_open(db, pos, name);
@@ -5868,6 +5935,7 @@ int main(int argc, char **argv)
         case_depose();
         case_depose_rejoin();
         case_leader_keep();
+        case_leader_rec_cap();
         case_hardlink();
         case_link_pos();
         case_leader_prune();
@@ -5964,6 +6032,7 @@ int main(int argc, char **argv)
     case_depose();
     case_depose_rejoin();
     case_leader_keep();
+    case_leader_rec_cap();
     case_hardlink();
     case_link_pos();
     case_leader_prune();

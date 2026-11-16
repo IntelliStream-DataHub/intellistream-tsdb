@@ -1409,7 +1409,7 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
     int rc = eng_check(db);
     if (rc || n == 0)
         return rc;
-    if (n < db->opt.wal_max_batch_rows) {
+    if (n < db->opt.wal_max_batch_rows && (!eng_jr(db) || n < atomic_load(&jr_rec_max_rows))) {
         /* a small batch: one pass that vectorizes costs nothing beside its WAL record (large ones check it in
            the passes the sort makes anyway, insert.c) */
         bool unreachable = false;

@@ -956,6 +956,10 @@ extern void (*_Atomic index_reload_hook)(const part *p, uint32_t i, int at);
 #endif
 #define HOUR_CUT_MS 3600000
 extern atomic_uint wal_rec_max_rows; /* 2^28; tests lower it to make a rows record split */
+/* A replicated leader's rows record stays below this many rows (2^18: 5 MiB at 20 bytes a row), and a batch of as
+ * many rows goes straight to parts: the driver sends whole records in one peer frame (PL_FRAME_MAX, 8 MiB), and a
+ * record larger than that would never reach a replica, so the commit point would never pass it. Tests lower it. */
+extern atomic_uint jr_rec_max_rows;
 extern atomic_uint hour_cut_min; /* HOUR_CUT_MIN; tests set 0 to compare against the layout without hour cuts */
 typedef struct part_writer {
     struct eng *db;

@@ -669,6 +669,7 @@ void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot)
  * is a cache line far from the tail the appenders write, and it would travel between cores with every call). Called
  * with buf_lock held at every place that hands wal_buf on or appends something that is not a row of this record. */
 atomic_uint wal_rec_max_rows = 1u << 28; /* a record's row count has 28 bits; tests lower it to split records */
+atomic_uint jr_rec_max_rows = 1u << 18; /* internal.h: a leader's record fits one peer frame */
 
 static void wal_rec_close(eng *db)
 {
@@ -701,8 +702,10 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
         eng_fail(db, "WAL numbers", EOVERFLOW);
         return TSDB_ERR_IO;
     }
-    bool extend = db->wal_rec_open &&
-                  (uint64_t)db->wal_rec_rows + n < atomic_load_explicit(&wal_rec_max_rows, memory_order_relaxed);
+    uint32_t rmax = atomic_load_explicit(&wal_rec_max_rows, memory_order_relaxed);
+    if (eng_jr(db))
+        rmax = MIN(rmax, atomic_load_explicit(&jr_rec_max_rows, memory_order_relaxed));
+    bool extend = db->wal_rec_open && (uint64_t)db->wal_rec_rows + n < rmax;
     size_t need = db->wal_len + (extend ? 0 : WAL_HDR) + n * WAL_ROW;
     if (need > db->wal_cap) {
         size_t cap = MAX(need, db->wal_cap * 2);
