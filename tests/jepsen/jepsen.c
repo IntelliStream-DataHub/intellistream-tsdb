@@ -1329,12 +1329,44 @@ static int req_deadline_s = REQ_DEADLINE_DEFAULT_S;
 static _Atomic int64_t req_worst_ns;  /* the slowest request that was answered (or failed) in this run */
 static int stall_problems;            /* reported (once per run) */
 
+/* A deadline miss while the kernel holds the server (round 12; VERIFY11 (B): at a load average of 599 the server's threads sat in D state on
+ * the file system's journal, jbd2_log_wait_commit and folio_wait_bit_common, for over a minute, and the harness called it "server stopped
+ * answering", a VIOLATION: liveness under load, not safety). The tasks of the server are sampled (dstate_thread, 4 times a second): a thread
+ * that has been in D state (uninterruptible sleep) for dstate_min_ns without a break is the kernel's, not tsdbd's. A request that missed its
+ * deadline while such a thread was there is a kernel I/O stall: no verdict, the request is an error like a refused one, the run goes on (the
+ * checker judges the history, which has the request as indeterminate) and ends INCONCLUSIVE ("kernel-stall"); a stall that lasts
+ * KSTALL_BOUND_S (JEPSEN_KSTALL_BOUND_S) from the first miss ends the run, also INCONCLUSIVE, with the server killed. A miss with no such
+ * thread (a futex wait, a pause, a spin, a deadlock: tsdbd's own) stays a VIOLATION. Short D states are not enough: a server that hangs a
+ * worker still fsyncs for the others, and its threads are in D for a few milliseconds at a time.
+ * The limit: a D state that is tsdbd's own, a thread stuck in the kernel for a reason of its own making (a file system that never answers
+ * the harness' volume), looks the same from outside; it is reported INCONCLUSIVE with the wait channels (print_proc_state) for a person to read. */
+#define KSTALL_BOUND_S_DEFAULT 600
+static _Atomic int64_t d_long_ns;      /* the last time a thread of the server was seen in D state for dstate_min_ns or more at a stretch */
+static atomic_bool kstall_seen, kstall_over;
+static int64_t kstall_first_ns;
+static int kstall_misses, kstall_bound_s = KSTALL_BOUND_S_DEFAULT;
+static int64_t dstate_min_ns = 10000000000LL;
+static atomic_bool dst_stop;
+
 static void req_done(const char *op, int rc, int64_t t0)
 {
     int64_t d = now_ns() - t0, w = atomic_load(&req_worst_ns);
     if (rc != TSDB_ERR_IO && rc != TSDB_ERR_UNAVAILABLE) /* an answer: the honest worst the deadline is calibrated on */
         while (d > w && !atomic_compare_exchange_weak(&req_worst_ns, &w, d))
             ;
+    if (rc == TSDB_ERR_IO && d >= (int64_t)req_deadline_s * 950000000LL && atomic_load(&d_long_ns) >= t0) {
+        pid_t pid = atomic_load(&server_pid);
+        if (!atomic_exchange(&kstall_seen, true)) {
+            kstall_first_ns = now_ns();
+            fprintf(stderr, "  [kernel I/O stall] %s got no answer in %.0f s (the deadline is %d s) while a thread of the server (pid %d) was in D state "
+                    "for %.0f s or more: the kernel's, not the server's; no verdict, the run goes on (at most %d s of it)\n", op, (double)d / 1e9,
+                    req_deadline_s, (int)pid, (double)dstate_min_ns / 1e9, kstall_bound_s);
+            if (pid > 0)
+                print_proc_state(pid);
+        }
+        kstall_misses++;
+        return;
+    }
     if (rc == TSDB_ERR_IO && d >= (int64_t)req_deadline_s * 950000000LL && !atomic_exchange(&hung_flag, true)) {
         pid_t pid = atomic_load(&server_pid);
         stall_problems++;
@@ -1345,6 +1377,73 @@ static void req_done(const char *op, int rc, int64_t t0)
         print_tail(slogpath);
         atomic_store(&stop, true); /* the clients and the nemesis end; main kills the server and judges what there is */
     }
+}
+
+/* The sampler of D state: four times a second, for the server that runs now. */
+static void *dstate_thread(void *arg)
+{
+    (void)arg;
+    enum { MAXT = 256 };
+    static pid_t tids[MAXT];
+    static int64_t since[MAXT];
+    int nt = 0;
+    pid_t cur = 0;
+    while (!atomic_load(&dst_stop)) {
+        usleep(250000);
+        pid_t pid = atomic_load(&server_pid);
+        int64_t now = now_ns();
+        if (pid != cur) {
+            cur = pid;
+            nt = 0;
+        }
+        if (pid <= 0)
+            continue;
+        char path[320], b[512];
+        snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+        DIR *dd = opendir(path);
+        struct dirent *e;
+        pid_t seen[MAXT];
+        int ns = 0;
+        while (dd && (e = readdir(dd))) {
+            if (e->d_name[0] < '0' || e->d_name[0] > '9')
+                continue;
+            snprintf(path, sizeof path, "/proc/%d/task/%s/stat", (int)pid, e->d_name);
+            FILE *f = fopen(path, "r");
+            if (!f)
+                continue;
+            size_t n = fread(b, 1, sizeof b - 1, f);
+            fclose(f);
+            b[n] = 0;
+            const char *c = strrchr(b, ')');
+            if (c && c[1] == ' ' && c[2] == 'D' && ns < MAXT)
+                seen[ns++] = (pid_t)atoi(e->d_name);
+        }
+        if (dd)
+            closedir(dd);
+        int64_t longest = 0;
+        int keep = 0;
+        for (int i = 0; i < ns; i++) { /* a thread in D state now: since when */
+            int j = 0;
+            while (j < nt && tids[j] != seen[i])
+                j++;
+            int64_t sc = j < nt ? since[j] : now;
+            if (sc < now && now - sc > longest)
+                longest = now - sc;
+            tids[keep] = seen[i];
+            since[keep++] = sc;
+        }
+        nt = keep;
+        if (longest >= dstate_min_ns)
+            atomic_store(&d_long_ns, now);
+        if (atomic_load(&kstall_seen) && !atomic_load(&kstall_over) && now - kstall_first_ns >= (int64_t)kstall_bound_s * 1000000000LL &&
+            now - atomic_load(&d_long_ns) < 2000000000LL) { /* the stall has lasted its bound and still does: the run ends, INCONCLUSIVE */
+            atomic_store(&kstall_over, true);
+            fprintf(stderr, "  [kernel I/O stall] still there %d s after the first request it held up: the run ends here\n", kstall_bound_s);
+            atomic_store(&hung_flag, true);
+            atomic_store(&stop, true);
+        }
+    }
+    return NULL;
 }
 #define REQ(op, expr) ({ int64_t t0_ = now_ns(); int r_ = (expr); req_done(op, r_, t0_); r_; })
 
@@ -2051,6 +2150,25 @@ static void *watcher(void *arg)
             return NULL;
         }
     }
+}
+
+/* The server of the quiet tail has no shim (round 12; VERIFY11 (A): a hung worker under power passed in 8 of 9 runs). A server under the
+ * shim dies by its own odds (CRASHFS_PROB: a power loss or an EIO at a random file operation, most within milliseconds of its start), and a
+ * server that dies in the tail takes with it every request that waits on a hung worker: the clients see a closed connection, not a
+ * missing answer, and the hang never reaches the deadline. So when the nemesis is quiet the faulty server is stopped (SIGTERM; a server the
+ * shim ended already is reaped) and a clean one, which nothing ends but the harness, takes the tail and answers or does not. Under the lock of
+ * the server (the nemesis is not in a step). Judged like any end: our SIGTERM, or the shim's own planned exit. */
+static void quiet_tail_server(void)
+{
+    pid_t pid = atomic_load(&server_pid);
+    int st = 0;
+    if (pid > 0 && reap_server(pid, &st, WNOHANG) == pid)
+        server_gone();
+    else if (pid > 0 && server_faulty)
+        stop_server_st(SIGTERM, &st);
+    else if (pid > 0)
+        return; /* a clean server already (the faulty one died while starting): it is the tail's */
+    start_server(false);
 }
 
 /* ------------------------------------------------------------- nemesis */
@@ -4463,6 +4581,9 @@ int main(int argc, char **argv)
         const char *rd = getenv("JEPSEN_REQ_DEADLINE_S");
         if (rd && atoi(rd) >= 2)
             req_deadline_s = atoi(rd);
+        dstate_min_ns = (req_deadline_s >= 60 ? 10 : req_deadline_s / 6 > 1 ? req_deadline_s / 6 : 1) * 1000000000LL; /* 10 s at the default 60 */
+        if (getenv("JEPSEN_KSTALL_BOUND_S") && atoi(getenv("JEPSEN_KSTALL_BOUND_S")) > 0)
+            kstall_bound_s = atoi(getenv("JEPSEN_KSTALL_BOUND_S"));
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
         sa.sa_handler = on_outer_kill;
@@ -4571,6 +4692,8 @@ int main(int argc, char **argv)
     nem_t0_ns = now_ns();
     if (pthread_create(&watch_th, NULL, watcher, NULL) == 0)
         watch_started = true;
+    pthread_t dst_th;
+    bool dst_started = pthread_create(&dst_th, NULL, dstate_thread, NULL) == 0;
     if (outage) {
         samp_on = pthread_create(&samp_th, NULL, disk_sampler, NULL) == 0;
     }
@@ -4586,8 +4709,11 @@ int main(int argc, char **argv)
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += 90;
-            if (pthread_mutex_timedlock(&server_lock, &ts) == 0)
+            if (pthread_mutex_timedlock(&server_lock, &ts) == 0) {
+                if (!strcmp(nemesis, "power") || !strcmp(nemesis, "eio"))
+                    quiet_tail_server();
                 pthread_mutex_unlock(&server_lock);
+            }
         }
         for (int64_t end = now_ns() + QUIET_TAIL_S * 1000000000LL; now_ns() < end && !atomic_load(&hung_flag);)
             usleep(20000);
@@ -4624,6 +4750,9 @@ int main(int argc, char **argv)
         join_bounded(fr, "the follower reader", req_deadline_s + 30);
     if (watch_started)
         join_bounded(watch_th, "the watcher", 30); /* it ends at the first poll after stop_ns */
+    atomic_store(&dst_stop, true);
+    if (dst_started)
+        join_bounded(dst_th, "the D-state sampler", 30);
     /* The nemesis is judged here, and the run goes on whatever the verdict: a lazy nemesis makes the run INCONCLUSIVE (exit 3, it
      * tested less than it says), but the final state and the whole history are always judged too, every safety check, and a loss
      * there is a VIOLATION (exit 1) on the attempt where it happened, never hidden behind a rerun (the user's scope, 2026-11-14:
@@ -4741,6 +4870,10 @@ int main(int argc, char **argv)
     }
     /* a server that ended by itself, under any nemesis or none (end_report), and under power one that would not die of the plug */
     v += death_problems + stall_problems + (!strcmp(nemesis, "power") ? hang_problems : 0);
+    if (atomic_load(&kstall_seen))
+        INCONCLUSIVE("kernel-stall", "%d requests got no answer within the %d s deadline while a thread of the server sat in D state (the kernel, not "
+                     "tsdbd: a machine whose file system stalls) for %.0f s or more%s: liveness under load, not a verdict; the history is judged as always\n",
+                     kstall_misses, req_deadline_s, (double)dstate_min_ns / 1e9, atomic_load(&kstall_over) ? ", and the stall outlasted its bound" : "");
     JP_PHASE("the cleanup (rm -rf of the directory)");
     unlink(markpath);
     unlink(pullpath);

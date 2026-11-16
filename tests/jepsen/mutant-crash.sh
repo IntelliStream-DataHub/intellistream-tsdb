@@ -8,6 +8,8 @@
 #                left alone: a core handler that is a pipe, systemd-coredump here, dumps whatever the limit says, and the dump keeps the
 #                process alive, not yet a zombie, for 0.1 s to seconds: the window in which a nemesis' SIGKILL used to hide the crash)
 #   JV_EXIT=N    _exit(JV_EXITCODE, 0 by default) on every Nth insert request (an end of its own, with no signal of ours)
+#   JV_DSTALL=N  a worker blocks in D state for good (vfork whose child never execs) on every Nth insert request: the kernel's stall, as an I/O stall
+#                is, and not tsdbd's hang (JV_HANG: pause(), no D state)
 #   JV_CRASHONCE=N  the same, once per gate (JV_ONCEFILE names the file whose creation says it happened)
 #   JV_CRASH_MB=M   before the abort, touch M MB: a dump that takes long on every core handler, so the nemesis' kill is certain to land in it
 #   JV_HANG=N    a worker pause()s for ever on every Nth insert request (the server is up and stops answering)
@@ -30,6 +32,7 @@ tmp=$(mktemp -d "${TMPDIR:-/var/tmp}/mutant-crash.XXXXXX") || exit 2
 git -C "$root" archive HEAD | tar -x -C "$tmp" || exit 2
 f=$tmp/server/tsdbd.c
 sed -i '0,/^#include <fcntl.h>$/s//#include <fcntl.h>\
+#include <sys\/prctl.h>\
 static _Atomic unsigned jv_cnt; \/* test-only mutants of tests\/jepsen\/mutant-crash.sh *\/\
 static int jv_every(const char *k)\
 {\
@@ -48,6 +51,14 @@ static void jv_crash(void)\
     }\
     abort();\
 }\
+static void jv_dstall(void) /* a thread in D state for good: the parent of a vfork whose child never execs (it dies with the server) */\
+{\
+    if (vfork() == 0) {\
+        prctl(PR_SET_PDEATHSIG, SIGKILL);\
+        for (;;)\
+            pause();\
+    }\
+}\
 static void jv_once(void)\
 {\
     const char *f = getenv("JV_ONCEFILE");\
@@ -59,12 +70,14 @@ sed -i 's/^    case TSDB_OP_INSERT: {$/&\
         if (jv_every("JV_CRASH")) jv_crash();\
         if (jv_every("JV_CRASHONCE")) jv_once();\
         if (jv_every("JV_EXIT")) _exit(atoi(getenv("JV_EXITCODE") ? getenv("JV_EXITCODE") : "0"));\
+        if (jv_every("JV_DSTALL")) jv_dstall();\
         if (jv_every("JV_HANG")) for (;;) pause();/; s/^    case TSDB_OP_INSERT_VALUES: {$/&\
         if (jv_every("JV_CRASH")) jv_crash();\
         if (jv_every("JV_CRASHONCE")) jv_once();\
         if (jv_every("JV_EXIT")) _exit(atoi(getenv("JV_EXITCODE") ? getenv("JV_EXITCODE") : "0"));\
+        if (jv_every("JV_DSTALL")) jv_dstall();\
         if (jv_every("JV_HANG")) for (;;) pause();/' "$f"
-if [ "$(grep -c 'jv_every(' "$f")" -ne 9 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
+if [ "$(grep -c 'jv_every(' "$f")" -ne 11 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
 (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-crash: build failed"; tail -5 "$tmp/build.log"; rm -rf "$tmp"; exit 1; }
 mut=$tmp/build/tsdbd
 crashfs=$root/build/libcrashfs.so
@@ -130,14 +143,30 @@ for code in 0 1; do
     run_case "exit$code-rot" "by itself: not a fail-stop" "a server that exits $code by itself, rot" JV_EXIT=150 JV_EXITCODE=$code -- \
         --nemesis rot --seconds 20 --verify-checksums
 done
+# a request that misses its deadline while a thread of the server sits in D state is the kernel's: INCONCLUSIVE (exit 3, the check kernel-stall),
+# never a violation (round 12; VERIFY11 (B)). The deadline is 12 s here (D state is sampled for 2 s at a stretch) and the stall's bound 20 s.
+if want dstall-kill; then
+    t0=$(date +%s)
+    out=$(JV_DSTALL=25 JEPSEN_REQ_DEADLINE_S=12 JEPSEN_KSTALL_BOUND_S=20 JEPSEN_TSDBD="$mut" timeout "${TMO:-200}" "$bin" --dir "$dir" --nemesis kill \
+        --seconds 10 2>&1); st=$?
+    left=$(leftover | tr '\n' ' ')
+    if [ $st -eq 3 ] && echo "$out" | grep -q 'check kernel-stall' && ! echo "$out" | grep -q 'FAILED\|server stopped answering' && [ -z "$left" ]; then
+        echo "mutant-crash: dstall-kill is INCONCLUSIVE (kernel-stall), not a violation, in $(($(date +%s) - t0)) s: a worker in D state for good"
+    else
+        echo "mutant-crash: dstall-kill: a worker in D state was not INCONCLUSIVE with the check kernel-stall (rc $st, wanted 3; left behind: ${left:-none})"
+        echo "$out" | tail -n 15
+        rc=1
+    fi
+    for p in $left; do kill -KILL "$p" 2>/dev/null; done
+fi
 HP='server stopped answering'
 for nem in kill pause none; do
     run_case "hang-$nem" "$HP" "a worker that hangs for ever on every 25th insert, $nem nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 -- \
         --nemesis "$nem" --seconds 10
 done
-for nem in eio power; do # the shim's own odds left out (0): the last server, which the quiet tail leaves to the clients, must live
-    run_case "hang-$nem" "$HP" "a worker that hangs for ever on every 25th insert, $nem nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 \
-        JEPSEN_PULL_PROB=0 JEPSEN_CRASH_PROB=0 -- --nemesis "$nem" --seconds 10 --crashfs "$crashfs"
+for nem in eio power; do # the shim's default odds: the quiet tail's server is a clean one (quiet_tail_server), which nothing but the harness ends
+    run_case "hang-$nem" "$HP" "a worker that hangs for ever on every 25th insert, $nem nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 -- \
+        --nemesis "$nem" --seconds 10 --crashfs "$crashfs"
 done
 run_case "hang-outage" "$HP" "a worker that hangs for ever on every 25th insert, outage nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 -- \
     --nemesis outage --seconds 20 --outagefs "$outagefs"
