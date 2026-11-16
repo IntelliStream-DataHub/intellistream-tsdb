@@ -1015,6 +1015,11 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
 {
     if (!db->wal_enabled || db->opt.wal_sync_ms != 0 || db->rp || db->opt.read_only)
         return TSDB_ERR_INVALID;
+    if (!db->replica_req) { /* the same rule as a replica's open (db.c): only a directory made for replication */
+        fprintf(stderr, "tsdb: %s: META does not say requires=replica: not attached as a replicated leader\n",
+                db->dir ? db->dir : "?");
+        return TSDB_ERR_INVALID;
+    }
     int rc = db->lrs ? 0 : leader_rs_open(db); /* RSTATE before the first marker */
     if (rc)
         return rc;

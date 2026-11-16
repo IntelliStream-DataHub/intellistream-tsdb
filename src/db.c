@@ -435,6 +435,7 @@ static int meta_load_or_create(eng *db, bool read_only)
             unsigned feats;
             meta_requires_parse(buf, &feats, feat, sizeof feat);
             db->feed_req = feats & META_REQ_FEED;
+            db->replica_req = feats & META_REQ_REPLICA;
             if (feat[0]) {
                 fprintf(stderr,
                         "tsdb: META requires the feature(s) \"%s\", which tsdb %s does not know: the open "
@@ -928,8 +929,20 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             }
         }
     }
+    if (replica && faccessat(db->dirfd, META_FILE, F_OK, 0) != 0) { /* before meta_load_or_create would make one */
+        fprintf(stderr, "tsdb: %s: no META (requires=replica): not opened as a replica\n", dir);
+        rc = TSDB_ERR_INVALID;
+        goto fail;
+    }
     if ((rc = meta_load_or_create(db, ro)) != 0)
         goto fail;
+    if (replica && !db->replica_req) {
+        /* a replica cuts its log to the leader's and skips what its links say: on a directory that was never made for
+         * one (cvolfs writes requires=replica into a cluster volume's META) that would rewrite a stranger's data */
+        fprintf(stderr, "tsdb: %s: META does not say requires=replica: not opened as a replica\n", dir);
+        rc = TSDB_ERR_INVALID;
+        goto fail;
+    }
     if ((rc = feed_open_reconcile(db, feed_want, &feed_wanted)) != 0)
         goto fail;
     if ((rc = series_open(&db->series, db->dirfd, "SERIES", ro, db->opt.fsync)) != 0 ||

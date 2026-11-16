@@ -85,6 +85,46 @@ static void stop_if_failed(const char *what)
     }
 }
 
+/* Only a directory whose META says requires=replica opens as a replica or attaches as a leader (cvolfs writes it into a
+ * cluster volume's META). The directories here are made by a plain open, so every open of one marks it: META gets the
+ * line, written and synced with its directory (a power child's open may be the first, and crashfs keeps synced data).
+ * case_requires_replica opens through the engine's eng_open, unmarked. */
+static void mark_replica(const char *dir)
+{
+    char p[PATH_MAX], buf[4096];
+    snprintf(p, sizeof p, "%s/META", dir);
+    int fd = open(p, O_RDWR | O_APPEND);
+    if (fd < 0)
+        return;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    buf[n > 0 ? n : 0] = '\0';
+    if (n >= 0 && !strstr(buf, "requires=replica")) {
+        static const char line[] = "requires=replica\n";
+        if (write(fd, line, sizeof line - 1) != (ssize_t)(sizeof line - 1) || fsync(fd) != 0) {
+            fprintf(stderr, "cannot mark %s\n", p);
+            exit(2);
+        }
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) {
+            (void)fsync(dfd);
+            close(dfd);
+        }
+    }
+    close(fd);
+}
+
+static int t_eng_open(const char *dir, const tsdb_options *o, eng **db)
+{
+    mark_replica(dir); /* META there already */
+    int rc = eng_open(dir, o, db);
+    if (rc == 0 && !(*db)->replica_req) { /* the open made META: marked now, as the next open would read it */
+        mark_replica(dir);
+        (*db)->replica_req = true;
+    }
+    return rc;
+}
+#define eng_open(d, o, db) t_eng_open(d, o, db) /* (eng_open)(...) is the engine's own */
+
 #define T0 1700000000000LL
 #define DAY1 ((T0 / 86400000LL + 1) * 86400000LL) /* the day edge after T0 */
 #define NS 2    /* series */
@@ -313,6 +353,47 @@ static void fresh(char *dir, const char *name)
 }
 
 /* ------------------------------------------------------------ A */
+
+/* A directory whose META lacks requires=replica opens neither as a replica nor attaches as a leader (r3g "Also 5"):
+ * a stranger's directory would have its log cut and its links followed. Marked, both work. */
+static void case_requires_replica(void)
+{
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/reqrep", S);
+    sh("rm -rf '%s' && mkdir -p '%s'", dir, dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 0;
+    eng *db = NULL;
+    /* an empty directory: refused, and left as it was (no META made by the refused open; review minor) */
+    CHECK_EQ(eng_open_replica(dir, &o, 0, &db), TSDB_ERR_INVALID);
+    CHECK(db == NULL);
+    char meta[PATH_MAX + 8];
+    snprintf(meta, sizeof meta, "%s/META", dir);
+    CHECK(access(meta, F_OK) != 0);
+    CHECK_EQ((eng_open)(dir, &o, &db), 0); /* the engine's open: META without the word */
+    if (!db)
+        return;
+    static const struct jr_ops none = {0};
+    CHECK_EQ(eng_leader_attach(db, &none), TSDB_ERR_INVALID);
+    eng_close(db);
+    db = NULL;
+    CHECK_EQ(eng_open_replica(dir, &o, 0, &db), TSDB_ERR_INVALID);
+    CHECK(db == NULL);
+    mark_replica(dir);
+    CHECK_EQ(eng_open_replica(dir, &o, 0, &db), 0);
+    if (db)
+        eng_close(db);
+    db = NULL;
+    CHECK_EQ((eng_open)(dir, &o, &db), 0);
+    if (!db)
+        return;
+    CHECK(db->replica_req);
+    eng_close(db);
+    sh("rm -rf '%s'", dir);
+}
 
 static void case_basic(void)
 {
@@ -1645,17 +1726,21 @@ static void case_atomic(void)
 static void case_feed_refused(void)
 {
     char dir[PATH_MAX];
-    fresh(dir, "o");
+    snprintf(dir, sizeof dir, "%s/o", S); /* not fresh(): its series are made through the marking open */
+    sh("rm -rf '%s' && mkdir -p '%s'", dir, dir);
     tsdb_options o;
     tsdb_options_init(&o);
     o.merge_threads = 0;
     o.create_volumes = 0;
     eng *db;
-    CHECK_EQ(eng_open(dir, &o, &db), 0);
+    /* the engine's own open: a feed is refused where META says requires=replica, so the feed comes first and the word
+     * after it, which leaves the feed the one reason for the replica open to refuse */
+    CHECK_EQ((eng_open)(dir, &o, &db), 0);
     if (!db)
         return;
     CHECK_EQ(eng_feed_enable(db, NULL), 0);
     eng_close(db);
+    mark_replica(dir);
     CHECK_EQ(open_replica(dir, 0, &db), TSDB_ERR_INVALID);
 }
 
@@ -5895,6 +5980,12 @@ int main(int argc, char **argv)
             fprintf(stderr, "test_replica: %d failures\n", failures);
             return 1;
         }
+    }
+    case_requires_replica();
+    if (getenv("TEST_REPLICA_REQUIRES_ONLY")) {
+        case_feed_refused();
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
     }
     if (getenv("TEST_REPLICA_APPLY_ONLY")) { /* the quick run of the apply's cases (R2 REVIEW M1) */
         case_commit();
