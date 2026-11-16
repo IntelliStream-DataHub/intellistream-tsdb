@@ -33,9 +33,28 @@
  * Heartbeats: every member sends HB{id, incarnation, applied} to every voter each heartbeat_ms (in memory, never an
  * entry); every voter records when it last heard each member. The Raft leader, once it has led for node_timeout,
  * proposes MEMBER_STATE down for an up member not heard for node_timeout, and up (with the new incarnation) for a down
- * member heard again or an up member that restarted; one proposal per member at a time. **Known gap (§6.1)**: this
- * thread is not the loop that serves the volumes, so a tsdbd whose request loop hangs still heartbeats; step 4 moves
- * the heartbeat there.
+ * member heard again or an up member that restarted; one proposal per member at a time.
+ *
+ * Liveness and leases (§6.1, §7.1). This thread is not the loop that serves the volumes, so the serving loop stamps a
+ * monotonic atomic every round and every tick (cluster_loop_stamp); while the stamp is older than
+ * CLUSTER_LOOP_STALE_MS a server with cfg.loop_gated sends no heartbeat at all (nor records itself, nor extends its
+ * own lease), so a hung I/O loop makes the member go down although this thread runs. The stamp is the I/O loop's
+ * only: workers that all hang inside requests (a stuck NFS call, a lock) while the loop runs keep the member up. A heartbeat carries the
+ * report sections: HBS_NODE (address, rack, flags), HBS_VOLUMES (led volumes with their epochs, failed volumes: a
+ * volume that r3d's fail-stop stopped is LOCAL_FAULT in the next beat), HBS_DOMAINS, HBS_LEASE {u64 send_ns, the
+ * sender's iso_now_ns, CLOCK_BOOTTIME} and HBS_UNREACH {u32 n, n x {u32 node, u32 age_ms}} (peers this server shares a
+ * replicated volume with and has not heard on any data link for a second; at most CLUSTER_REPORT_UNREACH). Each
+ * section is [u16 type][u32 len][body]; an unknown type is skipped. HB_ACK is {u32 leader, u64 term, u64 commit, u64
+ * echo (the HB's send_ns), u8 granted, u32 lease_ms, u32 drift_ppm}. The Raft leader grants only while the core's
+ * own check-quorum lease holds (raft_read_lease: no other Raft leader can exist yet) on the clock read as the HB is
+ * handled (the core answers against the last time it was given, which after a stall of this thread is from before
+ * it), shortened to the cluster's drift_ppm where the core was booted with less (core_lease_until), and records when
+ * it last granted to each member; a server extends its lease to echo + lease_ms * (1 - drift) on its own clock, only
+ * from an ack whose sender is the Raft leader it names, in a term no older than any it has heard. promote_safe_ns(X) = max(leader_since, last grant to X) + lease_ms *
+ * (1 + drift) is the earliest time a promotion away from X is safe; a new Raft leader declares nobody down before it
+ * (and before max(node_timeout, lease) of its own leadership). While its lease has run out, a server answers every
+ * request on a cluster volume it leads UNAVAILABLE (WHY UNREACHABLE, retry_after 200 ms) and repld admits no write.
+ * The leases of the data links (repld's heartbeats, L1) are about those links only: they never extend this lease.
  *
  * Voters (§2.2), on the leader once a second while no configuration change is in flight: promote a caught-up learner;
  * else, while fewer voters than meta_voter_target have been heard within voter_replace_s, add an up non-voter as a
@@ -101,7 +120,8 @@
 #define WB_MAX (64u << 20) /* queued to one peer; beyond it the link is dropped (Raft resends) */
 #define CL_MAGIC PL_CL_MAGIC /* "TSDC" */
 #define CL_VERSION PL_CL_VERSION /* 2: heartbeat sections, flags in PROBE_REPLY; 3: the R3 settings in INIT, VOLUME_ADD; 4: the link
-                      * kind in HELLO (data links, peerlink.h); peers of another
+                      * kind in HELLO (data links, peerlink.h); 5: HBS_LEASE, HBS_UNREACH and
+                      * the lease fields of HB_ACK; peers of another
                       * version are refused (no mixed versions) */
 #define RING 4096
 #define SNAP_EVERY 1000
@@ -139,7 +159,7 @@ enum {
 };
 
 /* the sections of a heartbeat (after its address fields) */
-enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3 };
+enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3, HBS_LEASE = 4, HBS_UNREACH = 5 };
 #define FREE_MIN_DEFAULT (1ull << 30) /* a state directory below this is not voter_ok (M11) */
 
 /* ------------------------------------------------------------------ bytes */
@@ -522,6 +542,17 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
             getstr(&r, h->doms[j].name, sizeof h->doms[j].name);
             h->doms[j].state = get8(&r);
         }
+        h->nunreach = get32(&r);
+        if (h->nunreach > CLUSTER_REPORT_UNREACH)
+            r.bad = 1; /* the array holds that many: a longer list is a malformed reply, never read past */
+        if (r.bad)
+            break;
+        for (uint32_t j = 0; j < h->nunreach; j++) {
+            h->unreach[j].node = get32(&r);
+            h->unreach[j].age_ms = get32(&r);
+        }
+        h->answered_ms = get64(&r);
+        h->lease_left_ms = (int64_t)get64(&r);
     }
     uint32_t il = r.bad ? 0 : get32(&r);
     if (r.bad || r.len - r.off != il) {
@@ -858,6 +889,10 @@ struct heard {
     uint32_t nvols, ndoms;
     struct cluster_vol_status *vols;
     struct cluster_dom_report *doms;
+    uint32_t nunreach;
+    struct cluster_unreach unreach[CLUSTER_REPORT_UNREACH];
+    uint64_t send_ns;     /* HBS_LEASE of its last heartbeat: its clock when it sent it (0: none) */
+    uint64_t answered_ns; /* the Raft leader: when it last granted it a lease (its own clock; 0: never) */
 };
 
 struct addr_e {
@@ -926,6 +961,8 @@ static struct {
     int running;
     atomic_int stop;
     atomic_int claim_bad; /* cluster_set_claim_ok(0) */
+    int loop_gated;       /* cfg.loop_gated */
+    int mutant;           /* TSDB_CLUSTER_MUTANT (tests only): enum cl_mutant */
 
     int have_node;
     uint8_t ident[16]; /* this server's own identity (meta/IDENT), made at its first start, never changed */
@@ -971,6 +1008,8 @@ static struct {
     unsigned watch_rot;
     uint32_t hint_leader;
     uint64_t hint_term, hint_commit;
+    uint64_t core_e;     /* the core's election_min_ns and max_clock_drift_ppm, as booted (core_lease_until) */
+    uint32_t core_drift;
     uint64_t watch_behind_since; /* when the watch stream first stayed behind hint_commit; 0: it does not */
 
     /* TSDB_CLUSTER_TEST (tests only): snap_every=N, snap_retain=N, seg_bytes=N, fail_snap_dirsync=1,
@@ -1476,6 +1515,125 @@ static void heard_set(uint32_t id, uint64_t now, uint64_t inc, uint64_t applied,
 static cluster_report_fn g_reporter;
 static void *g_reporter_arg;
 
+/* ---- liveness and leases (the header's "Liveness and leases") */
+/* Mutants (TSDB_CLUSTER_MUTANT, tests only): `leaseanyvoter` lets any voter's HB_ACK extend the lease, `nodrift` takes
+ * lease_ms without the drift margin both ways, `stampignored` heartbeats whatever the serving loop's stamp says,
+ * `noquorum` grants without the core's lease, `nocoreclock` takes the core's answer on its own clock (the code before
+ * the review), `nopromotewait` declares a member down after node_timeout without promote_safe_ns. */
+enum cl_mutant {
+    CLM_NONE = 0,
+    CLM_LEASEANYVOTER = 1,
+    CLM_NODRIFT = 2,
+    CLM_STAMPIGNORED = 3,
+    CLM_NOQUORUM = 4,
+    CLM_NOCORECLOCK = 5,
+    CLM_NOPROMOTEWAIT = 6
+};
+static int cl_mutant(void)
+{
+    static atomic_int m = -1; /* parsed once; a race parses the same string twice */
+    int v = atomic_load_explicit(&m, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TSDB_CLUSTER_MUTANT");
+        v = !e                            ? CLM_NONE
+            : !strcmp(e, "leaseanyvoter") ? CLM_LEASEANYVOTER
+            : !strcmp(e, "nodrift")       ? CLM_NODRIFT
+            : !strcmp(e, "stampignored")  ? CLM_STAMPIGNORED
+            : !strcmp(e, "noquorum")      ? CLM_NOQUORUM
+            : !strcmp(e, "nocoreclock")   ? CLM_NOCORECLOCK
+            : !strcmp(e, "nopromotewait") ? CLM_NOPROMOTEWAIT
+                                          : CLM_NONE;
+        atomic_store_explicit(&m, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+/* the cluster thread's clock (CLOCK_BOOTTIME: a suspend counts), for the stamp and the lease on any thread */
+static uint64_t mono_ns(void) { return iso_now_ns(); }
+
+static _Atomic uint64_t g_stamp_ns; /* the serving loop's last stamp (0: never) */
+static _Atomic uint64_t g_lease_ns; /* this server's read lease runs until this (mono_ns; 0: none) */
+
+void cluster_loop_stamp(void) { atomic_store_explicit(&g_stamp_ns, mono_ns(), memory_order_relaxed); }
+
+static _Atomic uint64_t g_lease_gen; /* + 1 whenever a lease begins after the last one had ended (lease_extend) */
+
+int cluster_lease_valid(void) { return mono_ns() < atomic_load_explicit(&g_lease_ns, memory_order_acquire); }
+
+uint64_t cluster_lease_gen(void) { return atomic_load_explicit(&g_lease_gen, memory_order_acquire); }
+
+int cluster_lease_still(uint64_t gen)
+{
+    uint64_t until = atomic_load_explicit(&g_lease_ns, memory_order_acquire); /* sees the gen of the extension */
+    return mono_ns() < until && atomic_load_explicit(&g_lease_gen, memory_order_acquire) == gen;
+}
+
+uint64_t cluster_lease_end(uint64_t send_ns, uint32_t lease_ms, uint32_t drift_ppm)
+{
+    uint64_t l = (uint64_t)lease_ms * MS;
+    if (cl_mutant() != CLM_NODRIFT)
+        l -= (uint64_t)lease_ms * drift_ppm; /* lease_ms * 1e6 ns * drift_ppm / 1e6 */
+    return send_ns + l;
+}
+
+uint64_t cluster_lease_safe(uint64_t answer_ns, uint32_t lease_ms, uint32_t drift_ppm)
+{
+    uint64_t l = (uint64_t)lease_ms * MS;
+    if (cl_mutant() != CLM_NODRIFT)
+        l += (uint64_t)lease_ms * drift_ppm;
+    return answer_ns + l;
+}
+
+/* The lease runs to `until` unless it already runs longer (several answers may cross; it never shrinks). */
+static void lease_extend(uint64_t until)
+{
+    uint64_t cur = atomic_load_explicit(&g_lease_ns, memory_order_relaxed);
+    while (until > cur) {
+        if (cur <= mono_ns()) /* it had ended: a new lease, not the old one continued (a second bump is harmless) */
+            atomic_fetch_add_explicit(&g_lease_gen, 1, memory_order_release);
+        if (atomic_compare_exchange_weak_explicit(&g_lease_ns, &cur, until, memory_order_release,
+                                                  memory_order_relaxed))
+            break;
+    }
+}
+
+/* E(1-d)/(1+d), exactly as raft_new computes the core's lease */
+static uint64_t core_lease_ns(uint64_t e, uint64_t d) { return e - e * 2 * d / (1000000 + d); }
+
+/* How long this server, as the Raft leader, holds the core's check-quorum lease (0: not at all). The core answers
+ * against the last time it was given, which is from before any stall of this thread (a pause, a long poll), so it is
+ * given `now` first and its end is compared with `now` here as well. A core booted before INIT's settings were applied
+ * (a joined node: on_raft -> core_boot) took the default drift; its lease is shortened to the cluster's drift_ppm, as
+ * if booted with it (the lease starts at the same round either way). */
+static uint64_t core_lease_until(uint64_t now)
+{
+    raft_lease l;
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
+        return 0;
+    if (cl_mutant() == CLM_NOQUORUM)
+        return UINT64_MAX;
+    if (cl_mutant() == CLM_NOCORECLOCK)
+        return raft_read_lease(C.r, &l) ? l.lease_until : 0;
+    raft_clock(C.r, now);
+    if (!raft_read_lease(C.r, &l))
+        return 0;
+    uint64_t until = l.lease_until, d = settings()->drift_ppm;
+    if (until != UINT64_MAX && d > C.core_drift && d < 1000000) {
+        uint64_t cut = core_lease_ns(C.core_e, C.core_drift) - core_lease_ns(C.core_e, d);
+        until = until > cut ? until - cut : 0;
+    }
+    return now < until ? until : 0;
+}
+
+/* Does the serving loop run? (without the gate: always) */
+static int loop_alive(uint64_t now)
+{
+    if (!C.loop_gated || cl_mutant() == CLM_STAMPIGNORED)
+        return 1;
+    uint64_t st = atomic_load_explicit(&g_stamp_ns, memory_order_relaxed);
+    return st && since(now, st) <= (uint64_t)CLUSTER_LOOP_STALE_MS * MS;
+}
+
 void cluster_set_claim_ok(int ok)
 {
     atomic_store(&C.claim_bad, !ok);
@@ -1532,7 +1690,29 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
         }
         struct rd s = {r->p + r->off, len, 0, 0};
         r->off += len;
-        if (type == HBS_NODE) {
+        if (type == HBS_LEASE) {
+            uint64_t t = get64(&s);
+            if (s.bad) {
+                r->bad = 1;
+                return;
+            }
+            h->send_ns = t;
+        } else if (type == HBS_UNREACH) {
+            uint32_t n = get32(&s);
+            if (s.bad || n > CLUSTER_REPORT_UNREACH || (size_t)n * 8 > len) {
+                r->bad = 1;
+                return;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                h->unreach[i].node = get32(&s);
+                h->unreach[i].age_ms = get32(&s);
+            }
+            if (s.bad) {
+                r->bad = 1;
+                return;
+            }
+            h->nunreach = n;
+        } else if (type == HBS_NODE) {
             uint8_t flags = get8(&s), dropped = get8(&s), rb = get8(&s);
             uint64_t fr = get64(&s);
             if (s.bad) {
@@ -2407,6 +2587,11 @@ static int core_boot(char *err, size_t errn)
     raft_opts_defaults(&o);
     if (C.snap_retain)
         o.snapshot_retain = C.snap_retain;
+    /* the core's own lease (check-quorum): the Raft leader grants read leases only while it holds (on_hb) */
+    o.lease_reads = true;
+    o.max_clock_drift_ppm = settings()->drift_ppm ? settings()->drift_ppm : 500;
+    C.core_e = o.election_min_ns;
+    C.core_drift = o.max_clock_drift_ppm;
     tsdb_random(&o.seed, sizeof o.seed);
     C.r = raft_new(C.id, &o, &raft_log_file_ops, C.log, &b, err, errn);
     if (!C.r) {
@@ -2572,25 +2757,55 @@ static void on_hb(struct conn *c, struct rd *r)
     }
     uint64_t now = iso_now_ns();
     heard_set(node, now, inc, applied, addr, peer);
-    heard_sections(heard_get(node), r, now);
+    struct heard *h = heard_get(node);
+    h->send_ns = 0; /* this heartbeat's own, or none */
+    heard_sections(h, r, now);
     if (r->bad) { /* a malformed section: the link is dropped, as for any broken frame */
         c->dead = 1;
         return;
     }
+    /* the lease (§7.1): only the Raft leader grants, and only while its own lease from the core holds (check-quorum:
+     * no other Raft leader can exist before it ends), so an answer is never given after a new Raft leader began its
+     * wait of one lease */
+    uint64_t until = h->send_ns ? core_lease_until(now) : 0;
+    int granted = until != 0;
+    if (granted && until != UINT64_MAX && now >= until) /* only the mutants can: test_cluster lease looks for it */
+        say("BUG: grants node %" PRIu32 " a lease %" PRIu64 " ms past the end of its own (term %" PRIu64 ")", node,
+            (uint64_t)((now - until) / MS), raft_get_term(C.r));
+    if (granted)
+        h->answered_ns = now;
+    const struct meta_settings *s = settings();
     frame_begin(&C.fb, F_HB_ACK);
     put32(&C.fb, C.r ? raft_get_leader(C.r) : 0);
     put64(&C.fb, C.r ? raft_get_term(C.r) : 0);
     put64(&C.fb, C.r ? raft_get_commit(C.r) : 0);
+    put64(&C.fb, h->send_ns);
+    put8(&C.fb, (uint8_t)granted);
+    put32(&C.fb, s->lease_ms);
+    put32(&C.fb, s->drift_ppm);
     frame_end(&C.fb);
     conn_send(c, 0);
 }
 
-static void on_hb_ack(struct rd *r)
+static void on_hb_ack(struct conn *c, struct rd *r)
 {
     uint32_t leader = get32(r);
     uint64_t term = get64(r), commit = get64(r);
-    if (r->bad || term < C.hint_term)
+    uint64_t echo = get64(r);
+    uint8_t granted = get8(r);
+    uint32_t lease_ms = get32(r), drift = get32(r);
+    if (r->bad)
         return;
+    /* the lease: from the Raft leader itself, about a heartbeat this server sent (its own clock, echoed), and never
+     * from a leader of a term older than one this server heard of (a deposed leader answering heartbeats it had
+     * queued while it was stopped) */
+    uint64_t now = iso_now_ns();
+    uint64_t known = C.r && raft_get_term(C.r) > C.hint_term ? raft_get_term(C.r) : C.hint_term;
+    if (term < known)
+        return;
+    int from_leader = granted && leader && leader == c->id;
+    if ((from_leader || (cl_mutant() == CLM_LEASEANYVOTER && c->id)) && echo && echo <= now && drift < 1000000)
+        lease_extend(cluster_lease_end(echo, lease_ms, drift));
     if (term > C.hint_term || leader)
         C.hint_leader = leader;
     /* the highest commit any voter reported in this term: what the watch stream must reach (watch_duty) */
@@ -2753,7 +2968,7 @@ static void copy_done(struct dres *r)
 }
 
 /* what a member's heartbeat last reported (the sections), after its line of the status */
-static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now)
+static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, int self)
 {
     put8(b, h && h->have_flags ? h->flags : 0);
     put8(b, h ? h->core_dropped : 0);
@@ -2782,6 +2997,18 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now)
         putstr(b, h->doms[i].name);
         put8(b, h->doms[i].state);
     }
+    put32(b, h ? h->nunreach : 0);
+    for (uint32_t i = 0; h && i < h->nunreach; i++) {
+        put32(b, h->unreach[i].node);
+        put32(b, h->unreach[i].age_ms);
+    }
+    put64(b, h && h->answered_ns ? since(now, h->answered_ns) / MS : UINT64_MAX);
+    int64_t left = 0;
+    if (self) {
+        uint64_t m = mono_ns(), until = atomic_load(&g_lease_ns);
+        left = until > m ? (int64_t)((until - m) / MS) : -(int64_t)((m - until) / MS) - 1;
+    }
+    put64(b, (uint64_t)left);
 }
 
 static void put_status(struct buf *b)
@@ -2804,7 +3031,7 @@ static void put_status(struct buf *b)
         put32(b, C.id);
         put64(b, 0);
         put64(b, C.incarnation);
-        put_heard_extra(b, heard_get(C.id), now);
+        put_heard_extra(b, heard_get(C.id), now, 1);
     }
     for (size_t i = 0; i < C.nheard; i++) {
         if (C.heard[i].id == C.id)
@@ -2812,7 +3039,7 @@ static void put_status(struct buf *b)
         put32(b, C.heard[i].id);
         put64(b, (since(now, C.heard[i].ns)) / MS);
         put64(b, C.heard[i].inc);
-        put_heard_extra(b, &C.heard[i], now);
+        put_heard_extra(b, &C.heard[i], now, 0);
     }
     if (S->applied || S->config_len) {
         uint8_t *img;
@@ -3413,7 +3640,7 @@ static void on_frame(struct conn *c, uint8_t type, const uint8_t *p, size_t n)
     switch (type) {
     case F_RAFT: on_raft(c, &r); break;
     case F_HB: on_hb(c, &r); break;
-    case F_HB_ACK: on_hb_ack(&r); break;
+    case F_HB_ACK: on_hb_ack(c, &r); break;
     case F_WATCH: {
         uint64_t from = get64(&r);
         if (r.bad || !C.have_node)
@@ -3572,7 +3799,7 @@ static uint8_t my_flags(void)
     return f;
 }
 
-static void put_sections(struct buf *b)
+static void put_sections(struct buf *b, uint64_t now)
 {
     size_t at = sec_begin(b, HBS_NODE);
     put8(b, my_flags());
@@ -3616,6 +3843,18 @@ static void put_sections(struct buf *b)
         put8(b, rep.doms[i].state);
     }
     sec_end(b, at);
+    at = sec_begin(b, HBS_LEASE);
+    put64(b, now);
+    sec_end(b, at);
+    if (rep.nunreach > CLUSTER_REPORT_UNREACH)
+        rep.nunreach = 0;
+    at = sec_begin(b, HBS_UNREACH);
+    put32(b, rep.nunreach);
+    for (uint32_t i = 0; i < rep.nunreach; i++) {
+        put32(b, rep.unreach[i].node);
+        put32(b, rep.unreach[i].age_ms);
+    }
+    sec_end(b, at);
 }
 
 static void heartbeat(uint64_t now)
@@ -3627,14 +3866,21 @@ static void heartbeat(uint64_t now)
         cfg = *raft_get_config(C.r);
     else if (!config_of(&C.sm, &cfg))
         return;
+    if (!loop_alive(now))
+        return; /* the serving loop hangs: this server is not heard, not even by itself, and its lease runs out */
     heard_set(C.id, now, C.incarnation, C.sm.applied, C.adv, C.padv);
+    if (core_lease_until(now)) { /* the Raft leader's own lease */
+        const struct meta_settings *s = settings();
+        heard_get(C.id)->answered_ns = now;
+        lease_extend(cluster_lease_end(now, s->lease_ms, s->drift_ppm));
+    }
     frame_begin(&C.fb, F_HB);
     put32(&C.fb, C.id);
     put64(&C.fb, C.incarnation);
     put64(&C.fb, C.sm.applied);
     putstr(&C.fb, C.adv);
     putstr(&C.fb, C.padv); /* a restart may have moved it (another port, another host) */
-    put_sections(&C.fb);
+    put_sections(&C.fb, now);
     {
         /* this server's own record of itself: the same sections, read back as a peer would */
         struct rd me = {C.fb.p + 4 + 1, C.fb.len - 4 - 1, 0, 0};
@@ -3686,12 +3932,28 @@ static void propose_member(uint32_t id, int state, uint64_t inc, struct heard *h
     }
 }
 
+/* The earliest time (this server's clock) at which a promotion away from server `id` is safe: one lease with the drift
+ * margin after the last answer that extended its lease, and never before one lease into this leadership (an earlier
+ * Raft leader's answers are unknown here). For r3e-failover; member_states marks no server down before it. */
+static uint64_t promote_safe_ns(uint32_t id)
+{
+    const struct meta_settings *s = settings();
+    const struct heard *h = heard_get(id);
+    uint64_t a = C.leader_since;
+    if (h && h->answered_ns > a)
+        a = h->answered_ns;
+    return cluster_lease_safe(a, s->lease_ms, s->drift_ppm);
+}
+
 static void member_states(uint64_t now)
 {
     const struct meta_settings *s = settings();
     uint64_t to = (uint64_t)s->node_timeout_ms * MS;
-    if (since(now, C.leader_since) < to)
-        return; /* a new leader does not know when the others last heard from anyone */
+    uint64_t wait = cluster_lease_safe(0, s->lease_ms, s->drift_ppm);
+    if (cl_mutant() == CLM_NOPROMOTEWAIT)
+        wait = 0;
+    if (since(now, C.leader_since) < (wait > to ? wait : to))
+        return; /* a new leader does not know when the others last heard from anyone, nor the leases given before */
     for (uint32_t i = 0; i < C.sm.nmembers && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
         const struct meta_member *m = &C.sm.members[i];
         if (m->state == META_OUT || m->state == META_DRAINING || pend_member(m->id))
@@ -3710,7 +3972,7 @@ static void member_states(uint64_t now)
                                       (!h->moved_ns || since(now, h->moved_ns) >= to)
                                   ? h
                                   : NULL;
-        if (st == META_UP && !fresh)
+        if (st == META_UP && !fresh && (cl_mutant() == CLM_NOPROMOTEWAIT || now >= promote_safe_ns(id)))
             propose_member(id, META_DOWN, minc, NULL, now);
         else if (fresh && inc >= minc && (st == META_DOWN || inc > minc))
             propose_member(id, META_UP, inc, moved, now);
@@ -4249,6 +4511,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.feed, sizeof C.feed, "%s", cfg->power_feed);
     snprintf(C.bmc, sizeof C.bmc, "%s", cfg->bmc);
     C.witness = cfg->witness != 0;
+    C.loop_gated = cfg->loop_gated != 0;
     C.rb_off = cfg->read_barrier_off != 0;
     memcpy(C.secret, cfg->secret, cfg->secret_len);
     C.secret_len = cfg->secret_len;

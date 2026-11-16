@@ -49,7 +49,8 @@
 #include <stdint.h>
 
 #define PL_CL_MAGIC 0x43445354u /* "TSDC": the cluster HELLO's magic (cluster.c) */
-#define PL_CL_VERSION 4         /* the cluster protocol version; 4 adds the link kind to HELLO */
+#define PL_CL_VERSION 5         /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
+                                 * HB and HB_ACK (r3e-leases) */
 
 enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2 };
 

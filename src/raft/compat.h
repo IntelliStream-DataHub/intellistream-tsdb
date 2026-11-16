@@ -91,7 +91,7 @@ int iso_fsync_parent(const char *path);
 extern ssize_t (*iso_pwrite_hook)(int fd, const void *buf, size_t len, uint64_t off);
 #endif
 
-/* CLOCK_MONOTONIC in nanoseconds. */
+/* CLOCK_BOOTTIME (where it exists, else CLOCK_MONOTONIC) in nanoseconds: a monotonic clock that runs through a suspend. */
 uint64_t iso_now_ns(void);
 
 /* xoshiro256**, seeded through SplitMix64 */
