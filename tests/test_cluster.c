@@ -30,6 +30,7 @@
  */
 #define _GNU_SOURCE
 #include "cluster.h"
+#include "cvol_check.h"
 #include "harness.h"
 #include "meta.h"
 #include "peerlink.h"
@@ -2770,6 +2771,126 @@ static void scen_links(void)
     printf("  data links: refused without a peerlink, for a non-member, a wrong identity or uuid; a member's come up\n");
 }
 
+/* replicate: a volume of 3 replicas with the replication driver (server/repld.c; no TSDB_CLUSTER_WRITES): the leader
+ * promotes itself once its EPOCH marker is committed, takes writes, and every replica holds the same rows. */
+static const char *const rep_names[] = {"pump1.flow", "pump2.flow", "pump3.big"};
+#define REP_NAMES 3
+
+/* waits until the leader takes a series creation in vol (it is still promoting: UNAVAILABLE) */
+static tsdb_sid rep_series(tsdbc *c, const char *name, const char *vol, int ms)
+{
+    uint64_t t0 = now_ms();
+    for (;;) {
+        tsdb_sid id = 0;
+        int rc = tsdbc_series_at(c, name, vol, &id);
+        if (rc == 0)
+            return id;
+        if (rc != TSDB_ERR_UNAVAILABLE || now_ms() - t0 > (uint64_t)ms)
+            die("series %s in %s: %s", name, vol, ers(rc));
+        struct timespec ts = {0, 20000000};
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* every server's copy of volume 1, read in-process after a clean stop: the same rows and digests, `want` rows each */
+static void rep_same(const uint64_t *want, const char *what)
+{
+    uint64_t rows[3][REP_NAMES], h[3][REP_NAMES];
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX + 80], v[PATH_MAX + 120];
+        server_dir(i, dir, sizeof dir);
+        snprintf(v, sizeof v, "%s/v1", dir);
+        int rc = cvol_digest(v, rep_names, REP_NAMES, rows[i], h[i]);
+        if (rc != 0)
+            die("%s: open %s read-only: %s", what, v, ers(rc));
+        for (int k = 0; k < REP_NAMES; k++) {
+            if (rows[i][k] != want[k])
+                die("%s: server %d holds %" PRIu64 " rows of %s, not %" PRIu64, what, i, rows[i][k], rep_names[k],
+                    want[k]);
+            if (i && h[i][k] != h[0][k])
+                die("%s: server %d's rows of %s differ from server 0's", what, i, rep_names[k]);
+        }
+    }
+}
+
+static void scen_replicate(void)
+{
+    scenario("replicate");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id[REP_NAMES];
+    for (int k = 0; k < REP_NAMES; k++)
+        id[k] = rep_series(c, rep_names[k], "plant", 30000);
+    uint64_t n[REP_NAMES] = {0, 0, 0};
+    /* small writes, one row each: the log stream and the commit point */
+    for (int j = 0; j < 200; j++) {
+        int64_t ts = 1000 + 1000LL * j;
+        float val = (float)j;
+        if ((rc = tsdbc_insert_series(c, id[0], &ts, &val, 1)) != 0)
+            die("small insert %d: %s", j, ers(rc));
+        n[0]++;
+    }
+    {
+        int64_t ts[3] = {1000, 2000, 3000};
+        float val[3] = {1, 2, 3};
+        if ((rc = tsdbc_insert_series(c, id[1], ts, val, 3)) != 0)
+            die("insert of 3 rows: %s", ers(rc));
+        n[1] += 3;
+    }
+    /* a large insert (straight to parts: shipped on the bulk link, staged, committed by a marker) */
+    {
+        enum { BIG = 100000 };
+        int64_t *ts = malloc(BIG * sizeof *ts);
+        float *val = malloc(BIG * sizeof *val);
+        if (!ts || !val)
+            die("out of memory");
+        for (int j = 0; j < BIG; j++)
+            ts[j] = 1000 + 1000LL * j, val[j] = (float)(j % 977);
+        if ((rc = tsdbc_insert_series(c, id[2], ts, val, BIG)) != 0)
+            die("large insert: %s", ers(rc));
+        n[2] += BIG;
+        /* a delete, and a replace of a range by fewer rows */
+        if ((rc = tsdbc_delete_range(c, id[2], 1000 + 1000LL * 100, 1000 + 1000LL * 200)) != 0)
+            die("delete: %s", ers(rc));
+        for (int j = 0; j < 10; j++)
+            ts[j] = 1000 + 1000LL * (500 + 7 * j), val[j] = -1;
+        tsdb_values tv = {TSDB_FLOAT32, val, NULL};
+        if ((rc = tsdbc_replace_range(c, id[2], 1000 + 1000LL * 500, 1000 + 1000LL * 600, ts, &tv, 10)) != 0)
+            die("replace: %s", ers(rc));
+        n[2] = (uint64_t)rows_of(c, id[2]); /* the replicas must hold what the leader answers */
+        if (n[2] >= BIG - 100)
+            die("the delete and the replace removed nothing: %" PRIu64 " rows", n[2]);
+        free(ts);
+        free(val);
+    }
+    for (int k = 0; k < REP_NAMES; k++)
+        if ((uint64_t)rows_of(c, id[k]) != n[k])
+            die("the leader reads %d rows of %s, not %" PRIu64, rows_of(c, id[k]), rep_names[k], n[k]);
+    tsdbc_close(c);
+    printf("  the leader promoted itself and took small and large writes, a delete and a replace\n");
+    stop_all();
+    rep_same(n, "small writes");
+    printf("  every replica holds the leader's rows after a clean stop\n");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -2799,7 +2920,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}};
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;

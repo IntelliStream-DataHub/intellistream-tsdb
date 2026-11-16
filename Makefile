@@ -800,10 +800,14 @@ META_SOAK_SECONDS ?= 30
 META_SOAK_FIRST   ?= 1000
 # tsdbd --cluster end to end: five servers, init, node add, a leader killed and restarted (the cluster thread polls:
 # one run covers both IO backends)
-$(B)/test_cluster: tests/test_cluster.c tests/harness.h server/cluster.h server/meta.h server/peerlink.h $(CLUSTER_OBJ) $(B)/tsdb_crypto.o \
-    $(B)/libtsdbclient.a $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
-	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) \
-	    $(ZSTD_LIB) -lpthread -lm
+# cvol_check.o opens a replica directory in-process (the engine's headers; test_cluster speaks the client's)
+$(B)/cvol_check.o: tests/cvol_check.c tests/cvol_check.h src/internal.h src/feed.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -Itests -c -o $@ $<
+$(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h server/peerlink.h \
+    $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB) \
+    $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
+	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
+	    $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(ZSTD_LIB) -lpthread -lm
 meta-mutants: $(B)/test_meta_mut
 	tests/meta_mutants.sh $(B)/test_meta_mut
 meta-soak: $(B)/test_meta
