@@ -3162,6 +3162,293 @@ static void scen_replfail(void)
     printf("  a replica whose engine failed stops that volume only, reports it LOCAL_FAULT and stops cleanly\n");
 }
 
+/* crashfs is preloaded into these scenarios' servers: 0 when it can be, else why not (printed as the skip) */
+static const char *crashfs_skip(const char **so)
+{
+    *so = getenv("CRASHFS_SO") ? getenv("CRASHFS_SO") : "./build/libcrashfs.so";
+#if defined(__SANITIZE_ADDRESS__)
+    return "crashfs cannot be preloaded into an AddressSanitizer build";
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    return "crashfs cannot be preloaded into an AddressSanitizer build";
+#endif
+#endif
+    if (access(*so, F_OK) != 0) {
+#ifdef __linux__
+        die("no %s (make build/libcrashfs.so): the scenario cannot run, and must not pass as skipped", *so);
+#else
+        return "no libcrashfs.so";
+#endif
+    }
+    return NULL;
+}
+
+/* the heartbeat of server R reports volume num LOCAL_FAULT to the others within 10 s */
+static void await_local_fault(int R, uint32_t num, int nserv)
+{
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(100000))
+        for (int i = 0; i < nserv; i++) {
+            struct view vw;
+            if (i == R || pids[i] <= 0)
+                continue;
+            view(i, &vw);
+            int fault = 0;
+            for (uint32_t k = 0; k < vw.st.nheard; k++)
+                if (vw.st.heard[k].id == ids[R])
+                    for (uint32_t j = 0; j < vw.st.heard[k].nvols; j++)
+                        fault |= vw.st.heard[k].vols[j].v.volume == num &&
+                                 vw.st.heard[k].vols[j].v.health == CL_HEALTH_LOCAL_FAULT;
+            view_free(&vw);
+            if (fault)
+                return;
+        }
+    die("server %d's heartbeat never reported volume %" PRIu32 " LOCAL_FAULT", R, num);
+}
+
+/* ackdurable (M6, design 5.1: a write is committed once it is durable on every member of the ISR): writes are
+ * acknowledged, then the power fails (crashfs: what was never synced is gone) on both replicas at their next
+ * append and then on the leader. Each replica, restarted with the leader still down (so it cannot catch up from the
+ * leader) and stopped cleanly, holds every acknowledged row, read in-process and read-only. Two witnesses keep the
+ * metadata group's quorum while the data nodes are down, and learn the restarted replicas' new peer ports.
+ * TSDB_REPLD_MUTANT=ackbeforesync (a replica reports its written end as durable without a sync) fails it. */
+static void scen_ackdurable(void)
+{
+    scenario("ackdurable");
+    const char *so, *skip = crashfs_skip(&so);
+    if (skip) {
+        printf("  skipped: %s\n", skip);
+        return;
+    }
+    static char pe[3][PATH_MAX * 2 + 128];
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX + 80];
+        server_dir(i, dir, sizeof dir);
+        if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+            die("mkdir %s: %s", dir, strerror(errno));
+        snprintf(pe[i], sizeof pe[i], "LD_PRELOAD=%s CRASHFS_ROOT=%s", so, dir);
+        penv[i] = pe[i];
+    }
+    for (int i = 3; i < 5; i++) {
+        is_witness[i] = 1;
+        xargs[i] = "--peer-port 0"; /* a witness takes the peer port 7071 unless told */
+        char wdir[PATH_MAX + 80];
+        server_dir(i, wdir, sizeof wdir); /* no --dir makes it; the state directory goes inside */
+        if (mkdir(wdir, 0755) != 0)
+            die("mkdir %s: %s", wdir, strerror(errno));
+    }
+    for (int i = 0; i < 5; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters, two of them witnesses");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    enum { ACKED = 40 };
+    for (int j = 0; j < ACKED; j++) {
+        int64_t ts = 1000 + 1000LL * j;
+        float val = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d with every replica up: %s", j, ers(rc));
+    }
+    tsdbc_close(c);
+    /* at once (a replica's flush would make the rows durable in a part): the power fails at each replica's next
+     * tracked operation, the append of the next write, which therefore is never acknowledged */
+    int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
+    signal_child(pids[R1], SIGUSR2);
+    signal_child(pids[R2], SIGUSR2);
+    struct rep_writer w1 = {cports[L], id, 1000 + 1000LL * ACKED, 1, 0, 0, 0};
+    pthread_t th1, th2;
+    if (pthread_create(&th1, NULL, rep_write_thread, &w1) != 0)
+        die("pthread_create");
+    for (int r = 0; r < 2; r++) {
+        int R = r ? R2 : R1, st = await_exit(R, 15000);
+        if (st != 99)
+            die("server %d ended with status %d after the power loss, expected 99 (crashfs)", R, st);
+    }
+    signal_child(pids[L], SIGUSR2); /* and the leader's, at its next append */
+    struct rep_writer w2 = {cports[L], id, 1000 + 1000LL * (ACKED + 1), 1, 0, 0, 0};
+    if (pthread_create(&th2, NULL, rep_write_thread, &w2) != 0)
+        die("pthread_create");
+    int st = await_exit(L, 15000);
+    if (st != 99)
+        die("server %d (the leader) ended with status %d after the power loss, expected 99 (crashfs)", L, st);
+    pthread_join(th1, NULL);
+    pthread_join(th2, NULL);
+    if (w1.rc == 0 || w2.rc == 0)
+        die("a write was acknowledged with both replicas down");
+    /* one at a time: a restarted server has a new peer port, which it tells the group (the witnesses) */
+    int R[2] = {R1, R2};
+    for (int r = 0; r < 2; r++) {
+        start(R[r]);
+        await_open_gen(3, "plant", R[r], 2, 0);
+    }
+    for (int r = 0; r < 2; r++)
+        stop(R[r], SIGTERM);
+    for (int r = 0; r < 2; r++) {
+        char dir[PATH_MAX + 80], vd[PATH_MAX + 120];
+        server_dir(R[r], dir, sizeof dir);
+        snprintf(vd, sizeof vd, "%s/v1", dir);
+        uint64_t rows, h;
+        if ((rc = cvol_digest(vd, rep_names, 1, &rows, &h)) != 0)
+            die("open %s read-only: %s", vd, ers(rc));
+        if (rows < ACKED || rows > ACKED + 2)
+            die("after a power loss replica %d holds %" PRIu64 " rows, %d were acknowledged (at most 2 more were sent)",
+                R[r], rows, ACKED);
+    }
+    stop_all();
+    printf("  %d acknowledged writes survive a power loss of both replicas and then of the leader, on each replica\n",
+           ACKED);
+}
+
+/* a write on its own connection; afterwards `after` is what a lookup in the root on that same connection gave */
+struct wf_writer {
+    tsdbc *c;
+    tsdb_sid id;
+    int64_t ts;
+    int rc, after, done;
+};
+static void *wf_write_thread(void *a)
+{
+    struct wf_writer *w = a;
+    int64_t ts = w->ts;
+    float val = 5;
+    w->rc = tsdbc_insert_series(w->c, w->id, &ts, &val, 1);
+    tsdb_sid any;
+    w->after = tsdbc_series(w->c, "writerfail.none", 0, &any);
+    __atomic_store_n(&w->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* writerfail (M5, D13 on the writer): the leader's engine fails (crashfs: EIO on its next fdatasync of a wal_ file:
+ * a second write's) while a write waits for a paused replica. The driver deposes the writer: the outcome of both
+ * writes is unknown (each went to the replicas), so their connections close without an answer (D12); the volume answers UNAVAILABLE from then on (quiesced: clients go to its
+ * next leader); the server reports the volume LOCAL_FAULT, answers in its root, keeps its vote and its other
+ * volumes (a later volume add commits and opens there) and stops cleanly. TSDB_REPLD_MUTANT=nodepose and noquiesce
+ * fail it. */
+static void scen_writerfail(void)
+{
+    scenario("writerfail");
+    const char *so, *skip = crashfs_skip(&so);
+    if (skip) {
+        printf("  skipped: %s\n", skip);
+        return;
+    }
+    static char pe[3][PATH_MAX * 3 + 256];
+    static char mark[3][PATH_MAX + 80];
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX + 80];
+        server_dir(i, dir, sizeof dir);
+        if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+            die("mkdir %s: %s", dir, strerror(errno));
+        snprintf(mark[i], sizeof mark[i], "%s/eio-n%d", base, i);
+        snprintf(pe[i], sizeof pe[i],
+                 "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_MODE=eio CRASHFS_EIO_ONLY=wal_ CRASHFS_EIO_ON=fdatasync "
+                 "CRASHFS_MARK=%s",
+                 so, dir, mark[i]);
+        penv[i] = pe[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    int R1 = (L + 1) % 3;
+    pause_server(R1, 1); /* the commit point stops below the next write (the other replica keeps the lease) */
+    struct wf_writer w[2] = {{client(L), id, 5000, 0, 0, 0}, {client(L), id, 6000, 0, 0, 0}};
+    pthread_t th[2];
+    if (pthread_create(&th[0], NULL, wf_write_thread, &w[0]) != 0)
+        die("pthread_create");
+    struct timespec ms300 = {0, 300000000};
+    nanosleep(&ms300, NULL);
+    if (__atomic_load_n(&w[0].done, __ATOMIC_ACQUIRE))
+        die("a write with a replica paused was answered: %s", ers(w[0].rc));
+    signal_child(pids[L], SIGUSR2); /* crashfs: the leader's next fdatasync of a wal_ file (w[1]'s) fails with EIO */
+    if (pthread_create(&th[1], NULL, wf_write_thread, &w[1]) != 0)
+        die("pthread_create");
+    uint64_t t0 = now_ms();
+    while (access(mark[L], F_OK) != 0) {
+        if (now_ms() - t0 > 30000)
+            die("no fdatasync of server %d's log failed in 30 s", L);
+        usleep(20000);
+    }
+    static const char *const which[2] = {"waiting for the commit point", "whose sync failed"};
+    for (int k = 0; k < 2; k++) {
+        for (t0 = now_ms(); !__atomic_load_n(&w[k].done, __ATOMIC_ACQUIRE); usleep(20000))
+            if (now_ms() - t0 > 10000)
+                die("the write %s on the failed writer was not ended in 10 s (the writer was not deposed)", which[k]);
+        pthread_join(th[k], NULL);
+        if (w[k].rc != TSDB_ERR_IO || w[k].after != TSDB_ERR_IO)
+            die("the write %s on the failed writer got %d (%s), then its connection %d (%s): not a closed connection",
+                which[k], w[k].rc, ers(w[k].rc), w[k].after, ers(w[k].after));
+        tsdbc_close(w[k].c);
+    }
+    if (await_exit(L, 1000) >= 0)
+        die("server %d exited on its cluster volume's engine failure (D13: only the volume stops)", L);
+    pause_server(R1, 0);
+    /* the failed volume: UNAVAILABLE for writes and reads; the root answers */
+    tsdbc *c2 = client(L);
+    ts = 7000;
+    if ((rc = tsdbc_insert_series(c2, id, &ts, &val, 1)) != TSDB_ERR_UNAVAILABLE)
+        die("a write to the failed volume: %s, not UNAVAILABLE", ers(rc));
+    tsdb_points p;
+    if ((rc = tsdbc_query_points(c2, id, INT64_MIN, INT64_MAX, &p)) != TSDB_ERR_UNAVAILABLE)
+        die("a read of the failed volume: %s, not UNAVAILABLE", ers(rc));
+    tsdb_sid any;
+    if ((rc = tsdbc_series(c2, "writerfail.none", 0, &any)) != TSDB_ERR_NOTFOUND)
+        die("a lookup in server %d's root after its volume failed: %s", L, ers(rc));
+    tsdbc_close(c2);
+    tsdbc_close(c);
+    await_local_fault(L, num, 3);
+    /* its vote and its other volumes: a volume added now commits (L is one of three voters) and opens on L too */
+    struct view vw;
+    view(L, &vw);
+    int voter = is_voter(&vw, ids[L]);
+    view_free(&vw);
+    if (!voter)
+        die("server %d is no voter after its volume failed", L);
+    if ((rc = vol_add((L + 2) % 3, "second", 3, &num)) != 0 || num != 2)
+        die("volume add second: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen((L + 2) % 3, "second", i, 1, 0);
+    stop(L, SIGTERM); /* a clean stop: the failed volume is no failure of the server */
+    stop_all();
+    printf("  a leader whose engine failed closes the connections of the writes in flight, answers UNAVAILABLE for "
+           "the volume, keeps its root, its vote and its other volumes and stops cleanly\n");
+}
+
 /* ------------------------------------------------------------ leases (§7.1) and the serving loop's stamp (§6.1) */
 
 /* a read on c by `kind` % 3: QUERY_RAW, QUERY_LATEST or QUERY_MULTI (the two ids paths of the lease check) */
@@ -3609,7 +3896,8 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail},
+               {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {

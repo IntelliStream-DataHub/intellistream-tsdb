@@ -39,10 +39,12 @@
  *
  * Mutants (TSDB_REPLD_MUTANT, tests only; NOTES of r3d-stream says which test catches each): `commitbyleader` commits
  * at the writer's own durable end, `ackbeforesync` has a follower report its written end as durable without a sync,
- * `floornotsaved` skips the REPL file's SAVE. Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
- * bulk file this process receives taken as staged but not kept, so its COMMIT marker finds the file missing and
- * FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER (writes then reach
- * the new writer while the driver still promotes: they must be refused for a retry, never depose it).
+ * `floornotsaved` skips the REPL file's SAVE, `nodepose` never deposes a failed writer, `noquiesce` leaves a failed
+ * volume's engine reachable (D13; test_cluster writerfail catches both). Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]:
+ * `dropbulk` has the first bulk file this process receives taken as staged but not kept, so its COMMIT marker finds
+ * the file missing and FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER
+ * (writes then reach the new writer while the driver still promotes: they must be refused for a retry, never depose
+ * it).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -129,7 +131,7 @@ struct rvol {
     struct jr_ops ops;
 };
 
-enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED };
+enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_NODEPOSE, RM_NOQUIESCE };
 
 static struct {
     pthread_mutex_t mu;
@@ -797,7 +799,7 @@ static void vol_fail(struct rvol *rv, const char *why)
     rv->failed = 1;
     say("volume %" PRIu32 ": stopped: %s", rv->number, why);
     struct eng *db = tsdb_cvol_ref(G.t, rv->number);
-    if (db && rv->mode == M_WRITER)
+    if (db && rv->mode == M_WRITER && G.mutant != RM_NODEPOSE)
         eng_leader_depose(db);
     tsdb_cvol_unref(&db);
 }
@@ -1272,6 +1274,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "commitbyleader") ? RM_COMMITBYLEADER
                : !strcmp(mu, "ackbeforesync")  ? RM_ACKBEFORESYNC
                : !strcmp(mu, "floornotsaved")  ? RM_FLOORNOTSAVED
+               : !strcmp(mu, "nodepose")       ? RM_NODEPOSE
+               : !strcmp(mu, "noquiesce")      ? RM_NOQUIESCE
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1481,7 +1485,7 @@ int repld_engine_failed(uint32_t v, const char *msg)
     int first = !rv->failed;
     vol_fail(rv, msg && msg[0] ? msg : "the engine failed"); /* deposes a writer before the quiesce hides its engine */
     pthread_mutex_unlock(&rv->mu);
-    if (first)
+    if (first && G.mutant != RM_NOQUIESCE)
         tsdb_volume_quiesce(G.t, v); /* clients get UNAVAILABLE and go to the volume's next leader */
     return 1;
 }
