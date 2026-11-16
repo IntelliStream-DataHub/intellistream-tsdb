@@ -131,10 +131,16 @@ cgroup, so `nice` does not keep your work out of its way.
 - `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable. Nothing that holds `buf_lock` may touch a large block of fresh memory (the series array is a lazily touched
   mapping, `mt_s_grow`), and big buffers freed on the flush path go through `tsdb_free_big` (`src/compat.h`): a `munmap`
   or a memset of tens of MB stalls every append and lookup for ms (`tests/test_flush_tail.c`). `src/fno.c`: the `FNO` file (the
-  durable bound of the WAL's log numbers). `src/replfile.c`: a replica directory's REPL file (rid, open generation,
-  fence, `led`, epoch history, log start, commit floor; FNO's two-slot scheme; a load with one bad slot is "unsure": the
+  durable bound of the WAL's log numbers). `src/replfile.c`: a replica directory's REPL file (rid, open generation and its
+  nonce (format 2), fence, `led`, epoch history, log start, commit floor; FNO's two-slot scheme; a load with one bad slot is "unsure": the
   open generation skips a belt and the caller takes fence, `led` and log start from the metadata group, never from the
-  surviving slot; `tests/test_replfile.c`, `fuzz_repl`). `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
+  surviving slot (the `unsure` flag is stored by the next save and cleared only by one with `led` = `fence`: a restart does not make the older
+  slot's values trusted); `tests/test_replfile.c`, `fuzz_repl`). tsdbd's volume manager keeps its replicas' open generation and
+  nonce in it: `server/cvolfs.c` (make `v<N>`: META, REPL, FNO in `v<N>.tmp`, renamed; load, check and raise REPL at every
+  open; a missing, unreadable or CORRUPT REPL, another identity and a failed save refuse the volume with a line naming the
+  path; `tests/test_cvolfs.c`: power loss at every step under crashfs, mutants `nosync nodirsync nononce trustunsure tornstale samerid`,
+  also settable as `TSDB_CVOL_MUTANT` in tsdbd for `test_cluster volumes`), `server/cvol.c` the manager thread above it.
+  `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
   decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
 - `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
   per-partition vectors, the HyperLogLogs of active series, the hot lists (reads, writes, bytes per row) and the
@@ -391,7 +397,12 @@ cgroup, so `nice` does not keep your work out of its way.
   writes the new FEED before FNO is raised. Tests: `tests/test_feedstore.c`, `tests/test_cli_feed.sh`, `jepsen --feed`
   with `tests/jepsen/feedcheck.c`.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
-  only into partitions without a part from that segment.
+  only into partitions without a part from that segment: a replicated leader keeps its flushed
+  segments for the replicas (`eng_leader_keep`): one goes only once its last position is at or below min(the driver's
+  keep bound, the commit point), after `fno_require`, by its own name (`lk_unlink_upto`: kept numbers jump at a promotion,
+  so never through `wal_unlink_upto`'s run of consecutive ones); `wal_removed` never passes one still on disk.
+  Kept segments (a leader's flushed ones, a promoted replica's) are named in RSTATE (`kept`, saved before a drop can
+  take their rows out of parts): a writer's open neither replays nor removes a segment at or below it.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
@@ -456,6 +467,10 @@ cgroup, so `nice` does not keep your work out of its way.
   replace classifies a fresh series like a large insert. `CLASSES` is append-only (24-byte checksummed records),
   synced (and its directory, when new) before anything relies on a record, fail-stop on error, torn tail cut,
   loaded before the WAL replay.
+  On a replicated volume (design-cluster 5.4) a replica takes the leader's T exactly, so the leader's T lies past every
+  row any member may still replay (its WAL tails are pruned by the members' replay floor, never by its own removed
+  segments, and a switch waits while that floor is unknown or below its open), and the CLASS marker precedes the
+  CLASSES record inside the switch.
   `tsdb_part_info.partition` stays the base partition number (where the partition starts); `cls`, `start_ms`,
   `end_ms` say the rest. Tests that count parts per base partition or name `p<N>_` files set
   `partition_classes = 0`.

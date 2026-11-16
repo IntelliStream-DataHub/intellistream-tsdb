@@ -301,6 +301,11 @@ $(B)/test_replica: tests/test_replica.c src/replica.h src/internal.h $(LIB) $(CR
 $(B)/test_cvol: tests/test_cvol.c src/cvol.h src/replica.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+# the disk side of tsdbd's volume manager (server/cvolfs.c): make v<N>, REPL's open generation and nonce; power loss
+# at every step (crashfs); the mutant runs plant the bugs it guards against and must fail
+$(B)/test_cvolfs: tests/test_cvolfs.c server/cvolfs.c server/cvolfs.h src/replfile.h src/cvol.h src/internal.h $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -o $@ tests/test_cvolfs.c server/cvolfs.c $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+
 # the change feed's disk side (design-cdc.md step F1): FEED, requires=feed, retained segments, the cleaner
 $(B)/test_feedstore: tests/test_feedstore.c tests/jepsen/feedcheck.c src/internal.h src/feed.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_feedstore.c tests/jepsen/feedcheck.c $(LIB) $(LDLIBS)
@@ -318,7 +323,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
 	./$(B)/test_tsdb $(SCRATCH)
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched $(SCRATCH)
@@ -346,7 +351,9 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	for m in nosync sameslot nochecksum; do ! ./$(B)/test_replfile --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_replica $(SCRATCH)
 	./$(B)/test_cvol $(SCRATCH)
-	for m in applyall ackunsynced keepcut nofloor walclock nopos classat opensync gapcheck torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced; do ! ./$(B)/test_replica --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done
+	./$(B)/test_cvolfs $(SCRATCH)
+	for m in nosync nodirsync nononce trustunsure tornstale samerid; do ! ./$(B)/test_cvolfs --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	for m in applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off; do ! ./$(B)/test_replica --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done
 	./$(B)/test_feedstore $(SCRATCH)
 	tests/expect_fail.sh 'renamed before its data was synced' ./$(B)/test_feedstore --mutant noseal $(SCRATCH) # a replayed segment renamed without its fdatasync must fail it
 	tests/expect_fail.sh 'removed before the floor was durable' ./$(B)/test_feedstore --mutant latefloor $(SCRATCH) # the cleaner's floor set after its unlinks must fail it
@@ -842,9 +849,9 @@ meta-soak: $(B)/test_meta
 	./$(B)/test_meta $(SCRATCH) --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
 TSDBD_SRC := server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
-             server/cluster.h server/cvol.h server/cvol.c src/cvol.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
+             server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c src/cvol.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c \
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
 
 # A server with a bug planted in the Raft log (the copy in src/raft is upstream's and stays unedited, so the mutant is
@@ -878,7 +885,7 @@ endif
 # is always set).
 $(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                   $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c $(B)/tsdb_pack.o \
+	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c $(B)/tsdb_pack.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
@@ -953,7 +960,7 @@ $(B)/test_wire: tests/test_wire.c include/tsdb_wire.h $(CLIB)
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
 $(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                     $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c $(B)/tsdb_pack.o $(B)/users.o \
+	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c $(B)/tsdb_pack.o $(B)/users.o \
 	    $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)

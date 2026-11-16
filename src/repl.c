@@ -38,6 +38,8 @@ struct peer {
     uint64_t rid;       /* the instance its ACKs came from; 0: none yet in this epoch */
     uint64_t last_send, last_ack;
     uint64_t snap_sent; /* when it was last told to install a snapshot (its next position is not retained) */
+    uint64_t start;     /* the first position its log holds, from its last ACK in this epoch (heard: one came) */
+    int heard;
 };
 
 struct pending {
@@ -47,6 +49,7 @@ struct pending {
 struct repl {
     struct repl_config cfg;
     uint64_t rid, fence, led, floor_saved, floor_tick;
+    uint64_t start;     /* the first position this log still holds (repl_log_start; at least 1) */
     struct repl_epoch *hist;
     uint32_t nhist, chist;
     uint64_t written, durable, applied, commit, verified;
@@ -301,6 +304,7 @@ static void ack(struct repl *r, int resync)
         m->durable++;
     m->written = r->verified;
     m->rid = r->rid;
+    m->start = MUT(38) ? r->durable + 1 : r->start;
     m->resync = resync;
 }
 
@@ -717,6 +721,8 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
         p->match = m->durable;
     p->acked = m->written;
     p->last_ack = r->now;
+    p->start = m->start;
+    p->heard = 1;
     if (m->resync || !p->next)
         p->next = m->written + 1;
     advance(r);
@@ -760,6 +766,7 @@ static void on_fence(struct repl *r, const struct repl_msg *m)
     s->durable = r->durable;
     s->last_epoch = epoch_at(r, r->durable);
     s->rid = r->rid;
+    s->start = r->start;
 }
 
 void repl_recv(struct repl *r, const struct repl_msg *m)
@@ -967,10 +974,33 @@ struct repl *repl_open(const struct repl_config *cfg, const struct repl_durable 
         return r;
     }
     r->sync_end = r->written;
+    r->start = d->log_start > 1 ? d->log_start : 1;
     r->floor_saved = d->floor;
     apply_to(r, d->floor);
     r->commit = r->applied;
     return r;
+}
+
+void repl_log_start(struct repl *r, uint64_t start)
+{
+    if (start > r->start)
+        r->start = start;
+}
+
+uint64_t repl_replay_floor(const struct repl *r)
+{
+    if (!r->leading || r->failed)
+        return 0;
+    uint64_t l = r->start;
+    for (int i = 0; i < r->cfg.nnodes; i++) {
+        if (i == r->cfg.self)
+            continue;
+        if (!r->peer[i].heard && !MUT(39))
+            return 0; /* unknown: it may hold anything from an older epoch */
+        if (r->peer[i].heard)
+            l = min64(l, r->peer[i].start);
+    }
+    return l;
 }
 
 void repl_free(struct repl *r)

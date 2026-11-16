@@ -1135,7 +1135,8 @@ static void test_daycut_merge(const char *base)
 
 /* A switch while tsdb_drop_before's renames are not yet durable: the switch sees no rows of the series (their part
  * is no longer listed) and writes its class from the beginning of time, synced. A power loss before the drop's
- * directory fsync brings the part back under its old name. Emulated: the state such a power loss leaves. */
+ * directory fsync brings the part back under its old name. Emulated: the state such a power loss leaves. The bound
+ * is per series and ends with the fsync (cls_dropped_bound_locked; test_replica L1f checks both). */
 static void test_drop_switch(const char *base)
 {
     char dir[600], a[900], b[900];
@@ -1163,7 +1164,10 @@ static void test_drop_switch(const char *base)
     snprintf(cmd, sizeof cmd, "cp '%s' '%s'", a, b);
     CHECK(system(cmd) == 0);
     OK(eng_drop_before(db, db->partition_ms));
-    /* in the window between the drop's renames and its directory fsync: what cls_observe would do */
+    /* in the window between the drop's renames and its directory fsync: what cls_observe would do. The drop has
+     * synced its directory by now, which ends the bound its part sets (cls_dropped); the window is emulated by taking
+     * that fsync back */
+    atomic_store(&db->dsync_done, 0);
     OK(eng_class_switch(db, s, 3, NULL));
     OK(eng_series_class(db, s, &c));
     CHECK(c == 3);

@@ -742,11 +742,26 @@ void *merge_thread_main(void *arg)
     return NULL;
 }
 
-int eng_optimize(eng *db)
+static int optimize_where(eng *db, const int64_t *keys, size_t nkeys);
+
+int eng_optimize(eng *db) { return optimize_where(db, NULL, 0); }
+
+int eng_optimize_keys(eng *db, const int64_t *keys, size_t nkeys) { return optimize_where(db, keys, nkeys); }
+
+static bool key_in(const int64_t *keys, size_t n, int64_t key)
+{
+    for (size_t i = 0; i < n; i++)
+        if (keys[i] == key)
+            return true;
+    return false;
+}
+
+/* keys: only those partitions, and no flush first (a replica's purge before a CLASS record, classes.c cls_apply) */
+static int optimize_where(eng *db, const int64_t *keys, size_t nkeys)
 {
     if (db->opt.read_only)
         return TSDB_ERR_READONLY;
-    int rc = eng_flush(db);
+    int rc = keys ? 0 : eng_flush(db);
     if (rc)
         return rc;
     part *sel[MAX_MERGE_PARTS];
@@ -762,6 +777,8 @@ int eng_optimize(eng *db)
             for (j = i; j < db->nparts && db->parts[j]->partition == db->parts[i]->partition; j++)
                 damaged |= atomic_load(&db->parts[j]->damaged);
             if (partition_dropping(db, db->parts[i]->partition)) /* the drop retires it: nothing to optimize */
+                continue;
+            if (keys && !key_in(keys, nkeys, db->parts[i]->partition))
                 continue;
             if (damaged && (j - i >= 2 || rewrite_alone(db->parts[i]))) /* the call fails at the end */
                 skipped = true;

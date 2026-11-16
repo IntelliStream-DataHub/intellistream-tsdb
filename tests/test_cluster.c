@@ -2244,18 +2244,31 @@ static void slurp(const char *path, char *buf, size_t n)
     fclose(f);
 }
 
-/* the REPL file of server i's v<number>: rid and gen */
+/* the REPL file of server i's v<number>: rid and open generation of the slot with the newer file generation (the
+ * layout of src/replfile.c, which this test does not link: two 4 KiB slots, magic "DS_BREP2" at 0, generation at 8,
+ * rid at 72, open generation at 80; the checksum is the server's to check) */
 static void repl_of(int i, uint32_t number, uint64_t *rid, uint64_t *gen)
 {
-    char dir[PATH_MAX + 80], path[PATH_MAX + 160], buf[512];
+    char dir[PATH_MAX + 80], path[PATH_MAX + 160];
+    uint8_t pg[2][4096];
     server_dir(i, dir, sizeof dir);
     snprintf(path, sizeof path, "%s/v%" PRIu32 "/REPL", dir, number);
-    slurp(path, buf, sizeof buf);
-    char *r = strstr(buf, "rid="), *g = strstr(buf, "gen=");
-    if (!r || !g)
-        die("%s: no rid= or gen= in \"%s\"", path, buf);
-    *rid = strtoull(r + 4, NULL, 16);
-    *gen = strtoull(g + 4, NULL, 10);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        die("%s: %s", path, strerror(errno));
+    size_t got = fread(pg, 1, sizeof pg, f);
+    fclose(f);
+    if (got != sizeof pg)
+        die("%s: %zu bytes, not two slots", path, got);
+    uint64_t g[2];
+    for (int k = 0; k < 2; k++) {
+        memcpy(&g[k], pg[k] + 8, 8);
+        if (memcmp(pg[k], "DS_BREP2", 8) != 0)
+            die("%s: slot %d has no REPL magic", path, k);
+    }
+    int n = g[1] > g[0];
+    memcpy(rid, pg[n] + 72, 8);
+    memcpy(gen, pg[n] + 80, 8);
 }
 
 static int nrows;
@@ -2779,7 +2792,8 @@ static void scen_links(void)
         struct view v;
         view(1, &v);
         const struct meta_member *m = v.st.self ? meta_member(&v.m, v.st.self) : NULL;
-        if (m && m->ident[0]) {
+        static const uint8_t unknown[16]; /* zero: not known; a random ident may begin with a zero byte */
+        if (m && memcmp(m->ident, unknown, 16) != 0) {
             mid = m->id;
             memcpy(mident, m->ident, 16);
         }
