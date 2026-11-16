@@ -2205,7 +2205,8 @@ static void nap(useconds_t us, bool watch)
      * run does by the shim's own odds, only not left to chance: 1 of ~20 loaded runs of idle, and 1 of 10 of nap:600, had no
      * death in a long nap): the plug is pulled at the start of every nap of 400 ms or more, so that the server lies dead for
      * what is left of it, far above the dead bound */
-    if ((idle_mutant || idle_mutant_long || (nem_mutant && !strncmp(nem_mutant, "nap:", 4))) && !watch && us >= 400000 && atomic_load(&server_pid) > 1)
+    if ((idle_mutant || idle_mutant_long || (nem_mutant && !strncmp(nem_mutant, "nap:", 4))) && !watch && us >= 400000 && atomic_load(&server_pid) > 1 &&
+        !atomic_load(&nem_quiet)) /* a quiet nemesis does nothing, also a mutant: the tail's server is a clean one, which a SIGUSR2 kills */
         signal_pid(atomic_load(&server_pid), SIGUSR2);
     for (useconds_t t = 0; t < us && !atomic_load(&stop) && !atomic_load(&nem_stop) && !atomic_load(&nem_quiet); t += 5000) {
         pid_t pid = atomic_load(&server_pid);
