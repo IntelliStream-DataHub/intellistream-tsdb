@@ -24,6 +24,9 @@ void repld_update(const struct cluster_vol_rec *r);
 /* 1 while volume v is held here and failed (FAIL, a failed save, the engine's fail-stop): it is quiesced and reported
  * failed, the process goes on (DECISION D13). */
 int repld_failed(uint32_t v);
+/* Volume v's engine failed (eng_fail): 1 when the driver holds v (it stops and quiesces it, the process goes on, D13),
+ * 0 when v is no volume of the driver (tsdbd's own rules apply). */
+int repld_engine_failed(uint32_t v, const char *msg);
 /* Stops every driver thread and the links (before the handle is closed). */
 void repld_stop(void);
 

@@ -257,6 +257,9 @@ static void on_report(void *arg, struct cluster_report *out)
         v->open_nonce = m->nonce;
     }
     pthread_mutex_unlock(&M.mu);
+    for (uint32_t i = 0; i < out->nvols; i++) /* after M.mu: the driver's locks are never taken under it */
+        if (repld_failed(out->vols[i].volume))
+            out->vols[i].health = CL_HEALTH_LOCAL_FAULT;
 }
 
 int cvol_why(uint32_t v)

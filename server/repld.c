@@ -36,6 +36,10 @@
  *
  * rec_find answers from the driver's index of WAL record starts (fed by the leader's bytes and the replica's WRITEs,
  * built at open by reading the log), and (pos, 1) for a position the writer admitted but has not written yet.
+ *
+ * Mutants (TSDB_REPLD_MUTANT, tests only; NOTES of r3d-stream says which test catches each): `commitbyleader` commits
+ * at the writer's own durable end, `ackbeforesync` has a follower report its written end as durable without a sync,
+ * `floornotsaved` skips the REPL file's SAVE.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -118,6 +122,8 @@ struct rvol {
     struct jr_ops ops;
 };
 
+enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED };
+
 static struct {
     pthread_mutex_t mu;
     tsdb *t;
@@ -133,6 +139,7 @@ static struct {
     struct rvol *vols[CLUSTER_REPORT_VOLS];
     uint32_t nvols;
     uint64_t fileno;
+    int mutant; /* RM_*: tests only */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -496,6 +503,8 @@ static void op_synced(void *ctx, struct eng *db, uint64_t last)
     if (rv->core && last > rv->synced_rep) {
         rv->synced_rep = last;
         repl_synced(rv->core, last);
+        if (G.mutant == RM_COMMITBYLEADER)
+            eng_leader_commit(db, last);
         pthread_cond_signal(&rv->cv);
     }
     pthread_mutex_unlock(&rv->mu);
@@ -874,7 +883,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
         hist_cut(rv, a->pos);
         break;
     case REPL_A_SAVE:
-        rc = save_repl(rv, a->fence, a->led, a->floor);
+        rc = G.mutant == RM_FLOORNOTSAVED ? 0 : save_repl(rv, a->fence, a->led, a->floor);
         if (rc != 0) {
             vol_fail(rv, "the REPL file could not be saved");
             break;
@@ -1069,12 +1078,15 @@ static void do_sync(struct rvol *rv)
     struct eng *db = tsdb_cvol_ref(G.t, rv->number);
     if (!db)
         return;
+    int ab = G.mutant == RM_ACKBEFORESYNC && rv->mode == M_REPLICA; /* a follower's ACK, not a promotion's sync */
     pthread_mutex_unlock(&rv->mu);
-    int rc = replica_sync(db);
+    int rc = ab ? 0 : replica_sync(db);
     uint64_t d = replica_durable_end(db), w = replica_log_end(db);
     char name[RW_NAME_MAX + 1] = "";
     uint64_t size = 0;
     int missing = d < w && replica_missing(db, name, sizeof name, &size) == 1;
+    if (ab && !missing)
+        d = w; /* written, never synced, reported durable */
     tsdb_cvol_unref(&db);
     pthread_mutex_lock(&rv->mu);
     if (rc != 0) {
@@ -1199,6 +1211,14 @@ static int links_up(const struct cluster_vol_rec *r)
 
 void repld_init(tsdb *t, const char *dir)
 {
+    const char *mu = getenv("TSDB_REPLD_MUTANT");
+    G.mutant = !mu                              ? RM_NONE
+               : !strcmp(mu, "commitbyleader") ? RM_COMMITBYLEADER
+               : !strcmp(mu, "ackbeforesync")  ? RM_ACKBEFORESYNC
+               : !strcmp(mu, "floornotsaved")  ? RM_FLOORNOTSAVED
+                                               : RM_NONE;
+    if (G.mutant)
+        say("MUTANT %s (tests only)", mu);
     G.t = t;
     snprintf(G.dir, sizeof G.dir, "%s", dir);
 }
@@ -1323,6 +1343,20 @@ int repld_failed(uint32_t v)
     int f = rv->failed;
     pthread_mutex_unlock(&rv->mu);
     return f;
+}
+
+int repld_engine_failed(uint32_t v, const char *msg)
+{
+    struct rvol *rv = vol_find(v);
+    if (!rv)
+        return 0;
+    pthread_mutex_lock(&rv->mu);
+    int first = !rv->failed;
+    vol_fail(rv, msg && msg[0] ? msg : "the engine failed"); /* deposes a writer before the quiesce hides its engine */
+    pthread_mutex_unlock(&rv->mu);
+    if (first)
+        tsdb_volume_quiesce(G.t, v); /* clients get UNAVAILABLE and go to the volume's next leader */
+    return 1;
 }
 
 void repld_stop(void)

@@ -460,12 +460,14 @@ static int dom_failwatch(char *msg, size_t msglen)
             continue;
         seen = 1;
         unseen = 0;
+        char own[512]; /* this volume's own error: msg is the first failed volume's, which may be another one */
+        if (tsdb_volume_failed(dom.db, (uint32_t)v, own, sizeof own) != TSDB_ERR_IO || !own[0])
+            snprintf(own, sizeof own, "%s", msg);
+        if (v > 0 && repld_engine_failed((uint32_t)v, own))
+            continue; /* a cluster volume: its driver quiesces it and reports it failed, the server goes on (D13) */
         if (dom_of(v) < 0)
             return 1;
         if (!atomic_load(&dom.vol[v].recovering) && !atomic_load(&dom.vol[v].diverged)) {
-            char own[512]; /* this volume's own error: msg is the first failed volume's, which may be another one */
-            if (tsdb_volume_failed(dom.db, (uint32_t)v, own, sizeof own) != TSDB_ERR_IO || !own[0])
-                snprintf(own, sizeof own, "%s", msg);
             dom_log("storage failure, recovering in place", v, own);
             tsdb_health_probe_now(dom.health, dom_of(v));
             dom_recover(v);

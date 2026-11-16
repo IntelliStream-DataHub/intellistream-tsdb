@@ -810,6 +810,10 @@ $(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h serve
 	    $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(ZSTD_LIB) -lpthread -lm
 meta-mutants: $(B)/test_meta_mut
 	tests/meta_mutants.sh $(B)/test_meta_mut
+# the replication driver's mutants (server/repld.c TSDB_REPLD_MUTANT): each must fail test_cluster replindet or
+# replicate; ackbeforesync is known to survive (it loses data only under power loss of replicas: r3e)
+repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(CRASHFS_SO)
+	CRASHFS_SO=$(CRASHFS_SO) TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(or $(TMPDIR),/tmp) commitbyleader floornotsaved
 meta-soak: $(B)/test_meta
 	./$(B)/test_meta /tmp --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 

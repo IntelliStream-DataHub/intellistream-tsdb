@@ -3035,6 +3035,95 @@ static void scen_replindet(void)
     printf("  a write left of unknown outcome by its leader's stop gets a closed connection, never an answer\n");
 }
 
+/* D13: an engine failure (EIO on a WAL fdatasync, crashfs) of one replica of a cluster volume stops that volume
+ * there, quiesced and reported LOCAL_FAULT in the server's heartbeat; the server itself goes on (its root answers)
+ * and exits cleanly on SIGTERM. Without D13 tsdbd exits with status 1 on any failed volume outside a domain. */
+static void scen_replfail(void)
+{
+    scenario("replfail");
+    const char *so = getenv("CRASHFS_SO") ? getenv("CRASHFS_SO") : "./build/libcrashfs.so";
+    static char pe[3][PATH_MAX * 3 + 256];
+    char mark[3][PATH_MAX + 80];
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX + 80];
+        server_dir(i, dir, sizeof dir);
+        if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+            die("mkdir %s: %s", dir, strerror(errno));
+        snprintf(mark[i], sizeof mark[i], "%s/eio-n%d", base, i);
+        snprintf(pe[i], sizeof pe[i],
+                 "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_MODE=eio CRASHFS_EIO_ONLY=wal_ CRASHFS_EIO_ON=fdatasync "
+                 "CRASHFS_MARK=%s",
+                 so, dir, mark[i]);
+        penv[i] = pe[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    tsdbc_close(c);
+    int R = (L + 1) % 3;
+    signal_child(pids[R], SIGUSR2); /* crashfs: the next fdatasync of a wal_ file there fails with EIO */
+    struct rep_writer w = {cports[L], id, 2000, 1000000, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    uint64_t t0 = now_ms();
+    while (access(mark[R], F_OK) != 0) {
+        if (now_ms() - t0 > 30000)
+            die("no fdatasync of server %d's log failed in 30 s", R);
+        usleep(20000);
+    }
+    if (await_exit(R, 2000) >= 0)
+        die("server %d exited on its cluster volume's engine failure (D13: only the volume stops)", R);
+    /* the heartbeat of R reports the volume LOCAL_FAULT to the metadata leader */
+    int fault = 0;
+    for (t0 = now_ms(); !fault && now_ms() - t0 < 10000; usleep(100000))
+        for (int i = 0; i < 3 && !fault; i++) {
+            struct view vw;
+            if (i == R)
+                continue;
+            view(i, &vw);
+            for (uint32_t k = 0; k < vw.st.nheard; k++)
+                if (vw.st.heard[k].id == ids[R])
+                    for (uint32_t j = 0; j < vw.st.heard[k].nvols; j++)
+                        if (vw.st.heard[k].vols[j].v.volume == num &&
+                            vw.st.heard[k].vols[j].v.health == CL_HEALTH_LOCAL_FAULT)
+                            fault = 1;
+        }
+    if (!fault)
+        die("server %d's heartbeat never reported volume %" PRIu32 " LOCAL_FAULT", R, num);
+    tsdbc *cr = client(R); /* the root of R still answers */
+    tsdb_sid any;
+    if ((rc = tsdbc_series(cr, "replfail.none", 0, &any)) != TSDB_ERR_NOTFOUND)
+        die("a lookup in server %d's root after its volume failed: %s", R, ers(rc));
+    tsdbc_close(cr);
+    stop(R, SIGTERM); /* a clean stop: the failed volume is no failure of the server */
+    stop(L, SIGTERM);
+    pthread_join(th, NULL);
+    stop_all();
+    printf("  a replica whose engine failed stops that volume only, reports it LOCAL_FAULT and stops cleanly\n");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -3064,7 +3153,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}};
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
