@@ -128,7 +128,8 @@
  *  - under power and eio the last server, which the quiet tail leaves to the clients, is a clean one (no shim, so nothing ends it but the
  *    harness): a hung worker then reaches the deadline.
  *  - under misdirect and rot a server's end is a fail-stop on damage (not a violation) only as exit 1, with a log that names the damage, in an
- *    epoch where a fault was injected; exit 0 of its own, or exit 1 without a fault or without damage in the log, is a violation.
+ *    epoch where a fault was injected (a "tsdbd: storage failure, exiting" line); exit 0 of its own, or exit 1 without a fault, without that
+ *    line or without damage in the log, is a violation.
  * The inherent limit: a hang or a self-stop (a SIGSTOP of its own) that a planned fault ends before the deadline (the next kill or plug, the
  * pause nemesis' SIGCONT, an outage that kills the server) cannot be told from slowness: a worker that hangs for good is found only while its
  * server lives past the deadline, which the quiet tail (every nemesis but outage, misdirect and rot) and a run with no nemesis give it.
@@ -2237,6 +2238,19 @@ static int epoch_faults(void)
     return n;
 }
 
+/* tsdbd's fail-stop (failwatch_main) prints this before it exits with status 1: an exit 1 without it is not one. */
+static bool log_has_failstop(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    char b[1024];
+    bool hit = false;
+    while (f && !hit && fgets(b, sizeof b, f))
+        hit = strstr(b, "tsdbd: storage failure, exiting") != NULL;
+    if (f)
+        fclose(f);
+    return hit;
+}
+
 static bool log_names_damage(const char *path, char *line, size_t n)
 {
     if (log_says_damage(path, line, n))
@@ -2266,8 +2280,8 @@ static void md_death(int st, int sig, pid_t pid)
     if ((sig && WIFSIGNALED(st) && WTERMSIG(st) == sig) || (sig == SIGTERM && WIFEXITED(st) && WEXITSTATUS(st) == 0))
         return;
     char dl[512];
-    if (WIFEXITED(st) && WEXITSTATUS(st) == 1 && epoch_faults() > 0 && log_names_damage(slogpath, dl, sizeof dl)) {
-        md_failstops++; /* the one end that is expected: a fail-stop whose log names damage, in an epoch where a fault was injected */
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 1 && epoch_faults() > 0 && log_has_failstop(slogpath) && log_names_damage(slogpath, dl, sizeof dl)) {
+        md_failstops++; /* the one end that is expected: a fail-stop (tsdbd says "storage failure, exiting") whose log names damage, in an epoch where a fault was injected */
         return;
     }
     if (WIFEXITED(st)) { /* round 12: exit 0 of its own, or exit 1 with no fault in this epoch or no damage in its log, is not a fail-stop on damage */
