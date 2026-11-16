@@ -124,6 +124,12 @@
 #include "cvol.h"
 #include "../src/cvol.h"
 #include "crashpt.h"
+/* The engine's "outcome unknown" (src/internal.h, which tsdbd does not include): a replicated write that was appended
+ * but whose leader was deposed or failed before the commit point passed it. It reaches tsdbd through the public calls
+ * unchanged and must never reach a client (frame_put). */
+#ifndef TSDB_ERR_INDETERMINATE
+#define TSDB_ERR_INDETERMINATE (-110)
+#endif
 #include "../tools/cfg.h" /* configuration files: docs/config.md */
 #include "tsdbd_keys.h"
 
@@ -883,6 +889,14 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
                       size_t alen, const void *b, size_t blen, const void *d, size_t dlen)
 {
     size_t pre = ix ? TSDB_MULTI_PREFIX : 0;
+    /* D12: a replicated write whose leader was deposed (or failed) after its WAL append may or may not commit; the
+     * client must not read that as a refusal, so it gets no answer at all: the connection closes, and the client
+     * treats every request in flight on it as of unknown outcome. Never put -110 on the wire. */
+    if (status == TSDB_ERR_INDETERMINATE) {
+        atomic_store(&c->closing, true);
+        shutdown(c->fd, SHUT_RDWR);
+        return false;
+    }
     uint8_t ub[2 + TSDB_UNAVAIL_ENTRY]; /* the body of UNAVAILABLE (protocol 13), after the op's own error shape */
     size_t ulen = 0;
     /* a cluster volume this server only replicates (or leads before replication is wired) refuses writes as

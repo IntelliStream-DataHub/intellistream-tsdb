@@ -2982,6 +2982,59 @@ static void scen_replicate(void)
     printf("  a replica killed under writes and restarted catches up; every replica holds the leader's rows\n");
 }
 
+/* replindet (D12): a replicated write whose outcome is unknown (appended on the leader, which then stops, deposing
+ * itself, before the commit point passed it) never reaches the client as TSDB_ERR_INDETERMINATE (-110) or as a
+ * refusal: tsdbd closes the connection without an answer, and the client sees a lost connection (TSDB_ERR_IO). */
+static void scen_replindet(void)
+{
+    scenario("replindet");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    tsdbc_close(c);
+    int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
+    pause_server(R1, 1); /* no replica acknowledges: the commit point stops below the next write */
+    pause_server(R2, 1);
+    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    struct timespec ms500 = {0, 500000000};
+    nanosleep(&ms500, NULL);
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
+        die("a write with both replicas paused was answered: %s", ers(w.rc));
+    stop(L, SIGTERM); /* the driver deposes the leader: the waiting write's outcome is unknown */
+    pthread_join(th, NULL);
+    if (w.rc != TSDB_ERR_IO)
+        die("a write of unknown outcome was answered %d (%s), not with a closed connection", w.rc, ers(w.rc));
+    pause_server(R1, 0);
+    pause_server(R2, 0);
+    stop_all();
+    printf("  a write left of unknown outcome by its leader's stop gets a closed connection, never an answer\n");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -3011,7 +3064,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}};
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
