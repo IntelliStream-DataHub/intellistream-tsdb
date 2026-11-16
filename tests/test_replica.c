@@ -1847,6 +1847,7 @@ typedef struct xport {
     uint64_t cseq, coff;   /* what the replica has been handed of the leader's log */
     bool withhold;         /* ship keeps the file instead of staging it */
     bool noapply;          /* wait ships the log but the replica applies nothing */
+    bool noship;           /* wait and seg_done ship nothing (the test ships by itself) */
     uint8_t *held;         /* the last file shipped */
     size_t held_len;
     char held_name[64];
@@ -1919,7 +1920,7 @@ static uint64_t ld_last(xport *x) { return x->ld->fno_next - 1; }
 
 static int xp_pump(xport *x, uint64_t commit)
 {
-    int rc = xp_ship_logs(x);
+    int rc = x->noship ? 0 : xp_ship_logs(x);
     if (rc == 0 && x->rep && !x->noapply)
         rc = replica_apply(x->rep, commit);
     return rc;
@@ -1953,7 +1954,8 @@ static int xp_wait(void *ctx, eng *db, uint64_t last)
 static void xp_seg_done(void *ctx, eng *db, uint64_t seq)
 {
     (void)db, (void)seq;
-    xp_ship_logs(ctx); /* before the file goes */
+    if (!((xport *)ctx)->noship)
+        xp_ship_logs(ctx); /* before the file goes */
 }
 
 static int xp_admit(void *ctx, eng *db, uint64_t fno, uint32_t span)
@@ -2248,6 +2250,225 @@ static void case_commit_cut(void)
     CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
     x.noapply = false;
     xp_step(&x, "K: re-sent");
+    xp_stop(&x);
+}
+
+/* ships from the end of the replica's newest segment again (after a cut: what the leader sends a replica again) */
+static void xp_resume(xport *x, const char *rd)
+{
+    char p[PATH_MAX], nm[64];
+    DIR *d = opendir(rd);
+    struct dirent *e;
+    uint64_t best = 0;
+    while (d && (e = readdir(d))) {
+        uint64_t seq;
+        int c = 0;
+        if (wal_file_name(e->d_name) && sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &c) == 1 && seq >= best)
+            best = seq;
+    }
+    if (d)
+        closedir(d);
+    wal_name(nm, sizeof nm, best);
+    snprintf(p, sizeof p, "%s/%s", rd, nm);
+    struct stat st;
+    CHECK_EQ(stat(p, &st), 0);
+    x->cseq = best;
+    x->coff = (uint64_t)st.st_size;
+}
+
+static void join_within(pthread_t t, atomic_bool *done, const char *what);
+
+/* R2 REVIEW M1: a COMMIT's apply (its flush, the reads of its files) does not hold the lock of the log: while it is
+ * paused after the flush, another thread appends the leader's next records, syncs them and reads the durable end */
+static struct {
+    xport *x;
+    bool fired, ok;
+    atomic_bool done;
+    pthread_t t;
+    int rc;
+    uint64_t dur, want;
+    void (*then)(void); /* the cut race: what the hook does instead */
+} AC;
+
+static void *ac_thread(void *arg)
+{
+    (void)arg;
+    AC.rc = xp_ship_logs(AC.x); /* replica_append and replica_sync */
+    AC.dur = replica_durable_end(AC.x->rep);
+    atomic_store(&AC.done, true);
+    return NULL;
+}
+
+static void ac_hook(eng *db)
+{
+    if (AC.fired || !AC.x || db != AC.x->rep)
+        return;
+    AC.fired = true;
+    if (AC.then) {
+        AC.then();
+        return;
+    }
+    if (pthread_create(&AC.t, NULL, ac_thread, NULL) != 0)
+        return;
+    for (int i = 0; i < 2500 && !atomic_load(&AC.done); i++) /* 5 s: the thread needs one append and one sync */
+        usleep(2000);
+    AC.ok = atomic_load(&AC.done) && AC.rc == 0 && AC.dur == AC.want;
+}
+
+static void case_apply_concurrent(void)
+{
+    xport x;
+    char rd[PATH_MAX];
+    xp_start(&x, "ac");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100), xp_rows(&x, 1, 0, 5, 300);
+    xp_step(&x, "AC: before");
+    x.noapply = true;
+    xp_rows(&x, 0, 5, 40, 2000); /* a COMMIT, shipped and staged, not applied */
+    uint64_t cpos = ld_last(&x);
+    CHECK_EQ(replica_durable_end(x.rep), cpos);
+    x.noship = true;
+    xp_rows(&x, 1, 20, 5, 500); /* rows after it, written by the leader and not yet sent */
+    AC.x = &x, AC.fired = AC.ok = false, AC.then = NULL, AC.want = ld_last(&x);
+    atomic_store(&AC.done, false);
+    CHECK(AC.want > cpos);
+    replica_test_apply_hook = ac_hook;
+    CHECK_EQ(replica_apply(x.rep, cpos), 0);
+    replica_test_apply_hook = NULL;
+    CHECK(AC.fired);
+    if (!AC.ok)
+        fprintf(stderr, "AC: the append, sync and durable end of the next records waited for the COMMIT's apply "
+                        "(mutant applyholdsmu)\n");
+    CHECK(AC.ok);
+    if (AC.fired)
+        join_within(AC.t, &AC.done, "AC: the appending thread did not end");
+    AC.x = NULL;
+    CHECK_EQ(replica_applied_end(x.rep), cpos);
+    x.noapply = x.noship = false;
+    xp_step(&x, "AC: after");
+    CHECK_EQ(count_files(rd, "stage_"), 0);
+    CHECK_EQ(count_files(rd, "tmp_"), 0);
+    xp_stop(&x);
+}
+
+/* A cut between a COMMIT's prepare and its publish: what the prepare made is dropped. Variant 0 cuts the COMMIT itself
+ * (a replica that never prepared has neither its rows nor its files), variant 1 only the records after it (the COMMIT
+ * is prepared again and applied). */
+static uint64_t AR_CUT;
+static void ar_cut(void) { CHECK_EQ(replica_cut(AC.x->rep, AR_CUT), 0); }
+
+static void case_apply_cut_race(int variant)
+{
+    if (eng_test_mutant == MUT_REPLICA_APPLY_HOLDS_MU)
+        return; /* the hook's cut would wait for the lock its own thread holds */
+    xport x;
+    char rd[PATH_MAX], what[64];
+    snprintf(what, sizeof what, "AR%d", variant);
+    xp_start(&x, variant ? "ar1" : "ar0");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "AR: before");
+    x.noapply = true;
+    xp_rows(&x, 0, 5, 40, 2000); /* the COMMIT */
+    uint64_t cpos = ld_last(&x);
+    xp_rows(&x, 1, 20, 5, 500); /* records after it */
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    CHECK_EQ(replica_durable_end(x.rep), ld_last(&x));
+    AR_CUT = variant ? cpos : cpos - 1;
+    AC.x = &x, AC.fired = false, AC.then = ar_cut;
+    replica_test_apply_hook = ac_hook;
+    CHECK_EQ(replica_apply(x.rep, cpos), 0);
+    replica_test_apply_hook = NULL;
+    AC.x = NULL, AC.then = NULL;
+    CHECK(AC.fired);
+    CHECK_EQ(eng_check(x.rep), 0);
+    CHECK_EQ(replica_log_end(x.rep), AR_CUT);
+    CHECK_EQ(replica_applied_end(x.rep), AR_CUT);
+    CHECK_EQ(count_files(rd, "tmp_"), 0); /* the prepare's links are gone */
+    qctx q = {.n = 0};
+    CHECK_EQ(eng_query_raw_ex(x.rep, 0, T0 - 1000, T0 + 1000LL * (NT + 1), false, 0, qfn, &q), 0);
+    if (variant == 0) {
+        CHECK_EQ(count_files(rd, "stage_"), 0);
+        if (q.n != 10)
+            fprintf(stderr, "%s: the replica shows %zu rows of series 0 after a cut of the COMMIT it was preparing, not 10 "
+                            "(mutant nocutgen)\n", what, q.n);
+        CHECK_EQ(q.n, 10);
+    } else {
+        CHECK_EQ(count_files(rd, "stage_"), 0); /* applied the second time */
+        CHECK_EQ(q.n, 45);
+    }
+    /* the leader sends what was cut again: the replica ends up as the leader */
+    eng_close(x.rep);
+    x.rep = NULL;
+    CHECK_EQ(open_replica(rd, 0, &x.rep), 0);
+    xp_resume(&x, rd);
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    if (variant == 0)
+        CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
+    x.noapply = false;
+    xp_step(&x, what);
+    CHECK_EQ(count_files(rd, "stage_"), 0);
+    xp_stop(&x);
+}
+
+/* A leader's DROP holds flush_lock from its marker to the retire: rows written after the marker into a partition it
+ * drops are not flushed into parts that the retire takes away on the leader alone (every replica keeps them in its
+ * active memtable: the marker begins its segment). The hook runs between the marker and the retire; a thread writes
+ * such rows and flushes. Mutant dropunheld (the old code) loses them on the leader. */
+static struct {
+    xport *x;
+    atomic_bool done;
+    pthread_t t;
+    bool fired;
+} DF;
+
+static void *df_thread(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 5; i++) {
+        int64_t t = T0 + 1000LL * (30 + i);
+        float v = 900.0f + (float)i;
+        CHECK_EQ(eng_insert_series(DF.x->ld, TSDB_FLOAT32, 0, &t, &v, 1), 0);
+    }
+    CHECK_EQ(eng_flush(DF.x->ld), 0);
+    atomic_store(&DF.done, true);
+    return NULL;
+}
+
+static void df_hook(eng *db)
+{
+    if (DF.fired || !DF.x || db != DF.x->ld)
+        return;
+    DF.fired = true;
+    if (pthread_create(&DF.t, NULL, df_thread, NULL) != 0)
+        return;
+    for (int i = 0; i < 500 && !atomic_load(&DF.done); i++) /* 1 s: with the fix the flush waits for the retire */
+        usleep(2000);
+}
+
+static void case_drop_flush(void)
+{
+    xport x;
+    xp_start(&x, "kf");
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "DF: rows");
+    CHECK_EQ(eng_flush(x.ld), 0);
+    xp_step(&x, "DF: flushed");
+    DF.x = &x, DF.fired = false;
+    atomic_store(&DF.done, false);
+    eng_test_drop_hook = df_hook;
+    CHECK_EQ(eng_drop_before(x.ld, T0 + 10 * DAY_MS), 0);
+    eng_test_drop_hook = NULL;
+    CHECK(DF.fired);
+    if (DF.fired)
+        join_within(DF.t, &DF.done, "DF: the writer did not end");
+    DF.x = NULL;
+    qctx q = {.n = 0};
+    CHECK_EQ(eng_query_raw_ex(x.ld, 0, T0 - 1000, T0 + 1000LL * (NT + 1), false, 0, qfn, &q), 0);
+    if (q.n != 5)
+        fprintf(stderr, "DF: the leader shows %zu of the 5 rows written after its DROP marker (mutant dropunheld)\n", q.n);
+    CHECK_EQ(q.n, 5);
+    xp_step(&x, "DF: after the drop");
     xp_stop(&x);
 }
 
@@ -4878,7 +5099,10 @@ static int mutant_of(const char *m)
                         : strcmp(m, "tailoksealed") == 0 ? MUT_LEADER_READ_TAILOK_SEALED
                         : strcmp(m, "notfoundsealed") == 0 ? MUT_LEADER_READ_NOTFOUND_SEALED
                         : strcmp(m, "nosweep") == 0 ? MUT_LEADER_NO_SWEEP
-                        : strcmp(m, "b0off") == 0 ? MUT_LEADER_B0_OFF : 0;
+                        : strcmp(m, "b0off") == 0 ? MUT_LEADER_B0_OFF
+                        : strcmp(m, "applyholdsmu") == 0 ? MUT_REPLICA_APPLY_HOLDS_MU
+                        : strcmp(m, "nocutgen") == 0 ? MUT_REPLICA_PREP_NO_CUT_GEN
+                        : strcmp(m, "dropunheld") == 0 ? MUT_LEADER_DROP_UNHELD : 0;
 }
 
 int main(int argc, char **argv)
@@ -4935,6 +5159,19 @@ int main(int argc, char **argv)
             fprintf(stderr, "test_replica: %d failures\n", failures);
             return 1;
         }
+    }
+    if (getenv("TEST_REPLICA_APPLY_ONLY")) { /* the quick run of the apply's cases (R2 REVIEW M1) */
+        case_commit();
+        case_commit_cut();
+        case_apply_concurrent();
+        case_apply_cut_race(0);
+        case_apply_cut_race(1);
+        case_drop();
+        case_drop_flush();
+        case_drop_race();
+        case_classes();
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
     }
     if (getenv("TEST_REPLICA_RSTATE_ONLY")) { /* the quick run of the RSTATE power loss */
         case_rstate_crash();
@@ -5001,7 +5238,11 @@ int main(int argc, char **argv)
     case_commit();
     case_commit_hold();
     case_commit_cut();
+    case_apply_concurrent();
+    case_apply_cut_race(0);
+    case_apply_cut_race(1);
     case_drop();
+    case_drop_flush();
     case_drop_race();
     case_restage();
     case_stage_damage();

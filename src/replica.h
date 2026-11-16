@@ -58,6 +58,7 @@ int replica_missing(struct eng *db, char *name, size_t cap, uint64_t *size);
  * not written yet). */
 extern size_t replica_read_win_min; /* test hook */
 extern void (*replica_test_sync_hook)(struct eng *db); /* test hook: between a sync's fdatasync and its bookkeeping */
+extern void (*replica_test_apply_hook)(struct eng *db); /* test hook: a COMMIT's prepare after its flush, rp->mu free */
 int replica_read(struct eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
                  uint64_t *last);
 

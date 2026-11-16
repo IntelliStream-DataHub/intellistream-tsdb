@@ -15,9 +15,14 @@
  * Nothing here assigns an fno. db->fno_next is the log end + 1; db->wal_fd, wal_seq and wal_off are the segment being
  * written, so a promotion (a later step) turns the same fields into a writer's.
  *
- * Locks: rp->mu (log, cursor, memtable switching; held across the apply) > flush_lock > db->lock > buf_lock;
- * segs_mu and unl_mu are leaves (the flusher takes flush_lock and then needs the segment list and the unlink list, so
- * those must not sit under rp->mu).
+ * Locks: rp->apply_mu (one applier: held across replica_apply) > rp->stage_mu (one replica_stage, and a COMMIT's
+ * reads of its staged files) > rp->mu (log, cursor, memtable switching) > flush_lock > db->lock > buf_lock; segs_mu and
+ * unl_mu are leaves (the flusher takes flush_lock and then needs the segment list and the unlink list, so those must
+ * not sit under rp->mu). The apply holds rp->mu while it reads and applies records, but lets go of it for the slow
+ * work of a marker (a COMMIT's flush and the reads of its files, a DROP's flush, a CLASS record's purge): appends,
+ * syncs and the ends the driver acknowledges by do not wait for that (R2 REVIEW M1). What it did meanwhile is kept only
+ * when no cut came in between (cut_gen); else it is dropped and the record read again from the cursor. The log end,
+ * the durable end and the applied end are atomics, read without any lock.
  *
  * Not in this step: rebuild and catch-up (R4), the network (R3). Marker records are carried in the log and counted,
  * and applied by apply_marker (later steps add the types).
@@ -57,6 +62,7 @@ struct rstate {
 };
 
 struct replica {
+    pthread_mutex_t apply_mu; /* one replica_apply at a time (outermost) */
     pthread_mutex_t mu;
     pthread_mutex_t segs_mu;
     pthread_mutex_t unl_mu;
@@ -65,10 +71,11 @@ struct replica {
     size_t nsegs, capsegs;
     /* the apply cursor: the next record to apply is at apply_off of segment apply_seq (0: before the first segment) */
     uint64_t apply_seq, apply_off;
-    uint64_t apply_next; /* the next position to apply */
+    _Atomic uint64_t apply_next; /* the next position to apply (written under mu, read anywhere) */
     uint64_t act_seq;    /* the segment the active memtable holds (0: none yet) */
     uint64_t sealed_seq; /* the highest segment whose memtable was sealed: records of it or below are refused */
-    uint64_t durable_next; /* positions below this are durable */
+    _Atomic uint64_t durable_next; /* positions below this are durable (written under mu, read anywhere) */
+    _Atomic uint64_t log_next;     /* db->fno_next, for readers without a lock (written under mu) */
     uint64_t cut_gen, last_cut_next;
     uint64_t epoch, epoch_pos; /* the newest EPOCH marker applied (0: none): its epoch and position */
     _Atomic uint64_t floor_saved;
@@ -102,6 +109,7 @@ struct replica {
 };
 
 #define RP_CHUNK ((size_t)1 << 20)
+#define RP_AGAIN 1 /* a marker's apply: a cut came while rp->mu was let go, nothing was done, read the record again */
 
 static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit);
 static int rs_load(eng *db, struct rstate *rs);
@@ -202,6 +210,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     pthread_mutex_init(&rp->segs_mu, NULL);
     pthread_mutex_init(&rp->unl_mu, NULL);
     pthread_mutex_init(&rp->stage_mu, NULL);
+    pthread_mutex_init(&rp->apply_mu, NULL);
     rp->rfd = -1;
     db->rp = rp; /* from here wal_check_segment lets rows name series that SERIES does not hold yet */
 
@@ -327,6 +336,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     }
     db->wal_open_removed = db->wal_flushed = nseg ? segs[0].seq - 1 : parts_seq;
     rp->durable_next = db->fno_next; /* synced above (fsync on): the files' bytes are durable now */
+    rp->log_next = db->fno_next;
     rp->sealed_seq = parts_seq;
     rp->apply_next = db->fno_next;
     for (size_t k = 0; k < nseg; k++)
@@ -385,6 +395,7 @@ void replica_free(eng *db)
     pthread_mutex_destroy(&rp->segs_mu);
     pthread_mutex_destroy(&rp->unl_mu);
     pthread_mutex_destroy(&rp->stage_mu);
+    pthread_mutex_destroy(&rp->apply_mu);
     free(rp);
     db->rp = NULL;
 }
@@ -917,38 +928,36 @@ static bool rs_committed(eng *db, struct replica *rp)
     return yes;
 }
 
-static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr, const mk *m)
+void (*replica_test_apply_hook)(eng *db); /* test hook: a COMMIT's prepare, after its flush (rp->mu not held) */
+
+/* Drops what a prepare made: the parts and their tmp_0_ links (the staged files stay for the marker, or went with a cut) */
+static void prep_discard(eng *db, part **ps, size_t n)
 {
-    const mk_commit *c = &m->u.commit;
-    uint64_t last = wr->fno + wr->span - 1;
-    size_t ci = rp->ncm;
-    for (size_t i = 0; i < rp->ncm; i++)
-        if (rp->cm[i].last == last)
-            ci = i;
-    if (last <= rp->rs.done && eng_test_mutant != MUT_REPLICA_NO_DONE_SKIP)
-        return 0; /* a replay: its parts are listed */
-    if (rp->rs.doing_pos == last && eng_test_mutant != MUT_REPLICA_NO_DONE_SKIP && rs_committed(db, rp)) {
-        rp->rs.done = last;
-        rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
-        int rc = rs_save(db, &rp->rs);
-        if (rc == 0 && ci < rp->ncm)
-            cm_remove(db, rp, ci);
-        return rc;
-    }
-    if (c->flush_through >= seq || c->nfiles == 0 || ci == rp->ncm) {
-        fprintf(stderr, "tsdb: %s: the COMMIT at position %" PRIu64 " (flush through %" PRIu64 ", segment %" PRIx64 ") is "
-                        "not one this replica can apply\n", db->dir, wr->fno, c->flush_through, seq);
-        return TSDB_ERR_CORRUPT;
-    }
+    for (size_t i = 0; i < n; i++)
+        if (ps[i]) {
+            char tp[sizeof ps[i]->pending];
+            snprintf(tp, sizeof tp, "%s", ps[i]->pending);
+            part_unref(ps[i]);
+            unlinkat(db->dirfd, tp, 0);
+        }
+}
+
+/* A COMMIT's prepare, without rp->mu: every sealed memtable to parts (the leader flushed through F before it wrote),
+ * then, under stage_mu, the staged files read, checked against the marker and linked to their pending names, and
+ * opened. `fs` is the marker's file list as it was under rp->mu (an append may move rp->cm meanwhile). */
+static int commit_prepare(eng *db, struct replica *rp, const wal_rec *wr, const mk_commit *c, const struct rcf *fs,
+                          size_t n, part **ps)
+{
     int rc = 0;
     if (eng_test_mutant != MUT_REPLICA_NO_COMMIT_FLUSH)
-        rc = replica_flush(db); /* every sealed memtable (the leader flushed through F before it wrote) is in parts */
-    size_t n = c->nfiles;
-    part **ps = calloc(n, sizeof *ps);
-    if (!ps)
-        return TSDB_ERR_NOMEM;
+        rc = replica_flush(db);
+    if (replica_test_apply_hook)
+        replica_test_apply_hook(db);
+    if (rc)
+        return rc;
+    pthread_mutex_lock(&rp->stage_mu); /* no replica_stage renames a staged file while it is read and linked */
     for (size_t i = 0; i < n && rc == 0; i++) {
-        const struct rcf *f = &rp->cm[ci].f[i];
+        const struct rcf *f = &fs[i];
         char sp[40], tp[64];
         stage_path(sp, sizeof sp, f->key);
         snprintf(tp, sizeof tp, "tmp_0_%" PRIu64 ".part", f->key);
@@ -973,8 +982,11 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
             break;
         }
         part *p;
-        if ((rc = part_open_as(db->dirfd, tp, f->name, db->opt.pin_index, db->parts_v8, &p)) != 0)
+        if ((rc = part_open_as(db->dirfd, tp, f->name, db->opt.pin_index, db->parts_v8, &p)) != 0) {
+            unlinkat(db->dirfd, tp, 0);
             break;
+        }
+        snprintf(p->pending, sizeof p->pending, "%s", tp);
         ps[i] = p;
         mk_file mf;
         size_t pos = 0;
@@ -988,8 +1000,64 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
             break;
         }
         p->verify = db->opt.verify_checksums;
-        snprintf(p->pending, sizeof p->pending, "%s", tp);
     }
+    pthread_mutex_unlock(&rp->stage_mu);
+    return rc;
+}
+
+/* rp->mu held; let go of across the prepare (commit_prepare), so the log goes on taking appends and syncs. Returns
+ * RP_AGAIN when a cut came meanwhile: what the prepare made is dropped (the cut may have removed this very marker and
+ * its files), and the loop reads the record at the cursor again. The publish runs under rp->mu: no cut between the
+ * check and the parts. */
+static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr, const mk *m)
+{
+    const mk_commit *c = &m->u.commit;
+    uint64_t last = wr->fno + wr->span - 1;
+    size_t ci = rp->ncm;
+    for (size_t i = 0; i < rp->ncm; i++)
+        if (rp->cm[i].last == last)
+            ci = i;
+    if (last <= rp->rs.done && eng_test_mutant != MUT_REPLICA_NO_DONE_SKIP)
+        return 0; /* a replay: its parts are listed */
+    if (rp->rs.doing_pos == last && eng_test_mutant != MUT_REPLICA_NO_DONE_SKIP && rs_committed(db, rp)) {
+        rp->rs.done = last;
+        rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
+        int rc = rs_save(db, &rp->rs);
+        if (rc == 0 && ci < rp->ncm)
+            cm_remove(db, rp, ci);
+        return rc;
+    }
+    if (c->flush_through >= seq || c->nfiles == 0 || ci == rp->ncm || rp->cm[ci].nf != c->nfiles) {
+        fprintf(stderr, "tsdb: %s: the COMMIT at position %" PRIu64 " (flush through %" PRIu64 ", segment %" PRIx64 ") is "
+                        "not one this replica can apply\n", db->dir, wr->fno, c->flush_through, seq);
+        return TSDB_ERR_CORRUPT;
+    }
+    size_t n = c->nfiles;
+    part **ps = calloc(n, sizeof *ps);
+    struct rcf *fs = malloc(n * sizeof *fs);
+    if (!ps || !fs) {
+        free(ps);
+        free(fs);
+        return TSDB_ERR_NOMEM;
+    }
+    memcpy(fs, rp->cm[ci].f, n * sizeof *fs);
+    uint64_t gen = rp->cut_gen;
+    const bool hold = eng_test_mutant == MUT_REPLICA_APPLY_HOLDS_MU; /* planted: rp->mu held across the prepare */
+    if (!hold)
+        pthread_mutex_unlock(&rp->mu);
+    int rc = commit_prepare(db, rp, wr, c, fs, n, ps);
+    if (!hold)
+        pthread_mutex_lock(&rp->mu);
+    free(fs);
+    if (rp->cut_gen != gen && eng_test_mutant != MUT_REPLICA_PREP_NO_CUT_GEN) {
+        prep_discard(db, ps, n);
+        free(ps);
+        return RP_AGAIN;
+    }
+    ci = rp->ncm; /* a cut (only with the mutant) may have removed it: found again */
+    for (size_t i = 0; i < rp->ncm; i++)
+        if (rp->cm[i].last == last)
+            ci = i;
     if (rc == 0) {
         pthread_mutex_lock(&db->publish_lock);
         rp->rs.doing_pos = last;
@@ -1020,7 +1088,7 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
     rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
     if (rc == 0)
         rc = rs_save(db, &rp->rs);
-    if (rc == 0)
+    if (rc == 0 && ci < rp->ncm)
         cm_remove(db, rp, ci);
     return rc;
 }
@@ -1046,8 +1114,15 @@ static int apply_drop(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
         return TSDB_ERR_CORRUPT;
     }
     int rc = 0;
-    if (eng_test_mutant != MUT_REPLICA_NO_DROP_FLUSH)
+    if (eng_test_mutant != MUT_REPLICA_NO_DROP_FLUSH) {
+        /* the flush without rp->mu (a sealed memtable can take seconds); nothing seals meanwhile (one applier) */
+        uint64_t gen = rp->cut_gen;
+        pthread_mutex_unlock(&rp->mu);
         rc = replica_flush(db);
+        pthread_mutex_lock(&rp->mu);
+        if (rp->cut_gen != gen)
+            return RP_AGAIN; /* the flush is harmless: the record is read again */
+    }
     if (rc == 0)
         rc = drop_retire(db, ts);
     if (rc)
@@ -1261,8 +1336,16 @@ static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec
         return eng_state_apply(db, m.u.state.name, m.u.state.name_len, m.u.state.id);
     case MK_RETENTION:
         return eng_retention_apply(db, m.u.retention.series, m.u.retention.limit_ms, m.u.retention.record_off);
-    case MK_CLASS:
-        return cls_apply(db, m.u.cls.series, (int)m.u.cls.cls, m.u.cls.at, m.u.cls.record_off);
+    case MK_CLASS: {
+        /* the purge (a merge, seconds) without rp->mu (R3b M2); then the record under it, unless a cut came */
+        uint64_t gen = rp->cut_gen;
+        pthread_mutex_unlock(&rp->mu);
+        rc = cls_purge(db, m.u.cls.series, (int)m.u.cls.cls, m.u.cls.at, m.u.cls.record_off);
+        pthread_mutex_lock(&rp->mu);
+        if (rp->cut_gen != gen)
+            return RP_AGAIN;
+        return rc ? rc : cls_apply(db, m.u.cls.series, (int)m.u.cls.cls, m.u.cls.at, m.u.cls.record_off);
+    }
     case MK_COMMIT:
         return apply_commit(db, rp, seq, wr, &m);
     case MK_DROP:
@@ -1381,6 +1464,10 @@ static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit)
         if (eng_test_mutant == MUT_REPLICA_COMMIT_CLOCK) /* planted: the clock follows every record's commit_ms */
             replica_now_advance(db, wr.commit_ms);
         rc = wr.kind == WAL_KIND_ROWS ? apply_rows(db, rp, cur.seq, &wr, pmax) : apply_marker(db, rp, cur.seq, &wr);
+        if (rc == RP_AGAIN) { /* a cut came while the marker's slow part ran without rp->mu: read again from the cursor */
+            rc = 0;
+            continue;
+        }
         if (rc)
             break;
         rp->apply_off += sz;
@@ -1398,38 +1485,21 @@ int replica_apply(eng *db, uint64_t commit)
         return TSDB_ERR_INVALID;
     if (eng_test_mutant == MUT_REPLICA_APPLY_ALL) /* planted: apply above the commit point */
         commit = UINT64_MAX;
+    pthread_mutex_lock(&rp->apply_mu);
     pthread_mutex_lock(&rp->mu);
     int rc = replica_apply_locked(db, rp, commit);
     pthread_mutex_unlock(&rp->mu);
+    pthread_mutex_unlock(&rp->apply_mu);
     return rc;
 }
 
-uint64_t replica_log_end(eng *db)
-{
-    struct replica *rp = db->rp;
-    pthread_mutex_lock(&rp->mu);
-    uint64_t v = db->fno_next - 1;
-    pthread_mutex_unlock(&rp->mu);
-    return v;
-}
+/* The three ends are read without a lock: the driver acknowledges by them while an apply holds rp->mu. Each is
+ * written under rp->mu as one store, so a reader sees a value the end had (a cut may lower the log and durable ends). */
+uint64_t replica_log_end(eng *db) { return atomic_load(&db->rp->log_next) - 1; }
 
-uint64_t replica_durable_end(eng *db)
-{
-    struct replica *rp = db->rp;
-    pthread_mutex_lock(&rp->mu);
-    uint64_t v = rp->durable_next - 1;
-    pthread_mutex_unlock(&rp->mu);
-    return v;
-}
+uint64_t replica_durable_end(eng *db) { return atomic_load(&db->rp->durable_next) - 1; }
 
-uint64_t replica_applied_end(eng *db)
-{
-    struct replica *rp = db->rp;
-    pthread_mutex_lock(&rp->mu);
-    uint64_t v = rp->apply_next - 1;
-    pthread_mutex_unlock(&rp->mu);
-    return v;
-}
+uint64_t replica_applied_end(eng *db) { return atomic_load(&db->rp->apply_next) - 1; }
 
 /* ----------------------------------------------------------------- append */
 
@@ -1499,6 +1569,7 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
         pthread_mutex_lock(&db->buf_lock); /* manifest_publish reads it under buf_lock (the flusher's thread) */
         db->fno_next = next;
         pthread_mutex_unlock(&db->buf_lock);
+        rp->log_next = next;
         if (eng_test_mutant == MUT_REPLICA_ACK_UNSYNCED) /* planted: acknowledge what is not synced */
             rp->durable_next = next;
         pthread_mutex_lock(&rp->segs_mu);
@@ -1692,6 +1763,7 @@ int replica_cut(eng *db, uint64_t last)
         pthread_mutex_lock(&db->buf_lock);
         db->fno_next = last + 1;
         pthread_mutex_unlock(&db->buf_lock);
+        rp->log_next = last + 1;
         for (size_t i = rp->ncm; i-- > 0;) /* the COMMIT markers above the cut never happened: their files go */
             if (rp->cm[i].first > last)
                 cm_remove(db, rp, i);
@@ -2320,7 +2392,8 @@ static int leader_drop(eng *db, int64_t ts)
     mk m = {.type = MK_DROP, .span = 1};
     m.u.drop = (mk_drop){.dropped_before = ts, .partition = MK_NO_PARTITION};
     uint64_t fno = 0;
-    int rc = mt_flush_ex(db, &m, &fno);
+    /* eng_drop_before holds flush_lock until the retire (planted MUT_LEADER_DROP_UNHELD: it does not, as before) */
+    int rc = eng_test_mutant == MUT_LEADER_DROP_UNHELD ? mt_flush_ex(db, &m, &fno) : mt_flush_held(db, &m, &fno);
     if (rc)
         return fno ? rc : leader_unappended(rc); /* no marker in the log: definitely not applied */
     if (fno == 0) /* a backstop: never retire without the marker */

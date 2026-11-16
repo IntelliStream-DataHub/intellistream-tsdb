@@ -1487,6 +1487,8 @@ int eng_flush(eng *db)
 
 /* ----------------------------------------------------------- maintenance */
 
+void (*eng_test_drop_hook)(eng *db);
+
 int eng_drop_before(eng *db, int64_t ts)
 {
     if (db->opt.read_only || db->rp)
@@ -1501,11 +1503,22 @@ int eng_drop_before(eng *db, int64_t ts)
     const bool serial = eng_jr(db) && eng_test_mutant != MUT_REPLICA_NO_DROP_SERIAL;
     if (serial)
         pthread_mutex_lock(&db->jr_serial);
+    /* A leader holds flush_lock from its marker's flush (leader_drop, mt_flush_held) to the retire: rows written after
+     * the marker stay in the memtable meanwhile. A flush between the two would put them into parts the retire then
+     * takes away on the leader, while every replica keeps them in its active memtable (the marker begins its
+     * segment): the leader would lose acknowledged rows. Lock order: jr_serial > flush_lock. */
+    const bool held = eng_jr(db) && eng_test_mutant != MUT_LEADER_DROP_UNHELD;
+    if (held)
+        pthread_mutex_lock(&db->flush_lock);
     int rc = jr_intent(db, JR_DROP, &ts);
     if (rc == 0 && !eng_jr(db))
         rc = eng_flush(db);
+    if (rc == 0 && eng_test_drop_hook)
+        eng_test_drop_hook(db);
     if (rc == 0)
         rc = drop_retire(db, ts);
+    if (held)
+        pthread_mutex_unlock(&db->flush_lock);
     if (rc == 0 && eng_jr(db))
         rc = leader_rs_drop(db, ts); /* RSTATE says the DROP is done (replica.c) */
     if (serial)

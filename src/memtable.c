@@ -1572,7 +1572,11 @@ int mt_flush(eng *db) { return mt_flush_ex(db, NULL, NULL); }
  * it is flushed here): a replica that applies it has sealed and flushes exactly the memtables the leader flushed
  * (the DROP marker, design-cluster.md 5.2). With an empty active memtable there is no new segment: the marker
  * goes into the current one, and the replica checks that its memtable holds no rows then. *fno: its first number. */
-int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
+static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held);
+int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno) { return mt_flush_do(db, marker, fno, false); }
+int mt_flush_held(eng *db, const mk *marker, uint64_t *fno) { return mt_flush_do(db, marker, fno, true); }
+
+static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held)
 {
     if (db->opt.read_only)
         return 0;
@@ -1592,7 +1596,8 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
         if (mrc)
             return mrc;
     }
-    pthread_mutex_lock(&db->flush_lock);
+    if (!held)
+        pthread_mutex_lock(&db->flush_lock);
     /* a memtable whose write failed earlier holds older rows than the active
      * one: it is written first, and the active one after it all the same, or
      * a large insert that relies on this flush would be shadowed by it */
@@ -1678,7 +1683,8 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
 
     if (rc == 0)
         rc = flush_waiting(db);
-    pthread_mutex_unlock(&db->flush_lock);
+    if (!held)
+        pthread_mutex_unlock(&db->flush_lock);
     free(mbody);
     if (mlsn && rc == 0)
         rc = wal_commit(db, mlsn); /* the marker is durable before the caller goes on */
