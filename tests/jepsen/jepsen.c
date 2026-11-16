@@ -2249,14 +2249,16 @@ static int epoch_faults(void)
     return n;
 }
 
-/* tsdbd's fail-stop (failwatch_main) prints this before it exits with status 1: an exit 1 without it is not one. */
+/* tsdbd exits with status 1 for two reasons it says so for: the fail-stop (failwatch_main: "storage failure, exiting") and a close that
+ * failed ("tsdbd: close: corrupt data": the clean stop after our SIGTERM found damage, which a misdirected write left). An exit 1 with
+ * neither line is not one of them. */
 static bool log_has_failstop(const char *path)
 {
     FILE *f = fopen(path, "r");
     char b[1024];
     bool hit = false;
     while (f && !hit && fgets(b, sizeof b, f))
-        hit = strstr(b, "tsdbd: storage failure, exiting") != NULL;
+        hit = strstr(b, "tsdbd: storage failure, exiting") != NULL || strstr(b, "tsdbd: close: ") != NULL;
     if (f)
         fclose(f);
     return hit;
