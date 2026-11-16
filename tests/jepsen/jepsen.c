@@ -476,6 +476,8 @@ static bool verify;                 /* --verify-checksums: tsdbd checks granule 
 static int epoch;
 static const char *md_files = "all"; /* CRASHFS_MD_FILES of this epoch */
 static char faultlog[PATH_MAX];     /* every injected fault, one line each (the shim's and rot's) */
+static int epoch_faults(void);
+static bool log_names_damage(const char *path, char *line, size_t n);
 static bool damaged;                /* the database is refused or unreadable: final state unknown */
 static int refused_faulty, refused_clean, md_failstops, md_crashes, tail_cuts;
 static atomic_int read_damage, write_damage; /* requests that failed with TSDB_ERR_CORRUPT or TSDB_ERR_IO */
@@ -984,10 +986,19 @@ static void start_server_run(bool faulty)
                 lives_faulty++;
             return;
         }
-        if (p == TH_EXITED && (md || rot)) {
-            /* refused: the open found damage (exit 1), or the faulty server stopped on damage it read; a signal
-             * is a crash, never an answer to damage */
+        char dmg[512];
+        if (p == TH_EXITED && (md || rot) &&
+            (WIFSIGNALED(th_status) || (WIFEXITED(th_status) && WEXITSTATUS(th_status) == 1 && log_names_damage(slogpath, dmg, sizeof dmg)))) {
+            /* refused: the open found damage (exit 1, and its log names it), or the faulty server stopped on damage it read; a signal
+             * is a crash, never an answer to damage. Any other end before it listened (exit 0, an exit that names no damage) is the
+             * environment or a damage-free fault, judged below (round 12). */
             server_gone();
+            if (WIFEXITED(th_status) && epoch_faults() == 0) { /* damage in a database that no fault touched */
+                death_problems++;
+                fprintf(stderr, "  the %s server (pid %d) refuses to open the database, and no fault was injected in this epoch: %s\n",
+                        server_faulty ? "faulty" : "clean", (int)pid, dmg);
+                print_tail(slogpath);
+            }
             if (WIFSIGNALED(th_status)) {
                 md_crashes++;
                 fprintf(stderr, "  the %s server (pid %d) died of signal %d while opening\n",
@@ -2077,15 +2088,59 @@ static void note_death(int st, bool we_killed, pid_t pid)
     end_report(pid, st);
 }
 
-/* misdirect and rot: how a server ended. Exit 1 is a stop on damage it found (fail-stop, or an open refused);
- * exit 0 after our SIGTERM and our SIGKILL are ours; a signal of its own (SIGSEGV, SIGABRT...) is a crash, which
- * damage must never cause. */
+/* The faults injected in this epoch (the shim's misdirected I/O and rot's damage, one line each in the fault log; a torn tail the engine
+ * cut is not one), and whether a server's log names damage (a fail-stop or a refused open on corrupt data, a checksum, an I/O error). */
+static int epoch_faults(void)
+{
+    int n = 0;
+    char line[3 * PATH_MAX];
+    FILE *f = fopen(faultlog, "r");
+    while (f && fgets(line, sizeof line, f))
+        n += strstr(line, "the engine cut") == NULL;
+    if (f)
+        fclose(f);
+    return n;
+}
+
+static bool log_names_damage(const char *path, char *line, size_t n)
+{
+    if (log_says_damage(path, line, n))
+        return true;
+    FILE *f = fopen(path, "r");
+    char b[1024];
+    bool hit = false;
+    while (f && !hit && fgets(b, sizeof b, f)) {
+        hit = !strncmp(b, "tsdb", 4) && (strcasestr(b, "corrupt") || strcasestr(b, "damag") || strcasestr(b, "checksum") ||
+                                          strcasestr(b, "input/output error") || strcasestr(b, "I/O error"));
+        if (hit) {
+            b[strcspn(b, "\n")] = 0;
+            snprintf(line, n, "%.400s", b);
+        }
+    }
+    if (f)
+        fclose(f);
+    return hit;
+}
+
+/* misdirect and rot: how a server ended. Ours: exit 0 after our SIGTERM, a death by the signal we sent. Expected: exit 1 with a log that
+ * names the damage, in an epoch where a fault was injected (a fail-stop on what the fault left). Anything else is a violation (round 12): exit 0
+ * of its own, exit 1 with no fault in the epoch or no damage in the log, another status; a signal of its own (SIGSEGV, SIGABRT...) is a
+ * crash, which damage must never cause. */
 static void md_death(int st, int sig, pid_t pid)
 {
     if ((sig && WIFSIGNALED(st) && WTERMSIG(st) == sig) || (sig == SIGTERM && WIFEXITED(st) && WEXITSTATUS(st) == 0))
         return;
-    if (WIFEXITED(st)) {
-        md_failstops++;
+    char dl[512];
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 1 && epoch_faults() > 0 && log_names_damage(slogpath, dl, sizeof dl)) {
+        md_failstops++; /* the one end that is expected: a fail-stop whose log names damage, in an epoch where a fault was injected */
+        return;
+    }
+    if (WIFEXITED(st)) { /* round 12: exit 0 of its own, or exit 1 with no fault in this epoch or no damage in its log, is not a fail-stop on damage */
+        death_problems++;
+        fprintf(stderr, "  the server (pid %d) ended with %s by itself: not a fail-stop on damage (that is exit status 1, with a log that names the "
+                "damage, in an epoch where a fault was injected: %d so far)\n", (int)pid, st ? "exit status 1 or more" : "exit status 0",
+                epoch_faults());
+        print_tail(slogpath);
         return;
     }
     md_crashes++;

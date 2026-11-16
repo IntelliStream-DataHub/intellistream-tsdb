@@ -7,6 +7,7 @@
 #   JV_CRASH=N   abort() on every Nth insert request (a crash of its own: SIGABRT), with the core dump the machine takes (RLIMIT_CORE is
 #                left alone: a core handler that is a pipe, systemd-coredump here, dumps whatever the limit says, and the dump keeps the
 #                process alive, not yet a zombie, for 0.1 s to seconds: the window in which a nemesis' SIGKILL used to hide the crash)
+#   JV_EXIT=N    _exit(JV_EXITCODE, 0 by default) on every Nth insert request (an end of its own, with no signal of ours)
 #   JV_CRASHONCE=N  the same, once per gate (JV_ONCEFILE names the file whose creation says it happened)
 #   JV_CRASH_MB=M   before the abort, touch M MB: a dump that takes long on every core handler, so the nemesis' kill is certain to land in it
 #   JV_HANG=N    a worker pause()s for ever on every Nth insert request (the server is up and stops answering)
@@ -57,11 +58,13 @@ static void jv_once(void)\
 sed -i 's/^    case TSDB_OP_INSERT: {$/&\
         if (jv_every("JV_CRASH")) jv_crash();\
         if (jv_every("JV_CRASHONCE")) jv_once();\
+        if (jv_every("JV_EXIT")) _exit(atoi(getenv("JV_EXITCODE") ? getenv("JV_EXITCODE") : "0"));\
         if (jv_every("JV_HANG")) for (;;) pause();/; s/^    case TSDB_OP_INSERT_VALUES: {$/&\
         if (jv_every("JV_CRASH")) jv_crash();\
         if (jv_every("JV_CRASHONCE")) jv_once();\
+        if (jv_every("JV_EXIT")) _exit(atoi(getenv("JV_EXITCODE") ? getenv("JV_EXITCODE") : "0"));\
         if (jv_every("JV_HANG")) for (;;) pause();/' "$f"
-if [ "$(grep -c 'jv_every(' "$f")" -ne 7 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
+if [ "$(grep -c 'jv_every(' "$f")" -ne 9 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
 (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-crash: build failed"; tail -5 "$tmp/build.log"; rm -rf "$tmp"; exit 1; }
 mut=$tmp/build/tsdbd
 crashfs=$root/build/libcrashfs.so
@@ -116,6 +119,16 @@ for wl in kv classes; do
             "one abort per gate with a core dump of ${CRASH_MB:-512} MB, kill nemesis, $wl workload" JV_CRASHONCE=${CRASH_ONCE_N:-20} \
             JV_CRASH_MB=${CRASH_MB:-512} JV_ONCEFILE="$tmp/once-$wl-$i" -- --nemesis kill --workload $wl --seconds 12
     done
+done
+# a server that exits by itself (status 0, or 1 with no fault in the epoch) under misdirect (with and without verify_checksums) and rot is
+# no fail-stop on damage (round 12; VERIFY11 (A): rc 0 in all six)
+for code in 0 1; do
+    run_case "exit$code-md" "ended with exit status\\|ended with a status of its own\\|by itself: not a fail-stop" "a server that exits $code by itself, misdirect" JV_EXIT=150 \
+        JV_EXITCODE=$code -- --nemesis misdirect --seconds 20 --crashfs "$crashfs"
+    run_case "exit$code-mdv" "by itself: not a fail-stop" "a server that exits $code by itself, misdirect, verify_checksums" JV_EXIT=150 JV_EXITCODE=$code -- \
+        --nemesis misdirect --seconds 20 --crashfs "$crashfs" --verify-checksums
+    run_case "exit$code-rot" "by itself: not a fail-stop" "a server that exits $code by itself, rot" JV_EXIT=150 JV_EXITCODE=$code -- \
+        --nemesis rot --seconds 20 --verify-checksums
 done
 HP='server stopped answering'
 for nem in kill pause none; do
