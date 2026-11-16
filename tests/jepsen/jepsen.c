@@ -1099,7 +1099,7 @@ static bool fatal_pending_unsent(pid_t pid, int *sigp)
                                      (1ULL << (SIGSEGV - 1)) | (1ULL << (SIGXCPU - 1)) | (1ULL << (SIGXFSZ - 1)) |
                                      (1ULL << (SIGSYS - 1));
     char path[320], line[256];
-    unsigned long long pend = 0;
+    unsigned long long pend = 0, handled = 0; /* handled: caught or ignored (the shim's SIGBUS handler, for one): a pending one is no crash */
     bool dumping = false;
     snprintf(path, sizeof path, "/proc/%d/status", (int)pid);
     FILE *f = fopen(path, "r");
@@ -1111,6 +1111,8 @@ static bool fatal_pending_unsent(pid_t pid, int *sigp)
             dumping = true;
         else if ((!strncmp(line, "ShdPnd:", 7) || !strncmp(line, "SigPnd:", 7)) && sscanf(line + 7, "%llx", &v) == 1)
             pend |= v;
+        else if ((!strncmp(line, "SigCgt:", 7) || !strncmp(line, "SigIgn:", 7)) && sscanf(line + 7, "%llx", &v) == 1)
+            handled |= v;
     }
     fclose(f);
     snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
@@ -1135,7 +1137,7 @@ static bool fatal_pending_unsent(pid_t pid, int *sigp)
         closedir(d);
     int s = 0;
     for (int n = 1; n < 64; n++)
-        if (((pend & fatal) >> (n - 1) & 1) && !sent_has(pid, n)) {
+        if (((pend & fatal & ~handled) >> (n - 1) & 1) && !sent_has(pid, n)) {
             s = n;
             break;
         }
