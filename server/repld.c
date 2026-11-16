@@ -58,9 +58,11 @@
 #include <unistd.h>
 
 #include "repld.h"
+#include "crashpt.h"
 #include "peerlink.h"
 #include "replwire.h"
 #include "../src/cvol.h"
+#include "../src/marker.h"
 #include "../src/repl.h"
 #include "../src/replfile.h"
 #include "../src/replica.h"
@@ -470,12 +472,17 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
 {
     (void)db;
     struct rvol *rv = ctx;
+    /* crash points (design-cluster 13.2): the leader has written, not synced and not sent; class-switch when a CLASS
+     * marker is among the records (the switch's record in the log, its CLASSES record not yet) */
+    crash_point(CP_WAL_BEFORE_SEND);
     pthread_mutex_lock(&rv->mu);
     for (size_t o = 0; o < len;) {
         wal_rec wr;
         size_t sz = wal_record((const uint8_t *)buf + o, len - o, seq, off + o, &wr);
         if (!sz)
             break;
+        if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_CLASS)
+            crash_point(CP_CLASS_SWITCH);
         idx_push(rv, wr.fno, wr.fno + wr.span - 1);
         o += sz;
     }
@@ -646,6 +653,7 @@ static int op_ship(void *ctx, struct eng *db, const char *file, const char *mnam
     pthread_mutex_unlock(&rv->mu);
     wait_ship(w, 30000);
     ship_detach(w); /* a job still queued reads fd later: the last done closes it */
+    crash_point(CP_PREPARED_BEFORE_COMMIT); /* a large write's file is staged on the replicas, its COMMIT not written */
     return 0;
 }
 
@@ -973,6 +981,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
         if (!db)
             break;
         if (rv->mode == M_WRITER) {
+            crash_point(CP_ACKED_BEFORE_OK); /* the replicas acknowledged; no client has its answer yet */
             eng_leader_commit(db, a->pos);
             break;
         }
