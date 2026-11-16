@@ -39,8 +39,10 @@
  *
  * Mutants (TSDB_REPLD_MUTANT, tests only; NOTES of r3d-stream says which test catches each): `commitbyleader` commits
  * at the writer's own durable end, `ackbeforesync` has a follower report its written end as durable without a sync,
- * `floornotsaved` skips the REPL file's SAVE. A fault for tests: TSDB_REPLD_TEST=dropbulk has the first bulk file this
- * process receives taken as staged but not kept, so its COMMIT marker finds the file missing and FETCHes it.
+ * `floornotsaved` skips the REPL file's SAVE. Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
+ * bulk file this process receives taken as staged but not kept, so its COMMIT marker finds the file missing and
+ * FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER (writes then reach
+ * the new writer while the driver still promotes: they must be refused for a retry, never depose it).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -94,7 +96,7 @@ struct rvol {
     pthread_mutex_t mu; /* the core, the index, the cursors, the inbox; below buf_lock (jr_ops.admit takes it) */
     pthread_cond_t cv;
     pthread_t th;
-    int started, stop, mode, failed;
+    int started, stop, mode, failed, set_changed;
     struct repl *core;
     struct replfile *rf;
     struct replfile_state st;
@@ -142,6 +144,7 @@ static struct {
     uint64_t fileno;
     int mutant; /* RM_*: tests only */
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
+    int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -383,6 +386,9 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
         plink_send(l, RW_T_MSG, b, n, 0);
 }
 
+static void vol_fail(struct rvol *rv, const char *why);
+static void cvol_close(uint32_t v);
+
 /* An APPEND to peer `to` of the records [buf, buf + len) of segment seq at off (whole WAL records), positions
  * first .. last. Under rv->mu. 0 once queued. */
 static int send_records(struct rvol *rv, int to, uint64_t seq, uint64_t off, const uint8_t *buf, size_t len,
@@ -422,8 +428,11 @@ static int send_records(struct rvol *rv, int to, uint64_t seq, uint64_t off, con
                          .leader = rv->self, .prev_pos = first - 1, .prev_epoch = epoch_at(rv, first - 1),
                          .commit = repl_commit(rv->core), .nrec = nrec, .rec = rv->recs, .meta.leader = -1};
     size_t cap = rw_msg_size(nrec, len);
-    if (cap > PL_FRAME_MAX)
+    if (cap > PL_FRAME_MAX) {
+        if (nrec == 1) /* never sent, so never committed: a backstop for jr_rec_max_rows (src/internal.h) */
+            vol_fail(rv, "a WAL record larger than a peer frame");
         return -1;
+    }
     uint8_t *b = malloc(cap);
     size_t n = b ? rw_encode_msg(b, cap, rv->number, &m, rv->lens, seq, off, buf, len) : 0;
     int rc = n ? plink_send(l, RW_T_MSG, b, n, 0) : -1;
@@ -484,6 +493,13 @@ static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
     struct rvol *rv = ctx;
     pthread_mutex_lock(&rv->mu);
     uint64_t pos = 0;
+    /* M_PROMOTING: the new writer engine is listed (tsdb_cvol_replace) before the driver's mode says so; a write in
+     * that window is refused for a retry, never taken as a sign that this node no longer leads (that deposed the
+     * fresh leader for good) */
+    if (rv->mode == M_PROMOTING) {
+        pthread_mutex_unlock(&rv->mu);
+        return TSDB_ERR_UNAVAILABLE;
+    }
     int rc = rv->mode == M_WRITER && rv->core ? repl_write(rv->core, span, &pos) : REPL_E_NOTLEADER;
     if (rc == REPL_OK && pos != fno) {
         eng_fail(db, "replication: the core's position is not the log number", TSDB_ERR_CORRUPT);
@@ -850,6 +866,14 @@ static void exec(struct rvol *rv, struct repl_action *a)
             }
         } else if (a->idx < rv->cur.m.nrec) {
             uint32_t i = a->idx;
+            wal_rec wr;
+            /* the core's position is the descriptor's; the engine's is the record's own header: they must agree */
+            if (wal_record(rv->cur.bytes + rv->coff[i], rv->cur.lens[i], rv->cur.seq, rv->cur.off + rv->coff[i],
+                           &wr) != rv->cur.lens[i] ||
+                wr.fno != a->rec.pos || wr.span != a->rec.n) {
+                vol_fail(rv, "a record's header does not match its descriptor");
+                break;
+            }
             pthread_mutex_unlock(&rv->mu);
             rc = replica_append(db, rv->cur.seq, rv->cur.off + rv->coff[i], rv->cur.bytes + rv->coff[i],
                                 rv->cur.lens[i]);
@@ -956,6 +980,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
             tsdb_cvol_unref(&db);
             pthread_mutex_unlock(&rv->mu);
             rc = tsdb_cvol_replace(G.t, rv->number, promote_fn, rv, CVOL_WRITER);
+            if (G.promote_wait) /* a fault for tests: writes reach the new writer before its mode is M_WRITER */
+                nanosleep(&(struct timespec){1, 0}, NULL);
             pthread_mutex_lock(&rv->mu);
             if (rc != 0) {
                 vol_fail(rv, "the promotion to the writer failed");
@@ -1233,7 +1259,8 @@ void repld_init(tsdb *t, const char *dir)
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
     const char *te = getenv("TSDB_REPLD_TEST");
-    G.drop_bulk = te && !strcmp(te, "dropbulk");
+    G.drop_bulk = te && strstr(te, "dropbulk");
+    G.promote_wait = te && strstr(te, "promotewait");
     G.t = t;
     snprintf(G.dir, sizeof G.dir, "%s", dir);
 }
@@ -1275,6 +1302,14 @@ int repld_open(const struct cluster_vol_rec *r)
             goto fail;
         }
     }
+    pthread_mutex_lock(&G.mu);
+    int room = G.nvols < CLUSTER_REPORT_VOLS;
+    pthread_mutex_unlock(&G.mu);
+    if (!room) { /* before the open: an engine without a driver would stay open, and every retry be refused */
+        say("volume %" PRIu32 ": not opened: this node drives %d volumes already", r->number, CLUSTER_REPORT_VOLS);
+        rc = TSDB_ERR_NOMEM;
+        goto fail;
+    }
     rc = tsdb_cvol_open(G.t, r->number, rv->dir, true, rv->st.floor);
     if (rc != 0) {
         say("volume %" PRIu32 ": the open of %s failed: %s", r->number, rv->dir, tsdb_strerror(rc));
@@ -1309,19 +1344,30 @@ int repld_open(const struct cluster_vol_rec *r)
     rv->core = repl_open(&cfg, &d);
     if (!rv->core) {
         say("volume %" PRIu32 ": the replication core refused the state of %s", r->number, rv->dir);
+        cvol_close(r->number);
         goto fail;
     }
     rv->epoch = repl_epoch(rv->core);
     /* what the line below logs, read before the thread starts: from then on rv->st and log_start are its (under mu) */
     uint64_t said_start = rv->log_start, said_floor = rv->st.floor, said_fence = rv->st.fence;
     pthread_mutex_lock(&G.mu);
-    int room = G.nvols < CLUSTER_REPORT_VOLS;
+    room = G.nvols < CLUSTER_REPORT_VOLS; /* checked before the open; repld_open runs on the manager thread only */
     if (room)
         G.vols[G.nvols++] = rv;
     pthread_mutex_unlock(&G.mu);
     if (!room || pthread_create(&rv->th, NULL, vol_main, rv) != 0) {
         say("volume %" PRIu32 ": no driver thread", r->number);
-        return TSDB_ERR_NOMEM; /* listed but not started: its frames queue and are freed at stop */
+        if (room) {
+            pthread_mutex_lock(&rv->mu);
+            vol_fail(rv, "no driver thread"); /* listed but not started: reported failed, closed at stop */
+            pthread_mutex_unlock(&rv->mu);
+            tsdb_volume_quiesce(G.t, r->number);
+        } else {
+            cvol_close(r->number);
+            repl_free(rv->core);
+            goto fail;
+        }
+        return TSDB_ERR_NOMEM;
     }
     rv->started = 1;
     post(rv, IN_META, 0, NULL, 0);
@@ -1344,8 +1390,15 @@ void repld_update(const struct cluster_vol_rec *r)
     links_up(r);
     pthread_mutex_lock(&rv->mu);
     int changed = r->epoch != rv->rec.epoch || r->isr_version != rv->rec.isr_version || r->leader != rv->rec.leader;
-    if (r->nrep == rv->rec.nrep)
+    int same = r->nrep == rv->rec.nrep;
+    for (uint32_t i = 0; same && i < r->nrep; i++)
+        same = r->rep[i].node == rv->rec.rep[i].node; /* a rid is filled in at its first open */
+    if (same)
         rv->rec = *r; /* the replica set is fixed for a volume's driver (a move: r3e and later) */
+    else if (!rv->set_changed) { /* a member's cursor and acks must never pass to another node: ignored, said once */
+        rv->set_changed = 1;
+        say("volume %" PRIu32 ": its replica set changed; this driver keeps the old one until a restart", r->number);
+    }
     pthread_mutex_unlock(&rv->mu);
     if (changed)
         post(rv, IN_META, 0, NULL, 0);
@@ -1374,6 +1427,31 @@ int repld_engine_failed(uint32_t v, const char *msg)
     if (first)
         tsdb_volume_quiesce(G.t, v); /* clients get UNAVAILABLE and go to the volume's next leader */
     return 1;
+}
+
+static int close_fn(void *ctx, struct eng **old, struct eng **neu)
+{
+    (void)ctx;
+    eng_close(*old); /* its error is the failure the driver stopped the volume on (or an open it never finished) */
+    *old = NULL;
+    *neu = NULL;
+    return 0;
+}
+
+/* Closes volume v's engine and leaves its slot free for a later tsdb_cvol_open. */
+static void cvol_close(uint32_t v)
+{
+    (void)tsdb_cvol_replace(G.t, v, close_fn, NULL, CVOL_NONE); /* TSDB_ERR_IO by contract: closed, nothing new */
+}
+
+void repld_close_failed(void)
+{
+    pthread_mutex_lock(&G.mu);
+    uint32_t n = G.nvols;
+    pthread_mutex_unlock(&G.mu);
+    for (uint32_t i = 0; i < n; i++)
+        if (repld_failed(G.vols[i]->number) && !G.vols[i]->started)
+            cvol_close(G.vols[i]->number);
 }
 
 void repld_stop(void)

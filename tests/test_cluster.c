@@ -3012,8 +3012,12 @@ static void scen_replicate(void)
 static void scen_replindet(void)
 {
     scenario("replindet");
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
+        /* every node may lead: rep_series' retries reach the new writer between its swap and M_WRITER, where a
+         * write once deposed the fresh leader for good (the volume then answered UNAVAILABLE until a restart) */
+        penv[i] = "TSDB_REPLD_TEST=promotewait";
         start(i);
+    }
     init_cluster(0, 600);
     node_add(0, 1);
     node_add(0, 2);

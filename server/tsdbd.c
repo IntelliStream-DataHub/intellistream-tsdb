@@ -4783,21 +4783,14 @@ int main(int argc, char **argv)
         close(new_fds[i]);
     free(new_fds);
     dom_shutdown();
-    /* A cluster volume its driver stopped on an engine failure (D13) fails the close as well, by design; that is no
-     * failure of the server. (A close-time error of another volume is then reported but no longer sets the status.) */
-    int failed = 0, cvol_failed = 0;
-    for (size_t v = 0, nv = tsdb_volume_count(db); v < nv; v++)
-        if (tsdb_volume_failed(db, (uint32_t)v, NULL, 0) != 0) {
-            if (v > 0 && repld_failed((uint32_t)v))
-                cvol_failed = 1;
-            else
-                failed = 1;
-        }
+    /* A cluster volume its driver stopped on an engine failure (D13) is no failure of the server: it is closed first
+     * (repld_close_failed), so that tsdb_close's result is the other volumes' alone. (tsdb_volume_failed is no test
+     * of the others: a slot with no engine, such as a cluster volume refused at its open, answers TSDB_ERR_INVALID.) */
+    repld_close_failed();
     rc = tsdb_close(db);
     if (atomic_load(&db_failed))
         return 1; /* close failed too, by design: nothing more was written */
     if (rc)
-        fprintf(stderr, "tsdbd: close: %s%s\n", tsdb_strerror(rc),
-                cvol_failed && !failed ? " (a cluster volume stopped on its engine's failure)" : "");
-    return rc && (failed || !cvol_failed) ? 1 : 0;
+        fprintf(stderr, "tsdbd: close: %s\n", tsdb_strerror(rc));
+    return rc ? 1 : 0;
 }

@@ -29,5 +29,8 @@ int repld_failed(uint32_t v);
 int repld_engine_failed(uint32_t v, const char *msg);
 /* Stops every driver thread and the links (before the handle is closed). */
 void repld_stop(void);
+/* After repld_stop: closes the engines of the volumes the driver stopped on a failure (D13), whose close fails by
+ * design; tsdb_close then reports the other volumes' errors only. */
+void repld_close_failed(void);
 
 #endif

@@ -171,7 +171,11 @@ cgroup, so `nice` does not keep your work out of its way.
   state machine (members, volumes, replicas, epochs, ISR, slots, users; entries of ops, snapshots, the §13.1
   invariants as `meta_check_step`). `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
-  add|status`). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  add|status`). `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
+  (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
+  over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below
+  `jr_rec_max_rows` so that it fits one peer frame. `TSDB_REPLD_MUTANT` and `TSDB_REPLD_TEST` are its test hooks
+  (`make repld-mutants`); `test_cluster replicate|replindet|replfail` its end-to-end tests. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs). The metadata state (NODE, IDENT, `raft/`, snapshot, `copy`, `retired`) lives in
@@ -309,6 +313,9 @@ cgroup, so `nice` does not keep your work out of its way.
   tsdbd exits with status 1, except for a volume under a `--health-domain` (ha.md 15; the root, USERS and every
   volume outside a domain still end the process): that volume is quiesced, answers `TSDB_ERR_UNAVAILABLE`, and
   `dom_recover` reopens it in the process once its domain is not DOWN (the section on **Storage outages** below).
+  A cluster volume that replicates (`server/repld.c`, D13) is the other exception: its driver stops it (a writer is
+  deposed), it is quiesced and reported LOCAL_FAULT in the heartbeat, tsdbd serves its other volumes and its vote and
+  exits 0 on SIGTERM (the failed volume is closed before `tsdb_close`, whose errors still set status 1).
   A retried fsync can return 0 after the kernel
   dropped the dirty pages, so it proves nothing; only a reopen, which replays
   from what is on disk, is safe. Every directory fsync goes through
