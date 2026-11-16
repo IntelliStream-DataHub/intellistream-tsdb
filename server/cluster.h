@@ -124,6 +124,19 @@ struct cluster_vol_rec {
     uint64_t epoch;
     uint64_t rid, open_gen; /* this server's replica: its instance and the last REPLICA_OPEN generation committed */
     uint64_t open_nonce;    /* and the nonce committed with it */
+    /* replication (server/repld.c): the replicas in record order (the node index of the core, src/repl.h, is the
+     * position here), with the peer address of each server as the member list holds it */
+    uint32_t nrep;
+    struct cluster_vol_rep {
+        uint32_t node;
+        uint64_t rid;
+        uint8_t learner;
+        char peer[META_ADDR_MAX];
+    } rep[META_REPLICAS_MAX];
+    uint32_t nisr;
+    uint32_t isr[META_REPLICAS_MAX]; /* node ids */
+    uint64_t isr_version;
+    uint32_t min_isr, isr_lag_ms;
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
  * holds every REPLICA_OPEN committed before this start), with every replicated volume that names this server (`self`)

@@ -3889,6 +3889,19 @@ static void vol_watch_duty(void)
             r->rid = v->rep[k].rid;
             r->open_gen = v->rep[k].open_gen;
             r->open_nonce = v->rep[k].open_nonce;
+            r->nrep = v->nrep;
+            for (uint32_t j = 0; j < v->nrep && j < META_REPLICAS_MAX; j++) {
+                const struct meta_member *mm = meta_member(&C.sm, v->rep[j].node);
+                r->rep[j].node = v->rep[j].node;
+                r->rep[j].rid = v->rep[j].rid;
+                r->rep[j].learner = v->rep[j].learner;
+                snprintf(r->rep[j].peer, sizeof r->rep[j].peer, "%s", mm ? mm->peer : "");
+            }
+            r->nisr = v->nisr;
+            memcpy(r->isr, v->isr, sizeof r->isr);
+            r->isr_version = v->isr_version;
+            r->min_isr = v->min_isr;
+            r->isr_lag_ms = C.sm.set.isr_lag_ms;
             break;
         }
     }
