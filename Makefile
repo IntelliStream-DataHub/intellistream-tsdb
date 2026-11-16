@@ -54,7 +54,7 @@ FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users cl
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
-FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o
+FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -465,7 +465,7 @@ $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuz
 	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
-$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o server/peerlink.h
+$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o server/peerlink.h server/replwire.h
 $(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
@@ -776,7 +776,10 @@ $(B)/repl.o: src/repl.c src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(RAFT_OBJ)
+# the replication driver's payloads on the data links (server/replwire.h)
+$(B)/replwire.o: server/replwire.c server/replwire.h src/repl.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(RAFT_OBJ)
 $(B)/tsdb: $(B)/cluster-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<

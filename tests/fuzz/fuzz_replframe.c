@@ -3,19 +3,23 @@
  * The data links' frame decoders (server/peerlink.c) on arbitrary bytes: the stream splitter with its length and
  * type checks, the zstd frames of a compressed log frame (a raw length that is not the decoded size, a bomb), the
  * link's own frame bodies (BEGIN, RESUME, CHUNK, END, DONE), the HELLO that carries the link kind, and the streaming
- * xxh64 against the one-shot. r3d-stream extends this harness with the replication message decoder.
+ * xxh64 against the one-shot, and the replication driver's payloads (server/replwire.c).
  *
- * Input: byte 0 picks the mode (mod 5), the rest is the data:
+ * Input: byte 0 picks the mode (mod 8), the rest is the data:
  *   0  a byte stream of frames, tags not checked, fed in pieces whose sizes come from byte 1
  *   1  one frame body: byte 1 is the type, the rest the payload
  *   2  a round trip: the data is encoded as a (compressed) frame of type byte 1 and must come back exactly, with
  *      its tag checked
  *   3  a HELLO body
  *   4  the data hashed whole and in two pieces (cut at byte 1 mod len) against xxh64()
+ *   5  a replication message (RW_T_MSG); one that decodes must encode back to the same bytes
+ *   6  a FETCH body, then the same as a bulk meta; each that decodes must encode back to the same bytes
+ *   7  a replication message decoded with room for byte 1 records only
  */
 #include "fuzz.h"
 #include "internal.h"
 #include "peerlink.h"
+#include "replwire.h"
 
 static const uint8_t KEY[32] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
                                 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32};
@@ -73,7 +77,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size < 2)
         return 0;
-    int mode = data[0] % 5;
+    int mode = data[0] % 8;
     uint8_t arg = data[1];
     size_t n = size - 2;
     /* an exact-size copy: a read past the end is the sanitizer's to find */
@@ -123,6 +127,37 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         }
         pl_reader_free(r);
         free(fr);
+    } else if (mode == 5 || mode == 7) {
+        uint32_t cap = mode == 7 ? arg : 4096;
+        struct repl_rec *recs = malloc((cap ? cap : 1) * sizeof *recs);
+        uint32_t *lens = malloc((cap ? cap : 1) * sizeof *lens);
+        struct rw_msg m;
+        if (rw_decode_msg(p, n, &m, recs, lens, cap) == 0) {
+            if (m.m.nrec > cap || (m.nbytes && (m.bytes < p || m.bytes + m.nbytes != p + n)))
+                abort();
+            uint8_t *back = malloc(n ? n : 1);
+            size_t bl = rw_encode_msg(back, n, m.volume, &m.m, m.lens, m.seq, m.off, m.bytes, m.nbytes);
+            if (bl != n || memcmp(back, p, n) != 0)
+                abort();
+            free(back);
+        }
+        free(recs);
+        free(lens);
+    } else if (mode == 6) {
+        uint32_t vol;
+        uint64_t size;
+        char name[RW_NAME_MAX + 1];
+        uint8_t back[RW_NAME_MAX + 32];
+        if (rw_decode_fetch(p, n, &vol, name, sizeof name) == 0) {
+            size_t bl = rw_encode_fetch(back, sizeof back, vol, name);
+            if (bl != n || memcmp(back, p, n) != 0)
+                abort();
+        }
+        if (rw_decode_bulk_meta(p, n, &vol, &size, name, sizeof name) == 0) {
+            size_t bl = rw_encode_bulk_meta(back, sizeof back, vol, size, name);
+            if (bl != n || memcmp(back, p, n) != 0 || n > PL_META_MAX)
+                abort();
+        }
     } else if (mode == 3) {
         int k = peerlink_hello_kind(p, n);
         if (k < -1 || k > 255)
@@ -142,7 +177,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
 static void put_frame(const char *dir, const char *name, int mode, uint8_t arg, const void *body, size_t n)
 {
+    if (n > (1u << 24))
+        abort();
     uint8_t *b = malloc(n + 2);
+    if (!b)
+        abort();
     b[0] = (uint8_t)mode;
     b[1] = arg;
     if (n)
@@ -190,4 +229,30 @@ void fuzz_seeds(const char *dir)
     le(h, PL_CL_MAGIC, 4), h[4] = PL_CL_VERSION, le(h + 5, 2, 4), le(h + 73, 0, 2), h[75] = PL_KIND_LOG;
     put_frame(dir, "seed-hello", 3, 0, h, 76);
     put_frame(dir, "seed-xxh", 4, 3, text, sizeof text);
+    /* replication messages: an ACK, and an APPEND of two records (5 and 1 positions) of 40 and 32 bytes */
+    static uint8_t mb[RW_HEAD + RW_APPEND_HEAD + 2 * RW_DESC + 72];
+    struct repl_msg am = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 3, .leader = -1, .durable = 90,
+                          .written = 95, .rid = 77, .start = 1, .meta.leader = -1};
+    size_t ml = rw_encode_msg(mb, sizeof mb, 4, &am, NULL, 0, 0, NULL, 0);
+    if (!ml)
+        abort();
+    put_frame(dir, "seed-rw-ack", 5, 0, mb, ml);
+    struct repl_rec rr[2] = {{.pos = 11, .epoch = 3, .n = 5}, {.pos = 16, .epoch = 3, .n = 1}};
+    uint32_t rl[2] = {40, 32};
+    struct repl_msg ap = {.type = REPL_M_APPEND, .from = 0, .to = 2, .epoch = 3, .leader = 0, .prev_pos = 10,
+                          .prev_epoch = 3, .commit = 9, .nrec = 2, .rec = rr, .meta.leader = -1};
+    ml = rw_encode_msg(mb, sizeof mb, 4, &ap, rl, 1ull << 40, 4096, text, 72);
+    if (!ml)
+        abort();
+    put_frame(dir, "seed-rw-append", 5, 0, mb, ml);
+    put_frame(dir, "seed-rw-append-cap1", 7, 1, mb, ml);
+    uint8_t fb[64];
+    size_t fl2 = rw_encode_fetch(fb, sizeof fb, 4, "p19000_1_2_0.part");
+    if (!fl2)
+        abort();
+    put_frame(dir, "seed-rw-fetch", 6, 0, fb, fl2);
+    fl2 = rw_encode_bulk_meta(fb, sizeof fb, 4, 123456, "p19000_1_2_0.part");
+    if (!fl2)
+        abort();
+    put_frame(dir, "seed-rw-bulkmeta", 6, 0, fb, fl2);
 }
