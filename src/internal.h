@@ -73,7 +73,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_READ_NO_GAP, MUT_LEADER_READ_CURSOR_ANY, MUT_LEADER_READ_TAILOK_SEALED,
        MUT_LEADER_READ_NOTFOUND_SEALED, MUT_LEADER_NO_SWEEP, MUT_LEADER_B0_OFF,
        MUT_REPLICA_APPLY_HOLDS_MU, MUT_REPLICA_PREP_NO_CUT_GEN, MUT_LEADER_DROP_UNHELD,
-       MUT_LEADER_LINK_BY_NAME, MUT_LEADER_RS_NO_PRUNE, MUT_LEADER_RS_PRUNE_ALL };
+       MUT_LEADER_LINK_BY_NAME, MUT_LEADER_RS_NO_PRUNE, MUT_LEADER_RS_PRUNE_ALL, MUT_LEADER_NOTE_LATE,
+       MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1324,7 +1325,8 @@ void mt_note_fno(memtable *m, uint64_t first, size_t n);
 int mt_flush(struct eng *db);
 int mt_flush_ex(struct eng *db, const mk *marker, uint64_t *fno); /* mt_flush with a marker as the new segment's first record */
 int mt_flush_held(struct eng *db, const mk *marker, uint64_t *fno); /* the same, flush_lock held by the caller */
-extern void (*eng_test_drop_hook)(struct eng *db); /* test hook: a leader's DROP between its marker and the retire */
+extern void (*eng_test_drop_hook)(struct eng *db, int at); /* test hook: a leader's DROP; at 0 before flush_lock, 1 between
+                                                            * its marker and the retire */
 int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
                size_t n, int type);
 /* WAL records, version 2 (format 9, docs/design-cdc.md 2.1):
@@ -1364,6 +1366,8 @@ int wal_marker_mk(struct eng *db, const mk *m, uint64_t *fno);
  * them once; *fno gets the first number, *last the last position. A non-zero return before the sync means nothing of
  * the batch is in the log. */
 int wal_markers_mk(struct eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last);
+int wal_markers_mk_at(struct eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last,
+                      void (*at)(struct eng *, uint64_t, void *), void *arg);
 
 /* The namespace-event hook (docs/design-ha-modes.md 2.1, M15): one call at each place a name or a file becomes
  * visible, in two phases. jr_intent runs before publish_lock is taken (a replicated backend appends the marker and
@@ -1859,7 +1863,7 @@ struct eng {
     struct lkfile {
         uint64_t fno, key;
     } *lf;                       /* with jr: the stage_ links of COMMIT markers in the log (leader_commit; lead_mu) */
-    size_t nlf, caplf;
+    size_t nlf, caplf, rlf;      /* rlf: entries of lf reserved by COMMITs about to append their marker (lead_mu) */
     uint64_t lrd_seq, lrd_off, lrd_next; /* where the last read of the log by position ended (replica_read; lead_mu) */
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */

@@ -841,6 +841,15 @@ int wal_marker_mk(eng *db, const mk *m, uint64_t *fno)
 
 int wal_markers_mk(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last)
 {
+    return wal_markers_mk_at(db, m, n, fno, last, NULL, NULL);
+}
+
+/* `at`, when given, runs under buf_lock once the numbers are assigned, before the records can reach the file (and so
+ * before anyone can read them by position): a leader notes there what a reader of the marker may ask for. It takes
+ * only leaf locks (lead_mu) and cannot fail. */
+int wal_markers_mk_at(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last, void (*at)(eng *, uint64_t, void *),
+                      void *arg)
+{
     if (n == 0)
         return TSDB_ERR_INVALID;
     uint8_t **enc = calloc(n, sizeof *enc);
@@ -858,6 +867,8 @@ int wal_markers_mk(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last
     if (rc == 0) {
         pthread_mutex_lock(&db->buf_lock);
         rc = wal_markers_locked(db, r, n, fno, &lsn);
+        if (rc == 0 && at)
+            at(db, *fno, arg);
         pthread_mutex_unlock(&db->buf_lock);
     }
     for (size_t i = 0; enc && i < n; i++)

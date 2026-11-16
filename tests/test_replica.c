@@ -2288,31 +2288,57 @@ static struct {
     int rc;
     uint64_t dur, want;
     void (*then)(void); /* the cut race: what the hook does instead */
+    int at;             /* the window it fires in (RH_*) */
+    int mode;           /* AC_SHIP: append, sync, durable end; AC_ENDS: the three ends; AC_STAGE: a replica_stage that
+                         * must wait for the prepare's stage_mu */
+    bool refuse;        /* at RH_COMMIT_OPEN: the staged file's open is refused */
 } AC;
+enum { AC_SHIP, AC_ENDS, AC_STAGE };
+
+static void ac_arm(xport *x, int at, int mode)
+{
+    AC.x = x, AC.fired = AC.ok = AC.refuse = false, AC.then = NULL, AC.at = at, AC.mode = mode, AC.rc = 0;
+    atomic_store(&AC.done, false);
+}
 
 static void *ac_thread(void *arg)
 {
     (void)arg;
-    AC.rc = xp_ship_logs(AC.x); /* replica_append and replica_sync */
-    AC.dur = replica_durable_end(AC.x->rep);
+    if (AC.mode == AC_SHIP) {
+        AC.rc = xp_ship_logs(AC.x); /* replica_append and replica_sync */
+        AC.dur = replica_durable_end(AC.x->rep);
+    } else if (AC.mode == AC_ENDS) {
+        AC.dur = replica_durable_end(AC.x->rep);
+        AC.rc = replica_log_end(AC.x->rep) >= AC.dur && replica_applied_end(AC.x->rep) < AC.dur ? 0 : -1;
+    } else {
+        AC.rc = replica_stage(AC.x->rep, AC.x->held_name, AC.x->held, AC.x->held_len);
+    }
     atomic_store(&AC.done, true);
     return NULL;
 }
 
-static void ac_hook(eng *db)
+static int ac_hook(eng *db, int at)
 {
-    if (AC.fired || !AC.x || db != AC.x->rep)
-        return;
+    if (at != AC.at || AC.fired || !AC.x || db != AC.x->rep)
+        return 0;
     AC.fired = true;
+    if (AC.refuse)
+        return 1;
     if (AC.then) {
         AC.then();
-        return;
+        return 0;
     }
     if (pthread_create(&AC.t, NULL, ac_thread, NULL) != 0)
-        return;
+        return 0;
+    if (AC.mode == AC_STAGE) { /* it must not get in while the prepare reads and links the staged files */
+        usleep(300000);
+        AC.ok = !atomic_load(&AC.done);
+        return 0;
+    }
     for (int i = 0; i < 2500 && !atomic_load(&AC.done); i++) /* 5 s: the thread needs one append and one sync */
         usleep(2000);
-    AC.ok = atomic_load(&AC.done) && AC.rc == 0 && AC.dur == AC.want;
+    AC.ok = atomic_load(&AC.done) && AC.rc == 0 && (AC.mode != AC_SHIP || AC.dur == AC.want);
+    return 0;
 }
 
 static void case_apply_concurrent(void)
@@ -2329,8 +2355,8 @@ static void case_apply_concurrent(void)
     CHECK_EQ(replica_durable_end(x.rep), cpos);
     x.noship = true;
     xp_rows(&x, 1, 20, 5, 500); /* rows after it, written by the leader and not yet sent */
-    AC.x = &x, AC.fired = AC.ok = false, AC.then = NULL, AC.want = ld_last(&x);
-    atomic_store(&AC.done, false);
+    ac_arm(&x, RH_COMMIT_FLUSHED, AC_SHIP);
+    AC.want = ld_last(&x);
     CHECK(AC.want > cpos);
     replica_test_apply_hook = ac_hook;
     CHECK_EQ(replica_apply(x.rep, cpos), 0);
@@ -2356,6 +2382,11 @@ static void case_apply_concurrent(void)
  * is prepared again and applied). */
 static uint64_t AR_CUT;
 static void ar_cut(void) { CHECK_EQ(replica_cut(AC.x->rep, AR_CUT), 0); }
+static void ar_cut_applied(void)
+{
+    AR_CUT = replica_applied_end(AC.x->rep);
+    CHECK_EQ(replica_cut(AC.x->rep, AR_CUT), 0);
+}
 
 static void case_apply_cut_race(int variant)
 {
@@ -2374,8 +2405,9 @@ static void case_apply_cut_race(int variant)
     xp_rows(&x, 1, 20, 5, 500); /* records after it */
     CHECK_EQ(xp_ship_logs(&x), 0);
     CHECK_EQ(replica_durable_end(x.rep), ld_last(&x));
-    AR_CUT = variant ? cpos : cpos - 1;
-    AC.x = &x, AC.fired = false, AC.then = ar_cut;
+    AR_CUT = variant == 1 ? cpos : cpos - 1;
+    ac_arm(&x, variant == 2 ? RH_COMMIT_PREPARED : RH_COMMIT_FLUSHED, AC_SHIP); /* 2: after the links are made */
+    AC.then = ar_cut;
     replica_test_apply_hook = ac_hook;
     CHECK_EQ(replica_apply(x.rep, cpos), 0);
     replica_test_apply_hook = NULL;
@@ -2384,10 +2416,12 @@ static void case_apply_cut_race(int variant)
     CHECK_EQ(eng_check(x.rep), 0);
     CHECK_EQ(replica_log_end(x.rep), AR_CUT);
     CHECK_EQ(replica_applied_end(x.rep), AR_CUT);
+    if (count_files(rd, "tmp_") != 0)
+        fprintf(stderr, "%s: a tmp_ link of the prepare is left after the cut (mutant discardnounlink)\n", what);
     CHECK_EQ(count_files(rd, "tmp_"), 0); /* the prepare's links are gone */
     qctx q = {.n = 0};
     CHECK_EQ(eng_query_raw_ex(x.rep, 0, T0 - 1000, T0 + 1000LL * (NT + 1), false, 0, qfn, &q), 0);
-    if (variant == 0) {
+    if (variant != 1) {
         CHECK_EQ(count_files(rd, "stage_"), 0);
         if (q.n != 10)
             fprintf(stderr, "%s: the replica shows %zu rows of series 0 after a cut of the COMMIT it was preparing, not 10 "
@@ -2403,11 +2437,223 @@ static void case_apply_cut_race(int variant)
     CHECK_EQ(open_replica(rd, 0, &x.rep), 0);
     xp_resume(&x, rd);
     CHECK_EQ(xp_ship_logs(&x), 0);
-    if (variant == 0)
+    if (variant != 1)
         CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
     x.noapply = false;
     xp_step(&x, what);
     CHECK_EQ(count_files(rd, "stage_"), 0);
+    xp_stop(&x);
+}
+
+/* r3g REVIEW F2, F3: the other windows of the applier. AW_DROP and AW_CLASS pause a DROP's flush and a CLASS purge (rp->mu
+ * free: mutants dropmu, classmu); AW_YIELD pauses between two row records (rp->mu free: mutant rowsholdmu); AW_ENDS pauses
+ * inside a row record's apply (rp->mu held) and reads the three ends (mutant endsmu); AW_STAGE pauses a COMMIT's prepare
+ * with a staged file linked and not yet opened, and a replica_stage of that file must wait (mutant nostagemu). */
+enum { AW_DROP, AW_CLASS, AW_YIELD, AW_ENDS, AW_STAGE };
+
+static uint64_t aw_marker(xport *x, int kind)
+{
+    if (kind == AW_DROP) {
+        CHECK_EQ(eng_flush(x->ld), 0);
+        xp_step(x, "AW: flushed");
+        x->noapply = true;
+        CHECK_EQ(eng_drop_before(x->ld, T0 + 10 * DAY_MS), 0);
+    } else if (kind == AW_CLASS) {
+        eng_leader_replay_floor(x->ld, x->ld->fno_next);
+        x->noapply = true;
+        CHECK_EQ(eng_class_switch(x->ld, 0, 2, NULL), 0);
+    } else if (kind == AW_STAGE) {
+        x->noapply = true;
+        xp_rows(x, 0, 5, 40, 2000); /* a COMMIT */
+    } else {
+        x->noapply = true;
+        for (int i = 0; i < 4; i++)
+            xp_rows(x, 1, 5 * i, 5, 300 + i); /* row records */
+        CHECK_EQ(xp_ship_logs(x), 0);
+    }
+    return ld_last(x);
+}
+
+static void case_apply_windows(int kind)
+{
+    static const char *const names[] = {"awdrop", "awclass", "awyield", "awends", "awstage"};
+    static const char *const muts[] = {"dropmu", "classmu", "rowsholdmu", "endsmu", "nostagemu"};
+    static const int ats[] = {RH_DROP, RH_CLASS, RH_ROWS_YIELD, RH_ROWS_HELD, RH_COMMIT_OPEN};
+    static const int modes[] = {AC_SHIP, AC_SHIP, AC_SHIP, AC_ENDS, AC_STAGE};
+    xport x;
+    xp_start(&x, names[kind]);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "AW: rows");
+    uint64_t pos = aw_marker(&x, kind);
+    if (modes[kind] == AC_SHIP) {
+        x.noship = true;
+        xp_rows(&x, 1, 40, 5, 500); /* rows after it, written by the leader and not yet sent */
+    }
+    ac_arm(&x, ats[kind], modes[kind]);
+    AC.want = ld_last(&x);
+    replica_test_apply_hook = ac_hook;
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    replica_test_apply_hook = NULL;
+    CHECK(AC.fired);
+    if (!AC.ok)
+        fprintf(stderr, "%s: the other thread %s (mutant %s)\n", names[kind],
+                modes[kind] == AC_STAGE ? "staged a file while the prepare read it" : "waited for the apply", muts[kind]);
+    CHECK(AC.ok);
+    if (AC.fired)
+        join_within(AC.t, &AC.done, "AW: the other thread did not end");
+    AC.x = NULL;
+    CHECK_EQ(replica_applied_end(x.rep), pos);
+    x.noapply = x.noship = false;
+    xp_step(&x, "AW: after");
+    xp_stop(&x);
+}
+
+/* r3g REVIEW F3: a cut while a DROP's flush or a CLASS purge runs without rp->mu removes the marker: the replica must not
+ * act on it (mutants dropnogen: the partitions are retired anyway; classnogen: the switch is recorded anyway) */
+static off_t file_size(const char *dir, const char *name)
+{
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    struct stat st;
+    return stat(p, &st) == 0 ? st.st_size : -1;
+}
+
+static void case_apply_marker_cut(int kind)
+{
+    xport x;
+    char rd[PATH_MAX];
+    xp_start(&x, kind == AW_DROP ? "amcdrop" : "amcclass");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "AMC: rows");
+    if (kind == AW_DROP) {
+        CHECK_EQ(eng_flush(x.ld), 0);
+        xp_step(&x, "AMC: flushed");
+    }
+    off_t cls0 = file_size(rd, "CLASSES");
+    uint64_t pos = aw_marker(&x, kind);
+    ac_arm(&x, kind == AW_DROP ? RH_DROP : RH_CLASS, AC_SHIP);
+    AC.then = ar_cut_applied; /* the marker being applied and everything after it */
+    replica_test_apply_hook = ac_hook;
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    replica_test_apply_hook = NULL;
+    AC.x = NULL, AC.then = NULL;
+    CHECK(AC.fired);
+    CHECK_EQ(eng_check(x.rep), 0);
+    CHECK_EQ(replica_applied_end(x.rep), AR_CUT);
+    if (kind == AW_DROP) {
+        qctx q = {.n = 0};
+        CHECK_EQ(eng_query_raw_ex(x.rep, 0, T0 - 1000, T0 + 1000LL * (NT + 1), false, 0, qfn, &q), 0);
+        if (q.n != 10)
+            fprintf(stderr, "AMC: the replica retired the partitions of a DROP that was cut (%zu rows; mutant dropnogen)\n",
+                    q.n);
+        CHECK_EQ(q.n, 10);
+    } else {
+        off_t cls1 = file_size(rd, "CLASSES");
+        if (cls1 != cls0)
+            fprintf(stderr, "AMC: the replica recorded a class switch that was cut (CLASSES %lld -> %lld bytes; mutant "
+                            "classnogen)\n", (long long)cls0, (long long)cls1);
+        CHECK_EQ(cls1, cls0);
+    }
+    eng_close(x.rep);
+    x.rep = NULL;
+    CHECK_EQ(open_replica(rd, 0, &x.rep), 0);
+    xp_resume(&x, rd);
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    x.noapply = false;
+    xp_step(&x, "AMC: after");
+    xp_stop(&x);
+}
+
+/* r3g REVIEW F3b: a staged file whose open fails leaves no tmp_0_ link behind (mutant openfailnounlink) */
+static void case_apply_open_refused(void)
+{
+    xport x;
+    char rd[PATH_MAX];
+    xp_start(&x, "aor");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "AOR: rows");
+    uint64_t pos = aw_marker(&x, AW_STAGE);
+    ac_arm(&x, RH_COMMIT_OPEN, AC_SHIP);
+    AC.refuse = true;
+    replica_test_apply_hook = ac_hook;
+    CHECK(replica_apply(x.rep, pos) != 0);
+    replica_test_apply_hook = NULL;
+    AC.x = NULL;
+    CHECK(AC.fired);
+    if (count_files(rd, "tmp_") != 0)
+        fprintf(stderr, "AOR: a refused open left its tmp_ link (mutant openfailnounlink)\n");
+    CHECK_EQ(count_files(rd, "tmp_"), 0);
+    eng_close(x.rep); /* failed: a reopen applies the COMMIT from what is staged */
+    x.rep = NULL;
+    CHECK_EQ(open_replica(rd, 0, &x.rep), 0);
+    xp_resume(&x, rd);
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    x.noapply = false;
+    xp_step(&x, "AOR: after");
+    xp_stop(&x);
+}
+
+/* r3g REVIEW F5: a promote that races an apply in one of its windows waits for it and succeeds, rather than being
+ * refused half way (mutant promotenoapplymu) */
+static struct {
+    eng *rep, *out;
+    uint64_t pos;
+    int rc;
+    atomic_bool done;
+    pthread_t t;
+    bool early;
+} PA;
+
+static void *pa_thread(void *arg)
+{
+    (void)arg;
+    PA.rc = replica_promote(&PA.rep, PA.pos, &PA.out);
+    atomic_store(&PA.done, true);
+    return NULL;
+}
+
+static void pa_then(void)
+{
+    if (pthread_create(&PA.t, NULL, pa_thread, NULL) != 0)
+        return;
+    usleep(300000);
+    PA.early = atomic_load(&PA.done);
+}
+
+static void case_promote_during_apply(void)
+{
+    xport x;
+    xp_start(&x, "pda");
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "PDA: rows");
+    x.noapply = true;
+    xp_rows(&x, 0, 5, 40, 2000); /* a COMMIT, shipped and staged, not applied */
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    uint64_t pos = 0;
+    CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), 0);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    PA.rep = x.rep, PA.out = NULL, PA.pos = pos, PA.rc = -1, PA.early = false;
+    atomic_store(&PA.done, false);
+    ac_arm(&x, RH_COMMIT_FLUSHED, AC_SHIP);
+    AC.then = pa_then;
+    replica_test_apply_hook = ac_hook;
+    CHECK_EQ(replica_apply(x.rep, pos), 0); /* x.rep is the promote's from here on */
+    replica_test_apply_hook = NULL;
+    AC.x = NULL, AC.then = NULL;
+    CHECK(AC.fired);
+    if (AC.fired)
+        join_within(PA.t, &PA.done, "PDA: the promote did not end");
+    if (PA.early || PA.rc != 0)
+        fprintf(stderr, "PDA: a promote during the apply %s (rc %d; mutant promotenoapplymu)\n",
+                PA.early ? "did not wait for it" : "failed", PA.rc);
+    CHECK(!PA.early);
+    CHECK_EQ(PA.rc, 0);
+    if (PA.rc == 0) {
+        x.rep = NULL;
+        eng_close(PA.out);
+    }
     xp_stop(&x);
 }
 
@@ -2435,9 +2681,9 @@ static void *df_thread(void *arg)
     return NULL;
 }
 
-static void df_hook(eng *db)
+static void df_hook(eng *db, int at)
 {
-    if (DF.fired || !DF.x || db != DF.x->ld)
+    if (at != 1 || DF.fired || !DF.x || db != DF.x->ld)
         return;
     DF.fired = true;
     if (pthread_create(&DF.t, NULL, df_thread, NULL) != 0)
@@ -4965,11 +5211,37 @@ static void case_hardlink(void)
  * names N at P1; reopened (a new leadership in the same process), its first large insert names N again, at P2, with
  * other bytes. P2 gives the new bytes; P1 is NOTFOUND (the replica takes a snapshot), never the new file under the old
  * marker, which a replica's check refuses and its catch-up stalls on. Mutant linkbyname: P1 serves the new file. */
+/* r3g REVIEW F1: a COMMIT's links are served from before its marker can be read (noted after the append, a replica asking
+ * between the sync and the note got NOTFOUND and went to a snapshot: mutant notelate) */
+static struct {
+    xport *x;
+    int rc;
+    bool fired;
+} LM;
+
+static void lm_hook(eng *db, uint64_t fno)
+{
+    if (LM.fired || !LM.x || db != LM.x->ld)
+        return;
+    LM.fired = true;
+    LM.rc = eng_leader_file_open(db, fno, LM.x->held_name);
+    if (LM.rc >= 0)
+        close(LM.rc);
+}
+
 static void case_link_pos(void)
 {
     xport x;
     xp_start(&x, "lpos");
+    LM.x = &x, LM.fired = false, LM.rc = -1;
+    leader_test_marker_hook = lm_hook;
     xp_rows(&x, 0, 0, 40, 1000); /* a large insert: a COMMIT */
+    leader_test_marker_hook = NULL;
+    LM.x = NULL;
+    CHECK(LM.fired);
+    if (LM.rc < 0)
+        fprintf(stderr, "LP: the file of a COMMIT whose marker is in the log was not served (%d; mutant notelate)\n", LM.rc);
+    CHECK(LM.rc >= 0);
     xp_step(&x, "LP: first leadership");
     char n1[64];
     snprintf(n1, sizeof n1, "%s", x.held_name);
@@ -4994,6 +5266,25 @@ static void case_link_pos(void)
     CHECK_EQ(fd, TSDB_ERR_NOTFOUND);
     if (fd >= 0)
         close(fd);
+    /* r3g REVIEW F7: the right position and another marker's file (mutant linkposonly) */
+    xp_rows(&x, 1, 0, 40, 6000); /* another COMMIT, another file */
+    xp_step(&x, "LP: a third COMMIT");
+    const uint64_t p3 = x.ld->nlf ? x.ld->lf[x.ld->nlf - 1].fno : 0;
+    CHECK(p3 > p2 && strcmp(n1, x.held_name) != 0);
+    CHECK(leader_file_is(x.ld, p3, x.held_name, x.held, x.held_len));
+    fd = eng_leader_file_open(x.ld, p2, n1); /* p2's link is still there */
+    CHECK(fd >= 0);
+    if (fd >= 0)
+        close(fd);
+    int f3 = eng_leader_file_open(x.ld, p3, n1), f2 = eng_leader_file_open(x.ld, p2, x.held_name);
+    if (f3 >= 0 || f2 >= 0)
+        fprintf(stderr, "LP: a marker was served another marker's file (mutant linkposonly)\n");
+    CHECK_EQ(f3, TSDB_ERR_NOTFOUND);
+    CHECK_EQ(f2, TSDB_ERR_NOTFOUND);
+    if (f3 >= 0)
+        close(f3);
+    if (f2 >= 0)
+        close(f2);
     xp_stop(&x);
     printf("  a leader serves a COMMIT's file only for the marker that named it in this leadership\n");
 }
@@ -5299,6 +5590,9 @@ static int mutant_of(const char *m)
                         : strcmp(m, "nocutgen") == 0 ? MUT_REPLICA_PREP_NO_CUT_GEN
                         : strcmp(m, "dropunheld") == 0 ? MUT_LEADER_DROP_UNHELD
                         : strcmp(m, "linkbyname") == 0 ? MUT_LEADER_LINK_BY_NAME
+                        : strcmp(m, "notelate") == 0 ? MUT_LEADER_NOTE_LATE
+                        : strcmp(m, "rowsholdmu") == 0 ? MUT_REPLICA_ROWS_HOLD_MU
+                        : strcmp(m, "promotenoapplymu") == 0 ? MUT_REPLICA_PROMOTE_NO_APPLY_MU
                         : strcmp(m, "leadernoprune") == 0 ? MUT_LEADER_RS_NO_PRUNE
                         : strcmp(m, "leaderpruneall") == 0 ? MUT_LEADER_RS_PRUNE_ALL : 0;
 }
@@ -5515,6 +5809,13 @@ int main(int argc, char **argv)
         case_apply_concurrent();
         case_apply_cut_race(0);
         case_apply_cut_race(1);
+        case_apply_cut_race(2);
+        for (int k = AW_DROP; k <= AW_STAGE; k++)
+            case_apply_windows(k);
+        case_apply_marker_cut(AW_DROP);
+        case_apply_marker_cut(AW_CLASS);
+        case_apply_open_refused();
+        case_promote_during_apply();
         case_drop();
         case_drop_flush();
         case_drop_race();
@@ -5602,6 +5903,13 @@ int main(int argc, char **argv)
     case_apply_concurrent();
     case_apply_cut_race(0);
     case_apply_cut_race(1);
+    case_apply_cut_race(2);
+    for (int k = AW_DROP; k <= AW_STAGE; k++)
+        case_apply_windows(k);
+    case_apply_marker_cut(AW_DROP);
+    case_apply_marker_cut(AW_CLASS);
+    case_apply_open_refused();
+    case_promote_during_apply();
     case_drop();
     case_drop_flush();
     case_drop_race();

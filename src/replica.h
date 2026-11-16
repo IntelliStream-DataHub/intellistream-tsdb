@@ -59,7 +59,14 @@ int replica_missing(struct eng *db, uint64_t *pos, char *name, size_t cap, uint6
  * not written yet). */
 extern size_t replica_read_win_min; /* test hook */
 extern void (*replica_test_sync_hook)(struct eng *db); /* test hook: between a sync's fdatasync and its bookkeeping */
-extern void (*replica_test_apply_hook)(struct eng *db); /* test hook: a COMMIT's prepare after its flush, rp->mu free */
+/* test hook: the applier's windows. RH_COMMIT_FLUSHED (a COMMIT's prepare after its flush), RH_COMMIT_PREPARED (after
+ * its staging) RH_DROP (after a DROP's flush), RH_CLASS (after a CLASS purge), RH_ROWS_YIELD (between records): rp->mu
+ * free. RH_COMMIT_OPEN (a staged file linked, before its open; stage_mu held; nonzero refuses the open), RH_ROWS_HELD
+ * (before a row record's apply): rp->mu held. Returns 0 except to refuse at RH_COMMIT_OPEN. */
+enum { RH_COMMIT_FLUSHED, RH_COMMIT_OPEN, RH_COMMIT_PREPARED, RH_DROP, RH_CLASS, RH_ROWS_HELD, RH_ROWS_YIELD };
+extern int (*replica_test_apply_hook)(struct eng *db, int at);
+extern void (*leader_test_marker_hook)(struct eng *db, uint64_t fno); /* test hook: a COMMIT's marker appended and
+                                                                         * synced, before leader_commit goes on */
 int replica_read(struct eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
                  uint64_t *last);
 
