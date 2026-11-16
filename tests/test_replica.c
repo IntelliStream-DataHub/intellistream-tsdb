@@ -2249,6 +2249,57 @@ static void case_commit(void)
     xp_stop(&x);
 }
 
+/* A read-only open of a replica's directory (jepsen-cluster's end check, an NFS follower) sees what the replica holds.
+ * A replica writes no WAL of its own (wal_enabled is off), and MANIFEST once said wal_active = wal_flushed for it, so
+ * a reader took the rows of its parts only: every row still in a segment was missing. */
+static bool ro_same(xport *x, const char *rd, const char *what)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.read_only = 1;
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    eng *ro = NULL;
+    int rc = (eng_open)(rd, &o, &ro);
+    if (rc != 0) {
+        fprintf(stderr, "%s: read-only open of the replica: %d\n", what, rc);
+        return false;
+    }
+    bool ok = true;
+    for (uint32_t s = 0; s < NS; s++)
+        ok &= eq_range(x->ld, ro, s, T0 - 1000, T0 + 1000LL * (NT + 1), what);
+    eng_close(ro);
+    return ok;
+}
+
+static void case_ro_open(void)
+{
+    xport x;
+    char rd[PATH_MAX];
+    xp_start(&x, "ro");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100), xp_rows(&x, 1, 0, 5, 300);
+    xp_step(&x, "RO: small rows");
+    CHECK(ro_same(&x, rd, "RO: small rows, read-only"));
+    CHECK_EQ(eng_flush(x.ld), 0); /* a new segment at the leader: the replica's too */
+    xp_rows(&x, 0, 10, 10, 500);
+    xp_step(&x, "RO: after a flush");
+    CHECK(ro_same(&x, rd, "RO: after a flush, read-only"));
+    xp_rows(&x, 1, 5, 40, 2000); /* a large insert over rows in a segment */
+    CHECK_EQ(eng_delete_range(x.ld, 0, T0 + 3000, T0 + 6000), 0);
+    xp_rows(&x, 0, 20, 5, 900);
+    xp_step(&x, "RO: large insert, delete");
+    CHECK(ro_same(&x, rd, "RO: large insert, delete, read-only"));
+    xp_reopen(&x, rd, replica_applied_end(x.rep)); /* the replica's own open publishes too */
+    xp_rows(&x, 1, 50, 5, 4000);
+    xp_step(&x, "RO: reopened");
+    CHECK(ro_same(&x, rd, "RO: reopened, read-only"));
+    eng_close(x.rep); /* what jepsen-cluster's end check opens: a stopped replica's directory */
+    x.rep = NULL;
+    CHECK(ro_same(&x, rd, "RO: replica closed, read-only"));
+    xp_stop(&x);
+}
+
 /* a COMMIT whose files are not staged: not acknowledged, not applied, until they are */
 static void case_commit_hold(void)
 {
@@ -6083,6 +6134,7 @@ int main(int argc, char **argv)
     case_sync_cut();
     case_sealed_open();
     case_commit();
+    case_ro_open();
     case_commit_hold();
     case_commit_cut();
     case_apply_concurrent();
