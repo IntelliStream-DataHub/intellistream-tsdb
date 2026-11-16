@@ -5303,6 +5303,147 @@ static int mutant_of(const char *m)
                         : strcmp(m, "leaderpruneall") == 0 ? MUT_LEADER_RS_PRUNE_ALL : 0;
 }
 
+/* Required 3 (R2 REVIEW M1): ACK latency (replica_append of the next record, replica_sync, replica_durable_end) on a
+ * second thread while the replica applies a COMMIT of BENCH_COMMIT_ROWS rows (default 10 M) with BENCH_MEM_ROWS rows
+ * (default 4 M: 64 MB at 16 bytes a row) in its memtable, which the apply flushes first. TEST_REPLICA_BENCH=REPS. */
+typedef struct bench_ack {
+    eng *ld, *rep;
+    atomic_bool stop;
+    double *lat, *beg; /* each round's latency and start */
+    size_t n, cap;
+    size_t fed;
+    int rc;
+} bench_ack;
+
+static double bench_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+static void *bench_ack_main(void *a)
+{
+    bench_ack *b = a;
+    while (!atomic_load(&b->stop)) {
+        double t0 = bench_now();
+        uint8_t *buf;
+        size_t len;
+        uint64_t seq, off, last;
+        int rc = replica_read(b->ld, replica_log_end(b->rep) + 1, &buf, &len, 256, &seq, &off, &last);
+        if (rc == 0 && len)
+            rc = replica_append(b->rep, seq, off, buf, len), b->fed += len;
+        free(buf);
+        if (rc == 0)
+            rc = replica_sync(b->rep);
+        (void)replica_durable_end(b->rep);
+        double t1 = bench_now();
+        if (rc && !b->rc)
+            b->rc = rc;
+        if (b->n < b->cap)
+            b->beg[b->n] = t0, b->lat[b->n++] = t1 - t0;
+    }
+    return NULL;
+}
+
+static int bench_cmp(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void bench_one(int rep, size_t mem_rows, size_t commit_rows)
+{
+    xport x;
+    char nm[32], rd[PATH_MAX];
+    snprintf(nm, sizeof nm, "bench%d", rep);
+    xp_start(&x, nm);
+    rdir(rd, sizeof rd, &x);
+    eng_close(x.rep); /* the replica again, with room for the whole memtable */
+    x.rep = NULL;
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 0;
+    o.buffer_rows = mem_rows * 2;
+    o.flush_interval_ms = 1 << 30;
+    if (eng_open_replica(rd, &o, 0, &x.rep) != 0)
+        exit(2);
+    size_t big = commit_rows > mem_rows ? commit_rows : mem_rows;
+    int64_t *ts = malloc(big * sizeof *ts);
+    float *v = malloc(big * sizeof *v);
+    if (!ts || !v)
+        exit(2);
+    /* the memtable: chunks of 100,000 rows through the WAL, applied by the replica; neither side flushes them before
+     * the COMMIT (a leader's flush starts a segment, and the replica's sealed memtable would flush in the background) */
+    x.ld->opt.wal_max_batch_rows = 1 << 22;
+    x.ld->opt.buffer_rows = mem_rows * 2;
+    x.ld->opt.flush_interval_ms = 1 << 30;
+    size_t chunk = 100000;
+    for (size_t done = 0; done < mem_rows; done += chunk) {
+        size_t k = mem_rows - done < chunk ? mem_rows - done : chunk;
+        for (size_t i = 0; i < k; i++)
+            ts[i] = T0 + (int64_t)(done / chunk / NS * chunk + i) * 10, v[i] = (float)(i % 1000);
+        CHECK_EQ(eng_insert_series(x.ld, TSDB_FLOAT32, (uint32_t)(done / chunk % NS), ts, v, k), 0);
+    }
+    CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
+    CHECK_EQ(replica_applied_end(x.rep), ld_last(&x));
+    /* the COMMIT: shipped and staged, not applied */
+    x.ld->opt.wal_max_batch_rows = 16;
+    x.noapply = true;
+    for (size_t i = 0; i < commit_rows; i++)
+        ts[i] = T0 + 5 * DAY_MS + (int64_t)i * 10, v[i] = (float)(i % 777);
+    CHECK_EQ(eng_insert_series(x.ld, TSDB_FLOAT32, 0, ts, v, commit_rows), 0);
+    CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
+    uint64_t commit = ld_last(&x);
+    /* the records the ACK thread hands over one by one: in the leader's log, not shipped */
+    eng *rp = x.rep;
+    x.rep = NULL;
+    for (int i = 0; i < 3000; i++) {
+        int64_t t = T0 + 9 * DAY_MS + i;
+        float f = (float)i;
+        CHECK_EQ(eng_insert_series(x.ld, TSDB_FLOAT32, 1, &t, &f, 1), 0);
+    }
+    x.rep = rp;
+    x.noapply = false;
+    bench_ack b = {.ld = x.ld, .rep = x.rep, .cap = 1 << 22};
+    b.lat = malloc(b.cap * sizeof *b.lat);
+    b.beg = malloc(b.cap * sizeof *b.beg);
+    pthread_t t;
+    pthread_create(&t, NULL, bench_ack_main, &b);
+    usleep(200000); /* the ACK loop running before the apply starts */
+    size_t memrows = x.rep->active ? x.rep->active->rows : 0; /* the apply seals it and flushes it first */
+    double a0 = bench_now();
+    int rc = replica_apply(x.rep, commit);
+    double a1 = bench_now();
+    usleep(100000);
+    atomic_store(&b.stop, true);
+    pthread_join(t, NULL);
+    CHECK_EQ(rc, 0);
+    CHECK_EQ(b.rc, 0);
+    /* the rounds that overlap the apply, the one it held up included */
+    size_t n = 0;
+    double *l = b.lat;
+    for (size_t i = 0; i < b.n; i++)
+        if (b.beg[i] < a1 && b.beg[i] + b.lat[i] > a0)
+            l[n++] = b.lat[i];
+    qsort(l, n, sizeof *l, bench_cmp);
+    double sum = 0;
+    for (size_t i = 0; i < n; i++)
+        sum += l[i];
+    printf("BENCH rep=%d apply_ms=%.1f acks=%zu mean_us=%.1f p50_us=%.1f p99_us=%.1f max_ms=%.2f fed=%zu memtable_rows=%zu\n", rep,
+           (a1 - a0) * 1e3, n, n ? sum / (double)n * 1e6 : 0, n ? l[n / 2] * 1e6 : 0,
+           n ? l[(size_t)((double)n * 0.99)] * 1e6 : 0, n ? l[n - 1] * 1e3 : 0, b.fed, memrows);
+    fflush(stdout);
+    free(b.lat);
+    free(b.beg);
+    free(ts);
+    free(v);
+    xp_stop(&x);
+    sh("rm -rf '%s' '%s'", x.ldir, rd);
+}
+
 int main(int argc, char **argv)
 {
     int a = 1;
@@ -5345,6 +5486,16 @@ int main(int argc, char **argv)
     {
         char *slash = strrchr(SELF, '/');
         snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
+    }
+    if (getenv("TEST_REPLICA_BENCH")) {
+        int reps = atoi(getenv("TEST_REPLICA_BENCH"));
+        size_t mem = getenv("BENCH_MEM_ROWS") ? strtoull(getenv("BENCH_MEM_ROWS"), NULL, 10) : 4000000;
+        size_t com = getenv("BENCH_COMMIT_ROWS") ? strtoull(getenv("BENCH_COMMIT_ROWS"), NULL, 10) : 10000000;
+        for (int r = 1; r <= (reps > 0 ? reps : 3); r++)
+            bench_one(r, mem, com);
+        sh("rm -rf '%s'", S);
+        printf("test_replica: bench: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
     }
     if (eng_test_mutant == MUT_LEADER_NO_CUTOFF || eng_test_mutant == MUT_LEADER_ZERO_RATE ||
         eng_test_mutant == MUT_LEADER_NO_RAISE_FROM || eng_test_mutant == MUT_LEADER_PRUNE_OFF1 ||
