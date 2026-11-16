@@ -93,6 +93,7 @@ static void state_of(struct replfile_state *st, int k)
     st->incarnation = 100 + (uint64_t)k / 4;
     st->rid = 0x1234567890abcdefull;
     st->open_gen = 1 + (uint64_t)k / 3;
+    st->open_nonce = 0x9e3779b97f4a7c15ull * (uint64_t)(k + 1); /* its own at every save: a mixed slot shows */
     st->fence = (uint64_t)k * (uint64_t)hist_scale; /* the history's epochs are 1..k*scale and never above the fence */
     st->led = (uint64_t)k / 2;
     st->floor = 3 * (uint64_t)k;
@@ -108,7 +109,7 @@ static bool same(const struct replfile_state *a, const struct replfile_state *b)
     return memcmp(a->volume_uuid, b->volume_uuid, 16) == 0 && memcmp(a->cluster_uuid, b->cluster_uuid, 16) == 0 &&
            a->node == b->node && a->incarnation == b->incarnation && a->rid == b->rid &&
            /* a torn load raised it by a belt */
-           a->open_gen % REPLFILE_OPEN_GEN_BELT == b->open_gen % REPLFILE_OPEN_GEN_BELT &&
+           a->open_gen % REPLFILE_OPEN_GEN_BELT == b->open_gen % REPLFILE_OPEN_GEN_BELT && a->open_nonce == b->open_nonce &&
            a->fence == b->fence && a->led == b->led && a->floor == b->floor && a->log_start == b->log_start &&
            a->nhist == b->nhist && (a->nhist == 0 || memcmp(a->hist, b->hist, a->nhist * sizeof *a->hist) == 0);
 }
@@ -252,6 +253,48 @@ static void test_basic(void)
     printf("  create, alternating slots, load\n");
 }
 
+/* A torn load is "unsure" and the next save stores it: after a restart the load is clean, and the older slot's fence
+ * and led must still not look trusted. Only a save that sets led = fence clears it. */
+static void test_unsure_flag(void)
+{
+    char dir[PATH_MAX + 32];
+    struct replfile *rf;
+    struct replfile_state got;
+    bool torn;
+    quiet(true);
+    fresh("unsure", dir, sizeof dir);
+    make(dir, 4);
+    flip(dir, 88); /* the newest slot's fence */
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && torn && got.unsure);
+    CHECK(got.led != got.fence); /* so that clearing needs a reason */
+    CHECK(replfile_save(rf, &got) == 0); /* the open generation, the fence and the led as loaded */
+    replfile_close(rf);
+    replfile_state_free(&got);
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && !torn && got.unsure);
+    struct replfile_state w = got;
+    w.unsure = false;
+    CHECK(replfile_save(rf, &w) == TSDB_ERR_INVALID); /* led != fence: the epoch is not the group's yet */
+    w.led = w.fence;
+    w.unsure = true;
+    CHECK(replfile_save(rf, &w) == 0); /* led = fence alone does not clear it either */
+    replfile_close(rf);
+    replfile_state_free(&got);
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && !torn && got.unsure);
+    replfile_state_free(&got);
+    replfile_close(rf);
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && got.unsure && got.led == got.fence);
+    w = got;
+    w.unsure = false;
+    CHECK(replfile_save(rf, &w) == 0);
+    replfile_close(rf);
+    replfile_state_free(&got);
+    CHECK(load_k(dir, &rf, &got, &torn) == 0 && !torn && !got.unsure);
+    replfile_state_free(&got);
+    replfile_close(rf);
+    quiet(false);
+    printf("  a torn load is unsure, the next save stores it, only a save with led = fence clears it\n");
+}
+
 static void test_damage(void)
 {
     char dir[PATH_MAX + 32];
@@ -274,6 +317,7 @@ static void test_damage(void)
     state_of(&st, 5);
     CHECK(replfile_save(rf, &st) == TSDB_ERR_INVALID); /* the handle holds saves to the belted open generation */
     st.open_gen += REPLFILE_OPEN_GEN_BELT;
+    st.unsure = true; /* a save after a torn load keeps the flag (test_unsure_flag clears it) */
     CHECK(replfile_save(rf, &st) == 0);
     replfile_state_free(&st);
     replfile_close(rf);
@@ -363,14 +407,11 @@ static void test_damage(void)
         CHECK(!replfile_parse(bad, sizeof bad, &p, &g));
         /* a reserved byte that is not zero, well checksummed: one encoding per state, so it is not a slot (the fuzzer
          * found a parse that took it and an encode that gave other bytes back) */
-        for (int k = 0; k < 2; k++) {
-            int off = k ? 120 : 60; /* the two reserved fields of the header */
-            memcpy(bad, page, sizeof bad);
-            bad[off + 2] = 5;
-            h = xxh64(bad, len - 8, 0);
-            memcpy(bad + len - 8, &h, 8);
-            CHECK(!replfile_parse(bad, sizeof bad, &p, &g));
-        }
+        memcpy(bad, page, sizeof bad);
+        bad[60 + 2] = 5; /* the reserved word of the header (the one at 120 is the open nonce since format 2) */
+        h = xxh64(bad, len - 8, 0);
+        memcpy(bad + len - 8, &h, 8);
+        CHECK(!replfile_parse(bad, sizeof bad, &p, &g));
         /* a history entry that starts at 0: no position, and the core fails an open on it */
         memcpy(bad, page, sizeof bad);
         memcpy(bad + 128 + 8, &zero, 8);
@@ -406,6 +447,7 @@ static void test_unsure(void)
     state_of(&st, 4); /* what had been acknowledged: its open generation (2) is below the belted one */
     CHECK(replfile_save(rf, &st) == TSDB_ERR_INVALID);
     st.open_gen = 2 + REPLFILE_OPEN_GEN_BELT;
+    st.unsure = true;
     CHECK(replfile_save(rf, &st) == 0);
     replfile_state_free(&st);
     replfile_close(rf);
@@ -612,7 +654,7 @@ static void test_convert(void)
     CHECK(replfile_from_durable(&other, &d) == 0);
     other.rid = st.rid;
     CHECK(other.fence == 5 && other.nhist == 5 && other.hist != st.hist && other.hist[4].start == 21);
-    other.open_gen = st.open_gen, other.incarnation = st.incarnation;
+    other.open_gen = st.open_gen, other.open_nonce = st.open_nonce, other.incarnation = st.incarnation;
     CHECK(same(&other, &st));
     replfile_state_free(&st);
     replfile_state_free(&other);
@@ -744,7 +786,7 @@ static void check_after(const char *dir, const char *ackfile, int k)
         struct replfile_state nx;
         state_of(&nx, found + 1);
         if (was_torn)
-            nx.open_gen += REPLFILE_OPEN_GEN_BELT;
+            nx.open_gen += REPLFILE_OPEN_GEN_BELT, nx.unsure = true;
         CHECK(replfile_save(rf, &nx) == 0);
         replfile_state_free(&nx);
         replfile_close(rf);
@@ -829,6 +871,7 @@ int main(int argc, char **argv)
     } else {
         test_basic();
         test_damage();
+        test_unsure_flag();
         test_unsure();
         test_trim_boundary();
         test_rules();

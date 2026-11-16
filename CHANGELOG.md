@@ -25,7 +25,10 @@ a cluster made with 0.10.0 is initialised again, not upgraded (as for every chan
   recorded that generation and the open's random nonce (`REPLICA_OPEN`), judged against a metadata copy that has
   caught up with the server's own start; a directory whose generation is below the record's, that saved the record's
   generation in another open, or whose replica id differs, is refused, naming both. A `v<N>.tmp` left by a crash is
-  removed and made again; a server makes at most 256 cluster volumes and says so in its log when given more. `status` prints `volume ...` and `replica volume ...` lines.
+  removed and made again; a copy's `REPL` (the replica id, open generation and nonce, in two checksummed slots, format 2)
+  that is missing, has no valid slot or belongs to another volume, cluster or node refuses the volume, naming the path, and
+  one slot damaged skips the open generation ahead by 2^32, is still judged an older copy when its surviving slot is far
+  behind the record, and stays "unsure" on disk until a save sets `led` = `fence`; a server makes at most 256 cluster volumes and says so in its log when given more. `status` prints `volume ...` and `replica volume ...` lines.
 - A server started with `--cluster` refuses to start with series in its own directory or lines in `VOLUMES` (naming
   them), and with `--wal-sync-ms` other than 0; while it runs, a series in its own directory and `tsdb DIR volume add`
   are refused (`TSDB_ERR_INVALID`). A directory whose `META` says `requires=cluster` opens only inside a cluster
