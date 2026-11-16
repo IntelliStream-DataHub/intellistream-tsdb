@@ -11,7 +11,9 @@
 #   JV_DSTALL=N  a worker blocks in D state for good (vfork whose child never execs) on every Nth insert request: the kernel's stall, as an I/O stall
 #                is, and not tsdbd's hang (JV_HANG: pause(), no D state)
 #   JV_CRASHONCE=N  the same, once per gate (JV_ONCEFILE names the file whose creation says it happened)
-#   JV_CRASH_MB=M   before the abort, touch M MB: a dump that takes long on every core handler, so the nemesis' kill is certain to land in it
+#   JV_CRASH_MB=M   before the abort, touch M MB: a dump that takes long on every core handler (off by default: the touching is a window in
+#                of its own in which the nemesis kills the server before it aborts, and under 16 busy loops the abort then never happens;
+#                the handler of the machine takes 0.1 to 0.5 s even for a small core)
 #   JV_HANG=N    a worker pause()s for ever on every Nth insert request (the server is up and stops answering)
 # and runs them through tests/jepsen/rerun.sh:
 #   crash under kill, pause, none, eio and power: exit 1 at the FIRST attempt (no "jepsen-rerun: attempt" line, never 0 or 3), naming the
@@ -122,15 +124,15 @@ for nem in eio power; do
     run_case "crash-$nem" "$CR" "a server that aborts on every 40th insert, $nem nemesis" JV_CRASH=40 -- --nemesis "$nem" --seconds 12 \
         --crashfs "$crashfs"
 done
-# one abort per gate, with a dump that takes long (CRASH_MB, 512 by default; the machine's core handler, whatever it is): the kill
-# nemesis' SIGKILL meets a server that is not a zombie yet. Under kv and under classes, the kill and the clkill nemeses never hid it
+# one abort per gate, with the dump the machine's core handler takes (CRASH_MB sets a larger one, 0 by default): the kill
+# nemesis' SIGKILL meets a server that is not a zombie yet. Under kv and under classes the kill nemesis hid it
 # before round 12 (7 of 10 kv kill gates passed VALID at load 125, 3 of 6 quiet; VERIFY11 (A)).
 for wl in kv classes; do
     for i in 1 2 3; do
         rm -f "$tmp/once-$wl-$i"
         run_case "crashonce-$wl-kill-$i" "$CR\|was crashing when the harness killed it" \
-            "one abort per gate with a core dump of ${CRASH_MB:-512} MB, kill nemesis, $wl workload" JV_CRASHONCE=${CRASH_ONCE_N:-20} \
-            JV_CRASH_MB=${CRASH_MB:-512} JV_ONCEFILE="$tmp/once-$wl-$i" -- --nemesis kill --workload $wl --seconds 12
+            "one abort per gate with a core dump (the machine's core handler), kill nemesis, $wl workload" JV_CRASHONCE=${CRASH_ONCE_N:-20} \
+            JV_CRASH_MB=${CRASH_MB:-0} JV_ONCEFILE="$tmp/once-$wl-$i" -- --nemesis kill --workload $wl --seconds 12
     done
 done
 # a server that exits by itself (status 0, or 1 with no fault in the epoch) under misdirect (with and without verify_checksums) and rot is
