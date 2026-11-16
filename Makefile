@@ -1331,10 +1331,12 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    tests/jepsen/mutant-crash.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a server that dies by itself or stops answering was hidden behind INCONCLUSIVE, a rerun or a pass, or hung the harness"; exit 1; }; \
 	for spec in 'kill@3@--nemesis kill --seconds 5' 'power@4@--nemesis power --seconds 8 --crashfs $(B)/libcrashfs.so'; do \
 	    oldifs=$$IFS; IFS=@; set -- $$spec; IFS=$$oldifs; nem=$$1; at=$$2; args=$$3; \
+	    for dly in 0 400; do \
 	    rm -f $(JEPSEN_DIR)-selftest.failstart-count; \
-	    out=$$(FAILSTART_AT=$$at FAILSTART=env JEPSEN_TSDBD=tests/jepsen/failstart-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest $$args 2>&1); rc=$$?; \
+	    out=$$(FAILSTART_AT=$$at FAILSTART=env JEPSEN_START_AWAIT_DELAY_MS=$$dly JEPSEN_TSDBD=tests/jepsen/failstart-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest $$args 2>&1); rc=$$?; \
 	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'the server does not come up (the environment, not a verdict about tsdb)' || echo "$$out" | grep -q 'FAILED'; then \
-	        echo "jepsen-selftest: a server that fails to start for want of memory under the $$nem nemesis was a verdict, not a harness error (rc $$rc, wanted 2)"; echo "$$out" | tail -n 12; exit 1; fi; \
+	        echo "jepsen-selftest: a server that fails to start for want of memory under the $$nem nemesis was a verdict, not a harness error (rc $$rc, wanted 2; the watcher saw it first: $$dly ms)"; echo "$$out" | tail -n 12; exit 1; fi; \
+	    done; \
 	    rm -f $(JEPSEN_DIR)-selftest.failstart-count; \
 	    tests/jepsen/expect.sh violation 'refuses to open the database after the faults: damaged data' \
 	        "a part file damaged before a restart under the $$nem nemesis (the open fails with corrupt data)" \

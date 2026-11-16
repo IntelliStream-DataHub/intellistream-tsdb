@@ -995,6 +995,8 @@ static void start_server_run(bool faulty)
             lives_clean++;
         if (getenv("JEPSEN_VERBOSE"))
             fprintf(stderr, "jepsen: started %d (%s)\n", (int)pid, attempt == 0 && faulty ? "faulty" : "clean");
+        if (getenv("JEPSEN_START_AWAIT_DELAY_MS")) /* a test hook of the selftest: the watcher polls first, as it may on a machine that starves this thread */
+            usleep((useconds_t)atoi(getenv("JEPSEN_START_AWAIT_DELAY_MS")) * 1000);
         int p = th_await(pf, pid, 30000);
         unlink(pf);
         atomic_store(&server_starting, false);
