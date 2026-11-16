@@ -353,7 +353,7 @@ int cls_open(eng *db, bool read_only)
     pthread_rwlock_init(&db->cls_rw, &ra);
     pthread_rwlockattr_destroy(&ra);
     db->cls_fd = -1;
-    db->cls_dropped_end = INT64_MIN;
+    db->cls_dropped = NULL;
     /* every series that exists now was decided (by a record, or class 0 without one) */
     uint32_t n = eng_series_count(db);
     pthread_mutex_lock(&db->cls_mu);
@@ -422,6 +422,11 @@ void cls_close(eng *db)
     }
     db->wtail = NULL;
     db->nwtail = 0;
+    for (struct cls_dropped *d = db->cls_dropped, *x; d; d = x) {
+        x = d->next;
+        free(d);
+    }
+    db->cls_dropped = NULL;
     pthread_mutex_destroy(&db->class_lock);
     pthread_mutex_destroy(&db->cls_mu);
     pthread_rwlock_destroy(&db->cls_rw);
@@ -433,8 +438,38 @@ typedef struct cls_rec {
     int cls;
 } cls_rec;
 
+/* A leader's CLASS markers for records r[0..n) that go to CLASSES at `off` (jr_markers: 0 at once elsewhere). */
+static int cls_markers(eng *db, const cls_rec *r, size_t n, uint64_t off)
+{
+    if (!eng_jr(db) || db->rp || n == 0)
+        return 0;
+    mk *m = calloc(n, sizeof *m);
+    if (!m)
+        return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < n; i++) {
+        m[i] = (mk){.type = MK_CLASS, .span = 1};
+        m[i].u.cls = (mk_class){.series = r[i].series, .cls = (uint32_t)r[i].cls, .at = r[i].from,
+                                .record_off = off + i * CLS_REC};
+    }
+    int rc = jr_markers(db, m, n, "a CLASS marker was appended but its commit point did not come");
+    free(m);
+    return rc;
+}
+
+/* planted (MUT_LEADER_CLASS_MARKER_LATE): the markers of a switch go out after it released flush_lock */
+static __thread cls_rec *late_r;
+static __thread size_t late_n;
+static __thread uint64_t late_off;
+static __thread bool late_armed; /* inside switch_retry's switch */
+void (*cls_test_after_switch)(eng *db);
+
 /* Appends and syncs records, then applies them in memory. Caller holds class_lock. Fail-stop: the WAL's rows
- * are mapped through these records, by flushes now and by a replay later. */
+ * are mapped through these records, by flushes now and by a replay later. A leader's records are markers first, and
+ * reach the file once the commit point passed them (design-cluster.md 5.4): here, under flush_lock (a switch) or in
+ * the flush (a fresh series), cls_rw and class_lock, never later. A marker appended after flush_lock is released
+ * could follow rows the leader placed under the new history in a later segment: a replica seals and flushes the
+ * segment with those rows before it applies the marker, places them under the old one, and the leader's T then lies
+ * below rows it may replay (its apply, or its next open, fails). */
 static int append_locked(eng *db, const cls_rec *r, size_t n)
 {
     if (n == 0)
@@ -444,6 +479,13 @@ static int append_locked(eng *db, const cls_rec *r, size_t n)
         return rc;
     if (db->cls_broken)
         return TSDB_ERR_IO;
+    if (eng_test_mutant == MUT_LEADER_CLASS_MARKER_LATE && late_armed && eng_jr(db) && !db->rp && late_r == NULL &&
+        (late_r = malloc(n * sizeof *r)) != NULL) {
+        memcpy(late_r, r, n * sizeof *r);
+        late_n = n, late_off = db->cls_off;
+    } else if ((rc = cls_markers(db, r, n, db->cls_off)) != 0) {
+        return rc;
+    }
     if (db->cls_fd < 0) {
         bool existed = faccessat(db->dirfd, CLS_FILE, F_OK, 0) == 0;
         db->cls_fd = openat(db->dirfd, CLS_FILE, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
@@ -548,7 +590,10 @@ typedef struct fstat_ {
 
 /* Decides the fresh series among st[0..n): a record from the beginning of time when they get a longer class,
  * in memory only for class 0. */
-static int decide_fresh(eng *db, const fstat_ *st, size_t n)
+static int decide_fresh_ex(eng *db, const fstat_ *st, size_t n, bool zero);
+static int decide_fresh(eng *db, const fstat_ *st, size_t n) { return decide_fresh_ex(db, st, n, false); }
+
+static int decide_fresh_ex(eng *db, const fstat_ *st, size_t n, bool zero)
 {
     cls_rec *r = malloc((n ? n : 1) * sizeof *r);
     if (!r)
@@ -560,7 +605,8 @@ static int decide_fresh(eng *db, const fstat_ *st, size_t n)
         if (cls_byte(db, st[i].s) & CLS_DECIDED)
             continue; /* a flush or another insert was first */
         double rate = rate_of(st[i].n, st[i].tmin, st[i].tmax);
-        int c = rate < 0 || db->rp ? 0 : class_choose(db, rate, class_cap(db, st[i].s)); /* a replica: the leader's CLASS */
+        /* a replica: the leader's CLASS; `zero`: a leader's flush, after cls_classify_active decided before the seal */
+        int c = rate < 0 || db->rp || zero ? 0 : class_choose(db, rate, class_cap(db, st[i].s));
         if (c)
             r[k++] = (cls_rec){st[i].s, INT64_MIN, c};
         else {
@@ -723,12 +769,99 @@ int cls_classify_memtable(eng *db, const memtable *m)
         run_stats(ms, &st[k].tmin, &st[k].tmax);
         k++;
     }
-    int rc = k ? decide_fresh(db, st, k) : 0;
+    int rc = k ? decide_fresh_ex(db, st, k, eng_jr(db) != NULL && eng_test_mutant != MUT_LEADER_ZERO_RATE) : 0;
     tsdb_free_big(st, m->nids * sizeof *st);
     return rc;
 }
 
+int cls_classify_active(eng *db)
+{
+    if (!db->cls_on || db->rp || !eng_jr(db))
+        return 0;
+    pthread_mutex_lock(&db->buf_lock); /* the rows of fresh series only: rare, and copied out before the decision */
+    memtable *m = db->active;
+    size_t k = 0, cap = 0;
+    fstat_ *st = NULL;
+    int rc = 0;
+    for (uint32_t i = 0; i < m->nids && rc == 0; i++) {
+        uint32_t id = m->ids[i];
+        if ((cls_byte(db, id) & CLS_DECIDED) || m->s[id].n == 0)
+            continue;
+        if (k == cap) {
+            size_t c = cap ? cap * 2 : 16;
+            fstat_ *p = realloc(st, c * sizeof *p);
+            if (!p) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            st = p, cap = c;
+        }
+        st[k] = (fstat_){id, m->s[id].n, 0, 0};
+        run_stats(&m->s[id], &st[k].tmin, &st[k].tmax);
+        k++;
+    }
+    pthread_mutex_unlock(&db->buf_lock);
+    if (rc == 0 && k)
+        rc = decide_fresh(db, st, k);
+    free(st);
+    return rc;
+}
+
 /* ---------------------------------------------------------- the switches */
+
+void cls_dropped_note(eng *db, const part *p)
+{
+    int64_t lo, end;
+    partition_range(db, p->partition, &lo, &end);
+    uint32_t n = p->ix.nruns;
+    struct cls_dropped *d = malloc(sizeof *d + (size_t)n * sizeof(uint32_t));
+    if (!d) { /* not counted per series: every series gets the bound, as before (never lower) */
+        n = 0;
+        d = malloc(sizeof *d);
+        if (!d) {
+            eng_fail(db, "the bound of a dropped partition", ENOMEM); /* a T below its rows could follow */
+            return;
+        }
+        d->n = UINT32_MAX;
+    } else {
+        d->n = n;
+        memcpy(d->ids, p->ix.rser, (size_t)n * sizeof(uint32_t));
+    }
+    d->end = end;
+    d->need = atomic_load(&db->dsync_started) + 1; /* after the rename: a later fsync covers it */
+    d->next = db->cls_dropped;
+    db->cls_dropped = d;
+}
+
+/* The lowest T series s may take for the dropped parts that are not durably gone (db->lock held; frees the rest). */
+static int64_t cls_dropped_bound_locked(eng *db, uint32_t s)
+{
+    uint64_t done = atomic_load(&db->dsync_done);
+    int64_t T = INT64_MIN;
+    for (struct cls_dropped **pp = &db->cls_dropped, *d; (d = *pp);) {
+        if (done >= d->need && eng_test_mutant != MUT_DROPPED_GLOBAL) {
+            *pp = d->next;
+            free(d);
+            continue;
+        }
+        bool has = d->n == UINT32_MAX || eng_test_mutant == MUT_DROPPED_GLOBAL;
+        if (!has) {
+            uint32_t lo = 0, hi = d->n;
+            while (lo < hi) {
+                uint32_t mid = lo + (hi - lo) / 2;
+                if (d->ids[mid] < s)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            has = lo < d->n && d->ids[lo] == s;
+        }
+        if (has)
+            T = MAX(T, d->end);
+        pp = &d->next;
+    }
+    return T;
+}
 
 /* Newest timestamp of series s in part p, or INT64_MIN. */
 static int64_t part_newest(const part *p, uint32_t s)
@@ -747,6 +880,8 @@ static int64_t mt_newest(const memtable *m, uint32_t s)
     return b;
 }
 
+_Atomic size_t cls_wtail_cap = CLS_WTAIL_CAP;
+
 struct cls_wtail *cls_wal_tail_new(const memtable *m)
 {
     struct cls_wtail *e = malloc(sizeof *e + (size_t)m->nids * (sizeof(int64_t) + sizeof(uint32_t)));
@@ -764,12 +899,29 @@ struct cls_wtail *cls_wal_tail_new(const memtable *m)
     return e;
 }
 
-void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, int64_t max_ts)
+/* Whether a flushed memtable's rows (segment seq, positions below fno_end) can no longer be replayed. A leader's own
+ * removal says nothing about its replicas, which replay from their log start: it goes by the replay floor (`floor`,
+ * read once by the caller) instead; anyone else by its own removal of the segment, durable. */
+static bool wtail_gone(eng *db, uint64_t seq, uint64_t fno_end, uint64_t floor)
 {
-    uint64_t synced = atomic_load(&db->wal_removed_synced);
+    if (eng_jr(db) && !db->rp && eng_test_mutant != MUT_LEADER_WTAIL_LOCAL)
+        return fno_end <= floor + (eng_test_mutant == MUT_LEADER_PRUNE_OFF1); /* planted: one too many */
+    return seq <= atomic_load(&db->wal_removed_synced);
+}
+
+static void raise_from(eng *db, uint64_t fno_end)
+{
+    if (eng_test_mutant != MUT_LEADER_NO_RAISE_FROM) /* planted: wtail_from stays at the attach value */
+        db->wtail_from = MAX(db->wtail_from, fno_end);
+}
+
+void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fno_end, int64_t max_ts)
+{
+    uint64_t floor = atomic_load(&db->lead_floor);
     for (struct cls_wtail **pp = &db->wtail; *pp;) { /* drop what can no longer be replayed */
         struct cls_wtail *x = *pp;
-        if (x->seq <= synced) {
+        if (wtail_gone(db, x->seq, x->fno_end, floor)) {
+            raise_from(db, x->fno_end); /* a lower floor later must not see it gone */
             *pp = x->next;
             free(x);
             db->nwtail--;
@@ -777,21 +929,45 @@ void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, int64_t max
             pp = &x->next;
         }
     }
-    if (db->wtail_all_seq <= synced)
-        db->wtail_all_seq = 0, db->wtail_all_max = INT64_MIN;
-    if (seq <= synced) {
+    if (db->wtail_all_seq && wtail_gone(db, db->wtail_all_seq, db->wtail_all_fno, floor)) {
+        raise_from(db, db->wtail_all_fno);
+        db->wtail_all_seq = 0, db->wtail_all_fno = 0, db->wtail_all_max = INT64_MIN;
+    }
+    if (wtail_gone(db, seq, fno_end, floor)) {
+        raise_from(db, fno_end);
         free(e);
         return;
     }
     if (!e) { /* ENOMEM: keep the bound, for every series (coarse, but never dropped) */
         db->wtail_all_seq = MAX(db->wtail_all_seq, seq);
+        db->wtail_all_fno = MAX(db->wtail_all_fno, fno_end);
         db->wtail_all_max = MAX(db->wtail_all_max, max_ts);
         return;
     }
     e->seq = seq;
+    e->fno_end = fno_end;
     e->next = db->wtail;
     db->wtail = e;
     db->nwtail++;
+    /* A leader keeps its entries until the replay floor passes them, and the floor stays put while a replica is away
+     * (for hours, with a storage outage): past the cap the oldest entry is folded into the coarse bound for every
+     * series, which only moves a later switch's T further out, never below a row. */
+    size_t cap = atomic_load_explicit(&cls_wtail_cap, memory_order_relaxed);
+    while (db->nwtail > cap && eng_test_mutant != MUT_WTAIL_NOCAP) {
+        struct cls_wtail **pp = &db->wtail;
+        while ((*pp)->next)
+            pp = &(*pp)->next;
+        struct cls_wtail *x = *pp;
+        int64_t mx = INT64_MIN;
+        for (size_t i = 0; i < x->n; i++)
+            mx = MAX(mx, x->max[i]);
+        db->wtail_all_seq = MAX(db->wtail_all_seq, x->seq);
+        db->wtail_all_fno = MAX(db->wtail_all_fno, x->fno_end);
+        db->wtail_all_max = MAX(db->wtail_all_max, mx);
+        *pp = NULL;
+        free(x);
+        db->nwtail--;
+    }
 }
 
 static int cmp_tail(const void *a, const void *b)
@@ -801,11 +977,12 @@ static int cmp_tail(const void *a, const void *b)
 }
 
 /* Newest timestamp of series s in the flushed memtables whose segments may still be replayed. db->lock held. */
-static int64_t wal_newest_locked(eng *db, uint32_t s)
+static int64_t wal_newest_locked(eng *db, uint32_t s, uint64_t floor)
 {
-    int64_t newest = db->wtail_all_seq > atomic_load(&db->wal_removed_synced) ? db->wtail_all_max : INT64_MIN;
+    int64_t newest = db->wtail_all_seq && !wtail_gone(db, db->wtail_all_seq, db->wtail_all_fno, floor) ? db->wtail_all_max
+                                                                                                       : INT64_MIN;
     for (struct cls_wtail *e = db->wtail; e; e = e->next) {
-        if (e->seq <= atomic_load(&db->wal_removed_synced))
+        if (wtail_gone(db, e->seq, e->fno_end, floor))
             continue;
         if (!e->sorted) { /* pack (id, max) pairs to sort them together, then unpack */
             uint64_t *pk = malloc((e->n ? e->n : 1) * sizeof *pk);
@@ -860,6 +1037,7 @@ void cls_thaw(eng *db)
 }
 
 #define CLS_LATER 1          /* switch_locked: placements in flight held the history; ask again later */
+#define CLS_DEFER 2          /* a leader's switch while the replay floor is unknown or below wtail_from */
 #define CLS_SWITCH_WAIT_MS 5 /* how long a switch waits for them, holding flush_lock and new placements back */
 #define CLS_RETRY_US 20000   /* between two tries of a switch that must happen (an observation, the test hook) */
 
@@ -903,8 +1081,19 @@ static int switch_locked(eng *db, const sw *w, size_t n)
     pthread_mutex_lock(&db->class_lock);
     size_t k = 0;
     int64_t far = sat_add(eng_now_ms(db), CLS_FAR_MS);
-    bool bad = false;
+    bool bad = false, bad_t = false;
+    bool leader = eng_jr(db) && !db->rp;
+    uint64_t floor = atomic_load(&db->lead_floor); /* one value for the whole switch */
     pthread_mutex_lock(&db->lock);
+    /* A leader's T must lie past every row a replica may still replay, and it knows those rows only from this run's
+     * flushes (wtail, from wtail_from on): while the floor is unknown or below that, the switch waits. */
+    if (leader && floor < db->wtail_from && eng_test_mutant != MUT_LEADER_NO_WTAIL_FROM) {
+        pthread_mutex_unlock(&db->lock);
+        pthread_mutex_unlock(&db->class_lock);
+        pthread_rwlock_unlock(&db->cls_rw);
+        free(r);
+        return CLS_DEFER;
+    }
     for (size_t i = 0; i < n; i++) {
         uint32_t s = w[i].s;
         uint8_t b = cls_byte(db, s);
@@ -919,18 +1108,31 @@ static int switch_locked(eng *db, const sw *w, size_t n)
             }
         } else if ((int)(b & CLS_MASK) == w[i].cls && (b & CLS_DECIDED))
             continue;
-        int64_t newest = wal_newest_locked(db, s);
+        int64_t newest = wal_newest_locked(db, s, floor);
         for (size_t j = 0; j < db->nparts; j++)
             newest = MAX(newest, part_newest(db->parts[j], s));
-        for (size_t j = 0; j < db->nflushing; j++)
+        /* A replica's memtable rows are placed after the marker, under the new history, as the leader's (they came
+         * before the marker in the log, so the leader had them in its memtables when it took T): only the rows it may
+         * replay and its parts must lie before the leader's T. */
+        bool mem = !w[i].pos || eng_test_mutant == MUT_REPLICA_CLASS_MAX;
+        for (size_t j = 0; mem && j < db->nflushing; j++)
             newest = MAX(newest, mt_newest(db->flushing[j], s));
-        pthread_mutex_lock(&db->buf_lock);
-        newest = MAX(newest, mt_newest(db->active, s));
-        pthread_mutex_unlock(&db->buf_lock);
+        if (mem) {
+            pthread_mutex_lock(&db->buf_lock);
+            newest = MAX(newest, mt_newest(db->active, s));
+            pthread_mutex_unlock(&db->buf_lock);
+        }
         int64_t T = newest == INT64_MIN ? INT64_MIN : sat_mul(floor_div(newest, db->partition_ms) + 1, db->partition_ms);
         /* rows of dropped partitions are no longer listed, but their removal may not be durable yet: a power loss
-         * brings them back, and they must still lie before T */
-        T = MAX(T, db->cls_dropped_end);
+         * brings them back, and they must still lie before T. A fresh series' decision (INT64_MIN) has no rows. */
+        if (!w[i].pos || *w[i].at != INT64_MIN)
+            T = MAX(T, cls_dropped_bound_locked(db, s));
+        if (leader) {
+            /* Expired rows a replica has not merged away yet (its clock lags the leader's): T is past them too */
+            int64_t cut = eng_cutoff(db, s);
+            if (cut != INT64_MIN && eng_test_mutant != MUT_LEADER_NO_CUTOFF)
+                T = MAX(T, sat_mul(floor_div(cut, db->partition_ms) + 1, db->partition_ms));
+        }
         if (T == INT64_MAX && !w[i].pos)
             continue; /* rows at the end of time: nothing can come after them */
         if (b & CLS_HIST) {
@@ -948,12 +1150,20 @@ static int switch_locked(eng *db, const sw *w, size_t n)
                             "until the row is gone\n", s, newest, (int)(b & CLS_MASK));
             continue;
         }
-        if (w[i].pos && eng_test_mutant == MUT_REPLICA_CLASS_AT) /* planted: the leader's T, not the one this replica's rows allow */
-            T = *w[i].at;
+        if (w[i].pos && eng_test_mutant != MUT_REPLICA_CLASS_MAX && T > *w[i].at &&
+            !(eng_test_mutant == MUT_REPLICA_FRESH_UNCHECKED && *w[i].at == INT64_MIN)) {
+            /* The leader's T is exact (design-cluster.md 5.4): a row this replica may replay, or one in its parts that
+             * cls_apply's merge did not remove, lies past it. Its history is not the leader's: never silent. */
+            fprintf(stderr, "tsdb: %s: series %u: the leader switches it to class %d at %" PRId64 ", below a row this "
+                            "replica holds or may replay (its rows reach %" PRId64 "): its history is not the leader's\n",
+                    db->dir, s, w[i].cls, *w[i].at, T);
+            bad_t = true;
+            break;
+        }
         r[k++] = (cls_rec){s, w[i].at && *w[i].at > T ? *w[i].at : T, w[i].cls};
     }
     pthread_mutex_unlock(&db->lock);
-    int rc = bad ? TSDB_ERR_CORRUPT : append_locked(db, r, k);
+    int rc = bad || bad_t ? TSDB_ERR_CORRUPT : append_locked(db, r, k);
     if (bad)
         fprintf(stderr, "tsdb: %s: the leader's CLASSES record is at offset %" PRIu64 ", this replica's file ends at %" PRIu64
                         ": its history is not the leader's\n", db->dir, w[0].off, db->cls_off);
@@ -965,13 +1175,29 @@ static int switch_locked(eng *db, const sw *w, size_t n)
     return rc;
 }
 
-/* A switch that must happen: tried until placements let it in, without holding flush_lock between tries. */
-static int switch_retry(eng *db, const sw *w, size_t n)
+/* A switch that must happen: tried until placements let it in, without holding flush_lock between tries. A leader's
+ * switch that must wait for the replay floor (CLS_DEFER) is not retried here: it may wait for long (a replica down):
+ * `explicit` (eng_class_switch) answers TSDB_ERR_UNAVAILABLE, an automatic one 0 (the series is measured again). */
+static int switch_retry(eng *db, const sw *w, size_t n, bool explicit)
 {
     for (;;) {
         pthread_mutex_lock(&db->flush_lock);
+        late_armed = true;
         int rc = switch_locked(db, w, n);
+        late_armed = false;
         pthread_mutex_unlock(&db->flush_lock);
+        void (*hook)(eng *) = __atomic_load_n(&cls_test_after_switch, __ATOMIC_ACQUIRE);
+        if (rc == 0 && hook)
+            hook(db);
+        if (late_r) { /* planted (MUT_LEADER_CLASS_MARKER_LATE): the markers after flush_lock */
+            int mrc = cls_markers(db, late_r, late_n, late_off);
+            free(late_r);
+            late_r = NULL;
+            if (rc == 0)
+                rc = mrc;
+        }
+        if (rc == CLS_DEFER)
+            return explicit ? TSDB_ERR_UNAVAILABLE : 0;
         if (rc != CLS_LATER)
             return rc;
         if (atomic_load(&db->stop))
@@ -989,19 +1215,82 @@ int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at)
     if (!db->cls_on || cls < 0 || cls >= PART_CLASSES || series >= eng_series_count(db))
         return TSDB_ERR_INVALID;
     sw w = {.s = series, .cls = cls, .at = at};
-    return switch_retry(db, &w, 1);
+    return switch_retry(db, &w, 1, true);
 }
 
-/* A replica applies a switch the leader decided (a CLASS record): at `at`, or later where this replica's own rows
- * need it (T past every row of the series in its parts, memtables and the WAL segments that may still replay: the
- * rule of AGENTS.md, judged on its state, which can hold fewer or more rows than the leader's at that moment). The
- * leader's record has offset `record_off` in CLASSES: one the file is past was applied before a restart. */
+/* A replica applies a switch the leader decided (a CLASS record) at exactly the leader's `at` (design-cluster.md 5.4,
+ * decided 2026-11-14): the leader's T lies past every row any replica may still replay (the replay floor), so a row
+ * of this replica's that it may replay, or one in its parts, at or past `at` means its history is not the leader's
+ * (TSDB_ERR_CORRUPT, switch_locked). Rows the leader's merges removed (hidden by a tombstone, expired) may still be in
+ * this replica's parts: the partitions where the series has rows at or past `at` are merged first (outside
+ * flush_lock), so they go as they went on the leader. The leader's record has offset `record_off` in CLASSES: one the
+ * file is past was applied before a restart. */
+/* A leader's record at an offset this replica's file is already past was applied before a restart: the record there
+ * must be the same one. An offset that is wrong (a bug, or a history that is not the leader's) would otherwise skip the
+ * record silently. A rare path (a replay), so it reads the file. */
+static int cls_same_at(eng *db, uint64_t off, uint32_t s, int64_t at, int cls)
+{
+    int fd = openat(db->dirfd, CLS_FILE, O_RDONLY | O_CLOEXEC);
+    uint8_t rec[CLS_REC];
+    ssize_t r = -1;
+    if (fd >= 0) {
+        do
+            r = pread(fd, rec, CLS_REC, (off_t)off);
+        while (r < 0 && errno == EINTR);
+        close(fd);
+    }
+    if (r != CLS_REC) {
+        fprintf(stderr, "tsdb: %s: cannot read the CLASSES record at offset %" PRIu64 ": %s\n", db->dir, off,
+                r < 0 ? strerror(errno) : "short read");
+        return TSDB_ERR_IO;
+    }
+    int64_t from;
+    memcpy(&from, rec + 8, 8);
+    uint32_t rs, rc_, chk;
+    memcpy(&chk, rec, 4);
+    memcpy(&rs, rec + 4, 4);
+    memcpy(&rc_, rec + 16, 4);
+    if (chk == rec_check(rec, off) && rs == s && from == at && rc_ == (uint32_t)cls)
+        return 0;
+    fprintf(stderr, "tsdb: %s: the leader's CLASSES record at offset %" PRIu64 " (series %u, class %d at %" PRId64 ") is "
+                    "not the one this replica holds there (series %u, class %u at %" PRId64 "): its history is not the "
+                    "leader's\n", db->dir, off, s, cls, at, rs, rc_, from);
+    return TSDB_ERR_CORRUPT;
+}
+
 int cls_apply(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off)
 {
     if (!db->cls_on || cls < 0 || cls >= PART_CLASSES || series >= eng_series_count(db))
         return TSDB_ERR_INVALID;
+    if (record_off < db->cls_off && eng_test_mutant != MUT_REPLICA_NO_POS) /* the applier is the only appender */
+        return cls_same_at(db, record_off, series, at, cls);
+    if (record_off >= db->cls_off && eng_test_mutant != MUT_REPLICA_NO_CLASS_PURGE) {
+        int64_t *keys = NULL;
+        size_t nk = 0;
+        pthread_mutex_lock(&db->lock);
+        for (size_t j = 0; j < db->nparts; j++) {
+            if (part_newest(db->parts[j], series) < at)
+                continue;
+            int64_t key = db->parts[j]->partition;
+            if (nk && keys[nk - 1] == key)
+                continue; /* parts are listed by partition */
+            int64_t *k2 = realloc(keys, (nk + 1) * sizeof *keys);
+            if (!k2) {
+                pthread_mutex_unlock(&db->lock);
+                free(keys);
+                return TSDB_ERR_NOMEM;
+            }
+            keys = k2;
+            keys[nk++] = key;
+        }
+        pthread_mutex_unlock(&db->lock);
+        int rc = nk ? eng_optimize_keys(db, keys, nk) : 0;
+        free(keys);
+        if (rc)
+            return rc;
+    }
     sw w = {.s = series, .cls = cls, .at = &at, .pos = true, .off = record_off};
-    return switch_retry(db, &w, 1);
+    return switch_retry(db, &w, 1, true);
 }
 
 int cls_flush_guard(eng *db, const memtable *m)
@@ -1030,7 +1319,8 @@ int cls_flush_guard(eng *db, const memtable *m)
     }
     int rc = switch_locked(db, w, k);
     free(w);
-    return rc == CLS_LATER ? 0 : rc; /* placements in flight: the guard asks again at the next flush */
+    /* placements in flight, or a leader's replay floor not yet past this run's start: asked again at the next flush */
+    return rc == CLS_LATER || rc == CLS_DEFER ? 0 : rc;
 }
 
 /* Where the series' newest class begins (INT64_MIN when it never switched). */
@@ -1089,7 +1379,7 @@ int cls_observe(eng *db, part *p)
     }
     int rc = 0;
     if (k)
-        rc = switch_retry(db, w, k);
+        rc = switch_retry(db, w, k, false);
     free(w);
     return rc;
 }

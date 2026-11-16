@@ -32,13 +32,15 @@ mode=${1:-quick}
 #  31 min ISR ignored (check 7)                      34 promotion drops the old leader that did not answer (seed 76)
 #  35 repl_synced believes a sync issued before a cut (with the naive driver)
 #  36 a position the log no longer retains fails the core (no snapshot path)
+# The replay floor (r3b, design §5.4): 38 an ACK reports durable + 1 as its log start; 39 the floor ignores members
+#     not heard from in this epoch
 #  25 promotion takes fence replies from outside the fenced ISR: caught only with 11 (a non-member has no rid in the
 #     record), and only because some runs fence every replica.
 # Equivalent, so not run: 11 and 25 alone (above); 24 (cut() rounds up: the next question cuts further); 30 (no
 # prev_epoch check while following: never reached, the core fails there now); 37 (unanswered members wait for the lag
 # rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
 quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20 21 22 23 26 27 28 29 31 34 35 36"
-all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36"
+all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39"
 # test_repl's scenarios and the planted bug each must catch
 scenarios="34 35 36 37"
 

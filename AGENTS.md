@@ -380,7 +380,12 @@ cgroup, so `nice` does not keep your work out of its way.
   writes the new FEED before FNO is raised. Tests: `tests/test_feedstore.c`, `tests/test_cli_feed.sh`, `jepsen --feed`
   with `tests/jepsen/feedcheck.c`.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
-  only into partitions without a part from that segment.
+  only into partitions without a part from that segment: a replicated leader keeps its flushed
+  segments for the replicas (`eng_leader_keep`): one goes only once its last position is at or below min(the driver's
+  keep bound, the commit point), after `fno_require`, by its own name (`lk_unlink_upto`: kept numbers jump at a promotion,
+  so never through `wal_unlink_upto`'s run of consecutive ones); `wal_removed` never passes one still on disk.
+  Kept segments (a leader's flushed ones, a promoted replica's) are named in RSTATE (`kept`, saved before a drop can
+  take their rows out of parts): a writer's open neither replays nor removes a segment at or below it.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
@@ -445,6 +450,10 @@ cgroup, so `nice` does not keep your work out of its way.
   replace classifies a fresh series like a large insert. `CLASSES` is append-only (24-byte checksummed records),
   synced (and its directory, when new) before anything relies on a record, fail-stop on error, torn tail cut,
   loaded before the WAL replay.
+  On a replicated volume (design-cluster 5.4) a replica takes the leader's T exactly, so the leader's T lies past every
+  row any member may still replay (its WAL tails are pruned by the members' replay floor, never by its own removed
+  segments, and a switch waits while that floor is unknown or below its open), and the CLASS marker precedes the
+  CLASSES record inside the switch.
   `tsdb_part_info.partition` stays the base partition number (where the partition starts); `cls`, `start_ms`,
   `end_ms` say the rest. Tests that count parts per base partition or name `p<N>_` files set
   `partition_classes = 0`.

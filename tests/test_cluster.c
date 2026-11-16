@@ -2719,7 +2719,8 @@ static void scen_links(void)
         struct view v;
         view(1, &v);
         const struct meta_member *m = v.st.self ? meta_member(&v.m, v.st.self) : NULL;
-        if (m && m->ident[0]) {
+        static const uint8_t unknown[16]; /* zero: not known; a random ident may begin with a zero byte */
+        if (m && memcmp(m->ident, unknown, 16) != 0) {
             mid = m->id;
             memcpy(mident, m->ident, 16);
         }

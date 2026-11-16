@@ -41,6 +41,21 @@ typedef struct rseg {
     uint64_t len;   /* its valid bytes */
 } rseg;
 
+/* The RSTATE file: which COMMIT and DROP markers are carried out already. A replica writes it as it applies them, a
+ * leader as it publishes its own (jr_precommit, jr_commit, leader_rs_drop), so a deposed leader reopened as a replica
+ * skips its own published markers instead of applying them again (design-cluster.md 6.3). */
+struct rstate {
+    uint64_t done; /* the last position of the last COMMIT or DROP applied */
+    uint64_t doing_pos, doing_b0, doing_n; /* a COMMIT being published: its position, first block, parts (0: none) */
+    struct rdrop {
+        uint64_t pos;  /* the DROP's position */
+        int64_t until; /* dropped_before */
+    } *drops;
+    size_t ndrops;
+    uint64_t kept; /* the wal_ segments up to this seq hold no row outside the parts: a writer's open neither replays nor
+                    * removes them (a leader's flushed segments kept for its replicas, a promoted replica's) */
+};
+
 struct replica {
     pthread_mutex_t mu;
     pthread_mutex_t segs_mu;
@@ -83,21 +98,13 @@ struct replica {
         } *f;
     } *cm; /* ascending by first */
     size_t ncm, capcm;
-    struct {
-        uint64_t done; /* the last position of the last COMMIT or DROP applied */
-        uint64_t doing_pos, doing_b0, doing_n; /* a COMMIT being published: its position, first block, parts (0: none) */
-        struct rdrop {
-            uint64_t pos;  /* the DROP's position */
-            int64_t until; /* dropped_before */
-        } *drops;
-        size_t ndrops;
-    } rs; /* the RSTATE file */
+    struct rstate rs; /* the RSTATE file */
 };
 
 #define RP_CHUNK ((size_t)1 << 20)
 
 static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit);
-static int rs_load(eng *db, struct replica *rp);
+static int rs_load(eng *db, struct rstate *rs);
 static int open_scan(eng *db, struct replica *rp);
 
 void replica_now_advance(eng *db, int64_t ms)
@@ -339,7 +346,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
                         "records the floor says were applied\n", db->dir, floor, db->fno_next - 1);
         return TSDB_ERR_CORRUPT;
     }
-    if ((rc = rs_load(db, rp)) == 0)
+    if ((rc = rs_load(db, &rp->rs)) == 0)
         rc = open_scan(db, rp);
     if (rc)
         return rc;
@@ -351,6 +358,17 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
 
 void replica_free(eng *db)
 {
+    if (db->lrs) { /* a leader's RSTATE (the leader side, below) */
+        free(db->lrs->drops);
+        free(db->lrs);
+        db->lrs = NULL;
+    }
+    free(db->lf); /* the links of its COMMITs' files: they stay on disk (removed at the next attach) */
+    db->lf = NULL;
+    db->nlf = db->caplf = 0;
+    free(db->lk); /* the leader's kept segments: they stay on disk */
+    db->lk = NULL;
+    db->nlk = db->caplk = 0;
     struct replica *rp = db->rp;
     if (!rp)
         return;
@@ -788,22 +806,23 @@ int replica_missing(eng *db, char *name, size_t cap, uint64_t *size)
 
 /* ---- RSTATE ---- */
 
-static int rs_save(eng *db, struct replica *rp)
+static int rs_save(eng *db, struct rstate *rs)
 {
-    size_t n = 8 + 4 * 8 + 8 + rp->rs.ndrops * 16 + 8, o = 0;
+    size_t n = 8 + 4 * 8 + 8 + rs->ndrops * 16 + 8 + 8, o = 0;
     uint8_t *b = malloc(n);
     if (!b)
         return TSDB_ERR_NOMEM;
     put64(b + o, RS_MAGIC), o += 8;
-    put64(b + o, rp->rs.done), o += 8;
-    put64(b + o, rp->rs.doing_pos), o += 8;
-    put64(b + o, rp->rs.doing_b0), o += 8;
-    put64(b + o, rp->rs.doing_n), o += 8;
-    put64(b + o, rp->rs.ndrops), o += 8;
-    for (size_t i = 0; i < rp->rs.ndrops; i++) {
-        put64(b + o, rp->rs.drops[i].pos), o += 8;
-        put64(b + o, (uint64_t)rp->rs.drops[i].until), o += 8;
+    put64(b + o, rs->done), o += 8;
+    put64(b + o, rs->doing_pos), o += 8;
+    put64(b + o, rs->doing_b0), o += 8;
+    put64(b + o, rs->doing_n), o += 8;
+    put64(b + o, rs->ndrops), o += 8;
+    for (size_t i = 0; i < rs->ndrops; i++) {
+        put64(b + o, rs->drops[i].pos), o += 8;
+        put64(b + o, (uint64_t)rs->drops[i].until), o += 8;
     }
+    put64(b + o, rs->kept), o += 8;
     put64(b + o, xxh64(b, o, 0));
     int fd = openat(db->dirfd, RS_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int rc = fd < 0 || write_full(fd, b, n) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
@@ -819,7 +838,7 @@ static int rs_save(eng *db, struct replica *rp)
     return rc;
 }
 
-static int rs_load(eng *db, struct replica *rp)
+static int rs_load(eng *db, struct rstate *rs)
 {
     uint8_t *b;
     size_t len;
@@ -828,32 +847,42 @@ static int rs_load(eng *db, struct replica *rp)
     int rc = read_file(db->dirfd, RS_FILE, &b, &len);
     if (rc)
         return rc;
-    bool ok = len >= 56 && get64(b) == RS_MAGIC && get64(b + len - 8) == xxh64(b, len - 8, 0);
+    bool ok = len >= 64 && get64(b) == RS_MAGIC && get64(b + len - 8) == xxh64(b, len - 8, 0);
     uint64_t nd = ok ? get64(b + 40) : 0;
-    ok = ok && nd <= (len - 56) / 16 && len == 56 + nd * 16;
+    ok = ok && nd <= (len - 64) / 16 && len == 64 + nd * 16;
     if (!ok) {
         free(b);
         fprintf(stderr, "tsdb: %s: RSTATE is damaged: the replica's state is lost, rebuild it\n", db->dir);
         return TSDB_ERR_CORRUPT;
     }
-    rp->rs.done = get64(b + 8);
-    rp->rs.doing_pos = get64(b + 16);
-    rp->rs.doing_b0 = get64(b + 24);
-    rp->rs.doing_n = get64(b + 32);
+    rs->done = get64(b + 8);
+    rs->doing_pos = get64(b + 16);
+    rs->doing_b0 = get64(b + 24);
+    rs->doing_n = get64(b + 32);
     if (nd) {
-        rp->rs.drops = malloc(nd * sizeof *rp->rs.drops);
-        if (!rp->rs.drops) {
+        rs->drops = malloc(nd * sizeof *rs->drops);
+        if (!rs->drops) {
             free(b);
             return TSDB_ERR_NOMEM;
         }
         for (uint64_t i = 0; i < nd; i++) {
-            rp->rs.drops[i].pos = get64(b + 48 + i * 16);
-            rp->rs.drops[i].until = (int64_t)get64(b + 56 + i * 16);
+            rs->drops[i].pos = get64(b + 48 + i * 16);
+            rs->drops[i].until = (int64_t)get64(b + 56 + i * 16);
         }
-        rp->rs.ndrops = nd;
+        rs->ndrops = nd;
     }
+    rs->kept = get64(b + 48 + nd * 16);
     free(b);
     return 0;
+}
+
+int rs_kept_seq(eng *db, uint64_t *seq)
+{
+    struct rstate rs = {0};
+    int rc = rs_load(db, &rs);
+    free(rs.drops);
+    *seq = rc == 0 && eng_test_mutant != MUT_KEPT_REPLAYED ? rs.kept : 0;
+    return rc;
 }
 
 /* A drop whose position lies below every retained record cannot matter to a replay any more */
@@ -878,6 +907,8 @@ static void rs_prune_drops(struct replica *rp)
  * its sources; blocks are never reused). intents_recover ran at the open, so the parts are all or none. */
 static bool rs_committed(eng *db, struct replica *rp)
 {
+    if (eng_test_mutant == MUT_REPLICA_RS_COMMITTED_TRUE || eng_test_mutant == MUT_REPLICA_RS_COMMITTED_FALSE)
+        return eng_test_mutant == MUT_REPLICA_RS_COMMITTED_TRUE; /* planted: the answer without looking */
     bool yes = false;
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < db->nparts && !yes; i++)
@@ -899,7 +930,7 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
     if (rp->rs.doing_pos == last && eng_test_mutant != MUT_REPLICA_NO_DONE_SKIP && rs_committed(db, rp)) {
         rp->rs.done = last;
         rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
-        int rc = rs_save(db, rp);
+        int rc = rs_save(db, &rp->rs);
         if (rc == 0 && ci < rp->ncm)
             cm_remove(db, rp, ci);
         return rc;
@@ -964,7 +995,7 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
         rp->rs.doing_pos = last;
         rp->rs.doing_b0 = atomic_load(&db->next_block);
         rp->rs.doing_n = n;
-        rc = rs_save(db, rp);
+        rc = rs_save(db, &rp->rs);
         if (rc == 0)
             rc = parts_commit(db, ps, n);
         if (rc == 0) {
@@ -988,7 +1019,7 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
     rp->rs.done = last;
     rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
     if (rc == 0)
-        rc = rs_save(db, rp);
+        rc = rs_save(db, &rp->rs);
     if (rc == 0)
         cm_remove(db, rp, ci);
     return rc;
@@ -1028,7 +1059,9 @@ static int apply_drop(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
     rp->rs.drops = d;
     rp->rs.drops[rp->rs.ndrops++] = (struct rdrop){last, ts};
     rs_prune_drops(rp);
-    return rs_save(db, rp);
+    if (eng_test_mutant == MUT_REPLICA_DROP_NO_SAVE)
+        return 0; /* planted: the DROP is carried out but RSTATE does not say so */
+    return rs_save(db, &rp->rs);
 }
 
 /* The open: the staged files that are on disk, the COMMIT markers above RSTATE's `done` (their files must be staged
@@ -1693,6 +1726,198 @@ int replica_cut(eng *db, uint64_t last)
 
 size_t replica_read_win_min = 65536; /* test hook: the smallest read window, so a test reaches the growth of the window */
 
+/* One read of segment r->seq (r->flen bytes of it are the log's) from position r->from: whole records from the one that
+ * starts there, at most r->cap bytes unless the first is larger, scanned from byte r->pos0 (a record start at or
+ * before it) in windows, never the whole segment: a catch-up in chunks costs the bytes it sends, not a square of the
+ * segment. r->found says whether a record starts at r->from; r->tail_ok: a record that does not parse at the end is
+ * where the writer's bytes end (a leader's newest segments, written while this reads), not damage. */
+struct segrd {
+    uint64_t seq, from, last;
+    size_t flen, pos0, cap, start, next_off, outlen;
+    bool tail_ok, found;
+    uint8_t *out;
+};
+
+static int seg_scan(eng *db, struct segrd *r)
+{
+    char name[64];
+    wal_name(name, sizeof name, r->seq);
+    int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    size_t flen = r->flen, pos0 = r->pos0, cap = r->cap;
+    uint64_t from = r->from;
+    size_t win = MAX(cap, replica_read_win_min);
+    uint8_t *fb = NULL;
+    size_t blen = 0, outcap = 0;
+    bool done = false;
+    int rc = 0;
+    while (rc == 0 && !done && pos0 < flen) {
+        size_t want = MIN(win, flen - pos0);
+        uint8_t *nb = realloc(fb, want);
+        if (!nb) {
+            rc = TSDB_ERR_NOMEM;
+            break;
+        }
+        fb = nb;
+        ssize_t got = pread(fd, fb, want, (off_t)pos0);
+        if (got < 0 || (size_t)got != want) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        blen = want;
+        size_t pos = 0;
+        bool window_end = pos0 + blen < flen; /* the file goes on beyond this window */
+        while (pos < blen) {
+            wal_rec wr;
+            size_t sz = wal_record(fb + pos, blen - pos, r->seq, pos0 + pos, &wr);
+            if (sz == 0) {
+                if (window_end)
+                    break; /* a record that does not fit the window: read from here with a larger one */
+                if (r->tail_ok)
+                    done = true; /* what the writer has written so far ends here */
+                else
+                    rc = TSDB_ERR_CORRUPT;
+                break;
+            }
+            if (!r->found) {
+                if (wr.fno == from)
+                    r->found = true, r->start = pos0 + pos;
+                else if (wr.fno > from) {
+                    rc = TSDB_ERR_INVALID; /* from is inside a record */
+                    break;
+                }
+            }
+            if (r->found) {
+                if (r->outlen > 0 && r->outlen + sz > cap) {
+                    done = true;
+                    break;
+                }
+                if (r->outlen + sz > outcap) {
+                    size_t nc = MAX(r->outlen + sz, outcap * 2);
+                    uint8_t *no = realloc(r->out, nc);
+                    if (!no) {
+                        rc = TSDB_ERR_NOMEM;
+                        break;
+                    }
+                    r->out = no, outcap = nc;
+                }
+                memcpy(r->out + r->outlen, fb + pos, sz);
+                r->outlen += sz;
+                r->last = wr.fno + wr.span - 1;
+                r->next_off = pos0 + pos + sz;
+            }
+            pos += sz;
+        }
+        if (rc || done)
+            break;
+        if (pos == 0 && window_end)
+            win *= 2; /* one record is larger than the window */
+        pos0 += pos;
+    }
+    free(fb);
+    close(fd);
+    return rc;
+}
+
+/* The newest WAL segment below `below` that is on disk (0: none), by a listing: a leader's kept segments need not
+ * follow one another (a promotion begins the new leader's log at epoch << 40, above the replica's own segments) */
+static int seg_below(eng *db, uint64_t below, uint64_t *prev)
+{
+    *prev = 0;
+    DIR *d = fdopendir(dup(db->dirfd));
+    if (!d)
+        return TSDB_ERR_IO;
+    rewinddir(d);
+    struct dirent *e;
+    for (errno = 0; (e = readdir(d)); errno = 0) {
+        uint64_t sq;
+        int consumed = 0;
+        if (!wal_file_name(e->d_name) || sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &sq, &consumed) != 1 ||
+            e->d_name[consumed])
+            continue;
+        if (sq < below && sq > *prev)
+            *prev = sq;
+    }
+    int rc = errno ? TSDB_ERR_IO : 0; /* a readdir error is an error, never the end of the directory */
+    closedir(d);
+    return rc;
+}
+
+/* A writer's (a leader's) log by position: what it keeps of it (its retained segments, eng_leader_keep, and the ones
+ * not flushed yet) and the current segment as far as the WAL writer role has written it, which is what the driver's
+ * `bytes` hook has been handed already or is about to be. The segment that holds `from` is the newest whose first
+ * record is at or below it. Numbers follow one another except where a promotion jumped to the epoch's (seg_below finds
+ * the kept ones under the jump); no segment below that means the position is in parts (TSDB_ERR_NOTFOUND: a
+ * snapshot). The two newest segments may end in a record still being written (the
+ * current one, and the one a rotation is finishing): their bytes end at the first record that does not parse. */
+static int leader_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
+                       uint64_t *last)
+{
+    pthread_mutex_lock(&db->buf_lock);
+    uint64_t cur = db->wal_seq, next = db->fno_next;
+    pthread_mutex_unlock(&db->buf_lock);
+    if (from == 0 || from > next)
+        return TSDB_ERR_INVALID;
+    *last = from - 1, *seq = cur, *off = 0;
+    for (uint64_t sq = cur; sq > 0; sq--) {
+        char name[64];
+        wal_name(name, sizeof name, sq);
+        int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
+        if (fd < 0 && errno == ENOENT) {
+            uint64_t prev;
+            int lrc = eng_test_mutant == MUT_LEADER_READ_NO_GAP ? (prev = 0, 0) : seg_below(db, sq, &prev);
+            if (lrc)
+                return lrc;
+            if (prev == 0)
+                return TSDB_ERR_NOTFOUND; /* gone below `from`'s segment: in parts */
+            sq = prev + 1; /* the loop steps to it */
+            continue;
+        }
+        if (fd < 0)
+            return TSDB_ERR_IO;
+        struct stat st;
+        uint8_t h[WAL_HDR];
+        uint64_t first = 0;
+        bool newest = sq + 1 >= cur;
+        int rc = 0;
+        if (fstat(fd, &st) != 0)
+            rc = TSDB_ERR_IO;
+        else if ((size_t)st.st_size >= WAL_HDR && pread(fd, h, WAL_HDR, 0) == WAL_HDR)
+            memcpy(&first, h + 16, 8);
+        else if (!newest)
+            rc = TSDB_ERR_CORRUPT; /* a sealed segment without a record */
+        close(fd);
+        if (rc)
+            return rc;
+        if (first == 0 || first > from)
+            continue; /* empty (just begun), or it starts above `from` */
+        pthread_mutex_lock(&db->lead_mu);
+        bool behind = db->lrd_next <= from || eng_test_mutant == MUT_LEADER_READ_CURSOR_ANY; /* the cursor is ours */
+        size_t pos0 = db->lrd_seq == sq && db->lrd_next && behind && db->lrd_off <= (uint64_t)st.st_size
+                          ? (size_t)db->lrd_off
+                          : 0;
+        pthread_mutex_unlock(&db->lead_mu);
+        struct segrd r = {.seq = sq, .flen = (size_t)st.st_size, .pos0 = pos0, .from = from, .cap = cap,
+                          .tail_ok = newest || eng_test_mutant == MUT_LEADER_READ_TAILOK_SEALED};
+        rc = seg_scan(db, &r);
+        if (rc == 0 && !r.found && !newest && eng_test_mutant != MUT_LEADER_READ_NOTFOUND_SEALED)
+            rc = TSDB_ERR_INVALID; /* a sealed segment that has the position inside a record, or not at all */
+        if (rc) {
+            free(r.out);
+            return rc;
+        }
+        if (!r.found)
+            return 0; /* not written yet */
+        *buf = r.out, *len = r.outlen, *seq = sq, *off = r.start, *last = r.last;
+        pthread_mutex_lock(&db->lead_mu);
+        db->lrd_seq = sq, db->lrd_off = r.next_off, db->lrd_next = r.last + 1;
+        pthread_mutex_unlock(&db->lead_mu);
+        return 0;
+    }
+    return TSDB_ERR_NOTFOUND;
+}
+
 int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
                  uint64_t *last)
 {
@@ -1700,7 +1925,8 @@ int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap,
     *buf = NULL;
     *len = 0;
     if (!rp)
-        return TSDB_ERR_INVALID;
+        return db->wal_enabled && !db->opt.read_only ? leader_read(db, from, buf, len, cap, seq, off, last)
+                                                     : TSDB_ERR_INVALID;
     pthread_mutex_lock(&rp->mu);
     int rc = 0;
     if (from > db->fno_next || from == 0) {
@@ -1728,100 +1954,22 @@ int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap,
         pthread_mutex_unlock(&rp->mu);
         return TSDB_ERR_NOTFOUND; /* below the log's start: it is in parts, a snapshot is needed */
     }
-    /* pread from where the last read of this segment ended (rd_*: the sender walks the log in order), in windows, never
-     * the whole segment: a catch-up in chunks costs the bytes it sends, not a square of the segment. The segment is
+    /* pread from where the last read of this segment ended (rd_*: the sender walks the log in order). The segment is
      * append-only between cuts, and a cut holds rp->mu like this does. */
-    char name[64];
-    wal_name(name, sizeof name, s.seq);
-    int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        pthread_mutex_unlock(&rp->mu);
-        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
-    }
-    size_t flen = (size_t)s.len;
-    size_t pos0 = rp->rd_seq == s.seq && rp->rd_next && rp->rd_next <= from && rp->rd_off <= flen ? (size_t)rp->rd_off : 0;
-    size_t win = MAX(cap, replica_read_win_min);
-    uint8_t *fb = NULL;
-    size_t start = 0, blen = 0;
-    bool found = false, done = false;
-    uint64_t lastpos = 0, next_fno = 0;
-    size_t next_off = 0;
-    uint8_t *out = NULL;
-    size_t outlen = 0, outcap = 0;
-    while (rc == 0 && !done && pos0 < flen) {
-        size_t want = MIN(win, flen - pos0);
-        uint8_t *nb = realloc(fb, want);
-        if (!nb) {
-            rc = TSDB_ERR_NOMEM;
-            break;
-        }
-        fb = nb;
-        ssize_t got = pread(fd, fb, want, (off_t)pos0);
-        if (got < 0 || (size_t)got != want) {
-            rc = TSDB_ERR_IO;
-            break;
-        }
-        blen = want;
-        size_t pos = 0;
-        bool window_end = pos0 + blen < flen; /* the file goes on beyond this window */
-        while (pos < blen) {
-            wal_rec wr;
-            size_t sz = wal_record(fb + pos, blen - pos, s.seq, pos0 + pos, &wr);
-            if (sz == 0) {
-                if (window_end)
-                    break; /* a record that does not fit the window: read from here with a larger one */
-                rc = TSDB_ERR_CORRUPT;
-                break;
-            }
-            if (!found) {
-                if (wr.fno == from)
-                    found = true, start = pos0 + pos;
-                else if (wr.fno > from) {
-                    rc = TSDB_ERR_INVALID; /* from is inside a record */
-                    break;
-                }
-            }
-            if (found) {
-                if (outlen > 0 && outlen + sz > cap) {
-                    done = true;
-                    break;
-                }
-                if (outlen + sz > outcap) {
-                    size_t nc = MAX(outlen + sz, outcap * 2);
-                    uint8_t *no = realloc(out, nc);
-                    if (!no) {
-                        rc = TSDB_ERR_NOMEM;
-                        break;
-                    }
-                    out = no, outcap = nc;
-                }
-                memcpy(out + outlen, fb + pos, sz);
-                outlen += sz;
-                lastpos = wr.fno + wr.span - 1;
-                next_fno = lastpos + 1;
-                next_off = pos0 + pos + sz;
-            }
-            pos += sz;
-        }
-        if (rc || done)
-            break;
-        if (pos == 0 && window_end)
-            win *= 2; /* one record is larger than the window */
-        pos0 += pos;
-    }
-    free(fb);
-    close(fd);
-    if (rc == 0 && !found)
+    size_t pos0 = rp->rd_seq == s.seq && rp->rd_next && rp->rd_next <= from && rp->rd_off <= s.len ? (size_t)rp->rd_off : 0;
+    struct segrd r = {.seq = s.seq, .flen = (size_t)s.len, .pos0 = pos0, .from = from, .cap = cap};
+    rc = seg_scan(db, &r);
+    if (rc == 0 && !r.found)
         rc = TSDB_ERR_INVALID;
     if (rc == 0) {
-        *buf = out;
-        *len = outlen;
+        *buf = r.out;
+        *len = r.outlen;
         *seq = s.seq;
-        *off = start;
-        *last = lastpos;
-        rp->rd_seq = s.seq, rp->rd_off = next_off, rp->rd_next = next_fno;
+        *off = r.start;
+        *last = r.last;
+        rp->rd_seq = s.seq, rp->rd_off = r.next_off, rp->rd_next = r.last + 1;
     } else {
-        free(out);
+        free(r.out);
     }
     pthread_mutex_unlock(&rp->mu);
     return rc;
@@ -1879,13 +2027,15 @@ int replica_epoch_begin(eng *db, uint64_t epoch, const char *owner, uint64_t *po
 /* Turns the replica engine into a writer: `*dbp` is closed and its directory opened again as a leader's, which the
  * caller then equips (db->jr). Only when nothing uncommitted can be in the way: the EPOCH marker at `epoch_pos` and
  * everything before it is applied, the log is applied to its end and durable, no COMMIT is waiting for its files and
- * the active memtable is empty. Everything applied is put into parts and the replica's segments are removed (FNO holds
- * the log's end first, so numbers go on from it), as a writer's open would do with a log it replays: the new writer
- * never meets a segment whose rows a drop has taken out of parts; the newest (the epoch's, with no rows) stays for the
- * writer's open to replay and remove, which keeps its own segment numbers above it. The numbers continue (fno_next = the log end + 1), the
- * writer's first segment is above the epoch's. A failure leaves the replica as it was, or (a crash in the middle)
- * with a log from which a replica open or a writer's open recovers; TSDB_ERR_INVALID: a precondition does not hold. */
-void (*replica_test_promote_hook)(void); /* test hook: after the segments are removed, before the engine is closed */
+ * the active memtable is empty. Everything applied is put into parts (FNO holds the log's end first, so numbers go on
+ * from it) and the replica's segments stay, named in RSTATE (`kept`) as holding nothing outside the parts: the writer's
+ * open neither replays them (rows a drop took out of parts would come back) nor removes them, and the leader keeps them
+ * for its replicas until the driver's keep bound passes them (eng_leader_keep). The numbers continue (fno_next = the
+ * log end + 1), the writer's first segment is above the epoch's. A failure leaves the replica as it was, or (a crash
+ * after RSTATE was saved) a directory a replica open or a writer's open recovers; TSDB_ERR_INVALID: a precondition does
+ * not hold.
+ * The writer gets the caller's latest_cache (a replica runs without the table) and the replica's RSTATE. */
+void (*replica_test_promote_hook)(void); /* test hook: after RSTATE names the kept segments, before the engine is closed */
 
 int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
 {
@@ -1934,33 +2084,30 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
         return rc;
     }
     tsdb_options opt = db->opt;
+    if (eng_test_mutant != MUT_PROMOTE_NO_CARRY)
+        opt.latest_cache = db->latest_cache_asked; /* the replica ran without the latest table; the leader has one */
     char *dir = strdup(db->dir);
     if (!dir) {
         free(seqs);
         return TSDB_ERR_NOMEM;
     }
-    /* oldest first: a crash leaves a log that starts later, which a replica's open accepts */
-    for (size_t i = 0; i + 1 < ns && eng_test_mutant != MUT_REPLICA_PROMOTE_KEEP_SEGS; i++) { /* not the newest: the epoch's */
-        char nm[64];
-        wal_name(nm, sizeof nm, seqs[i]);
-        if (unlinkat(db->dirfd, nm, 0) != 0 && errno != ENOENT) {
-            rc = TSDB_ERR_IO;
-            break;
-        }
-        if (eng_sync_dir(db, "fsync of the directory after removing a replica's segment") != 0) {
-            rc = TSDB_ERR_IO;
-            break;
-        }
+    /* Every segment stays (the catch-up source of the new leader's replicas, eng_leader_keep): none holds a row outside
+     * the parts, which RSTATE says before the writer's open sees them, so the open neither replays them (a drop's rows
+     * would come back) nor removes them; the newest is the epoch's, and the writer's first segment is above it. */
+    if (ns && eng_test_mutant != MUT_REPLICA_PROMOTE_KEEP_SEGS) { /* planted: the segments stay, unnamed in RSTATE */
+        pthread_mutex_lock(&rp->mu);
+        rp->rs.kept = MAX(rp->rs.kept, seqs[ns - 1]);
+        rc = rs_save(db, &rp->rs);
+        pthread_mutex_unlock(&rp->mu);
     }
     free(seqs);
     if (rc == 0 && replica_test_promote_hook)
         replica_test_promote_hook();
+    if (rc == 0 && eng_test_mutant == MUT_PROMOTE_NO_CARRY)
+        unlinkat(db->dirfd, RS_FILE, 0); /* planted: the old promote's removal of RSTATE */
     if (rc == 0) {
-        unlinkat(db->dirfd, RS_FILE, 0); /* a writer has no use for it; the positions it holds are below the new ones */
-        if (tsdb_fsync(db->dirfd) != 0) {
-            free(dir);
-            return TSDB_ERR_IO; /* the replica goes on as it was: its RSTATE is not gone for sure */
-        }
+        /* RSTATE stays: the leader carries it on (leader_rs_open), and should it be deposed and reopened as a replica,
+         * the COMMITs and DROPs it applied as a replica are still in its `done` and `drops` */
         eng_close(db);
         *dbp = NULL;
         rc = eng_open(dir, &opt, out);
@@ -2005,6 +2152,91 @@ static int leader_marker_wait(eng *db, uint64_t last, const char *what)
     return rc;
 }
 
+/* The position of the marker this thread's write appended and saw committed (leader_commit, leader_drop), which the
+ * publish that follows on the same thread records in the leader's RSTATE (jr_precommit, jr_commit, leader_rs_drop) */
+static __thread uint64_t lead_pos, lead_drop_pos;
+
+/* ---- the leader's links of its COMMITs' files (design-cluster.md 5.2, M4) ----
+ * Each file a leader's COMMIT marker names is hard linked as stage_<key>.part, the name a replica stages it under, so a
+ * replica that missed it can fetch it (eng_leader_file_open) after the leader merged the part away, and a deposed
+ * leader reopened as a replica finds the files of the markers it had not published (open_scan keeps the stage_ files
+ * that a marker above RSTATE's `done` names and removes the rest). The links go with the retained segment that holds
+ * their marker (leader_links_drop, from leader_unlink_due); the list is in memory only: links of an earlier leadership
+ * are removed at attach (leader_links_sweep). */
+static void leader_links_unlink(eng *db, const uint64_t *keys, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        char sp[40];
+        stage_path(sp, sizeof sp, keys[i]);
+        unlinkat(db->dirfd, sp, 0);
+    }
+}
+
+static void leader_links_note(eng *db, uint64_t fno, const uint64_t *keys, size_t n)
+{
+    pthread_mutex_lock(&db->lead_mu);
+    if (db->nlf + n > db->caplf) {
+        size_t c = db->caplf ? db->caplf : 16;
+        while (c < db->nlf + n)
+            c *= 2;
+        void *p = realloc(db->lf, c * sizeof *db->lf);
+        if (!p) {
+            pthread_mutex_unlock(&db->lead_mu);
+            return; /* they stay until the next attach: a leak, never a missing file */
+        }
+        db->lf = p;
+        db->caplf = c;
+    }
+    for (size_t i = 0; i < n; i++)
+        db->lf[db->nlf++] = (struct lkfile){fno, keys[i]};
+    pthread_mutex_unlock(&db->lead_mu);
+}
+
+void leader_links_drop(eng *db, uint64_t fno_end)
+{
+    uint64_t keys[64];
+    for (;;) {
+        size_t n = 0, k = 0;
+        pthread_mutex_lock(&db->lead_mu);
+        for (size_t i = 0; i < db->nlf; i++) {
+            if (db->lf[i].fno < fno_end && n < 64)
+                keys[n++] = db->lf[i].key;
+            else
+                db->lf[k++] = db->lf[i];
+        }
+        bool more = n == 64 && k < db->nlf;
+        db->nlf = k;
+        pthread_mutex_unlock(&db->lead_mu);
+        leader_links_unlink(db, keys, n); /* outside lead_mu, a leaf */
+        if (!more)
+            return;
+    }
+}
+
+void leader_links_sweep(eng *db)
+{
+    DIR *d = fdopendir(dup(db->dirfd));
+    if (!d)
+        return; /* the links stay: a leak, never a missing file */
+    rewinddir(d);
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        uint64_t key;
+        int consumed = 0;
+        if (sscanf(e->d_name, "stage_%" SCNx64 ".part%n", &key, &consumed) == 1 && !e->d_name[consumed])
+            unlinkat(db->dirfd, e->d_name, 0);
+    }
+    closedir(d);
+}
+
+int eng_leader_file_open(eng *db, const char *name)
+{
+    char sp[40];
+    stage_path(sp, sizeof sp, stage_key(name));
+    int fd = openat(db->dirfd, sp, O_RDONLY | O_CLOEXEC);
+    return fd >= 0 ? fd : errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+}
+
 static int leader_commit(eng *db, const struct jr_commit_arg *ja)
 {
     const struct jr_ops *jr = eng_jr(db);
@@ -2016,8 +2248,12 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
     for (size_t i = 0; i < ja->n; i++)
         cap += 24 + 8 + 64;
     uint8_t *files = malloc(cap);
-    if (!files)
+    uint64_t *keys = calloc(ja->n, sizeof *keys);
+    if (!files || !keys) {
+        free(files);
+        free(keys);
         return TSDB_ERR_NOMEM;
+    }
     size_t len = 0;
     int rc = 0;
     for (size_t i = 0; i < ja->n && rc == 0; i++) {
@@ -2038,9 +2274,24 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
                      .xxh64 = xxh64(p->map, p->map_len, 0), .header_check = p->index_hash};
         len += mk_file_put(files + len, &f);
         rc = jr->ship(jr->ctx, db, p->pending, mname, p->map_len);
+        keys[i] = stage_key(mname);
+        if (rc == 0 && eng_test_mutant != MUT_LEADER_NO_HARDLINK) {
+            char sp[40];
+            stage_path(sp, sizeof sp, keys[i]);
+            unlinkat(db->dirfd, sp, 0); /* left by a marker whose append failed, or an earlier leadership */
+            if (linkat(db->dirfd, p->pending, db->dirfd, sp, 0) != 0)
+                rc = TSDB_ERR_IO;
+        }
     }
+    /* The links are named before the marker can be durable anywhere: a leader that loses power after its marker and
+     * before parts_commit has its tmp_ files removed by the open (load_parts, db.c), and reopened as a replica
+     * (design-cluster.md 6.3) it applies the marker from these, as any replica does from what it staged. */
+    if (rc == 0 && eng_test_mutant != MUT_LEADER_NO_HARDLINK)
+        rc = eng_sync_dir(db, "the links of a COMMIT's files");
     if (rc) {
         free(files);
+        leader_links_unlink(db, keys, ja->n);
+        free(keys);
         return rc;
     }
     pthread_mutex_lock(&db->lock);
@@ -2052,9 +2303,16 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
     uint64_t fno = 0;
     rc = wal_marker_mk(db, &m, &fno);
     free(files);
+    if (fno)
+        leader_links_note(db, fno, keys, ja->n); /* in the log: they go with its segment */
+    else
+        leader_links_unlink(db, keys, ja->n); /* no marker names them */
+    free(keys);
     if (rc)
         return rc; /* the marker may be in the log (a failed sync): the engine is failed by the WAL's own rules */
-    return leader_marker_wait(db, fno, "a COMMIT marker was appended but its commit point did not come");
+    rc = leader_marker_wait(db, fno, "a COMMIT marker was appended but its commit point did not come");
+    lead_pos = rc == 0 ? fno : 0;
+    return rc;
 }
 
 static int leader_drop(eng *db, int64_t ts)
@@ -2067,7 +2325,65 @@ static int leader_drop(eng *db, int64_t ts)
         return fno ? rc : leader_unappended(rc); /* no marker in the log: definitely not applied */
     if (fno == 0) /* a backstop: never retire without the marker */
         return TSDB_ERR_IO;
-    return leader_marker_wait(db, fno, "a DROP marker was appended but its commit point did not come");
+    rc = leader_marker_wait(db, fno, "a DROP marker was appended but its commit point did not come");
+    lead_drop_pos = rc == 0 ? fno : 0;
+    return rc;
+}
+
+int jr_markers(eng *db, const mk *m, size_t n, const char *what)
+{
+    if (!eng_jr(db) || db->rp || n == 0)
+        return 0;
+    /* one unit: one admission for the whole batch (wal_markers_mk), so a refusal (min_isr, not leading) leaves none
+     * of them in the log and the write is simply refused; one sync for all of them */
+    uint64_t fno = 0, last = 0;
+    int rc = eng_test_mutant == MUT_LEADER_MARKERS_SPLIT ? 0 : wal_markers_mk(db, m, n, &fno, &last);
+    if (eng_test_mutant == MUT_LEADER_MARKERS_SPLIT) /* planted: one admission and one sync per marker */
+        for (size_t i = 0; i < n && rc == 0; i++) {
+            uint64_t l = 0;
+            rc = wal_markers_mk(db, &m[i], 1, &fno, &l);
+            if (l)
+                last = l;
+        }
+    if (rc && last == 0)
+        return leader_unappended(rc); /* none is in the log: definitely not applied */
+    if (rc) {
+        /* in the log (a failed sync fails the engine by the WAL's rules; a planted split may leave a prefix): the
+         * markers may commit without the records they name, so only a deposed leader (cut by the next one) goes on */
+        if (!atomic_load(&db->lead_deposed))
+            eng_fail(db, what, EIO);
+        return TSDB_ERR_INDETERMINATE;
+    }
+    if (eng_test_mutant == MUT_LEADER_DICT_EARLY) /* planted: the record goes to the file before the commit point */
+        return 0;
+    return leader_marker_wait(db, last, what);
+}
+
+static int jr_dict(eng *db, uint16_t type, uint32_t id, const char *name, size_t len, int vtype)
+{
+    mk m = {.type = type, .span = 1};
+    if (type == MK_SERIES)
+        m.u.series = (mk_series){.id = id, .vtype = (uint32_t)vtype, .name = name, .name_len = (uint32_t)len};
+    else
+        m.u.state = (mk_state){.id = id, .name = name, .name_len = (uint32_t)len};
+    return jr_markers(db, &m, 1, "a SERIES or STATE marker was appended but its commit point did not come");
+}
+
+int jr_dict_series(void *db, uint32_t id, const char *name, size_t len, int type)
+{
+    return jr_dict(db, MK_SERIES, id, name, len, type);
+}
+
+int jr_dict_state(void *db, uint32_t id, const char *name, size_t len, int type)
+{
+    return jr_dict(db, MK_STATE, id, name, len, type);
+}
+
+static int leader_retention(eng *db, const struct jr_ret_arg *ra)
+{
+    mk m = {.type = MK_RETENTION, .span = 1};
+    m.u.retention = (mk_retention){.series = ra->series, .limit_ms = ra->limit_ms, .record_off = ra->off};
+    return jr_markers(db, &m, 1, "a RETENTION marker was appended but its commit point did not come");
 }
 
 int jr_intent(eng *db, enum jr_kind kind, const void *arg)
@@ -2079,7 +2395,95 @@ int jr_intent(eng *db, enum jr_kind kind, const void *arg)
         return leader_commit(db, arg);
     case JR_DROP:
         return leader_drop(db, *(const int64_t *)arg);
+    case JR_RETENTION:
+        return leader_retention(db, arg);
     default:
-        return 0; /* the dictionary and retention markers are the driver's (it appends them with wal_marker_mk) */
+        return 0; /* SERIES, STATE and CLASS go through jr_markers from their dictionaries */
     }
+}
+
+/* ---- the leader's RSTATE (design-cluster.md 6.3: a deposed leader reopened as a replica) ----
+ * A replica records in RSTATE the COMMIT and DROP markers it carried out (apply_commit, apply_drop), so a replay of its
+ * log skips them; a leader publishes its own markers' effects without applying them, and records them the same way:
+ * `doing` (the position and the first block) before parts_commit, `done` after it, a DROP with its `drops` entry after
+ * its retire. Reopened as a replica (eng_open_replica on the same directory), the deposed leader then skips every
+ * marker it published (its parts are listed: there are no staged files to apply them from) and settles one whose
+ * publish a crash interrupted by its first block (rs_committed), as a replica does. All writes under publish_lock. */
+int leader_rs_open(eng *db)
+{
+    struct rstate *rs = calloc(1, sizeof *rs);
+    if (!rs)
+        return TSDB_ERR_NOMEM;
+    int rc = rs_load(db, rs); /* a promoted replica's carries on (replica_promote keeps it) */
+    if (rc) {
+        free(rs->drops);
+        free(rs);
+        return rc;
+    }
+    db->lrs = rs;
+    return 0;
+}
+
+int leader_rs_kept(eng *db, uint64_t seq)
+{
+    struct rstate *rs = db->lrs;
+    if (!rs || eng_test_mutant == MUT_LEADER_KEPT_NOSAVE)
+        return 0;
+    pthread_mutex_lock(&db->publish_lock); /* RSTATE's other writers (jr_precommit, jr_commit, leader_rs_drop) hold it */
+    int rc = 0;
+    if (seq > rs->kept) {
+        rs->kept = seq;
+        rc = rs_save(db, rs);
+    }
+    pthread_mutex_unlock(&db->publish_lock);
+    return rc;
+}
+
+int jr_precommit(eng *db, size_t n)
+{
+    struct rstate *rs = db->lrs;
+    if (!eng_jr(db) || !rs || !lead_pos || eng_test_mutant == MUT_LEADER_NO_RSTATE)
+        return 0;
+    rs->doing_pos = lead_pos;
+    /* block numbers are taken under publish_lock: this commit's first */
+    rs->doing_b0 = atomic_load(&db->next_block) + (eng_test_mutant == MUT_LEADER_B0_OFF ? 1000 : 0);
+    rs->doing_n = n;
+    return rs_save(db, rs);
+}
+
+void jr_commit(eng *db, enum jr_kind kind, const void *arg)
+{
+    (void)arg;
+    struct rstate *rs = db->lrs;
+    if (kind != JR_COMMIT || !eng_jr(db) || !rs || !lead_pos)
+        return;
+    uint64_t pos = lead_pos;
+    lead_pos = 0;
+    if (eng_test_mutant == MUT_LEADER_NO_RSTATE)
+        return;
+    rs->done = MAX(rs->done, pos);
+    rs->doing_pos = rs->doing_b0 = rs->doing_n = 0;
+    rs_save(db, rs); /* fails the engine on error: a replica reopened from here would apply the COMMIT again */
+}
+
+int leader_rs_drop(eng *db, int64_t ts)
+{
+    struct rstate *rs = db->lrs;
+    uint64_t pos = lead_drop_pos;
+    lead_drop_pos = 0;
+    if (!eng_jr(db) || !rs || !pos || eng_test_mutant == MUT_LEADER_NO_RSTATE)
+        return 0;
+    pthread_mutex_lock(&db->publish_lock);
+    struct rdrop *d = realloc(rs->drops, (rs->ndrops + 1) * sizeof *d);
+    int rc = d ? 0 : TSDB_ERR_NOMEM;
+    if (d) {
+        rs->drops = d;
+        rs->drops[rs->ndrops++] = (struct rdrop){pos, ts};
+        rs->done = MAX(rs->done, pos);
+        rc = rs_save(db, rs);
+    } else {
+        eng_fail(db, "recording a DROP in RSTATE", ENOMEM);
+    }
+    pthread_mutex_unlock(&db->publish_lock);
+    return rc;
 }

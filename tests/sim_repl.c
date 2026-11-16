@@ -132,7 +132,7 @@ static struct sim {
     struct {
         uint64_t acked, refused, unknown, promotions, stale, none, resigns, cuts, isr, crashes, wipes, parts, pauses,
             moves, msgs, applied, waits, refuses, xcuts, ack_isr1, ack_isrn, wiped_acked, wipe_leader,
-            fence_rep_out, deg_runs, deg_ok, trims, snaps, lies;
+            fence_rep_out, deg_runs, deg_ok, trims, snaps, lies, floors;
     } st, tot;
 } S;
 
@@ -273,6 +273,28 @@ static void check_isr(uint64_t from)
             check_node(i, from, S.cmax);
 }
 
+/* The replay floor (design-cluster.md 5.4): a leader's floor is never above a position some node still holds (and so
+ * may replay after a restart), down nodes included: a partition-class switch takes its T past every row at or above it. */
+static void check_floor(int l)
+{
+    uint64_t f = repl_replay_floor(S.node[l].r);
+    if (f == 0)
+        return;
+    S.st.floors++;
+    for (int i = 0; i < S.nn; i++) {
+        const struct node *nd = &S.node[i];
+        for (size_t k = 0; k < nd->n; k++) {
+            if (nd->log[k].pos + nd->log[k].n <= nd->start)
+                continue; /* went into parts */
+            uint64_t first = nd->log[k].pos > nd->start ? nd->log[k].pos : nd->start;
+            if (first < f)
+                violation("leader %d gives replay floor %" PRIu64 ", node %d still holds position %" PRIu64, l, f, i,
+                          first);
+            break;
+        }
+    }
+}
+
 static void check_apply(int i, uint64_t from, uint64_t to)
 {
     const struct node *nd = &S.node[i];
@@ -357,6 +379,10 @@ static void send_from(int i, const struct repl_action *a)
          t == REPL_M_SNAPSHOT) && a->msg.epoch != nd->fence)
         violation("node %d sends type %d in epoch %" PRIu64 ", its saved fence is %" PRIu64, i, t, a->msg.epoch,
                   nd->fence);
+    /* The replay floor (design-cluster.md 5.4): a node never reports a log start above the first position it still
+     * holds, or a leader takes a partition-class switch past rows that node may still replay. */
+    if ((t == REPL_M_ACK || t == REPL_M_FENCE_REPLY) && a->msg.start > (nd->start > 1 ? nd->start : 1))
+        violation("node %d reports log start %" PRIu64 ", its log starts at %" PRIu64, i, a->msg.start, nd->start);
     if ((t == REPL_M_FENCE_REPLY || t == REPL_M_RESIGN) && a->msg.epoch > nd->fence)
         violation("node %d answers fence %" PRIu64 " before saving it (saved %" PRIu64 ")", i, a->msg.epoch,
                   nd->fence);
@@ -986,6 +1012,7 @@ static void step(void)
         }
         if (S.trim && chance(50) && n->floor + 1 > n->start && n->floor <= dur_end(n)) {
             n->start = n->floor + 1; /* segments at or below the saved floor went into parts and are deleted */
+            repl_log_start(n->r, n->start);
             S.st.trims++;
         }
         repl_tick(n->r);
@@ -998,6 +1025,9 @@ static void step(void)
             enqueue(&m, i, META);
         }
     }
+    for (int i = 0; i < S.nn && !S.bad; i++)
+        if (S.node[i].r && repl_is_leader(S.node[i].r))
+            check_floor(i);
     if (!S.bad)
         meta_tick();
     if (S.writes && !S.bad && chance(S.wrate))
@@ -1312,8 +1342,8 @@ int main(int argc, char **argv)
         printf("coverage: %" PRIu64 " refusals, %" PRIu64 " excused cuts of committed records, acks with isr 1 / >1: %"
                PRIu64 " / %" PRIu64 ", %" PRIu64 " acked copies wiped, %" PRIu64 " wipes of the leader, %" PRIu64
                " fence replies from outside the fenced set, degraded runs %" PRIu64 " (ok %" PRIu64 "), %" PRIu64
-               " trims, %" PRIu64 " snapshots, %" PRIu64 " syncs that span a cut\n",
+               " trims, %" PRIu64 " snapshots, %" PRIu64 " syncs that span a cut, %" PRIu64 " replay floors checked\n",
                S.tot.refuses, S.tot.xcuts, S.tot.ack_isr1, S.tot.ack_isrn, S.tot.wiped_acked, S.tot.wipe_leader,
-               S.tot.fence_rep_out, S.tot.deg_runs, S.tot.deg_ok, S.tot.trims, S.tot.snaps, S.tot.lies);
+               S.tot.fence_rep_out, S.tot.deg_runs, S.tot.deg_ok, S.tot.trims, S.tot.snaps, S.tot.lies, S.tot.floors);
     return 0;
 }

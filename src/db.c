@@ -867,6 +867,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         return TSDB_ERR_INVALID;
     }
     db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0 && !replica;
+    db->latest_cache_asked = db->opt.latest_cache; /* replica_promote opens the writer with it */
     if (replica)
         db->opt.latest_cache = 0; /* its parts arrive whole (COMMIT): no fold lists to build the table from */
     if (latest_open(db) != 0) { /* the latest table (latest.c); a writer's only */
@@ -935,6 +936,10 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0 ||
         (rc = ret_open(db, ro)) != 0 || (rc = cls_open(db, ro)) != 0) /* classes before the WAL replay */
         goto fail;
+    db->series.before_append = jr_dict_series; /* a leader's marker first (jr_markers); nothing without one */
+    db->series.before_arg = db;
+    db->states.before_append = jr_dict_state;
+    db->states.before_arg = db;
     if (db->opt.stats > 0)
         stats_start(db, false); /* follows the open: load_parts hands it each part as it reads it */
     bool has_manifest = faccessat(db->dirfd, "MANIFEST", F_OK, 0) == 0;
@@ -1124,6 +1129,11 @@ int eng_close(eng *db)
     if (!db)
         return 0;
     int rc = 0;
+    /* A leader steps down before it closes: its flushes wait for the commit point, which may never move again (the ISR
+     * is gone), and what it holds above the commit point is not its to make durable in parts (C7). The WAL keeps every
+     * row; the directory opens as a replica (or a writer again) and replays it (internal.h, eng_leader_attach). */
+    if (eng_jr(db) && eng_test_mutant != MUT_LEADER_CLOSE_WAIT)
+        eng_leader_depose(db);
     if (db->has_flusher) {
         pthread_mutex_lock(&db->buf_lock);
         db->flusher_stop = true;
@@ -1140,7 +1150,8 @@ int eng_close(eng *db)
     }
     feed_cleaner_stop(db); /* before the final flush and wal_close: it unlinks and syncs the directory */
     /* a retired engine writes nothing: its replacement owns the directory */
-    if (!db->opt.read_only && db->active && !db->retiring)
+    bool deposed = eng_jr(db) && atomic_load(&db->lead_deposed) && eng_test_mutant != MUT_LEADER_CLOSE_FLUSH;
+    if (!db->opt.read_only && db->active && !db->retiring && !deposed)
         rc = eng_flush(db);
 
     pthread_mutex_lock(&db->lock);
@@ -1249,16 +1260,23 @@ int eng_sync_dir(eng *db, const char *what)
     uint64_t removed = atomic_load(&db->wal_removed); /* unlinked before the fsync below */
     if (!db->opt.fsync) {
         int rc = eng_check(db);
-        if (rc == 0)
+        if (rc == 0) {
             removed_synced_to(db, removed);
+            pthread_mutex_lock(&db->dir_sync_lock);
+            atomic_store(&db->dsync_done, atomic_fetch_add(&db->dsync_started, 1) + 1);
+            pthread_mutex_unlock(&db->dir_sync_lock);
+        }
         return rc;
     }
     pthread_mutex_lock(&db->dir_sync_lock);
+    uint64_t seq = atomic_fetch_add(&db->dsync_started, 1) + 1; /* covers every rename made before this point */
     int rc = eng_check(db);
     if (rc == 0 && tsdb_fsync(db->dirfd) != 0) {
         eng_fail(db, what, errno);
         rc = TSDB_ERR_IO;
     }
+    if (rc == 0)
+        atomic_store(&db->dsync_done, seq); /* in order: dir_sync_lock is held */
     pthread_mutex_unlock(&db->dir_sync_lock);
     if (rc == 0)
         removed_synced_to(db, removed);
@@ -1488,6 +1506,8 @@ int eng_drop_before(eng *db, int64_t ts)
         rc = eng_flush(db);
     if (rc == 0)
         rc = drop_retire(db, ts);
+    if (rc == 0 && eng_jr(db))
+        rc = leader_rs_drop(db, ts); /* RSTATE says the DROP is done (replica.c) */
     if (serial)
         pthread_mutex_unlock(&db->jr_serial);
     return rc;
