@@ -2527,6 +2527,36 @@ int leader_rs_kept(eng *db, uint64_t seq)
     return rc;
 }
 
+void leader_rs_prune(eng *db, uint64_t lo)
+{
+    struct rstate *rs = db->lrs;
+    if (!rs || eng_test_mutant == MUT_LEADER_RS_NO_PRUNE)
+        return;
+    if (eng_test_mutant == MUT_LEADER_RS_PRUNE_ALL)
+        lo = UINT64_MAX; /* planted: a DROP the retained log still holds goes too */
+    pthread_mutex_lock(&db->publish_lock); /* RSTATE's writers hold it */
+    /* As rs_prune_drops on a replica: a DROP below every retained record has no rows before it left to replay. One at
+     * `lo` itself is kept (the next segment need not start exactly there). */
+    size_t k = 0;
+    for (size_t i = 0; i < rs->ndrops; i++)
+        if (rs->drops[i].pos >= lo)
+            rs->drops[k++] = rs->drops[i];
+    rs->ndrops = k;
+    pthread_mutex_unlock(&db->publish_lock);
+}
+
+long leader_rs_ndrops(eng *db, uint64_t *first)
+{
+    struct rstate *rs = db->lrs;
+    if (!rs)
+        return -1;
+    pthread_mutex_lock(&db->publish_lock);
+    long n = (long)rs->ndrops;
+    *first = n ? rs->drops[0].pos : 0;
+    pthread_mutex_unlock(&db->publish_lock);
+    return n;
+}
+
 int jr_precommit(eng *db, size_t n)
 {
     struct rstate *rs = db->lrs;

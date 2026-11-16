@@ -1429,6 +1429,7 @@ static void lk_unlink_upto(eng *db, uint64_t bound)
         return;
     uint64_t last = db->lk[n - 1].seq;
     leader_links_drop(db, db->lk[n - 1].fno_end); /* the files their COMMIT markers named go with them */
+    leader_rs_prune(db, db->lk[n - 1].fno_end);   /* and the DROPs no retained record lies behind */
     memmove(db->lk, db->lk + n, (db->nlk - n) * sizeof *db->lk);
     db->nlk -= n;
     wal_removed_raise(db, last);

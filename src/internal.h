@@ -73,7 +73,7 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_READ_NO_GAP, MUT_LEADER_READ_CURSOR_ANY, MUT_LEADER_READ_TAILOK_SEALED,
        MUT_LEADER_READ_NOTFOUND_SEALED, MUT_LEADER_NO_SWEEP, MUT_LEADER_B0_OFF,
        MUT_REPLICA_APPLY_HOLDS_MU, MUT_REPLICA_PREP_NO_CUT_GEN, MUT_LEADER_DROP_UNHELD,
-       MUT_LEADER_LINK_BY_NAME };
+       MUT_LEADER_LINK_BY_NAME, MUT_LEADER_RS_NO_PRUNE, MUT_LEADER_RS_PRUNE_ALL };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1452,6 +1452,12 @@ int jr_precommit(struct eng *db, size_t n);
 int leader_rs_drop(struct eng *db, int64_t ts);
 int leader_rs_open(struct eng *db);
 int leader_rs_kept(struct eng *db, uint64_t seq);
+/* The DROPs below `lo`, the first position the leader's log may still hold (its kept segments went up to there), leave
+ * RSTATE's list in memory; the next save writes the shorter list (r3a2 R8). Takes publish_lock; a no-op on a
+ * writer that is not a leader. */
+void leader_rs_prune(struct eng *db, uint64_t lo);
+/* tests: how many DROPs the leader's RSTATE lists in memory (-1: none loaded); *first, the position of the oldest */
+long leader_rs_ndrops(struct eng *db, uint64_t *first);
 int rs_kept_seq(struct eng *db, uint64_t *seq);
 
 #define FNO_FILE "FNO"

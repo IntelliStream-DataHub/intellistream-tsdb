@@ -4878,6 +4878,42 @@ static void case_link_pos(void)
     printf("  a leader serves a COMMIT's file only for the marker that named it in this leadership\n");
 }
 
+/* r3a2 R8: a leader's RSTATE lists its DROPs (a deposed leader reopened as a replica skips the rows of its retained log
+ * that a DROP retired), and drops one once no retained record lies behind it. A DROP stays while its own segment is
+ * kept (the segment before it went: mutant leaderpruneall drops it too) and goes with that segment (mutant
+ * leadernoprune: the list only grows). */
+static void case_leader_prune(void)
+{
+    xport x;
+    xp_start(&x, "lprune");
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "LR: small rows");
+    CHECK_EQ(eng_drop_before(x.ld, T0 + 10 * DAY_MS), 0); /* a DROP: its marker begins a new segment */
+    xp_step(&x, "LR: drop");
+    uint64_t pd = 0, f;
+    CHECK_EQ(leader_rs_ndrops(x.ld, &pd), 1);
+    CHECK(pd > 1);
+    CHECK(x.ld->nlk >= 1);
+    eng_leader_keep(x.ld, pd - 1); /* the segment before the DROP goes */
+    CHECK_EQ(x.ld->nlk, 0);
+    long n = leader_rs_ndrops(x.ld, &f);
+    if (n != 1)
+        fprintf(stderr, "LR: the DROP at %" PRIu64 " left RSTATE while its segment is kept (mutant leaderpruneall)\n", pd);
+    CHECK_EQ(n, 1);
+    xp_rows(&x, 0, 20 * 86400, 10, 300);
+    xp_step(&x, "LR: rows after the drop");
+    CHECK_EQ(eng_flush(x.ld), 0); /* the DROP's segment is flushed and kept */
+    CHECK(x.ld->nlk >= 1);
+    eng_leader_keep(x.ld, UINT64_MAX); /* and goes */
+    CHECK_EQ(x.ld->nlk, 0);
+    n = leader_rs_ndrops(x.ld, &f);
+    if (n != 0)
+        fprintf(stderr, "LR: the DROP at %" PRIu64 " stays in RSTATE after its segment went (mutant leadernoprune)\n", pd);
+    CHECK_EQ(n, 0);
+    xp_stop(&x);
+    printf("  a leader's RSTATE lists a DROP while a retained segment lies behind it\n");
+}
+
 /* Feeds dst from the leader's log by position only (replica_read on the writer, `cap` bytes a read), then fetches every
  * file a COMMIT names that dst misses from the leader (eng_leader_file_open), syncs and applies to `commit`. */
 static int feed_once(eng *ld, eng *dst, size_t cap) /* one read and its append: 1 bytes came, 0 the end, < 0 an error */
@@ -5142,7 +5178,9 @@ static int mutant_of(const char *m)
                         : strcmp(m, "applyholdsmu") == 0 ? MUT_REPLICA_APPLY_HOLDS_MU
                         : strcmp(m, "nocutgen") == 0 ? MUT_REPLICA_PREP_NO_CUT_GEN
                         : strcmp(m, "dropunheld") == 0 ? MUT_LEADER_DROP_UNHELD
-                        : strcmp(m, "linkbyname") == 0 ? MUT_LEADER_LINK_BY_NAME : 0;
+                        : strcmp(m, "linkbyname") == 0 ? MUT_LEADER_LINK_BY_NAME
+                        : strcmp(m, "leadernoprune") == 0 ? MUT_LEADER_RS_NO_PRUNE
+                        : strcmp(m, "leaderpruneall") == 0 ? MUT_LEADER_RS_PRUNE_ALL : 0;
 }
 
 int main(int argc, char **argv)
@@ -5224,6 +5262,7 @@ int main(int argc, char **argv)
         case_leader_keep();
         case_hardlink();
         case_link_pos();
+        case_leader_prune();
         case_leader_read();
         case_link_sweep();
         for (int v = 0; v < 3; v++)
@@ -5311,6 +5350,7 @@ int main(int argc, char **argv)
     case_leader_keep();
     case_hardlink();
     case_link_pos();
+    case_leader_prune();
     case_leader_read();
     case_link_sweep();
     case_promote_refused();
