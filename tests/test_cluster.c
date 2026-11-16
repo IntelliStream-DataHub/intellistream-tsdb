@@ -3162,6 +3162,424 @@ static void scen_replfail(void)
     printf("  a replica whose engine failed stops that volume only, reports it LOCAL_FAULT and stops cleanly\n");
 }
 
+/* ------------------------------------------------------------ leases (§7.1) and the serving loop's stamp (§6.1) */
+
+/* a read on c by `kind` % 3: QUERY_RAW, QUERY_LATEST or QUERY_MULTI (the two ids paths of the lease check) */
+struct lread {
+    uint64_t sent;
+    int rc;
+};
+static int lease_read(tsdbc *c, tsdb_sid id, int kind, int *rows)
+{
+    if (kind % 3 == 2) {
+        tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = 0, .end = INT64_MAX / 2};
+        tsdb_series_result *r = NULL;
+        int rc = tsdbc_query_multi_collect(c, &q, &id, 1, NULL, &r);
+        if (rc == 0 && r[0].status != 0)
+            rc = r[0].status;
+        *rows = rc == 0 ? (int)r[0].n : 0;
+        if (r)
+            tsdbc_series_results_free(r, 1);
+        return rc;
+    }
+    if (kind % 3 == 1) {
+        tsdb_latest_result r;
+        int rc = tsdbc_latest(c, &id, 1, NULL, &r);
+        if (rc == 0 && r.status != 0)
+            rc = r.status;
+        *rows = rc == 0 && r.kind == TSDB_LATEST_VALUE;
+        return rc;
+    }
+    nrows = 0;
+    int rc = tsdbc_query_raw(c, id, 0, INT64_MAX / 2, count_rows, NULL);
+    *rows = nrows;
+    return rc;
+}
+
+/* reads on c until one succeeds (or `ms` passed): the time it was sent, or 0 */
+static uint64_t lease_until_ok(tsdbc *c, tsdb_sid id, int ms, int want_rows)
+{
+    uint64_t t0 = now_ms();
+    for (int k = 0; now_ms() - t0 < (uint64_t)ms; k++) {
+        uint64_t t = now_ms();
+        int rows, rc = lease_read(c, id, k % 3, &rows);
+        if (rc == 0) {
+            if (rows != want_rows)
+                die("a read answered %d rows, %d were written", rows, want_rows);
+            return t;
+        }
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("a read: %s", ers(rc));
+        struct timespec d = {0, 2000000};
+        nanosleep(&d, NULL);
+    }
+    return 0;
+}
+
+/* The volume leader X (not the Raft leader R) holds a lease the Raft leader's HB_ACKs extend: send time + lease_ms *
+ * (1 - drift). R paused at T0: X's last grant was for a heartbeat sent before T0, so it answers nothing sent after
+ * T0 + 800 ms (lease_ms 1000, drift 20%), and no new Raft leader can grant before an election timeout (1 s at least)
+ * has passed: every read sent in (T0 + 810, T0 + 940) must be refused, and some must have been sent. Mutants:
+ * leaseanyvoter (the third server's acks keep the lease), nodrift (it runs to T0 + 1000). Then X itself paused past
+ * lease and node_timeout, the others paused, X resumed: nobody renews, it answers nothing; all resumed: the row
+ * written before is read back. */
+struct stalled_read {
+    int server;
+    tsdb_sid id;
+    int rc;
+};
+static void *stalled_read_thread(void *a)
+{
+    struct stalled_read *sr = a;
+    tsdbc *c = client(sr->server);
+    tsdbc_set_retry(c, 0); /* the first answer, not a retried one */
+    int rows;
+    sr->rc = lease_read(c, sr->id, 0, &rows);
+    tsdbc_close(c);
+    return NULL;
+}
+
+static void scen_lease(void)
+{
+    scenario("lease");
+    static char pe[3][PATH_MAX + 80];
+    char stall[3][PATH_MAX + 64];
+    for (int i = 0; i < 3; i++) {
+        snprintf(stall[i], sizeof stall[i], "%s/rstall-n%d", base, i);
+        unlink(stall[i]);
+        snprintf(pe[i], sizeof pe[i], "TSDBD_TEST_READ_STALL=%s", stall[i]);
+        penv[i] = pe[i];
+        start(i);
+    }
+    struct meta_settings s;
+    meta_settings_default(&s);
+    s.node_timeout_ms = 3000;
+    s.heartbeat_ms = 50;
+    s.lease_ms = 1000;
+    s.drift_ppm = 200000;
+    s.voter_replace_s = 600;
+    uint8_t req[128], *reply;
+    size_t len;
+    size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
+    int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
+    free(reply);
+    if (rc != 0)
+        die("init: %s", cluster_strerror(rc));
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int R = 0, X = -1;
+    char name[16];
+    struct meta_volume v;
+    for (int k = 0; k < 8 && X < 0; k++) {
+        uint32_t num;
+        snprintf(name, sizeof name, "lease%d", k);
+        if ((rc = vol_add(0, name, 3, &num)) != 0)
+            die("volume add %s: %s", name, cluster_strerror(rc));
+        if (!vol_rec(0, name, &v))
+            die("no record of %s", name);
+        int L = server_of(v.leader);
+        if (L >= 0 && L <= 2 && L != R)
+            X = L;
+    }
+    if (X < 0)
+        die("eight volumes, every one led by the Raft leader");
+    int F = 3 - R - X;
+    printf("  Raft leader %d, %s led by %d, third server %d\n", R, name, X, F);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, name, i, 1, 0);
+    tsdbc *c = client(X);
+    tsdb_sid id = rep_series(c, rep_names[0], name, 30000);
+    int64_t ts = 1000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write: %s", ers(rc));
+    if (!lease_until_ok(c, id, 10000, 1))
+        die("no read answered on %d before the pause", X);
+
+    /* a: the Raft leader paused */
+    static struct lread log[1 << 16];
+    size_t nl = 0;
+    pause_server(R, 1);
+    uint64_t T0 = now_ms();
+    while (now_ms() - T0 < 3000 && nl < sizeof log / sizeof log[0]) {
+        int rows;
+        log[nl].sent = now_ms();
+        log[nl].rc = lease_read(c, id, (int)(nl % 3), &rows);
+        if (log[nl].rc != 0 && log[nl].rc != TSDB_ERR_UNAVAILABLE)
+            die("a read (%s) %" PRIu64 " ms into the pause: %s", nl & 1 ? "latest" : "raw", log[nl].sent - T0,
+                ers(log[nl].rc));
+        nl++;
+        struct timespec d = {0, 100000}; /* the log spans the whole pause */
+        nanosleep(&d, NULL);
+    }
+    pause_server(R, 0);
+    size_t refused = 0, early_ok = 0;
+    uint64_t last_ok = 0, first_refused = 0;
+    for (size_t k = 0; k < nl; k++) {
+        uint64_t at = log[k].sent - T0;
+        if (log[k].rc == 0 && at > 810 && at < 940)
+            die("a read sent %" PRIu64 " ms after the Raft leader paused was answered: past the lease (ends by 800)", at);
+        if (log[k].rc == 0 && at <= 810)
+            early_ok++, last_ok = at;
+        if (log[k].rc != 0 && !first_refused)
+            first_refused = at;
+        refused += log[k].rc != 0 && at > 810 && at < 940;
+    }
+    if (!refused)
+        die("no read was sent between 810 and 940 ms into the pause (%zu reads)", nl);
+    printf("  pause of the Raft leader: %zu reads, the last answered at %" PRIu64 " ms, the first refused at %" PRIu64
+           " ms, %zu refused in the window\n", nl, last_ok, first_refused, refused);
+    if (!lease_until_ok(c, id, 20000, 1))
+        die("no read answered on %d after the Raft leader came back", X);
+    /* review F1: the paused Raft leader, resumed after an election, answered the heartbeats queued meanwhile against
+     * the core's clock from before the pause (mutant nocoreclock: the code before the fix) */
+    for (int i = 0; i < 3; i++)
+        if (log_has(i, "past the end of its own"))
+            die("server %d granted a lease after its own check-quorum lease had ended", i);
+
+    /* c (review F4): a read admitted under the lease and stalled before its snapshot (TSDBD_TEST_READ_STALL) while the
+     * other two are paused past X's lease (both: phase a moved the Raft leadership, which may now be X's own): it must
+     * be refused, not answered from a snapshot taken after the lease */
+    int fdst = open(stall[X], O_CREAT | O_WRONLY, 0644);
+    if (fdst < 0)
+        die("create %s: %s", stall[X], strerror(errno));
+    close(fdst);
+    struct stalled_read sr = {X, id, 1};
+    pthread_t sth;
+    if (pthread_create(&sth, NULL, stalled_read_thread, &sr) != 0)
+        die("pthread_create");
+    struct timespec d0 = {0, 300000000}; /* the read is admitted and waits */
+    nanosleep(&d0, NULL);
+    pause_server(R, 1);
+    pause_server(F, 1);
+    struct timespec d1 = {1, 500000000}; /* past X's lease (800 ms), or its core's check-quorum lease as Raft leader */
+    nanosleep(&d1, NULL);
+    unlink(stall[X]);
+    pthread_join(sth, NULL);
+    pause_server(R, 0);
+    pause_server(F, 0);
+    if (sr.rc != TSDB_ERR_UNAVAILABLE)
+        die("a read admitted under the lease and stalled past it answered %s, not UNAVAILABLE", ers(sr.rc));
+    printf("  a read stalled between admission and snapshot past the lease: refused\n");
+    if (!lease_until_ok(c, id, 20000, 1))
+        die("no read answered on %d after the stalled read", X);
+
+    /* b: X paused past its lease and node_timeout; the others paused; X resumed: nobody renews its lease */
+    pause_server(X, 1);
+    struct timespec d = {4, 500000000};
+    nanosleep(&d, NULL);
+    pause_server(R, 1);
+    pause_server(F, 1);
+    pause_server(X, 0);
+    uint64_t t1 = now_ms();
+    int nb = 0;
+    while (now_ms() - t1 < 1500) {
+        int rows;
+        rc = lease_read(c, id, nb % 3, &rows);
+        if (rc == 0)
+            die("server %d answered a read %" PRIu64 " ms after it was resumed with every other server paused",
+                X, now_ms() - t1);
+        nb++;
+    }
+    pause_server(R, 0);
+    pause_server(F, 0);
+    if (!lease_until_ok(c, id, 30000, 1))
+        die("no read answered on %d after every server was resumed", X);
+    printf("  %d paused past its lease: %d reads refused while nobody renewed it, then answered\n", X, nb);
+    tsdbc_close(c);
+}
+
+/* n servers, server 0 INITs with heartbeats of 50 ms and the given lease, drift and node_timeout, the others join */
+static void lease_cluster(int n, uint32_t lease_ms, uint32_t drift_ppm, uint32_t node_timeout_ms)
+{
+    for (int i = 0; i < n; i++)
+        start(i);
+    struct meta_settings s;
+    meta_settings_default(&s);
+    s.node_timeout_ms = node_timeout_ms;
+    s.heartbeat_ms = 50;
+    s.lease_ms = lease_ms;
+    s.drift_ppm = drift_ppm;
+    s.voter_replace_s = 600;
+    uint8_t req[128], *reply;
+    size_t len;
+    size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
+    int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
+    free(reply);
+    if (rc != 0)
+        die("init: %s", cluster_strerror(rc));
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    for (int i = 1; i < n; i++)
+        node_add(0, i);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+}
+
+/* review F3: a Raft leader declares a member down no sooner than one lease (with the drift margin) after its last grant
+ * to it, even where node_timeout is shorter: lease 4000 ms, drift 20 %, node_timeout 1500. Server 2 paused after the
+ * leader has led for longer than a lease: DOWN at 4800 ms at the earliest (less a heartbeat for the last grant), not at
+ * 1500. Mutant nopromotewait (node_timeout alone) is DOWN after about 1.5 s. */
+static void scen_leasedown(void)
+{
+    scenario("leasedown");
+    lease_cluster(3, 4000, 200000, 1500);
+    struct timespec d = {5, 500000000}; /* the leader's own wait of one lease is over */
+    nanosleep(&d, NULL);
+    pause_server(2, 1);
+    uint64_t t0 = now_ms();
+    struct state_want down = {ids[2], META_DOWN, 0};
+    await_view(0, p_member_state, &down, "the paused server marked DOWN");
+    uint64_t at = now_ms() - t0;
+    pause_server(2, 0);
+    if (at < 4600)
+        die("server 2 was marked DOWN %" PRIu64 " ms after it was paused: its lease (4800 ms) could still hold", at);
+    printf("  paused member: DOWN after %" PRIu64 " ms (lease with margin 4800, node_timeout 1500)\n", at);
+    struct state_want up = {ids[2], META_UP, 0};
+    await_view(0, p_member_state, &up, "the server UP again");
+}
+
+/* review F2: the Raft leader R, alive and still leading, loses its quorum (the two other voters paused) while the volume
+ * leader W, the member that is no voter, still reaches it. R grants only while its core's check-quorum lease holds
+ * (it ends by 667 ms: E 1000 * 0.8 / 1.2), so W's lease ends by 667 + 800: every read sent in (1550, 1700) ms is
+ * refused. Mutant noquorum grants until check-quorum deposes R (1000 to 2000 ms): W answers until 1750 at least. */
+static void scen_leasequorum(void)
+{
+    scenario("leasequorum");
+    lease_cluster(4, 1000, 200000, 3000);
+    struct view vw;
+    int W = -1;
+    for (uint64_t t0 = now_ms(); W < 0 && now_ms() - t0 < (uint64_t)WAIT_MS;) {
+        view(0, &vw);
+        for (int i = 1; i < 4; i++)
+            if (!is_voter(&vw, ids[i]))
+                W = i;
+        int lead = vw.st.role == RAFT_LEADER;
+        view_free(&vw);
+        if (!lead)
+            die("server 0 no longer leads");
+        if (W < 0) {
+            struct timespec d = {0, 50000000};
+            nanosleep(&d, NULL);
+        }
+    }
+    if (W < 0)
+        die("no member outside the voters");
+    int A = -1, B = -1;
+    for (int i = 1; i < 4; i++)
+        if (i != W && A < 0)
+            A = i;
+        else if (i != W)
+            B = i;
+    char name[16];
+    struct meta_volume v;
+    int found = 0;
+    for (int k = 0; k < 40 && !found; k++) {
+        uint32_t num;
+        snprintf(name, sizeof name, "lq%d", k);
+        int rc = vol_add(0, name, 3, &num);
+        if (rc != 0)
+            die("volume add %s: %s", name, cluster_strerror(rc));
+        if (!vol_rec(0, name, &v))
+            die("no record of %s", name);
+        found = server_of(v.leader) == W;
+    }
+    if (!found)
+        die("forty volumes, none led by server %d", W);
+    printf("  Raft leader 0, voters 0 %d %d, %s led by %d (no voter)\n", A, B, name, W);
+    for (uint32_t r = 0; r < v.nrep; r++) {
+        int i = server_of(v.rep[r].node);
+        if (i >= 0)
+            await_open_gen(0, name, i, 1, 0);
+    }
+    tsdbc *c = client(W);
+    tsdb_sid id = rep_series(c, rep_names[0], name, 30000);
+    int64_t ts = 1000;
+    float val = 7;
+    int rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+    if (rc != 0)
+        die("a write: %s", ers(rc));
+    if (!lease_until_ok(c, id, 10000, 1))
+        die("no read answered on %d before the pause", W);
+    static struct lread log[1 << 16];
+    size_t nl = 0;
+    pause_server(A, 1);
+    pause_server(B, 1);
+    uint64_t T0 = now_ms();
+    while (now_ms() - T0 < 2500 && nl < sizeof log / sizeof log[0]) {
+        int rows;
+        log[nl].sent = now_ms();
+        log[nl].rc = lease_read(c, id, (int)(nl % 3), &rows);
+        if (log[nl].rc != 0 && log[nl].rc != TSDB_ERR_UNAVAILABLE)
+            die("a read %" PRIu64 " ms into the pause: %s", log[nl].sent - T0, ers(log[nl].rc));
+        nl++;
+        struct timespec d = {0, 100000};
+        nanosleep(&d, NULL);
+    }
+    pause_server(A, 0);
+    pause_server(B, 0);
+    size_t refused = 0;
+    uint64_t last_ok = 0;
+    for (size_t k = 0; k < nl; k++) {
+        uint64_t at = log[k].sent - T0;
+        if (log[k].rc == 0 && at > 1550 && at < 1700)
+            die("a read sent %" PRIu64 " ms after the Raft leader lost its quorum was answered (its lease ends by 667)",
+                at);
+        if (log[k].rc == 0)
+            last_ok = at;
+        refused += log[k].rc != 0 && at > 1550 && at < 1700;
+    }
+    if (!refused)
+        die("no read was sent between 1550 and 1700 ms (%zu reads)", nl);
+    printf("  the Raft leader without its quorum: %zu reads, the last answered at %" PRIu64 " ms\n", nl, last_ok);
+    if (!lease_until_ok(c, id, 30000, 1))
+        die("no read answered on %d once the voters were back", W);
+    tsdbc_close(c);
+}
+
+/* The serving loop of a server that is not the Raft leader hangs (TSDBD_TEST_LOOP_STALL): its cluster thread still
+ * answers, but it sends no heartbeat, so the Raft leader marks it DOWN; once the loop runs again it is UP. Mutant
+ * stampignored (heartbeats whatever the stamp says) keeps it UP. */
+static void scen_hungloop(void)
+{
+    scenario("hungloop");
+    static char pe[3][PATH_MAX + 80];
+    char stall[3][PATH_MAX + 64];
+    for (int i = 0; i < 3; i++) {
+        snprintf(stall[i], sizeof stall[i], "%s/stall-n%d", base, i);
+        unlink(stall[i]);
+        snprintf(pe[i], sizeof pe[i], "TSDBD_TEST_LOOP_STALL=%s", stall[i]);
+        penv[i] = pe[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int S = 2;
+    int fd = open(stall[S], O_CREAT | O_WRONLY, 0644);
+    if (fd < 0)
+        die("create %s: %s", stall[S], strerror(errno));
+    close(fd);
+    uint64_t t0 = now_ms();
+    struct state_want down = {ids[S], META_DOWN, 0};
+    await_view(0, p_member_state, &down, "the server with the hung loop marked DOWN");
+    printf("  server %d's loop hung: DOWN after %" PRIu64 " ms\n", S, now_ms() - t0);
+    struct view vw;
+    view(S, &vw); /* its cluster thread still answers */
+    view_free(&vw);
+    unlink(stall[S]);
+    t0 = now_ms();
+    struct state_want up = {ids[S], META_UP, 0};
+    await_view(0, p_member_state, &up, "the server UP again once its loop runs");
+    printf("  its loop ran again: UP after %" PRIu64 " ms\n", now_ms() - t0);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -3191,7 +3609,8 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}};
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
