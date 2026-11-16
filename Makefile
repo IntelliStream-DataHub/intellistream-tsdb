@@ -1198,7 +1198,12 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # insert, JV_HANG blocks a worker for ever, each under kill, pause, none, eio, power, the hang also under outage, exit 1 at the first
 # attempt, no tsdbd left behind), a tsdbd that cannot start for want of memory is a harness error (exit 2) and one whose open
 # finds a damaged part a violation (failstart-tsdbd.sh), and the outage heal that takes long is INCONCLUSIVE unless the server reports the
-# volume DIVERGED (mutant-slowprobe.sh).
+# volume DIVERGED (mutant-slowprobe.sh). Round 12 adds to mutant-crash.sh: one abort per gate with a core dump (JV_CRASHONCE, JV_CRASH_MB: the
+# core handler of the machine keeps the process from being a zombie when the kill nemesis' SIGKILL arrives; kv and classes), JV_EXIT under
+# misdirect and rot (exit 0, and exit 1 with no damage in the log: no fail-stop on damage), JV_HANG under power and eio at the shim's default odds
+# (the quiet tail's server is a clean one), and JV_DSTALL (a worker in D state, the kernel's stall: INCONCLUSIVE kernel-stall, never a violation).
+# The limit that cannot be removed (a hang or a self-stop that a planned fault ends before the deadline looks like slowness) is in the header of
+# jepsen.c. tests/test_crashfs_old.c (make test) holds the shim to what a disk may do: a rewritten or cut sector comes back as it was synced.
 # What passes on purpose is listed at the end of the comment of nemesis_check.
 # What each bound is set to, and the honest worst under load on tmpfs and disk, is in the comments of nemesis_check (jepsen.c).
 jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $(B)/test_crashfs_bus

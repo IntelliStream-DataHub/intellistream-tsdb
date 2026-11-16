@@ -51,7 +51,7 @@ static void jv_crash(void)\
     }\
     abort();\
 }\
-static void jv_dstall(void) /* a thread in D state for good: the parent of a vfork whose child never execs (it dies with the server) */\
+static void jv_dstall(void)\
 {\
     if (vfork() == 0) {\
         prctl(PR_SET_PDEATHSIG, SIGKILL);\

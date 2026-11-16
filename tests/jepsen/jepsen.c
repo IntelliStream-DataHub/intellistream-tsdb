@@ -116,6 +116,23 @@
  * is expected) or that stops answering (every request has a deadline, REQ_DEADLINE_DEFAULT_S) or whose stop never ends; a tsdbd that
  * will not start is the environment (exit 2) unless its log says that the data is damaged (exit 1). Liveness, how soon things
  * resume after a fault, is INCONCLUSIVE (exit 3) and never a violation.
+ * Round 12 (what the harness looks at before it acts, and where it cannot see):
+ *  - a server that is crashing when the harness kills it (its core dump keeps it from being a zombie, so a SIGKILL would turn the end
+ *    into "killed by the harness") is told by /proc (CoreDumping, a fatal signal pending that the harness did not send) before every
+ *    SIGKILL: crash_check. A crash in the microseconds between the kernel taking the signal off the queue and starting the dump, at the
+ *    very moment of a kill, is not seen.
+ *  - a request that misses its deadline while a thread of the server has been in D state (the kernel's: a file system that stalls) for
+ *    10 s at a stretch is INCONCLUSIVE (kernel-stall), one with no such thread is a VIOLATION. A D state that is tsdbd's own looks the same
+ *    from outside.
+ *  - a server that has not listened yet is judged by start_server_run alone: it never came up (exit 2) unless its log shows damage.
+ *  - under power and eio the last server, which the quiet tail leaves to the clients, is a clean one (no shim, so nothing ends it but the
+ *    harness): a hung worker then reaches the deadline.
+ *  - under misdirect and rot a server's end is a fail-stop on damage (not a violation) only as exit 1, with a log that names the damage, in an
+ *    epoch where a fault was injected; exit 0 of its own, or exit 1 without a fault or without damage in the log, is a violation.
+ * The inherent limit: a hang or a self-stop (a SIGSTOP of its own) that a planned fault ends before the deadline (the next kill or plug, the
+ * pause nemesis' SIGCONT, an outage that kills the server) cannot be told from slowness: a worker that hangs for good is found only while its
+ * server lives past the deadline, which the quiet tail (every nemesis but outage, misdirect and rot) and a run with no nemesis give it.
+ * tests/jepsen/mutant-crash.sh (make jepsen-selftest) plants each of these and requires the verdict.
  * Deletes and replaces clear a key range of one series (a replace writes its
  * keys in that range in the same step). A key may then be absent where the
  * checks above want a value, if a delete covering it that did not definitely
