@@ -1203,8 +1203,14 @@ static bool stop_pid(pid_t pid, int sig, int *st)
     /* never an unbounded wait (round 11): a server whose clean stop waits for a hung worker never ends, and the harness that waits
      * for it never ends either. Past the bound it is a VIOLATION (the server hangs), and it is killed by its pid. */
     int64_t until = now_ns() + (sig == SIGKILL ? STOP_KILL_S : STOP_TERM_S) * 1000000000LL;
-    for (int i = 0; !(reaped = reap_server(pid, st, WNOHANG) == pid) && now_ns() < until; i++)
+    for (int i = 0; !(reaped = reap_server(pid, st, WNOHANG) == pid) && now_ns() < until; i++) {
         usleep(i < 200 ? 250 : 5000);
+        if (sig != SIGKILL && atomic_load(&hung_flag)) { /* a request met its deadline meanwhile (a hung worker): that is the verdict, no 120 s to wait for */
+            sig = SIGKILL;
+            signal_pid(pid, SIGKILL);
+            until = now_ns() + STOP_KILL_S * 1000000000LL;
+        }
+    }
     if (!reaped && sig != SIGKILL) {
         death_problems++;
         fprintf(stderr, "  the server (pid %d) did not stop within %d s of signal %d: it hangs (its clean stop waits for something "
