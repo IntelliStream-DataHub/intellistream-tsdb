@@ -1329,7 +1329,8 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    tests/jepsen/mutant-loss.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: data loss beside a lazy nemesis was hidden behind INCONCLUSIVE or went unnoticed"; exit 1; }; \
 	    tests/jepsen/mutant-crash.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a server that dies by itself or stops answering was hidden behind INCONCLUSIVE, a rerun or a pass, or hung the harness"; exit 1; }; \
-	for spec in 'kill@3@--nemesis kill --seconds 5' 'power@4@--nemesis power --seconds 8 --crashfs $(B)/libcrashfs.so'; do \
+	for spec in 'kill@3@--nemesis kill --seconds 5' 'power@4@--nemesis power --seconds 8 --crashfs $(B)/libcrashfs.so' \
+	    'misdirect@3@--nemesis misdirect --seconds 8 --crashfs $(B)/libcrashfs.so' 'rot@3@--nemesis rot --seconds 8'; do \
 	    oldifs=$$IFS; IFS=@; set -- $$spec; IFS=$$oldifs; nem=$$1; at=$$2; args=$$3; \
 	    for dly in 0 400; do \
 	    rm -f $(JEPSEN_DIR)-selftest.failstart-count; \
@@ -1338,9 +1339,9 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	        echo "jepsen-selftest: a server that fails to start for want of memory under the $$nem nemesis was a verdict, not a harness error (rc $$rc, wanted 2; the watcher saw it first: $$dly ms)"; echo "$$out" | tail -n 12; exit 1; fi; \
 	    done; \
 	    rm -f $(JEPSEN_DIR)-selftest.failstart-count; \
-	    tests/jepsen/expect.sh violation 'refuses to open the database after the faults: damaged data' \
+	    if [ $$nem = kill ] || [ $$nem = power ]; then tests/jepsen/expect.sh violation 'refuses to open the database after the faults: damaged data' \
 	        "a part file damaged before a restart under the $$nem nemesis (the open fails with corrupt data)" \
-	        env FAILSTART_AT=$$at FAILSTART=damage JEPSEN_TSDBD=tests/jepsen/failstart-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest $$args || exit 1; \
+	        env FAILSTART_AT=$$at FAILSTART=damage JEPSEN_TSDBD=tests/jepsen/failstart-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest $$args || exit 1; fi; \
 	    rm -f $(JEPSEN_DIR)-selftest.failstart-count; \
 	done; \
 	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; }; \

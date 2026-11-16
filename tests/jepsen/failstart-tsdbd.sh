@@ -18,6 +18,8 @@ echo $n > "$c"
 if [ "$n" = "${FAILSTART_AT:-3}" ]; then
     case ${FAILSTART:-env} in
     env)
+        # the start-up note of a file system without checksums comes first, as on a real run (it says "checksums" and "damaged": no damage)
+        echo "tsdbd: $d is on ext4, which keeps no checksums of its data, and --verify-checksums is off: a damaged or misdirected data block would be read as wrong values" >&2
         echo "tsdbd: io_uring: Cannot allocate memory" >&2
         exit 1 ;;
     damage)

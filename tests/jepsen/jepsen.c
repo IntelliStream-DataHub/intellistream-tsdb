@@ -2263,9 +2263,12 @@ static bool log_names_damage(const char *path, char *line, size_t n)
     FILE *f = fopen(path, "r");
     char b[1024];
     bool hit = false;
+    /* only what the engine and the fail-stop say, not tsdbd's start-up notes (the one about a file system that keeps no checksums
+     * names "checksums" and "damaged" and is no damage) */
     while (f && !hit && fgets(b, sizeof b, f)) {
-        hit = !strncmp(b, "tsdb", 4) && (strcasestr(b, "corrupt") || strcasestr(b, "damag") || strcasestr(b, "checksum") ||
-                                          strcasestr(b, "input/output error") || strcasestr(b, "I/O error"));
+        hit = (!strncmp(b, "tsdb: ", 6) || !strncmp(b, "tsdbd: storage failure", 22)) &&
+              (strcasestr(b, "corrupt") || strcasestr(b, "damaged") || strcasestr(b, "checksum") ||
+               strcasestr(b, "input/output error") || strcasestr(b, "I/O error"));
         if (hit) {
             b[strcspn(b, "\n")] = 0;
             snprintf(line, n, "%.400s", b);
