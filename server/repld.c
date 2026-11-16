@@ -125,9 +125,14 @@ struct rvol {
     uint64_t fetch_ms;
     char fetch_name[RW_NAME_MAX + 1];
     struct jr_ops ops;
+    /* the ISR change the core asked the metadata group for (REPL_M_ISR_REQ), reported in this server's heartbeats
+     * (repld_isr_requests) while the record still is the request's basis */
+    int isr_want;
+    struct repl_vmeta isr_req;
+    uint64_t resigned; /* the epoch a RESIGN was said for */
 };
 
-enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED };
+enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR };
 
 static struct {
     pthread_mutex_t mu;
@@ -390,6 +395,32 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
 
 static void vol_fail(struct rvol *rv, const char *why);
 static void cvol_close(uint32_t v);
+
+/* A message of the core to the metadata group. ISR_REQ is kept for this server's heartbeats (repld_isr_requests: the
+ * Raft leader proposes ISR_CHANGE on the request's own basis) until the record moves; RESIGN and FENCE_REPLY belong to
+ * promotion (r3e-failover): said, not sent. */
+static void meta_msg(struct rvol *rv, const struct repl_msg *m)
+{
+    if (m->type == REPL_M_ISR_REQ) {
+        if (!rv->isr_want || memcmp(&rv->isr_req, &m->meta, sizeof m->meta))
+            say("volume %" PRIu32 ": asks for an ISR of %d members (ISR version %" PRIu64 ")", rv->number,
+                __builtin_popcount(m->meta.isr), m->meta.isr_version);
+        rv->isr_req = m->meta;
+        rv->isr_want = 1;
+        cluster_beat_soon();
+        if (G.mutant == RM_COMMITPASTREMOVED) { /* planted: the core is told the change committed when it asks */
+            struct repl_msg mm = {.type = REPL_M_META, .from = REPL_META, .to = rv->self, .leader = -1};
+            mm.meta = m->meta;
+            mm.meta.isr_version++;
+            mm.epoch = mm.meta.epoch;
+            repl_recv(rv->core, &mm);
+        }
+    } else if (m->type == REPL_M_RESIGN && rv->resigned != m->epoch) {
+        rv->resigned = m->epoch;
+        say("volume %" PRIu32 ": cannot lead epoch %" PRIu64 " (led it before a restart); waits for a promotion",
+            rv->number, m->epoch);
+    }
+}
 
 /* An APPEND to peer `to` of the records [buf, buf + len) of segment seq at off (whole WAL records), positions
  * first .. last. Under rv->mu. 0 once queued. */
@@ -964,6 +995,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
                 m.prev_epoch = epoch_at(rv, m.prev_pos);
                 send_msg(rv, &m);
             }
+        } else if (a->msg.to == REPL_META) {
+            meta_msg(rv, &a->msg);
         } else {
             send_msg(rv, &a->msg);
         }
@@ -1263,6 +1296,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "commitbyleader") ? RM_COMMITBYLEADER
                : !strcmp(mu, "ackbeforesync")  ? RM_ACKBEFORESYNC
                : !strcmp(mu, "floornotsaved")  ? RM_FLOORNOTSAVED
+               : !strcmp(mu, "commitpastremoved") ? RM_COMMITPASTREMOVED
+               : !strcmp(mu, "nominisr")       ? RM_NOMINISR
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1345,7 +1380,8 @@ int repld_open(const struct cluster_vol_rec *r)
     struct repl_durable d = {.rid = rv->st.rid, .fence = rv->st.fence, .led = rv->st.led, .floor = rv->st.floor,
                              .log_start = rv->log_start, .log_end = log_end, .hist = rv->hist, .nhist = rv->nhist};
     uint32_t lag = r->isr_lag_ms ? r->isr_lag_ms : 1000;
-    struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = r->min_isr ? (int)r->min_isr : 1,
+    int min_isr = r->min_isr && G.mutant != RM_NOMINISR ? (int)r->min_isr : 1; /* planted nominisr: never checked */
+    struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = min_isr,
                               .isr_lag_ticks = lag / TICK_MS, .resend_ticks = 200 / TICK_MS, .heartbeat_ticks = 1,
                               .floor_ticks = 1000 / TICK_MS, .max_batch = 1u << 30, .window = 1u << 30,
                               .rec_find = idx_find, .ctx = rv};
@@ -1411,6 +1447,50 @@ void repld_update(const struct cluster_vol_rec *r)
     pthread_mutex_unlock(&rv->mu);
     if (changed)
         post(rv, IN_META, 0, NULL, 0);
+}
+
+int repld_isr_short(uint32_t v)
+{
+    struct rvol *rv = vol_find(v);
+    if (!rv)
+        return 0;
+    pthread_mutex_lock(&rv->mu);
+    int s = rv->mode == M_WRITER && !rv->failed && rv->rec.min_isr > 1 && rv->rec.nisr < rv->rec.min_isr;
+    pthread_mutex_unlock(&rv->mu);
+    return s;
+}
+
+unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max)
+{
+    struct rvol *vs[CLUSTER_REPORT_VOLS];
+    pthread_mutex_lock(&G.mu);
+    uint32_t nv = G.nvols;
+    memcpy(vs, G.vols, nv * sizeof *vs);
+    pthread_mutex_unlock(&G.mu);
+    unsigned n = 0;
+    for (uint32_t i = 0; i < nv && n < max; i++) {
+        struct rvol *rv = vs[i];
+        pthread_mutex_lock(&rv->mu);
+        const struct repl_vmeta *q = &rv->isr_req;
+        if (rv->isr_want && (q->epoch != rv->rec.epoch || q->isr_version != rv->rec.isr_version))
+            rv->isr_want = 0; /* the record moved: the core asks again if it still wants a change */
+        if (rv->isr_want && !rv->failed && rv->core) {
+            struct cluster_isr_req *o = &out[n];
+            memset(o, 0, sizeof *o);
+            o->volume = rv->number;
+            o->epoch = q->epoch;
+            o->isr_version = q->isr_version;
+            o->commit = repl_commit(rv->core);
+            for (uint32_t k = 0; k < rv->rec.nrep && k < META_REPLICAS_MAX; k++)
+                if (q->isr & (1u << k)) {
+                    o->node[o->nisr] = rv->rec.rep[k].node;
+                    o->rid[o->nisr++] = q->rid[k];
+                }
+            n++;
+        }
+        pthread_mutex_unlock(&rv->mu);
+    }
+    return n;
 }
 
 unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t after_ms)

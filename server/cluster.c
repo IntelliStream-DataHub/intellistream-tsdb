@@ -159,7 +159,7 @@ enum {
 };
 
 /* the sections of a heartbeat (after its address fields) */
-enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3, HBS_LEASE = 4, HBS_UNREACH = 5 };
+enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3, HBS_LEASE = 4, HBS_UNREACH = 5, HBS_ISR = 6 };
 #define FREE_MIN_DEFAULT (1ull << 30) /* a state directory below this is not voter_ok (M11) */
 
 /* ------------------------------------------------------------------ bytes */
@@ -893,6 +893,8 @@ struct heard {
     struct cluster_unreach unreach[CLUSTER_REPORT_UNREACH];
     uint64_t send_ns;     /* HBS_LEASE of its last heartbeat: its clock when it sent it (0: none) */
     uint64_t answered_ns; /* the Raft leader: when it last granted it a lease (its own clock; 0: never) */
+    uint32_t nisr;        /* HBS_ISR of its last heartbeat: the ISR changes the volumes it leads ask for */
+    struct cluster_isr_req isr[CLUSTER_REPORT_ISR];
 };
 
 struct addr_e {
@@ -1037,6 +1039,10 @@ static struct {
     int snap_out;        /* core thread: a snapshot write is outstanding */
     uint64_t stall_ns, xfer_for, xfer_next; /* a leader whose sync is outstanding this long hands leadership on */
     int hold_opens;      /* TSDB_CLUSTER_TEST hold_opens_file=1: no REPLICA_OPEN proposed while <state-dir>/holdopens is */
+    int hold_isr;        /* TSDB_CLUSTER_TEST hold_isr_file=1: no ISR_CHANGE proposed while <state-dir>/holdisr is */
+    int isr_replay;      /* TSDB_CLUSTER_TEST isr_replay=1: every ISR request proposed once is proposed again, with its
+                          * old basis, after the record moved past it (a late duplicate: the apply must refuse it) */
+    char holdisrfile[1100];
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1266,6 +1272,10 @@ static void test_knobs(void)
             C.fail_pend_dirsync = v != 0;
         else if (sscanf(p, "hold_opens_file=%llu", &v) == 1)
             C.hold_opens = v != 0;
+        else if (sscanf(p, "hold_isr_file=%llu", &v) == 1)
+            C.hold_isr = v != 0;
+        else if (sscanf(p, "isr_replay=%llu", &v) == 1)
+            C.isr_replay = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
             C.stall_file = v != 0;
         else if (sscanf(p, "sync_delay_ms=%llu", &v) == 1)
@@ -1527,7 +1537,8 @@ enum cl_mutant {
     CLM_STAMPIGNORED = 3,
     CLM_NOQUORUM = 4,
     CLM_NOCORECLOCK = 5,
-    CLM_NOPROMOTEWAIT = 6
+    CLM_NOPROMOTEWAIT = 6,
+    CLM_SHRINKNOCOND = 7 /* an ISR request is proposed on the record's current epoch and ISR version, not its own basis */
 };
 static int cl_mutant(void)
 {
@@ -1542,6 +1553,7 @@ static int cl_mutant(void)
             : !strcmp(e, "noquorum")      ? CLM_NOQUORUM
             : !strcmp(e, "nocoreclock")   ? CLM_NOCORECLOCK
             : !strcmp(e, "nopromotewait") ? CLM_NOPROMOTEWAIT
+            : !strcmp(e, "shrinknocond")  ? CLM_SHRINKNOCOND
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -1553,6 +1565,9 @@ static uint64_t mono_ns(void) { return iso_now_ns(); }
 
 static _Atomic uint64_t g_stamp_ns; /* the serving loop's last stamp (0: never) */
 static _Atomic uint64_t g_lease_ns; /* this server's read lease runs until this (mono_ns; 0: none) */
+static atomic_int g_beat_soon;      /* cluster_beat_soon: send the next heartbeat at the next duty round */
+
+void cluster_beat_soon(void) { atomic_store_explicit(&g_beat_soon, 1, memory_order_relaxed); }
 
 void cluster_loop_stamp(void) { atomic_store_explicit(&g_stamp_ns, mono_ns(), memory_order_relaxed); }
 
@@ -1712,6 +1727,32 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
                 return;
             }
             h->nunreach = n;
+        } else if (type == HBS_ISR) {
+            uint32_t n = get32(&s);
+            if (s.bad || n > CLUSTER_REPORT_ISR || (size_t)n * 32 > len) {
+                r->bad = 1;
+                return;
+            }
+            for (uint32_t i = 0; i < n && !s.bad; i++) {
+                struct cluster_isr_req *q = &h->isr[i];
+                q->volume = get32(&s);
+                q->epoch = get64(&s);
+                q->isr_version = get64(&s);
+                q->commit = get64(&s);
+                q->nisr = get32(&s);
+                if (q->nisr > META_REPLICAS_MAX)
+                    s.bad = 1;
+                for (uint32_t k = 0; k < q->nisr && !s.bad; k++) {
+                    q->node[k] = get32(&s);
+                    q->rid[k] = get64(&s);
+                }
+            }
+            if (s.bad) {
+                h->nisr = 0;
+                r->bad = 1;
+                return;
+            }
+            h->nisr = n;
         } else if (type == HBS_NODE) {
             uint8_t flags = get8(&s), dropped = get8(&s), rb = get8(&s);
             uint64_t fr = get64(&s);
@@ -3855,6 +3896,24 @@ static void put_sections(struct buf *b, uint64_t now)
         put32(b, rep.unreach[i].age_ms);
     }
     sec_end(b, at);
+    if (rep.nisr > CLUSTER_REPORT_ISR)
+        rep.nisr = 0;
+    at = sec_begin(b, HBS_ISR);
+    put32(b, rep.nisr);
+    for (uint32_t i = 0; i < rep.nisr; i++) {
+        const struct cluster_isr_req *q = &rep.isr[i];
+        uint32_t n = q->nisr > META_REPLICAS_MAX ? 0 : q->nisr;
+        put32(b, q->volume);
+        put64(b, q->epoch);
+        put64(b, q->isr_version);
+        put64(b, q->commit);
+        put32(b, n);
+        for (uint32_t k = 0; k < n; k++) {
+            put32(b, q->node[k]);
+            put64(b, q->rid[k]);
+        }
+    }
+    sec_end(b, at);
 }
 
 static void heartbeat(uint64_t now)
@@ -4222,6 +4281,102 @@ static void propose_opens(uint64_t now)
     }
 }
 
+/* ISR changes (design-cluster.md 6.1, 8.1 step 5): the leader of a replicated volume reports the change its core asks
+ * for in its heartbeats (HBS_ISR) until its record moves; the Raft leader proposes ISR_CHANGE with the request's own
+ * basis (epoch, ISR version), so the apply refuses one that is no longer current (META_ERR_STALE), and with the
+ * leader's commit point. Only the record's leader is listened to. A request is proposed again after ISR_RETRY_NS while
+ * the record has not moved (a lost leadership or a full pipeline drops a proposal). */
+#define ISR_RETRY_NS (1000 * MS)
+struct isr_sent {
+    struct cluster_isr_req q;
+    uint64_t ns;
+    int replayed;
+};
+static struct isr_sent isr_sent[CLUSTER_REPORT_ISR];
+static uint32_t nisr_sent;
+
+static void propose_isr_one(const struct cluster_isr_req *q, uint64_t epoch, uint64_t version)
+{
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_isr_change(&e, q->volume, epoch, version, q->node, q->rid, q->nisr, q->commit);
+    if (propose(&e, 0, 0, 0) == ISO_OK)
+        say("proposes volume %" PRIu32 " ISR of %" PRIu32 " members (epoch %" PRIu64 ", ISR version %" PRIu64
+            ", commit point %" PRIu64 ")", q->volume, q->nisr, epoch, version, q->commit);
+}
+
+static void propose_isr(uint64_t now)
+{
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
+        return;
+    if (C.hold_isr && access(C.holdisrfile, F_OK) == 0)
+        return; /* tests: a change the metadata group has not committed must hold the commit point back */
+    static struct cluster_report own;
+    int have_own = 0;
+    for (uint32_t i = 0; i < C.sm.nvolumes; i++) {
+        const struct meta_volume *v = &C.sm.volumes[i];
+        if (v->kind != META_VOL_REPLICATED)
+            continue;
+        const struct cluster_isr_req *qs = NULL;
+        uint32_t nq = 0;
+        if (v->leader == C.id) {
+            if (!have_own) {
+                memset(&own, 0, sizeof own);
+                if (g_reporter)
+                    g_reporter(g_reporter_arg, &own);
+                have_own = 1;
+            }
+            qs = own.isr;
+            nq = own.nisr > CLUSTER_REPORT_ISR ? 0 : own.nisr;
+        } else {
+            struct heard *h = heard_get(v->leader);
+            if (h) {
+                qs = h->isr;
+                nq = h->nisr;
+            }
+        }
+        for (uint32_t j = 0; j < nq; j++) {
+            const struct cluster_isr_req *q = &qs[j];
+            if (q->volume != v->number || q->nisr == 0 || q->nisr > META_REPLICAS_MAX)
+                continue;
+            int nocond = cl_mutant() == CLM_SHRINKNOCOND;
+            if (!nocond && (q->epoch != v->epoch || q->isr_version != v->isr_version))
+                continue; /* the leader has not seen the record move yet; its next heartbeat drops it */
+            struct isr_sent *s = NULL;
+            for (uint32_t k = 0; k < nisr_sent && !s; k++)
+                if (isr_sent[k].q.volume == q->volume && isr_sent[k].q.epoch == q->epoch &&
+                    isr_sent[k].q.isr_version == q->isr_version)
+                    s = &isr_sent[k];
+            if (s && !memcmp(&s->q, q, sizeof *q) && since(now, s->ns) < ISR_RETRY_NS)
+                continue;
+            if (!s) {
+                if (nisr_sent == CLUSTER_REPORT_ISR)
+                    nisr_sent = 0; /* a cache of what went out recently, nothing more: forgetting costs a resend */
+                s = &isr_sent[nisr_sent++];
+            }
+            s->q = *q;
+            s->ns = now;
+            s->replayed = 0;
+            propose_isr_one(q, nocond ? v->epoch : q->epoch, nocond ? v->isr_version : q->isr_version);
+        }
+    }
+    /* tests (isr_replay=1): a late duplicate of a request whose record has moved on since */
+    for (uint32_t k = 0; C.isr_replay && k < nisr_sent; k++) {
+        struct isr_sent *s = &isr_sent[k];
+        const struct meta_volume *v = NULL;
+        for (uint32_t i = 0; i < C.sm.nvolumes && !v; i++)
+            if (C.sm.volumes[i].number == s->q.volume)
+                v = &C.sm.volumes[i];
+        if (!v || s->replayed || v->isr_version < s->q.isr_version + 2)
+            continue;
+        s->replayed = 1;
+        int nocond = cl_mutant() == CLM_SHRINKNOCOND;
+        say("test: replays an ISR request of volume %" PRIu32 " on ISR version %" PRIu64, s->q.volume,
+            s->q.isr_version);
+        propose_isr_one(&s->q, nocond ? v->epoch : s->q.epoch, nocond ? v->isr_version : s->q.isr_version);
+    }
+}
+
 static void leader_duties(uint64_t now)
 {
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
@@ -4245,6 +4400,7 @@ static void leader_duties(uint64_t now)
         return;
     member_states(now);
     propose_opens(now);
+    propose_isr(now);
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
@@ -4391,7 +4547,7 @@ static void *cluster_main(void *arg)
                 sync_stall_check();
         }
         copy_flush(now, 0);
-        if (now >= C.next_hb) {
+        if (now >= C.next_hb || (now >= C.next_duty && atomic_exchange(&g_beat_soon, 0))) {
             uint32_t hb = settings()->heartbeat_ms;
             C.next_hb = now + (uint64_t)(hb < 10 ? 10 : hb) * MS;
             heartbeat(now);
@@ -4525,6 +4681,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.retiredfile, sizeof C.retiredfile, "%s/retired", C.metadir);
     snprintf(C.stallfile, sizeof C.stallfile, "%s/stall", C.metadir);
     snprintf(C.holdopensfile, sizeof C.holdopensfile, "%s/holdopens", C.metadir);
+    snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     meta_init(&C.sm);

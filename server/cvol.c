@@ -262,6 +262,7 @@ static void on_report(void *arg, struct cluster_report *out)
         if (repld_failed(out->vols[i].volume))
             out->vols[i].health = CL_HEALTH_LOCAL_FAULT; /* D13: reported in the next heartbeat (r3e-failover acts) */
     out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, UNREACH_MS);
+    out->nisr = repld_isr_requests(out->isr, CLUSTER_REPORT_ISR);
 }
 
 int cvol_why(uint32_t v)

@@ -91,12 +91,28 @@ struct cluster_unreach { /* a server this one shares a volume with and has not h
     uint32_t node;
     uint32_t age_ms;
 };
+#define CLUSTER_REPORT_ISR 32
+/* A replicated volume led here asks the metadata group for an ISR change (design-cluster.md 6.1, 8.1 step 5; the core's
+ * REPL_M_ISR_REQ): the new ISR as (node, rid) pairs, holding the leader, on the basis (epoch, isr_version) of the record
+ * it saw, and the leader's commit point. The Raft leader proposes ISR_CHANGE (meta_op_isr_change) with exactly that
+ * basis, so a request that is no longer current is refused at the apply. */
+struct cluster_isr_req {
+    uint32_t volume;
+    uint64_t epoch, isr_version, commit;
+    uint32_t nisr;
+    uint32_t node[META_REPLICAS_MAX];
+    uint64_t rid[META_REPLICAS_MAX];
+};
 struct cluster_report {
-    uint32_t nvols, ndoms, nunreach;
+    uint32_t nvols, ndoms, nunreach, nisr;
     struct cluster_vol_report vols[CLUSTER_REPORT_VOLS];
     struct cluster_dom_report doms[CLUSTER_REPORT_DOMS];
     struct cluster_unreach unreach[CLUSTER_REPORT_UNREACH];
+    struct cluster_isr_req isr[CLUSTER_REPORT_ISR];
 };
+/* A volume led here has a new request for the metadata group (any thread, an atomic store): the cluster thread sends
+ * its next heartbeat within a duty round (100 ms) instead of after heartbeat_ms, so an ISR change waits that long. */
+void cluster_beat_soon(void);
 /* Fills `out` (zeroed) from what this server runs; called from the cluster thread once per heartbeat, so it must not
  * block. Without one (set before cluster_start) the server reports no volumes and no domains. */
 typedef void (*cluster_report_fn)(void *arg, struct cluster_report *out);

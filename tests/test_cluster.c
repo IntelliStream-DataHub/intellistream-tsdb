@@ -460,11 +460,15 @@ static void node_add(int via, int newi)
     printf("  server %d joined as member %" PRIu32 "\n", newi, ids[newi]);
 }
 
+static uint32_t init_min_isr; /* nonzero: INIT's min_isr (the volumes' min_isr, at most their replicas) */
+
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
 static void init_mode(int i, uint32_t replace_s, int mode)
 {
     struct meta_settings s;
     meta_settings_default(&s);
+    if (init_min_isr)
+        s.min_isr = init_min_isr;
     s.node_timeout_ms = 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
@@ -3006,6 +3010,241 @@ static void scen_replicate(void)
     printf("  a replica killed under writes and restarted catches up, fetching the part it missed; every replica holds the leader's rows\n");
 }
 
+/* the ISR of volume `name` in server via's copy: its member count, *version its ISR version */
+static uint32_t isr_of(int via, const char *name, uint64_t *version)
+{
+    struct meta_volume v;
+    if (!vol_rec(via, name, &v))
+        die("no record of %s", name);
+    if (version)
+        *version = v.isr_version;
+    return v.nisr;
+}
+
+static void await_isr(int via, const char *name, uint32_t n, int ms, const char *what)
+{
+    uint64_t t0 = now_ms();
+    while (isr_of(via, name, NULL) != n) {
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("%s: the ISR of %s has %" PRIu32 " members, not %" PRIu32 ", after %d ms", what, name,
+                isr_of(via, name, NULL), n, ms);
+        struct timespec w = {0, 50000000};
+        nanosleep(&w, NULL);
+    }
+}
+
+static void hold_isr(int on)
+{
+    for (int i = 0; i < 3; i++) {
+        char hold[PATH_MAX + 96];
+        server_dir(i, hold, sizeof hold);
+        strcat(hold, "/state/holdisr");
+        if (on) {
+            FILE *h = fopen(hold, "w");
+            if (!h || fclose(h) != 0)
+                die("%s: %s", hold, strerror(errno));
+        } else if (unlink(hold) != 0 && errno != ENOENT) {
+            die("%s: %s", hold, strerror(errno));
+        }
+    }
+}
+
+/* waits for a writer thread; dies after ms */
+static void await_writer(struct rep_writer *w, pthread_t th, int ms, const char *what)
+{
+    uint64_t t0 = now_ms();
+    while (!__atomic_load_n(&w->done, __ATOMIC_ACQUIRE)) {
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("%s: not answered after %d ms", what, ms);
+        struct timespec w10 = {0, 10000000};
+        nanosleep(&w10, NULL);
+    }
+    pthread_join(th, NULL);
+    if (w->rc != 0)
+        die("%s: %s", what, ers(w->rc));
+}
+
+/* isr (design-cluster.md 6.1, 8.1 step 5): a replica that stops acknowledging leaves the ISR after isr_lag_ms through
+ * an ISR_CHANGE the Raft leader proposes on the request's basis, and writes go on without it; back, it catches up and
+ * joins again. While the change is not committed (hold_isr_file) the commit point still waits for the member (mutant
+ * commitpastremoved); a late duplicate of the old shrink request (isr_replay) is refused at the apply (mutant
+ * shrinknocond). */
+static void scen_isr(void)
+{
+    scenario("isr");
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "hold_isr_file=1,isr_replay=1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    uint64_t rows = 0;
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    rows++;
+    await_isr(0, "plant", 3, 5000, "every replica up");
+
+    /* a killed replica while the metadata group commits no ISR change: the write waits */
+    int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
+    hold_isr(1);
+    stop(R1, SIGKILL);
+    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    struct timespec s3 = {3, 0};
+    nanosleep(&s3, NULL);
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
+        die("a write was acknowledged without a killed ISR member before the ISR change committed (rc %d)", w.rc);
+    if (isr_of(0, "plant", NULL) != 3)
+        die("the ISR changed while the proposals were held");
+    if (!log_has(L, "asks for an ISR of 2 members"))
+        die("the leader never asked for an ISR without the killed replica");
+    hold_isr(0);
+    await_writer(&w, th, 5000, "the write held by an uncommitted ISR change, once the change could commit");
+    rows++;
+    await_isr(0, "plant", 2, 5000, "a replica killed");
+    /* writes go on without it, each quickly */
+    for (int j = 0; j < 50; j++) {
+        uint64_t t0 = now_ms();
+        int64_t t = 10000 + 1000LL * j;
+        if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0)
+            die("a write with a replica out of the ISR: %s", ers(rc));
+        if (now_ms() - t0 > 1000)
+            die("a write with a replica out of the ISR took %" PRIu64 " ms", now_ms() - t0);
+        rows++;
+    }
+    uint64_t v1;
+    isr_of(0, "plant", &v1);
+    /* back, it catches up and joins; the old shrink request replayed late (isr_replay) must change nothing */
+    start(R1);
+    await_isr(0, "plant", 3, 30000, "the killed replica restarted");
+    uint64_t v2;
+    isr_of(0, "plant", &v2);
+    nanosleep(&s3, NULL);
+    uint64_t v3;
+    if (isr_of(0, "plant", &v3) != 3 || v3 != v2)
+        die("after the replica joined again the ISR moved: %" PRIu32 " members, version %" PRIu64 " -> %" PRIu64
+            " (a stale ISR request applied)", isr_of(0, "plant", NULL), v2, v3);
+    int replayed = 0;
+    for (int i = 0; i < 3; i++)
+        replayed |= log_has(i, "test: replays an ISR request");
+    if (!replayed)
+        die("no server replayed the old ISR request: the check above proves nothing");
+    printf("  a killed replica leaves the ISR only once the change committed (versions %" PRIu64 ", %" PRIu64
+           "), writes go on, and it joins again; a stale request is refused\n", v1, v2);
+
+    /* a stopped replica (SIGSTOP: its stream breaks, no ACK) likewise, and comes back by itself */
+    pause_server(R2, 1);
+    for (int j = 0; j < 20; j++) {
+        int64_t t = 100000 + 1000LL * j;
+        if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0)
+            die("a write with a replica stopped: %s", ers(rc));
+        rows++;
+    }
+    await_isr(0, "plant", 2, 10000, "a replica stopped");
+    pause_server(R2, 0);
+    await_isr(0, "plant", 3, 30000, "the stopped replica continued");
+    if ((uint64_t)rows_of(c, id) != rows)
+        die("the leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
+    tsdbc_close(c);
+    stop_all();
+    for (int i = 0; i < 3; i++)
+        envs[i] = NULL;
+    uint64_t wantr[REP_NAMES] = {rows, 0, 0, 0};
+    rep_same(wantr, "after a clean stop");
+    printf("  a stopped replica leaves the ISR and joins again once it runs; every replica holds the leader's rows\n");
+}
+
+/* minisr: with min_isr 2, a leader whose replicas are both gone refuses a write before anything is written
+ * (REPL_E_ISR: UNAVAILABLE), and takes writes again once they are back (mutant nominisr). */
+static void scen_minisr(void)
+{
+    scenario("minisr");
+    init_min_isr = 2;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    init_min_isr = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v) || v.min_isr != 2)
+        die("plant has no record or min_isr %" PRIu32 ", not 2", v.min_isr);
+    int L = server_of(v.leader);
+    tsdbc *c = client(L);
+    tsdbc_set_retry(c, 0);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
+    stop(R1, SIGKILL);
+    /* one replica gone: the ISR shrinks to 2 = min_isr, and writes go on */
+    ts = 2000;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with one of two replicas gone (min_isr 2): %s", ers(rc));
+    await_isr(0, "plant", 2, 10000, "one replica killed");
+    stop(R2, SIGKILL);
+    await_isr(0, "plant", 1, 10000, "both replicas killed");
+    for (int j = 0; j < 5; j++) {
+        uint64_t t0 = now_ms();
+        ts = 3000 + 1000LL * j;
+        rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("a write below min_isr was answered %d (%s), not UNAVAILABLE", rc, ers(rc));
+        if (now_ms() - t0 > 1000)
+            die("a write below min_isr took %" PRIu64 " ms to be refused", now_ms() - t0);
+        tsdb_unavail u[4];
+        unsigned nu = 0;
+        if (tsdbc_unavailable(c, u, 4, &nu) != 0 || nu < 1 || u[0].reason == TSDB_WHY_NONE)
+            die("a write below min_isr was refused without a reason (%u entries)", nu);
+    }
+    if (rows_of(c, id) != 2)
+        die("the leader reads %d rows after the refused writes, not 2", rows_of(c, id));
+    start(R1);
+    start(R2);
+    await_isr(0, "plant", 3, 30000, "both replicas back");
+    ts = 9000;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write once the replicas are back: %s", ers(rc));
+    if (rows_of(c, id) != 3)
+        die("the leader reads %d rows, not 3 (a refused write was written)", rows_of(c, id));
+    tsdbc_close(c);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {3, 0, 0, 0};
+    rep_same(wantr, "after a clean stop");
+    printf("  below min_isr a write is refused at once with a reason and nothing written; above it writes go on\n");
+}
+
 /* replindet (D12): a replicated write whose outcome is unknown (appended on the leader, which then stops, deposing
  * itself, before the commit point passed it) never reaches the client as TSDB_ERR_INDETERMINATE (-110) or as a
  * refusal: tsdbd closes the connection without an answer, and the client sees a lost connection (TSDB_ERR_IO). */
@@ -3609,7 +3848,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
