@@ -194,6 +194,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s LIBCRASHFS.so DIR [SEEDS]\n", argv[0]);
         return 2;
     }
+    int san = 0; /* a sanitizer's runtime must come first in the library list: with crashfs preloaded the child refuses to start */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    san = 1;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+    san = 1;
+#endif
+#endif
+    if (san) {
+        printf("test_crashfs_old: skipped: crashfs cannot be preloaded into a sanitizer build\n");
+        return 0;
+    }
     unsigned long seeds = argc > 3 ? strtoul(argv[3], NULL, 10) : 120;
     char base[2048];
     snprintf(base, sizeof base, "%s/crashfs_old.%d", argv[2], (int)getpid());
