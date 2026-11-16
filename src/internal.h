@@ -71,7 +71,10 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_CLOSE_FLUSH, MUT_LEADER_NO_RSTATE, MUT_LEADER_CLOSE_WAIT, MUT_LEADER_KEEP_IGNORED,
        MUT_LEADER_NO_HARDLINK, MUT_PROMOTE_NO_CARRY, MUT_KEPT_REPLAYED, MUT_LEADER_KEPT_NOSAVE,
        MUT_LEADER_READ_NO_GAP, MUT_LEADER_READ_CURSOR_ANY, MUT_LEADER_READ_TAILOK_SEALED,
-       MUT_LEADER_READ_NOTFOUND_SEALED, MUT_LEADER_NO_SWEEP, MUT_LEADER_B0_OFF };
+       MUT_LEADER_READ_NOTFOUND_SEALED, MUT_LEADER_NO_SWEEP, MUT_LEADER_B0_OFF,
+       MUT_REPLICA_APPLY_HOLDS_MU, MUT_REPLICA_PREP_NO_CUT_GEN, MUT_LEADER_DROP_UNHELD,
+       MUT_LEADER_LINK_BY_NAME, MUT_LEADER_RS_NO_PRUNE, MUT_LEADER_RS_PRUNE_ALL, MUT_LEADER_NOTE_LATE,
+       MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1321,6 +1324,9 @@ void mem_run_free(mem_run *r);
 void mt_note_fno(memtable *m, uint64_t first, size_t n);
 int mt_flush(struct eng *db);
 int mt_flush_ex(struct eng *db, const mk *marker, uint64_t *fno); /* mt_flush with a marker as the new segment's first record */
+int mt_flush_held(struct eng *db, const mk *marker, uint64_t *fno); /* the same, flush_lock held by the caller */
+extern void (*eng_test_drop_hook)(struct eng *db, int at); /* test hook: a leader's DROP; at 0 before flush_lock, 1 between
+                                                            * its marker and the retire */
 int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
                size_t n, int type);
 /* WAL records, version 2 (format 9, docs/design-cdc.md 2.1):
@@ -1360,6 +1366,8 @@ int wal_marker_mk(struct eng *db, const mk *m, uint64_t *fno);
  * them once; *fno gets the first number, *last the last position. A non-zero return before the sync means nothing of
  * the batch is in the log. */
 int wal_markers_mk(struct eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last);
+int wal_markers_mk_at(struct eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last,
+                      void (*at)(struct eng *, uint64_t, void *), void *arg);
 
 /* The namespace-event hook (docs/design-ha-modes.md 2.1, M15): one call at each place a name or a file becomes
  * visible, in two phases. jr_intent runs before publish_lock is taken (a replicated backend appends the marker and
@@ -1448,6 +1456,12 @@ int jr_precommit(struct eng *db, size_t n);
 int leader_rs_drop(struct eng *db, int64_t ts);
 int leader_rs_open(struct eng *db);
 int leader_rs_kept(struct eng *db, uint64_t seq);
+/* The DROPs below `lo`, the first position the leader's log may still hold (its kept segments went up to there), leave
+ * RSTATE's list in memory; the next save writes the shorter list (r3a2 R8). Takes publish_lock; a no-op on a
+ * writer that is not a leader. */
+void leader_rs_prune(struct eng *db, uint64_t lo);
+/* tests: how many DROPs the leader's RSTATE lists in memory (-1: none loaded); *first, the position of the oldest */
+long leader_rs_ndrops(struct eng *db, uint64_t *first);
 int rs_kept_seq(struct eng *db, uint64_t *seq);
 
 #define FNO_FILE "FNO"
@@ -1507,9 +1521,10 @@ void eng_leader_keep(struct eng *db, uint64_t pos);
 /* A file a COMMIT marker of this leader names (`name`: the marker's name, p<partition>_<pid>_<n>_0.part), for a replica
  * that missed it: the leader keeps each hard linked as stage_<xxh64 of the name>.part (the name a replica stages it
  * under) from before its marker is appended until the retained segment that holds the marker goes (eng_leader_keep),
- * whatever merges did to the part since. An fd open for reading, or TSDB_ERR_NOTFOUND (the segment went: the replica
- * needs a snapshot). */
-int eng_leader_file_open(struct eng *db, const char *name);
+ * whatever merges did to the part since. `pos`: the marker's position; a link is served only for the marker that
+ * named it in this leadership. An fd open for reading, or TSDB_ERR_NOTFOUND (the segment went, or the marker is of
+ * an earlier leadership: the replica needs a snapshot). */
+int eng_leader_file_open(struct eng *db, uint64_t pos, const char *name);
 /* replica.c: the links of the files of COMMIT markers whose position is below fno_end go (their segment went;
  * flush_lock held); every stage_ file goes (eng_leader_attach: a writer keeps no stage of its own) */
 void leader_links_drop(struct eng *db, uint64_t fno_end);
@@ -1848,7 +1863,7 @@ struct eng {
     struct lkfile {
         uint64_t fno, key;
     } *lf;                       /* with jr: the stage_ links of COMMIT markers in the log (leader_commit; lead_mu) */
-    size_t nlf, caplf;
+    size_t nlf, caplf, rlf;      /* rlf: entries of lf reserved by COMMITs about to append their marker (lead_mu) */
     uint64_t lrd_seq, lrd_off, lrd_next; /* where the last read of the log by position ended (replica_read; lead_mu) */
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
@@ -2424,6 +2439,7 @@ uint64_t cls_gen_now(eng *db);
 int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at);
 /* Replica only (replica.c): the leader's CLASS record (classes.c cls_apply). */
 int cls_apply(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off);
+int cls_purge(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off); /* before cls_apply, any lock free */
 int tsdb_test_class_switch(struct tsdb *t, tsdb_sid series, int cls, const int64_t *at); /* through the volumes */
 /* An id no volume can have by its bits: a zero volume field (an id cut to 32 bits) or bits 48-63 set. Queries answer
  * TSDB_ERR_INVALID for it, so a truncated id does not look like an empty range; a well formed id that is unknown

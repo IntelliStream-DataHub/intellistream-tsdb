@@ -841,6 +841,15 @@ int wal_marker_mk(eng *db, const mk *m, uint64_t *fno)
 
 int wal_markers_mk(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last)
 {
+    return wal_markers_mk_at(db, m, n, fno, last, NULL, NULL);
+}
+
+/* `at`, when given, runs under buf_lock once the numbers are assigned, before the records can reach the file (and so
+ * before anyone can read them by position): a leader notes there what a reader of the marker may ask for. It takes
+ * only leaf locks (lead_mu) and cannot fail. */
+int wal_markers_mk_at(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last, void (*at)(eng *, uint64_t, void *),
+                      void *arg)
+{
     if (n == 0)
         return TSDB_ERR_INVALID;
     uint8_t **enc = calloc(n, sizeof *enc);
@@ -858,6 +867,8 @@ int wal_markers_mk(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last
     if (rc == 0) {
         pthread_mutex_lock(&db->buf_lock);
         rc = wal_markers_locked(db, r, n, fno, &lsn);
+        if (rc == 0 && at)
+            at(db, *fno, arg);
         pthread_mutex_unlock(&db->buf_lock);
     }
     for (size_t i = 0; enc && i < n; i++)
@@ -1429,6 +1440,7 @@ static void lk_unlink_upto(eng *db, uint64_t bound)
         return;
     uint64_t last = db->lk[n - 1].seq;
     leader_links_drop(db, db->lk[n - 1].fno_end); /* the files their COMMIT markers named go with them */
+    leader_rs_prune(db, db->lk[n - 1].fno_end);   /* and the DROPs no retained record lies behind */
     memmove(db->lk, db->lk + n, (db->nlk - n) * sizeof *db->lk);
     db->nlk -= n;
     wal_removed_raise(db, last);
@@ -1572,7 +1584,11 @@ int mt_flush(eng *db) { return mt_flush_ex(db, NULL, NULL); }
  * it is flushed here): a replica that applies it has sealed and flushes exactly the memtables the leader flushed
  * (the DROP marker, design-cluster.md 5.2). With an empty active memtable there is no new segment: the marker
  * goes into the current one, and the replica checks that its memtable holds no rows then. *fno: its first number. */
-int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
+static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held);
+int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno) { return mt_flush_do(db, marker, fno, false); }
+int mt_flush_held(eng *db, const mk *marker, uint64_t *fno) { return mt_flush_do(db, marker, fno, true); }
+
+static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held)
 {
     if (db->opt.read_only)
         return 0;
@@ -1592,7 +1608,8 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
         if (mrc)
             return mrc;
     }
-    pthread_mutex_lock(&db->flush_lock);
+    if (!held)
+        pthread_mutex_lock(&db->flush_lock);
     /* a memtable whose write failed earlier holds older rows than the active
      * one: it is written first, and the active one after it all the same, or
      * a large insert that relies on this flush would be shadowed by it */
@@ -1678,7 +1695,8 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
 
     if (rc == 0)
         rc = flush_waiting(db);
-    pthread_mutex_unlock(&db->flush_lock);
+    if (!held)
+        pthread_mutex_unlock(&db->flush_lock);
     free(mbody);
     if (mlsn && rc == 0)
         rc = wal_commit(db, mlsn); /* the marker is durable before the caller goes on */

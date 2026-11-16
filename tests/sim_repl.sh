@@ -42,7 +42,7 @@ mode=${1:-quick}
 quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20 21 22 23 26 27 28 29 31 34 35 36"
 all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39"
 # test_repl's scenarios and the planted bug each must catch
-scenarios="34 35 36 37"
+scenarios="34 35 36 37 39"
 
 mutants() {
     local seeds=$1 bad=0 m out
