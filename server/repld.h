@@ -27,6 +27,9 @@ int repld_failed(uint32_t v);
 /* Volume v's engine failed (eng_fail): 1 when the driver holds v (it stops and quiesces it, the process goes on, D13),
  * 0 when v is no volume of the driver (tsdbd's own rules apply). */
 int repld_engine_failed(uint32_t v, const char *msg);
+/* The servers this one shares a running volume with and has heard nothing from on any of them for after_ms or more
+ * (the heartbeat's "unreachable" section, design-cluster.md §2.2): at most max into out; any thread. */
+unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t after_ms);
 /* Stops every driver thread and the links (before the handle is closed). */
 void repld_stop(void);
 /* After repld_stop: closes the engines of the volumes the driver stopped on a failure (D13), whose close fails by

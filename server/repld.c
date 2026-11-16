@@ -88,6 +88,7 @@ struct rpeer {
     uint64_t acked;    /* the `written` of its last ACK in this run */
     uint64_t gen;      /* the log link's connection the cursor was moved on */
     int heard;
+    uint64_t heard_ms; /* when a message of this volume last came from it (repld_unreachable) */
 };
 
 struct rvol {
@@ -104,6 +105,7 @@ struct rvol {
     int self, nnodes;
     uint64_t epoch; /* the core's, cached for the bytes path */
     struct rpeer peer[REPL_MAX_NODES];
+    uint64_t open_ms; /* when its driver started: a peer never heard counts as unheard since then */
     struct item *in_head, *in_tail;
     /* the index: starts of the WAL records from the log start, ascending; idx_end the last position indexed */
     uint64_t *idx;
@@ -497,6 +499,11 @@ static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
      * that window is refused for a retry, never taken as a sign that this node no longer leads (that deposed the
      * fresh leader for good) */
     if (rv->mode == M_PROMOTING) {
+        pthread_mutex_unlock(&rv->mu);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    /* no read lease (§7.1): a write that raced the check in tsdbd is refused the same way, never taken as a deposal */
+    if (rv->mode == M_WRITER && !cluster_lease_valid()) {
         pthread_mutex_unlock(&rv->mu);
         return TSDB_ERR_UNAVAILABLE;
     }
@@ -1090,6 +1097,7 @@ static void handle(struct rvol *rv, struct item *it)
     uint64_t o = 0;
     for (uint32_t i = 0; i < rv->cur.m.nrec; i++)
         rv->coff[i] = o, o += rv->cur.lens[i];
+    rv->peer[from].heard_ms = now_ms();
     if (rv->cur.m.type == REPL_M_ACK) {
         struct rpeer *p = &rv->peer[from];
         p->acked = rv->cur.m.written;
@@ -1350,6 +1358,7 @@ int repld_open(const struct cluster_vol_rec *r)
     rv->epoch = repl_epoch(rv->core);
     /* what the line below logs, read before the thread starts: from then on rv->st and log_start are its (under mu) */
     uint64_t said_start = rv->log_start, said_floor = rv->st.floor, said_fence = rv->st.fence;
+    rv->open_ms = now_ms(); /* before it is listed: repld_unreachable reads it from the list */
     pthread_mutex_lock(&G.mu);
     room = G.nvols < CLUSTER_REPORT_VOLS; /* checked before the open; repld_open runs on the manager thread only */
     if (room)
@@ -1402,6 +1411,45 @@ void repld_update(const struct cluster_vol_rec *r)
     pthread_mutex_unlock(&rv->mu);
     if (changed)
         post(rv, IN_META, 0, NULL, 0);
+}
+
+unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t after_ms)
+{
+    struct rvol *vs[CLUSTER_REPORT_VOLS];
+    pthread_mutex_lock(&G.mu);
+    uint32_t nv = G.nvols;
+    memcpy(vs, G.vols, nv * sizeof *vs);
+    pthread_mutex_unlock(&G.mu);
+    uint64_t now = now_ms();
+    struct {
+        uint32_t node;
+        uint64_t last; /* the latest message from it on any volume */
+    } seen[MAX_NODES];
+    unsigned ns = 0;
+    for (uint32_t i = 0; i < nv; i++) {
+        struct rvol *rv = vs[i];
+        pthread_mutex_lock(&rv->mu);
+        for (uint32_t k = 0; !rv->failed && k < rv->rec.nrep && k < REPL_MAX_NODES; k++) {
+            if ((int)k == rv->self || rv->rec.rep[k].learner)
+                continue;
+            uint64_t last = rv->peer[k].heard_ms ? rv->peer[k].heard_ms : rv->open_ms;
+            unsigned j = 0;
+            while (j < ns && seen[j].node != rv->rec.rep[k].node)
+                j++;
+            if (j == ns && ns < MAX_NODES)
+                seen[ns++] = (__typeof__(seen[0])){rv->rec.rep[k].node, last};
+            else if (j < ns && last > seen[j].last)
+                seen[j].last = last;
+        }
+        pthread_mutex_unlock(&rv->mu);
+    }
+    unsigned n = 0;
+    for (unsigned j = 0; j < ns && n < max; j++) {
+        uint64_t age = now > seen[j].last ? now - seen[j].last : 0;
+        if (age >= after_ms)
+            out[n++] = (struct cluster_unreach){seen[j].node, (uint32_t)(age > UINT32_MAX ? UINT32_MAX : age)};
+    }
+    return n;
 }
 
 int repld_failed(uint32_t v)

@@ -238,6 +238,7 @@ static void on_watch(void *arg, uint32_t self, const struct cluster_vol_rec *v, 
     pthread_mutex_unlock(&M.mu);
 }
 
+#define UNREACH_MS 1000 /* a peer unheard this long on every data link is reported unreachable (repld heartbeats: 5 ms) */
 static void on_report(void *arg, struct cluster_report *out)
 {
     (void)arg;
@@ -259,7 +260,8 @@ static void on_report(void *arg, struct cluster_report *out)
     pthread_mutex_unlock(&M.mu);
     for (uint32_t i = 0; i < out->nvols; i++) /* after M.mu: the driver's locks are never taken under it */
         if (repld_failed(out->vols[i].volume))
-            out->vols[i].health = CL_HEALTH_LOCAL_FAULT;
+            out->vols[i].health = CL_HEALTH_LOCAL_FAULT; /* D13: reported in the next heartbeat (r3e-failover acts) */
+    out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, UNREACH_MS);
 }
 
 int cvol_why(uint32_t v)
@@ -275,9 +277,22 @@ int cvol_why(uint32_t v)
     pthread_mutex_unlock(&M.mu);
     if (open && !writer && !repld_failed(v) && tsdb_cvol_role(M.t, v) == CVOL_WRITER)
         writer = 1; /* promoted by the replication driver */
-    if (open)
-        why = writer ? -1 : TSDB_WHY_FENCED;
+    if (open) /* led here: answered only under a read lease (§7.1; reads and writes alike) */
+        why = !writer ? TSDB_WHY_FENCED : cluster_lease_valid() ? -1 : TSDB_WHY_UNREACHABLE;
     return why;
+}
+
+int cvol_led(uint32_t v)
+{
+    if (!M.active)
+        return 0;
+    pthread_mutex_lock(&M.mu);
+    const struct mvol *m = mv_get(v);
+    int open = m && m->state == MV_OPEN, writer = m && m->writer;
+    pthread_mutex_unlock(&M.mu);
+    if (open && !writer && !repld_failed(v) && tsdb_cvol_role(M.t, v) == CVOL_WRITER)
+        writer = 1; /* promoted by the replication driver (as in cvol_why) */
+    return open && writer;
 }
 
 int cvol_active(void) { return M.active; }
