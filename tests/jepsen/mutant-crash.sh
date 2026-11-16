@@ -11,9 +11,9 @@
 #   JV_DSTALL=N  a worker blocks in D state for good (vfork whose child never execs) on every Nth insert request: the kernel's stall, as an I/O stall
 #                is, and not tsdbd's hang (JV_HANG: pause(), no D state)
 #   JV_CRASHONCE=N  the same, once per gate (JV_ONCEFILE names the file whose creation says it happened)
-#   JV_CRASH_MB=M   before the abort, touch M MB: a dump that takes long on every core handler (off by default: the touching is a window in
-#                of its own in which the nemesis kills the server before it aborts, and under 16 busy loops the abort then never happens;
-#                the handler of the machine takes 0.1 to 0.5 s even for a small core)
+#   JV_CRASH_MB=M   a thread of the server touches M MB from its first insert on, in the background: the abort then dumps a core of up to that
+#                size, a dump that takes long on every core handler (touching before the abort made a window in which the nemesis killed
+#                the server before it aborted, and under 16 busy loops the abort then never happened)
 #   JV_HANG=N    a worker pause()s for ever on every Nth insert request (the server is up and stops answering)
 # and runs them through tests/jepsen/rerun.sh:
 #   crash under kill, pause, none, eio and power: exit 1 at the FIRST attempt (no "jepsen-rerun: attempt" line, never 0 or 3), naming the
@@ -36,21 +36,29 @@ f=$tmp/server/tsdbd.c
 sed -i '0,/^#include <fcntl.h>$/s//#include <fcntl.h>\
 #include <sys\/prctl.h>\
 static _Atomic unsigned jv_cnt; \/* test-only mutants of tests\/jepsen\/mutant-crash.sh *\/\
+static void *jv_touch(void *a);\
 static int jv_every(const char *k)\
 {\
     const char *e = getenv(k);\
     int n = e ? atoi(e) : 0;\
+    static _Atomic int toucher;\
+    if (n > 0 \&\& getenv("JV_CRASH_MB") \&\& !atomic_exchange(\&toucher, 1)) {\
+        pthread_t th;\
+        if (pthread_create(\&th, NULL, jv_touch, (void *)(size_t)atol(getenv("JV_CRASH_MB"))) == 0)\
+            pthread_detach(th);\
+    }\
     return n > 0 \&\& atomic_fetch_add(\&jv_cnt, 1) % (unsigned)n == (unsigned)n - 1;\
+}\
+static void *jv_touch(void *a)\
+{\
+    size_t mb = (size_t)a;\
+    volatile char *p = malloc(mb << 20);\
+    for (size_t i = 0; p \&\& i < (mb << 20); i += 4096)\
+        p[i] = 1;\
+    return NULL;\
 }\
 static void jv_crash(void)\
 {\
-    const char *m = getenv("JV_CRASH_MB");\
-    size_t mb = m ? (size_t)atol(m) : 0;\
-    if (mb) {\
-        volatile char *p = malloc(mb << 20);\
-        for (size_t i = 0; p \&\& i < (mb << 20); i += 4096)\
-            p[i] = 1;\
-    }\
     abort();\
 }\
 static void jv_dstall(void)\
@@ -124,7 +132,7 @@ for nem in eio power; do
     run_case "crash-$nem" "$CR" "a server that aborts on every 40th insert, $nem nemesis" JV_CRASH=40 -- --nemesis "$nem" --seconds 12 \
         --crashfs "$crashfs"
 done
-# one abort per gate, with the dump the machine's core handler takes (CRASH_MB sets a larger one, 0 by default): the kill
+# one abort per gate, with a core dump of up to CRASH_MB (512 by default) on the core handler of the machine: the kill
 # nemesis' SIGKILL meets a server that is not a zombie yet. Under kv and under classes the kill nemesis hid it
 # before round 12 (7 of 10 kv kill gates passed VALID at load 125, 3 of 6 quiet; VERIFY11 (A)).
 for wl in kv classes; do
@@ -132,7 +140,7 @@ for wl in kv classes; do
         rm -f "$tmp/once-$wl-$i"
         run_case "crashonce-$wl-kill-$i" "$CR\|was crashing when the harness killed it" \
             "one abort per gate with a core dump (the machine's core handler), kill nemesis, $wl workload" JV_CRASHONCE=${CRASH_ONCE_N:-20} \
-            JV_CRASH_MB=${CRASH_MB:-0} JV_ONCEFILE="$tmp/once-$wl-$i" -- --nemesis kill --workload $wl --seconds 12
+            JV_CRASH_MB=${CRASH_MB:-512} JV_ONCEFILE="$tmp/once-$wl-$i" -- --nemesis kill --workload $wl --seconds 12
     done
 done
 # a server that exits by itself (status 0, or 1 with no fault in the epoch) under misdirect (with and without verify_checksums) and rot is
