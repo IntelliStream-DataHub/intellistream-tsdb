@@ -124,7 +124,9 @@ run_case() { # name pattern what envs... -- jepsen args...
         kill -KILL "$p" 2>/dev/null
     done
 }
-CR='ended with status .* (signal 6 (Aborted).*by itself'
+# the crash is told either as the end it had ('ended with status ... signal 6') or, when the harness' own SIGKILL met the server writing its core
+# (every nemesis but none: a stop that follows a crash by a few ms), as crash_check says it ('was crashing when the harness killed it')
+CR='ended with status .* (signal 6 (Aborted).*by itself\|was crashing when the harness killed it'
 for nem in kill pause none; do
     run_case "crash-$nem" "$CR" "a server that aborts on every 40th insert, $nem nemesis" JV_CRASH=40 -- --nemesis "$nem" --seconds 12
 done
@@ -138,7 +140,7 @@ done
 for wl in kv classes; do
     for i in 1 2 3; do
         rm -f "$tmp/once-$wl-$i"
-        run_case "crashonce-$wl-kill-$i" "$CR\|was crashing when the harness killed it" \
+        run_case "crashonce-$wl-kill-$i" "$CR" \
             "one abort per gate with a core dump (the machine's core handler), kill nemesis, $wl workload" JV_CRASHONCE=${CRASH_ONCE_N:-20} \
             JV_CRASH_MB=${CRASH_MB:-512} JV_ONCEFILE="$tmp/once-$wl-$i" -- --nemesis kill --workload $wl --seconds 12
     done
