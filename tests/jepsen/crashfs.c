@@ -383,6 +383,37 @@ static file *file_get(const char *path, bool create_new)
     return f;
 }
 
+/* The bytes [off, off + n) of the file behind `fd`, read through a descriptor crashfs opens itself: the caller's may be
+ * write-only (tsdb opens CLASSES O_WRONLY), and a failed pread there once left zeros that tear_file wrote back over
+ * synced records. False when they cannot be read in full: the caller keeps nothing, never bytes it made up. */
+static bool read_through(int fd, const char *path, void *buf, size_t n, off_t off)
+{
+    char self[64];
+    snprintf(self, sizeof self, "/proc/self/fd/%d", fd);
+    int rfd = real_open(self, O_RDONLY | O_CLOEXEC, 0);
+    if (rfd < 0 && path[0]) { /* no /proc: the file's path, if it is still the same inode */
+        struct stat a, b;
+        rfd = real_open(path, O_RDONLY | O_CLOEXEC, 0);
+        if (rfd >= 0 && (fstat(rfd, &a) != 0 || fstat(fd, &b) != 0 || a.st_ino != b.st_ino || a.st_dev != b.st_dev)) {
+            real_close(rfd);
+            rfd = -1;
+        }
+    }
+    if (rfd < 0)
+        return false;
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = real_pread(rfd, (char *)buf + got, n - got, off + (off_t)got);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0)
+            break;
+        got += (size_t)r;
+    }
+    real_close(rfd);
+    return got == n;
+}
+
 /* CRASHFS_TEAR: keeps the durable content of the sectors in [off, end) that
  * are about to change, once per sync, so a power loss can bring them back. */
 static void keep_old(file *f, int fd, off_t off, off_t end)
@@ -397,6 +428,11 @@ static void keep_old(file *f, int fd, off_t off, off_t end)
             have = f->old[i].off == s;
         if (have)
             continue;
+        unsigned char data[SECTOR];
+        off_t len = f->durable - s < SECTOR ? f->durable - s : SECTOR; /* the durable bytes of the sector */
+        memset(data, 0, sizeof data);
+        if (!read_through(fd, f->path, data, (size_t)len, s))
+            continue; /* not kept: a sector of made-up bytes is a loss no disk has */
         if (f->nold == f->capold) {
             size_t cap = f->capold ? 2 * f->capold : 16;
             struct old_sector *o = realloc(f->old, cap * sizeof *o);
@@ -407,9 +443,7 @@ static void keep_old(file *f, int fd, off_t off, off_t end)
         }
         struct old_sector *o = &f->old[f->nold++];
         o->off = s;
-        memset(o->data, 0, SECTOR);
-        if (pread(fd, o->data, SECTOR, s) < 0) {
-        }
+        memcpy(o->data, data, SECTOR);
     }
 }
 

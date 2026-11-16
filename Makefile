@@ -323,7 +323,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
 	./$(B)/test_tsdb $(SCRATCH)
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched $(SCRATCH)
@@ -354,6 +354,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_cvolfs $(SCRATCH)
 	for m in nosync nodirsync nononce trustunsure tornstale samerid; do ! ./$(B)/test_cvolfs --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	for m in applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off; do ! ./$(B)/test_replica --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done
+	$(if $(filter Darwin,$(UNAME_S)),,./$(B)/test_crashfs_old $(CURDIR)/$(B)/libcrashfs.so $(SCRATCH))
 	./$(B)/test_feedstore $(SCRATCH)
 	tests/expect_fail.sh 'renamed before its data was synced' ./$(B)/test_feedstore --mutant noseal $(SCRATCH) # a replayed segment renamed without its fdatasync must fail it
 	tests/expect_fail.sh 'removed before the floor was durable' ./$(B)/test_feedstore --mutant latefloor $(SCRATCH) # the cleaner's floor set after its unlinks must fail it
@@ -1077,6 +1078,10 @@ $(B)/liboutagefs.so: tests/jepsen/outagefs.c | $(B)
 # a reader of a mapping that the shim's power loss cuts: the process must end with the loss's status (jepsen-selftest)
 $(B)/test_crashfs_bus: tests/test_crashfs_bus.c | $(B)
 	$(CC) $(CFLAGS) -o $@ $< -lpthread
+
+# crashfs keeps the durable bytes of what a write-only descriptor rewrites or cuts (tests/test_crashfs_old.c)
+$(B)/test_crashfs_old: tests/test_crashfs_old.c | $(B)
+	$(CC) $(CFLAGS) -o $@ $<
 
 $(B)/test_outagefs: tests/test_outagefs.c tests/outagefs_ctl.h | $(B)
 	$(CC) $(CFLAGS) -o $@ $< -lpthread
