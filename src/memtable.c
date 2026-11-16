@@ -1484,10 +1484,14 @@ static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
     leader_unlink_due(db);
 }
 
+/* Never waits for flush_lock: a flush holds it while it waits for the commit point (flush_waiting, eng_leader_wait),
+ * and the driver's thread that calls this is the one that moves that point. When a flush holds it, the bound is
+ * stored and that flush's leader_flushed, or the next call, removes what is due. */
 void eng_leader_keep(eng *db, uint64_t pos)
 {
-    pthread_mutex_lock(&db->flush_lock);
     atomic_store(&db->lead_keep, pos);
+    if (pthread_mutex_trylock(&db->flush_lock) != 0)
+        return;
     leader_unlink_due(db);
     pthread_mutex_unlock(&db->flush_lock);
 }

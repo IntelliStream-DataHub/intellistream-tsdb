@@ -2830,6 +2830,7 @@ struct rep_writer {
     tsdb_sid id;
     int64_t t0;
     int count, done, rc;
+    int big; /* > 0: one insert of this many rows instead of `count` single rows */
 };
 
 /* small writes of one row each from another connection, while the main thread kills and restarts a replica */
@@ -2840,6 +2841,17 @@ static void *rep_write_thread(void *a)
     w->rc = tsdbc_connect("127.0.0.1", w->port, &c);
     if (w->rc == 0) {
         tsdbc_set_retry(c, 0);
+        if (w->big > 0) {
+            int64_t *ts = malloc((size_t)w->big * sizeof *ts);
+            float *val = malloc((size_t)w->big * sizeof *val);
+            if (!ts || !val)
+                die("out of memory");
+            for (int j = 0; j < w->big; j++)
+                ts[j] = w->t0 + 1000LL * j, val[j] = (float)(j % 613);
+            w->rc = tsdbc_insert_series(c, w->id, ts, val, w->big);
+            free(ts);
+            free(val);
+        }
         for (int j = 0; j < w->count && w->rc == 0; j++) {
             int64_t ts = w->t0 + 1000LL * j;
             float val = (float)j;
@@ -2955,31 +2967,43 @@ static void scen_replicate(void)
      * every server would come back on new peer ports, which the metadata group does not know) */
     int R = (L + 1) % 3;
     stop(R, SIGKILL);
-    struct rep_writer w = {cports[L], id[0], 10000000, 300, 0, 0};
-    pthread_t th;
-    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+    struct rep_writer w = {cports[L], id[0], 10000000, 300, 0, 0, 0};
+    /* and a large insert: its part is shipped while R is down; R, back, does not stage the first file it receives
+     * (TSDB_REPLD_TEST=dropbulk), finds the COMMIT marker in the log without the file and fetches it from the leader
+     * by the marker's position (eng_leader_file_open serves a name only for the marker that named it) */
+    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000}; /* above wal_max_batch_rows */
+    pthread_t th, thb;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0 || pthread_create(&thb, NULL, rep_write_thread, &wb) != 0)
         die("pthread_create");
     struct timespec pause = {1, 500000000};
     nanosleep(&pause, NULL);
+    penv[R] = "TSDB_REPLD_TEST=dropbulk"; /* the part shipped to R once it is back is lost: R must fetch it */
     start(R);
+    penv[R] = NULL;
     uint64_t t0 = now_ms();
-    while (!__atomic_load_n(&w.done, __ATOMIC_ACQUIRE)) {
+    while (!__atomic_load_n(&w.done, __ATOMIC_ACQUIRE) || !__atomic_load_n(&wb.done, __ATOMIC_ACQUIRE)) {
         if (now_ms() - t0 > 60000)
-            die("300 small writes with a replica down and back did not finish in 60 s");
+            die("300 small writes and a large one with a replica down and back did not finish in 60 s");
         struct timespec ms = {0, 10000000};
         nanosleep(&ms, NULL);
     }
     pthread_join(th, NULL);
+    pthread_join(thb, NULL);
     if (w.rc != 0)
         die("a small write with a replica down: %s", ers(w.rc));
+    if (wb.rc != 0)
+        die("a large write with a replica down: %s", ers(wb.rc));
     n[0] += 300;
+    n[2] += 100000;
+    if (!log_has(R, "fetches"))
+        die("the replica restarted under a large write never fetched its part from the leader");
     await_open_gen(L, "plant", R, 2, 0);
     if ((uint64_t)rows_of(c, id[0]) != n[0])
         die("the leader reads %d rows of %s, not %" PRIu64, rows_of(c, id[0]), rep_names[0], n[0]);
     tsdbc_close(c);
     stop_all();
     rep_same(n, "after a clean stop");
-    printf("  a replica killed under writes and restarted catches up; every replica holds the leader's rows\n");
+    printf("  a replica killed under writes and restarted catches up, fetching the part it missed; every replica holds the leader's rows\n");
 }
 
 /* replindet (D12): a replicated write whose outcome is unknown (appended on the leader, which then stops, deposing
@@ -3017,7 +3041,7 @@ static void scen_replindet(void)
     int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
     pause_server(R1, 1); /* no replica acknowledges: the commit point stops below the next write */
     pause_server(R2, 1);
-    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0};
+    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -3093,7 +3117,7 @@ static void scen_replfail(void)
     tsdbc_close(c);
     int R = (L + 1) % 3;
     signal_child(pids[R], SIGUSR2); /* crashfs: the next fdatasync of a wal_ file there fails with EIO */
-    struct rep_writer w = {cports[L], id, 2000, 1000000, 0, 0};
+    struct rep_writer w = {cports[L], id, 2000, 1000000, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");

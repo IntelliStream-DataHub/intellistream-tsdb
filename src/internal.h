@@ -1516,7 +1516,8 @@ extern void (*mt_test_before_seal)(struct eng *db);
  * lowest position any replica still needs: a replica's next `from` minus 1), at most the commit floor the driver saved.
  * A leader's flushed segment stays (a catch-up source, replica_read) until its last position is at or below
  * min(pos, the commit point); then it goes by its own name (lk_unlink_upto: FNO holds its end first). Before the first call the bound is 0: nothing goes. The bound may move back (a replica rejoins); what is gone
- * stays gone. Takes flush_lock (waits for a flush in progress). */
+ * stays gone. Never waits for flush_lock (a flush holds it while it waits for the commit point the driver moves): with a
+ * flush in progress the bound is stored and the removal is left to that flush or the next call. */
 void eng_leader_keep(struct eng *db, uint64_t pos);
 /* A file a COMMIT marker of this leader names (`name`: the marker's name, p<partition>_<pid>_<n>_0.part), for a replica
  * that missed it: the leader keeps each hard linked as stage_<xxh64 of the name>.part (the name a replica stages it

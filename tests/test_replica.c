@@ -5092,6 +5092,20 @@ static bool seg_exists(const char *dir, uint64_t seq)
  * they go at once); a bound one below the first's last position removes nothing; at that position the first goes,
  * with FNO holding its end first, and the second stays; a bound past both removes the second; a bound moved back
  * keeps the next one. */
+struct keep_arg {
+    eng *db;
+    uint64_t pos;
+    atomic_int done;
+};
+
+static void *keep_thread(void *a)
+{
+    struct keep_arg *k = a;
+    eng_leader_keep(k->db, k->pos);
+    atomic_store(&k->done, 1);
+    return NULL;
+}
+
 static void case_leader_keep(void)
 {
     xport x;
@@ -5111,6 +5125,18 @@ static void case_leader_keep(void)
     CHECK(seg_exists(x.ldir, a.seq) && seg_exists(x.ldir, b.seq));
     eng_leader_keep(x.ld, a.fno_end - 2);
     CHECK(seg_exists(x.ldir, a.seq) && seg_exists(x.ldir, b.seq));
+    /* a flush holds flush_lock while it waits for the commit point, which the driver's thread moves: the driver's call
+     * must not wait for it (tsdbd's repld hung there under a large write); the removal is left to a later call */
+    struct keep_arg ka = {x.ld, a.fno_end - 1, 0};
+    pthread_t kt;
+    pthread_mutex_lock(&x.ld->flush_lock);
+    CHECK_EQ(pthread_create(&kt, NULL, keep_thread, &ka), 0);
+    for (int i = 0; i < 500 && !atomic_load(&ka.done); i++)
+        nanosleep(&(struct timespec){0, 10000000}, NULL);
+    CHECK(atomic_load(&ka.done)); /* without the fix: it waits for flush_lock */
+    CHECK(seg_exists(x.ldir, a.seq));
+    pthread_mutex_unlock(&x.ld->flush_lock);
+    pthread_join(kt, NULL);
     eng_leader_keep(x.ld, a.fno_end - 1);
     CHECK(!seg_exists(x.ldir, a.seq) && seg_exists(x.ldir, b.seq));
     CHECK(atomic_load(&x.ld->fno_durable) >= a.fno_end); /* FNO held its end before it went */
