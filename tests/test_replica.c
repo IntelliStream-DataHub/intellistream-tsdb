@@ -2159,7 +2159,7 @@ static void case_commit_hold(void)
 {
     xport x;
     char rd[PATH_MAX], name[64];
-    uint64_t sz;
+    uint64_t sz, mpos;
     xp_start(&x, "kh");
     rdir(rd, sizeof rd, &x);
     xp_rows(&x, 0, 0, 10, 100);
@@ -2169,7 +2169,7 @@ static void case_commit_hold(void)
     uint64_t last = ld_last(&x);
     CHECK(replica_durable_end(x.rep) < last);
     CHECK(replica_applied_end(x.rep) < last);
-    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 1);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 1);
     CHECK(strcmp(name, x.held_name) == 0);
     CHECK_EQ(sz, x.held_len);
     {
@@ -2181,9 +2181,9 @@ static void case_commit_hold(void)
     /* a restart with the marker in the log and no file: still held */
     xp_reopen(&x, rd, 0);
     CHECK(replica_durable_end(x.rep) < last);
-    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 1);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 1);
     CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
-    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 0);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 0);
     xp_step(&x, "K: staged late");
     /* a file with the wrong content is no file */
     x.withhold = true;
@@ -2192,7 +2192,7 @@ static void case_commit_hold(void)
     memcpy(bad, x.held, x.held_len);
     bad[x.held_len / 2] ^= 1;
     CHECK_EQ(replica_stage(x.rep, x.held_name, bad, x.held_len), 0);
-    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 1);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 1);
     CHECK_EQ(replica_sync(x.rep), 0);
     CHECK(replica_durable_end(x.rep) < ld_last(&x));
     free(bad);
@@ -2207,7 +2207,7 @@ static void case_commit_cut(void)
 {
     xport x;
     char rd[PATH_MAX], name[64];
-    uint64_t sz;
+    uint64_t sz, mpos;
     xp_start(&x, "kk");
     rdir(rd, sizeof rd, &x);
     xp_rows(&x, 0, 0, 10, 100);
@@ -2219,7 +2219,7 @@ static void case_commit_cut(void)
     CHECK_EQ(count_files(rd, "stage_"), 1);
     CHECK_EQ(replica_cut(x.rep, last - 1), 0);
     CHECK_EQ(count_files(rd, "stage_"), 0);
-    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 0);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 0);
     CHECK_EQ(replica_log_end(x.rep), last - 1);
     /* the same marker again (a new leader would send another; here the old one is sent again) */
     x.coff = 0;
@@ -2245,7 +2245,7 @@ static void case_commit_cut(void)
         x.coff = (uint64_t)st.st_size;
     }
     CHECK_EQ(xp_ship_logs(&x), 0);
-    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 1);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 1);
     CHECK(replica_durable_end(x.rep) < last);
     CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
     x.noapply = false;
@@ -3302,7 +3302,7 @@ static void case_restage(void)
 {
     xport x;
     char rd[PATH_MAX], name[64];
-    uint64_t sz;
+    uint64_t sz, mpos;
     xp_start(&x, "krs");
     rdir(rd, sizeof rd, &x);
     xp_rows(&x, 0, 0, 10, 100);
@@ -3315,7 +3315,7 @@ static void case_restage(void)
     CHECK_EQ(replica_durable_end(x.rep), d0);
     xp_reopen(&x, rd, 0);
     CHECK_EQ(replica_durable_end(x.rep), d0); /* mutant stagetrunc: below it */
-    CHECK_EQ(replica_missing(x.rep, name, sizeof name, &sz), 0);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 0);
     CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0); /* the same bytes again: nothing to do */
     CHECK_EQ(count_files(rd, "stage_"), 1);
     x.noapply = false;
@@ -4762,9 +4762,9 @@ static void case_leader_keep(void)
     xp_stop(&x);
     printf("  a leader keeps its flushed segments until the driver's bound passes their end, FNO first\n");
 }
-static bool leader_file_is(eng *db, const char *name, const uint8_t *b, size_t len)
+static bool leader_file_is(eng *db, uint64_t pos, const char *name, const uint8_t *b, size_t len)
 {
-    int fd = eng_leader_file_open(db, name);
+    int fd = eng_leader_file_open(db, pos, name);
     if (fd < 0)
         return false;
     uint8_t *got = malloc(len + 1);
@@ -4797,17 +4797,18 @@ static void case_hardlink(void)
     size_t len = x.held_len;
     uint8_t *b = malloc(len);
     memcpy(b, x.held, len);
-    CHECK(leader_file_is(x.ld, name, b, len)); /* mutant nohardlink: NOTFOUND */
+    const uint64_t hpos = x.ld->nlf ? x.ld->lf[x.ld->nlf - 1].fno : 0; /* the COMMIT marker's position */
+    CHECK(leader_file_is(x.ld, hpos, name, b, len)); /* mutant nohardlink: NOTFOUND */
     xp_rows(&x, 0, 40, 40, 2000);
     xp_step(&x, "HL: second large insert");
     x.ld->opt.obsolete_part_lifetime_s = 0;
     CHECK_EQ(eng_optimize(x.ld), 0);
-    CHECK(leader_file_is(x.ld, name, b, len)); /* the merge took the part, not the link */
+    CHECK(leader_file_is(x.ld, hpos, name, b, len)); /* the merge took the part, not the link */
     xp_rows(&x, 1, 200, 5, 3000); /* rows, so that the flush seals the segment that holds the markers */
     xp_step(&x, "HL: small rows");
     CHECK_EQ(eng_flush(x.ld), 0);
     eng_leader_keep(x.ld, UINT64_MAX);
-    int fd = eng_leader_file_open(x.ld, name);
+    int fd = eng_leader_file_open(x.ld, hpos, name);
     CHECK_EQ(fd, TSDB_ERR_NOTFOUND); /* gone with the segment */
     if (fd >= 0)
         close(fd);
@@ -4839,6 +4840,44 @@ static void case_hardlink(void)
     printf("  a leader keeps its COMMITs' files linked while their segment is retained; a power loss before the publish keeps them\n");
 }
 
+/* r3a2 R5: names of COMMIT files repeat across engines in one process (the tmp counter starts again at every open), so
+ * a leader serves a link only for the marker position that named it in this leadership. A leader's first large insert
+ * names N at P1; reopened (a new leadership in the same process), its first large insert names N again, at P2, with
+ * other bytes. P2 gives the new bytes; P1 is NOTFOUND (the replica takes a snapshot), never the new file under the old
+ * marker, which a replica's check refuses and its catch-up stalls on. Mutant linkbyname: P1 serves the new file. */
+static void case_link_pos(void)
+{
+    xport x;
+    xp_start(&x, "lpos");
+    xp_rows(&x, 0, 0, 40, 1000); /* a large insert: a COMMIT */
+    xp_step(&x, "LP: first leadership");
+    char n1[64];
+    snprintf(n1, sizeof n1, "%s", x.held_name);
+    const uint64_t p1 = x.ld->nlf ? x.ld->lf[x.ld->nlf - 1].fno : 0;
+    CHECK(p1 != 0);
+    CHECK(leader_file_is(x.ld, p1, n1, x.held, x.held_len));
+    CHECK_EQ(eng_leader_file_open(x.ld, p1 + 1, n1), TSDB_ERR_NOTFOUND); /* no marker there names it */
+    eng_close(x.ld);
+    xp_open_leader(&x);
+    xp_rows(&x, 0, 0, 40, 5000); /* the same rows' keys, other values: the same partition, other bytes */
+    xp_step(&x, "LP: second leadership");
+    const uint64_t p2 = x.ld->nlf ? x.ld->lf[x.ld->nlf - 1].fno : 0;
+    if (strcmp(n1, x.held_name) != 0)
+        fprintf(stderr, "LP: the second leadership named %s, not %s: the test needs a repeated name\n", x.held_name, n1);
+    CHECK(strcmp(n1, x.held_name) == 0);
+    CHECK(p2 > p1);
+    CHECK(leader_file_is(x.ld, p2, n1, x.held, x.held_len));
+    int fd = eng_leader_file_open(x.ld, p1, n1);
+    if (fd >= 0)
+        fprintf(stderr, "LP: the marker at %" PRIu64 " was served the file of the marker at %" PRIu64 " (mutant linkbyname)\n",
+                p1, p2);
+    CHECK_EQ(fd, TSDB_ERR_NOTFOUND);
+    if (fd >= 0)
+        close(fd);
+    xp_stop(&x);
+    printf("  a leader serves a COMMIT's file only for the marker that named it in this leadership\n");
+}
+
 /* Feeds dst from the leader's log by position only (replica_read on the writer, `cap` bytes a read), then fetches every
  * file a COMMIT names that dst misses from the leader (eng_leader_file_open), syncs and applies to `commit`. */
 static int feed_once(eng *ld, eng *dst, size_t cap) /* one read and its append: 1 bytes came, 0 the end, < 0 an error */
@@ -4867,9 +4906,9 @@ static int feed_finish(eng *ld, eng *dst, uint64_t commit)
 {
     int rc = 0;
     char name[64];
-    uint64_t size;
-    while (rc == 0 && replica_missing(dst, name, sizeof name, &size) == 1) {
-        int fd = eng_leader_file_open(ld, name);
+    uint64_t size, mpos;
+    while (rc == 0 && replica_missing(dst, &mpos, name, sizeof name, &size) == 1) {
+        int fd = eng_leader_file_open(ld, mpos, name);
         uint8_t *b = fd >= 0 ? malloc(size ? size : 1) : NULL;
         rc = fd < 0 ? fd : !b || pread(fd, b, size, 0) != (ssize_t)size ? TSDB_ERR_IO : replica_stage(dst, name, b, size);
         free(b);
@@ -5102,7 +5141,8 @@ static int mutant_of(const char *m)
                         : strcmp(m, "b0off") == 0 ? MUT_LEADER_B0_OFF
                         : strcmp(m, "applyholdsmu") == 0 ? MUT_REPLICA_APPLY_HOLDS_MU
                         : strcmp(m, "nocutgen") == 0 ? MUT_REPLICA_PREP_NO_CUT_GEN
-                        : strcmp(m, "dropunheld") == 0 ? MUT_LEADER_DROP_UNHELD : 0;
+                        : strcmp(m, "dropunheld") == 0 ? MUT_LEADER_DROP_UNHELD
+                        : strcmp(m, "linkbyname") == 0 ? MUT_LEADER_LINK_BY_NAME : 0;
 }
 
 int main(int argc, char **argv)
@@ -5183,6 +5223,7 @@ int main(int argc, char **argv)
         case_depose();
         case_leader_keep();
         case_hardlink();
+        case_link_pos();
         case_leader_read();
         case_link_sweep();
         for (int v = 0; v < 3; v++)
@@ -5269,6 +5310,7 @@ int main(int argc, char **argv)
     case_depose();
     case_leader_keep();
     case_hardlink();
+    case_link_pos();
     case_leader_read();
     case_link_sweep();
     case_promote_refused();

@@ -793,7 +793,7 @@ int replica_stage(eng *db, const char *name, const void *buf, size_t len)
     return rc;
 }
 
-int replica_missing(eng *db, char *name, size_t cap, uint64_t *size)
+int replica_missing(eng *db, uint64_t *pos, char *name, size_t cap, uint64_t *size)
 {
     struct replica *rp = db->rp;
     if (!rp)
@@ -808,6 +808,7 @@ int replica_missing(eng *db, char *name, size_t cap, uint64_t *size)
                 continue;
             snprintf(name, cap, "%s", f->name);
             *size = f->size;
+            *pos = rp->cm[i].first;
             found = 1;
             break;
         }
@@ -2254,7 +2255,7 @@ static void leader_links_note(eng *db, uint64_t fno, const uint64_t *keys, size_
         void *p = realloc(db->lf, c * sizeof *db->lf);
         if (!p) {
             pthread_mutex_unlock(&db->lead_mu);
-            return; /* they stay until the next attach: a leak, never a missing file */
+            return; /* they stay until the next attach (a leak), and are not served: a replica takes a snapshot */
         }
         db->lf = p;
         db->caplf = c;
@@ -2301,10 +2302,24 @@ void leader_links_sweep(eng *db)
     closedir(d);
 }
 
-int eng_leader_file_open(eng *db, const char *name)
+/* A file of the COMMIT marker at `pos`, by its name in the marker. Only a link this leadership noted for that very
+ * marker is served: names repeat across engines in one process (the tmp counter starts at 0 at every open, a pid
+ * repeats in a container), and a promoted leader keeps the replica-era segments, whose markers may name a file that a
+ * COMMIT of this leadership links under the same key; serving that one would stall a replica's catch-up on a file
+ * that fails its check, where NOTFOUND sends it to a snapshot (r3a2 R5). A link noted and then dropped with its
+ * segment between the lookup and the open is ENOENT: NOTFOUND too. */
+int eng_leader_file_open(eng *db, uint64_t pos, const char *name)
 {
+    const uint64_t key = stage_key(name);
+    bool noted = eng_test_mutant == MUT_LEADER_LINK_BY_NAME;
+    pthread_mutex_lock(&db->lead_mu);
+    for (size_t i = 0; i < db->nlf && !noted; i++)
+        noted = db->lf[i].fno == pos && db->lf[i].key == key;
+    pthread_mutex_unlock(&db->lead_mu);
+    if (!noted)
+        return TSDB_ERR_NOTFOUND;
     char sp[40];
-    stage_path(sp, sizeof sp, stage_key(name));
+    stage_path(sp, sizeof sp, key);
     int fd = openat(db->dirfd, sp, O_RDONLY | O_CLOEXEC);
     return fd >= 0 ? fd : errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
 }

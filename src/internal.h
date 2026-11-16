@@ -72,7 +72,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_NO_HARDLINK, MUT_PROMOTE_NO_CARRY, MUT_KEPT_REPLAYED, MUT_LEADER_KEPT_NOSAVE,
        MUT_LEADER_READ_NO_GAP, MUT_LEADER_READ_CURSOR_ANY, MUT_LEADER_READ_TAILOK_SEALED,
        MUT_LEADER_READ_NOTFOUND_SEALED, MUT_LEADER_NO_SWEEP, MUT_LEADER_B0_OFF,
-       MUT_REPLICA_APPLY_HOLDS_MU, MUT_REPLICA_PREP_NO_CUT_GEN, MUT_LEADER_DROP_UNHELD };
+       MUT_REPLICA_APPLY_HOLDS_MU, MUT_REPLICA_PREP_NO_CUT_GEN, MUT_LEADER_DROP_UNHELD,
+       MUT_LEADER_LINK_BY_NAME };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1510,9 +1511,10 @@ void eng_leader_keep(struct eng *db, uint64_t pos);
 /* A file a COMMIT marker of this leader names (`name`: the marker's name, p<partition>_<pid>_<n>_0.part), for a replica
  * that missed it: the leader keeps each hard linked as stage_<xxh64 of the name>.part (the name a replica stages it
  * under) from before its marker is appended until the retained segment that holds the marker goes (eng_leader_keep),
- * whatever merges did to the part since. An fd open for reading, or TSDB_ERR_NOTFOUND (the segment went: the replica
- * needs a snapshot). */
-int eng_leader_file_open(struct eng *db, const char *name);
+ * whatever merges did to the part since. `pos`: the marker's position; a link is served only for the marker that
+ * named it in this leadership. An fd open for reading, or TSDB_ERR_NOTFOUND (the segment went, or the marker is of
+ * an earlier leadership: the replica needs a snapshot). */
+int eng_leader_file_open(struct eng *db, uint64_t pos, const char *name);
 /* replica.c: the links of the files of COMMIT markers whose position is below fno_end go (their segment went;
  * flush_lock held); every stage_ file goes (eng_leader_attach: a writer keeps no stage of its own) */
 void leader_links_drop(struct eng *db, uint64_t fno_end);
