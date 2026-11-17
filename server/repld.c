@@ -32,7 +32,11 @@
  * fdatasync, design 5.1 step 2) to every peer whose cursor is at their start; a peer behind is caught up from the log
  * (replica_read, which on the writer reads its kept segments and the current one as far as it is written). A resync
  * moves the cursor back only once what was sent after it has had RESEND_MS to arrive: the core's heartbeat acks ask for
- * a resync every time, and in-flight records would otherwise be sent twice.
+ * a resync every time, and in-flight records would otherwise be sent twice. "Had time to arrive" is also the peer's
+ * acknowledged end standing still for LOST_MS while the cursor is ahead of it: under writes that never pause the fast
+ * path moves the cursor (and sent_ms) with every record, and a peer that refuses them all for a gap (a replica
+ * restarted below the cursor) was never sent the records it lacks (the merge's jepsen-cluster kill run: a replica's log
+ * stayed where it died for 30 minutes; rejoin, mutant fastride).
  *
  * rec_find answers from the driver's index of WAL record starts (fed by the leader's bytes and the replica's WRITEs,
  * built at open by reading the log), and (pos, 1) for a position the writer admitted but has not written yet.
@@ -46,7 +50,8 @@
  * `nofastpath` (records go out on the tick only; caught only by the latency bound TSDB_TEST_ACK_MS that
  * tests/repld_mutants.sh sets); `hbnoclamp` (a heartbeat names positions not sent yet) SURVIVES: no scenario delays a
  * link yet;
- * `nocursorup` never moves a peer's cursor up to what it acknowledged (repcheck's `stalesent` step catches it).
+ * `nocursorup` never moves a peer's cursor up to what it acknowledged (repcheck's `stalesent` step catches it);
+ * `fastride` moves the cursor back on a resync only once sent_ms is RESEND_MS old (rejoin).
  * `commitpastremoved` takes an ISR request as the record at once, before the metadata group commits it (isr),
  * `nominisr` never checks min_isr (minisr), `ackbelowminisr` hands the writer a commit point reached after a shrink
  * below min_isr (minisr), `nocap` keeps the leader's segments for a lagging replica without the caps repl_retain_mb and
@@ -99,6 +104,7 @@
 _Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member must be heard well within isr_lag_ms");
 #define NOW_EVERY_MS 1000 /* a leader's NOW markers (design-cluster.md 5.4): its replicas' retention clock lags by at most this */
 #define RESEND_MS 50
+#define LOST_MS 500 /* a peer's acknowledged end standing still this long with the cursor ahead: what was sent is lost */
 #define FETCH_LATE_MS 5000 /* fetchlate (tests) */
 #define READ_CAP (4u << 20)
 #define MAX_NODES 64
@@ -122,6 +128,8 @@ struct rpeer {
                         * marker whose file it has not staged, so the segment that holds the marker, and with it the
                         * link the file is fetched from, stays (its `written` passes the marker: replicate) */
     uint64_t gen;      /* the log link's connection the cursor was moved on */
+    uint64_t wrote, wrote_ms; /* the `written` of its last ACK, and when that last changed */
+    uint64_t ahead_ms; /* since when `sent` is past `wrote` (0: it is not): what was sent since has not arrived */
     int heard;
     uint64_t heard_ms; /* when a message of this volume last came from it (repld_unreachable) */
 };
@@ -213,7 +221,8 @@ enum {
     RM_SYNCBYREP,
     RM_INBOXWAITALL,
     RM_SHIPNOISR,
-    RM_KEEPWRITTEN
+    RM_KEEPWRITTEN,
+    RM_FASTRIDE
 };
 
 static struct {
@@ -576,6 +585,15 @@ static int send_records(struct rvol *rv, int to, uint64_t seq, uint64_t off, con
     return rc == PL_OK ? 0 : -1;
 }
 
+/* After `sent` or `wrote` changed: whether the cursor is ahead of what the peer acknowledged having, and since when */
+static void ahead_mark(struct rpeer *p, uint64_t now)
+{
+    if (p->sent <= p->wrote)
+        p->ahead_ms = 0;
+    else if (!p->ahead_ms)
+        p->ahead_ms = now;
+}
+
 /* Catch-up of the peers whose cursor is behind what the core wants them to have: one read per peer per call. */
 static void catch_up(struct rvol *rv, struct eng *db)
 {
@@ -593,6 +611,7 @@ static void catch_up(struct rvol *rv, struct eng *db)
         if (rc == 0 && len && p->sent + 1 == from && send_records(rv, i, seq, off, buf, len, from) == 0) {
             p->sent = last;
             p->sent_ms = now_ms();
+            ahead_mark(p, p->sent_ms);
         }
         free(buf);
     }
@@ -633,6 +652,7 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
             send_records(rv, i, seq, off, buf, len, first) == 0) {
             p->sent = last;
             p->sent_ms = now_ms();
+            ahead_mark(p, p->sent_ms);
         }
     }
     pthread_mutex_unlock(&rv->mu);
@@ -1398,12 +1418,21 @@ static void exec(struct rvol *rv, struct repl_action *a)
              * arrived after RESEND_MS) would otherwise leave it below what the peer holds for good, and once the
              * leader's log no longer starts there (the commit point let it drop those segments) the catch-up finds
              * nothing to read and the peer is never sent another record. */
-            if (p->acked > p->sent && a->msg.prev_pos >= p->acked && G.mutant != RM_NOCURSORUP)
+            uint64_t now = now_ms();
+            if (p->acked > p->sent && a->msg.prev_pos >= p->acked && G.mutant != RM_NOCURSORUP) {
                 p->sent = p->acked;
-            if (a->msg.prev_pos < p->sent && (now_ms() - p->sent_ms >= RESEND_MS || !p->heard)) {
+                ahead_mark(p, now);
+            }
+            /* sent past what it has, its end standing still for LOST_MS: what went out since did not arrive, however
+             * recently the fast path sent more (it refuses each for the gap). Far above a live peer's ack latency, so a
+             * slow peer is not sent its backlog twice */
+            int lost = p->ahead_ms && now - p->ahead_ms >= LOST_MS && now - p->wrote_ms >= LOST_MS &&
+                       G.mutant != RM_FASTRIDE;
+            if (a->msg.prev_pos < p->sent && (now - p->sent_ms >= RESEND_MS || lost || !p->heard)) {
                 p->sent = a->msg.prev_pos ? rec_start(rv, a->msg.prev_pos + 1) - 1 : 0;
                 if (p->sent > a->msg.prev_pos)
                     p->sent = a->msg.prev_pos;
+                ahead_mark(p, now);
             }
             if (a->upto <= a->msg.prev_pos) {
                 /* a heartbeat: the commit point, after what the peer has been sent */
@@ -1617,6 +1646,11 @@ static void handle(struct rvol *rv, struct item *it)
         struct rpeer *p = &rv->peer[from];
         p->acked = G.mutant == RM_KEEPWRITTEN ? rv->cur.m.written : rv->cur.m.durable;
         p->heard = 1;
+        if (rv->cur.m.written != p->wrote || !p->wrote_ms) {
+            p->wrote = rv->cur.m.written;
+            p->wrote_ms = now_ms();
+        }
+        ahead_mark(p, now_ms());
     }
     repl_recv(rv->core, &rv->cur.m);
     drain(rv);
@@ -1859,6 +1893,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "syncbyrep")      ? RM_SYNCBYREP
                : !strcmp(mu, "inboxwaitall")   ? RM_INBOXWAITALL
                : !strcmp(mu, "shipnoisr")      ? RM_SHIPNOISR
+               : !strcmp(mu, "fastride")       ? RM_FASTRIDE
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);

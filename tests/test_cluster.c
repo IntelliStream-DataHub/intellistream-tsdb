@@ -3666,13 +3666,14 @@ static void *flood_thread(void *a)
 {
     struct flood *f = a;
     while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) {
-        struct rep_writer w = {f->port, f->id, 1000000000LL * (f->rounds + 1), 0, 0, 0, 1000};
+        struct rep_writer w = {f->port, f->id, 1000000000LL * (__atomic_load_n(&f->rounds, __ATOMIC_RELAXED) + 1), 0, 0,
+                               0, 1000};
         rep_write_thread(&w);
         if (w.rc != 0) {
-            f->rc = w.rc;
+            __atomic_store_n(&f->rc, w.rc, __ATOMIC_RELEASE);
             break;
         }
-        f->rounds++;
+        __atomic_add_fetch(&f->rounds, 1, __ATOMIC_RELEASE); /* rejoin reads it while this runs */
     }
     return NULL;
 }
@@ -3871,6 +3872,79 @@ static void scen_backpressure(void)
     rep_same(n, "after a clean stop");
     printf("  a stalled replica drops frames past its inbox bound and catches up (%d rounds of writes), a large part is"
            " received into a file; every replica holds the leader's rows\n", rounds);
+}
+
+/* rejoin (the merge's jepsen-cluster kill run, 2026-11-17): a replica killed and restarted below what the leader sent
+ * it, while the writes never pause, joins the ISR again while they go on. The leader's fast path kept the peer's cursor at the live end, moving
+ * sent_ms with every record, so the restarted replica refused every APPEND for the gap and the driver never moved the
+ * cursor back to what it held (mutant fastride): in that run a replica's log stayed where it died for 30 minutes. */
+static void scen_rejoin(void)
+{
+    scenario("rejoin");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    await_isr(L, "plant", 3, 10000, "every replica up");
+    struct flood f = {cports[L], id, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, flood_thread, &f) != 0)
+        die("pthread_create");
+    struct timespec s1 = {1, 0};
+    nanosleep(&s1, NULL);
+    /* stopped first (SIGSTOP: its link stays up and the leader's records go into it until its queue is full), then
+     * killed while stopped: what was sent and never read is lost, so the replica comes back below the cursor */
+    int R = (L + 1) % 3;
+    pause_server(R, 1);
+    await_isr(L, "plant", 2, 10000, "a replica stopped under writes");
+    nanosleep(&s1, NULL);
+    signal_child(pids[R], SIGKILL);
+    if (waitpid(pids[R], NULL, 0) != pids[R])
+        die("waitpid %d: %s", (int)pids[R], strerror(errno));
+    pids[R] = 0;
+    stopped[R] = 0;
+    int r0 = __atomic_load_n(&f.rounds, __ATOMIC_RELAXED);
+    start(R);
+    uint64_t t0 = now_ms();
+    while (isr_of(L, "plant", NULL) != 3) {
+        if (__atomic_load_n(&f.rc, __ATOMIC_RELAXED))
+            die("a write while the replica was away: %s", ers(f.rc));
+        if (now_ms() - t0 > 30000)
+            die("the replica restarted under writes that never pause did not join the ISR again in 30 s (%d writes "
+                "since its restart)", __atomic_load_n(&f.rounds, __ATOMIC_RELAXED) - r0);
+        struct timespec ms = {0, 50000000};
+        nanosleep(&ms, NULL);
+    }
+    int joined = __atomic_load_n(&f.rounds, __ATOMIC_RELAXED) - r0;
+    __atomic_store_n(&f.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    if (f.rc != 0)
+        die("a write while the replica was away: %s", ers(f.rc));
+    if (joined < 5)
+        die("only %d writes went on between the restart and the join: the writes paused, so this proved nothing", joined);
+    tsdbc_close(c);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {(uint64_t)f.rounds * 1000, 0, 0, 0};
+    rep_same(wantr, "after a clean stop");
+    printf("  a replica killed and restarted under writes that never paused joined the ISR again in %" PRIu64 " ms (%d "
+           "writes in between); every replica holds the leader's rows\n", now_ms() - t0, joined);
 }
 
 /* The keep caps (design-cluster.md 8.3): a replica out of the ISR holds the leader's flushed segments only for
@@ -5471,7 +5545,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
