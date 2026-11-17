@@ -1052,6 +1052,12 @@ JEPSEN_SECONDS ?=
 # The outage nemesis's seeds: a seed fixes the fault schedule, so more seeds test more than repeats of one do (the weekly CI
 # run sets six; a run with a flapping domain spends minutes waiting for its 60 s, and what it does in them is the seed's).
 JEPSEN_OUTAGE_SEEDS ?= 1 2
+# The directory tier (R7; tests/jepsen/jepsen.c, --tier N: N stores, 3 = 2+1, 6 = 4+2): kill, power, eio and
+# settle-steps (a power cut at each step of a settle) on both workloads and both backends, under the eager policy, and
+# the run fails when nothing settled. Empty until the tree has settles (src/ names TSDB_SETTLE_MUTANT, r7-settle's
+# mutant): before that every tier run would fail its settle count, as it is meant to. JEPSEN_TIER= turns it off.
+JEPSEN_TIER ?= $(if $(shell grep -l TSDB_SETTLE_MUTANT src/*.c 2>/dev/null),3 6,)
+JEPSEN_TIER_SEEDS ?= 1 2
 # Then kv once more with login (--auth: USERS made by $(B)/tsdb, every client logs in at every reconnect) under kill
 # and one power seed, per backend.
 jsec = $(if $(JEPSEN_SECONDS),$(JEPSEN_SECONDS),$(1))
@@ -1064,6 +1070,17 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis eio   --seconds $(call jsec,20) \
 	        --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis pause --seconds $(call jsec,10) && \
+	    for n in $(JEPSEN_TIER); do \
+	        echo "== tsdbd --io $$io, workload $$wl, a tier of $$n stores" && \
+	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --tier $$n --nemesis kill \
+	            --seconds $(call jsec,20) && \
+	        for seed in $(JEPSEN_TIER_SEEDS); do \
+	            TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --tier $$n --nemesis power \
+	                --seconds $(call jsec,20) --seed $$seed --crashfs $(B)/libcrashfs.so && \
+	            TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --tier $$n --nemesis settle-steps \
+	                --seconds $(call jsec,30) --seed $$seed --crashfs $(B)/libcrashfs.so || exit 1; done && \
+	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --tier $$n --nemesis eio \
+	            --seconds $(call jsec,20) --crashfs $(B)/libcrashfs.so || exit 1; done && \
 	    if [ $$wl = kv ]; then \
 	        for seed in $(JEPSEN_OUTAGE_SEEDS); do \
 	            TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis outage --seconds $(call jsec,40) \
@@ -1091,7 +1108,7 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
 # power run, and a power run whose nemesis sleeps through its naps (--mutant-idle) fails too. A tsdbd with a stale
 # entry in its latest table (three mutants, built from a copy of the tree) fails the kv run's latest check.
-jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
+jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
 	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss'; then \
@@ -1130,6 +1147,28 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    if [ "$$a" != 150.750 ] || [ "$$b" != 0.000 ] || [ "$$c" != 140.250 ]; then \
 	        echo "jepsen-selftest: the scan of slow write probes in a server log is wrong ($$a $$b $$c)"; exit 1; fi; \
 	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
+	    d=$(JEPSEN_DIR)-selftest.tier; rm -rf $$d; mkdir -p $$d/tier; \
+	    (cd $$d && touch p0_1_1_0.part p0_2_3_1.ec p1_1_1_0.ec settled_p0_1_1_0.part retired_p0_1_1_0.part \
+	        retired_p2_1_1_0.ec tmp_1_1.part tier/p9_1_1_0.ec); \
+	    printf '%s\n' 'tsdb: x' 'tsdb: settled p0 (3 granules)' 'tsdb: settled p1' 'tsdb: unsettled' > $$d.log; \
+	    a=$$(./$(B)/jepsen --scan-tier $$d,$$d.log,'settled ' 2>&1); \
+	    if [ "$$a" != "2 1 1 2 2 3" ]; then echo "jepsen-selftest: the count of .ec, settled_ and retired_ files and settle lines is wrong ($$a)"; exit 1; fi; \
+	    out=$$(JEPSEN_TSDBD=tests/jepsen/nosettle-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill \
+	        --seconds 8 --tier 3 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'tier: 0 settle lines'; then \
+	        echo "jepsen-selftest: a tier run in which nothing settled went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    $(CC) -shared -fPIC -o $$d/fakestep.so tests/jepsen/fakestep.c -lpthread || exit 1; \
+	    out=$$(FAKE_SO=$$(realpath $$d)/fakestep.so FAKE_EXIT=_exit JEPSEN_TSDBD=tests/jepsen/fakestep-tsdbd.sh JEPSEN_MIN_SETTLES=1 \
+	        ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis settle-steps --crashfs $(B)/libcrashfs.so --seconds 25 --tier 3 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'crashfs did not roll back' || ! echo "$$out" | grep -q 'no .ec, settled_'; then \
+	        echo "jepsen-selftest: a settle step that ends with _exit (no power cut) and a tier with settle lines but no file went unnoticed (rc $$rc)"; \
+	        echo "$$out" | tail -n 20; exit 1; fi; \
+	    out=$$(FAKE_SO=$$(realpath $$d)/fakestep.so FAKE_EXIT=exit FAKE_FILES=1 JEPSEN_TSDBD=tests/jepsen/fakestep-tsdbd.sh JEPSEN_MIN_SETTLES=1 \
+	        ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis settle-steps --crashfs $(B)/libcrashfs.so --seconds 25 --tier 3 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -Eq 'ended there:.* [1-9][0-9]*/[1-9]'; then \
+	        echo "jepsen-selftest: the settle-steps nemesis fails a server that ends at its step with exit(99) (rc $$rc)"; \
+	        echo "$$out" | tail -n 20; exit 1; fi; \
+	    JEPSEN_REQUIRE_TIER=$(if $(strip $(JEPSEN_TIER)),1,0) tests/jepsen/mutant-settle.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a settle bug went unnoticed"; exit 1; }; \
 	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 
