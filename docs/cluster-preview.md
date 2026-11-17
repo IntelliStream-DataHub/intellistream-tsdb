@@ -388,10 +388,10 @@ for later.
 | Option | Default | Meaning |
 |---|---:|---|
 | `--replication N` | 3 | Copies of every volume. |
-| `--min-isr N` | 1 | Copies that must be in sync for a write to count. At most `--replication`. With fewer, writes are refused (`UNAVAILABLE`) and reads go on. |
+| `--min-isr N` | 1 | Copies that must be in sync for a write to count. At most `--replication`. With fewer, writes are refused (`UNAVAILABLE`) and reads go on. A write already sent when the set shrinks below it is held until the set grows again: the client sees no answer (its timeout, an unknown outcome), never a refusal. |
 | `--node-timeout-ms MS` | 3000 | A server is marked down after this long without a heartbeat. |
 | `--heartbeat-ms MS` | 500 | How often servers report. Below `--node-timeout-ms`. |
-| `--isr-lag-ms MS` | 1000 | A copy this far behind (or silent this long) leaves the in-sync set, and comes back once it has caught up. |
+| `--isr-lag-ms MS` | 1000 | A copy this far behind (or silent this long) leaves the in-sync set, and comes back once it has caught up. At least 500. |
 | `--out-after-s S` | 1800 | A server down this long is marked `out`. Stored; in the preview no server is ever marked `out`. |
 | `--voter-replace-s S` | 600 | A voter down this long is replaced by another member. |
 | `--voters N` | 5 | The most voters the group has (an even number counts as one less). |
@@ -404,9 +404,9 @@ for later.
 | `--drift-ppm N` | 500 | The clock drift every lease allows for. |
 | `--unanswered-ms MS` | 1000 | A copy kept in sync that does not answer a promotion is dropped after this. |
 | `--commit-interval-ms MS` | 5 | The commit point reaches the copies within this. |
-| `--repl-retain-mb MB` | 4096 | Log kept for a copy that fell behind, at most, per volume. A copy further behind needs a snapshot. |
+| `--repl-retain-mb MB` | 4096 | Log kept for a copy that fell behind, at most, per volume. A copy further behind needs a snapshot. The bound is per volume: a server leading V volumes may keep V times this, and a full disk stops the volume's writes for good (a failed log write is fail-stop), so leave room for it. |
 | `--repl-retain-s S` | 1800 | And for at most this long. |
-| `--idle-seal-ms MS` | 1000 | An idle leader closes its log segment after this. |
+| `--idle-seal-ms MS` | 1000 | An idle leader closes its log segment after this. At least 100. A volume written more slowly than once per this interval gets one small part per write on every copy until merges combine them (a write every 2 s: about 1800 parts an hour), and an idle leader syncs one small log record a second on each copy. Raise it for slow writers. |
 
 The design lists more commands (`node drain` and `out`, `volume move`, `user`, `restore`, `adopt` and
 others). They are not built: `tsdb cluster` prints what exists.
