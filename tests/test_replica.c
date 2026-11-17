@@ -2272,10 +2272,26 @@ static bool ro_same(xport *x, const char *rd, const char *what)
     return ok;
 }
 
+/* A replica whose MANIFEST names the wrong segments fails its own apply, and the leader's large write then waits for a
+ * commit point that never comes: without a deadline the case hangs until make test's timeout kills the whole binary
+ * with no line naming it (REVIEW F12, mutants roflushed and romanifest). */
+static void ro_open_timeout(int sig)
+{
+    (void)sig;
+    static const char msg[] = "FAIL: case_ro_open did not finish within its deadline (a replica's apply failed?)\n";
+    ssize_t w = write(2, msg, sizeof msg - 1);
+    (void)w;
+    _exit(1);
+}
+
 static void case_ro_open(void)
 {
     xport x;
     char rd[PATH_MAX];
+    struct sigaction sa = {.sa_handler = ro_open_timeout}, old;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM, &sa, &old);
+    alarm(getenv("TEST_RO_OPEN_DEADLINE") ? (unsigned)atoi(getenv("TEST_RO_OPEN_DEADLINE")) : 300);
     xp_start(&x, "ro");
     rdir(rd, sizeof rd, &x);
     xp_rows(&x, 0, 0, 10, 100), xp_rows(&x, 1, 0, 5, 300);
@@ -2298,6 +2314,8 @@ static void case_ro_open(void)
     x.rep = NULL;
     CHECK(ro_same(&x, rd, "RO: replica closed, read-only"));
     xp_stop(&x);
+    alarm(0);
+    sigaction(SIGALRM, &old, NULL);
 }
 
 /* a COMMIT whose files are not staged: not acknowledged, not applied, until they are */

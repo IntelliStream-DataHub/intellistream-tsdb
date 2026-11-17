@@ -3552,10 +3552,35 @@ static void scen_writerfail(void)
         die("volume add second: %s, number %" PRIu32, cluster_strerror(rc), num);
     for (int i = 0; i < 3; i++)
         await_open_gen((L + 2) % 3, "second", i, 1, 0);
-    stop(L, SIGTERM); /* a clean stop: the failed volume is no failure of the server */
+    /* the replicas are given no position past the failure: R1 has been resumed for a while (anything the driver still
+     * shipped would have reached it), more writes were refused meanwhile, and each replica holds the acknowledged row
+     * and at most the two whose outcome is unknown (5000, 6000), never a refused one */
+    for (int k = 0; k < 5; k++) {
+        tsdbc *c3 = client(L);
+        ts = 8000 + k;
+        if ((rc = tsdbc_insert_series(c3, id, &ts, &val, 1)) != TSDB_ERR_UNAVAILABLE)
+            die("write %d to the failed volume: %s, not UNAVAILABLE", k, ers(rc));
+        tsdbc_close(c3);
+        usleep(200000);
+    }
+    for (int i = 0; i < 3; i++)
+        stop(i, SIGTERM); /* a clean stop: the failed volume is no failure of the server */
+    for (int r = 0; r < 3; r++) {
+        if (r == L)
+            continue;
+        char dir[PATH_MAX + 80], vd[PATH_MAX + 120];
+        server_dir(r, dir, sizeof dir);
+        snprintf(vd, sizeof vd, "%s/v1", dir);
+        uint64_t rows, h;
+        if ((rc = cvol_digest(vd, rep_names, 1, &rows, &h)) != 0)
+            die("open %s read-only: %s", vd, ers(rc));
+        if (rows < 1 || rows > 3)
+            die("replica %d holds %" PRIu64 " rows: 1 was acknowledged, 3 written before the volume failed", r, rows);
+    }
     stop_all();
     printf("  a leader whose engine failed closes the connections of the writes in flight, answers UNAVAILABLE for "
-           "the volume, keeps its root, its vote and its other volumes and stops cleanly\n");
+           "the volume, keeps its root, its vote and its other volumes and stops cleanly; the replicas hold nothing "
+           "written after the failure\n");
 }
 
 /* writerdepose (M5, D13 with a healthy engine): the leader's driver fails the volume while its engine is fine

@@ -1629,7 +1629,8 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
     }
     pthread_mutex_unlock(&rp->mu);
     if (rc == 0 && fresh) /* readers of the directory start on the new segment, as at a writer's (mt_flush); no I/O
-                             under rp->mu. A failure fails the engine. */
+                             under rp->mu. A failed write fails the engine; NOMEM returns without (the record is
+                             durable, the caller stops the volume all the same). */
         rc = manifest_publish(db);
     return rc;
 }

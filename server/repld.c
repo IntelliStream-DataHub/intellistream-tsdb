@@ -43,7 +43,9 @@
  * volume's engine reachable (D13; test_cluster writerfail catches both); test_cluster repcheck catches `floornottold`
  * (a replica's saved floor never reaches its engine: its flushed segments stay), `unsureignored` (an unsure REPL taken
  * as it stands) and `admitnocheck` (no check of the core's position against the log number), and measures
- * `nofastpath` (records go out on the tick only) and `hbnoclamp` (a heartbeat names positions not sent yet);
+ * `nofastpath` (records go out on the tick only; caught only by the latency bound TSDB_TEST_ACK_MS that
+ * tests/repld_mutants.sh sets); `hbnoclamp` (a heartbeat names positions not sent yet) SURVIVES: no scenario delays a
+ * link yet;
  * `nocursorup` never moves a peer's cursor up to what it acknowledged (repcheck's `stalesent` step catches it).
  * Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first bulk file this process receives taken as staged but not kept, so its COMMIT marker finds
  * the file missing and FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER
@@ -1434,9 +1436,12 @@ int repld_open(const struct cluster_vol_rec *r)
          * at or past its end is saved (replica_floor_saved), so the log's start proves that floor. Left below it, the
          * core refuses the log ("the log starts above the commit floor") at this open and every later one. This save
          * makes the file trusted again (replfile_save clears the flag only with led = fence); kept set, every later
-         * open would take the group's epoch over its own fence again and say unsure forever. */
-        if (rv->log_start - 1 > rv->st.floor)
-            rv->st.floor = rv->log_start - 1;
+         * open would take the group's epoch over its own fence again and say unsure forever. Only the start of a
+         * segment proves it: with none left the start is the log's end + 1, taken from fno_next, which FNO can hold
+         * above every record this replica kept (a cut lowers fno_next in memory only), so the floor is left as the
+         * slot has it (the core refuses an open it cannot prove, never takes positions as committed). */
+        if (first && first - 1 > rv->st.floor)
+            rv->st.floor = first - 1;
         rv->st.unsure = false;
         rc = replfile_save(rv->rf, &rv->st);
         if (rc != 0) {
