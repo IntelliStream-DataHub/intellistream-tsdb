@@ -2845,6 +2845,8 @@ struct rep_writer {
     int count, done, rc;
     int big; /* > 0: one insert of this many rows instead of `count` single rows */
 };
+static int rep_timeout_ms; /* > 0: every answer to a rep_write_thread within this, or the write fails (a hang shows as
+                              a failure, not as a test that never ends) */
 
 /* small writes of one row each from another connection, while the main thread kills and restarts a replica */
 static void *rep_write_thread(void *a)
@@ -2854,6 +2856,8 @@ static void *rep_write_thread(void *a)
     w->rc = tsdbc_connect("127.0.0.1", w->port, &c);
     if (w->rc == 0) {
         tsdbc_set_retry(c, 0);
+        if (rep_timeout_ms > 0)
+            tsdbc_set_timeout(c, rep_timeout_ms);
         if (w->big > 0) {
             int64_t *ts = malloc((size_t)w->big * sizeof *ts);
             float *val = malloc((size_t)w->big * sizeof *val);
@@ -3334,6 +3338,7 @@ static int closegone_setup(const char *name, const char *env, tsdb_sid *id)
         die("the leader of plant is node %u", v.leader);
     tsdbc *c = client(L);
     tsdbc_set_retry(c, 0);
+    tsdbc_set_timeout(c, 20000); /* a commit point that never moves (writersync's mutant) fails, never hangs, the test */
     *id = rep_series(c, rep_names[0], "plant", 30000);
     float val = 1;
     for (int64_t ts = 1000; ts <= 2000; ts += 1000)
@@ -3418,6 +3423,55 @@ static void scen_closegone(void)
            " write waiting there, answered %s; its directory reads %" PRIu64 " rows); its WAL written after the driver"
            " stopped, in %d ms\n",
            ms1, ms2, ers(w.rc), lrows, ms3);
+}
+
+/* writersync: the writer's SYNC actions against its engine's own reports of a durable WAL. With concurrent writes the
+ * engine's group sync covers more than the SYNC in flight was issued for; the core caps what it is told at that SYNC's
+ * end and issues another, which the driver once answered only when the WAL had moved past its last report: it had
+ * not, so the core's durable end, and the commit point, stayed behind a durable WAL until a later record (backpressure
+ * hung there after its last write, its flusher waiting; mutant syncbyrep). Batches of eight connections writing single
+ * rows: at the end of a batch, or once every writer waits, nothing moves the WAL, since noclock turns the NOW markers
+ * and the idle seal off. The leader's log says the overtaking happened, or this case proved nothing. */
+static void scen_writersync(void)
+{
+    tsdb_sid id;
+    int L = closegone_setup("writersync", "TSDB_REPLD_TEST=noclock", &id);
+    enum { CONNS = 8, BATCHES = 10, MAX_BATCHES = 100, WRITES = 20 };
+    struct rep_writer w[CONNS];
+    pthread_t th[CONNS];
+    rep_timeout_ms = 5000;
+    uint64_t t0 = now_ms();
+    int b, seen = 0, seen_at = -1;
+    /* BATCHES at least, and on until the overtaking was seen (it is not seen in every run of ten) */
+    for (b = 0; b < MAX_BATCHES && (b < BATCHES || !seen); b++) {
+        for (int k = 0; k < CONNS; k++) {
+            w[k] = (struct rep_writer){cports[L], id, 100000000LL * (b * CONNS + k + 1), WRITES, 0, 0, 0};
+            if (pthread_create(&th[k], NULL, rep_write_thread, &w[k]) != 0)
+                die("pthread_create");
+        }
+        for (int k = 0; k < CONNS; k++)
+            pthread_join(th[k], NULL);
+        for (int k = 0; k < CONNS; k++)
+            if (w[k].rc != 0)
+                die("writersync: batch %d, a write from connection %d: %s (its commit point stayed below the "
+                    "leader's durable WAL?)", b, k, ers(w[k].rc));
+        if (!seen && (seen = log_has(L, "an engine sync went past the SYNC in flight")))
+            seen_at = b;
+    }
+    uint64_t ms = now_ms() - t0;
+    rep_timeout_ms = 0;
+    if (!seen)
+        die("writersync: no engine sync went past a SYNC in flight in %d batches (the case proved nothing)", b);
+    tsdbc *c = client(L);
+    int n = rows_of(c, id);
+    tsdbc_close(c);
+    if (n != 2 + CONNS * b * WRITES)
+        die("writersync: the leader reads %d rows, not %d", n, 2 + CONNS * b * WRITES);
+    stop_all();
+    for (int i = 0; i < 3; i++)
+        penv[i] = NULL;
+    printf("  %d batches of %d connections x %d single-row writes in %" PRIu64 " ms, the engine's syncs overtaking the"
+           " SYNC in flight first in batch %d\n", b, CONNS, WRITES, ms, seen_at);
 }
 
 /* shipstall (the r3d review's M2): a large write over ten partitions with a replica stopped (SIGSTOP: its links stay
@@ -4458,7 +4512,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {

@@ -46,7 +46,8 @@
  * an idle leader's last segment unsealed (no idle flush; the NOW markers go on) (idleseal). Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
  * bulk file this process receives taken as staged but not kept, so its COMMIT marker finds the file missing and
  * FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER (writes then reach
- * the new writer while the driver still promotes: they must be refused for a retry, never depose it).
+ * the new writer while the driver still promotes: they must be refused for a retry, never depose it); `noclock` has a
+ * leader write no NOW markers and no idle seal (writersync).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -135,6 +136,7 @@ struct rvol {
     uint64_t *coff; /* byte offset of each record of cur */
     int sync_wanted;
     uint64_t synced_rep; /* the writer: the last durable end handed to repl_synced */
+    int sync_said;       /* noclock's line, once */
     uint64_t cstall_at, cstall_ms; /* the writer: the commit point and since when it has not moved with writes above it */
     int cstall_said;
     uint64_t epoch_pos;  /* M_PROMOTING: the EPOCH marker's position */
@@ -156,7 +158,7 @@ struct rvol {
 
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
        RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL, RM_NOSPILL, RM_NOINBOXBOUND,
-       RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK, RM_STOPNODEPOSE, RM_LATECLOCK };
+       RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK, RM_STOPNODEPOSE, RM_LATECLOCK, RM_SYNCBYREP };
 
 static struct {
     pthread_mutex_t mu;
@@ -185,6 +187,9 @@ static struct {
                    * freeing the links, and a stopped driver admits records whatever its lease, so the engine's NOW
                    * markers reach the WAL hooks of a stopped driver (op_bytes says so once) */
     _Atomic int said_late; /* latewal's line, once */
+    int no_clock; /* TSDB_REPLD_TEST=noclock (tests only): a leader writes no NOW markers and seals nothing idle, so
+                   * only the clients' writes move its WAL (writersync), and says once when a SYNC finds the WAL
+                   * durable past the core's durable end */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -1206,10 +1211,21 @@ static void exec(struct rvol *rv, struct repl_action *a)
         if (rv->mode == M_WRITER) {
             db = tsdb_cvol_ref(G.t, rv->number);
             uint64_t d = db ? eng_wal_durable_fno(db) : 0;
-            if (d > rv->synced_rep) {
+            int fresh = d > rv->synced_rep;
+            if (fresh)
                 rv->synced_rep = d;
-                repl_synced(rv->core, d);
+            /* Compared with the core's durable end, never with synced_rep: op_synced may have handed the core a
+             * larger end while an earlier SYNC was in flight, which the core caps at that SYNC's end (and issues this
+             * one); were the end compared with synced_rep here, this SYNC would never be answered, and with no
+             * further write to sync the commit point would stay below a durable WAL for good (backpressure hung so) */
+            uint64_t have = repl_durable_end(rv->core);
+            if (G.no_clock && !fresh && d > have && !rv->sync_said) {
+                say("test: volume %" PRIu32 ": a SYNC finds the WAL durable to %" PRIu64 ", past the core's %" PRIu64
+                    " (an engine sync went past the SYNC in flight)", rv->number, d, have);
+                rv->sync_said = 1;
             }
+            if (G.mutant == RM_SYNCBYREP ? fresh : d > have)
+                repl_synced(rv->core, d);
         } else {
             rv->sync_wanted = 1;
         }
@@ -1247,7 +1263,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
             uint64_t floor = a->floor;
             pthread_mutex_unlock(&rv->mu);
             eng_leader_keep_cap(db, capb, capms);
-            eng_leader_clock(db, NOW_EVERY_MS, G.mutant == RM_NOSEAL ? 0 : rv->rec.idle_seal_ms);
+            eng_leader_clock(db, G.no_clock ? 0 : NOW_EVERY_MS,
+                             G.mutant == RM_NOSEAL || G.no_clock ? 0 : rv->rec.idle_seal_ms);
             eng_leader_keep_floor(db, keep, floor);
             pthread_mutex_lock(&rv->mu);
         } else if (a->floor) {
@@ -1322,7 +1339,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
              * applied records: an idle new leader sent no NOW markers at all. buf_lock is above rv->mu. */
             if (G.mutant != RM_LATECLOCK && (db = tsdb_cvol_ref(G.t, rv->number))) {
                 pthread_mutex_unlock(&rv->mu);
-                eng_leader_clock(db, NOW_EVERY_MS, G.mutant == RM_NOSEAL ? 0 : rv->rec.idle_seal_ms);
+                eng_leader_clock(db, G.no_clock ? 0 : NOW_EVERY_MS,
+                                 G.mutant == RM_NOSEAL || G.no_clock ? 0 : rv->rec.idle_seal_ms);
                 pthread_mutex_lock(&rv->mu);
             }
         }
@@ -1669,6 +1687,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "nologstartcheck") ? RM_NOLOGSTARTCHECK
                : !strcmp(mu, "stopnodepose")   ? RM_STOPNODEPOSE
                : !strcmp(mu, "lateclock")      ? RM_LATECLOCK
+               : !strcmp(mu, "syncbyrep")      ? RM_SYNCBYREP
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1676,6 +1695,7 @@ void repld_init(tsdb *t, const char *dir)
     G.drop_bulk = te && strstr(te, "dropbulk");
     G.promote_wait = te && strstr(te, "promotewait");
     G.late_wal = te && strstr(te, "latewal");
+    G.no_clock = te && strstr(te, "noclock");
     G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
     if (G.mutant == RM_NOINBOXBOUND)
         G.inbox_bytes = SIZE_MAX;

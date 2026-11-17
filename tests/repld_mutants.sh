@@ -8,7 +8,9 @@
 # noinboxbound (an unbounded inbox) and nospill (every bulk file whole in memory) backpressure, keepignorespeers (the
 # keep bound ignores what the replicas acked) keepfloor, nologstartcheck (the core never hears the log start moved)
 # keepcap, stopnodepose (the stop leaves the leader in place: a write waiting for its commit point holds the
-# shutdown), lateclock (a new leader starts its NOW markers only at its first SAVE as a writer) closegone.
+# shutdown), lateclock (a new leader starts its NOW markers only at its first SAVE as a writer) closegone,
+# syncbyrep (a writer's SYNC answered only when the WAL moved past the engine's last report; a race: not in the
+# default list, writersync and backpressure under load catch it only sometimes) writersync.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -18,7 +20,7 @@ export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd}
 survived=
 for m in $muts; do
     caught=
-    case $m in commitpastremoved) scens=isr ;; nominisr|ackbelowminisr) scens=minisr ;; shipperfile) scens=shipstall ;; nocap) scens=keepcap ;; noseal) scens=idleseal ;; noinboxbound|nospill) scens=backpressure ;; keepignorespeers) scens=keepfloor ;; nologstartcheck) scens=keepcap ;; stopnodepose|lateclock) scens=closegone ;; *) scens="replindet replicate" ;; esac
+    case $m in commitpastremoved) scens=isr ;; nominisr|ackbelowminisr) scens=minisr ;; shipperfile) scens=shipstall ;; nocap) scens=keepcap ;; noseal) scens=idleseal ;; noinboxbound|nospill) scens=backpressure ;; keepignorespeers) scens=keepfloor ;; nologstartcheck) scens=keepcap ;; stopnodepose|lateclock) scens=closegone ;; syncbyrep) scens=writersync ;; *) scens="replindet replicate" ;; esac
     for s in $scens; do
         if ! TSDB_REPLD_MUTANT=$m timeout 600 ./build/test_cluster "$dir" $s > "$dir/mut-$m-$s.log" 2>&1; then
             caught=$s
