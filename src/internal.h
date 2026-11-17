@@ -1400,8 +1400,13 @@ struct jr_ops {
     void *ctx;
     /* sends the pending file `file` (the leader's tmp name, `size` bytes, in the volume directory) to every replica of
      * the ISR, which stages and syncs it under `mname` (replica_stage): the name the marker carries, a part name
-     * p<partition>_<pid>_<n>_0.part (the partition is in no part file); returns when they have */
+     * p<partition>_<pid>_<n>_0.part (the partition is in no part file); returns when they have, or (a driver with
+     * ship_wait) once the file is queued to them */
     int (*ship)(void *ctx, struct eng *db, const char *file, const char *mname, uint64_t size);
+    /* May be NULL. Called once after the last ship of a COMMIT (`failed`: a ship or a link failed, the COMMIT is not
+     * appended): a driver whose ship only queues the file waits here for the COMMIT's files under one deadline (and
+     * lets go of them when `failed`); past it the marker goes out and a replica without a file fetches it. */
+    int (*ship_wait)(void *ctx, struct eng *db, int failed);
     /* the marker whose last position is `last` is durable at the leader: returns once the commit point passed it (the
      * driver's view), or an error (nothing is then published). May be NULL. The engine then waits for its own copy of
      * the commit point (eng_leader_commit) in any case: that wait is what a deposed leader ends (eng_leader_depose).

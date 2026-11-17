@@ -3275,6 +3275,71 @@ static void scen_minisr(void)
            " shrink waits for the ISR to grow; above it writes go on\n");
 }
 
+/* shipstall (the r3d review's M2): a large write over ten partitions with a replica stopped (SIGSTOP: its links stay
+ * up, no DONE comes back) waits for its files under one deadline per COMMIT, and not past the moment the stopped
+ * replica leaves the ISR; it used to wait 30 s per file (mutant shipperfile). Running again, the replica fetches what
+ * it missed, joins the ISR and holds the leader's rows. */
+static void scen_shipstall(void)
+{
+    scenario("shipstall");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts1 = 1000;
+    float val1 = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts1, &val1, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    await_isr(0, "plant", 3, 5000, "every replica up");
+
+    enum { BIG = 100000 };
+    int64_t *ts = malloc(BIG * sizeof *ts);
+    float *val = malloc(BIG * sizeof *val);
+    if (!ts || !val)
+        die("out of memory");
+    for (int j = 0; j < BIG; j++) /* ten days from 2024-01-01: ten partitions, ten files in one COMMIT */
+        ts[j] = 1704067200000LL + 8640LL * j, val[j] = (float)(j % 977);
+    int R = (L + 1) % 3;
+    pause_server(R, 1);
+    uint64_t t0 = now_ms();
+    if ((rc = tsdbc_insert_series(c, id, ts, val, BIG)) != 0)
+        die("a large write with a replica stopped: %s", ers(rc));
+    uint64_t took = now_ms() - t0;
+    free(ts);
+    free(val);
+    if (took > 15000)
+        die("a large write over ten partitions with a replica stopped took %" PRIu64 " ms (30 s per file?)", took);
+    await_isr(0, "plant", 2, 10000, "a replica stopped under a large write");
+    pause_server(R, 0);
+    await_isr(0, "plant", 3, 30000, "the stopped replica continued");
+    uint64_t rows = 1 + BIG;
+    if ((uint64_t)rows_of(c, id) != rows)
+        die("the leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
+    tsdbc_close(c);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {rows, 0, 0, 0};
+    rep_same(wantr, "after a clean stop");
+    printf("  a large write with a replica stopped took %" PRIu64 " ms; the replica caught up and holds its rows\n",
+           took);
+}
+
 /* replindet (D12): a replicated write whose outcome is unknown (appended on the leader, which then stops, deposing
  * itself, before the commit point passed it) never reaches the client as TSDB_ERR_INDETERMINATE (-110) or as a
  * refusal: tsdbd closes the connection without an answer, and the client sees a lost connection (TSDB_ERR_IO). */
@@ -3878,7 +3943,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {

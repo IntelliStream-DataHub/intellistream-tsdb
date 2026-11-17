@@ -2438,6 +2438,11 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
                 rc = TSDB_ERR_IO;
         }
     }
+    if (jr->ship_wait) {
+        int wr = jr->ship_wait(jr->ctx, db, rc != 0);
+        if (rc == 0)
+            rc = wr;
+    }
     /* The links are named before the marker can be durable anywhere: a leader that loses power after its marker and
      * before parts_commit has its tmp_ files removed by the open (load_parts, db.c), and reopened as a replica
      * (design-cluster.md 6.3) it applies the marker from these, as any replica does from what it staged. */

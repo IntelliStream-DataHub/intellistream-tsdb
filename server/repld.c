@@ -140,7 +140,7 @@ struct rvol {
 };
 
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
-       RM_ACKBELOWMINISR };
+       RM_ACKBELOWMINISR, RM_SHIPPERFILE };
 
 static struct {
     pthread_mutex_t mu;
@@ -576,11 +576,19 @@ static void op_synced(void *ctx, struct eng *db, uint64_t last)
 
 /* ------------------------------------------------------------------ bulk files */
 
-/* The jobs of one file to its peers. `detached`: nobody waits; the last `done` closes fd and frees it. */
+/* The jobs of one file to its peers. `detached`: nobody waits; the last `done` closes fd and frees it. `pend[i]`: the
+ * jobs not done to the replica at record position i. */
 struct shipwait {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int pending, failed, detached, fd;
+    int pend[META_REPLICAS_MAX];
+};
+
+/* a job's `arg`: its file and the peer it goes to (freed by ship_done) */
+struct shipjob {
+    struct shipwait *w;
+    int peer;
 };
 
 static struct shipwait *ship_new(int fd)
@@ -616,62 +624,147 @@ static void ship_detach(struct shipwait *w)
 static void ship_done(void *arg, uint64_t file, int status, uint64_t sent)
 {
     (void)file, (void)sent;
-    struct shipwait *w = arg;
+    struct shipjob *j = arg;
+    struct shipwait *w = j->w;
     pthread_mutex_lock(&w->mu);
     int last = --w->pending == 0 && w->detached;
+    w->pend[j->peer]--;
     if (status != PL_OK)
         w->failed++;
     pthread_cond_broadcast(&w->cv);
     pthread_mutex_unlock(&w->mu);
+    free(j);
     if (last)
         ship_free(w);
 }
 
-/* Sends the file (fd, size) under marker name `mname` to `to` (a node index), or to every other replica (-1). With
- * `wait`, returns once each has answered or after 30 s (a peer that did not stage it fetches it, replica_missing). */
+/* Sends the file (fd, size) under marker name `mname` to `to` (a node index), or to every other replica (-1); w
+ * counts the jobs (a peer that did not stage it fetches it later, replica_missing). */
 static void bulk_out(struct rvol *rv, int fd, uint64_t size, const char *mname, int to, struct shipwait *w)
 {
     uint8_t meta[PL_META_MAX];
     size_t ml = rw_encode_bulk_meta(meta, sizeof meta, rv->number, size, mname);
     if (!ml)
         return;
-    for (int i = 0; i < (int)rv->rec.nrep; i++) {
+    for (int i = 0; i < (int)rv->rec.nrep && i < META_REPLICAS_MAX; i++) {
         if (i == rv->self || (to >= 0 && i != to))
             continue;
         struct plink *l = link_of(rv->rec.rep[i].node, 1);
-        if (!l)
+        struct shipjob *sj = l ? malloc(sizeof *sj) : NULL;
+        if (!sj)
             continue;
+        *sj = (struct shipjob){w, i};
         pthread_mutex_lock(&G.mu);
         uint64_t file = ++G.fileno;
         pthread_mutex_unlock(&G.mu);
         struct pl_job j = {.file = file, .fd = fd, .base = 0, .length = size, .meta = meta, .meta_len = ml,
-                           .max_attempts = 3, .done = ship_done, .arg = w};
+                           .max_attempts = 3, .done = ship_done, .arg = sj};
         pthread_mutex_lock(&w->mu);
         w->pending++;
+        w->pend[i]++;
         pthread_mutex_unlock(&w->mu);
         if (plink_bulk_send(l, &j) != PL_OK) {
             pthread_mutex_lock(&w->mu);
             w->pending--;
+            w->pend[i]--;
             pthread_mutex_unlock(&w->mu);
+            free(sj);
         }
     }
 }
 
-static void wait_ship(struct shipwait *w, int ms)
+/* One COMMIT's files (M2 of the r3d review). op_ship queues a file to every replica and returns; op_ship_wait, after
+ * the COMMIT's last file, waits for all of them under one deadline: SHIP_BASE_MS (or twice isr_lag_ms, if more) plus
+ * the bytes at SHIP_MIN_BPS, from the first file's send. It also stops waiting for a replica the ISR no longer holds.
+ * Past the deadline the marker goes out anyway: the transfers go on (the last done closes the file), a replica that
+ * has not staged a file fetches it when it applies the marker (replica_missing), and one that cannot keep up lags
+ * behind the marker and leaves the ISR by the core's rule (isr_lag). Waiting 30 s per file, as before, held jr_serial
+ * and the large write's fence N x 30 s for a stopped replica. The batch is per thread: the engine calls ship and
+ * ship_wait on the writer's thread, one COMMIT at a time. */
+enum { SHIP_BASE_MS = 3000 };
+#define SHIP_MIN_BPS (32ull << 20)
+
+static __thread struct shipbatch {
+    struct rvol *rv;
+    struct shipwait **w;
+    size_t n, cap;
+    uint64_t bytes, t0;
+} tl_ship;
+
+/* holds rv->mu: whether the replica at record position i is in the ISR the record names */
+static int in_isr_locked(const struct rvol *rv, int i)
 {
-    struct timespec dl;
-    clock_gettime(CLOCK_REALTIME, &dl);
-    dl.tv_sec += ms / 1000;
-    pthread_mutex_lock(&w->mu);
-    while (w->pending > 0 && pthread_cond_timedwait(&w->cv, &w->mu, &dl) != ETIMEDOUT)
-        ;
-    pthread_mutex_unlock(&w->mu);
+    for (uint32_t k = 0; k < rv->rec.nisr && k < META_REPLICAS_MAX; k++)
+        if (rv->rec.isr[k] == rv->rec.rep[i].node)
+            return 1;
+    return 0;
 }
 
-/* jr_ops.ship: the pending part file of a COMMIT, staged by every replica it reaches (on the writer's thread) */
+/* Waits for w's jobs to the replicas still in the ISR until `deadline` (now_ms); 1 when they are all done. */
+static int ship_wait_one(struct rvol *rv, struct shipwait *w, uint64_t deadline)
+{
+    for (;;) {
+        uint32_t isr = 0;
+        pthread_mutex_lock(&rv->mu);
+        for (int i = 0; i < (int)rv->rec.nrep && i < META_REPLICAS_MAX; i++)
+            if (in_isr_locked(rv, i))
+                isr |= 1u << i;
+        pthread_mutex_unlock(&rv->mu);
+        pthread_mutex_lock(&w->mu);
+        int left = 0;
+        for (int i = 0; i < META_REPLICAS_MAX; i++)
+            if (w->pend[i] > 0 && (isr & (1u << i)))
+                left++;
+        uint64_t now = now_ms();
+        if (!left || now >= deadline) {
+            pthread_mutex_unlock(&w->mu);
+            return !left;
+        }
+        /* woken by a done; the ISR is looked at again every 100 ms */
+        uint64_t slice = deadline - now < 100 ? deadline - now : 100;
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += (long)(slice * 1000000);
+        dl.tv_sec += dl.tv_nsec / 1000000000;
+        dl.tv_nsec %= 1000000000;
+        pthread_cond_timedwait(&w->cv, &w->mu, &dl);
+        pthread_mutex_unlock(&w->mu);
+    }
+}
+
+static void ship_batch_end(int wait)
+{
+    struct shipbatch *b = &tl_ship;
+    uint64_t span = 2ull * (b->rv && b->rv->rec.isr_lag_ms ? b->rv->rec.isr_lag_ms : 1000);
+    uint64_t deadline = b->t0 + (span > SHIP_BASE_MS ? span : SHIP_BASE_MS) + b->bytes * 1000 / SHIP_MIN_BPS;
+    int late = 0;
+    for (size_t i = 0; i < b->n; i++) {
+        if (wait && !ship_wait_one(b->rv, b->w[i], deadline))
+            late++;
+        ship_detach(b->w[i]); /* a job still queued reads fd later: the last done closes it */
+    }
+    if (late)
+        say("volume %" PRIu32 ": %d of %zu files of a COMMIT not staged by every ISR member in %" PRIu64
+            " ms: the marker goes out, a replica without one fetches it", b->rv->number, late, b->n,
+            deadline - b->t0);
+    free(b->w);
+    *b = (struct shipbatch){0};
+}
+
+/* jr_ops.ship: the pending part file of a COMMIT, queued to every replica (on the writer's thread) */
 static int op_ship(void *ctx, struct eng *db, const char *file, const char *mname, uint64_t size)
 {
     struct rvol *rv = ctx;
+    struct shipbatch *b = &tl_ship;
+    if (b->n && b->rv != rv)
+        ship_batch_end(0); /* a batch left by an engine that never called ship_wait: not waited for */
+    if (b->n == b->cap) {
+        size_t cap = b->cap ? 2 * b->cap : 16;
+        struct shipwait **nw = realloc(b->w, cap * sizeof *nw);
+        if (!nw)
+            return TSDB_ERR_NOMEM;
+        b->w = nw, b->cap = cap;
+    }
     int fd = openat(db->dirfd, file, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return TSDB_ERR_IO;
@@ -680,11 +773,33 @@ static int op_ship(void *ctx, struct eng *db, const char *file, const char *mnam
         close(fd);
         return TSDB_ERR_NOMEM;
     }
+    if (!b->n)
+        b->rv = rv, b->t0 = now_ms(), b->bytes = 0;
+    b->w[b->n++] = w;
+    b->bytes += size;
     pthread_mutex_lock(&rv->mu);
     bulk_out(rv, fd, size, mname, -1, w);
     pthread_mutex_unlock(&rv->mu);
-    wait_ship(w, 30000);
-    ship_detach(w); /* a job still queued reads fd later: the last done closes it */
+    if (G.mutant == RM_SHIPPERFILE) { /* planted: the code before the review's M2, 30 s for each file */
+        pthread_mutex_lock(&w->mu);
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += 30;
+        while (w->pending > 0 && pthread_cond_timedwait(&w->cv, &w->mu, &dl) != ETIMEDOUT)
+            ;
+        pthread_mutex_unlock(&w->mu);
+    }
+    return 0;
+}
+
+/* jr_ops.ship_wait: after a COMMIT's last ship (and after a failed one): the one wait of the batch */
+static int op_ship_wait(void *ctx, struct eng *db, int failed)
+{
+    (void)db;
+    if (tl_ship.n && tl_ship.rv == ctx)
+        ship_batch_end(!failed);
+    else if (tl_ship.n)
+        ship_batch_end(0);
     return 0;
 }
 
@@ -1350,6 +1465,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "commitpastremoved") ? RM_COMMITPASTREMOVED
                : !strcmp(mu, "nominisr")       ? RM_NOMINISR
                : !strcmp(mu, "ackbelowminisr") ? RM_ACKBELOWMINISR
+               : !strcmp(mu, "shipperfile")    ? RM_SHIPPERFILE
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1374,7 +1490,7 @@ int repld_open(const struct cluster_vol_rec *r)
     rv->nnodes = (int)r->nrep;
     pthread_mutex_init(&rv->mu, NULL);
     pthread_cond_init(&rv->cv, NULL);
-    rv->ops = (struct jr_ops){.ctx = rv, .ship = op_ship, .admit = op_admit, .bytes = op_bytes, .synced = op_synced};
+    rv->ops = (struct jr_ops){.ctx = rv, .ship = op_ship, .ship_wait = op_ship_wait, .admit = op_admit, .bytes = op_bytes, .synced = op_synced};
     int dfd = open(rv->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     bool torn = false;
     int rc = dfd < 0 ? TSDB_ERR_IO : replfile_load(dfd, &rv->rf, &rv->st, &torn);
