@@ -14,6 +14,14 @@
  *  - rewrite: two whole sectors of a synced file rewritten in place through an O_WRONLY descriptor: each sector is
  *             all old or all new, the rest and the size are untouched;
  *  - own:     the same cut on a file the child made and fsynced itself.
+ * and in every mode (CRASHFS_TEAR=1, none, REWRITE=old; round 13: the default mode gives old bytes, never zeros, for what was rewritten):
+ *  - rename_sync:    a file written and fsynced, renamed (directory synced), then appended to and fsynced through the descriptor that
+ *                    is still open on it: all 200 bytes are durable (VERIFY12: the shim credited the sync to the old name, and a
+ *                    power loss cut the fsynced append: a false loss)
+ *  - rename_newfile: the same, with a new file made at the old name before the fsync (the sync was credited to that file)
+ *  - maxdirty:       17 one-byte rewrites of a synced 8 KiB file between two syncs: no byte nobody rewrote changes (a list of 16
+ *                    regions once zeroed everything from the last one on), and a rewritten byte is old or new, never blank
+ *                    (CRASHFS_REWRITE=zero, the harsh mode, zeroes only what was rewritten)
  * Usage: test_crashfs_old LIBCRASHFS.so DIR [SEEDS]
  */
 #define _GNU_SOURCE
@@ -117,7 +125,7 @@ static int child(const char *kind, const char *dir, unsigned long seed)
     return 3;
 }
 
-static int run_case(const char *so, const char *kind, const char *dir, unsigned long seed)
+static int run_case(const char *so, const char *kind, const char *dir, unsigned long seed, int tear)
 {
     char path[4400];
     snprintf(path, sizeof path, "%s/f", dir);
@@ -141,7 +149,7 @@ static int run_case(const char *so, const char *kind, const char *dir, unsigned 
         snprintf(sd, sizeof sd, "CRASHFS_SEED=%lu", seed);
         char sdl[64];
         snprintf(sdl, sizeof sdl, "%lu", seed);
-        char *envp[] = {ld, root, sd, "CRASHFS_TEAR=1", "CRASHFS_PROB=0", NULL};
+        char *envp[] = {ld, root, sd, tear ? "CRASHFS_TEAR=1" : "CRASHFS_X=1", "CRASHFS_PROB=0", NULL};
         argv[0] = "test_crashfs_old";
         argv[1] = "--child";
         argv[2] = (char *)kind;
@@ -186,10 +194,147 @@ static int run_case(const char *so, const char *kind, const char *dir, unsigned 
     return 0;
 }
 
+/* the attack cases of round 13 (VERIFY12 (B), chk/cfattack.c): contents of 8 KiB, A for the synced bytes, B for the rewrites */
+static unsigned char CA[8192], CB[8192];
+static void cfill(unsigned char *b, int n, unsigned char base)
+{
+    for (int i = 0; i < n; i++)
+        b[i] = (unsigned char)(base + i % 200 + 1);
+}
+static void wr(int fd, const void *b, size_t n)
+{
+    if (write(fd, b, n) != (ssize_t)n)
+        _exit(6);
+}
+static void dsync(const char *dir)
+{
+    int d = open(dir, O_RDONLY | O_DIRECTORY);
+    if (d >= 0) {
+        fsync(d);
+        close(d);
+    }
+}
+static void np(const char *dir, const char *n, char *out) { snprintf(out, 4400, "%s/%s", dir, n); }
+
+static int child2(const char *kind, const char *dir)
+{
+    char a[4400], b[4400];
+    cfill(CA, sizeof CA, 10);
+    cfill(CB, sizeof CB, 77);
+    if (!strcmp(kind, "rename_sync") || !strcmp(kind, "rename_newfile")) {
+        np(dir, "a", a);
+        np(dir, "b", b);
+        int fd = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0)
+            return 2;
+        wr(fd, CA, 100);
+        fsync(fd);
+        dsync(dir);
+        rename(a, b);
+        dsync(dir);
+        if (!strcmp(kind, "rename_newfile")) {
+            int n = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            wr(n, CB, 50);
+            dsync(dir);
+        }
+        wr(fd, CA + 100, 100);
+        fsync(fd);
+    } else { /* maxdirty */
+        np(dir, "m", a);
+        int fd = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0)
+            return 2;
+        wr(fd, CA, 8192);
+        fsync(fd);
+        dsync(dir);
+        for (int i = 0; i < 17; i++)
+            if (pwrite(fd, CB, 1, (off_t)i * 64) != 1)
+                return 2;
+    }
+    pull(dir);
+    return 3;
+}
+
+static long slurp(const char *p, unsigned char *buf, size_t cap)
+{
+    int fd = open(p, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    long n = read(fd, buf, cap);
+    close(fd);
+    return n;
+}
+
+/* mode: "tear", "plain", "old" or "zero" */
+static void run_case2(const char *so, const char *kind, const char *mode, const char *dir, unsigned long seed)
+{
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+        failures++;
+        return;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0)
+            dup2(nul, 2);
+        char ld[4300], root[4300], sd[64], *argv[5];
+        snprintf(ld, sizeof ld, "LD_PRELOAD=%s", so);
+        snprintf(root, sizeof root, "CRASHFS_ROOT=%s", dir);
+        snprintf(sd, sizeof sd, "CRASHFS_SEED=%lu", seed);
+        const char *m = !strcmp(mode, "tear") ? "CRASHFS_TEAR=1" : !strcmp(mode, "old") ? "CRASHFS_REWRITE=old"
+                        : !strcmp(mode, "zero") ? "CRASHFS_REWRITE=zero" : "CRASHFS_X=1";
+        char *envp[] = {ld, root, sd, (char *)m, "CRASHFS_PROB=0", NULL};
+        argv[0] = "test_crashfs_old";
+        argv[1] = "--child2";
+        argv[2] = (char *)kind;
+        argv[3] = (char *)dir;
+        argv[4] = NULL;
+        execve("/proc/self/exe", argv, envp);
+        _exit(2);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid) {
+        failures++;
+        return;
+    }
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 99, "%s/%s seed %lu: the child ended with status 0x%x, not the loss's 99", kind, mode, seed, st);
+    static unsigned char got[16384];
+    char p[4400];
+    long n;
+    if (!strcmp(kind, "rename_sync") || !strcmp(kind, "rename_newfile")) {
+        np(dir, "b", p);
+        n = slurp(p, got, sizeof got);
+        CHECK(n == 200 && memcmp(got, CA, 200) == 0, "%s/%s seed %lu: b has %ld bytes, 200 were fsynced (through the descriptor opened before the rename)",
+              kind, mode, seed, n);
+        if (!strcmp(kind, "rename_newfile")) {
+            np(dir, "a", p);
+            n = slurp(p, got, sizeof got);
+            CHECK(n == 50 || n == 0 || n == -1, "%s/%s seed %lu: a (made at the old name, never synced) has %ld bytes", kind, mode, seed, n);
+        }
+        return;
+    }
+    np(dir, "m", p);
+    n = slurp(p, got, sizeof got);
+    CHECK(n == 8192, "maxdirty/%s seed %lu: the file has %ld bytes, 8192", mode, seed, n);
+    for (long i = 0; i < n && n == 8192; i++) {
+        int rew = i % 64 == 0 && i / 64 < 17;
+        if (!rew && got[i] != CA[i]) {
+            CHECK(0, "maxdirty/%s seed %lu: byte %ld, which nobody rewrote, is %d (synced %d)", mode, seed, i, got[i], CA[i]);
+            break;
+        }
+        if (rew && strcmp(mode, "zero") && got[i] != CA[i] && got[i] != CB[0]) {
+            CHECK(0, "maxdirty/%s seed %lu: rewritten byte %ld is %d, neither the synced %d nor the new %d", mode, seed, i, got[i], CA[i], CB[0]);
+            break;
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 5 && !strcmp(argv[1], "--child"))
         return child(argv[2], argv[3], strtoul(argv[4], NULL, 10));
+    if (argc >= 4 && !strcmp(argv[1], "--child2"))
+        return child2(argv[2], argv[3]);
     if (argc < 3) {
         fprintf(stderr, "usage: %s LIBCRASHFS.so DIR [SEEDS]\n", argv[0]);
         return 2;
@@ -206,23 +351,35 @@ int main(int argc, char **argv)
         printf("test_crashfs_old: skipped: crashfs cannot be preloaded into a sanitizer build\n");
         return 0;
     }
+    cfill(CA, sizeof CA, 10);
+    cfill(CB, sizeof CB, 77);
     unsigned long seeds = argc > 3 ? strtoul(argv[3], NULL, 10) : 120;
     char base[2048];
     snprintf(base, sizeof base, "%s/crashfs_old.%d", argv[2], (int)getpid());
     if (mkdir(base, 0755) != 0)
         return 2;
     static const char *kinds[] = {"cut", "rewrite", "own"};
-    for (unsigned long seed = 1; seed <= seeds && failures < 10; seed++)
-        for (int k = 0; k < 3; k++) {
-            char dir[3000];
-            snprintf(dir, sizeof dir, "%s/%s%lu", base, kinds[k], seed);
-            if (run_case(argv[1], kinds[k], dir, seed) != 0) {
-                fprintf(stderr, "FAIL: could not set up %s seed %lu\n", kinds[k], seed);
-                return 2;
+    for (unsigned long seed = 1; seed <= seeds && failures < 10; seed++) {
+        for (int tear = 0; tear < 2; tear++) /* the default mode (old bytes back) and the tear mode (old or new, each sector) */
+            for (int k = 0; k < 3; k++) {
+                char dir[3000];
+                snprintf(dir, sizeof dir, "%s/%s%d_%lu", base, kinds[k], tear, seed);
+                if (run_case(argv[1], kinds[k], dir, seed, tear) != 0) {
+                    fprintf(stderr, "FAIL: could not set up %s seed %lu\n", kinds[k], seed);
+                    return 2;
+                }
             }
-            if (failures >= 10)
-                break;
-        }
+        static const char *k2[] = {"rename_sync", "rename_newfile", "maxdirty"};
+        static const char *m2[] = {"plain", "tear", "old", "zero"};
+        for (int k = 0; k < 3; k++)
+            for (int m = 0; m < 4; m++) {
+                if (m == 3 && k != 2)
+                    continue; /* the harsh mode zeroes what was rewritten: nothing to say about a rename */
+                char dir[3000];
+                snprintf(dir, sizeof dir, "%s/%s-%s%lu", base, k2[k], m2[m], seed);
+                run_case2(argv[1], k2[k], m2[m], dir, seed);
+            }
+    }
     char cmd[4300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", base);
     if (system(cmd) != 0) {
@@ -231,6 +388,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "test_crashfs_old: %d failure(s)\n", failures);
         return 1;
     }
-    printf("test_crashfs_old: %lu seeds x 3 cases: a power loss gives back the synced content\n", seeds);
+    printf("test_crashfs_old: %lu seeds x (cut, rewrite, own in two modes; rename_sync, rename_newfile, maxdirty in every mode): a power loss gives back the synced content\n", seeds);
     return 0;
 }

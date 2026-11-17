@@ -8,10 +8,11 @@
  *    regions rewritten in place since then are dirty;
  *  - creating, renaming and removing a directory entry is durable only after
  *    an fsync of that directory.
- * On a "power loss" it truncates every file to its durable size, zeroes the
- * dirty regions (harsher than a real disk, which keeps old or new pages),
- * undoes every directory change that was not made durable, newest first, and
- * exits at once.
+ * On a "power loss" it truncates every file to its durable size, gives the
+ * dirty regions their old bytes back (a real disk keeps old or new pages of a
+ * sector it was rewriting, never blank ones; CRASHFS_REWRITE=zero zeroes them,
+ * harsher than any disk), undoes every directory change that was not made
+ * durable, newest first, and exits at once.
  *
  * A power loss happens with probability $CRASHFS_PROB at each tracked
  * operation (after $CRASHFS_WARMUP of them), or at the next one after
@@ -61,10 +62,16 @@
  * durable (files that lie after an injected EIO excepted), and is a point
  * where the EIO can be injected.
  *
- * With CRASHFS_REWRITE=old the dirty regions that rewrote durable bytes get those bytes back at a power loss
- * instead of zeros (what a disk keeps of an in-place overwrite: old or new, never blank); data past the durable
- * size is still cut. Without CRASHFS_TEAR (no kept prefixes, no mixed sectors), so a log append never synced is
- * lost for certain, and a rewritten hard-state slot is not blank.
+ * The dirty regions that rewrote durable bytes get those bytes back at a power loss, not zeros (what a disk keeps
+ * of an in-place overwrite: old or new, never blank: round 13, the default; CRASHFS_REWRITE=old says it too); data
+ * past the durable size is cut, and what a file system may return there (zeros, a hole) is all that is made up.
+ * Without CRASHFS_TEAR (no kept prefixes, no mixed sectors), so a log append never synced is lost for certain, and
+ * a rewritten hard-state slot is not blank. CRASHFS_REWRITE=zero gives the old harsher default: the rewritten
+ * region (never a byte nobody rewrote) comes back as zeros.
+ *
+ * A file is found by the identity of the descriptor's inode, not by the name the descriptor was opened under: a write,
+ * truncate or sync through a descriptor that is still open on a file that was renamed since (or whose old name now
+ * names another file) is that file's, and an fsync then makes the renamed file durable.
  *
  * With CRASHFS_AT_EXIT=1 the power also fails as the process exits normally:
  * what a command reported done must already be durable.
@@ -115,17 +122,16 @@
 #define MAX_FDS 65536
 #define MAX_FILES 65536
 #define MAX_OPS 1000000
-#define MAX_DIRTY 16
 
 typedef struct file {
     dev_t dev;
     ino_t ino;
     char path[PATH_MAX];
     off_t durable;
-    struct {
+    struct dirty_ext {
         off_t off, len;
-    } dirty[MAX_DIRTY];
-    int ndirty;
+    } *dirty; /* CRASHFS_REWRITE=zero only: the regions rewritten in place (or cut) since the last sync */
+    int ndirty, capdirty;
     bool used;
     bool lying; /* after an injected EIO: syncs succeed without making anything durable */
     struct old_sector *old; /* CRASHFS_TEAR: durable sectors rewritten since the last sync, as they were */
@@ -159,7 +165,7 @@ static long warmup, ops;
 static uint64_t rng;
 static volatile sig_atomic_t crash_requested;
 static bool tear; /* CRASHFS_TEAR=1 */
-static bool rewrite_old; /* CRASHFS_REWRITE=old */
+static bool rewrite_zero; /* CRASHFS_REWRITE=zero: the regions rewritten in place come back as zeros (harsher than a disk); else as they were */
 static unsigned tear_prefix, tear_garbage, tear_old, tear_kept; /* what the power loss kept, for the message */
 static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
 static bool loss_at_exit;       /* CRASHFS_AT_EXIT=1 */
@@ -303,7 +309,7 @@ __attribute__((constructor)) static void init(void)
     if (getenv("CRASHFS_MARK_SLOW_MS"))
         mark_slow_ms = (unsigned)atoi(getenv("CRASHFS_MARK_SLOW_MS"));
     tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
-    rewrite_old = getenv("CRASHFS_REWRITE") && !strcmp(getenv("CRASHFS_REWRITE"), "old");
+    rewrite_zero = getenv("CRASHFS_REWRITE") && !strcmp(getenv("CRASHFS_REWRITE"), "zero");
     loss_at_exit = getenv("CRASHFS_AT_EXIT") && atoi(getenv("CRASHFS_AT_EXIT")) != 0;
     md_mode = getenv("CRASHFS_MODE") && !strcmp(getenv("CRASHFS_MODE"), "misdirect");
     md_rate = getenv("CRASHFS_MD_RATE") ? atof(getenv("CRASHFS_MD_RATE")) : 0.001;
@@ -383,6 +389,59 @@ static file *file_get(const char *path, bool create_new)
     return f;
 }
 
+/* The file behind a tracked descriptor, found by the identity of its inode: the name the descriptor was opened under may have been
+ * renamed since (the descriptor's file is then the renamed one), or may name another file now (a new file made at the old name).
+ * Round 13 (VERIFY12): a sync or write through such a descriptor went to the record of whatever the old name said, so an fsync never
+ * raised the renamed file's durable size and a power loss cut fsynced bytes. A file that has no record yet (made before the shim was
+ * loaded, or opened by a path the shim did not see) gets one, durable as it is. */
+static file *file_of_fd(int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+        return NULL;
+    for (size_t i = 0; i < nfiles; i++)
+        if (files[i].used && files[i].dev == st.st_dev && files[i].ino == st.st_ino)
+            return &files[i];
+    if (nfiles == MAX_FILES)
+        return NULL;
+    file *f = &files[nfiles++];
+    memset(f, 0, sizeof *f);
+    f->used = true;
+    f->dev = st.st_dev;
+    f->ino = st.st_ino;
+    snprintf(f->path, PATH_MAX, "%s", fdpath[fd] ? fdpath[fd] : "");
+    f->durable = st.st_size;
+    return f;
+}
+
+/* Zero mode: a region of a durable file that was rewritten or cut, joined to the last one when they touch (never a region that nobody wrote). */
+static void dirty_add(file *f, off_t off, off_t len)
+{
+    if (len <= 0)
+        return;
+    if (f->ndirty > 0) {
+        struct dirty_ext *l = &f->dirty[f->ndirty - 1];
+        if (off <= l->off + l->len && off + len >= l->off) {
+            off_t lo = off < l->off ? off : l->off, hi = off + len > l->off + l->len ? off + len : l->off + l->len;
+            l->off = lo;
+            l->len = hi - lo;
+            return;
+        }
+    }
+    if (f->ndirty == f->capdirty) {
+        int cap = f->capdirty ? 2 * f->capdirty : 16;
+        struct dirty_ext *d = realloc(f->dirty, (size_t)cap * sizeof *d);
+        if (!d) { /* no room: the region is not remembered, so it keeps its new bytes (the disk may have kept them too) */
+            return;
+        }
+        f->dirty = d;
+        f->capdirty = cap;
+    }
+    f->dirty[f->ndirty].off = off;
+    f->dirty[f->ndirty].len = len;
+    f->ndirty++;
+}
+
 /* The bytes [off, off + n) of the file behind `fd`, read through a descriptor crashfs opens itself: the caller's may be
  * write-only (tsdb opens CLASSES O_WRONLY), and a failed pread there once left zeros that tear_file wrote back over
  * synced records. False when they cannot be read in full: the caller keeps nothing, never bytes it made up. */
@@ -418,7 +477,7 @@ static bool read_through(int fd, const char *path, void *buf, size_t n, off_t of
  * are about to change, once per sync, so a power loss can bring them back. */
 static void keep_old(file *f, int fd, off_t off, off_t end)
 {
-    if (!(tear || rewrite_old) || f->lying)
+    if (!tear && rewrite_zero)
         return;
     if (end > f->durable)
         end = f->durable;
@@ -618,7 +677,7 @@ static void rollback(void)
             real_close(fd);
             continue;
         }
-        if (rewrite_old) { /* rewritten in place, never synced: the old bytes come back, not zeros */
+        if (!rewrite_zero) { /* rewritten in place, never synced: the old bytes come back, not zeros */
             for (size_t i = 0; i < f->nold; i++) {
                 struct old_sector *o = &f->old[i];
                 off_t len = f->durable - o->off < SECTOR ? f->durable - o->off : SECTOR;
@@ -626,7 +685,7 @@ static void rollback(void)
                     break;
             }
         }
-        for (int k = 0; !rewrite_old && k < f->ndirty; k++) { /* rewritten in place, never synced */
+        for (int k = 0; rewrite_zero && k < f->ndirty; k++) { /* CRASHFS_REWRITE=zero: rewritten in place, never synced */
             off_t end = f->dirty[k].off + f->dirty[k].len;
             if (end > f->durable)
                 end = f->durable;
@@ -734,7 +793,7 @@ static bool eio_now(int fd, const char *what)
     if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
         snprintf(lying_dir, sizeof lying_dir, "%s", fdpath[fd]);
     } else {
-        file *f = file_get(fdpath[fd], false);
+        file *f = file_of_fd(fd);
         if (f)
             f->lying = true;
     }
@@ -1081,19 +1140,14 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
     }
     pthread_mutex_lock(&lock);
     maybe_crash();
-    file *f = file_get(fdpath[fd], false);
+    file *f = file_of_fd(fd);
     bool fail = eio_now(fd, "pwrite");
     if (fail)
         n = n > 1 ? n / 2 : 0;
     if (f && off < f->durable) { /* a rewrite of durable data */
         keep_old(f, fd, off, off + (off_t)n);
-        if (f->ndirty < MAX_DIRTY) {
-            f->dirty[f->ndirty].off = off;
-            f->dirty[f->ndirty].len = (off_t)n;
-            f->ndirty++;
-        } else {
-            f->dirty[MAX_DIRTY - 1].len = f->durable; /* everything from there on */
-        }
+        if (rewrite_zero)
+            dirty_add(f, off, (off + (off_t)n < f->durable ? off + (off_t)n : f->durable) - off);
     }
     ssize_t r = real_pwrite(fd, buf, n, off);
     pthread_mutex_unlock(&lock);
@@ -1206,7 +1260,7 @@ static int do_sync(int fd, bool data_only)
                     }
                 }
         } else {
-            file *f = file_get(fdpath[fd], false);
+            file *f = file_of_fd(fd);
             if (f && !f->lying) {
                 f->durable = st.st_size;
                 f->ndirty = 0;
@@ -1279,6 +1333,16 @@ static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool 
     if (r == 0) {
         add_dirop(OP_RENAME, a, b, saved[0] ? saved : NULL);
         file_get(b, false);
+        if (stat(b, &st) == 0 && S_ISREG(st.st_mode)) { /* a descriptor still open on the file is the file under its new name */
+            for (int fd = 0; fd < MAX_FDS; fd++)
+                if (fdpath[fd] && !strcmp(fdpath[fd], a)) {
+                    char *n = strdup(b);
+                    if (n) {
+                        free(fdpath[fd]);
+                        fdpath[fd] = n;
+                    }
+                }
+        }
         if (stat(b, &st) == 0 && S_ISDIR(st.st_mode)) { /* what is inside moved with it */
             for (size_t i = 0; i < nfiles; i++)
                 rekey(files[i].path, a, b);
@@ -1385,13 +1449,11 @@ int ftruncate(int fd, off_t len)
         return real_ftruncate(fd, len);
     pthread_mutex_lock(&lock);
     maybe_crash();
-    file *f = file_get(fdpath[fd], false);
-    if (f && len < f->durable)
+    file *f = file_of_fd(fd);
+    if (f && len < f->durable) { /* cutting durable data, unsynced */
         keep_old(f, fd, len, f->durable);
-    if (f && len < f->durable && f->ndirty < MAX_DIRTY) { /* cutting durable data, unsynced */
-        f->dirty[f->ndirty].off = len;
-        f->dirty[f->ndirty].len = f->durable - len;
-        f->ndirty++;
+        if (rewrite_zero)
+            dirty_add(f, len, f->durable - len);
     }
     int r = real_ftruncate(fd, len);
     pthread_mutex_unlock(&lock);
