@@ -525,7 +525,7 @@ static int settings_valid(const struct meta_settings *s)
     return s->replication >= 1 && s->replication <= META_REPLICAS_MAX && s->min_isr >= 1 &&
            s->min_isr <= s->replication && s->failover <= META_FAILOVER_BMC && s->read_barrier <= 1 &&
            s->lease_s >= 1 && s->lease_ms >= 1 && s->drift_ppm < 1000000 && s->commit_interval_ms >= 1 &&
-           s->idle_seal_ms >= 1;
+           s->isr_lag_ms >= META_ISR_LAG_MIN_MS && s->idle_seal_ms >= META_IDLE_SEAL_MIN_MS;
 }
 
 static void put_member(struct wr *w, const struct meta_member *mb)

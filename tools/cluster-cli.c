@@ -60,7 +60,7 @@ static const char cl_help[] =
     "    --min-isr N             copies that must be in sync for a write to count, at most --replication [1]\n"
     "    --node-timeout-ms MS    a server is marked down after this long without a heartbeat [3000]\n"
     "    --heartbeat-ms MS       how often servers report, below --node-timeout-ms [500]\n"
-    "    --isr-lag-ms MS         a copy this far behind leaves the in-sync set [1000] (stored, not acted on yet)\n"
+    "    --isr-lag-ms MS         a copy silent this long leaves the in-sync set [1000] (at least 500)\n"
     "    --out-after-s S         a server down this long is marked out [1800] (stored, not acted on yet)\n"
     "    --voter-replace-s S     a voter down this long is replaced by another member [600]\n"
     "    --voters N              the most voters the group has (an even number counts as one less) [5]\n"
@@ -75,7 +75,7 @@ static const char cl_help[] =
     "    --commit-interval-ms MS the commit point reaches the copies within this [5]\n"
     "    --repl-retain-mb MB     log kept for a copy that fell behind, at most [4096]\n"
     "    --repl-retain-s S       and for at most this long [1800]\n"
-    "    --idle-seal-ms MS       an idle leader closes its log segment after this [1000]\n"
+    "    --idle-seal-ms MS       an idle leader closes its log segment after this [1000] (at least 100)\n"
     "  In this preview the settings are stored and shown by status; nothing acts on the replication, failover and\n"
     "  volume ones yet.\n";
 

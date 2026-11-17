@@ -67,6 +67,11 @@
 #define META_GROUP_MAX 64 /* a server group (the takeover cap) */
 #define META_DOMAIN_MAX 64
 #define META_REPLICAS_MAX 7 /* replication 4 plus learners during a move */
+/* lower bounds of settings the replication driver acts on (r3d-isr review M5): below 500 ms a live member of an idle
+ * volume, heard every 100 ms (repld's idle heartbeat), would leave its ISR between two heartbeats and grow back, an
+ * endless churn through the metadata group; an idle seal below 100 ms flushes after nearly every write batch */
+#define META_ISR_LAG_MIN_MS 500
+#define META_IDLE_SEAL_MIN_MS 100
 #define META_SLOTS 65536
 #define META_NONE 0xffffffffu /* no volume (a slot without a home) */
 #define META_VOLUME_MAX 65534 /* series64: the volume field of an id is volume + 1 below 65,536 */

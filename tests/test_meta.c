@@ -749,6 +749,15 @@ static void test_shared(void)
     /* failover = attested: a grant away from a node that is not heard needs an attestation; bmc a power-off */
     struct meta_settings s;
     meta_settings_default(&s);
+    /* settings below what the replication driver can act on are refused (r3d-isr review M5) */
+    s.isr_lag_ms = META_ISR_LAG_MIN_MS - 1;
+    meta_op_settings(&e, &s);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    s.isr_lag_ms = META_ISR_LAG_MIN_MS;
+    s.idle_seal_ms = META_IDLE_SEAL_MIN_MS - 1;
+    meta_op_settings(&e, &s);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    meta_settings_default(&s);
     s.failover = META_FAILOVER_ATTESTED;
     meta_op_settings(&e, &s);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
