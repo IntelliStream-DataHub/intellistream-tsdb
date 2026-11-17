@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # The replication core's simulator (tests/sim_repl.c, docs/design-cluster.md §13.1).
-#   tests/sim_repl.sh quick            make test: 300 seeds, and the planted bugs that die within 200 seeds
+#   tests/sim_repl.sh quick            make test: 300 seeds, and the planted bugs that die within 1000 seeds (M@N: N seeds)
 #   tests/sim_repl.sh mutants          every planted bug, up to 20,000 seeds each; fails if one survives
 #   tests/sim_repl.sh soak [SEEDS] [JOBS] [FIRST]   SEEDS seeds (1,000,000) on JOBS processes (nproc), then mutants
 # B= the build directory (build).
@@ -40,15 +40,18 @@ mode=${1:-quick}
 # Equivalent, so not run: 11 and 25 alone (above); 24 (cut() rounds up: the next question cuts further); 30 (no
 # prev_epoch check while following: never reached, the core fails there now); 37 (unanswered members wait for the lag
 # rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
-quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20 21 22 23 26 27 28 29 31 34 35 36"
+# 20@3000: since the idle heartbeats (idle_heartbeat_ticks varies by seed) it first dies at seed 2324.
+quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36"
 all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39"
 # test_repl's scenarios and the planted bug each must catch
 scenarios="34 35 36 37 39 40"
 
 mutants() {
-    local seeds=$1 bad=0 m out
+    local seeds=$1 bad=0 m n out
     for m in $2; do
-        out=$("$B"/sim_repl_mut --mutant "$m" --seeds "$seeds" 2>/dev/null)
+        n=$seeds
+        case $m in *@*) n=${m#*@} m=${m%@*} ;; esac
+        out=$("$B"/sim_repl_mut --mutant "$m" --seeds "$n" 2>/dev/null)
         echo "$out"
         case $out in *KILLED*) ;; *) bad=1 ;; esac
     done
