@@ -256,6 +256,7 @@ static int log_has(int i, const char *needle)
 
 static uint32_t isr_of(int via, const char *name, uint64_t *version);
 static void await_isr(int via, const char *name, uint32_t n, int ms, const char *what);
+static uint64_t wal_lowest(int i, uint32_t num);
 
 /* stops every live server (SIGTERM, status 0) and starts a new scenario in its own directory */
 static void stop_all(void)
@@ -3095,6 +3096,15 @@ static void scen_replicate(void)
     /* a replica killed while the leader takes writes: restarted, it catches up from the leader's log (a restart of
      * every server would come back on new peer ports, which the metadata group does not know) */
     int R = (L + 1) % 3;
+    /* R has removed a segment of its own (its floor passed a flushed one) before it dies: the floor that allowed it
+     * must be in R's REPL by then, or R's log starts above the floor it reads back (floornotsaved, caught only when
+     * R's flush and floor had moved by this point: once in four runs they had not) */
+    for (uint64_t t1 = now_ms(); wal_lowest(R, 1) <= 1 && now_ms() - t1 < 20000;) {
+        struct timespec ms = {0, 50000000};
+        nanosleep(&ms, NULL);
+    }
+    if (wal_lowest(R, 1) <= 1)
+        die("replica %d removed none of its WAL segments in 20 s (a flush every 5 s, the floor every second)", R);
     stop(R, SIGKILL);
     struct rep_writer w = {cports[L], id[0], 10000000, 300, 0, 0, 0};
     /* and a large insert: its part is shipped while R is down; R, back, does not stage the first file it receives
@@ -3130,8 +3140,18 @@ static void scen_replicate(void)
     n[2] += 100000;
     /* the writes no longer wait for R: once R is silent for isr_lag_ms it leaves the ISR and they go on. R catches up
      * as a learner and grows back; only then has it surely seen the COMMIT marker and fetched the part. 60 s: under
-     * TSan the restart, the catch-up and the fetch (5 s late on purpose) took the whole of 30 s (r3d-isr g3 tsan) */
-    await_isr(L, "plant", 3, 60000, "the replica restarted under writes");
+     * TSan the restart, the catch-up and the fetch (5 s late on purpose) took the whole of 30 s (r3d-isr g3 tsan).
+     * A replica that refuses its own log (the leader dropped segments past a floor it never saved: floornotsaved) is
+     * named apart from a slow rejoin, so that mutant's catch cannot be a timeout for any other reason */
+    for (uint64_t t1 = now_ms(); isr_of(L, "plant", NULL) != 3;) {
+        if (log_has(R, "the log starts above the commit floor"))
+            die("the replica restarted under writes refused its log: the log starts above the commit floor");
+        if (now_ms() - t1 > 60000)
+            die("the replica restarted under writes: the ISR of plant has %" PRIu32 " members, not 3, after 60000 ms",
+                isr_of(L, "plant", NULL));
+        struct timespec ms = {0, 50000000};
+        nanosleep(&ms, NULL);
+    }
     if (!log_has(R, "fetches"))
         die("the replica restarted under a large write never fetched its part from the leader");
     await_open_gen(L, "plant", R, 2, 0);
@@ -3596,10 +3616,6 @@ static void scen_writersync(void)
            " SYNC in flight first in batch %d\n", b, CONNS, WRITES, ms, seen_at);
 }
 
-/* shipstall (the r3d review's M2): a large write over ten partitions with a replica stopped (SIGSTOP: its links stay
- * up, no DONE comes back) waits for its files under one deadline per COMMIT, and not past the moment the stopped
- * replica leaves the ISR; it used to wait 30 s per file (mutant shipperfile). Running again, the replica fetches what
- * it missed, joins the ISR and holds the leader's rows. */
 /* the WAL segments in server i's directory of volume num */
 static int wal_count(int i, uint32_t num)
 {
@@ -3619,8 +3635,27 @@ static int wal_count(int i, uint32_t num)
     return n;
 }
 
-/* The keep caps (design-cluster.md 8.3): a replica out of the ISR holds the leader's flushed segments only for
- * repl_retain_s (2 s here); past it they go, and the replica, back, is told it needs a snapshot and stays a learner. */
+/* the lowest WAL segment number in server i's directory of volume num; UINT64_MAX when it has none (a volume that
+ * flushed everything and removed its segments also passed number 1) */
+static uint64_t wal_lowest(int i, uint32_t num)
+{
+    char dir[PATH_MAX + 80], v[PATH_MAX + 120];
+    server_dir(i, dir, sizeof dir);
+    snprintf(v, sizeof v, "%s/v%" PRIu32, dir, num);
+    DIR *d = opendir(v);
+    if (!d)
+        die("opendir %s: %s", v, strerror(errno));
+    uint64_t lo = UINT64_MAX, seq;
+    errno = 0;
+    for (struct dirent *e; (e = readdir(d));)
+        if (sscanf(e->d_name, "wal_%" SCNx64 ".log", &seq) == 1 && seq < lo)
+            lo = seq;
+    if (errno)
+        die("readdir %s: %s", v, strerror(errno));
+    closedir(d);
+    return lo;
+}
+
 /* A writer of 1000-row inserts on one connection until `stop` (inboxshared's stalled volume) */
 struct flood {
     int port;
@@ -3838,6 +3873,8 @@ static void scen_backpressure(void)
            " received into a file; every replica holds the leader's rows\n", rounds);
 }
 
+/* The keep caps (design-cluster.md 8.3): a replica out of the ISR holds the leader's flushed segments only for
+ * repl_retain_s (2 s here); past it they go, and the replica, back, is told it needs a snapshot and stays a learner. */
 static void scen_keepcap(void)
 {
     scenario("keepcap");
@@ -4100,6 +4137,10 @@ static void scen_idleseal(void)
     rep_same(wantr, "after a clean stop");
 }
 
+/* shipstall (the r3d review's M2): a large write over ten partitions with a replica stopped (SIGSTOP: its links stay
+ * up, no DONE comes back) waits for its files under one deadline per COMMIT, and not past the moment the stopped
+ * replica leaves the ISR; it used to wait 30 s per file (mutant shipperfile). Running again, the replica fetches what
+ * it missed, joins the ISR and holds the leader's rows. */
 static void scen_shipstall(void)
 {
     scenario("shipstall");

@@ -24,7 +24,7 @@ dir=${1:-/tmp}; shift || true
 # mutant, its scenario, an extended regular expression its FAIL line must match
 table=(
     "commitbyleader|replindet|a write with both replicas paused was answered"
-    "floornotsaved|replicate|a replica down and back did not finish|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
+    "floornotsaved|replicate|the replica restarted under writes refused its log: the log starts above the commit floor"
     "ackbeforesync|ackdurable|after a power loss replica [0-9]+ holds [0-9]+ rows"
     "nodepose|writerdepose|the writer was not deposed"
     "noquiesce|writerfail|of the failed volume: .*not UNAVAILABLE"
