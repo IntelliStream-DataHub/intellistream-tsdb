@@ -496,7 +496,7 @@ $(FUZZ_B)/driver.o: tests/fuzz/driver.c $(FUZZ_B)/libtsdb.a
 
 $(FUZZ_B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/fuzz.h tests/fuzz/template.h src/internal.h $(FUZZ_B)/libtsdb.a \
                   $(if $(FUZZ_DRV),$(FUZZ_B)/driver.o)
-	$(FUZZ_CC) $(FUZZ_COMMON) $(FUZZ_ARCH) $(FUZZ_SAN) $(FUZZ_COV) -c -o $@.o $<
+	$(FUZZ_CC) $(FUZZ_COMMON) $(if $(EC_OBJ),-DTSDB_EC) $(FUZZ_ARCH) $(FUZZ_SAN) $(FUZZ_COV) -c -o $@.o $<
 	$(FUZZ_CC) $(FUZZ_SAN) $(FUZZ_LINK) -o $@ $@.o $(if $(FUZZ_DRV),$(FUZZ_B)/driver.o) \
 	    $(FUZZ_OBJS_$*:%=$(FUZZ_B)/%) $(FUZZ_B)/libtsdb.a $(LDLIBS)
 $(FUZZ_B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
