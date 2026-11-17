@@ -600,6 +600,7 @@ static int sync_far(const char *dir, eng **db)
     o.merge_threads = 0;
     o.create_volumes = 0;
     o.buffer_rows = 1u << 24; /* no flush: the segment stays */
+    o.flush_interval_ms = 3600000; /* nor one by age: a slow run (ASan beside other jobs) passed 5 s mid-test */
     o.wal_sync_ms = 3600000; /* nothing syncs behind the test's back: the buffer holds what the calls appended */
     return eng_open(dir, &o, db);
 }
