@@ -8,7 +8,7 @@
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
 dir=${1:-/tmp}; shift || true
-muts=${*:-commitbyleader ackbeforesync floornotsaved nodepose noquiesce floornottold unsureignored admitnocheck nofastpath}
+muts=${*:-commitbyleader ackbeforesync floornotsaved nodepose noquiesce floornottold unsureignored admitnocheck nofastpath nocursorup}
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}
 survived=
 for m in $muts; do

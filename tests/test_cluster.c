@@ -4160,7 +4160,7 @@ static void scen_repcheck(void)
     scenario("repcheck");
     for (int i = 0; i < 3; i++) {
         xargs[i] = "--flush-interval-ms 200";
-        penv[i] = "TSDB_REPLD_TEST=skippos";
+        penv[i] = "TSDB_REPLD_TEST=skippos,stalesent";
         start(i);
     }
     init_cluster(0, 600);
@@ -4268,6 +4268,45 @@ static void scen_repcheck(void)
     start(R);
     await_open_gen(L, "plant", R, gen + 2, rid);
     await_log_count(R, " of 3, log ", opens + 2, 30000);
+    /* the surviving slot's floor was older than the segments the replica had removed: the open takes the log's start
+     * as the floor's lower bound, or the core refuses the log at this open and every later one */
+    usleep(300000);
+    if (log_has(R, "the log starts above the commit floor"))
+        die("replica %d stopped after an open with a damaged REPL slot: the log starts above the commit floor it saved",
+            R);
+
+    /* a peer's cursor set back below the leader's log start (its segments went with the commit point): the cursor must
+     * move up to what the peer acknowledged, or the catch-up finds nothing to read and no write commits again (jepsen
+     * kv, seed 1: a resync raced records in flight) */
+    {
+        char stale[PATH_MAX + 80];
+        snprintf(stale, sizeof stale, "%s/n%d/stalesent", base, L);
+        int sfd = open(stale, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+        if (sfd < 0)
+            die("%s: %s", stale, strerror(errno));
+        close(sfd);
+        t0 = now_ms();
+        while (!log_has(L, "test fault: the cursor of peer")) {
+            if (now_ms() - t0 > 10000)
+                die("the stalesent fault did not fire in 10 s");
+            usleep(10000);
+        }
+        struct rep_writer sw = {cports[L], id, 4000000, 1, 0, 0, 0};
+        pthread_t sth;
+        if (pthread_create(&sth, NULL, rep_write_thread, &sw) != 0)
+            die("pthread_create");
+        t0 = now_ms();
+        while (!__atomic_load_n(&sw.done, __ATOMIC_ACQUIRE)) {
+            if (now_ms() - t0 > 10000)
+                die("no write was acknowledged in 10 s after a peer's cursor went back below the leader's log start "
+                    "(the cursor never moved up to what the peer acknowledged)");
+            usleep(10000);
+        }
+        pthread_join(sth, NULL);
+        if (sw.rc != 0)
+            die("the write after a peer's cursor went back failed: %s", ers(sw.rc));
+        printf("  a peer's cursor set back below the leader's log start moved up to what it acknowledged\n");
+    }
 
     /* the core's position one ahead of the log number: the write fails the volume, unacknowledged */
     char skip[PATH_MAX + 80];

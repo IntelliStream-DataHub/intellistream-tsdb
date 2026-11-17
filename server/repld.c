@@ -43,12 +43,17 @@
  * volume's engine reachable (D13; test_cluster writerfail catches both); test_cluster repcheck catches `floornottold`
  * (a replica's saved floor never reaches its engine: its flushed segments stay), `unsureignored` (an unsure REPL taken
  * as it stands) and `admitnocheck` (no check of the core's position against the log number), and measures
- * `nofastpath` (records go out on the tick only) and `hbnoclamp` (a heartbeat names positions not sent yet).
+ * `nofastpath` (records go out on the tick only) and `hbnoclamp` (a heartbeat names positions not sent yet);
+ * `nocursorup` never moves a peer's cursor up to what it acknowledged (repcheck's `stalesent` step catches it).
  * Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first bulk file this process receives taken as staged but not kept, so its COMMIT marker finds
  * the file missing and FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER
  * (writes then reach the new writer while the driver still promotes: they must be refused for a retry, never depose
  * it); `skippos` has one admit take a position more once the file <dir>/skippos exists (the check in op_admit must
- * fail the volume before the write is acknowledged).
+ * fail the volume before the write is acknowledged); `stalesent` sets one peer's cursor back to 0 once the file
+ * <dir>/stalesent exists, below the log's start (what a resync that raced records in flight left behind; the cursor
+ * must move up to what the peer acknowledged, or it is never sent another record).
+ * TSDB_REPLD_TRACE=1 (debugging; jepsen-cluster passes the environment on) logs every 2 s per volume a line of the
+ * core's state (repl_debug: per peer next, match, acked) and the driver's cursors (sent, want, acked, ages, link).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -119,6 +124,7 @@ struct rvol {
     uint64_t *idx;
     size_t nidx, cidx;
     uint64_t idx_end, log_start;
+    uint64_t trace_ms;
     struct repl_epoch hist[REPLFILE_MAX_HIST];
     uint32_t nhist;
     /* the message being handled */
@@ -146,7 +152,8 @@ enum {
     RM_FLOORNOTTOLD,
     RM_HBNOCLAMP,
     RM_UNSUREIGNORED,
-    RM_ADMITNOCHECK
+    RM_ADMITNOCHECK,
+    RM_NOCURSORUP
 };
 
 static struct {
@@ -167,6 +174,8 @@ static struct {
     int mutant; /* RM_*: tests only */
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
+    int trace; /* TSDB_REPLD_TRACE (debugging): the core's and the cursors' state every 2 s */
+    int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
@@ -987,6 +996,24 @@ static void exec(struct rvol *rv, struct repl_action *a)
             struct rpeer *p = &rv->peer[a->msg.to];
             if (a->upto > p->want)
                 p->want = a->upto;
+            if (G.stale_sent == 1 && rv->mode == M_WRITER && p->acked > 0) {
+                /* the fault: the cursor of a peer that has acknowledged records goes back below the log's start */
+                char f[sizeof G.dir + 16];
+                snprintf(f, sizeof f, "%s/stalesent", G.dir);
+                if (access(f, F_OK) == 0) {
+                    G.stale_sent = 2;
+                    p->sent = 0;
+                    say("volume %" PRIu32 ": test fault: the cursor of peer %d set back to 0 (it acknowledged %" PRIu64
+                        ")", rv->number, a->msg.to, p->acked);
+                }
+            }
+            /* The peer has what it acknowledged, and the core still counts on it (it has not asked to go back below
+             * it): the cursor moves up to it. A resync that moved the cursor back while records were in flight (they
+             * arrived after RESEND_MS) would otherwise leave it below what the peer holds for good, and once the
+             * leader's log no longer starts there (the commit point let it drop those segments) the catch-up finds
+             * nothing to read and the peer is never sent another record. */
+            if (p->acked > p->sent && a->msg.prev_pos >= p->acked && G.mutant != RM_NOCURSORUP)
+                p->sent = p->acked;
             if (a->msg.prev_pos < p->sent && (now_ms() - p->sent_ms >= RESEND_MS || !p->heard)) {
                 p->sent = a->msg.prev_pos ? rec_start(rv, a->msg.prev_pos + 1) - 1 : 0;
                 if (p->sent > a->msg.prev_pos)
@@ -1218,6 +1245,22 @@ static void *vol_main(void *arg)
         if (now >= next_tick) {
             repl_tick(rv->core);
             next_tick += TICK_MS;
+            if (G.trace && now - rv->trace_ms >= 2000) {
+                char tb[1536];
+                size_t k = repl_debug(rv->core, tb, sizeof tb);
+                for (int i = 0; i < (int)rv->rec.nrep && k < sizeof tb; i++) {
+                    struct rpeer *p = &rv->peer[i];
+                    int kk = snprintf(tb + k, sizeof tb - k, " | d%d sent %llu want %llu acked %llu heard %d sent_age %lld "
+                                      "heard_age %lld link %d", i, (unsigned long long)p->sent,
+                                      (unsigned long long)p->want, (unsigned long long)p->acked, p->heard,
+                                      (long long)(now - p->sent_ms), (long long)(now - p->heard_ms),
+                                      i != rv->self && link_of(rv->rec.rep[i].node, 0) != NULL);
+                    k = kk > 0 ? k + (size_t)kk : sizeof tb;
+                }
+                fprintf(stderr, "tsdbd: replication: volume %" PRIu32 ": trace mode %d log_start %llu idx_end %llu nidx %zu: %s\n", rv->number, rv->mode,
+                    (unsigned long long)rv->log_start, (unsigned long long)rv->idx_end, (size_t)rv->nidx, tb);
+                rv->trace_ms = now;
+            }
             if (next_tick < now)
                 next_tick = now + TICK_MS;
             drain(rv);
@@ -1307,6 +1350,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "hbnoclamp")      ? RM_HBNOCLAMP
                : !strcmp(mu, "unsureignored")  ? RM_UNSUREIGNORED
                : !strcmp(mu, "admitnocheck")   ? RM_ADMITNOCHECK
+               : !strcmp(mu, "nocursorup")     ? RM_NOCURSORUP
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1314,6 +1358,8 @@ void repld_init(tsdb *t, const char *dir)
     G.drop_bulk = te && strstr(te, "dropbulk");
     G.promote_wait = te && strstr(te, "promotewait");
     G.skip_pos = te && strstr(te, "skippos");
+    G.stale_sent = te && strstr(te, "stalesent");
+    G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
     G.t = t;
     snprintf(G.dir, sizeof G.dir, "%s", dir);
 }
@@ -1342,21 +1388,14 @@ int repld_open(const struct cluster_vol_rec *r)
         say("volume %" PRIu32 ": REPL of %s: %s", r->number, rv->dir, rc ? tsdb_strerror(rc) : "not a replica here");
         goto fail;
     }
-    if (rv->st.unsure && G.mutant != RM_UNSUREIGNORED) {
+    bool unsure = rv->st.unsure && G.mutant != RM_UNSUREIGNORED;
+    if (unsure) {
         /* fence, led, floor and log start are not trusted (replfile.h): the group's epoch stands in for fence and
          * led (this replica never leads the epoch it may have led, and refuses everything older), the floor is
-         * the engine's to find again from the leader's commit point, the log start from the segments */
+         * the engine's to find again from the leader's commit point, the log start from the segments. Saved below,
+         * once the segments have said where the log starts. */
         uint64_t e = rv->st.fence > r->epoch ? rv->st.fence : r->epoch;
         rv->st.fence = rv->st.led = e;
-        /* this save is the one that makes the file trusted again (replfile_save clears the flag only with led = fence);
-         * kept set, every later open would take the group's epoch over its own fence again and say unsure forever */
-        rv->st.unsure = false;
-        rc = replfile_save(rv->rf, &rv->st);
-        if (rc != 0) {
-            say("volume %" PRIu32 ": REPL of %s is unsure and could not be saved: %s", r->number, rv->dir,
-                tsdb_strerror(rc));
-            goto fail;
-        }
     }
     pthread_mutex_lock(&G.mu);
     int room = G.nvols < CLUSTER_REPORT_VOLS;
@@ -1390,6 +1429,23 @@ int repld_open(const struct cluster_vol_rec *r)
     if (db)
         index_log(rv, db, rv->log_start, log_end);
     tsdb_cvol_unref(&db);
+    if (unsure) {
+        /* The surviving slot's floor may be older than the segments this replica removed: one goes only once a floor
+         * at or past its end is saved (replica_floor_saved), so the log's start proves that floor. Left below it, the
+         * core refuses the log ("the log starts above the commit floor") at this open and every later one. This save
+         * makes the file trusted again (replfile_save clears the flag only with led = fence); kept set, every later
+         * open would take the group's epoch over its own fence again and say unsure forever. */
+        if (rv->log_start - 1 > rv->st.floor)
+            rv->st.floor = rv->log_start - 1;
+        rv->st.unsure = false;
+        rc = replfile_save(rv->rf, &rv->st);
+        if (rc != 0) {
+            say("volume %" PRIu32 ": REPL of %s is unsure and could not be saved: %s", r->number, rv->dir,
+                tsdb_strerror(rc));
+            cvol_close(r->number);
+            goto fail;
+        }
+    }
     struct repl_durable d = {.rid = rv->st.rid, .fence = rv->st.fence, .led = rv->st.led, .floor = rv->st.floor,
                              .log_start = rv->log_start, .log_end = log_end, .hist = rv->hist, .nhist = rv->nhist};
     uint32_t lag = r->isr_lag_ms ? r->isr_lag_ms : 1000;
