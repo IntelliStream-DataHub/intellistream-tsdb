@@ -54,6 +54,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,7 +153,7 @@ struct rvol {
 
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
        RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL, RM_NOSPILL, RM_NOINBOXBOUND,
-       RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK, RM_STOPNODEPOSE };
+       RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK, RM_STOPNODEPOSE, RM_LATECLOCK };
 
 static struct {
     pthread_mutex_t mu;
@@ -178,7 +179,9 @@ static struct {
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
     int late_wal; /* TSDB_REPLD_TEST=latewal (tests only): repld_stop leaves its writers in place and waits 2.5 s after
-                   * freeing the links, so the engine's NOW markers reach the WAL hooks of a stopped driver */
+                   * freeing the links, and a stopped driver admits records whatever its lease, so the engine's NOW
+                   * markers reach the WAL hooks of a stopped driver (op_bytes says so once) */
+    _Atomic int said_late; /* latewal's line, once */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -539,6 +542,13 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
     }
     /* Stopped (repld_stop): the links are freed or about to be. The engine may still write: a record admitted before
      * the depose, a NOW marker of the flusher; its bytes stay in the WAL for the next epoch. */
+    if (G.late_wal && rv->stop && !atomic_exchange(&G.said_late, 1)) {
+        int at = 0;
+        for (int i = 0; i < (int)rv->rec.nrep; i++)
+            at += i != rv->self && rv->peer[i].sent + 1 == first;
+        say("test: volume %" PRIu32 " writes WAL records %" PRIu64 "..%" PRIu64 " after its driver stopped (%d peers"
+            " were at them)", rv->number, first, last, at);
+    }
     for (int i = 0; !rv->stop && i < (int)rv->rec.nrep; i++) {
         struct rpeer *p = &rv->peer[i];
         if (i != rv->self && p->sent + 1 == first && send_records(rv, i, seq, off, buf, len, first) == 0) {
@@ -563,7 +573,7 @@ static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
         return TSDB_ERR_UNAVAILABLE;
     }
     /* no read lease (§7.1): a write that raced the check in tsdbd is refused the same way, never taken as a deposal */
-    if (rv->mode == M_WRITER && !cluster_lease_valid()) {
+    if (rv->mode == M_WRITER && !cluster_lease_valid() && !(G.late_wal && rv->stop)) {
         pthread_mutex_unlock(&rv->mu);
         return TSDB_ERR_UNAVAILABLE;
     }
@@ -1305,6 +1315,13 @@ static void exec(struct rvol *rv, struct repl_action *a)
             rv->held_commit = 0;
             say("volume %" PRIu32 ": leads epoch %" PRIu64 " from position %" PRIu64, rv->number, rv->epoch,
                 rv->epoch_pos);
+            /* the clock from the start (design-cluster.md 5.4), not from the first SAVE as a writer, which waits for
+             * applied records: an idle new leader sent no NOW markers at all. buf_lock is above rv->mu. */
+            if (G.mutant != RM_LATECLOCK && (db = tsdb_cvol_ref(G.t, rv->number))) {
+                pthread_mutex_unlock(&rv->mu);
+                eng_leader_clock(db, NOW_EVERY_MS, G.mutant == RM_NOSEAL ? 0 : rv->rec.idle_seal_ms);
+                pthread_mutex_lock(&rv->mu);
+            }
         }
         break;
     case REPL_A_REPLY:
@@ -1621,6 +1638,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "keepignorespeers") ? RM_KEEPIGNORESPEERS
                : !strcmp(mu, "nologstartcheck") ? RM_NOLOGSTARTCHECK
                : !strcmp(mu, "stopnodepose")   ? RM_STOPNODEPOSE
+               : !strcmp(mu, "lateclock")      ? RM_LATECLOCK
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);

@@ -3402,11 +3402,16 @@ static void scen_closegone(void)
     }
 
     /* 3: the engine writes after the driver stopped (a record admitted before the depose, a NOW marker while the
-     * read lease lasts): latewal keeps the leader in place 2.5 s past the freeing of the links, the replicas up so
-     * that the lease is fresh, and the flusher's NOW markers come through the WAL hooks. They used to send on the
-     * freed links (a use after free: status 139). */
+     * read lease lasts): latewal keeps the leader in place 2.5 s past the freeing of the links and lets the stopped
+     * driver admit records whatever its lease, so the flusher's NOW markers (one a second from the moment the volume
+     * is led, mutant lateclock: only from its first SAVE as a writer, after this test's SIGTERM) come through the WAL
+     * hooks. They used to send on the freed links (a use after free: status 139 or an ASan report). The leader's log
+     * says that the hooks ran after the stop, or this case proved nothing. */
     L = closegone_setup("closegone-late", "TSDB_REPLD_TEST=latewal", &id);
     int ms3 = term_within(L, 15000, "the leader writing NOW markers after its driver stopped");
+    if (!log_has(L, "after its driver stopped"))
+        die("closegone-late: the leader wrote no WAL record after its driver stopped (no NOW marker in 2.5 s: is its "
+            "clock started when it begins to lead?)");
     for (int i = 0; i < 3; i++)
         penv[i] = NULL;
     printf("  a leader whose replicas are gone stops on SIGTERM in %d ms (nothing above its commit point) and %d ms (a"
