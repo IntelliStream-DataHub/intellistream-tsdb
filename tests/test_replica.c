@@ -1941,6 +1941,7 @@ typedef struct xport {
      * replica that has every byte at once); with `manual` only the test moves it */
     bool manual;
     int refuse;            /* admit refuses with this code (0: admits) */
+    int refuse_once;       /* admit refuses the next admission with this code, then admits again */
     bool depose_in_admit;  /* admit deposes the leader and refuses (a driver whose core says it is not leading) */
     bool rec;              /* record admissions and bytes */
     uint64_t adm_fno[512];
@@ -2053,6 +2054,11 @@ static int xp_admit(void *ctx, eng *db, uint64_t fno, uint32_t span)
     }
     if (x->refuse)
         return x->refuse;
+    if (x->refuse_once) {
+        int rc = x->refuse_once;
+        x->refuse_once = 0;
+        return rc;
+    }
     if (x->rec && x->nadm < 512)
         x->adm_fno[x->nadm] = fno, x->adm_span[x->nadm++] = span;
     return 0;
@@ -4722,8 +4728,29 @@ static void case_leader_marker_refused(void)
         }
         xp_stop(&x);
     }
+    /* the leader's clock on: the NOW marker before the DROP is refused, the DROP's own would be admitted; the DROP
+     * is refused all the same (r3d-isr review L3: it went out without the replicas' clock) */
+    {
+        xport x;
+        xp_start(&x, "lmrefn");
+        xp_rows(&x, 0, 0, 10, 100);
+        CHECK_EQ(eng_flush(x.ld), 0);
+        xp_step(&x, "L6: rows before the clock's refusal");
+        eng_leader_clock(x.ld, 3600 * 1000, 0); /* an hour: the flusher writes no NOW of its own here */
+        uint64_t before = ld_last(&x);
+        x.refuse_once = TSDB_ERR_UNAVAILABLE;
+        CHECK_EQ(eng_drop_before(x.ld, T0 + 10 * DAY_MS), TSDB_ERR_UNAVAILABLE);
+        CHECK_EQ(x.refuse_once, 0); /* the NOW marker was asked for */
+        CHECK_EQ(ld_last(&x), before);
+        CHECK_EQ(lrows(x.ld, 0), 10); /* nothing retired */
+        CHECK_EQ(eng_drop_before(x.ld, T0 + 10 * DAY_MS), 0);
+        CHECK_EQ(lrows(x.ld, 0), 0);
+        xp_step(&x, "L6: the DROP after the NOW's refusal");
+        CHECK_EQ(lrows(x.rep, 0), 0);
+        xp_stop(&x);
+    }
     printf("  a DROP whose marker admission refuses is refused, retires nothing, and the leader stays the replicas' "
-           "equal\n");
+           "equal; so is one whose NOW marker is refused\n");
 }
 
 /* R2: a leader whose COMMIT marker is committed and whose publish then fails (here: the request is abandoned, as
