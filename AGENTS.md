@@ -490,7 +490,7 @@ cgroup, so `nice` does not keep your work out of its way.
   lock is taken under either; a user's rights index is built before it is shared and read without a lock.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
-- **Versions.** The release version is the file `VERSION` (0.10.0); `tools/check-version.sh` compares it with
+- **Versions.** The release version is the file `VERSION` (0.10.1); `tools/check-version.sh` compares it with
   `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.

@@ -6,6 +6,42 @@ All notable changes to tsdb are listed here, newest first. The format follows
 [docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.x release may still change the
 disk format and the wire protocol.
 
+## [0.10.1] - 2026-11-17
+
+**A patch release of 0.10.0: disk format 9, wire protocol 14 (floor 12) and embedded C ABI 7, as in 0.10.0.** A
+database written by 0.10.0 opens as it is, and 0.10.0 opens one written by this release. It fixes two ways in which
+a write that was refused could still end up in the database, a window in which `tsdbd` answered a dropped user once
+more, and the C client's handling of `UNAVAILABLE` in raw and values queries. Use the same release on the server and
+its clients.
+
+### Fixed
+
+- **A refused write could come back after a crash.** A small write (one that goes through the WAL and the memtable)
+  first went into the WAL buffer and then into the memtable. When the memtable could not grow (out of memory), the
+  write was refused, but the rows added before the failure were visible at once, and the whole batch stayed in the WAL
+  buffer: the next write's sync made it durable, and a crash brought it back. Who could hit it: a process that ran
+  out of memory while writing. Now the room for the whole batch is reserved before anything is written to the WAL, so
+  a refused write leaves nothing behind, in memory or after a crash; should the memtable still fail after the WAL
+  append, the database stops accepting writes until it is reopened (fail-stop), as for a failed WAL write.
+- **A write that was applied could be reported as failed.** When the memtable had grown to twice `buffer_rows`
+  (flushes falling behind), the write that found it so ran a flush after its own rows were in the WAL and the
+  memtable, and returned the flush's error (out of memory, a part that could not be written) as its own result: the
+  caller saw a failure for rows that were visible and came back after a crash. Who could hit it: a database whose
+  flushes failed (a full or failing disk, memory exhaustion) under a steady stream of small writes. Now that flush
+  runs at the start of the next write, before it appends anything; if the flush fails, that write is refused whole,
+  so the memtable stops growing while flushes fail and no applied write reports an error.
+- **`tsdbd` could answer one more request of a dropped user.** A user dropped while connected is
+  answered `TSDB_ERR_AUTH` once and the connection closes. A request the client sent right after reading that answer,
+  while the server's worker had not yet reported done, was read and answered `TSDB_ERR_AUTH` again, and the
+  connection stayed open for as long as the client kept sending. Nothing was read or written for such a request; now
+  no further request is read once the answer is sent.
+- **The C client turned `UNAVAILABLE` in a raw or values query into a broken connection.** `tsdbd` answers
+  `TSDB_ERR_UNAVAILABLE` for a volume whose storage domain is down (`--health-domain`). `tsdbc_query_raw` and
+  `tsdbc_query_values` read that answer as a damaged reply when the client's retries were off or its time budget
+  (`tsdbc_set_retry`) was spent: they returned `TSDB_ERR_CORRUPT` (or `TSDB_ERR_IO`) and every later call on the
+  connection failed. They return `TSDB_ERR_UNAVAILABLE` now, and the connection stays usable. The Rust, Python and
+  Java clients were not affected.
+
 ## [0.10.0] - 2026-11-09
 
 **Disk format 9, wire protocol 14 (floor 12, so clients and servers of protocol 12 and up still talk), embedded C ABI 7.**
