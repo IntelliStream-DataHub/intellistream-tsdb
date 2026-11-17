@@ -3877,12 +3877,27 @@ static void scen_backpressure(void)
 /* rejoin (the merge's jepsen-cluster kill run, 2026-11-17): a replica killed and restarted below what the leader sent
  * it, while the writes never pause, joins the ISR again while they go on. The leader's fast path kept the peer's cursor at the live end, moving
  * sent_ms with every record, so the restarted replica refused every APPEND for the gap and the driver never moved the
- * cursor back to what it held (mutant fastride): in that run a replica's log stayed where it died for 30 minutes. */
-static void scen_rejoin(void)
+ * cursor back to what it held (mutant fastride): in that run a replica's log stayed where it died for 30 minutes.
+ *
+ * rejoinsteady: the same with two writers (a write always in flight) and the restarted replica's ACKs reporting what
+ * it had 100 ms before (TSDB_REPLD_TEST=slowack: a far replica, always a few writes behind the leader's end). A
+ * learner joined only once its log reached the commit point, which under such writes it never does: the run of the
+ * merge had n1 out of the ISR for 30 minutes while it received everything. The leader now holds the commit point
+ * for a learner close behind until it has it (repl.c isr_check; mutant nojoinhold: the old rule).
+ *
+ * rejoinslow: the leader's catch-up reads take 10 ms each (TSDB_REPLD_TEST=slowread: longer than a tick). The driver
+ * ran a due tick (with its catch-up) before the inbox, so with each tick longer than one the next was always due and
+ * the healthy replica's ACKs waited in the inbox while the core's clock ran: the leader dropped it for silence (in
+ * the merge's repro the ISR went 3 -> 2 -> 1 during a rejoin). After each tick the inbox now gets a tick's time
+ * (mutant inboxstarve: none). The healthy replica must stay in the ISR throughout. */
+enum { REJ_GAP, REJ_STEADY, REJ_SLOW };
+static void rejoin_run(const char *name, int how)
 {
-    scenario("rejoin");
-    for (int i = 0; i < 3; i++)
+    scenario(name);
+    for (int i = 0; i < 3; i++) {
+        penv[i] = how == REJ_SLOW ? "TSDB_REPLD_TEST=slowread" : NULL;
         start(i);
+    }
     init_cluster(0, 600);
     node_add(0, 1);
     node_add(0, 2);
@@ -3901,51 +3916,98 @@ static void scen_rejoin(void)
     if (L < 0 || L > 2)
         die("the leader of plant is node %u", v.leader);
     tsdbc *c = client(L);
-    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int nf = how == REJ_STEADY ? 2 : 1;
+    tsdb_sid id[2];
+    for (int k = 0; k < nf; k++)
+        id[k] = rep_series(c, rep_names[k], "plant", 30000);
     await_isr(L, "plant", 3, 10000, "every replica up");
-    struct flood f = {cports[L], id, 0, 0, 0};
-    pthread_t th;
-    if (pthread_create(&th, NULL, flood_thread, &f) != 0)
-        die("pthread_create");
+    struct flood f[2];
+    pthread_t th[2];
+    for (int k = 0; k < nf; k++) {
+        f[k] = (struct flood){cports[L], id[k], 0, 0, 0};
+        if (pthread_create(&th[k], NULL, flood_thread, &f[k]) != 0)
+            die("pthread_create");
+    }
     struct timespec s1 = {1, 0};
     nanosleep(&s1, NULL);
     /* stopped first (SIGSTOP: its link stays up and the leader's records go into it until its queue is full), then
      * killed while stopped: what was sent and never read is lost, so the replica comes back below the cursor */
     int R = (L + 1) % 3;
     pause_server(R, 1);
-    await_isr(L, "plant", 2, 10000, "a replica stopped under writes");
+    uint64_t t0 = now_ms();
+    uint32_t n;
+    while ((n = isr_of(L, "plant", NULL)) == 3) {
+        if (now_ms() - t0 > 10000)
+            die("a replica stopped under writes: the ISR of plant has 3 members after 10000 ms");
+        struct timespec ms = {0, 50000000};
+        nanosleep(&ms, NULL);
+    }
+    if (how == REJ_SLOW && (n < 2 || log_has(L, "asks for an ISR of 1 members")))
+        die("the leader dropped the healthy replica from the ISR while another was away (its ACKs waited behind the "
+            "catch-up)");
     nanosleep(&s1, NULL);
     signal_child(pids[R], SIGKILL);
     if (waitpid(pids[R], NULL, 0) != pids[R])
         die("waitpid %d: %s", (int)pids[R], strerror(errno));
     pids[R] = 0;
     stopped[R] = 0;
-    int r0 = __atomic_load_n(&f.rounds, __ATOMIC_RELAXED);
+    int r0 = 0;
+    for (int k = 0; k < nf; k++)
+        r0 += __atomic_load_n(&f[k].rounds, __ATOMIC_RELAXED);
+    if (how == REJ_STEADY)
+        penv[R] = "TSDB_REPLD_TEST=slowack";
     start(R);
-    uint64_t t0 = now_ms();
-    while (isr_of(L, "plant", NULL) != 3) {
-        if (__atomic_load_n(&f.rc, __ATOMIC_RELAXED))
-            die("a write while the replica was away: %s", ers(f.rc));
+    t0 = now_ms();
+    int rounds = 0;
+    while ((n = isr_of(L, "plant", NULL)) != 3) {
+        rounds = 0;
+        for (int k = 0; k < nf; k++) {
+            if (__atomic_load_n(&f[k].rc, __ATOMIC_RELAXED))
+                die("a write while the replica was away: %s", ers(f[k].rc));
+            rounds += __atomic_load_n(&f[k].rounds, __ATOMIC_RELAXED);
+        }
+        if (how == REJ_SLOW && (n < 2 || log_has(L, "asks for an ISR of 1 members")))
+            die("the leader dropped the healthy replica from the ISR while another caught up (its ACKs waited behind "
+                "the catch-up)");
         if (now_ms() - t0 > 30000)
             die("the replica restarted under writes that never pause did not join the ISR again in 30 s (%d writes "
-                "since its restart)", __atomic_load_n(&f.rounds, __ATOMIC_RELAXED) - r0);
+                "since its restart)", rounds - r0);
         struct timespec ms = {0, 50000000};
         nanosleep(&ms, NULL);
     }
-    int joined = __atomic_load_n(&f.rounds, __ATOMIC_RELAXED) - r0;
-    __atomic_store_n(&f.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(th, NULL);
-    if (f.rc != 0)
-        die("a write while the replica was away: %s", ers(f.rc));
+    rounds = 0;
+    for (int k = 0; k < nf; k++)
+        rounds += __atomic_load_n(&f[k].rounds, __ATOMIC_RELAXED);
+    int joined = rounds - r0;
+    uint64_t took = now_ms() - t0;
+    for (int k = 0; k < nf; k++) {
+        __atomic_store_n(&f[k].stop, 1, __ATOMIC_RELEASE);
+        pthread_join(th[k], NULL);
+        if (f[k].rc != 0)
+            die("a write while the replica was away: %s", ers(f[k].rc));
+    }
+    if (how == REJ_SLOW && log_has(L, "asks for an ISR of 1 members"))
+        die("the leader dropped the healthy replica from the ISR while another caught up (its ACKs waited behind the "
+            "catch-up)");
     if (joined < 5)
         die("only %d writes went on between the restart and the join: the writes paused, so this proved nothing", joined);
     tsdbc_close(c);
     stop_all();
-    uint64_t wantr[REP_NAMES] = {(uint64_t)f.rounds * 1000, 0, 0, 0};
+    for (int i = 0; i < 3; i++)
+        penv[i] = NULL;
+    uint64_t wantr[REP_NAMES] = {0};
+    for (int k = 0; k < nf; k++)
+        wantr[k] = (uint64_t)f[k].rounds * 1000;
     rep_same(wantr, "after a clean stop");
     printf("  a replica killed and restarted under writes that never paused joined the ISR again in %" PRIu64 " ms (%d "
-           "writes in between); every replica holds the leader's rows\n", now_ms() - t0, joined);
+           "writes in between)%s; every replica holds the leader's rows\n", took, joined,
+           how == REJ_STEADY ? ", its ACKs 100 ms late" : how == REJ_SLOW ? ", the leader's reads slow, the healthy "
+           "replica in the ISR throughout" : "");
 }
+
+static void scen_rejoin(void) { rejoin_run("rejoin", REJ_GAP); }
+static void scen_rejoinsteady(void) { rejoin_run("rejoinsteady", REJ_STEADY); }
+static void scen_rejoinslow(void) { rejoin_run("rejoinslow", REJ_SLOW); }
 
 /* The keep caps (design-cluster.md 8.3): a replica out of the ISR holds the leader's flushed segments only for
  * repl_retain_s (2 s here); past it they go, and the replica, back, is told it needs a snapshot and stays a learner. */
@@ -5545,7 +5607,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

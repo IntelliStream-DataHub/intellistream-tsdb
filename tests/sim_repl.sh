@@ -33,6 +33,9 @@ mode=${1:-quick}
 #  35 repl_synced believes a sync issued before a cut (with the naive driver)
 #  36 a position the log no longer retains fails the core (no snapshot path)
 #  40 a silent member stays in the ISR while nothing is written (test_repl idle_shrink)
+#  41 a learner within the hold's bound is asked for at once, without waiting for the commit point (the hold of
+#     isr_check, r3d-isr liveness: join_hold_ticks on in 3 seeds of 4)
+#  42 no hold: a learner under writes that never pause never joins (test_repl steady_join, join_giveup)
 # The replay floor (r3b, design §5.4): 38 an ACK reports durable + 1 as its log start; 39 the floor ignores members
 #     not heard from in this epoch
 #  25 promotion takes fence replies from outside the fenced ISR: caught only with 11 (a non-member has no rid in the
@@ -41,10 +44,10 @@ mode=${1:-quick}
 # prev_epoch check while following: never reached, the core fails there now); 37 (unanswered members wait for the lag
 # rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
 # 20@3000: since the idle heartbeats (idle_heartbeat_ticks varies by seed) it first dies at seed 2324.
-quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36"
-all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39"
+quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36 41"
+all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39 41"
 # test_repl's scenarios and the planted bug each must catch
-scenarios="34 35 36 37 39 40"
+scenarios="34 35 36 37 39 40 42"
 
 mutants() {
     local seeds=$1 bad=0 m n out

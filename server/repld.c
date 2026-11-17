@@ -52,6 +52,9 @@
  * link yet;
  * `nocursorup` never moves a peer's cursor up to what it acknowledged (repcheck's `stalesent` step catches it);
  * `fastride` moves the cursor back on a resync only once sent_ms is RESEND_MS old (rejoin).
+ * `nojoinhold` holds no commit point for a learner close behind (join_hold_ticks 0: it joins only in a pause of the
+ * writes; rejoinsteady), `inboxstarve` gives the inbox no time after a tick while the next one is due (a catch-up read
+ * longer than a tick starved the other peers' ACKs; rejoinslow).
  * `commitpastremoved` takes an ISR request as the record at once, before the metadata group commits it (isr),
  * `nominisr` never checks min_isr (minisr), `ackbelowminisr` hands the writer a commit point reached after a shrink
  * below min_isr (minisr), `nocap` keeps the leader's segments for a lagging replica without the caps repl_retain_mb and
@@ -67,7 +70,9 @@
  * position more once the file <dir>/skippos exists (the check in op_admit must
  * fail the volume before the write is acknowledged); `stalesent` sets one peer's cursor back to 0 once the file
  * <dir>/stalesent exists, below the log's start (what a resync that raced records in flight left behind; the cursor
- * must move up to what the peer acknowledged, or it is never sent another record).
+ * must move up to what the peer acknowledged, or it is never sent another record); `slowread` has every catch-up
+ * read take SLOW_READ_MS more (a slow disk or NFS); `slowack` has a replica's ACKs report the durable end it had
+ * SLOW_ACK_MS before (a far replica: always a few writes behind the leader's end while it keeps up).
  * TSDB_REPLD_TRACE=1 (debugging; jepsen-cluster passes the environment on) logs every 2 s per volume a line of the
  * core's state (repl_debug: per peer next, match, acked) and the driver's cursors (sent, want, acked, ages, link).
  */
@@ -107,6 +112,9 @@ _Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member
 #define LOST_MS 500 /* a peer's acknowledged end standing still this long with the cursor ahead: what was sent is lost */
 #define FETCH_LATE_MS 5000 /* fetchlate (tests) */
 #define READ_CAP (4u << 20)
+#define SLOW_READ_MS 10  /* slowread (tests): longer than a tick */
+#define SLOW_ACK_MS 100  /* slowack (tests) */
+#define SLOW_ACK_RING 512
 #define MAX_NODES 64
 
 enum { M_REPLICA = 0, M_PROMOTING, M_WRITER, M_DEAD };
@@ -191,6 +199,9 @@ struct rvol {
     uint64_t held_commit;
     int short_said;
     int snap_said; /* the SNAPSHOT notice was said */
+    /* slowack (tests): the durable ends of its last ACKs and when they were sent; the one it reported last */
+    uint64_t sa_ms[SLOW_ACK_RING], sa_dur[SLOW_ACK_RING], sa_last;
+    unsigned sa_n;
 };
 
 enum {
@@ -222,7 +233,9 @@ enum {
     RM_INBOXWAITALL,
     RM_SHIPNOISR,
     RM_KEEPWRITTEN,
-    RM_FASTRIDE
+    RM_FASTRIDE,
+    RM_NOJOINHOLD,
+    RM_INBOXSTARVE
 };
 
 static struct {
@@ -264,6 +277,9 @@ static struct {
     int trace; /* TSDB_REPLD_TRACE (debugging): the core's and the cursors' state every 2 s */
     int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
+    int slow_read;    /* TSDB_REPLD_TEST=slowread: every catch-up read takes SLOW_READ_MS more (a slow disk, NFS) */
+    int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
+                       * replica: what it reports trails the leader's end even while it keeps up) */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -508,6 +524,21 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
 static void vol_fail(struct rvol *rv, const char *why);
 static void cvol_close(uint32_t v);
 
+/* slowack (tests): the ACK reports the highest durable end an ACK of SLOW_ACK_MS ago had, never more than it has now
+ * (a lower durable end is always true) */
+static void slow_ack(struct rvol *rv, struct repl_msg *m)
+{
+    uint64_t now = now_ms(), lag = rv->sa_last;
+    rv->sa_ms[rv->sa_n % SLOW_ACK_RING] = now;
+    rv->sa_dur[rv->sa_n++ % SLOW_ACK_RING] = m->durable;
+    for (unsigned i = 0; i < SLOW_ACK_RING && i < rv->sa_n; i++)
+        if (rv->sa_ms[i] + SLOW_ACK_MS <= now && rv->sa_dur[i] > lag)
+            lag = rv->sa_dur[i];
+    rv->sa_last = lag;
+    if (m->durable > lag)
+        m->durable = lag;
+}
+
 /* A message of the core to the metadata group. ISR_REQ is kept for this server's heartbeats (repld_isr_requests: the
  * Raft leader proposes ISR_CHANGE on the request's own basis) until the record moves; RESIGN and FENCE_REPLY belong to
  * promotion (r3e-failover): said, not sent. */
@@ -607,6 +638,10 @@ static void catch_up(struct rvol *rv, struct eng *db)
         size_t len = 0;
         uint64_t seq = 0, off = 0, last = 0;
         int rc = replica_read(db, from, &buf, &len, READ_CAP, &seq, &off, &last);
+        if (G.slow_read && rc == 0 && len) {
+            struct timespec sl = {0, SLOW_READ_MS * 1000000L};
+            nanosleep(&sl, NULL);
+        }
         pthread_mutex_lock(&rv->mu);
         if (rc == 0 && len && p->sent + 1 == from && send_records(rv, i, seq, off, buf, len, from) == 0) {
             p->sent = last;
@@ -623,9 +658,11 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
 {
     (void)db;
     struct rvol *rv = ctx;
-    /* crash points (design-cluster 13.2): the leader has written, not synced and not sent; class-switch when a CLASS
-     * marker is among the records (the switch's record in the log, its CLASSES record not yet) */
-    crash_point(CP_WAL_BEFORE_SEND);
+    /* crash points (design-cluster 13.2): the leader has written, not synced and not sent: wal-before-send only for
+     * bytes with a client's rows (r3d-isr review L3: the NOW markers, one a second, and the idle seal took the hit
+     * when no write was pending); class-switch when a CLASS marker is among the records (the switch's record in the
+     * log, its CLASSES record not yet) */
+    int rows = 0;
     pthread_mutex_lock(&rv->mu);
     for (size_t o = 0; o < len;) {
         wal_rec wr;
@@ -634,9 +671,12 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
             break;
         if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_CLASS)
             crash_point(CP_CLASS_SWITCH);
+        rows |= wr.kind == WAL_KIND_ROWS;
         idx_push(rv, wr.fno, wr.fno + wr.span - 1);
         o += sz;
     }
+    if (rows)
+        crash_point(CP_WAL_BEFORE_SEND);
     /* Stopped (repld_stop): the links are freed or about to be. The engine may still write: a record admitted before
      * the depose, a NOW marker of the flusher; its bytes stay in the WAL for the next epoch. */
     if (G.late_wal && rv->stop && !atomic_exchange(&G.said_late, 1)) {
@@ -1445,6 +1485,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
         } else if (a->msg.to == REPL_META) {
             meta_msg(rv, &a->msg);
         } else {
+            if (G.slow_ack && a->msg.type == REPL_M_ACK && rv->mode == M_REPLICA)
+                slow_ack(rv, &a->msg);
             send_msg(rv, &a->msg);
         }
         break;
@@ -1562,8 +1604,10 @@ static void isr_meta(struct rvol *rv)
     rv->short_said = 0;
     if (rv->held_commit) {
         struct eng *db = tsdb_cvol_ref(G.t, rv->number);
-        if (db)
+        if (db) {
+            crash_point(CP_ACKED_BEFORE_OK); /* as in APPLY (r3d-isr review L1): the held commit reaches the writer */
             eng_leader_commit(db, rv->held_commit);
+        }
         tsdb_cvol_unref(&db);
         rv->held_commit = 0;
     }
@@ -1737,7 +1781,7 @@ static void commit_watch(struct rvol *rv, uint64_t now)
 static void *vol_main(void *arg)
 {
     struct rvol *rv = arg;
-    uint64_t next_tick = now_ms() + TICK_MS;
+    uint64_t next_tick = now_ms() + TICK_MS, slice = 0;
     pthread_mutex_lock(&rv->mu);
     while (!rv->stop) {
         drain(rv);
@@ -1746,9 +1790,14 @@ static void *vol_main(void *arg)
             continue;
         }
         /* a tick that is due goes before the inbox (r3d review L2): under a steady stream of ACKs the inbox is never
-         * empty, and the ticks (catch-up of a lagging peer, resends, the ISR check) would wait for it */
+         * empty, and the ticks (catch-up of a lagging peer, resends, the ISR check) would wait for it. But after each
+         * tick the inbox gets a tick's time (`slice`) even when the next one is due: a tick whose catch-up read takes
+         * longer than a tick (a peer far behind: 4 MiB a read) made the next one due at once, and the ACKs of the
+         * other peers waited in the inbox while the core's clock went on, until it dropped a healthy member from the
+         * ISR for silence (a replica's rejoin, 2026-11-17: ISR 3 -> 2 -> 1; test_cluster rejoinslow) */
         uint64_t now = now_ms();
-        if (rv->in_head && now < next_tick) {
+        int mine = now < next_tick || (now < slice && G.mutant != RM_INBOXSTARVE);
+        if (rv->in_head && mine) {
             struct item *it = rv->in_head;
             rv->in_head = it->next;
             if (!rv->in_head)
@@ -1758,7 +1807,7 @@ static void *vol_main(void *arg)
             free(it);
             continue;
         }
-        if (rv->sync_wanted && now < next_tick) {
+        if (rv->sync_wanted && mine) {
             do_sync(rv);
             continue;
         }
@@ -1796,6 +1845,7 @@ static void *vol_main(void *arg)
                     catch_up(rv, db);
                 tsdb_cvol_unref(&db);
             }
+            slice = now_ms() + TICK_MS;
             continue;
         }
         struct timespec dl;
@@ -1894,6 +1944,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "inboxwaitall")   ? RM_INBOXWAITALL
                : !strcmp(mu, "shipnoisr")      ? RM_SHIPNOISR
                : !strcmp(mu, "fastride")       ? RM_FASTRIDE
+               : !strcmp(mu, "nojoinhold")     ? RM_NOJOINHOLD
+               : !strcmp(mu, "inboxstarve")    ? RM_INBOXSTARVE
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1912,6 +1964,8 @@ void repld_init(tsdb *t, const char *dir)
     if (G.mutant == RM_NOINBOXBOUND)
         G.inbox_bytes = SIZE_MAX;
     G.stall_inbox = te && strstr(te, "stallinbox");
+    G.slow_read = te && strstr(te, "slowread");
+    G.slow_ack = te && strstr(te, "slowack");
     G.spill_bytes = te && strstr(te, "spill") ? 64u << 10 : SPILL_BYTES;
     if (G.mutant == RM_NOSPILL)
         G.spill_bytes = UINT64_MAX;
@@ -2013,6 +2067,7 @@ int repld_open(const struct cluster_vol_rec *r)
                               .isr_lag_ticks = lag / TICK_MS, .resend_ticks = 200 / TICK_MS, .heartbeat_ticks = 1,
                               .idle_heartbeat_ticks = IDLE_HEARTBEAT_MS / TICK_MS,
                               .floor_ticks = 1000 / TICK_MS, .max_batch = 1u << 30, .window = 1u << 30,
+                              .join_hold_ticks = G.mutant == RM_NOJOINHOLD ? 0 : lag / TICK_MS,
                               .rec_find = idx_find, .ctx = rv};
     rv->core = repl_open(&cfg, &d);
     if (!rv->core) {

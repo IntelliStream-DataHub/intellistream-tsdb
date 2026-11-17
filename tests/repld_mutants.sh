@@ -16,7 +16,9 @@
 # gone) replicate (its knob fetchlate); stopnodepose (the stop leaves the leader in place) and lateclock (a new leader's
 # NOW markers start only at its first SAVE as a writer) closegone; syncbyrep (a writer's SYNC answered only when the WAL
 # moved past the engine's last report) writersync (knobs syncbyhook, synclate); inboxwaitall (a full inbox's every
-# frame waits on the shared link) inboxshared.
+# frame waits on the shared link) inboxshared; fastride (the cursor back on a resync only once sent_ms is old) rejoin;
+# nojoinhold (no commit point held for a learner close behind) rejoinsteady; inboxstarve (no inbox time after a tick
+# while the next is due) rejoinslow.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -45,6 +47,8 @@ table=(
     "nospill|backpressure|a replica received a part above the spill threshold into memory"
     "keepignorespeers|keepfloor|the leader keeps [0-9]+ WAL segments, not the 5 flushed ones a replica away has not acked"
     "fastride|rejoin|did not join the ISR again in 30 s"
+    "nojoinhold|rejoinsteady|did not join the ISR again in 30 s"
+    "inboxstarve|rejoinslow|the leader dropped the healthy replica from the ISR while another"
     "keepwritten|replicate|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
     "stopnodepose|closegone|its replicas killed: server [0-9]+ still runs [0-9]+ ms after SIGTERM"
     "lateclock|closegone|the leader wrote no WAL record after its driver stopped"

@@ -545,7 +545,10 @@ never data. The log says "frames are dropped (sent again)" once, and "the inbox 
 one received in memory. An idle volume sends its empty APPEND (the core's heartbeat) to a peer every 100 ms
 (`idle_heartbeat_ticks`), and at once when the commit point moved; every 5 ms tick, as before, made 102,400 frames a
 second for 256 volumes with two peers each, now 5,120. The volume's thread runs a due tick before it takes the inbox
-(L2), so a full inbox cannot starve the ISR rule. Tests: `test_cluster backpressure` (mutants `noinboxbound`,
+(L2), so a full inbox cannot starve the ISR rule; and after each tick the inbox gets a tick's time even when the
+next tick is due, so a tick longer than one (a catch-up read of 4 MiB for a peer far behind, on a slow disk) cannot
+starve the other peers' ACKs either: the leader dropped a healthy replica for silence while another caught up
+(`test_cluster rejoinslow`, mutant `inboxstarve`). Tests: `test_cluster backpressure` (mutants `noinboxbound`,
 `nospill`), `test_repl idle_heartbeat`.
 
 ### 5.2 Large inserts, deletes and replaces
@@ -970,6 +973,20 @@ catches up; a replica that already has the position answers with an ACK, so a st
 replica installs the leader's applied state P only if P is above its own log end, and reopens with start P+1.
 Without it one returning replica fail-stopped every leader in turn (mutant 36, seed 1; seeds 75881, 3865 and 25133
 for the stale notice; `test_repl trim`, `cut_applied`).
+
+*Built in R3 (r3d-isr, 2026-11-17).* Step 5 as written never fires under writes that never pause: the commit point
+runs ahead of a learner that keeps up only as closely as its round trip allows, so it joined only in a pause of the
+writes, and behind a lone leader (commit point = the leader's durable end) never (the jepsen-cluster kill run of the
+merge: a replica out of the ISR for 30 minutes while it received everything). So a learner whose log has what the
+leader had written half `isr_lag_ms` ago, and the start of the current epoch, has the **commit point held** for it: the
+leader counts it in the commit point's minimum from then on (the commit point stops where it is), and asks for it as
+soon as its log reaches the commit point, which then cannot have passed it; from the ask on the maximal ISR counts it
+as before. A learner that has not got there within `join_hold_ticks` (= `isr_lag_ms`) is let go, and not held for again
+for four times `isr_lag_ms`, so writes wait at most `isr_lag_ms` for a learner, as for a member that lags. The hold only
+adds a node to the minimum, so the commit point is never higher than without it, and the metadata group records a
+learner only when it has every committed position. `test_repl steady_join`, `join_giveup` (MUT 42: no hold), the
+simulator with the hold on in three seeds of four (MUT 41: asked for at the hold's start, killed at seed 1),
+`test_cluster rejoinsteady` (a replica whose ACKs trail by 100 ms joins under two writers; mutant `nojoinhold`).
 
 ### 8.2 A returning replica
 

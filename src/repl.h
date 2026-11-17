@@ -165,6 +165,10 @@ struct repl_config {
     uint32_t unanswered_ticks;    /* a member a promotion kept without a fence reply (meta.unanswered) is removed if
                                      it has not acknowledged this many ticks after the new leader took over; 0: only
                                      the lag rule (a few round trips is right: a live member answers by then) */
+    uint32_t join_hold_ticks;     /* a learner within half isr_lag of the leader's end has the commit point held for it
+                                     at most this long, so that it reaches the commit point under writes that never
+                                     pause and joins (§8.1 step 5); then not again for 4 x isr_lag. 0: no hold (a
+                                     learner joins only when the commit point waits anyway, in a pause of the writes) */
     /* The record of this replica's log that contains `pos` (1 <= pos <= written end): its first position and its
      * length. A read of the driver's own index (the WAL), never a write. Returns 0; 1 if the position is no longer
      * retained (below the log's start: its segment went into parts and was deleted, §8.3; the driver trims only

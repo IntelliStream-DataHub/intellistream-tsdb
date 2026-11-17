@@ -77,6 +77,8 @@ struct repl {
     int isr_busy;
     struct repl_vmeta isr_req;
     uint64_t isr_sent;
+    int join;           /* the learner the commit point is held for (-1: none), as instance join_rid, since join_tick */
+    uint64_t join_rid, join_tick, join_retry;
     struct pending *pend;
     size_t npend, cpend, hpend;
 
@@ -489,6 +491,10 @@ static void advance(struct repl *r)
             continue;
         c = min64(c, p->rid == want ? p->match : 0);
     }
+    /* A learner the commit point is held for counts as a member already: the commit point moves no further than
+     * what it has, so it can reach it (isr_check) while the writes go on */
+    if (r->join >= 0 && !(set & (1u << r->join)))
+        c = min64(c, r->peer[r->join].rid == r->join_rid ? r->peer[r->join].match : 0);
     if (c > r->commit)
         r->commit = c;
     apply_to(r, min64(r->commit, r->durable));
@@ -581,9 +587,36 @@ static void isr_request(struct repl *r, uint32_t isr, int add, uint64_t rid)
         m->meta = r->isr_req;
 }
 
-/* One ISR change at a time: drop a member that lags or answers as another instance, else add a caught-up one. */
+/* The hold for a learner ends (asked for, superseded, or given up: then not again for a while, so that a learner that
+ * cannot keep up does not stall the writes again and again) */
+static void join_end(struct repl *r, int gave_up)
+{
+    r->join = -1;
+    if (gave_up)
+        r->join_retry = r->now + 4 * (uint64_t)r->cfg.isr_lag_ticks;
+}
+
+/* One ISR change at a time: drop a member that lags or answers as another instance, else add a caught-up one.
+ *
+ * Joining (§8.1 step 5) needs the learner's log at the commit point. Under writes that never pause the commit point
+ * runs ahead of a learner that keeps up with the leader only as closely as its round trip allows, so a learner would
+ * join only in a pause of the writes (with a lone leader: never; the merge's jepsen-cluster kill run, a replica out
+ * for 30 minutes). So a learner within half isr_lag of the leader's end has the commit point held for it: advance()
+ * counts it as a member from then on, the commit point stops where it is until the learner has it, and the learner is
+ * asked for as soon as its log reaches the commit point, which then cannot have passed it. The hold ends after
+ * join_hold_ticks if the learner has not got there (the writes waited that long, as for a member that lags).
+ * Safety: the hold only adds a node to the minimum, so a commit point is never higher than without it; what the
+ * metadata group records is asked for only when the learner holds every position up to the commit point, and from the
+ * ask on the maximal ISR counts it (as before). Nothing acknowledged relies on a member the group has not recorded. */
 static void isr_check(struct repl *r)
 {
+    if (r->join >= 0) {
+        const struct peer *p = &r->peer[r->join];
+        if ((r->meta.isr & (1u << r->join)) || r->meta.epoch != r->epoch)
+            join_end(r, 0);
+        else if (p->rid != r->join_rid || r->now - r->join_tick >= r->cfg.join_hold_ticks)
+            join_end(r, 1);
+    }
     if (r->isr_busy || r->meta.epoch != r->epoch)
         return;
     uint32_t isr = r->meta.isr;
@@ -602,10 +635,14 @@ static void isr_check(struct repl *r)
              * idle volume's ISR (and min_isr) says who is there; heartbeats keep a live member heard */
             (lagged && !MUT(29) && !MUT(40) && r->now - p->last_heard >= r->cfg.isr_lag_ticks) ||
             (grace && (r->unans & (1u << i)) && !p->rid)) {
+            join_end(r, 0);
             isr_request(r, isr & ~(1u << i), -1, 0);
             return;
         }
     }
+    /* what the leader had written half isr_lag ago: a learner that has it may have the commit point held for it */
+    int half = lagged && r->cfg.join_hold_ticks && !MUT(42);
+    uint64_t near = half ? wend_at(r, r->now - r->cfg.isr_lag_ticks / 2) : 0;
     for (int i = 0; i < r->cfg.nnodes; i++) {
         if (i == r->cfg.self || (isr & (1u << i)))
             continue;
@@ -615,8 +652,18 @@ static void isr_check(struct repl *r)
          * up to its EPOCH marker may be committed already. */
         uint64_t start = r->nhist ? r->hist[r->nhist - 1].start : 0;
         if (p->rid && p->match >= r->commit && p->match >= old && (p->match >= start || MUT(12))) {
+            join_end(r, 0);
             isr_request(r, isr | (1u << i), i, p->rid);
             return;
+        }
+        if (half && r->join < 0 && r->now >= r->join_retry && p->rid && p->match >= near && p->match >= start) {
+            if (MUT(41)) { /* planted: asked for within the bound, without waiting for the commit point */
+                isr_request(r, isr | (1u << i), i, p->rid);
+                return;
+            }
+            r->join = i;
+            r->join_rid = p->rid;
+            r->join_tick = r->now;
         }
     }
 }
@@ -639,6 +686,8 @@ static void lead(struct repl *r, const struct repl_vmeta *v)
     r->resigning = 0;
     r->unans = v->unanswered & ~(1u << r->cfg.self);
     r->isr_busy = 0;
+    r->join = -1;
+    r->join_retry = 0;
     r->npend = r->hpend = 0;
     memset(r->peer, 0, sizeof r->peer);
     for (int i = 0; i < r->cfg.nnodes; i++)
@@ -952,6 +1001,7 @@ struct repl *repl_open(const struct repl_config *cfg, const struct repl_durable 
     if (!r)
         return NULL;
     r->cfg = *cfg;
+    r->join = -1;
     r->nwend = cfg->isr_lag_ticks + 1;
     r->wend = calloc(r->nwend, sizeof *r->wend);
     if (!r->wend) {
@@ -1062,6 +1112,9 @@ size_t repl_describe(const struct repl *r, char *buf, size_t cap)
          (unsigned long long)r->written, (unsigned long long)r->durable, (unsigned long long)r->commit,
          (unsigned long long)r->applied, r->meta.isr, (unsigned long long)r->meta.isr_version,
          r->isr_busy ? ", a change asked for" : "", r->npend - r->hpend);
+    if (r->join >= 0)
+        DESC(", the commit point held for learner %d for %llu ticks", r->join,
+             (unsigned long long)(r->now - r->join_tick));
     for (int i = 0; i < r->cfg.nnodes; i++)
         if (i != r->cfg.self)
             DESC("; peer %d: match %llu, acked %llu, next %llu, rid %s, heard %llu ticks ago", i,
