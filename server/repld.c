@@ -40,11 +40,15 @@
  * Mutants (TSDB_REPLD_MUTANT, tests only; NOTES of r3d-stream says which test catches each): `commitbyleader` commits
  * at the writer's own durable end, `ackbeforesync` has a follower report its written end as durable without a sync,
  * `floornotsaved` skips the REPL file's SAVE, `nodepose` never deposes a failed writer, `noquiesce` leaves a failed
- * volume's engine reachable (D13; test_cluster writerfail catches both). Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]:
- * `dropbulk` has the first bulk file this process receives taken as staged but not kept, so its COMMIT marker finds
+ * volume's engine reachable (D13; test_cluster writerfail catches both); test_cluster repcheck catches `floornottold`
+ * (a replica's saved floor never reaches its engine: its flushed segments stay), `unsureignored` (an unsure REPL taken
+ * as it stands) and `admitnocheck` (no check of the core's position against the log number), and measures
+ * `nofastpath` (records go out on the tick only) and `hbnoclamp` (a heartbeat names positions not sent yet).
+ * Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first bulk file this process receives taken as staged but not kept, so its COMMIT marker finds
  * the file missing and FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER
  * (writes then reach the new writer while the driver still promotes: they must be refused for a retry, never depose
- * it).
+ * it); `skippos` has one admit take a position more once the file <dir>/skippos exists (the check in op_admit must
+ * fail the volume before the write is acknowledged).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -131,7 +135,19 @@ struct rvol {
     struct jr_ops ops;
 };
 
-enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_NODEPOSE, RM_NOQUIESCE };
+enum {
+    RM_NONE,
+    RM_COMMITBYLEADER,
+    RM_ACKBEFORESYNC,
+    RM_FLOORNOTSAVED,
+    RM_NODEPOSE,
+    RM_NOQUIESCE,
+    RM_NOFASTPATH,
+    RM_FLOORNOTTOLD,
+    RM_HBNOCLAMP,
+    RM_UNSUREIGNORED,
+    RM_ADMITNOCHECK
+};
 
 static struct {
     pthread_mutex_t mu;
@@ -151,6 +167,7 @@ static struct {
     int mutant; /* RM_*: tests only */
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
+    int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -490,7 +507,8 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
     }
     for (int i = 0; i < (int)rv->rec.nrep; i++) {
         struct rpeer *p = &rv->peer[i];
-        if (i != rv->self && p->sent + 1 == first && send_records(rv, i, seq, off, buf, len, first) == 0) {
+        if (i != rv->self && p->sent + 1 == first && G.mutant != RM_NOFASTPATH &&
+            send_records(rv, i, seq, off, buf, len, first) == 0) {
             p->sent = last;
             p->sent_ms = now_ms();
         }
@@ -517,7 +535,15 @@ static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
         return TSDB_ERR_UNAVAILABLE;
     }
     int rc = rv->mode == M_WRITER && rv->core ? repl_write(rv->core, span, &pos) : REPL_E_NOTLEADER;
-    if (rc == REPL_OK && pos != fno) {
+    if (rc == REPL_OK && G.skip_pos == 1) { /* the fault: the core's positions run one ahead of the log numbers */
+        char f[sizeof G.dir + 16];
+        snprintf(f, sizeof f, "%s/skippos", G.dir);
+        if (access(f, F_OK) == 0) {
+            G.skip_pos = 2;
+            rc = repl_write(rv->core, 1, &pos);
+        }
+    }
+    if (rc == REPL_OK && pos != fno && G.mutant != RM_ADMITNOCHECK) {
         eng_fail(db, "replication: the core's position is not the log number", TSDB_ERR_CORRUPT);
         rc = REPL_E_FAILED;
     }
@@ -951,7 +977,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
             pthread_mutex_lock(&rv->mu);
         } else if (a->floor) {
             pthread_mutex_unlock(&rv->mu);
-            rc = replica_floor_saved(db, a->floor);
+            rc = G.mutant == RM_FLOORNOTTOLD ? 0 : replica_floor_saved(db, a->floor);
             pthread_mutex_lock(&rv->mu);
         }
         log_start_check(rv);
@@ -969,7 +995,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
             if (a->upto <= a->msg.prev_pos) {
                 /* a heartbeat: the commit point, after what the peer has been sent */
                 struct repl_msg m = a->msg;
-                if (m.prev_pos > p->sent)
+                if (m.prev_pos > p->sent && G.mutant != RM_HBNOCLAMP)
                     m.prev_pos = p->sent;
                 m.prev_epoch = epoch_at(rv, m.prev_pos);
                 send_msg(rv, &m);
@@ -1276,12 +1302,18 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "floornotsaved")  ? RM_FLOORNOTSAVED
                : !strcmp(mu, "nodepose")       ? RM_NODEPOSE
                : !strcmp(mu, "noquiesce")      ? RM_NOQUIESCE
+               : !strcmp(mu, "nofastpath")     ? RM_NOFASTPATH
+               : !strcmp(mu, "floornottold")   ? RM_FLOORNOTTOLD
+               : !strcmp(mu, "hbnoclamp")      ? RM_HBNOCLAMP
+               : !strcmp(mu, "unsureignored")  ? RM_UNSUREIGNORED
+               : !strcmp(mu, "admitnocheck")   ? RM_ADMITNOCHECK
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
     const char *te = getenv("TSDB_REPLD_TEST");
     G.drop_bulk = te && strstr(te, "dropbulk");
     G.promote_wait = te && strstr(te, "promotewait");
+    G.skip_pos = te && strstr(te, "skippos");
     G.t = t;
     snprintf(G.dir, sizeof G.dir, "%s", dir);
 }
@@ -1310,12 +1342,15 @@ int repld_open(const struct cluster_vol_rec *r)
         say("volume %" PRIu32 ": REPL of %s: %s", r->number, rv->dir, rc ? tsdb_strerror(rc) : "not a replica here");
         goto fail;
     }
-    if (rv->st.unsure) {
+    if (rv->st.unsure && G.mutant != RM_UNSUREIGNORED) {
         /* fence, led, floor and log start are not trusted (replfile.h): the group's epoch stands in for fence and
          * led (this replica never leads the epoch it may have led, and refuses everything older), the floor is
          * the engine's to find again from the leader's commit point, the log start from the segments */
         uint64_t e = rv->st.fence > r->epoch ? rv->st.fence : r->epoch;
         rv->st.fence = rv->st.led = e;
+        /* this save is the one that makes the file trusted again (replfile_save clears the flag only with led = fence);
+         * kept set, every later open would take the group's epoch over its own fence again and say unsure forever */
+        rv->st.unsure = false;
         rc = replfile_save(rv->rf, &rv->st);
         if (rc != 0) {
             say("volume %" PRIu32 ": REPL of %s is unsure and could not be saved: %s", r->number, rv->dir,

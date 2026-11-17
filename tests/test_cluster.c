@@ -4103,6 +4103,199 @@ static void scen_hungloop(void)
     printf("  its loop ran again: UP after %" PRIu64 " ms\n", now_ms() - t0);
 }
 
+/* the WAL segments in server i's directory of volume num */
+static int wal_count(int i, uint32_t num)
+{
+    char dir[PATH_MAX + 120];
+    snprintf(dir, sizeof dir, "%s/n%d/v%" PRIu32, base, i, num);
+    DIR *d = opendir(dir);
+    if (!d)
+        die("%s: %s", dir, strerror(errno));
+    int n = 0;
+    errno = 0;
+    for (struct dirent *e; (e = readdir(d));)
+        n += !strncmp(e->d_name, "wal_", 4);
+    if (errno)
+        die("readdir %s: %s", dir, strerror(errno));
+    closedir(d);
+    return n;
+}
+
+/* the newer valid-looking slot of server i's REPL of volume num (by generation): its page */
+static void repl_page(int i, uint32_t num, uint8_t pg[2][4096], int *newer, char *path, size_t pn)
+{
+    snprintf(path, pn, "%s/n%d/v%" PRIu32 "/REPL", base, i, num);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || pread(fd, pg, 2 * 4096, 0) != 2 * 4096)
+        die("%s: %s", path, strerror(errno));
+    close(fd);
+    uint64_t g0, g1;
+    memcpy(&g0, pg[0] + 8, 8);
+    memcpy(&g1, pg[1] + 8, 8);
+    *newer = g1 > g0;
+}
+
+static uint64_t now_us(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* repcheck: three duties of the replication driver that no other scenario sees, each the target of one of its mutants
+ * (server/repld.c): a replica's saved floor reaches its engine, which then removes its flushed segments (floornottold
+ * keeps them all); a replica whose newest REPL slot is damaged opens "unsure" and its first save at the open takes the
+ * group's epoch as fence and led, which clears the flag (unsureignored keeps the older slot's values and the flag);
+ * a write whose position in the core is not its log number fails the volume before it is acknowledged (admitnocheck
+ * acknowledges it; the fault is TSDB_REPLD_TEST=skippos). It also prints the latency of single-row writes (the fast
+ * path sends a batch to the replicas from the bytes callback; nofastpath leaves that to the 5 ms tick). */
+static void scen_repcheck(void)
+{
+    scenario("repcheck");
+    for (int i = 0; i < 3; i++) {
+        xargs[i] = "--flush-interval-ms 200";
+        penv[i] = "TSDB_REPLD_TEST=skippos";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    int R = (L + 1) % 3;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+
+    /* single-row writes over about 2 s: flushes every 200 ms on every node. TSDB_TEST_ACK_MS (tests/repld_mutants.sh)
+     * bounds their median, the best of up to three rounds: the fast path sends a batch from the bytes callback, the
+     * tick would add up to 5 ms to each write */
+    enum { NW = 300 };
+    static uint64_t lat[NW];
+    const char *ackms = getenv("TSDB_TEST_ACK_MS");
+    double best = 1e9;
+    for (int round = 0; round < 3; round++) {
+        for (int j = 0; j < NW; j++) {
+            int64_t ts = 1000 + 1000LL * (j + NW * round);
+            float val = (float)j;
+            uint64_t t0 = now_us();
+            if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+                die("small insert %d: %s", j, ers(rc));
+            lat[j] = now_us() - t0;
+            if (j % 20 == 19)
+                usleep(120000);
+        }
+        qsort(lat, NW, sizeof lat[0], cmp_u64);
+        printf("  %d single-row writes on a volume of 3 replicas: median %.2f ms, 90th percentile %.2f ms\n", NW,
+               lat[NW / 2] / 1000.0, lat[NW * 9 / 10] / 1000.0);
+        best = lat[NW / 2] / 1000.0 < best ? lat[NW / 2] / 1000.0 : best;
+        if (!ackms || best < atof(ackms))
+            break;
+    }
+    if (ackms && best >= atof(ackms))
+        die("the median latency of a single-row write is %.2f ms (best of three rounds), not below %s ms", best, ackms);
+    int nw = 0;
+    uint64_t t0 = now_ms();
+    for (;;) {
+        nw = wal_count(R, num);
+        if (nw <= 2)
+            break;
+        if (now_ms() - t0 > 20000)
+            die("replica %d still holds %d WAL segments 20 s after the writes (its saved floor never removed its "
+                "flushed segments)", R, nw);
+        usleep(100000);
+    }
+    printf("  the replica removed its flushed segments once its floor was saved (%d left)\n", nw);
+
+    /* damage the newer REPL slot of the replica, restart it: it opens unsure, and the open's save clears that */
+    stop(R, SIGTERM);
+    uint8_t pg[2][4096];
+    int nk;
+    char path[PATH_MAX + 120];
+    repl_page(R, num, pg, &nk, path, sizeof path);
+    {
+        int fd = open(path, O_WRONLY | O_CLOEXEC);
+        uint8_t b = pg[nk][30] ^ 0x5a; /* inside the volume uuid: the slot's checksum fails */
+        if (fd < 0 || pwrite(fd, &b, 1, (off_t)nk * 4096 + 30) != 1 || fsync(fd) != 0)
+            die("damaging %s: %s", path, strerror(errno));
+        close(fd);
+    }
+    uint64_t rid, gen;
+    {
+        uint64_t g;
+        memcpy(&g, pg[nk] + 80, 8);
+        gen = g;
+        memcpy(&rid, pg[nk] + 72, 8);
+    }
+    /* the open generation is registered by the volume manager before the driver opens (and saves REPL): wait for the
+     * driver's line */
+    int opens = log_count(R, " of 3, log ");
+    start(R);
+    await_open_gen(L, "plant", R, gen + 1, rid);
+    await_log_count(R, " of 3, log ", opens + 1, 30000);
+    if (!vol_rec(L, "plant", &v))
+        die("no record of plant");
+    uint64_t epoch = v.epoch;
+    stop(R, SIGTERM);
+    repl_page(R, num, pg, &nk, path, sizeof path);
+    uint32_t unsure;
+    uint64_t fence, led;
+    memcpy(&unsure, pg[nk] + 60, 4);
+    memcpy(&fence, pg[nk] + 88, 8);
+    memcpy(&led, pg[nk] + 96, 8);
+    if (unsure != 0 || fence != led || fence < epoch)
+        die("replica %d opened with a damaged REPL slot and saved unsure %u, fence %" PRIu64 ", led %" PRIu64
+            " (the group's epoch is %" PRIu64 ")", R, unsure, fence, led, epoch);
+    printf("  a replica with a damaged REPL slot opened unsure and took the group's epoch %" PRIu64 " as its fence\n",
+           epoch);
+    start(R);
+    await_open_gen(L, "plant", R, gen + 2, rid);
+    await_log_count(R, " of 3, log ", opens + 2, 30000);
+
+    /* the core's position one ahead of the log number: the write fails the volume, unacknowledged */
+    char skip[PATH_MAX + 80];
+    snprintf(skip, sizeof skip, "%s/n%d/skippos", base, L);
+    int fd = open(skip, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0)
+        die("%s: %s", skip, strerror(errno));
+    close(fd);
+    struct rep_writer w = {cports[L], id, 5000000, 1, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    t0 = now_ms();
+    while (!__atomic_load_n(&w.done, __ATOMIC_ACQUIRE)) {
+        if (now_ms() - t0 > 15000)
+            die("a write whose core position is not its log number neither failed nor was acknowledged in 15 s");
+        usleep(10000);
+    }
+    pthread_join(th, NULL);
+    if (w.rc == 0)
+        die("a write whose core position is not its log number was acknowledged");
+    if (!log_has(L, "the core's position is not the log number"))
+        die("the leader did not fail the volume on a core position that is not the log number");
+    printf("  a write whose core position is not its log number failed the volume (%s), unacknowledged\n", ers(w.rc));
+    tsdbc_close(c);
+    stop_all();
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -4136,7 +4329,8 @@ int main(int argc, char **argv)
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
                {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
-               {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot}};
+               {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
+               {"repcheck", scen_repcheck}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
