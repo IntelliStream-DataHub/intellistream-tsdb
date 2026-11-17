@@ -156,6 +156,8 @@ struct repl_config {
                                      ticks ago is removed (isr_lag_ms, §6.1) */
     uint32_t resend_ticks;        /* resend unanswered appends, queries, ISR requests */
     uint32_t heartbeat_ticks;     /* an empty APPEND with the commit point at least this often (§4.2: 5 ms) */
+    uint32_t idle_heartbeat_ticks; /* but only this often while a peer has nothing new: no positions to send and the
+                                      commit point it was last sent (an idle volume; 0: heartbeat_ticks) */
     uint32_t floor_ticks;         /* save the commit floor at most this often (§4.2: once a second) */
     uint32_t max_batch;           /* positions per APPEND */
     uint32_t window;              /* positions in flight per replica */

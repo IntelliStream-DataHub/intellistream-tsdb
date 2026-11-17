@@ -3306,6 +3306,96 @@ static int wal_count(int i)
 
 /* The keep caps (design-cluster.md 8.3): a replica out of the ISR holds the leader's flushed segments only for
  * repl_retain_s (2 s here); past it they go, and the replica, back, is told it needs a snapshot and stays a learner. */
+/* backpressure into a replica (r3d review M3): a replica that stops handling its peer frames (TSDB_REPLD_TEST=stallinbox
+ * while <dir>/stallinbox exists: a stalled disk's stand-in) leaves the ISR, and with a small inbox bound (smallinbox)
+ * drops the frames past the bound instead of holding the leader's stream in memory; unstalled, it catches up from the
+ * resends and grows back; a part above the spill threshold (spill: 64
+ * KiB) is received into a stage_s* file, not memory, and every replica ends with the leader's rows */
+static void scen_backpressure(void)
+{
+    scenario("backpressure");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=spill";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    int R = (L + 1) % 3, S2 = (L + 2) % 3;
+    stop(R, SIGTERM);
+    penv[R] = "TSDB_REPLD_TEST=spill,smallinbox,stallinbox";
+    start(R);
+    tsdbc *c = client(L);
+    tsdb_sid id[REP_NAMES];
+    for (int k = 0; k < REP_NAMES; k++)
+        id[k] = rep_series(c, rep_names[k], "plant", 30000);
+    await_isr(L, "plant", 3, 15000, "every replica up");
+    uint64_t n[REP_NAMES] = {0};
+    /* R stalls: it leaves the ISR and the writes go on at full speed, streamed to R, whose inbox fills */
+    char stall[PATH_MAX + 80];
+    server_dir(R, stall, sizeof stall);
+    strcat(stall, "/stallinbox");
+    FILE *sf = fopen(stall, "w");
+    if (!sf)
+        die("create %s", stall);
+    fclose(sf);
+    /* 1000-row writes from four connections for 4 s */
+    struct rep_writer w[4];
+    pthread_t th[4];
+    uint64_t t0 = now_ms();
+    int rounds = 0;
+    while (now_ms() - t0 < 4000) {
+        for (int k = 0; k < 4; k++) {
+            w[k] = (struct rep_writer){cports[L], id[0], 4000000LL * rounds + 1000000LL * k, 0, 0, 0,
+                                       1000};
+            if (pthread_create(&th[k], NULL, rep_write_thread, &w[k]) != 0)
+                die("pthread_create");
+        }
+        for (int k = 0; k < 4; k++) {
+            pthread_join(th[k], NULL);
+            if (w[k].rc != 0)
+                die("a write with a stalled replica: %s", ers(w[k].rc));
+        }
+        n[0] += 4000;
+        rounds++;
+    }
+    /* and a large write: its part is shipped as a file above the spill threshold */
+    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000};
+    rep_write_thread(&wb);
+    if (wb.rc != 0)
+        die("a large write with a stalled replica: %s", ers(wb.rc));
+    n[2] += 100000;
+    if (!log_has(R, "frames are dropped"))
+        die("the stalled replica held the leader's whole stream in its inbox (no frame dropped at the bound)");
+    unlink(stall);
+    if (!log_has(S2, "not into memory"))
+        die("a replica received a part above the spill threshold into memory");
+    await_isr(L, "plant", 3, 60000, "the stalled replica catching up");
+    if ((uint64_t)rows_of(c, id[0]) != n[0])
+        die("the leader reads %d rows of %s, not %" PRIu64, rows_of(c, id[0]), rep_names[0], n[0]);
+    tsdbc_close(c);
+    stop_all();
+    for (int i = 0; i < 3; i++)
+        penv[i] = NULL;
+    rep_same(n, "after a clean stop");
+    printf("  a stalled replica drops frames past its inbox bound and catches up (%d rounds of writes), a large part is"
+           " received into a file; every replica holds the leader's rows\n", rounds);
+}
+
 static void scen_keepcap(void)
 {
     scenario("keepcap");
@@ -4161,7 +4251,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"backpressure", scen_backpressure}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {

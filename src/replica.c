@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -796,6 +797,73 @@ int replica_stage(eng *db, const char *name, const void *buf, size_t len)
         unlinkat(db->dirfd, trunc ? sp : tp, 0); /* the name that held the old bytes is untouched (not so in place) */
         pthread_mutex_unlock(&rp->stage_mu);
         return rc;
+    }
+    rp_lock(rp);
+    rc = stg_put(rp, key, len, xx);
+    pthread_mutex_unlock(&rp->mu);
+    pthread_mutex_unlock(&rp->stage_mu);
+    return rc;
+}
+
+int replica_spill_open(eng *db, char *tmp, size_t cap)
+{
+    static unsigned seq;
+    if (!db->rp || cap < 48)
+        return TSDB_ERR_INVALID;
+    snprintf(tmp, cap, "stage_s%d_%u.tmp", (int)getpid(), __atomic_fetch_add(&seq, 1, __ATOMIC_RELAXED));
+    unlinkat(db->dirfd, tmp, 0); /* a new inode always (a failed write may have left pages dropped under an old one) */
+    int fd = openat(db->dirfd, tmp, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    return fd < 0 ? TSDB_ERR_IO : fd;
+}
+
+void replica_spill_drop(eng *db, const char *tmp)
+{
+    if (db && tmp && tmp[0])
+        unlinkat(db->dirfd, tmp, 0);
+}
+
+int replica_stage_spilled(eng *db, const char *name, int fd, const char *tmp, size_t len)
+{
+    struct replica *rp = db->rp;
+    struct stat st;
+    if (!rp || !name || !part_file_name(name) || strlen(name) >= 64 || len == 0 || fd < 0 ||
+        strncmp(tmp, "stage_s", 7) != 0) {
+        replica_spill_drop(db, tmp);
+        return TSDB_ERR_INVALID;
+    }
+    if (fstat(fd, &st) != 0 || (uint64_t)st.st_size != len) {
+        replica_spill_drop(db, tmp);
+        return TSDB_ERR_IO;
+    }
+    void *m = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0); /* the page cache, never the heap */
+    if (m == MAP_FAILED) {
+        replica_spill_drop(db, tmp);
+        return TSDB_ERR_IO;
+    }
+    uint64_t key = stage_key(name), xx = xxh64(m, len, 0);
+    munmap(m, len);
+    char sp[40];
+    stage_path(sp, sizeof sp, key);
+    pthread_mutex_lock(&rp->stage_mu);
+    int rc = 0;
+    rp_lock(rp);
+    const struct rstg *old = stg_find(rp, key);
+    if (old && old->size == len && old->xxh == xx)
+        rc = 1; /* staged already */
+    else if (old && stage_wanted(rp, key, old->size, old->xxh))
+        rc = TSDB_ERR_INVALID;
+    pthread_mutex_unlock(&rp->mu);
+    const bool sync = db->opt.fsync && eng_test_mutant != MUT_REPLICA_NO_STAGE_SYNC;
+    if (rc == 0 && sync && tsdb_fdatasync(fd) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && renameat(db->dirfd, tmp, db->dirfd, sp) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && sync && tsdb_fsync(db->dirfd) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc) {
+        unlinkat(db->dirfd, tmp, 0);
+        pthread_mutex_unlock(&rp->stage_mu);
+        return rc == 1 ? 0 : rc;
     }
     rp_lock(rp);
     rc = stg_put(rp, key, len, xx);

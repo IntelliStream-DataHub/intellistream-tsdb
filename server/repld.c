@@ -70,6 +70,10 @@
 #include "../src/replica.h"
 
 #define TICK_MS 5
+#define SPILL_BYTES (16u << 20) /* a bulk file above this is received into a file, not memory (r3d review M3) */
+#define INBOX_BYTES (64u << 20) /* a volume's inbox of peer frames: past it the link waits, then drops (M3) */
+#define INBOX_WAIT_MS 500       /* how long a link's thread waits for room (well below a link's dead_ms) */
+#define IDLE_HEARTBEAT_MS 100 /* an idle volume's empty APPEND per peer (r3d review L1: was every tick) */
 #define NOW_EVERY_MS 1000 /* a leader's NOW markers (design-cluster.md 5.4): its replicas' retention clock lags by at most this */
 #define RESEND_MS 50
 #define READ_CAP (4u << 20)
@@ -112,6 +116,9 @@ struct rvol {
     struct rpeer peer[REPL_MAX_NODES];
     uint64_t open_ms; /* when its driver started: a peer never heard counts as unheard since then */
     struct item *in_head, *in_tail;
+    size_t in_bytes;         /* of peer frames in the inbox (bounded: inbox_bytes) */
+    pthread_cond_t in_space; /* a link's thread waits here for room */
+    int in_waiters, in_full; /* in_full: the bound was hit and said, until the inbox empties */
     /* the index: starts of the WAL records from the log start, ascending; idx_end the last position indexed */
     uint64_t *idx;
     size_t nidx, cidx;
@@ -144,7 +151,7 @@ struct rvol {
 };
 
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
-       RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL };
+       RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL, RM_NOSPILL, RM_NOINBOXBOUND };
 
 static struct {
     pthread_mutex_t mu;
@@ -162,6 +169,11 @@ static struct {
     uint32_t nvols;
     uint64_t fileno;
     int mutant; /* RM_*: tests only */
+    uint64_t spill_bytes; /* a bulk file larger than this is received into a spill file (TSDB_REPLD_TEST=spill: 64 KiB) */
+    int spill_said;
+    size_t inbox_bytes; /* INBOX_BYTES (TSDB_REPLD_TEST=smallinbox: 256 KiB) */
+    int stall_inbox;    /* TSDB_REPLD_TEST=stallinbox: no peer frame is handled while <dir>/stallinbox exists (a
+                           stalled disk's stand-in) */
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
     struct rin *ins; /* bulk files being received */
@@ -813,8 +825,27 @@ struct rin {
     uint64_t file, total;
     uint32_t volume;
     char name[RW_NAME_MAX + 1];
-    uint8_t *buf;
+    uint8_t *buf; /* the file in memory, or NULL: it goes to the spill file `tmp` (fd) of the volume's directory */
+    int fd;
+    char tmp[48];
 };
+
+/* frees a receive and removes its spill file (a transfer that did not end in a stage) */
+static void rin_free(struct rin *r)
+{
+    if (!r)
+        return;
+    if (r->fd >= 0)
+        close(r->fd);
+    if (r->tmp[0]) {
+        struct eng *db = tsdb_cvol_ref(G.t, r->volume);
+        if (db)
+            replica_spill_drop(db, r->tmp);
+        tsdb_cvol_unref(&db);
+    }
+    free(r->buf);
+    free(r);
+}
 
 static struct rin *rin_find(struct plink *l, uint64_t file, int unlink_it)
 {
@@ -834,8 +865,30 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
     (void)arg;
     struct rin *r = calloc(1, sizeof *r);
     uint64_t size;
-    if (!r || rw_decode_bulk_meta(meta, meta_len, &r->volume, &size, r->name, sizeof r->name) != 0 ||
-        size != total || total > (1ull << 32) || !vol_find(r->volume) || !(r->buf = malloc(total ? total : 1))) {
+    if (!r)
+        return -1;
+    r->fd = -1;
+    if (rw_decode_bulk_meta(meta, meta_len, &r->volume, &size, r->name, sizeof r->name) != 0 || size != total ||
+        total > (1ull << 32) || !vol_find(r->volume)) {
+        free(r);
+        return -1;
+    }
+    if (total > G.spill_bytes) {
+        /* a large file goes to disk as it arrives, never whole into memory (r3d review M3) */
+        struct eng *db = tsdb_cvol_ref(G.t, r->volume);
+        r->fd = db ? replica_spill_open(db, r->tmp, sizeof r->tmp) : -1;
+        tsdb_cvol_unref(&db);
+        if (r->fd < 0) {
+            r->tmp[0] = 0;
+            free(r);
+            return -1;
+        }
+        if (!G.spill_said) {
+            G.spill_said = 1;
+            say("volume %" PRIu32 ": receives %s (%" PRIu64 " bytes) into %s, not into memory", r->volume, r->name,
+                total, r->tmp);
+        }
+    } else if (!(r->buf = malloc(total ? total : 1))) {
         free(r);
         return -1;
     }
@@ -844,13 +897,10 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
     *prefix_fd = -1;
     pthread_mutex_lock(&G.mu);
     struct rin *old = rin_find(l, file, 1); /* the same file begun again (a reconnect): from 0 */
-    if (old) {
-        free(old->buf);
-        free(old);
-    }
     r->next = G.ins;
     G.ins = r;
     pthread_mutex_unlock(&G.mu);
+    rin_free(old);
     return 0;
 }
 
@@ -864,7 +914,17 @@ static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, con
     pthread_mutex_unlock(&G.mu);
     if (!r || off > r->total || n > r->total - off)
         return -1;
-    memcpy(r->buf + off, p, n);
+    if (r->buf)
+        memcpy(r->buf + off, p, n);
+    else
+        for (size_t done = 0; done < n;) {
+            ssize_t w = pwrite(r->fd, (const uint8_t *)p + done, n - done, (off_t)(off + done));
+            if (w < 0 && errno == EINTR)
+                continue;
+            if (w <= 0)
+                return -1; /* the sender stops; bin_end removes the file */
+            done += (size_t)w;
+        }
     if (off + n < r->total)
         return 0;
     /* the last bytes: staged (file and directory synced) before the sender hears DONE */
@@ -879,7 +939,13 @@ static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, con
         return 0;
     }
     struct eng *db = tsdb_cvol_ref(G.t, r->volume);
-    int rc = db ? replica_stage(db, r->name, r->buf, r->total) : TSDB_ERR_UNAVAILABLE;
+    int rc = TSDB_ERR_UNAVAILABLE;
+    if (db && r->buf)
+        rc = replica_stage(db, r->name, r->buf, r->total);
+    else if (db) {
+        rc = replica_stage_spilled(db, r->name, r->fd, r->tmp, r->total);
+        r->tmp[0] = 0; /* renamed, or removed by the failed stage */
+    }
     tsdb_cvol_unref(&db);
     if (rc == 0)
         post(rv, IN_WAKE, 0, NULL, 0); /* a COMMIT may be durable now: sync and ACK */
@@ -892,13 +958,64 @@ static void bin_end(void *arg, struct plink *l, uint64_t file, int status)
     pthread_mutex_lock(&G.mu);
     struct rin *r = rin_find(l, file, 1);
     pthread_mutex_unlock(&G.mu);
-    if (r) {
-        free(r->buf);
-        free(r);
-    }
+    rin_free(r);
 }
 
 /* ------------------------------------------------------------------ the inbox */
+
+static int peer_kind(int kind) { return kind == IN_MSG || kind == IN_FETCH; }
+
+/* the volume's thread took `it` off the inbox */
+static void inbox_took(struct rvol *rv, const struct item *it)
+{
+    if (!peer_kind(it->kind))
+        return;
+    rv->in_bytes -= sizeof *it + it->n;
+    if (rv->in_waiters)
+        pthread_cond_broadcast(&rv->in_space);
+    if (!rv->in_bytes && rv->in_full) {
+        rv->in_full = 0;
+        say("volume %" PRIu32 ": the inbox is empty again", rv->number);
+    }
+    if (G.stall_inbox) {
+        char f[sizeof G.dir + 16];
+        snprintf(f, sizeof f, "%s/stallinbox", G.dir);
+        pthread_mutex_unlock(&rv->mu);
+        for (struct timespec w = {0, 10000000}; access(f, F_OK) == 0;)
+            nanosleep(&w, NULL);
+        pthread_mutex_lock(&rv->mu);
+    }
+}
+
+/* Room in the inbox for a peer frame of `need` bytes (rv->mu held), else 0: the link's thread waits a little (which
+ * stops reading the link: TCP pushes back on the sender), then the frame is dropped and the core sends it again. The
+ * inbox is never larger than the bound plus one frame (a frame alone always gets in), and local items are not counted
+ * (they are small and must not be lost). A failed volume reads nothing: its frames are dropped at once. */
+static int inbox_room(struct rvol *rv, size_t need)
+{
+    if (rv->in_bytes + need <= G.inbox_bytes || !rv->in_bytes)
+        return 1;
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_nsec += INBOX_WAIT_MS * 1000000L;
+    dl.tv_sec += dl.tv_nsec / 1000000000L;
+    dl.tv_nsec %= 1000000000L;
+    while (!rv->stop && !rv->failed && rv->in_bytes && rv->in_bytes + need > G.inbox_bytes) {
+        rv->in_waiters++;
+        int rc = pthread_cond_timedwait(&rv->in_space, &rv->mu, &dl);
+        rv->in_waiters--;
+        if (rc == ETIMEDOUT)
+            break;
+    }
+    if (rv->in_bytes + need <= G.inbox_bytes || !rv->in_bytes)
+        return 1;
+    if (!rv->in_full) {
+        rv->in_full = 1;
+        say("volume %" PRIu32 ": the inbox holds %zu bytes of peer frames, its bound: frames are dropped (sent again)",
+            rv->number, rv->in_bytes);
+    }
+    return 0;
+}
 
 static void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n)
 {
@@ -909,6 +1026,14 @@ static void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t
     if (n)
         memcpy(it->data, p, n);
     pthread_mutex_lock(&rv->mu);
+    if (peer_kind(kind)) {
+        if (!inbox_room(rv, sizeof *it + n)) {
+            pthread_mutex_unlock(&rv->mu);
+            free(it);
+            return;
+        }
+        rv->in_bytes += sizeof *it + n;
+    }
     if (rv->in_tail)
         rv->in_tail->next = it;
     else
@@ -1376,20 +1501,23 @@ static void *vol_main(void *arg)
             pthread_cond_wait(&rv->cv, &rv->mu);
             continue;
         }
-        if (rv->in_head) {
+        /* a tick that is due goes before the inbox (r3d review L2): under a steady stream of ACKs the inbox is never
+         * empty, and the ticks (catch-up of a lagging peer, resends, the ISR check) would wait for it */
+        uint64_t now = now_ms();
+        if (rv->in_head && now < next_tick) {
             struct item *it = rv->in_head;
             rv->in_head = it->next;
             if (!rv->in_head)
                 rv->in_tail = NULL;
+            inbox_took(rv, it);
             handle(rv, it);
             free(it);
             continue;
         }
-        if (rv->sync_wanted) {
+        if (rv->sync_wanted && now < next_tick) {
             do_sync(rv);
             continue;
         }
-        uint64_t now = now_ms();
         if (now >= next_tick) {
             repl_tick(rv->core);
             next_tick += TICK_MS;
@@ -1481,12 +1609,21 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "shipperfile")    ? RM_SHIPPERFILE
                : !strcmp(mu, "nocap")          ? RM_NOCAP
                : !strcmp(mu, "noseal")         ? RM_NOSEAL
+               : !strcmp(mu, "nospill")        ? RM_NOSPILL
+               : !strcmp(mu, "noinboxbound")   ? RM_NOINBOXBOUND
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
     const char *te = getenv("TSDB_REPLD_TEST");
     G.drop_bulk = te && strstr(te, "dropbulk");
     G.promote_wait = te && strstr(te, "promotewait");
+    G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
+    if (G.mutant == RM_NOINBOXBOUND)
+        G.inbox_bytes = SIZE_MAX;
+    G.stall_inbox = te && strstr(te, "stallinbox");
+    G.spill_bytes = te && strstr(te, "spill") ? 64u << 10 : SPILL_BYTES;
+    if (G.mutant == RM_NOSPILL)
+        G.spill_bytes = UINT64_MAX;
     G.t = t;
     snprintf(G.dir, sizeof G.dir, "%s", dir);
 }
@@ -1505,6 +1642,7 @@ int repld_open(const struct cluster_vol_rec *r)
     rv->nnodes = (int)r->nrep;
     pthread_mutex_init(&rv->mu, NULL);
     pthread_cond_init(&rv->cv, NULL);
+    pthread_cond_init(&rv->in_space, NULL);
     rv->ops = (struct jr_ops){.ctx = rv, .ship = op_ship, .ship_wait = op_ship_wait, .admit = op_admit, .bytes = op_bytes, .synced = op_synced};
     int dfd = open(rv->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     bool torn = false;
@@ -1566,6 +1704,7 @@ int repld_open(const struct cluster_vol_rec *r)
     int min_isr = r->min_isr && G.mutant != RM_NOMINISR ? (int)r->min_isr : 1; /* planted nominisr: never checked */
     struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = min_isr,
                               .isr_lag_ticks = lag / TICK_MS, .resend_ticks = 200 / TICK_MS, .heartbeat_ticks = 1,
+                              .idle_heartbeat_ticks = IDLE_HEARTBEAT_MS / TICK_MS,
                               .floor_ticks = 1000 / TICK_MS, .max_batch = 1u << 30, .window = 1u << 30,
                               .rec_find = idx_find, .ctx = rv};
     rv->core = repl_open(&cfg, &d);
@@ -1775,6 +1914,7 @@ void repld_stop(void)
         pthread_mutex_lock(&rv->mu);
         rv->stop = 1;
         pthread_cond_signal(&rv->cv);
+        pthread_cond_broadcast(&rv->in_space);
         pthread_mutex_unlock(&rv->mu);
         if (rv->started)
             pthread_join(rv->th, NULL);

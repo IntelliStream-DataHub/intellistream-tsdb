@@ -813,7 +813,7 @@ meta-mutants: $(B)/test_meta_mut
 # the replication driver's mutants (server/repld.c TSDB_REPLD_MUTANT): each must fail test_cluster replindet or
 # replicate; ackbeforesync is known to survive (it loses data only under power loss of replicas: r3e)
 repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
-	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(or $(TMPDIR),/tmp) commitbyleader floornotsaved commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal
+	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(or $(TMPDIR),/tmp) commitbyleader floornotsaved commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal noinboxbound nospill
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(or $(TMPDIR),/tmp)

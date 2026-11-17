@@ -37,6 +37,7 @@ struct peer {
     uint64_t acked;     /* written end it last reported */
     uint64_t rid;       /* the instance its ACKs came from; 0: none yet in this epoch */
     uint64_t last_send, last_ack;
+    uint64_t commit_sent; /* the commit point its last APPEND carried */
     uint64_t last_heard; /* the tick of its last ACK in this epoch (last_ack also moves when a resend goes back) */
     uint64_t snap_sent; /* when it was last told to install a snapshot (its next position is not retained) */
     uint64_t start;     /* the first position its log holds, from its last ACK in this epoch (heard: one came) */
@@ -553,6 +554,7 @@ static void send_append(struct repl *r, int to, int heartbeat)
     if (upto >= from)
         p->next = upto + 1;
     p->last_send = r->now;
+    p->commit_sent = r->commit;
 }
 
 static void replicate(struct repl *r)
@@ -897,8 +899,10 @@ void repl_tick(struct repl *r)
             }
             if (p->next && p->next <= r->written)
                 send_append(r, i, 0);
-            else if (r->now - p->last_send >= r->cfg.heartbeat_ticks)
-                send_append(r, i, 1);
+            else if (r->now - p->last_send >= r->cfg.heartbeat_ticks &&
+                     (p->commit_sent != r->commit || !r->cfg.idle_heartbeat_ticks ||
+                      r->now - p->last_send >= r->cfg.idle_heartbeat_ticks))
+                send_append(r, i, 1); /* news of the commit point at once; on an idle volume, only to stay heard */
         }
         if (r->isr_busy && r->now - r->isr_sent >= r->cfg.resend_ticks) {
             r->isr_sent = r->now;

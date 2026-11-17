@@ -4,16 +4,17 @@
 # with each planted bug, and each must fail one of them. The ISR mutants have their own scenario: commitpastremoved
 # (META handed to the core as soon as it asks, before the metadata group committed it) must fail isr, nominisr (the
 # core without min_isr) and ackbelowminisr (APPLY not held while the ISR is below min_isr) minisr, shipperfile (30 s
-# for each file of a COMMIT) shipstall, nocap (no keep caps) keepcap, noseal (no idle flush) idleseal. Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
+# for each file of a COMMIT) shipstall, nocap (no keep caps) keepcap, noseal (no idle flush) idleseal,
+# noinboxbound (an unbounded inbox) and nospill (every bulk file whole in memory) backpressure. Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
 dir=${1:-/tmp}; shift || true
-muts=${*:-commitbyleader ackbeforesync floornotsaved commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal}
+muts=${*:-commitbyleader ackbeforesync floornotsaved commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal noinboxbound nospill}
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
 survived=
 for m in $muts; do
     caught=
-    case $m in commitpastremoved) scens=isr ;; nominisr|ackbelowminisr) scens=minisr ;; shipperfile) scens=shipstall ;; nocap) scens=keepcap ;; noseal) scens=idleseal ;; *) scens="replindet replicate" ;; esac
+    case $m in commitpastremoved) scens=isr ;; nominisr|ackbelowminisr) scens=minisr ;; shipperfile) scens=shipstall ;; nocap) scens=keepcap ;; noseal) scens=idleseal ;; noinboxbound|nospill) scens=backpressure ;; *) scens="replindet replicate" ;; esac
     for s in $scens; do
         if ! TSDB_REPLD_MUTANT=$m timeout 600 ./build/test_cluster "$dir" $s > "$dir/mut-$m-$s.log" 2>&1; then
             caught=$s

@@ -380,6 +380,52 @@ static void idle_shrink(void)
     repl_free(r);
 }
 
+/* An idle volume (r3d review L1): with nothing to send, a peer gets an empty APPEND only every idle_heartbeat_ticks,
+ * but a commit point it has not been sent goes out at the next tick */
+static void idle_heartbeat(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(0, &d);
+    c.heartbeat_ticks = 1;
+    c.idle_heartbeat_ticks = 20;
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 100, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    struct repl_msg m = meta_msg(0, 2, 0, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    struct repl_msg k1 = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 2, .leader = -1, .durable = 101,
+                          .written = 101, .rid = 22, .resync = 1};
+    struct repl_msg k2 = {.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = 2, .leader = -1, .durable = 101,
+                          .written = 101, .rid = 33, .resync = 1};
+    repl_recv(r, &k1);
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_commit(r) == 101, "commit %" PRIu64 ", not 101", repl_commit(r));
+    repl_tick(r);
+    drain(r, &d, NULL);
+    int news = 0;
+    for (int i = 0; i < d.nact; i++)
+        news += d.act[i].type == REPL_A_SEND && d.act[i].msg.type == REPL_M_APPEND && d.act[i].msg.commit == 101;
+    CHECK(news == 2, "the new commit point went to %d peers at the next tick, not 2", news);
+    int sent = 0;
+    for (int t = 0; t < 200; t++) {
+        repl_recv(r, &k1);
+        repl_recv(r, &k2);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        for (int i = 0; i < d.nact; i++)
+            sent += d.act[i].type == REPL_A_SEND && d.act[i].msg.type == REPL_M_APPEND;
+    }
+    CHECK(sent >= 18 && sent <= 22, "%d empty APPENDs to 2 peers in 200 idle ticks, not about 20", sent);
+    repl_free(r);
+}
+
 static void round_cut(void)
 {
     static struct drv d;
@@ -502,6 +548,7 @@ int main(int argc, char **argv)
     promote();
     unanswered();
     idle_shrink();
+    idle_heartbeat();
     round_cut();
     replay_floor();
     if (failures) {
