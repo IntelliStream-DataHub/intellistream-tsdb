@@ -1537,6 +1537,14 @@ void eng_leader_keep_floor(struct eng *db, uint64_t pos, uint64_t floor);
  * than `max_bytes`, or it was flushed more than `max_ms` ago. 0 is no cap. Read at the next eng_leader_keep_floor or
  * flush. */
 void eng_leader_keep_cap(struct eng *db, uint64_t max_bytes, uint64_t max_ms);
+/* A leader's clock duties (design-cluster.md 5.3, 5.4), run by its flusher thread once the driver sets them (0 turns one
+ * off; both are off until the first call): a NOW marker with eng_now_ms every `now_every_ms` (the replicas' retention
+ * clock; also before a DROP), and the idle seal: an active memtable with rows that did not change for `idle_seal_ms` is
+ * flushed, and a NOW marker follows at once in the new segment, so a replica, which seals a segment only at the first
+ * committed record of a later one, seals and flushes the idle leader's last segment too. A NOW marker the driver
+ * refuses (not leading, below min_isr) is simply not written. */
+void eng_leader_clock(struct eng *db, uint64_t now_every_ms, uint64_t idle_seal_ms);
+int leader_now_marker(struct eng *db);
 /* A file a COMMIT marker of this leader names (`name`: the marker's name, p<partition>_<pid>_<n>_0.part), for a replica
  * that missed it: the leader keeps each hard linked as stage_<xxh64 of the name>.part (the name a replica stages it
  * under) from before its marker is appended until the retained segment that holds the marker goes (eng_leader_keep),
@@ -1889,6 +1897,10 @@ struct eng {
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */
     atomic_uint_fast64_t lead_saved; /* with jr: the commit floor the driver saved (eng_leader_keep_floor) */
     atomic_uint_fast64_t lead_cap_bytes, lead_cap_ms; /* with jr: eng_leader_keep_cap (0: no cap) */
+    atomic_uint_fast64_t lead_now_ms, lead_seal_ms; /* with jr: eng_leader_clock (0: off) */
+    int64_t lead_now_next;   /* the flusher's: when the next NOW marker is due (mono ms) */
+    uint64_t idle_rows, idle_seq; /* the flusher's: the active memtable as it last saw it changed (rows, wal_seq) */
+    int64_t idle_since;      /* and when (mono ms) */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
     atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */
     pthread_mutex_t lead_mu;          /* a leaf: waits for the commit point (lead_cv), its moves, depose, eng_fail */

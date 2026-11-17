@@ -1538,6 +1538,29 @@ void eng_leader_keep_cap(eng *db, uint64_t max_bytes, uint64_t max_ms)
     atomic_store(&db->lead_cap_ms, max_ms);
 }
 
+void eng_leader_clock(eng *db, uint64_t now_every_ms, uint64_t idle_seal_ms)
+{
+    uint64_t was = atomic_exchange(&db->lead_now_ms, now_every_ms);
+    atomic_store(&db->lead_seal_ms, idle_seal_ms);
+    if (was != now_every_ms) { /* the flusher's wait was computed without it */
+        pthread_mutex_lock(&db->buf_lock);
+        pthread_cond_signal(&db->flush_cv);
+        pthread_mutex_unlock(&db->buf_lock);
+    }
+}
+
+/* A NOW marker (eng_leader_clock), not waited for: a replica only reads the clock from it. Refused (not leading, below
+ * min_isr) it is not in the log; appended with a failed sync, the WAL's rules failed the engine. */
+int leader_now_marker(eng *db)
+{
+    if (!eng_jr(db) || db->rp || !atomic_load(&db->lead_now_ms))
+        return 0;
+    mk m = {.type = MK_NOW, .span = 1};
+    m.u.now = (mk_now){.now_ms = eng_now_ms(db)};
+    uint64_t fno = 0, last = 0;
+    return wal_markers_mk(db, &m, 1, &fno, &last);
+}
+
 void eng_leader_keep_floor(eng *db, uint64_t pos, uint64_t floor)
 {
     atomic_store(&db->lead_saved, MAX(pos, floor));
@@ -1773,6 +1796,18 @@ void *flusher_main(void *arg)
         int64_t due = db->active->rows ? db->active->created_ms + interval : mono_ms() + interval;
         if (db->opt.wal_sync_ms > 0)
             due = MIN(due, db->last_wal_sync_ms + db->opt.wal_sync_ms);
+        /* a leader's clock duties (eng_leader_clock): the next NOW marker, the idle seal of the active memtable */
+        uint64_t now_every = atomic_load(&db->lead_now_ms), seal_ms = atomic_load(&db->lead_seal_ms);
+        bool lead = eng_jr(db) && !db->rp;
+        if (lead && (db->active->rows != db->idle_rows || db->active->wal_seq != db->idle_seq)) {
+            db->idle_rows = db->active->rows; /* seen changed: idle from now on (at most a wake late) */
+            db->idle_seq = db->active->wal_seq;
+            db->idle_since = mono_ms();
+        }
+        if (lead && now_every)
+            due = MIN(due, db->lead_now_next);
+        if (lead && seal_ms && db->active->rows)
+            due = MIN(due, db->idle_since + (int64_t)seal_ms);
         int64_t wait = MAX(due - mono_ms(), (int64_t)1);
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -1790,6 +1825,15 @@ void *flusher_main(void *arg)
                      (db->active->rows >= db->opt.buffer_rows || now - db->active->created_ms >= interval);
         bool sync = db->opt.wal_sync_ms > 0 && now - db->last_wal_sync_ms >= db->opt.wal_sync_ms;
         uint64_t target = db->wal_appended;
+        lead = eng_jr(db) && !db->rp;
+        now_every = atomic_load(&db->lead_now_ms);
+        seal_ms = atomic_load(&db->lead_seal_ms);
+        bool idle = lead && seal_ms && db->active->rows && db->active->rows == db->idle_rows &&
+                    db->active->wal_seq == db->idle_seq && now - db->idle_since >= (int64_t)seal_ms;
+        bool now_mark = lead && now_every && (now >= db->lead_now_next || idle);
+        if (now_mark)
+            db->lead_now_next = now + (int64_t)now_every;
+        flush = flush || idle;
         pthread_mutex_unlock(&db->buf_lock);
         if (db->rp && !flush) { /* a replica's memtable of a finished leader segment waits to be written; nflushing is
                                    db->lock's, which the flusher may not take under buf_lock */
@@ -1804,6 +1848,8 @@ void *flusher_main(void *arg)
         }
         if (rc == 0 && flush)
             rc = mt_flush(db);
+        if (rc == 0 && now_mark) /* after an idle seal's flush: the first record of the new segment */
+            leader_now_marker(db); /* refused or failed: no marker (a failed sync failed the engine) */
         if (rc == 0)
             graveyard_purge(db, false);
         pthread_mutex_lock(&db->buf_lock);

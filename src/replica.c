@@ -2488,6 +2488,7 @@ static int leader_drop(eng *db, int64_t ts)
     mk m = {.type = MK_DROP, .span = 1};
     m.u.drop = (mk_drop){.dropped_before = ts, .partition = MK_NO_PARTITION};
     uint64_t fno = 0;
+    leader_now_marker(db); /* the replicas' clock first (design-cluster.md 5.4); refused, the DROP is refused too */
     /* eng_drop_before holds flush_lock until the retire (planted MUT_LEADER_DROP_UNHELD: it does not, as before) */
     int rc = eng_test_mutant == MUT_LEADER_DROP_UNHELD ? mt_flush_ex(db, &m, &fno) : mt_flush_held(db, &m, &fno);
     if (rc)

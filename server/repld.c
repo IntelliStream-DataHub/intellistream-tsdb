@@ -42,7 +42,8 @@
  * `floornotsaved` skips the REPL file's SAVE (test_cluster replicate, replindet); `commitpastremoved` takes an ISR
  * request as the record at once, before the metadata group commits it (isr), `nominisr` never checks min_isr (minisr),
  * `ackbelowminisr` hands the writer a commit point reached after a shrink below min_isr (minisr), `nocap` keeps the
- * leader's segments for a lagging replica without the caps repl_retain_mb and repl_retain_s (keepcap). Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
+ * leader's segments for a lagging replica without the caps repl_retain_mb and repl_retain_s (keepcap), `noseal` leaves
+ * an idle leader's last segment unsealed (no idle flush; the NOW markers go on) (idleseal). Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
  * bulk file this process receives taken as staged but not kept, so its COMMIT marker finds the file missing and
  * FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER (writes then reach
  * the new writer while the driver still promotes: they must be refused for a retry, never depose it).
@@ -69,6 +70,7 @@
 #include "../src/replica.h"
 
 #define TICK_MS 5
+#define NOW_EVERY_MS 1000 /* a leader's NOW markers (design-cluster.md 5.4): its replicas' retention clock lags by at most this */
 #define RESEND_MS 50
 #define READ_CAP (4u << 20)
 #define MAX_NODES 64
@@ -142,7 +144,7 @@ struct rvol {
 };
 
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
-       RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP };
+       RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL };
 
 static struct {
     pthread_mutex_t mu;
@@ -1101,6 +1103,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
             uint64_t floor = a->floor;
             pthread_mutex_unlock(&rv->mu);
             eng_leader_keep_cap(db, capb, capms);
+            eng_leader_clock(db, NOW_EVERY_MS, G.mutant == RM_NOSEAL ? 0 : rv->rec.idle_seal_ms);
             eng_leader_keep_floor(db, keep, floor);
             pthread_mutex_lock(&rv->mu);
         } else if (a->floor) {
@@ -1477,6 +1480,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "ackbelowminisr") ? RM_ACKBELOWMINISR
                : !strcmp(mu, "shipperfile")    ? RM_SHIPPERFILE
                : !strcmp(mu, "nocap")          ? RM_NOCAP
+               : !strcmp(mu, "noseal")         ? RM_NOSEAL
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);

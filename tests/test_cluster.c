@@ -3375,6 +3375,122 @@ static void scen_keepcap(void)
            " stays out of the ISR\n", nw);
 }
 
+/* the part files in server i's copy of volume 1 (retired ones too: a merge leaves its sources under retired_) */
+static int part_count(int i)
+{
+    char dir[PATH_MAX + 80], v[PATH_MAX + 120];
+    server_dir(i, dir, sizeof dir);
+    snprintf(v, sizeof v, "%s/v1", dir);
+    DIR *d = opendir(v);
+    if (!d)
+        die("opendir %s: %s", v, strerror(errno));
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t l = strlen(e->d_name);
+        n += l > 5 && !strcmp(e->d_name + l - 5, ".part") && strncmp(e->d_name, "tmp_", 4) &&
+             strncmp(e->d_name, "stage_", 6) && strncmp(e->d_name, "retired_", 8);
+    }
+    closedir(d);
+    return n;
+}
+
+/* the newest WAL segment of server i's copy of volume 1: one more for each flush (no promotion in between) */
+static uint64_t wal_newest(int i)
+{
+    char dir[PATH_MAX + 80], v[PATH_MAX + 120];
+    server_dir(i, dir, sizeof dir);
+    snprintf(v, sizeof v, "%s/v1", dir);
+    DIR *d = opendir(v);
+    if (!d)
+        die("opendir %s: %s", v, strerror(errno));
+    uint64_t hi = 0, seq;
+    struct dirent *e;
+    while ((e = readdir(d)))
+        if (sscanf(e->d_name, "wal_%" SCNx64 ".log", &seq) == 1 && seq > hi)
+            hi = seq;
+    closedir(d);
+    return hi;
+}
+
+/* The idle seal (design-cluster.md 5.3, D7): with flushes 10 min apart, an idle leader flushes its memtable after
+ * idle_seal_ms (1 s) and its next NOW marker starts a new segment, so the replicas seal and flush theirs too. */
+static void scen_idleseal(void)
+{
+    scenario("idleseal");
+    for (int i = 0; i < 3; i++) {
+        xargs[i] = "--flush-interval-ms 600000";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t tv[100];
+    float vv[100];
+    for (int j = 0; j < 100; j++)
+        tv[j] = 1000 + j, vv[j] = (float)j;
+    if ((rc = tsdbc_insert_series(c, id, tv, vv, 100)) != 0)
+        die("a write: %s", ers(rc));
+    uint64_t t0 = now_ms(), took[3] = {0, 0, 0};
+    for (int left = 3; left;) {
+        if (now_ms() - t0 > 6000)
+            die("an idle volume's rows were not in parts on every server 6 s after the write (leader %d: %d parts,"
+                " replicas %d, %d)", L, part_count(L), part_count((L + 1) % 3), part_count((L + 2) % 3));
+        for (int i = 0; i < 3; i++)
+            if (!took[i] && part_count(i) > 0)
+                took[i] = now_ms() - t0, left--;
+        struct timespec ms50 = {0, 50000000};
+        nanosleep(&ms50, NULL);
+    }
+    printf("  an idle volume is in parts after %" PRIu64 " ms on the leader, %" PRIu64 " and %" PRIu64
+           " ms on the replicas (idle_seal_ms 1000, flushes 10 min apart)\n",
+           took[L], took[(L + 1) % 3], took[(L + 2) % 3]);
+    /* the cost: a write every 2 s is a flush every 2 s (the parts of an hour, before merges) */
+    uint64_t w0 = wal_newest(L);
+    for (int k = 0; k < 10; k++) {
+        int64_t t = 5000 + k;
+        if ((rc = tsdbc_insert_series(c, id, &t, vv, 1)) != 0)
+            die("a write: %s", ers(rc));
+        struct timespec s2 = {2, 0};
+        nanosleep(&s2, NULL);
+    }
+    int made = (int)(wal_newest(L) - w0);
+    printf("  a write every 2 s: %d flushes in 20 s on the leader (about %d parts an hour, before merges)\n", made,
+           made * 180);
+    if (made < 5)
+        die("a write every 2 s made %d flushes in 20 s: the idle seal does not flush", made);
+    /* and an idle volume's WAL grows by its NOW markers alone */
+    char dir[PATH_MAX + 80], wp[PATH_MAX + 160];
+    server_dir(L, dir, sizeof dir);
+    snprintf(wp, sizeof wp, "%s/v1/wal_%016" PRIx64 ".log", dir, wal_newest(L));
+    struct stat st0, st1;
+    struct timespec s5 = {5, 0};
+    if (stat(wp, &st0) != 0 || (nanosleep(&s5, NULL), stat(wp, &st1)) != 0)
+        die("stat %s: %s", wp, strerror(errno));
+    printf("  an idle leader's WAL grows by %lld bytes in 5 s (NOW markers; about %lld KB an hour)\n",
+           (long long)(st1.st_size - st0.st_size), (long long)(st1.st_size - st0.st_size) * 720 / 1024);
+    tsdbc_close(c);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {110, 0, 0, 0};
+    rep_same(wantr, "after a clean stop");
+}
+
 static void scen_shipstall(void)
 {
     scenario("shipstall");
@@ -4039,7 +4155,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
