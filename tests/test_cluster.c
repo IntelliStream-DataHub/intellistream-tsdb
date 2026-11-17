@@ -465,6 +465,7 @@ static void node_add(int via, int newi)
 
 static uint32_t init_min_isr; /* nonzero: INIT's min_isr (the volumes' min_isr, at most their replicas) */
 static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
+static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
 
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
 static void init_mode(int i, uint32_t replace_s, int mode)
@@ -475,6 +476,8 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.min_isr = init_min_isr;
     if (init_retain_s)
         s.repl_retain_s = init_retain_s;
+    if (init_isr_lag_ms)
+        s.isr_lag_ms = init_isr_lag_ms;
     s.node_timeout_ms = 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
@@ -3431,19 +3434,24 @@ static void scen_closegone(void)
  * not, so the core's durable end, and the commit point, stayed behind a durable WAL until a later record (backpressure
  * hung there after its last write, its flusher waiting; mutant syncbyrep). Batches of eight connections writing single
  * rows: at the end of a batch, or once every writer waits, nothing moves the WAL, since noclock turns the NOW markers
- * and the idle seal off. The leader's log says the overtaking happened, or this case proved nothing. */
+ * and the idle seal off. The leader's log says the overtaking happened, or this case proved nothing. syncbyhook makes
+ * the driver answer a SYNC from what op_synced reported, never from a fresh read of the engine (which used to rescue
+ * the old code whenever the engine had synced again before op_synced ran), and synclate holds every other report of
+ * op_synced back to the driver's next tick, so that the report after it covers records written behind the SYNC in
+ * flight: the overtaking happens in the first batch, and under syncbyrep the core's durable end lags one report behind
+ * for good, which leaves the last write of a batch unanswered. */
 static void scen_writersync(void)
 {
     tsdb_sid id;
-    int L = closegone_setup("writersync", "TSDB_REPLD_TEST=noclock", &id);
+    int L = closegone_setup("writersync", "TSDB_REPLD_TEST=noclock,syncbyhook,synclate", &id);
     enum { CONNS = 8, BATCHES = 10, MAX_BATCHES = 100, WRITES = 20 };
     struct rep_writer w[CONNS];
     pthread_t th[CONNS];
     rep_timeout_ms = 5000;
     uint64_t t0 = now_ms();
     int b, seen = 0, seen_at = -1;
-    /* BATCHES at least, and on until the overtaking was seen (it is not seen in every run of ten) */
-    for (b = 0; b < MAX_BATCHES && (b < BATCHES || !seen); b++) {
+    /* BATCHES at least, on until the overtaking was seen (synclate makes it happen in the first), and two batches past it */
+    for (b = 0; b < MAX_BATCHES && (b < BATCHES || !seen || b <= seen_at + 2); b++) {
         for (int k = 0; k < CONNS; k++) {
             w[k] = (struct rep_writer){cports[L], id, 100000000LL * (b * CONNS + k + 1), WRITES, 0, 0, 0};
             if (pthread_create(&th[k], NULL, rep_write_thread, &w[k]) != 0)
@@ -3496,6 +3504,133 @@ static int wal_count(int i)
 
 /* The keep caps (design-cluster.md 8.3): a replica out of the ISR holds the leader's flushed segments only for
  * repl_retain_s (2 s here); past it they go, and the replica, back, is told it needs a snapshot and stays a learner. */
+/* A writer of 1000-row inserts on one connection until `stop` (inboxshared's stalled volume) */
+struct flood {
+    int port;
+    tsdb_sid id;
+    int stop, rc, rounds;
+};
+static void *flood_thread(void *a)
+{
+    struct flood *f = a;
+    while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) {
+        struct rep_writer w = {f->port, f->id, 1000000000LL * (f->rounds + 1), 0, 0, 0, 1000};
+        rep_write_thread(&w);
+        if (w.rc != 0) {
+            f->rc = w.rc;
+            break;
+        }
+        f->rounds++;
+    }
+    return NULL;
+}
+
+/* inboxshared (r3d-isr review H1): one data link carries every volume between two nodes, and its frames are handed
+ * to the volumes' inboxes on the link's one thread. A volume whose inbox is full and stays so (its disk stuck: here
+ * TSDB_REPLD_TEST=stallinbox with <dir>/stallinbox.<number>) must not hold that thread: the other volume, led by the
+ * same node, keeps the stalled node in its ISR and its single-row writes answer as fast as before. The thread used to
+ * wait 500 ms for every frame of the full volume (mutant inboxwaitall), and its leader's resends kept it asleep. */
+static void scen_inboxshared(void)
+{
+    scenario("inboxshared");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=smallinbox,stallinbox";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    /* two volumes with the same leader: of four, two share one of the three nodes */
+    static const char *const names[] = {"va", "vb", "vc", "vd"};
+    uint32_t num[4];
+    int lead[4], A = -1, B = -1;
+    for (int k = 0; k < 4 && B < 0; k++) {
+        int rc = vol_add(0, names[k], 3, &num[k]);
+        if (rc != 0)
+            die("volume add %s: %s", names[k], cluster_strerror(rc));
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, names[k], i, 1, 0);
+        struct meta_volume v;
+        if (!vol_rec(0, names[k], &v))
+            die("no record of %s", names[k]);
+        lead[k] = server_of(v.leader);
+        for (int j = 0; j < k && B < 0; j++)
+            if (lead[j] == lead[k])
+                A = j, B = k;
+    }
+    if (B < 0)
+        die("inboxshared: no two of four volumes have one leader");
+    int L = lead[A], R = (L + 1) % 3;
+    if (L < 0 || L > 2)
+        die("the leader of %s is not one of the nodes", names[A]);
+    tsdbc *c = client(L);
+    tsdb_sid sa = rep_series(c, "stalled", names[A], 30000), sb = rep_series(c, "healthy", names[B], 30000);
+    await_isr(L, names[A], 3, 15000, "every replica of the volume to stall up");
+    await_isr(L, names[B], 3, 15000, "every replica of the healthy volume up");
+    char stall[PATH_MAX + 96];
+    server_dir(R, stall, sizeof stall);
+    snprintf(stall + strlen(stall), sizeof stall - strlen(stall), "/stallinbox.%" PRIu32, num[A]);
+    FILE *sf = fopen(stall, "w");
+    if (!sf)
+        die("create %s", stall);
+    fclose(sf);
+    struct flood f[2] = {{cports[L], sa, 0, 0, 0}, {cports[L], sa, 0, 0, 0}};
+    pthread_t th[2];
+    for (int k = 0; k < 2; k++) {
+        f[k].rounds = k * 1000; /* other timestamps */
+        if (pthread_create(&th[k], NULL, flood_thread, &f[k]) != 0)
+            die("pthread_create");
+    }
+    /* 8 s of single-row writes to the healthy volume, its ISR checked between them */
+    uint64_t t0 = now_ms(), worst = 0, last_isr = 0;
+    int writes = 0, full_at = -1;
+    while (now_ms() - t0 < 8000) {
+        int64_t ts = 1000LL * (writes + 1);
+        float val = (float)writes;
+        uint64_t w0 = now_ms();
+        int rc = tsdbc_insert_series(c, sb, &ts, &val, 1);
+        uint64_t ms = now_ms() - w0;
+        if (rc != 0)
+            die("inboxshared: a write to the healthy volume: %s", ers(rc));
+        if (ms > worst)
+            worst = ms;
+        writes++;
+        if (full_at < 0 && log_has(R, "frames are dropped"))
+            full_at = writes;
+        if (now_ms() - last_isr >= 100) {
+            last_isr = now_ms();
+            uint32_t n = isr_of(L, names[B], NULL);
+            if (n != 3)
+                die("inboxshared: the healthy volume %s has %" PRIu32 " ISR members while %s's inbox on n%d is full"
+                    " (the shared link's thread waited for it)", names[B], n, names[A], R);
+        }
+    }
+    for (int k = 0; k < 2; k++)
+        __atomic_store_n(&f[k].stop, 1, __ATOMIC_RELEASE);
+    for (int k = 0; k < 2; k++) {
+        pthread_join(th[k], NULL);
+        if (f[k].rc != 0)
+            die("inboxshared: a write to the stalled volume: %s", ers(f[k].rc));
+    }
+    if (full_at < 0)
+        die("inboxshared: the stalled volume's inbox never filled (the case proved nothing)");
+    if (worst > 1000)
+        die("inboxshared: a single-row write to the healthy volume took %" PRIu64 " ms while %s's inbox was full",
+            worst, names[A]);
+    unlink(stall);
+    await_isr(L, names[A], 3, 60000, "the stalled volume's replica catching up");
+    if (rows_of(c, sb) != writes)
+        die("inboxshared: the leader reads %d rows of the healthy volume, not %d", rows_of(c, sb), writes);
+    tsdbc_close(c);
+    stop_all();
+    for (int i = 0; i < 3; i++)
+        penv[i] = NULL;
+    printf("  %s stalled on n%d (inbox full from write %d): %d writes to %s, the slowest %" PRIu64 " ms, its ISR "
+           "stayed 3\n", names[A], R, full_at, writes, names[B], worst);
+}
+
 /* backpressure into a replica (r3d review M3): a replica that stops handling its peer frames (TSDB_REPLD_TEST=stallinbox
  * while <dir>/stallinbox exists: a stalled disk's stand-in) leaves the ISR, and with a small inbox bound (smallinbox)
  * drops the frames past the bound instead of holding the leader's stream in memory; unstalled, it catches up from the
@@ -3853,7 +3988,9 @@ static void scen_shipstall(void)
     scenario("shipstall");
     for (int i = 0; i < 3; i++)
         start(i);
+    init_isr_lag_ms = 500; /* the stopped replica leaves the ISR well before the ship deadline (3 s) */
     init_cluster(0, 600);
+    init_isr_lag_ms = 0;
     node_add(0, 1);
     node_add(0, 2);
     unsigned want = 3;
@@ -3893,8 +4030,12 @@ static void scen_shipstall(void)
     uint64_t took = now_ms() - t0;
     free(ts);
     free(val);
-    if (took > 15000)
-        die("a large write over ten partitions with a replica stopped took %" PRIu64 " ms (30 s per file?)", took);
+    /* the write ends once the stopped replica has left the ISR (isr_lag_ms 500, then a heartbeat and the metadata
+     * group: about 1 s), not at the ship deadline (3 s: mutant shipnoisr) nor later (r3d-isr review M6: a bound of
+     * 15 s let a deadline five times too long pass) */
+    if (took > 2500)
+        die("a large write over ten partitions with a replica stopped took %" PRIu64 " ms (the ship wait did not end"
+            " when the replica left the ISR?)", took);
     await_isr(0, "plant", 2, 10000, "a replica stopped under a large write");
     pause_server(R, 0);
     await_isr(0, "plant", 3, 30000, "the stopped replica continued");
@@ -4512,7 +4653,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {

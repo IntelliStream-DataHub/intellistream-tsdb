@@ -77,6 +77,7 @@
 #define INBOX_BYTES (64u << 20) /* a volume's inbox of peer frames: past it the link waits, then drops (M3) */
 #define INBOX_WAIT_MS 500       /* how long a link's thread waits for room (well below a link's dead_ms) */
 #define IDLE_HEARTBEAT_MS 100 /* an idle volume's empty APPEND per peer (r3d review L1: was every tick) */
+_Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member must be heard well within isr_lag_ms");
 #define NOW_EVERY_MS 1000 /* a leader's NOW markers (design-cluster.md 5.4): its replicas' retention clock lags by at most this */
 #define RESEND_MS 50
 #define READ_CAP (4u << 20)
@@ -136,7 +137,10 @@ struct rvol {
     uint64_t *coff; /* byte offset of each record of cur */
     int sync_wanted;
     uint64_t synced_rep; /* the writer: the last durable end handed to repl_synced */
+    int rec_short;       /* isr_short_locked of `rec`, counted in G.nshort (rec_set) */
     int sync_said;       /* noclock's line, once */
+    uint64_t sync_late;  /* synclate: a report op_synced held back for the next tick (0: none) */
+    unsigned sync_n;     /* synclate: the reports op_synced has had */
     uint64_t cstall_at, cstall_ms; /* the writer: the commit point and since when it has not moved with writes above it */
     int cstall_said;
     uint64_t epoch_pos;  /* M_PROMOTING: the EPOCH marker's position */
@@ -158,9 +162,12 @@ struct rvol {
 
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
        RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL, RM_NOSPILL, RM_NOINBOXBOUND,
-       RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK, RM_STOPNODEPOSE, RM_LATECLOCK, RM_SYNCBYREP };
+       RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK, RM_STOPNODEPOSE, RM_LATECLOCK, RM_SYNCBYREP,
+       RM_INBOXWAITALL, RM_SHIPNOISR };
 
 static struct {
+    uint32_t isr_rot; /* (atomic) where repld_isr_requests starts its next report */
+    int nshort; /* (atomic) the volumes whose record has an ISR below min_isr: 0, and repld_isr_short asks nothing more */
     pthread_mutex_t mu;
     tsdb *t;
     char dir[4096];
@@ -187,6 +194,9 @@ static struct {
                    * freeing the links, and a stopped driver admits records whatever its lease, so the engine's NOW
                    * markers reach the WAL hooks of a stopped driver (op_bytes says so once) */
     _Atomic int said_late; /* latewal's line, once */
+    int sync_by_hook; /* TSDB_REPLD_TEST=syncbyhook: a writer's SYNC compares what op_synced reported, not the engine */
+    int sync_late;    /* TSDB_REPLD_TEST=synclate: every other report of op_synced reaches the core only at the next
+                       * tick, so the report after it covers records written behind the SYNC in flight (writersync) */
     int no_clock; /* TSDB_REPLD_TEST=noclock (tests only): a leader writes no NOW markers and seals nothing idle, so
                    * only the clients' writes move its WAL (writersync), and says once when a SYNC finds the WAL
                    * durable past the core's durable end */
@@ -597,18 +607,28 @@ static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
     return rc == REPL_OK ? 0 : TSDB_ERR_UNAVAILABLE;
 }
 
-/* jr_ops.synced: the writer's own durable end */
-static void op_synced(void *ctx, struct eng *db, uint64_t last)
+/* The writer's durable end to the core (rv->mu held); db NULL for synclate's held report */
+static void synced_locked(struct rvol *rv, struct eng *db, uint64_t last)
 {
-    (void)db;
-    struct rvol *rv = ctx;
-    pthread_mutex_lock(&rv->mu);
     if (rv->core && last > rv->synced_rep) {
         rv->synced_rep = last;
         repl_synced(rv->core, last);
-        if (G.mutant == RM_COMMITBYLEADER)
+        if (G.mutant == RM_COMMITBYLEADER && db)
             eng_leader_commit(db, last);
         pthread_cond_signal(&rv->cv);
+    }
+}
+
+/* jr_ops.synced: the writer's own durable end */
+static void op_synced(void *ctx, struct eng *db, uint64_t last)
+{
+    struct rvol *rv = ctx;
+    pthread_mutex_lock(&rv->mu);
+    if (G.sync_late && (rv->sync_n++ & 1) == 0 && last > rv->synced_rep) {
+        if (last > rv->sync_late)
+            rv->sync_late = last;
+    } else {
+        synced_locked(rv, db, last);
     }
     pthread_mutex_unlock(&rv->mu);
 }
@@ -746,7 +766,7 @@ static int ship_wait_one(struct rvol *rv, struct shipwait *w, uint64_t deadline)
         uint32_t isr = 0;
         pthread_mutex_lock(&rv->mu);
         for (int i = 0; i < (int)rv->rec.nrep && i < META_REPLICAS_MAX; i++)
-            if (in_isr_locked(rv, i))
+            if (in_isr_locked(rv, i) || G.mutant == RM_SHIPNOISR)
                 isr |= 1u << i;
         pthread_mutex_unlock(&rv->mu);
         pthread_mutex_lock(&w->mu);
@@ -1002,10 +1022,11 @@ static void inbox_took(struct rvol *rv, const struct item *it)
         say("volume %" PRIu32 ": the inbox is empty again", rv->number);
     }
     if (G.stall_inbox) {
-        char f[sizeof G.dir + 16];
+        char f[sizeof G.dir + 16], fv[sizeof G.dir + 32];
         snprintf(f, sizeof f, "%s/stallinbox", G.dir);
+        snprintf(fv, sizeof fv, "%s/stallinbox.%" PRIu32, G.dir, rv->number);
         pthread_mutex_unlock(&rv->mu);
-        for (struct timespec w = {0, 10000000}; access(f, F_OK) == 0;)
+        for (struct timespec w = {0, 10000000}; access(f, F_OK) == 0 || access(fv, F_OK) == 0;)
             nanosleep(&w, NULL);
         pthread_mutex_lock(&rv->mu);
     }
@@ -1014,11 +1035,18 @@ static void inbox_took(struct rvol *rv, const struct item *it)
 /* Room in the inbox for a peer frame of `need` bytes (rv->mu held), else 0: the link's thread waits a little (which
  * stops reading the link: TCP pushes back on the sender), then the frame is dropped and the core sends it again. The
  * inbox is never larger than the bound plus one frame (a frame alone always gets in), and local items are not counted
- * (they are small and must not be lost). A failed volume reads nothing: its frames are dropped at once. */
+ * (they are small and must not be lost). A failed volume reads nothing: its frames are dropped at once.
+ * The wait happens once per stall: while `in_full` is set (until the inbox empties) a frame is dropped at once. The
+ * link and its thread are shared by every volume between the two nodes, so a volume whose disk is stuck (an NFS
+ * server down for hours) must not hold up the others' frames: were each of its frames to wait, its leader's resends
+ * alone would keep the thread asleep, and the replica would leave the ISR of every volume on that link (r3d-isr
+ * review H1; test_cluster inboxshared). */
 static int inbox_room(struct rvol *rv, size_t need)
 {
     if (rv->in_bytes + need <= G.inbox_bytes || !rv->in_bytes)
         return 1;
+    if (rv->in_full && G.mutant != RM_INBOXWAITALL)
+        return 0;
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
     dl.tv_nsec += INBOX_WAIT_MS * 1000000L;
@@ -1210,7 +1238,9 @@ static void exec(struct rvol *rv, struct repl_action *a)
     case REPL_A_SYNC:
         if (rv->mode == M_WRITER) {
             db = tsdb_cvol_ref(G.t, rv->number);
-            uint64_t d = db ? eng_wal_durable_fno(db) : 0;
+            /* syncbyhook (tests): the end op_synced handed over, never a fresh read of the engine, so that a SYNC
+             * issued behind an op_synced that went past it is answered only by this comparison (writersync) */
+            uint64_t d = G.sync_by_hook ? rv->synced_rep : db ? eng_wal_durable_fno(db) : 0;
             int fresh = d > rv->synced_rep;
             if (fresh)
                 rv->synced_rep = d;
@@ -1378,6 +1408,18 @@ static void drain(struct rvol *rv)
 static int isr_short_locked(const struct rvol *rv)
 {
     return G.mutant != RM_NOMINISR && rv->rec.min_isr > 1 && rv->rec.nisr < rv->rec.min_isr;
+}
+
+/* rv->rec = *r (rv->mu held, or the volume not yet listed), with G.nshort kept: the write path's check of min_isr
+ * (repld_isr_short, every write request) takes no lock while no volume is short (r3d-isr review M3) */
+static void rec_set(struct rvol *rv, const struct cluster_vol_rec *r)
+{
+    rv->rec = *r;
+    int s = isr_short_locked(rv);
+    if (s != rv->rec_short) {
+        rv->rec_short = s;
+        __atomic_add_fetch(&G.nshort, s ? 1 : -1, __ATOMIC_RELEASE);
+    }
 }
 
 /* After a META on the writer (rv->mu held): says when the ISR fell below min_isr and when it is back, and hands a
@@ -1590,6 +1632,11 @@ static void *vol_main(void *arg)
             continue;
         }
         if (now >= next_tick) {
+            if (rv->sync_late) {
+                uint64_t l = rv->sync_late;
+                rv->sync_late = 0;
+                synced_locked(rv, NULL, l);
+            }
             repl_tick(rv->core);
             commit_watch(rv, now);
             next_tick += TICK_MS;
@@ -1688,6 +1735,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "stopnodepose")   ? RM_STOPNODEPOSE
                : !strcmp(mu, "lateclock")      ? RM_LATECLOCK
                : !strcmp(mu, "syncbyrep")      ? RM_SYNCBYREP
+               : !strcmp(mu, "inboxwaitall")   ? RM_INBOXWAITALL
+               : !strcmp(mu, "shipnoisr")      ? RM_SHIPNOISR
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1696,6 +1745,8 @@ void repld_init(tsdb *t, const char *dir)
     G.promote_wait = te && strstr(te, "promotewait");
     G.late_wal = te && strstr(te, "latewal");
     G.no_clock = te && strstr(te, "noclock");
+    G.sync_by_hook = te && strstr(te, "syncbyhook");
+    G.sync_late = te && strstr(te, "synclate");
     G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
     if (G.mutant == RM_NOINBOXBOUND)
         G.inbox_bytes = SIZE_MAX;
@@ -1715,7 +1766,7 @@ int repld_open(const struct cluster_vol_rec *r)
     if (!rv)
         return TSDB_ERR_NOMEM;
     rv->number = r->number;
-    rv->rec = *r;
+    rec_set(rv, r);
     snprintf(rv->dir, sizeof rv->dir, "%s/v%" PRIu32, G.dir, r->number);
     rv->self = node_index(rv, G.self);
     rv->nnodes = (int)r->nrep;
@@ -1840,7 +1891,7 @@ void repld_update(const struct cluster_vol_rec *r)
     for (uint32_t i = 0; same && i < r->nrep; i++)
         same = r->rep[i].node == rv->rec.rep[i].node; /* a rid is filled in at its first open */
     if (same)
-        rv->rec = *r; /* the replica set is fixed for a volume's driver (a move: r3e and later) */
+        rec_set(rv, r); /* the replica set is fixed for a volume's driver (a move: r3e and later) */
     else if (!rv->set_changed) { /* a member's cursor and acks must never pass to another node: ignored, said once */
         rv->set_changed = 1;
         say("volume %" PRIu32 ": its replica set changed; this driver keeps the old one until a restart", r->number);
@@ -1852,6 +1903,8 @@ void repld_update(const struct cluster_vol_rec *r)
 
 int repld_isr_short(uint32_t v)
 {
+    if (!__atomic_load_n(&G.nshort, __ATOMIC_ACQUIRE))
+        return 0; /* no volume is short: the common case, with no lock on the path of every write */
     struct rvol *rv = vol_find(v);
     if (!rv)
         return 0;
@@ -1869,8 +1922,11 @@ unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max)
     memcpy(vs, G.vols, nv * sizeof *vs);
     pthread_mutex_unlock(&G.mu);
     unsigned n = 0;
-    for (uint32_t i = 0; i < nv && n < max; i++) {
-        struct rvol *rv = vs[i];
+    /* from where the last report stopped: with more requests than one heartbeat carries (CLUSTER_REPORT_ISR) every
+     * volume gets its turn, not the same first ones until they apply (r3d-isr review L4) */
+    uint32_t rot = nv ? __atomic_load_n(&G.isr_rot, __ATOMIC_RELAXED) % nv : 0, i;
+    for (i = 0; i < nv && n < max; i++) {
+        struct rvol *rv = vs[(rot + i) % nv];
         pthread_mutex_lock(&rv->mu);
         const struct repl_vmeta *q = &rv->isr_req;
         if (rv->isr_want && (q->epoch != rv->rec.epoch || q->isr_version != rv->rec.isr_version))
@@ -1891,6 +1947,8 @@ unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max)
         }
         pthread_mutex_unlock(&rv->mu);
     }
+    if (n == max)
+        __atomic_store_n(&G.isr_rot, (rot + i) % nv, __ATOMIC_RELAXED);
     return n;
 }
 
