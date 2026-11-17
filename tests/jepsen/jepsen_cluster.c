@@ -3,7 +3,7 @@
  * jepsen-cluster: a Jepsen-style run of a tsdbd cluster (docs/design-cluster.md 13.2, design-cluster-data.md 10.3).
  *
  *   jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--nemesis kill,partition,pause,midcommit,power]
- *                  [--workload meta,kv-local] [--seed N] [--crashfs build/libcrashfs.so] [--mutant NAME]
+ *                  [--workload meta,kv-local|kv|classes] [--seed N] [--crashfs build/libcrashfs.so] [--mutant NAME]
  *
  * What it is. A runner starts 3-8 tsdbd (default 5), each a direct child with --port 0 --port-file,
  * --exit-with-parent=<this pid>, --cluster, a --state-dir and a --peer-advertise that names a proxy of this harness,
@@ -40,16 +40,26 @@
  *  3 atomic visibility: a read that sees w at one of its keys sees w or newer at the others;
  *  4 no stale reads: a read that began after w was acknowledged sees w or newer at w's keys;
  *  5 monotonic reads: a session's later read is not older than an earlier one at any key.
- * The checker takes histories as a union (`struct hist`): the replicated-volume workloads of r3d and r3e, whose
- * clients write one series through several nodes, put their operations into one history and add the final step
- * `replicas_equal` (every replica directory opened in-process after a clean stop: the same rows, the same counts after
- * tsdb_optimize).
+ * kv and classes (not with kv-local in one run: kv-local's nodes run with TSDB_CLUSTER_WRITES=1, these with the
+ * replication driver): one cluster volume "kvr" of 3 replicas, two series with a writer and a reader each through its
+ * leader (checks 1-5 as above) and a filler series of inserts of 50-1550 rows at a frontier whose rate changes every
+ * minute of timestamps (most of them large writes, shipped as files); classes adds small partitions and granules,
+ * quick flushes and idle merges so that series switch partition classes (CLASS markers in the stream). A write that a
+ * stalled replica holds up times out: indeterminate, never a failure (no ISR shrink yet). The leader of kvr is never
+ * the target of kill, power, pause or a midcommit restart (a restarted leader never leads again before r3e-failover);
+ * its replicas are. midcommit also arms one of the driver's crash points (wal-before-send, acked-before-ok,
+ * prepared-before-commit, class-switch) on every node at its first start behind a trigger file, made past the middle
+ * of the run: the leader must end at it (nem_terminal), and the volume has no leader after that. The end check reads
+ * every replica directory in place, read-only, after the clean stop (tests/cvol_check.c): with the leader alive to the
+ * end, the replicas hold the same rows (replicas_equal) and the keys of the leader's final read; after the terminal
+ * point, each replica's state passes checks 1 and 2 as the final state.
  *
  * Selftest (--selftest-checker, --mutant NAME; each must fail, `make jepsen-cluster-selftest`): foreign-pid (a port file that names another
  * pid), takeover (a stale table, a foreign server on the node's old port, and a client that skips th_owns_port),
  * takeover-checked (the same with the check: refused, the run passes), noop-partition, unfired (an armed crash point
  * nobody placed), idle (a nemesis that sleeps through its naps), lost-write (a write missing from the final state), nokill, nopause,
- * nodelay and noreset (a kill, pause or delay that does nothing, a heal that resumes held links: the run fails).
+ * nodelay and noreset (a kill, pause or delay that does nothing, a heal that resumes held links: the run fails),
+ * rep-lost-write (kv: an acknowledged write missing from one replica's directory).
  *
  * Exit status: 0 ok, 1 a violation or a failed expectation, 2 the harness itself could not run.
  */
@@ -57,6 +67,7 @@
 #include "tsdb_client.h"
 #include "cluster.h"
 #include "crashpt.h"
+#include "cvol_check.h"
 #include "harness.h"
 #include "meta.h"
 #include "tsdb.h"
@@ -103,6 +114,7 @@ static char rundir[PATH_MAX - 64], secret_path[PATH_MAX];
 static uint8_t secret[128];
 static size_t secret_len;
 static int want_meta = 1, want_kv = 1;
+static int want_rep, want_classes; /* workloads kv and classes: one volume of 3 replicas, written through its leader */
 static struct meta_settings S;
 
 enum { N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16 };
@@ -567,6 +579,20 @@ static int start_node(int i, const char *crash_at, int *status)
     argv[na++] = state;
     argv[na++] = "--peer-advertise";
     argv[na++] = padv;
+    if (want_rep) { /* large writes from 500 rows (the filler's go to parts: the driver ships them) */
+        argv[na++] = "--wal-max-batch-rows";
+        argv[na++] = "500";
+    }
+    if (want_classes) { /* small partitions and granules, quick flushes and idle merges: classes switch (jepsen.c) */
+        argv[na++] = "--partition-ms";
+        argv[na++] = "2000";
+        argv[na++] = "--granule-rows";
+        argv[na++] = "512";
+        argv[na++] = "--flush-interval-ms";
+        argv[na++] = "500";
+        argv[na++] = "--merge-idle-s";
+        argv[na++] = "1";
+    }
     if (getenv("TSDBD_IO") && *getenv("TSDBD_IO")) {
         snprintf(io, sizeof io, "%s", getenv("TSDBD_IO"));
         argv[na++] = "--io";
@@ -581,7 +607,8 @@ static int start_node(int i, const char *crash_at, int *status)
             strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20))
             envp[ne++] = *e;
     char e1[256], e2[PATH_MAX + 64], e3[PATH_MAX + 64];
-    envp[ne++] = "TSDB_CLUSTER_WRITES=1"; /* the leader of a cluster volume takes writes (kv-local) */
+    if (!want_rep) /* the leader of a 1-replica cluster volume takes writes without the driver (kv-local) */
+        envp[ne++] = "TSDB_CLUSTER_WRITES=1";
     if (crash_at) {
         snprintf(e1, sizeof e1, "TSDB_CRASH_AT=%s", crash_at);
         envp[ne++] = e1;
@@ -1089,12 +1116,9 @@ static struct rd *hist_read_slot(struct hist *h, int sess)
  * series). The workload looks it up by name: a node that has not opened its volume yet (a restart waits for the group
  * to record the open) says NOTFOUND or UNAVAILABLE, and the client tries again. */
 static char kv_vol[MAXN][META_NAME_MAX];
-static int kv_resolve(tsdbc *c, int node, tsdb_sid *sid)
-{
-    char name[48];
-    snprintf(name, sizeof name, "kvl.n%d", node);
-    return tsdbc_series(c, name, 0, sid);
-}
+static int nhists;            /* histories in use: kv-local one per node, kv and classes REP_HISTS */
+static int hist_node[MAXN];   /* the node a history's clients talk to */
+static int kv_resolve(tsdbc *c, int hi, tsdb_sid *sid) { return tsdbc_series(c, hists[hi].name, 0, sid); }
 
 static int64_t key_ts(int k) { return KV_BASE_TS + (int64_t)k * 1000; }
 static int ts_key(int64_t ts)
@@ -1105,19 +1129,19 @@ static int ts_key(int64_t ts)
 
 static _Atomic int kv_run;
 static _Atomic uint64_t kv_ok, kv_fail, kv_indet;
-static pthread_t kv_threads[2 * MAXN];
+static pthread_t kv_threads[2 * MAXN + 1];
 static int nkv_threads;
 
 static void *kv_writer(void *arg)
 {
-    int node = (int)(intptr_t)arg;
-    struct hist *h = &hists[node];
+    int hi = (int)(intptr_t)arg, node = hist_node[hi];
+    struct hist *h = &hists[hi];
     tsdbc *c = NULL;
     tsdb_sid sid = 0;
-    uint64_t r = mix(seed * 31 + (uint64_t)node);
+    uint64_t r = mix(seed * 31 + (uint64_t)hi);
     while (atomic_load(&kv_run)) {
         if (!c) {
-            if (connect_node(node, 0, &c) != 0 || kv_resolve(c, node, &sid) != 0) {
+            if (connect_node(node, 0, &c) != 0 || kv_resolve(c, hi, &sid) != 0) {
                 if (c)
                     tsdbc_close(c);
                 c = NULL;
@@ -1191,15 +1215,20 @@ static int kv_read_all(tsdbc *c, tsdb_sid sid, struct rd *rd)
     return 0;
 }
 
+/* the moment the terminal crash point was triggered (kv, classes): the leader of kvr ends at it and comes back as a
+ * replica, and a replica answers reads from what it has applied (tsdbd: REPLICA_OK, design-cluster.md 7.2, is a later
+ * step, so a replica does not refuse them): stale by design, so the readers stop there. */
+static _Atomic int64_t term_ns;
+
 static void *kv_reader(void *arg)
 {
-    int node = (int)(intptr_t)arg;
-    struct hist *h = &hists[node];
+    int hi = (int)(intptr_t)arg, node = hist_node[hi];
+    struct hist *h = &hists[hi];
     tsdbc *c = NULL;
     tsdb_sid sid = 0;
     while (atomic_load(&kv_run)) {
         if (!c) {
-            if (connect_node(node, 0, &c) != 0 || kv_resolve(c, node, &sid) != 0) {
+            if (connect_node(node, 0, &c) != 0 || kv_resolve(c, hi, &sid) != 0) {
                 if (c)
                     tsdbc_close(c);
                 c = NULL;
@@ -1207,9 +1236,13 @@ static void *kv_reader(void *arg)
                 continue;
             }
         }
+        if (atomic_load(&term_ns)) {
+            usleep(100000);
+            continue;
+        }
         struct rd tmp;
         memset(&tmp, 0, sizeof tmp);
-        if (kv_read_all(c, sid, &tmp) == 0)
+        if (kv_read_all(c, sid, &tmp) == 0 && (!atomic_load(&term_ns) || tmp.begin < atomic_load(&term_ns)))
             *hist_read_slot(h, 0) = tmp;
         else {
             h->reads_failed++;
@@ -1259,8 +1292,10 @@ static void kv_setup(void)
         if (!placed)
             usleep(200000);
     }
+    nhists = nn;
     for (int i = 0; i < nn; i++) {
         snprintf(hists[i].name, sizeof hists[i].name, "kvl.n%d", i);
+        hist_node[i] = i;
         pthread_mutex_init(&hists[i].mu, NULL);
         /* the group has recorded the open; the node opens its volume once it applied that too */
         for (int64_t t1 = now_ms();; usleep(100000)) {
@@ -1282,13 +1317,138 @@ static void kv_setup(void)
     }
 }
 
+/* kv and classes: one cluster volume "kvr" of 3 replicas with the replication driver (no TSDB_CLUSTER_WRITES), REP_HISTS
+ * series with a writer and a reader each and the filler's series, all created and written through the volume's leader
+ * (the replicas answer UNAVAILABLE). The leader is never killed, powered off, paused or armed at a restart (pick_node):
+ * a restarted leader never leads its epoch again and nothing fails the volume over before r3e-failover; the one fault
+ * it takes is the terminal crash point (nem_terminal). */
+#define REP_HISTS 2
+#define FILL_BASE (KV_BASE_TS + 86400000LL) /* the filler's rows: a day after the keys, never a key */
+static int rep_leader = -1, rep_nodes[3], protect_node = -1;
+static uint32_t rep_number;
+static char rep_dir[3][PATH_MAX + 32];
+static _Atomic uint64_t fill_ok, fill_err;
+
+static void rep_setup(void)
+{
+    uint8_t req[META_NAME_MAX + 8];
+    size_t rl = cluster_volume_add_encode("kvr", 3, req);
+    int rc = admin_real(0, CLUSTER_OP_VOLUME_ADD, req, rl, 1, 15000);
+    if (rc != 0)
+        die(1, "volume add kvr: %s", cluster_strerror(rc));
+    for (int64_t t0 = now_ms(); rep_leader < 0; usleep(200000)) {
+        struct view v;
+        if (now_ms() - t0 > 60000)
+            die(1, "kv: the volume kvr was not opened on 3 replicas with a leader within 60 s");
+        if (view_get(0, &v, 2000) != 0)
+            continue;
+        for (uint32_t k = 0; k < v.m.nvolumes; k++) {
+            const struct meta_volume *mv = &v.m.volumes[k];
+            if (strcmp(mv->name, "kvr") || mv->nrep != 3 || !mv->leader)
+                continue;
+            int ok = 1, lead = -1;
+            for (int r = 0; r < 3; r++) {
+                rep_nodes[r] = -1;
+                for (int i = 0; i < nn; i++)
+                    if (atomic_load(&nodes[i].id) == mv->rep[r].node)
+                        rep_nodes[r] = i;
+                ok &= rep_nodes[r] >= 0 && mv->rep[r].open_gen >= 1;
+                if (rep_nodes[r] >= 0 && mv->rep[r].node == mv->leader)
+                    lead = rep_nodes[r];
+            }
+            if (ok && lead >= 0) {
+                rep_number = mv->number;
+                rep_leader = protect_node = lead;
+            }
+        }
+        view_free(&v);
+    }
+    for (int r = 0; r < 3; r++)
+        snprintf(rep_dir[r], sizeof rep_dir[r], "%s/v%" PRIu32, nodes[rep_nodes[r]].dir, rep_number);
+    nhists = REP_HISTS;
+    static const char *const names[REP_HISTS + 1] = {"kvr.a", "kvr.b", "kvr.fill"};
+    for (int i = 0; i <= REP_HISTS; i++) {
+        if (i < REP_HISTS) {
+            snprintf(hists[i].name, sizeof hists[i].name, "%s", names[i]);
+            hist_node[i] = rep_leader;
+            pthread_mutex_init(&hists[i].mu, NULL);
+        }
+        for (int64_t t1 = now_ms();; usleep(100000)) { /* the leader promotes itself once its EPOCH marker commits */
+            tsdbc *c = NULL;
+            tsdb_sid sid = 0;
+            rc = connect_node(rep_leader, 1, &c);
+            if (rc == 0)
+                rc = tsdbc_series_at(c, names[i], "kvr", &sid);
+            if (c)
+                tsdbc_close(c);
+            if (rc == 0)
+                break;
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_NOTFOUND) || now_ms() - t1 > 30000)
+                die(1, "kv: cannot create %s in kvr on its leader (node %d): %s", names[i], rep_leader, tsdbc_strerror(rc));
+        }
+    }
+    printf("jepsen-cluster: kvr is volume %" PRIu32 " on nodes %d, %d, %d; its leader is node %d\n", rep_number,
+           rep_nodes[0], rep_nodes[1], rep_nodes[2], rep_leader);
+}
+
+/* The filler: inserts of 50-1550 rows to "kvr.fill" at a frontier that only moves ahead, a row every 1, 3, 8 or 50 ms
+ * of timestamps for a minute of them at a time (classes: the series' class follows its rate), most of them large
+ * writes that the driver ships as files (prepared-before-commit). Its outcomes are not checked, its rows are compared
+ * across the replicas. */
+static void *fill_writer(void *arg)
+{
+    (void)arg;
+    static const int spacing[4] = {1, 3, 8, 50};
+    int64_t *ts = malloc(1600 * sizeof *ts), front = FILL_BASE;
+    float *val = malloc(1600 * sizeof *val);
+    if (!ts || !val)
+        die(2, "out of memory");
+    uint64_t r = mix(seed * 77 + 5);
+    tsdbc *c = NULL;
+    tsdb_sid sid = 0;
+    while (atomic_load(&kv_run)) {
+        if (!c) {
+            if (connect_node(rep_leader, 0, &c) != 0 || tsdbc_series(c, "kvr.fill", 0, &sid) != 0) {
+                if (c)
+                    tsdbc_close(c);
+                c = NULL;
+                usleep(30000);
+                continue;
+            }
+        }
+        int n = 50 + (int)(mix(r += 1) % 1501);
+        for (int j = 0; j < n; j++) {
+            ts[j] = front;
+            val[j] = (float)(j % 997);
+            front += spacing[mix(seed + (uint64_t)((front - FILL_BASE) / 60000)) % 4];
+        }
+        int rc = tsdbc_insert_series(c, sid, ts, val, (size_t)n);
+        if (rc == 0)
+            atomic_fetch_add(&fill_ok, 1);
+        else {
+            atomic_fetch_add(&fill_err, 1);
+            tsdbc_close(c);
+            c = NULL;
+        }
+        usleep((useconds_t)(40000 + mix(r += 1) % 80000));
+    }
+    if (c)
+        tsdbc_close(c);
+    free(ts);
+    free(val);
+    return NULL;
+}
+
+static void *fill_writer(void *arg);
 static void kv_start(void)
 {
     atomic_store(&kv_run, 1);
-    for (int i = 0; i < nn; i++) {
+    for (int i = 0; i < nhists; i++) {
         pthread_create(&kv_threads[nkv_threads++], NULL, kv_writer, (void *)(intptr_t)i);
         pthread_create(&kv_threads[nkv_threads++], NULL, kv_reader, (void *)(intptr_t)i);
     }
+    if (want_rep)
+        pthread_create(&kv_threads[nkv_threads++], NULL, fill_writer, NULL);
 }
 
 static void kv_stop(void)
@@ -1307,7 +1467,7 @@ static void kv_final(int i)
     while (now_ms() - t0 < 30000) {
         tsdbc *c = NULL;
         tsdb_sid sid;
-        if (connect_node(i, 1, &c) == 0) {
+        if (connect_node(hist_node[i], 1, &c) == 0) {
             struct rd rd;
             memset(&rd, 0, sizeof rd);
             if (kv_resolve(c, i, &sid) == 0 && kv_read_all(c, sid, &rd) == 0) {
@@ -1316,13 +1476,13 @@ static void kv_final(int i)
                 tsdbc_close(c);
                 if (h->have_final)
                     return;
-                die(1, "the final read of node %d has a timestamp that is no key", i);
+                die(1, "the final read of %s has a timestamp that is no key", h->name);
             }
             tsdbc_close(c);
         }
         usleep(200000);
     }
-    die(1, "node %d: no final read of its series within 30 s", i);
+    die(1, "node %d: no final read of %s within 30 s", hist_node[i], h->name);
 }
 
 static int cmp_i64pair(const void *a, const void *b)
@@ -1554,6 +1714,35 @@ static int snaps_take(const char *dir, struct snaps *out)
     tsdb_close(db);
     return rc;
 }
+static int cv_collect(void *ctx, const char *name, const int64_t *ts, const float *v, size_t n)
+{
+    struct snaps *out = ctx;
+    if (out->n == out->cap) {
+        out->cap = out->cap ? out->cap * 2 : 16;
+        out->s = realloc(out->s, out->cap * sizeof *out->s);
+        if (!out->s)
+            die(2, "out of memory");
+    }
+    struct snapshot *s = &out->s[out->n++];
+    snprintf(s->name, sizeof s->name, "%s", name);
+    s->n = n;
+    s->ts = malloc((n + 1) * sizeof *s->ts);
+    s->v = malloc((n + 1) * sizeof *s->v);
+    if (!s->ts || !s->v)
+        die(2, "out of memory");
+    memcpy(s->ts, ts, n * sizeof *ts);
+    memcpy(s->v, v, n * sizeof *v);
+    return 0;
+}
+/* a cluster volume's directory, opened read-only in place (tests/cvol_check.c) */
+static int snaps_take_cvol(const char *dir, struct snaps *out)
+{
+    memset(out, 0, sizeof *out);
+    int rc = cvol_rows(dir, cv_collect, out);
+    if (rc == 0 && out->n)
+        qsort(out->s, out->n, sizeof *out->s, cmp_snap);
+    return rc;
+}
 static int snaps_diff(const struct snaps *a, const struct snaps *b, const char *la, const char *lb)
 {
     int diff = 0;
@@ -1575,12 +1764,12 @@ static int snaps_diff(const struct snaps *a, const struct snaps *b, const char *
 
 /* Every replica directory of a volume, opened in-process after a clean stop: the same series, the same rows, and the
  * same again after tsdb_optimize of each (design-cluster.md 13.2). Returns the number of differences. */
-static int replicas_equal(const char *const *dirs, int n)
+static int replicas_equal(const char *const *dirs, int n, int cluster)
 {
     int diff = 0;
     struct snaps first, cur;
     memset(&first, 0, sizeof first);
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < 2 - cluster; pass++) { /* a replica directory is only read: no tsdb_optimize there */
         if (pass == 1)
             for (int i = 0; i < n; i++) {
                 tsdb *db;
@@ -1593,7 +1782,7 @@ static int replicas_equal(const char *const *dirs, int n)
                 tsdb_close(db);
             }
         for (int i = 0; i < n; i++) {
-            if (snaps_take(dirs[i], &cur) != 0) {
+            if ((cluster ? snaps_take_cvol(dirs[i], &cur) : snaps_take(dirs[i], &cur)) != 0) {
                 fprintf(stderr, "jepsen-cluster: cannot read %s\n", dirs[i]);
                 return diff + 1;
             }
@@ -1610,13 +1799,95 @@ static int replicas_equal(const char *const *dirs, int n)
     return diff;
 }
 
-/* The replica directories of every volume once volumes are replicated (r3d fills this in: the tables of the metadata
- * copy name each volume's replicas and their nodes' directories). None yet. */
+/* The replica directories of the replicated volume (kv, classes): node directory/v<number>, the leader's among them. */
 static int replica_dirs(const char **dirs, int max)
 {
-    (void)dirs;
-    (void)max;
-    return 0;
+    int n = 0;
+    for (int r = 0; want_rep && r < 3 && n < max; r++)
+        dirs[n++] = rep_dir[r];
+    return n;
+}
+
+/* The keys of history h in a replica's snapshot (as kv_read_all reads them through a client). */
+static void snap_seen(const struct snaps *sn, const char *name, uint32_t *seen, int *stray)
+{
+    memset(seen, 0, KEYS * sizeof *seen);
+    *stray = 0;
+    for (size_t i = 0; i < sn->n; i++) {
+        if (strcmp(sn->s[i].name, name))
+            continue;
+        for (size_t j = 0; j < sn->s[i].n; j++) {
+            int k = ts_key(sn->s[i].ts[j]);
+            if (k < 0)
+                *stray = 1;
+            else if (!isnan(sn->s[i].v[j]))
+                seen[k] = (uint32_t)sn->s[i].v[j];
+        }
+    }
+}
+
+static int check_hist(struct hist *h, uint64_t *seen_indet_applied);
+
+/* kv and classes, after the clean stop: every replica directory, read in place, against the history. With the leader
+ * live to the end (its final read in h->final) each replica holds exactly the keys of that read; after the terminal
+ * crash point (no final read) each replica's state passes checks 1 and 2 as a final state, alone. --mutant
+ * rep-lost-write takes an acknowledged write out of the last replica's state. Returns the differences and violations. */
+static int rep_check(int terminal, int *viol)
+{
+    int bad = 0;
+    for (int r = 0; r < 3; r++) {
+        struct snaps sn;
+        int rc = snaps_take_cvol(rep_dir[r], &sn);
+        if (rc != 0) {
+            fprintf(stderr, "jepsen-cluster: cannot read the replica %s read-only: %d\n", rep_dir[r], rc);
+            bad++;
+            continue;
+        }
+        for (int i = 0; i < nhists; i++) {
+            struct hist *h = &hists[i];
+            uint32_t seen[KEYS];
+            int stray;
+            snap_seen(&sn, h->name, seen, &stray);
+            if (r == 2 && !strcmp(mutant, "rep-lost-write"))
+                for (int k = 0; k < KEYS; k++)
+                    if (seen[k] && seen[k] <= h->nw && h->w[seen[k] - 1].st == WS_OK) {
+                        seen[k] = 0;
+                        break;
+                    }
+            if (stray) {
+                fprintf(stderr, "jepsen-cluster: replica %s: %s has a timestamp that is no key\n", rep_dir[r], h->name);
+                bad++;
+            }
+            if (!terminal) {
+                for (int k = 0; k < KEYS; k++)
+                    if (seen[k] != h->final[k]) {
+                        fprintf(stderr, "jepsen-cluster: replica %s: %s key %d holds write %u, the leader's final read %u\n",
+                                rep_dir[r], h->name, k, seen[k], h->final[k]);
+                        bad++;
+                        break;
+                    }
+                continue;
+            }
+            /* the replica's state as the final state, the reads left out (they were checked once already) */
+            uint32_t nr[MAXSESS], fin[KEYS];
+            char name[sizeof h->name];
+            memcpy(nr, h->nr, sizeof nr);
+            memcpy(fin, h->final, sizeof fin);
+            memcpy(name, h->name, sizeof name);
+            memset(h->nr, 0, sizeof h->nr);
+            memcpy(h->final, seen, sizeof seen);
+            h->have_final = !stray;
+            snprintf(h->name, sizeof h->name, "%.20s@n%d", name, rep_nodes[r]);
+            uint64_t dummy = 0;
+            *viol += check_hist(h, &dummy);
+            memcpy(h->nr, nr, sizeof nr);
+            memcpy(h->final, fin, sizeof fin);
+            memcpy(h->name, name, sizeof name);
+            h->have_final = 0;
+        }
+        snaps_free(&sn);
+    }
+    return bad;
 }
 
 /* --selftest-replicas: the comparison itself, on two databases made here (no cluster) */
@@ -1639,7 +1910,7 @@ static int selftest_replicas(void)
                 die(2, "selftest-replicas: append");
         tsdb_close(db);
     }
-    if (replicas_equal(dirs, 2) != 0)
+    if (replicas_equal(dirs, 2, 0) != 0)
         die(1, "selftest-replicas: two equal databases differ");
     tsdb *db;
     tsdb_options o;
@@ -1648,7 +1919,7 @@ static int selftest_replicas(void)
     if (tsdb_open(b, &o, &db) != 0 || tsdb_series_at(db, "s", NULL, &sid) != 0 || tsdb_append(db, sid, KV_BASE_TS + 5000000, 1.0) != 0)
         die(2, "selftest-replicas: planting a row");
     tsdb_close(db);
-    if (replicas_equal(dirs, 2) == 0)
+    if (replicas_equal(dirs, 2, 0) == 0)
         die(1, "selftest-replicas: a row that only one replica has went unnoticed");
     printf("selftest-replicas: ok (equal replicas pass, a row on one replica is found)\n");
     return 0;
@@ -1657,16 +1928,18 @@ static int selftest_replicas(void)
 /* ------------------------------------------------------------------ nemeses */
 
 /* The crash points a midcommit round may arm. `placed`: the call exists in server code (r3d and r3e flip it as they
- * place theirs); `window_ms`: how long the armed node may run before the point is called unfired. */
+ * place theirs); `window_ms`: how long the armed node may run before the point is called unfired; `leader`: only the
+ * leader of a replicated volume passes it (server/repld.c), so it is never armed by a restart (that would end the
+ * leadership) but at every node's first start behind a trigger file, once per run (nem_terminal; kv and classes). */
 static struct {
     const char *name;
-    int placed, window_ms;
-} cps[] = {{"cluster-started", 1, 5000},
-           {"serving", 1, 5000},
-           {"wal-before-send", 0, 15000},
-           {"acked-before-ok", 0, 15000},
-           {"prepared-before-commit", 0, 15000},
-           {"class-switch", 0, 15000}};
+    int placed, window_ms, leader;
+} cps[] = {{"cluster-started", 1, 5000, 0},
+           {"serving", 1, 5000, 0},
+           {"wal-before-send", 1, 20000, 1},
+           {"acked-before-ok", 1, 20000, 1},
+           {"prepared-before-commit", 1, 20000, 1},
+           {"class-switch", 1, 30000, 1}};
 #define NCPS ((int)(sizeof cps / sizeof cps[0]))
 
 static unsigned faults[8], restarts, cp_hits, cp_hits_serving, cp_unfired, power_hits, power_idle;
@@ -1683,12 +1956,17 @@ static void hold_ms(int ms)
     }
 }
 
+/* a node to kill, power off, pause or arm: never the replicated volume's leader (protect_node) */
 static int pick_node(int bias_leader)
 {
     int l = atomic_load(&last_leader);
-    if (bias_leader && l >= 0 && l < nn && rnd() % 2)
+    if (bias_leader && l >= 0 && l < nn && l != protect_node && rnd() % 2)
         return l;
-    return rnd_range(0, nn - 1);
+    for (;;) {
+        int i = rnd_range(0, nn - 1);
+        if (i != protect_node)
+            return i;
+    }
 }
 
 static void restart_node(int i)
@@ -1792,7 +2070,7 @@ static void nem_midcommit(void)
     } else {
         int placed[NCPS], np = 0;
         for (int k = 0; k < NCPS; k++)
-            if (cps[k].placed)
+            if (cps[k].placed && !cps[k].leader)
                 placed[np++] = k;
         pick = placed[rnd_range(0, np - 1)];
     }
@@ -1826,6 +2104,40 @@ static void nem_midcommit(void)
     }
     hold_ms(rnd_range(200, 800));
     restart_node(i);
+}
+
+/* The terminal crash point (kv, classes, midcommit): every node started first with TSDB_CRASH_AT=<point>:1@<trigger>;
+ * past the middle of the run the trigger file is made and the leader of the replicated volume must end at the point
+ * within its window. Restarted, it never leads that volume again (no failover before r3e): the rest of the run writes
+ * fail, and the end check reads the replica directories as the final state. */
+static int term_cp = -1, term_fired, term_done;
+static char term_trigger[PATH_MAX], term_spec[PATH_MAX + 64];
+
+static void nem_terminal(void)
+{
+    int L = rep_leader;
+    int fd = open(term_trigger, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0)
+        die(2, "create %s: %s", term_trigger, strerror(errno));
+    close(fd);
+    atomic_store(&term_ns, now_ns());
+    int win = cps[term_cp].window_ms, st = await_exit(L, win);
+    if (st == -1) {
+        cp_unfired++;
+        snprintf(unfired_msg, sizeof unfired_msg, "the armed crash point %s never fired on node %d (the leader of kvr) "
+                 "within %d ms of its trigger", cps[term_cp].name, L, win);
+        stop_node(L, SIGKILL);
+    } else if (WIFEXITED(st) && WEXITSTATUS(st) == CRASH_EXIT_STATUS) {
+        cp_hits++;
+        cp_hits_serving++;
+        term_fired = 1;
+    } else
+        die(1, "node %d (the leader of kvr) ended with status 0x%x with %s triggered, not at the point (log %s)", L, st,
+            cps[term_cp].name, nodes[L].log);
+    effect_seen = 1;
+    term_done = 1;
+    hold_ms(rnd_range(200, 800));
+    restart_node(L);
 }
 
 static unsigned leader_cuts, leader_replaced, delays_applied;
@@ -2189,6 +2501,10 @@ int main(int argc, char **argv)
                     want_meta = 1;
                 else if (!nem && !strcmp(t, "kv-local"))
                     want_kv = 1;
+                else if (!nem && !strcmp(t, "kv"))
+                    want_rep = 1;
+                else if (!nem && !strcmp(t, "classes"))
+                    want_rep = want_classes = 1;
                 else
                     usage();
             }
@@ -2207,6 +2523,11 @@ int main(int argc, char **argv)
             known |= !strcmp(cps[k].name, crash_point_names[j]);
         if (!known)
             die(2, "crash point %s is not in server/crashpt.h", cps[k].name);
+    }
+    if (want_kv && want_rep) {
+        fprintf(stderr, "jepsen-cluster: kv-local (TSDB_CLUSTER_WRITES, no driver) and kv or classes (the driver) "
+                        "cannot share a run\n");
+        return 2;
     }
     use_crashfs = (nemeses & N_POWER) != 0;
     rng_state = mix(seed * 0x2545f4914f6cdd1dULL + 7);
@@ -2243,21 +2564,34 @@ int main(int argc, char **argv)
             die(2, "mkdir %s: %s", st, strerror(errno));
         proxy_start(i);
     }
+    if (want_rep && (nemeses & N_MIDCOMMIT) && strcmp(mutant, "unfired")) {
+        int cand[NCPS], nc = 0;
+        for (int k = 0; k < NCPS; k++)
+            if (cps[k].placed && cps[k].leader && (want_classes || strcmp(cps[k].name, "class-switch")))
+                cand[nc++] = k;
+        term_cp = cand[rnd() % (uint64_t)nc];
+        snprintf(term_trigger, sizeof term_trigger, "%s/terminal.trigger", rundir);
+        snprintf(term_spec, sizeof term_spec, "%s:1@%s", cps[term_cp].name, term_trigger);
+    }
     for (int i = 0; i < nn; i++) {
         int st = 0;
-        if (start_node(i, NULL, &st) != 0)
+        if (start_node(i, term_cp >= 0 ? term_spec : NULL, &st) != 0)
             die(1, "node %d exited with status 0x%x before it listened (log %s)", i, st, nodes[i].log);
     }
     cluster_form();
     settle("the formation");
     if (want_kv)
         kv_setup();
+    if (want_rep)
+        rep_setup();
     atomic_store(&sampler_run, 1);
     pthread_create(&sampler_th, NULL, sampler, NULL);
-    if (want_kv)
+    if (want_kv || want_rep)
         kv_start();
-    printf("jepsen-cluster: %d nodes, seed %" PRIu64 ", %d s, nemeses %d, workloads%s%s, run in %s\n", nn, seed, seconds,
-           nemeses, want_meta ? " meta" : "", want_kv ? " kv-local" : "", rundir);
+    printf("jepsen-cluster: %d nodes, seed %" PRIu64 ", %d s, nemeses %d, workloads%s%s%s, run in %s%s%s\n", nn, seed,
+           seconds, nemeses, want_meta ? " meta" : "", want_kv ? " kv-local" : "",
+           want_classes ? " classes" : want_rep ? " kv" : "", rundir, term_cp >= 0 ? "; terminal crash point " : "",
+           term_cp >= 0 ? cps[term_cp].name : "");
     fflush(stdout);
 
     int kinds[5], nk = 0;
@@ -2285,6 +2619,13 @@ int main(int argc, char **argv)
         }
         applied++;
         effect_seen = 0;
+        if (term_cp >= 0 && !term_done && now_ms() - t_start >= (int64_t)seconds * 600) {
+            faults[3]++;
+            nem_terminal();
+            settle("the terminal crash point");
+            hold_ms(rnd_range(300, 1200));
+            continue;
+        }
         switch (kind) {
         case N_KILL: faults[0]++; nem_kill(); break;
         case N_PARTITION: faults[1]++; nem_partition(); break;
@@ -2300,6 +2641,11 @@ int main(int argc, char **argv)
                kind == N_MIDCOMMIT ? "a crash point" : "a power loss");
         hold_ms(rnd_range(300, 1200));
     }
+    if (term_cp >= 0 && !term_done) {
+        cp_unfired++;
+        snprintf(unfired_msg, sizeof unfired_msg, "the terminal crash point %s was never triggered (the run was too short)",
+                 cps[term_cp].name);
+    }
     /* the end: everything healed, resumed and running */
     net_heal();
     for (int i = 0; i < nn; i++) {
@@ -2313,9 +2659,11 @@ int main(int argc, char **argv)
     settle("the last heal");
     int viol = 0;
     uint64_t indet_applied = 0, nreads = 0, nwrites = 0;
-    if (want_kv) {
+    if (want_kv || want_rep) {
         kv_stop();
-        for (int i = 0; i < nn; i++)
+        if (want_rep)
+            hold_ms(2000); /* the leader's commit point passes what was appended for the writes that timed out */
+        for (int i = 0; i < nhists && !term_fired; i++)
             kv_final(i);
         if (!strcmp(mutant, "lost-write")) { /* planted: the final state of node 0 lacks a write that was acknowledged */
             struct hist *h = &hists[0];
@@ -2327,7 +2675,7 @@ int main(int argc, char **argv)
                 }
             }
         }
-        for (int i = 0; i < nn; i++) {
+        for (int i = 0; i < nhists; i++) {
             viol += check_hist(&hists[i], &indet_applied);
             nwrites += hists[i].nw;
             nreads += hists[i].nr[0];
@@ -2355,8 +2703,14 @@ int main(int argc, char **argv)
         signal_child(foreign_pid, SIGTERM);
         waitpid(foreign_pid, NULL, 0);
     }
-    if (nd > 0)
-        rdiff = replicas_equal(dirs, nd);
+    if (nd > 0) {
+        if (!term_fired) /* after the terminal point a replica may lack what the leader appended last */
+            rdiff = replicas_equal(dirs, nd, 1);
+        rdiff += rep_check(term_fired, &viol);
+        if (rdiff)
+            fprintf(stderr, "jepsen-cluster: FAIL: %d difference(s) between the replicas of kvr, or with its leader's "
+                            "final read\n", rdiff);
+    }
     atomic_store(&stopping, 1);
 
     unsigned total_faults = faults[0] + faults[1] + faults[2] + faults[3] + faults[4];
@@ -2370,10 +2724,19 @@ int main(int argc, char **argv)
     if (want_meta)
         printf("meta: %" PRIu64 " STATUS samples (%" PRIu64 " unanswered), %u terms with a leader, %u leader changes seen\n",
                samples_ok, samples_failed, terms, changes);
-    if (want_kv)
-        printf("kv-local: %" PRIu64 " writes acknowledged, %" PRIu64 " refused, %" PRIu64 " indeterminate (%" PRIu64
+    if (want_rep) {
+        struct stat cs;
+        char cl[PATH_MAX + 48];
+        snprintf(cl, sizeof cl, "%s/CLASSES", rep_dir[0]);
+        printf("%s: filler inserts %" PRIu64 " acknowledged, %" PRIu64 " not; CLASSES %lld bytes on node %d; terminal "
+               "crash point %s%s\n", want_classes ? "classes" : "kv", (uint64_t)atomic_load(&fill_ok),
+               (uint64_t)atomic_load(&fill_err), stat(cl, &cs) == 0 ? (long long)cs.st_size : -1LL, rep_nodes[0],
+               term_cp >= 0 ? cps[term_cp].name : "none", term_cp < 0 ? "" : term_fired ? " (fired)" : " (did not fire)");
+    }
+    if (want_kv || want_rep)
+        printf("%s: %" PRIu64 " writes acknowledged, %" PRIu64 " refused, %" PRIu64 " indeterminate (%" PRIu64
                " of them applied), %" PRIu64 " reads; %u connections, %u refused for a port the node does not hold\n",
-               (uint64_t)atomic_load(&kv_ok), (uint64_t)atomic_load(&kv_fail), (uint64_t)atomic_load(&kv_indet),
+               want_kv ? "kv-local" : "kv", (uint64_t)atomic_load(&kv_ok), (uint64_t)atomic_load(&kv_fail), (uint64_t)atomic_load(&kv_indet),
                indet_applied, nreads, (unsigned)atomic_load(&client_connects), (unsigned)atomic_load(&refused_foreign));
     (void)nwrites;
     int rc = 0;

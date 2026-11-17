@@ -2,10 +2,12 @@
 /* Crash points: see crashpt.h. */
 #include "crashpt.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 const char *const crash_point_names[CRASH_POINT_COUNT] = {
@@ -19,6 +21,8 @@ static int armed_id = -1; /* written once, before crashpt_state leaves -1 (relea
 static long armed_n = 1;
 static pthread_once_t arm_once = PTHREAD_ONCE_INIT;
 static _Atomic long hits;
+static char armed_after[PATH_MAX]; /* "@path": passes count only once this file exists; written once, like armed_id */
+static _Atomic int after_seen;
 
 static void say(const char *msg, const char *name, long n)
 {
@@ -36,8 +40,17 @@ static void arm_from_env(void)
         atomic_store_explicit(&crashpt_state, 0, memory_order_release);
         return;
     }
-    char spec[96];
+    char spec[PATH_MAX + 96];
     snprintf(spec, sizeof spec, "%s", e);
+    char *at = strchr(spec, '@');
+    if (at) {
+        *at = 0;
+        if (!at[1]) {
+            say("empty trigger path in TSDB_CRASH_AT, exiting with status 2: ", spec, 0);
+            _exit(2);
+        }
+        snprintf(armed_after, sizeof armed_after, "%s", at + 1);
+    }
     long n = 1;
     char *colon = strchr(spec, ':');
     if (colon) {
@@ -67,6 +80,12 @@ void crashpt_slow(enum crash_point_id id)
     pthread_once(&arm_once, arm_from_env);
     if (atomic_load_explicit(&crashpt_state, memory_order_acquire) != 1 || id != armed_id)
         return;
+    if (armed_after[0] && !atomic_load_explicit(&after_seen, memory_order_relaxed)) {
+        struct stat st;
+        if (stat(armed_after, &st) != 0)
+            return; /* not triggered yet: this pass does not count */
+        atomic_store_explicit(&after_seen, 1, memory_order_relaxed);
+    }
     long h = atomic_fetch_add(&hits, 1) + 1;
     if (h != armed_n)
         return;

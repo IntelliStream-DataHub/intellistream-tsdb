@@ -1135,20 +1135,24 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 # front of every peer port, nemeses kill, partition, pause, midcommit (crash points, server/crashpt.h) and power
 # (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
 # each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
-$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/harness.h server/cluster.h server/meta.h server/crashpt.h \
-    $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) $(LIB) \
-	    $(LDLIBS)
+$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
+    server/crashpt.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
+	    $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 # on a disk, never /tmp (a tmpfs: a failing run keeps the state of five nodes there, and a power run never syncs)
 JEPSEN_CLUSTER_DIR ?= /var/tmp/tsdb-jepsen-cluster-$(shell printf %s "$(CURDIR)" | cksum | cut -d" " -f1)
 JEPSEN_NEMESES ?= kill partition pause midcommit power
 JEPSEN_SEED ?= 1
 JEPSEN_NODES ?= 5
+# kv-local runs its nodes with TSDB_CLUSTER_WRITES=1, kv and classes with the replication driver: separate runs
+JEPSEN_CLUSTER_WORKLOADS ?= meta,kv-local meta,kv meta,classes
 jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
-	for io in $(IO); do for nem in $(JEPSEN_NEMESES); do echo "== tsdbd --io $$io, nemesis $$nem"; \
+	for io in $(IO); do for wl in $(JEPSEN_CLUSTER_WORKLOADS); do for nem in $(JEPSEN_NEMESES); do \
+	    echo "== tsdbd --io $$io, workloads $$wl, nemesis $$nem"; \
 	    TSDBD=./$(B)/tsdbd TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
-	        --nemesis $$nem --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so || exit 1; \
-	    done; done
+	        --nemesis $$nem --workload $$wl --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
+	        || exit 1; \
+	    done; done; done
 
 # The harness has to notice what it is meant to: a port file that names another pid, a client that skips the check
 # of the port it connected to while a foreign server holds the node's old one (and the same client with the check:
@@ -1184,6 +1188,9 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
 	out=$$($$j --mutant lost-write --seconds 12 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a lost write'; then \
 	        echo "jepsen-cluster-selftest: a write missing from the final state went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant rep-lost-write --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "the leader's final read"; then \
+	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-checker 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: a check of the histories or the election check does not find what it is for (rc $$rc)"; echo "$$out" | tail -n 30; exit 1; fi; \
