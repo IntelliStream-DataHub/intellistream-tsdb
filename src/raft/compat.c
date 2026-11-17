@@ -177,7 +177,14 @@ ssize_t (*iso_pwrite_hook)(int fd, const void *buf, size_t len, uint64_t off);
 uint64_t iso_now_ns(void)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+#ifdef CLOCK_BOOTTIME
+    /* CLOCK_BOOTTIME: CLOCK_MONOTONIC stops while the host is suspended, so a Raft leader's check-quorum lease and a
+     * server's read lease (server/cluster.c) would come back from a suspend with the time they had left, however long
+     * it lasted. Every reading is compared with readings of the same host only. */
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts); /* macOS: its CLOCK_MONOTONIC runs on through sleep */
+#endif
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 

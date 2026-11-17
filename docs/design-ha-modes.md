@@ -697,7 +697,7 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | S3 | both | Clients (design-cluster.md step 6): direct mode, streams, the 32-byte header, QUERY_MULTI split; Pulsar sink | 3 | 4 (test-clients, integration with failover) | — |
 | R1 | replicated | `src/repl.c` and its simulator (design-cluster.md step 2; first checkpoint 44b352b, review fixes 9f2cf49; its fifteen design gaps folded into design-cluster.md on 2026-11-06; still to add: a restored-directory fault, gap 14) | 1-2 | 6 (simulator soak) | — |
 | R2 | replicated | Engine replica mode (step 3); the marker backend of the journal hook | 2-4 | 6 (jepsen) | — |
-| R3 | replicated | Replication, ISR, promotion and leases in tsdbd (step 4 without what S2 built) | 3-4 | 12 (jepsen-cluster: kill, partition, pause, midcommit) | servers with disks |
+| R3 | replicated | Replication, ISR, promotion and leases in tsdbd (step 4 without what S2 built). *2026-11-16*: 3-4 was set before R3 was scoped; the scope split it into ten tracks (gate, depose, dictionary, volumes, REPL file, swap, data links, stream, apply, leases, failover); eight were merged 2026-11-14 to 16, several at once, about one track-day each | 9-12 | 12 (jepsen-cluster: kill, partition, pause, midcommit) | servers with disks |
 | R4 | replicated | Rebuild, catch-up, moves, leader balance (step 7) | 2-3 | 12 (jepsen-cluster: kill2, rebuild, slow) | servers with disks |
 | R5 | replicated | EC codec (`src/ec/`, copied unchanged by `tools/sync-ec.sh`, AGPL-3.0-only like the engine since the relicence: design-cluster-data.md E32), CPU dispatch in `src/cpu.c`, `test_rs`, `build/ec-bench`, no codec in the Apache-2.0 clients ([design-cluster-data.md](design-cluster-data.md) §11, added 2026-11-09, re-estimated after its review the same day) | 1-2 | numbers on three CPUs | intellistream-objects replaces gf256.c's start-up constructor by a selection call (same owner) |
 | R6 | replicated | Object layout, chunk files (writer epoch, cell sums), chunk stores per disk, directory backend, range decode, fuzzers | 2-3 | 2 (fuzz) | — |
@@ -763,7 +763,7 @@ after the user's answers* (R10 in 0.11.0; cluster data production, so P1-P6 too)
 13-20 track-days and 43 gate hours, R5-R15 39-51 and 84 (*2026-11-11*: device classes, it was R5-R14 30-40 and 64),
 P1-P6 14-21 and 117: **about 66-92 track-days and 244 gate hours (about 10.2 machine-days, 3 of them the 72-hour soak)
 before reruns**, roughly 6-8 weeks of calendar on three
-tracks ([design-cluster-data.md](design-cluster-data.md) §11). Gate time for the minimum: about 68-88 machine-hours of
+tracks (*2026-11-16*: R3 restated from 3-4 to 9-12 track-days, so about 72-100) ([design-cluster-data.md](design-cluster-data.md) §11). Gate time for the minimum: about 68-88 machine-hours of
 gates plus N8's 2-3 days of real NFS runs, **about 5-7 machine-days**, mostly jepsen-ha and the NFS runs. The calendar
 is set by the two maintenance windows (N0 and N8) and the review rounds, not by building.
 

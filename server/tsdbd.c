@@ -122,8 +122,15 @@
 #include "tenants.h"
 #include "cluster.h"
 #include "cvol.h"
+#include "repld.h"
 #include "../src/cvol.h"
 #include "crashpt.h"
+/* The engine's "outcome unknown" (src/internal.h, which tsdbd does not include): a replicated write that was appended
+ * but whose leader was deposed or failed before the commit point passed it. It reaches tsdbd through the public calls
+ * unchanged and must never reach a client (frame_put). */
+#ifndef TSDB_ERR_INDETERMINATE
+#define TSDB_ERR_INDETERMINATE (-110)
+#endif
 #include "../tools/cfg.h" /* configuration files: docs/config.md */
 #include "tsdbd_keys.h"
 
@@ -478,6 +485,17 @@ static void write_on_wait(void *ctx, int delta)
  * frame_put, so every path that answers TSDB_ERR_UNAVAILABLE (the admission, a quiesced volume under an engine
  * call) sends the same body. */
 static __thread uint16_t unav_vol = TSDB_VOL_ANY;
+/* A read admitted under the lease (§7.1) checks it again at its first reply frame, which comes after its snapshot: a
+ * process paused between admission and snapshot would otherwise answer from a snapshot taken after the lease ended.
+ * A lapse in between (cluster_lease_still) on a volume led here drops every frame and handle() answers UNAVAILABLE. */
+static __thread struct {
+    bool on, checked, failed;
+    uint64_t gen;
+    uint16_t vol;        /* the request's volume, or TSDB_VOL_ANY with ids */
+    const tsdb_sid *ids; /* QUERY_MULTI, QUERY_LATEST: their ids (the payload, valid until handle_op returns) */
+    size_t n;
+} lguard;
+static const char *test_read_stall; /* TSDBD_TEST_READ_STALL: an admitted cluster read waits while this file exists */
 
 #include "domains.h"
 static void dom_waits(int delta) { worker_waits(delta); }
@@ -504,10 +522,13 @@ static void vol_health(size_t v, uint8_t *health, uint8_t *reason, int64_t *sinc
     *outage_id = 0;
     *retry_ms = 1000;
     *domain = 0xffff;
-    int cw = cvol_why((uint32_t)v); /* a cluster volume: a replica (FENCED) or one not open yet (RECOVERING) */
+    int cw = cvol_why((uint32_t)v); /* a cluster volume: a replica (FENCED), one not open yet (RECOVERING), or led
+                                      * here without a read lease (UNREACHABLE: retried after about a heartbeat) */
     if (cw >= 0) {
         *health = TSDB_HEALTH_UNAVAILABLE;
         *reason = (uint8_t)cw;
+        if (cw == TSDB_WHY_UNREACHABLE)
+            *retry_ms = 200;
         return;
     }
     int d = dom_of(v);
@@ -877,12 +898,46 @@ static int tn_group(uint8_t op)
     }
 }
 
+/* Does the guarded request read a cluster volume led here? (only asked once the lease lapsed: cvol_led locks) */
+static bool lguard_led(void)
+{
+    if (!lguard.ids)
+        return cvol_led(lguard.vol);
+    uint32_t last = UINT32_MAX;
+    for (size_t i = 0; i < lguard.n; i++) {
+        tsdb_sid id = lguard.ids[i];
+        if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY ||
+            TSDB_SID_VOLUME(id) == last)
+            continue;
+        last = (uint32_t)TSDB_SID_VOLUME(id);
+        if (cvol_led(last)) {
+            unav_vol = (uint16_t)last;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* One reply frame: status, the u32 index of a QUERY_MULTI series when ix is not NULL, then up to three pieces of
  * body. With ob, a small frame is gathered there. Returns false when the connection is going away. */
 static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const uint32_t *ix, const void *a,
                       size_t alen, const void *b, size_t blen, const void *d, size_t dlen)
 {
     size_t pre = ix ? TSDB_MULTI_PREFIX : 0;
+    /* D12: a replicated write whose leader was deposed (or failed) after its WAL append may or may not commit; the
+     * client must not read that as a refusal, so it gets no answer at all: the connection closes, and the client
+     * treats every request in flight on it as of unknown outcome. Never put -110 on the wire. */
+    if (status == TSDB_ERR_INDETERMINATE) {
+        atomic_store(&c->closing, true);
+        shutdown(c->fd, SHUT_RDWR);
+        return false;
+    }
+    if (lguard.on && !lguard.checked) {
+        lguard.checked = true;
+        lguard.failed = !cluster_lease_still(lguard.gen) && lguard_led();
+    }
+    if (lguard.on && lguard.failed)
+        return !atomic_load(&c->closing); /* handle() answers UNAVAILABLE once the op is done */
     uint8_t ub[2 + TSDB_UNAVAIL_ENTRY]; /* the body of UNAVAILABLE (protocol 13), after the op's own error shape */
     size_t ulen = 0;
     /* a cluster volume this server only replicates (or leads before replication is wired) refuses writes as
@@ -1073,6 +1128,7 @@ static const tsdb_sid *frame_ids(const uint8_t *p, size_t len, size_t end, uint3
 
 /* A packed INSERT_VALUES: unzstd, unshape into plain arrays, insert. */
 static int cvol_refuse_ids(const tsdb_sid *ids, size_t n);
+static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n);
 
 static int insert_packed(auth_conn *a, const uint8_t *p, size_t len, uint32_t n, tsdb_sid s)
 {
@@ -1543,6 +1599,8 @@ static void handle_multi(conn *c, req *r)
         series = own;
         m.denied = denied;
     }
+    if (rc == 0) /* after the rights: a denied id says nothing about its volume (it is TSDB_SID_NONE now) */
+        rc = cvol_lease_refuse_ids(series, n);
     if (rc == 0 && (m.op == TSDB_OP_QUERY_VALUES || m.op == TSDB_OP_QUERY_LTTB)) {
         m.vo = (values_out){.c = c, .id = r->id, .ob = &m.ob};
         m.vo.ts = malloc(RAW_CHUNK_ROWS * 8);
@@ -1669,6 +1727,8 @@ static void handle_latest(conn *c, req *r)
         }
         ids = own;
     }
+    if (rc == 0) /* after the rights, as in QUERY_MULTI: a denied id says nothing about its volume */
+        rc = cvol_lease_refuse_ids(ids, n);
     tsdb_latest_result *res = rc ? NULL : malloc((size_t)TSDB_LATEST_FRAME_IDS * sizeof *res);
     uint8_t *rec = rc ? NULL : malloc((size_t)TSDB_LATEST_FRAME_IDS * TSDB_LATEST_REC);
     if (rc == 0 && (!res || !rec))
@@ -2171,6 +2231,34 @@ static int cvol_refuse_ids(const tsdb_sid *ids, size_t n)
     return 0;
 }
 
+/* Reads naming many ids (QUERY_MULTI, QUERY_LATEST): one id on a volume led here whose read lease ran out (§7.1)
+ * refuses the whole request, as handle() refuses a single-id op on such a volume. A replica's reads are not refused
+ * here (§7.2's REPLICA_OK is a later step). */
+static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n)
+{
+    if (!cvol_active())
+        return 0;
+    uint64_t gen = cluster_lease_gen();
+    if (cluster_lease_valid()) { /* one atomic load; the volumes are looked at only once the lease ran out (or below) */
+        if (!lguard.on)
+            lguard = (__typeof__(lguard)){.on = true, .gen = gen, .vol = TSDB_VOL_ANY, .ids = ids, .n = n};
+        return 0;
+    }
+    uint32_t last = UINT32_MAX;
+    for (size_t i = 0; i < n; i++) {
+        tsdb_sid id = ids[i];
+        if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY ||
+            TSDB_SID_VOLUME(id) == last)
+            continue;
+        last = (uint32_t)TSDB_SID_VOLUME(id); /* each run of one volume asked once (cvol_why locks) */
+        if (cvol_why(last) == TSDB_WHY_UNREACHABLE) {
+            unav_vol = (uint16_t)TSDB_SID_VOLUME(id);
+            return TSDB_ERR_UNAVAILABLE;
+        }
+    }
+    return 0;
+}
+
 static bool g_reader_only; /* --follow or --read-only: every volume is a FOLLOWER in TOPOLOGY */
 
 /* TOPOLOGY of a server without a cluster (protocol 13): itself as node 1, every volume it has, owned by it, with
@@ -2278,7 +2366,20 @@ static void handle_op(req *r);
 /* Tests (TSDBD_TEST_AUTH_DELAY_MS): a worker that answered TSDB_ERR_AUTH waits that long before it reports done, the
  * window in which the client's next frame arrives (a preempted worker on a busy CI machine); test_auth. */
 static int test_auth_delay_ms;
+static void handle_in(req *r);
 static void handle(req *r)
+{
+    lguard.on = lguard.checked = lguard.failed = false;
+    lguard.ids = NULL;
+    handle_in(r);
+    if (lguard.on && lguard.failed) { /* the lease lapsed before the snapshot: nothing went out, refused now */
+        lguard.on = false;
+        reply_error(r->c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+    }
+    lguard.on = false;
+}
+
+static void handle_in(req *r)
 {
     conn *c = r->c;
     const uint8_t *p = r->payload;
@@ -2306,6 +2407,22 @@ static void handle(req *r)
         cvol_active() && cvol_why(unav_vol) >= 0) { /* a write to a cluster volume this server does not lead */
         reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
         return;
+    }
+    if (unav_vol != TSDB_VOL_ANY && cvol_active()) {
+        uint64_t gen = cluster_lease_gen();
+        if (!cluster_lease_valid()) { /* cvol_why (a lock) only once the lease ran out: reads do not queue on it */
+            if (cvol_why(unav_vol) == TSDB_WHY_UNREACHABLE) {
+                /* any op on a volume led here whose read lease ran out (§7.1): refused, the client retries */
+                reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+                return;
+            }
+        } else if (!(auth_ops[r->op].need & R_WRITE)) { /* a write that passed is committed by its replicas */
+            lguard = (__typeof__(lguard)){.on = true, .gen = gen, .vol = unav_vol};
+            while (test_read_stall && access(test_read_stall, F_OK) == 0 && !stopping) {
+                struct timespec d = {0, 20000000};
+                nanosleep(&d, NULL);
+            }
+        }
     }
     int dv = dom_volume_of(r->op, p, len); /* a volume of a storage domain: at most DOM_CAP requests inside */
     if (dv >= 0) {
@@ -3529,9 +3646,15 @@ static void unpark_some(void)
 /* Once a second: closes connections whose frame was started frame_timeout_s ago and is still incomplete while
  * the server waits for its bytes (not one parked or held back by its own pipeline), and those whose output has
  * not moved for send_timeout_s. Run after the events that came with it (ep_loop, uring_loop). */
+static const char *test_loop_stall; /* TSDBD_TEST_LOOP_STALL: the loop stalls in on_tick while this file exists */
+
 static void on_tick(void)
 {
     tick_drain();
+    while (test_loop_stall && access(test_loop_stall, F_OK) == 0 && !stopping) { /* tests: a hung serving loop */
+        struct timespec d = {0, 50000000};
+        nanosleep(&d, NULL);
+    }
     int64_t now = mono_s(), now_ms = mono_ms();
     static int64_t logged;
     static int64_t login_logged;
@@ -3776,6 +3899,7 @@ static void uring_loop(void)
     io_uring_sqe_set_data(sqe, &tick_ev);
     while (!stopping) {
         io_uring_submit_and_wait(&ring, 1);
+        cluster_loop_stamp(); /* the loop runs: heartbeats may go out (D8) */
         struct io_uring_cqe *cqe;
         unsigned head, seen = 0;
         bool tick = false;
@@ -3857,6 +3981,7 @@ static void ep_loop(void)
     while (!stopping) {
         int n = epoll_wait(epfd, evs, 256, ready_head ? 0 : -1);
         bool tick = false;
+        cluster_loop_stamp(); /* the loop runs: heartbeats may go out (D8) */
         if (n < 0) {
             if (errno != EINTR) {
                 perror("tsdbd: epoll_wait");
@@ -4577,6 +4702,8 @@ int main(int argc, char **argv)
     }
     if (getenv("TSDBD_TEST_HOLD_LARGE_MS") && (hold_large_ms = atoi(getenv("TSDBD_TEST_HOLD_LARGE_MS"))) > 0)
         tsdb_test_precommit(db, hold_large, NULL);
+    test_loop_stall = getenv("TSDBD_TEST_LOOP_STALL");
+    test_read_stall = getenv("TSDBD_TEST_READ_STALL");
     if (getenv("TSDBD_TEST_AUTH_DELAY_MS"))
         test_auth_delay_ms = atoi(getenv("TSDBD_TEST_AUTH_DELAY_MS"));
     struct rlimit rl;
@@ -4706,7 +4833,7 @@ int main(int argc, char **argv)
             snprintf(padv, sizeof padv, "%s", peer_advertise);
         struct cluster_cfg cc = {.state_dir = state_dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
                                  .rack = rack, .power_feed = power_feed, .bmc = bmc, .read_barrier_off = rb_off,
-                                 .secret = secret, .secret_len = secret_len};
+                                 .secret = secret, .secret_len = secret_len, .loop_gated = 1};
         if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0)
             return 1;
         crash_point(CP_CLUSTER_STARTED); /* the harness restarts the node and counts the hit (tests/jepsen) */
@@ -4781,6 +4908,10 @@ int main(int argc, char **argv)
         close(new_fds[i]);
     free(new_fds);
     dom_shutdown();
+    /* A cluster volume its driver stopped on an engine failure (D13) is no failure of the server: it is closed first
+     * (repld_close_failed), so that tsdb_close's result is the other volumes' alone. (tsdb_volume_failed is no test
+     * of the others: a slot with no engine, such as a cluster volume refused at its open, answers TSDB_ERR_INVALID.) */
+    repld_close_failed();
     rc = tsdb_close(db);
     if (atomic_load(&db_failed))
         return 1; /* close failed too, by design: nothing more was written */

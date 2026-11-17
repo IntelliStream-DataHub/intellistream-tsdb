@@ -1099,6 +1099,10 @@ int tsdbc_query_raw_ex(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, co
         if ((rc = read_reply(c, &st, &b, &len)) != 0)
             break;
         uint32_t n;
+        if (st && len >= 5 && b[0] == 1 && (memcpy(&n, b + 1, 4), n == 0)) {
+            rc = st; /* an error's frame: its shape, then the body of an HA status (UNAVAILABLE: protocol 13) */
+            break;
+        }
         if (len < 5 || (memcpy(&n, b + 1, 4), len != 5 + (size_t)n * 12)) {
             rc = TSDB_ERR_CORRUPT;
             c->broken = true; /* whether more of the stream follows is unknown */
@@ -2255,6 +2259,10 @@ static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx)
         if ((rc = read_reply(c, &st, &b, &len)) != 0)
             break;
         uint32_t n;
+        if (st && len >= 8 && b[0] == 1 && (memcpy(&n, b + 4, 4), n == 0)) {
+            rc = st; /* an error's frame: its shape, then the body of an HA status (UNAVAILABLE: protocol 13) */
+            break;
+        }
         if (len < 8 || b[1] > TSDB_STATE || (type >= 0 && b[1] != type) || (memcpy(&n, b + 4, 4), false)) {
             rc = TSDB_ERR_CORRUPT;
             c->broken = true;

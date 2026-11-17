@@ -669,6 +669,7 @@ void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot)
  * is a cache line far from the tail the appenders write, and it would travel between cores with every call). Called
  * with buf_lock held at every place that hands wal_buf on or appends something that is not a row of this record. */
 atomic_uint wal_rec_max_rows = 1u << 28; /* a record's row count has 28 bits; tests lower it to split records */
+atomic_uint jr_rec_max_rows = 1u << 18; /* internal.h: a leader's record fits one peer frame */
 
 static void wal_rec_close(eng *db)
 {
@@ -701,8 +702,10 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
         eng_fail(db, "WAL numbers", EOVERFLOW);
         return TSDB_ERR_IO;
     }
-    bool extend = db->wal_rec_open &&
-                  (uint64_t)db->wal_rec_rows + n < atomic_load_explicit(&wal_rec_max_rows, memory_order_relaxed);
+    uint32_t rmax = atomic_load_explicit(&wal_rec_max_rows, memory_order_relaxed);
+    if (eng_jr(db))
+        rmax = MIN(rmax, atomic_load_explicit(&jr_rec_max_rows, memory_order_relaxed));
+    bool extend = db->wal_rec_open && (uint64_t)db->wal_rec_rows + n < rmax;
     size_t need = db->wal_len + (extend ? 0 : WAL_HDR) + n * WAL_ROW;
     if (need > db->wal_cap) {
         size_t cap = MAX(need, db->wal_cap * 2);
@@ -841,6 +844,15 @@ int wal_marker_mk(eng *db, const mk *m, uint64_t *fno)
 
 int wal_markers_mk(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last)
 {
+    return wal_markers_mk_at(db, m, n, fno, last, NULL, NULL);
+}
+
+/* `at`, when given, runs under buf_lock once the numbers are assigned, before the records can reach the file (and so
+ * before anyone can read them by position): a leader notes there what a reader of the marker may ask for. It takes
+ * only leaf locks (lead_mu) and cannot fail. */
+int wal_markers_mk_at(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last, void (*at)(eng *, uint64_t, void *),
+                      void *arg)
+{
     if (n == 0)
         return TSDB_ERR_INVALID;
     uint8_t **enc = calloc(n, sizeof *enc);
@@ -858,6 +870,8 @@ int wal_markers_mk(eng *db, const mk *m, size_t n, uint64_t *fno, uint64_t *last
     if (rc == 0) {
         pthread_mutex_lock(&db->buf_lock);
         rc = wal_markers_locked(db, r, n, fno, &lsn);
+        if (rc == 0 && at)
+            at(db, *fno, arg);
         pthread_mutex_unlock(&db->buf_lock);
     }
     for (size_t i = 0; enc && i < n; i++)
@@ -1001,6 +1015,11 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
 {
     if (!db->wal_enabled || db->opt.wal_sync_ms != 0 || db->rp || db->opt.read_only)
         return TSDB_ERR_INVALID;
+    if (!db->replica_req) { /* the same rule as a replica's open (db.c): only a directory made for replication */
+        fprintf(stderr, "tsdb: %s: META does not say requires=replica: not attached as a replicated leader\n",
+                db->dir ? db->dir : "?");
+        return TSDB_ERR_INVALID;
+    }
     int rc = db->lrs ? 0 : leader_rs_open(db); /* RSTATE before the first marker */
     if (rc)
         return rc;
@@ -1429,6 +1448,7 @@ static void lk_unlink_upto(eng *db, uint64_t bound)
         return;
     uint64_t last = db->lk[n - 1].seq;
     leader_links_drop(db, db->lk[n - 1].fno_end); /* the files their COMMIT markers named go with them */
+    leader_rs_prune(db, db->lk[n - 1].fno_end);   /* and the DROPs no retained record lies behind */
     memmove(db->lk, db->lk + n, (db->nlk - n) * sizeof *db->lk);
     db->nlk -= n;
     wal_removed_raise(db, last);
@@ -1472,10 +1492,14 @@ static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
     leader_unlink_due(db);
 }
 
+/* Never waits for flush_lock: a flush holds it while it waits for the commit point (flush_waiting, eng_leader_wait),
+ * and the driver's thread that calls this is the one that moves that point. When a flush holds it, the bound is
+ * stored and that flush's leader_flushed, or the next call, removes what is due. */
 void eng_leader_keep(eng *db, uint64_t pos)
 {
-    pthread_mutex_lock(&db->flush_lock);
     atomic_store(&db->lead_keep, pos);
+    if (pthread_mutex_trylock(&db->flush_lock) != 0)
+        return;
     leader_unlink_due(db);
     pthread_mutex_unlock(&db->flush_lock);
 }
@@ -1572,7 +1596,11 @@ int mt_flush(eng *db) { return mt_flush_ex(db, NULL, NULL); }
  * it is flushed here): a replica that applies it has sealed and flushes exactly the memtables the leader flushed
  * (the DROP marker, design-cluster.md 5.2). With an empty active memtable there is no new segment: the marker
  * goes into the current one, and the replica checks that its memtable holds no rows then. *fno: its first number. */
-int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
+static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held);
+int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno) { return mt_flush_do(db, marker, fno, false); }
+int mt_flush_held(eng *db, const mk *marker, uint64_t *fno) { return mt_flush_do(db, marker, fno, true); }
+
+static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held)
 {
     if (db->opt.read_only)
         return 0;
@@ -1592,7 +1620,8 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
         if (mrc)
             return mrc;
     }
-    pthread_mutex_lock(&db->flush_lock);
+    if (!held)
+        pthread_mutex_lock(&db->flush_lock);
     /* a memtable whose write failed earlier holds older rows than the active
      * one: it is written first, and the active one after it all the same, or
      * a large insert that relies on this flush would be shadowed by it */
@@ -1678,7 +1707,8 @@ int mt_flush_ex(eng *db, const mk *marker, uint64_t *fno)
 
     if (rc == 0)
         rc = flush_waiting(db);
-    pthread_mutex_unlock(&db->flush_lock);
+    if (!held)
+        pthread_mutex_unlock(&db->flush_lock);
     free(mbody);
     if (mlsn && rc == 0)
         rc = wal_commit(db, mlsn); /* the marker is durable before the caller goes on */

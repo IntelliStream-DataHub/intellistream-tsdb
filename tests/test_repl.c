@@ -18,6 +18,8 @@
  *               (MUT(30)), or a cut would pass its applied end or a position its log no longer retains.
  *   round       a cut can fall inside a record: a replica whose last epoch the leader lacks cuts at the end of the
  *               leader's epoch before it, inside an older epoch's record that only the replica has.
+ *   replay_floor the leader's replay floor: the lowest log start of itself and every member, unknown until each has
+ *               ACKed in the current epoch (MUT(39): members not heard from were left out).
  */
 #include "repl.h"
 
@@ -496,6 +498,65 @@ static void round_cut(void)
     repl_free(r);
 }
 
+/* The replay floor (design-cluster.md 5.4): the lowest log start of every member heard from in this epoch and the
+ * leader's own; unknown (0) while a member has not ACKed in this epoch (MUT(39) took the members heard from alone), on
+ * a node that is not leading, and again after a new epoch. A partition-class switch puts its T past every row at or
+ * above the floor, so a floor too high lets a replica replay rows under a key the switch has moved. */
+static void replay_floor(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(1, &d);
+    struct repl_durable du = {.rid = 22, .fence = 1, .floor = 100, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    CHECK(repl_replay_floor(r) == 0, "a node that is not leading has floor %" PRIu64, repl_replay_floor(r));
+    struct repl_msg m = meta_msg(1, 2, 1, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    repl_log_start(r, 50);
+    CHECK(repl_replay_floor(r) == 0, "floor %" PRIu64 " before any member ACKed", repl_replay_floor(r));
+    struct repl_msg k2 = {.type = REPL_M_ACK, .from = 2, .to = 1, .epoch = 2, .leader = -1, .durable = 101,
+                          .written = 101, .rid = 33, .resync = 1, .start = 30};
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 0, "floor %" PRIu64 " while node 0 has not ACKed in this epoch",
+          repl_replay_floor(r));
+    struct repl_msg k0 = k2;
+    k0.from = 0;
+    k0.rid = 11;
+    k0.start = 70;
+    repl_recv(r, &k0);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 30, "floor %" PRIu64 ", not node 2's start 30", repl_replay_floor(r));
+    k2.start = 60; /* node 2 removed segments: the leader's own start is now the lowest */
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 50, "floor %" PRIu64 ", not the leader's start 50", repl_replay_floor(r));
+    repl_log_start(r, 40); /* never lowered */
+    CHECK(repl_replay_floor(r) == 50, "the leader's start went back: floor %" PRIu64, repl_replay_floor(r));
+    /* A later epoch with this node leading again: what was heard in epoch 2 says nothing about epoch 3. */
+    m = meta_msg(1, 3, 1, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader in epoch 3");
+    CHECK(repl_replay_floor(r) == 0, "floor %" PRIu64 " in a new epoch before any ACK", repl_replay_floor(r));
+    k0.epoch = k2.epoch = 3;
+    repl_recv(r, &k0);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 0, "floor %" PRIu64 " in epoch 3 with node 2 unheard", repl_replay_floor(r));
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 50, "floor %" PRIu64 " in epoch 3", repl_replay_floor(r));
+    repl_free(r);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_repl", 1200);
@@ -527,6 +588,7 @@ int main(int argc, char **argv)
     promote();
     unanswered();
     round_cut();
+    replay_floor();
     if (failures) {
         fprintf(stderr, "test_repl: %d scenario(s) failed\n", failures);
         return 1;

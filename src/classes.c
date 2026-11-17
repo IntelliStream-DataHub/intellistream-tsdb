@@ -1258,12 +1258,12 @@ static int cls_same_at(eng *db, uint64_t off, uint32_t s, int64_t at, int cls)
     return TSDB_ERR_CORRUPT;
 }
 
-int cls_apply(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off)
+/* A replica's purge before a new CLASS record: every partition that holds a row of the series at or after `at` is merged
+ * (a replica's apply runs it without its log lock, then cls_apply). Nothing to do for a record CLASSES holds already. */
+int cls_purge(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off)
 {
     if (!db->cls_on || cls < 0 || cls >= PART_CLASSES || series >= eng_series_count(db))
-        return TSDB_ERR_INVALID;
-    if (record_off < db->cls_off && eng_test_mutant != MUT_REPLICA_NO_POS) /* the applier is the only appender */
-        return cls_same_at(db, record_off, series, at, cls);
+        return 0; /* cls_apply refuses it */
     if (record_off >= db->cls_off && eng_test_mutant != MUT_REPLICA_NO_CLASS_PURGE) {
         int64_t *keys = NULL;
         size_t nk = 0;
@@ -1289,6 +1289,16 @@ int cls_apply(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off
         if (rc)
             return rc;
     }
+    return 0;
+}
+
+/* After cls_purge (rows reach a replica's memtables only through its one applier, which is here). */
+int cls_apply(eng *db, uint32_t series, int cls, int64_t at, uint64_t record_off)
+{
+    if (!db->cls_on || cls < 0 || cls >= PART_CLASSES || series >= eng_series_count(db))
+        return TSDB_ERR_INVALID;
+    if (record_off < db->cls_off && eng_test_mutant != MUT_REPLICA_NO_POS) /* the applier is the only appender */
+        return cls_same_at(db, record_off, series, at, cls);
     sw w = {.s = series, .cls = cls, .at = &at, .pos = true, .off = record_off};
     return switch_retry(db, &w, 1, true);
 }

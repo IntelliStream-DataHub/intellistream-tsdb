@@ -38,6 +38,19 @@ a cluster made with 0.10.0 is initialised again, not upgraded (as for every chan
   `TSDB_CLUSTER_WRITES=1` (for trying it out; it goes when copying works). The example client takes `TSDB_VOLUME=NAME`.
 - `tsdb cluster init` stores the settings of replicated volumes (`--lease-ms`, `--drift-ppm`, `--unanswered-ms`,
   `--commit-interval-ms`, `--repl-retain-mb`, `--repl-retain-s`, `--idle-seal-ms`; nothing acts on them yet).
+- Liveness and leases (peer protocol 5: every node of a preview cluster is upgraded together and the cluster made
+  again). The loop that serves requests stamps a clock every round; while the stamp is older than 2.5 s the server
+  sends no heartbeat, so a hung I/O loop makes the member go down although its cluster thread runs (workers stuck
+  inside requests while the loop runs are not detected yet). Heartbeats
+  carry their send time and the peers the server cannot reach; only the Raft leader's answer, given while its own
+  check-quorum lease holds, extends a server's lease to `send time + lease_ms × (1 − drift)`. While its lease has run
+  out a server answers reads and writes on the cluster volumes it leads `UNAVAILABLE` (reason `unreachable`, retry
+  after 200 ms). The Raft leader declares nobody down before `lease_ms × (1 + drift)` after its last answer to them and
+  after it began to lead. A read admitted under the lease is checked again at its first reply frame, after its
+  snapshot, and refused if the lease lapsed in between. Lease clocks are `CLOCK_BOOTTIME`, so a suspend counts. A replica directory whose `META` lacks `requires=replica` is refused by the engine. The C
+  client returned `TSDB_ERR_CORRUPT` for an `UNAVAILABLE` answer to a raw or values query when it did not retry; it
+  returns `TSDB_ERR_UNAVAILABLE`. Tests: `test_cluster` `lease` and `hungloop`, `make lease-mutants`
+  (`leaseanyvoter`, `nodrift`, `stampignored`).
 - The cluster tutorial's step 6 adds a volume and writes to it through its leader. Tests: `tests/test_cvol.c` (cluster
   volumes in a handle: holes, routing, the engine swap under readers), `test_cluster` `volumes` and `volrefuse`, with
   the mutants `TSDB_CVOL_MUTANT=noopengen|samerid|anynonce|replnonce`.

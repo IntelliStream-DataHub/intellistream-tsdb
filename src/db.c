@@ -435,6 +435,7 @@ static int meta_load_or_create(eng *db, bool read_only)
             unsigned feats;
             meta_requires_parse(buf, &feats, feat, sizeof feat);
             db->feed_req = feats & META_REQ_FEED;
+            db->replica_req = feats & META_REQ_REPLICA;
             if (feat[0]) {
                 fprintf(stderr,
                         "tsdb: META requires the feature(s) \"%s\", which tsdb %s does not know: the open "
@@ -928,8 +929,20 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             }
         }
     }
+    if (replica && faccessat(db->dirfd, META_FILE, F_OK, 0) != 0) { /* before meta_load_or_create would make one */
+        fprintf(stderr, "tsdb: %s: no META (requires=replica): not opened as a replica\n", dir);
+        rc = TSDB_ERR_INVALID;
+        goto fail;
+    }
     if ((rc = meta_load_or_create(db, ro)) != 0)
         goto fail;
+    if (replica && !db->replica_req) {
+        /* a replica cuts its log to the leader's and skips what its links say: on a directory that was never made for
+         * one (cvolfs writes requires=replica into a cluster volume's META) that would rewrite a stranger's data */
+        fprintf(stderr, "tsdb: %s: META does not say requires=replica: not opened as a replica\n", dir);
+        rc = TSDB_ERR_INVALID;
+        goto fail;
+    }
     if ((rc = feed_open_reconcile(db, feed_want, &feed_wanted)) != 0)
         goto fail;
     if ((rc = series_open(&db->series, db->dirfd, "SERIES", ro, db->opt.fsync)) != 0 ||
@@ -1409,7 +1422,7 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
     int rc = eng_check(db);
     if (rc || n == 0)
         return rc;
-    if (n < db->opt.wal_max_batch_rows) {
+    if (n < db->opt.wal_max_batch_rows && (!eng_jr(db) || n < atomic_load(&jr_rec_max_rows))) {
         /* a small batch: one pass that vectorizes costs nothing beside its WAL record (large ones check it in
            the passes the sort makes anyway, insert.c) */
         bool unreachable = false;
@@ -1487,6 +1500,10 @@ int eng_flush(eng *db)
 
 /* ----------------------------------------------------------- maintenance */
 
+void (*eng_test_drop_hook)(eng *db, int at); /* 0: the merges waited for, flush_lock not taken; 1: marker to retire */
+
+static void drop_settle_locked(eng *db, int64_t ts);
+
 int eng_drop_before(eng *db, int64_t ts)
 {
     if (db->opt.read_only || db->rp)
@@ -1501,11 +1518,36 @@ int eng_drop_before(eng *db, int64_t ts)
     const bool serial = eng_jr(db) && eng_test_mutant != MUT_REPLICA_NO_DROP_SERIAL;
     if (serial)
         pthread_mutex_lock(&db->jr_serial);
+    /* A leader holds flush_lock from its marker's flush (leader_drop, mt_flush_held) to the retire: rows written after
+     * the marker stay in the memtable meanwhile. A flush between the two would put them into parts the retire then
+     * takes away on the leader, while every replica keeps them in its active memtable (the marker begins its
+     * segment): the leader would lose acknowledged rows. Lock order: jr_serial > flush_lock. */
+    const bool held = eng_jr(db) && eng_test_mutant != MUT_LEADER_DROP_UNHELD;
+    if (held) {
+        /* The merges of the partitions it drops are waited for (seconds for a big one) before flush_lock, so the
+         * leader's flushes do not wait for them too (r3g REVIEW F4); the intent stays set, so no new one starts, and
+         * drop_retire looks again */
+        pthread_mutex_lock(&db->lock);
+        drop_settle_locked(db, ts);
+        pthread_mutex_unlock(&db->lock);
+        if (eng_test_drop_hook)
+            eng_test_drop_hook(db, 0);
+        pthread_mutex_lock(&db->flush_lock);
+    }
     int rc = jr_intent(db, JR_DROP, &ts);
     if (rc == 0 && !eng_jr(db))
         rc = eng_flush(db);
+    if (rc == 0 && eng_test_drop_hook)
+        eng_test_drop_hook(db, 1);
     if (rc == 0)
         rc = drop_retire(db, ts);
+    else if (held) {
+        pthread_mutex_lock(&db->lock);
+        db->drop_pending = false; /* drop_retire did not run: it clears the intent on its every other way out */
+        pthread_mutex_unlock(&db->lock);
+    }
+    if (held)
+        pthread_mutex_unlock(&db->flush_lock);
     if (rc == 0 && eng_jr(db))
         rc = leader_rs_drop(db, ts); /* RSTATE says the DROP is done (replica.c) */
     if (serial)
@@ -1515,17 +1557,10 @@ int eng_drop_before(eng *db, int64_t ts)
 
 /* The part of tsdb_drop_before after the flush: retires every partition that ends at or before ts. A replica runs
  * it when it applies the DROP marker (replica.c), after it has flushed its sealed memtables. */
-int drop_retire(eng *db, int64_t ts)
+/* db->lock held: publishes the drop's intent (no merge of a partition ending at or before ts is selected while it is
+ * set) and waits until the merges of those partitions already in flight have listed their outputs */
+static void drop_settle_locked(eng *db, int64_t ts)
 {
-    int rc;
-    pthread_mutex_lock(&db->lock);
-    /* A merge of a partition being dropped names its output (durably) before it takes db->lock to list it. Dropped
-     * meanwhile, its sources are gone and the output is the only part with their rows: a crash after the
-     * acknowledgement would list it alone. So wait until the merge has listed it (the loop below retires it with
-     * the rest, by rename, before the fsync) and look again: the wait released db->lock. The intent is published
-     * first, so that no further merge of those partitions is selected meanwhile (select_merge_locked,
-     * ttl_select_locked, eng_optimize): the wait ends with the merges already in flight. Drops are serialized by
-     * drop_lock (tsdb_drop_before), so there is one intent at a time; it is cleared on every way out below. */
     db->drop_pending = true;
     db->drop_pending_end = ts;
     for (bool busy = true; busy && !eng_check(db);) {
@@ -1538,6 +1573,20 @@ int drop_retire(eng *db, int64_t ts)
         if (busy)
             pthread_cond_wait(&db->merged_cv, &db->lock);
     }
+}
+
+int drop_retire(eng *db, int64_t ts)
+{
+    int rc;
+    pthread_mutex_lock(&db->lock);
+    /* A merge of a partition being dropped names its output (durably) before it takes db->lock to list it. Dropped
+     * meanwhile, its sources are gone and the output is the only part with their rows: a crash after the
+     * acknowledgement would list it alone. So wait until the merge has listed it (the loop below retires it with
+     * the rest, by rename, before the fsync) and look again: the wait released db->lock. The intent is published
+     * first, so that no further merge of those partitions is selected meanwhile (select_merge_locked,
+     * ttl_select_locked, eng_optimize): the wait ends with the merges already in flight. Drops are serialized by
+     * drop_lock (tsdb_drop_before), so there is one intent at a time; it is cleared on every way out below. */
+    drop_settle_locked(db, ts);
     /* The retiring and the latest table's drop floor are one section (latest_rw > db->lock, design-latest.md 3.6),
      * entered after the wait: no merge of these partitions is selected while drop_pending is set, so none is in
      * flight when db->lock is taken again */

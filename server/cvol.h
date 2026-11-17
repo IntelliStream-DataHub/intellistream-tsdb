@@ -17,9 +17,12 @@
 int cvol_start(tsdb *t, const char *dir);
 void cvol_stop(void);
 /* The reason (TSDB_WHY_*) a request for cluster volume `v` is refused, for UNAVAILABLE's body: FENCED on a replica
- * (and on a leader whose writes are not switched on), RECOVERING while the volume is not open yet. -1: v is no
+ * (and on a leader whose writes are not switched on), RECOVERING while the volume is not open yet, UNREACHABLE on the
+ * leader while it holds no read lease (cluster_lease_valid: no Raft leader's answer extended it). -1: v is no
  * cluster volume of this server or nothing is wrong with it. */
 int cvol_why(uint32_t v);
+/* 1 when volume v is a cluster volume open and led here (whatever the lease says) */
+int cvol_led(uint32_t v);
 /* 1 once cvol_start ran: an engine's READONLY on a cluster volume becomes UNAVAILABLE (FENCED). */
 int cvol_active(void);
 /* 1 once the manager went through the volume records of a metadata copy: before that a volume name it does not know

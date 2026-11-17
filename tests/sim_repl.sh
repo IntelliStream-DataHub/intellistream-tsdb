@@ -46,7 +46,7 @@ all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 
 # or a missing binary (127) is not a planted bug caught. 24 (rounding a cut up) and 11 (on its own) cannot be seen
 # by the simulator, so a scenario is their only planted-bug check; 14 is also in the simulator's list.
 scenarios="30:follower_damage 34:promote 35:sync_cut 36:trim 36:cut_applied 37:unanswered 24:round_cut 11:promote
-           14:promote"
+           14:promote 39:replay_floor"
 
 mutants() {
     local seeds=$1 bad=0 m out

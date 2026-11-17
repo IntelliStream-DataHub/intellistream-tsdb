@@ -49,7 +49,8 @@
 #include <stdint.h>
 
 #define PL_CL_MAGIC 0x43445354u /* "TSDC": the cluster HELLO's magic (cluster.c) */
-#define PL_CL_VERSION 4         /* the cluster protocol version; 4 adds the link kind to HELLO */
+#define PL_CL_VERSION 5         /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
+                                 * HB and HB_ACK (r3e-leases) */
 
 enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2 };
 
@@ -126,6 +127,9 @@ void peerlink_set_bulk_rate(struct peerlink *pl, uint64_t bytes_per_s);
 /* A link to `addr` (host:port, the peer's peer port), persistent. want_id: the node id the peer must answer as (0:
  * any). The result lives until peerlink_free. */
 struct plink *peerlink_dial(struct peerlink *pl, uint32_t want_id, const char *addr, int kind);
+/* A dialed link's new address (the peer came back on another peer port): its next connection attempt dials it; a
+ * connection that is up stays until it fails. -1 for an accepted link or an address that does not fit. */
+int plink_set_addr(struct plink *l, const char *addr);
 
 /* The cluster thread's hand-off: `fd` (nonblocking, accepted) whose HELLO frame body (after [len][type]) is `hello`.
  * `self` is what the HELLO_ACK says. 0: the link owns the fd; -1: the caller closes it. Never blocks. */

@@ -56,6 +56,7 @@
 
 #include "cvol.h"
 #include "cvolfs.h"
+#include "repld.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/cvol.h"
 #include "tsdb_protocol.h"
@@ -147,7 +148,8 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
     char vdir[4200];
     snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, M.dir, r->number);
     int writer = r->leader == M.self && M.writes;
-    int rc = tsdb_cvol_open(M.t, r->number, vdir, !writer, 0);
+    /* replication (server/repld.c) opens it as a replica with REPL's floor; the record's leader promotes itself */
+    int rc = M.writes ? tsdb_cvol_open(M.t, r->number, vdir, !writer, 0) : repld_open(r);
     pthread_mutex_lock(&M.mu);
     if (rc == 0) {
         m->state = MV_OPEN;
@@ -188,6 +190,8 @@ static void *mgr_main(void *arg)
             pthread_mutex_unlock(&M.mu);
             if (st == MV_NONE)
                 prepare(r);
+            else if (st == MV_OPEN && !M.writes)
+                repld_update(r);
             pthread_mutex_lock(&M.mu);
             m = mv_get(r->number);
             int ready = 0, older = 0;
@@ -234,6 +238,7 @@ static void on_watch(void *arg, uint32_t self, const struct cluster_vol_rec *v, 
     pthread_mutex_unlock(&M.mu);
 }
 
+#define UNREACH_MS 1000 /* a peer unheard this long on every data link is reported unreachable (repld heartbeats: 5 ms) */
 static void on_report(void *arg, struct cluster_report *out)
 {
     (void)arg;
@@ -244,7 +249,8 @@ static void on_report(void *arg, struct cluster_report *out)
             continue;
         struct cluster_vol_report *v = &out->vols[out->nvols++];
         v->volume = m->number;
-        v->role = m->state == MV_OPEN && m->writer ? CL_ROLE_OWNER : CL_ROLE_NONE;
+        int writer = m->writer || (m->state == MV_OPEN && tsdb_cvol_role(M.t, m->number) == CVOL_WRITER);
+        v->role = m->state == MV_OPEN && writer ? CL_ROLE_OWNER : CL_ROLE_NONE;
         v->health = CL_HEALTH_OK;
         v->epoch = m->epoch;
         v->rid = m->rid;
@@ -252,6 +258,10 @@ static void on_report(void *arg, struct cluster_report *out)
         v->open_nonce = m->nonce;
     }
     pthread_mutex_unlock(&M.mu);
+    for (uint32_t i = 0; i < out->nvols; i++) /* after M.mu: the driver's locks are never taken under it */
+        if (repld_failed(out->vols[i].volume))
+            out->vols[i].health = CL_HEALTH_LOCAL_FAULT; /* D13: reported in the next heartbeat (r3e-failover acts) */
+    out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, UNREACH_MS);
 }
 
 int cvol_why(uint32_t v)
@@ -261,10 +271,28 @@ int cvol_why(uint32_t v)
     int why = -1;
     pthread_mutex_lock(&M.mu);
     const struct mvol *m = mv_get(v);
-    if (m)
-        why = m->state == MV_OPEN ? (m->writer ? -1 : TSDB_WHY_FENCED) : TSDB_WHY_RECOVERING;
+    int open = m && m->state == MV_OPEN, writer = m && m->writer;
+    if (m && !open)
+        why = TSDB_WHY_RECOVERING;
     pthread_mutex_unlock(&M.mu);
+    if (open && !writer && !repld_failed(v) && tsdb_cvol_role(M.t, v) == CVOL_WRITER)
+        writer = 1; /* promoted by the replication driver */
+    if (open) /* led here: answered only under a read lease (§7.1; reads and writes alike) */
+        why = !writer ? TSDB_WHY_FENCED : cluster_lease_valid() ? -1 : TSDB_WHY_UNREACHABLE;
     return why;
+}
+
+int cvol_led(uint32_t v)
+{
+    if (!M.active)
+        return 0;
+    pthread_mutex_lock(&M.mu);
+    const struct mvol *m = mv_get(v);
+    int open = m && m->state == MV_OPEN, writer = m && m->writer;
+    pthread_mutex_unlock(&M.mu);
+    if (open && !writer && !repld_failed(v) && tsdb_cvol_role(M.t, v) == CVOL_WRITER)
+        writer = 1; /* promoted by the replication driver (as in cvol_why) */
+    return open && writer;
 }
 
 int cvol_active(void) { return M.active; }
@@ -281,6 +309,7 @@ int cvol_start(tsdb *t, const char *dir)
 {
     M.t = t;
     snprintf(M.dir, sizeof M.dir, "%s", dir);
+    repld_init(t, dir);
     const char *w = getenv("TSDB_CLUSTER_WRITES");
     M.writes = w && !strcmp(w, "1");
     while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
@@ -322,4 +351,5 @@ void cvol_stop(void)
     pthread_mutex_unlock(&M.mu);
     pthread_join(M.th, NULL);
     M.started = 0;
+    repld_stop(); /* after the cluster thread (tsdbd stops it first) and the manager: nothing opens or updates */
 }

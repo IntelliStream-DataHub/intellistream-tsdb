@@ -28,6 +28,8 @@ struct cluster_cfg {
     int read_barrier_off;       /* --read-barrier off: this node runs without it; its heartbeat says so */
     const uint8_t *secret;      /* the cluster secret (every member and the CLI hold the same bytes) */
     size_t secret_len;
+    int loop_gated;             /* 1: heartbeats only while the serving loop stamps (cluster_loop_stamp); 0: the
+                                 * witness, which serves nothing */
 };
 
 /* Reads <dir>/meta/NODE (a new incarnation, synced) and starts the thread. 0, or -1 with a line on stderr. */
@@ -84,10 +86,16 @@ struct cluster_dom_report {
     char name[META_DOMAIN_MAX];
     uint8_t state; /* enum cluster_dom_state */
 };
+#define CLUSTER_REPORT_UNREACH 64
+struct cluster_unreach { /* a server this one shares a volume with and has not heard on any data link for age_ms */
+    uint32_t node;
+    uint32_t age_ms;
+};
 struct cluster_report {
-    uint32_t nvols, ndoms;
+    uint32_t nvols, ndoms, nunreach;
     struct cluster_vol_report vols[CLUSTER_REPORT_VOLS];
     struct cluster_dom_report doms[CLUSTER_REPORT_DOMS];
+    struct cluster_unreach unreach[CLUSTER_REPORT_UNREACH];
 };
 /* Fills `out` (zeroed) from what this server runs; called from the cluster thread once per heartbeat, so it must not
  * block. Without one (set before cluster_start) the server reports no volumes and no domains. */
@@ -97,6 +105,27 @@ void cluster_set_reporter(cluster_report_fn fn, void *arg);
  * its own (the state disk, the storage), 1 once they work again. It goes into the heartbeat's flags (claim_ok), and
  * the leader lifts a CLAIM_FAILED bar only on the 0 -> 1 change. */
 void cluster_set_claim_ok(int ok);
+
+/* ---- liveness and leases (design-cluster.md §6.1, §7.1; DECISION D8 of r3-scope/PLAN.md) */
+/* The serving loop's stamp: tsdbd's request loop calls it every round and every tick (any thread, an atomic store of
+ * the monotonic clock). With cfg.loop_gated the cluster thread sends no heartbeat while the stamp is older than
+ * CLUSTER_LOOP_STALE_MS, so a server whose loop hangs is marked down although its cluster thread runs. */
+#define CLUSTER_LOOP_STALE_MS 2500 /* the loop ticks once a second when idle */
+void cluster_loop_stamp(void);
+/* 1 while this server holds a read lease (a Raft leader's HB_ACK extended it into the future of the cluster thread's
+ * clock, CLOCK_BOOTTIME); 0 outside a cluster, so callers ask only about cluster volumes. Any thread, no lock. A volume led here is answered only while it holds (§7.1). */
+int cluster_lease_valid(void);
+/* A request that was admitted under the lease checks again once its snapshot is taken (§7.1: an answer from a snapshot
+ * taken after the lease ended, by a process paused in between, is a stale read): cluster_lease_gen() at admission,
+ * cluster_lease_still(gen) later is 1 only while the lease holds and has not lapsed in between (a lease that ended
+ * and was granted again bumps the gen). */
+uint64_t cluster_lease_gen(void);
+int cluster_lease_still(uint64_t gen);
+/* The lease arithmetic (exported for the tests): a lease granted on a heartbeat sent at send_ns lasts until
+ * send_ns + lease_ms * (1 - drift); a promotion away from a server is safe lease_ms * (1 + drift) after the Raft
+ * leader's last answer to it (both on the clocks named, monotonic, ns). */
+uint64_t cluster_lease_end(uint64_t send_ns, uint32_t lease_ms, uint32_t drift_ppm);
+uint64_t cluster_lease_safe(uint64_t answer_ns, uint32_t lease_ms, uint32_t drift_ppm);
 
 /* ---- data links (server/peerlink.h): the acceptor hands a data link's socket to this peerlink after the HELLO (a
  * member of this cluster, by id and identity); NULL (the default) refuses them. Any thread. Shutdown: cluster_set_peerlink(NULL),
@@ -124,6 +153,19 @@ struct cluster_vol_rec {
     uint64_t epoch;
     uint64_t rid, open_gen; /* this server's replica: its instance and the last REPLICA_OPEN generation committed */
     uint64_t open_nonce;    /* and the nonce committed with it */
+    /* replication (server/repld.c): the replicas in record order (the node index of the core, src/repl.h, is the
+     * position here), with the peer address of each server as the member list holds it */
+    uint32_t nrep;
+    struct cluster_vol_rep {
+        uint32_t node;
+        uint64_t rid;
+        uint8_t learner;
+        char peer[META_ADDR_MAX];
+    } rep[META_REPLICAS_MAX];
+    uint32_t nisr;
+    uint32_t isr[META_REPLICAS_MAX]; /* node ids */
+    uint64_t isr_version;
+    uint32_t min_isr, isr_lag_ms;
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
  * holds every REPLICA_OPEN committed before this start), with every replicated volume that names this server (`self`)
@@ -148,6 +190,10 @@ struct cluster_heard {
     uint32_t nvols, ndoms;
     struct cluster_vol_status *vols;
     struct cluster_dom_report *doms;
+    uint32_t nunreach; /* the servers its heartbeat says it cannot reach on the data links */
+    struct cluster_unreach unreach[CLUSTER_REPORT_UNREACH];
+    uint64_t answered_ms; /* on the Raft leader: since its last lease-granting HB_ACK to it (UINT64_MAX: none) */
+    int64_t lease_left_ms; /* the server's own entry: how long its lease still runs (< 0: expired) */
 };
 struct cluster_status {
     uint32_t self;

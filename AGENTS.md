@@ -188,10 +188,15 @@ cgroup, so `nice` does not keep your work out of its way.
   state machine (members, volumes, replicas, epochs, ISR, slots, users; entries of ops, snapshots, the §13.1
   invariants as `meta_check_step`). `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
-  add|status`). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  add|status`). `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
+  (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
+  over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below
+  `jr_rec_max_rows` so that it fits one peer frame. `TSDB_REPLD_MUTANT` and `TSDB_REPLD_TEST` are its test hooks
+  (`make repld-mutants`); `test_cluster replicate|replindet|replfail` its end-to-end tests. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
-  disk, power loss under crashfs). The metadata state (NODE, IDENT, `raft/`, snapshot, `copy`, `retired`) lives in
+  disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants
+  `make lease-mutants` plants). The metadata state (NODE, IDENT, `raft/`, snapshot, `copy`, `retired`) lives in
   `--state-dir` on a local file system; log syncs and snapshot writes run on a disk worker thread (`dw_*`), never on
   the cluster thread; the hard-state save stays on the cluster thread (its slot sequence is shared with the durable
   floor, which the copied log does not lock). `tests/jepsen/crashfs.c` follows dup'ed descriptors (the Raft log syncs
@@ -326,6 +331,9 @@ cgroup, so `nice` does not keep your work out of its way.
   tsdbd exits with status 1, except for a volume under a `--health-domain` (ha.md 15; the root, USERS and every
   volume outside a domain still end the process): that volume is quiesced, answers `TSDB_ERR_UNAVAILABLE`, and
   `dom_recover` reopens it in the process once its domain is not DOWN (the section on **Storage outages** below).
+  A cluster volume that replicates (`server/repld.c`, D13) is the other exception: its driver stops it (a writer is
+  deposed), it is quiesced and reported LOCAL_FAULT in the heartbeat, tsdbd serves its other volumes and its vote and
+  exits 0 on SIGTERM (the failed volume is closed before `tsdb_close`, whose errors still set status 1).
   A retried fsync can return 0 after the kernel
   dropped the dirty pages, so it proves nothing; only a reopen, which replays
   from what is on disk, is safe. Every directory fsync goes through
@@ -552,7 +560,7 @@ cgroup, so `nice` does not keep your work out of its way.
   loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
   `latest_rw` is held across no I/O but `tsdb_drop_before`'s renames of the partitions it retires (`db_retire_locked`,
   in its write section; `db->lock` was held across them already), and never across a lookup's reads of granules. Followers have no table.
-- **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; a replica's `stage_mu` is outermost of the replica's own locks) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
+- **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf, and so is the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
   sweeper takes `db->lock` only with it released). The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
