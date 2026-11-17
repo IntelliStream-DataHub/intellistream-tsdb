@@ -254,6 +254,9 @@ static int log_has(int i, const char *needle)
     return hit;
 }
 
+static uint32_t isr_of(int via, const char *name, uint64_t *version);
+static void await_isr(int via, const char *name, uint32_t n, int ms, const char *what);
+
 /* stops every live server (SIGTERM, status 0) and starts a new scenario in its own directory */
 static void stop_all(void)
 {
@@ -3005,6 +3008,9 @@ static void scen_replicate(void)
         die("a large write with a replica down: %s", ers(wb.rc));
     n[0] += 300;
     n[2] += 100000;
+    /* the writes no longer wait for R: once R is silent for isr_lag_ms it leaves the ISR and they go on. R catches up
+     * as a learner and grows back; only then has it surely seen the COMMIT marker and fetched the part */
+    await_isr(L, "plant", 3, 30000, "the replica restarted under writes");
     if (!log_has(R, "fetches"))
         die("the replica restarted under a large write never fetched its part from the leader");
     await_open_gen(L, "plant", R, 2, 0);
