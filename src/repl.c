@@ -19,6 +19,7 @@
  */
 #include "repl.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1030,6 +1031,32 @@ uint64_t repl_durable_end(const struct repl *r) { return r->durable; }
 uint64_t repl_applied(const struct repl *r) { return r->applied; }
 uint64_t repl_commit(const struct repl *r) { return r->commit; }
 int repl_failed(const struct repl *r) { return r->failed; }
+
+size_t repl_describe(const struct repl *r, char *buf, size_t cap)
+{
+    size_t n = 0;
+#define DESC(...)                                                                                                    \
+    do {                                                                                                             \
+        int k_ = snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__);                                              \
+        if (k_ > 0)                                                                                                  \
+            n += (size_t)k_;                                                                                         \
+    } while (0)
+    DESC("written %llu, durable %llu, commit %llu, applied %llu, ISR 0x%x (version %llu)%s, %zu waiting",
+         (unsigned long long)r->written, (unsigned long long)r->durable, (unsigned long long)r->commit,
+         (unsigned long long)r->applied, r->meta.isr, (unsigned long long)r->meta.isr_version,
+         r->isr_busy ? ", a change asked for" : "", r->npend - r->hpend);
+    for (int i = 0; i < r->cfg.nnodes; i++)
+        if (i != r->cfg.self)
+            DESC("; peer %d: match %llu, acked %llu, next %llu, rid %s, heard %llu ticks ago", i,
+                 (unsigned long long)r->peer[i].match, (unsigned long long)r->peer[i].acked,
+                 (unsigned long long)r->peer[i].next,
+                 !r->peer[i].rid ? "none" : r->peer[i].rid == r->meta.rid[i] ? "the record's" : "another",
+                 (unsigned long long)(r->now - r->peer[i].last_heard));
+#undef DESC
+    if (cap)
+        buf[n < cap ? n : cap - 1] = 0;
+    return n;
+}
 
 /* ------------------------------------------------------------------ the metadata group's rules */
 

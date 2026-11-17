@@ -71,6 +71,7 @@
 #include "../src/replica.h"
 
 #define TICK_MS 5
+#define COMMIT_STALL_MS 5000 /* the writer says what holds its commit point once it has not moved for this long */
 #define SPILL_BYTES (16u << 20) /* a bulk file above this is received into a file, not memory (r3d review M3) */
 #define INBOX_BYTES (64u << 20) /* a volume's inbox of peer frames: past it the link waits, then drops (M3) */
 #define INBOX_WAIT_MS 500       /* how long a link's thread waits for room (well below a link's dead_ms) */
@@ -134,6 +135,8 @@ struct rvol {
     uint64_t *coff; /* byte offset of each record of cur */
     int sync_wanted;
     uint64_t synced_rep; /* the writer: the last durable end handed to repl_synced */
+    uint64_t cstall_at, cstall_ms; /* the writer: the commit point and since when it has not moved with writes above it */
+    int cstall_said;
     uint64_t epoch_pos;  /* M_PROMOTING: the EPOCH marker's position */
     uint64_t fetch_ms;
     char fetch_name[RW_NAME_MAX + 1];
@@ -1514,6 +1517,32 @@ static void do_sync(struct rvol *rv)
     }
 }
 
+/* The writer's commit point, stuck with writes above it for COMMIT_STALL_MS (rv->mu held): says once what holds it (the
+ * core's view and the engine's durable end), and once that it moves again. Nothing else: a stall is either a peer that
+ * the ISR check drops after isr_lag, or a bug, and this line is what tells them apart afterwards. */
+static void commit_watch(struct rvol *rv, uint64_t now)
+{
+    if (rv->mode != M_WRITER || !rv->core)
+        return;
+    uint64_t c = repl_commit(rv->core), w = repl_written(rv->core);
+    if (c != rv->cstall_at || w <= c) {
+        if (rv->cstall_said)
+            say("volume %" PRIu32 ": the commit point moves again (%" PRIu64 ")", rv->number, c);
+        rv->cstall_at = c, rv->cstall_ms = now, rv->cstall_said = 0;
+        return;
+    }
+    if (rv->cstall_said || now - rv->cstall_ms < COMMIT_STALL_MS)
+        return;
+    rv->cstall_said = 1;
+    char d[1024];
+    repl_describe(rv->core, d, sizeof d);
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+    uint64_t wd = db ? eng_wal_durable_fno(db) : 0;
+    tsdb_cvol_unref(&db);
+    say("volume %" PRIu32 ": the commit point has stayed at %" PRIu64 " for %d ms with writes above it: %s; the WAL is "
+        "durable to %" PRIu64 ", handed to the core %" PRIu64, rv->number, c, COMMIT_STALL_MS, d, wd, rv->synced_rep);
+}
+
 static void *vol_main(void *arg)
 {
     struct rvol *rv = arg;
@@ -1544,6 +1573,7 @@ static void *vol_main(void *arg)
         }
         if (now >= next_tick) {
             repl_tick(rv->core);
+            commit_watch(rv, now);
             next_tick += TICK_MS;
             if (next_tick < now)
                 next_tick = now + TICK_MS;

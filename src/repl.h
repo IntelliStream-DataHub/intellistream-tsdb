@@ -42,6 +42,7 @@
 #define TSDB_REPL_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define REPL_MAX_NODES 8          /* replicas of one volume: node indexes 0 .. nnodes-1 */
 #define REPL_META      (-1)       /* message address of the metadata group */
@@ -219,6 +220,9 @@ uint64_t repl_durable_end(const struct repl *r);
 uint64_t repl_applied(const struct repl *r);
 uint64_t repl_commit(const struct repl *r);
 int repl_failed(const struct repl *r);
+/* One line of the state behind the commit point (written, durable, commit, the ISR, each peer's match), for a driver's
+ * log when the commit point stalls; returns its length as snprintf does. */
+size_t repl_describe(const struct repl *r, char *buf, size_t cap);
 
 /* The metadata group's rules. An ISR change applies only if it names the current epoch, ISR version and leader, and
  * keeps the leader (C11). A promotion applies only if the record still is the one the fences were sent for
