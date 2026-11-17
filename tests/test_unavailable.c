@@ -221,6 +221,36 @@ static void check_multi_during_outage(tsdbc *c)
     }
 }
 
+static int count_values_cb(void *ctx, const int64_t *ts, const tsdb_values *values, size_t n)
+{
+    (void)ts;
+    (void)values;
+    *(size_t *)ctx += n;
+    return 0;
+}
+
+/* A raw and a values query of the down volume, on a client with its retries off: each returns UNAVAILABLE, and the
+ * connection stays usable. 0.10.0's C client read the error frame of these two queries (its shape, then the
+ * protocol-13 body) as a corrupt stream: TSDB_ERR_CORRUPT and the connection marked broken. */
+static void check_reads_during_outage(tsdbc *c)
+{
+    size_t n = 0;
+    int rc = tsdbc_query_raw(c, sid_a, 0, 100000, count_cb, &n);
+    if (rc != TSDB_ERR_UNAVAILABLE)
+        fprintf(stderr, "raw query of the down volume: %d, expected UNAVAILABLE\n", rc);
+    CHECK(rc == TSDB_ERR_UNAVAILABLE);
+    rc = tsdbc_query_values(c, sid_a, 0, 100000, NULL, count_values_cb, &n);
+    if (rc != TSDB_ERR_UNAVAILABLE)
+        fprintf(stderr, "values query of the down volume: %d, expected UNAVAILABLE\n", rc);
+    CHECK(rc == TSDB_ERR_UNAVAILABLE);
+    CHECK(n == 0);
+    int64_t ts = 7000;
+    float v = 1;
+    CHECK(tsdbc_insert_series(c, sid_root, &ts, &v, 1) == 0); /* the connection is not lost */
+    n = 0;
+    CHECK(tsdbc_query_raw(c, sid_root, 7000, 7001, count_cb, &n) == 0 && n == 1);
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -287,6 +317,7 @@ int main(int argc, char **argv)
     ts = 2001;
     CHECK(tsdbc_insert_series(c, sid_root, &ts, &v, 1) == 0);
     check_multi_during_outage(c);
+    check_reads_during_outage(c);
     check_version_gate();
     t = NULL;
     CHECK(tsdbc_topology(c, &t) == 0 && t);
