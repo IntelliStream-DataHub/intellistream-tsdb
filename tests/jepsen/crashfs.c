@@ -264,6 +264,21 @@ static void *zeroed(size_t size)
     return p == MAP_FAILED ? NULL : p;
 }
 
+/* A list that grows (the dirty extents, the kept old sectors) lives in its own mapping, never in the heap: a sanitizer's leak
+ * check does not scan the shim's mapped tables (`files`), so a heap block only they point to reads as a leak at the exit of a
+ * process that loaded the shim (test_export under ASan: the default old-bytes mode of round 13 keeps sectors in every run). */
+static void *regrow(void *p, size_t oldsz, size_t newsz)
+{
+    void *n = zeroed(newsz);
+    if (!n)
+        return NULL;
+    if (p) {
+        memcpy(n, p, oldsz);
+        munmap(p, oldsz);
+    }
+    return n;
+}
+
 __attribute__((constructor)) static void init(void)
 {
 #define LOAD(name) real_##name = dlsym(RTLD_NEXT, #name)
@@ -430,7 +445,7 @@ static void dirty_add(file *f, off_t off, off_t len)
     }
     if (f->ndirty == f->capdirty) {
         int cap = f->capdirty ? 2 * f->capdirty : 16;
-        struct dirty_ext *d = realloc(f->dirty, (size_t)cap * sizeof *d);
+        struct dirty_ext *d = regrow(f->dirty, (size_t)f->capdirty * sizeof *d, (size_t)cap * sizeof *d);
         if (!d) { /* no room: the region is not remembered, so it keeps its new bytes (the disk may have kept them too) */
             return;
         }
@@ -494,7 +509,7 @@ static void keep_old(file *f, int fd, off_t off, off_t end)
             continue; /* not kept: a sector of made-up bytes is a loss no disk has */
         if (f->nold == f->capold) {
             size_t cap = f->capold ? 2 * f->capold : 16;
-            struct old_sector *o = realloc(f->old, cap * sizeof *o);
+            struct old_sector *o = regrow(f->old, f->capold * sizeof *o, cap * sizeof *o);
             if (!o)
                 return;
             f->old = o;
