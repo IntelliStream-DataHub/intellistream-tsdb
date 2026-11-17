@@ -11,12 +11,13 @@
 # shutdown), lateclock (a new leader starts its NOW markers only at its first SAVE as a writer) closegone,
 # syncbyrep (a writer's SYNC answered only when the WAL moved past the engine's last report) writersync (its knobs
 # syncbyhook and synclate make the race certain), inboxwaitall (a full inbox's every frame waits on the shared link) inboxshared, shipnoisr (the ship
-# wait ignores a replica's exit from the ISR) shipstall.
+# wait ignores a replica's exit from the ISR) shipstall; keepwritten (the keep bound by the replicas' written ends, so a
+# replica out of the ISR that has a COMMIT marker but not its file finds the link gone) replicate (its knob fetchlate).
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
 dir=${1:-/tmp}; shift || true
-muts=${*:-commitbyleader ackbeforesync floornotsaved commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal noinboxbound nospill keepignorespeers nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr}
+muts=${*:-commitbyleader ackbeforesync floornotsaved commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal noinboxbound nospill keepignorespeers keepwritten nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr}
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
 survived=
 for m in $muts; do

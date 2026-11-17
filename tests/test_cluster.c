@@ -2997,7 +2997,11 @@ static void scen_replicate(void)
         die("pthread_create");
     struct timespec pause = {1, 500000000};
     nanosleep(&pause, NULL);
-    penv[R] = "TSDB_REPLD_TEST=dropbulk"; /* the part shipped to R once it is back is lost: R must fetch it */
+    /* the part shipped to R once it is back is lost: R must fetch it, and asks only 5 s after it found the file missing
+     * (fetchlate), when its log has long passed the marker and the leader has sealed and flushed the marker's segment:
+     * the leader keeps that segment, and the link the file is served from, by R's durable end, which stops below the
+     * marker (keepwritten: by R's written end it went, and R never got the file) */
+    penv[R] = "TSDB_REPLD_TEST=dropbulk,fetchlate";
     start(R);
     penv[R] = NULL;
     uint64_t t0 = now_ms();
@@ -3016,8 +3020,9 @@ static void scen_replicate(void)
     n[0] += 300;
     n[2] += 100000;
     /* the writes no longer wait for R: once R is silent for isr_lag_ms it leaves the ISR and they go on. R catches up
-     * as a learner and grows back; only then has it surely seen the COMMIT marker and fetched the part */
-    await_isr(L, "plant", 3, 30000, "the replica restarted under writes");
+     * as a learner and grows back; only then has it surely seen the COMMIT marker and fetched the part. 60 s: under
+     * TSan the restart, the catch-up and the fetch (5 s late on purpose) took the whole of 30 s (r3d-isr g3 tsan) */
+    await_isr(L, "plant", 3, 60000, "the replica restarted under writes");
     if (!log_has(R, "fetches"))
         die("the replica restarted under a large write never fetched its part from the leader");
     await_open_gen(L, "plant", R, 2, 0);

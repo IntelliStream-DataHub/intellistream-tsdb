@@ -43,9 +43,11 @@
  * request as the record at once, before the metadata group commits it (isr), `nominisr` never checks min_isr (minisr),
  * `ackbelowminisr` hands the writer a commit point reached after a shrink below min_isr (minisr), `nocap` keeps the
  * leader's segments for a lagging replica without the caps repl_retain_mb and repl_retain_s (keepcap), `noseal` leaves
- * an idle leader's last segment unsealed (no idle flush; the NOW markers go on) (idleseal). Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
- * bulk file this process receives taken as staged but not kept, so its COMMIT marker finds the file missing and
- * FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER (writes then reach
+ * an idle leader's last segment unsealed (no idle flush; the NOW markers go on) (idleseal), `keepwritten` keeps the
+ * leader's segments by its peers' written ends, not their durable ones (replicate). Faults for tests,
+ * TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first bulk file this process receives taken as staged but not kept,
+ * so its COMMIT marker finds the file missing and FETCHes it; `fetchlate` has a replica send its first FETCH of a
+ * name only 5 s after it found the file missing (the leader has sealed and flushed the marker's segment by then); `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER (writes then reach
  * the new writer while the driver still promotes: they must be refused for a retry, never depose it); `noclock` has a
  * leader write no NOW markers and no idle seal (writersync).
  */
@@ -80,6 +82,7 @@
 _Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member must be heard well within isr_lag_ms");
 #define NOW_EVERY_MS 1000 /* a leader's NOW markers (design-cluster.md 5.4): its replicas' retention clock lags by at most this */
 #define RESEND_MS 50
+#define FETCH_LATE_MS 5000 /* fetchlate (tests) */
 #define READ_CAP (4u << 20)
 #define MAX_NODES 64
 
@@ -98,7 +101,9 @@ struct rpeer {
     uint64_t sent;     /* the last position whose records went out to it (a WAL record end) */
     uint64_t want;     /* the core wants it to have up to here */
     uint64_t sent_ms;  /* when `sent` last moved forward */
-    uint64_t acked;    /* the `written` of its last ACK in this run */
+    uint64_t acked;    /* the `durable` of its last ACK in this run: a replica's durable end stops below a COMMIT
+                        * marker whose file it has not staged, so the segment that holds the marker, and with it the
+                        * link the file is fetched from, stays (its `written` passes the marker: replicate) */
     uint64_t gen;      /* the log link's connection the cursor was moved on */
     int heard;
     uint64_t heard_ms; /* when a message of this volume last came from it (repld_unreachable) */
@@ -146,6 +151,8 @@ struct rvol {
     uint64_t epoch_pos;  /* M_PROMOTING: the EPOCH marker's position */
     uint64_t fetch_ms;
     char fetch_name[RW_NAME_MAX + 1];
+    uint64_t fetch_late_ms;                 /* fetchlate (tests): when fetch_late_name was found missing */
+    char fetch_late_name[RW_NAME_MAX + 1];
     struct jr_ops ops;
     /* the ISR change the core asked the metadata group for (REPL_M_ISR_REQ), reported in this server's heartbeats
      * (repld_isr_requests) while the record still is the request's basis */
@@ -163,7 +170,7 @@ struct rvol {
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
        RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL, RM_NOSPILL, RM_NOINBOXBOUND,
        RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK, RM_STOPNODEPOSE, RM_LATECLOCK, RM_SYNCBYREP,
-       RM_INBOXWAITALL, RM_SHIPNOISR };
+       RM_INBOXWAITALL, RM_SHIPNOISR, RM_KEEPWRITTEN };
 
 static struct {
     uint32_t isr_rot; /* (atomic) where repld_isr_requests starts its next report */
@@ -195,6 +202,7 @@ static struct {
                    * markers reach the WAL hooks of a stopped driver (op_bytes says so once) */
     _Atomic int said_late; /* latewal's line, once */
     int sync_by_hook; /* TSDB_REPLD_TEST=syncbyhook: a writer's SYNC compares what op_synced reported, not the engine */
+    int fetch_late;   /* TSDB_REPLD_TEST=fetchlate: a replica's first FETCH of a name waits FETCH_LATE_MS */
     int sync_late;    /* TSDB_REPLD_TEST=synclate: every other report of op_synced reaches the core only at the next
                        * tick, so the report after it covers records written behind the SYNC in flight (writersync) */
     int no_clock; /* TSDB_REPLD_TEST=noclock (tests only): a leader writes no NOW markers and seals nothing idle, so
@@ -1524,7 +1532,7 @@ static void handle(struct rvol *rv, struct item *it)
     rv->peer[from].heard_ms = now_ms();
     if (rv->cur.m.type == REPL_M_ACK) {
         struct rpeer *p = &rv->peer[from];
-        p->acked = rv->cur.m.written;
+        p->acked = G.mutant == RM_KEEPWRITTEN ? rv->cur.m.written : rv->cur.m.durable;
         p->heard = 1;
     }
     repl_recv(rv->core, &rv->cur.m);
@@ -1562,6 +1570,12 @@ static void do_sync(struct rvol *rv)
         return;
     }
     repl_synced(rv->core, d);
+    if (missing && G.fetch_late && strcmp(name, rv->fetch_late_name)) { /* a new name: its first FETCH waits */
+        snprintf(rv->fetch_late_name, sizeof rv->fetch_late_name, "%s", name);
+        rv->fetch_late_ms = now_ms();
+    }
+    if (missing && G.fetch_late && now_ms() - rv->fetch_late_ms < FETCH_LATE_MS)
+        missing = 0;
     if (missing && (strcmp(name, rv->fetch_name) || now_ms() - rv->fetch_ms >= 1000)) {
         int ld = node_index(rv, rv->rec.leader);
         struct plink *l = ld >= 0 ? link_of(rv->rec.rep[ld].node, 0) : NULL;
@@ -1731,6 +1745,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "nospill")        ? RM_NOSPILL
                : !strcmp(mu, "noinboxbound")   ? RM_NOINBOXBOUND
                : !strcmp(mu, "keepignorespeers") ? RM_KEEPIGNORESPEERS
+               : !strcmp(mu, "keepwritten")    ? RM_KEEPWRITTEN
                : !strcmp(mu, "nologstartcheck") ? RM_NOLOGSTARTCHECK
                : !strcmp(mu, "stopnodepose")   ? RM_STOPNODEPOSE
                : !strcmp(mu, "lateclock")      ? RM_LATECLOCK
@@ -1747,6 +1762,7 @@ void repld_init(tsdb *t, const char *dir)
     G.no_clock = te && strstr(te, "noclock");
     G.sync_by_hook = te && strstr(te, "syncbyhook");
     G.sync_late = te && strstr(te, "synclate");
+    G.fetch_late = te && strstr(te, "fetchlate");
     G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
     if (G.mutant == RM_NOINBOXBOUND)
         G.inbox_bytes = SIZE_MAX;
