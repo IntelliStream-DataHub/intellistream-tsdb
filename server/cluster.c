@@ -4313,6 +4313,16 @@ static void propose_isr_one(const struct cluster_isr_req *q, uint64_t epoch, uin
             ", commit point %" PRIu64 ")", q->volume, q->nisr, epoch, version, q->commit);
 }
 
+static int isr_same_members(const struct cluster_isr_req *a, const struct cluster_isr_req *b)
+{
+    if (a->nisr != b->nisr)
+        return 0;
+    for (uint32_t k = 0; k < a->nisr && k < META_REPLICAS_MAX; k++)
+        if (a->node[k] != b->node[k] || a->rid[k] != b->rid[k])
+            return 0;
+    return 1;
+}
+
 static void propose_isr(uint64_t now)
 {
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
@@ -4355,7 +4365,10 @@ static void propose_isr(uint64_t now)
                 if (isr_sent[k].q.volume == q->volume && isr_sent[k].q.epoch == q->epoch &&
                     isr_sent[k].q.isr_version == q->isr_version)
                     s = &isr_sent[k];
-            if (s && !memcmp(&s->q, q, sizeof *q) && since(now, s->ns) < ISR_RETRY_NS)
+            /* the same members on the same basis: a resend only after ISR_RETRY_NS. The commit point is left out of
+             * the comparison: during a grow under writes it moves at every heartbeat, and each move would otherwise
+             * be a new proposal (refused as stale, but a Raft entry each; r3d-isr review L1) */
+            if (s && isr_same_members(&s->q, q) && since(now, s->ns) < ISR_RETRY_NS)
                 continue;
             if (!s) {
                 if (nisr_sent == CLUSTER_REPORT_ISR)
