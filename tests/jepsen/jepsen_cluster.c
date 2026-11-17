@@ -29,7 +29,10 @@
  * everybody, a replica cut from the Raft leader only, a bridge, one direction, delays), pause (SIGSTOP for longer
  * than node_timeout, or than the lease), midcommit (a crash point of server/crashpt.h armed with TSDB_CRASH_AT: the
  * node ends with status 99 at it, is restarted and the hit counted; an armed point that never fired fails the run),
- * power (crashfs under the node's directory with CRASHFS_KEEP_OLD, SIGUSR2, exit status 99).
+ * power (crashfs under the node's directory, SIGUSR2, exit status 99; at half of the starts, drawn from the seed,
+ * CRASHFS_TEAR: unsynced appends cut at a sector or ended in garbage, sectors rewritten in place old or new each,
+ * which reaches the torn and unsure paths of the two-slot files (REPL, FNO, the Raft hard state); at the other half
+ * CRASHFS_KEEP_OLD: the least a disk must keep, rewrites in place come back old).
  *
  * Workloads. meta: sampled STATUS of every node; a term has at most one leader (election safety), every node gets
  * back, every member UP after each heal, the metadata equal on every node. kv-local: per node, one writer and one
@@ -52,14 +55,16 @@
  * of the run: the leader must end at it (nem_terminal), and the volume has no leader after that. The end check reads
  * every replica directory in place, read-only, after the clean stop (tests/cvol_check.c): with the leader alive to the
  * end, the replicas hold the same rows (replicas_equal) and the keys of the leader's final read; after the terminal
- * point, each replica's state passes checks 1 and 2 as the final state.
+ * point, each replica's state passes checks 1 and 2 as the final state. In both cases every replica holds each of the
+ * filler's large writes whole or not at all, whole when acknowledged (fill_check).
  *
  * Selftest (--selftest-checker, --mutant NAME; each must fail, `make jepsen-cluster-selftest`): foreign-pid (a port file that names another
  * pid), takeover (a stale table, a foreign server on the node's old port, and a client that skips th_owns_port),
  * takeover-checked (the same with the check: refused, the run passes), noop-partition, unfired (an armed crash point
  * nobody placed), idle (a nemesis that sleeps through its naps), lost-write (a write missing from the final state), nokill, nopause,
  * nodelay and noreset (a kill, pause or delay that does nothing, a heal that resumes held links: the run fails),
- * rep-lost-write (kv: an acknowledged write missing from one replica's directory).
+ * rep-lost-write (kv: an acknowledged write missing from one replica's directory), rep-half-batch (kv: half of an
+ * acknowledged large write of the filler missing from one replica's directory).
  *
  * Exit status: 0 ok, 1 a violation or a failed expectation, 2 the harness itself could not run.
  */
@@ -520,6 +525,7 @@ static void net_cut_done(void)
 /* ------------------------------------------------------------------ starting, stopping and asking the nodes */
 
 static int use_crashfs;
+static _Atomic uint64_t crashfs_starts, crashfs_tears; /* node starts under crashfs, and those with CRASHFS_TEAR */
 
 struct pfcopy {
     char from[PATH_MAX + 128], to[PATH_MAX + 128];
@@ -606,7 +612,7 @@ static int start_node(int i, const char *crash_at, int *status)
         if (strncmp(*e, "TSDB_CLUSTER_TEST=", 18) && strncmp(*e, "TSDB_CRASH_AT=", 14) && strncmp(*e, "LD_PRELOAD=", 11) &&
             strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20))
             envp[ne++] = *e;
-    char e1[256], e2[PATH_MAX + 64], e3[PATH_MAX + 64];
+    char e1[256], e2[PATH_MAX + 64], e3[PATH_MAX + 64], e4[64];
     if (!want_rep) /* the leader of a 1-replica cluster volume takes writes without the driver (kv-local) */
         envp[ne++] = "TSDB_CLUSTER_WRITES=1";
     if (crash_at) {
@@ -618,9 +624,17 @@ static int start_node(int i, const char *crash_at, int *status)
         snprintf(e3, sizeof e3, "CRASHFS_ROOT=%s", n->dir);
         envp[ne++] = e2;
         envp[ne++] = e3;
-        /* a rewrite in place that never synced comes back old, as on a disk; crashfs's default zeroes it, which the Raft
-         * hard state's reader rightly takes for rot (test_cluster hardslot; a kv power run, seed 1, 2026-11-17) */
-        envp[ne++] = "CRASHFS_KEEP_OLD=1";
+        /* a rewrite in place that never synced comes back old (KEEP_OLD), or old or new per sector and unsynced appends
+         * torn (TEAR), as on a disk; crashfs's default zeroes it, which the Raft hard state's reader rightly takes for
+         * rot (test_cluster hardslot; a kv power run, seed 1, 2026-11-17) */
+        uint64_t k = atomic_fetch_add(&crashfs_starts, 1);
+        if (mix(seed * 1009 + k) & 1) {
+            envp[ne++] = "CRASHFS_TEAR=1";
+            snprintf(e4, sizeof e4, "CRASHFS_SEED=%" PRIu64, mix(seed * 7919 + k) & 0x7fffffff);
+            envp[ne++] = e4;
+            atomic_fetch_add(&crashfs_tears, 1);
+        } else
+            envp[ne++] = "CRASHFS_KEEP_OLD=1";
     }
     envp[ne] = NULL;
     pid_t pid = fork();
@@ -1331,6 +1345,15 @@ static int rep_leader = -1, rep_nodes[3], protect_node = -1;
 static uint32_t rep_number;
 static char rep_dir[3][PATH_MAX + 32];
 static _Atomic uint64_t fill_ok, fill_err;
+/* The filler's batches in the order sent (one thread; read after kv_stop joined it): the timestamps [ts0, ts1] of each,
+ * its row count and its outcome (WS_*). Batches never overlap (the frontier only moves ahead, also past a failed one),
+ * so every row of kvr.fill belongs to exactly one. */
+struct fbatch {
+    int64_t ts0, ts1;
+    int n, st;
+};
+static struct fbatch *fb;
+static size_t nfb, cfb;
 
 static void rep_setup(void)
 {
@@ -1396,8 +1419,8 @@ static void rep_setup(void)
 
 /* The filler: inserts of 50-1550 rows to "kvr.fill" at a frontier that only moves ahead, a row every 1, 3, 8 or 50 ms
  * of timestamps for a minute of them at a time (classes: the series' class follows its rate), most of them large
- * writes that the driver ships as files (prepared-before-commit). Its outcomes are not checked, its rows are compared
- * across the replicas. */
+ * writes that the driver ships as files (prepared-before-commit). Each batch is recorded (fbatch) and checked in every
+ * replica directory at the end (fill_check): whole or absent, whole when acknowledged, absent when refused. */
 static void *fill_writer(void *arg)
 {
     (void)arg;
@@ -1425,10 +1448,21 @@ static void *fill_writer(void *arg)
             val[j] = (float)(j % 997);
             front += spacing[mix(seed + (uint64_t)((front - FILL_BASE) / 60000)) % 4];
         }
+        if (nfb == cfb) {
+            cfb = cfb ? 2 * cfb : 1024;
+            if (!(fb = realloc(fb, cfb * sizeof *fb)))
+                die(2, "out of memory");
+        }
+        struct fbatch *b = &fb[nfb++];
+        *b = (struct fbatch){.ts0 = ts[0], .ts1 = ts[n - 1], .n = n, .st = WS_INDET};
         int rc = tsdbc_insert_series(c, sid, ts, val, (size_t)n);
-        if (rc == 0)
+        if (rc == 0) {
+            b->st = WS_OK;
             atomic_fetch_add(&fill_ok, 1);
-        else {
+        } else {
+            if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_MOVED || rc == TSDB_ERR_INVALID || rc == TSDB_ERR_DROPPED ||
+                rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_DENIED)
+                b->st = WS_FAIL; /* refused: definitely not applied (as in kv_writer) */
             atomic_fetch_add(&fill_err, 1);
             tsdbc_close(c);
             c = NULL;
@@ -1831,6 +1865,67 @@ static void snap_seen(const struct snaps *sn, const char *name, uint32_t *seen, 
 
 static int check_hist(struct hist *h, uint64_t *seen_indet_applied);
 
+/* The filler's rows in one replica's state against its batches: a large insert is all or nothing, so every batch is
+ * whole (each row at its timestamp with its value) or absent; an acknowledged one is whole (its commit point counted
+ * every replica), a refused one absent; a row outside every batch is stray. This holds after the terminal crash point
+ * too, which is where it matters: prepared-before-commit and class-switch cut a large write or a switch in the middle.
+ * --mutant rep-half-batch drops half of one acknowledged batch from the last replica's count. Returns the violations;
+ * counts the indeterminate batches this replica applied into *indet_applied. */
+static int fill_check(const struct snaps *sn, int r, uint64_t *indet_applied)
+{
+    const struct snapshot *x = NULL;
+    for (size_t i = 0; i < sn->n; i++)
+        if (!strcmp(sn->s[i].name, "kvr.fill"))
+            x = &sn->s[i];
+    int *cnt = calloc(nfb + 1, sizeof *cnt), bad = 0;
+    if (!cnt)
+        die(2, "out of memory");
+    size_t b = 0;
+    for (size_t j = 0; x && j < x->n; j++) {
+        int64_t t = x->ts[j];
+        if (j && t <= x->ts[j - 1]) {
+            fprintf(stderr, "jepsen-cluster: replica %s: kvr.fill's rows are out of order at %" PRId64 "\n", rep_dir[r], t);
+            bad++;
+            break;
+        }
+        while (b < nfb && fb[b].ts1 < t)
+            b++;
+        if (b == nfb || t < fb[b].ts0) {
+            if (bad++ < 5)
+                fprintf(stderr, "jepsen-cluster: replica %s: kvr.fill has a row at %" PRId64 " that no batch wrote\n",
+                        rep_dir[r], t);
+            continue;
+        }
+        if (x->v[j] != (float)(cnt[b] % 997) && bad++ < 5)
+            fprintf(stderr, "jepsen-cluster: replica %s: kvr.fill batch %zu row %d holds %g, written %d\n", rep_dir[r], b,
+                    cnt[b], (double)x->v[j], cnt[b] % 997);
+        cnt[b]++;
+    }
+    if (r == 2 && !strcmp(mutant, "rep-half-batch"))
+        for (size_t i = 0; i < nfb; i++)
+            if (fb[i].st == WS_OK && cnt[i] == fb[i].n) {
+                cnt[i] /= 2;
+                break;
+            }
+    for (size_t i = 0; i < nfb; i++) {
+        const char *why = NULL;
+        if (cnt[i] != 0 && cnt[i] != fb[i].n)
+            why = "half of a large write";
+        else if (fb[i].st == WS_OK && cnt[i] == 0)
+            why = "an acknowledged large write is missing";
+        else if (fb[i].st == WS_FAIL && cnt[i] != 0)
+            why = "a refused large write was applied";
+        else if (fb[i].st == WS_INDET && cnt[i])
+            ++*indet_applied;
+        if (why && bad++ < 5)
+            fprintf(stderr, "jepsen-cluster: replica %s: %s: kvr.fill batch %zu [%" PRId64 ", %" PRId64 "] (%s) holds %d of "
+                    "its %d rows\n", rep_dir[r], why, i, fb[i].ts0, fb[i].ts1,
+                    fb[i].st == WS_OK ? "acknowledged" : fb[i].st == WS_FAIL ? "refused" : "indeterminate", cnt[i], fb[i].n);
+    }
+    free(cnt);
+    return bad;
+}
+
 /* kv and classes, after the clean stop: every replica directory, read in place, against the history. With the leader
  * live to the end (its final read in h->final) each replica holds exactly the keys of that read; after the terminal
  * crash point (no final read) each replica's state passes checks 1 and 2 as a final state, alone. --mutant
@@ -1888,6 +1983,14 @@ static int rep_check(int terminal, int *viol)
             memcpy(h->name, name, sizeof name);
             h->have_final = 0;
         }
+        uint64_t fapplied = 0;
+        int fbad = fill_check(&sn, r, &fapplied);
+        if (fbad)
+            fprintf(stderr, "jepsen-cluster: replica %s: %d violation(s) of the filler's large writes\n", rep_dir[r], fbad);
+        else
+            printf("jepsen-cluster: replica %s: kvr.fill holds every one of its %zu batches whole or not at all "
+                   "(%" PRIu64 " indeterminate applied)\n", rep_dir[r], nfb, fapplied);
+        bad += fbad;
         snaps_free(&sn);
     }
     return bad;
@@ -2711,8 +2814,8 @@ int main(int argc, char **argv)
             rdiff = replicas_equal(dirs, nd, 1);
         rdiff += rep_check(term_fired, &viol);
         if (rdiff)
-            fprintf(stderr, "jepsen-cluster: FAIL: %d difference(s) between the replicas of kvr, or with its leader's "
-                            "final read\n", rdiff);
+            fprintf(stderr, "jepsen-cluster: FAIL: %d difference(s) between the replicas of kvr, with its leader's "
+                            "final read, or in the filler's large writes\n", rdiff);
     }
     atomic_store(&stopping, 1);
 
@@ -2721,6 +2824,9 @@ int main(int argc, char **argv)
            "never fired %u), power %u (losses %u, idle %u); restarts %u, rounds %u\n",
            faults[0], faults[1], partitions_applied, partitions_planted_noop ? ", PLANTED NO-OP" : "", faults[2],
            faults[3], cp_hits, cp_hits_serving, cp_unfired, faults[4], power_hits, power_idle, restarts, rounds);
+    if (use_crashfs)
+        printf("crashfs: %" PRIu64 " node starts, %" PRIu64 " of them with CRASHFS_TEAR, the rest CRASHFS_KEEP_OLD\n",
+               (uint64_t)atomic_load(&crashfs_starts), (uint64_t)atomic_load(&crashfs_tears));
     printf("settles: %d (mean %lld ms, max %lld ms); proxy: %" PRIu64 " links held, %" PRIu64 " reset by a heal\n", settles,
            settles ? (long long)(settle_ms_total / settles) : 0, (long long)settle_ms_max, (uint64_t)atomic_load(&held_links),
            (uint64_t)atomic_load(&reset_links));

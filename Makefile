@@ -1193,6 +1193,9 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
 	out=$$($$j --mutant rep-lost-write --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "the leader's final read"; then \
 	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant rep-half-batch --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'half of a large write'; then \
+	        echo "jepsen-cluster-selftest: half of an acknowledged large write in a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-checker 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: a check of the histories or the election check does not find what it is for (rc $$rc)"; echo "$$out" | tail -n 30; exit 1; fi; \
