@@ -151,7 +151,8 @@ struct rvol {
 };
 
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
-       RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL, RM_NOSPILL, RM_NOINBOXBOUND };
+       RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL, RM_NOSPILL, RM_NOINBOXBOUND,
+       RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK };
 
 static struct {
     pthread_mutex_t mu;
@@ -1219,7 +1220,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
         if (rv->mode == M_WRITER) {
             uint64_t keep = a->floor;
             for (int i = 0; i < (int)rv->rec.nrep; i++)
-                if (i != rv->self && rv->peer[i].acked < keep)
+                if (i != rv->self && rv->peer[i].acked < keep && G.mutant != RM_KEEPIGNORESPEERS)
                     keep = rv->peer[i].acked; /* a peer never heard from holds everything */
             /* the caps (design-cluster.md 8.3): past them a lagging peer's segments go, up to the floor, and the core
              * tells that peer to install a snapshot once the log start passed what it needs */
@@ -1236,7 +1237,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
             rc = replica_floor_saved(db, a->floor);
             pthread_mutex_lock(&rv->mu);
         }
-        log_start_check(rv);
+        if (G.mutant != RM_NOLOGSTARTCHECK) /* planted: the core never hears that the log start moved */
+            log_start_check(rv);
         break;
     case REPL_A_SEND:
         if (a->msg.type == REPL_M_APPEND && a->msg.to >= 0 && a->msg.to < (int)rv->rec.nrep) {
@@ -1611,6 +1613,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "noseal")         ? RM_NOSEAL
                : !strcmp(mu, "nospill")        ? RM_NOSPILL
                : !strcmp(mu, "noinboxbound")   ? RM_NOINBOXBOUND
+               : !strcmp(mu, "keepignorespeers") ? RM_KEEPIGNORESPEERS
+               : !strcmp(mu, "nologstartcheck") ? RM_NOLOGSTARTCHECK
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);

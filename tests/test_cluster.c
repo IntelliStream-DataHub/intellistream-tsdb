@@ -3471,6 +3471,77 @@ static void scen_keepcap(void)
            " stays out of the ISR\n", nw);
 }
 
+/* keepfloor: below the caps the leader keeps every segment a replica away has not acked (design-cluster.md 8.3). The
+ * replica is killed, the leader writes and flushes segments past it, and the replica back must catch up from them,
+ * join the ISR again and never be told it needs a snapshot (r3d review: keep_ignores_peers survived every test). */
+static void scen_keepfloor(void)
+{
+    scenario("keepfloor");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    uint64_t rows = 0;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    rows++;
+    await_isr(0, "plant", 3, 5000, "every replica up");
+    int R = (L + 1) % 3;
+    stop(R, SIGKILL);
+    await_isr(0, "plant", 2, 10000, "a replica killed");
+    int64_t t = 10000;
+    for (int k = 0; k < 5; k++) {
+        int64_t tv[100];
+        float vv[100];
+        for (int j = 0; j < 100; j++)
+            tv[j] = t++, vv[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, tv, vv, 100)) != 0)
+            die("a write with a replica away: %s", ers(rc));
+        rows += 100;
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush: %s", ers(rc));
+    }
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0) /* a commit after the last flush: a save of the keep */
+        die("a write with a replica away: %s", ers(rc));
+    rows++;
+    struct timespec s1 = {1, 0};
+    nanosleep(&s1, NULL);
+    int nw = wal_count(L);
+    if (nw < 5)
+        die("the leader keeps %d WAL segments, not the 5 flushed ones a replica away has not acked", nw);
+    start(R);
+    await_isr(0, "plant", 3, 30000, "the killed replica back and caught up from the kept segments");
+    if (log_has(R, "it needs a snapshot"))
+        die("a replica back within the keep caps was told it needs a snapshot");
+    if ((uint64_t)rows_of(c, id) != rows)
+        die("the leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
+    tsdbc_close(c);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {rows, 0, 0, 0};
+    rep_same(wantr, "after a clean stop");
+    printf("  with a replica away the leader keeps its %d flushed segments; the replica back catches up from them and"
+           " holds the leader's rows\n", nw);
+}
+
 /* the part files in server i's copy of volume 1 (retired ones too: a merge leaves its sources under retired_) */
 static int part_count(int i)
 {
@@ -4251,7 +4322,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"backpressure", scen_backpressure}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
