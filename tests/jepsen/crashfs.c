@@ -54,6 +54,12 @@
  * durable (files that lie after an injected EIO excepted), and is a point
  * where the EIO can be injected.
  *
+ * With CRASHFS_KEEP_OLD=1 (and no CRASHFS_TEAR) a power loss puts the sectors rewritten in place since the last
+ * sync back as they were instead of zeroing them: still the least a disk must keep (a write in place that never
+ * synced is lost), but never a state no disk leaves. A reader may rightly refuse zeros where the old bytes or the new
+ * ones are all a power cut can leave: the Raft hard state's two slots (src/raft/raft_log.c, "What the reader
+ * accepts") take a zeroed slot beside a later sequence for rot, so tsdbd --cluster under a power nemesis needs this.
+ *
  * With CRASHFS_AT_EXIT=1 the power also fails as the process exits normally:
  * what a command reported done must already be durable.
  *
@@ -116,7 +122,7 @@ typedef struct file {
     int ndirty;
     bool used;
     bool lying; /* after an injected EIO: syncs succeed without making anything durable */
-    struct old_sector *old; /* CRASHFS_TEAR: durable sectors rewritten since the last sync, as they were */
+    struct old_sector *old; /* CRASHFS_TEAR or _KEEP_OLD: durable sectors rewritten since the last sync, as they were */
     size_t nold, capold;
 } file;
 
@@ -147,6 +153,7 @@ static long warmup, ops;
 static uint64_t rng;
 static volatile sig_atomic_t crash_requested;
 static bool tear; /* CRASHFS_TEAR=1 */
+static bool keep_old_mode; /* CRASHFS_KEEP_OLD=1 */
 static unsigned tear_prefix, tear_garbage, tear_old, tear_kept; /* what the power loss kept, for the message */
 static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
 static bool loss_at_exit;       /* CRASHFS_AT_EXIT=1 */
@@ -244,6 +251,7 @@ __attribute__((constructor)) static void init(void)
     if (getenv("CRASHFS_MARK"))
         snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
     tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
+    keep_old_mode = getenv("CRASHFS_KEEP_OLD") && atoi(getenv("CRASHFS_KEEP_OLD")) != 0;
     loss_at_exit = getenv("CRASHFS_AT_EXIT") && atoi(getenv("CRASHFS_AT_EXIT")) != 0;
     md_mode = getenv("CRASHFS_MODE") && !strcmp(getenv("CRASHFS_MODE"), "misdirect");
     md_rate = getenv("CRASHFS_MD_RATE") ? atof(getenv("CRASHFS_MD_RATE")) : 0.001;
@@ -319,11 +327,11 @@ static file *file_get(const char *path, bool create_new)
     return f;
 }
 
-/* CRASHFS_TEAR: keeps the durable content of the sectors in [off, end) that
+/* CRASHFS_TEAR, CRASHFS_KEEP_OLD: keeps the durable content of the sectors in [off, end) that
  * are about to change, once per sync, so a power loss can bring them back. */
 static void keep_old(file *f, int fd, off_t off, off_t end)
 {
-    if (!tear || f->lying)
+    if ((!tear && !keep_old_mode) || f->lying)
         return;
     if (end > f->durable)
         end = f->durable;
@@ -529,6 +537,13 @@ static void rollback(void)
                 size_t n = (size_t)(end - o < (off_t)sizeof zeros ? end - o : (off_t)sizeof zeros);
                 if (real_pwrite(fd, zeros, n, o) < 0)
                     break;
+            }
+        }
+        /* CRASHFS_KEEP_OLD: the rewritten sectors as they were (what a cut that kept none of the new ones leaves) */
+        for (size_t k = 0; keep_old_mode && k < f->nold; k++) {
+            struct old_sector *o = &f->old[k];
+            off_t len = f->durable - o->off < SECTOR ? f->durable - o->off : SECTOR;
+            if (len > 0 && real_pwrite(fd, o->data, (size_t)len, o->off) < 0) {
             }
         }
         if (st.st_size > f->durable)

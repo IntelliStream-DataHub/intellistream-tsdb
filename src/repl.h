@@ -219,6 +219,7 @@ uint64_t repl_written(const struct repl *r);
 uint64_t repl_durable_end(const struct repl *r);
 uint64_t repl_applied(const struct repl *r);
 uint64_t repl_commit(const struct repl *r);
+unsigned long repl_debug(const struct repl *r, char *buf, unsigned long cap);
 int repl_failed(const struct repl *r);
 /* One line of the state behind the commit point (written, durable, commit, the ISR, each peer's match), for a driver's
  * log when the commit point stalls; returns its length as snprintf does. */

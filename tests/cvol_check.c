@@ -72,3 +72,63 @@ int cvol_digest(const char *dir, const char *const *names, int n, uint64_t *rows
         rc = TSDB_ERR_IO;
     return rc;
 }
+
+struct rows_acc {
+    int64_t *ts;
+    float *v;
+    size_t n, cap;
+};
+
+static int rows_fn(void *ctx, const int64_t *ts, const void *v, size_t n)
+{
+    struct rows_acc *a = ctx;
+    if (a->n + n > a->cap) {
+        size_t cap = a->cap ? a->cap : 1024;
+        while (cap < a->n + n)
+            cap *= 2;
+        int64_t *t2 = realloc(a->ts, cap * sizeof *t2);
+        if (t2)
+            a->ts = t2;
+        float *v2 = realloc(a->v, cap * sizeof *v2);
+        if (v2)
+            a->v = v2;
+        if (!t2 || !v2)
+            return TSDB_ERR_NOMEM;
+        a->cap = cap;
+    }
+    memcpy(a->ts + a->n, ts, n * sizeof *ts);
+    memcpy(a->v + a->n, v, n * sizeof(float));
+    a->n += n;
+    return 0;
+}
+
+int cvol_rows(const char *dir, int (*fn)(void *ctx, const char *name, const int64_t *ts, const float *v, size_t n),
+              void *ctx)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.read_only = 1; /* the directory itself, after a clean stop: nothing is written to it */
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    eng *db = NULL;
+    meta_cluster_open_allow(true);
+    int rc = eng_open(dir, &o, &db);
+    meta_cluster_open_allow(false);
+    if (rc != 0)
+        return rc;
+    uint32_t ns = eng_series_count(db);
+    for (uint32_t id = 0; id < ns && rc == 0; id++) {
+        if (eng_series_type(db, id) != TSDB_FLOAT32) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        struct rows_acc a = {0};
+        rc = eng_query_raw_ex(db, id, INT64_MIN / 2, INT64_MAX / 2, false, 0, rows_fn, &a);
+        if (rc == 0)
+            rc = fn(ctx, eng_series_name(db, id), a.ts, a.v, a.n);
+        free(a.ts);
+        free(a.v);
+    }
+    int crc = eng_close(db);
+    return rc ? rc : crc;
+}

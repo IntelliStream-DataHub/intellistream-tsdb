@@ -1332,8 +1332,13 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     pthread_mutex_unlock(&db->buf_lock);
     if (announced)
         hook(hook_ctx, -1);
-    if (rc == 0 && db->wal_enabled && db->opt.wal_sync_ms == 0)
+    if (rc == 0 && db->wal_enabled && db->opt.wal_sync_ms == 0) {
         rc = wal_commit(db, lsn); /* a failure is eng_fail: indeterminate, and the server exits */
+        /* a leader's batch went to the replicas before its sync (jr_ops.bytes): a new leader may commit it, so the
+         * client gets no answer (D12), never an error it could take for a refusal */
+        if (rc != 0 && eng_jr(db) && counted)
+            rc = TSDB_ERR_INDETERMINATE;
+    }
     /* A leader acknowledges once the commit point passed the batch (C7): a failover keeps what it acknowledged. The
      * wait holds a server thread for a replica's round trip and fdatasync (about one fdatasync longer than a write on
      * a plain engine), so it is reported through the write wait hook like a fence wait: tsdbd starts another worker

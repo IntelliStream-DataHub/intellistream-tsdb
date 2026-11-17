@@ -79,6 +79,8 @@ int manifest_publish(eng *db)
         pthread_mutex_unlock(&db->manifest_lock);
         return TSDB_ERR_NOMEM;
     }
+    /* wal_active is the segment being written: a replica's too, which writes the leader's WAL with wal_enabled off
+     * (a reader that took wal_flushed there would see the rows of its parts only) */
     pthread_mutex_lock(&db->buf_lock); /* after db->lock in the order */
     uint64_t fno_next = db->fno_next;
     pthread_mutex_unlock(&db->buf_lock);
@@ -86,7 +88,7 @@ int manifest_publish(eng *db)
                             "tsdb-manifest %d\nversion %" PRIu64 "\nseries %u\nwal_flushed %" PRIu64
                             "\nwal_active %" PRIu64 "\nfsync %d\nstates %u\nfno_next %" PRIu64 "\nparts %zu\n",
                             FORMAT_VERSION, ++db->manifest_version, atomic_load(&db->series.count), db->wal_flushed,
-                            db->wal_enabled ? db->wal_seq : db->wal_flushed, db->opt.fsync ? 1 : 0,
+                            db->wal_enabled || db->rp ? db->wal_seq : db->wal_flushed, db->opt.fsync ? 1 : 0,
                             atomic_load(&db->states.count), fno_next, db->nparts);
     for (size_t i = 0; i < db->nparts; i++)
         len += (size_t)snprintf(buf + len, cap - len, "%s\n", db->parts[i]->name);
