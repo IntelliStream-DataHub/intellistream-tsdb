@@ -3449,6 +3449,133 @@ static void scen_writerfail(void)
            "the volume, keeps its root, its vote and its other volumes and stops cleanly\n");
 }
 
+/* writerdepose (M5, D13 with a healthy engine): the leader's driver fails the volume while its engine is fine
+ * (crashfs: EIO on the leader's next fdatasync of its REPL file, the save of the commit floor at most once a second
+ * after the floor moved), with a write waiting for a paused replica. Nothing in the engine ends that wait: only the
+ * deposal does (eng_leader_depose in vol_fail), and its outcome is unknown (its records went to the replicas), so its
+ * connection closes without an answer (D12). A later write is refused (UNAVAILABLE) and never numbered; the replicas
+ * hold no row past what was sent before the failure. TSDB_REPLD_MUTANT=nodepose fails it (the write waits for good). */
+static void scen_writerdepose(void)
+{
+    scenario("writerdepose");
+    const char *so, *skip = crashfs_skip(&so);
+    if (skip) {
+        printf("  skipped: %s\n", skip);
+        return;
+    }
+    static char pe[3][PATH_MAX * 3 + 256];
+    static char mark[3][PATH_MAX + 80];
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX + 80];
+        server_dir(i, dir, sizeof dir);
+        if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+            die("mkdir %s: %s", dir, strerror(errno));
+        snprintf(mark[i], sizeof mark[i], "%s/eio-n%d", base, i);
+        snprintf(pe[i], sizeof pe[i],
+                 "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_MODE=eio CRASHFS_EIO_ONLY=REPL CRASHFS_EIO_ON=fdatasync "
+                 "CRASHFS_MARK=%s",
+                 so, dir, mark[i]);
+        penv[i] = pe[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    int sent = 1, acked = 1;
+    /* the floor is saved at once after a commit when its last save is a second old, else a second after that save:
+     * the commit of `ts` saves it now, the next commit moves it again and its save comes a second later */
+    struct timespec ms1200 = {1, 200000000}, ms100 = {0, 100000000};
+    nanosleep(&ms1200, NULL);
+    ts += 1000;
+    sent++;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    acked++;
+    nanosleep(&ms100, NULL); /* that save is done (unharmed) */
+    ts += 1000;
+    sent++;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    acked++;
+    uint64_t t_moved = now_ms();
+    signal_child(pids[L], SIGUSR2); /* crashfs: the leader's next fdatasync of REPL (that save) fails with EIO */
+    int R1 = (L + 1) % 3;
+    pause_server(R1, 1); /* the commit point stops below the next write */
+    struct wf_writer w = {client(L), id, ts + 1000, 0, 0, 0};
+    sent++;
+    pthread_t th;
+    if (pthread_create(&th, NULL, wf_write_thread, &w) != 0)
+        die("pthread_create");
+    while (access(mark[L], F_OK) != 0) {
+        if (now_ms() - t_moved > 30000)
+            die("no fdatasync of server %d's REPL failed in 30 s", L);
+        usleep(20000);
+    }
+    for (uint64_t t0 = now_ms(); !__atomic_load_n(&w.done, __ATOMIC_ACQUIRE); usleep(20000))
+        if (now_ms() - t0 > 10000)
+            die("the write waiting for the commit point on the failed writer was not ended in 10 s (the writer was "
+                "not deposed)");
+    pthread_join(th, NULL);
+    if (w.rc != TSDB_ERR_IO || w.after != TSDB_ERR_IO)
+        die("the write waiting for the commit point on the failed writer got %d (%s), then its connection %d (%s): "
+            "not a closed connection (UNAVAILABLE: the save failed before the write was numbered)",
+            w.rc, ers(w.rc), w.after, ers(w.after));
+    tsdbc_close(w.c);
+    tsdbc_close(c);
+    pause_server(R1, 0);
+    await_local_fault(L, num, 3);
+    /* a write after the failure: refused, never numbered */
+    tsdbc *c2 = client(L);
+    ts += 100000;
+    if ((rc = tsdbc_insert_series(c2, id, &ts, &val, 1)) != TSDB_ERR_UNAVAILABLE)
+        die("a write to the failed volume: %s, not UNAVAILABLE", ers(rc));
+    tsdb_sid any;
+    if ((rc = tsdbc_series(c2, "writerfail.none", 0, &any)) != TSDB_ERR_NOTFOUND)
+        die("a lookup in server %d's root after its volume failed: %s", L, ers(rc));
+    tsdbc_close(c2);
+    if (await_exit(L, 500) >= 0)
+        die("server %d exited on its cluster volume's failure (D13: only the volume stops)", L);
+    for (int i = 0; i < 3; i++)
+        stop(i, SIGTERM);
+    for (int r = 0; r < 3; r++) {
+        if (r == L)
+            continue;
+        char dir[PATH_MAX + 80], vd[PATH_MAX + 120];
+        server_dir(r, dir, sizeof dir);
+        snprintf(vd, sizeof vd, "%s/v1", dir);
+        uint64_t rows, h;
+        if ((rc = cvol_digest(vd, rep_names, 1, &rows, &h)) != 0)
+            die("open %s read-only: %s", vd, ers(rc));
+        if (rows < (uint64_t)acked || rows > (uint64_t)sent)
+            die("replica %d holds %" PRIu64 " rows: %d were acknowledged, %d sent before the volume failed", r, rows,
+                acked, sent);
+    }
+    stop_all();
+    printf("  a leader whose driver failed the volume (its engine healthy) closes the connection of the write waiting "
+           "for its commit point and refuses the next; the replicas hold between %d and %d rows\n",
+           acked, sent);
+}
+
 /* ------------------------------------------------------------ leases (§7.1) and the serving loop's stamp (§6.1) */
 
 /* a read on c by `kind` % 3: QUERY_RAW, QUERY_LATEST or QUERY_MULTI (the two ids paths of the lease check) */
@@ -3897,7 +4024,7 @@ int main(int argc, char **argv)
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
                {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail},
-               {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
