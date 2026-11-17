@@ -37,7 +37,8 @@ a cluster made with 0.10.0 is initialised again, not upgraded (as for every chan
   does not lead refuses writes (`UNAVAILABLE`, reason `fenced`), and so does the leader unless its server runs with
   `TSDB_CLUSTER_WRITES=1` (for trying it out; it goes when copying works). The example client takes `TSDB_VOLUME=NAME`.
 - `tsdb cluster init` stores the settings of replicated volumes (`--lease-ms`, `--drift-ppm`, `--unanswered-ms`,
-  `--commit-interval-ms`, `--repl-retain-mb`, `--repl-retain-s`, `--idle-seal-ms`; nothing acts on them yet).
+  `--commit-interval-ms`, `--repl-retain-mb`, `--repl-retain-s`, `--idle-seal-ms`; the last three are used by the
+  replicated volumes below, the others by the leases).
 - Liveness and leases (peer protocol 5: every node of a preview cluster is upgraded together and the cluster made
   again). The loop that serves requests stamps a clock every round; while the stamp is older than 2.5 s the server
   sends no heartbeat, so a hung I/O loop makes the member go down although its cluster thread runs (workers stuck
@@ -51,6 +52,22 @@ a cluster made with 0.10.0 is initialised again, not upgraded (as for every chan
   client returned `TSDB_ERR_CORRUPT` for an `UNAVAILABLE` answer to a raw or values query when it did not retry; it
   returns `TSDB_ERR_UNAVAILABLE`. Tests: `test_cluster` `lease` and `hungloop`, `make lease-mutants`
   (`leaseanyvoter`, `nodrift`, `stampignored`).
+- Replicated volumes keep going with a replica down (peer protocol unchanged; a new heartbeat section, `HBS_ISR`, which
+  older peers skip). A leader asks the metadata group to take a silent replica out of the ISR (after `isr_lag_ms`, also
+  while nothing is written) and to take it back once it has caught up; the request rides the next heartbeat and the
+  Raft leader commits it only if the record's epoch and ISR version are still the ones it was based on. Below
+  `min_isr` writes are refused (`UNAVAILABLE`, reason `unreachable`, retry after 1 s) while reads go on, and a write
+  admitted just before the shrink is answered only once the ISR has grown back. The part files of a large write go out
+  at once and are waited for under one deadline (3 s, or twice `isr_lag_ms`, plus 1 s per 32 MiB), no longer 30 s
+  each, and a replica that leaves the ISR is no longer waited for. An idle leader writes a `NOW` marker every second
+  (and before a drop) and seals its last segment after `idle_seal_ms` (1 s), so replicas flush the same rows. A leader
+  keeps flushed segments for a lagging replica up to `repl_retain_mb` and `repl_retain_s` per volume; one that falls
+  further behind gets a snapshot. Peer frames wait in a bounded inbox per volume (64 MiB; a link waits up to 0.5 s,
+  then drops the frame, which is sent again), part files above 16 MiB are received into a stage file rather than
+  memory, and an idle volume sends an empty heartbeat to each peer every 100 ms instead of every 5 ms. Tests:
+  `test_cluster` `isr`, `minisr`, `shipstall`, `keepcap`, `idleseal`, `backpressure`; `test_repl idle_shrink`,
+  `idle_heartbeat`; mutants `shrinknocond`, `commitpastremoved`, `nominisr`, `ackbelowminisr`, `shipperfile`, `nocap`,
+  `noseal`, `nospill`, `noinboxbound` (`make repld-mutants`, `make lease-mutants`) and planted bug 40 in `sim_repl`.
 - The cluster tutorial's step 6 adds a volume and writes to it through its leader. Tests: `tests/test_cvol.c` (cluster
   volumes in a handle: holes, routing, the engine swap under readers), `test_cluster` `volumes` and `volrefuse`, with
   the mutants `TSDB_CVOL_MUTANT=noopengen|samerid|anynonce|replnonce`.

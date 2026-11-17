@@ -536,6 +536,18 @@ the end covers resumed bytes too); then `CHUNK{file, offset, bytes}` of 256 KiB 
 the job goes back to the head of the queue and starts from the receiver's offset, at most `max_attempts` connections.
 One file at a time per link.
 
+*Backpressure in the driver* (r3d review M3, L1, L2; `server/repld.c`). A link's reader thread copies a frame into the
+volume's inbox, which holds at most 64 MiB (`INBOX_BYTES`); when it is full the thread waits up to 0.5 s (well below
+`dead_ms`) and then drops the frame: the core sends again what was not acknowledged, so a dropped frame costs time,
+never data. The log says "frames are dropped (sent again)" once, and "the inbox is empty again". A bulk file above
+16 MiB (`SPILL_BYTES`) is received into a stage file (`stage_s<pid>_<n>.tmp`, `O_EXCL`; the open removes any
+`stage_*.tmp` as before) instead of memory, then hashed through a mapping, synced, renamed and its directory synced like
+one received in memory. An idle volume sends its empty APPEND (the core's heartbeat) to a peer every 100 ms
+(`idle_heartbeat_ticks`), and at once when the commit point moved; every 5 ms tick, as before, made 102,400 frames a
+second for 256 volumes with two peers each, now 5,120. The volume's thread runs a due tick before it takes the inbox
+(L2), so a full inbox cannot starve the ISR rule. Tests: `test_cluster backpressure` (mutants `noinboxbound`,
+`nospill`), `test_repl idle_heartbeat`.
+
 ### 5.2 Large inserts, deletes and replaces
 
 Today: the writer registers an `lw_fence` for its keys, flushes the memtable if it holds rows inside them, writes
@@ -588,9 +600,14 @@ and every marker in it is applied durably, and keeps sealed segments for catch-u
 - **A flushed segment is never appended to.** Rows added to segment s after its memtable became parts with
   `wal_seq = s` would be skipped by the next open's replay (`partition_wal_seq >= s`) and be lost. `replica_append`
   refuses `seq <= sealed_seq` (the highest `wal_seq` of the parts, and of a flush of this run).
-- **The last segment's memtable is not sealed until a later segment starts.** An idle leader therefore leaves the rows
-  of its last segment in the replica's memory and that segment on disk. The driver (R3) needs a seal signal for this
-  (a `ROLL` marker, or the leader rotating its segment after an idle interval); not built in R2.
+- **The last segment's memtable is not sealed until a later segment starts.** An idle leader would therefore leave the
+  rows of its last segment in the replica's memory and that segment on disk. *Built in R3 (r3d-isr):* the **idle
+  seal**. A replicated leader's flusher flushes the active memtable once it has not changed (rows, segment) for
+  `idle_seal_ms` (1 s by default, a cluster setting), which starts a new segment, and appends a `NOW` marker into it
+  at once; a replica seals the old segment at that committed record and flushes the same rows
+  (`eng_leader_clock`, `test_cluster idleseal`, mutant `noseal`). Measured: parts on all three copies 1.7 s after the
+  last write; a trickle of one write every 2 s makes 10 flushes in 20 s (about 1,800 small parts an hour before
+  merges); an idle volume's WAL grows by 48 bytes a second (the `NOW` markers, about 168 KB an hour).
 - **The retention clock is the `NOW` markers only** (§5.4), not the `commit_ms` of records: the leader stamps
   `commit_ms` with its wall clock, which its retention clock (`opt.clock_ms`, the floor) need not follow. After a
   restart the clock restarts from the parts' `written_ms` and the replay up to the commit floor, so it may be lower
@@ -609,8 +626,10 @@ and every marker in it is applied durably, and keeps sealed segments for catch-u
 ### 5.4 Clocks and classes
 
 - **Retention clock.** A replica never reads its own wall clock for retention. The leader appends a `NOW` marker
-  every second (and before any `DROP`); a replica's engine runs with `opt.clock_ms` returning the last applied `NOW`
-  (retention.c:176-190 already takes a clock hook and keeps it from going back). A new leader starts from
+  every second (and before any `DROP`; built in R3: the flusher of a replicated leader appends it without waiting for
+  the commit point, and a refusal is ignored: the next second sends another); a replica's engine runs with
+  `opt.clock_ms` returning the last applied `NOW` (retention.c:176-190 already takes a clock hook and keeps it from
+  going back). A new leader starts from
   `max(own clock, last NOW)`. A replica therefore clamps up to a second later than the leader: visible only to a read
   that asked for a replica.
 - **Merges** drop expired rows with the replica's clock; queries clamp to the cutoff anyway, so the answer is the
@@ -697,6 +716,25 @@ at once; the Raft leader sees the volume reported failed in the next heartbeat a
   led, a new leader and epoch (§6.2); for every volume where it was in the ISR, a smaller ISR.
 - **A replica, seen by its leader**: a replica that has not acknowledged a record within `isr_lag_ms` (1 s) of its
   sending, or whose log stream broke, is removed from the ISR (§6.3). Writes to that volume wait at most that long.
+  *Built in R3 (r3d-isr).* A member silent for `isr_lag_ms` leaves the ISR also while nothing is written (the core
+  keeps when it last heard an ACK; before, a dead replica of an idle volume stayed in the ISR, and the first write after
+  it waited for it: planted bug 40, `test_repl idle_shrink`). The core's request (`REPL_M_ISR_REQ`) goes from the
+  driver into the leader's next heartbeat (`HBS_ISR`, sent at the next duty round of the cluster thread), and the Raft
+  leader proposes `ISR_CHANGE` conditional on the epoch and ISR version the request was based on (mutant
+  `shrinknocond`), again after a second while the record has not moved; the driver hands the core the record only once
+  the metadata group committed it (mutant `commitpastremoved`). A grow (§8.1 step 5) takes the same path.
+  **Below `min_isr`** a leader refuses writes before the engine (`UNAVAILABLE`, WHY `unreachable`, retry after 1 s) and
+  keeps serving reads. A write admitted while the ISR was large enough but committed after a shrink below `min_isr` is
+  not answered until the ISR grows back: the writer's waits go by the commit point the driver hands the engine
+  (`eng_leader_commit`), so the driver holds that point while the record's ISR is short (`ackbelowminisr`; the core's
+  own `min_isr` check only held its REPLY, which the engine does not wait for). With `min_isr` 3 and two of three
+  servers down the Raft group has no quorum either, so no change of the ISR commits at all (`test_cluster minisr`
+  takes one replica away, `isr` kills one and restarts it).
+- **A large write's files** (§5.2 step 3) go out at once and are waited for under one deadline per `COMMIT`: 3 s or
+  twice `isr_lag_ms`, whichever is more, plus a second per 32 MiB; a peer that leaves the ISR meanwhile is no longer
+  waited for (it fetches the files when it comes back). Waiting 30 s per file, as R3's first driver did, held
+  `jr_serial` for minutes behind a stopped replica (r3d review M2; `test_cluster shipstall`: 100,000 rows over 10 days
+  answered in 1.6 s with a replica stopped; mutant `shipperfile`).
 - **A leader that cannot reach its replicas but reaches the Raft leader**: before shrinking the ISR below 2 while the
   Raft leader still hears the replicas' heartbeats, the Raft leader moves leadership to a replica instead (ha.md D38's
   reasoning: the cut-off one should step aside, not the others).
@@ -959,7 +997,13 @@ cut below the applied end).
 ### 8.3 Retained segments
 
 The leader keeps sealed WAL segments of each volume after they are in parts, for catch-up: up to
-`repl_retain_mb` per server (4 GB by default, split over its volumes by write rate) and at most 30 min. The change feed
+`repl_retain_mb` per server (4 GB by default, split over its volumes by write rate) and at most 30 min.
+*Built in R3 (r3d-isr), per volume:* `repl_retain_mb` (4096) and `repl_retain_s` (1800) are caps of each volume, not
+split per server yet. The leader keeps what the slowest member still needs (the driver's keep bound) only while the
+kept segments, newest first, stay within both caps; past them it unlinks as if that member had caught up
+(`eng_leader_keep_cap`), and the member, once back, is told to install a snapshot (the driver says so once in its log;
+it stays a learner until the snapshot path of R4). `test_cluster keepcap` (`repl_retain_s` 2, seven flushes a second
+apart with a replica down: 3 segments kept, 8 under the mutant `nocap`). The change feed
 of design-cdc.md retains segments the same way (`fwal_` names); one mechanism serves both. A replica away for longer
 than that, or than the budget, gets a snapshot.
 

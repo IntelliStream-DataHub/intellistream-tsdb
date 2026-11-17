@@ -388,10 +388,10 @@ for later.
 | Option | Default | Meaning |
 |---|---:|---|
 | `--replication N` | 3 | Copies of every volume. |
-| `--min-isr N` | 1 | Copies that must be in sync for a write to count. At most `--replication`. |
+| `--min-isr N` | 1 | Copies that must be in sync for a write to count. At most `--replication`. With fewer, writes are refused (`UNAVAILABLE`) and reads go on. |
 | `--node-timeout-ms MS` | 3000 | A server is marked down after this long without a heartbeat. |
 | `--heartbeat-ms MS` | 500 | How often servers report. Below `--node-timeout-ms`. |
-| `--isr-lag-ms MS` | 1000 | A copy this far behind leaves the in-sync set. Stored; nothing acts on it in the preview. |
+| `--isr-lag-ms MS` | 1000 | A copy this far behind (or silent this long) leaves the in-sync set, and comes back once it has caught up. |
 | `--out-after-s S` | 1800 | A server down this long is marked `out`. Stored; in the preview no server is ever marked `out`. |
 | `--voter-replace-s S` | 600 | A voter down this long is replaced by another member. |
 | `--voters N` | 5 | The most voters the group has (an even number counts as one less). |
@@ -404,7 +404,7 @@ for later.
 | `--drift-ppm N` | 500 | The clock drift every lease allows for. |
 | `--unanswered-ms MS` | 1000 | A copy kept in sync that does not answer a promotion is dropped after this. |
 | `--commit-interval-ms MS` | 5 | The commit point reaches the copies within this. |
-| `--repl-retain-mb MB` | 4096 | Log kept for a copy that fell behind, at most. |
+| `--repl-retain-mb MB` | 4096 | Log kept for a copy that fell behind, at most, per volume. A copy further behind needs a snapshot. |
 | `--repl-retain-s S` | 1800 | And for at most this long. |
 | `--idle-seal-ms MS` | 1000 | An idle leader closes its log segment after this. |
 

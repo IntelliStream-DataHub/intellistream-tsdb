@@ -43,7 +43,12 @@
  * report sections: HBS_NODE (address, rack, flags), HBS_VOLUMES (led volumes with their epochs, failed volumes: a
  * volume that r3d's fail-stop stopped is LOCAL_FAULT in the next beat), HBS_DOMAINS, HBS_LEASE {u64 send_ns, the
  * sender's iso_now_ns, CLOCK_BOOTTIME} and HBS_UNREACH {u32 n, n x {u32 node, u32 age_ms}} (peers this server shares a
- * replicated volume with and has not heard on any data link for a second; at most CLUSTER_REPORT_UNREACH). Each
+ * replicated volume with and has not heard on any data link for a second; at most CLUSTER_REPORT_UNREACH) and HBS_ISR
+ * {u32 n, n x {u32 vol, u64 epoch, u64 isr_version (the record the request is based on), u64 commit, u32 nisr, nisr x
+ * {u32 node, u64 rid}}} (the ISR changes the volumes it leads ask for, at most CLUSTER_REPORT_ISR; a new one
+ * makes the next heartbeat go at the next duty round). The Raft leader proposes each as a conditional ISR_CHANGE
+ * (propose_isr: only from the record's leader, only while the record's epoch and ISR version are the request's basis,
+ * again after a second). Each
  * section is [u16 type][u32 len][body]; an unknown type is skipped. HB_ACK is {u32 leader, u64 term, u64 commit, u64
  * echo (the HB's send_ns), u8 granted, u32 lease_ms, u32 drift_ppm}. The Raft leader grants only while the core's
  * own check-quorum lease holds (raft_read_lease: no other Raft leader can exist yet) on the clock read as the HB is
