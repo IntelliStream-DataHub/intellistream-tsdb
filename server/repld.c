@@ -41,7 +41,8 @@
  * at the writer's own durable end, `ackbeforesync` has a follower report its written end as durable without a sync,
  * `floornotsaved` skips the REPL file's SAVE (test_cluster replicate, replindet); `commitpastremoved` takes an ISR
  * request as the record at once, before the metadata group commits it (isr), `nominisr` never checks min_isr (minisr),
- * `ackbelowminisr` hands the writer a commit point reached after a shrink below min_isr (minisr). Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
+ * `ackbelowminisr` hands the writer a commit point reached after a shrink below min_isr (minisr), `nocap` keeps the
+ * leader's segments for a lagging replica without the caps repl_retain_mb and repl_retain_s (keepcap). Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first
  * bulk file this process receives taken as staged but not kept, so its COMMIT marker finds the file missing and
  * FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER (writes then reach
  * the new writer while the driver still promotes: they must be refused for a retry, never depose it).
@@ -137,10 +138,11 @@ struct rvol {
      * go by APPLY): the commit point is held here and handed to the engine once the ISR is back at min_isr */
     uint64_t held_commit;
     int short_said;
+    int snap_said; /* the SNAPSHOT notice was said */
 };
 
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
-       RM_ACKBELOWMINISR, RM_SHIPPERFILE };
+       RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP };
 
 static struct {
     pthread_mutex_t mu;
@@ -1092,8 +1094,14 @@ static void exec(struct rvol *rv, struct repl_action *a)
             for (int i = 0; i < (int)rv->rec.nrep; i++)
                 if (i != rv->self && rv->peer[i].acked < keep)
                     keep = rv->peer[i].acked; /* a peer never heard from holds everything */
+            /* the caps (design-cluster.md 8.3): past them a lagging peer's segments go, up to the floor, and the core
+             * tells that peer to install a snapshot once the log start passed what it needs */
+            uint64_t capb = G.mutant == RM_NOCAP ? 0 : (uint64_t)rv->rec.repl_retain_mb << 20;
+            uint64_t capms = G.mutant == RM_NOCAP ? 0 : (uint64_t)rv->rec.repl_retain_s * 1000;
+            uint64_t floor = a->floor;
             pthread_mutex_unlock(&rv->mu);
-            eng_leader_keep(db, keep);
+            eng_leader_keep_cap(db, capb, capms);
+            eng_leader_keep_floor(db, keep, floor);
             pthread_mutex_lock(&rv->mu);
         } else if (a->floor) {
             pthread_mutex_unlock(&rv->mu);
@@ -1172,8 +1180,10 @@ static void exec(struct rvol *rv, struct repl_action *a)
         vol_fail(rv, a->reason ? a->reason : "the core failed");
         break;
     case REPL_A_SNAPSHOT:
-        say("volume %" PRIu32 ": the leader no longer has the records this replica needs: it needs a snapshot (not"
-            " built yet); it stays as it is", rv->number);
+        if (!rv->snap_said) /* the core repeats the notice until the replica catches up: said once per open */
+            say("volume %" PRIu32 ": the leader no longer has the records this replica needs: it needs a snapshot (not"
+                " built yet); it stays a learner", rv->number);
+        rv->snap_said = 1;
         break;
     }
     tsdb_cvol_unref(&db);
@@ -1466,6 +1476,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "nominisr")       ? RM_NOMINISR
                : !strcmp(mu, "ackbelowminisr") ? RM_ACKBELOWMINISR
                : !strcmp(mu, "shipperfile")    ? RM_SHIPPERFILE
+               : !strcmp(mu, "nocap")          ? RM_NOCAP
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);

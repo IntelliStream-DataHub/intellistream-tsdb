@@ -4223,6 +4223,9 @@ static void vol_watch_duty(void)
             r->isr_version = v->isr_version;
             r->min_isr = v->min_isr;
             r->isr_lag_ms = C.sm.set.isr_lag_ms;
+            r->repl_retain_mb = C.sm.set.repl_retain_mb;
+            r->repl_retain_s = C.sm.set.repl_retain_s;
+            r->idle_seal_ms = C.sm.set.idle_seal_ms;
             break;
         }
     }

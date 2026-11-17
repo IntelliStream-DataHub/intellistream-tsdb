@@ -1528,6 +1528,15 @@ extern void (*mt_test_before_seal)(struct eng *db);
  * stays gone. Never waits for flush_lock (a flush holds it while it waits for the commit point the driver moves): with a
  * flush in progress the bound is stored and the removal is left to that flush or the next call. */
 void eng_leader_keep(struct eng *db, uint64_t pos);
+/* eng_leader_keep with the commit floor the driver saved (`floor` >= `pos`): the keep caps (eng_leader_keep_cap) may let
+ * segments go above `pos`, but never above `floor` nor the commit point. eng_leader_keep(db, pos) is this with floor =
+ * pos (no cap can act). */
+void eng_leader_keep_floor(struct eng *db, uint64_t pos, uint64_t floor);
+/* The keep caps (design-cluster.md 8.3, repl_retain_mb and repl_retain_s): a kept segment goes, whatever the keep bound
+ * says (a replica that needs it is told to install a snapshot), once the segments flushed after it and it hold more
+ * than `max_bytes`, or it was flushed more than `max_ms` ago. 0 is no cap. Read at the next eng_leader_keep_floor or
+ * flush. */
+void eng_leader_keep_cap(struct eng *db, uint64_t max_bytes, uint64_t max_ms);
 /* A file a COMMIT marker of this leader names (`name`: the marker's name, p<partition>_<pid>_<n>_0.part), for a replica
  * that missed it: the leader keeps each hard linked as stage_<xxh64 of the name>.part (the name a replica stages it
  * under) from before its marker is appended until the retained segment that holds the marker goes (eng_leader_keep),
@@ -1866,6 +1875,7 @@ struct eng {
     size_t latest_cache_asked; /* the caller's opt.latest_cache (a replica runs with 0; replica_promote restores it) */
     struct lkseg {
         uint64_t seq, fno_end;
+        uint64_t bytes, ms; /* its size and when it was flushed (monotonic ms; a segment the open found: the open) */
     } *lk; /* flushed segments kept for the replicas, oldest first (flush_lock); also those a writer's open found at or
             * below RSTATE's `kept` (a writer that is not a leader removes them at its next flush) */
     size_t nlk, caplk;
@@ -1877,6 +1887,8 @@ struct eng {
     size_t nlf, caplf, rlf;      /* rlf: entries of lf reserved by COMMITs about to append their marker (lead_mu) */
     uint64_t lrd_seq, lrd_off, lrd_next; /* where the last read of the log by position ended (replica_read; lead_mu) */
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */
+    atomic_uint_fast64_t lead_saved; /* with jr: the commit floor the driver saved (eng_leader_keep_floor) */
+    atomic_uint_fast64_t lead_cap_bytes, lead_cap_ms; /* with jr: eng_leader_keep_cap (0: no cap) */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
     atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */
     pthread_mutex_t lead_mu;          /* a leaf: waits for the commit point (lead_cv), its moves, depose, eng_fail */

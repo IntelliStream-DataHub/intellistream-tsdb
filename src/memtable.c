@@ -1456,10 +1456,38 @@ static void lk_unlink_upto(eng *db, uint64_t bound)
         feed_cleaner_wake(db);
 }
 
-/* A leader's kept segments go once their last position is at or below min(keep bound, commit point) */
+static uint64_t lk_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/* The last position of the newest kept segment the caps let go (eng_leader_keep_cap), 0 none: the caps count from the
+ * newest segment back, so what goes is always a prefix of lk[]. */
+static uint64_t lk_cap_bound(eng *db)
+{
+    uint64_t maxb = atomic_load(&db->lead_cap_bytes), maxms = atomic_load(&db->lead_cap_ms);
+    if ((!maxb && !maxms) || db->nlk == 0)
+        return 0;
+    uint64_t now = lk_now_ms(), sum = 0;
+    for (size_t i = db->nlk; i-- > 0;) {
+        sum += db->lk[i].bytes;
+        if ((maxb && sum > maxb) || (maxms && now > db->lk[i].ms && now - db->lk[i].ms > maxms))
+            return db->lk[i].fno_end - 1;
+    }
+    return 0;
+}
+
+/* A leader's kept segments go once their last position is at or below min(keep bound, commit point); the caps raise
+ * the keep bound up to the commit floor the driver saved, never past it (a segment above it may hold records a new
+ * leader rolls back to, design-cluster.md section 4 decision 13) */
 static void leader_unlink_due(eng *db)
 {
     uint64_t bound = atomic_load(&db->lead_keep), c = atomic_load(&db->lead_commit);
+    uint64_t cap = lk_cap_bound(db);
+    if (cap > bound)
+        bound = MIN(cap, MAX(bound, atomic_load(&db->lead_saved)));
     bound = MIN(bound, c);
     if (eng_test_mutant == MUT_LEADER_KEEP_IGNORED) /* planted: a flushed segment goes at once */
         bound = UINT64_MAX - 1;
@@ -1476,7 +1504,11 @@ static int lk_push(eng *db, uint64_t seq, uint64_t fno_end)
         db->lk = p;
         db->caplk = c;
     }
-    db->lk[db->nlk++] = (struct lkseg){seq, fno_end};
+    char name[64];
+    struct stat st;
+    wal_name(name, sizeof name, seq);
+    uint64_t bytes = fstatat(db->dirfd, name, &st, 0) == 0 ? (uint64_t)st.st_size : 0; /* gone: nothing to count */
+    db->lk[db->nlk++] = (struct lkseg){seq, fno_end, bytes, lk_now_ms()};
     return 0;
 }
 
@@ -1497,6 +1529,18 @@ static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
  * stored and that flush's leader_flushed, or the next call, removes what is due. */
 void eng_leader_keep(eng *db, uint64_t pos)
 {
+    eng_leader_keep_floor(db, pos, pos);
+}
+
+void eng_leader_keep_cap(eng *db, uint64_t max_bytes, uint64_t max_ms)
+{
+    atomic_store(&db->lead_cap_bytes, max_bytes);
+    atomic_store(&db->lead_cap_ms, max_ms);
+}
+
+void eng_leader_keep_floor(eng *db, uint64_t pos, uint64_t floor)
+{
+    atomic_store(&db->lead_saved, MAX(pos, floor));
     atomic_store(&db->lead_keep, pos);
     if (pthread_mutex_trylock(&db->flush_lock) != 0)
         return;

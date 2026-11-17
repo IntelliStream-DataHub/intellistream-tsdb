@@ -182,6 +182,7 @@ struct cluster_vol_rec {
     uint32_t isr[META_REPLICAS_MAX]; /* node ids */
     uint64_t isr_version;
     uint32_t min_isr, isr_lag_ms;
+    uint32_t repl_retain_mb, repl_retain_s, idle_seal_ms; /* the settings (meta.h) */
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
  * holds every REPLICA_OPEN committed before this start), with every replicated volume that names this server (`self`)

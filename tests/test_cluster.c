@@ -461,6 +461,7 @@ static void node_add(int via, int newi)
 }
 
 static uint32_t init_min_isr; /* nonzero: INIT's min_isr (the volumes' min_isr, at most their replicas) */
+static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
 
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
 static void init_mode(int i, uint32_t replace_s, int mode)
@@ -469,6 +470,8 @@ static void init_mode(int i, uint32_t replace_s, int mode)
     meta_settings_default(&s);
     if (init_min_isr)
         s.min_isr = init_min_isr;
+    if (init_retain_s)
+        s.repl_retain_s = init_retain_s;
     s.node_timeout_ms = 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
@@ -3279,6 +3282,99 @@ static void scen_minisr(void)
  * up, no DONE comes back) waits for its files under one deadline per COMMIT, and not past the moment the stopped
  * replica leaves the ISR; it used to wait 30 s per file (mutant shipperfile). Running again, the replica fetches what
  * it missed, joins the ISR and holds the leader's rows. */
+static int wal_count(int i)
+{
+    char dir[PATH_MAX + 80], v[PATH_MAX + 120];
+    server_dir(i, dir, sizeof dir);
+    snprintf(v, sizeof v, "%s/v1", dir);
+    DIR *d = opendir(v);
+    if (!d)
+        die("opendir %s: %s", v, strerror(errno));
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)))
+        n += strncmp(e->d_name, "wal_", 4) == 0;
+    closedir(d);
+    return n;
+}
+
+/* The keep caps (design-cluster.md 8.3): a replica out of the ISR holds the leader's flushed segments only for
+ * repl_retain_s (2 s here); past it they go, and the replica, back, is told it needs a snapshot and stays a learner. */
+static void scen_keepcap(void)
+{
+    scenario("keepcap");
+    init_retain_s = 2;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    init_retain_s = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    await_isr(0, "plant", 3, 5000, "every replica up");
+    int R = (L + 1) % 3;
+    stop(R, SIGKILL);
+    await_isr(0, "plant", 2, 10000, "a replica killed");
+    /* a segment a second, each flushed: with the replica away the keep bound stays where it was */
+    struct timespec s1 = {1, 0};
+    int64_t t = 10000;
+    for (int k = 0; k < 7; k++) {
+        int64_t tv[100];
+        float vv[100];
+        for (int j = 0; j < 100; j++)
+            tv[j] = t++, vv[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, tv, vv, 100)) != 0)
+            die("a write with a replica away: %s", ers(rc));
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush: %s", ers(rc));
+        nanosleep(&s1, NULL);
+    }
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0) /* a commit after the last flush: the log start moves */
+        die("a write with a replica away: %s", ers(rc));
+    int nw = wal_count(L);
+    if (nw > 4)
+        die("the leader keeps %d WAL segments for a replica away longer than repl_retain_s (7 flushed, 1 s apart)",
+            nw);
+    start(R);
+    uint64_t t0 = now_ms();
+    while (!log_has(R, "it needs a snapshot")) {
+        if (now_ms() - t0 > 15000)
+            die("the replica back past the keep cap never heard it needs a snapshot");
+        struct timespec ms100 = {0, 100000000};
+        nanosleep(&ms100, NULL);
+    }
+    struct timespec s3 = {3, 0};
+    nanosleep(&s3, NULL);
+    if (isr_of(0, "plant", NULL) != 2)
+        die("a replica that needs a snapshot joined the ISR");
+    t++;
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0)
+        die("a write with a replica that needs a snapshot: %s", ers(rc));
+    tsdbc_close(c);
+    stop_all();
+    printf("  past repl_retain_s the leader keeps %d WAL segments, the replica back is told it needs a snapshot and"
+           " stays out of the ISR\n", nw);
+}
+
 static void scen_shipstall(void)
 {
     scenario("shipstall");
@@ -3943,7 +4039,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
