@@ -47,6 +47,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -725,6 +726,93 @@ static void case_cut(void)
         }
     }
 #undef h
+    leader_free(&l);
+}
+
+/* B3: a cut back into an older segment (replica_cut sets wal_seq) while another thread publishes MANIFEST, as a merge,
+ * a drop or a retention change does on any thread while the replica's rp->mu and flush_lock are held by the cut. The
+ * publisher reads wal_seq for wal_active under buf_lock, so the cut writes it there too: under TSan the planted
+ * cutwalsequnlocked (the cut's write outside buf_lock) must be reported (REVIEW F2: no case raced a cut with a publish).
+ * The counters are relaxed on purpose: an acquire on them would order the publisher's reads before the cut's write
+ * and hide the race. Each round's cut runs while the publisher loops (fsync of the directory and of the cut segment
+ * make its window a few ms); the last MANIFEST must name the segment the cut kept. */
+static struct {
+    eng *db;
+    atomic_int stop;
+    atomic_long n;
+    atomic_int bad;
+} CP;
+
+static void *cp_thread(void *a)
+{
+    (void)a;
+    while (!atomic_load_explicit(&CP.stop, memory_order_relaxed)) {
+        if (manifest_publish(CP.db) != 0)
+            atomic_store_explicit(&CP.bad, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&CP.n, 1, memory_order_relaxed);
+    }
+    return NULL;
+}
+
+static uint64_t manifest_wal_active(const char *dir)
+{
+    char path[PATH_MAX + 16], line[256];
+    snprintf(path, sizeof path, "%s/MANIFEST", dir);
+    FILE *f = fopen(path, "r");
+    uint64_t v = 0;
+    if (!f)
+        return 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "wal_active %" SCNu64, &v) == 1)
+            break;
+    fclose(f);
+    return v;
+}
+
+static void case_cut_publish(void)
+{
+    char dir[PATH_MAX];
+    leader l;
+    unsigned rng = 11;
+    leader_init(&l);
+    for (int i = 0; i < 4; i++)
+        leader_rows(&l, 4, &rng);
+    leader_roll(&l);
+    for (int i = 0; i < 4; i++)
+        leader_rows(&l, 4, &rng);
+    CHECK(l.r[3].seq != l.r[7].seq); /* the cut below goes back across a segment boundary */
+    int rounds = getenv("TEST_CUT_PUBLISH_ROUNDS") ? atoi(getenv("TEST_CUT_PUBLISH_ROUNDS")) : 10;
+    for (int round = 0; round < rounds && !failures; round++) {
+        fresh(dir, "cp");
+        eng *db;
+        CHECK_EQ(open_replica(dir, 0, &db), 0);
+        if (!db)
+            break;
+        CHECK_EQ(feed(db, &l, 0, l.n), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(replica_apply(db, l.r[3].last), 0);
+        CHECK_EQ(manifest_publish(db), 0);
+        CHECK_EQ(manifest_wal_active(dir), l.r[7].seq); /* the newer segment is the one being written */
+        CP.db = db;
+        atomic_store(&CP.stop, 0);
+        atomic_store(&CP.n, 0);
+        atomic_store(&CP.bad, 0);
+        pthread_t t;
+        CHECK_EQ(pthread_create(&t, NULL, cp_thread, NULL), 0);
+        while (atomic_load_explicit(&CP.n, memory_order_relaxed) < 3) /* publishing before and during the cut */
+            sched_yield();
+        CHECK_EQ(replica_cut(db, l.r[3].last), 0);
+        long before = atomic_load_explicit(&CP.n, memory_order_relaxed);
+        while (atomic_load_explicit(&CP.n, memory_order_relaxed) < before + 3) /* and after it */
+            sched_yield();
+        atomic_store(&CP.stop, 1);
+        pthread_join(t, NULL);
+        CHECK_EQ(atomic_load(&CP.bad), 0);
+        CHECK_EQ(replica_log_end(db), l.r[3].last);
+        CHECK_EQ(count_files(dir, "wal_"), 1);
+        CHECK_EQ(manifest_wal_active(dir), l.r[3].seq); /* the segment the cut kept, not the one it removed */
+        CHECK_EQ(eng_close(db), 0);
+    }
     leader_free(&l);
 }
 
@@ -5841,7 +5929,9 @@ static int mutant_of(const char *m)
                         : strcmp(m, "rowsholdmu") == 0 ? MUT_REPLICA_ROWS_HOLD_MU
                         : strcmp(m, "promotenoapplymu") == 0 ? MUT_REPLICA_PROMOTE_NO_APPLY_MU
                         : strcmp(m, "leadernoprune") == 0 ? MUT_LEADER_RS_NO_PRUNE
-                        : strcmp(m, "leaderpruneall") == 0 ? MUT_LEADER_RS_PRUNE_ALL : 0;
+                        : strcmp(m, "leaderpruneall") == 0 ? MUT_LEADER_RS_PRUNE_ALL
+                        : strcmp(m, "walsequnlocked") == 0 ? MUT_REPLICA_WALSEQ_UNLOCKED
+                        : strcmp(m, "cutwalsequnlocked") == 0 ? MUT_REPLICA_CUT_WALSEQ_UNLOCKED : 0;
 }
 
 /* Required 3 (R2 REVIEW M1): ACK latency (replica_append of the next record, replica_sync, replica_durable_end) on a
@@ -6050,6 +6140,20 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    if (getenv("TEST_REPLICA_RO_ONLY")) { /* the quick run of the read-only open; under TSan with walsequnlocked it
+                                            * must report the race of a rotation's wal_seq with the flusher's MANIFEST */
+        case_ro_open();
+        sh("rm -rf '%s'", S);
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
+    }
+    if (getenv("TEST_REPLICA_CUT_PUBLISH_ONLY")) { /* under TSan with cutwalsequnlocked it must report the race of a
+                                                     * cut's wal_seq with a concurrent MANIFEST publish */
+        case_cut_publish();
+        sh("rm -rf '%s'", S);
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
+    }
     case_requires_replica();
     if (getenv("TEST_REPLICA_REQUIRES_ONLY")) {
         case_feed_refused();
@@ -6135,6 +6239,7 @@ int main(int argc, char **argv)
     }
     case_basic();
     case_cut();
+    case_cut_publish();
     case_refused();
     case_bad_appends();
     case_dicts();

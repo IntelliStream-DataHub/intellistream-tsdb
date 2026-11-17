@@ -13,7 +13,8 @@
  * segment is unlinked only at or below the commit floor the driver has saved durably (8.3).
  *
  * Nothing here assigns an fno. db->fno_next is the log end + 1; db->wal_fd, wal_seq and wal_off are the segment being
- * written, so a promotion (a later step) turns the same fields into a writer's.
+ * written, so a promotion (a later step) turns the same fields into a writer's. wal_seq and fno_next change under rp->mu
+ * and buf_lock: manifest_publish, on any thread (the flusher, merges), reads them under buf_lock for MANIFEST.
  *
  * Locks: rp->apply_mu (one applier: held across replica_apply) > rp->stage_mu (one replica_stage, and a COMMIT's
  * reads of its staged files) > rp->mu (log, cursor, memtable switching) > flush_lock > db->lock > buf_lock; segs_mu and
@@ -1589,7 +1590,13 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
         int fd = -1;
         if (rc == 0 && (rc = wal_open_segment(db, seq, &fd)) == 0) {
             db->wal_fd = fd;
-            db->wal_seq = seq;
+            if (eng_test_mutant == MUT_REPLICA_WALSEQ_UNLOCKED) { /* planted: the write of the race TSan found */
+                db->wal_seq = seq;
+            } else {
+                pthread_mutex_lock(&db->buf_lock); /* manifest_publish reads it under buf_lock (wal_active) */
+                db->wal_seq = seq;
+                pthread_mutex_unlock(&db->buf_lock);
+            }
             db->wal_off = 0;
             if ((rc = segs_push(rp, seq, 0, 0)) != 0)
                 eng_fail(db, "listing a new segment", ENOMEM);
@@ -1789,7 +1796,13 @@ int replica_cut(eng *db, uint64_t last)
                 eng_fail(db, "reopening a segment after a cut", errno);
                 rc = TSDB_ERR_IO;
             }
-            db->wal_seq = ss[t].seq;
+            if (eng_test_mutant == MUT_REPLICA_CUT_WALSEQ_UNLOCKED) { /* planted: the cut's write unlocked (test_replica) */
+                db->wal_seq = ss[t].seq;
+            } else {
+                pthread_mutex_lock(&db->buf_lock); /* manifest_publish reads it under buf_lock (wal_active) */
+                db->wal_seq = ss[t].seq;
+                pthread_mutex_unlock(&db->buf_lock);
+            }
             db->wal_off = off_cut;
         } else {
             db->wal_off = 0;
