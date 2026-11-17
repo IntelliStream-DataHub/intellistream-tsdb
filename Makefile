@@ -1307,6 +1307,11 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	tests/jepsen/expect.sh gate 'was idle' 'plugs that the shim ignored (counted as pulled)' \
 	    env CRASHFS_IGNORE_USR2=1 JEPSEN_PULL_PROB=0.0003 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 \
 	    --crashfs $(B)/libcrashfs.so || exit 1; \
+	tests/jepsen/expect.sh gate 'was idle' 'classes: plugs that the shim ignored (the poke rows of the harness are no rows of the workload: round 13)' \
+	    env CRASHFS_IGNORE_USR2=1 JEPSEN_PULL_PROB=0.0003 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --workload classes --nemesis power \
+	    --seconds 20 --crashfs $(B)/libcrashfs.so || exit 1; \
+	tests/jepsen/expect.sh violation 'in two partitions' 'a row of the classes workload in two partitions (planted in the count)' \
+	    env JEPSEN_TEST_PLANT_ROW=1 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --workload classes --nemesis none --seconds 8 || exit 1; \
 	tests/jepsen/expect.sh valid 'a plug pulled when the clients are gone (no traffic for the power loss to wait on; called a hung server)' \
 	    ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so --mutant-nemesis lastpull || exit 1; \
 	tests/jepsen/expect.sh valid 'a shim slow to write its mark (an empty name read as a file the server must stop on) made an honest eio run fail' \

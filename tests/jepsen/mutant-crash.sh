@@ -15,6 +15,12 @@
 #                size, a dump that takes long on every core handler (touching before the abort made a window in which the nemesis killed
 #                the server before it aborted, and under 16 busy loops the abort then never happened)
 #   JV_HANG=N    a worker pause()s for ever on every Nth insert request (the server is up and stops answering)
+#   JV_HANGONCE=K  the Kth insert request makes its worker pause() for ever, once per gate (JV_ONCEFILE2 names the file whose creation says so)
+#   JV_DBLIP=K2    the K2th insert puts its worker in D state for JV_DBLIP_S seconds (vfork whose child sleeps), once per gate (JV_ONCEFILE3):
+#                  a D stretch that ENDS before a hung request's deadline passes (round 13, VERIFY12: it passed the hang as a kernel stall)
+#   JV_OPENFAIL=1  a server whose log (the epoch's, appended to) holds the damage line an earlier server planted exits 1 at open, once per gate
+#                  (JV_ONCEFILE4), with "tsdbd: open: invalid argument": a recovery bug of its own, no damage (VERIFY12 (A): it counted as refused on
+#                  damage because the whole epoch's log was read); the first server of the epoch plants that line
 # and runs them through tests/jepsen/rerun.sh:
 #   crash under kill, pause, none, eio and power: exit 1 at the FIRST attempt (no "jepsen-rerun: attempt" line, never 0 or 3), naming the
 #     signal and the server's log;
@@ -33,8 +39,67 @@ root=$(cd "$here/../.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/var/tmp}/mutant-crash.XXXXXX") || exit 2
 git -C "$root" archive HEAD | tar -x -C "$tmp" || exit 2
 f=$tmp/server/tsdbd.c
+cat > "$tmp/server/jv_hooks.h" <<'JVEOF'
+/* test-only hooks of tests/jepsen/mutant-crash.sh (round 13) */
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+static int jv_once_file(const char *var)
+{
+    const char *f = getenv(var);
+    int fd = f ? open(f, O_WRONLY | O_CREAT | O_EXCL, 0644) : -1;
+    if (fd < 0)
+        return 0;
+    close(fd);
+    return 1;
+}
+static void jv_extra(void)
+{
+    static _Atomic unsigned hang_n, blip_n;
+    const char *e;
+    if ((e = getenv("JV_HANGONCE")) && atomic_fetch_add(&hang_n, 1) + 1 == (unsigned)atoi(e) && jv_once_file("JV_ONCEFILE2"))
+        for (;;)
+            pause();
+    if ((e = getenv("JV_DBLIP")) && atomic_fetch_add(&blip_n, 1) + 1 == (unsigned)atoi(e) && jv_once_file("JV_ONCEFILE3")) {
+        int secs = getenv("JV_DBLIP_S") ? atoi(getenv("JV_DBLIP_S")) : 8;
+        if (vfork() == 0) { /* the parent waits for it in D state; the child ends with the server, never holds its lock for long */
+            struct timespec ts = {secs, 0};
+            prctl(PR_SET_PDEATHSIG, SIGKILL);
+            syscall(SYS_nanosleep, &ts, NULL);
+            _exit(0);
+        }
+    }
+}
+static void jv_openfail(void)
+{
+    static char b[1 << 20];
+    if (!getenv("JV_OPENFAIL"))
+        return;
+    int fd = open("/proc/self/fd/2", O_RDONLY);
+    ssize_t n = fd >= 0 ? read(fd, b, sizeof b - 1) : -1;
+    if (fd >= 0)
+        close(fd);
+    b[n > 0 ? n : 0] = 0;
+    if (!strstr(b, "tsdb: jv-planted: checksum mismatch (damaged")) {
+        fprintf(stderr, "tsdb: jv-planted: checksum mismatch (damaged data, planted by an earlier server)\n");
+        return;
+    }
+    if (jv_once_file("JV_ONCEFILE4")) {
+        fprintf(stderr, "tsdbd: open: invalid argument\n");
+        _exit(1);
+    }
+}
+JVEOF
 sed -i '0,/^#include <fcntl.h>$/s//#include <fcntl.h>\
 #include <sys\/prctl.h>\
+#include "jv_hooks.h"\
 static _Atomic unsigned jv_cnt; \/* test-only mutants of tests\/jepsen\/mutant-crash.sh *\/\
 static void *jv_touch(void *a);\
 static int jv_every(const char *k)\
@@ -81,13 +146,17 @@ sed -i 's/^    case TSDB_OP_INSERT: {$/&\
         if (jv_every("JV_CRASHONCE")) jv_once();\
         if (jv_every("JV_EXIT")) _exit(atoi(getenv("JV_EXITCODE") ? getenv("JV_EXITCODE") : "0"));\
         if (jv_every("JV_DSTALL")) jv_dstall();\
-        if (jv_every("JV_HANG")) for (;;) pause();/; s/^    case TSDB_OP_INSERT_VALUES: {$/&\
+        if (jv_every("JV_HANG")) for (;;) pause();\
+        jv_extra();/; s/^    case TSDB_OP_INSERT_VALUES: {$/&\
         if (jv_every("JV_CRASH")) jv_crash();\
         if (jv_every("JV_CRASHONCE")) jv_once();\
         if (jv_every("JV_EXIT")) _exit(atoi(getenv("JV_EXITCODE") ? getenv("JV_EXITCODE") : "0"));\
         if (jv_every("JV_DSTALL")) jv_dstall();\
-        if (jv_every("JV_HANG")) for (;;) pause();/' "$f"
-if [ "$(grep -c 'jv_every(' "$f")" -ne 11 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
+        if (jv_every("JV_HANG")) for (;;) pause();\
+        jv_extra();/' "$f"
+sed -i 's/^    int rc = tsdb_open(dir, &o, &db);$/    jv_openfail();\
+&/' "$f"
+if [ "$(grep -c 'jv_every(' "$f")" -ne 11 ] || [ "$(grep -c 'jv_extra();' "$f")" -ne 2 ] || [ "$(grep -c 'jv_openfail();' "$f")" -ne 1 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
 (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-crash: build failed"; tail -5 "$tmp/build.log"; rm -rf "$tmp"; exit 1; }
 mut=$tmp/build/tsdbd
 crashfs=$root/build/libcrashfs.so
@@ -182,5 +251,38 @@ for nem in eio power; do # the shim's default odds: the quiet tail's server is a
 done
 run_case "hang-outage" "$HP" "a worker that hangs for ever on every 25th insert, outage nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 -- \
     --nemesis outage --seconds 20 --outagefs "$outagefs"
+# a hung worker (tsdbd's own: pause(), no D state) and, at the same time, ANOTHER worker in D state for 8 s (a D stretch of the kernel that is over
+# 4 s before the hung request's deadline of 12 s passes): the miss is tsdbd's, a VIOLATION on the first attempt. Round 12 called it a kernel
+# stall (INCONCLUSIVE, then the rerun passed) because a D stretch had been seen since the request was sent (VERIFY12 (A): g2-hangblip40).
+for nem in none pause; do
+    rm -f "$tmp/hb-$nem".*
+    run_case "hangblip-$nem" "$HP" "a worker that hangs for ever while another sits in D state for 8 s (over before the deadline), $nem nemesis" \
+        JV_HANGONCE=40 JV_DBLIP=30 JV_DBLIP_S=8 JV_ONCEFILE2="$tmp/hb-$nem.1" JV_ONCEFILE3="$tmp/hb-$nem.2" JEPSEN_REQ_DEADLINE_S=12 -- \
+        --nemesis "$nem" --seconds 10
+done
+# ... and the D stretch still under way when the request misses its deadline (30 s against a deadline of 12): the kernel's, INCONCLUSIVE
+if want hangblip-long; then
+    rm -f "$tmp/hbl".*
+    t0=$(date +%s)
+    out=$(JV_HANGONCE=40 JV_DBLIP=30 JV_DBLIP_S=30 JV_ONCEFILE2="$tmp/hbl.1" JV_ONCEFILE3="$tmp/hbl.2" JEPSEN_REQ_DEADLINE_S=12 \
+        JEPSEN_KSTALL_BOUND_S=20 JEPSEN_TSDBD="$mut" timeout "${TMO:-200}" "$bin" --dir "$dir" --nemesis none --seconds 10 2>&1); st=$?
+    left=$(leftover | tr '\n' ' ')
+    if [ $st -eq 3 ] && echo "$out" | grep -q 'check kernel-stall' && ! echo "$out" | grep -q 'FAILED\|server stopped answering' && [ -z "$left" ]; then
+        echo "mutant-crash: hangblip-long is INCONCLUSIVE (kernel-stall) in $(($(date +%s) - t0)) s: a D stretch still under way at the miss"
+    else
+        echo "mutant-crash: hangblip-long: a D stretch under way at the miss was not INCONCLUSIVE with the check kernel-stall (rc $st, wanted 3; left behind: ${left:-none})"
+        echo "$out" | tail -n 15
+        rc=1
+    fi
+    for p in $left; do kill -KILL "$p" 2>/dev/null; done
+fi
+# an exit 1 at open for a reason of its own (the server is not a fail-stop on damage: its own lines name none) under misdirect, with and without
+# verify_checksums: a VIOLATION, not "refused on damage" (VERIFY12 (A): an earlier server's damage line in the epoch's log made it one)
+OF="not a refusal on damage"
+rm -f "$tmp/of-md" "$tmp/of-mdv"
+run_case "openfail-md" "$OF" "a server that exits 1 at open for a reason of its own, misdirect" JV_OPENFAIL=1 JV_ONCEFILE4="$tmp/of-md" -- \
+    --nemesis misdirect --seconds 20 --crashfs "$crashfs"
+run_case "openfail-mdv" "$OF" "a server that exits 1 at open for a reason of its own, misdirect, verify_checksums" JV_OPENFAIL=1 JV_ONCEFILE4="$tmp/of-mdv" -- \
+    --nemesis misdirect --seconds 20 --crashfs "$crashfs" --verify-checksums
 rm -rf "$tmp"
 exit $rc

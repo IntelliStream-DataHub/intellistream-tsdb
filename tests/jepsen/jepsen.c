@@ -28,7 +28,8 @@
  * Nemeses: kill (SIGKILL the server), power (the crashfs shim rolls the
  * directory back to what was fsync'd, then the server dies; every other
  * server with CRASHFS_TEAR, which keeps torn tails, old-or-new sectors and a
- * random subset of unsynced directory operations), pause
+ * random subset of unsynced directory operations; the others get the old bytes back where a durable sector was rewritten and
+ * not synced, as a disk may, never zeros: round 13), pause
  * (SIGSTOP/SIGCONT), eio (the crashfs shim fails one write or sync with EIO
  * and from then on lies about that file's syncs, as Linux may after a failed
  * writeback; at exit it rolls back what was not made durable). After an EIO
@@ -495,7 +496,8 @@ static int epoch;
 static const char *md_files = "all"; /* CRASHFS_MD_FILES of this epoch */
 static char faultlog[PATH_MAX];     /* every injected fault, one line each (the shim's and rot's) */
 static int epoch_faults(void);
-static bool log_names_damage(const char *path, char *line, size_t n);
+static bool log_names_damage(const char *path, long from, char *line, size_t n);
+static long slog_from; /* where the latest server's own lines begin in slogpath (the epoch's log is appended to: an earlier server's lines are not this one's) */
 static bool damaged;                /* the database is refused or unreadable: final state unknown */
 static int refused_faulty, refused_clean, md_failstops, md_crashes, tail_cuts;
 static atomic_int read_damage, write_damage; /* requests that failed with TSDB_ERR_CORRUPT or TSDB_ERR_IO */
@@ -859,11 +861,13 @@ static const char *crash_prob(void)
 /* Whether a server's log (the stderr of its latest start) says that the open found damaged data: tsdb_open failed with
  * "corrupt data" or "I/O error" (tsdbd prints "tsdbd: DIR: <strerror>"), or the engine named a damaged file ("... is damaged ...",
  * "Damage is never silent"). Not an io_uring that would not start, not a port in use. The first such line goes to `line`. */
-static bool log_says_damage(const char *path, char *line, size_t n)
+static bool log_says_damage(const char *path, long from, char *line, size_t n)
 {
     FILE *f = fopen(path, "r");
     if (!f)
         return false;
+    if (from > 0 && fseek(f, from, SEEK_SET) != 0)
+        rewind(f);
     char b[1024];
     bool hit = false;
     while (!hit && fgets(b, sizeof b, f)) {
@@ -875,6 +879,26 @@ static bool log_says_damage(const char *path, char *line, size_t n)
         }
     }
     fclose(f);
+    return hit;
+}
+
+/* Whether the lines a server wrote (from `from` on) say that the machine, not the server, failed it: io_uring or a thread or a descriptor it
+ * could not get, a port, a full disk, a limit. Such a start is a harness error (exit 2). */
+static bool log_env_failure(const char *path, long from)
+{
+    static const char *const sig[] = {"io_uring", "Cannot allocate memory", "cannot start", "wake-up descriptor", "epoll:", "metrics thread",
+                                      "cannot write", "Too many open files", "No space left", "Address already in use", "descriptor limit",
+                                      "exit-with-parent", "Resource temporarily unavailable", NULL};
+    FILE *f = fopen(path, "r");
+    char b[1024];
+    bool hit = false;
+    if (f && from > 0 && fseek(f, from, SEEK_SET) != 0)
+        rewind(f);
+    while (f && !hit && fgets(b, sizeof b, f))
+        for (int i = 0; sig[i] && !hit; i++)
+            hit = strstr(b, sig[i]) != NULL;
+    if (f)
+        fclose(f);
     return hit;
 }
 
@@ -910,6 +934,10 @@ static void start_server_run(bool faulty)
         th_portfile(pf, sizeof pf, dir);
         char follow[64];
         th_follow_me(follow, sizeof follow);
+        { /* the log of an epoch is appended to (misdirect, rot, outage, keep): this server's lines begin where the file ends now */
+            struct stat lsb;
+            slog_from = (md || rot || outage || getenv("JEPSEN_KEEP")) && !getenv("JEPSEN_VERBOSE") && stat(slogpath, &lsb) == 0 ? (long)lsb.st_size : 0;
+        }
         pid_t pid = fork();
         if (pid == 0) {
             if (outage && faulty && outagefs_lib) { /* the shim: the nemesis takes a volume's directory away */
@@ -1008,7 +1036,7 @@ static void start_server_run(bool faulty)
         }
         char dmg[512];
         if (p == TH_EXITED && (md || rot) &&
-            (WIFSIGNALED(th_status) || (WIFEXITED(th_status) && WEXITSTATUS(th_status) == 1 && log_names_damage(slogpath, dmg, sizeof dmg)))) {
+            (WIFSIGNALED(th_status) || (WIFEXITED(th_status) && WEXITSTATUS(th_status) == 1 && log_names_damage(slogpath, slog_from, dmg, sizeof dmg)))) {
             /* refused: the open found damage (exit 1, and its log names it), or the faulty server stopped on damage it read; a signal
              * is a crash, never an answer to damage. Any other end before it listened (exit 0, an exit that names no damage) is the
              * environment or a damage-free fault, judged below (round 12). */
@@ -1061,8 +1089,18 @@ static void start_server_run(bool faulty)
                 }
                 bail(1);
             }
+            if ((md || rot) && WIFEXITED(st) && WEXITSTATUS(st) == 1 && !log_env_failure(slogpath, slog_from)) {
+                /* round 13 (VERIFY12): a server that exits 1 while opening for a reason of its own (its lines name no damage, or the first
+                 * block above would have taken it, and no failure of the machine) is a server that died: damage is not what it says */
+                fprintf(stderr, "  the server (pid %d) exits with status 1 while opening, and its own log names neither damage nor a failure of the "
+                        "environment: not a refusal on damage\n", (int)pid);
+                death_problems++;
+                print_tail(slogpath);
+                stop_server(SIGKILL);
+                bail(1);
+            }
             char dl[512];
-            if (WIFEXITED(st) && log_says_damage(slogpath, dl, sizeof dl)) {
+            if (WIFEXITED(st) && log_says_damage(slogpath, slog_from, dl, sizeof dl)) {
                 fprintf(stderr, "  the server (pid %d, exit status %d) refuses to open the database after the faults: damaged data: %s\n",
                         (int)pid, WEXITSTATUS(st), dl);
                 death_problems++;
@@ -1361,7 +1399,8 @@ static int stall_problems;            /* reported (once per run) */
  * the file system's journal, jbd2_log_wait_commit and folio_wait_bit_common, for over a minute, and the harness called it "server stopped
  * answering", a VIOLATION: liveness under load, not safety). The tasks of the server are sampled (dstate_thread, 4 times a second): a thread
  * that has been in D state (uninterruptible sleep) for dstate_min_ns without a break is the kernel's, not tsdbd's. A request that missed its
- * deadline while such a thread was there is a kernel I/O stall: no verdict, the request is an error like a refused one, the run goes on (the
+ * deadline while such a stretch is under way at that moment (a fresh look at the miss; a stretch that ended before it changes nothing: round 13,
+ * VERIFY12) is a kernel I/O stall: no verdict, the request is an error like a refused one, the run goes on (the
  * checker judges the history, which has the request as indeterminate) and ends INCONCLUSIVE ("kernel-stall"); a stall that lasts
  * KSTALL_BOUND_S (JEPSEN_KSTALL_BOUND_S) from the first miss ends the run, also INCONCLUSIVE, with the server killed. A miss with no such
  * thread (a futex wait, a pause, a spin, a deadlock: tsdbd's own) stays a VIOLATION. Short D states are not enough: a server that hangs a
@@ -1376,13 +1415,17 @@ static int kstall_misses, kstall_bound_s = KSTALL_BOUND_S_DEFAULT;
 static int64_t dstate_min_ns = 10000000000LL;
 static atomic_bool dst_stop;
 
+static int64_t dstate_scan(void);
+
 static void req_done(const char *op, int rc, int64_t t0)
 {
     int64_t d = now_ns() - t0, w = atomic_load(&req_worst_ns);
     if (rc != TSDB_ERR_IO && rc != TSDB_ERR_UNAVAILABLE) /* an answer: the honest worst the deadline is calibrated on */
         while (d > w && !atomic_compare_exchange_weak(&req_worst_ns, &w, d))
             ;
-    if (rc == TSDB_ERR_IO && d >= (int64_t)req_deadline_s * 950000000LL && atomic_load(&d_long_ns) >= t0) {
+    /* only a D stretch still under way at this moment makes the miss the kernel's (VERIFY12: a stretch that ended before the miss, a
+     * worker blocked in D for 40 s from the first second and a hung one that missed at 60 s, passed as a stall): a fresh scan decides */
+    if (rc == TSDB_ERR_IO && d >= (int64_t)req_deadline_s * 950000000LL && dstate_scan() >= dstate_min_ns) {
         pid_t pid = atomic_load(&server_pid);
         if (!atomic_exchange(&kstall_seen, true)) {
             kstall_first_ns = now_ns();
@@ -1407,25 +1450,25 @@ static void req_done(const char *op, int rc, int64_t t0)
     }
 }
 
-/* The sampler of D state: four times a second, for the server that runs now. */
-static void *dstate_thread(void *arg)
+/* The sampler of D state: four times a second, for the server that runs now (and once more at a deadline miss: dstate_scan is the one
+ * place that reads the tasks, under dst_mu, so the thread's record of since-when and a miss's look at the same instant agree). It returns
+ * the longest stretch, in ns, that a thread of the server has been in D state without a break, as of this scan. */
+static pthread_mutex_t dst_mu = PTHREAD_MUTEX_INITIALIZER;
+static int64_t dstate_scan(void)
 {
-    (void)arg;
     enum { MAXT = 256 };
     static pid_t tids[MAXT];
     static int64_t since[MAXT];
-    int nt = 0;
-    pid_t cur = 0;
-    while (!atomic_load(&dst_stop)) {
-        usleep(250000);
-        pid_t pid = atomic_load(&server_pid);
-        int64_t now = now_ns();
-        if (pid != cur) {
-            cur = pid;
-            nt = 0;
-        }
-        if (pid <= 0)
-            continue;
+    static int nt;
+    static pid_t cur;
+    pthread_mutex_lock(&dst_mu);
+    pid_t pid = atomic_load(&server_pid);
+    int64_t now = now_ns(), longest = 0;
+    if (pid != cur) {
+        cur = pid;
+        nt = 0;
+    }
+    if (pid > 0) {
         char path[320], b[512];
         snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
         DIR *dd = opendir(path);
@@ -1448,8 +1491,10 @@ static void *dstate_thread(void *arg)
         }
         if (dd)
             closedir(dd);
-        int64_t longest = 0;
-        int keep = 0;
+        /* the new record is built beside the old one: a thread's entry is found in the old list whatever order the others are in (VERIFY12:
+         * compacting in place overwrote entries not yet searched, and a stretch that went on restarted whenever another thread entered D) */
+        pid_t ntids[MAXT];
+        int64_t nsince[MAXT];
         for (int i = 0; i < ns; i++) { /* a thread in D state now: since when */
             int j = 0;
             while (j < nt && tids[j] != seen[i])
@@ -1457,12 +1502,28 @@ static void *dstate_thread(void *arg)
             int64_t sc = j < nt ? since[j] : now;
             if (sc < now && now - sc > longest)
                 longest = now - sc;
-            tids[keep] = seen[i];
-            since[keep++] = sc;
+            ntids[i] = seen[i];
+            nsince[i] = sc;
         }
-        nt = keep;
-        if (longest >= dstate_min_ns)
-            atomic_store(&d_long_ns, now);
+        memcpy(tids, ntids, (size_t)ns * sizeof tids[0]);
+        memcpy(since, nsince, (size_t)ns * sizeof since[0]);
+        nt = ns;
+    } else {
+        nt = 0;
+    }
+    if (longest >= dstate_min_ns)
+        atomic_store(&d_long_ns, now);
+    pthread_mutex_unlock(&dst_mu);
+    return longest;
+}
+
+static void *dstate_thread(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&dst_stop)) {
+        usleep(250000);
+        int64_t now = now_ns();
+        dstate_scan();
         if (atomic_load(&kstall_seen) && !atomic_load(&kstall_over) && now - kstall_first_ns >= (int64_t)kstall_bound_s * 1000000000LL &&
             now - atomic_load(&d_long_ns) < 2000000000LL) { /* the stall has lasted its bound and still does: the run ends, INCONCLUSIVE */
             atomic_store(&kstall_over, true);
@@ -2252,11 +2313,13 @@ static int epoch_faults(void)
 /* tsdbd exits with status 1 for two reasons it says so for: the fail-stop (failwatch_main: "storage failure, exiting") and a close that
  * failed ("tsdbd: close: corrupt data": the clean stop after our SIGTERM found damage, which a misdirected write left). An exit 1 with
  * neither line is not one of them. */
-static bool log_has_failstop(const char *path)
+static bool log_has_failstop(const char *path, long from)
 {
     FILE *f = fopen(path, "r");
     char b[1024];
     bool hit = false;
+    if (f && from > 0 && fseek(f, from, SEEK_SET) != 0)
+        rewind(f);
     while (f && !hit && fgets(b, sizeof b, f))
         hit = strstr(b, "tsdbd: storage failure, exiting") != NULL || strstr(b, "tsdbd: close: ") != NULL;
     if (f)
@@ -2264,13 +2327,15 @@ static bool log_has_failstop(const char *path)
     return hit;
 }
 
-static bool log_names_damage(const char *path, char *line, size_t n)
+static bool log_names_damage(const char *path, long from, char *line, size_t n)
 {
-    if (log_says_damage(path, line, n))
+    if (log_says_damage(path, from, line, n))
         return true;
     FILE *f = fopen(path, "r");
     char b[1024];
     bool hit = false;
+    if (f && from > 0 && fseek(f, from, SEEK_SET) != 0)
+        rewind(f);
     /* only what the engine and the fail-stop say, not tsdbd's start-up notes (the one about a file system that keeps no checksums
      * names "checksums" and "damaged" and is no damage) */
     while (f && !hit && fgets(b, sizeof b, f)) {
@@ -2296,7 +2361,7 @@ static void md_death(int st, int sig, pid_t pid)
     if ((sig && WIFSIGNALED(st) && WTERMSIG(st) == sig) || (sig == SIGTERM && WIFEXITED(st) && WEXITSTATUS(st) == 0))
         return;
     char dl[512];
-    if (WIFEXITED(st) && WEXITSTATUS(st) == 1 && epoch_faults() > 0 && log_has_failstop(slogpath) && log_names_damage(slogpath, dl, sizeof dl)) {
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 1 && epoch_faults() > 0 && log_has_failstop(slogpath, slog_from) && log_names_damage(slogpath, slog_from, dl, sizeof dl)) {
         md_failstops++; /* the one end that is expected: a fail-stop (tsdbd says "storage failure, exiting") whose log names damage, in an epoch where a fault was injected */
         return;
     }
@@ -4213,6 +4278,29 @@ static void tally_part(void *ctx, const tsdb_part_info *in)
         t->parts[in->cls]++, t->crows[in->cls] += in->rows;
 }
 
+/* The rows of every series that is not the workload's (the harness' own "jepsen.poke", written to a server that outlives its clients: round 13,
+ * VERIFY12): the parts of a database hold them too, and the check of the parts counts the workload's keys only. */
+struct other_rows {
+    tsdb *db;
+    uint64_t rows;
+    int err;
+};
+static int other_series(void *ctx, tsdb_sid id)
+{
+    struct other_rows *o = ctx;
+    for (int s = 0; s < nseries; s++)
+        if (ids[s] == id)
+            return 0;
+    tsdb_points p = {0};
+    if (tsdb_query_points(o->db, id, INT64_MIN, INT64_MAX, &p) != 0) {
+        o->err++;
+        return 0;
+    }
+    o->rows += p.n;
+    tsdb_points_free(&p);
+    return 0;
+}
+
 static int check_classes(const uint32_t *final)
 {
     int before = violations;
@@ -4270,6 +4358,8 @@ static int check_classes(const uint32_t *final)
                       "%zu\n", s, p.n, same, want);
         tsdb_points_free(&p);
     }
+    struct other_rows other = {.db = db};
+    tsdb_series_foreach(db, other_series, &other);
     tsdb_close(db);
     unsigned used = 0;
     for (int c = 0; c < 4; c++)
@@ -4281,9 +4371,14 @@ static int check_classes(const uint32_t *final)
     for (int c = 0; c < 4; c++)
         printf(" %llu (%llu)", (unsigned long long)t.parts[c], (unsigned long long)t.crows[c]);
     printf("\n");
-    if (t.rows != keys)
-        VIOLATION("classes: after tsdb_optimize the parts hold %llu rows, the final state %llu: rows of one (series, "
-                  "time) in two partitions\n", (unsigned long long)t.rows, (unsigned long long)keys);
+    if (getenv("JEPSEN_TEST_PLANT_ROW")) /* a test hook of the selftest: one row too many in the parts, what a (series, time) in two partitions is */
+        t.rows++;
+    if (other.err)
+        VIOLATION("classes: in-process read of a series that is not the workload's failed (%d)\n", other.err);
+    if (t.rows != keys + other.rows)
+        VIOLATION("classes: after tsdb_optimize the parts hold %llu rows, the final state %llu (and %llu of series that are not the "
+                  "workload's): rows of one (series, time) in two partitions\n", (unsigned long long)t.rows, (unsigned long long)keys,
+                  (unsigned long long)other.rows);
     if (switches == 0 || used < 2) /* the workload did too little (a machine that starves the clients writes a dozen rows in 20 s): no violation */
         INCONCLUSIVE("classes-coverage", "classes: %u switches, parts in %u classes: the workload tested no change of class\n", switches,
                      used);
