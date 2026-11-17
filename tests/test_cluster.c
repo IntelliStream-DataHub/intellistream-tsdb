@@ -1719,7 +1719,7 @@ static void power_loss(int snaps)
     snprintf(dir0, sizeof dir0, "%s/n0", base);
     if (mkdir(dir0, 0755) != 0 || mkdir(st, 0755) != 0)
         die("mkdir %s: %s", st, strerror(errno));
-    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s", so, st);
+    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_KEEP_OLD=1", so, st);
     penv[0] = pe;
     envs[0] = snaps ? "snap_every=2,snap_retain=1,seg_bytes=200" : NULL;
     for (int i = 1; i < 5; i++)
@@ -1802,7 +1802,7 @@ static void scen_powervote(void)
     snprintf(st, sizeof st, "%s/n2/state", base);
     if (mkdir(dir2, 0755) != 0 || mkdir(st, 0755) != 0)
         die("mkdir %s: %s", st, strerror(errno));
-    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s", so, st);
+    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_KEEP_OLD=1", so, st);
     penv[2] = pe;
     envs[3] = "free_min=9999999999999999"; /* a watcher: the proposal that makes n2 append */
     for (int i = 0; i < 4; i++)
@@ -1859,6 +1859,115 @@ static void scen_powervote(void)
     printf("  a voter's vote in term %" PRIu64 " (for node %" PRIu32 ") survives a power loss\n", term, leader);
 }
 static void scen_powersnap(void) { power_loss(1); }
+
+/* A power cut between a hard state save's write and its sync (jepsen-cluster kv power, seed 1, 2026-11-17: "slot 1 of the
+ * raft hard state in raft/hard is blank beside sequence 6 in slot 0", and the node never started again). A disk keeps
+ * the slot's old sectors or the new ones, which the reader takes; crashfs zeroed rewrites it was not told to keep, and
+ * the reader rightly takes a zeroed slot beside a later save for rot. So every power-loss harness of tsdbd --cluster
+ * runs crashfs with CRASHFS_KEEP_OLD=1: here a child saves six hard states (seq 6 in slot 0, seq 5 in slot 1), writes
+ * the seventh save's slot 1 without its sync and loses power at exit. With KEEP_OLD the hard state reads back as
+ * term 6; without it (crashfs's default) it must be refused, which is the state the jepsen node was left in. */
+static int hardslot_child(const char *dir)
+{
+    char err[512];
+    raft_log *l;
+    raft_log_opts o = {0};
+    o.segment_bytes = RAFT_LOG_SEGMENT_MIN;
+    if (raft_log_open(dir, &o, 0, 0, &l, err, sizeof err) != ISO_OK) {
+        fprintf(stderr, "hardslot child: open %s: %s\n", dir, err);
+        _exit(3);
+    }
+    for (unsigned t = 1; t <= 6; t++) {
+        raft_hard_state hs = {.term = t, .vote = 1};
+        if (raft_log_hard_save(l, &hs, err, sizeof err) != ISO_OK) {
+            fprintf(stderr, "hardslot child: save %u: %s\n", t, err);
+            _exit(3);
+        }
+    }
+    char hp[PATH_MAX + 16];
+    snprintf(hp, sizeof hp, "%s/hard", dir);
+    int fd = open(hp, O_RDWR | O_CLOEXEC);
+    static uint8_t slot[4096];
+    memset(slot, 0xab, sizeof slot);
+    if (fd < 0 || pwrite(fd, slot, sizeof slot, 4096) != (ssize_t)sizeof slot) { /* seq 7 goes to slot 1 */
+        fprintf(stderr, "hardslot child: rewrite %s: %s\n", hp, strerror(errno));
+        _exit(3);
+    }
+    exit(0); /* CRASHFS_AT_EXIT: the power fails here, before the seventh save's sync */
+}
+
+static void scen_hardslot(void)
+{
+    scenario("hardslot");
+    const char *so = getenv("CRASHFS_SO") ? getenv("CRASHFS_SO") : "./build/libcrashfs.so";
+    if (access(so, F_OK) != 0) {
+#ifdef __linux__
+        die("no %s (make build/libcrashfs.so): the power-loss scenarios cannot run, and must not pass as skipped", so);
+#else
+        printf("  skipped: no %s\n", so);
+        return;
+#endif
+    }
+#if defined(__SANITIZE_ADDRESS__)
+    printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
+    return;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
+    return;
+#endif
+#endif
+    char self[PATH_MAX];
+    ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (sl <= 0)
+        die("readlink /proc/self/exe: %s", strerror(errno));
+    self[sl] = '\0';
+    for (int keep = 1; keep >= 0; keep--) {
+        char top[PATH_MAX + 64], rd[PATH_MAX + 80];
+        snprintf(top, sizeof top, "%s/hardslot-%d", base, keep);
+        snprintf(rd, sizeof rd, "%s/raft", top);
+        /* made before the child: crashfs does not track its root's own entries, and the open does not sync the parent
+         * of a new directory */
+        if (mkdir(top, 0755) != 0 || mkdir(rd, 0755) != 0)
+            die("mkdir %s: %s", rd, strerror(errno));
+        pid_t pid = fork();
+        if (pid < 0)
+            die("fork: %s", strerror(errno));
+        if (pid == 0) {
+            setenv("LD_PRELOAD", so, 1);
+            setenv("CRASHFS_ROOT", top, 1);
+            setenv("CRASHFS_PROB", "0", 1);
+            setenv("CRASHFS_AT_EXIT", "1", 1);
+            if (keep)
+                setenv("CRASHFS_KEEP_OLD", "1", 1);
+            else
+                unsetenv("CRASHFS_KEEP_OLD");
+            unsetenv("CRASHFS_TEAR");
+            execl(self, self, "hardslot-child", rd, (char *)NULL);
+            _exit(127);
+        }
+        int st = -1;
+        if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+            die("the hardslot child (keep %d) ended with status 0x%x", keep, st);
+        raft_hard_state hs;
+        memset(&hs, 0, sizeof hs);
+        char lerr[512] = "";
+        iso_err e = raft_log_hard_load(rd, &hs, lerr, sizeof lerr);
+        if (keep) {
+            if (e != ISO_OK || hs.term != 6)
+                die("CRASHFS_KEEP_OLD: after a power cut inside the seventh hard save the state reads as rc %d term %" PRIu64
+                    " (want term 6): %s",
+                    (int)e, (uint64_t)hs.term, lerr);
+            printf("  CRASHFS_KEEP_OLD: a power cut inside a hard save leaves the previous one (term 6)\n");
+        } else {
+            if (e == ISO_OK)
+                die("without CRASHFS_KEEP_OLD the zeroed slot read as term %" PRIu64 ": this scenario no longer reaches "
+                    "the state the jepsen node was left in",
+                    (uint64_t)hs.term);
+            printf("  crashfs's default zeroes the slot, and the reader refuses it: %.120s\n", lerr);
+        }
+    }
+}
 
 /* Placement (item 10): a replacement voter comes from a power feed the voters do not use. */
 static void scen_feed(void)
@@ -3225,7 +3334,7 @@ static void scen_ackdurable(void)
         server_dir(i, dir, sizeof dir);
         if (mkdir(dir, 0755) != 0 && errno != EEXIST)
             die("mkdir %s: %s", dir, strerror(errno));
-        snprintf(pe[i], sizeof pe[i], "LD_PRELOAD=%s CRASHFS_ROOT=%s", so, dir);
+        snprintf(pe[i], sizeof pe[i], "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_KEEP_OLD=1", so, dir);
         penv[i] = pe[i];
     }
     for (int i = 3; i < 5; i++) {
@@ -3997,6 +4106,8 @@ static void scen_hungloop(void)
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
+    if (argc == 3 && !strcmp(argv[1], "hardslot-child"))
+        return hardslot_child(argv[2]);
     const char *scratch = argc > 1 ? argv[1] : "/tmp";
     snprintf(root, sizeof root, "%s/tsdb_cluster.XXXXXX", scratch);
     if (!mkdtemp(root)) {
@@ -4025,7 +4136,7 @@ int main(int argc, char **argv)
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
                {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
-               {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
+               {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;

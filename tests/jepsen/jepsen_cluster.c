@@ -29,7 +29,7 @@
  * everybody, a replica cut from the Raft leader only, a bridge, one direction, delays), pause (SIGSTOP for longer
  * than node_timeout, or than the lease), midcommit (a crash point of server/crashpt.h armed with TSDB_CRASH_AT: the
  * node ends with status 99 at it, is restarted and the hit counted; an armed point that never fired fails the run),
- * power (crashfs under the node's directory, SIGUSR2, exit status 99).
+ * power (crashfs under the node's directory with CRASHFS_KEEP_OLD, SIGUSR2, exit status 99).
  *
  * Workloads. meta: sampled STATUS of every node; a term has at most one leader (election safety), every node gets
  * back, every member UP after each heal, the metadata equal on every node. kv-local: per node, one writer and one
@@ -618,6 +618,9 @@ static int start_node(int i, const char *crash_at, int *status)
         snprintf(e3, sizeof e3, "CRASHFS_ROOT=%s", n->dir);
         envp[ne++] = e2;
         envp[ne++] = e3;
+        /* a rewrite in place that never synced comes back old, as on a disk; crashfs's default zeroes it, which the Raft
+         * hard state's reader rightly takes for rot (test_cluster hardslot; a kv power run, seed 1, 2026-11-17) */
+        envp[ne++] = "CRASHFS_KEEP_OLD=1";
     }
     envp[ne] = NULL;
     pid_t pid = fork();
