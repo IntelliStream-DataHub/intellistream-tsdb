@@ -3284,6 +3284,137 @@ static void scen_minisr(void)
            " shrink waits for the ISR to grow; above it writes go on\n");
 }
 
+/* closegone (a leader's shutdown with its replicas gone): an orphaned tsdbd once logged "shutting down" as the leader of
+ * a volume whose replicas had stopped and then sat for hours in futex waits. A close must not wait for a commit point
+ * that cannot move: tsdbd deposes the leader (repld_stop, eng_close) and the rows above the commit point stay in the
+ * WAL for the next epoch. SIGTERM ends the leader in bounded time with nothing above its commit point, and with a write
+ * waiting there (its replicas stopped before they acknowledged it, then killed; two of three voters gone, so no ISR
+ * change can commit). --exit-with-parent stops a server the same way (it sets `stopping` as SIGTERM does). The write
+ * is answered with an error; every directory opens afterwards, the replicas without the row. */
+static int term_within(int i, int ms, const char *what)
+{
+    uint64_t t0 = now_ms();
+    signal_child(pids[i], SIGTERM);
+    int st = await_exit(i, ms);
+    if (st < 0)
+        die("%s: server %d still runs %d ms after SIGTERM (its close waits for a commit point that cannot move)", what,
+            i, ms);
+    if (st != 0)
+        die("%s: server %d exited with status %d on SIGTERM, not 0", what, i, st);
+    stopped[i] = 0;
+    return (int)(now_ms() - t0);
+}
+
+/* a cluster of three in its own directory with volume plant on all of them, two rows written and the ISR full; the
+ * leader's index. (A scenario never restarts all three: every restart takes new ports, and no server would know where
+ * another one is.) */
+static int closegone_setup(const char *name, const char *env, tsdb_sid *id)
+{
+    scenario(name);
+    for (int i = 0; i < 3; i++) {
+        penv[i] = env;
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdbc_set_retry(c, 0);
+    *id = rep_series(c, rep_names[0], "plant", 30000);
+    float val = 1;
+    for (int64_t ts = 1000; ts <= 2000; ts += 1000)
+        if ((rc = tsdbc_insert_series(c, *id, &ts, &val, 1)) != 0)
+            die("a write with every replica up: %s", ers(rc));
+    await_isr(0, "plant", 3, 5000, "every replica up");
+    tsdbc_close(c);
+    return L;
+}
+
+static void scen_closegone(void)
+{
+    tsdb_sid id;
+    /* 1: both replicas stopped cleanly, nothing above the leader's commit point */
+    int L = closegone_setup("closegone", NULL, &id);
+    stop((L + 1) % 3, SIGTERM);
+    stop((L + 2) % 3, SIGTERM);
+    int ms1 = term_within(L, 15000, "the leader with its replicas stopped, nothing above its commit point");
+
+    /* 2: a write waits above the commit point: the replicas are stopped (SIGSTOP) before they acknowledge it */
+    L = closegone_setup("closegone-above", NULL, &id);
+    pause_server((L + 1) % 3, 1);
+    pause_server((L + 2) % 3, 1);
+    struct rep_writer w = {cports[L], id, 3000, 1, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    nanosleep(&(struct timespec){1, 500000000}, NULL);
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
+        die("a write with both replicas stopped was answered (%s): nothing waits above the commit point", ers(w.rc));
+    for (int r = 0; r < 3; r++) {
+        if (r == L)
+            continue;
+        signal_child(pids[r], SIGKILL); /* a stopped process dies of SIGKILL without running again */
+        int st;
+        if (waitpid(pids[r], &st, 0) != pids[r])
+            die("waitpid %d: %s", (int)pids[r], strerror(errno));
+        pids[r] = 0;
+        stopped[r] = 0;
+    }
+    int ms2 = term_within(L, 15000, "the leader with a write above its commit point and its replicas killed");
+    uint64_t tw = now_ms();
+    while (!__atomic_load_n(&w.done, __ATOMIC_ACQUIRE)) {
+        if (now_ms() - tw > 5000)
+            die("the write above the commit point got no answer after its server stopped");
+        nanosleep(&(struct timespec){0, 10000000}, NULL);
+    }
+    pthread_join(th, NULL);
+    if (w.rc == 0)
+        die("a write no replica acknowledged was answered as written");
+    /* every directory opens; the replicas never saw the row, the leader's WAL may keep it for the next epoch */
+    uint64_t lrows = 0;
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX + 80], vd[PATH_MAX + 120];
+        server_dir(i, dir, sizeof dir);
+        snprintf(vd, sizeof vd, "%s/v1", dir);
+        uint64_t rows[REP_NAMES], h[REP_NAMES];
+        int rc = cvol_digest(vd, rep_names, REP_NAMES, rows, h);
+        if (rc != 0)
+            die("open %s read-only after the stop: %s", vd, ers(rc));
+        if (i == L ? rows[0] < 2 || rows[0] > 3 : rows[0] != 2)
+            die("server %d (%s) holds %" PRIu64 " rows after the stop", i, i == L ? "the leader" : "a replica",
+                rows[0]);
+        if (i == L)
+            lrows = rows[0];
+    }
+
+    /* 3: the engine writes after the driver stopped (a record admitted before the depose, a NOW marker while the
+     * read lease lasts): latewal keeps the leader in place 2.5 s past the freeing of the links, the replicas up so
+     * that the lease is fresh, and the flusher's NOW markers come through the WAL hooks. They used to send on the
+     * freed links (a use after free: status 139). */
+    L = closegone_setup("closegone-late", "TSDB_REPLD_TEST=latewal", &id);
+    int ms3 = term_within(L, 15000, "the leader writing NOW markers after its driver stopped");
+    for (int i = 0; i < 3; i++)
+        penv[i] = NULL;
+    printf("  a leader whose replicas are gone stops on SIGTERM in %d ms (nothing above its commit point) and %d ms (a"
+           " write waiting there, answered %s; its directory reads %" PRIu64 " rows); its WAL written after the driver"
+           " stopped, in %d ms\n",
+           ms1, ms2, ers(w.rc), lrows, ms3);
+}
+
 /* shipstall (the r3d review's M2): a large write over ten partitions with a replica stopped (SIGSTOP: its links stay
  * up, no DONE comes back) waits for its files under one deadline per COMMIT, and not past the moment the stopped
  * replica leaves the ISR; it used to wait 30 s per file (mutant shipperfile). Running again, the replica fetches what
@@ -4322,7 +4453,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"idleseal", scen_idleseal}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int k = 0; k < n; k++) {

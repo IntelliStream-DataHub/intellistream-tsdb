@@ -152,7 +152,7 @@ struct rvol {
 
 enum { RM_NONE, RM_COMMITBYLEADER, RM_ACKBEFORESYNC, RM_FLOORNOTSAVED, RM_COMMITPASTREMOVED, RM_NOMINISR,
        RM_ACKBELOWMINISR, RM_SHIPPERFILE, RM_NOCAP, RM_NOSEAL, RM_NOSPILL, RM_NOINBOXBOUND,
-       RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK };
+       RM_KEEPIGNORESPEERS, RM_NOLOGSTARTCHECK, RM_STOPNODEPOSE };
 
 static struct {
     pthread_mutex_t mu;
@@ -177,6 +177,8 @@ static struct {
                            stalled disk's stand-in) */
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
+    int late_wal; /* TSDB_REPLD_TEST=latewal (tests only): repld_stop leaves its writers in place and waits 2.5 s after
+                   * freeing the links, so the engine's NOW markers reach the WAL hooks of a stopped driver */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -535,7 +537,9 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
         idx_push(rv, wr.fno, wr.fno + wr.span - 1);
         o += sz;
     }
-    for (int i = 0; i < (int)rv->rec.nrep; i++) {
+    /* Stopped (repld_stop): the links are freed or about to be. The engine may still write: a record admitted before
+     * the depose, a NOW marker of the flusher; its bytes stay in the WAL for the next epoch. */
+    for (int i = 0; !rv->stop && i < (int)rv->rec.nrep; i++) {
         struct rpeer *p = &rv->peer[i];
         if (i != rv->self && p->sent + 1 == first && send_records(rv, i, seq, off, buf, len, first) == 0) {
             p->sent = last;
@@ -795,7 +799,8 @@ static int op_ship(void *ctx, struct eng *db, const char *file, const char *mnam
     b->w[b->n++] = w;
     b->bytes += size;
     pthread_mutex_lock(&rv->mu);
-    bulk_out(rv, fd, size, mname, -1, w);
+    if (!rv->stop) /* no links any more (op_bytes): no job, so the wait for this file ends at once */
+        bulk_out(rv, fd, size, mname, -1, w);
     pthread_mutex_unlock(&rv->mu);
     if (G.mutant == RM_SHIPPERFILE) { /* planted: the code before the review's M2, 30 s for each file */
         pthread_mutex_lock(&w->mu);
@@ -1615,12 +1620,14 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "noinboxbound")   ? RM_NOINBOXBOUND
                : !strcmp(mu, "keepignorespeers") ? RM_KEEPIGNORESPEERS
                : !strcmp(mu, "nologstartcheck") ? RM_NOLOGSTARTCHECK
+               : !strcmp(mu, "stopnodepose")   ? RM_STOPNODEPOSE
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
     const char *te = getenv("TSDB_REPLD_TEST");
     G.drop_bulk = te && strstr(te, "dropbulk");
     G.promote_wait = te && strstr(te, "promotewait");
+    G.late_wal = te && strstr(te, "latewal");
     G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
     if (G.mutant == RM_NOINBOXBOUND)
         G.inbox_bytes = SIZE_MAX;
@@ -1924,7 +1931,7 @@ void repld_stop(void)
             pthread_join(rv->th, NULL);
         rv->started = 0;
         struct eng *db = tsdb_cvol_ref(G.t, rv->number);
-        if (db && rv->mode == M_WRITER)
+        if (db && rv->mode == M_WRITER && G.mutant != RM_STOPNODEPOSE && !G.late_wal)
             eng_leader_depose(db); /* nothing waits for a commit point that no longer moves */
         tsdb_cvol_unref(&db);
     }
@@ -1934,4 +1941,7 @@ void repld_stop(void)
         peerlink_free(G.pl);
         G.pl = NULL;
     }
+    /* `stop`, set under each volume's mu above, keeps the engine's hooks (op_bytes, op_ship) off the freed links */
+    if (G.late_wal)
+        nanosleep(&(struct timespec){2, 500000000}, NULL);
 }
