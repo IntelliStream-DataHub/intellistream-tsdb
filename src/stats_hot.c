@@ -19,6 +19,7 @@
  * exactly, one mincore per (part, series).
  */
 #include "stats_priv.h"
+#include "eccache.h"
 
 /* ------------------------------------------------------------------------------ space-saving */
 
@@ -418,11 +419,12 @@ static void sample_part(struct estats *es, const part *p, prec *rec)
     for (uint32_t s = 0; s < m; s++) {
         uint32_t e = (uint32_t)(((uint64_t)(2 * s + 1) * n) / (2 * (uint64_t)m));
         uint64_t off = gix_get(x, e, GF_OFF), len = gix_get(x, e, GF_TSLEN) + gix_get(x, e, GF_VALLEN);
-        if (off > p->map_len || len > p->map_len - off)
+        if (!p->ec && (off > p->map_len || len > p->map_len - off))
             continue; /* damaged index: no sample */
         uint32_t id = x->rser[gix_run_of(x, e)];
         uint32_t t = tenant_of(es, id);
-        size_t got = resident_bytes_range(p->map + off, len);
+        /* R7: an .ec part's granules are in the tier's cache, not in its map */
+        size_t got = p->ec ? (size_t)eccache_resident(p, off, len) : resident_bytes_range(p->map + off, len);
         unsigned i = 0;
         while (i < nt && tn[i] != t)
             i++;

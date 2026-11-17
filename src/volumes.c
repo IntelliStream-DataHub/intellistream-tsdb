@@ -47,6 +47,7 @@
 #include "cvol.h"
 #include "replica.h"
 #include "stats_priv.h"
+#include "tier.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -86,6 +87,9 @@ struct tsdb {
     tsdb_options opt;
     char *dir;
     int dirfd;
+    /* R7 (src/tier.h): the handle's tier (TSDB_TEST_TIER), NULL without one; this reference is tsdb_close's to give
+     * back, each engine holds its own (tier_want before every engine open below) */
+    struct tier *tier;
     uint64_t id;
     pthread_rwlock_t lock; /* the arrays below; written when volumes are added */
     eng **vols;
@@ -355,7 +359,9 @@ static bool engine_file_name(const char *name)
         if (strcmp(name, fixed[i]) == 0)
             return true;
     return wal_file_name(name) || part_file_name(name) || part_tmp_name(name) || intent_file_name(name) ||
-           (strncmp(name, "retired_", 8) == 0 && part_file_name(name + 8));
+           (strncmp(name, "retired_", 8) == 0 && part_file_name(name + 8)) ||
+           /* R7: an .ec part, its temporary, a retired one, a settle's source */
+           ec_file_name(name) || ec_tmp_name(name) || ec_retired_name(name) || settled_part_name(name);
 }
 
 /* The first file in the directory open at fd that engine_file_name takes for the engine's, into name; 0 when
@@ -878,7 +884,9 @@ static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad
     if (!t->opt.read_only)
         volume_feed_want(t); /* the wish is taken by the next eng_open_sched of this thread */
     opts_with_tenants(t, &o, &hold, &tlgen);
+    tier_want(t->tier, index);
     rc = eng_open_sched(path, &o, t->sched, &e);
+    tier_want(NULL, 0);
     tlist_unref(hold);
     if (rc != 0)
         return rc;
@@ -1019,6 +1027,8 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         rc = meta_check(mfd, dir, 0);
     if (mfd >= 0)
         close(mfd);
+    if (rc == 0)
+        rc = tier_open(dir, &t->opt, &t->tier); /* R7: TSDB_TEST_TIER, before any engine opens */
     if (rc) {
         tsdb_close(t);
         return rc;
@@ -1028,7 +1038,9 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
     tlist *hold;
     uint32_t tlgen;
     opts_with_tenants(t, &o, &hold, &tlgen);
+    tier_want(t->tier, 0);
     rc = eng_open_sched(dir, &o, t->sched, &root); /* creates the directory for a writer */
+    tier_want(NULL, 0);
     tlist_unref(hold);
     if (rc) {
         tsdb_close(t);
@@ -1090,11 +1102,13 @@ int tsdb_close(tsdb *t)
     if (!t)
         return 0;
     int rc = 0;
+    tier_quiesce(t->tier); /* R7: no settle runs on an engine being closed */
     for (size_t i = 0; i < t->nvols; i++) {
         int r = eng_close(t->vols[i]);
         rc = rc ? rc : r;
         free(t->paths[i]);
     }
+    tier_put(t->tier); /* the engines gave theirs back; a retired engine still kept by a cut gives its own later */
     sched_free(t->sched); /* after the volumes: none of them runs a query now */
     qreg_close(t->reg);   /* threads that still hold a block keep the registry alive until they exit */
     tlist_unref(t->tl);
@@ -2049,7 +2063,9 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
         tlist *hold;
         volume_feed_want(t); /* the root's state, as at the first open of the volume */
         opts_with_tenants(t, &o, &hold, &tlgen);
+        tier_want(t->tier, (uint32_t)vol);
         rc = eng_reopen(old, path, &o, t->sched, &e, reval_check_open, &chk);
+        tier_want(NULL, 0);
         tlist_unref(hold);
     }
     free(path);
@@ -3654,7 +3670,10 @@ static int up_scan(const up_dir *d)
         const char *why = strncmp(e->d_name, "wal_", 4) == 0 ? "a WAL segment"
                           : intent_file_name(e->d_name)       ? "an insert's intent"
                           : part_tmp_name(e->d_name)          ? "a part that was being written"
-                                                              : NULL;
+                          : ec_file_name(e->d_name) || ec_tmp_name(e->d_name) || ec_retired_name(e->d_name) ||
+                                    settled_part_name(e->d_name)
+                              ? "an erasure-coded part's file (a newer release's)"
+                              : NULL;
         if (why) {
             fprintf(stderr, "tsdb: upgrade: %s/%s is %s: the database was not closed cleanly. Open it with the "
                     "release that wrote it (it recovers), close it, and run this again\n", d->path, e->d_name, why);
@@ -3951,12 +3970,14 @@ int tsdb_cvol_open(tsdb *t, uint32_t number, const char *dir, bool replica, uint
     opts_with_tenants(t, &o, &hold, &tlgen);
     eng *e = NULL;
     meta_cluster_open_allow(true);
+    tier_want(t->tier, number); /* R7: r7-tier refuses a tier on a cluster volume (D1) */
     if (replica) {
         rc = eng_open_replica(dir, &o, floor, &e);
     } else {
         eng_set_open_feed_want(0, NULL); /* a cluster volume has no feed (design-cluster.md 5.3) */
         rc = eng_open_sched(dir, &o, t->sched, &e);
     }
+    tier_want(NULL, 0);
     meta_cluster_open_allow(false);
     tlist_unref(hold);
     if (rc) {

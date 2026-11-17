@@ -92,13 +92,17 @@ endif
 # out gf256.c's constructor; src/cpu.c calls tsdb_ec_select() instead (AGENTS.md "CPU levels"). Compiled once, at the
 # baseline of $(ARCH): the AVX2, AVX-512 and GFNI kernels carry target attributes and run only where src/ec/compat.c's
 # iso_cpu_has() says so (tools/check-isa.sh checks that nothing else in them goes beyond x86-64-v2).
-ifeq ($(shell uname -m),x86_64)
+# NO_EC=1 builds an x86-64 engine without it, as the embedded bindings and other machines do (after make clean, or with
+# its own B=): every R7 stub and test must build and pass both ways.
+ifeq ($(shell uname -m)$(NO_EC),x86_64)
 EC_OBJ := $(B)/ec_gf256.o $(B)/ec_gf256_avx2.o $(B)/ec_gf256_avx512.o $(B)/ec_rs.o $(B)/ec_compat.o
 OBJ  += $(EC_OBJ)
 EC_BENCH := $(B)/ec-bench
 override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
+# R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
+R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/eckeep.h src/ecswap.h src/chunk.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -116,7 +120,7 @@ BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
 all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench $(EC_BENCH)
 
-$(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
+$(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h $(R7_HDR) | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 # simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
 $(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
@@ -361,7 +365,7 @@ TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 te
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
-test-units-b: $(B)/test_chunk $(B)/test_chunk_heal
+test-units-b: $(B)/test_chunk $(B)/test_chunk_heal $(B)/test_ecnames
 test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(or $(TMPDIR),/tmp)
 	B=$(B) tests/test_config.sh $(TMPDIR)
@@ -386,6 +390,8 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_chunk $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in nosums nofence eof settings nosync epochnosync; do ! ./$(B)/test_chunk --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_chunk_heal $(or $(TMPDIR),/tmp)
+	./$(B)/test_ecnames $(or $(TMPDIR),/tmp)
+	for m in nameloose tierloose; do ! ./$(B)/test_ecnames --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	$(if $(EC_OBJ),for m in heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always; do ! ./$(B)/test_chunk_heal --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	tests/test_sync_ec.sh
 	tools/sync-ec.sh --check
@@ -965,6 +971,11 @@ $(B)/test_delete: tests/test_delete.c src/internal.h $(LIB)
 
 $(B)/test_rs: tests/test_rs.c src/internal.h $(EC_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
+
+# R7's interfaces (r7-iface): the names of .ec parts and settled sources, every near miss; TSDB_TEST_TIER's grammar and
+# its refusal without TSDB_TEST_TIER_I_KNOW=1; the stubs leave a database as today's code does; eng_test_mark_ec
+$(B)/test_ecnames: tests/test_ecnames.c src/internal.h $(R7_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # objects, chunk files, stores and the directory backend (R6): every geometry, every damage pattern, range reads at every
 # boundary, epoch fences, power loss (crashfs) at every step of a chunk write and an EPOCH store; mutants must fail it

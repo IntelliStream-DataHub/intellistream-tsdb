@@ -796,6 +796,8 @@ typedef struct part {
     /* protected by tsdb.lock */
     bool merging;
     bool dropped;
+    bool settling; /* R7: a settle has taken it (db->lock, like merging): out of merges, rewrites and TTL selection until
+                    * the swap lists its .ec or the settle is abandoned */
     atomic_bool damaged; /* its index no longer matches the open's checksum, or a merge could not decode one of its
                           * granules: out of merges and drops (part_checked, part_mark_payload) */
     atomic_bool wait_logged; /* db_wait_merges said once that inserts no longer wait for this damaged part's partition */
@@ -810,6 +812,11 @@ typedef struct part {
      * of its nulls, made by the part writer; the publisher folds and frees it (NULL when the table is off) */
     struct lfold *lf;
     size_t nlf;
+    /* R7 (src/ecpart.h): NULL for a .part. Set for an .ec part, whose map holds the source's header, index, tombstones
+     * and footer verbatim (the granule bytes are in the chunk store, read through ec_granule_read), and for a part
+     * eng_test_mark_ec marked in a test (its bytes are still in the map). Set before the part is listed and never
+     * changed while it is: readers test it without a lock. Freed by part_unref (ecgc_last_unref). */
+    struct ecpart *ec;
 } part;
 
 
@@ -913,7 +920,9 @@ int part_open(int dirfd, const char *name, bool pin, part **out);
 int part_open_as(int dirfd, const char *file, const char *name, bool pin, bool v8_ok, part **out);
 /* the position range a part writer begun on this thread takes (set around a flush; a merge sets its own) */
 extern __thread uint64_t cur_fno_lo, cur_fno_hi;
-bool part_index_intact(const part *p);
+bool part_index_intact(const part *p); /* an .ec part asks ec_index_intact */
+/* part_index_intact for a part whose index is in its own mapping: what part_index_intact does for a .part */
+bool part_map_intact(const part *p);
 /* part_index_intact; a part that fails it is marked damaged, logged and counted once (st_broken_parts) */
 bool part_checked(struct eng *db, part *p, const char *what);
 /* A merge could not decode a granule of p: marks it damaged, logs and counts it once (in memory only) */
@@ -926,6 +935,13 @@ void part_unref(part *p);
  * the caller's buffers and the one in g, so cap is what the buffers hold, never a count loaded before. */
 int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
                  bool verify);
+/* granule_read for a part whose granule bytes are in its mapping (a .part); an .ec part's go through ec_granule_read */
+int granule_read_map(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
+                     bool verify);
+/* The decode of granule_read from the block's bytes blk (g->ts_len + g->val_len of them, wherever they were read
+ * from): the checks of count against cap and the part's granule size, the checksum if verify, the counters. */
+int granule_decode(codec_ctx *c, const part *p, const granule *g, const uint8_t *blk, int type, int64_t *ts, void *v,
+                   size_t cap, bool verify);
 /* the same for entry i: decodes its GW_LOC fields into *g first. Out of line on purpose: inlined, the entry's
  * decoding changes how the compiler lays out a caller's per-row loop (TWA lost 12% that way). */
 int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, size_t cap, bool verify,
@@ -1034,7 +1050,23 @@ int intents_recover(struct eng *db);
 /* Exactly the names the engine gives part writers' tmp files and parts: what a cleanup at open may touch. */
 bool part_tmp_name(const char *name);
 bool part_file_name(const char *name);
-bool intent_file_name(const char *name); /* an insert's intent, txn_<pid>_<n>.intent */
+bool intent_file_name(const char *name); /* an insert's intent, txn_<pid>_<n>.intent (versions 3 and 4 alike) */
+/* R7's names (the engine writes them only with a tier; src/ecpart.h). The .ec part keeps its source's name and block
+ * range (D2): p<partition>_<min>_<max>_<level>.ec; its temporary tmp_<pid>_<n>.ec; a retired one retired_<that>; the
+ * source a swap renamed settled_p<partition>_<min>_<max>_<level>.part, kept until r7-keep releases it. */
+bool ec_file_name(const char *name);
+bool ec_tmp_name(const char *name);
+bool ec_retired_name(const char *name);
+bool settled_part_name(const char *name);
+/* r7-iface's planted bugs (tests/test_ecnames.c --mutant NAME; the Makefile requires each to fail it): an .ec name
+ * matched by its prefix and extension only; TSDB_TEST_TIER taken without TSDB_TEST_TIER_I_KNOW=1 */
+enum { R7_MUT_NONE = 0, R7_MUT_NAMELOOSE, R7_MUT_TIERLOOSE };
+extern int r7_mutant;
+/* The first line of an intent of version 4 (a settle's swap, src/ecswap.c); version 3 is an insert's. */
+#define INTENT_V4_HEAD "tsdb-intent 4 "
+/* Checks an intent's last line ("end <xxh64 of everything before it>") and cuts it off: the body is then buf, a
+ * NUL-terminated string without its last newline. false when it is torn or damaged (buf may be changed). */
+bool intent_unseal(char *buf, size_t len);
 bool wal_file_name(const char *name);    /* a WAL segment, wal_<16 lowercase hex>.log (memtable.c) */
 void meta_tmp_make(char *buf, size_t cap); /* a volume add's own META temporary (db.c) */
 bool meta_tmp_name(const char *name);      /* the engine's or an add's META temporary */
@@ -1590,10 +1622,20 @@ typedef struct wal_tail {
     bool reported;
 } wal_tail;
 
+/* The kinds of graveyard entries: a retired part (graveyard_purge unlinks it at its deadline), a retired .ec part
+ * (retired_*.ec: r7-gc's, which deletes its chunks too) and a settled source (settled_*.part: r7-keep's, kept from the
+ * .ec record's settle time). R7's kinds are purged by their stubs (ecgc_purge_entry, eckeep_purge_entry). */
+enum { GY_PART = 0, GY_EC = 1, GY_SETTLED = 2 };
+
 typedef struct graveyard_entry {
-    char name[256];   /* retired_<part name> */
+    char name[256];   /* retired_<part name>, retired_<name>.ec or settled_<part name> */
     int64_t deadline; /* monotonic ms (eng_mono_ms): a wall clock step must not purge early */
+    uint8_t kind;     /* GY_* */
 } graveyard_entry;
+
+/* Appends an entry (db->lock held, or the open before any thread runs); TSDB_ERR_NOMEM when the list cannot grow
+ * (the file stays on disk and the next open collects it). */
+int graveyard_add(struct eng *db, const char *name, int kind, int64_t deadline);
 
 int manifest_publish(struct eng *db);
 int follow_refresh(struct eng *db);
@@ -1709,6 +1751,13 @@ struct eng {
     /* partition classes (classes.c): on, key multiplier, length and key step per class */
     bool cls_on;
     int64_t cls_kmul, cls_len[PART_CLASSES], cls_km[PART_CLASSES];
+    /* R7 (src/tier.h): the tsdb handle's tier, one reference held from the open (tier_engine_attach) to eng_close
+     * (tier_engine_detach), retired engines included; NULL without one. tier_vol: this engine's volume number there.
+     * ecstate: the per-engine state of R7's files (struct ecstate, src/tier.h), NULL without a tier. Pointers only:
+     * every lock and list of R7 lives behind them. */
+    struct tier *tier;
+    struct ecstate *ecstate;
+    uint32_t tier_vol;
 
     pthread_mutex_t lock; /* parts list and part flags */
     /* New parts get their block numbers, names and place in the list in one

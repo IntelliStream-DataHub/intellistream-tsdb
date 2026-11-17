@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Database lifecycle, the active parts list, buffered appends and maintenance. */
 #include "internal.h"
+#include "ecgc.h"
+#include "eckeep.h"
+#include "ecpart.h"
+#include "tier.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -667,7 +671,7 @@ static int load_parts(eng *db, bool read_only)
         const char *name = e->d_name;
         /* Only names the engine writes: a volume may be a directory with the user's own files in it
          * (tsdb_volume_add_dir), and their tmp_notes.txt or retired_old.csv is not ours to delete. */
-        if (part_tmp_name(name) || meta_tmp_name(name) || strcmp(name, FNO_FILE ".tmp") == 0 ||
+        if (part_tmp_name(name) || ec_tmp_name(name) || meta_tmp_name(name) || strcmp(name, FNO_FILE ".tmp") == 0 ||
             strcmp(name, "MANIFEST.tmp") == 0 || strcmp(name, FEED_FILE ".tmp") == 0 ||
             strcmp(name, FEEDSLOTS_FILE ".tmp") == 0) { /* an interrupted fno_create, `tsdb upgrade` or feed file */
             if (!read_only)
@@ -679,34 +683,35 @@ static int load_parts(eng *db, bool read_only)
             if (!read_only && db->opt.obsolete_part_lifetime_s <= 0) {
                 unlinkat(db->dirfd, name, 0); /* no lifetime: nobody is promised the file */
             } else if (!read_only && db->ngraveyard < 1u << 20) {
-                if (db->ngraveyard == db->graveyard_cap) {
-                    size_t cap = db->graveyard_cap ? db->graveyard_cap * 2 : 64;
-                    graveyard_entry *g = realloc(db->graveyard, cap * sizeof *g);
-                    if (!g) {
-                        rc = TSDB_ERR_NOMEM;
-                        break;
-                    }
-                    db->graveyard = g;
-                    db->graveyard_cap = cap;
-                }
-                graveyard_entry *e = &db->graveyard[db->ngraveyard++];
-                snprintf(e->name, sizeof e->name, "%s", name);
-                e->deadline = eng_mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000;
+                rc = graveyard_add(db, name, GY_PART,
+                                   eng_mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000);
+                if (rc)
+                    break;
             }
             continue;
         }
-        if (!part_file_name(name))
+        /* R7's names (src/ecpart.h): each to the file that owns it */
+        if (ec_retired_name(name) || settled_part_name(name)) {
+            rc = ec_retired_name(name) ? ecgc_load_retired(db, name, read_only)
+                                       : eckeep_load_settled(db, name, read_only);
+            if (rc)
+                break;
             continue;
-        part *p;
-        int r = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, &p);
-        if (r == TSDB_ERR_NOTFOUND)
-            continue; /* removed while we listed the directory */
+        }
+        bool ec = ec_file_name(name);
+        if (!ec && !part_file_name(name))
+            continue;
+        part *p = NULL;
+        int r = ec ? ecpart_load(db, name, read_only, &p)
+                   : part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, &p);
+        if (r == TSDB_ERR_NOTFOUND || (r == 0 && !p))
+            continue; /* removed while we listed the directory (or an .ec file its owner leaves alone) */
         if (r == 0 && p->grows != db->granule_rows) {
             part_unref(p);
             r = TSDB_ERR_CORRUPT;
         }
-        if (r == 0)
-            p->verify = db->opt.verify_checksums;
+        if (r == 0 && !p->ec)
+            p->verify = db->opt.verify_checksums; /* an .ec part's granules are always checked (E11) */
         if (r == TSDB_ERR_CORRUPT || r == TSDB_ERR_INVALID) {
             /* Never left out quietly: its rows would vanish and older values of
              * the same keys come back, and a merge would make that permanent.
@@ -934,7 +939,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         rc = TSDB_ERR_INVALID;
         goto fail;
     }
-    if ((rc = meta_load_or_create(db, ro)) != 0)
+    if ((rc = meta_load_or_create(db, ro)) != 0 || (rc = tier_engine_attach(db)) != 0) /* R7: after META */
         goto fail;
     if (replica && !db->replica_req) {
         /* a replica cuts its log to the leader's and skips what its links say: on a directory that was never made for
@@ -1234,6 +1239,7 @@ int eng_close(eng *db)
     pthread_cond_destroy(&db->merge_cv);
     pthread_cond_destroy(&db->merged_cv);
     pthread_cond_destroy(&db->flush_cv);
+    tier_engine_detach(db); /* R7: after the parts went (an .ec part reaches the tier through its engine) */
     free(db->dir);
     free(db);
     return rc;

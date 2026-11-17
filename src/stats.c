@@ -33,6 +33,7 @@
  * and keep answering after the engine failed.
  */
 #include "stats_priv.h"
+#include "eccache.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -406,7 +407,8 @@ int part_walk(struct estats *es, const part *p, prec *r, unsigned flags)
     r->index_bytes = (uint64_t)x->n * x->stride + 8ull * x->nruns;
     uint64_t used = r->ts_bytes + r->val_bytes + r->index_bytes; /* the tombstones are in "other": a part's four columns
                                                                     * add up to its file */
-    r->other_bytes = p->map_len > used ? p->map_len - used : 0;
+    uint64_t file = p->ec ? eccache_part_bytes(p) : p->map_len; /* R7: what an .ec part counts as its file */
+    r->other_bytes = file > used ? file - used : 0;
     if (rows != p->rows) /* damage after the open: still counted, its bytes are on disk */
         fprintf(stderr, "tsdb: stats: part %s: its index holds %" PRIu64 " rows, its footer says %" PRIu64 "\n", p->name,
                 rows, p->rows);
@@ -1131,7 +1133,9 @@ void sscx_run(sscx *x, const uint32_t *ids, size_t m, tsdb_series_stat *out, uin
                 if (resident) { /* a series' granules are contiguous in a part: one mincore for the run */
                     uint64_t off0 = gix_get(g, a, GF_OFF);
                     uint64_t off1 = gix_get(g, b - 1, GF_OFF) + gix_get(g, b - 1, GF_TSLEN) + gix_get(g, b - 1, GF_VALLEN);
-                    if (off1 > off0 && off1 <= p->map_len)
+                    if (off1 > off0 && p->ec) /* R7: an .ec part's granules are in the tier's cache */
+                        o->resident_bytes += eccache_resident(p, off0, off1 - off0);
+                    else if (off1 > off0 && off1 <= p->map_len)
                         o->resident_bytes += resident_bytes_range(p->map + off0, off1 - off0);
                     *probes += 1 + (off1 > off0 ? (off1 - off0) / 4096 / 16 : 0); /* a syscall and its page vector */
                 }

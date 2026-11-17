@@ -26,6 +26,9 @@
  *    a recently created part or segment is not hidden by a cached "not found".
  */
 #include "internal.h"
+#include "ecgc.h"
+#include "eckeep.h"
+#include "ecpart.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -115,6 +118,23 @@ int manifest_publish(eng *db)
     return rc;
 }
 
+int graveyard_add(eng *db, const char *name, int kind, int64_t deadline)
+{
+    if (db->ngraveyard == db->graveyard_cap) {
+        size_t cap = db->graveyard_cap ? db->graveyard_cap * 2 : 64;
+        graveyard_entry *g = realloc(db->graveyard, cap * sizeof *g);
+        if (!g)
+            return TSDB_ERR_NOMEM;
+        db->graveyard = g;
+        db->graveyard_cap = cap;
+    }
+    graveyard_entry *e = &db->graveyard[db->ngraveyard++];
+    snprintf(e->name, sizeof e->name, "%s", name);
+    e->deadline = deadline;
+    e->kind = (uint8_t)kind;
+    return 0;
+}
+
 /* Takes p out of service. It stays readable under its retired name until its
  * lifetime has passed, for followers that still use it. Caller holds db->lock. */
 void db_retire_locked(eng *db, part *p)
@@ -126,27 +146,20 @@ void db_retire_locked(eng *db, part *p)
     if (renameat(db->dirfd, p->name, db->dirfd, retired) != 0) {
         /* still listed after a reopen: a dropped part would come back */
         eng_fail(db, "rename of a replaced part to retired_", errno);
-    } else if (db->opt.obsolete_part_lifetime_s <= 0) {
-        /* The name goes at once, even where a query still maps the file: a crash while that reference is held
-         * must not list a dropped part again (nothing covers it). The file itself is deleted when the last
-         * reference goes, under its retired name, which an open never lists. */
-        p->retired = true;
-        atomic_store(&p->obsolete, true);
     } else {
-        if (db->ngraveyard == db->graveyard_cap) {
-            size_t cap = db->graveyard_cap ? db->graveyard_cap * 2 : 64;
-            graveyard_entry *g = realloc(db->graveyard, cap * sizeof *g);
-            if (g) {
-                db->graveyard = g;
-                db->graveyard_cap = cap;
-            }
+        if (p->ec)
+            ecgc_retire_locked(db, p); /* R7: retired_<name>.ec; its object goes with it (r7-gc) */
+        if (db->opt.obsolete_part_lifetime_s <= 0) {
+            /* The name goes at once, even where a query still maps the file: a crash while that reference is held
+             * must not list a dropped part again (nothing covers it). The file itself is deleted when the last
+             * reference goes, under its retired name, which an open never lists. */
+            p->retired = true;
+            atomic_store(&p->obsolete, true);
+        } else {
+            /* an unrecorded one (out of memory) is collected at the next open */
+            (void)graveyard_add(db, retired, p->ec ? GY_EC : GY_PART,
+                                mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000);
         }
-        if (db->ngraveyard < db->graveyard_cap) {
-            graveyard_entry *e = &db->graveyard[db->ngraveyard++];
-            snprintf(e->name, sizeof e->name, "%s", retired);
-            e->deadline = mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000;
-        }
-        /* an unrecorded one is collected at the next open */
     }
     db_parts_remove_locked(db, p);
 }
@@ -177,9 +190,14 @@ void graveyard_purge(eng *db, bool all)
     size_t kept = 0;
     for (size_t i = 0; i < db->ngraveyard; i++) {
         graveyard_entry *e = &db->graveyard[i];
-        if (all || e->deadline <= now)
+        bool done;
+        if (e->kind == GY_EC) /* R7: a retired .ec part (r7-gc) */
+            done = ecgc_purge_entry(db, e, all, now);
+        else if (e->kind == GY_SETTLED) /* R7: a settle's source (r7-keep) */
+            done = eckeep_purge_entry(db, e, all, now);
+        else if ((done = all || e->deadline <= now))
             unlinkat(db->dirfd, e->name, 0);
-        else
+        if (!done)
             db->graveyard[kept++] = *e;
     }
     if (kept != db->ngraveyard)
@@ -318,6 +336,8 @@ static int cmp_part_order(const void *x, const void *y)
 /* Opens a part by its active name or, if the writer has just retired it, by its retired name. */
 static int open_listed_part(eng *db, const char *name, part **out)
 {
+    if (ec_file_name(name))
+        return ecpart_follower_open(db, name, out); /* R7: a follower does not read .ec parts (D7) */
     int rc = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, out);
     if (rc == TSDB_ERR_NOTFOUND) {
         char retired[256];
