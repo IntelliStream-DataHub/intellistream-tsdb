@@ -216,6 +216,7 @@ uint64_t repl_written(const struct repl *r);
 uint64_t repl_durable_end(const struct repl *r);
 uint64_t repl_applied(const struct repl *r);
 uint64_t repl_commit(const struct repl *r);
+unsigned long repl_debug(const struct repl *r, char *buf, unsigned long cap);
 int repl_failed(const struct repl *r);
 
 /* The metadata group's rules. An ISR change applies only if it names the current epoch, ISR version and leader, and

@@ -74,7 +74,11 @@
  * names another file) is that file's, and an fsync then makes the renamed file durable.
  *
  * With CRASHFS_AT_EXIT=1 the power also fails as the process exits normally:
- * what a command reported done must already be durable.
+ * what a command reported done must already be durable. With $CRASHFS_EXIT_MARK set, the process that rolled
+ * back at its exit creates `<that path>.<pid>` (per pid: a helper the process started inherits the shim and
+ * rolls back on its own), so a harness can tell an exit that was a power cut from a `_exit`, which skips the
+ * destructor and cuts nothing.
+ * With $CRASHFS_EIO_DIR, only files below that directory fail (CRASHFS_EIO_ONLY and it both apply).
  *
  * With CRASHFS_MODE=misdirect there is no power loss; instead, with
  * probability $CRASHFS_MD_RATE per write, pwrite, read or pread of a regular
@@ -134,7 +138,7 @@ typedef struct file {
     int ndirty, capdirty;
     bool used;
     bool lying; /* after an injected EIO: syncs succeed without making anything durable */
-    struct old_sector *old; /* CRASHFS_TEAR: durable sectors rewritten since the last sync, as they were */
+    struct old_sector *old; /* CRASHFS_TEAR or the old-bytes default: durable sectors rewritten since the last sync, as they were */
     size_t nold, capold;
 } file;
 
@@ -174,7 +178,7 @@ static double md_rate, md_map_rate;
 static int md_files; /* 0: every file, 1: parts only, 2: all but parts */
 static char md_log[PATH_MAX];
 static char lying_dir[PATH_MAX]; /* a directory whose syncs lie after the error */
-static char mark[PATH_MAX], eio_only[64], eio_on[16];
+static char mark[PATH_MAX], eio_only[64], eio_on[16], eio_dir[PATH_MAX], exit_mark[PATH_MAX];
 static unsigned mark_slow_ms; /* CRASHFS_MARK_SLOW_MS: the mark file is created this long before its line is written (a thread that waits for a CPU does the same) */
 static char *fdpath[MAX_FDS];
 static file *files;
@@ -319,6 +323,10 @@ __attribute__((constructor)) static void init(void)
         snprintf(eio_only, sizeof eio_only, "%s", getenv("CRASHFS_EIO_ONLY"));
     if (getenv("CRASHFS_EIO_ON"))
         snprintf(eio_on, sizeof eio_on, "%s", getenv("CRASHFS_EIO_ON"));
+    if (getenv("CRASHFS_EIO_DIR"))
+        snprintf(eio_dir, sizeof eio_dir, "%s", getenv("CRASHFS_EIO_DIR"));
+    if (getenv("CRASHFS_EXIT_MARK"))
+        snprintf(exit_mark, sizeof exit_mark, "%s", getenv("CRASHFS_EXIT_MARK"));
     if (getenv("CRASHFS_MARK"))
         snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
     if (getenv("CRASHFS_MARK_SLOW_MS"))
@@ -802,6 +810,8 @@ static bool eio_now(int fd, const char *what)
         return false;
     if (eio_on[0] && strcmp(what, eio_on) != 0)
         return false;
+    if (eio_dir[0] && (strncmp(fdpath[fd], eio_dir, strlen(eio_dir)) != 0 || fdpath[fd][strlen(eio_dir)] != '/'))
+        return false;
     eio_done = true;
     crash_requested = 0;
     struct stat st;
@@ -840,6 +850,13 @@ __attribute__((destructor)) static void fini(void)
         return;
     pthread_mutex_lock(&lock); /* never released: no thread writes after this */
     rollback();
+    if (exit_mark[0]) {
+        char mp[PATH_MAX + 16];
+        snprintf(mp, sizeof mp, "%s.%d", exit_mark, (int)getpid());
+        int m = real_open(mp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (m >= 0)
+            real_close(m);
+    }
     static const char msg[] = "crashfs: at exit, unsynced data lost\n";
     if (real_write(2, msg, sizeof msg - 1) < 0) {
     }

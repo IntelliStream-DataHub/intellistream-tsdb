@@ -7,7 +7,10 @@
  *
  * is armed by the environment, read once per process: TSDB_CRASH_AT=name[:n] ends the process with `_exit(99)` at the
  * n-th time that point is passed (default 1), after one line on stderr ("tsdbd: crash point NAME (hit N): exiting
- * with status 99") that the harness counts. 99 is crashfs's power loss too and no signal's (a SIGSEGV is a bug, and
+ * with status 99") that the harness counts. TSDB_CRASH_AT=name[:n]@path counts the passes only once the file `path`
+ * exists (one stat per pass of the armed point until it does): a harness arms a process at its start and triggers the
+ * point later, without the restart that would cost a replicated volume's leader its leadership (jepsen-cluster's last
+ * fault on the leader of its replicated volume). 99 is crashfs's power loss too and no signal's (a SIGSEGV is a bug, and
  * jepsen tells the two apart). An unknown name ends the process with status 2 at the first crash_point(): a typo in a
  * harness must not pass as a point that never fired.
  *

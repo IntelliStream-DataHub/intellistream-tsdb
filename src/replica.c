@@ -337,7 +337,10 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
             rc = TSDB_ERR_IO;
         db->wal_off = segs[nseg - 1].end;
     }
-    db->wal_open_removed = db->wal_flushed = nseg ? segs[0].seq - 1 : parts_seq;
+    db->wal_open_removed = nseg ? segs[0].seq - 1 : parts_seq;
+    /* segments up to parts_seq are in parts (flushes go in segment order; a large write's parts carry no segment):
+     * MANIFEST says so, or a reader of the directory would take the rows of a kept segment over a later delete */
+    db->wal_flushed = MAX(db->wal_open_removed, parts_seq);
     rp->durable_next = db->fno_next; /* synced above (fsync on): the files' bytes are durable now */
     rp->log_next = db->fno_next;
     rp->sealed_seq = parts_seq;
@@ -1625,6 +1628,10 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
             eng_fail(db, "a COMMIT marker that cannot be tracked", EIO);
     }
     pthread_mutex_unlock(&rp->mu);
+    if (rc == 0 && fresh) /* readers of the directory start on the new segment, as at a writer's (mt_flush); no I/O
+                             under rp->mu. A failed write fails the engine; NOMEM returns without (the record is
+                             durable, the caller stops the volume all the same). */
+        rc = manifest_publish(db);
     return rc;
 }
 

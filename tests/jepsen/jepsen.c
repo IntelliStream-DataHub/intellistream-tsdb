@@ -3,9 +3,29 @@
  * A Jepsen-style test of tsdbd: clients write and read through the network
  * while a nemesis crashes the server, and a checker verifies the history.
  *
- *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|none] [--seconds 20]
+ *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|settle-steps|none] [--seconds 20]
  *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]
- *          [--verify-checksums] [--auth] [--feed]
+ *          [--verify-checksums] [--auth] [--feed] [--tier N]
+ *
+ * Tier (--tier N; R7, docs/design-cluster-data.md 10.2): the database has a directory tier, N store directories
+ * (DIR/tier/s0 ...; k + m = N with m = N / 3, so 3 = 2+1 and 6 = 4+2), given to every tsdbd, the CLI and the final
+ * in-process open as TSDB_TEST_TIER=k=..,m=..,dirs=..,grace_s=1,keep_s=5,eager=1 with TSDB_TEST_TIER_I_KNOW=1 (the
+ * eager policy settles a key as soon as it is a second old: kv's keys are old from the start, and its writes keep
+ * merges selectable, so no other policy would settle anything). With the tier the workloads send more deletes,
+ * replaces and large inserts (also into old keys, which a settle has taken or is taking), and the run ends with a
+ * settle check (tier_check): `.ec` parts, `settled_` and `retired_*.ec` files in DIR and the settle lines in the
+ * server logs (JEPSEN_SETTLE_LINE, default "settled ") must reach a minimum (JEPSEN_MIN_SETTLES; 0 turns it off, for
+ * a tsdbd without settles), so a run in which nothing settled fails: it tested nothing of the tier. The parts per
+ * partition at the end are reported (settled parts count toward insert backpressure, finding 11). A kv or classes
+ * run with the tier reads the database as it lies on disk: no follower (a follower refuses a tier volume, D7), and
+ * classes' final "one part per partition" is only "no fewer rows than keys" (an `.ec` part is never merged).
+ * The eio nemesis may hit a store file: a failed store stops that process's settles and nothing else (the server
+ * goes on, reads go on), so a failure on a file under DIR/tier needs no fail-stop, and the minimum is 1.
+ * settle-steps (needs --tier and --crashfs): every faulty tsdbd starts with TSDB_SETTLE_CRASH_AT=<step>[:n] (after-put,
+ * after-ec-tmp, after-intent, between-renames, before-unlink) and CRASHFS_AT_EXIT=1 (no random power loss): it ends
+ * at that step with exit 99, which the shim turns into a power cut (everything not synced is rolled back), the
+ * nemesis restarts it with the next step, and a server that has not reached its step in SETTLE_WAIT_S is killed. A
+ * random power cut seldom lands inside a swap that lasts milliseconds; this one always does.
  *
  * Change feed (--feed; docs/design-cdc.md, step F1): before the first server the CLI (`tsdb DIR feed enable`) turns the
  * feed on, so every WAL segment the engine is done with is kept as fwal_<seq>.log instead of being unlinked. Before every
@@ -148,6 +168,7 @@
 #include "tsdb_client.h"
 
 #include <dirent.h>
+#include <glob.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -491,6 +512,20 @@ static int64_t ffail_longest;       /* ns, the longest run of failed follower re
 /* misdirect and rot: damage the database; each epoch (a forked child) runs on a fresh directory and ends early once
  * the damage is persistent (even a server without faults refuses the directory or fails the final read) */
 static bool md, rot;                /* --nemesis misdirect / rot */
+/* --tier N: a directory tier of N stores (see the header). settle_steps: --nemesis settle-steps. */
+static int tier_n;
+static bool settle_steps;
+static char tier_root[PATH_MAX];    /* DIR/tier, as an absolute path: the stores are tier_root/s<i> */
+static const char *const settle_step_names[] = {"after-put", "after-ec-tmp", "after-intent", "between-renames",
+                                                "before-unlink"};
+#define NSTEPS 5
+#define SETTLE_WAIT_S 12            /* a server that has not reached its armed step by then is killed and restarted */
+static int cur_step = -1;           /* the step the current server is armed with, -1: none */
+static int64_t up_ns;               /* when the current server came up */
+static int step_crashes[NSTEPS], step_unreached, step_armed[NSTEPS];
+static int step_nocut;              /* servers that ended at their step with exit 99 but no power cut (a `_exit`) */
+static int store_eios;              /* eio with the tier: faults that landed on a file of a store */
+static char exitmark[PATH_MAX];     /* crashfs creates exitmark.<pid> when the process rolled back at its exit */
 static bool verify;                 /* --verify-checksums: tsdbd checks granule payloads */
 static int epoch;
 static const char *md_files = "all"; /* CRASHFS_MD_FILES of this epoch */
@@ -660,7 +695,7 @@ static uint32_t key_limit(int s)
 }
 
 /* Series that write into the past as well (classes: the odd ones; their memtables then hold old rows too). */
-static int near_pct(int s) { return s % 2 ? 70 : 97; }
+static int near_pct(int s) { return tier_n ? (s % 2 ? 40 : 75) : (s % 2 ? 70 : 97); } /* the tier: more into old keys */
 
 /* ----------------------------------------------------------- the server */
 
@@ -918,6 +953,25 @@ __attribute__((noreturn)) static void bail(int code)
     exit(code);
 }
 
+/* A server armed with a settle step ended with exit 99: that is a power cut only if crashfs rolled back in its
+ * destructor, which runs on exit() and not on _exit(): the hook must leave through exit(99). Without the rollback the
+ * step reached was a plain crash, and what it is meant to test (a cut inside the swap) never happened. */
+static bool step_reached(int step, pid_t pid)
+{
+    char mp[PATH_MAX + 16];
+    snprintf(mp, sizeof mp, "%s.%d", exitmark, (int)pid);
+    if (access(mp, F_OK) == 0) {
+        unlink(mp);
+        step_crashes[step]++;
+        return true;
+    } else {
+        step_nocut++;
+        fprintf(stderr, "  step %s: the server ended with exit 99 and crashfs did not roll back (a _exit?)\n",
+                settle_step_names[step]);
+    }
+    return false;
+}
+
 static void start_server_run(bool faulty)
 {
     char pms[32], pf[PATH_MAX];
@@ -931,12 +985,20 @@ static void start_server_run(bool faulty)
     for (int attempt = 0;; attempt++) {
         unlink(markpath); /* an EIO while opening: the clean server of the second attempt has no fault */
         unlink(pullpath);
+        char arm[48] = "";
+        cur_step = -1;
+        if (settle_steps && faulty && crashfs && attempt == 0) { /* this server ends at a settle step, as a power cut */
+            uint64_t q = mix(seed * 7919 + (uint64_t)restarts * 31 + 5);
+            cur_step = (int)(q % NSTEPS);
+            snprintf(arm, sizeof arm, "%s:%d", settle_step_names[cur_step], 1 + (int)((q >> 20) % 3));
+            step_armed[cur_step]++;
+        }
         th_portfile(pf, sizeof pf, dir);
         char follow[64];
         th_follow_me(follow, sizeof follow);
         { /* the log of an epoch is appended to (misdirect, rot, outage, keep): this server's lines begin where the file ends now */
             struct stat lsb;
-            slog_from = (md || rot || outage || getenv("JEPSEN_KEEP")) && !getenv("JEPSEN_VERBOSE") && stat(slogpath, &lsb) == 0 ? (long)lsb.st_size : 0;
+            slog_from = (md || rot || outage || tier_n || getenv("JEPSEN_KEEP")) && !getenv("JEPSEN_VERBOSE") && stat(slogpath, &lsb) == 0 ? (long)lsb.st_size : 0;
         }
         pid_t pid = fork();
         if (pid == 0) {
@@ -956,8 +1018,14 @@ static void start_server_run(bool faulty)
                 setenv("CRASHFS_SEED", sd, 1);
                 setenv("CRASHFS_PROB", crash_prob(), 1);
                 setenv("CRASHFS_WARMUP", "200", 1);
-                if (!strcmp(nemesis, "power") && restarts % 2 == 1)
+                if ((!strcmp(nemesis, "power") || settle_steps) && restarts % 2 == 1)
                     setenv("CRASHFS_TEAR", "1", 1); /* every other server: keep what a real disk may keep */
+                if (arm[0]) { /* no random power loss: the settle step is the cut, and the shim rolls back at exit */
+                    setenv("CRASHFS_PROB", "0", 1);
+                    setenv("CRASHFS_AT_EXIT", "1", 1);
+                    setenv("CRASHFS_EXIT_MARK", exitmark, 1);
+                    setenv("TSDB_SETTLE_CRASH_AT", arm, 1);
+                }
                 if (md) {
                     setenv("CRASHFS_MODE", "misdirect", 1);
                     /* low enough that a server lives a while between faults (0.002 ended most epochs at once) */
@@ -968,7 +1036,12 @@ static void start_server_run(bool faulty)
                 if (!strcmp(nemesis, "eio")) {
                     setenv("CRASHFS_MODE", "eio", 1);
                     setenv("CRASHFS_MARK", markpath, 1);
-                    if (restarts % 2 == 0) /* every other server: the WAL, where an error must stop it */
+                    if (tier_n) { /* the WAL, any file, a file of a store (a store's failure stops no server) in turn */
+                        if (restarts % 3 == 0)
+                            setenv("CRASHFS_EIO_ONLY", "wal_", 1);
+                        else if (restarts % 3 == 2)
+                            setenv("CRASHFS_EIO_DIR", tier_root, 1);
+                    } else if (restarts % 2 == 0) /* every other server: the WAL, where an error must stop it */
                         setenv("CRASHFS_EIO_ONLY", "wal_", 1);
                 }
             }
@@ -979,7 +1052,8 @@ static void start_server_run(bool faulty)
                 setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=2000,spawn=60000", 1);
             if (!getenv("JEPSEN_VERBOSE")) { /* kept for a server that does not come up */
                 bool keep = getenv("JEPSEN_KEEP") != NULL;
-                int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot || outage || keep ? O_APPEND : O_TRUNC), 0644);
+                int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot || outage || keep || tier_n ? O_APPEND : O_TRUNC),
+                               0644); /* the tier: tier_check counts the settle lines of every server of the run */
                 if (lfd < 0)
                     lfd = open("/dev/null", O_WRONLY);
                 else if (keep) { /* JEPSEN_KEEP: every server's log, each headed by when it started */
@@ -1030,6 +1104,7 @@ static void start_server_run(bool faulty)
         atomic_store(&server_starting, false);
         if (p > 0) {
             atomic_store(&port, p);
+            up_ns = now_ns();
             if (server_faulty)
                 lives_faulty++;
             return;
@@ -1076,6 +1151,11 @@ static void start_server_run(bool faulty)
                            (WEXITSTATUS(st) == 99 || (WEXITSTATUS(st) == 1 && !strcmp(nemesis, "eio") && access(markpath, F_OK) == 0));
             if (planned) { /* crashed while starting (power loss at open, an EIO at open): a clean one */
                 lives_died_starting++;
+                if (!strcmp(nemesis, "power") || settle_steps)
+                    note_death(th_status, false, pid);
+                if (settle_steps && cur_step >= 0 && WIFEXITED(th_status) && WEXITSTATUS(th_status) == 99 &&
+                    step_reached(cur_step, pid))
+                    nem_fault(); /* the settle at open (a recovery of one) reached its step */
                 if (getenv("JEPSEN_VERBOSE"))
                     fprintf(stderr, "jepsen: %d died while starting\n", (int)pid);
                 continue;
@@ -1860,7 +1940,8 @@ static void *client(void *arg)
         int s = (int)(r % (uint64_t)nseries);
         if (outage) /* a client works one volume only: one stuck in a hung volume's calls must not hold back the rest */
             s = (s & ~1) | (int)((intptr_t)arg % 2);
-        if ((r >> 8) % 100 < 6) { /* a delete or a replace of a key range */
+        const uint64_t td = tier_n ? 8 : 0; /* the tier: more deletes and replaces, which a settle must survive */
+        if ((r >> 8) % 100 < 6 + td) { /* a delete or a replace of a key range */
             uint32_t id = atomic_fetch_add(&nwrites, 1);
             if (id >= MAX_OPS)
                 break;
@@ -1907,7 +1988,7 @@ static void *client(void *arg)
                 tsdbc_close(c);
                 c = connect_retry();
             }
-        } else if (latest_on && (r >> 8) % 100 < 12) { /* nulls over a key range, near the top: the newest row's null */
+        } else if (latest_on && (r >> 8) % 100 < 12 + td) { /* nulls over a key range, near the top: the newest row's null */
             uint32_t id = atomic_fetch_add(&nwrites, 1);
             if (id >= MAX_OPS)
                 break;
@@ -1941,7 +2022,7 @@ static void *client(void *arg)
                 tsdbc_close(c);
                 c = connect_retry();
             }
-        } else if (latest_on && (r >> 8) % 100 < 20) { /* the newest row of every series, in one request */
+        } else if (latest_on && (r >> 8) % 100 < 20 + td) { /* the newest row of every series, in one request */
             uint32_t base = atomic_fetch_add(&nlats, (uint32_t)nseries);
             if (base + (uint32_t)nseries > MAX_LATEST)
                 break;
@@ -1977,8 +2058,9 @@ static void *client(void *arg)
                     c = connect_retry();
                 }
             }
-        } else if ((r >> 8) % 100 < 60) { /* a write */
-            uint32_t n = (r >> 16) % 100 < 85 ? 1 + (uint32_t)((r >> 24) % 20) : 400 + (uint32_t)((r >> 24) % 2600);
+        } else if ((r >> 8) % 100 < 60 + td) { /* a write */
+            uint32_t n = (r >> 16) % 100 < (tier_n ? 65 : 85) ? 1 + (uint32_t)((r >> 24) % 20)
+                                                               : 400 + (uint32_t)((r >> 24) % 2600);
             uint32_t id = atomic_fetch_add(&nwrites, 1);
             if (id >= MAX_OPS)
                 break;
@@ -2894,7 +2976,7 @@ static void *nemesis_thread(void *arg)
             usleep(500000);
         else
             nap(mnap ? mnap : idle_mutant_long ? 5000000 : 150000 + (useconds_t)(r % 600000) + slow,
-                (((!strcmp(nemesis, "power") && crashfs) || !strcmp(nemesis, "eio")) && !idle_mutant && !idle_mutant_long && !mnap) ||
+                (((!strcmp(nemesis, "power") && crashfs) || settle_steps || !strcmp(nemesis, "eio")) && !idle_mutant && !idle_mutant_long && !mnap) ||
                     md);
         if (!late && (atomic_load(&stop) || atomic_load(&nem_stop)))
             break;
@@ -2994,6 +3076,33 @@ static void *nemesis_thread(void *arg)
             if (!strncmp(mm, "busysleep:", 10)) /* sleeps inside the fault step with the new server up (and maybe dead) */
                 usleep((useconds_t)atoi(mm + 10) * 1000);
             nem_idle_ns += now_ns() - step0 - waited;
+        } else if (settle_steps) {
+            /* the server ends by itself at its armed step (exit 99 after the shim's rollback); one that has not
+             * reached it in SETTLE_WAIT_S has nothing to settle or settles too slowly: killed, the next arming
+             * follows (counted, and a run in which most were unreached fails in tier_check) */
+            pid_t pid = atomic_load(&server_pid);
+            int st = 0;
+            bool gone = reap_server(pid, &st, WNOHANG) == pid, killed = false;
+            /* a server with no step (the clean one after an armed server died while starting) is replaced after a
+             * few seconds and not counted as one that never reached a step */
+            if (!gone && now_ns() - up_ns > (int64_t)(cur_step >= 0 ? SETTLE_WAIT_S : 3) * 1000000000LL) {
+                signal_pid(pid, SIGKILL);
+                reap_server(pid, &st, 0);
+                gone = killed = true;
+                step_unreached += cur_step >= 0;
+                nem_attempt_span(up_ns, now_ns()); /* it was waiting for its step: at work, though no fault */
+            }
+            if (!gone)
+                nem_touch(); /* an armed server is the fault still to come: the nemesis is at work while it waits */
+            if (gone) {
+                if (!killed && cur_step >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 99 && step_reached(cur_step, pid))
+                    nem_fault_span(up_ns, now_ns()); /* a confirmed cut: the shim rolled back at the server's exit */
+                note_death(st, killed, pid);
+                server_gone();
+                start_server(true);
+                restarts++;
+                nem_touch();
+            }
         } else if (!strcmp(nemesis, "eio")) {
             pid_t pid = atomic_load(&server_pid);
             int st = 0;
@@ -3060,7 +3169,10 @@ static void *nemesis_thread(void *arg)
                  * about 220 ms on a quiet machine and seconds with 16 busy loops on 4 CPUs (an honest loaded run ended on a bound of
                  * 1 s: a harness bound that load breaks), so the wait for it is EIO_STOP_WAIT_S. An unpublished part (tmp_) or an intent
                  * (txn_) fails just the call and the server stays: a second is all it is given there. */
-                bool survives = !strncmp(base, "tmp_", 4) || !strncmp(base, "txn_", 4);
+                bool in_store = tier_n && !strncmp(failed, tier_root, strlen(tier_root)) &&
+                                failed[strlen(tier_root)] == '/';
+                store_eios += in_store;
+                bool survives = in_store || !strncmp(base, "tmp_", 4) || !strncmp(base, "txn_", 4); /* a store's failure stops no server */
                 int64_t fs0 = now_ns();
                 atomic_fetch_add(&nem_inprog, 1); /* the fault is still being carried out until the server has stopped */
                 int stop_wait_s = EIO_STOP_WAIT_S;
@@ -3082,12 +3194,18 @@ static void *nemesis_thread(void *arg)
                     if (!ours && (!WIFEXITED(st) || WEXITSTATUS(st) != 1)) {
                         eio_problems++;
                         fprintf(stderr, "  after EIO on %s the server ended with status %#x, not exit 1\n", failed, st);
+                    } else if (!ours && in_store) { /* r7-tier: the store fails, the server and its reads go on */
+                        eio_problems++;
+                        fprintf(stderr, "  after EIO on %s, a file of a store, the server stopped: only the store is "
+                                "to fail\n", failed);
                     }
                 } else {
                     /* only an unpublished part (tmp_) or an intent whose name was never synced (txn_) fails
                      * just the call; the WAL, MANIFEST, the dictionaries, a volume's META and the directory are
                      * relied upon (class b in docs/design.md): fail-stop */
-                    if (strncmp(base, "tmp_", 4) && strncmp(base, "txn_", 4)) {
+                    /* a file of a store: the store fails (no more puts and deletes, no more settles in this
+                     * process, r7-tier) and reads go on: the server is not to stop */
+                    if (!in_store && strncmp(base, "tmp_", 4) && strncmp(base, "txn_", 4)) {
                         eio_problems++;
                         fprintf(stderr, "  after EIO on %s the server is still running after %d s\n", failed, EIO_STOP_WAIT_S);
                     }
@@ -3234,6 +3352,8 @@ static double nem_rate(void)
 {
     if (outage)
         return 0.11;
+    if (settle_steps) /* a server settles when it settles: tier_check judges the steps reached, the floor is one cut */
+        return 0;
     if (!strcmp(nemesis, "kill"))
         return 1.0;
     if (!strcmp(nemesis, "pause"))
@@ -3243,6 +3363,12 @@ static double nem_rate(void)
     if (!strcmp(nemesis, "eio"))
         return 0.4;
     return 0.3;
+}
+
+static int cmp_size(const void *a, const void *b)
+{
+    size_t x = *(const size_t *)a, y = *(const size_t *)b;
+    return (x > y) - (x < y);
 }
 
 /* The longest a server may be listening with no fault issued or in progress and no restart by the nemesis (honest: 0.65 to 0.85 s
@@ -4268,12 +4394,15 @@ static int final_state(uint32_t *final)
  * as many rows as the final state has keys and answer the final state: a (series, time) with rows in two
  * partitions would count twice. */
 struct cls_tally {
-    uint64_t rows, parts[4], crows[4];
+    uint64_t rows, ec_rows, parts[4], crows[4];
 };
 static void tally_part(void *ctx, const tsdb_part_info *in)
 {
     struct cls_tally *t = ctx;
     t->rows += in->rows;
+    size_t nl = in->name ? strlen(in->name) : 0;
+    if (nl > 3 && !strcmp(in->name + nl - 3, ".ec"))
+        t->ec_rows += in->rows;
     if (in->cls >= 0 && in->cls < 4)
         t->parts[in->cls]++, t->crows[in->cls] += in->rows;
 }
@@ -4375,13 +4504,187 @@ static int check_classes(const uint32_t *final)
         t.rows++;
     if (other.err)
         VIOLATION("classes: in-process read of a series that is not the workload's failed (%d)\n", other.err);
-    if (t.rows != keys + other.rows)
-        VIOLATION("classes: after tsdb_optimize the parts hold %llu rows, the final state %llu (and %llu of series that are not the "
-                  "workload's): rows of one (series, time) in two partitions\n", (unsigned long long)t.rows, (unsigned long long)keys,
-                  (unsigned long long)other.rows);
+    /* With the tier an `.ec` part is never merged, so a newer part may overlap it and a row of one key sit in two
+     * parts of one partition: every such duplicate has an older copy in an `.ec` part, so the rows beyond the final
+     * state are at most those of the `.ec` parts. A (series, time) in two keys beyond that bound is still caught here;
+     * below it only the open's check of every part against CLASSES (cls_check_parts) judges it: part info has no
+     * per-series ranges. With no `.ec` part the equality holds as without the tier. */
+    if (tier_n ? (t.rows < keys + other.rows || t.rows > keys + other.rows + t.ec_rows) : t.rows != keys + other.rows)
+        VIOLATION("classes: after tsdb_optimize the parts hold %llu rows (%llu in .ec parts), the final state %llu (and %llu of series that are not the "
+                  "workload's): rows of one (series, time) in two partitions\n", (unsigned long long)t.rows,
+                  (unsigned long long)t.ec_rows, (unsigned long long)keys, (unsigned long long)other.rows);
     if (switches == 0 || used < 2) /* the workload did too little (a machine that starves the clients writes a dozen rows in 20 s): no violation */
         INCONCLUSIVE("classes-coverage", "classes: %u switches, parts in %u classes: the workload tested no change of class\n", switches,
                      used);
+    return violations - before;
+}
+
+/* ---------------------------------------------------------------- the tier */
+
+/* What a settle leaves in a database directory, and in the server logs. Counts the names of DIR (not below it: the
+ * stores are in DIR/tier and hold chunks, not parts) and the lines of LOG that contain PAT, and the parts per
+ * partition: p<partition>_<min>_<max>_<level>.part or .ec, a `settled_` or `retired_` prefix for what a settle or a
+ * merge left. */
+struct tier_part {
+    int64_t partition;
+    int kind; /* 0 part, 1 .ec, 2 settled_, 3 retired_ (any), 4 retired_*.ec */
+};
+
+static int cmp_tier_part(const void *a, const void *b)
+{
+    const struct tier_part *x = a, *y = b;
+    return (x->partition > y->partition) - (x->partition < y->partition);
+}
+
+struct tier_counts {
+    unsigned ec, settled, retired_ec, lines;
+    size_t nparts, nlive; /* names counted per partition; those of them that are listed (a part or an .ec) */
+    size_t nlivepart;     /* partitions with a listed part */
+    struct tier_part *parts;
+};
+
+static bool ends_with(const char *s, const char *suf)
+{
+    size_t a = strlen(s), b = strlen(suf);
+    return a >= b && !strcmp(s + a - b, suf);
+}
+
+static void tier_scan(const char *d, const char *log, const char *pat, struct tier_counts *c)
+{
+    memset(c, 0, sizeof *c);
+    DIR *dp = opendir(d);
+    size_t cap = 256;
+    c->parts = malloc(cap * sizeof *c->parts);
+    struct dirent *e;
+    while (dp && (e = readdir(dp))) {
+        const char *n = e->d_name;
+        int kind;
+        bool is_ec = ends_with(n, ".ec");
+        if (!strncmp(n, "settled_", 8)) {
+            n += 8;
+            kind = 2;
+            c->settled++;
+        } else if (!strncmp(n, "retired_", 8)) {
+            n += 8;
+            kind = is_ec ? 4 : 3;
+            c->retired_ec += is_ec;
+        } else if (n[0] == 'p' && (is_ec || ends_with(n, ".part"))) {
+            kind = is_ec;
+            c->ec += is_ec;
+        } else {
+            continue;
+        }
+        long long part = 0, lo, hi;
+        unsigned lvl;
+        /* a retired_ name keeps its source's: retired_p<N>_..., or retired_<something>: only the first form counts */
+        if (n[0] != 'p' || sscanf(n, "p%lld_%lld_%lld_%u", &part, &lo, &hi, &lvl) != 4)
+            continue;
+        if (c->nparts == cap)
+            c->parts = realloc(c->parts, (cap *= 2) * sizeof *c->parts);
+        c->parts[c->nparts++] = (struct tier_part){part, kind};
+        c->nlive += kind <= 1;
+    }
+    if (dp)
+        closedir(dp);
+    FILE *f = log ? fopen(log, "r") : NULL;
+    char line[2048];
+    while (f && fgets(line, sizeof line, f))
+        c->lines += strstr(line, pat) != NULL;
+    if (f)
+        fclose(f);
+    qsort(c->parts, c->nparts, sizeof *c->parts, cmp_tier_part);
+    for (size_t i = 0; i < c->nparts;) {
+        size_t j = i;
+        bool live = false;
+        while (j < c->nparts && c->parts[j].partition == c->parts[i].partition)
+            live |= c->parts[j++].kind <= 1;
+        c->nlivepart += live;
+        i = j;
+    }
+}
+
+/* At the end of a run with the tier: report, and fail a run in which nothing settled. */
+static int tier_check(void)
+{
+    int before = violations;
+    const char *pat = getenv("JEPSEN_SETTLE_LINE") ? getenv("JEPSEN_SETTLE_LINE") : "settled ";
+    struct tier_counts c;
+    tier_scan(dir, slogpath, pat, &c);
+    /* the minimum: a few settles in any run of a minute (the eager policy settles 30 a minute at most, and a key
+     * needs its merge round first); the eio nemesis fails a store now and then, and a failed store stops the settles of
+     * that process until the next start, so there one is enough. */
+    unsigned want = seconds >= 100 ? 5 : seconds >= 40 ? 3 : 1;
+    if (!strcmp(nemesis, "eio"))
+        want = 1;
+    if (getenv("JEPSEN_MIN_SETTLES"))
+        want = (unsigned)atoi(getenv("JEPSEN_MIN_SETTLES"));
+    printf("tier: %d stores; at the end %u .ec, %u settled_ and %u retired_*.ec files; %u settle lines (\"%s\") in "
+           "the server logs; at least %u wanted\n", tier_n, c.ec, c.settled, c.retired_ec, c.lines, pat, want);
+    /* parts per partition: one entry per name that stands for a part of the partition (listed, or kept by a settle) */
+    size_t nparts = 0, minp = SIZE_MAX, maxp = 0, worst_n = 0;
+    int64_t worst = 0;
+    size_t counts[65536], nc = 0;
+    for (size_t i = 0; i < c.nparts;) {
+        size_t j = i, live = 0;
+        while (j < c.nparts && c.parts[j].partition == c.parts[i].partition)
+            live += c.parts[j++].kind <= 1;
+        if (live) {
+            nparts++;
+            if (live < minp)
+                minp = live;
+            if (live > maxp) {
+                maxp = live;
+                worst = c.parts[i].partition;
+                worst_n = j - i;
+            }
+            if (nc < sizeof counts / sizeof *counts)
+                counts[nc++] = live;
+        }
+        i = j;
+    }
+    if (nparts) {
+        qsort(counts, nc, sizeof *counts, cmp_size);
+        printf("tier: parts per partition at the end: %zu partitions, %zu listed parts (%u of them .ec), per partition "
+               "min %zu, median %zu, max %zu (partition %lld: %zu listed, and %zu settled_ or retired_ names waiting "
+               "out their keep time or a retire; DIR only: kv and classes have no volumes)\n",
+               nparts, c.nlive, c.ec, minp, counts[nc / 2], maxp, (long long)worst, maxp, worst_n - maxp);
+    } else {
+        printf("tier: no part files at the end\n");
+    }
+    unsigned files = c.ec + c.settled + c.retired_ec;
+    if (want > 0 && files == 0)
+        VIOLATION("tier: no .ec, settled_ or retired_*.ec file at the end: nothing settled (or all of it was removed)\n");
+    if (c.lines < want)
+        VIOLATION("tier: %u settle lines (\"%s\") in the server logs, at least %u wanted in %.0f s: nothing, or too "
+                  "little, settled\n", c.lines, pat, want, seconds);
+    if (tier_n && !strcmp(nemesis, "eio")) {
+        printf("tier: %d EIOs landed on a file of a store\n", store_eios);
+        unsigned min_eios = getenv("JEPSEN_MIN_STORE_EIOS") ? (unsigned)atoi(getenv("JEPSEN_MIN_STORE_EIOS")) : 1;
+        if (want > 0 && seconds >= 20 && (unsigned)store_eios < min_eios)
+            VIOLATION("tier: %d faults on a file of a store in %.0f s, at least %u wanted: the eio nemesis never hit "
+                      "a store\n", store_eios, seconds, min_eios);
+    }
+    if (settle_steps) {
+        unsigned crashes = 0;
+        printf("settle-steps: servers armed / ended there:");
+        for (int i = 0; i < NSTEPS; i++) {
+            printf(" %s %d/%d", settle_step_names[i], step_armed[i], step_crashes[i]);
+            crashes += (unsigned)step_crashes[i];
+        }
+        printf("; %d killed after %d s without reaching their step; %d ended with exit 99 and no power cut\n",
+               step_unreached, SETTLE_WAIT_S, step_nocut);
+        if (step_nocut)
+            VIOLATION("settle-steps: %d servers ended at their step with exit 99 and crashfs did not roll back: the "
+                      "hook must leave through exit(99), a _exit cuts no power\n", step_nocut);
+        if (getenv("JEPSEN_MIN_SETTLES") == NULL || want > 0) {
+            if (seconds >= 20 && crashes == 0)
+                VIOLATION("settle-steps: no server ended at its armed step in %.0f s: the nemesis cut nothing\n", seconds);
+            if (seconds >= 20 && (unsigned)step_unreached > crashes + 3)
+                VIOLATION("settle-steps: %d servers never reached their step, %u did: too few settles to cut\n",
+                          step_unreached, crashes);
+        }
+    }
+    free(c.parts);
     return violations - before;
 }
 
@@ -4659,13 +4962,55 @@ static int epochs(void)
     return 0;
 }
 
+/* --tier N: N store directories inside DIR (under the shim of a power run too: crashfs's root is DIR), and the two
+ * variables for every process of the run: the servers, the CLI and the in-process opens of this one. DIR is made now
+ * (tsdbd takes an existing one). m = N / 3 stores may be lost (3 = 2+1, 6 = 4+2). The settle policy is the eager one
+ * with a short grace and keep time (see the header). */
+static int tier_setup(void)
+{
+    int m = tier_n / 3, k = tier_n - m;
+    if ((mkdir(dir, 0755) != 0 && errno != EEXIST) || !realpath(dir, tier_root)) {
+        fprintf(stderr, "jepsen: cannot make %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    char dirs[16 * PATH_MAX], d[PATH_MAX + 64];
+    size_t at = 0;
+    if (strlen(tier_root) + 8 >= sizeof tier_root) {
+        fprintf(stderr, "jepsen: the path of %s is too long\n", dir);
+        return 1;
+    }
+    strcat(tier_root, "/tier");
+    if (mkdir(tier_root, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "jepsen: cannot make %s: %s\n", tier_root, strerror(errno));
+        return 1;
+    }
+    for (int i = 0; i < tier_n; i++) {
+        snprintf(d, sizeof d, "%s/s%d", tier_root, i);
+        if ((mkdir(d, 0755) != 0 && errno != EEXIST) || at + strlen(d) + 2 >= sizeof dirs) {
+            fprintf(stderr, "jepsen: cannot make store %s: %s\n", d, strerror(errno));
+            return 1;
+        }
+        at += (size_t)snprintf(dirs + at, sizeof dirs - at, "%s%s", i ? ":" : "", d);
+    }
+    char *spec = malloc(sizeof dirs + 256);
+    const char *extra = getenv("JEPSEN_TIER_EXTRA"); /* more settings of the grammar, e.g. coarse_s=60 */
+    snprintf(spec, sizeof dirs + 256, "k=%d,m=%d,dirs=%s,grace_s=1,keep_s=5,eager=1%s%s", k, m, dirs,
+             extra && *extra ? "," : "", extra && *extra ? extra : "");
+    setenv("TSDB_TEST_TIER", spec, 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+    printf("tier: %d stores, k=%d m=%d, TSDB_TEST_TIER=%s\n", tier_n, k, m, spec);
+    free(spec);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     static struct option opts[] = {{"dir", required_argument, 0, 'd'},     {"nemesis", required_argument, 0, 'n'},
                                    {"seconds", required_argument, 0, 't'}, {"clients", required_argument, 0, 'c'},
                                    {"seed", required_argument, 0, 's'},    {"crashfs", required_argument, 0, 'f'},
                                    {"workload", required_argument, 0, 'w'}, {"verify-checksums", no_argument, 0, 'V'},
-                                   {"feed", no_argument, 0, 'E'},
+                                   {"feed", no_argument, 0, 'E'},           {"tier", required_argument, 0, 'T'},
+                                   {"scan-tier", required_argument, 0, 'S'},
                                    {"auth", no_argument, 0, 'A'},           {"outagefs", required_argument, 0, 'o'},
                                    {"mutant-idle", no_argument, 0, 'I'},
                                    {"mutant-longnap", no_argument, 0, 'L'},
@@ -4690,6 +5035,17 @@ int main(int argc, char **argv)
         case 'V': verify = true; break;
         case 'A': auth = true; break;
         case 'E': feed = true; break;
+        case 'T': tier_n = atoi(optarg); break;
+        case 'S': { /* the self-test of tier_scan: DIR,LOG,PATTERN prints ec, settled, retired_ec, lines, partitions */
+            char *a = strdup(optarg), *c2 = strrchr(a, ','), *c1 = c2 ? (*c2 = 0, strrchr(a, ',')) : NULL;
+            if (!c1)
+                return 2;
+            *c1 = 0;
+            struct tier_counts tc;
+            tier_scan(a, c1 + 1, c2 + 1, &tc);
+            printf("%u %u %u %u %zu %zu\n", tc.ec, tc.settled, tc.retired_ec, tc.lines, tc.nlivepart, tc.nlive);
+            return 0;
+        }
         case 'I': idle_mutant = true; break;
         case 'L': idle_mutant_long = true; break;
         case 'M': nem_mutant = optarg; break;
@@ -4709,12 +5065,16 @@ int main(int argc, char **argv)
     md = !strcmp(nemesis, "misdirect");
     rot = !strcmp(nemesis, "rot");
     outage = !strcmp(nemesis, "outage");
-    bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || md || outage;
+    settle_steps = !strcmp(nemesis, "settle-steps");
+    bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || md || outage || settle_steps;
     if (!dir || (shim && !outage && !crashfs) || (outage && (!outagefs_lib || classes || auth)) ||
-        ((md || rot) && classes)) {
-        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|none] [--seconds S]\n"
-                        "              [--clients N] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]\n"
-                        "              [--verify-checksums]   (misdirect and rot: workload kv) [--auth] [--feed]\n"
+        ((md || rot) && classes) || tier_n < 0 || (tier_n && (tier_n < 3 || outage || md || rot || verify)) ||
+        (settle_steps && !tier_n)) {
+        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|settle-steps|none]\n"
+                        "              [--seconds S] [--clients N] [--seed N] [--crashfs build/libcrashfs.so]\n"
+                        "              [--workload kv|classes] [--verify-checksums]   (misdirect and rot: workload kv)\n"
+                        "              [--auth] [--feed] [--tier N]   (N stores, at least 3; not with outage, misdirect, rot or\n"
+                        "              --verify-checksums; settle-steps needs it)\n"
                         "              [--outagefs build/liboutagefs.so]   (outage: workload kv, no login)\n");
         return 2;
     }
@@ -4769,6 +5129,7 @@ int main(int argc, char **argv)
     rm_cmd = cmd;
     snprintf(markpath, sizeof markpath, "%s.eio", dir);
     snprintf(pullpath, sizeof pullpath, "%s.pulls", dir);
+    snprintf(exitmark, sizeof exitmark, "%s.cut", dir);
     if (md || rot)
         snprintf(slogpath, sizeof slogpath, "%s.e%d.server.log", dir, epoch);
     else
@@ -4789,6 +5150,8 @@ int main(int argc, char **argv)
     nseries = classes ? CL_SERIES : NSERIES;
     make_keys();
     fnull = calloc(koff[nseries] + 1, 1);
+    if (tier_n && tier_setup()) /* before the CLI runs: every process of the run has the tier's variables */
+        return 2;
     if (auth && make_users())
         return 2;
     if (outage && make_volumes())
@@ -4819,7 +5182,7 @@ int main(int argc, char **argv)
     }
 
     pthread_t th[256], nem, fr;
-    if (!strcmp(nemesis, "power")) {
+    if (!strcmp(nemesis, "power") && !tier_n) { /* a follower refuses a volume with a tier (D7) */
         snprintf(flogpath, sizeof flogpath, "%s.follower.log", dir);
         freads = calloc(MAX_FREADS, sizeof *freads);
         atexit(kill_follower);
@@ -4991,6 +5354,8 @@ int main(int argc, char **argv)
         v = epoch_report(v, ok);
     if (classes)
         v += check_classes(final);
+    if (tier_n)
+        v += tier_check();
     if (!strcmp(nemesis, "eio")) {
         printf("eio: %d fail-stops\n", failstops);
         v += eio_problems;
@@ -5019,6 +5384,16 @@ int main(int argc, char **argv)
     JP_PHASE("the cleanup (rm -rf of the directory)");
     unlink(markpath);
     unlink(pullpath);
+    {
+        glob_t g; /* exitmark.<pid> of servers that were stopped, not read */
+        char pat[PATH_MAX + 8];
+        snprintf(pat, sizeof pat, "%s.*", exitmark);
+        if (glob(pat, 0, NULL, &g) == 0) {
+            for (size_t i = 0; i < g.gl_pathc; i++)
+                unlink(g.gl_pathv[i]);
+            globfree(&g);
+        }
+    }
     if (samp_on) {
         atomic_store(&samp_stop, true);
         join_bounded(samp_th, "the disk sampler", 30);

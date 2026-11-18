@@ -854,9 +854,11 @@ rewind-mutants:
 meta-mutants: $(B)/test_meta_mut
 	tests/meta_mutants.sh $(B)/test_meta_mut
 # the replication driver's mutants (server/repld.c TSDB_REPLD_MUTANT): each must fail test_cluster replindet or
-# replicate; ackbeforesync is known to survive (it loses data only under power loss of replicas: r3e)
+# replicate, or ackdurable (power loss of the replicas) or writerfail (D13 on the writer), or repcheck (floor, unsure
+# REPL, admit check, fast path, a peer's cursor below what it acknowledged); hbnoclamp is not listed: no scenario delays a link yet
 repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
-	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(or $(TMPDIR),/tmp) commitbyleader floornotsaved
+	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(or $(TMPDIR),/tmp) commitbyleader floornotsaved ackbeforesync nodepose noquiesce floornottold \
+	    unsureignored admitnocheck nofastpath nocursorup
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(or $(TMPDIR),/tmp)
@@ -1133,6 +1135,12 @@ JEPSEN_SECONDS ?=
 # The outage nemesis's seeds: a seed fixes the fault schedule, so more seeds test more than repeats of one do (the weekly CI
 # run sets six; a run with a flapping domain spends minutes waiting for its 60 s, and what it does in them is the seed's).
 JEPSEN_OUTAGE_SEEDS ?= 1 2
+# The directory tier (R7; tests/jepsen/jepsen.c, --tier N: N stores, 3 = 2+1, 6 = 4+2): kill, power, eio and
+# settle-steps (a power cut at each step of a settle) on both workloads and both backends, under the eager policy, and
+# the run fails when nothing settled. Empty until the tree has settles (src/ names TSDB_SETTLE_MUTANT, r7-settle's
+# mutant): before that every tier run would fail its settle count, as it is meant to. JEPSEN_TIER= turns it off.
+JEPSEN_TIER ?= $(if $(shell grep -l TSDB_SETTLE_MUTANT src/*.c 2>/dev/null),3 6,)
+JEPSEN_TIER_SEEDS ?= 1 2
 # Then kv once more with login (--auth: USERS made by $(B)/tsdb, every client logs in at every reconnect) under kill
 # and one power seed, per backend.
 jsec = $(if $(JEPSEN_SECONDS),$(JEPSEN_SECONDS),$(1))
@@ -1150,6 +1158,17 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 	    TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis eio   --seconds $(call jsec,20) \
 	        --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis pause --seconds $(call jsec,20) && \
+	    for n in $(JEPSEN_TIER); do \
+	        echo "== tsdbd --io $$io, workload $$wl, a tier of $$n stores" && \
+	        TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --tier $$n --nemesis kill \
+	            --seconds $(call jsec,20) && \
+	        for seed in $(JEPSEN_TIER_SEEDS); do \
+	            TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --tier $$n --nemesis power \
+	                --seconds $(call jsec,20) --seed $$seed --crashfs $(B)/libcrashfs.so && \
+	            TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --tier $$n --nemesis settle-steps \
+	                --seconds $(call jsec,30) --seed $$seed --crashfs $(B)/libcrashfs.so || exit 1; done && \
+	        TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --tier $$n --nemesis eio \
+	            --seconds $(call jsec,20) --crashfs $(B)/libcrashfs.so || exit 1; done && \
 	    if [ $$wl = kv ]; then \
 	        for seed in $(JEPSEN_OUTAGE_SEEDS); do \
 	            TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis outage --seconds $(call jsec,40) \
@@ -1363,6 +1382,28 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	        env FAILSTART_AT=$$at FAILSTART=damage JEPSEN_TSDBD=tests/jepsen/failstart-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest $$args || exit 1; fi; \
 	    rm -f $(JEPSEN_DIR)-selftest.failstart-count; \
 	done; \
+	    d=$(JEPSEN_DIR)-selftest.tier; rm -rf $$d; mkdir -p $$d/tier; \
+	    (cd $$d && touch p0_1_1_0.part p0_2_3_1.ec p1_1_1_0.ec settled_p0_1_1_0.part retired_p0_1_1_0.part \
+	        retired_p2_1_1_0.ec tmp_1_1.part tier/p9_1_1_0.ec); \
+	    printf '%s\n' 'tsdb: x' 'tsdb: settled p0 (3 granules)' 'tsdb: settled p1' 'tsdb: unsettled' > $$d.log; \
+	    a=$$(./$(B)/jepsen --scan-tier $$d,$$d.log,'settled ' 2>&1); \
+	    if [ "$$a" != "2 1 1 2 2 3" ]; then echo "jepsen-selftest: the count of .ec, settled_ and retired_ files and settle lines is wrong ($$a)"; exit 1; fi; \
+	    out=$$(JEPSEN_TSDBD=tests/jepsen/nosettle-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis kill \
+	        --seconds 8 --tier 3 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'tier: 0 settle lines'; then \
+	        echo "jepsen-selftest: a tier run in which nothing settled went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    $(CC) -shared -fPIC -o $$d/fakestep.so tests/jepsen/fakestep.c -lpthread || exit 1; \
+	    out=$$(FAKE_SO=$$(realpath $$d)/fakestep.so FAKE_EXIT=_exit JEPSEN_TSDBD=tests/jepsen/fakestep-tsdbd.sh JEPSEN_MIN_SETTLES=1 \
+	        ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis settle-steps --crashfs $(B)/libcrashfs.so --seconds 25 --tier 3 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'crashfs did not roll back' || ! echo "$$out" | grep -q 'no .ec, settled_'; then \
+	        echo "jepsen-selftest: a settle step that ends with _exit (no power cut) and a tier with settle lines but no file went unnoticed (rc $$rc)"; \
+	        echo "$$out" | tail -n 20; exit 1; fi; \
+	    out=$$(FAKE_SO=$$(realpath $$d)/fakestep.so FAKE_EXIT=exit FAKE_FILES=1 JEPSEN_TSDBD=tests/jepsen/fakestep-tsdbd.sh JEPSEN_MIN_SETTLES=1 \
+	        ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis settle-steps --crashfs $(B)/libcrashfs.so --seconds 25 --tier 3 2>&1); rc=$$?; \
+	    if [ $$rc -ne 0 ] || ! echo "$$out" | grep -Eq 'ended there:.* [1-9][0-9]*/[1-9]'; then \
+	        echo "jepsen-selftest: the settle-steps nemesis fails a server that ends at its step with exit(99) (rc $$rc)"; \
+	        echo "$$out" | tail -n 20; exit 1; fi; \
+	    JEPSEN_REQUIRE_TIER=$(if $(strip $(JEPSEN_TIER)),1,0) tests/jepsen/mutant-settle.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a settle bug went unnoticed"; exit 1; }; \
 	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; }; \
 	    echo "jepsen-selftest: ok"
 
@@ -1370,20 +1411,24 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 # front of every peer port, nemeses kill, partition, pause, midcommit (crash points, server/crashpt.h) and power
 # (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
 # each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
-$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/harness.h server/cluster.h server/meta.h server/crashpt.h \
-    $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/tsdb_crypto.o $(CLIB) $(LIB) \
-	    $(LDLIBS)
+$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
+    server/crashpt.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
+	    $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 # on a disk, never /tmp (a tmpfs: a failing run keeps the state of five nodes there, and a power run never syncs)
 JEPSEN_CLUSTER_DIR ?= /var/tmp/tsdb-jepsen-cluster-$(shell printf %s "$(CURDIR)" | cksum | cut -d" " -f1)
 JEPSEN_NEMESES ?= kill partition pause midcommit power
 JEPSEN_SEED ?= 1
 JEPSEN_NODES ?= 5
+# kv-local runs its nodes with TSDB_CLUSTER_WRITES=1, kv and classes with the replication driver: separate runs
+JEPSEN_CLUSTER_WORKLOADS ?= meta,kv-local meta,kv meta,classes
 jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
-	for io in $(IO); do for nem in $(JEPSEN_NEMESES); do echo "== tsdbd --io $$io, nemesis $$nem"; \
+	for io in $(IO); do for wl in $(JEPSEN_CLUSTER_WORKLOADS); do for nem in $(JEPSEN_NEMESES); do \
+	    echo "== tsdbd --io $$io, workloads $$wl, nemesis $$nem"; \
 	    TSDBD=./$(B)/tsdbd TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
-	        --nemesis $$nem --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so || exit 1; \
-	    done; done
+	        --nemesis $$nem --workload $$wl --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
+	        || exit 1; \
+	    done; done; done
 
 # The harness has to notice what it is meant to: a port file that names another pid, a client that skips the check
 # of the port it connected to while a foreign server holds the node's old one (and the same client with the check:
@@ -1419,6 +1464,12 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
 	out=$$($$j --mutant lost-write --seconds 12 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a lost write'; then \
 	        echo "jepsen-cluster-selftest: a write missing from the final state went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant rep-lost-write --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "the leader's final read"; then \
+	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant rep-half-batch --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'half of a large write'; then \
+	        echo "jepsen-cluster-selftest: half of an acknowledged large write in a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-checker 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: a check of the histories or the election check does not find what it is for (rc $$rc)"; echo "$$out" | tail -n 30; exit 1; fi; \

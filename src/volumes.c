@@ -3216,24 +3216,28 @@ int tsdb_get_stats(tsdb *t, tsdb_stats *st)
     return 0;
 }
 
+/* The per-volume inspections take a meta reference and let go of the read lock before they walk the engine: the
+ * walk takes db->lock, and a repld volume thread takes the read lock (tsdb_cvol_ref) under its mutex, which a writer
+ * holding buf_lock waits for, under db->lock (tsan: test_cluster writerfail, whose failed volume tsdbd's failwatch
+ * inspects). A meta reference keeps the engine from being freed without holding up tsdb_volume_idle: these answer for
+ * a failed or quiesced volume too. */
 int tsdb_get_volume_stats(tsdb *t, uint32_t volume, tsdb_volume_stats *st)
 {
     pthread_rwlock_rdlock(&t->lock);
-    int rc = volume < t->nvols && t->vols[volume] ? eng_get_volume_stats(t->vols[volume], st) : TSDB_ERR_INVALID;
+    eng *e EREFM = volume < t->nvols && t->vols[volume] ? eng_ref_meta(t->vols[volume]) : NULL;
     pthread_rwlock_unlock(&t->lock);
-    return rc;
+    return e ? eng_get_volume_stats(e, st) : TSDB_ERR_INVALID;
 }
 
 int tsdb_get_latest_stats(tsdb *t, uint32_t volume, tsdb_latest_stats *st)
 {
     pthread_rwlock_rdlock(&t->lock);
-    int rc = TSDB_ERR_INVALID;
-    if (volume < t->nvols && t->vols[volume]) {
-        latest_info(t->vols[volume], st);
-        rc = 0;
-    }
+    eng *e EREFM = volume < t->nvols && t->vols[volume] ? eng_ref_meta(t->vols[volume]) : NULL;
     pthread_rwlock_unlock(&t->lock);
-    return rc;
+    if (!e)
+        return TSDB_ERR_INVALID;
+    latest_info(e, st);
+    return 0;
 }
 
 int tsdb_stats_settle(tsdb *t, int timeout_ms)
