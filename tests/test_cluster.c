@@ -3674,6 +3674,13 @@ static void *flood_thread(void *a)
             break;
         }
         __atomic_add_fetch(&f->rounds, 1, __ATOMIC_RELEASE); /* rejoin reads it while this runs */
+#if defined(__SANITIZE_THREAD__)
+        /* Under TSan the catch-up of a restarted replica is slowed several times more than a client's write into a
+         * tmpfs: two writers of 1000-row inserts outran it, and rejoinsteady's learner never got close enough to join
+         * in 30 s, with the old tick rule as with the new (2026-11-18, /tmp a tmpfs: 2 of 3 and 1 of 3 runs). The
+         * writes still never pause; they come at most 100 a second per writer. */
+        nanosleep(&(struct timespec){0, 10000000}, NULL);
+#endif
     }
     return NULL;
 }
