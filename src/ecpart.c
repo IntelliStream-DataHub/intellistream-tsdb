@@ -7,29 +7,39 @@
  */
 #include "ecpart.h"
 
+#include <stdio.h>
 #include <stdlib.h>
+
+atomic_uint_fast64_t ec_calls[EC_CALL_N];
 
 int ecpart_load(eng *db, const char *name, bool read_only, part **out)
 {
-    (void)db;
-    (void)name;
+    EC_CALLED(EC_CALL_LOAD);
     (void)read_only;
-    *out = NULL; /* left alone, as load_parts leaves every name that is not a part's */
-    return 0;
+    *out = NULL;
+    fprintf(stderr, "tsdb: %s/%s is an erasure-coded part, which this build cannot read: the open fails\n", db->dir,
+            name);
+    return TSDB_ERR_CORRUPT;
 }
 
 int ecpart_follower_open(eng *db, const char *name, part **out)
 {
+    EC_CALLED(EC_CALL_FOLLOWER_OPEN);
     (void)db;
     (void)name;
     *out = NULL;
     return TSDB_ERR_CORRUPT; /* part_open_as of an .ec file: not a part (the follower keeps its previous view) */
 }
 
-bool ec_index_intact(const part *p) { return part_map_intact(p); }
+bool ec_index_intact(const part *p)
+{
+    EC_CALLED(EC_CALL_INDEX_INTACT);
+    return part_map_intact(p);
+}
 
 int ec_cls_record(eng *db, const part *p)
 {
+    EC_CALLED(EC_CALL_CLS_RECORD);
     (void)db;
     (void)p;
     return 0;
@@ -52,6 +62,8 @@ int eng_test_mark_ec(eng *db, part *p, unsigned flags)
             rc = 0;
             break;
         }
+    if (rc == 0 && p->merging)
+        rc = TSDB_ERR_LOCKED; /* the merge would meet an .ec source (pw_copy_granule) and fail */
     if (rc == 0 && (flags & EC_MARK_EC) && !p->ec) {
         struct ecpart *e = calloc(1, sizeof *e);
         if (!e) {
@@ -60,7 +72,7 @@ int eng_test_mark_ec(eng *db, part *p, unsigned flags)
             e->test_mark = true;
             e->tier = db->tier;
             e->volume = db->tier_vol;
-            p->ec = e;
+            atomic_store_explicit(&p->ec, e, memory_order_release); /* readers run beside this store */
         }
     }
     if (rc == 0)

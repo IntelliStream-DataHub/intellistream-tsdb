@@ -56,7 +56,19 @@ int tier_from_strings(const char *spec, const char *iknow, tier_cfg *c);
 /* tier_from_strings(getenv("TSDB_TEST_TIER"), getenv("TSDB_TEST_TIER_I_KNOW"), c) */
 int tier_from_env(tier_cfg *c);
 
-typedef struct tier tier;
+/* A tier. Its owners' state hangs off one pointer each, made by the owner's open hook and freed by its close hook (in
+ * the owner's own file), so no two tracks edit this struct or tier.c's open and close: tier_open calls
+ * eccache_tier_open, ecgc_tier_open, ecsettle_tier_open in that order (a failure: the tier is put, which runs every
+ * close), the last tier_put calls the closes in the reverse order, each also for an owner whose open never ran or
+ * failed (its pointer is then NULL), and tier_quiesce calls ecsettle_tier_quiesce. r7-tier adds the backend's
+ * fields. */
+typedef struct tier {
+    atomic_uint refs;
+    tier_cfg cfg;
+    struct eccache_tier *cache;   /* r7-seam: the granule cache and the open objects (src/eccache.c) */
+    struct ecgc_tier *gc;         /* r7-gc: the delete queue the settle thread works (src/ecgc.c) */
+    struct ecsettle_tier *settle; /* r7-settle: the settle thread (src/settle.c) */
+} tier;
 
 /* tsdb_open's: *out NULL when no tier is configured, else a tier holding the caller's reference. A configuration the
  * build cannot serve (no TSDB_EC) is refused with a line. dir: the database, for messages. */
@@ -76,7 +88,10 @@ int tier_engine_attach(eng *db);
 void tier_engine_detach(eng *db);
 
 /* The per-engine state of R7's files, db->ecstate (made by tier_engine_attach when the engine has a tier). One pointer
- * per owner, each defined in its own file, so no two tracks edit one struct. */
+ * per owner, each defined in its own file, so no two tracks edit one struct. tier_engine_attach calls ecgc_eng_open,
+ * eckeep_eng_open, ecsettle_eng_open, ecswap_eng_open in that order, right after META is read (before recovery and
+ * load_parts); a failure fails the open, whose eng_close runs tier_engine_detach, which calls the four closes in the
+ * reverse order, each also for an owner whose open never ran or failed (its pointer NULL), then frees ecstate. */
 struct ecstate {
     struct ecgc_eng *gc;         /* r7-gc: the delete queue (src/ecgc.c) */
     struct eckeep_eng *keep;     /* r7-keep: settled_* digests (src/eckeep.c) */

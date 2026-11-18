@@ -814,9 +814,11 @@ typedef struct part {
     size_t nlf;
     /* R7 (src/ecpart.h): NULL for a .part. Set for an .ec part, whose map holds the source's header, index, tombstones
      * and footer verbatim (the granule bytes are in the chunk store, read through ec_granule_read), and for a part
-     * eng_test_mark_ec marked in a test (its bytes are still in the map). Set before the part is listed and never
-     * changed while it is: readers test it without a lock. Freed by part_unref (ecgc_last_unref). */
-    struct ecpart *ec;
+     * eng_test_mark_ec marked in a test (its bytes are still in the map). Set before the part is listed and, but for
+     * that test hook, never changed while it is; atomic because readers test it without a lock beside the hook (the
+     * statistics' sweeper and sampler, queries, merges): NULL or the whole ecpart. Freed by part_unref
+     * (ecgc_last_unref). */
+    _Atomic(struct ecpart *) ec;
 } part;
 
 

@@ -20,4 +20,8 @@ uint64_t eccache_part_bytes(const part *p);
  * statistics. Stub: the page cache's residency of the map, as for a .part (0 for a range outside it). */
 uint64_t eccache_resident(const part *p, uint64_t off, uint64_t len);
 
+/* The tier's hooks (src/tier.h): t->cache. Stubs: nothing (counted). eccache_part_bytes runs under db->lock as well
+ * (stats_walk, eng_foreach_part): a number the part keeps, no I/O and no lock. */
+int eccache_tier_open(struct tier *t);
+void eccache_tier_close(struct tier *t);
 #endif

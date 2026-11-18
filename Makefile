@@ -93,8 +93,8 @@ endif
 # baseline of $(ARCH): the AVX2, AVX-512 and GFNI kernels carry target attributes and run only where src/ec/compat.c's
 # iso_cpu_has() says so (tools/check-isa.sh checks that nothing else in them goes beyond x86-64-v2).
 # NO_EC=1 builds an x86-64 engine without it, as the embedded bindings and other machines do (after make clean, or with
-# its own B=): every R7 stub and test must build and pass both ways.
-ifeq ($(shell uname -m)$(NO_EC),x86_64)
+# its own B=): every R7 stub and test must build and pass both ways. Only NO_EC=1 turns it off (NO_EC=0 or empty: on).
+ifeq ($(shell uname -m)$(filter 1,$(NO_EC)),x86_64)
 EC_OBJ := $(B)/ec_gf256.o $(B)/ec_gf256_avx2.o $(B)/ec_gf256_avx512.o $(B)/ec_rs.o $(B)/ec_compat.o
 OBJ  += $(EC_OBJ)
 EC_BENCH := $(B)/ec-bench
@@ -102,7 +102,7 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
-R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/eckeep.h src/ecswap.h src/chunk.h
+R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -392,6 +392,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_chunk_heal $(or $(TMPDIR),/tmp)
 	./$(B)/test_ecnames $(or $(TMPDIR),/tmp)
 	for m in nameloose tierloose; do ! ./$(B)/test_ecnames --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
 	$(if $(EC_OBJ),for m in heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always; do ! ./$(B)/test_chunk_heal --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	tests/test_sync_ec.sh
 	tools/sync-ec.sh --check
@@ -971,6 +972,11 @@ $(B)/test_delete: tests/test_delete.c src/internal.h $(LIB)
 
 $(B)/test_rs: tests/test_rs.c src/internal.h $(EC_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
+
+# whether this build has the erasure codec (test-units-b checks that NO_EC=0 keeps it and NO_EC=1 drops it)
+.PHONY: print-ec
+print-ec:
+	@echo $(if $(EC_OBJ),ec,noec)
 
 # R7's interfaces (r7-iface): the names of .ec parts and settled sources, every near miss; TSDB_TEST_TIER's grammar and
 # its refusal without TSDB_TEST_TIER_I_KNOW=1; the stubs leave a database as today's code does; eng_test_mark_ec

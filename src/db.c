@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Database lifecycle, the active parts list, buffered appends and maintenance. */
 #include "internal.h"
+#include "eccache.h"
 #include "ecgc.h"
 #include "eckeep.h"
 #include "ecpart.h"
@@ -1030,6 +1031,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         open_check = NULL;
         check(db, open_check_arg);
     }
+    if (!ro && db->tier && (rc = ecgc_open_sweep(db)) != 0) /* R7 (D6): orphan chunks, before any thread starts */
+        goto fail;
     if (!ro && db->opt.merge_threads > 0) {
         db->mergers = calloc((size_t)db->opt.merge_threads, sizeof *db->mergers);
         for (int i = 0; db->mergers && i < db->opt.merge_threads; i++)
@@ -1642,7 +1645,7 @@ static void stats_walk(eng *db, tsdb_stats *st, uint64_t *granules, uint64_t *me
             *merging += p->merging;
         st->parts++;
         st->rows += p->rows;
-        st->bytes += p->map_len;
+        st->bytes += p->ec ? eccache_part_bytes(p) : p->map_len; /* R7: what an .ec part counts as its file */
         if (i == 0 || db->parts[i - 1]->partition != p->partition)
             st->partitions++;
     }
@@ -1702,7 +1705,8 @@ int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info),
     for (size_t i = 0; i < n; i++) {
         part *p = ps[i];
         tsdb_part_info info = {.name = p->name, .partition = p->partition, .min_ts = p->min_ts, .max_ts = p->max_ts,
-                               .rows = p->rows, .bytes = p->map_len, .granules = p->ng, .level = p->level,
+                               .rows = p->rows, .bytes = p->ec ? eccache_part_bytes(p) : p->map_len, /* R7 */
+                               .granules = p->ng, .level = p->level,
                                .created_s = p->created, .written_s = p->written,
                                .cls = partition_class(db, p->partition)};
         partition_range(db, p->partition, &info.start_ms, &info.end_ms);

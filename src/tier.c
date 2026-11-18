@@ -2,11 +2,18 @@
 /*
  * The tier of a tsdb handle (src/tier.h has the design). r7-iface: the configuration's parser (pure), the decision
  * of TSDB_TEST_TIER / TSDB_TEST_TIER_I_KNOW, a tier that is a reference count around its configuration, and the
- * engine's attach and detach. r7-tier adds the backend (chunk_be_open2, epoch 1, vuuid=, requires=tier and the
- * refusals of D1 and D7) here; r7-seam the cache and the open objects; r7-settle the settle thread.
+ * engine's attach and detach, which call each owner's hooks (src/tier.h). r7-tier adds the backend (chunk_be_open2,
+ * epoch 1, vuuid=, requires=tier and the refusals of D1 and D7) here; r7-seam's cache, r7-gc's queue and r7-settle's
+ * thread live in their own files, behind the hooks, never here.
  */
 #include "tier.h"
 #include "chunk.h"
+#include "eccache.h"
+#include "ecgc.h"
+#include "eckeep.h"
+#include "ecpart.h"
+#include "ecswap.h"
+#include "settle.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -15,11 +22,6 @@
 #include <string.h>
 
 int r7_mutant;
-
-struct tier {
-    atomic_uint refs;
-    tier_cfg cfg;
-};
 
 void tier_cfg_free(tier_cfg *c)
 {
@@ -232,6 +234,10 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
     }
     atomic_init(&t->refs, 1);
     t->cfg = c;
+    if ((rc = eccache_tier_open(t)) != 0 || (rc = ecgc_tier_open(t)) != 0 || (rc = ecsettle_tier_open(t)) != 0) {
+        tier_put(t); /* every close, the failed owner's included */
+        return rc;
+    }
     *out = t;
     return 0;
 #endif
@@ -248,11 +254,18 @@ void tier_put(tier *t)
 {
     if (!t || atomic_fetch_sub_explicit(&t->refs, 1, memory_order_acq_rel) != 1)
         return;
+    ecsettle_tier_close(t);
+    ecgc_tier_close(t);
+    eccache_tier_close(t);
     tier_cfg_free(&t->cfg);
     free(t);
 }
 
-void tier_quiesce(tier *t) { (void)t; }
+void tier_quiesce(tier *t)
+{
+    if (t)
+        ecsettle_tier_quiesce(t);
+}
 
 const tier_cfg *tier_config(const tier *t) { return t ? &t->cfg : NULL; }
 
@@ -279,11 +292,21 @@ int tier_engine_attach(eng *db)
     db->ecstate = es;
     db->tier = tier_get(t);
     db->tier_vol = want_vol;
+    int rc;
+    if ((rc = ecgc_eng_open(db)) != 0 || (rc = eckeep_eng_open(db)) != 0 || (rc = ecsettle_eng_open(db)) != 0 ||
+        (rc = ecswap_eng_open(db)) != 0)
+        return rc; /* the open fails; its eng_close detaches */
     return 0;
 }
 
 void tier_engine_detach(eng *db)
 {
+    if (db->ecstate) {
+        ecswap_eng_close(db);
+        ecsettle_eng_close(db);
+        eckeep_eng_close(db);
+        ecgc_eng_close(db);
+    }
     free(db->ecstate);
     db->ecstate = NULL;
     tier_put(db->tier);

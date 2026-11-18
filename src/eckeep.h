@@ -14,4 +14,7 @@ int eckeep_load_settled(eng *db, const char *name, bool read_only);
 /* graveyard_purge, for a GY_SETTLED entry (db->lock held): true when it leaves the list. Stub: unlinked once due. */
 bool eckeep_purge_entry(eng *db, const graveyard_entry *e, bool all, int64_t now);
 
+/* The engine's hooks (src/tier.h): db->ecstate->keep. Stubs: nothing (counted). */
+int eckeep_eng_open(eng *db);
+void eckeep_eng_close(eng *db);
 #endif

@@ -14,4 +14,7 @@
  * intent it cannot parse: a line, and 0 (rolled back: nothing was renamed by it, since nothing writes one yet). */
 int ecswap_recover(eng *db, const char *name, char *buf, size_t len);
 
+/* The engine's hooks (src/tier.h): db->ecstate->swap. Stubs: nothing (counted). */
+int ecswap_eng_open(eng *db);
+void ecswap_eng_close(eng *db);
 #endif

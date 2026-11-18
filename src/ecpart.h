@@ -124,7 +124,10 @@ int ec_index_write(eng *db, const part *src, const ec_record *r, char tmp[96]);
 int part_open_ec(eng *db, const char *file, const char *name, part **out);
 
 /* ------------------------------------------------------------ stubs r7-iface left (src/ecpart.c, r7-ecfile fills) */
-/* load_parts met `name` (ec_file_name): *out a part to list (or NULL to leave the file alone). Stub: NULL, 0. */
+/* load_parts met `name` (ec_file_name): *out a part to list (or NULL to leave the file alone). Stub: a line naming the
+ * file and TSDB_ERR_CORRUPT, which fails the open (load_parts never leaves a part out quietly): this build cannot read
+ * an .ec part, and its rows must not vanish without a word. Whoever fills it keeps that refusal for a volume whose
+ * META lacks requires=tier (r7-tier writes it before the first .ec name; an .ec name without it is damage). */
 int ecpart_load(eng *db, const char *name, bool read_only, part **out);
 /* A follower's MANIFEST names an .ec part: what open_listed_part returns. Stub: TSDB_ERR_CORRUPT (what part_open_as
  * says of an .ec file today; the follower keeps its previous view). r7-tier: the follower stops with one line (D7). */
@@ -139,9 +142,42 @@ void ecpart_free(struct ecpart *e);
 /* ------------------------------------------------------------ test hook (r7-iface's; r7-skip, r7-oracle) */
 enum { EC_MARK_EC = 1, EC_MARK_SETTLING = 2 };
 /* Flags a listed part of db in memory, nothing on disk: EC_MARK_EC gives it a struct ecpart with test_mark (once;
- * never taken back: readers test p->ec without a lock, so mark before queries run on it), EC_MARK_SETTLING sets
- * p->settling (under db->lock; without the flag it is cleared). TSDB_ERR_NOTFOUND when p is not listed,
- * TSDB_ERR_NOMEM. */
+ * never taken back), EC_MARK_SETTLING sets p->settling (under db->lock; without the flag it is cleared).
+ * TSDB_ERR_NOTFOUND when p is not listed, TSDB_ERR_LOCKED when a merge has it (`merging`: the merge would meet an .ec
+ * source and fail), TSDB_ERR_NOMEM. The mark is the one store into p->ec while the part is listed: p->ec is atomic, so
+ * the readers that run beside it (the statistics' sweeper and sampler, queries, merges) see NULL or the whole ecpart.
+ * Merges still select a marked part until r7-skip's barriers: tests that mark run with merge_threads = 0. */
 int eng_test_mark_ec(eng *db, part *p, unsigned flags);
+
+/* ------------------------------------------------------------ call counters (tests/test_ecnames.c) */
+/* Every stub above and in src/{eccache,ecgc,eckeep,ecswap,settle,tier}.c bumps its counter on entry, so the test sees
+ * that each dispatch in a shared file reaches it (a stub does what the old code did: without the counters nothing
+ * could tell a missing branch). Whoever fills a stub keeps its EC_CALLED line. Relaxed increments, on R7's paths only
+ * (a .part never reaches one). */
+enum {
+    EC_CALL_GRANULE_READ,   /* ec_granule_read (part.c granule_read) */
+    EC_CALL_INDEX_INTACT,   /* ec_index_intact (part.c part_index_intact) */
+    EC_CALL_CLS_RECORD,     /* ec_cls_record (classes.c cls_check_parts) */
+    EC_CALL_LOAD,           /* ecpart_load (db.c load_parts) */
+    EC_CALL_FOLLOWER_OPEN,  /* ecpart_follower_open (manifest.c open_listed_part) */
+    EC_CALL_PART_BYTES,     /* eccache_part_bytes (stats.c part_walk, db.c stats_walk and eng_foreach_part) */
+    EC_CALL_RESIDENT,       /* eccache_resident (stats.c sscx_run, stats_hot.c sample_part) */
+    EC_CALL_SWAP_RECOVER,   /* ecswap_recover (part.c intents_recover) */
+    EC_CALL_GC_LOAD,        /* ecgc_load_retired (load_parts) */
+    EC_CALL_GC_RETIRE,      /* ecgc_retire_locked (manifest.c db_retire_locked) */
+    EC_CALL_GC_PURGE,       /* ecgc_purge_entry (manifest.c graveyard_purge) */
+    EC_CALL_GC_LAST_UNREF,  /* ecgc_last_unref (part.c part_unref) */
+    EC_CALL_GC_SWEEP,       /* ecgc_open_sweep (db.c eng_open_sched) */
+    EC_CALL_KEEP_LOAD,      /* eckeep_load_settled (load_parts) */
+    EC_CALL_KEEP_PURGE,     /* eckeep_purge_entry (graveyard_purge) */
+    EC_CALL_ENG_OPEN,       /* each of the four per-engine opens (tier_engine_attach): 4 per engine with a tier */
+    EC_CALL_ENG_CLOSE,      /* each of the four per-engine closes (tier_engine_detach) */
+    EC_CALL_TIER_OPEN,      /* each of the three per-tier opens (tier_open) */
+    EC_CALL_TIER_CLOSE,     /* each of the three per-tier closes (the last tier_put) */
+    EC_CALL_TIER_QUIESCE,   /* ecsettle_tier_quiesce (tier_quiesce, tsdb_close) */
+    EC_CALL_N
+};
+extern atomic_uint_fast64_t ec_calls[EC_CALL_N];
+#define EC_CALLED(k) atomic_fetch_add_explicit(&ec_calls[(k)], 1, memory_order_relaxed)
 
 #endif
