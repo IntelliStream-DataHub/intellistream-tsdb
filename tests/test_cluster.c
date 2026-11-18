@@ -4662,7 +4662,7 @@ static void scen_replindet(void)
     printf("  a write left of unknown outcome by its leader's stop gets a closed connection, never an answer\n");
 }
 
-/* The rows of `id` in [from, to] on server i, once its answer is not UNAVAILABLE (a promotion under way): -1 after ms */
+/* The rows of `id` in [from, to) on server i, once its answer is not UNAVAILABLE (a promotion under way): -1 after ms */
 static int rows_in(int i, tsdb_sid id, int64_t from, int64_t to, int ms)
 {
     uint64_t t0 = now_ms();
@@ -4677,6 +4677,40 @@ static int rows_in(int i, tsdb_sid id, int64_t from, int64_t to, int ms)
             return -1;
         usleep(50000);
     }
+}
+
+/* Says which of the rows t0, t0 + 1000, ... (n of them) server i lacks: a failed check names what it lost */
+static unsigned char *seen_rows;
+static int seen_n;
+static int64_t seen_t0;
+static int mark_rows(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ctx, (void)v;
+    for (size_t k = 0; k < n; k++) {
+        int64_t j = (ts[k] - seen_t0) / 1000;
+        if (j >= 0 && j < seen_n && (ts[k] - seen_t0) % 1000 == 0)
+            seen_rows[j] = 1;
+    }
+    return 0;
+}
+
+static void missing_rows(int i, tsdb_sid id, int64_t t0, int n)
+{
+    seen_rows = calloc((size_t)n + 1, 1);
+    if (!seen_rows)
+        return;
+    seen_n = n, seen_t0 = t0;
+    tsdbc *c = client(i);
+    int rc = tsdbc_query_raw(c, id, t0, t0 + 1000LL * n, mark_rows, NULL);
+    tsdbc_close(c);
+    printf("  server %d (query %s) lacks:", i, ers(rc));
+    for (int j = 0; j < n; j++)
+        if (!seen_rows[j])
+            printf(" row %d (ts %" PRId64 ")", j, (int64_t)(t0 + 1000LL * j));
+    printf("\n");
+    fflush(stdout);
+    free(seen_rows);
+    seen_rows = NULL;
 }
 
 /* design-cluster.md 6.2-6.3 (r3e-failover): the leader of a replicated volume is killed under writes. The Raft leader
@@ -4745,9 +4779,11 @@ static void scen_failover(void)
     snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
     await_log_count(Nw, lead, 1, 30000);
     uint64_t tl = now_ms();
-    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * (acked - 1), 30000);
-    if (got != acked)
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * acked, 30000); /* [from, to): rows 0 .. acked - 1 */
+    if (got != acked) {
+        missing_rows(Nw, id, 1000000, acked);
         die("the new leader (server %d) holds %d of the %d acknowledged rows", Nw, got, acked);
+    }
     printf("  leader %d killed after %d acknowledged rows: the record names server %d at epoch %" PRIu64 " after %" PRIu64
            " ms, which leads after %" PRIu64 " ms and holds every one\n", L, acked, Nw, v.epoch, tr - tk, tl - tk);
     /* the new leader takes writes */
