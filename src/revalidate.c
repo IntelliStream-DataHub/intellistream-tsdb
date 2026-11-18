@@ -16,6 +16,9 @@
  *     its sources back, but an overwrite, a delete or an expiry that was merged into its output is not in them (the
  *     rows would silently revert), and counting rows cannot tell the two apart. What remains is lost: counted,
  *     logged, and the volume stays refused (DIVERGED) until an operator accepts it;
+ *     R7's names: an .ec part is the part of the same name with .part (a settle swaps one for the other with the same
+ *     block range, D2), so either counts as there; settled_* and retired_* files are never listed parts, so they
+ *     neither stand in for a lost part nor count as lost (same_part);
  *   - RETENTION and CLASSES are append-only: the open must apply as many bytes of each as the engine had (reval_logs).
  *
  * What this does not see: a payload damaged inside a part of the right name and size (only the header, index and
@@ -106,6 +109,17 @@ int reval_capture(eng *old, reval_part **out, size_t *n)
     return 0;
 }
 
+/* One part under either of its names: a settle (R7, D2) lists an .ec part under its source's name and block range,
+ * renaming the source settled_<name>.part, and the reopen may find it before or after that swap. A settled_ or
+ * retired_ file is never listed, so it never stands in for a part. */
+static bool same_part(const char *a, const char *b)
+{
+    const char *ea = strrchr(a, '.'), *eb = strrchr(b, '.');
+    if (!ea || !eb || ea - a != eb - b || strncmp(a, b, (size_t)(ea - a)) != 0)
+        return false;
+    return (strcmp(ea, ".part") == 0 || strcmp(ea, ".ec") == 0) && (strcmp(eb, ".part") == 0 || strcmp(eb, ".ec") == 0);
+}
+
 /* After the open: which of the captured parts are gone. Reads neu->parts without a lock: only before its threads
  * start (reval_check_open). */
 void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost, uint64_t *lost_rows)
@@ -115,7 +129,7 @@ void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost,
         bool found = false, covered = false;
         for (size_t j = 0; j < neu->nparts; j++) {
             const part *p = neu->parts[j];
-            if (strcmp(p->name, o->name) == 0) {
+            if (same_part(p->name, o->name)) {
                 found = true;
                 break;
             }

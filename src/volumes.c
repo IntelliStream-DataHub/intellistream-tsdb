@@ -532,10 +532,10 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
         return TSDB_ERR_NOMEM;
     }
     size_t n = 0;
-    for (char *l = txt, *next; *l; l = next) { /* every line but the root's volume number and its old parts */
+    for (char *l = txt, *next; *l; l = next) { /* every line but the root's volume number, its old parts and its uuid (R7) */
         next = strchr(l, '\n');
         next = next ? next + 1 : l + strlen(l);
-        if (strncmp(l, "volume=", 7) != 0 && strncmp(l, "parts_v8=", 9) != 0) {
+        if (strncmp(l, "volume=", 7) != 0 && strncmp(l, "parts_v8=", 9) != 0 && strncmp(l, "vuuid=", 6) != 0) {
             memcpy(buf + n, l, (size_t)(next - l));
             n += (size_t)(next - l);
         }
