@@ -186,7 +186,11 @@ struct repl_durable {
     uint64_t log_start;           /* first position the log still has (0 or 1: all of it); everything below is
                                      applied (in parts): log_start - 1 <= floor. A replica opened from a snapshot at P
                                      has log_start P + 1, log_end P, floor P, and the epoch of P in hist */
-    uint64_t log_end;             /* last position of the durable log (0: empty) */
+    uint64_t log_end;             /* last position of the log (0: empty) */
+    uint64_t hold;                /* 0, or the first position that is not durable although written: a replica's COMMIT
+                                     marker whose files are not staged holds its durable end below it (the driver's
+                                     replica_durable_end + 1). The durable end starts there, not at log_end: an ACK of
+                                     log_end after a restart told the leader the replica held a file it never staged */
     const struct repl_epoch *hist;
     uint32_t nhist;
 };

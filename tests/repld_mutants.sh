@@ -18,7 +18,9 @@
 # moved past the engine's last report) writersync (knobs syncbyhook, synclate); inboxwaitall (a full inbox's every
 # frame waits on the shared link) inboxshared; fastride (the cursor back on a resync only once sent_ms is old) rejoin;
 # nojoinhold (no commit point held for a learner close behind) rejoinsteady; inboxstarve (no inbox time after a tick
-# while the next is due) rejoinslow.
+# while the next is due) rejoinslow; opennohold (a replica's core opens with its whole log durable, past a COMMIT
+# marker whose file it has not staged) reopenhold (knobs dropbulk, nofetch, syncpause, fetchlate); tickstretch (a late
+# tick dropped: the core's clock slower than the wall's under a slow catch-up step) tickwall (knob slowtick).
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -49,6 +51,8 @@ table=(
     "fastride|rejoin|did not join the ISR again in 30 s"
     "nojoinhold|rejoinsteady|did not join the ISR again in 30 s"
     "inboxstarve|rejoinslow|the leader dropped the healthy replica from the ISR while another"
+    "opennohold|reopenhold|the leader dropped the file of a COMMIT marker that a restarted replica had not staged"
+    "tickstretch|tickwall|a member stopped under writes left the ISR only after [0-9]+ ms"
     "keepwritten|replicate|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
     "stopnodepose|closegone|its replicas killed: server [0-9]+ still runs [0-9]+ ms after SIGTERM"
     "lateclock|closegone|the leader wrote no WAL record after its driver stopped"

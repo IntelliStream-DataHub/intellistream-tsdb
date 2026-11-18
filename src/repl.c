@@ -1012,6 +1012,8 @@ struct repl *repl_open(const struct repl_config *cfg, const struct repl_durable 
     r->fence = d->fence;
     r->led = d->led;
     r->written = r->durable = d->log_end;
+    if (d->hold && d->hold <= d->log_end)
+        r->durable = d->hold - 1;
     r->leader = -1;
     for (uint32_t i = 0; i < d->nhist; i++) {
         if ((i && (d->hist[i].epoch <= d->hist[i - 1].epoch || d->hist[i].start <= d->hist[i - 1].start)) ||

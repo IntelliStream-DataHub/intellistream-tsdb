@@ -4009,6 +4009,73 @@ static void scen_rejoin(void) { rejoin_run("rejoin", REJ_GAP); }
 static void scen_rejoinsteady(void) { rejoin_run("rejoinsteady", REJ_STEADY); }
 static void scen_rejoinslow(void) { rejoin_run("rejoinslow", REJ_SLOW); }
 
+/* tickwall (r3d-isr review M1): isr_lag is wall time. The core counts it in ticks, and every catch-up step of the
+ * leader ran inside a tick, a late tick dropped: with a step of 20 ms (TSDB_REPLD_TEST=slowtick, every tick) a core
+ * tick took 25 ms, and a stopped member held the writes for 5 s instead of isr_lag (1 s). Now a late tick is the
+ * clock catching up and runs without a step (mutant tickstretch: the old rule). A member stopped under writes must
+ * leave the ISR within 3.5 s (isr_lag, the ask and the metadata group's round, with room for a slow machine). */
+static void scen_tickwall(void)
+{
+    scenario("tickwall");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=slowtick";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    await_isr(L, "plant", 3, 10000, "every replica up");
+    struct flood f = {cports[L], id, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, flood_thread, &f) != 0)
+        die("pthread_create");
+    struct timespec s1 = {1, 0};
+    nanosleep(&s1, NULL);
+    int R = (L + 1) % 3;
+    pause_server(R, 1);
+    uint64_t t0 = now_ms(), took;
+    while (isr_of(L, "plant", NULL) == 3) {
+        if (now_ms() - t0 > 20000)
+            die("a member stopped under writes: the ISR of plant has 3 members after 20000 ms");
+        struct timespec ms = {0, 10000000};
+        nanosleep(&ms, NULL);
+    }
+    took = now_ms() - t0;
+    pause_server(R, 0);
+    __atomic_store_n(&f.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    if (f.rc != 0)
+        die("a write while a member was stopped: %s", ers(f.rc));
+    if (took > 3500)
+        die("a member stopped under writes left the ISR only after %" PRIu64 " ms (isr_lag 1000 ms): the core's ticks "
+            "ran slower than the wall clock", took);
+    await_isr(L, "plant", 3, 60000, "the stopped member back");
+    tsdbc_close(c);
+    stop_all();
+    for (int i = 0; i < 3; i++)
+        penv[i] = NULL;
+    uint64_t wantr[REP_NAMES] = {(uint64_t)f.rounds * 1000, 0, 0, 0};
+    rep_same(wantr, "after a clean stop");
+    printf("  with a catch-up step of 20 ms at every tick a member stopped under writes left the ISR after %" PRIu64
+           " ms\n", took);
+}
+
 /* The keep caps (design-cluster.md 8.3): a replica out of the ISR holds the leader's flushed segments only for
  * repl_retain_s (2 s here); past it they go, and the replica, back, is told it needs a snapshot and stays a learner. */
 static void scen_keepcap(void)
@@ -4155,6 +4222,111 @@ static void scen_keepfloor(void)
     rep_same(wantr, "after a clean stop");
     printf("  with a replica away the leader keeps its %d flushed segments; the replica back catches up from them and"
            " holds the leader's rows\n", nw);
+}
+
+/* reopenhold: a replica killed with a COMMIT marker in its log whose file it has not staged starts its core with the
+ * durable end below that marker (repl_durable.hold), never at its log end. It did start at the log end: its first ACK
+ * after the restart claimed the whole log, the leader's keep bound passed the marker, the segment and the link the
+ * file is served from went, and the replica asked for the file in vain for the rest of the run (jepsen-cluster kill,
+ * kv and classes, 2026-11-18: "it needs a snapshot", the ISR never whole again). R does not stage the large write's
+ * file (dropbulk) and sends no FETCH (nofetch); its log passes the marker and the leader seals the marker's segment;
+ * R is killed, and back its syncs wait 4 s (syncpause: its ACKs carry the durable end its core opened with) and it
+ * fetches only 5 s late (fetchlate): time enough for the leader, which goes on writing, to save its keep bound by a
+ * false ACK and drop the segment. Mutant opennohold. */
+static void scen_reopenhold(void)
+{
+    scenario("reopenhold");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id0 = rep_series(c, rep_names[0], "plant", 30000), id2 = rep_series(c, rep_names[2], "plant", 30000);
+    uint64_t n[REP_NAMES] = {0};
+    int64_t t = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id0, &t, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    n[0]++;
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    int R = (L + 1) % 3;
+    stop(R, SIGKILL);
+    await_isr(0, "plant", 2, 10000, "a replica killed");
+    penv[R] = "TSDB_REPLD_TEST=dropbulk,nofetch";
+    start(R);
+    penv[R] = NULL;
+    await_open_gen(L, "plant", R, 2, 0);
+    struct rep_writer wb = {cports[L], id2, 2000000000, 0, 0, 0, 100000}; /* above wal_max_batch_rows */
+    rep_write_thread(&wb);
+    if (wb.rc != 0)
+        die("a large write with a replica that drops its file: %s", ers(wb.rc));
+    n[2] += 100000;
+    for (uint64_t t0 = now_ms(); !log_has(R, "withholds the FETCH");) {
+        if (now_ms() - t0 > 20000)
+            die("the replica that dropped the large write's file did not find its COMMIT marker without it in 20 s");
+        struct timespec ms = {0, 50000000};
+        nanosleep(&ms, NULL);
+    }
+    /* the leader seals the marker's segment, and R's log passes its end */
+    if ((rc = tsdbc_flush(c)) != 0)
+        die("flush: %s", ers(rc));
+    for (int k = 0; k < 20; k++) {
+        t += 1000;
+        if ((rc = tsdbc_insert_series(c, id0, &t, &val, 1)) != 0)
+            die("a write after the large one: %s", ers(rc));
+        n[0]++;
+    }
+    struct timespec s15 = {1, 500000000};
+    nanosleep(&s15, NULL);
+    stop(R, SIGKILL);
+    penv[R] = "TSDB_REPLD_TEST=fetchlate,syncpause";
+    start(R);
+    penv[R] = NULL;
+    /* writes go on meanwhile: the leader saves its floor, and with it the keep bound, only as the commit point moves */
+    for (uint64_t t0 = now_ms(); isr_of(L, "plant", NULL) != 3 || !log_has(R, "fetches");) {
+        t += 1000;
+        if ((rc = tsdbc_insert_series(c, id0, &t, &val, 1)) != 0)
+            die("a write while the replica is back: %s", ers(rc));
+        n[0]++;
+        if (log_has(L, "it needs a snapshot"))
+            die("the leader dropped the file of a COMMIT marker that a restarted replica had not staged: it needs a "
+                "snapshot");
+        if (now_ms() - t0 > 60000)
+            die("the replica restarted without the large write's file: ISR %" PRIu32 " members, fetched %d, after "
+                "60000 ms", isr_of(L, "plant", NULL), log_has(R, "fetches"));
+        struct timespec ms = {0, 50000000};
+        nanosleep(&ms, NULL);
+    }
+    struct timespec s1 = {1, 0};
+    nanosleep(&s1, NULL);
+    if (log_has(L, "it needs a snapshot"))
+        die("the leader dropped the file of a COMMIT marker that a restarted replica had not staged: it needs a "
+            "snapshot");
+    t += 1000;
+    if ((rc = tsdbc_insert_series(c, id0, &t, &val, 1)) != 0)
+        die("a write with every replica back: %s", ers(rc));
+    n[0]++;
+    await_isr(0, "plant", 3, 30000, "every replica back");
+    tsdbc_close(c);
+    stop_all();
+    rep_same(n, "after a clean stop");
+    printf("  a replica killed with a COMMIT marker whose file it had not staged acknowledges below it when back; the"
+           " leader keeps the file, the replica fetches it and holds the leader's rows\n");
 }
 
 /* the part files in server i's copy of volume 1 (retired ones too: a merge leaves its sources under retired_) */
@@ -5607,7 +5779,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"keepfloor", scen_keepfloor}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

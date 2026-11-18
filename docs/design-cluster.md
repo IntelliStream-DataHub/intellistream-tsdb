@@ -987,6 +987,18 @@ adds a node to the minimum, so the commit point is never higher than without it,
 learner only when it has every committed position. `test_repl steady_join`, `join_giveup` (MUT 42: no hold), the
 simulator with the hold on in three seeds of four (MUT 41: asked for at the hold's start, killed at seed 1),
 `test_cluster rejoinsteady` (a replica whose ACKs trail by 100 ms joins under two writers; mutant `nojoinhold`).
+`isr_lag_ms` and the hold are counted in the core's ticks, which follow the wall clock: a tick that comes a tick or
+more late (the leader's catch-up step of the tick before took that long) runs without a catch-up step of its own, after
+the inbox had its slice, up to a second of backlog. Before, each tick ran a step and a late tick was dropped, so with
+20 ms catch-up reads a core tick took 25 ms and a stopped member held the writes 5 s (r3d-isr review M1; `test_cluster
+tickwall`, mutant `tickstretch`).
+
+A replica's durable end stops below a COMMIT marker whose files it has not staged, and its core starts there at an
+open too (`repl_durable.hold`), not at its log end: a replica killed between such a marker and the FETCH of its file
+acknowledged its whole log once the leader had verified it, the leader's keep bound passed the marker, and the segment
+and the link the file is served from went; the replica asked for the file for the rest of the run (jepsen-cluster
+kill, kv and classes, 2026-11-18), and its match claimed positions it could not apply (`test_repl open_hold`,
+`test_cluster reopenhold`, mutant `opennohold`).
 
 ### 8.2 A returning replica
 

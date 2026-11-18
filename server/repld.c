@@ -54,7 +54,9 @@
  * `fastride` moves the cursor back on a resync only once sent_ms is RESEND_MS old (rejoin).
  * `nojoinhold` holds no commit point for a learner close behind (join_hold_ticks 0: it joins only in a pause of the
  * writes; rejoinsteady), `inboxstarve` gives the inbox no time after a tick while the next one is due (a catch-up read
- * longer than a tick starved the other peers' ACKs; rejoinslow).
+ * longer than a tick starved the other peers' ACKs; rejoinslow), `opennohold` starts a replica's core with its whole
+ * log durable, past a COMMIT marker whose file it has not staged (reopenhold), `tickstretch` drops the ticks a slow
+ * catch-up step made late, so the core's clock (isr_lag, the join hold) runs slower than the wall's (tickwall).
  * `commitpastremoved` takes an ISR request as the record at once, before the metadata group commits it (isr),
  * `nominisr` never checks min_isr (minisr), `ackbelowminisr` hands the writer a commit point reached after a shrink
  * below min_isr (minisr), `nocap` keeps the leader's segments for a lagging replica without the caps repl_retain_mb and
@@ -63,7 +65,9 @@
  * (replicate); tests/repld_mutants.sh names the rest and pins each mutant to its scenario's FAIL line.
  * Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first bulk file this process receives taken as staged but not kept, so its COMMIT marker finds
  * the file missing and FETCHes it; `fetchlate` has a replica send its first FETCH of a name only 5 s after it found
- * the file missing (the leader has sealed and flushed the marker's segment by then); `promotewait` waits 1 s between
+ * the file missing (the leader has sealed and flushed the marker's segment by then); `nofetch` has a replica send no
+ * FETCH at all and say once per name that it withholds it (reopenhold kills it there); `syncpause` has a replica's
+ * SYNCs wait 4 s after its core's open (its ACKs carry the durable end it opened with; reopenhold); `promotewait` waits 1 s between
  * the promotion's engine swap and the mode M_WRITER
  * (writes then reach the new writer while the driver still promotes: they must be refused for a retry, never depose
  * it); `noclock` has a leader write no NOW markers and no idle seal (writersync); `skippos` has one admit take a
@@ -71,7 +75,8 @@
  * fail the volume before the write is acknowledged); `stalesent` sets one peer's cursor back to 0 once the file
  * <dir>/stalesent exists, below the log's start (what a resync that raced records in flight left behind; the cursor
  * must move up to what the peer acknowledged, or it is never sent another record); `slowread` has every catch-up
- * read take SLOW_READ_MS more (a slow disk or NFS); `slowack` has a replica's ACKs report the durable end it had
+ * read take SLOW_READ_MS more (a slow disk or NFS); `slowtick` has a writer's catch-up step take SLOW_TICK_MS at every
+ * tick it runs (tickwall); `slowack` has a replica's ACKs report the durable end it had
  * SLOW_ACK_MS before (a far replica: always a few writes behind the leader's end while it keeps up).
  * TSDB_REPLD_TRACE=1 (debugging; jepsen-cluster passes the environment on) logs every 2 s per volume a line of the
  * core's state (repl_debug: per peer next, match, acked) and the driver's cursors (sent, want, acked, ages, link).
@@ -111,8 +116,11 @@ _Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member
 #define RESEND_MS 50
 #define LOST_MS 500 /* a peer's acknowledged end standing still this long with the cursor ahead: what was sent is lost */
 #define FETCH_LATE_MS 5000 /* fetchlate (tests) */
+#define SYNC_PAUSE_MS 4000 /* syncpause (tests) */
 #define READ_CAP (4u << 20)
 #define SLOW_READ_MS 10  /* slowread (tests): longer than a tick */
+#define SLOW_TICK_MS 20  /* slowtick (tests): a catch-up step that long, at every tick it runs */
+#define TICK_BACKLOG_MS 1000 /* the core's clock catches up at most this much of wall time (vol_main) */
 #define SLOW_ACK_MS 100  /* slowack (tests) */
 #define SLOW_ACK_RING 512
 #define MAX_NODES 64
@@ -186,6 +194,8 @@ struct rvol {
     uint64_t fetch_ms;
     char fetch_name[RW_NAME_MAX + 1];
     uint64_t fetch_late_ms;                 /* fetchlate (tests): when fetch_late_name was found missing */
+    uint64_t sync_pause_end;                /* syncpause (tests): a replica's syncs wait until then */
+    int sync_paused;                        /* syncpause: a SYNC waits for sync_pause_end */
     char fetch_late_name[RW_NAME_MAX + 1];
     struct jr_ops ops;
     /* the ISR change the core asked the metadata group for (REPL_M_ISR_REQ), reported in this server's heartbeats
@@ -235,7 +245,9 @@ enum {
     RM_KEEPWRITTEN,
     RM_FASTRIDE,
     RM_NOJOINHOLD,
-    RM_INBOXSTARVE
+    RM_INBOXSTARVE,
+    RM_OPENNOHOLD,
+    RM_TICKSTRETCH
 };
 
 static struct {
@@ -269,6 +281,9 @@ static struct {
     _Atomic int said_late; /* latewal's line, once */
     int sync_by_hook; /* TSDB_REPLD_TEST=syncbyhook: a writer's SYNC compares what op_synced reported, not the engine */
     int fetch_late;   /* TSDB_REPLD_TEST=fetchlate: a replica's first FETCH of a name waits FETCH_LATE_MS */
+    int no_fetch;     /* TSDB_REPLD_TEST=nofetch: a replica sends no FETCH and says once per name that it withholds it */
+    int sync_pause;   /* TSDB_REPLD_TEST=syncpause: a replica's SYNCs wait SYNC_PAUSE_MS after its core's open, so its
+                       * ACKs carry the durable end the core opened with that long (reopenhold) */
     int sync_late;    /* TSDB_REPLD_TEST=synclate: every other report of op_synced reaches the core only at the next
                        * tick, so the report after it covers records written behind the SYNC in flight (writersync) */
     int no_clock; /* TSDB_REPLD_TEST=noclock (tests only): a leader writes no NOW markers and seals nothing idle, so
@@ -278,6 +293,8 @@ static struct {
     int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
     int slow_read;    /* TSDB_REPLD_TEST=slowread: every catch-up read takes SLOW_READ_MS more (a slow disk, NFS) */
+    int slow_tick;    /* TSDB_REPLD_TEST=slowtick: a writer's catch-up step takes SLOW_TICK_MS at every tick it runs,
+                       * lagging peer or not (tickwall) */
     int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
                        * replica: what it reports trails the leader's end even while it keeps up) */
     struct rin *ins; /* bulk files being received */
@@ -1712,6 +1729,10 @@ static void handle(struct rvol *rv, struct item *it)
 static void do_sync(struct rvol *rv)
 {
     rv->sync_wanted = 0;
+    if (G.sync_pause && rv->mode == M_REPLICA && now_ms() < rv->sync_pause_end) {
+        rv->sync_paused = 1; /* the tick hands it back once the pause is over */
+        return;
+    }
     struct eng *db = tsdb_cvol_ref(G.t, rv->number);
     if (!db)
         return;
@@ -1737,6 +1758,13 @@ static void do_sync(struct rvol *rv)
     }
     if (missing && G.fetch_late && now_ms() - rv->fetch_late_ms < FETCH_LATE_MS)
         missing = 0;
+    if (missing && G.no_fetch) {
+        if (strcmp(name, rv->fetch_name))
+            say("test: volume %" PRIu32 ": withholds the FETCH of %s (the marker at %" PRIu64 ")", rv->number, name,
+                mpos);
+        snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
+        missing = 0;
+    }
     if (missing && (strcmp(name, rv->fetch_name) || now_ms() - rv->fetch_ms >= 1000)) {
         int ld = node_index(rv, rv->rec.leader);
         struct plink *l = ld >= 0 ? link_of(rv->rec.rep[ld].node, 0) : NULL;
@@ -1812,6 +1840,18 @@ static void *vol_main(void *arg)
             continue;
         }
         if (now >= next_tick) {
+            /* The core counts isr_lag and the join hold in ticks, which must follow the wall clock: a tick that comes
+             * a tick or more late (the catch-up step of the one before took that long) is the clock catching up, and
+             * runs without a catch-up step of its own, after the inbox had its slice; the step runs again once the
+             * clock is current. Each tick ran one step before and a late tick was dropped, so with catch-up reads of
+             * X ms a core tick took X + 5 ms of wall time: with 20 ms reads a stopped member stalled the writes for
+             * 5 s, not isr_lag (r3d-isr review M1; test_cluster tickwall, mutant tickstretch) */
+            const int stretch = G.mutant == RM_TICKSTRETCH;
+            int behind = !stretch && now >= next_tick + TICK_MS;
+            if (rv->sync_paused && now >= rv->sync_pause_end) {
+                rv->sync_paused = 0;
+                rv->sync_wanted = 1;
+            }
             if (rv->sync_late) {
                 uint64_t l = rv->sync_late;
                 rv->sync_late = 0;
@@ -1836,14 +1876,20 @@ static void *vol_main(void *arg)
                     (unsigned long long)rv->log_start, (unsigned long long)rv->idx_end, (size_t)rv->nidx, tb);
                 rv->trace_ms = now;
             }
-            if (next_tick < now)
-                next_tick = now + TICK_MS;
+            if (stretch ? next_tick < now : next_tick + TICK_BACKLOG_MS < now)
+                next_tick = stretch ? now + TICK_MS : now - TICK_BACKLOG_MS; /* a longer stall: that much is caught up */
             drain(rv);
-            if (rv->mode == M_WRITER || rv->mode == M_PROMOTING) {
+            if (!behind && (rv->mode == M_WRITER || rv->mode == M_PROMOTING)) {
                 struct eng *db = tsdb_cvol_ref(G.t, rv->number);
                 if (db)
                     catch_up(rv, db);
                 tsdb_cvol_unref(&db);
+                if (G.slow_tick && rv->mode == M_WRITER) {
+                    pthread_mutex_unlock(&rv->mu);
+                    struct timespec st = {0, SLOW_TICK_MS * 1000000L};
+                    nanosleep(&st, NULL);
+                    pthread_mutex_lock(&rv->mu);
+                }
             }
             slice = now_ms() + TICK_MS;
             continue;
@@ -1946,6 +1992,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "fastride")       ? RM_FASTRIDE
                : !strcmp(mu, "nojoinhold")     ? RM_NOJOINHOLD
                : !strcmp(mu, "inboxstarve")    ? RM_INBOXSTARVE
+               : !strcmp(mu, "opennohold")     ? RM_OPENNOHOLD
+               : !strcmp(mu, "tickstretch")    ? RM_TICKSTRETCH
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1960,11 +2008,14 @@ void repld_init(tsdb *t, const char *dir)
     G.sync_by_hook = te && strstr(te, "syncbyhook");
     G.sync_late = te && strstr(te, "synclate");
     G.fetch_late = te && strstr(te, "fetchlate");
+    G.no_fetch = te && strstr(te, "nofetch");
+    G.sync_pause = te && strstr(te, "syncpause");
     G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
     if (G.mutant == RM_NOINBOXBOUND)
         G.inbox_bytes = SIZE_MAX;
     G.stall_inbox = te && strstr(te, "stallinbox");
     G.slow_read = te && strstr(te, "slowread");
+    G.slow_tick = te && strstr(te, "slowtick");
     G.slow_ack = te && strstr(te, "slowack");
     G.spill_bytes = te && strstr(te, "spill") ? 64u << 10 : SPILL_BYTES;
     if (G.mutant == RM_NOSPILL)
@@ -2026,6 +2077,14 @@ int repld_open(const struct cluster_vol_rec *r)
     scan_segments(rv, h, &nh, &first);
     struct eng *db = tsdb_cvol_ref(G.t, r->number);
     uint64_t log_end = db ? replica_log_end(db) : 0;
+    /* the durable end the core starts from: below a COMMIT marker whose files are not staged (replica.c's hold), not
+     * the log end. A replica killed between such a marker and its file's FETCH otherwise acknowledged its whole log at
+     * the restart (once its log was verified, before its first sync): the leader took it as holding the file, its keep
+     * bound passed the marker, the segment and the link the file is served from went, and the replica asked for the
+     * file for the rest of the run ("it needs a snapshot"; jepsen-cluster kill, kv and classes, 2026-11-18). Its match
+     * claimed positions it could not apply too. test_cluster reopenhold; mutant opennohold */
+    uint64_t dur = db ? replica_durable_end(db) : 0;
+    uint64_t hold = dur < log_end && G.mutant != RM_OPENNOHOLD ? dur + 1 : 0;
     /* the history: REPL's entries below the first segment's, then the segments' own */
     for (uint32_t i = 0; i < rv->st.nhist; i++)
         if (!nh || rv->st.hist[i].start < h[0].start)
@@ -2060,7 +2119,8 @@ int repld_open(const struct cluster_vol_rec *r)
         }
     }
     struct repl_durable d = {.rid = rv->st.rid, .fence = rv->st.fence, .led = rv->st.led, .floor = rv->st.floor,
-                             .log_start = rv->log_start, .log_end = log_end, .hist = rv->hist, .nhist = rv->nhist};
+                             .log_start = rv->log_start, .log_end = log_end, .hold = hold, .hist = rv->hist,
+                             .nhist = rv->nhist};
     uint32_t lag = r->isr_lag_ms ? r->isr_lag_ms : 1000;
     int min_isr = r->min_isr && G.mutant != RM_NOMINISR ? (int)r->min_isr : 1; /* planted nominisr: never checked */
     struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = min_isr,
@@ -2070,6 +2130,7 @@ int repld_open(const struct cluster_vol_rec *r)
                               .join_hold_ticks = G.mutant == RM_NOJOINHOLD ? 0 : lag / TICK_MS,
                               .rec_find = idx_find, .ctx = rv};
     rv->core = repl_open(&cfg, &d);
+    rv->sync_pause_end = now_ms() + SYNC_PAUSE_MS;
     if (!rv->core) {
         say("volume %" PRIu32 ": the replication core refused the state of %s", r->number, rv->dir);
         cvol_close(r->number);

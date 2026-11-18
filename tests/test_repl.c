@@ -208,6 +208,34 @@ static void trim(void)
     repl_free(r);
 }
 
+/* A replica reopened with a COMMIT marker at 7 whose file it has not staged (repl_durable.hold): its durable end starts
+ * at 6, not at its log end, and its ACK after the leader verified its log says so. It said 10: the leader kept its
+ * segments, and the link the file is fetched from, only up to what the ACK claimed, and dropped the marker's
+ * (jepsen-cluster kill, 2026-11-18; test_cluster reopenhold). */
+static void open_hold(void)
+{
+    static struct drv f;
+    memset(&f, 0, sizeof f);
+    fill(&f, 1, 10, 1, 1);
+    struct repl_config c = config(1, &f);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_durable du = {.rid = 22, .fence = 1, .floor = 5, .log_end = 10, .hold = 7, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    CHECK(r && !repl_failed(r) && repl_durable_end(r) == 6 && repl_written(r) == 10,
+          "a replica opened with a hold at 7 starts durable to %llu", r ? (unsigned long long)repl_durable_end(r) : 0);
+    struct repl_msg m = meta_msg(1, 2, 0, 0x1, 0);
+    repl_recv(r, &m);
+    drain(r, &f, NULL);
+    struct repl_msg an = {.type = REPL_M_ANSWER, .from = 0, .to = 1, .epoch = 2, .leader = 0, .last_epoch = 1,
+                          .written = 1000, .prev_epoch = 1, .prev_pos = 10, .end = 1};
+    repl_recv(r, &an);
+    drain(r, &f, NULL);
+    const struct repl_action *s = find_act(&f, REPL_A_SEND, REPL_M_ACK);
+    CHECK(s && s->msg.written == 10 && s->msg.durable == 6, "the ACK after the verification says durable %llu",
+          s ? (unsigned long long)s->msg.durable : 0);
+    repl_free(r);
+}
+
 static void cut_applied(void)
 {
     static struct drv d;
@@ -671,6 +699,7 @@ int main(int argc, char **argv)
     }
 #endif
     trim();
+    open_hold();
     cut_applied();
     sync_cut();
     promote();
