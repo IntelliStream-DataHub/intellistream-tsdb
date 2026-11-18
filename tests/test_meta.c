@@ -266,6 +266,23 @@ static void test_state_machine(void)
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
     promo_skip(&e, meta_volume(&m, 0), 2, 4, f24, 2, a4, 1, 300, 1); /* epoch 4 from 2: a replicated epoch rises by one */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && meta_volume(&m, 0)->epoch == 2);
+    /* D10: a replicated epoch stays below 2^22 (replica_epoch_begin refuses more): a promotion to 2^22 - 1 commits, one
+     * to 2^22 is RANGE (on a copy whose epoch was set near the bound; MUT(9) drops the check) */
+    {
+        struct meta_state near;
+        meta_copy(&near, &m);
+        struct meta_volume *nv = &near.volumes[0];
+        nv->epoch = META_EPOCH_LIMIT - 2;
+        nv->hist[nv->nhist - 1].epoch = nv->epoch;
+        promo(&e, meta_volume(&near, 0), META_EPOCH_LIMIT - 2, 4, f24, 2, a4, 1, 400);
+        CHECK(apply1(&near, &e, res, 8) == META_OK && res[0] == META_OK &&
+              meta_volume(&near, 0)->epoch == META_EPOCH_LIMIT - 1);
+        promo(&e, meta_volume(&near, 0), META_EPOCH_LIMIT - 1, 4, f24, 2, a4, 1, 500);
+        CHECK(apply1(&near, &e, res, 8) == META_OK && res[0] == META_ERR_RANGE &&
+              meta_volume(&near, 0)->epoch == META_EPOCH_LIMIT - 1);
+        CHECK(META_EPOCH_LIMIT == 1ull << 22);
+        meta_free(&near);
+    }
 
     /* the checker catches a leader from outside the ISR, an epoch that goes back, a skipped epoch */
     struct meta_state bent;
@@ -694,8 +711,8 @@ static void test_shared(void)
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->leader == other);
     }
 
-    /* the u24 bound: a grant whose reservation would reach 2^24 - 1 is refused with its own code; VOLUME_SELF may
-     * reach 2^24 - 2 and no further */
+    /* the epoch bound (D10: 2^22, what the engine takes): a grant whose reservation would reach 2^22 - 1 is refused with its own code; VOLUME_SELF may
+     * reach 2^22 - 2 and no further */
     {
         uint32_t n3[3] = {1, 2, 3};
         vol_add(&e, META_VOL_SHARED, 1, "s1", 1, n3, 3); /* its own volume: the bound is far from volume 0's epochs */
@@ -703,7 +720,7 @@ static void test_shared(void)
     }
     v = meta_volume(&m, 1);
     uint32_t someone = v->leader == 1 ? 2 : 1;
-    g = sgrant(v, someone, META_EPOCH_LIMIT - 1, META_GR_PLANNED); /* its reservation would be 2^24 - 1 */
+    g = sgrant(v, someone, META_EPOCH_LIMIT - 1, META_GR_PLANNED); /* its reservation would be 2^22 - 1 */
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_RANGE);
     v = meta_volume(&m, 1);
@@ -716,7 +733,7 @@ static void test_shared(void)
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v = meta_volume(&m, 1);
     CHECK(v->epoch == META_EPOCH_LIMIT - 2 && meta_reserved_epoch(v) == META_EPOCH_LIMIT - 1);
-    meta_op_volume_self(&e, 1, v->leader, v->epoch + 1); /* 2^24 - 2: the last legal epoch */
+    meta_op_volume_self(&e, 1, v->leader, v->epoch + 1); /* 2^22 - 2: the last legal epoch */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v = meta_volume(&m, 1);
     CHECK(v->epoch == META_EPOCH_LIMIT - 1);

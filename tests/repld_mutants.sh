@@ -32,7 +32,7 @@ table=(
     "floornotsaved|replicate|the replica restarted under writes refused its log: the log starts above the commit floor"
     "ackbeforesync|ackdurable|after a power loss replica [0-9]+ holds [0-9]+ rows"
     "nodepose|writerdepose|the writer was not deposed"
-    "noquiesce|writerfail|of the failed volume: .*not UNAVAILABLE"
+    "noquiesce|writerfail|of the failed volume: .*not (UNAVAILABLE|MOVED)"
     "floornottold|repcheck|its saved floor never removed its flushed segments"
     "unsureignored|repcheck|opened with a damaged REPL slot and saved unsure 1"
     "admitnocheck|repcheck|a write whose core position is not its log number was acknowledged"

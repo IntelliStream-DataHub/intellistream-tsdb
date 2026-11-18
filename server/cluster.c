@@ -60,6 +60,11 @@
  * (and before max(node_timeout, lease) of its own leadership). While its lease has run out, a server answers every
  * request on a cluster volume it leads UNAVAILABLE (WHY UNREACHABLE, retry_after 200 ms) and repld admits no write.
  * The leases of the data links (repld's heartbeats, L1) are about those links only: they never extend this lease.
+ * Promotion (design-cluster.md 6.2): FENCE {u32 vol, u64 fence} goes from the Raft leader to each ISR member of a
+ * volume whose leader is down, reported it LOCAL_FAULT or resigned; the member's driver saves the fence in REPL
+ * (fdatasync) before it answers VOLMSG {u8 kind (1 FENCE_REPLY, 2 RESIGN), u32 vol, u64 epoch, durable, last_epoch,
+ * rid, start} to the Raft leader, which proposes a conditional VOLUME_LEADER once every fresh member answered or after
+ * 500 ms with one answer (promo_step). These frames ride on version 6 (s2b's bump), not on a version of their own.
  *
  * Voters (§2.2), on the leader once a second while no configuration change is in flight: promote a caught-up learner;
  * else, while fewer voters than meta_voter_target have been heard within voter_replace_s, add an up non-voter as a
