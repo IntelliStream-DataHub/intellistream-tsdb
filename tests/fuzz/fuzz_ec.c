@@ -18,7 +18,7 @@
 #include "internal.h"
 #include "chunk.h"
 
-#if !defined(__x86_64__) /* the codec is x86-64 code (the Makefile builds no src/ec elsewhere): nothing to fuzz */
+#ifndef TSDB_EC /* the codec is x86-64 code (the Makefile builds no src/ec elsewhere, nor with NO_EC=1): nothing to fuzz */
 int LLVMFuzzerInitialize(int *argc, char ***argv)
 {
     (void)argc, (void)argv;

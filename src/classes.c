@@ -52,6 +52,7 @@
  * sees it) is partitioned like before, with that class's length.
  */
 #include "internal.h"
+#include "ecpart.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1441,6 +1442,9 @@ int cls_check_parts(eng *db)
     int rc = 0;
     for (size_t pi = 0; pi < db->nparts && rc == 0; pi++) {
         const part *p = db->parts[pi];
+        /* R7: an .ec part's granules are not decoded here: the class check of its settle (in its record) stands */
+        if (p->ec && (rc = ec_cls_record(db, p)) != 0)
+            break;
         int pc = partition_class(db, p->partition);
         int64_t lo, hi;
         partition_range(db, p->partition, &lo, &hi);
@@ -1465,6 +1469,8 @@ int cls_check_parts(eng *db)
                     rc = check_fail(p, s, "rows in a partition of another class than CLASSES gives them", tmin, tmax);
                 continue;
             }
+            if (p->ec && !p->ec->test_mark)
+                continue; /* R7: its granules were judged at settle (ec_cls_record above), never decoded at open */
             if (!cc && !(cc = codec_new()))
                 rc = TSDB_ERR_NOMEM;
             if (rc == 0 && tscap < p->grows) {

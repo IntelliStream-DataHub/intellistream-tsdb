@@ -22,6 +22,10 @@
  * p<partition>_<min_block>_<max_block>_<level>.part, which makes it visible.
  */
 #include "internal.h"
+#include "eccache.h"
+#include "ecgc.h"
+#include "ecpart.h"
+#include "ecswap.h"
 
 #include <dirent.h>
 #include <stddef.h>
@@ -103,6 +107,13 @@ int part_open(int dirfd, const char *name, bool pin, part **out)
  * in place (without pin_index) can be damaged after the open; a merge copies granule statistics from the index
  * verbatim and would write them under a fresh hash, so it checks first (about 0.3% of the part's bytes). */
 bool part_index_intact(const part *p)
+{
+    if (p->ec)
+        return ec_index_intact(p); /* its own index and record (R7) */
+    return part_map_intact(p);
+}
+
+bool part_map_intact(const part *p)
 {
     if (p->icopy)
         return true; /* the copy is what was checked */
@@ -290,6 +301,8 @@ void part_unref(part *p)
             snprintf(retired, sizeof retired, "retired_%s", p->name);
         unlinkat(p->dirfd, p->retired ? retired : p->name, 0);
     }
+    if (p->ec)
+        ecgc_last_unref(p); /* R7: its object's chunks go once nothing reads them (r7-gc); frees p->ec */
     free(p);
 }
 
@@ -307,11 +320,26 @@ int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *
 int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
                  bool verify)
 {
+    if (p->ec)
+        return ec_granule_read(c, p, g, type, ts, v, cap, verify); /* R7: the bytes come from the chunk store */
+    return granule_read_map(c, p, g, type, ts, v, cap, verify);
+}
+
+int granule_read_map(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
+                     bool verify)
+{
     uint64_t len = (uint64_t)g->ts_len + g->val_len;
-    if (g->off < p->hdr_len || g->off > p->index_off || len > p->index_off - g->off || g->count == 0 ||
-        g->count > p->grows || g->count > cap)
+    if (g->off < p->hdr_len || g->off > p->index_off || len > p->index_off - g->off)
         return TSDB_ERR_CORRUPT;
-    const uint8_t *blk = p->map + g->off;
+    return granule_decode(c, p, g, p->map + g->off, type, ts, v, cap, verify);
+}
+
+int granule_decode(codec_ctx *c, const part *p, const granule *g, const uint8_t *blk, int type, int64_t *ts, void *v,
+                   size_t cap, bool verify)
+{
+    uint64_t len = (uint64_t)g->ts_len + g->val_len;
+    if (g->count == 0 || g->count > p->grows || g->count > cap)
+        return TSDB_ERR_CORRUPT;
     if (verify) {
         atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
         if ((uint32_t)xxh64(blk, len, 0) != g->crc)
@@ -704,6 +732,10 @@ int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const v
  * first, so callers only do this when the pending rows belong to an earlier series. */
 int pw_copy_granule(part_writer *w, const part *src, uint32_t i)
 {
+    if (src->ec) { /* R7: merges never take an .ec part (r7-skip's barriers); its map has no granule bytes to copy */
+        fprintf(stderr, "tsdb: bug: a merge was given the erasure-coded part %s as a source\n", src->name);
+        return TSDB_ERR_INVALID;
+    }
     int rc = pw_emit_pending(w);
     if (rc)
         return rc;
@@ -1033,8 +1065,8 @@ static bool two_numbers_name(const char *name, const char *prefix, const char *s
 
 bool part_tmp_name(const char *name) { return two_numbers_name(name, "tmp_", ".part"); }
 
-/* p<partition>_<min_block>_<max_block>_<level>.part; the partition may be negative (before 1970) */
-bool part_file_name(const char *name)
+/* p<partition>_<min_block>_<max_block>_<level>.<ext>; the partition may be negative (before 1970) */
+static bool part_like_name(const char *name, const char *ext)
 {
     if (name[0] != 'p')
         return false;
@@ -1044,17 +1076,26 @@ bool part_file_name(const char *name)
             return false;
         s++;
     }
-    return strcmp(s, "part") == 0;
+    return strcmp(s, ext) == 0;
 }
+
+bool part_file_name(const char *name) { return part_like_name(name, "part"); }
+
+/* R7 (src/ecpart.h): an .ec part keeps its source's name with another extension */
+bool ec_file_name(const char *name)
+{
+    if (r7_mutant == R7_MUT_NAMELOOSE)
+        return name[0] == 'p' && strstr(name, ".ec") != NULL;
+    return part_like_name(name, "ec");
+}
+bool ec_tmp_name(const char *name) { return two_numbers_name(name, "tmp_", ".ec"); }
+bool ec_retired_name(const char *name) { return strncmp(name, "retired_", 8) == 0 && ec_file_name(name + 8); }
+bool settled_part_name(const char *name) { return strncmp(name, "settled_", 8) == 0 && part_file_name(name + 8); }
 
 bool intent_file_name(const char *name) { return two_numbers_name(name, INTENT_PREFIX, ".intent"); }
 
-/* Parses an intent into its n renames; false when it is torn or damaged. */
-static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[128], size_t *n)
+bool intent_unseal(char *buf, size_t len)
 {
-    *tmp = NULL;
-    *fin = NULL;
-    *n = 0;
     if (len < 4 || buf[len - 1] != '\n' || memchr(buf, '\0', len))
         return false;
     buf[len - 1] = '\0';
@@ -1065,6 +1106,18 @@ static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[1
         xxh64(buf, (size_t)(end + 1 - buf), 0) != want)
         return false;
     *end = '\0';
+    return true;
+}
+
+/* Parses an intent into its n renames; false when it is torn or damaged. */
+static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[128], size_t *n)
+{
+    *tmp = NULL;
+    *fin = NULL;
+    *n = 0;
+    if (!intent_unseal(buf, len))
+        return false;
+    char extra;
     char *line = buf, *next = strchr(line, '\n');
     size_t count;
     if (!next)
@@ -1118,9 +1171,13 @@ int intents_recover(eng *db)
             break;
         }
         close(fd);
-        char (*tmp)[96], (*fin)[128];
+        char (*tmp)[96] = NULL, (*fin)[128] = NULL;
         size_t n;
-        if (!intent_parse(buf, (size_t)st.st_size, &tmp, &fin, &n)) {
+        if ((size_t)st.st_size >= sizeof INTENT_V4_HEAD - 1 &&
+            memcmp(buf, INTENT_V4_HEAD, sizeof INTENT_V4_HEAD - 1) == 0) {
+            /* R7: a settle's swap (an .ec part for each source, the source renamed settled_): its own recovery */
+            rc = ecswap_recover(db, e->d_name, buf, (size_t)st.st_size);
+        } else if (!intent_parse(buf, (size_t)st.st_size, &tmp, &fin, &n)) {
             fprintf(stderr, "tsdb: insert intent %s is torn: the insert is rolled back\n", e->d_name);
         } else {
             size_t missing = 0, renamed = 0;
