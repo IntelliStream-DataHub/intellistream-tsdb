@@ -80,15 +80,25 @@ int manifest_publish(eng *db)
         return TSDB_ERR_NOMEM;
     }
     /* wal_active is the segment being written: a replica's too, which writes the leader's WAL with wal_enabled off
-     * (a reader that took wal_flushed there would see the rows of its parts only) */
+     * (a reader that took wal_flushed there would see the rows of its parts only). wal_seq is read under buf_lock: a
+     * writer's rotation (mt_flush) sets it under db->lock and buf_lock, a replica's (replica_append, replica_cut)
+     * under rp->mu and buf_lock, the edge its fno_next already takes; buf_lock is the innermost of the three, so this
+     * db->lock > buf_lock is in the order. The reads follow each other under manifest_lock, so the last MANIFEST
+     * written names the newest segment (after a rotation that is the appender's own publish). */
     pthread_mutex_lock(&db->buf_lock); /* after db->lock in the order */
     uint64_t fno_next = db->fno_next;
+    uint64_t wal_active = db->wal_enabled || db->rp ? db->wal_seq : db->wal_flushed;
     pthread_mutex_unlock(&db->buf_lock);
+    /* planted with the unlocked write of replica_append, as main had it (test_replica). Only that write is what TSan
+     * can catch: this read follows the unlock by a few instructions, so a rotation's locked write orders after it
+     * unless it lands in that window, and a mutant of the read alone passed 5 of 5 runs (no test of the read side) */
+    if (eng_test_mutant == MUT_REPLICA_WALSEQ_UNLOCKED)
+        wal_active = db->wal_enabled || db->rp ? db->wal_seq : db->wal_flushed;
     len += (size_t)snprintf(buf + len, cap - len,
                             "tsdb-manifest %d\nversion %" PRIu64 "\nseries %u\nwal_flushed %" PRIu64
                             "\nwal_active %" PRIu64 "\nfsync %d\nstates %u\nfno_next %" PRIu64 "\nparts %zu\n",
                             FORMAT_VERSION, ++db->manifest_version, atomic_load(&db->series.count), db->wal_flushed,
-                            db->wal_enabled || db->rp ? db->wal_seq : db->wal_flushed, db->opt.fsync ? 1 : 0,
+                            wal_active, db->opt.fsync ? 1 : 0,
                             atomic_load(&db->states.count), fno_next, db->nparts);
     for (size_t i = 0; i < db->nparts; i++)
         len += (size_t)snprintf(buf + len, cap - len, "%s\n", db->parts[i]->name);

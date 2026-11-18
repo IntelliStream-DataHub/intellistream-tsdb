@@ -333,6 +333,8 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_replfile $(or $(TMPDIR),/tmp)
 	for m in nosync sameslot nochecksum; do ! ./$(B)/test_replfile --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_replica $(or $(TMPDIR),/tmp)
+	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 ./$(B)/test_replica --mutant walsequnlocked $(or $(TMPDIR),/tmp) >$(B)/walsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/walsequnlocked.log) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
+	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 ./$(B)/test_replica --mutant cutwalsequnlocked $(or $(TMPDIR),/tmp) >$(B)/cutwalsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/cutwalsequnlocked.log && grep -q replica_cut $(B)/cutwalsequnlocked.log) # and a cut's
 	./$(B)/test_cvol $(or $(TMPDIR),/tmp)
 	./$(B)/test_cvolfs $(or $(TMPDIR),/tmp)
 	for m in nosync nodirsync nononce trustunsure tornstale samerid; do ! ./$(B)/test_cvolfs --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
