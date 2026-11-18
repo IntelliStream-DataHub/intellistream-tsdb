@@ -200,6 +200,7 @@ sed -i 's/^    int rc = tsdb_open(dir, &o, &db);$/    jv_openfail();\
 if [ "$(grep -c 'jv_every(' "$f")" -ne 11 ] || [ "$(grep -c 'jv_extra();' "$f")" -ne 2 ] || [ "$(grep -c 'jv_openfail();' "$f")" -ne 1 ] || [ "$(grep -c 'jv_openany(dir);' "$f")" -ne 1 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
 (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-crash: build failed"; tail -5 "$tmp/build.log"; rm -rf "$tmp"; exit 1; }
 mut=$tmp/build/tsdbd
+export JEPSEN_TSDB=$root/build/tsdb # the CLI of the login and the change feed cases
 crashfs=$root/build/libcrashfs.so
 outagefs=$root/build/liboutagefs.so
 
@@ -332,7 +333,6 @@ run_case "openfail-mdv" "$OF" "a server that exits 1 at open for a reason of its
 OE="exits with status 1 while opening.*not a refusal on damage"
 O0="exits with status 0 before it listens"
 OH="is alive and wrote no port file in [0-9]* s, and the machine did not stall"
-tiercli=$root/build/tsdb
 oa_case() { # name pattern what mode nemesis-args...
     local name=$1 pat=$2 what=$3 mode=$4; shift 4
     want "$name" || return 0
@@ -367,6 +367,39 @@ for mode in exit1 exit0 hang; do # the follower of the power nemesis
     run_case "openfol-$mode" "$pat" "a follower that fails at open ($mode), power nemesis" JV_OPENANY=$mode JV_OPENWHO=follower \
         JV_STARTCNT="$tmp/of-$mode.1" JV_ONCEFILE6="$tmp/of-$mode.2" JEPSEN_OPEN_WAIT_MS=10000 -- --nemesis power --seconds 12 --crashfs "$crashfs"
 done
+# MATRIX=1: the same three failures at open (exit 1 with no damage, exit 0, a hang) under EVERY configuration of the gate: the kill, pause, power,
+# eio, outage and no nemesis, each with the classes workload where it has one, misdirect with and without verify_checksums, rot, login, and the change
+# feed under kill, power and eio (round 14; VERIFY13's a-ox1-*, a-ox0-*, a-ohang-*: 17 configurations; not part of the selftest's default: about 20 minutes)
+if [ -n "${MATRIX:-}" ]; then
+    while IFS='|' read -r cfg args; do
+        [ -n "$cfg" ] || continue
+        # shellcheck disable=SC2086
+        for mode in exit1 exit0 hang; do
+            case $mode in exit1) pat=$OE ;; exit0) pat=$O0 ;; *) pat=$OH ;; esac
+            a=${args//@crashfs@/$crashfs}; a=${a//@outagefs@/$outagefs}
+            # shellcheck disable=SC2086
+            oa_case "matrix-$mode-$cfg" "$pat" "a server whose restart fails at open ($mode), configuration $cfg" $mode $a
+        done
+    done <<MEOF
+kill|--nemesis kill --seconds 12
+clkill|--workload classes --nemesis kill --seconds 12
+pause|--nemesis pause --seconds 12
+clpause|--workload classes --nemesis pause --seconds 12
+power|--nemesis power --seconds 12 --crashfs @crashfs@
+clpower|--workload classes --nemesis power --seconds 12 --crashfs @crashfs@
+eio|--nemesis eio --seconds 12 --crashfs @crashfs@
+cleio|--workload classes --nemesis eio --seconds 12 --crashfs @crashfs@
+outage|--nemesis outage --seconds 40 --seed 1 --outagefs @outagefs@
+none|--nemesis none --seconds 12
+mdv|--nemesis misdirect --seconds 20 --crashfs @crashfs@ --verify-checksums
+md|--nemesis misdirect --seconds 20 --crashfs @crashfs@
+rot|--nemesis rot --seconds 20 --verify-checksums
+authkill|--auth --nemesis kill --seconds 12
+feedkill|--feed --nemesis kill --seconds 12
+feedpower|--feed --nemesis power --seconds 12 --crashfs @crashfs@
+feedeio|--feed --nemesis eio --seconds 12 --crashfs @crashfs@
+MEOF
+fi
 # a thread of the server in D state for good at open is the kernel's stall, not a verdict: a harness error (exit 2), never a violation, never a pass
 if want openany-dstall-kill; then
     rm -f "$tmp/oa-ds".*

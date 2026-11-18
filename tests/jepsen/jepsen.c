@@ -769,7 +769,7 @@ static bool end_planned(pid_t pid, int st)
 {
     if (md || rot)
         return true; /* md_death */
-    bool shim_nem = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio");
+    bool shim_nem = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || settle_steps; /* settle-steps: the hook's exit(99) after the shim's rollback */
     if (WIFSIGNALED(st)) /* a signal we sent, and no core: a SIGKILL cannot dump one, so a core is a crash that the kill met */
         return sent_has(pid, WTERMSIG(st)) && !WCOREDUMP(st);
     int c = WEXITSTATUS(st);
@@ -5296,7 +5296,7 @@ int main(int argc, char **argv)
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += 90;
             if (pthread_mutex_timedlock(&server_lock, &ts) == 0) {
-                if (!strcmp(nemesis, "power") || !strcmp(nemesis, "eio"))
+                if (!strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || settle_steps)
                     quiet_tail_server();
                 pthread_mutex_unlock(&server_lock);
             }
