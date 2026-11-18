@@ -385,6 +385,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	$(if $(EC_OBJ),for m in coef kernel guard; do ! ./$(B)/test_rs --quick --mutant $$m >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (--quick: seconds, not 20 s a run)
 	./$(B)/test_chunk $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in nosums nofence eof settings nosync epochnosync; do ! ./$(B)/test_chunk --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),out=$$(./$(B)/test_chunk --quick --mutant streamreread $(or $(TMPDIR),/tmp) 2>&1); [ $$? -ne 0 ] && echo "$$out" | grep -q 'stream put .* differ from chunk_encode' || { echo "test_chunk: mutant streamreread was not caught by the stream put's comparison with chunk_encode" >&2; exit 1; }) # pinned to its oracle's line
 	./$(B)/test_chunk_heal $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always; do ! ./$(B)/test_chunk_heal --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	tests/test_sync_ec.sh

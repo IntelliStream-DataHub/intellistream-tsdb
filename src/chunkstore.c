@@ -759,6 +759,8 @@ static int wr_cell(chunk_wr *w, const void *data, size_t len, uint64_t sum)
         return w->err;
     if (w->next >= w->ncells || len != chunk_pos_cell_len(&w->g, w->id.pos, w->next))
         return w->err = TSDB_ERR_INVALID;
+    if (chunk_fault_write > 0 && --chunk_fault_write == 0) /* test hook: the write fails the way a bad disk's does */
+        return w->err = TSDB_ERR_IO;
     int rc = wr_full(w->fd, data, len);
     if (rc)
         return w->err = rc;
@@ -1472,6 +1474,7 @@ int chunk_be_list(chunk_backend *be, uint32_t volume, bool verify, chunk_list_fn
 }
 
 /* ---------------------------------------------------------------- put an object */
+#ifdef TSDB_EC
 typedef struct put_ctx {
     chunk_wr *w[CHUNK_POS_MAX];
 } put_ctx;
@@ -1482,11 +1485,17 @@ static int put_cell(void *ctx, unsigned pos, uint64_t idx, const uint8_t *data, 
     chunk_wr *w = ((put_ctx *)ctx)->w[pos];
     return w ? chunk_wr_cell_trusted(w, data, len, sum) : 0;
 }
+#endif
 
-int chunk_be_put_object(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
-                        const chunk_geom *g, uint64_t epoch, const uint8_t *obj, unsigned posmask, uint64_t *sums_out)
+int chunk_be_put_stream(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
+                        const chunk_geom *g, uint64_t epoch, const chunk_put_src *src, unsigned posmask,
+                        uint64_t *sums_out)
 {
-    if (!chunk_geom_valid(g))
+#ifndef TSDB_EC
+    (void)be, (void)volume, (void)vuuid, (void)oid, (void)g, (void)epoch, (void)src, (void)posmask, (void)sums_out;
+    return TSDB_ERR_INVALID; /* no erasure codec in this build: nothing is opened */
+#else
+    if (!chunk_geom_valid(g) || !src || !src->fill)
         return TSDB_ERR_INVALID;
     put_ctx pc;
     memset(&pc, 0, sizeof pc);
@@ -1501,7 +1510,7 @@ int chunk_be_put_object(chunk_backend *be, uint32_t volume, const uint8_t vuuid[
         rc = chunk_be_wr_open(be, (base + (int)p) % be->n, &id, g, epoch, &pc.w[p]);
     }
     if (rc == 0)
-        rc = chunk_encode(g, obj, put_cell, &pc, sums_out);
+        rc = chunk_encode_stream(g, src, put_cell, &pc, sums_out);
     for (unsigned p = 0; p < np; p++) {
         if (!pc.w[p])
             continue;
@@ -1517,4 +1526,19 @@ int chunk_be_put_object(chunk_backend *be, uint32_t volume, const uint8_t vuuid[
             }
     }
     return rc;
+#endif
+}
+
+static int mem_fill(void *ctx, uint64_t s, uint64_t off, uint8_t *buf, size_t len)
+{
+    (void)s;
+    memcpy(buf, (const uint8_t *)ctx + off, len);
+    return 0;
+}
+
+int chunk_be_put_object(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
+                        const chunk_geom *g, uint64_t epoch, const uint8_t *obj, unsigned posmask, uint64_t *sums_out)
+{
+    chunk_put_src src = {(void *)(uintptr_t)obj, mem_fill};
+    return chunk_be_put_stream(be, volume, vuuid, oid, g, epoch, &src, posmask, sums_out);
 }
