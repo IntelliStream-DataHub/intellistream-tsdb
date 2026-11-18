@@ -2091,7 +2091,15 @@ static int xp_ship_logs(xport *x)
     return rc;
 }
 
-static uint64_t ld_last(xport *x) { return x->ld->fno_next - 1; }
+/* the leader's last log position; under buf_lock, where the WAL hands numbers out: the flusher appends NOW markers of its
+ * own while a leader's clock is on (TSan, test_replica lmrefn) */
+static uint64_t ld_last(xport *x)
+{
+    pthread_mutex_lock(&x->ld->buf_lock);
+    uint64_t v = x->ld->fno_next - 1;
+    pthread_mutex_unlock(&x->ld->buf_lock);
+    return v;
+}
 
 static int xp_pump(xport *x, uint64_t commit)
 {
@@ -4893,7 +4901,11 @@ static void case_leader_marker_refused(void)
         xp_rows(&x, 0, 0, 10, 100);
         CHECK_EQ(eng_flush(x.ld), 0);
         xp_step(&x, "L6: rows before the clock's refusal");
-        eng_leader_clock(x.ld, 3600 * 1000, 0); /* an hour: the flusher writes no NOW of its own here */
+        uint64_t start = ld_last(&x);
+        eng_leader_clock(x.ld, 3600 * 1000, 0); /* an hour: after its first NOW, the flusher writes none of its own here */
+        for (int i = 0; i < 5000 && ld_last(&x) == start; i++) /* the first one is due at once: let it land first, or */
+            usleep(1000);                                       /* it takes the refusal below and moves ld_last */
+        CHECK(ld_last(&x) > start);
         uint64_t before = ld_last(&x);
         x.refuse_once = TSDB_ERR_UNAVAILABLE;
         CHECK_EQ(eng_drop_before(x.ld, T0 + 10 * DAY_MS), TSDB_ERR_UNAVAILABLE);
