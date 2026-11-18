@@ -183,6 +183,12 @@ static char lying_dir[PATH_MAX]; /* a directory whose syncs lie after the error 
 static char mark[PATH_MAX], eio_only[64], eio_on[16], eio_dir[PATH_MAX], exit_mark[PATH_MAX];
 static unsigned mark_slow_ms; /* CRASHFS_MARK_SLOW_MS: the mark file is created this long before its line is written (a thread that waits for a CPU does the same) */
 static char *fdpath[MAX_FDS];
+/* the file a tracked descriptor was opened on (round 14). A descriptor closed by a call the shim does not see (closedir
+ * of a dup'ed directory descriptor; fclose) leaves its entry behind, and the next socket, pipe or eventfd of that number
+ * would be taken for the file: a worker's wake-up write failed "on the directory" with EIO, the server went on, and the
+ * harness reported a server that did not fail-stop. fd_tracked checks the descriptor still is that file. */
+static dev_t fddev[MAX_FDS];
+static ino_t fdino[MAX_FDS];
 static file *files;
 static size_t nfiles;
 static dirop *dops;
@@ -1189,6 +1195,8 @@ static int md_open(int dirfd, const char *name, int flags, mode_t mode, bool at,
         pthread_mutex_lock(&lock);
         free(fdpath[fd]);
         fdpath[fd] = strdup(path);
+        fddev[fd] = st.st_dev;
+        fdino[fd] = st.st_ino;
         pthread_mutex_unlock(&lock);
     }
     return fd;
@@ -1222,6 +1230,10 @@ static int do_open(int dirfd, const char *name, int flags, mode_t mode, bool at)
         if (fd < MAX_FDS) {
             free(fdpath[fd]);
             fdpath[fd] = strdup(path);
+            if (fstat(fd, &st) == 0) {
+                fddev[fd] = st.st_dev;
+                fdino[fd] = st.st_ino;
+            }
         }
     }
     pthread_mutex_unlock(&lock);
@@ -1255,13 +1267,34 @@ int openat(int dirfd, const char *name, int flags, ...)
 int open64(const char *name, int flags, ...) __attribute__((alias("open")));
 int openat64(int dirfd, const char *name, int flags, ...) __attribute__((alias("openat")));
 
-static bool fd_tracked(int fd) { return fd >= 0 && fd < MAX_FDS && fdpath[fd]; }
+static bool fd_is(int fd) /* the entry is there and the descriptor still is the file it was made for */
+{
+    struct stat st;
+    return fd >= 0 && fd < MAX_FDS && fdpath[fd] && fstat(fd, &st) == 0 && st.st_dev == fddev[fd] &&
+           st.st_ino == fdino[fd];
+}
+
+static bool fd_tracked(int fd) /* the lock is not held */
+{
+    if (fd < 0 || fd >= MAX_FDS || !fdpath[fd])
+        return false;
+    if (fd_is(fd))
+        return true;
+    pthread_mutex_lock(&lock); /* closed behind the shim's back: whatever has this number now is not the file */
+    if (fdpath[fd] && !fd_is(fd)) {
+        free(fdpath[fd]);
+        fdpath[fd] = NULL;
+    }
+    bool t = fdpath[fd] != NULL;
+    pthread_mutex_unlock(&lock);
+    return t;
+}
 
 /* misdirect mode: a write that may go astray; false if the caller must do it as usual */
 static bool md_maybe_write(int fd, const void *buf, size_t n, off_t off, bool positional, ssize_t *r)
 {
     pthread_mutex_lock(&lock);
-    *r = fdpath[fd] && urand() < md_rate ? md_write(fd, buf, n, off, positional) : -1;
+    *r = fd_is(fd) && urand() < md_rate ? md_write(fd, buf, n, off, positional) : -1;
     pthread_mutex_unlock(&lock);
     return *r >= 0;
 }
@@ -1325,7 +1358,7 @@ ssize_t read(int fd, void *buf, size_t n)
     off_t off = lseek(fd, 0, SEEK_CUR);
     ssize_t r = real_read(fd, buf, n);
     pthread_mutex_lock(&lock);
-    if (r > 0 && fdpath[fd] && urand() < md_rate)
+    if (r > 0 && fd_is(fd) && urand() < md_rate)
         md_read(fd, buf, (size_t)r, off);
     pthread_mutex_unlock(&lock);
     return r;
@@ -1337,7 +1370,7 @@ ssize_t pread(int fd, void *buf, size_t n, off_t off)
         return real_pread(fd, buf, n, off);
     ssize_t r = real_pread(fd, buf, n, off);
     pthread_mutex_lock(&lock);
-    if (r > 0 && fdpath[fd] && urand() < md_rate)
+    if (r > 0 && fd_is(fd) && urand() < md_rate)
         md_read(fd, buf, (size_t)r, off);
     pthread_mutex_unlock(&lock);
     return r;
@@ -1355,7 +1388,7 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
         len > ((size_t)1 << 28))
         return real_mmap(addr, len, prot, flags, fd, off);
     pthread_mutex_lock(&lock);
-    bool fault = fdpath[fd] && md_part(fdpath[fd]) && urand() < md_map_rate;
+    bool fault = fd_is(fd) && md_part(fdpath[fd]) && urand() < md_map_rate;
     struct stat st;
     void *p = MAP_FAILED;
     if (fault && fstat(fd, &st) == 0 && (size_t)st.st_size == len && len >= 2)
@@ -1637,6 +1670,8 @@ static void dup_note(int from, int to)
     pthread_mutex_lock(&lock);
     free(fdpath[to]);
     fdpath[to] = fdpath[from] ? strdup(fdpath[from]) : NULL;
+    fddev[to] = fddev[from];
+    fdino[to] = fdino[from];
     pthread_mutex_unlock(&lock);
 }
 

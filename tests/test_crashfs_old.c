@@ -35,10 +35,17 @@
  *  - otrunc_ident:    no loss: a descriptor opened before the truncation sees the new content and the inode is the same
  *  - unlink_nosync, write_then_unlink: a file unlinked without a directory sync is back with what was synced (a soft
  *                     check: bytes that were written and not synced may come back too, as on a disk): the synced bytes, never others
+ * and round 14 (a descriptor closed behind the shim's back: closedir of a dup'ed directory descriptor leaves its entry, and the
+ * next pipe, socket or eventfd of that number was taken for the directory: jepsen --feed --nemesis eio failed a worker's
+ * wake-up write with "EIO on write of DIR", the server went on, and the run reported a server that did not fail-stop):
+ *  - stale_fd:        a directory descriptor dup'ed, read and closed with closedir, a pipe made (its write end has that number), the
+ *                     error armed (CRASHFS_MODE=eio, SIGUSR2): the write to the pipe succeeds, and the next write to a real file
+ *                     is the one that fails with EIO. Run against liboutagefs.so too (a stale number of a failed volume would hang)
  * Usage: test_crashfs_old LIBCRASHFS.so DIR [SEEDS]
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -48,6 +55,8 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "outagefs_ctl.h"
 
 #define LEN 2700 /* not a multiple of 512: the last sector is short */
 #define SECT 512
@@ -322,6 +331,79 @@ static int child2(const char *kind, const char *dir)
     return 3;
 }
 
+/* round 14: stale_fd. Exit 0: the pipe write succeeded and the file write failed with EIO. */
+static int child3(const char *dir)
+{
+    char fp[4400];
+    np(dir, "real", fp);
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0)
+        return 2;
+    int d2 = dup(dfd);
+    DIR *d = d2 >= 0 ? fdopendir(d2) : NULL;
+    if (!d)
+        return 2;
+    while (readdir(d))
+        ;
+    closedir(d); /* not close(): the shim does not see it */
+    close(dfd);
+    int pf[2];
+    if (pipe(pf) != 0)
+        return 2;
+    if (pf[1] != d2 && pf[0] != d2)
+        return 2; /* the numbers are reused in order: the test's premise */
+    int rf = open(fp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (rf < 0)
+        return 2;
+    if (!getenv("OUTAGEFS_CTL"))
+        raise(SIGUSR2); /* the next write or sync of a file fails (crashfs) */
+    else { /* outagefs: every call on the volume fails with EIO */
+        char line[4500], out[256];
+        snprintf(line, sizeof line, "eio %s", dir);
+        if (outagefs_cmd(getenv("OUTAGEFS_CTL"), line, out, sizeof out) != 0)
+            return 2;
+    }
+    if (write(pf[1], "x", 1) != 1)
+        return 3; /* EIO on a pipe: the number of a closed directory descriptor was taken for the directory */
+    errno = 0;
+    if (write(rf, CA, 100) != -1 || errno != EIO)
+        return 4; /* the real file must fail: the shim's error is not disarmed by what it did to the pipe */
+    return 0;
+}
+
+static void run_stale(const char *so, const char *which, const char *dir, bool outage)
+{
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+        failures++;
+        return;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0)
+            dup2(nul, 2);
+        char ld[4300], root[4300], *argv[4];
+        snprintf(ld, sizeof ld, "LD_PRELOAD=%s", so);
+        snprintf(root, sizeof root, "%s=%s", outage ? "OUTAGEFS_ROOTS" : "CRASHFS_ROOT", dir);
+        char ctl[4300];
+        snprintf(ctl, sizeof ctl, "OUTAGEFS_CTL=%s.sock", dir);
+        char *envp[] = {ld, root, "CRASHFS_MODE=eio", "CRASHFS_PROB=0", "CRASHFS_SEED=1", outage ? ctl : "X=1",
+                        "OUTAGEFS_HOLD_MAX_S=20", NULL};
+        argv[0] = "test_crashfs_old";
+        argv[1] = "--child3";
+        argv[2] = (char *)dir;
+        argv[3] = NULL;
+        execve("/proc/self/exe", argv, envp);
+        _exit(2);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid) {
+        failures++;
+        return;
+    }
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "%s stale_fd: the child ended with status 0x%x (3: the pipe write failed with EIO, a stale descriptor entry was taken for the directory; 4: the real file's write did not fail)", which, st);
+}
+
 static long slurp(const char *p, unsigned char *buf, size_t cap)
 {
     int fd = open(p, O_RDONLY);
@@ -437,6 +519,8 @@ int main(int argc, char **argv)
         return child(argv[2], argv[3], strtoul(argv[4], NULL, 10));
     if (argc >= 4 && !strcmp(argv[1], "--child2"))
         return child2(argv[2], argv[3]);
+    if (argc >= 3 && !strcmp(argv[1], "--child3"))
+        return child3(argv[2]);
     if (argc < 3) {
         fprintf(stderr, "usage: %s LIBCRASHFS.so DIR [SEEDS]\n", argv[0]);
         return 2;
@@ -482,6 +566,17 @@ int main(int argc, char **argv)
                 snprintf(dir, sizeof dir, "%s/%s-%s%lu", base, k2[k], m2[m], seed);
                 run_case2(argv[1], k2[k], m2[m], dir, seed);
             }
+    }
+    {
+        char dir[3000];
+        snprintf(dir, sizeof dir, "%s/stale_fd", base);
+        run_stale(argv[1], "crashfs", dir, false);
+        char so2[4300], *sl = strrchr(argv[1], '/');
+        snprintf(so2, sizeof so2, "%.*sliboutagefs.so", sl ? (int)(sl - argv[1] + 1) : 0, argv[1]);
+        if (access(so2, R_OK) == 0) {
+            snprintf(dir, sizeof dir, "%s/so", base); /* its control socket, DIR.sock, must fit sun_path */
+            run_stale(so2, "outagefs", dir, true);
+        }
     }
     char cmd[4300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", base);

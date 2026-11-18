@@ -73,6 +73,11 @@ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static signed char fdroot[MAX_FDS]; /* 0: not ours, else index + 1 */
 static bool fdpoison[MAX_FDS];      /* eiodrop: this descriptor's failure was reported */
+/* The file a descriptor was tracked for (round 14): a descriptor closed by a call the shim does not see (closedir of a
+ * dup'ed directory descriptor) leaves its entry, and the next socket or pipe of that number would be failed or held as
+ * a file of the dead volume. root_of_fd checks it still is that file. */
+static dev_t fddev[MAX_FDS];
+static ino_t fdino[MAX_FDS];
 static __thread bool bypass;        /* the control thread's own file work */
 static pid_t parent0;               /* getppid() when the shim loaded: the harness */
 static char ctl_path[PATH_MAX];     /* the control socket's file, "" without one */
@@ -164,7 +169,16 @@ static int root_of_path(const char *p)
     return 0;
 }
 
-static int root_of_fd(int fd) { return fd >= 0 && fd < MAX_FDS ? fdroot[fd] : 0; }
+static int root_of_fd(int fd)
+{
+    if (fd < 0 || fd >= MAX_FDS || !fdroot[fd])
+        return 0;
+    struct stat st;
+    if (real_fstat(fd, &st) == 0 && st.st_dev == fddev[fd] && st.st_ino == fdino[fd])
+        return fdroot[fd];
+    fdroot[fd] = 0; /* closed behind the shim's back */
+    return 0;
+}
 
 static int root_of_at(int dirfd, const char *name)
 {
@@ -258,6 +272,13 @@ static int sync_gate(int fd)
 static void track(int fd, int r)
 {
     if (fd >= 0 && fd < MAX_FDS) {
+        struct stat st;
+        if (r && real_fstat(fd, &st) == 0) {
+            fddev[fd] = st.st_dev;
+            fdino[fd] = st.st_ino;
+        } else {
+            r = 0;
+        }
         fdroot[fd] = (signed char)r;
         fdpoison[fd] = false;
     }
