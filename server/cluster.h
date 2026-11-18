@@ -45,6 +45,16 @@ enum cluster_admin_op {
     CLUSTER_OP_STATUS = 3,   /* no body; on any server */
     CLUSTER_OP_VOLUME_ADD = 4, /* body: u16 name length, the name, u32 replicas (0: the cluster's replication); on the
                                 * Raft leader, which picks the number, uuid, servers and rids. Reply: u32 number */
+    /* USER_PUT, USER_DEL: body u16 name length, the name, u64 version (DEL: 0), u32 wait_ms, u32 blob length, the
+     * blob (DEL: none); on the Raft leader. Answered once applied there: the operation's result, and when it is
+     * META_OK the body u64 index, u32 uid, u32 n, n x {u32 member, u64 applied} (the members below the index after
+     * wait_ms, cluster_user_propose) */
+    CLUSTER_OP_USER_PUT = 5,
+    CLUSTER_OP_USER_DEL = 6,
+    /* USER_GET: body u16 name length, the name; on any server, from its copy. Reply: u64 version, u32 uid, the blob
+     * (META_ERR_NOTFOUND without a body). An empty name lists: u32 n, n x {u16 name length, the name, u32 uid, u64
+     * version} */
+    CLUSTER_OP_USER_GET = 7,
 };
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
@@ -190,6 +200,45 @@ struct cluster_vol_rec {
  * keeps and not block. */
 typedef void (*cluster_vol_watch_fn)(void *arg, uint32_t self, const struct cluster_vol_rec *v, uint32_t n);
 void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg);
+
+/* ---- users and grants in the metadata group (design-cluster.md C22, design-ha-modes.md :916; S2-1) */
+struct cluster_user_rec {
+    const char *name;    /* at most USER_NAME_MAX bytes */
+    uint32_t uid;        /* assigned by the state machine, never reused */
+    uint64_t version;    /* the index of the entry that last put the user: what a conditional put names */
+    const uint8_t *blob; /* META_USER_UID_LEN bytes of uid (little-endian), then the user's compacted USERS records */
+    uint32_t len;
+};
+/* Called on the cluster thread with every user of the metadata copy, ascending by name, and the applied index the
+ * list is at, after the copy changed its users (an entry or a snapshot) and once when a callback is set while the copy
+ * has any. The records point into the copy and are valid during the call only: it must copy what it keeps and not
+ * block. NULL stops the calls. Any thread. */
+typedef void (*cluster_users_fn)(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied);
+void cluster_set_users_watch(cluster_users_fn fn, void *arg);
+
+/* The catch-up barrier (D-S2): 0 from cluster_start until this server has heard a Raft leader's commit index in this
+ * run (an HB_ACK from the leader it names; the leader itself: its commit index once an entry of its own term is
+ * committed) and its copy has applied up to it; 1 from then on, also while it is cut off later (a member cut off
+ * keeps the users it has until it hears the group, ha-modes :916). Logins wait for it, so a restarted server never
+ * accepts a user whose drop committed while it was down. Any thread. */
+int cluster_users_caught_up(void);
+
+enum { CLUSTER_USER_PUT = 1, CLUSTER_USER_DEL = 2 };
+#define CLUSTER_LAGGARDS_MAX 64
+struct cluster_laggard {
+    uint32_t id;      /* a member (not OUT) */
+    uint64_t applied; /* the applied index its last heartbeat reported; 0: not heard */
+};
+/* Proposes USER_PUT (`blob`, `len`: META_USER_UID_LEN bytes, which the state machine overwrites with the uid, then
+ * the records; conditional on `version`, 0 to create) or USER_DEL (blob, len and version unused) through the Raft
+ * leader (this server, or the leader it knows, over the admin link with the cluster secret). Returns once the entry
+ * is committed and applied on the leader and every member has reported an applied index at or above it, or wait_ms
+ * after that: *index is the entry's index, *uid the user's, lag[0 .. *nlag) the members still below it (at most
+ * CLUSTER_LAGGARDS_MAX). Result: META_OK, a META_ERR_* of the operation (STALE, EXISTS, NOTFOUND, INVALID, RANGE), or
+ * a CLUSTER_ERR_* (NOTLEADER when no leader is known, RETRY when the outcome is unknown: read the user again before
+ * deciding). Blocks: never on the cluster thread. */
+int cluster_user_propose(int op, const char *name, const void *blob, uint32_t len, uint64_t version, int wait_ms,
+                         uint64_t *index, uint32_t *uid, struct cluster_laggard *lag, uint32_t *nlag);
 
 struct cluster_vol_status {
     struct cluster_vol_report v;
