@@ -23,6 +23,10 @@ void cvol_stop(void);
 int cvol_why(uint32_t v);
 /* 1 when volume v is a cluster volume open and led here (whatever the lease says) */
 int cvol_led(uint32_t v);
+/* 1 when a write to replicated volume `v` belongs to another server: this one only replicates it (or was deposed) and
+ * the metadata copy names a leader with a client address, which `node`, `epoch` and `addr` (NUL terminated) get. tsdbd
+ * answers such a write MOVED (design-cluster.md 6.3): definitely not applied, the client goes to that address. */
+int cvol_moved(uint32_t v, uint32_t *node, uint64_t *epoch, char *addr, size_t cap);
 /* 1 once cvol_start ran: an engine's READONLY on a cluster volume becomes UNAVAILABLE (FENCED). */
 int cvol_active(void);
 /* 1 once the manager went through the volume records of a metadata copy: before that a volume name it does not know

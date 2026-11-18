@@ -300,6 +300,28 @@ int cvol_led(uint32_t v)
     return open && writer;
 }
 
+int cvol_moved(uint32_t v, uint32_t *node, uint64_t *epoch, char *addr, size_t cap)
+{
+    if (!M.active || cap == 0 || cvol_why(v) != TSDB_WHY_FENCED)
+        return 0;
+    int found = 0;
+    pthread_mutex_lock(&M.mu);
+    for (uint32_t i = 0; i < M.nrecs; i++) {
+        const struct cluster_vol_rec *r = &M.recs[i];
+        if (r->number != v)
+            continue;
+        if (r->leader != M.self && r->leader_addr[0]) {
+            *node = r->leader;
+            *epoch = r->epoch;
+            snprintf(addr, cap, "%s", r->leader_addr);
+            found = 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&M.mu);
+    return found;
+}
+
 int cvol_active(void) { return M.active; }
 
 int cvol_synced(void)

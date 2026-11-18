@@ -2353,6 +2353,26 @@ static void expect_unavail(tsdbc *c, int rc, uint16_t vol, int why, const char *
             n ? e.reason : 0, n, vol, why);
 }
 
+/* rc is MOVED (design-cluster.md 6.3): a write to a replicated volume on a server that does not lead it, naming
+ * volume `vol` and its leader `node` at `epoch` with that server's client address */
+static void expect_moved(tsdbc *c, int rc, uint16_t vol, uint32_t node, uint64_t epoch, const char *what)
+{
+    tsdbc_err_info e;
+    if (rc != TSDB_ERR_MOVED)
+        die("%s: %s, not MOVED", what, ers(rc));
+    if (tsdbc_last_error(c, &e) != TSDB_ERR_MOVED || !e.has_body || e.nmoved != 1)
+        die("%s: MOVED without one entry (body %d, %u entries)", what, e.has_body, e.nmoved);
+    int s = server_of(node);
+    char port[16];
+    snprintf(port, sizeof port, ":%d", s >= 0 ? cports[s] : -1);
+    size_t al = strlen(e.moved[0].addr), pl = strlen(port);
+    if (e.moved[0].vol != vol || e.moved[0].node_id != node || e.moved[0].epoch != epoch || al < pl ||
+        strcmp(e.moved[0].addr + al - pl, port) != 0)
+        die("%s: MOVED names volume %u, node %u at epoch %u, address %s; not volume %u, node %u at epoch %" PRIu64
+            ", port %s", what, e.moved[0].vol, e.moved[0].node_id, e.moved[0].epoch, e.moved[0].addr, vol, node, epoch,
+            port + 1);
+}
+
 /* series pump7.flow in `vol` on server i: made, written and read back (returns its id) */
 static tsdb_sid write_read(tsdbc *c, const char *vol, int64_t t0)
 {
@@ -2472,24 +2492,24 @@ static void scen_volumes(void)
             continue;
         c = client(i);
         rc = tsdbc_series_at(c, "pump7.flow", "plant", &x);
-        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "series made on a replica");
+        expect_moved(c, rc, 1, v.leader, v.epoch, "series made on a replica");
         int64_t ts = 5000;
         float val = 5;
         rc = tsdbc_insert_series(c, id, &ts, &val, 1);
-        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "insert on a replica");
+        expect_moved(c, rc, 1, v.leader, v.epoch, "insert on a replica");
         /* the packed frames name a series per row: an id the replica's dictionary does not know yet (the leader made
-         * it, nothing replicates) is still FENCED naming the volume, never INVALID (cvol_refuse_ids) */
+         * it, nothing replicates) is still MOVED naming the volume, never INVALID (cvol_refuse_ids) */
         tsdb_sid ids2[2] = {id, id};
         int64_t ts2[2] = {5000, 5001};
         float val2[2] = {5, 6};
         rc = tsdbc_insert(c, ids2, ts2, val2, 2);
-        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "a packed insert on a replica");
+        expect_moved(c, rc, 1, v.leader, v.epoch, "a packed insert on a replica");
         tsdb_values tv = {TSDB_FLOAT32, val2, NULL};
         rc = tsdbc_insert_values(c, ids2, ts2, &tv, 2);
-        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "a packed typed insert on a replica");
+        expect_moved(c, rc, 1, v.leader, v.epoch, "a packed typed insert on a replica");
         tsdbc_close(c);
     }
-    printf("  the leader takes writes and reads them back, the replicas refuse them (FENCED)\n");
+    printf("  the leader takes writes and reads them back, the replicas refuse them (MOVED to the leader)\n");
 
     /* restarts: the same rid, the generation raised, saved and recorded; the leader's rows are still there */
     char dir1[PATH_MAX + 80], v1[PATH_MAX + 120], old1[PATH_MAX + 120], cmd[PATH_MAX * 4];
@@ -4794,12 +4814,27 @@ static void scen_failover(void)
     if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
         die("a write to the new leader: %s", ers(rc));
     tsdbc_close(c);
-    /* the old leader restarts as a replica and rejoins */
+    /* a write to the other replica is MOVED to the new leader, and a client with a budget follows it there */
+    int R = 3 - L - Nw;
+    c = client(R);
+    ts = 9001000;
+    rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+    expect_moved(c, rc, 1, v.leader, v.epoch, "a write to a replica after the failover");
+    tsdbc_set_retry(c, 10000);
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write that follows MOVED from server %d: %s", R, ers(rc));
+    tsdbc_close(c);
+    /* the old leader restarts as a replica and rejoins; it never resumes leading: writes to it are MOVED */
     start(L);
     await_isr(via, "fo", 3, 60000, "the old leader back in the ISR");
+    c = client(L);
+    ts = 9002000;
+    rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+    expect_moved(c, rc, 1, v.leader, v.epoch, "a write to the old leader after it rejoined");
+    tsdbc_close(c);
     int total = rows_in(Nw, id, 0, INT64_MAX / 2, 10000);
-    if (total < acked + 1)
-        die("the new leader holds %d rows after the rejoin, fewer than the %d acknowledged", total, acked + 1);
+    if (total < acked + 2)
+        die("the new leader holds %d rows after the rejoin, fewer than the %d acknowledged", total, acked + 2);
     stop_all();
     uint64_t wantr[REP_NAMES] = {0};
     wantr[0] = (uint64_t)total;

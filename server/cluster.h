@@ -183,6 +183,7 @@ struct cluster_vol_rec {
     uint8_t uuid[16], cluster[16];
     uint32_t leader; /* the record's leader (rep[0] at VOLUME_ADD): the writer */
     uint64_t epoch;
+    char leader_addr[META_ADDR_MAX]; /* its client address as the member list holds it ("" unknown): MOVED names it */
     uint64_t rid, open_gen; /* this server's replica: its instance and the last REPLICA_OPEN generation committed */
     uint64_t open_nonce;    /* and the nonce committed with it */
     /* replication (server/repld.c): the replicas in record order (the node index of the core, src/repl.h, is the

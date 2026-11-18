@@ -4223,6 +4223,8 @@ static void vol_watch_duty(void)
             memcpy(r->cluster, C.uuid, 16);
             r->leader = v->leader;
             r->epoch = v->epoch;
+            const struct meta_member *lm = meta_member(&C.sm, v->leader);
+            snprintf(r->leader_addr, sizeof r->leader_addr, "%s", lm ? lm->addr : "");
             r->rid = v->rep[k].rid;
             r->open_gen = v->rep[k].open_gen;
             r->open_nonce = v->rep[k].open_nonce;

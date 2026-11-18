@@ -499,6 +499,7 @@ static __thread struct {
     size_t n;
 } lguard;
 static const char *test_read_stall; /* TSDBD_TEST_READ_STALL: an admitted cluster read waits while this file exists */
+static bool test_no_moved; /* TSDBD_TEST_NO_MOVED (a planted fault): a write a non-leader refuses gets UNAVAILABLE */
 
 #include "domains.h"
 static void dom_waits(int delta) { worker_waits(delta); }
@@ -946,7 +947,7 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
     }
     if (lguard.on && lguard.failed)
         return !atomic_load(&c->closing); /* handle() answers UNAVAILABLE once the op is done */
-    uint8_t ub[2 + TSDB_UNAVAIL_ENTRY]; /* the body of UNAVAILABLE (protocol 13), after the op's own error shape */
+    uint8_t ub[2 + 13 + TSDB_ADDR_MAX]; /* the body of UNAVAILABLE or MOVED (protocol 13), after the op's error shape */
     size_t ulen = 0;
     /* a cluster volume this server only replicates (or leads before replication is wired) refuses writes as
      * UNAVAILABLE (FENCED), the engine's READONLY; a cluster node has no other read-only volume (--cluster refuses
@@ -956,8 +957,26 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
     /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
      * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
     if (status == TSDB_ERR_UNAVAILABLE && atomic_load(&c->proto) >= 13 && (!ix || *ix == TSDB_MULTI_END)) {
-        tsdb_unavail e = unav_entry(unav_vol);
-        ulen = tsdb_wire_put_unavail(ub, sizeof ub, &e, 1);
+        /* a write to a replicated volume whose leader is another server (this one replicates it, or was deposed):
+         * MOVED to the record's leader (design-cluster.md 6.3), definitely not applied. A write the deposed leader
+         * had already appended never gets here: it is of unknown outcome (D12, above). */
+        uint32_t node;
+        uint64_t epoch;
+        char addr[TSDB_ADDR_MAX + 1];
+        if (unav_write && unav_vol != TSDB_VOL_ANY && cvol_active() && !test_no_moved &&
+            cvol_moved(unav_vol, &node, &epoch, addr, sizeof addr)) {
+            tsdb_moved m = {.vol = unav_vol, .epoch = (uint32_t)epoch, .node_id = node, .addr = addr,
+                            .addr_len = (uint16_t)strlen(addr)};
+            ulen = tsdb_wire_put_moved(ub, sizeof ub, &m, 1);
+            if (ulen && ulen <= sizeof ub)
+                status = TSDB_ERR_MOVED;
+            else
+                ulen = 0;
+        }
+        if (status == TSDB_ERR_UNAVAILABLE) {
+            tsdb_unavail e = unav_entry(unav_vol);
+            ulen = tsdb_wire_put_unavail(ub, sizeof ub, &e, 1);
+        }
     }
     size_t body = 4 + 1 + 4 + pre + alen + blen + dlen + ulen;
     if (body > TSDB_MAX_FRAME + pre) { /* callers check: a client could not read it, and the length would wrap */
@@ -2599,8 +2618,10 @@ static void handle_op(req *r)
             rc = tsdb_series_at(db, name, path && *path ? path : NULL, &id);
         if (rc == TSDB_ERR_NOTFOUND && path && *path && cvol_active() && !cvol_synced())
             rc = TSDB_ERR_UNAVAILABLE; /* a volume the metadata copy has not shown this server yet (RECOVERING) */
-        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_READONLY) /* READONLY: a replica's, sent as UNAVAILABLE */
+        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_READONLY) { /* READONLY: a replica's, sent as UNAVAILABLE */
             unav_vol = path_volume(path);
+            unav_write |= rc == TSDB_ERR_READONLY; /* a creation: MOVED where another server leads the volume */
+        }
         free(name);
         free(path);
         if (rc == 0) {
@@ -2702,8 +2723,10 @@ static void handle_op(req *r)
         rc = !name || (pn && !path) ? TSDB_ERR_NOMEM : tsdb_series_create(db, name, (tsdb_type)p[0], path, &id);
         if (rc == TSDB_ERR_NOTFOUND && path && *path && cvol_active() && !cvol_synced())
             rc = TSDB_ERR_UNAVAILABLE; /* a volume the metadata copy has not shown this server yet (RECOVERING) */
-        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_READONLY) /* READONLY: a replica's, sent as UNAVAILABLE */
+        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_READONLY) { /* READONLY: a replica's, sent as UNAVAILABLE */
             unav_vol = path_volume(path);
+            unav_write |= rc == TSDB_ERR_READONLY; /* a creation: MOVED where another server leads the volume */
+        }
         free(name);
         free(path);
         if (rc == 0) {
@@ -4703,6 +4726,7 @@ int main(int argc, char **argv)
         tsdb_test_precommit(db, hold_large, NULL);
     test_loop_stall = getenv("TSDBD_TEST_LOOP_STALL");
     test_read_stall = getenv("TSDBD_TEST_READ_STALL");
+    test_no_moved = getenv("TSDBD_TEST_NO_MOVED") != NULL;
     if (getenv("TSDBD_TEST_AUTH_DELAY_MS"))
         test_auth_delay_ms = atoi(getenv("TSDBD_TEST_AUTH_DELAY_MS"));
     struct rlimit rl;
