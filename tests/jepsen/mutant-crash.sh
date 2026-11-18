@@ -21,6 +21,11 @@
 #   JV_OPENFAIL=1  a server whose log (the epoch's, appended to) holds the damage line an earlier server planted exits 1 at open, once per gate
 #                  (JV_ONCEFILE4), with "tsdbd: open: invalid argument": a recovery bug of its own, no damage (VERIFY12 (A): it counted as refused on
 #                  damage because the whole epoch's log was read); the first server of the epoch plants that line
+#   JV_OPENANY=exit1|exit0|hang|dstall  the SECOND start of the tsdbd the harness runs as its writer (or, with JV_OPENWHO=follower, the follower: its only
+#                  start), once per gate (JV_ONCEFILE6; JV_STARTCNT names the file whose creation says the first start has passed), does at open:
+#                  exit 1 with "tsdbd: DIR: invalid argument" (a recovery bug of its own: no damage, no failure of the machine), exit 0, pause() for
+#                  ever before it listens, or a thread in D state for good (vfork whose child never execs: the kernel's stall) (round 14; VERIFY13
+#                  (A): the first three were a harness error, exit 2, "not a verdict about tsdb", under every nemesis but misdirect and rot)
 # and runs them through tests/jepsen/rerun.sh:
 #   crash under kill, pause, none, eio and power: exit 1 at the FIRST attempt (no "jepsen-rerun: attempt" line, never 0 or 3), naming the
 #     signal and the server's log;
@@ -42,6 +47,7 @@ f=$tmp/server/tsdbd.c
 cat > "$tmp/server/jv_hooks.h" <<'JVEOF'
 /* test-only hooks of tests/jepsen/mutant-crash.sh (round 13) */
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -94,6 +100,40 @@ static void jv_openfail(void)
     if (jv_once_file("JV_ONCEFILE4")) {
         fprintf(stderr, "tsdbd: open: invalid argument\n");
         _exit(1);
+    }
+}
+static void jv_openany(const char *dir)
+{
+    static char cl[8192];
+    const char *m = getenv("JV_OPENANY");
+    if (!m || !getenv("JV_STARTCNT"))
+        return;
+    bool fol = false; /* the follower is a tsdbd too (--follow) */
+    int cfd = open("/proc/self/cmdline", O_RDONLY);
+    ssize_t cn = cfd >= 0 ? read(cfd, cl, sizeof cl - 1) : -1;
+    if (cfd >= 0)
+        close(cfd);
+    for (ssize_t i = 0; i < cn; i += (ssize_t)strlen(cl + i) + 1)
+        fol = fol || !strcmp(cl + i, "--follow");
+    bool aim = getenv("JV_OPENWHO") && !strcmp(getenv("JV_OPENWHO"), "follower") ? fol : !fol;
+    if (!aim)
+        return;
+    int first = fol ? 0 : jv_once_file("JV_STARTCNT"); /* the writer's first start (the series') passes */
+    if (first || !jv_once_file("JV_ONCEFILE6"))
+        return;
+    if (!strcmp(m, "exit1")) {
+        fprintf(stderr, "tsdbd: %s: invalid argument\n", dir);
+        _exit(1);
+    }
+    if (!strcmp(m, "exit0"))
+        _exit(0);
+    if (!strcmp(m, "hang"))
+        for (;;)
+            pause();
+    if (!strcmp(m, "dstall") && vfork() == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        for (;;)
+            pause();
     }
 }
 JVEOF
@@ -155,8 +195,9 @@ sed -i 's/^    case TSDB_OP_INSERT: {$/&\
         if (jv_every("JV_HANG")) for (;;) pause();\
         jv_extra();/' "$f"
 sed -i 's/^    int rc = tsdb_open(dir, &o, &db);$/    jv_openfail();\
+    jv_openany(dir);\
 &/' "$f"
-if [ "$(grep -c 'jv_every(' "$f")" -ne 11 ] || [ "$(grep -c 'jv_extra();' "$f")" -ne 2 ] || [ "$(grep -c 'jv_openfail();' "$f")" -ne 1 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
+if [ "$(grep -c 'jv_every(' "$f")" -ne 11 ] || [ "$(grep -c 'jv_extra();' "$f")" -ne 2 ] || [ "$(grep -c 'jv_openfail();' "$f")" -ne 1 ] || [ "$(grep -c 'jv_openany(dir);' "$f")" -ne 1 ]; then echo "mutant-crash: the hooks did not apply"; rm -rf "$tmp"; exit 1; fi
 (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-crash: build failed"; tail -5 "$tmp/build.log"; rm -rf "$tmp"; exit 1; }
 mut=$tmp/build/tsdbd
 crashfs=$root/build/libcrashfs.so
@@ -284,5 +325,64 @@ run_case "openfail-md" "$OF" "a server that exits 1 at open for a reason of its 
     --nemesis misdirect --seconds 20 --crashfs "$crashfs"
 run_case "openfail-mdv" "$OF" "a server that exits 1 at open for a reason of its own, misdirect, verify_checksums" JV_OPENFAIL=1 JV_ONCEFILE4="$tmp/of-mdv" -- \
     --nemesis misdirect --seconds 20 --crashfs "$crashfs" --verify-checksums
+# a server (the writer, and the follower) that fails at open for a reason of its own after the planned faults, under every nemesis: a VIOLATION at the FIRST
+# attempt (round 14; VERIFY13 (A): exit 1 with no damage in its lines, exit 0 and a hang before it listens were "the environment, not a verdict about
+# tsdb", exit 2, under every nemesis but misdirect and rot; the follower likewise). The hung server is waited for 10 s (JEPSEN_OPEN_WAIT_MS), the machine
+# not stalled; one that sits in D state for good is the kernel's: exit 2 (the environment), as it always was.
+OE="exits with status 1 while opening.*not a refusal on damage"
+O0="exits with status 0 before it listens"
+OH="is alive and wrote no port file in [0-9]* s, and the machine did not stall"
+tiercli=$root/build/tsdb
+oa_case() { # name pattern what mode nemesis-args...
+    local name=$1 pat=$2 what=$3 mode=$4; shift 4
+    want "$name" || return 0
+    rm -f "$tmp/oa-$name".*
+    run_case "$name" "$pat" "$what" JV_OPENANY="$mode" JV_STARTCNT="$tmp/oa-$name.1" JV_ONCEFILE6="$tmp/oa-$name.2" JEPSEN_OPEN_WAIT_MS=10000 -- "$@"
+}
+for nem in kill pause none; do
+    oa_case "openany-exit1-$nem" "$OE" "a server whose restart exits 1 at open for a reason of its own, $nem nemesis" exit1 --nemesis "$nem" --seconds 12
+    oa_case "openany-exit0-$nem" "$O0" "a server whose restart exits 0 before it listens, $nem nemesis" exit0 --nemesis "$nem" --seconds 12
+    oa_case "openany-hang-$nem" "$OH" "a server whose restart hangs before it listens, $nem nemesis" hang --nemesis "$nem" --seconds 12
+done
+for nem in eio power; do
+    oa_case "openany-exit1-$nem" "$OE" "a server whose restart exits 1 at open for a reason of its own, $nem nemesis" exit1 --nemesis "$nem" --seconds 12 \
+        --crashfs "$crashfs"
+    oa_case "openany-exit0-$nem" "$O0" "a server whose restart exits 0 before it listens, $nem nemesis" exit0 --nemesis "$nem" --seconds 12 --crashfs "$crashfs"
+    oa_case "openany-hang-$nem" "$OH" "a server whose restart hangs before it listens, $nem nemesis" hang --nemesis "$nem" --seconds 12 --crashfs "$crashfs"
+done
+oa_case "openany-exit1-outage" "$OE" "a server whose restart exits 1 at open for a reason of its own, outage nemesis" exit1 --nemesis outage --seconds 20 \
+    --outagefs "$outagefs"
+oa_case "openany-exit1-auth" "$OE" "a server whose restart exits 1 at open for a reason of its own, login on, kill nemesis" exit1 --auth --nemesis kill --seconds 12
+oa_case "openany-exit1-feed" "$OE" "a server whose restart exits 1 at open for a reason of its own, change feed on, kill nemesis" exit1 --feed --nemesis kill --seconds 12
+oa_case "openany-exit1-classes" "$OE" "a server whose restart exits 1 at open for a reason of its own, classes workload, power nemesis" exit1 --workload classes \
+    --nemesis power --seconds 12 --crashfs "$crashfs"
+for mode in exit1 exit0 hang; do # the follower of the power nemesis
+    case $mode in
+    exit1) pat="the follower (pid [0-9]*) exits with status 1 while opening" ;;
+    exit0) pat="the follower (pid [0-9]*) exits with status 0 before it listens" ;;
+    *) pat="the follower (pid [0-9]*) is alive and wrote no port file in [0-9]* s, and the machine did not stall" ;;
+    esac
+    want "openfol-$mode" || continue
+    rm -f "$tmp/of-$mode".*
+    run_case "openfol-$mode" "$pat" "a follower that fails at open ($mode), power nemesis" JV_OPENANY=$mode JV_OPENWHO=follower \
+        JV_STARTCNT="$tmp/of-$mode.1" JV_ONCEFILE6="$tmp/of-$mode.2" JEPSEN_OPEN_WAIT_MS=10000 -- --nemesis power --seconds 12 --crashfs "$crashfs"
+done
+# a thread of the server in D state for good at open is the kernel's stall, not a verdict: a harness error (exit 2), never a violation, never a pass
+if want openany-dstall-kill; then
+    rm -f "$tmp/oa-ds".*
+    t0=$(date +%s)
+    out=$(JV_OPENANY=dstall JV_STARTCNT="$tmp/oa-ds.1" JV_ONCEFILE6="$tmp/oa-ds.2" JEPSEN_REQ_DEADLINE_S=12 JEPSEN_OPEN_WAIT_MS=20000 JEPSEN_TSDBD="$mut" \
+        timeout "${TMO:-200}" "$bin" --dir "$dir" --nemesis kill --seconds 10 2>&1); st=$?
+    left=$(leftover | tr '\n' ' ')
+    if [ $st -eq 2 ] && echo "$out" | grep -q 'the server does not come up (the environment, not a verdict about tsdb), and a thread of the server sat in D state' &&
+        ! echo "$out" | grep -q 'FAILED' && [ -z "$left" ]; then
+        echo "mutant-crash: openany-dstall-kill is a harness error (exit 2), not a violation, in $(($(date +%s) - t0)) s: a thread in D state for good at open"
+    else
+        echo "mutant-crash: openany-dstall-kill: a thread in D state for good at open was not a harness error (rc $st, wanted 2; left behind: ${left:-none})"
+        echo "$out" | tail -n 15
+        rc=1
+    fi
+    for p in $left; do kill -KILL "$p" 2>/dev/null; done
+fi
 rm -rf "$tmp"
 exit $rc

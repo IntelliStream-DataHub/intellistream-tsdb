@@ -135,7 +135,10 @@
  * Not a wrong answer but the server itself (round 11; the same verdict, VIOLATION, under every nemesis and under none): a tsdbd that
  * ends by itself (a crash, an exit of its own; end_report: only what the harness sent, or the shim's power loss, or an EIO's fail-stop
  * is expected) or that stops answering (every request has a deadline, REQ_DEADLINE_DEFAULT_S) or whose stop never ends; a tsdbd that
- * will not start is the environment (exit 2) unless its log says that the data is damaged (exit 1). Liveness, how soon things
+ * will not start for a reason of its own (round 14: it exits 0, or exits with no line naming a failure of the machine, or is alive with no
+ * port file and the machine not stalled: no_port_is_noted; the follower too) is a VIOLATION (exit 1), and only what the machine did (io_uring:
+ * Cannot allocate memory, a stall: a thread of the server in D state for 10 s, this thread not scheduled for a second) is the environment
+ * (exit 2). Liveness, how soon things
  * resume after a fault, is INCONCLUSIVE (exit 3) and never a violation.
  * Round 12 (what the harness looks at before it acts, and where it cannot see):
  *  - a server that is crashing when the harness kills it (its core dump keeps it from being a zombie, so a SIGKILL would turn the end
@@ -145,7 +148,7 @@
  *  - a request that misses its deadline while a thread of the server has been in D state (the kernel's: a file system that stalls) for
  *    10 s at a stretch is INCONCLUSIVE (kernel-stall), one with no such thread is a VIOLATION. A D state that is tsdbd's own looks the same
  *    from outside.
- *  - a server that has not listened yet is judged by start_server_run alone: it never came up (exit 2) unless its log shows damage.
+ *  - a server that has not listened yet is judged by start_server_run alone (round 14 reversed round 12's "never came up: exit 2"): see above.
  *  - under power and eio the last server, which the quiet tail leaves to the clients, is a clean one (no shim, so nothing ends it but the
  *    harness): a hung worker then reaches the deadline.
  *  - under misdirect and rot a server's end is a fail-stop on damage (not a violation) only as exit 1, with a log that names the damage, in an
@@ -972,6 +975,74 @@ static bool step_reached(int step, pid_t pid)
     return false;
 }
 
+/* A server that does not come up (round 14; VERIFY13 finding 1). Two things are a verdict about tsdb, whatever the nemesis (kill, pause, power,
+ * eio, outage, none, the login and feed variants, and the follower): a server that ENDS before it listens for a reason of its own (exit 0,
+ * or a non-zero exit whose own lines, from this start's offset, name no failure of the machine: log_env_failure), and a server that is ALIVE
+ * and wrote no port file in 30 s while the machine was not stalled (it hangs: pause(), a spin, a deadlock). Not a verdict: a server that
+ * says what a machine out of memory says (io_uring: Cannot allocate memory), exit 127 (no binary), a server the machine killed, and a wait
+ * during which the machine stalled (a thread of the server in D state for dstate_min_ns, or this thread itself not scheduled for a second:
+ * liveness under load, a harness error, exit 2). A refusal on damage under misdirect and rot is judged before this, from the log. Every
+ * message names the server's log and its last lines. */
+static int64_t dstate_min_ns = 10000000000LL; /* a thread of the server in D state this long without a break is the kernel's stall (see req_done) */
+#define AWAIT_SLICE_MS 250
+static int open_wait_ms(void) /* how long a server may take to write its port file (JEPSEN_OPEN_WAIT_MS: the selftest's hung servers) */
+{
+    return getenv("JEPSEN_OPEN_WAIT_MS") && atoi(getenv("JEPSEN_OPEN_WAIT_MS")) > 0 ? atoi(getenv("JEPSEN_OPEN_WAIT_MS")) : 30000;
+}
+#define AWAIT_STARVED_MS 1000 /* a slice of the wait that took this much longer than it should have: the machine did not run this thread */
+static int64_t dstate_scan(void);
+static int await_watched(const char *pf, pid_t pid, int timeout_ms, const char **stall_why, char *whybuf, size_t wn)
+{
+    *stall_why = NULL;
+    int64_t t0 = now_ns();
+    int p = TH_BAD;
+    while (now_ns() - t0 < (int64_t)timeout_ms * 1000000LL) {
+        int64_t s0 = now_ns();
+        p = th_await(pf, pid, AWAIT_SLICE_MS);
+        int64_t el = (now_ns() - s0) / 1000000LL;
+        if (p != TH_BAD || strstr(th_why, "names pid")) /* a port, an exit, or another process's port file: no more waiting helps */
+            return p;
+        if (el > AWAIT_SLICE_MS + AWAIT_STARVED_MS && !*stall_why) {
+            snprintf(whybuf, wn, "this thread was not scheduled for %lld ms during the wait", (long long)(el - AWAIT_SLICE_MS));
+            *stall_why = whybuf;
+        }
+        int64_t d = dstate_scan();
+        if (d >= dstate_min_ns && !*stall_why) {
+            snprintf(whybuf, wn, "a thread of the server sat in D state (the kernel) for %.0f s", (double)d / 1e9);
+            *stall_why = whybuf;
+        }
+    }
+    return p;
+}
+
+/* The verdict on a server (the writer, or the follower) that did not listen. `p` is what the wait returned, `st` the wait status when it
+ * ended. Returns when it is the environment (the caller prints the harness error); a verdict ends the run here (exit 1). */
+static bool no_port_is_noted(pid_t pid, int p, int st, const char *who, const char *logpath, long from, const char *stall_why)
+{
+    if (p == TH_EXITED) {
+        if (WIFSIGNALED(st) || (WIFEXITED(st) && WEXITSTATUS(st) == 127) || log_env_failure(logpath, from))
+            return false; /* a signal (the crashes are judged by the caller), no binary, or a machine that failed the start */
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0)
+            fprintf(stderr, "  the %s (pid %d) exits with status 0 before it listens, nobody having asked it to: a server that stops by itself "
+                    "(its log: %s)\n", who, (int)pid, logpath);
+        else
+            fprintf(stderr, "  the %s (pid %d) exits with status %d while opening, and its own log names neither damage nor a failure of the "
+                    "environment: not a refusal on damage (its log: %s)\n", who, (int)pid, WIFEXITED(st) ? WEXITSTATUS(st) : -1, logpath);
+    } else if (p == TH_BAD && strstr(th_why, "wrote no")) {
+        if (stall_why)
+            return false; /* the machine stalled during the wait: liveness under load, not a verdict (exit 2, the harness error) */
+        fprintf(stderr, "  the %s (pid %d) is alive and wrote no port file in %d s, and the machine did not stall (no thread of it in D state "
+                "for %.0f s, this thread scheduled): it hangs while opening (its log: %s)\n", who, (int)pid, open_wait_ms() / 1000,
+                (double)dstate_min_ns / 1e9, logpath);
+        print_proc_state(pid);
+    } else {
+        return false; /* a port that is not the server's, another pid in the file: the environment */
+    }
+    death_problems++;
+    print_tail(logpath);
+    return true;
+}
+
 static void start_server_run(bool faulty)
 {
     char pms[32], pf[PATH_MAX];
@@ -1099,7 +1170,9 @@ static void start_server_run(bool faulty)
             fprintf(stderr, "jepsen: started %d (%s)\n", (int)pid, attempt == 0 && faulty ? "faulty" : "clean");
         if (getenv("JEPSEN_START_AWAIT_DELAY_MS")) /* a test hook of the selftest: the watcher polls first, as it may on a machine that starves this thread */
             usleep((useconds_t)atoi(getenv("JEPSEN_START_AWAIT_DELAY_MS")) * 1000);
-        int p = th_await(pf, pid, 30000);
+        const char *stall_why;
+        char stall_buf[160];
+        int p = await_watched(pf, pid, open_wait_ms(), &stall_why, stall_buf, sizeof stall_buf);
         unlink(pf);
         atomic_store(&server_starting, false);
         if (p > 0) {
@@ -1142,8 +1215,9 @@ static void start_server_run(bool faulty)
             /* A server that ends before it listens (round 11): the end the shim plans for a faulty server (its power loss, exit 99; under
              * eio the fail-stop on the file it failed, exit 1, with its mark) is the fault, and a clean server follows. A crash is a
              * violation. An open that failed on damage (the log says CORRUPT, I/O error, damaged: the data a fault left is damaged) is
-             * a violation too. Anything else (io_uring: Cannot allocate memory, exit 127, a server killed by the machine) is the
-             * environment: a harness error, exit 2, never a verdict about tsdb. */
+             * a violation too. Anything else that the machine did (io_uring: Cannot allocate memory, exit 127, a server killed by it) is the
+             * environment: a harness error, exit 2; a server that ends for a reason of its own (exit 0, or exit with no such line) is a verdict
+             * (no_port_is_noted, round 14), under every nemesis. */
             int st = th_status;
             server_gone();
             bool shim0 = faulty && crashfs && attempt == 0;
@@ -1169,16 +1243,6 @@ static void start_server_run(bool faulty)
                 }
                 bail(1);
             }
-            if ((md || rot) && WIFEXITED(st) && WEXITSTATUS(st) == 1 && !log_env_failure(slogpath, slog_from)) {
-                /* round 13 (VERIFY12): a server that exits 1 while opening for a reason of its own (its lines name no damage, or the first
-                 * block above would have taken it, and no failure of the machine) is a server that died: damage is not what it says */
-                fprintf(stderr, "  the server (pid %d) exits with status 1 while opening, and its own log names neither damage nor a failure of the "
-                        "environment: not a refusal on damage\n", (int)pid);
-                death_problems++;
-                print_tail(slogpath);
-                stop_server(SIGKILL);
-                bail(1);
-            }
             char dl[512];
             if (WIFEXITED(st) && log_says_damage(slogpath, slog_from, dl, sizeof dl)) {
                 fprintf(stderr, "  the server (pid %d, exit status %d) refuses to open the database after the faults: damaged data: %s\n",
@@ -1189,7 +1253,15 @@ static void start_server_run(bool faulty)
                 bail(1);
             }
         }
-        fprintf(stderr, "jepsen: the server does not come up (the environment, not a verdict about tsdb): %s", th_why);
+        /* round 14 (VERIFY13 finding 1): under every nemesis, a server that ends at open for a reason of its own, or hangs there with the machine
+         * not stalled, is a verdict. Only what the machine did is a harness error. */
+        if (no_port_is_noted(pid, p, th_status, "server", slogpath, slog_from, stall_why)) {
+            stop_server(SIGKILL);
+            outage_keep_log();
+            bail(1);
+        }
+        fprintf(stderr, "jepsen: the server does not come up (the environment, not a verdict about tsdb)%s%s: %s", stall_why ? ", and ": "",
+                stall_why ? stall_why : "", th_why);
         print_tail(slogpath);
         stop_server(SIGKILL);
         outage_keep_log();
@@ -1439,19 +1511,29 @@ static void start_follower(void)
         _exit(127);
     }
     atomic_store(&follower_pid, pid);
-    int p = th_await(pf, pid, 30000);
+    const char *stall_why;
+    char stall_buf[160];
+    int p = await_watched(pf, pid, open_wait_ms(), &stall_why, stall_buf, sizeof stall_buf);
     unlink(pf);
     if (p > 0) {
         fport = p;
         return;
     }
-    fprintf(stderr, "jepsen: the follower does not come up (see %s): %s", flogpath, th_why);
+    /* round 14 (VERIFY13 finding 1): the follower is a tsdbd too: one that ends at open for a reason of its own, or hangs there with the machine
+     * not stalled, is a verdict; the log is its own (opened with O_TRUNC) */
+    int fst = th_status;
+    bool verdict = no_port_is_noted(pid, p, fst, "follower", flogpath, 0, stall_why);
+    if (!verdict)
+        fprintf(stderr, "jepsen: the follower does not come up (see %s)%s%s: %s", flogpath, stall_why ? ", and " : "", stall_why ? stall_why : "",
+                th_why);
     if (p != TH_EXITED) {
         signal_pid(pid, SIGKILL);
         waitpid(pid, NULL, 0);
     }
     atomic_store(&follower_pid, 0);
     stop_server(SIGKILL);
+    if (verdict)
+        bail(1);
     exit(2);
 }
 
@@ -1492,7 +1574,6 @@ static _Atomic int64_t d_long_ns;      /* the last time a thread of the server w
 static atomic_bool kstall_seen, kstall_over;
 static int64_t kstall_first_ns;
 static int kstall_misses, kstall_bound_s = KSTALL_BOUND_S_DEFAULT;
-static int64_t dstate_min_ns = 10000000000LL;
 static atomic_bool dst_stop;
 
 static int64_t dstate_scan(void);

@@ -22,12 +22,26 @@
  *  - maxdirty:       17 one-byte rewrites of a synced 8 KiB file between two syncs: no byte nobody rewrote changes (a list of 16
  *                    regions once zeroed everything from the last one on), and a rewritten byte is old or new, never blank
  *                    (CRASHFS_REWRITE=zero, the harsh mode, zeroes only what was rewritten)
+ * and round 14 (VERIFY13 finding 2: open(O_TRUNC) of a durable file was a removal and a new file, so that the new content, fsynced
+ * without a directory sync, was lost to the OLD content, and an open(O_WRONLY | O_TRUNC) with no O_CREAT of an existing file failed
+ * with ENOENT), in every mode:
+ *  - otrunc_sync:     a synced file of 1000 bytes opened O_TRUNC | O_CREAT, 500 new bytes written and fsynced (no sync of the directory): the
+ *                     file holds exactly the 500 new bytes after the loss (never the old 1000)
+ *  - otrunc_nocreat:  the same without O_CREAT: the open must succeed (the file exists), and the same bytes remain
+ *  - otrunc_pre:      the same on a file that was there before the shim was loaded (made by this parent), no O_CREAT
+ *  - otrunc_nosync:   truncated and written, never synced: the old 1000 bytes (CRASHFS_TEAR: the old bytes, or a prefix of the new ones)
+ *  - otrunc_dirsync:  truncated, written, the directory synced but the file not: the old content is not back (the truncation committed
+ *                     with the directory's transaction): at most a prefix of the new bytes
+ *  - otrunc_ident:    no loss: a descriptor opened before the truncation sees the new content and the inode is the same
+ *  - unlink_nosync, write_then_unlink: a file unlinked without a directory sync is back with what was synced (a soft
+ *                     check: bytes that were written and not synced may come back too, as on a disk): the synced bytes, never others
  * Usage: test_crashfs_old LIBCRASHFS.so DIR [SEEDS]
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -239,6 +253,59 @@ static int child2(const char *kind, const char *dir)
         }
         wr(fd, CA + 100, 100);
         fsync(fd);
+    } else if (!strncmp(kind, "otrunc_", 7) || !strcmp(kind, "unlink_nosync") || !strcmp(kind, "write_then_unlink")) {
+        np(dir, "a", a);
+        int fd;
+        if (!strcmp(kind, "otrunc_pre")) { /* made by the parent before the shim */
+            fd = open(a, O_WRONLY | O_TRUNC);
+            if (fd < 0)
+                return 9;
+            wr(fd, CB, 500);
+            fsync(fd);
+            pull(dir);
+            return 3;
+        }
+        fd = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0)
+            return 2;
+        wr(fd, CA, 1000);
+        fsync(fd);
+        dsync(dir);
+        if (!strcmp(kind, "unlink_nosync")) {
+            unlink(a);
+            wr(fd, CA + 1000, 100); /* appended to the unlinked file, not synced */
+            pull(dir);
+            return 3;
+        }
+        if (!strcmp(kind, "write_then_unlink")) {
+            wr(fd, CA + 1000, 100);
+            close(fd);
+            unlink(a);
+            pull(dir);
+            return 3;
+        }
+        close(fd);
+        if (!strcmp(kind, "otrunc_ident")) { /* no loss: the same file, truncated */
+            int fd0 = open(a, O_RDONLY);
+            struct stat s0, s1;
+            fd = open(a, O_WRONLY | O_TRUNC);
+            if (fd0 < 0 || fd < 0 || fstat(fd0, &s0) != 0 || stat(a, &s1) != 0 || s0.st_ino != s1.st_ino)
+                return 7;
+            wr(fd, CB, 500);
+            fsync(fd);
+            unsigned char r[600];
+            if (pread(fd0, r, sizeof r, 0) != 500 || memcmp(r, CB, 500) != 0)
+                return 8;
+            return 0;
+        }
+        fd = open(a, !strcmp(kind, "otrunc_sync") ? O_WRONLY | O_TRUNC | O_CREAT : O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0)
+            return 9;
+        wr(fd, CB, 500);
+        if (!strcmp(kind, "otrunc_dirsync"))
+            dsync(dir);
+        else if (strcmp(kind, "otrunc_nosync"))
+            fsync(fd);
     } else { /* maxdirty */
         np(dir, "m", a);
         int fd = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -272,6 +339,17 @@ static void run_case2(const char *so, const char *kind, const char *mode, const 
         failures++;
         return;
     }
+    if (!strcmp(kind, "otrunc_pre")) { /* there before the shim: durable at its size */
+        char pa[4400];
+        np(dir, "a", pa);
+        int pf = open(pa, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (pf < 0 || write(pf, CA, 1000) != 1000 || fsync(pf) != 0) {
+            failures++;
+            return;
+        }
+        close(pf);
+        dsync(dir);
+    }
     pid_t pid = fork();
     if (pid == 0) {
         int nul = open("/dev/null", O_WRONLY);
@@ -297,10 +375,34 @@ static void run_case2(const char *so, const char *kind, const char *mode, const 
         failures++;
         return;
     }
-    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 99, "%s/%s seed %lu: the child ended with status 0x%x, not the loss's 99", kind, mode, seed, st);
+    bool noloss = !strcmp(kind, "otrunc_ident");
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == (noloss ? 0 : 99), "%s/%s seed %lu: the child ended with status 0x%x, not %s", kind, mode, seed, st,
+          noloss ? "0 (an open(O_TRUNC) of an existing file failed, or a descriptor opened before it saw other content, or the inode changed)"
+                 : "the loss's 99 (an open(O_TRUNC) without O_CREAT of an existing file failed?)");
     static unsigned char got[16384];
     char p[4400];
     long n;
+    if (noloss)
+        return;
+    if (!strncmp(kind, "otrunc_", 7) || !strcmp(kind, "unlink_nosync") || !strcmp(kind, "write_then_unlink")) {
+        np(dir, "a", p);
+        n = slurp(p, got, sizeof got);
+        bool tr = !strcmp(mode, "tear");
+        if (!strcmp(kind, "otrunc_sync") || !strcmp(kind, "otrunc_nocreat") || !strcmp(kind, "otrunc_pre")) {
+            CHECK(n == 500 && memcmp(got, CB, 500) == 0, "%s/%s seed %lu: a has %ld bytes %s, the 500 fsynced after the truncation were wanted (the old 1000 are back?)",
+                  kind, mode, seed, n, n > 0 && got[0] == CA[0] ? "(the OLD content)" : "");
+        } else if (!strcmp(kind, "otrunc_nosync")) {
+            bool old = n == 1000 && memcmp(got, CA, 1000) == 0, pre = n >= 0 && n <= 500 && memcmp(got, CB, (size_t)n) == 0;
+            CHECK(old || (tr && pre), "%s/%s seed %lu: a has %ld bytes that are neither the old 1000 nor (CRASHFS_TEAR) a prefix of the new 500", kind, mode, seed, n);
+        } else if (!strcmp(kind, "otrunc_dirsync")) {
+            CHECK(n >= 0 && n <= 500 && memcmp(got, CB, (size_t)n) == 0, "%s/%s seed %lu: a has %ld bytes: the truncation committed with the directory's sync, "
+                  "so only a prefix of the new 500 may be there (the old content is back?)", kind, mode, seed, n);
+        } else { /* unlink_nosync, write_then_unlink: the synced 1000 bytes, then the unsynced ones may be there too (soft) */
+            CHECK((tr && n == -1) /* CRASHFS_TEAR may keep the unlink */ || (n >= 1000 && n <= 1100 && memcmp(got, CA, (size_t)n) == 0), "%s/%s seed %lu: a has %ld bytes, the synced 1000 (and perhaps the unsynced 100) of the same content were wanted",
+                  kind, mode, seed, n);
+        }
+        return;
+    }
     if (!strcmp(kind, "rename_sync") || !strcmp(kind, "rename_newfile")) {
         np(dir, "b", p);
         n = slurp(p, got, sizeof got);
@@ -369,11 +471,12 @@ int main(int argc, char **argv)
                     return 2;
                 }
             }
-        static const char *k2[] = {"rename_sync", "rename_newfile", "maxdirty"};
+        static const char *k2[] = {"rename_sync", "rename_newfile", "maxdirty", "otrunc_sync", "otrunc_nocreat", "otrunc_pre", "otrunc_nosync",
+                                   "otrunc_dirsync", "otrunc_ident", "unlink_nosync", "write_then_unlink"};
         static const char *m2[] = {"plain", "tear", "old", "zero"};
-        for (int k = 0; k < 3; k++)
+        for (int k = 0; k < (int)(sizeof k2 / sizeof k2[0]); k++)
             for (int m = 0; m < 4; m++) {
-                if (m == 3 && k != 2)
+                if (m == 3 && k != 2 && k < 3)
                     continue; /* the harsh mode zeroes what was rewritten: nothing to say about a rename */
                 char dir[3000];
                 snprintf(dir, sizeof dir, "%s/%s-%s%lu", base, k2[k], m2[m], seed);
@@ -388,6 +491,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "test_crashfs_old: %d failure(s)\n", failures);
         return 1;
     }
-    printf("test_crashfs_old: %lu seeds x (cut, rewrite, own in two modes; rename_sync, rename_newfile, maxdirty in every mode): a power loss gives back the synced content\n", seeds);
+    printf("test_crashfs_old: %lu seeds x (cut, rewrite, own in two modes; rename_sync, rename_newfile, maxdirty, the open(O_TRUNC) and unlink cases in every mode): a power loss gives back the synced content\n", seeds);
     return 0;
 }

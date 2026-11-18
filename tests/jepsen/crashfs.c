@@ -140,6 +140,8 @@ typedef struct file {
     bool lying; /* after an injected EIO: syncs succeed without making anything durable */
     struct old_sector *old; /* CRASHFS_TEAR or the old-bytes default: durable sectors rewritten since the last sync, as they were */
     size_t nold, capold;
+    unsigned tsave;  /* open(O_TRUNC) of a durable file: the id of the copy of what a power loss brings back (0: none), until the file is synced */
+    off_t tsave_len; /* its length */
 } file;
 
 #define SECTOR 512
@@ -578,6 +580,126 @@ static bool keep_aside(const char *path, char *saved)
     return real_rename(path, saved) == 0;
 }
 
+/* open(O_TRUNC) of a durable file (round 14; VERIFY13 finding 2). The file stays the same file (its name and its inode: a
+ * descriptor, a hard link or a mapping that another party holds sees what a truncation does, never a new file). What it holds
+ * from then on is new content, none of it durable until the file is synced: an fsync of the descriptor makes the truncation and
+ * what was written after it durable (on ext4 and every journalling file system the truncation commits with the data's size at
+ * that sync), and so does a sync of its directory or of the file system (the transaction that carries the truncation commits).
+ * Until then a power loss may leave the truncation undone: the old content is back as it was durable (a copy, kept in the root
+ * directory, made at the truncation: the durable prefix with the rewritten sectors put back, or zeroed in the harsher mode). With
+ * CRASHFS_TEAR the new content may instead be what the loss leaves (a prefix of it, an empty file), as for any unsynced data.
+ * Never an older state than the last sync, never a mix of old and new bytes that no disk leaves in the plain modes. */
+static unsigned tsave_counter;
+static void tsave_name(unsigned id, char *out)
+{
+    snprintf(out, PATH_MAX, "%s/.crashfs_tsave_%d_%u", root, (int)getpid(), id);
+}
+
+static void tsave_drop(file *f)
+{
+    if (f->tsave) {
+        char sv[PATH_MAX];
+        tsave_name(f->tsave, sv);
+        real_unlink(sv);
+        f->tsave = 0;
+    }
+}
+
+/* A copy of what a power loss now leaves of `f` (read through `path`), at the saved name; its length, or -1. */
+static off_t tsave_make(file *f, const char *path, const char *sv)
+{
+    int rfd = real_open(path, O_RDONLY | O_CLOEXEC, 0);
+    if (rfd < 0)
+        return -1;
+    int wfd = real_open(sv, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (wfd < 0) {
+        real_close(rfd);
+        return -1;
+    }
+    static __thread char buf[1 << 16];
+    off_t at = 0;
+    bool ok = true;
+    while (ok && at < f->durable) {
+        size_t want = (size_t)(f->durable - at < (off_t)sizeof buf ? f->durable - at : (off_t)sizeof buf);
+        ssize_t r = real_pread(rfd, buf, want, at);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0)
+            break; /* the file is shorter than its durable size (an unsynced cut): the old sectors below put back what they can */
+        ssize_t w = real_pwrite(wfd, buf, (size_t)r, at);
+        ok = w == r;
+        at += r;
+    }
+    off_t len = at;
+    if (ok && !rewrite_zero) {
+        for (size_t i = 0; i < f->nold; i++) {
+            struct old_sector *o = &f->old[i];
+            off_t l = f->durable - o->off < SECTOR ? f->durable - o->off : SECTOR;
+            if (l > 0 && real_pwrite(wfd, o->data, (size_t)l, o->off) == l && o->off + l > len)
+                len = o->off + l;
+        }
+    }
+    for (int k = 0; ok && rewrite_zero && k < f->ndirty; k++) {
+        off_t end = f->dirty[k].off + f->dirty[k].len;
+        if (end > len)
+            end = len;
+        static const char zeros[4096];
+        for (off_t o = f->dirty[k].off; o < end; o += (off_t)sizeof zeros)
+            if (real_pwrite(wfd, zeros, (size_t)(end - o < (off_t)sizeof zeros ? end - o : (off_t)sizeof zeros), o) < 0)
+                break;
+    }
+    if (len > f->durable)
+        len = f->durable;
+    if (ok && real_ftruncate(wfd, len) != 0)
+        ok = false;
+    real_close(rfd);
+    real_close(wfd);
+    if (!ok)
+        real_unlink(sv);
+    return ok ? len : -1;
+}
+
+/* open(O_TRUNC) of `f`: keeps the durable image aside, and the file's content is new from here on. */
+static void tsave_trunc(file *f, const char *path)
+{
+    if (f->durable > 0 && !f->tsave) {
+        char sv[PATH_MAX];
+        unsigned id = ++tsave_counter;
+        tsave_name(id, sv);
+        off_t len = tsave_make(f, path, sv);
+        if (len >= 0) {
+            f->tsave = id;
+            f->tsave_len = len;
+        }
+    }
+    f->durable = 0;
+    f->ndirty = 0;
+    f->nold = 0;
+}
+
+/* The power loss brings the old content back into the file behind `fd`. */
+static void tsave_restore(file *f, int fd)
+{
+    char sv[PATH_MAX];
+    tsave_name(f->tsave, sv);
+    int rfd = real_open(sv, O_RDONLY | O_CLOEXEC, 0);
+    if (rfd < 0)
+        return;
+    static __thread char buf[1 << 16];
+    off_t at = 0;
+    while (at < f->tsave_len) {
+        ssize_t r = real_pread(rfd, buf, (size_t)(f->tsave_len - at < (off_t)sizeof buf ? f->tsave_len - at : (off_t)sizeof buf), at);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0 || real_pwrite(fd, buf, (size_t)r, at) != r)
+            break;
+        at += r;
+    }
+    if (at == f->tsave_len && real_ftruncate(fd, f->tsave_len) != 0) {
+    }
+    real_close(rfd);
+}
+
 /* ---------------------------------------------------------- power loss */
 
 static void rm_tree(const char *p)
@@ -695,6 +817,11 @@ static void rollback(void)
         int fd = real_open(f->path, O_WRONLY);
         if (fd < 0)
             continue;
+        if (f->tsave && (!tear || urand() < 0.5)) { /* the truncation was never synced: undone (with CRASHFS_TEAR, or the new content torn) */
+            tsave_restore(f, fd);
+            real_close(fd);
+            continue;
+        }
         if (tear) {
             tear_file(f, fd, st.st_size);
             real_close(fd);
@@ -752,6 +879,8 @@ static void rollback(void)
     for (size_t i = 0; i < ndops; i++)
         if (dops[i].done && dops[i].saved[0])
             rm_tree(dops[i].saved);
+    for (size_t i = 0; i < nfiles; i++)
+        tsave_drop(&files[i]);
 }
 
 /* A thread that reads a part it mapped, while the rollback cuts the file back, dies of SIGBUS before the thread that rolls back reaches
@@ -846,8 +975,11 @@ static bool eio_now(int fd, const char *what)
  * (a command line tool: what it reported done must be on disk). */
 __attribute__((destructor)) static void fini(void)
 {
-    if (!eio_done && !(loss_at_exit && active))
+    if (!eio_done && !(loss_at_exit && active)) {
+        for (size_t i = 0; i < nfiles; i++) /* no power loss: the copies kept for one are not left in the directory */
+            tsave_drop(&files[i]);
         return;
+    }
     pthread_mutex_lock(&lock); /* never released: no thread writes after this */
     rollback();
     if (exit_mark[0]) {
@@ -1076,14 +1208,8 @@ static int do_open(int dirfd, const char *name, int flags, mode_t mode, bool at)
     bool existed = stat(path, &st) == 0;
     if ((flags & O_TRUNC) && existed && S_ISREG(st.st_mode)) {
         file *f = file_get(path, false);
-        if (f && f->durable > 0) { /* truncating durable data: keep it until synced */
-            char saved[PATH_MAX];
-            if (keep_aside(path, saved)) {
-                add_dirop(OP_UNLINK, path, NULL, saved);
-                f->used = false;
-                existed = false;
-            }
-        }
+        if (f) /* the same file, truncated: not a removal and a new file (round 14), whatever O_CREAT says */
+            tsave_trunc(f, path);
     }
     int fd = at ? real_openat(dirfd, name, flags, mode) : real_open(name, flags, mode);
     if (fd >= 0) {
@@ -1291,12 +1417,19 @@ static int do_sync(int fd, bool data_only)
                         /* the old name is gone for good too, if it was in another dir */
                     }
                 }
+            for (size_t i = 0; i < nfiles; i++) { /* the transaction that carries a truncation commits with the directory's sync */
+                char fdir[PATH_MAX];
+                dir_of(files[i].path, fdir);
+                if (files[i].used && files[i].tsave && !strcmp(fdir, fdpath[fd]))
+                    tsave_drop(&files[i]);
+            }
         } else {
             file *f = file_of_fd(fd);
             if (f && !f->lying) {
                 f->durable = st.st_size;
                 f->ndirty = 0;
                 f->nold = 0;
+                tsave_drop(f); /* the truncation and the new content are durable */
             }
         }
     }
@@ -1328,6 +1461,7 @@ int syncfs(int fd)
                 f->durable = st.st_size;
                 f->ndirty = 0;
                 f->nold = 0;
+                tsave_drop(f);
             }
         }
         for (size_t i = 0; i < ndops; i++) {
