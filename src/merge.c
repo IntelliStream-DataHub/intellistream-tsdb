@@ -27,7 +27,11 @@
  * no older part is listed: block numbers only grow, so none can come later. An
  * output with no rows is still written, with no granules, so that it replaces
  * its sources and keeps their wal_seq: WAL replay skips a partition by it.
+ *
+ * R7 (src/ecskip.h): .ec and settling parts are barriers like damaged ones, and never rewritten alone, by
+ * optimize or by the TTL rewrite; a settled partition keeps its expired rows hidden by the queries' clamp.
  */
+#include "ecskip.h"
 #include "internal.h"
 
 #include <math.h>
@@ -39,6 +43,8 @@
 #define MAX_SIZE_TO_LOWER_BASE (100ull << 30)
 #define MIN_PARTS_TO_LOWER_BASE 10
 #define MAX_PARTS_TO_LOWER_BASE 50
+
+int ecskip_mutant;
 
 static double unit(double v, double lo, double hi) { return v <= lo ? 0 : v >= hi ? 1 : (v - lo) / (hi - lo); }
 static double lerp(double a, double b, double t) { return a + (b - a) * t; }
@@ -79,17 +85,22 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
         size_t b = a + 1;
         while (b < db->nparts && db->parts[b]->partition == db->parts[a]->partition)
             b++;
-        size_t nparts = b - a;
+        /* R7: .ec parts are not counted towards the base (db_wait_merges leaves them out for the same reason): they
+         * are at rest for good, and a settled key's objects would lower it for every young part above them */
+        size_t nparts = 0;
         time_t newest = 0;
-        for (size_t i = a; i < b; i++)
+        for (size_t i = a; i < b; i++) {
             newest = MAX(newest, db->parts[i]->written);
+            nparts += !part_is_ec(db->parts[i]) || ecskip_mutant == ECSKIP_MUT_MERGECOUNTEC;
+        }
         if (partition_dropping(db, db->parts[a]->partition)) { /* the drop retires it: start nothing */
             a = b;
             continue;
         }
         bool idle = db->opt.merge_idle_s >= 0 && now - newest >= db->opt.merge_idle_s;
         for (size_t i = a; i < b && solo_ok && idle && solo == SIZE_MAX; i++)
-            if (rewrite_alone(db->parts[i]) && !db->parts[i]->merging && !atomic_load(&db->parts[i]->damaged))
+            if (rewrite_alone(db->parts[i]) && !db->parts[i]->merging && !atomic_load(&db->parts[i]->damaged) &&
+                !part_no_rewrite(db->parts[i])) /* R7: an .ec part is at rest already, a settling one is taken */
                 solo = i;
         if (nparts >= 2) {
             for (size_t i = a; i < b; i++) {
@@ -97,8 +108,10 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
                 for (size_t j = i; j < b && j - i < MAX_MERGE_PARTS; j++) {
                     part *p = db->parts[j];
                     /* a damaged part is a barrier (merge_parts would fail on it again, part_checked): the ranges
-                     * on either side go on, never one across it, which would let a lower block's row win */
-                    if (p->merging || atomic_load(&p->damaged))
+                     * on either side go on, never one across it, which would let a lower block's row win. So are
+                     * an .ec part (no granule bytes in its map) and a settling one (the swap would list its .ec
+                     * beside an output that holds the same rows): src/ecskip.h */
+                    if (p->merging || atomic_load(&p->damaged) || part_merge_barrier(p))
                         break;
                     double size = (double)p->map_len;
                     if (sum + size > (double)db->opt.max_part_bytes && j > i)
@@ -637,7 +650,11 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
         if (now >= all && !eng_check(db) && partition_expired_checked_locked(db, a, b, gen, now)) {
             /* every series in the partition has expired past its end, or nothing is left in it: drop it like
              * tsdb_drop_before. Memtable rows of it are hidden by the same cutoffs; flushed later, they go the
-             * same way (or, for an empty partition, are newer than what was deleted). */
+             * same way (or, for an empty partition, are newer than what was deleted). R7: .ec and settling parts
+             * go like any other (db_retire_locked retires an .ec one with its object), and a settle is not waited
+             * for (busy counts merges only): the single-server swap checks its inputs under db->lock in the hold
+             * that lists the .ec and its recovery rolls back over retired sources, so a source retired here never
+             * comes back (r7-swap items 2-4; drop_settle_locked) */
             for (size_t i = b; i-- > a;) {
                 db->parts[i]->dropped = true; /* an in-flight merge of it discards its result */
                 db_retire_locked(db, db->parts[i]);
@@ -648,9 +665,10 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
         }
         for (size_t i = a; ret && i < b && !k; i++) {
             part *p = db->parts[i];
-            if (p->merging || atomic_load(&p->damaged) || (!p->ng && !p->nt) || now <= p->ttl_any ||
-                db->opt.retention_merge_s < 0 ||
-                wall - p->created < db->opt.retention_merge_s)
+            /* R7: an .ec or settling part is never rewritten for its expired rows: queries clamp to the cutoff,
+             * and the partition goes whole once all of it has expired (above) */
+            if (p->merging || atomic_load(&p->damaged) || part_no_rewrite(p) || (!p->ng && !p->nt) ||
+                now <= p->ttl_any || db->opt.retention_merge_s < 0 || wall - p->created < db->opt.retention_merge_s)
                 continue;
             p->merging = true;
             p->merge_len_gen = atomic_load(&db->ret_len_gen);
@@ -756,6 +774,8 @@ static bool key_in(const int64_t *keys, size_t n, int64_t key)
     return false;
 }
 
+static bool optimize_barrier(const part *p) { return atomic_load(&p->damaged) || part_merge_barrier(p); }
+
 /* keys: only those partitions, and no flush first (a replica's purge before a CLASS record, classes.c cls_apply) */
 static int optimize_where(eng *db, const int64_t *keys, size_t nkeys)
 {
@@ -769,7 +789,9 @@ static int optimize_where(eng *db, const int64_t *keys, size_t nkeys)
     pthread_mutex_lock(&db->lock);
     for (;;) {
         /* first range between damaged parts (barriers) with several parts, or with one only inserts wrote, and no
-         * merge in flight; one a merge thread is rewriting right now is waited for like any other busy range */
+         * merge in flight; one a merge thread is rewriting right now is waited for like any other busy range. R7:
+         * .ec and settling parts are barriers too, without the error a damaged one gives (src/ecskip.h), and a
+         * settle is not waited for: its part is left as it is */
         size_t a = SIZE_MAX, e = 0, k = 0;
         bool waiting = false;
         for (size_t i = 0, j; i < db->nparts && a == SIZE_MAX; i = j) {
@@ -783,14 +805,14 @@ static int optimize_where(eng *db, const int64_t *keys, size_t nkeys)
             if (damaged && (j - i >= 2 || rewrite_alone(db->parts[i]))) /* the call fails at the end */
                 skipped = true;
             for (size_t s = i, t; s < j && a == SIZE_MAX; s = t) {
-                if (atomic_load(&db->parts[s]->damaged)) {
+                if (optimize_barrier(db->parts[s])) {
                     t = s + 1;
                     continue;
                 }
                 bool busy = false;
-                for (t = s; t < j && !atomic_load(&db->parts[t]->damaged); t++)
+                for (t = s; t < j && !optimize_barrier(db->parts[t]); t++)
                     busy |= db->parts[t]->merging;
-                if (t - s < 2 && !rewrite_alone(db->parts[s]))
+                if (t - s < 2 && !rewrite_alone(db->parts[s])) /* a lone .ec or settling part: a barrier above */
                     continue;
                 if (busy)
                     waiting = true;

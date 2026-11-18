@@ -5,6 +5,7 @@
 #include "ecgc.h"
 #include "eckeep.h"
 #include "ecpart.h"
+#include "ecskip.h"
 #include "tier.h"
 
 #include <dirent.h>
@@ -233,7 +234,15 @@ static int64_t wait_mono_ms(void)
  * counting only the time between merges would stretch the bound to wait_stall_ms times the length of a merge).
  * Then the partition is remembered as stalled (stalled[]): the next waiters go on at once until its count falls or
  * a merge of it commits, so the bound is paid once, not per call and per part. Without this a partition whose merges
- * kept failing held every writer of the process for ever (jepsen --nemesis misdirect, verify_checksums off). */
+ * kept failing held every writer of the process for ever (jepsen --nemesis misdirect, verify_checksums off).
+ * R7 (src/ecskip.h): .ec and settling parts are barriers for `pairs`, like damaged ones: no merge takes them, so
+ * only two neighbours with neither between them can bring the count down. .ec parts are left out of the count: a
+ * settled partition holds as many of them as it had parts when it settled (hundreds, for a key of many small
+ * parts), they are at rest by design and no merge ever lowers their number, so counting them would hold every
+ * insert into the partition for wait_stall_ms past PARTS_TO_DELAY_INSERT. A settling part still counts (it is
+ * a .part until the swap). With no pair left the insert goes on at once, also while a settle is in flight: the
+ * swap would lower the count, but a settle can take minutes (drop_settle_locked) and does not fall behind the
+ * inserts the way merges do, so waiting for it would only hold a writer of a cold key for wait_stall_ms. */
 void db_wait_merges(eng *db, int64_t partition)
 {
     if (db->nmergers == 0)
@@ -244,26 +253,32 @@ void db_wait_merges(eng *db, int64_t partition)
     uint64_t start_seq = db->merge_fail_seq;
     while (!atomic_load(&db->stop)) {
         size_t n = 0;
-        bool merging = false, failed = false, pairs = false, prev_ok = false;
+        bool merging = false, failed = false, pairs = false, prev_ok = false, settling = false;
         part *bad = NULL;
         for (size_t i = 0; i < db->nparts; i++) {
             part *p = db->parts[i];
             if (p->partition != partition)
                 continue;
-            n++;
+            if (!part_is_ec(p) || ecskip_mutant == ECSKIP_MUT_WAITCOUNTEC)
+                n++;
             merging |= p->merging;
+            settling |= p->settling; /* only the waitsettle mutant waits for a settle (above) */
             failed |= p->fail_seq > start_seq;
             bool dmg = atomic_load(&p->damaged);
             if (dmg && !bad)
                 bad = p;
-            pairs |= prev_ok && !dmg; /* two neighbours with no barrier between: a merge can still run */
-            prev_ok = !dmg;
+            bool wall = dmg || (part_merge_barrier(p) && ecskip_mutant != ECSKIP_MUT_WAITWALL);
+            pairs |= prev_ok && !wall; /* two neighbours with no barrier between: a merge can still run */
+            prev_ok = !wall;
         }
         if (n <= PARTS_TO_DELAY_INSERT || eng_check(db)) {
             if (n <= PARTS_TO_DELAY_INSERT)
                 db_stall_clear_locked(db, partition);
             break;
         }
+        if (!pairs && !bad && ecskip_mutant != ECSKIP_MUT_WAITNOBREAK &&
+            (ecskip_mutant != ECSKIP_MUT_WAITSETTLE || !settling))
+            break; /* R7: .ec or settling barriers alone, no merge can lower the count (above) */
         if (bad && !pairs) {
             if (!atomic_exchange(&bad->wait_logged, true))
                 fprintf(stderr, "tsdb: partition %" PRId64 " has %zu parts and part %s is damaged: no two parts "
@@ -1567,7 +1582,14 @@ int eng_drop_before(eng *db, int64_t ts)
 /* The part of tsdb_drop_before after the flush: retires every partition that ends at or before ts. A replica runs
  * it when it applies the DROP marker (replica.c), after it has flushed its sealed memtables. */
 /* db->lock held: publishes the drop's intent (no merge of a partition ending at or before ts is selected while it is
- * set) and waits until the merges of those partitions already in flight have listed their outputs */
+ * set) and waits until the merges of those partitions already in flight have listed their outputs. R7: never for a
+ * settle (p->settling) of a single server's tier. Its encode can take minutes on a slow store and is nobody's
+ * acknowledgement: the drop retires the settling part like any other, and the single-server swap (r7-swap items 2-4)
+ * lists nothing: it checks under db->lock, in the hold of its renames, that every input is still listed and not
+ * dropped, and its recovery rolls back an intent whose sources are retired or gone (the intent is durable before
+ * that check, and a drop takes no publish_lock: the window that makes drops wait for merges). Those, with r7-swap's
+ * swapnodropcheck mutant and power-loss test, keep a dropped part from coming back, not a wait here. A cluster
+ * settle is different (design-cluster-data.md 2.3): there the drop waits at the settle gate for steps 3-6. */
 static void drop_settle_locked(eng *db, int64_t ts)
 {
     db->drop_pending = true;
@@ -1577,7 +1599,8 @@ static void drop_settle_locked(eng *db, int64_t ts)
         for (size_t i = 0; i < db->nparts && !busy; i++) {
             int64_t lo, end;
             partition_range(db, db->parts[i]->partition, &lo, &end);
-            busy = end <= ts && db->parts[i]->merging;
+            busy = end <= ts && (db->parts[i]->merging ||
+                                 (ecskip_mutant == ECSKIP_MUT_DROPWAITSETTLE && db->parts[i]->settling));
         }
         if (busy)
             pthread_cond_wait(&db->merged_cv, &db->lock);
@@ -1611,7 +1634,10 @@ int drop_retire(eng *db, int64_t ts)
         if (eng_check(db)) /* a rename below failed: retire nothing more */
             break;
         if (end <= ts) {
-            p->dropped = true; /* an in-flight merge of it discards its result */
+            /* an in-flight merge of it discards its result. R7: an .ec part goes the same way (db_retire_locked
+             * renames it retired_<name>.ec, its object goes with it, r7-gc), and so does a settling one: a
+             * single server's swap sees `dropped` under db->lock and lists nothing (drop_settle_locked) */
+            p->dropped = true;
             db_retire_locked(db, p);
             retired = true;
         } else {
