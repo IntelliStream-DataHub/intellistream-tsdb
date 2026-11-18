@@ -34,7 +34,7 @@
 #     tsdbd of the mutant left behind (looked up by its executable in /proc, never by name: no pkill -f).
 # On d52d0df the crash passed under kill (exit 0) and ended INCONCLUSIVE (exit 3) under pause and eio, and the hang made the harness wait
 # for ever (every case ended at the timeout).
-# Usage: tests/jepsen/mutant-crash.sh JEPSEN_DIR [JEPSEN_BIN]   (CASES="crash-kill hang-none" runs only those)
+# Usage: tests/jepsen/mutant-crash.sh JEPSEN_DIR [JEPSEN_BIN]   (CASES="crash-kill hang-none openany-*" runs only those; MATRIX=1 adds matrix-*)
 set -u
 dir=${1:?usage: mutant-crash.sh JEPSEN_DIR [JEPSEN_BIN]}
 bin=${2:-}
@@ -213,7 +213,7 @@ leftover() {
 }
 
 rc=0
-want() { [ -z "${CASES:-}" ] || [[ " $CASES " == *" $1 "* ]]; }
+want() { local c; [ -z "${CASES:-}" ] && return 0; for c in $CASES; do [[ $1 == $c ]] && return 0; done; return 1; } # CASES: names or globs (openany-* matrix-*)
 run_case() { # name pattern what envs... -- jepsen args...
     local name=$1 pat=$2 what=$3; shift 3
     local envs=() t0 t1 out st left
