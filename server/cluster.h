@@ -148,6 +148,22 @@ uint64_t cluster_lease_safe(uint64_t answer_ns, uint32_t lease_ms, uint32_t drif
  * then cluster_stop() (no hand-off is under way after it), and only then peerlink_free. */
 struct peerlink;
 void cluster_set_peerlink(struct peerlink *pl);
+
+/* Promotion (design-cluster.md 6.2, r3e-failover). The Raft leader sends FENCE(v, fence) to the reachable ISR members of
+ * a volume whose leader is gone; the cluster thread hands it to the handler (repld_fence), whose core saves the fence
+ * before it answers. The answer, and a restarted leader's RESIGN, go back through cluster_vol_msg (any thread: queued
+ * and sent by the cluster thread, to `to`, or the Raft leader when 0). */
+enum { CL_VMSG_FENCE_REPLY = 1, CL_VMSG_RESIGN = 2 };
+struct cluster_vmsg {
+    uint8_t kind;
+    uint32_t volume;
+    uint64_t epoch; /* FENCE_REPLY: the fence answered; RESIGN: the epoch resigned */
+    uint64_t durable, last_epoch, rid, start;
+    uint32_t to;
+};
+void cluster_vol_msg(const struct cluster_vmsg *m);
+typedef void (*cluster_fence_fn)(void *arg, uint32_t volume, uint64_t fence, uint32_t from);
+void cluster_set_fence_handler(cluster_fence_fn fn, void *arg);
 /* What a peerlink needs to dial and answer as this server (any thread, after cluster_start). 0, or -1 while this
  * server is in no cluster yet (id 0). */
 struct cluster_self {

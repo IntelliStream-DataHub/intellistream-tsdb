@@ -29,6 +29,9 @@ int repld_failed(uint32_t v);
 int repld_engine_failed(uint32_t v, const char *msg);
 /* 1 while volume v is led here with fewer in-sync replicas than its min_isr: writes are refused (REPL_E_ISR). */
 int repld_isr_short(uint32_t v);
+/* A FENCE(v, fence) from the Raft leader `from` (the cluster thread's handler, cluster_set_fence_handler): handed to the
+ * volume's core, whose reply goes back through cluster_vol_msg once the fence is saved. No such volume: ignored. */
+void repld_fence(void *arg, uint32_t v, uint64_t fence, uint32_t from);
 /* The ISR changes the volumes led here ask the metadata group for (cluster_report.isr); at most max. */
 unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max);
 /* The servers this one shares a running volume with and has heard nothing from on any of them for after_ms or more

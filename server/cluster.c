@@ -161,6 +161,8 @@ enum {
     F_JOIN_REPLY,
     F_PROBE,
     F_PROBE_REPLY,
+    F_FENCE,  /* Raft leader -> member: u32 volume, u64 fence (promotion, 6.2) */
+    F_VOLMSG, /* member -> Raft leader (or the fence's sender): cluster_vmsg */
 };
 
 /* the sections of a heartbeat (after its address fields) */
@@ -2790,6 +2792,8 @@ static void on_raft(struct conn *c, struct rd *r)
     pump();
 }
 
+static int promo_holds_lease(uint32_t node);
+
 static void on_hb(struct conn *c, struct rd *r)
 {
     uint32_t node = get32(r);
@@ -2813,7 +2817,7 @@ static void on_hb(struct conn *c, struct rd *r)
     /* the lease (§7.1): only the Raft leader grants, and only while its own lease from the core holds (check-quorum:
      * no other Raft leader can exist before it ends), so an answer is never given after a new Raft leader began its
      * wait of one lease */
-    uint64_t until = h->send_ns ? core_lease_until(now) : 0;
+    uint64_t until = h->send_ns && !promo_holds_lease(node) ? core_lease_until(now) : 0;
     int granted = until != 0;
     if (granted && until != UINT64_MAX && now >= until) /* only the mutants can: test_cluster lease looks for it */
         say("BUG: grants node %" PRIu32 " a lease %" PRIu64 " ms past the end of its own (term %" PRIu64 ")", node,
@@ -3676,6 +3680,9 @@ static void handshake(struct conn *c, uint8_t type, struct rd *r)
     }
 }
 
+static void on_fence(struct conn *c, struct rd *r);
+static void on_volmsg(struct conn *c, struct rd *r);
+
 static void on_frame(struct conn *c, uint8_t type, const uint8_t *p, size_t n)
 {
     struct rd r = {p, n, 0, 0};
@@ -3702,6 +3709,8 @@ static void on_frame(struct conn *c, uint8_t type, const uint8_t *p, size_t n)
     case F_JOIN_REPLY: on_join_reply(c, &r); break;
     case F_PROBE: on_probe(c, &r); break;
     case F_PROBE_REPLY: on_probe_reply(c, &r); break;
+    case F_FENCE: on_fence(c, &r); break;
+    case F_VOLMSG: on_volmsg(c, &r); break;
     default: c->dead = 1; break;
     }
 }
@@ -4398,6 +4407,334 @@ static void propose_isr(uint64_t now)
     }
 }
 
+/* ------------------------------------------------------------------ promotion (design-cluster.md 6.2, r3e-failover)
+ *
+ * The Raft leader keeps, in memory, one promotion per replicated volume whose leader is gone: the record leader DOWN
+ * (UNHEARD: member_states marks it so only after promote_safe_ns, so its lease has run out), its heartbeat reporting
+ * the volume LOCAL_FAULT (FENCED, D13: the driver stopped it and the volume answers UNAVAILABLE, never a read), or
+ * its RESIGN of the record's epoch (RESIGNED: a restarted leader never resumes, `led` in REPL). It sends FENCE(v, e+1)
+ * to every ISR member (resent every PROMO_RESEND_NS until it answers; this server's own through the handler), and
+ * proposes VOLUME_LEADER on the basis (epoch, ISR version) once every member it hears has answered, or after
+ * PROMO_WAIT_NS with one answer at least. A live old leader (RESIGNED) is not passed by until it answered (its core is
+ * deposed by the fence) or its lease ran out (promote_safe_ns): until then on_hb grants it no lease. The promotion
+ * goes once the record moves past its basis, or after PROMO_GIVEUP_NS (a new one starts on the record then). No answer
+ * at all: NO_OWNER, said once (`tsdb cluster volume force-leader`). */
+#define PROMO_RESEND_NS (100 * MS)
+#define PROMO_WAIT_NS (500 * MS)
+#define PROMO_GIVEUP_NS (5000 * MS)
+#define VMSG_Q 256
+
+struct promo {
+    uint32_t vol, old;
+    uint64_t epoch, version;
+    uint8_t reason;
+    uint32_t nfenced, fenced[META_REPLICAS_MAX];
+    uint8_t replied[META_REPLICAS_MAX];
+    struct meta_fence_reply reply[META_REPLICAS_MAX];
+    uint64_t t0, sent_ns, proposed_ns;
+    int said;
+};
+
+static pthread_mutex_t vmsg_mu = PTHREAD_MUTEX_INITIALIZER; /* the queue of cluster_vol_msg: any thread; a leaf */
+static struct cluster_vmsg vmsg_q[VMSG_Q];
+static unsigned vmsg_n;
+static cluster_fence_fn g_fence_fn;
+static void *g_fence_arg;
+static struct promo *g_promo; /* the cluster thread's */
+static size_t g_npromo, g_promo_cap;
+static struct { uint32_t vol, from; uint64_t epoch; } g_resign[64]; /* RESIGNs heard since the last duty round */
+static unsigned g_nresign;
+
+void cluster_set_fence_handler(cluster_fence_fn fn, void *arg)
+{
+    g_fence_fn = fn;
+    g_fence_arg = arg;
+}
+
+/* queued; the cluster thread sends it at the top of its next round (at most a poll timeout, 50 ms, later): the reply
+ * of a fence is not on any write's path */
+void cluster_vol_msg(const struct cluster_vmsg *m)
+{
+    pthread_mutex_lock(&vmsg_mu);
+    if (vmsg_n < VMSG_Q)
+        vmsg_q[vmsg_n++] = *m; /* full: dropped, the proposer resends its fence and the core its RESIGN */
+    pthread_mutex_unlock(&vmsg_mu);
+}
+
+static struct promo *promo_find(uint32_t vol)
+{
+    for (size_t i = 0; i < g_npromo; i++)
+        if (g_promo[i].vol == vol)
+            return &g_promo[i];
+    return NULL;
+}
+
+static void volmsg_in(uint32_t from, const struct cluster_vmsg *m)
+{
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
+        return;
+    if (m->kind == CL_VMSG_RESIGN) {
+        if (g_nresign < sizeof g_resign / sizeof g_resign[0])
+            g_resign[g_nresign++] = (__typeof__(g_resign[0])){m->volume, from, m->epoch};
+        return;
+    }
+    struct promo *p = promo_find(m->volume);
+    if (!p || m->kind != CL_VMSG_FENCE_REPLY || m->epoch != p->epoch + 1)
+        return;
+    for (uint32_t i = 0; i < p->nfenced; i++)
+        if (p->fenced[i] == from && !p->replied[i]) {
+            p->replied[i] = 1;
+            p->reply[i] = (struct meta_fence_reply){from, m->rid, m->durable, m->last_epoch};
+        }
+}
+
+static void vmsg_flush(void)
+{
+    struct cluster_vmsg q[VMSG_Q];
+    pthread_mutex_lock(&vmsg_mu);
+    unsigned n = vmsg_n;
+    memcpy(q, vmsg_q, n * sizeof q[0]);
+    vmsg_n = 0;
+    pthread_mutex_unlock(&vmsg_mu);
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t to = q[i].to ? q[i].to : C.r ? raft_get_leader(C.r) : C.hint_leader;
+        if (to == C.id) {
+            volmsg_in(C.id, &q[i]);
+            continue;
+        }
+        struct conn *c = conn_to(to);
+        if (!c)
+            continue;
+        frame_begin(&C.fb, F_VOLMSG);
+        put8(&C.fb, q[i].kind);
+        put32(&C.fb, q[i].volume);
+        put64(&C.fb, q[i].epoch);
+        put64(&C.fb, q[i].durable);
+        put64(&C.fb, q[i].last_epoch);
+        put64(&C.fb, q[i].rid);
+        put64(&C.fb, q[i].start);
+        frame_end(&C.fb);
+        conn_send(c, 0);
+    }
+}
+
+static void on_volmsg(struct conn *c, struct rd *r)
+{
+    struct cluster_vmsg m = {.kind = get8(r), .volume = get32(r)};
+    m.epoch = get64(r);
+    m.durable = get64(r);
+    m.last_epoch = get64(r);
+    m.rid = get64(r);
+    m.start = get64(r);
+    if (r->bad) {
+        c->dead = 1;
+        return;
+    }
+    volmsg_in(c->id, &m);
+}
+
+static void on_fence(struct conn *c, struct rd *r)
+{
+    uint32_t vol = get32(r);
+    uint64_t fence = get64(r);
+    if (r->bad) {
+        c->dead = 1;
+        return;
+    }
+    if (g_fence_fn)
+        g_fence_fn(g_fence_arg, vol, fence, c->id);
+}
+
+/* on_hb: no lease for `node` while a promotion away from it waits for its answer (stale reads, r3e-leases F5) */
+static int promo_holds_lease(uint32_t node)
+{
+    for (size_t i = 0; i < g_npromo; i++) {
+        const struct promo *p = &g_promo[i];
+        if (p->old != node || p->reason == META_GR_FENCED)
+            continue;
+        for (uint32_t k = 0; k < p->nfenced; k++)
+            if (p->fenced[k] == node && !p->replied[k])
+                return 1;
+    }
+    return 0;
+}
+
+static void promo_start(const struct meta_volume *v, uint8_t reason, uint64_t now)
+{
+    if (v->epoch + 1 >= META_EPOCH_LIMIT) {
+        static uint32_t said = UINT32_MAX;
+        if (said != v->number)
+            say("volume %" PRIu32 ": cannot promote past epoch %" PRIu64 " (the limit is %llu)", v->number, v->epoch,
+                (unsigned long long)META_EPOCH_LIMIT);
+        said = v->number;
+        return;
+    }
+    if (g_npromo == g_promo_cap) {
+        g_promo_cap = g_promo_cap ? 2 * g_promo_cap : 8;
+        g_promo = realloc(g_promo, g_promo_cap * sizeof *g_promo);
+        if (!g_promo)
+            oom();
+    }
+    struct promo *p = &g_promo[g_npromo++];
+    memset(p, 0, sizeof *p);
+    p->vol = v->number;
+    p->old = v->leader;
+    p->epoch = v->epoch;
+    p->version = v->isr_version;
+    p->reason = reason;
+    p->t0 = now;
+    for (uint32_t i = 0; i < v->nisr && i < META_REPLICAS_MAX; i++)
+        p->fenced[p->nfenced++] = v->isr[i];
+    say("volume %" PRIu32 ": leader %" PRIu32 " at epoch %" PRIu64 " is gone (reason %u); fences %" PRIu32
+        " ISR members for epoch %" PRIu64, v->number, v->leader, v->epoch, (unsigned)reason, p->nfenced, v->epoch + 1);
+}
+
+static int heard_fresh(uint32_t id, uint64_t now)
+{
+    if (id == C.id)
+        return 1;
+    uint64_t last = heard_ns(id, now);
+    return last && since(now, last) < (uint64_t)settings()->node_timeout_ms * MS;
+}
+
+/* 1: proposed (or nothing to do any more) */
+static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now)
+{
+    if (p->proposed_ns)
+        return 0;
+    if (!p->sent_ns || since(now, p->sent_ns) >= PROMO_RESEND_NS) {
+        p->sent_ns = now;
+        for (uint32_t i = 0; i < p->nfenced; i++) {
+            if (p->replied[i])
+                continue;
+            if (p->fenced[i] == C.id) {
+                if (g_fence_fn)
+                    g_fence_fn(g_fence_arg, p->vol, p->epoch + 1, C.id);
+                continue;
+            }
+            struct conn *c = conn_to(p->fenced[i]);
+            if (!c)
+                continue;
+            frame_begin(&C.fb, F_FENCE);
+            put32(&C.fb, p->vol);
+            put64(&C.fb, p->epoch + 1);
+            frame_end(&C.fb);
+            conn_send(c, 0);
+        }
+    }
+    uint32_t nrep = 0, waiting = 0, old_ok = p->reason == META_GR_FENCED;
+    for (uint32_t i = 0; i < p->nfenced; i++) {
+        if (p->replied[i])
+            nrep++;
+        else if (heard_fresh(p->fenced[i], now))
+            waiting++;
+        if (p->fenced[i] == p->old && p->replied[i])
+            old_ok = 1;
+    }
+    const struct meta_member *om = meta_member(&C.sm, p->old);
+    if (!old_ok && (!om || om->state != META_UP || now >= promote_safe_ns(p->old)))
+        old_ok = 1;
+    if (!nrep) {
+        if (!p->said && since(now, p->t0) >= PROMO_WAIT_NS) {
+            p->said = 1;
+            say("volume %" PRIu32 ": NO_OWNER: no ISR member answers the fence for epoch %" PRIu64
+                " (tsdb cluster volume force-leader %" PRIu32 " NODE)", p->vol, p->epoch + 1, p->vol);
+        }
+        return 0;
+    }
+    if ((waiting && since(now, p->t0) < PROMO_WAIT_NS) || !old_ok)
+        return 0;
+    struct meta_grant g;
+    memset(&g, 0, sizeof g);
+    g.number = p->vol;
+    g.epoch = p->epoch;
+    g.new_epoch = p->epoch + 1;
+    g.isr_version = p->version;
+    g.reason = p->reason;
+    g.nfenced = p->nfenced;
+    memcpy(g.fenced, p->fenced, sizeof g.fenced);
+    uint64_t best = 0;
+    for (uint32_t i = 0; i < p->nfenced; i++)
+        if (p->replied[i] && !(p->reason == META_GR_FENCED && p->fenced[i] == p->old)) { /* not the failed one */
+            g.reply[g.nreplies++] = p->reply[i];
+            if (p->reply[i].durable > best)
+                best = p->reply[i].durable;
+        }
+    int rc = meta_promote_pick(v, &g, &g.leader);
+    if (rc != META_OK) {
+        if (!p->said)
+            say("volume %" PRIu32 ": no candidate among %" PRIu32 " fence answers (%d)", p->vol, g.nreplies, rc);
+        p->said = 1;
+        return 0;
+    }
+    for (uint32_t i = 0; i < g.nreplies; i++)
+        if (g.reply[i].node == g.leader)
+            best = g.reply[i].durable;
+    /* the first position the new leader writes (its EPOCH marker) is past its durable end; recorded, not a condition */
+    uint64_t last = v->nhist ? v->hist[v->nhist - 1].start : 0;
+    g.start = best + 1 > last + 1 ? best + 1 : last + 1;
+    p->proposed_ns = now;
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_volume_leader(&e, &g);
+    if (propose(&e, 0, 0, 0) == ISO_OK)
+        say("proposes volume %" PRIu32 " leader %" PRIu32 " at epoch %" PRIu64 " (%" PRIu32 " of %" PRIu32
+            " fenced members answered, %" PRIu64 " ms)", p->vol, g.leader, g.new_epoch, g.nreplies, g.nfenced,
+            (uint64_t)(since(now, p->t0) / MS));
+    return 1;
+}
+
+static int vol_reports_fault(uint32_t node, const struct meta_volume *v)
+{
+    const struct heard *h = heard_get(node);
+    for (uint32_t j = 0; h && j < h->nvols; j++)
+        if (h->vols[j].v.volume == v->number && h->vols[j].v.health == CL_HEALTH_LOCAL_FAULT)
+            return 1;
+    return 0;
+}
+
+static void promote_duty(uint64_t now)
+{
+    unsigned nres = g_nresign;
+    g_nresign = 0;
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER) {
+        g_npromo = 0;
+        return;
+    }
+    size_t k = 0;
+    for (size_t i = 0; i < g_npromo; i++) { /* the record moved past the basis, or the proposal is lost */
+        const struct meta_volume *v = meta_volume(&C.sm, g_promo[i].vol);
+        if (v && v->epoch == g_promo[i].epoch && v->isr_version == g_promo[i].version &&
+            since(now, g_promo[i].t0) < PROMO_GIVEUP_NS)
+            g_promo[k++] = g_promo[i];
+    }
+    g_npromo = k;
+    for (uint32_t i = 0; i < C.sm.nvolumes; i++) {
+        const struct meta_volume *v = &C.sm.volumes[i];
+        if (v->kind != META_VOL_REPLICATED || !v->nhist || !v->leader)
+            continue;
+        struct promo *p = promo_find(v->number);
+        if (!p) {
+            const struct meta_member *m = meta_member(&C.sm, v->leader);
+            uint8_t reason = 0;
+            if (m && m->state == META_DOWN)
+                reason = META_GR_UNHEARD;
+            else if (vol_reports_fault(v->leader, v))
+                reason = META_GR_FENCED;
+            for (unsigned r = 0; r < nres && !reason; r++)
+                if (g_resign[r].vol == v->number && g_resign[r].from == v->leader && g_resign[r].epoch == v->epoch)
+                    reason = META_GR_RESIGNED;
+            if (!reason)
+                continue;
+            promo_start(v, reason, now);
+            p = promo_find(v->number);
+            if (!p)
+                continue;
+        }
+        promo_step(p, v, now);
+    }
+}
+
 static void leader_duties(uint64_t now)
 {
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
@@ -4422,6 +4759,7 @@ static void leader_duties(uint64_t now)
     member_states(now);
     propose_opens(now);
     propose_isr(now);
+    promote_duty(now);
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
@@ -4559,6 +4897,7 @@ static void *cluster_main(void *arg)
     while (!atomic_load(&C.stop)) {
         uint64_t now = iso_now_ns();
         dw_collect();
+        vmsg_flush();
         if (C.r) {
             raft_tick(C.r, now);
             pump();

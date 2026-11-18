@@ -129,7 +129,7 @@ _Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member
 #define MAX_NODES 64
 
 enum { M_REPLICA = 0, M_PROMOTING, M_WRITER, M_DEAD };
-enum { IN_MSG = 1, IN_FETCH, IN_META, IN_WAKE };
+enum { IN_MSG = 1, IN_FETCH, IN_META, IN_WAKE, IN_FENCE };
 
 struct item {
     struct item *next;
@@ -207,6 +207,7 @@ struct rvol {
     int isr_want;
     struct repl_vmeta isr_req;
     uint64_t resigned; /* the epoch a RESIGN was said for */
+    uint32_t fence_from; /* the Raft leader whose FENCE the core is answering (its reply goes there) */
     /* min_isr after the append: a write admitted while the ISR was large enough, whose commit point is reached only
      * after a shrink below min_isr, is not acknowledged (the core's REPLY waits the same way, but the writer's waiters
      * go by APPLY): the commit point is held here and handed to the engine once the ISR is back at min_isr */
@@ -564,8 +565,9 @@ static void slow_ack(struct rvol *rv, struct repl_msg *m)
 }
 
 /* A message of the core to the metadata group. ISR_REQ is kept for this server's heartbeats (repld_isr_requests: the
- * Raft leader proposes ISR_CHANGE on the request's own basis) until the record moves; RESIGN and FENCE_REPLY belong to
- * promotion (r3e-failover): said, not sent. */
+ * Raft leader proposes ISR_CHANGE on the request's own basis) until the record moves. FENCE_REPLY (after the core's SAVE
+ * of the fence: the action order) goes to the Raft leader that sent the fence, RESIGN to the Raft leader, both through
+ * the cluster thread (cluster_vol_msg); the core repeats a RESIGN while the record names it, the proposer a fence. */
 static void meta_msg(struct rvol *rv, const struct repl_msg *m)
 {
     if (m->type == REPL_M_ISR_REQ) {
@@ -582,10 +584,19 @@ static void meta_msg(struct rvol *rv, const struct repl_msg *m)
             mm.epoch = mm.meta.epoch;
             repl_recv(rv->core, &mm);
         }
-    } else if (m->type == REPL_M_RESIGN && rv->resigned != m->epoch) {
+    } else if (m->type == REPL_M_FENCE_REPLY) {
+        struct cluster_vmsg q = {.kind = CL_VMSG_FENCE_REPLY, .volume = rv->number, .epoch = m->epoch,
+                                 .durable = m->durable, .last_epoch = m->last_epoch, .rid = m->rid, .start = m->start,
+                                 .to = rv->fence_from};
+        crash_point(CP_FENCE_SAVED); /* the fence is in REPL, the reply not yet out */
+        cluster_vol_msg(&q);
+    } else if (m->type == REPL_M_RESIGN) {
+        if (rv->resigned != m->epoch)
+            say("volume %" PRIu32 ": cannot lead epoch %" PRIu64 " (led it before a restart); resigns", rv->number,
+                m->epoch);
         rv->resigned = m->epoch;
-        say("volume %" PRIu32 ": cannot lead epoch %" PRIu64 " (led it before a restart); waits for a promotion",
-            rv->number, m->epoch);
+        struct cluster_vmsg q = {.kind = CL_VMSG_RESIGN, .volume = rv->number, .epoch = m->epoch, .rid = m->rid};
+        cluster_vol_msg(&q);
     }
 }
 
@@ -1358,6 +1369,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
             uint64_t pos = 0;
             snprintf(owner, sizeof owner, "node %" PRIu32, G.self);
             pthread_mutex_unlock(&rv->mu);
+            crash_point(CP_PROMOTE_BEFORE_EPOCH);
             rc = replica_epoch_begin(db, a->rec.epoch, owner, &pos);
             pthread_mutex_lock(&rv->mu);
             if (rc == 0 && pos != a->rec.pos)
@@ -1657,6 +1669,17 @@ static struct repl_vmeta vmeta_of(const struct rvol *rv)
 
 static void handle(struct rvol *rv, struct item *it)
 {
+    if (it->kind == IN_FENCE) { /* design-cluster.md 6.2 step 1: the core saves it (SAVE) before it replies */
+        uint64_t fence;
+        if (it->n != sizeof fence)
+            return;
+        memcpy(&fence, it->data, sizeof fence);
+        struct repl_msg m = {.type = REPL_M_FENCE, .from = REPL_META, .to = rv->self, .epoch = fence, .leader = -1};
+        rv->fence_from = it->node;
+        repl_recv(rv->core, &m);
+        drain(rv);
+        return;
+    }
     if (it->kind == IN_META) {
         struct repl_msg m = {.type = REPL_M_META, .from = REPL_META, .to = rv->self, .leader = -1};
         m.meta = vmeta_of(rv);
@@ -2219,6 +2242,14 @@ void repld_update(const struct cluster_vol_rec *r)
     pthread_mutex_unlock(&rv->mu);
     if (changed)
         post(rv, IN_META, 0, NULL, 0);
+}
+
+void repld_fence(void *arg, uint32_t v, uint64_t fence, uint32_t from)
+{
+    (void)arg;
+    struct rvol *rv = vol_find(v);
+    if (rv && fence)
+        post(rv, IN_FENCE, from, &fence, sizeof fence);
 }
 
 int repld_isr_short(uint32_t v)
