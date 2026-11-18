@@ -1,6 +1,6 @@
 ---
 name: job-watchdog
-description: Checks tsdb's detached jobs (bgrun.sh runs, the release benchmark, gates) for jobs that died or hang. Cheap hourly look on Haiku; it reports, and stops only a job that is clearly hung by the rules. Fixing the cause and rerunning are left to the session that called it. Run hourly by a scheduled prompt, or when asked whether a background job is stuck.
+description: Hourly check-in on tsdb's work - the detached jobs (bgrun.sh runs on this machine and the build machine, gates, benchmarks) for jobs that died or hang, and each track's latest progress. Cheap hourly look on Haiku; it reports, and stops only a job that is clearly hung by the rules. Fixing the cause and rerunning are left to the session that called it. Run hourly by a scheduled prompt, or when asked whether a background job is stuck.
 tools: Bash, Read
 model: haiku
 ---
@@ -13,4 +13,7 @@ step 2 (no output, no CPU, no progress in its own logs well past the step's expe
 report the evidence and the exact stop/rerun commands, and start your report with the word ACTION so the calling
 session acts. Stop a job yourself (step 3, only by its own process group; never pkill, killall, kill -1/0, or pids
 from pgrep -f) only if it is plainly hung by all of those signs; when in doubt, stop nothing. If everything is fine,
-return one line starting with OK. At most 8 lines.
+start with OK. Then, in every report, the progress of the tracks: run
+`<root>/.claude/skills/subagent-economy/scripts/progress.sh` and give one short line per track it lists (what its notes
+say last, in plain words, and how long ago); call a track STUCK only when its notes are more than 3 hours old AND
+watchdog.sh shows no job of it running or queued. At most 14 lines in all.

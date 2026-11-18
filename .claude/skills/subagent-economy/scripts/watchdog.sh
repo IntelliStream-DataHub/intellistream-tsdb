@@ -5,9 +5,13 @@
 #   WAITING  NAME  on BENCH.lock held by PID (JOB) for Nm   a flock waiter: fine unless the holder is STALLED
 #   STALLED  NAME  out Nm ago, cpu 0%, child: CMD             no output and no CPU for STALL_MIN minutes
 #   DIED     NAME  no process left and no rc                  killed (session end, OOM, reboot)
+#   QUEUED   NAME  (build machine) waiting for a slot there   a job of bgrun.sh's build machine (SE_REMOTE) not started yet
+# A job on the build machine (rpgid in its run dir) is judged by its process group THERE; "(build machine)" marks it,
+# and the orphan check runs there too ("LOOK remote orphan ..."). Stop such a job there by that group (rpgid), then
+# its local pid.
 # plus the holders of BENCH.lock. "out" means the newest of the job's out file and the files its run dir's `watch` lists. A job someone stopped on purpose gets a file `stopped` (one line: why) in its run
 # dir and is skipped; DIED jobs older than a day are skipped too (old runs of this and other projects share $RUNS).
-# PATTERN limits the report to jobs whose cmd matches it (e.g. tsdb), so a watchdog never acts on another project's
+# PATTERN limits the report to jobs whose cmd or working directory matches it (e.g. tsdb), so a watchdog never acts on another project's
 # jobs. CPU is counted for the job's own process group only: a job waiting on a container (its CPU is in the
 # container's cgroup) shows 0%, so STALLED is a lead to check, not a verdict. The script only reads /proc and the
 # run directories; deciding what to do is the job of the watchdog agent (.claude/agents/job-watchdog.md, skill
@@ -23,25 +27,33 @@
 STALL_MIN=${1:-45}; PATTERN=${2:-}
 L=${BENCH_LOCK:-$SE_HOME/BENCH.lock}
 
-for name in ${WATCHDOG_ORPHANS-tsdbd}; do
-    for p in $(pgrep -u "$(id -u)" -x "$name"); do
-        pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$pp" ] || continue
-        [ "$pp" = 1 ] || [ "$(ps -o comm= -p "$pp" 2>/dev/null)" = systemd ] || continue
-        mapfile -d '' -t a 2>/dev/null < "/proc/$p/cmdline" || continue
-        d= pf=
-        for ((i = 1; i < ${#a[@]}; i++)); do
-            case "${a[i]}" in
-            --dir) d=${a[i + 1]-} ;;
-            --dir=*) d=${a[i]#--dir=} ;;
-            --port-file | --port-file=*) pf=1 ;;
-            esac
+# orphaned harness servers; a function so that the same code also runs on the build machine (SE_REMOTE)
+orphans() {
+    for name in ${WATCHDOG_ORPHANS-tsdbd}; do
+        for p in $(pgrep -u "$(id -u)" -x "$name"); do
+            pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$pp" ] || continue
+            [ "$pp" = 1 ] || [ "$(ps -o comm= -p "$pp" 2>/dev/null)" = systemd ] || continue
+            mapfile -d '' -t a 2>/dev/null < "/proc/$p/cmdline" || continue
+            d= pf=
+            for ((i = 1; i < ${#a[@]}; i++)); do
+                case "${a[i]}" in
+                --dir) d=${a[i + 1]-} ;;
+                --dir=*) d=${a[i]#--dir=} ;;
+                --port-file | --port-file=*) pf=1 ;;
+                esac
+            done
+            [ -n "$pf" ] || continue # not a harness's server
+            case "$d" in /*) ;; ?*) d=$(readlink "/proc/$p/cwd" 2>/dev/null)/${d#./} ;; esac
+            case "$d" in /var/tmp/* | /tmp/*) ;; *) continue ;; esac
+            echo "LOOK orphan $name pid $p (ppid $pp, dir $d, age $(ps -o etime= -p "$p" 2>/dev/null | tr -d ' '))"
         done
-        [ -n "$pf" ] || continue # not a harness's server
-        case "$d" in /*) ;; ?*) d=$(readlink "/proc/$p/cwd" 2>/dev/null)/${d#./} ;; esac
-        case "$d" in /var/tmp/* | /tmp/*) ;; *) continue ;; esac
-        echo "LOOK orphan $name pid $p (ppid $pp, dir $d, age $(ps -o etime= -p "$p" 2>/dev/null | tr -d ' '))"
     done
-done
+}
+orphans
+if [ -n "${SE_REMOTE:-}" ]; then
+    { declare -f orphans; echo "WATCHDOG_ORPHANS='${WATCHDOG_ORPHANS-tsdbd}'; orphans"; } |
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "$SE_REMOTE" bash -s 2>/dev/null | sed 's/^LOOK /LOOK remote /'
+fi
 now=$(date +%s)
 ticks=$(getconf CLK_TCK)
 
@@ -82,10 +94,28 @@ done
 
 for d in "$RUNS"/*/; do
     n=$(basename "$d"); [ -e "$d/rc" ] && continue; [ -e "$d/pid" ] || continue; [ -e "$d/stopped" ] && continue
-    [ -n "$PATTERN" ] && ! grep -q -- "$PATTERN" "$d/cmd" 2>/dev/null && continue
     pg=$(cat "$d/pid")
+    # the command or the directory it runs in (a worktree: tsdb-<track>) names the project
+    [ -n "$PATTERN" ] && ! grep -q -- "$PATTERN" "$d/cmd" 2>/dev/null &&
+        ! readlink "/proc/$pg/cwd" 2>/dev/null | grep -q -- "$PATTERN" && continue
     np=$(ps -o pid= -g "$pg" 2>/dev/null | wc -l)
     if [ "$np" -eq 0 ]; then [ $((now - $(cat $d/start))) -gt 86400 ] && continue; echo "DIED     $n  no process left and no rc (started $(date -d @$(cat $d/start) +%F_%H:%M))"; continue; fi
+    if [ -e "$d/rpgid" ]; then
+        # a job on the build machine (se-rjob.sh): the local pid only copies its output back every 15 s, so judge the
+        # job's own process group THERE (its CPU over 2 s, its newest process) and its out, which the copy keeps fresh
+        rg=$(cat "$d/rpgid"); age=$(( (now - $(stat -c %Y "$d/out" 2>/dev/null || cat "$d/start")) / 60 ))
+        if tail -1 "$d/out" 2>/dev/null | grep -q 'waiting for a slot'; then echo "QUEUED   $n  (build machine) waiting for a slot there"; continue; fi
+        r=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$SE_REMOTE" "t() { s=0; for p in \$(ps -o pid= -g $rg); do s=\$((s + \$(awk '{print \$14+\$15+\$16+\$17}' /proc/\$p/stat 2>/dev/null || echo 0))); done; echo \$s; }
+            n=\$(ps -o pid= -g $rg | wc -l); a=\$(t); sleep 2; b=\$(t); echo \$n \$(( (b - a) * 100 / (2 * \$(getconf CLK_TCK)) ))
+            ps -o pid=,etime=,args= -g $rg --sort=start_time | tail -1 | cut -c1-120" 2>/dev/null)
+        [ -n "$r" ] || { echo "RUNNING  $n  (build machine, not reachable now) out ${age}m ago"; continue; }
+        read -r rn rcpu <<< "$(head -1 <<< "$r")"; leaf=$(sed -n 2p <<< "$r")
+        if [ "$rn" -eq 0 ]; then echo "RUNNING  $n  (build machine) its group there has ended; the exit code is on its way back"
+        elif [ "$rcpu" -eq 0 ] && [ "$age" -ge "$STALL_MIN" ]; then
+            echo "STALLED  $n  (build machine, pgid $rg there) out ${age}m ago, cpu 0%, newest: $leaf"
+        else echo "RUNNING  $n  (build machine) out ${age}m ago, cpu ${rcpu}%"; fi
+        continue
+    fi
     # a job that logs its progress elsewhere names those files, one per line, in $d/watch (the release driver:
     # $DBCMP/results/steps.log); the newest of them and out counts
     newest=$(stat -c %Y "$d/out" 2>/dev/null || cat "$d/start")
