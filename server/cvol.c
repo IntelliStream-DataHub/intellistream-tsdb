@@ -258,9 +258,13 @@ static void on_report(void *arg, struct cluster_report *out)
         v->open_nonce = m->nonce;
     }
     pthread_mutex_unlock(&M.mu);
-    for (uint32_t i = 0; i < out->nvols; i++) /* after M.mu: the driver's locks are never taken under it */
+    for (uint32_t i = 0; i < out->nvols; i++) { /* after M.mu: the driver's locks are never taken under it */
         if (repld_failed(out->vols[i].volume))
             out->vols[i].health = CL_HEALTH_LOCAL_FAULT; /* D13: reported in the next heartbeat (r3e-failover acts) */
+        int l = repld_leading(out->vols[i].volume, NULL); /* the driver's writer only while its core leads: a deposed */
+        if (l >= 0)                                        /* one is no OWNER (the Raft leader's lease check) */
+            out->vols[i].role = l == 1 ? CL_ROLE_OWNER : CL_ROLE_NONE;
+    }
     out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, UNREACH_MS);
     out->nisr = repld_isr_requests(out->isr, CLUSTER_REPORT_ISR);
 }
@@ -276,8 +280,8 @@ int cvol_why(uint32_t v)
     if (m && !open)
         why = TSDB_WHY_RECOVERING;
     pthread_mutex_unlock(&M.mu);
-    if (open && !writer && !repld_failed(v) && tsdb_cvol_role(M.t, v) == CVOL_WRITER)
-        writer = 1; /* promoted by the replication driver */
+    if (open && !writer && repld_leading(v, NULL) == 1)
+        writer = 1; /* promoted by the replication driver, and not deposed since */
     if (open) /* led here: answered only under a read lease (§7.1; reads and writes alike) */
         why = !writer ? TSDB_WHY_FENCED : cluster_lease_valid() ? -1 : TSDB_WHY_UNREACHABLE;
     return why;
@@ -291,7 +295,7 @@ int cvol_led(uint32_t v)
     const struct mvol *m = mv_get(v);
     int open = m && m->state == MV_OPEN, writer = m && m->writer;
     pthread_mutex_unlock(&M.mu);
-    if (open && !writer && !repld_failed(v) && tsdb_cvol_role(M.t, v) == CVOL_WRITER)
+    if (open && !writer && repld_leading(v, NULL) == 1)
         writer = 1; /* promoted by the replication driver (as in cvol_why) */
     return open && writer;
 }

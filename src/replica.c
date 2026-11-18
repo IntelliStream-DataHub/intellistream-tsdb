@@ -2316,6 +2316,23 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
     return rc;
 }
 
+int replica_demote(eng **dbp, uint64_t floor, void (*between)(void), eng **out)
+{
+    eng *db = *dbp;
+    tsdb_options opt = db->opt;
+    opt.latest_cache = db->latest_cache_asked; /* the replica's open runs without the table and keeps the size asked */
+    char *dir = strdup(db->dir);
+    if (!dir)
+        return TSDB_ERR_NOMEM;
+    eng_close(db); /* a leader's close deposes it and never flushes: nothing the commit point did not pass is put in parts */
+    *dbp = NULL;
+    if (between)
+        between();
+    int rc = eng_open_replica(dir, &opt, floor, out);
+    free(dir);
+    return rc;
+}
+
 /* ------------------------------------------------------------ the leader side */
 /*
  * The replicated backend of the namespace-event hook (internal.h, struct jr_ops; design-cluster.md 5.2, design-ha-modes.md

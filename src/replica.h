@@ -85,5 +85,10 @@ int replica_read(struct eng *db, uint64_t from, uint8_t **buf, size_t *len, size
 int replica_epoch_begin(struct eng *db, uint64_t epoch, const char *owner, uint64_t *pos);
 extern void (*replica_test_promote_hook)(void); /* test hook: after the segments are removed, before the engine closes */
 int replica_promote(struct eng **dbp, uint64_t epoch_pos, struct eng **out);
+/* A deposed leader (design-cluster.md 6.3), or a replica whose promotion was fenced: *dbp is closed without a flush (a
+ * leader's close deposes it first, eng_close) and set to NULL, `between` (may be NULL; tsdbd's crash point) runs, and
+ * the directory opens as a replica in *out with commit floor `floor` (the REPL file's), whose open cuts the tail the
+ * commit point never passed; the driver's QUERY/ANSWER then cuts what the new leader's history does not hold. */
+int replica_demote(struct eng **dbp, uint64_t floor, void (*between)(void), struct eng **out);
 
 #endif

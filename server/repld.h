@@ -24,6 +24,11 @@ void repld_update(const struct cluster_vol_rec *r);
 /* 1 while volume v is held here and failed (FAIL, a failed save, the engine's fail-stop): it is quiesced and reported
  * failed, the process goes on (DECISION D13). */
 int repld_failed(uint32_t v);
+/* Whether this node writes volume v: 1 while its driver is the writer and its core still leads (epoch: the core's),
+ * 0 when it drives v otherwise (a replica, promoting, deposed, failed), -1 when no driver drives v here. Reads and
+ * writes are served, and OWNER reported in the heartbeat, only on 1: a deposed writer stops at once, before its engine
+ * is reopened as a replica (design-cluster.md 6.3, 7.1). */
+int repld_leading(uint32_t v, uint64_t *epoch);
 /* Volume v's engine failed (eng_fail): 1 when the driver holds v (it stops and quiesces it, the process goes on, D13),
  * 0 when v is no volume of the driver (tsdbd's own rules apply). */
 int repld_engine_failed(uint32_t v, const char *msg);

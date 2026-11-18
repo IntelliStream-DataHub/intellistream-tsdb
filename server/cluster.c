@@ -1545,7 +1545,8 @@ enum cl_mutant {
     CLM_NOQUORUM = 4,
     CLM_NOCORECLOCK = 5,
     CLM_NOPROMOTEWAIT = 6,
-    CLM_SHRINKNOCOND = 7 /* an ISR request is proposed on the record's current epoch and ISR version, not its own basis */
+    CLM_SHRINKNOCOND = 7, /* an ISR request is proposed on the record's current epoch and ISR version, not its own basis */
+    CLM_LEASESTALE = 8    /* a node that reports itself the writer of a volume another leads still gets a lease */
 };
 static int cl_mutant(void)
 {
@@ -1561,6 +1562,7 @@ static int cl_mutant(void)
             : !strcmp(e, "nocoreclock")   ? CLM_NOCORECLOCK
             : !strcmp(e, "nopromotewait") ? CLM_NOPROMOTEWAIT
             : !strcmp(e, "shrinknocond")  ? CLM_SHRINKNOCOND
+            : !strcmp(e, "leasestale")    ? CLM_LEASESTALE
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -4545,9 +4547,19 @@ static void on_fence(struct conn *c, struct rd *r)
         g_fence_fn(g_fence_arg, vol, fence, c->id);
 }
 
-/* on_hb: no lease for `node` while a promotion away from it waits for its answer (stale reads, r3e-leases F5) */
+/* on_hb: no lease for `node` while a promotion away from it waits for its answer, nor while it reports itself the
+ * writer (OWNER) of a replicated volume whose record names another leader (stale reads, r3e-leases F5): its driver
+ * reports OWNER only while its core leads (repld_leading), so a deposed writer that has not yet heard of its fence, or a
+ * Raft leader elected after the promotion with no promotion state of its own, still gives it no lease */
 static int promo_holds_lease(uint32_t node)
 {
+    const struct heard *h = heard_get(node);
+    for (uint32_t i = 0; h && i < h->nvols; i++) {
+        const struct cluster_vol_report *r = &h->vols[i].v;
+        const struct meta_volume *v = r->role == CL_ROLE_OWNER ? meta_volume(&C.sm, r->volume) : NULL;
+        if (v && v->kind == META_VOL_REPLICATED && v->leader != node && cl_mutant() != CLM_LEASESTALE)
+            return 1;
+    }
     for (size_t i = 0; i < g_npromo; i++) {
         const struct promo *p = &g_promo[i];
         if (p->old != node || p->reason == META_GR_FENCED)

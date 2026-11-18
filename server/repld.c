@@ -1840,6 +1840,74 @@ static void commit_watch(struct rvol *rv, uint64_t now)
         "durable to %" PRIu64 ", handed to the core %" PRIu64, rv->number, c, COMMIT_STALL_MS, d, wd, rv->synced_rep);
 }
 
+/* ------------------------------------------------------------------ deposed */
+
+static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struct repl **core_out);
+
+static void demote_between(void) { crash_point(CP_DEPOSE_BEFORE_REOPEN); }
+
+static int demote_fn(void *ctx, struct eng **old, struct eng **neu)
+{
+    const uint64_t *floor = ctx;
+    return replica_demote(old, *floor, demote_between, neu);
+}
+
+/* The core stepped down (a FENCE or REFUSE with a higher epoch, a REPLY REPL_MOVED; design-cluster.md 6.3) while this
+ * node was the writer or promoting: the writer is deposed (its waiting writers end indeterminate, D12: tsdbd closes
+ * their connections; new writes are refused), its engine closed without a flush and the directory opened as a replica,
+ * whose open cuts the tail the commit point never passed; a new core from REPL (led stays the epoch it led: it never
+ * resumes it) then follows the new leader, whose QUERY/ANSWER cuts what its history does not hold. rv->mu held; let go
+ * of across the swap and the core's build (both read the engine: buf_lock is above rv->mu). While it runs rv->core is
+ * NULL: op_admit refuses, op_synced and the heartbeat's ISR requests skip it, and the engine is a replica's from the
+ * swap on, which calls no jr hook. */
+static void demote(struct rvol *rv)
+{
+    struct repl *old = rv->core;
+    uint64_t floor = rv->st.floor, epoch = rv->epoch;
+    int was = rv->mode;
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+    if (db && was == M_WRITER)
+        eng_leader_depose(db);
+    tsdb_cvol_unref(&db);
+    rv->core = NULL;
+    rv->mode = M_REPLICA;
+    rv->isr_want = 0;
+    rv->synced_rep = rv->held_commit = rv->epoch_pos = 0;
+    rv->cstall_at = rv->cstall_ms = 0;
+    rv->cstall_said = rv->short_said = rv->snap_said = 0;
+    for (int i = 0; i < REPL_MAX_NODES; i++) {
+        struct rpeer *p = &rv->peer[i];
+        p->sent = p->want = p->sent_ms = p->acked = p->gen = p->wrote = p->wrote_ms = p->ahead_ms = 0;
+    }
+    rv->nidx = 0;
+    rv->idx_end = 0;
+    rv->nhist = 0;
+    pthread_mutex_unlock(&rv->mu);
+    repl_free(old);
+    uint64_t t0 = now_ms();
+    int rc = tsdb_cvol_replace(G.t, rv->number, demote_fn, &floor, CVOL_REPLICA);
+    struct repl *core = NULL;
+    uint64_t log_end = 0;
+    if (rc == 0)
+        rc = core_build(rv, false, &log_end, &core);
+    pthread_mutex_lock(&rv->mu);
+    if (rc != 0) {
+        /* the engine is closed or a replica that no core drives: reported failed (D13), the group acts */
+        say("volume %" PRIu32 ": deposed at epoch %" PRIu64 ", the reopen as a replica failed: %s", rv->number, epoch,
+            tsdb_strerror(rc));
+        rv->failed = 1;
+        return;
+    }
+    rv->core = core;
+    rv->epoch = repl_epoch(core);
+    say("volume %" PRIu32 ": deposed at epoch %" PRIu64 "%s: a replica again (log ..%" PRIu64 ", fence %" PRIu64
+        ", reopened in %" PRIu64 " ms)", rv->number, epoch, was == M_PROMOTING ? " while promoting" : "", log_end,
+        rv->st.fence, now_ms() - t0);
+    pthread_mutex_unlock(&rv->mu); /* post takes it */
+    post(rv, IN_META, 0, NULL, 0);
+    pthread_mutex_lock(&rv->mu);
+}
+
 static void *vol_main(void *arg)
 {
     struct rvol *rv = arg;
@@ -1849,6 +1917,10 @@ static void *vol_main(void *arg)
         drain(rv);
         if (rv->failed) {
             pthread_cond_wait(&rv->cv, &rv->mu);
+            continue;
+        }
+        if ((rv->mode == M_WRITER || rv->mode == M_PROMOTING) && !repl_is_leader(rv->core)) {
+            demote(rv);
             continue;
         }
         /* a tick that is due goes before the inbox (r3d review L2): under a steady stream of ACKs the inbox is never
@@ -2074,6 +2146,79 @@ void repld_init(tsdb *t, const char *dir)
     snprintf(G.dir, sizeof G.dir, "%s", dir);
 }
 
+/* The index, the history and a new core from what the volume's directory and REPL hold: at the open, and after a
+ * deposed leader's engine was reopened as a replica (demote). rv->nidx and rv->nhist are empty; rv->rec is set. Without
+ * rv->mu (it reads the engine, whose buf_lock is above it): the caller lists the core under it. */
+static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struct repl **core_out)
+{
+    struct repl_epoch h[REPLFILE_MAX_HIST];
+    uint32_t nh = 0;
+    uint64_t first = 0;
+    scan_segments(rv, h, &nh, &first);
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+    uint64_t log_end = db ? replica_log_end(db) : 0;
+    *log_end_out = log_end;
+    /* the durable end the core starts from: below a COMMIT marker whose files are not staged (replica.c's hold), not
+     * the log end. A replica killed between such a marker and its file's FETCH otherwise acknowledged its whole log at
+     * the restart (once its log was verified, before its first sync): the leader took it as holding the file, its keep
+     * bound passed the marker, the segment and the link the file is served from went, and the replica asked for the
+     * file for the rest of the run ("it needs a snapshot"; jepsen-cluster kill, kv and classes, 2026-11-18). Its match
+     * claimed positions it could not apply too. test_cluster reopenhold; mutant opennohold */
+    uint64_t dur = db ? replica_durable_end(db) : 0;
+    uint64_t hold = dur < log_end && G.mutant != RM_OPENNOHOLD ? dur + 1 : 0;
+    /* the history: REPL's entries below the first segment's, then the segments' own */
+    for (uint32_t i = 0; i < rv->st.nhist; i++)
+        if (!nh || rv->st.hist[i].start < h[0].start)
+            hist_note(rv, rv->st.hist[i].epoch, rv->st.hist[i].start);
+    for (uint32_t i = 0; i < nh; i++)
+        hist_note(rv, h[i].epoch, h[i].start);
+    rv->log_start = first ? first : log_end + 1;
+    if (rv->log_start < 1)
+        rv->log_start = 1;
+    rv->idx_end = rv->log_start - 1;
+    if (db)
+        index_log(rv, db, rv->log_start, log_end);
+    tsdb_cvol_unref(&db);
+    if (unsure) {
+        /* The surviving slot's floor may be older than the segments this replica removed: one goes only once a floor
+         * at or past its end is saved (replica_floor_saved), so the log's start proves that floor. Left below it, the
+         * core refuses the log ("the log starts above the commit floor") at this open and every later one. This save
+         * makes the file trusted again (replfile_save clears the flag only with led = fence); kept set, every later
+         * open would take the group's epoch over its own fence again and say unsure forever. Only the start of a
+         * segment proves it: with none left the start is the log's end + 1, taken from fno_next, which FNO can hold
+         * above every record this replica kept (a cut lowers fno_next in memory only), so the floor is left as the
+         * slot has it (the core refuses an open it cannot prove, never takes positions as committed). */
+        if (first && first - 1 > rv->st.floor)
+            rv->st.floor = first - 1;
+        rv->st.unsure = false;
+        int rc = replfile_save(rv->rf, &rv->st);
+        if (rc != 0) {
+            say("volume %" PRIu32 ": REPL of %s is unsure and could not be saved: %s", rv->number, rv->dir,
+                tsdb_strerror(rc));
+            return rc;
+        }
+    }
+    struct repl_durable d = {.rid = rv->st.rid, .fence = rv->st.fence, .led = rv->st.led, .floor = rv->st.floor,
+                             .log_start = rv->log_start, .log_end = log_end, .hold = hold, .hist = rv->hist,
+                             .nhist = rv->nhist};
+    const struct cluster_vol_rec *r = &rv->rec;
+    uint32_t lag = r->isr_lag_ms ? r->isr_lag_ms : 1000;
+    int min_isr = r->min_isr && G.mutant != RM_NOMINISR ? (int)r->min_isr : 1; /* planted nominisr: never checked */
+    struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = min_isr,
+                              .isr_lag_ticks = lag / TICK_MS, .resend_ticks = 200 / TICK_MS, .heartbeat_ticks = 1,
+                              .idle_heartbeat_ticks = IDLE_HEARTBEAT_MS / TICK_MS,
+                              .floor_ticks = 1000 / TICK_MS, .max_batch = 1u << 30, .window = 1u << 30,
+                              .join_hold_ticks = G.mutant == RM_NOJOINHOLD ? 0 : lag / TICK_MS,
+                              .rec_find = idx_find, .ctx = rv};
+    *core_out = repl_open(&cfg, &d);
+    rv->sync_pause_end = now_ms() + SYNC_PAUSE_MS;
+    if (!*core_out) {
+        say("volume %" PRIu32 ": the replication core refused the state of %s", rv->number, rv->dir);
+        return TSDB_ERR_CORRUPT;
+    }
+    return 0;
+}
+
 int repld_open(const struct cluster_vol_rec *r)
 {
     if (r->nrep == 0 || r->nrep > REPL_MAX_NODES || links_up(r) != 0)
@@ -2121,68 +2266,9 @@ int repld_open(const struct cluster_vol_rec *r)
         say("volume %" PRIu32 ": the open of %s failed: %s", r->number, rv->dir, tsdb_strerror(rc));
         goto fail;
     }
-    struct repl_epoch h[REPLFILE_MAX_HIST];
-    uint32_t nh = 0;
-    uint64_t first = 0;
-    scan_segments(rv, h, &nh, &first);
-    struct eng *db = tsdb_cvol_ref(G.t, r->number);
-    uint64_t log_end = db ? replica_log_end(db) : 0;
-    /* the durable end the core starts from: below a COMMIT marker whose files are not staged (replica.c's hold), not
-     * the log end. A replica killed between such a marker and its file's FETCH otherwise acknowledged its whole log at
-     * the restart (once its log was verified, before its first sync): the leader took it as holding the file, its keep
-     * bound passed the marker, the segment and the link the file is served from went, and the replica asked for the
-     * file for the rest of the run ("it needs a snapshot"; jepsen-cluster kill, kv and classes, 2026-11-18). Its match
-     * claimed positions it could not apply too. test_cluster reopenhold; mutant opennohold */
-    uint64_t dur = db ? replica_durable_end(db) : 0;
-    uint64_t hold = dur < log_end && G.mutant != RM_OPENNOHOLD ? dur + 1 : 0;
-    /* the history: REPL's entries below the first segment's, then the segments' own */
-    for (uint32_t i = 0; i < rv->st.nhist; i++)
-        if (!nh || rv->st.hist[i].start < h[0].start)
-            hist_note(rv, rv->st.hist[i].epoch, rv->st.hist[i].start);
-    for (uint32_t i = 0; i < nh; i++)
-        hist_note(rv, h[i].epoch, h[i].start);
-    rv->log_start = first ? first : log_end + 1;
-    if (rv->log_start < 1)
-        rv->log_start = 1;
-    rv->idx_end = rv->log_start - 1;
-    if (db)
-        index_log(rv, db, rv->log_start, log_end);
-    tsdb_cvol_unref(&db);
-    if (unsure) {
-        /* The surviving slot's floor may be older than the segments this replica removed: one goes only once a floor
-         * at or past its end is saved (replica_floor_saved), so the log's start proves that floor. Left below it, the
-         * core refuses the log ("the log starts above the commit floor") at this open and every later one. This save
-         * makes the file trusted again (replfile_save clears the flag only with led = fence); kept set, every later
-         * open would take the group's epoch over its own fence again and say unsure forever. Only the start of a
-         * segment proves it: with none left the start is the log's end + 1, taken from fno_next, which FNO can hold
-         * above every record this replica kept (a cut lowers fno_next in memory only), so the floor is left as the
-         * slot has it (the core refuses an open it cannot prove, never takes positions as committed). */
-        if (first && first - 1 > rv->st.floor)
-            rv->st.floor = first - 1;
-        rv->st.unsure = false;
-        rc = replfile_save(rv->rf, &rv->st);
-        if (rc != 0) {
-            say("volume %" PRIu32 ": REPL of %s is unsure and could not be saved: %s", r->number, rv->dir,
-                tsdb_strerror(rc));
-            cvol_close(r->number);
-            goto fail;
-        }
-    }
-    struct repl_durable d = {.rid = rv->st.rid, .fence = rv->st.fence, .led = rv->st.led, .floor = rv->st.floor,
-                             .log_start = rv->log_start, .log_end = log_end, .hold = hold, .hist = rv->hist,
-                             .nhist = rv->nhist};
-    uint32_t lag = r->isr_lag_ms ? r->isr_lag_ms : 1000;
-    int min_isr = r->min_isr && G.mutant != RM_NOMINISR ? (int)r->min_isr : 1; /* planted nominisr: never checked */
-    struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = min_isr,
-                              .isr_lag_ticks = lag / TICK_MS, .resend_ticks = 200 / TICK_MS, .heartbeat_ticks = 1,
-                              .idle_heartbeat_ticks = IDLE_HEARTBEAT_MS / TICK_MS,
-                              .floor_ticks = 1000 / TICK_MS, .max_batch = 1u << 30, .window = 1u << 30,
-                              .join_hold_ticks = G.mutant == RM_NOJOINHOLD ? 0 : lag / TICK_MS,
-                              .rec_find = idx_find, .ctx = rv};
-    rv->core = repl_open(&cfg, &d);
-    rv->sync_pause_end = now_ms() + SYNC_PAUSE_MS;
-    if (!rv->core) {
-        say("volume %" PRIu32 ": the replication core refused the state of %s", r->number, rv->dir);
+    uint64_t log_end = 0;
+    rc = core_build(rv, unsure, &log_end, &rv->core); /* the thread is not started: nothing else reads rv->core */
+    if (rc != 0) {
         cvol_close(r->number);
         goto fail;
     }
@@ -2351,6 +2437,19 @@ int repld_failed(uint32_t v)
     int f = rv->failed;
     pthread_mutex_unlock(&rv->mu);
     return f;
+}
+
+int repld_leading(uint32_t v, uint64_t *epoch)
+{
+    struct rvol *rv = vol_find(v);
+    if (!rv)
+        return -1;
+    pthread_mutex_lock(&rv->mu);
+    int l = rv->mode == M_WRITER && !rv->failed && rv->core && repl_is_leader(rv->core);
+    if (l && epoch)
+        *epoch = repl_epoch(rv->core);
+    pthread_mutex_unlock(&rv->mu);
+    return l;
 }
 
 int repld_engine_failed(uint32_t v, const char *msg)
