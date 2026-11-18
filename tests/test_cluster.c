@@ -3889,13 +3889,18 @@ static void scen_backpressure(void)
  * ran a due tick (with its catch-up) before the inbox, so with each tick longer than one the next was always due and
  * the healthy replica's ACKs waited in the inbox while the core's clock ran: the leader dropped it for silence (in
  * the merge's repro the ISR went 3 -> 2 -> 1 during a rejoin). After each tick the inbox now gets a tick's time
- * (mutant inboxstarve: none). The healthy replica must stay in the ISR throughout. */
-enum { REJ_GAP, REJ_STEADY, REJ_SLOW };
+ * (mutant inboxstarve: none). The healthy replica must stay in the ISR throughout.
+ *
+ * rejoinlate: every tick of the leader takes 6 ms (TSDB_REPLD_TEST=latetick), so its volume thread is never current
+ * (as under TSan with a full inbox). Late ticks run without a catch-up step (tickwall), but one still runs as long
+ * after the last as that took: a version that ran steps only on current ticks never caught the replica up
+ * (rejoinsteady under TSan; mutant stepcurrentonly). */
+enum { REJ_GAP, REJ_STEADY, REJ_SLOW, REJ_LATE };
 static void rejoin_run(const char *name, int how)
 {
     scenario(name);
     for (int i = 0; i < 3; i++) {
-        penv[i] = how == REJ_SLOW ? "TSDB_REPLD_TEST=slowread" : NULL;
+        penv[i] = how == REJ_SLOW ? "TSDB_REPLD_TEST=slowread" : how == REJ_LATE ? "TSDB_REPLD_TEST=latetick" : NULL;
         start(i);
     }
     init_cluster(0, 600);
@@ -4008,6 +4013,7 @@ static void rejoin_run(const char *name, int how)
 static void scen_rejoin(void) { rejoin_run("rejoin", REJ_GAP); }
 static void scen_rejoinsteady(void) { rejoin_run("rejoinsteady", REJ_STEADY); }
 static void scen_rejoinslow(void) { rejoin_run("rejoinslow", REJ_SLOW); }
+static void scen_rejoinlate(void) { rejoin_run("rejoinlate", REJ_LATE); }
 
 /* tickwall (r3d-isr review M1): isr_lag is wall time. The core counts it in ticks, and every catch-up step of the
  * leader ran inside a tick, a late tick dropped: with a step of 20 ms (TSDB_REPLD_TEST=slowtick, every tick) a core
@@ -5779,7 +5785,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

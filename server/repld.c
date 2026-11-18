@@ -56,7 +56,9 @@
  * writes; rejoinsteady), `inboxstarve` gives the inbox no time after a tick while the next one is due (a catch-up read
  * longer than a tick starved the other peers' ACKs; rejoinslow), `opennohold` starts a replica's core with its whole
  * log durable, past a COMMIT marker whose file it has not staged (reopenhold), `tickstretch` drops the ticks a slow
- * catch-up step made late, so the core's clock (isr_lag, the join hold) runs slower than the wall's (tickwall).
+ * catch-up step made late, so the core's clock (isr_lag, the join hold) runs slower than the wall's (tickwall),
+ * `stepcurrentonly` runs catch-up steps only on ticks that are not late (a thread always late never catches a peer
+ * up: rejoinlate).
  * `commitpastremoved` takes an ISR request as the record at once, before the metadata group commits it (isr),
  * `nominisr` never checks min_isr (minisr), `ackbelowminisr` hands the writer a commit point reached after a shrink
  * below min_isr (minisr), `nocap` keeps the leader's segments for a lagging replica without the caps repl_retain_mb and
@@ -76,7 +78,7 @@
  * <dir>/stalesent exists, below the log's start (what a resync that raced records in flight left behind; the cursor
  * must move up to what the peer acknowledged, or it is never sent another record); `slowread` has every catch-up
  * read take SLOW_READ_MS more (a slow disk or NFS); `slowtick` has a writer's catch-up step take SLOW_TICK_MS at every
- * tick it runs (tickwall); `slowack` has a replica's ACKs report the durable end it had
+ * tick it runs (tickwall); `latetick` has every tick of a writer take LATE_TICK_MS more (rejoinlate); `slowack` has a replica's ACKs report the durable end it had
  * SLOW_ACK_MS before (a far replica: always a few writes behind the leader's end while it keeps up).
  * TSDB_REPLD_TRACE=1 (debugging; jepsen-cluster passes the environment on) logs every 2 s per volume a line of the
  * core's state (repl_debug: per peer next, match, acked) and the driver's cursors (sent, want, acked, ages, link).
@@ -120,6 +122,7 @@ _Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member
 #define READ_CAP (4u << 20)
 #define SLOW_READ_MS 10  /* slowread (tests): longer than a tick */
 #define SLOW_TICK_MS 20  /* slowtick (tests): a catch-up step that long, at every tick it runs */
+#define LATE_TICK_MS 6   /* latetick (tests): every tick of a writer that much longer: the thread is never current */
 #define TICK_BACKLOG_MS 1000 /* the core's clock catches up at most this much of wall time (vol_main) */
 #define SLOW_ACK_MS 100  /* slowack (tests) */
 #define SLOW_ACK_RING 512
@@ -195,6 +198,7 @@ struct rvol {
     char fetch_name[RW_NAME_MAX + 1];
     uint64_t fetch_late_ms;                 /* fetchlate (tests): when fetch_late_name was found missing */
     uint64_t sync_pause_end;                /* syncpause (tests): a replica's syncs wait until then */
+    uint64_t cu_next;                       /* a late tick runs a catch-up step only from then on (vol_main) */
     int sync_paused;                        /* syncpause: a SYNC waits for sync_pause_end */
     char fetch_late_name[RW_NAME_MAX + 1];
     struct jr_ops ops;
@@ -247,7 +251,8 @@ enum {
     RM_NOJOINHOLD,
     RM_INBOXSTARVE,
     RM_OPENNOHOLD,
-    RM_TICKSTRETCH
+    RM_TICKSTRETCH,
+    RM_STEPCURRENTONLY
 };
 
 static struct {
@@ -295,6 +300,8 @@ static struct {
     int slow_read;    /* TSDB_REPLD_TEST=slowread: every catch-up read takes SLOW_READ_MS more (a slow disk, NFS) */
     int slow_tick;    /* TSDB_REPLD_TEST=slowtick: a writer's catch-up step takes SLOW_TICK_MS at every tick it runs,
                        * lagging peer or not (tickwall) */
+    int late_tick;    /* TSDB_REPLD_TEST=latetick: every tick of a writer takes LATE_TICK_MS more, so its ticks are always
+                       * late (a volume thread that cannot keep up: TSan, a full inbox) (rejoinlate) */
     int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
                        * replica: what it reports trails the leader's end even while it keeps up) */
     struct rin *ins; /* bulk files being received */
@@ -1845,7 +1852,11 @@ static void *vol_main(void *arg)
              * runs without a catch-up step of its own, after the inbox had its slice; the step runs again once the
              * clock is current. Each tick ran one step before and a late tick was dropped, so with catch-up reads of
              * X ms a core tick took X + 5 ms of wall time: with 20 ms reads a stopped member stalled the writes for
-             * 5 s, not isr_lag (r3d-isr review M1; test_cluster tickwall, mutant tickstretch) */
+             * 5 s, not isr_lag (r3d-isr review M1; test_cluster tickwall, mutant tickstretch). A thread that never
+             * gets current again (a full inbox under TSan) still runs a step once as long after the last one as that
+             * one took: the steps get at least half its time while it is late, and a lagging peer is never starved
+             * (the first version ran steps only on current ticks: rejoinsteady under TSan never joined in 30 s;
+             * test_cluster rejoinlate, mutant stepcurrentonly) */
             const int stretch = G.mutant == RM_TICKSTRETCH;
             int behind = !stretch && now >= next_tick + TICK_MS;
             if (rv->sync_paused && now >= rv->sync_pause_end) {
@@ -1879,7 +1890,15 @@ static void *vol_main(void *arg)
             if (stretch ? next_tick < now : next_tick + TICK_BACKLOG_MS < now)
                 next_tick = stretch ? now + TICK_MS : now - TICK_BACKLOG_MS; /* a longer stall: that much is caught up */
             drain(rv);
-            if (!behind && (rv->mode == M_WRITER || rv->mode == M_PROMOTING)) {
+            if (G.late_tick && rv->mode == M_WRITER) {
+                pthread_mutex_unlock(&rv->mu);
+                struct timespec lt = {0, LATE_TICK_MS * 1000000L};
+                nanosleep(&lt, NULL);
+                pthread_mutex_lock(&rv->mu);
+            }
+            uint64_t cu0 = now_ms();
+            int step = !behind || (cu0 >= rv->cu_next && G.mutant != RM_STEPCURRENTONLY);
+            if (step && (rv->mode == M_WRITER || rv->mode == M_PROMOTING)) {
                 struct eng *db = tsdb_cvol_ref(G.t, rv->number);
                 if (db)
                     catch_up(rv, db);
@@ -1890,6 +1909,8 @@ static void *vol_main(void *arg)
                     nanosleep(&st, NULL);
                     pthread_mutex_lock(&rv->mu);
                 }
+                uint64_t cu1 = now_ms();
+                rv->cu_next = cu1 + (cu1 - cu0);
             }
             slice = now_ms() + TICK_MS;
             continue;
@@ -1994,6 +2015,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "inboxstarve")    ? RM_INBOXSTARVE
                : !strcmp(mu, "opennohold")     ? RM_OPENNOHOLD
                : !strcmp(mu, "tickstretch")    ? RM_TICKSTRETCH
+               : !strcmp(mu, "stepcurrentonly") ? RM_STEPCURRENTONLY
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -2016,6 +2038,7 @@ void repld_init(tsdb *t, const char *dir)
     G.stall_inbox = te && strstr(te, "stallinbox");
     G.slow_read = te && strstr(te, "slowread");
     G.slow_tick = te && strstr(te, "slowtick");
+    G.late_tick = te && strstr(te, "latetick");
     G.slow_ack = te && strstr(te, "slowack");
     G.spill_bytes = te && strstr(te, "spill") ? 64u << 10 : SPILL_BYTES;
     if (G.mutant == RM_NOSPILL)

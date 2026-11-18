@@ -989,9 +989,11 @@ simulator with the hold on in three seeds of four (MUT 41: asked for at the hold
 `test_cluster rejoinsteady` (a replica whose ACKs trail by 100 ms joins under two writers; mutant `nojoinhold`).
 `isr_lag_ms` and the hold are counted in the core's ticks, which follow the wall clock: a tick that comes a tick or
 more late (the leader's catch-up step of the tick before took that long) runs without a catch-up step of its own, after
-the inbox had its slice, up to a second of backlog. Before, each tick ran a step and a late tick was dropped, so with
-20 ms catch-up reads a core tick took 25 ms and a stopped member held the writes 5 s (r3d-isr review M1; `test_cluster
-tickwall`, mutant `tickstretch`).
+the inbox had its slice, up to a second of backlog; a thread that is never current still runs a step once as long after
+the last one as that one took, so the steps keep at least half its time and a lagging peer is never starved
+(`rejoinlate`, mutant `stepcurrentonly`: under TSan a replica never rejoined). Before, each tick ran a step and a late
+tick was dropped, so with 20 ms catch-up reads a core tick took 25 ms and a stopped member held the writes 5 s
+(r3d-isr review M1; `test_cluster tickwall`, mutant `tickstretch`).
 
 A replica's durable end stops below a COMMIT marker whose files it has not staged, and its core starts there at an
 open too (`repl_durable.hold`), not at its log end: a replica killed between such a marker and the FETCH of its file
