@@ -27,7 +27,7 @@ make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBS
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
                           # with an output buffer of exactly n values, part, manifest, wal, dict, volumes, tz, import = the
-                          # export stream, users = USERS, classes = CLASSES, marker = WAL marker payloads, chunk = a chunk file, ec = the decode path of objects and the codec) under ASan+UBSan in build-fuzz/; make test
+                          # export stream, users = USERS, classes = CLASSES, marker = WAL marker payloads, chunk = a chunk file, ec = the decode path of objects and the codec, ecpart = a settled part's .ec file and its object record) under ASan+UBSan in build-fuzz/; make test
                           # replays tests/fuzz/corpus/<name>/ (codecx uses codec's). A crash-* input, once fixed, goes there.
                           # At a CPU level: make fuzz FUZZ_ARCH=-march=x86-64-v4 (or -v3; its own dir build-fuzz-v4, and a changed level in a FUZZ_B you name
                           # empties it; make fuzz-v4-check replays part and codecx at v4 under ASan with use-after-return on; the
