@@ -2957,6 +2957,7 @@ struct rep_writer {
     int64_t t0;
     int count, done, rc;
     int big; /* > 0: one insert of this many rows instead of `count` single rows */
+    int acked; /* rows acknowledged so far (rows t0, t0 + 1000, ...) */
 };
 static int rep_timeout_ms; /* > 0: every answer to a rep_write_thread within this, or the write fails (a hang shows as
                               a failure, not as a test that never ends) */
@@ -2979,6 +2980,8 @@ static void *rep_write_thread(void *a)
             for (int j = 0; j < w->big; j++)
                 ts[j] = w->t0 + 1000LL * j, val[j] = (float)(j % 613);
             w->rc = tsdbc_insert_series(c, w->id, ts, val, w->big);
+            if (w->rc == 0)
+                __atomic_store_n(&w->acked, w->big, __ATOMIC_RELEASE);
             free(ts);
             free(val);
         }
@@ -2986,6 +2989,8 @@ static void *rep_write_thread(void *a)
             int64_t ts = w->t0 + 1000LL * j;
             float val = (float)j;
             w->rc = tsdbc_insert_series(c, w->id, &ts, &val, 1);
+            if (w->rc == 0)
+                __atomic_store_n(&w->acked, j + 1, __ATOMIC_RELEASE);
         }
         tsdbc_close(c);
     }
@@ -4657,6 +4662,116 @@ static void scen_replindet(void)
     printf("  a write left of unknown outcome by its leader's stop gets a closed connection, never an answer\n");
 }
 
+/* The rows of `id` in [from, to] on server i, once its answer is not UNAVAILABLE (a promotion under way): -1 after ms */
+static int rows_in(int i, tsdb_sid id, int64_t from, int64_t to, int ms)
+{
+    uint64_t t0 = now_ms();
+    for (;;) {
+        tsdbc *c = client(i);
+        nrows = 0;
+        int rc = tsdbc_query_raw(c, id, from, to, count_rows, NULL);
+        tsdbc_close(c);
+        if (rc == 0)
+            return nrows;
+        if (now_ms() - t0 > (uint64_t)ms)
+            return -1;
+        usleep(50000);
+    }
+}
+
+/* design-cluster.md 6.2-6.3 (r3e-failover): the leader of a replicated volume is killed under writes. The Raft leader
+ * sees it down (node_timeout, then its lease's end), fences the ISR, and a replica leads at epoch e+1; every
+ * acknowledged write is there; the new leader takes writes; the old leader restarts as a replica (led e: it never
+ * resumes), is cut by the new leader's history, catches up and holds the same rows as the others. */
+static void scen_failover(void)
+{
+    scenario("failover");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "fo", 3, &num)) != 0 || num != 1)
+        die("volume add fo: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fo", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "fo", &v))
+        die("no record of fo");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of fo is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "fo", 30000);
+    tsdbc_close(c);
+    await_isr(0, "fo", 3, 30000, "every replica in the ISR before the kill");
+    struct rep_writer w = {cports[L], id, 1000000, 1000000, 0, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    uint64_t t0 = now_ms();
+    while (__atomic_load_n(&w.acked, __ATOMIC_ACQUIRE) < 300) {
+        if (now_ms() - t0 > 30000)
+            die("the writer had %d rows acknowledged in 30 s", __atomic_load_n(&w.acked, __ATOMIC_ACQUIRE));
+        usleep(10000);
+    }
+    signal_child(pids[L], SIGKILL);
+    uint64_t tk = now_ms();
+    if (await_exit(L, 5000) < 0)
+        die("server %d did not die of SIGKILL", L);
+    pthread_join(th, NULL);
+    int acked = __atomic_load_n(&w.acked, __ATOMIC_ACQUIRE);
+    int via = (L + 1) % 3, Nw = -1;
+    for (;;) {
+        if (vol_rec(via, "fo", &v) && v.leader != ids[L] && v.epoch > e0) {
+            Nw = server_of(v.leader);
+            break;
+        }
+        if (now_ms() - tk > 30000)
+            die("no new leader of fo 30 s after its leader was killed (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+        usleep(20000);
+    }
+    if (v.epoch != e0 + 1 || Nw < 0 || Nw == L)
+        die("the new record of fo: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    uint64_t tr = now_ms();
+    /* a replica answers reads from what it applied (it may lag the commit point): the new leader's own answer counts,
+     * once it leads (after its EPOCH marker is committed and applied, and the engine reopened as the writer) */
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    uint64_t tl = now_ms();
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * (acked - 1), 30000);
+    if (got != acked)
+        die("the new leader (server %d) holds %d of the %d acknowledged rows", Nw, got, acked);
+    printf("  leader %d killed after %d acknowledged rows: the record names server %d at epoch %" PRIu64 " after %" PRIu64
+           " ms, which leads after %" PRIu64 " ms and holds every one\n", L, acked, Nw, v.epoch, tr - tk, tl - tk);
+    /* the new leader takes writes */
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the new leader: %s", ers(rc));
+    tsdbc_close(c);
+    /* the old leader restarts as a replica and rejoins */
+    start(L);
+    await_isr(via, "fo", 3, 60000, "the old leader back in the ISR");
+    int total = rows_in(Nw, id, 0, INT64_MAX / 2, 10000);
+    if (total < acked + 1)
+        die("the new leader holds %d rows after the rejoin, fewer than the %d acknowledged", total, acked + 1);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)total;
+    rep_same(wantr, "after the failover");
+    printf("  the old leader came back as a replica, was cut and caught up: every server holds the same %d rows\n",
+           total);
+}
+
 /* D13: an engine failure (EIO on a WAL fdatasync, crashfs) of one replica of a cluster volume stops that volume
  * there, quiesced and reported LOCAL_FAULT in the server's heartbeat; the server itself goes on (its root answers)
  * and exits cleanly on SIGTERM. Without D13 tsdbd exits with status 1 on any failed volume outside a domain. */
@@ -5863,7 +5978,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
