@@ -2390,6 +2390,349 @@ static int cli_run(const char *args, const char *in, char *out, size_t n)
     return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
 }
 
+/* `tsdb ARGS` started without waiting (cli_finish reads its output and status): two CLI calls at once */
+static FILE *cli_start(const char *args)
+{
+    const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
+    char cmd[PATH_MAX * 3 + 256];
+    snprintf(cmd, sizeof cmd, "%s %s 2>&1", cli, args);
+    FILE *p = popen(cmd, "r");
+    if (!p)
+        die("popen %s: %s", cmd, strerror(errno));
+    return p;
+}
+
+static int cli_finish(FILE *p, char *out, size_t n)
+{
+    size_t got = fread(out, 1, n - 1, p);
+    out[got] = 0;
+    int st = pclose(p);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+}
+
+struct users_want {
+    const char *present[3];
+    const char *absent;
+};
+static int p_users(const struct view *v, void *a)
+{
+    const struct users_want *w = a;
+    for (int k = 0; k < 3 && w->present[k]; k++)
+        if (!meta_user(&v->m, w->present[k]))
+            return 0;
+    return !w->absent || !meta_user(&v->m, w->absent);
+}
+
+static int p_users_caught_up(const struct view *v, void *a)
+{
+    (void)a;
+    return v->st.users_caught_up == 1;
+}
+
+/* the file a server's users probe wrote (TSDB_CLUSTER_TEST users_probe=1), "" while there is none */
+static void probe_read(int i, const char *name, char *out, size_t n)
+{
+    char path[PATH_MAX + 96];
+    server_dir(i, path, sizeof path);
+    strcat(path, "/state/");
+    strcat(path, name);
+    out[0] = 0;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        size_t got = fread(out, 1, n - 1, f);
+        out[got] = 0;
+        fclose(f);
+    }
+}
+
+static void await_probe(int i, const char *name, const char *want, const char *what)
+{
+    char out[8192];
+    uint64_t t0 = now_ms();
+    for (probe_read(i, name, out, sizeof out); !strstr(out, want); probe_read(i, name, out, sizeof out)) {
+        if (now_ms() - t0 > WAIT_MS)
+            die("server %d: %s: no \"%s\" in its %s: %s", i, what, want, name, out);
+        usleep(50000);
+    }
+}
+
+/* S2-1: users in the metadata group. `cluster init --superuser` puts root (uid 1) in the first entries; two `cluster
+ * user add` of different names through two servers at once get different uids, the same in every copy (the state
+ * machine assigns them; the CLI sends uid 0, so this checks the end to end path only: the uid rules have their mutant,
+ * uidfromproposer, in test_meta); a grant made through one server is listed by another; the users watch and
+ * cluster_user_propose (users_probe); a drop with a member stopped (SIGSTOP) is answered after --wait-ms naming that
+ * member as lagging, and the member applies the drop once it runs again. With no quorum a USER_DEL is never answered
+ * OK (mutant dropnotcommitted: OK at propose). The watch ring drops entries past its bytes. A restarted member whose
+ * Raft core is held reports users_caught_up only after it heard a leader's commit index and applied that far (mutants
+ * caughtupearly: true from the start; floornoapplied: true once the commit index is heard). */
+static void scen_users(void)
+{
+    scenario("users");
+    /* frequent snapshots: the member restarted below loads its copy (members, addresses, carol) from one, so it reaches
+     * the leader with its Raft core held; server 1 registers a users watch and drops probe-drop through
+     * cluster_user_propose; a watch ring of 256 KiB, which two big blobs pass */
+    envs[0] = envs[2] = "snap_every=2,ring_bytes=262144";
+    envs[1] = "snap_every=2,ring_bytes=262144,users_probe=1";
+    for (int i = 0; i < 3; i++)
+        start(i);
+    char pw[PATH_MAX + 80], args[PATH_MAX * 2 + 512], out[8192], out2[8192], p[3][META_ADDR_MAX];
+    snprintf(pw, sizeof pw, "%s/pw", base);
+    FILE *f = fopen(pw, "w");
+    if (!f || fputs("correct horse battery\n", f) < 0 || fclose(f) != 0)
+        die("cannot write %s", pw);
+    for (int i = 0; i < 3; i++)
+        peer_of(i, p[i], sizeof p[i]);
+    /* a password file that cannot be read is found before INIT: the cluster stays uninitialised (the init below works) */
+    snprintf(args, sizeof args, "cluster init %s --secret-file %s --superuser root --password-file %s/missing", p[0],
+             secret_path, base);
+    if (cli_run(args, NULL, out, sizeof out) == 0 || strstr(out, "initialised"))
+        die("cluster init with an unreadable password file: %s", out);
+    snprintf(args, sizeof args,
+             "cluster init %s --secret-file %s --node-timeout-ms 1500 --heartbeat-ms 200 --voter-replace-s 600 "
+             "--superuser root --password-file %s",
+             p[0], secret_path, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user root: uid 1, index "))
+        die("cluster init --superuser root: %s", out);
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+
+    /* two adds at once, through the leader and through a follower */
+    char a1[PATH_MAX * 2 + 512], a2[PATH_MAX * 2 + 512];
+    snprintf(a1, sizeof a1, "cluster user add %s alice --password-file %s --secret-file %s", p[0], pw, secret_path);
+    snprintf(a2, sizeof a2, "cluster user add %s bob --password-file %s --secret-file %s", p[1], pw, secret_path);
+    FILE *c1 = cli_start(a1), *c2 = cli_start(a2);
+    int r1 = cli_finish(c1, out, sizeof out), r2 = cli_finish(c2, out2, sizeof out2);
+    if (r1 != 0 || !strstr(out, "put user alice: uid "))
+        die("user add alice: %s", out);
+    if (r2 != 0 || !strstr(out2, "put user bob: uid "))
+        die("user add bob: %s", out2);
+    struct users_want all3 = {{"root", "alice", "bob"}, NULL};
+    uint32_t uid[3][3];
+    for (int i = 0; i < 3; i++) {
+        await_view(i, p_users, &all3, "root, alice and bob in its copy");
+        struct view v;
+        view(i, &v);
+        for (int k = 0; k < 3; k++)
+            uid[i][k] = meta_user(&v.m, all3.present[k])->uid;
+        view_free(&v);
+        if (uid[i][0] != 1 || uid[i][1] == uid[i][2] || uid[i][1] < 2 || uid[i][1] > 3 || uid[i][2] < 2 ||
+            uid[i][2] > 3)
+            die("server %d: uids root %" PRIu32 ", alice %" PRIu32 ", bob %" PRIu32 " (want 1 and 2, 3 apart)", i,
+                uid[i][0], uid[i][1], uid[i][2]);
+        if (i && memcmp(uid[i], uid[0], sizeof uid[0]))
+            die("server %d has other uids than server 0", i);
+    }
+    printf("  root uid 1, alice uid %" PRIu32 ", bob uid %" PRIu32 " in every copy\n", uid[0][1], uid[0][2]);
+
+    /* server 1's users watch has the three; probe-drop, added through server 0, is dropped by server 1's probe through
+     * cluster_user_propose (a follower: it sends to the leader), in every copy */
+    await_probe(1, "userswatch", "user alice uid ", "the users watch");
+    await_probe(1, "userswatch", "user bob uid ", "the users watch");
+    await_probe(1, "userswatch", "user root uid 1 ", "the users watch");
+    snprintf(args, sizeof args, "cluster user add %s probe-drop --password-file %s --secret-file %s", p[0], pw,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user probe-drop: uid "))
+        die("user add probe-drop: %s", out);
+    await_probe(1, "userpropose", "rc 0 index ", "cluster_user_propose's DEL");
+    for (int i = 0; i < 3; i++)
+        await_view(i, p_users, &(struct users_want){{"root", "alice", "bob"}, "probe-drop"}, "probe-drop dropped");
+    {
+        char w[8192];
+        uint64_t t1 = now_ms();
+        for (probe_read(1, "userswatch", w, sizeof w); strstr(w, "probe-drop"); probe_read(1, "userswatch", w, sizeof w))
+            if (now_ms() - t1 > WAIT_MS)
+                die("server 1's users watch still lists probe-drop: %s", w);
+            else
+                usleep(50000);
+    }
+    printf("  users watch and cluster_user_propose: probe-drop dropped from server 1\n");
+
+    /* a grant through a follower, listed by the third server from its copy */
+    snprintf(args, sizeof args, "cluster user grant %s alice prefix:plant. read --secret-file %s", p[1], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user alice: uid "))
+        die("user grant: %s", out);
+    snprintf(args, sizeof args, "cluster user list %s alice --secret-file %s", p[2], secret_path);
+    uint64_t t0 = now_ms();
+    while (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "\ngrant prefix:plant. read\n"))
+        if (now_ms() - t0 > WAIT_MS)
+            die("server 2 does not list alice's grant: %s", out);
+        else
+            usleep(100000);
+    snprintf(args, sizeof args, "cluster user list %s root --secret-file %s", p[2], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "\nsuperuser yes\npassword yes\n"))
+        die("root is no superuser with a password: %s", out);
+    /* a name longer than USERS allows is refused before anything is built (it overflowed a stack buffer) */
+    {
+        char lname[400];
+        memset(lname, 'a', sizeof lname - 1);
+        lname[sizeof lname - 1] = 0;
+        snprintf(args, sizeof args, "cluster user list %s %s --secret-file %s", p[2], lname, secret_path);
+        int lrc = cli_run(args, NULL, out, sizeof out);
+        if (lrc != 2 || !strstr(out, "not a valid user name"))
+            die("user list with a 399-byte name: rc %d: %s", lrc, out);
+    }
+    snprintf(args, sizeof args, "cluster user list %s --secret-file %s", p[1], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "user root uid 1 version ") ||
+        !strstr(out, "user alice uid ") || !strstr(out, "user bob uid "))
+        die("user list: %s", out);
+
+    /* a drop with server 2 stopped: answered after the wait, naming server 2 as lagging (server 1 is not) */
+    pause_server(2, 1);
+    snprintf(args, sizeof args, "cluster user drop %s alice --wait-ms 1500 --secret-file %s", p[0], secret_path);
+    t0 = now_ms();
+    int rc = cli_run(args, NULL, out, sizeof out);
+    uint64_t took = now_ms() - t0;
+    char lag2[64], lag1[64];
+    snprintf(lag2, sizeof lag2, "lagging: node %" PRIu32 " applied ", ids[2]);
+    snprintf(lag1, sizeof lag1, "lagging: node %" PRIu32 " applied ", ids[1]);
+    if (rc != 0 || !strstr(out, "dropped user alice") || !strstr(out, lag2) || strstr(out, lag1) || took < 1400)
+        die("user drop with server 2 stopped (%" PRIu64 " ms): %s", took, out);
+    printf("  drop answered after %" PRIu64 " ms naming node %" PRIu32 " as lagging\n", took, ids[2]);
+    struct users_want gone = {{"root", "bob", NULL}, "alice"};
+    await_view(1, p_users, &gone, "alice dropped on server 1");
+    pause_server(2, 0);
+    await_view(2, p_users, &gone, "alice dropped on server 2 once it runs again");
+
+    /* no quorum: a USER_DEL is never answered OK */
+    pause_server(1, 1);
+    pause_server(2, 1);
+    {
+        uint8_t req[64], *reply = NULL;
+        size_t rl = 0, len = 0;
+        req[rl++] = 3;
+        req[rl++] = 0;
+        memcpy(req + rl, "bob", 3);
+        rl += 3;
+        memset(req + rl, 0, 12); /* version 0, wait_ms 0 */
+        rl += 12;
+        char err[1024];
+        int arc = 0;
+        int sent = cluster_admin(p[0], secret, secret_len, CLUSTER_OP_USER_DEL, req, rl, 3000, &arc, &reply, &len,
+                                 err, sizeof err);
+        free(reply);
+        if (sent == 0 && arc == 0)
+            die("USER_DEL answered OK with two of three voters stopped: before it committed");
+        printf("  no quorum: USER_DEL %s\n", sent ? err : cluster_strerror(arc));
+    }
+    pause_server(1, 0);
+    pause_server(2, 0);
+
+    /* the no-quorum check may have moved the leadership: the member stopped below is one that does not lead */
+    int l = -1;
+    for (uint64_t t2 = now_ms(); l < 0; usleep(100000)) {
+        for (int i = 0; i < 3 && l < 0; i++) {
+            struct view v;
+            view(i, &v);
+            if (p_leader_self(&v, NULL))
+                l = i;
+            view_free(&v);
+        }
+        if (l < 0 && now_ms() - t2 > WAIT_MS)
+            die("no leader after the no-quorum check");
+    }
+    int x = l == 2 ? 1 : 2;
+    /* the watch ring is bounded by bytes, not only by entries: every put carries the whole blob (up to 1 MiB) */
+    for (int k = 0; k < 2; k++) {
+        size_t bl = 200 << 10, rl = 0, len = 0;
+        uint8_t *req = calloc(1, 64 + bl), *reply = NULL;
+        if (!req)
+            die("out of memory");
+        req[rl++] = 7;
+        req[rl++] = 0;
+        memcpy(req + rl, k ? "bigblob" : "bigblub", 7);
+        rl += 7;
+        rl += 12; /* version 0 (a new user), wait_ms 0 */
+        memcpy(req + rl, &(uint32_t){(uint32_t)bl}, 4); /* little-endian, as the wire */
+        rl += 4 + bl;
+        char err[1024];
+        int arc = 0;
+        if (cluster_admin(p[l], secret, secret_len, CLUSTER_OP_USER_PUT, req, rl, 10000, &arc, &reply, &len, err,
+                          sizeof err) != 0 || arc != 0)
+            die("USER_PUT of a 200 KiB blob: %s", arc ? cluster_strerror(arc) : err);
+        free(reply);
+        memcpy(req + 2, k ? "bigblob" : "bigblub", 7);
+        if (cluster_admin(p[l], secret, secret_len, CLUSTER_OP_USER_DEL, req, 2 + 7 + 12, 10000, &arc, &reply, &len,
+                          err, sizeof err) != 0 || arc != 0)
+            die("USER_DEL of a 200 KiB blob's user: %s", arc ? cluster_strerror(arc) : err);
+        free(reply);
+        free(req);
+    }
+    /* the server checks a name itself (the CLI does too, so only a raw request reaches this): a control byte is refused */
+    {
+        uint8_t req[64], *reply = NULL;
+        size_t rl = 0, len = 0;
+        req[rl++] = 8;
+        req[rl++] = 0;
+        memcpy(req + rl, "bad\tname", 8);
+        rl += 8;
+        memset(req + rl, 0, 12); /* version 0 (a new user), wait_ms 0 */
+        rl += 12;
+        memcpy(req + rl, &(uint32_t){4}, 4);
+        rl += 4;
+        memset(req + rl, 0, 4); /* the uid placeholder */
+        rl += 4;
+        char err[1024];
+        int arc = 0;
+        int sent = cluster_admin(p[l], secret, secret_len, CLUSTER_OP_USER_PUT, req, rl, 10000, &arc, &reply, &len, err,
+                                 sizeof err);
+        free(reply);
+        if (sent != 0 || arc != META_ERR_INVALID)
+            die("USER_PUT of the name \"bad\\tname\": %s, not INVALID", sent ? err : cluster_strerror(arc));
+        printf("  a name with a control byte is refused by the server\n");
+    }
+    t0 = now_ms();
+    while (!log_has(l, "the watch ring holds") && now_ms() - t0 < WAIT_MS)
+        usleep(50000);
+    if (!log_has(l, "the watch ring holds"))
+        die("server %d kept 400 KiB of blobs in a watch ring of 256 KiB", l);
+    printf("  the watch ring drops its oldest entries past its bytes\n");
+    /* a restarted member is not caught up until it heard a leader's commit index and applied it: carol is dropped while
+     * member x is down; it restarts with its Raft core held (hold_raft_file): its copy comes from its last snapshot
+     * (which names the members, so its heartbeats reach the leader), it hears the leader's commit index in the acks but
+     * applies nothing, and must not say it is caught up while its copy still has carol */
+    snprintf(args, sizeof args, "cluster user add %s carol --password-file %s --secret-file %s", p[l], pw, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user carol: uid "))
+        die("user add carol: %s", out);
+    struct users_want carol = {{"root", "carol", NULL}, "alice"};
+    await_view(x, p_users, &carol, "carol on the member to stop");
+    stop(x, SIGTERM);
+    snprintf(args, sizeof args, "cluster user drop %s carol --wait-ms 100 --secret-file %s", p[l], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "dropped user carol"))
+        die("user drop carol with server %d down: %s", x, out);
+    char holdraft[PATH_MAX + 96];
+    server_dir(x, holdraft, sizeof holdraft);
+    strcat(holdraft, "/state/holdraft");
+    FILE *hr = fopen(holdraft, "w");
+    if (!hr || fclose(hr) != 0)
+        die("cannot make %s", holdraft);
+    envs[x] = "snap_every=2,hold_raft_file=1";
+    start(x);
+    /* the leader runs and is heard (its acks carry its commit index); the copy, which applies nothing, still has carol
+     * (mutants caughtupearly and floornoapplied) */
+    t0 = now_ms();
+    while (now_ms() - t0 < 2500) {
+        struct view v;
+        view(x, &v);
+        int cu = v.st.users_caught_up, has = meta_user(&v.m, "carol") != NULL;
+        view_free(&v);
+        if (!has)
+            die("server %d applied carol's drop with its Raft core held", x);
+        if (cu)
+            die("server %d says its users are caught up while its copy still has carol, dropped while it was down", x);
+        usleep(100000);
+    }
+    if (unlink(holdraft) != 0)
+        die("cannot remove %s", holdraft);
+    await_view(x, p_users_caught_up, NULL, "users caught up after a leader was heard");
+    struct users_want root_only = {{"root", NULL, NULL}, "carol"};
+    await_view(x, p_users, &root_only, "the restarted copy without carol");
+    printf("  restarted member caught up only after hearing the leader\n");
+}
+
 /* 3 servers, a volume of 3 replicas: every server makes v1 with the right META and REPL and opens it once the
  * metadata group recorded its open generation; the leader (TSDB_CLUSTER_WRITES=1) takes writes, the replicas
  * refuse them (UNAVAILABLE, FENCED, naming the volume); a restart keeps the rid and raises the generation, which is
@@ -5859,7 +6202,7 @@ int main(int argc, char **argv)
                {"torn", scen_torn},         {"rebase", scen_rebase},
                {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"stall", scen_stall},
-               {"witness", scen_witness},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
+               {"witness", scen_witness},   {"users", scen_users},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
