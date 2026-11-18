@@ -71,6 +71,16 @@ a cluster made with 0.10.0 is initialised again, not upgraded (as for every chan
 - The cluster tutorial's step 6 adds a volume and writes to it through its leader. Tests: `tests/test_cvol.c` (cluster
   volumes in a handle: holes, routing, the engine swap under readers), `test_cluster` `volumes` and `volrefuse`, with
   the mutants `TSDB_CVOL_MUTANT=noopengen|samerid|anynonce|replnonce`.
+- Users in the metadata group (S2-1; tsdbd does not log in from them yet): `tsdb cluster user add|passwd|drop|grant|
+  revoke|list` and `tsdb cluster init --superuser NAME --password-file F`. The group assigns each user a uid (never
+  reused) and a version that every put is conditional on; a user's record is at most 1 MiB and all users together at
+  most 8 MiB. A change is answered once applied on the leader and, after `--wait-ms`, names the members that have not
+  applied it yet. The metadata snapshot is now version 4, and the reply of `CLUSTER_OP_STATUS` has a byte
+  (`users_caught_up`) before the image: a `tsdb cluster status` of an earlier build fails to decode a newer server's
+  reply (initialise the preview cluster again, as for every change of it). jepsen-cluster's workloads propose no user
+  operation yet; the metadata simulator (`make meta-soak`) covers them. Tests: `test_meta` (users, limits, the
+  snapshot's user rules), `test_cluster users`; mutants `userstaleok`, `uidfromproposer`, `nousersbudget`
+  (`make meta-mutants`), `dropnotcommitted`, `caughtupearly`, `floornoapplied` (`make lease-mutants`).
 
 **Statistics over the network, protocol 15 (floor stays 12).** Everything of `docs/design-stats.md` that was embedded-only
 is now a request to `tsdbd`: the storage numbers of series, and the numbers, hot series and request costs of tenants.

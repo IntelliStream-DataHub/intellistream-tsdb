@@ -209,7 +209,10 @@ struct cluster_user_rec {
     const uint8_t *blob; /* META_USER_UID_LEN bytes of uid (little-endian), then the user's compacted USERS records */
     uint32_t len;
 };
-/* Called on the cluster thread with every user of the metadata copy, ascending by name, and the applied index the
+/* The group stores any blob a holder of the cluster secret puts under a name (meta.c checks only the uid): a consumer
+ * decodes it (user_blob_decode), refuses one that does not decode, and checks that the user it holds has the record's
+ * name, before it lets anyone log in with it.
+ * Called on the cluster thread with every user of the metadata copy, ascending by name, and the applied index the
  * list is at, after the copy changed its users (an entry or a snapshot) and once when a callback is set while the copy
  * has any. The records point into the copy and are valid during the call only: it must copy what it keeps and not
  * block. NULL stops the calls. Any thread. */
@@ -217,8 +220,8 @@ typedef void (*cluster_users_fn)(void *arg, const struct cluster_user_rec *u, ui
 void cluster_set_users_watch(cluster_users_fn fn, void *arg);
 
 /* The catch-up barrier (D-S2): 0 from cluster_start until this server has heard a Raft leader's commit index in this
- * run (an HB_ACK from the leader it names; the leader itself: its commit index once an entry of its own term is
- * committed) and its copy has applied up to it; 1 from then on, also while it is cut off later (a member cut off
+ * run (an HB_ACK from the leader it names that grants the lease, so that leader holds the check-quorum lease; the leader
+ * itself: its commit index once an entry of its own term is committed) and its copy has applied up to it; 1 from then on, also while it is cut off later (a member cut off
  * keeps the users it has until it hears the group, ha-modes :916). Logins wait for it, so a restarted server never
  * accepts a user whose drop committed while it was down. Any thread. */
 int cluster_users_caught_up(void);
@@ -269,6 +272,7 @@ struct cluster_status {
     uint32_t leader;
     uint32_t nheard;
     struct cluster_heard *heard;
+    uint8_t users_caught_up; /* cluster_users_caught_up() on that server */
     const uint8_t *image;
     size_t image_len;
 };

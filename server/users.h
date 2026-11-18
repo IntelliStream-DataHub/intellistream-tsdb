@@ -130,6 +130,15 @@ uint32_t users_superusers(const users *us);
 
 /* ------------------------------------------------------- the grant model */
 
+/* A user as the cluster's metadata group stores it (S2-1; server/meta.h META_USER_*): 4 bytes of uid (little-endian,
+ * written by the state machine), 4 zero bytes, then the user's compacted records (USER, VERIFIER, GRANT) as they
+ * would follow a USERS header, each with uid 1. encode: 0 or NOMEM, *blob malloc'ed. decode: 0 with *out a private
+ * user (user_release) whose uid is the blob's, CORRUPT for anything else than one whole user, or NOMEM. */
+int user_blob_encode(const user *u, uint8_t **blob, size_t *len);
+int user_blob_decode(const uint8_t *blob, size_t len, user **out);
+/* users_grant / users_revoke on a private user, without the rights checks (the operator at the cluster CLI) */
+int user_change_grant(user *u, uint8_t kind, const char *sel, size_t len, uint8_t rights, bool grant);
+
 bool user_name_valid(const char *name, size_t len);
 bool verifier_valid(const user_verifier *v);
 /* Normalizes a selector (A24): out gets the kind and the bytes (NUL-terminated, at most len + 1 bytes). 0 or

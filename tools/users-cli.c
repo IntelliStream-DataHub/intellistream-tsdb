@@ -139,6 +139,13 @@ static int get_password(const char *file, const char *name, password pw)
 }
 
 /* The verifier of a password with a fresh random salt (A18: the server never sees the password). */
+static int make_verifier(const char *file, const char *name, uint32_t iterations, user_verifier *v);
+int cli_user_verifier(const char *file, const char *name, uint32_t iterations, user_verifier *v); /* cluster-user-cli.c */
+int cli_user_verifier(const char *file, const char *name, uint32_t iterations, user_verifier *v)
+{
+    return make_verifier(file, name, iterations, v);
+}
+
 static int make_verifier(const char *file, const char *name, uint32_t iterations, user_verifier *v)
 {
     password pw;
