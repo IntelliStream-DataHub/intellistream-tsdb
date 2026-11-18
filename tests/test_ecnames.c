@@ -312,6 +312,7 @@ static void open_refusal(void)
     char dir[600], stores[600];
     fresh(dir, sizeof dir, "refuse");
     fresh(stores, sizeof stores, "stores");
+    CHECK(mkdir(stores, 0755) == 0); /* a new tier makes each store directory, one level of it (chunk_store_init) */
     char spec[2048];
     snprintf(spec, sizeof spec, "k=2,m=1,dirs=%s/a:%s/b:%s/c", stores, stores, stores);
     setenv("TSDB_TEST_TIER", spec, 1);
@@ -366,10 +367,13 @@ static void tier_refs_case(void)
 #ifndef TSDB_EC
     printf("test_ecnames: tier references skipped: no TSDB_EC in this build\n");
 #else
-    char dir[600], dir2[600];
+    char dir[600], dir2[600], stores[600], spec[1400];
     fresh(dir, sizeof dir, "refs");
     fresh(dir2, sizeof dir2, "refs2");
-    setenv("TSDB_TEST_TIER", "k=1,m=1,dirs=/nonexistent/a:/nonexistent/b", 1);
+    fresh(stores, sizeof stores, "refstores");
+    CHECK(mkdir(stores, 0755) == 0); /* tier_open opens the backend: the stores must be makeable */
+    snprintf(spec, sizeof spec, "k=1,m=1,dirs=%s/a:%s/b", stores, stores);
+    setenv("TSDB_TEST_TIER", spec, 1);
     setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
     tier *t = NULL;
     CHECK(tier_open(dir, NULL, &t) == 0 && t);
@@ -395,18 +399,18 @@ static void tier_refs_case(void)
     eng_close(a);
     CHECK(tier_refs(t) == 1);
     CHECK(CALLS_SINCE(EC_CALL_ENG_CLOSE, c0) == 4);
-    /* a read-only open with a tier attaches, but never sweeps */
+    /* a read-only open of a tier volume is refused (requires=tier: only the writer, which holds the stores, reads .ec
+     * parts) and gives the wish back unused */
     tsdb_options ro;
     tsdb_options_init(&ro);
     ro.read_only = 1;
     ro.create_volumes = 0;
     calls_now(c0);
     tier_want(t, 3);
-    CHECK(eng_open(dir, &ro, &a) == 0);
+    a = NULL;
+    CHECK(eng_open(dir, &ro, &a) == TSDB_ERR_INVALID && !a);
     tier_want(NULL, 0);
-    CHECK(a && a->tier == t && CALLS_SINCE(EC_CALL_ENG_OPEN, c0) == 4 && CALLS_SINCE(EC_CALL_GC_SWEEP, c0) == 0);
-    if (a)
-        eng_close(a);
+    CHECK(CALLS_SINCE(EC_CALL_ENG_OPEN, c0) == 0 && CALLS_SINCE(EC_CALL_GC_SWEEP, c0) == 0);
     CHECK(tier_refs(t) == 1);
     tier_want(t, 1); /* an open that fails gives its reference back */
     eng *c = NULL;
@@ -427,6 +431,7 @@ static void tier_refs_case(void)
     CHECK(CALLS_SINCE(EC_CALL_TIER_CLOSE, c0) == 3);
     rm_rf(dir);
     rm_rf(dir2);
+    rm_rf(stores);
 #endif
 }
 
