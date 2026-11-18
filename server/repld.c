@@ -277,7 +277,7 @@ static struct {
     int spill_said;
     size_t inbox_bytes; /* INBOX_BYTES (TSDB_REPLD_TEST=smallinbox: 256 KiB) */
     int stall_inbox;    /* TSDB_REPLD_TEST=stallinbox: no peer frame is handled while <dir>/stallinbox exists (a
-                           stalled disk's stand-in) */
+                           stalled disk's stand-in), until repld_stop (test_cluster stallstop) */
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
     int late_wal; /* TSDB_REPLD_TEST=latewal (tests only): repld_stop leaves its writers in place and waits 2.5 s after
@@ -1181,10 +1181,14 @@ static void inbox_took(struct rvol *rv, const struct item *it)
         char f[sizeof G.dir + 16], fv[sizeof G.dir + 32];
         snprintf(f, sizeof f, "%s/stallinbox", G.dir);
         snprintf(fv, sizeof fv, "%s/stallinbox.%" PRIu32, G.dir, rv->number);
-        pthread_mutex_unlock(&rv->mu);
-        for (struct timespec w = {0, 10000000}; access(f, F_OK) == 0 || access(fv, F_OK) == 0;)
+        /* the stall ends at repld_stop too: a test that died with the file in place left a replica that logged
+         * "shutting down" and then waited in repld_stop's join for ever, holding its io_uring ring under init, so
+         * that every later io_uring run on the machine failed to start (2026-11-18) */
+        for (struct timespec w = {0, 10000000}; !rv->stop && (access(f, F_OK) == 0 || access(fv, F_OK) == 0);) {
+            pthread_mutex_unlock(&rv->mu);
             nanosleep(&w, NULL);
-        pthread_mutex_lock(&rv->mu);
+            pthread_mutex_lock(&rv->mu);
+        }
     }
 }
 

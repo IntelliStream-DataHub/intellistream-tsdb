@@ -3881,6 +3881,77 @@ static void scen_backpressure(void)
            " received into a file; every replica holds the leader's rows\n", rounds);
 }
 
+/* stallstop (2026-11-18): a replica whose volume thread is stalled (TSDB_REPLD_TEST=stallinbox, <dir>/stallinbox in
+ * place) stops cleanly on SIGTERM within seconds. The stall used to end only when the file went, so a test that died
+ * with the file in place left its replica in repld_stop's join for ever, under init and holding an io_uring ring:
+ * every later io_uring jepsen-cluster run on the machine failed with "io_uring: Cannot allocate memory". */
+static void scen_stallstop(void)
+{
+    scenario("stallstop");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    int R = (L + 1) % 3;
+    stop(R, SIGTERM);
+    penv[R] = "TSDB_REPLD_TEST=smallinbox,stallinbox";
+    start(R);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    tsdbc_close(c);
+    await_isr(L, "plant", 3, 15000, "every replica up");
+    char stall[PATH_MAX + 80];
+    server_dir(R, stall, sizeof stall);
+    strcat(stall, "/stallinbox");
+    FILE *sf = fopen(stall, "w");
+    if (!sf)
+        die("create %s", stall);
+    fclose(sf);
+    /* writes until R's inbox is past its bound: its volume thread is then asleep in the stall */
+    uint64_t t0 = now_ms();
+    for (int round = 0; !log_has(R, "frames are dropped"); round++) {
+        if (now_ms() - t0 > 20000) {
+            unlink(stall);
+            die("the stalled replica's inbox never filled in 20 s (the case proved nothing)");
+        }
+        struct rep_writer w = {cports[L], id, 1000000LL * round + 1, 0, 0, 0, 1000};
+        rep_write_thread(&w);
+        if (w.rc != 0) {
+            unlink(stall);
+            die("a write with a stalled replica: %s", ers(w.rc));
+        }
+    }
+    signal_child(pids[R], SIGTERM);
+    int st = await_exit(R, 10000);
+    unlink(stall);
+    if (st != 0) {
+        if (st < 0) {
+            signal_child(pids[R], SIGKILL);
+            waitpid(pids[R], NULL, 0);
+            pids[R] = 0;
+        }
+        die("a replica stalled in its inbox %s on SIGTERM", st < 0 ? "did not stop in 10 s" : "did not stop cleanly");
+    }
+    penv[R] = NULL;
+    stop_all();
+    printf("  a replica stalled in its inbox stops cleanly on SIGTERM\n");
+}
+
 /* rejoin (the merge's jepsen-cluster kill run, 2026-11-17): a replica killed and restarted below what the leader sent
  * it, while the writes never pause, joins the ISR again while they go on. The leader's fast path kept the peer's cursor at the live end, moving
  * sent_ms with every record, so the restarted replica refused every APPEND for the gap and the driver never moved the
@@ -5792,7 +5863,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
