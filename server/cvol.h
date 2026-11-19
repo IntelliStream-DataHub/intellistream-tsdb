@@ -27,6 +27,9 @@ int cvol_led(uint32_t v);
  * the metadata copy names a leader with a client address, which `node`, `epoch` and `addr` (NUL terminated) get. tsdbd
  * answers such a write MOVED (design-cluster.md 6.3): definitely not applied, the client goes to that address. */
 int cvol_moved(uint32_t v, uint32_t *node, uint64_t *epoch, char *addr, size_t cap);
+/* 1: volume v's record names another server as leader and no ISR member is up in the group's view (design-cluster.md
+ * 6.2): UNAVAILABLE(NO_OWNER) until a member returns or an operator forces a leader, not MOVED to a dead server */
+int cvol_no_owner(uint32_t v);
 /* 1 once cvol_start ran: an engine's READONLY on a cluster volume becomes UNAVAILABLE (FENCED). */
 int cvol_active(void);
 /* 1 once the manager went through the volume records of a metadata copy: before that a volume name it does not know

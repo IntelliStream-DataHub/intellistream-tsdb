@@ -3133,6 +3133,15 @@ size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *o
     return 2 + n + 4;
 }
 
+size_t cluster_volume_force_encode(uint32_t volume, uint32_t node, uint8_t *out)
+{
+    for (int j = 0; j < 4; j++) {
+        out[j] = (uint8_t)(volume >> (8 * j));
+        out[4 + j] = (uint8_t)(node >> (8 * j));
+    }
+    return 8;
+}
+
 /* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
 static int text_ok_cl(const char *s)
 {
@@ -3477,6 +3486,80 @@ static void on_probe_reply(struct conn *c, struct rd *r)
     C.pend_join = 0;
 }
 
+/* `tsdb cluster volume force-leader` (design-cluster.md 6.2): with every ISR member down, the group cannot promote
+ * (NO_OWNER). The operator names a replica that is up; it joins the ISR (an ISR_CHANGE with the record's leader still
+ * in it), so the promotion that is waiting fences it and, as the only one to answer, picks it. Unclean: writes the old
+ * ISR acknowledged past the replica's log end are lost, and its own extra records are cut from the others when they
+ * return. The promotion's log line compares the replica's durable end with the last shrink's commit point. */
+/* forced replicas, so that the promotion's log line can compare (cluster thread) */
+static struct { uint32_t vol, node; uint64_t epoch; } g_forced[16]; /* force-leader: logged at the promotion */
+static unsigned g_nforced;
+
+static void admin_volume_force(struct conn *c, uint32_t reqid, struct rd *r)
+{
+    uint32_t number = get32(r), node = get32(r);
+    char text[512];
+    if (r->bad) {
+        admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
+        return;
+    }
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised) {
+        const char *lp = leader_peer();
+        admin_reply(c->serial, reqid, C.sm.initialised || C.have_node ? CLUSTER_ERR_NOTLEADER : CLUSTER_ERR_STATE,
+                    lp, strlen(lp));
+        return;
+    }
+    const struct meta_volume *v = meta_volume(&C.sm, number);
+    if (!v) {
+        admin_reply(c->serial, reqid, META_ERR_NOTFOUND, NULL, 0);
+        return;
+    }
+    int x = -1;
+    for (uint32_t i = 0; i < v->nrep; i++)
+        if (v->rep[i].node == node)
+            x = (int)i;
+    const struct meta_member *nm = meta_member(&C.sm, node);
+    if (v->kind != META_VOL_REPLICATED || x < 0 || !nm || nm->state != META_UP || meta_volume_in_isr(v, node)) {
+        int n = snprintf(text, sizeof text, "node %" PRIu32 " is not an up replica of volume %" PRIu32
+                         " outside its ISR", node, number);
+        admin_reply(c->serial, reqid, META_ERR_INVALID, text, (size_t)n);
+        return;
+    }
+    for (uint32_t i = 0; i < v->nisr; i++) {
+        const struct meta_member *m = meta_member(&C.sm, v->isr[i]);
+        if (m && m->state == META_UP) {
+            int n = snprintf(text, sizeof text, "ISR member %" PRIu32 " of volume %" PRIu32 " is up: the promotion "
+                             "does not need an operator", v->isr[i], number);
+            admin_reply(c->serial, reqid, CLUSTER_ERR_STATE, text, (size_t)n);
+            return;
+        }
+    }
+    uint32_t ids[META_REPLICAS_MAX];
+    uint64_t rids[META_REPLICAS_MAX];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < v->nrep; i++)
+        if (meta_volume_in_isr(v, v->rep[i].node) || (int)i == x) {
+            ids[n] = v->rep[i].node;
+            rids[n++] = v->rep[i].rid;
+        }
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_isr_change(&e, number, v->epoch, v->isr_version, ids, rids, n, 0);
+    if (propose(&e, 0, 0, 0) != ISO_OK) {
+        admin_reply(c->serial, reqid, CLUSTER_ERR_RETRY, NULL, 0);
+        return;
+    }
+    if (g_nforced == sizeof g_forced / sizeof g_forced[0])
+        g_nforced = 0;
+    g_forced[g_nforced++] = (__typeof__(g_forced[0])){number, node, v->epoch};
+    int tl = snprintf(text, sizeof text, "volume %" PRIu32 ": node %" PRIu32 " joins the ISR of epoch %" PRIu64
+                      " and is promoted (unclean). The last shrink's commit point is %" PRIu64 "; writes "
+                      "acknowledged past node %" PRIu32 "'s log end are lost (the promotion's log line compares the two)",
+                      number, node, v->epoch, v->isr_commit, node);
+    say("%s", text);
+    admin_reply(c->serial, reqid, 0, text, (size_t)tl);
+}
+
 static void on_admin(struct conn *c, struct rd *r)
 {
     uint8_t op = get8(r);
@@ -3489,6 +3572,7 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_INIT: admin_init(c, reqid, r); break;
     case CLUSTER_OP_NODE_ADD: admin_node_add(c, reqid, r); break;
     case CLUSTER_OP_VOLUME_ADD: admin_volume_add(c, reqid, r); break;
+    case CLUSTER_OP_VOLUME_FORCE: admin_volume_force(c, reqid, r); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -4255,6 +4339,12 @@ static void vol_watch_duty(void)
             r->nisr = v->nisr;
             memcpy(r->isr, v->isr, sizeof r->isr);
             r->isr_version = v->isr_version;
+            r->no_owner = 1;
+            for (uint32_t j = 0; j < v->nisr; j++) {
+                const struct meta_member *im = meta_member(&C.sm, v->isr[j]);
+                if (im && im->state == META_UP)
+                    r->no_owner = 0;
+            }
             r->min_isr = v->min_isr;
             r->isr_lag_ms = C.sm.set.isr_lag_ms;
             r->unanswered_ms = C.sm.set.unanswered_ms;
@@ -4729,6 +4819,12 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
         say("proposes volume %" PRIu32 " leader %" PRIu32 " at epoch %" PRIu64 " (%" PRIu32 " of %" PRIu32
             " fenced members answered, %" PRIu64 " ms)", p->vol, g.leader, g.new_epoch, g.nreplies, g.nfenced,
             (uint64_t)(since(now, p->t0) / MS));
+    for (unsigned i = 0; i < g_nforced; i++)
+        if (g_forced[i].vol == p->vol && g_forced[i].node == g.leader && g_forced[i].epoch == p->epoch)
+            say("volume %" PRIu32 ": forced leader %" PRIu32 " ends at %" PRIu64 ", the last shrink's commit point is "
+                "%" PRIu64 ": %s", p->vol, g.leader, best, v->isr_commit,
+                best >= v->isr_commit ? "it holds every write acknowledged before that shrink"
+                                      : "writes acknowledged before that shrink are lost");
     return 1;
 }
 

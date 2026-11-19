@@ -32,6 +32,7 @@ static const char cl_help[] =
     "       tsdb cluster init PEER --secret-file F [options]\n"
     "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
     "       tsdb cluster volume add PEER NAME [--replicas N] --secret-file F\n"
+    "       tsdb cluster volume force-leader PEER VOLUME NODE --secret-file F\n"
     "       tsdb cluster status PEER --secret-file F\n"
     "       tsdb cluster help\n"
     "\n"
@@ -52,6 +53,10 @@ static const char cl_help[] =
     "                      volume's directory (v<number> in its --dir) and opens it. Clients create and find\n"
     "                      series inside the volume they name (in this preview only its first server takes writes,\n"
     "                      and only with TSDB_CLUSTER_WRITES=1: replication is not built yet).\n"
+    "  volume force-leader PEER VOLUME NODE  when no ISR member of volume number VOLUME is up (clients get\n"
+    "                      UNAVAILABLE NO_OWNER), makes the replica on node NODE its leader. Unclean: writes\n"
+    "                      acknowledged past that replica's log end are lost; the leader of the group logs its log\n"
+    "                      end beside the commit point of the last ISR shrink.\n"
     "  status PEER         what that server knows: its role, the leader, the settings, every member (up or down,\n"
     "                      incarnation, when it was last heard), the volumes and users. One fact a line.\n"
     "\n"
@@ -227,6 +232,7 @@ int cluster_cli(int argc, char **argv)
         return 0;
     }
     const char *verb = argv[1], *addr = NULL, *newpeer = NULL, *secret_file = NULL;
+    uint32_t force_vol = 0, force_node = 0; /* volume force-leader */
     int i = 2;
     if (!strcmp(verb, "node")) {
         if (argc < 5 || strcmp(argv[2], "add") != 0)
@@ -234,6 +240,15 @@ int cluster_cli(int argc, char **argv)
         addr = argv[3];
         newpeer = argv[4];
         i = 5;
+    } else if (!strcmp(verb, "volume") && argc >= 6 && !strcmp(argv[2], "force-leader")) {
+        addr = argv[3];
+        char *end1, *end2;
+        unsigned long fv = strtoul(argv[4], &end1, 10), fn = strtoul(argv[5], &end2, 10);
+        if (*end1 || *end2 || !fv || !fn || fv > UINT32_MAX || fn > UINT32_MAX)
+            return cl_usage();
+        force_vol = (uint32_t)fv;
+        force_node = (uint32_t)fn;
+        i = 6;
     } else if (!strcmp(verb, "volume")) {
         if (argc < 5 || strcmp(argv[2], "add") != 0)
             return cl_usage();
@@ -349,6 +364,9 @@ int cluster_cli(int argc, char **argv)
         req[1] = (uint8_t)(n >> 8);
         memcpy(req + 2, newpeer, n);
         rl = 2 + n;
+    } else if (force_vol) {
+        op = CLUSTER_OP_VOLUME_FORCE;
+        rl = cluster_volume_force_encode(force_vol, force_node, req);
     } else if (!strcmp(verb, "volume")) {
         op = CLUSTER_OP_VOLUME_ADD;
         size_t n = strlen(newpeer);
@@ -377,6 +395,8 @@ int cluster_cli(int argc, char **argv)
             continue;
         }
         if (rc != 0) {
+            if (op == CLUSTER_OP_VOLUME_FORCE && len)
+                fprintf(stderr, "tsdb cluster volume force-leader: %.*s\n", (int)len, (const char *)reply);
             fprintf(stderr, "tsdb cluster %s: %s\n", verb, cluster_strerror(rc));
             free(reply);
             return 1;
@@ -395,6 +415,8 @@ int cluster_cli(int argc, char **argv)
             for (size_t k = 0; k < 4 && k < len; k++)
                 number |= (uint32_t)reply[k] << (8 * k);
             printf("added volume %s: number %" PRIu32 "\n", newpeer, number);
+        } else if (op == CLUSTER_OP_VOLUME_FORCE) {
+            printf("%.*s\n", (int)len, (const char *)reply);
         } else if (op == CLUSTER_OP_INIT) {
             printf("initialised: node 1 at %s\n", target);
         } else {

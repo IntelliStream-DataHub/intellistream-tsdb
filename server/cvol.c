@@ -322,6 +322,21 @@ int cvol_moved(uint32_t v, uint32_t *node, uint64_t *epoch, char *addr, size_t c
     return found;
 }
 
+int cvol_no_owner(uint32_t v)
+{
+    if (!M.active)
+        return 0;
+    int no = 0;
+    pthread_mutex_lock(&M.mu);
+    for (uint32_t i = 0; i < M.nrecs; i++)
+        if (M.recs[i].number == v) {
+            no = M.recs[i].no_owner && M.recs[i].leader != M.self;
+            break;
+        }
+    pthread_mutex_unlock(&M.mu);
+    return no;
+}
+
 int cvol_active(void) { return M.active; }
 
 int cvol_synced(void)

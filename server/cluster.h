@@ -45,6 +45,10 @@ enum cluster_admin_op {
     CLUSTER_OP_STATUS = 3,   /* no body; on any server */
     CLUSTER_OP_VOLUME_ADD = 4, /* body: u16 name length, the name, u32 replicas (0: the cluster's replication); on the
                                 * Raft leader, which picks the number, uuid, servers and rids. Reply: u32 number */
+    CLUSTER_OP_VOLUME_FORCE = 5, /* body: u32 volume, u32 node; on the Raft leader. While no ISR member of the volume
+                                  * is up (NO_OWNER), puts the replica on `node` into its ISR, so that the next
+                                  * promotion fences it and picks it: an unclean election (design-cluster.md 6.2).
+                                  * Reply: text for the operator (the proposal is made; the promotion follows) */
 };
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
@@ -199,6 +203,7 @@ struct cluster_vol_rec {
     uint32_t isr[META_REPLICAS_MAX]; /* node ids */
     uint64_t isr_version;
     uint32_t min_isr, isr_lag_ms, unanswered_ms;
+    uint8_t no_owner; /* no ISR member is up in the group's view: UNAVAILABLE(NO_OWNER), not MOVED to a dead leader */
     uint32_t repl_retain_mb, repl_retain_s, idle_seal_ms; /* the settings (meta.h) */
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
@@ -266,6 +271,7 @@ void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *cons
 
 /* The VOLUME_ADD body (at most 2 + META_NAME_MAX + 4 bytes). */
 size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out);
+size_t cluster_volume_force_encode(uint32_t volume, uint32_t node, uint8_t *out); /* 8 bytes */
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);

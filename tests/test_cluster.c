@@ -3634,7 +3634,7 @@ static void scen_writersync(void)
     /* BATCHES at least, on until the overtaking was seen (synclate makes it happen in the first), and two batches past it */
     for (b = 0; b < MAX_BATCHES && (b < BATCHES || !seen || b <= seen_at + 2); b++) {
         for (int k = 0; k < CONNS; k++) {
-            w[k] = (struct rep_writer){cports[L], id, 100000000LL * (b * CONNS + k + 1), WRITES, 0, 0, 0};
+            w[k] = (struct rep_writer){cports[L], id, 100000000LL * (b * CONNS + k + 1), WRITES, 0, 0, 0, 0};
             if (pthread_create(&th[k], NULL, rep_write_thread, &w[k]) != 0)
                 die("pthread_create");
         }
@@ -6378,6 +6378,158 @@ static void scen_cut(void)
     rep_same(wantr, "after the cut");
 }
 
+/* No ISR member up (design-cluster.md 6.2): a replica outside the ISR is up, but the group cannot promote it. Clients
+ * get UNAVAILABLE(NO_OWNER) from it (not MOVED to the dead leader), the leader of the group says NO_OWNER, and
+ * `tsdb cluster volume force-leader` makes the replica the leader at e + 1: its rows stand, the rows the old ISR
+ * acknowledged after the cut are lost (unclean, said so), and the old members return and are cut to its history. Two
+ * witnesses keep the metadata group's majority with two of the three data servers dead. */
+static void scen_noowner(void)
+{
+    scenario("noowner");
+    for (int i = 0; i < 3; i++)
+        penv[i] = "TSDB_REPLD_TEST=cutlinks";
+    for (int i = 3; i < 5; i++) {
+        is_witness[i] = 1;
+        xargs[i] = "--peer-port 0"; /* a witness takes the peer port 7071 unless told */
+        char wdir[PATH_MAX + 80];
+        server_dir(i, wdir, sizeof wdir);
+        if (mkdir(wdir, 0755) != 0)
+            die("mkdir %s: %s", wdir, strerror(errno));
+    }
+    for (int i = 0; i < 5; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters, two of them witnesses");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "nw", 3, &num)) != 0 || num != 1)
+        die("volume add nw: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "nw", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "nw", &v))
+        die("no record of nw");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of nw is node %u", v.leader);
+    int Cs = (L + 1) % 3, B = (L + 2) % 3;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "nw", 30000);
+    enum { BEFORE = 20, AFTER = 10 };
+    await_isr(L, "nw", 3, 30000, "every replica in the ISR");
+    for (int j = 0; j < BEFORE; j++) {
+        int64_t ts = 1000000 + 1000LL * j;
+        float val = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", j, ers(rc));
+    }
+    for (uint64_t t1 = now_ms(); rows_in(Cs, id, 1000000, 1000000 + 1000LL * BEFORE, 30000) != BEFORE; usleep(50000))
+        if (now_ms() - t1 > 30000)
+            die("server %d does not hold the %d rows written with every replica in the ISR", Cs, BEFORE);
+    cut_file(L, Cs, 1);
+    cut_file(Cs, L, 1);
+    await_isr(L, "nw", 2, 30000, "the cut replica out of the ISR");
+    for (int j = BEFORE; j < BEFORE + AFTER; j++) {
+        int64_t ts = 1000000 + 1000LL * j;
+        float val = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d with ISR {leader, server %d}: %s", j, B, ers(rc));
+    }
+    tsdbc_close(c);
+    if (!vol_rec(Cs, "nw", &v))
+        die("no record of nw");
+    uint64_t e0 = v.epoch;
+    stop(L, SIGKILL);
+    stop(B, SIGKILL);
+    uint64_t t0 = now_ms();
+    c = client(Cs);
+    tsdbc_set_retry(c, 0);
+    for (;; usleep(50000)) {
+        int64_t ts = 8000000;
+        float val = 1;
+        rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+        tsdb_unavail e;
+        unsigned ne = 0;
+        if (rc == TSDB_ERR_UNAVAILABLE && tsdbc_unavailable(c, &e, 1, &ne) == 0 && ne == 1 &&
+            e.reason == TSDB_WHY_NO_OWNER)
+            break;
+        if (rc == 0)
+            die("server %d acknowledged a write with no ISR member up", Cs);
+        if (now_ms() - t0 > 30000)
+            die("no UNAVAILABLE(NO_OWNER) from server %d 30 s after its ISR died (last: %s)", Cs, ers(rc));
+    }
+    int said = 0;
+    for (uint64_t t1 = now_ms(); !said; usleep(50000)) {
+        for (int i = 0; i < 5; i++)
+            if (i != L && i != B)
+                said += log_count(i, "NO_OWNER: no ISR member answers");
+        if (!said && now_ms() - t1 > 30000)
+            die("the leader of the group never said NO_OWNER");
+    }
+    if (!vol_rec(Cs, "nw", &v) || v.epoch != e0 || v.leader != old)
+        die("the record of nw moved with no ISR member up (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+    uint8_t req[8], *reply = NULL;
+    size_t len = 0;
+    uint32_t cnode = ids[Cs];
+    size_t rl = cluster_volume_force_encode(num, cnode, req);
+    if ((rc = admin(Cs, CLUSTER_OP_VOLUME_FORCE, req, rl, 1, &reply, &len)) != 0)
+        die("force-leader %" PRIu32 " %" PRIu32 ": %s (%.*s)", num, cnode, cluster_strerror(rc), (int)len,
+            reply ? (const char *)reply : "");
+    printf("  force-leader: %.*s\n", (int)len, (const char *)reply);
+    free(reply);
+    int Nw = await_promoted(Cs, "nw", old, e0, &v);
+    if (Nw != Cs || v.epoch != e0 + 1)
+        die("after force-leader: leader server %d at epoch %" PRIu64 " (want %d at %" PRIu64 ")", Nw, v.epoch, Cs,
+            e0 + 1);
+    await_isr(Cs, "nw", 1, 30000, "the dead members out of the forced leader's ISR (unanswered)");
+    int logged = 0;
+    for (uint64_t t1 = now_ms(); !logged; usleep(50000)) {
+        for (int i = 0; i < 5; i++)
+            if (i != L && i != B)
+                logged += log_count(i, "it holds every write acknowledged before that shrink");
+        if (!logged && now_ms() - t1 > 10000)
+            die("no log line compares the forced leader's end with the last shrink's commit point");
+    }
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the forced leader: %s", ers(rc));
+    tsdbc_close(c);
+    int got = rows_in(Cs, id, 1000000, 1000000 + 1000LL * (BEFORE + AFTER), 30000);
+    if (got != BEFORE)
+        die("the forced leader holds %d rows of the first %d, want exactly the %d written before the cut", got,
+            BEFORE + AFTER, BEFORE);
+    printf("  no ISR member up: NO_OWNER %" PRIu64 " ms after the kill; force-leader made server %d leader at epoch "
+           "%" PRIu64 " with the %d rows from before the cut (the %d after it are lost, as said)\n",
+           now_ms() - t0, Cs, v.epoch, BEFORE, AFTER);
+    cut_file(L, Cs, 0);
+    cut_file(Cs, L, 0);
+    /* The old members applied rows past the forced leader's history (committed at epoch e0): they cannot cut below
+     * what they applied, so they stop the volume, loudly, rather than rejoin with rows the leader lacks. Rebuilding
+     * such a replica from the leader is not built (NOTES: open). */
+    start(L);
+    start(B);
+    await_log_count(L, "stopped: a cut below the applied end", 1, 60000);
+    await_log_count(B, "stopped: a cut below the applied end", 1, 60000);
+    if (!vol_rec(Cs, "nw", &v) || v.leader != ids[Cs] || v.nisr != 1)
+        die("after the old members returned: leader %u, ISR of %u (want %u alone)", v.leader, v.nisr, ids[Cs]);
+    c = client(Cs);
+    tsdbc_set_retry(c, 10000);
+    ts = 9001000;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the forced leader after the old members returned: %s", ers(rc));
+    tsdbc_close(c);
+    if ((got = rows_in(Cs, id, 0, INT64_MAX, 30000)) != BEFORE + 2)
+        die("the forced leader holds %d rows, want %d", got, BEFORE + 2);
+    printf("  the old members returned, found rows they applied past the forced leader's history and stopped\n");
+    stop_all();
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -6409,7 +6561,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"pause", scen_pause}, {"resign", scen_resign}, {"cut", scen_cut}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"pause", scen_pause}, {"resign", scen_resign}, {"cut", scen_cut}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
