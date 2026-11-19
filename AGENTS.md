@@ -636,7 +636,14 @@ cgroup, so `nice` does not keep your work out of its way.
   as end of file, skip a part or drop a WAL record quietly. The one exception:
   granule payloads are hashed only with `verify_checksums` (default off), so
   without it a damaged granule decodes to wrong values; decoders must therefore
-  be safe (no UB, no overread) on any bytes. With `fsync = 0` a power loss looks
+  be safe (no UB, no overread) on any bytes. Wrong timestamps are refused all the same, with or without the
+  checksum: `granule_decode` fails a granule (`TSDB_ERR_CORRUPT`) whose decoded timestamps do not strictly increase
+  within its entry's [ts_min, ts_max], because every reader takes that as given: `src_fill` clips a query's range by
+  the entry's ends, and the bucketers index their arrays by each row's bucket (`fold_into` wrote outside them;
+  `test_damage` `test_ts_damage`, `test_ts_verified`). The order is checked inside the timestamp decoders
+  (`block_decode_ts_sorted`: one overflow test per DoubleDelta run of unchanged deltas, a compare per other row while
+  it is in a register; `test_tsdb` `test_ts_sorted`, `fuzz_codec` against the plain decoders), the window at the two
+  ends; `GW_LOC` loads them. A new timestamp transform needs its `_sorted` form. With `fsync = 0` a power loss looks
   like damage and fails the open.
 - **Protocol.** Until 1.0 (0.9.0 is the first release, 2026-11-05) the wire protocol may change
   without keeping old clients working (decided on 2026-10-24; the changelog of the release that moves it names

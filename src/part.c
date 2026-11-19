@@ -347,7 +347,15 @@ int granule_decode(codec_ctx *c, const part *p, const granule *g, const uint8_t 
     }
     QS_ADD(rows_decoded, g->count);
     QS_ADD(bytes_read, len);
-    int rc = block_decode_ts(c, blk, g->ts_len, g->count, ts);
+    /* The rows must strictly increase within the entry's [ts_min, ts_max], as the writer's rows of one entry do:
+     * every reader relies on it (src_fill clips a query's range by the entry's ends and lower_bound, and the
+     * bucketers index their arrays by the bucket of each row; fold_into wrote outside them). Without the checksum
+     * (verify_checksums = 0) damaged bytes decode to any timestamps, and a 32-bit checksum is no proof of memory
+     * safety either, so it is checked always: the order inside the decoder, where it costs least (dd_dec), the
+     * window here, at the two ends. */
+    int rc = block_decode_ts_sorted(c, blk, g->ts_len, g->count, ts);
+    if (rc == 0 && (ts[0] < g->ts_min || ts[g->count - 1] > g->ts_max))
+        rc = TSDB_ERR_CORRUPT;
     if (rc == 0 && v)
         rc = block_decode_vals(c, type, blk + g->ts_len, g->val_len, g->count, v);
     return rc;
