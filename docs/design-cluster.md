@@ -808,6 +808,15 @@ carries the leader's commit point when it asked**, and `force-leader` (and `tsdb
 remaining replica, whether its log end reaches that point: a replica that does holds everything acknowledged before
 the shrink, and only writes acknowledged by the lone leader afterwards can be lost.
 
+*As built (r3e-failover).* `tsdb cluster volume force-leader PEER VOLUME NODE` asks the Raft leader, which accepts it
+only while no ISR member is up and NODE is an up replica outside the ISR. It adds NODE to the ISR (an `ISR_CHANGE`
+that keeps the record's leader, so no new metadata operation and no new invariant: the leader the promotion then
+picks was in the previous ISR); the promotion that waited fences NODE, NODE alone answers and leads at e + 1. The
+leader's log line compares NODE's log end with the last shrink's commit point and says whether writes acknowledged
+before the shrink are all kept or which ones are lost. Members of the old ISR that come back with records past the new
+history (applied at the old epoch, never in NODE's log) stop the volume with "a cut below the applied end" rather than
+diverge silently; rebuilding such a replica (a new instance copied from the leader) is not built yet.
+
 Time to writes again: 3 s detection + about 10 ms for fencing, a Raft commit and the first record + the clients'
 TOPOLOGY refresh. About 4 s in total for the volumes the server led. Other volumes see only the ISR shrink (§6.1,
 under 1 s of waiting).
