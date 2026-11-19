@@ -11,7 +11,8 @@ agree, with the Raft protocol, on a list of facts about the cluster:
 - which servers are **members**, where they are, and whether they are up or down;
 - which servers are **voters** (they decide) and which only **watch**;
 - the settings of the cluster (how many copies, how long a server may stay quiet);
-- the places where **volumes**, **owners**, **epochs**, **in-sync sets**, **users** and **grants** will be kept.
+- the **users** and their **grants** ([Logins](#logins));
+- the places where **volumes**, **owners**, **epochs** and **in-sync sets** will be kept.
 
 A **witness** is a member with no data. It only keeps the list and can vote. It is a cheap third or fifth vote.
 
@@ -310,13 +311,17 @@ build/tsdb cluster user list $(peer 3) --secret-file $D/secret
 ```
 
 A superuser can also manage users over the client protocol (the clients' user calls) on any server; the change is
-made in the cluster and answered once every server that is up has it.
+made in the cluster and answered once every server that is up has it (or after 5 seconds: a server that is slow to
+catch up gets it a little later). When the server cannot tell whether the change was made (the cluster's leader
+stopped at that moment), it closes the connection instead of answering: look with `tsdb cluster user list` before
+you send it again.
 
 Things to know:
 
 - **`tsdb DIR user ...` does not work on a cluster server's directory.** It says so and names `tsdb cluster user`.
 - **A server that was down refuses logins for a moment after it starts** (`UNAVAILABLE`): until it has heard the
-  cluster, it might still hold a user that was dropped while it was away. Clients try again by themselves.
+  cluster, it might still hold a user that was dropped while it was away. The clients do not wait for it: the
+  connect fails with that error, and your program tries again (or connects to another server).
 - **A server cut off from the others** keeps the users it had until it can reach them again.
 - **Servers that had their own users before** (a USERS file in their directory) do not start with `--cluster` until
   that file is gone. Bring their users in first, with the servers stopped:
@@ -328,7 +333,10 @@ Things to know:
   A user that is the same in every directory is copied as it is (the password too: nobody needs to know it). A user
   that differs between them, or is missing from one, stops the whole import, which lists each such user; add
   `--from-node /srv/old2/data` to say whose copy wins. Running the import again is safe. Then remove each
-  directory's USERS file.
+  directory's USERS file. When every server had its own users, none of them can start yet: move each USERS file
+  out of its directory first, start the servers, and import from the moved copies.
+- **A server taken out of the cluster** keeps a `CLUSTER_USERS` file in its directory, and `tsdb DIR user ...` goes
+  on refusing there until you remove that file by hand.
 
 ## How to read `status`
 
@@ -372,7 +380,8 @@ more (at most `--voters`). A member that does not vote watches.
   USERS file from before it was in a cluster. Bring the users over with `tsdb cluster user import` and remove the
   file ([Logins](#logins)).
 - **A login answers `UNAVAILABLE`**: that server has not heard the group since it started, so it does not know yet
-  whether a user was dropped meanwhile. It lets logins in once it has caught up; clients try again by themselves.
+  whether a user was dropped meanwhile. It lets logins in once it has caught up; connect again then, or to another
+  server (the clients do not retry a login by themselves).
 - **The block fails in the middle and servers keep running**: stop them by process id:
   `for n in 1 2 3 4; do kill $(cat /tmp/tsdb-cluster/n$n/pid); done`. Do not use `pkill` or `killall`: they stop every
   process with that name, also ones that are not yours.
@@ -459,10 +468,10 @@ others). They are not built: `tsdb cluster` prints what exists.
 
 The preview is the first step of a longer plan. The designs are written; the work is in this order:
 
-- **The metadata group, finished** (S2, S4): the servers' links to each other and routing of requests, users and
-  grants kept in the group, and names that are unique across the cluster. The group's state machine (S1) and what a
-  single server does while its storage is away (UNAVAILABLE, in N1) are already in 0.10.0; the proposer's rules for
-  ownership and the time rules come with N7.
+- **The metadata group, finished** (S2, S4): the servers' links to each other and routing of requests, and names
+  that are unique across the cluster. The group's state machine (S1) and what a single server does while its storage
+  is away (UNAVAILABLE, in N1) are already in 0.10.0, and users and grants kept in the group, with logins on every
+  server ([Logins](#logins)), are in this preview; the proposer's rules for ownership and the time rules come with N7.
 - **Shared mode** (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume,
   fenced by the group (the design of [ha.md](ha.md)); this is what production on NFSv4 needs first.
 - **Replicated mode** (R1 to R4): each volume on three servers with their own disks, with replication, the in-sync set,

@@ -35,13 +35,12 @@ minutes.</p>
 <p>The <strong>metadata group</strong> is a few servers that agree, with the Raft protocol, on a list of facts: which
 servers are <strong>members</strong>, whether they are up or down, which are <strong>voters</strong> (they decide) and
 which only <strong>watch</strong>, and the settings of the cluster. A <strong>witness</strong> is a member with no data:
-it keeps the list and can vote, a cheap third or fifth vote. The group also has places for volumes, owners, epochs,
-in-sync sets, users and grants, which later steps fill.</p>
+it keeps the list and can vote, a cheap third or fifth vote. It also keeps the cluster's users and their grants
+(<a href="#logins">Logins</a>), and has places for volumes, owners, epochs and in-sync sets, which later steps fill.</p>
 <div class="note"><p>It is a <strong>preview</strong>. It <strong>does not copy your data</strong>: a row written to one server stays
 on that server. It <strong>does not fail over</strong>: when a server dies, the group marks it down and nothing takes
-over its data. It does not move volumes, and you cannot add a volume or a user to the cluster yet. It changes nothing for
-clients: the client port, the protocol and every request work as without <code>--cluster</code>, and logins stay
-per server. Do not run it in production. The metadata format and the peer protocol may change in a later 0.x release;
+over its data. It does not move volumes. The client port and the protocol work as without <code>--cluster</code>; logins use the
+cluster's users, the same on every server. Do not run it in production. The metadata format and the peer protocol may change in a later 0.x release;
 you then start the cluster again with <code>tsdb cluster init</code>, you do not upgrade it.</p></div>
 <p>Why ship it? The group is the part everything else stands on, and the hardest to get right. It has its own
 simulator, a checker and fault tests, and now you can run it yourself. Without <code>--cluster</code> none of it runs.</p>
@@ -70,7 +69,7 @@ build/tsdb cluster secret $D/secret
 # 3. Helpers. A "node" is a server with its own data directory (n1/data) and its own state directory (n1/state).
 #    The state directory holds the cluster's own files and must be on a local disk, never on NFS.
 #    Node N listens for clients on port 1708N and for the other servers on port 1709N (the two lines marked ports).
-#    --no-auth: no login, because users are still per server in the preview. Fine on 127.0.0.1, nowhere else.
+#    --no-auth: no login, to keep the tutorial short ([Logins](#logins) below shows how). Fine on 127.0.0.1, nowhere else.
 #    TSDB_CLUSTER_WRITES=1: a preview switch that lets a volume's leader take writes (step 6), though nothing is
 #    copied yet. Without it every cluster volume refuses writes.
 #    A witness (node 4) has no data directory and no client port.
@@ -238,6 +237,25 @@ heartbeat for <code>node_timeout_ms</code> (3 s by default). The survivors first
 node <code>down</code> once it has itself led for <code>node_timeout_ms</code>, so the <code>down</code> comes a few
 seconds after the election. When the <code>down</code> line appears, a new leader exists.</p>
 
+<h2 id="logins">Logins</h2>
+<p>In a cluster the users and their grants belong to the whole cluster, not to one server: you add a user once, and it
+can log in on every server. A changed password or a revoked grant counts on every server as soon as the command
+answers. Start the servers without <code>--no-auth</code>, and give the first superuser to <code>init</code>:</p>
+<pre><code class="language-sh" data-src="docs/cluster-preview.md#Logins">echo 'a long password' &gt; $D/root.pw; echo 'another one' &gt; $D/alice.pw; chmod 600 $D/*.pw
+build/tsdb cluster init $(peer 1) --secret-file $D/secret --superuser root --password-file $D/root.pw
+build/tsdb cluster user add $(peer 1) alice --password-file $D/alice.pw --secret-file $D/secret
+build/tsdb cluster user grant $(peer 2) alice prefix:plant. read --secret-file $D/secret   # any member will do
+build/tsdb cluster user list $(peer 3) --secret-file $D/secret</code></pre>
+<ul>
+<li><code>tsdb DIR user ...</code> does not work on a cluster server's directory; it names <code>tsdb cluster user</code>.</li>
+<li>A server that was down refuses logins for a moment after it starts (<code>UNAVAILABLE</code>), until it has heard
+the cluster: it might still hold a user that was dropped while it was away. The clients do not wait for it: connect
+again, or to another server.</li>
+<li>Servers that had their own users before (a USERS file) do not start with <code>--cluster</code> until that file is
+gone: bring their users in first with <code>tsdb cluster user import</code>, with the servers stopped
+(<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/cluster-preview.md#logins">the details</a>).</li>
+</ul>
+
 <h2 id="status">How to read status</h2>
 <p><code>tsdb cluster status PEER</code> asks one server what it knows and prints one fact per line. Ask any member: they
 agree, up to a moment's delay. A server that has just restarted may show its saved copy first, with a
@@ -341,9 +359,9 @@ nothing acts on those about volumes and failover yet.</p>
 <p>The designs are written; the work goes in this order:</p>
 <ul>
 <li><strong>The metadata group, finished</strong> (steps S2, S4): the servers' links and routing of
-requests, users and grants kept in the group, and names that are unique across the cluster. The group's state machine
-(S1) and what a single server does while its storage is away (UNAVAILABLE, N1) are already in 0.10.0; the rules for
-ownership and time come with N7.</li>
+requests, and names that are unique across the cluster. The group's state machine (S1) and what a single server does
+while its storage is away (UNAVAILABLE, N1) are already in 0.10.0, and users and grants kept in the group are in this
+preview; the rules for ownership and time come with N7.</li>
 <li><strong>Shared mode</strong> (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume, fenced by the group.
 Production on NFSv4 needs this first.</li>
 <li><strong>Replicated mode</strong> (R1 to R4): each volume on three servers with their own disks, with replication,
