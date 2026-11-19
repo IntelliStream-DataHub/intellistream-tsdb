@@ -7,11 +7,15 @@
  *  - round trip: parts with one granule, many granules, tombstones and rows (a replace): each written as an .ec file,
  *    swapped in for its source while the engine is closed, and the reopened engine's .ec part compared with the source
  *    opened by part_open: every gx_* field (gx_load GW_ALL), tombstones, rows, time range, wal_seq, fno range, index
- *    geometry and hash; the index check (part_index_intact) holds, and fails on damage after the open;
+ *    geometry and hash; the index check (part_index_intact) holds, and fails on damage after the open; again with
+ *    pin_index (the index parsed from the checked copy; damage to the mapping after the open changes nothing);
  *  - damage to every region of the file (header, index, tombstones, footer, record, sums, trailer, length) fails the
  *    open with TSDB_ERR_CORRUPT;
- *  - listing: an .ec and a .part of one name both present fails the open; an .ec file in a volume whose META lacks
- *    requires=tier fails the open; a record whose class check failed fails the open;
+ *  - sealed: the checks behind the hashes, on images whose hashes are made right again (identity, footer against the
+ *    index, index_off against object_len, log numbers, tombstone order, R8 fields, the granules' places);
+ *  - the writer refuses a record of another part, and a source whose mapped index changed (unless pinned);
+ *  - listing: an .ec and a .part of one name both present fails the open (a reader's lists one of them); an .ec file
+ *    in a volume whose META lacks requires=tier fails the open; a record whose class check failed fails the open;
  *  - a WAL segment replayed at reopen does not replay into a partition held only by an .ec part;
  *  - fno_next counts the .ec part's numbers (FNO lowered by the test: the slot is taken first otherwise).
  *
@@ -19,13 +23,14 @@
  * an .ec part is read (r7-seam's), so the latest table and statistics are off.
  *
  *   ./build/test_ecpart [scratch dir]
- *   ./build/test_ecpart --mutant ecnohash|ecnowalseq|ecskipname|ecnofno [scratch dir]     must fail
+ *   ./build/test_ecpart --mutant ecnohash|ecnowalseq|ecskipname|ecnofno|ecnolayout [scratch dir]     must fail
  */
 #define _GNU_SOURCE
 #include "internal.h"
 #include "chunk.h"
 #include "ecpart.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -68,10 +73,13 @@ static void fresh(const char *name, char *dir, size_t n)
 }
 
 static uint32_t grows_opt = 0;
+static int pin_opt, ro_opt; /* pin_index, read_only */
 static int open_eng(const char *dir, eng **db)
 {
     tsdb_options o;
     tsdb_options_init(&o);
+    o.pin_index = pin_opt;
+    o.read_only = ro_opt;
     o.merge_threads = 0;
     o.create_volumes = 0;
     o.stats = -1;        /* the sweeper and sampler would read only the index, but nothing here needs them */
@@ -284,6 +292,11 @@ static void compare(const char *dir, const part *e, const char *source)
         return;
     }
     CHECK(e->ec && !e->ec->test_mark && e->verify);
+    /* pin_index: the index is parsed from the copy the open checked, never from the mapping */
+    if (pin_opt)
+        CHECK(e->icopy && e->ix.e >= e->icopy && e->ix.e < e->icopy + e->pinned);
+    else
+        CHECK(!e->icopy);
     CHECK(e->partition == s->partition && e->min_block == s->min_block && e->max_block == s->max_block &&
           e->level == s->level);
     CHECK(e->grows == s->grows && e->wal_seq == s->wal_seq && e->hdr_len == s->hdr_len);
@@ -314,33 +327,64 @@ static void compare(const char *dir, const part *e, const char *source)
 /* Merges the two newest parts of the newest partition (a replace's tombstone part and its rows) the way
  * optimize_where does. An older part of the partition lies below them, so the output keeps the tombstones: the
  * one way to get a part with both granules and tombstones (a replace writes its tombstones in a part of their own). */
-static void merge_newest_two(eng *db)
+static void merge_newest(eng *db, size_t k)
 {
     pthread_mutex_lock(&db->lock);
     size_t np = db->nparts;
-    CHECK(np >= 3 && db->parts[np - 2]->partition == db->parts[np - 1]->partition &&
-          db->parts[np - 3]->partition == db->parts[np - 1]->partition);
-    if (np < 3) {
+    bool ok = k >= 2 && k <= 4 && np >= k + 1;
+    for (size_t i = 2; ok && i <= k + 1; i++)
+        ok = db->parts[np - i]->partition == db->parts[np - 1]->partition;
+    CHECK(ok);
+    if (!ok) {
         pthread_mutex_unlock(&db->lock);
         return;
     }
-    part *sel[2] = {db->parts[np - 2], db->parts[np - 1]};
-    for (int i = 0; i < 2; i++) {
+    part *sel[4];
+    for (size_t i = 0; i < k; i++) {
+        sel[i] = db->parts[np - k + i];
         sel[i]->merging = true;
         sel[i]->merge_len_gen = atomic_load(&db->ret_len_gen);
         part_ref(sel[i]);
     }
     pthread_mutex_unlock(&db->lock);
     part *out = NULL;
-    int rc = merge_parts(db, sel, 2, &out);
+    int rc = merge_parts(db, sel, k, &out);
     CHECK(rc == 0 && out != NULL && out->nt > 0 && out->ng > 0);
     pthread_mutex_lock(&db->lock);
-    merge_commit_locked(db, sel, 2, out, rc);
+    merge_commit_locked(db, sel, k, out, rc);
     pthread_mutex_unlock(&db->lock);
     if (out)
         CHECK(manifest_publish(db) == 0);
-    for (int i = 0; i < 2; i++)
+    for (size_t i = 0; i < k; i++)
         part_unref(sel[i]);
+}
+
+static void merge_newest_two(eng *db) { merge_newest(db, 2); }
+
+/* pin_index: damage to the mapped index after the open changes no answer and no index check (the copy is used) */
+static void pinned_flip(const char *dir, part *p)
+{
+    granule *before = calloc(p->ng, sizeof *before);
+    for (uint32_t i = 0; i < p->ng; i++)
+        gx_load(p, i, GW_ALL, &before[i]);
+    char path[PATH_MAX + 200];
+    snprintf(path, sizeof path, "%s/%s", dir, p->name);
+    int fd = open(path, O_RDWR);
+    off_t at = (off_t)(p->hdr_len + p->index_len / 2);
+    uint8_t x = 0, y;
+    CHECK(fd >= 0 && pread(fd, &x, 1, at) == 1);
+    y = x ^ 0x5a;
+    CHECK(pwrite(fd, &y, 1, at) == 1);
+    for (uint32_t i = 0; i < p->ng; i++) {
+        granule g;
+        memset(&g, 0, sizeof g);
+        gx_load(p, i, GW_ALL, &g);
+        CHECK(memcmp(&g, &before[i], sizeof g) == 0);
+    }
+    CHECK(part_index_intact(p));
+    CHECK(pwrite(fd, &x, 1, at) == 1);
+    close(fd);
+    free(before);
 }
 
 static void test_roundtrip(const char *what, uint32_t grows, int kind)
@@ -386,6 +430,8 @@ static void test_roundtrip(const char *what, uint32_t grows, int kind)
         tombs |= p->nt > 0;
         compare(dir, p, st[i].source);
         CHECK(part_index_intact(p) && part_checked(db, p, "test"));
+        if (pin_opt)
+            pinned_flip(dir, p);
     }
     if (kind == 2)
         CHECK(tombs);
@@ -558,6 +604,336 @@ static void test_damage(void)
            "the index check\n", sizeof at / sizeof *at);
 }
 
+/* ---------------------------------------------------------------- the checks behind the hashes */
+/* The hashes of an edited .ec image, made right again (the footer's, the record's, the trailer's): what a settle that
+ * mixed something up, or damage the hashes cannot see, would leave. part_open_ec must still refuse it. */
+static void reseal(uint8_t *b, size_t len)
+{
+    const size_t HL = sizeof(part_header), FL = sizeof(part_footer), TL = EC_TRAILER_BYTES;
+    uint8_t *tr = b + len - TL;
+    uint64_t rlen;
+    memcpy(&rlen, tr + EC_TR_REC_LEN, 8);
+    size_t roff = len - TL - (size_t)rlen;
+    part_footer f;
+    memcpy(&f, b + roff - FL, FL);
+    size_t il = (size_t)f.index_len, tl = roff - FL - HL - il;
+    uint64_t x = xxh64(b, HL, 0);
+    x = xxh64(b + HL, il, x);
+    if (tl)
+        x = xxh64(b + HL + il, tl, x);
+    f.index_hash = xxh64(&f, offsetof(part_footer, index_hash), x);
+    memcpy(b + roff - FL, &f, FL);
+    uint64_t h = xxh64(b + roff, (size_t)rlen, 0);
+    memcpy(tr + EC_TR_REC_HASH, &h, 8);
+    h = xxh64(tr, EC_TR_HASH, 0);
+    memcpy(tr + EC_TR_HASH, &h, 8);
+}
+
+/* An .ec image of p (listed, opened from `orig`) with the packed index of g[0..n) in place of its own: the object's
+ * length follows the index's, and the record's geometry and sums follow the length, so only what the index says
+ * differs. Sealed. */
+static uint8_t *rebuild(const uint8_t *orig, const part *p, const granule *g, uint32_t n, size_t *out_len)
+{
+    const size_t HL = sizeof(part_header), FL = sizeof(part_footer), TL = EC_TRAILER_BYTES;
+    size_t R = (size_t)p->ec->rec_off, il = (size_t)p->index_len, tl = R - FL - HL - il;
+    uint8_t *ix = NULL;
+    size_t il2 = 0;
+    if (gix_encode(g, n, &ix, &il2) != 0)
+        return NULL;
+    part_footer f;
+    memcpy(&f, orig + R - FL, FL);
+    f.index_len = il2;
+    f.ngranules = n;
+    ec_record r;
+    if (ec_record_decode(orig + R, (size_t)p->ec->rec_len, &r) != 0) {
+        free(ix);
+        return NULL;
+    }
+    chunk_geom geo;
+    r.object_len = f.index_off + il2 + tl + FL;
+    CHECK(chunk_geom_derive(&geo, 2, 1, r.object_len) == 0);
+    r.k = geo.k, r.m = geo.m, r.cell_bytes = geo.cell;
+    free(r.sums);
+    r.nsums = chunk_sums_total(&geo);
+    r.sums = calloc(r.nsums, 8);
+    size_t rl = ec_record_size(&r), len = HL + il2 + tl + FL + rl + TL;
+    uint8_t *b = calloc(1, len);
+    memcpy(b, orig, HL);
+    memcpy(b + HL, ix, il2);
+    memcpy(b + HL + il2, orig + HL + il, tl);
+    memcpy(b + HL + il2 + tl, &f, FL);
+    size_t R2 = HL + il2 + tl + FL;
+    CHECK(ec_record_encode(&r, b + R2, rl) == 0);
+    uint8_t *t = b + R2 + rl;
+    memcpy(t + EC_TR_MAGIC, EC_TRAILER_MAGIC, 8);
+    uint32_t v = EC_TRAILER_VERSION, rv = r.version;
+    uint64_t o = R2, l = rl;
+    memcpy(t + EC_TR_VERSION, &v, 4);
+    memcpy(t + EC_TR_REC_VERSION, &rv, 4);
+    memcpy(t + EC_TR_REC_OFF, &o, 8);
+    memcpy(t + EC_TR_REC_LEN, &l, 8);
+    reseal(b, len);
+    ec_record_free(&r);
+    free(ix);
+    *out_len = len;
+    return b;
+}
+
+static size_t tmp_files(const char *dir)
+{
+    size_t n = 0;
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    while (d && (de = readdir(d)))
+        n += strncmp(de->d_name, "tmp_", 4) == 0;
+    if (d)
+        closedir(d);
+    return n;
+}
+
+static void set64(uint8_t *at, uint64_t v) { memcpy(at, &v, 8); }
+
+/* Opens the image b as p's name: the return code */
+static int open_image(eng *db, const char *bad, const part *p, const uint8_t *b, size_t len)
+{
+    spit(bad, b, len);
+    part *q = NULL;
+    int rc = part_open_ec(db, "damaged.bin", p->name, &q);
+    CHECK((rc == 0) == (q != NULL));
+    if (q)
+        part_unref(q);
+    return rc;
+}
+
+/* Every check of part_open_ec that a hash cannot stand in for, each on an image whose hashes are right: the record of
+ * another key, block range or source; the footer's rows and time range off by one; index_off against object_len; the
+ * header's log numbers; tombstones out of order; the R8 fields; granules the index places on top of each other or past
+ * the object's data (a fuzz timeout once: offsets of stride 0 made any granule count look valid). */
+static void test_sealed(void)
+{
+    char dir[PATH_MAX];
+    fresh("sealed", dir, sizeof dir);
+    grows_opt = 256;
+    eng *db = NULL;
+    CHECK(open_eng(dir, &db) == 0);
+    if (!db)
+        return;
+    uint32_t a = 0, b = 0;
+    CHECK(eng_series(db, "a", TSDB_FLOAT32, &a) == 0 && eng_series(db, "b", TSDB_FLOAT32, &b) == 0);
+    rows(db, a, T0, 3000, 0);
+    rows(db, b, T0, 3000, 50);
+    CHECK(eng_flush(db) == 0);
+    /* a delete of b, then a replace of a, merged: one part with granules and two tombstones, a's before b's */
+    CHECK(eng_delete_range(db, b, T0 + 10000, T0 + 20000) == 0);
+    int64_t ts[600];
+    float v[600];
+    for (int i = 0; i < 600; i++)
+        ts[i] = T0 + 100000 + i * 1000, v[i] = -1.0f - (float)i;
+    CHECK(eng_replace_range(db, TSDB_FLOAT32, a, T0 + 100000, T0 + 800000, ts, v, 600) == 0);
+    merge_newest(db, 3);
+    CHECK(eng_flush(db) == 0);
+    settled st[8];
+    size_t n = settle_all(db, dir, EC_CLS_PASSED, st, 8);
+    db = NULL;
+    CHECK(open_eng(dir, &db) == 0);
+    grows_opt = 0;
+    if (!db)
+        return;
+    const part *p = NULL;
+    for (size_t i = 0; i < n; i++) {
+        const part *q = listed(db, st[i].name);
+        if (q && q->nt == 2 && q->ng >= 2)
+            p = q;
+    }
+    CHECK(p != NULL);
+    char path[PATH_MAX + 200], bad[PATH_MAX + 200];
+    size_t len = 0;
+    uint8_t *orig = NULL;
+    if (p) {
+        snprintf(path, sizeof path, "%s/%s", dir, p->name);
+        orig = slurp(path, &len);
+    }
+    CHECK(orig != NULL);
+    if (!orig) {
+        eng_close(db);
+        return;
+    }
+    snprintf(bad, sizeof bad, "%s/damaged.bin", dir);
+    const size_t HL = sizeof(part_header), FL = sizeof(part_footer);
+    size_t R = (size_t)p->ec->rec_off, il = (size_t)p->index_len, F = R - FL;
+    uint8_t *c = malloc(len);
+    int bad_cases = 0;
+#define EDIT(what, stmt)                                                                                               \
+    do {                                                                                                               \
+        memcpy(c, orig, len);                                                                                          \
+        stmt;                                                                                                          \
+        reseal(c, len);                                                                                                \
+        int rc_ = open_image(db, bad, p, c, len);                                                                      \
+        if (rc_ != TSDB_ERR_CORRUPT)                                                                                   \
+            fprintf(stderr, "  sealed %s: %d\n", what, rc_);                                                         \
+        CHECK(rc_ == TSDB_ERR_CORRUPT);                                                                                \
+        bad_cases++;                                                                                                   \
+    } while (0)
+#define SET64(off, val) set64(c + (off), (uint64_t)(val))
+#define GET64(off) ({ uint64_t v_; memcpy(&v_, orig + (off), 8); v_; })
+    memcpy(c, orig, len);
+    reseal(c, len);
+    CHECK(memcmp(c, orig, len) == 0); /* the reseal of an untouched image changes nothing */
+    CHECK(open_image(db, bad, p, c, len) == 0);
+    EDIT("record key", SET64(R + EC_REC_KEY, GET64(R + EC_REC_KEY) + 1));
+    EDIT("record min_block", SET64(R + EC_REC_MIN_BLOCK, GET64(R + EC_REC_MIN_BLOCK) + 1));
+    EDIT("record max_block", SET64(R + EC_REC_MAX_BLOCK, GET64(R + EC_REC_MAX_BLOCK) + 1));
+    EDIT("record source", c[R + EC_REC_SOURCE] = 'q');
+    EDIT("record positions", c[R + EC_REC_POSITIONS] = 1);
+    EDIT("record ppos", c[R + EC_REC_PPOS] = 1);
+    EDIT("record stripe_version", c[R + EC_REC_STRIPE_VERSION] = 1);
+    EDIT("footer rows", SET64(F + offsetof(part_footer, rows), GET64(F + offsetof(part_footer, rows)) + 1));
+    EDIT("footer min_ts", SET64(F + offsetof(part_footer, min_ts), GET64(F + offsetof(part_footer, min_ts)) - 1));
+    EDIT("footer max_ts", SET64(F + offsetof(part_footer, max_ts), GET64(F + offsetof(part_footer, max_ts)) + 1));
+    EDIT("footer index_off", SET64(F + offsetof(part_footer, index_off), GET64(F + offsetof(part_footer, index_off)) + 8));
+    EDIT("header fno_lo > fno_hi", (SET64(offsetof(part_header, fno_lo), 7), SET64(offsetof(part_header, fno_hi), 5)));
+    EDIT("header fno_lo 0 only", (SET64(offsetof(part_header, fno_lo), 0), SET64(offsetof(part_header, fno_hi), 5)));
+    EDIT("header fno_hi at the bound", (SET64(offsetof(part_header, fno_lo), 1),
+                                        SET64(offsetof(part_header, fno_hi), FNO_BOUND_MAX)));
+    tomb t2[2];
+    memcpy(t2, orig + HL + il, sizeof t2);
+    CHECK(t2[0].series < t2[1].series);
+    EDIT("tombstones out of order", (memcpy(c + HL + il, &t2[1], sizeof(tomb)),
+                                     memcpy(c + HL + il + sizeof(tomb), &t2[0], sizeof(tomb))));
+    /* b's: the time range of the part ends with a's tombstone and starts with b's, so this one changes neither */
+    EDIT("an empty tombstone", SET64(HL + il + sizeof(tomb) + offsetof(tomb, end), t2[1].start));
+    /* the index against the object's data */
+    granule *g = calloc(p->ng, sizeof *g);
+    for (uint32_t i = 0; i < p->ng; i++) {
+        gx_load(p, i, GW_ALL, &g[i]);
+        g[i].series = gx_series(p, i);
+    }
+    size_t blen = 0;
+    uint8_t *img = rebuild(orig, p, g, p->ng, &blen);
+    CHECK(img && open_image(db, bad, p, img, blen) == 0); /* the control: the same index, rebuilt */
+    free(img);
+    struct { const char *what; uint32_t i; int field; uint64_t val; } lay[] = {
+        {"two granules at one offset", 1, 0, g[0].off},
+        {"a granule inside the one before", 1, 0, g[0].off + 1},
+        {"a granule before the data", 0, 0, HL - 8},
+        {"a granule past the object's data", p->ng - 1, 1, (uint64_t)1 << 20},
+        {"a granule of no bytes", p->ng - 1, 2, 0},
+    };
+    for (size_t k = 0; k < sizeof lay / sizeof *lay; k++) {
+        granule s = g[lay[k].i];
+        if (lay[k].field == 0)
+            g[lay[k].i].off = lay[k].val;
+        else if (lay[k].field == 1)
+            g[lay[k].i].ts_len = (uint32_t)lay[k].val;
+        else
+            g[lay[k].i].ts_len = g[lay[k].i].val_len = 0;
+        img = rebuild(orig, p, g, p->ng, &blen);
+        CHECK(img != NULL);
+        int rc = img ? open_image(db, bad, p, img, blen) : 0;
+        if (rc != TSDB_ERR_CORRUPT)
+            fprintf(stderr, "  sealed %s: %d\n", lay[k].what, rc);
+        CHECK(rc == TSDB_ERR_CORRUPT);
+        bad_cases++;
+        free(img);
+        g[lay[k].i] = s;
+    }
+#undef EDIT
+#undef SET64
+#undef GET64
+    free(g);
+    free(c);
+    free(orig);
+    unlink(bad);
+    CHECK(eng_close(db) == 0);
+    printf("  sealed: %d images with right hashes and a wrong identity, footer, header, tombstone, R8 field or "
+           "granule layout each fail the open\n", bad_cases);
+}
+
+/* ec_index_write refuses a record of another part, and a source whose mapped index changed since its open (with
+ * pin_index the copy the open checked is written, and the change does not matter) */
+static void test_writer(int pin)
+{
+    char dir[PATH_MAX];
+    fresh(pin ? "writer_pinned" : "writer", dir, sizeof dir);
+    pin_opt = pin;
+    eng *db = NULL;
+    CHECK(open_eng(dir, &db) == 0);
+    pin_opt = 0;
+    if (!db)
+        return;
+    uint32_t a = 0;
+    CHECK(eng_series(db, "a", TSDB_FLOAT32, &a) == 0);
+    rows(db, a, T0, 500, 0);
+    CHECK(eng_flush(db) == 0);
+    pthread_mutex_lock(&db->lock);
+    part *src = db->nparts == 1 ? db->parts[0] : NULL;
+    if (src)
+        part_ref(src);
+    pthread_mutex_unlock(&db->lock);
+    CHECK(src && (pin ? src->icopy != NULL : src->icopy == NULL));
+    if (!src) {
+        eng_close(db);
+        return;
+    }
+    char tmp[96], path[PATH_MAX + 200];
+    ec_record r;
+    make_record(src, EC_CLS_PASSED, &r);
+    CHECK(ec_index_write(db, src, &r, tmp) == 0 && tmp_files(dir) == 1); /* the control */
+    snprintf(path, sizeof path, "%s/%s", dir, tmp);
+    unlink(path);
+    struct { const char *what; int field; } w[] = {{"key", 0}, {"max_block", 1}, {"level", 2}, {"object_len", 3},
+                                                   {"source", 4}};
+    for (size_t k = 0; k < sizeof w / sizeof *w; k++) {
+        ec_record x;
+        make_record(src, EC_CLS_PASSED, &x);
+        if (w[k].field == 0) {
+            x.key++;
+        } else if (w[k].field == 1) {
+            x.max_block++;
+        } else if (w[k].field == 2) {
+            x.level++;
+        } else if (w[k].field == 3) { /* one byte short, the record's own geometry and sums kept consistent */
+            chunk_geom geo;
+            x.object_len--;
+            CHECK(chunk_geom_make(&geo, x.k, x.m, x.cell_bytes, x.object_len) == 0);
+            x.nsums = chunk_sums_total(&geo);
+        } else {
+            snprintf(x.source, sizeof x.source, "p%lld_%llu_%llu_%u.part", (long long)src->partition,
+                     (unsigned long long)src->min_block, (unsigned long long)src->max_block, src->level + 1);
+            memset(x.source + strlen(x.source), 0, sizeof x.source - strlen(x.source));
+        }
+        int rc = ec_index_write(db, src, &x, tmp);
+        if (rc != TSDB_ERR_INVALID)
+            fprintf(stderr, "  writer: a record of another %s: %d\n", w[k].what, rc);
+        CHECK(rc == TSDB_ERR_INVALID && tmp[0] == '\0' && tmp_files(dir) == 0);
+        ec_record_free(&x);
+    }
+    /* a byte of the source's index changes in the file (and so in its mapping) after the open */
+    snprintf(path, sizeof path, "%s/%s", dir, src->name);
+    int fd = open(path, O_RDWR);
+    off_t at = (off_t)(src->index_off + src->index_len / 2);
+    uint8_t x0 = 0, x1;
+    CHECK(fd >= 0 && pread(fd, &x0, 1, at) == 1);
+    x1 = x0 ^ 0x22;
+    CHECK(pwrite(fd, &x1, 1, at) == 1);
+    if (pin) {
+        CHECK(ec_index_write(db, src, &r, tmp) == 0 && tmp_files(dir) == 1);
+        snprintf(path, sizeof path, "%s/%s", dir, tmp);
+        unlink(path);
+    } else {
+        fprintf(stderr, "  (a refusal is logged next: a source whose index changed)\n");
+        CHECK(ec_index_write(db, src, &r, tmp) == TSDB_ERR_CORRUPT && tmp[0] == '\0' && tmp_files(dir) == 0);
+    }
+    CHECK(pwrite(fd, &x0, 1, at) == 1);
+    close(fd);
+    ec_record_free(&r);
+    part_unref(src);
+    CHECK(eng_close(db) == 0);
+    printf("  writer%s: a record of another key, block range, level, length or source is refused, and %s\n",
+           pin ? " (pin_index)" : "", pin ? "the checked copy is written after the mapping changed"
+                                         : "a source whose mapped index changed is not written");
+}
+
 /* ---------------------------------------------------------------- listing */
 static void test_listing(void)
 {
@@ -579,6 +955,23 @@ static void test_listing(void)
     fprintf(stderr, "  (two refusals are logged next: a .part beside its .ec)\n");
     db = NULL;
     CHECK(open_eng(dir, &db) == TSDB_ERR_CORRUPT && !db);
+    /* a reader's open has recovered no intent, and may see a swap between its two renames: it lists one of the two
+     * (they hold the same rows), never fails and never neither. With a MANIFEST it lists what that names (here the
+     * .part: the swap ran with the writer closed); without one it lists the directory (load_parts) */
+    for (int man = 1; man >= 0; man--) {
+        if (!man)
+            sh("mv '%s/MANIFEST' '%s/MANIFEST.keep'", dir, dir);
+        ro_opt = 1;
+        CHECK(open_eng(dir, &db) == 0 && db);
+        ro_opt = 0;
+        if (db) {
+            CHECK((listed(db, st[0].name) != NULL) + (listed(db, st[0].source) != NULL) == 1);
+            CHECK(eng_close(db) == 0);
+            db = NULL;
+        }
+        if (!man)
+            sh("mv '%s/MANIFEST.keep' '%s/MANIFEST'", dir, dir);
+    }
     sh("rm -f '%s/%s'", dir, st[0].source);
     /* no requires=tier */
     atomic_store(&ec_test_assume_tier, false);
@@ -588,6 +981,25 @@ static void test_listing(void)
     CHECK(open_eng(dir, &db) == 0 && db);
     if (db) {
         CHECK(listed(db, st[0].name) != NULL);
+        /* META's requires= read for real (the engine refuses "tier" before load_parts on this branch, so the load is
+         * called alone): named among others, absent, and META unreadable (an I/O error, not damage) */
+        atomic_store(&ec_test_assume_tier, false);
+        char meta[PATH_MAX + 16], keep[PATH_MAX + 16];
+        snprintf(meta, sizeof meta, "%s/META", dir);
+        snprintf(keep, sizeof keep, "%s/META.keep", dir);
+        sh("cp '%s' '%s' && printf 'requires=feed,tier\n' >> '%s'", meta, keep, meta);
+        part *q = NULL;
+        CHECK(ecpart_load(db, st[0].name, false, &q) == 0 && q);
+        if (q)
+            part_unref(q);
+        sh("cp '%s' '%s' && printf 'requires=tiers,feed\n' >> '%s'", keep, meta, meta);
+        fprintf(stderr, "  (two refusals are logged next: no word tier in requires=, and META unreadable)\n");
+        q = NULL;
+        CHECK(ecpart_load(db, st[0].name, false, &q) == TSDB_ERR_CORRUPT && !q);
+        sh("rm -f '%s' && mkdir '%s'", meta, meta);
+        CHECK(ecpart_load(db, st[0].name, false, &q) == TSDB_ERR_IO && !q);
+        sh("rmdir '%s' && mv '%s' '%s'", meta, keep, meta);
+        atomic_store(&ec_test_assume_tier, true);
         CHECK(eng_close(db) == 0);
     }
 
@@ -605,8 +1017,24 @@ static void test_listing(void)
     db = NULL;
     fprintf(stderr, "  (a refusal is logged next: a failed class check)\n");
     CHECK(open_eng(dir2, &db) == TSDB_ERR_CORRUPT && !db);
+
+    /* a record whose settle ran no class check, with partition classes on: its rows cannot be placed */
+    char dir3[PATH_MAX];
+    fresh("listing_nocls", dir3, sizeof dir3);
+    db = NULL;
+    CHECK(open_eng(dir3, &db) == 0);
+    if (!db)
+        return;
+    CHECK(db->cls_on);
+    CHECK(eng_series(db, "a", TSDB_FLOAT32, &a) == 0);
+    rows(db, a, T0, 500, 0);
+    CHECK(eng_flush(db) == 0);
+    CHECK(settle_all(db, dir3, EC_CLS_NONE, st, 4) == 1);
+    db = NULL;
+    fprintf(stderr, "  (a refusal is logged next: no class check)\n");
+    CHECK(open_eng(dir3, &db) == TSDB_ERR_CORRUPT && !db);
     printf("  listing: an .ec part is listed; beside its .part, without requires=tier or with a failed class check "
-           "the open fails\n");
+           "(or none, with classes on) the open fails; a reader beside a swap lists one of the two\n");
 }
 
 /* ---------------------------------------------------------------- the WAL and FNO */
@@ -704,6 +1132,7 @@ int main(int argc, char **argv)
                         : !strcmp(m, "ecnowalseq") ? EC_MUT_NOWALSEQ
                         : !strcmp(m, "ecskipname") ? EC_MUT_SKIPNAME
                         : !strcmp(m, "ecnofno")    ? EC_MUT_NOFNO
+                        : !strcmp(m, "ecnolayout") ? EC_MUT_NOLAYOUT
                                                    : -1;
         if (ecpart_mutant < 0) {
             fprintf(stderr, "unknown mutant %s\n", m);
@@ -722,7 +1151,15 @@ int main(int argc, char **argv)
     test_roundtrip("one", 0, 0);
     test_roundtrip("many", 256, 1);
     test_roundtrip("tombs", 256, 2);
+    pin_opt = 1; /* the same with pin_index: the open and the writer use the checked copy */
+    test_roundtrip("one-pinned", 0, 0);
+    test_roundtrip("many-pinned", 256, 1);
+    test_roundtrip("tombs-pinned", 256, 2);
+    pin_opt = 0;
     test_damage();
+    test_sealed();
+    test_writer(0);
+    test_writer(1);
     test_listing();
     test_replay();
     test_fno();

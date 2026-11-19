@@ -128,8 +128,9 @@ int part_open_ec(eng *db, const char *file, const char *name, part **out);
 /* r7-ecfile's planted bugs (tests/test_ecpart.c --mutant NAME; the Makefile requires each to fail it): the open checks
  * no hash (neither the source's nor the record's); the open leaves wal_seq 0 (a WAL segment replays into a partition an
  * .ec part holds); load_parts leaves .ec files alone (ecpart_load lists nothing); the open leaves fno_lo, fno_hi 0
- * (fno_next does not count the .ec part's numbers) */
-enum { EC_MUT_NONE = 0, EC_MUT_NOHASH, EC_MUT_NOWALSEQ, EC_MUT_SKIPNAME, EC_MUT_NOFNO };
+ * (fno_next does not count the .ec part's numbers); the open does not check where the index places each granule
+ * (overlapping granules, or one past the object's data, are opened) */
+enum { EC_MUT_NONE = 0, EC_MUT_NOHASH, EC_MUT_NOWALSEQ, EC_MUT_SKIPNAME, EC_MUT_NOFNO, EC_MUT_NOLAYOUT };
 extern int ecpart_mutant;
 /* Test hook: ecpart_load takes every volume as one whose META says requires=tier (r7-tier writes the word, and refuses
  * it without a configured tier; tests of the .ec file itself run without one). */

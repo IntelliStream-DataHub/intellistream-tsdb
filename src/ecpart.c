@@ -82,11 +82,15 @@ static bool source_ok(const char *s)
 }
 
 /* What a record must hold whichever way it came: its version and class result, its geometry (E2: recorded, never
- * derived from settings), the sums of exactly that geometry, a block range in order, a source name. */
+ * derived from settings), the sums of exactly that geometry, a block range in order, a source name. The fields R8
+ * fills (a degraded settle's mask of positions, the marker's log position, the stripe list's version) are 0: a record
+ * that sets one says something this build cannot honour (it would read a degraded object as fully written), so R8
+ * either bumps EC_RECORD_VERSION or teaches this check. */
 static bool record_valid(const ec_record *r)
 {
     chunk_geom g;
     return r->version == EC_RECORD_VERSION && r->class_check <= EC_CLS_FAILED && r->min_block <= r->max_block &&
+           r->positions == 0 && r->ppos == 0 && r->stripe_version == 0 &&
            chunk_geom_make(&g, r->k, r->m, r->cell_bytes, r->object_len) == 0 && r->nsums == chunk_sums_total(&g) &&
            source_ok(r->source);
 }
@@ -392,6 +396,15 @@ int part_open_ec(eng *db, const char *file, const char *name, part **out)
     size_t ilen = (size_t)f.index_len, tlen = (size_t)(roff - FL - HL - f.index_len);
     if (r->object_len < (uint64_t)ilen + tlen + FL || r->object_len - ilen - tlen - FL != f.index_off)
         goto fail;
+    /* Every granule's blocks lie between the header and the index, at least a byte each, so the count is bounded by
+     * the object's data bytes. That bound is the object's, not this file's: a packed index of stride 0 (every field
+     * constant or linear) is a few bytes for any count, and a record's 8-byte sum may vouch for a cell of up to
+     * CHUNK_CELL_LIMIT. What keeps a crafted or damaged count from holding the open (a fuzz timeout: a sealed file of
+     * 536 bytes claimed 10^8 granules, then one of 656 bytes 2^30) is the walk below, which checks each granule's
+     * place first and stops at the first one out of place: constant offsets fail at the second. A count the walk
+     * accepts describes an object of at least that many bytes, whose open costs what its granules cost. */
+    if (f.ngranules > f.index_off - HL)
+        goto fail;
     const uint8_t *ib = p->map + HL;
     if (db->opt.pin_index) { /* as part_open_as: the bytes checked are the bytes used */
         rc = TSDB_ERR_NOMEM;
@@ -413,12 +426,23 @@ int part_open_ec(eng *db, const char *file, const char *name, part **out)
     p->rows = f.rows;
     p->min_ts = f.min_ts;
     p->max_ts = f.max_ts;
-    /* the footer against the index: its rows and its time range (the rows' and the tombstones', as pw_finish_mode
-     * writes them) */
+    /* the index against the object: the writer appends each granule's blocks at the end of the data in index order
+     * (pw_emit, pw_copy_granule), so granule i starts at or after the end of granule i - 1, holds a byte or more and
+     * ends before the index. Nothing else checks this here (the blocks are not in this file), and a reader would take
+     * the offsets as they are. Then the footer against the index: its rows and its time range (the rows' and the
+     * tombstones', as pw_finish_mode writes them) */
     if (p->ng || p->nt) {
-        uint64_t rows = 0;
+        uint64_t rows = 0, end = HL;
         int64_t lo = INT64_MAX, hi = INT64_MIN;
         for (uint32_t i = 0; i < p->ng; i++) {
+            if (ecpart_mutant != EC_MUT_NOLAYOUT) {
+                granule g;
+                gx_load(p, i, GW_LOC, &g);
+                uint64_t len = (uint64_t)g.ts_len + g.val_len;
+                if (g.off < end || g.off > f.index_off || len == 0 || len > f.index_off - g.off)
+                    goto fail;
+                end = g.off + len;
+            }
             rows += gx_count(p, i);
             lo = MIN(lo, gx_ts_min(p, i));
             hi = MAX(hi, gx_ts_max(p, i));
@@ -447,19 +471,27 @@ fail:
     return rc;
 }
 
-/* Whether META's requires= line names "tier" (r7-tier writes it before the first .ec file can exist). */
-static bool meta_says_tier(eng *db)
+/* Whether META's requires= line names "tier" (r7-tier writes it before the first .ec file can exist): 1 or 0, or
+ * TSDB_ERR_IO (named) when META cannot be read. A second reader of requires= until r7-tier's db field replaces it. */
+static int meta_says_tier(eng *db)
 {
     if (atomic_load(&ec_test_assume_tier))
-        return true;
+        return 1;
     int fd = openat(db->dirfd, "META", O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return false;
-    char buf[4096];
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    close(fd);
-    if (n <= 0)
-        return false;
+    if (fd < 0 && errno == ENOENT)
+        return 0;
+    char buf[65536];
+    size_t n = 0;
+    ssize_t k = fd < 0 ? -1 : 0;
+    while (fd >= 0 && n < sizeof buf - 1 && (k = read(fd, buf + n, sizeof buf - 1 - n)) > 0)
+        n += (size_t)k;
+    int err = errno;
+    if (fd >= 0)
+        close(fd);
+    if (k < 0) {
+        fprintf(stderr, "tsdb: %s/META: %s: the open fails\n", db->dir, strerror(err));
+        return TSDB_ERR_IO;
+    }
     buf[n] = '\0';
     for (const char *l = buf; *l;) {
         const char *end = strchr(l, '\n');
@@ -469,38 +501,47 @@ static bool meta_says_tier(eng *db)
                 const char *c = memchr(w, ',', (size_t)(l + len - w));
                 const char *we = c ? c : l + len;
                 if (we - w == 4 && strncmp(w, "tier", 4) == 0)
-                    return true;
+                    return 1;
                 w = we + 1;
             }
         if (!end)
             break;
         l = end + 1;
     }
-    return false;
+    return 0;
 }
 
 int ecpart_load(eng *db, const char *name, bool read_only, part **out)
 {
     EC_CALLED(EC_CALL_LOAD);
-    (void)read_only;
     *out = NULL;
     if (ecpart_mutant == EC_MUT_SKIPNAME)
         return 0; /* planted: the file is left alone, and its rows vanish */
-    if (!meta_says_tier(db)) {
+    int tier = meta_says_tier(db);
+    if (tier < 0)
+        return tier;
+    if (!tier) {
         fprintf(stderr, "tsdb: %s/%s is an erasure-coded part, but the volume's META does not say requires=tier "
                         "(which is written before the first one): the open fails\n", db->dir, name);
         return TSDB_ERR_CORRUPT;
     }
     /* A settle's swap leaves one of the two (intent v4, recovered before the parts are listed): both, with no intent
-     * naming them, is damage or a bug, and which of them holds the rows cannot be told. */
+     * naming them, is damage or a bug, and which of them holds the rows cannot be told. Only a writer's open has
+     * recovered the intents (db.c). A reader follows MANIFEST where there is one (ecpart_follower_open, r7-tier's);
+     * without one it lists the directory here, and beside a writer it sees the swap between its two renames, or a crash's
+     * intent that the next writer finishes: both files hold the same rows (E7) under the same name, so a reader opens
+     * the .ec as well and the cover rule lists one of them, as it does for a merge's output and its sources. Skipping
+     * the .ec here instead would lose the rows when the .part is renamed after this check and before the listing
+     * reaches it. */
     char src[96];
     if (!source_name(name, src))
         return TSDB_ERR_INVALID;
-    if (faccessat(db->dirfd, src, F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+    if (!read_only && faccessat(db->dirfd, src, F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
         fprintf(stderr, "tsdb: %s/%s and %s/%s both exist and no intent names them (a settle leaves one of the two): "
                         "the open fails\n", db->dir, src, db->dir, name);
         return TSDB_ERR_CORRUPT;
-    } else if (errno != ENOENT) {
+    } else if (!read_only && errno != ENOENT) {
+        fprintf(stderr, "tsdb: %s/%s: %s: the open fails\n", db->dir, src, strerror(errno));
         return TSDB_ERR_IO;
     }
     return part_open_ec(db, name, name, out);
