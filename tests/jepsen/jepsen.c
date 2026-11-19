@@ -215,6 +215,7 @@
 #define CL_SPEED 2       /* ms of timestamps the frontier moves per ms of the run */
 #define CL_NEAR 200      /* keys behind the frontier most writes go to */
 #define MAX_OPS 2000000
+static uint32_t max_ops = MAX_OPS; /* JEPSEN_MAX_OPS: a test hook of the selftest (the room for the history, never above MAX_OPS) */
 #define MAX_FREADS 200000
 #define FOLLOW_FAIL_S 10 /* longest run of failed follower reads */
 #define FOLLOW_CATCHUP_S 20
@@ -2007,16 +2008,51 @@ static void jepsen_watchdog(void)
     th_watchdog(name, budget);
 }
 
+/* Pacing (round 14). The history is kept in memory and checked after the run, and what the checker costs grows with the number of
+ * operations (the arrays of MAX_OPS, the keys of every write, check_latest's covers of a hot key: quadratic). On a fast file system
+ * (tmpfs: 860,000 writes in 20 s, against 17,000 on a disk that syncs) a run of 60 s took 14 minutes to check and 5.9 GB, and one of 120 s
+ * reached MAX_OPS after 45 s, where every client stopped quietly (the rest of the run tested nothing) and the checker took 13 GB (the
+ * OOM killer: the gate's selftest on /tmp). So the clients together do at most JEPSEN_OPS_PER_S operations a second (default 8000; 0: no
+ * limit), and never more than 80% of MAX_OPS over the run's seconds: the fast file system is paced, a disk that syncs is not. A client
+ * that falls behind does not catch up in a burst. A cap that is reached anyway is not quiet: see ops_cap_hit. */
+static int64_t pace_ns; /* per client between two operations, 0: none */
+static atomic_bool ops_cap_hit;
+
+static void pace_init(void)
+{
+    double rate = 8000;
+    const char *e = getenv("JEPSEN_OPS_PER_S");
+    if (e)
+        rate = atof(e);
+    if (rate <= 0) {
+        pace_ns = 0;
+        return;
+    }
+    double cap_rate = 0.8 * max_ops / (seconds > 1 ? seconds : 1);
+    if (rate > cap_rate)
+        rate = cap_rate;
+    pace_ns = (int64_t)(1e9 * nclients / rate);
+}
+
 static void *client(void *arg)
 {
     uint64_t r = mix(seed * 1000 + (uint64_t)(intptr_t)arg);
     tsdbc *c = connect_retry();
+    int64_t pace_next = now_ns();
     /* JEPSEN_CLIENT_NAP_MS: a test hook of the selftest, the clients of a machine that starves them (a run of the classes workload wrote 12 rows in 20 s
      * under 40 busy loops on 4 CPUs): every operation waits that long first, and the run, which tested nothing, must end INCONCLUSIVE */
     const char *cnap = getenv("JEPSEN_CLIENT_NAP_MS");
     while (c && !atomic_load(&stop)) {
         if (cnap)
             usleep((useconds_t)atoi(cnap) * 1000);
+        if (pace_ns) {
+            pace_next += pace_ns;
+            int64_t d = pace_next - now_ns();
+            if (d > 0)
+                usleep((useconds_t)(d / 1000));
+            else if (d < -1000000000LL)
+                pace_next = now_ns();
+        }
         r = mix(r);
         int s = (int)(r % (uint64_t)nseries);
         if (outage) /* a client works one volume only: one stuck in a hung volume's calls must not hold back the rest */
@@ -2024,8 +2060,10 @@ static void *client(void *arg)
         const uint64_t td = tier_n ? 8 : 0; /* the tier: more deletes and replaces, which a settle must survive */
         if ((r >> 8) % 100 < 6 + td) { /* a delete or a replace of a key range */
             uint32_t id = atomic_fetch_add(&nwrites, 1);
-            if (id >= MAX_OPS)
+            if (id >= max_ops) {
+                atomic_store(&ops_cap_hit, true);
                 break;
+            }
             wop *w = &writes[id];
             w->series = s;
             w->kind = (r >> 16) % 2 ? W_REPLACE : W_DELETE;
@@ -2071,8 +2109,10 @@ static void *client(void *arg)
             }
         } else if (latest_on && (r >> 8) % 100 < 12 + td) { /* nulls over a key range, near the top: the newest row's null */
             uint32_t id = atomic_fetch_add(&nwrites, 1);
-            if (id >= MAX_OPS)
+            if (id >= max_ops) {
+                atomic_store(&ops_cap_hit, true);
                 break;
+            }
             wop *w = &writes[id];
             w->series = s;
             w->kind = W_NULL;
@@ -2105,8 +2145,10 @@ static void *client(void *arg)
             }
         } else if (latest_on && (r >> 8) % 100 < 20 + td) { /* the newest row of every series, in one request */
             uint32_t base = atomic_fetch_add(&nlats, (uint32_t)nseries);
-            if (base + (uint32_t)nseries > MAX_LATEST)
+            if (base + (uint32_t)nseries > MAX_LATEST) {
+                atomic_store(&ops_cap_hit, true);
                 break;
+            }
             bool wn = (r >> 14) % 2;
             int64_t end = (r >> 15) % 3 ? INT64_MAX : key_ts(s, (uint32_t)(mix(r + 9) % nkeys[s]));
             tsdb_latest_result out[MAX_SERIES];
@@ -2143,8 +2185,10 @@ static void *client(void *arg)
             uint32_t n = (r >> 16) % 100 < (tier_n ? 65 : 85) ? 1 + (uint32_t)((r >> 24) % 20)
                                                                : 400 + (uint32_t)((r >> 24) % 2600);
             uint32_t id = atomic_fetch_add(&nwrites, 1);
-            if (id >= MAX_OPS)
+            if (id >= max_ops) {
+                atomic_store(&ops_cap_hit, true);
                 break;
+            }
             wop *w = &writes[id];
             w->series = s;
             w->keys = malloc(n * sizeof *w->keys);
@@ -2197,8 +2241,10 @@ static void *client(void *arg)
             }
         } else { /* a read of a key range */
             uint32_t idx = atomic_fetch_add(&nreads, 1);
-            if (idx >= MAX_OPS)
+            if (idx >= max_ops) {
+                atomic_store(&ops_cap_hit, true);
                 break;
+            }
             rop *q = &reads[idx];
             q->series = s;
             q->lo = pick_key(s, r >> 12, r >> 50, 50);
@@ -3905,7 +3951,7 @@ static void dump_history(const uint32_t *final)
     if (!f)
         return;
     uint32_t nw = atomic_load(&nwrites), nr = atomic_load(&nreads);
-    nw = nw > MAX_OPS ? MAX_OPS : nw, nr = nr > MAX_OPS ? MAX_OPS : nr;
+    nw = nw > max_ops ? max_ops : nw, nr = nr > max_ops ? max_ops : nr;
     for (int s = 0; s < nseries; s++)
         for (uint32_t k = 0; k < nkeys[s]; k++)
             fprintf(f, "K %d %u %lld\n", s, k, (long long)kts[s][k]);
@@ -3936,10 +3982,10 @@ static void dump_history(const uint32_t *final)
 static int check(const uint32_t *final)
 {
     uint32_t nw = atomic_load(&nwrites), nr = atomic_load(&nreads);
-    if (nw > MAX_OPS)
-        nw = MAX_OPS;
-    if (nr > MAX_OPS)
-        nr = MAX_OPS;
+    if (nw > max_ops)
+        nw = max_ops;
+    if (nr > max_ops)
+        nr = max_ops;
     bool *applied = calloc(nw, sizeof *applied);
     skeys = calloc(nw, sizeof *skeys);
     dcnt = calloc(koff[nseries] + 1, sizeof *dcnt);
@@ -4299,8 +4345,8 @@ static int check_follower(const uint32_t *final)
         return violations - before;
     }
     uint32_t nw = atomic_load(&nwrites), nr = atomic_load(&nfreads);
-    if (nw > MAX_OPS)
-        nw = MAX_OPS;
+    if (nw > max_ops)
+        nw = max_ops;
     if (nr > MAX_FREADS)
         nr = MAX_FREADS;
     unsigned ok = 0;
@@ -5220,8 +5266,11 @@ int main(int argc, char **argv)
         snprintf(outage_keeppath, sizeof outage_keeppath, "%s.outage-s%llu.server.log", dir, (unsigned long long)seed);
         unlink(outage_keeppath);
     }
-    writes = calloc(MAX_OPS, sizeof *writes);
-    reads = calloc(MAX_OPS, sizeof *reads);
+    if (getenv("JEPSEN_MAX_OPS") && atol(getenv("JEPSEN_MAX_OPS")) > 1000 && atol(getenv("JEPSEN_MAX_OPS")) < MAX_OPS)
+        max_ops = (uint32_t)atol(getenv("JEPSEN_MAX_OPS"));
+    pace_init();
+    writes = calloc(max_ops, sizeof *writes);
+    reads = calloc(max_ops, sizeof *reads);
     /* QUERY_LATEST: with nulls written and every answer checked against the acknowledged writes. Not where damage is
      * injected (a damaged part may decode to wrong rows, which the reads count as known) nor under outage (a volume is
      * away for seconds: its series answer UNAVAILABLE, which only the volume's own calls expect) nor in classes. */
@@ -5382,13 +5431,13 @@ int main(int argc, char **argv)
     JP_PHASE("the checker");
     uint32_t nw = atomic_load(&nwrites) - 1, nr = atomic_load(&nreads);
     unsigned ok = 0, info = 0, fail = 0, rok = 0, dels = 0, reps = 0, nulls_ok = 0;
-    for (uint32_t w = 1; w <= nw && w < MAX_OPS; w++) {
+    for (uint32_t w = 1; w <= nw && w < max_ops; w++) {
         ok += writes[w].st == ST_OK, info += writes[w].st == ST_INFO, fail += writes[w].st == ST_FAIL;
         dels += writes[w].kind == W_DELETE && writes[w].st == ST_OK;
         reps += writes[w].kind == W_REPLACE && writes[w].st == ST_OK;
         nulls_ok += writes[w].kind == W_NULL && writes[w].st == ST_OK;
     }
-    for (uint32_t i = 0; i < nr && i < MAX_OPS; i++)
+    for (uint32_t i = 0; i < nr && i < max_ops; i++)
         rok += reads[i].st == ST_OK;
     if (!(md || rot)) {
         printf("jepsen %s: %.0f s, %d clients, %d restarts; writes %u ok / %u indeterminate / %u failed, reads %u ok; "
@@ -5397,6 +5446,10 @@ int main(int argc, char **argv)
         printf("requests: the slowest answered one took %.3f s (the deadline is %d s)\n", (double)atomic_load(&req_worst_ns) / 1e9,
                req_deadline_s);
     }
+    if (atomic_load(&ops_cap_hit)) /* the clients stopped before the run did: what came after tested nothing (the pacing keeps an honest run below it) */
+        INCONCLUSIVE("ops-cap", "a client ran out of room for its history (%u writes, %u reads, %u answers of latest: MAX_OPS and MAX_LATEST) "
+                     "before the run ended; JEPSEN_OPS_PER_S paces the clients (now %lld ns between the operations of a client)\n",
+                     nw, nr, atomic_load(&nlats), (long long)pace_ns);
     /* kv coverage (every workload but misdirect and rot, which count epochs): a run whose clients were starved wrote almost nothing
      * (8 acknowledged writes and no delete in 20 s, in a run with 40 busy loops on 4 CPUs), and a tsdbd that drops every 20th write
      * then passes it, because the bug never fired. Too few acknowledged writes, or too few of the deletes and replaces the workload

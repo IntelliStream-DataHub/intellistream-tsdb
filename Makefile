@@ -1291,6 +1291,14 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	tests/jepsen/expect.sh gate 'the clients made [0-9]* acknowledged writes in 12 s (at least 100 expected)' \
 	    'a kv workload whose clients are starved (8 acknowledged writes in a run: a tsdbd that drops every 20th would pass it)' \
 	    env JEPSEN_CLIENT_NAP_MS=3000 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis none --seconds 12 --clients 2 || exit 1; \
+	tests/jepsen/expect.sh gate 'ran out of room for its history' \
+	    'clients that fill their history before the run ends (they stopped quietly, and the rest of the run tested nothing: round 14)' \
+	    env JEPSEN_MAX_OPS=1500 JEPSEN_OPS_PER_S=0 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis none --seconds 10 || exit 1; \
+	out=$$(JEPSEN_OPS_PER_S=400 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis none --seconds 10 2>&1); rc=$$?; \
+	    n=$$(echo "$$out" | sed -n 's/^jepsen none: .*; writes \([0-9]*\) ok .*reads \([0-9]*\) ok;.*/\1 \2/p' | awk '{print $$1+$$2}'); \
+	    if [ $$rc -ne 0 ] || [ -z "$$n" ] || [ "$$n" -gt 6000 ] || [ "$$n" -lt 400 ]; then \
+	        echo "jepsen-selftest: JEPSEN_OPS_PER_S=400 did not pace the clients ($$n writes and reads in 10 s, wanted 400 to 6000; rc $$rc)"; \
+	        echo "$$out" | tail -n 12; exit 1; fi; \
 	for spec in \
 	    'kill@20@killnoeffect@-@the nemesis issued 0 faults in 20 s.*it was idle@a kill that kills nothing was counted as a fault' \
 	    'pause@10@pausenoeffect@-@the nemesis issued 0 faults in 10 s.*it was idle@a pause that stops nothing was counted as a fault' \
