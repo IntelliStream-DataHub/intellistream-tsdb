@@ -1072,7 +1072,8 @@ static int promote_rule(const struct meta_volume *v, const struct meta_grant *g,
             return META_ERR_INVALID;
         rr[i] = (struct repl_fence_reply){x, g->reply[i].durable, g->reply[i].last_epoch, g->reply[i].rid};
     }
-    int rc = repl_meta_promote(&vm, g->epoch, g->isr_version, fenced, rr, (int)g->nreplies);
+    /* MUT(14) (versionless) drops the ISR version check here too: repl_meta_promote makes it again */
+    int rc = repl_meta_promote(&vm, g->epoch, MUT(14) ? v->isr_version : g->isr_version, fenced, rr, (int)g->nreplies);
     *out = vm;
     if (rc == REPL_E_STALE)
         return META_ERR_STALE;
@@ -1367,7 +1368,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         int rc = vol_get(m, g.number, touched, *ntouched, &v);
         if (rc)
             return rc;
-        if (g.epoch != v->epoch || g.isr_version != v->isr_version)
+        if (g.epoch != v->epoch || (g.isr_version != v->isr_version && !MUT(14)))
             return META_ERR_STALE;
         if (g.reason < 1 || g.reason > META_GR_LAST)
             return META_ERR_INVALID;

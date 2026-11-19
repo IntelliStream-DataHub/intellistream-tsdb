@@ -266,6 +266,15 @@ static void test_state_machine(void)
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
     promo_skip(&e, meta_volume(&m, 0), 2, 4, f24, 2, a4, 1, 300, 1); /* epoch 4 from 2: a replicated epoch rises by one */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && meta_volume(&m, 0)->epoch == 2);
+    {
+        /* the basis is the epoch AND the ISR version (design-cluster.md 6.2): fences sent before an ISR change answer
+         * for a set that no longer stands, so a grant at the right epoch with an older ISR version is STALE (MUT(14),
+         * mutant versionless, drops the version check) */
+        struct meta_volume old = *meta_volume(&m, 0);
+        old.isr_version--;
+        promo(&e, &old, 2, 4, f24, 2, a4, 1, 300);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE && meta_volume(&m, 0)->epoch == 2);
+    }
     /* D10: a replicated epoch stays below 2^22 (replica_epoch_begin refuses more): a promotion to 2^22 - 1 commits, one
      * to 2^22 is RANGE (on a copy whose epoch was set near the bound; MUT(9) drops the check) */
     {
