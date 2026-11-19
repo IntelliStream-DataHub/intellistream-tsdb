@@ -6330,6 +6330,13 @@ static void scen_cut(void)
             die("write %d: %s", acked, ers(rc));
     }
     await_isr(L, "rs", 3, 30000, "every replica in the ISR before the cut");
+    /* A replica still connecting while the 50 writes run may leave the ISR and come back: only shrinks after the cut
+     * count (clus8, 2026-11-19: ISR version 2 of one member at commit point 54, before the cut). */
+    char line[96];
+    snprintf(line, sizeof line, "ISR of 1 members (epoch %" PRIu64 ",", e0);
+    int shrunk0 = 0;
+    for (int i = 0; i < 3; i++)
+        shrunk0 += log_count(i, line);
     uint64_t t0 = now_ms();
     for (int i = 0; i < 3; i++)
         if (i != L) {
@@ -6340,9 +6347,7 @@ static void scen_cut(void)
     uint64_t tm = now_ms();
     if (v.epoch != e0 + 1 || Nw == L)
         die("the record of rs after the cut: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
-    char line[96];
-    snprintf(line, sizeof line, "ISR of 1 members (epoch %" PRIu64 ",", e0);
-    int moved = 0, shrunk = 0;
+    int moved = 0, shrunk = -shrunk0;
     for (int i = 0; i < 3; i++) {
         moved += log_count(i, "(reason 3); fences");
         shrunk += log_count(i, line);

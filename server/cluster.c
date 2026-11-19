@@ -20,9 +20,9 @@
  * other member keeps the state in memory from a **watch stream**: WATCH{from} to a core server, which answers with
  * the committed entries from `from` (from a ring of the last RING applied) or, when those are gone, a snapshot of its
  * state first and the entries after it. An entry whose index does not follow is a broken stream: reconnect. A core
- * server that has known no leader for NOLEADER_PROBE_NS (one booted from its files at start: until it sees one)
- * watches as well (into a second state); if what it sees is a configuration without itself, it was removed while away,
- * and it drops its core (its files stay) and goes on as a watcher. So does a core whose own configuration has not held
+ * server that has known no leader for NOLEADER_PROBE_NS (one booted from its files at start: until its own state
+ * holds it) watches as well (into a second state); if what it sees is a configuration without itself, it was removed
+ * while away, and it drops its core (its files stay) and goes on as a watcher. So does a core whose own configuration has not held
  * it for NOTMEMBER_DROP_NS.
  *
  * Durability: every action of the core is done inline, in its order (the hard state saved and synced, the log synced
@@ -1556,7 +1556,8 @@ enum cl_mutant {
     CLM_LEASESTALE = 8,   /* a node that reports itself the writer of a volume another leads still gets a lease */
     CLM_UPWAITS = 9,      /* a new Raft leader proposes a restarted member up only after node_timeout */
     CLM_CUTSHRINKS = 10,  /* a leader cut from its replicas shrinks the ISR to itself instead of stepping aside */
-    CLM_PROBELATE = 11    /* a core restarted from its files watches only after NOLEADER_PROBE_NS without a leader */
+    CLM_PROBELATE = 11,   /* a core restarted from its files watches only after NOLEADER_PROBE_NS without a leader */
+    CLM_PROBEINIT = 12    /* a watched state below the core's own log end (the INIT entry replayed) may drop the core */
 };
 static int cl_mutant(void)
 {
@@ -1576,6 +1577,7 @@ static int cl_mutant(void)
             : !strcmp(e, "upwaits")       ? CLM_UPWAITS
             : !strcmp(e, "cutshrinks")    ? CLM_CUTSHRINKS
             : !strcmp(e, "probelate")     ? CLM_PROBELATE
+            : !strcmp(e, "probeinit")     ? CLM_PROBEINIT
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -2392,10 +2394,8 @@ static void pump(void)
                 say("node %" PRIu32 " leads the metadata group (term %" PRIu64 ")", C.id, a.u.state.term);
             }
             C.role = a.u.state.role;
-            if (a.u.state.leader) {
+            if (a.u.state.leader)
                 C.leader_seen = now;
-                C.probe_at_start = 0;
-            }
             break;
         }
         default: break;
@@ -2885,7 +2885,13 @@ static void on_hb_ack(struct conn *c, struct rd *r)
 static void check_probe(void)
 {
     raft_config cfg;
-    if (C.r && C.wsm_on && C.wsm.applied >= C.sm.applied && config_of(&C.wsm, &cfg) && cfg.n &&
+    /* Only a watched state at or past everything this core holds can say it was removed: a stream replayed from index
+     * 1 passes the INIT entry, whose configuration holds the first node only, and a restarted core has applied nothing
+     * (C.sm.applied 0) while its log reaches past the entry that added it. */
+    uint64_t own = C.sm.applied;
+    if (C.r && raft_get_last(C.r) > own && cl_mutant() != CLM_PROBEINIT)
+        own = raft_get_last(C.r);
+    if (C.r && C.wsm_on && C.wsm.applied >= own && config_of(&C.wsm, &cfg) && cfg.n &&
         !raft_config_find(&cfg, C.id))
         drop_core(&C.wsm, "a voter's state says so");
 }
@@ -4998,9 +5004,17 @@ static void watch_duty(uint64_t now)
      * nothing before a leader reaches it) and NODE's seeds, and a leader dials it at the peer address the group holds,
      * which a restart elsewhere (--port 0, another host) changed: until the group records the new one nobody reaches
      * it and it reaches nobody, so its new incarnation (its volumes open only then, a volume leader's RESIGN with them)
-     * would wait for NOLEADER_PROBE_NS. The watch stream names the others' addresses; it ends when a leader is seen. */
+     * would wait for NOLEADER_PROBE_NS. The watch stream names the others' addresses. It goes on, a leader seen or not,
+     * until the core's own state holds this node: a leader's message is not enough (test_cluster reseed: a learner
+     * whose log a damaged install emptied heard leader 1 once, stopped watching, and was removed as a learner while its
+     * empty state named nobody to answer; never dropping its core, it sat as a follower of no configuration). */
+    if (C.probe_at_start && C.r) {
+        raft_config own;
+        if (raft_get_leader(C.r) && config_of(&C.sm, &own) && in_config(&own, C.id))
+            C.probe_at_start = 0;
+    }
     int early = C.probe_at_start && cl_mutant() != CLM_PROBELATE;
-    int want = !C.r || (raft_get_leader(C.r) == 0 && (early || since(now, C.leader_seen) >= NOLEADER_PROBE_NS));
+    int want = !C.r || early || (raft_get_leader(C.r) == 0 && since(now, C.leader_seen) >= NOLEADER_PROBE_NS);
     struct conn *w = conn_by_serial(C.watch_conn);
     if (!want) {
         if (w)
