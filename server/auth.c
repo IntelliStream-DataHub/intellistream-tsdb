@@ -921,9 +921,11 @@ int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need)
     return need == NEED_ANY ? ids_check(au, ids, n, need, true) : ids_check(au, ids, n, need, false);
 }
 
-int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
+/* What auth_check_login and auth_check_ids share: an error, 0 (decided: allowed), or 1 with the rights the op's series
+ * need in *need (P_SERIES, no right on `all` that covers it). quiet: the second caller logs nothing. */
+static int check_pre(auth_conn *a, const auth_op *e, uint8_t op, const uint8_t *p, size_t len, uint8_t *need,
+                     bool quiet)
 {
-    const auth_op *e = &auth_ops[op];
     if (a->state != AS_IN)
         return e->who == P_ANY || e->who == P_PRE ? 0 : TSDB_ERR_AUTH;
     if (e->who == P_PRE)
@@ -937,7 +939,7 @@ int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
             return 0;
         static _Atomic time_t last;
         time_t t = time(NULL);
-        if (atomic_exchange_explicit(&last, t, memory_order_relaxed) != t)
+        if (!quiet && atomic_exchange_explicit(&last, t, memory_order_relaxed) != t)
             fprintf(stderr, "tsdbd: --no-auth: user admin op %u refused; manage users with 'tsdb <dir> user'\n",
                     op);
         return TSDB_ERR_DENIED;
@@ -954,33 +956,57 @@ int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
     case P_COMMIT: return au->writer ? 0 : TSDB_ERR_DENIED;
     default: break;
     }
-    uint8_t need = e->need;
+    *need = e->need;
     if (e->create_at && len >= e->create_at && p[e->create_at - 1])
-        need = R_INSERT;
-    if (enough(au->all, need))
-        return 0;
-    tsdb_sid id;
+        *need = R_INSERT;
+    return enough(au->all, *need) ? 0 : 1;
+}
+
+int auth_check_login(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
+{
+    const auth_op *e = &auth_ops[op];
+    uint8_t need = 0;
+    int rc = check_pre(a, e, op, p, len, &need, false);
+    if (rc <= 0)
+        return rc;
     switch (e->where) {
     case W_ID0:
-    case W_ID8: {
-        size_t at = e->where == W_ID0 ? 0 : 8;
-        if (len < at + 8)
-            return TSDB_ERR_INVALID; /* no series to check: malformed, as the handler would say */
-        memcpy(&id, p + at, 8);
-        if (id == TSDB_MANY_SERIES && e->where == W_ID8 && op != TSDB_OP_REPLACE_RANGE)
-            return 0; /* an id per row: the handler checks each (auth_ids) */
-        return auth_id(a, id, need);
-    }
+    case W_ID8:
+    case W_MULTI: return 0; /* ids: auth_check_ids; QUERY_MULTI per series, in the handler (A17) */
     case W_NAME3: {
         uint16_t n;
         if (len < 3 || (memcpy(&n, p + 1, 2), n == 0 || len < 3u + n) || n > SERIES_NAME_MAX)
             return TSDB_ERR_INVALID; /* the engine would refuse it too: no matching on names it never holds */
-        uint8_t r = rights_of(au->u, (const char *)p + 3, n); /* no lock: the index was built before sharing */
+        uint8_t r = rights_of(a->au->u, (const char *)p + 3, n); /* no lock: the index was built before sharing */
         return enough(r, need) ? 0 : TSDB_ERR_DENIED;
     }
-    case W_MULTI: return 0; /* per series, in the handler (A17) */
     default: return TSDB_ERR_DENIED;
     }
+}
+
+int auth_check_ids(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
+{
+    const auth_op *e = &auth_ops[op];
+    if (e->where != W_ID0 && e->where != W_ID8)
+        return 0; /* auth_check_login decided */
+    uint8_t need = 0;
+    int rc = check_pre(a, e, op, p, len, &need, true);
+    if (rc <= 0)
+        return rc;
+    size_t at = e->where == W_ID0 ? 0 : 8;
+    if (len < at + 8)
+        return TSDB_ERR_INVALID; /* no series to check: malformed, as the handler would say */
+    tsdb_sid id;
+    memcpy(&id, p + at, 8);
+    if (id == TSDB_MANY_SERIES && e->where == W_ID8 && op != TSDB_OP_REPLACE_RANGE)
+        return 0; /* an id per row: the handler checks each (auth_ids) */
+    return auth_id(a, id, need);
+}
+
+int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
+{
+    int rc = auth_check_login(a, op, p, len);
+    return rc ? rc : auth_check_ids(a, op, p, len);
 }
 
 /* ------------------------------------------------------------ admin ops */

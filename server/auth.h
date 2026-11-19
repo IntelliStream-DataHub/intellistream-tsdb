@@ -82,6 +82,12 @@ int auth_fresh(auth_conn *a);
 /* The op table's checks for a request (who, and the series at W_ID0, W_ID8 or W_NAME3): 0, TSDB_ERR_DENIED,
  * TSDB_ERR_INVALID (too short to hold its series), TSDB_ERR_AUTH (not logged in, or AUTH_* answered elsewhere). */
 int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len);
+/* auth_check in two halves, so that a request can be routed between them (a series on another node is answered there):
+ * auth_check_login (logged in, the op allowed to this user, the rights on a series named in the request) and
+ * auth_check_ids (the rights on the series id at W_ID0 / W_ID8, through its name in this node's volumes). Call
+ * auth_check_ids only after auth_check_login returned 0; auth_check is both. */
+int auth_check_login(auth_conn *a, uint8_t op, const uint8_t *p, size_t len);
+int auth_check_ids(auth_conn *a, uint8_t op, const uint8_t *p, size_t len);
 /* The rights on one id / every id of a request (all or nothing, A16): 0 or TSDB_ERR_DENIED. */
 int auth_id(auth_conn *a, tsdb_sid id, uint8_t need);
 int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need);
