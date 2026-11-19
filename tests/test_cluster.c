@@ -37,6 +37,7 @@
 #include "raft/raft.h"
 #include "raft/raft_log.h"
 #include "tsdb_client.h"
+#include "users.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -2734,6 +2735,304 @@ static void scen_users(void)
     printf("  restarted member caught up only after hearing the leader\n");
 }
 
+/* writes `text` and a newline to base/NAME; its path in out */
+static void put_file(const char *name, const char *text, char *out, size_t n)
+{
+    snprintf(out, n, "%s/%s", base, name);
+    FILE *f = fopen(out, "w");
+    if (!f || fprintf(f, "%s\n", text) < 0 || fclose(f) != 0)
+        die("cannot write %s", out);
+}
+
+/* a login as user on server i: 0, or the error (the client does not retry AUTH_START) */
+static int try_login(int i, const char *user, const char *pw)
+{
+    tsdbc *c = NULL;
+    int rc = tsdbc_connect_auth("127.0.0.1", cports[i], user, pw, &c);
+    if (rc == 0)
+        tsdbc_close(c);
+    return rc;
+}
+
+/* waits for a login that works (a change reaches a server's copy a heartbeat after it committed) */
+static void await_login(int i, const char *user, const char *pw)
+{
+    uint64_t t0 = now_ms();
+    int rc;
+    while ((rc = try_login(i, user, pw)) != 0) {
+        if (now_ms() - t0 > WAIT_MS)
+            die("server %d: no login as %s: %s", i, user, ers(rc));
+        usleep(100000);
+    }
+}
+
+static tsdbc *login_on(int i, const char *user, const char *pw)
+{
+    tsdbc *c = NULL;
+    int rc = tsdbc_connect_auth("127.0.0.1", cports[i], user, pw, &c);
+    if (rc != 0)
+        die("server %d: login as %s: %s", i, user, ers(rc));
+    return c;
+}
+
+/* S2-1, login from the metadata group's copy on every server (server/auth.c "The cluster store"): a user added once
+ * logs in on all three; a password changed over the client protocol through a follower: the old one is refused on
+ * every server once the reply came (the change is answered after every member applied it, and a member's watch is
+ * given the users before its heartbeat reports the index); a grant revoked and then the user dropped while a session
+ * is open on the third server: its next request is DENIED, then AUTH; a user dropped while the third server was down
+ * (SIGKILL), which restarts with its Raft core held (it hears the leader but applies nothing, its copy from its last
+ * snapshot still has the user): every login there is UNAVAILABLE, never AUTH and never in; once it applies, the dropped
+ * user is refused and root logs in. Mutants (TSDB_AUTH_MUTANT): authlocalusers (the server does not start: its root
+ * has no USERS), adminlocal (the old password still works), loginbeforecatchup (the dropped user logs in). */
+static void scen_login(void)
+{
+    scenario("login");
+    const char *mut = getenv("TSDB_AUTH_MUTANT");
+    static char mpenv[128];
+    snprintf(mpenv, sizeof mpenv, "TSDB_AUTH_MUTANT=%s", mut ? mut : "");
+    for (int i = 0; i < 3; i++) {
+        auth_on[i] = 1;
+        envs[i] = "snap_every=2";
+        if (mut)
+            penv[i] = mpenv;
+        start(i);
+    }
+    char pw[PATH_MAX + 80], pw2[PATH_MAX + 80], args[PATH_MAX * 2 + 512], out[8192], p[3][META_ADDR_MAX];
+    put_file("pw", "root-pw", pw, sizeof pw);
+    put_file("pw2", "alice-pw", pw2, sizeof pw2);
+    for (int i = 0; i < 3; i++)
+        peer_of(i, p[i], sizeof p[i]);
+    /* before INIT no server has heard a leader: the barrier, not "no such user" */
+    int rc = try_login(0, "root", "root-pw");
+    if (rc != TSDB_ERR_UNAVAILABLE)
+        die("a login before the cluster exists: %s, not UNAVAILABLE", ers(rc));
+    snprintf(args, sizeof args,
+             "cluster init %s --secret-file %s --node-timeout-ms 1500 --heartbeat-ms 200 --voter-replace-s 600 "
+             "--superuser root --password-file %s",
+             p[0], secret_path, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user root: uid 1, index "))
+        die("cluster init --superuser root: %s", out);
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    for (int i = 0; i < 3; i++)
+        await_view(i, p_users_caught_up, NULL, "users caught up");
+
+    snprintf(args, sizeof args, "cluster user add %s alice --password-file %s --secret-file %s", p[0], pw2,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user alice: uid "))
+        die("user add alice: %s", out);
+    for (int i = 0; i < 3; i++) {
+        await_login(i, "root", "root-pw");
+        if ((rc = try_login(i, "alice", "alice-pw")) != 0)
+            die("server %d: alice, added before, does not log in: %s", i, ers(rc));
+        if ((rc = try_login(i, "alice", "wrong")) != TSDB_ERR_AUTH)
+            die("server %d: alice with a wrong password: %s, not AUTH", i, ers(rc));
+    }
+    printf("  one cluster user add: the user logs in on all three servers\n");
+
+    /* passwd over the client protocol, through a follower */
+    tsdbc *r1 = login_on(1, "root", "root-pw");
+    if ((rc = tsdbc_user_password(r1, "alice", "alice-new", 0)) != 0)
+        die("passwd of alice through server 1: %s", ers(rc));
+    for (int i = 0; i < 3; i++) {
+        if ((rc = try_login(i, "alice", "alice-pw")) != TSDB_ERR_AUTH)
+            die("server %d: alice's old password after the passwd was answered: %s, not AUTH", i, ers(rc));
+        if ((rc = try_login(i, "alice", "alice-new")) != 0)
+            die("server %d: alice's new password: %s", i, ers(rc));
+    }
+    /* a create through a follower: the name taken is refused as by one server */
+    if ((rc = tsdbc_user_create(r1, "alice", "x-pw", 0, 0)) != TSDB_ERR_INVALID)
+        die("a create of a name taken: %s, not INVALID", ers(rc));
+    printf("  passwd through a follower: the old password refused on every server after the reply\n");
+
+    /* a session open on server 2: a grant reaches it, its revoke (through server 0) and alice's drop too */
+    tsdbc *a2 = login_on(2, "alice", "alice-new");
+    tsdb_sid sid = 0;
+    if ((rc = tsdbc_series(a2, "plant.x", 0, &sid)) != TSDB_ERR_DENIED)
+        die("alice's lookup without a grant: %s, not DENIED", ers(rc));
+    if ((rc = tsdbc_grant(r1, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+        die("grant: %s", ers(rc));
+    if ((rc = tsdbc_series(a2, "plant.x", 0, &sid)) != TSDB_ERR_NOTFOUND)
+        die("alice's lookup after the grant was answered: %s, not NOTFOUND", ers(rc));
+    tsdbc *r0 = login_on(0, "root", "root-pw");
+    if ((rc = tsdbc_revoke(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+        die("revoke: %s", ers(rc));
+    if ((rc = tsdbc_series(a2, "plant.x", 0, &sid)) != TSDB_ERR_DENIED)
+        die("alice's open session on server 2 after the revoke was answered: %s, not DENIED", ers(rc));
+    if ((rc = tsdbc_user_drop(r0, "alice")) != 0)
+        die("drop alice: %s", ers(rc));
+    if ((rc = tsdbc_series(a2, "plant.x", 0, &sid)) != TSDB_ERR_AUTH)
+        die("alice's open session on server 2 after her drop was answered: %s, not AUTH", ers(rc));
+    tsdbc_close(a2);
+    for (int i = 0; i < 3; i++)
+        if ((rc = try_login(i, "alice", "alice-new")) != TSDB_ERR_AUTH)
+            die("server %d: alice logs in after her drop: %s", i, ers(rc));
+    printf("  an open session on another server: the revoke is DENIED, the drop AUTH on its next request\n");
+
+    /* the restart barrier: carol dropped while server 2 is down; it comes back with its Raft core held */
+    snprintf(args, sizeof args, "cluster user add %s carol --password-file %s --secret-file %s", p[0], pw2,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user carol: uid "))
+        die("user add carol: %s", out);
+    snprintf(args, sizeof args, "cluster user add %s dave --password-file %s --secret-file %s", p[0], pw2,
+             secret_path); /* a second entry: server 2's last snapshot (snap_every=2) holds carol */
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user dave: uid "))
+        die("user add dave: %s", out);
+    await_login(2, "carol", "alice-pw");
+    stop(2, SIGKILL);
+    if ((rc = tsdbc_user_drop(r0, "carol")) != 0) /* server 2 lags: answered after the wait, OK */
+        die("drop carol with server 2 down: %s", ers(rc));
+    char holdraft[PATH_MAX + 96];
+    server_dir(2, holdraft, sizeof holdraft);
+    strcat(holdraft, "/state/holdraft");
+    FILE *hr = fopen(holdraft, "w");
+    if (!hr || fclose(hr) != 0)
+        die("cannot make %s", holdraft);
+    envs[2] = "snap_every=2,hold_raft_file=1";
+    start(2);
+    uint64_t t0 = now_ms();
+    int tries = 0;
+    while (now_ms() - t0 < 2500) {
+        struct view v;
+        view(2, &v);
+        int has = meta_user(&v.m, "carol") != NULL;
+        view_free(&v);
+        if (!has)
+            die("server 2 applied carol's drop with its Raft core held (the test has no teeth)");
+        if ((rc = try_login(2, "carol", "alice-pw")) != TSDB_ERR_UNAVAILABLE)
+            die("server 2, not caught up, its copy still holding carol: carol's login %s, not UNAVAILABLE", ers(rc));
+        if ((rc = try_login(2, "root", "root-pw")) != TSDB_ERR_UNAVAILABLE)
+            die("server 2, not caught up: root's login %s, not UNAVAILABLE", ers(rc));
+        tries++;
+        usleep(100000);
+    }
+    if (unlink(holdraft) != 0)
+        die("cannot remove %s", holdraft);
+    await_view(2, p_users_caught_up, NULL, "users caught up once it applies");
+    if ((rc = try_login(2, "carol", "alice-pw")) != TSDB_ERR_AUTH)
+        die("server 2, caught up: carol, dropped while it was down: %s, not AUTH", ers(rc));
+    if ((rc = try_login(2, "root", "root-pw")) != 0 || (rc = try_login(2, "dave", "alice-pw")) != 0)
+        die("server 2, caught up: root or dave: %s", ers(rc));
+    printf("  restarted with its Raft core held: %d logins UNAVAILABLE; caught up, the dropped user is refused\n",
+           tries);
+    tsdbc_close(r0);
+    tsdbc_close(r1);
+}
+
+/* `tsdb cluster user import PEER DIR...` (tools/cluster-user-cli.c): the USERS of two stopped servers, the same (a
+ * user with 5,000 grants among them), go in as they are: the verifiers copied, so the passwords log in on a cluster
+ * server, the grants count and are in force; a rerun skips what the group holds the same. Two that differ (a grant
+ * more in one, a user missing from the other) import nothing and name each such user, until --from-node says whose
+ * copy wins. Mutant importmerge (differing users imported silently) must fail here. */
+static void scen_userimport(void)
+{
+    scenario("userimport");
+    auth_on[0] = 1;
+    start(0);
+    init_fast(0);
+    char pw[PATH_MAX + 80], args[PATH_MAX * 4 + 512], out[16384], p0[META_ADDR_MAX];
+    char a[PATH_MAX + 80], b[PATH_MAX + 80], c[PATH_MAX + 80], d[PATH_MAX + 80], f1[PATH_MAX + 96], f2[PATH_MAX + 96];
+    peer_of(0, p0, sizeof p0);
+    put_file("pw", "imported-pw", pw, sizeof pw);
+    snprintf(a, sizeof a, "%s/old-a", base);
+    snprintf(b, sizeof b, "%s/old-b", base);
+    snprintf(c, sizeof c, "%s/old-c", base);
+    snprintf(d, sizeof d, "%s/old-d", base);
+    const char *dirs[4] = {a, b, c, d};
+    for (int k = 0; k < 4; k++)
+        if (mkdir(dirs[k], 0755) != 0)
+            die("mkdir %s: %s", dirs[k], strerror(errno));
+    snprintf(args, sizeof args, "%s user add ops --superuser --password-file %s", a, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("`tsdb %s`: %s", args, out);
+    snprintf(args, sizeof args, "%s user add big --password-file %s", a, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("`tsdb %s`: %s", args, out);
+    users us;
+    int rc = users_open(&us, a, true);
+    if (rc != 0)
+        die("users_open %s: %s", a, ers(rc));
+    for (int g = 0; g < 5000; g++) {
+        char sel[64];
+        int sl = snprintf(sel, sizeof sel, "plant.s%04d", g);
+        if ((rc = users_grant(&us, 0, "big", TSDB_SEL_NAME, sel, (size_t)sl, TSDB_RIGHT_READ)) != 0)
+            die("grant %d: %s", g, ers(rc));
+    }
+    users_close(&us);
+    snprintf(f1, sizeof f1, "%s/USERS", a);
+    snprintf(f2, sizeof f2, "%s/USERS", b);
+    snprintf(args, sizeof args, "cp %s %s", f1, f2);
+    if (system(args) != 0)
+        die("%s", args);
+
+    snprintf(args, sizeof args, "cluster user import %s %s %s --secret-file %s", p0, a, b, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "imported 2 users (0 in the group already)"))
+        die("import of two equal USERS: %s", out);
+    snprintf(args, sizeof args, "cluster user list %s big --secret-file %s", p0, secret_path);
+    static char big[1 << 20];
+    if (cli_run(args, NULL, big, sizeof big) != 0)
+        die("user list big: %.400s", big);
+    int ng = 0;
+    for (const char *q = big; (q = strstr(q, "\ngrant name:plant.s")); q++)
+        ng++;
+    if (ng != 5000)
+        die("big has %d grants in the group, not 5000: %.400s", ng, big);
+    await_login(0, "big", "imported-pw");
+    tsdbc *cb = login_on(0, "big", "imported-pw");
+    tsdb_sid sid;
+    if ((rc = tsdbc_series(cb, "plant.s4999", 0, &sid)) != TSDB_ERR_NOTFOUND)
+        die("big's lookup of a name granted: %s, not NOTFOUND", ers(rc));
+    if ((rc = tsdbc_series(cb, "plant.t0", 0, &sid)) != TSDB_ERR_DENIED)
+        die("big's lookup of a name not granted: %s, not DENIED", ers(rc));
+    tsdbc_close(cb);
+    await_login(0, "ops", "imported-pw");
+    snprintf(args, sizeof args, "cluster user import %s %s %s --secret-file %s", p0, a, b, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "imported 0 users (2 in the group already)"))
+        die("the import again: %s", out);
+    printf("  two equal USERS imported (5,000 grants; the passwords log in); a rerun skips them\n");
+
+    /* c: dora and eve; d: dora with a grant more, no eve */
+    snprintf(args, sizeof args, "%s user add dora --password-file %s", c, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("`tsdb %s`: %s", args, out);
+    snprintf(f1, sizeof f1, "%s/USERS", c);
+    snprintf(f2, sizeof f2, "%s/USERS", d);
+    snprintf(args, sizeof args, "cp %s %s", f1, f2);
+    if (system(args) != 0)
+        die("%s", args);
+    snprintf(args, sizeof args, "%s user add eve --password-file %s", c, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("`tsdb %s`: %s", args, out);
+    snprintf(args, sizeof args, "%s user grant dora read prefix:line3.", d);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("`tsdb %s`: %s", args, out);
+    snprintf(args, sizeof args, "cluster user import %s %s %s --secret-file %s", p0, c, d, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) == 0 || !strstr(out, "user dora differs between the servers") ||
+        !strstr(out, "user eve differs between the servers") || !strstr(out, "2 users differ") ||
+        !strstr(out, "nothing imported"))
+        die("import of two USERS that differ: %s", out);
+    for (int k = 0; k < 2; k++) {
+        snprintf(args, sizeof args, "cluster user list %s %s --secret-file %s", p0, k ? "eve" : "dora", secret_path);
+        if (cli_run(args, NULL, out, sizeof out) == 0)
+            die("%s is in the group after an import that differed: %s", k ? "eve" : "dora", out);
+    }
+    snprintf(args, sizeof args, "cluster user import %s %s %s --from-node %s --secret-file %s", p0, c, d, d,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "imported 1 users"))
+        die("import with --from-node: %s", out);
+    snprintf(args, sizeof args, "cluster user list %s dora --secret-file %s", p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "grant prefix:line3."))
+        die("dora as old-d had her: %s", out);
+    snprintf(args, sizeof args, "cluster user list %s eve --secret-file %s", p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) == 0)
+        die("eve, absent from the winning copy, was imported: %s", out);
+    printf("  two USERS that differ: nothing imported, each user named; --from-node takes that copy\n");
+}
+
 /* 3 servers, a volume of 3 replicas: every server makes v1 with the right META and REPL and opens it once the
  * metadata group recorded its open generation; the leader (TSDB_CLUSTER_WRITES=1) takes writes, the replicas
  * refuse them (UNAVAILABLE, FENCED, naming the volume); a restart keeps the rid and raises the generation, which is
@@ -3044,7 +3343,9 @@ static void scen_volrefuse(void)
         die("a node with a local volume started (%d, 0x%x)", rc, th_status);
     printf("  --wal-sync-ms 10, a series in the root and a local volume are refused at start, naming them\n");
 
-    /* login per node: a superuser in the root's USERS writes to a volume of 1 replica */
+    /* S2-1: a root that holds USERS is refused (with and without login: the file would look valid), naming the
+     * import; without it the server starts, marks its root, and `tsdb DIR user` refuses there naming `tsdb cluster
+     * user`; a superuser of the metadata group writes to a volume of 1 replica */
     server_dir(3, dir, sizeof dir);
     snprintf(in, sizeof in, "%s/pw", base);
     FILE *f = fopen(in, "w");
@@ -3053,10 +3354,33 @@ static void scen_volrefuse(void)
     snprintf(args, sizeof args, "%s user add admin --superuser --password-file %s", dir, in);
     if (cli_run(args, NULL, out, sizeof out) != 0)
         die("`tsdb %s`: %s", args, out);
-    auth_on[3] = 1;
+    for (int on = 0; on < 2; on++) {
+        auth_on[3] = on;
+        rc = start_try(3);
+        if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) == 0 ||
+            !log_has(3, "never from its root: carry them over with 'tsdb cluster user import PEER "))
+            die("a cluster node with USERS in its root started (login %s; %d, 0x%x)", on ? "on" : "off", rc,
+                th_status);
+    }
+    char upath[PATH_MAX + 96];
+    snprintf(upath, sizeof upath, "%s/USERS", dir);
+    if (unlink(upath) != 0)
+        die("unlink %s: %s", upath, strerror(errno));
     penv[3] = "TSDB_CLUSTER_WRITES=1";
     start(3);
+    snprintf(args, sizeof args, "%s user add admin --superuser --password-file %s", dir, in);
+    if (cli_run(args, NULL, out, sizeof out) == 0 || !strstr(out, "use 'tsdb cluster user add PEER"))
+        die("`tsdb DIR user add` on a cluster node's root: %s", out);
+    if (access(upath, F_OK) == 0)
+        die("`tsdb DIR user add` made %s on a cluster node's root", upath);
     init_fast(3);
+    char p3[META_ADDR_MAX];
+    peer_of(3, p3, sizeof p3);
+    snprintf(args, sizeof args, "cluster user add %s admin --superuser --password-file %s --secret-file %s", p3, in,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user admin: uid "))
+        die("cluster user add admin: %s", out);
+    printf("  a root USERS is refused naming the import; `tsdb DIR user` refuses on a cluster root\n");
     uint32_t num;
     if ((rc = vol_add(3, "solo", 1, &num)) != 0 || num != 1)
         die("volume add solo: %s", cluster_strerror(rc));
@@ -3071,7 +3395,7 @@ static void scen_volrefuse(void)
     if (rows_of(c, id) != 3)
         die("the rows written with a login are not read back");
     tsdbc_close(c);
-    printf("  login on a cluster node uses its own USERS; a volume of 1 replica takes writes\n");
+    printf("  login with a user of the metadata group; a volume of 1 replica takes writes\n");
 }
 
 
@@ -6585,7 +6909,7 @@ int main(int argc, char **argv)
                {"torn", scen_torn},         {"rebase", scen_rebase},
                {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"stall", scen_stall},
-               {"witness", scen_witness},   {"users", scen_users},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
+               {"witness", scen_witness},   {"users", scen_users}, {"login", scen_login}, {"userimport", scen_userimport},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},

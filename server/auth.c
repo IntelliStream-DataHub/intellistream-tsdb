@@ -170,9 +170,10 @@ static const auth_group_ops *group;
 static pthread_cond_t group_cv;
 static uint64_t group_applied, group_pushes;
 /* TSDB_AUTH_MUTANT (tests only): authlocalusers (a cluster node reads its root's USERS), adminlocal (an admin op is
- * answered without reaching the group), loginbeforecatchup (the restart barrier ignored) */
+ * answered without reaching the group), loginbeforecatchup (the restart barrier ignored), barrierifempty (the barrier
+ * holds only while the copy has no users: a restarted server's copy from its snapshot lets logins in) */
 static int mutant;
-enum { MUT_LOCALUSERS = 1, MUT_ADMINLOCAL, MUT_EARLYLOGIN };
+enum { MUT_LOCALUSERS = 1, MUT_ADMINLOCAL, MUT_EARLYLOGIN, MUT_BARRIEREMPTY };
 
 bool auth_enabled(void) { return enabled; }
 
@@ -429,7 +430,8 @@ void auth_set_group(const auth_group_ops *ops)
     group = ops;
     const char *m = getenv("TSDB_AUTH_MUTANT");
     mutant = !m ? 0 : !strcmp(m, "authlocalusers") ? MUT_LOCALUSERS : !strcmp(m, "adminlocal") ? MUT_ADMINLOCAL
-                   : !strcmp(m, "loginbeforecatchup") ? MUT_EARLYLOGIN : 0;
+                   : !strcmp(m, "loginbeforecatchup") ? MUT_EARLYLOGIN
+                   : !strcmp(m, "barrierifempty")     ? MUT_BARRIEREMPTY : 0;
     if (mutant)
         fprintf(stderr, "tsdbd: TSDB_AUTH_MUTANT=%s (a test of the tests)\n", m);
     if (mutant == MUT_LOCALUSERS)
@@ -706,8 +708,16 @@ int auth_scram_start(auth_conn *a, const uint8_t *p, size_t len, uint8_t *out, s
         return TSDB_ERR_INVALID; /* a connection logs in once */
     /* the restart barrier (D-S2): until this server heard the group's commit index and applied it, its copy may hold
      * a user dropped (a password changed) while it was down; the client retries after retry_after, never AUTH */
-    if (a->state == AS_NONE && group && mutant != MUT_EARLYLOGIN && !group->caught_up())
-        return TSDB_ERR_UNAVAILABLE;
+    if (a->state == AS_NONE && group && mutant != MUT_EARLYLOGIN && !group->caught_up()) {
+        bool some = false;
+        if (mutant == MUT_BARRIEREMPTY) {
+            pthread_mutex_lock(&auth_mu);
+            some = snap && snap->n > 0;
+            pthread_mutex_unlock(&auth_mu);
+        }
+        if (!some)
+            return TSDB_ERR_UNAVAILABLE;
+    }
     if (a->state != AS_NONE) { /* a second AUTH_START is a client's bug; after a failure the answer stays AUTH */
         int rc = a->state == AS_STARTED ? TSDB_ERR_INVALID : TSDB_ERR_AUTH;
         scram_clear(a);

@@ -3996,10 +3996,12 @@ static void users_duty(uint64_t now)
         if (!C.users_floor && commit && raft_get_term_at(C.r, commit) == raft_get_term(C.r))
             C.users_floor = commit;
     }
+    /* before the replies: a member this server counts as caught up has its watch given the change; and before the
+     * barrier opens, so a login it lets in finds the users the copy has at the floor, not the ones from before */
+    users_push();
     if (C.users_floor && (C.sm.applied >= C.users_floor || cl_mutant() == CLM_FLOORNOAPPLIED) &&
         !atomic_load(&g_users_ok))
         atomic_store_explicit(&g_users_ok, 1, memory_order_release);
-    users_push(); /* before the replies: a member this server counts as caught up has its watch given the change */
 
     for (size_t i = 0; i < C.nuwait;) {
         struct uwait *w = &C.uwait[i];
