@@ -1557,7 +1557,8 @@ enum cl_mutant {
     CLM_UPWAITS = 9,      /* a new Raft leader proposes a restarted member up only after node_timeout */
     CLM_CUTSHRINKS = 10,  /* a leader cut from its replicas shrinks the ISR to itself instead of stepping aside */
     CLM_PROBELATE = 11,   /* a core restarted from its files watches only after NOLEADER_PROBE_NS without a leader */
-    CLM_PROBEINIT = 12    /* a watched state below the core's own log end (the INIT entry replayed) may drop the core */
+    CLM_PROBEINIT = 12,   /* a watched state below the core's own log end (the INIT entry replayed) may drop the core */
+    CLM_DEPOSEDSTUCK = 13 /* a record's leader deposed by a fence no promotion followed is never taken as resigned */
 };
 static int cl_mutant(void)
 {
@@ -1578,6 +1579,7 @@ static int cl_mutant(void)
             : !strcmp(e, "cutshrinks")    ? CLM_CUTSHRINKS
             : !strcmp(e, "probelate")     ? CLM_PROBELATE
             : !strcmp(e, "probeinit")     ? CLM_PROBEINIT
+            : !strcmp(e, "deposedstuck")  ? CLM_DEPOSEDSTUCK
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -4902,8 +4904,55 @@ static int cut_move(const struct meta_volume *v, const struct cluster_isr_req *q
     return promo_find(v->number) != NULL;
 }
 
+/* The record's leader is up and heard, but its driver does not lead: it answered the fence of a promotion that was then
+ * given up (a PLANNED move whose candidates never answered: cut_move's "no replica to move", or a promotion lost with
+ * the Raft leader that ran it). Its core holds the higher fence and waits for a record past it that nobody proposes,
+ * and the volume has no writer for good (jepsen-cluster meta,classes kill, 2026-11-19: ISR version 158 to the end).
+ * Once that has lasted DEPOSED_HOLD_NS with no promotion under way it counts as a resignation: the group fences
+ * again and may pick the old leader itself at a new epoch. A new leader's reopen and a restarted leader's own RESIGN
+ * take far less. *own is this server's report, gathered at most once per call (the driver's state, cut_move's way). */
+#define DEPOSED_HOLD_NS (3000 * MS)
+static int leader_deposed(const struct meta_volume *v, uint64_t now, struct cluster_report *own, int *have_own)
+{
+    static struct { uint32_t vol, leader; uint64_t epoch, ns; } seen[16];
+    static unsigned nseen;
+    int role = -1;
+    if (v->leader == C.id) {
+        if (!*have_own) {
+            memset(own, 0, sizeof *own);
+            if (g_reporter)
+                g_reporter(g_reporter_arg, own);
+            *have_own = 1;
+        }
+        for (uint32_t i = 0; i < own->nvols && i < CLUSTER_REPORT_VOLS; i++)
+            if (own->vols[i].volume == v->number)
+                role = own->vols[i].role;
+    } else if (heard_fresh(v->leader, now)) {
+        const struct heard *h = heard_get(v->leader);
+        for (uint32_t i = 0; h && i < h->nvols; i++)
+            if (h->vols[i].v.volume == v->number)
+                role = h->vols[i].v.role;
+    }
+    unsigned si = 0;
+    while (si < nseen && seen[si].vol != v->number)
+        si++;
+    if (role != CL_ROLE_NONE || cl_mutant() == CLM_DEPOSEDSTUCK) {
+        if (si < nseen)
+            seen[si] = seen[--nseen];
+        return 0;
+    }
+    if (si == nseen)
+        si = nseen < sizeof seen / sizeof seen[0] ? nseen++ : (unsigned)(now % (sizeof seen / sizeof seen[0]));
+    else if (seen[si].leader == v->leader && seen[si].epoch == v->epoch)
+        return since(now, seen[si].ns) >= DEPOSED_HOLD_NS;
+    seen[si].vol = v->number, seen[si].leader = v->leader, seen[si].epoch = v->epoch, seen[si].ns = now;
+    return 0;
+}
+
 static void promote_duty(uint64_t now)
 {
+    static struct cluster_report own;
+    int have_own = 0;
     unsigned nres = g_nresign;
     g_nresign = 0;
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER) {
@@ -4942,6 +4991,12 @@ static void promote_duty(uint64_t now)
             for (unsigned r = 0; r < nres && !reason; r++)
                 if (g_resign[r].vol == v->number && g_resign[r].from == v->leader && g_resign[r].epoch == v->epoch)
                     reason = META_GR_RESIGNED;
+            if (!reason && m && m->state == META_UP && leader_deposed(v, now, &own, &have_own)) {
+                say("volume %" PRIu32 ": leader %" PRIu32 " of epoch %" PRIu64 " is up but has not led it for %llu ms "
+                    "(deposed by a fence no promotion followed); taken as its resignation", v->number, v->leader,
+                    v->epoch, (unsigned long long)(DEPOSED_HOLD_NS / MS));
+                reason = META_GR_RESIGNED;
+            }
             if (!reason)
                 continue;
             promo_start(v, reason, now);

@@ -6776,6 +6776,127 @@ static void scen_cut(void)
     rep_same(wantr, "after the cut");
 }
 
+static void nofence_file(int at, int on)
+{
+    char f[PATH_MAX + 64];
+    server_dir(at, f, sizeof f);
+    snprintf(f + strlen(f), sizeof f - strlen(f), "/nofencereply");
+    if (on) {
+        FILE *fp = fopen(f, "w");
+        if (!fp)
+            die("create %s", f);
+        fclose(fp);
+    } else if (unlink(f) != 0 && errno != ENOENT) {
+        die("unlink %s", f);
+    }
+}
+
+/* cutstuck (jepsen-cluster meta,classes kill, 2026-11-19: kvr had no writer for the second half of the run): a move of
+ * the leadership away from a cut leader (cut) fences every ISR member, the old leader too, which answers and is
+ * deposed; when no candidate answers (TSDB_REPLD_TEST=nofencereply on the replicas: they save the fence and say
+ * nothing, as a member killed before its answer) the Raft leader gives the move up, and the record still names the old
+ * leader at the old epoch while its core waits for a record past its fence. The group must take that as the old
+ * leader's resignation and promote again once the members answer: a leader past the old epoch, which accepts a write
+ * and holds every acknowledged row. TSDB_CLUSTER_MUTANT=deposedstuck (never taken as resigned) fails it. */
+static void scen_cutstuck(void)
+{
+    scenario("cutstuck");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks,nofencereply";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rs", 3, &num)) != 0 || num != 1)
+        die("volume add rs: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rs", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rs", &v))
+        die("no record of rs");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rs is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rs", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(L, "rs", 3, 30000, "every replica in the ISR before the cut");
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            nofence_file(i, 1);
+    uint64_t t0 = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    char gaveup[96], deposed[64];
+    snprintf(gaveup, sizeof gaveup, "no replica to move the leadership of epoch %" PRIu64 " to;", e0);
+    snprintf(deposed, sizeof deposed, "deposed at epoch %" PRIu64 ":", e0);
+    for (int n = 0; n < 1;) {
+        n = 0;
+        for (int i = 0; i < 3; i++)
+            n += log_count(i, gaveup);
+        if (now_ms() - t0 > 30000)
+            die("no Raft leader gave the move of the cut leader up in 30 s");
+        usleep(50000);
+    }
+    await_log_count(L, deposed, 1, 10000);
+    uint64_t tg = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            nofence_file(i, 0);
+    /* a leader past e0 that leads (the old one may be granted e + 1 first and moved from again while it promotes) */
+    int Nw = -1;
+    for (char lead[64];; usleep(50000)) {
+        if (vol_rec(L, "rs", &v) && v.epoch > e0 && (Nw = server_of(v.leader)) >= 0 && Nw <= 2) {
+            snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+            if (log_count(Nw, lead) > 0)
+                break;
+        }
+        if (now_ms() - tg > 30000)
+            die("rs has no leader past epoch %" PRIu64 " 30 s after the move was given up (record: leader %u at epoch "
+                "%" PRIu64 "): the deposed leader is still named", e0, v.leader, v.epoch);
+    }
+    uint64_t tl = now_ms();
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the leader at epoch %" PRIu64 " (server %d): %s", v.epoch, Nw, ers(rc));
+    tsdbc_close(c);
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * acked, 30000);
+    if (got != acked)
+        die("the leader at epoch %" PRIu64 " (server %d) holds %d of the %d acknowledged rows", v.epoch, Nw, got, acked);
+    printf("  the move away from cut leader %d given up %llu ms after the cut (the old leader deposed); server %d leads "
+           "epoch %" PRIu64 " %llu ms after the members answer again, with all %d acknowledged rows\n", L,
+           (unsigned long long)(tg - t0), Nw, v.epoch, (unsigned long long)(tl - tg), acked);
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    await_isr(Nw, "rs", 3, 60000, "every server in the ISR once the links are back");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)acked + 1;
+    rep_same(wantr, "after the cut and the given-up move");
+}
+
 /* No ISR member up (design-cluster.md 6.2): a replica outside the ISR is up, but the group cannot promote it. Clients
  * get UNAVAILABLE(NO_OWNER) from it (not MOVED to the dead leader), the leader of the group says NO_OWNER, and
  * `tsdb cluster volume force-leader` makes the replica the leader at e + 1: its rows stand, the rows the old ISR
@@ -6959,7 +7080,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

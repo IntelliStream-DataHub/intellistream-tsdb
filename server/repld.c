@@ -302,6 +302,8 @@ static struct {
     int trace; /* TSDB_REPLD_TRACE (debugging): the core's and the cursors' state every 2 s */
     int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
+    int no_fence_reply; /* TSDB_REPLD_TEST=nofencereply (tests only): no FENCE_REPLY leaves while <dir>/nofencereply
+                         * exists (the fence is saved; a member that dies before its answer is out) */
     int slow_read;    /* TSDB_REPLD_TEST=slowread: every catch-up read takes SLOW_READ_MS more (a slow disk, NFS) */
     int slow_tick;    /* TSDB_REPLD_TEST=slowtick: a writer's catch-up step takes SLOW_TICK_MS at every tick it runs,
                        * lagging peer or not (tickwall) */
@@ -593,6 +595,18 @@ static void meta_msg(struct rvol *rv, const struct repl_msg *m)
                                  .durable = m->durable, .last_epoch = m->last_epoch, .rid = m->rid, .start = m->start,
                                  .to = rv->fence_from};
         crash_point(CP_FENCE_SAVED); /* the fence is in REPL, the reply not yet out */
+        if (G.no_fence_reply) {
+            char f[sizeof G.dir + 16];
+            snprintf(f, sizeof f, "%s/nofencereply", G.dir);
+            if (access(f, F_OK) == 0) {
+                static uint64_t said; /* the volume thread's; once per epoch is enough for a test's log */
+                if (said != m->epoch)
+                    say("volume %" PRIu32 ": withholds its answer to the fence for epoch %" PRIu64 " (nofencereply)",
+                        rv->number, m->epoch);
+                said = m->epoch;
+                return;
+            }
+        }
         cluster_vol_msg(&q);
     } else if (m->type == REPL_M_RESIGN) {
         if (rv->resigned != m->epoch)
@@ -2156,6 +2170,7 @@ void repld_init(tsdb *t, const char *dir)
         G.inbox_bytes = SIZE_MAX;
     G.stall_inbox = te && strstr(te, "stallinbox");
     G.cut_links = te && strstr(te, "cutlinks");
+    G.no_fence_reply = te && strstr(te, "nofencereply");
     G.slow_read = te && strstr(te, "slowread");
     G.slow_tick = te && strstr(te, "slowtick");
     G.late_tick = te && strstr(te, "latetick");
