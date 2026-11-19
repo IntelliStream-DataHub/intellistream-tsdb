@@ -148,6 +148,12 @@ uint64_t cluster_lease_safe(uint64_t answer_ns, uint32_t lease_ms, uint32_t drif
  * then cluster_stop() (no hand-off is under way after it), and only then peerlink_free. */
 struct peerlink;
 void cluster_set_peerlink(struct peerlink *pl);
+/* The acceptor's table, one peerlink per link kind (PL_KIND_*): a data link's HELLO of kind k goes to the peerlink
+ * registered for k, and a kind without one (or at or above CLUSTER_PL_KINDS) is refused with a line.
+ * cluster_set_peerlink(pl) is this for PL_KIND_LOG and PL_KIND_BULK. Any thread; each kind's pointer follows the
+ * shutdown order above. -1 for PL_KIND_META (the cluster thread's own) or a kind out of range, else 0. */
+#define CLUSTER_PL_KINDS 8
+int cluster_set_peerlink_kind(int kind, struct peerlink *pl);
 /* What a peerlink needs to dial and answer as this server (any thread, after cluster_start). 0, or -1 while this
  * server is in no cluster yet (id 0). */
 struct cluster_self {
@@ -190,6 +196,64 @@ struct cluster_vol_rec {
  * keeps and not block. */
 typedef void (*cluster_vol_watch_fn)(void *arg, uint32_t self, const struct cluster_vol_rec *v, uint32_t n);
 void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg);
+
+/* ---- the whole metadata copy as one snapshot (S2-1: TOPOLOGY, STATUS, MOVED; s2e's routing, r3e, R8 read it)
+ * The cluster thread builds a new snapshot after every applied batch, snapshot install and copy swap (whatever moved
+ * `applied`, its term or the restore generation) and publishes it by an atomic pointer swap. cluster_copy_get() (any
+ * thread, no lock, never blocks) returns the current one with a reference, NULL before this server holds an
+ * initialised copy or after cluster_stop; every get is paired with one cluster_copy_put(). A snapshot never changes
+ * and lives until its last reference goes; holding one does not hold the cluster thread up (it is only memory). It is
+ * as stale as any copy: leaders check epochs (design-cluster.md 2.4). A get and a put each write two shared counters
+ * (cache lines every reader shares): a hot path (s2e's per-request routing) keeps a snapshot per thread and gets a new
+ * one only when cluster_copy_builds() moved, so that per request it only reads a shared line.
+ * Member states (to settle in S3/s2e, nothing proposes them yet): TOPOLOGY's alive and cluster_vol_owner take META_UP
+ * only, so a DRAINING leader would show alive 0 and its volumes NO_OWNER; OUT members stay in the copy for good (a
+ * new member may reuse an OUT member's peer address), so TOPOLOGY's nodes and STATUS's peers list them. */
+struct cluster_copy_member {
+    uint32_t id;
+    uint8_t state;            /* enum meta_member_state */
+    char addr[META_ADDR_MAX]; /* the client address, host:port */
+    char peer[META_ADDR_MAX]; /* the peer address */
+};
+struct cluster_copy_vol {
+    uint32_t number;
+    uint8_t kind;    /* enum meta_vol_kind */
+    uint32_t leader; /* the record's leader (writer, shared: owner); 0: none */
+    uint64_t epoch;
+    uint32_t nrep;
+    struct cluster_copy_rep {
+        uint32_t node;
+        uint8_t learner;
+    } rep[META_REPLICAS_MAX]; /* in record order */
+    uint32_t nisr;
+    uint32_t isr[META_REPLICAS_MAX]; /* node ids, ascending */
+};
+struct cluster_copy {
+    uint64_t applied, applied_term, restore_gen;
+    uint32_t self; /* this server's member id (0: none yet) */
+    uint32_t nmembers, nvolumes;
+    const struct cluster_copy_member *members; /* ascending by id */
+    const struct cluster_copy_vol *volumes;    /* ascending by number */
+};
+const struct cluster_copy *cluster_copy_get(void);
+void cluster_copy_put(const struct cluster_copy *c);
+/* how many snapshots this process has published: unchanged means a snapshot held since is still the current one */
+unsigned long cluster_copy_builds(void);
+/* Tests only (test_cluster ccstress), with no cluster running in the process: `readers` threads loop get/put while
+ * `publishes` snapshots are swapped in; 0 when all were published within `ms` and every reader saw what it held
+ * intact, else -1. why: a line either way (counts, the longest swap). */
+int cluster_copy_stress(unsigned readers, unsigned long publishes, unsigned ms, char *why, size_t wn);
+const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy *c, uint32_t id); /* NULL: none */
+const struct cluster_copy_vol *cluster_copy_vol(const struct cluster_copy *c, uint32_t number);    /* NULL: none */
+/* The role of member `node` in volume v as TOPOLOGY says it (TSDB_ROLE_*, D9: no new role before S3): the leader
+ * OWNER, a replica in the ISR STANDBY, any other replica (a learner too) FOLLOWER, anyone else NONE. */
+int cluster_copy_role(const struct cluster_copy_vol *v, uint32_t node);
+/* Where requests for volume `vol` go, from the current snapshot: 1 when it has a leader whose member is UP and is
+ * another server, 2 when that leader is this server (the snapshot's self), with its id, the epoch and its client
+ * address in addr, cap bytes; 0 when there is none (no copy, no such volume, no leader, or the leader is not UP).
+ * Never turn a 2 into MOVED: the client would follow it back here until its retry budget ran out. Any thread; never call it on the cluster thread's own path (vol_watch_duty and the like
+ * read C.sm directly). */
+int cluster_vol_owner(uint32_t vol, uint32_t *node, uint64_t *epoch, char *addr, size_t cap);
 
 struct cluster_vol_status {
     struct cluster_vol_report v;

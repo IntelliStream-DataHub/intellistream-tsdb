@@ -99,6 +99,7 @@
 #include "raft/raft_log.h"
 #include "raft/raft_wire.h"
 #include "tsdb_crypto.h"
+#include "tsdb_protocol.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -108,6 +109,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -866,6 +868,7 @@ struct conn {
     uint64_t seq_in, seq_out;
     struct buf rb, wb, q; /* q: frames queued before AUTH (untagged; tagged as they move to wb) */
     int handoff;          /* a data link's HELLO passed the checks: conn_read hands the socket to peerlink */
+    uint8_t kind;         /* and its kind (PL_KIND_*): the peerlink it goes to */
     int watch_served;     /* it watches this server */
     int watch_ours;       /* this server's watch stream */
     int join;             /* NODE_ADD: 1 a PROBE sent, 2 a JOIN sent, not yet answered */
@@ -1052,6 +1055,9 @@ static struct {
     char stallfile[1100];
     char holdopensfile[1100];
     unsigned sync_delay_ms; /* TSDB_CLUSTER_TEST sync_delay_ms=N: the worker waits N ms before each sync round */
+    unsigned copy_hold;  /* TSDB_CLUSTER_TEST copy_hold=N: cc_hold_main holds a snapshot across N more */
+    atomic_uint copy_drive; /* proposals of the settings still wanted by cc_hold_main (the Raft leader makes them) */
+    pthread_t copy_hold_th;
     int fail_file;       /* TSDB_CLUSTER_TEST fail_sync_file=1: a sync fails with EIO while <state-dir>/failsync exists */
     char failfile[1100];
 
@@ -1291,6 +1297,8 @@ static void test_knobs(void)
             C.stall_ns = v * 1000000ull;
         else if (sscanf(p, "hold_install_ms=%llu", &v) == 1)
             C.hold_install_ns = v * 1000000ull;
+        else if (sscanf(p, "copy_hold=%llu", &v) == 1)
+            C.copy_hold = (unsigned)v;
         p = strchr(p, ',');
         if (p)
             p++;
@@ -1534,7 +1542,10 @@ static void *g_reporter_arg;
 /* Mutants (TSDB_CLUSTER_MUTANT, tests only): `leaseanyvoter` lets any voter's HB_ACK extend the lease, `nodrift` takes
  * lease_ms without the drift margin both ways, `stampignored` heartbeats whatever the serving loop's stamp says,
  * `noquorum` grants without the core's lease, `nocoreclock` takes the core's answer on its own clock (the code before
- * the review), `nopromotewait` declares a member down after node_timeout without promote_safe_ns. */
+ * the review), `nopromotewait` declares a member down after node_timeout without promote_safe_ns. The copy's
+ * (cluster_copy_get, test_cluster topology/copyhold/links): `snapfreeheld` frees a snapshot one reference early,
+ * `rolesswap` makes a replica outside the ISR STANDBY, `selfone` says node 1 for this server, `movedpeeraddr` gives the
+ * leader's peer address for its client address, `kindall` hands a data link of any kind to whatever peerlink is set. */
 enum cl_mutant {
     CLM_NONE = 0,
     CLM_LEASEANYVOTER = 1,
@@ -1543,7 +1554,16 @@ enum cl_mutant {
     CLM_NOQUORUM = 4,
     CLM_NOCORECLOCK = 5,
     CLM_NOPROMOTEWAIT = 6,
-    CLM_SHRINKNOCOND = 7 /* an ISR request is proposed on the record's current epoch and ISR version, not its own basis */
+    CLM_SHRINKNOCOND = 7, /* an ISR request is proposed on the record's current epoch and ISR version, not its own basis */
+    CLM_SNAPFREEHELD = 8,
+    CLM_ROLESSWAP = 9,
+    CLM_SELFONE = 10,
+    CLM_MOVEDPEERADDR = 11,
+    CLM_KINDALL = 12,
+    CLM_CCNOWAIT = 13,  /* cc_swap drops the old snapshot at once, readers taking a reference or not */
+    CLM_CCONESLOT = 14, /* cc_swap waits until the current parity's counter is 0: one counter for every reader, which
+                         * continuous readers never leave at 0 (the cluster thread starves) */
+    CLM_OWNERSELF = 15  /* cluster_vol_owner says 1 (elsewhere) for a leader that is this server */
 };
 static int cl_mutant(void)
 {
@@ -1559,6 +1579,14 @@ static int cl_mutant(void)
             : !strcmp(e, "nocoreclock")   ? CLM_NOCORECLOCK
             : !strcmp(e, "nopromotewait") ? CLM_NOPROMOTEWAIT
             : !strcmp(e, "shrinknocond")  ? CLM_SHRINKNOCOND
+            : !strcmp(e, "snapfreeheld")  ? CLM_SNAPFREEHELD
+            : !strcmp(e, "rolesswap")     ? CLM_ROLESSWAP
+            : !strcmp(e, "selfone")       ? CLM_SELFONE
+            : !strcmp(e, "ccnowait")      ? CLM_CCNOWAIT
+            : !strcmp(e, "cconeslot")     ? CLM_CCONESLOT
+            : !strcmp(e, "ownerself")     ? CLM_OWNERSELF
+            : !strcmp(e, "movedpeeraddr") ? CLM_MOVEDPEERADDR
+            : !strcmp(e, "kindall")       ? CLM_KINDALL
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -1667,10 +1695,401 @@ void cluster_set_reporter(cluster_report_fn fn, void *arg)
 
 static cluster_vol_watch_fn g_vwatch;
 static void *g_vwatch_arg;
-static _Atomic(struct peerlink *) g_pl_a; /* where data links go (cluster_set_peerlink) */
-#define g_pl atomic_load(&g_pl_a)
+/* where data links go, one peerlink per kind (cluster_set_peerlink_kind; [PL_KIND_META] stays NULL) */
+static _Atomic(struct peerlink *) g_pl_a[CLUSTER_PL_KINDS];
 
-void cluster_set_peerlink(struct peerlink *pl) { atomic_store(&g_pl_a, pl); }
+static struct peerlink *pl_of_kind(unsigned kind)
+{
+    if (cl_mutant() == CLM_KINDALL) /* the acceptor takes any kind: to the first peerlink there is */
+        for (unsigned k = 1; k < CLUSTER_PL_KINDS; k++)
+            if (atomic_load(&g_pl_a[k]))
+                return atomic_load(&g_pl_a[k]);
+    return kind != PL_KIND_META && kind < CLUSTER_PL_KINDS ? atomic_load(&g_pl_a[kind]) : NULL;
+}
+
+int cluster_set_peerlink_kind(int kind, struct peerlink *pl)
+{
+    if (kind <= PL_KIND_META || kind >= CLUSTER_PL_KINDS)
+        return -1;
+    atomic_store(&g_pl_a[kind], pl);
+    return 0;
+}
+
+void cluster_set_peerlink(struct peerlink *pl)
+{
+    cluster_set_peerlink_kind(PL_KIND_LOG, pl);
+    cluster_set_peerlink_kind(PL_KIND_BULK, pl);
+}
+
+/* ---- the metadata copy as one snapshot (cluster.h "the whole metadata copy")
+ * One block per snapshot: the header, the volumes, the members. Readers take a reference without a lock: a reader
+ * counts itself in cc_getting[q & 1], q being cc_phase (it checks that cc_phase did not move meanwhile, else it counts
+ * itself again under the new parity), loads cc_cur, takes its reference and counts itself out. The cluster thread
+ * never waits for readers (a wait for a counter that continuous readers never leave at 0 starved it, and any wait
+ * lasts as long as a reader preempted inside its few instructions: test_cluster ccstress, mutant cconeslot). A
+ * swapped-out snapshot goes on the retired list with the phase rp of its swap, and its published reference is dropped
+ * later (cc_reclaim, every round of the cluster loop) once no reader can still be about to take one:
+ * - a reader that loaded it registered at a phase q <= rp (its check of cc_phase came before its load, which came
+ *   before the swap);
+ * - cc_phase moves from p to p + 1 only while the counter of the parity it moves into, (p + 1) & 1, is 0, so a reader
+ *   of phase q is out before the phase reaches q + 2: once the phase is rp + 1, a reader of phase rp - 1 is out, and
+ *   once the counter of parity rp & 1 has been 0 after that move, so is every reader of phase rp;
+ * so a retired snapshot is dropped when cc_phase >= rp + 2, or at rp + 1 with cc_getting[rp & 1] at 0. Only the
+ * cluster thread (and cluster_stop after it, which does wait) swaps, reclaims and moves the phase. The checks of
+ * cc_unref are always on: a count below zero or a put of a freed snapshot (poisoned by cc_unref) aborts with a line. */
+#define CC_MAGIC 0x43435059u /* "YPCC" */
+struct cc_snap {
+    struct cluster_copy pub;
+    atomic_long refs;       /* the cluster thread's while it is published, and one per reader */
+    _Atomic uint32_t magic; /* CC_MAGIC until freed */
+    size_t bytes;
+    uint64_t sum; /* of the content, for the hold check (copy_hold) */
+    struct cc_snap *next; /* on the retired list */
+    unsigned long rp;     /* cc_phase when it was swapped out */
+};
+static _Atomic(struct cc_snap *) cc_cur;
+static atomic_ulong cc_phase;
+static atomic_long cc_getting[2];
+static struct cc_snap *cc_retired; /* swapped out, the published reference still held; the swapping thread's */
+static unsigned long cc_nretired, cc_nretired_max;
+static atomic_ulong cc_builds; /* snapshots published since the start (the hold check counts them) */
+
+static uint64_t cc_sum(const struct cc_snap *s)
+{
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *p = (const uint8_t *)(s + 1);
+    for (size_t i = 0; i < s->bytes - sizeof *s; i++)
+        h = (h ^ p[i]) * 1099511628211ull;
+    return h ^ s->pub.applied ^ (s->pub.applied_term << 1) ^ ((uint64_t)s->pub.nmembers << 32) ^ s->pub.nvolumes;
+}
+
+static void cc_unref(struct cc_snap *s)
+{
+    if (atomic_load(&s->magic) != CC_MAGIC) {
+        say("copy: a snapshot was put after it was freed");
+        abort();
+    }
+    long left = atomic_fetch_sub(&s->refs, 1) - 1;
+    if (left < 0) {
+        say("copy: a snapshot's reference count went below zero");
+        abort();
+    }
+    if (left == 0 || (left == 1 && cl_mutant() == CLM_SNAPFREEHELD)) {
+        memset(s, 0xdb, s->bytes); /* a reader that still held it sees the poison, not stale data */
+        free(s);
+    }
+}
+
+const struct cluster_copy *cluster_copy_get(void)
+{
+    unsigned long p;
+    for (;;) {
+        p = atomic_load(&cc_phase);
+        atomic_fetch_add(&cc_getting[p & 1], 1);
+        if (atomic_load(&cc_phase) == p)
+            break;
+        atomic_fetch_sub(&cc_getting[p & 1], 1); /* a swap flipped in between: count under the new parity */
+    }
+    struct cc_snap *s = atomic_load(&cc_cur);
+    if (s)
+        atomic_fetch_add(&s->refs, 1);
+    atomic_fetch_sub(&cc_getting[p & 1], 1);
+    return s ? &s->pub : NULL;
+}
+
+unsigned long cluster_copy_builds(void)
+{
+    return atomic_load_explicit(&cc_builds, memory_order_acquire);
+}
+
+void cluster_copy_put(const struct cluster_copy *c)
+{
+    if (c)
+        cc_unref((struct cc_snap *)(void *)c); /* pub is the first member */
+}
+
+/* the swapping thread: drop the published reference of every retired snapshot no reader can still be taking one of,
+ * and move the phase on while snapshots of the current one wait (never waits itself); 1 when none is left */
+static int cc_reclaim(void)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        unsigned long p = atomic_load(&cc_phase);
+        int drained = p > 0 && atomic_load(&cc_getting[(p - 1) & 1]) == 0, current = 0;
+        for (struct cc_snap **pp = &cc_retired; *pp;) {
+            struct cc_snap *x = *pp;
+            if (x->rp + 2 <= p || (x->rp + 1 == p && drained)) {
+                *pp = x->next;
+                cc_nretired--;
+                cc_unref(x);
+            } else {
+                current |= x->rp == p;
+                pp = &x->next;
+            }
+        }
+        if (!current || atomic_load(&cc_getting[(p + 1) & 1]) != 0)
+            break;
+        atomic_store(&cc_phase, p + 1); /* the readers of phase p - 1 are out: their parity can be p + 1's */
+    }
+    return cc_retired == NULL;
+}
+
+/* the cluster thread (and cluster_stop): s becomes the current snapshot (NULL: none); the old one is retired */
+static void cc_swap(struct cc_snap *s)
+{
+    struct cc_snap *old = atomic_exchange(&cc_cur, s);
+    if (!old)
+        return;
+    if (cl_mutant() == CLM_CCNOWAIT) {
+        cc_unref(old);
+        return;
+    }
+    if (cl_mutant() == CLM_CCONESLOT) { /* the old protocol: wait for the one counter every reader uses */
+        while (atomic_load(&cc_getting[atomic_load(&cc_phase) & 1]))
+            sched_yield();
+        cc_unref(old);
+        return;
+    }
+    old->rp = atomic_load(&cc_phase);
+    old->next = cc_retired;
+    cc_retired = old;
+    if (++cc_nretired > cc_nretired_max)
+        cc_nretired_max = cc_nretired;
+    cc_reclaim();
+}
+
+/* cluster_stop and the stress test: none current, and every retired one dropped (waits for the readers in flight) */
+static void cc_clear(void)
+{
+    cc_swap(NULL);
+    while (!cc_reclaim())
+        sched_yield();
+}
+
+/* After whatever moved the copy (an applied batch, an installed snapshot, a swap to the state file's copy, a
+ * restore): a new snapshot of C.sm. The cluster thread only. */
+static void copy_publish(void)
+{
+    if (cc_retired)
+        cc_reclaim();
+    if (!C.sm.initialised)
+        return;
+    uint32_t self = cl_mutant() == CLM_SELFONE ? 1 : C.have_node ? C.id : 0;
+    struct cc_snap *cur = atomic_load(&cc_cur); /* ours: the published reference is the cluster thread's */
+    if (cur && cur->pub.applied == C.sm.applied && cur->pub.applied_term == C.sm.applied_term &&
+        cur->pub.restore_gen == C.sm.restore_gen && cur->pub.self == self)
+        return;
+    uint32_t nv = C.sm.nvolumes, nm = C.sm.nmembers;
+    size_t bytes = sizeof(struct cc_snap) + (size_t)nv * sizeof(struct cluster_copy_vol) +
+                   (size_t)nm * sizeof(struct cluster_copy_member);
+    struct cc_snap *s = calloc(1, bytes);
+    if (!s)
+        oom();
+    struct cluster_copy_vol *vols = (struct cluster_copy_vol *)(void *)(s + 1);
+    struct cluster_copy_member *mem = (struct cluster_copy_member *)(void *)(vols + nv);
+    for (uint32_t i = 0; i < nv; i++) {
+        const struct meta_volume *v = &C.sm.volumes[i];
+        struct cluster_copy_vol *o = &vols[i];
+        o->number = v->number;
+        o->kind = v->kind;
+        o->leader = v->leader;
+        o->epoch = v->epoch;
+        o->nrep = v->nrep < META_REPLICAS_MAX ? v->nrep : META_REPLICAS_MAX;
+        for (uint32_t k = 0; k < o->nrep; k++)
+            o->rep[k] = (struct cluster_copy_rep){v->rep[k].node, v->rep[k].learner};
+        o->nisr = v->nisr < META_REPLICAS_MAX ? v->nisr : META_REPLICAS_MAX;
+        memcpy(o->isr, v->isr, o->nisr * sizeof o->isr[0]);
+    }
+    for (uint32_t i = 0; i < nm; i++) {
+        const struct meta_member *m = &C.sm.members[i];
+        mem[i].id = m->id;
+        mem[i].state = m->state;
+        snprintf(mem[i].addr, sizeof mem[i].addr, "%s", m->addr);
+        snprintf(mem[i].peer, sizeof mem[i].peer, "%s", m->peer);
+    }
+    s->pub = (struct cluster_copy){.applied = C.sm.applied, .applied_term = C.sm.applied_term,
+                                   .restore_gen = C.sm.restore_gen, .self = self, .nmembers = nm, .nvolumes = nv,
+                                   .members = mem, .volumes = vols};
+    s->bytes = bytes;
+    atomic_init(&s->refs, 1);
+    atomic_init(&s->magic, CC_MAGIC);
+    if (C.copy_hold)
+        s->sum = cc_sum(s); /* only the hold check reads it: not paid on every publish */
+    cc_swap(s);
+    atomic_fetch_add_explicit(&cc_builds, 1, memory_order_release);
+}
+
+const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy *c, uint32_t id)
+{
+    for (uint32_t i = 0; c && i < c->nmembers; i++)
+        if (c->members[i].id == id)
+            return &c->members[i];
+    return NULL;
+}
+
+const struct cluster_copy_vol *cluster_copy_vol(const struct cluster_copy *c, uint32_t number)
+{
+    uint32_t lo = 0, hi = c ? c->nvolumes : 0;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (c->volumes[mid].number < number)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return c && lo < c->nvolumes && c->volumes[lo].number == number ? &c->volumes[lo] : NULL;
+}
+
+int cluster_copy_role(const struct cluster_copy_vol *v, uint32_t node)
+{
+    if (!v || !node)
+        return TSDB_ROLE_NONE;
+    if (v->leader == node)
+        return TSDB_ROLE_OWNER;
+    for (uint32_t k = 0; k < v->nrep; k++) {
+        if (v->rep[k].node != node)
+            continue;
+        for (uint32_t j = 0; j < v->nisr; j++)
+            if (v->isr[j] == node)
+                return TSDB_ROLE_STANDBY;
+        return cl_mutant() == CLM_ROLESSWAP ? TSDB_ROLE_STANDBY : TSDB_ROLE_FOLLOWER;
+    }
+    return TSDB_ROLE_NONE;
+}
+
+int cluster_vol_owner(uint32_t vol, uint32_t *node, uint64_t *epoch, char *addr, size_t cap)
+{
+    const struct cluster_copy *c = cluster_copy_get();
+    const struct cluster_copy_vol *v = cluster_copy_vol(c, vol);
+    const struct cluster_copy_member *m = v && v->leader ? cluster_copy_member(c, v->leader) : NULL;
+    int ok = m && m->state == META_UP ? (c->self && m->id == c->self && cl_mutant() != CLM_OWNERSELF ? 2 : 1) : 0;
+    if (ok) {
+        *node = m->id;
+        *epoch = v->epoch;
+        if (addr && cap)
+            snprintf(addr, cap, "%s", cl_mutant() == CLM_MOVEDPEERADDR ? m->peer : m->addr);
+    }
+    cluster_copy_put(c);
+    return ok;
+}
+
+/* TSDB_CLUSTER_TEST copy_hold=N (test_cluster copyhold): a reader that holds the first snapshot while N more are
+ * published (the Raft leader proposes its settings again, one entry a duty round, while copy_drive is above 0), then
+ * checks that what it held is unchanged and says so. */
+static void *cc_hold_main(void *arg)
+{
+    unsigned want = (unsigned)(uintptr_t)arg;
+    const struct cluster_copy *h = NULL;
+    while (!atomic_load(&C.stop) && !(h = cluster_copy_get()))
+        usleep(20000);
+    if (!h)
+        return NULL;
+    const struct cc_snap *hs = (const struct cc_snap *)(const void *)h;
+    uint64_t sum = hs->sum, applied = h->applied;
+    unsigned long b0 = atomic_load(&cc_builds);
+    say("copy hold: holds the snapshot of applied %" PRIu64, applied);
+    atomic_store(&C.copy_drive, want + 5);
+    while (!atomic_load(&C.stop) && atomic_load(&cc_builds) - b0 < want)
+        usleep(5000);
+    atomic_store(&C.copy_drive, 0);
+    unsigned long seen = atomic_load(&cc_builds) - b0;
+    if (seen < want)
+        ; /* stopped first: no verdict */
+    else if (atomic_load(&hs->magic) == CC_MAGIC && hs->sum == sum && cc_sum(hs) == sum && h->applied == applied)
+        say("copy hold: intact after %lu batches", seen);
+    else
+        say("copy hold: FAILED: the held snapshot changed after %lu batches", seen);
+    cluster_copy_put(h);
+    return NULL;
+}
+
+/* Tests (test_cluster ccstress): the get/put/swap protocol under continuous readers, in-process with no cluster
+ * running. `readers` threads loop get/put and check what they hold; this thread publishes `publishes` synthetic
+ * snapshots through cc_swap. Readers stop at the deadline, so a starved swap returns then; it fails when the writer
+ * did not get through (mutant cconeslot) or a reader saw a snapshot change or freed under it (ccnowait; ASan also
+ * reports the use after free). */
+struct ccst {
+    atomic_int bad;
+    atomic_ulong gets;
+    _Atomic uint64_t deadline_ns;
+};
+#define CCST_VOLS 4
+static uint64_t ccst_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static void *ccst_reader(void *arg)
+{
+    struct ccst *t = arg;
+    unsigned long n = 0;
+    while (ccst_now() < atomic_load_explicit(&t->deadline_ns, memory_order_relaxed)) {
+        const struct cluster_copy *c = cluster_copy_get();
+        if (!c)
+            continue;
+        const struct cc_snap *s = (const struct cc_snap *)(const void *)c;
+        int ok = atomic_load(&s->magic) == CC_MAGIC && c->nvolumes == CCST_VOLS;
+        for (uint32_t i = 0; ok && i < CCST_VOLS; i++)
+            ok = c->volumes[i].epoch == c->applied && c->volumes[i].number == i + 1;
+        if (!ok || atomic_load(&s->magic) != CC_MAGIC) {
+            atomic_store(&t->bad, 1); /* no put: a freed one would abort before the test says why */
+            break;
+        }
+        cluster_copy_put(c);
+        n++;
+    }
+    atomic_fetch_add(&t->gets, n);
+    return NULL;
+}
+
+int cluster_copy_stress(unsigned readers, unsigned long publishes, unsigned ms, char *why, size_t wn)
+{
+    if (atomic_load(&cc_cur)) {
+        snprintf(why, wn, "a copy is published: the cluster runs in this process");
+        return -1;
+    }
+    uint64_t t0 = ccst_now();
+    struct ccst t;
+    atomic_init(&t.bad, 0);
+    atomic_init(&t.gets, 0);
+    atomic_init(&t.deadline_ns, ccst_now() + (uint64_t)ms * 1000000ull);
+    pthread_t *th = calloc(readers ? readers : 1, sizeof *th);
+    if (!th)
+        oom();
+    unsigned started = 0;
+    while (started < readers && pthread_create(&th[started], NULL, ccst_reader, &t) == 0)
+        started++;
+    unsigned long done = 0;
+    uint64_t worst = 0;
+    while (done < publishes && ccst_now() < atomic_load(&t.deadline_ns)) {
+        size_t bytes = sizeof(struct cc_snap) + CCST_VOLS * sizeof(struct cluster_copy_vol);
+        struct cc_snap *s = calloc(1, bytes);
+        if (!s)
+            oom();
+        struct cluster_copy_vol *vols = (struct cluster_copy_vol *)(void *)(s + 1);
+        for (uint32_t i = 0; i < CCST_VOLS; i++)
+            vols[i] = (struct cluster_copy_vol){.number = i + 1, .epoch = done + 1};
+        s->pub = (struct cluster_copy){.applied = done + 1, .nvolumes = CCST_VOLS, .volumes = vols};
+        s->bytes = bytes;
+        atomic_init(&s->refs, 1);
+        atomic_init(&s->magic, CC_MAGIC);
+        uint64_t w0 = ccst_now();
+        cc_swap(s);
+        uint64_t w = ccst_now() - w0;
+        worst = w > worst ? w : worst;
+        done++;
+    }
+    atomic_store(&t.deadline_ns, 0); /* the readers stop */
+    for (unsigned i = 0; i < started; i++)
+        pthread_join(th[i], NULL);
+    free(th);
+    cc_clear();
+    snprintf(why, wn, "%u readers, %lu of %lu publishes in %.0f ms (at most %u), %lu gets, the longest swap %.3f ms, "
+             "at most %lu retired at once%s", started, done, publishes, (double)(ccst_now() - t0) / 1e6, ms,
+             atomic_load(&t.gets), (double)worst / 1e6,
+             cc_nretired_max, atomic_load(&t.bad) ? ": a reader saw its snapshot change or freed" : "");
+    return started == readers && done == publishes && !atomic_load(&t.bad) ? 0 : -1;
+}
 
 static pthread_mutex_t self_mu = PTHREAD_MUTEX_INITIALIZER; /* C.id, C.uuid, C.have_node for cluster_self */
 
@@ -3595,13 +4014,14 @@ static void handshake(struct conn *c, uint8_t type, struct rd *r)
         if (kind != PL_KIND_META) {
             /* a data link (peerlink.h): only a member of this cluster, by its id and identity; the handshake goes on
              * on the link's own thread, and this thread never does data I/O */
-            if (kind > PL_KIND_BULK || !C.have_node || !g_pl || !id || zero16(uuid) || memcmp(uuid, C.uuid, 16) != 0 ||
+            if (!pl_of_kind(kind) || !C.have_node || !id || zero16(uuid) || memcmp(uuid, C.uuid, 16) != 0 ||
                 !member_ident_ok(id, ident)) {
                 say("refused a data link from %s (node %" PRIu32 ", kind %u)", c->peer, id, (unsigned)kind);
                 c->dead = 1;
                 return;
             }
             c->handoff = 1;
+            c->kind = kind;
             return;
         }
         c->id = id;
@@ -3712,7 +4132,7 @@ static void conn_handoff(struct conn *c)
     struct pl_self self = {.id = C.id};
     memcpy(self.uuid, C.uuid, 16);
     memcpy(self.ident, C.ident, 16);
-    struct peerlink *pl = g_pl;
+    struct peerlink *pl = pl_of_kind(c->kind);
     c->handoff = 0;
     if (pl && peerlink_adopt(pl, c->fd, c->tr, c->trlen, &self) == 0)
         c->fd = -1; /* the link's thread owns it now */
@@ -4579,6 +4999,13 @@ static void *cluster_main(void *arg)
             watch_duty(now);
             vol_watch_duty();
             seeds_refresh(now);
+            if (atomic_load(&C.copy_drive) && C.r && raft_get_role(C.r) == RAFT_LEADER && C.sm.initialised) {
+                struct meta_entry e; /* copy_hold: an entry that changes nothing, one more applied batch */
+                meta_entry_init(&e);
+                meta_op_settings(&e, settings());
+                if (propose(&e, 0, 0, 0) == ISO_OK)
+                    atomic_fetch_sub(&C.copy_drive, 1);
+            }
             for (size_t i = 0; i < C.nconns; i++) {
                 struct conn *c = C.conns[i];
                 if ((c->state != CS_READY && since(now, c->opened_ns) > HANDSHAKE_NS) ||
@@ -4586,6 +5013,7 @@ static void *cluster_main(void *arg)
                     c->dead = 1;
             }
         }
+        copy_publish(); /* whatever moved the copy since the last round: an apply, an install, the watch stream */
         size_t n0 = C.nconns;
         if (pfcap < n0 + 3) {
             pfcap = (n0 + 3) * 2;
@@ -4807,6 +5235,8 @@ int cluster_start(const struct cluster_cfg *cfg)
         return -1;
     }
     C.running = 1;
+    if (C.copy_hold && pthread_create(&C.copy_hold_th, NULL, cc_hold_main, (void *)(uintptr_t)C.copy_hold) != 0)
+        C.copy_hold = 0;
     return 0;
 }
 
@@ -4818,6 +5248,9 @@ void cluster_stop(void)
     ssize_t w = write(C.stop_pipe[1], "x", 1);
     (void)w;
     pthread_join(C.th, NULL);
+    if (C.copy_hold)
+        pthread_join(C.copy_hold_th, NULL);
+    cc_clear(); /* readers that hold one keep it until they put it */
     dw_stop_thread();
     C.running = 0;
     for (size_t i = 0; i < C.nconns; i++)

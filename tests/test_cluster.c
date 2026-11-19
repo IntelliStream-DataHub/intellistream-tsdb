@@ -2865,6 +2865,16 @@ static void scen_links(void)
     if (lk_dials(padv, mid, me.uuid, mident, PL_KIND_LOG, 1500))
         die("links: a data link came up while no peerlink was set");
     struct peerlink *srv = lk_peerlink(0, me.id, me.uuid, me.ident);
+    /* the acceptor's table (cluster_set_peerlink_kind): a kind goes only to the peerlink registered for it (mutant
+     * kindall); the metadata kind and kinds past the table cannot be registered */
+    if (cluster_set_peerlink_kind(PL_KIND_META, srv) != -1 || cluster_set_peerlink_kind(CLUSTER_PL_KINDS, srv) != -1 ||
+        cluster_set_peerlink_kind(-1, srv) != -1)
+        die("links: the table took the metadata kind or a kind out of range");
+    cluster_set_peerlink_kind(PL_KIND_LOG, srv);
+    if (lk_dials(padv, mid, me.uuid, mident, PL_KIND_BULK, 1500))
+        die("links: a bulk link came up while only the log kind had a peerlink");
+    if (!lk_dials(padv, mid, me.uuid, mident, PL_KIND_LOG, 10000))
+        die("links: a log link did not come up with the log kind registered");
     cluster_set_peerlink(srv);
     if (lk_dials(padv, mid, me.uuid, bad_ident, PL_KIND_LOG, 1500))
         die("links: a data link came up for a member's id with another identity");
@@ -2892,7 +2902,8 @@ static void scen_links(void)
     cluster_stop();
     peerlink_free(srv);
     stop_all();
-    printf("  data links: refused without a peerlink, for a non-member, a wrong identity or uuid; a member's come up\n");
+    printf("  data links: refused without a peerlink, for a kind without one, for a non-member, a wrong identity or uuid; a "
+           "member's come up\n");
 }
 
 /* replicate: a volume of 3 replicas with the replication driver (server/repld.c; no TSDB_CLUSTER_WRITES): the leader
@@ -3326,6 +3337,368 @@ static void scen_isr(void)
     uint64_t wantr[REP_NAMES] = {rows, 0, 0, 0};
     rep_same(wantr, "after a clean stop");
     printf("  a stopped replica leaves the ISR and joins again once it runs; every replica holds the leader's rows\n");
+}
+
+/* topology: TOPOLOGY, STATUS and MOVED of a cluster node come from its metadata copy (cluster_copy_get; S2-1). */
+static const char *const topo_vols[] = {"east", "west"};
+
+/* server i's TOPOLOGY against the records of server via's copy: the three members (client address, alive unless
+ * server `down`), and for each volume one entry per replica with the record's epoch, its member's client address and
+ * the role D9 gives it (leader OWNER, ISR STANDBY, else FOLLOWER); a replica of server `down` UNAVAILABLE
+ * (UNREACHABLE). 0 when they agree, else a line in why; *followers counts the FOLLOWER entries. */
+static int topo_agrees(int i, int via, int down, char *why, size_t wn, int *followers)
+{
+    tsdbc *c = client(i);
+    tsdbc_topo *t = NULL;
+    int rc = tsdbc_topology(c, &t), bad = 0;
+    tsdbc_close(c);
+    if (rc != 0) {
+        snprintf(why, wn, "TOPOLOGY: %s", ers(rc));
+        return -1;
+    }
+    *followers = 0;
+    if (t->nnodes != 3) {
+        snprintf(why, wn, "%zu nodes, not 3", t->nnodes);
+        bad = 1;
+    }
+    for (int s = 0; s < 3 && !bad; s++) {
+        char want[64];
+        snprintf(want, sizeof want, "127.0.0.1:%d", cports[s]);
+        size_t k = 0;
+        while (k < t->nnodes && t->nodes[k].node_id != ids[s])
+            k++;
+        if (k == t->nnodes || strcmp(t->nodes[k].addr, want) != 0 || t->nodes[k].alive != (s != down)) {
+            snprintf(why, wn, "node %u (server %d): %s, alive %d (want %s, alive %d)", (unsigned)ids[s], s,
+                     k < t->nnodes ? t->nodes[k].addr : "missing", k < t->nnodes ? t->nodes[k].alive : -1, want,
+                     s != down);
+            bad = 1;
+        }
+    }
+    size_t seen = 0;
+    for (int n = 0; n < 2 && !bad; n++) {
+        struct meta_volume v;
+        if (!vol_rec(via, topo_vols[n], &v))
+            die("topology: no record of %s", topo_vols[n]);
+        for (uint32_t k = 0; k < v.nrep && !bad; k++) {
+            uint32_t node = v.rep[k].node;
+            int in_isr = 0;
+            for (uint32_t j = 0; j < v.nisr; j++)
+                in_isr |= v.isr[j] == node;
+            int role = node == v.leader ? TSDB_ROLE_OWNER : in_isr ? TSDB_ROLE_STANDBY : TSDB_ROLE_FOLLOWER;
+            int s = server_of(node);
+            char want[64];
+            snprintf(want, sizeof want, "127.0.0.1:%d", s >= 0 ? cports[s] : 0);
+            size_t e = 0;
+            while (e < t->nvols && !(t->vols[e].vol == v.number && t->vols[e].owner == node))
+                e++;
+            if (e == t->nvols) {
+                snprintf(why, wn, "%s: no entry for node %u", topo_vols[n], (unsigned)node);
+                bad = 1;
+                break;
+            }
+            const tsdbc_vol *tv = &t->vols[e];
+            seen++;
+            *followers += tv->role == TSDB_ROLE_FOLLOWER;
+            if (tv->role != role || tv->epoch != v.epoch || strcmp(tv->addr, want) != 0) {
+                snprintf(why, wn, "%s node %u: role %u epoch %u addr %s, the record says role %d epoch %" PRIu64 " %s",
+                         topo_vols[n], (unsigned)node, tv->role, tv->epoch, tv->addr, role, v.epoch, want);
+                bad = 1;
+            } else if (s == down && role != TSDB_ROLE_OWNER &&
+                       (tv->health != TSDB_HEALTH_UNAVAILABLE || tv->reason != TSDB_WHY_UNREACHABLE)) {
+                snprintf(why, wn, "%s: the down replica %u has health %u reason %u", topo_vols[n], (unsigned)node,
+                         tv->health, tv->reason);
+                bad = 1;
+            } else if (s == down && role == TSDB_ROLE_OWNER &&
+                       (tv->health != TSDB_HEALTH_UNAVAILABLE || tv->reason != TSDB_WHY_NO_OWNER)) {
+                snprintf(why, wn, "%s: the down leader %u has health %u reason %u, not NO_OWNER", topo_vols[n],
+                         (unsigned)node, tv->health, tv->reason);
+                bad = 1;
+            } else if (s != down && role == TSDB_ROLE_OWNER && i != s && tv->health != TSDB_HEALTH_AVAILABLE) {
+                snprintf(why, wn, "%s: the leader %u, up and elsewhere, has health %u reason %u", topo_vols[n],
+                         (unsigned)node, tv->health, tv->reason);
+                bad = 1;
+            }
+        }
+    }
+    if (!bad && seen != t->nvols) {
+        snprintf(why, wn, "%zu entries, the records have %zu", t->nvols, seen);
+        bad = 1;
+    }
+    tsdbc_topology_free(t);
+    return bad ? -1 : 0;
+}
+
+static void await_topo(int via, int down, int ms, int need_follower, const char *what)
+{
+    char why[512] = "";
+    uint64_t t0 = now_ms();
+    for (;;) {
+        int ok = 1, fol = 0;
+        for (int i = 0; i < 3 && ok; i++) {
+            int f = 0;
+            if (i != down && topo_agrees(i, via, down, why, sizeof why, &f) != 0) {
+                ok = 0;
+                snprintf(why + strlen(why), sizeof why - strlen(why), " (server %d)", i);
+            }
+            fol += f;
+        }
+        if (ok && (!need_follower || fol))
+            return;
+        if (ok)
+            snprintf(why, sizeof why, "no entry is a FOLLOWER");
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("%s: TOPOLOGY does not agree with the records after %d ms: %s", what, ms, why);
+        usleep(100000);
+    }
+}
+
+/* STATUS through c lists every server but `self` as a peer: its client and peer addresses, alive unless `down` */
+static void status_peers(tsdbc *c, int self, int down, const char *what)
+{
+    char *text = NULL, line[160];
+    int rc = tsdbc_status(c, &text);
+    if (rc != 0)
+        die("%s: STATUS: %s", what, ers(rc));
+    if (!strstr(text, "\ncluster.applied="))
+        die("%s: STATUS has no cluster.applied line", what);
+    for (int s = 0; s < 3; s++) {
+        if (s == self)
+            continue;
+        snprintf(line, sizeof line, "\npeer.%u.addr=127.0.0.1:%d\n", (unsigned)ids[s], cports[s]);
+        int ok = strstr(text, line) != NULL;
+        snprintf(line, sizeof line, "\npeer.%u.peer=127.0.0.1:%d\n", (unsigned)ids[s], pports[s]);
+        ok = ok && strstr(text, line);
+        snprintf(line, sizeof line, "\npeer.%u.alive=%d\n", (unsigned)ids[s], s != down);
+        if (!ok || !strstr(text, line))
+            die("%s: STATUS of server %d does not list server %d (node %u) as a peer at %d/%d, alive %d:\n%s", what,
+                self, s, (unsigned)ids[s], cports[s], pports[s], s != down, text);
+    }
+    snprintf(line, sizeof line, "\npeer.%u.", (unsigned)ids[self]);
+    if (strstr(text, line))
+        die("%s: STATUS of server %d lists itself as a peer", what, self);
+    free(text);
+}
+
+/* STATUS of server i through c says node.id=want */
+static void status_id(tsdbc *c, uint32_t want, const char *what)
+{
+    char *text = NULL, line[64];
+    int rc = tsdbc_status(c, &text);
+    if (rc != 0)
+        die("%s: STATUS: %s", what, ers(rc));
+    snprintf(line, sizeof line, "node.id=%u\n", (unsigned)want);
+    if (strncmp(text, line, strlen(line)) != 0)
+        die("%s: STATUS begins \"%.40s\", not %s", what, text, line);
+    free(text);
+}
+
+static void scen_topology(void)
+{
+    scenario("topology");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDBD_TEST_ROUTE_MOVED=1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num[2];
+    int rc;
+    if ((rc = vol_add(0, "east", 3, &num[0])) != 0 || (rc = vol_add(0, "west", 2, &num[1])) != 0)
+        die("volume add: %s", cluster_strerror(rc));
+    for (int n = 0; n < 2; n++) {
+        struct meta_volume v;
+        if (!vol_rec(0, topo_vols[n], &v))
+            die("no record of %s", topo_vols[n]);
+        for (uint32_t k = 0; k < v.nrep; k++)
+            await_open_gen(0, topo_vols[n], server_of(v.rep[k].node), 1, 0);
+    }
+    await_isr(0, "east", 3, 20000, "east with every replica up");
+    /* every node answers the same leaders, epochs and replica sets (the records of server 0's copy) */
+    await_topo(0, -1, 20000, 0, "every server up");
+    /* STATUS: each server its own id (one of them is not 1) */
+    for (int i = 0; i < 3; i++) {
+        tsdbc *c = client(i);
+        status_id(c, ids[i], "STATUS");
+        status_peers(c, i, -1, "STATUS");
+        tsdbc_close(c);
+    }
+    struct meta_volume ev;
+    if (!vol_rec(0, "east", &ev))
+        die("no record of east");
+    int L = server_of(ev.leader);
+    if (L < 0 || L > 2)
+        die("the leader of east is node %u", ev.leader);
+    int k = L == 0 ? 1 : 3 - L; /* neither the leader of east nor server 0 (the metadata group's first leader) */
+    struct meta_volume wv;
+    if (!vol_rec(0, "west", &wv))
+        die("no record of west");
+    int W = server_of(wv.leader);
+    if (W > 0 && W != L)
+        k = W;         /* kill west's leader where that is allowed: its OWNER entry and route_moved say NO_OWNER */
+    int j = 3 - L - k; /* the third: neither leads east */
+    /* the replica of west that is not its leader, for route_moved's NO_OWNER once that leader is down */
+    int wr = -1;
+    for (uint32_t r = 0; r < wv.nrep; r++)
+        if (wv.rep[r].node != wv.leader)
+            wr = server_of(wv.rep[r].node);
+    tsdb_sid wid = 0;
+    if (W == k && wr >= 0 && wr != k) {
+        tsdbc *wc = client(W);
+        wid = rep_series(wc, "pump.west", "west", 30000);
+        tsdbc_close(wc);
+    }
+    /* MOVED from the copy (the test hook routes a write to a volume led elsewhere): the leader's id, epoch and client
+     * address; the C client follows it and writes there */
+    {
+        tsdbc *lc = client(L);
+        tsdb_sid id = rep_series(lc, "pump.moved", "east", 30000);
+        tsdbc_close(lc);
+        tsdbc *c = client(j);
+        int64_t ts = 1000;
+        float val = 1;
+        rc = tsdbc_insert_series(c, id, &ts, &val, 1); /* by id: the hook sees the volume of an id */
+        tsdbc_err_info e;
+        char want_addr[64];
+        snprintf(want_addr, sizeof want_addr, "127.0.0.1:%d", cports[L]);
+        if (rc != TSDB_ERR_MOVED || tsdbc_last_error(c, &e) != TSDB_ERR_MOVED || e.nmoved != 1 ||
+            e.moved[0].node_id != ev.leader || e.moved[0].epoch != ev.epoch || e.moved[0].vol != ev.number ||
+            strcmp(e.moved[0].addr, want_addr) != 0)
+            die("a write to east on server %d: %s, MOVED to node %u epoch %u at %s (want node %u epoch %" PRIu64
+                " at %s)", j, ers(rc), e.nmoved ? (unsigned)e.moved[0].node_id : 0, e.nmoved ? e.moved[0].epoch : 0,
+                e.nmoved ? e.moved[0].addr : "-", (unsigned)ev.leader, ev.epoch, want_addr);
+        tsdbc_set_retry(c, 20000);
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("the client did not follow MOVED to the leader of east: %s", ers(rc));
+        status_id(c, ev.leader, "STATUS after MOVED"); /* the connection is the leader's now */
+        tsdbc_close(c);
+    }
+    /* a member marked down: alive 0 on every other node; once east's ISR drops it its entry is a FOLLOWER */
+    stop(k, SIGKILL);
+    struct state_want sw = {ids[k], META_DOWN, 0};
+    await_view(L, p_member_state, &sw, "the killed member marked down");
+    await_isr(L, "east", 2, 30000, "east without the killed replica");
+    await_topo(L, k, 30000, 1, "a member down");
+    {
+        tsdbc *c = client(L);
+        status_peers(c, L, k, "STATUS with a member down");
+        tsdbc_close(c);
+    }
+    /* west's leader killed: a write on its other replica gets UNAVAILABLE (NO_OWNER) from route_moved, not MOVED to
+     * the dead leader, while the record still names it (a promotion would move the record on: then no verdict) */
+    if (wid) {
+        uint64_t t0 = now_ms();
+        for (;;) {
+            tsdbc *c = client(wr);
+            int64_t ts = 2000;
+            float val = 2;
+            int rc2 = tsdbc_insert_series(c, wid, &ts, &val, 1);
+            tsdbc_err_info e;
+            tsdbc_last_error(c, &e);
+            tsdbc_close(c);
+            struct meta_volume now;
+            if (!vol_rec(L, "west", &now) || now.leader != wv.leader) {
+                printf("  (west was promoted away from its killed leader: no NO_OWNER check)\n");
+                break;
+            }
+            if (rc2 == TSDB_ERR_UNAVAILABLE && e.nunavail == 1 && e.unavail[0].reason == TSDB_WHY_NO_OWNER &&
+                e.nmoved == 0)
+                break;
+            if (now_ms() - t0 > 20000)
+                die("a write to west on server %d with its leader (server %d) down: %s, %u MOVED, reason %u (want "
+                    "UNAVAILABLE, NO_OWNER)", wr, k, ers(rc2), e.nmoved, e.nunavail ? e.unavail[0].reason : 0);
+            usleep(100000);
+        }
+    } else {
+        printf("  (west's leader is server 0 or east's leader: no NO_OWNER check of route_moved)\n");
+    }
+    stop_all();
+    printf("  TOPOLOGY from the copy agrees on every node (roles, epochs, addresses, alive); STATUS names each node; "
+           "MOVED names the leader and the C client follows it\n");
+}
+
+/* movedself: route_moved on the leader itself (TSDBD_TEST_ROUTE_MOVED=2 routes every INSERT to a cluster volume,
+ * one led here too) answers UNAVAILABLE, never MOVED to its own address (a client would follow that in a circle
+ * until its retry budget ran out); mutant ownerself */
+static void scen_movedself(void)
+{
+    scenario("movedself");
+    penv[0] = "TSDBD_TEST_ROUTE_MOVED=2";
+    start(0);
+    init_cluster(0, 600);
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "solo", 1, &num)) != 0)
+        die("volume add: %s", cluster_strerror(rc));
+    await_open_gen(0, "solo", 0, 1, 0);
+    tsdbc *c = client(0);
+    tsdb_sid id = rep_series(c, "pump.self", "solo", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    uint64_t t0 = now_ms();
+    for (;;) { /* the copy may not name this server as the leader yet: then NO_OWNER as well */
+        rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+        tsdbc_err_info e;
+        tsdbc_last_error(c, &e);
+        if (rc == TSDB_ERR_MOVED || e.nmoved)
+            die("the leader answered MOVED to itself (node %u at %s)", e.nmoved ? (unsigned)e.moved[0].node_id : 0,
+                e.nmoved ? e.moved[0].addr : "-");
+        if (rc != TSDB_ERR_UNAVAILABLE || e.nunavail != 1 || e.unavail[0].vol != num)
+            die("the routed write on the leader: %s (%d), %u entries, volume %u, after %llu ms (want UNAVAILABLE for "
+                "volume %u)", ers(rc), rc, e.nunavail, e.nunavail ? (unsigned)e.unavail[0].vol : 0,
+                (unsigned long long)(now_ms() - t0), (unsigned)num);
+        if (now_ms() - t0 > 3000)
+            break;
+        usleep(100000);
+    }
+    tsdbc_close(c);
+    stop_all();
+    printf("  route_moved on the volume's own leader answers UNAVAILABLE, never MOVED to itself\n");
+}
+
+/* ccstress: the copy's get/put/swap in-process (cluster_copy_stress, no server): 32 readers loop get/put while 5,000
+ * snapshots are swapped in. The writer must get through (one counter for every reader starved it for good: mutant
+ * cconeslot), and no reader may see its snapshot change or freed (ccnowait; ASan names the use after free). */
+static void scen_ccstress(void)
+{
+    scenario("ccstress");
+    char why[256];
+    int rc = cluster_copy_stress(32, 5000, 30000, why, sizeof why);
+    if (rc != 0)
+        die("the copy's get/put/swap under load: %s", why);
+    printf("  the copy's get/put/swap under load: %s\n", why);
+}
+
+/* copyhold: a reader that holds a snapshot of the copy while 50 more are published keeps what it held (the
+ * cluster thread frees a snapshot only at its last reference); mutant snapfreeheld */
+static void scen_copyhold(void)
+{
+    scenario("copyhold");
+    envs[0] = "copy_hold=50";
+    start(0);
+    init_cluster(0, 600);
+    tsdbc *c = client(0);
+    uint64_t t0 = now_ms();
+    while (!log_has(0, "copy hold: intact") && !log_has(0, "copy hold: FAILED")) {
+        tsdbc_topo *t = NULL; /* readers beside it */
+        int rc = tsdbc_topology(c, &t);
+        if (rc == 0)
+            tsdbc_topology_free(t);
+        else if (rc != TSDB_ERR_UNAVAILABLE)
+            die("TOPOLOGY beside the hold: %s", ers(rc));
+        if (await_exit(0, 0) >= 0)
+            die("the server exited while a reader held a snapshot");
+        if (now_ms() - t0 > 60000)
+            die("no verdict of the hold check in 60 s");
+        usleep(20000);
+    }
+    tsdbc_close(c);
+    if (log_has(0, "copy hold: FAILED") || log_has(0, "copy: a snapshot"))
+        die("the held snapshot changed or a reference went wrong (see %s/n0.log)", base);
+    stop_all();
+    printf("  a snapshot held across 50 published ones is unchanged\n");
 }
 
 /* minisr: with min_isr 3, a leader whose ISR shrank to 2 refuses a write before anything is written (REPL_E_ISR:
@@ -5863,7 +6236,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
