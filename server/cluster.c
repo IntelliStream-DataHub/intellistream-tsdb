@@ -20,9 +20,10 @@
  * other member keeps the state in memory from a **watch stream**: WATCH{from} to a core server, which answers with
  * the committed entries from `from` (from a ring of the last RING applied) or, when those are gone, a snapshot of its
  * state first and the entries after it. An entry whose index does not follow is a broken stream: reconnect. A core
- * server that has known no leader for NOLEADER_PROBE_NS watches as well (into a second state); if what it sees is a
- * configuration without itself, it was removed while away, and it drops its core (its files stay) and goes on as a
- * watcher. So does a core whose own configuration has not held it for NOTMEMBER_DROP_NS.
+ * server that has known no leader for NOLEADER_PROBE_NS (one booted from its files at start: until it sees one)
+ * watches as well (into a second state); if what it sees is a configuration without itself, it was removed while away,
+ * and it drops its core (its files stay) and goes on as a watcher. So does a core whose own configuration has not held
+ * it for NOTMEMBER_DROP_NS.
  *
  * Durability: every action of the core is done inline, in its order (the hard state saved and synced, the log synced
  * through raft_log_sync_prepare / raft_log_sync_run, sends, applies). Metadata changes are rare (tens a minute), so
@@ -990,6 +991,7 @@ static struct {
     raft_log *log;
     int role;
     uint64_t leader_since, leader_seen, notmember_since;
+    int probe_at_start; /* booted from its files at start and no leader seen since: watch at once (watch_duty) */
     uint8_t *snap; /* the image the core's log was last compacted to (sent as SNAPSHOT) */
     size_t snaplen;
     uint64_t snap_index;
@@ -1553,7 +1555,8 @@ enum cl_mutant {
     CLM_SHRINKNOCOND = 7, /* an ISR request is proposed on the record's current epoch and ISR version, not its own basis */
     CLM_LEASESTALE = 8,   /* a node that reports itself the writer of a volume another leads still gets a lease */
     CLM_UPWAITS = 9,      /* a new Raft leader proposes a restarted member up only after node_timeout */
-    CLM_CUTSHRINKS = 10   /* a leader cut from its replicas shrinks the ISR to itself instead of stepping aside */
+    CLM_CUTSHRINKS = 10,  /* a leader cut from its replicas shrinks the ISR to itself instead of stepping aside */
+    CLM_PROBELATE = 11    /* a core restarted from its files watches only after NOLEADER_PROBE_NS without a leader */
 };
 static int cl_mutant(void)
 {
@@ -1572,6 +1575,7 @@ static int cl_mutant(void)
             : !strcmp(e, "leasestale")    ? CLM_LEASESTALE
             : !strcmp(e, "upwaits")       ? CLM_UPWAITS
             : !strcmp(e, "cutshrinks")    ? CLM_CUTSHRINKS
+            : !strcmp(e, "probelate")     ? CLM_PROBELATE
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -2388,8 +2392,10 @@ static void pump(void)
                 say("node %" PRIu32 " leads the metadata group (term %" PRIu64 ")", C.id, a.u.state.term);
             }
             C.role = a.u.state.role;
-            if (a.u.state.leader)
+            if (a.u.state.leader) {
                 C.leader_seen = now;
+                C.probe_at_start = 0;
+            }
             break;
         }
         default: break;
@@ -4988,7 +4994,13 @@ static void watch_duty(uint64_t now)
             C.notmember_since = 0;
         }
     }
-    int want = !C.r || (raft_get_leader(C.r) == 0 && since(now, C.leader_seen) >= NOLEADER_PROBE_NS);
+    /* A core booted from its files at start knows the others only from its last applied state (often none: it applies
+     * nothing before a leader reaches it) and NODE's seeds, and a leader dials it at the peer address the group holds,
+     * which a restart elsewhere (--port 0, another host) changed: until the group records the new one nobody reaches
+     * it and it reaches nobody, so its new incarnation (its volumes open only then, a volume leader's RESIGN with them)
+     * would wait for NOLEADER_PROBE_NS. The watch stream names the others' addresses; it ends when a leader is seen. */
+    int early = C.probe_at_start && cl_mutant() != CLM_PROBELATE;
+    int want = !C.r || (raft_get_leader(C.r) == 0 && (early || since(now, C.leader_seen) >= NOLEADER_PROBE_NS));
     struct conn *w = conn_by_serial(C.watch_conn);
     if (!want) {
         if (w)
@@ -5299,9 +5311,12 @@ int cluster_start(const struct cluster_cfg *cfg)
             fprintf(stderr, "tsdbd: cluster: %s exists: this node does not boot a Raft core (clear the state "
                             "directory and node add it as a new member to make it a voter again)\n",
                     C.retiredfile);
-        } else if ((exists(C.snapfile) || exists(C.logdir)) && core_boot(err, sizeof err) != 0) {
-            fprintf(stderr, "tsdbd: cluster: cannot start the Raft core: %s\n", err);
-            return -1;
+        } else if (exists(C.snapfile) || exists(C.logdir)) {
+            if (core_boot(err, sizeof err) != 0) {
+                fprintf(stderr, "tsdbd: cluster: cannot start the Raft core: %s\n", err);
+                return -1;
+            }
+            C.probe_at_start = 1;
         }
         if (exists(C.copyfile)) {
             /* the copy of the last run, served stale until a watch stream (or, for a voter, its core) confirms it

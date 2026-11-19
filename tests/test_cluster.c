@@ -6240,7 +6240,8 @@ static void scen_resign(void)
     if (v.epoch != e0 + 1 || Nw < 0 || Nw > 2)
         die("the new record of rs: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
     /* the RESIGN moves it, not detection: the restart usually made another server the Raft leader, which must record
-     * the new incarnation (the volume opens only then) without waiting out its node_timeout of 20 s first */
+     * the new incarnation (the volume opens only then) without waiting out its node_timeout of 20 s first; and the
+     * restarted server, at a new peer port nobody dials, must find the others at once (its watch), not after 10 s */
     if (tr - ts0 >= 10000)
         die("the record of rs moved %" PRIu64 " ms after its leader restarted: that is detection (node_timeout 20 s), "
             "not the RESIGN", tr - ts0);
