@@ -17,6 +17,7 @@
  * `test_latest DIR bench` measures the slow path at 10, 100 and 1,000 partitions (docs/design-latest.md, U4). */
 #define _GNU_SOURCE
 #include "internal.h" /* part_footer, tsdb_test_midplace */
+#include "ecpart.h" /* EC_MARK_EC: the settle step */
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -523,10 +524,24 @@ static void world_open(world *w, const char *name, tsdb_options opt, bool classe
 /* the option set of the partial-merge run: parts idle for a second merge, in pieces of max_part_bytes */
 #define PARTIAL(o) ((o).merge_idle_s > 0 && (o).merge_idle_s < 60)
 
+/* the "latest_r6" run: a settle step in the walk (R7). It marks the parts of some partitions as settled (in memory:
+ * their bytes stay in their map, eng_test_mark_ec); the table and the slow path must go on giving the scan's answer.
+ * Merges and optimize stop once a part is marked, as a settled part is out of merges. */
+static bool settle_on;
+static bool settled_any;
+
+static bool settle_pick(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows)
+{
+    (void)level, (void)rows;
+    uint64_t salt = *(uint64_t *)ctx, x = (salt ^ ((uint64_t)vol << 40) ^ (uint64_t)partition) * 0x9e3779b97f4a7c15ull;
+    return (x >> 33) % 3 == 0;
+}
+
 static void random_run(const char *name, tsdb_options opt, bool classes, int steps, uint64_t seed)
 {
     world w;
     rs = seed;
+    settled_any = false;
     set_clock(20 * DAY);
     world_open(&w, name, opt, classes);
     /* only nulls into onlynull */
@@ -566,14 +581,18 @@ static void random_run(const char *name, tsdb_options opt, bool classes, int ste
         else if (r < 76)
             OK(tsdb_commit(w.db));
         else if (r < 80) /* a partial-merge run lets parts pile up: optimize would merge whole partitions */
-            OK(PARTIAL(opt) ? tsdb_flush(w.db) : tsdb_optimize(w.db));
+            OK(PARTIAL(opt) || settled_any ? tsdb_flush(w.db) : tsdb_optimize(w.db));
         else if (r < 82 && w.classes)
             (void)tsdb_test_class_switch(w.db, w.id[si], (int)(rnd() % 4), NULL);
         else if (r < 83 && rnd() % 3 == 0)
             OK(tsdb_drop_before(w.db, (int64_t)(rnd() % 30) * DAY - 5 * DAY));
         else if (r < 86)
             reopen(&w);
-        else
+        else if (r < 92 && settle_on) {
+            uint64_t salt = rnd();
+            if (tsdb_test_mark_ec(w.db, EC_MARK_EC, settle_pick, &salt) > 0)
+                settled_any = true;
+        } else
             do_insert(&w, si, rnd() % 4 == 0, nullp);
         if (w.step % 3 == 0 || r >= 86)
             check_world(&w);
@@ -2086,6 +2105,17 @@ int main(int argc, char **argv)
     o.merge_threads = 1;
     random_run("latest_r5", o, true, steps / 2, 66);
     printf("latest_cache = 0 ok\n");
+
+    /* a settle step in the walk: parts marked settled; the answers stay those of the scan */
+    tsdb_options_init(&o);
+    o.wal_max_batch_rows = 64;
+    o.granule_rows = 32;
+    o.merge_threads = 0;
+    settle_on = true;
+    random_run("latest_r6", o, true, steps, 77);
+    settle_on = false;
+    CHECK(settled_any || steps < 40); /* the run reached a settled state */
+    printf("settle steps ok\n");
 
     test_crash();
     printf("crash ok\n");
