@@ -2442,8 +2442,12 @@ static void handle_in(req *r)
     if (unav_vol != TSDB_VOL_ANY && cvol_active()) {
         uint64_t gen = cluster_lease_gen();
         if (!cluster_lease_valid()) { /* cvol_why (a lock) only once the lease ran out: reads do not queue on it */
-            if (cvol_why(unav_vol) == TSDB_WHY_UNREACHABLE) {
-                /* any op on a volume led here whose read lease ran out (§7.1): refused, the client retries */
+            int cw = cvol_why(unav_vol);
+            if (cw == TSDB_WHY_UNREACHABLE || cw == TSDB_WHY_FENCED) {
+                /* any op on a volume led here whose read lease ran out (§7.1): refused, the client retries. A replica
+                 * without a lease is refused too: it may be a leader deposed while it was cut off (its core stepped
+                 * down at the fence it found queued, or it reopened as a replica), whose rows stop where the new
+                 * leader's began (test_cluster lease, phase b) */
                 reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
                 return;
             }

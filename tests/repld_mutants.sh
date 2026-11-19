@@ -26,6 +26,7 @@
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
 dir=${1:-/tmp}; shift || true
+mkdir -p "$dir" || exit 1
 # mutant, its scenario, an extended regular expression its FAIL line must match
 table=(
     "commitbyleader|replindet|a write with both replicas paused was answered"
