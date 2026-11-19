@@ -396,7 +396,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_ecnames $(or $(TMPDIR),/tmp)
 	for m in nameloose tierloose; do ! ./$(B)/test_ecnames --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_seam $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in seamnoverify seamnoretry cachekeyoff; do ! ./$(B)/test_seam --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),for m in seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop; do ! ./$(B)/test_seam --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
 	$(if $(EC_OBJ),for m in heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always; do ! ./$(B)/test_chunk_heal --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	tests/test_sync_ec.sh

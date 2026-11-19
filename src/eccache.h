@@ -18,7 +18,9 @@
  * decode. Entries live under a byte budget (cache_mb of TSDB_TEST_TIER, 0: 10% of RAM), LRU; a granule larger than
  * the budget is read, used by its reader and dropped. Objects (chunk_obj, one fd per chunk found) live under an fd
  * budget, LRU; an object a reader holds is never closed under it. Two readers that miss the same granule or object
- * read it once: the second waits for the first (on the cache's cv) and then hits.
+ * read it once: the second waits for the first (on the cache's cv) and then hits. Every fill and open broadcasts on
+ * that one cv, so each wakes every waiter (cheap at tens of threads; per-entry waits if it ever shows up).
+ * The budget is per tier, so per handle: an embedded process with several handles has one cache each.
  *
  * No read here runs under db->lock, latest_rw, buf_lock or publish_lock: every caller of granule_read reads a
  * snapshot's granules with no engine lock held (the audit is in tests/test_seam.c's header).
@@ -29,6 +31,10 @@
 #define TSDB_ECCACHE_H
 
 #include "internal.h"
+
+/* What a cache entry costs beyond its granule's bytes: struct ce, BLK_SLACK, two allocator headers, table slots.
+ * The budget counts it (eccache.c ce_cost). */
+#define ECCACHE_ENTRY_OVERHEAD 224
 
 struct chunk_backend;
 struct ec_record;
@@ -49,17 +55,25 @@ int eccache_tier_open(struct tier *t);
 void eccache_tier_close(struct tier *t);
 
 /* The backend the cache reads from. r7-tier hands its per-handle backend over once it is open (owned by the tier, not
- * closed here). Until that is merged, and whenever none was handed over, the cache opens one itself at its first use
- * from the tier's configuration (chunk_be_open2 over dirs, min_up = stores - m) and closes it with the tier; a failed
- * open is tried again at most once a second (its error is the reader's). */
-void eccache_set_backend(struct tier *t, struct chunk_backend *be);
+ * closed here, and kept open until eccache_tier_close: readers use it without a reference). Until that is merged, and
+ * whenever none was handed over, the cache opens one itself at its first use from the tier's configuration
+ * (chunk_be_open2 over dirs, min_up = stores - m) and closes it with the tier; a failed open is tried again at most
+ * once a second (its error is the reader's). TSDB_ERR_LOCKED once that fallback is open: it is never closed under its
+ * readers, and it holds the stores' flocks, so no other backend could have opened beside it. Its stores' states are
+ * those of its open for the life of the handle (a store DOWN then stays DOWN): r7-tier's backend replaces it. */
+int eccache_set_backend(struct tier *t, struct chunk_backend *be);
 /* The volume's uuid of chunk identities (META vuuid=, r7-tier); all zero until set. */
 void eccache_set_vuuid(struct tier *t, uint32_t volume, const uint8_t vuuid[16]);
 /* The backend (opened on first use as above; NULL with *rc set when it cannot be) and the volume's uuid. */
 struct chunk_backend *eccache_backend(struct tier *t, int *rc);
 void eccache_vuuid(struct tier *t, uint32_t volume, uint8_t out[16]);
-/* r7-gc: the object's chunks are gone; its granules leave the cache and it is closed once no reader holds it. */
+/* r7-gc: the object's chunks are gone; its granules leave the cache (a read in flight finishes and is not cached) and
+ * it is closed once no reader holds it (an object that is still opening included). Costs the object's entries only. */
 void eccache_forget(struct tier *t, uint32_t volume, const uint8_t oid[16]);
+/* Heal, replace and settle (chunkheal.c write new files) and a store coming back: the object is closed once no reader
+ * holds it and the next reader opens it again (its cached granules stay: they were checked). A read that sees the
+ * object degraded (a cell failed or rebuilt, a position away, an error) does the same by itself. */
+void eccache_reopen(struct tier *t, uint32_t volume, const uint8_t oid[16]);
 
 /* ------------------------------------------------------------ tests */
 typedef struct eccache_counters {
@@ -77,6 +91,12 @@ void eccache_test_budget(struct tier *t, uint64_t bytes);
 void eccache_test_fd_budget(struct tier *t, uint64_t fds);
 /* Empties the cache of what no reader holds and closes every object no reader holds (a cold cache). */
 void eccache_test_drop(struct tier *t);
+/* Empties the cache of what no reader holds; the objects stay open. */
+void eccache_test_drop_entries(struct tier *t);
+/* Called (when set) after an object's open, before it is listed open, and after a granule's fill, before it is listed
+ * READY: a test forgets the object there to run its race without threads. */
+enum { ECC_HOOK_OPENED = 1, ECC_HOOK_FILLED };
+extern void (*eccache_test_hook)(struct tier *t, int where, const uint8_t oid[16]);
 
 /* r7-seam's test hook (r7-keep, r7-gc, r7-oracle use it): encodes the bytes of p, a listed .part of db, into the
  * tier's chunk store as a new object (oid random, the tier's k and m, epoch 1) and attaches it: p->ec set (the one
@@ -85,6 +105,9 @@ void eccache_test_drop(struct tier *t);
  * TSDB_ERR_NOTFOUND (not listed), TSDB_ERR_LOCKED (merging), TSDB_ERR_INVALID (no tier, already .ec, or a part with
  * no granules), the backend's errors. Tests that attach run with merge_threads = 0 until r7-skip. */
 int ec_test_attach(eng *db, part *p, struct ec_record *rec);
+/* The same with the object encoded from src (p->map_len bytes; NULL: p->map): a test plants an object whose record
+ * matches its chunks but whose bytes are not the part's. */
+int ec_test_attach_from(eng *db, part *p, const uint8_t *src, struct ec_record *rec);
 /* The same for an object already in the store (rec from an earlier ec_test_attach, before a reopen): nothing is
  * written. */
 int ec_test_attach_object(eng *db, part *p, const struct ec_record *rec);
@@ -95,6 +118,10 @@ enum {
     ECC_MUT_NOVERIFY, /* seamnoverify: a miss's bytes are not checked against the granule's crc */
     ECC_MUT_NORETRY,  /* seamnoretry: a mismatch is CORRUPT at once, never read again without RAW */
     ECC_MUT_KEYOFF,   /* cachekeyoff: entries keyed by the offset alone, so two objects collide */
+    ECC_MUT_NORECHECK, /* seamnorecheck: the whole-cell read's bytes are not checked against the crc */
+    ECC_MUT_RETRYERR,  /* seamretryerr: a RAW read that failed is read again whole (double I/O while a store is away) */
+    ECC_MUT_KEEPSTALE, /* seamkeepstale: an object a read saw degraded stays open (a healed chunk is never read) */
+    ECC_MUT_FORGETNOOP, /* forgetnoop: eccache_forget does nothing */
 };
 extern int eccache_mutant;
 #endif

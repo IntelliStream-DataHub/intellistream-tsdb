@@ -28,12 +28,17 @@
 #include <unistd.h>
 
 int eccache_mutant;
+void (*eccache_test_hook)(struct tier *t, int where, const uint8_t oid[16]);
 
 enum { CE_LOADING = 0, CE_READY };
+
+struct og;
 
 typedef struct ce {
     struct ce *hnext;       /* hash chain (or the victims' list once out of the table) */
     struct ce *prev, *next; /* LRU, READY entries only */
+    struct ce *gprev, *gnext; /* the entries of one object (its group), while listed */
+    struct og *grp;
     uint8_t oid[16];
     uint64_t off, len;
     uint32_t crc;
@@ -42,6 +47,9 @@ typedef struct ce {
     bool listed; /* in the hash table */
     uint8_t *data;
 } ce;
+
+_Static_assert(sizeof(ce) + BLK_SLACK + 32 + 2 * sizeof(ce *) <= ECCACHE_ENTRY_OVERHEAD,
+               "ECCACHE_ENTRY_OVERHEAD covers an entry's struct, slack, allocator headers and table slots");
 
 enum { CO_OPENING = 0, CO_OPEN };
 
@@ -55,8 +63,15 @@ typedef struct co {
     uint32_t pins;
     unsigned fds; /* counted against the fd budget from the reservation (OPENING) on */
     int state;
-    bool listed, forgotten;
+    bool listed; /* in the table: found by readers; an object taken out of it is closed by its last reader */
 } co;
+
+/* The entries of one object (by oid), so that eccache_forget walks them and not the whole table. */
+typedef struct og {
+    struct og *hnext;
+    uint8_t oid[16];
+    ce *first;
+} og;
 
 typedef struct vu {
     uint32_t volume;
@@ -73,6 +88,8 @@ struct eccache_tier {
     co **oh;
     size_t ohn, nobj;
     co olru;
+    og **gh;
+    size_t ghn, ngrp;
     uint64_t budget, bytes, fd_budget, fds;
     eccache_counters n; /* the counters (bytes, entries, objs_open, fds_open, budgets filled in on read) */
     vu *vus;
@@ -143,26 +160,102 @@ static void ce_grow(struct eccache_tier *c)
     free(old);
 }
 
-static void ce_insert(struct eccache_tier *c, ce *x)
+static size_t og_hash(const struct eccache_tier *c, const uint8_t oid[16])
+{
+    uint64_t h = ld64(oid) ^ ld64(oid + 8) * 0x9e3779b97f4a7c15ull;
+    h ^= h >> 31;
+    return (size_t)(h & (c->ghn - 1));
+}
+
+static og *og_find(struct eccache_tier *c, const uint8_t oid[16])
+{
+    for (og *g = c->gh[og_hash(c, oid)]; g; g = g->hnext)
+        if (memcmp(g->oid, oid, 16) == 0)
+            return g;
+    return NULL;
+}
+
+static void og_grow(struct eccache_tier *c)
+{
+    if (c->ngrp < 2 * c->ghn)
+        return;
+    size_t n = c->ghn * 2;
+    og **nh = calloc(n, sizeof *nh);
+    if (!nh)
+        return;
+    og **old = c->gh;
+    size_t on = c->ghn;
+    c->gh = nh;
+    c->ghn = n;
+    for (size_t i = 0; i < on; i++)
+        for (og *g = old[i], *nx; g; g = nx) {
+            nx = g->hnext;
+            size_t h = og_hash(c, g->oid);
+            g->hnext = nh[h];
+            nh[h] = g;
+        }
+    free(old);
+}
+
+/* Lists x (LOADING) in the table and in its object's group; *spare is a group allocated outside the leaf, taken when
+ * the object has none yet (mu held). */
+static void ce_insert(struct eccache_tier *c, ce *x, og **spare)
 {
     size_t h = ce_hash(c, x->oid, x->off);
     x->hnext = c->eh[h];
     c->eh[h] = x;
     x->listed = true;
     c->nent++;
+    og *g = og_find(c, x->oid);
+    if (!g) {
+        g = *spare;
+        *spare = NULL;
+        memcpy(g->oid, x->oid, 16);
+        size_t gh = og_hash(c, g->oid);
+        g->hnext = c->gh[gh];
+        c->gh[gh] = g;
+        c->ngrp++;
+        og_grow(c);
+    }
+    x->grp = g;
+    x->gprev = NULL;
+    x->gnext = g->first;
+    if (g->first)
+        g->first->gprev = x;
+    g->first = x;
     ce_grow(c);
 }
 
 static void ce_unhash(struct eccache_tier *c, ce *x)
 {
+    if (!x->listed)
+        return;
     for (ce **pp = &c->eh[ce_hash(c, x->oid, x->off)]; *pp; pp = &(*pp)->hnext)
         if (*pp == x) {
             *pp = x->hnext;
             x->hnext = NULL;
-            x->listed = false;
-            c->nent--;
-            return;
+            break;
         }
+    x->listed = false;
+    c->nent--;
+    og *g = x->grp;
+    if (x->gprev)
+        x->gprev->gnext = x->gnext;
+    else
+        g->first = x->gnext;
+    if (x->gnext)
+        x->gnext->gprev = x->gprev;
+    x->gprev = x->gnext = NULL;
+    x->grp = NULL;
+    if (!g->first) { /* the object's last entry: its group goes (a small free under the leaf, no I/O) */
+        for (og **pp = &c->gh[og_hash(c, g->oid)]; *pp; pp = &(*pp)->hnext)
+            if (*pp == g) {
+                *pp = g->hnext;
+                break;
+            }
+        c->ngrp--;
+        free(g);
+    }
 }
 
 static void lru_unlink(ce *x)
@@ -183,13 +276,22 @@ static void lru_front(struct eccache_tier *c, ce *x)
 }
 
 /* Takes a READY entry out of the table and the LRU (mu held); it is freed by whoever lets go of it last. */
+/* What an entry costs against the budget: its bytes, its slack, its struct, the allocator's headers and its share of
+ * the tables (an entry of a slow series' granule is a few hundred bytes, so the overhead is not small beside it). */
+static uint64_t ce_cost(const ce *x)
+{
+    return x->len + ECCACHE_ENTRY_OVERHEAD;
+}
+
+/* Takes x out of the table, its group, the LRU and the bytes (mu held). Only a READY entry is in the LRU and the
+ * bytes; a LOADING one taken out goes on to its reader (and its waiters look again), never into the cache. */
 static void ce_remove(struct eccache_tier *c, ce *x)
 {
     ce_unhash(c, x);
-    if (x->prev)
+    if (x->prev) {
         lru_unlink(x);
-    if (x->state == CE_READY)
-        c->bytes -= x->len;
+        c->bytes -= ce_cost(x);
+    }
 }
 
 /* Evicts unpinned entries from the cold end until the bytes fit the budget; the victims go to *vict (mu held). */
@@ -272,8 +374,12 @@ static void co_lru_front(struct eccache_tier *c, co *o)
     c->olru.next = o;
 }
 
+/* Takes o out of the table and the LRU, and its fds out of the count (mu held); its reader, or the caller when none
+ * holds it, closes it. */
 static void co_remove(struct eccache_tier *c, co *o)
 {
+    if (!o->listed)
+        return;
     for (co **pp = &c->oh[co_hash(c, o->volume, o->oid)]; *pp; pp = &(*pp)->hnext)
         if (*pp == o) {
             *pp = o->hnext;
@@ -393,6 +499,8 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, co **out)
         eccache_vuuid(c->t, e->volume, u);
         rc = chunk_obj_open(be, e->volume, u, r->oid, &gm, nw->sums, &nw->o);
     }
+    if (eccache_test_hook)
+        eccache_test_hook(c->t, ECC_HOOK_OPENED, r->oid);
     pthread_mutex_lock(&c->mu);
     if (rc) {
         co_remove(c, nw);
@@ -404,24 +512,27 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, co **out)
     }
     nw->state = CO_OPEN;
     c->n.obj_opens++;
-    co_lru_front(c, nw);
+    if (nw->listed) /* else forgotten while it opened: its reader closes it */
+        co_lru_front(c, nw);
     pthread_cond_broadcast(&c->cv);
     pthread_mutex_unlock(&c->mu);
     *out = nw;
     return 0;
 }
 
-static void obj_put(struct eccache_tier *c, co *o)
+/* Lets go of o. `stale`: the read just made saw it degraded (a cell that failed or was rebuilt, a position away, an
+ * error), so it leaves the table and the next reader opens it again: a chunk that heal or replace wrote since is a new
+ * file (chunkheal.c), and a position that was away at the open may be back; an open object keeps its fds on the old
+ * inodes and its positions' state for its life. */
+static void obj_put(struct eccache_tier *c, co *o, bool stale)
 {
     co *vict = NULL;
     pthread_mutex_lock(&c->mu);
     o->pins--;
-    if (o->pins == 0 && o->forgotten && o->listed) {
+    if (stale && eccache_mutant != ECC_MUT_KEEPSTALE)
         co_remove(c, o);
-        o->hnext = vict;
-        vict = o;
-    } else if (o->pins == 0 && !o->listed) {
-        vict = o; /* forgotten while held: closed by its last reader */
+    if (o->pins == 0 && !o->listed) {
+        vict = o; /* out of the table (stale, forgotten, reopened): closed by its last reader */
         o->hnext = NULL;
     } else {
         co_evict(c, 0, &vict);
@@ -466,18 +577,26 @@ static int fill(struct eccache_tier *c, const part *p, const struct ecpart *e, c
         return rc;
     }
     chunk_report rep;
+    memset(&rep, 0, sizeof rep);
     rc = chunk_obj_read(o->o, x->off, x->len, x->data, CHUNK_RR_RAW, &rep);
     atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
     bool ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
-    if (!ok && rc != TSDB_ERR_NOMEM && rc != TSDB_ERR_INVALID && eccache_mutant != ECC_MUT_NORETRY) {
-        /* rot that RAW cannot see, or a chunk RAW read around badly: whole cells against the record's sums */
+    bool retried = false;
+    /* Only a mismatch is read again. A RAW read that fails (UNAVAILABLE, CORRUPT) met erasures: positions absent,
+     * away or unreadable, the same ones a whole-cell read meets, which can only add the cells that fail their sums;
+     * reading again would double the I/O of every miss while a store is away and answer the same. */
+    if ((rc == 0 || eccache_mutant == ECC_MUT_RETRYERR) && !ok && rc != TSDB_ERR_NOMEM && rc != TSDB_ERR_INVALID &&
+        eccache_mutant != ECC_MUT_NORETRY) {
+        /* rot that RAW cannot see: whole cells against the record's sums */
         pthread_mutex_lock(&c->mu);
         c->n.retries++;
         pthread_mutex_unlock(&c->mu);
+        retried = true;
         rc = chunk_obj_read(o->o, x->off, x->len, x->data, 0, &rep);
-        ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
+        ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || eccache_mutant == ECC_MUT_NORECHECK ||
+                         (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
     }
-    obj_put(c, o);
+    obj_put(c, o, rc != 0 || retried || rep.bad_cells || rep.decoded_cells);
     bool mismatch = !ok && rc == 0;
     if (mismatch)
         rc = TSDB_ERR_CORRUPT;
@@ -514,6 +633,7 @@ int ec_granule_read(codec_ctx *cx, const part *p, const granule *g, int type, in
         return TSDB_ERR_CORRUPT;
     }
     ce *nw = NULL, *x, *vict = NULL;
+    og *spare = NULL;
     pthread_mutex_lock(&c->mu);
     for (;;) {
         x = ce_find(c, e->rec.oid, g->off);
@@ -533,16 +653,18 @@ int ec_granule_read(codec_ctx *cx, const part *p, const granule *g, int type, in
             nw = NULL;
             x->state = CE_LOADING;
             x->pins = 1;
-            ce_insert(c, x);
+            ce_insert(c, x, &spare);
             c->n.misses++;
             break;
         }
         pthread_mutex_unlock(&c->mu); /* allocations outside the leaf */
         nw = calloc(1, sizeof *nw);
+        spare = nw ? calloc(1, sizeof *spare) : NULL;
         /* BLK_SLACK zeroed bytes past the granule: the decoders read up to that far beyond a block (in a mapped
          * part the footer covers it), and granule_decode runs on this buffer */
-        if (!nw || !(nw->data = malloc(len + BLK_SLACK))) {
+        if (!nw || !spare || !(nw->data = malloc(len + BLK_SLACK))) {
             free(nw);
+            free(spare);
             return TSDB_ERR_NOMEM;
         }
         memset(nw->data + len, 0, BLK_SLACK);
@@ -553,21 +675,29 @@ int ec_granule_read(codec_ctx *cx, const part *p, const granule *g, int type, in
         pthread_mutex_lock(&c->mu);
     }
     pthread_mutex_unlock(&c->mu);
-    if (nw) { /* another reader filled it meanwhile */
+    free(spare); /* the object had a group, or another reader filled the entry meanwhile */
+    if (nw) {
         free(nw->data);
         free(nw);
     }
     int rc = 0;
     if (x->state == CE_LOADING) {
         rc = fill(c, p, e, g, x);
+        if (eccache_test_hook)
+            eccache_test_hook(c->t, ECC_HOOK_FILLED, e->rec.oid);
         pthread_mutex_lock(&c->mu);
         if (rc) {
             ce_unhash(c, x);
+        } else if (!x->listed) {
+            x->state = CE_READY; /* forgotten while it was read: its reader decodes it and frees it */
+        } else if (ce_cost(x) > c->budget) {
+            /* larger than the whole budget: used by its reader and dropped, without emptying the cache for it */
+            ce_unhash(c, x);
+            x->state = CE_READY;
+            c->n.uncached++;
         } else {
             x->state = CE_READY;
-            c->bytes += x->len;
-            if (x->len > c->budget)
-                c->n.uncached++;
+            c->bytes += ce_cost(x);
             lru_front(c, x);
             ce_evict(c, &vict);
         }
@@ -662,11 +792,14 @@ int eccache_tier_open(struct tier *t)
     c->t = t;
     c->ehn = 1024;
     c->ohn = 64;
+    c->ghn = 64;
     c->eh = calloc(c->ehn, sizeof *c->eh);
     c->oh = calloc(c->ohn, sizeof *c->oh);
-    if (!c->eh || !c->oh) {
+    c->gh = calloc(c->ghn, sizeof *c->gh);
+    if (!c->eh || !c->oh || !c->gh) {
         free(c->eh);
         free(c->oh);
+        free(c->gh);
         free(c);
         return TSDB_ERR_NOMEM;
     }
@@ -697,6 +830,11 @@ void eccache_tier_close(struct tier *t)
     /* the last reference: no reader is left */
     for (size_t i = 0; i < c->ehn; i++)
         ce_free_list(c->eh[i]);
+    for (size_t i = 0; i < c->ghn; i++)
+        for (og *g = c->gh[i], *nx; g; g = nx) {
+            nx = g->hnext;
+            free(g);
+        }
     for (size_t i = 0; i < c->ohn; i++)
         for (co *o = c->oh[i], *nx; o; o = nx) {
             nx = o->hnext;
@@ -710,6 +848,7 @@ void eccache_tier_close(struct tier *t)
         chunk_be_close(be);
     free(c->eh);
     free(c->oh);
+    free(c->gh);
     free(c->vus);
     pthread_mutex_destroy(&c->mu);
     pthread_cond_destroy(&c->cv);
@@ -718,16 +857,18 @@ void eccache_tier_close(struct tier *t)
     t->cache = NULL;
 }
 
-void eccache_set_backend(struct tier *t, struct chunk_backend *be)
+int eccache_set_backend(struct tier *t, struct chunk_backend *be)
 {
     struct eccache_tier *c = t->cache;
     pthread_mutex_lock(&c->be_mu);
     chunk_backend *old = atomic_load(&c->be);
-    if (old && c->be_owned)
-        chunk_be_close(old); /* only before the first read: r7-tier hands its backend over at tier_open */
-    c->be_owned = false;
-    atomic_store(&c->be, be);
+    /* The fallback is read without a reference (readers load c->be and open objects through it), so it is never
+     * closed under them; and it holds every store's flock, so a backend opened beside it could not have been. */
+    int rc = old && c->be_owned ? TSDB_ERR_LOCKED : 0;
+    if (rc == 0)
+        atomic_store(&c->be, be);
     pthread_mutex_unlock(&c->be_mu);
+    return rc;
 }
 
 struct chunk_backend *eccache_backend(struct tier *t, int *rc)
@@ -792,37 +933,52 @@ void eccache_vuuid(struct tier *t, uint32_t volume, uint8_t out[16])
     pthread_mutex_unlock(&c->mu);
 }
 
-void eccache_forget(struct tier *t, uint32_t volume, const uint8_t oid[16])
+/* Takes the object's entries out (each freed now, or by its reader: a fill in flight goes on to its reader and is
+ * never cached) and the object out of the table, opening or open (closed now, or by its last reader). */
+static void drop_object(struct eccache_tier *c, uint32_t volume, const uint8_t oid[16], bool entries)
 {
-    struct eccache_tier *c = t ? t->cache : NULL;
-    if (!c)
-        return;
     ce *vict = NULL;
     co *ov = NULL;
     pthread_mutex_lock(&c->mu);
-    for (size_t i = 0; i < c->ehn; i++)
-        for (ce *x = c->eh[i], *nx; x; x = nx) {
-            nx = x->hnext;
-            if (x->state == CE_READY && memcmp(x->oid, oid, 16) == 0) {
-                ce_remove(c, x);
-                if (x->pins == 0) {
-                    x->hnext = vict;
-                    vict = x;
-                }
-            }
+    og *g = entries && eccache_mutant != ECC_MUT_FORGETNOOP ? og_find(c, oid) : NULL;
+    while (g) {
+        ce *x = g->first;
+        bool last = x->gnext == NULL; /* the group is freed with its last entry */
+        ce_remove(c, x);
+        if (x->pins == 0) {
+            x->hnext = vict;
+            vict = x;
         }
-    co *o = co_find(c, volume, oid);
-    if (o && o->state == CO_OPEN) {
+        if (last)
+            break;
+    }
+    co *o = eccache_mutant != ECC_MUT_FORGETNOOP ? co_find(c, volume, oid) : NULL;
+    if (o) {
+        co_remove(c, o);
         if (o->pins == 0) {
-            co_remove(c, o);
+            o->hnext = NULL;
             ov = o;
-        } else {
-            o->forgotten = true;
         }
     }
+    if (o || vict)
+        pthread_cond_broadcast(&c->cv); /* waiters on a LOADING entry or an OPENING object taken out look again */
     pthread_mutex_unlock(&c->mu);
     ce_free_list(vict);
     co_close_list(c, ov);
+}
+
+void eccache_forget(struct tier *t, uint32_t volume, const uint8_t oid[16])
+{
+    struct eccache_tier *c = t ? t->cache : NULL;
+    if (c)
+        drop_object(c, volume, oid, true);
+}
+
+void eccache_reopen(struct tier *t, uint32_t volume, const uint8_t oid[16])
+{
+    struct eccache_tier *c = t ? t->cache : NULL;
+    if (c)
+        drop_object(c, volume, oid, false);
 }
 
 /* ------------------------------------------------------------ tests */
@@ -862,6 +1018,19 @@ void eccache_test_fd_budget(struct tier *t, uint64_t fds)
     co_evict(c, 0, &vict);
     pthread_mutex_unlock(&c->mu);
     co_close_list(c, vict);
+}
+
+void eccache_test_drop_entries(struct tier *t)
+{
+    struct eccache_tier *c = t->cache;
+    ce *vict = NULL;
+    pthread_mutex_lock(&c->mu);
+    uint64_t b = c->budget;
+    c->budget = 0;
+    ce_evict(c, &vict);
+    c->budget = b;
+    pthread_mutex_unlock(&c->mu);
+    ce_free_list(vict);
 }
 
 void eccache_test_drop(struct tier *t)
@@ -930,6 +1099,11 @@ int ec_test_attach_object(eng *db, part *p, const ec_record *rec)
 
 int ec_test_attach(eng *db, part *p, ec_record *rec_out)
 {
+    return ec_test_attach_from(db, p, NULL, rec_out);
+}
+
+int ec_test_attach_from(eng *db, part *p, const uint8_t *src, ec_record *rec_out)
+{
     tier *t = db->tier;
     if (!t || !t->cache || p->ix.n == 0)
         return TSDB_ERR_INVALID;
@@ -957,7 +1131,9 @@ int ec_test_attach(eng *db, part *p, ec_record *rec_out)
     r.m = g.m;
     r.cell_bytes = g.cell;
     r.object_len = p->map_len;
-    r.object_xxh64 = xxh64(p->map, p->map_len, 0);
+    if (!src)
+        src = p->map;
+    r.object_xxh64 = xxh64(src, p->map_len, 0);
     r.writer_epoch = 1;
     r.settle_ms = eng_now_ms(db);
     snprintf(r.source, sizeof r.source, "%s", p->name);
@@ -968,11 +1144,16 @@ int ec_test_attach(eng *db, part *p, ec_record *rec_out)
     eccache_vuuid(t, db->tier_vol, u);
     rc = chunk_be_see_epoch(be, db->tier_vol, 1);
     if (rc == 0)
-        rc = chunk_be_put_object(be, db->tier_vol, u, r.oid, &g, 1, p->map, ~0u, r.sums);
-    if (rc == 0)
-        rc = ec_test_attach_object(db, p, &r);
+        rc = chunk_be_put_object(be, db->tier_vol, u, r.oid, &g, 1, src, ~0u, r.sums);
     if (rc == 0 && rec_out)
-        rc = rec_copy(rec_out, &r);
+        rc = rec_copy(rec_out, &r); /* before the attach: a failure after it would report a part left attached */
+    if (rc == 0) {
+        rc = ec_test_attach_object(db, p, &r);
+        if (rc && rec_out) {
+            free(rec_out->sums);
+            rec_out->sums = NULL;
+        }
+    }
     free(r.sums);
     return rc <= -100 ? TSDB_ERR_IO : rc; /* the chunk layer's own codes */
 }

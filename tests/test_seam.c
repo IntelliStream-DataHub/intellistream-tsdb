@@ -22,8 +22,14 @@
  * Merges never take an .ec part (r7-skip's barriers; tests that attach run with merge_threads = 0).
  *
  * Mutants (--mutant NAME; the Makefile requires each to fail): seamnoverify (the damage case reads wrong bytes),
- * seamnoretry (the damage case says CORRUPT), cachekeyoff (every part's first granule is at the same offset: the warm
- * run meets another object's bytes and refuses them).
+ * seamnoretry (the damage case says CORRUPT), cachekeyoff (every part's first granule is at the same offset: the cold
+ * run meets another object's bytes and the len/crc check of a hit refuses them; that check, not the key, is what
+ * kills it), seamnorecheck (case_bad's self-consistent wrong object decodes), seamretryerr (case_down counts second
+ * reads after UNAVAILABLE), seamkeepstale (case_heal reads the damaged inode again), forgetnoop (case_heal's
+ * eccache_reopen and case_forget). An object closed under a reader (case_threads with an fd budget of 8) is found by
+ * ASan (make asan), not by a plain run.
+ * Not here: tsdb_query_multi (volumes.c, the same engine queries per series) and the statistics' byte columns of an
+ * .ec part (eccache_part_bytes is the map's length until r7-ecfile gives the object its own).
  */
 #include "internal.h"
 #include "chunk.h"
@@ -57,7 +63,7 @@ static char scratch[512];
 #define K 3
 #define M 2
 #define NST 5
-#define NSER 3
+#define NSER 5
 #define DAY 86400000LL
 
 static char base[600], dbdir[700], stores[NST][700];
@@ -183,7 +189,7 @@ static int raw_fn(void *ctx, const int64_t *ts, const void *v, size_t n)
     return 0;
 }
 
-static const int types[NSER] = {TSDB_FLOAT32, TSDB_FLOAT64, TSDB_INT64};
+static const int types[NSER] = {TSDB_FLOAT32, TSDB_FLOAT64, TSDB_INT64, TSDB_BOOL, TSDB_STATE};
 static uint32_t sids[NSER];
 
 /* Every query kind over every series; the first failing return code is put in *rc. */
@@ -198,11 +204,13 @@ static void run_all(eng *db, buf *o, int *rc)
             *rc = r_;                                                                                                  \
     } while (0)
     for (int s = 0; s < NSER; s++) {
-        rawctx rc8 = {o, types[s] == TSDB_FLOAT32 ? 4 : 8};
+        rawctx rc8 = {o, (int)type_width(types[s])};
         Q(eng_query_raw_ex(db, sids[s], INT64_MIN, INT64_MAX, false, 0, raw_fn, &rc8));
         Q(eng_query_raw_ex(db, sids[s], INT64_MIN, INT64_MAX, true, 3000, raw_fn, &rc8));
         Q(eng_query_raw_ex(db, sids[s], DAY + 12345, 3 * DAY + 777, false, 0, raw_fn, &rc8));
-        Q(eng_query_lttb(db, sids[s], 0, 8 * DAY, 500, false, 0, raw_fn, &rc8));
+        bool state = types[s] == TSDB_STATE; /* no LTTB and no TWA of a state (TSDB_ERR_INVALID) */
+        if (!state)
+            Q(eng_query_lttb(db, sids[s], 0, 8 * DAY, 500, false, 0, raw_fn, &rc8));
         tsdb_group gs[3] = {{TSDB_HOUR, 1, NULL}, {TSDB_MINUTE, 7, NULL}, {TSDB_DAY, 1, NULL}};
         for (int gi = 0; gi < 3; gi++) {
             bucketer bk;
@@ -216,6 +224,8 @@ static void run_all(eng *db, buf *o, int *rc)
             Q(eng_query_spread(db, sids[s], 0, 8 * DAY, &bk, false, 0, &sb, &nb));
             put(o, sb, nb * sizeof *sb);
             free(sb);
+            if (state)
+                continue;
             tsdb_twa_opts to = {.method = gi ? TSDB_TWA_LINEAR : TSDB_TWA_STEP, .no_stats = 1};
             tsdb_twa_bucket *tb = NULL;
             Q(eng_query_twa(db, sids[s], 5000, 7 * DAY, &bk, &to, &tb, &nb));
@@ -249,7 +259,7 @@ static uint64_t xs(void)
 
 static void fill_db(eng *db)
 {
-    const char *names[NSER] = {"f32", "f64", "i64"};
+    const char *names[NSER] = {"f32", "f64", "i64", "bool", "state"};
     size_t n = 100000; /* 6 s apart: about 7 days, a part per day and series */
     int64_t *ts = malloc(n * 8);
     uint8_t *v = malloc(n * 8);
@@ -260,12 +270,24 @@ static void fill_db(eng *db)
             t += 6000 - 500 + (int64_t)(xs() % 1000);
             ts[i] = t;
             double d = 20 + 5 * (double)(i % 3600) / 3600.0 + (double)(xs() % 1000) / 100.0;
-            if (types[s] == TSDB_FLOAT32)
-                ((float *)v)[i] = (float)d;
-            else if (types[s] == TSDB_FLOAT64)
-                ((double *)v)[i] = d;
-            else
-                ((int64_t *)v)[i] = (int64_t)(d * 1000);
+            uint64_t z;
+            if (types[s] == TSDB_FLOAT32) {
+                float f = (float)d;
+                uint32_t u;
+                memcpy(&u, &f, 4);
+                z = u;
+            } else if (types[s] == TSDB_FLOAT64) {
+                memcpy(&z, &d, 8);
+            } else if (types[s] == TSDB_INT64) {
+                z = (uint64_t)(int64_t)(d * 1000);
+            } else if (types[s] == TSDB_BOOL) {
+                z = (i / 37) & 1;
+            } else {
+                z = (i / 50) % 5;
+            }
+            if (i % 101 == 7)
+                z = type_null(types[s]); /* nulls in every type */
+            memcpy(v + i * type_width(types[s]), &z, type_width(types[s]));
         }
         CHECK(eng_insert_series(db, types[s], sids[s], ts, v, n) == 0);
     }
@@ -280,12 +302,19 @@ static void fill_db(eng *db)
             } else if (types[s] == TSDB_FLOAT64) {
                 double d = i;
                 memcpy(&z, &d, 8);
+            } else if (types[s] == TSDB_BOOL) {
+                z = (uint64_t)i & 1;
             } else {
-                z = (uint64_t)i;
+                z = (uint64_t)i % 3;
             }
+            if (i % 9 == 4)
+                z = type_null(types[s]);
             CHECK(eng_insert_series(db, types[s], sids[s], &t1, &z, 1) == 0);
         }
     CHECK(eng_flush(db) == 0);
+    /* an hour deleted on day 3: its tombstone part hides rows of attached parts (decode_visible reads them) */
+    for (int s = 0; s < NSER; s++)
+        CHECK(eng_delete_range(db, sids[s], 3 * DAY + 1000, 3 * DAY + 3600000) == 0);
     free(ts);
     free(v);
 }
@@ -304,6 +333,8 @@ static int attach_all(eng *db, bool fresh_objects)
     size_t n = list_parts(db, ps, MAXP);
     int attached = 0;
     for (size_t i = 0; i < n; i++) {
+        if (ps[i]->ix.n == 0)
+            continue; /* a tombstone part: no granules to read */
         if (fresh_objects) {
             CHECK(nobjs < MAXP);
             if (nobjs >= MAXP)
@@ -397,13 +428,17 @@ static void case_equal(h *x)
     run_all(db, &ref, &rc);
     CHECK(rc == 0 && ref.n > 1000000);
     for (int s = 0; s < NSER; s++) {
-        rawref[s] = (hsum){0, 0, types[s] == TSDB_FLOAT32 ? 4 : 8};
+        rawref[s] = (hsum){0, 0, (int)type_width(types[s])};
         CHECK(eng_query_raw_ex(db, sids[s], INT64_MIN, INT64_MAX, false, 0, hash_fn, &rawref[s]) == 0);
     }
-    part *ps[MAXP];
-    size_t np = list_parts(db, ps, MAXP);
-    CHECK(np >= 2 * NSER);
-    /* residency before: the map's; the part bytes are the map's length */
+    part *all[MAXP], *ps[MAXP];
+    size_t na = list_parts(db, all, MAXP), np = 0, ntomb = 0;
+    for (size_t i = 0; i < na; i++) {
+        if (all[i]->ix.n)
+            ps[np++] = all[i];
+        ntomb += all[i]->nt > 0;
+    }
+    CHECK(np >= 2 * NSER && ntomb >= NSER); /* the delete's tombstones are parts of their own */
     int n = attach_all(db, true);
     CHECK(n == (int)np);
     uint64_t c0 = atomic_load(&ec_calls[EC_CALL_GRANULE_READ]);
@@ -425,7 +460,34 @@ static void case_equal(h *x)
     uint64_t res = 0;
     for (size_t i = 0; i < np; i++)
         res += eccache_resident(ps[i], 0, ps[i]->map_len);
-    CHECK(res == k2.bytes); /* the cache's bytes, part by part */
+    /* the cache's granule bytes, part by part; the budget counts each entry's overhead as well */
+    CHECK(res > 0 && res + k2.entries * ECCACHE_ENTRY_OVERHEAD == k2.bytes);
+    /* the statistics' residency (tsdb_series_stats resident) of the .ec parts is the cache's */
+    uint32_t ids[NSER];
+    memcpy(ids, sids, sizeof ids);
+    for (int i = 1; i < NSER; i++) /* ascending */
+        for (int j = i; j > 0 && ids[j - 1] > ids[j]; j--) {
+            uint32_t t = ids[j];
+            ids[j] = ids[j - 1];
+            ids[j - 1] = t;
+        }
+    sscx *sx = sscx_open(db);
+    CHECK(sx != NULL);
+    if (sx) {
+        tsdb_series_stat st[NSER];
+        uint64_t probes = 0;
+        memset(st, 0, sizeof st);
+        sscx_run(sx, ids, NSER, st, &probes, true);
+        uint64_t sres = 0;
+        for (int i = 0; i < NSER; i++)
+            sres += st[i].resident_bytes;
+        CHECK(sres == res);
+        sscx_close(sx);
+    }
+    /* the fallback backend is open: a handover now is refused, never closes it under readers */
+    static char not_a_backend;
+    CHECK(eccache_set_backend(x->t, (chunk_backend *)(void *)&not_a_backend) == TSDB_ERR_LOCKED);
+    CHECK(same_as_ref(db, "after a refused handover"));
     printf("test_seam: equal: %zu parts, %" PRIu64 " granules read, %" PRIu64 " hits, %" PRIu64 " bytes cached\n",
            np, k2.misses, k2.hits, k2.bytes);
 }
@@ -510,7 +572,9 @@ static void case_down(h *x)
     chunk_be_opts bo = {.min_up = 0};
     CHECK(chunk_be_open2(&be, pp, NST, NULL, &bo) == 0);
     if (be) {
-        eccache_set_backend(x->t, be);
+        CHECK(eccache_set_backend(x->t, be) == 0); /* the fallback never opened */
+        eccache_counters kd;
+        eccache_get_counters(x->t, &kd);
         int unavail = 0;
         for (int s = 0; s < NSER; s++) {
             /* an object whose k' positions are on the stores left is still read; the rest are away, never lost */
@@ -526,6 +590,7 @@ static void case_down(h *x)
         eccache_counters k;
         eccache_get_counters(x->t, &k);
         CHECK(k.corrupt == 0); /* objects whose k' positions are up were read */
+        CHECK(k.retries == kd.retries); /* an UNAVAILABLE RAW read is not read again whole (seamretryerr) */
     }
     h_close(x);
     if (be)
@@ -561,7 +626,7 @@ static int job_run(eng *db, const qjob *j, hsum *out)
 {
     out->h = 0;
     out->n = 0;
-    out->w = types[j->s] == TSDB_FLOAT32 ? 4 : 8;
+    out->w = (int)type_width(types[j->s]);
     return eng_query_raw_ex(db, sids[j->s], j->a, j->b, false, 0, hash_fn, out);
 }
 
@@ -581,8 +646,15 @@ static void *thr(void *arg)
     return NULL;
 }
 
-static void case_threads(h *x)
+/* fdb: an fd budget (0: the default); 8 holds one object of 5 chunks, so objects are closed while other threads
+ * read through theirs (an object a reader holds must never be closed under it) */
+static void case_threads(h *x, uint64_t fdb)
 {
+    eccache_counters kb;
+    eccache_get_counters(x->t, &kb);
+    if (fdb)
+        eccache_test_fd_budget(x->t, fdb);
+    atomic_store(&thr_bad, 0);
     for (int i = 0; i < NJ; i++) {
         jobs[i].s = i % NSER;
         jobs[i].a = (int64_t)(xs() % (uint64_t)(6 * DAY));
@@ -615,8 +687,229 @@ static void case_threads(h *x)
     eccache_get_counters(x->t, &k2);
     CHECK(k2.bytes == 0 && k2.entries == 0 && k2.uncached > k1.uncached);
     eccache_test_budget(x->t, 64 << 20);
-    printf("test_seam: threads: 32 x 40 queries, %" PRIu64 " evictions, %" PRIu64 " waits\n",
-           k1.evictions - k0.evictions, k1.waits - k0.waits);
+    if (fdb) {
+        CHECK(k1.obj_closes > k0.obj_closes + 32); /* objects were closed while the threads read */
+        eccache_test_fd_budget(x->t, kb.fd_budget);
+    }
+    printf("test_seam: threads (fd budget %" PRIu64 "): 32 x 40 queries, %" PRIu64 " evictions, %" PRIu64
+           " waits, %" PRIu64 " objects closed\n",
+           fdb ? fdb : kb.fd_budget, k1.evictions - k0.evictions, k1.waits - k0.waits, k1.obj_closes - k0.obj_closes);
+}
+
+/* the attached part of object j, and the series of its first granule */
+static part *obj_part(eng *db, size_t j, int *ser)
+{
+    part *ps[MAXP];
+    size_t np = list_parts(db, ps, MAXP);
+    for (size_t i = 0; i < np; i++)
+        if (!strcmp(objs[j].name, ps[i]->name)) {
+            *ser = 0;
+            while (*ser < NSER && sids[*ser] != ps[i]->ix.rser[0])
+                (*ser)++;
+            return *ser < NSER ? ps[i] : NULL;
+        }
+    return NULL;
+}
+
+static int read_part(eng *db, const part *p, int s, hsum *o)
+{
+    *o = (hsum){0, 0, (int)type_width(types[s])};
+    return eng_query_raw_ex(db, sids[s], p->min_ts, p->max_ts + 1, false, 0, hash_fn, o);
+}
+
+static bool copy_file(const char *from, const char *to)
+{
+    char *b = NULL;
+    FILE *f = fopen(from, "rb"), *g = NULL;
+    bool ok = false;
+    if (f && fseek(f, 0, SEEK_END) == 0) {
+        long n = ftell(f);
+        rewind(f);
+        b = malloc((size_t)n + 1);
+        g = fopen(to, "wb");
+        ok = b && g && fread(b, 1, (size_t)n, f) == (size_t)n && fwrite(b, 1, (size_t)n, g) == (size_t)n;
+    }
+    if (f)
+        fclose(f);
+    if (g && fclose(g) != 0)
+        ok = false;
+    free(b);
+    return ok;
+}
+
+/* fds of this process open on a chunk file of the object (whatever its name now) */
+static int fds_on(const uint8_t oid[16])
+{
+    char hex[33];
+    chunk_oid_hex(oid, hex);
+    DIR *d = opendir("/proc/self/fd");
+    if (!d)
+        return 0; /* not Linux: not counted */
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        char p[300], t[4096];
+        snprintf(p, sizeof p, "/proc/self/fd/%s", de->d_name);
+        ssize_t k = readlink(p, t, sizeof t - 1);
+        if (k > 0) {
+            t[k] = 0;
+            n += strstr(t, hex) != NULL;
+        }
+    }
+    closedir(d);
+    return n;
+}
+
+/* A chunk healed (a new file renamed over the damaged one, as chunkheal.c writes it) is read once the object is
+ * opened again: a read that saw the object degraded drops it (seamkeepstale keeps it: the old inode stays read). */
+static void case_heal(h *x)
+{
+    int s;
+    part *p = obj_part(x->db, 0, &s);
+    CHECK(p);
+    if (!p)
+        return;
+    hsum want, o;
+    CHECK(read_part(x->db, p, s, &want) == 0 && want.n > 0);
+    char path[4096], good[4200];
+    CHECK(chunk_path(objs[0].rec.oid, 0, path, sizeof path));
+    snprintf(good, sizeof good, "%s.good", path);
+    CHECK(copy_file(path, good));
+    chunk_geom g;
+    CHECK(chunk_geom_make(&g, objs[0].rec.k, objs[0].rec.m, objs[0].rec.cell_bytes, objs[0].rec.object_len) == 0);
+    int fd = open(path, O_RDWR);
+    CHECK(fd >= 0);
+    for (uint64_t off = 10; off < chunk_pos_len(&g, 0); off += 700) {
+        uint8_t b;
+        CHECK(pread(fd, &b, 1, CHUNK_HDR_BYTES + off) == 1);
+        b ^= 0xa5;
+        CHECK(pwrite(fd, &b, 1, CHUNK_HDR_BYTES + off) == 1);
+    }
+    close(fd);
+    eccache_test_drop(x->t);
+    eccache_counters k0, k1, k2, k3;
+    eccache_get_counters(x->t, &k0);
+    CHECK(read_part(x->db, p, s, &o) == 0 && o.h == want.h && o.n == want.n);
+    eccache_get_counters(x->t, &k1);
+    CHECK(k1.retries > k0.retries && k1.corrupt == k0.corrupt);
+    CHECK(rename(good, path) == 0); /* healed: a new inode under the chunk's name */
+    eccache_test_drop_entries(x->t);
+    CHECK(read_part(x->db, p, s, &o) == 0 && o.h == want.h && o.n == want.n);
+    eccache_get_counters(x->t, &k2);
+    CHECK(k2.retries == k1.retries); /* the healed chunk was read, not the old inode */
+    /* eccache_reopen: the object open now is closed (no reader holds it) and opened again by the next read */
+    CHECK(fds_on(objs[0].rec.oid) > 0);
+    eccache_reopen(x->t, 0, objs[0].rec.oid);
+    eccache_get_counters(x->t, &k3);
+    CHECK(k3.obj_closes == k2.obj_closes + 1 && fds_on(objs[0].rec.oid) == 0);
+    eccache_test_drop_entries(x->t);
+    CHECK(read_part(x->db, p, s, &o) == 0 && o.h == want.h);
+    printf("test_seam: heal: %" PRIu64 " second reads while damaged, none after the heal\n", k1.retries - k0.retries);
+}
+
+/* eccache_forget (r7-gc): the object's chunks go away (renamed here, so they can come back), then forget. A read in
+ * flight at the forget finishes and is not cached, an object that was opening is closed by its reader, and nothing of
+ * the object stays: no entry, no fd. First without threads, the forget run from the hooks; then under 8 readers. */
+static const uint8_t *fg_oid;
+static h *fg_h;
+static hsum fg_want;
+static int fg_where, fg_done;
+
+static void fg_hide(const uint8_t oid[16], bool hide)
+{
+    for (unsigned pos = 0; pos < K + M; pos++)
+        for (int i = 0; i < NST; i++) {
+            char a[1000], b[1100];
+            char hex[33];
+            chunk_oid_hex(oid, hex);
+            snprintf(a, sizeof a, "%s/s0/o%s.%u.chunk", stores[i], hex, pos);
+            snprintf(b, sizeof b, "%s.hid", a);
+            (void)rename(hide ? a : b, hide ? b : a);
+        }
+}
+
+static void fg_hook(struct tier *t, int where, const uint8_t oid[16])
+{
+    if (fg_done || where != fg_where || memcmp(oid, fg_oid, 16) != 0)
+        return;
+    fg_done = 1;
+    fg_hide(oid, true);
+    eccache_forget(t, 0, oid);
+}
+
+static void *fg_thr(void *arg)
+{
+    const part *p = arg;
+    int s = 0;
+    while (s < NSER && sids[s] != p->ix.rser[0])
+        s++;
+    for (int it = 0; it < 200 && !atomic_load(&thr_bad); it++) {
+        hsum o;
+        int rc = read_part(fg_h->db, p, s, &o);
+        if (rc == TSDB_ERR_CORRUPT)
+            break; /* gone */
+        if (rc != 0 || o.h != fg_want.h || o.n != fg_want.n)
+            atomic_fetch_add(&thr_bad, 1);
+    }
+    return NULL;
+}
+
+static void case_forget(h *x)
+{
+    char log[800];
+    snprintf(log, sizeof log, "%s/forget.log", base);
+    for (int where = ECC_HOOK_OPENED; where <= ECC_HOOK_FILLED; where++) {
+        size_t j = (size_t)where; /* objects 1 and 2 */
+        int s;
+        part *p = obj_part(x->db, j, &s);
+        CHECK(p);
+        if (!p)
+            continue;
+        eccache_test_drop(x->t);
+        fg_oid = objs[j].rec.oid;
+        fg_where = where;
+        fg_done = 0;
+        eccache_test_hook = fg_hook;
+        hsum o;
+        cap_begin(log);
+        int rc = read_part(x->db, p, s, &o); /* the first granule is read, the next ones find the object gone */
+        cap_end();
+        eccache_test_hook = NULL;
+        CHECK(fg_done && (rc == 0 || rc == TSDB_ERR_CORRUPT));
+        CHECK(eccache_resident(p, 0, p->map_len) == 0); /* the granule in flight was not cached */
+        CHECK(fds_on(fg_oid) == 0);                      /* and the object was closed by its reader */
+        fg_hide(fg_oid, false);
+        eccache_test_drop(x->t);
+    }
+    /* under 8 readers */
+    int s;
+    part *p = obj_part(x->db, 3, &s);
+    CHECK(p);
+    if (!p)
+        return;
+    hsum want;
+    CHECK(read_part(x->db, p, s, &want) == 0);
+    fg_want = want;
+    eccache_test_drop(x->t);
+    fg_h = x;
+    atomic_store(&thr_bad, 0);
+    pthread_t th[8];
+    cap_begin(log);
+    for (int i = 0; i < 8; i++)
+        pthread_create(&th[i], NULL, fg_thr, p);
+    usleep(20000);
+    fg_hide(objs[3].rec.oid, true);
+    eccache_forget(x->t, 0, objs[3].rec.oid);
+    for (int i = 0; i < 8; i++)
+        pthread_join(th[i], NULL);
+    cap_end();
+    CHECK(atomic_load(&thr_bad) == 0);
+    CHECK(eccache_resident(p, 0, p->map_len) == 0);
+    CHECK(fds_on(objs[3].rec.oid) == 0);
+    fg_hide(objs[3].rec.oid, false);
+    hsum o;
+    CHECK(read_part(x->db, p, s, &o) == 0 && o.h == want.h && o.n == want.n); /* back: opened again */
+    printf("test_seam: forget: nothing of the object left after a forget during its open, its fill, 8 readers\n");
 }
 
 /* more than m chunks of one object gone: CORRUPT, with the line; the other parts still answer */
@@ -669,6 +962,92 @@ static void case_lost(h *x)
     free(t);
     CHECK(atomic_load(&victim->damaged) == false); /* never part_mark_payload */
     printf("test_seam: lost: CORRUPT naming the granule\n");
+}
+
+/* Objects and indexes that are wrong in themselves, on a handle of their own: an object encoded from bytes with one
+ * granule's byte flipped (its record matches its chunks, so the whole-cell read rebuilds the same wrong bytes: the
+ * second check must refuse them, seamnorecheck); a granule placed outside the object's granules by its index entry;
+ * a record whose sums table does not fit its geometry. All CORRUPT with the line, never rows, never a crash. */
+static void case_bad(void)
+{
+    char dir[800], log[800];
+    snprintf(dir, sizeof dir, "%s/bad", base);
+    snprintf(log, sizeof log, "%s/bad.log", base);
+    h x;
+    CHECK(h_open(&x, dir, NULL) == 0);
+    if (!x.db)
+        return;
+    uint32_t s;
+    CHECK(eng_series(x.db, "b", TSDB_FLOAT32, &s) == 0);
+    enum { DAYS = 3, PER = 3000 };
+    static int64_t ts[PER];
+    static float v[PER];
+    for (int d = 0; d < DAYS; d++) {
+        for (int i = 0; i < PER; i++)
+            ts[i] = d * DAY + i * 20000, v[i] = (float)(d * 7 + i % 113) / 4;
+        CHECK(eng_insert_series(x.db, TSDB_FLOAT32, s, ts, v, PER) == 0);
+    }
+    CHECK(eng_flush(x.db) == 0);
+    part *ps[MAXP];
+    size_t np = list_parts(x.db, ps, MAXP);
+    CHECK(np == DAYS);
+    if (np != DAYS) {
+        h_close(&x);
+        return;
+    }
+    /* 1: the object of day 0 from a copy with a byte of its first granule's values flipped */
+    granule g;
+    gx_load(ps[0], 0, GW_LOC, &g);
+    uint8_t *cp = malloc(ps[0]->map_len);
+    memcpy(cp, ps[0]->map, ps[0]->map_len);
+    cp[g.off + g.ts_len + g.val_len / 2] ^= 0x10;
+    CHECK(ec_test_attach_from(x.db, ps[0], cp, NULL) == 0);
+    free(cp);
+    eccache_counters k0, k1;
+    eccache_get_counters(x.t, &k0);
+    buf o = {0};
+    rawctx r = {&o, 4};
+    cap_begin(log);
+    int rc = eng_query_raw_ex(x.db, s, 0, DAY, false, 0, raw_fn, &r);
+    cap_end();
+    eccache_get_counters(x.t, &k1);
+    CHECK(rc == TSDB_ERR_CORRUPT && k1.retries > k0.retries && k1.corrupt > k0.corrupt);
+    char *t = slurp(log);
+    CHECK(strstr(t, "fail its checksum after a decode of whole cells") && strstr(t, "granule 0 "));
+    free(t);
+    free(o.b);
+    /* 2: index entries outside the object's granules (the reader is called with them directly) */
+    ec_record rec1;
+    CHECK(ec_test_attach(x.db, ps[1], &rec1) == 0);
+    codec_ctx *cx = codec_new();
+    static int64_t gts[8192 + 64];
+    static float gv[8192 + 64];
+    granule g1;
+    gx_load(ps[1], 0, GW_LOC, &g1);
+    CHECK(ec_granule_read(cx, ps[1], &g1, TSDB_FLOAT32, gts, gv, 8192 + 64, false) == 0);
+    eccache_test_drop_entries(x.t);
+    granule bad[3] = {g1, g1, g1};
+    bad[0].off = ps[1]->index_off;           /* runs into the index */
+    bad[1].off = ps[1]->hdr_len - 1;         /* inside the header */
+    bad[2].val_len = (uint32_t)ps[1]->map_len; /* longer than the object */
+    cap_begin(log);
+    for (int i = 0; i < 3; i++)
+        CHECK(ec_granule_read(cx, ps[1], &bad[i], TSDB_FLOAT32, gts, gv, 8192 + 64, false) == TSDB_ERR_CORRUPT);
+    cap_end();
+    codec_free(cx);
+    /* 3: day 2 attached to day 1's object with a record whose sums do not fit its geometry */
+    ec_record bad_rec = rec1;
+    bad_rec.nsums = 1;
+    CHECK(ec_test_attach_object(x.db, ps[2], &bad_rec) == 0);
+    o = (buf){0};
+    cap_begin(log);
+    rc = eng_query_raw_ex(x.db, s, 2 * DAY, 3 * DAY, false, 0, raw_fn, &r);
+    cap_end();
+    CHECK(rc == TSDB_ERR_CORRUPT && o.n == 0);
+    free(o.b);
+    free(rec1.sums);
+    printf("test_seam: bad: a self-consistent wrong object, three misplaced index entries, a bad record: CORRUPT\n");
+    h_close(&x);
 }
 
 /* 100 objects (a part per day) under an fd budget of 8 */
@@ -734,14 +1113,20 @@ static void run(void)
         return;
     fill_db(x.db);
     case_equal(&x);
-    case_threads(&x);
+    case_threads(&x, 0);
+    case_threads(&x, 8);
     case_down(&x); /* before the damage: two stores away and two damaged positions would be more than m */
+    if (x.db)
+        case_heal(&x);
+    if (x.db)
+        case_forget(&x);
     if (x.db)
         case_damage(&x);
     if (x.db)
         case_lost(&x);
     h_close(&x);
     case_fds();
+    case_bad();
     free_objs();
     free(ref.b);
     if (!failures)
@@ -760,8 +1145,17 @@ int main(int argc, char **argv)
             eccache_mutant = ECC_MUT_NORETRY;
         else if (!strcmp(m, "cachekeyoff"))
             eccache_mutant = ECC_MUT_KEYOFF;
+        else if (!strcmp(m, "seamnorecheck"))
+            eccache_mutant = ECC_MUT_NORECHECK;
+        else if (!strcmp(m, "seamretryerr"))
+            eccache_mutant = ECC_MUT_RETRYERR;
+        else if (!strcmp(m, "seamkeepstale"))
+            eccache_mutant = ECC_MUT_KEEPSTALE;
+        else if (!strcmp(m, "forgetnoop"))
+            eccache_mutant = ECC_MUT_FORGETNOOP;
         else {
-            fprintf(stderr, "usage: test_seam [--mutant seamnoverify|seamnoretry|cachekeyoff] [SCRATCH]\n");
+            fprintf(stderr, "usage: test_seam [--mutant seamnoverify|seamnoretry|cachekeyoff|seamnorecheck|"
+                            "seamretryerr|seamkeepstale|forgetnoop] [SCRATCH]\n");
             return 2;
         }
         a += 2;
