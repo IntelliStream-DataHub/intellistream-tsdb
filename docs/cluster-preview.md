@@ -26,10 +26,10 @@ What the preview does **not** do yet. Please do not skip this list:
   (step 3 does), a switch for trying it out that will go once copying works. Step 6 shows it.
 - **It does not fail over.** If a server dies, nothing takes over its data. The group notices (it marks the server
   down) and that is all.
-- **It does not move volumes**, and you cannot add a user to the cluster yet.
+- **It does not move volumes.**
 - **Clients name the volume.** The client port and the protocol are as without `--cluster`, but a series is made in
   a cluster volume, named like any volume (`tsdbc_series_at` with the volume's name), and a client talks to the
-  volume's leader. Logins are still per server (`tsdb DIR user ...`).
+  volume's leader. Logins use the cluster's users, the same on every server ([Logins](#logins)).
 - **It is not for production.** The format of the metadata and the peer protocol may change in a later 0.x
   release. A build of the preview does not talk to a build from before such a change: you start the cluster again
   with `tsdb cluster init`, you do not upgrade it.
@@ -68,7 +68,7 @@ build/tsdb cluster secret $D/secret
 # 3. Helpers. A "node" is a server with its own data directory (n1/data) and its own state directory (n1/state).
 #    The state directory holds the cluster's own files and must be on a local disk, never on NFS.
 #    Node N listens for clients on port 1708N and for the other servers on port 1709N (the two lines marked ports).
-#    --no-auth: no login, because users are still per server in the preview. Fine on 127.0.0.1, nowhere else.
+#    --no-auth: no login, to keep the tutorial short ([Logins](#logins) below shows how). Fine on 127.0.0.1, nowhere else.
 #    TSDB_CLUSTER_WRITES=1: a preview switch that lets a volume's leader take writes (step 6), though nothing is
 #    copied yet. Without it every cluster volume refuses writes.
 #    A witness (node 4) has no data directory and no client port.
@@ -295,6 +295,41 @@ heartbeat for `node_timeout_ms` (3 s by default). The survivors first elect a ne
 node `down` once it has itself led for `node_timeout_ms`, so the `down` comes a few seconds after the election, not at
 the moment of the kill. Step 7's `wait_for` waits for the `down` line, so by then a new leader exists.
 
+## Logins
+
+In a cluster the users and their grants belong to the whole cluster, not to one server: you add a user once, and it
+can log in on every server. A changed password or a revoked grant counts on every server as soon as the command
+answers. Start the servers without `--no-auth`, and give the first superuser to `init`:
+
+```sh
+echo 'a long password' > $D/root.pw; echo 'another one' > $D/alice.pw; chmod 600 $D/*.pw
+build/tsdb cluster init $(peer 1) --secret-file $D/secret --superuser root --password-file $D/root.pw
+build/tsdb cluster user add $(peer 1) alice --password-file $D/alice.pw --secret-file $D/secret
+build/tsdb cluster user grant $(peer 2) alice prefix:plant. read --secret-file $D/secret   # any member will do
+build/tsdb cluster user list $(peer 3) --secret-file $D/secret
+```
+
+A superuser can also manage users over the client protocol (the clients' user calls) on any server; the change is
+made in the cluster and answered once every server that is up has it.
+
+Things to know:
+
+- **`tsdb DIR user ...` does not work on a cluster server's directory.** It says so and names `tsdb cluster user`.
+- **A server that was down refuses logins for a moment after it starts** (`UNAVAILABLE`): until it has heard the
+  cluster, it might still hold a user that was dropped while it was away. Clients try again by themselves.
+- **A server cut off from the others** keeps the users it had until it can reach them again.
+- **Servers that had their own users before** (a USERS file in their directory) do not start with `--cluster` until
+  that file is gone. Bring their users in first, with the servers stopped:
+
+  ```sh
+  build/tsdb cluster user import $(peer 1) /srv/old1/data /srv/old2/data --secret-file $D/secret
+  ```
+
+  A user that is the same in every directory is copied as it is (the password too: nobody needs to know it). A user
+  that differs between them, or is missing from one, stops the whole import, which lists each such user; add
+  `--from-node /srv/old2/data` to say whose copy wins. Running the import again is safe. Then remove each
+  directory's USERS file.
+
 ## How to read `status`
 
 `tsdb cluster status PEER` asks one server what it knows and prints one fact per line. Ask any member: they should
@@ -333,6 +368,11 @@ more (at most `--voters`). A member that does not vote watches.
 - **`the new server belongs to another cluster or has another id`** (from `node add`): the server at `NEW_PEER` is a
   member of a cluster already. To use it here, stop it, remove its state directory and start it again.
 - **`--state-dir ... on NFS`**: the cluster's files must be on a local file system.
+- **`... USERS: a cluster server takes its users from the metadata group`**: the server's directory still has a
+  USERS file from before it was in a cluster. Bring the users over with `tsdb cluster user import` and remove the
+  file ([Logins](#logins)).
+- **A login answers `UNAVAILABLE`**: that server has not heard the group since it started, so it does not know yet
+  whether a user was dropped meanwhile. It lets logins in once it has caught up; clients try again by themselves.
 - **The block fails in the middle and servers keep running**: stop them by process id:
   `for n in 1 2 3 4; do kill $(cat /tmp/tsdb-cluster/n$n/pid); done`. Do not use `pkill` or `killall`: they stop every
   process with that name, also ones that are not yours.
@@ -380,6 +420,10 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 | `tsdb cluster node add PEER NEW_PEER --secret-file F` | Add the server at `NEW_PEER` (running with `--cluster`, in no cluster yet). `PEER` is any member; the command follows to the leader. A server that is already a member is added again without harm (the same number). |
 | `tsdb cluster volume add PEER NAME [--replicas N] --secret-file F` | Add a cluster volume called `NAME` on `N` servers (default: the cluster's `--replication`), in different racks where it can. Answers with its number. Refused when fewer than `N` members are up and may hold volumes. A name is never used twice. |
 | `tsdb cluster status PEER --secret-file F` | What that server knows (see above). |
+| `tsdb cluster user add\|passwd\|drop PEER NAME --secret-file F` | Add a user (`--superuser`, `--password-file F`), change a password, drop a user, for every server at once ([Logins](#logins)). |
+| `tsdb cluster user grant\|revoke PEER NAME SELECTOR RIGHTS --secret-file F` | Give or take rights, as `tsdb DIR user grant` does on one server. |
+| `tsdb cluster user list PEER [NAME] --secret-file F` | The users and their grants. |
+| `tsdb cluster user import PEER DIR... [--from-node DIR] --secret-file F` | Bring the users of servers that ran on their own into the cluster ([Logins](#logins)). |
 
 Options of `init`. Each number is a whole number above 0. The settings are stored and shown; in the preview nothing acts on
 those about volumes and failover yet. Members are only `up` or `down` in the preview: `draining` and `out` are
@@ -408,7 +452,7 @@ for later.
 | `--repl-retain-s S` | 1800 | And for at most this long. |
 | `--idle-seal-ms MS` | 1000 | An idle leader closes its log segment after this. At least 100. A volume written more slowly than once per this interval gets one small part per write on every copy until merges combine them (a write every 2 s: about 1800 parts an hour), and an idle leader syncs one small log record a second on each copy. Raise it for slow writers. |
 
-The design lists more commands (`node drain` and `out`, `volume move`, `user`, `restore`, `adopt` and
+The design lists more commands (`node drain` and `out`, `volume move`, `restore`, `adopt` and
 others). They are not built: `tsdb cluster` prints what exists.
 
 ## What's next

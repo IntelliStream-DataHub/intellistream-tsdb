@@ -75,6 +75,11 @@ tenant admins are in 0.9; state names shared within a volume are accepted and do
 | A27 | **A before-and-after benchmark closes the work** (the user's request): `tools/auth-bench.sh` runs main at 3bd4e96 against the auth build with `--no-auth` and with login, on a quiet machine, repeated, and its results go into BENCHMARKS.md (§9). | Only the perf gate of step 2 | The gate catches a regression during the work; the user wants a number to publish, rerunnable on other machines. |
 | A28 | **`--no-auth` refuses the user admin ops** (decided on 2026-11-04, step 2). Without login, connections need no login and every data op runs unchecked, but USER_CREATE, USER_DROP, USER_ALTER, USER_PASSWORD, GRANT, REVOKE and USER_LIST are answered TSDB_ERR_DENIED (a log line at most once a second); USERS is not opened. Users are managed with the offline `tsdb <dir> user` verbs. WHOAMI answers an empty name with the superuser flag. | Admin ops act as the operator (actor 0) on USERS | A server run without login for a while must not let any network client plant a superuser in USERS that stays valid once login is on (fail closed, as A13). |
 | A29 | **A reload that shows no superuser keeps serving** (step 2, the question step 1 left). Logged-in users keep their grants, admin ops follow users.c's rules (only a superuser could create one again, so none can until the CLI adds one), one log line per change into that state; the next start refuses (A13). | Stop the server | A CLI slip (dropping or demoting the last superuser) must not take a production server down; nothing is opened that was closed, and the restart fails closed. |
+| A30 | **A cluster server's users are the metadata group's** (S2-1, design-cluster.md C22): with `--cluster`, auth reads no USERS; it builds its snapshot from the group's copy (`cluster_set_users_watch`, every change pushes the whole list) and a root that holds USERS is refused at start, also with `--no-auth`, naming `tsdb cluster user import` (§12). | Each server keeps its own USERS | A password change or a revoke made on one server would stay there; a USERS file a cluster server never reads must not look like it is in force. |
+| A31 | **The restart barrier**: until `cluster_users_caught_up()` (this run heard a Raft leader's commit index and applied it), every login answers `TSDB_ERR_UNAVAILABLE`, never `AUTH` and never in; the barrier also waits until the users watch took the users at that index (a push that failed is pushed again). The clients do not retry AUTH_START: the connect fails and the caller connects again. A member cut off later keeps the users it has until it hears the group (ha-modes :916). | Logins from the copy as it was loaded at start | A restarted server's copy is its last snapshot: it may hold a user dropped, or a password changed, while it was down. |
+| A32 | **Admin ops over the client protocol propose** (S2-1): checked against the copy by users.c's rules, proposed conditional on the user's version, answered once committed, applied on every member (or after 5 s) and back in this server's copy (or after 5 s); a STALE proposal is checked again on the newer copy (8 tries; a STALE whose wait brought no newer copy answers UNAVAILABLE at once). A failed proposal answers an error and changes nothing anywhere; an outcome unknown (the leader stopped after it may have got the entry) closes the connection, never UNAVAILABLE, which says "not applied" (D12). | Write locally and forward | Two copies must never disagree on what was acknowledged. |
+| A33 | **An import of USERS that differ imports nothing** (`tsdb cluster user import`): a user that is not the same (flags, verifier, grants as a set) on every node given, or is missing from one, is listed and the whole import refused unless `--from-node DIR` names whose copy wins; the group holding the same user already is no error, so a rerun is safe. | A merge (union of grants, newest password) | A user missing on one node may have been dropped there on purpose; a merge could bring back a revoked grant or an old password. |
+| A34 | **The actor guard** (S2-1): an admin op over the client protocol carries the actor's name and version (a trailer after the body); the state machine answers STALE unless the actor still has that version, so the actor's rights are those of the entry the proposal commits after. | A proposal conditional on the target only | The actor's rights come from this server's copy, which may lag: a superuser demoted through another server could otherwise still create a superuser through a lagging one. |
 
 ## 1. Threat model and scope
 
@@ -491,6 +496,50 @@ Left by step 1 for step 2:
   through a pointer reached from shared state. tsdbd holds one mutex around every `users` call (reload, admin ops,
   rights lookups at login), or builds every index at load and treats the state as read-only between reloads.
   Lookups by name are hashed and the manage checks indexed (step 1), so the mutex is held for microseconds.
+
+## 12. The cluster store (S2-1)
+
+On a `--cluster` server the users and grants live in the metadata group (design-cluster.md C22): one record per user,
+its uid assigned by the state machine, its blob the user's compacted USERS records (`user_blob_decode`), its version
+the index of the entry that last put it. `server/users.c` keeps a group store (`users_group_init`,
+`users_group_set`): no file, no lock, no I/O; a push replaces the user set, keeping the user object of a user whose
+uid and version did not change, so auth's snapshot and rights maps carry over as for a reload that found nothing new,
+and a user that changed is a new object whose rights map goes stale (§5) exactly as after a USERS change. A blob that
+does not decode as the user it is listed as is refused (logged, nobody logs in as it): the group stores what any
+holder of the cluster secret puts.
+
+- **Start.** A root that holds `USERS` is refused, with and without login, naming `tsdb cluster user import PEER DIR`;
+  otherwise the server writes `CLUSTER_USERS` in its root, and `tsdb DIR user ...` refuses there naming
+  `tsdb cluster user` (a USERS made there would stop the next start). There is no superuser check at start: the
+  first superuser comes with `tsdb cluster init --superuser NAME --password-file F`.
+- **Login** reads the snapshot built from the last push (A30). Until the restart barrier opens (A31) every
+  AUTH_START answers UNAVAILABLE. No client retries AUTH_START (C `login()`, Rust `login_status` and the bindings
+  over them return the status): the connect fails and the caller connects again, to this server or another. A
+  logged-in request cannot exist before it, since login comes first. The barrier opens only once the watch took the
+  users at the index it caught up to (`users_push` records what auth took; a push auth failed, out of memory, is
+  pushed again at the next duty tick, every 100 ms, and is logged once per run of failures). The cluster thread
+  gives the watch the users before every heartbeat; a member whose push failed still reports its applied index
+  meanwhile, so for those 100 ms (longer only while memory stays short) its logins may lag what it reports.
+- **Admin ops** (A32) answer after the change is committed and in this server's copy; `cluster_user_propose` returns
+  once every member reported that index or after its wait, so a password changed through any server is refused on
+  every member that was up and applied it within the wait (`GROUP_WAIT_MS`, 5 s) once the reply came. After the
+  wait the op answers OK even when members, or this server's own copy, have not got the change yet: laggards are
+  not reported. A member that was down, or cut off, has the old users until it hears the group: cut off, it goes on
+  with them (a revoke reaches it when the partition heals); restarted, it refuses every login until it caught up.
+  The proposal carries the actor guard (A34): a STALE answer, the actor's or the target's version having moved, is
+  checked again on the newer copy, up to 8 tries; an op can hold a tsdbd worker for up to 8 x (5 s + 5 s). An
+  outcome unknown closes the connection (`AUTH_ERR_INDETERMINATE`), as a data op's does (design-cluster D12).
+- **Lock order**: the cluster thread holds `uw_mu` across the watch's call, which takes `users_mu` > `auth_mu` >
+  `tn_mu`; so `uw_mu` > `users_mu`, and `cluster_user_propose` (which waits on the cluster thread) is never called
+  under `users_mu` or `auth_mu`.
+- **Import** (A33): `tsdb cluster user import PEER DIR... [--from-node DIR] [--wait-ms MS] --secret-file F` reads
+  the USERS of stopped servers' roots and puts each user as a create (version 0) with its verifier as stored: no
+  password is needed or sent. Then remove each root's USERS before starting the servers with `--cluster`. When
+  every member's root has USERS no member can start: move them aside, start, import from the moved copies (what
+  tsdbd's refusal says). `CLUSTER_USERS` stays in a root taken out of the cluster; it is removed by hand.
+- **Tests**: test_cluster `login`, `userimport` and `volrefuse`; `make auth-mutants` (tests/auth_mutants.sh):
+  authlocalusers, adminlocal, loginbeforecatchup, barrierifempty, noguard, retryunavail, pushnoretry, importmerge,
+  each required to fail with its own FAIL line; `make meta-mutants` 39 (noactorguard).
 
 ## Open questions
 
