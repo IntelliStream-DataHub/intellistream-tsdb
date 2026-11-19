@@ -52,7 +52,13 @@
 #define PL_CL_VERSION 5         /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
                                  * HB and HB_ACK (r3e-leases) */
 
-enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2 };
+/* LOG and BULK are the replication driver's (server/repld.c); FWD (forwarded requests and their replies) and FWDQ
+ * (forwarded queries and their streamed replies under CREDIT) are server/fwd.c's, on a peerlink of its own, so a
+ * forwarded insert never waits behind replication traffic (ha.md 9.1). The kinds need no new cluster version: a
+ * server of this version that does not know a kind refuses its HELLO with a line (cluster.c's acceptor table,
+ * peerlink_adopt), and the dialer redials with backoff. */
+enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2, PL_KIND_FWD = 3, PL_KIND_FWDQ = 4 };
+#define PL_KIND_DATA_MAX PL_KIND_FWDQ /* data kinds are 1 .. this */
 
 enum {
     PL_OK = 0,
@@ -117,6 +123,12 @@ struct pl_cfg {
     uint32_t dead_ms;     /* nothing heard for this long ends a link; 0: 5000 */
     uint32_t backoff_min_ms, backoff_max_ms; /* redial gap, doubled up to the max; 0: 50 and 2000 */
     uint32_t hs_ms;                          /* the handshake's deadline; 0: 5000 */
+    /* A tracked frame of plink_sendv left the link: written 1 once the first of its bytes reached the socket (whether
+     * the peer got it is then unknown), 0 when none ever did (the link went down or the peerlink closed with the
+     * frame queued or still wholly in the write buffer, or its deadline passed in the queue): that is definite. Once
+     * per tracked frame, on the link's thread, with the connection number it was queued on; must not block. */
+    void (*on_sent)(void *arg, struct plink *l, uint64_t token, uint64_t gen, int written);
+    int sock_buf; /* tests: SO_SNDBUF and SO_RCVBUF of every connection (0: the kernel's) */
 };
 
 struct peerlink *peerlink_new(const struct pl_cfg *cfg);
@@ -159,6 +171,26 @@ int plink_send(struct plink *l, uint8_t type, const void *p, size_t n, int timeo
  * PL_E_INVALID. Sends are PL_E_DOWN until on_link(up) has returned, except from the thread inside it (the link's own
  * thread), so the driver's resume logic in on_link goes first on a new connection. */
 int plink_send_gen(struct plink *l, uint64_t gen, uint8_t type, const void *p, size_t n, int timeout_ms);
+/* plink_send_gen (gen 0: whatever connection is up) of the payload hdr[0, hn) followed by p[0, n) (at most
+ * PL_FRAME_MAX together), copied once. tracked: on PL_OK on_sent runs once for the frame, with `token`; deadline_ns
+ * (CLOCK_MONOTONIC, 0: none): a frame still queued then leaves unwritten (on_sent 0). Any other return: nothing was
+ * queued and on_sent never runs. */
+int plink_sendv(struct plink *l, uint64_t gen, uint8_t type, const void *hdr, size_t hn, const void *p, size_t n,
+                int timeout_ms, int tracked, uint64_t token, uint64_t deadline_ns);
+/* Ends the link's current connection (a dialed link redials, an accepted one waits for the peer's next): what
+ * was queued is dropped as when the peer goes. Tests, and nothing else, call it (a late reply is never a reason). */
+void plink_reset(struct plink *l);
+/* A dialed link that is no longer wanted (its member left): its connection ends and it dials no more; the link
+ * stays valid (sends are PL_E_DOWN) until peerlink_free. */
+void plink_stop(struct plink *l);
+/* Stops (1) or resumes (0) reading the link's socket, on every connection of the link until resumed: TCP pushes back
+ * on the peer. The link's thread goes on writing and sends PINGs on its own clock, so the peer does not count it dead,
+ * and it does not count the peer dead while it is not reading. Frames already read are still delivered after the
+ * pause. A hangup or a socket error is still read. Any thread, also from inside on_frame. */
+void plink_pause(struct plink *l, int paused);
+/* Takes the tracked frame `token` out of the queue if no link thread has taken it yet: 1 (no byte of it will be
+ * written, and its on_sent never runs), else 0 (on_sent runs or ran for it). */
+int plink_unqueue(struct plink *l, uint64_t token);
 /* bytes now queued (for the driver's own decisions) */
 size_t plink_queued(struct plink *l);
 
@@ -252,6 +284,10 @@ enum {
     PL_MUT_CHUNKOFF = 9,    /* a CHUNK at another offset than the next is accepted */
     PL_MUT_RESUMEBOUND = 10, /* a receiver's resume offset beyond the file is accepted */
     PL_MUT_NOKICK = 11,     /* a new connection of the same peer does not take the accepted link over */
+    PL_MUT_QUEUEDASUNSENT = 12, /* a frame only partly written when its link went down is reported unwritten */
+    PL_MUT_KINDSHARED = 13,     /* a FWD link is the LOG link's socket to that peer */
+    PL_MUT_WBWRITTEN = 14,      /* at a cut, every tracked frame in the write buffer is reported written */
+    PL_MUT_PAUSEDEAD = 15,      /* a paused link keeps its dead_ms check and PINGs only when it hears nothing */
 };
 /* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
  * and misbehaves. */
