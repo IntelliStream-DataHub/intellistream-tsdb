@@ -465,6 +465,7 @@ static void node_add(int via, int newi)
 }
 
 static uint32_t init_min_isr; /* nonzero: INIT's min_isr (the volumes' min_isr, at most their replicas) */
+static uint32_t init_node_timeout_ms; /* > 0: init_mode sets node_timeout to this instead of 1.5 s */
 static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
 
@@ -479,7 +480,7 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.repl_retain_s = init_retain_s;
     if (init_isr_lag_ms)
         s.isr_lag_ms = init_isr_lag_ms;
-    s.node_timeout_ms = 1500;
+    s.node_timeout_ms = init_node_timeout_ms ? init_node_timeout_ms : 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
     uint8_t req[128], *reply;
@@ -6176,6 +6177,96 @@ static void scen_pause(void)
     printf("  the deposed leader rejoined as a replica: every server holds the same %d rows\n", total);
 }
 
+
+/* design-cluster.md 6.2 (r3e-failover, item 6): the leader of a replicated volume is killed and restarted before the
+ * group sees it down (node_timeout 20 s here). Its REPL says it led epoch e, so it never resumes: its core sends RESIGN(v, e), the Raft leader
+ * fences the ISR at once (reason RESIGNED, no node_timeout) and the record moves to e+1, the restarted server again
+ * when it is still the best; every acknowledged write is there and the new leader takes writes. */
+static void scen_resign(void)
+{
+    scenario("resign");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_node_timeout_ms = 20000; /* the restart (open generation recorded, then the core) must beat detection */
+    init_cluster(0, 600);
+    init_node_timeout_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rs", 3, &num)) != 0 || num != 1)
+        die("volume add rs: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rs", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rs", &v))
+        die("no record of rs");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rs is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rs", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, "rs", 3, 30000, "every replica in the ISR before the restart");
+    signal_child(pids[L], SIGKILL);
+    if (await_exit(L, 5000) < 0)
+        die("server %d did not die of SIGKILL", L);
+    uint64_t tk = now_ms();
+    start(L);
+    uint64_t ts0 = now_ms();
+    char line[96];
+    snprintf(line, sizeof line, "cannot lead epoch %" PRIu64 " (led it before a restart); resigns", e0);
+    await_log_count(L, line, 1, 30000);
+    int via = (L + 1) % 3;
+    for (;;) {
+        if (vol_rec(via, "rs", &v) && v.epoch > e0)
+            break;
+        if (now_ms() - ts0 > 30000)
+            die("no new record of rs 30 s after its leader restarted (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+        usleep(20000);
+    }
+    uint64_t tr = now_ms();
+    int Nw = server_of(v.leader);
+    if (v.epoch != e0 + 1 || Nw < 0 || Nw > 2)
+        die("the new record of rs: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    int resigned = 0;
+    for (int i = 0; i < 3; i++)
+        resigned += log_count(i, "(reason 7); fences");
+    if (!resigned)
+        die("the record moved to epoch %" PRIu64 " but no Raft leader promoted for a RESIGN (reason 7)", v.epoch);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * acked, 30000);
+    if (got != acked)
+        die("the leader at epoch %" PRIu64 " (server %d) holds %d of the %d acknowledged rows", v.epoch, Nw, got, acked);
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the leader at epoch %" PRIu64 ": %s", v.epoch, ers(rc));
+    tsdbc_close(c);
+    printf("  leader %d restarted %" PRIu64 " ms after its kill resigned epoch %" PRIu64 ": server %d%s leads epoch %"
+           PRIu64 " %" PRIu64 " ms after the restart, with all %d acknowledged rows\n", L, ts0 - tk, e0, Nw,
+           Nw == L ? " (the restarted one, still the best)" : "", v.epoch, tr - ts0, acked);
+    await_isr(via, "rs", 3, 60000, "every server in the ISR after the resign");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)acked + 1;
+    rep_same(wantr, "after the resign");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -6207,7 +6298,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"pause", scen_pause}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"pause", scen_pause}, {"resign", scen_resign}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
