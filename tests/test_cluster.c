@@ -2373,6 +2373,27 @@ static void expect_moved(tsdbc *c, int rc, uint16_t vol, uint32_t node, uint64_t
             port + 1);
 }
 
+/* a write of one row to a server that no longer leads `vol` after a promotion, expected to be MOVED to (node, epoch).
+ * The server answers from its own copy of the record, which the group's watch delivers a little after the record
+ * another server reported: until then it may say UNAVAILABLE (its volume is fenced and the record still names it) or
+ * MOVED to the leader of an older epoch. Both refuse before numbering anything, so they are retried for 5 s; anything
+ * else, or a stale answer after that, fails (r3e-clus4: writerdepose got UNAVAILABLE right after the record moved). */
+static void insert_expect_moved(tsdbc *c, tsdb_sid id, int64_t ts, float val, uint16_t vol, uint32_t node,
+                                uint64_t epoch, const char *what)
+{
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        int rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+        tsdbc_err_info e;
+        int stale = rc == TSDB_ERR_UNAVAILABLE ||
+                    (rc == TSDB_ERR_MOVED && tsdbc_last_error(c, &e) == TSDB_ERR_MOVED && e.has_body &&
+                     e.nmoved == 1 && e.moved[0].epoch < epoch);
+        if (!stale || now_ms() - t0 > 5000) {
+            expect_moved(c, rc, vol, node, epoch, what);
+            return;
+        }
+    }
+}
+
 /* series pump7.flow in `vol` on server i: made, written and read back (returns its id) */
 static tsdb_sid write_read(tsdbc *c, const char *vol, int64_t t0)
 {
@@ -4818,8 +4839,7 @@ static void scen_failover(void)
     int R = 3 - L - Nw;
     c = client(R);
     ts = 9001000;
-    rc = tsdbc_insert_series(c, id, &ts, &val, 1);
-    expect_moved(c, rc, 1, v.leader, v.epoch, "a write to a replica after the failover");
+    insert_expect_moved(c, id, ts, val, 1, v.leader, v.epoch, "a write to a replica after the failover");
     tsdbc_set_retry(c, 10000);
     if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
         die("a write that follows MOVED from server %d: %s", R, ers(rc));
@@ -4829,8 +4849,7 @@ static void scen_failover(void)
     await_isr(via, "fo", 3, 60000, "the old leader back in the ISR");
     c = client(L);
     ts = 9002000;
-    rc = tsdbc_insert_series(c, id, &ts, &val, 1);
-    expect_moved(c, rc, 1, v.leader, v.epoch, "a write to the old leader after it rejoined");
+    insert_expect_moved(c, id, ts, val, 1, v.leader, v.epoch, "a write to the old leader after it rejoined");
     tsdbc_close(c);
     int total = rows_in(Nw, id, 0, INT64_MAX / 2, 10000);
     if (total < acked + 2)
@@ -5220,8 +5239,7 @@ static void scen_writerfail(void)
         die("the new record of plant: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
     tsdbc *c2 = client(L);
     ts = 7000;
-    rc = tsdbc_insert_series(c2, id, &ts, &val, 1);
-    expect_moved(c2, rc, 1, v.leader, v.epoch, "a write to the failed volume");
+    insert_expect_moved(c2, id, ts, val, 1, v.leader, v.epoch, "a write to the failed volume");
     tsdb_points p;
     if ((rc = tsdbc_query_points(c2, id, INT64_MIN, INT64_MAX, &p)) != TSDB_ERR_UNAVAILABLE)
         die("a read of the failed volume: %s, not UNAVAILABLE", ers(rc));
@@ -5248,8 +5266,7 @@ static void scen_writerfail(void)
     for (int k = 0; k < 5; k++) {
         tsdbc *c3 = client(L);
         ts = 8000 + k;
-        rc = tsdbc_insert_series(c3, id, &ts, &val, 1);
-        expect_moved(c3, rc, 1, v.leader, v.epoch, "a later write to the failed volume");
+        insert_expect_moved(c3, id, ts, val, 1, v.leader, v.epoch, "a later write to the failed volume");
         tsdbc_close(c3);
         usleep(200000);
     }
@@ -5376,8 +5393,7 @@ static void scen_writerdepose(void)
         die("the new record of plant: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
     tsdbc *c2 = client(L);
     ts += 100000;
-    rc = tsdbc_insert_series(c2, id, &ts, &val, 1);
-    expect_moved(c2, rc, 1, v.leader, v.epoch, "a write to the failed volume");
+    insert_expect_moved(c2, id, ts, val, 1, v.leader, v.epoch, "a write to the failed volume");
     tsdb_sid any;
     if ((rc = tsdbc_series(c2, "writerfail.none", 0, &any)) != TSDB_ERR_NOTFOUND)
         die("a lookup in server %d's root after its volume failed: %s", L, ers(rc));
