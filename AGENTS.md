@@ -303,7 +303,10 @@ cgroup, so `nice` does not keep your work out of its way.
   through these windows.
 - **Inserts are all or nothing.** All parts of one insert are written pending,
   then committed through an intent file (`parts_commit`). Never publish them one
-  by one.
+  by one. The open's roll-forward (`intents_recover`) fsyncs the directory after an intent it rolls forward, renamed
+  by this open or not (final names seen at open may be in the page cache only), and before it unlinks the intent:
+  unsynced directory operations reach the disk in any order, and an unlink kept with a rename lost leaves the insert
+  half there (`tests/test_intents.c`, crashfs with `CRASHFS_TEAR`; mutant `unlinkfirst`).
 - **Durability.** A new file is durable after fsync of the file and of its
   directory; a rename after fsync of the directory. In sync mode
   (`wal_sync_ms = 0`) a memtable row is visible to queries only once the WAL is
