@@ -6265,6 +6265,111 @@ static void crash_promo(int promote)
     stop_all();
 }
 
+/* leasestale (r3e-leases F5): a deposed writer that has not heard of its deposal gets no read lease. Server L, the
+ * leader of the volume, has its volume thread stalled (TSDB_REPLD_TEST=stallinbox, the file in place, a write waiting
+ * on its replicas' ACKs, which the stalled thread never takes) and is paused until the record names a new leader. Once
+ * it runs again its driver still sees itself the writer at the old epoch (the record change waits in the stalled
+ * inbox) and reports OWNER; the promotion's state is gone with the record moved, so only the check of the report
+ * against the record keeps the lease from it. Reads on L must be refused (they would miss the new leader's rows) until
+ * the stall ends and L, deposed, takes up the new history. TSDB_CLUSTER_MUTANT=leasestale fails it. */
+static void scen_leasestale(void)
+{
+    scenario("leasestale");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=stallinbox";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "ls", 3, &num)) != 0 || num != 1)
+        die("volume add ls: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "ls", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "ls", &v))
+        die("no record of ls");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of ls is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "ls", 30000);
+    for (int k = 0; k < 10; k++) {
+        int64_t ts = 1000 + k;
+        float val = 1;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d with every replica up: %s", k, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, "ls", 3, 30000, "every replica in the ISR before the stall");
+    char stall[PATH_MAX + 80];
+    server_dir(L, stall, sizeof stall);
+    strcat(stall, "/stallinbox");
+    FILE *sf = fopen(stall, "w");
+    if (!sf)
+        die("create %s", stall);
+    fclose(sf);
+    struct wf_writer w = {client(L), id, 2000, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, wf_write_thread, &w) != 0)
+        die("pthread_create");
+    nanosleep(&(struct timespec){0, 500000000}, NULL); /* the replicas' ACKs reach L's inbox: its thread stalls */
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE)) {
+        unlink(stall);
+        die("a write to a leader with a stalled volume thread was answered: %s", ers(w.rc));
+    }
+    pause_server(L, 1);
+    int Nw = await_promoted((L + 1) % 3, "ls", ids[L], e0, &v);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    tsdbc *cn = client(Nw);
+    tsdbc_set_retry(cn, 10000);
+    int64_t ts = 3000;
+    float val = 3;
+    if ((rc = tsdbc_insert_series(cn, id, &ts, &val, 1)) != 0) {
+        unlink(stall);
+        die("a write to the new leader: %s", ers(rc));
+    }
+    tsdbc_close(cn);
+    pause_server(L, 0);
+    /* L heartbeats again, as OWNER at e0, for 4 s: no read there may be answered */
+    tsdbc *cr = client(L);
+    tsdbc_set_retry(cr, 0);
+    int answered = 0, refused = 0, rows = 0, last = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 4000; usleep(100000)) {
+        int r = lease_read(cr, id, 0, &rows);
+        if (r == 0) {
+            answered++;
+            last = rows;
+        } else if (r == TSDB_ERR_UNAVAILABLE) {
+            refused++;
+        }
+    }
+    tsdbc_close(cr);
+    unlink(stall);
+    if (answered)
+        die("server %d, deposed at epoch %" PRIu64 " while stalled and not yet told, answered %d reads (the last with "
+            "%d rows; the new leader has 11): it held a read lease",
+            L, e0, answered, last);
+    if (!refused)
+        die("no read on the stale writer was refused UNAVAILABLE in 4 s (the case proved nothing)");
+    pthread_join(th, NULL);
+    tsdbc_close(w.c);
+    await_isr(Nw, "ls", 3, 60000, "the stale writer back in the ISR once its stall ended");
+    stop_all();
+    for (int i = 0; i < 3; i++)
+        penv[i] = NULL;
+    printf("  a writer deposed while stalled reports itself OWNER at epoch %" PRIu64 " and gets no read lease (%d reads "
+           "refused); it rejoins once the stall ends\n",
+           e0, refused);
+}
+
 static void scen_fencecrash(void) { crash_promo(0); }
 static void scen_promotecrash(void) { crash_promo(1); }
 static void scen_deposecrash(void) { crash_promo(2); }
@@ -6854,7 +6959,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
