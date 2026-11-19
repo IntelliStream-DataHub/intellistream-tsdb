@@ -20,6 +20,7 @@
 #include "internal.h"
 #include "peerlink.h"
 #include "replwire.h"
+#include "fwd.h"
 
 static const uint8_t KEY[32] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
                                 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32};
@@ -77,7 +78,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size < 2)
         return 0;
-    int mode = data[0] % 8;
+    int mode = data[0] % 9;
     uint8_t arg = data[1];
     size_t n = size - 2;
     /* an exact-size copy: a read past the end is the sanitizer's to find */
@@ -159,6 +160,33 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             if (bl != n || memcmp(back, p, n) != 0 || n > PL_META_MAX)
                 abort();
         }
+    } else if (mode == 8) {
+        /* the forwarding links' payloads (fwd.h): FWD or FWDQ by bit 0 of arg, the type by the next three */
+        int kind = arg & 1 ? PL_KIND_FWDQ : PL_KIND_FWD;
+        uint8_t type = (uint8_t)((arg >> 1) & 7);
+        struct fwd_wire w;
+        if (fwd_wire_decode(kind, type, p, n, &w) == 0) {
+            if (n < FWD_HDR || w.frame_id != (uint64_t)p[0] + ((uint64_t)p[1] << 8) + ((uint64_t)p[2] << 16) +
+                                                ((uint64_t)p[3] << 24) + ((uint64_t)p[4] << 32) +
+                                                ((uint64_t)p[5] << 40) + ((uint64_t)p[6] << 48) +
+                                                ((uint64_t)p[7] << 56))
+                abort();
+            if (w.n && (w.body < p || w.body + w.n != p + n))
+                abort();
+            uint8_t x = 0;
+            for (size_t i = 0; i < w.n; i++)
+                x ^= w.body[i];
+            (void)x;
+            if (kind == PL_KIND_FWDQ && type == FWDQ_T_CHUNK && w.n > FWD_CHUNK_MAX)
+                abort();
+            if (kind == PL_KIND_FWDQ && type == FWDQ_T_CANCEL && (n != FWD_HDR || w.n))
+                abort();
+            if (kind == PL_KIND_FWDQ && type == FWDQ_T_CREDIT) {
+                uint8_t back[12];
+                if (fwd_wire_credit(back, w.frame_id, w.chunks) != n || memcmp(back, p, n) != 0)
+                    abort();
+            }
+        }
     } else if (mode == 3) {
         int k = peerlink_hello_kind(p, n);
         if (k < -1 || k > 255)
@@ -229,6 +257,21 @@ void fuzz_seeds(const char *dir)
     uint8_t h[80] = {0};
     le(h, PL_CL_MAGIC, 4), h[4] = PL_CL_VERSION, le(h + 5, 2, 4), le(h + 73, 0, 2), h[75] = PL_KIND_LOG;
     put_frame(dir, "seed-hello", 3, 0, h, 76);
+    h[75] = PL_KIND_FWDQ;
+    put_frame(dir, "seed-hello-fwdq", 3, 0, h, 76);
+    /* the forwarding payloads (mode 8; arg: bit 0 FWDQ, bits 1-2 the type) */
+    uint8_t fw[32] = {0};
+    fwd_wire_credit(fw, 0x1122334455667788ull, 4);
+    put_frame(dir, "seed-fwd-credit", 8, 1 | FWDQ_T_CREDIT << 1, fw, 12);
+    le(fw, 21, 8), fw[8] = 1, memset(fw + 9, 0x5a, 16);
+    put_frame(dir, "seed-fwd-chunk", 8, 1 | FWDQ_T_CHUNK << 1, fw, 25);
+    le(fw, 22, 8), memcpy(fw + 8, "select", 6);
+    put_frame(dir, "seed-fwd-qreq", 8, 1 | FWDQ_T_REQ << 1, fw, 14);
+    le(fw, 23, 8), memcpy(fw + 8, "insert", 6);
+    put_frame(dir, "seed-fwd-req", 8, FWD_T_REQ << 1, fw, 14);
+    put_frame(dir, "seed-fwd-rep", 8, FWD_T_REP << 1, fw, 14);
+    le(fw, 24, 8);
+    put_frame(dir, "seed-fwd-cancel", 8, 1 | FWDQ_T_CANCEL << 1, fw, 8);
     put_frame(dir, "seed-xxh", 4, 3, text, sizeof text);
     /* replication messages: an ACK, and an APPEND of two records (5 and 1 positions) of 40 and 32 bytes */
     static uint8_t mb[RW_HEAD + RW_APPEND_HEAD + 2 * RW_DESC + 72];

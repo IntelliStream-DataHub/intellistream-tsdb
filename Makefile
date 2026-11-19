@@ -54,7 +54,7 @@ FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users cl
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
-FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o
+FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o fwd.o
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -417,7 +417,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/tsdbd $(B)/t
 	./$(B)/test_meta /tmp --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
 	./$(B)/test_peerlink $(or $(TMPDIR),/tmp)
-	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick; do ! ./$(B)/test_peerlink $(or $(TMPDIR),/tmp) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead; do ! ./$(B)/test_peerlink $(or $(TMPDIR),/tmp) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 
 # the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 17 runs of 2 minutes each under a sanitizer
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
@@ -475,7 +475,7 @@ $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuz
 	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
-$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o server/peerlink.h server/replwire.h
+$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o server/peerlink.h server/replwire.h server/fwd.h
 $(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
@@ -492,7 +492,7 @@ $(FUZZ_B)/libtsdb.a: FORCE
 	    rm -f $(FUZZ_B)/*.o $(FUZZ_B)/*.a $(FUZZ_B)/fuzz-*; printf '%s\n' "$(FUZZ_SIG)" >$(FUZZ_B)/.flags; \
 	fi
 	$(MAKE) B=$(FUZZ_B) CC=$(FUZZ_CC) ARCH="$(FUZZ_ARCH)" CFLAGS="$(FUZZ_SAN) $(FUZZ_COV)" $@ \
-	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o $(FUZZ_B)/props.o $(FUZZ_B)/cfg.o $(FUZZ_B)/peerlink.o $(FUZZ_B)/replwire.o
+	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o $(FUZZ_B)/props.o $(FUZZ_B)/cfg.o $(FUZZ_B)/peerlink.o $(FUZZ_B)/replwire.o $(FUZZ_B)/fwd.o
 
 # the driver is built without coverage: it holds the hook
 $(FUZZ_B)/driver.o: tests/fuzz/driver.c $(FUZZ_B)/libtsdb.a
@@ -781,6 +781,12 @@ $(B)/cluster.o: server/cluster.c server/cluster.h server/peerlink.h server/meta.
 # the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it
 $(B)/peerlink.o: server/peerlink.c server/peerlink.h client/tsdb_crypto.h src/compat.h | $(B)
 	$(CC) $(CFLAGS) -Iclient -c -o $@ $<
+# the forwarding links (server/fwd.h): the transport in fwd.o (no cluster calls: test_peerlink and the fuzzer link
+# it), tsdbd's instance over the cluster's member list in fwd_cluster.o
+$(B)/fwd.o: server/fwd.c server/fwd.h server/peerlink.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(B)/fwd_cluster.o: server/fwd_cluster.c server/fwd.h server/peerlink.h server/cluster.h server/meta.h client/tsdb_crypto.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
 $(B)/repl.o: src/repl.c src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
@@ -789,15 +795,15 @@ $(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
 # the replication driver's payloads on the data links (server/replwire.h)
 $(B)/replwire.o: server/replwire.c server/replwire.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(RAFT_OBJ)
+CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(RAFT_OBJ)
 $(B)/tsdb: $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
-$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 $(B)/test_meta: tests/test_meta.c server/meta.h $(B)/meta.o $(B)/repl.o $(RAFT_OBJ) $(B)/raft_raft_sim.o
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -o $@ $< $(B)/meta.o $(B)/repl.o $(RAFT_OBJ) $(B)/raft_raft_sim.o -lm
 # test_meta with bugs planted in meta.c (MUT(n), -DMETA_MUTANTS): tests/meta_mutants.sh runs each with --mutant n and
@@ -840,7 +846,7 @@ copy-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 meta-soak: $(B)/test_meta
 	./$(B)/test_meta /tmp --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
-TSDBD_SRC := server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
+TSDBD_SRC := server/fwd.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c \
