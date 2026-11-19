@@ -740,7 +740,11 @@ at once; the Raft leader sees the volume reported failed in the next heartbeat a
   answered in 1.6 s with a replica stopped; mutant `shipperfile`).
 - **A leader that cannot reach its replicas but reaches the Raft leader**: before shrinking the ISR below 2 while the
   Raft leader still hears the replicas' heartbeats, the Raft leader moves leadership to a replica instead (ha.md D38's
-  reasoning: the cut-off one should step aside, not the others).
+  reasoning: the cut-off one should step aside, not the others). *Built in R3 (r3e-failover):* a member the shrink drops that
+  the Raft leader hears and whose heartbeat lists the leader among the peers it has not heard on any data link for a
+  second makes it a move (a promotion with reason PLANNED: the old leader is fenced and its own answer is no candidate);
+  a shrink below 2 that drops a member heard but not yet reporting waits up to 2 s for that report, and a move with no
+  candidate in 2 s gives way to the shrink (`test_cluster cut`, `TSDB_REPLD_TEST=cutlinks`; mutant `cutshrinks`).
 - A tsdbd that hangs but keeps its sockets open stops heartbeating (heartbeats come from the event loop, which also
   serves the volumes), so it is treated as down. A slow disk shows as a replica falling behind: ISR removal, not
   failover.

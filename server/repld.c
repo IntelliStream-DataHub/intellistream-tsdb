@@ -277,6 +277,8 @@ static struct {
     uint64_t spill_bytes; /* a bulk file larger than this is received into a spill file (TSDB_REPLD_TEST=spill: 64 KiB) */
     int spill_said;
     size_t inbox_bytes; /* INBOX_BYTES (TSDB_REPLD_TEST=smallinbox: 256 KiB) */
+    int cut_links;      /* TSDB_REPLD_TEST=cutlinks: a message of any volume from node N is dropped as it arrives while
+                         * <dir>/cutfrom.N exists (test_cluster cut) */
     int stall_inbox;    /* TSDB_REPLD_TEST=stallinbox: no peer frame is handled while <dir>/stallinbox exists (a
                            stalled disk's stand-in), until repld_stop (test_cluster stallstop) */
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
@@ -1733,6 +1735,12 @@ static void handle(struct rvol *rv, struct item *it)
     if (rw_decode_msg(it->data, it->n, &rv->cur, rv->recs, rv->lens, rv->crec) != 0 || rv->cur.volume != rv->number ||
         rv->cur.m.from != from || rv->cur.m.to != rv->self)
         return; /* not a message of this volume from that peer: dropped */
+    if (G.cut_links) { /* a data link cut both ways when each end has the other's file (the peer port stays) */
+        char f[sizeof G.dir + 32];
+        snprintf(f, sizeof f, "%s/cutfrom.%" PRIu32, G.dir, rv->rec.rep[from].node);
+        if (access(f, F_OK) == 0)
+            return;
+    }
     uint64_t o = 0;
     for (uint32_t i = 0; i < rv->cur.m.nrec; i++)
         rv->coff[i] = o, o += rv->cur.lens[i];
@@ -2135,6 +2143,7 @@ void repld_init(tsdb *t, const char *dir)
     if (G.mutant == RM_NOINBOXBOUND)
         G.inbox_bytes = SIZE_MAX;
     G.stall_inbox = te && strstr(te, "stallinbox");
+    G.cut_links = te && strstr(te, "cutlinks");
     G.slow_read = te && strstr(te, "slowread");
     G.slow_tick = te && strstr(te, "slowtick");
     G.late_tick = te && strstr(te, "latetick");

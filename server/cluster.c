@@ -1552,7 +1552,8 @@ enum cl_mutant {
     CLM_NOPROMOTEWAIT = 6,
     CLM_SHRINKNOCOND = 7, /* an ISR request is proposed on the record's current epoch and ISR version, not its own basis */
     CLM_LEASESTALE = 8,   /* a node that reports itself the writer of a volume another leads still gets a lease */
-    CLM_UPWAITS = 9       /* a new Raft leader proposes a restarted member up only after node_timeout */
+    CLM_UPWAITS = 9,      /* a new Raft leader proposes a restarted member up only after node_timeout */
+    CLM_CUTSHRINKS = 10   /* a leader cut from its replicas shrinks the ISR to itself instead of stepping aside */
 };
 static int cl_mutant(void)
 {
@@ -1570,6 +1571,7 @@ static int cl_mutant(void)
             : !strcmp(e, "shrinknocond")  ? CLM_SHRINKNOCOND
             : !strcmp(e, "leasestale")    ? CLM_LEASESTALE
             : !strcmp(e, "upwaits")       ? CLM_UPWAITS
+            : !strcmp(e, "cutshrinks")    ? CLM_CUTSHRINKS
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -4350,6 +4352,8 @@ static int isr_same_members(const struct cluster_isr_req *a, const struct cluste
     return 1;
 }
 
+static int cut_move(const struct meta_volume *v, const struct cluster_isr_req *q, uint64_t now);
+
 static void propose_isr(uint64_t now)
 {
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
@@ -4387,6 +4391,8 @@ static void propose_isr(uint64_t now)
             int nocond = cl_mutant() == CLM_SHRINKNOCOND;
             if (!nocond && (q->epoch != v->epoch || q->isr_version != v->isr_version))
                 continue; /* the leader has not seen the record move yet; its next heartbeat drops it */
+            if (cut_move(v, q, now))
+                continue; /* the leader is the one cut off: it steps aside rather than shrink the others out */
             struct isr_sent *s = NULL;
             for (uint32_t k = 0; k < nisr_sent && !s; k++)
                 if (isr_sent[k].q.volume == q->volume && isr_sent[k].q.epoch == q->epoch &&
@@ -4436,8 +4442,18 @@ static void propose_isr(uint64_t now)
  * PROMO_WAIT_NS with one answer at least. A live old leader (RESIGNED) is not passed by until it answered (its core is
  * deposed by the fence) or its lease ran out (promote_safe_ns): until then on_hb grants it no lease. The promotion
  * goes once the record moves past its basis, or after PROMO_GIVEUP_NS (a new one starts on the record then). No answer
- * at all: NO_OWNER, said once (`tsdb cluster volume force-leader`). */
+ * at all: NO_OWNER, said once (`tsdb cluster volume force-leader`).
+ *
+ * A move (PLANNED, design-cluster.md 6.1): the leader asks for an ISR below 2 while a member it would drop is heard
+ * here and its heartbeat says it cannot reach the leader on the data links (a cut, not a slow disk). The Raft leader
+ * then holds the shrink and promotes as above, the old leader's own answer not a candidate (its tail past the replicas'
+ * was never committed), and the old leader not passed by until it answered or its lease ran out. A move that finds no
+ * candidate within PROMO_MOVE_NS gives up for that basis, and the shrink goes ahead. A member reports a peer
+ * unreachable only after a second (cvol.c UNREACH_MS), about when its leader asks to drop it, so a shrink below 2 that
+ * would drop a member heard here waits up to CUT_HOLD_NS for that report: a slow disk's shrink to one copy costs that. */
 #define PROMO_RESEND_NS (100 * MS)
+#define PROMO_MOVE_NS (2000 * MS)
+#define CUT_HOLD_NS (2000 * MS)
 #define PROMO_WAIT_NS (500 * MS)
 #define PROMO_GIVEUP_NS (5000 * MS)
 #define VMSG_Q 256
@@ -4461,6 +4477,8 @@ static void *g_fence_arg;
 static struct promo *g_promo; /* the cluster thread's */
 static size_t g_npromo, g_promo_cap;
 static struct { uint32_t vol, from; uint64_t epoch; } g_resign[64]; /* RESIGNs heard since the last duty round */
+static struct { uint32_t vol; uint64_t epoch, version; } g_cutfail[16]; /* moves given up, per basis */
+static unsigned g_ncutfail;
 static unsigned g_nresign;
 
 void cluster_set_fence_handler(cluster_fence_fn fn, void *arg)
@@ -4663,7 +4681,7 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
     if (!old_ok && (!om || om->state != META_UP || now >= promote_safe_ns(p->old)))
         old_ok = 1;
     if (!nrep) {
-        if (!p->said && since(now, p->t0) >= PROMO_WAIT_NS) {
+        if (!p->said && since(now, p->t0) >= PROMO_WAIT_NS && p->reason != META_GR_PLANNED) {
             p->said = 1;
             say("volume %" PRIu32 ": NO_OWNER: no ISR member answers the fence for epoch %" PRIu64
                 " (tsdb cluster volume force-leader %" PRIu32 " NODE)", p->vol, p->epoch + 1, p->vol);
@@ -4683,7 +4701,8 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
     memcpy(g.fenced, p->fenced, sizeof g.fenced);
     uint64_t best = 0;
     for (uint32_t i = 0; i < p->nfenced; i++)
-        if (p->replied[i] && !(p->reason == META_GR_FENCED && p->fenced[i] == p->old)) { /* not the failed one */
+        if (p->replied[i] && !((p->reason == META_GR_FENCED || p->reason == META_GR_PLANNED) &&
+                               p->fenced[i] == p->old)) { /* not the failed or the cut-off one */
             g.reply[g.nreplies++] = p->reply[i];
             if (p->reply[i].durable > best)
                 best = p->reply[i].durable;
@@ -4721,6 +4740,58 @@ static int vol_reports_fault(uint32_t node, const struct meta_volume *v)
     return 0;
 }
 
+/* 1: the shrink q is held for a move of the leadership (see the head of this section) */
+static int cut_move(const struct meta_volume *v, const struct cluster_isr_req *q, uint64_t now)
+{
+    if (q->nisr >= 2 || v->nisr < 2 || !v->leader || cl_mutant() == CLM_CUTSHRINKS)
+        return 0;
+    if (promo_find(v->number))
+        return 1;
+    for (unsigned i = 0; i < g_ncutfail; i++)
+        if (g_cutfail[i].vol == v->number && g_cutfail[i].epoch == v->epoch && g_cutfail[i].version == v->isr_version)
+            return 0;
+    static struct { uint32_t vol; uint64_t epoch, version, ns; } seen[16]; /* when a shrink was first held */
+    static unsigned nseen;
+    unsigned si = 0;
+    while (si < nseen && !(seen[si].vol == v->number && seen[si].epoch == v->epoch && seen[si].version == v->isr_version))
+        si++;
+    if (si == nseen) {
+        si = nseen < sizeof seen / sizeof seen[0] ? nseen++ : (unsigned)(now % (sizeof seen / sizeof seen[0]));
+        seen[si].vol = v->number, seen[si].epoch = v->epoch, seen[si].version = v->isr_version, seen[si].ns = now;
+    }
+    static struct cluster_report own;
+    int cut = 0, alive = 0;
+    for (uint32_t i = 0; i < v->nisr && !cut; i++) {
+        uint32_t m = v->isr[i], kept = 0;
+        for (uint32_t k = 0; k < q->nisr && k < META_REPLICAS_MAX; k++)
+            kept |= q->node[k] == m;
+        if (m == v->leader || kept || !heard_fresh(m, now))
+            continue;
+        alive = 1;
+        const struct cluster_unreach *u = NULL;
+        uint32_t nu = 0;
+        if (m == C.id) {
+            memset(&own, 0, sizeof own);
+            if (g_reporter)
+                g_reporter(g_reporter_arg, &own);
+            u = own.unreach;
+            nu = own.nunreach > CLUSTER_REPORT_UNREACH ? 0 : own.nunreach;
+        } else {
+            const struct heard *h = heard_get(m);
+            if (h) {
+                u = h->unreach;
+                nu = h->nunreach;
+            }
+        }
+        for (uint32_t k = 0; k < nu; k++)
+            cut |= u[k].node == v->leader;
+    }
+    if (!cut) /* a member heard here but not (yet) saying it lost the leader: its report is at most a second late */
+        return alive && since(now, seen[si].ns) < CUT_HOLD_NS;
+    promo_start(v, META_GR_PLANNED, now);
+    return promo_find(v->number) != NULL;
+}
+
 static void promote_duty(uint64_t now)
 {
     unsigned nres = g_nresign;
@@ -4731,10 +4802,19 @@ static void promote_duty(uint64_t now)
     }
     size_t k = 0;
     for (size_t i = 0; i < g_npromo; i++) { /* the record moved past the basis, or the proposal is lost */
-        const struct meta_volume *v = meta_volume(&C.sm, g_promo[i].vol);
-        if (v && v->epoch == g_promo[i].epoch && v->isr_version == g_promo[i].version &&
-            since(now, g_promo[i].t0) < PROMO_GIVEUP_NS)
-            g_promo[k++] = g_promo[i];
+        const struct promo *p = &g_promo[i];
+        const struct meta_volume *v = meta_volume(&C.sm, p->vol);
+        int moved = !v || v->epoch != p->epoch || v->isr_version != p->version;
+        if (!moved && p->reason == META_GR_PLANNED && !p->proposed_ns && since(now, p->t0) >= PROMO_MOVE_NS) {
+            say("volume %" PRIu32 ": no replica to move the leadership of epoch %" PRIu64 " to; the ISR shrinks",
+                p->vol, p->epoch);
+            if (g_ncutfail == sizeof g_cutfail / sizeof g_cutfail[0])
+                g_ncutfail = 0;
+            g_cutfail[g_ncutfail++] = (__typeof__(g_cutfail[0])){p->vol, p->epoch, p->version};
+            continue;
+        }
+        if (!moved && since(now, p->t0) < PROMO_GIVEUP_NS)
+            g_promo[k++] = *p;
     }
     g_npromo = k;
     for (uint32_t i = 0; i < C.sm.nvolumes; i++) {

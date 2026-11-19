@@ -3714,7 +3714,7 @@ static void *flood_thread(void *a)
     struct flood *f = a;
     while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) {
         struct rep_writer w = {f->port, f->id, 1000000000LL * (__atomic_load_n(&f->rounds, __ATOMIC_RELAXED) + 1), 0, 0,
-                               0, 1000};
+                               0, 1000, 0};
         rep_write_thread(&w);
         if (w.rc != 0) {
             __atomic_store_n(&f->rc, w.rc, __ATOMIC_RELEASE);
@@ -3893,7 +3893,7 @@ static void scen_backpressure(void)
     while (now_ms() - t0 < 4000) {
         for (int k = 0; k < 4; k++) {
             w[k] = (struct rep_writer){cports[L], id[0], 4000000LL * rounds + 1000000LL * k, 0, 0, 0,
-                                       1000};
+                                       1000, 0};
             if (pthread_create(&th[k], NULL, rep_write_thread, &w[k]) != 0)
                 die("pthread_create");
         }
@@ -3906,7 +3906,7 @@ static void scen_backpressure(void)
         rounds++;
     }
     /* and a large write: its part is shipped as a file above the spill threshold */
-    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000};
+    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000, 0};
     rep_write_thread(&wb);
     if (wb.rc != 0)
         die("a large write with a stalled replica: %s", ers(wb.rc));
@@ -3976,7 +3976,7 @@ static void scen_stallstop(void)
             unlink(stall);
             die("the stalled replica's inbox never filled in 20 s (the case proved nothing)");
         }
-        struct rep_writer w = {cports[L], id, 1000000LL * round + 1, 0, 0, 0, 1000};
+        struct rep_writer w = {cports[L], id, 1000000LL * round + 1, 0, 0, 0, 1000, 0};
         rep_write_thread(&w);
         if (w.rc != 0) {
             unlink(stall);
@@ -4402,7 +4402,7 @@ static void scen_reopenhold(void)
     start(R);
     penv[R] = NULL;
     await_open_gen(L, "plant", R, 2, 0);
-    struct rep_writer wb = {cports[L], id2, 2000000000, 0, 0, 0, 100000}; /* above wal_max_batch_rows */
+    struct rep_writer wb = {cports[L], id2, 2000000000, 0, 0, 0, 100000, 0}; /* above wal_max_batch_rows */
     rep_write_thread(&wb);
     if (wb.rc != 0)
         die("a large write with a replica that drops its file: %s", ers(wb.rc));
@@ -4686,7 +4686,7 @@ static void scen_replindet(void)
     int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
     pause_server(R1, 1); /* no replica acknowledges: the commit point stops below the next write */
     pause_server(R2, 1);
-    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -4921,7 +4921,7 @@ static void scen_replfail(void)
     tsdbc_close(c);
     int R = (L + 1) % 3;
     signal_child(pids[R], SIGUSR2); /* crashfs: the next fdatasync of a wal_ file there fails with EIO */
-    struct rep_writer w = {cports[L], id, 2000, 1000000, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 2000, 1000000, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -5070,7 +5070,7 @@ static void scen_ackdurable(void)
     int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
     signal_child(pids[R1], SIGUSR2);
     signal_child(pids[R2], SIGUSR2);
-    struct rep_writer w1 = {cports[L], id, 1000 + 1000LL * ACKED, 1, 0, 0, 0};
+    struct rep_writer w1 = {cports[L], id, 1000 + 1000LL * ACKED, 1, 0, 0, 0, 0};
     pthread_t th1, th2;
     if (pthread_create(&th1, NULL, rep_write_thread, &w1) != 0)
         die("pthread_create");
@@ -6010,7 +6010,7 @@ static void scen_repcheck(void)
                 die("the stalesent fault did not fire in 10 s");
             usleep(10000);
         }
-        struct rep_writer sw = {cports[L], id, 4000000, 1, 0, 0, 0};
+        struct rep_writer sw = {cports[L], id, 4000000, 1, 0, 0, 0, 0};
         pthread_t sth;
         if (pthread_create(&sth, NULL, rep_write_thread, &sw) != 0)
             die("pthread_create");
@@ -6039,7 +6039,7 @@ static void scen_repcheck(void)
     if (fd < 0)
         die("%s: %s", skip, strerror(errno));
     close(fd);
-    struct rep_writer w = {cports[L], id, 5000000, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 5000000, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -6272,6 +6272,112 @@ static void scen_resign(void)
     rep_same(wantr, "after the resign");
 }
 
+static void cut_file(int at, int from, int on)
+{
+    char f[PATH_MAX + 64];
+    server_dir(at, f, sizeof f);
+    snprintf(f + strlen(f), sizeof f - strlen(f), "/cutfrom.%" PRIu32, ids[from]);
+    if (on) {
+        FILE *fp = fopen(f, "w");
+        if (!fp)
+            die("create %s", f);
+        fclose(fp);
+    } else if (unlink(f) != 0 && errno != ENOENT) {
+        die("unlink %s", f);
+    }
+}
+
+/* A leader cut from its replicas on the data links (TSDB_REPLD_TEST=cutlinks; the peer port, heartbeats and the Raft
+ * group stay whole) asks to shrink the ISR to itself; the Raft leader, which hears the replicas and reads in their
+ * heartbeats that they lost the leader, moves the leadership to one of them instead (design-cluster.md 6.1): no ISR of
+ * one member at the old epoch, a replica leads e+1 with every acknowledged row, a write to the old leader is MOVED, and
+ * the old leader rejoins once the links are back. TSDB_CLUSTER_MUTANT=cutshrinks (the shrink proposed) fails it. */
+static void scen_cut(void)
+{
+    scenario("cut");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rs", 3, &num)) != 0 || num != 1)
+        die("volume add rs: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rs", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rs", &v))
+        die("no record of rs");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rs is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdbc_set_retry(c, 0); /* the MOVED below is to be seen, not followed */
+    tsdb_sid id = rep_series(c, rep_names[0], "rs", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    await_isr(L, "rs", 3, 30000, "every replica in the ISR before the cut");
+    uint64_t t0 = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    int Nw = await_promoted((L + 1) % 3, "rs", old, e0, &v);
+    uint64_t tm = now_ms();
+    if (v.epoch != e0 + 1 || Nw == L)
+        die("the record of rs after the cut: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    char line[96];
+    snprintf(line, sizeof line, "ISR of 1 members (epoch %" PRIu64 ",", e0);
+    int moved = 0, shrunk = 0;
+    for (int i = 0; i < 3; i++) {
+        moved += log_count(i, "(reason 3); fences");
+        shrunk += log_count(i, line);
+    }
+    if (shrunk || !moved)
+        die("the cut leader's ISR: %d proposals of one member at epoch %" PRIu64 ", %d moves (want 0 and 1 at least)",
+            shrunk, e0, moved);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * acked, 30000);
+    if (got != acked)
+        die("the leader at epoch %" PRIu64 " (server %d) holds %d of the %d acknowledged rows", v.epoch, Nw, got, acked);
+    insert_expect_moved(c, id, 5000000, 1, (uint16_t)num, v.leader, v.epoch, "a write to the cut-off old leader");
+    tsdbc_close(c);
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the leader at epoch %" PRIu64 ": %s", v.epoch, ers(rc));
+    tsdbc_close(c);
+    printf("  leader %d cut from its replicas: server %d leads epoch %" PRIu64 " %" PRIu64 " ms after the cut, with all "
+           "%d acknowledged rows; no ISR of one\n", L, Nw, v.epoch, tm - t0, acked);
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    await_isr(Nw, "rs", 3, 60000, "every server in the ISR once the links are back");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)acked + 1;
+    rep_same(wantr, "after the cut");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -6303,7 +6409,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"pause", scen_pause}, {"resign", scen_resign}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"pause", scen_pause}, {"resign", scen_resign}, {"cut", scen_cut}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
