@@ -419,6 +419,11 @@ int user_main(const char *dir, int argc, char **argv)
             fprintf(stderr, "tsdb: %s does not exist\n", dir);
         return 1;
     }
+    if (users_cluster_marked(dir)) { /* S2-1: a USERS made here would stop that tsdbd from starting */
+        fprintf(stderr, "tsdb: %s is a cluster server's root: its users are the metadata group's; use 'tsdb cluster "
+                        "user %s PEER ...' (docs/cluster-preview.md)\n", dir, verb);
+        return 1;
+    }
     users us;
     int rc = users_open(&us, dir, !(strcmp(verb, "list") == 0));
     if (rc) {

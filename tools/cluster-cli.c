@@ -37,7 +37,7 @@ static const char cl_help[] =
     "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
     "       tsdb cluster volume add PEER NAME [--replicas N] --secret-file F\n"
     "       tsdb cluster status PEER --secret-file F\n"
-       "       tsdb cluster user add|passwd|drop|grant|revoke|list PEER ... --secret-file F\n"
+       "       tsdb cluster user add|passwd|drop|grant|revoke|list|import PEER ... --secret-file F\n"
     "       tsdb cluster help\n"
     "\n"
     "  PEER and NEW_PEER are a server's peer address, host:port (tsdbd --cluster, its --peer-port and --advertise).\n"

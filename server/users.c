@@ -1623,6 +1623,8 @@ static int sync_name(users *us, const uint8_t id[16])
  * so they are made durable first. Unlocks. */
 static int change_none(users *us, int rc)
 {
+    if (us->group) /* the copy holds only what the group committed */
+        return rc;
     if (tsdb_fdatasync(us->fd) != 0) {
         users_fail(us, "fdatasync");
         rc = TSDB_ERR_IO;
@@ -1636,12 +1638,14 @@ static int change_none(users *us, int rc)
 /* Takes the write lock on the file now at the path, and reads what others appended. */
 static int change_lock(users *us)
 {
-    if (!us->writable)
+    if (!us->writable || (us->group && !us->prop))
         return TSDB_ERR_READONLY;
     if (us->failed)
         return TSDB_ERR_IO;
     if (us->damaged)
         return TSDB_ERR_CORRUPT;
+    if (us->group)
+        return 0; /* no file, no lock: the conditional put of the proposal orders writers */
     struct stat d;
     int rc = writer_ok(us, &d);
     if (rc)
@@ -1687,9 +1691,40 @@ static int change_lock(users *us)
     return rc;
 }
 
+/* A group store's change_write: applies the records of b in a batch only to see the target's new state, puts that
+ * (or its drop) in *us->prop, and rolls back: the state changes only when the copy brings the committed entry. */
+static int group_write(users *us, rbuf *b)
+{
+    users_proposal *pr = us->prop;
+    int rc = b->oom ? TSDB_ERR_NOMEM : 0;
+    const user *pre = rc ? NULL : users_find(us, us->target);
+    uint64_t version = pre ? pre->version : 0;
+    batch bt;
+    size_t end;
+    if (rc == 0 && (rc = batch_begin(us, &bt)) == 0) {
+        rc = apply_buf(us, &bt, b->p, b->n, b->base, 0, &end);
+        if (rc == 0 && end != b->n)
+            rc = TSDB_ERR_CORRUPT;
+        if (rc == 0) {
+            const user *t = users_find(us, us->target);
+            users_proposal_clear(pr);
+            snprintf(pr->name, sizeof pr->name, "%s", us->target);
+            pr->version = version;
+            pr->op = t ? USERS_PROP_PUT : USERS_PROP_DEL;
+            if (t && (rc = user_blob_encode(t, &pr->blob, &pr->len)) != 0)
+                pr->op = 0;
+        }
+        batch_rollback(us, &bt);
+    }
+    free(b->p);
+    return rc;
+}
+
 /* Appends the records of b (built for offset us->off), syncs and applies them, and unlocks. */
 static int change_write(users *us, rbuf *b)
 {
+    if (us->group)
+        return group_write(us, b);
     int rc = 0;
     if (b->oom) {
         rc = TSDB_ERR_NOMEM;
@@ -1775,6 +1810,7 @@ int users_create(users *us, uint32_t actor, const char *name, uint8_t flags, con
 {
     if (!user_name_valid(name, strlen(name)) || (flags & ~USER_SUPERUSER) || (v && !verifier_valid(v)))
         return TSDB_ERR_INVALID;
+    us->target = name;
     int rc = change_lock(us);
     if (rc)
         return rc;
@@ -1806,6 +1842,7 @@ static int change_target(users *us, uint32_t actor, const char *name, const user
 {
     if (!user_name_valid(name, strlen(name)))
         return TSDB_ERR_INVALID;
+    us->target = name;
     int rc = change_lock(us);
     if (rc)
         return rc;
@@ -2089,6 +2126,115 @@ int user_blob_decode(const uint8_t *blob, size_t len, user **out)
     }
     users_close(&us);
     return rc;
+}
+
+/* ------------------------------------------------------- a group store */
+
+int users_group_init(users *us)
+{
+    memset(us, 0, sizeof *us);
+    us->fd = us->dfd = -1;
+    us->writable = us->group = us->have_header = true;
+    us->off = HEADER_SIZE; /* the records of a change follow a header, as in a blob */
+    snprintf(us->path, sizeof us->path, "the metadata group's users");
+    /* the unknown-user verifiers of this process (A4); every server has its own */
+    return tsdb_random(us->mock_key, sizeof us->mock_key) != 0 ? TSDB_ERR_IO : 0;
+}
+
+bool users_cluster_marked(const char *dir)
+{
+    char p[4200];
+    snprintf(p, sizeof p, "%s/" USERS_CLUSTER_MARK, dir);
+    struct stat st;
+    return lstat(p, &st) == 0;
+}
+
+int users_mark_cluster(const char *dir)
+{
+    if (users_cluster_marked(dir))
+        return 0;
+    char p[4200];
+    snprintf(p, sizeof p, "%s/" USERS_CLUSTER_MARK, dir);
+    static const char text[] = "the users of this server are the cluster's metadata group's: 'tsdb cluster user'\n";
+    int fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return errno == EEXIST ? 0 : TSDB_ERR_IO;
+    bool ok = write(fd, text, sizeof text - 1) == (ssize_t)(sizeof text - 1) && tsdb_fsync(fd) == 0;
+    ok &= close(fd) == 0;
+    return ok && fsync_dir(dir) == 0 ? 0 : TSDB_ERR_IO;
+}
+
+void users_proposal_clear(users_proposal *p)
+{
+    free(p->blob);
+    memset(p, 0, sizeof *p);
+}
+
+static int by_uid(const void *a, const void *b)
+{
+    uint32_t x = (*(user *const *)a)->uid, y = (*(user *const *)b)->uid;
+    return x < y ? -1 : x > y;
+}
+
+int users_group_set(users *us, const users_group_rec *r, uint32_t n, uint32_t *refused)
+{
+    *refused = 0;
+    user **v = malloc((n ? n : 1) * sizeof *v);
+    bool *kept = us->n ? calloc(us->n, 1) : NULL;
+    if (!v || (us->n && !kept)) {
+        free(v), free(kept);
+        return TSDB_ERR_NOMEM;
+    }
+    uint64_t bt = us->batch + 1;
+    uint32_t m = 0, max_uid = us->max_uid;
+    for (uint32_t i = 0; i < n; i++) {
+        long j = user_index(us, r[i].uid);
+        user *u = NULL;
+        if (j >= 0 && !kept[j] && us->u[j]->version == r[i].version && strcmp(us->u[j]->name, r[i].name) == 0) {
+            u = us->u[j];
+            kept[j] = true;
+        } else {
+            int rc = user_blob_decode(r[i].blob, r[i].len, &u);
+            if (rc == TSDB_ERR_NOMEM) {
+                for (uint32_t k = 0; k < m; k++)
+                    if (v[k]->batch == bt)
+                        user_free(v[k]);
+                free(v), free(kept);
+                return rc;
+            }
+            if (rc || u->uid == 0 || u->uid != r[i].uid || strcmp(u->name, r[i].name) != 0) {
+                user_free(u); /* NULL when it did not decode */
+                (*refused)++;
+                continue;
+            }
+            u->version = r[i].version;
+            u->batch = bt;
+        }
+        v[m++] = u;
+        if (u->uid > max_uid)
+            max_uid = u->uid;
+    }
+    qsort(v, m, sizeof *v, by_uid);
+    uint32_t w = 0;
+    for (uint32_t k = 0; k < m; k++) {
+        if (w && v[k]->uid == v[w - 1]->uid) { /* the state machine never gives two users one uid: the first stays */
+            if (v[k]->batch == bt)
+                user_free(v[k]);
+            else
+                kept[user_index(us, v[k]->uid)] = false; /* freed with the old users below */
+            (*refused)++;
+            continue;
+        }
+        v[w++] = v[k];
+    }
+    m = w;
+    for (uint32_t j = 0; j < us->n; j++)
+        if (!kept[j])
+            user_free(us->u[j]);
+    free(us->u), free(kept);
+    us->u = v, us->n = m, us->cap = n ? n : 1, us->max_uid = max_uid, us->batch = bt;
+    (void)names_rebuild(us); /* out of memory: users_find scans until the next rebuild */
+    return 0;
 }
 
 int user_change_grant(user *u, uint8_t kind, const char *sel, size_t len, uint8_t rights, bool grant)

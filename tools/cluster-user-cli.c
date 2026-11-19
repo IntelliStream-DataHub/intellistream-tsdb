@@ -33,9 +33,13 @@ static int uusage(void)
             "       tsdb cluster user drop PEER NAME [--wait-ms MS]\n"
             "       tsdb cluster user grant|revoke PEER NAME SELECTOR RIGHTS [--wait-ms MS]\n"
             "       tsdb cluster user list PEER [NAME]\n"
+            "       tsdb cluster user import PEER DIR... [--from-node DIR] [--wait-ms MS]\n"
             "  each with --secret-file F (the cluster's secret). SELECTOR: all, prefix:P, name:N, glob:G; RIGHTS:\n"
             "  read, insert, delete, admin, write, separated by commas. A change is answered once the group\n"
-            "  committed it; members that had not applied it after --wait-ms (10000) are listed as lagging.\n");
+            "  committed it; members that had not applied it after --wait-ms (10000) are listed as lagging.\n"
+            "  import reads the USERS of stopped servers' roots (DIR...) and puts the users that are the same in every\n"
+            "  one (verifiers as they are: no password is needed); a user that differs between them stops the import\n"
+            "  unless --from-node DIR (one of them) says whose copy wins.\n");
     return 2;
 }
 
@@ -323,6 +327,133 @@ int cluster_user_add_first(const char *addr, const uint8_t *secret, size_t slen,
     return uedit(&x, "add", name, 1, pwfile, ITER_MIN, NULL, NULL, 10000);
 }
 
+/* Two users hold the same facts: flags, verifier, grants (as sets: their order is their history's). */
+static bool user_same(const user *a, const user *b)
+{
+    if (a->flags != b->flags || a->has_verifier != b->has_verifier || a->ng != b->ng)
+        return false;
+    if (a->has_verifier &&
+        (a->v.iterations != b->v.iterations || a->v.salt_len != b->v.salt_len ||
+         memcmp(a->v.salt, b->v.salt, a->v.salt_len) || memcmp(a->v.stored_key, b->v.stored_key, 32) ||
+         memcmp(a->v.server_key, b->v.server_key, 32)))
+        return false;
+    for (uint32_t i = 0; i < a->ng; i++) {
+        uint32_t j = 0;
+        while (j < b->ng && (b->g[j].kind != a->g[i].kind || b->g[j].rights != a->g[i].rights ||
+                             b->g[j].len != a->g[i].len || memcmp(b->g[j].sel, a->g[i].sel, a->g[i].len)))
+            j++;
+        if (j == b->ng)
+            return false;
+    }
+    return true;
+}
+
+/* `import PEER DIR...`: every user of the USERS files given, put with version 0 (a create). A user that differs
+ * between them (or is missing from one: that node may have dropped it) stops the whole import before anything is put,
+ * unless --from-node names whose copy wins; a user the group already holds the same is skipped, so a rerun after a
+ * failure is safe. TSDB_AUTH_MUTANT=importmerge (tests only): differing users go in from the first file. */
+static int uimport(struct uctx *x, char **dirs, int nd, const char *from, uint32_t wait_ms)
+{
+    const char *m = getenv("TSDB_AUTH_MUTANT");
+    bool merge = m && !strcmp(m, "importmerge");
+    users *us = calloc((size_t)nd, sizeof *us);
+    int fi = -1, ret = 0;
+    if (!us)
+        return 1;
+    for (int i = 0; i < nd; i++) {
+        if (from && !strcmp(from, dirs[i]))
+            fi = i;
+        int rc = users_open(&us[i], dirs[i], false);
+        if (rc) {
+            fprintf(stderr, "tsdb cluster user import: %s/USERS: %s\n", dirs[i], tsdb_strerror(rc));
+            ret = 1;
+        } else if (us[i].n == 0) {
+            fprintf(stderr, "tsdb cluster user import: %s/USERS: no users (is it a server's root?)\n", dirs[i]);
+            ret = 1;
+        }
+    }
+    if (from && fi < 0) {
+        fprintf(stderr, "tsdb cluster user import: --from-node %s is none of the directories given\n", from);
+        ret = 2;
+    }
+    /* first pass: decide; nothing is put while a user differs without a winner */
+    uint32_t differ = 0, nput = 0, same = 0, failed = 0;
+    for (int pass = 0; pass < 2 && ret == 0; pass++) {
+        for (int i = 0; i < nd && ret == 0; i++) {
+            for (uint32_t k = 0; k < us[i].n; k++) {
+                const user *u = us[i].u[k];
+                bool seen = false, equal = true;
+                for (int j = 0; j < i && !seen; j++)
+                    seen = users_find(&us[j], u->name) != NULL;
+                if (seen)
+                    continue;
+                for (int j = i + 1; j < nd; j++) {
+                    const user *o = users_find(&us[j], u->name);
+                    equal &= o && user_same(u, o);
+                }
+                if (i > 0) /* absent from every earlier one (seen is false) */
+                    equal = false;
+                const user *put = u;
+                if (!equal && !merge) {
+                    if (fi < 0) {
+                        if (pass == 0) {
+                            differ++;
+                            fprintf(stderr, "user %s differs between the servers:", u->name);
+                            for (int j = 0; j < nd; j++) {
+                                const user *o = users_find(&us[j], u->name);
+                                fprintf(stderr, " %s: %s", dirs[j],
+                                        !o ? "absent" : o->flags & USER_SUPERUSER ? "superuser" : "present");
+                                if (o)
+                                    fprintf(stderr, " with %" PRIu32 " grants%s", o->ng,
+                                            o->has_verifier ? "" : ", no password");
+                                fputc(j + 1 < nd ? ',' : '\n', stderr);
+                            }
+                        }
+                        continue;
+                    }
+                    put = users_find(&us[fi], u->name); /* the winner's copy; absent there: dropped there */
+                }
+                if (pass == 0 || !put)
+                    continue;
+                int rc = 0, r = uchange(x, put->name, put, 0, wait_ms, &rc);
+                if (r == 1 && rc == META_ERR_EXISTS) {
+                    user *g = NULL;
+                    uint64_t version;
+                    if (uget(x, put->name, &g, &version) == 0 && g && user_same(g, put)) {
+                        printf("user %s: in the group already, the same\n", put->name);
+                        same++;
+                    } else {
+                        fprintf(stderr, "user %s: the group holds another user of that name: not imported\n",
+                                put->name);
+                        failed++;
+                    }
+                    user_release(g);
+                } else if (r != 0) {
+                    if (r == 1)
+                        fprintf(stderr, "user %s: %s\n", put->name, cluster_strerror(rc));
+                    failed++;
+                } else {
+                    nput++;
+                }
+            }
+        }
+        if (pass == 0 && differ) {
+            fprintf(stderr, "tsdb cluster user import: %" PRIu32 " users differ between the servers: nothing "
+                            "imported; --from-node DIR says whose copy wins\n", differ);
+            ret = 1;
+        }
+    }
+    if (ret == 0) {
+        printf("imported %" PRIu32 " users (%" PRIu32 " in the group already)%s\n", nput, same,
+               failed ? "; some failed" : "");
+        ret = failed ? 1 : 0;
+    }
+    for (int i = 0; i < nd; i++)
+        users_close(&us[i]);
+    free(us);
+    return ret;
+}
+
 int cluster_user_cli(int argc, char **argv)
 {
     /* argv: cluster user VERB PEER [NAME ...] */
@@ -330,6 +461,40 @@ int cluster_user_cli(int argc, char **argv)
         return uusage();
     const char *verb = argv[2], *peer = argv[3], *name = NULL, *seltext = NULL, *rtext = NULL;
     const char *secret_file = NULL, *pwfile = NULL;
+    if (!strcmp(verb, "import")) {
+        char **dirs = calloc((size_t)argc, sizeof *dirs);
+        const char *from = NULL;
+        long wms = 10000;
+        int nd = 0;
+        if (!dirs)
+            return 1;
+        for (int k = 4; k < argc; k++) {
+            char *end;
+            if (!strcmp(argv[k], "--secret-file") && k + 1 < argc)
+                secret_file = argv[++k];
+            else if (!strcmp(argv[k], "--from-node") && k + 1 < argc)
+                from = argv[++k];
+            else if (!strcmp(argv[k], "--wait-ms") && k + 1 < argc &&
+                     (wms = strtol(argv[k + 1], &end, 10), k++, !*end && wms >= 0 && wms <= 3600000))
+                ;
+            else if (strncmp(argv[k], "--", 2))
+                dirs[nd++] = argv[k];
+            else
+                return free(dirs), uusage();
+        }
+        if (nd == 0)
+            return free(dirs), uusage();
+        uint8_t sec[CLUSTER_SECRET_MAX];
+        size_t sl;
+        int s = secret_of(secret_file, sec, &sl);
+        if (s)
+            return free(dirs), s;
+        struct uctx x = {.secret = sec, .slen = sl};
+        snprintf(x.target, sizeof x.target, "%s", peer);
+        int r = uimport(&x, dirs, nd, from, (uint32_t)wms);
+        free(dirs);
+        return r;
+    }
     int super = 0, i = 4;
     long iterations = ITER_MIN, wait_ms = 10000;
     int edit = !strcmp(verb, "add") || !strcmp(verb, "passwd") || !strcmp(verb, "drop");
