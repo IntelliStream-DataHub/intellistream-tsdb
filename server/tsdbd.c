@@ -2258,9 +2258,10 @@ static int cvol_refuse_ids(const tsdb_sid *ids, size_t n)
     return 0;
 }
 
-/* Reads naming many ids (QUERY_MULTI, QUERY_LATEST): one id on a volume led here whose read lease ran out (§7.1)
- * refuses the whole request, as handle() refuses a single-id op on such a volume. A replica's reads are not refused
- * here (§7.2's REPLICA_OK is a later step). */
+/* Reads naming many ids (QUERY_MULTI, QUERY_LATEST): one id on a volume led here whose read lease ran out (§7.1), or on
+ * a replica while this server holds no lease (it may be a leader deposed while it was cut off), refuses the whole
+ * request, as handle() refuses a single-id op on such a volume. A replica with a lease answers (§7.2's REPLICA_OK is a
+ * later step). */
 static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n)
 {
     if (!cvol_active())
@@ -2278,7 +2279,8 @@ static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n)
             TSDB_SID_VOLUME(id) == last)
             continue;
         last = (uint32_t)TSDB_SID_VOLUME(id); /* each run of one volume asked once (cvol_why locks) */
-        if (cvol_why(last) == TSDB_WHY_UNREACHABLE) {
+        int cw = cvol_why(last);
+        if (cw == TSDB_WHY_UNREACHABLE || cw == TSDB_WHY_FENCED) { /* as in handle() (test_cluster lease, phase b) */
             unav_vol = (uint16_t)TSDB_SID_VOLUME(id);
             return TSDB_ERR_UNAVAILABLE;
         }
