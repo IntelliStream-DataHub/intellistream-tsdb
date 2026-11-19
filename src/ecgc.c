@@ -39,6 +39,12 @@ void ecgc_last_unref(part *p)
     p->ec = NULL;
 }
 
+void ecgc_unlisted_object(eng *db, const part *p)
+{
+    (void)db;
+    (void)p;
+}
+
 int ecgc_tier_open(struct tier *t)
 {
     (void)t;

@@ -23,6 +23,10 @@ bool ecgc_purge_entry(eng *db, const graveyard_entry *e, bool all, int64_t now);
  * no reference of its own (the engine's does; eng_close puts it after its parts went). Frees p->ec. Stub:
  * ecpart_free. */
 void ecgc_last_unref(part *p);
+/* A swap that did not happen (ec_swap_commit refused it: a drop took its key, or its intent could not be written)
+ * unlinked the temporary of the .ec part p, which was never listed and never named: its object's chunks belong to
+ * no one now. r7-gc queues their deletion (p stays the caller's; read only its record). Stub: nothing (r7-swap). */
+void ecgc_unlisted_object(eng *db, const part *p);
 
 /* The tier's and the engine's hooks (src/tier.h): t->gc, db->ecstate->gc. Stubs: nothing (counted). */
 int ecgc_tier_open(struct tier *t);
