@@ -251,7 +251,7 @@ enum {
     RM_FASTRIDE,
     RM_NOJOINHOLD,
     RM_KEEPUNANSWERED, /* unanswered_ticks 0: a member a promotion kept unanswered goes only by the lag rule */
-    RM_FENCENOSYNC,    /* a SAVE that raises the fence is skipped: the FENCE_REPLY goes out with the fence not in REPL */
+    RM_FENCENOSYNC,    /* a SAVE that raises the fence skipped: the FENCE_REPLY goes out, the fence not in REPL */
     RM_INBOXSTARVE,
     RM_OPENNOHOLD,
     RM_TICKSTRETCH,
@@ -1560,7 +1560,9 @@ static void exec(struct rvol *rv, struct repl_action *a)
         if (rv->mode == M_PROMOTING && a->pos >= rv->epoch_pos) {
             tsdb_cvol_unref(&db);
             pthread_mutex_unlock(&rv->mu);
+            uint64_t t_promote = now_ms();
             rc = tsdb_cvol_replace(G.t, rv->number, promote_fn, rv, CVOL_WRITER);
+            t_promote = now_ms() - t_promote; /* D6: the promotion is a reopen; its time is in the log line */
             if (G.promote_wait) /* a fault for tests: writes reach the new writer before its mode is M_WRITER */
                 nanosleep(&(struct timespec){1, 0}, NULL);
             pthread_mutex_lock(&rv->mu);
@@ -1571,8 +1573,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
             rv->mode = M_WRITER;
             rv->synced_rep = a->pos;
             rv->held_commit = 0;
-            say("volume %" PRIu32 ": leads epoch %" PRIu64 " from position %" PRIu64, rv->number, rv->epoch,
-                rv->epoch_pos);
+            say("volume %" PRIu32 ": leads epoch %" PRIu64 " from position %" PRIu64
+                " (reopened as the writer in %" PRIu64 " ms)", rv->number, rv->epoch, rv->epoch_pos, t_promote);
             /* the clock from the start (design-cluster.md 5.4), not from the first SAVE as a writer, which waits for
              * applied records: an idle new leader sent no NOW markers at all. buf_lock is above rv->mu. */
             if (G.mutant != RM_LATECLOCK && (db = tsdb_cvol_ref(G.t, rv->number))) {
