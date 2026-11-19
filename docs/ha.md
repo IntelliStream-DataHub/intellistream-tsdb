@@ -1144,10 +1144,15 @@ The row numbers refer to the stall map (rows 1-16).
 >   DROPPED are defined, encoded, decoded and fuzzed (`tests/fuzz/fuzz_wire.c`), but a single server has no owner to
 >   name, no frame that spans owners and no drop watermark: the cluster (S1/S2) and the drop (D33) send them.
 > - **TOPOLOGY (48)** answers a single server: node 1, every volume as OWNER (FOLLOWER under `--follow`), the health of
->   its domain, and `gen`, a hash of the reply. Paths go to a superuser only. Any logged-in user may ask. **STATUS (49)**
+>   its domain, and `gen`, a hash of the reply. On a cluster node (S2-1) it comes from the metadata copy: every member
+>   with its client address and `alive`, and per volume one entry per replica (leader OWNER, in-sync replica STANDBY,
+>   other replica FOLLOWER); the health of a volume led elsewhere is what the copy says (its leader up or not), and
+>   `gen` also folds in the copy's applied index. Paths go to a superuser only. Any logged-in user may ask. **STATUS (49)**
 >   is `u32 len` and then `len` bytes of `key=value` lines for a superuser (`node.id=...` first, `vol.<n>.health`,
 >   `vol.<n>.reason`, `domain.<d>.state`, ...); every client returns the text without the length. `since_gen` of
 >   TOPOLOGY is reserved: 13 answers in full whatever it is and the clients send none.
+>   On a cluster node STATUS's `node.id` is the member id, followed by `cluster.applied` and
+>   `peer.<id>.addr`, `peer.<id>.peer`, `peer.<id>.alive` of every other member, from the copy.
 > - **Who sees the bodies.** A connection reads the HA bodies only if its HELLO said 13: tsdbd keeps the negotiated
 >   version per connection and sends a 12 client the bare status of every op (protocol 12 reads a longer error reply as
 >   corrupt). In QUERY_MULTI only the END frame carries the body; a per-series frame with status UNAVAILABLE is bare.
