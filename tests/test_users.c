@@ -2030,6 +2030,66 @@ static void power_loss(void)
     }
 }
 
+/* users_group_set (tsdbd --cluster): the group stores any blob a holder of the cluster secret puts, so a blob that is
+ * not the user it is listed as (another name, another uid) and a second user listed with a uid already given are left
+ * out and counted, never logged in with; a user whose uid and version are unchanged keeps its object. */
+static uint8_t *blob_as(const uint8_t *b, size_t n, uint32_t uid)
+{
+    uint8_t *x = malloc(n);
+    CHECK(x != NULL);
+    memcpy(x, b, n);
+    for (int j = 0; j < 4; j++)
+        x[j] = (uint8_t)(uid >> (8 * j));
+    return x;
+}
+
+static void group_set(void)
+{
+    char d[4096];
+    fresh("groupset", d, sizeof d);
+    users f;
+    uint32_t ua = 0, ub = 0, uc = 0;
+    CHECK(users_open(&f, d, true) == 0);
+    CHECK(users_create(&f, 0, "alice", USER_SUPERUSER, NULL, &ua) == 0);
+    CHECK(users_create(&f, 0, "bob", 0, NULL, &ub) == 0);
+    CHECK(users_create(&f, 0, "carol", 0, NULL, &uc) == 0);
+    uint8_t *ba, *bb, *bc;
+    size_t la, lb, lc;
+    CHECK(user_blob_encode(users_find(&f, "alice"), &ba, &la) == 0);
+    CHECK(user_blob_encode(users_find(&f, "bob"), &bb, &lb) == 0);
+    CHECK(user_blob_encode(users_find(&f, "carol"), &bc, &lc) == 0);
+    users_close(&f);
+    users g;
+    CHECK(users_group_init(&g) == 0);
+    uint32_t refused = 9;
+    users_group_rec ok[2] = {{"alice", ua, 10, ba, (uint32_t)la}, {"bob", ub, 11, bb, (uint32_t)lb}};
+    CHECK(users_group_set(&g, ok, 2, &refused) == 0 && refused == 0);
+    const user *a0 = users_find(&g, "alice");
+    CHECK(a0 && a0->uid == ua && a0->version == 10 && users_find(&g, "bob") && users_find(&g, "bob")->uid == ub);
+    /* bob's blob (its uid made alice's) listed as alice; bob's blob holding uid 77 listed as bob */
+    uint8_t *bob_as_a = blob_as(bb, lb, ua), *bob_77 = blob_as(bb, lb, 77);
+    users_group_rec bad[3] = {{"alice", ua, 12, bob_as_a, (uint32_t)lb},
+                              {"bob", ub, 13, bob_77, (uint32_t)lb},
+                              {"carol", uc, 14, bc, (uint32_t)lc}};
+    CHECK(users_group_set(&g, bad, 3, &refused) == 0 && refused == 2);
+    CHECK(!users_find(&g, "alice") && !users_find(&g, "bob") && users_find(&g, "carol") && !users_by_uid(&g, 77));
+    CHECK(!users_by_uid(&g, ua) && !users_by_uid(&g, ub));
+    /* two users given one uid: one of them, never both */
+    uint8_t *carol_as_a = blob_as(bc, lc, ua);
+    users_group_rec dup[2] = {{"alice", ua, 10, ba, (uint32_t)la}, {"carol", ua, 15, carol_as_a, (uint32_t)lc}};
+    CHECK(users_group_set(&g, dup, 2, &refused) == 0 && refused == 1);
+    CHECK((users_find(&g, "alice") != NULL) + (users_find(&g, "carol") != NULL) == 1);
+    CHECK(users_by_uid(&g, ua) != NULL && users_by_uid(&g, uc) == NULL);
+    /* unchanged uid and version: the same object */
+    CHECK(users_group_set(&g, ok, 2, &refused) == 0 && refused == 0);
+    const user *a1 = users_find(&g, "alice");
+    CHECK(users_group_set(&g, ok, 2, &refused) == 0 && refused == 0 && users_find(&g, "alice") == a1);
+    users_close(&g);
+    free(ba), free(bb), free(bc), free(bob_as_a), free(bob_77), free(carol_as_a);
+    cleanup(d);
+    printf("  group set: a blob of another name or uid, and a uid given twice, are left out and counted\n");
+}
+
 int main(int argc, char **argv)
 {
     snprintf(base_dir, sizeof base_dir, "%s", argc > 1 ? argv[1] : "/tmp");
@@ -2066,6 +2126,7 @@ int main(int argc, char **argv)
     revoke_rules();
     permissions();
     links();
+    group_set();
 #ifdef __APPLE__
     printf("  (power loss in the CLI's add, revoke and compact: skipped on macOS, it needs the crashfs "
            "LD_PRELOAD shim)\n");

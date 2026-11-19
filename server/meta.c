@@ -851,7 +851,8 @@ void meta_op_slot_home(struct meta_entry *e, uint32_t first, uint32_t count, uin
     op_end(e, st);
 }
 
-void meta_op_user_put(struct meta_entry *e, const char *name, uint64_t version, const void *blob, uint32_t len)
+void meta_op_user_put_as(struct meta_entry *e, const char *name, uint64_t version, const void *blob, uint32_t len,
+                         const char *actor, uint64_t actor_version)
 {
     struct wr w;
     size_t st = op_begin(e, &w, META_OP_USER_PUT);
@@ -859,16 +860,31 @@ void meta_op_user_put(struct meta_entry *e, const char *name, uint64_t version, 
     put64(&w, version);
     put32(&w, len);
     put(&w, blob, len);
+    if (actor && actor[0]) { /* the guard: a trailer, absent for the operator's changes */
+        putstr(&w, actor, META_USER_NAME_MAX);
+        put64(&w, actor_version);
+    }
     op_end(e, st);
 }
 
-void meta_op_user_del(struct meta_entry *e, const char *name)
+void meta_op_user_put(struct meta_entry *e, const char *name, uint64_t version, const void *blob, uint32_t len)
+{
+    meta_op_user_put_as(e, name, version, blob, len, NULL, 0);
+}
+
+void meta_op_user_del_as(struct meta_entry *e, const char *name, const char *actor, uint64_t actor_version)
 {
     struct wr w;
     size_t st = op_begin(e, &w, META_OP_USER_DEL);
     putstr(&w, name, META_USER_NAME_MAX);
+    if (actor && actor[0]) {
+        putstr(&w, actor, META_USER_NAME_MAX);
+        put64(&w, actor_version);
+    }
     op_end(e, st);
 }
+
+void meta_op_user_del(struct meta_entry *e, const char *name) { meta_op_user_del_as(e, name, NULL, 0); }
 
 void meta_op_volume_self(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t new_epoch)
 {
@@ -1208,6 +1224,26 @@ static void slot_pend_remove(struct meta_state *m, int32_t at)
 {
     memmove(&m->pend[at], &m->pend[at + 1], (m->npend - (uint32_t)at - 1) * sizeof m->pend[0]);
     m->npend--;
+}
+
+/* The actor guard of USER_PUT and USER_DEL (the bytes of r from `at` on; none: 0): a change a user asked for through
+ * a server whose copy may lag is checked there against the actor's rights as that copy holds them, so it applies only
+ * while the actor still has the version it was checked at (STALE otherwise, the actor dropped included): a demotion
+ * or drop of the actor committed before it always wins. FORMAT for a guard that does not decode. */
+static int user_guard(const struct meta_state *m, const struct rd *r, size_t at)
+{
+    if (at >= r->len)
+        return 0;
+    struct rd g = {r->p + at, r->len - at, 0, 0};
+    char actor[META_USER_NAME_MAX];
+    getstr(&g, actor, sizeof actor);
+    uint64_t av = get64(&g);
+    if (g.bad || g.off != g.len || !actor[0])
+        return META_ERR_FORMAT;
+    if (MUT(39)) /* noactorguard: the guard is ignored (a demoted actor's change through a lagging server applies) */
+        return 0;
+    int32_t a = user_at(m, actor);
+    return a >= 0 && m->users[a].version == av ? 0 : META_ERR_STALE;
 }
 
 static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *touched, uint32_t *ntouched)
@@ -1760,17 +1796,20 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         uint32_t len = get32(r);
         if (r->bad || len > META_USER_BLOB_MAX || len > r->len - r->off)
             return META_ERR_FORMAT;
+        int guard = user_guard(m, r, r->off + len);
+        if (guard == META_ERR_FORMAT)
+            return guard;
         if (!name[0] || len < META_USER_UID_LEN) {
-            r->off += len;
+            r->off = r->len;
             return META_ERR_INVALID;
         }
         int32_t at = user_at(m, name);
         if (!MUT(36)) { /* userstaleok: an unconditional put (a passwd racing a revoke undoes the revoke) */
             int rc = at >= 0 ? (version == 0 ? META_ERR_EXISTS : version != m->users[at].version ? META_ERR_STALE : 0)
                              : (version != 0 ? META_ERR_NOTFOUND : 0);
-            if (rc) {
-                r->off += len;
-                return rc;
+            if (rc || guard) {
+                r->off = r->len;
+                return rc ? rc : guard;
             }
         }
         /* the budget (nousersbudget: none, and a snapshot passes a peer frame: node add and catch-up stop for good) */
@@ -1803,6 +1842,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         m->users[at].version = m->applied; /* meta_apply sets the scratch copy's applied to this entry's index */
         m->users[at].blob = blob;
         m->users[at].len = len;
+        r->off = r->len; /* past the guard */
         return META_OK;
     }
     case META_OP_USER_DEL: {
@@ -1810,9 +1850,15 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         getstr(r, name, sizeof name);
         if (r->bad)
             return META_ERR_FORMAT;
+        int guard = user_guard(m, r, r->off);
+        if (guard == META_ERR_FORMAT)
+            return guard;
+        r->off = r->len;
         int32_t at = user_at(m, name);
         if (at < 0)
             return META_ERR_NOTFOUND;
+        if (guard)
+            return guard;
         ublob_unref(m->users[at].blob);
         memmove(&m->users[at], &m->users[at + 1], (m->nusers - (uint32_t)at - 1) * sizeof *m->users);
         m->nusers--;

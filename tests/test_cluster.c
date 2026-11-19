@@ -2784,19 +2784,34 @@ static tsdbc *login_on(int i, const char *user, const char *pw)
  * snapshot still has the user): every login there is UNAVAILABLE, never AUTH and never in; once it applies, the dropped
  * user is refused and root logs in. Mutants (TSDB_AUTH_MUTANT): authlocalusers (the server does not start: its root
  * has no USERS), adminlocal (the old password still works), loginbeforecatchup (the dropped user logs in). */
+static void *unlink_later(void *path)
+{
+    usleep(1500000);
+    if (unlink(path) != 0)
+        fprintf(stderr, "cannot remove %s: %s\n", (const char *)path, strerror(errno));
+    return NULL;
+}
+
 static void scen_login(void)
 {
     scenario("login");
     const char *mut = getenv("TSDB_AUTH_MUTANT");
-    static char mpenv[128];
+    static char mpenv[128], mpenv2[PATH_MAX + 256];
+    char failpush[PATH_MAX + 96], holdraft[PATH_MAX + 96];
+    snprintf(failpush, sizeof failpush, "%s/failpush", base);
     snprintf(mpenv, sizeof mpenv, "TSDB_AUTH_MUTANT=%s", mut ? mut : "");
+    snprintf(mpenv2, sizeof mpenv2, "TSDB_AUTH_MUTANT=%s TSDB_AUTH_TEST=failpush_file=%s", mut ? mut : "", failpush);
     for (int i = 0; i < 3; i++) {
         auth_on[i] = 1;
-        envs[i] = "snap_every=2";
+        envs[i] = i == 2 ? "snap_every=2,hold_raft_file=1" : "snap_every=2";
         if (mut)
             penv[i] = mpenv;
+        if (i == 2)
+            penv[i] = mpenv2;
         start(i);
     }
+    server_dir(2, holdraft, sizeof holdraft);
+    strcat(holdraft, "/state/holdraft");
     char pw[PATH_MAX + 80], pw2[PATH_MAX + 80], args[PATH_MAX * 2 + 512], out[8192], p[3][META_ADDR_MAX];
     put_file("pw", "root-pw", pw, sizeof pw);
     put_file("pw2", "alice-pw", pw2, sizeof pw2);
@@ -2820,6 +2835,18 @@ static void scen_login(void)
     await_view(0, p_voters, &want, "three voters");
     for (int i = 0; i < 3; i++)
         await_view(i, p_users_caught_up, NULL, "users caught up");
+    /* `tsdb DIR user ...` on a cluster server's root: refused, naming `tsdb cluster user`, and no USERS made */
+    {
+        char root1[PATH_MAX + 80], uf[PATH_MAX + 96];
+        server_dir(1, root1, sizeof root1);
+        snprintf(args, sizeof args, "%s user add local --password-file %s", root1, pw2);
+        if (cli_run(args, NULL, out, sizeof out) == 0 || !strstr(out, "is a cluster server's root") ||
+            !strstr(out, "tsdb cluster user"))
+            die("`tsdb DIR user add` on a cluster server's root was not refused: %s", out);
+        snprintf(uf, sizeof uf, "%s/USERS", root1);
+        if (access(uf, F_OK) == 0)
+            die("`tsdb DIR user add` on a cluster server's root made %s", uf);
+    }
 
     snprintf(args, sizeof args, "cluster user add %s alice --password-file %s --secret-file %s", p[0], pw2,
              secret_path);
@@ -2873,6 +2900,92 @@ static void scen_login(void)
             die("server %d: alice logs in after her drop: %s", i, ers(rc));
     printf("  an open session on another server: the revoke is DENIED, the drop AUTH on its next request\n");
 
+    /* a push of the users that server 2 fails to take (as out of memory) is pushed again until it is taken (mutant
+     * pushnoretry: server 2 keeps the old password until the next change of the users) */
+    if ((rc = tsdbc_user_create(r0, "bob", "bob-pw", 0, 0)) != 0)
+        die("create bob: %s", ers(rc));
+    await_login(2, "bob", "bob-pw");
+    char fp2[PATH_MAX + 96];
+    put_file("failpush", "", fp2, sizeof fp2);
+    if ((rc = tsdbc_user_password(r0, "bob", "bob-new", 0)) != 0)
+        die("passwd of bob: %s", ers(rc));
+    usleep(500000);
+    if ((rc = try_login(2, "bob", "bob-pw")) != 0)
+        die("server 2, failing its pushes: bob's old password %s, not in (the test has no teeth)", ers(rc));
+    if (unlink(failpush) != 0)
+        die("cannot remove %s", failpush);
+    uint64_t tp = now_ms();
+    while ((rc = try_login(2, "bob", "bob-pw")) != TSDB_ERR_AUTH) {
+        if (now_ms() - tp > 5000)
+            die("server 2, its pushes taken again: bob's old password %s after 5 s, not AUTH", ers(rc));
+        usleep(100000);
+    }
+    printf("  a push server 2 failed to take is pushed again: the old password refused there once it is taken\n");
+    /* an admin op through server 2 while its copy is behind: the conditional put finds bob changed (STALE), waits for
+     * the newer copy and checks again (mutant onetry: UNAVAILABLE); and one answered only once server 2's own copy
+     * has it, so its next login there sees it (mutant nolocalwait: answered once the members reported the index,
+     * server 2's copy still failing its pushes) */
+    tsdbc *r2 = login_on(2, "root", "root-pw");
+    if (tsdbc_set_retry(r2, 0) != 0)
+        die("tsdbc_set_retry");
+    put_file("failpush", "", fp2, sizeof fp2);
+    if ((rc = tsdbc_user_password(r0, "bob", "bob-3", 0)) != 0)
+        die("passwd of bob through server 0: %s", ers(rc));
+    pthread_t ul;
+    if (pthread_create(&ul, NULL, unlink_later, failpush) != 0)
+        die("pthread_create");
+    rc = tsdbc_user_password(r2, "bob", "bob-4", 0);
+    pthread_join(ul, NULL);
+    if (rc != 0)
+        die("passwd through server 2, its copy behind: %s (STALE not checked again on the newer copy)", ers(rc));
+    put_file("failpush", "", fp2, sizeof fp2);
+    if (pthread_create(&ul, NULL, unlink_later, failpush) != 0)
+        die("pthread_create");
+    tp = now_ms();
+    rc = tsdbc_user_password(r2, "bob", "bob-5", 0);
+    uint64_t took = now_ms() - tp;
+    int old = try_login(2, "bob", "bob-4");
+    pthread_join(ul, NULL);
+    if (rc != 0)
+        die("passwd through server 2: %s", ers(rc));
+    if (old != TSDB_ERR_AUTH)
+        die("server 2 answered a passwd after %" PRIu64 " ms, before its own copy had it: the old password %s, "
+            "not AUTH", took, ers(old));
+    tsdbc_close(r2);
+    printf("  through a server whose copy is behind: STALE checked again on the newer copy; the reply waits for "
+           "its own copy (%" PRIu64 " ms)\n", took);
+
+    /* the actor guard: a superuser demoted through server 0 while server 2 lags (its Raft core held) has a session
+     * open on server 2, whose copy still says superuser: their user create there must not commit (mutant noguard) */
+    if ((rc = tsdbc_user_create(r0, "mallory", "mallory-pw", 0, TSDB_USER_SUPERUSER)) != 0)
+        die("create mallory: %s", ers(rc));
+    await_login(2, "mallory", "mallory-pw");
+    tsdbc *m2 = login_on(2, "mallory", "mallory-pw");
+    if (tsdbc_set_retry(m2, 0) != 0)
+        die("tsdbc_set_retry");
+    FILE *hr = fopen(holdraft, "w");
+    if (!hr || fclose(hr) != 0)
+        die("cannot make %s", holdraft);
+    if ((rc = tsdbc_user_alter(r0, "mallory", 0)) != 0) /* server 2 lags: answered after the wait */
+        die("demote mallory with server 2 held: %s", ers(rc));
+    uint64_t tm = now_ms();
+    rc = tsdbc_user_create(m2, "mallory2", "m2-pw", 0, TSDB_USER_SUPERUSER);
+    if (rc == 0 || try_login(0, "mallory2", "m2-pw") == 0)
+        die("a superuser demoted through server 0 created a superuser through lagging server 2 (%s)", ers(rc));
+    if (rc != TSDB_ERR_UNAVAILABLE)
+        die("the demoted actor's create on lagging server 2: %s, not UNAVAILABLE", ers(rc));
+    printf("  a demoted actor's admin op on a lagging server: UNAVAILABLE after %" PRIu64 " ms, nothing made\n",
+           now_ms() - tm);
+    if (unlink(holdraft) != 0)
+        die("cannot remove %s", holdraft);
+    tp = now_ms();
+    while ((rc = tsdbc_user_create(m2, "mallory2", "m2-pw", 0, TSDB_USER_SUPERUSER)) != TSDB_ERR_DENIED) {
+        if (rc == 0 || now_ms() - tp > WAIT_MS)
+            die("the demoted actor's create once server 2 caught up: %s, not DENIED", ers(rc));
+        usleep(100000);
+    }
+    tsdbc_close(m2);
+
     /* the restart barrier: carol dropped while server 2 is down; it comes back with its Raft core held */
     snprintf(args, sizeof args, "cluster user add %s carol --password-file %s --secret-file %s", p[0], pw2,
              secret_path);
@@ -2886,14 +2999,10 @@ static void scen_login(void)
     stop(2, SIGKILL);
     if ((rc = tsdbc_user_drop(r0, "carol")) != 0) /* server 2 lags: answered after the wait, OK */
         die("drop carol with server 2 down: %s", ers(rc));
-    char holdraft[PATH_MAX + 96];
-    server_dir(2, holdraft, sizeof holdraft);
-    strcat(holdraft, "/state/holdraft");
-    FILE *hr = fopen(holdraft, "w");
+    hr = fopen(holdraft, "w");
     if (!hr || fclose(hr) != 0)
         die("cannot make %s", holdraft);
-    envs[2] = "snap_every=2,hold_raft_file=1";
-    start(2);
+    start(2); /* its copy is pushed from its snapshot, carol in it (mutant barrierifempty: logins pass) */
     uint64_t t0 = now_ms();
     int tries = 0;
     while (now_ms() - t0 < 2500) {
@@ -2910,8 +3019,26 @@ static void scen_login(void)
         tries++;
         usleep(100000);
     }
+    put_file("failpush", "", fp2, sizeof fp2); /* the pushes after it applies fail: the barrier waits for one taken */
     if (unlink(holdraft) != 0)
         die("cannot remove %s", holdraft);
+    /* applied, its pushes failing: the barrier stays closed (mutant pushnoretry: open, its copy the snapshot's) */
+    t0 = now_ms();
+    int seen_drop = 0;
+    while (now_ms() - t0 < WAIT_MS && !seen_drop) {
+        struct view v;
+        view(2, &v);
+        seen_drop = meta_user(&v.m, "carol") == NULL;
+        view_free(&v);
+        usleep(100000);
+    }
+    if (!seen_drop)
+        die("server 2 did not apply carol's drop once its Raft core was let go");
+    usleep(1000000);
+    if ((rc = try_login(2, "root", "root-pw")) != TSDB_ERR_UNAVAILABLE)
+        die("server 2, applied but its users watch failing every push: root's login %s, not UNAVAILABLE", ers(rc));
+    if (unlink(failpush) != 0)
+        die("cannot remove %s", failpush);
     await_view(2, p_users_caught_up, NULL, "users caught up once it applies");
     if ((rc = try_login(2, "carol", "alice-pw")) != TSDB_ERR_AUTH)
         die("server 2, caught up: carol, dropped while it was down: %s, not AUTH", ers(rc));
@@ -2919,6 +3046,26 @@ static void scen_login(void)
         die("server 2, caught up: root or dave: %s", ers(rc));
     printf("  restarted with its Raft core held: %d logins UNAVAILABLE; caught up, the dropped user is refused\n",
            tries);
+
+    /* an outcome unknown (the leader stopped after it may have got the entry): no answer, the connection closes;
+     * never UNAVAILABLE, which says "not applied" and has the client send it again (mutant retryunavail) */
+    await_view(0, p_leader_self, NULL, "server 0 leading");
+    if (tsdbc_set_retry(r1, 0) != 0 || tsdbc_set_timeout(r1, 60000) != 0)
+        die("tsdbc_set_retry, tsdbc_set_timeout");
+    pause_server(0, 1);
+    tm = now_ms();
+    rc = tsdbc_user_create(r1, "erin", "erin-pw", 0, 0);
+    pause_server(0, 0);
+    if (rc == 0 || rc == TSDB_ERR_UNAVAILABLE)
+        die("a create whose leader stopped (outcome unknown): %s after %" PRIu64 " ms, not a closed connection",
+            ers(rc), now_ms() - tm);
+    tsdbc_user *who = NULL;
+    if (tsdbc_whoami(r1, &who) == 0) {
+        tsdbc_users_free(who, 1);
+        die("the connection of an outcome unknown is still open");
+    }
+    printf("  an admin op of unknown outcome: no answer, the connection closed after %" PRIu64 " ms (%s)\n",
+           now_ms() - tm, ers(rc));
     tsdbc_close(r0);
     tsdbc_close(r1);
 }
@@ -3010,10 +3157,19 @@ static void scen_userimport(void)
     snprintf(args, sizeof args, "%s user grant dora read prefix:line3.", d);
     if (cli_run(args, NULL, out, sizeof out) != 0)
         die("`tsdb %s`: %s", args, out);
+    /* frank, the same on both but for his password (A33: which one is the newest is not known; mutant
+     * noverifiercmp) */
+    char pwd[PATH_MAX + 80];
+    put_file("pw-frank-d", "frank-d-pw", pwd, sizeof pwd);
+    for (int k = 0; k < 2; k++) {
+        snprintf(args, sizeof args, "%s user add frank --password-file %s", k ? d : c, k ? pwd : pw);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("`tsdb %s`: %s", args, out);
+    }
     snprintf(args, sizeof args, "cluster user import %s %s %s --secret-file %s", p0, c, d, secret_path);
     if (cli_run(args, NULL, out, sizeof out) == 0 || !strstr(out, "user dora differs between the servers") ||
-        !strstr(out, "user eve differs between the servers") || !strstr(out, "2 users differ") ||
-        !strstr(out, "nothing imported"))
+        !strstr(out, "user eve differs between the servers") || !strstr(out, "user frank differs between the servers") ||
+        !strstr(out, "3 users differ") || !strstr(out, "nothing imported"))
         die("import of two USERS that differ: %s", out);
     for (int k = 0; k < 2; k++) {
         snprintf(args, sizeof args, "cluster user list %s %s --secret-file %s", p0, k ? "eve" : "dora", secret_path);
@@ -3022,8 +3178,11 @@ static void scen_userimport(void)
     }
     snprintf(args, sizeof args, "cluster user import %s %s %s --from-node %s --secret-file %s", p0, c, d, d,
              secret_path);
-    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "imported 1 users"))
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "imported 2 users"))
         die("import with --from-node: %s", out);
+    await_login(0, "frank", "frank-d-pw");
+    if ((rc = try_login(0, "frank", "imported-pw")) != TSDB_ERR_AUTH)
+        die("frank's password of the losing copy: %s, not AUTH", ers(rc));
     snprintf(args, sizeof args, "cluster user list %s dora --secret-file %s", p0, secret_path);
     if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "grant prefix:line3."))
         die("dora as old-d had her: %s", out);
@@ -3358,7 +3517,7 @@ static void scen_volrefuse(void)
         auth_on[3] = on;
         rc = start_try(3);
         if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) == 0 ||
-            !log_has(3, "never from its root: carry them over with 'tsdb cluster user import PEER "))
+            !log_has(3, "never from its root: move the file aside (out of "))
             die("a cluster node with USERS in its root started (login %s; %d, 0x%x)", on ? "on" : "off", rc,
                 th_status);
     }

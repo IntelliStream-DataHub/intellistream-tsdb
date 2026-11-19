@@ -279,8 +279,9 @@ struct cluster_user_rec {
  * Called on the cluster thread with every user of the metadata copy, ascending by name, and the applied index the
  * list is at, after the copy changed its users (an entry or a snapshot) and once when a callback is set while the copy
  * has any. The records point into the copy and are valid during the call only: it must copy what it keeps and not
- * block. NULL stops the calls. Any thread. */
-typedef void (*cluster_users_fn)(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied);
+ * block. It returns 0, or non-zero when it could not take the list (out of memory): the list is pushed again on the
+ * next tick (100 ms) until it is taken. NULL stops the calls. Any thread. */
+typedef int (*cluster_users_fn)(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied);
 void cluster_set_users_watch(cluster_users_fn fn, void *arg);
 
 /* The catch-up barrier (D-S2): 0 from cluster_start until this server has heard a Raft leader's commit index in this
@@ -303,9 +304,12 @@ struct cluster_laggard {
  * after that: *index is the entry's index, *uid the user's, lag[0 .. *nlag) the members still below it (at most
  * CLUSTER_LAGGARDS_MAX). Result: META_OK, a META_ERR_* of the operation (STALE, EXISTS, NOTFOUND, INVALID, RANGE), or
  * a CLUSTER_ERR_* (NOTLEADER when no leader is known, RETRY when the outcome is unknown: read the user again before
- * deciding). Blocks: never on the cluster thread. */
-int cluster_user_propose(int op, const char *name, const void *blob, uint32_t len, uint64_t version, int wait_ms,
-                         uint64_t *index, uint32_t *uid, struct cluster_laggard *lag, uint32_t *nlag);
+ * deciding). `actor` (NULL: the operator) and `actor_version`: the user whose rights allowed the change, as the
+ * caller's copy holds them; the op is then STALE unless the actor still has that version (meta_op_user_put_as).
+ * Blocks: never on the cluster thread. */
+int cluster_user_propose(int op, const char *name, const void *blob, uint32_t len, uint64_t version,
+                         const char *actor, uint64_t actor_version, int wait_ms, uint64_t *index, uint32_t *uid,
+                         struct cluster_laggard *lag, uint32_t *nlag);
 
 struct cluster_vol_status {
     struct cluster_vol_report v;

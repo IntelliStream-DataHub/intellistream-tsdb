@@ -66,11 +66,12 @@ bool auth_enabled(void);
 struct cluster_user_rec;
 struct cluster_laggard;
 typedef struct auth_group_ops {
-    void (*set_watch)(void (*fn)(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied),
+    void (*set_watch)(int (*fn)(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied),
                       void *arg);
     int (*caught_up)(void);
-    int (*propose)(int op, const char *name, const void *blob, uint32_t len, uint64_t version, int wait_ms,
-                   uint64_t *index, uint32_t *uid, struct cluster_laggard *lag, uint32_t *nlag);
+    int (*propose)(int op, const char *name, const void *blob, uint32_t len, uint64_t version, const char *actor,
+                   uint64_t actor_version, int wait_ms, uint64_t *index, uint32_t *uid, struct cluster_laggard *lag,
+                   uint32_t *nlag);
 } auth_group_ops;
 void auth_set_group(const auth_group_ops *ops);
 /* The reload thread: USERS on a one-second tick (A10), and what it changed reaches the connections. */

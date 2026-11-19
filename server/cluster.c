@@ -1037,6 +1037,7 @@ static struct {
     size_t nuwait, capuwait;
     uint64_t users_floor;    /* a Raft leader's commit index heard in this run (cluster_users_caught_up); 0: none */
     uint64_t uw_n, uw_max;   /* the users' count and highest version last pushed to the users watch */
+    uint64_t uw_at;          /* the applied index whose users the watch has taken (the barrier waits for it) */
     int uw_said;
 
     uint64_t next_hb, next_manage, next_duty, watch_conn, watch_next_try;
@@ -3824,6 +3825,16 @@ static void admin_user_change(struct conn *c, uint32_t reqid, struct rd *r, int 
     const uint8_t *blob = r->p + r->off;
     if (!r->bad && (blen > META_USER_BLOB_MAX || !need(r, blen)))
         r->bad = 1;
+    if (!r->bad)
+        r->off += blen;
+    char actor[META_USER_NAME_MAX] = ""; /* the actor guard (meta_op_user_put_as): tsdbd's admin ops send it */
+    uint64_t aver = 0;
+    if (!r->bad && r->off < r->len) {
+        getstr(r, actor, sizeof actor);
+        aver = get64(r);
+        if (!r->bad && (r->off != r->len || !uname_ok(actor)))
+            r->bad = 1;
+    }
     if (r->bad || !uname_ok(u->name) || (!del && blen < META_USER_UID_LEN) || u->wait_ms > 3600000) {
         free(u);
         admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
@@ -3846,9 +3857,9 @@ static void admin_user_change(struct conn *c, uint32_t reqid, struct rd *r, int 
     struct meta_entry e;
     meta_entry_init(&e);
     if (del)
-        meta_op_user_del(&e, u->name);
+        meta_op_user_del_as(&e, u->name, actor, aver);
     else
-        meta_op_user_put(&e, u->name, version, blob, blen);
+        meta_op_user_put_as(&e, u->name, version, blob, blen, actor, aver);
     int early = cl_mutant() == CLM_DROPNOTCOMMITTED;
     C.pend_user = u;
     iso_err rc = propose(&e, early ? 0 : c->serial, reqid, 0);
@@ -3916,14 +3927,14 @@ static void *probe_drop(void *arg)
     uint64_t index = 0;
     uint32_t uid = 0, nlag = 0;
     struct cluster_laggard lag[CLUSTER_LAGGARDS_MAX];
-    int rc = cluster_user_propose(CLUSTER_USER_DEL, "probe-drop", NULL, 0, 0, 5000, &index, &uid, lag, &nlag);
+    int rc = cluster_user_propose(CLUSTER_USER_DEL, "probe-drop", NULL, 0, 0, NULL, 0, 5000, &index, &uid, lag, &nlag);
     char t[128];
     snprintf(t, sizeof t, "rc %d index %" PRIu64 " uid %" PRIu32 "\n", rc, index, uid);
     probe_write("userpropose", t);
     return NULL;
 }
 
-static void users_probe_watch(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied)
+static int users_probe_watch(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied)
 {
     (void)arg;
     static int dropping;
@@ -3943,6 +3954,7 @@ static void users_probe_watch(void *arg, const struct cluster_user_rec *u, uint3
     put(&b, "", 1);
     probe_write("userswatch", (const char *)b.p);
     buf_free(&b);
+    return 0;
 }
 
 /* The users watch, given the copy's users when they changed. Called before every heartbeat, so the applied index a
@@ -3956,7 +3968,7 @@ static void users_push(void)
             umax = C.sm.users[i].version;
     /* (count, highest version) changes with every change of the set: a put raises the highest version unless its
      * user is dropped again, which leaves the set as it was */
-    int force = atomic_exchange(&g_uw_new, 0);
+    int force = atomic_exchange(&g_uw_new, 0), taken = 1;
     if (force || C.sm.nusers != C.uw_n || umax != C.uw_max || (!C.uw_said && C.sm.nusers)) {
         pthread_mutex_lock(&uw_mu);
         if (g_uwatch && (C.sm.nusers || C.uw_said)) {
@@ -3967,7 +3979,10 @@ static void users_push(void)
                 const struct meta_user *u = &C.sm.users[i];
                 recs[i] = (struct cluster_user_rec){u->name, u->uid, u->version, u->blob, u->len};
             }
-            g_uwatch(g_uwatch_arg, recs, C.sm.nusers, C.sm.applied);
+            if (g_uwatch(g_uwatch_arg, recs, C.sm.nusers, C.sm.applied) != 0) {
+                taken = 0;
+                atomic_store(&g_uw_new, 1); /* not taken (out of memory): again on the next tick */
+            }
             free(recs);
             C.uw_said = 1;
         }
@@ -3975,6 +3990,9 @@ static void users_push(void)
         C.uw_n = C.sm.nusers;
         C.uw_max = umax;
     }
+    /* a watch set meanwhile (g_uw_new) has not been given these yet */
+    if (taken && !atomic_load(&g_uw_new))
+        C.uw_at = C.sm.applied;
 }
 
 /* the applied index member `id` last reported (its heartbeat; this server's own copy for itself), 0 never */
@@ -3999,7 +4017,9 @@ static void users_duty(uint64_t now)
     /* before the replies: a member this server counts as caught up has its watch given the change; and before the
      * barrier opens, so a login it lets in finds the users the copy has at the floor, not the ones from before */
     users_push();
-    if (C.users_floor && (C.sm.applied >= C.users_floor || cl_mutant() == CLM_FLOORNOAPPLIED) &&
+    /* and only once the watch has taken the users at the floor: a push it failed (out of memory) keeps it closed */
+    if (C.users_floor &&
+        ((C.sm.applied >= C.users_floor && C.uw_at >= C.users_floor) || cl_mutant() == CLM_FLOORNOAPPLIED) &&
         !atomic_load(&g_users_ok))
         atomic_store_explicit(&g_users_ok, 1, memory_order_release);
 
@@ -4037,19 +4057,20 @@ static void users_duty(uint64_t now)
     pthread_mutex_unlock(&ul_mu);
 }
 
-int cluster_user_propose(int op, const char *name, const void *blob, uint32_t len, uint64_t version, int wait_ms,
-                         uint64_t *index, uint32_t *uid, struct cluster_laggard *lag, uint32_t *nlag)
+int cluster_user_propose(int op, const char *name, const void *blob, uint32_t len, uint64_t version,
+                         const char *actor, uint64_t actor_version, int wait_ms, uint64_t *index, uint32_t *uid,
+                         struct cluster_laggard *lag, uint32_t *nlag)
 {
     *index = 0;
     *uid = 0;
     *nlag = 0;
-    size_t nl = strlen(name);
-    if ((op != CLUSTER_USER_PUT && op != CLUSTER_USER_DEL) || nl >= META_USER_NAME_MAX || wait_ms < 0 ||
-        (op == CLUSTER_USER_PUT && (len < META_USER_UID_LEN || len > META_USER_BLOB_MAX)))
+    size_t nl = strlen(name), al = actor ? strlen(actor) : 0;
+    if ((op != CLUSTER_USER_PUT && op != CLUSTER_USER_DEL) || nl >= META_USER_NAME_MAX || al >= META_USER_NAME_MAX ||
+        wait_ms < 0 || (op == CLUSTER_USER_PUT && (len < META_USER_UID_LEN || len > META_USER_BLOB_MAX)))
         return META_ERR_INVALID;
     if (op == CLUSTER_USER_DEL)
         len = 0;
-    size_t qn = 2 + nl + 8 + 4 + (op == CLUSTER_USER_PUT ? 4 + (size_t)len : 0);
+    size_t qn = 2 + nl + 8 + 4 + (op == CLUSTER_USER_PUT ? 4 + (size_t)len : 0) + (al ? 2 + al + 8 : 0);
     uint8_t *q = malloc(qn), *p = q;
     if (!q)
         return CLUSTER_ERR_RETRY;
@@ -4065,6 +4086,15 @@ int cluster_user_propose(int op, const char *name, const void *blob, uint32_t le
         for (int j = 0; j < 4; j++)
             *p++ = (uint8_t)(len >> (8 * j));
         memcpy(p, blob, len);
+        p += len;
+    }
+    if (al) {
+        *p++ = (uint8_t)al;
+        *p++ = (uint8_t)(al >> 8);
+        memcpy(p, actor, al);
+        p += al;
+        for (int j = 0; j < 8; j++)
+            *p++ = (uint8_t)(actor_version >> (8 * j));
     }
     char addr[META_ADDR_MAX];
     pthread_mutex_lock(&ul_mu);
