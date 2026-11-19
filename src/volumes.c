@@ -46,6 +46,7 @@
 #include "internal.h"
 #include "cvol.h"
 #include "replica.h"
+#include "ecpart.h"
 #include "stats_priv.h"
 #include "tier.h"
 
@@ -2215,6 +2216,31 @@ void tsdb_test_granules(tsdb *t, void (*fn)(void *ctx, int cls, uint32_t i, cons
         }
     if (ps)
         db_release(ps, n);
+}
+
+/* test hook (tests/test_settle_oracle.c, R7): flags (eng_test_mark_ec's) the parts of every open volume that pick
+ * names, nothing on disk; returns how many turned settled (a part a merge holds, or one already marked, is not counted). */
+size_t tsdb_test_mark_ec(tsdb *t, unsigned flags,
+                         bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
+                         void *ctx)
+{
+    size_t marked = 0;
+    for (size_t v = 0; v < t->nvols; v++) {
+        eng *e = t->vols[v];
+        size_t n;
+        part **ps;
+        if (!e || !(ps = db_snapshot(e, INT64_MIN, INT64_MAX, &n)))
+            continue;
+        for (size_t k = 0; k < n; k++)
+            if (pick(ctx, (uint32_t)v, ps[k]->partition, ps[k]->level, ps[k]->rows)) {
+                bool was = atomic_load_explicit(&ps[k]->ec, memory_order_acquire) != NULL;
+                if (eng_test_mark_ec(e, ps[k], flags) == 0 && !was &&
+                    atomic_load_explicit(&ps[k]->ec, memory_order_acquire))
+                    marked++; /* a part that turned settled now: marking one again counts nothing */
+            }
+        db_release(ps, n);
+    }
+    return marked;
 }
 
 /* ---------------------------------------------------------------- states */

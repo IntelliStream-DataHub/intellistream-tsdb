@@ -2563,6 +2563,13 @@ typedef struct tsdb_test_granule {
 void tsdb_test_granules(struct tsdb *t, void (*fn)(void *ctx, int cls, uint32_t i, const tsdb_test_granule *g),
                         void *ctx);
 
+/* test hook (R7, tests/test_settle_oracle.c): flags (eng_test_mark_ec's EC_MARK_*) every listed part that pick names
+ * (its volume, partition key, level and rows), in memory only; returns how many turned settled (not a part already
+ * marked, nor one a merge holds) */
+size_t tsdb_test_mark_ec(struct tsdb *t, unsigned flags,
+                         bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
+                         void *ctx);
+
 int ret_open(eng *db, bool read_only);
 int ret_reload(eng *db);
 int ret_cut_tail(eng *db); /* a writer's open, once its checks passed: cuts the torn tail ret_open found */

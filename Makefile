@@ -367,7 +367,7 @@ TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 te
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
-test-units-b: $(B)/test_chunk $(B)/test_chunk_heal $(B)/test_ecnames
+test-units-b: $(B)/test_chunk $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle
 test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(or $(TMPDIR),/tmp)
 	B=$(B) tests/test_config.sh $(TMPDIR)
@@ -395,6 +395,8 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_chunk_heal $(or $(TMPDIR),/tmp)
 	./$(B)/test_ecnames $(or $(TMPDIR),/tmp)
 	for m in nameloose tierloose; do ! ./$(B)/test_ecnames --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp)
+	for m in $(ORACLE_MUTANTS); do ! ./$(B)/test_settle_oracle --mutant $$m --seeds 2 $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
 	$(if $(EC_OBJ),for m in heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always; do ! ./$(B)/test_chunk_heal --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	tests/test_sync_ec.sh
@@ -993,6 +995,19 @@ print-ec:
 # its refusal without TSDB_TEST_TIER_I_KNOW=1; the stubs leave a database as today's code does; eng_test_mark_ec
 $(B)/test_ecnames: tests/test_ecnames.c src/internal.h $(R7_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# settled answers equal unsettled answers bit for bit (R7, r7-oracle): two databases, one history, B settles some partitions;
+# every query kind is compared. make oracle-soak: ORACLE_SEEDS seeds of ORACLE_STEPS steps from ORACLE_FIRST (a failure names its seed)
+ORACLE_MUTANTS := skipdelete skipreplace skipretention nomark flipvalues flipagg flipgroup flipbounds flipspread fliptwa fliplttb fliplatest flipmulti flipstats
+ORACLE_SEEDS ?= 200
+ORACLE_STEPS ?= 150
+ORACLE_FIRST ?= 1000
+$(B)/test_settle_oracle: tests/test_settle_oracle.c src/internal.h $(R7_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
+
+.PHONY: oracle-soak
+oracle-soak: $(B)/test_settle_oracle
+	./$(B)/test_settle_oracle --seeds $(ORACLE_SEEDS) --steps $(ORACLE_STEPS) --first $(ORACLE_FIRST) $(or $(TMPDIR),/tmp)
 
 # objects, chunk files, stores and the directory backend (R6): every geometry, every damage pattern, range reads at every
 # boundary, epoch fences, power loss (crashfs) at every step of a chunk write and an EPOCH store; mutants must fail it
