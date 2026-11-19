@@ -509,8 +509,9 @@ cgroup, so `nice` does not keep your work out of its way.
   the shim. Not built yet: mountinfo discovery, parking and BUSY, a per-volume bounded queue, SIGTERM with a stuck call,
   metrics, the volumes cache, parallel open.
 - **Statistics are never on the append path** (`src/stats.c`). Nothing is added to a write, the WAL, the memtable, the
-  part writer or a merge: the two functions that change a part list (`db_parts_insert_locked`,
-  `db_parts_remove_locked`) push one event into a bounded ring under the `db->lock` they hold, and a nice-19
+  part writer or a merge: the functions that change a part list (`db_parts_insert_locked`,
+  `db_parts_remove_locked`, and R7's swap `ec_swap_commit` in `src/ecswap.c`, which replaces a part by its `.ec` in place)
+  push one event into a bounded ring under the `db->lock` they hold, and a nice-19
   sweeper thread (throttled to `stats_sweep_mb_s`, a hard cap) walks each added part's granule index once. A full
   ring drops events and the sweeper reconciles its records with the part list (never before the open has finished:
   `load_parts` changes the list without `db->lock`; an overflow stays set until `stats_open_done`), so the totals are
@@ -544,7 +545,9 @@ cgroup, so `nice` does not keep your work out of its way.
   always give the slow path's answer (`tests/test_latest.c` compares both after every random step). Entry words are
   loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
   `latest_rw` is held across no I/O but `tsdb_drop_before`'s renames of the partitions it retires (`db_retire_locked`,
-  in its write section; `db->lock` was held across them already), and never across a lookup's reads of granules. Followers have no table.
+  in its write section; `db->lock` was held across them already) and the settle swap's 2n renames (`ec_swap_commit`,
+  `src/ecswap.c`: its input check and renames are one step against a drop, which takes no `publish_lock`; on NFS,
+  snapshots and lookups of the volume wait for those round trips), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf, and so is the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
