@@ -171,7 +171,9 @@ cgroup, so `nice` does not keep your work out of its way.
   state machine (members, volumes, replicas, epochs, ISR, slots, users; entries of ops, snapshots, the §13.1
   invariants as `meta_check_step`). `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
-  add|status`). `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
+  add|status`; users: USER_PUT/DEL answered after commit with the members still behind, the uid assigned at apply,
+  puts conditional on the user's version, `cluster_users_caught_up`, `tools/cluster-user-cli.c` for `tsdb cluster
+  user ...`, `test_cluster users`). `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
   (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
   over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below
   `jr_rec_max_rows` so that it fits one peer frame. `TSDB_REPLD_MUTANT` and `TSDB_REPLD_TEST` are its test hooks, `TSDB_REPLD_TRACE=1` logs the core's and the cursors' state every 2 s

@@ -178,7 +178,7 @@ $(B)/cfg.o: tools/cfg.c tools/cfg.h tools/props.h | $(B)
 $(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c tools/cluster-cli.c tools/cfg.h \
           server/cluster.h client/tsdb_client.h $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -DTSDB_FORMAT_VERSION=$(TSDB_FORMAT) -o $@ $< tools/dump.c \
-	    tools/users-cli.c $(B)/cluster-cli.o $(CLUSTER_OBJ) $(CFG_OBJ) $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
+	    tools/users-cli.c $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ) $(CFG_OBJ) $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 
 # login (docs/design-auth.md): the crypto is client code, shared with tsdbd and the CLI; USERS and the grant model
 # are tsdbd's and the CLI's
@@ -790,8 +790,10 @@ $(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
 $(B)/replwire.o: server/replwire.c server/replwire.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(RAFT_OBJ)
-$(B)/tsdb: $(B)/cluster-cli.o $(CLUSTER_OBJ)
+$(B)/tsdb: $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
+	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
+$(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
 $(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)

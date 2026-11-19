@@ -994,6 +994,36 @@ static int drop_all(users *us, batch *b)
     return 0;
 }
 
+/* A GRANT record's effect on u: the selector's rights become `rights` (0: the grant goes). CORRUPT past USER_GLOBS. */
+static int grant_set(user *u, uint8_t kind, uint8_t rights, const char *sel, size_t sl)
+{
+    umatch_free(u->m);
+    u->m = NULL;
+    long gi = grant_find(u, kind, sel, sl);
+    if (gi >= 0 && rights) {
+        u->g[gi].rights = rights;
+    } else if (gi >= 0) {
+        grant_clear(&u->g[gi]);
+        memmove(u->g + gi, u->g + gi + 1, (u->ng - (size_t)gi - 1) * sizeof *u->g);
+        u->ng--;
+    } else if (rights) {
+        if (kind == SEL_GLOB && glob_count(u) >= USER_GLOBS)
+            return TSDB_ERR_CORRUPT;
+        if (u->ng == u->gcap) {
+            uint32_t cap = u->gcap ? 2 * u->gcap : 4;
+            user_grant *g = realloc(u->g, cap * sizeof *g);
+            if (!g)
+                return TSDB_ERR_NOMEM;
+            u->g = g, u->gcap = cap;
+        }
+        int rc = grant_init(&u->g[u->ng], kind, rights, sel, sl);
+        if (rc)
+            return rc;
+        u->ng++;
+    }
+    return 0;
+}
+
 /* Applies one record; TSDB_ERR_CORRUPT for one that does not fit the state. */
 static int apply_rec(users *us, batch *b, uint8_t type, const uint8_t *p, size_t len, uint64_t off)
 {
@@ -1092,31 +1122,7 @@ static int apply_rec(users *us, batch *b, uint8_t type, const uint8_t *p, size_t
         tsdb_wipe(&v, sizeof v);
         return 0;
     }
-    umatch_free(u->m);
-    u->m = NULL;
-    long gi = grant_find(u, kind, sel, sl);
-    if (gi >= 0 && rights) {
-        u->g[gi].rights = rights;
-    } else if (gi >= 0) {
-        grant_clear(&u->g[gi]);
-        memmove(u->g + gi, u->g + gi + 1, (u->ng - (size_t)gi - 1) * sizeof *u->g);
-        u->ng--;
-    } else if (rights) {
-        if (kind == SEL_GLOB && glob_count(u) >= USER_GLOBS)
-            return TSDB_ERR_CORRUPT;
-        if (u->ng == u->gcap) {
-            uint32_t cap = u->gcap ? 2 * u->gcap : 4;
-            user_grant *g = realloc(u->g, cap * sizeof *g);
-            if (!g)
-                return TSDB_ERR_NOMEM;
-            u->g = g, u->gcap = cap;
-        }
-        int rc = grant_init(&u->g[u->ng], kind, rights, sel, sl);
-        if (rc)
-            return rc;
-        u->ng++;
-    }
-    return 0;
+    return grant_set(u, kind, rights, sel, sl);
 }
 
 /* The record at buf[pos..size), at file offset base + pos. */
@@ -2025,5 +2031,92 @@ out:
         us->fd = -1;
     }
     free(b.p);
+    return rc;
+}
+
+/* ------------------------------------------------------- a user in the cluster's metadata group (S2-1) */
+
+/* The records follow 8 bytes of uid and padding, at the offsets they would have after a USERS header, with uid 1 in
+ * each: the state machine writes the real uid into the first 4 bytes (meta.c, META_USER_UID_LEN) */
+#define BLOB_HEAD 8
+
+int user_blob_encode(const user *u, uint8_t **blob, size_t *len)
+{
+    rbuf b;
+    memset(&b, 0, sizeof b);
+    b.base = HEADER_SIZE - BLOB_HEAD;
+    put32(&b, u->uid);
+    put32(&b, 0);
+    rec_user(&b, 1, u->flags, u->name);
+    if (u->has_verifier)
+        rec_verifier(&b, 1, &u->v);
+    for (uint32_t j = 0; j < u->ng; j++)
+        rec_grant(&b, 1, u->g[j].kind, u->g[j].rights, u->g[j].sel, u->g[j].len);
+    if (b.oom) {
+        free(b.p);
+        return TSDB_ERR_NOMEM;
+    }
+    *blob = b.p;
+    *len = b.n;
+    return 0;
+}
+
+int user_blob_decode(const uint8_t *blob, size_t len, user **out)
+{
+    *out = NULL;
+    if (len < BLOB_HEAD + 16 || ld32(blob + 4) != 0)
+        return TSDB_ERR_CORRUPT;
+    users us;
+    memset(&us, 0, sizeof us);
+    us.fd = us.dfd = -1;
+    us.have_header = true;
+    snprintf(us.path, sizeof us.path, "a cluster user's record");
+    batch b;
+    int rc = batch_begin(&us, &b);
+    size_t end = 0;
+    if (rc == 0)
+        rc = apply_buf(&us, &b, blob + BLOB_HEAD, len - BLOB_HEAD, HEADER_SIZE, 0, &end);
+    if (rc == 0 && (end != len - BLOB_HEAD || us.n != 1 || us.u[0]->uid != 1))
+        rc = TSDB_ERR_CORRUPT;
+    if (rc == 0) {
+        batch_commit(&us, &b);
+        if (!(*out = user_dup(us.u[0])))
+            rc = TSDB_ERR_NOMEM;
+        else
+            (*out)->uid = ld32(blob);
+    } else {
+        batch_rollback(&us, &b);
+    }
+    users_close(&us);
+    return rc;
+}
+
+int user_change_grant(user *u, uint8_t kind, const char *sel, size_t len, uint8_t rights, bool grant)
+{
+    if (rights < 1 || rights > R_EVERY || len > SEL_MAX)
+        return TSDB_ERR_INVALID;
+    char *ns = malloc(len + 1);
+    if (!ns)
+        return TSDB_ERR_NOMEM;
+    uint8_t nk;
+    size_t nl;
+    int rc = sel_normalize(kind, sel, len, &nk, ns, &nl);
+    if (rc == 0) {
+        long gi = grant_find(u, nk, ns, nl);
+        uint8_t had = gi >= 0 ? u->g[gi].rights : 0, now;
+        if (grant)
+            now = had | rights;
+        else if ((had & R_ADMIN) && !(rights & R_ADMIN) && (rights & R_EVERY & ~R_ADMIN))
+            now = expand(had) & (uint8_t)~rights & (uint8_t)~R_ADMIN;
+        else
+            now = had & (uint8_t)~rights;
+        if (!grant && !(expand(had) & rights))
+            rc = TSDB_ERR_NOTFOUND;
+        else if (grant && nk == SEL_GLOB && gi < 0 && glob_count(u) >= USER_GLOBS)
+            rc = TSDB_ERR_INVALID;
+        else
+            rc = grant_set(u, nk, now, ns, nl);
+    }
+    free(ns);
     return rc;
 }

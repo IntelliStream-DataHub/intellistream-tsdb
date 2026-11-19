@@ -21,6 +21,10 @@
 #include <string.h>
 
 int cluster_cli(int argc, char **argv); /* tools/tsdb-cli.c */
+int cluster_user_cli(int argc, char **argv); /* tools/cluster-user-cli.c */
+int cluster_user_first_check(const char *name, const char *pwfile); /* cluster-user-cli.c */
+int cluster_user_add_first(const char *addr, const uint8_t *secret, size_t slen, const char *name,
+                           const char *pwfile);
 
 /* The one text of the cluster commands: `tsdb cluster` (or help, --help) prints it on stdout and exits 0; a mistake in
  * a command prints the same on stderr and exits 2. docs/cluster-preview.md has the longer story. */
@@ -33,6 +37,7 @@ static const char cl_help[] =
     "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
     "       tsdb cluster volume add PEER NAME [--replicas N] --secret-file F\n"
     "       tsdb cluster status PEER --secret-file F\n"
+       "       tsdb cluster user add|passwd|drop|grant|revoke|list PEER ... --secret-file F\n"
     "       tsdb cluster help\n"
     "\n"
     "  PEER and NEW_PEER are a server's peer address, host:port (tsdbd --cluster, its --peer-port and --advertise).\n"
@@ -54,6 +59,9 @@ static const char cl_help[] =
     "                      and only with TSDB_CLUSTER_WRITES=1: replication is not built yet).\n"
     "  status PEER         what that server knows: its role, the leader, the settings, every member (up or down,\n"
     "                      incarnation, when it was last heard), the volumes and users. One fact a line.\n"
+    "\n"
+    "  user ...            users and grants of the whole cluster, kept by the group (`tsdb cluster user` says how).\n"
+    "                      init --superuser NAME --password-file F makes the first superuser.\n"
     "\n"
     "  init options (each takes a whole number above 0; defaults in brackets):\n"
     "    --replication N         copies of every volume the cluster will keep [3]\n"
@@ -227,7 +235,10 @@ int cluster_cli(int argc, char **argv)
         return 0;
     }
     const char *verb = argv[1], *addr = NULL, *newpeer = NULL, *secret_file = NULL;
+    const char *superuser = NULL, *pwfile = NULL;
     int i = 2;
+    if (!strcmp(verb, "user"))
+        return cluster_user_cli(argc, argv);
     if (!strcmp(verb, "node")) {
         if (argc < 5 || strcmp(argv[2], "add") != 0)
             return cl_usage();
@@ -273,6 +284,14 @@ int cluster_cli(int argc, char **argv)
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--secret-file") && i + 1 < argc) {
             secret_file = argv[++i];
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--superuser")) {
+            superuser = argv[++i];
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--password-file")) {
+            pwfile = argv[++i];
             continue;
         }
         if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--mode")) {
@@ -325,6 +344,10 @@ int cluster_cli(int argc, char **argv)
                         "--replication\n");
         return 2;
     }
+    /* the superuser's name and password are checked before INIT: an init cannot be run again, so a bad file found after
+     * it would leave a group without a user */
+    if (superuser && cluster_user_first_check(superuser, pwfile) != 0)
+        return 2;
     uint8_t secret[CLUSTER_SECRET_MAX];
     size_t slen;
     char err[1024];
@@ -397,6 +420,15 @@ int cluster_cli(int argc, char **argv)
             printf("added volume %s: number %" PRIu32 "\n", newpeer, number);
         } else if (op == CLUSTER_OP_INIT) {
             printf("initialised: node 1 at %s\n", target);
+            if (superuser) { /* the group's first user entries: the superuser, before anything else is asked */
+                free(reply);
+                if (cluster_user_add_first(target, secret, slen, superuser, pwfile) == 0)
+                    return 0;
+                fprintf(stderr, "tsdb cluster init: the cluster is initialised without its superuser; make it with "
+                                "tsdb cluster user add %s %s --superuser --password-file F --secret-file F\n",
+                        target, superuser);
+                return 1;
+            }
         } else {
             printf("added %s\n", newpeer);
         }

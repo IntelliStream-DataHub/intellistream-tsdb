@@ -21,7 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SNAP_VERSION 3 /* 3: the replicated volumes' settings (R3); a preview cluster is initialised again */
+#define SNAP_VERSION 4 /* 3: the replicated volumes' settings (R3); 4: users with uid and version, max_uid (S2-1); a
+                        * preview cluster is initialised again */
 
 /* tests/test_meta.c --mutant N plants bug N (MUT(n)) in a build with -DMETA_MUTANTS; the simulator and the unit tests
  * must catch every one (a checker that catches nothing proves nothing). Without the define, MUT is 0. */
@@ -111,12 +112,46 @@ void meta_init(struct meta_state *m)
         m->slot_home[i] = META_NONE;
 }
 
+/* A user's blob is shared by every copy of the state (meta_copy runs once per entry: copying megabytes of users each
+ * time would cost more than the entry) and never changed after its put; a count before the bytes says how many
+ * copies hold it. Copies may be handed to other threads (the cluster thread's watch), so the count is atomic. */
+struct ublob {
+    uint32_t refs, pad;
+};
+
+static uint8_t *ublob_new(uint32_t len)
+{
+    struct ublob *h = malloc(sizeof *h + (size_t)len + 1);
+    if (!h)
+        abort(); /* as every other op: a failed apply on one member would let the copies diverge */
+    h->refs = 1;
+    return (uint8_t *)(h + 1);
+}
+
+static void ublob_ref(uint8_t *b) { __atomic_add_fetch(&((struct ublob *)b - 1)->refs, 1, __ATOMIC_RELAXED); }
+
+static void ublob_unref(uint8_t *b)
+{
+    if (b && __atomic_sub_fetch(&((struct ublob *)b - 1)->refs, 1, __ATOMIC_ACQ_REL) == 0)
+        free((struct ublob *)b - 1);
+}
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v, p[1] = (uint8_t)(v >> 8), p[2] = (uint8_t)(v >> 16), p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t get_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
 void meta_free(struct meta_state *m)
 {
     for (uint32_t i = 0; i < m->nvolumes; i++)
         free(m->volumes[i].hist);
     for (uint32_t i = 0; i < m->nusers; i++)
-        free(m->users[i].blob);
+        ublob_unref(m->users[i].blob);
     free(m->domains);
     free(m->since);
     free(m->pend);
@@ -178,13 +213,8 @@ void meta_copy(struct meta_state *dst, const struct meta_state *src)
             abort();
         copy_n(v->hist, src->volumes[i].hist, v->nhist * sizeof *v->hist);
     }
-    for (uint32_t i = 0; i < src->nusers; i++) {
-        struct meta_user *u = &dst->users[i];
-        u->blob = malloc(u->len + 1);
-        if (!u->blob)
-            abort();
-        copy_n(u->blob, src->users[i].blob, u->len);
-    }
+    for (uint32_t i = 0; i < src->nusers; i++)
+        ublob_ref(dst->users[i].blob);
 }
 
 /* ---------------------------------------------------------------- lookups */
@@ -215,6 +245,14 @@ static int32_t volume_at(const struct meta_state *m, uint32_t number)
     return lo < m->nvolumes && m->volumes[lo].number == number ? (int32_t)lo : -1 - (int32_t)lo;
 }
 
+uint64_t meta_users_bytes(const struct meta_state *m)
+{
+    uint64_t n = 0;
+    for (uint32_t i = 0; i < m->nusers; i++)
+        n += m->users[i].len + strlen(m->users[i].name) + 1;
+    return n;
+}
+
 static int32_t user_at(const struct meta_state *m, const char *name)
 {
     uint32_t lo = 0, hi = m->nusers;
@@ -226,6 +264,36 @@ static int32_t user_at(const struct meta_state *m, const char *name)
             hi = mid;
     }
     return lo < m->nusers && !strcmp(m->users[lo].name, name) ? (int32_t)lo : -1 - (int32_t)lo;
+}
+
+const struct meta_user *meta_user(const struct meta_state *m, const char *name)
+{
+    int32_t at = user_at(m, name);
+    return at >= 0 ? &m->users[at] : NULL;
+}
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* 0 when no two users share a uid (a decoded snapshot; apply keeps it by construction) */
+static int users_uids_unique(const struct meta_state *m)
+{
+    if (m->nusers < 2)
+        return 0;
+    uint32_t *u = malloc(m->nusers * sizeof *u);
+    if (!u)
+        abort();
+    for (uint32_t i = 0; i < m->nusers; i++)
+        u[i] = m->users[i].uid;
+    qsort(u, m->nusers, sizeof *u, cmp_u32);
+    int rc = 0;
+    for (uint32_t i = 1; i < m->nusers && !rc; i++)
+        rc = u[i] == u[i - 1] ? -1 : 0;
+    free(u);
+    return rc;
 }
 
 static int32_t domain_at(const struct meta_state *m, const char *name)
@@ -783,11 +851,12 @@ void meta_op_slot_home(struct meta_entry *e, uint32_t first, uint32_t count, uin
     op_end(e, st);
 }
 
-void meta_op_user_put(struct meta_entry *e, const char *name, const void *blob, uint32_t len)
+void meta_op_user_put(struct meta_entry *e, const char *name, uint64_t version, const void *blob, uint32_t len)
 {
     struct wr w;
     size_t st = op_begin(e, &w, META_OP_USER_PUT);
-    putstr(&w, name, META_NAME_MAX);
+    putstr(&w, name, META_USER_NAME_MAX);
+    put64(&w, version);
     put32(&w, len);
     put(&w, blob, len);
     op_end(e, st);
@@ -797,7 +866,7 @@ void meta_op_user_del(struct meta_entry *e, const char *name)
 {
     struct wr w;
     size_t st = op_begin(e, &w, META_OP_USER_DEL);
-    putstr(&w, name, META_NAME_MAX);
+    putstr(&w, name, META_USER_NAME_MAX);
     op_end(e, st);
 }
 
@@ -1685,21 +1754,43 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         r->off = r->len; /* a number kept for S4's prefix groups: nothing applies it yet */
         return META_ERR_INVALID;
     case META_OP_USER_PUT: {
-        char name[META_NAME_MAX];
+        char name[META_USER_NAME_MAX];
         getstr(r, name, sizeof name);
+        uint64_t version = get64(r);
         uint32_t len = get32(r);
         if (r->bad || len > META_USER_BLOB_MAX || len > r->len - r->off)
             return META_ERR_FORMAT;
-        if (!name[0])
+        if (!name[0] || len < META_USER_UID_LEN) {
+            r->off += len;
             return META_ERR_INVALID;
-        uint8_t *blob = malloc(len + 1);
-        if (!blob)
-            abort();
-        get(r, blob, len);
+        }
         int32_t at = user_at(m, name);
+        if (!MUT(36)) { /* userstaleok: an unconditional put (a passwd racing a revoke undoes the revoke) */
+            int rc = at >= 0 ? (version == 0 ? META_ERR_EXISTS : version != m->users[at].version ? META_ERR_STALE : 0)
+                             : (version != 0 ? META_ERR_NOTFOUND : 0);
+            if (rc) {
+                r->off += len;
+                return rc;
+            }
+        }
+        /* the budget (nousersbudget: none, and a snapshot passes a peer frame: node add and catch-up stop for good) */
+        uint64_t total = meta_users_bytes(m) + len + strlen(name) + 1 -
+                         (at >= 0 ? m->users[at].len + strlen(name) + 1 : 0);
+        if ((at < 0 && m->max_uid == UINT32_MAX) || (total > META_USERS_BYTES_MAX && !MUT(38))) {
+            r->off += len;
+            return META_ERR_RANGE;
+        }
+        uint8_t *blob = ublob_new(len);
+        get(r, blob, len);
+        uint32_t uid;
         if (at >= 0) {
-            free(m->users[at].blob);
+            uid = m->users[at].uid;
+            ublob_unref(m->users[at].blob);
         } else {
+            /* uidfromproposer: the proposer's uid (two proposers reading one copy pick the same) */
+            uid = MUT(37) && get_le32(blob) ? get_le32(blob) : m->max_uid + 1;
+            if (uid > m->max_uid)
+                m->max_uid = uid;
             uint32_t pos = (uint32_t)(-1 - at);
             m->users = grow(m->users, &m->users_cap, m->nusers + 1, sizeof *m->users);
             memmove(&m->users[pos + 1], &m->users[pos], (m->nusers - pos) * sizeof *m->users);
@@ -1707,19 +1798,22 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             at = (int32_t)pos;
             memcpy(m->users[at].name, name, sizeof name);
         }
+        put_le32(blob, uid);
+        m->users[at].uid = uid;
+        m->users[at].version = m->applied; /* meta_apply sets the scratch copy's applied to this entry's index */
         m->users[at].blob = blob;
         m->users[at].len = len;
         return META_OK;
     }
     case META_OP_USER_DEL: {
-        char name[META_NAME_MAX];
+        char name[META_USER_NAME_MAX];
         getstr(r, name, sizeof name);
         if (r->bad)
             return META_ERR_FORMAT;
         int32_t at = user_at(m, name);
         if (at < 0)
             return META_ERR_NOTFOUND;
-        free(m->users[at].blob);
+        ublob_unref(m->users[at].blob);
         memmove(&m->users[at], &m->users[at + 1], (m->nusers - (uint32_t)at - 1) * sizeof *m->users);
         m->nusers--;
         return META_OK;
@@ -1922,9 +2016,12 @@ static void encode_body(struct wr *w, const struct meta_state *m)
         put32(w, m->pend[i].to);
         put64(w, m->pend[i].freeze_epoch);
     }
+    put32(w, m->max_uid);
     put32(w, m->nusers);
     for (uint32_t i = 0; i < m->nusers; i++) {
-        putstr(w, m->users[i].name, META_NAME_MAX);
+        putstr(w, m->users[i].name, META_USER_NAME_MAX);
+        put32(w, m->users[i].uid);
+        put64(w, m->users[i].version);
         put32(w, m->users[i].len);
         put(w, m->users[i].blob, m->users[i].len);
     }
@@ -2091,24 +2188,28 @@ static int decode_body(struct rd *r, struct meta_state *m)
             return -1;
         m->npend = i + 1;
     }
+    m->max_uid = get32(r);
     n = get32(r);
-    if (r->bad || n > (r->len - r->off) / 6)
+    if (r->bad || n > (r->len - r->off) / 22)
         return -1;
     m->users = grow(m->users, &m->users_cap, n + 1, sizeof *m->users);
     for (uint32_t i = 0; i < n && !r->bad; i++) {
         struct meta_user *u = &m->users[i];
-        getstr(r, u->name, META_NAME_MAX);
+        getstr(r, u->name, META_USER_NAME_MAX);
+        u->uid = get32(r);
+        u->version = get64(r);
         u->len = get32(r);
-        if (u->len > META_USER_BLOB_MAX)
+        if (r->bad || u->len > META_USER_BLOB_MAX || u->len < META_USER_UID_LEN || u->len > r->len - r->off)
             return -1;
-        u->blob = malloc(u->len + 1);
-        if (!u->blob)
-            abort();
+        u->blob = ublob_new(u->len);
         m->nusers = i + 1;
         get(r, u->blob, u->len);
-        if (i && strcmp(u->name, m->users[i - 1].name) <= 0)
+        if (!u->name[0] || (i && strcmp(u->name, m->users[i - 1].name) <= 0) || !u->uid || u->uid > m->max_uid ||
+            get_le32(u->blob) != u->uid || u->version > m->applied)
             r->bad = 1;
     }
+    if (!r->bad && users_uids_unique(m) != 0)
+        return -1;
     if (get32(r) != 0) /* rules this build has no list for */
         return -1;
     return r->bad || r->off != r->len ? -1 : 0;
@@ -2321,5 +2422,30 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
                 FAIL("slot %u's freeze names an epoch its old home never had", p->slot);
         }
     }
+    /* users: uids never go back and name one user; a user's uid stays while it lives; a version moves only with a
+     * put, which is the entry's own index */
+    if (next->max_uid < prev->max_uid)
+        FAIL("max_uid went down (%u -> %u)", prev->max_uid, next->max_uid);
+    for (uint32_t i = 0; i < next->nusers; i++) {
+        const struct meta_user *u = &next->users[i], *o = meta_user(prev, u->name);
+        if (!u->uid || u->uid > next->max_uid || u->len < META_USER_UID_LEN || get_le32(u->blob) != u->uid)
+            FAIL("user %s: uid %u outside 1..%u or not in its blob", u->name, u->uid, next->max_uid);
+        if (i && strcmp(u->name, next->users[i - 1].name) <= 0)
+            FAIL("users out of order at %s", u->name);
+        if (o && o->version == u->version &&
+            (o->uid != u->uid || o->len != u->len || (o->blob != u->blob && memcmp(o->blob, u->blob, u->len))))
+            FAIL("user %s changed without a put", u->name);
+        if (o && o->version != u->version && u->version != next->applied)
+            FAIL("user %s: version %llu is not this entry's index %llu", u->name, (unsigned long long)u->version,
+                 (unsigned long long)next->applied);
+        if (o && o->uid != u->uid && u->uid <= prev->max_uid)
+            FAIL("user %s: uid %u -> %u, a uid already given out", u->name, o->uid, u->uid);
+        if (!o && u->uid <= prev->max_uid)
+            FAIL("user %s: new with uid %u, at or below max_uid %u", u->name, u->uid, prev->max_uid);
+    }
+    if (users_uids_unique(next) != 0)
+        FAIL("two users share a uid");
+    if (meta_users_bytes(next) > META_USERS_BYTES_MAX)
+        FAIL("the users take %llu bytes, above %u", (unsigned long long)meta_users_bytes(next), META_USERS_BYTES_MAX);
     return 0;
 }
