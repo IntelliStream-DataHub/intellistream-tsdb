@@ -6086,6 +6086,186 @@ static void scen_repcheck(void)
  * unknown outcome), never MOVED or UNAVAILABLE; a new write is MOVED to the new leader and a client with a budget
  * follows it there; the old leader rejoins as a replica (cut, caught up) with the same rows as the others. Which of
  * the two ends the waiting write gets is a race, so the planted fault deposemoved is writerdepose's to catch. */
+/* the fence in server i's REPL of volume number (the slot with the newer generation; offset 88, src/replfile.c) */
+static uint64_t repl_fence_of(int i, uint32_t number)
+{
+    char dir[PATH_MAX + 80], path[PATH_MAX + 160];
+    uint8_t pg[2][4096];
+    server_dir(i, dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/v%" PRIu32 "/REPL", dir, number);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        die("%s: %s", path, strerror(errno));
+    size_t got = fread(pg, 1, sizeof pg, f);
+    fclose(f);
+    if (got != sizeof pg)
+        die("%s: %zu bytes, not two slots", path, got);
+    uint64_t g[2], fence;
+    memcpy(&g[0], pg[0] + 8, 8);
+    memcpy(&g[1], pg[1] + 8, 8);
+    memcpy(&fence, pg[g[1] > g[0]] + 88, 8);
+    return fence;
+}
+
+/* Crash points of a promotion (design-cluster.md 6.2), a replica armed, the leader killed under none of its writes lost:
+ * fencecrash: a fenced replica saves the fence in REPL before it answers, so one that stops at fence-saved-before-reply
+ * (its reply not yet out) holds the new epoch's fence on disk (mutant fencenosync answers with the fence unsaved); the
+ * other replica is promoted alone. promotecrash: both replicas armed with promote-before-epoch, the one the record
+ * names stops before its EPOCH marker; restarted, it never resumes that epoch (it resigns, or is promoted again later)
+ * and some replica leads with every acknowledged row. deposecrash: the leader paused past its lease and node_timeout is
+ * promoted away; resumed, it stops at depose-before-reopen (writer closed, replica not yet open) and, restarted, opens
+ * as a replica, rejoins and holds the same rows. Each time the crashed server rejoins. */
+static void crash_promo(int promote)
+{
+    scenario(promote == 2 ? "deposecrash" : promote ? "promotecrash" : "fencecrash");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = promote == 2 ? "TSDB_CRASH_AT=depose-before-reopen" : NULL; /* only a demotion passes it */
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "fc", 3, &num)) != 0)
+        die("volume add fc: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fc", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "fc", &v))
+        die("no record of fc");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of fc is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "fc", 30000);
+    for (int j = 0; j < 20; j++) {
+        int64_t ts = 1000000 + 1000LL * j;
+        float val = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d to the leader: %s", j, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, "fc", 3, 30000, "every replica in the ISR");
+    /* the crashing replica is one that is not the Raft leader (the fences come from there) */
+    int R = -1;
+    for (int i = 0; i < 3 && R < 0; i++)
+        if (i != L && i != 0)
+            R = i;
+    int Q = 3 - L - R;
+    const char *spec = promote ? "TSDB_CRASH_AT=promote-before-epoch" : "TSDB_CRASH_AT=fence-saved-before-reply";
+    for (int k = 0; k < (promote == 2 ? 0 : promote ? 2 : 1); k++) {
+        int x = k ? Q : R;
+        stop(x, SIGTERM);
+        penv[x] = spec;
+        start(x);
+        /* back as a replica (its volume opens once the group holds its new incarnation) before the next one stops:
+         * two servers restarted at new peer ports at once cannot find each other (scen_minisr) */
+        await_log_count(x, "open as the replica", 2, 60000);
+        await_isr(k ? R : Q, "fc", 3, 60000, "the restarted replica back in the ISR");
+    }
+    if (promote == 2) {
+        /* paused past its lease and node_timeout, the leader is promoted away; resumed, it is deposed and stops
+         * between the close of its writer and the open as a replica; restarted, it opens as a replica and rejoins */
+        pause_server(L, 1);
+        uint64_t t1 = now_ms();
+        while (!(vol_rec(Q, "fc", &v) && v.epoch > e0 && v.leader != ids[L])) {
+            if (now_ms() - t1 > 30000)
+                die("no new leader of fc 30 s after its leader was paused");
+            usleep(50000);
+        }
+        pause_server(L, 0);
+        int st = await_exit(L, 30000);
+        for (int i = 0; i < 3; i++)
+            penv[i] = NULL;
+        if (st != 99)
+            die("the deposed leader %d did not stop at depose-before-reopen (status %d)", L, st);
+        printf("  the deposed leader %d stopped at depose-before-reopen\n", L);
+        start(L);
+    } else {
+        signal_child(pids[L], SIGKILL);
+        if (await_exit(L, 5000) < 0)
+            die("server %d did not die of SIGKILL", L);
+    }
+    if (promote == 2) {
+    } else if (promote) {
+        /* the one named first stops; the other may be named after it and stop as well */
+        uint64_t t1 = now_ms();
+        int st = -1;
+        for (;;) {
+            int got_one = -1;
+            for (int x = 0; x < 3 && got_one < 0; x++)
+                if (x != L && pids[x] && (st = await_exit(x, 0)) >= 0)
+                    got_one = x;
+            if (got_one >= 0) {
+                if (st != 99)
+                    die("replica %d ended with status %d, not at promote-before-epoch", got_one, st);
+                printf("  replica %d stopped at promote-before-epoch\n", got_one);
+                penv[got_one] = NULL;
+                start(got_one);
+                break;
+            }
+            if (now_ms() - t1 > 30000)
+                die("no replica stopped at promote-before-epoch 30 s after the leader was killed");
+            usleep(50000);
+        }
+        penv[R] = penv[Q] = NULL;
+    } else {
+        int st = await_exit(R, 30000);
+        penv[R] = NULL;
+        if (st != 99)
+            die("replica %d did not stop at fence-saved-before-reply (status %d)", R, st);
+        uint64_t fence = repl_fence_of(R, num);
+        if (fence < e0 + 1)
+            die("replica %d: REPL holds fence %" PRIu64 " after it stopped at fence-saved-before-reply for epoch %" PRIu64,
+                R, fence, e0 + 1);
+        printf("  replica %d stopped at fence-saved-before-reply with fence %" PRIu64 " in REPL\n", R, fence);
+        start(R);
+    }
+    uint64_t t0 = now_ms();
+    for (;;) {
+        if (promote) {
+            /* the replica still armed may stop too when named; it is restarted unarmed */
+            for (int x = 0; x < 3; x++)
+                if (x != L && pids[x] && await_exit(x, 0) >= 0)
+                    start(x);
+        }
+        int via = pids[Q] ? Q : R;
+        char lead[64];
+        if (vol_rec(via, "fc", &v) && v.leader != ids[L] && v.epoch > e0 && server_of(v.leader) >= 0 &&
+            (snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch), log_has(server_of(v.leader), lead)))
+            break;
+        if (now_ms() - t0 > 30000)
+            die("no new leader of fc 30 s after its leader was killed (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+        usleep(20000);
+    }
+    int Nw = server_of(v.leader);
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * 20, 30000);
+    if (got != 20)
+        die("the new leader (server %d) holds %d of the 20 acknowledged rows", Nw, got);
+    if (promote == 2) {
+        await_log_count(L, "open as the replica", 1, 60000); /* its first open was as the leader */
+        await_isr(Nw, "fc", 3, 60000, "the deposed leader back in the ISR");
+        stop_all();
+        uint64_t wantr[REP_NAMES] = {0};
+        wantr[0] = 20;
+        rep_same(wantr, "after the deposed leader rejoined");
+        printf("  server %d leads fc at epoch %" PRIu64 "; the deposed leader reopened as a replica and holds the same "
+               "rows\n", Nw, v.epoch);
+        return;
+    }
+    await_isr(Nw, "fc", 2, 60000, "the two live replicas in the ISR");
+    printf("  server %d leads fc at epoch %" PRIu64 " with every row; the crashed replica rejoined\n", Nw, v.epoch);
+    stop_all();
+}
+
+static void scen_fencecrash(void) { crash_promo(0); }
+static void scen_promotecrash(void) { crash_promo(1); }
+static void scen_deposecrash(void) { crash_promo(2); }
+
 static void scen_pause(void)
 {
     scenario("pause");
@@ -6584,7 +6764,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"pause", scen_pause}, {"resign", scen_resign}, {"cut", scen_cut}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"resign", scen_resign}, {"cut", scen_cut}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

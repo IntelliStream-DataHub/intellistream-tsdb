@@ -23,7 +23,8 @@
 # tick dropped: the core's clock slower than the wall's under a slow catch-up step) tickwall (knob slowtick);
 # stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick). Two are tsdbd's, read by
 # it under the same name: nomoved (a write to a non-leader refused UNAVAILABLE, not MOVED) failover; deposemoved (a
-# write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose.
+# write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose. fencenosync (a
+# FENCE_REPLY sent with the raised fence not in REPL) fencecrash.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -59,6 +60,7 @@ table=(
     "tickstretch|tickwall|a member stopped under writes left the ISR only after [0-9]+ ms"
     "stepcurrentonly|rejoinlate|did not join the ISR again in 30 s"
     "keepunanswered|failover|the killed old leader was still in the ISR of fo"
+    "fencenosync|fencecrash|REPL holds fence [0-9]+ after it stopped at fence-saved-before-reply"
     "keepwritten|replicate|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
     "stopnodepose|closegone|its replicas killed: server [0-9]+ still runs [0-9]+ ms after SIGTERM"
     "lateclock|closegone|the leader wrote no WAL record after its driver stopped"

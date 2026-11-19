@@ -251,6 +251,7 @@ enum {
     RM_FASTRIDE,
     RM_NOJOINHOLD,
     RM_KEEPUNANSWERED, /* unanswered_ticks 0: a member a promotion kept unanswered goes only by the lag rule */
+    RM_FENCENOSYNC,    /* a SAVE that raises the fence is skipped: the FENCE_REPLY goes out with the fence not in REPL */
     RM_INBOXSTARVE,
     RM_OPENNOHOLD,
     RM_TICKSTRETCH,
@@ -1448,7 +1449,9 @@ static void exec(struct rvol *rv, struct repl_action *a)
         hist_cut(rv, a->pos);
         break;
     case REPL_A_SAVE:
-        rc = G.mutant == RM_FLOORNOTSAVED ? 0 : save_repl(rv, a->fence, a->led, a->floor);
+        rc = G.mutant == RM_FLOORNOTSAVED || (G.mutant == RM_FENCENOSYNC && a->fence > rv->st.fence)
+                 ? 0
+                 : save_repl(rv, a->fence, a->led, a->floor);
         if (rc != 0) {
             vol_fail(rv, "the REPL file could not be saved");
             break;
@@ -2125,6 +2128,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "fastride")       ? RM_FASTRIDE
                : !strcmp(mu, "nojoinhold")     ? RM_NOJOINHOLD
                : !strcmp(mu, "keepunanswered") ? RM_KEEPUNANSWERED
+               : !strcmp(mu, "fencenosync")    ? RM_FENCENOSYNC
                : !strcmp(mu, "inboxstarve")    ? RM_INBOXSTARVE
                : !strcmp(mu, "opennohold")     ? RM_OPENNOHOLD
                : !strcmp(mu, "tickstretch")    ? RM_TICKSTRETCH
