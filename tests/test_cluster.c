@@ -3153,11 +3153,11 @@ static void scen_replicate(void)
     if (wal_lowest(R, 1) <= 1)
         die("replica %d removed none of its WAL segments in 20 s (a flush every 5 s, the floor every second)", R);
     stop(R, SIGKILL);
-    struct rep_writer w = {cports[L], id[0], 10000000, 300, 0, 0, 0};
+    struct rep_writer w = {cports[L], id[0], 10000000, 300, 0, 0, 0, 0};
     /* and a large insert: its part is shipped while R is down; R, back, does not stage the first file it receives
      * (TSDB_REPLD_TEST=dropbulk), finds the COMMIT marker in the log without the file and fetches it from the leader
      * by the marker's position (eng_leader_file_open serves a name only for the marker that named it) */
-    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000}; /* above wal_max_batch_rows */
+    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000, 0}; /* above wal_max_batch_rows */
     pthread_t th, thb;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0 || pthread_create(&thb, NULL, rep_write_thread, &wb) != 0)
         die("pthread_create");
@@ -3307,7 +3307,7 @@ static void scen_isr(void)
     int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
     hold_isr(1);
     stop(R1, SIGKILL);
-    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -3420,7 +3420,7 @@ static void scen_minisr(void)
     /* a write admitted with the ISR at 3, its commit point reached only once the shrink to 2 committed: held */
     hold_isr(1);
     stop(R1, SIGKILL);
-    struct rep_writer w = {cports[L], id, 2500, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 2500, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -3546,7 +3546,7 @@ static void scen_closegone(void)
     L = closegone_setup("closegone-above", NULL, &id);
     pause_server((L + 1) % 3, 1);
     pause_server((L + 2) % 3, 1);
-    struct rep_writer w = {cports[L], id, 3000, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 3000, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -6239,6 +6239,11 @@ static void scen_resign(void)
     int Nw = server_of(v.leader);
     if (v.epoch != e0 + 1 || Nw < 0 || Nw > 2)
         die("the new record of rs: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    /* the RESIGN moves it, not detection: the restart usually made another server the Raft leader, which must record
+     * the new incarnation (the volume opens only then) without waiting out its node_timeout of 20 s first */
+    if (tr - ts0 >= 10000)
+        die("the record of rs moved %" PRIu64 " ms after its leader restarted: that is detection (node_timeout 20 s), "
+            "not the RESIGN", tr - ts0);
     int resigned = 0;
     for (int i = 0; i < 3; i++)
         resigned += log_count(i, "(reason 7); fences");

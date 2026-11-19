@@ -1551,7 +1551,8 @@ enum cl_mutant {
     CLM_NOCORECLOCK = 5,
     CLM_NOPROMOTEWAIT = 6,
     CLM_SHRINKNOCOND = 7, /* an ISR request is proposed on the record's current epoch and ISR version, not its own basis */
-    CLM_LEASESTALE = 8    /* a node that reports itself the writer of a volume another leads still gets a lease */
+    CLM_LEASESTALE = 8,   /* a node that reports itself the writer of a volume another leads still gets a lease */
+    CLM_UPWAITS = 9       /* a new Raft leader proposes a restarted member up only after node_timeout */
 };
 static int cl_mutant(void)
 {
@@ -1568,6 +1569,7 @@ static int cl_mutant(void)
             : !strcmp(e, "nopromotewait") ? CLM_NOPROMOTEWAIT
             : !strcmp(e, "shrinknocond")  ? CLM_SHRINKNOCOND
             : !strcmp(e, "leasestale")    ? CLM_LEASESTALE
+            : !strcmp(e, "upwaits")       ? CLM_UPWAITS
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -4032,8 +4034,13 @@ static void member_states(uint64_t now)
     uint64_t wait = cluster_lease_safe(0, s->lease_ms, s->drift_ppm);
     if (cl_mutant() == CLM_NOPROMOTEWAIT)
         wait = 0;
-    if (since(now, C.leader_since) < (wait > to ? wait : to))
-        return; /* a new leader does not know when the others last heard from anyone, nor the leases given before */
+    /* A new leader does not know when the others last heard from anyone, nor the leases given before: it proposes
+     * nothing but a member it hears itself coming back (DOWN, or a new incarnation: a restart, whose volumes open
+     * only once the group holds that incarnation) until the wait is over. A restarted volume leader resigns only
+     * then, and its restart often is what made this server the Raft leader (test_cluster resign). */
+    int settled = since(now, C.leader_since) >= (wait > to ? wait : to);
+    if (!settled && cl_mutant() == CLM_UPWAITS)
+        return;
     for (uint32_t i = 0; i < C.sm.nmembers && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
         const struct meta_member *m = &C.sm.members[i];
         if (m->state == META_OUT || m->state == META_DRAINING || pend_member(m->id))
@@ -4052,6 +4059,8 @@ static void member_states(uint64_t now)
                                       (!h->moved_ns || since(now, h->moved_ns) >= to)
                                   ? h
                                   : NULL;
+        if (!settled && !(fresh && inc >= minc && (st == META_DOWN || inc > minc)))
+            continue;
         if (st == META_UP && !fresh && (cl_mutant() == CLM_NOPROMOTEWAIT || now >= promote_safe_ns(id)))
             propose_member(id, META_DOWN, minc, NULL, now);
         else if (fresh && inc >= minc && (st == META_DOWN || inc > minc))
