@@ -21,7 +21,9 @@
 # while the next is due) rejoinslow; opennohold (a replica's core opens with its whole log durable, past a COMMIT
 # marker whose file it has not staged) reopenhold (knobs dropbulk, nofetch, syncpause, fetchlate); tickstretch (a late
 # tick dropped: the core's clock slower than the wall's under a slow catch-up step) tickwall (knob slowtick);
-# stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick).
+# stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick). Two are tsdbd's, read by
+# it under the same name: nomoved (a write to a non-leader refused UNAVAILABLE, not MOVED) failover; deposemoved (a
+# write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -60,6 +62,8 @@ table=(
     "stopnodepose|closegone|its replicas killed: server [0-9]+ still runs [0-9]+ ms after SIGTERM"
     "lateclock|closegone|the leader wrote no WAL record after its driver stopped"
     "syncbyrep|writersync|writersync: batch [0-9]+, a write from connection [0-9]+: .*its commit point stayed below"
+    "nomoved|failover|a write to a replica after the failover: .*not MOVED"
+    "deposemoved|writerdepose|the write waiting for the commit point on the failed writer got"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
 all=

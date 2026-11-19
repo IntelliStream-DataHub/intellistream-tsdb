@@ -500,6 +500,7 @@ static __thread struct {
 } lguard;
 static const char *test_read_stall; /* TSDBD_TEST_READ_STALL: an admitted cluster read waits while this file exists */
 static bool test_no_moved; /* TSDBD_TEST_NO_MOVED (a planted fault): a write a non-leader refuses gets UNAVAILABLE */
+static bool test_depose_moved; /* TSDBD_TEST_DEPOSE_MOVED (a planted fault): a write of unknown outcome is refused */
 
 #include "domains.h"
 static void dom_waits(int delta) { worker_waits(delta); }
@@ -936,6 +937,8 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
     /* D12: a replicated write whose leader was deposed (or failed) after its WAL append may or may not commit; the
      * client must not read that as a refusal, so it gets no answer at all: the connection closes, and the client
      * treats every request in flight on it as of unknown outcome. Never put -110 on the wire. */
+    if (status == TSDB_ERR_INDETERMINATE && test_depose_moved)
+        status = TSDB_ERR_UNAVAILABLE;
     if (status == TSDB_ERR_INDETERMINATE) {
         atomic_store(&c->closing, true);
         shutdown(c->fd, SHUT_RDWR);
@@ -4732,7 +4735,10 @@ int main(int argc, char **argv)
         tsdb_test_precommit(db, hold_large, NULL);
     test_loop_stall = getenv("TSDBD_TEST_LOOP_STALL");
     test_read_stall = getenv("TSDBD_TEST_READ_STALL");
-    test_no_moved = getenv("TSDBD_TEST_NO_MOVED") != NULL;
+    /* also as TSDB_REPLD_MUTANT names, so that tests/repld_mutants.sh plants them like the driver's */
+    const char *rmu = getenv("TSDB_REPLD_MUTANT");
+    test_no_moved = getenv("TSDBD_TEST_NO_MOVED") != NULL || (rmu && !strcmp(rmu, "nomoved"));
+    test_depose_moved = getenv("TSDBD_TEST_DEPOSE_MOVED") != NULL || (rmu && !strcmp(rmu, "deposemoved"));
     if (getenv("TSDBD_TEST_AUTH_DELAY_MS"))
         test_auth_delay_ms = atoi(getenv("TSDBD_TEST_AUTH_DELAY_MS"));
     struct rlimit rl;

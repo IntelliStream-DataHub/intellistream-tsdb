@@ -6058,6 +6058,124 @@ static void scen_repcheck(void)
     stop_all();
 }
 
+
+/* design-cluster.md 6.3 (r3e-failover): the leader of a replicated volume is paused (SIGSTOP) past its lease and
+ * node_timeout with a write waiting for its commit point (both replicas were paused first, and nothing can shrink
+ * the ISR without a Raft quorum). The replicas resume and one is promoted at e+1; it takes a write. The old leader
+ * resumes with the others paused: it answers no read (no lease, deposed or not). Once every server runs, its waiting
+ * write ends acknowledged (the replicas read the record from their sockets, acknowledged it, and the new epoch starts
+ * past it: the old leader may see those acknowledgements before the fence) or with a closed connection (D12: of
+ * unknown outcome), never MOVED or UNAVAILABLE; a new write is MOVED to the new leader and a client with a budget
+ * follows it there; the old leader rejoins as a replica (cut, caught up) with the same rows as the others. Which of
+ * the two ends the waiting write gets is a race, so the planted fault deposemoved is writerdepose's to catch. */
+static void scen_pause(void)
+{
+    scenario("pause");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "pz", 3, &num)) != 0 || num != 1)
+        die("volume add pz: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "pz", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "pz", &v))
+        die("no record of pz");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of pz is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "pz", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    await_isr(0, "pz", 3, 30000, "every replica in the ISR before the pause");
+    int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
+    pause_server(R1, 1);
+    pause_server(R2, 1);
+    struct wf_writer w = {client(L), id, 2000, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, wf_write_thread, &w) != 0)
+        die("pthread_create");
+    nanosleep(&(struct timespec){0, 300000000}, NULL);
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
+        die("a write with both replicas paused was answered: %s", ers(w.rc));
+    pause_server(L, 1);
+    uint64_t tp = now_ms();
+    pause_server(R1, 0);
+    pause_server(R2, 0);
+    int Nw = await_promoted(R1, "pz", ids[L], e0, &v);
+    if (Nw < 0 || Nw == L || v.epoch != e0 + 1)
+        die("the new record of pz: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    uint64_t tr = now_ms();
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    tsdbc *cn = client(Nw);
+    tsdbc_set_retry(cn, 10000);
+    ts = 3000;
+    if ((rc = tsdbc_insert_series(cn, id, &ts, &val, 1)) != 0)
+        die("a write to the new leader: %s", ers(rc));
+    tsdbc_close(cn);
+    printf("  leader %d paused with a write waiting: the record names server %d at epoch %" PRIu64 " after %" PRIu64
+           " ms\n", L, Nw, v.epoch, tr - tp);
+    /* the old leader resumes alone: whatever it learns from what was queued for it, it answers no read */
+    pause_server(R1, 1);
+    pause_server(R2, 1);
+    pause_server(L, 0);
+    uint64_t t1 = now_ms();
+    int nb = 0;
+    while (now_ms() - t1 < 1500) {
+        int rows;
+        if ((rc = lease_read(c, id, nb % 3, &rows)) == 0)
+            die("server %d answered a read %" PRIu64 " ms after it was resumed with every other server paused (%d rows)",
+                L, now_ms() - t1, rows);
+        nb++;
+    }
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE) && w.rc != 0 && (w.rc != TSDB_ERR_IO || w.after != TSDB_ERR_IO))
+        die("the write waiting on the paused leader got %d (%s), then its connection %d (%s): not a closed connection",
+            w.rc, ers(w.rc), w.after, ers(w.after));
+    pause_server(R1, 0);
+    pause_server(R2, 0);
+    for (uint64_t t0 = now_ms(); !__atomic_load_n(&w.done, __ATOMIC_ACQUIRE); usleep(20000))
+        if (now_ms() - t0 > 15000)
+            die("the write waiting on the deposed leader %d was not ended in 15 s", L);
+    pthread_join(th, NULL);
+    if (w.rc != 0 && (w.rc != TSDB_ERR_IO || w.after != TSDB_ERR_IO))
+        die("the write waiting on the deposed leader got %d (%s), then its connection %d (%s): neither acknowledged "
+            "nor a closed connection (D12)", w.rc, ers(w.rc), w.after, ers(w.after));
+    tsdbc_close(w.c);
+    tsdbc_close(c);
+    printf("  resumed alone it answered none of %d reads; its waiting write ended %s\n", nb,
+           w.rc == 0 ? "acknowledged (committed in the new epoch)" : "with a closed connection");
+    /* new writes on the old leader are MOVED, and a client with a budget follows them */
+    c = client(L);
+    ts = 4000;
+    insert_expect_moved(c, id, ts, val, 1, v.leader, v.epoch, "a write to the deposed leader");
+    tsdbc_set_retry(c, 10000);
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write that follows MOVED from the deposed leader %d: %s", L, ers(rc));
+    tsdbc_close(c);
+    await_isr(R1, "pz", 3, 60000, "the deposed leader back in the ISR");
+    int total = rows_in(Nw, id, 0, INT64_MAX / 2, 10000);
+    if (total != 4 && !(total == 3 && w.rc != 0))
+        die("the new leader holds %d rows: 3 acknowledged, and the waiting write %s", total,
+            w.rc == 0 ? "acknowledged too" : "of unknown outcome");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)total;
+    rep_same(wantr, "after the pause");
+    printf("  the deposed leader rejoined as a replica: every server holds the same %d rows\n", total);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -6089,7 +6207,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"pause", scen_pause}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
