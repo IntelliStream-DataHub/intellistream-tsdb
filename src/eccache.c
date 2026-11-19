@@ -8,9 +8,9 @@
  * for it (cv) instead of reading it again; it is pinned by its loader. Pinned entries and objects are never evicted;
  * what eviction takes out is freed or closed after mu is released. Nothing under mu does I/O.
  *
- * The backend: r7-tier hands its own over (eccache_set_backend); until then the cache opens one from the tier's
- * configuration at first use, under be_mu, which is held across that open (I/O) and taken only by readers with no
- * engine lock (the seam's callers hold none), never under mu.
+ * The backend is the tier's (tier_open hands it over, eccache_set_backend), never one of the cache's own: a store flocks
+ * its directory, so a second backend over the tier's stores would be BUSY at every store the tier holds (one backend
+ * per handle, src/tier.h). The volumes' uuids likewise come from the tier's engines (tier_engine_attach).
  */
 #include "eccache.h"
 #include "chunk.h"
@@ -94,19 +94,8 @@ struct eccache_tier {
     eccache_counters n; /* the counters (bytes, entries, objs_open, fds_open, budgets filled in on read) */
     vu *vus;
     size_t nvus;
-    pthread_mutex_t be_mu; /* the fallback backend's open (I/O): see the file header */
-    _Atomic(chunk_backend *) be;
-    bool be_owned;
-    int64_t be_fail_ms;
-    int be_rc;
+    _Atomic(chunk_backend *) be; /* the tier's: not owned, not closed here */
 };
-
-static int64_t mono_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 
 static uint64_t ld64(const uint8_t *b)
 {
@@ -805,7 +794,6 @@ int eccache_tier_open(struct tier *t)
     }
     pthread_mutex_init(&c->mu, NULL);
     pthread_cond_init(&c->cv, NULL);
-    pthread_mutex_init(&c->be_mu, NULL);
     c->lru.next = c->lru.prev = &c->lru;
     c->olru.next = c->olru.prev = &c->olru;
     if (t->cfg.cache_mb) {
@@ -843,65 +831,30 @@ void eccache_tier_close(struct tier *t)
             free(o->sums);
             free(o);
         }
-    chunk_backend *be = atomic_load(&c->be);
-    if (be && c->be_owned)
-        chunk_be_close(be);
     free(c->eh);
     free(c->oh);
     free(c->gh);
     free(c->vus);
     pthread_mutex_destroy(&c->mu);
     pthread_cond_destroy(&c->cv);
-    pthread_mutex_destroy(&c->be_mu);
     free(c);
     t->cache = NULL;
 }
 
-int eccache_set_backend(struct tier *t, struct chunk_backend *be)
+void eccache_set_backend(struct tier *t, struct chunk_backend *be)
 {
-    struct eccache_tier *c = t->cache;
-    pthread_mutex_lock(&c->be_mu);
-    chunk_backend *old = atomic_load(&c->be);
-    /* The fallback is read without a reference (readers load c->be and open objects through it), so it is never
-     * closed under them; and it holds every store's flock, so a backend opened beside it could not have been. */
-    int rc = old && c->be_owned ? TSDB_ERR_LOCKED : 0;
-    if (rc == 0)
-        atomic_store(&c->be, be);
-    pthread_mutex_unlock(&c->be_mu);
-    return rc;
+    atomic_store_explicit(&t->cache->be, be, memory_order_release);
 }
 
 struct chunk_backend *eccache_backend(struct tier *t, int *rc)
 {
-    struct eccache_tier *c = t->cache;
-    chunk_backend *be = atomic_load_explicit(&c->be, memory_order_acquire);
-    if (be)
-        return be;
-    pthread_mutex_lock(&c->be_mu);
-    be = atomic_load(&c->be);
-    if (!be) {
-        int64_t now = mono_ms();
-        if (c->be_fail_ms && now - c->be_fail_ms < 1000) {
-            *rc = c->be_rc;
-        } else {
-            chunk_be_opts o = {.min_up = t->cfg.ndirs - t->cfg.m};
-            int r = chunk_be_open2(&be, (const char *const *)t->cfg.dirs, t->cfg.ndirs, NULL, &o);
-            if (r) {
-                be = NULL;
-                c->be_rc = *rc = map_rc(r);
-                c->be_fail_ms = now ? now : 1;
-            } else {
-                c->be_owned = true;
-                c->be_fail_ms = 0;
-                atomic_store_explicit(&c->be, be, memory_order_release);
-            }
-        }
-    }
-    pthread_mutex_unlock(&c->be_mu);
+    chunk_backend *be = atomic_load_explicit(&t->cache->be, memory_order_acquire);
+    if (!be)
+        *rc = TSDB_ERR_UNAVAILABLE;
     return be;
 }
 
-void eccache_set_vuuid(struct tier *t, uint32_t volume, const uint8_t vuuid[16])
+int eccache_set_vuuid(struct tier *t, uint32_t volume, const uint8_t vuuid[16])
 {
     struct eccache_tier *c = t->cache;
     pthread_mutex_lock(&c->mu);
@@ -912,7 +865,7 @@ void eccache_set_vuuid(struct tier *t, uint32_t volume, const uint8_t vuuid[16])
         vu *n = realloc(c->vus, (c->nvus + 1) * sizeof *n);
         if (!n) {
             pthread_mutex_unlock(&c->mu);
-            return;
+            return TSDB_ERR_NOMEM; /* the open fails: a reader with an all-zero uuid would take every chunk for lost */
         }
         c->vus = n;
         c->nvus++;
@@ -920,6 +873,7 @@ void eccache_set_vuuid(struct tier *t, uint32_t volume, const uint8_t vuuid[16])
     }
     memcpy(c->vus[i].u, vuuid, 16);
     pthread_mutex_unlock(&c->mu);
+    return 0;
 }
 
 void eccache_vuuid(struct tier *t, uint32_t volume, uint8_t out[16])
@@ -1140,8 +1094,8 @@ int ec_test_attach_from(eng *db, part *p, const uint8_t *src, ec_record *rec_out
     r.nsums = chunk_sums_total(&g);
     if (!(r.sums = malloc(r.nsums * sizeof *r.sums)))
         return TSDB_ERR_NOMEM;
-    uint8_t u[16];
-    eccache_vuuid(t, db->tier_vol, u);
+    /* the engine's own uuid (META vuuid=), as a settle writes it: the cache reads with the one the tier handed it */
+    const uint8_t *u = tier_vuuid(db);
     rc = chunk_be_see_epoch(be, db->tier_vol, 1);
     if (rc == 0)
         rc = chunk_be_put_object(be, db->tier_vol, u, r.oid, &g, 1, src, ~0u, r.sums);

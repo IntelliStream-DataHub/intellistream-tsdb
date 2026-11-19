@@ -4,8 +4,9 @@
  * through it equals the same parts read from their maps, bit for bit; a flipped byte in a chunk (RAW reads it, the
  * crc refuses it, the whole-cell read rebuilds it) gives the right answer; more than m chunks of an object gone is
  * TSDB_ERR_CORRUPT with a line naming volume, partition, part and granule; stores DOWN (moved away, the handle
- * reopened): right answers while at most m are, TSDB_ERR_UNAVAILABLE beyond (the fallback's open refuses; a backend
- * opened with NULL paths reads the DOWN positions), never wrong rows; eviction under a tiny budget while 32 threads
+ * reopened): right answers while at most m are, beyond that the handle does not open, and a handle whose third store
+ * went while it served reads TSDB_ERR_UNAVAILABLE (no backend, then one opened with NULL paths that reads the DOWN
+ * positions), never wrong rows; the cache reads through the tier's backend (one per handle) with META's vuuid; eviction under a tiny budget while 32 threads
  * query; an fd budget of 8 over 100 objects; residency of an .ec part is the cache's.
  *
  * Parts are attached with ec_test_attach (the part's own bytes encoded into the tier's stores, p->ec set in memory),
@@ -96,6 +97,21 @@ typedef struct h {
     eng *db;
 } h;
 
+/* the engine of x, under its tier */
+static int h_eng_open(h *x, const char *dir)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0; /* no merge barrier for an attached part before r7-skip */
+    o.create_volumes = 0;
+    o.partition_classes = 0;
+    o.obsolete_part_lifetime_s = 3600;
+    tier_want(x->t, 0);
+    int rc = eng_open(dir, &o, &x->db);
+    tier_want(NULL, 0);
+    return rc;
+}
+
 static int h_open(h *x, const char *dir, const char *extra)
 {
     char spec[8192];
@@ -112,15 +128,7 @@ static int h_open(h *x, const char *dir, const char *extra)
     unsetenv("TSDB_TEST_TIER_I_KNOW");
     if (rc)
         return rc;
-    tsdb_options o;
-    tsdb_options_init(&o);
-    o.merge_threads = 0; /* no merge barrier for an attached part before r7-skip */
-    o.create_volumes = 0;
-    o.partition_classes = 0;
-    o.obsolete_part_lifetime_s = 3600;
-    tier_want(x->t, 0);
-    rc = eng_open(dir, &o, &x->db);
-    tier_want(NULL, 0);
+    rc = h_eng_open(x, dir);
     if (rc) {
         tier_put(x->t);
         x->t = NULL;
@@ -484,10 +492,13 @@ static void case_equal(h *x)
         CHECK(sres == res);
         sscx_close(sx);
     }
-    /* the fallback backend is open: a handover now is refused, never closes it under readers */
-    static char not_a_backend;
-    CHECK(eccache_set_backend(x->t, (chunk_backend *)(void *)&not_a_backend) == TSDB_ERR_LOCKED);
-    CHECK(same_as_ref(db, "after a refused handover"));
+    /* one backend per handle: the cache read through the tier's (a backend of its own would have been BUSY at every
+     * store), and the objects were named by the volume's uuid from META, the one a settle writes them with */
+    int brc = 0;
+    CHECK(tier_backend(x->t) != NULL && eccache_backend(x->t, &brc) == tier_backend(x->t));
+    uint8_t vu[16], zero[16] = {0};
+    eccache_vuuid(x->t, db->tier_vol, vu);
+    CHECK(tier_vuuid(db) && memcmp(vu, tier_vuuid(db), 16) == 0 && memcmp(vu, zero, 16) != 0);
     printf("test_seam: equal: %zu parts, %" PRIu64 " granules read, %" PRIu64 " hits, %" PRIu64 " bytes cached\n",
            np, k2.misses, k2.hits, k2.bytes);
 }
@@ -547,14 +558,36 @@ static void case_down(h *x)
     CHECK(same_as_ref(x->db, "two stores down"));
     h_close(x);
 
-    /* three down: the backend cannot open (min_up = stores - m) */
+    /* three down: the tier's backend cannot open (min_up = stores - m), so neither can the handle */
+    char log[800];
+    snprintf(log, sizeof log, "%s/err.log", base);
     move_store(1, true);
+    cap_begin(log);
+    int orc = h_open(x, dbdir, NULL);
+    cap_end();
+    CHECK(orc != 0 && !x->t && !x->db);
+    if (x->db)
+        h_close(x);
+    /* so the tier opens with two away and the third goes after: with its engine closed (no reader, the latest table's
+     * warmer included, holds the tier's backend) the backend gives way to none, the engine opens again under the same
+     * tier, and later one opened with the three as NULL paths (the stores' flocks are free) is handed over to it */
+    move_store(1, false);
     CHECK(h_open(x, dbdir, NULL) == 0);
     if (!x->db)
         return;
+    eng_close(x->db);
+    x->db = NULL;
+    move_store(1, true);
+    eccache_test_drop(x->t); /* no object stays open through the backend about to close */
+    chunk_be_close(x->t->be);
+    x->t->be = NULL;
+    eccache_set_backend(x->t, NULL);
+    CHECK(h_eng_open(x, dbdir) == 0);
+    if (!x->db) {
+        h_close(x);
+        return;
+    }
     CHECK(attach_all(x->db, false) == (int)nobjs);
-    char log[800];
-    snprintf(log, sizeof log, "%s/err.log", base);
     for (int s = 0; s < NSER; s++) {
         buf o = {0};
         rawctx r = {&o, 8};
@@ -572,7 +605,8 @@ static void case_down(h *x)
     chunk_be_opts bo = {.min_up = 0};
     CHECK(chunk_be_open2(&be, pp, NST, NULL, &bo) == 0);
     if (be) {
-        CHECK(eccache_set_backend(x->t, be) == 0); /* the fallback never opened */
+        x->t->be = be; /* the tier's from here on: its close closes it; from none, so no reader held the old one */
+        eccache_set_backend(x->t, be);
         eccache_counters kd;
         eccache_get_counters(x->t, &kd);
         int unavail = 0;
@@ -593,8 +627,6 @@ static void case_down(h *x)
         CHECK(k.retries == kd.retries); /* an UNAVAILABLE RAW read is not read again whole (seamretryerr) */
     }
     h_close(x);
-    if (be)
-        chunk_be_close(be);
     move_store(0, false);
     move_store(1, false);
     move_store(3, false);

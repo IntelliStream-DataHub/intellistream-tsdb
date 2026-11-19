@@ -54,17 +54,16 @@ uint64_t eccache_resident(const part *p, uint64_t off, uint64_t len);
 int eccache_tier_open(struct tier *t);
 void eccache_tier_close(struct tier *t);
 
-/* The backend the cache reads from. r7-tier hands its per-handle backend over once it is open (owned by the tier, not
- * closed here, and kept open until eccache_tier_close: readers use it without a reference). Until that is merged, and
- * whenever none was handed over, the cache opens one itself at its first use from the tier's configuration
- * (chunk_be_open2 over dirs, min_up = stores - m) and closes it with the tier; a failed open is tried again at most
- * once a second (its error is the reader's). TSDB_ERR_LOCKED once that fallback is open: it is never closed under its
- * readers, and it holds the stores' flocks, so no other backend could have opened beside it. Its stores' states are
- * those of its open for the life of the handle (a store DOWN then stays DOWN): r7-tier's backend replaces it. */
-int eccache_set_backend(struct tier *t, struct chunk_backend *be);
-/* The volume's uuid of chunk identities (META vuuid=, r7-tier); all zero until set. */
-void eccache_set_vuuid(struct tier *t, uint32_t volume, const uint8_t vuuid[16]);
-/* The backend (opened on first use as above; NULL with *rc set when it cannot be) and the volume's uuid. */
+/* The backend the cache reads from: the tier's, handed over by tier_open (owned by the tier, never closed here, and
+ * open until the tier closes, after eccache_tier_close: readers use it without a reference). The cache never opens one
+ * of its own: a store flocks its directory, so one beside the tier's would be BUSY (one backend per handle). Without
+ * one (only test_tier's tierperengine mutant) every read is TSDB_ERR_UNAVAILABLE. Tests may hand another over while no
+ * reader runs. */
+void eccache_set_backend(struct tier *t, struct chunk_backend *be);
+/* The volume's uuid of chunk identities (META vuuid=), handed over by tier_engine_attach; all zero until set (and then
+ * every chunk's identity is wrong). TSDB_ERR_NOMEM fails the engine's open. */
+int eccache_set_vuuid(struct tier *t, uint32_t volume, const uint8_t vuuid[16]);
+/* The backend (NULL with *rc = TSDB_ERR_UNAVAILABLE when none was handed over) and the volume's uuid. */
 struct chunk_backend *eccache_backend(struct tier *t, int *rc);
 void eccache_vuuid(struct tier *t, uint32_t volume, uint8_t out[16]);
 /* r7-gc: the object's chunks are gone; its granules leave the cache (a read in flight finishes and is not cached) and

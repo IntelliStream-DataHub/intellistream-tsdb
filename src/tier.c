@@ -352,6 +352,8 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
         tier_put(t); /* every close, the failed owner's included */
         return rc;
     }
+    /* the cache reads through this backend, never one of its own (its stores' flocks would make that one BUSY) */
+    eccache_set_backend(t, t->be);
     *out = t;
     return 0;
 #endif
@@ -529,6 +531,8 @@ int tier_engine_attach(eng *db)
     db->tier_vol = vol;
     if ((rc = tier_meta_write(db, txt, es->vuuid)) != 0)
         return rc; /* the open fails; its eng_close detaches */
+    if ((rc = eccache_set_vuuid(t, vol, es->vuuid)) != 0)
+        return rc; /* the cache's readers name chunks by the same uuid as their writers */
     chunk_backend *be = t->be;
     if (tier_mutant == TIER_MUT_PERENGINE) {
         chunk_be_opts o = {.min_up = t->cfg.ndirs - t->cfg.m};
