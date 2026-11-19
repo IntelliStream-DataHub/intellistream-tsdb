@@ -58,6 +58,7 @@ table=(
     "opennohold|reopenhold|the leader dropped the file of a COMMIT marker that a restarted replica had not staged"
     "tickstretch|tickwall|a member stopped under writes left the ISR only after [0-9]+ ms"
     "stepcurrentonly|rejoinlate|did not join the ISR again in 30 s"
+    "keepunanswered|failover|the killed old leader was still in the ISR of fo"
     "keepwritten|replicate|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
     "stopnodepose|closegone|its replicas killed: server [0-9]+ still runs [0-9]+ ms after SIGTERM"
     "lateclock|closegone|the leader wrote no WAL record after its driver stopped"

@@ -4346,6 +4346,7 @@ static void vol_watch_duty(void)
                 r->rep[j].node = v->rep[j].node;
                 r->rep[j].rid = v->rep[j].rid;
                 r->rep[j].learner = v->rep[j].learner;
+                r->rep[j].unanswered = v->rep[j].unanswered;
                 snprintf(r->rep[j].peer, sizeof r->rep[j].peer, "%s", mm ? mm->peer : "");
             }
             r->nisr = v->nisr;

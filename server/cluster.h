@@ -197,6 +197,7 @@ struct cluster_vol_rec {
         uint32_t node;
         uint64_t rid;
         uint8_t learner;
+        uint8_t unanswered; /* kept in the ISR by the last promotion without a fence reply (meta.h; repl.h unanswered) */
         char peer[META_ADDR_MAX];
     } rep[META_REPLICAS_MAX];
     uint32_t nisr;

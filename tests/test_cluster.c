@@ -4764,7 +4764,11 @@ static void scen_failover(void)
     scenario("failover");
     for (int i = 0; i < 3; i++)
         start(i);
+    /* isr_lag_ms well above unanswered_ms (1000): the killed old leader, which the promotion keeps in the ISR as
+     * unanswered, must leave it by unanswered_ms, not by the lag rule (design-cluster.md 6.2; mutant keepunanswered) */
+    init_isr_lag_ms = 10000;
     init_cluster(0, 600);
+    init_isr_lag_ms = 0;
     node_add(0, 1);
     node_add(0, 2);
     unsigned want = 3;
@@ -4815,6 +4819,19 @@ static void scen_failover(void)
     if (v.epoch != e0 + 1 || Nw < 0 || Nw == L)
         die("the new record of fo: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
     uint64_t tr = now_ms();
+    /* the promotion kept the dead old leader in the ISR, unanswered: it goes after unanswered_ms (1 s), well before the
+     * lag rule's 10 s would take it (until then it holds the new leader's commit point, its EPOCH marker first) */
+    {
+        uint64_t version;
+        while (isr_of(via, "fo", &version) != 2) {
+            if (now_ms() - tr > 4000)
+                die("the killed old leader was still in the ISR of fo %" PRIu64 " ms after the promotion (unanswered_ms "
+                    "1000, isr_lag_ms 10000)", now_ms() - tr);
+            usleep(50000);
+        }
+        printf("  the killed old leader left the ISR %" PRIu64 " ms after the record named the new leader\n",
+               now_ms() - tr);
+    }
     /* a replica answers reads from what it applied (it may lag the commit point): the new leader's own answer counts,
      * once it leads (after its EPOCH marker is committed and applied, and the engine reopened as the writer) */
     char lead[64];

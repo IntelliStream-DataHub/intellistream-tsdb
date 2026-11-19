@@ -1665,6 +1665,10 @@ static struct repl_vmeta vmeta_of(const struct rvol *rv)
         if (k >= 0) {
             m.isr |= 1u << k;
             m.rid[k] = rv->rec.rep[k].rid;
+            /* without it the core's unanswered_ticks never fires and a dead old leader holds a new leader's commit
+             * point (its EPOCH marker first) for isr_lag_ms (test_cluster failover with isr_lag_ms 10000) */
+            if (rv->rec.rep[k].unanswered)
+                m.unanswered |= 1u << k;
         }
     }
     return m;
