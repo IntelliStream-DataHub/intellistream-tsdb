@@ -41,6 +41,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -5832,12 +5833,21 @@ static void scen_repcheck(void)
     stop_all();
 }
 
+static int rm_one(const char *path, const struct stat *st, int flag, struct FTW *ftw)
+{
+    (void)st, (void)flag, (void)ftw;
+    return remove(path) != 0 && errno != ENOENT ? -1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
     if (argc == 3 && !strcmp(argv[1], "hardslot-child"))
         return hardslot_child(argv[2]);
-    const char *scratch = argc > 1 ? argv[1] : "/tmp";
+    /* TMPDIR when no directory is given: /tmp is often a RAM tmpfs, and a run writes over a GB */
+    const char *scratch = argc > 1 && *argv[1] ? argv[1] : getenv("TMPDIR");
+    if (!scratch || !*scratch)
+        scratch = "/tmp";
     snprintf(root, sizeof root, "%s/tsdb_cluster.XXXXXX", scratch);
     if (!mkdtemp(root)) {
         fprintf(stderr, "test_cluster: mkdtemp %s: %s\n", root, strerror(errno));
@@ -5876,6 +5886,14 @@ int main(int argc, char **argv)
             all[k].fn();
     }
     stop_all();
-    printf("test_cluster: OK (%s)\n", root);
+    /* a passing run removes its directory (a failing one dies above and keeps it for a look);
+       TSDB_KEEP_SCRATCH=1 keeps it */
+    const char *keep = getenv("TSDB_KEEP_SCRATCH");
+    if (keep && *keep && strcmp(keep, "0"))
+        printf("test_cluster: OK (%s kept)\n", root);
+    else if (nftw(root, rm_one, 16, FTW_DEPTH | FTW_PHYS) != 0)
+        printf("test_cluster: OK (could not remove all of %s: %s)\n", root, strerror(errno));
+    else
+        printf("test_cluster: OK\n");
     return 0;
 }
