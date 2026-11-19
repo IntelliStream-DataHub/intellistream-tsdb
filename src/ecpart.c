@@ -18,6 +18,7 @@
  */
 #include "ecpart.h"
 #include "chunk.h"
+#include "tier.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -550,10 +551,8 @@ int ecpart_load(eng *db, const char *name, bool read_only, part **out)
 int ecpart_follower_open(eng *db, const char *name, part **out)
 {
     EC_CALLED(EC_CALL_FOLLOWER_OPEN);
-    (void)db;
-    (void)name;
     *out = NULL;
-    return TSDB_ERR_CORRUPT; /* part_open_as of an .ec file: not a part (the follower keeps its previous view) */
+    return tier_follower_ec(db, name); /* r7-tier: the follower stops with one line (D7) */
 }
 
 bool ec_index_intact(const part *p)

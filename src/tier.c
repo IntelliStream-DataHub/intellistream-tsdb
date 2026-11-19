@@ -8,20 +8,29 @@
  */
 #include "tier.h"
 #include "chunk.h"
+#include "chunk_priv.h"
 #include "eccache.h"
+#include "feed.h"
 #include "ecgc.h"
 #include "eckeep.h"
 #include "ecpart.h"
 #include "ecswap.h"
 #include "settle.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
+#include <unistd.h>
 
 int r7_mutant;
+int tier_mutant;
+
+static void tier_halt(tier *t, int i, const char *why);
 
 void tier_cfg_free(tier_cfg *c)
 {
@@ -189,51 +198,156 @@ out:
     return 0;
 }
 
-int tier_from_strings(const char *spec, const char *iknow, tier_cfg *c)
+/* tier_from_strings, its lines naming the database (dir; NULL: none) */
+static int tier_decide(const char *dir, const char *spec, const char *iknow, tier_cfg *c)
 {
     memset(c, 0, sizeof *c);
     if (!spec || !*spec)
         return 0;
+    const char *sep = dir ? ": " : "";
+    dir = dir ? dir : "";
     if ((!iknow || strcmp(iknow, "1") != 0) && r7_mutant != R7_MUT_TIERLOOSE) {
-        fprintf(stderr, "tsdb: TSDB_TEST_TIER is set but TSDB_TEST_TIER_I_KNOW=1 is not: the tier is a test feature "
-                        "that writes requires=tier into META, which older builds refuse; the open fails (unset "
-                        "TSDB_TEST_TIER, or set TSDB_TEST_TIER_I_KNOW=1 for a test)\n");
+        fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER is set but TSDB_TEST_TIER_I_KNOW=1 is not: the tier is a test "
+                        "feature that writes requires=tier into META, which older builds refuse; the open fails (unset "
+                        "TSDB_TEST_TIER, or set TSDB_TEST_TIER_I_KNOW=1 for a test)\n", dir, sep);
         return TSDB_ERR_INVALID;
     }
     char err[256];
     int rc = tier_cfg_parse(spec, c, err, sizeof err);
     if (rc)
-        fprintf(stderr, "tsdb: TSDB_TEST_TIER: %s: the open fails\n", err);
+        fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: %s: the open fails\n", dir, sep, err);
     return rc;
 }
+
+int tier_from_strings(const char *spec, const char *iknow, tier_cfg *c) { return tier_decide(NULL, spec, iknow, c); }
 
 int tier_from_env(tier_cfg *c)
 {
     return tier_from_strings(getenv("TSDB_TEST_TIER"), getenv("TSDB_TEST_TIER_I_KNOW"), c);
 }
 
+#ifdef TSDB_EC
+/* Whether the store at path holds a volume (an s<number> directory), or might: anything but a clean "no" says yes. */
+static bool store_has_volumes(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d)
+        return errno != ENOENT;
+    bool has = false;
+    struct dirent *e;
+    errno = 0;
+    while ((e = readdir(d)) != NULL)
+        if (e->d_name[0] == 's' && e->d_name[1] >= '0' && e->d_name[1] <= '9') {
+            has = true;
+            break;
+        }
+    if (!e && errno)
+        has = true;
+    closedir(d);
+    return has;
+}
+
+/* Whether the database's root META says requires=tier, or might: anything but a clean "no" (no META yet, or META
+ * without the word) says yes. */
+static bool root_has_tier(const char *dir)
+{
+    char p[PATH_MAX + 8];
+    snprintf(p, sizeof p, "%s/META", dir);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return errno != ENOENT;
+    char txt[512];
+    ssize_t r = read(fd, txt, sizeof txt - 1);
+    close(fd);
+    if (r < 0)
+        return true;
+    txt[r] = '\0';
+    unsigned feats;
+    meta_requires_parse(txt, &feats, NULL, 0);
+    return feats & META_REQ_TIER;
+}
+
+/* The backend. A tier is new while the root's META does not say requires=tier (the root's attach writes it after the
+ * stores were made and before any store holds a volume) and none of its stores holds a volume: the stores without
+ * META are made first (chunk_store_init: the directory, one level of it, and META, all synced), so a power loss
+ * between two of them is finished by the next open. Once the root says requires=tier, or a volume has been raised in
+ * any store, a store without META is a lost disk (a mount that is not there, a disk replaced): DOWN, never made again
+ * here (its chunks are gone; a heal or replace makes it, R15). The stores alone cannot tell: all of them missing or
+ * empty look like a new tier. */
+static int tier_be_open(tier *t, const char *dir)
+{
+    int n = t->cfg.ndirs;
+    const char *const *paths = (const char *const *)t->cfg.dirs;
+    bool fresh = tier_mutant == TIER_MUT_FRESH || !root_has_tier(dir);
+    char meta[PATH_MAX + 8];
+    for (int i = 0; i < n && fresh; i++) {
+        snprintf(meta, sizeof meta, "%s/META", paths[i]);
+        if (access(meta, F_OK) == 0 && store_has_volumes(paths[i]))
+            fresh = false;
+    }
+    for (int i = 0; i < n && fresh; i++) {
+        snprintf(meta, sizeof meta, "%s/META", paths[i]);
+        if (access(meta, F_OK) == 0 || errno != ENOENT)
+            continue;
+        uint8_t id[16];
+        int rc = chunk_store_init(paths[i], NULL, id);
+        if (rc) {
+            fprintf(stderr, "tsdb: %s: the tier's chunk store %d (%s) cannot be made (%s): the open fails\n", dir, i,
+                    paths[i], tsdb_strerror(rc));
+            return rc;
+        }
+    }
+    for (int i = 0; i < n && !fresh; i++) {
+        snprintf(meta, sizeof meta, "%s/META", paths[i]);
+        if (access(meta, F_OK) != 0 && errno == ENOENT)
+            fprintf(stderr, "tsdb: %s: the tier's chunk store %d (%s) has no META, but the tier holds data: a lost "
+                            "disk or a mount that is not there; it is DOWN and not made again\n", dir, i, paths[i]);
+    }
+    chunk_be_opts o = {.min_up = n - t->cfg.m};
+    int rc = tier_mutant == TIER_MUT_STRICT ? chunk_be_open(&t->be, paths, n, NULL)
+                                            : chunk_be_open2(&t->be, paths, n, NULL, &o);
+    if (rc) {
+        t->be = NULL;
+        fprintf(stderr, "tsdb: %s: the tier's chunk stores do not open (%s; %d of %d must be up): the open fails\n",
+                dir, tsdb_strerror(rc), o.min_up, n);
+    }
+    return rc;
+}
+#endif
+
 int tier_open(const char *dir, const tsdb_options *opt, tier **out)
 {
-    (void)opt;
     *out = NULL;
     tier_cfg c;
-    int rc = tier_from_env(&c);
+    int rc = tier_decide(dir, getenv("TSDB_TEST_TIER"), getenv("TSDB_TEST_TIER_I_KNOW"), &c);
     if (rc || !c.set)
         return rc;
 #ifndef TSDB_EC
+    (void)opt;
     fprintf(stderr, "tsdb: %s: TSDB_TEST_TIER is set, but this build has no erasure codec (TSDB_EC): the open fails\n",
             dir);
     tier_cfg_free(&c);
     return TSDB_ERR_INVALID;
 #else
-    (void)dir;
+    if (opt && (opt->read_only || opt->follow)) {
+        /* the writer holds the stores (flock), and a follower does not read .ec parts (D7) */
+        fprintf(stderr, "tsdb: %s: TSDB_TEST_TIER is set on a read-only open or a follower: only a writer opens a "
+                        "tier: the open fails\n", dir);
+        tier_cfg_free(&c);
+        return TSDB_ERR_INVALID;
+    }
     tier *t = calloc(1, sizeof *t);
     if (!t) {
         tier_cfg_free(&c);
         return TSDB_ERR_NOMEM;
     }
     atomic_init(&t->refs, 1);
+    atomic_init(&t->halted, false);
     t->cfg = c;
+    if (tier_mutant != TIER_MUT_PERENGINE && (rc = tier_be_open(t, dir)) != 0) {
+        tier_put(t);
+        return rc;
+    }
     if ((rc = eccache_tier_open(t)) != 0 || (rc = ecgc_tier_open(t)) != 0 || (rc = ecsettle_tier_open(t)) != 0) {
         tier_put(t); /* every close, the failed owner's included */
         return rc;
@@ -257,6 +371,10 @@ void tier_put(tier *t)
     ecsettle_tier_close(t);
     ecgc_tier_close(t);
     eccache_tier_close(t);
+#ifdef TSDB_EC
+    if (t->be)
+        chunk_be_close(t->be);
+#endif
     tier_cfg_free(&t->cfg);
     free(t);
 }
@@ -280,23 +398,222 @@ void tier_want(tier *t, uint32_t vol)
     want_vol = vol;
 }
 
+static int hexval(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; }
+
+/* META's vuuid= line: 1 and *u when there is one, 0 when there is none, TSDB_ERR_CORRUPT when it is not 32 lowercase
+ * hex digits. */
+static int meta_vuuid(const char *txt, uint8_t u[16])
+{
+    for (const char *l = txt; *l;) {
+        if (strncmp(l, "vuuid=", 6) == 0) {
+            const char *h = l + 6;
+            for (int i = 0; i < 16; i++) {
+                int a = hexval(h[2 * i]), b = a < 0 ? -1 : hexval(h[2 * i + 1]);
+                if (b < 0)
+                    return TSDB_ERR_CORRUPT;
+                u[i] = (uint8_t)(a << 4 | b);
+            }
+            return h[32] == '\n' || h[32] == '\0' ? 1 : TSDB_ERR_CORRUPT;
+        }
+        const char *e = strchr(l, '\n');
+        if (!e)
+            break;
+        l = e + 1;
+    }
+    return 0;
+}
+
+static bool random_bytes(uint8_t *b, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = getrandom(b + got, n - got, 0);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0)
+            return false;
+        got += (size_t)r;
+    }
+    return true;
+}
+
+/* META, for the refusals of every engine (with a tier or not) and the tier's vuuid=. */
+static int tier_meta_read(eng *db, char *buf, size_t cap)
+{
+    int fd = openat(db->dirfd, "META", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    ssize_t r = read(fd, buf, cap - 1);
+    close(fd);
+    if (r <= 0)
+        return TSDB_ERR_CORRUPT;
+    buf[r] = '\0';
+    return 0;
+}
+
+/* The engine's META under a tier: vuuid= made once, requires=tier written before anything can name an .ec file (one
+ * rewrite, so a power loss leaves META with both or with neither; an open after it makes them again). */
+static int tier_meta_write(eng *db, const char *txt, uint8_t u[16])
+{
+    unsigned feats;
+    meta_requires_parse(txt, &feats, NULL, 0);
+    int rc = meta_vuuid(txt, u);
+    if (rc < 0) {
+        fprintf(stderr, "tsdb: %s: META's vuuid= line is damaged: the open fails\n", db->dir);
+        return rc;
+    }
+    if (rc == 1 && (feats & META_REQ_TIER))
+        return 0;
+    if (rc == 0 && !random_bytes(u, 16)) {
+        fprintf(stderr, "tsdb: %s: no random bytes for the volume's uuid: the open fails\n", db->dir);
+        return TSDB_ERR_IO;
+    }
+    char line[48];
+    int n = snprintf(line, sizeof line, "vuuid=");
+    for (int i = 0; i < 16; i++)
+        n += snprintf(line + n, sizeof line - (size_t)n, "%02x", u[i]);
+    snprintf(line + n, sizeof line - (size_t)n, "\n");
+    if ((rc = meta_tier_require(db->dirfd, db->opt.fsync, line)) != 0)
+        fprintf(stderr, "tsdb: %s: META could not be given requires=tier and vuuid= (%s): the open fails\n", db->dir,
+                tsdb_strerror(rc));
+    return rc;
+}
+
 int tier_engine_attach(eng *db)
 {
     tier *t = want_tier;
+    uint32_t vol = want_vol;
     want_tier = NULL; /* taken once: an engine opened inside this open (none today) does not attach to it */
+    char txt[512];
+    int rc = tier_meta_read(db, txt, sizeof txt);
+    if (rc)
+        return rc; /* meta_load_or_create read it a moment ago */
+    unsigned feats;
+    meta_requires_parse(txt, &feats, NULL, 0);
+    bool ro = db->opt.read_only || db->opt.follow;
+    if (feats & META_REQ_TIER) {
+#ifndef TSDB_EC
+        if (tier_mutant == TIER_MUT_NOEC)
+            return 0; /* planted: the volume opens as if its .ec parts were not there */
+        fprintf(stderr, "tsdb: %s: META says requires=tier (the volume may hold erasure-coded parts), but this "
+                        "build has no erasure codec (TSDB_EC): the open fails\n", db->dir);
+        return TSDB_ERR_INVALID;
+#endif
+        if (ro) {
+            fprintf(stderr, "tsdb: %s: META says requires=tier: a follower or a read-only open does not read "
+                            "erasure-coded parts: the open fails\n", db->dir);
+            return TSDB_ERR_INVALID;
+        }
+        if (!t) {
+            fprintf(stderr, "tsdb: %s: META says requires=tier, but no tier is configured (TSDB_TEST_TIER with "
+                            "TSDB_TEST_TIER_I_KNOW=1): the open fails\n", db->dir);
+            return TSDB_ERR_INVALID;
+        }
+    }
     if (!t)
         return 0;
+    if ((feats & (META_REQ_CLUSTER | META_REQ_REPLICA)) || db->replica_req) {
+        fprintf(stderr, "tsdb: %s: a tier on a cluster volume (META requires=cluster or replica) is not built yet "
+                        "(R8): the open fails\n", db->dir);
+        return TSDB_ERR_INVALID;
+    }
+    if (ro) { /* tier_open refuses these; an engine opened read-only under a writer's tier is the same mistake */
+        fprintf(stderr, "tsdb: %s: a read-only open under a tier: the open fails\n", db->dir);
+        return TSDB_ERR_INVALID;
+    }
     struct ecstate *es = calloc(1, sizeof *es);
     if (!es)
         return TSDB_ERR_NOMEM;
     db->ecstate = es;
     db->tier = tier_get(t);
-    db->tier_vol = want_vol;
-    int rc;
+    db->tier_vol = vol;
+    if ((rc = tier_meta_write(db, txt, es->vuuid)) != 0)
+        return rc; /* the open fails; its eng_close detaches */
+    chunk_backend *be = t->be;
+    if (tier_mutant == TIER_MUT_PERENGINE) {
+        chunk_be_opts o = {.min_up = t->cfg.ndirs - t->cfg.m};
+        if ((rc = chunk_be_open2(&es->mut_be, (const char *const *)t->cfg.dirs, t->cfg.ndirs, NULL, &o)) != 0) {
+            es->mut_be = NULL;
+            fprintf(stderr, "tsdb: %s: the tier's chunk stores do not open (%s): the open fails\n", db->dir,
+                    tsdb_strerror(rc));
+            return rc;
+        }
+        be = es->mut_be;
+    }
+    /* D4: the chunk epoch is the constant 1, given as the authoritative one at every open: it clears a volume whose
+     * EPOCH lost a slot (a torn store), which would refuse every put. The call does not reach every store: the
+     * backend's fence is the highest epoch any store holds, so a store behind it (a power cut before its EPOCH was
+     * stored, or a store that failed to take it at an earlier open) is not raised, and not every error fails the store
+     * (a mkdir of s<N> refused leaves it UP). So each store UP is raised by itself where it does not hold the epoch:
+     * one that still does not halts the tier (no put may reach a store without its fence); none holding it fails the
+     * open. */
+    if (be && tier_mutant != TIER_MUT_UNSURE) {
+        rc = chunk_be_see_epoch(be, vol, 1);
+        if (rc == TSDB_ERR_NOMEM)
+            return rc;
+        int held = tier_mutant == TIER_MUT_FENCE; /* planted: the call's word taken for every store */
+        for (int i = 0; i < chunk_be_nstores(be) && tier_mutant != TIER_MUT_FENCE; i++) {
+            chunk_store *st = chunk_be_store(be, i);
+            if (chunk_be_store_state(be, i) != CHUNK_STORE_UP || !st || chunk_store_failed(st))
+                continue; /* tier_writable halts for these */
+            bool has = chunk_store_epoch(st, vol) >= 1 && !chunk_store_epoch_unsure(st, vol);
+            if (!has && chunk_store_raise(st, vol, 1) == 0)
+                has = chunk_store_epoch(st, vol) >= 1 && !chunk_store_epoch_unsure(st, vol);
+            if (has)
+                held++;
+            else
+                tier_halt(t, i, "did not take the volume's epoch at its open");
+        }
+        if (held == 0) {
+            fprintf(stderr, "tsdb: %s: no chunk store of the tier holds the epoch of volume %u (%s): the open fails\n",
+                    db->dir, vol, rc ? tsdb_strerror(rc) : "none is up and not failed");
+            return rc ? rc : TSDB_ERR_IO;
+        }
+    }
+    if (be)
+        (void)tier_writable(t); /* a store DOWN at open: the line now, not at the first settle */
     if ((rc = ecgc_eng_open(db)) != 0 || (rc = eckeep_eng_open(db)) != 0 || (rc = ecsettle_eng_open(db)) != 0 ||
         (rc = ecswap_eng_open(db)) != 0)
         return rc; /* the open fails; its eng_close detaches */
     return 0;
+}
+
+struct chunk_backend *tier_backend(const tier *t) { return t ? t->be : NULL; }
+
+const uint8_t *tier_vuuid(const eng *db) { return db->ecstate ? db->ecstate->vuuid : NULL; }
+
+static void tier_halt(tier *t, int i, const char *why)
+{
+    if (!atomic_exchange(&t->halted, true))
+        fprintf(stderr, "tsdb: tier store %d (%s) %s: settles and chunk deletes stop for this tier until it is opened "
+                        "again; reads go on\n", i, t->cfg.dirs[i], why);
+}
+
+bool tier_writable(tier *t)
+{
+    if (!t || !t->be)
+        return false;
+    if (atomic_load(&t->halted))
+        return false;
+    for (int i = 0; i < chunk_be_nstores(t->be); i++) {
+        int st = chunk_be_store_state(t->be, i);
+        if (st == CHUNK_STORE_UP)
+            continue;
+        char why[64];
+        snprintf(why, sizeof why, "is %s", chunk_store_state_name(st));
+        tier_halt(t, i, why);
+        return false;
+    }
+    return true;
+}
+
+int tier_follower_ec(eng *db, const char *name)
+{
+    char what[160];
+    snprintf(what, sizeof what, "reading %s, an erasure-coded part MANIFEST names (followers do not read them)",
+             name);
+    eng_fail(db, what, ENOTSUP);
+    return TSDB_ERR_IO; /* follow_refresh passes it up: CORRUPT or INVALID would add "keeping the previous view" */
 }
 
 void tier_engine_detach(eng *db)
@@ -307,6 +624,8 @@ void tier_engine_detach(eng *db)
         eckeep_eng_close(db);
         ecgc_eng_close(db);
     }
+    if (db->ecstate && db->ecstate->mut_be)
+        chunk_be_close(db->ecstate->mut_be);
     free(db->ecstate);
     db->ecstate = NULL;
     tier_put(db->tier);
