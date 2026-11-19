@@ -108,6 +108,8 @@ struct ecpart {
     struct tier *tier;
     uint32_t volume;
     bool test_mark;
+    /* r7-ecfile: where the open found the record in the .ec file and its hash (ec_index_intact checks it again) */
+    uint64_t rec_off, rec_len, rec_hash;
 };
 
 /* ------------------------------------------------------------ r7-ecfile: prototypes (src/ecpart.c) */
@@ -122,6 +124,17 @@ int ec_index_write(eng *db, const part *src, const ec_record *r, char tmp[96]);
 /* Opens an .ec file as a part (p->ec set, p->verify true: E11): the source's header and footer hash, the trailer,
  * the record's hash, and the record against the footer and the name (rows, time range, block range). */
 int part_open_ec(eng *db, const char *file, const char *name, part **out);
+
+/* r7-ecfile's planted bugs (tests/test_ecpart.c --mutant NAME; the Makefile requires each to fail it): the open checks
+ * no hash (neither the source's nor the record's); the open leaves wal_seq 0 (a WAL segment replays into a partition an
+ * .ec part holds); load_parts leaves .ec files alone (ecpart_load lists nothing); the open leaves fno_lo, fno_hi 0
+ * (fno_next does not count the .ec part's numbers); the open does not check where the index places each granule
+ * (overlapping granules, or one past the object's data, are opened) */
+enum { EC_MUT_NONE = 0, EC_MUT_NOHASH, EC_MUT_NOWALSEQ, EC_MUT_SKIPNAME, EC_MUT_NOFNO, EC_MUT_NOLAYOUT };
+extern int ecpart_mutant;
+/* Test hook: ecpart_load takes every volume as one whose META says requires=tier (r7-tier writes the word, and refuses
+ * it without a configured tier; tests of the .ec file itself run without one). */
+extern atomic_bool ec_test_assume_tier;
 
 /* ------------------------------------------------------------ stubs r7-iface left (src/ecpart.c, r7-ecfile fills) */
 /* load_parts met `name` (ec_file_name): *out a part to list (or NULL to leave the file alone). Stub: a line naming the
