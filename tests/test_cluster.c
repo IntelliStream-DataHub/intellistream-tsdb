@@ -5080,7 +5080,7 @@ static void scen_ackdurable(void)
             die("server %d ended with status %d after the power loss, expected 99 (crashfs)", R, st);
     }
     signal_child(pids[L], SIGUSR2); /* and the leader's, at its next append */
-    struct rep_writer w2 = {cports[L], id, 1000 + 1000LL * (ACKED + 1), 1, 0, 0, 0};
+    struct rep_writer w2 = {cports[L], id, 1000 + 1000LL * (ACKED + 1), 1, 0, 0, 0, 0};
     if (pthread_create(&th2, NULL, rep_write_thread, &w2) != 0)
         die("pthread_create");
     int st = await_exit(L, 15000);

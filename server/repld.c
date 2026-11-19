@@ -250,6 +250,7 @@ enum {
     RM_KEEPWRITTEN,
     RM_FASTRIDE,
     RM_NOJOINHOLD,
+    RM_KEEPUNANSWERED, /* unanswered_ticks 0: a member a promotion kept unanswered goes only by the lag rule */
     RM_INBOXSTARVE,
     RM_OPENNOHOLD,
     RM_TICKSTRETCH,
@@ -2119,6 +2120,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "shipnoisr")      ? RM_SHIPNOISR
                : !strcmp(mu, "fastride")       ? RM_FASTRIDE
                : !strcmp(mu, "nojoinhold")     ? RM_NOJOINHOLD
+               : !strcmp(mu, "keepunanswered") ? RM_KEEPUNANSWERED
                : !strcmp(mu, "inboxstarve")    ? RM_INBOXSTARVE
                : !strcmp(mu, "opennohold")     ? RM_OPENNOHOLD
                : !strcmp(mu, "tickstretch")    ? RM_TICKSTRETCH
@@ -2218,6 +2220,9 @@ static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struc
                               .idle_heartbeat_ticks = IDLE_HEARTBEAT_MS / TICK_MS,
                               .floor_ticks = 1000 / TICK_MS, .max_batch = 1u << 30, .window = 1u << 30,
                               .join_hold_ticks = G.mutant == RM_NOJOINHOLD ? 0 : lag / TICK_MS,
+                              /* a member a promotion kept unanswered (§6.2) goes after unanswered_ms, not isr_lag */
+                              .unanswered_ticks =
+                                  G.mutant == RM_KEEPUNANSWERED ? 0 : (r->unanswered_ms + TICK_MS - 1) / TICK_MS,
                               .rec_find = idx_find, .ctx = rv};
     *core_out = repl_open(&cfg, &d);
     rv->sync_pause_end = now_ms() + SYNC_PAUSE_MS;
