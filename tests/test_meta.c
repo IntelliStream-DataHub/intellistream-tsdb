@@ -720,8 +720,8 @@ static void test_shared(void)
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->leader == other);
     }
 
-    /* the epoch bound (D10: 2^22, what the engine takes): a grant whose reservation would reach 2^22 - 1 is refused with its own code; VOLUME_SELF may
-     * reach 2^22 - 2 and no further */
+    /* the epoch bound (D10: 2^22, what the engine takes): a grant whose reservation would reach 2^22 - 1 is refused
+     * with its own code; VOLUME_SELF may reach 2^22 - 2 and no further */
     {
         uint32_t n3[3] = {1, 2, 3};
         vol_add(&e, META_VOL_SHARED, 1, "s1", 1, n3, 3); /* its own volume: the bound is far from volume 0's epochs */

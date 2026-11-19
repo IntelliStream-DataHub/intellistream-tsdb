@@ -2258,7 +2258,8 @@ int repld_open(const struct cluster_vol_rec *r)
     pthread_mutex_init(&rv->mu, NULL);
     pthread_cond_init(&rv->cv, NULL);
     pthread_cond_init(&rv->in_space, NULL);
-    rv->ops = (struct jr_ops){.ctx = rv, .ship = op_ship, .ship_wait = op_ship_wait, .admit = op_admit, .bytes = op_bytes, .synced = op_synced};
+    rv->ops = (struct jr_ops){.ctx = rv, .ship = op_ship, .ship_wait = op_ship_wait, .admit = op_admit,
+                              .bytes = op_bytes, .synced = op_synced};
     int dfd = open(rv->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     bool torn = false;
     int rc = dfd < 0 ? TSDB_ERR_IO : replfile_load(dfd, &rv->rf, &rv->st, &torn);

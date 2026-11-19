@@ -22,8 +22,8 @@
  * state first and the entries after it. An entry whose index does not follow is a broken stream: reconnect. A core
  * server that has known no leader for NOLEADER_PROBE_NS (one booted from its files at start: until its own state
  * holds it) watches as well (into a second state); if what it sees is a configuration without itself, it was removed
- * while away, and it drops its core (its files stay) and goes on as a watcher. So does a core whose own configuration has not held
- * it for NOTMEMBER_DROP_NS.
+ * while away, and it drops its core (its files stay) and goes on as a watcher. So does a core whose own configuration
+ * has not held it for NOTMEMBER_DROP_NS.
  *
  * Durability: every action of the core is done inline, in its order (the hard state saved and synced, the log synced
  * through raft_log_sync_prepare / raft_log_sync_run, sends, applies). Metadata changes are rare (tens a minute), so

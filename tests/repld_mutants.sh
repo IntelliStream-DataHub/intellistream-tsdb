@@ -24,7 +24,9 @@
 # stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick). Two are tsdbd's, read by
 # it under the same name: nomoved (a write to a non-leader refused UNAVAILABLE, not MOVED) failover; deposemoved (a
 # write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose. fencenosync (a
-# FENCE_REPLY sent with the raised fence not in REPL) fencecrash.
+# FENCE_REPLY sent with the raised fence not in REPL) fencecrash. One is the volume manager's (server/cvol.c,
+# TSDB_CVOL_MUTANT, set to the same name): refusedsilent (a volume the server refused is left out of its heartbeat
+# report, not LOCAL_FAULT) refused.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -67,6 +69,7 @@ table=(
     "syncbyrep|writersync|writersync: batch [0-9]+, a write from connection [0-9]+: .*its commit point stayed below"
     "nomoved|failover|a write to a replica after the failover: .*not MOVED"
     "deposemoved|writerdepose|the write waiting for the commit point on the failed writer got"
+    "refusedsilent|refused|the refused volume was not reported"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
 all=
@@ -84,7 +87,7 @@ for m in $muts; do
     fi
     rest=${row#*|}; s=${rest%%|*}; want=${rest#*|}
     log="$dir/mut-$m-$s.log"
-    TSDB_REPLD_MUTANT=$m timeout 600 ./build/test_cluster "$dir" "$s" > "$log" 2>&1
+    TSDB_REPLD_MUTANT=$m TSDB_CVOL_MUTANT=$m timeout 600 ./build/test_cluster "$dir" "$s" > "$log" 2>&1
     rc=$?
     fail=$(grep -m1 FAIL "$log")
     if [ $rc -ne 0 ] && grep -m1 FAIL "$log" | grep -qE "$want"; then

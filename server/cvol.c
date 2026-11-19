@@ -89,7 +89,7 @@ static struct {
     struct mvol vols[CLUSTER_REPORT_VOLS]; /* what this manager made of them; under mu */
     uint32_t nvols;
     int writes;  /* TSDB_CLUSTER_WRITES=1 */
-    int mutant;  /* 1 noopengen, 3 anynonce (the others are cvolfs.h's) */
+    int mutant;  /* 1 noopengen, 3 anynonce, 4 refusedsilent (the others are cvolfs.h's) */
     int stale_first; /* TSDB_CLUSTER_TEST stale_first_watch=1, until the first push */
 } M = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
@@ -245,13 +245,15 @@ static void on_report(void *arg, struct cluster_report *out)
     pthread_mutex_lock(&M.mu);
     for (uint32_t i = 0; i < M.nvols && out->nvols < CLUSTER_REPORT_VOLS; i++) {
         const struct mvol *m = &M.vols[i];
-        if (m->state != MV_WAIT && m->state != MV_OPEN)
+        /* a refused volume (no valid REPL, an older copy, a failed open) is LOCAL_FAULT, D13: when this server leads
+         * it, nothing else would tell the group (the server is up, and no driver runs to resign) */
+        if (m->state == MV_NONE || (m->state == MV_REFUSED && M.mutant == 4))
             continue;
         struct cluster_vol_report *v = &out->vols[out->nvols++];
         v->volume = m->number;
         int writer = m->writer || (m->state == MV_OPEN && tsdb_cvol_role(M.t, m->number) == CVOL_WRITER);
         v->role = m->state == MV_OPEN && writer ? CL_ROLE_OWNER : CL_ROLE_NONE;
-        v->health = CL_HEALTH_OK;
+        v->health = m->state == MV_REFUSED ? CL_HEALTH_LOCAL_FAULT : CL_HEALTH_OK;
         v->epoch = m->epoch;
         v->rid = m->rid;
         v->open_gen = m->gen;
@@ -357,7 +359,10 @@ int cvol_start(tsdb *t, const char *dir)
     while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
         ;
     const char *mu = getenv("TSDB_CVOL_MUTANT");
-    M.mutant = mu && !strcmp(mu, "noopengen") ? 1 : mu && !strcmp(mu, "anynonce") ? 3 : 0;
+    M.mutant = mu && !strcmp(mu, "noopengen")       ? 1
+               : mu && !strcmp(mu, "anynonce")      ? 3
+               : mu && !strcmp(mu, "refusedsilent") ? 4
+                                                    : 0;
     cvolfs_test_mutant = !mu                         ? CVOLFS_MUT_NONE
                          : !strcmp(mu, "samerid")     ? CVOLFS_MUT_SAMERID
                          : !strcmp(mu, "replnonce")   ? CVOLFS_MUT_REPLNONCE

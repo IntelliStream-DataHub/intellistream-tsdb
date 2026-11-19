@@ -8,7 +8,8 @@
 # and version instead of the request's) isr, upwaits (a new Raft leader records a restarted member's incarnation only
 # after node_timeout, so a restarted volume leader's RESIGN waits for detection) resign, cutshrinks (a leader cut from
 # its replicas on the data links shrinks the ISR to itself instead of stepping aside) cut, probelate (a core restarted
-# at another peer address learns the others' addresses only after NOLEADER_PROBE_NS, 10 s) resign. Usage: tests/lease_mutants.sh SCRATCH [MUTANT...]
+# at another peer address learns the others' addresses only after NOLEADER_PROBE_NS, 10 s) resign.
+# Usage: tests/lease_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb).
 set -u
 dir=${1:-/tmp}; shift || true
