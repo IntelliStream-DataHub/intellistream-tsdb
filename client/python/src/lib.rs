@@ -501,7 +501,9 @@ impl Client {
     /// The nodes and volumes the server lists (protocol 13): a dict with generation, nodes (dicts of node_id,
     /// alive, addr; addr "" is the node that answered) and volumes (dicts of volume, role, health, epoch,
     /// reason, domain, since_ms, owner, server, addr and path; path only for a superuser). A single server
-    /// lists itself and every volume it serves.
+    /// lists itself and every volume it serves. On a cluster node every volume has one entry per replica: owner
+    /// and addr are that entry's member (its node id and client address), so the leader is the entry whose role
+    /// is OWNER.
     ///
     /// Raises:
     ///     TsdbError: The client is closed or the call failed.

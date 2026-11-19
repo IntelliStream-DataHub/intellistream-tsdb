@@ -39,9 +39,10 @@ public record Topology(long generation, List<Node> nodes, List<Vol> volumes) {
      * @param reason {@code TSDB_WHY_*} when not available
      * @param domain the storage domain, 0xffff when unknown
      * @param sinceMs since when the health has held, ms
-     * @param owner the owner's node id
+     * @param owner the node id of this entry's member: the owner for an OWNER entry; on a cluster node a STANDBY or
+     *        FOLLOWER entry names its replica (the volume's leader is the entry whose role is OWNER)
      * @param server the server (a node's index)
-     * @param addr the owner's address, empty: this node
+     * @param addr the client address of this entry's member, empty: this node
      * @param path the volume's directory; empty unless the user is a superuser
      */
     public record Vol(int vol, int role, int health, long epoch, int reason, int domain, long sinceMs, long owner,
