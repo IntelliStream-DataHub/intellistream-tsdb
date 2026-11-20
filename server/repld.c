@@ -2127,6 +2127,8 @@ static int links_up(const struct cluster_vol_rec *r)
 void repld_init(tsdb *t, const char *dir)
 {
     const char *mu = getenv("TSDB_REPLD_MUTANT");
+    if (mu && !strcmp(mu, "replicadropsfloor")) /* the engine's mutant (src/replica.c), planted in tsdbd */
+        tsdb_test_replica_drops_floor();
     G.mutant = !mu                              ? RM_NONE
                : !strcmp(mu, "commitbyleader") ? RM_COMMITBYLEADER
                : !strcmp(mu, "ackbeforesync")  ? RM_ACKBEFORESYNC

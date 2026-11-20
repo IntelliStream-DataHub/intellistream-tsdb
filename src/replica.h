@@ -45,6 +45,9 @@ int replica_floor_saved(struct eng *db, uint64_t floor);
  * replica_keep_next sets them for the next eng_open_replica on this thread (its open flushes what it replays). */
 void replica_keep_cap(struct eng *db, uint64_t max_bytes, uint64_t max_ms);
 void replica_keep_next(uint64_t max_bytes, uint64_t max_ms);
+/* tests: plants mutant replicadropsfloor (a replica's flushed segments go by the floor alone) in this process; tsdbd
+ * calls it for TSDB_REPLD_MUTANT=replicadropsfloor (tests/test_cluster.c failoverkeep) */
+void tsdb_test_replica_drops_floor(void);
 /* Cuts the log after position `last` (a record end, or 0): the segment that holds it is truncated there, later
  * segments are removed, the cut is durable before it returns. TSDB_ERR_CORRUPT (nothing changed) when `last` is below
  * the applied end (the core never asks: damage or a bug) or is not a record end. */

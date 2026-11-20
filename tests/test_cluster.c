@@ -4880,6 +4880,122 @@ static void scen_failover(void)
            total);
 }
 
+/* failoverkeep: a replica keeps its flushed segments under the retention caps past its commit floor (design-cluster.md
+ * 8.3), so that, promoted, it can serve a member that was away. R is killed, the leader L writes and flushes segments
+ * past it (B, the other replica, flushes them too and its floor passes them), L is killed and B leads; R back must catch
+ * up from B's segments and join the ISR, never be told it needs a snapshot (jepsen-cluster partition, fHdR4T: a
+ * promoted replica had unlinked what a laggard still needed). Mutant replicadropsfloor (the floor alone again). */
+static void scen_failoverkeep(void)
+{
+    scenario("failoverkeep");
+    /* two witnesses (servers 3, 4): five voters, so the metadata group keeps a majority with L and R down, and the
+     * volume's replicas are on servers 0-2 */
+    for (int i = 3; i < 5; i++) {
+        is_witness[i] = 1;
+        xargs[i] = "--peer-port 0";
+        char wdir[PATH_MAX + 160];
+        snprintf(wdir, sizeof wdir, "%s/n%d", base, i);
+        if (mkdir(wdir, 0755) != 0)
+            die("mkdir %s: %s", wdir, strerror(errno));
+    }
+    for (int i = 0; i < 5; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters (two witnesses)");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "fk", 3, &num)) != 0 || num != 1)
+        die("volume add fk: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fk", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "fk", &v))
+        die("no record of fk");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of fk is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "fk", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    uint64_t rows = 0;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    rows++;
+    await_isr(L, "fk", 3, 5000, "every replica up");
+    int R = (L + 1) % 3, B = (L + 2) % 3;
+    stop(R, SIGKILL);
+    await_isr(L, "fk", 2, 10000, "a replica killed");
+    int64_t t = 10000;
+    for (int k = 0; k < 5; k++) {
+        int64_t tv[100];
+        float vv[100];
+        for (int j = 0; j < 100; j++)
+            tv[j] = t++, vv[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, tv, vv, 100)) != 0)
+            die("a write with a replica away: %s", ers(rc));
+        rows += 100;
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush: %s", ers(rc));
+    }
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0) /* a commit after the last flush: B's floor passes them */
+        die("a write with a replica away: %s", ers(rc));
+    rows++;
+    tsdbc_close(c);
+    struct timespec s1 = {1, 0};
+    nanosleep(&s1, NULL);
+    int nb = wal_count(B, 1);
+    stop(L, SIGKILL);
+    uint64_t tk = now_ms();
+    for (;;) {
+        if (vol_rec(B, "fk", &v) && v.leader == ids[B] && v.epoch > e0)
+            break;
+        if (now_ms() - tk > 30000)
+            die("server %d was not promoted 30 s after the leader was killed (epoch %" PRIu64 ", leader %u)", B, v.epoch,
+                v.leader);
+        usleep(20000);
+    }
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(B, lead, 1, 30000);
+    start(R);
+    uint64_t t0 = now_ms();
+    for (;;) {
+        if (log_has(R, "it needs a snapshot"))
+            die("the replica away during the failover was told it needs a snapshot by the promoted leader (which held %d"
+                " WAL segments before the failover)", nb);
+        int in = 0;
+        if (vol_rec(B, "fk", &v))
+            for (uint32_t k = 0; k < v.nisr; k++)
+                in |= v.isr[k] == ids[R];
+        if (in)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("the replica away during the failover did not join the new leader's ISR in 30 s");
+        usleep(50000);
+    }
+    c = client(B);
+    tsdbc_set_retry(c, 10000);
+    t++;
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0)
+        die("a write to the new leader: %s", ers(rc));
+    rows++;
+    if ((uint64_t)rows_of(c, id) != rows)
+        die("the new leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
+    tsdbc_close(c);
+    start(L);
+    await_isr(B, "fk", 3, 60000, "the old leader back");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {rows, 0, 0, 0};
+    rep_same(wantr, "after a clean stop");
+    printf("  the promoted replica had kept %d WAL segments past its floor; the member away caught up from them and "
+           "every server holds the same %" PRIu64 " rows\n", nb, rows);
+}
+
 /* D13: an engine failure (EIO on a WAL fdatasync, crashfs) of one replica of a cluster volume stops that volume
  * there, quiesced and reported LOCAL_FAULT in the server's heartbeat; the server itself goes on (its root answers)
  * and exits cleanly on SIGTERM. Without D13 tsdbd exits with status 1 on any failed volume outside a domain. */
@@ -7116,7 +7232,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

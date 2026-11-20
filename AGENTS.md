@@ -392,6 +392,9 @@ cgroup, so `nice` does not keep your work out of its way.
   segments for the replicas (`eng_leader_keep`): one goes only once its last position is at or below min(the driver's
   keep bound, the commit point), after `fno_require`, by its own name (`lk_unlink_upto`: kept numbers jump at a promotion,
   so never through `wal_unlink_upto`'s run of consecutive ones); `wal_removed` never passes one still on disk.
+  A replica keeps its flushed segments as well, past its saved commit floor, under the same caps (`replica_keep_cap`,
+  `replica_keep_next` before its open; `unl_cap_bound` counts from the newest back), so that, promoted, it can serve a
+  member that was away (`test_cluster failoverkeep`, mutant `replicadropsfloor`); never one above the floor.
   Kept segments (a leader's flushed ones, a promoted replica's) are named in RSTATE (`kept`, saved before a drop can
   take their rows out of parts): a writer's open neither replays nor removes a segment at or below it.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never

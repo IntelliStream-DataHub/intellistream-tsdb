@@ -26,7 +26,8 @@
 # write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose. fencenosync (a
 # FENCE_REPLY sent with the raised fence not in REPL) fencecrash. One is the volume manager's (server/cvol.c,
 # TSDB_CVOL_MUTANT, set to the same name): refusedsilent (a volume the server refused is left out of its heartbeat
-# report, not LOCAL_FAULT) refused.
+# report, not LOCAL_FAULT) refused. One is the engine's (src/replica.c, planted by tsdbd under the same name):
+# replicadropsfloor (a replica's flushed segments go once its floor passes them, the retention caps ignored) failoverkeep.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -55,6 +56,7 @@ table=(
     "noinboxbound|backpressure|the stalled replica held the leader's whole stream in its inbox"
     "nospill|backpressure|a replica received a part above the spill threshold into memory"
     "keepignorespeers|keepfloor|the leader keeps [0-9]+ WAL segments, not the 5 flushed ones a replica away has not acked"
+    "replicadropsfloor|failoverkeep|the replica away during the failover was told it needs a snapshot"
     "fastride|rejoin|did not join the ISR again in 30 s"
     "nojoinhold|rejoinsteady|did not join the ISR again in 30 s"
     "inboxstarve|rejoinslow|the leader dropped the healthy replica from the ISR while another"

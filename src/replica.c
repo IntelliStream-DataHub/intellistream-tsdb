@@ -498,6 +498,11 @@ void replica_keep_next(uint64_t max_bytes, uint64_t max_ms)
     keep_next.ms = max_ms;
 }
 
+void tsdb_test_replica_drops_floor(void)
+{
+    eng_test_mutant = MUT_REPLICA_KEEP_FLOOR;
+}
+
 void replica_keep_cap(eng *db, uint64_t max_bytes, uint64_t max_ms)
 {
     struct replica *rp = db->rp;
