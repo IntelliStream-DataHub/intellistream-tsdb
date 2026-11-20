@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #include "chunk.h"
 #include "chunk_priv.h"
+#include "ecgc.h"
 #include "feed.h"
 #include "tier.h"
 #include "tsdb.h"
@@ -893,6 +894,9 @@ static void t_follow(void)
 
 int main(int argc, char **argv)
 {
+    /* the objects here are put straight into the stores, named by no .ec file: a reopen's sweep (R7 D6) would delete
+     * them as orphans (eio reads one back after a reopen); test_ecgc tests the sweep. Before the child too. */
+    atomic_store(&ecgc_test_nosweep, true);
     for (size_t i = 0; i < sizeof OBJ; i++) /* before the child too: it compares what it reads with OBJ */
         OBJ[i] = (uint8_t)(i * 131 + 7);
 #ifdef TSDB_EC

@@ -157,7 +157,8 @@ void chunk_wr_abort(chunk_wr *w);
 int chunk_store_put(chunk_store *st, const chunk_ident *id, const chunk_geom *g, uint64_t epoch, const void *cells,
                     const uint64_t *sums);
 /* Deletes the chunk (a missing one is TSDB_ERR_NOTFOUND). Refused below the volume's epoch, and below the epoch the
- * chunk's header records (E14); the unlink is followed by a directory fsync (fail-stop). */
+ * chunk's header records (E14); the unlink is followed by a directory fsync (fail-stop). A chunk whose header names
+ * another volume uuid than id->vuuid is not the one asked for: TSDB_ERR_NOTFOUND, and it stays (r7-gc). */
 int chunk_store_del(chunk_store *st, const chunk_ident *id, uint64_t epoch);
 
 /* A chunk open for reading. open() checks everything but the cells (header, size, sums table, footer, identity):
@@ -178,6 +179,7 @@ typedef struct chunk_listed {
     uint16_t pos;
     uint64_t size;
     uint64_t epoch;
+    uint8_t vuuid[16]; /* the header's volume uuid (status OK) */
     int status; /* CHUNK_ST_OK, DAMAGED (header or, with verify, footer or sums bad), IOERR */
     int store;  /* chunk_be_list: the index of the store it is in */
 } chunk_listed;
@@ -247,6 +249,8 @@ int chunk_be_rd_open(chunk_backend *be, const chunk_ident *id, chunk_rd **out);
  * fewer than k' positions left, which heal never rebuilds from; E14 removes it, never this layer). */
 int chunk_be_del(chunk_backend *be, const chunk_ident *id, uint64_t epoch);
 int chunk_be_list(chunk_backend *be, uint32_t volume, bool verify, chunk_list_fn fn, void *ctx);
+/* Names only (oid, pos, store): no chunk file is opened, so size, epoch and vuuid are 0 and status is CHUNK_ST_OK. */
+int chunk_be_list_names(chunk_backend *be, uint32_t volume, chunk_list_fn fn, void *ctx);
 
 /* ---------------------------------------------------------------- heal, attach, replace (§5.5, §5.9, E55) */
 /* A chunk that is missing or damaged in a store is rebuilt, never edited: the position's cells are decoded from k'

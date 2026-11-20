@@ -295,7 +295,7 @@ void part_unref(part *p)
     munmap((void *)p->map, p->map_len);
     free(p->icopy);
     free(p->lf);
-    if (atomic_load(&p->obsolete)) {
+    if (atomic_load(&p->obsolete) && !ecgc_owns_name(p)) { /* an .ec part's name goes after its chunks (r7-gc) */
         char retired[sizeof p->name + 8];
         if (p->retired)
             snprintf(retired, sizeof retired, "retired_%s", p->name);

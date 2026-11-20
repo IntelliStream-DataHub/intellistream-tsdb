@@ -893,6 +893,8 @@ int chunk_store_del(chunk_store *st, const chunk_ident *id, uint64_t epoch)
                 int hr = rd_full(fd, hb, sizeof hb, 0);
                 if (hr != 0)
                     rc = hr;
+                else if (chunk_hdr_decode(hb, &h) == 0 && memcmp(h.vuuid, id->vuuid, 16) != 0)
+                    rc = TSDB_ERR_NOTFOUND; /* another volume's chunk (two databases on one set of stores): not ours */
                 else if (chunk_hdr_decode(hb, &h) == 0 && epoch < h.epoch && chunk_mutant != CHUNK_MUT_NOFENCE)
                     rc = CHUNK_ERR_FENCED; /* a delete below the chunk's own writer epoch (E14) */
             }
@@ -1030,7 +1032,9 @@ int chunk_rd_scrub(chunk_rd *r, uint64_t *bad)
     return rc;
 }
 
-int chunk_store_list(chunk_store *st, uint32_t volume, bool verify, chunk_list_fn fn, void *ctx)
+/* names_only: what the file name says (oid, pos), no file opened: the sweep of orphans (src/ecgc.c) reads a header
+ * only for an object that nothing names, so that an open costs one readdir per store, not one open per chunk */
+static int store_list(chunk_store *st, uint32_t volume, bool verify, bool names_only, chunk_list_fn fn, void *ctx)
 {
     pthread_mutex_lock(&st->mu);
     vol_state *v;
@@ -1062,6 +1066,10 @@ int chunk_store_list(chunk_store *st, uint32_t volume, bool verify, chunk_list_f
         if (pos >= CHUNK_POS_MAX || strcmp(end, ".chunk") != 0)
             continue;
         c.pos = (uint16_t)pos;
+        if (names_only) {
+            rc = fn(ctx, &c);
+            continue;
+        }
         int fd = openat(vfd, n, O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
             c.status = errno == ENOENT ? CHUNK_ST_ABSENT : CHUNK_ST_IOERR; /* removed under the scan, or unreadable */
@@ -1074,8 +1082,10 @@ int chunk_store_list(chunk_store *st, uint32_t volume, bool verify, chunk_list_f
             c.size = fstat(fd, &sb) == 0 ? (uint64_t)sb.st_size : 0;
             int lr = rd_load(fd, c.oid, c.pos, NULL, verify, &r, &h);
             c.status = lr == 0 ? CHUNK_ST_OK : lr == TSDB_ERR_IO ? CHUNK_ST_IOERR : CHUNK_ST_DAMAGED;
-            if (lr == 0)
+            if (lr == 0) {
                 c.epoch = h.epoch;
+                memcpy(c.vuuid, h.vuuid, 16);
+            }
             if (r)
                 chunk_rd_close(r);
             else
@@ -1085,6 +1095,11 @@ int chunk_store_list(chunk_store *st, uint32_t volume, bool verify, chunk_list_f
     }
     closedir(d);
     return rc == 0 && derr ? TSDB_ERR_IO : rc; /* a failing readdir is not the end of the directory */
+}
+
+int chunk_store_list(chunk_store *st, uint32_t volume, bool verify, chunk_list_fn fn, void *ctx)
+{
+    return store_list(st, volume, verify, false, fn, ctx);
 }
 
 /* ---------------------------------------------------------------- the directory backend */
@@ -1459,18 +1474,28 @@ static int list_one(void *ctx, const chunk_listed *c)
     return l->fn(l->ctx, &t);
 }
 
-int chunk_be_list(chunk_backend *be, uint32_t volume, bool verify, chunk_list_fn fn, void *ctx)
+static int be_list(chunk_backend *be, uint32_t volume, bool verify, bool names_only, chunk_list_fn fn, void *ctx)
 {
     for (int i = 0; i < be->n; i++) {
         chunk_store *st = chunk_be_open_store(be, i);
         if (!st)
             continue;
         list_ctx l = {fn, ctx, i};
-        int rc = chunk_store_list(st, volume, verify, list_one, &l);
+        int rc = store_list(st, volume, verify, names_only, list_one, &l);
         if (rc)
             return rc;
     }
     return 0;
+}
+
+int chunk_be_list(chunk_backend *be, uint32_t volume, bool verify, chunk_list_fn fn, void *ctx)
+{
+    return be_list(be, volume, verify, false, fn, ctx);
+}
+
+int chunk_be_list_names(chunk_backend *be, uint32_t volume, chunk_list_fn fn, void *ctx)
+{
+    return be_list(be, volume, false, true, fn, ctx);
 }
 
 /* ---------------------------------------------------------------- put an object */
