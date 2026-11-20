@@ -2343,6 +2343,20 @@ static tsdbc *client(int i)
     return c;
 }
 
+/* rc is MOVED, one entry: volume `vol` to node `node` at server s's client address (the copy's MEMBER_ADDR) */
+static void expect_moved(tsdbc *c, int rc, uint32_t vol, uint32_t node, int s, const char *what)
+{
+    tsdbc_err_info e;
+    char want[64];
+    snprintf(want, sizeof want, "127.0.0.1:%d", cports[s]);
+    if (rc != TSDB_ERR_MOVED || tsdbc_last_error(c, &e) != TSDB_ERR_MOVED || e.nmoved != 1 || e.moved[0].vol != vol ||
+        e.moved[0].node_id != node || strcmp(e.moved[0].addr, want) != 0)
+        die("%s: %s, %u MOVED (volume %u node %u at %s), want MOVED of volume %u to node %u at %s", what, ers(rc),
+            rc == TSDB_ERR_MOVED ? e.nmoved : 0, rc == TSDB_ERR_MOVED && e.nmoved ? e.moved[0].vol : 0,
+            rc == TSDB_ERR_MOVED && e.nmoved ? (unsigned)e.moved[0].node_id : 0,
+            rc == TSDB_ERR_MOVED && e.nmoved ? e.moved[0].addr : "-", (unsigned)vol, (unsigned)node, want);
+}
+
 /* rc is UNAVAILABLE and its body names volume `vol` (TSDB_VOL_ANY: any) and reason `why` */
 static void expect_unavail(tsdbc *c, int rc, uint16_t vol, int why, const char *what)
 {
@@ -3274,24 +3288,24 @@ static void scen_volumes(void)
             continue;
         c = client(i);
         rc = tsdbc_series_at(c, "pump7.flow", "plant", &x);
-        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "series made on a replica");
+        expect_moved(c, rc, 1, v.leader, L, "series made on a replica");
         int64_t ts = 5000;
         float val = 5;
         rc = tsdbc_insert_series(c, id, &ts, &val, 1);
-        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "insert on a replica");
+        expect_moved(c, rc, 1, v.leader, L, "insert on a replica");
         /* the packed frames name a series per row: an id the replica's dictionary does not know yet (the leader made
-         * it, nothing replicates) is still FENCED naming the volume, never INVALID (cvol_refuse_ids) */
+         * it, nothing replicates) is still MOVED to the leader by its volume, never INVALID (route_ids) */
         tsdb_sid ids2[2] = {id, id};
         int64_t ts2[2] = {5000, 5001};
         float val2[2] = {5, 6};
         rc = tsdbc_insert(c, ids2, ts2, val2, 2);
-        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "a packed insert on a replica");
+        expect_moved(c, rc, 1, v.leader, L, "a packed insert on a replica");
         tsdb_values tv = {TSDB_FLOAT32, val2, NULL};
         rc = tsdbc_insert_values(c, ids2, ts2, &tv, 2);
-        expect_unavail(c, rc, 1, TSDB_WHY_FENCED, "a packed typed insert on a replica");
+        expect_moved(c, rc, 1, v.leader, L, "a packed typed insert on a replica");
         tsdbc_close(c);
     }
-    printf("  the leader takes writes and reads them back, the replicas refuse them (FENCED)\n");
+    printf("  the leader takes writes and reads them back, the replicas move them to it (MOVED)\n");
 
     /* restarts: the same rid, the generation raised, saved and recorded; the leader's rows are still there */
     char dir1[PATH_MAX + 80], v1[PATH_MAX + 120], old1[PATH_MAX + 120], cmd[PATH_MAX * 4];
@@ -4364,9 +4378,9 @@ static void scen_topology(void)
         die("no record of west");
     int W = server_of(wv.leader);
     if (W > 0 && W != L)
-        k = W;         /* kill west's leader where that is allowed: its OWNER entry and route_moved say NO_OWNER */
+        k = W;         /* kill west's leader where that is allowed: route_moved then says PROMOTING (leader not UP) */
     int j = 3 - L - k; /* the third: neither leads east */
-    /* the replica of west that is not its leader, for route_moved's NO_OWNER once that leader is down */
+    /* the replica of west that is not its leader, for route_moved's PROMOTING once that leader is down */
     int wr = -1;
     for (uint32_t r = 0; r < wv.nrep; r++)
         if (wv.rep[r].node != wv.leader)
@@ -4413,8 +4427,9 @@ static void scen_topology(void)
         status_peers(c, L, k, "STATUS with a member down");
         tsdbc_close(c);
     }
-    /* west's leader killed: a write on its other replica gets UNAVAILABLE (NO_OWNER) from route_moved, not MOVED to
-     * the dead leader, while the record still names it (a promotion would move the record on: then no verdict) */
+    /* west's leader killed: a write on its other replica gets UNAVAILABLE (PROMOTING, the record names a leader whose
+     * member is not UP: route_fill) from route_moved, not MOVED to the dead leader, while the record still names it (a
+     * promotion would move the record on: then no verdict) */
     if (wid) {
         uint64_t t0 = now_ms();
         for (;;) {
@@ -4427,19 +4442,19 @@ static void scen_topology(void)
             tsdbc_close(c);
             struct meta_volume now;
             if (!vol_rec(L, "west", &now) || now.leader != wv.leader) {
-                printf("  (west was promoted away from its killed leader: no NO_OWNER check)\n");
+                printf("  (west was promoted away from its killed leader: no PROMOTING check)\n");
                 break;
             }
-            if (rc2 == TSDB_ERR_UNAVAILABLE && e.nunavail == 1 && e.unavail[0].reason == TSDB_WHY_NO_OWNER &&
+            if (rc2 == TSDB_ERR_UNAVAILABLE && e.nunavail == 1 && e.unavail[0].reason == TSDB_WHY_PROMOTING &&
                 e.nmoved == 0)
                 break;
             if (now_ms() - t0 > 20000)
                 die("a write to west on server %d with its leader (server %d) down: %s, %u MOVED, reason %u (want "
-                    "UNAVAILABLE, NO_OWNER)", wr, k, ers(rc2), e.nmoved, e.nunavail ? e.unavail[0].reason : 0);
+                    "UNAVAILABLE, PROMOTING)", wr, k, ers(rc2), e.nmoved, e.nunavail ? e.unavail[0].reason : 0);
             usleep(100000);
         }
     } else {
-        printf("  (west's leader is server 0 or east's leader: no NO_OWNER check of route_moved)\n");
+        printf("  (west's leader is server 0 or east's leader: no PROMOTING check of route_moved)\n");
     }
     stop_all();
     printf("  TOPOLOGY from the copy agrees on every node (roles, epochs, addresses, alive); STATUS names each node; "
@@ -4486,19 +4501,6 @@ static void scen_movedself(void)
 }
 
 /* rc is MOVED to the leader `node` of volume `vol` at server s's client address (the copy's MOVED, never UNAVAILABLE) */
-static void expect_moved(tsdbc *c, int rc, uint32_t vol, uint32_t node, int s, const char *what)
-{
-    tsdbc_err_info e;
-    char want[64];
-    snprintf(want, sizeof want, "127.0.0.1:%d", cports[s]);
-    if (rc != TSDB_ERR_MOVED || tsdbc_last_error(c, &e) != TSDB_ERR_MOVED || e.nmoved != 1 || e.moved[0].vol != vol ||
-        e.moved[0].node_id != node || strcmp(e.moved[0].addr, want) != 0)
-        die("%s: %s, %u MOVED (volume %u node %u at %s), want MOVED of volume %u to node %u at %s", what, ers(rc),
-            rc == TSDB_ERR_MOVED ? e.nmoved : 0, rc == TSDB_ERR_MOVED && e.nmoved ? e.moved[0].vol : 0,
-            rc == TSDB_ERR_MOVED && e.nmoved ? (unsigned)e.moved[0].node_id : 0,
-            rc == TSDB_ERR_MOVED && e.nmoved ? e.moved[0].addr : "-", (unsigned)vol, (unsigned)node, want);
-}
-
 static tsdbc *login_retry(int i, const char *user, const char *pw, int budget_ms)
 {
     tsdbc *c = login_on(i, user, pw);

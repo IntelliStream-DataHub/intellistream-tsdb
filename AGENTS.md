@@ -177,7 +177,10 @@ cgroup, so `nice` does not keep your work out of its way.
   (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
   over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below
   `jr_rec_max_rows` so that it fits one peer frame. `TSDB_REPLD_MUTANT` and `TSDB_REPLD_TEST` are its test hooks, `TSDB_REPLD_TRACE=1` logs the core's and the cursors' state every 2 s
-  (`make repld-mutants`); `test_cluster replicate|replindet|replfail` its end-to-end tests. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  (`make repld-mutants`); `test_cluster replicate|replindet|replfail` its end-to-end tests. The entry node's decision is `route_decide` in `server/tsdbd.c` (D5, S2-1:
+  served only where every cluster volume of the request is led here, else MOVED to the copy's leader, reads included, or
+  UNAVAILABLE NO_OWNER/PROMOTING; before any right on an id is checked; a frame spanning two owners is INVALID;
+  docs/design-cluster.md 6.4); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants
