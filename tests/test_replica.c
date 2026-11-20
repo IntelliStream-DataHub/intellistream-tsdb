@@ -1712,6 +1712,74 @@ static void case_open_checks(void)
     }
     leader_free(&l);
 
+    /* the same, where the missing segment is the new epoch's first and holds only its EPOCH marker: no part's number or
+     * position reaches it, RSTATE's `kept` (a leader's flush, a promotion) does (jepsen-cluster power, 2026-11-20: a
+     * promoted leader's first segment went and one of its flushed epoch-1 segments came back; mutant gapnokept) */
+    fresh(dir, "j1d");
+    leader_init(&l);
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        leader_roll(&l);
+    }
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    end = l.r[l.n - 1].last;
+    CHECK_EQ(replica_apply(db, end), 0);
+    char se[PATH_MAX + 64];
+    seg_file(s3, sizeof s3, dir, 3);
+    snprintf(k3, sizeof k3, "%s.save", s3);
+    CHECK_EQ(link(s3, k3), 0);
+    CHECK_EQ(replica_epoch_begin(db, 2, "n1", &epos), 0); /* the segment 2 << 40, its EPOCH marker at end + 1 */
+    CHECK_EQ(epos, end + 1);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, end + 1), 0);
+    CHECK_EQ(replica_flush(db), 0);
+    CHECK_EQ(mt_flush(db), 0);
+    size_t n0 = l.n; /* the epoch's next segment: rows from end + 2 */
+    l.seq = (UINT64_C(2) << 40) + 1;
+    l.off = 0;
+    l.next = end + 2;
+    leader_rows(&l, 4, &rng);
+    CHECK_EQ(feed(db, &l, n0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    uint64_t end2 = l.r[l.n - 1].last;
+    CHECK_EQ(replica_apply(db, end2), 0);
+    eng_close(db);
+    if (access(s3, F_OK) != 0)
+        CHECK_EQ(link(k3, s3), 0);
+    unlink(k3);
+    seg_file(se, sizeof se, dir, UINT64_C(2) << 40);
+    unlink(se); /* the gap: the EPOCH marker's segment */
+    CHECK_EQ(open_replica(dir, end2, &db), TSDB_ERR_CORRUPT); /* nothing says the marker's segment was flushed */
+    {
+        /* what a leader's flush of that segment saves before it can go (leader_rs_kept) */
+        uint8_t b[64] = {0};
+        uint64_t w[2] = {UINT64_C(0x5453544154535231), UINT64_C(2) << 40};
+        memcpy(b, &w[0], 8);
+        memcpy(b + 48, &w[1], 8);
+        uint64_t h = xxh64(b, 56, 0);
+        memcpy(b + 56, &h, 8);
+        snprintf(p, sizeof p, "%s/RSTATE", dir);
+        FILE *f = fopen(p, "wb");
+        CHECK_EQ(f != NULL, true);
+        if (f) {
+            CHECK_EQ(fwrite(b, 1, sizeof b, f), sizeof b);
+            fclose(f);
+        }
+    }
+    CHECK_EQ(open_replica(dir, end, &db), TSDB_ERR_CORRUPT); /* above the floor: still damage */
+    CHECK_EQ(open_replica(dir, end2, &db), 0);
+    if (db) {
+        CHECK_EQ(access(s3, F_OK) != 0, true);
+        CHECK_EQ(replica_log_end(db), end2);
+        eng_close(db);
+    }
+    leader_free(&l);
+
     /* a torn tail is cut: the next append lands at the valid end */
     fresh(dir, "j2");
     leader_init(&l);
@@ -6179,6 +6247,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "gapcheck") == 0 ? MUT_REPLICA_NO_GAP_CHECK
                         : strcmp(m, "noleftover") == 0 ? MUT_REPLICA_NO_LEFTOVER_DROP
                         : strcmp(m, "gapbyseq") == 0 ? MUT_REPLICA_GAP_BY_SEQ
+                        : strcmp(m, "gapnokept") == 0 ? MUT_REPLICA_GAP_NO_KEPT
                         : strcmp(m, "torncut") == 0 ? MUT_REPLICA_NO_TORN_CUT
                         : strcmp(m, "floorcheck") == 0 ? MUT_REPLICA_NO_FLOOR_CHECK
                         : strcmp(m, "durablegate") == 0 ? MUT_REPLICA_NO_DURABLE_GATE

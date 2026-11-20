@@ -281,6 +281,17 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
         parts_seq = MAX(parts_seq, db->parts[i]->wal_seq);
         parts_fno = MAX(parts_fno, db->parts[i]->fno_hi);
     }
+    /* RSTATE's `kept`: the newest segment a leader flushed (leader_rs_kept, saved before the segment can go) or a
+     * promotion found flushed. It names a segment whose records are all markers, which no part's wal_seq or fno_hi
+     * reaches (below). Read here as well as in the open below: the gap check needs it before anything is listed. */
+    uint64_t kept_seq = 0;
+    {
+        struct rstate rs0 = {0};
+        rc = rs_load(db, &rs0);
+        free(rs0.drops);
+        if (rc == 0 && eng_test_mutant != MUT_REPLICA_GAP_NO_KEPT)
+            kept_seq = rs0.kept;
+    }
     for (size_t k = 0; k < nseg && rc == 0; k++)
         rc = wal_check_segment(db, &segs[k]);
     if (rc == 0)
@@ -303,7 +314,10 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
      * the numbers jump at a promotion (epoch << 40) and the old epoch's last number is unknown, the positions: a part
      * holds the row just before the gap's end, and a flush takes every row of the segments it seals, in segment order
      * (jepsen-cluster power, 2026-11-20: a promoted leader's flushed epoch-1 segments went in part, wal_..20000000000
-     * followed the gap, and its open refused the volume for good). A marker as the gap's last record fails this: damage. */
+     * followed the gap, and its open refused the volume for good). A marker as the gap's last record fails the positions;
+ * RSTATE's `kept` then says the missing segment was flushed (jepsen-cluster power, 2026-11-20: a promoted leader's
+ * first segment held only its EPOCH marker; the unlink of it and of the epoch-1 segments went in one batch, a power
+ * loss kept the first and lost one of the others, and every open refused the volume for good). */
     if (rc == 0 && eng_test_mutant != MUT_REPLICA_NO_LEFTOVER_DROP) {
         size_t lo = 0;
         uint64_t prev_end = 0;
@@ -311,7 +325,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
             if (!segs[k].fno_first)
                 continue;
             if (prev_end && segs[k].fno_first > prev_end &&
-                (segs[k].seq - 1 <= parts_seq ||
+                (segs[k].seq - 1 <= MAX(parts_seq, kept_seq) ||
                  (parts_fno >= segs[k].fno_first - 1 && eng_test_mutant != MUT_REPLICA_GAP_BY_SEQ)) &&
                 segs[k].fno_first - 1 <= floor)
                 lo = k;
