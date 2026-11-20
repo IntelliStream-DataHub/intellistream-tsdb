@@ -7,7 +7,8 @@
 #   JV_CRASH=N   abort() on every Nth insert request (a crash of its own: SIGABRT), with the core dump the machine takes (RLIMIT_CORE is
 #                left alone: a core handler that is a pipe, systemd-coredump here, dumps whatever the limit says, and the dump keeps the
 #                process alive, not yet a zombie, for 0.1 s to seconds: the window in which a nemesis' SIGKILL used to hide the crash)
-#   JV_EXIT=N    _exit(JV_EXITCODE, 0 by default) on every Nth insert request (an end of its own, with no signal of ours)
+#   JV_EXIT=N    _exit(JV_EXITCODE, 0 by default) on every Nth insert request (an end of its own, with no signal of ours); JV_EXITMSG: the line it
+#                prints first (round 15: "tsdbd: wal: No space left on device", with jepsen's JEPSEN_FREE_BYTES=0: a fail-stop on a full disk)
 #   JV_DSTALL=N  a worker blocks in D state for good (vfork whose child never execs) on every Nth insert request: the kernel's stall, as an I/O stall
 #                is, and not tsdbd's hang (JV_HANG: pause(), no D state)
 #   JV_CRASHONCE=N  the same, once per gate (JV_ONCEFILE names the file whose creation says it happened)
@@ -69,6 +70,12 @@ static int jv_once_file(const char *var)
         return 0;
     close(fd);
     return 1;
+}
+static void jv_exit(void)
+{
+    if (getenv("JV_EXITMSG")) /* what the server says as it goes (a fail-stop's line) */
+        fprintf(stderr, "%s\n", getenv("JV_EXITMSG"));
+    _exit(atoi(getenv("JV_EXITCODE") ? getenv("JV_EXITCODE") : "0"));
 }
 static void jv_extra(void)
 {
@@ -218,13 +225,13 @@ static void jv_once(void)\
 sed -i 's/^    case TSDB_OP_INSERT: {$/&\
         if (jv_every("JV_CRASH")) jv_crash();\
         if (jv_every("JV_CRASHONCE")) jv_once();\
-        if (jv_every("JV_EXIT")) _exit(atoi(getenv("JV_EXITCODE") ? getenv("JV_EXITCODE") : "0"));\
+        if (jv_every("JV_EXIT")) jv_exit();\
         if (jv_every("JV_DSTALL")) jv_dstall();\
         if (jv_every("JV_HANG")) for (;;) pause();\
         jv_extra();/; s/^    case TSDB_OP_INSERT_VALUES: {$/&\
         if (jv_every("JV_CRASH")) jv_crash();\
         if (jv_every("JV_CRASHONCE")) jv_once();\
-        if (jv_every("JV_EXIT")) _exit(atoi(getenv("JV_EXITCODE") ? getenv("JV_EXITCODE") : "0"));\
+        if (jv_every("JV_EXIT")) jv_exit();\
         if (jv_every("JV_DSTALL")) jv_dstall();\
         if (jv_every("JV_HANG")) for (;;) pause();\
         jv_extra();/' "$f"
@@ -447,6 +454,24 @@ feedpower|--feed --nemesis power --seconds 12 --crashfs @crashfs@
 feedeio|--feed --nemesis eio --seconds 12 --crashfs @crashfs@
 MEOF
 fi
+# a server that fail-stops on ENOSPC (exit 1, "No space left on device") is the environment's (exit 2) where the test directory's file system is full
+# (JEPSEN_FREE_BYTES=0 stands for that), and a verdict (exit 1, the first attempt) where it has room (round 15, optional item 5)
+if want enospc-full; then
+    t0=$(date +%s)
+    out=$(JV_EXIT=150 JV_EXITCODE=1 JV_EXITMSG='tsdbd: wal: No space left on device' JEPSEN_FREE_BYTES=0 JEPSEN_TSDBD="$mut" \
+        timeout "${TMO:-200}" "$bin" --dir "$dir" --nemesis none --seconds 10 2>&1); st=$?
+    left=$(leftover | tr '\n' ' ')
+    if [ $st -eq 2 ] && echo "$out" | grep -q 'fail-stopped on a full disk' && ! echo "$out" | grep -q 'FAILED' && [ -z "$left" ]; then
+        echo "mutant-crash: enospc-full is a harness error (exit 2), not a violation, in $(($(date +%s) - t0)) s: a fail-stop on a full disk"
+    else
+        echo "mutant-crash: enospc-full: a fail-stop on a full disk was not a harness error (rc $st, wanted 2; left behind: ${left:-none})"
+        echo "$out" | tail -n 15
+        rc=1
+    fi
+    for p in $left; do kill -KILL "$p" 2>/dev/null; done
+fi
+run_case "enospc-room" "ended with status .* by itself" "a server that fail-stops on ENOSPC with room on the disk" JV_EXIT=150 JV_EXITCODE=1 \
+    JV_EXITMSG='tsdbd: wal: No space left on device' -- --nemesis none --seconds 10
 # a thread of the server in D state for good at open is the kernel's stall, not a verdict: a harness error (exit 2), never a violation, never a pass
 if want openany-dstall-kill; then
     rm -f "$tmp/oa-ds".*

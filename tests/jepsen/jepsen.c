@@ -191,6 +191,7 @@
 #include <sys/prctl.h>
 #endif
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -790,6 +791,36 @@ static const char *end_text(int st, char *buf, size_t n)
     return buf;
 }
 
+/* A server that fail-stops on ENOSPC while the file system of the test directory IS full (round 15, optional item 5): the machine's, not tsdb's: a
+ * harness error (exit 2). Both must hold: the server's log (its latest start) ends with "No space left on device", and what is free on the
+ * directory's file system is under 64 MB now (a quota, or the outage shim's injected ENOSPC, leaves room, and stays a verdict).
+ * JEPSEN_FREE_BYTES overrides the free space (the selftest's hook). */
+static bool fs_full_failstop(const char *logpath)
+{
+    long long avail;
+    if (getenv("JEPSEN_FREE_BYTES"))
+        avail = atoll(getenv("JEPSEN_FREE_BYTES"));
+    else {
+        struct statvfs sv;
+        if (!dir || statvfs(dir, &sv) != 0)
+            return false;
+        avail = (long long)sv.f_bavail * (long long)sv.f_frsize;
+    }
+    if (avail >= (64LL << 20))
+        return false;
+    char b[8192];
+    int fd = open(logpath, O_RDONLY);
+    if (fd < 0)
+        return false;
+    off_t end = lseek(fd, 0, SEEK_END), at = end > (off_t)sizeof b - 1 ? end - ((off_t)sizeof b - 1) : 0;
+    ssize_t n = pread(fd, b, sizeof b - 1, at);
+    close(fd);
+    if (n <= 0)
+        return false;
+    b[n] = 0;
+    return strstr(b, "No space left on device") != NULL;
+}
+
 /* Judges the end of server `pid` (wait status `st`) and reports it, once, when the harness neither caused nor expected it. */
 static bool end_report(pid_t pid, int st)
 {
@@ -809,6 +840,14 @@ static bool end_report(pid_t pid, int st)
         env_kills++;
         fprintf(stderr, "jepsen: the %s server (pid %d) was killed by SIGKILL, which the harness did not send (the machine's "
                 "out-of-memory killer?): the environment, not a verdict\n", server_faulty ? "faulty" : "clean", (int)pid);
+        return true;
+    }
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 1 && fs_full_failstop(slogpath)) {
+        env_kills++;
+        fprintf(stderr, "jepsen: the %s server (pid %d) exited with status 1 after \"No space left on device\", and the file system of %s has "
+                "less than 64 MB free: it fail-stopped on a full disk, the environment, not a verdict\n", server_faulty ? "faulty" : "clean",
+                (int)pid, dir);
+        print_tail(slogpath);
         return true;
     }
     death_problems++;
@@ -5584,7 +5623,7 @@ int main(int argc, char **argv)
         return 1;
     }
     if (env_kills) { /* the machine killed the server (see end_report): nothing here says anything about tsdb */
-        fprintf(stderr, "jepsen: harness error: a server was killed by something that was not the harness\n");
+        fprintf(stderr, "jepsen: harness error: a server was killed, or fail-stopped on a full disk, by something that was not the harness\n");
         return 2;
     }
     if (inconclusive)
