@@ -1619,6 +1619,49 @@ static void case_open_checks(void)
     CHECK_EQ(open_replica(dir, 0, &db), TSDB_ERR_CORRUPT);
     leader_free(&l);
 
+    /* the same gap below the parts and the floor is a batch of unlinks a power loss kept only in part (jepsen-cluster
+     * power, 2026-11-20: every open refused the volume for good): the segment before it goes, the open succeeds
+     * (mutant noleftover) */
+    fresh(dir, "j1b");
+    leader_init(&l);
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        leader_roll(&l);
+    }
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    end = l.r[l.n - 1].last;
+    CHECK_EQ(replica_apply(db, end), 0);
+    char s1[PATH_MAX + 64], s3[PATH_MAX + 64], k1[PATH_MAX + 80], k3[PATH_MAX + 80];
+    seg_file(s1, sizeof s1, dir, 1);
+    seg_file(s3, sizeof s3, dir, 3);
+    snprintf(k1, sizeof k1, "%s.save", s1);
+    snprintf(k3, sizeof k3, "%s.save", s3);
+    CHECK_EQ(link(s1, k1), 0); /* the unlinks the power loss "lost" */
+    CHECK_EQ(link(s3, k3), 0);
+    CHECK_EQ(mt_flush(db), 0); /* every segment's rows are in parts */
+    eng_close(db);
+    if (access(s1, F_OK) != 0)
+        CHECK_EQ(link(k1, s1), 0);
+    if (access(s3, F_OK) != 0)
+        CHECK_EQ(link(k3, s3), 0);
+    unlink(k1);
+    unlink(k3);
+    seg_file(p, sizeof p, dir, 2);
+    unlink(p);
+    CHECK_EQ(open_replica(dir, 0, &db), TSDB_ERR_CORRUPT); /* the gap is above the floor: damage */
+    CHECK_EQ(open_replica(dir, end, &db), 0);
+    if (db) {
+        CHECK_EQ(access(s1, F_OK) != 0, true);
+        CHECK_EQ(replica_log_end(db), end);
+        eng_close(db);
+    }
+    leader_free(&l);
+
     /* a torn tail is cut: the next append lands at the valid end */
     fresh(dir, "j2");
     leader_init(&l);
@@ -6084,6 +6127,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "noclasspurge") == 0 ? MUT_REPLICA_NO_CLASS_PURGE
                         : strcmp(m, "opensync") == 0 ? MUT_REPLICA_NO_OPEN_SYNC
                         : strcmp(m, "gapcheck") == 0 ? MUT_REPLICA_NO_GAP_CHECK
+                        : strcmp(m, "noleftover") == 0 ? MUT_REPLICA_NO_LEFTOVER_DROP
                         : strcmp(m, "torncut") == 0 ? MUT_REPLICA_NO_TORN_CUT
                         : strcmp(m, "floorcheck") == 0 ? MUT_REPLICA_NO_FLOOR_CHECK
                         : strcmp(m, "durablegate") == 0 ? MUT_REPLICA_NO_DURABLE_GATE
@@ -6386,6 +6430,12 @@ int main(int argc, char **argv)
     case_requires_replica();
     if (getenv("TEST_REPLICA_REQUIRES_ONLY")) {
         case_feed_refused();
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
+    }
+    if (getenv("TEST_REPLICA_OPEN_ONLY")) { /* the quick run of the open's checks */
+        case_open_checks();
+        sh("rm -rf '%s'", S);
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
     }

@@ -291,6 +291,36 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
         fprintf(stderr, "tsdb: %s: FNO has a damaged slot: a replica cannot tell its log end, rebuild it\n", db->dir);
         rc = TSDB_ERR_CORRUPT;
     }
+    /* A gap below what the parts and the floor hold is a removal a power loss interrupted, not damage: flushed segments
+     * go in batches with one directory fsync after each (unlink_due), and a file system may keep a later unlink of a
+     * batch and lose an earlier one (jepsen-cluster power, 2026-11-20: a promoted replica's old segment of position 1
+     * came back beside the rest of its retained log, and every later open refused the volume for good). The segments
+     * before such a gap hold only rows the parts hold: they go now, before anything is listed, so the log starts after
+     * the gap and a laggard below it is sent a snapshot. A gap above the parts or the floor stays damage (below). */
+    if (rc == 0 && eng_test_mutant != MUT_REPLICA_NO_LEFTOVER_DROP) {
+        size_t lo = 0;
+        uint64_t prev_end = 0;
+        for (size_t k = 0; k < nseg; k++) {
+            if (!segs[k].fno_first)
+                continue;
+            if (prev_end && segs[k].fno_first > prev_end && segs[k].seq - 1 <= parts_seq &&
+                segs[k].fno_first - 1 <= floor)
+                lo = k;
+            prev_end = segs[k].fno_end;
+        }
+        for (size_t k = 0; k < lo && rc == 0; k++) {
+            fprintf(stderr, "tsdb: %s: segment %s lies below a gap that the parts and the floor (%" PRIu64 ") cover: a "
+                            "removal a power loss interrupted, it goes now\n", db->dir, segs[k].name, floor);
+            if (unlinkat(db->dirfd, segs[k].name, 0) != 0 && errno != ENOENT)
+                rc = TSDB_ERR_IO;
+        }
+        if (rc == 0 && lo > 0) {
+            if (db->opt.fsync && tsdb_fsync(db->dirfd) != 0)
+                rc = TSDB_ERR_IO;
+            memmove(segs, segs + lo, (nseg - lo) * sizeof *segs);
+            nseg -= lo;
+        }
+    }
     /* The log of a replica is contiguous (replica_append enforces it): a segment that does not start where the one before
      * it ends means a file went (damage, or a file system that reordered the unlinks of a cut), and the replica would
      * acknowledge positions it does not hold. FNO is only a bound: it never exceeds what the log and parts hold. */
