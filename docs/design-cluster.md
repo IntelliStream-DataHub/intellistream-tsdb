@@ -1006,7 +1006,12 @@ the inbox had its slice, up to a second of backlog; a thread that is never curre
 the last one as that one took, so the steps keep at least half its time and a lagging peer is never starved
 (`rejoinlate`, mutant `stepcurrentonly`: under TSan a replica never rejoined). Before, each tick ran a step and a late
 tick was dropped, so with 20 ms catch-up reads a core tick took 25 ms and a stopped member held the writes 5 s
-(r3d-isr review M1; `test_cluster tickwall`, mutant `tickstretch`).
+(r3d-isr review M1; `test_cluster tickwall`, mutant `tickstretch`). A stop of the whole process is not caught up: a
+tick wait that returns 250 ms (`STALL_MS`) past its deadline was a SIGSTOP or a VM pause, not a busy step, so the
+ticks restart from the resume, the peers count as heard then, and the heartbeat names no peer unreachable while the
+driver's thread has not looped for that long. Otherwise a leader and a replica stopped together came back with every
+peer silent for a second of ticks (an ISR of one) and the replica named the leader for its own stop (a cut that deposed
+it; `test_cluster jointpause`, mutant `stallcatchup`).
 
 A replica's durable end stops below a COMMIT marker whose files it has not staged, and its core starts there at an
 open too (`repl_durable.hold`), not at its log end: a replica killed between such a marker and the FETCH of its file
