@@ -563,7 +563,10 @@ cgroup, so `nice` does not keep your work out of its way.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf, and so is the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
-  sweeper takes `db->lock` only with it released). The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
+  sweeper takes `db->lock` only with it released). R7's settle: the policy's `ps->pmu` (`src/ecpolicy.c`: its fail list and eager count, taken under
+  `db->lock` while the settle thread picks) is a leaf; the tier's settle mutex `st->mu` (`src/settle.c`) is never held
+  across an engine call (the thread lets go of it around a settle), and `eng_halt`/`eng_close` wait on its cv with no
+  engine lock held. The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
   `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
   that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
   the warmer take `latest_rw` (read) > `db->lock`, a lookup then `buf_lock` in sub-holds. The window's `pmu`/`pcv` (a writer
