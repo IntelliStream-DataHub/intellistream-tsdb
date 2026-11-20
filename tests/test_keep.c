@@ -1,0 +1,608 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/*
+ * Settled sources (src/eckeep.c, r7-keep; design-cluster-data.md E26, the plan's D5): settled_<part>.part is kept for
+ * keep_s from the .ec record's settle time and until its digest matched; a digest that does not match holds it for
+ * good and makes the volume DIVERGED (UNAVAILABLE answers).
+ *
+ * Settles are made by hand until r7-settle's eng_settle: the part's bytes put into the tier's stores as an object
+ * (chunk_be_put_object, as ec_test_attach does, optionally from other bytes), its .ec file written (ec_index_write),
+ * opened (part_open_ec) and swapped in (ec_swap_commit), which renames the source settled_<name>.
+ *
+ *   xxh64     the digest's xxh64 over pieces equals xxh64() in one call, at every length and split
+ *   match     the digest matches; the file stays until keep_s after the settle, then goes; answers unchanged
+ *   restart   keep_s one day, the file's mtime two days old (a rename keeps the source's), the handle reopened a minute
+ *             later: the digest matches again and the file stays
+ *   damage1   one damaged chunk (a data position, at most m): the digest matches, nothing DIVERGED
+ *   damageall a byte changed in every position of a stripe: DIVERGED, one line naming volume, partition, oid and both
+ *             files; the file kept past keep_s; queries and writes of the volume answer UNAVAILABLE; again after a
+ *             reopen
+ *   othersrc  an object whose record agrees with its chunks but whose bytes are not the source's: DIVERGED
+ *   pending   a digest that has not run when the handle closes: after the reopen nothing is released before it ran
+ *   down      a store DOWN: the digest waits and the file stays; back UP: it matches
+ *   orphan    the key dropped before the digest: the file goes keep_s later
+ *
+ * Usage: test_keep [--mutant digestskip|digestraw|digestnohold|keepmtime] [SCRATCH]. Without TSDB_EC it says it is
+ * skipped.
+ */
+#include "internal.h"
+#include "chunk.h"
+#include "eckeep.h"
+#include "ecpart.h"
+#include "ecswap.h"
+#include "tier.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+static int failures;
+#define CHECK(c)                                                                                                       \
+    do {                                                                                                               \
+        if (!(c)) {                                                                                                    \
+            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c);                                               \
+            failures++;                                                                                                \
+        }                                                                                                              \
+    } while (0)
+
+#ifdef TSDB_EC
+uint64_t eckeep_test_xxh64_pieces(const void *data, size_t len, size_t piece);
+
+#define K 2
+#define M 1
+#define NST 3
+static const int64_t DAY = 86400000, T0 = 1704067200000; /* 2024-01-01 */
+static char scratch[PATH_MAX];
+static char dbdir[PATH_MAX + 64], stores[NST][PATH_MAX + 64];
+static int64_t clock_off; /* added to the real clock: a reopen "a minute later" */
+
+static int64_t test_clock(void *arg)
+{
+    (void)arg;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + clock_off;
+}
+
+static void rm_rf(const char *path)
+{
+    char cmd[PATH_MAX * 2];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", path);
+    if (system(cmd) != 0)
+        fprintf(stderr, "rm -rf %s failed\n", path);
+}
+
+static bool exists(const char *name)
+{
+    char p[PATH_MAX * 2];
+    snprintf(p, sizeof p, "%s/%s", dbdir, name);
+    return access(p, F_OK) == 0;
+}
+
+static void fresh(const char *what)
+{
+    snprintf(dbdir, sizeof dbdir, "%s/%s", scratch, what);
+    rm_rf(dbdir);
+    CHECK(mkdir(dbdir, 0755) == 0);
+    for (int i = 0; i < NST; i++) {
+        snprintf(stores[i], sizeof stores[i], "%s/%s.st%d", scratch, what, i);
+        rm_rf(stores[i]);
+        char away[PATH_MAX + 80];
+        snprintf(away, sizeof away, "%s.away", stores[i]);
+        rm_rf(away);
+    }
+}
+
+typedef struct {
+    tsdb *t;
+    eng *db;
+    uint32_t s;
+} h;
+
+static int h_open(h *x, int keep_s)
+{
+    char spec[8192];
+    int n = snprintf(spec, sizeof spec, "k=%d,m=%d,keep_s=%d,cache_mb=16,dirs=", K, M, keep_s);
+    for (int i = 0; i < NST; i++)
+        n += snprintf(spec + n, sizeof spec - (size_t)n, "%s%s", i ? ":" : "", stores[i]);
+    setenv("TSDB_TEST_TIER", spec, 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_classes = 0;
+    o.clock_ms = test_clock;
+    x->t = NULL;
+    x->db = NULL;
+    int rc = tsdb_open(dbdir, &o, &x->t);
+    unsetenv("TSDB_TEST_TIER");
+    unsetenv("TSDB_TEST_TIER_I_KNOW");
+    if (rc)
+        return rc;
+    x->db = tsdb_test_engine(x->t, 0);
+    CHECK(x->db && x->db->tier);
+    if (!x->db || eng_series(x->db, "s", TSDB_FLOAT32, &x->s) != 0)
+        return TSDB_ERR_INVALID;
+    return 0;
+}
+
+static void h_close(h *x)
+{
+    if (x->t)
+        tsdb_close(x->t);
+    x->t = NULL;
+    x->db = NULL;
+}
+
+static uint64_t lcg_state = 88172645463325252ull;
+static uint64_t lcg(void)
+{
+    lcg_state = lcg_state * 6364136223846793005ull + 1442695040888963407ull;
+    return lcg_state >> 33;
+}
+
+static void write_day(h *x, int n)
+{
+    int64_t ts[512];
+    float v[512];
+    for (int i = 0; i < n; i += 512) {
+        int k = n - i < 512 ? n - i : 512;
+        for (int j = 0; j < k; j++)
+            ts[j] = T0 + (int64_t)(i + j) * 3000, v[j] = (float)(lcg() % 1000003) / 7.0f; /* a larger object */
+        CHECK(eng_insert_series(x->db, TSDB_FLOAT32, x->s, ts, v, (size_t)k) == 0);
+    }
+    CHECK(eng_flush(x->db) == 0);
+}
+
+typedef struct {
+    size_t n;
+    double sum;
+} acc;
+
+static int acc_fn(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ts;
+    acc *a = ctx;
+    for (size_t i = 0; i < n; i++)
+        a->sum += v[i];
+    a->n += n;
+    return 0;
+}
+
+/* the rows of "s" through the handle (the route() family): its return code */
+static int read_all(h *x, acc *a)
+{
+    memset(a, 0, sizeof *a);
+    return tsdb_query_raw(x->t, TSDB_SID(0, x->s), T0 - DAY, T0 + 2 * DAY, acc_fn, a);
+}
+
+typedef struct {
+    char settled[256];
+    ec_record rec;
+} settled;
+
+/* A settle by hand (see the top) of the first listed .part with granules; alt (NULL: the part's bytes) are the bytes
+ * the object is encoded from */
+static int settle_one(h *x, bool alt_bytes, settled *out)
+{
+    eng *db = x->db;
+    part *p = NULL;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts && !p; i++)
+        if (!atomic_load(&db->parts[i]->ec) && db->parts[i]->ng > 0) {
+            p = db->parts[i];
+            part_ref(p);
+        }
+    pthread_mutex_unlock(&db->lock);
+    CHECK(p != NULL);
+    if (!p)
+        return TSDB_ERR_NOTFOUND;
+    uint8_t *alt = NULL;
+    const uint8_t *src = p->map;
+    if (alt_bytes) {
+        alt = malloc(p->map_len);
+        memcpy(alt, p->map, p->map_len);
+        alt[p->map_len / 3] ^= 0x40; /* inside some granule: its record and sums agree with these bytes */
+        src = alt;
+    }
+    chunk_backend *be = tier_backend(db->tier);
+    ec_record r;
+    memset(&r, 0, sizeof r);
+    chunk_geom g;
+    int rc = chunk_geom_derive(&g, K, M, p->map_len);
+    CHECK(rc == 0);
+    r.version = EC_RECORD_VERSION;
+    r.class_check = EC_CLS_PASSED;
+    chunk_random(r.oid, sizeof r.oid);
+    r.key = p->partition;
+    r.min_block = p->min_block;
+    r.max_block = p->max_block;
+    r.level = p->level;
+    r.k = (uint16_t)g.k;
+    r.m = (uint16_t)g.m;
+    r.cell_bytes = g.cell;
+    r.object_len = p->map_len;
+    r.object_xxh64 = xxh64(src, p->map_len, 0);
+    r.writer_epoch = 1;
+    r.settle_ms = eng_now_ms(db);
+    snprintf(r.source, sizeof r.source, "%s", p->name);
+    r.nsums = chunk_sums_total(&g);
+    r.sums = malloc(r.nsums * sizeof *r.sums);
+    CHECK(chunk_be_see_epoch(be, db->tier_vol, 1) == 0);
+    rc = chunk_be_put_object(be, db->tier_vol, tier_vuuid(db), r.oid, &g, 1, src, ~0u, r.sums);
+    CHECK(rc == 0);
+    char tmp[96] = "", ecname[160];
+    snprintf(ecname, sizeof ecname, "%.*s.ec", (int)(strlen(p->name) - 5), p->name);
+    if (rc == 0)
+        CHECK((rc = ec_index_write(db, p, &r, tmp)) == 0);
+    part *e = NULL;
+    if (rc == 0)
+        CHECK((rc = part_open_ec(db, tmp, ecname, &e)) == 0 && e);
+    if (rc == 0) {
+        CHECK(strlen(tmp) < sizeof e->pending); /* tmp_* names are short; the copy must not cut one */
+        snprintf(e->pending, sizeof e->pending, "%.63s", tmp);
+        CHECK((rc = ec_swap_commit(db, &p, &e, 1)) == 0);
+        part_unref(e);
+    }
+    snprintf(out->settled, sizeof out->settled, "settled_%s", p->name);
+    out->rec = r;
+    part_unref(p);
+    free(alt);
+    return rc;
+}
+
+static void chunk_path(const settled *s, unsigned pos, char *out, size_t cap)
+{
+    char hex[33];
+    chunk_oid_hex(s->rec.oid, hex);
+    for (int i = 0; i < NST; i++) {
+        snprintf(out, cap, "%s/s0/o%s.%u.chunk", stores[i], hex, pos);
+        if (access(out, F_OK) == 0)
+            return;
+    }
+    out[0] = '\0';
+}
+
+/* flips bytes of the cells of position pos (never its header): every 1500th from 100 */
+static int flip(const settled *s, unsigned pos)
+{
+    chunk_geom g;
+    CHECK(chunk_geom_make(&g, s->rec.k, s->rec.m, s->rec.cell_bytes, s->rec.object_len) == 0);
+    char p[16384];
+    chunk_path(s, pos, p, sizeof p);
+    CHECK(p[0] != '\0');
+    int fd = open(p, O_RDWR);
+    CHECK(fd >= 0);
+    if (fd < 0)
+        return 0;
+    int n = 0;
+    for (uint64_t off = 100; off < chunk_pos_len(&g, pos); off += 1500, n++) {
+        uint8_t b;
+        CHECK(pread(fd, &b, 1, (off_t)(CHUNK_HDR_BYTES + off)) == 1);
+        b ^= 0x5a;
+        CHECK(pwrite(fd, &b, 1, (off_t)(CHUNK_HDR_BYTES + off)) == 1);
+    }
+    close(fd);
+    return n;
+}
+
+/* stderr into a file while a block runs */
+static int saved_err = -1;
+static char cap_path[PATH_MAX + 64];
+static void cap_begin(void)
+{
+    snprintf(cap_path, sizeof cap_path, "%s/stderr.txt", scratch);
+    fflush(stderr);
+    saved_err = dup(2);
+    int fd = open(cap_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(fd, 2);
+    close(fd);
+}
+static char *cap_end(void)
+{
+    fflush(stderr);
+    dup2(saved_err, 2);
+    close(saved_err);
+    FILE *f = fopen(cap_path, "r");
+    static char buf[1 << 16];
+    size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+    buf[n] = '\0';
+    if (f)
+        fclose(f);
+    fputs(buf, stderr); /* still shown */
+    return buf;
+}
+
+static void sleep_ms(int ms)
+{
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+/* ------------------------------------------------------------ cases */
+
+static void case_xxh64(void)
+{
+    uint8_t buf[700];
+    for (size_t i = 0; i < sizeof buf; i++)
+        buf[i] = (uint8_t)(i * 131 + 7);
+    static const size_t pieces[] = {1, 3, 7, 31, 32, 33, 64, 100, 1000};
+    for (size_t len = 0; len < sizeof buf; len += len < 80 ? 1 : 37)
+        for (size_t j = 0; j < sizeof pieces / sizeof *pieces; j++)
+            CHECK(eckeep_test_xxh64_pieces(buf, len, pieces[j]) == xxh64(buf, len, 0));
+}
+
+static void case_match(void)
+{
+    fresh("match");
+    h x;
+    CHECK(h_open(&x, 2) == 0);
+    write_day(&x, 20000);
+    acc a0, a1;
+    CHECK(read_all(&x, &a0) == 0 && a0.n == 20000);
+    settled s;
+    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(exists(s.settled));
+    CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
+    graveyard_purge(x.db, false);
+    if (eng_now_ms(x.db) < s.rec.settle_ms + 1900) /* a slow run (sanitizers) may be past the deadline already */
+        CHECK(exists(s.settled) && eckeep_status(x.db, s.settled) == ECKEEP_MATCHED);
+    while (eng_now_ms(x.db) < s.rec.settle_ms + 2100)
+        sleep_ms(50);
+    graveyard_purge(x.db, false);
+    CHECK(!exists(s.settled) && eckeep_status(x.db, s.settled) == TSDB_ERR_NOTFOUND);
+    CHECK(!atomic_load(&x.db->diverged));
+    CHECK(read_all(&x, &a1) == 0 && a1.n == a0.n && a1.sum == a0.sum);
+    free(s.rec.sums);
+    h_close(&x);
+}
+
+static void case_restart(void)
+{
+    fresh("restart");
+    h x;
+    CHECK(h_open(&x, 86400) == 0);
+    write_day(&x, 20000);
+    settled s;
+    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
+    h_close(&x);
+    /* the source was written two days ago: a rename keeps that mtime */
+    char p[PATH_MAX * 2];
+    snprintf(p, sizeof p, "%s/%s", dbdir, s.settled);
+    struct timespec tv[2];
+    clock_gettime(CLOCK_REALTIME, &tv[0]);
+    tv[0].tv_sec -= 2 * 86400;
+    tv[1] = tv[0];
+    CHECK(utimensat(AT_FDCWD, p, tv, 0) == 0);
+    clock_off = 60000; /* a minute later */
+    CHECK(h_open(&x, 86400) == 0);
+    CHECK(eckeep_status(x.db, s.settled) == ECKEEP_PENDING || eckeep_status(x.db, s.settled) == ECKEEP_MATCHED);
+    CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
+    graveyard_purge(x.db, false);
+    CHECK(exists(s.settled) && eckeep_status(x.db, s.settled) == ECKEEP_MATCHED);
+    h_close(&x);
+    clock_off = 0;
+    free(s.rec.sums);
+}
+
+static void case_damage1(void)
+{
+    fresh("damage1");
+    h x;
+    CHECK(h_open(&x, 1) == 0);
+    write_day(&x, 20000);
+    acc a0, a1;
+    CHECK(read_all(&x, &a0) == 0);
+    atomic_store(&eckeep_test_pause, true);
+    settled s;
+    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(flip(&s, 0) > 0); /* a data position: a RAW read would hash these bytes */
+    atomic_store(&eckeep_test_pause, false);
+    CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
+    CHECK(!atomic_load(&x.db->diverged));
+    CHECK(read_all(&x, &a1) == 0 && a1.n == a0.n && a1.sum == a0.sum);
+    free(s.rec.sums);
+    h_close(&x);
+}
+
+static void diverged_checks(h *x, const settled *s, const char *log)
+{
+    char hex[33];
+    chunk_oid_hex(s->rec.oid, hex);
+    char ecname[160];
+    snprintf(ecname, sizeof ecname, "%.*s.ec", (int)(strlen(s->settled) - 8 - 5), s->settled + 8);
+    CHECK(strstr(log, "DIVERGED") && strstr(log, hex) && strstr(log, ecname) && strstr(log, s->settled) &&
+          strstr(log, "volume 0 partition"));
+    CHECK(atomic_load(&x->db->diverged));
+    acc a;
+    CHECK(read_all(x, &a) == TSDB_ERR_UNAVAILABLE);
+    CHECK(tsdb_append(x->t, TSDB_SID(0, x->s), T0 + 5 * DAY, 1.0f) == TSDB_ERR_UNAVAILABLE);
+    /* held for good: past keep_s (1 s) a purge leaves it */
+    while (eng_now_ms(x->db) < s->rec.settle_ms + 1200)
+        sleep_ms(50);
+    graveyard_purge(x->db, false);
+    CHECK(exists(s->settled) && eckeep_status(x->db, s->settled) == ECKEEP_DIVERGED);
+}
+
+static void case_diverged(bool othersrc)
+{
+    fresh(othersrc ? "othersrc" : "damageall");
+    h x;
+    CHECK(h_open(&x, 1) == 0);
+    write_day(&x, 20000);
+    acc a0;
+    CHECK(read_all(&x, &a0) == 0);
+    atomic_store(&eckeep_test_pause, true);
+    settled s;
+    CHECK(settle_one(&x, othersrc, &s) == 0);
+    if (!othersrc)
+        for (unsigned pos = 0; pos < (unsigned)s.rec.k + s.rec.m; pos++) /* the object's k' + m */
+            CHECK(flip(&s, pos) > 0);
+    cap_begin();
+    atomic_store(&eckeep_test_pause, false);
+    int st = eckeep_test_wait(x.db, s.settled, 20000);
+    char *log = cap_end();
+    CHECK(st == ECKEEP_DIVERGED);
+    diverged_checks(&x, &s, log);
+    h_close(&x);
+    /* a reopen digests it again, and again it does not match */
+    atomic_store(&eckeep_test_pause, true);
+    cap_begin();
+    CHECK(h_open(&x, 1) == 0);
+    acc a;
+    CHECK(!atomic_load(&x.db->diverged) && read_all(&x, &a) != TSDB_ERR_UNAVAILABLE); /* not known yet */
+    atomic_store(&eckeep_test_pause, false);
+    st = eckeep_test_wait(x.db, s.settled, 20000);
+    log = cap_end();
+    CHECK(st == ECKEEP_DIVERGED);
+    diverged_checks(&x, &s, log);
+    h_close(&x);
+    free(s.rec.sums);
+}
+
+static void case_pending(void)
+{
+    fresh("pending");
+    h x;
+    CHECK(h_open(&x, 1) == 0);
+    write_day(&x, 20000);
+    atomic_store(&eckeep_test_pause, true);
+    settled s;
+    CHECK(settle_one(&x, false, &s) == 0);
+    h_close(&x);
+    CHECK(exists(s.settled));
+    CHECK(h_open(&x, 1) == 0);
+    while (eng_now_ms(x.db) < s.rec.settle_ms + 1200)
+        sleep_ms(50);
+    graveyard_purge(x.db, false); /* due, but not digested in this process: held */
+    CHECK(exists(s.settled) && eckeep_status(x.db, s.settled) == ECKEEP_PENDING);
+    atomic_store(&eckeep_test_pause, false);
+    CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
+    graveyard_purge(x.db, false);
+    CHECK(!exists(s.settled));
+    h_close(&x);
+    free(s.rec.sums);
+}
+
+static void move_store(int i, bool away)
+{
+    char a[PATH_MAX + 80];
+    snprintf(a, sizeof a, "%s.away", stores[i]);
+    CHECK(rename(away ? stores[i] : a, away ? a : stores[i]) == 0);
+}
+
+static void case_down(void)
+{
+    fresh("down");
+    h x;
+    CHECK(h_open(&x, 1) == 0);
+    write_day(&x, 20000);
+    atomic_store(&eckeep_test_pause, true);
+    settled s;
+    CHECK(settle_one(&x, false, &s) == 0);
+    h_close(&x);
+    move_store(NST - 1, true);
+    CHECK(h_open(&x, 1) == 0);
+    atomic_store(&eckeep_test_pause, false);
+    uint64_t t0 = eckeep_test_tries(x.db);
+    CHECK(eckeep_test_wait(x.db, s.settled, 2500) == ECKEEP_PENDING);
+    CHECK(eckeep_test_tries(x.db) > t0);
+    while (eng_now_ms(x.db) < s.rec.settle_ms + 1200)
+        sleep_ms(50);
+    graveyard_purge(x.db, false);
+    CHECK(exists(s.settled) && eckeep_status(x.db, s.settled) == ECKEEP_PENDING);
+    CHECK(!atomic_load(&x.db->diverged));
+    h_close(&x);
+    move_store(NST - 1, false);
+    CHECK(h_open(&x, 1) == 0);
+    CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
+    graveyard_purge(x.db, false);
+    CHECK(!exists(s.settled));
+    h_close(&x);
+    free(s.rec.sums);
+}
+
+static void case_orphan(void)
+{
+    fresh("orphan");
+    h x;
+    CHECK(h_open(&x, 1) == 0);
+    write_day(&x, 20000);
+    atomic_store(&eckeep_test_pause, true);
+    settled s;
+    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(eng_drop_before(x.db, T0 + 2 * DAY) == 0);
+    int64_t found = eng_now_ms(x.db);
+    atomic_store(&eckeep_test_pause, false);
+    CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_ORPHAN);
+    CHECK(!atomic_load(&x.db->diverged));
+    while (eng_now_ms(x.db) < found + 1200)
+        sleep_ms(50);
+    graveyard_purge(x.db, false);
+    CHECK(!exists(s.settled));
+    h_close(&x);
+    free(s.rec.sums);
+}
+
+static const struct {
+    const char *name;
+    int m;
+} MUTANTS[] = {{"digestskip", ECKEEP_MUT_DIGESTSKIP},
+               {"digestraw", ECKEEP_MUT_DIGESTRAW},
+               {"digestnohold", ECKEEP_MUT_DIGESTNOHOLD},
+               {"keepmtime", ECKEEP_MUT_KEEPMTIME}};
+#endif
+
+int main(int argc, char **argv)
+{
+#ifndef TSDB_EC
+    (void)argc;
+    (void)argv;
+    printf("test_keep: skipped (built without TSDB_EC)\n");
+    return 0;
+#else
+    const char *base = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {
+            const char *m = argv[++i];
+            eckeep_mutant = -1;
+            for (size_t k = 0; k < sizeof MUTANTS / sizeof *MUTANTS; k++)
+                if (!strcmp(m, MUTANTS[k].name))
+                    eckeep_mutant = MUTANTS[k].m;
+            if (eckeep_mutant < 0) {
+                fprintf(stderr, "unknown mutant %s\n", m);
+                return 2;
+            }
+        } else {
+            base = argv[i];
+        }
+    }
+    snprintf(scratch, sizeof scratch, "%s/test_keep.XXXXXX", base);
+    if (!mkdtemp(scratch)) {
+        perror("mkdtemp");
+        return 1;
+    }
+    eckeep_digest_mb_s = 0;
+    case_xxh64();
+    case_match();
+    case_restart();
+    case_damage1();
+    case_diverged(false);
+    case_diverged(true);
+    case_pending();
+    case_down();
+    case_orphan();
+    if (failures == 0)
+        rm_rf(scratch);
+    printf("test_keep: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
+    return failures != 0;
+#endif
+}

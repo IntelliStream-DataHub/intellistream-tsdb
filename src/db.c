@@ -1100,6 +1100,7 @@ void eng_halt(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     db->nmergers = 0;
+    eckeep_eng_stop(db); /* R7: the digest thread holds part references and takes db->lock */
 }
 
 /* The names of `old` that `neu` also holds at the same index become `neu`'s: it frees its own copy and keeps the
@@ -1198,6 +1199,7 @@ int eng_close(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     free(db->mergers);
+    eckeep_eng_stop(db); /* R7: before the parts go (the digest thread references them and takes db->lock) */
     stats_stop(db);
     latest_close(db); /* after the final flush: it folds into the table too */
     if (db->own_sched)

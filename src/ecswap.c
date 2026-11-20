@@ -60,6 +60,7 @@
  * durable, its intent still there. An unknown name ends the process with status 2 at the first point passed.
  */
 #include "ecswap.h"
+#include "eckeep.h"
 #include "ecgc.h"
 #include "ecpart.h"
 
@@ -327,6 +328,7 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
         fprintf(stderr, "tsdb: unlink of settle intent %s after its swap: %s (the next open rolls it forward)\n",
                 intent, strerror(errno));
     pthread_mutex_unlock(&db->publish_lock);
+    eckeep_swapped(db, in, n); /* r7-keep: the settled_ files are held until their digests matched and keep_s passed */
     /* Its result is not the caller's, as in db_add_parts: the parts are committed and listed. A failed write of
      * MANIFEST failed the engine, which the next call sees; out of memory leaves the older MANIFEST until the next
      * publish. A caller that read an error here as "not swapped" would free the chunks of a listed .ec part. */

@@ -574,15 +574,19 @@ static void stubs_case(void)
             found = db->graveyard[i].kind == GY_EC;
     pthread_mutex_unlock(&db->lock);
     CHECK(found);
-    /* a settled source in the graveyard goes to r7-keep's stub */
+    /* a settled source in the graveyard goes to r7-keep (src/eckeep.c), which releases one only after its digest
+     * matched: never without a tier, as here, so the file stays (and is taken away by hand below) */
     touch(dir, "settled_p0_1_1_0.part");
     pthread_mutex_lock(&db->lock);
     CHECK(graveyard_add(db, "settled_p0_1_1_0.part", GY_SETTLED, 0) == 0);
     pthread_mutex_unlock(&db->lock);
     calls_now(c0);
     graveyard_purge(db, true);
-    CHECK(!exists(dir, retired0) && !exists(dir, "settled_p0_1_1_0.part"));
+    CHECK(!exists(dir, retired0) && exists(dir, "settled_p0_1_1_0.part"));
     CHECK(CALLS_SINCE(EC_CALL_GC_PURGE, c0) == 1 && CALLS_SINCE(EC_CALL_KEEP_PURGE, c0) == 1);
+    char settled0[700];
+    snprintf(settled0, sizeof settled0, "%s/settled_p0_1_1_0.part", dir);
+    CHECK(unlink(settled0) == 0);
     acc dropped = read_all(db, s);
     CHECK(dropped.n == 20000);
     CHECK(eng_close(db) == 0); /* part_unref freed the marked part's ecpart (ASan) */

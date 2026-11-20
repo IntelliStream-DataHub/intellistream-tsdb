@@ -1150,6 +1150,14 @@ static int64_t sid_volume(tsdb_sid id) { return id >> 48 || !(id >> 32) ? -1 : (
  * reference is taken under the read lock and refused once the engine is quiesced, which is set under the write lock:
  * so after tsdb_volume_quiesce returns, the count only falls. `route` and the loops over the volumes give theirs
  * back with EREF (a cleanup) or eng_unref. */
+/* Whether a call is refused on the volume (TSDB_ERR_UNAVAILABLE): it is quiesced, or a settle's digest found it
+ * DIVERGED (src/eckeep.h, D5; the digest thread sets it with no handle, so it is a flag of its own, read here). */
+static bool eng_refused(eng *e)
+{
+    return atomic_load_explicit(&e->quiesced, memory_order_acquire) ||
+           atomic_load_explicit(&e->diverged, memory_order_acquire);
+}
+
 static pthread_mutex_t idle_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t idle_cv = PTHREAD_COND_INITIALIZER;
 
@@ -1244,7 +1252,7 @@ static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
     if (ok && !t->vols[v]) { /* a cluster volume this server does not hold (or no volume) */
         route_rc = t->cluster && t->cnames[v] ? TSDB_ERR_UNAVAILABLE : 0;
         ok = false;
-    } else if (ok && live && atomic_load_explicit(&t->vols[v]->quiesced, memory_order_acquire)) {
+    } else if (ok && live && eng_refused(t->vols[v])) {
         route_rc = TSDB_ERR_UNAVAILABLE;
         ok = false;
     } else if (ok) {
@@ -1520,7 +1528,7 @@ static int feed_engines(tsdb *t, eng ***out, bool **live, size_t *n)
     if (v && lv) {
         memcpy(v, t->vols, *n * sizeof *v);
         for (size_t i = 0; i < *n; i++)
-            if ((lv[i] = v[i] && !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
+            if ((lv[i] = v[i] && !eng_refused(v[i])))
                 eng_ref(v[i]);
     }
     pthread_rwlock_unlock(&t->lock);
@@ -1697,7 +1705,7 @@ static int cvol_series_make(tsdb *t, const char *name, int type, const char *vna
     if (rc)
         return rc;
     pthread_rwlock_rdlock(&t->lock);
-    eng *e EREF = t->vols[v] && !atomic_load_explicit(&t->vols[v]->quiesced, memory_order_acquire)
+    eng *e EREF = t->vols[v] && !eng_refused(t->vols[v])
                       ? eng_ref(t->vols[v]) : NULL;
     pthread_rwlock_unlock(&t->lock);
     if (!e)
@@ -1767,7 +1775,7 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ts
     uint32_t local = 0;
     if (rc == 0) {
         pthread_rwlock_rdlock(&t->lock); /* an add may move the array */
-        eng *e EREF = atomic_load_explicit(&t->vols[vol]->quiesced, memory_order_acquire) ? NULL : eng_ref(t->vols[vol]);
+        eng *e EREF = eng_refused(t->vols[vol]) ? NULL : eng_ref(t->vols[vol]);
         pthread_rwlock_unlock(&t->lock);
         rc = e ? eng_series(e, name, type < 0 ? TSDB_FLOAT32 : type, &local) /* one append, in the volume */
                : TSDB_ERR_UNAVAILABLE;
@@ -1972,6 +1980,15 @@ void *tsdb_test_meta_hold(tsdb *t, tsdb_sid id)
         h = NULL;
     }
     return h;
+}
+
+/* tests (tests/test_keep.c): the engine of volume vol, unreferenced (the handle keeps it while it is open) */
+eng *tsdb_test_engine(tsdb *t, uint32_t vol)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    eng *e = vol < t->nvols ? t->vols[vol] : NULL;
+    pthread_rwlock_unlock(&t->lock);
+    return e;
 }
 
 int tsdb_test_meta_use(void *hold) /* what tsdb_series_type does with the engine */
@@ -2384,7 +2401,7 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
     }
     if (one) {
         eng *e EREF = t->vols[n ? TSDB_SID_VOLUME(series[0]) : 0];
-        if (atomic_load_explicit(&e->quiesced, memory_order_acquire))
+        if (eng_refused(e))
             e = NULL, route_rc = TSDB_ERR_UNAVAILABLE;
         else
             eng_ref(e);
@@ -2425,7 +2442,7 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
             continue;
         if (t->crole && t->crole[v] == CVOL_REPLICA)
             rc = rc ? rc : TSDB_ERR_READONLY;
-        else if (atomic_load_explicit(&vols[v]->quiesced, memory_order_acquire))
+        else if (eng_refused(vols[v]))
             rc = rc ? rc : TSDB_ERR_UNAVAILABLE;
         else
             eng_ref(vols[v]), refd[v] = true;
@@ -2544,7 +2561,7 @@ static int each(tsdb *t, int (*fn)(eng *))
     if (v && live) {
         memcpy(v, t->vols, n * sizeof *v);
         for (size_t i = 0; i < n; i++)
-            if ((live[i] = v[i] && !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
+            if ((live[i] = v[i] && !eng_refused(v[i])))
                 eng_ref(v[i]);
     }
     pthread_rwlock_unlock(&t->lock);
