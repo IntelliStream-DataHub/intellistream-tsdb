@@ -81,6 +81,7 @@
 #include "tsdb.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -97,6 +98,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -647,6 +649,9 @@ static int start_node(int i, const char *crash_at, int *status)
         int fd = open(n->log, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0)
             dup2(fd, 2);
+        /* lets dump_threads' gdb (not an ancestor of the node) attach under yama ptrace_scope 1; kept across exec */
+        if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0) {
+        }
         execve(bin, (char *const *)argv, envp);
         _exit(127);
     }
@@ -819,6 +824,9 @@ static void view_free(struct view *v)
     memset(v, 0, sizeof *v);
 }
 
+/* why the last view_get of this thread failed: a settle that times out names it */
+static _Thread_local char view_err[300];
+
 /* STATUS of node i through its real peer port, as `tsdb cluster status` asks. 0, or -1 when it did not answer. */
 static int view_get(int i, struct view *v, int timeout_ms)
 {
@@ -826,20 +834,28 @@ static int view_get(int i, struct view *v, int timeout_ms)
     node_snap(i, NULL, NULL, &pp);
     memset(v, 0, sizeof *v);
     meta_init(&v->m);
-    if (pp <= 0)
+    if (pp <= 0) {
+        snprintf(view_err, sizeof view_err, "no peer port");
         return -1;
-    char addr[48], err[256];
+    }
+    char addr[48], err[256] = "";
     snprintf(addr, sizeof addr, "127.0.0.1:%d", pp);
-    int rc;
+    int rc = 0, ar;
     size_t len = 0;
-    if (cluster_admin(addr, secret, secret_len, CLUSTER_OP_STATUS, NULL, 0, timeout_ms, &rc, &v->raw, &len, err,
-                      sizeof err) != 0 || rc != 0 || cluster_status_parse(v->raw, len, &v->st) != 0) {
+    int64_t t0 = now_ms();
+    if ((ar = cluster_admin(addr, secret, secret_len, CLUSTER_OP_STATUS, NULL, 0, timeout_ms, &rc, &v->raw, &len, err,
+                            sizeof err)) != 0 ||
+        rc != 0 || cluster_status_parse(v->raw, len, &v->st) != 0) {
+        snprintf(view_err, sizeof view_err, "%s after %" PRId64 " ms (%s)",
+                 ar ? "no reply" : rc ? "rc != 0" : "a reply that does not parse", now_ms() - t0,
+                 ar ? err : rc ? "admin error" : "status");
         free(v->raw);
         meta_free(&v->m);
         memset(v, 0, sizeof *v);
         return -1;
     }
     if (v->st.image_len && meta_snapshot_decode(&v->m, v->st.image, v->st.image_len) != META_OK) {
+        snprintf(view_err, sizeof view_err, "an image of %zu bytes that does not decode", (size_t)v->st.image_len);
         view_free(v);
         return -1;
     }
@@ -876,6 +892,59 @@ static int admin_real(int i, int op, const void *req, size_t rl, int follow, int
 
 /* Every node up and answering, one leader that every core node names, every member UP, the same metadata. A node
  * stuck in a state nobody leaves is what this is for. Returns 0, or -1 with `why` naming what is not yet so. */
+static int settle_bad = -1; /* the node a failing settled_once named last (STATUS), for the dump at a timeout */
+
+/* The threads of node i: name, state and kernel wait channel (what a cluster thread that answers no STATUS waits on) */
+static void dump_threads(int i)
+{
+    pid_t pid;
+    node_snap(i, &pid, NULL, NULL);
+    if (pid <= 0)
+        return;
+    char d[64];
+    snprintf(d, sizeof d, "/proc/%d/task", (int)pid);
+    DIR *dir = opendir(d);
+    if (!dir)
+        return;
+    fprintf(stderr, "jepsen-cluster: threads of node %d (pid %d): name state wchan\n", i, (int)pid);
+    struct dirent *e;
+    while ((e = readdir(dir))) {
+        if (e->d_name[0] == '.')
+            continue;
+        char p[384], comm[64] = "?", st[512] = "", wch[128] = "?";
+        FILE *f;
+        snprintf(p, sizeof p, "%s/%s/comm", d, e->d_name);
+        if ((f = fopen(p, "r"))) {
+            if (fgets(comm, sizeof comm, f))
+                comm[strcspn(comm, "\n")] = 0;
+            fclose(f);
+        }
+        snprintf(p, sizeof p, "%s/%s/stat", d, e->d_name);
+        if ((f = fopen(p, "r"))) {
+            if (!fgets(st, sizeof st, f))
+                st[0] = 0;
+            fclose(f);
+        }
+        const char *rp = strrchr(st, ')');
+        snprintf(p, sizeof p, "%s/%s/wchan", d, e->d_name);
+        if ((f = fopen(p, "r"))) {
+            if (!fgets(wch, sizeof wch, f))
+                snprintf(wch, sizeof wch, "?");
+            fclose(f);
+        }
+        fprintf(stderr, "  %s %s %c %s\n", e->d_name, comm, rp && rp[1] && rp[2] ? rp[2] : '?', wch);
+    }
+    closedir(dir);
+    if (access("/usr/bin/gdb", X_OK) == 0) { /* the node is our child: ptrace is allowed under yama scope 1 */
+        char cmd[160];
+        snprintf(cmd, sizeof cmd, "timeout 60 gdb -p %d -batch -ex 'thread apply all bt' </dev/null >&2 2>&1",
+                 (int)pid);
+        fflush(stderr);
+        if (system(cmd) != 0) {
+        }
+    }
+}
+
 static int settled_once(char *why, size_t wn)
 {
     struct view v[MAXN];
@@ -887,7 +956,8 @@ static int settled_once(char *why, size_t wn)
             snprintf(why, wn, "node %d is %s", i, pid <= 0 ? "not running" : "paused");
             rc = -1;
         } else if (view_get(i, &v[i], 2500) != 0) {
-            snprintf(why, wn, "node %d does not answer STATUS", i);
+            snprintf(why, wn, "node %d does not answer STATUS: %s", i, view_err);
+            settle_bad = i;
             rc = -1;
         } else {
             have[i] = 1;
@@ -939,7 +1009,7 @@ static int settles;
 
 static void settle(const char *after)
 {
-    char why[256] = "";
+    char why[512] = "";
     int64_t t0 = now_ms();
     int good = 0;
     while (now_ms() - t0 < SETTLE_MS) {
@@ -952,8 +1022,11 @@ static void settle(const char *after)
         usleep(200000);
     }
     int64_t took = now_ms() - t0;
-    if (good < 2)
+    if (good < 2) {
+        if (settle_bad >= 0 && strstr(why, "does not answer STATUS"))
+            dump_threads(settle_bad);
         die(1, "no settle within %d ms after %s: %s", SETTLE_MS, after, why);
+    }
     settles++;
     settle_ms_total += took;
     if (took > settle_ms_max)
