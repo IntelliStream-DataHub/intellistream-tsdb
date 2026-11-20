@@ -1662,6 +1662,56 @@ static void case_open_checks(void)
     }
     leader_free(&l);
 
+    /* the same, where the segment after the gap is a new epoch's (a promotion's jump to epoch << 40): its number says
+     * nothing of the missing ones, the parts' positions do (jepsen-cluster power, 2026-11-20: a promoted leader's flushed
+     * epoch-1 segments went in part, and every open refused the volume for good; mutant gapbyseq) */
+    fresh(dir, "j1c");
+    leader_init(&l);
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        leader_roll(&l);
+    }
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    end = l.r[l.n - 1].last;
+    CHECK_EQ(replica_apply(db, end), 0);
+    uint64_t epos = 0;
+    CHECK_EQ(replica_epoch_begin(db, 2, "n1", &epos), 0); /* the segment 2 << 40, its EPOCH marker at end + 1 */
+    CHECK_EQ(epos, end + 1);
+    CHECK_EQ(replica_sync(db), 0);
+    char s2[PATH_MAX + 64], k2[PATH_MAX + 80];
+    seg_file(s1, sizeof s1, dir, 1);
+    seg_file(s2, sizeof s2, dir, 2);
+    snprintf(k1, sizeof k1, "%s.save", s1);
+    snprintf(k2, sizeof k2, "%s.save", s2);
+    CHECK_EQ(link(s1, k1), 0);
+    CHECK_EQ(link(s2, k2), 0);
+    CHECK_EQ(replica_apply(db, end + 1), 0);
+    CHECK_EQ(replica_flush(db), 0); /* as a promotion does: every row is in parts, their fno_hi is end */
+    CHECK_EQ(mt_flush(db), 0);
+    eng_close(db);
+    if (access(s1, F_OK) != 0)
+        CHECK_EQ(link(k1, s1), 0);
+    if (access(s2, F_OK) != 0)
+        CHECK_EQ(link(k2, s2), 0);
+    unlink(k1);
+    unlink(k2);
+    seg_file(p, sizeof p, dir, 3);
+    unlink(p); /* the gap is right below the new epoch's segment */
+    CHECK_EQ(open_replica(dir, 0, &db), TSDB_ERR_CORRUPT); /* above the floor: still damage */
+    CHECK_EQ(open_replica(dir, end + 1, &db), 0);
+    if (db) {
+        CHECK_EQ(access(s1, F_OK) != 0, true);
+        CHECK_EQ(access(s2, F_OK) != 0, true);
+        CHECK_EQ(replica_log_end(db), end + 1);
+        eng_close(db);
+    }
+    leader_free(&l);
+
     /* a torn tail is cut: the next append lands at the valid end */
     fresh(dir, "j2");
     leader_init(&l);
@@ -6128,6 +6178,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "opensync") == 0 ? MUT_REPLICA_NO_OPEN_SYNC
                         : strcmp(m, "gapcheck") == 0 ? MUT_REPLICA_NO_GAP_CHECK
                         : strcmp(m, "noleftover") == 0 ? MUT_REPLICA_NO_LEFTOVER_DROP
+                        : strcmp(m, "gapbyseq") == 0 ? MUT_REPLICA_GAP_BY_SEQ
                         : strcmp(m, "torncut") == 0 ? MUT_REPLICA_NO_TORN_CUT
                         : strcmp(m, "floorcheck") == 0 ? MUT_REPLICA_NO_FLOOR_CHECK
                         : strcmp(m, "durablegate") == 0 ? MUT_REPLICA_NO_DURABLE_GATE

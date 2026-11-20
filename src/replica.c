@@ -276,9 +276,11 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     if (nseg)
         qsort(segs, nseg, sizeof *segs, cmp_seg);
 
-    uint64_t parts_seq = 0;
-    for (size_t i = 0; i < db->nparts; i++)
+    uint64_t parts_seq = 0, parts_fno = 0;
+    for (size_t i = 0; i < db->nparts; i++) {
         parts_seq = MAX(parts_seq, db->parts[i]->wal_seq);
+        parts_fno = MAX(parts_fno, db->parts[i]->fno_hi);
+    }
     for (size_t k = 0; k < nseg && rc == 0; k++)
         rc = wal_check_segment(db, &segs[k]);
     if (rc == 0)
@@ -296,14 +298,21 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
      * batch and lose an earlier one (jepsen-cluster power, 2026-11-20: a promoted replica's old segment of position 1
      * came back beside the rest of its retained log, and every later open refused the volume for good). The segments
      * before such a gap hold only rows the parts hold: they go now, before anything is listed, so the log starts after
-     * the gap and a laggard below it is sent a snapshot. A gap above the parts or the floor stays damage (below). */
+     * the gap and a laggard below it is sent a snapshot. A gap above the parts or the floor stays damage (below).
+     * "Below the parts" is either the segment numbers (the one before the segment after the gap was flushed) or, where
+     * the numbers jump at a promotion (epoch << 40) and the old epoch's last number is unknown, the positions: a part
+     * holds the row just before the gap's end, and a flush takes every row of the segments it seals, in segment order
+     * (jepsen-cluster power, 2026-11-20: a promoted leader's flushed epoch-1 segments went in part, wal_..20000000000
+     * followed the gap, and its open refused the volume for good). A marker as the gap's last record fails this: damage. */
     if (rc == 0 && eng_test_mutant != MUT_REPLICA_NO_LEFTOVER_DROP) {
         size_t lo = 0;
         uint64_t prev_end = 0;
         for (size_t k = 0; k < nseg; k++) {
             if (!segs[k].fno_first)
                 continue;
-            if (prev_end && segs[k].fno_first > prev_end && segs[k].seq - 1 <= parts_seq &&
+            if (prev_end && segs[k].fno_first > prev_end &&
+                (segs[k].seq - 1 <= parts_seq ||
+                 (parts_fno >= segs[k].fno_first - 1 && eng_test_mutant != MUT_REPLICA_GAP_BY_SEQ)) &&
                 segs[k].fno_first - 1 <= floor)
                 lo = k;
             prev_end = segs[k].fno_end;
