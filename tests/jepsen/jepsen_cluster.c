@@ -1073,6 +1073,7 @@ struct rd {
     int64_t begin, end;
     uint32_t seen[KEYS]; /* the id of the write whose value a key shows, 0: nothing */
     uint8_t stray;
+    int8_t node; /* the node that answered it (kv_roam: a stale read names it) */
 };
 #define MAXSESS 4
 struct hist {
@@ -1318,6 +1319,7 @@ static void *kv_reader(void *arg)
         }
         struct rd tmp;
         memset(&tmp, 0, sizeof tmp);
+        tmp.node = (int8_t)node;
         if (kv_read_all(c, sid, &tmp) == 0 && (!atomic_load(&term_ns) || tmp.begin < atomic_load(&term_ns)))
             *hist_read_slot(h, 0) = tmp;
         else {
@@ -1759,9 +1761,11 @@ static int check_hist(struct hist *h, uint64_t *seen_indet_applied)
                 }
                 if (lo > 0) {
                     if (v == 0)
-                        VIOL(V_STALE, "stale read: key %d is empty in a read that began after it was written and acknowledged", k);
+                        VIOL(V_STALE, "stale read: key %d is empty in a read that began after it was written and acknowledged "
+                                     "(read %u, answered by node %d)", k, j, rd->node);
                     else if (v <= nw && w[v - 1].end < ack[k][2 * (lo - 1) + 1])
-                        VIOL(V_STALE, "stale read: key %d shows write %u, older than an acknowledged write of the key", k, v);
+                        VIOL(V_STALE, "stale read: key %d shows write %u, older than an acknowledged write of the key (read %u, "
+                                     "answered by node %d)", k, v, j, rd->node);
                 }
                 /* 3: what a write that is seen did at its other keys */
                 if (v && v <= nw)

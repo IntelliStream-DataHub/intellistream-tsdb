@@ -4544,8 +4544,8 @@ static tsdbc *login_retry(int i, const char *user, const char *pw, int budget_ms
  * there: a replica serves no read), and the C client follows MOVED to the leader within its budget; lone answers
  * UNAVAILABLE (NO_OWNER) off its real leader; a user with a prefix grant writes through a server that holds no copy of
  * south and is moved, not DENIED, and an id outside the grant is still DENIED at the owner; a frame naming volumes
- * led on two servers is INVALID and writes nothing. Mutants (TSDB_ROUTE_MUTANT): rightsbeforeroute, movedoffcopy,
- * replicaread, spanaccepted. */
+ * led on two servers is INVALID and writes nothing; a volume the copy has no record of is NO_OWNER, never an empty read.
+ * Mutants (TSDB_ROUTE_MUTANT): rightsbeforeroute, movedoffcopy, replicaread, spanaccepted, nocopyserved. */
 static void scen_route(void)
 {
     scenario("route");
@@ -4645,8 +4645,18 @@ static void scen_route(void)
     c = login_retry(nl, "root", "root-pw", 0);
     expect_unavail(c, tsdbc_series_at(c, "plant.c", "lone", &x), (uint16_t)num[1], TSDB_WHY_NO_OWNER,
                    "a volume with no leader in the copy");
+    /* a volume the copy has no record of (here never made; in jepsen-cluster a restarted server before its copy was
+     * built): not open here, so the engine would answer an empty read; NO_OWNER until the copy knows it */
+    tsdb_sid ghost = TSDB_SID(9, 0);
+    nrows = 0;
+    expect_unavail(c, tsdbc_query_raw(c, ghost, 0, INT64_MAX / 2, count_rows, NULL), 9, TSDB_WHY_NO_OWNER,
+                   "a read of a volume the copy does not know");
+    if (nrows != 0)
+        die("a read of a volume the copy does not know answered %d rows", nrows);
+    expect_unavail(c, tsdbc_insert_series(c, ghost, ts, val, 1), 9, TSDB_WHY_NO_OWNER,
+                   "a write to a volume the copy does not know");
     tsdbc_close(c);
-    printf("  a volume with no leader in the copy: UNAVAILABLE (NO_OWNER)\n");
+    printf("  a volume with no leader in the copy, or none in it: UNAVAILABLE (NO_OWNER)\n");
 
     /* south, on one server: a user with a prefix grant writes by id through a server without a copy of it and
      * is moved, never DENIED there (the id is not resolved through that server's names); outside the grant: DENIED at

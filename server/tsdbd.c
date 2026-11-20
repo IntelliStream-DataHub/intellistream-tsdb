@@ -2346,15 +2346,15 @@ static void route_moved(conn *c, req *r, uint16_t vol)
  * answered before anything of it is done (not applied, include/tsdb.h): MOVED to the leader the metadata copy names,
  * writes and reads alike (D-S8: a replica never answers a read; S3's REPLICA_OK may), UNAVAILABLE (NO_OWNER, about
  * 1 s) when the copy names no leader, UNAVAILABLE (PROMOTING, about 200 ms) when the leader's member is not UP
- * (route_fill). A volume the copy does not know (the root, one led here before the copy shows it, an id of no volume)
- * gets today's answer from the gates after it. The decision comes before any right on a series id is checked
+ * (route_fill). A volume the copy does not know gets today's answer from the gates after it only when it is the root or
+ * open here as a writer; else NO_OWNER (route_away). The decision comes before any right on a series id is checked
  * (auth_check_ids, auth_ids, auth_id resolve an id through the names of this server's volumes: a volume led elsewhere
  * would be DENIED here; the owner checks them, D-S8). A frame whose rows name volumes led on two nodes is INVALID with
  * a log line (D-S4: S3's clients split frames). Led here is this server's own view (the gates after it, the read lease
  * among them, judge it as before), so a copy that lags a promotion here does not move requests away.
  * The copy is held per worker thread and taken again only when cluster_copy_builds() moved: per request it reads
  * one shared line and takes the volume table's read lock (tsdb_cvol_role), which the engine's route takes anyway. */
-enum { RTM_NONE, RTM_RIGHTSBEFOREROUTE, RTM_MOVEDOFFCOPY, RTM_REPLICAREAD, RTM_SPANACCEPTED };
+enum { RTM_NONE, RTM_RIGHTSBEFOREROUTE, RTM_MOVEDOFFCOPY, RTM_REPLICAREAD, RTM_SPANACCEPTED, RTM_NOCOPYSERVED };
 static int route_mutant; /* TSDB_ROUTE_MUTANT (tests: each must fail test_cluster route) */
 static __thread const struct cluster_copy *rt_cp;
 static __thread unsigned long rt_builds;
@@ -2380,14 +2380,19 @@ static void route_release(void) /* a worker that leaves */
 }
 
 /* Volume v: 0 to serve here, else 1 with *owner the copy's leader (0: none; this server when the copy names it while
- * it does not lead the volume here yet). `read`: the request only reads (the replicaread mutant serves it here). */
+ * it does not lead the volume here yet). `read`: the request only reads (the replicaread mutant serves it here).
+ * A volume the copy has no record of (no copy yet: a server just started; or a copy that lags the volume's creation)
+ * is served only when it is open here as a writer (the gates after it judge it). Anything else would be answered by
+ * an engine that does not hold the volume: an empty read (jepsen-cluster, kv on random members: a member without kvr,
+ * restarted, answered reads with no rows before its copy was built). It is UNAVAILABLE NO_OWNER, retried, until the
+ * copy knows the volume. Volume 0 (the root, which holds no series on a cluster node) keeps today's answer. */
 static int route_away(uint32_t v, bool read, uint32_t *owner)
 {
     const struct cluster_copy *cp = route_copy();
     const struct cluster_copy_vol *cv = cluster_copy_vol(cp, v);
     *owner = 0;
     if (!cv)
-        return 0;
+        return v != 0 && route_mutant != RTM_NOCOPYSERVED && tsdb_cvol_role(db, v) != CVOL_WRITER;
     *owner = cv->leader;
     if (route_mutant == RTM_MOVEDOFFCOPY)
         return 1;
@@ -5045,7 +5050,8 @@ int main(int argc, char **argv)
     test_read_stall = getenv("TSDBD_TEST_READ_STALL");
     test_route_moved = getenv("TSDBD_TEST_ROUTE_MOVED") ? atoi(getenv("TSDBD_TEST_ROUTE_MOVED")) : 0;
     if (getenv("TSDB_ROUTE_MUTANT")) {
-        static const char *const names[] = {"", "rightsbeforeroute", "movedoffcopy", "replicaread", "spanaccepted"};
+        static const char *const names[] = {"",           "rightsbeforeroute", "movedoffcopy",
+                                            "replicaread", "spanaccepted",      "nocopyserved"};
         for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
             if (strcmp(getenv("TSDB_ROUTE_MUTANT"), names[i]) == 0)
                 route_mutant = i;

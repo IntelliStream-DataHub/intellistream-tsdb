@@ -846,13 +846,17 @@ cluster volume it names is led there (the node's own view: its writer role or `l
 here does not send requests away). A replica, or a node that has no copy of the volume, answers MOVED to the leader
 its metadata copy names, reads included (D5: a replica never answers a read; S3's REPLICA_OK may); UNAVAILABLE
 (NO_OWNER, about 1 s) when the copy names no leader; UNAVAILABLE (PROMOTING, about 200 ms) when the leader's member
-is not UP or the volume is being promoted here. A volume the copy does not know gets the answer of the gates after it,
-as before. Every one of these answers is given before anything of the request is done, so each means "not applied"
+is not UP or the volume is being promoted here. A volume the copy does not know (no copy yet: a node just started; or
+a copy that lags the volume's creation) is served only where it is open as a writer; anywhere else it is UNAVAILABLE
+(NO_OWNER), because an engine that does not hold the volume answers a read with no rows (jepsen-cluster found that
+stale read on a restarted node without the volume). The root (volume 0) keeps the answer of the gates after it. The
+price: an id of a volume that was never made is retried until the client's budget runs out instead of failing at once.
+Every one of these answers is given before anything of the request is done, so each means "not applied"
 (§6.5). The decision comes before any right on a series id is checked: rights on ids resolve through the names of the
 volumes served here, so an id of a volume led elsewhere would be DENIED at the entry node; the owner checks them.
 A frame whose rows name volumes led on two nodes is INVALID with a log line (S3's clients split frames).
 `test_cluster route` tests it, and `TSDB_ROUTE_MUTANT` (`rightsbeforeroute`, `movedoffcopy`, `replicaread`,
-`spanaccepted`) plants the bugs it must catch.
+`spanaccepted`, `nocopyserved`) plants the bugs it must catch.
 
 Risk, open until S3: MOVED carries the address in the copy. A node restarted on another port or host is named at its
 old address until its MEMBER_ADDR has committed and reached the copy, so a client moved meanwhile reaches nobody (an
