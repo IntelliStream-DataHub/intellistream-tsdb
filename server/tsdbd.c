@@ -121,6 +121,7 @@
 #include "auth.h"
 #include "tenants.h"
 #include "cluster.h"
+#include "fwd.h"
 #include "cvol.h"
 #include "repld.h"
 #include "../src/cvol.h"
@@ -5001,7 +5002,7 @@ int main(int argc, char **argv)
         struct cluster_cfg cc = {.state_dir = state_dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
                                  .rack = rack, .power_feed = power_feed, .bmc = bmc, .read_barrier_off = rb_off,
                                  .secret = secret, .secret_len = secret_len, .loop_gated = 1};
-        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0)
+        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0 || fwd_cluster_start(NULL, NULL) != 0)
             return 1;
         crash_point(CP_CLUSTER_STARTED); /* the harness restarts the node and counts the hit (tests/jepsen) */
         tsdb_wipe(secret, sizeof secret);
@@ -5036,6 +5037,7 @@ int main(int argc, char **argv)
         metrics_stop(); /* before tsdb_close: it reads the database */
     if (cluster_on) {
         cluster_stop();
+        fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
         cvol_stop(); /* after the cluster thread: no push or report reaches it any more */
     }
     pthread_mutex_lock(&work_lock);
@@ -5055,6 +5057,8 @@ int main(int argc, char **argv)
     while (running_workers > 0)
         pthread_cond_wait(&workers_gone_cv, &work_lock);
     pthread_mutex_unlock(&work_lock);
+    if (cluster_on)
+        fwd_cluster_free(); /* no worker can call into the forwarding links any more */
 #ifndef TSDBD_NO_URING
     if (io == IO_URING)
         io_uring_queue_exit(&ring);

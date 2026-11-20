@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -34,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -42,6 +44,7 @@
 
 #include "internal.h"
 #include "peerlink.h"
+#include "fwd.h"
 #include "tsdb_crypto.h"
 
 static int failures;
@@ -319,6 +322,10 @@ struct node {
     int strict;       /* seq must be last + 1 */
     int echo;         /* a type 2 frame is answered with type 3 */
     int gate_closed;  /* on_frame blocks while set */
+    int gate_kind;    /* ...on links of this kind only (0: every link) */
+    _Atomic int t6;   /* type 6 frames seen */
+    _Atomic int sent_out[64]; /* on_sent by token: 0 none yet, 1 unwritten, 2 written; +10 per extra call */
+    _Atomic uint64_t sent_gen[64];
     /* rtt */
     uint64_t rtt[MAXRTT];
     _Atomic int nrtt;
@@ -355,9 +362,11 @@ static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p,
     if (!atomic_load(&nd->first_type))
         atomic_store(&nd->first_type, type);
     pthread_mutex_lock(&nd->mu);
-    while (nd->gate_closed)
+    while (nd->gate_closed && (!nd->gate_kind || plink_kind(l) == nd->gate_kind))
         pthread_cond_wait(&nd->cv, &nd->mu);
     pthread_mutex_unlock(&nd->mu);
+    if (type == 6)
+        atomic_fetch_add(&nd->t6, 1);
     if (type == 1 || type == 4) {
         uint64_t seq;
         if (n < 8) {
@@ -370,10 +379,12 @@ static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p,
         if (memcmp(want, p, n) != 0)
             nd->bad_frames++;
         free(want);
+        pthread_mutex_lock(&nd->mu); /* links of two kinds deliver on two threads (kinds) */
         if (nd->have_seq && (nd->strict ? seq != nd->last_seq + 1 : seq <= nd->last_seq))
             nd->order_bad++;
         nd->last_seq = seq;
         nd->have_seq = 1;
+        pthread_mutex_unlock(&nd->mu);
         nd->frames_in++;
     } else if (type == 2 && nd->echo) {
         plink_send(l, 3, p, n, 200);
@@ -466,6 +477,17 @@ static void b_end(void *arg, struct plink *l, uint64_t file, int status)
     atomic_fetch_add(&nd->ends, 1);
 }
 
+static void rec_sent(void *arg, struct plink *l, uint64_t token, uint64_t gen, int written)
+{
+    (void)l;
+    struct node *nd = arg;
+    if (token >= 64)
+        return;
+    int was = atomic_load(&nd->sent_out[token]);
+    atomic_store(&nd->sent_out[token], was ? was + 10 : 1 + !!written);
+    atomic_store(&nd->sent_gen[token], gen);
+}
+
 static struct node *node_new(uint32_t id, const uint8_t *secret, struct pl_cfg *over, int listen_it)
 {
     struct node *nd = calloc(1, sizeof *nd);
@@ -488,6 +510,7 @@ static struct node *node_new(uint32_t id, const uint8_t *secret, struct pl_cfg *
     c.arg = nd;
     c.on_link = on_link;
     c.on_frame = on_frame;
+    c.on_sent = rec_sent;
     c.bulk.open = b_open;
     c.bulk.data = b_data;
     c.bulk.end = b_end;
@@ -1698,6 +1721,610 @@ static void test_chain(void)
     node_free(a);
 }
 
+/* ---------------------------------------------------------------- forwarding kinds (server/fwd.h) */
+
+/* FWD and FWDQ links come up and carry frames; a kind this build does not know is refused at the HELLO, and cannot
+ * be dialed */
+static void test_kinds(void)
+{
+    struct node *a = node_new(1, SECRET, NULL, 1);
+    struct node *d = node_new(2, SECRET, NULL, 0);
+    a->strict = 0;
+    struct plink *f = dial(d, 1, a->port, PL_KIND_FWD), *q = dial(d, 1, a->port, PL_KIND_FWDQ);
+    CHECK(WAIT_FOR(plink_up(f) && plink_up(q), 3000));
+    CHECK(plink_kind(f) == PL_KIND_FWD && plink_kind(q) == PL_KIND_FWDQ);
+    CHECK(send_frames(f, 4, 1, 10, 3000, 1000) == PL_OK && send_frames(q, 4, 11, 10, 3000, 1000) == PL_OK);
+    CHECK(WAIT_FOR(a->frames_in == 20, 3000));
+    CHECK(a->bad_frames == 0);
+    CHECK(WAIT_FOR(peerlink_find(a->pl, 2, PL_KIND_FWD) && peerlink_find(a->pl, 2, PL_KIND_FWDQ), 1000));
+    struct pl_stats st;
+    peerlink_stats(d->pl, &st);
+    CHECK(st.bytes_out < st.raw_out); /* text frames: FWD and FWDQ are compressed, like LOG */
+    CHECK(peerlink_dial(d->pl, 1, "127.0.0.1:1", PL_KIND_FWDQ + 1) == NULL);
+    CHECK(peerlink_dial(d->pl, 1, "127.0.0.1:1", PL_KIND_META) == NULL);
+    int fd = raw_connect(a->port);
+    raw_hello(fd, 2, (uint8_t)g_uuid_byte, PL_KIND_FWDQ + 1);
+    int t = raw_read(fd, 1000);
+    printf("  kinds: an unknown kind's HELLO gets %d (-1: closed)\n", t);
+    CHECK(t == -1);
+    close(fd);
+    node_free(d);
+    node_free(a);
+}
+
+/* a payload above PL_FRAME_MAX is refused, header included; one at the bound goes */
+static void test_toobig(void)
+{
+    struct node *a = node_new(1, SECRET, NULL, 1);
+    struct node *d = node_new(2, SECRET, NULL, 0);
+    struct plink *f = dial(d, 1, a->port, PL_KIND_FWD);
+    CHECK(WAIT_FOR(plink_up(f), 3000));
+    uint8_t *b = malloc(PL_FRAME_MAX + 1);
+    fill_random(b, PL_FRAME_MAX + 1, 3);
+    uint8_t h[8] = {0};
+    CHECK(plink_send(f, 5, b, PL_FRAME_MAX + 1, 0) == PL_E_TOOBIG);
+    CHECK(plink_sendv(f, 0, 5, h, 8, b, PL_FRAME_MAX - 7, 0, 1, 9, 0) == PL_E_TOOBIG);
+    CHECK(atomic_load(&d->sent_out[9]) == 0); /* refused: never called back */
+    CHECK(plink_sendv(f, 0, 6, h, 8, b, PL_FRAME_MAX - 8, 1000, 1, 8, 0) == PL_OK);
+    CHECK(WAIT_FOR(a->t6 == 1 && atomic_load(&d->sent_out[8]) == 2, 5000));
+    free(b);
+    node_free(d);
+    node_free(a);
+}
+
+static int sent_all(struct node *d, int from, int to)
+{
+    for (int i = from; i <= to; i++)
+        if (!atomic_load(&d->sent_out[i]))
+            return 0;
+    return 1;
+}
+
+/* A frame is WRITTEN once a byte of it reached the socket, NEVER_WRITTEN when none did: frames 0 and 1 fill a
+ * receiver that stopped reading (0 delivered, 1 partly written), 2 and 3 wait in the queue; a deadline takes one out
+ * of the queue while the link is up; a cut ends the rest. Small socket buffers make "partly" certain. */
+static void test_written(void)
+{
+    struct pl_cfg over = {.sock_buf = 32 << 10, .dead_ms = 4000, .queue_bytes = 64u << 20};
+    struct node *a = node_new(1, SECRET, &over, 1);
+    struct node *d = node_new(2, SECRET, &over, 0);
+    a->strict = 0;
+    set_gate(a, 1);
+    struct plink *f = dial(d, 1, a->port, PL_KIND_FWD);
+    CHECK(WAIT_FOR(plink_up(f), 3000));
+    uint64_t g = plink_gen(f);
+    size_t n = PL_FRAME_MAX;
+    uint8_t *b = malloc(n);
+    for (uint64_t i = 0; i < 4; i++) {
+        gen_payload(1, b, n, 100 + i);
+        CHECK(plink_sendv(f, 0, 1, NULL, 0, b, n, 2000, 1, i, 0) == PL_OK);
+    }
+    /* 0 and 1 written (1 only in part: the receiver sits in frame 0's callback) */
+    int ok = WAIT_FOR(atomic_load(&d->sent_out[0]) == 2 && atomic_load(&d->sent_out[1]) == 2, 5000);
+    printf("  written: frames 0, 1: %d %d (2: written)\n", atomic_load(&d->sent_out[0]), atomic_load(&d->sent_out[1]));
+    CHECK(ok);
+    usleep(300 * 1000);
+    CHECK(atomic_load(&d->sent_out[2]) == 0 && atomic_load(&d->sent_out[3]) == 0);
+    /* a deadline in the queue: NEVER_WRITTEN, the link stays */
+    gen_payload(1, b, 64, 200);
+    uint64_t t0 = now_ns();
+    CHECK(plink_sendv(f, 0, 1, NULL, 0, b, 64, 0, 1, 4, now_ns() + 200 * 1000000ull) == PL_OK);
+    CHECK(WAIT_FOR(atomic_load(&d->sent_out[4]) == 1, 2000));
+    printf("  written: a queued frame's deadline of 200 ms ended it after %.0f ms\n", (double)(now_ns() - t0) / 1e6);
+    CHECK(plink_up(f) && plink_gen(f) == g);
+    plink_reset(f);
+    CHECK(WAIT_FOR(sent_all(d, 0, 4), 3000));
+    printf("  written: after the cut: %d %d %d %d %d\n", atomic_load(&d->sent_out[0]), atomic_load(&d->sent_out[1]),
+           atomic_load(&d->sent_out[2]), atomic_load(&d->sent_out[3]), atomic_load(&d->sent_out[4]));
+    CHECK(atomic_load(&d->sent_out[0]) == 2 && atomic_load(&d->sent_out[1]) == 2);
+    CHECK(atomic_load(&d->sent_out[2]) == 1 && atomic_load(&d->sent_out[3]) == 1);
+    for (int i = 0; i < 5; i++)
+        CHECK(atomic_load(&d->sent_gen[i]) == g);
+    set_gate(a, 0);
+    /* the receiver got frame 0 and at most frame 1, never one that was reported unwritten */
+    usleep(300 * 1000);
+    CHECK(a->frames_in <= 2 && a->bad_frames == 0);
+    CHECK(WAIT_FOR(plink_up(f) && plink_gen(f) > g, 3000)); /* the dialed link comes back */
+    usleep(200 * 1000);
+    for (int i = 0; i < 5; i++)
+        CHECK(atomic_load(&d->sent_out[i]) < 10); /* once each */
+    free(b);
+    node_free(d);
+    node_free(a);
+}
+
+/* A LOG link whose receiver stopped reading does not delay a FWD frame to the same peer: their own sockets */
+static void test_fwdstall(void)
+{
+    struct node *a = node_new(1, SECRET, NULL, 1);
+    struct node *d = node_new(2, SECRET, NULL, 0);
+    a->strict = 0;
+    a->gate_kind = PL_KIND_LOG;
+    set_gate(a, 1);
+    struct plink *lg = dial(d, 1, a->port, PL_KIND_LOG);
+    struct plink *f = dial(d, 1, a->port, PL_KIND_FWD);
+    CHECK(WAIT_FOR(plink_up(lg) && plink_up(f), 3000));
+    CHECK(send_frames(lg, 1, 1, 6, 1 << 20, 1000) == PL_OK); /* the receiver sits in the first one's callback */
+    usleep(200 * 1000);
+    uint64_t t0 = now_ns();
+    CHECK(plink_send(f, 6, "fwd", 3, 1000) == PL_OK);
+    int got = WAIT_FOR(a->t6 == 1, 1000);
+    printf("  fwdstall: a FWD frame behind a stalled LOG link: %s after %.1f ms\n", got ? "delivered" : "NOT delivered",
+           (double)(now_ns() - t0) / 1e6);
+    CHECK(got);
+    set_gate(a, 0);
+    node_free(d);
+    node_free(a);
+}
+
+/* two fwd instances: requests and replies, outcomes, deadlines, credit */
+#define FEV_MAX 512
+struct frec {
+    pthread_mutex_t mu;
+    struct fwd_ev ev[FEV_MAX];
+    uint8_t body0[FEV_MAX]; /* the first byte of each body */
+    int n;
+    struct fwd *self;
+    int autoreply;          /* a FWD request with frame id below 10 (or below autoreply, when above 1) is echoed (its
+                             * first 64 bytes) */
+    int block_type;         /* the first event of this type after block_ms is set sleeps that long (a slow consumer) */
+    _Atomic int block_ms;
+};
+
+static void frec_ev(void *arg, const struct fwd_ev *ev)
+{
+    struct frec *r = arg;
+    if (r->block_type && ev->type == r->block_type) {
+        int ms = atomic_exchange(&r->block_ms, 0);
+        if (ms)
+            usleep((useconds_t)ms * 1000);
+    }
+    if (ev->type == FWD_EV_REQUEST && ev->kind == PL_KIND_FWD && r->autoreply &&
+        ev->frame_id < (r->autoreply > 1 ? (uint64_t)r->autoreply : 10))
+        CHECK(fwd_reply(r->self, &ev->from, ev->frame_id, ev->p, ev->n < 64 ? ev->n : 64) == FWD_OK);
+    pthread_mutex_lock(&r->mu);
+    if (r->n < FEV_MAX) {
+        r->ev[r->n] = *ev;
+        r->ev[r->n].p = NULL;
+        r->body0[r->n] = ev->n ? ev->p[0] : 0;
+        r->n++;
+    }
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* the index of the k-th event of `type` for frame_id (any frame: UINT64_MAX), or -1 */
+static int frec_find(struct frec *r, int type, uint64_t id, int k, struct fwd_ev *out)
+{
+    int hit = -1;
+    pthread_mutex_lock(&r->mu);
+    for (int i = 0; i < r->n; i++)
+        if (r->ev[i].type == type && (id == UINT64_MAX || r->ev[i].frame_id == id) && k-- == 0) {
+            hit = i;
+            if (out)
+                *out = r->ev[i];
+            break;
+        }
+    pthread_mutex_unlock(&r->mu);
+    return hit;
+}
+
+static int frec_count(struct frec *r, int type, uint64_t id)
+{
+    int c = 0;
+    pthread_mutex_lock(&r->mu);
+    for (int i = 0; i < r->n; i++)
+        c += r->ev[i].type == type && (id == UINT64_MAX || r->ev[i].frame_id == id);
+    pthread_mutex_unlock(&r->mu);
+    return c;
+}
+
+static struct fwd *fwd_node_with(uint32_t id, struct frec *r, int *port, const struct fwd_cfg *over)
+{
+    struct fwd_cfg c = {.secret = SECRET, .secret_len = 32, .arg = r, .on_event = frec_ev, .ping_ms = 100,
+                        .dead_ms = 2000, .backoff_min_ms = 20, .backoff_max_ms = 200};
+    if (over) {
+        c.dead_ms = over->dead_ms ? over->dead_ms : c.dead_ms;
+        c.inbox_bytes = over->inbox_bytes;
+        c.credit = over->credit;
+        c.queue_bytes = over->queue_bytes;
+        c.sock_buf = over->sock_buf;
+    }
+    c.self.id = id;
+    memset(c.self.uuid, g_uuid_byte, 16);
+    memset(c.self.ident, 0xB0 + (int)id, 16);
+    pthread_mutex_init(&r->mu, NULL);
+    struct fwd *f = fwd_new(&c);
+    if (!f || (*port = peerlink_listen(fwd_peerlink(f), 0)) <= 0) {
+        fprintf(stderr, "fwd_new failed\n");
+        exit(2);
+    }
+    r->self = f;
+    return f;
+}
+
+static struct fwd *fwd_node(uint32_t id, struct frec *r, int *port) { return fwd_node_with(id, r, port, NULL); }
+
+static uint64_t in_ms(int ms) { return now_ns() + (uint64_t)ms * 1000000ull; }
+
+static void test_fwd(void)
+{
+    static struct frec ra, rb;
+    memset(&ra, 0, sizeof ra);
+    memset(&rb, 0, sizeof rb);
+    rb.autoreply = 1;
+    int pa, pb;
+    struct fwd *A = fwd_node(1, &ra, &pa), *B = fwd_node(2, &rb, &pb);
+    struct fwd_member ma[2] = {{1, ""}, {2, ""}}, mb[2];
+    snprintf(ma[0].peer, sizeof ma[0].peer, "127.0.0.1:%d", pa);
+    snprintf(ma[1].peer, sizeof ma[1].peer, "127.0.0.1:%d", pb);
+    memcpy(mb, ma, sizeof ma);
+    fwd_set_members(A, ma, 2); /* itself is skipped */
+    fwd_set_members(B, mb, 2);
+    CHECK(WAIT_FOR(fwd_link_up(A, 2, PL_KIND_FWD) && fwd_link_up(A, 2, PL_KIND_FWDQ) && fwd_link_up(B, 1, PL_KIND_FWD) &&
+                       fwd_link_up(B, 1, PL_KIND_FWDQ),
+                   3000));
+    CHECK(!fwd_link_up(A, 1, PL_KIND_FWD));
+
+    /* a request and its reply */
+    struct fwd_msg m = {PL_KIND_FWD, "hello", 5};
+    CHECK(fwd_send(A, 2, &m, 1, in_ms(2000)) == FWD_OK);
+    struct fwd_ev s1 = {0}, r1 = {0};
+    CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_REPLY, 1, 0, &r1) >= 0, 2000));
+    CHECK(frec_find(&ra, FWD_EV_SENT, 1, 0, &s1) >= 0 && s1.outcome == FWD_WRITTEN);
+    CHECK(frec_find(&ra, FWD_EV_SENT, 1, 0, NULL) < frec_find(&ra, FWD_EV_REPLY, 1, 0, NULL));
+    CHECK(r1.n == 5 && r1.gen == s1.gen);
+    CHECK(fwd_send(A, 2, &m, 1, 0) == FWD_OK); /* done: its id is free again */
+    CHECK(WAIT_FOR(frec_count(&ra, FWD_EV_REPLY, 1) == 2, 2000));
+    CHECK(fwd_send(A, 9, &m, 2, 0) == FWD_E_NOPEER && fwd_send(A, 1, &m, 2, 0) == FWD_E_NOPEER);
+
+    /* the size bound: FWD_MSG_MAX + 1 is refused, FWD_MSG_MAX goes */
+    uint8_t *big = malloc(FWD_MSG_MAX + 1);
+    fill_random(big, FWD_MSG_MAX + 1, 7);
+    struct fwd_msg mbig = {PL_KIND_FWD, big, FWD_MSG_MAX + 1};
+    CHECK(fwd_send(A, 2, &mbig, 3, 0) == FWD_E_TOOBIG);
+    mbig.n = FWD_MSG_MAX;
+    CHECK(fwd_send(A, 2, &mbig, 3, in_ms(5000)) == FWD_OK);
+    struct fwd_ev rq = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 3, 0, &rq) >= 0, 5000) && rq.n == FWD_MSG_MAX);
+    CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_REPLY, 3, 0, NULL) >= 0, 5000));
+    free(big);
+
+    /* a late reply: the frame times out at its deadline, the reply is dropped, and the link stays */
+    struct fwd_stats st0, st1;
+    fwd_stats(A, &st0);
+    CHECK(fwd_send(A, 2, &m, 10, in_ms(200)) == FWD_OK);
+    CHECK(fwd_send(A, 2, &m, 10, 0) == FWD_E_INVALID); /* in flight */
+    struct fwd_ev held = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 10, 0, &held) >= 0, 2000));
+    CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_TIMEOUT, 10, 0, NULL) >= 0, 2000));
+    usleep(200 * 1000);
+    int rr = fwd_reply(B, &held.from, 10, "late", 4);
+    CHECK(rr == FWD_OK);
+    CHECK(WAIT_FOR((fwd_stats(A, &st1), st1.dropped > st0.dropped), 2000));
+    CHECK(frec_count(&ra, FWD_EV_REPLY, 10) == 0);
+    CHECK(fwd_send(A, 2, &m, 4, in_ms(2000)) == FWD_OK);
+    struct fwd_ev r4 = {0};
+    CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_REPLY, 4, 0, &r4) >= 0, 2000));
+    printf("  fwd: a late reply: connection %" PRIu64 " before, %" PRIu64 " after (link downs at A: %d)\n", s1.gen,
+           r4.gen, frec_count(&ra, FWD_EV_LINK, UINT64_MAX) - 4);
+    CHECK(r4.gen == s1.gen);
+    for (int k = 0; frec_find(&ra, FWD_EV_LINK, UINT64_MAX, k, &rq) >= 0; k++)
+        CHECK(rq.up);
+
+    /* credit: the owner sends 4 chunks, then waits for CREDIT; a grant lets the rest through */
+    struct fwd_msg mq = {PL_KIND_FWDQ, "select", 6};
+    CHECK(fwd_send(A, 2, &mq, 20, in_ms(5000)) == FWD_OK);
+    struct fwd_ev qreq = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 20, 0, &qreq) >= 0, 2000) && qreq.kind == PL_KIND_FWDQ);
+    uint8_t *chunk = malloc(FWD_CHUNK_MAX + 1);
+    fill_random(chunk, FWD_CHUNK_MAX + 1, 9);
+    CHECK(fwd_chunk(B, &qreq.from, 20, chunk, FWD_CHUNK_MAX + 1, 0, 0) == FWD_E_TOOBIG);
+    int ok4 = 1;
+    for (int i = 0; i < 4; i++) {
+        chunk[0] = (uint8_t)i;
+        ok4 &= fwd_chunk(B, &qreq.from, 20, chunk, FWD_CHUNK_MAX, 0, 0) == FWD_OK;
+    }
+    CHECK(ok4);
+    chunk[0] = 4;
+    int c5 = fwd_chunk(B, &qreq.from, 20, chunk, FWD_CHUNK_MAX, 0, 300);
+    usleep(300 * 1000);
+    int got = frec_count(&ra, FWD_EV_CHUNK, 20);
+    printf("  fwd: credit 4: the 5th chunk without a grant: %d (%d: no credit), chunks at the entry %d\n", c5,
+           FWD_E_TIMEOUT, got);
+    CHECK(c5 == FWD_E_TIMEOUT && got == 4);
+    CHECK(fwd_credit(A, 2, 20, 1) == FWD_OK);
+    CHECK(fwd_chunk(B, &qreq.from, 20, chunk, FWD_CHUNK_MAX, 1, 2000) == FWD_OK);
+    CHECK(WAIT_FOR(frec_count(&ra, FWD_EV_CHUNK, 20) == 5, 2000));
+    struct fwd_ev last = {0};
+    CHECK(frec_find(&ra, FWD_EV_CHUNK, 20, 4, &last) >= 0 && last.last);
+    for (int i = 0; i < 5; i++) {
+        struct fwd_ev c;
+        int at = frec_find(&ra, FWD_EV_CHUNK, 20, i, &c);
+        CHECK(at >= 0 && ra.body0[at] == i); /* in order */
+    }
+    CHECK(fwd_credit(A, 2, 20, 1) == FWD_E_INVALID);              /* done at the entry */
+    CHECK(fwd_chunk(B, &qreq.from, 20, chunk, 1, 1, 0) == FWD_E_DOWN); /* and at the owner */
+    free(chunk);
+
+    /* a connection that ends: the frame written on it is LOST; the owner's reply on the old connection is refused */
+    CHECK(fwd_send(A, 2, &m, 30, 0) == FWD_OK);
+    struct fwd_ev r30 = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 30, 0, &r30) >= 0, 2000));
+    plink_reset(r30.from.l);
+    CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_LOST, 30, 0, NULL) >= 0, 3000));
+    CHECK(WAIT_FOR(fwd_link_up(A, 2, PL_KIND_FWD), 3000));
+    CHECK(fwd_reply(B, &r30.from, 30, "x", 1) == FWD_E_DOWN);
+    CHECK(fwd_send(A, 2, &m, 5, in_ms(2000)) == FWD_OK);
+    CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_REPLY, 5, 0, NULL) >= 0, 3000));
+
+    /* a member that leaves: its links stop */
+    fwd_set_members(A, ma, 1);
+    CHECK(!fwd_link_up(A, 2, PL_KIND_FWD));
+    struct plink *bl = peerlink_find(fwd_peerlink(B), 1, PL_KIND_FWD);
+    CHECK(bl && WAIT_FOR(!plink_up(bl), 3000)); /* the stopped link's connection ended */
+    CHECK(fwd_send(A, 2, &m, 6, 0) == FWD_E_NOPEER);
+    fwd_free(A);
+    fwd_free(B);
+}
+
+/* The member list grows by several at once while the node table has room (nn < ncap), and past its capacity: every
+ * member gets its two links (ASan: the per-call table of seen nodes once had room for one new member only, which
+ * test_cluster ids hit when two nodes joined between two polls) */
+static int frec_downs(struct frec *r)
+{
+    int downs = 0;
+    struct fwd_ev e;
+    for (int k = 0; frec_find(r, FWD_EV_LINK, UINT64_MAX, k, &e) >= 0; k++)
+        downs += !e.up;
+    return downs;
+}
+
+static void fwd_pair(struct fwd **A, struct frec *ra, struct fwd **B, struct frec *rb, const struct fwd_cfg *over)
+{
+    int pa, pb;
+    *A = fwd_node_with(1, ra, &pa, over);
+    *B = fwd_node_with(2, rb, &pb, over);
+    struct fwd_member ma[2] = {{1, ""}, {2, ""}};
+    snprintf(ma[0].peer, sizeof ma[0].peer, "127.0.0.1:%d", pa);
+    snprintf(ma[1].peer, sizeof ma[1].peer, "127.0.0.1:%d", pb);
+    fwd_set_members(*A, ma, 2);
+    fwd_set_members(*B, ma, 2);
+    CHECK(WAIT_FOR(fwd_link_up(*A, 2, PL_KIND_FWD) && fwd_link_up(*A, 2, PL_KIND_FWDQ) && fwd_link_up(*B, 1, PL_KIND_FWD) &&
+                       fwd_link_up(*B, 1, PL_KIND_FWDQ),
+                   3000));
+}
+
+/* A consumer that is slow for 3 s behind a small inbox (dead_ms 1 s): the links stay up (the full inbox pauses the
+ * link, keepalive goes on both ways; the requests compress to little, so the sender is not held back by a shut window,
+ * which alone would keep it from counting the peer dead), every request and reply arrives (none dropped); then, of the
+ * frames behind a second pause, one still queued is canceled NEVER_WRITTEN, one in the write buffer WRITTEN (and its
+ * late reply dropped). */
+static void test_fwdslow(void)
+{
+    static struct frec ra, rb;
+    memset(&ra, 0, sizeof ra);
+    memset(&rb, 0, sizeof rb);
+    rb.autoreply = 1000;
+    rb.block_type = FWD_EV_REQUEST;
+    struct fwd_cfg over = {.dead_ms = 1000, .inbox_bytes = 256 << 10, .sock_buf = 64 << 10};
+    struct fwd *A, *B;
+    fwd_pair(&A, &ra, &B, &rb, &over);
+    size_t n = 64 << 10, big = 4u << 20;
+    uint8_t *b = malloc(big);
+    atomic_store(&rb.block_ms, 3000);
+    for (uint64_t i = 0; i < 16; i++) {
+        memset(b, 'a' + (int)i, n);
+        struct fwd_msg m = {PL_KIND_FWD, b, n};
+        CHECK(fwd_send(A, 2, &m, 100 + i, 0) == FWD_OK);
+    }
+    int ok = WAIT_FOR(frec_count(&ra, FWD_EV_REPLY, UINT64_MAX) == 16, 8000);
+    printf("  fwdslow: consumer slow 3 s, inbox 256 KiB, dead_ms 1 s: %d replies, %d LOST, link downs %d/%d\n",
+           frec_count(&ra, FWD_EV_REPLY, UINT64_MAX), frec_count(&ra, FWD_EV_LOST, UINT64_MAX), frec_downs(&ra),
+           frec_downs(&rb));
+    CHECK(ok && frec_count(&ra, FWD_EV_LOST, UINT64_MAX) == 0 && frec_downs(&ra) == 0 && frec_downs(&rb) == 0);
+    for (uint64_t i = 0; i < 16; i++)
+        CHECK(frec_count(&ra, FWD_EV_REPLY, 100 + i) == 1);
+
+    atomic_store(&rb.block_ms, 2000);
+    for (uint64_t i = 0; i < 8; i++) {
+        memset(b, 'A' + (int)i, n);
+        struct fwd_msg m = {PL_KIND_FWD, b, n};
+        CHECK(fwd_send(A, 2, &m, 120 + i, 0) == FWD_OK);
+    }
+    fill_random(b, big, 200);
+    struct fwd_msg mb = {PL_KIND_FWD, b, big}, ml = {PL_KIND_FWD, "late", 4};
+    CHECK(fwd_send(A, 2, &mb, 200, 0) == FWD_OK); /* behind the pause: taken into the write buffer */
+    usleep(300 * 1000);
+    CHECK(fwd_send(A, 2, &ml, 201, 0) == FWD_OK); /* behind that: still queued */
+    usleep(200 * 1000);
+    int c201 = fwd_cancel(A, 2, 201), c200 = fwd_cancel(A, 2, 200);
+    CHECK(fwd_cancel(A, 2, 201) == FWD_E_INVALID);
+    ok = WAIT_FOR(frec_count(&ra, FWD_EV_REPLY, UINT64_MAX) == 24 && frec_count(&rb, FWD_EV_REQUEST, 200) == 1, 8000);
+    usleep(300 * 1000);
+    struct fwd_stats st;
+    fwd_stats(A, &st);
+    printf("  fwdslow: behind a second pause: cancel queued %d, in the buffer %d; %d replies, B got %d requests\n",
+           c201, c200, frec_count(&ra, FWD_EV_REPLY, UINT64_MAX), frec_count(&rb, FWD_EV_REQUEST, UINT64_MAX));
+    CHECK(ok && frec_count(&ra, FWD_EV_LOST, UINT64_MAX) == 0 && frec_downs(&ra) == 0 && frec_downs(&rb) == 0);
+    CHECK(c201 == FWD_NEVER_WRITTEN && c200 == FWD_WRITTEN);
+    CHECK(frec_count(&rb, FWD_EV_REQUEST, 201) == 0 && frec_count(&rb, FWD_EV_REQUEST, UINT64_MAX) == 25);
+    CHECK(frec_count(&ra, FWD_EV_REPLY, 200) == 0 && st.dropped >= 1 && st.canceled == 2);
+    free(b);
+    fwd_free(A);
+    fwd_free(B);
+}
+
+/* FWDQ streams: the span of a frame's deadline applies again after a chunk while the owner holds credit; a cancel
+ * ends the owner's stream; a chunk that found no queue room keeps its credit and, the last, its stream */
+static void test_fwdstream(void)
+{
+    static struct frec ra, rb;
+    memset(&ra, 0, sizeof ra);
+    memset(&rb, 0, sizeof rb);
+    ra.block_type = FWD_EV_CHUNK;
+    struct fwd_cfg over = {.dead_ms = 1000, .inbox_bytes = 64 << 10, .sock_buf = 64 << 10, .queue_bytes = 64 << 10,
+                           .credit = 16};
+    struct fwd *A, *B;
+    fwd_pair(&A, &ra, &B, &rb, &over);
+    struct fwd_msg mq = {PL_KIND_FWDQ, "q", 1};
+
+    /* one chunk, then nothing: TIMEOUT one span later, and the id is free again */
+    CHECK(fwd_send(A, 2, &mq, 50, in_ms(500)) == FWD_OK);
+    struct fwd_ev q = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 50, 0, &q) >= 0, 2000));
+    CHECK(fwd_chunk(B, &q.from, 50, "x", 1, 0, 0) == FWD_OK);
+    uint64_t t0 = now_ns();
+    int to = WAIT_FOR(frec_count(&ra, FWD_EV_TIMEOUT, 50) == 1, 2500);
+    printf("  fwdstream: a stream silent after one chunk: %s after %.0f ms (span 500 ms)\n", to ? "TIMEOUT" : "nothing",
+           (double)(now_ns() - t0) / 1e6);
+    CHECK(to && frec_count(&ra, FWD_EV_CHUNK, 50) == 1);
+    CHECK(fwd_send(A, 2, &mq, 50, 0) == FWD_OK && fwd_cancel(A, 2, 50) >= 0);
+
+    /* a cancel: the owner's stream goes */
+    CHECK(fwd_send(A, 2, &mq, 51, 0) == FWD_OK);
+    struct fwd_ev q2 = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 51, 0, &q2) >= 0, 2000));
+    CHECK(fwd_chunk(B, &q2.from, 51, "y", 1, 0, 0) == FWD_OK);
+    CHECK(WAIT_FOR(frec_count(&ra, FWD_EV_CHUNK, 51) == 1, 2000));
+    CHECK(fwd_cancel(A, 2, 51) == FWD_WRITTEN);
+    CHECK(WAIT_FOR(fwd_chunk(B, &q2.from, 51, "z", 1, 0, 0) == FWD_E_DOWN, 2000));
+    struct fwd_stats sb;
+    fwd_stats(B, &sb);
+    CHECK(sb.cancels >= 1);
+
+    /* the entry's reader stops for 2 s (its link paused): the owner's queue fills, and what found no room is kept */
+    CHECK(fwd_send(A, 2, &mq, 60, 0) == FWD_OK);
+    struct fwd_ev q3 = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 60, 0, &q3) >= 0, 2000));
+    atomic_store(&ra.block_ms, 2000);
+    size_t cn = 256 << 10;
+    uint8_t *b = malloc(cn);
+    int sent = 0, rc = FWD_OK;
+    while (sent < 15) {
+        fill_random(b, cn, 600 + (uint64_t)sent);
+        if ((rc = fwd_chunk(B, &q3.from, 60, b, cn, 0, 500)) != FWD_OK) /* a long wait: FULL only behind A */
+            break;
+        sent++;
+    }
+    int rl = rc == FWD_E_FULL ? fwd_chunk(B, &q3.from, 60, b, cn, 1, 0) : rc; /* the last does not fit either */
+    int again = fwd_chunk(B, &q3.from, 60, b, cn, 0, 5000); /* the same chunk once the entry reads again */
+    int more = 0, end = FWD_OK, fulls = 0;
+    for (int tries = 0; tries < 2000; tries++) { /* small chunks, no wait: FULL (kept, tried again) or TIMEOUT */
+        end = fwd_chunk(B, &q3.from, 60, "m", 1, 0, 0);
+        if (end == FWD_OK)
+            more++;
+        else if (end == FWD_E_FULL)
+            fulls++, usleep(2000);
+        else
+            break;
+    }
+    printf("  fwdstream: queue FULL after %d chunks (last: %d), retry %d, then %d more within the credit of 16 (%d "
+           "FULL on the way), then %d\n",
+           sent, rl, again, more, fulls, end);
+    CHECK(rc == FWD_E_FULL && rl == FWD_E_FULL && again == FWD_OK && end == FWD_E_TIMEOUT);
+    CHECK(sent + 1 + more == 16);
+    CHECK(fwd_credit(A, 2, 60, 1) == FWD_OK);
+    CHECK(fwd_chunk(B, &q3.from, 60, "end", 3, 1, 2000) == FWD_OK);
+    struct fwd_ev last = {0};
+    CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_CHUNK, 60, sent + 1 + more, &last) >= 0, 3000) && last.last);
+    CHECK(fwd_chunk(B, &q3.from, 60, "after", 5, 0, 0) == FWD_E_DOWN); /* the last one ended it */
+    CHECK(frec_count(&ra, FWD_EV_LOST, UINT64_MAX) == 0 && frec_downs(&ra) == 0 && frec_downs(&rb) == 0);
+    free(b);
+    fwd_free(A);
+    fwd_free(B);
+}
+
+/* Small frames taken into the write buffer behind a receiver that stopped reading, none of whose bytes went: at the
+ * cut they are NEVER_WRITTEN, like the queued ones (test_written covers those and the partly written) */
+static void test_wbcut(void)
+{
+    struct pl_cfg over = {.sock_buf = 32 << 10, .dead_ms = 4000, .queue_bytes = 64u << 20};
+    struct node *a = node_new(1, SECRET, &over, 1);
+    struct node *d = node_new(2, SECRET, &over, 0);
+    a->strict = 0;
+    set_gate(a, 1);
+    struct plink *f = dial(d, 1, a->port, PL_KIND_FWD);
+    CHECK(WAIT_FOR(plink_up(f), 3000));
+    size_t n = 32 << 10;
+    uint8_t *b = malloc(n);
+    for (uint64_t i = 0; i < 48; i++) {
+        gen_payload(1, b, n, 300 + i);
+        CHECK(plink_sendv(f, 0, 1, NULL, 0, b, n, 2000, 1, i, 0) == PL_OK);
+    }
+    usleep(500 * 1000);
+    int queued = (int)(plink_queued(f) / (n + 48));
+    plink_reset(f);
+    CHECK(WAIT_FOR(sent_all(d, 0, 47), 3000));
+    int w = 0, u = 0;
+    for (int i = 0; i < 48; i++) {
+        w += atomic_load(&d->sent_out[i]) == 2;
+        u += atomic_load(&d->sent_out[i]) == 1;
+    }
+    printf("  wbcut: 48 frames of 32 KiB, %d still queued at the cut: %d written, %d unwritten\n", queued, w, u);
+    CHECK(w >= 1 && w + u == 48 && u > queued);
+    set_gate(a, 0);
+    free(b);
+    node_free(d);
+    node_free(a);
+}
+
+/* A member whose dial failed (no pipe for its link: the fd limit) is dialed again by the next fwd_set_members */
+static void test_fwdredial(void)
+{
+    static struct frec ra, rb;
+    memset(&ra, 0, sizeof ra);
+    memset(&rb, 0, sizeof rb);
+    int pa, pb;
+    struct fwd *A = fwd_node(1, &ra, &pa), *B = fwd_node(2, &rb, &pb);
+    struct fwd_member ma[2] = {{1, ""}, {2, ""}};
+    snprintf(ma[0].peer, sizeof ma[0].peer, "127.0.0.1:%d", pa);
+    snprintf(ma[1].peer, sizeof ma[1].peer, "127.0.0.1:%d", pb);
+    fwd_set_members(B, ma, 2);
+    struct rlimit rl0, rl;
+    CHECK(getrlimit(RLIMIT_NOFILE, &rl0) == 0);
+    int lo = open("/dev/null", O_RDONLY); /* the lowest free descriptor: with the limit there, no pipe can be made */
+    CHECK(lo >= 0);
+    close(lo);
+    rl = rl0;
+    rl.rlim_cur = (rlim_t)lo;
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    fwd_set_members(A, ma, 2);
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl0) == 0);
+    struct fwd_msg m = {PL_KIND_FWD, "x", 1};
+    int before = fwd_send(A, 2, &m, 1, 0);
+    fwd_set_members(A, ma, 2);
+    int up = WAIT_FOR(fwd_link_up(A, 2, PL_KIND_FWD) && fwd_link_up(A, 2, PL_KIND_FWDQ), 3000);
+    printf("  fwdredial: send while the dial had failed: %d (-4: no peer); after the next member list: %s\n", before,
+           up ? "both links up" : "NOT up");
+    CHECK(before == FWD_E_NOPEER && up);
+    fwd_free(A);
+    fwd_free(B);
+}
+
+static void test_fwdgrow(void)
+{
+    static struct frec r;
+    memset(&r, 0, sizeof r);
+    int port;
+    struct fwd *A = fwd_node(1, &r, &port);
+    struct fwd_member m[12];
+    for (int i = 0; i < 12; i++) {
+        m[i].id = (uint32_t)i + 1;
+        snprintf(m[i].peer, sizeof m[i].peer, "127.0.0.1:%d", i ? 1 : port); /* nobody listens on port 1 */
+    }
+    static const uint32_t steps[] = {2, 5, 7, 12, 3, 11};
+    struct fwd_msg q = {PL_KIND_FWDQ, "q", 1};
+    uint64_t fid = 1;
+    for (size_t s = 0; s < sizeof steps / sizeof steps[0]; s++) {
+        fwd_set_members(A, m, steps[s]);
+        for (uint32_t i = 1; i < 12; i++) { /* a member has a link (queued or down), anyone else none */
+            int rc = fwd_send(A, m[i].id, &q, fid++, in_ms(100));
+            CHECK(i < steps[s] ? rc != FWD_E_NOPEER : rc == FWD_E_NOPEER);
+        }
+    }
+    fwd_free(A);
+}
+
 int main(int argc, char **argv)
 {
     const char *only = NULL;
@@ -1744,6 +2371,33 @@ int main(int argc, char **argv)
             } else if (!strcmp(m, "nokick")) {
                 peerlink_mutant = PL_MUT_NOKICK;
                 only = "replace";
+            } else if (!strcmp(m, "queuedasunsent")) {
+                peerlink_mutant = PL_MUT_QUEUEDASUNSENT;
+                only = "written";
+            } else if (!strcmp(m, "kindshared")) {
+                peerlink_mutant = PL_MUT_KINDSHARED;
+                only = "fwdstall";
+            } else if (!strcmp(m, "lateclose")) {
+                fwd_mutant = FWD_MUT_LATECLOSE;
+                only = "fwd";
+            } else if (!strcmp(m, "nocredit")) {
+                fwd_mutant = FWD_MUT_NOCREDIT;
+                only = "fwd";
+            } else if (!strcmp(m, "inboxwait")) {
+                fwd_mutant = FWD_MUT_INBOXWAIT;
+                only = "fwdslow";
+            } else if (!strcmp(m, "inboxdrop")) {
+                fwd_mutant = FWD_MUT_INBOXDROP;
+                only = "fwdslow";
+            } else if (!strcmp(m, "chunkfirst")) {
+                fwd_mutant = FWD_MUT_CHUNKFIRST;
+                only = "fwdstream";
+            } else if (!strcmp(m, "wbwritten")) {
+                peerlink_mutant = PL_MUT_WBWRITTEN;
+                only = "wbcut";
+            } else if (!strcmp(m, "pausedead")) {
+                peerlink_mutant = PL_MUT_PAUSEDEAD;
+                only = "fwdslow";
             } else {
                 fprintf(stderr, "unknown mutant %s\n", m);
                 return 2;
@@ -1765,7 +2419,9 @@ int main(int argc, char **argv)
         {"resume", test_resume}, {"secret", test_secret},   {"flip", test_flip},
         {"blackhole", test_blackhole}, {"backpressure", test_backpressure}, {"backlog", test_backlog}, {"latency", test_latency}, {"kick", test_kick}, {"dataerr", test_dataerr}, {"slowcb", test_slowcb}, {"chain", test_chain}, {"rawauth", test_rawauth}, {"endhash", test_endhash},
         {"throttle", test_throttle}, {"badchunk", test_badchunk}, {"replace", test_replace}, {"freehs", test_freehs},
-        {"gen", test_gen},
+        {"gen", test_gen}, {"kinds", test_kinds}, {"toobig", test_toobig}, {"written", test_written},
+        {"fwdstall", test_fwdstall}, {"fwd", test_fwd}, {"fwdgrow", test_fwdgrow}, {"fwdredial", test_fwdredial},
+        {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"wbcut", test_wbcut},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (only && strcmp(only, cases[i].name) != 0)

@@ -177,7 +177,13 @@ cgroup, so `nice` does not keep your work out of its way.
   (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
   over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below
   `jr_rec_max_rows` so that it fits one peer frame. `TSDB_REPLD_MUTANT` and `TSDB_REPLD_TEST` are its test hooks, `TSDB_REPLD_TRACE=1` logs the core's and the cursors' state every 2 s
-  (`make repld-mutants`); `test_cluster replicate|replindet|replfail` its end-to-end tests. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  (`make repld-mutants`); `test_cluster replicate|replindet|replfail` its end-to-end tests. `server/fwd.[ch]`: the forwarding links' transport (S2-2), a peerlink of its own on every member with link kinds
+  FWD (3) and FWDQ (4) to every other member (`server/fwd_cluster.c` keeps them to the metadata copy's members), per frame
+  NEVER_WRITTEN (no byte reached the socket: `plink_sendv` tracked) or WRITTEN, replies only from the connection the frame
+  went on, CREDIT for streamed query replies; `test_peerlink kinds|toobig|written|wbcut|fwdstall|fwd|fwdgrow|fwdredial|fwdslow|fwdstream`
+  (mutants `queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead`); a full inbox
+  pauses the link (`plink_pause`: no reading, keepalive goes on) and never blocks its thread; `fwd_cancel`; the
+  instance is freed only after tsdbd's workers are joined (`fwd_cluster_free`), `test_cluster fwdlinks`. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants

@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -469,7 +470,8 @@ int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(vo
 struct qf {
     struct qf *next;
     size_t n;
-    uint8_t type;
+    uint8_t type, tracked; /* tracked: on_sent is owed for it (plink_send_tracked) */
+    uint64_t token, deadline;
     uint8_t p[];
 };
 
@@ -508,6 +510,10 @@ struct plink {
     size_t qbytes;
     struct jobq *jh, *jt;
     int njobs;
+    uint64_t qdl_min;   /* the earliest deadline of a tracked frame in the queue (0: none; may be early, never late) */
+    uint64_t reset_gen; /* plink_reset: the connection to end */
+    _Atomic int stopped; /* plink_stop */
+    _Atomic int paused;  /* plink_pause: the link's thread reads nothing from the socket meanwhile */
 };
 
 struct peerlink {
@@ -605,22 +611,29 @@ size_t plink_queued(struct plink *l)
     return n;
 }
 
-static int send_impl(struct plink *l, uint64_t gen, uint8_t type, const void *p, size_t n, int timeout_ms)
+static int send_impl2(struct plink *l, uint64_t gen, uint8_t type, const void *hdr, size_t hn, const void *p,
+                      size_t n, int timeout_ms, int tracked, uint64_t token, uint64_t deadline)
 {
     struct peerlink *pl = l->pl;
-    if (type == 0 || type > PL_USER_TYPE_MAX || (!p && n))
+    if (type == 0 || type > PL_USER_TYPE_MAX || (!p && n) || (!hdr && hn))
         return PL_E_INVALID;
-    if (n > PL_FRAME_MAX)
+    if (n > PL_FRAME_MAX || hn > PL_FRAME_MAX - n)
         return PL_E_TOOBIG;
-    size_t cost = n + 48, cap = pl->cfg.queue_bytes ? pl->cfg.queue_bytes : PL_QUEUE_BYTES;
-    struct qf *f = malloc(sizeof *f + n);
+    struct qf *f = malloc(sizeof *f + hn + n);
     if (!f)
         oom();
     f->next = NULL;
-    f->n = n;
     f->type = type;
+    f->tracked = (uint8_t)tracked;
+    f->token = token;
+    f->deadline = tracked ? deadline : 0;
+    if (hn)
+        memcpy(f->p, hdr, hn);
     if (n)
-        memcpy(f->p, p, n);
+        memcpy(f->p + hn, p, n);
+    n += hn;
+    f->n = n;
+    size_t cost = n + 48, cap = pl->cfg.queue_bytes ? pl->cfg.queue_bytes : PL_QUEUE_BYTES;
     struct timespec dl;
     clock_gettime(CLOCK_MONOTONIC, &dl);
     dl.tv_sec += timeout_ms / 1000;
@@ -632,8 +645,8 @@ static int send_impl(struct plink *l, uint64_t gen, uint8_t type, const void *p,
     int rc = PL_OK;
     pthread_mutex_lock(&l->mu);
     for (;;) {
-        if (atomic_load(&pl->closing)) {
-            rc = PL_E_CLOSED;
+        if (atomic_load(&pl->closing) || atomic_load(&l->stopped)) {
+            rc = atomic_load(&pl->closing) ? PL_E_CLOSED : PL_E_DOWN;
             break;
         }
         /* sends open when on_link(up) has returned; the link's own thread may send from inside it */
@@ -660,6 +673,8 @@ static int send_impl(struct plink *l, uint64_t gen, uint8_t type, const void *p,
             l->qh = f;
         l->qt = f;
         l->qbytes += cost;
+        if (f->deadline && (!l->qdl_min || f->deadline < l->qdl_min))
+            l->qdl_min = f->deadline;
     }
     pthread_mutex_unlock(&l->mu);
     if (rc != PL_OK) {
@@ -670,9 +685,64 @@ static int send_impl(struct plink *l, uint64_t gen, uint8_t type, const void *p,
     return PL_OK;
 }
 
+static int send_impl(struct plink *l, uint64_t gen, uint8_t type, const void *p, size_t n, int timeout_ms)
+{
+    return send_impl2(l, gen, type, NULL, 0, p, n, timeout_ms, 0, 0, 0);
+}
+
 int plink_send(struct plink *l, uint8_t type, const void *p, size_t n, int timeout_ms)
 {
     return send_impl(l, 0, type, p, n, timeout_ms);
+}
+
+int plink_sendv(struct plink *l, uint64_t gen, uint8_t type, const void *hdr, size_t hn, const void *p, size_t n,
+                int timeout_ms, int tracked, uint64_t token, uint64_t deadline_ns)
+{
+    return send_impl2(l, gen, type, hdr, hn, p, n, timeout_ms, tracked, token, deadline_ns);
+}
+
+void plink_reset(struct plink *l)
+{
+    pthread_mutex_lock(&l->mu);
+    if (l->up)
+        l->reset_gen = l->gen;
+    pthread_mutex_unlock(&l->mu);
+    wake(l);
+}
+
+void plink_pause(struct plink *l, int paused)
+{
+    atomic_store(&l->paused, paused ? 1 : 0);
+    wake(l);
+}
+
+int plink_unqueue(struct plink *l, uint64_t token)
+{
+    int found = 0;
+    pthread_mutex_lock(&l->mu);
+    for (struct qf **pp = &l->qh, *prev = NULL; *pp; prev = *pp, pp = &(*pp)->next) {
+        struct qf *f = *pp;
+        if (!f->tracked || f->token != token)
+            continue;
+        *pp = f->next;
+        if (l->qt == f)
+            l->qt = prev;
+        l->qbytes -= f->n + 48;
+        pthread_cond_broadcast(&l->cv);
+        free(f); /* qdl_min may now be early, which it is allowed to be */
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&l->mu);
+    return found;
+}
+
+void plink_stop(struct plink *l)
+{
+    if (!l->dialed)
+        return;
+    atomic_store(&l->stopped, 1);
+    wake(l);
 }
 
 int plink_test_ctl(struct plink *l, uint8_t type, const void *p, size_t n)
@@ -1087,7 +1157,61 @@ struct conn {
     int jstate;
     uint64_t jnext, jsent, throttle_until;
     struct pl_xxh jh;
+
+    /* tracked frames whose bytes are in wb, in order: [start, end) in the bytes this connection handed to wb (every
+     * byte appended is at wdone + its distance from wb.off, so no appender needs to count) */
+    uint64_t gen, wdone;
+    struct trk {
+        uint64_t token, start, end;
+    } *trk;
+    size_t trk_h, trk_n, trk_cap;
 };
+
+static void sent_cb(struct conn *c, uint64_t token, int written)
+{
+    if (c->pl->cfg.on_sent)
+        c->pl->cfg.on_sent(c->pl->cfg.arg, c->l, token, c->gen, written);
+}
+
+/* the tracked frames whose first byte (the mutant: last byte) has reached the socket */
+static void trk_written(struct conn *c)
+{
+    while (c->trk_h < c->trk_n) {
+        struct trk *t = &c->trk[c->trk_h];
+        if (peerlink_mutant == PL_MUT_QUEUEDASUNSENT ? t->end > c->wdone : t->start >= c->wdone)
+            break;
+        c->trk_h++;
+        sent_cb(c, t->token, 1);
+    }
+    if (c->trk_h == c->trk_n)
+        c->trk_h = c->trk_n = 0;
+}
+
+/* queued tracked frames past their deadline leave unwritten (l->mu held; the callbacks run after it is let go) */
+static struct qf *q_expire(struct plink *l, uint64_t now)
+{
+    struct qf *gone = NULL, **pp = &l->qh, *last = NULL;
+    uint64_t min = 0;
+    while (*pp) {
+        struct qf *f = *pp;
+        if (f->tracked && f->deadline && f->deadline <= now) {
+            *pp = f->next;
+            l->qbytes -= f->n + 48;
+            f->next = gone;
+            gone = f;
+            continue;
+        }
+        if (f->deadline && (!min || f->deadline < min))
+            min = f->deadline;
+        last = f;
+        pp = &f->next;
+    }
+    l->qt = last;
+    l->qdl_min = min;
+    if (gone)
+        pthread_cond_broadcast(&l->cv);
+    return gone;
+}
 
 static void job_done(struct peerlink *pl, struct jobq *q, int status, uint64_t sent)
 {
@@ -1388,9 +1512,14 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
     /* no TCP_USER_TIMEOUT: Linux counts bytes held back by a shut window as unacknowledged, which would end a link
      * whose peer is merely slow. A silent idle peer is found by PING and dead_ms; a host that vanishes while we are held
      * back by it, by the kernel's own retransmission limit. */
+    if (pl->cfg.sock_buf > 0) {
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &pl->cfg.sock_buf, sizeof pl->cfg.sock_buf);
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &pl->cfg.sock_buf, sizeof pl->cfg.sock_buf);
+    }
     pthread_mutex_lock(&l->mu);
     l->up = 1;
     l->gen++;
+    c.gen = l->gen;
     l->io_thr = pthread_self();
     l->io_set = 1;
     atomic_store(&l->peer, keys->peer);
@@ -1408,13 +1537,27 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
     if (poll_cap < 10)
         poll_cap = 10;
 
-    while (!c.dead && !atomic_load(&pl->closing)) {
+    while (!c.dead && !atomic_load(&pl->closing) && !atomic_load(&l->stopped)) {
         pthread_mutex_lock(&pl->mu);
         int kicked = !l->dialed && l->adopt_seq != my_seq;
         pthread_mutex_unlock(&pl->mu);
         if (kicked)
             break;
         uint64_t now = now_ns();
+        pthread_mutex_lock(&l->mu);
+        int reset = l->reset_gen == c.gen;
+        struct qf *expired = l->qdl_min && l->qdl_min <= now ? q_expire(l, now) : NULL;
+        pthread_mutex_unlock(&l->mu);
+        while (expired) {
+            struct qf *nx = expired->next;
+            sent_cb(&c, expired->token, 0);
+            free(expired);
+            expired = nx;
+        }
+        if (reset) {
+            ST(pl, drops, 1);
+            break;
+        }
         /* queued frames of the driver */
         while (c.wb.len - c.wb.off < WB_HIGH) {
             pthread_mutex_lock(&l->mu);
@@ -1429,8 +1572,28 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
             pthread_mutex_unlock(&l->mu);
             if (!f)
                 break;
-            size_t before = c.wb.len;
-            frame_user(&c.wb, &c.keys.out, &c.seq_out, c.zc, l->kind == PL_KIND_LOG, f->type, f->p, f->n);
+            if (f->tracked && f->deadline && f->deadline <= now) {
+                sent_cb(&c, f->token, 0);
+                free(f);
+                continue;
+            }
+            size_t before = c.wb.len, pend0 = c.wb.len - c.wb.off;
+            frame_user(&c.wb, &c.keys.out, &c.seq_out, c.zc, l->kind != PL_KIND_BULK, f->type, f->p, f->n);
+            if (f->tracked) {
+                if (c.trk_n == c.trk_cap) {
+                    if (c.trk_h) {
+                        memmove(c.trk, c.trk + c.trk_h, (c.trk_n - c.trk_h) * sizeof *c.trk);
+                        c.trk_n -= c.trk_h;
+                        c.trk_h = 0;
+                    } else {
+                        c.trk_cap = c.trk_cap ? c.trk_cap * 2 : 64;
+                        c.trk = realloc(c.trk, c.trk_cap * sizeof *c.trk);
+                        if (!c.trk)
+                            oom();
+                    }
+                }
+                c.trk[c.trk_n++] = (struct trk){f->token, c.wdone + pend0, c.wdone + (c.wb.len - c.wb.off)};
+            }
             ST(pl, frames_out, 1);
             ST(pl, bytes_out, c.wb.len - before);
             ST(pl, raw_out, f->n);
@@ -1448,13 +1611,17 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
             if (bwait)
                 c.throttle_until = now + bwait;
         }
+        int paused = atomic_load(&l->paused), pfresh = paused && peerlink_mutant != PL_MUT_PAUSEDEAD;
         if (c.stalled)
             c.last_rx = now; /* the peer's window is shut with our bytes waiting: it is slow, not silent */
+        if (pfresh)
+            c.last_rx = now; /* we do not read: the peer's silence is ours (its PINGs wait in the socket) */
         if (now - c.last_rx > dead_ns) {
             ST(pl, drops, 1);
             break;
         }
-        if (now - c.last_rx > ping_ns && now - c.last_ping > ping_ns) {
+        /* paused, we still PING on our own clock: the peer hears from us and does not count us dead */
+        if ((pfresh || now - c.last_rx > ping_ns) && now - c.last_ping > ping_ns) {
             send_ctl(&c, PLT_PING, "", 0);
             c.last_ping = now;
         }
@@ -1471,7 +1638,9 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
                 break;
             }
             c.wb.off += (size_t)w;
+            c.wdone += (uint64_t)w;
         }
+        trk_written(&c);
         if (c.wb.off == c.wb.len)
             c.wb.off = c.wb.len = 0;
         c.stalled = c.wb.len > c.wb.off;
@@ -1486,7 +1655,18 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
             tmo = 0;
         if (c.hp.active && !c.dead)
             tmo = 0; /* the next megabyte of a prefix */
-        struct pollfd pf[2] = {{fd, (short)(POLLIN | (c.wb.len > c.wb.off ? POLLOUT : 0)), 0}, {l->evfd, POLLIN, 0}};
+        pthread_mutex_lock(&l->mu);
+        uint64_t qdl = l->qdl_min;
+        pthread_mutex_unlock(&l->mu);
+        if (qdl) { /* a queued frame's deadline */
+            uint64_t t = now_ns();
+            int d = qdl <= t ? 0 : (int)((qdl - t) / MS) + 1;
+            if (d < tmo)
+                tmo = d;
+        }
+        /* paused: no POLLIN (a hangup or an error is still reported, and read) */
+        struct pollfd pf[2] = {{fd, (short)((paused ? 0 : POLLIN) | (c.wb.len > c.wb.off ? POLLOUT : 0)), 0},
+                               {l->evfd, POLLIN, 0}};
         /* room left in the write buffer: come back as soon as the socket drains */
         int pr = poll(pf, 2, tmo);
         if (pr < 0 && errno != EINTR)
@@ -1521,10 +1701,23 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
     struct qf *f = l->qh;
     l->qh = l->qt = NULL;
     l->qbytes = 0;
+    l->qdl_min = 0;
     pthread_cond_broadcast(&l->cv);
     pthread_mutex_unlock(&l->mu);
+    /* the tracked frames still in wb: written if any of their bytes went (the mutant: all of them), else not; then
+     * the queue, none of whose bytes went */
+    for (; c.trk_h < c.trk_n; c.trk_h++) {
+        struct trk *t = &c.trk[c.trk_h];
+        sent_cb(&c, t->token,
+                peerlink_mutant == PL_MUT_QUEUEDASUNSENT ? t->end <= c.wdone
+                : peerlink_mutant == PL_MUT_WBWRITTEN    ? 1
+                                                         : t->start < c.wdone);
+    }
+    free(c.trk);
     while (f) {
         struct qf *nx = f->next;
+        if (f->tracked)
+            sent_cb(&c, f->token, 0);
         free(f);
         f = nx;
     }
@@ -1562,7 +1755,7 @@ static void *dial_main(void *arg)
     uint64_t lo = (uint64_t)(pl->cfg.backoff_min_ms ? pl->cfg.backoff_min_ms : 50) * MS;
     uint64_t hi = (uint64_t)(pl->cfg.backoff_max_ms ? pl->cfg.backoff_max_ms : 2000) * MS;
     uint64_t gap = lo;
-    while (!atomic_load(&pl->closing)) {
+    while (!atomic_load(&pl->closing) && !atomic_load(&l->stopped)) {
         uint64_t hs = (uint64_t)(pl->cfg.hs_ms ? pl->cfg.hs_ms : 5000) * MS;
         char addr[sizeof l->addr];
         pthread_mutex_lock(&pl->mu); /* plink_set_addr may change it */
@@ -1580,7 +1773,7 @@ static void *dial_main(void *arg)
         uint64_t rnd;
         tsdb_random(&rnd, sizeof rnd);
         uint64_t until = now_ns() + gap / 2 + rnd % (gap / 2 + 1);
-        while (!atomic_load(&pl->closing) && now_ns() < until) {
+        while (!atomic_load(&pl->closing) && !atomic_load(&l->stopped) && now_ns() < until) {
             struct pollfd pf = {l->evfd, POLLIN, 0};
             poll(&pf, 1, 20);
             if (pf.revents & POLLIN)
@@ -1663,9 +1856,12 @@ static void *adopt_main(void *arg)
 int peerlink_adopt(struct peerlink *pl, int fd, const uint8_t *hello, size_t hello_len, const struct pl_self *self)
 {
     struct hello h;
-    if (hello_len > HS_FRAME_MAX || hello_parse(hello, hello_len, &h) != 0 ||
-        (h.kind != PL_KIND_LOG && h.kind != PL_KIND_BULK))
+    if (hello_len > HS_FRAME_MAX || hello_parse(hello, hello_len, &h) != 0)
         return -1;
+    if (h.kind <= PL_KIND_META || h.kind > PL_KIND_DATA_MAX) {
+        fprintf(stderr, "peerlink: refused a link of kind %d from node %" PRIu32 " (unknown here)\n", h.kind, h.id);
+        return -1;
+    }
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     struct adopt *a = calloc(1, sizeof *a);
@@ -1715,7 +1911,7 @@ struct plink *peerlink_find(struct peerlink *pl, uint32_t peer, int kind)
 
 struct plink *peerlink_dial(struct peerlink *pl, uint32_t want_id, const char *addr, int kind)
 {
-    if (strlen(addr) >= sizeof((struct plink *)0)->addr || (kind != PL_KIND_LOG && kind != PL_KIND_BULK))
+    if (strlen(addr) >= sizeof((struct plink *)0)->addr || kind <= PL_KIND_META || kind > PL_KIND_DATA_MAX)
         return NULL;
     pthread_mutex_lock(&pl->mu);
     struct plink *l;
@@ -1731,6 +1927,14 @@ struct plink *peerlink_dial(struct peerlink *pl, uint32_t want_id, const char *a
                 return l;
             }
         kind = PL_KIND_LOG;
+    }
+    if (peerlink_mutant == PL_MUT_KINDSHARED && kind == PL_KIND_FWD) {
+        /* the planted bug: forwarded frames on the log link's socket */
+        for (l = pl->links; l; l = l->next)
+            if (l->dialed && l->kind == PL_KIND_LOG && l->want_id == want_id && !strcmp(l->addr, addr)) {
+                pthread_mutex_unlock(&pl->mu);
+                return l;
+            }
     }
     l = link_new(pl, kind, 1);
     if (!l) {

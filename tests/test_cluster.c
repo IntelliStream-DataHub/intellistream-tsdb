@@ -3624,6 +3624,44 @@ static int lk_dials(const char *addr, uint32_t id, const uint8_t uuid[16], const
     return up;
 }
 
+/* every node holds a FWD and a FWDQ link to every other member, with no replicated volume anywhere (s2d), and
+ * dials a member again after it restarts */
+static void fwd_await(int i, uint32_t peer, const char *kind, int conn)
+{
+    char needle[128];
+    snprintf(needle, sizeof needle, "fwd link to node %" PRIu32 " (%s) up, connection %d", peer, kind, conn);
+    uint64_t t0 = now_ms();
+    while (!log_has(i, needle) && now_ms() - t0 < WAIT_MS)
+        usleep(50000);
+    if (!log_has(i, needle))
+        die("server %d: no \"%s\"", i, needle);
+}
+
+static void scen_fwdlinks(void)
+{
+    scenario("fwdlinks");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            if (i != j) {
+                fwd_await(i, ids[j], "fwd", 1);
+                fwd_await(i, ids[j], "fwdq", 1);
+            }
+    stop(2, SIGTERM);
+    start(2);
+    for (int i = 0; i < 2; i++) {
+        fwd_await(i, ids[2], "fwd", 2);
+        fwd_await(i, ids[2], "fwdq", 2);
+    }
+    printf("  fwdlinks: 3 servers, each with FWD and FWDQ links to both others; both redial a restarted one\n");
+}
+
 static void scen_links(void)
 {
     scenario("links");
@@ -7072,7 +7110,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
