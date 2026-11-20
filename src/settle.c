@@ -64,9 +64,9 @@ int settle_mutant;
 
 int settle_mutant_parse(const char *name)
 {
-    static const char *const names[] = {"", "ecrankdown", "settlenocheck", "settletwopass", "settlebusy",
+    static const char *const names[] = {"none", "ecrankdown", "settlenocheck", "settletwopass", "settlebusy",
                                         "coarsewhole"};
-    for (int i = 1; i < (int)(sizeof names / sizeof *names); i++)
+    for (int i = 0; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
     return -1;
