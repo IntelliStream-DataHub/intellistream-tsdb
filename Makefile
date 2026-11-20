@@ -338,7 +338,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_upgrade $(or $(TMPDIR),/tmp)
 	! ./$(B)/test_upgrade --mutant v8hash48 $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # the planted bug must fail it
 	./$(B)/test_fno $(or $(TMPDIR),/tmp)
-	for m in reuse manifest markers nosync flushclose; do ! ./$(B)/test_fno --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	for m in reuse manifest markers nosync flushclose walclock; do ! ./$(B)/test_fno --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_intents $(or $(TMPDIR),/tmp)
 	./$(B)/test_intents --mutant unlinkfirst $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'ROWS WRONG' # the old order must lose rows
 	./$(B)/test_replfile $(or $(TMPDIR),/tmp)

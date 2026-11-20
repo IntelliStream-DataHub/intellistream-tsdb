@@ -16,11 +16,15 @@
  *  - META requires= refuses the open of a root and of a volume, and a volume is not added to such a root;
  *  - a volume that never held a record and has no FNO (an add by 0.9.0) gets one at its first open;
  *  - power lost at every step (crashfs, tearing unsynced data): after rows, a flush, a drop and markers, and during
- *    the open that replays a segment of markers only, every number a caller was told is below the next one.
+ *    the open that replays a segment of markers only, every number a caller was told is below the next one;
+ *  - the periodic WAL sync (wal_sync_ms > 0): its clock starts at the open, the first sync is due exactly wal_sync_ms
+ *    after it (neither at the first wake nor periods later), each later one wal_sync_ms after the one before, and a
+ *    sync makes the rows appended before it durable.
  *
  *   ./build/test_fno [scratch dir]                run from the source directory is not needed
- *   ./build/test_fno --mutant reuse|manifest|markers|nosync|flushclose [scratch dir]    must fail
- *                                                  (nosync: in the power-loss sweeps; flushclose: a flush leaves a record open)
+ *   ./build/test_fno --mutant reuse|manifest|markers|nosync|flushclose|walclock [scratch dir]    must fail
+ *                                                  (nosync: in the power-loss sweeps; flushclose: a flush leaves a
+ *                                                  record open; walclock: the periodic sync's clock from 0)
  *   ./build/test_fno --child KIND DIR ACKFILE     (internal: a process the shim kills)
  */
 #define _GNU_SOURCE
@@ -813,6 +817,91 @@ static void test_wal_split(void)
     printf("  a rows record that reaches its cap is closed: the buffer parses and a reopen has every row\n");
 }
 
+/* The periodic sync's clock starts at the open (src/db.c, before the flusher starts): with wal_sync_ms an hour away the
+ * flusher's wakes sync nothing, and the rows the calls append stay in one open record. The clock used to start at 0, so
+ * the first wake found the sync overdue on any machine up longer than wal_sync_ms and closed the record behind
+ * sync_far's back (test_wal_split saw four records under ASan on a loaded machine). The test wakes the flusher itself
+ * and waits for its rounds to finish: no sleep decides what it sees. Mutant "walclock". */
+static void flusher_round(eng *db)
+{
+    uint64_t r0 = atomic_load_explicit(&db->st_flusher_rounds, memory_order_acquire);
+    for (int i = 0; i < 60000 && atomic_load_explicit(&db->st_flusher_rounds, memory_order_acquire) == r0; i++) {
+        pthread_mutex_lock(&db->buf_lock); /* a signal while the flusher is not waiting is lost: send it again */
+        pthread_cond_signal(&db->flush_cv);
+        pthread_mutex_unlock(&db->buf_lock);
+        usleep(1000);
+    }
+    CHECK(atomic_load_explicit(&db->st_flusher_rounds, memory_order_acquire) > r0);
+}
+
+static void test_wal_clock(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("walclock", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(sync_far(dir, &db) == 0);
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 5);
+    flusher_round(db);
+    flusher_round(db); /* the second one woke after the rows were appended */
+    pthread_mutex_lock(&db->buf_lock);
+    uint64_t appended = db->wal_appended;
+    pthread_mutex_unlock(&db->buf_lock);
+    CHECK(atomic_load(&db->st_periodic_syncs) == 0);
+    CHECK(appended == 5 && atomic_load(&db->wal_durable) < appended); /* nothing synced behind the test's back */
+    rows(db, s, T0 + 10, 5);
+    wal_flush_now(db);
+    rec r[4];
+    size_t k = read_records(dir, r, 4);
+    CHECK(k == 1 && r[0].kind == WAL_KIND_ROWS && r[0].n == 10 && r[0].fno == 1); /* one record: never closed early */
+    CHECK(eng_close(db) == 0);
+    printf("  the periodic WAL sync is due wal_sync_ms after the open: the flusher's wakes before it sync nothing\n");
+}
+
+/* The other half of the clock: the first periodic sync is due wal_sync_ms after the open, not later (a clock that
+ * started periods late leaves every row acknowledged meanwhile to a power loss, past what wal_sync_ms promises), each
+ * later one wal_sync_ms after the one before (not at every wake once the first period has passed), and a sync makes
+ * what was appended before it durable. No timing decides it: the flusher records the deadline its first wait computed
+ * and the `now` of its first two syncs, the test brackets the open between two readings of the same clock, and it
+ * waits on the sync counter (60 s at most; the syncs come within a second). */
+static void test_wal_cadence(void)
+{
+    enum { N = 300 };
+    char dir[PATH_MAX + 32];
+    fresh("walcadence", dir, sizeof dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.buffer_rows = 1u << 24;
+    o.flush_interval_ms = 3600000;
+    o.wal_sync_ms = N;
+    eng *db;
+    int64_t t0 = eng_mono_ms();
+    CHECK(eng_open(dir, &o, &db) == 0);
+    int64_t t1 = eng_mono_ms();
+    uint32_t s;
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 5);
+    pthread_mutex_lock(&db->buf_lock);
+    uint64_t appended = db->wal_appended;
+    pthread_mutex_unlock(&db->buf_lock);
+    /* a sync counted after this load read its target after the rows were appended, or the one after it did */
+    uint64_t want = atomic_load_explicit(&db->st_periodic_syncs, memory_order_acquire) + 2;
+    for (int i = 0; i < 60000 && atomic_load_explicit(&db->st_periodic_syncs, memory_order_acquire) < want; i++)
+        usleep(1000);
+    CHECK(atomic_load_explicit(&db->st_periodic_syncs, memory_order_acquire) >= want); /* the timer syncs at all */
+    int64_t due0 = atomic_load(&db->st_sync_due0), at0 = atomic_load(&db->st_sync_at[0]),
+            at1 = atomic_load(&db->st_sync_at[1]);
+    CHECK(due0 >= t0 + N && due0 <= t1 + N); /* the clock started at the open: not at 0, not periods late */
+    CHECK(at0 >= due0);                      /* not before it was due */
+    CHECK(at1 >= at0 + N);                   /* the next one a period after the first, not at the next wake */
+    CHECK(appended == 5 && atomic_load(&db->wal_durable) >= appended); /* a sync made the rows durable */
+    CHECK(eng_close(db) == 0);
+    printf("  the first periodic WAL sync is due wal_sync_ms after the open, the next a period later, and syncs\n");
+}
+
 static void test_wal_races(void)
 {
     char dir[PATH_MAX + 32];
@@ -992,6 +1081,7 @@ static void set_mutant(const char *mutant)
                       : strcmp(mutant, "markers") == 0  ? MUT_MARKER_ROWS
                       : strcmp(mutant, "nosync") == 0   ? MUT_FNO_NOSYNC
                       : strcmp(mutant, "flushclose") == 0 ? MUT_FLUSH_NOCLOSE
+                      : strcmp(mutant, "walclock") == 0   ? MUT_WALSYNC_FROM_ZERO
                                                         : MUT_NONE;
     if (eng_test_mutant == MUT_NONE) {
         fprintf(stderr, "unknown mutant %s\n", mutant);
@@ -1036,6 +1126,8 @@ int main(int argc, char **argv)
         test_replay_markers();
         test_wal_books();
         test_wal_split();
+        test_wal_clock();
+        test_wal_cadence();
         test_wal_flush_tail();
         test_wal_races();
         if (!mutant) {
