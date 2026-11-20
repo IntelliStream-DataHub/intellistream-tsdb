@@ -400,7 +400,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_ecswap $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled; do ! ./$(B)/test_ecswap --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_ecgc $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight; do ! ./$(B)/test_ecgc --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),for m in gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer; do ! ./$(B)/test_ecgc --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_seam $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop; do ! ./$(B)/test_seam --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_ecpart $(or $(TMPDIR),/tmp)
@@ -1029,7 +1029,7 @@ $(B)/test_ecswap: tests/test_ecswap.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_
 # retired .ec parts and their objects (r7-gc, src/ecgc.c): holds across the deadline, the sweep at open, a store DOWN,
 # power loss at every step of an open and a purge (crashfs); mutants gcunlinkfirst gcunrefleak gcnohold sweeplive
 # sweepinflight
-$(B)/test_ecgc: tests/test_ecgc.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_SO)
+$(B)/test_ecgc: tests/test_ecgc.c src/internal.h $(R7_HDR) src/chunk_priv.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # the seam of .ec parts (r7-seam, src/eccache.c): every query kind through it equals the maps, damaged cells, lost

@@ -7,9 +7,9 @@
  *
  * 1. A name stays until the chunks are gone. A retired .ec part keeps its name retired_<name>.ec (or retired_<name>
  *    for a part with an attached object) until every chunk of its object is deleted; only then is the name unlinked
- *    and the directory synced. So a crash at any step leaves either the name (and the next open, which reads the
- *    object's id from it, deletes again: NOTFOUND counts as gone) or no chunk at all. part_unref leaves such a name
- *    alone (ecgc_owns_name).
+ *    (with no directory fsync: a name that comes back is collected again). So a crash at any step leaves either the
+ *    name (and the next open, which reads the object's id from it, deletes again: NOTFOUND counts as gone) or no
+ *    chunk at all. part_unref leaves such a name alone (ecgc_owns_name).
  *
  * 2. Nothing is deleted while a part of the object is referenced. db_retire_locked takes a hold for the part
  *    (ecgc_retire_locked) in the tier, keyed by (volume, oid), which the part's last part_unref lets go of (no I/O
@@ -27,12 +27,16 @@
  * puts its chunks before any file names them, so a sweep later than that could delete a live settle's object. It
  * queues every object of the volume that no listed .ec part and no retired name names (the objects of abandoned
  * settles, of swaps refused or cut by a power loss, of parts attached in memory by tests), only with every store UP.
+ * It lists file names only and reads one chunk header per object nothing names: an object is queued only when that
+ * header names this volume's uuid, since another database on the same stores lists the same volume numbers (and
+ * chunk_store_del refuses a chunk of another uuid as well).
  *
  * The queue is worked by a thread of the tier (nice 19, woken by every enqueue, and every 2 s while entries wait).
  * Lock order: db->lock > the tier gc mutex (a leaf: never held across I/O or another lock).
  */
 #include "ecgc.h"
 #include "chunk.h"
+#include "chunk_priv.h"
 #include "eccache.h"
 #include "ecpart.h"
 #include "tier.h"
@@ -50,6 +54,8 @@
 int ecgc_mutant;
 atomic_bool ecgc_test_manual;
 atomic_bool ecgc_test_nosweep;
+atomic_int ecgc_test_del_fail;
+void (*ecgc_test_after_del)(struct tier *t, unsigned pos);
 
 /* D4: chunks are written and deleted at the constant epoch 1 (a delete above a store's epoch would raise it) */
 #define GC_EPOCH 1
@@ -92,8 +98,8 @@ typedef struct gc_deferred {
 struct ecgc_tier {
     pthread_mutex_t mu;
     pthread_cond_t cv;
-    gc_item *q;
-    size_t nq, capq;
+    gc_item *q; /* the entries are q[qh .. nq): a pop moves qh, a push compacts only once qh is half of nq */
+    size_t qh, nq, capq;
     gc_hold *holds;
     size_t nholds, capholds;
     gc_deferred *def;
@@ -119,8 +125,15 @@ struct ecgc_eng {
 
 /* ------------------------------------------------------------ the tier's queue and holds */
 
+static size_t qlen(const struct ecgc_tier *g) { return g->nq - g->qh; }
+
 static int push_locked(struct ecgc_tier *g, const gc_item *it)
 {
+    if (g->nq == g->capq && g->qh && g->qh >= g->nq / 2) { /* at most half moves, after at least as many pops */
+        memmove(g->q, g->q + g->qh, (g->nq - g->qh) * sizeof *g->q);
+        g->nq -= g->qh;
+        g->qh = 0;
+    }
     if (g->nq == g->capq) {
         size_t cap = g->capq ? 2 * g->capq : 16;
         gc_item *q = realloc(g->q, cap * sizeof *q);
@@ -212,6 +225,9 @@ static bool delete_object(tier *t, const gc_item *it)
     chunk_backend *be = tier_backend(t);
     if (!be || !tier_writable(t))
         return false;
+    for (int f = atomic_load(&ecgc_test_del_fail); f > 0; f = atomic_load(&ecgc_test_del_fail))
+        if (atomic_compare_exchange_weak(&ecgc_test_del_fail, &f, f - 1))
+            return false;
     eccache_forget(t, it->volume, it->oid); /* no reader holds it (a part held would hold the object) */
     chunk_ident id = {.volume = it->volume};
     memcpy(id.vuuid, it->vuuid, 16);
@@ -220,9 +236,14 @@ static bool delete_object(tier *t, const gc_item *it)
         id.pos = (uint16_t)pos;
         int rc = chunk_be_del(be, &id, GC_EPOCH);
         if (rc && rc != TSDB_ERR_NOTFOUND)
-            return false;
+            return false; /* a store that failed in service answers TSDB_ERR_IO for every delete after it */
+        if (ecgc_test_after_del)
+            ecgc_test_after_del(t, pos);
     }
-    return tier_writable(t); /* a store that went DOWN meanwhile kept its copies: chunk_be_del skips it */
+    /* A backstop: chunk_be_del skips a store that holds no open store (DOWN), and counts the skip as NOTFOUND. No store
+     * goes from open to DOWN in service today (a failed one stays open and refuses, a replaced one is swapped for the
+     * new one), so nothing reaches this but a future change of the backend; the noafter mutant cannot be killed. */
+    return ecgc_mutant == GC_MUT_NOAFTER || tier_writable(t);
 }
 
 static int sweep_list(tier *t, uint32_t volume, const uint8_t vuuid[16], uint8_t (*named)[16], size_t nnamed);
@@ -244,19 +265,19 @@ size_t ecgc_tier_work(tier *t)
     }
     free(def);
     pthread_mutex_lock(&g->mu);
-    size_t round = g->nq;
+    size_t round = qlen(g);
     pthread_mutex_unlock(&g->mu);
 
     /* one round: the entries there before it, each once; a kept one goes to the back */
     for (size_t k = 0; k < round; k++) {
         pthread_mutex_lock(&g->mu);
-        if (g->nq == 0 || g->stop) {
+        if (qlen(g) == 0 || g->stop) {
             pthread_mutex_unlock(&g->mu);
             break;
         }
-        gc_item it = g->q[0];
-        memmove(g->q, g->q + 1, (g->nq - 1) * sizeof *g->q);
-        g->nq--;
+        gc_item it = g->q[g->qh++];
+        if (g->qh == g->nq)
+            g->qh = g->nq = 0;
         pthread_mutex_unlock(&g->mu);
         if (delete_object(t, &it)) {
             if (it.tk)
@@ -267,13 +288,13 @@ size_t ecgc_tier_work(tier *t)
         }
         atomic_fetch_add(&g->retries, 1);
         pthread_mutex_lock(&g->mu);
-        int rc = push_locked(g, &it); /* cannot fail: the slot it left is free */
+        int rc = push_locked(g, &it); /* cannot fail: the slot it left is free (a compaction makes room) */
         pthread_mutex_unlock(&g->mu);
         if (rc)
             tk_put(it.tk);
     }
     pthread_mutex_lock(&g->mu);
-    size_t left = g->nq;
+    size_t left = qlen(g);
     pthread_mutex_unlock(&g->mu);
     return left;
 }
@@ -285,11 +306,11 @@ static void *gc_main(void *arg)
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19); /* this thread only, as D11's settle thread */
     pthread_mutex_lock(&g->mu);
     while (!g->stop) {
-        if (!g->kick && g->nq == 0 && g->ndef == 0) {
+        if (!g->kick && ((qlen(g) == 0 && g->ndef == 0) || ecgc_mutant == GC_MUT_NORETRYTIMER)) {
             pthread_cond_wait(&g->cv, &g->mu);
             continue;
         }
-        if (!g->kick) { /* entries kept from the last round: again in 2 s */
+        if (!g->kick) { /* entries kept from the last round (a transient error): again in 2 s */
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += 2;
@@ -336,7 +357,7 @@ void ecgc_tier_close(tier *t)
     if (g->has_thread)
         pthread_join(g->thread, NULL);
     /* what is left stays on the stores: named objects for the next open's purge, the rest for its sweep */
-    for (size_t i = 0; i < g->nq; i++)
+    for (size_t i = g->qh; i < g->nq; i++)
         tk_put(g->q[i].tk);
     free(g->q);
     free(g->holds);
@@ -363,7 +384,7 @@ void ecgc_get_counters(tier *t, ecgc_counters *out)
     out->sweeps_skipped = atomic_load(&g->sweeps_skipped);
     out->unlinked = atomic_load(&g->unlinked);
     pthread_mutex_lock(&g->mu);
-    out->pending = g->nq;
+    out->pending = qlen(g);
     out->holds = g->nholds;
     pthread_mutex_unlock(&g->mu);
 }
@@ -533,10 +554,10 @@ bool ecgc_purge_entry(eng *db, const graveyard_entry *ge, bool all, int64_t now)
     default: /* TK_DELETED: every chunk is gone, so the name may go */
         break;
     }
-    if (unlinkat(db->dirfd, ge->name, 0) == 0 || errno == ENOENT) {
-        eng_sync_dir(db, "fsync of the directory after removing a retired erasure-coded part"); /* fail-stop inside */
+    /* No directory fsync (none per name under db->lock on the flusher): a name that a power loss brings back is
+     * loaded again, its deletes find nothing (NOTFOUND counts as gone) and it goes, as GY_PART names go unsynced. */
+    if (unlinkat(db->dirfd, ge->name, 0) == 0 || errno == ENOENT)
         atomic_fetch_add(&db->tier->gc->unlinked, 1);
-    }
     rec_remove(e, r);
     return true;
 }
@@ -561,53 +582,74 @@ int ecgc_queue_object(eng *db, const uint8_t oid[16], unsigned npos)
 void ecgc_unlisted_object(eng *db, const part *p)
 {
     struct ecpart *e = atomic_load(&((part *)p)->ec);
-    if (!e || e->test_mark || !db->tier)
+    if (!e || e->test_mark || !db->tier || ecgc_mutant == GC_MUT_UNLISTEDNOOP)
         return;
     (void)ecgc_queue_object(db, e->rec.oid, (unsigned)e->rec.k + e->rec.m); /* unqueued: the next open's sweep */
 }
 
 /* ------------------------------------------------------------ the sweep (D6) */
 
+/* A chunk that no listed or retired name names: its object is ours to delete only if a header says it is this volume's
+ * (another database on the same stores lists the same volume number: rev F1). */
+typedef struct sweep_ent {
+    uint8_t oid[16];
+    uint16_t pos;
+    int16_t store;
+} sweep_ent;
+
 typedef struct sweep_ctx {
     uint8_t (*named)[16];
     size_t nnamed;
-    struct orphan {
-        uint8_t oid[16];
-        unsigned npos;
-    } *orph;
+    sweep_ent *e;
     size_t n, cap;
     bool nomem;
 } sweep_ctx;
 
 static int oid_cmp(const void *a, const void *b) { return memcmp(a, b, 16); }
 
+static int ent_cmp(const void *a, const void *b)
+{
+    const sweep_ent *x = a, *y = b;
+    int c = memcmp(x->oid, y->oid, 16);
+    return c ? c : (x->pos > y->pos) - (x->pos < y->pos);
+}
+
 static int list_one(void *ctx, const chunk_listed *c)
 {
     sweep_ctx *s = ctx;
     if (s->nnamed && bsearch(c->oid, s->named, s->nnamed, 16, oid_cmp))
         return 0;
-    for (size_t i = 0; i < s->n; i++)
-        if (!memcmp(s->orph[i].oid, c->oid, 16)) {
-            if (c->pos + 1u > s->orph[i].npos)
-                s->orph[i].npos = c->pos + 1u;
-            return 0;
-        }
     if (s->n == s->cap) {
         size_t cap = s->cap ? 2 * s->cap : 64;
-        struct orphan *o = realloc(s->orph, cap * sizeof *o);
-        if (!o) {
+        sweep_ent *e = realloc(s->e, cap * sizeof *e);
+        if (!e) {
             s->nomem = true;
             return 1;
         }
-        s->orph = o;
+        s->e = e;
         s->cap = cap;
     }
-    memcpy(s->orph[s->n].oid, c->oid, 16);
-    s->orph[s->n++].npos = c->pos + 1u;
+    sweep_ent *e = &s->e[s->n++];
+    memcpy(e->oid, c->oid, 16);
+    e->pos = c->pos;
+    e->store = (int16_t)c->store;
     return 0;
 }
 
-/* lists the volume's objects and queues the ones not named; TSDB_ERR_NOMEM, or 0 (a skip says why on stderr) */
+/* 1: a header of the object names vuuid; 0: it names another volume; -1: no header of it could be read */
+static int obj_owner(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const sweep_ent *e, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        chunk_store *st = chunk_be_open_store(be, e[i].store);
+        chunk_hdr h;
+        if (st && chunk_store_peek(st, volume, e[i].oid, e[i].pos, &h) == 0)
+            return !memcmp(h.vuuid, vuuid, 16) || ecgc_mutant == GC_MUT_SWEEPFOREIGN;
+    }
+    return -1;
+}
+
+/* Lists the volume's chunks by name (no file opened), reads one header per object nothing names, and queues those
+ * this volume wrote. TSDB_ERR_NOMEM, or 0 (a skip says why on stderr). */
 static int sweep_list(tier *t, uint32_t volume, const uint8_t vuuid[16], uint8_t (*named)[16], size_t nnamed)
 {
     struct ecgc_tier *g = t->gc;
@@ -620,27 +662,51 @@ static int sweep_list(tier *t, uint32_t volume, const uint8_t vuuid[16], uint8_t
     if (nnamed)
         qsort(named, nnamed, 16, oid_cmp);
     sweep_ctx s = {.named = named, .nnamed = nnamed};
-    int rc = chunk_be_list(tier_backend(t), volume, false, list_one, &s);
+    chunk_backend *be = tier_backend(t);
+    int rc = chunk_be_list_names(be, volume, list_one, &s);
     if (s.nomem) {
-        free(s.orph);
+        free(s.e);
         return TSDB_ERR_NOMEM;
     }
     if (rc) { /* a listing cut short says nothing of what it did not reach: nothing is queued from it */
         atomic_fetch_add(&g->sweeps_skipped, 1);
         fprintf(stderr, "tsdb: volume %u: the sweep of orphan chunks is skipped: a chunk store cannot be listed (%s)\n",
                 volume, tsdb_strerror(rc));
-        free(s.orph);
+        free(s.e);
         return 0;
     }
-    size_t q = 0;
-    for (size_t i = 0; i < s.n; i++)
-        if (enqueue(t, volume, vuuid, s.orph[i].oid, s.orph[i].npos, NULL) == 0)
-            q++;
-    atomic_fetch_add(&g->swept, q);
     if (s.n)
-        fprintf(stderr, "tsdb: volume %u: %zu orphan objects in the chunk stores, %zu queued for deletion\n", volume, s.n,
-                q);
-    free(s.orph);
+        qsort(s.e, s.n, sizeof *s.e, ent_cmp);
+    size_t orphans = 0, q = 0, foreign = 0, unread = 0;
+    for (size_t i = 0, j; i < s.n; i = j) {
+        for (j = i + 1; j < s.n && !memcmp(s.e[j].oid, s.e[i].oid, 16); j++)
+            ;
+        int own = obj_owner(be, volume, vuuid, s.e + i, j - i);
+        if (own == 0) {
+            foreign++;
+            continue;
+        }
+        if (own < 0) {
+            unread++;
+            continue;
+        }
+        orphans++;
+        if (enqueue(t, volume, vuuid, s.e[i].oid, s.e[j - 1].pos + 1u, NULL) == 0) /* sorted: the last is the highest */
+            q++;
+    }
+    atomic_fetch_add(&g->swept, q);
+    if (orphans)
+        fprintf(stderr, "tsdb: volume %u: %zu orphan objects in the chunk stores, %zu queued for deletion\n", volume,
+                orphans, q);
+    if (foreign)
+        fprintf(stderr,
+                "tsdb: volume %u: the chunk stores hold %zu objects of another volume uuid (another database on the "
+                "same stores?): left alone\n",
+                volume, foreign);
+    if (unread)
+        fprintf(stderr, "tsdb: volume %u: %zu objects named by no part have no readable chunk header: left alone\n",
+                volume, unread);
+    free(s.e);
     return 0;
 }
 

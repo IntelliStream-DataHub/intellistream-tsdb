@@ -74,11 +74,29 @@ extern atomic_bool ecgc_test_manual;
 /* Set before an open: no sweep. Objects a test attached in memory only (ec_test_attach, tests/test_seam.c) are named by
  * no .ec file, so a reopen's sweep would delete them as orphans. */
 extern atomic_bool ecgc_test_nosweep;
+/* A transient delete error: while positive, a round keeps each entry it reaches (and counts this down). */
+extern atomic_int ecgc_test_del_fail;
+/* Called by the worker after each position's delete (a test fails a store in the middle of a round). */
+extern void (*ecgc_test_after_del)(struct tier *t, unsigned pos);
 /* Planted bugs (tests/test_ecgc.c --mutant NAME; the Makefile requires each to fail it): the purge unlinks the retired
  * name before the chunks are deleted (gcunlinkfirst); the last part_unref keeps its hold, so the object never goes
  * (gcunrefleak); the purge ignores the holds, deleting the chunks of a part a query still reads (gcnohold); the sweep
  * ignores the retired names (sweeplive); the sweep lists the stores at the first round of the queue, after the threads
- * started, instead of in the open (sweepinflight). */
-enum { GC_MUT_NONE = 0, GC_MUT_UNLINKFIRST, GC_MUT_UNREFLEAK, GC_MUT_NOHOLD, GC_MUT_SWEEPLIVE, GC_MUT_SWEEPINFLIGHT };
+ * started, instead of in the open (sweepinflight); the sweep takes another volume's objects for orphans
+ * (sweepforeign); a refused swap's object is not queued (unlistednoop); the worker waits only for a new entry, never
+ * retrying a kept one (noretrytimer). Not required to fail (no path reaches it today, see delete_object): the round
+ * trusts its deletes without asking tier_writable after them (noafter). */
+enum {
+    GC_MUT_NONE = 0,
+    GC_MUT_UNLINKFIRST,
+    GC_MUT_UNREFLEAK,
+    GC_MUT_NOHOLD,
+    GC_MUT_SWEEPLIVE,
+    GC_MUT_SWEEPINFLIGHT,
+    GC_MUT_SWEEPFOREIGN,
+    GC_MUT_UNLISTEDNOOP,
+    GC_MUT_NORETRYTIMER,
+    GC_MUT_NOAFTER,
+};
 extern int ecgc_mutant;
 #endif

@@ -9,15 +9,20 @@
  *            listed .ec's, a retired one's, or one a settle puts after the open; ecgc_queue_object.
  *   down     a store DOWN at the purge: the entry is kept, nothing unlinked; with the store back every chunk and the
  *            name go.
+ *   foreign  another database on the same stores: its open's sweep and its deletes leave this one's object.
+ *   unlisted a swap refused (its source dropped meanwhile) queues its object: the chunks go without a reopen.
+ *   midround every store fails in service between two positions' deletes: the name stays; a reopen finishes.
+ *   retry    a transient delete error keeps an entry, and the worker's own timer retries it.
  *   power    power lost (crashfs, torn at random) at every step of an open (its sweep) and a purge: a listed object
  *            keeps every chunk, a retired name stays until its object's chunks are all gone; a clean open then removes
  *            the retired object and the orphan.
  *
  * Mutants (--mutant NAME; the Makefile requires each to fail): gcunlinkfirst gcunrefleak gcnohold sweeplive
- * sweepinflight (src/ecgc.h).
+ * sweepinflight sweepforeign unlistednoop noretrytimer; noafter too is accepted, but survives (src/ecgc.h).
  */
 #include "internal.h"
 #include "chunk.h"
+#include "chunk_priv.h"
 #include "eccache.h"
 #include "ecgc.h"
 #include "ecpart.h"
@@ -52,7 +57,8 @@ static const struct {
     int m;
 } MUTANTS[] = {{"none", GC_MUT_NONE},           {"gcunlinkfirst", GC_MUT_UNLINKFIRST}, {"gcunrefleak", GC_MUT_UNREFLEAK},
                {"gcnohold", GC_MUT_NOHOLD},     {"sweeplive", GC_MUT_SWEEPLIVE},
-               {"sweepinflight", GC_MUT_SWEEPINFLIGHT}};
+               {"sweepinflight", GC_MUT_SWEEPINFLIGHT}, {"sweepforeign", GC_MUT_SWEEPFOREIGN},
+               {"unlistednoop", GC_MUT_UNLISTEDNOOP}, {"noretrytimer", GC_MUT_NORETRYTIMER}, {"noafter", GC_MUT_NOAFTER}};
 
 static const char *mutant_name(int m)
 {
@@ -102,13 +108,13 @@ typedef struct h {
 
 static bool use_thread; /* the tier's worker works the queue (thread_case); else the test does */
 
-static int h_open(h *x, const char *dir, int lifetime_s)
+/* the stores dir/st0.. and the database db (another database on the same stores: foreign_case) */
+static int h_open_at(h *x, const char *dir, const char *db, int lifetime_s)
 {
-    char spec[8192], db[PATH_MAX + 8];
+    char spec[8192];
     int n = snprintf(spec, sizeof spec, "k=%d,m=%d,cache_mb=64,dirs=", K, M);
     for (int i = 0; i < NST; i++)
         n += snprintf(spec + n, sizeof spec - (size_t)n, "%s%s/st%d", i ? ":" : "", dir, i);
-    snprintf(db, sizeof db, "%s/db", dir);
     setenv("TSDB_TEST_TIER", spec, 1);
     setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
     x->t = NULL;
@@ -133,6 +139,13 @@ static int h_open(h *x, const char *dir, int lifetime_s)
         x->t = NULL;
     }
     return rc;
+}
+
+static int h_open(h *x, const char *dir, int lifetime_s)
+{
+    char db[PATH_MAX + 8];
+    snprintf(db, sizeof db, "%s/db", dir);
+    return h_open_at(x, dir, db, lifetime_s);
 }
 
 static void h_close(h *x)
@@ -217,13 +230,15 @@ static void put_object(h *x, const uint8_t *b, size_t len, uint8_t oid[16])
     free(sums);
 }
 
-/* a settle by hand of day d's .part: the object, the .ec file, the swap. Its oid into oid; the .ec name into name. */
-static void settle_day(h *x, int d, uint8_t oid[16], char name[96])
+/* a settle by hand of day d's .part: the object, the .ec file, the swap. Its oid into oid; the .ec name into name.
+ * drop_first: day d is dropped before the swap, which is then refused (the swap's rc is returned). */
+static int settle_day_ex(h *x, int d, uint8_t oid[16], char name[96], bool drop_first)
 {
     eng *db = x->db;
     part *p = day_part(db, d);
+    int rc = TSDB_ERR_NOTFOUND;
     if (!p)
-        return;
+        return rc;
     chunk_geom g;
     CHECK(chunk_geom_derive(&g, K, M, p->map_len) == 0);
     ec_record r;
@@ -256,14 +271,19 @@ static void settle_day(h *x, int d, uint8_t oid[16], char name[96])
     if (e) {
         snprintf(e->pending, sizeof e->pending, "%s", tmp);
         part *in[1] = {p}, *ec[1] = {e};
-        CHECK(ec_swap_commit(db, in, ec, 1) == 0);
+        if (drop_first)
+            CHECK(eng_drop_before(db, (int64_t)(d + 1) * DAY) == 0);
+        rc = ec_swap_commit(db, in, ec, 1);
         part_unref(e);
     }
     memcpy(oid, r.oid, 16);
     note(oid, (int)(g.k + g.m));
     free(r.sums);
     part_unref(p);
+    return rc;
 }
+
+static void settle_day(h *x, int d, uint8_t oid[16], char name[96]) { CHECK(settle_day_ex(x, d, oid, name, false) == 0); }
 
 /* chunk files of oid in every store */
 static int chunks(const char *dir, const uint8_t oid[16])
@@ -506,6 +526,144 @@ static void thread_case(void)
     printf("  thread: the tier's worker deleted a dropped part's object, then the purge its name (%d ms)\n", ms);
 }
 
+/* ------------------------------------------------------------ foreign */
+
+/* Two databases on one set of stores (an operator's mistake): each one's volume 0 lists the other's objects, which
+ * neither names. B's sweep must leave A's object (its headers name A's vuuid), and so must a delete of it by B. */
+static void foreign_case(void)
+{
+    char dir[PATH_MAX], name[96], dbb[PATH_MAX + 8];
+    uint8_t oid[16];
+    fresh("foreign", dir, sizeof dir);
+    snprintf(dbb, sizeof dbb, "%s/dbB", dir);
+    h a, b;
+    CHECK(h_open(&a, dir, 3600) == 0);
+    if (!a.db)
+        return;
+    write_day(a.db, 0);
+    write_day(a.db, 1);
+    settle_day(&a, 0, oid, name);
+    h_close(&a);
+    CHECK(chunks(dir, oid) == npos(oid));
+    CHECK(h_open_at(&b, dir, dbb, 3600) == 0);
+    if (!b.db)
+        return;
+    ecgc_counters c;
+    ecgc_get_counters(b.t, &c);
+    CHECK(c.sweeps == 1 && c.sweeps_skipped == 0 && c.swept == 0);
+    h_gc(&b);
+    CHECK(chunks(dir, oid) == npos(oid));
+    CHECK(ecgc_queue_object(b.db, oid, (unsigned)npos(oid)) == 0); /* the backstop: deletes check the vuuid */
+    ecgc_tier_work(b.t);
+    CHECK(chunks(dir, oid) == npos(oid));
+    h_close(&b);
+    CHECK(h_open(&a, dir, 3600) == 0);
+    if (!a.db)
+        return;
+    uint64_t rows = 0;
+    part *p = day_part(a.db, 0);
+    CHECK(p && atomic_load(&p->ec) && read_all(&a, p, &rows) == 0 && rows == ROWS);
+    if (p)
+        part_unref(p);
+    h_close(&a);
+    printf("  foreign: another database on the same stores neither swept nor deleted this one's object\n");
+}
+
+/* ------------------------------------------------------------ unlisted */
+
+/* A swap refused because its source was dropped meanwhile hands its object to the queue: the chunks go with no reopen. */
+static void unlisted_case(void)
+{
+    char dir[PATH_MAX], name[96];
+    uint8_t oid[16];
+    fresh("unlisted", dir, sizeof dir);
+    h x;
+    CHECK(h_open(&x, dir, 3600) == 0);
+    if (!x.db)
+        return;
+    write_day(x.db, 0);
+    write_day(x.db, 1);
+    CHECK(settle_day_ex(&x, 0, oid, name, true) != 0);
+    CHECK(chunks(dir, oid) == npos(oid) && !exists(dir, name));
+    ecgc_tier_work(x.t);
+    CHECK(chunks(dir, oid) == 0);
+    h_close(&x);
+    printf("  unlisted: a refused swap's object was deleted without a reopen\n");
+}
+
+/* ------------------------------------------------------------ midround, retry */
+
+static void fail_all_stores(tier *t, unsigned pos)
+{
+    if (pos != 0)
+        return;
+    for (int i = 0; i < NST; i++) {
+        chunk_store *st = chunk_be_store(tier_backend(t), i);
+        if (st)
+            chunk_store_test_fail(st);
+    }
+}
+
+/* every store fails in service after position 0 is deleted: the name and the other chunks stay; after a reopen they go */
+static void midround_case(void)
+{
+    char dir[PATH_MAX], name[96], rname[128];
+    uint8_t oid[16];
+    fresh("midround", dir, sizeof dir);
+    h x;
+    CHECK(h_open(&x, dir, 0) == 0);
+    if (!x.db)
+        return;
+    write_day(x.db, 0);
+    write_day(x.db, 1);
+    settle_day(&x, 0, oid, name);
+    snprintf(rname, sizeof rname, "retired_%s", name);
+    CHECK(eng_drop_before(x.db, DAY) == 0);
+    ecgc_test_after_del = fail_all_stores;
+    h_gc(&x);
+    ecgc_test_after_del = NULL;
+    CHECK(exists(dir, rname) && chunks(dir, oid) == npos(oid) - 1);
+    h_close(&x);
+    CHECK(h_open(&x, dir, 0) == 0);
+    if (!x.db)
+        return;
+    h_gc(&x);
+    CHECK(chunks(dir, oid) == 0 && !exists(dir, rname));
+    h_close(&x);
+    printf("  midround: stores failing between two deletes kept the name; the next open finished the object\n");
+}
+
+/* a transient error keeps an entry: the worker tries it again by itself (its timer: nothing else kicks it) */
+static void retry_case(void)
+{
+    char dir[PATH_MAX], name[96], rname[128];
+    uint8_t oid[16];
+    fresh("retry", dir, sizeof dir);
+    use_thread = true;
+    h x;
+    CHECK(h_open(&x, dir, 0) == 0);
+    use_thread = false;
+    if (!x.db)
+        return;
+    write_day(x.db, 0);
+    write_day(x.db, 1);
+    settle_day(&x, 0, oid, name);
+    snprintf(rname, sizeof rname, "retired_%s", name);
+    atomic_store(&ecgc_test_del_fail, 1);
+    CHECK(eng_drop_before(x.db, DAY) == 0);
+    int ms = 0;
+    for (; ms < 10000 && (chunks(dir, oid) != 0 || exists(dir, rname)); ms += 10) {
+        graveyard_purge(x.db, false);
+        usleep(10000);
+    }
+    ecgc_counters c;
+    ecgc_get_counters(x.t, &c);
+    CHECK(chunks(dir, oid) == 0 && !exists(dir, rname) && c.retries >= 1);
+    atomic_store(&ecgc_test_del_fail, 0);
+    h_close(&x);
+    printf("  retry: an entry a transient error kept was deleted by the worker's own retry (%d ms)\n", ms);
+}
+
 /* ------------------------------------------------------------ power */
 
 static char PBASE[PATH_MAX], PNAME[128];
@@ -630,6 +788,10 @@ static void run(void)
     sweep_case();
     down_case();
     thread_case();
+    foreign_case();
+    unlisted_case();
+    midround_case();
+    retry_case();
     power_case();
 }
 #endif
@@ -646,7 +808,7 @@ int main(int argc, char **argv)
                     ecgc_mutant = MUTANTS[j].m, ok = true;
             if (!ok) {
                 fprintf(stderr, "usage: test_ecgc [--quick] [--mutant gcunlinkfirst|gcunrefleak|gcnohold|sweeplive|"
-                                "sweepinflight] [SCRATCH]\n");
+                                "sweepinflight|sweepforeign|unlistednoop|noretrytimer|noafter] [SCRATCH]\n");
                 return 2;
             }
         } else if (!strcmp(argv[i], "--child") && i + 1 < argc) {
