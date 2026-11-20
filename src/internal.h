@@ -2046,6 +2046,8 @@ struct eng {
     void *retire_owner;    /* the tsdb handle it does that for */
     uint32_t adopted_series, adopted_states; /* the first names the next engine took over (eng_adopt_names) */
     atomic_bool quiesced;  /* no new caller: the volume is being recovered */
+    atomic_bool diverged;  /* R7 (src/eckeep.c, D5): a settle's digest did not match: refused like quiesced until a
+                            * restart (tsdb_volume_resume does not clear it) */
     struct tlist *tl;       /* the tenant list the sweeper is to count by (stats_priv.h), under tl_mu */
     pthread_mutex_t tl_mu;  /* a leaf */
     bool retiring;        /* eng_close keeps the names of the dictionaries (eng_retire) */
@@ -2551,6 +2553,7 @@ void tsdb_test_latest_nowarm(int on); /* engines opened while on start no warmer
  * name or type lookup holds it between its route and its use (tsdb_test_meta_use reads the type through it) */
 void tsdb_test_reopen_hook(void (*fn)(void *, int phase), void *arg);
 void *tsdb_test_meta_hold(struct tsdb *t, tsdb_sid id);
+struct eng *tsdb_test_engine(struct tsdb *t, uint32_t vol); /* tests/test_keep.c: no reference taken */
 int tsdb_test_meta_use(void *hold);
 void tsdb_test_meta_release(void *hold);
 int tsdb_test_deferred_retires(struct tsdb *t); /* retired engines a multi call's cut still keeps */
