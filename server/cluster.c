@@ -1088,6 +1088,8 @@ static struct {
                           * user named probe-drop through cluster_user_propose from another thread (test_cluster users) */
     unsigned sync_delay_ms; /* TSDB_CLUSTER_TEST sync_delay_ms=N: the worker waits N ms before each sync round */
     unsigned copy_hold;  /* TSDB_CLUSTER_TEST copy_hold=N: cc_hold_main holds a snapshot across N more */
+    unsigned copy_noleader; /* TSDB_CLUSTER_TEST copy_noleader=V (test_cluster route): the copy shows volume V with no
+                             * leader (R3 never leaves a record without one), so routing answers NO_OWNER for it */
     atomic_uint copy_drive; /* proposals of the settings still wanted by cc_hold_main (the Raft leader makes them) */
     pthread_t copy_hold_th;
     int fail_file;       /* TSDB_CLUSTER_TEST fail_sync_file=1: a sync fails with EIO while <state-dir>/failsync exists */
@@ -1338,6 +1340,8 @@ static void test_knobs(void)
             C.hold_install_ns = v * 1000000ull;
         else if (sscanf(p, "copy_hold=%llu", &v) == 1)
             C.copy_hold = (unsigned)v;
+        else if (sscanf(p, "copy_noleader=%llu", &v) == 1)
+            C.copy_noleader = (unsigned)v;
         p = strchr(p, ',');
         if (p)
             p++;
@@ -1935,8 +1939,9 @@ static void copy_publish(void)
         const struct meta_volume *v = &C.sm.volumes[i];
         struct cluster_copy_vol *o = &vols[i];
         o->number = v->number;
+        snprintf(o->name, sizeof o->name, "%s", v->name);
         o->kind = v->kind;
-        o->leader = v->leader;
+        o->leader = C.copy_noleader && v->number == C.copy_noleader ? 0 : v->leader;
         o->epoch = v->epoch;
         o->nrep = v->nrep < META_REPLICAS_MAX ? v->nrep : META_REPLICAS_MAX;
         for (uint32_t k = 0; k < o->nrep; k++)
@@ -1982,6 +1987,14 @@ const struct cluster_copy_vol *cluster_copy_vol(const struct cluster_copy *c, ui
             hi = mid;
     }
     return c && lo < c->nvolumes && c->volumes[lo].number == number ? &c->volumes[lo] : NULL;
+}
+
+const struct cluster_copy_vol *cluster_copy_vol_named(const struct cluster_copy *c, const char *name, size_t n)
+{
+    for (uint32_t i = 0; c && n && n < META_NAME_MAX && i < c->nvolumes; i++)
+        if (memcmp(c->volumes[i].name, name, n) == 0 && c->volumes[i].name[n] == 0)
+            return &c->volumes[i];
+    return NULL;
 }
 
 int cluster_copy_role(const struct cluster_copy_vol *v, uint32_t node)

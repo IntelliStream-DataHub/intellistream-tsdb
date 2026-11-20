@@ -4485,6 +4485,197 @@ static void scen_movedself(void)
     printf("  route_moved on the volume's own leader answers UNAVAILABLE, never MOVED to itself\n");
 }
 
+/* rc is MOVED to the leader `node` of volume `vol` at server s's client address (the copy's MOVED, never UNAVAILABLE) */
+static void expect_moved(tsdbc *c, int rc, uint32_t vol, uint32_t node, int s, const char *what)
+{
+    tsdbc_err_info e;
+    char want[64];
+    snprintf(want, sizeof want, "127.0.0.1:%d", cports[s]);
+    if (rc != TSDB_ERR_MOVED || tsdbc_last_error(c, &e) != TSDB_ERR_MOVED || e.nmoved != 1 || e.moved[0].vol != vol ||
+        e.moved[0].node_id != node || strcmp(e.moved[0].addr, want) != 0)
+        die("%s: %s, %u MOVED (volume %u node %u at %s), want MOVED of volume %u to node %u at %s", what, ers(rc),
+            rc == TSDB_ERR_MOVED ? e.nmoved : 0, rc == TSDB_ERR_MOVED && e.nmoved ? e.moved[0].vol : 0,
+            rc == TSDB_ERR_MOVED && e.nmoved ? (unsigned)e.moved[0].node_id : 0,
+            rc == TSDB_ERR_MOVED && e.nmoved ? e.moved[0].addr : "-", (unsigned)vol, (unsigned)node, want);
+}
+
+static tsdbc *login_retry(int i, const char *user, const char *pw, int budget_ms)
+{
+    tsdbc *c = login_on(i, user, pw);
+    if (tsdbc_set_retry(c, budget_ms) != 0)
+        die("tsdbc_set_retry");
+    return c;
+}
+
+/* route (S2-1, s2e: the entry node's decision). Three servers with login on; east on all three, south and north on one
+ * each, lone on all three but shown with no leader in every copy (TSDB_CLUSTER_TEST copy_noleader). On a server that
+ * does not lead east, writes and reads by id, by path and in packed frames are MOVED to east's leader (never answered
+ * there: a replica serves no read), and the C client follows MOVED to the leader within its budget; lone answers
+ * UNAVAILABLE (NO_OWNER) off its real leader; a user with a prefix grant writes through a server that holds no copy of
+ * south and is moved, not DENIED, and an id outside the grant is still DENIED at the owner; a frame naming volumes
+ * led on two servers is INVALID and writes nothing. Mutants (TSDB_ROUTE_MUTANT): rightsbeforeroute, movedoffcopy,
+ * replicaread, spanaccepted. */
+static void scen_route(void)
+{
+    scenario("route");
+    const char *mut = getenv("TSDB_ROUTE_MUTANT");
+    static char menv[128];
+    snprintf(menv, sizeof menv, "TSDB_ROUTE_MUTANT=%s", mut ? mut : "");
+    for (int i = 0; i < 3; i++) {
+        auth_on[i] = 1;
+        envs[i] = "copy_noleader=2";
+        if (mut)
+            penv[i] = menv;
+        start(i);
+    }
+    char pw[PATH_MAX + 80], pw2[PATH_MAX + 80], args[PATH_MAX * 2 + 512], out[8192], p0[META_ADDR_MAX];
+    put_file("pw", "root-pw", pw, sizeof pw);
+    put_file("pw2", "alice-pw", pw2, sizeof pw2);
+    peer_of(0, p0, sizeof p0);
+    snprintf(args, sizeof args,
+             "cluster init %s --secret-file %s --node-timeout-ms 1500 --heartbeat-ms 200 --voter-replace-s 600 "
+             "--superuser root --password-file %s",
+             p0, secret_path, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("cluster init --superuser root: %s", out);
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    snprintf(args, sizeof args, "cluster user add %s alice --password-file %s --secret-file %s", p0, pw2,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("user add alice: %s", out);
+    for (int i = 0; i < 3; i++) {
+        await_view(i, p_users_caught_up, NULL, "users caught up");
+        await_login(i, "root", "root-pw");
+    }
+    static const char *const names[4] = {"east", "lone", "south", "north"};
+    static const uint32_t reps[4] = {3, 3, 1, 1};
+    uint32_t num[4];
+    struct meta_volume v[4];
+    int rc;
+    for (int n = 0; n < 4; n++)
+        if ((rc = vol_add(0, names[n], reps[n], &num[n])) != 0)
+            die("volume add %s: %s", names[n], cluster_strerror(rc));
+    if (num[1] != 2)
+        die("lone is volume %u, not 2 (copy_noleader names 2)", (unsigned)num[1]);
+    for (int n = 0; n < 4; n++) {
+        if (!vol_rec(0, names[n], &v[n]))
+            die("no record of %s", names[n]);
+        for (uint32_t k = 0; k < v[n].nrep; k++)
+            await_open_gen(0, names[n], server_of(v[n].rep[k].node), 1, 0);
+    }
+    await_isr(0, "east", 3, 20000, "east with every replica up");
+    int L = server_of(v[0].leader), R = (L + 1) % 3, LL = server_of(v[1].leader);
+    {
+        tsdbc *r0 = login_on(0, "root", "root-pw");
+        if ((rc = tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ | TSDB_RIGHT_INSERT)) != 0)
+            die("grant: %s", ers(rc));
+        tsdbc_close(r0);
+    }
+
+    /* east's leader serves; a replica of it moves writes, reads, paths and packed frames to the leader */
+    tsdbc *c = login_retry(L, "root", "root-pw", 0);
+    tsdb_sid id = rep_series(c, "plant.a", "east", 30000), other = rep_series(c, "other.a", "east", 30000);
+    int64_t ts[2] = {1000, 2000};
+    float val[2] = {1, 2};
+    if ((rc = tsdbc_insert_series(c, id, ts, val, 1)) != 0)
+        die("a write on east's leader: %s", ers(rc));
+    tsdbc_close(c);
+    c = login_retry(R, "root", "root-pw", 0);
+    tsdb_sid x;
+    expect_moved(c, tsdbc_insert_series(c, id, ts + 1, val + 1, 1), num[0], v[0].leader, L, "a write on a replica");
+    nrows = 0;
+    expect_moved(c, tsdbc_query_raw(c, id, 0, INT64_MAX / 2, count_rows, NULL), num[0], v[0].leader, L,
+                 "a read on a replica");
+    if (nrows != 0)
+        die("a replica answered %d rows of a read before MOVED", nrows);
+    expect_moved(c, tsdbc_series_at(c, "plant.b", "east", &x), num[0], v[0].leader, L, "a series by path on a replica");
+    tsdb_sid two[2] = {id, id};
+    expect_moved(c, tsdbc_insert(c, two, ts, val, 2), num[0], v[0].leader, L, "a packed write on a replica");
+    tsdbc_close(c);
+    c = login_retry(R, "root", "root-pw", 20000);
+    if ((rc = tsdbc_insert_series(c, id, ts + 1, val + 1, 1)) != 0)
+        die("the client did not follow MOVED to east's leader: %s", ers(rc));
+    status_id(c, v[0].leader, "STATUS after a write was moved");
+    tsdbc_close(c);
+    c = login_retry(R, "root", "root-pw", 20000);
+    if (rows_of(c, id) != 2)
+        die("the read through a replica, moved to the leader, has %d rows, not 2", nrows);
+    status_id(c, v[0].leader, "STATUS after a read was moved");
+    tsdbc_close(c);
+    printf("  a replica moves writes, reads, paths and packed frames to the leader; the client follows MOVED\n");
+
+    /* lone: no leader in the copy; its real leader serves it (led here), every other server answers NO_OWNER */
+    int nl = LL == 0 ? 1 : 0;
+    c = login_retry(nl, "root", "root-pw", 0);
+    expect_unavail(c, tsdbc_series_at(c, "plant.c", "lone", &x), (uint16_t)num[1], TSDB_WHY_NO_OWNER,
+                   "a volume with no leader in the copy");
+    tsdbc_close(c);
+    printf("  a volume with no leader in the copy: UNAVAILABLE (NO_OWNER)\n");
+
+    /* south, on one server: a user with a prefix grant writes by id through a server without a copy of it and
+     * is moved, never DENIED there (the id is not resolved through that server's names); outside the grant: DENIED at
+     * the owner */
+    int so = server_of(v[2].leader), to = (so + 1) % 3, no = server_of(v[3].leader);
+    c = login_retry(so, "root", "root-pw", 0);
+    tsdb_sid sid = rep_series(c, "plant.s", "south", 30000), sother = rep_series(c, "other.s", "south", 30000);
+    tsdbc_close(c);
+    tsdbc *a = login_retry(to, "alice", "alice-pw", 0);
+    expect_moved(a, tsdbc_insert_series(a, sid, ts, val, 1), num[2], v[2].leader, so, "alice's write off the owner");
+    tsdbc_close(a);
+    a = login_retry(to, "alice", "alice-pw", 20000);
+    if ((rc = tsdbc_insert_series(a, sid, ts, val, 1)) != 0)
+        die("alice's write through server %d, moved to south's owner: %s", to, ers(rc));
+    tsdbc_close(a);
+    a = login_retry(to, "alice", "alice-pw", 20000);
+    if ((rc = tsdbc_insert_series(a, sother, ts, val, 1)) != TSDB_ERR_DENIED)
+        die("alice's write outside her grant, moved to the owner: %s, not DENIED", ers(rc));
+    tsdbc_close(a);
+    a = login_retry(R, "alice", "alice-pw", 20000);
+    if ((rc = tsdbc_insert_series(a, other, ts, val, 1)) != TSDB_ERR_DENIED)
+        die("alice's write to east outside her grant through a replica: %s, not DENIED", ers(rc));
+    tsdbc_close(a);
+    printf("  a user is moved before her rights are checked, and DENIED at the owner outside her grant\n");
+
+    /* a frame naming volumes led on two servers: INVALID, nothing written */
+    int sa = -1, sb = -1;
+    tsdb_sid ia = 0, ib = 0;
+    if (so != L)
+        sa = L, sb = so, ia = id, ib = sid;
+    else if (no != L) {
+        c = login_retry(no, "root", "root-pw", 0);
+        ib = rep_series(c, "plant.n", "north", 30000);
+        tsdbc_close(c);
+        sa = L, sb = no, ia = id;
+    }
+    if (sa < 0) {
+        printf("  (east, south and north are led on one server: no spanning check)\n");
+    } else {
+        tsdb_sid span[2] = {ia, ib};
+        int64_t sts[2] = {9000, 9000};
+        for (int via = 0; via < 3; via++) {
+            c = login_retry(via, "root", "root-pw", 0);
+            if ((rc = tsdbc_insert(c, span, sts, val, 2)) != TSDB_ERR_INVALID)
+                die("a frame naming volumes led on servers %d and %d, through server %d: %s, not INVALID", sa, sb, via,
+                    ers(rc));
+            tsdbc_close(c);
+        }
+        for (int k = 0; k < 2; k++) {
+            c = login_retry(k ? sb : sa, "root", "root-pw", 0);
+            nrows = 0;
+            if ((rc = tsdbc_query_raw(c, span[k], 9000, 9001, count_rows, NULL)) != 0 || nrows != 0)
+                die("the refused spanning frame left %d rows on server %d (%s)", nrows, k ? sb : sa, ers(rc));
+            tsdbc_close(c);
+        }
+        printf("  a frame naming volumes led on two servers: INVALID on every server, nothing written\n");
+    }
+    stop_all();
+}
+
 /* ccstress: the copy's get/put/swap in-process (cluster_copy_stress, no server): 32 readers loop get/put while 5,000
  * snapshots are swapped in. The writer must get through (one counter for every reader starved it for good: mutant
  * cconeslot), and no reader may see its snapshot change or freed (ccnowait; ASan names the use after free). */
@@ -7072,7 +7263,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
