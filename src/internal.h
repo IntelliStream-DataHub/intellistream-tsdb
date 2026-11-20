@@ -1554,6 +1554,7 @@ void eng_leader_depose(struct eng *db);
 void eng_leader_replay_floor(struct eng *db, uint64_t floor);
 /* test hook (tests/test_replica.c): called by a switch right after it released flush_lock */
 extern void (*cls_test_after_switch)(struct eng *db);
+int cls_test_apply(struct eng *db, uint32_t s, int64_t from, int c);
 /* test hook: called by a leader's flush after cls_classify_active, before the seal (src/memtable.c) */
 extern void (*mt_test_before_seal)(struct eng *db);
 /* The driver's keep bound (design-cluster.md 8.3), inclusive: the highest position every replica has (one below the

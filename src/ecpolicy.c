@@ -7,6 +7,10 @@
  *    grace_s old by eng_now_ms and no merge of it is selectable: the parts of a day at rest are merged into as few
  *    as the merge policy makes (an idle partition is merged whole, merge_idle_s), so the settle encodes final parts
  *    and never an input that a merge would rewrite a minute later (merges skip settled parts: src/ecskip.h).
+ *    "Selectable" is what the merge threads will do: with merge_threads = 0 nothing is (D11: no merges never stops
+ *    settling), and with merge_idle_s < 0 only a merge in flight is (no part is rewritten alone and no pair merged
+ *    as idle; a pair that the size and age rule takes some day is not waited for: the key may settle as two objects
+ *    where a merge would have made one).
  *  - Classes 1-3 (7, 28 or 364 base partitions): such a key takes rows for weeks, so it settles part by part, each
  *    once its newest row is grace_s old, and at most once per coarse_s, counted from the settle time in the newest
  *    .ec record of the key (the record is on disk: the pace survives a restart; never an mtime).
@@ -91,10 +95,15 @@ static bool mergeable(const part *p)
  * flight, a part it rewrites alone, or two neighbours it may merge) */
 static bool merge_selectable(const eng *db, size_t a, size_t b)
 {
+    if (db->opt.merge_threads <= 0) /* no merge thread: nothing will be merged, and a merge in flight is a call's */
+        return false;
+    bool idle = db->opt.merge_idle_s >= 0; /* else select_merge_locked never rewrites alone nor merges as idle */
     for (size_t i = a; i < b; i++) {
         const part *p = db->parts[i];
         if (p->merging)
             return true;
+        if (!idle)
+            continue;
         bool alone = (p->level == 0 && p->ng > 0) || p->hdr_len != sizeof(part_header);
         if (alone && !part_no_rewrite(p) && !atomic_load(&p->damaged))
             return true;
@@ -159,11 +168,6 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
                     sel[n++] = db->parts[i];
         } else {
             if (newest_settle != INT64_MIN && now - newest_settle < coarse)
-                continue;
-            bool due = false;
-            for (size_t i = lo_i; i < hi_i; i++)
-                due |= settleable(db->parts[i]) && db->parts[i]->max_ts <= now - grace;
-            if (!due)
                 continue;
             for (size_t i = lo_i; i < hi_i && n < cap; i++) {
                 part *p = db->parts[i];

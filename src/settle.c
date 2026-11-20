@@ -433,6 +433,9 @@ static int sfill_prepare(sfill *f)
     if (!(f->asmb = calloc(1, (size_t)maxlen + BLK_SLACK)))
         return TSDB_ERR_NOMEM;
     xxs_init(&f->h);
+    void (*hook)(eng *, const part *, uint64_t) = atomic_load(&settle_fill_hook);
+    if (hook)
+        hook(db, p, SETTLE_HOOK_PREPARED);
     return 0;
 }
 

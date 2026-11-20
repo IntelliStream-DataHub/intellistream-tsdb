@@ -277,7 +277,8 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     bool early = ecswap_mutant == SWAP_MUT_EARLY;
     if (rc == 0 && !early && (rc = intent_write(db, intent, in, ec, n)) != 0) {
         pthread_mutex_unlock(&db->publish_lock);
-        swap_discard(db, NULL, ec, n);
+        if (rc != TSDB_ERR_NOMEM) /* NOMEM: nothing written, the caller cleans up (ecswap.h), never both */
+            swap_discard(db, NULL, ec, n);
         free(at);
         return rc;
     }

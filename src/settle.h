@@ -69,6 +69,9 @@ extern atomic_int settle_poll_ms;
 /* Runs in a settle's fill, for every stripe: after the stripe's bytes were copied out of the map and before they are
  * checked (with the settletwopass mutant: between the check, which reads the map, and the copy). */
 extern void (*_Atomic settle_fill_hook)(eng *db, const part *p, uint64_t stripe);
+/* The hook's stripe once more, before the first stripe: the early copy of the header, index and footer is taken and
+ * checked, nothing of the object is copied yet. */
+#define SETTLE_HOOK_PREPARED UINT64_MAX
 /* Counters for tests: settles that swapped, failed (CORRUPT and the others but STOPPED), abandoned (STOPPED), and the
  * settle thread's rounds. */
 extern atomic_uint_fast64_t settle_done, settle_failed, settle_abandoned, settle_rounds;
@@ -83,4 +86,7 @@ enum { SETTLE_MUT_NONE = 0, SETTLE_MUT_RANKDOWN, SETTLE_MUT_NOCHECK, SETTLE_MUT_
        SETTLE_MUT_COARSEWHOLE };
 extern int settle_mutant;
 int settle_mutant_parse(const char *name); /* -1 when unknown */
+/* For tests: the streaming xxh64 the fill hashes the object with, fed lens[0..n) bytes of buf in turn (it must equal
+ * xxh64(buf, sum of lens, 0) however the bytes are split) */
+uint64_t settle_xxh64_pieces(const uint8_t *buf, const size_t *lens, size_t n);
 #endif

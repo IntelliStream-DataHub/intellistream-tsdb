@@ -22,6 +22,7 @@
  * (flip), settlebusy (policy), coarsewhole (coarse). Usage: test_settle [--quick] [--mutant NAME] [SCRATCH]
  */
 #include "internal.h"
+#include "chunk.h"
 #include "ecpart.h"
 #include "ecskip.h"
 #include "settle.h"
@@ -113,6 +114,7 @@ static void tier_env(const where *w, int grace_s, int coarse_s, int eager)
 typedef struct {
     int merge_threads, classes;
     size_t wal_max_batch_rows;
+    int idle; /* merge_idle_s; 0: 1 */
 } eopts;
 
 typedef struct {
@@ -127,7 +129,7 @@ static void opts_of(const eopts *e, tsdb_options *o)
     o->partition_classes = e->classes;
     o->create_volumes = 0;
     o->clock_ms = clock_fn;
-    o->merge_idle_s = 1;
+    o->merge_idle_s = e->idle ? e->idle : 1;
     if (e->wal_max_batch_rows)
         o->wal_max_batch_rows = e->wal_max_batch_rows;
 }
@@ -359,9 +361,30 @@ static void basic_case(void)
         CHECK(eng_settle(d.db, 0, &a, 1, NULL) == TSDB_ERR_NOTFOUND);
         a->hdr_len = hl;
         /* the newer part first: as an .ec part it must still rank above A */
+        uint64_t bh = xxh64(b->map, b->map_len, 0), bl = b->map_len, bmin = b->min_block, bmax = b->max_block;
+        int64_t t0 = eng_now_ms(d.db);
         size_t got = 0;
         CHECK(eng_settle(d.db, 0, &b, 1, &got) == 0 && got == 1);
+        int64_t t1 = eng_now_ms(d.db);
         CHECK(same(digest(d.db, "s"), want));
+        /* its record: what the coarse pace counts from, D4's epoch, and the object's length and hash */
+        part *q[8];
+        size_t nq = key_parts(d.db, 0, q, 8), found = 0;
+        for (size_t i = 0; i < nq; i++) {
+            struct ecpart *ep = atomic_load(&q[i]->ec);
+            if (!ep || q[i]->max_block != bmax)
+                continue;
+            found++;
+            const ec_record *r = &ep->rec;
+            CHECK(r->settle_ms >= t0 && r->settle_ms <= t1);
+            CHECK(r->writer_epoch == 1);
+            CHECK(r->key == 0 && r->min_block == bmin && r->max_block == bmax);
+            CHECK(r->object_len == bl);
+            CHECK(r->object_xxh64 == bh);
+            CHECK(r->class_check == EC_CLS_PASSED);
+        }
+        CHECK(found == 1);
+        unref_all(q, nq);
         CHECK(eng_settle(d.db, 0, &a, 1, &got) == 0 && got == 1);
         CHECK(same(digest(d.db, "s"), want));
         unref_all(p, n);
@@ -511,6 +534,227 @@ static void flip_case(void)
 
 /* ------------------------------------------------------------ stores DOWN */
 
+/* ------------------------------------------------------------ each check before the encode, on its own */
+
+static _Atomic(const char *) plant_dir;
+static _Atomic uint64_t plant_off, plant_stripe;
+static atomic_int plant_done;
+static char plant_name[96];
+
+/* flips the byte at plant_off of plant_name once, at the hook's stripe plant_stripe */
+static void plant_hook(eng *db, const part *p, uint64_t stripe)
+{
+    (void)db;
+    if (stripe == atomic_load(&plant_stripe) && !strcmp(p->name, plant_name) && atomic_exchange(&plant_done, 1) == 0)
+        flip(atomic_load(&plant_dir), plant_name, atomic_load(&plant_off));
+}
+
+static void plant(const where *w, const part *p, uint64_t stripe, uint64_t off)
+{
+    snprintf(plant_name, sizeof plant_name, "%s", p->name);
+    atomic_store(&plant_dir, w->db);
+    atomic_store(&plant_off, off);
+    atomic_store(&plant_stripe, stripe);
+    atomic_store(&plant_done, 0);
+    atomic_store(&settle_fill_hook, plant_hook);
+}
+
+/* eng_settle of key's one part: rc, and on a failure the key holds no .ec part and no chunk was named: each check
+ * fails the fill, before the encode finishes (ec_index_write's own hash check comes after the chunks were put, so a
+ * check that lets the damage through to it is caught here) */
+static void settle_expect(const where *w, eng *db, int64_t key, int want, const char *what)
+{
+    part *p[4];
+    size_t n = key_parts(db, key, p, 4);
+    CHECK(n == 1);
+    size_t c0 = chunks(w);
+    int rc = n == 1 ? eng_settle(db, key, p, 1, NULL) : -999;
+    atomic_store(&settle_fill_hook, NULL);
+    if (rc != want) {
+        fprintf(stderr, "FAIL %s: eng_settle %d, not %d\n", what, rc, want);
+        failures++;
+    }
+    unref_all(p, n);
+    if (want != 0) {
+        size_t all, ec, c1 = chunks(w);
+        key_count(db, key, &all, &ec);
+        CHECK(ec == 0);
+        if (c1 != c0) {
+            fprintf(stderr, "FAIL %s: %zu chunks named before the settle failed (not in the fill)\n", what, c1 - c0);
+            failures++;
+        }
+    }
+}
+
+/* the fill's streaming xxh64 against xxh64 over every length up to 300 (each tail of 8, 4 and single bytes) and
+ * random splits, pieces of 0 bytes included: the .ec record keeps it as the object's hash */
+static void hash_case(void)
+{
+    enum { N = 300 };
+    uint8_t buf[N];
+    uint64_t r = 0x9e3779b97f4a7c15ull;
+    for (int i = 0; i < N; i++) {
+        r = r * 6364136223846793005ull + 1442695040888963407ull;
+        buf[i] = (uint8_t)(r >> 56);
+    }
+    size_t bad = 0;
+    for (size_t len = 0; len <= N; len++) {
+        size_t one = len;
+        if (settle_xxh64_pieces(buf, &one, 1) != xxh64(buf, len, 0))
+            bad++;
+        for (int t = 0; t < 20; t++) {
+            size_t lens[16], n = 0, left = len;
+            while (left && n < 15) {
+                r = r * 6364136223846793005ull + 1442695040888963407ull;
+                size_t k = (size_t)(r >> 33) % (left + 1) / (t & 1 ? 1 : 4);
+                lens[n++] = k;
+                left -= k;
+            }
+            lens[n++] = left;
+            if (settle_xxh64_pieces(buf, lens, n) != xxh64(buf, len, 0))
+                bad++;
+        }
+    }
+    if (bad) {
+        fprintf(stderr, "FAIL the streaming xxh64 differs from xxh64 in %zu of %d cases\n", bad, 21 * (N + 1));
+        failures++;
+    }
+    printf("  hash: the streaming xxh64 equals xxh64 at every length up to %d and any split\n", N);
+}
+
+static void checks_case(void)
+{
+    where w;
+    fresh("checks", &w);
+    tier_env(&w, 3600, 86400, 0);
+    atomic_store(&NOW, 1000); /* nothing due: only the calls below settle */
+    eopts e = {.merge_threads = 0, .classes = 0};
+    tdb d;
+    CHECK(t_open(&w, &e, &d) == 0);
+    if (!d.db)
+        return;
+    eng *db = d.db;
+    enum { KEYS = 7 };
+    uint32_t s;
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    for (int k = 0; k < KEYS; k++)
+        write_rows(db, s, k * DAY, 200000, 200, NOISY); /* about 750 KB a key: several stripes */
+    CHECK(eng_flush(db) == 0);
+    CHECK(eng_optimize(db) == 0);
+    part *p[KEYS][4];
+    for (int k = 0; k < KEYS; k++) {
+        size_t n = key_parts(db, k, p[k], 4);
+        CHECK(n == 1);
+        if (n != 1) {
+            t_close(&d);
+            return;
+        }
+        chunk_geom g;
+        CHECK(chunk_geom_derive(&g, 2, 1, p[k][0]->map_len) == 0 && g.k == 2);
+        CHECK(p[k][0]->map_len > (uint64_t)g.k * g.cell); /* more than one stripe */
+    }
+    const uint64_t foot_rows = offsetof(part_footer, rows) + 7;
+    /* 0: a footer byte flipped before the settle: the hash the open checked fails (indexhash) */
+    part *x = p[0][0];
+    flip(w.db, x->name, x->map_len - sizeof(part_footer) + foot_rows);
+    settle_expect(&w, db, 0, TSDB_ERR_CORRUPT, "a footer byte flipped");
+    /* 1: the same, with the file's footer hash made to match: only the open's hash tells (openhash) */
+    x = p[1][0];
+    uint64_t fo = x->map_len - sizeof(part_footer);
+    flip(w.db, x->name, fo + foot_rows);
+    const uint8_t *m = x->map;
+    uint64_t h = xxh64(m, x->hdr_len, 0);
+    h = xxh64(m + x->index_off, x->index_len, h);
+    if (fo > x->index_off + x->index_len)
+        h = xxh64(m + x->index_off + x->index_len, fo - x->index_off - x->index_len, h);
+    h = xxh64(m + fo, offsetof(part_footer, index_hash), h);
+    char path[PATH_MAX + 128];
+    snprintf(path, sizeof path, "%s/%s", w.db, x->name);
+    int fd = open(path, O_RDWR);
+    CHECK(fd >= 0 && pwrite(fd, &h, sizeof h, (off_t)(fo + offsetof(part_footer, index_hash))) == sizeof h);
+    if (fd >= 0)
+        close(fd);
+    settle_expect(&w, db, 1, TSDB_ERR_CORRUPT, "a footer byte flipped and its hash rewritten");
+    /* 2: a header byte flipped after the early copy, before the first stripe (hdrcmp) */
+    plant(&w, p[2][0], SETTLE_HOOK_PREPARED, offsetof(part_header, wal_seq) + 7);
+    settle_expect(&w, db, 2, TSDB_ERR_CORRUPT, "the header changed after its check");
+    /* 3: a footer byte flipped after the first stripe was copied: the last stripe's copy differs (tailcmp) */
+    x = p[3][0];
+    plant(&w, x, 0, x->map_len - sizeof(part_footer) + foot_rows);
+    settle_expect(&w, db, 3, TSDB_ERR_CORRUPT, "the footer changed after its check");
+    /* 4: a byte flipped in the second stripe's share of the granule that straddles the first stripe edge (straddle) */
+    x = p[4][0];
+    chunk_geom g;
+    CHECK(chunk_geom_derive(&g, 2, 1, x->map_len) == 0);
+    uint64_t edge = (uint64_t)g.k * g.cell, at = 0;
+    for (uint32_t i = 0; i < x->ng && !at; i++) {
+        granule gr;
+        gx_load(x, i, GW_LOC | GW_TIME, &gr);
+        if (gr.off < edge && gr.off + gr.ts_len + gr.val_len > edge + 1)
+            at = gr.off + gr.ts_len + gr.val_len - 1;
+    }
+    CHECK(at > edge);
+    if (at)
+        flip(w.db, x->name, at);
+    settle_expect(&w, db, 4, TSDB_ERR_CORRUPT, "a straddling granule's second half flipped");
+    /* 5: a part in a merge is refused before anything is encoded (nomerging: the swap's own check catches it after
+     * a whole encode and put, STOPPED) */
+    size_t c0 = chunks(&w);
+    pthread_mutex_lock(&db->lock);
+    p[5][0]->merging = true;
+    pthread_mutex_unlock(&db->lock);
+    settle_expect(&w, db, 5, TSDB_ERR_NOTFOUND, "a part in a merge");
+    pthread_mutex_lock(&db->lock);
+    p[5][0]->merging = false;
+    pthread_mutex_unlock(&db->lock);
+    CHECK(chunks(&w) == c0);
+    /* 6 and 5: the same parts untouched settle */
+    settle_expect(&w, db, 5, 0, "an untouched part");
+    settle_expect(&w, db, 6, 0, "an untouched part");
+    for (int k = 0; k < KEYS; k++)
+        unref_all(p[k], 1);
+    CHECK(count_names(w.db, "", ".ec") == 2);
+    t_close(&d);
+    printf("  checks: each check before the encode on its own (the open's hash, the footer's, the header and tail "
+           "copies, a straddling granule) aborts; a merging part is refused before the encode\n");
+}
+
+/* ------------------------------------------------------------ a class contradiction */
+
+static void class_case(void)
+{
+    where w;
+    fresh("class", &w);
+    tier_env(&w, 3600, 86400, 0);
+    atomic_store(&NOW, 1000);
+    eopts e = {.merge_threads = 0, .classes = 1};
+    tdb d;
+    CHECK(t_open(&w, &e, &d) == 0);
+    if (!d.db)
+        return;
+    eng *db = d.db;
+    uint32_t a, b;
+    CHECK(eng_series(db, "a", TSDB_FLOAT32, &a) == 0 && eng_series(db, "b", TSDB_FLOAT32, &b) == 0);
+    int64_t t0 = 0, t1 = 0; /* class 0 from 0 (a fresh series this slow would be classed coarser) */
+    CHECK(eng_class_switch(db, a, 0, &t0) == 0 && eng_class_switch(db, b, 0, &t1) == 0 && t0 == 0 && t1 == 0);
+    write_rows(db, a, 0, 20000, 2000, 0);
+    write_rows(db, b, 2 * DAY, 20000, 2000, 0);
+    CHECK(eng_flush(db) == 0);
+    int64_t ka = partition_of(db, a, 0), kb = partition_of(db, b, 2 * DAY);
+    CHECK(partition_class(db, ka) == 0 && partition_class(db, kb) == 0);
+    /* a's rows all lie in class 1 by the history: the granules' bounds say so (noclass) */
+    CHECK(cls_test_apply(db, a, 0, 1) == 0);
+    settle_expect(&w, db, ka, TSDB_ERR_CORRUPT, "a series in another class");
+    /* b is class 1 for 10 s inside its first granule, class 0 at both ends: only its decoded rows say so
+     * (judgerows) */
+    CHECK(cls_test_apply(db, b, 2 * DAY + 10000, 1) == 0 && cls_test_apply(db, b, 2 * DAY + 20000, 0) == 0);
+    settle_expect(&w, db, kb, TSDB_ERR_CORRUPT, "rows of another class inside a granule");
+    CHECK(count_names(w.db, "", ".ec") == 0);
+    CHECK(chunks(&w) == 0);
+    t_close(&d);
+    printf("  class: a part that CLASSES contradicts (whole granules, rows inside one) aborts with no .ec\n");
+}
+
 static void down_case(void)
 {
     where w;
@@ -581,10 +825,70 @@ static void policy_case(void)
     CHECK(same(digest(d.db, "s"), want));
     t_close(&d);
 
-    /* no merges: two level-0 parts keep a merge selectable, so the key never settles (settlebusy does) */
+    /* D11: no merge thread, nothing selectable: a day key settles after grace_s all the same; never while the day
+     * still takes rows (NOW past its start + grace_s), never with a damaged part in the key */
+    fresh("nomerge", &w);
+    tier_env(&w, 3600, 86400, 0);
+    atomic_store(&NOW, 1000);
+    e.merge_threads = 0;
+    CHECK(t_open(&w, &e, &d) == 0);
+    if (!d.db)
+        return;
+    CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &s) == 0);
+    for (int k = 0; k < 2; k++) {
+        write_rows(d.db, s, k * DAY, 5000, 2000, 0);
+        CHECK(eng_flush(d.db) == 0);
+        write_rows(d.db, s, k * DAY + 1000, 5000, 2000, 1);
+        CHECK(eng_flush(d.db) == 0);
+    }
+    part *p[4];
+    size_t n = key_parts(d.db, 1, p, 4);
+    CHECK(n == 2);
+    if (n)
+        atomic_store(&p[0]->damaged, true);
+    unref_all(p, n);
+    atomic_store(&NOW, 3 * HOUR);
+    wait_rounds(5);
+    key_count(d.db, 0, &all, &ec);
+    CHECK(all == 2 && ec == 0);
+    atomic_store(&NOW, 2 * DAY + HOUR + 1);
+    CHECK(wait_settled(d.db, 0, 20000));
+    key_count(d.db, 0, &all, &ec);
+    CHECK(all == 2 && ec == 2);
+    wait_rounds(5);
+    key_count(d.db, 1, &all, &ec);
+    CHECK(all == 2 && ec == 0);
+    t_close(&d);
+
+    /* a merge thread whose idle round is far off: two level-0 parts are still to be rewritten, so the key waits
+     * (settlebusy settles it) */
     fresh("busy", &w);
     tier_env(&w, 3600, 86400, 0);
-    e.merge_threads = 0;
+    atomic_store(&NOW, 1000);
+    e.merge_threads = 1;
+    e.idle = 1000000;
+    CHECK(t_open(&w, &e, &d) == 0);
+    if (!d.db)
+        return;
+    CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &s) == 0);
+    write_rows(d.db, s, 0, 5000, 2000, 0);
+    write_rows(d.db, s, DAY, 5000, 2000, 0); /* key 1: one level-0 part, which an idle round rewrites alone */
+    CHECK(eng_flush(d.db) == 0);
+    write_rows(d.db, s, 1000, 5000, 2000, 1);
+    CHECK(eng_flush(d.db) == 0);
+    atomic_store(&NOW, 30 * DAY);
+    wait_rounds(10);
+    key_count(d.db, 0, &all, &ec);
+    CHECK(all == 2 && ec == 0);
+    key_count(d.db, 1, &all, &ec);
+    CHECK(all == 1 && ec == 0);
+    t_close(&d);
+
+    /* merge_idle_s = -1: no part is rewritten alone and nothing merged as idle, so nothing is waited for */
+    fresh("noidle", &w);
+    tier_env(&w, 3600, 86400, 0);
+    atomic_store(&NOW, 1000);
+    e.idle = -1;
     CHECK(t_open(&w, &e, &d) == 0);
     if (!d.db)
         return;
@@ -594,18 +898,17 @@ static void policy_case(void)
     write_rows(d.db, s, 1000, 5000, 2000, 1);
     CHECK(eng_flush(d.db) == 0);
     atomic_store(&NOW, 30 * DAY);
-    wait_rounds(10);
-    key_count(d.db, 0, &all, &ec);
-    CHECK(all == 2 && ec == 0);
+    CHECK(wait_settled(d.db, 0, 20000));
     t_close(&d);
-    printf("  policy: a day key settles after grace_s and its merges, not before, never with a merge selectable\n");
+    printf("  policy: a day key settles after grace_s and its merges, not before, never with a merge selectable or a "
+           "damaged part; without merges (threads 0, idle off) it settles\n");
 }
 
 static void coarse_case(void)
 {
     where w;
     fresh("coarse", &w);
-    tier_env(&w, 3600, 7 * 86400, 0);
+    tier_env(&w, 4 * 86400, 7 * 86400, 0); /* grace 4 days: the first settle comes after coarse_s from 0 */
     atomic_store(&NOW, 1000);
     eopts e = {.merge_threads = 0, .classes = 1};
     tdb d;
@@ -618,7 +921,7 @@ static void coarse_case(void)
     CHECK(eng_class_switch(d.db, s, 1, &t0) == 0);
     write_rows(d.db, s, 0, 2000, 10000, 0); /* day 0: part 1 */
     CHECK(eng_flush(d.db) == 0);
-    write_rows(d.db, s, 3 * DAY, 2000, 10000, 1); /* day 3, the same week: part 2 */
+    write_rows(d.db, s, 5 * DAY, 2000, 10000, 1); /* day 5, the same week: part 2 */
     CHECK(eng_flush(d.db) == 0);
     acc want = digest(d.db, "s");
     part *p[4];
@@ -629,7 +932,7 @@ static void coarse_case(void)
         t_close(&d);
         return;
     }
-    atomic_store(&NOW, DAY + HOUR); /* part 1 is due, part 2 is not */
+    atomic_store(&NOW, 8 * DAY); /* part 1 is due, part 2 is not */
     for (int i = 0; i < 2000; i++) {
         size_t all, ec;
         key_count(d.db, 1, &all, &ec);
@@ -642,7 +945,7 @@ static void coarse_case(void)
     key_count(d.db, 1, &all, &ec);
     CHECK(all == 2 && ec == 1); /* coarsewhole settles both */
     CHECK(same(digest(d.db, "s"), want));
-    atomic_store(&NOW, 5 * DAY); /* part 2 due now, but the last settle is less than coarse_s old */
+    atomic_store(&NOW, 11 * DAY); /* part 2 due now, but the last settle (at 8 days) is less than coarse_s old */
     wait_rounds(5);
     key_count(d.db, 1, &all, &ec);
     CHECK(ec == 1);
@@ -653,7 +956,7 @@ static void coarse_case(void)
     wait_rounds(5);
     key_count(d.db, 1, &all, &ec);
     CHECK(all == 2 && ec == 1);
-    atomic_store(&NOW, DAY + HOUR + 7 * DAY + 1000);
+    atomic_store(&NOW, 15 * DAY + 1000);
     CHECK(wait_settled(d.db, 1, 20000));
     CHECK(same(digest(d.db, "s"), want));
     t_close(&d);
@@ -736,6 +1039,11 @@ static void eager_case(void)
         sleep_ms(10);
     CHECK(count_names(w.db, "", ".ec") == KEYS);
     CHECK(same(digest(d.db, "s"), want));
+    write_rows(d.db, s, 100 * DAY + 60000, 500, 2, 0); /* its newest row less than grace_s old */
+    CHECK(eng_flush(d.db) == 0);
+    CHECK(eng_optimize(d.db) == 0);
+    wait_rounds(5);
+    CHECK(count_names(w.db, "", ".ec") == KEYS);
     t_close(&d);
     printf("  eager: nothing before a merge round, then %d a minute\n", ECPOLICY_EAGER_PER_MIN);
 }
@@ -907,13 +1215,16 @@ static void threads_case(void)
 
 /* ------------------------------------------------------------ crash points and power loss */
 
+/* grace_s for the crash and power cases: the settle thread never picks (merges are off, so their two level-0 parts
+ * would be due at once, D11), only the settles the case makes run */
+enum { QUIET_GRACE = 315360000 };
 static where BASE;
 static acc BWANT;
 
 static void make_base(void)
 {
     fresh("base", &BASE);
-    tier_env(&BASE, 3600, 86400, 0);
+    tier_env(&BASE, QUIET_GRACE, 86400, 0);
     eopts e = {.merge_threads = 0, .classes = 0};
     tdb d;
     CHECK(t_open(&BASE, &e, &d) == 0);
@@ -945,7 +1256,7 @@ static int child_settle(const char *root)
     snprintf(w.db, sizeof w.db, "%s/db", root);
     for (int i = 0; i < 3; i++)
         snprintf(w.st[i], sizeof w.st[i], "%s/st%d", root, i);
-    tier_env(&w, 3600, 86400, 0);
+    tier_env(&w, QUIET_GRACE, 86400, 0);
     eopts e = {.merge_threads = 0, .classes = 0};
     tdb d;
     if (t_open(&w, &e, &d) != 0)
@@ -1005,7 +1316,7 @@ static int run_child(const where *w, const char *crash_at, int warmup, int seed)
 /* reopens w: the rows equal the base's, no temporary is left; 2: the key is all .ec, 1: all .part, -1 otherwise */
 static int reopen_check(const where *w, const char *what)
 {
-    tier_env(w, 3600, 86400, 0);
+    tier_env(w, QUIET_GRACE, 86400, 0);
     eopts e = {.merge_threads = 0, .classes = 0};
     tdb d;
     int rc = t_open(w, &e, &d);
@@ -1128,6 +1439,9 @@ int main(int argc, char **argv)
     basic_case();
     corrupt_case();
     flip_case();
+    hash_case();
+    checks_case();
+    class_case();
     down_case();
     policy_case();
     coarse_case();
