@@ -235,6 +235,7 @@ size_t dd_bound(size_t n);
 size_t gorilla_bound(size_t n);
 size_t dd_encode(const int64_t *in, size_t n, uint8_t *out);
 int dd_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+int dd_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out);
 size_t gorilla_encode(const uint32_t *in, size_t n, uint8_t *out);
 int gorilla_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
 size_t chimp_bound(size_t n);
@@ -256,8 +257,10 @@ int bytesplit_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
 size_t tsfor_bound(size_t n);
 size_t ts_grid_encode(const int64_t *ts, size_t n, uint8_t *out);
 int ts_grid_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+int ts_grid_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out);
 size_t ts_delta_encode(const int64_t *ts, size_t n, uint8_t *out);
 int ts_delta_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+int ts_delta_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out);
 size_t decimal_bp_bound(size_t n);
 size_t decimal_bp_encode(const float *in, size_t n, uint8_t *out);
 int decimal_bp_decode(const uint8_t *in, size_t len, size_t n, float *out);
@@ -283,6 +286,7 @@ size_t block_encode_ts(codec_ctx *c, int level, const int64_t *ts, size_t n, uin
 #define VALUES_FIXED_ONLY (-1)
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out);
 int block_decode_ts(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int64_t *out);
+int block_decode_ts_sorted(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int64_t *out);
 int block_decode_f32(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, float *out);
 /* any value type, in slots of type_width(type) (codec_typed.c) */
 size_t block_encode_vals(codec_ctx *c, int level, int value_codec, int type, const void *v, size_t n, uint8_t *out);
@@ -827,7 +831,7 @@ typedef struct part {
  * is a few dependent loads, shifts and masks; the statistics path over many small parts is bound by them). */
 enum {
     GW_TIME = 1,     /* ts_min, ts_max */
-    GW_LOC = 2,      /* off, ts_len, val_len, crc, nulls */
+    GW_LOC = 2,      /* off, ts_len, val_len, crc, nulls; and ts_min, ts_max, which granule_decode checks the rows by */
     GW_STAT = 4,     /* nulls, min, max, sum (isum_hi only with GW_INT) */
     GW_SPREAD = 8,   /* m2 or isq0 (isq1, isq2 only with GW_INT) */
     GW_TWEND = 16,   /* ts_min, ts_max, tw_first, tw_last, tw_flags */
@@ -858,7 +862,7 @@ static inline void gx_load(const part *p, uint32_t i, unsigned want, granule *g)
     const gix *x = &p->ix;
     g->count = (uint32_t)gix_get(x, i, GF_COUNT);
     uint64_t span = 0;
-    if (want & (GW_TIME | GW_TWEND | GW_TWSTEP | GW_TWLIN)) {
+    if (want & (GW_TIME | GW_LOC | GW_TWEND | GW_TWSTEP | GW_TWLIN)) {
         span = gix_get(x, i, GF_SPAN);
         g->ts_min = (int64_t)gix_get(x, i, GF_TSMIN);
         g->ts_max = (int64_t)((uint64_t)g->ts_min + span);
@@ -935,7 +939,10 @@ void part_unref(part *p);
 /* Decodes a granule: timestamps, and values (if v) as slots of `type`, into buffers of room for cap rows; checks
  * the granule's checksum first if verify. A count above cap or the part's granule size is TSDB_ERR_CORRUPT: without
  * pin_index the count is read in the mapping, where a write to the file can change it between the load that sized
- * the caller's buffers and the one in g, so cap is what the buffers hold, never a count loaded before. */
+ * the caller's buffers and the one in g, so cap is what the buffers hold, never a count loaded before. Without
+ * verify, timestamps that do not strictly increase within g's [ts_min, ts_max] are TSDB_ERR_CORRUPT too (damage the
+ * checksum would have caught): every reader may take the rows as sorted and inside the entry's ends. g holds at
+ * least GW_LOC, which loads those ends. */
 int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
                  bool verify);
 /* granule_read for a part whose granule bytes are in its mapping (a .part); an .ec part's go through ec_granule_read */

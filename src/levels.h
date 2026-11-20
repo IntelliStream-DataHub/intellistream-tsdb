@@ -43,6 +43,7 @@
     X(size_t, gorilla_bound, (size_t n), (n))                                                                 \
     X(size_t, dd_encode, (const int64_t *in, size_t n, uint8_t *out), (in, n, out))                           \
     X(int, dd_decode, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))             \
+    X(int, dd_decode_sorted, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))      \
     X(size_t, gorilla_encode, (const uint32_t *in, size_t n, uint8_t *out), (in, n, out))                     \
     X(int, gorilla_decode, (const uint8_t *in, size_t len, size_t n, uint32_t *out), (in, len, n, out))       \
     X(size_t, chimp_bound, (size_t n), (n))                                                                   \
@@ -61,8 +62,12 @@
     X(size_t, tsfor_bound, (size_t n), (n))                                                                   \
     X(size_t, ts_grid_encode, (const int64_t *ts, size_t n, uint8_t *out), (ts, n, out))                      \
     X(int, ts_grid_decode, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))        \
+    X(int, ts_grid_decode_sorted, (const uint8_t *in, size_t len, size_t n, int64_t *out),                    \
+      (in, len, n, out))                                                                                      \
     X(size_t, ts_delta_encode, (const int64_t *ts, size_t n, uint8_t *out), (ts, n, out))                     \
     X(int, ts_delta_decode, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))       \
+    X(int, ts_delta_decode_sorted, (const uint8_t *in, size_t len, size_t n, int64_t *out),                   \
+      (in, len, n, out))                                                                                      \
     X(size_t, decimal_bp_bound, (size_t n), (n))                                                              \
     X(size_t, decimal_bp_encode, (const float *in, size_t n, uint8_t *out), (in, n, out))                     \
     X(int, decimal_bp_decode, (const uint8_t *in, size_t len, size_t n, float *out), (in, len, n, out))       \
@@ -92,6 +97,8 @@
     X(size_t, block_encode_f32, (codec_ctx * c, int level, int value_codec, const float *v, size_t n,          \
                                  uint8_t *out), (c, level, value_codec, v, n, out))                           \
     X(int, block_decode_ts, (codec_ctx * c, const uint8_t *blk, size_t len, size_t n, int64_t *out),          \
+      (c, blk, len, n, out))                                                                                  \
+    X(int, block_decode_ts_sorted, (codec_ctx * c, const uint8_t *blk, size_t len, size_t n, int64_t *out),   \
       (c, blk, len, n, out))                                                                                  \
     X(int, block_decode_f32, (codec_ctx * c, const uint8_t *blk, size_t len, size_t n, float *out),           \
       (c, blk, len, n, out))                                                                                  \
