@@ -56,7 +56,9 @@
  *
  * Crash points for r7-jepsen: TSDB_SETTLE_CRASH_AT=after-put|after-ec-tmp|after-intent|between-renames|before-unlink[:n]
  * ends the process
- * with _exit(99) the n-th time (default 1) the point is passed; read once per process. after-intent: the intent is
+ * with exit(99) the n-th time (default 1) the point is passed; read once per process. exit, not _exit: under
+ * jepsen's crashfs the point must be a power cut, which crashfs's destructor makes (it runs on exit only; tsdbd and the
+ * engine register no atexit handler, so nothing else runs on the way out). after-intent: the intent is
  * durable, nothing renamed; between-renames: after each rename but the swap's last; before-unlink: the swap is
  * durable, its intent still there. after-put and after-ec-tmp are the settle's (src/settle.c, ecswap_crash_point):
  * its chunks are durable, and then its tmp_*.ec too, nothing renamed. An unknown name ends the process with status 2 at the first point passed.
@@ -114,8 +116,24 @@ static void settle_crash(int point)
     long hit = atomic_fetch_add(&sc_hits, 1) + 1;
     if (hit == sc_at) {
         fprintf(stderr, "tsdb: settle crash point %s (hit %ld): exiting with status 99\n", sc_names[point], hit);
-        _exit(99);
+        exit(99);
     }
+}
+
+/* TSDB_SWAP_MUTANT=swapearly arms SWAP_MUT_EARLY in a whole process (tsdbd under tests/jepsen/mutant-settle.sh, whose
+ * settle-steps run must catch it); the other mutants are test_ecswap's, set through ecswap_mutant. Read once, at the
+ * first swap; an unknown name ends the process with status 2, as TSDB_SETTLE_CRASH_AT does. */
+static pthread_once_t sm_once = PTHREAD_ONCE_INIT;
+static void sm_read(void)
+{
+    const char *v = getenv("TSDB_SWAP_MUTANT");
+    if (!v || !*v || strcmp(v, "none") == 0)
+        return;
+    if (strcmp(v, "swapearly") != 0) {
+        fprintf(stderr, "tsdb: TSDB_SWAP_MUTANT=%s names no mutant: exiting with status 2\n", v);
+        _exit(2);
+    }
+    ecswap_mutant = SWAP_MUT_EARLY;
 }
 
 void ecswap_crash_point(int which) { settle_crash(which == ECSWAP_CRASH_AFTER_PUT ? SC_AFTER_PUT : SC_AFTER_EC_TMP); }
@@ -239,6 +257,7 @@ static bool swap_renames(eng *db, part **in, part **ec, size_t n)
 
 int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
 {
+    pthread_once(&sm_once, sm_read);
     if (n == 0)
         return 0;
     if (db->opt.read_only || db->opt.follow)

@@ -955,12 +955,23 @@ static int child_settle(const char *root)
     return rc == 0 && crc == 0 ? 0 : 4;
 }
 
+static const char *exit_mark; /* CRASHFS_EXIT_MARK of the next child under the shim, NULL: none */
+static pid_t child_pid;       /* the last child's pid */
+
 static int run_child(const where *w, const char *crash_at, int warmup, int seed)
 {
     pid_t pid = fork();
     if (pid == 0) {
-        if (crash_at)
+        if (crash_at) {
             setenv("TSDB_SETTLE_CRASH_AT", crash_at, 1);
+            /* the crash point leaves through exit(99) (a power cut under crashfs) with the engine still open, which
+             * a leak check at exit would report (and change the status) */
+            char asan[512];
+            snprintf(asan, sizeof asan, "%s:detect_leaks=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+            setenv("ASAN_OPTIONS", asan, 1);
+        }
+        if (exit_mark)
+            setenv("CRASHFS_EXIT_MARK", exit_mark, 1);
         if (warmup >= 0) {
             char asan[512], wu[16], sd[16];
             snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0:detect_leaks=0",
@@ -984,6 +995,7 @@ static int run_child(const where *w, const char *crash_at, int warmup, int seed)
         execl(SELF, "test_settle", "--child", w->root, "--mutant", mutant, (char *)NULL);
         _exit(127);
     }
+    child_pid = pid;
     int st = -1;
     if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
         return -1;
@@ -1028,6 +1040,26 @@ static void crash_case(void)
         copy_base("cp", &w);
         CHECK(run_child(&w, points[i], -1, 0) == 99);
         CHECK(reopen_check(&w, points[i]) == 1);
+    }
+    /* under crashfs (whose own power loss is never due here) a crash point must be a power cut: the hook leaves
+     * through exit(99), so crashfs's destructor rolls back what was not synced and leaves its mark; jepsen's
+     * settle-steps nemesis needs exactly that (a _exit there was a plain crash, and 488 runs cut nothing) */
+    if (access(SHIM, R_OK) == 0) {
+        char mark[PATH_MAX + 32], mp[PATH_MAX + 64];
+        for (int i = 0; i < 2; i++) {
+            copy_base("cpcut", &w);
+            snprintf(mark, sizeof mark, "%s.cut", w.root);
+            exit_mark = mark;
+            CHECK(run_child(&w, points[i], 1000000000, 1) == 99);
+            exit_mark = NULL;
+            snprintf(mp, sizeof mp, "%s.%d", mark, (int)child_pid);
+            bool cut = access(mp, F_OK) == 0;
+            CHECK(cut);
+            if (!cut)
+                fprintf(stderr, "  (%s under crashfs: no power cut at the crash point, no %s)\n", points[i], mp);
+            unlink(mp);
+            CHECK(reopen_check(&w, points[i]) == 1);
+        }
     }
     copy_base("cp", &w);
     CHECK(run_child(&w, NULL, -1, 0) == 0);

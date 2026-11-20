@@ -745,8 +745,14 @@ static int run_child(const char *kind, const char *dir, const char *crash_at, in
 {
     pid_t pid = fork();
     if (pid == 0) {
-        if (crash_at)
+        if (crash_at) {
             setenv("TSDB_SETTLE_CRASH_AT", crash_at, 1);
+            /* the crash point leaves through exit(99) (a power cut under crashfs) with the engine still open, which
+             * a leak check at exit would report (and change the status) */
+            char asan[512];
+            snprintf(asan, sizeof asan, "%s:detect_leaks=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+            setenv("ASAN_OPTIONS", asan, 1);
+        }
         if (warmup >= 0) {
             char asan[512], w[16], sd[16];
             /* the power fails at exit (CRASHFS_AT_EXIT) with the shim's kept sectors still allocated, which a leak
