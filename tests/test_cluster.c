@@ -2369,6 +2369,23 @@ static void expect_unavail(tsdbc *c, int rc, uint16_t vol, int why, const char *
             n ? e.reason : 0, n, vol, why);
 }
 
+/* rc is server s's answer for volume `name` (number vol) that is not open there (held, refused, stale): the entry
+ * node decides from the copy alone (route_decide), so the volume's leader answers UNAVAILABLE (RECOVERING) and any
+ * other server MOVED to that leader, whatever its own directory holds */
+static void expect_held(tsdbc *c, int rc, int s, const char *name, uint16_t vol, const char *what)
+{
+    struct meta_volume w;
+    if (!vol_rec(0, name, &w) || w.number != vol)
+        die("%s: the record of %s is missing", what, name);
+    int ls = server_of(w.leader);
+    if (ls < 0)
+        die("%s: the leader of %s is node %u, no server", what, name, (unsigned)w.leader);
+    if (ls == s)
+        expect_unavail(c, rc, vol, TSDB_WHY_RECOVERING, what);
+    else
+        expect_moved(c, rc, vol, w.leader, ls, what);
+}
+
 /* series pump7.flow in `vol` on server i: made, written and read back (returns its id) */
 static tsdb_sid write_read(tsdbc *c, const char *vol, int64_t t0)
 {
@@ -3352,7 +3369,7 @@ static void scen_volumes(void)
     start(1);
     await_log_count(1, "is at open generation 1, below the 2 the metadata group recorded", 1, 40000);
     c = client(1);
-    expect_unavail(c, tsdbc_series_at(c, "pump7.flow", "plant", &x), 1, TSDB_WHY_RECOVERING, "an old copy");
+    expect_held(c, tsdbc_series_at(c, "pump7.flow", "plant", &x), 1, "plant", 1, "an old copy");
     tsdbc_close(c);
     if (log_count(1, "(plant): open as the") != 2)
         die("server 1 opened its old copy of v1");
@@ -3380,7 +3397,7 @@ static void scen_volumes(void)
         if (log_count(i, "(tank): open as the"))
             die("server %d opened tank before the group recorded its open generation", i);
         c = client(i);
-        expect_unavail(c, tsdbc_series_at(c, "pump7.flow", "tank", &x), 2, TSDB_WHY_RECOVERING, "tank held");
+        expect_held(c, tsdbc_series_at(c, "pump7.flow", "tank", &x), i, "tank", 2, "tank held");
         tsdbc_close(c);
     }
     for (int i = 0; i < 3; i++) {
@@ -3441,7 +3458,7 @@ static void scen_volumes(void)
         die("volume add spare: %s", cluster_strerror(rc));
     await_log_count(1, "(pipe): the metadata group recorded open generation 2 of another open", 1, 30000);
     c = client(1);
-    expect_unavail(c, tsdbc_series_at(c, "pump7.flow", "pipe", &x), 3, TSDB_WHY_RECOVERING, "a stale open");
+    expect_held(c, tsdbc_series_at(c, "pump7.flow", "pipe", &x), 1, "pipe", 3, "a stale open");
     tsdbc_close(c);
     if (log_count(1, "(pipe): open as the") != 2)
         die("server 1 opened its older copy of v3 under the generation of the open it predates");
@@ -3460,8 +3477,20 @@ static void scen_volumes(void)
     start(s);
     usleep(3000000);
     c = client(s);
-    /* its copy is stale (no core caught up): plant may not be declared yet, still never NOTFOUND */
-    expect_unavail(c, tsdbc_series_at(c, "pump7.flow", "plant", &x), TSDB_VOL_ANY, TSDB_WHY_RECOVERING, "no quorum");
+    /* its copy is stale (no core caught up): plant may not be declared yet (RECOVERING), or declared with its leader
+     * on server L, which the copy may still show UP (MOVED there: the entry node decides from the copy alone) or not
+     * (PROMOTING); never NOTFOUND, never served here */
+    rc = tsdbc_series_at(c, "pump7.flow", "plant", &x);
+    if (rc == TSDB_ERR_MOVED) {
+        expect_moved(c, rc, 1, v.leader, L, "no quorum");
+    } else {
+        tsdb_unavail e;
+        unsigned n = 0;
+        if (rc != TSDB_ERR_UNAVAILABLE || tsdbc_unavailable(c, &e, 1, &n) != 0 || n != 1 ||
+            (e.reason != TSDB_WHY_RECOVERING && e.reason != TSDB_WHY_PROMOTING))
+            die("no quorum: %s (reason %u), not MOVED to the old leader or UNAVAILABLE (RECOVERING, PROMOTING)",
+                ers(rc), n ? e.reason : 0);
+    }
     tsdbc_close(c);
     if (log_count(s, "(plant): open as the") != 2)
         die("server %d opened plant before the metadata group recorded its generation", s);
