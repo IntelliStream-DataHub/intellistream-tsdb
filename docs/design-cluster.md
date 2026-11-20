@@ -841,6 +841,34 @@ first unacknowledged frame, frames acknowledged after it included, with attempt 
 UNAVAILABLE does not count); `TCP_USER_TIMEOUT` of about 3 s. Forwarding by any server in simple mode (ha.md §9.1),
 one hop, never a transparent retry.
 
+**The entry node (S2-1, built; `route_decide` in `server/tsdbd.c`).** A request is served by a node only when every
+cluster volume it names is led there (the node's own view: its writer role or `led`, so a copy that lags a promotion
+here does not send requests away). A replica, or a node that has no copy of the volume, answers MOVED to the leader
+its metadata copy names, reads included (D5: a replica never answers a read; S3's REPLICA_OK may); UNAVAILABLE
+(NO_OWNER, about 1 s) when the copy names no leader; UNAVAILABLE (PROMOTING, about 200 ms) when the leader's member
+is not UP or the volume is being promoted here. A volume the copy does not know (no copy yet: a node just started; or
+a copy that lags the volume's creation) is served only where it is open as a writer; anywhere else it is UNAVAILABLE
+(NO_OWNER), because an engine that does not hold the volume answers a read with no rows (jepsen-cluster found that
+stale read on a restarted node without the volume). The root (volume 0) keeps the answer of the gates after it. The
+price: an id of a volume that was never made, or of one that was removed, is retried until the client's budget runs out
+(30 s by default) instead of failing at once; and a user without rights can tell a volume that does not exist
+(UNAVAILABLE) from one led elsewhere (MOVED), which TOPOLOGY tells every logged-in client anyway.
+Every one of these answers is given before anything of the request is done, so each means "not applied"
+(§6.5). The decision comes before any right on a series id is checked: rights on ids resolve through the names of the
+volumes served here, so an id of a volume led elsewhere would be DENIED at the entry node; the owner checks them.
+The requests that name many ids (packed and many-series inserts, QUERY_MULTI, QUERY_LATEST, STATS_SERIES) are decided
+in their handlers on every id (`route_ids`), before their rights.
+A frame whose rows name volumes led on two nodes is INVALID with a log line (S3's clients split frames).
+`test_cluster route` tests it, and `TSDB_ROUTE_MUTANT` (`rightsbeforeroute`, `movedoffcopy`, `replicaread`,
+`spanaccepted`, `nocopyserved`) plants the bugs it must catch.
+
+Risk, open until S3: MOVED carries the address in the copy. A node restarted on another port or host is named at its
+old address until its MEMBER_ADDR has committed and reached the copy, so a client moved meanwhile reaches nobody (an
+I/O error it retries) or, worse, whatever process holds that address now; the client checks no identity after the
+reconnect (a node id in HELLO's reply is S3's). No test covers this case: `test_cluster route` restarts no node, and
+jepsen-cluster's clients follow MOVED by the node id through the harness's own table of nodes, never to the address in
+the body, so the client's own following after a restart is untested until S3.
+
 The Pulsar sink inherits this through the Java client. Its `ErrorClassifier` already retries unknown codes; MOVED,
 UNAVAILABLE and IO become explicitly retryable, DROPPED stays final. It acknowledges a Pulsar message only after tsdb's
 OK, so a failover costs it a pause, never a message.

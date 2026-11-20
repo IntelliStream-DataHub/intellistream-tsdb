@@ -1073,6 +1073,7 @@ struct rd {
     int64_t begin, end;
     uint32_t seen[KEYS]; /* the id of the write whose value a key shows, 0: nothing */
     uint8_t stray;
+    int8_t node; /* the node that answered it (kv_roam: a stale read names it) */
 };
 #define MAXSESS 4
 struct hist {
@@ -1138,7 +1139,50 @@ static struct rd *hist_read_slot(struct hist *h, int sess)
 static char kv_vol[MAXN][META_NAME_MAX];
 static int nhists;            /* histories in use: kv-local one per node, kv and classes REP_HISTS */
 static int hist_node[MAXN];   /* the node a history's clients talk to */
-static int kv_resolve(tsdbc *c, int hi, tsdb_sid *sid) { return tsdbc_series(c, hists[hi].name, 0, sid); }
+/* kv and classes (kv_roam): a client connects to a random member, not to kvr's leader, and now and then drops its
+ * connection to start again elsewhere; a replica or a member without kvr answers MOVED (route_decide in tsdbd, D5:
+ * reads too), which the history counts as definitely failed, and the client follows it to the node it names (by
+ * node id, through the node table: never to the address in the body). Each history logs its first moves and the node
+ * it talks to after each; kv_moved counts them all. The ids were made on the leader (hist_sid): a member without kvr
+ * knows no name of it. */
+static int kv_roam;
+static tsdb_sid hist_sid[MAXN];
+static _Atomic uint64_t kv_moved;
+static int kv_resolve(tsdbc *c, int hi, tsdb_sid *sid)
+{
+    if (kv_roam && hist_sid[hi]) {
+        *sid = hist_sid[hi];
+        return 0;
+    }
+    return tsdbc_series(c, hists[hi].name, 0, sid);
+}
+
+/* the node a (re)connecting client of history hi takes: hist_node[hi], or under kv_roam the one a MOVED named, else
+ * a random member */
+static int kv_pick(int hi, int *next, uint64_t *r)
+{
+    if (!kv_roam)
+        return hist_node[hi];
+    int n = *next >= 0 ? *next : (int)(mix(*r += 1) % (uint64_t)nn);
+    *next = -1;
+    return n;
+}
+
+/* after a failed request on node `from`: a MOVED sets *next to the node it names; 1 when it was a MOVED */
+static int kv_follow(tsdbc *c, int hi, int from, int *next, unsigned *logged, const char *who)
+{
+    tsdbc_err_info e;
+    if (!kv_roam || tsdbc_last_error(c, &e) != TSDB_ERR_MOVED || !e.nmoved)
+        return 0;
+    int to = idx_of_id(e.moved[0].node_id);
+    uint64_t n = atomic_fetch_add(&kv_moved, 1) + 1;
+    *next = to;
+    if (++*logged <= 5 || n % 1000 == 0)
+        printf("jepsen-cluster: %s of %s: MOVED by node %d to node %d (id %u, epoch %u); it talks to node %d now "
+               "(%" PRIu64 " moves)\n", who, hists[hi].name, from, to, (unsigned)e.moved[0].node_id,
+               (unsigned)e.moved[0].epoch, to, n);
+    return 1;
+}
 
 static int64_t key_ts(int k) { return KV_BASE_TS + (int64_t)k * 1000; }
 static int ts_key(int64_t ts)
@@ -1154,13 +1198,15 @@ static int nkv_threads;
 
 static void *kv_writer(void *arg)
 {
-    int hi = (int)(intptr_t)arg, node = hist_node[hi];
+    int hi = (int)(intptr_t)arg, node = hist_node[hi], next = -1;
+    unsigned logged = 0;
     struct hist *h = &hists[hi];
     tsdbc *c = NULL;
     tsdb_sid sid = 0;
     uint64_t r = mix(seed * 31 + (uint64_t)hi);
     while (atomic_load(&kv_run)) {
         if (!c) {
+            node = kv_pick(hi, &next, &r);
             if (connect_node(node, 0, &c) != 0 || kv_resolve(c, hi, &sid) != 0) {
                 if (c)
                     tsdbc_close(c);
@@ -1201,9 +1247,17 @@ static void *kv_writer(void *arg)
                    rc == TSDB_ERR_DROPPED || rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_DENIED) {
             hist_end(h, id, WS_FAIL); /* refused: definitely not applied */
             atomic_fetch_add(&kv_fail, 1);
+            if (kv_follow(c, hi, node, &next, &logged, "the writer")) {
+                tsdbc_close(c);
+                c = NULL;
+            }
         } else {
             hist_end(h, id, WS_INDET); /* the node may have applied it */
             atomic_fetch_add(&kv_indet, 1);
+            tsdbc_close(c);
+            c = NULL;
+        }
+        if (c && kv_roam && mix(r += 1) % 200 == 0) { /* start again on a random member */
             tsdbc_close(c);
             c = NULL;
         }
@@ -1236,18 +1290,21 @@ static int kv_read_all(tsdbc *c, tsdb_sid sid, struct rd *rd)
 }
 
 /* the moment the terminal crash point was triggered (kv, classes): the leader of kvr ends at it and comes back as a
- * replica, and a replica answers reads from what it has applied (tsdbd: REPLICA_OK, design-cluster.md 7.2, is a later
- * step, so a replica does not refuse them): stale by design, so the readers stop there. */
+ * replica, and the volume has no leader after it (no promotion before r3e-failover): the readers stop there (a replica
+ * answers MOVED or UNAVAILABLE since route_decide, never a read; before it, it answered stale reads). */
 static _Atomic int64_t term_ns;
 
 static void *kv_reader(void *arg)
 {
-    int hi = (int)(intptr_t)arg, node = hist_node[hi];
+    int hi = (int)(intptr_t)arg, node = hist_node[hi], next = -1;
+    unsigned logged = 0;
+    uint64_t r = mix(seed * 37 + (uint64_t)hi);
     struct hist *h = &hists[hi];
     tsdbc *c = NULL;
     tsdb_sid sid = 0;
     while (atomic_load(&kv_run)) {
         if (!c) {
+            node = kv_pick(hi, &next, &r);
             if (connect_node(node, 0, &c) != 0 || kv_resolve(c, hi, &sid) != 0) {
                 if (c)
                     tsdbc_close(c);
@@ -1262,10 +1319,16 @@ static void *kv_reader(void *arg)
         }
         struct rd tmp;
         memset(&tmp, 0, sizeof tmp);
+        tmp.node = (int8_t)node;
         if (kv_read_all(c, sid, &tmp) == 0 && (!atomic_load(&term_ns) || tmp.begin < atomic_load(&term_ns)))
             *hist_read_slot(h, 0) = tmp;
         else {
-            h->reads_failed++;
+            if (!kv_follow(c, hi, node, &next, &logged, "the reader")) /* MOVED: not applied, not a failure */
+                h->reads_failed++;
+            tsdbc_close(c);
+            c = NULL;
+        }
+        if (c && kv_roam && mix(r += 1) % 200 == 0) {
             tsdbc_close(c);
             c = NULL;
         }
@@ -1410,14 +1473,18 @@ static void rep_setup(void)
                 rc = tsdbc_series_at(c, names[i], "kvr", &sid);
             if (c)
                 tsdbc_close(c);
-            if (rc == 0)
+            if (rc == 0) {
+                if (i < REP_HISTS)
+                    hist_sid[i] = sid;
                 break;
+            }
             if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_NOTFOUND) || now_ms() - t1 > 30000)
                 die(1, "kv: cannot create %s in kvr on its leader (node %d): %s", names[i], rep_leader, tsdbc_strerror(rc));
         }
     }
-    printf("jepsen-cluster: kvr is volume %" PRIu32 " on nodes %d, %d, %d; its leader is node %d\n", rep_number,
-           rep_nodes[0], rep_nodes[1], rep_nodes[2], rep_leader);
+    kv_roam = 1;
+    printf("jepsen-cluster: kvr is volume %" PRIu32 " on nodes %d, %d, %d; its leader is node %d; clients on random "
+           "members, moved to it\n", rep_number, rep_nodes[0], rep_nodes[1], rep_nodes[2], rep_leader);
 }
 
 /* kvr's ISR as the metadata group holds it: a mask of the replicas (bit r: rep_nodes[r]) in the record with the highest
@@ -1694,9 +1761,11 @@ static int check_hist(struct hist *h, uint64_t *seen_indet_applied)
                 }
                 if (lo > 0) {
                     if (v == 0)
-                        VIOL(V_STALE, "stale read: key %d is empty in a read that began after it was written and acknowledged", k);
+                        VIOL(V_STALE, "stale read: key %d is empty in a read that began after it was written and acknowledged "
+                                     "(read %u, answered by node %d)", k, j, rd->node);
                     else if (v <= nw && w[v - 1].end < ack[k][2 * (lo - 1) + 1])
-                        VIOL(V_STALE, "stale read: key %d shows write %u, older than an acknowledged write of the key", k, v);
+                        VIOL(V_STALE, "stale read: key %d shows write %u, older than an acknowledged write of the key (read %u, "
+                                     "answered by node %d)", k, v, j, rd->node);
                 }
                 /* 3: what a write that is seen did at its other keys */
                 if (v && v <= nw)
@@ -2920,9 +2989,10 @@ int main(int argc, char **argv)
     }
     if (want_kv || want_rep)
         printf("%s: %" PRIu64 " writes acknowledged, %" PRIu64 " refused, %" PRIu64 " indeterminate (%" PRIu64
-               " of them applied), %" PRIu64 " reads; %u connections, %u refused for a port the node does not hold\n",
+               " of them applied), %" PRIu64 " reads, %" PRIu64 " MOVED followed; %u connections, %u refused for a port "
+               "the node does not hold\n",
                want_kv ? "kv-local" : "kv", (uint64_t)atomic_load(&kv_ok), (uint64_t)atomic_load(&kv_fail), (uint64_t)atomic_load(&kv_indet),
-               indet_applied, nreads, (unsigned)atomic_load(&client_connects), (unsigned)atomic_load(&refused_foreign));
+               indet_applied, nreads, (uint64_t)atomic_load(&kv_moved), (unsigned)atomic_load(&client_connects), (unsigned)atomic_load(&refused_foreign));
     (void)nwrites;
     int rc = 0;
     if (viol) {

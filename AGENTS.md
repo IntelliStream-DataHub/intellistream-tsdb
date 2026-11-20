@@ -183,7 +183,10 @@ cgroup, so `nice` does not keep your work out of its way.
   went on, CREDIT for streamed query replies; `test_peerlink kinds|toobig|written|wbcut|fwdstall|fwd|fwdgrow|fwdredial|fwdslow|fwdstream`
   (mutants `queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead`); a full inbox
   pauses the link (`plink_pause`: no reading, keepalive goes on) and never blocks its thread; `fwd_cancel`; the
-  instance is freed only after tsdbd's workers are joined (`fwd_cluster_free`), `test_cluster fwdlinks`. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  instance is freed only after tsdbd's workers are joined (`fwd_cluster_free`), `test_cluster fwdlinks`. The entry node's decision is `route_decide` in `server/tsdbd.c` (D5, S2-1:
+  served only where every cluster volume of the request is led here, else MOVED to the copy's leader, reads included, or
+  UNAVAILABLE NO_OWNER/PROMOTING; before any right on an id is checked; a frame spanning two owners is INVALID;
+  docs/design-cluster.md 6.4); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants

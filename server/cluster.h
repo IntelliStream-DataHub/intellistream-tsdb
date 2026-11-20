@@ -227,7 +227,8 @@ struct cluster_copy_member {
 };
 struct cluster_copy_vol {
     uint32_t number;
-    uint8_t kind;    /* enum meta_vol_kind */
+    char name[META_NAME_MAX]; /* what clients name it by (tsdbc_series_at's path) */
+    uint8_t kind;             /* enum meta_vol_kind */
     uint32_t leader; /* the record's leader (writer, shared: owner); 0: none */
     uint64_t epoch;
     uint32_t nrep;
@@ -255,6 +256,8 @@ unsigned long cluster_copy_builds(void);
 int cluster_copy_stress(unsigned readers, unsigned long publishes, unsigned ms, char *why, size_t wn);
 const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy *c, uint32_t id); /* NULL: none */
 const struct cluster_copy_vol *cluster_copy_vol(const struct cluster_copy *c, uint32_t number);    /* NULL: none */
+/* the volume named `name` (n bytes, no NUL needed), NULL: none (s2e routes series ops that name a volume by it) */
+const struct cluster_copy_vol *cluster_copy_vol_named(const struct cluster_copy *c, const char *name, size_t n);
 /* The role of member `node` in volume v as TOPOLOGY says it (TSDB_ROLE_*, D9: no new role before S3): the leader
  * OWNER, a replica in the ISR STANDBY, any other replica (a learner too) FOLLOWER, anyone else NONE. */
 int cluster_copy_role(const struct cluster_copy_vol *v, uint32_t node);
