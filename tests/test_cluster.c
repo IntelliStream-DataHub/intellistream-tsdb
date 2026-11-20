@@ -6610,6 +6610,68 @@ static void scen_pause(void)
 }
 
 
+/* jointpause (r3e jc7, finding P): every server of a volume stopped together for 2 s (SIGSTOP: a VM pause, a host
+ * that froze) and resumed. Nobody was silent but for the stop itself: the leader must not catch the 2 s up in ticks
+ * (every peer then looks silent for isr_lag and it asks for an ISR of one) and no member may name a peer unreachable for
+ * its own stop (a cut that deposes the leader: the pause scenario's write after MOVED got a closed connection). The
+ * record keeps its epoch and its ISR version, and a write is acknowledged (mutant stallcatchup). */
+static void scen_jointpause(void)
+{
+    scenario("jointpause");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "jp", 3, &num)) != 0 || num != 1)
+        die("volume add jp: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "jp", i, 1, 0);
+    struct meta_volume v0, v;
+    if (!vol_rec(0, "jp", &v0))
+        die("no record of jp");
+    int L = server_of(v0.leader);
+    if (L < 0 || L > 2)
+        die("the leader of jp is node %u", v0.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "jp", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every server up: %s", ers(rc));
+    await_isr(0, "jp", 3, 30000, "every replica in the ISR before the stop");
+    if (!vol_rec(0, "jp", &v0))
+        die("no record of jp");
+    for (int round = 0; round < 3; round++) {
+        for (int i = 0; i < 3; i++)
+            pause_server(i, 1);
+        nanosleep(&(struct timespec){2, 0}, NULL);
+        for (int i = 0; i < 3; i++)
+            pause_server(i, 0);
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 4000; usleep(20000)) {
+            for (int i = 0; i < 3; i++)
+                if (vol_rec(i, "jp", &v) && (v.epoch != v0.epoch || v.isr_version != v0.isr_version || v.nisr != 3))
+                    die("round %d: after a stop of every server the record of jp (via server %d) has epoch %" PRIu64
+                        " (was %" PRIu64 "), ISR version %" PRIu64 " (was %" PRIu64 ") of %" PRIu32 " members: a "
+                        "member took the stop for its peers' silence", round, i, v.epoch, v0.epoch, v.isr_version,
+                        v0.isr_version, v.nisr);
+        }
+        ts = 2000 + round;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("round %d: a write to the leader after a stop of every server: %s", round, ers(rc));
+    }
+    tsdbc_close(c);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {4, 0, 0, 0};
+    rep_same(wantr, "after three stops of every server");
+    printf("  three stops of every server for 2 s: epoch %" PRIu64 " and ISR version %" PRIu64 " kept, writes go on\n",
+           v0.epoch, v0.isr_version);
+}
+
 /* design-cluster.md 6.2 (r3e-failover, item 6): the leader of a replicated volume is killed and restarted before the
  * group sees it down (node_timeout 20 s here). Its REPL says it led epoch e, so it never resumes: its core sends
  * RESIGN(v, e), the Raft leader fences the ISR at once (reason RESIGNED, no node_timeout) and the record moves to e+1, the restarted server again
@@ -7243,7 +7305,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

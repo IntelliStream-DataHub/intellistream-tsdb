@@ -58,7 +58,8 @@
  * log durable, past a COMMIT marker whose file it has not staged (reopenhold), `tickstretch` drops the ticks a slow
  * catch-up step made late, so the core's clock (isr_lag, the join hold) runs slower than the wall's (tickwall),
  * `stepcurrentonly` runs catch-up steps only on ticks that are not late (a thread always late never catches a peer
- * up: rejoinlate).
+ * up: rejoinlate), `stallcatchup` catches a stop of the whole process up in ticks and counts its own stop as its peers'
+ * silence (jointpause).
  * `commitpastremoved` takes an ISR request as the record at once, before the metadata group commits it (isr),
  * `nominisr` never checks min_isr (minisr), `ackbelowminisr` hands the writer a commit point reached after a shrink
  * below min_isr (minisr), `nocap` keeps the leader's segments for a lagging replica without the caps repl_retain_mb and
@@ -124,6 +125,7 @@ _Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member
 #define SLOW_TICK_MS 20  /* slowtick (tests): a catch-up step that long, at every tick it runs */
 #define LATE_TICK_MS 6   /* latetick (tests): every tick of a writer that much longer: the thread is never current */
 #define TICK_BACKLOG_MS 1000 /* the core's clock catches up at most this much of wall time (vol_main) */
+#define STALL_MS 250 /* a tick wait that returns this late: the process was stopped (SIGSTOP, a VM pause), not busy */
 #define SLOW_ACK_MS 100  /* slowack (tests) */
 #define SLOW_ACK_RING 512
 #define MAX_NODES 64
@@ -168,6 +170,8 @@ struct rvol {
     uint64_t epoch; /* the core's, cached for the bytes path */
     struct rpeer peer[REPL_MAX_NODES];
     uint64_t open_ms; /* when its driver started: a peer never heard counts as unheard since then */
+    uint64_t resumed_ms; /* when its thread came back from a stall (STALL_MS): peers count as unheard since then */
+    uint64_t loop_ms;    /* when its thread last woke or looped (repld_unreachable) */
     struct item *in_head, *in_tail;
     size_t in_bytes;         /* of peer frames in the inbox (bounded: inbox_bytes) */
     pthread_cond_t in_space; /* a link's thread waits here for room */
@@ -255,7 +259,8 @@ enum {
     RM_INBOXSTARVE,
     RM_OPENNOHOLD,
     RM_TICKSTRETCH,
-    RM_STEPCURRENTONLY
+    RM_STEPCURRENTONLY,
+    RM_STALLCATCHUP
 };
 
 static struct {
@@ -1976,6 +1981,7 @@ static void *vol_main(void *arg)
          * other peers waited in the inbox while the core's clock went on, until it dropped a healthy member from the
          * ISR for silence (a replica's rejoin, 2026-11-17: ISR 3 -> 2 -> 1; test_cluster rejoinslow) */
         uint64_t now = now_ms();
+        rv->loop_ms = now;
         int mine = now < next_tick || (now < slice && G.mutant != RM_INBOXSTARVE);
         if (rv->in_head && mine) {
             struct item *it = rv->in_head;
@@ -2066,6 +2072,16 @@ static void *vol_main(void *arg)
         dl.tv_sec += (time_t)(ns / 1000000000ull);
         dl.tv_nsec = (long)(ns % 1000000000ull);
         pthread_cond_timedwait(&rv->cv, &rv->mu, &dl);
+        /* A wait that returns STALL_MS past its deadline was a stop of the whole process (the pause scenario stops a
+         * leader and a replica together for 1.5 s): the time is not caught up in ticks, which would count every peer
+         * silent for TICK_BACKLOG_MS and ask for an ISR of one, and repld_unreachable counts its peers as heard at
+         * the resume, or this member names the leader it was stopped together with and a cut deposes it (test_cluster
+         * jointpause, mutant stallcatchup). A busy step is not a stall: tickwall's slow reads are caught up. */
+        uint64_t woke = now_ms();
+        if (woke > next_tick + STALL_MS && G.mutant != RM_STALLCATCHUP) {
+            next_tick = woke;
+            rv->resumed_ms = woke;
+        }
     }
     pthread_mutex_unlock(&rv->mu);
     return NULL;
@@ -2166,6 +2182,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "inboxstarve")    ? RM_INBOXSTARVE
                : !strcmp(mu, "opennohold")     ? RM_OPENNOHOLD
                : !strcmp(mu, "tickstretch")    ? RM_TICKSTRETCH
+               : !strcmp(mu, "stallcatchup")   ? RM_STALLCATCHUP
                : !strcmp(mu, "stepcurrentonly") ? RM_STEPCURRENTONLY
                                                : RM_NONE;
     if (G.mutant)
@@ -2464,10 +2481,15 @@ unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t a
     for (uint32_t i = 0; i < nv; i++) {
         struct rvol *rv = vs[i];
         pthread_mutex_lock(&rv->mu);
-        for (uint32_t k = 0; !rv->failed && k < rv->rec.nrep && k < REPL_MAX_NODES; k++) {
+        /* a thread that has not looped for STALL_MS is stopped with its process or not yet back from it: its peers'
+         * silence is its own (vol_main) */
+        int stalled = G.mutant != RM_STALLCATCHUP && now > rv->loop_ms + STALL_MS;
+        for (uint32_t k = 0; !rv->failed && !stalled && k < rv->rec.nrep && k < REPL_MAX_NODES; k++) {
             if ((int)k == rv->self || rv->rec.rep[k].learner)
                 continue;
             uint64_t last = rv->peer[k].heard_ms ? rv->peer[k].heard_ms : rv->open_ms;
+            if (G.mutant != RM_STALLCATCHUP && rv->resumed_ms > last)
+                last = rv->resumed_ms;
             unsigned j = 0;
             while (j < ns && seen[j].node != rv->rec.rep[k].node)
                 j++;

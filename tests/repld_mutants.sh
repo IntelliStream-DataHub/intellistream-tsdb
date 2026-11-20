@@ -21,7 +21,8 @@
 # while the next is due) rejoinslow; opennohold (a replica's core opens with its whole log durable, past a COMMIT
 # marker whose file it has not staged) reopenhold (knobs dropbulk, nofetch, syncpause, fetchlate); tickstretch (a late
 # tick dropped: the core's clock slower than the wall's under a slow catch-up step) tickwall (knob slowtick);
-# stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick). Two are tsdbd's, read by
+# stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick); stallcatchup (a stop
+# of the whole process caught up in ticks and taken for the peers' silence) jointpause. Two are tsdbd's, read by
 # it under the same name: nomoved (a write to a non-leader refused UNAVAILABLE, not MOVED) failover; deposemoved (a
 # write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose. fencenosync (a
 # FENCE_REPLY sent with the raised fence not in REPL) fencecrash. One is the volume manager's (server/cvol.c,
@@ -63,6 +64,7 @@ table=(
     "opennohold|reopenhold|the leader dropped the file of a COMMIT marker that a restarted replica had not staged"
     "tickstretch|tickwall|a member stopped under writes left the ISR only after [0-9]+ ms"
     "stepcurrentonly|rejoinlate|did not join the ISR again in 30 s"
+    "stallcatchup|jointpause|after a stop of every server the record of jp"
     "keepunanswered|failover|the killed old leader was still in the ISR of fo"
     "fencenosync|fencecrash|REPL holds fence [0-9]+ after it stopped at fence-saved-before-reply"
     "keepwritten|replicate|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
