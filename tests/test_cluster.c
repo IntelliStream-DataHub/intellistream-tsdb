@@ -6004,8 +6004,8 @@ static int cmp_u64(const void *a, const void *b)
 }
 
 /* repcheck: three duties of the replication driver that no other scenario sees, each the target of one of its mutants
- * (server/repld.c): a replica's saved floor reaches its engine, which then removes its flushed segments (floornottold
- * keeps them all); a replica whose newest REPL slot is damaged opens "unsure" and its first save at the open takes the
+ * (server/repld.c): a replica's saved floor reaches its engine, which then removes its flushed segments once they are
+ * also past the keep caps (repl_retain_s is 2 s here; floornottold keeps them all); a replica whose newest REPL slot is damaged opens "unsure" and its first save at the open takes the
  * group's epoch as fence and led, which clears the flag (unsureignored keeps the older slot's values and the flag);
  * a write whose position in the core is not its log number fails the volume before it is acknowledged (admitnocheck
  * acknowledges it; the fault is TSDB_REPLD_TEST=skippos). It also prints the latency of single-row writes (the fast
@@ -6018,7 +6018,9 @@ static void scen_repcheck(void)
         penv[i] = "TSDB_REPLD_TEST=skippos,stalesent";
         start(i);
     }
+    init_retain_s = 2; /* a replica keeps flushed segments past its floor for repl_retain_s (design-cluster.md 8.3) */
     init_cluster(0, 600);
+    init_retain_s = 0;
     node_add(0, 1);
     node_add(0, 2);
     unsigned want = 3;
@@ -6074,7 +6076,7 @@ static void scen_repcheck(void)
             break;
         if (now_ms() - t0 > 20000)
             die("replica %d still holds %d WAL segments 20 s after the writes (its saved floor never removed its "
-                "flushed segments)", R, nw);
+                "flushed segments past the keep caps)", R, nw);
         usleep(100000);
     }
     printf("  the replica removed its flushed segments once its floor was saved (%d left)\n", nw);
