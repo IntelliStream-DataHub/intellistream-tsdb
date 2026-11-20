@@ -981,8 +981,9 @@ static bool step_reached(int step, pid_t pid)
  * or a non-zero exit whose own lines, from this start's offset, name no failure of the machine: log_env_failure), and a server that is ALIVE
  * and wrote no port file in 30 s while the machine was not stalled (it hangs: pause(), a spin, a deadlock). Not a verdict: a server that
  * says what a machine out of memory says (io_uring: Cannot allocate memory), exit 127 (no binary), a server the machine killed, and a wait
- * during which the machine stalled (a thread of the server in D state for dstate_min_ns, or this thread itself not scheduled for a second:
- * liveness under load, a harness error, exit 2). A refusal on damage under misdirect and rot is judged before this, from the log. Every
+ * that ends with the machine still stalling (a thread of the AWAITED process in D state, or this thread itself not scheduled, for a second:
+ * liveness under load, a harness error, exit 2). A stall that ended before the wait ran out only lengthens it (await_watched): the server
+ * that hangs after it is a verdict. A refusal on damage under misdirect and rot is judged before this, from the log. Every
  * message names the server's log and its last lines. */
 static int64_t dstate_min_ns = 10000000000LL; /* a thread of the server in D state this long without a break is the kernel's stall (see req_done) */
 #define AWAIT_SLICE_MS 250
@@ -991,29 +992,55 @@ static int open_wait_ms(void) /* how long a server may take to write its port fi
     return getenv("JEPSEN_OPEN_WAIT_MS") && atoi(getenv("JEPSEN_OPEN_WAIT_MS")) > 0 ? atoi(getenv("JEPSEN_OPEN_WAIT_MS")) : 30000;
 }
 #define AWAIT_STARVED_MS 1000 /* a slice of the wait that took this much longer than it should have: the machine did not run this thread */
-static int64_t dstate_scan(void);
+/* The sampler of D state for one process: the longest stretch, in ns, that a thread of `pid` has been in D state without a break, as of this
+ * sample (struct dst_state keeps the record between samples: the global sampler's for the server that runs now, a wait's own for the process
+ * it awaits). */
+struct dst_state {
+    pid_t cur;
+    int nt;
+    pid_t tids[256];
+    int64_t since[256];
+};
+static int64_t dst_sample(struct dst_state *st, pid_t pid);
+#define AWAIT_STALL_MIN_NS 1000000000LL /* a thread of the awaited server in D state this long, or this thread unscheduled this long, is a stall NOW */
+#define AWAIT_CAP_FACTOR 4 /* a stall that goes on is waited out for this many times the wait, then it is the environment's (exit 2) */
+/* Waits for the port file of `pid`. A wait does not end while the machine stalls, and the time it stalled does not count against the wait
+ * (round 15, VERIFY14 findings 1 and 2): the stall is read from the process awaited (its own threads in D state for a second, or this thread
+ * not scheduled for a second), at every slice. A server alive and not stalled when the wait runs out hangs: the caller's verdict. A stall still
+ * there after AWAIT_CAP_FACTOR times the wait is the environment's: *stall_why says so (and only then; a stall that ended earlier leaves it
+ * NULL, whatever it cost). */
 static int await_watched(const char *pf, pid_t pid, int timeout_ms, const char **stall_why, char *whybuf, size_t wn)
 {
     *stall_why = NULL;
-    int64_t t0 = now_ns();
+    struct dst_state ds;
+    memset(&ds, 0, sizeof ds);
+    int64_t t0 = now_ns(), stalled_ns = 0, wait_ns = (int64_t)timeout_ms * 1000000LL;
     int p = TH_BAD;
-    while (now_ns() - t0 < (int64_t)timeout_ms * 1000000LL) {
+    for (;;) {
         int64_t s0 = now_ns();
         p = th_await(pf, pid, AWAIT_SLICE_MS);
-        int64_t el = (now_ns() - s0) / 1000000LL;
+        int64_t s1 = now_ns(), el = (s1 - s0) / 1000000LL;
         if (p != TH_BAD || strstr(th_why, "names pid")) /* a port, an exit, or another process's port file: no more waiting helps */
             return p;
-        if (el > AWAIT_SLICE_MS + AWAIT_STARVED_MS && !*stall_why) {
-            snprintf(whybuf, wn, "this thread was not scheduled for %lld ms during the wait", (long long)(el - AWAIT_SLICE_MS));
-            *stall_why = whybuf;
-        }
-        int64_t d = dstate_scan();
-        if (d >= dstate_min_ns && !*stall_why) {
-            snprintf(whybuf, wn, "a thread of the server sat in D state (the kernel) for %.0f s", (double)d / 1e9);
-            *stall_why = whybuf;
+        int64_t d = dst_sample(&ds, pid);
+        bool starved = el > AWAIT_SLICE_MS + AWAIT_STARVED_MS, in_d = d >= (dstate_min_ns < AWAIT_STALL_MIN_NS ? dstate_min_ns : AWAIT_STALL_MIN_NS);
+        int64_t now = now_ns();
+        if (starved || in_d)
+            stalled_ns += now - s0; /* the machine did not run what this slice waits for */
+        if (now - t0 - stalled_ns >= wait_ns || now - t0 >= wait_ns * AWAIT_CAP_FACTOR) {
+            if (starved)
+                snprintf(whybuf, wn, "this thread was not scheduled for %lld ms during the last slice of the wait", (long long)(el - AWAIT_SLICE_MS));
+            else if (in_d)
+                snprintf(whybuf, wn, "a thread of the server sat in D state (the kernel) for %.0f s, and still did at the end of the wait", (double)d / 1e9);
+            if (starved || in_d)
+                *stall_why = whybuf;
+            /* the last slice's own reason is not the verdict's: what the wait saw is that no port file came */
+            if (strstr(th_why, "wrote no"))
+                snprintf(th_why, sizeof th_why, "harness: tsdbd (pid %d) wrote no %s in %lld s (%lld s of it stalled)\n", (int)pid, pf,
+                         (long long)((now - t0) / 1000000000LL), (long long)(stalled_ns / 1000000000LL));
+            return p;
         }
     }
-    return p;
 }
 
 /* The verdict on a server (the writer, or the follower) that did not listen. `p` is what the wait returned, `st` the wait status when it
@@ -1033,8 +1060,8 @@ static bool no_port_is_noted(pid_t pid, int p, int st, const char *who, const ch
         if (stall_why)
             return false; /* the machine stalled during the wait: liveness under load, not a verdict (exit 2, the harness error) */
         fprintf(stderr, "  the %s (pid %d) is alive and wrote no port file in %d s, and the machine did not stall (no thread of it in D state "
-                "for %.0f s, this thread scheduled): it hangs while opening (its log: %s)\n", who, (int)pid, open_wait_ms() / 1000,
-                (double)dstate_min_ns / 1e9, logpath);
+                "at the end of the wait, this thread scheduled; the time it did stall was not counted): it hangs while opening (its log: %s)\n",
+                who, (int)pid, open_wait_ms() / 1000, logpath);
         print_proc_state(pid);
     } else {
         return false; /* a port that is not the server's, another pid in the file: the environment */
@@ -1616,19 +1643,13 @@ static void req_done(const char *op, int rc, int64_t t0)
  * place that reads the tasks, under dst_mu, so the thread's record of since-when and a miss's look at the same instant agree). It returns
  * the longest stretch, in ns, that a thread of the server has been in D state without a break, as of this scan. */
 static pthread_mutex_t dst_mu = PTHREAD_MUTEX_INITIALIZER;
-static int64_t dstate_scan(void)
+static int64_t dst_sample(struct dst_state *st, pid_t pid)
 {
     enum { MAXT = 256 };
-    static pid_t tids[MAXT];
-    static int64_t since[MAXT];
-    static int nt;
-    static pid_t cur;
-    pthread_mutex_lock(&dst_mu);
-    pid_t pid = atomic_load(&server_pid);
     int64_t now = now_ns(), longest = 0;
-    if (pid != cur) {
-        cur = pid;
-        nt = 0;
+    if (pid != st->cur) {
+        st->cur = pid;
+        st->nt = 0;
     }
     if (pid > 0) {
         char path[320], b[512];
@@ -1659,20 +1680,29 @@ static int64_t dstate_scan(void)
         int64_t nsince[MAXT];
         for (int i = 0; i < ns; i++) { /* a thread in D state now: since when */
             int j = 0;
-            while (j < nt && tids[j] != seen[i])
+            while (j < st->nt && st->tids[j] != seen[i])
                 j++;
-            int64_t sc = j < nt ? since[j] : now;
+            int64_t sc = j < st->nt ? st->since[j] : now;
             if (sc < now && now - sc > longest)
                 longest = now - sc;
             ntids[i] = seen[i];
             nsince[i] = sc;
         }
-        memcpy(tids, ntids, (size_t)ns * sizeof tids[0]);
-        memcpy(since, nsince, (size_t)ns * sizeof since[0]);
-        nt = ns;
+        memcpy(st->tids, ntids, (size_t)ns * sizeof st->tids[0]);
+        memcpy(st->since, nsince, (size_t)ns * sizeof st->since[0]);
+        st->nt = ns;
     } else {
-        nt = 0;
+        st->nt = 0;
     }
+    return longest;
+}
+
+/* the server that runs now (server_pid); the one record of it, under dst_mu */
+static int64_t dstate_scan(void)
+{
+    static struct dst_state gst;
+    pthread_mutex_lock(&dst_mu);
+    int64_t longest = dst_sample(&gst, atomic_load(&server_pid)), now = now_ns();
     if (longest >= dstate_min_ns)
         atomic_store(&d_long_ns, now);
     pthread_mutex_unlock(&dst_mu);

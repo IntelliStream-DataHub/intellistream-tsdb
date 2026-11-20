@@ -26,6 +26,9 @@
 #                  exit 1 with "tsdbd: DIR: invalid argument" (a recovery bug of its own: no damage, no failure of the machine), exit 0, pause() for
 #                  ever before it listens, or a thread in D state for good (vfork whose child never execs: the kernel's stall) (round 14; VERIFY13
 #                  (A): the first three were a harness error, exit 2, "not a verdict about tsdb", under every nemesis but misdirect and rot)
+#   JV_OPENANY=blip:S  the same start sits in D state for S seconds, then pause()s for ever (round 15; VERIFY14: a stall that ended before the wait ran out
+#                  excused the hang as the environment); JV_OPENANY=wdbg-fhang with JV_OPENWHO=follower: the WRITER has a thread in D state for good
+#                  while the follower hangs at open (a writer's stall must not excuse the follower's hang)
 # and runs them through tests/jepsen/rerun.sh:
 #   crash under kill, pause, none, eio and power: exit 1 at the FIRST attempt (no "jepsen-rerun: attempt" line, never 0 or 3), naming the
 #     signal and the server's log;
@@ -51,6 +54,7 @@ cat > "$tmp/server/jv_hooks.h" <<'JVEOF'
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/prctl.h>
@@ -102,6 +106,16 @@ static void jv_openfail(void)
         _exit(1);
     }
 }
+static void *jv_dthread(void *a)
+{
+    (void)a;
+    if (vfork() == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        for (;;)
+            pause();
+    }
+    return NULL;
+}
 static void jv_openany(const char *dir)
 {
     static char cl[8192];
@@ -115,6 +129,16 @@ static void jv_openany(const char *dir)
         close(cfd);
     for (ssize_t i = 0; i < cn; i += (ssize_t)strlen(cl + i) + 1)
         fol = fol || !strcmp(cl + i, "--follow");
+    if (!strcmp(m, "wdbg-fhang")) { /* the writer has a thread in D state for good (the kernel's stall, in ITS process) while the follower hangs at open */
+        if (!fol) {
+            pthread_t th;
+            if (pthread_create(&th, NULL, jv_dthread, NULL) == 0)
+                pthread_detach(th);
+            return;
+        }
+        for (;;)
+            pause();
+    }
     bool aim = getenv("JV_OPENWHO") && !strcmp(getenv("JV_OPENWHO"), "follower") ? fol : !fol;
     if (!aim)
         return;
@@ -130,6 +154,16 @@ static void jv_openany(const char *dir)
     if (!strcmp(m, "hang"))
         for (;;)
             pause();
+    if (!strncmp(m, "blip:", 5)) { /* in D state for S seconds (a vfork whose child sleeps), then hangs for ever: a stall that ENDS before the wait does (round 15) */
+        if (vfork() == 0) {
+            struct timespec ts = {atoi(m + 5), 0};
+            prctl(PR_SET_PDEATHSIG, SIGKILL);
+            syscall(SYS_nanosleep, &ts, NULL);
+            _exit(0);
+        }
+        for (;;)
+            pause();
+    }
     if (!strcmp(m, "dstall") && vfork() == 0) {
         prctl(PR_SET_PDEATHSIG, SIGKILL);
         for (;;)
@@ -367,6 +401,19 @@ for mode in exit1 exit0 hang; do # the follower of the power nemesis
     run_case "openfol-$mode" "$pat" "a follower that fails at open ($mode), power nemesis" JV_OPENANY=$mode JV_OPENWHO=follower \
         JV_STARTCNT="$tmp/of-$mode.1" JV_ONCEFILE6="$tmp/of-$mode.2" JEPSEN_OPEN_WAIT_MS=10000 -- --nemesis power --seconds 12 --crashfs "$crashfs"
 done
+# a stall that ENDS before the wait runs out only lengthens the wait: a server that then hangs is a verdict (round 15; VERIFY14 finding 1: blip15
+# under every nemesis gave exit 2, "the environment"). D state for 6 s, with a wait of 10 s and D sampled from 1 s on.
+for nem in kill pause power; do
+    a=(--nemesis "$nem" --seconds 12); [ "$nem" = power ] && a+=(--crashfs "$crashfs")
+    want "openany-blip-$nem" && rm -f "$tmp/oa-blip-$nem".* && run_case "openany-blip-$nem" "$OH" \
+        "a server whose restart sits in D state for 6 s, then hangs before it listens, $nem nemesis" JV_OPENANY=blip:6 JV_STARTCNT="$tmp/oa-blip-$nem.1" \
+        JV_ONCEFILE6="$tmp/oa-blip-$nem.2" JEPSEN_OPEN_WAIT_MS=10000 JEPSEN_REQ_DEADLINE_S=12 -- "${a[@]}"
+done
+# the follower's own D state is looked at, not the writer's (VERIFY14 finding 2): a writer thread in D state for good does not excuse a follower
+# that hangs; a follower in D state for good is the kernel's (exit 2), never a violation
+want openfol-hang-wd && rm -f "$tmp/of-wd".* && run_case "openfol-hang-wd" "the follower (pid [0-9]*) is alive and wrote no port file in [0-9]* s, and the machine did not stall" \
+    "a follower that hangs at open while the writer has a thread in D state for good, power nemesis" JV_OPENANY=wdbg-fhang JV_OPENWHO=follower \
+    JV_STARTCNT="$tmp/of-wd.1" JV_ONCEFILE6="$tmp/of-wd.2" JEPSEN_OPEN_WAIT_MS=10000 JEPSEN_REQ_DEADLINE_S=12 -- --nemesis power --seconds 12 --crashfs "$crashfs"
 # MATRIX=1: the same three failures at open (exit 1 with no damage, exit 0, a hang) under EVERY configuration of the gate: the kill, pause, power,
 # eio, outage and no nemesis, each with the classes workload where it has one, misdirect with and without verify_checksums, rot, login, and the change
 # feed under kill, power and eio (round 14; VERIFY13's a-ox1-*, a-ox0-*, a-ohang-*: 17 configurations; not part of the selftest's default: about 20 minutes)
@@ -412,6 +459,23 @@ if want openany-dstall-kill; then
         echo "mutant-crash: openany-dstall-kill is a harness error (exit 2), not a violation, in $(($(date +%s) - t0)) s: a thread in D state for good at open"
     else
         echo "mutant-crash: openany-dstall-kill: a thread in D state for good at open was not a harness error (rc $st, wanted 2; left behind: ${left:-none})"
+        echo "$out" | tail -n 15
+        rc=1
+    fi
+    for p in $left; do kill -KILL "$p" 2>/dev/null; done
+fi
+# a follower in D state for good at open: the kernel's stall, exit 2 (never exit 1; VERIFY14: 7 of 7 were a false VIOLATION)
+if want openfol-dstall-power; then
+    rm -f "$tmp/of-ds".*
+    t0=$(date +%s)
+    out=$(JV_OPENANY=dstall JV_OPENWHO=follower JV_STARTCNT="$tmp/of-ds.1" JV_ONCEFILE6="$tmp/of-ds.2" JEPSEN_REQ_DEADLINE_S=12 JEPSEN_OPEN_WAIT_MS=5000 \
+        JEPSEN_TSDBD="$mut" timeout "${TMO:-200}" "$bin" --dir "$dir" --nemesis power --seconds 10 --crashfs "$crashfs" 2>&1); st=$?
+    left=$(leftover | tr '\n' ' ')
+    if [ $st -eq 2 ] && echo "$out" | grep -q 'the follower does not come up (see .*), and a thread of the server sat in D state' &&
+        ! echo "$out" | grep -q 'FAILED' && [ -z "$left" ]; then
+        echo "mutant-crash: openfol-dstall-power is a harness error (exit 2), not a violation, in $(($(date +%s) - t0)) s: a follower in D state for good at open"
+    else
+        echo "mutant-crash: openfol-dstall-power: a follower in D state for good at open was not a harness error (rc $st, wanted 2; left behind: ${left:-none})"
         echo "$out" | tail -n 15
         rc=1
     fi

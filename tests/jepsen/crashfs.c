@@ -142,6 +142,7 @@ typedef struct file {
     size_t nold, capold;
     unsigned tsave;  /* open(O_TRUNC) of a durable file: the id of the copy of what a power loss brings back (0: none), until the file is synced */
     off_t tsave_len; /* its length */
+    size_t tsave_ndops; /* how many directory operations there were when the truncation was made (CRASHFS_TEAR: a rename after it that survives takes it along) */
 } file;
 
 #define SECTOR 512
@@ -596,7 +597,11 @@ static bool keep_aside(const char *path, char *saved)
  * Until then a power loss may leave the truncation undone: the old content is back as it was durable (a copy, kept in the root
  * directory, made at the truncation: the durable prefix with the rewritten sectors put back, or zeroed in the harsher mode). With
  * CRASHFS_TEAR the new content may instead be what the loss leaves (a prefix of it, an empty file), as for any unsynced data.
- * Never an older state than the last sync, never a mix of old and new bytes that no disk leaves in the plain modes. */
+ * Never an older state than the last sync, never a mix of old and new bytes that no disk leaves in the plain modes. An open(O_TRUNC) that
+ * fails truncated nothing (the state before it is put back), and with CRASHFS_TEAR a rename of the file that survives after the truncation takes
+ * the truncation with it (the metadata operations of a journalled file system commit in order). Known gap: only the file's last rename is
+ * looked at; a chain of renames (tmp to a, a to b) with the first kept and the last not may bring the old content back. No tsdb path does it
+ * (every tmp is fsynced before its rename). */
 static unsigned tsave_counter;
 static void tsave_name(unsigned id, char *out)
 {
@@ -678,6 +683,7 @@ static void tsave_trunc(file *f, const char *path)
         if (len >= 0) {
             f->tsave = id;
             f->tsave_len = len;
+            f->tsave_ndops = ndops;
         }
     }
     f->durable = 0;
@@ -814,8 +820,21 @@ static void tear_dirops(void)
 }
 
 /* Rolls the tracked tree back to what was made durable. Called with the lock held. */
+/* CRASHFS_TEAR: a rename of the file (after its O_TRUNC) that reached the disk took the truncation, which came before it, along: a journalled file system
+ * commits its metadata operations in order, so the old content is not back in a file that was renamed over its target (round 15, VERIFY14: the
+ * old tmp's content in the target). Only the file's last rename is looked at (its current name is the destination). */
+static bool tsave_carried(const file *f)
+{
+    for (size_t i = f->tsave_ndops; i < ndops; i++)
+        if (dops[i].kind == OP_RENAME && dops[i].done && !strcmp(dops[i].b, f->path))
+            return true;
+    return false;
+}
+
 static void rollback(void)
 {
+    if (tear)
+        tear_dirops(); /* the survivors among the directory operations are known before the files are cut back */
     /* file data first, by each file's current name */
     for (size_t i = 0; i < nfiles; i++) {
         file *f = &files[i];
@@ -825,7 +844,7 @@ static void rollback(void)
         int fd = real_open(f->path, O_WRONLY);
         if (fd < 0)
             continue;
-        if (f->tsave && (!tear || urand() < 0.5)) { /* the truncation was never synced: undone (with CRASHFS_TEAR, or the new content torn) */
+        if (f->tsave && (!tear || (!tsave_carried(f) && urand() < 0.5))) { /* the truncation was never synced: undone (with CRASHFS_TEAR, or the new content torn) */
             tsave_restore(f, fd);
             real_close(fd);
             continue;
@@ -859,8 +878,6 @@ static void rollback(void)
         real_close(fd);
     }
     /* then directory entries, newest first */
-    if (tear)
-        tear_dirops();
     for (size_t i = ndops; i-- > 0;) {
         dirop *d = &dops[i];
         if (d->done)
@@ -1239,12 +1256,33 @@ static int do_open(int dirfd, const char *name, int flags, mode_t mode, bool at)
     maybe_crash();
     struct stat st;
     bool existed = stat(path, &st) == 0;
+    file *tf = NULL;
+    struct { /* what the file was before tsave_trunc: an open that FAILS truncated nothing (round 15, VERIFY14: EMFILE, EEXIST) */
+        unsigned tsave;
+        off_t tsave_len, durable;
+        size_t tsave_ndops;
+        int ndirty;
+        size_t nold;
+    } keep = {0, 0, 0, 0, 0, 0};
     if ((flags & O_TRUNC) && existed && S_ISREG(st.st_mode)) {
-        file *f = file_get(path, false);
-        if (f) /* the same file, truncated: not a removal and a new file (round 14), whatever O_CREAT says */
-            tsave_trunc(f, path);
+        tf = file_get(path, false);
+        if (tf) { /* the same file, truncated: not a removal and a new file (round 14), whatever O_CREAT says */
+            keep.tsave = tf->tsave, keep.tsave_len = tf->tsave_len, keep.tsave_ndops = tf->tsave_ndops;
+            keep.durable = tf->durable, keep.ndirty = tf->ndirty, keep.nold = tf->nold;
+            tsave_trunc(tf, path);
+        }
     }
     int fd = at ? real_openat(dirfd, name, flags, mode) : real_open(name, flags, mode);
+    if (fd < 0 && tf) {
+        if (tf->tsave != keep.tsave)
+            tsave_drop(tf); /* the copy this call made */
+        tf->tsave = keep.tsave;
+        tf->tsave_len = keep.tsave_len;
+        tf->tsave_ndops = keep.tsave_ndops;
+        tf->durable = keep.durable; /* dirty and old are kept as they were: tsave_trunc only set their counts to 0 */
+        tf->ndirty = keep.ndirty;
+        tf->nold = keep.nold;
+    }
     if (fd >= 0) {
         if ((flags & O_CREAT) && !existed) {
             add_dirop(OP_CREATE, path, NULL, NULL);

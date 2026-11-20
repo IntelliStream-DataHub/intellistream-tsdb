@@ -41,6 +41,13 @@
  *  - stale_fd:        a directory descriptor dup'ed, read and closed with closedir, a pipe made (its write end has that number), the
  *                     error armed (CRASHFS_MODE=eio, SIGUSR2): the write to the pipe succeeds, and the next write to a real file
  *                     is the one that fails with EIO. Run against liboutagefs.so too (a stale number of a failed volume would hang)
+ * and round 15 (VERIFY14: the shim forgot a file's durable image when the open(O_TRUNC) that was to truncate it FAILED, so the next power
+ * loss cut a file that a real disk keeps whole; and in CRASHFS_TEAR a rename could survive while the truncation of its source, which came
+ * before it, was undone):
+ *  - otrunc_fail_excl: a durable file of 1000 bytes, open(O_CREAT | O_EXCL | O_TRUNC) fails with EEXIST: after the loss it holds the 1000
+ *  - otrunc_emfile:    the same open fails with EMFILE (the descriptor limit): the 1000 bytes are still there
+ *  - tmp_rename_nosync: a durable leftover tmp of 1000 bytes opened O_TRUNC, 500 new bytes written, closed, renamed over a durable f of 300 bytes,
+ *                     nothing synced: f is the old 300 bytes or a prefix of the 500 new ones, never the OLD tmp content
  * Usage: test_crashfs_old LIBCRASHFS.so DIR [SEEDS]
  */
 #define _GNU_SOURCE
@@ -52,6 +59,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -262,6 +270,60 @@ static int child2(const char *kind, const char *dir)
         }
         wr(fd, CA + 100, 100);
         fsync(fd);
+    } else if (!strcmp(kind, "otrunc_fail_excl") || !strcmp(kind, "otrunc_emfile")) {
+        np(dir, "a", a);
+        int fd = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0)
+            return 2;
+        wr(fd, CA, 1000);
+        fsync(fd);
+        dsync(dir);
+        close(fd);
+        if (!strcmp(kind, "otrunc_fail_excl")) {
+            fd = open(a, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0644);
+            if (fd >= 0 || errno != EEXIST)
+                return 9; /* the open must fail, and truncate nothing */
+        } else {
+            struct rlimit old, lo;
+            getrlimit(RLIMIT_NOFILE, &old);
+            lo = old;
+            lo.rlim_cur = 64;
+            setrlimit(RLIMIT_NOFILE, &lo);
+            int held[80], nh = 0, x;
+            while (nh < 80 && (x = open("/dev/null", O_RDONLY)) >= 0)
+                held[nh++] = x;
+            fd = open(a, O_WRONLY | O_TRUNC);
+            int e = errno;
+            for (int i = 0; i < nh; i++)
+                close(held[i]);
+            setrlimit(RLIMIT_NOFILE, &old);
+            if (fd >= 0 || e != EMFILE)
+                return 9;
+        }
+    } else if (!strcmp(kind, "tmp_rename_nosync")) {
+        char t[4400];
+        np(dir, "t", t);
+        np(dir, "f", a);
+        int fd = open(t, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0)
+            return 2;
+        wr(fd, CA, 1000);
+        fsync(fd);
+        close(fd);
+        fd = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0)
+            return 2;
+        wr(fd, CA + 3000, 300);
+        fsync(fd);
+        close(fd);
+        dsync(dir);
+        fd = open(t, O_WRONLY | O_CREAT | O_TRUNC, 0644); /* tsdb's tmp pattern on a leftover tmp, without its fsync */
+        if (fd < 0)
+            return 2;
+        wr(fd, CB, 500);
+        close(fd);
+        if (rename(t, a) != 0)
+            return 2;
     } else if (!strncmp(kind, "otrunc_", 7) || !strcmp(kind, "unlink_nosync") || !strcmp(kind, "write_then_unlink")) {
         np(dir, "a", a);
         int fd;
@@ -466,6 +528,21 @@ static void run_case2(const char *so, const char *kind, const char *mode, const 
     long n;
     if (noloss)
         return;
+    if (!strcmp(kind, "otrunc_fail_excl") || !strcmp(kind, "otrunc_emfile")) {
+        np(dir, "a", p);
+        n = slurp(p, got, sizeof got);
+        CHECK(n == 1000 && memcmp(got, CA, 1000) == 0, "%s/%s seed %lu: a has %ld bytes: the open(O_TRUNC) that FAILED truncated nothing, so the durable 1000 "
+              "must be there (the shim forgot the durable image before the open ran?)", kind, mode, seed, n);
+        return;
+    }
+    if (!strcmp(kind, "tmp_rename_nosync")) {
+        np(dir, "f", p);
+        n = slurp(p, got, sizeof got);
+        bool oldf = n == 300 && memcmp(got, CA + 3000, 300) == 0, pre = n >= 0 && n <= 500 && memcmp(got, CB, (size_t)n) == 0;
+        CHECK(oldf || pre, "%s/%s seed %lu: f has %ld bytes that are neither the old 300 nor a prefix of the 500 new ones (%s)", kind, mode, seed, n,
+              n == 1000 ? "the OLD tmp content: the rename was kept and the truncation before it undone" : "?");
+        return;
+    }
     if (!strncmp(kind, "otrunc_", 7) || !strcmp(kind, "unlink_nosync") || !strcmp(kind, "write_then_unlink")) {
         np(dir, "a", p);
         n = slurp(p, got, sizeof got);
@@ -556,7 +633,8 @@ int main(int argc, char **argv)
                 }
             }
         static const char *k2[] = {"rename_sync", "rename_newfile", "maxdirty", "otrunc_sync", "otrunc_nocreat", "otrunc_pre", "otrunc_nosync",
-                                   "otrunc_dirsync", "otrunc_ident", "unlink_nosync", "write_then_unlink"};
+                                   "otrunc_dirsync", "otrunc_ident", "unlink_nosync", "write_then_unlink", "otrunc_fail_excl", "otrunc_emfile",
+                                   "tmp_rename_nosync"};
         static const char *m2[] = {"plain", "tear", "old", "zero"};
         for (int k = 0; k < (int)(sizeof k2 / sizeof k2[0]); k++)
             for (int m = 0; m < 4; m++) {
