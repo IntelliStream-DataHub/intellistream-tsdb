@@ -1821,6 +1821,12 @@ static void handle_stats_series(conn *c, req *r)
         return;
     }
     const tsdb_sid *ids = (const tsdb_sid *)(const void *)(p + 8); /* 8-aligned in the malloc'd payload */
+    if ((rc = route_ids(c, ids, n, true)) != 0) { /* before the rights, as in QUERY_MULTI: a replica's statistics of a
+                                                  * replicated volume are a read off the leader, and a remote id is
+                                                  * never judged through this server's names */
+        reply_status(c, r->id, rc);
+        return;
+    }
     tsdb_sid *own = NULL;
     uint8_t *denied = NULL;
     bool bounds = auth_all(&c->auth, R_READ); /* the error bounds of the hot lists: whoever reads everything */
@@ -2404,17 +2410,17 @@ static int route_away(uint32_t v, bool read, uint32_t *owner)
     return 1;
 }
 
-/* A request that names many series (packed and many-series inserts, QUERY_MULTI, QUERY_LATEST): 0 to serve it here,
- * else its answer (MOVED or UNAVAILABLE with rmv filled; INVALID when its volumes are led on two nodes). Ids that
- * name no volume are left to the gates after it. */
+/* A request that names many series (packed and many-series inserts, QUERY_MULTI, QUERY_LATEST, STATS_SERIES): 0 to
+ * serve it here, else its answer (MOVED or UNAVAILABLE with rmv filled; INVALID when its volumes are led on two
+ * nodes). Ids that name no volume are left to the gates after it. */
 static int32_t route_ids(conn *c, const tsdb_sid *ids, size_t n, bool read)
 {
     if (!cvol_active())
         return 0;
     struct {
         uint32_t v, key;
-    } seen[8];
-    size_t ns = 0;
+    } seen[64]; /* past 64 volumes in one frame a volume is decided again per row (route_away: two read locks) */
+    size_t ns = 0, last = 0;
     const uint32_t HERE = UINT32_MAX; /* no member id: ids are below it */
     uint32_t key = 0, kvol = 0, away = UINT32_MAX, self = route_copy() ? rt_cp->self : 0;
     for (size_t i = 0; i < n; i++) {
@@ -2422,11 +2428,12 @@ static int32_t route_ids(conn *c, const tsdb_sid *ids, size_t n, bool read)
         if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY)
             continue; /* the library refuses it (or a denied id, TSDB_SID_NONE) */
         uint32_t v = (uint32_t)TSDB_SID_VOLUME(id), k = 0;
-        size_t j = 0;
+        size_t j = last < ns && seen[last].v == v ? last : 0;
         while (j < ns && seen[j].v != v)
             j++;
         if (j < ns) {
             k = seen[j].key;
+            last = j;
         } else {
             uint32_t owner;
             int a = route_away(v, read, &owner);
@@ -2707,8 +2714,9 @@ static void handle(req *r)
 {
     lguard.on = lguard.checked = lguard.failed = false;
     lguard.ids = NULL;
+    rmv.on = false; /* per request, as lguard: no answer carries another request's route body */
     handle_in(r);
-    rmv.on = false; /* a handler's route_ids answer went out with its reply */
+    rmv.on = false; /* a handler's route_ids answer went out with its reply; lguard's below is its own */
     if (lguard.on && lguard.failed) { /* the lease lapsed before the snapshot: nothing went out, refused now */
         lguard.on = false;
         reply_error(r->c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
@@ -5049,7 +5057,7 @@ int main(int argc, char **argv)
     test_loop_stall = getenv("TSDBD_TEST_LOOP_STALL");
     test_read_stall = getenv("TSDBD_TEST_READ_STALL");
     test_route_moved = getenv("TSDBD_TEST_ROUTE_MOVED") ? atoi(getenv("TSDBD_TEST_ROUTE_MOVED")) : 0;
-    if (getenv("TSDB_ROUTE_MUTANT")) {
+    if (getenv("TSDB_ROUTE_MUTANT") && *getenv("TSDB_ROUTE_MUTANT")) { /* "" is unset (an exported empty name) */
         static const char *const names[] = {"",           "rightsbeforeroute", "movedoffcopy",
                                             "replicaread", "spanaccepted",      "nocopyserved"};
         for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)

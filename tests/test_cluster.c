@@ -4546,6 +4546,46 @@ static tsdbc *login_retry(int i, const char *user, const char *pw, int budget_ms
  * south and is moved, not DENIED, and an id outside the grant is still DENIED at the owner; a frame naming volumes
  * led on two servers is INVALID and writes nothing; a volume the copy has no record of is NO_OWNER, never an empty read.
  * Mutants (TSDB_ROUTE_MUTANT): rightsbeforeroute, movedoffcopy, replicaread, spanaccepted, nocopyserved. */
+static int count_series(void *ctx, const tsdb_series_result *r)
+{
+    (void)r;
+    ++*(int *)ctx;
+    return 0;
+}
+
+/* The requests that name many series by id, sent off the owner of `id`'s volume: QUERY_MULTI, QUERY_LATEST,
+ * STATS_SERIES and the unpacked many-series inserts (INSERT and INSERT_VALUES, compression off) are each MOVED to node
+ * `node` at server s, and none is answered here (route_ids in every handler, review F2, F3a-c) */
+static void moved_many(tsdbc *c, tsdb_sid id, uint32_t vol, uint32_t node, int s, const char *where)
+{
+    char what[160];
+    int got = 0;
+    tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = 0, .end = INT64_MAX / 2, .opts = {TSDB_ASC, 0}};
+    snprintf(what, sizeof what, "QUERY_MULTI %s", where);
+    expect_moved(c, tsdbc_query_multi(c, &q, &id, 1, NULL, count_series, &got), vol, node, s, what);
+    if (got != 0)
+        die("%s answered %d series before MOVED", what, got);
+    tsdb_latest_result lr;
+    snprintf(what, sizeof what, "QUERY_LATEST %s", where);
+    expect_moved(c, tsdbc_latest(c, &id, 1, NULL, &lr), vol, node, s, what);
+    tsdb_series_stat st;
+    snprintf(what, sizeof what, "STATS_SERIES %s", where);
+    expect_moved(c, tsdbc_series_stats(c, &id, 1, 0, &st), vol, node, s, what);
+    tsdb_sid two[2] = {id, id};
+    int64_t ts[2] = {5000, 6000};
+    float val[2] = {5, 6};
+    tsdb_values col = {TSDB_FLOAT32, val, NULL};
+    int rc;
+    if ((rc = tsdbc_set_compression(c, 0)) != 0)
+        die("compression off: %s", ers(rc));
+    snprintf(what, sizeof what, "an unpacked many-series INSERT %s", where);
+    expect_moved(c, tsdbc_insert(c, two, ts, val, 2), vol, node, s, what);
+    snprintf(what, sizeof what, "an unpacked many-series INSERT_VALUES %s", where);
+    expect_moved(c, tsdbc_insert_values(c, two, ts, &col, 2), vol, node, s, what);
+    if ((rc = tsdbc_set_compression(c, 1)) != 0)
+        die("compression on: %s", ers(rc));
+}
+
 static void scen_route(void)
 {
     scenario("route");
@@ -4627,6 +4667,7 @@ static void scen_route(void)
     expect_moved(c, tsdbc_series_at(c, "plant.b", "east", &x), num[0], v[0].leader, L, "a series by path on a replica");
     tsdb_sid two[2] = {id, id};
     expect_moved(c, tsdbc_insert(c, two, ts, val, 2), num[0], v[0].leader, L, "a packed write on a replica");
+    moved_many(c, id, num[0], v[0].leader, L, "on a replica");
     tsdbc_close(c);
     c = login_retry(R, "root", "root-pw", 20000);
     if ((rc = tsdbc_insert_series(c, id, ts + 1, val + 1, 1)) != 0)
@@ -4637,8 +4678,13 @@ static void scen_route(void)
     if (rows_of(c, id) != 2)
         die("the read through a replica, moved to the leader, has %d rows, not 2", nrows);
     status_id(c, v[0].leader, "STATUS after a read was moved");
+    tsdb_latest_result lr;
+    if ((rc = tsdbc_latest(c, &id, 1, NULL, &lr)) != 0 || lr.status != 0 || lr.ts != 2000)
+        die("QUERY_LATEST through a replica, moved to the leader: %s, status %d, ts %" PRId64 ", not 2000", ers(rc),
+            (int)lr.status, lr.ts);
     tsdbc_close(c);
-    printf("  a replica moves writes, reads, paths and packed frames to the leader; the client follows MOVED\n");
+    printf("  a replica moves writes, reads, paths, packed and many-series frames, QUERY_MULTI, QUERY_LATEST and "
+           "STATS_SERIES to the leader; the client follows MOVED\n");
 
     /* lone: no leader in the copy; its real leader serves it (led here), every other server answers NO_OWNER */
     int nl = LL == 0 ? 1 : 0;
@@ -4667,6 +4713,7 @@ static void scen_route(void)
     tsdbc_close(c);
     tsdbc *a = login_retry(to, "alice", "alice-pw", 0);
     expect_moved(a, tsdbc_insert_series(a, sid, ts, val, 1), num[2], v[2].leader, so, "alice's write off the owner");
+    moved_many(a, sid, num[2], v[2].leader, so, "by alice off the owner");
     tsdbc_close(a);
     a = login_retry(to, "alice", "alice-pw", 20000);
     if ((rc = tsdbc_insert_series(a, sid, ts, val, 1)) != 0)
@@ -4693,9 +4740,31 @@ static void scen_route(void)
         tsdbc_close(c);
         sa = L, sb = no, ia = id;
     }
-    if (sa < 0) {
-        printf("  (east, south and north are led on one server: no spanning check)\n");
-    } else {
+    /* placement is the metadata's: when east, south and north are led on one server, more volumes are made until
+     * one is led elsewhere (the check never skips itself: review F4) */
+    for (int k = 1; sa < 0 && k <= 6; k++) {
+        char nm[16];
+        uint32_t nn;
+        struct meta_volume w;
+        snprintf(nm, sizeof nm, "span%d", k);
+        if ((rc = vol_add(0, nm, 1, &nn)) != 0)
+            die("volume add %s: %s", nm, cluster_strerror(rc));
+        if (!vol_rec(0, nm, &w))
+            die("no record of %s", nm);
+        int ws = server_of(w.leader);
+        if (ws < 0)
+            die("%s is led by node %u, no server", nm, (unsigned)w.leader);
+        await_open_gen(0, nm, ws, 1, 0);
+        if (ws != L) {
+            c = login_retry(ws, "root", "root-pw", 0);
+            ib = rep_series(c, "plant.p", nm, 30000);
+            tsdbc_close(c);
+            sa = L, sb = ws, ia = id;
+        }
+    }
+    if (sa < 0)
+        die("east, south, north and six more volumes are all led on server %d: no spanning check", L);
+    {
         tsdb_sid span[2] = {ia, ib};
         int64_t sts[2] = {9000, 9000};
         for (int via = 0; via < 3; via++) {
