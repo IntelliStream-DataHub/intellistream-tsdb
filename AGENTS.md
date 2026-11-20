@@ -221,6 +221,14 @@ cgroup, so `nice` does not keep your work out of its way.
   (heal, repair, settle, attach, replace: rebuilt chunks are checked against the survivors' sums, written as new files at
   the object's epoch, never from fewer than k' positions, never for what `live` says is deleted; a new store gets every
   fence before its first chunk). `tests/test_chunk.c`, `tests/test_chunk_heal.c` (mutants in the Makefile).
+- `src/ecgc.c` (R7, r7-gc): the objects of retired `.ec` parts and orphans. A retired `.ec` keeps its `retired_` name
+  until every chunk of its object is deleted (`part_unref` leaves it: `ecgc_owns_name`); nothing is deleted while a part
+  of the object is referenced (holds in the tier, keyed (volume, oid)); the chunk I/O runs on the tier's worker, never
+  under an engine lock. The open sweeps (D6: after recovery, before any thread of the engine starts) the objects no
+  listed or retired name names, by file name only, reading one header per such object: only those whose header names
+  the volume's uuid are queued (another database on the same stores is left alone; `chunk_store_del` too refuses a
+  chunk of another vuuid as NOTFOUND). A test that puts objects named by no `.ec` file and reopens sets
+  `ecgc_test_nosweep` (test_seam, test_tier). `tests/test_ecgc.c` (mutants in the Makefile).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
@@ -550,7 +558,8 @@ cgroup, so `nice` does not keep your work out of its way.
   snapshots and lookups of the volume wait for those round trips), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
-  is a leaf, and so is the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
+  is a leaf, and so are the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O)
+  and the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
   sweeper takes `db->lock` only with it released). The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
   `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
   that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
