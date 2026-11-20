@@ -47,8 +47,10 @@
 #include "cvol.h"
 #include "replica.h"
 #include "ecpart.h"
+#include "eccache.h"
 #include "stats_priv.h"
 #include "tier.h"
+#include "settle.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -2241,6 +2243,62 @@ size_t tsdb_test_mark_ec(tsdb *t, unsigned flags,
         db_release(ps, n);
     }
     return marked;
+}
+
+/* test hook (tests/test_settle_oracle.c, stage 3): settles for real, with eng_settle, the parts of every open volume
+ * that pick names, the picked parts of one key in one call; *settled: how many turned .ec. Returns 0, or the first
+ * result of eng_settle that is not 0 or NOTFOUND (nothing of that key was left to settle). */
+int tsdb_test_settle(tsdb *t, bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
+                     void *ctx, size_t *settled)
+{
+    int first = 0;
+    *settled = 0;
+    for (size_t v = 0; v < t->nvols; v++) {
+        eng *e = t->vols[v];
+        size_t n;
+        part **ps;
+        if (!e || !(ps = db_snapshot(e, INT64_MIN, INT64_MAX, &n)))
+            continue;
+        part **sel = malloc((n ? n : 1) * sizeof *sel);
+        bool *done = calloc(n ? n : 1, sizeof *done);
+        if (!sel || !done) {
+            free(sel), free(done), db_release(ps, n);
+            return TSDB_ERR_NOMEM;
+        }
+        for (size_t k = 0; k < n; k++) {
+            if (done[k])
+                continue;
+            size_t m = 0;
+            for (size_t j = k; j < n; j++)
+                if (!done[j] && ps[j]->partition == ps[k]->partition) {
+                    done[j] = true;
+                    if (pick(ctx, (uint32_t)v, ps[j]->partition, ps[j]->level, ps[j]->rows))
+                        sel[m++] = ps[j];
+                }
+            size_t s = 0;
+            int rc = m ? eng_settle(e, ps[k]->partition, sel, m, &s) : 0;
+            *settled += s;
+            if (rc && rc != TSDB_ERR_NOTFOUND && !first)
+                first = rc;
+        }
+        free(sel), free(done);
+        db_release(ps, n);
+    }
+    return first;
+}
+
+/* test hook (tests/test_settle_oracle.c): the cache's count of granules read again as whole cells (their RAW bytes
+ * failed the crc: a damaged chunk was met); drop: empty the cache and close its objects first, so the next queries
+ * read the chunks */
+uint64_t tsdb_test_ec_retries(tsdb *t, bool drop)
+{
+    eccache_counters c = {0};
+    if (t->tier) {
+        if (drop)
+            eccache_test_drop(t->tier);
+        eccache_get_counters(t->tier, &c);
+    }
+    return c.retries;
 }
 
 /* ---------------------------------------------------------------- states */

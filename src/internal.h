@@ -2570,6 +2570,13 @@ void tsdb_test_granules(struct tsdb *t, void (*fn)(void *ctx, int cls, uint32_t 
 size_t tsdb_test_mark_ec(struct tsdb *t, unsigned flags,
                          bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
                          void *ctx);
+/* test hook (R7 stage 3, tests/test_settle_oracle.c): eng_settle of the parts pick names, key by key; *settled counts
+ * the parts that turned .ec; 0 or the first result that is not 0 or TSDB_ERR_NOTFOUND */
+int tsdb_test_settle(struct tsdb *t,
+                     bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
+                     void *ctx, size_t *settled);
+/* test hook (tests/test_settle_oracle.c): the tier cache's granules read again as whole cells; drop empties it first */
+uint64_t tsdb_test_ec_retries(struct tsdb *t, bool drop);
 
 int ret_open(eng *db, bool read_only);
 int ret_reload(eng *db);

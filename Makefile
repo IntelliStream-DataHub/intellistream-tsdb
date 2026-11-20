@@ -1010,7 +1010,7 @@ $(B)/test_ecnames: tests/test_ecnames.c src/internal.h $(R7_HDR) $(LIB)
 
 # settled answers equal unsettled answers bit for bit (R7, r7-oracle): two databases, one history, B settles some partitions;
 # every query kind is compared. make oracle-soak: ORACLE_SEEDS seeds of ORACLE_STEPS steps from ORACLE_FIRST (a failure names its seed)
-ORACLE_MUTANTS := skipdelete skipreplace skipretention nomark flipvalues flipagg flipgroup flipbounds flipspread fliptwa fliplttb fliplatest flipmulti flipstats
+ORACLE_MUTANTS := skipdelete skipreplace skipretention nomark flipvalues flipagg flipgroup flipbounds flipspread fliptwa fliplttb fliplatest flipmulti flipstats noretry rankdown
 ORACLE_SEEDS ?= 200
 ORACLE_STEPS ?= 150
 ORACLE_FIRST ?= 1000
