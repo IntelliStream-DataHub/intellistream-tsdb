@@ -53,15 +53,17 @@ for m in $muts; do
         out=$(env TSDB_SWAP_MUTANT=swapearly JEPSEN_TSDBD="$tsdbd" "$jepsen" --dir "$dir" --nemesis settle-steps \
             --crashfs "$crashfs" --seconds 40 --tier 3 2>&1); st=$?
         want='lost: final holds|final holds .* completed before|: stale$|: torn$|acknowledged before a read saw|^  final: series|^  final latest'
-        refused='does not come up.*(\.ec|settled_|txn_|intent)|cannot open.*(\.ec|settled_|txn_|intent)'
+        # jepsen says "does not come up" on one line and the server's log tail, which names the file, below it
+        refused='does not come up|cannot open'
+        named='^tsdb: .*(\.ec|settled_|txn_|intent)'
         ;;
     esac
-    if [ $m = swapearly ] && [ $st -eq 2 ] && echo "$out" | grep -Eq "$refused"; then
+    if [ $m = swapearly ] && [ $st -eq 2 ] && echo "$out" | grep -Eq "$refused" && echo "$out" | grep -Eq "$named"; then
         # a refused open: a catch only if the control comes up
         ctl=$(env JEPSEN_TSDBD="$tsdbd" "$jepsen" --dir "$dir" --nemesis settle-steps --crashfs "$crashfs" \
             --seconds 40 --tier 3 2>&1); cst=$?
         if [ $cst -eq 0 ]; then
-            echo "mutant-settle: $m caught: $(echo "$out" | grep -E "$refused" | head -n 1)"
+            echo "mutant-settle: $m caught: $(echo "$out" | grep -E "$named" | head -n 1)"
         else
             echo "mutant-settle: $m: the open refused, but the control without the mutant failed too (rc $cst): no catch"
             echo "$ctl" | tail -n 8; rc=1
