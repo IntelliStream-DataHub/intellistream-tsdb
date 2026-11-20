@@ -1293,7 +1293,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    env JEPSEN_CLIENT_NAP_MS=3000 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis none --seconds 12 --clients 2 || exit 1; \
 	tests/jepsen/expect.sh gate 'ran out of room for its history' \
 	    'clients that fill their history before the run ends (they stopped quietly, and the rest of the run tested nothing: round 14)' \
-	    env JEPSEN_MAX_OPS=1500 JEPSEN_OPS_PER_S=0 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis none --seconds 10 || exit 1; \
+	    env JEPSEN_MAX_OPS=1001 JEPSEN_OPS_PER_S=0 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis none --seconds 20 || exit 1; \
 	out=$$(JEPSEN_OPS_PER_S=400 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis none --seconds 10 2>&1); rc=$$?; \
 	    n=$$(echo "$$out" | sed -n 's/^jepsen none: .*; writes \([0-9]*\) ok .*reads \([0-9]*\) ok;.*/\1 \2/p' | awk '{print $$1+$$2}'); \
 	    if [ $$rc -ne 0 ] || [ -z "$$n" ] || [ "$$n" -gt 6000 ] || [ "$$n" -lt 400 ]; then \
