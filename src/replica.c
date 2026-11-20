@@ -42,6 +42,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 typedef struct rseg {
@@ -85,10 +86,13 @@ struct replica {
     uint64_t epoch, epoch_pos; /* the newest EPOCH marker applied (0: none): its epoch and position */
     _Atomic uint64_t floor_saved;
     _Atomic int64_t now_ms; /* the replicated retention clock: the newest commit_ms / NOW applied, never the wall clock */
-    struct {
-        uint64_t seq, fno_end;
+    struct unlseg {
+        uint64_t seq, fno_end, bytes, ms; /* ms: CLOCK_MONOTONIC when it was flushed (or found at the open) */
     } *unl; /* flushed segments not yet unlinked, ascending (unl_mu) */
     size_t nunl, capunl;
+    /* the retention caps (replica_keep_cap; design-cluster.md 8.3): unset, a segment goes once the floor passes it */
+    _Atomic bool keep_set;
+    _Atomic uint64_t keep_bytes, keep_ms;
     int rfd; /* the segment the cursor reads (-1: none) */
     uint64_t rfd_seq;
     uint8_t *rbuf;
@@ -200,8 +204,19 @@ static void rfd_close(struct replica *rp)
 
 /* ------------------------------------------------------------------- open */
 
+/* The caps for the replica the next eng_open_replica on this thread opens (the driver's, from the volume's settings):
+ * its open replays and flushes the segments it finds, and they must not go by the floor alone before the driver's
+ * first save sets the caps (a deposed writer reopened as a replica lost the segments a laggard needed that way) */
+static __thread struct {
+    bool set;
+    uint64_t bytes, ms;
+} keep_next;
+
 int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
 {
+    bool keep_set = keep_next.set;
+    uint64_t keep_b = keep_next.bytes, keep_ms = keep_next.ms;
+    keep_next.set = false; /* one open only, failed or not */
     if (db->feed_req || atomic_load(&db->feed_on)) {
         /* a retained segment (fwal_) is kept for the feed instead of unlinked: the replica unlinks flushed segments and
          * ignores fwal_ names in its numbering, which would break that invariant silently. Not designed yet. */
@@ -217,6 +232,9 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     pthread_mutex_init(&rp->stage_mu, NULL);
     pthread_mutex_init(&rp->apply_mu, NULL);
     rp->rfd = -1;
+    atomic_store(&rp->keep_bytes, keep_b);
+    atomic_store(&rp->keep_ms, keep_ms);
+    atomic_store(&rp->keep_set, keep_set);
     db->rp = rp; /* from here wal_check_segment lets rows name series that SERIES does not hold yet */
 
     wal_seg *segs = NULL;
@@ -466,19 +484,64 @@ int replica_flush(eng *db)
     return rc;
 }
 
-/* Unlinks the flushed segments whose last position is at or below the saved floor (flush_lock held). */
+static uint64_t unl_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+void replica_keep_next(uint64_t max_bytes, uint64_t max_ms)
+{
+    keep_next.set = true;
+    keep_next.bytes = max_bytes;
+    keep_next.ms = max_ms;
+}
+
+void replica_keep_cap(eng *db, uint64_t max_bytes, uint64_t max_ms)
+{
+    struct replica *rp = db->rp;
+    if (!rp)
+        return;
+    atomic_store(&rp->keep_bytes, max_bytes);
+    atomic_store(&rp->keep_ms, max_ms);
+    atomic_store(&rp->keep_set, true);
+}
+
+/* The last position the caps let go (unl_mu held): counted from the newest flushed segment back, as a leader counts
+ * its kept ones (lk_cap_bound), so what goes is always a prefix of unl[]; 0: none. Without caps every flushed segment
+ * goes once the floor passes it, the rule before failover (a replica that never leads keeps nothing for others). */
+static uint64_t unl_cap_bound(struct replica *rp)
+{
+    uint64_t maxb = atomic_load(&rp->keep_bytes), maxms = atomic_load(&rp->keep_ms);
+    if (!atomic_load(&rp->keep_set) || (!maxb && !maxms) || eng_test_mutant == MUT_REPLICA_KEEP_FLOOR)
+        return UINT64_MAX - 1; /* planted (replicadropsfloor): the floor alone again */
+    uint64_t now = unl_now_ms(), sum = 0;
+    for (size_t i = rp->nunl; i-- > 0;) {
+        sum += rp->unl[i].bytes;
+        if ((maxb && sum > maxb) || (maxms && now > rp->unl[i].ms && now - rp->unl[i].ms > maxms))
+            return rp->unl[i].fno_end - 1;
+    }
+    return 0;
+}
+
+/* Unlinks the flushed segments whose last position is at or below the saved floor and that the retention caps let go
+ * (flush_lock held). A replica keeps its sealed segments under the same caps as a leader (design-cluster.md 8.3): once
+ * a failover promotes it, it is the catch-up source of every member that lags it, and a member whose next record went
+ * with a segment needs a snapshot. Never past the floor: a segment above it may hold records a new leader cuts. */
 static void unlink_due(eng *db)
 {
     struct replica *rp = db->rp;
     uint64_t floor = atomic_load(&rp->floor_saved);
     if (eng_test_mutant == MUT_REPLICA_NO_FLOOR) /* planted: a segment goes before the floor is saved */
         floor = UINT64_MAX - 1;
-    uint64_t seqs[64];
+    struct unlseg seqs[64];
     for (;;) {
         size_t n = 0;
         pthread_mutex_lock(&rp->unl_mu);
-        while (n < rp->nunl && n < 64 && rp->unl[n].fno_end - 1 <= floor)
-            seqs[n] = rp->unl[n].seq, n++;
+        uint64_t bound = MIN(floor, unl_cap_bound(rp));
+        while (n < rp->nunl && n < 64 && rp->unl[n].fno_end - 1 <= bound)
+            seqs[n] = rp->unl[n], n++;
         if (n > 0) { /* rp->unl is NULL while the list was never used: memmove(NULL, ...) is undefined */
             memmove(rp->unl, rp->unl + n, (rp->nunl - n) * sizeof *rp->unl);
             rp->nunl -= n;
@@ -489,7 +552,7 @@ static void unlink_due(eng *db)
         size_t done = 0;
         for (; done < n; done++) {
             char name[64];
-            wal_name(name, sizeof name, seqs[done]);
+            wal_name(name, sizeof name, seqs[done].seq);
             if (unlinkat(db->dirfd, name, 0) != 0 && errno != ENOENT) {
                 fprintf(stderr, "tsdb: removing %s failed (%s): it stays until a later flush removes it\n", name,
                         strerror(errno));
@@ -509,10 +572,8 @@ static void unlink_due(eng *db)
                 rp->capunl = c;
             }
             memmove(rp->unl + (n - done), rp->unl, rp->nunl * sizeof *rp->unl);
-            for (size_t i = done; i < n; i++) {
-                rp->unl[i - done].seq = seqs[i];
-                rp->unl[i - done].fno_end = floor + 1; /* due: below the floor already */
-            }
+            for (size_t i = done; i < n; i++)
+                rp->unl[i - done] = seqs[i]; /* due again at the next call: the bound only grows */
             rp->nunl += n - done;
             pthread_mutex_unlock(&rp->unl_mu);
         }
@@ -523,14 +584,14 @@ static void unlink_due(eng *db)
         for (size_t i = 0; i < rp->nsegs; i++) {
             bool gone = false;
             for (size_t j = 0; j < done; j++)
-                gone |= rp->segs[i].seq == seqs[j];
+                gone |= rp->segs[i].seq == seqs[j].seq;
             if (!gone)
                 rp->segs[keep++] = rp->segs[i];
         }
         rp->nsegs = keep;
         pthread_mutex_unlock(&rp->segs_mu);
         pthread_mutex_lock(&db->lock);
-        db->wal_removed = MAX(db->wal_removed, seqs[done - 1]);
+        db->wal_removed = MAX(db->wal_removed, seqs[done - 1].seq);
         pthread_mutex_unlock(&db->lock);
         eng_sync_dir(db, "fsync of the directory after removing WAL segments"); /* fails the engine itself */
         if (done < n)
@@ -552,9 +613,11 @@ void replica_flushed(eng *db, uint64_t seq, uint64_t fno_end)
         rp->unl = p;
         rp->capunl = c;
     }
-    rp->unl[rp->nunl].seq = seq;
-    rp->unl[rp->nunl].fno_end = fno_end;
-    rp->nunl++;
+    char name[64];
+    struct stat st;
+    wal_name(name, sizeof name, seq);
+    uint64_t bytes = fstatat(db->dirfd, name, &st, 0) == 0 ? (uint64_t)st.st_size : 0; /* gone: nothing to count */
+    rp->unl[rp->nunl++] = (struct unlseg){seq, fno_end, bytes, unl_now_ms()};
     pthread_mutex_unlock(&rp->unl_mu);
     unlink_due(db);
 }

@@ -474,6 +474,85 @@ static void case_basic(void)
     leader_free(&l);
 }
 
+/* A replica keeps its flushed segments under the retention caps, past its floor (design-cluster.md 8.3): a failover
+ * may promote it, and a member that lags it catches up from them or needs a snapshot (jepsen-cluster, r3e: a deposed
+ * writer reopened as a replica dropped what a killed member needed next). The caps count from the newest flushed segment
+ * back; an open with the caps (replica_keep_next) keeps what it replays and flushes; without caps the floor alone
+ * decides, as before. Mutant replicadropsfloor (the floor alone again). */
+static void case_keepcap(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "kc");
+    leader l;
+    unsigned rng = 7;
+    leader_init(&l);
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 4; i++)
+            leader_rows(&l, 3 + s, &rng);
+        leader_roll(&l);
+    }
+    for (int i = 0; i < 2; i++)
+        leader_rows(&l, 2, &rng);
+    uint64_t end = l.r[l.n - 1].last;
+    eng *db;
+    replica_keep_next(0, 3600 * 1000); /* an hour, no byte cap */
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, end), 0);
+    CHECK_EQ(mt_flush(db), 0);
+    CHECK_EQ(replica_floor_saved(db, end), 0);
+    CHECK_EQ(count_files(dir, "wal_"), 4); /* three flushed ones within the caps, and the active one */
+    model m;
+    model_at(&l, end, &m);
+    CHECK(same_as(db, &m, "keepcap: kept"));
+    /* reopened with the caps: what the open replays and flushes stays */
+    CHECK_EQ(eng_close(db), 0);
+    replica_keep_next(0, 3600 * 1000);
+    CHECK_EQ(open_replica(dir, end, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(mt_flush(db), 0);
+    CHECK_EQ(replica_floor_saved(db, end), 0);
+    CHECK_EQ(count_files(dir, "wal_"), 4);
+    CHECK(same_as(db, &m, "keepcap: reopened"));
+    /* the byte cap counts from the newest flushed segment back: exactly its size keeps it alone */
+    char name[64];
+    struct stat st;
+    wal_name(name, sizeof name, l.r[l.n - 1].seq - 1);
+    CHECK_EQ(fstatat(db->dirfd, name, &st, 0), 0);
+    replica_keep_cap(db, (uint64_t)st.st_size, 0);
+    CHECK_EQ(replica_floor_saved(db, end), 0);
+    CHECK_EQ(count_files(dir, "wal_"), 2);
+    CHECK_EQ(fstatat(db->dirfd, name, &st, 0), 0);
+    /* the age cap: past it every flushed segment goes */
+    replica_keep_cap(db, 0, 1);
+    usleep(5000);
+    CHECK_EQ(replica_floor_saved(db, end), 0);
+    CHECK_EQ(count_files(dir, "wal_"), 1);
+    CHECK(same_as(db, &m, "keepcap: capped"));
+    CHECK_EQ(eng_close(db), 0);
+    /* never past the floor, whatever the caps say */
+    char dir2[PATH_MAX];
+    fresh(dir2, "kc2");
+    replica_keep_next(1, 1);
+    CHECK_EQ(open_replica(dir2, 0, &db), 0);
+    if (db) {
+        CHECK_EQ(feed(db, &l, 0, l.n), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(replica_apply(db, end), 0);
+        CHECK_EQ(mt_flush(db), 0);
+        usleep(5000);
+        CHECK_EQ(replica_floor_saved(db, l.r[0].last), 0);
+        CHECK_EQ(count_files(dir2, "wal_"), 4); /* the first segment ends above that floor */
+        CHECK_EQ(eng_close(db), 0);
+    }
+    leader_free(&l);
+    sh("rm -rf '%s' '%s'", dir, dir2);
+}
+
 /* ------------------------------------------------------------ read */
 
 /* the sender's side: the log read back in chunks gives exactly the bytes that were appended, at every chunk size and
@@ -5952,6 +6031,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "nowtailfrom") == 0 ? MUT_LEADER_NO_WTAIL_FROM
                         : strcmp(m, "markersplit") == 0 ? MUT_LEADER_MARKERS_SPLIT
                         : strcmp(m, "switchunattached") == 0 ? MUT_LEADER_SWITCH_UNATTACHED
+                        : strcmp(m, "replicadropsfloor") == 0 ? MUT_REPLICA_KEEP_FLOOR
                         : strcmp(m, "droppedglobal") == 0 ? MUT_DROPPED_GLOBAL
                         : strcmp(m, "wtailnocap") == 0 ? MUT_WTAIL_NOCAP
                         : strcmp(m, "nocutoff") == 0 ? MUT_LEADER_NO_CUTOFF
@@ -6293,6 +6373,7 @@ int main(int argc, char **argv)
         return failures != 0;
     }
     case_basic();
+    case_keepcap();
     case_cut();
     case_cut_publish();
     case_refused();

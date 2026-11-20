@@ -1056,6 +1056,25 @@ commit floor (the one in REPL, not the one in memory), and records its new log s
 position the leader no longer retains is told to install a snapshot (§8.1). A segment deleted above the saved floor
 could leave a replica that restarts unable to rebuild what it had applied.
 
+*Built in R3 (r3e-failover, 2026-11-20): replicas retain too.* A replica used to unlink a flushed segment as soon as
+its saved floor passed it. After a failover the promoted member is the only source of what a lagging member still
+needs, and it had kept nothing below its floor: in jepsen-cluster a deposed writer, reopened as a replica and promoted
+again, had dropped the records a killed member needed next, which then stayed a learner ("needs a snapshot") with the
+ISR short of it. Now a replica keeps its flushed segments under the same caps as a leader (`replica_keep_cap`, the
+volume's `repl_retain_mb` and `repl_retain_s`, counted from the newest flushed segment back): a segment goes once the
+saved floor passes it **and** the caps let it go, never above the floor. The driver gives the caps to every replica
+open (`replica_keep_next`: a demotion's and a restart's open replay and flush the segments they find, which must not
+go by the floor alone before the driver's first save) and again at every floor save. Both caps zero, or a replica
+opened without a driver (tests), keeps the old rule (a replica has no keep bound of its own to wait for, so "no cap"
+would be "forever"). A promotion keeps every segment still on disk (RSTATE `kept`), so a member that lags the new
+leader by less than the caps catches up from it; one past the caps still needs the snapshot of R4.
+Not done: a replica's flushed segments are not named in RSTATE `kept`, so a replica's open still replays them
+(rows a part of their segment holds are skipped per partition, DROPs by RSTATE's `drops`, which are kept while a
+retained segment lies behind them) and reads up to the caps at every open; and the replay floor (5.4) is the members'
+log start, which now lies up to the caps back, so a new leader's class switches wait (CLS_DEFER) until its members'
+retained segments pass its attach: up to `repl_retain_s` after a failover. Naming them in `kept` and reporting a replay
+start separate from the log start would end both. `test_replica keepcap` (mutant `replicadropsfloor`).
+
 ### 8.4 Priorities
 
 Rebuilds run in this order: volumes whose ISR has 1 member, then volumes with 2, then moves for balance. A rebuild

@@ -1490,7 +1490,9 @@ static void exec(struct rvol *rv, struct repl_action *a)
             eng_leader_keep_floor(db, keep, floor);
             pthread_mutex_lock(&rv->mu);
         } else if (a->floor) {
+            uint64_t capb = (uint64_t)rv->rec.repl_retain_mb << 20, capms = (uint64_t)rv->rec.repl_retain_s * 1000;
             pthread_mutex_unlock(&rv->mu);
+            replica_keep_cap(db, capb, capms); /* the settings may have changed since the open */
             rc = G.mutant == RM_FLOORNOTTOLD ? 0 : replica_floor_saved(db, a->floor);
             pthread_mutex_lock(&rv->mu);
         }
@@ -1876,6 +1878,17 @@ static void commit_watch(struct rvol *rv, uint64_t now)
 
 static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struct repl **core_out);
 
+/* The caps of the replica the next open on this thread makes (replica_keep_next): its open flushes the segments it
+ * replays, and a deposed writer's or a restarted replica's must stay for the members that lag it (design-cluster.md
+ * 8.3), not go by the floor before the first save sets the caps */
+static void replica_caps_next(struct rvol *rv)
+{
+    pthread_mutex_lock(&rv->mu);
+    uint64_t capb = (uint64_t)rv->rec.repl_retain_mb << 20, capms = (uint64_t)rv->rec.repl_retain_s * 1000;
+    pthread_mutex_unlock(&rv->mu);
+    replica_keep_next(capb, capms);
+}
+
 static void demote_between(void) { crash_point(CP_DEPOSE_BEFORE_REOPEN); }
 
 static int demote_fn(void *ctx, struct eng **old, struct eng **neu)
@@ -1917,6 +1930,7 @@ static void demote(struct rvol *rv)
     pthread_mutex_unlock(&rv->mu);
     repl_free(old);
     uint64_t t0 = now_ms();
+    replica_caps_next(rv);
     int rc = tsdb_cvol_replace(G.t, rv->number, demote_fn, &floor, CVOL_REPLICA);
     struct repl *core = NULL;
     uint64_t log_end = 0;
@@ -2301,6 +2315,7 @@ int repld_open(const struct cluster_vol_rec *r)
         rc = TSDB_ERR_NOMEM;
         goto fail;
     }
+    replica_caps_next(rv);
     rc = tsdb_cvol_open(G.t, r->number, rv->dir, true, rv->st.floor);
     if (rc != 0) {
         say("volume %" PRIu32 ": the open of %s failed: %s", r->number, rv->dir, tsdb_strerror(rc));

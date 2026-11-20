@@ -38,6 +38,13 @@ int replica_apply(struct eng *db, uint64_t commit);
 /* The driver saved the commit floor `floor` (>= every floor before): segments at or below it that are in parts are
  * unlinked. Never called with a floor above the applied end. */
 int replica_floor_saved(struct eng *db, uint64_t floor);
+/* The retention caps of a replica's flushed segments (design-cluster.md 8.3, the volume's repl_retain_mb and
+ * repl_retain_s): a segment at or below the saved floor stays while the segments from it to the newest flushed one hold
+ * at most max_bytes and it was flushed at most max_ms ago (a zero cap is not used), so that a member a failover promotes
+ * can still send it to a lagging member. Both zero, or never set: a segment goes once the floor passes it.
+ * replica_keep_next sets them for the next eng_open_replica on this thread (its open flushes what it replays). */
+void replica_keep_cap(struct eng *db, uint64_t max_bytes, uint64_t max_ms);
+void replica_keep_next(uint64_t max_bytes, uint64_t max_ms);
 /* Cuts the log after position `last` (a record end, or 0): the segment that holds it is truncated there, later
  * segments are removed, the cut is durable before it returns. TSDB_ERR_CORRUPT (nothing changed) when `last` is below
  * the applied end (the core never asks: damage or a bug) or is not a record end. */
