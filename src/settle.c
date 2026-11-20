@@ -606,6 +606,10 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
         atomic_fetch_add(&settle_done, 1);
         if (settled)
             *settled = np;
+        /* one line per settle (a key at rest settles once; the eager policy caps itself a minute): operators see what
+         * moved to the tier, and jepsen's tier_check counts these lines ("settled ", JEPSEN_SETTLE_LINE) */
+        fprintf(stderr, "tsdb: %s: settled %zu part%s of partition %lld into the tier\n", db->dir, np,
+                np == 1 ? "" : "s", (long long)partition);
     } else if (rc == TSDB_ERR_STOPPED) {
         atomic_fetch_add(&settle_abandoned, 1);
     } else if (rc != TSDB_ERR_NOTFOUND) {
