@@ -76,7 +76,7 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_LINK_BY_NAME, MUT_LEADER_RS_NO_PRUNE, MUT_LEADER_RS_PRUNE_ALL, MUT_LEADER_NOTE_LATE,
        MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU,
        MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED,
-       MUT_LEADER_SWITCH_UNATTACHED, MUT_REPLICA_KEEP_FLOOR };
+       MUT_LEADER_SWITCH_UNATTACHED, MUT_REPLICA_KEEP_FLOOR, MUT_REPLICA_DROP_APPLIED_FILES };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1591,7 +1591,7 @@ int eng_leader_file_open(struct eng *db, uint64_t pos, const char *name);
 /* replica.c: the links of the files of COMMIT markers whose position is below fno_end go (their segment went;
  * flush_lock held); every stage_ file goes (eng_leader_attach: a writer keeps no stage of its own) */
 void leader_links_drop(struct eng *db, uint64_t fno_end);
-void leader_links_sweep(struct eng *db);
+void leader_links_sweep(struct eng *db, bool stages);
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
@@ -1949,7 +1949,9 @@ struct eng {
     uint64_t lk_failed;          /* the kept segment whose removal failed last (its message is printed once) */
     struct lkfile {
         uint64_t fno, key;
-    } *lf;                       /* with jr: the stage_ links of COMMIT markers in the log (leader_commit; lead_mu) */
+        bool keep; /* keep_<fno>_<key>.part: a committed marker's file, kept with its segment; else stage_<key>.part */
+    } *lf; /* the files of COMMIT markers in retained segments (lead_mu): with jr the stage_ links of this leadership's
+            * (leader_commit) and the keep_ files found at the attach; on a replica its keep_ files (replica.c) */
     size_t nlf, caplf, rlf;      /* rlf: entries of lf reserved by COMMITs about to append their marker (lead_mu) */
     uint64_t lrd_seq, lrd_off, lrd_next; /* where the last read of the log by position ended (replica_read; lead_mu) */
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */

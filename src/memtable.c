@@ -1023,8 +1023,8 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
     int rc = db->lrs ? 0 : leader_rs_open(db); /* RSTATE before the first marker */
     if (rc)
         return rc;
-    if (eng_test_mutant != MUT_LEADER_NO_SWEEP)
-        leader_links_sweep(db); /* an earlier leadership's links, or a promoted replica's stages: no marker here needs them */
+    /* an earlier leadership's links, or a promoted replica's stages: no marker here needs them; keep_ files are served */
+    leader_links_sweep(db, eng_test_mutant != MUT_LEADER_NO_SWEEP);
     pthread_mutex_lock(&db->lock); /* rows of positions below the log end at the attach are in no wtail entry */
     pthread_mutex_lock(&db->buf_lock);
     db->wtail_from = MAX(db->wtail_from, db->fno_next);

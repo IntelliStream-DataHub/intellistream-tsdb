@@ -395,6 +395,9 @@ cgroup, so `nice` does not keep your work out of its way.
   A replica keeps its flushed segments as well, past its saved commit floor, under the same caps (`replica_keep_cap`,
   `replica_keep_next` before its open; `unl_cap_bound` counts from the newest back), so that, promoted, it can serve a
   member that was away (`test_cluster failoverkeep`, mutant `replicadropsfloor`); never one above the floor.
+  The files of the committed COMMIT markers in kept segments stay with them on every member as `keep_<pos>_<key>.part`
+  (a replica's apply and open rename the stage_ file; a leader serves them from its attach, by position, never by name
+  alone; `test_replica keepfiles`, mutant `replicadropsfiles`).
   Kept segments (a leader's flushed ones, a promoted replica's) are named in RSTATE (`kept`, saved before a drop can
   take their rows out of parts): a writer's open neither replays nor removes a segment at or below it.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never

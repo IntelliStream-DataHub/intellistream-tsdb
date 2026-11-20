@@ -1074,6 +1074,18 @@ retained segment lies behind them) and reads up to the caps at every open; and t
 log start, which now lies up to the caps back, so a new leader's class switches wait (CLS_DEFER) until its members'
 retained segments pass its attach: up to `repl_retain_s` after a failover. Naming them in `kept` and reporting a replay
 start separate from the log start would end both. `test_replica keepcap` (mutant `replicadropsfloor`).
+The files of COMMIT markers go the same way (jepsen-cluster meta,classes power, finding A2: a member that had led an
+earlier epoch was promoted again and answered "needs a snapshot" for the files of its own earlier markers, because the
+leader's links (5.2, M4) were per leadership and in memory, a replica removed a COMMIT's staged files once applied and
+a deposed leader's open removed its links as orphans). Every member now keeps the files of a committed marker as
+`keep_<position>_<key>.part` for as long as the segment that holds the marker: a replica renames a staged file to that
+name when its marker is applied, a replica's open (a deposed leader's included) renames the stage_ files of markers at
+or below RSTATE's `done` that match what the marker names, and the files go with their segment (`unlink_due`,
+`leader_unlink_due`). At the attach a leader serves the keep_ files it finds by position and key; the position in the
+name is what keeps r3a2 R5 (a file of an earlier leadership is never served for a later marker that names the same
+key). A replica's open also hands the segments it finds wholly in parts and applied to the same rule (before, a deposed
+writer's kept segments stayed until a promotion). `test_replica keepfiles` (mutant `replicadropsfiles`, also
+`TSDB_REPLD_MUTANT=replicadropsfiles` in tsdbd).
 
 ### 8.4 Priorities
 

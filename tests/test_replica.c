@@ -5979,6 +5979,99 @@ static void case_link_sweep(void)
     printf("  a leader's attach removes the stage_ links of an earlier leadership\n");
 }
 
+/* names in dir that start with `prefix` */
+static int count_named(const char *dir, const char *prefix)
+{
+    DIR *d = opendir(dir);
+    int n = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)))
+        n += strncmp(e->d_name, prefix, strlen(prefix)) == 0;
+    if (d)
+        closedir(d);
+    return n;
+}
+
+/* r3e finding A2 (jepsen-cluster meta,classes power): a member promoted after a failover serves a laggard the files of
+ * the COMMIT markers in its retained segments, which an earlier leadership wrote (this member's own as the leader before
+ * it was deposed, or ones it applied as a replica): every member keeps a committed marker's files as
+ * keep_<pos>_<key>.part as long as the segment that holds the marker (mutant replicadropsfiles: the old rule, a replica
+ * removed them at the apply and a deposed leader at its reopen, and the promoted member answered "needs a snapshot"). */
+static void case_keep_files(void)
+{
+    xport x;
+    char rd[PATH_MAX], kp[64];
+    xp_start(&x, "kfiles");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 40, 1000); /* a large insert: a COMMIT */
+    xp_step(&x, "KF: commit");
+    xp_rows(&x, 1, 0, 5, 50);
+    CHECK_EQ(eng_flush(x.ld), 0); /* the marker's segment ends: it can go once the floor or the bound passes it */
+    xp_step(&x, "KF: flushed");
+    char n1[64];
+    snprintf(n1, sizeof n1, "%s", x.held_name);
+    const uint64_t p1 = x.ld->nlf ? x.ld->lf[x.ld->nlf - 1].fno : 0;
+    CHECK(p1 != 0);
+    uint8_t *h1 = malloc(x.held_len);
+    size_t l1 = x.held_len;
+    if (!h1)
+        exit(2);
+    memcpy(h1, x.held, l1);
+    snprintf(kp, sizeof kp, "keep_%016" PRIx64 "_", p1);
+    int nk = count_named(rd, kp);
+    if (nk != 1)
+        fprintf(stderr, "KF: the replica keeps %d files of the applied marker at %" PRIu64 " (mutant replicadropsfiles)\n",
+                nk, p1);
+    CHECK_EQ(nk, 1);
+    CHECK_EQ(count_named(rd, "stage_"), 0); /* the stage_ name is free for the next marker naming the same key */
+    xp_reopen(&x, rd, replica_applied_end(x.rep));
+    replica_keep_cap(x.rep, 1 << 30, 3600000); /* the driver's caps: without them a segment goes at the floor */
+    CHECK_EQ(count_named(rd, kp), 1); /* its segment is still here */
+    /* the old leader, deposed, reopens as a replica: its own committed marker's link becomes a keep_ file */
+    xp_rows(&x, 1, 10, 5, 60); /* in the next segment */
+    xp_step(&x, "KF: small rows");
+    uint64_t end = ld_last(&x);
+    eng_close(x.ld);
+    x.ld = NULL;
+    eng *old = NULL;
+    CHECK_EQ(open_replica(x.ldir, end, &old), 0);
+    nk = count_named(x.ldir, kp);
+    if (nk != 1)
+        fprintf(stderr, "KF: the deposed leader keeps %d files of its marker at %" PRIu64 " (mutant replicadropsfiles)\n",
+                nk, p1);
+    CHECK_EQ(nk, 1);
+    CHECK_EQ(count_named(x.ldir, "stage_"), 0);
+    /* the replica is promoted: it serves the marker's file from the attach on */
+    uint64_t pos = 0;
+    eng *n = NULL;
+    CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), 0);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    CHECK_EQ(replica_promote(&x.rep, pos, &n), 0);
+    if (!n)
+        exit(2);
+    CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
+    bool served = leader_file_is(n, p1, n1, h1, l1);
+    if (!served)
+        fprintf(stderr, "KF: the promoted member does not serve the file of the marker at %" PRIu64 "\n", p1);
+    CHECK(served);
+    CHECK_EQ(eng_leader_file_open(n, p1 + 1, n1), TSDB_ERR_NOTFOUND); /* no marker there names it */
+    /* and the files go with their segments: on the leader once the replicas' bound passes them, on a replica at the
+     * floor (no caps set here) */
+    eng_leader_commit(n, pos);
+    eng_leader_keep(n, UINT64_MAX);
+    CHECK_EQ(count_named(rd, kp), 0);
+    CHECK_EQ(eng_leader_file_open(n, p1, n1), TSDB_ERR_NOTFOUND);
+    CHECK_EQ(replica_flush(old), 0);
+    CHECK_EQ(replica_floor_saved(old, end), 0);
+    CHECK_EQ(count_named(x.ldir, kp), 0);
+    eng_close(old);
+    eng_close(n);
+    free(x.held);
+    free(h1);
+    printf("  a committed marker's files stay with its segment on every member and a promoted one serves them\n");
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -6032,6 +6125,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "markersplit") == 0 ? MUT_LEADER_MARKERS_SPLIT
                         : strcmp(m, "switchunattached") == 0 ? MUT_LEADER_SWITCH_UNATTACHED
                         : strcmp(m, "replicadropsfloor") == 0 ? MUT_REPLICA_KEEP_FLOOR
+                        : strcmp(m, "replicadropsfiles") == 0 ? MUT_REPLICA_DROP_APPLIED_FILES
                         : strcmp(m, "droppedglobal") == 0 ? MUT_DROPPED_GLOBAL
                         : strcmp(m, "wtailnocap") == 0 ? MUT_WTAIL_NOCAP
                         : strcmp(m, "nocutoff") == 0 ? MUT_LEADER_NO_CUTOFF
@@ -6340,6 +6434,7 @@ int main(int argc, char **argv)
         case_leader_prune();
         case_leader_read();
         case_link_sweep();
+        case_keep_files();
         for (int v = 0; v < 3; v++)
             case_promote(v);
         case_promote_crash();
@@ -6440,6 +6535,7 @@ int main(int argc, char **argv)
     case_leader_prune();
     case_leader_read();
     case_link_sweep();
+    case_keep_files();
     case_promote_refused();
     for (int v = 0; v < 3; v++)
         case_promote(v);

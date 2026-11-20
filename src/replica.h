@@ -48,6 +48,9 @@ void replica_keep_next(uint64_t max_bytes, uint64_t max_ms);
 /* tests: plants mutant replicadropsfloor (a replica's flushed segments go by the floor alone) in this process; tsdbd
  * calls it for TSDB_REPLD_MUTANT=replicadropsfloor (tests/test_cluster.c failoverkeep) */
 void tsdb_test_replica_drops_floor(void);
+/* tests: plants mutant replicadropsfiles (a replica removes an applied COMMIT's files at once, and a deposed leader its
+ * own, so a member promoted later cannot serve them); TSDB_REPLD_MUTANT=replicadropsfiles in tsdbd */
+void tsdb_test_replica_drops_files(void);
 /* Cuts the log after position `last` (a record end, or 0): the segment that holds it is truncated there, later
  * segments are removed, the cut is durable before it returns. TSDB_ERR_CORRUPT (nothing changed) when `last` is below
  * the applied end (the core never asks: damage or a bug) or is not a record end. */
