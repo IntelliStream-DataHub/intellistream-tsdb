@@ -7028,15 +7028,38 @@ static void scen_noowner(void)
            now_ms() - t0, Cs, v.epoch, BEFORE, AFTER);
     cut_file(L, Cs, 0);
     cut_file(Cs, L, 0);
-    /* The old members applied rows past the forced leader's history (committed at epoch e0): they cannot cut below
-     * what they applied, so they stop the volume, loudly, rather than rejoin with rows the leader lacks. Rebuilding
-     * such a replica from the leader is not built (NOTES: open). */
+    /* An old member whose REPL floor had reached rows past the forced leader's history (committed at epoch e0)
+     * reopens with them applied: it cannot cut below what it applied, so it stops the volume, loudly, rather than
+     * rejoin with rows the leader lacks (rebuilding it from the leader is not built). One whose floor was still at or
+     * below the forced leader's start (the floor is saved after the commit point moves, and the kill came right after
+     * the last acknowledgement; jc5, 2026-11-20) reopens without them, cuts its log there and rejoins: then it must
+     * hold exactly the forced leader's rows, none of the lost ones. Either way per member. */
     start(L);
     start(B);
-    await_log_count(L, "stopped: a cut below the applied end", 1, 60000);
-    await_log_count(B, "stopped: a cut below the applied end", 1, 60000);
-    if (!vol_rec(Cs, "nw", &v) || v.leader != ids[Cs] || v.nisr != 1)
-        die("after the old members returned: leader %u, ISR of %u (want %u alone)", v.leader, v.nisr, ids[Cs]);
+    int olds[2] = {L, B}, stopped[2] = {0, 0}, joined[2] = {0, 0};
+    for (uint64_t t1 = now_ms();; usleep(50000)) {
+        if (!vol_rec(Cs, "nw", &v))
+            die("no record of nw");
+        int left = 0;
+        for (int k = 0; k < 2; k++) {
+            stopped[k] = log_count(olds[k], "stopped: a cut below the applied end") > 0;
+            joined[k] = 0;
+            for (uint32_t j = 0; j < v.nisr; j++)
+                joined[k] |= v.isr[j] == ids[olds[k]];
+            if (stopped[k] && joined[k])
+                die("server %d stopped at a cut below its applied end and is in the ISR", olds[k]);
+            left += !stopped[k] && !joined[k];
+        }
+        if (!left)
+            break;
+        if (now_ms() - t1 > 60000)
+            die("60 s after the old members returned: server %d %s, server %d %s (want each stopped or in the ISR)",
+                L, stopped[0] ? "stopped" : joined[0] ? "joined" : "neither", B,
+                stopped[1] ? "stopped" : joined[1] ? "joined" : "neither");
+    }
+    if (v.leader != ids[Cs] || v.nisr != 1u + (unsigned)joined[0] + (unsigned)joined[1])
+        die("after the old members returned: leader %u, ISR of %u (want %u and the %d that rejoined)", v.leader,
+            v.nisr, ids[Cs], joined[0] + joined[1]);
     c = client(Cs);
     tsdbc_set_retry(c, 10000);
     ts = 9001000;
@@ -7045,7 +7068,20 @@ static void scen_noowner(void)
     tsdbc_close(c);
     if ((got = rows_in(Cs, id, 0, INT64_MAX, 30000)) != BEFORE + 2)
         die("the forced leader holds %d rows, want %d", got, BEFORE + 2);
-    printf("  the old members returned, found rows they applied past the forced leader's history and stopped\n");
+    for (int k = 0; k < 2; k++) {
+        if (!joined[k])
+            continue;
+        uint64_t t1 = now_ms();
+        while ((got = rows_in(olds[k], id, 0, INT64_MAX, 30000)) != BEFORE + 2 && now_ms() - t1 < 30000)
+            usleep(100000);
+        if (got != BEFORE + 2)
+            die("server %d rejoined the forced leader's ISR and holds %d rows, want its %d", olds[k], got, BEFORE + 2);
+        if ((got = rows_in(olds[k], id, 1000000 + 1000LL * BEFORE, 1000000 + 1000LL * (BEFORE + AFTER), 30000)) != 0)
+            die("server %d rejoined and holds %d of the %d rows lost with the force", olds[k], got, AFTER);
+    }
+    printf("  the old members returned: server %d %s, server %d %s (a cut below the applied end stops; a member that "
+           "had not applied past the forced leader's start cuts and rejoins without the lost rows)\n",
+           L, stopped[0] ? "stopped" : "rejoined", B, stopped[1] ? "stopped" : "rejoined");
     stop_all();
 }
 
