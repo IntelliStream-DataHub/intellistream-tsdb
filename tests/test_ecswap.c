@@ -642,6 +642,22 @@ static void recover_case(void)
                         IV4, true, dir, sizeof dir);
     CHECK(rc == TSDB_ERR_CORRUPT && exists(dir, "txn_7_1.intent") && exists(dir, "p500_1_1_0.ec") &&
           exists(dir, "tmp_7_2.ec") && !exists(dir, "retired_p500_1_1_0.ec"));
+    /* the swap done, its intent's unlink lost (before-unlink under a power cut), and a retired_ name of a source
+     * beside its settled_ one: an older file of that name (the open's cover rule retired a merge output a crash left
+     * unlisted, the merge named it again; jepsen tier300 classes settle-steps, 2026-11-20). Not damage: forward, the
+     * intent goes (the fake parts then fail the open at load_parts, as in rc-released) */
+    plant_open("rc-stale", (const char *const[]){"p500_1_1_0.ec", "p500_2_2_0.ec", "settled_p500_1_1_0.part",
+                                                 "settled_p500_2_2_0.part", "retired_p500_1_1_0.part", NULL},
+               IV4, true, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && exists(dir, "p500_1_1_0.ec") && exists(dir, "p500_2_2_0.ec") &&
+          exists(dir, "settled_p500_1_1_0.part"));
+    /* the same cut between the renames: the second source still P.part, both with an older retired_ copy: forward */
+    plant_open("rc-stalehalf", (const char *const[]){"p500_1_1_0.ec", "tmp_7_2.ec", "settled_p500_1_1_0.part",
+                                                     "p500_2_2_0.part", "retired_p500_1_1_0.part",
+                                                     "retired_p500_2_2_0.part", NULL},
+               IV4, true, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && exists(dir, "p500_2_2_0.ec") &&
+          exists(dir, "settled_p500_2_2_0.part") && !exists(dir, "p500_2_2_0.part") && !exists(dir, "tmp_7_2.ec"));
     /* the swap done, then a drop with obsolete_part_lifetime_s = 0: the .ec parts retired and deleted at their last
      * reference, the intent's unlink lost to a power cut: forward (nothing left to do), the open succeeds */
     rc = plant_open("rc-dropafter", (const char *const[]){"settled_p500_1_1_0.part", "settled_p500_2_2_0.part", NULL},
@@ -687,7 +703,8 @@ static void recover_case(void)
               !exists(dir, "MANIFEST.x") && count_names(dir, "settled_", ".part") == 0);
     }
     printf("  recovery: torn, forward, forward past a retired .ec, back when nothing was renamed (a source gone, a "
-           "refused swap's cleanup), forward after a drop or a release that followed the swap, damage (a retired "
+           "refused swap's cleanup), forward after a drop or a release that followed the swap or past an older "
+           "retired_ copy of a source, damage (a retired "
            "source after a rename, a lost .ec, a crafted intent) fails the open\n");
 }
 
@@ -745,8 +762,14 @@ static int run_child(const char *kind, const char *dir, const char *crash_at, in
 {
     pid_t pid = fork();
     if (pid == 0) {
-        if (crash_at)
+        if (crash_at) {
             setenv("TSDB_SETTLE_CRASH_AT", crash_at, 1);
+            /* the crash point leaves through exit(99) (a power cut under crashfs) with the engine still open, which
+             * a leak check at exit would report (and change the status) */
+            char asan[512];
+            snprintf(asan, sizeof asan, "%s:detect_leaks=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+            setenv("ASAN_OPTIONS", asan, 1);
+        }
         if (warmup >= 0) {
             char asan[512], w[16], sd[16];
             /* the power fails at exit (CRASHFS_AT_EXIT) with the shim's kept sectors still allocated, which a leak

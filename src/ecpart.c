@@ -473,7 +473,7 @@ fail:
 }
 
 /* Whether META's requires= line names "tier" (r7-tier writes it before the first .ec file can exist): 1 or 0, or
- * TSDB_ERR_IO (named) when META cannot be read. A second reader of requires= until r7-tier's db field replaces it. */
+ * TSDB_ERR_IO (named) when META cannot be read. Read again here: load_parts meets .ec names before the tier's attach. */
 static int meta_says_tier(eng *db)
 {
     if (atomic_load(&ec_test_assume_tier))
@@ -494,22 +494,9 @@ static int meta_says_tier(eng *db)
         return TSDB_ERR_IO;
     }
     buf[n] = '\0';
-    for (const char *l = buf; *l;) {
-        const char *end = strchr(l, '\n');
-        size_t len = end ? (size_t)(end - l) : strlen(l);
-        if (strncmp(l, "requires=", 9) == 0)
-            for (const char *w = l + 9; w < l + len;) {
-                const char *c = memchr(w, ',', (size_t)(l + len - w));
-                const char *we = c ? c : l + len;
-                if (we - w == 4 && strncmp(w, "tier", 4) == 0)
-                    return 1;
-                w = we + 1;
-            }
-        if (!end)
-            break;
-        l = end + 1;
-    }
-    return 0;
+    unsigned feats = 0;
+    meta_requires_parse(buf, &feats, NULL, 0); /* the one parser of requires= (an unknown word failed the open before) */
+    return (feats & META_REQ_TIER) != 0;
 }
 
 int ecpart_load(eng *db, const char *name, bool read_only, part **out)

@@ -50,14 +50,20 @@
  *     counts as done.
  *   Damage fails the open (the intent stays): a sealed intent whose lines break the rules of a swap's names, an .ec
  *   part under none of its names while its source is still P.part (no flow loses it: a drop after the swap finds the
- *   sources settled), a source under retired_ although the swap renamed (a drop before the check renames nothing),
+ *   sources settled), a source under retired_ and not settled_ although the swap renamed (a drop before the check
+ *   renames nothing; a retired_ name beside settled_ is an older file of that name: the open's cover rule retires a
+ *   merge output a crash left unlisted, and the merge names it again),
  *   and a lookup that fails other than ENOENT (EIO, ESTALE on NFS: never read as "absent"). The directory is synced
  *   before ecswap_recover returns, so the intent is unlinked only after its renames are durable.
  *
- * Crash points for r7-jepsen: TSDB_SETTLE_CRASH_AT=after-intent|between-renames|before-unlink[:n] ends the process
- * with _exit(99) the n-th time (default 1) the point is passed; read once per process. after-intent: the intent is
+ * Crash points for r7-jepsen: TSDB_SETTLE_CRASH_AT=after-put|after-ec-tmp|after-intent|between-renames|before-unlink[:n]
+ * ends the process
+ * with exit(99) the n-th time (default 1) the point is passed; read once per process. exit, not _exit: under
+ * jepsen's crashfs the point must be a power cut, which crashfs's destructor makes (it runs on exit only; tsdbd and the
+ * engine register no atexit handler, so nothing else runs on the way out). after-intent: the intent is
  * durable, nothing renamed; between-renames: after each rename but the swap's last; before-unlink: the swap is
- * durable, its intent still there. An unknown name ends the process with status 2 at the first point passed.
+ * durable, its intent still there. after-put and after-ec-tmp are the settle's (src/settle.c, ecswap_crash_point):
+ * its chunks are durable, and then its tmp_*.ec too, nothing renamed. An unknown name ends the process with status 2 at the first point passed.
  */
 #include "ecswap.h"
 #include "eckeep.h"
@@ -78,8 +84,9 @@ int ecswap_mutant;
 
 /* ------------------------------------------------------------ crash points */
 
-enum { SC_AFTER_INTENT, SC_BETWEEN_RENAMES, SC_BEFORE_UNLINK, SC_N };
-static const char *const sc_names[SC_N] = {"after-intent", "between-renames", "before-unlink"};
+enum { SC_AFTER_INTENT, SC_BETWEEN_RENAMES, SC_BEFORE_UNLINK, SC_AFTER_PUT, SC_AFTER_EC_TMP, SC_N };
+static const char *const sc_names[SC_N] = {"after-intent", "between-renames", "before-unlink", "after-put",
+                                           "after-ec-tmp"};
 static pthread_once_t sc_once = PTHREAD_ONCE_INIT;
 static int sc_point = -1; /* the armed point, -1: none */
 static long sc_at = 1;
@@ -112,9 +119,27 @@ static void settle_crash(int point)
     long hit = atomic_fetch_add(&sc_hits, 1) + 1;
     if (hit == sc_at) {
         fprintf(stderr, "tsdb: settle crash point %s (hit %ld): exiting with status 99\n", sc_names[point], hit);
-        _exit(99);
+        exit(99);
     }
 }
+
+/* TSDB_SWAP_MUTANT=swapearly arms SWAP_MUT_EARLY in a whole process (tsdbd under tests/jepsen/mutant-settle.sh, whose
+ * settle-steps run must catch it); the other mutants are test_ecswap's, set through ecswap_mutant. Read once, at the
+ * first swap; an unknown name ends the process with status 2, as TSDB_SETTLE_CRASH_AT does. */
+static pthread_once_t sm_once = PTHREAD_ONCE_INIT;
+static void sm_read(void)
+{
+    const char *v = getenv("TSDB_SWAP_MUTANT");
+    if (!v || !*v || strcmp(v, "none") == 0)
+        return;
+    if (strcmp(v, "swapearly") != 0) {
+        fprintf(stderr, "tsdb: TSDB_SWAP_MUTANT=%s names no mutant: exiting with status 2\n", v);
+        _exit(2);
+    }
+    ecswap_mutant = SWAP_MUT_EARLY;
+}
+
+void ecswap_crash_point(int which) { settle_crash(which == ECSWAP_CRASH_AFTER_PUT ? SC_AFTER_PUT : SC_AFTER_EC_TMP); }
 
 /* ------------------------------------------------------------ names */
 
@@ -235,6 +260,7 @@ static bool swap_renames(eng *db, part **in, part **ec, size_t n)
 
 int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
 {
+    pthread_once(&sm_once, sm_read);
     if (n == 0)
         return 0;
     if (db->opt.read_only || db->opt.follow)
@@ -252,7 +278,8 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     bool early = ecswap_mutant == SWAP_MUT_EARLY;
     if (rc == 0 && !early && (rc = intent_write(db, intent, in, ec, n)) != 0) {
         pthread_mutex_unlock(&db->publish_lock);
-        swap_discard(db, NULL, ec, n);
+        if (rc != TSDB_ERR_NOMEM) /* NOMEM: nothing written, the caller cleans up (ecswap.h), never both */
+            swap_discard(db, NULL, ec, n);
         free(at);
         return rc;
     }
@@ -446,7 +473,10 @@ int ecswap_recover(eng *db, const char *name, char *buf, size_t len)
         renamed = false; /* the planted bug: a missing source read as a drop of the key, whatever was renamed */
     for (size_t i = 0; i < n && rc == 0 && renamed; i++) {
         const char *why = NULL;
-        if (on[i][N_RSRC] && !on[i][N_SRC])
+        /* retired_P.part with settled_P.part beside it is an older file of the same name, not this source: the open
+         * retires a merge output a crash left unlisted when its sources are still there (load_parts' cover rule),
+         * the merge runs again and names the same P, and the retired_ copy waits out obsolete_part_lifetime_s */
+        if (on[i][N_RSRC] && !on[i][N_SRC] && !on[i][N_DST])
             why = "a source is under retired_ although the swap renamed (a drop before its check renames nothing)";
         else if (!on[i][N_TMP] && !on[i][N_FIN] && !on[i][N_RFIN] &&
                  (on[i][N_SRC] || ecswap_mutant == SWAP_MUT_LOSTSETTLED))
