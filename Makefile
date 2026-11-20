@@ -1049,7 +1049,7 @@ $(B)/test_ecskip: tests/test_ecskip.c src/internal.h $(R7_HDR) $(LIB)
 
 # the tier of a handle (r7-tier): one backend for every volume, vuuid= and requires=tier in META (power loss at every
 # step), stores DOWN at open and failed in service, the unsure EPOCH, the refusals; mutants must fail it
-$(B)/test_tier: tests/test_tier.c src/internal.h src/tier.h src/chunk.h src/chunk_priv.h src/feed.h $(LIB) $(CRASHFS_SO)
+$(B)/test_tier: tests/test_tier.c src/internal.h src/ecgc.h src/tier.h src/chunk.h src/chunk_priv.h src/feed.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # objects, chunk files, stores and the directory backend (R6): every geometry, every damage pattern, range reads at every
