@@ -50,7 +50,9 @@
  *     counts as done.
  *   Damage fails the open (the intent stays): a sealed intent whose lines break the rules of a swap's names, an .ec
  *   part under none of its names while its source is still P.part (no flow loses it: a drop after the swap finds the
- *   sources settled), a source under retired_ although the swap renamed (a drop before the check renames nothing),
+ *   sources settled), a source under retired_ and not settled_ although the swap renamed (a drop before the check
+ *   renames nothing; a retired_ name beside settled_ is an older file of that name: the open's cover rule retires a
+ *   merge output a crash left unlisted, and the merge names it again),
  *   and a lookup that fails other than ENOENT (EIO, ESTALE on NFS: never read as "absent"). The directory is synced
  *   before ecswap_recover returns, so the intent is unlinked only after its renames are durable.
  *
@@ -468,7 +470,10 @@ int ecswap_recover(eng *db, const char *name, char *buf, size_t len)
         renamed = false; /* the planted bug: a missing source read as a drop of the key, whatever was renamed */
     for (size_t i = 0; i < n && rc == 0 && renamed; i++) {
         const char *why = NULL;
-        if (on[i][N_RSRC] && !on[i][N_SRC])
+        /* retired_P.part with settled_P.part beside it is an older file of the same name, not this source: the open
+         * retires a merge output a crash left unlisted when its sources are still there (load_parts' cover rule),
+         * the merge runs again and names the same P, and the retired_ copy waits out obsolete_part_lifetime_s */
+        if (on[i][N_RSRC] && !on[i][N_SRC] && !on[i][N_DST])
             why = "a source is under retired_ although the swap renamed (a drop before its check renames nothing)";
         else if (!on[i][N_TMP] && !on[i][N_FIN] && !on[i][N_RFIN] &&
                  (on[i][N_SRC] || ecswap_mutant == SWAP_MUT_LOSTSETTLED))
