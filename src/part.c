@@ -962,7 +962,10 @@ int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, ui
  * would publish part of the insert. If a part is missing and none was
  * renamed yet, the insert is rolled back; if some were renamed, the insert
  * was published and the missing ones have since been merged or dropped.
- * Failing I/O (reading the intent, a rename) fails the open.
+ * The renames of a roll-forward are synced (the directory's fsync) before the
+ * intent is unlinked: a power cut could otherwise keep the unlink and lose a
+ * rename, and the next open, finding no intent, would remove that tmp part.
+ * Failing I/O (reading the intent, a rename, that fsync) fails the open.
  * Not covered: an intent damaged on disk after its renames ran (a synced file
  * gone bad) also reads as torn, and the parts it renamed are rolled back
  * although the insert may have been acknowledged.
@@ -1142,6 +1145,8 @@ static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[1
     return *n == count && !next;
 }
 
+int intents_test_mutant;
+
 /* At open: finish committed inserts that a crash interrupted, roll back the others. */
 int intents_recover(eng *db)
 {
@@ -1173,9 +1178,12 @@ int intents_recover(eng *db)
         close(fd);
         char (*tmp)[96] = NULL, (*fin)[128] = NULL;
         size_t n;
+        bool forward = false; /* rolled forward: its parts are under their final names, by this open or not */
         if ((size_t)st.st_size >= sizeof INTENT_V4_HEAD - 1 &&
             memcmp(buf, INTENT_V4_HEAD, sizeof INTENT_V4_HEAD - 1) == 0) {
-            /* R7: a settle's swap (an .ec part for each source, the source renamed settled_): its own recovery */
+            /* R7: a settle's swap (an .ec part for each source, the source renamed settled_): its own recovery,
+             * which syncs the directory itself before it returns, so the intent's unlink below cannot pass its
+             * renames */
             rc = ecswap_recover(db, e->d_name, buf, (size_t)st.st_size);
         } else if (!intent_parse(buf, (size_t)st.st_size, &tmp, &fin, &n)) {
             fprintf(stderr, "tsdb: insert intent %s is torn: the insert is rolled back\n", e->d_name);
@@ -1193,17 +1201,35 @@ int intents_recover(eng *db)
                 fprintf(stderr, "tsdb: %zu of the %zu parts of insert intent %s are gone: the insert is rolled back\n",
                         missing, n, e->d_name);
             } else {
-                for (size_t i = 0; i < n && rc == 0; i++)
-                    if (faccessat(db->dirfd, tmp[i], F_OK, 0) == 0 && renameat(db->dirfd, tmp[i], db->dirfd, fin[i]) != 0) {
+                forward = true;
+                for (size_t i = 0; i < n && rc == 0; i++) {
+                    if (faccessat(db->dirfd, tmp[i], F_OK, 0) != 0)
+                        continue;
+                    if (renameat(db->dirfd, tmp[i], db->dirfd, fin[i]) != 0) {
                         fprintf(stderr, "tsdb: rolling insert intent %s forward: rename of %s: %s\n", e->d_name,
                                 tmp[i], strerror(errno));
                         rc = TSDB_ERR_IO;
                     }
+                }
             }
         }
         free(tmp);
         free(fin);
         free(buf);
+        /* The renames of a roll-forward reach the disk before the intent's unlink can: until the directory is
+         * synced its operations are durable in any order, and a power cut that kept the unlink but lost a rename
+         * would leave no intent and a tmp_ part, which the open then removes: the insert half there. This holds
+         * whoever renamed: parts found under their final names may be renamed in the page cache only (a writer
+         * killed before its directory fsync, an open killed in this loop, or one whose fsync below failed), so the
+         * sync runs for every intent rolled forward, also when this open renamed nothing. A rolled-back intent
+         * renamed nothing; its unlink needs no order (its tmp files go after it, and an intent found again with
+         * them gone is rolled back again). */
+        if (rc == 0 && forward && db->opt.fsync && intents_test_mutant != INTENTS_MUT_UNLINK_FIRST &&
+            tsdb_fsync(db->dirfd) != 0) {
+            fprintf(stderr, "tsdb: rolling insert intent %s forward: fsync of the directory: %s: the open fails\n",
+                    e->d_name, strerror(errno));
+            rc = TSDB_ERR_IO;
+        }
         if (rc == 0) {
             /* the tmp files of a rolled-back insert go with the other tmp files, after this */
             if (unlinkat(db->dirfd, e->d_name, 0) != 0 && errno != ENOENT)
