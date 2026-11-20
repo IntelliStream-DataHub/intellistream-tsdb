@@ -56,11 +56,11 @@ endif
 # where the tests make their scratch directories (each run makes its own below it)
 SCRATCH ?= $(or $(TMPDIR),/tmp)
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl replframe
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl replframe ecpart
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
-FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o
+FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o fwd.o
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -98,13 +98,17 @@ endif
 # out gf256.c's constructor; src/cpu.c calls tsdb_ec_select() instead (AGENTS.md "CPU levels"). Compiled once, at the
 # baseline of $(ARCH): the AVX2, AVX-512 and GFNI kernels carry target attributes and run only where src/ec/compat.c's
 # iso_cpu_has() says so (tools/check-isa.sh checks that nothing else in them goes beyond x86-64-v2).
-ifeq ($(shell uname -m),x86_64)
+# NO_EC=1 builds an x86-64 engine without it, as the embedded bindings and other machines do (after make clean, or with
+# its own B=): every R7 stub and test must build and pass both ways. Only NO_EC=1 turns it off (NO_EC=0 or empty: on).
+ifeq ($(shell uname -m)$(filter 1,$(NO_EC)),x86_64)
 EC_OBJ := $(B)/ec_gf256.o $(B)/ec_gf256_avx2.o $(B)/ec_gf256_avx512.o $(B)/ec_rs.o $(B)/ec_compat.o
 OBJ  += $(EC_OBJ)
 EC_BENCH := $(B)/ec-bench
 override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
+# R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
+R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -122,7 +126,7 @@ BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
 all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench $(EC_BENCH)
 
-$(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
+$(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h $(R7_HDR) | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 # simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
 $(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
@@ -182,7 +186,7 @@ $(B)/cfg.o: tools/cfg.c tools/cfg.h tools/props.h | $(B)
 $(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c tools/cluster-cli.c tools/cfg.h \
           server/cluster.h client/tsdb_client.h $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -DTSDB_FORMAT_VERSION=$(TSDB_FORMAT) -o $@ $< tools/dump.c \
-	    tools/users-cli.c $(B)/cluster-cli.o $(CLUSTER_OBJ) $(CFG_OBJ) $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
+	    tools/users-cli.c $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ) $(CFG_OBJ) $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 
 # login (docs/design-auth.md): the crypto is client code, shared with tsdbd and the CLI; USERS and the grant model
 # are tsdbd's and the CLI's
@@ -288,6 +292,11 @@ $(B)/test_upgrade: tests/test_upgrade.c src/internal.h $(LIB)
 $(B)/test_fno: tests/test_fno.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+# an insert's intent recovered at the open (src/part.c intents_recover), power lost at every step of it (crashfs);
+# the mutant unlinks the intent before its renames are synced and must fail
+$(B)/test_intents: tests/test_intents.c src/internal.h $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 # the REPL file of a replica directory (src/replfile.c, design-cluster.md 4.3): two checksummed slots, power loss at
 # every step of create and save (crashfs); the mutant runs plant the bugs it guards against and must fail
 $(B)/test_replfile: tests/test_replfile.c src/replfile.h src/repl.h src/internal.h $(LIB) $(CRASHFS_SO)
@@ -323,7 +332,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
 	./$(B)/test_tsdb $(SCRATCH)
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched $(SCRATCH)
@@ -347,9 +356,13 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	tests/expect_fail.sh 'a segment of markers replays' ./$(B)/test_fno --mutant markers $(SCRATCH)
 	tests/expect_fail.sh 'f > mx' ./$(B)/test_fno --mutant nosync $(SCRATCH)
 	! ./$(B)/test_fno --mutant flushclose $(SCRATCH) >/dev/null 2>&1 # a flush that leaves a record open crashes in the seal (status 139): the one planted bug whose symptom is a crash
+	./$(B)/test_intents $(SCRATCH)
+	./$(B)/test_intents --mutant unlinkfirst $(SCRATCH) 2>/dev/null | grep -q 'ROWS WRONG' # the old order must lose rows
 	./$(B)/test_replfile $(SCRATCH)
 	for m in nosync sameslot nochecksum; do ! ./$(B)/test_replfile --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_replica $(SCRATCH)
+	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 ./$(B)/test_replica --mutant walsequnlocked $(SCRATCH) >$(B)/walsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/walsequnlocked.log) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
+	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 ./$(B)/test_replica --mutant cutwalsequnlocked $(SCRATCH) >$(B)/cutwalsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/cutwalsequnlocked.log && grep -q replica_cut $(B)/cutwalsequnlocked.log) # and a cut's
 	./$(B)/test_cvol $(SCRATCH)
 	./$(B)/test_cvolfs $(SCRATCH)
 	for m in nosync nodirsync nononce trustunsure tornstale samerid; do ! ./$(B)/test_cvolfs --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
@@ -380,7 +393,7 @@ TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 te
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
-test-units-b: $(B)/test_chunk $(B)/test_chunk_heal
+test-units-b: $(B)/test_chunk $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier
 test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(or $(TMPDIR),/tmp)
 	B=$(B) tests/test_config.sh $(TMPDIR)
@@ -405,7 +418,23 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	$(if $(EC_OBJ),for m in coef kernel guard; do ! ./$(B)/test_rs --quick --mutant $$m >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (--quick: seconds, not 20 s a run)
 	./$(B)/test_chunk $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in nosums nofence eof settings nosync epochnosync; do ! ./$(B)/test_chunk --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),out=$$(./$(B)/test_chunk --quick --mutant streamreread $(or $(TMPDIR),/tmp) 2>&1); [ $$? -ne 0 ] && echo "$$out" | grep -q 'stream put .* differ from chunk_encode' || { echo "test_chunk: mutant streamreread was not caught by the stream put's comparison with chunk_encode" >&2; exit 1; }) # pinned to its oracle's line
 	./$(B)/test_chunk_heal $(or $(TMPDIR),/tmp)
+	./$(B)/test_ecnames $(or $(TMPDIR),/tmp)
+	for m in nameloose tierloose; do ! ./$(B)/test_ecnames --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp)
+	$(if $(EC_OBJ),for m in $(ORACLE_MUTANTS); do ! ./$(B)/test_settle_oracle --mutant $$m --seeds 2 $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (EC builds: without TSDB_EC the oracle skips)
+	./$(B)/test_ecswap $(or $(TMPDIR),/tmp)
+	$(if $(EC_OBJ),for m in swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled; do ! ./$(B)/test_ecswap --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_seam $(or $(TMPDIR),/tmp)
+	$(if $(EC_OBJ),for m in seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop; do ! ./$(B)/test_seam --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_ecpart $(or $(TMPDIR),/tmp)
+	$(if $(EC_OBJ),for m in ecnohash ecnowalseq ecskipname ecnofno ecnolayout; do ! ./$(B)/test_ecpart --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_ecskip $(or $(TMPDIR),/tmp)
+	$(if $(EC_OBJ),for m in mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec; do ! ./$(B)/test_ecskip --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_tier $(or $(TMPDIR),/tmp)
+	$(if $(EC_OBJ),for m in tierperengine tierunsure tierstrict tierfresh tierfence; do ! ./$(B)/test_tier --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done,! ./$(B)/test_tier --mutant tiernoec $(or $(TMPDIR),/tmp) >/dev/null 2>&1) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
+	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
 	$(if $(EC_OBJ),for m in heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always; do ! ./$(B)/test_chunk_heal --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	tests/test_sync_ec.sh
 	tools/sync-ec.sh --check
@@ -428,7 +457,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/tsdbd $(B)/t
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
 	./$(B)/test_peerlink $(SCRATCH)
-	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick; do ! ./$(B)/test_peerlink $(SCRATCH) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead; do ! ./$(B)/test_peerlink $(SCRATCH) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	$(MAKE) cluster-mutants
 
 # the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 17 runs of 2 minutes each under a sanitizer
@@ -488,7 +517,7 @@ $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuz
 	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
-$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o server/peerlink.h server/replwire.h
+$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o server/peerlink.h server/replwire.h server/fwd.h
 $(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
@@ -505,7 +534,7 @@ $(FUZZ_B)/libtsdb.a: FORCE
 	    rm -f $(FUZZ_B)/*.o $(FUZZ_B)/*.a $(FUZZ_B)/fuzz-*; printf '%s\n' "$(FUZZ_SIG)" >$(FUZZ_B)/.flags; \
 	fi
 	$(MAKE) B=$(FUZZ_B) CC=$(FUZZ_CC) ARCH="$(FUZZ_ARCH)" CFLAGS="$(FUZZ_SAN) $(FUZZ_COV)" $@ \
-	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o $(FUZZ_B)/props.o $(FUZZ_B)/cfg.o $(FUZZ_B)/peerlink.o $(FUZZ_B)/replwire.o
+	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o $(FUZZ_B)/props.o $(FUZZ_B)/cfg.o $(FUZZ_B)/peerlink.o $(FUZZ_B)/replwire.o $(FUZZ_B)/fwd.o
 
 # the driver is built without coverage: it holds the hook
 $(FUZZ_B)/driver.o: tests/fuzz/driver.c $(FUZZ_B)/libtsdb.a
@@ -513,7 +542,7 @@ $(FUZZ_B)/driver.o: tests/fuzz/driver.c $(FUZZ_B)/libtsdb.a
 
 $(FUZZ_B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/fuzz.h tests/fuzz/template.h src/internal.h $(FUZZ_B)/libtsdb.a \
                   $(if $(FUZZ_DRV),$(FUZZ_B)/driver.o)
-	$(FUZZ_CC) $(FUZZ_COMMON) $(FUZZ_ARCH) $(FUZZ_SAN) $(FUZZ_COV) -c -o $@.o $<
+	$(FUZZ_CC) $(FUZZ_COMMON) $(if $(EC_OBJ),-DTSDB_EC) $(FUZZ_ARCH) $(FUZZ_SAN) $(FUZZ_COV) -c -o $@.o $<
 	$(FUZZ_CC) $(FUZZ_SAN) $(FUZZ_LINK) -o $@ $@.o $(if $(FUZZ_DRV),$(FUZZ_B)/driver.o) \
 	    $(FUZZ_OBJS_$*:%=$(FUZZ_B)/%) $(FUZZ_B)/libtsdb.a $(LDLIBS)
 $(FUZZ_B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
@@ -777,7 +806,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: lease-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: lease-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -812,6 +841,12 @@ $(B)/cluster.o: server/cluster.c server/cluster.h server/peerlink.h server/meta.
 # the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it
 $(B)/peerlink.o: server/peerlink.c server/peerlink.h client/tsdb_crypto.h src/compat.h | $(B)
 	$(CC) $(CFLAGS) -Iclient -c -o $@ $<
+# the forwarding links (server/fwd.h): the transport in fwd.o (no cluster calls: test_peerlink and the fuzzer link
+# it), tsdbd's instance over the cluster's member list in fwd_cluster.o
+$(B)/fwd.o: server/fwd.c server/fwd.h server/peerlink.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(B)/fwd_cluster.o: server/fwd_cluster.c server/fwd.h server/peerlink.h server/cluster.h server/meta.h client/tsdb_crypto.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
 $(B)/repl.o: src/repl.c src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
@@ -820,13 +855,15 @@ $(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
 # the replication driver's payloads on the data links (server/replwire.h)
 $(B)/replwire.o: server/replwire.c server/replwire.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(RAFT_OBJ)
-$(B)/tsdb: $(B)/cluster-cli.o $(CLUSTER_OBJ)
+CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(RAFT_OBJ)
+$(B)/tsdb: $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
+$(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
+	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
-$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 $(B)/test_meta: tests/test_meta.c server/meta.h $(B)/meta.o $(B)/repl.o $(RAFT_OBJ) $(B)/raft_raft_sim.o
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -o $@ $< $(B)/meta.o $(B)/repl.o $(RAFT_OBJ) $(B)/raft_raft_sim.o -lm
 # test_meta with bugs planted in meta.c (MUT(n), -DMETA_MUTANTS): tests/meta_mutants.sh runs each with --mutant n and
@@ -845,27 +882,36 @@ META_SOAK_FIRST   ?= 1000
 $(B)/cvol_check.o: tests/cvol_check.c tests/cvol_check.h src/internal.h src/feed.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Itests -c -o $@ $<
 $(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h server/peerlink.h \
-    $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB) \
+    $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB) \
     $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
-	    $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(ZSTD_LIB) -lpthread -lm
+	    $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(ZSTD_LIB) -lpthread -lm
 rewind-mutants:
 	tests/rewind_mutants.sh $(or $(REWIND_DIR),/var/tmp/rewind-mutants-$$$$)
 meta-mutants: $(B)/test_meta_mut
 	tests/meta_mutants.sh $(B)/test_meta_mut
 # the replication driver's mutants (server/repld.c TSDB_REPLD_MUTANT): each must fail test_cluster replindet or
 # replicate, or ackdurable (power loss of the replicas) or writerfail (D13 on the writer), or repcheck (floor, unsure
-# REPL, admit check, fast path, a peer's cursor below what it acknowledged); hbnoclamp is not listed: no scenario delays a link yet
+# REPL, admit check, fast path, a peer's cursor below what it acknowledged), or the ISR, keep, ship, backpressure, close and
+# rejoin scenarios (tests/repld_mutants.sh pins each to its FAIL line); hbnoclamp is not listed: no scenario delays a link yet
 repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(or $(TMPDIR),/tmp) commitbyleader floornotsaved ackbeforesync nodepose noquiesce floornottold \
-	    unsureignored admitnocheck nofastpath nocursorup
+	    unsureignored admitnocheck nofastpath nocursorup commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal \
+	    noinboxbound nospill keepignorespeers keepwritten nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr fastride \
+	    nojoinhold inboxstarve opennohold tickstretch stepcurrentonly
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(or $(TMPDIR),/tmp)
+# the cluster login mutants (server/auth.c, tools/cluster-user-cli.c TSDB_AUTH_MUTANT; tests/auth_mutants.sh)
+auth-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/auth_mutants.sh $(or $(TMPDIR),/tmp)
+# the metadata copy's snapshot, TOPOLOGY, STATUS, MOVED and the acceptor's table (tests/copy_mutants.sh)
+copy-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/copy_mutants.sh $(or $(TMPDIR),/tmp)
 meta-soak: $(B)/test_meta
 	./$(B)/test_meta $(SCRATCH) --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
-TSDBD_SRC := server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
+TSDBD_SRC := server/fwd.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c \
@@ -1033,6 +1079,54 @@ $(B)/test_delete: tests/test_delete.c src/internal.h $(LIB)
 
 $(B)/test_rs: tests/test_rs.c src/internal.h $(EC_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
+
+# whether this build has the erasure codec (test-units-b checks that NO_EC=0 keeps it and NO_EC=1 drops it)
+.PHONY: print-ec
+print-ec:
+	@echo $(if $(EC_OBJ),ec,noec)
+
+# R7's interfaces (r7-iface): the names of .ec parts and settled sources, every near miss; TSDB_TEST_TIER's grammar and
+# its refusal without TSDB_TEST_TIER_I_KNOW=1; the stubs leave a database as today's code does; eng_test_mark_ec
+$(B)/test_ecnames: tests/test_ecnames.c src/internal.h $(R7_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# settled answers equal unsettled answers bit for bit (R7, r7-oracle): two databases, one history, B settles some partitions;
+# every query kind is compared. make oracle-soak: ORACLE_SEEDS seeds of ORACLE_STEPS steps from ORACLE_FIRST (a failure names its seed)
+ORACLE_MUTANTS := skipdelete skipreplace skipretention nomark flipvalues flipagg flipgroup flipbounds flipspread fliptwa fliplttb fliplatest flipmulti flipstats
+ORACLE_SEEDS ?= 200
+ORACLE_STEPS ?= 150
+ORACLE_FIRST ?= 1000
+$(B)/test_settle_oracle: tests/test_settle_oracle.c src/internal.h $(R7_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
+
+.PHONY: oracle-soak
+oracle-soak: $(B)/test_settle_oracle
+	./$(B)/test_settle_oracle --seeds $(ORACLE_SEEDS) --steps $(ORACLE_STEPS) --first $(ORACLE_FIRST) $(or $(TMPDIR),/tmp)
+
+# the swap of a settle (r7-swap): intent v4, the input check under db->lock against a drop, recovery at open; crash
+# points and power loss (crashfs) at every step; readers across swaps; mutants must fail it
+$(B)/test_ecswap: tests/test_ecswap.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# the seam of .ec parts (r7-seam, src/eccache.c): every query kind through it equals the maps, damaged cells, lost
+# objects, stores DOWN, eviction under 32 threads, the fd budget; mutants seamnoverify seamnoretry cachekeyoff
+$(B)/test_seam: tests/test_seam.c src/internal.h $(R7_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# the .ec index file (r7-ecfile): its record codec, writer and open against the source part, damage to every region,
+# the listing's refusals, WAL replay and fno_next over a settled partition; mutants must fail it
+$(B)/test_ecpart: tests/test_ecpart.c src/internal.h $(R7_HDR) src/chunk.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# r7-skip: .ec and settling parts are merge barriers, never rewritten alone, by optimize or by the TTL work; drops
+# retire them without waiting for a settle; .ec parts do not hold inserts (db_wait_merges). Marks by eng_test_mark_ec
+$(B)/test_ecskip: tests/test_ecskip.c src/internal.h $(R7_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# the tier of a handle (r7-tier): one backend for every volume, vuuid= and requires=tier in META (power loss at every
+# step), stores DOWN at open and failed in service, the unsure EPOCH, the refusals; mutants must fail it
+$(B)/test_tier: tests/test_tier.c src/internal.h src/tier.h src/chunk.h src/chunk_priv.h src/feed.h $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # objects, chunk files, stores and the directory backend (R6): every geometry, every damage pattern, range reads at every
 # boundary, epoch fences, power loss (crashfs) at every step of a chunk write and an EPOCH store; mutants must fail it
@@ -1475,6 +1569,9 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
 	out=$$($$j --mutant rep-lost-write --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "the leader's final read"; then \
 	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant rep-lost-write --seconds 20 --nemesis midcommit --workload kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "kvr's last ISR" || ! echo "$$out" | grep -q '@n[0-9]*: durability'; then \
+	        echo "jepsen-cluster-selftest: an acknowledged write missing from a member of kvr's last ISR after the terminal point went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --mutant rep-half-batch --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'half of a large write'; then \
 	        echo "jepsen-cluster-selftest: half of an acknowledged large write in a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \

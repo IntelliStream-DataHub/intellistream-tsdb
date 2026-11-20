@@ -43,7 +43,7 @@ make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBS
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
                           # with an output buffer of exactly n values, part, manifest, wal, dict, volumes, tz, import = the
-                          # export stream, users = USERS, classes = CLASSES, marker = WAL marker payloads, chunk = a chunk file, ec = the decode path of objects and the codec) under ASan+UBSan in build-fuzz/; make test
+                          # export stream, users = USERS, classes = CLASSES, marker = WAL marker payloads, chunk = a chunk file, ec = the decode path of objects and the codec, ecpart = a settled part's .ec file and its object record) under ASan+UBSan in build-fuzz/; make test
                           # replays tests/fuzz/corpus/<name>/ (codecx uses codec's). A crash-* input, once fixed, goes there.
                           # At a CPU level: make fuzz FUZZ_ARCH=-march=x86-64-v4 (or -v3; its own dir build-fuzz-v4, and a changed level in a FUZZ_B you name
                           # empties it; make fuzz-v4-check replays part and codecx at v4 under ASan with use-after-return on; the
@@ -175,7 +175,7 @@ cgroup, so `nice` does not keep your work out of its way.
   (who may send it, where its series are, the rights it needs), which `handle()` consults before its switch, and
   the per-user rights maps. `server/users.c`: the USERS file, shared with `tools/users-cli.c` (`tsdb DIR user ...`,
   which edits it beside a running tsdbd). `client/tsdb_crypto.c`: SHA-256, HMAC, PBKDF2 and base64 for SCRAM, used
-  by tsdbd, the C client and the CLI. `docs/design-auth.md` is the design (decisions A1-A29).
+  by tsdbd, the C client and the CLI. `docs/design-auth.md` is the design (decisions A1-A33).
   `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate; its shared glue is `client/python-common`), `client/java`:
   the other clients, network only and Apache-2.0. The embedded bindings, which contain the engine and are AGPL-3.0:
@@ -188,11 +188,22 @@ cgroup, so `nice` does not keep your work out of its way.
   state machine (members, volumes, replicas, epochs, ISR, slots, users; entries of ops, snapshots, the §13.1
   invariants as `meta_check_step`). `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
-  add|status`). `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
+  add|status`; users: USER_PUT/DEL answered after commit with the members still behind, the uid assigned at apply,
+  puts conditional on the user's version, `cluster_users_caught_up`, `tools/cluster-user-cli.c` for `tsdb cluster
+  user ...`, `test_cluster users`). `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
   (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
   over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below
   `jr_rec_max_rows` so that it fits one peer frame. `TSDB_REPLD_MUTANT` and `TSDB_REPLD_TEST` are its test hooks, `TSDB_REPLD_TRACE=1` logs the core's and the cursors' state every 2 s
-  (`make repld-mutants`); `test_cluster replicate|replindet|replfail` its end-to-end tests. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  (`make repld-mutants`); `test_cluster replicate|replindet|replfail` its end-to-end tests. `server/fwd.[ch]`: the forwarding links' transport (S2-2), a peerlink of its own on every member with link kinds
+  FWD (3) and FWDQ (4) to every other member (`server/fwd_cluster.c` keeps them to the metadata copy's members), per frame
+  NEVER_WRITTEN (no byte reached the socket: `plink_sendv` tracked) or WRITTEN, replies only from the connection the frame
+  went on, CREDIT for streamed query replies; `test_peerlink kinds|toobig|written|wbcut|fwdstall|fwd|fwdgrow|fwdredial|fwdslow|fwdstream`
+  (mutants `queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead`); a full inbox
+  pauses the link (`plink_pause`: no reading, keepalive goes on) and never blocks its thread; `fwd_cancel`; the
+  instance is freed only after tsdbd's workers are joined (`fwd_cluster_free`), `test_cluster fwdlinks`. The entry node's decision is `route_decide` in `server/tsdbd.c` (D5, S2-1:
+  served only where every cluster volume of the request is led here, else MOVED to the copy's leader, reads included, or
+  UNAVAILABLE NO_OWNER/PROMOTING; before any right on an id is checked; a frame spanning two owners is INVALID;
+  docs/design-cluster.md 6.4); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants
@@ -318,7 +329,10 @@ cgroup, so `nice` does not keep your work out of its way.
   through these windows.
 - **Inserts are all or nothing.** All parts of one insert are written pending,
   then committed through an intent file (`parts_commit`). Never publish them one
-  by one.
+  by one. The open's roll-forward (`intents_recover`) fsyncs the directory after an intent it rolls forward, renamed
+  by this open or not (final names seen at open may be in the page cache only), and before it unlinks the intent:
+  unsynced directory operations reach the disk in any order, and an unlink kept with a rename lost leaves the insert
+  half there (`tests/test_intents.c`, crashfs with `CRASHFS_TEAR`; mutant `unlinkfirst`).
 - **Durability.** A new file is durable after fsync of the file and of its
   directory; a rename after fsync of the directory. In sync mode
   (`wal_sync_ms = 0`) a memtable row is visible to queries only once the WAL is
@@ -500,6 +514,12 @@ cgroup, so `nice` does not keep your work out of its way.
   other append-only files (checksummed records, OFD write lock, torn tail cut, damage fails the open), and a failed
   write or fdatasync of it is fail-stop (tsdbd exits with status 1 before acknowledging): an acknowledged revoke
   must not come back after a power loss. `--no-auth` checks nothing and refuses the user admin ops.
+  On a `--cluster` server (design-auth.md §12, A30-A33) the users are the metadata group's: auth builds its snapshot
+  from the users watch (users.c's group store, no file), a root holding USERS is refused at start naming
+  `tsdb cluster user import`, logins answer UNAVAILABLE until `cluster_users_caught_up()`, the admin ops propose
+  through `cluster_user_propose` and answer once committed and back in the local copy (a failed proposal changes
+  nothing), and `tsdb DIR user` refuses a root marked `CLUSTER_USERS`. `test_cluster login|userimport|volrefuse`,
+  `make auth-mutants`.
 - **Storage outages** (ha.md 15, N1; `src/health.c`, `server/domains.h`, `src/revalidate.c`). A volume on NFS that is
   down must refuse fast while the other volumes go on, and come back without losing or resurrecting anything.
   `tsdb_health_*` (probe threads with `O_DIRECT`, no engine call) gives each domain UP, DEGRADED, DOWN, RECOVERING.
@@ -524,8 +544,9 @@ cgroup, so `nice` does not keep your work out of its way.
   the shim. Not built yet: mountinfo discovery, parking and BUSY, a per-volume bounded queue, SIGTERM with a stuck call,
   metrics, the volumes cache, parallel open.
 - **Statistics are never on the append path** (`src/stats.c`). Nothing is added to a write, the WAL, the memtable, the
-  part writer or a merge: the two functions that change a part list (`db_parts_insert_locked`,
-  `db_parts_remove_locked`) push one event into a bounded ring under the `db->lock` they hold, and a nice-19
+  part writer or a merge: the functions that change a part list (`db_parts_insert_locked`,
+  `db_parts_remove_locked`, and R7's swap `ec_swap_commit` in `src/ecswap.c`, which replaces a part by its `.ec` in place)
+  push one event into a bounded ring under the `db->lock` they hold, and a nice-19
   sweeper thread (throttled to `stats_sweep_mb_s`, a hard cap) walks each added part's granule index once. A full
   ring drops events and the sweeper reconciles its records with the part list (never before the open has finished:
   `load_parts` changes the list without `db->lock`; an overflow stays set until `stats_open_done`), so the totals are
@@ -559,7 +580,9 @@ cgroup, so `nice` does not keep your work out of its way.
   always give the slow path's answer (`tests/test_latest.c` compares both after every random step). Entry words are
   loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
   `latest_rw` is held across no I/O but `tsdb_drop_before`'s renames of the partitions it retires (`db_retire_locked`,
-  in its write section; `db->lock` was held across them already), and never across a lookup's reads of granules. Followers have no table.
+  in its write section; `db->lock` was held across them already) and the settle swap's 2n renames (`ec_swap_commit`,
+  `src/ecswap.c`: its input check and renames are one step against a drop, which takes no `publish_lock`; on NFS,
+  snapshots and lookups of the volume wait for those round trips), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf, and so is the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
@@ -589,7 +612,9 @@ cgroup, so `nice` does not keep your work out of its way.
   `append_lock` is released (also when a durable record could not be added in memory). The `crashfs` lock in tests is innermost. The scheduler's mutex (`sched.c`) and a multi call's (`multi.c`) are leaves: never held while a job's
   `fn`, a query or the callback runs, nor while an engine lock is taken. A job's `fn` waits only for the items of its
   own nested jobs (a fork/join tree), never for a lock another job's worker may hold while waiting for helpers.
-  tsdbd's login (`server/auth.c`): `users_mu` (the USERS state; held across USERS's I/O and its OFD lock, so on NFS
+  tsdbd's login (`server/auth.c`): on a cluster server the cluster thread's `uw_mu` (`server/cluster.c`, held across
+  the users watch's call) comes first, and `cluster_user_propose` is never called under `users_mu` or `auth_mu`; then
+  `users_mu` (the USERS state; held across USERS's I/O and its OFD lock, so on NFS
   as long as a server is away) > `auth_mu` (the published snapshot of the users and the registry of logged-in
   users; never held across I/O) > `tn_mu` (`server/tenants.c`: the tenant list, its slots and the pending list; auth_mu takes
   it to find a user's tenant (`tn_slot_user`) and a failed login to count under one, and USERS's publish calls `tn_offer`

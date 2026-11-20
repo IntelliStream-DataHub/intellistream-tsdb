@@ -58,6 +58,16 @@ Only by the job's own process group, which `bgrun.sh` makes its session leader:
 pg=$(cat $SE_HOME/runs/NAME/pid); [ "$pg" -gt 1 ] && kill -TERM -- -"$pg"
 ```
 
+A job on the build machine (`(build machine)` in watchdog.sh's line; its run dir has `rpgid`): stop its group there
+first, then the local copier, which writes rc 143:
+
+```sh
+rg=$(cat $SE_HOME/runs/NAME/rpgid); [ "$rg" -gt 1 ] && ssh "$SE_REMOTE" "kill -TERM -- -$rg"   # SE_REMOTE from config.sh
+```
+
+A `LOOK remote orphan` line is stopped there by its single pid (`ssh "$SE_REMOTE" kill PID`), under the same rule as a
+local orphan; a tsdbd stuck in its shutdown may need `kill -KILL PID`.
+
 An orphaned lock holder (a leftover tsdbd from a killed test, parent pid 1): stop that single pid after checking its
 command line names a scratch directory of a finished or dead job. Never `pkill`, `killall`, `kill -1`, `kill 0`, or
 pids taken from `pgrep -f`. After stopping, remove the containers that job created (`podman rm -f rb-...`, only the
@@ -80,5 +90,6 @@ command, so the user can run it.
 
 ## 5. Report
 
-Return at most 8 lines: each job's state, what you did and why. Write the same into
+Return at most 14 lines: each job that is not plainly RUNNING, what you did and why; then one line per track from
+`progress.sh` (what its notes say last, and how long ago). Write the same into
 `$SE_HOME/agents/tsdb/watchdog.log` with the time. If nothing needed doing, one line saying so.

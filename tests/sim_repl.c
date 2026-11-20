@@ -1123,7 +1123,9 @@ static int run(uint64_t seed, uint64_t ticks)
         S.vm.rid[i] = nd->rid;
         nd->cfg = (struct repl_config){.self = i, .nnodes = S.nn, .min_isr = min_isr, .isr_lag_ticks = 30,
                                        .resend_ticks = 10, .heartbeat_ticks = 3, .floor_ticks = 20,
-                                       .unanswered_ticks = 20, .max_batch = batch, .window = 32 * batch, .rec_find = rec_find, .ctx = nd};
+                                       .idle_heartbeat_ticks = seed % 3 ? 3 + (uint32_t)(seed % 10) : 0,
+                                       .unanswered_ticks = 20, .join_hold_ticks = seed % 4 ? 30 : 0,
+                                       .max_batch = batch, .window = 32 * batch, .rec_find = rec_find, .ctx = nd};
         node_open(i);
     }
     meta_broadcast();

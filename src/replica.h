@@ -47,6 +47,14 @@ int replica_cut(struct eng *db, uint64_t last);
  * acknowledged, not applied) until every file it names is staged with the size and xxh64 it says: call replica_sync
  * after the last replica_stage of a marker. */
 int replica_stage(struct eng *db, const char *name, const void *buf, size_t len);
+/* The same for a file too large to hold in memory while it arrives (r3d review M3): replica_spill_open makes a new
+ * file stage_s<pid>_<n>.tmp in the volume's directory (its name in tmp, cap >= 48; removed by the next open like every
+ * stage tmp) and returns its descriptor or a negative error; the driver writes the bytes there, and
+ * replica_stage_spilled syncs it and names it as replica_stage would (it consumes the tmp name: renamed, or removed on
+ * failure; the caller closes fd). replica_spill_drop removes a spill file whose transfer failed. */
+int replica_spill_open(struct eng *db, char *tmp, size_t cap);
+int replica_stage_spilled(struct eng *db, const char *name, int fd, const char *tmp, size_t len);
+void replica_spill_drop(struct eng *db, const char *tmp);
 /* The first file of an appended, unapplied COMMIT marker that is not staged (or staged wrongly): its leader name and
  * size and the marker's position (*pos, for eng_leader_file_open), for the driver to fetch and replica_stage. Returns 1,
  * or 0 when none is missing. */

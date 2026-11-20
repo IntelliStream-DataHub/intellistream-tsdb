@@ -13,7 +13,8 @@
  * segment is unlinked only at or below the commit floor the driver has saved durably (8.3).
  *
  * Nothing here assigns an fno. db->fno_next is the log end + 1; db->wal_fd, wal_seq and wal_off are the segment being
- * written, so a promotion (a later step) turns the same fields into a writer's.
+ * written, so a promotion (a later step) turns the same fields into a writer's. wal_seq and fno_next change under rp->mu
+ * and buf_lock: manifest_publish, on any thread (the flusher, merges), reads them under buf_lock for MANIFEST.
  *
  * Locks: rp->apply_mu (one applier: held across replica_apply) > rp->stage_mu (one replica_stage, and a COMMIT's
  * reads of its staged files) > rp->mu (log, cursor, memtable switching) > flush_lock > db->lock > buf_lock; segs_mu and
@@ -39,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -799,6 +801,73 @@ int replica_stage(eng *db, const char *name, const void *buf, size_t len)
         unlinkat(db->dirfd, trunc ? sp : tp, 0); /* the name that held the old bytes is untouched (not so in place) */
         pthread_mutex_unlock(&rp->stage_mu);
         return rc;
+    }
+    rp_lock(rp);
+    rc = stg_put(rp, key, len, xx);
+    pthread_mutex_unlock(&rp->mu);
+    pthread_mutex_unlock(&rp->stage_mu);
+    return rc;
+}
+
+int replica_spill_open(eng *db, char *tmp, size_t cap)
+{
+    static unsigned seq;
+    if (!db->rp || cap < 48)
+        return TSDB_ERR_INVALID;
+    snprintf(tmp, cap, "stage_s%d_%u.tmp", (int)getpid(), __atomic_fetch_add(&seq, 1, __ATOMIC_RELAXED));
+    unlinkat(db->dirfd, tmp, 0); /* a new inode always (a failed write may have left pages dropped under an old one) */
+    int fd = openat(db->dirfd, tmp, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    return fd < 0 ? TSDB_ERR_IO : fd;
+}
+
+void replica_spill_drop(eng *db, const char *tmp)
+{
+    if (db && tmp && tmp[0])
+        unlinkat(db->dirfd, tmp, 0);
+}
+
+int replica_stage_spilled(eng *db, const char *name, int fd, const char *tmp, size_t len)
+{
+    struct replica *rp = db->rp;
+    struct stat st;
+    if (!rp || !name || !part_file_name(name) || strlen(name) >= 64 || len == 0 || fd < 0 ||
+        strncmp(tmp, "stage_s", 7) != 0) {
+        replica_spill_drop(db, tmp);
+        return TSDB_ERR_INVALID;
+    }
+    if (fstat(fd, &st) != 0 || (uint64_t)st.st_size != len) {
+        replica_spill_drop(db, tmp);
+        return TSDB_ERR_IO;
+    }
+    void *m = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0); /* the page cache, never the heap */
+    if (m == MAP_FAILED) {
+        replica_spill_drop(db, tmp);
+        return TSDB_ERR_IO;
+    }
+    uint64_t key = stage_key(name), xx = xxh64(m, len, 0);
+    munmap(m, len);
+    char sp[40];
+    stage_path(sp, sizeof sp, key);
+    pthread_mutex_lock(&rp->stage_mu);
+    int rc = 0;
+    rp_lock(rp);
+    const struct rstg *old = stg_find(rp, key);
+    if (old && old->size == len && old->xxh == xx)
+        rc = 1; /* staged already */
+    else if (old && stage_wanted(rp, key, old->size, old->xxh))
+        rc = TSDB_ERR_INVALID;
+    pthread_mutex_unlock(&rp->mu);
+    const bool sync = db->opt.fsync && eng_test_mutant != MUT_REPLICA_NO_STAGE_SYNC;
+    if (rc == 0 && sync && tsdb_fdatasync(fd) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && renameat(db->dirfd, tmp, db->dirfd, sp) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && sync && tsdb_fsync(db->dirfd) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc) {
+        unlinkat(db->dirfd, tmp, 0);
+        pthread_mutex_unlock(&rp->stage_mu);
+        return rc == 1 ? 0 : rc;
     }
     rp_lock(rp);
     rc = stg_put(rp, key, len, xx);
@@ -1589,7 +1658,13 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
         int fd = -1;
         if (rc == 0 && (rc = wal_open_segment(db, seq, &fd)) == 0) {
             db->wal_fd = fd;
-            db->wal_seq = seq;
+            if (eng_test_mutant == MUT_REPLICA_WALSEQ_UNLOCKED) { /* planted: the write of the race TSan found */
+                db->wal_seq = seq;
+            } else {
+                pthread_mutex_lock(&db->buf_lock); /* manifest_publish reads it under buf_lock (wal_active) */
+                db->wal_seq = seq;
+                pthread_mutex_unlock(&db->buf_lock);
+            }
             db->wal_off = 0;
             if ((rc = segs_push(rp, seq, 0, 0)) != 0)
                 eng_fail(db, "listing a new segment", ENOMEM);
@@ -1789,7 +1864,13 @@ int replica_cut(eng *db, uint64_t last)
                 eng_fail(db, "reopening a segment after a cut", errno);
                 rc = TSDB_ERR_IO;
             }
-            db->wal_seq = ss[t].seq;
+            if (eng_test_mutant == MUT_REPLICA_CUT_WALSEQ_UNLOCKED) { /* planted: the cut's write unlocked (test_replica) */
+                db->wal_seq = ss[t].seq;
+            } else {
+                pthread_mutex_lock(&db->buf_lock); /* manifest_publish reads it under buf_lock (wal_active) */
+                db->wal_seq = ss[t].seq;
+                pthread_mutex_unlock(&db->buf_lock);
+            }
             db->wal_off = off_cut;
         } else {
             db->wal_off = 0;
@@ -2445,6 +2526,11 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
                 rc = TSDB_ERR_IO;
         }
     }
+    if (jr->ship_wait) {
+        int wr = jr->ship_wait(jr->ctx, db, rc != 0);
+        if (rc == 0)
+            rc = wr;
+    }
     /* The links are named before the marker can be durable anywhere: a leader that loses power after its marker and
      * before parts_commit has its tmp_ files removed by the open (load_parts, db.c), and reopened as a replica
      * (design-cluster.md 6.3) it applies the marker from these, as any replica does from what it staged. */
@@ -2490,6 +2576,11 @@ static int leader_drop(eng *db, int64_t ts)
     mk m = {.type = MK_DROP, .span = 1};
     m.u.drop = (mk_drop){.dropped_before = ts, .partition = MK_NO_PARTITION};
     uint64_t fno = 0;
+    /* the replicas' clock first (design-cluster.md 5.4); refused or failed, the DROP is refused too: it never goes out
+     * without the clock it is judged by (r3d-isr review L3) */
+    int nrc = leader_now_marker(db);
+    if (nrc)
+        return leader_unappended(nrc);
     /* eng_drop_before holds flush_lock until the retire (planted MUT_LEADER_DROP_UNHELD: it does not, as before) */
     int rc = eng_test_mutant == MUT_LEADER_DROP_UNHELD ? mt_flush_ex(db, &m, &fno) : mt_flush_held(db, &m, &fno);
     if (rc)

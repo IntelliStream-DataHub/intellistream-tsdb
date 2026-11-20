@@ -26,6 +26,9 @@
  *    a recently created part or segment is not hidden by a cached "not found".
  */
 #include "internal.h"
+#include "ecgc.h"
+#include "eckeep.h"
+#include "ecpart.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -80,15 +83,25 @@ int manifest_publish(eng *db)
         return TSDB_ERR_NOMEM;
     }
     /* wal_active is the segment being written: a replica's too, which writes the leader's WAL with wal_enabled off
-     * (a reader that took wal_flushed there would see the rows of its parts only) */
+     * (a reader that took wal_flushed there would see the rows of its parts only). wal_seq is read under buf_lock: a
+     * writer's rotation (mt_flush) sets it under db->lock and buf_lock, a replica's (replica_append, replica_cut)
+     * under rp->mu and buf_lock, the edge its fno_next already takes; buf_lock is the innermost of the three, so this
+     * db->lock > buf_lock is in the order. The reads follow each other under manifest_lock, so the last MANIFEST
+     * written names the newest segment (after a rotation that is the appender's own publish). */
     pthread_mutex_lock(&db->buf_lock); /* after db->lock in the order */
     uint64_t fno_next = db->fno_next;
+    uint64_t wal_active = db->wal_enabled || db->rp ? db->wal_seq : db->wal_flushed;
     pthread_mutex_unlock(&db->buf_lock);
+    /* planted with the unlocked write of replica_append, as main had it (test_replica). Only that write is what TSan
+     * can catch: this read follows the unlock by a few instructions, so a rotation's locked write orders after it
+     * unless it lands in that window, and a mutant of the read alone passed 5 of 5 runs (no test of the read side) */
+    if (eng_test_mutant == MUT_REPLICA_WALSEQ_UNLOCKED)
+        wal_active = db->wal_enabled || db->rp ? db->wal_seq : db->wal_flushed;
     len += (size_t)snprintf(buf + len, cap - len,
                             "tsdb-manifest %d\nversion %" PRIu64 "\nseries %u\nwal_flushed %" PRIu64
                             "\nwal_active %" PRIu64 "\nfsync %d\nstates %u\nfno_next %" PRIu64 "\nparts %zu\n",
                             FORMAT_VERSION, ++db->manifest_version, atomic_load(&db->series.count), db->wal_flushed,
-                            db->wal_enabled || db->rp ? db->wal_seq : db->wal_flushed, db->opt.fsync ? 1 : 0,
+                            wal_active, db->opt.fsync ? 1 : 0,
                             atomic_load(&db->states.count), fno_next, db->nparts);
     for (size_t i = 0; i < db->nparts; i++)
         len += (size_t)snprintf(buf + len, cap - len, "%s\n", db->parts[i]->name);
@@ -115,6 +128,23 @@ int manifest_publish(eng *db)
     return rc;
 }
 
+int graveyard_add(eng *db, const char *name, int kind, int64_t deadline)
+{
+    if (db->ngraveyard == db->graveyard_cap) {
+        size_t cap = db->graveyard_cap ? db->graveyard_cap * 2 : 64;
+        graveyard_entry *g = realloc(db->graveyard, cap * sizeof *g);
+        if (!g)
+            return TSDB_ERR_NOMEM;
+        db->graveyard = g;
+        db->graveyard_cap = cap;
+    }
+    graveyard_entry *e = &db->graveyard[db->ngraveyard++];
+    snprintf(e->name, sizeof e->name, "%s", name);
+    e->deadline = deadline;
+    e->kind = (uint8_t)kind;
+    return 0;
+}
+
 /* Takes p out of service. It stays readable under its retired name until its
  * lifetime has passed, for followers that still use it. Caller holds db->lock. */
 void db_retire_locked(eng *db, part *p)
@@ -126,27 +156,20 @@ void db_retire_locked(eng *db, part *p)
     if (renameat(db->dirfd, p->name, db->dirfd, retired) != 0) {
         /* still listed after a reopen: a dropped part would come back */
         eng_fail(db, "rename of a replaced part to retired_", errno);
-    } else if (db->opt.obsolete_part_lifetime_s <= 0) {
-        /* The name goes at once, even where a query still maps the file: a crash while that reference is held
-         * must not list a dropped part again (nothing covers it). The file itself is deleted when the last
-         * reference goes, under its retired name, which an open never lists. */
-        p->retired = true;
-        atomic_store(&p->obsolete, true);
     } else {
-        if (db->ngraveyard == db->graveyard_cap) {
-            size_t cap = db->graveyard_cap ? db->graveyard_cap * 2 : 64;
-            graveyard_entry *g = realloc(db->graveyard, cap * sizeof *g);
-            if (g) {
-                db->graveyard = g;
-                db->graveyard_cap = cap;
-            }
+        if (p->ec)
+            ecgc_retire_locked(db, p); /* R7: retired_<name>.ec; its object goes with it (r7-gc) */
+        if (db->opt.obsolete_part_lifetime_s <= 0) {
+            /* The name goes at once, even where a query still maps the file: a crash while that reference is held
+             * must not list a dropped part again (nothing covers it). The file itself is deleted when the last
+             * reference goes, under its retired name, which an open never lists. */
+            p->retired = true;
+            atomic_store(&p->obsolete, true);
+        } else {
+            /* an unrecorded one (out of memory) is collected at the next open */
+            (void)graveyard_add(db, retired, p->ec ? GY_EC : GY_PART,
+                                mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000);
         }
-        if (db->ngraveyard < db->graveyard_cap) {
-            graveyard_entry *e = &db->graveyard[db->ngraveyard++];
-            snprintf(e->name, sizeof e->name, "%s", retired);
-            e->deadline = mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000;
-        }
-        /* an unrecorded one is collected at the next open */
     }
     db_parts_remove_locked(db, p);
 }
@@ -177,9 +200,14 @@ void graveyard_purge(eng *db, bool all)
     size_t kept = 0;
     for (size_t i = 0; i < db->ngraveyard; i++) {
         graveyard_entry *e = &db->graveyard[i];
-        if (all || e->deadline <= now)
+        bool done;
+        if (e->kind == GY_EC) /* R7: a retired .ec part (r7-gc) */
+            done = ecgc_purge_entry(db, e, all, now);
+        else if (e->kind == GY_SETTLED) /* R7: a settle's source (r7-keep) */
+            done = eckeep_purge_entry(db, e, all, now);
+        else if ((done = all || e->deadline <= now))
             unlinkat(db->dirfd, e->name, 0);
-        else
+        if (!done)
             db->graveyard[kept++] = *e;
     }
     if (kept != db->ngraveyard)
@@ -318,6 +346,8 @@ static int cmp_part_order(const void *x, const void *y)
 /* Opens a part by its active name or, if the writer has just retired it, by its retired name. */
 static int open_listed_part(eng *db, const char *name, part **out)
 {
+    if (ec_file_name(name))
+        return ecpart_follower_open(db, name, out); /* R7: a follower does not read .ec parts (D7) */
     int rc = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, out);
     if (rc == TSDB_ERR_NOTFOUND) {
         char retired[256];

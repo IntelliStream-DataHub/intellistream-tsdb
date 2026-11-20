@@ -405,6 +405,7 @@ void meta_requires_parse(const char *txt, unsigned *feats, char *unknown, size_t
             unsigned bit = wl == 4 && strncmp(w, "feed", 4) == 0      ? META_REQ_FEED
                            : wl == 7 && strncmp(w, "cluster", 7) == 0 ? META_REQ_CLUSTER
                            : wl == 7 && strncmp(w, "replica", 7) == 0 ? META_REQ_REPLICA
+                           : wl == 4 && strncmp(w, "tier", 4) == 0    ? META_REQ_TIER
                                                                       : 0;
             if (bit) {
                 if (feats)
@@ -421,36 +422,24 @@ void meta_requires_parse(const char *txt, unsigned *feats, char *unknown, size_t
     }
 }
 
-/* META with the word added or removed (a requires= line with other words keeps them). tmp, fsync, rename, then the
- * directory fsync. Nothing is written when META already says it. */
-static int meta_word(const feed_dir *d, bool on)
+/* META with the words `add` set and `del` cleared (META_REQ_*), every other word kept (the unknown ones first, as
+ * written), and the line `extra` (with its newline; NULL: none) appended when META has no line with its key (the text
+ * up to its '='). tmp, fsync, rename, then the directory fsync. Nothing is written when nothing would change. */
+static int meta_edit(const feed_dir *d, const uint8_t *txt, size_t len, unsigned add, unsigned del, const char *extra)
 {
-    uint8_t *txt;
-    size_t len;
-    int rc = read_whole(d->dirfd, "META", &txt, &len);
-    if (rc)
-        return rc;
     unsigned feats;
-    meta_requires_parse((const char *)txt, &feats, NULL, 0);
-    bool has = feats & META_REQ_FEED;
-    if (feats & (META_REQ_CLUSTER | META_REQ_REPLICA)) {
-        /* a replica cannot keep a feed (design-cluster.md §5.3): its log is the leader's; nor is this rewrite of the
-         * requires= line one that keeps those words */
-        fprintf(stderr, "tsdb: the directory is a cluster volume's (META requires=cluster): no change feed there\n");
-        free(txt);
-        return TSDB_ERR_INVALID;
-    }
-    if (has == on) {
-        free(txt);
-        return 0;
-    }
     char unknown[96];
-    meta_requires_parse((const char *)txt, NULL, unknown, sizeof unknown);
-    char *out = malloc(len + 64 + sizeof unknown);
-    if (!out) {
-        free(txt);
+    meta_requires_parse((const char *)txt, &feats, unknown, sizeof unknown);
+    unsigned want = (feats | add) & ~del;
+    size_t klen = extra ? (size_t)(strchr(extra, '=') - extra) + 1 : 0;
+    bool has_extra = !extra;
+    for (const char *l = (const char *)txt; *l && !has_extra; l = *line_end(l) ? line_end(l) + 1 : line_end(l))
+        has_extra = strncmp(l, extra, klen) == 0;
+    if (want == feats && has_extra)
+        return 0;
+    char *out = malloc(len + 128 + sizeof unknown + (extra ? strlen(extra) : 0));
+    if (!out)
         return TSDB_ERR_NOMEM;
-    }
     size_t n = 0;
     for (const char *l = (const char *)txt; *l;) {
         const char *e = line_end(l);
@@ -463,15 +452,59 @@ static int meta_word(const feed_dir *d, bool on)
         }
         l += ll;
     }
-    free(txt);
-    if (on || unknown[0])
-        n += (size_t)snprintf(out + n, 64 + sizeof unknown, "requires=%s%s%s\n", unknown, unknown[0] && on ? "," : "",
-                              on ? "feed" : "");
+    if (!has_extra)
+        n += (size_t)sprintf(out + n, "%s", extra);
+    static const struct { unsigned bit; const char *w; } words[] = {
+        {META_REQ_FEED, "feed"}, {META_REQ_CLUSTER, "cluster"}, {META_REQ_REPLICA, "replica"}, {META_REQ_TIER, "tier"}};
+    if (want || unknown[0]) {
+        n += (size_t)sprintf(out + n, "requires=%s", unknown);
+        bool first = !unknown[0];
+        for (size_t i = 0; i < sizeof words / sizeof words[0]; i++)
+            if (want & words[i].bit) {
+                n += (size_t)sprintf(out + n, "%s%s", first ? "" : ",", words[i].w);
+                first = false;
+            }
+        out[n++] = '\n';
+    }
     char tmp[128];
     meta_tmp_make(tmp, sizeof tmp);
-    rc = put_file(d, tmp, "META", out, n);
+    int rc = put_file(d, tmp, "META", out, n);
     free(out);
     return rc ? rc : dsync(d);
+}
+
+/* META with the feed's word added or removed. */
+static int meta_word(const feed_dir *d, bool on)
+{
+    uint8_t *txt;
+    size_t len;
+    int rc = read_whole(d->dirfd, "META", &txt, &len);
+    if (rc)
+        return rc;
+    unsigned feats;
+    meta_requires_parse((const char *)txt, &feats, NULL, 0);
+    if (feats & (META_REQ_CLUSTER | META_REQ_REPLICA)) {
+        /* a replica cannot keep a feed (design-cluster.md §5.3): its log is the leader's */
+        fprintf(stderr, "tsdb: the directory is a cluster volume's (META requires=cluster): no change feed there\n");
+        free(txt);
+        return TSDB_ERR_INVALID;
+    }
+    rc = meta_edit(d, txt, len, on ? META_REQ_FEED : 0, on ? 0 : META_REQ_FEED, NULL);
+    free(txt);
+    return rc;
+}
+
+int meta_tier_require(int dirfd, bool sync, const char *vuuid_line)
+{
+    feed_dir d = {.dirfd = dirfd, .db = NULL, .sync = sync}; /* sync: opt.fsync, as the feed's open */
+    uint8_t *txt;
+    size_t len;
+    int rc = read_whole(dirfd, "META", &txt, &len);
+    if (rc)
+        return rc;
+    rc = meta_edit(&d, txt, len, META_REQ_TIER, 0, vuuid_line);
+    free(txt);
+    return rc;
 }
 
 /* ---------------------------------------------------------- directory scan */

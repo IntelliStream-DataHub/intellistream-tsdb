@@ -5,6 +5,7 @@
 #include "tsdb_client.h"
 #include "tsdb_pack.h"
 #include "tsdb_protocol.h"
+#include "tsdb_wire.h"
 #include "metrics.h"
 #include "samekeys.h"
 #include "lttb_ref.h"
@@ -531,6 +532,42 @@ static void *fake_server(void *arg)
     if (fd >= 0)
         close(fd);
     return NULL;
+}
+
+/* TOPOLOGY and STATUS of a server without a cluster stay what 13 specified (S2-1 added the cluster form beside them):
+ * node 1 with an empty address, every volume OWNER of node 1 at epoch 0, and gen the hash of exactly these bytes, which
+ * the reply is encoded again from here to check. */
+static void test_topology_single(tsdbc *c)
+{
+    tsdbc_topo *t = NULL;
+    OK(tsdbc_topology(c, &t));
+    CHECK(t && t->nnodes == 1 && t->nodes[0].node_id == 1 && t->nodes[0].alive == 1 && t->nodes[0].addr[0] == 0);
+    CHECK(t && t->nvols >= 1);
+    uint8_t buf[1 << 16];
+    size_t at = tsdb_wire_put_topo_head(buf, sizeof buf, 0, 1);
+    tsdb_topo_node node = {1, 1, "", 0};
+    at += tsdb_wire_put_topo_node(buf + at, sizeof buf - at, &node);
+    at += tsdb_wire_put_u32(buf + at, sizeof buf - at, t ? (uint32_t)t->nvols : 0);
+    for (size_t i = 0; t && i < t->nvols; i++) {
+        const tsdbc_vol *v = &t->vols[i];
+        CHECK(v->vol == i && v->role == TSDB_ROLE_OWNER && v->owner == 1 && v->epoch == 0 && v->server == 0xffff &&
+              v->addr[0] == 0);
+        tsdb_topo_vol tv = {.vol = v->vol, .role = v->role, .health = v->health, .epoch = v->epoch, .reason = v->reason,
+                            .domain = v->domain, .since_ms = v->since_ms, .owner = v->owner, .server = v->server,
+                            .addr = "", .path = v->path ? v->path : "",
+                            .path_len = (uint16_t)(v->path ? strlen(v->path) : 0)};
+        at += tsdb_wire_put_topo_vol(buf + at, sizeof buf - at, &tv);
+    }
+    CHECK(at <= sizeof buf);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 8; i < at && i < sizeof buf; i++)
+        h = (h ^ buf[i]) * 1099511628211ull;
+    CHECK(t && t->gen == h); /* nothing folded in: no applied index without a cluster */
+    tsdbc_topology_free(t);
+    char *text = NULL;
+    OK(tsdbc_status(c, &text));
+    CHECK(text && strncmp(text, "node.id=1\nnode.role=owner\n", 26) == 0 && !strstr(text, "peer."));
+    free(text);
 }
 
 static void test_old_server(uint32_t version)
@@ -3981,6 +4018,7 @@ int main(int argc, char **argv)
     test_old_server(5);
     test_types(c);
     test_wide_ids(c);
+    test_topology_single(c);
     test_nan(c);
     test_lttb_remote(c);
     test_pack_roundtrip();

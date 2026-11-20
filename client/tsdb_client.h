@@ -186,9 +186,10 @@ typedef struct tsdbc_vol {
     uint8_t reason; /* TSDB_WHY_* */
     uint16_t domain; /* 0xffff: unknown */
     int64_t since_ms;
-    uint32_t owner;  /* a node_id */
+    uint32_t owner;  /* the node_id of this entry's member (a cluster node lists one entry per replica: the volume's
+                      * leader is the entry whose role is OWNER) */
     uint16_t server;
-    char addr[TSDB_ADDR_MAX + 1];
+    char addr[TSDB_ADDR_MAX + 1]; /* that member's client address; empty: the node that answered */
     char *path; /* the volume's directory; empty unless the user is a superuser */
 } tsdbc_vol;
 typedef struct tsdbc_topology {

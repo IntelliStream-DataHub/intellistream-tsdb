@@ -215,7 +215,10 @@
  *               (clients poll; there is no push). domain and server are 0xffff when unknown. addr is the owner's address for clients;
  *               empty means "the node you are connected to". path is the volume's directory, sent only to a superuser
  *               (a client needs ids, not paths). tsdbd without a cluster answers itself as node 1, every volume
- *               as OWNER (FOLLOWER under --follow), with the health of its storage domain.
+ *               as OWNER (FOLLOWER under --follow), with the health of its storage domain. A cluster node answers
+ *               from its metadata copy: every member (alive while up), and per volume one entry per replica with
+ *               owner = that member and its address: the leader OWNER, an in-sync replica STANDBY, any other
+ *               FOLLOWER; gen also changes with the copy.
  *   STATUS      -> u32 len, then len bytes of `key=value` lines (docs/ha.md 15.4); superuser only.
  *   Version 13 also moves the planned numbers of the other designs one up: QUERY_LATEST is protocol 14, the change
  *   feed 15, statistics 16 (their op numbers are unchanged: 39 to 47; TOPOLOGY is 48 and STATUS 49). Version 15 below

@@ -17,13 +17,17 @@
  *  - stores: META and the store id, EPOCH (damage, torn slots, no EPOCH beside chunks), the fence (put and delete
  *    below the epoch, a delete below the chunk's own epoch, the maximum over the stores of a backend), tmp_* files
  *    removed at open, list with and without verify;
+ *  - the one-pass put (E26): chunk_be_put_stream gives chunk_be_put_object's files and sums for every shape, asks
+ *    for each stripe once and in order, ignores a source that changes after handing a stripe, and an abort from the
+ *    source at any stripe returns its code and leaves no chunk;
  *  - power loss (crashfs) at every step of a chunk write, an EPOCH store and a delete, with unsynced data torn at
  *    random: every chunk present is whole, every acknowledged one is there, EPOCH never goes back; and an I/O error
  *    (crashfs eio) at every step: the store acknowledges nothing after it fails.
  *
  *   test_chunk [DIR]                  DIR is the scratch directory of the other tests
  *   test_chunk --quick                coarser power-loss sweeps (the mutant runs use it)
- *   test_chunk --mutant NAME          plants nosums | nofence | eof | settings | nosync | epochnosync: must fail
+ *   test_chunk --mutant NAME          plants nosums | nofence | eof | settings | nosync | epochnosync | streamreread:
+ *                                     must fail
  */
 #include "internal.h"
 #include "chunk.h"
@@ -2001,6 +2005,325 @@ static void test_crashfs(void)
     sweep("eio", 1, quick ? 3 : 1);
 }
 
+/* ---------------------------------------------------------------- the one-pass put (E26) */
+/* A source over a private copy of the object that changes each stripe's bytes in its copy as soon as it has handed
+ * them out: a put that reads the source again (for the parity, the sums or the writes) gets other bytes. It also
+ * records how often each stripe was asked for, and aborts with `abort_rc` at stripe `abort_at`. */
+typedef struct vsrc {
+    const chunk_geom *g;
+    uint8_t *cur;
+    uint64_t ns, next, bytes;
+    unsigned *calls;
+    bool mutate, bad_order;
+    uint64_t abort_at;
+    int abort_rc;
+} vsrc;
+
+static int vs_fill(void *ctx, uint64_t s, uint64_t off, uint8_t *buf, size_t len)
+{
+    vsrc *v = ctx;
+    uint64_t sb = (uint64_t)v->g->k * v->g->cell, want = v->g->len - off < sb ? v->g->len - off : sb;
+    if (s >= v->ns || s != v->next || off != s * sb || len != want)
+        v->bad_order = true;
+    if (s < v->ns)
+        v->calls[s]++;
+    v->next = s + 1;
+    if (s >= v->ns || off + len > v->g->len)
+        return TSDB_ERR_INVALID;
+    memcpy(buf, v->cur + off, len);
+    v->bytes += len;
+    if (v->mutate)
+        for (size_t i = 0; i < len; i++)
+            v->cur[off + i] ^= (uint8_t)(0x5a + i); /* "the page changed" after it was read */
+    return s == v->abort_at ? v->abort_rc : 0;
+}
+
+static void vs_init(vsrc *v, const chunk_geom *g, const uint8_t *obj, bool mutate)
+{
+    memset(v, 0, sizeof *v);
+    v->g = g;
+    v->ns = chunk_nstripes(g);
+    v->cur = malloc((size_t)g->len);
+    memcpy(v->cur, obj, (size_t)g->len);
+    v->calls = calloc((size_t)v->ns, sizeof *v->calls);
+    v->mutate = mutate;
+    v->abort_at = UINT64_MAX;
+}
+
+static void vs_free(vsrc *v)
+{
+    free(v->cur);
+    free(v->calls);
+}
+
+/* Each stripe asked for exactly once, in order, and every byte of the object handed out once. */
+static bool vs_once(const vsrc *v)
+{
+    if (v->bad_order || v->bytes != v->g->len)
+        return false;
+    for (uint64_t s = 0; s < v->ns; s++)
+        if (v->calls[s] != 1)
+            return false;
+    return true;
+}
+
+static void stream_path(const char *root, const fx *f, unsigned pos, char *out, size_t cap)
+{
+    char hex[33];
+    chunk_oid_hex(f->oid, hex);
+    snprintf(out, cap, "%s/st%d/s%u/o%s.%u.chunk", root, (f->base + (int)pos) % f->n, f->vol, hex, pos);
+}
+
+/* Chunk files of f's object under `root` (stores st0..) are byte for byte those chunk_be_put_object made. */
+static bool stream_same_files(const fx *f, const char *root)
+{
+    bool same = true;
+    for (unsigned p = 0; p < chunk_npos(&f->g); p++) {
+        char a[PATH_MAX * 2], b[PATH_MAX * 2];
+        fx_path(f, p, a, sizeof a);
+        stream_path(root, f, p, b, sizeof b);
+        size_t na, nb;
+        uint8_t *ba = slurp(a, &na), *bb = slurp(b, &nb);
+        if (!ba || !bb || na != nb || memcmp(ba, bb, na) != 0)
+            same = false;
+        free(ba);
+        free(bb);
+    }
+    return same;
+}
+
+/* No file of the object in any store of `root`, temporary ones included. */
+static int stream_files_left(const char *root, int n, uint32_t vol)
+{
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        char d[PATH_MAX * 2];
+        snprintf(d, sizeof d, "%s/st%d/s%u", root, i, vol);
+        DIR *dir = opendir(d);
+        if (!dir)
+            continue;
+        struct dirent *e;
+        while ((e = readdir(dir)))
+            if (e->d_name[0] == 'o' || !strncmp(e->d_name, "tmp_", 4))
+                found++;
+        closedir(dir);
+    }
+    return found;
+}
+
+/* The chunks of f's object in `be` hold exactly the cells and sums the memory encoder (chunk_encode, which the stream
+ * put does not use) gave in `ms`: the oracle for "the same bytes on disk" that does not run the code under test. */
+static bool stream_same_as_memory(chunk_backend *be, const fx *f, const msrc *ms)
+{
+    bool same = true;
+    for (unsigned p = 0; p < chunk_npos(&f->g) && same; p++) {
+        chunk_ident id = {.volume = f->vol, .pos = p};
+        memcpy(id.vuuid, f->vuuid, 16), memcpy(id.oid, f->oid, 16);
+        chunk_rd *r = NULL;
+        uint8_t *b = malloc(ms->clen[p] + 1);
+        same = b && chunk_be_rd_open(be, &id, &r) == 0 && chunk_rd_read(r, 0, b, ms->clen[p]) == 0 &&
+               memcmp(b, ms->cells[p], ms->clen[p]) == 0 &&
+               memcmp(chunk_rd_sums(r), ms->sums[p], (size_t)chunk_pos_cells(&f->g, p) * 8) == 0;
+        if (r)
+            chunk_rd_close(r);
+        free(b);
+    }
+    return same;
+}
+
+/* chunk_encode_stream's cells and sums, from a source that changes each stripe once read, are chunk_encode's. */
+static bool stream_encode_same(const chunk_geom *g, const uint8_t *obj, const msrc *ms)
+{
+    msrc got;
+    ms_build(&got, g, obj);
+    for (unsigned p = 0; p < chunk_npos(g); p++) {
+        memset(got.cells[p], 0, got.clen[p]);
+        memset(got.sums[p], 0, (size_t)chunk_pos_cells(g, p) * 8);
+    }
+    memset(got.rec, 0, (size_t)chunk_sums_total(g) * 8);
+    vsrc v;
+    vs_init(&v, g, obj, true);
+    chunk_put_src src = {&v, vs_fill};
+    bool same = chunk_encode_stream(g, &src, ms_collect, &got, got.rec) == 0 && vs_once(&v) &&
+                memcmp(got.rec, ms->rec, (size_t)chunk_sums_total(g) * 8) == 0;
+    for (unsigned p = 0; p < chunk_npos(g) && same; p++)
+        same = memcmp(got.cells[p], ms->cells[p], got.clen[p]) == 0 &&
+               memcmp(got.sums[p], ms->sums[p], (size_t)chunk_pos_cells(g, p) * 8) == 0;
+    vs_free(&v);
+    ms_free(&got);
+    return same;
+}
+
+static chunk_backend *stream_backend(const char *root, int n)
+{
+    sh("rm -rf '%s'; mkdir -p '%s'", root, root);
+    char paths[6][PATH_MAX + 64];
+    const char *pp[6];
+    for (int i = 0; i < n; i++) {
+        snprintf(paths[i], sizeof paths[i], "%s/st%d", root, i);
+        pp[i] = paths[i];
+        CHECK(chunk_store_init(paths[i], NULL, NULL) == 0);
+    }
+    chunk_backend *be = NULL;
+    CHECK(chunk_be_open(&be, pp, n, NULL) == 0);
+    return be;
+}
+
+static void test_stream_put(void)
+{
+    static const struct {
+        unsigned k, m;
+        uint32_t cell; /* 0: derived (E7) */
+        uint64_t len;
+        const char *label;
+    } t[] = {{4, 2, 32, 32 * 11 - 11, "4+2"}, {8, 2, 32, 32 * 21 - 11, "8+2"}, {8, 4, 32, 32 * 21 - 11, "8+4"},
+             {16, 4, 32, 32 * 41 - 11, "16+4"}, {1, 2, 32, 32 * 3 - 11, "1+2"}, {2, 1, 32, 32 * 6 - 11, "2+1"},
+             {3, 1, 32, 32 * 8 - 11, "3+1"}, {5, 2, 32, 32 * 13 - 11, "5+2"}, {1, 1, 32, 32 * 3 - 11, "1+1"},
+             {16, 1, 32, 32 * 41 - 11, "16+1"}, {3, 2, 16, 16 * 3 + 5, "k'=3 of 8+2"}, {2, 4, 8, 8 * 5, "whole cells"},
+             {1, 4, 100, 37, "one short cell"}, {7, 3, 1, 7 * 4 + 3, "cells of one byte"},
+             {4, 2, 64, 64 * 8, "whole stripes"}, {16, 4, 0, 3u << 20, "16+4 derived 3 MiB"},
+             {8, 2, 0, (5u << 20) + 12345, "8+2 derived 5 MiB"}, {8, 4, 0, 70000, "8+4 derived 70000"},
+             {8, 2, 0, 10000, "8+2 derived 10000"}};
+    unsigned shapes = 0, aborts = 0;
+    for (size_t i = 0; i < sizeof t / sizeof *t; i++) {
+        fx f;
+        fx_make(&f, "fx-stream", 4, t[i].k, t[i].m, t[i].cell, t[i].len, 2);
+        char root[PATH_MAX + 32];
+        snprintf(root, sizeof root, "%s/stream", S);
+        uint64_t nsums = chunk_sums_total(&f.g);
+        uint64_t *rec = calloc(nsums + 1, 8);
+        msrc ms; /* what the memory encoder, which this branch left alone, makes of the object */
+        ms_build(&ms, &f.g, f.obj);
+        bool enc = stream_encode_same(&f.g, f.obj, &ms);
+        if (!enc)
+            fprintf(ERR, "stream put %s: chunk_encode_stream's cells or sums differ from chunk_encode's\n", t[i].label);
+        CHECK(enc);
+
+        /* the same files and sums as chunk_be_put_object, from a source that changes each stripe once read */
+        chunk_backend *be = stream_backend(root, f.n);
+        vsrc v;
+        vs_init(&v, &f.g, f.obj, true);
+        chunk_put_src src = {&v, vs_fill};
+        int rc = chunk_be_put_stream(be, f.vol, f.vuuid, f.oid, &f.g, 2, &src, ~0u, rec);
+        CHECK(rc == 0);
+        if (!vs_once(&v))
+            fprintf(ERR, "stream put %s: the source was read more than once or out of order\n", t[i].label);
+        CHECK(vs_once(&v));
+        bool same = rc == 0 && stream_same_files(&f, root) && memcmp(rec, f.rec, (size_t)nsums * 8) == 0;
+        if (!same)
+            fprintf(ERR, "stream put %s: chunk files or sums differ from chunk_be_put_object's\n", t[i].label);
+        CHECK(same);
+        same = rc == 0 && memcmp(rec, ms.rec, (size_t)nsums * 8) == 0 && stream_same_as_memory(be, &f, &ms);
+        if (!same)
+            fprintf(ERR, "stream put %s: chunk cells or sums differ from chunk_encode's\n", t[i].label);
+        CHECK(same);
+        chunk_obj *o = NULL;
+        uint8_t *back = malloc((size_t)t[i].len);
+        CHECK(chunk_obj_open(be, f.vol, f.vuuid, f.oid, NULL, ms.rec, &o) == 0);
+        CHECK(o && chunk_obj_read(o, 0, t[i].len, back, 0, NULL) == 0 && memcmp(back, f.obj, (size_t)t[i].len) == 0);
+        chunk_obj_close(o);
+        free(back);
+        vs_free(&v);
+        chunk_be_close(be);
+
+        /* an abort from the source at every stripe: its code comes back, and no chunk (nor a tmp file) is left */
+        uint64_t ns = chunk_nstripes(&f.g);
+        for (uint64_t at = 0; at < ns; at += ns > 8 ? ns / 4 : 1) {
+            be = stream_backend(root, f.n);
+            vs_init(&v, &f.g, f.obj, false);
+            v.abort_at = at, v.abort_rc = -77 - (int)at;
+            src.ctx = &v;
+            CHECK(chunk_be_put_stream(be, f.vol, f.vuuid, f.oid, &f.g, 2, &src, ~0u, NULL) == -77 - (int)at);
+            CHECK(v.next == at + 1); /* nothing asked for past the stripe that aborted */
+            CHECK(stream_files_left(root, f.n, f.vol) == 0);
+            chunk_rd *r = NULL;
+            chunk_ident id = {.volume = f.vol, .pos = 0};
+            memcpy(id.vuuid, f.vuuid, 16), memcpy(id.oid, f.oid, 16);
+            CHECK(chunk_be_rd_open(be, &id, &r) == TSDB_ERR_NOTFOUND);
+            if (r)
+                chunk_rd_close(r);
+            /* the same backend takes the object afterwards, whole */
+            vs_free(&v);
+            vs_init(&v, &f.g, f.obj, false);
+            CHECK(chunk_be_put_stream(be, f.vol, f.vuuid, f.oid, &f.g, 2, &src, ~0u, NULL) == 0);
+            CHECK(stream_same_files(&f, root));
+            vs_free(&v);
+            chunk_be_close(be);
+            aborts++;
+        }
+        /* a chunk write that fails (the first, one in the middle, the last of the last stripe, when every other
+         * position holds all its cells): the code comes back and no chunk is committed, then the object goes in */
+        be = stream_backend(root, f.n);
+        vs_init(&v, &f.g, f.obj, false);
+        src.ctx = &v;
+        chunk_fault_write = INT_MAX;
+        CHECK(chunk_be_put_stream(be, f.vol, f.vuuid, f.oid, &f.g, 2, &src, ~0u, NULL) == 0);
+        int writes = INT_MAX - chunk_fault_write; /* cell writes of one whole put */
+        chunk_fault_write = 0;
+        vs_free(&v);
+        chunk_be_close(be);
+        CHECK(writes >= (int)chunk_npos(&f.g));
+        int at_w[3] = {1, writes / 2 + 1, writes};
+        for (int j = 0; j < 3; j++) {
+            be = stream_backend(root, f.n);
+            vs_init(&v, &f.g, f.obj, false);
+            src.ctx = &v;
+            chunk_fault_write = at_w[j];
+            int wrc = chunk_be_put_stream(be, f.vol, f.vuuid, f.oid, &f.g, 2, &src, ~0u, NULL);
+            chunk_fault_write = 0;
+            int left = stream_files_left(root, f.n, f.vol);
+            if (wrc != TSDB_ERR_IO || left != 0)
+                fprintf(ERR, "stream put %s: cell write %d of %d failed: rc %d, %d chunk files left\n", t[i].label,
+                        at_w[j], writes, wrc, left);
+            CHECK(wrc == TSDB_ERR_IO && left == 0);
+            vs_free(&v);
+            vs_init(&v, &f.g, f.obj, false);
+            CHECK(chunk_be_put_stream(be, f.vol, f.vuuid, f.oid, &f.g, 2, &src, ~0u, NULL) == 0);
+            CHECK(stream_same_files(&f, root));
+            vs_free(&v);
+            chunk_be_close(be);
+            aborts++;
+        }
+        /* a positive abort code from the source is no success: TSDB_ERR_INVALID, and nothing is left */
+        be = stream_backend(root, f.n);
+        vs_init(&v, &f.g, f.obj, false);
+        v.abort_at = v.ns - 1, v.abort_rc = 1;
+        src.ctx = &v;
+        CHECK(chunk_be_put_stream(be, f.vol, f.vuuid, f.oid, &f.g, 2, &src, ~0u, NULL) == TSDB_ERR_INVALID);
+        CHECK(stream_files_left(root, f.n, f.vol) == 0);
+        vs_free(&v);
+        chunk_be_close(be);
+        /* a partial posmask: those positions only, the same files */
+        be = stream_backend(root, f.n);
+        vs_init(&v, &f.g, f.obj, true);
+        src.ctx = &v;
+        unsigned mask = 0x5u & ((1u << chunk_npos(&f.g)) - 1);
+        CHECK(chunk_be_put_stream(be, f.vol, f.vuuid, f.oid, &f.g, 2, &src, mask, NULL) == 0 && vs_once(&v));
+        CHECK(stream_files_left(root, f.n, f.vol) == popcount(mask));
+        vs_free(&v);
+        chunk_be_close(be);
+
+        free(rec);
+        ms_free(&ms);
+        fx_free(&f);
+        shapes++;
+    }
+    /* arguments */
+    chunk_geom g;
+    CHECK(chunk_geom_make(&g, 4, 2, 32, 100) == 0);
+    char root[PATH_MAX + 32];
+    snprintf(root, sizeof root, "%s/stream-args", S);
+    chunk_backend *be = stream_backend(root, 1);
+    uint8_t id16[16] = {1};
+    chunk_put_src none = {NULL, NULL};
+    CHECK(chunk_be_put_stream(be, 3, id16, id16, &g, 2, &none, ~0u, NULL) == TSDB_ERR_INVALID);
+    CHECK(chunk_be_put_stream(be, 3, id16, id16, &g, 2, NULL, ~0u, NULL) == TSDB_ERR_INVALID);
+    chunk_be_close(be);
+    printf("  stream put: %u shapes give put_object's files and chunk_encode's cells from a source read once, "
+           "%u aborts and failed writes leave nothing\n",
+           shapes, aborts);
+}
+
 /* ---------------------------------------------------------------- main */
 static void set_mutant(const char *m)
 {
@@ -2016,6 +2339,8 @@ static void set_mutant(const char *m)
         chunk_mutant = CHUNK_MUT_NOSYNC;
     else if (!strcmp(m, "epochnosync"))
         chunk_mutant = CHUNK_MUT_EPOCH_NOSYNC;
+    else if (!strcmp(m, "streamreread"))
+        chunk_mutant = CHUNK_MUT_STREAM_REREAD;
     else {
         fprintf(stderr, "test_chunk: no mutant %s\n", m);
         exit(2);
@@ -2079,6 +2404,7 @@ int main(int argc, char **argv)
     test_stale_writers();
     test_two_encodings();
     test_degraded_backend();
+    test_stream_put();
     test_threads();
     test_crashfs();
     if (failures) {

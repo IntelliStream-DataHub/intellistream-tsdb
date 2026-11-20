@@ -1,6 +1,12 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Database lifecycle, the active parts list, buffered appends and maintenance. */
 #include "internal.h"
+#include "eccache.h"
+#include "ecgc.h"
+#include "eckeep.h"
+#include "ecpart.h"
+#include "ecskip.h"
+#include "tier.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -228,7 +234,15 @@ static int64_t wait_mono_ms(void)
  * counting only the time between merges would stretch the bound to wait_stall_ms times the length of a merge).
  * Then the partition is remembered as stalled (stalled[]): the next waiters go on at once until its count falls or
  * a merge of it commits, so the bound is paid once, not per call and per part. Without this a partition whose merges
- * kept failing held every writer of the process for ever (jepsen --nemesis misdirect, verify_checksums off). */
+ * kept failing held every writer of the process for ever (jepsen --nemesis misdirect, verify_checksums off).
+ * R7 (src/ecskip.h): .ec and settling parts are barriers for `pairs`, like damaged ones: no merge takes them, so
+ * only two neighbours with neither between them can bring the count down. .ec parts are left out of the count: a
+ * settled partition holds as many of them as it had parts when it settled (hundreds, for a key of many small
+ * parts), they are at rest by design and no merge ever lowers their number, so counting them would hold every
+ * insert into the partition for wait_stall_ms past PARTS_TO_DELAY_INSERT. A settling part still counts (it is
+ * a .part until the swap). With no pair left the insert goes on at once, also while a settle is in flight: the
+ * swap would lower the count, but a settle can take minutes (drop_settle_locked) and does not fall behind the
+ * inserts the way merges do, so waiting for it would only hold a writer of a cold key for wait_stall_ms. */
 void db_wait_merges(eng *db, int64_t partition)
 {
     if (db->nmergers == 0)
@@ -239,26 +253,32 @@ void db_wait_merges(eng *db, int64_t partition)
     uint64_t start_seq = db->merge_fail_seq;
     while (!atomic_load(&db->stop)) {
         size_t n = 0;
-        bool merging = false, failed = false, pairs = false, prev_ok = false;
+        bool merging = false, failed = false, pairs = false, prev_ok = false, settling = false;
         part *bad = NULL;
         for (size_t i = 0; i < db->nparts; i++) {
             part *p = db->parts[i];
             if (p->partition != partition)
                 continue;
-            n++;
+            if (!part_is_ec(p) || ecskip_mutant == ECSKIP_MUT_WAITCOUNTEC)
+                n++;
             merging |= p->merging;
+            settling |= p->settling; /* only the waitsettle mutant waits for a settle (above) */
             failed |= p->fail_seq > start_seq;
             bool dmg = atomic_load(&p->damaged);
             if (dmg && !bad)
                 bad = p;
-            pairs |= prev_ok && !dmg; /* two neighbours with no barrier between: a merge can still run */
-            prev_ok = !dmg;
+            bool wall = dmg || (part_merge_barrier(p) && ecskip_mutant != ECSKIP_MUT_WAITWALL);
+            pairs |= prev_ok && !wall; /* two neighbours with no barrier between: a merge can still run */
+            prev_ok = !wall;
         }
         if (n <= PARTS_TO_DELAY_INSERT || eng_check(db)) {
             if (n <= PARTS_TO_DELAY_INSERT)
                 db_stall_clear_locked(db, partition);
             break;
         }
+        if (!pairs && !bad && ecskip_mutant != ECSKIP_MUT_WAITNOBREAK &&
+            (ecskip_mutant != ECSKIP_MUT_WAITSETTLE || !settling))
+            break; /* R7: .ec or settling barriers alone, no merge can lower the count (above) */
         if (bad && !pairs) {
             if (!atomic_exchange(&bad->wait_logged, true))
                 fprintf(stderr, "tsdb: partition %" PRId64 " has %zu parts and part %s is damaged: no two parts "
@@ -667,7 +687,7 @@ static int load_parts(eng *db, bool read_only)
         const char *name = e->d_name;
         /* Only names the engine writes: a volume may be a directory with the user's own files in it
          * (tsdb_volume_add_dir), and their tmp_notes.txt or retired_old.csv is not ours to delete. */
-        if (part_tmp_name(name) || meta_tmp_name(name) || strcmp(name, FNO_FILE ".tmp") == 0 ||
+        if (part_tmp_name(name) || ec_tmp_name(name) || meta_tmp_name(name) || strcmp(name, FNO_FILE ".tmp") == 0 ||
             strcmp(name, "MANIFEST.tmp") == 0 || strcmp(name, FEED_FILE ".tmp") == 0 ||
             strcmp(name, FEEDSLOTS_FILE ".tmp") == 0) { /* an interrupted fno_create, `tsdb upgrade` or feed file */
             if (!read_only)
@@ -679,34 +699,35 @@ static int load_parts(eng *db, bool read_only)
             if (!read_only && db->opt.obsolete_part_lifetime_s <= 0) {
                 unlinkat(db->dirfd, name, 0); /* no lifetime: nobody is promised the file */
             } else if (!read_only && db->ngraveyard < 1u << 20) {
-                if (db->ngraveyard == db->graveyard_cap) {
-                    size_t cap = db->graveyard_cap ? db->graveyard_cap * 2 : 64;
-                    graveyard_entry *g = realloc(db->graveyard, cap * sizeof *g);
-                    if (!g) {
-                        rc = TSDB_ERR_NOMEM;
-                        break;
-                    }
-                    db->graveyard = g;
-                    db->graveyard_cap = cap;
-                }
-                graveyard_entry *e = &db->graveyard[db->ngraveyard++];
-                snprintf(e->name, sizeof e->name, "%s", name);
-                e->deadline = eng_mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000;
+                rc = graveyard_add(db, name, GY_PART,
+                                   eng_mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000);
+                if (rc)
+                    break;
             }
             continue;
         }
-        if (!part_file_name(name))
+        /* R7's names (src/ecpart.h): each to the file that owns it */
+        if (ec_retired_name(name) || settled_part_name(name)) {
+            rc = ec_retired_name(name) ? ecgc_load_retired(db, name, read_only)
+                                       : eckeep_load_settled(db, name, read_only);
+            if (rc)
+                break;
             continue;
-        part *p;
-        int r = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, &p);
-        if (r == TSDB_ERR_NOTFOUND)
-            continue; /* removed while we listed the directory */
+        }
+        bool ec = ec_file_name(name);
+        if (!ec && !part_file_name(name))
+            continue;
+        part *p = NULL;
+        int r = ec ? ecpart_load(db, name, read_only, &p)
+                   : part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, &p);
+        if (r == TSDB_ERR_NOTFOUND || (r == 0 && !p))
+            continue; /* removed while we listed the directory (or an .ec file its owner leaves alone) */
         if (r == 0 && p->grows != db->granule_rows) {
             part_unref(p);
             r = TSDB_ERR_CORRUPT;
         }
-        if (r == 0)
-            p->verify = db->opt.verify_checksums;
+        if (r == 0 && !p->ec)
+            p->verify = db->opt.verify_checksums; /* an .ec part's granules are always checked (E11) */
         if (r == TSDB_ERR_CORRUPT || r == TSDB_ERR_INVALID) {
             /* Never left out quietly: its rows would vanish and older values of
              * the same keys come back, and a merge would make that permanent.
@@ -934,7 +955,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         rc = TSDB_ERR_INVALID;
         goto fail;
     }
-    if ((rc = meta_load_or_create(db, ro)) != 0)
+    if ((rc = meta_load_or_create(db, ro)) != 0 || (rc = tier_engine_attach(db)) != 0) /* R7: after META */
         goto fail;
     if (replica && !db->replica_req) {
         /* a replica cuts its log to the leader's and skips what its links say: on a directory that was never made for
@@ -1025,6 +1046,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         open_check = NULL;
         check(db, open_check_arg);
     }
+    if (!ro && db->tier && (rc = ecgc_open_sweep(db)) != 0) /* R7 (D6): orphan chunks, before any thread starts */
+        goto fail;
     if (!ro && db->opt.merge_threads > 0) {
         db->mergers = calloc((size_t)db->opt.merge_threads, sizeof *db->mergers);
         for (int i = 0; db->mergers && i < db->opt.merge_threads; i++)
@@ -1234,6 +1257,7 @@ int eng_close(eng *db)
     pthread_cond_destroy(&db->merge_cv);
     pthread_cond_destroy(&db->merged_cv);
     pthread_cond_destroy(&db->flush_cv);
+    tier_engine_detach(db); /* R7: after the parts went (an .ec part reaches the tier through its engine) */
     free(db->dir);
     free(db);
     return rc;
@@ -1558,7 +1582,14 @@ int eng_drop_before(eng *db, int64_t ts)
 /* The part of tsdb_drop_before after the flush: retires every partition that ends at or before ts. A replica runs
  * it when it applies the DROP marker (replica.c), after it has flushed its sealed memtables. */
 /* db->lock held: publishes the drop's intent (no merge of a partition ending at or before ts is selected while it is
- * set) and waits until the merges of those partitions already in flight have listed their outputs */
+ * set) and waits until the merges of those partitions already in flight have listed their outputs. R7: never for a
+ * settle (p->settling) of a single server's tier. Its encode can take minutes on a slow store and is nobody's
+ * acknowledgement: the drop retires the settling part like any other, and the single-server swap (r7-swap items 2-4)
+ * lists nothing: it checks under db->lock, in the hold of its renames, that every input is still listed and not
+ * dropped, and its recovery rolls back an intent whose sources are retired or gone (the intent is durable before
+ * that check, and a drop takes no publish_lock: the window that makes drops wait for merges). Those, with r7-swap's
+ * swapnodropcheck mutant and power-loss test, keep a dropped part from coming back, not a wait here. A cluster
+ * settle is different (design-cluster-data.md 2.3): there the drop waits at the settle gate for steps 3-6. */
 static void drop_settle_locked(eng *db, int64_t ts)
 {
     db->drop_pending = true;
@@ -1568,7 +1599,8 @@ static void drop_settle_locked(eng *db, int64_t ts)
         for (size_t i = 0; i < db->nparts && !busy; i++) {
             int64_t lo, end;
             partition_range(db, db->parts[i]->partition, &lo, &end);
-            busy = end <= ts && db->parts[i]->merging;
+            busy = end <= ts && (db->parts[i]->merging ||
+                                 (ecskip_mutant == ECSKIP_MUT_DROPWAITSETTLE && db->parts[i]->settling));
         }
         if (busy)
             pthread_cond_wait(&db->merged_cv, &db->lock);
@@ -1602,7 +1634,10 @@ int drop_retire(eng *db, int64_t ts)
         if (eng_check(db)) /* a rename below failed: retire nothing more */
             break;
         if (end <= ts) {
-            p->dropped = true; /* an in-flight merge of it discards its result */
+            /* an in-flight merge of it discards its result. R7: an .ec part goes the same way (db_retire_locked
+             * renames it retired_<name>.ec, its object goes with it, r7-gc), and so does a settling one: a
+             * single server's swap sees `dropped` under db->lock and lists nothing (drop_settle_locked) */
+            p->dropped = true;
             db_retire_locked(db, p);
             retired = true;
         } else {
@@ -1636,7 +1671,7 @@ static void stats_walk(eng *db, tsdb_stats *st, uint64_t *granules, uint64_t *me
             *merging += p->merging;
         st->parts++;
         st->rows += p->rows;
-        st->bytes += p->map_len;
+        st->bytes += p->ec ? eccache_part_bytes(p) : p->map_len; /* R7: what an .ec part counts as its file */
         if (i == 0 || db->parts[i - 1]->partition != p->partition)
             st->partitions++;
     }
@@ -1696,7 +1731,8 @@ int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info),
     for (size_t i = 0; i < n; i++) {
         part *p = ps[i];
         tsdb_part_info info = {.name = p->name, .partition = p->partition, .min_ts = p->min_ts, .max_ts = p->max_ts,
-                               .rows = p->rows, .bytes = p->map_len, .granules = p->ng, .level = p->level,
+                               .rows = p->rows, .bytes = p->ec ? eccache_part_bytes(p) : p->map_len, /* R7 */
+                               .granules = p->ng, .level = p->level,
                                .created_s = p->created, .written_s = p->written,
                                .cls = partition_class(db, p->partition)};
         partition_range(db, p->partition, &info.start_ms, &info.end_ms);

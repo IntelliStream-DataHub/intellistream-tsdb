@@ -33,6 +33,7 @@
  */
 #define _GNU_SOURCE
 #include "auth.h"
+#include "cluster.h"
 #include "tenants.h"
 #include "tsdb_protocol.h"
 #include "../client/tsdb_crypto.h"
@@ -40,10 +41,12 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -160,6 +163,23 @@ static pthread_mutex_t stop_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t stop_cv = PTHREAD_COND_INITIALIZER;
 static bool stop_flag;
 const char *auth_test_nonce;
+/* The cluster store (auth_set_group): the watch replaces `us` (a group store) and publishes under users_mu; the
+ * applied index of the last push and a count of pushes, which group_cv (on users_mu) announces to admin ops waiting for
+ * their entry to come back. */
+static const auth_group_ops *group;
+static pthread_cond_t group_cv;
+static uint64_t group_applied, group_pushes;
+/* TSDB_AUTH_MUTANT (tests only): authlocalusers (a cluster node reads its root's USERS), adminlocal (an admin op is
+ * answered without reaching the group), loginbeforecatchup (the restart barrier ignored), barrierifempty (the barrier
+ * holds only while the copy has no users: a restarted server's copy from its snapshot lets logins in) */
+static int mutant;
+enum { MUT_LOCALUSERS = 1, MUT_ADMINLOCAL, MUT_EARLYLOGIN, MUT_BARRIEREMPTY, MUT_NOGUARD, MUT_RETRYUNAVAIL,
+       MUT_PUSHNORETRY };
+/* more mutants: noguard (an admin op is proposed without the actor guard), retryunavail (an outcome unknown answers
+ * UNAVAILABLE), pushnoretry (a push this server failed to take is not asked for again). TSDB_AUTH_TEST
+ * failpush_file=PATH (tests only): every push fails, as out of memory, while PATH exists. */
+static char failpush_file[4096];
+static int push_failing; /* failed pushes in a row: one log line for a run of them */
 
 bool auth_enabled(void) { return enabled; }
 
@@ -373,7 +393,7 @@ static void reg_sync(void)
         atomic_store_explicit(&au->stale, true, memory_order_relaxed);
         dead[ndead++] = au; /* room: au_get kept dead_cap >= ndead + nreg */
     }
-    if (enabled && snap && snap->superusers == 0) {
+    if (enabled && snap && snap->superusers == 0 && !us.group) {
         if (!no_super_logged)
             fprintf(stderr, "tsdbd: USERS has no superuser any more: logged-in users keep their grants; a restart "
                             "will refuse to start until 'tsdb <dir> user add NAME --superuser'\n");
@@ -411,6 +431,107 @@ static int publish(void)
     return 0;
 }
 
+void auth_set_group(const auth_group_ops *ops)
+{
+    group = ops;
+    const char *m = getenv("TSDB_AUTH_MUTANT");
+    mutant = !m ? 0 : !strcmp(m, "authlocalusers") ? MUT_LOCALUSERS : !strcmp(m, "adminlocal") ? MUT_ADMINLOCAL
+                   : !strcmp(m, "loginbeforecatchup") ? MUT_EARLYLOGIN
+                   : !strcmp(m, "barrierifempty")     ? MUT_BARRIEREMPTY
+                   : !strcmp(m, "noguard")            ? MUT_NOGUARD
+                   : !strcmp(m, "retryunavail")       ? MUT_RETRYUNAVAIL
+                   : !strcmp(m, "pushnoretry")        ? MUT_PUSHNORETRY : 0;
+    if (mutant)
+        fprintf(stderr, "tsdbd: TSDB_AUTH_MUTANT=%s (a test of the tests)\n", m);
+    const char *t = getenv("TSDB_AUTH_TEST");
+    if (t && !strncmp(t, "failpush_file=", 14))
+        snprintf(failpush_file, sizeof failpush_file, "%s", t + 14);
+    if (mutant == MUT_LOCALUSERS)
+        group = NULL;
+}
+
+/* The copy's users, on the cluster thread (cluster_set_users_watch): no I/O under users_mu in a group store, so the
+ * thread waits only for another publish or an admin op's check. */
+static int on_group_users(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied)
+{
+    (void)arg;
+    bool fail = failpush_file[0] && access(failpush_file, F_OK) == 0;
+    users_group_rec *r = fail ? NULL : malloc((n ? n : 1) * sizeof *r);
+    int rc = r ? 0 : TSDB_ERR_NOMEM;
+    uint32_t refused = 0;
+    if (r) {
+        for (uint32_t i = 0; i < n; i++)
+            r[i] = (users_group_rec){u[i].name, u[i].uid, u[i].version, u[i].blob, u[i].len};
+        pthread_mutex_lock(&users_mu);
+        if ((rc = users_group_set(&us, r, n, &refused)) == 0)
+            rc = publish();
+        if (rc == 0) {
+            group_applied = applied;
+            group_pushes++;
+            pthread_cond_broadcast(&group_cv);
+        }
+        pthread_mutex_unlock(&users_mu);
+        free(r);
+    }
+    if (rc != 0) {
+        /* the cluster thread pushes again on its next tick (100 ms): logins go on with the users as they were */
+        if (push_failing++ == 0)
+            fprintf(stderr, "tsdbd: the cluster's users at %" PRIu64 ": out of memory: logins go on with the users "
+                            "as they were until a push succeeds\n", applied);
+        return mutant == MUT_PUSHNORETRY ? 0 : rc;
+    }
+    if (push_failing)
+        fprintf(stderr, "tsdbd: the cluster's users at %" PRIu64 ": taken after %d failed pushes\n", applied,
+                push_failing);
+    push_failing = 0;
+    if (refused) /* the group stores what a holder of the cluster secret put (cluster.h): never a login with it */
+        fprintf(stderr, "tsdbd: the cluster's users at %" PRIu64 ": %" PRIu32 " that do not decode as the user "
+                        "they are listed as: nobody logs in as them\n", applied, refused);
+    return 0;
+}
+
+static int group_refuse_users(const char *dir)
+{
+    struct stat st;
+    char path[4200];
+    snprintf(path, sizeof path, "%s/USERS", dir);
+    if (lstat(path, &st) == 0) {
+        fprintf(stderr, "tsdbd: %s: a cluster server takes its users from the metadata group, never from its root: "
+                        "move the file aside (out of %s), start this tsdbd, then carry the users over with 'tsdb "
+                        "cluster user import PEER DIR... --secret-file F' from the moved copies "
+                        "(docs/cluster-preview.md, \"Logins\")\n", path, dir);
+        return TSDB_ERR_INVALID;
+    }
+    if (errno != ENOENT) { /* it may or may not be there: refuse rather than log in past it */
+        fprintf(stderr, "tsdbd: %s: %s (a cluster server's root must not hold USERS)\n", path, strerror(errno));
+        return TSDB_ERR_IO;
+    }
+    return 0;
+}
+
+static int init_group(const char *dir)
+{
+    (void)dir;
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&group_cv, &ca);
+    pthread_condattr_destroy(&ca);
+    pthread_mutex_lock(&users_mu);
+    int rc = users_group_init(&us);
+    if (rc == 0) {
+        us_open = true;
+        rc = publish(); /* no users until the copy shows them: every login fails (or waits, the barrier) */
+    }
+    pthread_mutex_unlock(&users_mu);
+    if (rc != 0) {
+        fprintf(stderr, "tsdbd: the cluster's users: %s\n", tsdb_strerror(rc));
+        return rc;
+    }
+    group->set_watch(on_group_users, NULL); /* not under users_mu: the cluster thread holds its own lock across a push */
+    return 0;
+}
+
 int auth_init(const char *dir, bool on, bool writable, tsdb *db)
 {
     enabled = on;
@@ -419,8 +540,16 @@ int auth_init(const char *dir, bool on, bool writable, tsdb *db)
         long pages = sysconf(_SC_PHYS_PAGES), psize = sysconf(_SC_PAGESIZE);
         auth_map_budget = pages > 0 && psize > 0 ? (size_t)pages * (size_t)psize / 16 : MAP_CAP;
     }
+    if (group && group_refuse_users(dir) != 0)
+        return TSDB_ERR_INVALID; /* also with --no-auth: a USERS a cluster server never reads must not look valid */
+    if (group && users_mark_cluster(dir) != 0) { /* before a 'tsdb DIR user add' can make a USERS here */
+        fprintf(stderr, "tsdbd: %s/" USERS_CLUSTER_MARK ": %s\n", dir, strerror(errno));
+        return TSDB_ERR_IO;
+    }
     if (!on)
         return 0; /* --no-auth: nothing reads USERS, and the admin ops are refused (auth_check) */
+    if (group)
+        return init_group(dir);
     pthread_mutex_lock(&users_mu);
     int rc = users_open(&us, dir, writable);
     if (rc != 0) {
@@ -451,7 +580,7 @@ void auth_reload(void)
     if (us_open) {
         if (auth_test_reload_hook)
             auth_test_reload_hook();
-        int rc = users_reload(&us); /* may wait on NFS: only users_mu is held */
+        int rc = us.group ? 0 : users_reload(&us); /* may wait on NFS: only users_mu is held */
         if (rc != 0 && !damaged_logged) {
             damaged_logged = true;
             fprintf(stderr, "tsdbd: USERS: %s: the users stay as last read; user admin ops are refused until a "
@@ -492,6 +621,8 @@ int auth_start_reload(void)
 
 void auth_shutdown(void)
 {
+    if (group && us_open)
+        group->set_watch(NULL, NULL); /* waits for a push in progress; not under users_mu (on_group_users takes it) */
     if (reload_running) {
         pthread_mutex_lock(&stop_mu);
         stop_flag = true;
@@ -602,6 +733,18 @@ int auth_scram_start(auth_conn *a, const uint8_t *p, size_t len, uint8_t *out, s
 {
     if (a->state == AS_IN)
         return TSDB_ERR_INVALID; /* a connection logs in once */
+    /* the restart barrier (D-S2): until this server heard the group's commit index and applied it, its copy may hold
+     * a user dropped (a password changed) while it was down; the client retries after retry_after, never AUTH */
+    if (a->state == AS_NONE && group && mutant != MUT_EARLYLOGIN && !group->caught_up()) {
+        bool some = false;
+        if (mutant == MUT_BARRIEREMPTY) {
+            pthread_mutex_lock(&auth_mu);
+            some = snap && snap->n > 0;
+            pthread_mutex_unlock(&auth_mu);
+        }
+        if (!some)
+            return TSDB_ERR_UNAVAILABLE;
+    }
     if (a->state != AS_NONE) { /* a second AUTH_START is a client's bug; after a failure the answer stays AUTH */
         int rc = a->state == AS_STARTED ? TSDB_ERR_INVALID : TSDB_ERR_AUTH;
         scram_clear(a);
@@ -921,9 +1064,11 @@ int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need)
     return need == NEED_ANY ? ids_check(au, ids, n, need, true) : ids_check(au, ids, n, need, false);
 }
 
-int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
+/* What auth_check_login and auth_check_ids share: an error, 0 (decided: allowed), or 1 with the rights the op's series
+ * need in *need (P_SERIES, no right on `all` that covers it). quiet: the second caller logs nothing. */
+static int check_pre(auth_conn *a, const auth_op *e, uint8_t op, const uint8_t *p, size_t len, uint8_t *need,
+                     bool quiet)
 {
-    const auth_op *e = &auth_ops[op];
     if (a->state != AS_IN)
         return e->who == P_ANY || e->who == P_PRE ? 0 : TSDB_ERR_AUTH;
     if (e->who == P_PRE)
@@ -937,7 +1082,7 @@ int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
             return 0;
         static _Atomic time_t last;
         time_t t = time(NULL);
-        if (atomic_exchange_explicit(&last, t, memory_order_relaxed) != t)
+        if (!quiet && atomic_exchange_explicit(&last, t, memory_order_relaxed) != t)
             fprintf(stderr, "tsdbd: --no-auth: user admin op %u refused; manage users with 'tsdb <dir> user'\n",
                     op);
         return TSDB_ERR_DENIED;
@@ -954,33 +1099,57 @@ int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
     case P_COMMIT: return au->writer ? 0 : TSDB_ERR_DENIED;
     default: break;
     }
-    uint8_t need = e->need;
+    *need = e->need;
     if (e->create_at && len >= e->create_at && p[e->create_at - 1])
-        need = R_INSERT;
-    if (enough(au->all, need))
-        return 0;
-    tsdb_sid id;
+        *need = R_INSERT;
+    return enough(au->all, *need) ? 0 : 1;
+}
+
+int auth_check_login(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
+{
+    const auth_op *e = &auth_ops[op];
+    uint8_t need = 0;
+    int rc = check_pre(a, e, op, p, len, &need, false);
+    if (rc <= 0)
+        return rc;
     switch (e->where) {
     case W_ID0:
-    case W_ID8: {
-        size_t at = e->where == W_ID0 ? 0 : 8;
-        if (len < at + 8)
-            return TSDB_ERR_INVALID; /* no series to check: malformed, as the handler would say */
-        memcpy(&id, p + at, 8);
-        if (id == TSDB_MANY_SERIES && e->where == W_ID8 && op != TSDB_OP_REPLACE_RANGE)
-            return 0; /* an id per row: the handler checks each (auth_ids) */
-        return auth_id(a, id, need);
-    }
+    case W_ID8:
+    case W_MULTI: return 0; /* ids: auth_check_ids; QUERY_MULTI per series, in the handler (A17) */
     case W_NAME3: {
         uint16_t n;
         if (len < 3 || (memcpy(&n, p + 1, 2), n == 0 || len < 3u + n) || n > SERIES_NAME_MAX)
             return TSDB_ERR_INVALID; /* the engine would refuse it too: no matching on names it never holds */
-        uint8_t r = rights_of(au->u, (const char *)p + 3, n); /* no lock: the index was built before sharing */
+        uint8_t r = rights_of(a->au->u, (const char *)p + 3, n); /* no lock: the index was built before sharing */
         return enough(r, need) ? 0 : TSDB_ERR_DENIED;
     }
-    case W_MULTI: return 0; /* per series, in the handler (A17) */
     default: return TSDB_ERR_DENIED;
     }
+}
+
+int auth_check_ids(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
+{
+    const auth_op *e = &auth_ops[op];
+    if (e->where != W_ID0 && e->where != W_ID8)
+        return 0; /* auth_check_login decided */
+    uint8_t need = 0;
+    int rc = check_pre(a, e, op, p, len, &need, true);
+    if (rc <= 0)
+        return rc;
+    size_t at = e->where == W_ID0 ? 0 : 8;
+    if (len < at + 8)
+        return TSDB_ERR_INVALID; /* no series to check: malformed, as the handler would say */
+    tsdb_sid id;
+    memcpy(&id, p + at, 8);
+    if (id == TSDB_MANY_SERIES && e->where == W_ID8 && op != TSDB_OP_REPLACE_RANGE)
+        return 0; /* an id per row: the handler checks each (auth_ids) */
+    return auth_id(a, id, need);
+}
+
+int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
+{
+    int rc = auth_check_login(a, op, p, len);
+    return rc ? rc : auth_check_ids(a, op, p, len);
 }
 
 /* ------------------------------------------------------------ admin ops */
@@ -1054,6 +1223,136 @@ static const uint8_t *get_verifier(const uint8_t *p, const uint8_t *end, user_ve
     return p + 5 + v->salt_len + 64;
 }
 
+/* The change of an admin op on `us` (users_mu held): a file store's is made and synced; a group store's checked and
+ * left in us.prop. */
+static int admin_change(uint8_t op, uint32_t actor, const char *name, const uint8_t *q, const uint8_t *end,
+                        user_verifier *vp)
+{
+    int rc;
+    switch (op) {
+    case TSDB_OP_USER_CREATE: {
+        uint8_t flags = q < end ? *q++ : 0;
+        const uint8_t *r = q < end ? get_verifier(q, end, vp) : NULL;
+        rc = !r || r != end || (flags & ~USER_SUPERUSER) ? TSDB_ERR_INVALID : users_create(&us, actor, name, flags, vp, NULL);
+        break;
+    }
+    case TSDB_OP_USER_DROP: rc = q != end ? TSDB_ERR_INVALID : users_drop(&us, actor, name); break;
+    case TSDB_OP_USER_ALTER:
+        rc = end - q != 1 || (*q & ~USER_SUPERUSER) ? TSDB_ERR_INVALID : users_set_flags(&us, actor, name, *q);
+        break;
+    case TSDB_OP_USER_PASSWORD: {
+        const uint8_t *r = get_verifier(q, end, vp);
+        rc = r != end ? TSDB_ERR_INVALID : users_set_verifier(&us, actor, name, vp);
+        break;
+    }
+    case TSDB_OP_GRANT:
+    case TSDB_OP_REVOKE: {
+        uint16_t sl;
+        if (end - q < 4 || (memcpy(&sl, q + 2, 2), (size_t)(end - q) != 4u + sl) || memchr(q + 4, 0, sl)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        rc = op == TSDB_OP_GRANT ? users_grant(&us, actor, name, q[0], (const char *)q + 4, sl, q[1])
+                                 : users_revoke(&us, actor, name, q[0], (const char *)q + 4, sl, q[1]);
+        break;
+    }
+    default: rc = TSDB_ERR_INVALID; break;
+    }
+    return rc;
+}
+
+
+/* tsdbd.c's TSDB_ERR_INDETERMINATE (src/internal.h's number): never on the wire, the connection closes */
+#define AUTH_ERR_INDETERMINATE (-110)
+
+static int group_result(int r)
+{
+    switch (r) {
+    case META_OK: return 0;
+    case META_ERR_EXISTS: return TSDB_ERR_INVALID; /* a create of a name taken meanwhile, as users_create says */
+    case META_ERR_NOTFOUND: return TSDB_ERR_NOTFOUND;
+    case META_ERR_INVALID:
+    case META_ERR_RANGE: return TSDB_ERR_INVALID;
+    case CLUSTER_ERR_NOTLEADER: /* no leader known, nothing proposed: a client retries after retry_after */
+    case CLUSTER_ERR_STATE: return TSDB_ERR_UNAVAILABLE;
+    /* the entry may have committed (sent and no answer, a new leader, a snapshot): UNAVAILABLE says "not applied",
+     * and a client would send it again (a create it made then answers "name taken"). No answer at all instead: tsdbd
+     * closes the connection (frame_put), as for a replicated write of unknown outcome (D12). */
+    case CLUSTER_ERR_RETRY: return mutant == MUT_RETRYUNAVAIL ? TSDB_ERR_UNAVAILABLE : AUTH_ERR_INDETERMINATE;
+    default: return TSDB_ERR_IO;
+    }
+}
+
+/* Waits on group_cv until pred(arg) or ms passed. users_mu held. */
+static void group_wait(bool (*pred)(uint64_t), uint64_t arg, int ms)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    t.tv_sec += ms / 1000;
+    t.tv_nsec += (long)(ms % 1000) * 1000000;
+    if (t.tv_nsec >= 1000000000)
+        t.tv_sec++, t.tv_nsec -= 1000000000;
+    while (!pred(arg))
+        if (pthread_cond_timedwait(&group_cv, &users_mu, &t) != 0)
+            break;
+}
+static bool applied_at(uint64_t index) { return group_applied >= index; }
+static bool pushed_after(uint64_t n) { return group_pushes > n; }
+
+#define GROUP_WAIT_MS 5000 /* how long a change waits for the members, and then for this server's own copy */
+#define GROUP_TRIES 8      /* conditional puts that found the user changed (STALE) before the op gives up */
+
+/* An admin op on a cluster server: checked against the copy (the rules of the file store, users.c), proposed
+ * conditional on the version it was checked at, answered once committed and back in this server's copy (so the
+ * client's next request here sees it). STALE: another change came between; check again on the newer copy. Nothing is
+ * changed here but by the copy: a failed proposal leaves every server as it was. */
+static int admin_group(uint8_t op, uint32_t actor, const char *name, const uint8_t *q, const uint8_t *end,
+                       user_verifier *v)
+{
+    for (int attempt = 0;; attempt++) {
+        users_proposal pr = {0};
+        char aname[USER_NAME_MAX + 1] = "";
+        uint64_t aversion = 0;
+        pthread_mutex_lock(&users_mu);
+        us.prop = &pr;
+        int rc = admin_change(op, actor, name, q, end, v);
+        us.prop = NULL;
+        /* the actor as this copy has them: the commit must find them unchanged (the guard), or a demotion committed
+         * meanwhile, which a lagging copy has not seen, would be undone by a change it no longer allows */
+        const user *au = users_by_uid(&us, actor);
+        if (au && mutant != MUT_NOGUARD) {
+            snprintf(aname, sizeof aname, "%s", au->name);
+            aversion = au->version;
+        }
+        uint64_t seen = group_pushes;
+        pthread_mutex_unlock(&users_mu);
+        if (rc != 0 || pr.op == 0 || mutant == MUT_ADMINLOCAL) {
+            users_proposal_clear(&pr);
+            return rc; /* refused, or nothing to change */
+        }
+        uint64_t index = 0;
+        uint32_t uid = 0, nlag = 0;
+        struct cluster_laggard lag[CLUSTER_LAGGARDS_MAX];
+        int r = group->propose(pr.op == USERS_PROP_PUT ? CLUSTER_USER_PUT : CLUSTER_USER_DEL, pr.name, pr.blob,
+                               (uint32_t)pr.len, pr.version, aname, aversion, GROUP_WAIT_MS, &index, &uid, lag,
+                               &nlag);
+        users_proposal_clear(&pr);
+        bool newer = false;
+        pthread_mutex_lock(&users_mu);
+        if (r == META_OK) {
+            group_wait(applied_at, index, GROUP_WAIT_MS);
+        } else if (r == META_ERR_STALE && attempt + 1 < GROUP_TRIES) {
+            group_wait(pushed_after, seen, GROUP_WAIT_MS); /* the newer user is on its way to this copy */
+            newer = pushed_after(seen);
+        }
+        pthread_mutex_unlock(&users_mu);
+        if (r != META_ERR_STALE)
+            return group_result(r);
+        if (!newer) /* this copy lags (or the tries are spent): it cannot check again, nothing was changed */
+            return TSDB_ERR_UNAVAILABLE;
+    }
+}
+
 int auth_admin(auth_conn *a, uint8_t op, const uint8_t *p, size_t len, uint8_t **out, size_t *out_len)
 {
     *out = NULL;
@@ -1085,39 +1384,17 @@ int auth_admin(auth_conn *a, uint8_t op, const uint8_t *p, size_t len, uint8_t *
     const uint8_t *q = get_name(p, end, name);
     if (!q)
         return TSDB_ERR_INVALID;
+    if (group) {
+        memset(&v, 0, sizeof v);
+        rc = admin_group(op, actor, name, q, end, &v);
+        tsdb_wipe(&v, sizeof v);
+        return rc;
+    }
     pthread_mutex_lock(&users_mu); /* waits for USERS I/O (a reload on a slow NFS): admin ops only */
     if (!us_open) {
         rc = TSDB_ERR_CORRUPT;
     } else {
-        switch (op) {
-        case TSDB_OP_USER_CREATE: {
-            uint8_t flags = q < end ? *q++ : 0;
-            const uint8_t *r = q < end ? get_verifier(q, end, &v) : NULL;
-            rc = !r || r != end || (flags & ~USER_SUPERUSER) ? TSDB_ERR_INVALID : users_create(&us, actor, name, flags, &v, NULL);
-            break;
-        }
-        case TSDB_OP_USER_DROP: rc = q != end ? TSDB_ERR_INVALID : users_drop(&us, actor, name); break;
-        case TSDB_OP_USER_ALTER:
-            rc = end - q != 1 || (*q & ~USER_SUPERUSER) ? TSDB_ERR_INVALID : users_set_flags(&us, actor, name, *q);
-            break;
-        case TSDB_OP_USER_PASSWORD: {
-            const uint8_t *r = get_verifier(q, end, &v);
-            rc = r != end ? TSDB_ERR_INVALID : users_set_verifier(&us, actor, name, &v);
-            break;
-        }
-        case TSDB_OP_GRANT:
-        case TSDB_OP_REVOKE: {
-            uint16_t sl;
-            if (end - q < 4 || (memcpy(&sl, q + 2, 2), (size_t)(end - q) != 4u + sl) || memchr(q + 4, 0, sl)) {
-                rc = TSDB_ERR_INVALID;
-                break;
-            }
-            rc = op == TSDB_OP_GRANT ? users_grant(&us, actor, name, q[0], (const char *)q + 4, sl, q[1])
-                                     : users_revoke(&us, actor, name, q[0], (const char *)q + 4, sl, q[1]);
-            break;
-        }
-        default: rc = TSDB_ERR_INVALID; break;
-        }
+        rc = admin_change(op, actor, name, q, end, &v);
         /* before the reply: the next request of a user this changed sees it. A change that is durable but not
          * published (out of memory) is not acknowledged; the next tick publishes it. */
         int pr = publish();

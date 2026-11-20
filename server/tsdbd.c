@@ -121,6 +121,7 @@
 #include "auth.h"
 #include "tenants.h"
 #include "cluster.h"
+#include "fwd.h"
 #include "cvol.h"
 #include "repld.h"
 #include "../src/cvol.h"
@@ -485,6 +486,16 @@ static void write_on_wait(void *ctx, int delta)
  * frame_put, so every path that answers TSDB_ERR_UNAVAILABLE (the admission, a quiesced volume under an engine
  * call) sends the same body. */
 static __thread uint16_t unav_vol = TSDB_VOL_ANY;
+/* The request in hand writes (auth_ops' R_WRITE): a volume led here with fewer in-sync replicas than its min_isr
+ * refuses it as UNAVAILABLE (UNREACHABLE: its replicas cannot be reached) while its reads are served (D9). */
+static __thread bool unav_write;
+/* route_moved's answer, for frame_put: MOVED's body, or the UNAVAILABLE entry (NO_OWNER) it chose */
+static __thread struct {
+    bool on;
+    tsdb_moved m;
+    tsdb_unavail u;
+    char addr[META_ADDR_MAX];
+} rmv;
 /* A read admitted under the lease (§7.1) checks it again at its first reply frame, which comes after its snapshot: a
  * process paused between admission and snapshot would otherwise answer from a snapshot taken after the lease ended.
  * A lapse in between (cluster_lease_still) on a volume led here drops every frame and handle() answers UNAVAILABLE. */
@@ -599,6 +610,11 @@ static tsdb_unavail unav_entry(uint16_t vol)
         return e;
     }
     vol_health(vol, &health, &reason, &e.since_ms, &e.outage_id, &retry, &dom_idx);
+    if (health == TSDB_HEALTH_AVAILABLE && unav_write && cvol_active() && repld_isr_short(vol)) {
+        e.reason = TSDB_WHY_UNREACHABLE; /* min_isr (REPL_E_ISR): the replicas come back or a shrink is undone */
+        e.retry_after_ms = unav_jitter(1000);
+        return e;
+    }
 found:
     e.reason = health == TSDB_HEALTH_AVAILABLE ? (dom_idx == 0xffff ? TSDB_WHY_NONE : TSDB_WHY_RECOVERING) : reason;
     e.retry_after_ms = unav_jitter(retry);
@@ -938,7 +954,8 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
     }
     if (lguard.on && lguard.failed)
         return !atomic_load(&c->closing); /* handle() answers UNAVAILABLE once the op is done */
-    uint8_t ub[2 + TSDB_UNAVAIL_ENTRY]; /* the body of UNAVAILABLE (protocol 13), after the op's own error shape */
+    uint8_t ub[2 + TSDB_UNAVAIL_ENTRY + 16 + META_ADDR_MAX]; /* the body of UNAVAILABLE or MOVED (protocol 13), after
+                                                             * the op's own error shape */
     size_t ulen = 0;
     /* a cluster volume this server only replicates (or leads before replication is wired) refuses writes as
      * UNAVAILABLE (FENCED), the engine's READONLY; a cluster node has no other read-only volume (--cluster refuses
@@ -948,9 +965,11 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
     /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
      * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
     if (status == TSDB_ERR_UNAVAILABLE && atomic_load(&c->proto) >= 13 && (!ix || *ix == TSDB_MULTI_END)) {
-        tsdb_unavail e = unav_entry(unav_vol);
+        tsdb_unavail e = rmv.on ? rmv.u : unav_entry(unav_vol);
         ulen = tsdb_wire_put_unavail(ub, sizeof ub, &e, 1);
     }
+    if (status == TSDB_ERR_MOVED && rmv.on && (!ix || *ix == TSDB_MULTI_END))
+        ulen = tsdb_wire_put_moved(ub, sizeof ub, &rmv.m, 1); /* route_moved sends MOVED to 13 only */
     size_t body = 4 + 1 + 4 + pre + alen + blen + dlen + ulen;
     if (body > TSDB_MAX_FRAME + pre) { /* callers check: a client could not read it, and the length would wrap */
         atomic_store(&c->closing, true);
@@ -1129,9 +1148,11 @@ static const tsdb_sid *frame_ids(const uint8_t *p, size_t len, size_t end, uint3
 /* A packed INSERT_VALUES: unzstd, unshape into plain arrays, insert. */
 static int cvol_refuse_ids(const tsdb_sid *ids, size_t n);
 static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n);
+static int32_t route_ids(conn *c, const tsdb_sid *ids, size_t n, bool read);
 
-static int insert_packed(auth_conn *a, const uint8_t *p, size_t len, uint32_t n, tsdb_sid s)
+static int insert_packed(conn *c, const uint8_t *p, size_t len, uint32_t n, tsdb_sid s)
 {
+    auth_conn *a = &c->auth;
     unsigned type = p[4];
     bool valid = p[5] & TSDB_VALID, many = s == TSDB_MANY_SERIES;
     uint32_t raw_len;
@@ -1163,7 +1184,7 @@ static int insert_packed(auth_conn *a, const uint8_t *p, size_t len, uint32_t n,
         if (ZSTD_isError(got) || got != raw_len ||
             tsdb_pack_unshape(raw, raw_len, n, type, valid, many, ts, vals, bits, series) != 0) {
             rc = TSDB_ERR_INVALID;
-        } else if (many && (rc = auth_ids(a, series, n, R_INSERT)) != 0) {
+        } else if (many && ((rc = route_ids(c, series, n, false)) != 0 || (rc = auth_ids(a, series, n, R_INSERT)) != 0)) {
             /* one row of a series the user may not insert into refuses the whole frame (A16) */
         } else if (many && (rc = cvol_refuse_ids(series, n)) != 0) {
         } else {
@@ -1582,6 +1603,8 @@ static void handle_multi(conn *c, req *r)
     uint16_t threads = 0;
     uint64_t max_rows = 0;
     int rc = multi_parse(r->payload, r->len, &q, &qr, &series, &n, &m.op, &threads, &max_rows);
+    if (rc == 0) /* before the rights: an id of a volume led elsewhere is not resolved here */
+        rc = route_ids(c, series, n, true);
     tsdb_sid *own = NULL;
     uint8_t *denied = NULL;
     if (rc == 0 && !auth_all(&c->auth, R_READ)) {
@@ -1713,6 +1736,10 @@ static void handle_latest(conn *c, req *r)
         latest_frame(c, r->id, rc, 0, 0, true, NULL);
         return;
     }
+    if ((rc = route_ids(c, ids, n, true)) != 0) { /* before the rights, as in QUERY_MULTI */
+        latest_frame(c, r->id, rc, 0, 0, true, NULL);
+        return;
+    }
     tsdb_sid *own = NULL;
     uint8_t *denied = NULL;
     if (!auth_all(&c->auth, R_READ)) {
@@ -1795,6 +1822,12 @@ static void handle_stats_series(conn *c, req *r)
         return;
     }
     const tsdb_sid *ids = (const tsdb_sid *)(const void *)(p + 8); /* 8-aligned in the malloc'd payload */
+    if ((rc = route_ids(c, ids, n, true)) != 0) { /* before the rights, as in QUERY_MULTI: a replica's statistics of a
+                                                  * replicated volume are a read off the leader, and a remote id is
+                                                  * never judged through this server's names */
+        reply_status(c, r->id, rc);
+        return;
+    }
     tsdb_sid *own = NULL;
     uint8_t *denied = NULL;
     bool bounds = auth_all(&c->auth, R_READ); /* the error bounds of the hot lists: whoever reads everything */
@@ -2261,6 +2294,295 @@ static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n)
 
 static bool g_reader_only; /* --follow or --read-only: every volume is a FOLLOWER in TOPOLOGY */
 
+/* MOVED for cluster volume `vol` to its leader as the metadata copy's snapshot holds it (node id, epoch, the leader's
+ * client address; tsdb_protocol.h), or UNAVAILABLE (NO_OWNER, about 1 s) when the copy knows no leader that is UP.
+ * When the copy names this server as the leader (a volume led here without its lease or still opening, a deposed
+ * leader whose copy is behind) it answers UNAVAILABLE with the local reason (unav_entry; NO_OWNER when there is none):
+ * MOVED to itself would send the client round in a circle until its retry budget ran out.
+ * Either says "not applied": call it before anything of the request is done. s2e's routing and r3e-failover's deposed
+ * leader answer with it; in this step only the test hook (TSDBD_TEST_ROUTE_MOVED) does. */
+static const struct cluster_copy_vol *route_copy_vol(uint32_t v);
+/* route_moved's answer without the reply: the status, with rmv filled for frame_put (handle() clears it). A leader
+ * the copy names whose member is not UP is UNAVAILABLE (PROMOTING, about 200 ms: a promotion is due), as is a volume
+ * the copy says this server leads while it is still a replica here (FENCED: the driver has not promoted it yet). */
+static int32_t route_fill(conn *c, uint16_t vol)
+{
+    uint32_t node = 0;
+    uint64_t epoch = 0;
+    int32_t st = TSDB_ERR_UNAVAILABLE;
+    rmv.on = true;
+    rmv.u = (tsdb_unavail){.vol = vol, .reason = TSDB_WHY_NO_OWNER, .retry_after_ms = unav_jitter(1000)};
+    int where = cluster_vol_owner(vol, &node, &epoch, rmv.addr, sizeof rmv.addr);
+    if (where == 0) {
+        const struct cluster_copy_vol *cv = route_copy_vol(vol);
+        if (cv && cv->leader) {
+            rmv.u.reason = TSDB_WHY_PROMOTING;
+            rmv.u.retry_after_ms = unav_jitter(200);
+            if (cv->epoch < META_EPOCH_LIMIT)
+                rmv.u.epoch = (uint32_t)cv->epoch;
+        }
+    } else if (where == 2) {
+        tsdb_unavail here = unav_entry(vol);
+        if (here.reason == TSDB_WHY_FENCED)
+            here.reason = TSDB_WHY_PROMOTING, here.retry_after_ms = unav_jitter(200);
+        if (here.reason != TSDB_WHY_NONE)
+            rmv.u = here;
+    } else if (where) {
+        if (epoch >= META_EPOCH_LIMIT) /* a check, never an assert: the wire's epoch is 32 bits */
+            fprintf(stderr, "tsdbd: volume %u has epoch %llu, at or above the limit: answered UNAVAILABLE\n",
+                    (unsigned)vol, (unsigned long long)epoch);
+        else if (atomic_load(&c->proto) >= 13) { /* a 12 client knows no MOVED */
+            rmv.m = (tsdb_moved){.vol = vol, .epoch = (uint32_t)epoch, .node_id = node, .addr = rmv.addr,
+                                 .addr_len = (uint16_t)strlen(rmv.addr)};
+            st = TSDB_ERR_MOVED;
+        }
+        if (epoch < META_EPOCH_LIMIT)
+            rmv.u.epoch = (uint32_t)epoch;
+    }
+    return st;
+}
+
+static void route_moved(conn *c, req *r, uint16_t vol)
+{
+    reply_error(c, r->id, r->op, route_fill(c, vol));
+    rmv.on = false;
+}
+
+/* ---- the entry node's decision (S2-1; design-cluster.md D5, C15; ha.md 9.1 "The entry node")
+ * On a cluster node a request is served here only when every cluster volume it names is led here. Otherwise it is
+ * answered before anything of it is done (not applied, include/tsdb.h): MOVED to the leader the metadata copy names,
+ * writes and reads alike (D-S8: a replica never answers a read; S3's REPLICA_OK may), UNAVAILABLE (NO_OWNER, about
+ * 1 s) when the copy names no leader, UNAVAILABLE (PROMOTING, about 200 ms) when the leader's member is not UP
+ * (route_fill). A volume the copy does not know gets today's answer from the gates after it only when it is the root or
+ * open here as a writer; else NO_OWNER (route_away). The decision comes before any right on a series id is checked
+ * (auth_check_ids, auth_ids, auth_id resolve an id through the names of this server's volumes: a volume led elsewhere
+ * would be DENIED here; the owner checks them, D-S8). A frame whose rows name volumes led on two nodes is INVALID with
+ * a log line (D-S4: S3's clients split frames). Led here is this server's own view (the gates after it, the read lease
+ * among them, judge it as before), so a copy that lags a promotion here does not move requests away.
+ * The copy is held per worker thread and taken again only when cluster_copy_builds() moved: per request it reads
+ * one shared line and takes the volume table's read lock (tsdb_cvol_role), which the engine's route takes anyway. */
+enum { RTM_NONE, RTM_RIGHTSBEFOREROUTE, RTM_MOVEDOFFCOPY, RTM_REPLICAREAD, RTM_SPANACCEPTED, RTM_NOCOPYSERVED };
+static int route_mutant; /* TSDB_ROUTE_MUTANT (tests: each must fail test_cluster route) */
+static __thread const struct cluster_copy *rt_cp;
+static __thread unsigned long rt_builds;
+
+static const struct cluster_copy *route_copy(void)
+{
+    unsigned long b = cluster_copy_builds(); /* before the get: published before it was counted (cluster.c) */
+    if (!rt_cp || b != rt_builds) {
+        const struct cluster_copy *n = cluster_copy_get();
+        cluster_copy_put(rt_cp);
+        rt_cp = n;
+        rt_builds = b;
+    }
+    return rt_cp;
+}
+
+static const struct cluster_copy_vol *route_copy_vol(uint32_t v) { return cluster_copy_vol(route_copy(), v); }
+
+static void route_release(void) /* a worker that leaves */
+{
+    cluster_copy_put(rt_cp);
+    rt_cp = NULL;
+}
+
+/* Volume v: 0 to serve here, else 1 with *owner the copy's leader (0: none; this server when the copy names it while
+ * it does not lead the volume here yet). `read`: the request only reads (the replicaread mutant serves it here).
+ * A volume the copy has no record of (no copy yet: a server just started; or a copy that lags the volume's creation)
+ * is served only when it is open here as a writer (the gates after it judge it). Anything else would be answered by
+ * an engine that does not hold the volume: an empty read (jepsen-cluster, kv on random members: a member without kvr,
+ * restarted, answered reads with no rows before its copy was built). It is UNAVAILABLE NO_OWNER, retried, until the
+ * copy knows the volume. Volume 0 (the root, which holds no series on a cluster node) keeps today's answer. */
+static int route_away(uint32_t v, bool read, uint32_t *owner)
+{
+    const struct cluster_copy *cp = route_copy();
+    const struct cluster_copy_vol *cv = cluster_copy_vol(cp, v);
+    *owner = 0;
+    if (!cv)
+        return v != 0 && route_mutant != RTM_NOCOPYSERVED && tsdb_cvol_role(db, v) != CVOL_WRITER;
+    *owner = cv->leader;
+    if (route_mutant == RTM_MOVEDOFFCOPY)
+        return 1;
+    int role = tsdb_cvol_role(db, v);
+    if (role == CVOL_WRITER || (role != CVOL_NONE && cvol_led(v)))
+        return 0;
+    if (route_mutant == RTM_REPLICAREAD && read && role == CVOL_REPLICA)
+        return 0;
+    return 1;
+}
+
+/* A request that names many series (packed and many-series inserts, QUERY_MULTI, QUERY_LATEST, STATS_SERIES): 0 to
+ * serve it here, else its answer (MOVED or UNAVAILABLE with rmv filled; INVALID when its volumes are led on two
+ * nodes). Ids that name no volume are left to the gates after it. */
+static int32_t route_ids(conn *c, const tsdb_sid *ids, size_t n, bool read)
+{
+    if (!cvol_active())
+        return 0;
+    struct {
+        uint32_t v, key;
+    } seen[64]; /* past 64 volumes in one frame a volume is decided again per row (route_away: two read locks) */
+    size_t ns = 0, last = 0;
+    const uint32_t HERE = UINT32_MAX; /* no member id: ids are below it */
+    uint32_t key = 0, kvol = 0, away = UINT32_MAX, self = route_copy() ? rt_cp->self : 0;
+    for (size_t i = 0; i < n; i++) {
+        tsdb_sid id = ids[i];
+        if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY)
+            continue; /* the library refuses it (or a denied id, TSDB_SID_NONE) */
+        uint32_t v = (uint32_t)TSDB_SID_VOLUME(id), k = 0;
+        size_t j = last < ns && seen[last].v == v ? last : 0;
+        while (j < ns && seen[j].v != v)
+            j++;
+        if (j < ns) {
+            k = seen[j].key;
+            last = j;
+        } else {
+            uint32_t owner;
+            int a = route_away(v, read, &owner);
+            k = !a || (owner && owner == self) ? HERE : owner;
+            if (a && away == UINT32_MAX)
+                away = v;
+            if (ns < sizeof seen / sizeof seen[0])
+                seen[ns++] = (__typeof__(seen[0])){v, k};
+        }
+        if (!k || k == key)
+            continue; /* no leader: no owner to span (route_fill answers NO_OWNER) */
+        if (!key) {
+            key = k, kvol = v;
+            continue;
+        }
+        static _Atomic time_t last;
+        time_t t = time(NULL);
+        if (atomic_exchange_explicit(&last, t, memory_order_relaxed) != t)
+            fprintf(stderr, "tsdbd: a frame names volume %u (%s) and volume %u (%s): led on two nodes, refused "
+                    "(INVALID) until clients split such frames\n", (unsigned)kvol,
+                    key == HERE ? "here" : "elsewhere", (unsigned)v, k == HERE ? "here" : "elsewhere");
+        if (route_mutant == RTM_SPANACCEPTED)
+            return 0;
+        return TSDB_ERR_INVALID;
+    }
+    if (away == UINT32_MAX)
+        return 0;
+    return route_fill(c, (uint16_t)away);
+}
+
+/* handle_in's decision for a request naming one volume (unav_vol, by its series id) or a cluster volume by its name
+ * (SERIES, SERIES_CREATE with a path): 0 to serve it here, 1 when answered. */
+static int route_decide(req *r)
+{
+    if (!cvol_active())
+        return 0;
+    uint32_t v = unav_vol, owner;
+    const uint8_t *p = r->payload;
+    size_t len = r->len;
+    if (v == TSDB_VOL_ANY && (r->op == TSDB_OP_SERIES || r->op == TSDB_OP_SERIES_CREATE) && len >= 5) {
+        uint16_t n, pn;
+        memcpy(&n, p + 1, 2);
+        if (len >= 5u + n && (memcpy(&pn, p + 3 + n, 2), pn > 0) && len >= 5u + n + pn) {
+            const struct cluster_copy_vol *cv = cluster_copy_vol_named(route_copy(), (const char *)p + 5 + n, pn);
+            if (cv && cv->number < TSDB_VOL_ANY)
+                v = cv->number;
+        }
+    }
+    if (v == TSDB_VOL_ANY)
+        return 0;
+    if (!route_away(v, !(auth_ops[r->op].need & R_WRITE), &owner))
+        return 0;
+    route_moved(r->c, r, (uint16_t)v);
+    return 1;
+}
+
+/* TOPOLOGY on a cluster node (S2-1), from the metadata copy's snapshot, no I/O: every member as a node (its client
+ * address, alive while UP), and per volume one entry per replica in record order: the leader OWNER, a replica in the
+ * ISR STANDBY, any other FOLLOWER (D9; cluster_copy_role), `owner` that member and `addr` its client address. Health
+ * (D-S6): the owner's entry of a volume led here has this server's own view (vol_health), of one led elsewhere what
+ * the copy says (AVAILABLE while the leader is UP, else UNAVAILABLE NO_OWNER); a replica's entry is AVAILABLE while its
+ * member is UP, else UNAVAILABLE UNREACHABLE. Paths: a superuser's, of the entries of this server. gen is the hash of
+ * the reply with the copy's applied index folded in. No snapshot yet: UNAVAILABLE. An epoch at or above
+ * META_EPOCH_LIMIT does not fit the wire: logged and answered UNAVAILABLE. */
+static void topology_cluster(req *r)
+{
+    conn *c = r->c;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (!cp) {
+        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+        return;
+    }
+    size_t nent = 0;
+    for (uint32_t i = 0; i < cp->nvolumes; i++) {
+        const struct cluster_copy_vol *v = &cp->volumes[i];
+        if (v->epoch >= META_EPOCH_LIMIT) {
+            fprintf(stderr, "tsdbd: TOPOLOGY: volume %u has epoch %llu, at or above the limit\n", (unsigned)v->number,
+                    (unsigned long long)v->epoch);
+            unav_vol = v->number < TSDB_VOL_ANY ? (uint16_t)v->number : TSDB_VOL_ANY;
+            cluster_copy_put(cp);
+            reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+            return;
+        }
+        nent += v->number < TSDB_VOL_ANY ? v->nrep : 0;
+    }
+    bool paths = auth_conn_super(&c->auth);
+    size_t cap = 16 + (size_t)cp->nmembers * (8 + META_ADDR_MAX) + nent * (34 + META_ADDR_MAX + (paths ? 4096 : 0));
+    uint8_t *buf = malloc(cap);
+    if (!buf) {
+        cluster_copy_put(cp);
+        reply_status(c, r->id, TSDB_ERR_NOMEM);
+        return;
+    }
+    size_t at = tsdb_wire_put_topo_head(buf, cap, 0, cp->nmembers);
+    for (uint32_t i = 0; i < cp->nmembers; i++) {
+        const struct cluster_copy_member *m = &cp->members[i];
+        tsdb_topo_node node = {m->id, m->state == META_UP, m->addr, (uint16_t)strlen(m->addr)};
+        at += tsdb_wire_put_topo_node(buf + at, cap - at, &node);
+    }
+    at += tsdb_wire_put_u32(buf + at, cap - at, (uint32_t)nent);
+    for (uint32_t i = 0; i < cp->nvolumes; i++) {
+        const struct cluster_copy_vol *v = &cp->volumes[i];
+        if (v->number >= TSDB_VOL_ANY)
+            continue;
+        const struct cluster_copy_member *lm = v->leader ? cluster_copy_member(cp, v->leader) : NULL;
+        bool here = cp->self && v->leader == cp->self;
+        for (uint32_t k = 0; k < v->nrep; k++) {
+            const struct cluster_copy_member *m = cluster_copy_member(cp, v->rep[k].node);
+            tsdb_topo_vol tv = {.vol = (uint16_t)v->number, .role = (uint8_t)cluster_copy_role(v, v->rep[k].node),
+                                .epoch = (uint32_t)v->epoch, .domain = 0xffff, .owner = v->rep[k].node,
+                                .server = 0xffff, .addr = m ? m->addr : "", .addr_len = m ? (uint16_t)strlen(m->addr) : 0,
+                                .path = ""};
+            if (tv.role == TSDB_ROLE_OWNER && here) {
+                uint32_t retry;
+                vol_health(v->number, &tv.health, &tv.reason, &tv.since_ms, &(uint64_t){0}, &retry, &tv.domain);
+            } else if (tv.role == TSDB_ROLE_OWNER) {
+                bool up = lm && lm->state == META_UP;
+                tv.health = up ? TSDB_HEALTH_AVAILABLE : TSDB_HEALTH_UNAVAILABLE;
+                tv.reason = up ? TSDB_WHY_NONE : TSDB_WHY_NO_OWNER;
+            } else {
+                bool up = m && m->state == META_UP;
+                tv.health = up ? TSDB_HEALTH_AVAILABLE : TSDB_HEALTH_UNAVAILABLE;
+                tv.reason = up ? TSDB_WHY_NONE : TSDB_WHY_UNREACHABLE;
+            }
+            const char *path = paths && cp->self && v->rep[k].node == cp->self && v->number < tsdb_volume_count(db)
+                                   ? tsdb_volume_path(db, v->number)
+                                   : NULL;
+            if (path && strlen(path) <= 4096) {
+                tv.path = path;
+                tv.path_len = (uint16_t)strlen(path);
+            }
+            size_t n = tsdb_wire_put_topo_vol(buf + at, cap - at, &tv);
+            if (n == 0 || n > cap - at)
+                break; /* cannot happen: cap holds every entry at its largest */
+            at += n;
+        }
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 8; i < at; i++)
+        h = (h ^ buf[i]) * 1099511628211ull;
+    for (int i = 0; i < 8; i++) /* the applied index: a new copy is a new gen even where the reply looks the same */
+        h = (h ^ (uint8_t)(cp->applied >> (8 * i))) * 1099511628211ull;
+    cluster_copy_put(cp);
+    tsdb_wire_wr64(buf, h);
+    reply(c, r->id, 0, buf, at, NULL, 0, NULL, 0);
+    free(buf);
+}
+
 /* TOPOLOGY of a server without a cluster (protocol 13): itself as node 1, every volume it has, owned by it, with
  * the health of its storage domain. Its address is empty (the node you are connected to). The paths go to a
  * superuser only. gen is a hash of the rest of the reply, so it changes exactly when the reply does. */
@@ -2270,6 +2592,10 @@ static void handle_topology(req *r)
     uint64_t since;
     if (tsdb_wire_get_topology_request(r->payload, r->len, &since) != 0) {
         reply_status(c, r->id, TSDB_ERR_INVALID);
+        return;
+    }
+    if (cvol_active()) {
+        topology_cluster(r);
         return;
     }
     uint32_t nv = tsdb_volume_count(db);
@@ -2324,16 +2650,30 @@ static void handle_status(req *r)
         return;
     }
     uint32_t nv = tsdb_volume_count(db);
-    size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256;
+    /* a cluster node: its own id and its peers from the metadata copy (0 and none before it has one) */
+    const struct cluster_copy *cp = cvol_active() ? cluster_copy_get() : NULL;
+    size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
+                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) : 0);
     char *t = malloc(cap + 4);
     if (!t) {
+        cluster_copy_put(cp);
         reply_status(c, r->id, TSDB_ERR_NOMEM);
         return;
     }
     size_t at = 4;
 #define ST_PUT(...) (at += (size_t)snprintf(t + at, cap - at, __VA_ARGS__))
-    ST_PUT("node.id=1\nnode.role=%s\nprotocol=%d\nvolumes=%u\n", g_reader_only ? "follower" : "owner",
-           TSDB_PROTOCOL_VERSION, (unsigned)nv);
+    ST_PUT("node.id=%u\nnode.role=%s\nprotocol=%d\nvolumes=%u\n", cp ? (unsigned)cp->self : cvol_active() ? 0u : 1u,
+           g_reader_only ? "follower" : "owner", TSDB_PROTOCOL_VERSION, (unsigned)nv);
+    if (cp) {
+        ST_PUT("cluster.applied=%llu\n", (unsigned long long)cp->applied);
+        for (uint32_t i = 0; i < cp->nmembers; i++) {
+            const struct cluster_copy_member *m = &cp->members[i];
+            if (m->id != cp->self)
+                ST_PUT("peer.%u.addr=%s\npeer.%u.peer=%s\npeer.%u.alive=%d\n", (unsigned)m->id, m->addr,
+                       (unsigned)m->id, m->peer, (unsigned)m->id, m->state == META_UP);
+        }
+        cluster_copy_put(cp);
+    }
     for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
         uint8_t health, reason;
         int64_t since;
@@ -2366,12 +2706,18 @@ static void handle_op(req *r);
 /* Tests (TSDBD_TEST_AUTH_DELAY_MS): a worker that answered TSDB_ERR_AUTH waits that long before it reports done, the
  * window in which the client's next frame arrives (a preempted worker on a busy CI machine); test_auth. */
 static int test_auth_delay_ms;
+/* Tests (TSDBD_TEST_ROUTE_MOVED=1): a write to a cluster volume not led here gets route_moved's answer (test_cluster
+ * topology: the C client follows it), not UNAVAILABLE. =2: an insert to any cluster volume, one led here too
+ * (test_cluster movedself: never MOVED to this server itself). */
+static int test_route_moved;
 static void handle_in(req *r);
 static void handle(req *r)
 {
     lguard.on = lguard.checked = lguard.failed = false;
     lguard.ids = NULL;
+    rmv.on = false; /* per request, as lguard: no answer carries another request's route body */
     handle_in(r);
+    rmv.on = false; /* a handler's route_ids answer went out with its reply; lguard's below is its own */
     if (lguard.on && lguard.failed) { /* the lease lapsed before the snapshot: nothing went out, refused now */
         lguard.on = false;
         reply_error(r->c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
@@ -2389,7 +2735,8 @@ static void handle_in(req *r)
     uint8_t was = a->state;
     atomic_store_explicit(&c->nonup_since, 0, memory_order_relaxed); /* a new request: its time inside a domain
                                                                          * that is not UP starts again (out_wait) */
-    if ((rc = auth_fresh(a)) != 0 || (rc = auth_check(a, r->op, p, len)) != 0) {
+    if ((rc = auth_fresh(a)) != 0 || (rc = auth_check_login(a, r->op, p, len)) != 0 ||
+        (route_mutant == RTM_RIGHTSBEFOREROUTE && (rc = auth_check_ids(a, r->op, p, len)) != 0)) {
         if (rc == TSDB_ERR_AUTH) { /* not logged in, or the user was dropped: the connection closes */
             if (was == AS_NONE || was == AS_STARTED)
                 metrics_login(METRICS_LOGIN_REFUSED);
@@ -2403,9 +2750,24 @@ static void handle_in(req *r)
         return;
     }
     unav_vol = req_volume(r->op, p, len);
-    if (unav_vol != TSDB_VOL_ANY && !(auth_ops[r->op].need & NEED_ANY) && (auth_ops[r->op].need & R_WRITE) &&
-        cvol_active() && cvol_why(unav_vol) >= 0) { /* a write to a cluster volume this server does not lead */
-        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+    unav_write = !(auth_ops[r->op].need & NEED_ANY) && (auth_ops[r->op].need & R_WRITE);
+    if (test_route_moved && unav_vol != TSDB_VOL_ANY && unav_write && cvol_active() &&
+        (cvol_why(unav_vol) >= 0 || (test_route_moved == 2 && (r->op == TSDB_OP_INSERT || r->op == TSDB_OP_INSERT_VALUES)))) {
+        route_moved(c, r, unav_vol); /* tests: MOVED to the leader the copy names (TSDBD_TEST_ROUTE_MOVED) */
+        return;
+    }
+    if (route_decide(r))
+        return;
+    if ((rc = auth_check_ids(a, r->op, p, len)) != 0) { /* only where the volume is served (route_decide) */
+        reply_error(c, r->id, r->op, rc);
+        return;
+    }
+    if (unav_vol != TSDB_VOL_ANY && unav_write && cvol_active() && cvol_why(unav_vol) >= 0) {
+        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE); /* a write to a cluster volume this server does not lead */
+        return;
+    }
+    if (unav_vol != TSDB_VOL_ANY && unav_write && cvol_active() && repld_isr_short(unav_vol)) {
+        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE); /* min_isr: refused before anything is written (D9) */
         return;
     }
     if (unav_vol != TSDB_VOL_ANY && cvol_active()) {
@@ -2459,7 +2821,7 @@ static void handle_in(req *r)
                 size_t nl;
                 /* rights before admission: a user without them is DENIED whatever the volume's state, or the
                  * answer would tell which volumes exist and are degraded (review m3) */
-                if ((rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0) {
+                if ((rc = route_ids(c, ids, n, false)) != 0 || (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0) {
                     reply_error(c, r->id, r->op, rc);
                     return;
                 }
@@ -2629,7 +2991,7 @@ static void handle_op(req *r)
             rc = TSDB_ERR_INVALID;
             break;
         }
-        if (many && (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0)
+        if (many && ((rc = route_ids(c, ids, n, false)) != 0 || (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0))
             break; /* all or nothing (A16) */
         if (many && (rc = cvol_refuse_ids(ids, n)) != 0)
             break;
@@ -2729,7 +3091,7 @@ static void handle_op(req *r)
         memcpy(&s, p + 8, 8);
         bool many = s == TSDB_MANY_SERIES;
         if (p[5] & TSDB_PACKED) {
-            rc = insert_packed(&c->auth, p, len, n, s);
+            rc = insert_packed(c, p, len, n, s);
             break;
         }
         size_t vb = (size_t)n * tsdb_wire_width(p[4]), valid = (p[5] & TSDB_VALID) ? ((size_t)n + 7) / 8 : 0;
@@ -2739,7 +3101,7 @@ static void handle_op(req *r)
             rc = TSDB_ERR_INVALID;
             break;
         }
-        if (many && (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0)
+        if (many && ((rc = route_ids(c, ids, n, false)) != 0 || (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0))
             break; /* all or nothing (A16) */
         if (many && (rc = cvol_refuse_ids(ids, n)) != 0)
             break;
@@ -2983,6 +3345,7 @@ static void *worker_main(void *arg)
             if (--running_workers == 0)
                 pthread_cond_broadcast(&workers_gone_cv);
             pthread_mutex_unlock(&work_lock);
+            route_release();
             return NULL;
         }
         req *r = work_head;
@@ -4689,6 +5052,9 @@ int main(int argc, char **argv)
                 w ? "; set by the configuration file (--no-auth=false on the command line turns login back on)" : "");
     }
     g_reader_only = o.read_only || o.follow;
+    static const auth_group_ops group_users = {cluster_set_users_watch, cluster_users_caught_up, cluster_user_propose};
+    if (cluster_on) /* S2-1: the users are the metadata group's, never the root's USERS */
+        auth_set_group(&group_users);
     if (auth_init(dir, !no_auth, !o.read_only && !o.follow, db) != 0) {
         tn_stop();
         tsdb_close(db);
@@ -4704,6 +5070,19 @@ int main(int argc, char **argv)
         tsdb_test_precommit(db, hold_large, NULL);
     test_loop_stall = getenv("TSDBD_TEST_LOOP_STALL");
     test_read_stall = getenv("TSDBD_TEST_READ_STALL");
+    test_route_moved = getenv("TSDBD_TEST_ROUTE_MOVED") ? atoi(getenv("TSDBD_TEST_ROUTE_MOVED")) : 0;
+    if (getenv("TSDB_ROUTE_MUTANT") && *getenv("TSDB_ROUTE_MUTANT")) { /* "" is unset (an exported empty name) */
+        static const char *const names[] = {"",           "rightsbeforeroute", "movedoffcopy",
+                                            "replicaread", "spanaccepted",      "nocopyserved"};
+        for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
+            if (strcmp(getenv("TSDB_ROUTE_MUTANT"), names[i]) == 0)
+                route_mutant = i;
+        if (!route_mutant) {
+            fprintf(stderr, "tsdbd: TSDB_ROUTE_MUTANT=%s: no such mutant\n", getenv("TSDB_ROUTE_MUTANT"));
+            return 2;
+        }
+        fprintf(stderr, "tsdbd: TSDB_ROUTE_MUTANT=%s\n", names[route_mutant]);
+    }
     if (getenv("TSDBD_TEST_AUTH_DELAY_MS"))
         test_auth_delay_ms = atoi(getenv("TSDBD_TEST_AUTH_DELAY_MS"));
     struct rlimit rl;
@@ -4834,7 +5213,7 @@ int main(int argc, char **argv)
         struct cluster_cfg cc = {.state_dir = state_dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
                                  .rack = rack, .power_feed = power_feed, .bmc = bmc, .read_barrier_off = rb_off,
                                  .secret = secret, .secret_len = secret_len, .loop_gated = 1};
-        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0)
+        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0 || fwd_cluster_start(NULL, NULL) != 0)
             return 1;
         crash_point(CP_CLUSTER_STARTED); /* the harness restarts the node and counts the hit (tests/jepsen) */
         tsdb_wipe(secret, sizeof secret);
@@ -4869,6 +5248,7 @@ int main(int argc, char **argv)
         metrics_stop(); /* before tsdb_close: it reads the database */
     if (cluster_on) {
         cluster_stop();
+        fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
         cvol_stop(); /* after the cluster thread: no push or report reaches it any more */
     }
     pthread_mutex_lock(&work_lock);
@@ -4888,6 +5268,8 @@ int main(int argc, char **argv)
     while (running_workers > 0)
         pthread_cond_wait(&workers_gone_cv, &work_lock);
     pthread_mutex_unlock(&work_lock);
+    if (cluster_on)
+        fwd_cluster_free(); /* no worker can call into the forwarding links any more */
 #ifndef TSDBD_NO_URING
     if (io == IO_URING)
         io_uring_queue_exit(&ring);

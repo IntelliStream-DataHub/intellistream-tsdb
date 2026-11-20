@@ -536,6 +536,21 @@ the end covers resumed bytes too); then `CHUNK{file, offset, bytes}` of 256 KiB 
 the job goes back to the head of the queue and starts from the receiver's offset, at most `max_attempts` connections.
 One file at a time per link.
 
+*Backpressure in the driver* (r3d review M3, L1, L2; `server/repld.c`). A link's reader thread copies a frame into the
+volume's inbox, which holds at most 64 MiB (`INBOX_BYTES`); when it is full the thread waits up to 0.5 s (well below
+`dead_ms`) and then drops the frame: the core sends again what was not acknowledged, so a dropped frame costs time,
+never data. The log says "frames are dropped (sent again)" once, and "the inbox is empty again". A bulk file above
+16 MiB (`SPILL_BYTES`) is received into a stage file (`stage_s<pid>_<n>.tmp`, `O_EXCL`; the open removes any
+`stage_*.tmp` as before) instead of memory, then hashed through a mapping, synced, renamed and its directory synced like
+one received in memory. An idle volume sends its empty APPEND (the core's heartbeat) to a peer every 100 ms
+(`idle_heartbeat_ticks`), and at once when the commit point moved; every 5 ms tick, as before, made 102,400 frames a
+second for 256 volumes with two peers each, now 5,120. The volume's thread runs a due tick before it takes the inbox
+(L2), so a full inbox cannot starve the ISR rule; and after each tick the inbox gets a tick's time even when the
+next tick is due, so a tick longer than one (a catch-up read of 4 MiB for a peer far behind, on a slow disk) cannot
+starve the other peers' ACKs either: the leader dropped a healthy replica for silence while another caught up
+(`test_cluster rejoinslow`, mutant `inboxstarve`). Tests: `test_cluster backpressure` (mutants `noinboxbound`,
+`nospill`), `test_repl idle_heartbeat`.
+
 ### 5.2 Large inserts, deletes and replaces
 
 Today: the writer registers an `lw_fence` for its keys, flushes the memtable if it holds rows inside them, writes
@@ -588,9 +603,14 @@ and every marker in it is applied durably, and keeps sealed segments for catch-u
 - **A flushed segment is never appended to.** Rows added to segment s after its memtable became parts with
   `wal_seq = s` would be skipped by the next open's replay (`partition_wal_seq >= s`) and be lost. `replica_append`
   refuses `seq <= sealed_seq` (the highest `wal_seq` of the parts, and of a flush of this run).
-- **The last segment's memtable is not sealed until a later segment starts.** An idle leader therefore leaves the rows
-  of its last segment in the replica's memory and that segment on disk. The driver (R3) needs a seal signal for this
-  (a `ROLL` marker, or the leader rotating its segment after an idle interval); not built in R2.
+- **The last segment's memtable is not sealed until a later segment starts.** An idle leader would therefore leave the
+  rows of its last segment in the replica's memory and that segment on disk. *Built in R3 (r3d-isr):* the **idle
+  seal**. A replicated leader's flusher flushes the active memtable once it has not changed (rows, segment) for
+  `idle_seal_ms` (1 s by default, a cluster setting), which starts a new segment, and appends a `NOW` marker into it
+  at once; a replica seals the old segment at that committed record and flushes the same rows
+  (`eng_leader_clock`, `test_cluster idleseal`, mutant `noseal`). Measured: parts on all three copies 1.7 s after the
+  last write; a trickle of one write every 2 s makes 10 flushes in 20 s (about 1,800 small parts an hour before
+  merges); an idle volume's WAL grows by 48 bytes a second (the `NOW` markers, about 168 KB an hour).
 - **The retention clock is the `NOW` markers only** (§5.4), not the `commit_ms` of records: the leader stamps
   `commit_ms` with its wall clock, which its retention clock (`opt.clock_ms`, the floor) need not follow. After a
   restart the clock restarts from the parts' `written_ms` and the replay up to the commit floor, so it may be lower
@@ -609,8 +629,10 @@ and every marker in it is applied durably, and keeps sealed segments for catch-u
 ### 5.4 Clocks and classes
 
 - **Retention clock.** A replica never reads its own wall clock for retention. The leader appends a `NOW` marker
-  every second (and before any `DROP`); a replica's engine runs with `opt.clock_ms` returning the last applied `NOW`
-  (retention.c:176-190 already takes a clock hook and keeps it from going back). A new leader starts from
+  every second (and before any `DROP`; built in R3: the flusher of a replicated leader appends it without waiting for
+  the commit point, and a refusal is ignored: the next second sends another); a replica's engine runs with
+  `opt.clock_ms` returning the last applied `NOW` (retention.c:176-190 already takes a clock hook and keeps it from
+  going back). A new leader starts from
   `max(own clock, last NOW)`. A replica therefore clamps up to a second later than the leader: visible only to a read
   that asked for a replica.
 - **Merges** drop expired rows with the replica's clock; queries clamp to the cutoff anyway, so the answer is the
@@ -697,6 +719,25 @@ at once; the Raft leader sees the volume reported failed in the next heartbeat a
   led, a new leader and epoch (§6.2); for every volume where it was in the ISR, a smaller ISR.
 - **A replica, seen by its leader**: a replica that has not acknowledged a record within `isr_lag_ms` (1 s) of its
   sending, or whose log stream broke, is removed from the ISR (§6.3). Writes to that volume wait at most that long.
+  *Built in R3 (r3d-isr).* A member silent for `isr_lag_ms` leaves the ISR also while nothing is written (the core
+  keeps when it last heard an ACK; before, a dead replica of an idle volume stayed in the ISR, and the first write after
+  it waited for it: planted bug 40, `test_repl idle_shrink`). The core's request (`REPL_M_ISR_REQ`) goes from the
+  driver into the leader's next heartbeat (`HBS_ISR`, sent at the next duty round of the cluster thread), and the Raft
+  leader proposes `ISR_CHANGE` conditional on the epoch and ISR version the request was based on (mutant
+  `shrinknocond`), again after a second while the record has not moved; the driver hands the core the record only once
+  the metadata group committed it (mutant `commitpastremoved`). A grow (§8.1 step 5) takes the same path.
+  **Below `min_isr`** a leader refuses writes before the engine (`UNAVAILABLE`, WHY `unreachable`, retry after 1 s) and
+  keeps serving reads. A write admitted while the ISR was large enough but committed after a shrink below `min_isr` is
+  not answered until the ISR grows back: the writer's waits go by the commit point the driver hands the engine
+  (`eng_leader_commit`), so the driver holds that point while the record's ISR is short (`ackbelowminisr`; the core's
+  own `min_isr` check only held its REPLY, which the engine does not wait for). With `min_isr` 3 and two of three
+  servers down the Raft group has no quorum either, so no change of the ISR commits at all (`test_cluster minisr`
+  takes one replica away, `isr` kills one and restarts it).
+- **A large write's files** (§5.2 step 3) go out at once and are waited for under one deadline per `COMMIT`: 3 s or
+  twice `isr_lag_ms`, whichever is more, plus a second per 32 MiB; a peer that leaves the ISR meanwhile is no longer
+  waited for (it fetches the files when it comes back). Waiting 30 s per file, as R3's first driver did, held
+  `jr_serial` for minutes behind a stopped replica (r3d review M2; `test_cluster shipstall`: 100,000 rows over 10 days
+  answered in 1.6 s with a replica stopped; mutant `shipperfile`).
 - **A leader that cannot reach its replicas but reaches the Raft leader**: before shrinking the ISR below 2 while the
   Raft leader still hears the replicas' heartbeats, the Raft leader moves leadership to a replica instead (ha.md D38's
   reasoning: the cut-off one should step aside, not the others).
@@ -799,6 +840,34 @@ leader's address, the epoch and the replicas); direct mode; one stream per `(ses
 first unacknowledged frame, frames acknowledged after it included, with attempt + 1; retry by a time budget (30 s;
 UNAVAILABLE does not count); `TCP_USER_TIMEOUT` of about 3 s. Forwarding by any server in simple mode (ha.md §9.1),
 one hop, never a transparent retry.
+
+**The entry node (S2-1, built; `route_decide` in `server/tsdbd.c`).** A request is served by a node only when every
+cluster volume it names is led there (the node's own view: its writer role or `led`, so a copy that lags a promotion
+here does not send requests away). A replica, or a node that has no copy of the volume, answers MOVED to the leader
+its metadata copy names, reads included (D5: a replica never answers a read; S3's REPLICA_OK may); UNAVAILABLE
+(NO_OWNER, about 1 s) when the copy names no leader; UNAVAILABLE (PROMOTING, about 200 ms) when the leader's member
+is not UP or the volume is being promoted here. A volume the copy does not know (no copy yet: a node just started; or
+a copy that lags the volume's creation) is served only where it is open as a writer; anywhere else it is UNAVAILABLE
+(NO_OWNER), because an engine that does not hold the volume answers a read with no rows (jepsen-cluster found that
+stale read on a restarted node without the volume). The root (volume 0) keeps the answer of the gates after it. The
+price: an id of a volume that was never made, or of one that was removed, is retried until the client's budget runs out
+(30 s by default) instead of failing at once; and a user without rights can tell a volume that does not exist
+(UNAVAILABLE) from one led elsewhere (MOVED), which TOPOLOGY tells every logged-in client anyway.
+Every one of these answers is given before anything of the request is done, so each means "not applied"
+(§6.5). The decision comes before any right on a series id is checked: rights on ids resolve through the names of the
+volumes served here, so an id of a volume led elsewhere would be DENIED at the entry node; the owner checks them.
+The requests that name many ids (packed and many-series inserts, QUERY_MULTI, QUERY_LATEST, STATS_SERIES) are decided
+in their handlers on every id (`route_ids`), before their rights.
+A frame whose rows name volumes led on two nodes is INVALID with a log line (S3's clients split frames).
+`test_cluster route` tests it, and `TSDB_ROUTE_MUTANT` (`rightsbeforeroute`, `movedoffcopy`, `replicaread`,
+`spanaccepted`, `nocopyserved`) plants the bugs it must catch.
+
+Risk, open until S3: MOVED carries the address in the copy. A node restarted on another port or host is named at its
+old address until its MEMBER_ADDR has committed and reached the copy, so a client moved meanwhile reaches nobody (an
+I/O error it retries) or, worse, whatever process holds that address now; the client checks no identity after the
+reconnect (a node id in HELLO's reply is S3's). No test covers this case: `test_cluster route` restarts no node, and
+jepsen-cluster's clients follow MOVED by the node id through the harness's own table of nodes, never to the address in
+the body, so the client's own following after a restart is untested until S3.
 
 The Pulsar sink inherits this through the Java client. Its `ErrorClassifier` already retries unknown codes; MOVED,
 UNAVAILABLE and IO become explicitly retryable, DROPPED stays final. It acknowledges a Pulsar message only after tsdb's
@@ -933,6 +1002,34 @@ replica installs the leader's applied state P only if P is above its own log end
 Without it one returning replica fail-stopped every leader in turn (mutant 36, seed 1; seeds 75881, 3865 and 25133
 for the stale notice; `test_repl trim`, `cut_applied`).
 
+*Built in R3 (r3d-isr, 2026-11-17).* Step 5 as written never fires under writes that never pause: the commit point
+runs ahead of a learner that keeps up only as closely as its round trip allows, so it joined only in a pause of the
+writes, and behind a lone leader (commit point = the leader's durable end) never (the jepsen-cluster kill run of the
+merge: a replica out of the ISR for 30 minutes while it received everything). So a learner whose log has what the
+leader had written half `isr_lag_ms` ago, and the start of the current epoch, has the **commit point held** for it: the
+leader counts it in the commit point's minimum from then on (the commit point stops where it is), and asks for it as
+soon as its log reaches the commit point, which then cannot have passed it; from the ask on the maximal ISR counts it
+as before. A learner that has not got there within `join_hold_ticks` (= `isr_lag_ms`) is let go, and not held for again
+for four times `isr_lag_ms`, so writes wait at most `isr_lag_ms` for a learner, as for a member that lags. The hold only
+adds a node to the minimum, so the commit point is never higher than without it, and the metadata group records a
+learner only when it has every committed position. `test_repl steady_join`, `join_giveup` (MUT 42: no hold), the
+simulator with the hold on in three seeds of four (MUT 41: asked for at the hold's start, killed at seed 1),
+`test_cluster rejoinsteady` (a replica whose ACKs trail by 100 ms joins under two writers; mutant `nojoinhold`).
+`isr_lag_ms` and the hold are counted in the core's ticks, which follow the wall clock: a tick that comes a tick or
+more late (the leader's catch-up step of the tick before took that long) runs without a catch-up step of its own, after
+the inbox had its slice, up to a second of backlog; a thread that is never current still runs a step once as long after
+the last one as that one took, so the steps keep at least half its time and a lagging peer is never starved
+(`rejoinlate`, mutant `stepcurrentonly`: under TSan a replica never rejoined). Before, each tick ran a step and a late
+tick was dropped, so with 20 ms catch-up reads a core tick took 25 ms and a stopped member held the writes 5 s
+(r3d-isr review M1; `test_cluster tickwall`, mutant `tickstretch`).
+
+A replica's durable end stops below a COMMIT marker whose files it has not staged, and its core starts there at an
+open too (`repl_durable.hold`), not at its log end: a replica killed between such a marker and the FETCH of its file
+acknowledged its whole log once the leader had verified it, the leader's keep bound passed the marker, and the segment
+and the link the file is served from went; the replica asked for the file for the rest of the run (jepsen-cluster
+kill, kv and classes, 2026-11-18), and its match claimed positions it could not apply (`test_repl open_hold`,
+`test_cluster reopenhold`, mutant `opennohold`).
+
 ### 8.2 A returning replica
 
 A replica back after an outage or a restart:
@@ -959,7 +1056,13 @@ cut below the applied end).
 ### 8.3 Retained segments
 
 The leader keeps sealed WAL segments of each volume after they are in parts, for catch-up: up to
-`repl_retain_mb` per server (4 GB by default, split over its volumes by write rate) and at most 30 min. The change feed
+`repl_retain_mb` per server (4 GB by default, split over its volumes by write rate) and at most 30 min.
+*Built in R3 (r3d-isr), per volume:* `repl_retain_mb` (4096) and `repl_retain_s` (1800) are caps of each volume, not
+split per server yet. The leader keeps what the slowest member still needs (the driver's keep bound) only while the
+kept segments, newest first, stay within both caps; past them it unlinks as if that member had caught up
+(`eng_leader_keep_cap`), and the member, once back, is told to install a snapshot (the driver says so once in its log;
+it stays a learner until the snapshot path of R4). `test_cluster keepcap` (`repl_retain_s` 2, seven flushes a second
+apart with a replica down: 3 segments kept, 8 under the mutant `nocap`). The change feed
 of design-cdc.md retains segments the same way (`fwal_` names); one mechanism serves both. A replica away for longer
 than that, or than the budget, gets a snapshot.
 

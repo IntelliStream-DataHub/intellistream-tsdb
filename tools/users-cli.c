@@ -139,6 +139,13 @@ static int get_password(const char *file, const char *name, password pw)
 }
 
 /* The verifier of a password with a fresh random salt (A18: the server never sees the password). */
+static int make_verifier(const char *file, const char *name, uint32_t iterations, user_verifier *v);
+int cli_user_verifier(const char *file, const char *name, uint32_t iterations, user_verifier *v); /* cluster-user-cli.c */
+int cli_user_verifier(const char *file, const char *name, uint32_t iterations, user_verifier *v)
+{
+    return make_verifier(file, name, iterations, v);
+}
+
 static int make_verifier(const char *file, const char *name, uint32_t iterations, user_verifier *v)
 {
     password pw;
@@ -410,6 +417,11 @@ int user_main(const char *dir, int argc, char **argv)
     if (strcmp(verb, "add") == 0 ? ensure_dir(dir) != 0 : access(dir, F_OK) != 0) {
         if (strcmp(verb, "add") != 0)
             fprintf(stderr, "tsdb: %s does not exist\n", dir);
+        return 1;
+    }
+    if (users_cluster_marked(dir)) { /* S2-1: a USERS made here would stop that tsdbd from starting */
+        fprintf(stderr, "tsdb: %s is a cluster server's root: its users are the metadata group's; use 'tsdb cluster "
+                        "user %s PEER ...' (docs/cluster-preview.md)\n", dir, verb);
         return 1;
     }
     users us;

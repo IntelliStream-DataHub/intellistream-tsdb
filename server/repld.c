@@ -32,7 +32,11 @@
  * fdatasync, design 5.1 step 2) to every peer whose cursor is at their start; a peer behind is caught up from the log
  * (replica_read, which on the writer reads its kept segments and the current one as far as it is written). A resync
  * moves the cursor back only once what was sent after it has had RESEND_MS to arrive: the core's heartbeat acks ask for
- * a resync every time, and in-flight records would otherwise be sent twice.
+ * a resync every time, and in-flight records would otherwise be sent twice. "Had time to arrive" is also the peer's
+ * acknowledged end standing still for LOST_MS while the cursor is ahead of it: under writes that never pause the fast
+ * path moves the cursor (and sent_ms) with every record, and a peer that refuses them all for a gap (a replica
+ * restarted below the cursor) was never sent the records it lacks (the merge's jepsen-cluster kill run: a replica's log
+ * stayed where it died for 30 minutes; rejoin, mutant fastride).
  *
  * rec_find answers from the driver's index of WAL record starts (fed by the leader's bytes and the replica's WRITEs,
  * built at open by reading the log), and (pos, 1) for a position the writer admitted but has not written yet.
@@ -46,14 +50,36 @@
  * `nofastpath` (records go out on the tick only; caught only by the latency bound TSDB_TEST_ACK_MS that
  * tests/repld_mutants.sh sets); `hbnoclamp` (a heartbeat names positions not sent yet) SURVIVES: no scenario delays a
  * link yet;
- * `nocursorup` never moves a peer's cursor up to what it acknowledged (repcheck's `stalesent` step catches it).
+ * `nocursorup` never moves a peer's cursor up to what it acknowledged (repcheck's `stalesent` step catches it);
+ * `fastride` moves the cursor back on a resync only once sent_ms is RESEND_MS old (rejoin).
+ * `nojoinhold` holds no commit point for a learner close behind (join_hold_ticks 0: it joins only in a pause of the
+ * writes; rejoinsteady), `inboxstarve` gives the inbox no time after a tick while the next one is due (a catch-up read
+ * longer than a tick starved the other peers' ACKs; rejoinslow), `opennohold` starts a replica's core with its whole
+ * log durable, past a COMMIT marker whose file it has not staged (reopenhold), `tickstretch` drops the ticks a slow
+ * catch-up step made late, so the core's clock (isr_lag, the join hold) runs slower than the wall's (tickwall),
+ * `stepcurrentonly` runs catch-up steps only on ticks that are not late (a thread always late never catches a peer
+ * up: rejoinlate).
+ * `commitpastremoved` takes an ISR request as the record at once, before the metadata group commits it (isr),
+ * `nominisr` never checks min_isr (minisr), `ackbelowminisr` hands the writer a commit point reached after a shrink
+ * below min_isr (minisr), `nocap` keeps the leader's segments for a lagging replica without the caps repl_retain_mb and
+ * repl_retain_s (keepcap), `noseal` leaves an idle leader's last segment unsealed (no idle flush; the NOW markers go
+ * on) (idleseal), `keepwritten` keeps the leader's segments by its peers' written ends, not their durable ones
+ * (replicate); tests/repld_mutants.sh names the rest and pins each mutant to its scenario's FAIL line.
  * Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first bulk file this process receives taken as staged but not kept, so its COMMIT marker finds
- * the file missing and FETCHes it; `promotewait` waits 1 s between the promotion's engine swap and the mode M_WRITER
+ * the file missing and FETCHes it; `fetchlate` has a replica send its first FETCH of a name only 5 s after it found
+ * the file missing (the leader has sealed and flushed the marker's segment by then); `nofetch` has a replica send no
+ * FETCH at all and say once per name that it withholds it (reopenhold kills it there); `syncpause` has a replica's
+ * SYNCs wait 4 s after its core's open (its ACKs carry the durable end it opened with; reopenhold); `promotewait` waits 1 s between
+ * the promotion's engine swap and the mode M_WRITER
  * (writes then reach the new writer while the driver still promotes: they must be refused for a retry, never depose
- * it); `skippos` has one admit take a position more once the file <dir>/skippos exists (the check in op_admit must
+ * it); `noclock` has a leader write no NOW markers and no idle seal (writersync); `skippos` has one admit take a
+ * position more once the file <dir>/skippos exists (the check in op_admit must
  * fail the volume before the write is acknowledged); `stalesent` sets one peer's cursor back to 0 once the file
  * <dir>/stalesent exists, below the log's start (what a resync that raced records in flight left behind; the cursor
- * must move up to what the peer acknowledged, or it is never sent another record).
+ * must move up to what the peer acknowledged, or it is never sent another record); `slowread` has every catch-up
+ * read take SLOW_READ_MS more (a slow disk or NFS); `slowtick` has a writer's catch-up step take SLOW_TICK_MS at every
+ * tick it runs (tickwall); `latetick` has every tick of a writer take LATE_TICK_MS more (rejoinlate); `slowack` has a replica's ACKs report the durable end it had
+ * SLOW_ACK_MS before (a far replica: always a few writes behind the leader's end while it keeps up).
  * TSDB_REPLD_TRACE=1 (debugging; jepsen-cluster passes the environment on) logs every 2 s per volume a line of the
  * core's state (repl_debug: per peer next, match, acked) and the driver's cursors (sent, want, acked, ages, link).
  */
@@ -63,6 +89,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,8 +108,24 @@
 #include "../src/replica.h"
 
 #define TICK_MS 5
+#define COMMIT_STALL_MS 5000 /* the writer says what holds its commit point once it has not moved for this long */
+#define SPILL_BYTES (16u << 20) /* a bulk file above this is received into a file, not memory (r3d review M3) */
+#define INBOX_BYTES (64u << 20) /* a volume's inbox of peer frames: past it the link waits, then drops (M3) */
+#define INBOX_WAIT_MS 500       /* how long a link's thread waits for room (well below a link's dead_ms) */
+#define IDLE_HEARTBEAT_MS 100 /* an idle volume's empty APPEND per peer (r3d review L1: was every tick) */
+_Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member must be heard well within isr_lag_ms");
+#define NOW_EVERY_MS 1000 /* a leader's NOW markers (design-cluster.md 5.4): its replicas' retention clock lags by at most this */
 #define RESEND_MS 50
+#define LOST_MS 500 /* a peer's acknowledged end standing still this long with the cursor ahead: what was sent is lost */
+#define FETCH_LATE_MS 5000 /* fetchlate (tests) */
+#define SYNC_PAUSE_MS 4000 /* syncpause (tests) */
 #define READ_CAP (4u << 20)
+#define SLOW_READ_MS 10  /* slowread (tests): longer than a tick */
+#define SLOW_TICK_MS 20  /* slowtick (tests): a catch-up step that long, at every tick it runs */
+#define LATE_TICK_MS 6   /* latetick (tests): every tick of a writer that much longer: the thread is never current */
+#define TICK_BACKLOG_MS 1000 /* the core's clock catches up at most this much of wall time (vol_main) */
+#define SLOW_ACK_MS 100  /* slowack (tests) */
+#define SLOW_ACK_RING 512
 #define MAX_NODES 64
 
 enum { M_REPLICA = 0, M_PROMOTING, M_WRITER, M_DEAD };
@@ -100,8 +143,12 @@ struct rpeer {
     uint64_t sent;     /* the last position whose records went out to it (a WAL record end) */
     uint64_t want;     /* the core wants it to have up to here */
     uint64_t sent_ms;  /* when `sent` last moved forward */
-    uint64_t acked;    /* the `written` of its last ACK in this run */
+    uint64_t acked;    /* the `durable` of its last ACK in this run: a replica's durable end stops below a COMMIT
+                        * marker whose file it has not staged, so the segment that holds the marker, and with it the
+                        * link the file is fetched from, stays (its `written` passes the marker: replicate) */
     uint64_t gen;      /* the log link's connection the cursor was moved on */
+    uint64_t wrote, wrote_ms; /* the `written` of its last ACK, and when that last changed */
+    uint64_t ahead_ms; /* since when `sent` is past `wrote` (0: it is not): what was sent since has not arrived */
     int heard;
     uint64_t heard_ms; /* when a message of this volume last came from it (repld_unreachable) */
 };
@@ -122,6 +169,9 @@ struct rvol {
     struct rpeer peer[REPL_MAX_NODES];
     uint64_t open_ms; /* when its driver started: a peer never heard counts as unheard since then */
     struct item *in_head, *in_tail;
+    size_t in_bytes;         /* of peer frames in the inbox (bounded: inbox_bytes) */
+    pthread_cond_t in_space; /* a link's thread waits here for room */
+    int in_waiters, in_full; /* in_full: the bound was hit and said, until the inbox empties */
     /* the index: starts of the WAL records from the log start, ascending; idx_end the last position indexed */
     uint64_t *idx;
     size_t nidx, cidx;
@@ -137,10 +187,35 @@ struct rvol {
     uint64_t *coff; /* byte offset of each record of cur */
     int sync_wanted;
     uint64_t synced_rep; /* the writer: the last durable end handed to repl_synced */
+    int rec_short;       /* isr_short_locked of `rec`, counted in G.nshort (rec_set) */
+    int sync_said;       /* noclock's line, once */
+    uint64_t sync_late;  /* synclate: a report op_synced held back for the next tick (0: none) */
+    unsigned sync_n;     /* synclate: the reports op_synced has had */
+    uint64_t cstall_at, cstall_ms; /* the writer: the commit point and since when it has not moved with writes above it */
+    int cstall_said;
     uint64_t epoch_pos;  /* M_PROMOTING: the EPOCH marker's position */
     uint64_t fetch_ms;
     char fetch_name[RW_NAME_MAX + 1];
+    uint64_t fetch_late_ms;                 /* fetchlate (tests): when fetch_late_name was found missing */
+    uint64_t sync_pause_end;                /* syncpause (tests): a replica's syncs wait until then */
+    uint64_t cu_next;                       /* a late tick runs a catch-up step only from then on (vol_main) */
+    int sync_paused;                        /* syncpause: a SYNC waits for sync_pause_end */
+    char fetch_late_name[RW_NAME_MAX + 1];
     struct jr_ops ops;
+    /* the ISR change the core asked the metadata group for (REPL_M_ISR_REQ), reported in this server's heartbeats
+     * (repld_isr_requests) while the record still is the request's basis */
+    int isr_want;
+    struct repl_vmeta isr_req;
+    uint64_t resigned; /* the epoch a RESIGN was said for */
+    /* min_isr after the append: a write admitted while the ISR was large enough, whose commit point is reached only
+     * after a shrink below min_isr, is not acknowledged (the core's REPLY waits the same way, but the writer's waiters
+     * go by APPLY): the commit point is held here and handed to the engine once the ISR is back at min_isr */
+    uint64_t held_commit;
+    int short_said;
+    int snap_said; /* the SNAPSHOT notice was said */
+    /* slowack (tests): the durable ends of its last ACKs and when they were sent; the one it reported last */
+    uint64_t sa_ms[SLOW_ACK_RING], sa_dur[SLOW_ACK_RING], sa_last;
+    unsigned sa_n;
 };
 
 enum {
@@ -155,10 +230,34 @@ enum {
     RM_HBNOCLAMP,
     RM_UNSUREIGNORED,
     RM_ADMITNOCHECK,
-    RM_NOCURSORUP
+    RM_NOCURSORUP,
+    RM_COMMITPASTREMOVED,
+    RM_NOMINISR,
+    RM_ACKBELOWMINISR,
+    RM_SHIPPERFILE,
+    RM_NOCAP,
+    RM_NOSEAL,
+    RM_NOSPILL,
+    RM_NOINBOXBOUND,
+    RM_KEEPIGNORESPEERS,
+    RM_NOLOGSTARTCHECK,
+    RM_STOPNODEPOSE,
+    RM_LATECLOCK,
+    RM_SYNCBYREP,
+    RM_INBOXWAITALL,
+    RM_SHIPNOISR,
+    RM_KEEPWRITTEN,
+    RM_FASTRIDE,
+    RM_NOJOINHOLD,
+    RM_INBOXSTARVE,
+    RM_OPENNOHOLD,
+    RM_TICKSTRETCH,
+    RM_STEPCURRENTONLY
 };
 
 static struct {
+    uint32_t isr_rot; /* (atomic) where repld_isr_requests starts its next report */
+    int nshort; /* (atomic) the volumes whose record has an ISR below min_isr: 0, and repld_isr_short asks nothing more */
     pthread_mutex_t mu;
     tsdb *t;
     char dir[4096];
@@ -174,11 +273,37 @@ static struct {
     uint32_t nvols;
     uint64_t fileno;
     int mutant; /* RM_*: tests only */
+    uint64_t spill_bytes; /* a bulk file larger than this is received into a spill file (TSDB_REPLD_TEST=spill: 64 KiB) */
+    int spill_said;
+    size_t inbox_bytes; /* INBOX_BYTES (TSDB_REPLD_TEST=smallinbox: 256 KiB) */
+    int stall_inbox;    /* TSDB_REPLD_TEST=stallinbox: no peer frame is handled while <dir>/stallinbox exists (a
+                           stalled disk's stand-in), until repld_stop (test_cluster stallstop) */
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
+    int late_wal; /* TSDB_REPLD_TEST=latewal (tests only): repld_stop leaves its writers in place and waits 2.5 s after
+                   * freeing the links, and a stopped driver admits records whatever its lease, so the engine's NOW
+                   * markers reach the WAL hooks of a stopped driver (op_bytes says so once) */
+    _Atomic int said_late; /* latewal's line, once */
+    int sync_by_hook; /* TSDB_REPLD_TEST=syncbyhook: a writer's SYNC compares what op_synced reported, not the engine */
+    int fetch_late;   /* TSDB_REPLD_TEST=fetchlate: a replica's first FETCH of a name waits FETCH_LATE_MS */
+    int no_fetch;     /* TSDB_REPLD_TEST=nofetch: a replica sends no FETCH and says once per name that it withholds it */
+    int sync_pause;   /* TSDB_REPLD_TEST=syncpause: a replica's SYNCs wait SYNC_PAUSE_MS after its core's open, so its
+                       * ACKs carry the durable end the core opened with that long (reopenhold) */
+    int sync_late;    /* TSDB_REPLD_TEST=synclate: every other report of op_synced reaches the core only at the next
+                       * tick, so the report after it covers records written behind the SYNC in flight (writersync) */
+    int no_clock; /* TSDB_REPLD_TEST=noclock (tests only): a leader writes no NOW markers and seals nothing idle, so
+                   * only the clients' writes move its WAL (writersync), and says once when a SYNC finds the WAL
+                   * durable past the core's durable end */
     int trace; /* TSDB_REPLD_TRACE (debugging): the core's and the cursors' state every 2 s */
     int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
+    int slow_read;    /* TSDB_REPLD_TEST=slowread: every catch-up read takes SLOW_READ_MS more (a slow disk, NFS) */
+    int slow_tick;    /* TSDB_REPLD_TEST=slowtick: a writer's catch-up step takes SLOW_TICK_MS at every tick it runs,
+                       * lagging peer or not (tickwall) */
+    int late_tick;    /* TSDB_REPLD_TEST=latetick: every tick of a writer takes LATE_TICK_MS more, so its ticks are always
+                       * late (a volume thread that cannot keep up: TSan, a full inbox) (rejoinlate) */
+    int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
+                       * replica: what it reports trails the leader's end even while it keeps up) */
     struct rin *ins; /* bulk files being received */
 } G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -423,6 +548,47 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
 static void vol_fail(struct rvol *rv, const char *why);
 static void cvol_close(uint32_t v);
 
+/* slowack (tests): the ACK reports the highest durable end an ACK of SLOW_ACK_MS ago had, never more than it has now
+ * (a lower durable end is always true) */
+static void slow_ack(struct rvol *rv, struct repl_msg *m)
+{
+    uint64_t now = now_ms(), lag = rv->sa_last;
+    rv->sa_ms[rv->sa_n % SLOW_ACK_RING] = now;
+    rv->sa_dur[rv->sa_n++ % SLOW_ACK_RING] = m->durable;
+    for (unsigned i = 0; i < SLOW_ACK_RING && i < rv->sa_n; i++)
+        if (rv->sa_ms[i] + SLOW_ACK_MS <= now && rv->sa_dur[i] > lag)
+            lag = rv->sa_dur[i];
+    rv->sa_last = lag;
+    if (m->durable > lag)
+        m->durable = lag;
+}
+
+/* A message of the core to the metadata group. ISR_REQ is kept for this server's heartbeats (repld_isr_requests: the
+ * Raft leader proposes ISR_CHANGE on the request's own basis) until the record moves; RESIGN and FENCE_REPLY belong to
+ * promotion (r3e-failover): said, not sent. */
+static void meta_msg(struct rvol *rv, const struct repl_msg *m)
+{
+    if (m->type == REPL_M_ISR_REQ) {
+        if (!rv->isr_want || memcmp(&rv->isr_req, &m->meta, sizeof m->meta))
+            say("volume %" PRIu32 ": asks for an ISR of %d members (ISR version %" PRIu64 ")", rv->number,
+                __builtin_popcount(m->meta.isr), m->meta.isr_version);
+        rv->isr_req = m->meta;
+        rv->isr_want = 1;
+        cluster_beat_soon();
+        if (G.mutant == RM_COMMITPASTREMOVED) { /* planted: the core is told the change committed when it asks */
+            struct repl_msg mm = {.type = REPL_M_META, .from = REPL_META, .to = rv->self, .leader = -1};
+            mm.meta = m->meta;
+            mm.meta.isr_version++;
+            mm.epoch = mm.meta.epoch;
+            repl_recv(rv->core, &mm);
+        }
+    } else if (m->type == REPL_M_RESIGN && rv->resigned != m->epoch) {
+        rv->resigned = m->epoch;
+        say("volume %" PRIu32 ": cannot lead epoch %" PRIu64 " (led it before a restart); waits for a promotion",
+            rv->number, m->epoch);
+    }
+}
+
 /* An APPEND to peer `to` of the records [buf, buf + len) of segment seq at off (whole WAL records), positions
  * first .. last. Under rv->mu. 0 once queued. */
 static int send_records(struct rvol *rv, int to, uint64_t seq, uint64_t off, const uint8_t *buf, size_t len,
@@ -474,6 +640,15 @@ static int send_records(struct rvol *rv, int to, uint64_t seq, uint64_t off, con
     return rc == PL_OK ? 0 : -1;
 }
 
+/* After `sent` or `wrote` changed: whether the cursor is ahead of what the peer acknowledged having, and since when */
+static void ahead_mark(struct rpeer *p, uint64_t now)
+{
+    if (p->sent <= p->wrote)
+        p->ahead_ms = 0;
+    else if (!p->ahead_ms)
+        p->ahead_ms = now;
+}
+
 /* Catch-up of the peers whose cursor is behind what the core wants them to have: one read per peer per call. */
 static void catch_up(struct rvol *rv, struct eng *db)
 {
@@ -487,10 +662,15 @@ static void catch_up(struct rvol *rv, struct eng *db)
         size_t len = 0;
         uint64_t seq = 0, off = 0, last = 0;
         int rc = replica_read(db, from, &buf, &len, READ_CAP, &seq, &off, &last);
+        if (G.slow_read && rc == 0 && len) {
+            struct timespec sl = {0, SLOW_READ_MS * 1000000L};
+            nanosleep(&sl, NULL);
+        }
         pthread_mutex_lock(&rv->mu);
         if (rc == 0 && len && p->sent + 1 == from && send_records(rv, i, seq, off, buf, len, from) == 0) {
             p->sent = last;
             p->sent_ms = now_ms();
+            ahead_mark(p, p->sent_ms);
         }
         free(buf);
     }
@@ -502,9 +682,11 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
 {
     (void)db;
     struct rvol *rv = ctx;
-    /* crash points (design-cluster 13.2): the leader has written, not synced and not sent; class-switch when a CLASS
-     * marker is among the records (the switch's record in the log, its CLASSES record not yet) */
-    crash_point(CP_WAL_BEFORE_SEND);
+    /* crash points (design-cluster 13.2): the leader has written, not synced and not sent: wal-before-send only for
+     * bytes with a client's rows (r3d-isr review L3: the NOW markers, one a second, and the idle seal took the hit
+     * when no write was pending); class-switch when a CLASS marker is among the records (the switch's record in the
+     * log, its CLASSES record not yet) */
+    int rows = 0;
     pthread_mutex_lock(&rv->mu);
     for (size_t o = 0; o < len;) {
         wal_rec wr;
@@ -513,15 +695,28 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
             break;
         if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_CLASS)
             crash_point(CP_CLASS_SWITCH);
+        rows |= wr.kind == WAL_KIND_ROWS;
         idx_push(rv, wr.fno, wr.fno + wr.span - 1);
         o += sz;
     }
-    for (int i = 0; i < (int)rv->rec.nrep; i++) {
+    if (rows)
+        crash_point(CP_WAL_BEFORE_SEND);
+    /* Stopped (repld_stop): the links are freed or about to be. The engine may still write: a record admitted before
+     * the depose, a NOW marker of the flusher; its bytes stay in the WAL for the next epoch. */
+    if (G.late_wal && rv->stop && !atomic_exchange(&G.said_late, 1)) {
+        int at = 0;
+        for (int i = 0; i < (int)rv->rec.nrep; i++)
+            at += i != rv->self && rv->peer[i].sent + 1 == first;
+        say("test: volume %" PRIu32 " writes WAL records %" PRIu64 "..%" PRIu64 " after its driver stopped (%d peers"
+            " were at them)", rv->number, first, last, at);
+    }
+    for (int i = 0; !rv->stop && i < (int)rv->rec.nrep; i++) {
         struct rpeer *p = &rv->peer[i];
         if (i != rv->self && p->sent + 1 == first && G.mutant != RM_NOFASTPATH &&
             send_records(rv, i, seq, off, buf, len, first) == 0) {
             p->sent = last;
             p->sent_ms = now_ms();
+            ahead_mark(p, p->sent_ms);
         }
     }
     pthread_mutex_unlock(&rv->mu);
@@ -541,7 +736,7 @@ static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
         return TSDB_ERR_UNAVAILABLE;
     }
     /* no read lease (§7.1): a write that raced the check in tsdbd is refused the same way, never taken as a deposal */
-    if (rv->mode == M_WRITER && !cluster_lease_valid()) {
+    if (rv->mode == M_WRITER && !cluster_lease_valid() && !(G.late_wal && rv->stop)) {
         pthread_mutex_unlock(&rv->mu);
         return TSDB_ERR_UNAVAILABLE;
     }
@@ -565,29 +760,47 @@ static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
     return rc == REPL_OK ? 0 : TSDB_ERR_UNAVAILABLE;
 }
 
-/* jr_ops.synced: the writer's own durable end */
-static void op_synced(void *ctx, struct eng *db, uint64_t last)
+/* The writer's durable end to the core (rv->mu held); db NULL for synclate's held report */
+static void synced_locked(struct rvol *rv, struct eng *db, uint64_t last)
 {
-    (void)db;
-    struct rvol *rv = ctx;
-    pthread_mutex_lock(&rv->mu);
     if (rv->core && last > rv->synced_rep) {
         rv->synced_rep = last;
         repl_synced(rv->core, last);
-        if (G.mutant == RM_COMMITBYLEADER)
+        if (G.mutant == RM_COMMITBYLEADER && db)
             eng_leader_commit(db, last);
         pthread_cond_signal(&rv->cv);
+    }
+}
+
+/* jr_ops.synced: the writer's own durable end */
+static void op_synced(void *ctx, struct eng *db, uint64_t last)
+{
+    struct rvol *rv = ctx;
+    pthread_mutex_lock(&rv->mu);
+    if (G.sync_late && (rv->sync_n++ & 1) == 0 && last > rv->synced_rep) {
+        if (last > rv->sync_late)
+            rv->sync_late = last;
+    } else {
+        synced_locked(rv, db, last);
     }
     pthread_mutex_unlock(&rv->mu);
 }
 
 /* ------------------------------------------------------------------ bulk files */
 
-/* The jobs of one file to its peers. `detached`: nobody waits; the last `done` closes fd and frees it. */
+/* The jobs of one file to its peers. `detached`: nobody waits; the last `done` closes fd and frees it. `pend[i]`: the
+ * jobs not done to the replica at record position i. */
 struct shipwait {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int pending, failed, detached, fd;
+    int pend[META_REPLICAS_MAX];
+};
+
+/* a job's `arg`: its file and the peer it goes to (freed by ship_done) */
+struct shipjob {
+    struct shipwait *w;
+    int peer;
 };
 
 static struct shipwait *ship_new(int fd)
@@ -623,62 +836,147 @@ static void ship_detach(struct shipwait *w)
 static void ship_done(void *arg, uint64_t file, int status, uint64_t sent)
 {
     (void)file, (void)sent;
-    struct shipwait *w = arg;
+    struct shipjob *j = arg;
+    struct shipwait *w = j->w;
     pthread_mutex_lock(&w->mu);
     int last = --w->pending == 0 && w->detached;
+    w->pend[j->peer]--;
     if (status != PL_OK)
         w->failed++;
     pthread_cond_broadcast(&w->cv);
     pthread_mutex_unlock(&w->mu);
+    free(j);
     if (last)
         ship_free(w);
 }
 
-/* Sends the file (fd, size) under marker name `mname` to `to` (a node index), or to every other replica (-1). With
- * `wait`, returns once each has answered or after 30 s (a peer that did not stage it fetches it, replica_missing). */
+/* Sends the file (fd, size) under marker name `mname` to `to` (a node index), or to every other replica (-1); w
+ * counts the jobs (a peer that did not stage it fetches it later, replica_missing). */
 static void bulk_out(struct rvol *rv, int fd, uint64_t size, const char *mname, int to, struct shipwait *w)
 {
     uint8_t meta[PL_META_MAX];
     size_t ml = rw_encode_bulk_meta(meta, sizeof meta, rv->number, size, mname);
     if (!ml)
         return;
-    for (int i = 0; i < (int)rv->rec.nrep; i++) {
+    for (int i = 0; i < (int)rv->rec.nrep && i < META_REPLICAS_MAX; i++) {
         if (i == rv->self || (to >= 0 && i != to))
             continue;
         struct plink *l = link_of(rv->rec.rep[i].node, 1);
-        if (!l)
+        struct shipjob *sj = l ? malloc(sizeof *sj) : NULL;
+        if (!sj)
             continue;
+        *sj = (struct shipjob){w, i};
         pthread_mutex_lock(&G.mu);
         uint64_t file = ++G.fileno;
         pthread_mutex_unlock(&G.mu);
         struct pl_job j = {.file = file, .fd = fd, .base = 0, .length = size, .meta = meta, .meta_len = ml,
-                           .max_attempts = 3, .done = ship_done, .arg = w};
+                           .max_attempts = 3, .done = ship_done, .arg = sj};
         pthread_mutex_lock(&w->mu);
         w->pending++;
+        w->pend[i]++;
         pthread_mutex_unlock(&w->mu);
         if (plink_bulk_send(l, &j) != PL_OK) {
             pthread_mutex_lock(&w->mu);
             w->pending--;
+            w->pend[i]--;
             pthread_mutex_unlock(&w->mu);
+            free(sj);
         }
     }
 }
 
-static void wait_ship(struct shipwait *w, int ms)
+/* One COMMIT's files (M2 of the r3d review). op_ship queues a file to every replica and returns; op_ship_wait, after
+ * the COMMIT's last file, waits for all of them under one deadline: SHIP_BASE_MS (or twice isr_lag_ms, if more) plus
+ * the bytes at SHIP_MIN_BPS, from the first file's send. It also stops waiting for a replica the ISR no longer holds.
+ * Past the deadline the marker goes out anyway: the transfers go on (the last done closes the file), a replica that
+ * has not staged a file fetches it when it applies the marker (replica_missing), and one that cannot keep up lags
+ * behind the marker and leaves the ISR by the core's rule (isr_lag). Waiting 30 s per file, as before, held jr_serial
+ * and the large write's fence N x 30 s for a stopped replica. The batch is per thread: the engine calls ship and
+ * ship_wait on the writer's thread, one COMMIT at a time. */
+enum { SHIP_BASE_MS = 3000 };
+#define SHIP_MIN_BPS (32ull << 20)
+
+static __thread struct shipbatch {
+    struct rvol *rv;
+    struct shipwait **w;
+    size_t n, cap;
+    uint64_t bytes, t0;
+} tl_ship;
+
+/* holds rv->mu: whether the replica at record position i is in the ISR the record names */
+static int in_isr_locked(const struct rvol *rv, int i)
 {
-    struct timespec dl;
-    clock_gettime(CLOCK_REALTIME, &dl);
-    dl.tv_sec += ms / 1000;
-    pthread_mutex_lock(&w->mu);
-    while (w->pending > 0 && pthread_cond_timedwait(&w->cv, &w->mu, &dl) != ETIMEDOUT)
-        ;
-    pthread_mutex_unlock(&w->mu);
+    for (uint32_t k = 0; k < rv->rec.nisr && k < META_REPLICAS_MAX; k++)
+        if (rv->rec.isr[k] == rv->rec.rep[i].node)
+            return 1;
+    return 0;
 }
 
-/* jr_ops.ship: the pending part file of a COMMIT, staged by every replica it reaches (on the writer's thread) */
+/* Waits for w's jobs to the replicas still in the ISR until `deadline` (now_ms); 1 when they are all done. */
+static int ship_wait_one(struct rvol *rv, struct shipwait *w, uint64_t deadline)
+{
+    for (;;) {
+        uint32_t isr = 0;
+        pthread_mutex_lock(&rv->mu);
+        for (int i = 0; i < (int)rv->rec.nrep && i < META_REPLICAS_MAX; i++)
+            if (in_isr_locked(rv, i) || G.mutant == RM_SHIPNOISR)
+                isr |= 1u << i;
+        pthread_mutex_unlock(&rv->mu);
+        pthread_mutex_lock(&w->mu);
+        int left = 0;
+        for (int i = 0; i < META_REPLICAS_MAX; i++)
+            if (w->pend[i] > 0 && (isr & (1u << i)))
+                left++;
+        uint64_t now = now_ms();
+        if (!left || now >= deadline) {
+            pthread_mutex_unlock(&w->mu);
+            return !left;
+        }
+        /* woken by a done; the ISR is looked at again every 100 ms */
+        uint64_t slice = deadline - now < 100 ? deadline - now : 100;
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += (long)(slice * 1000000);
+        dl.tv_sec += dl.tv_nsec / 1000000000;
+        dl.tv_nsec %= 1000000000;
+        pthread_cond_timedwait(&w->cv, &w->mu, &dl);
+        pthread_mutex_unlock(&w->mu);
+    }
+}
+
+static void ship_batch_end(int wait)
+{
+    struct shipbatch *b = &tl_ship;
+    uint64_t span = 2ull * (b->rv && b->rv->rec.isr_lag_ms ? b->rv->rec.isr_lag_ms : 1000);
+    uint64_t deadline = b->t0 + (span > SHIP_BASE_MS ? span : SHIP_BASE_MS) + b->bytes * 1000 / SHIP_MIN_BPS;
+    int late = 0;
+    for (size_t i = 0; i < b->n; i++) {
+        if (wait && !ship_wait_one(b->rv, b->w[i], deadline))
+            late++;
+        ship_detach(b->w[i]); /* a job still queued reads fd later: the last done closes it */
+    }
+    if (late)
+        say("volume %" PRIu32 ": %d of %zu files of a COMMIT not staged by every ISR member in %" PRIu64
+            " ms: the marker goes out, a replica without one fetches it", b->rv->number, late, b->n,
+            deadline - b->t0);
+    free(b->w);
+    *b = (struct shipbatch){0};
+}
+
+/* jr_ops.ship: the pending part file of a COMMIT, queued to every replica (on the writer's thread) */
 static int op_ship(void *ctx, struct eng *db, const char *file, const char *mname, uint64_t size)
 {
     struct rvol *rv = ctx;
+    struct shipbatch *b = &tl_ship;
+    if (b->n && b->rv != rv)
+        ship_batch_end(0); /* a batch left by an engine that never called ship_wait: not waited for */
+    if (b->n == b->cap) {
+        size_t cap = b->cap ? 2 * b->cap : 16;
+        struct shipwait **nw = realloc(b->w, cap * sizeof *nw);
+        if (!nw)
+            return TSDB_ERR_NOMEM;
+        b->w = nw, b->cap = cap;
+    }
     int fd = openat(db->dirfd, file, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return TSDB_ERR_IO;
@@ -687,12 +985,37 @@ static int op_ship(void *ctx, struct eng *db, const char *file, const char *mnam
         close(fd);
         return TSDB_ERR_NOMEM;
     }
+    if (!b->n)
+        b->rv = rv, b->t0 = now_ms(), b->bytes = 0;
+    b->w[b->n++] = w;
+    b->bytes += size;
     pthread_mutex_lock(&rv->mu);
-    bulk_out(rv, fd, size, mname, -1, w);
+    if (!rv->stop) /* no links any more (op_bytes): no job, so the wait for this file ends at once */
+        bulk_out(rv, fd, size, mname, -1, w);
     pthread_mutex_unlock(&rv->mu);
-    wait_ship(w, 30000);
-    ship_detach(w); /* a job still queued reads fd later: the last done closes it */
-    crash_point(CP_PREPARED_BEFORE_COMMIT); /* a large write's file is staged on the replicas, its COMMIT not written */
+    if (G.mutant == RM_SHIPPERFILE) { /* planted: the code before the review's M2, 30 s for each file */
+        pthread_mutex_lock(&w->mu);
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += 30;
+        while (w->pending > 0 && pthread_cond_timedwait(&w->cv, &w->mu, &dl) != ETIMEDOUT)
+            ;
+        pthread_mutex_unlock(&w->mu);
+    }
+    return 0;
+}
+
+/* jr_ops.ship_wait: after a COMMIT's last ship (and after a failed one): the one wait of the batch */
+static int op_ship_wait(void *ctx, struct eng *db, int failed)
+{
+    (void)db;
+    if (tl_ship.n && tl_ship.rv == ctx) {
+        ship_batch_end(!failed);
+        if (!failed) /* a large write's files are staged on the replicas (or their deadline passed), its COMMIT not
+                      * written: once per COMMIT, after its one wait (the per-file wait it followed is gone) */
+            crash_point(CP_PREPARED_BEFORE_COMMIT);
+    } else if (tl_ship.n)
+        ship_batch_end(0);
     return 0;
 }
 
@@ -702,8 +1025,27 @@ struct rin {
     uint64_t file, total;
     uint32_t volume;
     char name[RW_NAME_MAX + 1];
-    uint8_t *buf;
+    uint8_t *buf; /* the file in memory, or NULL: it goes to the spill file `tmp` (fd) of the volume's directory */
+    int fd;
+    char tmp[48];
 };
+
+/* frees a receive and removes its spill file (a transfer that did not end in a stage) */
+static void rin_free(struct rin *r)
+{
+    if (!r)
+        return;
+    if (r->fd >= 0)
+        close(r->fd);
+    if (r->tmp[0]) {
+        struct eng *db = tsdb_cvol_ref(G.t, r->volume);
+        if (db)
+            replica_spill_drop(db, r->tmp);
+        tsdb_cvol_unref(&db);
+    }
+    free(r->buf);
+    free(r);
+}
 
 static struct rin *rin_find(struct plink *l, uint64_t file, int unlink_it)
 {
@@ -723,8 +1065,30 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
     (void)arg;
     struct rin *r = calloc(1, sizeof *r);
     uint64_t size;
-    if (!r || rw_decode_bulk_meta(meta, meta_len, &r->volume, &size, r->name, sizeof r->name) != 0 ||
-        size != total || total > (1ull << 32) || !vol_find(r->volume) || !(r->buf = malloc(total ? total : 1))) {
+    if (!r)
+        return -1;
+    r->fd = -1;
+    if (rw_decode_bulk_meta(meta, meta_len, &r->volume, &size, r->name, sizeof r->name) != 0 || size != total ||
+        total > (1ull << 32) || !vol_find(r->volume)) {
+        free(r);
+        return -1;
+    }
+    if (total > G.spill_bytes) {
+        /* a large file goes to disk as it arrives, never whole into memory (r3d review M3) */
+        struct eng *db = tsdb_cvol_ref(G.t, r->volume);
+        r->fd = db ? replica_spill_open(db, r->tmp, sizeof r->tmp) : -1;
+        tsdb_cvol_unref(&db);
+        if (r->fd < 0) {
+            r->tmp[0] = 0;
+            free(r);
+            return -1;
+        }
+        if (!G.spill_said) {
+            G.spill_said = 1;
+            say("volume %" PRIu32 ": receives %s (%" PRIu64 " bytes) into %s, not into memory", r->volume, r->name,
+                total, r->tmp);
+        }
+    } else if (!(r->buf = malloc(total ? total : 1))) {
         free(r);
         return -1;
     }
@@ -733,13 +1097,10 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
     *prefix_fd = -1;
     pthread_mutex_lock(&G.mu);
     struct rin *old = rin_find(l, file, 1); /* the same file begun again (a reconnect): from 0 */
-    if (old) {
-        free(old->buf);
-        free(old);
-    }
     r->next = G.ins;
     G.ins = r;
     pthread_mutex_unlock(&G.mu);
+    rin_free(old);
     return 0;
 }
 
@@ -753,7 +1114,17 @@ static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, con
     pthread_mutex_unlock(&G.mu);
     if (!r || off > r->total || n > r->total - off)
         return -1;
-    memcpy(r->buf + off, p, n);
+    if (r->buf)
+        memcpy(r->buf + off, p, n);
+    else
+        for (size_t done = 0; done < n;) {
+            ssize_t w = pwrite(r->fd, (const uint8_t *)p + done, n - done, (off_t)(off + done));
+            if (w < 0 && errno == EINTR)
+                continue;
+            if (w <= 0)
+                return -1; /* the sender stops; bin_end removes the file */
+            done += (size_t)w;
+        }
     if (off + n < r->total)
         return 0;
     /* the last bytes: staged (file and directory synced) before the sender hears DONE */
@@ -768,7 +1139,13 @@ static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, con
         return 0;
     }
     struct eng *db = tsdb_cvol_ref(G.t, r->volume);
-    int rc = db ? replica_stage(db, r->name, r->buf, r->total) : TSDB_ERR_UNAVAILABLE;
+    int rc = TSDB_ERR_UNAVAILABLE;
+    if (db && r->buf)
+        rc = replica_stage(db, r->name, r->buf, r->total);
+    else if (db) {
+        rc = replica_stage_spilled(db, r->name, r->fd, r->tmp, r->total);
+        r->tmp[0] = 0; /* renamed, or removed by the failed stage */
+    }
     tsdb_cvol_unref(&db);
     if (rc == 0)
         post(rv, IN_WAKE, 0, NULL, 0); /* a COMMIT may be durable now: sync and ACK */
@@ -781,13 +1158,76 @@ static void bin_end(void *arg, struct plink *l, uint64_t file, int status)
     pthread_mutex_lock(&G.mu);
     struct rin *r = rin_find(l, file, 1);
     pthread_mutex_unlock(&G.mu);
-    if (r) {
-        free(r->buf);
-        free(r);
-    }
+    rin_free(r);
 }
 
 /* ------------------------------------------------------------------ the inbox */
+
+static int peer_kind(int kind) { return kind == IN_MSG || kind == IN_FETCH; }
+
+/* the volume's thread took `it` off the inbox */
+static void inbox_took(struct rvol *rv, const struct item *it)
+{
+    if (!peer_kind(it->kind))
+        return;
+    rv->in_bytes -= sizeof *it + it->n;
+    if (rv->in_waiters)
+        pthread_cond_broadcast(&rv->in_space);
+    if (!rv->in_bytes && rv->in_full) {
+        rv->in_full = 0;
+        say("volume %" PRIu32 ": the inbox is empty again", rv->number);
+    }
+    if (G.stall_inbox) {
+        char f[sizeof G.dir + 16], fv[sizeof G.dir + 32];
+        snprintf(f, sizeof f, "%s/stallinbox", G.dir);
+        snprintf(fv, sizeof fv, "%s/stallinbox.%" PRIu32, G.dir, rv->number);
+        /* the stall ends at repld_stop too: a test that died with the file in place left a replica that logged
+         * "shutting down" and then waited in repld_stop's join for ever, holding its io_uring ring under init, so
+         * that every later io_uring run on the machine failed to start (2026-11-18) */
+        for (struct timespec w = {0, 10000000}; !rv->stop && (access(f, F_OK) == 0 || access(fv, F_OK) == 0);) {
+            pthread_mutex_unlock(&rv->mu);
+            nanosleep(&w, NULL);
+            pthread_mutex_lock(&rv->mu);
+        }
+    }
+}
+
+/* Room in the inbox for a peer frame of `need` bytes (rv->mu held), else 0: the link's thread waits a little (which
+ * stops reading the link: TCP pushes back on the sender), then the frame is dropped and the core sends it again. The
+ * inbox is never larger than the bound plus one frame (a frame alone always gets in), and local items are not counted
+ * (they are small and must not be lost). A failed volume reads nothing: its frames are dropped at once.
+ * The wait happens once per stall: while `in_full` is set (until the inbox empties) a frame is dropped at once. The
+ * link and its thread are shared by every volume between the two nodes, so a volume whose disk is stuck (an NFS
+ * server down for hours) must not hold up the others' frames: were each of its frames to wait, its leader's resends
+ * alone would keep the thread asleep, and the replica would leave the ISR of every volume on that link (r3d-isr
+ * review H1; test_cluster inboxshared). */
+static int inbox_room(struct rvol *rv, size_t need)
+{
+    if (rv->in_bytes + need <= G.inbox_bytes || !rv->in_bytes)
+        return 1;
+    if (rv->in_full && G.mutant != RM_INBOXWAITALL)
+        return 0;
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_nsec += INBOX_WAIT_MS * 1000000L;
+    dl.tv_sec += dl.tv_nsec / 1000000000L;
+    dl.tv_nsec %= 1000000000L;
+    while (!rv->stop && !rv->failed && rv->in_bytes && rv->in_bytes + need > G.inbox_bytes) {
+        rv->in_waiters++;
+        int rc = pthread_cond_timedwait(&rv->in_space, &rv->mu, &dl);
+        rv->in_waiters--;
+        if (rc == ETIMEDOUT)
+            break;
+    }
+    if (rv->in_bytes + need <= G.inbox_bytes || !rv->in_bytes)
+        return 1;
+    if (!rv->in_full) {
+        rv->in_full = 1;
+        say("volume %" PRIu32 ": the inbox holds %zu bytes of peer frames, its bound: frames are dropped (sent again)",
+            rv->number, rv->in_bytes);
+    }
+    return 0;
+}
 
 static void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n)
 {
@@ -798,6 +1238,14 @@ static void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t
     if (n)
         memcpy(it->data, p, n);
     pthread_mutex_lock(&rv->mu);
+    if (peer_kind(kind)) {
+        if (!inbox_room(rv, sizeof *it + n)) {
+            pthread_mutex_unlock(&rv->mu);
+            free(it);
+            return;
+        }
+        rv->in_bytes += sizeof *it + n;
+    }
     if (rv->in_tail)
         rv->in_tail->next = it;
     else
@@ -890,6 +1338,8 @@ static void log_start_check(struct rvol *rv)
     }
 }
 
+static int isr_short_locked(const struct rvol *rv);
+
 static void exec(struct rvol *rv, struct repl_action *a)
 {
     struct eng *db = NULL;
@@ -948,11 +1398,24 @@ static void exec(struct rvol *rv, struct repl_action *a)
     case REPL_A_SYNC:
         if (rv->mode == M_WRITER) {
             db = tsdb_cvol_ref(G.t, rv->number);
-            uint64_t d = db ? eng_wal_durable_fno(db) : 0;
-            if (d > rv->synced_rep) {
+            /* syncbyhook (tests): the end op_synced handed over, never a fresh read of the engine, so that a SYNC
+             * issued behind an op_synced that went past it is answered only by this comparison (writersync) */
+            uint64_t d = G.sync_by_hook ? rv->synced_rep : db ? eng_wal_durable_fno(db) : 0;
+            int fresh = d > rv->synced_rep;
+            if (fresh)
                 rv->synced_rep = d;
-                repl_synced(rv->core, d);
+            /* Compared with the core's durable end, never with synced_rep: op_synced may have handed the core a
+             * larger end while an earlier SYNC was in flight, which the core caps at that SYNC's end (and issues this
+             * one); were the end compared with synced_rep here, this SYNC would never be answered, and with no
+             * further write to sync the commit point would stay below a durable WAL for good (backpressure hung so) */
+            uint64_t have = repl_durable_end(rv->core);
+            if (G.no_clock && !fresh && d > have && !rv->sync_said) {
+                say("test: volume %" PRIu32 ": a SYNC finds the WAL durable to %" PRIu64 ", past the core's %" PRIu64
+                    " (an engine sync went past the SYNC in flight)", rv->number, d, have);
+                rv->sync_said = 1;
             }
+            if (G.mutant == RM_SYNCBYREP ? fresh : d > have)
+                repl_synced(rv->core, d);
         } else {
             rv->sync_wanted = 1;
         }
@@ -981,17 +1444,26 @@ static void exec(struct rvol *rv, struct repl_action *a)
         if (rv->mode == M_WRITER) {
             uint64_t keep = a->floor;
             for (int i = 0; i < (int)rv->rec.nrep; i++)
-                if (i != rv->self && rv->peer[i].acked < keep)
+                if (i != rv->self && rv->peer[i].acked < keep && G.mutant != RM_KEEPIGNORESPEERS)
                     keep = rv->peer[i].acked; /* a peer never heard from holds everything */
+            /* the caps (design-cluster.md 8.3): past them a lagging peer's segments go, up to the floor, and the core
+             * tells that peer to install a snapshot once the log start passed what it needs */
+            uint64_t capb = G.mutant == RM_NOCAP ? 0 : (uint64_t)rv->rec.repl_retain_mb << 20;
+            uint64_t capms = G.mutant == RM_NOCAP ? 0 : (uint64_t)rv->rec.repl_retain_s * 1000;
+            uint64_t floor = a->floor;
             pthread_mutex_unlock(&rv->mu);
-            eng_leader_keep(db, keep);
+            eng_leader_keep_cap(db, capb, capms);
+            eng_leader_clock(db, G.no_clock ? 0 : NOW_EVERY_MS,
+                             G.mutant == RM_NOSEAL || G.no_clock ? 0 : rv->rec.idle_seal_ms);
+            eng_leader_keep_floor(db, keep, floor);
             pthread_mutex_lock(&rv->mu);
         } else if (a->floor) {
             pthread_mutex_unlock(&rv->mu);
             rc = G.mutant == RM_FLOORNOTTOLD ? 0 : replica_floor_saved(db, a->floor);
             pthread_mutex_lock(&rv->mu);
         }
-        log_start_check(rv);
+        if (G.mutant != RM_NOLOGSTARTCHECK) /* planted: the core never hears that the log start moved */
+            log_start_check(rv);
         break;
     case REPL_A_SEND:
         if (a->msg.type == REPL_M_APPEND && a->msg.to >= 0 && a->msg.to < (int)rv->rec.nrep) {
@@ -1014,12 +1486,21 @@ static void exec(struct rvol *rv, struct repl_action *a)
              * arrived after RESEND_MS) would otherwise leave it below what the peer holds for good, and once the
              * leader's log no longer starts there (the commit point let it drop those segments) the catch-up finds
              * nothing to read and the peer is never sent another record. */
-            if (p->acked > p->sent && a->msg.prev_pos >= p->acked && G.mutant != RM_NOCURSORUP)
+            uint64_t now = now_ms();
+            if (p->acked > p->sent && a->msg.prev_pos >= p->acked && G.mutant != RM_NOCURSORUP) {
                 p->sent = p->acked;
-            if (a->msg.prev_pos < p->sent && (now_ms() - p->sent_ms >= RESEND_MS || !p->heard)) {
+                ahead_mark(p, now);
+            }
+            /* sent past what it has, its end standing still for LOST_MS: what went out since did not arrive, however
+             * recently the fast path sent more (it refuses each for the gap). Far above a live peer's ack latency, so a
+             * slow peer is not sent its backlog twice */
+            int lost = p->ahead_ms && now - p->ahead_ms >= LOST_MS && now - p->wrote_ms >= LOST_MS &&
+                       G.mutant != RM_FASTRIDE;
+            if (a->msg.prev_pos < p->sent && (now - p->sent_ms >= RESEND_MS || lost || !p->heard)) {
                 p->sent = a->msg.prev_pos ? rec_start(rv, a->msg.prev_pos + 1) - 1 : 0;
                 if (p->sent > a->msg.prev_pos)
                     p->sent = a->msg.prev_pos;
+                ahead_mark(p, now);
             }
             if (a->upto <= a->msg.prev_pos) {
                 /* a heartbeat: the commit point, after what the peer has been sent */
@@ -1029,7 +1510,11 @@ static void exec(struct rvol *rv, struct repl_action *a)
                 m.prev_epoch = epoch_at(rv, m.prev_pos);
                 send_msg(rv, &m);
             }
+        } else if (a->msg.to == REPL_META) {
+            meta_msg(rv, &a->msg);
         } else {
+            if (G.slow_ack && a->msg.type == REPL_M_ACK && rv->mode == M_REPLICA)
+                slow_ack(rv, &a->msg);
             send_msg(rv, &a->msg);
         }
         break;
@@ -1038,6 +1523,11 @@ static void exec(struct rvol *rv, struct repl_action *a)
         if (!db)
             break;
         if (rv->mode == M_WRITER) {
+            if (isr_short_locked(rv) && G.mutant != RM_ACKBELOWMINISR) {
+                if (a->pos > rv->held_commit)
+                    rv->held_commit = a->pos; /* handed over by isr_meta once the ISR is back at min_isr */
+                break;
+            }
             crash_point(CP_ACKED_BEFORE_OK); /* the replicas acknowledged; no client has its answer yet */
             eng_leader_commit(db, a->pos);
             break;
@@ -1062,8 +1552,17 @@ static void exec(struct rvol *rv, struct repl_action *a)
             }
             rv->mode = M_WRITER;
             rv->synced_rep = a->pos;
+            rv->held_commit = 0;
             say("volume %" PRIu32 ": leads epoch %" PRIu64 " from position %" PRIu64, rv->number, rv->epoch,
                 rv->epoch_pos);
+            /* the clock from the start (design-cluster.md 5.4), not from the first SAVE as a writer, which waits for
+             * applied records: an idle new leader sent no NOW markers at all. buf_lock is above rv->mu. */
+            if (G.mutant != RM_LATECLOCK && (db = tsdb_cvol_ref(G.t, rv->number))) {
+                pthread_mutex_unlock(&rv->mu);
+                eng_leader_clock(db, G.no_clock ? 0 : NOW_EVERY_MS,
+                                 G.mutant == RM_NOSEAL || G.no_clock ? 0 : rv->rec.idle_seal_ms);
+                pthread_mutex_lock(&rv->mu);
+            }
         }
         break;
     case REPL_A_REPLY:
@@ -1074,8 +1573,10 @@ static void exec(struct rvol *rv, struct repl_action *a)
         vol_fail(rv, a->reason ? a->reason : "the core failed");
         break;
     case REPL_A_SNAPSHOT:
-        say("volume %" PRIu32 ": the leader no longer has the records this replica needs: it needs a snapshot (not"
-            " built yet); it stays as it is", rv->number);
+        if (!rv->snap_said) /* the core repeats the notice until the replica catches up: said once per open */
+            say("volume %" PRIu32 ": the leader no longer has the records this replica needs: it needs a snapshot (not"
+                " built yet); it stays a learner", rv->number);
+        rv->snap_said = 1;
         break;
     }
     tsdb_cvol_unref(&db);
@@ -1091,6 +1592,54 @@ static void drain(struct rvol *rv)
 }
 
 /* ------------------------------------------------------------------ events */
+
+/* The ISR is below min_isr (rv->mu held): the record's view, which the core gets next (META), so a write the core
+ * still admitted under the larger ISR is held, never acknowledged, while the record says too few */
+static int isr_short_locked(const struct rvol *rv)
+{
+    return G.mutant != RM_NOMINISR && rv->rec.min_isr > 1 && rv->rec.nisr < rv->rec.min_isr;
+}
+
+/* rv->rec = *r (rv->mu held, or the volume not yet listed), with G.nshort kept: the write path's check of min_isr
+ * (repld_isr_short, every write request) takes no lock while no volume is short (r3d-isr review M3) */
+static void rec_set(struct rvol *rv, const struct cluster_vol_rec *r)
+{
+    rv->rec = *r;
+    int s = isr_short_locked(rv);
+    if (s != rv->rec_short) {
+        rv->rec_short = s;
+        __atomic_add_fetch(&G.nshort, s ? 1 : -1, __ATOMIC_RELEASE);
+    }
+}
+
+/* After a META on the writer (rv->mu held): says when the ISR fell below min_isr and when it is back, and hands a
+ * held commit point to the engine once it is (every member of the larger ISR has the held positions: the core grows
+ * the ISR only by a member at the commit point). */
+static void isr_meta(struct rvol *rv)
+{
+    if (rv->mode != M_WRITER || rv->failed)
+        return;
+    if (isr_short_locked(rv)) {
+        if (!rv->short_said)
+            say("volume %" PRIu32 ": an ISR of %" PRIu32 " members, below min_isr %" PRIu32
+                ": writes are refused until it grows", rv->number, rv->rec.nisr, rv->rec.min_isr);
+        rv->short_said = 1;
+        return;
+    }
+    if (rv->short_said)
+        say("volume %" PRIu32 ": the ISR is back at %" PRIu32 " members (min_isr %" PRIu32 "): writes are taken",
+            rv->number, rv->rec.nisr, rv->rec.min_isr);
+    rv->short_said = 0;
+    if (rv->held_commit) {
+        struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+        if (db) {
+            crash_point(CP_ACKED_BEFORE_OK); /* as in APPLY (r3d-isr review L1): the held commit reaches the writer */
+            eng_leader_commit(db, rv->held_commit);
+        }
+        tsdb_cvol_unref(&db);
+        rv->held_commit = 0;
+    }
+}
 
 static struct repl_vmeta vmeta_of(const struct rvol *rv)
 {
@@ -1114,6 +1663,7 @@ static void handle(struct rvol *rv, struct item *it)
         m.epoch = m.meta.epoch;
         repl_recv(rv->core, &m);
         drain(rv);
+        isr_meta(rv);
         return;
     }
     int from = node_index(rv, it->node);
@@ -1166,8 +1716,13 @@ static void handle(struct rvol *rv, struct item *it)
     rv->peer[from].heard_ms = now_ms();
     if (rv->cur.m.type == REPL_M_ACK) {
         struct rpeer *p = &rv->peer[from];
-        p->acked = rv->cur.m.written;
+        p->acked = G.mutant == RM_KEEPWRITTEN ? rv->cur.m.written : rv->cur.m.durable;
         p->heard = 1;
+        if (rv->cur.m.written != p->wrote || !p->wrote_ms) {
+            p->wrote = rv->cur.m.written;
+            p->wrote_ms = now_ms();
+        }
+        ahead_mark(p, now_ms());
     }
     repl_recv(rv->core, &rv->cur.m);
     drain(rv);
@@ -1185,6 +1740,10 @@ static void handle(struct rvol *rv, struct item *it)
 static void do_sync(struct rvol *rv)
 {
     rv->sync_wanted = 0;
+    if (G.sync_pause && rv->mode == M_REPLICA && now_ms() < rv->sync_pause_end) {
+        rv->sync_paused = 1; /* the tick hands it back once the pause is over */
+        return;
+    }
     struct eng *db = tsdb_cvol_ref(G.t, rv->number);
     if (!db)
         return;
@@ -1204,6 +1763,19 @@ static void do_sync(struct rvol *rv)
         return;
     }
     repl_synced(rv->core, d);
+    if (missing && G.fetch_late && strcmp(name, rv->fetch_late_name)) { /* a new name: its first FETCH waits */
+        snprintf(rv->fetch_late_name, sizeof rv->fetch_late_name, "%s", name);
+        rv->fetch_late_ms = now_ms();
+    }
+    if (missing && G.fetch_late && now_ms() - rv->fetch_late_ms < FETCH_LATE_MS)
+        missing = 0;
+    if (missing && G.no_fetch) {
+        if (strcmp(name, rv->fetch_name))
+            say("test: volume %" PRIu32 ": withholds the FETCH of %s (the marker at %" PRIu64 ")", rv->number, name,
+                mpos);
+        snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
+        missing = 0;
+    }
     if (missing && (strcmp(name, rv->fetch_name) || now_ms() - rv->fetch_ms >= 1000)) {
         int ld = node_index(rv, rv->rec.leader);
         struct plink *l = ld >= 0 ? link_of(rv->rec.rep[ld].node, 0) : NULL;
@@ -1219,10 +1791,36 @@ static void do_sync(struct rvol *rv)
     }
 }
 
+/* The writer's commit point, stuck with writes above it for COMMIT_STALL_MS (rv->mu held): says once what holds it (the
+ * core's view and the engine's durable end), and once that it moves again. Nothing else: a stall is either a peer that
+ * the ISR check drops after isr_lag, or a bug, and this line is what tells them apart afterwards. */
+static void commit_watch(struct rvol *rv, uint64_t now)
+{
+    if (rv->mode != M_WRITER || !rv->core)
+        return;
+    uint64_t c = repl_commit(rv->core), w = repl_written(rv->core);
+    if (c != rv->cstall_at || w <= c) {
+        if (rv->cstall_said)
+            say("volume %" PRIu32 ": the commit point moves again (%" PRIu64 ")", rv->number, c);
+        rv->cstall_at = c, rv->cstall_ms = now, rv->cstall_said = 0;
+        return;
+    }
+    if (rv->cstall_said || now - rv->cstall_ms < COMMIT_STALL_MS)
+        return;
+    rv->cstall_said = 1;
+    char d[1024];
+    repl_describe(rv->core, d, sizeof d);
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+    uint64_t wd = db ? eng_wal_durable_fno(db) : 0;
+    tsdb_cvol_unref(&db);
+    say("volume %" PRIu32 ": the commit point has stayed at %" PRIu64 " for %d ms with writes above it: %s; the WAL is "
+        "durable to %" PRIu64 ", handed to the core %" PRIu64, rv->number, c, COMMIT_STALL_MS, d, wd, rv->synced_rep);
+}
+
 static void *vol_main(void *arg)
 {
     struct rvol *rv = arg;
-    uint64_t next_tick = now_ms() + TICK_MS;
+    uint64_t next_tick = now_ms() + TICK_MS, slice = 0;
     pthread_mutex_lock(&rv->mu);
     while (!rv->stop) {
         drain(rv);
@@ -1230,22 +1828,52 @@ static void *vol_main(void *arg)
             pthread_cond_wait(&rv->cv, &rv->mu);
             continue;
         }
-        if (rv->in_head) {
+        /* a tick that is due goes before the inbox (r3d review L2): under a steady stream of ACKs the inbox is never
+         * empty, and the ticks (catch-up of a lagging peer, resends, the ISR check) would wait for it. But after each
+         * tick the inbox gets a tick's time (`slice`) even when the next one is due: a tick whose catch-up read takes
+         * longer than a tick (a peer far behind: 4 MiB a read) made the next one due at once, and the ACKs of the
+         * other peers waited in the inbox while the core's clock went on, until it dropped a healthy member from the
+         * ISR for silence (a replica's rejoin, 2026-11-17: ISR 3 -> 2 -> 1; test_cluster rejoinslow) */
+        uint64_t now = now_ms();
+        int mine = now < next_tick || (now < slice && G.mutant != RM_INBOXSTARVE);
+        if (rv->in_head && mine) {
             struct item *it = rv->in_head;
             rv->in_head = it->next;
             if (!rv->in_head)
                 rv->in_tail = NULL;
+            inbox_took(rv, it);
             handle(rv, it);
             free(it);
             continue;
         }
-        if (rv->sync_wanted) {
+        if (rv->sync_wanted && mine) {
             do_sync(rv);
             continue;
         }
-        uint64_t now = now_ms();
         if (now >= next_tick) {
+            /* The core counts isr_lag and the join hold in ticks, which must follow the wall clock: a tick that comes
+             * a tick or more late (the catch-up step of the one before took that long) is the clock catching up, and
+             * runs without a catch-up step of its own, after the inbox had its slice; the step runs again once the
+             * clock is current. Each tick ran one step before and a late tick was dropped, so with catch-up reads of
+             * X ms a core tick took X + 5 ms of wall time: with 20 ms reads a stopped member stalled the writes for
+             * 5 s, not isr_lag (r3d-isr review M1; test_cluster tickwall, mutant tickstretch). A thread that never
+             * gets current again (a full inbox under TSan) still runs a step once as long after the last one as that
+             * one took: the steps get at least half its time while it is late, and a lagging peer is never starved
+             * (the first version ran steps only on current ticks: rejoinsteady under TSan never joined in 30 s;
+             * test_cluster rejoinlate, mutant stepcurrentonly) */
+            const int stretch = G.mutant == RM_TICKSTRETCH;
+            int behind = !stretch && now >= next_tick + TICK_MS;
+            if (rv->sync_paused && now >= rv->sync_pause_end) {
+                rv->sync_paused = 0;
+                rv->sync_wanted = 1;
+            }
+            if (rv->sync_late) {
+                uint64_t l = rv->sync_late;
+                rv->sync_late = 0;
+                synced_locked(rv, NULL, l);
+            }
             repl_tick(rv->core);
+            commit_watch(rv, now);
             next_tick += TICK_MS;
             if (G.trace && now - rv->trace_ms >= 2000) {
                 char tb[1536];
@@ -1263,15 +1891,32 @@ static void *vol_main(void *arg)
                     (unsigned long long)rv->log_start, (unsigned long long)rv->idx_end, (size_t)rv->nidx, tb);
                 rv->trace_ms = now;
             }
-            if (next_tick < now)
-                next_tick = now + TICK_MS;
+            if (stretch ? next_tick < now : next_tick + TICK_BACKLOG_MS < now)
+                next_tick = stretch ? now + TICK_MS : now - TICK_BACKLOG_MS; /* a longer stall: that much is caught up */
             drain(rv);
-            if (rv->mode == M_WRITER || rv->mode == M_PROMOTING) {
+            if (G.late_tick && rv->mode == M_WRITER) {
+                pthread_mutex_unlock(&rv->mu);
+                struct timespec lt = {0, LATE_TICK_MS * 1000000L};
+                nanosleep(&lt, NULL);
+                pthread_mutex_lock(&rv->mu);
+            }
+            uint64_t cu0 = now_ms();
+            int step = !behind || (cu0 >= rv->cu_next && G.mutant != RM_STEPCURRENTONLY);
+            if (step && (rv->mode == M_WRITER || rv->mode == M_PROMOTING)) {
                 struct eng *db = tsdb_cvol_ref(G.t, rv->number);
                 if (db)
                     catch_up(rv, db);
                 tsdb_cvol_unref(&db);
+                if (G.slow_tick && rv->mode == M_WRITER) {
+                    pthread_mutex_unlock(&rv->mu);
+                    struct timespec st = {0, SLOW_TICK_MS * 1000000L};
+                    nanosleep(&st, NULL);
+                    pthread_mutex_lock(&rv->mu);
+                }
+                uint64_t cu1 = now_ms();
+                rv->cu_next = cu1 + (cu1 - cu0);
             }
+            slice = now_ms() + TICK_MS;
             continue;
         }
         struct timespec dl;
@@ -1353,6 +1998,28 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "unsureignored")  ? RM_UNSUREIGNORED
                : !strcmp(mu, "admitnocheck")   ? RM_ADMITNOCHECK
                : !strcmp(mu, "nocursorup")     ? RM_NOCURSORUP
+               : !strcmp(mu, "commitpastremoved") ? RM_COMMITPASTREMOVED
+               : !strcmp(mu, "nominisr")       ? RM_NOMINISR
+               : !strcmp(mu, "ackbelowminisr") ? RM_ACKBELOWMINISR
+               : !strcmp(mu, "shipperfile")    ? RM_SHIPPERFILE
+               : !strcmp(mu, "nocap")          ? RM_NOCAP
+               : !strcmp(mu, "noseal")         ? RM_NOSEAL
+               : !strcmp(mu, "nospill")        ? RM_NOSPILL
+               : !strcmp(mu, "noinboxbound")   ? RM_NOINBOXBOUND
+               : !strcmp(mu, "keepignorespeers") ? RM_KEEPIGNORESPEERS
+               : !strcmp(mu, "keepwritten")    ? RM_KEEPWRITTEN
+               : !strcmp(mu, "nologstartcheck") ? RM_NOLOGSTARTCHECK
+               : !strcmp(mu, "stopnodepose")   ? RM_STOPNODEPOSE
+               : !strcmp(mu, "lateclock")      ? RM_LATECLOCK
+               : !strcmp(mu, "syncbyrep")      ? RM_SYNCBYREP
+               : !strcmp(mu, "inboxwaitall")   ? RM_INBOXWAITALL
+               : !strcmp(mu, "shipnoisr")      ? RM_SHIPNOISR
+               : !strcmp(mu, "fastride")       ? RM_FASTRIDE
+               : !strcmp(mu, "nojoinhold")     ? RM_NOJOINHOLD
+               : !strcmp(mu, "inboxstarve")    ? RM_INBOXSTARVE
+               : !strcmp(mu, "opennohold")     ? RM_OPENNOHOLD
+               : !strcmp(mu, "tickstretch")    ? RM_TICKSTRETCH
+               : !strcmp(mu, "stepcurrentonly") ? RM_STEPCURRENTONLY
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -1362,6 +2029,24 @@ void repld_init(tsdb *t, const char *dir)
     G.skip_pos = te && strstr(te, "skippos");
     G.stale_sent = te && strstr(te, "stalesent");
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
+    G.late_wal = te && strstr(te, "latewal");
+    G.no_clock = te && strstr(te, "noclock");
+    G.sync_by_hook = te && strstr(te, "syncbyhook");
+    G.sync_late = te && strstr(te, "synclate");
+    G.fetch_late = te && strstr(te, "fetchlate");
+    G.no_fetch = te && strstr(te, "nofetch");
+    G.sync_pause = te && strstr(te, "syncpause");
+    G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
+    if (G.mutant == RM_NOINBOXBOUND)
+        G.inbox_bytes = SIZE_MAX;
+    G.stall_inbox = te && strstr(te, "stallinbox");
+    G.slow_read = te && strstr(te, "slowread");
+    G.slow_tick = te && strstr(te, "slowtick");
+    G.late_tick = te && strstr(te, "latetick");
+    G.slow_ack = te && strstr(te, "slowack");
+    G.spill_bytes = te && strstr(te, "spill") ? 64u << 10 : SPILL_BYTES;
+    if (G.mutant == RM_NOSPILL)
+        G.spill_bytes = UINT64_MAX;
     G.t = t;
     snprintf(G.dir, sizeof G.dir, "%s", dir);
 }
@@ -1374,13 +2059,14 @@ int repld_open(const struct cluster_vol_rec *r)
     if (!rv)
         return TSDB_ERR_NOMEM;
     rv->number = r->number;
-    rv->rec = *r;
+    rec_set(rv, r);
     snprintf(rv->dir, sizeof rv->dir, "%s/v%" PRIu32, G.dir, r->number);
     rv->self = node_index(rv, G.self);
     rv->nnodes = (int)r->nrep;
     pthread_mutex_init(&rv->mu, NULL);
     pthread_cond_init(&rv->cv, NULL);
-    rv->ops = (struct jr_ops){.ctx = rv, .ship = op_ship, .admit = op_admit, .bytes = op_bytes, .synced = op_synced};
+    pthread_cond_init(&rv->in_space, NULL);
+    rv->ops = (struct jr_ops){.ctx = rv, .ship = op_ship, .ship_wait = op_ship_wait, .admit = op_admit, .bytes = op_bytes, .synced = op_synced};
     int dfd = open(rv->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     bool torn = false;
     int rc = dfd < 0 ? TSDB_ERR_IO : replfile_load(dfd, &rv->rf, &rv->st, &torn);
@@ -1418,6 +2104,14 @@ int repld_open(const struct cluster_vol_rec *r)
     scan_segments(rv, h, &nh, &first);
     struct eng *db = tsdb_cvol_ref(G.t, r->number);
     uint64_t log_end = db ? replica_log_end(db) : 0;
+    /* the durable end the core starts from: below a COMMIT marker whose files are not staged (replica.c's hold), not
+     * the log end. A replica killed between such a marker and its file's FETCH otherwise acknowledged its whole log at
+     * the restart (once its log was verified, before its first sync): the leader took it as holding the file, its keep
+     * bound passed the marker, the segment and the link the file is served from went, and the replica asked for the
+     * file for the rest of the run ("it needs a snapshot"; jepsen-cluster kill, kv and classes, 2026-11-18). Its match
+     * claimed positions it could not apply too. test_cluster reopenhold; mutant opennohold */
+    uint64_t dur = db ? replica_durable_end(db) : 0;
+    uint64_t hold = dur < log_end && G.mutant != RM_OPENNOHOLD ? dur + 1 : 0;
     /* the history: REPL's entries below the first segment's, then the segments' own */
     for (uint32_t i = 0; i < rv->st.nhist; i++)
         if (!nh || rv->st.hist[i].start < h[0].start)
@@ -1452,13 +2146,18 @@ int repld_open(const struct cluster_vol_rec *r)
         }
     }
     struct repl_durable d = {.rid = rv->st.rid, .fence = rv->st.fence, .led = rv->st.led, .floor = rv->st.floor,
-                             .log_start = rv->log_start, .log_end = log_end, .hist = rv->hist, .nhist = rv->nhist};
+                             .log_start = rv->log_start, .log_end = log_end, .hold = hold, .hist = rv->hist,
+                             .nhist = rv->nhist};
     uint32_t lag = r->isr_lag_ms ? r->isr_lag_ms : 1000;
-    struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = r->min_isr ? (int)r->min_isr : 1,
+    int min_isr = r->min_isr && G.mutant != RM_NOMINISR ? (int)r->min_isr : 1; /* planted nominisr: never checked */
+    struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = min_isr,
                               .isr_lag_ticks = lag / TICK_MS, .resend_ticks = 200 / TICK_MS, .heartbeat_ticks = 1,
+                              .idle_heartbeat_ticks = IDLE_HEARTBEAT_MS / TICK_MS,
                               .floor_ticks = 1000 / TICK_MS, .max_batch = 1u << 30, .window = 1u << 30,
+                              .join_hold_ticks = G.mutant == RM_NOJOINHOLD ? 0 : lag / TICK_MS,
                               .rec_find = idx_find, .ctx = rv};
     rv->core = repl_open(&cfg, &d);
+    rv->sync_pause_end = now_ms() + SYNC_PAUSE_MS;
     if (!rv->core) {
         say("volume %" PRIu32 ": the replication core refused the state of %s", r->number, rv->dir);
         cvol_close(r->number);
@@ -1512,7 +2211,7 @@ void repld_update(const struct cluster_vol_rec *r)
     for (uint32_t i = 0; same && i < r->nrep; i++)
         same = r->rep[i].node == rv->rec.rep[i].node; /* a rid is filled in at its first open */
     if (same)
-        rv->rec = *r; /* the replica set is fixed for a volume's driver (a move: r3e and later) */
+        rec_set(rv, r); /* the replica set is fixed for a volume's driver (a move: r3e and later) */
     else if (!rv->set_changed) { /* a member's cursor and acks must never pass to another node: ignored, said once */
         rv->set_changed = 1;
         say("volume %" PRIu32 ": its replica set changed; this driver keeps the old one until a restart", r->number);
@@ -1520,6 +2219,57 @@ void repld_update(const struct cluster_vol_rec *r)
     pthread_mutex_unlock(&rv->mu);
     if (changed)
         post(rv, IN_META, 0, NULL, 0);
+}
+
+int repld_isr_short(uint32_t v)
+{
+    if (!__atomic_load_n(&G.nshort, __ATOMIC_ACQUIRE))
+        return 0; /* no volume is short: the common case, with no lock on the path of every write */
+    struct rvol *rv = vol_find(v);
+    if (!rv)
+        return 0;
+    pthread_mutex_lock(&rv->mu);
+    int s = rv->mode == M_WRITER && !rv->failed && isr_short_locked(rv);
+    pthread_mutex_unlock(&rv->mu);
+    return s;
+}
+
+unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max)
+{
+    struct rvol *vs[CLUSTER_REPORT_VOLS];
+    pthread_mutex_lock(&G.mu);
+    uint32_t nv = G.nvols;
+    memcpy(vs, G.vols, nv * sizeof *vs);
+    pthread_mutex_unlock(&G.mu);
+    unsigned n = 0;
+    /* from where the last report stopped: with more requests than one heartbeat carries (CLUSTER_REPORT_ISR) every
+     * volume gets its turn, not the same first ones until they apply (r3d-isr review L4) */
+    uint32_t rot = nv ? __atomic_load_n(&G.isr_rot, __ATOMIC_RELAXED) % nv : 0, i;
+    for (i = 0; i < nv && n < max; i++) {
+        struct rvol *rv = vs[(rot + i) % nv];
+        pthread_mutex_lock(&rv->mu);
+        const struct repl_vmeta *q = &rv->isr_req;
+        if (rv->isr_want && (q->epoch != rv->rec.epoch || q->isr_version != rv->rec.isr_version))
+            rv->isr_want = 0; /* the record moved: the core asks again if it still wants a change */
+        if (rv->isr_want && !rv->failed && rv->core) {
+            struct cluster_isr_req *o = &out[n];
+            memset(o, 0, sizeof *o);
+            o->volume = rv->number;
+            o->epoch = q->epoch;
+            o->isr_version = q->isr_version;
+            o->commit = repl_commit(rv->core);
+            for (uint32_t k = 0; k < rv->rec.nrep && k < META_REPLICAS_MAX; k++)
+                if (q->isr & (1u << k)) {
+                    o->node[o->nisr] = rv->rec.rep[k].node;
+                    o->rid[o->nisr++] = q->rid[k];
+                }
+            n++;
+        }
+        pthread_mutex_unlock(&rv->mu);
+    }
+    if (n == max)
+        __atomic_store_n(&G.isr_rot, (rot + i) % nv, __ATOMIC_RELAXED);
+    return n;
 }
 
 unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t after_ms)
@@ -1621,12 +2371,13 @@ void repld_stop(void)
         pthread_mutex_lock(&rv->mu);
         rv->stop = 1;
         pthread_cond_signal(&rv->cv);
+        pthread_cond_broadcast(&rv->in_space);
         pthread_mutex_unlock(&rv->mu);
         if (rv->started)
             pthread_join(rv->th, NULL);
         rv->started = 0;
         struct eng *db = tsdb_cvol_ref(G.t, rv->number);
-        if (db && rv->mode == M_WRITER)
+        if (db && rv->mode == M_WRITER && G.mutant != RM_STOPNODEPOSE && !G.late_wal)
             eng_leader_depose(db); /* nothing waits for a commit point that no longer moves */
         tsdb_cvol_unref(&db);
     }
@@ -1636,4 +2387,7 @@ void repld_stop(void)
         peerlink_free(G.pl);
         G.pl = NULL;
     }
+    /* `stop`, set under each volume's mu above, keeps the engine's hooks (op_bytes, op_ship) off the freed links */
+    if (G.late_wal)
+        nanosleep(&(struct timespec){2, 500000000}, NULL);
 }

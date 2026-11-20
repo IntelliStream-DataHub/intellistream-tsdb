@@ -18,6 +18,7 @@
  *   test_stats [scratch dir]
  */
 #include "internal.h"
+#include "ecpart.h"
 #include "tsdb.h"
 
 #include <dirent.h>
@@ -160,13 +161,14 @@ static void check_volumes(tsdb *db, const char *when)
     }
     tsdb_stats gs;
     tsdb_get_stats(db, &gs);
-    if (counted != listed || listed != ps.parts || bytes != ps.bytes || gs.rows != ps.rows)
+    if (counted != listed || listed != ps.parts || bytes != ps.bytes || gs.rows != ps.rows || gs.bytes != ps.bytes)
         fprintf(stderr, "  %s: counted %" PRIu64 " listed %" PRIu64 " parts %" PRIu64 "; bytes %" PRIu64 " files %" PRIu64
-                        "; rows %" PRIu64 " %" PRIu64 "\n",
-                when, counted, listed, ps.parts, bytes, ps.bytes, gs.rows, ps.rows);
+                        "; rows %" PRIu64 " %" PRIu64 "; tsdb_stats bytes %" PRIu64 "\n",
+                when, counted, listed, ps.parts, bytes, ps.bytes, gs.rows, ps.rows, gs.bytes);
     CHECK(counted == listed);
     CHECK(listed == ps.parts);
     CHECK(bytes == ps.bytes);
+    CHECK(gs.bytes == ps.bytes); /* tsdb_get_stats (stats_walk) counts a settled part as its object too */
     CHECK(logical <= gs.rows * 16 && (gs.rows == 0 || logical >= gs.rows * 12)); /* 8 + a width of 4 or 8 */
 }
 
@@ -242,6 +244,12 @@ static void load_all(world *w, size_t rows, size_t k0)
         for (size_t k = 0; k < rows; k += 5000)
             put_rows(w->db, w->id[i], w->type[i], T0, 60000, k0 + k, rows - k < 5000 ? rows - k : 5000);
     put_rows(w->db, w->id[w->n - 1], TSDB_FLOAT64, T0, 3600000, k0, 2000); /* 2,000 hourly rows: 83 days */
+}
+
+static bool mark_all(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows)
+{
+    (void)ctx, (void)vol, (void)partition, (void)level, (void)rows;
+    return true;
 }
 
 static void test_oracle(const char *base)
@@ -330,6 +338,26 @@ static void test_oracle(const char *base)
     OK(tsdb_drop_before(w.db, T0 + 2 * DAY));
     check_volumes(w.db, "drop_before");
     check_series(&w, "drop_before", false);
+
+    /* settled parts (R7): a part with an .ec file counts as its object, what its source file was, so the four byte
+     * columns still add up to tsdb_foreach_part's bytes. Here parts marked in memory (eng_test_mark_ec: the bytes are
+     * still in the map); the settle of r7-settle makes real ones. Marked after the sweeper walked them. */
+    OK(tsdb_stats_settle(w.db, 60000));
+    size_t marked = tsdb_test_mark_ec(w.db, EC_MARK_EC, mark_all, NULL);
+    CHECK(marked > 0);
+    check_volumes(w.db, "parts marked settled");
+    check_series(&w, "parts marked settled", false);
+
+    /* the other order: marked before the sweeper walks them, so its walk (part_walk, stats_walk) reads a settled part
+     * through eccache_part_bytes, not only tsdb_foreach_part (review F2: +1 byte on either walk must fail here) */
+    atomic_store(&stats_pause, 1);
+    for (size_t i = 0; i + 1 < w.n; i++)
+        put_rows(w.db, w.id[i], w.type[i], T0 + 200 * DAY, 60000, 0, 4000);
+    OK(tsdb_flush(w.db));
+    CHECK(tsdb_test_mark_ec(w.db, EC_MARK_EC, mark_all, NULL) > 0); /* only the new parts: the old ones are marked */
+    atomic_store(&stats_pause, 0);
+    check_volumes(w.db, "parts marked before their walk");
+    check_series(&w, "parts marked before their walk", false);
 
     /* memtable rows: a small write is counted in memtable_rows and not in the part columns */
     OK(tsdb_append(w.db, w.id[0], T0 + 30 * DAY, 1.0f));

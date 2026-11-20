@@ -218,6 +218,7 @@ REAL(fcntl);
 REAL(mkdir);
 REAL(mkdirat);
 REAL(ftruncate);
+REAL(closedir);
 
 static volatile sig_atomic_t power_losing; /* the power loss is rolling files back: another thread that reads a mapping of one gets SIGBUS */
 static volatile sig_atomic_t usr2_seen; /* only a SIGUSR2 sets it: the power loss line says so (jepsen counts the nemesis's own) */
@@ -316,6 +317,7 @@ __attribute__((constructor)) static void init(void)
     LOAD(mkdir);
     LOAD(mkdirat);
     LOAD(ftruncate);
+    LOAD(closedir);
     const char *r = getenv("CRASHFS_ROOT");
     if (!r || !realpath(r, root))
         return;
@@ -1186,10 +1188,30 @@ static void md_read(int fd, void *buf, size_t r, off_t off)
 
 /* --------------------------------------------------------------- hooks */
 
+/* A descriptor number open() hands out is not the file a record of it names any more: that one was closed where this
+ * shim does not see it (glibc's closedir of an fdopendir(dup(fd))). A stale record made an fsync of a file outside
+ * the root fail as an EIO on a directory inside it. */
+static void fd_forget(int fd)
+{
+    if (fd >= 0 && fd < MAX_FDS && fdpath[fd]) {
+        pthread_mutex_lock(&lock);
+        free(fdpath[fd]);
+        fdpath[fd] = NULL;
+        pthread_mutex_unlock(&lock);
+    }
+}
+
+int closedir(DIR *d)
+{
+    fd_forget(dirfd(d));
+    return real_closedir(d);
+}
+
 /* misdirect mode: remember the descriptor of a database file, nothing else */
 static int md_open(int dirfd, const char *name, int flags, mode_t mode, bool at, const char *path)
 {
     int fd = at ? real_openat(dirfd, name, flags, mode) : real_open(name, flags, mode);
+    fd_forget(fd);
     struct stat st;
     if (fd >= 0 && fd < MAX_FDS && md_eligible(path) && fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
         pthread_mutex_lock(&lock);
@@ -1208,8 +1230,11 @@ static int do_open(int dirfd, const char *name, int flags, mode_t mode, bool at)
     path_of_at(at ? dirfd : AT_FDCWD, name, path);
     if (md_mode)
         return md_open(dirfd, name, flags, mode, at, path);
-    if (!tracked(path))
-        return at ? real_openat(dirfd, name, flags, mode) : real_open(name, flags, mode);
+    if (!tracked(path)) {
+        int fd = at ? real_openat(dirfd, name, flags, mode) : real_open(name, flags, mode);
+        fd_forget(fd);
+        return fd;
+    }
     pthread_mutex_lock(&lock);
     maybe_crash();
     struct stat st;

@@ -59,7 +59,28 @@ typedef struct user {
     uint32_t ng, gcap;
     struct umatch *m; /* rights_of's index, built on first use */
     uint64_t batch;   /* the load batch that made this copy (users.c) */
+    uint64_t version; /* a group store's (users_group_init): the metadata entry that last put the user; else 0 */
 } user;
+
+/* A change made in a group store: what the mutator would have appended, as the target's new blob (user_blob_encode)
+ * or a drop, for the caller to propose to the metadata group (conditional on version: 0 for a create). */
+typedef struct users_proposal {
+    int op; /* 0: the change changes nothing; USERS_PROP_PUT, USERS_PROP_DEL */
+    char name[USER_NAME_MAX + 1];
+    uint64_t version;
+    uint8_t *blob; /* PUT: malloc'ed */
+    size_t len;
+} users_proposal;
+enum { USERS_PROP_PUT = 1, USERS_PROP_DEL = 2 };
+
+/* A user of the metadata group's copy, as users_group_set takes it (server/cluster.h cluster_user_rec). */
+typedef struct users_group_rec {
+    const char *name;
+    uint32_t uid;
+    uint64_t version;
+    const uint8_t *blob;
+    uint32_t len;
+} users_group_rec;
 
 typedef struct users {
     char dir[4096], path[4200];
@@ -85,6 +106,9 @@ typedef struct users {
     bool failed;  /* a write or sync of USERS failed: nothing more is acknowledged (fail-stop) */
     void (*on_fail)(void *arg, const char *msg); /* tsdbd exits; NULL: the call returns TSDB_ERR_IO */
     void *fail_arg;
+    bool group;            /* a group store (users_group_init): no file, the users are the metadata copy's */
+    const char *target;    /* group: the name the change in progress is about */
+    users_proposal *prop;  /* group: where a change puts what it would append; NULL: changes are refused */
 } users;
 
 /* ------------------------------------------------------------ the file */
@@ -96,6 +120,22 @@ int users_open(users *us, const char *dir, bool writable);
  * end is read next time. Damage: TSDB_ERR_CORRUPT, the state stays as it was and `damaged` is set. */
 int users_reload(users *us);
 void users_close(users *us);
+
+/* A group store (tsdbd --cluster, S2-1): the users of the metadata group's copy, set whole by users_group_set; no file
+ * is read or written. The changes below check exactly as on a file, then leave the state as it was and describe the
+ * change in *us->prop (op 0: nothing to change) for the caller to propose; the copy brings it back once committed. */
+int users_group_init(users *us);
+/* The mark of a cluster server's root (the file CLUSTER_USERS, written by tsdbd at its start with --cluster): `tsdb DIR
+ * user ...` refuses there and names `tsdb cluster user`. mark: 0 or TSDB_ERR_IO; marked: the file exists. */
+#define USERS_CLUSTER_MARK "CLUSTER_USERS"
+int users_mark_cluster(const char *dir);
+bool users_cluster_marked(const char *dir);
+/* Replaces the users with the copy's (any order). A user whose uid and version are unchanged keeps its object (and
+ * its batch: tsdbd's snapshots and rights maps carry over); the others are decoded (user_blob_decode). A blob that
+ * does not decode, or holds another name or uid than its record, is left out and counted in *refused. 0 or
+ * TSDB_ERR_NOMEM (the state stays as it was). */
+int users_group_set(users *us, const users_group_rec *r, uint32_t n, uint32_t *refused);
+void users_proposal_clear(users_proposal *p);
 
 /* Changes. `actor` is the uid of the user asking, 0 for the operator at the shell (the CLI: who can write the
  * directory holds every right already). Each takes the lock, reads what others appended, checks the change against
@@ -129,6 +169,15 @@ const user *users_by_uid(const users *us, uint32_t uid);
 uint32_t users_superusers(const users *us);
 
 /* ------------------------------------------------------- the grant model */
+
+/* A user as the cluster's metadata group stores it (S2-1; server/meta.h META_USER_*): 4 bytes of uid (little-endian,
+ * written by the state machine), 4 zero bytes, then the user's compacted records (USER, VERIFIER, GRANT) as they
+ * would follow a USERS header, each with uid 1. encode: 0 or NOMEM, *blob malloc'ed. decode: 0 with *out a private
+ * user (user_release) whose uid is the blob's, CORRUPT for anything else than one whole user, or NOMEM. */
+int user_blob_encode(const user *u, uint8_t **blob, size_t *len);
+int user_blob_decode(const uint8_t *blob, size_t len, user **out);
+/* users_grant / users_revoke on a private user, without the rights checks (the operator at the cluster CLI) */
+int user_change_grant(user *u, uint8_t kind, const char *sel, size_t len, uint8_t rights, bool grant);
 
 bool user_name_valid(const char *name, size_t len);
 bool verifier_valid(const user_verifier *v);

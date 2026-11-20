@@ -45,6 +45,16 @@ enum cluster_admin_op {
     CLUSTER_OP_STATUS = 3,   /* no body; on any server */
     CLUSTER_OP_VOLUME_ADD = 4, /* body: u16 name length, the name, u32 replicas (0: the cluster's replication); on the
                                 * Raft leader, which picks the number, uuid, servers and rids. Reply: u32 number */
+    /* USER_PUT, USER_DEL: body u16 name length, the name, u64 version (DEL: 0), u32 wait_ms, u32 blob length, the
+     * blob (DEL: none); on the Raft leader. Answered once applied there: the operation's result, and when it is
+     * META_OK the body u64 index, u32 uid, u32 n, n x {u32 member, u64 applied} (the members below the index after
+     * wait_ms, cluster_user_propose) */
+    CLUSTER_OP_USER_PUT = 5,
+    CLUSTER_OP_USER_DEL = 6,
+    /* USER_GET: body u16 name length, the name; on any server, from its copy. Reply: u64 version, u32 uid, the blob
+     * (META_ERR_NOTFOUND without a body). An empty name lists: u32 n, n x {u16 name length, the name, u32 uid, u64
+     * version} */
+    CLUSTER_OP_USER_GET = 7,
 };
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
@@ -91,12 +101,28 @@ struct cluster_unreach { /* a server this one shares a volume with and has not h
     uint32_t node;
     uint32_t age_ms;
 };
+#define CLUSTER_REPORT_ISR 32
+/* A replicated volume led here asks the metadata group for an ISR change (design-cluster.md 6.1, 8.1 step 5; the core's
+ * REPL_M_ISR_REQ): the new ISR as (node, rid) pairs, holding the leader, on the basis (epoch, isr_version) of the record
+ * it saw, and the leader's commit point. The Raft leader proposes ISR_CHANGE (meta_op_isr_change) with exactly that
+ * basis, so a request that is no longer current is refused at the apply. */
+struct cluster_isr_req {
+    uint32_t volume;
+    uint64_t epoch, isr_version, commit;
+    uint32_t nisr;
+    uint32_t node[META_REPLICAS_MAX];
+    uint64_t rid[META_REPLICAS_MAX];
+};
 struct cluster_report {
-    uint32_t nvols, ndoms, nunreach;
+    uint32_t nvols, ndoms, nunreach, nisr;
     struct cluster_vol_report vols[CLUSTER_REPORT_VOLS];
     struct cluster_dom_report doms[CLUSTER_REPORT_DOMS];
     struct cluster_unreach unreach[CLUSTER_REPORT_UNREACH];
+    struct cluster_isr_req isr[CLUSTER_REPORT_ISR];
 };
+/* A volume led here has a new request for the metadata group (any thread, an atomic store): the cluster thread sends
+ * its next heartbeat within a duty round (100 ms) instead of after heartbeat_ms, so an ISR change waits that long. */
+void cluster_beat_soon(void);
 /* Fills `out` (zeroed) from what this server runs; called from the cluster thread once per heartbeat, so it must not
  * block. Without one (set before cluster_start) the server reports no volumes and no domains. */
 typedef void (*cluster_report_fn)(void *arg, struct cluster_report *out);
@@ -132,6 +158,12 @@ uint64_t cluster_lease_safe(uint64_t answer_ns, uint32_t lease_ms, uint32_t drif
  * then cluster_stop() (no hand-off is under way after it), and only then peerlink_free. */
 struct peerlink;
 void cluster_set_peerlink(struct peerlink *pl);
+/* The acceptor's table, one peerlink per link kind (PL_KIND_*): a data link's HELLO of kind k goes to the peerlink
+ * registered for k, and a kind without one (or at or above CLUSTER_PL_KINDS) is refused with a line.
+ * cluster_set_peerlink(pl) is this for PL_KIND_LOG and PL_KIND_BULK. Any thread; each kind's pointer follows the
+ * shutdown order above. -1 for PL_KIND_META (the cluster thread's own) or a kind out of range, else 0. */
+#define CLUSTER_PL_KINDS 8
+int cluster_set_peerlink_kind(int kind, struct peerlink *pl);
 /* What a peerlink needs to dial and answer as this server (any thread, after cluster_start). 0, or -1 while this
  * server is in no cluster yet (id 0). */
 struct cluster_self {
@@ -166,6 +198,7 @@ struct cluster_vol_rec {
     uint32_t isr[META_REPLICAS_MAX]; /* node ids */
     uint64_t isr_version;
     uint32_t min_isr, isr_lag_ms;
+    uint32_t repl_retain_mb, repl_retain_s, idle_seal_ms; /* the settings (meta.h) */
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
  * holds every REPLICA_OPEN committed before this start), with every replicated volume that names this server (`self`)
@@ -173,6 +206,113 @@ struct cluster_vol_rec {
  * keeps and not block. */
 typedef void (*cluster_vol_watch_fn)(void *arg, uint32_t self, const struct cluster_vol_rec *v, uint32_t n);
 void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg);
+
+/* ---- the whole metadata copy as one snapshot (S2-1: TOPOLOGY, STATUS, MOVED; s2e's routing, r3e, R8 read it)
+ * The cluster thread builds a new snapshot after every applied batch, snapshot install and copy swap (whatever moved
+ * `applied`, its term or the restore generation) and publishes it by an atomic pointer swap. cluster_copy_get() (any
+ * thread, no lock, never blocks) returns the current one with a reference, NULL before this server holds an
+ * initialised copy or after cluster_stop; every get is paired with one cluster_copy_put(). A snapshot never changes
+ * and lives until its last reference goes; holding one does not hold the cluster thread up (it is only memory). It is
+ * as stale as any copy: leaders check epochs (design-cluster.md 2.4). A get and a put each write two shared counters
+ * (cache lines every reader shares): a hot path (s2e's per-request routing) keeps a snapshot per thread and gets a new
+ * one only when cluster_copy_builds() moved, so that per request it only reads a shared line.
+ * Member states (to settle in S3/s2e, nothing proposes them yet): TOPOLOGY's alive and cluster_vol_owner take META_UP
+ * only, so a DRAINING leader would show alive 0 and its volumes NO_OWNER; OUT members stay in the copy for good (a
+ * new member may reuse an OUT member's peer address), so TOPOLOGY's nodes and STATUS's peers list them. */
+struct cluster_copy_member {
+    uint32_t id;
+    uint8_t state;            /* enum meta_member_state */
+    char addr[META_ADDR_MAX]; /* the client address, host:port */
+    char peer[META_ADDR_MAX]; /* the peer address */
+};
+struct cluster_copy_vol {
+    uint32_t number;
+    char name[META_NAME_MAX]; /* what clients name it by (tsdbc_series_at's path) */
+    uint8_t kind;             /* enum meta_vol_kind */
+    uint32_t leader; /* the record's leader (writer, shared: owner); 0: none */
+    uint64_t epoch;
+    uint32_t nrep;
+    struct cluster_copy_rep {
+        uint32_t node;
+        uint8_t learner;
+    } rep[META_REPLICAS_MAX]; /* in record order */
+    uint32_t nisr;
+    uint32_t isr[META_REPLICAS_MAX]; /* node ids, ascending */
+};
+struct cluster_copy {
+    uint64_t applied, applied_term, restore_gen;
+    uint32_t self; /* this server's member id (0: none yet) */
+    uint32_t nmembers, nvolumes;
+    const struct cluster_copy_member *members; /* ascending by id */
+    const struct cluster_copy_vol *volumes;    /* ascending by number */
+};
+const struct cluster_copy *cluster_copy_get(void);
+void cluster_copy_put(const struct cluster_copy *c);
+/* how many snapshots this process has published: unchanged means a snapshot held since is still the current one */
+unsigned long cluster_copy_builds(void);
+/* Tests only (test_cluster ccstress), with no cluster running in the process: `readers` threads loop get/put while
+ * `publishes` snapshots are swapped in; 0 when all were published within `ms` and every reader saw what it held
+ * intact, else -1. why: a line either way (counts, the longest swap). */
+int cluster_copy_stress(unsigned readers, unsigned long publishes, unsigned ms, char *why, size_t wn);
+const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy *c, uint32_t id); /* NULL: none */
+const struct cluster_copy_vol *cluster_copy_vol(const struct cluster_copy *c, uint32_t number);    /* NULL: none */
+/* the volume named `name` (n bytes, no NUL needed), NULL: none (s2e routes series ops that name a volume by it) */
+const struct cluster_copy_vol *cluster_copy_vol_named(const struct cluster_copy *c, const char *name, size_t n);
+/* The role of member `node` in volume v as TOPOLOGY says it (TSDB_ROLE_*, D9: no new role before S3): the leader
+ * OWNER, a replica in the ISR STANDBY, any other replica (a learner too) FOLLOWER, anyone else NONE. */
+int cluster_copy_role(const struct cluster_copy_vol *v, uint32_t node);
+/* Where requests for volume `vol` go, from the current snapshot: 1 when it has a leader whose member is UP and is
+ * another server, 2 when that leader is this server (the snapshot's self), with its id, the epoch and its client
+ * address in addr, cap bytes; 0 when there is none (no copy, no such volume, no leader, or the leader is not UP).
+ * Never turn a 2 into MOVED: the client would follow it back here until its retry budget ran out. Any thread; never call it on the cluster thread's own path (vol_watch_duty and the like
+ * read C.sm directly). */
+int cluster_vol_owner(uint32_t vol, uint32_t *node, uint64_t *epoch, char *addr, size_t cap);
+
+/* ---- users and grants in the metadata group (design-cluster.md C22, design-ha-modes.md :916; S2-1) */
+struct cluster_user_rec {
+    const char *name;    /* at most USER_NAME_MAX bytes */
+    uint32_t uid;        /* assigned by the state machine, never reused */
+    uint64_t version;    /* the index of the entry that last put the user: what a conditional put names */
+    const uint8_t *blob; /* META_USER_UID_LEN bytes of uid (little-endian), then the user's compacted USERS records */
+    uint32_t len;
+};
+/* The group stores any blob a holder of the cluster secret puts under a name (meta.c checks only the uid): a consumer
+ * decodes it (user_blob_decode), refuses one that does not decode, and checks that the user it holds has the record's
+ * name, before it lets anyone log in with it.
+ * Called on the cluster thread with every user of the metadata copy, ascending by name, and the applied index the
+ * list is at, after the copy changed its users (an entry or a snapshot) and once when a callback is set while the copy
+ * has any. The records point into the copy and are valid during the call only: it must copy what it keeps and not
+ * block. It returns 0, or non-zero when it could not take the list (out of memory): the list is pushed again on the
+ * next tick (100 ms) until it is taken. NULL stops the calls. Any thread. */
+typedef int (*cluster_users_fn)(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied);
+void cluster_set_users_watch(cluster_users_fn fn, void *arg);
+
+/* The catch-up barrier (D-S2): 0 from cluster_start until this server has heard a Raft leader's commit index in this
+ * run (an HB_ACK from the leader it names that grants the lease, so that leader holds the check-quorum lease; the leader
+ * itself: its commit index once an entry of its own term is committed) and its copy has applied up to it; 1 from then on, also while it is cut off later (a member cut off
+ * keeps the users it has until it hears the group, ha-modes :916). Logins wait for it, so a restarted server never
+ * accepts a user whose drop committed while it was down. Any thread. */
+int cluster_users_caught_up(void);
+
+enum { CLUSTER_USER_PUT = 1, CLUSTER_USER_DEL = 2 };
+#define CLUSTER_LAGGARDS_MAX 64
+struct cluster_laggard {
+    uint32_t id;      /* a member (not OUT) */
+    uint64_t applied; /* the applied index its last heartbeat reported; 0: not heard */
+};
+/* Proposes USER_PUT (`blob`, `len`: META_USER_UID_LEN bytes, which the state machine overwrites with the uid, then
+ * the records; conditional on `version`, 0 to create) or USER_DEL (blob, len and version unused) through the Raft
+ * leader (this server, or the leader it knows, over the admin link with the cluster secret). Returns once the entry
+ * is committed and applied on the leader and every member has reported an applied index at or above it, or wait_ms
+ * after that: *index is the entry's index, *uid the user's, lag[0 .. *nlag) the members still below it (at most
+ * CLUSTER_LAGGARDS_MAX). Result: META_OK, a META_ERR_* of the operation (STALE, EXISTS, NOTFOUND, INVALID, RANGE), or
+ * a CLUSTER_ERR_* (NOTLEADER when no leader is known, RETRY when the outcome is unknown: read the user again before
+ * deciding). `actor` (NULL: the operator) and `actor_version`: the user whose rights allowed the change, as the
+ * caller's copy holds them; the op is then STALE unless the actor still has that version (meta_op_user_put_as).
+ * Blocks: never on the cluster thread. */
+int cluster_user_propose(int op, const char *name, const void *blob, uint32_t len, uint64_t version,
+                         const char *actor, uint64_t actor_version, int wait_ms, uint64_t *index, uint32_t *uid,
+                         struct cluster_laggard *lag, uint32_t *nlag);
 
 struct cluster_vol_status {
     struct cluster_vol_report v;
@@ -203,6 +343,7 @@ struct cluster_status {
     uint32_t leader;
     uint32_t nheard;
     struct cluster_heard *heard;
+    uint8_t users_caught_up; /* cluster_users_caught_up() on that server */
     const uint8_t *image;
     size_t image_len;
 };

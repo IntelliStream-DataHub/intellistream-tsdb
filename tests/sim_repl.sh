@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # The replication core's simulator (tests/sim_repl.c, docs/design-cluster.md §13.1).
-#   tests/sim_repl.sh quick            make test: 300 seeds, and the planted bugs that die within 200 seeds
+#   tests/sim_repl.sh quick            make test: 300 seeds, and the planted bugs that die within 1000 seeds (M@N: N seeds)
 #   tests/sim_repl.sh mutants          every planted bug, up to 20,000 seeds each; fails if one survives
 #   tests/sim_repl.sh soak [SEEDS] [JOBS] [FIRST]   SEEDS seeds (1,000,000) on JOBS processes (nproc), then mutants
 # B= the build directory (build).
@@ -32,6 +32,10 @@ mode=${1:-quick}
 #  31 min ISR ignored (check 7)                      34 promotion drops the old leader that did not answer (seed 76)
 #  35 repl_synced believes a sync issued before a cut (with the naive driver)
 #  36 a position the log no longer retains fails the core (no snapshot path)
+#  40 a silent member stays in the ISR while nothing is written (test_repl idle_shrink)
+#  41 a learner within the hold's bound is asked for at once, without waiting for the commit point (the hold of
+#     isr_check, r3d-isr liveness: join_hold_ticks on in 3 seeds of 4)
+#  42 no hold: a learner under writes that never pause never joins (test_repl steady_join, join_giveup)
 # The replay floor (r3b, design §5.4): 38 an ACK reports durable + 1 as its log start; 39 the floor ignores members
 #     not heard from in this epoch
 #  25 promotion takes fence replies from outside the fenced ISR: caught only with 11 (a non-member has no rid in the
@@ -39,19 +43,22 @@ mode=${1:-quick}
 # Equivalent, so not run: 11 and 25 alone (above); 24 (cut() rounds up: the next question cuts further); 30 (no
 # prev_epoch check while following: the simulator never reaches it; test_repl's `follower_damage` is its check);
 # 37 (unanswered members wait for the lag rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
-quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20 21 22 23 26 27 28 29 31 34 35 36"
-all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39"
+# 20@3000: since the idle heartbeats (idle_heartbeat_ticks varies by seed) it first dies at seed 2324.
+quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36 41"
+all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39 41"
 # test_repl's scenarios: BUG:SCENARIO, the planted bug and the scenario that must report it. The bug has to make the
 # run exit 1 with "scenario(s) failed" and a failure line of that scenario: a crash (139), an unknown bug number (2)
 # or a missing binary (127) is not a planted bug caught. 24 (rounding a cut up) and 11 (on its own) cannot be seen
 # by the simulator, so a scenario is their only planted-bug check; 14 is also in the simulator's list.
 scenarios="30:follower_damage 34:promote 35:sync_cut 36:trim 36:cut_applied 37:unanswered 24:round_cut 11:promote
-           14:promote 39:replay_floor"
+           14:promote 39:replay_floor 40:idle_shrink 42:steady_join"
 
 mutants() {
-    local seeds=$1 bad=0 m out
+    local seeds=$1 bad=0 m n out
     for m in $2; do
-        out=$("$B"/sim_repl_mut --mutant "$m" --seeds "$seeds" 2>/dev/null)
+        n=$seeds
+        case $m in *@*) n=${m#*@} m=${m%@*} ;; esac
+        out=$("$B"/sim_repl_mut --mutant "$m" --seeds "$n" 2>/dev/null)
         echo "$out"
         case $out in *KILLED*) ;; *) bad=1 ;; esac
     done
@@ -83,7 +90,7 @@ quick)
     for s in 43308 200636 294653 478816 570201 653518 756115 903046 75881 3865 25133 299557 436347; do
         "$B"/sim_repl --seed $s > /dev/null || exit 1
     done
-    mutants 200 "$quick"
+    mutants 1000 "$quick"
     ;;
 mutants)
     mutants 20000 "$all"

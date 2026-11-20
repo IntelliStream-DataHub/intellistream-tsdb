@@ -16,10 +16,18 @@
  *               repl_open that nothing reached).
  *   follower_damage a follower fails, never repairs, when the leader's log differs from its own below the verified end
  *               (MUT(30)), or a cut would pass its applied end or a position its log no longer retains.
+ *   idle_shrink a member that stops acknowledging leaves the ISR after isr_lag although nothing is written (MUT(40):
+ *               only a member behind the log end isr_lag ago went, so an idle volume kept a dead member, and min_isr
+ *               never refused).
  *   round       a cut can fall inside a record: a replica whose last epoch the leader lacks cuts at the end of the
  *               leader's epoch before it, inside an older epoch's record that only the replica has.
  *   replay_floor the leader's replay floor: the lowest log start of itself and every member, unknown until each has
  *               ACKed in the current epoch (MUT(39): members not heard from were left out).
+ *   steady_join a learner that keeps up with writes that never pause, a few ticks behind, joins the ISR: the commit
+ *               point is held for it until it has it (MUT(42): no hold; it joined only in a pause of the writes, and
+ *               behind a lone leader never). When asked for, it has every position up to the commit point.
+ *   join_giveup a learner that stops short under the hold: the commit point waits at most join_hold_ticks, then
+ *               moves on, and is not held again for 4 x isr_lag; a learner more than half isr_lag behind is not held for.
  */
 #include "repl.h"
 
@@ -202,6 +210,34 @@ static void trim(void)
     du.floor = 999;
     r = repl_open(&c, &du);
     CHECK(r && repl_failed(r), "a log start above the floor is accepted");
+    repl_free(r);
+}
+
+/* A replica reopened with a COMMIT marker at 7 whose file it has not staged (repl_durable.hold): its durable end starts
+ * at 6, not at its log end, and its ACK after the leader verified its log says so. It said 10: the leader kept its
+ * segments, and the link the file is fetched from, only up to what the ACK claimed, and dropped the marker's
+ * (jepsen-cluster kill, 2026-11-18; test_cluster reopenhold). */
+static void open_hold(void)
+{
+    static struct drv f;
+    memset(&f, 0, sizeof f);
+    fill(&f, 1, 10, 1, 1);
+    struct repl_config c = config(1, &f);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_durable du = {.rid = 22, .fence = 1, .floor = 5, .log_end = 10, .hold = 7, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    CHECK(r && !repl_failed(r) && repl_durable_end(r) == 6 && repl_written(r) == 10,
+          "a replica opened with a hold at 7 starts durable to %llu", r ? (unsigned long long)repl_durable_end(r) : 0);
+    struct repl_msg m = meta_msg(1, 2, 0, 0x1, 0);
+    repl_recv(r, &m);
+    drain(r, &f, NULL);
+    struct repl_msg an = {.type = REPL_M_ANSWER, .from = 0, .to = 1, .epoch = 2, .leader = 0, .last_epoch = 1,
+                          .written = 1000, .prev_epoch = 1, .prev_pos = 10, .end = 1};
+    repl_recv(r, &an);
+    drain(r, &f, NULL);
+    const struct repl_action *s = find_act(&f, REPL_A_SEND, REPL_M_ACK);
+    CHECK(s && s->msg.written == 10 && s->msg.durable == 6, "the ACK after the verification says durable %llu",
+          s ? (unsigned long long)s->msg.durable : 0);
     repl_free(r);
 }
 
@@ -463,6 +499,216 @@ static void unanswered(void)
     repl_free(r);
 }
 
+static void idle_shrink(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(0, &d);
+    c.isr_lag_ticks = 50;
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 100, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    struct repl_msg m = meta_msg(0, 2, 0, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    /* both members ACK the EPOCH marker (position 101); then node 1 goes silent and nothing more is written */
+    struct repl_msg k1 = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 2, .leader = -1, .durable = 101,
+                          .written = 101, .rid = 22, .resync = 1};
+    struct repl_msg k2 = {.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = 2, .leader = -1, .durable = 101,
+                          .written = 101, .rid = 33, .resync = 1};
+    repl_recv(r, &k1);
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    const struct repl_action *q = NULL;
+    int t;
+    for (t = 1; t <= 3 * (int)c.isr_lag_ticks && !q; t++) {
+        repl_recv(r, &k2); /* node 2 answers every heartbeat */
+        drain(r, &d, NULL);
+        if ((q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ)) != NULL)
+            break;
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    }
+    CHECK(q && q->msg.meta.isr == 0x5, "a silent member of an idle volume stayed in the ISR for %d ticks (isr_lag %u)",
+          t, c.isr_lag_ticks);
+    CHECK(!q || t <= (int)c.isr_lag_ticks + 3, "dropped only after %d ticks (isr_lag %u)", t, c.isr_lag_ticks);
+    repl_free(r);
+}
+
+/* The leader of epoch 2 (node 0, ISR {0, 2}, learner 1), synced, both others heard at the EPOCH marker (101) */
+static struct repl *join_leader(struct drv *d, struct repl_config *c)
+{
+    memset(d, 0, sizeof *d);
+    fill(d, 1, 100, 1, 1);
+    static struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    *c = config(0, d);
+    c->isr_lag_ticks = 50;
+    c->join_hold_ticks = 50;
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 100, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(c, &du);
+    if (!r)
+        return NULL;
+    struct repl_msg m = meta_msg(0, 2, 0, 0x5, 0);
+    repl_recv(r, &m);
+    drain(r, d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, d, NULL);
+    for (int from = 1; from <= 2; from++) {
+        struct repl_msg k = {.type = REPL_M_ACK, .from = from, .to = 0, .epoch = 2, .leader = -1, .durable = 101,
+                             .written = 101, .rid = from == 1 ? 22 : 33, .resync = 1};
+        repl_recv(r, &k);
+        drain(r, d, NULL);
+    }
+    return r;
+}
+
+/* One tick of writes that never pause: a record written and synced, member 2 at the leader's end, the learner at
+ * `learner` (its durable and written end; 0: silent). Returns the ISR request this tick made, if any. */
+static const struct repl_action *join_step(struct repl *r, struct drv *d, uint64_t learner)
+{
+    uint64_t pos;
+    repl_write(r, 1, &pos);
+    drain(r, d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, d, NULL);
+    struct repl_msg k2 = {.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = 2, .leader = -1,
+                          .durable = repl_written(r), .written = repl_written(r), .rid = 33};
+    repl_recv(r, &k2);
+    drain(r, d, NULL);
+    if (learner) {
+        struct repl_msg k1 = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 2, .leader = -1, .durable = learner,
+                              .written = learner, .rid = 22};
+        repl_recv(r, &k1);
+        drain(r, d, NULL);
+        const struct repl_action *q = find_act(d, REPL_A_SEND, REPL_M_ISR_REQ);
+        if (q)
+            return q;
+    }
+    repl_tick(r);
+    drain(r, d, NULL);
+    return find_act(d, REPL_A_SEND, REPL_M_ISR_REQ);
+}
+
+static void steady_join(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c);
+    CHECK(r && repl_is_leader(r), "not leader");
+    uint64_t wend[1024] = {0};
+    const struct repl_action *q = NULL;
+    int t, stalled = 0;
+    uint64_t last_commit = 0;
+    for (t = 0; t < 600 && !q; t++) {
+        uint64_t learner = t >= 3 ? wend[t - 3] : 101; /* three ticks behind the leader, always */
+        q = join_step(r, &d, learner);
+        wend[t] = repl_written(r);
+        if (q) {
+            CHECK(q->msg.meta.isr == 0x7 && q->msg.meta.rid[1] == 22, "asked for ISR 0x%x", q->msg.meta.isr);
+            CHECK(repl_commit(r) <= learner, "the learner was asked for at %" PRIu64 " below the commit point %" PRIu64,
+                  learner, repl_commit(r));
+        }
+        stalled = repl_commit(r) == last_commit ? stalled + 1 : 0;
+        last_commit = repl_commit(r);
+        CHECK(stalled <= (int)c.join_hold_ticks, "the commit point stood still for %d ticks", stalled);
+    }
+    CHECK(q, "a learner three ticks behind writes that never pause did not join in %d ticks (isr_lag %u)", t,
+          c.isr_lag_ticks);
+    CHECK(t <= 2 * (int)c.isr_lag_ticks, "joined only after %d ticks (isr_lag %u)", t, c.isr_lag_ticks);
+    repl_free(r);
+}
+
+static void join_giveup(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c);
+    CHECK(r && repl_is_leader(r), "not leader");
+    uint64_t wend[1024] = {0};
+    int t, stalled = 0, held = 0, after = -1;
+    uint64_t last_commit = 0;
+    /* far behind (more than half isr_lag): never held for */
+    for (t = 0; t < 150; t++) {
+        uint64_t learner = t >= 40 ? wend[t - 40] : 101;
+        CHECK(!join_step(r, &d, learner), "a learner 40 ticks behind was asked for");
+        wend[t] = repl_written(r);
+        CHECK(t < 2 || repl_commit(r) == repl_written(r), "the commit point was held for a learner 40 ticks behind");
+    }
+    /* always one short of the commit point: held for at most join_hold_ticks, then not again for 4 x isr_lag */
+    int gaveup = 0;
+    for (; t < 1000; t++) {
+        uint64_t learner = repl_commit(r) - 1;
+        CHECK(!join_step(r, &d, learner), "a learner short of the commit point was asked for");
+        wend[t] = repl_written(r);
+        if (repl_commit(r) == last_commit) {
+            stalled++;
+            held = 1;
+        } else {
+            if (held && stalled)
+                after = t, gaveup++;
+            stalled = 0;
+        }
+        last_commit = repl_commit(r);
+        CHECK(stalled <= (int)c.join_hold_ticks + 1, "the commit point stood still for %d ticks (join_hold %u)", stalled,
+              c.join_hold_ticks);
+        CHECK(after < 0 || t == after || repl_commit(r) == repl_written(r) || t - after >= 4 * (int)c.isr_lag_ticks - 2,
+              "held again %d ticks after giving up", t - after);
+    }
+    CHECK(held && gaveup >= 2, "the commit point was held %d times for a learner close behind", gaveup);
+    repl_free(r);
+}
+
+/* An idle volume (r3d review L1): with nothing to send, a peer gets an empty APPEND only every idle_heartbeat_ticks,
+ * but a commit point it has not been sent goes out at the next tick */
+static void idle_heartbeat(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(0, &d);
+    c.heartbeat_ticks = 1;
+    c.idle_heartbeat_ticks = 20;
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 100, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    struct repl_msg m = meta_msg(0, 2, 0, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    struct repl_msg k1 = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 2, .leader = -1, .durable = 101,
+                          .written = 101, .rid = 22, .resync = 1};
+    struct repl_msg k2 = {.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = 2, .leader = -1, .durable = 101,
+                          .written = 101, .rid = 33, .resync = 1};
+    repl_recv(r, &k1);
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_commit(r) == 101, "commit %" PRIu64 ", not 101", repl_commit(r));
+    repl_tick(r);
+    drain(r, &d, NULL);
+    int news = 0;
+    for (int i = 0; i < d.nact; i++)
+        news += d.act[i].type == REPL_A_SEND && d.act[i].msg.type == REPL_M_APPEND && d.act[i].msg.commit == 101;
+    CHECK(news == 2, "the new commit point went to %d peers at the next tick, not 2", news);
+    int sent = 0;
+    for (int t = 0; t < 200; t++) {
+        repl_recv(r, &k1);
+        repl_recv(r, &k2);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        for (int i = 0; i < d.nact; i++)
+            sent += d.act[i].type == REPL_A_SEND && d.act[i].msg.type == REPL_M_APPEND;
+    }
+    CHECK(sent >= 18 && sent <= 22, "%d empty APPENDs to 2 peers in 200 idle ticks, not about 20", sent);
+    repl_free(r);
+}
+
 static void round_cut(void)
 {
     static struct drv d;
@@ -583,12 +829,17 @@ int main(int argc, char **argv)
     trim();
     open_damage();
     follower_damage();
+    open_hold();
     cut_applied();
     sync_cut();
     promote();
     unanswered();
+    idle_shrink();
+    idle_heartbeat();
     round_cut();
     replay_floor();
+    steady_join();
+    join_giveup();
     if (failures) {
         fprintf(stderr, "test_repl: %d scenario(s) failed\n", failures);
         return 1;

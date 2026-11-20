@@ -67,10 +67,24 @@
 #define META_GROUP_MAX 64 /* a server group (the takeover cap) */
 #define META_DOMAIN_MAX 64
 #define META_REPLICAS_MAX 7 /* replication 4 plus learners during a move */
+/* lower bounds of settings the replication driver acts on (r3d-isr review M5): below 500 ms a live member of an idle
+ * volume, heard every 100 ms (repld's idle heartbeat), would leave its ISR between two heartbeats and grow back, an
+ * endless churn through the metadata group; an idle seal below 100 ms flushes after nearly every write batch */
+#define META_ISR_LAG_MIN_MS 500
+#define META_IDLE_SEAL_MIN_MS 100
 #define META_SLOTS 65536
 #define META_NONE 0xffffffffu /* no volume (a slot without a home) */
 #define META_VOLUME_MAX 65534 /* series64: the volume field of an id is volume + 1 below 65,536 */
-#define META_USER_BLOB_MAX 4096
+/* A user's record (design-cluster.md C22; S2-1): its compacted USERS records (server/users.h), opaque to meta.c but for
+ * the first 4 bytes, the uid (little-endian), which the state machine assigns and writes. Names as USERS allows them:
+ * USER_NAME_MAX (128) bytes and the NUL. META_NAME_MAX stays 64: volumes and an attestation's `who` use it. */
+#define META_USER_BLOB_MAX (1u << 20)
+#define META_USER_NAME_MAX 129
+#define META_USER_UID_LEN 4 /* the blob's head: the uid */
+/* All users together (blob and name with its NUL, meta_users_bytes): a put past it is META_ERR_RANGE. The snapshot
+ * image carries every blob and travels as one peer frame (FRAME_MAX, 16 MiB: a Raft SNAPSHOT, STATUS, the watch
+ * stream), so the users keep half of it and the rest of the state the other half. */
+#define META_USERS_BYTES_MAX (8u << 20)
 #define META_OPS_MAX 1024 /* operations in one entry */
 /* A shared volume's epoch, and the epoch reserved after it, stay below this (ha.md §2.4: E is a u24 in block
  * numbers, and an epoch at or above 2^24 - 1 is refused everywhere). */
@@ -84,7 +98,8 @@ enum meta_err {
     META_ERR_STALE = -4,    /* the epoch, ISR version, generation or reservation named is not current */
     META_ERR_INVALID = -5,  /* the change would break a rule above */
     META_ERR_STATE = -6,    /* not now: the cluster is (not) initialised */
-    META_ERR_RANGE = -7,    /* a shared volume's epoch space (below 2^24 - 1, reservation included) is used up */
+    META_ERR_RANGE = -7,    /* a shared volume's epoch space (below 2^24 - 1, reservation included) is used up; uids are
+                             * used up, or a user put would pass META_USERS_BYTES_MAX */
     META_ERR_ATTEST = -8,   /* the deployment's failover mode needs an attestation this grant does not carry */
     META_ERR_BLOCKED = -9,  /* the grant goes to a node a CLAIM_FAILED barred, while another candidate is not */
 };
@@ -218,10 +233,16 @@ struct meta_domain {
     uint8_t state;
 };
 
+/* A user. `uid` is assigned at apply when the name is new (max_uid + 1) and kept by every later put; uids are never
+ * reused, also after a drop. `version` is the index of the entry that last put the user (unique across drops, so a
+ * put conditional on it cannot hit a user dropped and made again). The blob is shared between copies of the state
+ * (meta_copy) and never changed in place: a put replaces it. */
 struct meta_user {
-    char name[META_NAME_MAX];
+    char name[META_USER_NAME_MAX];
+    uint32_t uid;
+    uint64_t version;
     uint32_t len;
-    uint8_t *blob;
+    uint8_t *blob; /* len >= META_USER_UID_LEN bytes, the uid first */
 };
 
 /* The Raft configuration as the state machine last applied it (a CONFIG entry or a snapshot), in the core's wire
@@ -255,6 +276,7 @@ struct meta_state {
     struct meta_slot_pending *pend; /* ascending by slot */
     uint32_t nusers, users_cap;
     struct meta_user *users; /* ascending by name */
+    uint32_t max_uid;        /* the highest uid ever assigned; never goes down */
 };
 
 void meta_init(struct meta_state *m);
@@ -402,8 +424,20 @@ void meta_op_isr_change(struct meta_entry *e, uint32_t number, uint64_t epoch, u
 void meta_op_replica_add(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t node, uint64_t rid);
 void meta_op_replica_remove(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t node);
 void meta_op_slot_home(struct meta_entry *e, uint32_t first, uint32_t count, uint32_t volume);
-void meta_op_user_put(struct meta_entry *e, const char *name, const void *blob, uint32_t len);
+/* USER_PUT, conditional on `version`: 0 makes the user (EXISTS when the name is taken; the uid is max_uid + 1,
+ * RANGE once uids are used up, or when the users would take more than META_USERS_BYTES_MAX), anything else must be the user's version (NOTFOUND when it does not exist, STALE when
+ * another put came between). The blob's first META_USER_UID_LEN bytes are overwritten with the uid (INVALID when it
+ * is shorter, or the name is empty). */
+void meta_op_user_put(struct meta_entry *e, const char *name, uint64_t version, const void *blob, uint32_t len);
 void meta_op_user_del(struct meta_entry *e, const char *name);
+/* The same with an actor guard (actor NULL or "": none): the op is STALE unless the user `actor` exists with exactly
+ * `actor_version`, so a change checked against an actor's rights on a lagging copy never outlives the actor's
+ * demotion or drop (a USER_DEL of a name that does not exist stays NOTFOUND). */
+void meta_op_user_put_as(struct meta_entry *e, const char *name, uint64_t version, const void *blob, uint32_t len,
+                         const char *actor, uint64_t actor_version);
+void meta_op_user_del_as(struct meta_entry *e, const char *name, const char *actor, uint64_t actor_version);
+const struct meta_user *meta_user(const struct meta_state *m, const char *name);
+uint64_t meta_users_bytes(const struct meta_state *m); /* what META_USERS_BYTES_MAX limits */
 void meta_op_volume_self(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t new_epoch);
 void meta_op_volume_reserve(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t series_reserved,
                             uint32_t states_reserved, const struct meta_positions *pos);

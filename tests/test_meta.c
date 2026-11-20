@@ -364,8 +364,8 @@ static void test_state_machine(void)
     meta_op_slot_home(&e, 0, META_SLOTS, 0);
     meta_op_slot_home(&e, 100, 50, 1); /* those slots have a home: the freeze protocol moves them */
     meta_op_slot_home(&e, 0, 1, 77);   /* no such volume */
-    meta_op_user_put(&e, "bob", "abc", 3);
-    meta_op_user_put(&e, "alice", "x", 1);
+    meta_op_user_put(&e, "bob", 0, "\0\0\0\0abc", 7);
+    meta_op_user_put(&e, "alice", 0, "\0\0\0\0x", 5);
     meta_op_user_del(&e, "carol");
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK &&
           res[2] == META_ERR_INVALID && res[3] == META_ERR_NOTFOUND && res[4] == META_OK && res[5] == META_OK &&
@@ -753,6 +753,15 @@ static void test_shared(void)
     /* failover = attested: a grant away from a node that is not heard needs an attestation; bmc a power-off */
     struct meta_settings s;
     meta_settings_default(&s);
+    /* settings below what the replication driver can act on are refused (r3d-isr review M5) */
+    s.isr_lag_ms = META_ISR_LAG_MIN_MS - 1;
+    meta_op_settings(&e, &s);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    s.isr_lag_ms = META_ISR_LAG_MIN_MS;
+    s.idle_seal_ms = META_IDLE_SEAL_MIN_MS - 1;
+    meta_op_settings(&e, &s);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    meta_settings_default(&s);
     s.failover = META_FAILOVER_ATTESTED;
     meta_op_settings(&e, &s);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
@@ -888,6 +897,237 @@ static void test_shared(void)
 }
 
 /* ================================================================ the copied core under its own simulator */
+
+static uint32_t blob_uid(const struct meta_user *u)
+{
+    uint32_t v;
+    memcpy(&v, u->blob, 4);
+    return v;
+}
+
+/* users (S2-1): puts conditional on the version, uids from the state machine, never reused, the snapshot */
+static void test_users(void)
+{
+    struct meta_state m, prev, back;
+    struct meta_entry e;
+    int res[8];
+    char why[256];
+    meta_entry_init(&e);
+    init_cluster(&m, &e, META_MODE_REPLICATED, 3);
+
+    /* two creates whose proposers both picked uid 7 from their copies: the state machine assigns 1 and 2 */
+    uint8_t b7[8] = {7, 0, 0, 0, 'v', 'e', 'r', 'f'};
+    meta_copy(&prev, &m);
+    meta_op_user_put(&e, "alice", 0, b7, 8);
+    meta_op_user_put(&e, "bob", 0, b7, 8);
+    meta_op_user_put(&e, "carol", 0, b7, 3);  /* shorter than the uid */
+    meta_op_user_put(&e, "", 0, b7, 8);       /* no name */
+    meta_op_user_put(&e, "dave", 5, b7, 8);   /* an update of a user that does not exist */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK &&
+          res[2] == META_ERR_INVALID && res[3] == META_ERR_INVALID && res[4] == META_ERR_NOTFOUND);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    const struct meta_user *a = meta_user(&m, "alice"), *b = meta_user(&m, "bob");
+    CHECK(a && b && a->uid == 1 && b->uid == 2 && m.max_uid == 2 && blob_uid(a) == 1 && blob_uid(b) == 2);
+    CHECK(a->version == m.applied && b->version == m.applied && a->len == 8 && !memcmp(a->blob + 4, "verf", 4));
+    CHECK(!meta_user(&m, "carol") && !meta_user(&m, "dave") && m.nusers == 2);
+    uint64_t va = a->version;
+
+    /* a name of 128 bytes (USERS allows them); 129 does not fit */
+    char longname[130];
+    memset(longname, 'n', 128);
+    longname[128] = 0;
+    meta_op_user_put(&e, longname, 0, b7, 8);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_user(&m, longname) && meta_user(&m, longname)->uid == 3);
+
+    /* an update keeps the uid; one with an old version, or a create of a taken name, is refused */
+    meta_copy(&prev, &m);
+    meta_op_user_put(&e, "alice", va, "\0\0\0\0passwd2", 11);
+    meta_op_user_put(&e, "alice", va, "\0\0\0\0revoked", 11); /* the same version: stale after the first */
+    meta_op_user_put(&e, "bob", 0, b7, 8);
+    meta_op_user_put(&e, "bob", va + 1000, b7, 8);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_STALE &&
+          res[2] == META_ERR_EXISTS && res[3] == META_ERR_STALE);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    a = meta_user(&m, "alice");
+    CHECK(a->uid == 1 && blob_uid(a) == 1 && a->version == m.applied && a->version > va && a->len == 11 &&
+          !memcmp(a->blob + 4, "passwd2", 7));
+
+    /* a drop; the name made again gets a new uid, never the old one, and max_uid stays */
+    meta_op_user_del(&e, "bob");
+    meta_op_user_del(&e, "bob");
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_NOTFOUND);
+    CHECK(!meta_user(&m, "bob") && m.max_uid == 3);
+    meta_op_user_put(&e, longname, meta_user(&m, longname)->version, b7, 8);
+    meta_op_user_del(&e, longname);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && m.max_uid == 3);
+    meta_copy(&prev, &m);
+    meta_op_user_put(&e, "bob", 0, b7, 8);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    CHECK(meta_user(&m, "bob")->uid == 4 && m.max_uid == 4 && blob_uid(meta_user(&m, "bob")) == 4);
+    /* the checker: a uid given out again, max_uid down, a version that moved without a put */
+    {
+        struct meta_state bent;
+        meta_copy(&bent, &m);
+        bent.max_uid = 2;
+        CHECK(meta_check_step(&m, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+        meta_copy(&bent, &m);
+        struct meta_user *u = (struct meta_user *)meta_user(&bent, "bob");
+        u->uid = 2;
+        CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0); /* also: the blob says 4 */
+        meta_free(&bent);
+    }
+    meta_free(&prev);
+
+    /* a 1 MiB blob and max_uid through a snapshot; one byte more does not decode */
+    uint8_t *big = malloc(META_USER_BLOB_MAX + 1);
+    for (uint32_t i = 0; i < META_USER_BLOB_MAX + 1; i++)
+        big[i] = (uint8_t)(i * 31 + 7);
+    meta_op_user_put(&e, "zed", 0, big, META_USER_BLOB_MAX);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_user_put(&e, "zz", 0, big, META_USER_BLOB_MAX + 1);
+    CHECK(apply1(&m, &e, res, 8) == META_ERR_FORMAT);
+    meta_op_user_del(&e, "alice"); /* max_uid (5) stays above every live uid */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    uint8_t *img;
+    size_t len;
+    CHECK(meta_snapshot_encode(&m, &img, &len) == 0);
+    meta_init(&back);
+    CHECK(meta_snapshot_decode(&back, img, len) == META_OK);
+    CHECK(back.max_uid == 5 && back.nusers == m.nusers && meta_hash(&back) == meta_hash(&m));
+    const struct meta_user *z = meta_user(&back, "zed");
+    CHECK(z && z->uid == 5 && z->len == META_USER_BLOB_MAX && blob_uid(z) == 5 && !memcmp(z->blob + 4, big + 4, z->len - 4));
+    CHECK(z->version == meta_user(&m, "zed")->version);
+    meta_free(&back);
+    free(img);
+    /* a copy shares blobs; freeing either leaves the other whole */
+    meta_copy(&back, &m);
+    meta_free(&m);
+    z = meta_user(&back, "zed");
+    CHECK(z && z->len == META_USER_BLOB_MAX && !memcmp(z->blob + 4, big + 4, 64));
+    meta_op_user_del(&e, "zed");
+    CHECK(apply1(&back, &e, res, 8) == META_OK && res[0] == META_OK && !meta_user(&back, "zed") && back.max_uid == 5);
+    meta_op_user_put(&e, "zed", 0, b7, 8);
+    CHECK(apply1(&back, &e, res, 8) == META_OK && meta_user(&back, "zed")->uid == 6);
+    /* the actor guard (tsdbd's admin ops, checked on a copy that may lag): a change applies only while its actor has
+     * the version it was checked at, so a demotion or drop of the actor committed first wins (mutant noactorguard) */
+    {
+        uint64_t zv = meta_user(&back, "zed")->version;
+        meta_op_user_put_as(&e, "carl", 0, b7, 8, "zed", zv);        /* zed as checked: applies */
+        meta_op_user_put(&e, "zed", zv, "\0\0\0\0demoted", 11);      /* zed demoted */
+        meta_op_user_put_as(&e, "dora", 0, b7, 8, "zed", zv);        /* checked before the demotion */
+        meta_op_user_del_as(&e, "carl", "zed", zv);
+        meta_op_user_put_as(&e, "erin", 0, b7, 8, "nobody", zv);     /* an actor dropped */
+        meta_op_user_del_as(&e, "nosuch", "zed", zv);
+        CHECK(apply1(&back, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK &&
+              res[2] == META_ERR_STALE && res[3] == META_ERR_STALE && res[4] == META_ERR_STALE &&
+              res[5] == META_ERR_NOTFOUND);
+        CHECK(meta_user(&back, "carl") && !meta_user(&back, "dora") && !meta_user(&back, "erin"));
+        uint64_t z2 = meta_user(&back, "zed")->version;
+        meta_op_user_del_as(&e, "carl", "zed", z2);
+        CHECK(apply1(&back, &e, res, 8) == META_OK && res[0] == META_OK && !meta_user(&back, "carl"));
+    }
+    free(big);
+    meta_free(&back);
+    meta_entry_free(&e);
+}
+
+/* An image of a state with user `name`, patched at `at` bytes past the name (u32 uid, u64 version, u32 len, then the
+ * blob, its uid first) with `val` (also into the blob's uid when `blob_too`), its crc fixed: what the decode says */
+static int users_patch(const uint8_t *img, size_t len, const char *name, size_t at, const void *val, size_t vl,
+                       int blob_too)
+{
+    uint8_t *p = malloc(len), *hit = NULL;
+    memcpy(p, img, len);
+    size_t nl = strlen(name);
+    for (size_t i = 2; i + nl + 20 <= len && !hit; i++)
+        if (p[i - 2] == (uint8_t)nl && p[i - 1] == 0 && !memcmp(p + i, name, nl))
+            hit = p + i + nl;
+    CHECK(hit != NULL);
+    if (hit) {
+        memcpy(hit + at, val, vl);
+        if (blob_too)
+            memcpy(hit + 16, val, 4);
+    }
+    uint32_t crc = iso_crc32c(0, p, len - 4);
+    memcpy(p + len - 4, &crc, 4);
+    struct meta_state t;
+    meta_init(&t);
+    int rc = meta_snapshot_decode(&t, p, len);
+    meta_free(&t);
+    free(p);
+    return rc;
+}
+
+/* The users' limits: the snapshot decoder's rules (each broken alone in an image), uids used up, the bytes budget */
+static void test_users_limits(void)
+{
+    struct meta_state m, prev;
+    struct meta_entry e;
+    int res[8];
+    char why[256];
+    meta_entry_init(&e);
+    init_cluster(&m, &e, META_MODE_REPLICATED, 3);
+    uint8_t b[8] = {0, 0, 0, 0, 'v', 'e', 'r', 'f'};
+    meta_op_user_put(&e, "uuA", 0, b, 8);
+    meta_op_user_put(&e, "uuB", 0, b, 8);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && m.max_uid == 2);
+    uint8_t *img;
+    size_t len;
+    CHECK(meta_snapshot_encode(&m, &img, &len) == 0);
+    uint32_t one = 1, two = 2, three = 3;
+    uint64_t ahead = m.applied + 1;
+    CHECK(users_patch(img, len, "uuB", 0, &two, 4, 1) == META_OK);           /* the patch alone: it decodes */
+    CHECK(users_patch(img, len, "uuB", 16, &one, 4, 0) == META_ERR_FORMAT);  /* the blob says uid 1, the record 2 */
+    CHECK(users_patch(img, len, "uuB", 0, &one, 4, 1) == META_ERR_FORMAT);   /* uid 1 twice */
+    CHECK(users_patch(img, len, "uuB", 4, &ahead, 8, 0) == META_ERR_FORMAT); /* a version past applied */
+    CHECK(users_patch(img, len, "uuB", 0, &three, 4, 1) == META_ERR_FORMAT); /* a uid above max_uid */
+    free(img);
+
+    /* uids used up: the last one is given out, then RANGE; an update of a user still works */
+    m.max_uid = UINT32_MAX - 1;
+    meta_op_user_put(&e, "uuC", 0, b, 8);
+    meta_op_user_put(&e, "uuD", 0, b, 8);
+    meta_op_user_put(&e, "uuA", meta_user(&m, "uuA")->version, b, 8);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_RANGE && res[2] == META_OK);
+    CHECK(meta_user(&m, "uuC") && meta_user(&m, "uuC")->uid == UINT32_MAX && !meta_user(&m, "uuD"));
+    meta_free(&m);
+
+    /* the bytes budget: users of 1 MiB until RANGE; the image stays well inside a peer frame (16 MiB) */
+    init_cluster(&m, &e, META_MODE_REPLICATED, 3);
+    uint8_t *big = calloc(1, META_USER_BLOB_MAX);
+    unsigned made = 0;
+    int last = 0;
+    for (unsigned i = 0; i < 16 && !last; i++) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "big%02u", i);
+        meta_copy(&prev, &m);
+        meta_op_user_put(&e, nm, 0, big, META_USER_BLOB_MAX);
+        CHECK(apply1(&m, &e, res, 8) == META_OK);
+        CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+        meta_free(&prev);
+        if (res[0] == META_OK)
+            made++;
+        else
+            last = res[0];
+    }
+    CHECK(last == META_ERR_RANGE && made == META_USERS_BYTES_MAX / (META_USER_BLOB_MAX + 6));
+    CHECK(meta_users_bytes(&m) <= META_USERS_BYTES_MAX);
+    /* a put that shrinks a user is no new bytes; then a smaller new user fits where a big one did not */
+    meta_op_user_put(&e, "big00", meta_user(&m, "big00")->version, b, 8);
+    meta_op_user_put(&e, "small", 0, big, META_USER_BLOB_MAX / 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+    CHECK(meta_users_bytes(&m) <= META_USERS_BYTES_MAX);
+    CHECK(meta_snapshot_encode(&m, &img, &len) == 0 && len < (12u << 20));
+    free(img);
+    free(big);
+    meta_free(&m);
+    meta_entry_free(&e);
+}
 
 static void test_raft_sim(unsigned seeds, uint64_t first, double seconds)
 {
@@ -1438,6 +1678,10 @@ struct msim {
     raft_config boot;
     int heal_pending;
     uint64_t heal_at;
+    struct udrop { char name[8]; uint64_t index; } *drops; /* every committed drop of a user, as first applied */
+    size_t ndrops, dropcap;
+    char (*uid_name)[8]; /* uid -> the one user it names, ever */
+    uint32_t uid_cap;
 };
 
 static void sim_fail(struct msim *s, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -1470,6 +1714,56 @@ static uint64_t local_now(struct msim *s, struct snode *nd)
     return (uint64_t)((double)s->now * nd->rate);
 }
 
+/* Users: a committed drop is never undone in any copy (a copy past the drop holds the name only as a user made again
+ * after it, so with a later version), and a uid names one user, ever. */
+static void check_users(struct msim *s, struct snode *nd, const struct meta_state *before)
+{
+    const struct meta_state *m = &nd->sm;
+    if (before)
+        for (uint32_t i = 0; i < before->nusers; i++) {
+            const struct meta_user *o = &before->users[i], *u = meta_user(m, o->name);
+            if (u && u->uid == o->uid)
+                continue;
+            size_t k;
+            for (k = 0; k < s->ndrops; k++)
+                if (s->drops[k].index == m->applied && !strcmp(s->drops[k].name, o->name))
+                    break;
+            if (k == s->ndrops) {
+                if (s->ndrops == s->dropcap) {
+                    s->dropcap = s->dropcap ? 2 * s->dropcap : 64;
+                    s->drops = realloc(s->drops, s->dropcap * sizeof *s->drops);
+                }
+                snprintf(s->drops[s->ndrops].name, sizeof s->drops[0].name, "%.7s", o->name);
+                s->drops[s->ndrops++].index = m->applied;
+            }
+        }
+    for (size_t k = 0; k < s->ndrops; k++) {
+        const struct meta_user *u = meta_user(m, s->drops[k].name);
+        if (s->drops[k].index <= m->applied && u && u->version < s->drops[k].index) /* = : made again in it */
+            sim_fail(s, "node %u at %" PRIu64 ": user %s, dropped at %" PRIu64 ", is back (version %" PRIu64 ")",
+                     nd->id, m->applied, s->drops[k].name, s->drops[k].index, u->version);
+    }
+    for (uint32_t i = 0; i < m->nusers; i++) {
+        uint32_t uid = m->users[i].uid;
+        if (uid >= (1u << 20)) {
+            sim_fail(s, "node %u: user %s has uid %u, more than were ever made", nd->id, m->users[i].name, uid);
+            continue;
+        }
+        if (uid >= s->uid_cap) {
+            uint32_t c = s->uid_cap ? s->uid_cap : 64;
+            while (c <= uid)
+                c *= 2;
+            s->uid_name = realloc(s->uid_name, c * sizeof *s->uid_name);
+            memset(s->uid_name + s->uid_cap, 0, (c - s->uid_cap) * sizeof *s->uid_name);
+            s->uid_cap = c;
+        }
+        if (!s->uid_name[uid][0])
+            snprintf(s->uid_name[uid], sizeof s->uid_name[uid], "%.7s", m->users[i].name);
+        else if (strcmp(s->uid_name[uid], m->users[i].name))
+            sim_fail(s, "node %u: uid %u names %s and %s", nd->id, uid, s->uid_name[uid], m->users[i].name);
+    }
+}
+
 static void record(struct msim *s, struct snode *nd, const struct meta_state *before)
 {
     uint64_t i = nd->sm.applied;
@@ -1490,6 +1784,7 @@ static void record(struct msim *s, struct snode *nd, const struct meta_state *be
     char why[256];
     if (before && meta_check_step(before, &nd->sm, why, sizeof why))
         sim_fail(s, "node %u, index %" PRIu64 ": %s", nd->id, i, why);
+    check_users(s, nd, before);
     for (uint32_t v = 0; v < nd->sm.nvolumes; v++) {
         const struct meta_volume *mv = &nd->sm.volumes[v];
         size_t k;
@@ -2071,10 +2366,20 @@ static void propose(struct msim *s, struct snode *nd)
         } else {
             char name[16];
             snprintf(name, sizeof name, "u%u", (unsigned)rnd(s, 0, 5));
-            if (rnd(s, 0, 2))
-                meta_op_user_put(&e, name, "verifier", (uint32_t)rnd(s, 0, 8));
-            else
+            if (rnd(s, 0, 2)) {
+                /* the version this proposer's copy has (often stale by the time it applies), sometimes a wrong one;
+                 * the blob's uid is what a proposer would pick from its copy (the state machine must not take it) */
+                const struct meta_user *u = meta_user(m, name);
+                uint64_t ver = u ? u->version : 0;
+                if (!rnd(s, 0, 5))
+                    ver = rnd(s, 0, 1) ? 0 : ver + 1;
+                uint8_t blob[13] = "\0\0\0\0verifier";
+                uint32_t uid = m->max_uid + (uint32_t)rnd(s, 0, 1);
+                memcpy(blob, &uid, 4);
+                meta_op_user_put(&e, name, ver, blob, (uint32_t)rnd(s, 3, 12));
+            } else {
                 meta_op_user_del(&e, name);
+            }
         }
     }
     meta_entry_finish(&e);
@@ -2319,6 +2624,8 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
     free(s->ev);
     free(s->ref_hash);
     free(s->vl);
+    free(s->drops);
+    free(s->uid_name);
     free(s);
     return ok;
 }
@@ -2362,6 +2669,8 @@ int main(int argc, char **argv)
     if (!sim_only) {
         test_state_machine();
         test_shared();
+        test_users();
+        test_users_limits();
     }
     if (!mutant) {
         const char *b = scratch_make(dir, "test_meta_log");

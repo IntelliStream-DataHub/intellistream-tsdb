@@ -338,6 +338,31 @@ int chunk_encode(const chunk_geom *g, const uint8_t *obj, chunk_cell_fn fn, void
  * aborts the unfinished ones (those already committed stay: chunks are immutable and an orphan is E14's business). */
 int chunk_be_put_object(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
                         const chunk_geom *g, uint64_t epoch, const uint8_t *obj, unsigned posmask, uint64_t *sums_out);
+/* The object's bytes for a one-pass put (E26). fill() writes bytes [off, off + len) of the object, which are stripe s
+ * (k' cells; the last stripe may be shorter), into `buf`, a buffer private to the put: called once per stripe, in
+ * stripe order, so each byte is asked for once. Before it returns it may inspect what it wrote (granule checksums,
+ * the footer hash of the part being encoded) and return non-zero to abort: a negative code is returned by the put as
+ * it is, a positive one as TSDB_ERR_INVALID (a put's failures are negative). The encoder, the sums and the chunk writes
+ * read only `buf`, so the bytes checked are the bytes encoded: a page that changes in the source after fill() changes
+ * nothing (two reads of a mapping can see two different pages).
+ * fill() sees one stripe at a time. A check over bytes outside it (a granule that straddles two stripes, a part's
+ * index and footer, which sit at its end) needs those bytes earlier, read from the source a first time: the caller
+ * must then compare that early copy with the same bytes as fill() hands them over (or it checked one copy and the
+ * put encodes another), and a check of the whole object can decide only in the last stripe's fill(). */
+typedef struct chunk_put_src {
+    void *ctx;
+    int (*fill)(void *ctx, uint64_t s, uint64_t off, uint8_t *buf, size_t len);
+} chunk_put_src;
+/* chunk_encode from a source instead of memory, with the same cells and sums. */
+int chunk_encode_stream(const chunk_geom *g, const chunk_put_src *src, chunk_cell_fn fn, void *ctx, uint64_t *sums_out);
+/* chunk_be_put_object from a source (chunk_be_put_object is this with a memcpy source): the same chunk files, sums and
+ * placement. Chunks are committed only after the last stripe is written, so an abort from fill() or a failure before
+ * that (encoding, a chunk write) leaves no chunk of the object. A failure while committing (an fsync, the fence, a
+ * rename) leaves the positions committed before it, as chunk_be_put_object: orphans, E14's business.
+ * TSDB_ERR_INVALID without an erasure codec in this build. */
+int chunk_be_put_stream(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
+                        const chunk_geom *g, uint64_t epoch, const chunk_put_src *src, unsigned posmask,
+                        uint64_t *sums_out);
 
 /* ---------------------------------------------------------------- read, with decode */
 /* Where an object's chunks are read from: files (chunk_obj below), memory in tests and fuzzing, the peers in R8. */
@@ -397,12 +422,15 @@ enum { CHUNK_MUT_NONE = 0, CHUNK_MUT_NOSUMS, CHUNK_MUT_NOFENCE, CHUNK_MUT_EOF, C
        CHUNK_MUT_HEAL_KMINUS1,     /* a rebuild from k' - 1 good positions is attempted */
        CHUNK_MUT_HEAL_RESURRECT,   /* the caller's `live` is never asked */
        CHUNK_MUT_HEAL_COUNT_TARGET, /* the target's own absent positions count as a store that is away */
-       CHUNK_MUT_SETTLE_UP_ALWAYS  /* a REPLACING store goes UP whatever the heal said */ };
+       CHUNK_MUT_SETTLE_UP_ALWAYS, /* a REPLACING store goes UP whatever the heal said */
+       /* tests/test_chunk.c again */
+       CHUNK_MUT_STREAM_REREAD     /* a stream put reads the source a second time for the parity */ };
 extern int chunk_mutant;
 /* Non-zero: chunk_read_range and chunk_obj_open do not log (a fuzz harness provokes the refusal by the million). */
 extern int chunk_log_quiet;
-/* Fault injection for tests: the nth following pread of the chunk files / the nth readdir fails with EIO (0: off). */
-extern int chunk_fault_read, chunk_fault_readdir;
+/* Fault injection for tests: the nth following pread of the chunk files / the nth readdir / the nth cell a chunk
+ * writer writes fails with EIO (0: off). */
+extern int chunk_fault_read, chunk_fault_readdir, chunk_fault_write;
 /* The nth chunk a heal has just rebuilt gets one byte of its first cell flipped before the read-back (0: off). */
 extern int chunk_fault_heal_flip;
 /* "Today's settings", used only by CHUNK_MUT_SETTINGS (a reader that takes k and m from them, not from the object). */

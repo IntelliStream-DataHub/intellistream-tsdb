@@ -30,7 +30,7 @@
 #endif
 
 int chunk_mutant;
-int chunk_fault_read, chunk_fault_readdir, chunk_fault_heal_flip;
+int chunk_fault_read, chunk_fault_readdir, chunk_fault_write, chunk_fault_heal_flip;
 int chunk_log_quiet;
 unsigned chunk_settings_k, chunk_settings_m;
 
@@ -326,28 +326,41 @@ void *chunk_rs_get(unsigned k, unsigned m)
 #endif
 
 #ifdef TSDB_EC
-/* Stripe s: `cells` points at the bytes of its first data cell (cell s * k); mem is (k + m) * cap bytes of scratch. */
-static int encode_stripe(const chunk_geom *g, iso_rs *rs, uint64_t s, const uint8_t *cells, uint8_t *mem, size_t cap,
-                         chunk_cell_fn fn, void *ctx, uint64_t *sums_out, const uint64_t *bases)
+/* The data shards of stripe s from `cells` (the bytes of its first data cell): a full-length cell is read in place,
+ * a short or missing one is copied into mem and padded with zeros (never stored). */
+static void data_shards(const chunk_geom *g, uint64_t s, const uint8_t *cells, uint8_t *mem, size_t cap,
+                        uint8_t **shards)
 {
-    unsigned k = g->k, m = g->m;
     uint64_t ncells = chunk_ncells(g);
     size_t ls = (size_t)chunk_stripe_len(g, s);
-    uint8_t *shards[CHUNK_POS_MAX];
-    for (unsigned i = 0; i < k; i++) {
-        uint64_t c = s * k + i, cl = chunk_cell_len(g, c);
-        if (c < ncells && cl == ls) { /* a full-length cell is read in place */
+    for (unsigned i = 0; i < g->k; i++) {
+        uint64_t c = s * g->k + i, cl = chunk_cell_len(g, c);
+        if (c < ncells && cl == ls) {
             shards[i] = (uint8_t *)(uintptr_t)(cells + (size_t)i * g->cell);
             continue;
         }
         shards[i] = mem + (size_t)i * cap;
         if (cl)
             memcpy(shards[i], cells + (size_t)i * g->cell, (size_t)cl);
-        memset(shards[i] + cl, 0, ls - (size_t)cl); /* the padding of a short or missing cell: zeros, never stored */
+        memset(shards[i] + cl, 0, ls - (size_t)cl);
     }
+}
+
+/* Stripe s: `cells` points at the bytes of its first data cell (cell s * k); mem is (k + m) * cap bytes of scratch.
+ * The parity is computed from `pcells`: `cells`, except in CHUNK_MUT_STREAM_REREAD (a second read of the source). */
+static int encode_stripe(const chunk_geom *g, iso_rs *rs, uint64_t s, const uint8_t *cells, const uint8_t *pcells,
+                         uint8_t *mem, size_t cap, chunk_cell_fn fn, void *ctx, uint64_t *sums_out,
+                         const uint64_t *bases)
+{
+    unsigned k = g->k, m = g->m;
+    size_t ls = (size_t)chunk_stripe_len(g, s);
+    uint8_t *shards[CHUNK_POS_MAX];
+    data_shards(g, s, pcells, mem, cap, shards);
     for (unsigned j = 0; j < m; j++)
         shards[k + j] = mem + (size_t)(k + j) * cap;
     iso_rs_encode(rs, shards, ls);
+    if (pcells != cells) /* planted: the data cells are what the first read gave, the parity what the second gave */
+        data_shards(g, s, cells, mem, cap, shards);
     int rc = 0;
     for (unsigned p = 0; p < k + m && rc == 0; p++) {
         size_t len = p < k ? (size_t)chunk_cell_len(g, s * k + p) : ls;
@@ -384,7 +397,7 @@ int chunk_encode(const chunk_geom *g, const uint8_t *obj, chunk_cell_fn fn, void
         return TSDB_ERR_NOMEM;
     int rc = 0;
     for (uint64_t s = 0; s < ns && rc == 0; s++)
-        rc = encode_stripe(g, rs, s, obj + s * k * g->cell, mem, cap, fn, ctx, sums_out, bases);
+        rc = encode_stripe(g, rs, s, obj + s * k * g->cell, obj + s * k * g->cell, mem, cap, fn, ctx, sums_out, bases);
     free(mem);
     return rc;
 #endif
@@ -405,7 +418,48 @@ int chunk_encode_stripe(const chunk_geom *g, uint64_t s, const uint8_t *stripe, 
     uint8_t *mem = malloc((size_t)(g->k + g->m) * cap);
     if (!mem)
         return TSDB_ERR_NOMEM;
-    int rc = encode_stripe(g, rs, s, stripe, mem, cap, fn, ctx, NULL, NULL);
+    int rc = encode_stripe(g, rs, s, stripe, stripe, mem, cap, fn, ctx, NULL, NULL);
+    free(mem);
+    return rc;
+#endif
+}
+
+int chunk_encode_stream(const chunk_geom *g, const chunk_put_src *src, chunk_cell_fn fn, void *ctx, uint64_t *sums_out)
+{
+#ifndef TSDB_EC
+    (void)g, (void)src, (void)fn, (void)ctx, (void)sums_out;
+    return TSDB_ERR_INVALID;
+#else
+    if (!chunk_geom_valid(g) || !src || !src->fill)
+        return TSDB_ERR_INVALID;
+    unsigned k = g->k, m = g->m;
+    iso_rs *rs = chunk_rs_get(k, m);
+    if (!rs)
+        return TSDB_ERR_NOMEM;
+    uint64_t ns = chunk_nstripes(g), bases[CHUNK_POS_MAX], sbytes = (uint64_t)k * g->cell;
+    for (unsigned p = 0; p < k + m; p++)
+        bases[p] = chunk_sums_base(g, p);
+    if (sbytes > g->len)
+        sbytes = g->len; /* the most bytes one stripe holds */
+    size_t cap = g->cell > g->len ? (size_t)g->len : g->cell;
+    bool reread = chunk_mutant == CHUNK_MUT_STREAM_REREAD;
+    uint8_t *mem = malloc((size_t)(k + m) * cap), *buf = malloc((size_t)sbytes);
+    uint8_t *buf2 = reread ? malloc((size_t)sbytes) : NULL;
+    int rc = mem && buf && (!reread || buf2) ? 0 : TSDB_ERR_NOMEM;
+    for (uint64_t s = 0; s < ns && rc == 0; s++) {
+        /* Everything below reads `buf` only: the source is asked for each byte once, so what fill() checked in it is
+         * exactly what is hashed and encoded (E26: two reads of a mapping can see two different pages). */
+        uint64_t off = s * k * g->cell, n = g->len - off < sbytes ? g->len - off : sbytes;
+        rc = src->fill(src->ctx, s, off, buf, (size_t)n);
+        if (rc > 0)
+            rc = TSDB_ERR_INVALID; /* a caller that tests for a negative code must not take an abort for success */
+        if (rc == 0 && reread)
+            rc = src->fill(src->ctx, s, off, buf2, (size_t)n); /* planted: the source read again for the parity */
+        if (rc == 0)
+            rc = encode_stripe(g, rs, s, buf, reread ? buf2 : buf, mem, cap, fn, ctx, sums_out, bases);
+    }
+    free(buf2);
+    free(buf);
     free(mem);
     return rc;
 #endif

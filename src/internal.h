@@ -74,7 +74,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_READ_NOTFOUND_SEALED, MUT_LEADER_NO_SWEEP, MUT_LEADER_B0_OFF,
        MUT_REPLICA_APPLY_HOLDS_MU, MUT_REPLICA_PREP_NO_CUT_GEN, MUT_LEADER_DROP_UNHELD,
        MUT_LEADER_LINK_BY_NAME, MUT_LEADER_RS_NO_PRUNE, MUT_LEADER_RS_PRUNE_ALL, MUT_LEADER_NOTE_LATE,
-       MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU };
+       MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU,
+       MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -796,6 +797,8 @@ typedef struct part {
     /* protected by tsdb.lock */
     bool merging;
     bool dropped;
+    bool settling; /* R7: a settle has taken it (db->lock, like merging): out of merges, rewrites and TTL selection until
+                    * the swap lists its .ec or the settle is abandoned */
     atomic_bool damaged; /* its index no longer matches the open's checksum, or a merge could not decode one of its
                           * granules: out of merges and drops (part_checked, part_mark_payload) */
     atomic_bool wait_logged; /* db_wait_merges said once that inserts no longer wait for this damaged part's partition */
@@ -810,6 +813,13 @@ typedef struct part {
      * of its nulls, made by the part writer; the publisher folds and frees it (NULL when the table is off) */
     struct lfold *lf;
     size_t nlf;
+    /* R7 (src/ecpart.h): NULL for a .part. Set for an .ec part, whose map holds the source's header, index, tombstones
+     * and footer verbatim (the granule bytes are in the chunk store, read through ec_granule_read), and for a part
+     * eng_test_mark_ec marked in a test (its bytes are still in the map). Set before the part is listed and, but for
+     * that test hook, never changed while it is; atomic because readers test it without a lock beside the hook (the
+     * statistics' sweeper and sampler, queries, merges): NULL or the whole ecpart. Freed by part_unref
+     * (ecgc_last_unref). */
+    _Atomic(struct ecpart *) ec;
 } part;
 
 
@@ -913,7 +923,9 @@ int part_open(int dirfd, const char *name, bool pin, part **out);
 int part_open_as(int dirfd, const char *file, const char *name, bool pin, bool v8_ok, part **out);
 /* the position range a part writer begun on this thread takes (set around a flush; a merge sets its own) */
 extern __thread uint64_t cur_fno_lo, cur_fno_hi;
-bool part_index_intact(const part *p);
+bool part_index_intact(const part *p); /* an .ec part asks ec_index_intact */
+/* part_index_intact for a part whose index is in its own mapping: what part_index_intact does for a .part */
+bool part_map_intact(const part *p);
 /* part_index_intact; a part that fails it is marked damaged, logged and counted once (st_broken_parts) */
 bool part_checked(struct eng *db, part *p, const char *what);
 /* A merge could not decode a granule of p: marks it damaged, logs and counts it once (in memory only) */
@@ -926,6 +938,13 @@ void part_unref(part *p);
  * the caller's buffers and the one in g, so cap is what the buffers hold, never a count loaded before. */
 int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
                  bool verify);
+/* granule_read for a part whose granule bytes are in its mapping (a .part); an .ec part's go through ec_granule_read */
+int granule_read_map(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
+                     bool verify);
+/* The decode of granule_read from the block's bytes blk (g->ts_len + g->val_len of them, wherever they were read
+ * from): the checks of count against cap and the part's granule size, the checksum if verify, the counters. */
+int granule_decode(codec_ctx *c, const part *p, const granule *g, const uint8_t *blk, int type, int64_t *ts, void *v,
+                   size_t cap, bool verify);
 /* the same for entry i: decodes its GW_LOC fields into *g first. Out of line on purpose: inlined, the entry's
  * decoding changes how the compiler lays out a caller's per-row loop (TWA lost 12% that way). */
 int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, size_t cap, bool verify,
@@ -1031,10 +1050,29 @@ int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, ui
 int parts_commit(struct eng *db, part **ps, size_t n);
 void parts_discard(struct eng *db, part **ps, size_t n);
 int intents_recover(struct eng *db);
+/* tests/test_intents.c: UNLINK_FIRST unlinks a rolled-forward intent before its renames are synced (the old order) */
+enum { INTENTS_MUT_NONE = 0, INTENTS_MUT_UNLINK_FIRST };
+extern int intents_test_mutant;
 /* Exactly the names the engine gives part writers' tmp files and parts: what a cleanup at open may touch. */
 bool part_tmp_name(const char *name);
 bool part_file_name(const char *name);
-bool intent_file_name(const char *name); /* an insert's intent, txn_<pid>_<n>.intent */
+bool intent_file_name(const char *name); /* an insert's intent, txn_<pid>_<n>.intent (versions 3 and 4 alike) */
+/* R7's names (the engine writes them only with a tier; src/ecpart.h). The .ec part keeps its source's name and block
+ * range (D2): p<partition>_<min>_<max>_<level>.ec; its temporary tmp_<pid>_<n>.ec; a retired one retired_<that>; the
+ * source a swap renamed settled_p<partition>_<min>_<max>_<level>.part, kept until r7-keep releases it. */
+bool ec_file_name(const char *name);
+bool ec_tmp_name(const char *name);
+bool ec_retired_name(const char *name);
+bool settled_part_name(const char *name);
+/* r7-iface's planted bugs (tests/test_ecnames.c --mutant NAME; the Makefile requires each to fail it): an .ec name
+ * matched by its prefix and extension only; TSDB_TEST_TIER taken without TSDB_TEST_TIER_I_KNOW=1 */
+enum { R7_MUT_NONE = 0, R7_MUT_NAMELOOSE, R7_MUT_TIERLOOSE };
+extern int r7_mutant;
+/* The first line of an intent of version 4 (a settle's swap, src/ecswap.c); version 3 is an insert's. */
+#define INTENT_V4_HEAD "tsdb-intent 4 "
+/* Checks an intent's last line ("end <xxh64 of everything before it>") and cuts it off: the body is then buf, a
+ * NUL-terminated string without its last newline. false when it is torn or damaged (buf may be changed). */
+bool intent_unseal(char *buf, size_t len);
 bool wal_file_name(const char *name);    /* a WAL segment, wal_<16 lowercase hex>.log (memtable.c) */
 void meta_tmp_make(char *buf, size_t cap); /* a volume add's own META temporary (db.c) */
 bool meta_tmp_name(const char *name);      /* the engine's or an add's META temporary */
@@ -1401,8 +1439,13 @@ struct jr_ops {
     void *ctx;
     /* sends the pending file `file` (the leader's tmp name, `size` bytes, in the volume directory) to every replica of
      * the ISR, which stages and syncs it under `mname` (replica_stage): the name the marker carries, a part name
-     * p<partition>_<pid>_<n>_0.part (the partition is in no part file); returns when they have */
+     * p<partition>_<pid>_<n>_0.part (the partition is in no part file); returns when they have, or (a driver with
+     * ship_wait) once the file is queued to them */
     int (*ship)(void *ctx, struct eng *db, const char *file, const char *mname, uint64_t size);
+    /* May be NULL. Called once after the last ship of a COMMIT (`failed`: a ship or a link failed, the COMMIT is not
+     * appended): a driver whose ship only queues the file waits here for the COMMIT's files under one deadline (and
+     * lets go of them when `failed`); past it the marker goes out and a replica without a file fetches it. */
+    int (*ship_wait)(void *ctx, struct eng *db, int failed);
     /* the marker whose last position is `last` is durable at the leader: returns once the commit point passed it (the
      * driver's view), or an error (nothing is then published). May be NULL. The engine then waits for its own copy of
      * the commit point (eng_leader_commit) in any case: that wait is what a deposed leader ends (eng_leader_depose).
@@ -1524,6 +1567,23 @@ extern void (*mt_test_before_seal)(struct eng *db);
  * stays gone. Never waits for flush_lock (a flush holds it while it waits for the commit point the driver moves): with a
  * flush in progress the bound is stored and the removal is left to that flush or the next call. */
 void eng_leader_keep(struct eng *db, uint64_t pos);
+/* eng_leader_keep with the commit floor the driver saved (`floor` >= `pos`): the keep caps (eng_leader_keep_cap) may let
+ * segments go above `pos`, but never above `floor` nor the commit point. eng_leader_keep(db, pos) is this with floor =
+ * pos (no cap can act). */
+void eng_leader_keep_floor(struct eng *db, uint64_t pos, uint64_t floor);
+/* The keep caps (design-cluster.md 8.3, repl_retain_mb and repl_retain_s): a kept segment goes, whatever the keep bound
+ * says (a replica that needs it is told to install a snapshot), once the segments flushed after it and it hold more
+ * than `max_bytes`, or it was flushed more than `max_ms` ago. 0 is no cap. Read at the next eng_leader_keep_floor or
+ * flush. */
+void eng_leader_keep_cap(struct eng *db, uint64_t max_bytes, uint64_t max_ms);
+/* A leader's clock duties (design-cluster.md 5.3, 5.4), run by its flusher thread once the driver sets them (0 turns one
+ * off; both are off until the first call): a NOW marker with eng_now_ms every `now_every_ms` (the replicas' retention
+ * clock; also before a DROP), and the idle seal: an active memtable with rows that did not change for `idle_seal_ms` is
+ * flushed, and a NOW marker follows at once in the new segment, so a replica, which seals a segment only at the first
+ * committed record of a later one, seals and flushes the idle leader's last segment too. A NOW marker the driver
+ * refuses (not leading, below min_isr) is simply not written. */
+void eng_leader_clock(struct eng *db, uint64_t now_every_ms, uint64_t idle_seal_ms);
+int leader_now_marker(struct eng *db);
 /* A file a COMMIT marker of this leader names (`name`: the marker's name, p<partition>_<pid>_<n>_0.part), for a replica
  * that missed it: the leader keeps each hard linked as stage_<xxh64 of the name>.part (the name a replica stages it
  * under) from before its marker is appended until the retained segment that holds the marker goes (eng_leader_keep),
@@ -1591,10 +1651,20 @@ typedef struct wal_tail {
     bool reported;
 } wal_tail;
 
+/* The kinds of graveyard entries: a retired part (graveyard_purge unlinks it at its deadline), a retired .ec part
+ * (retired_*.ec: r7-gc's, which deletes its chunks too) and a settled source (settled_*.part: r7-keep's, kept from the
+ * .ec record's settle time). R7's kinds are purged by their stubs (ecgc_purge_entry, eckeep_purge_entry). */
+enum { GY_PART = 0, GY_EC = 1, GY_SETTLED = 2 };
+
 typedef struct graveyard_entry {
-    char name[256];   /* retired_<part name> */
+    char name[256];   /* retired_<part name>, retired_<name>.ec or settled_<part name> */
     int64_t deadline; /* monotonic ms (eng_mono_ms): a wall clock step must not purge early */
+    uint8_t kind;     /* GY_* */
 } graveyard_entry;
+
+/* Appends an entry (db->lock held, or the open before any thread runs); TSDB_ERR_NOMEM when the list cannot grow
+ * (the file stays on disk and the next open collects it). */
+int graveyard_add(struct eng *db, const char *name, int kind, int64_t deadline);
 
 int manifest_publish(struct eng *db);
 int follow_refresh(struct eng *db);
@@ -1710,6 +1780,13 @@ struct eng {
     /* partition classes (classes.c): on, key multiplier, length and key step per class */
     bool cls_on;
     int64_t cls_kmul, cls_len[PART_CLASSES], cls_km[PART_CLASSES];
+    /* R7 (src/tier.h): the tsdb handle's tier, one reference held from the open (tier_engine_attach) to eng_close
+     * (tier_engine_detach), retired engines included; NULL without one. tier_vol: this engine's volume number there.
+     * ecstate: the per-engine state of R7's files (struct ecstate, src/tier.h), NULL without a tier. Pointers only:
+     * every lock and list of R7 lives behind them. */
+    struct tier *tier;
+    struct ecstate *ecstate;
+    uint32_t tier_vol;
 
     pthread_mutex_t lock; /* parts list and part flags */
     /* New parts get their block numbers, names and place in the list in one
@@ -1862,6 +1939,7 @@ struct eng {
     size_t latest_cache_asked; /* the caller's opt.latest_cache (a replica runs with 0; replica_promote restores it) */
     struct lkseg {
         uint64_t seq, fno_end;
+        uint64_t bytes, ms; /* its size and when it was flushed (monotonic ms; a segment the open found: the open) */
     } *lk; /* flushed segments kept for the replicas, oldest first (flush_lock); also those a writer's open found at or
             * below RSTATE's `kept` (a writer that is not a leader removes them at its next flush) */
     size_t nlk, caplk;
@@ -1873,6 +1951,12 @@ struct eng {
     size_t nlf, caplf, rlf;      /* rlf: entries of lf reserved by COMMITs about to append their marker (lead_mu) */
     uint64_t lrd_seq, lrd_off, lrd_next; /* where the last read of the log by position ended (replica_read; lead_mu) */
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */
+    atomic_uint_fast64_t lead_saved; /* with jr: the commit floor the driver saved (eng_leader_keep_floor) */
+    atomic_uint_fast64_t lead_cap_bytes, lead_cap_ms; /* with jr: eng_leader_keep_cap (0: no cap) */
+    atomic_uint_fast64_t lead_now_ms, lead_seal_ms; /* with jr: eng_leader_clock (0: off) */
+    int64_t lead_now_next;   /* the flusher's: when the next NOW marker is due (mono ms) */
+    uint64_t idle_rows, idle_seq; /* the flusher's: the active memtable as it last saw it changed (rows, wal_seq) */
+    int64_t idle_since;      /* and when (mono ms) */
     atomic_uint_fast64_t lead_commit; /* with jr: the commit point (eng_leader_commit), a position */
     atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */
     pthread_mutex_t lead_mu;          /* a leaf: waits for the commit point (lead_cv), its moves, depose, eng_fail */
@@ -2482,6 +2566,13 @@ typedef struct tsdb_test_granule {
 } tsdb_test_granule;
 void tsdb_test_granules(struct tsdb *t, void (*fn)(void *ctx, int cls, uint32_t i, const tsdb_test_granule *g),
                         void *ctx);
+
+/* test hook (R7, tests/test_settle_oracle.c): flags (eng_test_mark_ec's EC_MARK_*) every listed part that pick names
+ * (its volume, partition key, level and rows), in memory only; returns how many turned settled (not a part already
+ * marked, nor one a merge holds) */
+size_t tsdb_test_mark_ec(struct tsdb *t, unsigned flags,
+                         bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
+                         void *ctx);
 
 int ret_open(eng *db, bool read_only);
 int ret_reload(eng *db);

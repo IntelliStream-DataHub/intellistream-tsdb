@@ -1905,12 +1905,18 @@ static void nz_hook(int at)
         usleep(1000);
 }
 
-static int64_t nz_missing(const char *dir, const char *name, codec_ctx *cc, uint64_t *blocks)
+/* -1: the part is gone (only where the caller allows it: a background rewrite retired it after the listing) */
+static int64_t nz_missing(const char *dir, const char *name, codec_ctx *cc, uint64_t *blocks, bool may_vanish)
 {
     int dfd = open(dir, O_RDONLY | O_DIRECTORY);
     CHECK(dfd >= 0);
     part *p;
-    OK(part_open(dfd, name, false, &p));
+    int rc = part_open(dfd, name, false, &p);
+    if (rc == TSDB_ERR_NOTFOUND && may_vanish) {
+        close(dfd);
+        return -1;
+    }
+    OK(rc);
     int64_t missing = 0;
     for (uint32_t i = 0; i < p->ng; i++) {
         granule g;
@@ -1933,8 +1939,9 @@ static int64_t nz_missing(const char *dir, const char *name, codec_ctx *cc, uint
     return missing;
 }
 
-/* nz_missing over the parts merges wrote; *level0 gets the sum over the parts no merge wrote. */
-static int64_t nz_scan(tsdb *db, const char *dir, nz_parts *ps, int64_t *level0)
+/* nz_missing over the parts merges wrote; *level0 gets the sum over the parts no merge wrote. With may_vanish (a
+ * background rewrite may run), a part retired between the listing and its open makes it return -1. */
+static int64_t nz_scan(tsdb *db, const char *dir, nz_parts *ps, int64_t *level0, bool may_vanish)
 {
     memset(ps, 0, sizeof *ps);
     OK(tsdb_foreach_part(db, nz_part, ps));
@@ -1945,7 +1952,11 @@ static int64_t nz_scan(tsdb *db, const char *dir, nz_parts *ps, int64_t *level0)
     *level0 = 0;
     for (int i = 0; i < ps->n && i < 64; i++) {
         uint64_t blocks = 0;
-        int64_t m = nz_missing(dir, ps->names[i], cc, &blocks);
+        int64_t m = nz_missing(dir, ps->names[i], cc, &blocks, may_vanish);
+        if (m < 0) {
+            codec_free(cc);
+            return -1;
+        }
         CHECK(blocks > 0);
         if (ps->level[i] == 0)
             *level0 += m;
@@ -2097,7 +2108,7 @@ static void test_insert_nozstd(const char *base)
         nz_check_rows(db, id, t0, 2 * N + A);
         OK(tsdb_flush(db)); /* the replayed WAL rows: a third part */
         nz_parts ps;
-        int64_t raw0, merged = nz_scan(db, dir, &ps, &raw0);
+        int64_t raw0, merged = nz_scan(db, dir, &ps, &raw0, false);
         CHECK(ps.n == 3 && ps.level[0] == 0 && ps.level[1] == 0 && ps.level[2] == 0 && merged == 0);
         CHECK(mode ? raw0 == 0 : raw0 > 0);
         uint64_t raw_bytes = ps.bytes;
@@ -2105,7 +2116,7 @@ static void test_insert_nozstd(const char *base)
 
         /* one merge of the three, re-encoded at zstd_level */
         OK(tsdb_optimize(db));
-        merged = nz_scan(db, dir, &ps, &raw0);
+        merged = nz_scan(db, dir, &ps, &raw0, false);
         CHECK(ps.n == 1 && ps.level[0] == 1 && merged == 0 && raw0 == 0);
         CHECK(mode || ps.bytes * 10 < raw_bytes * 9); /* data zstd shrinks: the test would see a missing zstd */
         nz_check_rows(db, id, t0, 2 * N + A);
@@ -2116,14 +2127,14 @@ static void test_insert_nozstd(const char *base)
         OK(tsdb_insert_series(db, id, ts, v, N));
         OK(tsdb_close(db));
         OK(tsdb_open(dir, &o, &db));
-        merged = nz_scan(db, dir, &ps, &raw0);
+        merged = nz_scan(db, dir, &ps, &raw0, false);
         CHECK(ps.n == 2 && merged == 0 && (mode ? raw0 == 0 : raw0 > 0));
         tsdb_stats st0, st1;
         OK(tsdb_get_stats(db, &st0));
         OK(tsdb_optimize(db));
         OK(tsdb_get_stats(db, &st1));
         CHECK(st1.passthrough_granules >= st0.passthrough_granules + 2 * N / G);
-        merged = nz_scan(db, dir, &ps, &raw0);
+        merged = nz_scan(db, dir, &ps, &raw0, false);
         CHECK(ps.n == 1 && merged == 0 && raw0 == 0);
         nz_check_rows(db, id, t0, 3 * N + A);
         OK(tsdb_close(db));
@@ -2139,7 +2150,7 @@ static void test_insert_nozstd(const char *base)
         for (int tries = 0; tries < 300 && atomic_load(&nz_parked) == 0; tries++) /* the idle rewrite is under way */
             usleep(100000);
         CHECK(atomic_load(&nz_parked) == 1);
-        merged = nz_scan(db, dir, &ps, &raw0); /* with it parked nothing is retired while the scan lists and opens */
+        merged = nz_scan(db, dir, &ps, &raw0, false); /* with it parked nothing is retired while the scan lists and opens */
         CHECK(ps.n == 2 && (ps.level[0] > 0) != (ps.level[1] > 0) && merged == 0 && (mode ? raw0 == 0 : raw0 > 0));
         atomic_store(&nz_hold, 0);
         for (int tries = 0; tries < 300; tries++) { /* only the listing, no opens: until the rewrite is listed */
@@ -2150,7 +2161,7 @@ static void test_insert_nozstd(const char *base)
             usleep(100000);
         }
         CHECK(ps.n == 2 && ps.level[0] && ps.level[1]);
-        merged = nz_scan(db, dir, &ps, &raw0); /* nothing is left to merge: the parts listed now are the parts at rest */
+        merged = nz_scan(db, dir, &ps, &raw0, false); /* nothing is left to merge: the parts listed now are the parts at rest */
         atomic_store(&merge_hook, NULL);
         CHECK(ps.n == 2 && ps.level[0] && ps.level[1] && merged == 0 && raw0 == 0);
         nz_check_rows(db, id, t0, 3 * N + A);

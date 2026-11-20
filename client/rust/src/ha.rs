@@ -236,11 +236,12 @@ pub struct TopoVol {
     pub domain: u16,
     /// Since when the health has held, ms.
     pub since_ms: i64,
-    /// The owner's node id.
+    /// The node id of this entry's member: the owner for an OWNER entry; on a cluster node, a STANDBY or FOLLOWER
+    /// entry names its replica (the volume's leader is the entry whose role is OWNER).
     pub owner: u32,
     /// The server (a node's index).
     pub server: u16,
-    /// The owner's address, empty: this node.
+    /// The client address of this entry's member, empty: this node.
     pub addr: String,
     /// The volume's directory; empty unless the user is a superuser.
     pub path: String,

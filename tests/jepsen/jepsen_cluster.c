@@ -47,23 +47,26 @@
  * replication driver): one cluster volume "kvr" of 3 replicas, two series with a writer and a reader each through its
  * leader (checks 1-5 as above) and a filler series of inserts of 50-1550 rows at a frontier whose rate changes every
  * minute of timestamps (most of them large writes, shipped as files); classes adds small partitions and granules,
- * quick flushes and idle merges so that series switch partition classes (CLASS markers in the stream). A write that a
- * stalled replica holds up times out: indeterminate, never a failure (no ISR shrink yet). The leader of kvr is never
+ * quick flushes and idle merges so that series switch partition classes (CLASS markers in the stream). A replica silent
+ * for isr_lag_ms (1 s) leaves kvr's ISR and the writes go on without it (one it held up until then may time out:
+ * indeterminate, never a failure); it joins again once caught up. The leader of kvr is never
  * the target of kill, power, pause or a midcommit restart (a restarted leader never leads again before r3e-failover);
  * its replicas are. midcommit also arms one of the driver's crash points (wal-before-send, acked-before-ok,
  * prepared-before-commit, class-switch) on every node at its first start behind a trigger file, made past the middle
  * of the run: the leader must end at it (nem_terminal), and the volume has no leader after that. The end check reads
  * every replica directory in place, read-only, after the clean stop (tests/cvol_check.c): with the leader alive to the
- * end, the replicas hold the same rows (replicas_equal) and the keys of the leader's final read; after the terminal
- * point, each replica's state passes checks 1 and 2 as the final state. In both cases every replica holds each of the
- * filler's large writes whole or not at all, whole when acknowledged (fill_check).
+ * end, the run first waits (60 s) for kvr's ISR to be whole again, then the replicas hold the same rows
+ * (replicas_equal) and the keys of the leader's final read; after the terminal point, each replica in kvr's last ISR
+ * (rep_isr_mask) passes checks 1 and 2 as the final state, and the others check 2. In both cases every replica holds
+ * each of the filler's large writes whole or not at all, whole when acknowledged and in the ISR (fill_check).
  *
  * Selftest (--selftest-checker, --mutant NAME; each must fail, `make jepsen-cluster-selftest`): foreign-pid (a port file that names another
  * pid), takeover (a stale table, a foreign server on the node's old port, and a client that skips th_owns_port),
  * takeover-checked (the same with the check: refused, the run passes), noop-partition, unfired (an armed crash point
  * nobody placed), idle (a nemesis that sleeps through its naps), lost-write (a write missing from the final state), nokill, nopause,
  * nodelay and noreset (a kill, pause or delay that does nothing, a heal that resumes held links: the run fails),
- * rep-lost-write (kv: an acknowledged write missing from one replica's directory), rep-half-batch (kv: half of an
+ * rep-lost-write (kv: an acknowledged write missing from one replica's directory; under midcommit, from a member of
+ * the last ISR after the terminal point), rep-half-batch (kv: half of an
  * acknowledged large write of the filler missing from one replica's directory).
  *
  * Exit status: 0 ok, 1 a violation or a failed expectation, 2 the harness itself could not run.
@@ -1070,6 +1073,7 @@ struct rd {
     int64_t begin, end;
     uint32_t seen[KEYS]; /* the id of the write whose value a key shows, 0: nothing */
     uint8_t stray;
+    int8_t node; /* the node that answered it (kv_roam: a stale read names it) */
 };
 #define MAXSESS 4
 struct hist {
@@ -1135,7 +1139,50 @@ static struct rd *hist_read_slot(struct hist *h, int sess)
 static char kv_vol[MAXN][META_NAME_MAX];
 static int nhists;            /* histories in use: kv-local one per node, kv and classes REP_HISTS */
 static int hist_node[MAXN];   /* the node a history's clients talk to */
-static int kv_resolve(tsdbc *c, int hi, tsdb_sid *sid) { return tsdbc_series(c, hists[hi].name, 0, sid); }
+/* kv and classes (kv_roam): a client connects to a random member, not to kvr's leader, and now and then drops its
+ * connection to start again elsewhere; a replica or a member without kvr answers MOVED (route_decide in tsdbd, D5:
+ * reads too), which the history counts as definitely failed, and the client follows it to the node it names (by
+ * node id, through the node table: never to the address in the body). Each history logs its first moves and the node
+ * it talks to after each; kv_moved counts them all. The ids were made on the leader (hist_sid): a member without kvr
+ * knows no name of it. */
+static int kv_roam;
+static tsdb_sid hist_sid[MAXN];
+static _Atomic uint64_t kv_moved;
+static int kv_resolve(tsdbc *c, int hi, tsdb_sid *sid)
+{
+    if (kv_roam && hist_sid[hi]) {
+        *sid = hist_sid[hi];
+        return 0;
+    }
+    return tsdbc_series(c, hists[hi].name, 0, sid);
+}
+
+/* the node a (re)connecting client of history hi takes: hist_node[hi], or under kv_roam the one a MOVED named, else
+ * a random member */
+static int kv_pick(int hi, int *next, uint64_t *r)
+{
+    if (!kv_roam)
+        return hist_node[hi];
+    int n = *next >= 0 ? *next : (int)(mix(*r += 1) % (uint64_t)nn);
+    *next = -1;
+    return n;
+}
+
+/* after a failed request on node `from`: a MOVED sets *next to the node it names; 1 when it was a MOVED */
+static int kv_follow(tsdbc *c, int hi, int from, int *next, unsigned *logged, const char *who)
+{
+    tsdbc_err_info e;
+    if (!kv_roam || tsdbc_last_error(c, &e) != TSDB_ERR_MOVED || !e.nmoved)
+        return 0;
+    int to = idx_of_id(e.moved[0].node_id);
+    uint64_t n = atomic_fetch_add(&kv_moved, 1) + 1;
+    *next = to;
+    if (++*logged <= 5 || n % 1000 == 0)
+        printf("jepsen-cluster: %s of %s: MOVED by node %d to node %d (id %u, epoch %u); it talks to node %d now "
+               "(%" PRIu64 " moves)\n", who, hists[hi].name, from, to, (unsigned)e.moved[0].node_id,
+               (unsigned)e.moved[0].epoch, to, n);
+    return 1;
+}
 
 static int64_t key_ts(int k) { return KV_BASE_TS + (int64_t)k * 1000; }
 static int ts_key(int64_t ts)
@@ -1151,13 +1198,15 @@ static int nkv_threads;
 
 static void *kv_writer(void *arg)
 {
-    int hi = (int)(intptr_t)arg, node = hist_node[hi];
+    int hi = (int)(intptr_t)arg, node = hist_node[hi], next = -1;
+    unsigned logged = 0;
     struct hist *h = &hists[hi];
     tsdbc *c = NULL;
     tsdb_sid sid = 0;
     uint64_t r = mix(seed * 31 + (uint64_t)hi);
     while (atomic_load(&kv_run)) {
         if (!c) {
+            node = kv_pick(hi, &next, &r);
             if (connect_node(node, 0, &c) != 0 || kv_resolve(c, hi, &sid) != 0) {
                 if (c)
                     tsdbc_close(c);
@@ -1198,9 +1247,17 @@ static void *kv_writer(void *arg)
                    rc == TSDB_ERR_DROPPED || rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_DENIED) {
             hist_end(h, id, WS_FAIL); /* refused: definitely not applied */
             atomic_fetch_add(&kv_fail, 1);
+            if (kv_follow(c, hi, node, &next, &logged, "the writer")) {
+                tsdbc_close(c);
+                c = NULL;
+            }
         } else {
             hist_end(h, id, WS_INDET); /* the node may have applied it */
             atomic_fetch_add(&kv_indet, 1);
+            tsdbc_close(c);
+            c = NULL;
+        }
+        if (c && kv_roam && mix(r += 1) % 200 == 0) { /* start again on a random member */
             tsdbc_close(c);
             c = NULL;
         }
@@ -1233,18 +1290,21 @@ static int kv_read_all(tsdbc *c, tsdb_sid sid, struct rd *rd)
 }
 
 /* the moment the terminal crash point was triggered (kv, classes): the leader of kvr ends at it and comes back as a
- * replica, and a replica answers reads from what it has applied (tsdbd: REPLICA_OK, design-cluster.md 7.2, is a later
- * step, so a replica does not refuse them): stale by design, so the readers stop there. */
+ * replica, and the volume has no leader after it (no promotion before r3e-failover): the readers stop there (a replica
+ * answers MOVED or UNAVAILABLE since route_decide, never a read; before it, it answered stale reads). */
 static _Atomic int64_t term_ns;
 
 static void *kv_reader(void *arg)
 {
-    int hi = (int)(intptr_t)arg, node = hist_node[hi];
+    int hi = (int)(intptr_t)arg, node = hist_node[hi], next = -1;
+    unsigned logged = 0;
+    uint64_t r = mix(seed * 37 + (uint64_t)hi);
     struct hist *h = &hists[hi];
     tsdbc *c = NULL;
     tsdb_sid sid = 0;
     while (atomic_load(&kv_run)) {
         if (!c) {
+            node = kv_pick(hi, &next, &r);
             if (connect_node(node, 0, &c) != 0 || kv_resolve(c, hi, &sid) != 0) {
                 if (c)
                     tsdbc_close(c);
@@ -1259,10 +1319,16 @@ static void *kv_reader(void *arg)
         }
         struct rd tmp;
         memset(&tmp, 0, sizeof tmp);
+        tmp.node = (int8_t)node;
         if (kv_read_all(c, sid, &tmp) == 0 && (!atomic_load(&term_ns) || tmp.begin < atomic_load(&term_ns)))
             *hist_read_slot(h, 0) = tmp;
         else {
-            h->reads_failed++;
+            if (!kv_follow(c, hi, node, &next, &logged, "the reader")) /* MOVED: not applied, not a failure */
+                h->reads_failed++;
+            tsdbc_close(c);
+            c = NULL;
+        }
+        if (c && kv_roam && mix(r += 1) % 200 == 0) {
             tsdbc_close(c);
             c = NULL;
         }
@@ -1407,14 +1473,49 @@ static void rep_setup(void)
                 rc = tsdbc_series_at(c, names[i], "kvr", &sid);
             if (c)
                 tsdbc_close(c);
-            if (rc == 0)
+            if (rc == 0) {
+                if (i < REP_HISTS)
+                    hist_sid[i] = sid;
                 break;
+            }
             if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_NOTFOUND) || now_ms() - t1 > 30000)
                 die(1, "kv: cannot create %s in kvr on its leader (node %d): %s", names[i], rep_leader, tsdbc_strerror(rc));
         }
     }
-    printf("jepsen-cluster: kvr is volume %" PRIu32 " on nodes %d, %d, %d; its leader is node %d\n", rep_number,
-           rep_nodes[0], rep_nodes[1], rep_nodes[2], rep_leader);
+    kv_roam = 1;
+    printf("jepsen-cluster: kvr is volume %" PRIu32 " on nodes %d, %d, %d; its leader is node %d; clients on random "
+           "members, moved to it\n", rep_number, rep_nodes[0], rep_nodes[1], rep_nodes[2], rep_leader);
+}
+
+/* kvr's ISR as the metadata group holds it: a mask of the replicas (bit r: rep_nodes[r]) in the record with the highest
+ * ISR version among the copies of every running node (one node's copy may lag), its version in *ver. -1 when no node
+ * answered. The leader commits on the union of the ISR in force and one it asked for (src/repl.c), and a member joins
+ * only once its log reaches the commit point, so every member of the last ISR holds every write the leader
+ * acknowledged; a replica outside it was not needed for the acknowledgements since it left. */
+static int rep_isr_mask(uint64_t *ver)
+{
+    int mask = -1;
+    *ver = 0;
+    for (int i = 0; i < nn; i++) {
+        pid_t pid;
+        node_snap(i, &pid, NULL, NULL);
+        struct view v;
+        if (pid <= 0 || node_paused(i) || view_get(i, &v, 2000) != 0)
+            continue;
+        for (uint32_t k = 0; k < v.m.nvolumes; k++) {
+            const struct meta_volume *mv = &v.m.volumes[k];
+            if (mv->number != rep_number || (mask >= 0 && mv->isr_version <= *ver))
+                continue;
+            *ver = mv->isr_version;
+            mask = 0;
+            for (int r = 0; r < 3; r++)
+                for (uint32_t j = 0; j < mv->nisr; j++)
+                    if (mv->isr[j] == atomic_load(&nodes[rep_nodes[r]].id))
+                        mask |= 1 << r;
+        }
+        view_free(&v);
+    }
+    return mask;
 }
 
 /* The filler: inserts of 50-1550 rows to "kvr.fill" at a frontier that only moves ahead, a row every 1, 3, 8 or 50 ms
@@ -1660,9 +1761,11 @@ static int check_hist(struct hist *h, uint64_t *seen_indet_applied)
                 }
                 if (lo > 0) {
                     if (v == 0)
-                        VIOL(V_STALE, "stale read: key %d is empty in a read that began after it was written and acknowledged", k);
+                        VIOL(V_STALE, "stale read: key %d is empty in a read that began after it was written and acknowledged "
+                                     "(read %u, answered by node %d)", k, j, rd->node);
                     else if (v <= nw && w[v - 1].end < ack[k][2 * (lo - 1) + 1])
-                        VIOL(V_STALE, "stale read: key %d shows write %u, older than an acknowledged write of the key", k, v);
+                        VIOL(V_STALE, "stale read: key %d shows write %u, older than an acknowledged write of the key (read %u, "
+                                     "answered by node %d)", k, v, j, rd->node);
                 }
                 /* 3: what a write that is seen did at its other keys */
                 if (v && v <= nw)
@@ -1866,12 +1969,12 @@ static void snap_seen(const struct snaps *sn, const char *name, uint32_t *seen, 
 static int check_hist(struct hist *h, uint64_t *seen_indet_applied);
 
 /* The filler's rows in one replica's state against its batches: a large insert is all or nothing, so every batch is
- * whole (each row at its timestamp with its value) or absent; an acknowledged one is whole (its commit point counted
- * every replica), a refused one absent; a row outside every batch is stray. This holds after the terminal crash point
- * too, which is where it matters: prepared-before-commit and class-switch cut a large write or a switch in the middle.
- * --mutant rep-half-batch drops half of one acknowledged batch from the last replica's count. Returns the violations;
- * counts the indeterminate batches this replica applied into *indet_applied. */
-static int fill_check(const struct snaps *sn, int r, uint64_t *indet_applied)
+ * whole (each row at its timestamp with its value) or absent; an acknowledged one is whole where `in_isr` (its commit
+ * point counted every member of the ISR: rep_isr_mask), a refused one absent; a row outside every batch is stray. This
+ * holds after the terminal crash point too, which is where it matters: prepared-before-commit and class-switch cut a
+ * large write or a switch in the middle. --mutant rep-half-batch drops half of one acknowledged batch from the last
+ * replica's count. Returns the violations; counts the indeterminate batches this replica applied into *indet_applied. */
+static int fill_check(const struct snaps *sn, int r, int in_isr, uint64_t *indet_applied)
 {
     const struct snapshot *x = NULL;
     for (size_t i = 0; i < sn->n; i++)
@@ -1911,7 +2014,7 @@ static int fill_check(const struct snaps *sn, int r, uint64_t *indet_applied)
         const char *why = NULL;
         if (cnt[i] != 0 && cnt[i] != fb[i].n)
             why = "half of a large write";
-        else if (fb[i].st == WS_OK && cnt[i] == 0)
+        else if (fb[i].st == WS_OK && cnt[i] == 0 && in_isr)
             why = "an acknowledged large write is missing";
         else if (fb[i].st == WS_FAIL && cnt[i] != 0)
             why = "a refused large write was applied";
@@ -1927,13 +2030,24 @@ static int fill_check(const struct snaps *sn, int r, uint64_t *indet_applied)
 }
 
 /* kv and classes, after the clean stop: every replica directory, read in place, against the history. With the leader
- * live to the end (its final read in h->final) each replica holds exactly the keys of that read; after the terminal
- * crash point (no final read) each replica's state passes checks 1 and 2 as a final state, alone. --mutant
- * rep-lost-write takes an acknowledged write out of the last replica's state. Returns the differences and violations. */
-static int rep_check(int terminal, int *viol)
+ * live to the end (its final read in h->final; the end waited for a whole ISR) each replica holds exactly the keys of
+ * that read; after the terminal crash point (no final read) each replica's state passes checks 1 and 2 as a final
+ * state, alone, where `isr` (a mask of the replicas in kvr's last ISR) has it, and check 2 only where not: a replica
+ * that left the ISR was not needed for what the leader acknowledged since. --mutant rep-lost-write takes an
+ * acknowledged write out of the state of the last replica (after the terminal point: the last one in the ISR). Returns
+ * the differences and violations. */
+static int rep_check(int terminal, int isr, int *viol)
 {
-    int bad = 0;
+    int bad = 0, plant = 2;
+    if (terminal)
+        for (int r = 0; r < 3; r++)
+            if (isr & 1 << r)
+                plant = r;
     for (int r = 0; r < 3; r++) {
+        int in_isr = !terminal || (isr & 1 << r);
+        if (!in_isr)
+            printf("jepsen-cluster: replica %s is not in kvr's last ISR: checked for validity and whole-or-absent large "
+                   "writes, not for every acknowledged write\n", rep_dir[r]);
         struct snaps sn;
         int rc = snaps_take_cvol(rep_dir[r], &sn);
         if (rc != 0) {
@@ -1946,7 +2060,7 @@ static int rep_check(int terminal, int *viol)
             uint32_t seen[KEYS];
             int stray;
             snap_seen(&sn, h->name, seen, &stray);
-            if (r == 2 && !strcmp(mutant, "rep-lost-write"))
+            if (r == plant && !strcmp(mutant, "rep-lost-write"))
                 for (int k = 0; k < KEYS; k++)
                     if (seen[k] && seen[k] <= h->nw && h->w[seen[k] - 1].st == WS_OK) {
                         seen[k] = 0;
@@ -1974,7 +2088,7 @@ static int rep_check(int terminal, int *viol)
             memcpy(name, h->name, sizeof name);
             memset(h->nr, 0, sizeof h->nr);
             memcpy(h->final, seen, sizeof seen);
-            h->have_final = !stray;
+            h->have_final = !stray && in_isr; /* check 1 (durability) needs a final state that must hold every write */
             snprintf(h->name, sizeof h->name, "%.20s@n%d", name, rep_nodes[r]);
             uint64_t dummy = 0;
             *viol += check_hist(h, &dummy);
@@ -1984,7 +2098,7 @@ static int rep_check(int terminal, int *viol)
             h->have_final = 0;
         }
         uint64_t fapplied = 0;
-        int fbad = fill_check(&sn, r, &fapplied);
+        int fbad = fill_check(&sn, r, in_isr, &fapplied);
         if (fbad)
             fprintf(stderr, "jepsen-cluster: replica %s: %d violation(s) of the filler's large writes\n", rep_dir[r], fbad);
         else
@@ -2216,7 +2330,7 @@ static void nem_midcommit(void)
  * past the middle of the run the trigger file is made and the leader of the replicated volume must end at the point
  * within its window. Restarted, it never leads that volume again (no failover before r3e): the rest of the run writes
  * fail, and the end check reads the replica directories as the final state. */
-static int term_cp = -1, term_fired, term_done;
+static int term_cp = -1, term_fired, term_done, isr_short;
 static char term_trigger[PATH_MAX], term_spec[PATH_MAX + 64];
 
 static void nem_terminal(void)
@@ -2769,6 +2883,25 @@ int main(int argc, char **argv)
         kv_stop();
         if (want_rep)
             hold_ms(2000); /* the leader's commit point passes what was appended for the writes that timed out */
+        if (want_rep && !term_fired) {
+            /* a replica that left the ISR (out for isr_lag_ms under a kill, pause, partition or power loss) holds
+             * what was acknowledged without it only once it has caught up and joined again; the end compares every
+             * replica with the leader's final read, so it waits for that. One that never joins is a finding. */
+            int64_t t0 = now_ms();
+            uint64_t ver;
+            int m = rep_isr_mask(&ver);
+            for (; m != 7 && now_ms() - t0 < 60000; m = rep_isr_mask(&ver))
+                usleep(200000);
+            if (m != 7) {
+                fprintf(stderr, "jepsen-cluster: FAIL: the ISR of kvr is not whole 60 s after the last heal (mask %d, "
+                        "version %" PRIu64 "): a replica never caught up and joined again\n", m, ver);
+                isr_short = 1;
+            } else if (now_ms() - t0 > 200) {
+                printf("jepsen-cluster: kvr's ISR whole again %lld ms after the writers stopped\n",
+                       (long long)(now_ms() - t0));
+                hold_ms(2000);
+            }
+        }
         for (int i = 0; i < nhists && !term_fired; i++)
             kv_final(i);
         if (!strcmp(mutant, "lost-write")) { /* planted: the final state of node 0 lacks a write that was acknowledged */
@@ -2795,7 +2928,19 @@ int main(int argc, char **argv)
         terms = changes = 0;
     const char *dirs[MAXN * 3];
     int nd = replica_dirs(dirs, MAXN * 3);
-    int rdiff = 0;
+    int rdiff = isr_short, isr = 7;
+    if (want_rep && term_fired) {
+        /* after the terminal point kvr has no leader, so nothing changes its ISR any more */
+        uint64_t ver;
+        isr = rep_isr_mask(&ver);
+        if (isr < 0) {
+            fprintf(stderr, "jepsen-cluster: FAIL: no node answered with kvr's ISR after the terminal crash point\n");
+            rdiff++;
+            isr = 7;
+        } else
+            printf("jepsen-cluster: kvr's last ISR (version %" PRIu64 "): replicas%s%s%s\n", ver,
+                   isr & 1 ? " 0" : "", isr & 2 ? " 1" : "", isr & 4 ? " 2" : "");
+    }
     /* a clean stop of every node: SIGTERM, status 0 */
     int unclean = 0;
     for (int i = 0; i < nn; i++) {
@@ -2811,8 +2956,8 @@ int main(int argc, char **argv)
     }
     if (nd > 0) {
         if (!term_fired) /* after the terminal point a replica may lack what the leader appended last */
-            rdiff = replicas_equal(dirs, nd, 1);
-        rdiff += rep_check(term_fired, &viol);
+            rdiff += replicas_equal(dirs, nd, 1);
+        rdiff += rep_check(term_fired, isr, &viol);
         if (rdiff)
             fprintf(stderr, "jepsen-cluster: FAIL: %d difference(s) between the replicas of kvr, with its leader's "
                             "final read, or in the filler's large writes\n", rdiff);
@@ -2844,9 +2989,10 @@ int main(int argc, char **argv)
     }
     if (want_kv || want_rep)
         printf("%s: %" PRIu64 " writes acknowledged, %" PRIu64 " refused, %" PRIu64 " indeterminate (%" PRIu64
-               " of them applied), %" PRIu64 " reads; %u connections, %u refused for a port the node does not hold\n",
+               " of them applied), %" PRIu64 " reads, %" PRIu64 " MOVED followed; %u connections, %u refused for a port "
+               "the node does not hold\n",
                want_kv ? "kv-local" : "kv", (uint64_t)atomic_load(&kv_ok), (uint64_t)atomic_load(&kv_fail), (uint64_t)atomic_load(&kv_indet),
-               indet_applied, nreads, (unsigned)atomic_load(&client_connects), (unsigned)atomic_load(&refused_foreign));
+               indet_applied, nreads, (uint64_t)atomic_load(&kv_moved), (unsigned)atomic_load(&client_connects), (unsigned)atomic_load(&refused_foreign));
     (void)nwrites;
     int rc = 0;
     if (viol) {

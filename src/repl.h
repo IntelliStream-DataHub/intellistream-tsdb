@@ -42,6 +42,7 @@
 #define TSDB_REPL_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define REPL_MAX_NODES 8          /* replicas of one volume: node indexes 0 .. nnodes-1 */
 #define REPL_META      (-1)       /* message address of the metadata group */
@@ -156,12 +157,18 @@ struct repl_config {
                                      ticks ago is removed (isr_lag_ms, §6.1) */
     uint32_t resend_ticks;        /* resend unanswered appends, queries, ISR requests */
     uint32_t heartbeat_ticks;     /* an empty APPEND with the commit point at least this often (§4.2: 5 ms) */
+    uint32_t idle_heartbeat_ticks; /* but only this often while a peer has nothing new: no positions to send and the
+                                      commit point it was last sent (an idle volume; 0: heartbeat_ticks) */
     uint32_t floor_ticks;         /* save the commit floor at most this often (§4.2: once a second) */
     uint32_t max_batch;           /* positions per APPEND */
     uint32_t window;              /* positions in flight per replica */
     uint32_t unanswered_ticks;    /* a member a promotion kept without a fence reply (meta.unanswered) is removed if
                                      it has not acknowledged this many ticks after the new leader took over; 0: only
                                      the lag rule (a few round trips is right: a live member answers by then) */
+    uint32_t join_hold_ticks;     /* a learner within half isr_lag of the leader's end has the commit point held for it
+                                     at most this long, so that it reaches the commit point under writes that never
+                                     pause and joins (§8.1 step 5); then not again for 4 x isr_lag. 0: no hold (a
+                                     learner joins only when the commit point waits anyway, in a pause of the writes) */
     /* The record of this replica's log that contains `pos` (1 <= pos <= written end): its first position and its
      * length. A read of the driver's own index (the WAL), never a write. Returns 0; 1 if the position is no longer
      * retained (below the log's start: its segment went into parts and was deleted, §8.3; the driver trims only
@@ -179,7 +186,11 @@ struct repl_durable {
     uint64_t log_start;           /* first position the log still has (0 or 1: all of it); everything below is
                                      applied (in parts): log_start - 1 <= floor. A replica opened from a snapshot at P
                                      has log_start P + 1, log_end P, floor P, and the epoch of P in hist */
-    uint64_t log_end;             /* last position of the durable log (0: empty) */
+    uint64_t log_end;             /* last position of the log (0: empty) */
+    uint64_t hold;                /* 0, or the first position that is not durable although written: a replica's COMMIT
+                                     marker whose files are not staged holds its durable end below it (the driver's
+                                     replica_durable_end + 1). The durable end starts there, not at log_end: an ACK of
+                                     log_end after a restart told the leader the replica held a file it never staged */
     const struct repl_epoch *hist;
     uint32_t nhist;
 };
@@ -218,6 +229,9 @@ uint64_t repl_applied(const struct repl *r);
 uint64_t repl_commit(const struct repl *r);
 unsigned long repl_debug(const struct repl *r, char *buf, unsigned long cap);
 int repl_failed(const struct repl *r);
+/* One line of the state behind the commit point (written, durable, commit, the ISR, each peer's match), for a driver's
+ * log when the commit point stalls; returns its length as snprintf does. */
+size_t repl_describe(const struct repl *r, char *buf, size_t cap);
 
 /* The metadata group's rules. An ISR change applies only if it names the current epoch, ISR version and leader, and
  * keeps the leader (C11). A promotion applies only if the record still is the one the fences were sent for

@@ -27,6 +27,10 @@ int repld_failed(uint32_t v);
 /* Volume v's engine failed (eng_fail): 1 when the driver holds v (it stops and quiesces it, the process goes on, D13),
  * 0 when v is no volume of the driver (tsdbd's own rules apply). */
 int repld_engine_failed(uint32_t v, const char *msg);
+/* 1 while volume v is led here with fewer in-sync replicas than its min_isr: writes are refused (REPL_E_ISR). */
+int repld_isr_short(uint32_t v);
+/* The ISR changes the volumes led here ask the metadata group for (cluster_report.isr); at most max. */
+unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max);
 /* The servers this one shares a running volume with and has heard nothing from on any of them for after_ms or more
  * (the heartbeat's "unreachable" section, design-cluster.md §2.2): at most max into out; any thread. */
 unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t after_ms);
