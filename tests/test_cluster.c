@@ -4563,11 +4563,20 @@ static void scen_idleseal(void)
     /* and an idle volume's WAL grows by its NOW markers alone */
     char dir[PATH_MAX + 80], wp[PATH_MAX + 160];
     server_dir(L, dir, sizeof dir);
-    snprintf(wp, sizeof wp, "%s/v1/wal_%016" PRIx64 ".log", dir, wal_newest(L));
     struct stat st0, st1;
     struct timespec s5 = {5, 0};
-    if (stat(wp, &st0) != 0 || (nanosleep(&s5, NULL), stat(wp, &st1)) != 0)
-        die("stat %s: %s", wp, strerror(errno));
+    /* The last write's seal may still be under way (slow under ASan): its segment then goes once flushed and the NOW
+     * marker starts the next one. Measure a segment that stays for the whole 5 s; a third roll is a failure. */
+    for (int tries = 0;; tries++) {
+        uint64_t w = wal_newest(L);
+        snprintf(wp, sizeof wp, "%s/v1/wal_%016" PRIx64 ".log", dir, w);
+        if (stat(wp, &st0) == 0 && (nanosleep(&s5, NULL), stat(wp, &st1)) == 0)
+            break;
+        int e = errno;
+        if (e != ENOENT || tries == 2 || wal_newest(L) == w)
+            die("stat %s: %s", wp, strerror(e));
+        printf("  the newest segment rolled while measured (the last seal still running); again\n");
+    }
     printf("  an idle leader's WAL grows by %lld bytes in 5 s (NOW markers; about %lld KB an hour)\n",
            (long long)(st1.st_size - st0.st_size), (long long)(st1.st_size - st0.st_size) * 720 / 1024);
     tsdbc_close(c);
