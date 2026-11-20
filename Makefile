@@ -410,6 +410,9 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	$(if $(EC_OBJ),for m in gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer; do ! ./$(B)/test_ecgc --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_settle $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in ecrankdown settlenocheck settletwopass settlebusy coarsewhole; do ! ./$(B)/test_settle --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),for m in gcskipput gcskipindex gcskipopen gcskipelse gcskipswap gcskipdiscard gccommitted gcdouble; do ! ./$(B)/test_settle --quick --case gcpaths --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each failure path's handoff (int-h)
+	$(if $(EC_OBJ),for m in gcearly nullnosync syncfailgo; do ! ./$(B)/test_settle --quick --case gcpower --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # the handoff after the directory sync, never on a failed engine
+	$(if $(EC_OBJ),! ./$(B)/test_settle --quick --case halt --mutant nohaltstop $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1) # a halt stops the settle
 	./$(B)/test_seam $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop; do ! ./$(B)/test_seam --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_ecpart $(or $(TMPDIR),/tmp)

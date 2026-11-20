@@ -60,12 +60,15 @@
 atomic_int settle_poll_ms = 1000;
 void (*_Atomic settle_fill_hook)(eng *db, const part *p, uint64_t stripe);
 atomic_uint_fast64_t settle_done, settle_failed, settle_abandoned, settle_rounds;
+atomic_int settle_test_fail_at, settle_test_fail_skip;
 int settle_mutant;
 
 int settle_mutant_parse(const char *name)
 {
     static const char *const names[] = {"none", "ecrankdown", "settlenocheck", "settletwopass", "settlebusy",
-                                        "coarsewhole"};
+                                        "coarsewhole", "gcskipput", "gcskipindex", "gcskipopen", "gcskipelse",
+                                        "gcskipswap", "gcskipdiscard", "gccommitted", "gcdouble", "gcearly",
+                                        "nullnosync",  "syncfailgo",  "nohaltstop"};
     for (int i = 0; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
@@ -460,6 +463,11 @@ static void gc_object(eng *db, const ec_record *r)
 static int settle_one(eng *db, part *p, part **out)
 {
     *out = NULL;
+    int fail_at = atomic_load(&settle_test_fail_at); /* tests: one planted failure (settle.h) */
+    if (fail_at && atomic_fetch_sub(&settle_test_fail_skip, 1) > 0)
+        fail_at = SETTLE_FAIL_NONE;
+    else if (fail_at)
+        atomic_store(&settle_test_fail_at, SETTLE_FAIL_NONE);
     const tier_cfg *cfg = tier_config(db->tier);
     chunk_geom g;
     int rc = chunk_geom_derive(&g, (unsigned)cfg->k, (unsigned)cfg->m, p->map_len);
@@ -489,10 +497,13 @@ static int settle_one(eng *db, part *p, part **out)
     chunk_put_src src = {.ctx = &f, .fill = settle_fill};
     rc = chunk_be_put_stream(tier_backend(db->tier), db->tier_vol, tier_vuuid(db), r.oid, &g, r.writer_epoch, &src,
                              ~0u, r.sums);
+    if (rc == 0 && fail_at == SETTLE_FAIL_PUT)
+        rc = TSDB_ERR_IO;
     if (rc) {
         if (!f.aborted) {
             fprintf(stderr, "tsdb: %s: settle of part %s: the put failed (%d)\n", db->dir, p->name, rc);
-            gc_object(db, &r); /* a failure while committing leaves the positions committed before it */
+            if (settle_mutant != SETTLE_MUT_GCSKIPPUT)
+                gc_object(db, &r); /* a failure while committing leaves the positions committed before it */
         }
         goto out;
     }
@@ -500,17 +511,19 @@ static int settle_one(eng *db, part *p, part **out)
     r.object_xxh64 = f.hash;
     r.settle_ms = eng_now_ms(db);
     char tmp[96];
-    if ((rc = ec_index_write(db, p, &r, tmp)) != 0) {
-        gc_object(db, &r);
+    if ((rc = fail_at == SETTLE_FAIL_INDEX ? TSDB_ERR_IO : ec_index_write(db, p, &r, tmp)) != 0) {
+        if (settle_mutant != SETTLE_MUT_GCSKIPINDEX)
+            gc_object(db, &r);
         goto out;
     }
     ecswap_crash_point(ECSWAP_CRASH_AFTER_EC_TMP);
     char name[96];
     snprintf(name, sizeof name, "%.*s.ec", (int)strlen(p->name) - 5, p->name);
     part *e = NULL;
-    if ((rc = part_open_ec(db, tmp, name, &e)) != 0) {
+    if ((rc = fail_at == SETTLE_FAIL_OPEN ? TSDB_ERR_IO : part_open_ec(db, tmp, name, &e)) != 0) {
         unlinkat(db->dirfd, tmp, 0);
-        gc_object(db, &r);
+        if (settle_mutant != SETTLE_MUT_GCSKIPOPEN)
+            gc_object(db, &r);
         goto out;
     }
     if (!e->pending[0])
@@ -585,13 +598,18 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
         if (rc == TSDB_ERR_INVALID || rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_READONLY)
             for (size_t i = 0; i < np; i++) { /* nothing written: the temporaries and objects are ours to remove */
                 unlinkat(db->dirfd, ec[i]->pending, 0);
-                ecgc_unlisted_object(db, ec[i]);
+                if (settle_mutant != SETTLE_MUT_GCSKIPSWAP)
+                    ecgc_unlisted_object(db, ec[i]);
             }
+        if (rc == 0 && settle_mutant == SETTLE_MUT_GCCOMMITTED) /* the bug: the chunks of listed parts go */
+            for (size_t i = 0; i < np; i++)
+                ecgc_unlisted_object(db, ec[i]);
         /* STOPPED: the swap unlinked the temporaries and handed their objects to r7-gc; IO: the next open decides */
     } else {
         for (size_t i = 0; i < nec; i++) { /* the ones written before the failure */
             unlinkat(db->dirfd, ec[i]->pending, 0);
-            ecgc_unlisted_object(db, ec[i]);
+            if (settle_mutant != SETTLE_MUT_GCSKIPELSE)
+                ecgc_unlisted_object(db, ec[i]);
         }
     }
     pthread_mutex_lock(&db->lock);

@@ -75,6 +75,12 @@ extern void (*_Atomic settle_fill_hook)(eng *db, const part *p, uint64_t stripe)
 /* Counters for tests: settles that swapped, failed (CORRUPT and the others but STOPPED), abandoned (STOPPED), and the
  * settle thread's rounds. */
 extern atomic_uint_fast64_t settle_done, settle_failed, settle_abandoned, settle_rounds;
+/* A failure planted in settle_one (tests): the call after settle_test_fail_skip passing ones fails at the step
+ * settle_test_fail_at names with TSDB_ERR_IO, as the real step's failure would leave it: PUT after a put that committed
+ * every position (a failure while committing), INDEX in place of ec_index_write (no tmp .ec), OPEN in place of
+ * part_open_ec (the tmp .ec written). 0: none. */
+enum { SETTLE_FAIL_NONE = 0, SETTLE_FAIL_PUT, SETTLE_FAIL_INDEX, SETTLE_FAIL_OPEN };
+extern atomic_int settle_test_fail_at, settle_test_fail_skip;
 
 /* planted bugs (tests/test_settle.c --mutant NAME, or TSDB_SETTLE_MUTANT=NAME in the environment; the Makefile requires
  * each to fail the test): ecrankdown: in memory only, an .ec part ranks below every other part of its partition (its
@@ -83,7 +89,21 @@ extern atomic_uint_fast64_t settle_done, settle_failed, settle_abandoned, settle
  * settlebusy: the thread settles a key while a merge of it is selectable; coarsewhole: a coarse key settles all its
  * parts once one is due */
 enum { SETTLE_MUT_NONE = 0, SETTLE_MUT_RANKDOWN, SETTLE_MUT_NOCHECK, SETTLE_MUT_TWOPASS, SETTLE_MUT_BUSY,
-       SETTLE_MUT_COARSEWHOLE };
+       SETTLE_MUT_COARSEWHOLE,
+       /* the chunk handoffs of the failure paths (int-h; test_settle --case gcpaths, gcpower): gcskipput, gcskipindex,
+        * gcskipopen: settle_one hands no object to r7-gc after a failed put, index write, open of the .ec; gcskipelse:
+        * eng_settle keeps the objects of the parts settled before a later one failed; gcskipswap: nor those of a swap
+        * refused with nothing written; gcskipdiscard: swap_discard (a STOPPED swap) hands none over; gccommitted: a
+        * swap that committed hands its objects over all the same; gcdouble: a NOMEM intent write is cleaned up by
+        * the swap and by the caller (REVIEW F7); gcearly: swap_discard hands the objects over before the directory
+        * sync that makes the temporaries' unlinks durable (a power cut then rolls the intent forward onto deleted
+        * chunks); nullnosync: no such sync after a failed intent write (whose name another thread's sync may have
+        * made durable); syncfailgo: the objects go to r7-gc although that sync failed (the engine failed, so the
+        * unlinks may never reach the disk); nohaltstop: eng_halt does not stop the engine's settle (a settle of a
+        * halted engine, a volume being reopened, would go on beside the new engine: test_settle --case halt) */
+       SETTLE_MUT_GCSKIPPUT, SETTLE_MUT_GCSKIPINDEX, SETTLE_MUT_GCSKIPOPEN, SETTLE_MUT_GCSKIPELSE, SETTLE_MUT_GCSKIPSWAP,
+       SETTLE_MUT_GCSKIPDISCARD, SETTLE_MUT_GCCOMMITTED, SETTLE_MUT_GCDOUBLE, SETTLE_MUT_GCEARLY,
+       SETTLE_MUT_NULLNOSYNC, SETTLE_MUT_SYNCFAILGO, SETTLE_MUT_NOHALTSTOP };
 extern int settle_mutant;
 int settle_mutant_parse(const char *name); /* -1 when unknown */
 /* For tests: the streaming xxh64 the fill hashes the object with, fed lens[0..n) bytes of buf in turn (it must equal

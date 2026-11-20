@@ -69,6 +69,7 @@
 #include "eckeep.h"
 #include "ecgc.h"
 #include "ecpart.h"
+#include "settle.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -81,6 +82,10 @@
 void (*ec_swap_hook)(eng *db);
 int (*ec_swap_publish)(eng *db) = manifest_publish;
 int ecswap_mutant;
+atomic_int ecswap_test_fail;
+void (*ecswap_discard_hook)(eng *db);
+void (*ecswap_handed_hook)(eng *db);
+void (*ecswap_intent_fail_hook)(eng *db);
 
 /* ------------------------------------------------------------ crash points */
 
@@ -178,7 +183,10 @@ static int intent_write(eng *db, const char *intent, part **in, part **ec, size_
     size_t cap = 64, len = 0; /* the lines' own lengths: no bound on a name's length is assumed */
     for (size_t i = 0; i < n; i++)
         cap += 16 + strlen(ec[i]->pending) + strlen(ec[i]->name) + 2 * strlen(in[i]->name);
-    char *buf = malloc(cap);
+    int fail = atomic_load(&ecswap_test_fail); /* tests: one planted failure (ecswap.h) */
+    if (fail == ECSWAP_FAIL_INTENT_NOMEM || fail == ECSWAP_FAIL_INTENT_IO)
+        atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
+    char *buf = fail == ECSWAP_FAIL_INTENT_NOMEM ? NULL : malloc(cap);
     if (!buf)
         return TSDB_ERR_NOMEM;
     len += (size_t)snprintf(buf + len, cap - len, INTENT_V4_HEAD "%zu\n", n);
@@ -191,8 +199,12 @@ static int intent_write(eng *db, const char *intent, part **in, part **ec, size_
     int rc = fd < 0 || write_full(fd, buf, len) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
     if (fd >= 0 && close(fd) != 0 && rc == 0) /* on NFS, close sends the data to the server */
         rc = TSDB_ERR_IO;
+    if (fail == ECSWAP_FAIL_INTENT_IO) /* as a failed fdatasync: the whole intent written, its name never synced */
+        rc = TSDB_ERR_IO;
     free(buf);
-    if (rc) /* nothing committed: the name was not synced, and goes now */
+    if (rc && ecswap_intent_fail_hook)
+        ecswap_intent_fail_hook(db);
+    if (rc) /* nothing committed: this thread did not sync the name (another one may have), and it goes now */
         unlinkat(db->dirfd, intent, 0);
     return rc;
 }
@@ -219,18 +231,36 @@ static bool args_valid(part **in, part **ec, size_t n)
     return true;
 }
 
-/* A refused swap: its temporaries go, then the intent (the directory synced between: an intent that outlived its
- * temporaries would be rolled back at open, as it must, see ecswap_recover). Not on a failed engine, which names and
- * removes nothing more: the next open sorts the files out. */
+/* A refused swap: its temporaries are unlinked, the directory is synced, the objects go to r7-gc, then the intent is
+ * unlinked. Not on a failed engine, which names and removes nothing more: the next open sorts the files out.
+ * The order of the unlinks themselves does not matter (an intent missing a temporary is rolled back at open, a
+ * temporary with no intent is removed: ecswap_recover); what matters is that the objects go to r7-gc only after that
+ * sync, also with no intent (a write of it failed: another thread's directory sync may have made its name durable
+ * before intent_write removed it). Until the unlinks are durable a power cut can bring back an intent together with
+ * every temporary and every source (a drop's renames of the sources are not synced either when the swap refuses), and
+ * the open rolls such an intent forward: the .ec parts are listed and their chunks must still be there. A sync that
+ * fails failed the engine: nothing is handed over, and the next open's sweep (after the intents are recovered) takes
+ * the objects nothing names. test_settle gcpower (gcearly, nullnosync, syncfailgo). */
 static void swap_discard(eng *db, const char *intent, part **ec, size_t n)
 {
     if (eng_check(db))
         return;
     for (size_t i = 0; i < n; i++) {
         unlinkat(db->dirfd, ec[i]->pending, 0);
-        ecgc_unlisted_object(db, ec[i]); /* its chunks are no one's now (r7-gc) */
+        if (settle_mutant == SETTLE_MUT_GCEARLY) /* the bug: the chunks go while the intent can still roll forward */
+            ecgc_unlisted_object(db, ec[i]);
     }
-    if (intent && eng_sync_dir(db, "fsync of the directory after removing a refused settle's files") == 0)
+    if (ecswap_discard_hook)
+        ecswap_discard_hook(db);
+    if ((intent || settle_mutant != SETTLE_MUT_NULLNOSYNC) &&
+        eng_sync_dir(db, "fsync of the directory after removing a refused settle's files") != 0 &&
+        settle_mutant != SETTLE_MUT_SYNCFAILGO)
+        return;
+    for (size_t i = 0; i < n && settle_mutant != SETTLE_MUT_GCEARLY && settle_mutant != SETTLE_MUT_GCSKIPDISCARD; i++)
+        ecgc_unlisted_object(db, ec[i]); /* its chunks are no one's now (r7-gc) */
+    if (ecswap_handed_hook)
+        ecswap_handed_hook(db);
+    if (intent)
         unlinkat(db->dirfd, intent, 0);
 }
 
@@ -267,7 +297,11 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
         return TSDB_ERR_READONLY;
     if (!args_valid(in, ec, n))
         return TSDB_ERR_INVALID;
-    size_t *at = malloc(n * sizeof *at);
+    size_t *at = NULL;
+    if (atomic_load(&ecswap_test_fail) == ECSWAP_FAIL_AT_NOMEM)
+        atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
+    else
+        at = malloc(n * sizeof *at);
     if (!at)
         return TSDB_ERR_NOMEM;
     char intent[64];
@@ -278,7 +312,8 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     bool early = ecswap_mutant == SWAP_MUT_EARLY;
     if (rc == 0 && !early && (rc = intent_write(db, intent, in, ec, n)) != 0) {
         pthread_mutex_unlock(&db->publish_lock);
-        if (rc != TSDB_ERR_NOMEM) /* NOMEM: nothing written, the caller cleans up (ecswap.h), never both */
+        if (rc != TSDB_ERR_NOMEM || settle_mutant == SETTLE_MUT_GCDOUBLE) /* NOMEM: nothing written, the caller
+                                                                           * cleans up (ecswap.h), never both */
             swap_discard(db, NULL, ec, n);
         free(at);
         return rc;

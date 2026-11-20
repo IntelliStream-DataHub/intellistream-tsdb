@@ -15,16 +15,27 @@
  *   backoff   a failed settle is not retried for an hour, then is
  *   eager     eager=1: only after a merge round, at most 30 settles a minute
  *   close     an engine closed during a slow encode: the settle is abandoned, nothing is left listed
+ *   halt      an engine halted (a volume reopen) during a slow encode: the settle is abandoned before eng_halt returns
  *   threads   8 writers (appends, large inserts, deletes, replaces), merges, a drop and settles at once
  *   crash     TSDB_SETTLE_CRASH_AT after-put and after-ec-tmp, then power loss (crashfs) at every step
+ *   gcpaths   every failure after the put (src/settle.h SETTLE_FAIL_*, src/ecswap.h ECSWAP_FAIL_*, a drop inside the
+ *             swap): each failed object goes to r7-gc once, a gc round leaves exactly the listed objects in the
+ *             stores, the key settles again, the rows equal the oracle's, a reopen's sweep finds nothing
+ *   gcpower   a power cut in a refused swap's cleanup: with a drop's renames unsynced (stopped), after a failed
+ *             intent write whose name another sync made durable (intentio), after a failed discard sync (syncfail):
+ *             an intent that rolls forward finds whole objects, nothing is left behind
  *
  * Mutants (--mutant NAME, src/settle.h; each must fail it): ecrankdown (basic), settlenocheck (corrupt), settletwopass
- * (flip), settlebusy (policy), coarsewhole (coarse). Usage: test_settle [--quick] [--mutant NAME] [SCRATCH]
+ * (flip), settlebusy (policy), coarsewhole (coarse); gcskipput gcskipindex gcskipopen gcskipelse gcskipswap
+ * gcskipdiscard gccommitted gcdouble (gcpaths), gcearly nullnosync syncfailgo (gcpower), nohaltstop (halt). Usage: test_settle [--quick] [--case NAME]
+ * [--mutant NAME] [SCRATCH]
  */
 #include "internal.h"
 #include "chunk.h"
 #include "ecpart.h"
+#include "ecgc.h"
 #include "ecskip.h"
+#include "ecswap.h"
 #include "settle.h"
 #include "tier.h"
 
@@ -63,6 +74,7 @@ int main(void)
 static char S[PATH_MAX / 2], SELF[PATH_MAX], SHIM[PATH_MAX];
 static bool quick;
 static const char *mutant = "none";
+static const char *only; /* --case NAME: that case alone */
 static const int64_t DAY = 86400000, HOUR = 3600000;
 
 /* the test's clock: every engine reads it (never goes back) */
@@ -1087,6 +1099,7 @@ static void close_case(void)
     atomic_store(&settle_fill_hook, NULL);
     CHECK(atomic_load(&settle_abandoned) == a0 + 1 && atomic_load(&settle_done) == d0);
     t_close(&d);
+    CHECK(chunks(&w) == 0); /* abandoned in the fill: no position was committed, nothing for the gc */
     atomic_store(&NOW, 1000 + 3 * DAY); /* the clock never goes back */
     CHECK(count_names(w.db, "", ".ec") == 0);
     CHECK(t_open(&w, &e, &d) == 0);
@@ -1097,6 +1110,52 @@ static void close_case(void)
     }
     t_close(&d);
     printf("  close: an engine closed during a slow encode abandons the settle; the next open settles the key\n");
+}
+
+/* A halt (a volume about to be reopened: tsdb_volume_reopen) stops the engine's settle before it returns, as a close
+ * does: a settle of the halted engine that went on would rename its sources and temporaries in a directory the new
+ * engine owns. The fill sleeps 300 ms per stripe, so a halt that did not wait for the settle (nohaltstop) returns with
+ * it still running. The stop order after it (settle, then the keep digest, then the parts) is the close's. */
+static void halt_case(void)
+{
+    where w;
+    fresh("halt", &w);
+    tier_env(&w, 3600, 86400, 0);
+    atomic_store(&NOW, 1000);
+    eopts e = {.merge_threads = 0, .classes = 0};
+    tdb d;
+    CHECK(t_open(&w, &e, &d) == 0);
+    if (!d.db)
+        return;
+    uint32_t s;
+    CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &s) == 0);
+    write_rows(d.db, s, 0, 400000, 200, NOISY);
+    CHECK(eng_flush(d.db) == 0);
+    CHECK(eng_optimize(d.db) == 0);
+    acc want = digest(d.db, "s");
+    atomic_store(&slow_started, 0);
+    atomic_store(&settle_fill_hook, slow_hook);
+    uint64_t a0 = atomic_load(&settle_abandoned), d0 = atomic_load(&settle_done);
+    atomic_store(&NOW, 3 * DAY);
+    for (int i = 0; i < 2000 && !atomic_load(&slow_started); i++)
+        sleep_ms(10);
+    CHECK(atomic_load(&slow_started));
+    eng_halt(d.db);
+    bool stopped = atomic_load(&settle_abandoned) == a0 + 1 && atomic_load(&settle_done) == d0;
+    if (!stopped)
+        fprintf(stderr, "FAIL halt: eng_halt returned with the engine's settle still running\n");
+    CHECK(stopped);
+    atomic_store(&settle_fill_hook, NULL);
+    CHECK(eng_close(d.db) == 0);
+    d.db = NULL;
+    t_close(&d);
+    CHECK(chunks(&w) == 0 && count_names(w.db, "", ".ec") == 0 && count_names(w.db, "settled_", "") == 0);
+    atomic_store(&NOW, 1000 + 3 * DAY);
+    CHECK(t_open(&w, &e, &d) == 0);
+    if (d.db)
+        CHECK(same(digest(d.db, "s"), want));
+    t_close(&d);
+    printf("  halt: a halted engine's settle is abandoned before eng_halt returns\n");
 }
 
 /* ------------------------------------------------------------ 8 writers, merges, a drop, settles */
@@ -1249,6 +1308,7 @@ static void copy_base(const char *what, where *w)
     CHECK(system(cmd) == 0);
 }
 
+static int child_gcpower(const where *w);
 static int child_settle(const char *root)
 {
     where w;
@@ -1256,6 +1316,9 @@ static int child_settle(const char *root)
     snprintf(w.db, sizeof w.db, "%s/db", root);
     for (int i = 0; i < 3; i++)
         snprintf(w.st[i], sizeof w.st[i], "%s/st%d", root, i);
+    const char *kind = getenv("TSDB_TEST_SETTLE_CHILD");
+    if (kind && !strcmp(kind, "gcpower"))
+        return child_gcpower(&w);
     tier_env(&w, QUIET_GRACE, 86400, 0);
     eopts e = {.merge_threads = 0, .classes = 0};
     tdb d;
@@ -1267,6 +1330,7 @@ static int child_settle(const char *root)
 }
 
 static const char *exit_mark; /* CRASHFS_EXIT_MARK of the next child under the shim, NULL: none */
+static bool no_tear;          /* the next child's power loss drops everything not synced (no CRASHFS_TEAR) */
 static pid_t child_pid;       /* the last child's pid */
 
 static int run_child(const where *w, const char *crash_at, int warmup, int seed)
@@ -1295,7 +1359,8 @@ static int run_child(const where *w, const char *crash_at, int warmup, int seed)
             setenv("CRASHFS_PROB", "1", 1);
             setenv("CRASHFS_WARMUP", wu, 1);
             setenv("CRASHFS_AT_EXIT", "1", 1);
-            setenv("CRASHFS_TEAR", "1", 1);
+            if (!no_tear)
+                setenv("CRASHFS_TEAR", "1", 1);
             setenv("CRASHFS_SEED", sd, 1);
         }
         int null = open("/dev/null", O_WRONLY);
@@ -1314,17 +1379,24 @@ static int run_child(const where *w, const char *crash_at, int warmup, int seed)
 }
 
 /* reopens w: the rows equal the base's, no temporary is left; 2: the key is all .ec, 1: all .part, -1 otherwise */
+static size_t stores_exact(const where *w, eng *db, const char *what);
 static int reopen_check(const where *w, const char *what)
 {
     tier_env(w, QUIET_GRACE, 86400, 0);
     eopts e = {.merge_threads = 0, .classes = 0};
     tdb d;
+    bool manual = atomic_exchange(&ecgc_test_manual, true); /* the test works the delete queue itself */
     int rc = t_open(w, &e, &d);
+    atomic_store(&ecgc_test_manual, manual);
     CHECK(rc == 0);
     if (rc) {
         fprintf(stderr, "  (%s: the reopen said %d)\n", what, rc);
         return -1;
     }
+    /* the open's sweep and a gc round: no chunk of an object nothing names is left, every listed .ec is whole */
+    ecgc_tier_work(d.t);
+    ecgc_tier_work(d.t);
+    stores_exact(w, d.db, what);
     bool ok = same(digest(d.db, "s"), BWANT);
     CHECK(ok);
     if (!ok)
@@ -1407,6 +1479,350 @@ static void crash_case(void)
            crashes / seeds, seeds, back, fwd);
 }
 
+/* ------------------------------------------------------------ the failure paths' chunks (int-h) */
+
+/* chunk files per object in the three stores, by the oid's hex in the name (o<hex>.<pos>.chunk) */
+enum { MAXOBJ = 256 };
+static struct {
+    char hex[33];
+    unsigned n;
+} objs[MAXOBJ];
+static size_t nobjs;
+static int obj_fn(const char *path, const struct stat *st, int type, struct FTW *f)
+{
+    (void)st;
+    const char *b = path + f->base;
+    if (type != FTW_F || b[0] != 'o' || strlen(b) < 34 || b[33] != '.' || !strstr(b, ".chunk"))
+        return 0;
+    for (size_t i = 0; i < nobjs; i++)
+        if (!strncmp(objs[i].hex, b + 1, 32)) {
+            objs[i].n++;
+            return 0;
+        }
+    if (nobjs < MAXOBJ) {
+        snprintf(objs[nobjs].hex, sizeof objs[nobjs].hex, "%.32s", b + 1);
+        objs[nobjs++].n = 1;
+    }
+    return 0;
+}
+
+/* The stores hold exactly the objects of the listed .ec parts, each whole (k' + m chunk files), and nothing else.
+ * Returns how many chunk files the listed parts need. */
+static size_t stores_exact(const where *w, eng *db, const char *what)
+{
+    nobjs = 0;
+    for (int i = 0; i < 3; i++)
+        nftw(w->st[i], obj_fn, 16, FTW_PHYS);
+    bool used[MAXOBJ] = {false};
+    size_t need = 0;
+    bool ok = true;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++) {
+        struct ecpart *e = atomic_load(&db->parts[i]->ec);
+        if (!e)
+            continue;
+        char hex[33];
+        chunk_oid_hex(e->rec.oid, hex);
+        unsigned want = (unsigned)e->rec.k + e->rec.m, have = 0;
+        need += want;
+        for (size_t j = 0; j < nobjs; j++)
+            if (!strcmp(objs[j].hex, hex)) {
+                used[j] = true;
+                have = objs[j].n;
+            }
+        if (have != want) {
+            fprintf(stderr, "FAIL %s: listed %s has %u of its %u chunks\n", what, db->parts[i]->name, have, want);
+            ok = false;
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+    for (size_t j = 0; j < nobjs; j++)
+        if (!used[j]) {
+            fprintf(stderr, "FAIL %s: %u chunks of object %s that no listed part names\n", what, objs[j].n,
+                    objs[j].hex);
+            ok = false;
+        }
+    CHECK(ok);
+    return need;
+}
+
+static void two_parts(eng *db, uint32_t s, int64_t key)
+{
+    write_rows(db, s, key * DAY, 20000, 2000, 0);
+    CHECK(eng_flush(db) == 0);
+    write_rows(db, s, key * DAY + 1000, 20000, 2000, 1);
+    CHECK(eng_flush(db) == 0);
+}
+
+static eng *gc_drop_db;
+static void *gc_drop_run(void *arg)
+{
+    (void)arg;
+    return (void *)(intptr_t)eng_drop_before(gc_drop_db, DAY);
+}
+/* Key 0 goes while its swap waits: STOPPED. The hook runs under the swap's publish_lock, and a drop flushes (flush_lock,
+ * which comes before publish_lock), so the drop runs on a thread of its own as a real one does, never inline: its
+ * flush finds the memtable empty and needs no publish_lock, and its retire section waits for nothing the swap holds
+ * here. */
+static void gc_drop_hook(eng *db)
+{
+    (void)db;
+    pthread_t t;
+    void *ret = (void *)(intptr_t)-1;
+    CHECK(pthread_create(&t, NULL, gc_drop_run, NULL) == 0);
+    CHECK(pthread_join(t, &ret) == 0);
+    CHECK((intptr_t)ret == 0);
+}
+
+/* One failure path on key `key`: settle it with the failure planted, expect rc; the failed objects' chunks must be in
+ * the stores (the path did put them) until a gc round, which leaves exactly the listed objects; the rows equal the
+ * oracle's; and the objects handed to r7-gc are exactly `handed` (one per object: never twice, F7). */
+static void gc_path(const where *w, tdb *d, eng *o, const char *what, int64_t key, int rc_want, size_t handed,
+                    size_t left)
+{
+    ecgc_counters c0, c1;
+    ecgc_get_counters(d->t, &c0);
+    size_t before = chunks(w);
+    int rc = settle_key(d->db, key, NULL);
+    if (rc != rc_want)
+        fprintf(stderr, "FAIL %s: the settle said %d, not %d\n", what, rc, rc_want);
+    CHECK(rc == rc_want);
+    CHECK(atomic_load(&settle_test_fail_at) == SETTLE_FAIL_NONE && atomic_load(&ecswap_test_fail) == ECSWAP_FAIL_NONE);
+    size_t all, ec;
+    key_count(d->db, key, &all, &ec);
+    CHECK(all == left && ec == 0);
+    CHECK(count_names(w->db, "tmp_", "") == 0);
+    CHECK(count_names(w->db, "txn_", ".intent") == 0); /* a failed intent write removes its intent too */
+    bool teeth = chunks(w) > before; /* the path is reached after the put: else this case has no teeth */
+    if (!teeth)
+        fprintf(stderr, "FAIL %s: no chunk was put before the failure\n", what);
+    CHECK(teeth);
+    ecgc_tier_work(d->t);
+    ecgc_get_counters(d->t, &c1);
+    if (c1.queued - c0.queued != handed)
+        fprintf(stderr, "FAIL %s: %" PRIu64 " objects handed to the gc, not %zu\n", what, c1.queued - c0.queued,
+                handed);
+    CHECK(c1.queued - c0.queued == handed);
+    stores_exact(w, d->db, what);
+    CHECK(same(digest(d->db, "s"), digest(o, "s")));
+}
+
+static void gcpaths_case(void)
+{
+    where w;
+    fresh("gcpaths", &w);
+    tier_env(&w, QUIET_GRACE, 86400, 0);
+    atomic_store(&ecgc_test_manual, true); /* the test works the delete queue itself */
+    eopts e = {.merge_threads = 0, .classes = 0};
+    tdb d;
+    CHECK(t_open(&w, &e, &d) == 0);
+    eng *o = o_open(&w, &e);
+    if (!d.db || !o) {
+        atomic_store(&ecgc_test_manual, false);
+        return;
+    }
+    uint32_t s, so;
+    CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &s) == 0 && eng_series(o, "s", TSDB_FLOAT32, &so) == 0);
+    for (int64_t k = 0; k < 9; k++) {
+        two_parts(d.db, s, k);
+        two_parts(o, so, k);
+    }
+    atomic_store(&NOW, 30 * DAY);
+
+    /* a drop of the key inside the swap (STOPPED): swap_discard unlinks, syncs, then hands over */
+    gc_drop_db = d.db;
+    ec_swap_hook = gc_drop_hook;
+    CHECK(eng_drop_before(o, DAY) == 0);
+    gc_path(&w, &d, o, "stopped", 0, TSDB_ERR_STOPPED, 2, 0);
+    ec_swap_hook = NULL;
+    CHECK(same(digest(d.db, "s"), digest(o, "s")));
+
+    struct {
+        const char *what;
+        int settle_at, skip, swap, rc;
+        size_t handed;
+    } paths[] = {
+        {"put", SETTLE_FAIL_PUT, 0, 0, TSDB_ERR_IO, 1},
+        {"index", SETTLE_FAIL_INDEX, 0, 0, TSDB_ERR_IO, 1},
+        {"open", SETTLE_FAIL_OPEN, 0, 0, TSDB_ERR_IO, 1},
+        {"second", SETTLE_FAIL_OPEN, 1, 0, TSDB_ERR_IO, 2},    /* the first part's object too (eng_settle's else) */
+        {"swapnomem", 0, 0, ECSWAP_FAIL_AT_NOMEM, TSDB_ERR_NOMEM, 2},
+        {"intentnomem", 0, 0, ECSWAP_FAIL_INTENT_NOMEM, TSDB_ERR_NOMEM, 2}, /* F7: one owner, each object once */
+        {"intentio", 0, 0, ECSWAP_FAIL_INTENT_IO, TSDB_ERR_IO, 2},
+    };
+    for (size_t i = 0; i < sizeof paths / sizeof *paths; i++) {
+        int64_t key = 1 + (int64_t)i;
+        atomic_store(&settle_test_fail_skip, paths[i].skip);
+        atomic_store(&settle_test_fail_at, paths[i].settle_at);
+        atomic_store(&ecswap_test_fail, paths[i].swap);
+        gc_path(&w, &d, o, paths[i].what, key, paths[i].rc, paths[i].handed, 2);
+        atomic_store(&settle_test_fail_at, SETTLE_FAIL_NONE);
+        atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
+        /* the same key settled again: nothing a failed settle handed over takes any of its chunks */
+        ecgc_counters c0, c1;
+        ecgc_get_counters(d.t, &c0);
+        CHECK(settle_key(d.db, key, NULL) == 0);
+        ecgc_tier_work(d.t);
+        ecgc_get_counters(d.t, &c1);
+        CHECK(c1.queued == c0.queued); /* a committed swap hands nothing over (gccommitted) */
+        CHECK(stores_exact(&w, d.db, paths[i].what) > 0);
+        CHECK(same(digest(d.db, "s"), digest(o, "s")));
+    }
+
+    /* the reopen's sweep finds nothing to take: every chunk left is a listed part's */
+    CHECK(t_close(&d) == 0);
+    CHECK(t_open(&w, &e, &d) == 0);
+    if (d.db) {
+        ecgc_tier_work(d.t); /* the sweep's listing, if the open deferred it, and the queue */
+        ecgc_tier_work(d.t);
+        ecgc_counters c;
+        ecgc_get_counters(d.t, &c);
+        CHECK(c.sweeps >= 1 && c.sweeps_skipped == 0 && c.swept == 0); /* the sweep ran and found nothing */
+        stores_exact(&w, d.db, "reopen");
+        CHECK(same(digest(d.db, "s"), digest(o, "s")));
+    }
+    t_close(&d);
+    atomic_store(&ecgc_test_manual, false);
+    CHECK(eng_close(o) == 0);
+    printf("  gcpaths: every failure after the put (put, index, open, a later part, the swap's NOMEM twice, its "
+           "intent's IO, a drop: STOPPED) hands each object to the gc once; a gc round leaves exactly the listed "
+           "objects; the key settles again; the reopen sweeps nothing\n");
+}
+
+/* The power-cut window of a refused swap (gcearly): a drop renames key 0's sources while the swap waits (its
+ * directory sync held back by the hook), the swap is refused, and the power fails in swap_discard before its sync,
+ * after the gc worked its queue. The open then finds the intent, every temporary and every source again and rolls the
+ * swap forward: the .ec parts' chunks must still be there. */
+static void *gcp_drop(void *arg)
+{
+    eng_drop_before(arg, DAY);
+    return NULL;
+}
+static void gcp_swap_hook(eng *db)
+{
+    pthread_mutex_lock(&db->dir_sync_lock); /* the drop's sync waits behind it: its renames stay unsynced */
+    pthread_t t;
+    if (pthread_create(&t, NULL, gcp_drop, db) != 0)
+        _exit(5);
+    pthread_detach(t); /* the child ends in exit(99) with no join; syncfail lets the drop finish first (TSan: a leak) */
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s", db->dir);
+    for (int i = 0; i < 1000 && count_names(dir, "retired_", "") == 0; i++)
+        sleep_ms(5);
+    if (count_names(dir, "retired_", "") == 0)
+        _exit(5);
+    sleep_ms(50); /* the drop's retire section ends; the swap's check waits for it anyway */
+}
+static void gcp_discard_hook(eng *db)
+{
+    ecgc_tier_work(db->tier); /* the worker's round, had it run now */
+    exit(99);                 /* the power cut (crashfs at exit) */
+}
+/* intentio: another thread's directory sync lands while the failed intent is still named (REVIEW F2) */
+static void gcp_intent_sync_hook(eng *db)
+{
+    if (eng_sync_dir(db, "test: another thread's directory sync") != 0)
+        _exit(5);
+}
+/* syncfail: the engine fails between the unlinks and the discard's sync, so that sync fails (REVIEW F3); the drop's
+ * sync, let go now, fails too: its renames stay unsynced */
+static void gcp_fail_hook(eng *db)
+{
+    eng_fail(db, "test: the directory fsync of a refused swap's cleanup", EIO);
+    pthread_mutex_unlock(&db->dir_sync_lock);
+}
+/* the gcpower variants: stopped (a drop inside the swap: the cut before the discard's sync), intentio (a failed intent
+ * write whose name another sync made durable: the cut after the handoff), syncfail (the stopped swap's discard sync
+ * fails: the cut after the gc round) */
+static int child_gcpower(const where *w)
+{
+    const char *v = getenv("TSDB_TEST_GCPOWER");
+    tier_env(w, QUIET_GRACE, 86400, 0);
+    atomic_store(&ecgc_test_manual, true);
+    eopts e = {.merge_threads = 0, .classes = 0};
+    tdb d;
+    if (!v || t_open(w, &e, &d) != 0)
+        return 3;
+    if (!strcmp(v, "stopped")) {
+        ec_swap_hook = gcp_swap_hook;
+        ecswap_discard_hook = gcp_discard_hook;
+    } else if (!strcmp(v, "intentio")) {
+        atomic_store(&ecswap_test_fail, ECSWAP_FAIL_INTENT_IO);
+        ecswap_intent_fail_hook = gcp_intent_sync_hook;
+        ecswap_handed_hook = gcp_discard_hook;
+    } else if (!strcmp(v, "syncfail")) {
+        ec_swap_hook = gcp_swap_hook;
+        ecswap_discard_hook = gcp_fail_hook;
+        ecswap_handed_hook = gcp_discard_hook;
+    } else
+        return 3;
+    int rc = settle_key(d.db, 0, NULL);
+    if (!strcmp(v, "syncfail") && rc != 0) /* nothing handed over: the gc round finds nothing, then the cut */
+        gcp_discard_hook(d.db);
+    return 6; /* the hooks never returned here */
+}
+
+static void gcpower_case(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  gcpower: skipped (no libcrashfs.so)\n");
+        return;
+    }
+    if (!BASE.root[0])
+        make_base();
+    const char *variants[] = {"stopped", "intentio", "syncfail"};
+    int seeds = quick ? 2 : 6, fwd = 0;
+    for (int vi = 0; vi < 3; vi++)
+    for (int seed = 1; seed <= seeds; seed++) {
+        const char *v = variants[vi];
+        bool drop = vi != 1;
+        where w;
+        copy_base("gcpower", &w);
+        setenv("TSDB_TEST_SETTLE_CHILD", "gcpower", 1);
+        setenv("TSDB_TEST_GCPOWER", v, 1);
+        no_tear = seed == 1; /* every unsynced name change lost: the intent finds all it names and rolls forward */
+        int code = run_child(&w, NULL, 1000000000, seed);
+        no_tear = false;
+        unsetenv("TSDB_TEST_SETTLE_CHILD");
+        unsetenv("TSDB_TEST_GCPOWER");
+        if (code != 99)
+            fprintf(stderr, "FAIL gcpower %s seed %d: the child said %d\n", v, seed, code);
+        CHECK(code == 99);
+        /* the drop was never acknowledged: key 0 is whole or gone; listed .ec parts are whole objects */
+        tier_env(&w, QUIET_GRACE, 86400, 0);
+        atomic_store(&ecgc_test_manual, true);
+        eopts e = {.merge_threads = 0, .classes = 0};
+        tdb d;
+        int rc = t_open(&w, &e, &d);
+        CHECK(rc == 0);
+        if (rc == 0) {
+            ecgc_tier_work(d.t); /* the sweep's orphans (a swap rolled back) */
+            ecgc_tier_work(d.t);
+            /* a drop retires part by part: a cut before its sync may keep any of its renames (CRASHFS_TEAR) */
+            acc a = digest(d.db, "s");
+            bool ok = same(a, BWANT) || (drop && (a.n == 0 || a.n == BWANT.n / 2));
+            if (!ok)
+                fprintf(stderr, "FAIL gcpower %s seed %d: %zu rows, not the base's %zu%s\n", v, seed, a.n, BWANT.n,
+                        drop ? ", half or none" : "");
+            CHECK(ok);
+            size_t all, ec;
+            key_count(d.db, 0, &all, &ec);
+            fwd += all && ec == all;
+            if (seed == 1 && drop) /* nothing of the drop or the cleanup survived the cut: the intent rolled forward */
+                CHECK(all == 2 && ec == 2 && same(a, BWANT));
+            if (seed == 1 && !drop) /* the discard's sync took the intent and the temporaries away for good */
+                CHECK(all == 2 && ec == 0);
+            stores_exact(&w, d.db, v);
+            CHECK(count_names(w.db, "tmp_", "") == 0 && count_names(w.db, "txn_", ".intent") == 0);
+        }
+        t_close(&d);
+        atomic_store(&ecgc_test_manual, false);
+    }
+    printf("  gcpower: a power cut in a refused swap's cleanup (a drop inside it, a failed intent write whose name "
+           "another sync made durable, a failed discard sync) rolled %d of %d forward onto whole objects\n",
+           fwd, 3 * seeds);
+}
+
 int main(int argc, char **argv)
 {
     const char *scratch = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", *child = NULL;
@@ -1415,6 +1831,8 @@ int main(int argc, char **argv)
             quick = true;
         } else if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {
             mutant = argv[++i];
+        } else if (!strcmp(argv[i], "--case") && i + 1 < argc) {
+            only = argv[++i];
         } else if (!strcmp(argv[i], "--child") && i + 1 < argc) {
             child = argv[++i];
         } else {
@@ -1436,20 +1854,25 @@ int main(int argc, char **argv)
     snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
     snprintf(S, sizeof S, "%s", scratch);
     printf("test_settle%s%s\n", m ? " --mutant " : "", m ? mutant : "");
-    basic_case();
-    corrupt_case();
-    flip_case();
-    hash_case();
-    checks_case();
-    class_case();
-    down_case();
-    policy_case();
-    coarse_case();
-    backoff_case();
-    eager_case();
-    close_case();
-    threads_case();
-    crash_case();
+#define RUN(name) (!only || !strcmp(only, #name) ? name##_case() : (void)0)
+    RUN(basic);
+    RUN(corrupt);
+    RUN(flip);
+    RUN(hash);
+    RUN(checks);
+    RUN(class);
+    RUN(down);
+    RUN(policy);
+    RUN(coarse);
+    RUN(backoff);
+    RUN(eager);
+    RUN(close);
+    RUN(halt);
+    RUN(threads);
+    RUN(crash);
+    RUN(gcpaths);
+    RUN(gcpower);
+#undef RUN
     if (failures) {
         fprintf(stderr, "test_settle: %d failures\n", failures);
         return 1;

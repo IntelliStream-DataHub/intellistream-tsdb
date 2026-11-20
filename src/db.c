@@ -1104,7 +1104,8 @@ void eng_halt(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     db->nmergers = 0;
-    ecsettle_eng_stop(db); /* R7: no settle of this engine runs from here on (abandoned or waited for) */
+    if (settle_mutant != SETTLE_MUT_NOHALTSTOP)
+        ecsettle_eng_stop(db); /* R7: no settle of this engine runs from here on (abandoned or waited for) */
     if (eckeep_mutant != ECKEEP_MUT_NOHALTSTOP)
         eckeep_eng_stop(db); /* R7: the digest thread holds part references and takes db->lock */
 }
