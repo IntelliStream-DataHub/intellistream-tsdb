@@ -3155,6 +3155,21 @@ static void case_promote(int variant)
     }
     x.noapply = false;
     n->opt.wal_max_batch_rows = 16;
+    { /* the promoted writer before its attach: its merges and flusher run already, and a switch decided now would go to
+       * CLASSES with no marker, a record of this member alone (jepsen-cluster meta,classes partition, r3e: the next
+       * epoch's leader decided another T for the same offset; mutant switchunattached) */
+        uint64_t off = n->cls_off;
+        struct stat cs0, cs1;
+        char cp[PATH_MAX + 16];
+        snprintf(cp, sizeof cp, "%s/CLASSES", rd);
+        int had = stat(cp, &cs0) == 0;
+        CHECK(n->cls_on);
+        CHECK_EQ(eng_class_switch(n, 0, 2, NULL), TSDB_ERR_UNAVAILABLE);
+        CHECK_EQ(n->cls_off, off);
+        CHECK_EQ(stat(cp, &cs1) == 0, had);
+        if (had && stat(cp, &cs1) == 0)
+            CHECK_EQ((long long)cs1.st_size, (long long)cs0.st_size);
+    }
     CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
     /* item 6: the promoted leader has the latest table (a replica runs without one) and keeps the replica's RSTATE,
      * which holds the DROP it applied (mutant promotenocarry: no table, RSTATE removed) */
@@ -5936,6 +5951,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "classmarkerlate") == 0 ? MUT_LEADER_CLASS_MARKER_LATE
                         : strcmp(m, "nowtailfrom") == 0 ? MUT_LEADER_NO_WTAIL_FROM
                         : strcmp(m, "markersplit") == 0 ? MUT_LEADER_MARKERS_SPLIT
+                        : strcmp(m, "switchunattached") == 0 ? MUT_LEADER_SWITCH_UNATTACHED
                         : strcmp(m, "droppedglobal") == 0 ? MUT_DROPPED_GLOBAL
                         : strcmp(m, "wtailnocap") == 0 ? MUT_WTAIL_NOCAP
                         : strcmp(m, "nocutoff") == 0 ? MUT_LEADER_NO_CUTOFF

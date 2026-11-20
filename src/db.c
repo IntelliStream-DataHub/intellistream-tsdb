@@ -796,6 +796,15 @@ int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, 
     return eng_open_sched(dir, opts, NULL, out);
 }
 
+/* eng_open_leader: taken at the open's start as well */
+static __thread bool leader_want;
+
+int eng_open_leader(const char *dir, const tsdb_options *opts, eng **out)
+{
+    leader_want = true;
+    return eng_open_sched(dir, opts, NULL, out);
+}
+
 static __thread int adopt_lockfd = -1;
 /* A check of the opened engine (eng_reopen), run by the open once nothing can fail any more and before the engine's
  * own threads start: they change the parts list (a merge, a flush), which the check reads without a lock. */
@@ -835,6 +844,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     bool replica = replica_want;
     uint64_t floor = replica_floor;
     replica_want = false;
+    bool leader = leader_want;
+    leader_want = false;
     simd_init();
     /* 64-byte aligned: the hot fields of the write path are laid out in whole cache lines (internal.h, buf_lock) */
     _Static_assert(_Alignof(eng) == 64, "eng is aligned to a cache line");
@@ -842,6 +853,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     if (!db)
         return TSDB_ERR_NOMEM;
     memset(db, 0, sizeof *db);
+    db->leader_open = leader && eng_test_mutant != MUT_LEADER_SWITCH_UNATTACHED; /* before any of its threads start */
     db->ret_fd = -2; /* retention not opened yet */
     db->cls_fd = -2;
     if (opts)

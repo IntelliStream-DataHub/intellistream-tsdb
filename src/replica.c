@@ -2310,7 +2310,7 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
          * the COMMITs and DROPs it applied as a replica are still in its `done` and `drops` */
         eng_close(db);
         *dbp = NULL;
-        rc = eng_open(dir, &opt, out);
+        rc = eng_open_leader(dir, &opt, out); /* no class switch before the driver attaches (db->leader_open) */
     }
     free(dir);
     return rc;

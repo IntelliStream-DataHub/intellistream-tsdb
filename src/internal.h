@@ -75,7 +75,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_APPLY_HOLDS_MU, MUT_REPLICA_PREP_NO_CUT_GEN, MUT_LEADER_DROP_UNHELD,
        MUT_LEADER_LINK_BY_NAME, MUT_LEADER_RS_NO_PRUNE, MUT_LEADER_RS_PRUNE_ALL, MUT_LEADER_NOTE_LATE,
        MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU,
-       MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED };
+       MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED,
+       MUT_LEADER_SWITCH_UNATTACHED };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1627,6 +1628,9 @@ int mt_reserve_rows(struct memtable *m, const uint32_t *series, uint32_t cs, siz
 struct replica;
 struct rstate;
 int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, struct eng **out);
+/* The writer of a promotion (replica_promote): its merges and flusher run before the driver attaches (eng_leader_attach),
+ * and a class switch decided in between would reach CLASSES with no marker in the log (db->leader_open). */
+int eng_open_leader(const char *dir, const tsdb_options *opts, struct eng **out);
 int replica_open_log(struct eng *db, uint64_t floor, int (*cut_tails)(struct eng *)); /* instead of wal_open; sets db->rp */
 void replica_free(struct eng *db);                     /* wal_close */
 int replica_flush(struct eng *db);                     /* mt_flush of a replica */
@@ -1873,6 +1877,8 @@ struct eng {
     _Atomic bool feed_on;     /* FEED exists and the word is in META: segments are renamed to fwal_, not unlinked */
     bool feed_req;            /* META said requires=feed at the open */
     bool replica_req;         /* META said requires=replica: only such a directory opens as a replica or a leader */
+    bool leader_open;         /* opened by eng_open_leader (a promotion): until eng_leader_attach it is a writer with no
+                               * jr, and decides nothing the replicas must carry out (a class switch: classes.c) */
     bool fno_torn_open;       /* the open found one FNO slot bad (the numbers skipped ahead by FNO_BELT) */
     pthread_mutex_t feed_lock;
     pthread_cond_t feed_cv;
