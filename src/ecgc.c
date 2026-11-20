@@ -49,6 +49,7 @@
 
 int ecgc_mutant;
 atomic_bool ecgc_test_manual;
+atomic_bool ecgc_test_nosweep;
 
 /* D4: chunks are written and deleted at the constant epoch 1 (a delete above a store's epoch would raise it) */
 #define GC_EPOCH 1
@@ -648,7 +649,7 @@ int ecgc_open_sweep(eng *db)
     EC_CALLED(EC_CALL_GC_SWEEP);
     tier *t = db->tier;
     struct ecgc_eng *e = eng_gc(db);
-    if (!t || !t->gc || !e)
+    if (!t || !t->gc || !e || atomic_load(&ecgc_test_nosweep))
         return 0;
     /* what the engine names: its listed .ec parts and its retired names (no thread of it runs yet) */
     pthread_mutex_lock(&db->lock);

@@ -71,6 +71,9 @@ typedef struct ecgc_counters {
 void ecgc_get_counters(struct tier *t, ecgc_counters *out);
 /* Set before tier_open: no worker thread; the test calls ecgc_tier_work itself. */
 extern atomic_bool ecgc_test_manual;
+/* Set before an open: no sweep. Objects a test attached in memory only (ec_test_attach, tests/test_seam.c) are named by
+ * no .ec file, so a reopen's sweep would delete them as orphans. */
+extern atomic_bool ecgc_test_nosweep;
 /* Planted bugs (tests/test_ecgc.c --mutant NAME; the Makefile requires each to fail it): the purge unlinks the retired
  * name before the chunks are deleted (gcunlinkfirst); the last part_unref keeps its hold, so the object never goes
  * (gcunrefleak); the purge ignores the holds, deleting the chunks of a part a query still reads (gcnohold); the sweep

@@ -35,6 +35,7 @@
 #include "internal.h"
 #include "chunk.h"
 #include "eccache.h"
+#include "ecgc.h"
 #include "ecpart.h"
 #include "tier.h"
 
@@ -1168,6 +1169,8 @@ static void run(void)
 
 int main(int argc, char **argv)
 {
+    /* the objects here are attached in memory, named by no .ec file: a reopen's sweep (R7 D6) would delete them */
+    atomic_store(&ecgc_test_nosweep, true);
     int a = 1;
     if (a < argc && !strcmp(argv[a], "--mutant")) {
         const char *m = a + 1 < argc ? argv[a + 1] : "";
