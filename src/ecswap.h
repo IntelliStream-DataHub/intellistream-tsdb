@@ -38,6 +38,11 @@ void ecswap_eng_close(eng *db);
  * threads that swap start. */
 extern void (*ec_swap_hook)(eng *db);
 
+/* The settle's own crash points (src/settle.c) of TSDB_SETTLE_CRASH_AT, which this file reads: after-put (the chunks
+ * are durable) and after-ec-tmp (the tmp_*.ec is durable too, no intent written) */
+enum { ECSWAP_CRASH_AFTER_PUT = 1, ECSWAP_CRASH_AFTER_EC_TMP = 2 };
+void ecswap_crash_point(int which);
+
 /* tests: what publishes MANIFEST after a swap (manifest_publish) */
 extern int (*ec_swap_publish)(eng *db);
 

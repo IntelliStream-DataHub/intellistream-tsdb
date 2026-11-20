@@ -54,10 +54,12 @@
  *   and a lookup that fails other than ENOENT (EIO, ESTALE on NFS: never read as "absent"). The directory is synced
  *   before ecswap_recover returns, so the intent is unlinked only after its renames are durable.
  *
- * Crash points for r7-jepsen: TSDB_SETTLE_CRASH_AT=after-intent|between-renames|before-unlink[:n] ends the process
+ * Crash points for r7-jepsen: TSDB_SETTLE_CRASH_AT=after-put|after-ec-tmp|after-intent|between-renames|before-unlink[:n]
+ * ends the process
  * with _exit(99) the n-th time (default 1) the point is passed; read once per process. after-intent: the intent is
  * durable, nothing renamed; between-renames: after each rename but the swap's last; before-unlink: the swap is
- * durable, its intent still there. An unknown name ends the process with status 2 at the first point passed.
+ * durable, its intent still there. after-put and after-ec-tmp are the settle's (src/settle.c, ecswap_crash_point):
+ * its chunks are durable, and then its tmp_*.ec too, nothing renamed. An unknown name ends the process with status 2 at the first point passed.
  */
 #include "ecswap.h"
 #include "ecgc.h"
@@ -77,8 +79,9 @@ int ecswap_mutant;
 
 /* ------------------------------------------------------------ crash points */
 
-enum { SC_AFTER_INTENT, SC_BETWEEN_RENAMES, SC_BEFORE_UNLINK, SC_N };
-static const char *const sc_names[SC_N] = {"after-intent", "between-renames", "before-unlink"};
+enum { SC_AFTER_INTENT, SC_BETWEEN_RENAMES, SC_BEFORE_UNLINK, SC_AFTER_PUT, SC_AFTER_EC_TMP, SC_N };
+static const char *const sc_names[SC_N] = {"after-intent", "between-renames", "before-unlink", "after-put",
+                                           "after-ec-tmp"};
 static pthread_once_t sc_once = PTHREAD_ONCE_INIT;
 static int sc_point = -1; /* the armed point, -1: none */
 static long sc_at = 1;
@@ -114,6 +117,8 @@ static void settle_crash(int point)
         _exit(99);
     }
 }
+
+void ecswap_crash_point(int which) { settle_crash(which == ECSWAP_CRASH_AFTER_PUT ? SC_AFTER_PUT : SC_AFTER_EC_TMP); }
 
 /* ------------------------------------------------------------ names */
 

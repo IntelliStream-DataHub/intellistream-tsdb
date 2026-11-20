@@ -1873,6 +1873,7 @@ struct eng {
     _Atomic bool feed_on;     /* FEED exists and the word is in META: segments are renamed to fwal_, not unlinked */
     bool feed_req;            /* META said requires=feed at the open */
     bool replica_req;         /* META said requires=replica: only such a directory opens as a replica or a leader */
+    bool cluster_req;         /* META said requires=cluster: a cluster volume's (R7 never settles one: D1) */
     bool fno_torn_open;       /* the open found one FNO slot bad (the numbers skipped ahead by FNO_BELT) */
     pthread_mutex_t feed_lock;
     pthread_cond_t feed_cv;
