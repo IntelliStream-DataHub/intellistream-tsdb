@@ -136,19 +136,19 @@ extern int ecpart_mutant;
  * it without a configured tier; tests of the .ec file itself run without one). */
 extern atomic_bool ec_test_assume_tier;
 
-/* ------------------------------------------------------------ stubs r7-iface left (src/ecpart.c, r7-ecfile fills) */
-/* load_parts met `name` (ec_file_name): *out a part to list (or NULL to leave the file alone). Stub: a line naming the
- * file and TSDB_ERR_CORRUPT, which fails the open (load_parts never leaves a part out quietly): this build cannot read
- * an .ec part, and its rows must not vanish without a word. Whoever fills it keeps that refusal for a volume whose
- * META lacks requires=tier (r7-tier writes it before the first .ec name; an .ec name without it is damage). */
+/* ------------------------------------------------------------ the engine's calls into src/ecpart.c */
+/* load_parts met `name` (ec_file_name): *out the .ec part to list. A volume whose META lacks requires=tier (written
+ * before the first .ec name; an .ec name without it is damage), or both an .ec part and its source with no intent
+ * naming them, fail the open with a line (TSDB_ERR_CORRUPT): load_parts never leaves a part out quietly. */
 int ecpart_load(eng *db, const char *name, bool read_only, part **out);
-/* A follower's MANIFEST names an .ec part: what open_listed_part returns. Stub: TSDB_ERR_CORRUPT (what part_open_as
- * says of an .ec file today; the follower keeps its previous view). r7-tier: the follower stops with one line (D7). */
+/* A follower's MANIFEST names an .ec part: the follower stops with one line (tier_follower_ec, D7). */
 int ecpart_follower_open(eng *db, const char *name, part **out);
-/* part_index_intact of an .ec part. Stub: part_map_intact (a test-marked part's map is a whole part). */
+/* part_index_intact of an .ec part: its record's hash, and the source's header, index, tombstones and footer against
+ * the hash the open checked (a test-marked part: part_map_intact, its map is a whole part). */
 bool ec_index_intact(const part *p);
-/* cls_check_parts for an .ec part: the record's class check result (its granules are never decoded there; the index
- * checks still run). Stub: 0. */
+/* cls_check_parts for an .ec part: its granules are never decoded there, so the record's class check stands for them
+ * (the index checks still run): TSDB_ERR_CORRUPT with a line when it says FAILED, or, with partition classes on, did
+ * not run (a settle writes EC_CLS_PASSED); 0 otherwise. */
 int ec_cls_record(eng *db, const part *p);
 void ecpart_free(struct ecpart *e);
 
