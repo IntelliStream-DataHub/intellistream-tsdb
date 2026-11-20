@@ -58,6 +58,22 @@ typedef struct auth_conn {
  * gives); writable: admin ops may change USERS (not --read-only or --follow). 0, or a TSDB_ERR_* after a message. */
 int auth_init(const char *dir, bool enabled, bool writable, tsdb *db);
 bool auth_enabled(void);
+
+/* The cluster's users (S2-1; design-auth.md "The cluster store"): set before auth_init on a --cluster server, whose
+ * login then reads the metadata group's copy (set_watch) instead of USERS, which must not exist in its root; logins
+ * answer TSDB_ERR_UNAVAILABLE until caught_up() (the restart barrier), and the admin ops propose their change and
+ * answer once it committed. The functions are server/cluster.h's (pointers: test_auth links no cluster). */
+struct cluster_user_rec;
+struct cluster_laggard;
+typedef struct auth_group_ops {
+    void (*set_watch)(int (*fn)(void *arg, const struct cluster_user_rec *u, uint32_t n, uint64_t applied),
+                      void *arg);
+    int (*caught_up)(void);
+    int (*propose)(int op, const char *name, const void *blob, uint32_t len, uint64_t version, const char *actor,
+                   uint64_t actor_version, int wait_ms, uint64_t *index, uint32_t *uid, struct cluster_laggard *lag,
+                   uint32_t *nlag);
+} auth_group_ops;
+void auth_set_group(const auth_group_ops *ops);
 /* The reload thread: USERS on a one-second tick (A10), and what it changed reaches the connections. */
 int auth_start_reload(void);
 void auth_shutdown(void);
@@ -82,6 +98,12 @@ int auth_fresh(auth_conn *a);
 /* The op table's checks for a request (who, and the series at W_ID0, W_ID8 or W_NAME3): 0, TSDB_ERR_DENIED,
  * TSDB_ERR_INVALID (too short to hold its series), TSDB_ERR_AUTH (not logged in, or AUTH_* answered elsewhere). */
 int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len);
+/* auth_check in two halves, so that a request can be routed between them (a series on another node is answered there):
+ * auth_check_login (logged in, the op allowed to this user, the rights on a series named in the request) and
+ * auth_check_ids (the rights on the series id at W_ID0 / W_ID8, through its name in this node's volumes). Call
+ * auth_check_ids only after auth_check_login returned 0; auth_check is both. */
+int auth_check_login(auth_conn *a, uint8_t op, const uint8_t *p, size_t len);
+int auth_check_ids(auth_conn *a, uint8_t op, const uint8_t *p, size_t len);
 /* The rights on one id / every id of a request (all or nothing, A16): 0 or TSDB_ERR_DENIED. */
 int auth_id(auth_conn *a, tsdb_sid id, uint8_t need);
 int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need);

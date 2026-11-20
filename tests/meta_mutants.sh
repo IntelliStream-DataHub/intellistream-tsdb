@@ -11,7 +11,7 @@ if [ "${1:-}" = --part ]; then
 fi
 bin=$1
 shift
-muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 25 28 31 35 36 37 38} # 36 userstaleok, 37 uidfromproposer, 38 nousersbudget
+muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 25 28 31 35 36 37 38 39} # 36 userstaleok, 37 uidfromproposer, 38 nousersbudget, 39 noactorguard
 if [ -n "$part" ]; then
     k=${part%/*}
     n=${part#*/}

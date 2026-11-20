@@ -758,7 +758,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: lease-mutants copy-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: lease-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -828,10 +828,10 @@ META_SOAK_FIRST   ?= 1000
 $(B)/cvol_check.o: tests/cvol_check.c tests/cvol_check.h src/internal.h src/feed.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Itests -c -o $@ $<
 $(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h server/peerlink.h \
-    $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB) \
+    $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB) \
     $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
-	    $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(ZSTD_LIB) -lpthread -lm
+	    $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(ZSTD_LIB) -lpthread -lm
 meta-mutants: $(B)/test_meta_mut
 	tests/meta_mutants.sh $(B)/test_meta_mut
 # the replication driver's mutants (server/repld.c TSDB_REPLD_MUTANT): each must fail test_cluster replindet or
@@ -846,6 +846,9 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(or $(TMPDIR),/tmp)
+# the cluster login mutants (server/auth.c, tools/cluster-user-cli.c TSDB_AUTH_MUTANT; tests/auth_mutants.sh)
+auth-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/auth_mutants.sh $(or $(TMPDIR),/tmp)
 # the metadata copy's snapshot, TOPOLOGY, STATUS, MOVED and the acceptor's table (tests/copy_mutants.sh)
 copy-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/copy_mutants.sh $(or $(TMPDIR),/tmp)

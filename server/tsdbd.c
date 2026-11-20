@@ -4852,6 +4852,9 @@ int main(int argc, char **argv)
                 w ? "; set by the configuration file (--no-auth=false on the command line turns login back on)" : "");
     }
     g_reader_only = o.read_only || o.follow;
+    static const auth_group_ops group_users = {cluster_set_users_watch, cluster_users_caught_up, cluster_user_propose};
+    if (cluster_on) /* S2-1: the users are the metadata group's, never the root's USERS */
+        auth_set_group(&group_users);
     if (auth_init(dir, !no_auth, !o.read_only && !o.follow, db) != 0) {
         tn_stop();
         tsdb_close(db);

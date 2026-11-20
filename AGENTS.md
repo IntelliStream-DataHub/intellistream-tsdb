@@ -158,7 +158,7 @@ cgroup, so `nice` does not keep your work out of its way.
   (who may send it, where its series are, the rights it needs), which `handle()` consults before its switch, and
   the per-user rights maps. `server/users.c`: the USERS file, shared with `tools/users-cli.c` (`tsdb DIR user ...`,
   which edits it beside a running tsdbd). `client/tsdb_crypto.c`: SHA-256, HMAC, PBKDF2 and base64 for SCRAM, used
-  by tsdbd, the C client and the CLI. `docs/design-auth.md` is the design (decisions A1-A29).
+  by tsdbd, the C client and the CLI. `docs/design-auth.md` is the design (decisions A1-A33).
   `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate; its shared glue is `client/python-common`), `client/java`:
   the other clients, network only and Apache-2.0. The embedded bindings, which contain the engine and are AGPL-3.0:
@@ -485,6 +485,12 @@ cgroup, so `nice` does not keep your work out of its way.
   other append-only files (checksummed records, OFD write lock, torn tail cut, damage fails the open), and a failed
   write or fdatasync of it is fail-stop (tsdbd exits with status 1 before acknowledging): an acknowledged revoke
   must not come back after a power loss. `--no-auth` checks nothing and refuses the user admin ops.
+  On a `--cluster` server (design-auth.md §12, A30-A33) the users are the metadata group's: auth builds its snapshot
+  from the users watch (users.c's group store, no file), a root holding USERS is refused at start naming
+  `tsdb cluster user import`, logins answer UNAVAILABLE until `cluster_users_caught_up()`, the admin ops propose
+  through `cluster_user_propose` and answer once committed and back in the local copy (a failed proposal changes
+  nothing), and `tsdb DIR user` refuses a root marked `CLUSTER_USERS`. `test_cluster login|userimport|volrefuse`,
+  `make auth-mutants`.
 - **Storage outages** (ha.md 15, N1; `src/health.c`, `server/domains.h`, `src/revalidate.c`). A volume on NFS that is
   down must refuse fast while the other volumes go on, and come back without losing or resurrecting anything.
   `tsdb_health_*` (probe threads with `O_DIRECT`, no engine call) gives each domain UP, DEGRADED, DOWN, RECOVERING.
@@ -577,7 +583,9 @@ cgroup, so `nice` does not keep your work out of its way.
   `append_lock` is released (also when a durable record could not be added in memory). The `crashfs` lock in tests is innermost. The scheduler's mutex (`sched.c`) and a multi call's (`multi.c`) are leaves: never held while a job's
   `fn`, a query or the callback runs, nor while an engine lock is taken. A job's `fn` waits only for the items of its
   own nested jobs (a fork/join tree), never for a lock another job's worker may hold while waiting for helpers.
-  tsdbd's login (`server/auth.c`): `users_mu` (the USERS state; held across USERS's I/O and its OFD lock, so on NFS
+  tsdbd's login (`server/auth.c`): on a cluster server the cluster thread's `uw_mu` (`server/cluster.c`, held across
+  the users watch's call) comes first, and `cluster_user_propose` is never called under `users_mu` or `auth_mu`; then
+  `users_mu` (the USERS state; held across USERS's I/O and its OFD lock, so on NFS
   as long as a server is away) > `auth_mu` (the published snapshot of the users and the registry of logged-in
   users; never held across I/O) > `tn_mu` (`server/tenants.c`: the tenant list, its slots and the pending list; auth_mu takes
   it to find a user's tenant (`tn_slot_user`) and a failed login to count under one, and USERS's publish calls `tn_offer`

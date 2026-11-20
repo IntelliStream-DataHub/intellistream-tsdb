@@ -430,6 +430,12 @@ void meta_op_slot_home(struct meta_entry *e, uint32_t first, uint32_t count, uin
  * is shorter, or the name is empty). */
 void meta_op_user_put(struct meta_entry *e, const char *name, uint64_t version, const void *blob, uint32_t len);
 void meta_op_user_del(struct meta_entry *e, const char *name);
+/* The same with an actor guard (actor NULL or "": none): the op is STALE unless the user `actor` exists with exactly
+ * `actor_version`, so a change checked against an actor's rights on a lagging copy never outlives the actor's
+ * demotion or drop (a USER_DEL of a name that does not exist stays NOTFOUND). */
+void meta_op_user_put_as(struct meta_entry *e, const char *name, uint64_t version, const void *blob, uint32_t len,
+                         const char *actor, uint64_t actor_version);
+void meta_op_user_del_as(struct meta_entry *e, const char *name, const char *actor, uint64_t actor_version);
 const struct meta_user *meta_user(const struct meta_state *m, const char *name);
 uint64_t meta_users_bytes(const struct meta_state *m); /* what META_USERS_BYTES_MAX limits */
 void meta_op_volume_self(struct meta_entry *e, uint32_t number, uint32_t node, uint64_t new_epoch);

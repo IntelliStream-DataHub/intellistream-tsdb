@@ -1009,6 +1009,24 @@ static void test_users(void)
     CHECK(apply1(&back, &e, res, 8) == META_OK && res[0] == META_OK && !meta_user(&back, "zed") && back.max_uid == 5);
     meta_op_user_put(&e, "zed", 0, b7, 8);
     CHECK(apply1(&back, &e, res, 8) == META_OK && meta_user(&back, "zed")->uid == 6);
+    /* the actor guard (tsdbd's admin ops, checked on a copy that may lag): a change applies only while its actor has
+     * the version it was checked at, so a demotion or drop of the actor committed first wins (mutant noactorguard) */
+    {
+        uint64_t zv = meta_user(&back, "zed")->version;
+        meta_op_user_put_as(&e, "carl", 0, b7, 8, "zed", zv);        /* zed as checked: applies */
+        meta_op_user_put(&e, "zed", zv, "\0\0\0\0demoted", 11);      /* zed demoted */
+        meta_op_user_put_as(&e, "dora", 0, b7, 8, "zed", zv);        /* checked before the demotion */
+        meta_op_user_del_as(&e, "carl", "zed", zv);
+        meta_op_user_put_as(&e, "erin", 0, b7, 8, "nobody", zv);     /* an actor dropped */
+        meta_op_user_del_as(&e, "nosuch", "zed", zv);
+        CHECK(apply1(&back, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK &&
+              res[2] == META_ERR_STALE && res[3] == META_ERR_STALE && res[4] == META_ERR_STALE &&
+              res[5] == META_ERR_NOTFOUND);
+        CHECK(meta_user(&back, "carl") && !meta_user(&back, "dora") && !meta_user(&back, "erin"));
+        uint64_t z2 = meta_user(&back, "zed")->version;
+        meta_op_user_del_as(&e, "carl", "zed", z2);
+        CHECK(apply1(&back, &e, res, 8) == META_OK && res[0] == META_OK && !meta_user(&back, "carl"));
+    }
     free(big);
     meta_free(&back);
     meta_entry_free(&e);
