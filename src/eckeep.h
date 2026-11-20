@@ -12,11 +12,14 @@
  * and tries again): it never "matches" by reading around a position that is away. A match releases the file at its
  * deadline. A mismatch, an object that cannot be read whole, or a file of another length holds the file for good, logs
  * one line naming volume, partition, oid and both files, and sets db->diverged: the route() family of src/volumes.c then
- * answers TSDB_ERR_UNAVAILABLE for the volume until a restart (D5; the way out comes with R15). A settled_ file whose
+ * answers TSDB_ERR_UNAVAILABLE for the volume until a restart (D5; the way out comes with R15). An in-process reopen
+ * (tsdb_volume_reopen, tsdb_cvol_replace) is not a restart: the new engine inherits the flag. A settled_ file whose
  * .ec part is no longer listed (a drop took the key) has no object to compare with: its rows are gone from the volume
  * anyway, and it is released keep_s after it was found so.
  *
- * The digests run on one thread per engine (nice 19, throttled to eckeep_digest_mb_s of reads, both files counted),
+ * The object is read a whole number of stripes (k' cells) at a time, so no cell is read and checked twice and a damaged
+ * stripe is rebuilt once. The digests run on one thread per engine (nice 19, throttled to eckeep_digest_mb_s of reads,
+ * both files counted, per engine),
  * started by the first swap or the first graveyard purge after the open (never during load_parts, which lists parts
  * without db->lock) and stopped by eckeep_eng_stop, which eng_close and eng_halt call right after the merge threads
  * (the thread holds part references and takes db->lock). Its mutex is a leaf: never held across I/O or an engine lock.
@@ -51,9 +54,12 @@ int eckeep_status(eng *db, const char *name);
 int eckeep_test_wait(eng *db, const char *name, int64_t timeout_ms);
 /* tests: digests started since the open (each try counts, a store that was not UP included) */
 uint64_t eckeep_test_tries(eng *db);
+/* tests: whether the engine's digest thread was told to stop (eckeep_eng_stop): it never runs again */
+bool eckeep_test_stopped(eng *db);
 /* tests: while set the thread starts no digest */
 extern atomic_bool eckeep_test_pause;
-/* MB per second the digest reads (the object and the file together); 0: no limit. Set before engines open. */
+/* MB per second the digest reads (the object and the file together), per engine: n tiered volumes read up to n times
+ * this; 0: no limit. Set before engines open. */
 extern unsigned eckeep_digest_mb_s;
 
 /* planted bugs (tests/test_keep.c --mutant NAME; the Makefile requires each to fail it) */
@@ -63,6 +69,11 @@ enum {
     ECKEEP_MUT_DIGESTRAW,    /* digestraw: the object is read with CHUNK_RR_RAW (a bad cell's bytes are hashed) */
     ECKEEP_MUT_DIGESTNOHOLD, /* digestnohold: a diverged file is released at its deadline like a matched one */
     ECKEEP_MUT_KEEPMTIME,    /* keepmtime: the deadline counts from the settled_ file's mtime */
+    ECKEEP_MUT_NOOBJCMP,     /* noobjcmp: the object's xxh64 is not compared with the record's (only the file's is) */
+    ECKEEP_MUT_OPENWAIT,     /* openwait: an object that cannot be opened with every store UP waits, never DIVERGED */
+    ECKEEP_MUT_NOLENCHECK,   /* nolencheck: a settled_ file of another length is not refused (its first bytes hashed) */
+    ECKEEP_MUT_ORPHANNOW,    /* orphannow: an orphan is released at once, not keep_s after it was found */
+    ECKEEP_MUT_NOHALTSTOP,   /* nohaltstop: eng_halt leaves the digest thread running (src/db.c) */
 };
 extern int eckeep_mutant;
 #endif

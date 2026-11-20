@@ -307,7 +307,7 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
         return R_WAIT;
     }
     uint64_t len = ep->test_mark ? p->map_len : r->object_len;
-    if ((uint64_t)st.st_size != len) {
+    if ((uint64_t)st.st_size != len && eckeep_mutant != ECKEEP_MUT_NOLENCHECK) {
         close(fd);
         char why[96];
         snprintf(why, sizeof why, "the file has %" PRIu64 " bytes, the object %" PRIu64, (uint64_t)st.st_size, len);
@@ -325,7 +325,8 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
                  : chunk_geom_make(&g, r->k, r->m, r->cell_bytes, r->object_len);
         if (rc == 0)
             rc = chunk_obj_open(be, ep->volume, tier_vuuid(db), r->oid, &g, r->sums, &o);
-        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_IO) {
+        if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_IO ||
+            (rc && eckeep_mutant == ECKEEP_MUT_OPENWAIT)) {
             close(fd);
             return R_WAIT;
         }
@@ -336,7 +337,14 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
             return R_DIVERGED;
         }
     }
-    uint8_t *ob = malloc(DIGEST_PIECE), *fb = malloc(DIGEST_PIECE);
+    /* whole stripes per read: a cell that straddled two pieces would be read and checked twice, and a damaged stripe
+     * rebuilt for each piece that touches it */
+    size_t step = DIGEST_PIECE;
+    if (o) {
+        size_t stripe = (size_t)chunk_obj_geom(o)->k * chunk_obj_geom(o)->cell;
+        step = stripe >= DIGEST_PIECE ? stripe : DIGEST_PIECE / stripe * stripe;
+    }
+    uint8_t *ob = malloc(step), *fb = malloc(step);
     if (!ob || !fb)
         res = R_WAIT;
     xs ho, hf;
@@ -347,7 +355,7 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
     uint64_t done = 0;
     const char *why = NULL;
     for (uint64_t off = 0; res == R_MATCH && off < len;) {
-        size_t piece = len - off < DIGEST_PIECE ? (size_t)(len - off) : DIGEST_PIECE;
+        size_t piece = len - off < step ? (size_t)(len - off) : step;
         if (o) {
             chunk_report rep;
             memset(&rep, 0, sizeof rep);
@@ -396,7 +404,7 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
     if (res == R_MATCH) {
         uint64_t a = xs_digest(&ho), b = xs_digest(&hf), want = ep->test_mark ? xxh64(p->map, p->map_len, 0)
                                                                               : r->object_xxh64;
-        if (a != want || b != want) {
+        if ((a != want && eckeep_mutant != ECKEEP_MUT_NOOBJCMP) || b != want) {
             char w[160];
             snprintf(w, sizeof w, "xxh64 of the object %016" PRIx64 ", of the file %016" PRIx64 ", recorded %016" PRIx64,
                      a, b, want);
@@ -429,7 +437,7 @@ static int digest(eng *db, struct eckeep_eng *k, const char *name, int64_t *dead
         }
     pthread_mutex_unlock(&db->lock);
     if (!p) {
-        *deadline = eng_now_ms(db) + k->keep_ms;
+        *deadline = eckeep_mutant == ECKEEP_MUT_ORPHANNOW ? 0 : eng_now_ms(db) + k->keep_ms;
         return R_ORPHAN;
     }
     int res = digest_part(db, k, p, name, deadline);
@@ -634,6 +642,17 @@ uint64_t eckeep_test_tries(eng *db)
     uint64_t n = k->tries;
     pthread_mutex_unlock(&k->mu);
     return n;
+}
+
+bool eckeep_test_stopped(eng *db)
+{
+    struct eckeep_eng *k = keep_of(db);
+    if (!k)
+        return true;
+    pthread_mutex_lock(&k->mu);
+    bool s = k->stop;
+    pthread_mutex_unlock(&k->mu);
+    return s;
 }
 
 int eckeep_eng_open(eng *db)

@@ -404,7 +404,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_ecpart $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in ecnohash ecnowalseq ecskipname ecnofno ecnolayout; do ! ./$(B)/test_ecpart --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_keep $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in digestskip digestraw digestnohold keepmtime; do ! ./$(B)/test_keep --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),for m in digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop; do ! ./$(B)/test_keep --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_ecskip $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec; do ! ./$(B)/test_ecskip --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_tier $(or $(TMPDIR),/tmp)
@@ -1027,7 +1027,7 @@ $(B)/test_ecswap: tests/test_ecswap.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # settled sources (r7-keep, src/eckeep.c): the keep from the record's settle time, the digest, DIVERGED; mutants
-# digestskip digestraw digestnohold keepmtime must fail it
+# digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop must fail it
 $(B)/test_keep: tests/test_keep.c src/internal.h $(R7_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 

@@ -17,11 +17,18 @@
  *             files; the file kept past keep_s; queries and writes of the volume answer UNAVAILABLE; again after a
  *             reopen
  *   othersrc  an object whose record agrees with its chunks but whose bytes are not the source's: DIVERGED
+ *   badrec    chunks and sums of other bytes under the source's object_xxh64: only the object's hash tells: DIVERGED
+ *   gone      every chunk file of the object removed, every store UP: DIVERGED (never a wait)
+ *   long      the settled_ file longer than the object, its first bytes the source's: DIVERGED
+ *   reopen    a DIVERGED volume 1 through tsdb_volume_reopen (not a restart): still UNAVAILABLE, before the new
+ *             engine's digest ran, and after tsdb_volume_resume; also a packed insert over two volumes, a series made;
+ *             eng_halt stopped the old engine's digest thread before the new engine opened
  *   pending   a digest that has not run when the handle closes: after the reopen nothing is released before it ran
  *   down      a store DOWN: the digest waits and the file stays; back UP: it matches
- *   orphan    the key dropped before the digest: the file goes keep_s later
+ *   orphan    the key dropped before the digest: the file stays, and goes keep_s (an hour) later
  *
- * Usage: test_keep [--mutant digestskip|digestraw|digestnohold|keepmtime] [SCRATCH]. Without TSDB_EC it says it is
+ * Usage: test_keep [--mutant digestskip|digestraw|digestnohold|keepmtime|noobjcmp|openwait|nolencheck|orphannow|
+ * nohaltstop] [SCRATCH]. Without TSDB_EC it says it is
  * skipped.
  */
 #include "internal.h"
@@ -61,7 +68,7 @@ uint64_t eckeep_test_xxh64_pieces(const void *data, size_t len, size_t piece);
 static const int64_t DAY = 86400000, T0 = 1704067200000; /* 2024-01-01 */
 static char scratch[PATH_MAX];
 static char dbdir[PATH_MAX + 64], stores[NST][PATH_MAX + 64];
-static int64_t clock_off; /* added to the real clock: a reopen "a minute later" */
+static _Atomic int64_t clock_off; /* added to the real clock: a reopen "a minute later", keep_s passed */
 
 static int64_t test_clock(void *arg)
 {
@@ -77,6 +84,13 @@ static void rm_rf(const char *path)
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", path);
     if (system(cmd) != 0)
         fprintf(stderr, "rm -rf %s failed\n", path);
+}
+
+static bool exists_in(const char *dir, const char *name)
+{
+    char p[PATH_MAX * 2];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return access(p, F_OK) == 0;
 }
 
 static bool exists(const char *name)
@@ -103,7 +117,9 @@ static void fresh(const char *what)
 typedef struct {
     tsdb *t;
     eng *db;
-    uint32_t s;
+    uint32_t s;          /* the local id of series "s" in volume v */
+    uint32_t v;          /* the volume */
+    const char *path;    /* its path for tsdb_series_create (NULL: the root) */
 } h;
 
 static int h_open(h *x, int keep_s)
@@ -121,6 +137,8 @@ static int h_open(h *x, int keep_s)
     o.clock_ms = test_clock;
     x->t = NULL;
     x->db = NULL;
+    x->v = 0;
+    x->path = NULL;
     int rc = tsdb_open(dbdir, &o, &x->t);
     unsetenv("TSDB_TEST_TIER");
     unsetenv("TSDB_TEST_TIER_I_KNOW");
@@ -180,17 +198,22 @@ static int acc_fn(void *ctx, const int64_t *ts, const float *v, size_t n)
 static int read_all(h *x, acc *a)
 {
     memset(a, 0, sizeof *a);
-    return tsdb_query_raw(x->t, TSDB_SID(0, x->s), T0 - DAY, T0 + 2 * DAY, acc_fn, a);
+    return tsdb_query_raw(x->t, TSDB_SID(x->v, x->s), T0 - DAY, T0 + 2 * DAY, acc_fn, a);
 }
 
 typedef struct {
     char settled[256];
     ec_record rec;
+    uint32_t vol;
 } settled;
 
-/* A settle by hand (see the top) of the first listed .part with granules; alt (NULL: the part's bytes) are the bytes
- * the object is encoded from */
-static int settle_one(h *x, bool alt_bytes, settled *out)
+/* what settle_one encodes: the part's bytes; other bytes with a record that agrees with them; other bytes with the
+ * record (its object_xxh64) of the source, so that the chunks' sums agree with the object and only the object's hash
+ * compared with the record's can tell */
+enum { SRC_SAME, SRC_ALT, SRC_BADREC };
+
+/* A settle by hand (see the top) of the first listed .part with granules */
+static int settle_one(h *x, int how, settled *out)
 {
     eng *db = x->db;
     part *p = NULL;
@@ -206,7 +229,7 @@ static int settle_one(h *x, bool alt_bytes, settled *out)
         return TSDB_ERR_NOTFOUND;
     uint8_t *alt = NULL;
     const uint8_t *src = p->map;
-    if (alt_bytes) {
+    if (how != SRC_SAME) {
         alt = malloc(p->map_len);
         memcpy(alt, p->map, p->map_len);
         alt[p->map_len / 3] ^= 0x40; /* inside some granule: its record and sums agree with these bytes */
@@ -229,7 +252,7 @@ static int settle_one(h *x, bool alt_bytes, settled *out)
     r.m = (uint16_t)g.m;
     r.cell_bytes = g.cell;
     r.object_len = p->map_len;
-    r.object_xxh64 = xxh64(src, p->map_len, 0);
+    r.object_xxh64 = xxh64(how == SRC_BADREC ? p->map : src, p->map_len, 0);
     r.writer_epoch = 1;
     r.settle_ms = eng_now_ms(db);
     snprintf(r.source, sizeof r.source, "%s", p->name);
@@ -253,6 +276,7 @@ static int settle_one(h *x, bool alt_bytes, settled *out)
     }
     snprintf(out->settled, sizeof out->settled, "settled_%s", p->name);
     out->rec = r;
+    out->vol = db->tier_vol;
     part_unref(p);
     free(alt);
     return rc;
@@ -263,7 +287,7 @@ static void chunk_path(const settled *s, unsigned pos, char *out, size_t cap)
     char hex[33];
     chunk_oid_hex(s->rec.oid, hex);
     for (int i = 0; i < NST; i++) {
-        snprintf(out, cap, "%s/s0/o%s.%u.chunk", stores[i], hex, pos);
+        snprintf(out, cap, "%s/s%" PRIu32 "/o%s.%u.chunk", stores[i], s->vol, hex, pos);
         if (access(out, F_OK) == 0)
             return;
     }
@@ -348,7 +372,7 @@ static void case_match(void)
     acc a0, a1;
     CHECK(read_all(&x, &a0) == 0 && a0.n == 20000);
     settled s;
-    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(settle_one(&x, SRC_SAME, &s) == 0);
     CHECK(exists(s.settled));
     CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
     graveyard_purge(x.db, false);
@@ -371,7 +395,7 @@ static void case_restart(void)
     CHECK(h_open(&x, 86400) == 0);
     write_day(&x, 20000);
     settled s;
-    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(settle_one(&x, SRC_SAME, &s) == 0);
     CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
     h_close(&x);
     /* the source was written two days ago: a rename keeps that mtime */
@@ -403,7 +427,7 @@ static void case_damage1(void)
     CHECK(read_all(&x, &a0) == 0);
     atomic_store(&eckeep_test_pause, true);
     settled s;
-    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(settle_one(&x, SRC_SAME, &s) == 0);
     CHECK(flip(&s, 0) > 0); /* a data position: a RAW read would hash these bytes */
     atomic_store(&eckeep_test_pause, false);
     CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
@@ -419,22 +443,34 @@ static void diverged_checks(h *x, const settled *s, const char *log)
     chunk_oid_hex(s->rec.oid, hex);
     char ecname[160];
     snprintf(ecname, sizeof ecname, "%.*s.ec", (int)(strlen(s->settled) - 8 - 5), s->settled + 8);
+    char vp[48];
+    snprintf(vp, sizeof vp, "volume %" PRIu32 " partition", x->v);
     CHECK(strstr(log, "DIVERGED") && strstr(log, hex) && strstr(log, ecname) && strstr(log, s->settled) &&
-          strstr(log, "volume 0 partition"));
+          strstr(log, vp));
     CHECK(atomic_load(&x->db->diverged));
     acc a;
     CHECK(read_all(x, &a) == TSDB_ERR_UNAVAILABLE);
-    CHECK(tsdb_append(x->t, TSDB_SID(0, x->s), T0 + 5 * DAY, 1.0f) == TSDB_ERR_UNAVAILABLE);
+    CHECK(tsdb_append(x->t, TSDB_SID(x->v, x->s), T0 + 5 * DAY, 1.0f) == TSDB_ERR_UNAVAILABLE);
+    /* the other ways in: a packed insert of one volume (insert_slots), a series made in the volume (series_make) */
+    tsdb_sid two[2] = {TSDB_SID(x->v, x->s), TSDB_SID(x->v, x->s)};
+    int64_t tt[2] = {T0 + 5 * DAY, T0 + 5 * DAY + 1};
+    float vv[2] = {1, 2};
+    CHECK(tsdb_insert(x->t, two, tt, vv, 2) == TSDB_ERR_UNAVAILABLE);
+    tsdb_sid nid = 0;
+    CHECK(tsdb_series_create(x->t, "made_while_diverged", TSDB_FLOAT32, x->path, &nid) == TSDB_ERR_UNAVAILABLE);
     /* held for good: past keep_s (1 s) a purge leaves it */
     while (eng_now_ms(x->db) < s->rec.settle_ms + 1200)
         sleep_ms(50);
     graveyard_purge(x->db, false);
-    CHECK(exists(s->settled) && eckeep_status(x->db, s->settled) == ECKEEP_DIVERGED);
+    CHECK(exists_in(x->path ? x->path : dbdir, s->settled) && eckeep_status(x->db, s->settled) == ECKEEP_DIVERGED);
 }
 
-static void case_diverged(bool othersrc)
+enum { DV_DAMAGEALL, DV_OTHERSRC, DV_BADREC, DV_GONE, DV_LONG };
+static const char *const DV_NAME[] = {"damageall", "othersrc", "badrec", "gone", "long"};
+
+static void case_diverged(int mode)
 {
-    fresh(othersrc ? "othersrc" : "damageall");
+    fresh(DV_NAME[mode]);
     h x;
     CHECK(h_open(&x, 1) == 0);
     write_day(&x, 20000);
@@ -442,13 +478,26 @@ static void case_diverged(bool othersrc)
     CHECK(read_all(&x, &a0) == 0);
     atomic_store(&eckeep_test_pause, true);
     settled s;
-    CHECK(settle_one(&x, othersrc, &s) == 0);
-    if (!othersrc)
-        for (unsigned pos = 0; pos < (unsigned)s.rec.k + s.rec.m; pos++) /* the object's k' + m */
+    CHECK(settle_one(&x, mode == DV_OTHERSRC ? SRC_ALT : mode == DV_BADREC ? SRC_BADREC : SRC_SAME, &s) == 0);
+    unsigned npos = (unsigned)s.rec.k + s.rec.m; /* the object's k' + m */
+    if (mode == DV_DAMAGEALL)
+        for (unsigned pos = 0; pos < npos; pos++)
             CHECK(flip(&s, pos) > 0);
+    if (mode == DV_GONE) /* every store UP, no chunk of the object anywhere: NOTFOUND from the open, never a wait */
+        for (unsigned pos = 0; pos < npos; pos++) {
+            char cp[16384];
+            chunk_path(&s, pos, cp, sizeof cp);
+            CHECK(cp[0] && unlink(cp) == 0);
+        }
+    if (mode == DV_LONG) { /* the kept file longer than the object, its first object_len bytes the source's */
+        char fp[PATH_MAX * 2];
+        snprintf(fp, sizeof fp, "%s/%s", dbdir, s.settled);
+        CHECK(truncate(fp, (off_t)s.rec.object_len + 4096) == 0);
+    }
+    int64_t tmo = mode == DV_GONE ? 5000 : 20000; /* openwait leaves it PENDING: no need to wait long for that */
     cap_begin();
     atomic_store(&eckeep_test_pause, false);
-    int st = eckeep_test_wait(x.db, s.settled, 20000);
+    int st = eckeep_test_wait(x.db, s.settled, tmo);
     char *log = cap_end();
     CHECK(st == ECKEEP_DIVERGED);
     diverged_checks(&x, &s, log);
@@ -460,10 +509,88 @@ static void case_diverged(bool othersrc)
     acc a;
     CHECK(!atomic_load(&x.db->diverged) && read_all(&x, &a) != TSDB_ERR_UNAVAILABLE); /* not known yet */
     atomic_store(&eckeep_test_pause, false);
-    st = eckeep_test_wait(x.db, s.settled, 20000);
+    st = eckeep_test_wait(x.db, s.settled, tmo);
     log = cap_end();
     CHECK(st == ECKEEP_DIVERGED);
     diverged_checks(&x, &s, log);
+    h_close(&x);
+    free(s.rec.sums);
+}
+
+/* tsdb_volume_reopen (what tsdbd's dom_recover runs once a health domain is back) is not a restart: a volume 1 that a
+ * digest found DIVERGED stays refused by the new engine, with that engine's own digest not run yet (paused); the old
+ * engine's digest thread is stopped by eng_halt, before the new engine opens */
+static eng *reopen_old;
+static int reopen_hook_calls;
+static void reopen_hook(void *arg, int phase)
+{
+    (void)arg;
+    if (phase == 1) {
+        reopen_hook_calls++;
+        CHECK(eckeep_test_stopped(reopen_old));
+    }
+}
+
+static void case_reopen(void)
+{
+    fresh("reopen");
+    char vpath[PATH_MAX + 64];
+    snprintf(vpath, sizeof vpath, "%s/reopen.v1", scratch);
+    rm_rf(vpath);
+    h x;
+    CHECK(h_open(&x, 1) == 0);
+    uint32_t idx = 0;
+    CHECK(tsdb_volume_add(x.t, vpath, &idx) == 0 && idx == 1);
+    tsdb_sid sid = 0;
+    CHECK(tsdb_series_create(x.t, "s1", TSDB_FLOAT32, vpath, &sid) == 0 && TSDB_SID_VOLUME(sid) == 1);
+    h y = {.t = x.t, .db = tsdb_test_engine(x.t, 1), .s = TSDB_SID_LOCAL(sid), .v = 1, .path = vpath};
+    CHECK(y.db && y.db->tier && y.db->tier_vol == 1);
+    if (!y.db || !y.db->tier) {
+        h_close(&x);
+        return;
+    }
+    write_day(&y, 20000);
+    atomic_store(&eckeep_test_pause, true);
+    settled s;
+    CHECK(settle_one(&y, SRC_ALT, &s) == 0);
+    cap_begin();
+    atomic_store(&eckeep_test_pause, false);
+    int st = eckeep_test_wait(y.db, s.settled, 20000);
+    char *log = cap_end();
+    CHECK(st == ECKEEP_DIVERGED);
+    diverged_checks(&y, &s, log);
+    /* a packed insert over two volumes refuses the whole call; the root alone goes on */
+    tsdb_sid two[2] = {TSDB_SID(0, x.s), TSDB_SID(1, y.s)};
+    int64_t tt[2] = {T0 + 6 * DAY, T0 + 6 * DAY};
+    float vv[2] = {1, 2};
+    CHECK(tsdb_insert(x.t, two, tt, vv, 2) == TSDB_ERR_UNAVAILABLE);
+    CHECK(tsdb_append(x.t, TSDB_SID(0, x.s), T0 + 6 * DAY, 1.0f) == 0);
+
+    atomic_store(&eckeep_test_pause, true); /* the new engine's digest must not be what refuses it */
+    reopen_old = y.db;
+    reopen_hook_calls = 0;
+    tsdb_test_reopen_hook(reopen_hook, NULL);
+    CHECK(tsdb_volume_quiesce(x.t, 1) == 0);
+    CHECK(tsdb_volume_idle(x.t, 1, 5000) == 0);
+    tsdb_volume_report rep;
+    CHECK(tsdb_volume_reopen(x.t, 1, &rep) == 0);
+    tsdb_test_reopen_hook(NULL, NULL);
+    CHECK(reopen_hook_calls == 1);
+    y.db = tsdb_test_engine(x.t, 1);
+    CHECK(y.db && y.db != reopen_old);
+    CHECK(eckeep_status(y.db, s.settled) == ECKEEP_PENDING);
+    CHECK(atomic_load(&y.db->diverged));
+    acc a;
+    CHECK(read_all(&y, &a) == TSDB_ERR_UNAVAILABLE);
+    (void)tsdb_volume_resume(x.t, 1); /* accepts a reopen's loss, never a digest's mismatch */
+    CHECK(read_all(&y, &a) == TSDB_ERR_UNAVAILABLE);
+    CHECK(tsdb_append(x.t, TSDB_SID(1, y.s), T0 + 6 * DAY, 1.0f) == TSDB_ERR_UNAVAILABLE);
+    atomic_store(&eckeep_test_pause, false);
+    cap_begin();
+    st = eckeep_test_wait(y.db, s.settled, 20000);
+    (void)cap_end();
+    CHECK(st == ECKEEP_DIVERGED);
+    CHECK(exists_in(vpath, s.settled));
     h_close(&x);
     free(s.rec.sums);
 }
@@ -476,7 +603,7 @@ static void case_pending(void)
     write_day(&x, 20000);
     atomic_store(&eckeep_test_pause, true);
     settled s;
-    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(settle_one(&x, SRC_SAME, &s) == 0);
     h_close(&x);
     CHECK(exists(s.settled));
     CHECK(h_open(&x, 1) == 0);
@@ -507,7 +634,7 @@ static void case_down(void)
     write_day(&x, 20000);
     atomic_store(&eckeep_test_pause, true);
     settled s;
-    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(settle_one(&x, SRC_SAME, &s) == 0);
     h_close(&x);
     move_store(NST - 1, true);
     CHECK(h_open(&x, 1) == 0);
@@ -534,21 +661,22 @@ static void case_orphan(void)
 {
     fresh("orphan");
     h x;
-    CHECK(h_open(&x, 1) == 0);
+    CHECK(h_open(&x, 3600) == 0);
     write_day(&x, 20000);
     atomic_store(&eckeep_test_pause, true);
     settled s;
-    CHECK(settle_one(&x, false, &s) == 0);
+    CHECK(settle_one(&x, SRC_SAME, &s) == 0);
     CHECK(eng_drop_before(x.db, T0 + 2 * DAY) == 0);
-    int64_t found = eng_now_ms(x.db);
     atomic_store(&eckeep_test_pause, false);
     CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_ORPHAN);
     CHECK(!atomic_load(&x.db->diverged));
-    while (eng_now_ms(x.db) < found + 1200)
-        sleep_ms(50);
+    graveyard_purge(x.db, false); /* not before keep_s from when it was found so */
+    CHECK(exists(s.settled) && eckeep_status(x.db, s.settled) == ECKEEP_ORPHAN);
+    atomic_store(&clock_off, 3601000); /* an hour later */
     graveyard_purge(x.db, false);
     CHECK(!exists(s.settled));
     h_close(&x);
+    atomic_store(&clock_off, 0);
     free(s.rec.sums);
 }
 
@@ -558,7 +686,12 @@ static const struct {
 } MUTANTS[] = {{"digestskip", ECKEEP_MUT_DIGESTSKIP},
                {"digestraw", ECKEEP_MUT_DIGESTRAW},
                {"digestnohold", ECKEEP_MUT_DIGESTNOHOLD},
-               {"keepmtime", ECKEEP_MUT_KEEPMTIME}};
+               {"keepmtime", ECKEEP_MUT_KEEPMTIME},
+               {"noobjcmp", ECKEEP_MUT_NOOBJCMP},
+               {"openwait", ECKEEP_MUT_OPENWAIT},
+               {"nolencheck", ECKEEP_MUT_NOLENCHECK},
+               {"orphannow", ECKEEP_MUT_ORPHANNOW},
+               {"nohaltstop", ECKEEP_MUT_NOHALTSTOP}};
 #endif
 
 int main(int argc, char **argv)
@@ -595,8 +728,9 @@ int main(int argc, char **argv)
     case_match();
     case_restart();
     case_damage1();
-    case_diverged(false);
-    case_diverged(true);
+    for (int m = DV_DAMAGEALL; m <= DV_LONG; m++)
+        case_diverged(m);
+    case_reopen();
     case_pending();
     case_down();
     case_orphan();

@@ -1100,7 +1100,8 @@ void eng_halt(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     db->nmergers = 0;
-    eckeep_eng_stop(db); /* R7: the digest thread holds part references and takes db->lock */
+    if (eckeep_mutant != ECKEEP_MUT_NOHALTSTOP)
+        eckeep_eng_stop(db); /* R7: the digest thread holds part references and takes db->lock */
 }
 
 /* The names of `old` that `neu` also holds at the same index become `neu`'s: it frees its own copy and keeps the
