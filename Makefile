@@ -1257,13 +1257,13 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
 	out=$$($$j --mutant lost-write --seconds 12 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a lost write'; then \
 	        echo "jepsen-cluster-selftest: a write missing from the final state went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$($$j --mutant rep-lost-write --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	out=$$($$j --mutant rep-lost-write --seconds 30 --nemesis kill --workload kv 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "the leader's final read"; then \
 	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --mutant rep-lost-write --seconds 20 --nemesis midcommit --workload kv 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "kvr's last ISR" || ! echo "$$out" | grep -q '@n[0-9]*: durability'; then \
-	        echo "jepsen-cluster-selftest: an acknowledged write missing from a member of kvr's last ISR after the terminal point went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$($$j --mutant rep-half-batch --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "terminal crash point .*ended there" || ! echo "$$out" | grep -q "the leader's final read"; then \
+	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr after the terminal point and its failover went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant rep-half-batch --seconds 30 --nemesis kill --workload kv 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'half of a large write'; then \
 	        echo "jepsen-cluster-selftest: half of an acknowledged large write in a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-checker 2>&1); rc=$$?; \

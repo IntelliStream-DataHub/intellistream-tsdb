@@ -23,6 +23,9 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # (crash points: server/crashpt.h, TSDB_CRASH_AT=name[:n] -> _exit(99)) and power (crashfs), workloads meta
                           # and kv-local (a cluster volume of 1 replica per node); JEPSEN_SECONDS, JEPSEN_NEMESES, JEPSEN_SEED,
                           # JEPSEN_NODES, both IO backends; tests/jepsen/jepsen_cluster.c; make jepsen-cluster-selftest plants what it must catch (not part of jepsen-cluster)
+                          # (kv/classes: the nemeses aim at kvr's leader too, the clients follow its failovers; JEPSEN_TERMINAL=name
+                          # picks the run's terminal crash point, failover points included; JEPSEN_TRACE=1 stamps the nemesis's
+                          # actions and kvr's leader changes in ms and details the first stale reads)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
