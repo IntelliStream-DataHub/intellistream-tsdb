@@ -913,6 +913,9 @@ static int admin_real(int i, int op, const void *req, size_t rl, int follow, int
 /* ------------------------------------------------------------------ the cluster and what must hold after a heal */
 
 #define SETTLE_MS 60000
+/* classes runs: the keep caps' age (repl_retain_s) and the longest quiet tail that waits for a first switch */
+#define CLASSES_RETAIN_S 30
+#define CLASSES_TAIL_MS (CLASSES_RETAIN_S * 1000 + 60000)
 
 /* Every node up and answering, one leader that every core node names, every member UP, the same metadata. A node
  * stuck in a state nobody leaves is what this is for. Returns 0, or -1 with `why` naming what is not yet so. */
@@ -1556,6 +1559,21 @@ static void rep_setup(void)
  * answered. The leader commits on the union of the ISR in force and one it asked for (src/repl.c), and a member joins
  * only once its log reaches the commit point, so every member of the last ISR holds every write the leader
  * acknowledged; a replica outside it was not needed for the acknowledgements since it left. */
+/* The largest CLASSES on kvr's replicas, -1 when none has one: 24-byte records, the filler's first class and then one
+ * per switch, so 48 or more is a switch. */
+static long long classes_most(void)
+{
+    long long most = -1;
+    for (int r = 0; r < 3; r++) {
+        struct stat cs;
+        char cl[PATH_MAX + 48];
+        snprintf(cl, sizeof cl, "%s/CLASSES", rep_dir[r]);
+        if (stat(cl, &cs) == 0 && (long long)cs.st_size > most)
+            most = (long long)cs.st_size;
+    }
+    return most;
+}
+
 static int rep_isr_mask(uint64_t *ver)
 {
     int mask = -1;
@@ -2457,6 +2475,10 @@ static void nem_midcommit(void)
 static void nem_terminal(void)
 {
     int L = atomic_load(&kv_leader), fo = cps[term_cp].leader == 2, win = cps[term_cp].window_ms;
+    /* a leader promoted shortly before decides no switch until the members' log start passes its attach, up to
+     * CLASSES_RETAIN_S later (CLS_DEFER; r3e-fix16: 2 of 13 runs fired 28 and 34 s after the trigger) */
+    if (want_classes && !strcmp(cps[term_cp].name, "class-switch"))
+        win += CLASSES_RETAIN_S * 1000;
     if (fo) {
         /* a failover needs another ISR member to promote: a leader that is the ISR alone (the others not yet back
          * after the faults before) is only cut, and the point never fires (seed 12103 epoll) */
@@ -2673,6 +2695,16 @@ static int cluster_form(void)
     S.node_timeout_ms = 1500;
     S.heartbeat_ms = 200;
     S.lease_s = 4;
+    /* classes: a promoted writer decides no class switch while a member's log may still replay below its attach
+     * (CLS_DEFER, design-cluster.md 8.3: the replay floor is the members' log start, which the keep caps hold up to
+     * repl_retain_s back); with the default 30 min every failover ended the switches for the rest of the run. 30 s
+     * lets the floor pass the attach about 31 s after a promotion (flushes every 500 ms); under kill and power a new
+     * epoch comes every 5 to 14 s, so those runs switch in the quiet tail after the last heal (classes_tail, up to
+     * CLASSES_TAIL_MS). Shorter caps strand a member that fell further behind than them: it needs a snapshot, which
+     * is not built yet (r3e-fix14: 3 s left a learner behind in 4 of 13 runs, a partition-only run among them;
+     * r3e-fix15: 10 s in 2 of 13, a learner killed again and again while it caught up). */
+    if (want_classes)
+        S.repl_retain_s = CLASSES_RETAIN_S;
     uint8_t req[64];
     size_t rl = cluster_settings_encode(&S, META_MODE_REPLICATED, req);
     int rc = admin_real(0, CLUSTER_OP_INIT, req, rl, 0, 10000);
@@ -3004,7 +3036,7 @@ int main(int argc, char **argv)
     int64_t t_start = now_ms(), t_end = t_start + (int64_t)seconds * 1000;
     int takeover = !strncmp(mutant, "takeover", 8);
     unsigned rounds = 0, applied = 0;
-    while (now_ms() < t_end && (nk || takeover)) {
+    while (now_ms() < t_end) { /* --nemesis none: the workloads run their seconds without faults */
         check_unexpected_exits();
         if (takeover && !takeover_done && now_ms() - t_start > (int64_t)seconds * 1000 / 3) {
             takeover_event();
@@ -3060,6 +3092,19 @@ int main(int argc, char **argv)
             restart_node(i);
     }
     settle("the last heal");
+    /* classes_tail: under kill and power the writer changed too often for its switches to come out of CLS_DEFER, so a
+     * run that has made none yet goes on without faults (the writers still running) until one is in a CLASSES; the
+     * check at the end fails a run of 30 s or more that has none even then */
+    if (want_classes && seconds >= 30 && classes_most() < 2 * 24 &&
+        !(term_fired && !strcmp(cps[term_cp].name, "class-switch"))) {
+        int64_t t0 = now_ms();
+        while (classes_most() < 2 * 24 && now_ms() - t0 < CLASSES_TAIL_MS) {
+            check_unexpected_exits();
+            usleep(200000);
+        }
+        printf("jepsen-cluster: classes: %s %lld ms into the quiet tail after the last heal\n",
+               classes_most() < 2 * 24 ? "still no switch" : "the first switch", (long long)(now_ms() - t0));
+    }
     int viol = 0;
     uint64_t indet_applied = 0, nreads = 0, nwrites = 0;
     if (want_kv || want_rep) {
@@ -3189,6 +3234,17 @@ int main(int argc, char **argv)
         fprintf(stderr, "jepsen-cluster: FAIL: the workload did nothing: %" PRIu64 " writes acknowledged, %" PRIu64
                 " reads\n", (uint64_t)atomic_load(&kv_ok), nreads);
         rc = 1;
+    }
+    /* a classes run whose series never switched checked no CLASS marker; a terminal crash point that fired inside a
+     * switch counts as one (its record may never have reached CLASSES) */
+    if (want_classes && seconds >= 30 && !(term_fired && !strcmp(cps[term_cp].name, "class-switch"))) {
+        long long most = classes_most();
+        if (most < 2 * 24) { /* 24-byte records: the filler's first class, then one per switch */
+            fprintf(stderr, "jepsen-cluster: FAIL: the classes workload made no class switch, not even in %d s without "
+                            "faults after the last heal (CLASSES %lld bytes at most on kvr's replicas)\n",
+                    CLASSES_TAIL_MS / 1000, most);
+            rc = 1;
+        }
     }
     unsigned expect = (unsigned)(seconds / 10 > 0 ? seconds / 10 : 1); /* a round is 3 to 8 s */
     if (nk && !takeover && total_faults < expect) {
