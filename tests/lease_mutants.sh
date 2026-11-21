@@ -9,16 +9,19 @@
 # after node_timeout, so a restarted volume leader's RESIGN waits for detection) resign, cutshrinks (a leader cut from
 # its replicas on the data links shrinks the ISR to itself instead of stepping aside) cut, probelate (a core restarted
 # at another peer address learns the others' addresses only after NOLEADER_PROBE_NS, 10 s) resign, leasestale (a node
-# that reports itself the writer of a volume another leads still gets a lease) leasestale.
+# that reports itself the writer of a volume another leads still gets a lease) leasestale, fencelease (an old leader
+# whose fence answer a promotion waits for keeps its lease: no promotion) and oldpass (a promotion without the old
+# leader's answer or the end of its lease: it answers reads after the new leader's first write) and movegiveup (a move
+# with a replica's answer gives up waiting for the old leader's lease: the ISR shrinks to it, no new leader) oneway.
 # Usage: tests/lease_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb).
 set -u
 dir=${1:-/tmp}; shift || true
-muts=${*:-leaseanyvoter nodrift stampignored nocoreclock noquorum nopromotewait shrinknocond upwaits cutshrinks probelate leasestale deposedstuck}
+muts=${*:-leaseanyvoter nodrift stampignored nocoreclock noquorum nopromotewait shrinknocond upwaits cutshrinks probelate leasestale deposedstuck fencelease oldpass movegiveup}
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
 survived=
 for m in $muts; do
-    case $m in stampignored) s=hungloop ;; noquorum) s=leasequorum ;; nopromotewait) s=leasedown ;; shrinknocond) s=isr ;; upwaits|probelate) s=resign ;; cutshrinks) s=cut ;; leasestale) s=leasestale ;; deposedstuck) s=cutstuck ;; *) s=lease ;; esac
+    case $m in stampignored) s=hungloop ;; noquorum) s=leasequorum ;; nopromotewait) s=leasedown ;; shrinknocond) s=isr ;; upwaits|probelate) s=resign ;; cutshrinks) s=cut ;; leasestale) s=leasestale ;; deposedstuck) s=cutstuck ;; fencelease|oldpass|movegiveup) s=oneway ;; *) s=lease ;; esac
     if ! TSDB_CLUSTER_MUTANT=$m timeout 600 ./build/test_cluster "$dir" $s > "$dir/mut-$m-$s.log" 2>&1; then
         echo "mutant $m: caught by $s ($(grep -m1 FAIL "$dir/mut-$m-$s.log"))"
     else

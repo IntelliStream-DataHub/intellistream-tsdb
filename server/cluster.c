@@ -1057,6 +1057,11 @@ static struct {
     int isr_replay;      /* TSDB_CLUSTER_TEST isr_replay=1: every ISR request proposed once is proposed again, with its
                           * old basis, after the record moved past it (a late duplicate: the apply must refuse it) */
     char holdisrfile[1100];
+    int drop_fence;      /* TSDB_CLUSTER_TEST drop_fence_file=1: while <state-dir>/dropfence is, a FENCE received is dropped
+                          * and a volume led here is passed on as led here whatever epoch the record moves to (test_cluster
+                          * oneway: an old leader that hears nothing of its deposition, but still heartbeats and gets
+                          * leases) */
+    char dropfencefile[1100];
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1288,6 +1293,8 @@ static void test_knobs(void)
             C.hold_opens = v != 0;
         else if (sscanf(p, "hold_isr_file=%llu", &v) == 1)
             C.hold_isr = v != 0;
+        else if (sscanf(p, "drop_fence_file=%llu", &v) == 1)
+            C.drop_fence = v != 0;
         else if (sscanf(p, "isr_replay=%llu", &v) == 1)
             C.isr_replay = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
@@ -1558,7 +1565,11 @@ enum cl_mutant {
     CLM_CUTSHRINKS = 10,  /* a leader cut from its replicas shrinks the ISR to itself instead of stepping aside */
     CLM_PROBELATE = 11,   /* a core restarted from its files watches only after NOLEADER_PROBE_NS without a leader */
     CLM_PROBEINIT = 12,   /* a watched state below the core's own log end (the INIT entry replayed) may drop the core */
-    CLM_DEPOSEDSTUCK = 13 /* a record's leader deposed by a fence no promotion followed is never taken as resigned */
+    CLM_DEPOSEDSTUCK = 13, /* a record's leader deposed by a fence no promotion followed is never taken as resigned */
+    CLM_FENCELEASE = 14,   /* an old leader whose fence answer a promotion waits for still gets leases (review R1) */
+    CLM_OLDPASS = 15,      /* a promotion goes ahead without the old leader's fence answer or the end of its lease (R3) */
+    CLM_MOVEGIVEUP = 16    /* a move gives up at PROMO_MOVE_NS, and any promotion at PROMO_GIVEUP_NS, though a replica
+                            * answered and only the old leader's lease is awaited */
 };
 static int cl_mutant(void)
 {
@@ -1580,6 +1591,9 @@ static int cl_mutant(void)
             : !strcmp(e, "probelate")     ? CLM_PROBELATE
             : !strcmp(e, "probeinit")     ? CLM_PROBEINIT
             : !strcmp(e, "deposedstuck")  ? CLM_DEPOSEDSTUCK
+            : !strcmp(e, "fencelease")    ? CLM_FENCELEASE
+            : !strcmp(e, "oldpass")       ? CLM_OLDPASS
+            : !strcmp(e, "movegiveup")    ? CLM_MOVEGIVEUP
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -4315,9 +4329,14 @@ static void vol_watch_duty(void)
     if (!me || me->incarnation != C.incarnation)
         return;
     g_vwatch_applied = C.sm.applied;
-    static struct cluster_vol_rec recs[CLUSTER_REPORT_VOLS];
-    static uint32_t said_over;
+    static struct cluster_vol_rec recs[CLUSTER_REPORT_VOLS], prev[CLUSTER_REPORT_VOLS];
+    static uint32_t said_over, nprev, nlast;
     uint32_t n = 0, over = 0;
+    int hold = C.drop_fence && access(C.dropfencefile, F_OK) == 0, held = 0;
+    if (hold) {
+        memcpy(prev, recs, nlast * sizeof *recs);
+        nprev = nlast;
+    }
     for (uint32_t i = 0; i < C.sm.nvolumes; i++) {
         const struct meta_volume *v = &C.sm.volumes[i];
         if (v->kind != META_VOL_REPLICATED)
@@ -4366,9 +4385,17 @@ static void vol_watch_duty(void)
             r->repl_retain_mb = C.sm.set.repl_retain_mb;
             r->repl_retain_s = C.sm.set.repl_retain_s;
             r->idle_seal_ms = C.sm.set.idle_seal_ms;
+            for (uint32_t j = 0; hold && j < nprev; j++) /* drop_fence_file: a volume this server led stays so here */
+                if (prev[j].number == r->number && prev[j].leader == C.id && r->epoch > prev[j].epoch) {
+                    *r = prev[j];
+                    held = 1;
+                }
             break;
         }
     }
+    if (held)
+        g_vwatch_applied = 0; /* pushed again every round until the file goes */
+    nlast = n;
     if (over > said_over) /* the heartbeat's report has room for this many: the rest are never made or opened here */
         say("holds replicas of %" PRIu32 " volumes more than the %d this server makes, opens and reports; those past"
             " volume %" PRIu32 " are not opened", over, CLUSTER_REPORT_VOLS, recs[n - 1].number);
@@ -4554,7 +4581,10 @@ static void propose_isr(uint64_t now)
  * here and its heartbeat says it cannot reach the leader on the data links (a cut, not a slow disk). The Raft leader
  * then holds the shrink and promotes as above, the old leader's own answer not a candidate (its tail past the replicas'
  * was never committed), and the old leader not passed by until it answered or its lease ran out. A move that finds no
- * candidate within PROMO_MOVE_NS gives up for that basis, and the shrink goes ahead. A member reports a peer
+ * candidate within PROMO_MOVE_NS gives up for that basis, and the shrink goes ahead; one a candidate answered waits for
+ * the old leader's answer or the end of its lease, past PROMO_GIVEUP_NS if need be (on_hb grants it none meanwhile:
+ * dropped and started again, the promotion would let it renew its lease in between and wait for that one, test_cluster
+ * oneway). A member reports a peer
  * unreachable only after a second (cvol.c UNREACH_MS), about when its leader asks to drop it, so a shrink below 2 that
  * would drop a member heard here waits up to CUT_HOLD_NS for that report: a slow disk's shrink to one copy costs that. */
 #define PROMO_RESEND_NS (100 * MS)
@@ -4683,6 +4713,8 @@ static void on_fence(struct conn *c, struct rd *r)
         c->dead = 1;
         return;
     }
+    if (C.drop_fence && access(C.dropfencefile, F_OK) == 0)
+        return;
     if (g_fence_fn)
         g_fence_fn(g_fence_arg, vol, fence, c->id);
 }
@@ -4700,7 +4732,7 @@ static int promo_holds_lease(uint32_t node)
         if (v && v->kind == META_VOL_REPLICATED && v->leader != node && cl_mutant() != CLM_LEASESTALE)
             return 1;
     }
-    for (size_t i = 0; i < g_npromo; i++) {
+    for (size_t i = 0; i < g_npromo && cl_mutant() != CLM_FENCELEASE; i++) {
         const struct promo *p = &g_promo[i];
         if (p->old != node || p->reason == META_GR_FENCED)
             continue;
@@ -4784,7 +4816,7 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
             old_ok = 1;
     }
     const struct meta_member *om = meta_member(&C.sm, p->old);
-    if (!old_ok && (!om || om->state != META_UP || now >= promote_safe_ns(p->old)))
+    if (!old_ok && (!om || om->state != META_UP || now >= promote_safe_ns(p->old) || cl_mutant() == CLM_OLDPASS))
         old_ok = 1;
     if (!nrep) {
         if (!p->said && since(now, p->t0) >= PROMO_WAIT_NS && p->reason != META_GR_PLANNED) {
@@ -4841,6 +4873,16 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
                 best >= v->isr_commit ? "it holds every write acknowledged before that shrink"
                                       : "writes acknowledged before that shrink are lost");
     return 1;
+}
+
+/* a member other than the old leader answered the fence: the promotion has someone to name and may be waiting only for
+ * the old leader's answer or the end of its lease */
+static int promo_candidate(const struct promo *p)
+{
+    for (uint32_t i = 0; i < p->nfenced; i++)
+        if (p->replied[i] && p->fenced[i] != p->old)
+            return 1;
+    return 0;
 }
 
 static int vol_reports_fault(uint32_t node, const struct meta_volume *v)
@@ -4969,7 +5011,8 @@ static void promote_duty(uint64_t now)
         const struct promo *p = &g_promo[i];
         const struct meta_volume *v = meta_volume(&C.sm, p->vol);
         int moved = !v || v->epoch != p->epoch || v->isr_version != p->version;
-        if (!moved && p->reason == META_GR_PLANNED && !p->proposed_ns && since(now, p->t0) >= PROMO_MOVE_NS) {
+        int cand = cl_mutant() != CLM_MOVEGIVEUP && promo_candidate(p);
+        if (!moved && p->reason == META_GR_PLANNED && !p->proposed_ns && !cand && since(now, p->t0) >= PROMO_MOVE_NS) {
             say("volume %" PRIu32 ": no replica to move the leadership of epoch %" PRIu64 " to; the ISR shrinks",
                 p->vol, p->epoch);
             if (g_ncutfail == sizeof g_cutfail / sizeof g_cutfail[0])
@@ -4977,7 +5020,8 @@ static void promote_duty(uint64_t now)
             g_cutfail[g_ncutfail++] = (__typeof__(g_cutfail[0])){p->vol, p->epoch, p->version};
             continue;
         }
-        if (!moved && since(now, p->t0) < PROMO_GIVEUP_NS)
+        if (!moved && (since(now, p->t0) < PROMO_GIVEUP_NS ||
+                       (cand && !p->proposed_ns && now < promote_safe_ns(p->old) + PROMO_GIVEUP_NS)))
             g_promo[k++] = *p;
     }
     g_npromo = k;
@@ -5334,6 +5378,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.stallfile, sizeof C.stallfile, "%s/stall", C.metadir);
     snprintf(C.holdopensfile, sizeof C.holdopensfile, "%s/holdopens", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
+    snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     meta_init(&C.sm);

@@ -7002,6 +7002,166 @@ static void cut_file(int at, int from, int on)
     }
 }
 
+/* oneway (review F6): the case the fence-then-promote wait exists for. The volume leader L (not the Raft leader R) is
+ * cut from its replicas on the data links (TSDB_REPLD_TEST=cutlinks), drops every FENCE it receives and hears no
+ * volume record (TSDB_CLUSTER_TEST drop_fence_file=1), while its heartbeats still reach R: it stays UP, holds a lease
+ * and answers its clients. R moves the volume (the replicas report losing L) and may name the new leader only once L
+ * answered the fence or L's last lease has ended, and gives L no lease meanwhile; the move does not give up at
+ * PROMO_MOVE_NS while a replica answered (it did, and the ISR shrank to L alone with no new leader). A reader on L logs every read; once the new leader
+ * acknowledged its first write, no read sent to L after that ack may be answered (a stale read: L does not have the
+ * row). Mutants: fencelease (L keeps its lease: no promotion within 30 s), oldpass (the promotion goes ahead at once: L
+ * answers reads after the ack). */
+struct ow_read {
+    uint64_t sent;
+    int rc, kind, rows;
+};
+struct ow_reader {
+    int server;
+    tsdb_sid id;
+    struct ow_read *log;
+    size_t n, cap;
+    int stop; /* __atomic */
+};
+static void *ow_reader_thread(void *a)
+{
+    struct ow_reader *r = a;
+    tsdbc *c = client(r->server);
+    for (int k = 0; r->n < r->cap && !__atomic_load_n(&r->stop, __ATOMIC_RELAXED); k++) {
+        struct ow_read *e = &r->log[r->n];
+        e->kind = k % 3;
+        e->sent = now_ms();
+        e->rc = lease_read(c, r->id, e->kind, &e->rows);
+        r->n++;
+        usleep(200);
+    }
+    tsdbc_close(c);
+    return NULL;
+}
+
+static void scen_oneway(void)
+{
+    scenario("oneway");
+    strict_reads = 1; /* every read on the leader (D5): a replica's reads are not the question here */
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks";
+        envs[i] = "drop_fence_file=1";
+    }
+    lease_cluster(3, 5000, 200000, 3000); /* L's lease runs 4 s past its last grant; R waits 6 s */
+    int L = -1, rc;
+    uint32_t num = 0;
+    char name[16];
+    struct meta_volume v;
+    for (int k = 0; k < 8 && L < 0; k++) {
+        snprintf(name, sizeof name, "ow%d", k);
+        if ((rc = vol_add(0, name, 3, &num)) != 0)
+            die("volume add %s: %s", name, cluster_strerror(rc));
+        if (!vol_rec(0, name, &v))
+            die("no record of %s", name);
+        int s = server_of(v.leader);
+        if (s >= 1 && s <= 2)
+            L = s;
+    }
+    if (L < 0)
+        die("eight volumes, every one led by the Raft leader");
+    for (int i = 0; i < 3; i++) /* every server opened it: a series made before L knows the volume is NOTFOUND */
+        await_open_gen(0, name, i, 1, 0);
+    uint64_t e0 = v.epoch;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], name, 30000);
+    int acked = 0;
+    for (; acked < 20; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(L, name, 3, 30000, "every replica in the ISR before the cut");
+    struct ow_reader rd = {.server = L, .id = id, .cap = 1u << 20};
+    if (!(rd.log = calloc(rd.cap, sizeof *rd.log)))
+        die("out of memory");
+    pthread_t th;
+    if (pthread_create(&th, NULL, ow_reader_thread, &rd) != 0)
+        die("pthread_create");
+    char df[PATH_MAX + 64];
+    server_dir(L, df, sizeof df);
+    strcat(df, "/state/dropfence");
+    FILE *fp = fopen(df, "w");
+    if (!fp)
+        die("create %s: %s", df, strerror(errno));
+    fclose(fp);
+    uint64_t t0 = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    int Nw = await_promoted(0, name, old, e0, &v);
+    uint64_t tp = now_ms();
+    if (Nw == L || Nw < 0 || Nw > 2)
+        die("the record of %s after the cut names node %u at epoch %" PRIu64, name, v.leader, v.epoch);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    tsdbc *cn = client(Nw);
+    tsdbc_set_retry(cn, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(cn, id, &ts, &val, 1)) != 0)
+        die("the first write to the leader at epoch %" PRIu64 " (server %d): %s", v.epoch, Nw, ers(rc));
+    uint64_t tack = now_ms();
+    tsdbc_close(cn);
+    usleep(2000000); /* reads on L go on past the ack */
+    __atomic_store_n(&rd.stop, 1, __ATOMIC_RELAXED);
+    pthread_join(th, NULL);
+    size_t after = 0, answered = 0;
+    uint64_t last_ok = 0;
+    for (size_t i = 0; i < rd.n; i++) {
+        const struct ow_read *e = &rd.log[i];
+        if (e->rc == 0) {
+            answered++;
+            last_ok = e->sent;
+            int want = e->kind == 1 ? 1 : acked;
+            if (e->rows != want)
+                die("a read on the old leader (kind %d) %" PRIu64 " ms after the cut answered %d rows, not %d", e->kind,
+                    e->sent - t0, e->rows, want);
+        } else if (e->rc != TSDB_ERR_UNAVAILABLE && e->rc != TSDB_ERR_MOVED) {
+            die("a read on the old leader %" PRIu64 " ms after the cut: %s", e->sent - t0, ers(e->rc));
+        }
+        if (e->sent > tack) {
+            after++;
+            if (e->rc == 0)
+                die("a read sent to the old leader %" PRIu64 " ms after the new leader's first acknowledged write was "
+                    "answered (%" PRIu64 " ms after the cut, promotion seen at %" PRIu64 " ms): a stale read",
+                    e->sent - tack, e->sent - t0, tp - t0);
+        }
+    }
+    if (!after || !answered)
+        die("%zu reads on the old leader after the ack, %zu answered in all (%zu reads): the test saw nothing", after,
+            answered, rd.n);
+    free(rd.log);
+    unlink(df); /* L hears the record again: a write is MOVED */
+    tsdbc *co = client(L);
+    insert_expect_moved(co, id, 9500000, 1, (uint16_t)num, v.leader, v.epoch, "a write to the old leader");
+    tsdbc_close(co);
+    printf("  leader %d cut from its replicas, fences dropped, heartbeats whole: server %d leads epoch %" PRIu64
+           " %" PRIu64 " ms after the cut; %zu reads on %d, the last answered at %" PRIu64 " ms, none of %zu after the "
+           "new leader's first ack (%" PRIu64 " ms)\n", L, Nw, v.epoch, tp - t0, rd.n, L, last_ok - t0, after,
+           tack - t0);
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    int got = rows_in(Nw, id, 1000000, 9000001, 30000);
+    if (got != acked + 1)
+        die("the leader at epoch %" PRIu64 " (server %d) holds %d rows, %d were acknowledged", v.epoch, Nw, got,
+            acked + 1);
+    await_isr(Nw, name, 3, 60000, "every server in the ISR once the links are back");
+    stop_all();
+}
+
 /* A leader cut from its replicas on the data links (TSDB_REPLD_TEST=cutlinks; the peer port, heartbeats and the Raft
  * group stay whole) asks to shrink the ISR to itself; the Raft leader, which hears the replicas and reads in their
  * heartbeats that they lost the leader, moves the leadership to one of them instead (design-cluster.md 6.1): no ISR of
@@ -7438,7 +7598,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"oneway", scen_oneway}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
