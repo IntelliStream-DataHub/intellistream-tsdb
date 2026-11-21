@@ -39,7 +39,7 @@ mkdir -p "$dir" || exit 1
 # mutant, its scenario, an extended regular expression its FAIL line must match
 table=(
     "commitbyleader|replindet|a write with both replicas paused was answered"
-    "floornotsaved|replicate|the replica restarted under writes refused its log: the log starts above the commit floor"
+    "floornotsaved|repcheck|restarted after its flushed segments went refused its log: the log starts above the commit floor"
     "ackbeforesync|ackdurable|after a power loss replica [0-9]+ holds [0-9]+ rows"
     "nodepose|writerdepose|the writer was not deposed"
     "noquiesce|writerfail|of the failed volume: .*not (UNAVAILABLE|MOVED)"

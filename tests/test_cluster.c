@@ -263,7 +263,6 @@ static int log_has(int i, const char *needle)
 
 static uint32_t isr_of(int via, const char *name, uint64_t *version);
 static void await_isr(int via, const char *name, uint32_t n, int ms, const char *what);
-static uint64_t wal_lowest(int i, uint32_t num);
 
 /* stops every live server (SIGTERM, status 0) and starts a new scenario in its own directory */
 static void stop_all(void)
@@ -3151,15 +3150,6 @@ static void scen_replicate(void)
     /* a replica killed while the leader takes writes: restarted, it catches up from the leader's log (a restart of
      * every server would come back on new peer ports, which the metadata group does not know) */
     int R = (L + 1) % 3;
-    /* R has removed a segment of its own (its floor passed a flushed one) before it dies: the floor that allowed it
-     * must be in R's REPL by then, or R's log starts above the floor it reads back (floornotsaved, caught only when
-     * R's flush and floor had moved by this point: once in four runs they had not) */
-    for (uint64_t t1 = now_ms(); wal_lowest(R, 1) <= 1 && now_ms() - t1 < 20000;) {
-        struct timespec ms = {0, 50000000};
-        nanosleep(&ms, NULL);
-    }
-    if (wal_lowest(R, 1) <= 1)
-        die("replica %d removed none of its WAL segments in 20 s (a flush every 5 s, the floor every second)", R);
     stop(R, SIGKILL);
     struct rep_writer w = {cports[L], id[0], 10000000, 300, 0, 0, 0, 0};
     /* and a large insert: its part is shipped while R is down; R, back, does not stage the first file it receives
@@ -3196,8 +3186,8 @@ static void scen_replicate(void)
     /* the writes no longer wait for R: once R is silent for isr_lag_ms it leaves the ISR and they go on. R catches up
      * as a learner and grows back; only then has it surely seen the COMMIT marker and fetched the part. 60 s: under
      * TSan the restart, the catch-up and the fetch (5 s late on purpose) took the whole of 30 s (r3d-isr g3 tsan).
-     * A replica that refuses its own log (the leader dropped segments past a floor it never saved: floornotsaved) is
-     * named apart from a slow rejoin, so that mutant's catch cannot be a timeout for any other reason */
+     * A replica that refuses its own log is named apart from a slow rejoin. (Under the default keep caps R removes no
+     * segment here, so floornotsaved is repcheck's: its caps are 2 s.) */
     for (uint64_t t1 = now_ms(); isr_of(L, "plant", NULL) != 3;) {
         if (log_has(R, "the log starts above the commit floor"))
             die("the replica restarted under writes refused its log: the log starts above the commit floor");
@@ -3688,27 +3678,6 @@ static int wal_count(int i, uint32_t num)
         die("readdir %s: %s", v, strerror(errno));
     closedir(d);
     return n;
-}
-
-/* the lowest WAL segment number in server i's directory of volume num; UINT64_MAX when it has none (a volume that
- * flushed everything and removed its segments also passed number 1) */
-static uint64_t wal_lowest(int i, uint32_t num)
-{
-    char dir[PATH_MAX + 80], v[PATH_MAX + 120];
-    server_dir(i, dir, sizeof dir);
-    snprintf(v, sizeof v, "%s/v%" PRIu32, dir, num);
-    DIR *d = opendir(v);
-    if (!d)
-        die("opendir %s: %s", v, strerror(errno));
-    uint64_t lo = UINT64_MAX, seq;
-    errno = 0;
-    for (struct dirent *e; (e = readdir(d));)
-        if (sscanf(e->d_name, "wal_%" SCNx64 ".log", &seq) == 1 && seq < lo)
-            lo = seq;
-    if (errno)
-        die("readdir %s: %s", v, strerror(errno));
-    closedir(d);
-    return lo;
 }
 
 /* A writer of 1000-row inserts on one connection until `stop` (inboxshared's stalled volume) */
@@ -6048,7 +6017,8 @@ static int cmp_u64(const void *a, const void *b)
 
 /* repcheck: three duties of the replication driver that no other scenario sees, each the target of one of its mutants
  * (server/repld.c): a replica's saved floor reaches its engine, which then removes its flushed segments once they are
- * also past the keep caps (repl_retain_s is 2 s here; floornottold keeps them all); a replica whose newest REPL slot is damaged opens "unsure" and its first save at the open takes the
+ * also past the keep caps (repl_retain_s is 2 s here; floornottold keeps them all) and, restarted, opens its log from
+ * the floor it saved (floornotsaved never saves it: the log starts above it, the core refuses); a replica whose newest REPL slot is damaged opens "unsure" and its first save at the open takes the
  * group's epoch as fence and led, which clears the flag (unsureignored keeps the older slot's values and the flag);
  * a write whose position in the core is not its log number fails the volume before it is acknowledged (admitnocheck
  * acknowledges it; the fault is TSDB_REPLD_TEST=skippos). It also prints the latency of single-row writes (the fast
@@ -6123,6 +6093,30 @@ static void scen_repcheck(void)
         usleep(100000);
     }
     printf("  the replica removed its flushed segments once its floor was saved (%d left)\n", nw);
+    /* a clean restart: the segments went, so the log starts above position 1, and the floor that let them go must be
+     * in REPL, or the core refuses the log at this open and every later one (floornotsaved: the engine was told the
+     * floor, the save was skipped). Done here because only these 2 s keep caps let a replica's segments go in a test. */
+    {
+        int o = log_count(R, " of 3, log ");
+        stop(R, SIGTERM);
+        start(R);
+        await_log_count(R, " of 3, log ", o + 1, 30000);
+        /* the core's refusal is said by the volume's thread, after the open's line, and the ISR may still hold R for
+         * isr_lag_ms: 2 s for the line before the ISR is asked */
+        for (uint64_t t1 = now_ms(); isr_of(L, "plant", NULL) != 3 || now_ms() - t1 < 2000;) {
+            if (log_has(R, "the log starts above the commit floor"))
+                die("replica %d restarted after its flushed segments went refused its log: the log starts above the "
+                    "commit floor (the floor that let them go was not saved)", R);
+            if (now_ms() - t1 > 30000)
+                die("replica %d restarted after its flushed segments went: the ISR of plant has %" PRIu32
+                    " members, not 3, after 30000 ms", R, isr_of(L, "plant", NULL));
+            usleep(50000);
+        }
+        if (log_has(R, "the log starts above the commit floor"))
+            die("replica %d restarted after its flushed segments went refused its log: the log starts above the "
+                "commit floor (the floor that let them go was not saved)", R);
+        printf("  restarted, the replica opened its log from the floor it saved and joined the ISR again\n");
+    }
 
     /* damage the newer REPL slot of the replica, restart it: it opens unsure, and the open's save clears that */
     stop(R, SIGTERM);
