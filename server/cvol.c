@@ -264,9 +264,12 @@ static void on_report(void *arg, struct cluster_report *out)
     for (uint32_t i = 0; i < out->nvols; i++) { /* after M.mu: the driver's locks are never taken under it */
         if (repld_failed(out->vols[i].volume))
             out->vols[i].health = CL_HEALTH_LOCAL_FAULT; /* D13: reported in the next heartbeat (r3e-failover acts) */
-        int l = repld_leading(out->vols[i].volume, NULL); /* the driver's writer only while its core leads: a deposed */
-        if (l >= 0)                                        /* one is no OWNER (the Raft leader's lease check) */
-            out->vols[i].role = l == 1 ? CL_ROLE_OWNER : CL_ROLE_NONE;
+        uint64_t pe = 0;
+        int l = repld_leading(out->vols[i].volume, &pe); /* the driver's writer only while its core leads: a deposed */
+        if (l >= 0)                                       /* one is no OWNER (the Raft leader's lease check) */
+            out->vols[i].role = l == 1 ? CL_ROLE_OWNER : l == 2 ? CL_ROLE_PROMOTING : CL_ROLE_NONE;
+        if (l == 2)
+            out->vols[i].epoch = pe; /* the epoch it promotes to (leader_deposed in cluster.c) */
     }
     out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, UNREACH_MS);
     out->nisr = repld_isr_requests(out->isr, CLUSTER_REPORT_ISR);

@@ -29,6 +29,7 @@ int repld_failed(uint32_t v);
  * writes are served, and OWNER reported in the heartbeat, only on 1: a deposed writer stops at once, before its engine
  * is reopened as a replica (design-cluster.md 6.3, 7.1). */
 int repld_leading(uint32_t v, uint64_t *epoch);
+/* (repld_leading: 1 the writer, 2 promoting to *epoch, 0 neither, -1 no such volume) */
 /* Volume v's engine failed (eng_fail): 1 when the driver holds v (it stops and quiesces it, the process goes on, D13),
  * 0 when v is no volume of the driver (tsdbd's own rules apply). */
 int repld_engine_failed(uint32_t v, const char *msg);

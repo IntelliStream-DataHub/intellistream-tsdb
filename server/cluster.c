@@ -4909,14 +4909,17 @@ static int cut_move(const struct meta_volume *v, const struct cluster_isr_req *q
  * the Raft leader that ran it). Its core holds the higher fence and waits for a record past it that nobody proposes,
  * and the volume has no writer for good (jepsen-cluster meta,classes kill, 2026-11-19: ISR version 158 to the end).
  * Once that has lasted DEPOSED_HOLD_NS with no promotion under way it counts as a resignation: the group fences
- * again and may pick the old leader itself at a new epoch. A new leader's reopen and a restarted leader's own RESIGN
- * take far less. *own is this server's report, gathered at most once per call (the driver's state, cut_move's way). */
+ * again and may pick the old leader itself at a new epoch. A restarted leader's own RESIGN takes far less. A leader that
+ * reports PROMOTING to the record's epoch is not deposed however long its promotion takes (shipping the log, the EPOCH
+ * marker's commit, a reopen of seconds on a large volume or a loaded host: review F3, test_cluster promoteslow). *own is
+ * this server's report, gathered at most once per call (the driver's state, cut_move's way). */
 #define DEPOSED_HOLD_NS (3000 * MS)
 static int leader_deposed(const struct meta_volume *v, uint64_t now, struct cluster_report *own, int *have_own)
 {
     static struct { uint32_t vol, leader; uint64_t epoch, ns; } seen[16];
     static unsigned nseen;
     int role = -1;
+    uint64_t pepoch = 0;
     if (v->leader == C.id) {
         if (!*have_own) {
             memset(own, 0, sizeof *own);
@@ -4926,16 +4929,18 @@ static int leader_deposed(const struct meta_volume *v, uint64_t now, struct clus
         }
         for (uint32_t i = 0; i < own->nvols && i < CLUSTER_REPORT_VOLS; i++)
             if (own->vols[i].volume == v->number)
-                role = own->vols[i].role;
+                role = own->vols[i].role, pepoch = own->vols[i].epoch;
     } else if (heard_fresh(v->leader, now)) {
         const struct heard *h = heard_get(v->leader);
         for (uint32_t i = 0; h && i < h->nvols; i++)
             if (h->vols[i].v.volume == v->number)
-                role = h->vols[i].v.role;
+                role = h->vols[i].v.role, pepoch = h->vols[i].v.epoch;
     }
     unsigned si = 0;
     while (si < nseen && seen[si].vol != v->number)
         si++;
+    if (role == CL_ROLE_PROMOTING && pepoch != v->epoch)
+        role = CL_ROLE_NONE; /* promoting to an older epoch: the record moved past it */
     if (role != CL_ROLE_NONE || cl_mutant() == CLM_DEPOSEDSTUCK) {
         if (si < nseen)
             seen[si] = seen[--nseen];

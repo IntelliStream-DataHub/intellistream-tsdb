@@ -67,7 +67,9 @@ const char *cluster_strerror(int rc);
 enum cluster_mode { CLUSTER_MODE_NONE = 0, CLUSTER_MODE_CORE = 1, CLUSTER_MODE_WATCH = 2 };
 /* ---- what a server reports in its heartbeat besides its address: sections (docs/design-ha-modes.md §7.1 item 1) */
 
-enum cluster_vol_role { CL_ROLE_NONE = 0, CL_ROLE_OWNER = 1, CL_ROLE_RELEASING = 2 };
+/* PROMOTING: named the record's leader, its driver not the writer yet (the EPOCH marker's commit, the reopen); the
+ * report's epoch is then the epoch it promotes to */
+enum cluster_vol_role { CL_ROLE_NONE = 0, CL_ROLE_OWNER = 1, CL_ROLE_RELEASING = 2, CL_ROLE_PROMOTING = 3 };
 enum cluster_vol_health { CL_HEALTH_OK = 0, CL_HEALTH_LOCAL_FAULT = 1, CL_HEALTH_DOMAIN_FAULT = 2 };
 enum cluster_dom_state { CL_DOM_OK = 0, CL_DOM_SLOW = 1, CL_DOM_FAULT = 2 };
 #define CLUSTER_REPORT_VOLS 256

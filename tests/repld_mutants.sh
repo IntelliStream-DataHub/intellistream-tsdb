@@ -29,6 +29,8 @@
 # TSDB_CVOL_MUTANT, set to the same name): refusedsilent (a volume the server refused is left out of its heartbeat
 # report, not LOCAL_FAULT) refused. One is the engine's (src/replica.c, planted by tsdbd under the same name):
 # replicadropsfloor (a replica's flushed segments go once its floor passes them, the retention caps ignored) failoverkeep.
+# promotenone (a driver promoting reports role NONE, so a promotion slower than 3 s is taken for a deposed leader and
+# fenced again; the volume's first promotion is slow too, so it may never get a writer) promoteslow (knob promoteslow).
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -66,6 +68,7 @@ table=(
     "stepcurrentonly|rejoinlate|did not join the ISR again in 30 s"
     "stallcatchup|jointpause|after a stop of every server the record of jp"
     "keepunanswered|failover|the killed old leader was still in the ISR of fo"
+    "promotenone|promoteslow|the record of ps moved past epoch|series pump1.flow in ps: error -11"
     "fencenosync|fencecrash|REPL holds fence [0-9]+ after it stopped at fence-saved-before-reply"
     "keepwritten|replicate|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
     "stopnodepose|closegone|its replicas killed: server [0-9]+ still runs [0-9]+ ms after SIGTERM"

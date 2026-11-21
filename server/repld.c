@@ -258,6 +258,7 @@ enum {
     RM_FENCENOSYNC,    /* a SAVE that raises the fence skipped: the FENCE_REPLY goes out, the fence not in REPL */
     RM_INBOXSTARVE,
     RM_OPENNOHOLD,
+    RM_PROMOTENONE, /* a driver promoting reports role NONE: a slow promotion is taken for deposed (F3) */
     RM_TICKSTRETCH,
     RM_STEPCURRENTONLY,
     RM_STALLCATCHUP
@@ -290,6 +291,7 @@ static struct {
                            stalled disk's stand-in), until repld_stop (test_cluster stallstop) */
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
+    int promote_slow; /* TSDB_REPLD_TEST=promoteslow (tests only): 5 s before the promotion's swap, a slow reopen */
     int late_wal; /* TSDB_REPLD_TEST=latewal (tests only): repld_stop leaves its writers in place and waits 2.5 s after
                    * freeing the links, and a stopped driver admits records whatever its lease, so the engine's NOW
                    * markers reach the WAL hooks of a stopped driver (op_bytes says so once) */
@@ -1581,6 +1583,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
         if (rv->mode == M_PROMOTING && a->pos >= rv->epoch_pos) {
             tsdb_cvol_unref(&db);
             pthread_mutex_unlock(&rv->mu);
+            if (G.promote_slow) /* a fault for tests: a reopen of seconds (a large volume, a loaded host) */
+                nanosleep(&(struct timespec){5, 0}, NULL);
             uint64_t t_promote = now_ms();
             rc = tsdb_cvol_replace(G.t, rv->number, promote_fn, rv, CVOL_WRITER);
             t_promote = now_ms() - t_promote; /* D6: the promotion is a reopen; its time is in the log line */
@@ -1959,6 +1963,20 @@ static void demote(struct rvol *rv)
     pthread_mutex_lock(&rv->mu);
 }
 
+/* One step of the volume thread that took STALL_MS or more (a promotion's or a depose's reopen: seconds on a large
+ * volume or a loaded host, 7.7 s in jepsen; a slow fdatasync) is the thread's own silence, as a stop of the process
+ * is (vol_main's wait): its peers' messages queued meanwhile. Caught up in ticks it would count every peer silent for
+ * TICK_BACKLOG_MS, so a new leader asked for an ISR of one right after its slow promotion, which the group took for a
+ * leader cut from its replicas and moved away (review F3, test_cluster promoteslow; mutant stallcatchup). */
+static void long_step(struct rvol *rv, uint64_t t0, uint64_t *next_tick)
+{
+    uint64_t t1 = now_ms();
+    if (t1 > t0 + STALL_MS && G.mutant != RM_STALLCATCHUP) {
+        *next_tick = t1;
+        rv->resumed_ms = t1;
+    }
+}
+
 static void *vol_main(void *arg)
 {
     struct rvol *rv = arg;
@@ -1989,12 +2007,16 @@ static void *vol_main(void *arg)
             if (!rv->in_head)
                 rv->in_tail = NULL;
             inbox_took(rv, it);
+            uint64_t h0 = now_ms();
             handle(rv, it);
             free(it);
+            long_step(rv, h0, &next_tick);
             continue;
         }
         if (rv->sync_wanted && mine) {
+            uint64_t h0 = now_ms();
             do_sync(rv);
+            long_step(rv, h0, &next_tick);
             continue;
         }
         if (now >= next_tick) {
@@ -2181,6 +2203,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "fencenosync")    ? RM_FENCENOSYNC
                : !strcmp(mu, "inboxstarve")    ? RM_INBOXSTARVE
                : !strcmp(mu, "opennohold")     ? RM_OPENNOHOLD
+               : !strcmp(mu, "promotenone")    ? RM_PROMOTENONE
                : !strcmp(mu, "tickstretch")    ? RM_TICKSTRETCH
                : !strcmp(mu, "stallcatchup")   ? RM_STALLCATCHUP
                : !strcmp(mu, "stepcurrentonly") ? RM_STEPCURRENTONLY
@@ -2190,6 +2213,7 @@ void repld_init(tsdb *t, const char *dir)
     const char *te = getenv("TSDB_REPLD_TEST");
     G.drop_bulk = te && strstr(te, "dropbulk");
     G.promote_wait = te && strstr(te, "promotewait");
+    G.promote_slow = te && strstr(te, "promoteslow");
     G.skip_pos = te && strstr(te, "skippos");
     G.stale_sent = te && strstr(te, "stalesent");
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
@@ -2527,8 +2551,10 @@ int repld_leading(uint32_t v, uint64_t *epoch)
         return -1;
     pthread_mutex_lock(&rv->mu);
     int l = rv->mode == M_WRITER && !rv->failed && rv->core && repl_is_leader(rv->core);
+    if (!l && rv->mode == M_PROMOTING && !rv->failed && rv->core && G.mutant != RM_PROMOTENONE)
+        l = 2; /* named the leader, not the writer yet: the group must not take it for deposed (review F3) */
     if (l && epoch)
-        *epoch = repl_epoch(rv->core);
+        *epoch = rv->mode == M_PROMOTING ? rv->epoch : repl_epoch(rv->core);
     pthread_mutex_unlock(&rv->mu);
     return l;
 }

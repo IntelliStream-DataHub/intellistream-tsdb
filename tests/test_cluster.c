@@ -283,6 +283,7 @@ static void scenario(const char *name)
     memset(envs, 0, sizeof envs);
     memset(xargs, 0, sizeof xargs);
     memset(penv, 0, sizeof penv);
+    strict_reads = 0;
     memset(is_witness, 0, sizeof is_witness);
     memset(auth_on, 0, sizeof auth_on);
     snprintf(base, sizeof base, "%s/%s", root, name);
@@ -6669,6 +6670,79 @@ static void scen_pause(void)
 }
 
 
+/* promoteslow (review F3): a promotion that takes longer than the 3 s after which the Raft leader takes a record leader
+ * whose driver does not lead for deposed (leader_deposed: a fence nobody followed up). Every server's swap to the writer
+ * waits 5 s first (TSDB_REPLD_TEST=promoteslow: a reopen of a large volume or on a loaded host; jepsen saw 7.7 s). The
+ * new leader reports PROMOTING to the record's epoch meanwhile, so the record stays at e0 + 1 and that leader takes
+ * writes; mutant promotenone (role NONE while promoting) fences it again and the record moves on to e0 + 2 and beyond
+ * (the volume's first promotion is as slow, so under the mutant it may get no writer at all). The swap's 5 s in the
+ * volume thread are the thread's own silence, not its peers': the new leader must not ask for an ISR of one after it
+ * (repld.c long_step), which the group takes for a leader cut from its replicas and moves away. */
+static void scen_promoteslow(void)
+{
+    scenario("promoteslow");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=promoteslow";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "ps", 3, &num)) != 0 || num != 1)
+        die("volume add ps: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "ps", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "ps", &v))
+        die("no record of ps");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of ps is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "ps", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    tsdbc_close(c);
+    await_isr(0, "ps", 3, 30000, "every replica in the ISR before the kill");
+    signal_child(pids[L], SIGKILL);
+    if (await_exit(L, 5000) < 0)
+        die("server %d did not die of SIGKILL", L);
+    int via = (L + 1) % 3;
+    int Nw = await_promoted(via, "ps", ids[L], e0, &v);
+    if (Nw < 0 || Nw == L || v.epoch != e0 + 1)
+        die("the new record of ps: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    uint64_t tr = now_ms();
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", e0 + 1);
+    await_log_count(Nw, lead, 1, 30000);
+    uint64_t tl = now_ms();
+    /* past the 5 s of the swap and the 3 s of leader_deposed, with margin: the record must not have moved on */
+    while (now_ms() - tr < 12000) {
+        struct meta_volume w;
+        if (vol_rec(via, "ps", &w) && (w.epoch != e0 + 1 || w.leader != v.leader))
+            die("the record of ps moved past epoch %" PRIu64 " (leader %u): epoch %" PRIu64 ", leader %u, %" PRIu64
+                " ms after the promotion; a slow promotion was taken for a deposed leader", e0 + 1, v.leader, w.epoch,
+                w.leader, now_ms() - tr);
+        usleep(100000);
+    }
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    ts = 2000;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the slowly promoted leader %d: %s", Nw, ers(rc));
+    tsdbc_close(c);
+    printf("  a promotion of %" PRIu64 " ms (5 s of it before the swap): the record stayed at epoch %" PRIu64
+           " and server %d took writes\n", tl - tr, e0 + 1, Nw);
+}
+
+
 /* jointpause (r3e jc7, finding P): every server of a volume stopped together for 2 s (SIGSTOP: a VM pause, a host
  * that froze) and resumed. Nobody was silent but for the stop itself: the leader must not catch the 2 s up in ticks
  * (every peer then looks silent for isr_lag and it asks for an ISR of one) and no member may name a peer unreachable for
@@ -7364,7 +7438,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
