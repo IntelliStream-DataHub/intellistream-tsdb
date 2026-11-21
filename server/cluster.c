@@ -1062,6 +1062,10 @@ static struct {
                           * oneway: an old leader that hears nothing of its deposition, but still heartbeats and gets
                           * leases) */
     char dropfencefile[1100];
+    int hold_reply;      /* TSDB_CLUSTER_TEST hold_reply_file=1: while <state-dir>/holdreply is, a copy of each FENCE_REPLY sent
+                          * is kept; while <state-dir>/replayreply is, the copies are sent again every round (test_cluster
+                          * oneway2: a late answer to an earlier fence of the volume must not count for the promotion now) */
+    char holdreplyfile[1100], replayreplyfile[1100];
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1295,6 +1299,8 @@ static void test_knobs(void)
             C.hold_isr = v != 0;
         else if (sscanf(p, "drop_fence_file=%llu", &v) == 1)
             C.drop_fence = v != 0;
+        else if (sscanf(p, "hold_reply_file=%llu", &v) == 1)
+            C.hold_reply = v != 0;
         else if (sscanf(p, "isr_replay=%llu", &v) == 1)
             C.isr_replay = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
@@ -1568,8 +1574,9 @@ enum cl_mutant {
     CLM_DEPOSEDSTUCK = 13, /* a record's leader deposed by a fence no promotion followed is never taken as resigned */
     CLM_FENCELEASE = 14,   /* an old leader whose fence answer a promotion waits for still gets leases (review R1) */
     CLM_OLDPASS = 15,      /* a promotion goes ahead without the old leader's fence answer or the end of its lease (R3) */
-    CLM_MOVEGIVEUP = 16    /* a move gives up at PROMO_MOVE_NS, and any promotion at PROMO_GIVEUP_NS, though a replica
+    CLM_MOVEGIVEUP = 16,   /* a move gives up at PROMO_MOVE_NS, and any promotion at PROMO_GIVEUP_NS, though a replica
                             * answered and only the old leader's lease is awaited */
+    CLM_ANYEPOCH = 17      /* a FENCE_REPLY of any epoch counts for the promotion of its volume (review R2) */
 };
 static int cl_mutant(void)
 {
@@ -1594,6 +1601,7 @@ static int cl_mutant(void)
             : !strcmp(e, "fencelease")    ? CLM_FENCELEASE
             : !strcmp(e, "oldpass")       ? CLM_OLDPASS
             : !strcmp(e, "movegiveup")    ? CLM_MOVEGIVEUP
+            : !strcmp(e, "anyepoch")      ? CLM_ANYEPOCH
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -4651,7 +4659,9 @@ static void volmsg_in(uint32_t from, const struct cluster_vmsg *m)
         return;
     }
     struct promo *p = promo_find(m->volume);
-    if (!p || m->kind != CL_VMSG_FENCE_REPLY || m->epoch != p->epoch + 1)
+    /* only an answer to this promotion's fence: a late one to an earlier fence (the old leader's, from when it was
+     * promoted) says nothing of whether it stopped at this epoch */
+    if (!p || m->kind != CL_VMSG_FENCE_REPLY || (m->epoch != p->epoch + 1 && cl_mutant() != CLM_ANYEPOCH))
         return;
     for (uint32_t i = 0; i < p->nfenced; i++)
         if (p->fenced[i] == from && !p->replied[i]) {
@@ -4660,34 +4670,50 @@ static void volmsg_in(uint32_t from, const struct cluster_vmsg *m)
         }
 }
 
+static void vmsg_send(const struct cluster_vmsg *m, uint32_t to)
+{
+    if (to == C.id) {
+        volmsg_in(C.id, m);
+        return;
+    }
+    struct conn *c = conn_to(to);
+    if (!c)
+        return;
+    frame_begin(&C.fb, F_VOLMSG);
+    put8(&C.fb, m->kind);
+    put32(&C.fb, m->volume);
+    put64(&C.fb, m->epoch);
+    put64(&C.fb, m->durable);
+    put64(&C.fb, m->last_epoch);
+    put64(&C.fb, m->rid);
+    put64(&C.fb, m->start);
+    frame_end(&C.fb);
+    conn_send(c, 0);
+}
+
 static void vmsg_flush(void)
 {
     struct cluster_vmsg q[VMSG_Q];
+    static struct cluster_vmsg held[8]; /* tests (hold_reply_file=1), with `to` resolved */
+    static unsigned nheld;
     pthread_mutex_lock(&vmsg_mu);
     unsigned n = vmsg_n;
     memcpy(q, vmsg_q, n * sizeof q[0]);
     vmsg_n = 0;
     pthread_mutex_unlock(&vmsg_mu);
+    int hold = C.hold_reply && access(C.holdreplyfile, F_OK) == 0;
     for (unsigned i = 0; i < n; i++) {
         uint32_t to = q[i].to ? q[i].to : C.r ? raft_get_leader(C.r) : C.hint_leader;
-        if (to == C.id) {
-            volmsg_in(C.id, &q[i]);
-            continue;
+        if (hold && q[i].kind == CL_VMSG_FENCE_REPLY && nheld < sizeof held / sizeof held[0]) {
+            held[nheld] = q[i];
+            held[nheld++].to = to;
+            say("test: keeps a copy of its answer to fence %" PRIu64 " of volume %" PRIu32, q[i].epoch, q[i].volume);
         }
-        struct conn *c = conn_to(to);
-        if (!c)
-            continue;
-        frame_begin(&C.fb, F_VOLMSG);
-        put8(&C.fb, q[i].kind);
-        put32(&C.fb, q[i].volume);
-        put64(&C.fb, q[i].epoch);
-        put64(&C.fb, q[i].durable);
-        put64(&C.fb, q[i].last_epoch);
-        put64(&C.fb, q[i].rid);
-        put64(&C.fb, q[i].start);
-        frame_end(&C.fb);
-        conn_send(c, 0);
+        vmsg_send(&q[i], to);
     }
+    if (C.hold_reply && access(C.replayreplyfile, F_OK) == 0)
+        for (unsigned i = 0; i < nheld; i++)
+            vmsg_send(&held[i], held[i].to);
 }
 
 static void on_volmsg(struct conn *c, struct rd *r)
@@ -5379,6 +5405,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdopensfile, sizeof C.holdopensfile, "%s/holdopens", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
+    snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);
+    snprintf(C.replayreplyfile, sizeof C.replayreplyfile, "%s/replayreply", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     meta_init(&C.sm);

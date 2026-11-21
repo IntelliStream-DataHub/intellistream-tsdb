@@ -7038,46 +7038,15 @@ static void *ow_reader_thread(void *a)
     return NULL;
 }
 
-static void scen_oneway(void)
+/* L leads `name` at e0 with `acked` rows of `id`, every server in its ISR: cut it one way (above), read on it through
+ * the promotion and check that no read sent after the new leader's first acknowledged write is answered; then the links
+ * come back and the new leader holds every row. replay: L sends again the fence answers it gave while it was promoted
+ * (oneway2). */
+static void ow_cut_promote(int L, const char *name, tsdb_sid id, int acked, uint32_t num, uint64_t e0, uint32_t old,
+                           int replay)
 {
-    scenario("oneway");
-    strict_reads = 1; /* every read on the leader (D5): a replica's reads are not the question here */
-    for (int i = 0; i < 3; i++) {
-        penv[i] = "TSDB_REPLD_TEST=cutlinks";
-        envs[i] = "drop_fence_file=1";
-    }
-    lease_cluster(3, 5000, 200000, 3000); /* L's lease runs 4 s past its last grant; R waits 6 s */
-    int L = -1, rc;
-    uint32_t num = 0;
-    char name[16];
     struct meta_volume v;
-    for (int k = 0; k < 8 && L < 0; k++) {
-        snprintf(name, sizeof name, "ow%d", k);
-        if ((rc = vol_add(0, name, 3, &num)) != 0)
-            die("volume add %s: %s", name, cluster_strerror(rc));
-        if (!vol_rec(0, name, &v))
-            die("no record of %s", name);
-        int s = server_of(v.leader);
-        if (s >= 1 && s <= 2)
-            L = s;
-    }
-    if (L < 0)
-        die("eight volumes, every one led by the Raft leader");
-    for (int i = 0; i < 3; i++) /* every server opened it: a series made before L knows the volume is NOTFOUND */
-        await_open_gen(0, name, i, 1, 0);
-    uint64_t e0 = v.epoch;
-    uint32_t old = v.leader;
-    tsdbc *c = client(L);
-    tsdb_sid id = rep_series(c, rep_names[0], name, 30000);
-    int acked = 0;
-    for (; acked < 20; acked++) {
-        int64_t ts = 1000000 + 1000LL * acked;
-        float val = (float)acked;
-        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
-            die("write %d: %s", acked, ers(rc));
-    }
-    tsdbc_close(c);
-    await_isr(L, name, 3, 30000, "every replica in the ISR before the cut");
+    int rc;
     struct ow_reader rd = {.server = L, .id = id, .cap = 1u << 20};
     if (!(rd.log = calloc(rd.cap, sizeof *rd.log)))
         die("out of memory");
@@ -7091,6 +7060,14 @@ static void scen_oneway(void)
     if (!fp)
         die("create %s: %s", df, strerror(errno));
     fclose(fp);
+    char rf[PATH_MAX + 64];
+    server_dir(L, rf, sizeof rf);
+    strcat(rf, "/state/replayreply");
+    if (replay) {
+        if (!(fp = fopen(rf, "w")))
+            die("create %s: %s", rf, strerror(errno));
+        fclose(fp);
+    }
     uint64_t t0 = now_ms();
     for (int i = 0; i < 3; i++)
         if (i != L) {
@@ -7142,6 +7119,7 @@ static void scen_oneway(void)
             answered, rd.n);
     free(rd.log);
     unlink(df); /* L hears the record again: a write is MOVED */
+    unlink(rf);
     tsdbc *co = client(L);
     insert_expect_moved(co, id, 9500000, 1, (uint16_t)num, v.leader, v.epoch, "a write to the old leader");
     tsdbc_close(co);
@@ -7159,6 +7137,127 @@ static void scen_oneway(void)
         die("the leader at epoch %" PRIu64 " (server %d) holds %d rows, %d were acknowledged", v.epoch, Nw, got,
             acked + 1);
     await_isr(Nw, name, 3, 60000, "every server in the ISR once the links are back");
+}
+
+static void scen_oneway(void)
+{
+    scenario("oneway");
+    strict_reads = 1; /* every read on the leader (D5): a replica's reads are not the question here */
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks";
+        envs[i] = "drop_fence_file=1";
+    }
+    lease_cluster(3, 5000, 200000, 3000); /* L's lease runs 4 s past its last grant; R waits 6 s */
+    int L = -1, rc;
+    uint32_t num = 0;
+    char name[16];
+    struct meta_volume v;
+    for (int k = 0; k < 8 && L < 0; k++) {
+        snprintf(name, sizeof name, "ow%d", k);
+        if ((rc = vol_add(0, name, 3, &num)) != 0)
+            die("volume add %s: %s", name, cluster_strerror(rc));
+        if (!vol_rec(0, name, &v))
+            die("no record of %s", name);
+        int s = server_of(v.leader);
+        if (s >= 1 && s <= 2)
+            L = s;
+    }
+    if (L < 0)
+        die("eight volumes, every one led by the Raft leader");
+    for (int i = 0; i < 3; i++) /* every server opened it: a series made before L knows the volume is NOTFOUND */
+        await_open_gen(0, name, i, 1, 0);
+    uint64_t e0 = v.epoch;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], name, 30000);
+    int acked = 0;
+    for (; acked < 20; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(L, name, 3, 30000, "every replica in the ISR before the cut");
+    ow_cut_promote(L, name, id, acked, num, e0, old, 0);
+    stop_all();
+}
+
+/* oneway2 (review R2): a late answer to an earlier fence must not count as the old leader's answer now. Server 0 (the
+ * Raft leader) leads; its data links are cut and a replica N is promoted to e0 + 1, keeping a copy of its answer to
+ * fence e0 + 1 (TSDB_CLUSTER_TEST hold_reply_file=1). Once every server is back in the ISR, N is cut one way as in
+ * oneway and sends that old answer again every round: the promotion to e0 + 2 still waits for N's lease. Mutant
+ * anyepoch (an answer of any epoch counted) promotes at once and N answers reads after the new leader's first ack. */
+static void scen_oneway2(void)
+{
+    scenario("oneway2");
+    strict_reads = 1;
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks";
+        envs[i] = "drop_fence_file=1,hold_reply_file=1";
+    }
+    lease_cluster(3, 5000, 200000, 3000);
+    int rc, L0 = -1;
+    uint32_t num = 0;
+    char name[16];
+    struct meta_volume v;
+    for (int k = 0; k < 8 && L0 < 0; k++) {
+        snprintf(name, sizeof name, "ox%d", k);
+        if ((rc = vol_add(0, name, 3, &num)) != 0)
+            die("volume add %s: %s", name, cluster_strerror(rc));
+        if (!vol_rec(0, name, &v))
+            die("no record of %s", name);
+        if (server_of(v.leader) == 0)
+            L0 = 0;
+    }
+    if (L0 < 0)
+        die("eight volumes, none led by the Raft leader");
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, name, i, 1, 0);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(0);
+    tsdb_sid id = rep_series(c, rep_names[0], name, 30000);
+    int acked = 0;
+    for (; acked < 20; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, name, 3, 30000, "every replica in the ISR before the first cut");
+    char hf[3][PATH_MAX + 64];
+    for (int i = 1; i < 3; i++) {
+        server_dir(i, hf[i], sizeof hf[i]);
+        strcat(hf[i], "/state/holdreply");
+        FILE *fp = fopen(hf[i], "w");
+        if (!fp)
+            die("create %s: %s", hf[i], strerror(errno));
+        fclose(fp);
+    }
+    for (int i = 1; i < 3; i++) {
+        cut_file(0, i, 1);
+        cut_file(i, 0, 1);
+    }
+    int Nn = await_promoted(0, name, ids[0], e0, &v);
+    if (Nn < 1 || Nn > 2)
+        die("the record of %s after the first cut names node %u at epoch %" PRIu64, name, v.leader, v.epoch);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nn, lead, 1, 30000);
+    for (int i = 1; i < 3; i++) {
+        cut_file(0, i, 0);
+        cut_file(i, 0, 0);
+        unlink(hf[i]);
+    }
+    char kept[96];
+    snprintf(kept, sizeof kept, "keeps a copy of its answer to fence %" PRIu64 " of volume %" PRIu32, e0 + 1, num);
+    if (log_count(Nn, kept) < 1)
+        die("server %d led epoch %" PRIu64 " without keeping its answer to the fence (no \"%s\")", Nn, v.epoch, kept);
+    await_isr(Nn, name, 3, 60000, "every server in the ISR after the first promotion");
+    printf("  server %d leads epoch %" PRIu64 " after the first cut and replays its answer to fence %" PRIu64
+           " through the second\n", Nn, v.epoch, e0 + 1);
+    ow_cut_promote(Nn, name, id, acked, num, v.epoch, v.leader, 1);
     stop_all();
 }
 
@@ -7598,7 +7697,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"oneway", scen_oneway}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
