@@ -27,6 +27,7 @@
 #include "ecgc.h"
 #include "ecpart.h"
 #include "ecswap.h"
+#include "settle.h"
 #include "tier.h"
 
 #include <dirent.h>
@@ -104,6 +105,7 @@ static void fresh(const char *what, char *dir, size_t cap)
 typedef struct h {
     tier *t;
     eng *db;
+    uint_fast64_t rounds; /* settle_rounds once the tier's settle thread was stopped */
 } h;
 
 static bool use_thread; /* the tier's worker works the queue (thread_case); else the test does */
@@ -119,12 +121,18 @@ static int h_open_at(h *x, const char *dir, const char *db, int lifetime_s)
     setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
     x->t = NULL;
     x->db = NULL;
+    x->rounds = atomic_load(&settle_rounds);
     atomic_store(&ecgc_test_manual, !use_thread);
     int rc = tier_open(db, NULL, &x->t);
     unsetenv("TSDB_TEST_TIER");
     unsetenv("TSDB_TEST_TIER_I_KNOW");
     if (rc)
         return rc;
+    /* The days written here are from 1970, due at once: the tier's settle thread (r7-settle) would settle them beside
+     * the case's own steps, and its references (a swap's warmer cut, its own pins) hold an object the case expects gone
+     * (midround failed so under TSan). Settles are test_settle's, with r7-gc's handoffs (gcpaths, gcpower). */
+    ecsettle_tier_quiesce(x->t);
+    x->rounds = atomic_load(&settle_rounds);
     tsdb_options o;
     tsdb_options_init(&o);
     o.merge_threads = 0;
@@ -150,6 +158,7 @@ static int h_open(h *x, const char *dir, int lifetime_s)
 
 static void h_close(h *x)
 {
+    CHECK(atomic_load(&settle_rounds) == x->rounds); /* no settle thread ran beside the case */
     if (x->db)
         eng_close(x->db);
     tier_put(x->t);
