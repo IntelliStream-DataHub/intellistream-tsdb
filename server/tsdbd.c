@@ -2268,9 +2268,9 @@ static int cvol_refuse_ids(const tsdb_sid *ids, size_t n)
     return 0;
 }
 
-/* Reads naming many ids (QUERY_MULTI, QUERY_LATEST): one id on a volume led here whose read lease ran out (§7.1), or on
- * a volume another server leads (D5: MOVED there; under TSDB_REPLICA_READS a replica holding a lease answers), refuses
- * the whole request, as handle() refuses a single-id op on such a volume. */
+/* Reads naming many ids (QUERY_MULTI, QUERY_LATEST): one id on a volume still opening, on a volume led here whose read
+ * lease ran out (§7.1), or on a volume another server leads (D5: MOVED there; under TSDB_REPLICA_READS a replica holding
+ * a lease answers), refuses the whole request, as handle() refuses a single-id op on such a volume. */
 static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n)
 {
     if (!cvol_active())
@@ -2285,7 +2285,7 @@ static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n)
             continue;
         last = (uint32_t)TSDB_SID_VOLUME(id); /* each run of one volume asked once (cvol_why locks) */
         int cw = cvol_why(last);
-        if (cw == TSDB_WHY_UNREACHABLE || (cw == TSDB_WHY_FENCED && !(lease && cvol_replica_reads()))) {
+        if (cw >= 0 && !(cw == TSDB_WHY_FENCED && lease && cvol_replica_reads())) {
             unav_vol = (uint16_t)TSDB_SID_VOLUME(id); /* as in handle() (test_cluster lease, phase b; staleread) */
             return TSDB_ERR_UNAVAILABLE;
         }
@@ -2452,8 +2452,11 @@ static void handle_in(req *r)
         uint64_t gen = cluster_lease_gen();
         bool lease = cluster_lease_valid();
         int cw = cvol_why(unav_vol);
-        if (cw == TSDB_WHY_UNREACHABLE || (cw == TSDB_WHY_FENCED && !(lease && cvol_replica_reads()))) {
-            /* any op on a volume led here whose read lease ran out (§7.1): refused, the client retries. Reads of a
+        if (cw >= 0 && !(cw == TSDB_WHY_FENCED && lease && cvol_replica_reads())) {
+            /* a volume still opening (RECOVERING): its engine may be open already, as a replica at REPL's floor, before
+             * the manager marks it open, and a restarted leader's floor lies below what it acknowledged (jepsen
+             * kill-classes: a stale read in that window; test_cluster openread). Any op on a volume led here whose
+             * read lease ran out (§7.1): refused, the client retries. Reads of a
              * volume another server leads go there (D5, MOVED in the reply): a replica answers from what it applied,
              * and a leader deposed by a failover (reopened as a replica, back in the ISR with a lease again) does not
              * have the writes the new leader acknowledged since (test_cluster pause, staleread). Without a lease a

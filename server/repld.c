@@ -292,6 +292,7 @@ static struct {
     int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
     int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
     int promote_slow; /* TSDB_REPLD_TEST=promoteslow (tests only): 5 s before the promotion's swap, a slow reopen */
+    int open_slow;    /* TSDB_REPLD_TEST=openslow (tests only): 3 s between the engine's open and the manager's MV_OPEN */
     int late_wal; /* TSDB_REPLD_TEST=latewal (tests only): repld_stop leaves its writers in place and waits 2.5 s after
                    * freeing the links, and a stopped driver admits records whatever its lease, so the engine's NOW
                    * markers reach the WAL hooks of a stopped driver (op_bytes says so once) */
@@ -2214,6 +2215,7 @@ void repld_init(tsdb *t, const char *dir)
     G.drop_bulk = te && strstr(te, "dropbulk");
     G.promote_wait = te && strstr(te, "promotewait");
     G.promote_slow = te && strstr(te, "promoteslow");
+    G.open_slow = te && strstr(te, "openslow");
     G.skip_pos = te && strstr(te, "skippos");
     G.stale_sent = te && strstr(te, "stalesent");
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
@@ -2365,6 +2367,10 @@ int repld_open(const struct cluster_vol_rec *r)
     if (rc != 0) {
         say("volume %" PRIu32 ": the open of %s failed: %s", r->number, rv->dir, tsdb_strerror(rc));
         goto fail;
+    }
+    if (G.open_slow) { /* a fault for tests: the engine is routable, the manager does not call the volume open yet */
+        say("volume %" PRIu32 ": engine open, 3 s before the volume counts as open (openslow)", r->number);
+        sleep(3);
     }
     uint64_t log_end = 0;
     rc = core_build(rv, unsure, &log_end, &rv->core); /* the thread is not started: nothing else reads rv->core */
