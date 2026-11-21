@@ -27,6 +27,9 @@ int cvol_why(uint32_t v);
 int cvol_replica_reads(void);
 /* 1 when volume v is a cluster volume open and led here (whatever the lease says) */
 int cvol_led(uint32_t v);
+/* cvol_led, and the epoch it leads (the replication driver's; 0 for a writer the manager opened, which no driver
+ * deposes): a leader deposed and promoted again leads a later epoch, so (1, epoch) names one leadership */
+int cvol_lead(uint32_t v, uint64_t *epoch);
 /* 1: volume v's record names another server as leader and no ISR member is up in the group's view (design-cluster.md
  * 6.2): UNAVAILABLE(NO_OWNER) until a member returns or an operator forces a leader, not MOVED to a dead server */
 int cvol_no_owner(uint32_t v);

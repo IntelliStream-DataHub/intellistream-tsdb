@@ -191,7 +191,11 @@ cgroup, so `nice` does not keep your work out of its way.
   UNAVAILABLE NO_OWNER/PROMOTING; before any right on an id is checked; a frame spanning two owners is INVALID;
   docs/design-cluster.md 6.4; NO_OWNER when no ISR member is UP, 6.2); a refusal after it (a leader deposed by a failover
   before the engine call) takes the same answer (`route_fill` in `frame_put`), and `TSDB_REPLICA_READS=1` (a test hook) lets
-  a replica that holds a lease serve reads; `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  a replica that holds a lease serve reads (test_cluster defaults to it: a scenario about a read's safety sets
+  `strict_reads`, the production path); a read admitted under the lease (`lguard`) records which of its volumes are led
+  here and at which epoch, and its first reply frame (after the snapshot) refuses it when that leadership changed
+  (deposed, or deposed and promoted again) or the lease lapsed meanwhile: never "led now", which a read held across a
+  deposal answers from the demoted replica engine (`test_cluster readdepose`, mutant `leadnow` in repld_mutants.sh); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants

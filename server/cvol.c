@@ -297,18 +297,26 @@ int cvol_why(uint32_t v)
 
 int cvol_replica_reads(void) { return M.replica_reads; }
 
-int cvol_led(uint32_t v)
+int cvol_lead(uint32_t v, uint64_t *epoch)
 {
+    if (epoch)
+        *epoch = 0;
     if (!M.active)
         return 0;
     pthread_mutex_lock(&M.mu);
     const struct mvol *m = mv_get(v);
     int open = m && m->state == MV_OPEN, writer = m && m->writer;
     pthread_mutex_unlock(&M.mu);
-    if (open && !writer && repld_leading(v, NULL) == 1)
+    uint64_t e = 0;
+    if (open && !writer && repld_leading(v, &e) == 1) {
         writer = 1; /* promoted by the replication driver (as in cvol_why) */
+        if (epoch)
+            *epoch = e;
+    }
     return open && writer;
 }
+
+int cvol_led(uint32_t v) { return cvol_lead(v, NULL); }
 
 int cvol_no_owner(uint32_t v)
 {

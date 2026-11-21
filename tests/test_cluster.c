@@ -9108,6 +9108,126 @@ static void scen_cuthold(void)
     cut_run(1);
 }
 
+/* readdepose (int-r review F1): a read on the leader L of a replicated volume, admitted under its lease and the
+ * volume led here, then held before its snapshot (TSDBD_TEST_READ_STALL), while L is deposed: cut from its replicas on
+ * the data links (TSDB_REPLD_TEST=cutlinks), the group moves the volume and L, fenced, reopens its engine as a
+ * replica at REPL's floor ("a replica again"). L's lease goes on (its heartbeats reach the Raft leader), so a check of
+ * the lease alone lets the read through to the replica engine, which may lie below writes acknowledged before the
+ * read was sent. Once the stall ends the read must be refused (UNAVAILABLE or MOVED), never answered: a raw query (the
+ * single-volume path) and a QUERY_LATEST and a QUERY_MULTI (the ids path). Strict reads (D5), as in production.
+ * TSDB_REPLD_MUTANT=leadnow (the check before the fix: a lapse on a volume led now) fails it. */
+struct held_read {
+    int server, kind;
+    tsdb_sid id;
+    int rc, rows;
+    atomic_int done;
+};
+static void *held_read_thread(void *a)
+{
+    struct held_read *h = a;
+    tsdbc *c = client(h->server);
+    tsdbc_set_retry(c, 0); /* the first answer, not a followed one */
+    h->rc = lease_read(c, h->id, h->kind, &h->rows);
+    tsdbc_close(c);
+    atomic_store(&h->done, 1);
+    return NULL;
+}
+
+static void scen_readdepose(void)
+{
+    scenario("readdepose");
+    strict_reads = 1; /* the production path: reads only on the leader (D5) */
+    static char pe[3][PATH_MAX + 128];
+    char stall[3][PATH_MAX + 64];
+    for (int i = 0; i < 3; i++) {
+        snprintf(stall[i], sizeof stall[i], "%s/rstall-n%d", base, i);
+        unlink(stall[i]);
+        snprintf(pe[i], sizeof pe[i], "TSDB_REPLD_TEST=cutlinks TSDBD_TEST_READ_STALL=%s", stall[i]);
+        penv[i] = pe[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rd", 3, &num)) != 0 || num != 1)
+        die("volume add rd: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rd", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rd", &v))
+        die("no record of rd");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rd is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rd", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) { /* W0: acknowledged before any read below was sent */
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(L, "rd", 3, 30000, "every replica in the ISR before the reads");
+    int got = rows_in(L, id, 1000000, 1000000 + 1000LL * acked, 30000);
+    if (got != acked)
+        die("the leader %d answers %d of the %d acknowledged rows before the stall", L, got, acked);
+    int fd = open(stall[L], O_CREAT | O_WRONLY, 0644);
+    if (fd < 0)
+        die("create %s: %s", stall[L], strerror(errno));
+    close(fd);
+    struct held_read h[3];
+    pthread_t th[3];
+    for (int k = 0; k < 3; k++) {
+        h[k] = (struct held_read){.server = L, .kind = k, .id = id, .rc = 1};
+        atomic_init(&h[k].done, 0);
+        if (pthread_create(&th[k], NULL, held_read_thread, &h[k]) != 0)
+            die("pthread_create");
+    }
+    nanosleep(&(struct timespec){0, 500000000}, NULL);
+    for (int k = 0; k < 3; k++)
+        if (atomic_load(&h[k].done))
+            die("read kind %d on the leader %d came back (%s) before its stall ended: not admitted", k, L,
+                ers(h[k].rc));
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    int Nw = await_promoted((L + 1) % 3, "rd", old, e0, &v);
+    char deposed[64];
+    snprintf(deposed, sizeof deposed, "deposed at epoch %" PRIu64 ":", e0);
+    await_log_count(L, deposed, 1, 30000);
+    await_log_count(L, "a replica again", 1, 30000); /* the demotion's reopen: the engine is a replica's now */
+    unlink(stall[L]);
+    for (int k = 0; k < 3; k++)
+        pthread_join(th[k], NULL);
+    static const char *const kn[3] = {"a raw query", "QUERY_LATEST", "QUERY_MULTI"};
+    for (int k = 0; k < 3; k++) {
+        if (h[k].rc == 0)
+            die("%s admitted on the leader %d under its lease and held while it was deposed answered (%d rows%s) from "
+                "the replica engine of its demotion", kn[k], L, h[k].rows,
+                h[k].kind == 0 && h[k].rows < acked ? ", fewer than the acknowledged" : "");
+        if (h[k].rc != TSDB_ERR_UNAVAILABLE && h[k].rc != TSDB_ERR_MOVED)
+            die("%s held across the deposal of its leader got %s, not UNAVAILABLE or MOVED", kn[k], ers(h[k].rc));
+    }
+    printf("  reads admitted on leader %d and held across its deposal (server %d leads epoch %" PRIu64 "): refused "
+           "(%s, %s, %s)\n", L, Nw, v.epoch, ers(h[0].rc), ers(h[1].rc), ers(h[2].rc));
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    stop_all();
+}
+
 static void nofence_file(int at, int on)
 {
     char f[PATH_MAX + 64];
@@ -9469,7 +9589,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

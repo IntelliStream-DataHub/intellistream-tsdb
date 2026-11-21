@@ -22,10 +22,12 @@
 # marker whose file it has not staged) reopenhold (knobs dropbulk, nofetch, syncpause, fetchlate); tickstretch (a late
 # tick dropped: the core's clock slower than the wall's under a slow catch-up step) tickwall (knob slowtick);
 # stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick); stallcatchup (a stop
-# of the whole process caught up in ticks and taken for the peers' silence) jointpause. Two are tsdbd's, read by
+# of the whole process caught up in ticks and taken for the peers' silence) jointpause. Three are tsdbd's, read by
 # it under the same name: nomoved (a write to a non-leader refused UNAVAILABLE, not MOVED) failover; deposemoved (a
-# write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose. fencenosync (a
-# FENCE_REPLY sent with the raised fence not in REPL) fencecrash. One is the volume manager's (server/cvol.c,
+# write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose; leadnow (a read
+# admitted on the leader and held while it is deposed is checked against the lease only, and answered from the
+# replica engine its demotion reopened) readdepose. fencenosync (a FENCE_REPLY sent with the raised fence not in REPL)
+# fencecrash. One is the volume manager's (server/cvol.c,
 # TSDB_CVOL_MUTANT, set to the same name): refusedsilent (a volume the server refused is left out of its heartbeat
 # report, not LOCAL_FAULT) refused. One is the engine's (src/replica.c, planted by tsdbd under the same name):
 # replicadropsfloor (a replica's flushed segments go once its floor passes them, the retention caps ignored) failoverkeep.
@@ -76,6 +78,7 @@ table=(
     "syncbyrep|writersync|writersync: batch [0-9]+, a write from connection [0-9]+: .*its commit point stayed below"
     "nomoved|failover|a write to a replica after the failover: .*not MOVED"
     "deposemoved|writerdepose|the write waiting for the commit point on the failed writer got"
+    "leadnow|readdepose|held while it was deposed answered"
     "refusedsilent|refused|the refused volume was not reported"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
