@@ -7,6 +7,7 @@
 #include "ecpart.h"
 #include "ecskip.h"
 #include "tier.h"
+#include "settle.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -456,6 +457,7 @@ static int meta_load_or_create(eng *db, bool read_only)
             meta_requires_parse(buf, &feats, feat, sizeof feat);
             db->feed_req = feats & META_REQ_FEED;
             db->replica_req = feats & META_REQ_REPLICA;
+            db->cluster_req = feats & META_REQ_CLUSTER;
             if (feat[0]) {
                 fprintf(stderr,
                         "tsdb: META requires the feature(s) \"%s\", which tsdb %s does not know: the open "
@@ -1081,6 +1083,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     if (db->opt.follow && tsdb_thread_create(&db->follower, follower_main, db) == 0)
         db->has_follower = true;
     latest_start(db);
+    if (!ro && db->tier)
+        ecsettle_eng_ready(db); /* R7: the settle thread may take this engine from here on */
     *out = db;
     return 0;
 fail:
@@ -1119,6 +1123,8 @@ void eng_halt(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     db->nmergers = 0;
+    if (settle_mutant != SETTLE_MUT_NOHALTSTOP)
+        ecsettle_eng_stop(db); /* R7: no settle of this engine runs from here on (abandoned or waited for) */
     if (eckeep_mutant != ECKEEP_MUT_NOHALTSTOP)
         eckeep_eng_stop(db); /* R7: the digest thread holds part references and takes db->lock */
 }
@@ -1219,6 +1225,7 @@ int eng_close(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     free(db->mergers);
+    ecsettle_eng_stop(db); /* R7: before the parts go: a settle of this engine is abandoned or waited for */
     eckeep_eng_stop(db); /* R7: before the parts go (the digest thread references them and takes db->lock) */
     stats_stop(db);
     latest_close(db); /* after the final flush: it folds into the table too */

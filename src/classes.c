@@ -469,6 +469,15 @@ static __thread uint64_t late_off;
 static __thread bool late_armed; /* inside switch_retry's switch */
 void (*cls_test_after_switch)(eng *db);
 
+/* tests: a switch record applied in memory only (no CLASSES record), to plant a history that the parts contradict */
+int cls_test_apply(eng *db, uint32_t s, int64_t from, int c)
+{
+    pthread_mutex_lock(&db->cls_mu);
+    int rc = apply_locked(db, s, from, c);
+    pthread_mutex_unlock(&db->cls_mu);
+    return rc;
+}
+
 /* Appends and syncs records, then applies them in memory. Caller holds class_lock. Fail-stop: the WAL's rows
  * are mapped through these records, by flushes now and by a replay later. A leader's records are markers first, and
  * reach the file once the commit point passed them (design-cluster.md 5.4): here, under flush_lock (a switch) or in

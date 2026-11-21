@@ -1566,6 +1566,7 @@ void eng_leader_depose(struct eng *db);
 void eng_leader_replay_floor(struct eng *db, uint64_t floor);
 /* test hook (tests/test_replica.c): called by a switch right after it released flush_lock */
 extern void (*cls_test_after_switch)(struct eng *db);
+int cls_test_apply(struct eng *db, uint32_t s, int64_t from, int c);
 /* test hook: called by a leader's flush after cls_classify_active, before the seal (src/memtable.c) */
 extern void (*mt_test_before_seal)(struct eng *db);
 /* The driver's keep bound (design-cluster.md 8.3), inclusive: the highest position every replica has (one below the
@@ -1890,6 +1891,7 @@ struct eng {
     bool replica_req;         /* META said requires=replica: only such a directory opens as a replica or a leader */
     bool leader_open;         /* opened by eng_open_leader (a promotion): until eng_leader_attach it is a writer with no
                                * jr, and decides nothing the replicas must carry out (a class switch: classes.c) */
+    bool cluster_req;         /* META said requires=cluster: a cluster volume's (R7 never settles one: D1) */
     bool fno_torn_open;       /* the open found one FNO slot bad (the numbers skipped ahead by FNO_BELT) */
     pthread_mutex_t feed_lock;
     pthread_cond_t feed_cv;
@@ -2597,6 +2599,13 @@ void tsdb_test_granules(struct tsdb *t, void (*fn)(void *ctx, int cls, uint32_t 
 size_t tsdb_test_mark_ec(struct tsdb *t, unsigned flags,
                          bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
                          void *ctx);
+/* test hook (R7 stage 3, tests/test_settle_oracle.c): eng_settle of the parts pick names, key by key; *settled counts
+ * the parts that turned .ec; 0 or the first result that is not 0 or TSDB_ERR_NOTFOUND */
+int tsdb_test_settle(struct tsdb *t,
+                     bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
+                     void *ctx, size_t *settled);
+/* test hook (tests/test_settle_oracle.c): the tier cache's granules read again as whole cells; drop empties it first */
+uint64_t tsdb_test_ec_retries(struct tsdb *t, bool drop);
 
 int ret_open(eng *db, bool read_only);
 int ret_reload(eng *db);

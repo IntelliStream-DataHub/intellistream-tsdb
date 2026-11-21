@@ -37,6 +37,7 @@
 #include "eccache.h"
 #include "ecgc.h"
 #include "ecpart.h"
+#include "settle.h"
 #include "tier.h"
 
 #include <dirent.h>
@@ -579,6 +580,9 @@ static void case_down(h *x)
     eng_close(x->db);
     x->db = NULL;
     move_store(1, true);
+    /* the settle thread reads t->be (tier_writable) for every engine it holds; it is stopped for good before the
+     * backend is swapped below, as no tier does outside this test (settles are not what this case is about) */
+    ecsettle_tier_quiesce(x->t);
     eccache_test_drop(x->t); /* no object stays open through the backend about to close */
     chunk_be_close(x->t->be);
     x->t->be = NULL;

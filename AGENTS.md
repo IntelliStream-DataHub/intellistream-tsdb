@@ -247,6 +247,23 @@ cgroup, so `nice` does not keep your work out of its way.
   the volume's uuid are queued (another database on the same stores is left alone; `chunk_store_del` too refuses a
   chunk of another vuuid as NOTFOUND). A test that puts objects named by no `.ec` file and reopens sets
   `ecgc_test_nosweep` (test_seam, test_tier). `tests/test_ecgc.c` (mutants in the Makefile).
+- `src/settle.c`, `src/ecpolicy.c` (R7, design-cluster-data.md E5-E7, E26): `eng_settle` turns a key's parts into `.ec`
+  parts in ONE pass over each part's map (each stripe copied once; the granule crcs, the header, index and footer hash
+  and the CLASSES judgement are checked on that copy, which is what is encoded: never read the map twice), then
+  `ec_index_write` and one `ec_swap_commit`. Pinned by `settling` under `db->lock`; merging, damaged, v8, pending and
+  granule-less parts are skipped, a dropping key is skipped whole; refused on a cluster or replica volume (D1), without
+  a tier and while a store is not UP (`tier_writable`). A CORRUPT check marks the part damaged; any failure hands its
+  own chunks to r7-gc, each object once (a NOMEM intent write: the caller, never the swap too). A refused swap
+  (`swap_discard`) hands them over only after the directory fsync of its unlinks (until then a power cut can bring the
+  intent back with its temporaries and roll it forward), also after a failed intent write, and never on a failed
+  engine (the next open's sweep takes them). One settle thread per tier (nice 19, one settle at a time; never `jr_serial`, `flush_lock`,
+  `cls_rw`); `eng_halt` and `eng_close` stop and wait for a settle of their engine. The policy (`ecpolicy_pick_locked`,
+  ages from `eng_now_ms`): class 0 a key after `grace_s` once no merge of it is selectable; classes 1-3 part by part, at
+  most once per `coarse_s` from the newest `.ec` record's settle time; `eager` (jepsen) after a merge round or above
+  1 MiB, 30 a minute; a failed key waits an hour. `tests/test_settle.c` (mutants `ecrankdown settlenocheck
+  settletwopass settlebusy coarsewhole`; the failure paths' handoffs `gcskip* gccommitted gcdouble` (gcpaths), `gcearly
+  nullnosync syncfailgo` (gcpower, crashfs), `nohaltstop` (halt)); `tests/test_settle_oracle.c` against an unsettled
+  twin (`tests/oracle_mutants.sh`: a mutant counts as caught only by its own line).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
@@ -593,7 +610,10 @@ cgroup, so `nice` does not keep your work out of its way.
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf, and so are the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O)
   and the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
-  sweeper takes `db->lock` only with it released). The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
+  sweeper takes `db->lock` only with it released). R7's settle: the policy's `ps->pmu` (`src/ecpolicy.c`: its fail list and eager count, taken under
+  `db->lock` while the settle thread picks) is a leaf; the tier's settle mutex `st->mu` (`src/settle.c`) is never held
+  across an engine call (the thread lets go of it around a settle), and `eng_halt`/`eng_close` wait on its cv with no
+  engine lock held. The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
   `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
   that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
   the warmer take `latest_rw` (read) > `db->lock`, a lookup then `buf_lock` in sub-holds. The window's `pmu`/`pcv` (a writer

@@ -19,21 +19,31 @@
  * goes on.
  *
  * Stages (the task's list): 1. eng_test_mark_ec, the skip rules alone: a marked part's bytes are still in its map and
- * every R7 stub reads it as a .part; `settle_step` is one function with one case per stage. 2. ec_test_attach (r7-seam)
- * and 3. eng_settle (r7-settle), with a store DOWN and with a damaged chunk, are added there when those tracks land
- * (REPORT.md, "what is left").
+ * every R7 stub reads it as a .part; `settle_step` is one function with one case per stage. 3. eng_settle through
+ * tsdb_test_settle: B is opened with a tier of three directory stores (k=2, m=1) whose own settle thread never finds a
+ * part due, and a settle step either marks (stage 1) or settles for real; real .ec parts stay across reopens and are
+ * read through their objects. Store 0 is moved away (DOWN) at some reopens and back at the next, and chunks on it are
+ * damaged at rest: one store holds one chunk per object, so every answer must still be the same.
  *
  * Usage: test_settle_oracle [--mutant NAME] [--seeds N] [--first S] [--steps N] [SCRATCH]
  *   the seeds and steps also from TSDB_ORACLE_SEEDS, TSDB_ORACLE_FIRST and TSDB_ORACLE_STEPS (make oracle-soak)
  * Mutants (each must fail the test: the Makefile requires it): skipdelete, skipreplace, skipretention (B leaves out
  * every delete, replace or retention change), nomark (the settle step settles nothing: a run that never reaches a
  * settled state fails), and flipvalues, flipagg, flipgroup, flipbounds, flipspread, fliptwa, fliplttb, fliplatest,
- * flipmulti, flipstats (one bit of B's answer of that kind is wrong: the comparison of that kind must see it).
+ * flipmulti, flipstats (one bit of B's answer of that kind is wrong: the comparison of that kind must see it), noretry
+ * (the cache never decodes around a chunk damaged on store 0) and rankdown (the settle's ecrankdown). A compare after
+ * a real settle or damage also reads every series whole, so these two are met far more often than by the random
+ * windows alone, but not on every run: a damaged chunk may be parity, belong to a part already retired and not yet
+ * collected, or hold bytes no granule read touches (the part's own index). tests/oracle_mutants.sh therefore tries a
+ * few seed windows and counts a mutant as caught only by its own line (DIVERGED), never by any failure;
+ * test_seam's seamnoretry and test_settle's ecrankdown catch the two bugs deterministically.
  */
 #define _GNU_SOURCE
 #include "internal.h"
 #include "ecpart.h"
+#include "eccache.h"
 
+#include <fcntl.h>
 #include <ftw.h>
 #include <math.h>
 #include <stdarg.h>
@@ -41,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -98,7 +109,8 @@ static uint64_t mix(uint64_t a, uint64_t b)
 
 static const char *const mutant_names[] = {"none",        "skipdelete", "skipreplace", "skipretention", "nomark",
                                            "flipvalues",  "flipagg",    "flipgroup",   "flipbounds",    "flipspread",
-                                           "fliptwa",     "fliplttb",   "fliplatest",  "flipmulti",     "flipstats"};
+                                           "fliptwa",     "fliplttb",   "fliplatest",  "flipmulti",     "flipstats",
+                                           "noretry",     "rankdown"};
 static int mutant; /* index into mutant_names */
 static bool is(const char *name) { return strcmp(mutant_names[mutant], name) == 0; }
 
@@ -222,6 +234,7 @@ static void fp_stats(fp *f, tsdb_sid id)
 typedef struct world {
     tsdb *db[2]; /* 0: A, never settled; 1: B */
     char dir[2][700], vol2[2][700];
+    char st[3][720], away[730]; /* B's tier: three directory stores (k=2, m=1); store 0 moved to `away` while DOWN */
     tsdb_options opt;
     tsdb_sid id[NS], never;
     tsdb_type type[NS];
@@ -230,8 +243,12 @@ typedef struct world {
     uint64_t seed;
     int step;
     bool settled_any;
+    bool real; /* B holds .ec parts that eng_settle made: they stay settled across a reopen */
+    bool down; /* store 0 is DOWN (moved away) since B's last open */
+    bool whole; /* the next compare also reads every series whole: a real settle or damage came before it */
     /* what the run reached */
     size_t marked, settle_steps, compares, nonempty, failed;
+    size_t real_settled, real_steps, unavailable, damaged, downs, retries;
 } world;
 
 static const tsdb_type types[NS] = {TSDB_FLOAT32, TSDB_FLOAT64, TSDB_INT64, TSDB_BOOL,
@@ -265,14 +282,36 @@ static void make_series(world *w, int d)
         CHECK(w->never == nv);
 }
 
+/* B's tier: never settles by itself (grace_s, its limit of 10 years, is far past any age here), only through tsdb_test_settle */
+static void tier_env(world *w, bool on)
+{
+    if (!on) {
+        unsetenv("TSDB_TEST_TIER");
+        unsetenv("TSDB_TEST_TIER_I_KNOW");
+        return;
+    }
+    char spec[3 * 720 + 128];
+    snprintf(spec, sizeof spec, "k=2,m=1,dirs=%s:%s:%s,grace_s=315360000,coarse_s=86400,eager=0", w->st[0], w->st[1],
+             w->st[2]);
+    setenv("TSDB_TEST_TIER", spec, 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+}
+
 static void open_both(world *w, bool fresh)
 {
+    if (fresh)
+        for (int i = 0; i < 3; i++) {
+            rmrf(w->st[i]);
+            CHECK(mkdir(w->st[i], 0755) == 0);
+        }
     for (int d = 0; d < 2; d++) {
         if (fresh) {
             rmrf(w->dir[d]);
             rmrf(w->vol2[d]);
         }
+        tier_env(w, d == 1);
         OK(tsdb_open(w->dir[d], &w->opt, &w->db[d]));
+        tier_env(w, false);
         if (fresh) {
             uint32_t vi;
             OK(tsdb_volume_add(w->db[d], w->vol2[d], &vi));
@@ -497,11 +536,64 @@ static void settle_step(world *w)
     pc.per_part = rnd(&w->r) % 2 == 0;
     if (pc.per_part)
         pc.mod = 2;
-    size_t n = tsdb_test_mark_ec(w->db[1], EC_MARK_EC, pick_partition, &pc);
+    bool real = rnd(&w->r) % 3 != 0;
+    size_t n;
     w->settle_steps++;
+    if (real) {
+        /* stage 3: the parts turn .ec on disk; the query then reads them through their objects (the cache and the
+         * decode), also after a reopen. With store 0 DOWN eng_settle refuses (tier_writable): nothing changes. */
+        int rc = tsdb_test_settle(w->db[1], pick_partition, &pc, &n);
+        if (rc == TSDB_ERR_UNAVAILABLE && w->down)
+            w->unavailable++;
+        else if (rc) {
+            fprintf(stderr, "seed %llu step %d: tsdb_test_settle: %s\n", (unsigned long long)w->seed, w->step,
+                    tsdb_strerror(rc));
+            exit(1);
+        }
+        w->real_steps++;
+        w->real_settled += n;
+        if (n)
+            w->real = true, w->whole = true;
+    } else
+        n = tsdb_test_mark_ec(w->db[1], EC_MARK_EC, pick_partition, &pc);
     w->marked += n;
     if (n)
         w->settled_any = true;
+}
+
+/* Damage at rest on store 0 only: one store holds one chunk of each object (k + m = 3 stores), so with any number of
+ * its chunks damaged, and store 0 DOWN as well, every object still has k = 2 good chunks and decodes to the same
+ * bytes. A byte in the middle of the file (a cell, or the sums table) changes: the chunk is an erasure. */
+static world *damage_w; /* nftw passes no context */
+static rng damage_r;     /* its own draws: how many chunk files there are depends on the collector's timing */
+static int damage_cb(const char *p, const struct stat *st, int flag, struct FTW *f)
+{
+    (void)f;
+    world *w = damage_w;
+    size_t len = strlen(p);
+    if (flag != FTW_F || len < 6 || strcmp(p + len - 6, ".chunk") != 0 || st->st_size < 2 || rnd(&damage_r) % 4)
+        return 0;
+    int fd = open(p, O_RDWR);
+    CHECK(fd >= 0);
+    off_t at = st->st_size / 2;
+    unsigned char c;
+    CHECK(pread(fd, &c, 1, at) == 1);
+    c ^= 0x20;
+    CHECK(pwrite(fd, &c, 1, at) == 1);
+    close(fd);
+    w->damaged++;
+    return 0;
+}
+
+static void damage_store0(world *w)
+{
+    if (w->down)
+        return; /* the store is away: its chunks are not read now */
+    damage_w = w;
+    damage_r.s = rnd(&w->r);
+    nftw(w->st[0], damage_cb, 16, FTW_PHYS);
+    tsdb_test_ec_retries(w->db[1], true); /* the next battery reads the chunks again */
+    w->whole = true;
 }
 
 /* ------------------------------------------------------------------ the battery */
@@ -727,6 +819,17 @@ static void battery(world *w, tsdb *db, uint64_t qseed, int mode, fp *f)
         if (!mode || getenv("ORACLE_MULTI_STATS_MT")) /* the reproducer: ORACLE_MULTI_STATS_MT=1 with --mutant nomark */
             fp_stats(f, all[0]);
     }
+    /* After a real settle or damage on store 0 the random windows may miss every damaged granule or every key a new
+     * .ec part overwrote, so the mutants noretry and rankdown were caught only on some runs (under TSan one survived:
+     * which chunk files exist when store 0 is damaged depends on the collector's timing). Every series read whole
+     * reads every granule of every listed part, so each overwritten key and each damaged data cell of a listed part
+     * that holds granule bytes is met (not parity, nor a retired part's object). No draw from q: the windows above stay
+     * the same. */
+    for (size_t i = 0; w->whole && i < NS; i++) {
+        fp_begin(f, "whole s%zu", i);
+        int rc = tsdb_query_values(db, w->id[i], TSDB_TS_MIN, TSDB_TS_MAX, NULL, rows_cb, f);
+        fp_rc(f, rc);
+    }
 }
 
 /* B's answers wrong in one bit, for the mutants that test the comparison of each kind */
@@ -826,6 +929,7 @@ static void compare(world *w, const char *why)
         fp_free(&fa);
         fp_free(&fb);
     }
+    w->whole = false;
 }
 
 /* ------------------------------------------------------------------ the walk */
@@ -841,6 +945,9 @@ static void run_seed(world *w, const char *scratch, uint64_t seed, int steps)
                  "ab"[d]);
         snprintf(w->vol2[d], sizeof w->vol2[d], "%s_v2", w->dir[d]);
     }
+    for (int i = 0; i < 3; i++)
+        snprintf(w->st[i], sizeof w->st[i], "%s_st%d", w->dir[1], i);
+    snprintf(w->away, sizeof w->away, "%s_away", w->st[0]);
     tsdb_options_init(&w->opt);
     w->opt.merge_threads = 0; /* the layout is a function of the history alone */
     w->opt.query_threads = 4;
@@ -896,24 +1003,38 @@ static void run_seed(world *w, const char *scratch, uint64_t seed, int steps)
                 OK(tsdb_drop_before(w->db[d], t));
             what = "drop_before";
         } else if (r < 80) {
+            w->retries += tsdb_test_ec_retries(w->db[1], false);
             close_both(w);
+            /* store 0 goes DOWN (moved away) or comes back; while it is away B reads every object around it */
+            if (w->down || (w->real && rnd(&w->r) % 4 == 0)) {
+                CHECK(rename(w->down ? w->away : w->st[0], w->down ? w->st[0] : w->away) == 0);
+                w->down = !w->down;
+                w->downs += w->down;
+            }
             open_both(w, false);
-            w->settled_any = false; /* a reopen drops every mark: merges of B are the same as A's again */
+            /* a reopen drops every mark: merges of B are the same as A's again, unless B holds real .ec parts */
+            w->settled_any = w->real;
             what = "reopen", force = true;
         } else if (r < 90 && w->step >= 8) {
             settle_step(w);
             what = "settle", force = true;
+            if (w->real && rnd(&w->r) % 3 == 0)
+                damage_store0(w), what = "settle and damage";
         } else
             apply_insert(w, si, rnd(&w->r) % 4 == 0, nullp), what = "insert";
         if (force || w->step % 4 == 3)
             compare(w, what);
     }
     compare(w, "end");
+    w->retries += tsdb_test_ec_retries(w->db[1], false);
     close_both(w);
     for (int d = 0; d < 2; d++) {
         rmrf(w->dir[d]);
         rmrf(w->vol2[d]);
     }
+    for (int i = 0; i < 3; i++)
+        rmrf(w->st[i]);
+    rmrf(w->away);
 }
 
 int main(int argc, char **argv)
@@ -942,15 +1063,30 @@ int main(int argc, char **argv)
         else
             scratch = argv[i];
     }
+    /* stage 3's mutants live in the engine: the cache answers a granule whose RAW bytes fail their crc as CORRUPT at
+     * once (a damaged chunk on store 0 is then an error, never decoded around), and an .ec part ranks below every
+     * other part of its partition (a settled newer part loses to an older one) */
+    if (is("noretry"))
+        eccache_mutant = ECC_MUT_NORETRY;
+    if (is("rankdown"))
+        setenv("TSDB_SETTLE_MUTANT", "ecrankdown", 1);
 #ifndef TSDB_EC
     printf("test_settle_oracle: skipped: no TSDB_EC in this build\n");
     return 0;
 #else
     world w;
     size_t marked = 0, settle_steps = 0, compares = 0, nonempty = 0;
+    size_t real_settled = 0, real_steps = 0, unavailable = 0, damaged = 0, downs = 0, retries = 0;
     for (uint64_t s = first; s < first + seeds; s++) {
         run_seed(&w, scratch, s, steps);
         marked += w.marked, settle_steps += w.settle_steps, compares += w.compares, nonempty += w.nonempty;
+        real_settled += w.real_settled, real_steps += w.real_steps, unavailable += w.unavailable;
+        damaged += w.damaged, downs += w.downs, retries += w.retries;
+    }
+    /* stage 3: a run whose settles never made an .ec part tests the marks only */
+    if (real_settled == 0 && !is("nomark")) {
+        fprintf(stderr, "test_settle_oracle: no eng_settle made an .ec part (%zu steps)\n", real_steps);
+        return 1;
     }
     /* a run that never settled a part, or never had an answer to compare, proves nothing */
     if (marked == 0 || nonempty == 0) {
@@ -963,6 +1099,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "test_settle_oracle: no battery ever read a granule of a settled part\n");
         return 1;
     }
+    /* No "damaged, so some granule was read again" check: it does not hold (int-h REVIEW F1: 4 of 80 unmutated windows
+     * damaged chunks that no read meets, see the top of the file), and a false failure here would also count as a
+     * mutant caught. */
     for (size_t k = 0; k < NKIND && kstat[k].name[0]; k++)
         if (kstat[k].calls >= 50 && kstat[k].errs * 2 > kstat[k].calls) {
             fprintf(stderr, "test_settle_oracle: %zu of %zu %s calls answered an error: the battery drifted\n",
@@ -977,6 +1116,9 @@ int main(int argc, char **argv)
     for (size_t k = 0; k < NKIND && kstat[k].name[0]; k++)
         printf(" %s %zu/%zu", kstat[k].name, kstat[k].errs, kstat[k].calls);
     printf("\n");
+    printf("test_settle_oracle: stage 3: %zu eng_settle steps made %zu .ec parts (%zu refused with store 0 DOWN); store 0 "
+           "went DOWN %zu times, %zu chunks on it damaged, %zu granules read again as whole cells\n",
+           real_steps, real_settled, unavailable, downs, damaged, retries);
     return 0;
 #endif
 }

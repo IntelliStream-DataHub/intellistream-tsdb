@@ -50,19 +50,26 @@
  *     counts as done.
  *   Damage fails the open (the intent stays): a sealed intent whose lines break the rules of a swap's names, an .ec
  *   part under none of its names while its source is still P.part (no flow loses it: a drop after the swap finds the
- *   sources settled), a source under retired_ although the swap renamed (a drop before the check renames nothing),
+ *   sources settled), a source under retired_ and not settled_ although the swap renamed (a drop before the check
+ *   renames nothing; a retired_ name beside settled_ is an older file of that name: the open's cover rule retires a
+ *   merge output a crash left unlisted, and the merge names it again),
  *   and a lookup that fails other than ENOENT (EIO, ESTALE on NFS: never read as "absent"). The directory is synced
  *   before ecswap_recover returns, so the intent is unlinked only after its renames are durable.
  *
- * Crash points for r7-jepsen: TSDB_SETTLE_CRASH_AT=after-intent|between-renames|before-unlink[:n] ends the process
- * with _exit(99) the n-th time (default 1) the point is passed; read once per process. after-intent: the intent is
+ * Crash points for r7-jepsen: TSDB_SETTLE_CRASH_AT=after-put|after-ec-tmp|after-intent|between-renames|before-unlink[:n]
+ * ends the process
+ * with exit(99) the n-th time (default 1) the point is passed; read once per process. exit, not _exit: under
+ * jepsen's crashfs the point must be a power cut, which crashfs's destructor makes (it runs on exit only; tsdbd and the
+ * engine register no atexit handler, so nothing else runs on the way out). after-intent: the intent is
  * durable, nothing renamed; between-renames: after each rename but the swap's last; before-unlink: the swap is
- * durable, its intent still there. An unknown name ends the process with status 2 at the first point passed.
+ * durable, its intent still there. after-put and after-ec-tmp are the settle's (src/settle.c, ecswap_crash_point):
+ * its chunks are durable, and then its tmp_*.ec too, nothing renamed. An unknown name ends the process with status 2 at the first point passed.
  */
 #include "ecswap.h"
 #include "eckeep.h"
 #include "ecgc.h"
 #include "ecpart.h"
+#include "settle.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -75,11 +82,16 @@
 void (*ec_swap_hook)(eng *db);
 int (*ec_swap_publish)(eng *db) = manifest_publish;
 int ecswap_mutant;
+atomic_int ecswap_test_fail;
+void (*ecswap_discard_hook)(eng *db);
+void (*ecswap_handed_hook)(eng *db);
+void (*ecswap_intent_fail_hook)(eng *db);
 
 /* ------------------------------------------------------------ crash points */
 
-enum { SC_AFTER_INTENT, SC_BETWEEN_RENAMES, SC_BEFORE_UNLINK, SC_N };
-static const char *const sc_names[SC_N] = {"after-intent", "between-renames", "before-unlink"};
+enum { SC_AFTER_INTENT, SC_BETWEEN_RENAMES, SC_BEFORE_UNLINK, SC_AFTER_PUT, SC_AFTER_EC_TMP, SC_N };
+static const char *const sc_names[SC_N] = {"after-intent", "between-renames", "before-unlink", "after-put",
+                                           "after-ec-tmp"};
 static pthread_once_t sc_once = PTHREAD_ONCE_INIT;
 static int sc_point = -1; /* the armed point, -1: none */
 static long sc_at = 1;
@@ -112,9 +124,27 @@ static void settle_crash(int point)
     long hit = atomic_fetch_add(&sc_hits, 1) + 1;
     if (hit == sc_at) {
         fprintf(stderr, "tsdb: settle crash point %s (hit %ld): exiting with status 99\n", sc_names[point], hit);
-        _exit(99);
+        exit(99);
     }
 }
+
+/* TSDB_SWAP_MUTANT=swapearly arms SWAP_MUT_EARLY in a whole process (tsdbd under tests/jepsen/mutant-settle.sh, whose
+ * settle-steps run must catch it); the other mutants are test_ecswap's, set through ecswap_mutant. Read once, at the
+ * first swap; an unknown name ends the process with status 2, as TSDB_SETTLE_CRASH_AT does. */
+static pthread_once_t sm_once = PTHREAD_ONCE_INIT;
+static void sm_read(void)
+{
+    const char *v = getenv("TSDB_SWAP_MUTANT");
+    if (!v || !*v || strcmp(v, "none") == 0)
+        return;
+    if (strcmp(v, "swapearly") != 0) {
+        fprintf(stderr, "tsdb: TSDB_SWAP_MUTANT=%s names no mutant: exiting with status 2\n", v);
+        _exit(2);
+    }
+    ecswap_mutant = SWAP_MUT_EARLY;
+}
+
+void ecswap_crash_point(int which) { settle_crash(which == ECSWAP_CRASH_AFTER_PUT ? SC_AFTER_PUT : SC_AFTER_EC_TMP); }
 
 /* ------------------------------------------------------------ names */
 
@@ -153,7 +183,10 @@ static int intent_write(eng *db, const char *intent, part **in, part **ec, size_
     size_t cap = 64, len = 0; /* the lines' own lengths: no bound on a name's length is assumed */
     for (size_t i = 0; i < n; i++)
         cap += 16 + strlen(ec[i]->pending) + strlen(ec[i]->name) + 2 * strlen(in[i]->name);
-    char *buf = malloc(cap);
+    int fail = atomic_load(&ecswap_test_fail); /* tests: one planted failure (ecswap.h) */
+    if (fail == ECSWAP_FAIL_INTENT_NOMEM || fail == ECSWAP_FAIL_INTENT_IO)
+        atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
+    char *buf = fail == ECSWAP_FAIL_INTENT_NOMEM ? NULL : malloc(cap);
     if (!buf)
         return TSDB_ERR_NOMEM;
     len += (size_t)snprintf(buf + len, cap - len, INTENT_V4_HEAD "%zu\n", n);
@@ -166,8 +199,12 @@ static int intent_write(eng *db, const char *intent, part **in, part **ec, size_
     int rc = fd < 0 || write_full(fd, buf, len) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
     if (fd >= 0 && close(fd) != 0 && rc == 0) /* on NFS, close sends the data to the server */
         rc = TSDB_ERR_IO;
+    if (fail == ECSWAP_FAIL_INTENT_IO) /* as a failed fdatasync: the whole intent written, its name never synced */
+        rc = TSDB_ERR_IO;
     free(buf);
-    if (rc) /* nothing committed: the name was not synced, and goes now */
+    if (rc && ecswap_intent_fail_hook)
+        ecswap_intent_fail_hook(db);
+    if (rc) /* nothing committed: this thread did not sync the name (another one may have), and it goes now */
         unlinkat(db->dirfd, intent, 0);
     return rc;
 }
@@ -194,18 +231,36 @@ static bool args_valid(part **in, part **ec, size_t n)
     return true;
 }
 
-/* A refused swap: its temporaries go, then the intent (the directory synced between: an intent that outlived its
- * temporaries would be rolled back at open, as it must, see ecswap_recover). Not on a failed engine, which names and
- * removes nothing more: the next open sorts the files out. */
+/* A refused swap: its temporaries are unlinked, the directory is synced, the objects go to r7-gc, then the intent is
+ * unlinked. Not on a failed engine, which names and removes nothing more: the next open sorts the files out.
+ * The order of the unlinks themselves does not matter (an intent missing a temporary is rolled back at open, a
+ * temporary with no intent is removed: ecswap_recover); what matters is that the objects go to r7-gc only after that
+ * sync, also with no intent (a write of it failed: another thread's directory sync may have made its name durable
+ * before intent_write removed it). Until the unlinks are durable a power cut can bring back an intent together with
+ * every temporary and every source (a drop's renames of the sources are not synced either when the swap refuses), and
+ * the open rolls such an intent forward: the .ec parts are listed and their chunks must still be there. A sync that
+ * fails failed the engine: nothing is handed over, and the next open's sweep (after the intents are recovered) takes
+ * the objects nothing names. test_settle gcpower (gcearly, nullnosync, syncfailgo). */
 static void swap_discard(eng *db, const char *intent, part **ec, size_t n)
 {
     if (eng_check(db))
         return;
     for (size_t i = 0; i < n; i++) {
         unlinkat(db->dirfd, ec[i]->pending, 0);
-        ecgc_unlisted_object(db, ec[i]); /* its chunks are no one's now (r7-gc) */
+        if (settle_mutant == SETTLE_MUT_GCEARLY) /* the bug: the chunks go while the intent can still roll forward */
+            ecgc_unlisted_object(db, ec[i]);
     }
-    if (intent && eng_sync_dir(db, "fsync of the directory after removing a refused settle's files") == 0)
+    if (ecswap_discard_hook)
+        ecswap_discard_hook(db);
+    if ((intent || settle_mutant != SETTLE_MUT_NULLNOSYNC) &&
+        eng_sync_dir(db, "fsync of the directory after removing a refused settle's files") != 0 &&
+        settle_mutant != SETTLE_MUT_SYNCFAILGO)
+        return;
+    for (size_t i = 0; i < n && settle_mutant != SETTLE_MUT_GCEARLY && settle_mutant != SETTLE_MUT_GCSKIPDISCARD; i++)
+        ecgc_unlisted_object(db, ec[i]); /* its chunks are no one's now (r7-gc) */
+    if (ecswap_handed_hook)
+        ecswap_handed_hook(db);
+    if (intent)
         unlinkat(db->dirfd, intent, 0);
 }
 
@@ -235,13 +290,18 @@ static bool swap_renames(eng *db, part **in, part **ec, size_t n)
 
 int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
 {
+    pthread_once(&sm_once, sm_read);
     if (n == 0)
         return 0;
     if (db->opt.read_only || db->opt.follow)
         return TSDB_ERR_READONLY;
     if (!args_valid(in, ec, n))
         return TSDB_ERR_INVALID;
-    size_t *at = malloc(n * sizeof *at);
+    size_t *at = NULL;
+    if (atomic_load(&ecswap_test_fail) == ECSWAP_FAIL_AT_NOMEM)
+        atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
+    else
+        at = malloc(n * sizeof *at);
     if (!at)
         return TSDB_ERR_NOMEM;
     char intent[64];
@@ -252,7 +312,9 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     bool early = ecswap_mutant == SWAP_MUT_EARLY;
     if (rc == 0 && !early && (rc = intent_write(db, intent, in, ec, n)) != 0) {
         pthread_mutex_unlock(&db->publish_lock);
-        swap_discard(db, NULL, ec, n);
+        if (rc != TSDB_ERR_NOMEM || settle_mutant == SETTLE_MUT_GCDOUBLE) /* NOMEM: nothing written, the caller
+                                                                           * cleans up (ecswap.h), never both */
+            swap_discard(db, NULL, ec, n);
         free(at);
         return rc;
     }
@@ -446,7 +508,10 @@ int ecswap_recover(eng *db, const char *name, char *buf, size_t len)
         renamed = false; /* the planted bug: a missing source read as a drop of the key, whatever was renamed */
     for (size_t i = 0; i < n && rc == 0 && renamed; i++) {
         const char *why = NULL;
-        if (on[i][N_RSRC] && !on[i][N_SRC])
+        /* retired_P.part with settled_P.part beside it is an older file of the same name, not this source: the open
+         * retires a merge output a crash left unlisted when its sources are still there (load_parts' cover rule),
+         * the merge runs again and names the same P, and the retired_ copy waits out obsolete_part_lifetime_s */
+        if (on[i][N_RSRC] && !on[i][N_SRC] && !on[i][N_DST])
             why = "a source is under retired_ although the swap renamed (a drop before its check renames nothing)";
         else if (!on[i][N_TMP] && !on[i][N_FIN] && !on[i][N_RFIN] &&
                  (on[i][N_SRC] || ecswap_mutant == SWAP_MUT_LOSTSETTLED))
