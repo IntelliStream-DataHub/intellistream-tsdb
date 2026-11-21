@@ -1056,6 +1056,13 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             if (tsdb_thread_create(&db->mergers[db->nmergers], merge_thread_main, db) == 0)
                 db->nmergers++;
     }
+    /* The periodic WAL sync's clock starts here, with the flusher of every open (a volume's reopen included): left at
+     * 0, the first wake would find the sync overdue on any machine up longer than wal_sync_ms and sync (closing the
+     * open rows record) at once instead of wal_sync_ms after the open. Taken before the thread starts, not by it, so
+     * a row acknowledged right after the open waits no longer than wal_sync_ms either. */
+    db->last_wal_sync_ms = eng_mono_ms();
+    if (eng_test_mutant == MUT_WALSYNC_FROM_ZERO) /* planted: the old clock from 0 on a machine up for a period */
+        db->last_wal_sync_ms -= db->opt.wal_sync_ms;
     if (!ro && tsdb_thread_create(&db->flusher, flusher_main, db) == 0)
         db->has_flusher = true;
     if (!ro && atomic_load(&db->feed_on) && (rc = feed_cleaner_start(db)) != 0)

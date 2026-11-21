@@ -50,7 +50,7 @@ typedef struct eng eng;
 /* Planted mutations: a test sets eng_test_mutant (tests link the engine) and must then fail, to show that it
  * catches the bug; nothing in the library or the server ever sets it. */
 enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR,
-       MUT_FLUSH_NOCLOSE,
+       MUT_FLUSH_NOCLOSE, MUT_WALSYNC_FROM_ZERO,
        MUT_REPLICA_APPLY_ALL, MUT_REPLICA_ACK_UNSYNCED, MUT_REPLICA_KEEP_CUT, MUT_REPLICA_NO_FLOOR, MUT_REPLICA_WALL_CLOCK, MUT_REPLICA_NO_POS,
        MUT_REPLICA_NO_OPEN_SYNC, MUT_REPLICA_NO_GAP_CHECK, MUT_REPLICA_NO_TORN_CUT, MUT_REPLICA_NO_FLOOR_CHECK,
        MUT_REPLICA_NO_DURABLE_GATE, MUT_REPLICA_NO_APPLY_CONTIG, MUT_REPLICA_NO_SEALED_RULE, MUT_REPLICA_NO_ROT_SYNC,
@@ -1987,7 +1987,13 @@ struct eng {
     bool parts_v8;                    /* META said parts_v8=1 at open: format-8 part headers are valid here (upgrade) */
     bool v8_meta;                     /* META still says it (db->lock): v8_parts_account takes it out when none is left */
     atomic_uint_fast64_t wal_durable; /* the last position durable (with the WAL on: an fno; see eng_leader_commit) */
+    /* the periodic sync's clock (the flusher's own after it starts): set by the open just before it starts the
+     * flusher, so the first sync is due wal_sync_ms after the open, not at the first wake. The st_ fields are for
+     * tests/test_fno.c (test_wal_clock, test_wal_cadence): the flusher's rounds done, its periodic syncs, the
+     * deadline of the first one as its first wait computed it, and the `now` of the first two. */
     int64_t last_wal_sync_ms;
+    atomic_uint_fast64_t st_flusher_rounds, st_periodic_syncs;
+    atomic_int_fast64_t st_sync_due0, st_sync_at[2];
     int bg_error;
     bool flusher_stop;
     bool has_flusher;
