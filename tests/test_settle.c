@@ -933,6 +933,14 @@ static void coarse_case(void)
     CHECK(eng_class_switch(d.db, s, 1, &t0) == 0);
     write_rows(d.db, s, 0, 2000, 10000, 0); /* day 0: part 1 */
     CHECK(eng_flush(d.db) == 0);
+    /* Nothing is due at 1000, part 1 alone included: two rounds run to the end any settle a round picks (it runs its
+     * settle inside the round). Without this check coarsewhole, which picks part 1 here, is caught only when no round
+     * falls between the two flushes: a record written after NOW moves on to 8 days holds the key back until 15 days,
+     * which the checks below cannot tell from a right settle of part 1 (gate under load, 2026-11-21). */
+    size_t all0, ec0;
+    wait_rounds(2);
+    key_count(d.db, 1, &all0, &ec0);
+    CHECK(all0 == 1 && ec0 == 0);
     write_rows(d.db, s, 5 * DAY, 2000, 10000, 1); /* day 5, the same week: part 2 */
     CHECK(eng_flush(d.db) == 0);
     acc want = digest(d.db, "s");
@@ -944,6 +952,9 @@ static void coarse_case(void)
         t_close(&d);
         return;
     }
+    wait_rounds(2);
+    key_count(d.db, 1, &all0, &ec0);
+    CHECK(all0 == 2 && ec0 == 0);
     atomic_store(&NOW, 8 * DAY); /* part 1 is due, part 2 is not */
     for (int i = 0; i < 2000; i++) {
         size_t all, ec;
