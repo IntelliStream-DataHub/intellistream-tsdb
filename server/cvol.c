@@ -92,6 +92,8 @@ static struct {
     int replica_reads; /* TSDB_REPLICA_READS=1: a replica with a lease answers reads (tests only, until REPLICA_OK) */
     int mutant;  /* 1 noopengen, 3 anynonce, 4 refusedsilent (the others are cvolfs.h's) */
     int stale_first; /* TSDB_CLUSTER_TEST stale_first_watch=1, until the first push */
+    unsigned unreach_ms; /* UNREACH_MS, or TSDB_CVOL_TEST unreach_ms=N (tests only: a report later than the leader's
+                          * shrink request, which cluster.c's cut_move holds for, test_cluster cuthold) */
 } M = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
 #define say cvolfs_say
@@ -271,7 +273,7 @@ static void on_report(void *arg, struct cluster_report *out)
         if (l == 2)
             out->vols[i].epoch = pe; /* the epoch it promotes to (leader_deposed in cluster.c) */
     }
-    out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, UNREACH_MS);
+    out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, M.unreach_ms);
     out->nisr = repld_isr_requests(out->isr, CLUSTER_REPORT_ISR);
 }
 
@@ -381,6 +383,10 @@ int cvol_start(tsdb *t, const char *dir)
                                                       : CVOLFS_MUT_NONE;
     const char *ct = getenv("TSDB_CLUSTER_TEST");
     M.stale_first = ct && strstr(ct, "stale_first_watch=1");
+    const char *cv = getenv("TSDB_CVOL_TEST");
+    M.unreach_ms = UNREACH_MS;
+    if (cv && sscanf(cv, "unreach_ms=%u", &M.unreach_ms) == 1)
+        say("TSDB_CVOL_TEST: a peer is reported unreachable after %u ms (tests only)", M.unreach_ms);
     if (M.writes)
         say("TSDB_CLUSTER_WRITES=1: a volume's leader takes writes before replication is wired (tests only)");
     if (M.replica_reads)

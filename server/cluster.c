@@ -1576,7 +1576,8 @@ enum cl_mutant {
     CLM_OLDPASS = 15,      /* a promotion goes ahead without the old leader's fence answer or the end of its lease (R3) */
     CLM_MOVEGIVEUP = 16,   /* a move gives up at PROMO_MOVE_NS, and any promotion at PROMO_GIVEUP_NS, though a replica
                             * answered and only the old leader's lease is awaited */
-    CLM_ANYEPOCH = 17      /* a FENCE_REPLY of any epoch counts for the promotion of its volume (review R2) */
+    CLM_ANYEPOCH = 17,     /* a FENCE_REPLY of any epoch counts for the promotion of its volume (review R2) */
+    CLM_NOCUTHOLD = 18     /* a shrink below 2 goes ahead before the member it drops reported the cut (review R13) */
 };
 static int cl_mutant(void)
 {
@@ -1602,6 +1603,7 @@ static int cl_mutant(void)
             : !strcmp(e, "oldpass")       ? CLM_OLDPASS
             : !strcmp(e, "movegiveup")    ? CLM_MOVEGIVEUP
             : !strcmp(e, "anyepoch")      ? CLM_ANYEPOCH
+            : !strcmp(e, "nocuthold")     ? CLM_NOCUTHOLD
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -5029,7 +5031,7 @@ static int cut_move(const struct meta_volume *v, const struct cluster_isr_req *q
             cut |= u[k].node == v->leader;
     }
     if (!cut) /* a member heard here but not (yet) saying it lost the leader: its report is at most a second late */
-        return alive && since(now, held_ns) < CUT_HOLD_NS;
+        return alive && since(now, held_ns) < CUT_HOLD_NS && cl_mutant() != CLM_NOCUTHOLD;
     promo_start(v, META_GR_PLANNED, now);
     return promo_find(v->number) != NULL;
 }
