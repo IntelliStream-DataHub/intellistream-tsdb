@@ -6302,6 +6302,7 @@ static void missing_rows(int i, tsdb_sid id, int64_t t0, int n)
 static void scen_failover(void)
 {
     scenario("failover");
+    strict_reads = 1; /* every read on the leader (D5), as in production */
     for (int i = 0; i < 3; i++)
         start(i);
     /* isr_lag_ms well above unanswered_ms (1000): the killed old leader, which the promotion keeps in the ISR as
@@ -6834,6 +6835,7 @@ static void scen_writerfail(void)
         printf("  skipped: %s\n", skip);
         return;
     }
+    strict_reads = 1; /* every read on the leader (D5), as in production */
     static char pe[3][PATH_MAX * 3 + 256];
     static char mark[3][PATH_MAX + 80];
     for (int i = 0; i < 3; i++) {
@@ -7984,6 +7986,7 @@ static void crash_promo(int promote)
 static void scen_leasestale(void)
 {
     scenario("leasestale");
+    strict_reads = 1; /* every read on the leader (D5), as in production */
     for (int i = 0; i < 3; i++) {
         penv[i] = "TSDB_REPLD_TEST=stallinbox";
         start(i);
@@ -8351,6 +8354,85 @@ static void scen_openread(void)
            R);
 }
 
+/* openreadlead (int-r review F2): openread on the production path (strict reads, D5) and for the LEADER: L, which
+ * acknowledged writes, is killed and restarted with TSDB_REPLD_TEST=openslow, so its engine is open as a replica at
+ * REPL's floor (below what L acknowledged) for 3 s before the manager counts the volume open. A raw query and a
+ * QUERY_LATEST on L meanwhile go through route_decide (route_fill: UNAVAILABLE RECOVERING where the copy still names
+ * L, MOVED where it names the leader that replaced it) and must never be answered from that engine. */
+static void scen_openreadlead(void)
+{
+    scenario("openreadlead");
+    strict_reads = 1;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "ol", 3, &num)) != 0 || num != 1)
+        die("volume add ol: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "ol", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "ol", &v))
+        die("no record of ol");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of ol is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "ol", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, "ol", 3, 30000, "every replica in the ISR before the restart");
+    signal_child(pids[L], SIGKILL);
+    if (await_exit(L, 5000) < 0)
+        die("server %d did not die of SIGKILL", L);
+    penv[L] = "TSDB_REPLD_TEST=openslow";
+    start(L);
+    penv[L] = NULL;
+    await_log_count(L, "(openslow)", 1, 30000);
+    c = client(L);
+    tsdbc_set_retry(c, 0); /* the first answer, not a followed one */
+    tsdb_points p;
+    rc = tsdbc_query_points(c, id, INT64_MIN, INT64_MAX, &p);
+    if (rc == 0)
+        die("a raw query on the restarted leader %d while its volume opens: answered (%zu of %d acknowledged rows) "
+            "from the engine at REPL's floor", L, p.n, acked);
+    int why = -1;
+    tsdb_unavail e;
+    unsigned n = 0;
+    if (rc == TSDB_ERR_UNAVAILABLE && tsdbc_unavailable(c, &e, 1, &n) == 0 && n == 1)
+        why = e.reason;
+    if (!(rc == TSDB_ERR_MOVED || (rc == TSDB_ERR_UNAVAILABLE && why == TSDB_WHY_RECOVERING)))
+        die("a raw query on the restarted leader %d while its volume opens: %s (reason %d), not UNAVAILABLE "
+            "(RECOVERING) or MOVED", L, ers(rc), why);
+    const char *raw = rc == TSDB_ERR_MOVED ? "MOVED" : "UNAVAILABLE (RECOVERING)";
+    tsdb_latest_result lr;
+    rc = tsdbc_latest(c, &id, 1, NULL, &lr);
+    if (rc == 0 && lr.status == 0)
+        die("QUERY_LATEST on the restarted leader %d while its volume opens: answered", L);
+    if (rc == 0)
+        rc = lr.status;
+    why = -1, n = 0;
+    if (rc == TSDB_ERR_UNAVAILABLE && tsdbc_unavailable(c, &e, 1, &n) == 0 && n == 1)
+        why = e.reason;
+    if (!(rc == TSDB_ERR_MOVED || (rc == TSDB_ERR_UNAVAILABLE && why == TSDB_WHY_RECOVERING)))
+        die("QUERY_LATEST on the restarted leader %d while its volume opens: %s (reason %d), not UNAVAILABLE "
+            "(RECOVERING) or MOVED", L, ers(rc), why);
+    tsdbc_close(c);
+    printf("  restarted leader %d, its engine open at REPL's floor: a raw query %s, QUERY_LATEST %s\n", L, raw,
+           rc == TSDB_ERR_MOVED ? "MOVED" : "UNAVAILABLE (RECOVERING)");
+}
+
 /* jointpause (r3e jc7, finding P): every server of a volume stopped together for 2 s (SIGSTOP: a VM pause, a host
  * that froze) and resumed. Nobody was silent but for the stop itself: the leader must not catch the 2 s up in ticks
  * (every peer then looks silent for isr_lag and it asks for an ISR of one) and no member may name a peer unreachable for
@@ -8420,6 +8502,7 @@ static void scen_jointpause(void)
 static void scen_resign(void)
 {
     scenario("resign");
+    strict_reads = 1; /* every read on the leader (D5), as in production */
     for (int i = 0; i < 3; i++)
         start(i);
     init_node_timeout_ms = 20000; /* the restart (open generation recorded, then the core) must beat detection */
@@ -9589,7 +9672,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
