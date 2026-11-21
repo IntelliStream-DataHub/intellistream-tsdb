@@ -52,11 +52,11 @@ typedef struct eng eng;
 enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR,
        MUT_FLUSH_NOCLOSE, MUT_WALSYNC_FROM_ZERO,
        MUT_REPLICA_APPLY_ALL, MUT_REPLICA_ACK_UNSYNCED, MUT_REPLICA_KEEP_CUT, MUT_REPLICA_NO_FLOOR, MUT_REPLICA_WALL_CLOCK, MUT_REPLICA_NO_POS,
-       MUT_REPLICA_NO_OPEN_SYNC, MUT_REPLICA_NO_GAP_CHECK, MUT_REPLICA_NO_TORN_CUT, MUT_REPLICA_NO_FLOOR_CHECK,
+       MUT_REPLICA_NO_OPEN_SYNC, MUT_REPLICA_NO_GAP_CHECK, MUT_REPLICA_NO_LEFTOVER_DROP, MUT_REPLICA_GAP_BY_SEQ, MUT_REPLICA_GAP_NO_KEPT, MUT_REPLICA_NO_TORN_CUT, MUT_REPLICA_NO_FLOOR_CHECK,
        MUT_REPLICA_NO_DURABLE_GATE, MUT_REPLICA_NO_APPLY_CONTIG, MUT_REPLICA_NO_SEALED_RULE, MUT_REPLICA_NO_ROT_SYNC,
        MUT_REPLICA_NO_CUT_GEN, MUT_REPLICA_NO_CUT_SYNC, MUT_REPLICA_NO_CUT_DIRSYNC, MUT_REPLICA_NO_REPLAY_SKIP,
        MUT_REPLICA_NO_NOW_MARKER, MUT_REPLICA_COMMIT_CLOCK, MUT_REPLICA_EARLY_SEAL,
-       MUT_REPLICA_NO_STAGE_HOLD, MUT_REPLICA_NO_COMMIT_FLUSH, MUT_REPLICA_NO_DONE_SKIP, MUT_REPLICA_KEEP_STAGED,
+       MUT_REPLICA_NO_STAGE_HOLD, MUT_REPLICA_CUT_NO_HOLD, MUT_REPLICA_NO_COMMIT_FLUSH, MUT_REPLICA_NO_DONE_SKIP, MUT_REPLICA_KEEP_STAGED,
        MUT_REPLICA_NO_DROP_SKIP, MUT_REPLICA_NO_DROP_FLUSH, MUT_REPLICA_NO_STAGE_SYNC,
        MUT_REPLICA_PROMOTE_UNAPPLIED, MUT_REPLICA_PROMOTE_KEEP_SEGS, MUT_REPLICA_EPOCH_SEG,
        MUT_REPLICA_NO_DROP_SERIAL, MUT_REPLICA_STAGE_TRUNC,
@@ -75,7 +75,9 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_APPLY_HOLDS_MU, MUT_REPLICA_PREP_NO_CUT_GEN, MUT_LEADER_DROP_UNHELD,
        MUT_LEADER_LINK_BY_NAME, MUT_LEADER_RS_NO_PRUNE, MUT_LEADER_RS_PRUNE_ALL, MUT_LEADER_NOTE_LATE,
        MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU,
-       MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED };
+       MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED,
+       MUT_LEADER_SWITCH_UNATTACHED, MUT_REPLICA_KEEP_FLOOR, MUT_REPLICA_DROP_APPLIED_FILES,
+       MUT_LEADER_FRESH_UNATTACHED };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1600,7 +1602,7 @@ int eng_leader_file_open(struct eng *db, uint64_t pos, const char *name);
 /* replica.c: the links of the files of COMMIT markers whose position is below fno_end go (their segment went;
  * flush_lock held); every stage_ file goes (eng_leader_attach: a writer keeps no stage of its own) */
 void leader_links_drop(struct eng *db, uint64_t fno_end);
-void leader_links_sweep(struct eng *db);
+void leader_links_sweep(struct eng *db, bool stages);
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
@@ -1637,6 +1639,9 @@ int mt_reserve_rows(struct memtable *m, const uint32_t *series, uint32_t cs, siz
 struct replica;
 struct rstate;
 int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, struct eng **out);
+/* The writer of a promotion (replica_promote): its merges and flusher run before the driver attaches (eng_leader_attach),
+ * and a class switch decided in between would reach CLASSES with no marker in the log (db->leader_open). */
+int eng_open_leader(const char *dir, const tsdb_options *opts, struct eng **out);
 int replica_open_log(struct eng *db, uint64_t floor, int (*cut_tails)(struct eng *)); /* instead of wal_open; sets db->rp */
 void replica_free(struct eng *db);                     /* wal_close */
 int replica_flush(struct eng *db);                     /* mt_flush of a replica */
@@ -1883,6 +1888,8 @@ struct eng {
     _Atomic bool feed_on;     /* FEED exists and the word is in META: segments are renamed to fwal_, not unlinked */
     bool feed_req;            /* META said requires=feed at the open */
     bool replica_req;         /* META said requires=replica: only such a directory opens as a replica or a leader */
+    bool leader_open;         /* opened by eng_open_leader (a promotion): until eng_leader_attach it is a writer with no
+                               * jr, and decides nothing the replicas must carry out (a class switch: classes.c) */
     bool fno_torn_open;       /* the open found one FNO slot bad (the numbers skipped ahead by FNO_BELT) */
     pthread_mutex_t feed_lock;
     pthread_cond_t feed_cv;
@@ -1953,7 +1960,9 @@ struct eng {
     uint64_t lk_failed;          /* the kept segment whose removal failed last (its message is printed once) */
     struct lkfile {
         uint64_t fno, key;
-    } *lf;                       /* with jr: the stage_ links of COMMIT markers in the log (leader_commit; lead_mu) */
+        bool keep; /* keep_<fno>_<key>.part: a committed marker's file, kept with its segment; else stage_<key>.part */
+    } *lf; /* the files of COMMIT markers in retained segments (lead_mu): with jr the stage_ links of this leadership's
+            * (leader_commit) and the keep_ files found at the attach; on a replica its keep_ files (replica.c) */
     size_t nlf, caplf, rlf;      /* rlf: entries of lf reserved by COMMITs about to append their marker (lead_mu) */
     uint64_t lrd_seq, lrd_off, lrd_next; /* where the last read of the log by position ended (replica_read; lead_mu) */
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */

@@ -16,7 +16,10 @@
  * A power loss happens with probability $CRASHFS_PROB at each tracked
  * operation (after $CRASHFS_WARMUP of them), or at the next one after
  * SIGUSR2. Every tracked operation runs under one lock, so no thread can
- * write while the state is being rolled back.
+ * write while the state is being rolled back. writev and pwritev are tracked
+ * too (gathered into one write or pwrite): the Raft log appends with
+ * pwritev, and one that ran past the lock while the power loss cut its file
+ * left a hole of zeros under a later record that the process then read back.
  *
  * With CRASHFS_MODE=eio the fault is an I/O error instead, the way Linux
  * reports a failed writeback ("fsyncgate", PostgreSQL 2018): at the point
@@ -108,6 +111,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #define MAX_FDS 65536
@@ -182,6 +186,8 @@ REAL(mmap);
 REAL(openat);
 REAL(write);
 REAL(pwrite);
+REAL(writev);
+REAL(pwritev);
 REAL(fsync);
 REAL(fdatasync);
 REAL(syncfs);
@@ -223,6 +229,8 @@ __attribute__((constructor)) static void init(void)
     LOAD(openat);
     LOAD(write);
     LOAD(pwrite);
+    LOAD(writev);
+    LOAD(pwritev);
     LOAD(fsync);
     LOAD(fdatasync);
     LOAD(syncfs);
@@ -1039,6 +1047,61 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
 }
 
 ssize_t pwrite64(int fd, const void *buf, size_t n, off_t off) __attribute__((alias("pwrite")));
+
+/* writev and pwritev of a tracked file: gathered and passed to write and pwrite above, so they count as operations,
+ * wait for the lock while a power loss rolls back, and keep the old sectors of a rewrite like any other write */
+static void *gather(const struct iovec *iov, int cnt, size_t *n)
+{
+    size_t t = 0;
+    for (int i = 0; i < cnt; i++)
+        t += iov[i].iov_len;
+    char *b = malloc(t ? t : 1);
+    if (!b)
+        return NULL;
+    size_t o = 0;
+    for (int i = 0; i < cnt; i++) {
+        memcpy(b + o, iov[i].iov_base, iov[i].iov_len);
+        o += iov[i].iov_len;
+    }
+    *n = t;
+    return b;
+}
+
+ssize_t writev(int fd, const struct iovec *iov, int cnt)
+{
+    if (!fd_tracked(fd) || cnt < 0)
+        return real_writev(fd, iov, cnt);
+    size_t n;
+    void *b = gather(iov, cnt, &n);
+    if (!b) {
+        errno = ENOMEM;
+        return -1;
+    }
+    ssize_t r = write(fd, b, n);
+    int e = errno;
+    free(b);
+    errno = e;
+    return r;
+}
+
+ssize_t pwritev(int fd, const struct iovec *iov, int cnt, off_t off)
+{
+    if (!fd_tracked(fd) || cnt < 0)
+        return real_pwritev(fd, iov, cnt, off);
+    size_t n;
+    void *b = gather(iov, cnt, &n);
+    if (!b) {
+        errno = ENOMEM;
+        return -1;
+    }
+    ssize_t r = pwrite(fd, b, n, off);
+    int e = errno;
+    free(b);
+    errno = e;
+    return r;
+}
+
+ssize_t pwritev64(int fd, const struct iovec *iov, int cnt, off_t off) __attribute__((alias("pwritev")));
 
 ssize_t read(int fd, void *buf, size_t n)
 {

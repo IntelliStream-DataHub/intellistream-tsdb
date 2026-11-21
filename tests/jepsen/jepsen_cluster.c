@@ -49,24 +49,28 @@
  * minute of timestamps (most of them large writes, shipped as files); classes adds small partitions and granules,
  * quick flushes and idle merges so that series switch partition classes (CLASS markers in the stream). A replica silent
  * for isr_lag_ms (1 s) leaves kvr's ISR and the writes go on without it (one it held up until then may time out:
- * indeterminate, never a failure); it joins again once caught up. The leader of kvr is never
- * the target of kill, power, pause or a midcommit restart (a restarted leader never leads again before r3e-failover);
- * its replicas are. midcommit also arms one of the driver's crash points (wal-before-send, acked-before-ok,
- * prepared-before-commit, class-switch) on every node at its first start behind a trigger file, made past the middle
- * of the run: the leader must end at it (nem_terminal), and the volume has no leader after that. The end check reads
- * every replica directory in place, read-only, after the clean stop (tests/cvol_check.c): with the leader alive to the
- * end, the run first waits (60 s) for kvr's ISR to be whole again, then the replicas hold the same rows
- * (replicas_equal) and the keys of the leader's final read; after the terminal point, each replica in kvr's last ISR
- * (rep_isr_mask) passes checks 1 and 2 as the final state, and the others check 2. In both cases every replica holds
- * each of the filler's large writes whole or not at all, whole when acknowledged and in the ISR (fill_check).
+ * indeterminate, never a failure); it joins again once caught up. kvr's leader is a target of kill, power, pause and
+ * a midcommit restart like any node (half of the picks go to it: pick_node), so the group fails the volume over under
+ * load; the clients follow its leader as the record names it (kv_leader, from the sampler) and reconnect on MOVED or
+ * UNAVAILABLE, and the readers go on through every failover: a node that does not lead kvr answers MOVED (tsdbd D5), so
+ * a stale read can only come from a deposed leader that still answers, which its lease must prevent (check 4).
+ * midcommit also arms one of the crash points of the driver (wal-before-send, acked-before-ok, prepared-before-commit,
+ * class-switch: the leader ends there) or of a failover (fence-saved-before-reply: a replica, promote-before-epoch: the
+ * new leader, depose-before-reopen: the old one) on every node at every start behind a trigger file, made past the
+ * middle of the run (nem_terminal; a failover point after a cut of the leader from every other node, which makes the
+ * failover). The trigger goes as soon as a node ended there, before anything is restarted, so the node that leads next
+ * does not end at the same point (and restarts from then on arm nothing). The end check reads every replica directory in place, read-only, after the clean
+ * stop (tests/cvol_check.c): the run first waits (90 s) for kvr's ISR to be whole again, then the replicas hold the
+ * same rows (replicas_equal) and the keys of the leader's final read, and every replica holds each of the filler's
+ * large writes whole or not at all, whole when acknowledged (fill_check).
  *
  * Selftest (--selftest-checker, --mutant NAME; each must fail, `make jepsen-cluster-selftest`): foreign-pid (a port file that names another
  * pid), takeover (a stale table, a foreign server on the node's old port, and a client that skips th_owns_port),
  * takeover-checked (the same with the check: refused, the run passes), noop-partition, unfired (an armed crash point
  * nobody placed), idle (a nemesis that sleeps through its naps), lost-write (a write missing from the final state), nokill, nopause,
  * nodelay and noreset (a kill, pause or delay that does nothing, a heal that resumes held links: the run fails),
- * rep-lost-write (kv: an acknowledged write missing from one replica's directory; under midcommit, from a member of
- * the last ISR after the terminal point), rep-half-batch (kv: half of an
+ * rep-lost-write (kv: an acknowledged write missing from one replica's directory, also under midcommit),
+ * rep-half-batch (kv: half of an
  * acknowledged large write of the filler missing from one replica's directory).
  *
  * Exit status: 0 ok, 1 a violation or a failed expectation, 2 the harness itself could not run.
@@ -81,6 +85,7 @@
 #include "tsdb.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -97,6 +102,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -135,6 +141,22 @@ static int64_t now_ns(void)
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 static int64_t now_ms(void) { return now_ns() / 1000000; }
+
+/* JEPSEN_TRACE=1: the nemesis's actions and kvr's leader changes, stamped with CLOCK_MONOTONIC ms (one clock for every
+ * process of the host), and the node and times of the operations a stale or non-monotonic read involves */
+static int trace_on;
+static void ev(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void ev(const char *fmt, ...)
+{
+    if (!trace_on)
+        return;
+    char b[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "jepsen-cluster: [%lld] %s\n", (long long)now_ms(), b);
+}
 
 static uint64_t mix(uint64_t x)
 {
@@ -647,6 +669,9 @@ static int start_node(int i, const char *crash_at, int *status)
         int fd = open(n->log, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0)
             dup2(fd, 2);
+        /* lets dump_threads' gdb (not an ancestor of the node) attach under yama ptrace_scope 1; kept across exec */
+        if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0) {
+        }
         execve(bin, (char *const *)argv, envp);
         _exit(127);
     }
@@ -679,6 +704,7 @@ static int start_node(int i, const char *crash_at, int *status)
     n->pport = th_pport;
     n->paused = 0;
     pthread_mutex_unlock(&tbl_mu);
+    ev("node %d up, pid %d", i, (int)pid);
     return 0;
 }
 
@@ -696,6 +722,7 @@ static int stop_node(int i, int sig)
     pthread_mutex_unlock(&tbl_mu);
     if (pid <= 0)
         return 0;
+    ev("node %d: signal %d to pid %d", i, sig, (int)pid);
     if (was_paused)
         signal_child(pid, SIGCONT);
     signal_child(pid, sig);
@@ -738,6 +765,7 @@ static int await_exit(int i, int ms)
             nodes[i].cport = nodes[i].pport = 0;
             nodes[i].paused = 0;
             pthread_mutex_unlock(&tbl_mu);
+            ev("node %d (pid %d) exited by itself, status 0x%x", i, (int)pid, st);
             return st;
         }
         if (r < 0)
@@ -755,6 +783,7 @@ static void pause_node(int i, int on)
     pid = nodes[i].pid;
     nodes[i].paused = on;
     pthread_mutex_unlock(&tbl_mu);
+    ev("node %d: %s", i, on ? "paused" : "resumed");
     if (strcmp(mutant, "nopause")) /* nopause: planted, nothing is stopped */
         signal_child(pid, on ? SIGSTOP : SIGCONT);
 }
@@ -819,6 +848,9 @@ static void view_free(struct view *v)
     memset(v, 0, sizeof *v);
 }
 
+/* why the last view_get of this thread failed: a settle that times out names it */
+static _Thread_local char view_err[300];
+
 /* STATUS of node i through its real peer port, as `tsdb cluster status` asks. 0, or -1 when it did not answer. */
 static int view_get(int i, struct view *v, int timeout_ms)
 {
@@ -826,20 +858,28 @@ static int view_get(int i, struct view *v, int timeout_ms)
     node_snap(i, NULL, NULL, &pp);
     memset(v, 0, sizeof *v);
     meta_init(&v->m);
-    if (pp <= 0)
+    if (pp <= 0) {
+        snprintf(view_err, sizeof view_err, "no peer port");
         return -1;
-    char addr[48], err[256];
+    }
+    char addr[48], err[256] = "";
     snprintf(addr, sizeof addr, "127.0.0.1:%d", pp);
-    int rc;
+    int rc = 0, ar;
     size_t len = 0;
-    if (cluster_admin(addr, secret, secret_len, CLUSTER_OP_STATUS, NULL, 0, timeout_ms, &rc, &v->raw, &len, err,
-                      sizeof err) != 0 || rc != 0 || cluster_status_parse(v->raw, len, &v->st) != 0) {
+    int64_t t0 = now_ms();
+    if ((ar = cluster_admin(addr, secret, secret_len, CLUSTER_OP_STATUS, NULL, 0, timeout_ms, &rc, &v->raw, &len, err,
+                            sizeof err)) != 0 ||
+        rc != 0 || cluster_status_parse(v->raw, len, &v->st) != 0) {
+        snprintf(view_err, sizeof view_err, "%s after %" PRId64 " ms (%s)",
+                 ar ? "no reply" : rc ? "rc != 0" : "a reply that does not parse", now_ms() - t0,
+                 ar ? err : rc ? "admin error" : "status");
         free(v->raw);
         meta_free(&v->m);
         memset(v, 0, sizeof *v);
         return -1;
     }
     if (v->st.image_len && meta_snapshot_decode(&v->m, v->st.image, v->st.image_len) != META_OK) {
+        snprintf(view_err, sizeof view_err, "an image of %zu bytes that does not decode", (size_t)v->st.image_len);
         view_free(v);
         return -1;
     }
@@ -873,9 +913,65 @@ static int admin_real(int i, int op, const void *req, size_t rl, int follow, int
 /* ------------------------------------------------------------------ the cluster and what must hold after a heal */
 
 #define SETTLE_MS 60000
+/* classes runs: the keep caps' age (repl_retain_s) and the longest quiet tail that waits for a first switch */
+#define CLASSES_RETAIN_S 30
+#define CLASSES_TAIL_MS (CLASSES_RETAIN_S * 1000 + 60000)
 
 /* Every node up and answering, one leader that every core node names, every member UP, the same metadata. A node
  * stuck in a state nobody leaves is what this is for. Returns 0, or -1 with `why` naming what is not yet so. */
+static int settle_bad = -1; /* the node a failing settled_once named last (STATUS), for the dump at a timeout */
+
+/* The threads of node i: name, state and kernel wait channel (what a cluster thread that answers no STATUS waits on) */
+static void dump_threads(int i)
+{
+    pid_t pid;
+    node_snap(i, &pid, NULL, NULL);
+    if (pid <= 0)
+        return;
+    char d[64];
+    snprintf(d, sizeof d, "/proc/%d/task", (int)pid);
+    DIR *dir = opendir(d);
+    if (!dir)
+        return;
+    fprintf(stderr, "jepsen-cluster: threads of node %d (pid %d): name state wchan\n", i, (int)pid);
+    struct dirent *e;
+    while ((e = readdir(dir))) {
+        if (e->d_name[0] == '.')
+            continue;
+        char p[384], comm[64] = "?", st[512] = "", wch[128] = "?";
+        FILE *f;
+        snprintf(p, sizeof p, "%s/%s/comm", d, e->d_name);
+        if ((f = fopen(p, "r"))) {
+            if (fgets(comm, sizeof comm, f))
+                comm[strcspn(comm, "\n")] = 0;
+            fclose(f);
+        }
+        snprintf(p, sizeof p, "%s/%s/stat", d, e->d_name);
+        if ((f = fopen(p, "r"))) {
+            if (!fgets(st, sizeof st, f))
+                st[0] = 0;
+            fclose(f);
+        }
+        const char *rp = strrchr(st, ')');
+        snprintf(p, sizeof p, "%s/%s/wchan", d, e->d_name);
+        if ((f = fopen(p, "r"))) {
+            if (!fgets(wch, sizeof wch, f))
+                snprintf(wch, sizeof wch, "?");
+            fclose(f);
+        }
+        fprintf(stderr, "  %s %s %c %s\n", e->d_name, comm, rp && rp[1] && rp[2] ? rp[2] : '?', wch);
+    }
+    closedir(dir);
+    if (access("/usr/bin/gdb", X_OK) == 0) { /* the node is our child: ptrace is allowed under yama scope 1 */
+        char cmd[160];
+        snprintf(cmd, sizeof cmd, "timeout 60 gdb -p %d -batch -ex 'thread apply all bt' </dev/null >&2 2>&1",
+                 (int)pid);
+        fflush(stderr);
+        if (system(cmd) != 0) {
+        }
+    }
+}
+
 static int settled_once(char *why, size_t wn)
 {
     struct view v[MAXN];
@@ -887,7 +983,8 @@ static int settled_once(char *why, size_t wn)
             snprintf(why, wn, "node %d is %s", i, pid <= 0 ? "not running" : "paused");
             rc = -1;
         } else if (view_get(i, &v[i], 2500) != 0) {
-            snprintf(why, wn, "node %d does not answer STATUS", i);
+            snprintf(why, wn, "node %d does not answer STATUS: %s", i, view_err);
+            settle_bad = i;
             rc = -1;
         } else {
             have[i] = 1;
@@ -939,7 +1036,7 @@ static int settles;
 
 static void settle(const char *after)
 {
-    char why[256] = "";
+    char why[512] = "";
     int64_t t0 = now_ms();
     int good = 0;
     while (now_ms() - t0 < SETTLE_MS) {
@@ -952,8 +1049,11 @@ static void settle(const char *after)
         usleep(200000);
     }
     int64_t took = now_ms() - t0;
-    if (good < 2)
+    if (good < 2) {
+        if (settle_bad >= 0 && strstr(why, "does not answer STATUS"))
+            dump_threads(settle_bad);
         die(1, "no settle within %d ms after %s: %s", SETTLE_MS, after, why);
+    }
     settles++;
     settle_ms_total += took;
     if (took > settle_ms_max)
@@ -970,6 +1070,32 @@ struct obs {
 static struct obs *obs;
 static _Atomic uint32_t nobs;
 static _Atomic int sampler_run, last_leader = -1;
+/* kvr (kv, classes): its replicas, the leader that rep_setup found, and kv_leader: the node the record with the highest
+ * epoch names as its leader, as the sampler last saw it (the clients follow it; epochs only grow, so a copy that lags
+ * never moves it back). */
+static int rep_leader = -1, rep_nodes[3];
+static uint32_t rep_number;
+static _Atomic int kv_leader = -1;
+static uint64_t kv_epoch;
+
+static void kv_leader_see(const struct view *v)
+{
+    if (rep_leader < 0)
+        return;
+    for (uint32_t k = 0; k < v->m.nvolumes; k++) {
+        const struct meta_volume *mv = &v->m.volumes[k];
+        if (mv->number != rep_number || !mv->leader || mv->epoch < kv_epoch)
+            continue;
+        for (int i = 0; i < nn; i++)
+            if (atomic_load(&nodes[i].id) == mv->leader) {
+                if (atomic_load(&kv_leader) != i || kv_epoch != mv->epoch)
+                    ev("kvr: leader node %d at epoch %llu (was node %d)", i, (unsigned long long)mv->epoch,
+                       atomic_load(&kv_leader));
+                kv_epoch = mv->epoch;
+                atomic_store(&kv_leader, i);
+            }
+    }
+}
 static pthread_t sampler_th;
 static uint64_t samples_ok, samples_failed;
 
@@ -988,6 +1114,7 @@ static void *sampler(void *arg)
                 continue;
             }
             samples_ok++;
+            kv_leader_see(&v);
             if (v.st.role == RAFT_LEADER_ROLE && v.st.mode == CLUSTER_MODE_CORE) {
                 atomic_store(&last_leader, i);
                 uint32_t k = atomic_load(&nobs);
@@ -1067,13 +1194,14 @@ enum { WS_INDET = 0, WS_OK = 1, WS_FAIL = 2 };
 struct wr {
     int8_t nk, keys[3];
     uint8_t st;
+    int8_t node; /* the node it was sent to */
     int64_t begin, end; /* end: INT64_MAX while indeterminate */
 };
 struct rd {
     int64_t begin, end;
+    int8_t node; /* the node that answered (kv_roam: a stale read names it) */
     uint32_t seen[KEYS]; /* the id of the write whose value a key shows, 0: nothing */
     uint8_t stray;
-    int8_t node; /* the node that answered it (kv_roam: a stale read names it) */
 };
 #define MAXSESS 4
 struct hist {
@@ -1090,7 +1218,7 @@ struct hist {
 static struct hist hists[MAXN];
 #define MAX_WRITE_ID (8u << 20) /* a float32 holds integers exactly up to 2^24 */
 
-static uint32_t hist_begin(struct hist *h, const int *keys, int nk)
+static uint32_t hist_begin(struct hist *h, const int *keys, int nk, int node)
 {
     pthread_mutex_lock(&h->mu);
     if (h->nw == h->wcap) {
@@ -1102,6 +1230,7 @@ static uint32_t hist_begin(struct hist *h, const int *keys, int nk)
     struct wr *w = &h->w[h->nw++];
     memset(w, 0, sizeof *w);
     w->nk = (int8_t)nk;
+    w->node = (int8_t)node;
     for (int k = 0; k < nk; k++)
         w->keys[k] = (int8_t)keys[k];
     w->st = WS_INDET;
@@ -1157,12 +1286,19 @@ static int kv_resolve(tsdbc *c, int hi, tsdb_sid *sid)
     return tsdbc_series(c, hists[hi].name, 0, sid);
 }
 
-/* the node a (re)connecting client of history hi takes: hist_node[hi], or under kv_roam the one a MOVED named, else
+/* the node a history's client connects to without kv_roam: kvr's current leader (kv, classes), kv-local's fixed node */
+static int hist_target(int hi)
+{
+    int l = atomic_load(&kv_leader);
+    return want_rep && l >= 0 ? l : hist_node[hi];
+}
+
+/* the node a (re)connecting client of history hi takes: hist_target(hi), or under kv_roam the one a MOVED named, else
  * a random member */
 static int kv_pick(int hi, int *next, uint64_t *r)
 {
     if (!kv_roam)
-        return hist_node[hi];
+        return hist_target(hi);
     int n = *next >= 0 ? *next : (int)(mix(*r += 1) % (uint64_t)nn);
     *next = -1;
     return n;
@@ -1232,7 +1368,7 @@ static void *kv_writer(void *arg)
                     keys[a] = keys[b];
                     keys[b] = t;
                 }
-        uint32_t id = hist_begin(h, keys, nk);
+        uint32_t id = hist_begin(h, keys, nk, node);
         int64_t ts[3];
         float val[3];
         for (int k = 0; k < nk; k++) {
@@ -1247,7 +1383,8 @@ static void *kv_writer(void *arg)
                    rc == TSDB_ERR_DROPPED || rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_DENIED) {
             hist_end(h, id, WS_FAIL); /* refused: definitely not applied */
             atomic_fetch_add(&kv_fail, 1);
-            if (kv_follow(c, hi, node, &next, &logged, "the writer")) {
+            if (kv_follow(c, hi, node, &next, &logged, "the writer") || rc == TSDB_ERR_MOVED ||
+                rc == TSDB_ERR_UNAVAILABLE) { /* kvr may lead elsewhere now */
                 tsdbc_close(c);
                 c = NULL;
             }
@@ -1289,11 +1426,6 @@ static int kv_read_all(tsdbc *c, tsdb_sid sid, struct rd *rd)
     return 0;
 }
 
-/* the moment the terminal crash point was triggered (kv, classes): the leader of kvr ends at it and comes back as a
- * replica, and the volume has no leader after it (no promotion before r3e-failover): the readers stop there (a replica
- * answers MOVED or UNAVAILABLE since route_decide, never a read; before it, it answered stale reads). */
-static _Atomic int64_t term_ns;
-
 static void *kv_reader(void *arg)
 {
     int hi = (int)(intptr_t)arg, node = hist_node[hi], next = -1;
@@ -1313,14 +1445,10 @@ static void *kv_reader(void *arg)
                 continue;
             }
         }
-        if (atomic_load(&term_ns)) {
-            usleep(100000);
-            continue;
-        }
         struct rd tmp;
         memset(&tmp, 0, sizeof tmp);
         tmp.node = (int8_t)node;
-        if (kv_read_all(c, sid, &tmp) == 0 && (!atomic_load(&term_ns) || tmp.begin < atomic_load(&term_ns)))
+        if (kv_read_all(c, sid, &tmp) == 0)
             *hist_read_slot(h, 0) = tmp;
         else {
             if (!kv_follow(c, hi, node, &next, &logged, "the reader")) /* MOVED: not applied, not a failure */
@@ -1407,8 +1535,6 @@ static void kv_setup(void)
  * it takes is the terminal crash point (nem_terminal). */
 #define REP_HISTS 2
 #define FILL_BASE (KV_BASE_TS + 86400000LL) /* the filler's rows: a day after the keys, never a key */
-static int rep_leader = -1, rep_nodes[3], protect_node = -1;
-static uint32_t rep_number;
 static char rep_dir[3][PATH_MAX + 32];
 static _Atomic uint64_t fill_ok, fill_err;
 /* The filler's batches in the order sent (one thread; read after kv_stop joined it): the timestamps [ts0, ts1] of each,
@@ -1450,7 +1576,9 @@ static void rep_setup(void)
             }
             if (ok && lead >= 0) {
                 rep_number = mv->number;
-                rep_leader = protect_node = lead;
+                rep_leader = lead;
+                kv_epoch = mv->epoch;
+                atomic_store(&kv_leader, lead);
             }
         }
         view_free(&v);
@@ -1492,6 +1620,21 @@ static void rep_setup(void)
  * answered. The leader commits on the union of the ISR in force and one it asked for (src/repl.c), and a member joins
  * only once its log reaches the commit point, so every member of the last ISR holds every write the leader
  * acknowledged; a replica outside it was not needed for the acknowledgements since it left. */
+/* The largest CLASSES on kvr's replicas, -1 when none has one: 24-byte records, the filler's first class and then one
+ * per switch, so 48 or more is a switch. */
+static long long classes_most(void)
+{
+    long long most = -1;
+    for (int r = 0; r < 3; r++) {
+        struct stat cs;
+        char cl[PATH_MAX + 48];
+        snprintf(cl, sizeof cl, "%s/CLASSES", rep_dir[r]);
+        if (stat(cl, &cs) == 0 && (long long)cs.st_size > most)
+            most = (long long)cs.st_size;
+    }
+    return most;
+}
+
 static int rep_isr_mask(uint64_t *ver)
 {
     int mask = -1;
@@ -1535,7 +1678,7 @@ static void *fill_writer(void *arg)
     tsdb_sid sid = 0;
     while (atomic_load(&kv_run)) {
         if (!c) {
-            if (connect_node(rep_leader, 0, &c) != 0 || tsdbc_series(c, "kvr.fill", 0, &sid) != 0) {
+            if (connect_node(atomic_load(&kv_leader), 0, &c) != 0 || tsdbc_series(c, "kvr.fill", 0, &sid) != 0) {
                 if (c)
                     tsdbc_close(c);
                 c = NULL;
@@ -1605,7 +1748,7 @@ static void kv_final(int i)
     while (now_ms() - t0 < 30000) {
         tsdbc *c = NULL;
         tsdb_sid sid;
-        if (connect_node(hist_node[i], 1, &c) == 0) {
+        if (connect_node(hist_target(i), 1, &c) == 0) {
             struct rd rd;
             memset(&rd, 0, sizeof rd);
             if (kv_resolve(c, i, &sid) == 0 && kv_read_all(c, sid, &rd) == 0) {
@@ -1620,7 +1763,7 @@ static void kv_final(int i)
         }
         usleep(200000);
     }
-    die(1, "node %d: no final read of %s within 30 s", hist_node[i], h->name);
+    die(1, "node %d: no final read of %s within 30 s", hist_target(i), h->name);
 }
 
 static int cmp_i64pair(const void *a, const void *b)
@@ -1642,6 +1785,37 @@ static int viol_by[V_KINDS];
             fputc('\n', stderr);                                                                                      \
         }                                                                                                             \
     } while (0)
+
+static const char *const ws_name[] = {"indeterminate", "acknowledged", "refused"};
+static void trace_op(const struct hist *h, const char *what, uint32_t id)
+{
+    if (!trace_on || id == 0 || id > h->nw)
+        return;
+    const struct wr *x = &h->w[id - 1];
+    fprintf(stderr, "jepsen-cluster:   %s: write %u to node %d, [%lld, %lld] ms, %s\n", what, id, x->node,
+            (long long)(x->begin / 1000000), x->end == INT64_MAX ? -1LL : (long long)(x->end / 1000000), ws_name[x->st]);
+}
+/* the acknowledged write of key k that ended before `t` with the latest begin */
+static uint32_t trace_acked_before(const struct hist *h, int k, int64_t t)
+{
+    uint32_t best = 0;
+    for (uint32_t id = 1; id <= h->nw; id++) {
+        const struct wr *x = &h->w[id - 1];
+        int has = 0;
+        for (int j = 0; j < x->nk; j++)
+            has |= x->keys[j] == k;
+        if (has && x->st == WS_OK && x->end < t && (!best || x->begin > h->w[best - 1].begin))
+            best = id;
+    }
+    return best;
+}
+static void trace_read(const struct hist *h, const char *what, const struct rd *rd)
+{
+    if (trace_on)
+        fprintf(stderr, "jepsen-cluster:   %s: node %d, [%lld, %lld] ms\n", what, rd->node, (long long)(rd->begin / 1000000),
+                (long long)(rd->end / 1000000));
+    (void)h;
+}
 
 /* Checks 1-5 of the header over one history. Returns the number of violations. `r[0]` is the one session of kv-local. */
 static int check_hist(struct hist *h, uint64_t *seen_indet_applied)
@@ -1760,12 +1934,20 @@ static int check_hist(struct hist *h, uint64_t *seen_indet_applied)
                         hi = mid;
                 }
                 if (lo > 0) {
+                    int pr = viol_by[V_STALE] < 3;
                     if (v == 0)
                         VIOL(V_STALE, "stale read: key %d is empty in a read that began after it was written and acknowledged "
                                      "(read %u, answered by node %d)", k, j, rd->node);
                     else if (v <= nw && w[v - 1].end < ack[k][2 * (lo - 1) + 1])
                         VIOL(V_STALE, "stale read: key %d shows write %u, older than an acknowledged write of the key (read %u, "
                                      "answered by node %d)", k, v, j, rd->node);
+                    else
+                        pr = 0;
+                    if (pr) {
+                        trace_read(h, "the read", rd);
+                        trace_op(h, "it saw", v);
+                        trace_op(h, "acknowledged before it", trace_acked_before(h, k, rd->begin));
+                    }
                 }
                 /* 3: what a write that is seen did at its other keys */
                 if (v && v <= nw)
@@ -1779,8 +1961,16 @@ static int check_hist(struct hist *h, uint64_t *seen_indet_applied)
                 /* 5: monotonic reads of a session */
                 if (prev && prev->seen[k] && prev->seen[k] <= nw) {
                     uint32_t pv = prev->seen[k];
-                    if (v == 0 || (v <= nw && w[v - 1].end < w[pv - 1].begin))
+                    if (v == 0 || (v <= nw && w[v - 1].end < w[pv - 1].begin)) {
+                        int pr = viol_by[V_MONO] < 3;
                         VIOL(V_MONO, "monotonic reads: key %d went back from write %u to %s", k, pv, v ? "an older one" : "nothing");
+                        if (pr) {
+                            trace_read(h, "the earlier read", prev);
+                            trace_read(h, "the later read", rd);
+                            trace_op(h, "the earlier read saw", pv);
+                            trace_op(h, "the later read saw", v);
+                        }
+                    }
                 }
             }
             prev = rd;
@@ -2148,9 +2338,11 @@ static int selftest_replicas(void)
 /* ------------------------------------------------------------------ nemeses */
 
 /* The crash points a midcommit round may arm. `placed`: the call exists in server code (r3d and r3e flip it as they
- * place theirs); `window_ms`: how long the armed node may run before the point is called unfired; `leader`: only the
- * leader of a replicated volume passes it (server/repld.c), so it is never armed by a restart (that would end the
- * leadership) but at every node's first start behind a trigger file, once per run (nem_terminal; kv and classes). */
+ * place theirs); `window_ms`: how long the armed node may run before the point is called unfired; `leader`: 1, only the
+ * leader of a replicated volume passes it (server/repld.c), 2, only a failover passes it (a replica saving a fence, the
+ * promoted replica, the deposed leader). Neither is armed by a restart (a restart of the leader would end its
+ * leadership, and a failover point would go unfired) but at every node's first start behind a trigger file, once per
+ * run (nem_terminal; kv and classes), which makes the failover for a point of 2. */
 static struct {
     const char *name;
     int placed, window_ms, leader;
@@ -2159,7 +2351,10 @@ static struct {
            {"wal-before-send", 1, 20000, 1},
            {"acked-before-ok", 1, 20000, 1},
            {"prepared-before-commit", 1, 20000, 1},
-           {"class-switch", 1, 30000, 1}};
+           {"class-switch", 1, 30000, 1},
+           {"fence-saved-before-reply", 1, 30000, 2},
+           {"promote-before-epoch", 1, 30000, 2},
+           {"depose-before-reopen", 1, 30000, 2}};
 #define NCPS ((int)(sizeof cps / sizeof cps[0]))
 
 static unsigned faults[8], restarts, cp_hits, cp_hits_serving, cp_unfired, power_hits, power_idle;
@@ -2176,23 +2371,27 @@ static void hold_ms(int ms)
     }
 }
 
-/* a node to kill, power off, pause or arm: never the replicated volume's leader (protect_node) */
+/* a node to kill, power off, pause or arm: kv and classes pick kvr's leader half of the time (a failover under load),
+ * `bias_leader` the Raft leader half of the time (of the rest, with kvr) */
 static int pick_node(int bias_leader)
 {
-    int l = atomic_load(&last_leader);
-    if (bias_leader && l >= 0 && l < nn && l != protect_node && rnd() % 2)
+    int k = atomic_load(&kv_leader), l = atomic_load(&last_leader);
+    if (want_rep && k >= 0 && k < nn && rnd() % 2)
+        return k;
+    if (bias_leader && l >= 0 && l < nn && rnd() % 2)
         return l;
-    for (;;) {
-        int i = rnd_range(0, nn - 1);
-        if (i != protect_node)
-            return i;
-    }
+    return rnd_range(0, nn - 1);
 }
 
+static int term_cp = -1, term_fired, term_done, isr_short;
+static char term_trigger[PATH_MAX], term_spec[PATH_MAX + 64];
+
+/* a restart before the terminal point keeps the node armed for it: kvr's leader and replicas are restarted too, and any
+ * of them may be the one that must end there */
 static void restart_node(int i)
 {
     int st = 0;
-    if (start_node(i, NULL, &st) != 0)
+    if (start_node(i, term_cp >= 0 && !term_done ? term_spec : NULL, &st) != 0)
         die(1, "node %d exited with status 0x%x right after a restart (log %s)", i, st, nodes[i].log);
     restarts++;
 }
@@ -2217,6 +2416,7 @@ static void nem_power(void)
     node_snap(i, &pid, NULL, NULL);
     signal_child(pid, SIGUSR2); /* the shim cuts the power at the node's next file operation */
     int st = await_exit(i, 6000);
+    ev("node %d: power cut (status 0x%x)", i, st);
     if (st == -1) { /* no file operation in time: the node goes down as with kill */
         int ks = stop_node(i, SIGKILL);
         power_idle++;
@@ -2326,38 +2526,101 @@ static void nem_midcommit(void)
     restart_node(i);
 }
 
-/* The terminal crash point (kv, classes, midcommit): every node started first with TSDB_CRASH_AT=<point>:1@<trigger>;
- * past the middle of the run the trigger file is made and the leader of the replicated volume must end at the point
- * within its window. Restarted, it never leads that volume again (no failover before r3e): the rest of the run writes
- * fail, and the end check reads the replica directories as the final state. */
-static int term_cp = -1, term_fired, term_done, isr_short;
-static char term_trigger[PATH_MAX], term_spec[PATH_MAX + 64];
-
+/* The terminal crash point (kv, classes, midcommit): every node runs with TSDB_CRASH_AT=<point>:1@<trigger> until then;
+ * past the middle of the run the trigger file is made. A leader point (cps[].leader 1): kvr's leader must end there
+ * within the window. A failover point (2): kvr's leader is then cut from every other node, which makes the group move
+ * the volume (the replicas are fenced and one is promoted), and one of kvr's nodes must end there: a replica that saved
+ * the fence, the promoted one, or the old leader, deposed once the cut heals (after 10 s, or as soon as a node ended
+ * there). Several nodes may end at the point at once (both replicas save a fence): every one that ends within a second
+ * of the first is counted, and any other way to end is a failure. The trigger goes before anything is restarted, so
+ * the node that leads next (and was armed at its first start) does not end at the same point; then the cut heals and
+ * the nodes come back, and the run goes on with the volume led wherever the group put it. */
 static void nem_terminal(void)
 {
-    int L = rep_leader;
+    int L = atomic_load(&kv_leader), fo = cps[term_cp].leader == 2, win = cps[term_cp].window_ms;
+    /* a leader promoted shortly before decides no switch until the members' log start passes its attach, up to
+     * CLASSES_RETAIN_S later (CLS_DEFER; r3e-fix16: 2 of 13 runs fired 28 and 34 s after the trigger) */
+    if (want_classes && !strcmp(cps[term_cp].name, "class-switch"))
+        win += CLASSES_RETAIN_S * 1000;
+    if (fo) {
+        /* a failover needs another ISR member to promote: a leader that is the ISR alone (the others not yet back
+         * after the faults before) is only cut, and the point never fires (seed 12103 epoll) */
+        int64_t tw = now_ms();
+        uint64_t ver;
+        int m;
+        while ((m = rep_isr_mask(&ver)) != 7 && now_ms() - tw < 60000)
+            usleep(200000);
+        if (m != 7)
+            fprintf(stderr, "jepsen-cluster: the ISR of kvr is not whole (mask %d) 60 s before the failover point %s\n", m,
+                    cps[term_cp].name);
+        ev("ISR of kvr mask %d before the failover point (%lld ms)", m, (long long)(now_ms() - tw));
+        L = atomic_load(&kv_leader);
+    }
     int fd = open(term_trigger, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0)
         die(2, "create %s: %s", term_trigger, strerror(errno));
     close(fd);
-    atomic_store(&term_ns, now_ns());
-    int win = cps[term_cp].window_ms, st = await_exit(L, win);
-    if (st == -1) {
+    if (fo) {
+        for (int j = 0; j < nn; j++)
+            if (j != L)
+                net_cut(L, j, 1);
+        net_cut_done();
+    }
+    int ended[MAXN] = {0}, nend = 0, healed = !fo;
+    int64_t t0 = now_ms(), first = -1;
+    for (;;) {
+        for (int r = 0; r < 3; r++) {
+            int i = rep_nodes[r];
+            if (!fo && i != L)
+                continue;
+            pid_t pid;
+            node_snap(i, &pid, NULL, NULL);
+            if (pid <= 0 || ended[i])
+                continue;
+            int st = await_exit(i, 0);
+            if (st == -1)
+                continue;
+            if (!(WIFEXITED(st) && WEXITSTATUS(st) == CRASH_EXIT_STATUS))
+                die(1, "node %d (%s of kvr) ended with status 0x%x with %s triggered, not at the point (log %s)", i,
+                    i == L ? "the leader" : "a replica", st, cps[term_cp].name, nodes[i].log);
+            ended[i] = 1;
+            nend++;
+            if (first < 0) {
+                first = now_ms();
+                unlink(term_trigger); /* before the next leader passes the point */
+            }
+        }
+        if (fo && !healed && (first >= 0 || now_ms() - t0 >= 10000)) {
+            net_heal();
+            healed = 1;
+        }
+        if ((first >= 0 && now_ms() - first >= 1000) || now_ms() - t0 >= win)
+            break;
+        usleep(20000);
+    }
+    if (!healed)
+        net_heal();
+    if (first < 0) {
+        unlink(term_trigger);
         cp_unfired++;
-        snprintf(unfired_msg, sizeof unfired_msg, "the armed crash point %s never fired on node %d (the leader of kvr) "
-                 "within %d ms of its trigger", cps[term_cp].name, L, win);
-        stop_node(L, SIGKILL);
-    } else if (WIFEXITED(st) && WEXITSTATUS(st) == CRASH_EXIT_STATUS) {
-        cp_hits++;
-        cp_hits_serving++;
+        snprintf(unfired_msg, sizeof unfired_msg, "the armed crash point %s never fired on %s within %d ms of its "
+                 "trigger", cps[term_cp].name, fo ? "any node of kvr (its leader cut from the others)" :
+                 "kvr's leader", win);
+        if (!fo)
+            stop_node(L, SIGKILL);
+    } else {
+        cp_hits += (unsigned)nend;
+        cp_hits_serving += (unsigned)nend;
         term_fired = 1;
-    } else
-        die(1, "node %d (the leader of kvr) ended with status 0x%x with %s triggered, not at the point (log %s)", L, st,
-            cps[term_cp].name, nodes[L].log);
+        printf("jepsen-cluster: terminal crash point %s: %d node(s) ended there, %s%s\n", cps[term_cp].name, nend,
+               ended[L] ? "the leader" : "not the leader", fo ? " (failover)" : "");
+    }
     effect_seen = 1;
     term_done = 1;
     hold_ms(rnd_range(200, 800));
-    restart_node(L);
+    for (int i = 0; i < nn; i++)
+        if (ended[i] || (first < 0 && !fo && i == L))
+            restart_node(i);
 }
 
 static unsigned leader_cuts, leader_replaced, delays_applied;
@@ -2495,6 +2758,16 @@ static int cluster_form(void)
     S.node_timeout_ms = 1500;
     S.heartbeat_ms = 200;
     S.lease_s = 4;
+    /* classes: a promoted writer decides no class switch while a member's log may still replay below its attach
+     * (CLS_DEFER, design-cluster.md 8.3: the replay floor is the members' log start, which the keep caps hold up to
+     * repl_retain_s back); with the default 30 min every failover ended the switches for the rest of the run. 30 s
+     * lets the floor pass the attach about 31 s after a promotion (flushes every 500 ms); under kill and power a new
+     * epoch comes every 5 to 14 s, so those runs switch in the quiet tail after the last heal (classes_tail, up to
+     * CLASSES_TAIL_MS). Shorter caps strand a member that fell further behind than them: it needs a snapshot, which
+     * is not built yet (r3e-fix14: 3 s left a learner behind in 4 of 13 runs, a partition-only run among them;
+     * r3e-fix15: 10 s in 2 of 13, a learner killed again and again while it caught up). */
+    if (want_classes)
+        S.repl_retain_s = CLASSES_RETAIN_S;
     uint8_t req[64];
     size_t rl = cluster_settings_encode(&S, META_MODE_REPLICATED, req);
     int rc = admin_real(0, CLUSTER_OP_INIT, req, rl, 0, 10000);
@@ -2784,12 +3057,17 @@ int main(int argc, char **argv)
             die(2, "mkdir %s: %s", st, strerror(errno));
         proxy_start(i);
     }
+    trace_on = getenv("JEPSEN_TRACE") && atoi(getenv("JEPSEN_TRACE")) > 0;
     if (want_rep && (nemeses & N_MIDCOMMIT) && strcmp(mutant, "unfired")) {
         int cand[NCPS], nc = 0;
         for (int k = 0; k < NCPS; k++)
             if (cps[k].placed && cps[k].leader && (want_classes || strcmp(cps[k].name, "class-switch")))
                 cand[nc++] = k;
         term_cp = cand[rnd() % (uint64_t)nc];
+        const char *want_cp = getenv("JEPSEN_TERMINAL"); /* a point by name, to try one (the run's seed picks otherwise) */
+        for (int k = 0; want_cp && *want_cp && k < nc; k++)
+            if (!strcmp(cps[cand[k]].name, want_cp))
+                term_cp = cand[k];
         snprintf(term_trigger, sizeof term_trigger, "%s/terminal.trigger", rundir);
         snprintf(term_spec, sizeof term_spec, "%s:1@%s", cps[term_cp].name, term_trigger);
     }
@@ -2821,7 +3099,7 @@ int main(int argc, char **argv)
     int64_t t_start = now_ms(), t_end = t_start + (int64_t)seconds * 1000;
     int takeover = !strncmp(mutant, "takeover", 8);
     unsigned rounds = 0, applied = 0;
-    while (now_ms() < t_end && (nk || takeover)) {
+    while (now_ms() < t_end) { /* --nemesis none: the workloads run their seconds without faults */
         check_unexpected_exits();
         if (takeover && !takeover_done && now_ms() - t_start > (int64_t)seconds * 1000 / 3) {
             takeover_event();
@@ -2877,23 +3155,36 @@ int main(int argc, char **argv)
             restart_node(i);
     }
     settle("the last heal");
+    /* classes_tail: under kill and power the writer changed too often for its switches to come out of CLS_DEFER, so a
+     * run that has made none yet goes on without faults (the writers still running) until one is in a CLASSES; the
+     * check at the end fails a run of 30 s or more that has none even then */
+    if (want_classes && seconds >= 30 && classes_most() < 2 * 24 &&
+        !(term_fired && !strcmp(cps[term_cp].name, "class-switch"))) {
+        int64_t t0 = now_ms();
+        while (classes_most() < 2 * 24 && now_ms() - t0 < CLASSES_TAIL_MS) {
+            check_unexpected_exits();
+            usleep(200000);
+        }
+        printf("jepsen-cluster: classes: %s %lld ms into the quiet tail after the last heal\n",
+               classes_most() < 2 * 24 ? "still no switch" : "the first switch", (long long)(now_ms() - t0));
+    }
     int viol = 0;
     uint64_t indet_applied = 0, nreads = 0, nwrites = 0;
     if (want_kv || want_rep) {
         kv_stop();
         if (want_rep)
             hold_ms(2000); /* the leader's commit point passes what was appended for the writes that timed out */
-        if (want_rep && !term_fired) {
+        if (want_rep) {
             /* a replica that left the ISR (out for isr_lag_ms under a kill, pause, partition or power loss) holds
              * what was acknowledged without it only once it has caught up and joined again; the end compares every
              * replica with the leader's final read, so it waits for that. One that never joins is a finding. */
             int64_t t0 = now_ms();
             uint64_t ver;
             int m = rep_isr_mask(&ver);
-            for (; m != 7 && now_ms() - t0 < 60000; m = rep_isr_mask(&ver))
+            for (; m != 7 && now_ms() - t0 < 90000; m = rep_isr_mask(&ver))
                 usleep(200000);
             if (m != 7) {
-                fprintf(stderr, "jepsen-cluster: FAIL: the ISR of kvr is not whole 60 s after the last heal (mask %d, "
+                fprintf(stderr, "jepsen-cluster: FAIL: the ISR of kvr is not whole 90 s after the last heal (mask %d, "
                         "version %" PRIu64 "): a replica never caught up and joined again\n", m, ver);
                 isr_short = 1;
             } else if (now_ms() - t0 > 200) {
@@ -2902,7 +3193,7 @@ int main(int argc, char **argv)
                 hold_ms(2000);
             }
         }
-        for (int i = 0; i < nhists && !term_fired; i++)
+        for (int i = 0; i < nhists; i++)
             kv_final(i);
         if (!strcmp(mutant, "lost-write")) { /* planted: the final state of node 0 lacks a write that was acknowledged */
             struct hist *h = &hists[0];
@@ -2929,18 +3220,6 @@ int main(int argc, char **argv)
     const char *dirs[MAXN * 3];
     int nd = replica_dirs(dirs, MAXN * 3);
     int rdiff = isr_short, isr = 7;
-    if (want_rep && term_fired) {
-        /* after the terminal point kvr has no leader, so nothing changes its ISR any more */
-        uint64_t ver;
-        isr = rep_isr_mask(&ver);
-        if (isr < 0) {
-            fprintf(stderr, "jepsen-cluster: FAIL: no node answered with kvr's ISR after the terminal crash point\n");
-            rdiff++;
-            isr = 7;
-        } else
-            printf("jepsen-cluster: kvr's last ISR (version %" PRIu64 "): replicas%s%s%s\n", ver,
-                   isr & 1 ? " 0" : "", isr & 2 ? " 1" : "", isr & 4 ? " 2" : "");
-    }
     /* a clean stop of every node: SIGTERM, status 0 */
     int unclean = 0;
     for (int i = 0; i < nn; i++) {
@@ -2955,9 +3234,8 @@ int main(int argc, char **argv)
         waitpid(foreign_pid, NULL, 0);
     }
     if (nd > 0) {
-        if (!term_fired) /* after the terminal point a replica may lack what the leader appended last */
-            rdiff += replicas_equal(dirs, nd, 1);
-        rdiff += rep_check(term_fired, isr, &viol);
+        rdiff += replicas_equal(dirs, nd, 1);
+        rdiff += rep_check(0, isr, &viol);
         if (rdiff)
             fprintf(stderr, "jepsen-cluster: FAIL: %d difference(s) between the replicas of kvr, with its leader's "
                             "final read, or in the filler's large writes\n", rdiff);
@@ -3016,6 +3294,22 @@ int main(int argc, char **argv)
     }
     if (unclean || rdiff)
         rc = 1;
+    if ((want_kv || want_rep) && (!atomic_load(&kv_ok) || !nreads)) { /* nothing to check is no evidence */
+        fprintf(stderr, "jepsen-cluster: FAIL: the workload did nothing: %" PRIu64 " writes acknowledged, %" PRIu64
+                " reads\n", (uint64_t)atomic_load(&kv_ok), nreads);
+        rc = 1;
+    }
+    /* a classes run whose series never switched checked no CLASS marker; a terminal crash point that fired inside a
+     * switch counts as one (its record may never have reached CLASSES) */
+    if (want_classes && seconds >= 30 && !(term_fired && !strcmp(cps[term_cp].name, "class-switch"))) {
+        long long most = classes_most();
+        if (most < 2 * 24) { /* 24-byte records: the filler's first class, then one per switch */
+            fprintf(stderr, "jepsen-cluster: FAIL: the classes workload made no class switch, not even in %d s without "
+                            "faults after the last heal (CLASSES %lld bytes at most on kvr's replicas)\n",
+                    CLASSES_TAIL_MS / 1000, most);
+            rc = 1;
+        }
+    }
     unsigned expect = (unsigned)(seconds / 10 > 0 ? seconds / 10 : 1); /* a round is 3 to 8 s */
     if (nk && !takeover && total_faults < expect) {
         fprintf(stderr, "jepsen-cluster: FAIL: only %u faults in %d s (at least %u expected): the nemesis was idle\n",

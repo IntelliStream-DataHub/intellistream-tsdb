@@ -288,6 +288,9 @@ $(B)/test_intents: tests/test_intents.c src/internal.h $(LIB) $(CRASHFS_SO)
 # every step of create and save (crashfs); the mutant runs plant the bugs it guards against and must fail
 $(B)/test_replfile: tests/test_replfile.c src/replfile.h src/repl.h src/internal.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+# the power-loss shim itself: writev and pwritev are tracked (the Raft log appends with pwritev)
+$(B)/test_crashfs: tests/test_crashfs.c $(CRASHFS_SO) | $(B)
+	$(CC) $(CFLAGS) -o $@ $<
 
 # the engine as a replica (src/replica.c, design-cluster.md step 3): the mutant runs plant the bugs it guards against
 $(B)/test_replica: tests/test_replica.c src/replica.h src/internal.h $(LIB) $(CRASHFS_SO)
@@ -319,7 +322,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -343,13 +346,14 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_intents --mutant unlinkfirst $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'ROWS WRONG' # the old order must lose rows
 	./$(B)/test_replfile $(or $(TMPDIR),/tmp)
 	for m in nosync sameslot nochecksum; do ! ./$(B)/test_replfile --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	./$(B)/test_crashfs $(or $(TMPDIR),/tmp)
 	./$(B)/test_replica $(or $(TMPDIR),/tmp)
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 ./$(B)/test_replica --mutant walsequnlocked $(or $(TMPDIR),/tmp) >$(B)/walsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/walsequnlocked.log) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 ./$(B)/test_replica --mutant cutwalsequnlocked $(or $(TMPDIR),/tmp) >$(B)/cutwalsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/cutwalsequnlocked.log && grep -q replica_cut $(B)/cutwalsequnlocked.log) # and a cut's
 	./$(B)/test_cvol $(or $(TMPDIR),/tmp)
 	./$(B)/test_cvolfs $(or $(TMPDIR),/tmp)
 	for m in nosync nodirsync nononce trustunsure tornstale samerid; do ! ./$(B)/test_cvolfs --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
-	for m in applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu; do ! ./$(B)/test_replica --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done
+	for m in applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles; do ! ./$(B)/test_replica --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done
 	./$(B)/test_feedstore $(or $(TMPDIR),/tmp)
 	! ./$(B)/test_feedstore --mutant noseal $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # a replayed segment renamed without its fdatasync must fail it
 	! ./$(B)/test_feedstore --mutant latefloor $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # the cleaner's floor set after its unlinks must fail it
@@ -442,7 +446,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/tsdbd $(B)/t
 	./$(B)/test_peerlink $(or $(TMPDIR),/tmp)
 	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead; do ! ./$(B)/test_peerlink $(or $(TMPDIR),/tmp) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 
-# the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 17 runs of 2 minutes each under a sanitizer
+# the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 18 runs of 2 minutes each under a sanitizer
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
 	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
 
@@ -859,7 +863,8 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(or $(TMPDIR),/tmp) commitbyleader floornotsaved ackbeforesync nodepose noquiesce floornottold \
 	    unsureignored admitnocheck nofastpath nocursorup commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal \
 	    noinboxbound nospill keepignorespeers keepwritten nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr fastride \
-	    nojoinhold inboxstarve opennohold tickstretch stepcurrentonly
+	    nojoinhold inboxstarve opennohold promotenone tickstretch stepcurrentonly stallcatchup keepunanswered fencenosync nomoved deposemoved \
+	    refusedsilent
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(or $(TMPDIR),/tmp)
@@ -1338,13 +1343,13 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
 	out=$$($$j --mutant lost-write --seconds 12 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a lost write'; then \
 	        echo "jepsen-cluster-selftest: a write missing from the final state went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$($$j --mutant rep-lost-write --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	out=$$($$j --mutant rep-lost-write --seconds 30 --nemesis kill --workload kv 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "the leader's final read"; then \
 	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --mutant rep-lost-write --seconds 20 --nemesis midcommit --workload kv 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "kvr's last ISR" || ! echo "$$out" | grep -q '@n[0-9]*: durability'; then \
-	        echo "jepsen-cluster-selftest: an acknowledged write missing from a member of kvr's last ISR after the terminal point went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$($$j --mutant rep-half-batch --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "terminal crash point .*ended there" || ! echo "$$out" | grep -q "the leader's final read"; then \
+	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr after the terminal point and its failover went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant rep-half-batch --seconds 30 --nemesis kill --workload kv 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'half of a large write'; then \
 	        echo "jepsen-cluster-selftest: half of an acknowledged large write in a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-checker 2>&1); rc=$$?; \

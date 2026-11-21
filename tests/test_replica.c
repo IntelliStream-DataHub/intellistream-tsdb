@@ -474,6 +474,85 @@ static void case_basic(void)
     leader_free(&l);
 }
 
+/* A replica keeps its flushed segments under the retention caps, past its floor (design-cluster.md 8.3): a failover
+ * may promote it, and a member that lags it catches up from them or needs a snapshot (jepsen-cluster, r3e: a deposed
+ * writer reopened as a replica dropped what a killed member needed next). The caps count from the newest flushed segment
+ * back; an open with the caps (replica_keep_next) keeps what it replays and flushes; without caps the floor alone
+ * decides, as before. Mutant replicadropsfloor (the floor alone again). */
+static void case_keepcap(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "kc");
+    leader l;
+    unsigned rng = 7;
+    leader_init(&l);
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 4; i++)
+            leader_rows(&l, 3 + s, &rng);
+        leader_roll(&l);
+    }
+    for (int i = 0; i < 2; i++)
+        leader_rows(&l, 2, &rng);
+    uint64_t end = l.r[l.n - 1].last;
+    eng *db;
+    replica_keep_next(0, 3600 * 1000); /* an hour, no byte cap */
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, end), 0);
+    CHECK_EQ(mt_flush(db), 0);
+    CHECK_EQ(replica_floor_saved(db, end), 0);
+    CHECK_EQ(count_files(dir, "wal_"), 4); /* three flushed ones within the caps, and the active one */
+    model m;
+    model_at(&l, end, &m);
+    CHECK(same_as(db, &m, "keepcap: kept"));
+    /* reopened with the caps: what the open replays and flushes stays */
+    CHECK_EQ(eng_close(db), 0);
+    replica_keep_next(0, 3600 * 1000);
+    CHECK_EQ(open_replica(dir, end, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(mt_flush(db), 0);
+    CHECK_EQ(replica_floor_saved(db, end), 0);
+    CHECK_EQ(count_files(dir, "wal_"), 4);
+    CHECK(same_as(db, &m, "keepcap: reopened"));
+    /* the byte cap counts from the newest flushed segment back: exactly its size keeps it alone */
+    char name[64];
+    struct stat st;
+    wal_name(name, sizeof name, l.r[l.n - 1].seq - 1);
+    CHECK_EQ(fstatat(db->dirfd, name, &st, 0), 0);
+    replica_keep_cap(db, (uint64_t)st.st_size, 0);
+    CHECK_EQ(replica_floor_saved(db, end), 0);
+    CHECK_EQ(count_files(dir, "wal_"), 2);
+    CHECK_EQ(fstatat(db->dirfd, name, &st, 0), 0);
+    /* the age cap: past it every flushed segment goes */
+    replica_keep_cap(db, 0, 1);
+    usleep(5000);
+    CHECK_EQ(replica_floor_saved(db, end), 0);
+    CHECK_EQ(count_files(dir, "wal_"), 1);
+    CHECK(same_as(db, &m, "keepcap: capped"));
+    CHECK_EQ(eng_close(db), 0);
+    /* never past the floor, whatever the caps say */
+    char dir2[PATH_MAX];
+    fresh(dir2, "kc2");
+    replica_keep_next(1, 1);
+    CHECK_EQ(open_replica(dir2, 0, &db), 0);
+    if (db) {
+        CHECK_EQ(feed(db, &l, 0, l.n), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(replica_apply(db, end), 0);
+        CHECK_EQ(mt_flush(db), 0);
+        usleep(5000);
+        CHECK_EQ(replica_floor_saved(db, l.r[0].last), 0);
+        CHECK_EQ(count_files(dir2, "wal_"), 4); /* the first segment ends above that floor */
+        CHECK_EQ(eng_close(db), 0);
+    }
+    leader_free(&l);
+    sh("rm -rf '%s' '%s'", dir, dir2);
+}
+
 /* ------------------------------------------------------------ read */
 
 /* the sender's side: the log read back in chunks gives exactly the bytes that were appended, at every chunk size and
@@ -1540,6 +1619,167 @@ static void case_open_checks(void)
     CHECK_EQ(open_replica(dir, 0, &db), TSDB_ERR_CORRUPT);
     leader_free(&l);
 
+    /* the same gap below the parts and the floor is a batch of unlinks a power loss kept only in part (jepsen-cluster
+     * power, 2026-11-20: every open refused the volume for good): the segment before it goes, the open succeeds
+     * (mutant noleftover) */
+    fresh(dir, "j1b");
+    leader_init(&l);
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        leader_roll(&l);
+    }
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    end = l.r[l.n - 1].last;
+    CHECK_EQ(replica_apply(db, end), 0);
+    char s1[PATH_MAX + 64], s3[PATH_MAX + 64], k1[PATH_MAX + 80], k3[PATH_MAX + 80];
+    seg_file(s1, sizeof s1, dir, 1);
+    seg_file(s3, sizeof s3, dir, 3);
+    snprintf(k1, sizeof k1, "%s.save", s1);
+    snprintf(k3, sizeof k3, "%s.save", s3);
+    CHECK_EQ(link(s1, k1), 0); /* the unlinks the power loss "lost" */
+    CHECK_EQ(link(s3, k3), 0);
+    CHECK_EQ(mt_flush(db), 0); /* every segment's rows are in parts */
+    eng_close(db);
+    if (access(s1, F_OK) != 0)
+        CHECK_EQ(link(k1, s1), 0);
+    if (access(s3, F_OK) != 0)
+        CHECK_EQ(link(k3, s3), 0);
+    unlink(k1);
+    unlink(k3);
+    seg_file(p, sizeof p, dir, 2);
+    unlink(p);
+    CHECK_EQ(open_replica(dir, 0, &db), TSDB_ERR_CORRUPT); /* the gap is above the floor: damage */
+    CHECK_EQ(open_replica(dir, end, &db), 0);
+    if (db) {
+        CHECK_EQ(access(s1, F_OK) != 0, true);
+        CHECK_EQ(replica_log_end(db), end);
+        eng_close(db);
+    }
+    leader_free(&l);
+
+    /* the same, where the segment after the gap is a new epoch's (a promotion's jump to epoch << 40): its number says
+     * nothing of the missing ones, the parts' positions do (jepsen-cluster power, 2026-11-20: a promoted leader's flushed
+     * epoch-1 segments went in part, and every open refused the volume for good; mutant gapbyseq) */
+    fresh(dir, "j1c");
+    leader_init(&l);
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        leader_roll(&l);
+    }
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    end = l.r[l.n - 1].last;
+    CHECK_EQ(replica_apply(db, end), 0);
+    uint64_t epos = 0;
+    CHECK_EQ(replica_epoch_begin(db, 2, "n1", &epos), 0); /* the segment 2 << 40, its EPOCH marker at end + 1 */
+    CHECK_EQ(epos, end + 1);
+    CHECK_EQ(replica_sync(db), 0);
+    char s2[PATH_MAX + 64], k2[PATH_MAX + 80];
+    seg_file(s1, sizeof s1, dir, 1);
+    seg_file(s2, sizeof s2, dir, 2);
+    snprintf(k1, sizeof k1, "%s.save", s1);
+    snprintf(k2, sizeof k2, "%s.save", s2);
+    CHECK_EQ(link(s1, k1), 0);
+    CHECK_EQ(link(s2, k2), 0);
+    CHECK_EQ(replica_apply(db, end + 1), 0);
+    CHECK_EQ(replica_flush(db), 0); /* as a promotion does: every row is in parts, their fno_hi is end */
+    CHECK_EQ(mt_flush(db), 0);
+    eng_close(db);
+    if (access(s1, F_OK) != 0)
+        CHECK_EQ(link(k1, s1), 0);
+    if (access(s2, F_OK) != 0)
+        CHECK_EQ(link(k2, s2), 0);
+    unlink(k1);
+    unlink(k2);
+    seg_file(p, sizeof p, dir, 3);
+    unlink(p); /* the gap is right below the new epoch's segment */
+    CHECK_EQ(open_replica(dir, 0, &db), TSDB_ERR_CORRUPT); /* above the floor: still damage */
+    CHECK_EQ(open_replica(dir, end + 1, &db), 0);
+    if (db) {
+        CHECK_EQ(access(s1, F_OK) != 0, true);
+        CHECK_EQ(access(s2, F_OK) != 0, true);
+        CHECK_EQ(replica_log_end(db), end + 1);
+        eng_close(db);
+    }
+    leader_free(&l);
+
+    /* the same, where the missing segment is the new epoch's first and holds only its EPOCH marker: no part's number or
+     * position reaches it, RSTATE's `kept` (a leader's flush, a promotion) does (jepsen-cluster power, 2026-11-20: a
+     * promoted leader's first segment went and one of its flushed epoch-1 segments came back; mutant gapnokept) */
+    fresh(dir, "j1d");
+    leader_init(&l);
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        leader_roll(&l);
+    }
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    end = l.r[l.n - 1].last;
+    CHECK_EQ(replica_apply(db, end), 0);
+    char se[PATH_MAX + 64];
+    seg_file(s3, sizeof s3, dir, 3);
+    snprintf(k3, sizeof k3, "%s.save", s3);
+    CHECK_EQ(link(s3, k3), 0);
+    CHECK_EQ(replica_epoch_begin(db, 2, "n1", &epos), 0); /* the segment 2 << 40, its EPOCH marker at end + 1 */
+    CHECK_EQ(epos, end + 1);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, end + 1), 0);
+    CHECK_EQ(replica_flush(db), 0);
+    CHECK_EQ(mt_flush(db), 0);
+    size_t n0 = l.n; /* the epoch's next segment: rows from end + 2 */
+    l.seq = (UINT64_C(2) << 40) + 1;
+    l.off = 0;
+    l.next = end + 2;
+    leader_rows(&l, 4, &rng);
+    CHECK_EQ(feed(db, &l, n0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    uint64_t end2 = l.r[l.n - 1].last;
+    CHECK_EQ(replica_apply(db, end2), 0);
+    eng_close(db);
+    if (access(s3, F_OK) != 0)
+        CHECK_EQ(link(k3, s3), 0);
+    unlink(k3);
+    seg_file(se, sizeof se, dir, UINT64_C(2) << 40);
+    unlink(se); /* the gap: the EPOCH marker's segment */
+    CHECK_EQ(open_replica(dir, end2, &db), TSDB_ERR_CORRUPT); /* nothing says the marker's segment was flushed */
+    {
+        /* what a leader's flush of that segment saves before it can go (leader_rs_kept) */
+        uint8_t b[64] = {0};
+        uint64_t w[2] = {UINT64_C(0x5453544154535231), UINT64_C(2) << 40};
+        memcpy(b, &w[0], 8);
+        memcpy(b + 48, &w[1], 8);
+        uint64_t h = xxh64(b, 56, 0);
+        memcpy(b + 56, &h, 8);
+        snprintf(p, sizeof p, "%s/RSTATE", dir);
+        FILE *f = fopen(p, "wb");
+        CHECK_EQ(f != NULL, true);
+        if (f) {
+            CHECK_EQ(fwrite(b, 1, sizeof b, f), sizeof b);
+            fclose(f);
+        }
+    }
+    CHECK_EQ(open_replica(dir, end, &db), TSDB_ERR_CORRUPT); /* above the floor: still damage */
+    CHECK_EQ(open_replica(dir, end2, &db), 0);
+    if (db) {
+        CHECK_EQ(access(s3, F_OK) != 0, true);
+        CHECK_EQ(replica_log_end(db), end2);
+        eng_close(db);
+    }
+    leader_free(&l);
+
     /* a torn tail is cut: the next append lands at the valid end */
     fresh(dir, "j2");
     leader_init(&l);
@@ -2468,6 +2708,45 @@ static void case_commit_hold(void)
     xp_stop(&x);
 }
 
+/* A cut above a COMMIT marker whose file is not staged keeps the hold: the durable end stays below the marker, and an
+ * apply stops before it instead of failing on the missing file (jepsen-cluster mc-wal-before-send seed 23233: a cut
+ * set the durable end to the cut, past the hold; the replica acknowledged the marker and its apply failed the volume). */
+static void case_commit_hold_cut(void)
+{
+    xport x;
+    char rd[PATH_MAX], name[64];
+    uint64_t sz, mpos;
+    xp_start(&x, "kc");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "KC: before");
+    x.withhold = true;
+    xp_rows(&x, 0, 5, 40, 2000);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 1);
+    xp_rows(&x, 1, 0, 3, 300);
+    uint64_t mid = ld_last(&x);
+    xp_rows(&x, 1, 3, 3, 400);
+    CHECK(mid > mpos && ld_last(&x) > mid);
+    CHECK_EQ(xp_ship_logs(&x), 0); /* small writes: the test ships their records */
+    CHECK_EQ(replica_log_end(x.rep), ld_last(&x));
+    CHECK(replica_durable_end(x.rep) < mpos);
+    CHECK_EQ(replica_cut(x.rep, mid), 0);
+    CHECK_EQ(replica_log_end(x.rep), mid);
+    CHECK(replica_durable_end(x.rep) < mpos); /* the cut's sync covers the log, not the marker's file */
+    CHECK_EQ(replica_apply(x.rep, mid), 0);
+    CHECK(eng_check(x.rep) == 0);
+    CHECK(replica_applied_end(x.rep) < mpos);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 1);
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(replica_durable_end(x.rep), mid);
+    CHECK_EQ(replica_apply(x.rep, mid), 0);
+    CHECK_EQ(replica_applied_end(x.rep), mid);
+    x.withhold = false;
+    x.noship = true; /* the leader's records above the cut are not this test's: a new leader would never send them */
+    xp_stop(&x);
+}
+
 /* a cut removes the files of the markers it removes */
 static void case_commit_cut(void)
 {
@@ -3155,10 +3434,38 @@ static void case_promote(int variant)
     }
     x.noapply = false;
     n->opt.wal_max_batch_rows = 16;
+    { /* the promoted writer before its attach: its merges and flusher run already, and a switch decided now would go to
+       * CLASSES with no marker, a record of this member alone (jepsen-cluster meta,classes partition, r3e: the next
+       * epoch's leader decided another T for the same offset; mutant switchunattached) */
+        uint64_t off = n->cls_off;
+        struct stat cs0, cs1;
+        char cp[PATH_MAX + 16];
+        snprintf(cp, sizeof cp, "%s/CLASSES", rd);
+        int had = stat(cp, &cs0) == 0;
+        CHECK(n->cls_on);
+        CHECK_EQ(eng_class_switch(n, 0, 2, NULL), TSDB_ERR_UNAVAILABLE);
+        /* the other way to a record (review R20): the first class of a series made after the open (the open takes
+         * every series it finds as decided), from a large insert's rows an hour apart (a long class), reaches
+         * cls_markers without switch_locked's deferral, so its own guard refuses it (mutant freshunattached) */
+        {
+            int64_t fts[100];
+            float fv[100];
+            uint32_t fid = 0;
+            for (int i = 0; i < 100; i++)
+                fts[i] = far + DAY_MS + 3600000LL * i, fv[i] = (float)i;
+            CHECK_EQ(eng_series(n, "fresh-unattached", TSDB_FLOAT32, &fid), 0);
+            CHECK_EQ(eng_insert_series(n, TSDB_FLOAT32, fid, fts, fv, 100), TSDB_ERR_UNAVAILABLE);
+        }
+        CHECK_EQ(n->cls_off, off);
+        CHECK_EQ(stat(cp, &cs1) == 0, had);
+        if (had && stat(cp, &cs1) == 0)
+            CHECK_EQ((long long)cs1.st_size, (long long)cs0.st_size);
+    }
     CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
     /* item 6: the promoted leader has the latest table (a replica runs without one) and keeps the replica's RSTATE,
      * which holds the DROP it applied (mutant promotenocarry: no table, RSTATE removed) */
     CHECK(n->lt != NULL);
+    uint64_t gap_first = 0;
     { /* the promoted leader serves its log from the kept segments below the epoch's jump of numbers (mutant readgap:
        * NOTFOUND at the first missing number, a snapshot for every member behind the promotion) */
         uint8_t *rb = NULL;
@@ -3178,6 +3485,7 @@ static void case_promote(int variant)
         CHECK_EQ(replica_read(n, first, &rb, &rl, 1 << 20, &rsq, &roff, &rlast), 0);
         CHECK(rl > 0 && rsq < old[nold - 1] && roff == 0 && rlast >= first);
         free(rb);
+        gap_first = first;
     }
     {
         char rs[PATH_MAX + 16];
@@ -3197,6 +3505,26 @@ static void case_promote(int variant)
     xp_step(&x, "P: small after promotion");
     xp_rows(&x, 1, 0, 40, 800);
     xp_step(&x, "P: large after promotion");
+    { /* a sealed segment that never got a record, among the kept ones under the jump (a member killed right after a
+       * rotation made it: a writer's open neither replays nor removes a kept segment), holds no position: the read
+       * of the positions below it goes on to the segment that has them (jepsen-cluster kill, r3e: the leader read
+       * it as CORRUPT, which the catch-up dropped, and both replicas behind the promotion stopped for good) */
+        char p[PATH_MAX + 64], nm2[64];
+        wal_name(nm2, sizeof nm2, old[nold - 1] - 1);
+        snprintf(p, sizeof p, "%s/%s", rd, nm2);
+        CHECK(x.ld->wal_seq > old[nold - 1]); /* sealed: below the current segment and the one before it */
+        int fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        CHECK(fd >= 0);
+        if (fd >= 0)
+            close(fd);
+        uint8_t *rb = NULL;
+        size_t rl = 0;
+        uint64_t rsq = 0, roff = 0, rlast = 0;
+        CHECK_EQ(replica_read(x.ld, gap_first, &rb, &rl, 1 << 20, &rsq, &roff, &rlast), 0);
+        CHECK(rl > 0 && rsq < old[nold - 1] - 1 && rlast >= gap_first);
+        free(rb);
+        unlink(p);
+    }
     CHECK_EQ(eng_delete_range(x.ld, 0, T0 + 1000, T0 + 3000), 0);
     xp_step(&x, "P: delete after promotion");
     xp_rows(&x, 0, 40, 10, 3000);
@@ -5885,6 +6213,99 @@ static void case_link_sweep(void)
     printf("  a leader's attach removes the stage_ links of an earlier leadership\n");
 }
 
+/* names in dir that start with `prefix` */
+static int count_named(const char *dir, const char *prefix)
+{
+    DIR *d = opendir(dir);
+    int n = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)))
+        n += strncmp(e->d_name, prefix, strlen(prefix)) == 0;
+    if (d)
+        closedir(d);
+    return n;
+}
+
+/* r3e finding A2 (jepsen-cluster meta,classes power): a member promoted after a failover serves a laggard the files of
+ * the COMMIT markers in its retained segments, which an earlier leadership wrote (this member's own as the leader before
+ * it was deposed, or ones it applied as a replica): every member keeps a committed marker's files as
+ * keep_<pos>_<key>.part as long as the segment that holds the marker (mutant replicadropsfiles: the old rule, a replica
+ * removed them at the apply and a deposed leader at its reopen, and the promoted member answered "needs a snapshot"). */
+static void case_keep_files(void)
+{
+    xport x;
+    char rd[PATH_MAX], kp[64];
+    xp_start(&x, "kfiles");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 40, 1000); /* a large insert: a COMMIT */
+    xp_step(&x, "KF: commit");
+    xp_rows(&x, 1, 0, 5, 50);
+    CHECK_EQ(eng_flush(x.ld), 0); /* the marker's segment ends: it can go once the floor or the bound passes it */
+    xp_step(&x, "KF: flushed");
+    char n1[64];
+    snprintf(n1, sizeof n1, "%s", x.held_name);
+    const uint64_t p1 = x.ld->nlf ? x.ld->lf[x.ld->nlf - 1].fno : 0;
+    CHECK(p1 != 0);
+    uint8_t *h1 = malloc(x.held_len);
+    size_t l1 = x.held_len;
+    if (!h1)
+        exit(2);
+    memcpy(h1, x.held, l1);
+    snprintf(kp, sizeof kp, "keep_%016" PRIx64 "_", p1);
+    int nk = count_named(rd, kp);
+    if (nk != 1)
+        fprintf(stderr, "KF: the replica keeps %d files of the applied marker at %" PRIu64 " (mutant replicadropsfiles)\n",
+                nk, p1);
+    CHECK_EQ(nk, 1);
+    CHECK_EQ(count_named(rd, "stage_"), 0); /* the stage_ name is free for the next marker naming the same key */
+    xp_reopen(&x, rd, replica_applied_end(x.rep));
+    replica_keep_cap(x.rep, 1 << 30, 3600000); /* the driver's caps: without them a segment goes at the floor */
+    CHECK_EQ(count_named(rd, kp), 1); /* its segment is still here */
+    /* the old leader, deposed, reopens as a replica: its own committed marker's link becomes a keep_ file */
+    xp_rows(&x, 1, 10, 5, 60); /* in the next segment */
+    xp_step(&x, "KF: small rows");
+    uint64_t end = ld_last(&x);
+    eng_close(x.ld);
+    x.ld = NULL;
+    eng *old = NULL;
+    CHECK_EQ(open_replica(x.ldir, end, &old), 0);
+    nk = count_named(x.ldir, kp);
+    if (nk != 1)
+        fprintf(stderr, "KF: the deposed leader keeps %d files of its marker at %" PRIu64 " (mutant replicadropsfiles)\n",
+                nk, p1);
+    CHECK_EQ(nk, 1);
+    CHECK_EQ(count_named(x.ldir, "stage_"), 0);
+    /* the replica is promoted: it serves the marker's file from the attach on */
+    uint64_t pos = 0;
+    eng *n = NULL;
+    CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), 0);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(replica_apply(x.rep, pos), 0);
+    CHECK_EQ(replica_promote(&x.rep, pos, &n), 0);
+    if (!n)
+        exit(2);
+    CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
+    bool served = leader_file_is(n, p1, n1, h1, l1);
+    if (!served)
+        fprintf(stderr, "KF: the promoted member does not serve the file of the marker at %" PRIu64 "\n", p1);
+    CHECK(served);
+    CHECK_EQ(eng_leader_file_open(n, p1 + 1, n1), TSDB_ERR_NOTFOUND); /* no marker there names it */
+    /* and the files go with their segments: on the leader once the replicas' bound passes them, on a replica at the
+     * floor (no caps set here) */
+    eng_leader_commit(n, pos);
+    eng_leader_keep(n, UINT64_MAX);
+    CHECK_EQ(count_named(rd, kp), 0);
+    CHECK_EQ(eng_leader_file_open(n, p1, n1), TSDB_ERR_NOTFOUND);
+    CHECK_EQ(replica_flush(old), 0);
+    CHECK_EQ(replica_floor_saved(old, end), 0);
+    CHECK_EQ(count_named(x.ldir, kp), 0);
+    eng_close(old);
+    eng_close(n);
+    free(x.held);
+    free(h1);
+    printf("  a committed marker's files stay with its segment on every member and a promoted one serves them\n");
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "applyall") == 0 ? MUT_REPLICA_APPLY_ALL
@@ -5897,6 +6318,9 @@ static int mutant_of(const char *m)
                         : strcmp(m, "noclasspurge") == 0 ? MUT_REPLICA_NO_CLASS_PURGE
                         : strcmp(m, "opensync") == 0 ? MUT_REPLICA_NO_OPEN_SYNC
                         : strcmp(m, "gapcheck") == 0 ? MUT_REPLICA_NO_GAP_CHECK
+                        : strcmp(m, "noleftover") == 0 ? MUT_REPLICA_NO_LEFTOVER_DROP
+                        : strcmp(m, "gapbyseq") == 0 ? MUT_REPLICA_GAP_BY_SEQ
+                        : strcmp(m, "gapnokept") == 0 ? MUT_REPLICA_GAP_NO_KEPT
                         : strcmp(m, "torncut") == 0 ? MUT_REPLICA_NO_TORN_CUT
                         : strcmp(m, "floorcheck") == 0 ? MUT_REPLICA_NO_FLOOR_CHECK
                         : strcmp(m, "durablegate") == 0 ? MUT_REPLICA_NO_DURABLE_GATE
@@ -5911,6 +6335,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "cutgen") == 0 ? MUT_REPLICA_NO_CUT_GEN
                         : strcmp(m, "earlyseal") == 0 ? MUT_REPLICA_EARLY_SEAL
                         : strcmp(m, "nostagehold") == 0 ? MUT_REPLICA_NO_STAGE_HOLD
+                        : strcmp(m, "cutnohold") == 0 ? MUT_REPLICA_CUT_NO_HOLD
                         : strcmp(m, "nocommitflush") == 0 ? MUT_REPLICA_NO_COMMIT_FLUSH
                         : strcmp(m, "nodoneskip") == 0 ? MUT_REPLICA_NO_DONE_SKIP
                         : strcmp(m, "keepstaged") == 0 ? MUT_REPLICA_KEEP_STAGED
@@ -5936,6 +6361,10 @@ static int mutant_of(const char *m)
                         : strcmp(m, "classmarkerlate") == 0 ? MUT_LEADER_CLASS_MARKER_LATE
                         : strcmp(m, "nowtailfrom") == 0 ? MUT_LEADER_NO_WTAIL_FROM
                         : strcmp(m, "markersplit") == 0 ? MUT_LEADER_MARKERS_SPLIT
+                        : strcmp(m, "switchunattached") == 0 ? MUT_LEADER_SWITCH_UNATTACHED
+                        : strcmp(m, "replicadropsfloor") == 0 ? MUT_REPLICA_KEEP_FLOOR
+                        : strcmp(m, "replicadropsfiles") == 0 ? MUT_REPLICA_DROP_APPLIED_FILES
+                        : strcmp(m, "freshunattached") == 0 ? MUT_LEADER_FRESH_UNATTACHED
                         : strcmp(m, "droppedglobal") == 0 ? MUT_DROPPED_GLOBAL
                         : strcmp(m, "wtailnocap") == 0 ? MUT_WTAIL_NOCAP
                         : strcmp(m, "nocutoff") == 0 ? MUT_LEADER_NO_CUTOFF
@@ -6199,9 +6628,16 @@ int main(int argc, char **argv)
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
     }
+    if (getenv("TEST_REPLICA_OPEN_ONLY")) { /* the quick run of the open's checks */
+        case_open_checks();
+        sh("rm -rf '%s'", S);
+        printf("test_replica: %s\n", failures ? "FAILED" : "ok");
+        return failures != 0;
+    }
     if (getenv("TEST_REPLICA_APPLY_ONLY")) { /* the quick run of the apply's cases (R2 REVIEW M1) */
         case_commit();
         case_commit_cut();
+        case_commit_hold_cut();
         case_apply_concurrent();
         case_apply_cut_race(0);
         case_apply_cut_race(1);
@@ -6244,6 +6680,7 @@ int main(int argc, char **argv)
         case_leader_prune();
         case_leader_read();
         case_link_sweep();
+        case_keep_files();
         for (int v = 0; v < 3; v++)
             case_promote(v);
         case_promote_crash();
@@ -6277,6 +6714,7 @@ int main(int argc, char **argv)
         return failures != 0;
     }
     case_basic();
+    case_keepcap();
     case_cut();
     case_cut_publish();
     case_refused();
@@ -6299,6 +6737,7 @@ int main(int argc, char **argv)
     case_ro_open();
     case_commit_hold();
     case_commit_cut();
+    case_commit_hold_cut();
     case_apply_concurrent();
     case_apply_cut_race(0);
     case_apply_cut_race(1);
@@ -6343,6 +6782,7 @@ int main(int argc, char **argv)
     case_leader_prune();
     case_leader_read();
     case_link_sweep();
+    case_keep_files();
     case_promote_refused();
     for (int v = 0; v < 3; v++)
         case_promote(v);
