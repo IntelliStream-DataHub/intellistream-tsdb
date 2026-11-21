@@ -2150,7 +2150,9 @@ int replica_cut(eng *db, uint64_t last)
         for (size_t i = rp->ncm; i-- > 0;) /* the COMMIT markers above the cut never happened: their files go */
             if (rp->cm[i].first > last)
                 cm_remove(db, rp, i, false);
-        rp->durable_next = last + 1; /* what stays was synced (the cut's own sync, the rotations') */
+        /* what stays was synced (the cut's own sync, the rotations'), but a COMMIT marker below the cut whose files are
+         * not staged still holds it: a cut never acknowledges a marker without its files (r3e: the apply then failed) */
+        rp->durable_next = eng_test_mutant == MUT_REPLICA_CUT_NO_HOLD ? last + 1 : MIN(last + 1, hold_cap(rp));
         rp->cut_gen++;
         rp->last_cut_next = last + 1;
         /* the cursor: it is at the applied end, which is at or below the cut; if its segment went, it is at the end of

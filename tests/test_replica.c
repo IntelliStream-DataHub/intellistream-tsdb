@@ -2708,6 +2708,45 @@ static void case_commit_hold(void)
     xp_stop(&x);
 }
 
+/* A cut above a COMMIT marker whose file is not staged keeps the hold: the durable end stays below the marker, and an
+ * apply stops before it instead of failing on the missing file (jepsen-cluster mc-wal-before-send seed 23233: a cut
+ * set the durable end to the cut, past the hold; the replica acknowledged the marker and its apply failed the volume). */
+static void case_commit_hold_cut(void)
+{
+    xport x;
+    char rd[PATH_MAX], name[64];
+    uint64_t sz, mpos;
+    xp_start(&x, "kc");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "KC: before");
+    x.withhold = true;
+    xp_rows(&x, 0, 5, 40, 2000);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 1);
+    xp_rows(&x, 1, 0, 3, 300);
+    uint64_t mid = ld_last(&x);
+    xp_rows(&x, 1, 3, 3, 400);
+    CHECK(mid > mpos && ld_last(&x) > mid);
+    CHECK_EQ(xp_ship_logs(&x), 0); /* small writes: the test ships their records */
+    CHECK_EQ(replica_log_end(x.rep), ld_last(&x));
+    CHECK(replica_durable_end(x.rep) < mpos);
+    CHECK_EQ(replica_cut(x.rep, mid), 0);
+    CHECK_EQ(replica_log_end(x.rep), mid);
+    CHECK(replica_durable_end(x.rep) < mpos); /* the cut's sync covers the log, not the marker's file */
+    CHECK_EQ(replica_apply(x.rep, mid), 0);
+    CHECK(eng_check(x.rep) == 0);
+    CHECK(replica_applied_end(x.rep) < mpos);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 1);
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(replica_durable_end(x.rep), mid);
+    CHECK_EQ(replica_apply(x.rep, mid), 0);
+    CHECK_EQ(replica_applied_end(x.rep), mid);
+    x.withhold = false;
+    x.noship = true; /* the leader's records above the cut are not this test's: a new leader would never send them */
+    xp_stop(&x);
+}
+
 /* a cut removes the files of the markers it removes */
 static void case_commit_cut(void)
 {
@@ -6296,6 +6335,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "cutgen") == 0 ? MUT_REPLICA_NO_CUT_GEN
                         : strcmp(m, "earlyseal") == 0 ? MUT_REPLICA_EARLY_SEAL
                         : strcmp(m, "nostagehold") == 0 ? MUT_REPLICA_NO_STAGE_HOLD
+                        : strcmp(m, "cutnohold") == 0 ? MUT_REPLICA_CUT_NO_HOLD
                         : strcmp(m, "nocommitflush") == 0 ? MUT_REPLICA_NO_COMMIT_FLUSH
                         : strcmp(m, "nodoneskip") == 0 ? MUT_REPLICA_NO_DONE_SKIP
                         : strcmp(m, "keepstaged") == 0 ? MUT_REPLICA_KEEP_STAGED
@@ -6597,6 +6637,7 @@ int main(int argc, char **argv)
     if (getenv("TEST_REPLICA_APPLY_ONLY")) { /* the quick run of the apply's cases (R2 REVIEW M1) */
         case_commit();
         case_commit_cut();
+        case_commit_hold_cut();
         case_apply_concurrent();
         case_apply_cut_race(0);
         case_apply_cut_race(1);
@@ -6696,6 +6737,7 @@ int main(int argc, char **argv)
     case_ro_open();
     case_commit_hold();
     case_commit_cut();
+    case_commit_hold_cut();
     case_apply_concurrent();
     case_apply_cut_race(0);
     case_apply_cut_race(1);
