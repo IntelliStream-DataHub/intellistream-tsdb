@@ -21,6 +21,10 @@ void cvol_stop(void);
  * leader while it holds no read lease (cluster_lease_valid: no Raft leader's answer extended it). -1: v is no
  * cluster volume of this server or nothing is wrong with it. */
 int cvol_why(uint32_t v);
+/* 1 under TSDB_REPLICA_READS=1 (a test hook standing in for design-cluster.md 7.2's REPLICA_OK, not built): a replica
+ * that holds a read lease answers reads from what it applied. Otherwise every read of a replicated volume goes to its
+ * leader (D5): a replica, a deposed leader above all, may not have applied a write the new leader acknowledged. */
+int cvol_replica_reads(void);
 /* 1 when volume v is a cluster volume open and led here (whatever the lease says) */
 int cvol_led(uint32_t v);
 /* 1 when a write to replicated volume `v` belongs to another server: this one only replicates it (or was deposed) and

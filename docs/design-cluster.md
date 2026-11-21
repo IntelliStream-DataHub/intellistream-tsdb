@@ -941,6 +941,12 @@ write (a body that 1.x adds for clients that ask, §11.2); a query may carry `mi
 that far waits up to 50 ms, then answers MOVED to the leader. Use: dashboards and heavy scans spread over all three
 copies; the Pulsar sink and anything that reads after writing stay on leaders.
 
+As built (r3e-failover), `REPLICA_OK` does not exist yet, so tsdbd answers every request on a replicated volume it does
+not lead MOVED to the record's leader, reads included: a leader deposed by a failover reopens as a replica and is back
+in the ISR with a read lease within seconds, without the writes the new leader acknowledged meanwhile. The environment
+variable `TSDB_REPLICA_READS=1` (tests only: `test_cluster` counts a replica's rows through it) lets a replica that
+holds a lease answer; a replica without a lease is refused even then.
+
 ### 7.3 Many series, many servers
 
 - **QUERY_MULTI** (direct mode): the client splits the series by the leader of their volume, sends one QUERY_MULTI per

@@ -126,6 +126,9 @@ static uint64_t now_ms(void)
 static void server_dir(int i, char *out, size_t n) { snprintf(out, n, "%s/n%d", base, i); }
 
 static int auth_on[N]; /* server i runs with login (no --no-auth): its root has USERS */
+/* Servers run with TSDB_REPLICA_READS=1 (replicas holding a lease answer reads, so a scenario can count a replica's
+ * rows) unless a scenario sets strict_reads: then every read goes to the leader (D5), as in production. */
+static int strict_reads;
 static int cports[N];  /* the client port of server i */
 
 /* Starts server i; returns th_await's answer (the client port, or TH_EXITED with th_status, or TH_BAD). */
@@ -144,6 +147,10 @@ static int start_try(int i)
         int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0)
             dup2(fd, 2);
+        if (strict_reads)
+            unsetenv("TSDB_REPLICA_READS");
+        else
+            setenv("TSDB_REPLICA_READS", "1", 1);
         if (envs[i])
             setenv("TSDB_CLUSTER_TEST", envs[i], 1);
         else
@@ -5792,9 +5799,35 @@ static void scen_lease(void)
     }
     pause_server(R, 0);
     pause_server(F, 0);
-    if (!lease_until_ok(c, id, 30000, 1))
-        die("no read answered on %d after every server was resumed", X);
-    printf("  %d paused past its lease: %d reads refused while nobody renewed it, then answered\n", X, nb);
+    /* X was away past node_timeout: the group declared it down and moved the volume to another member, and X, deposed,
+     * answers MOVED (it serves no reads for a volume it does not lead). The row is read back where MOVED points. */
+    int at = X;
+    for (uint64_t t2 = now_ms();;) {
+        int rows;
+        if (now_ms() - t2 > 30000)
+            die("no read answered after every server was resumed (last asked server %d)", at);
+        rc = lease_read(c, id, 2, &rows); /* a raw query: MOVED for the whole request, with its body */
+        if (rc == 0) {
+            if (rows != 1)
+                die("a read on server %d answered %d rows, 1 was written", at, rows);
+            break;
+        }
+        tsdbc_err_info e;
+        if (rc == TSDB_ERR_MOVED && tsdbc_last_error(c, &e) == TSDB_ERR_MOVED && e.has_body && e.nmoved == 1) {
+            int s = server_of(e.moved[0].node_id);
+            if (s < 0 || s > 2)
+                die("a read on server %d: MOVED to node %u, no server of this test", at, e.moved[0].node_id);
+            if (s != at) {
+                tsdbc_close(c);
+                c = client(s);
+                at = s;
+            }
+        } else if (rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) {
+            die("a read on server %d: %s", at, ers(rc));
+        }
+        usleep(20000);
+    }
+    printf("  %d paused past its lease: %d reads refused while nobody renewed it, then answered on %d\n", X, nb, at);
     tsdbc_close(c);
 }
 
@@ -6504,6 +6537,7 @@ static void scen_deposecrash(void) { crash_promo(2); }
 static void scen_pause(void)
 {
     scenario("pause");
+    strict_reads = 1; /* the deposed leader back in the ISR holds a lease again: its reads must go to the new leader */
     for (int i = 0; i < 3; i++)
         start(i);
     init_cluster(0, 600);
@@ -6598,9 +6632,34 @@ static void scen_pause(void)
         die("a write that follows MOVED from the deposed leader %d: %s", L, ers(rc));
     tsdbc_close(c);
     await_isr(R1, "pz", 3, 60000, "the deposed leader back in the ISR");
+    /* back in the ISR the deposed leader holds a read lease again, but the writes the new leader acknowledges reach it
+     * only at its next apply: every read there is MOVED to the new leader (D5, review F2), never answered stale. A
+     * write acknowledged by the new leader is in every answer a client following MOVED from L gets. */
+    c = client(L);
+    for (int k = 0; k < 3; k++) {
+        int rows = -1;
+        rc = lease_read(c, id, k, &rows);
+        if (rc == 0)
+            die("the deposed leader %d, back in the ISR, answered a read (kind %d, %d rows): a replica's answer may "
+                "miss a write the new leader acknowledged", L, k, rows);
+        expect_moved(c, rc, (uint16_t)num, v.leader, v.epoch, "a read on the deposed leader");
+    }
+    tsdbc_set_retry(c, 10000);
+    tsdbc *cw = client(Nw);
+    for (int k = 0; k < 20; k++) {
+        ts = 10000 + k;
+        if ((rc = tsdbc_insert_series(cw, id, &ts, &val, 1)) != 0)
+            die("write %d on the new leader: %s", k, ers(rc));
+        int want = rows_in(Nw, id, 0, INT64_MAX / 2, 10000), rows = -1;
+        if ((rc = lease_read(c, id, k % 2 ? 2 : 0, &rows)) != 0 || rows != want) /* a count: raw, QUERY_MULTI */
+            die("a read through the deposed leader %d after write %d was acknowledged: %d (%s), %d rows of %d", L, k,
+                rc, ers(rc), rows, want);
+    }
+    tsdbc_close(cw);
+    tsdbc_close(c);
     int total = rows_in(Nw, id, 0, INT64_MAX / 2, 10000);
-    if (total != 4 && !(total == 3 && w.rc != 0))
-        die("the new leader holds %d rows: 3 acknowledged, and the waiting write %s", total,
+    if (total != 24 && !(total == 23 && w.rc != 0))
+        die("the new leader holds %d rows: 23 acknowledged, and the waiting write %s", total,
             w.rc == 0 ? "acknowledged too" : "of unknown outcome");
     stop_all();
     uint64_t wantr[REP_NAMES] = {0};

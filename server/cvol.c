@@ -89,6 +89,7 @@ static struct {
     struct mvol vols[CLUSTER_REPORT_VOLS]; /* what this manager made of them; under mu */
     uint32_t nvols;
     int writes;  /* TSDB_CLUSTER_WRITES=1 */
+    int replica_reads; /* TSDB_REPLICA_READS=1: a replica with a lease answers reads (tests only, until REPLICA_OK) */
     int mutant;  /* 1 noopengen, 3 anynonce, 4 refusedsilent (the others are cvolfs.h's) */
     int stale_first; /* TSDB_CLUSTER_TEST stale_first_watch=1, until the first push */
 } M = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
@@ -289,6 +290,8 @@ int cvol_why(uint32_t v)
     return why;
 }
 
+int cvol_replica_reads(void) { return M.replica_reads; }
+
 int cvol_led(uint32_t v)
 {
     if (!M.active)
@@ -356,6 +359,8 @@ int cvol_start(tsdb *t, const char *dir)
     repld_init(t, dir);
     const char *w = getenv("TSDB_CLUSTER_WRITES");
     M.writes = w && !strcmp(w, "1");
+    const char *rr = getenv("TSDB_REPLICA_READS");
+    M.replica_reads = rr && !strcmp(rr, "1");
     while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
         ;
     const char *mu = getenv("TSDB_CVOL_MUTANT");
@@ -375,6 +380,8 @@ int cvol_start(tsdb *t, const char *dir)
     M.stale_first = ct && strstr(ct, "stale_first_watch=1");
     if (M.writes)
         say("TSDB_CLUSTER_WRITES=1: a volume's leader takes writes before replication is wired (tests only)");
+    if (M.replica_reads)
+        say("TSDB_REPLICA_READS=1: a replica holding a read lease answers reads, which may be stale (tests only)");
     if (M.mutant || cvolfs_test_mutant)
         say("MUTANT %s (tests only)", mu);
     if (pthread_create(&M.th, NULL, mgr_main, NULL) != 0) {

@@ -965,16 +965,16 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
     /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
      * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
     if (status == TSDB_ERR_UNAVAILABLE && atomic_load(&c->proto) >= 13 && (!ix || *ix == TSDB_MULTI_END)) {
-        /* a write to a replicated volume whose leader is another server (this one replicates it, or was deposed):
-         * MOVED to the record's leader (design-cluster.md 6.3), definitely not applied. A write the deposed leader
+        /* a request on a replicated volume whose leader is another server (this one replicates it, or was deposed):
+         * MOVED to the record's leader (design-cluster.md 6.3; reads too, D5), definitely not applied. A write the deposed leader
          * had already appended never gets here: it is of unknown outcome (D12, above). */
         uint32_t node;
         uint64_t epoch;
         char addr[TSDB_ADDR_MAX + 1];
         if (unav_vol != TSDB_VOL_ANY && cvol_active() && cvol_no_owner(unav_vol)) {
             /* no ISR member is up: neither MOVED to a dead leader nor retried there (below: NO_OWNER) */
-        } else if (unav_write && unav_vol != TSDB_VOL_ANY && cvol_active() && !test_no_moved &&
-            cvol_moved(unav_vol, &node, &epoch, addr, sizeof addr)) {
+        } else if (unav_vol != TSDB_VOL_ANY && cvol_active() && !test_no_moved &&
+                   cvol_moved(unav_vol, &node, &epoch, addr, sizeof addr)) { /* a read goes there too (D5) */
             tsdb_moved m = {.vol = unav_vol, .epoch = (uint32_t)epoch, .node_id = node, .addr = addr,
                             .addr_len = (uint16_t)strlen(addr)};
             ulen = tsdb_wire_put_moved(ub, sizeof ub, &m, 1);
@@ -2269,19 +2269,14 @@ static int cvol_refuse_ids(const tsdb_sid *ids, size_t n)
 }
 
 /* Reads naming many ids (QUERY_MULTI, QUERY_LATEST): one id on a volume led here whose read lease ran out (§7.1), or on
- * a replica while this server holds no lease (it may be a leader deposed while it was cut off), refuses the whole
- * request, as handle() refuses a single-id op on such a volume. A replica with a lease answers (§7.2's REPLICA_OK is a
- * later step). */
+ * a volume another server leads (D5: MOVED there; under TSDB_REPLICA_READS a replica holding a lease answers), refuses
+ * the whole request, as handle() refuses a single-id op on such a volume. */
 static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n)
 {
     if (!cvol_active())
         return 0;
     uint64_t gen = cluster_lease_gen();
-    if (cluster_lease_valid()) { /* one atomic load; the volumes are looked at only once the lease ran out (or below) */
-        if (!lguard.on)
-            lguard = (__typeof__(lguard)){.on = true, .gen = gen, .vol = TSDB_VOL_ANY, .ids = ids, .n = n};
-        return 0;
-    }
+    bool lease = cluster_lease_valid();
     uint32_t last = UINT32_MAX;
     for (size_t i = 0; i < n; i++) {
         tsdb_sid id = ids[i];
@@ -2290,11 +2285,13 @@ static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n)
             continue;
         last = (uint32_t)TSDB_SID_VOLUME(id); /* each run of one volume asked once (cvol_why locks) */
         int cw = cvol_why(last);
-        if (cw == TSDB_WHY_UNREACHABLE || cw == TSDB_WHY_FENCED) { /* as in handle() (test_cluster lease, phase b) */
-            unav_vol = (uint16_t)TSDB_SID_VOLUME(id);
+        if (cw == TSDB_WHY_UNREACHABLE || (cw == TSDB_WHY_FENCED && !(lease && cvol_replica_reads()))) {
+            unav_vol = (uint16_t)TSDB_SID_VOLUME(id); /* as in handle() (test_cluster lease, phase b; staleread) */
             return TSDB_ERR_UNAVAILABLE;
         }
     }
+    if (lease && !lguard.on)
+        lguard = (__typeof__(lguard)){.on = true, .gen = gen, .vol = TSDB_VOL_ANY, .ids = ids, .n = n};
     return 0;
 }
 
@@ -2453,17 +2450,19 @@ static void handle_in(req *r)
     }
     if (unav_vol != TSDB_VOL_ANY && cvol_active()) {
         uint64_t gen = cluster_lease_gen();
-        if (!cluster_lease_valid()) { /* cvol_why (a lock) only once the lease ran out: reads do not queue on it */
-            int cw = cvol_why(unav_vol);
-            if (cw == TSDB_WHY_UNREACHABLE || cw == TSDB_WHY_FENCED) {
-                /* any op on a volume led here whose read lease ran out (§7.1): refused, the client retries. A replica
-                 * without a lease is refused too: it may be a leader deposed while it was cut off (its core stepped
-                 * down at the fence it found queued, or it reopened as a replica), whose rows stop where the new
-                 * leader's began (test_cluster lease, phase b) */
-                reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
-                return;
-            }
-        } else if (!(auth_ops[r->op].need & R_WRITE)) { /* a write that passed is committed by its replicas */
+        bool lease = cluster_lease_valid();
+        int cw = cvol_why(unav_vol);
+        if (cw == TSDB_WHY_UNREACHABLE || (cw == TSDB_WHY_FENCED && !(lease && cvol_replica_reads()))) {
+            /* any op on a volume led here whose read lease ran out (§7.1): refused, the client retries. Reads of a
+             * volume another server leads go there (D5, MOVED in the reply): a replica answers from what it applied,
+             * and a leader deposed by a failover (reopened as a replica, back in the ISR with a lease again) does not
+             * have the writes the new leader acknowledged since (test_cluster pause, staleread). Without a lease a
+             * replica is refused even under TSDB_REPLICA_READS: it may be a leader deposed while it was cut off, whose
+             * rows stop where the new leader's began (test_cluster lease, phase b) */
+            reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+            return;
+        }
+        if (lease && !(auth_ops[r->op].need & R_WRITE)) { /* a write that passed is committed by its replicas */
             lguard = (__typeof__(lguard)){.on = true, .gen = gen, .vol = unav_vol};
             while (test_read_stall && access(test_read_stall, F_OK) == 0 && !stopping) {
                 struct timespec d = {0, 20000000};
