@@ -334,6 +334,12 @@ for nem in eio power; do # the shim's default odds: the quiet tail's server is a
 done
 run_case "hang-outage" "$HP" "a worker that hangs for ever on every 25th insert, outage nemesis" JV_HANG=25 JEPSEN_REQ_DEADLINE_S=8 -- \
     --nemesis outage --seconds 20 --outagefs "$outagefs"
+# every worker hung, power nemesis (round 15; VERIFY14's hang-power selftest hung for 200 s in 1 run of 3 on the build machine): the plug the nemesis pulled lands at no
+# file operation, so it waits for the server to die, and pokes it with a request once a second when the clients are gone; that poke's HELLO took the client's
+# default 10 s on a server with no worker to answer it (the wait of 30 s became minutes). The verdict is the hang, at the first attempt, in well under the
+# timeout (every insert hangs its worker: 8 workers are gone in the first moments)
+run_case "hang-power-all" "$HP" "every worker hung (every insert), power nemesis: the pokes at a server that answers nothing are bounded" JV_HANG=1 JEPSEN_REQ_DEADLINE_S=8 -- \
+    --nemesis power --seconds 10 --crashfs "$crashfs"
 # a hung worker (tsdbd's own: pause(), no D state) and, at the same time, ANOTHER worker in D state for 8 s (a D stretch of the kernel that is over
 # 4 s before the hung request's deadline of 12 s passes): the miss is tsdbd's, a VIOLATION on the first attempt. Round 12 called it a kernel
 # stall (INCONCLUSIVE, then the rerun passed) because a D stretch had been seen since the request was sent (VERIFY12 (A): g2-hangblip40).

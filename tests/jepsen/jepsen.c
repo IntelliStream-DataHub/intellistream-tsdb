@@ -1770,9 +1770,10 @@ static void *dstate_thread(void *arg)
 /* Connects to the server this harness started, and only to it: the port may have been given to another process
  * since that server died (the nemesis notices a crash only at its next tick), so after connecting the socket
  * has to belong to `pid`. A dead server holds no socket, which makes this fail until the next one is up. */
-static int connect_own(int p, pid_t pid, tsdbc **c)
+static int connect_own_ms(int p, pid_t pid, tsdbc **c, int hello_ms)
 {
-    tsdbc_options o = {.user = auth ? KV_USER : NULL, .password_file = auth ? kv_pw : NULL, .require_auth = auth};
+    /* connect_ms bounds the TCP connect and the HELLO (tsdbc_connect_opts): 0 is 10 s, and a server whose workers are all hung answers no HELLO */
+    tsdbc_options o = {.user = auth ? KV_USER : NULL, .password_file = auth ? kv_pw : NULL, .connect_ms = hello_ms, .require_auth = auth};
     if (p <= 0 || pid <= 0 || tsdbc_connect_opts("127.0.0.1", p, &o, c) != 0)
         return -1;
     if (!th_owns_port(pid, p)) {
@@ -1785,6 +1786,11 @@ static int connect_own(int p, pid_t pid, tsdbc **c)
     return 0;
 }
 
+static int connect_own(int p, pid_t pid, tsdbc **c)
+{
+    return connect_own_ms(p, pid, c, 0);
+}
+
 /* A power loss lands at the server's next file operation, and a server that has no client left (the run's time is up while
  * the nemesis waits for a pulled plug to take effect: found once, a server "hung" 30 s after a SIGUSR2 sent in the last
  * moments, all its threads idle) makes none. This is the traffic: a row of a series of its own. A server that
@@ -1792,7 +1798,7 @@ static int connect_own(int p, pid_t pid, tsdbc **c)
 static void poke_server(pid_t pid)
 {
     tsdbc *c = NULL;
-    if (connect_own(atomic_load(&port), pid, &c) != 0)
+    if (connect_own_ms(atomic_load(&port), pid, &c, 2000) != 0) /* round 15 (VERIFY14 hang-power): a HELLO that took the default 10 s, once a second, stretched the wait for the plug to minutes */
         return;
     tsdbc_set_timeout(c, 2000);
     tsdb_sid id;
@@ -3213,15 +3219,20 @@ static void *nemesis_thread(void *arg)
                 int wait_s = PULL_WAIT_S;
                 if (!strncmp(mm, "waitspin:", 9)) /* the same, but after the wait began: the step counts it as the wait for the death, and only the dead stretch is left to see it */
                     spin_ms(atoi(mm + 9));
-                for (int i = 0; !gone && i < wait_s * 100 && !(gone = reap_server(pid, &st, WNOHANG) == pid); i++) {
-                    usleep(10000);
-                    if (atomic_load(&stop_ns) && now_ns() - atomic_load(&stop_ns) > 1000000000LL && i % 100 == 0)
-                        poke_server(pid); /* the clients are gone: no traffic brings the file operation the power loss waits for */
-                    if (i == wait_s * 100 - 1 && wait_s < PULL_EXIT_WAIT_S && proc_exiting(pid)) { /* dying, slowly: not hung */
+                /* by the clock, never by the count of naps: a poke that waits for a hung server takes its time too */
+                int64_t wend = w0 + (int64_t)wait_s * 1000000000LL;
+                for (int i = 0; !gone && !(gone = reap_server(pid, &st, WNOHANG) == pid); i++) {
+                    if (now_ns() >= wend) {
+                        if (wait_s >= PULL_EXIT_WAIT_S || !proc_exiting(pid)) /* dying, slowly, is not hung */
+                            break;
                         wait_s = PULL_EXIT_WAIT_S;
+                        wend = w0 + (int64_t)wait_s * 1000000000LL;
                         if (getenv("JEPSEN_FAULT_TRACE"))
                             fprintf(stderr, "jepsen: the server is still exiting %d s after SIGUSR2, waiting on\n", PULL_WAIT_S);
                     }
+                    usleep(10000);
+                    if (atomic_load(&stop_ns) && now_ns() - atomic_load(&stop_ns) > 1000000000LL && i % 100 == 0)
+                        poke_server(pid); /* the clients are gone: no traffic brings the file operation the power loss waits for */
                 }
                 atomic_fetch_sub(&nem_inprog, 1);
                 waited += now_ns() - w0;

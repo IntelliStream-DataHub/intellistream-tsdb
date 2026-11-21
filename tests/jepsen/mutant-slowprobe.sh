@@ -33,7 +33,7 @@ sed -i 's/^    case TSDB_OP_\(INSERT\|INSERT_VALUES\|DELETE_RANGE\|REPLACE_RANGE
 # the insert the clients send is the packed one (INSERT_VALUES with TSDB_PACKED, through insert_packed): refuse there too
 sed -i '/^static int insert_packed(auth_conn \*a, const uint8_t \*p, size_t len, uint32_t n, tsdb_sid s)$/{n;s/^{$/{\
     if (atomic_load(\&jv_div)) return TSDB_ERR_UNAVAILABLE; \/* MUTANT *\//}' "$tmp.div/server/tsdbd.c"
-if [ "$(grep -c 'MUTANT' "$tmp.div/server/tsdbd.c")" -ne 7 ]; then echo "mutant-slowprobe: the DIVERGED mutant did not apply"; rm -rf "$tmp" "$tmp.div"; exit 1; fi
+if [ "$(grep -c '/\* MUTANT' "$tmp.div/server/tsdbd.c")" -ne 7 ]; then echo "mutant-slowprobe: the DIVERGED mutant did not apply"; rm -rf "$tmp" "$tmp.div"; exit 1; fi
 (cd "$tmp" && make -j8 build/tsdbd >"$tmp/build.log" 2>&1) || { echo "mutant-slowprobe: the build failed"; tail -5 "$tmp/build.log"; rm -rf "$tmp" "$tmp.div"; exit 1; }
 (cd "$tmp.div" && make -j8 build/tsdbd >"$tmp.div/build.log" 2>&1) || { echo "mutant-slowprobe: the build failed"; tail -5 "$tmp.div/build.log"; rm -rf "$tmp" "$tmp.div"; exit 1; }
 out=$(JEPSEN_TSDBD="$tmp/build/tsdbd" "${JEPSEN_BIN:-$root/build/jepsen}" --dir "$dir" --nemesis outage --seconds "$secs" \
