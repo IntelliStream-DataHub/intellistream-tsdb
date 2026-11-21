@@ -5286,7 +5286,7 @@ static void *wf_write_thread(void *a)
 /* writerfail (M5, D13 on the writer): the leader's engine fails (crashfs: EIO on its next fdatasync of a wal_ file:
  * a second write's) while a write waits for a paused replica. The driver deposes the writer: the outcome of both
  * writes is unknown (each went to the replicas), so their connections close without an answer (D12); the volume is
- * quiesced (reads UNAVAILABLE), the group promotes a replica at e+1 and writes on the old leader are MOVED to it; the
+ * quiesced (UNAVAILABLE), the group promotes a replica at e+1 and writes and reads on the old leader are MOVED to it; the
  * server reports the volume LOCAL_FAULT, answers in its root, keeps its vote and its other
  * volumes (a later volume add commits and opens there) and stops cleanly. TSDB_REPLD_MUTANT=nodepose and noquiesce
  * fail it. */
@@ -5382,8 +5382,8 @@ static void scen_writerfail(void)
     if (await_exit(L, 1000) >= 0)
         die("server %d exited on its cluster volume's engine failure (D13: only the volume stops)", L);
     pause_server(R1, 0);
-    /* the failed volume: the group promotes a replica (reason FENCED, D13), writes on L are MOVED to it, reads stay
-     * UNAVAILABLE; the root answers */
+    /* the failed volume: the group promotes a replica (reason FENCED, D13), writes and reads on L are MOVED to it
+     * (reads too, D5: the failed volume answers nothing); the root answers */
     uint64_t e0 = v.epoch;
     int Nw = await_promoted((L + 1) % 3, "plant", ids[L], e0, &v);
     if (Nw < 0 || Nw == L || v.epoch != e0 + 1)
@@ -5392,8 +5392,8 @@ static void scen_writerfail(void)
     ts = 7000;
     insert_expect_moved(c2, id, ts, val, 1, v.leader, v.epoch, "a write to the failed volume");
     tsdb_points p;
-    if ((rc = tsdbc_query_points(c2, id, INT64_MIN, INT64_MAX, &p)) != TSDB_ERR_UNAVAILABLE)
-        die("a read of the failed volume: %s, not UNAVAILABLE", ers(rc));
+    rc = tsdbc_query_points(c2, id, INT64_MIN, INT64_MAX, &p); /* D5: reads go to the leader as well */
+    expect_moved(c2, rc, 1, v.leader, v.epoch, "a read of the failed volume");
     tsdb_sid any;
     if ((rc = tsdbc_series(c2, "writerfail.none", 0, &any)) != TSDB_ERR_NOTFOUND)
         die("a lookup in server %d's root after its volume failed: %s", L, ers(rc));
@@ -5437,7 +5437,7 @@ static void scen_writerfail(void)
     }
     stop_all();
     printf("  a leader whose engine failed closes the connections of the writes in flight, a replica leads at epoch "
-           "%" PRIu64 ", the old leader answers writes MOVED and reads UNAVAILABLE, keeps its root, its vote and its "
+           "%" PRIu64 ", the old leader answers writes and reads MOVED, keeps its root, its vote and its "
            "other volumes and stops cleanly; the replicas hold nothing "
            "written after the failure\n",
            v.epoch);
