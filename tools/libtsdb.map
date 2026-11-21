@@ -43,6 +43,7 @@
         tsdb_test_latest_stats;
         tsdb_test_latest_window;
         tsdb_test_latest_wr_held;
+        tsdb_test_mark_ec;
         tsdb_test_mem_cap;
         tsdb_test_meta_hold;
         tsdb_test_meta_release;
