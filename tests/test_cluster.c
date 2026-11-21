@@ -4390,7 +4390,14 @@ static void scen_reopenhold(void)
         struct timespec ms = {0, 50000000};
         nanosleep(&ms, NULL);
     }
-    /* the leader seals the marker's segment, and R's log passes its end */
+    /* the leader seals the marker's segment, and R's log passes its end. The large write flushed the memtable before
+     * its marker, and a flush of an empty memtable starts no segment: a row first, or the marker's segment stays open
+     * until an idle seal that the 1.5 s below may miss, and the leader drops it only after R fetched (the mutant
+     * survived 2 runs of 3) */
+    t += 1000;
+    if ((rc = tsdbc_insert_series(c, id0, &t, &val, 1)) != 0)
+        die("a write after the large one: %s", ers(rc));
+    n[0]++;
     if ((rc = tsdbc_flush(c)) != 0)
         die("flush: %s", ers(rc));
     for (int k = 0; k < 20; k++) {
