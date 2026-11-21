@@ -1667,7 +1667,7 @@ int drop_retire(eng *db, int64_t ts)
             if (end <= ts)
                 ps[j++] = db->parts[i];
         }
-        rc = drop_retire_parts_locked(db, ps, n, intent, &done);
+        rc = drop_retire_parts_locked(db, ps, n, intent, &done, drop_marker_logged(db));
     }
     free(ps);
     db->drop_pending = false; /* also after a failed engine or intent: this is the only exit */

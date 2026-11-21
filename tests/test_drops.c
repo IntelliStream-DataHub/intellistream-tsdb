@@ -18,15 +18,26 @@
  *    checksum is wrong after all its renames ran reads as torn: the renames stand (the partition is gone), the
  *    intent is removed (as an insert's intent, part.c).
  *  - ec: an .ec name in a drop intent is rolled forward to retired_<name>.ec (r7-gc's name).
- * Failures print HALF DROP, TTL ORDER WRONG or EC LEFT, which the mutant runs in the Makefile require.
+ *  - kill with two parts in partition 0 (fixture_parts): a drop of exactly two parts takes an intent too.
+ *  - ttl power: the retention drop under crashfs: both partitions whole or both gone (one intent per pass).
+ *  - beside a settle's swap intent: drop intents are rolled forward last (a swap rolled forward hands the drop its
+ *    .ec; a swap whose renames were lost lists the .ec again unless the drop goes after it).
+ *  - names: a checksummed intent naming MANIFEST, a path or a retired_ name fails the open, nothing renamed.
+ *  - eio: EIO while checking a name at open fails the open; deleted: a part retired and deleted before the crash.
+ *  - no space: the intent cannot be written: the drop fails and retires nothing, fail-stop only for
+ *    tsdb_drop_before where a DROP marker is logged; a retention pass is never fail-stop, the next one drops.
+ * Failures print HALF DROP, TTL ORDER WRONG, EC LEFT, NAMES ACCEPTED, EIO AS GONE or TTL FAIL-STOP, which the
+ * mutant runs in the Makefile require.
  *
  *   ./build/test_drops [scratch dir]
- *   ./build/test_drops --mutant nointent|nosync|unlinkfirst|ttlreverse|skipec [scratch dir]   must fail
+ *   ./build/test_drops --mutant nointent|nosync|unlinkfirst|ttlreverse|skipec|dropfirst|nosettled|two|
+ *              novalidate|eioasgone|ttlfailstop|ttlunlinkfirst [scratch dir]   must fail
  */
 #define _GNU_SOURCE
 #include "internal.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -41,6 +52,8 @@
 #define SEEDS 8
 
 static int failures;
+static int fixture_parts = 3; /* 2: partition 0 without the third insert (a drop of exactly two parts) */
+static bool judge_ttl;        /* judge a retention drop: lift the limit first, both partitions go as one */
 static char S[PATH_MAX - 64], SELF[PATH_MAX], SHIM[PATH_MAX];
 
 #define CHECK(c)                                                                                                       \
@@ -101,7 +114,8 @@ static void make_fixture(const char *dir)
     CHECK(tsdb_series(db, "s", &id) == 0);
     CHECK(put(db, id, 0, 0, 2500, 1) == 0); /* 500 rows of it nothing overwrites: its retirement shows */
     CHECK(put(db, id, 0, 0, 2000, 2) == 0);
-    CHECK(put(db, id, 0, 500, 1500, 3) == 0);
+    if (fixture_parts == 3)
+        CHECK(put(db, id, 0, 500, 1500, 3) == 0);
     CHECK(put(db, id, DAY, 0, 100, 9) == 0);
     tsdb_close(db);
 }
@@ -137,15 +151,21 @@ static enum verdict judge(const char *dir)
     tsdb_sid id;
     enum verdict v = V_ERR;
     tsdb_points p = {0}, q = {0};
-    if (tsdb_series_lookup(db, "s", &id) == 0 && tsdb_query_points(db, id, 0, DAY, &p) == 0 &&
+    if (tsdb_series_lookup(db, "s", &id) == 0 && (!judge_ttl || tsdb_set_retention(db, id, 0) == 0) &&
+        tsdb_query_points(db, id, 0, DAY, &p) == 0 &&
         tsdb_query_points(db, id, DAY, 2 * DAY, &q) == 0) {
         bool day1 = q.n == 100;
         for (size_t i = 0; i < q.n; i++)
             day1 = day1 && q.values[i] == 9;
         bool whole = p.n == 2500;
         for (size_t i = 0; whole && i < p.n; i++)
-            whole = p.ts[i] == (int64_t)i * 1000 && p.values[i] == (i >= 2000 ? 1 : i >= 500 && i < 1500 ? 3 : 2);
-        v = !day1 ? V_ERR : p.n == 0 ? V_GONE : whole ? V_WHOLE : V_HALF;
+            whole = p.ts[i] == (int64_t)i * 1000 &&
+                    p.values[i] == (i >= 2000 ? 1 : i >= 500 && i < 1500 && fixture_parts == 3 ? 3 : 2);
+        v = p.n == 0 ? V_GONE : whole ? V_WHOLE : V_HALF;
+        if (judge_ttl) /* one intent for the pass: partition 1 goes with partition 0 or stays with it */
+            v = v == V_HALF || (day1 ? V_WHOLE : q.n == 0 ? V_GONE : V_HALF) != v ? V_HALF : v;
+        else if (!day1)
+            v = V_ERR;
         if (v != V_GONE && v != V_WHOLE)
             fprintf(stderr, "  partition 0: %zu rows (first value %g), partition 1: %zu rows\n", p.n,
                     p.n ? (double)p.values[0] : 0.0, q.n);
@@ -314,14 +334,22 @@ static int run_child(const char *mode, const char *dir, const char *ack, int war
     return WEXITSTATUS(st);
 }
 
-/* --child-drop DIR ACK: open, drop, acknowledge; --child-open DIR -: the open alone */
-static int child_main(bool drop, const char *dir, const char *ack)
+/* --child-drop DIR ACK: open, drop, acknowledge; --child-open DIR -: the open alone; --child-ttl DIR ACK: open with a
+ * merge thread (the retention limit is set already) and wait until its retention drop has retired every part */
+static int child_main(int mode, const char *dir, const char *ack)
 {
-    tsdb_options o = opts(0);
+    tsdb_options o = opts(mode == 2 ? 1 : 0);
     tsdb *db = NULL;
     if (tsdb_open(dir, &o, &db) != 0)
         return 2;
-    if (drop && tsdb_drop_before(db, DAY) == 0) {
+    for (int i = 0; mode == 2 && i < 2000 && listed_parts(dir) != 0; i++)
+        usleep(5000);
+    if (mode == 2 && listed_parts(dir) == 0) { /* the names are gone, not yet durable: nothing is acknowledged */
+        int fd = open(ack, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0)
+            close(fd);
+    }
+    if (mode == 1 && tsdb_drop_before(db, DAY) == 0) {
         int fd = open(ack, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0)
             close(fd);
@@ -364,29 +392,42 @@ static size_t p0_names(const char *dir, char names[][128])
     return n;
 }
 
-static void sweep(bool drop)
+enum { SW_DROP, SW_OPEN, SW_TTL };
+static void sweep(int mode)
 {
+    const bool drop = mode == SW_DROP, ttl_mode = mode == SW_TTL;
+    const int seeds = ttl_mode ? 4 : SEEDS;
     char src[PATH_MAX], work[PATH_MAX], ack[PATH_MAX + 8];
     snprintf(src, sizeof src, "%s/src", S);
     snprintf(work, sizeof work, "%s/work", S);
     snprintf(ack, sizeof ack, "%s/ack", S);
     make_fixture(src);
-    if (!drop) { /* a drop that wrote its intent and renamed one part, then died */
+    if (ttl_mode) { /* the limit is set here, without a merge thread: the child's first retention pass drops */
+        tsdb_options o = opts(0);
+        tsdb *db = NULL;
+        tsdb_sid id;
+        CHECK(tsdb_open(src, &o, &db) == 0 && tsdb_series_lookup(db, "s", &id) == 0 &&
+              tsdb_set_retention(db, id, DAY) == 0);
+        if (db)
+            tsdb_close(db);
+    } else if (!drop) { /* a drop that wrote its intent and renamed one part, then died */
         char names[8][128];
         CHECK(p0_names(src, names) == 3);
         write_intent(src, names, 3, false, false);
         retire_by_hand(src, names[0]);
     }
-    const char *what = drop ? "tsdb_drop_before" : "the open rolling a drop intent forward";
+    const char *what = drop       ? "tsdb_drop_before"
+                       : ttl_mode ? "the retention drop"
+                                  : "the open rolling a drop intent forward";
     int bad = 0, steps = 0, gone = 0, whole = 0;
     bool half = false;
     for (int w = 0; w < 5000 && bad < 3; w++) {
         bool ended = false;
-        for (int seed = 0; seed < SEEDS && bad < 3; seed++) {
+        for (int seed = 0; seed < seeds && bad < 3; seed++) {
             sh("rm -rf '%s'%s", work, "");
             sh("cp -a '%s' '%s'", src, work);
             unlink(ack);
-            int st = run_child(drop ? "--child-drop" : "--child-open", work, ack, w, seed);
+            int st = run_child(drop ? "--child-drop" : ttl_mode ? "--child-ttl" : "--child-open", work, ack, w, seed);
             if (st != 99 && st != 0) {
                 fprintf(stderr, "%s: step %d seed %d: the child exited with %d\n", what, w, seed, st);
                 failures++;
@@ -404,11 +445,13 @@ static void sweep(bool drop)
                         printf(" %s", tr[i]);
                 printf("\n");
             }
+            judge_ttl = ttl_mode;
             enum verdict v = judge(work);
+            judge_ttl = false;
             gone += v == V_GONE;
             whole += v == V_WHOLE;
             half = half || v == V_HALF;
-            if (v == V_HALF || v == V_ERR || (v == V_WHOLE && (acked || !drop))) {
+            if (v == V_HALF || v == V_ERR || (v == V_WHOLE && ((acked && drop) || mode == SW_OPEN))) {
                 fprintf(stderr, "%s: power lost before operation %d (seed %d): partition 0 %s%s\n", what, w, seed,
                         vname[v], acked ? " (acknowledged)" : "");
                 failures++;
@@ -419,15 +462,18 @@ static void sweep(bool drop)
         if (ended)
             break;
     }
-    if (drop && (!gone || !whole)) {
+    if (mode != SW_OPEN && (!gone || !whole)) {
         fprintf(stderr, "%s: %d cuts left it gone, %d whole: the sweep missed a side\n", what, gone, whole);
         failures++;
     }
     if (half)
         printf("  %s: HALF DROP\n", what);
-    printf("  %s: power lost at each of %d steps (%d seeds each; %d gone, %d whole): %s\n", what, steps, SEEDS, gone,
+    printf("  %s: power lost at each of %d steps (%d seeds each; %d gone, %d whole): %s\n", what, steps, seeds, gone,
            whole,
-           bad ? "FAILED" : drop ? "whole or gone, gone once acknowledged" : "gone");
+           bad        ? "FAILED"
+           : drop     ? "whole or gone, gone once acknowledged"
+           : ttl_mode ? "both partitions whole or both gone"
+                      : "gone");
 }
 
 /* ------------------------------------------------------- torn, damaged, ec */
@@ -481,9 +527,214 @@ static void crafted(void)
     printf("  an .ec name in a drop intent becomes retired_<name>.ec: %s\n", retired && !left ? "yes" : "no");
 }
 
+/* -------------------------------------- beside a settle's swap; names; EIO; deleted parts; a full disk */
+
+static void put_file(const char *dir, const char *name, const char *buf, size_t len)
+{
+    char p[PATH_MAX + 200];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    FILE *f = fopen(p, "w");
+    CHECK(f && fwrite(buf, 1, len, f) == len);
+    if (f)
+        fclose(f);
+}
+
+static bool exists(const char *dir, const char *name)
+{
+    char p[PATH_MAX + 200];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return access(p, F_OK) == 0;
+}
+
+/* names of partition 0 a reader would list: a part or an .ec part, not retired_ or settled_ */
+static size_t listed_p0(const char *dir)
+{
+    char names[64][128];
+    size_t n = count_prefix(dir, "p0_", names, 64), k = 0;
+    for (size_t i = 0; i < n && i < 64; i++)
+        k += part_file_name(names[i]) || ec_file_name(names[i]);
+    return k;
+}
+
+/* A settle's swap intent (the oldest part of partition 0 to its .ec) pending beside a drop intent; nothing of either
+ * renamed. 0: the drop named the part (the swap is rolled forward at the open, so the drop must take the .ec in its
+ * place); 1: the drop named the .ec, and the swap's renames were lost (the drop's intent name reached the disk first),
+ * so the swap's roll-forward lists the .ec again unless the drop goes after it. Either way partition 0 must end with
+ * nothing listed. The .ec is an empty stand-in, so the open fails after its intents, where this looks. */
+static void beside_swap(void)
+{
+    for (int c = 0; c < 2; c++) {
+        char work[PATH_MAX], names[8][128], stem[128], buf[2048], ec[160];
+        snprintf(work, sizeof work, "%s/swap%d", S, c);
+        make_fixture(work);
+        CHECK(p0_names(work, names) == 3);
+        snprintf(stem, sizeof stem, "%s", names[0]);
+        *strrchr(stem, '.') = '\0';
+        snprintf(ec, sizeof ec, "%s.ec", stem);
+        size_t len = (size_t)snprintf(buf, sizeof buf, INTENT_V4_HEAD "1\nL tmp_77_77.ec %s\nR %s settled_%s\n", ec,
+                                      names[0], names[0]);
+        len += (size_t)snprintf(buf + len, sizeof buf - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
+        put_file(work, "tmp_77_77.ec", "", 0);
+        put_file(work, "txn_1_99.intent", buf, len);
+        if (c == 1)
+            snprintf(names[0], 128, "%.120s", ec);
+        write_intent(work, names, 3, false, false);
+        tsdb_options o = opts(0);
+        tsdb *db = NULL;
+        (void)tsdb_open(work, &o, &db);
+        if (db)
+            tsdb_close(db);
+        char rec[200];
+        snprintf(rec, sizeof rec, "retired_%s", ec);
+        size_t left = listed_p0(work);
+        const char *what = c ? "the drop named the .ec, the swap's renames lost" : "the drop named the part";
+        if (left)
+            printf("  beside a settle's swap (%s): %zu names of partition 0 still listed: HALF DROP\n", what, left);
+        CHECK(left == 0 && exists(work, rec) && count_prefix(work, "txn_", NULL, 0) == 0);
+        printf("  a drop intent beside a settle's swap intent (%s): %zu listed, %s %s\n", what, left, rec,
+               exists(work, rec) ? "there" : "missing");
+    }
+}
+
+/* An intent whose checksum holds but which names something that is no part fails the open and renames nothing. */
+static void bad_names(void)
+{
+    const char *bad[] = {"MANIFEST", "../escape.part", "retired_p0_9_9_0.part"};
+    for (size_t b = 0; b < sizeof bad / sizeof *bad; b++) {
+        char work[PATH_MAX], names[8][128];
+        snprintf(work, sizeof work, "%s/names", S);
+        make_fixture(work);
+        CHECK(p0_names(work, names) == 3);
+        snprintf(names[3], 128, "%s", bad[b]);
+        write_intent(work, names, 4, false, false);
+        tsdb_options o = opts(0);
+        tsdb *db = NULL;
+        int rc = tsdb_open(work, &o, &db);
+        if (db)
+            tsdb_close(db);
+        bool ok = rc == TSDB_ERR_CORRUPT && exists(work, "MANIFEST") && listed_p0(work) == 3;
+        if (!ok)
+            printf("  NAMES ACCEPTED: a checksummed intent naming %s: the open said %d, %zu parts listed\n", bad[b], rc,
+                   listed_p0(work));
+        CHECK(ok);
+    }
+    printf("  a checksummed drop intent naming MANIFEST, a path or a retired_ name: the open fails, nothing renamed\n");
+}
+
+/* An existence check that fails with EIO fails the open (read as "gone", the part would stay listed); with the
+ * error gone the next open finishes the drop. */
+static void eio_at_open(void)
+{
+    char work[PATH_MAX], names[8][128];
+    snprintf(work, sizeof work, "%s/eio", S);
+    make_fixture(work);
+    CHECK(p0_names(work, names) == 3);
+    write_intent(work, names, 3, false, false);
+    drop_test_eio_name = names[1];
+    tsdb_options o = opts(0);
+    tsdb *db = NULL;
+    int rc = tsdb_open(work, &o, &db);
+    drop_test_eio_name = NULL;
+    if (db)
+        tsdb_close(db);
+    if (rc != TSDB_ERR_IO)
+        printf("  EIO AS GONE: the open said %d with EIO on %s\n", rc, names[1]);
+    CHECK(rc == TSDB_ERR_IO && count_prefix(work, "txn_", NULL, 0) == 1);
+    enum verdict v = judge(work);
+    CHECK(v == V_GONE);
+    printf("  EIO while rolling a drop intent forward: the open fails (%d); the next one finds partition 0 %s\n", rc,
+           vname[v]);
+}
+
+/* A part retired and its retired_ file deleted before the crash (obsolete_part_lifetime_s, r7-gc): the roll-forward
+ * counts it and goes on. */
+static void deleted_before(void)
+{
+    char work[PATH_MAX], names[8][128], p[PATH_MAX + 200];
+    snprintf(work, sizeof work, "%s/deleted", S);
+    make_fixture(work);
+    CHECK(p0_names(work, names) == 3);
+    write_intent(work, names, 3, false, false);
+    retire_by_hand(work, names[0]);
+    snprintf(p, sizeof p, "%s/retired_%s", work, names[0]);
+    CHECK(unlink(p) == 0);
+    enum verdict v = judge(work);
+    CHECK(v == V_GONE);
+    printf("  a drop intent whose first part was retired and deleted: partition 0 %s\n", vname[v]);
+}
+
+static bool failed(tsdb *db)
+{
+    char msg[256];
+    return tsdb_failed(db, msg, sizeof msg) != 0;
+}
+
+/* The intent cannot be written (a full disk). tsdb_drop_before fails and retires nothing; it is fail-stop only where
+ * a DROP marker is in the log (drop_test_marker stands in for a leader). A retention pass fails alone even there: no
+ * marker precedes it; the next pass drops. */
+static void no_space(void)
+{
+    char work[PATH_MAX];
+    snprintf(work, sizeof work, "%s/nospace", S);
+    for (int leader = 0; leader < 2; leader++) {
+        make_fixture(work);
+        tsdb_options o = opts(0);
+        tsdb *db = NULL;
+        CHECK(tsdb_open(work, &o, &db) == 0);
+        if (!db)
+            return;
+        drop_test_marker = leader;
+        drop_test_intent_errno = ENOSPC;
+        int rc = tsdb_drop_before(db, DAY);
+        drop_test_intent_errno = 0;
+        CHECK(rc != 0 && failed(db) == (leader == 1) && listed_p0(work) == 3);
+        CHECK(count_prefix(work, "txn_", NULL, 0) == 0);
+        if (!leader)
+            CHECK(tsdb_drop_before(db, DAY) == 0 && listed_p0(work) == 0);
+        drop_test_marker = false;
+        tsdb_close(db);
+        enum verdict v = judge(work);
+        CHECK(v == (leader ? V_WHOLE : V_GONE));
+        printf("  tsdb_drop_before on a full disk (%s): fails, %s; partition 0 %s at the next open\n",
+               leader ? "a DROP marker logged" : "a single node", leader ? "fail-stop" : "the retry drops", vname[v]);
+    }
+
+    make_fixture(work);
+    tsdb_options o = opts(0);
+    tsdb *db = NULL;
+    tsdb_sid id;
+    CHECK(tsdb_open(work, &o, &db) == 0 && tsdb_series_lookup(db, "s", &id) == 0 &&
+          tsdb_set_retention(db, id, DAY) == 0);
+    if (db)
+        tsdb_close(db);
+    o = opts(1);
+    drop_test_marker = true;
+    drop_test_intent_errno = ENOSPC;
+    atomic_store(&drop_test_intent_fails, 0);
+    db = NULL;
+    CHECK(tsdb_open(work, &o, &db) == 0);
+    if (!db)
+        return;
+    for (int i = 0; i < 600 && atomic_load(&drop_test_intent_fails) < 2; i++)
+        usleep(50000);
+    bool stopped = failed(db), passes = atomic_load(&drop_test_intent_fails) >= 2;
+    drop_test_intent_errno = 0;
+    for (int i = 0; i < 600 && listed_parts(work) != 0; i++)
+        usleep(50000);
+    if (stopped)
+        printf("  TTL FAIL-STOP: a retention pass whose intent failed failed the engine\n");
+    CHECK(passes && !stopped && !failed(db) && listed_parts(work) == 0);
+    drop_test_marker = false;
+    tsdb_close(db);
+    printf("  a retention drop on a full disk with a DROP marker possible: the pass fails alone (%s), the next drops "
+           "(%zu listed)\n", stopped ? "fail-stop" : "no fail-stop", listed_parts(work));
+}
+
 static int parse_mutant(const char *m)
 {
-    static const char *names[] = {"", "nointent", "nosync", "unlinkfirst", "ttlreverse", "skipec"};
+    static const char *names[] = {"",          "nointent",  "nosync",     "unlinkfirst", "ttlreverse",
+                                  "skipec",    "dropfirst", "nosettled",  "novalidate",  "eioasgone",
+                                  "ttlfailstop", "ttlunlinkfirst", "two"};
     for (int i = 1; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(m, names[i]) == 0)
             return i;
@@ -494,8 +745,10 @@ int main(int argc, char **argv)
 {
     if (getenv("TSDB_DROP_MUTANT"))
         drop_test_mutant = parse_mutant(getenv("TSDB_DROP_MUTANT"));
-    if (argc == 4 && (strcmp(argv[1], "--child-drop") == 0 || strcmp(argv[1], "--child-open") == 0))
-        return child_main(strcmp(argv[1], "--child-drop") == 0, argv[2], argv[3]);
+    if (argc == 4 && (strcmp(argv[1], "--child-drop") == 0 || strcmp(argv[1], "--child-open") == 0 ||
+                      strcmp(argv[1], "--child-ttl") == 0))
+        return child_main(strcmp(argv[1], "--child-drop") == 0 ? 1 : strcmp(argv[1], "--child-ttl") == 0 ? 2 : 0,
+                          argv[2], argv[3]);
     const char *scratch = "/tmp";
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mutant") == 0 && i + 1 < argc) {
@@ -522,11 +775,20 @@ int main(int argc, char **argv)
     printf("test_drops: a drop is whole or not at all after a crash\n");
     kill_drop(0);
     kill_drop(1);
+    fixture_parts = 2; /* a drop of exactly two parts takes an intent too */
+    kill_drop(0);
+    fixture_parts = 3;
     ttl();
     crafted();
+    beside_swap();
+    bad_names();
+    eio_at_open();
+    deleted_before();
+    no_space();
     if (access(SHIM, R_OK) == 0) {
-        sweep(true);
-        sweep(false);
+        sweep(SW_DROP);
+        sweep(SW_OPEN);
+        sweep(SW_TTL);
     } else {
 #ifdef __linux__
         fprintf(stderr, "test_drops: %s is missing\n", SHIM);

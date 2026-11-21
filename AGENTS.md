@@ -345,11 +345,17 @@ cgroup, so `nice` does not keep your work out of its way.
   merge thread (one intent per pass) and a replica's DROP write a drop intent (`tsdb-drop 1 <n>`, the part names, under
   a `txn_` name) and sync it and the directory before the first `retired_` rename, unlink it only after the directory
   fsync that follows the renames, and `intents_recover` rolls a whole one forward (an `.ec` name to `retired_<name>.ec`,
-  before the listing and ecgc's sweep); a torn one retired nothing. The renames still go in block order, oldest first
+  before the listing and ecgc's sweep) in a second pass, after every insert and settle-swap intent: a drop does not wait
+  for a settle, and a swap rolled forward hands the drop its `.ec` (a listed source found `settled_` is retired through
+  its `.ec`); a torn one retired nothing; one whose checksum holds but names no part (MANIFEST, a path), or an existence
+  check that fails with EIO, fails the open. The renames still go in block order, oldest first
   (the TTL drop went newest first): a prefix keeps every key at its newest value. `latest_rw` and `db->lock` are held
-  across the intent's fdatasync and directory fsync. A failed intent write fails just the call, except on a leader or a
-  replica (the DROP marker is in the log): fail-stop. `tests/test_drops.c` (kill, crashfs, mutants `nointent nosync
-  unlinkfirst ttlreverse skipec`).
+  across the intent's fdatasync and directory fsync. A failed intent write (a full disk: a drop of two parts or more
+  needs a new file) fails just the call, except for `tsdb_drop_before` on a leader or a replica (the DROP marker is in
+  the log, `drop_marker_logged`): fail-stop; a retention pass logs no marker and is never fail-stop there.
+  `tests/test_drops.c` (kill, crashfs for the drop, the open and the retention drop, beside a swap intent, bad names,
+  EIO, a full disk; mutants `nointent nosync unlinkfirst ttlreverse skipec dropfirst nosettled two ttlunlinkfirst
+  novalidate eioasgone ttlfailstop`).
 - **Durability.** A new file is durable after fsync of the file and of its
   directory; a rename after fsync of the directory. In sync mode
   (`wal_sync_ms = 0`) a memtable row is visible to queries only once the WAL is

@@ -690,7 +690,11 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal, cha
                 drop[ndrop - 1 - i] = t;
             }
         size_t done = 0;
-        (void)drop_retire_parts_locked(db, drop, ndrop, drop_intent, &done); /* fails just this pass, or fail-stop */
+        /* A failed intent fails just this pass, also on a replicated leader: no DROP marker precedes a retention
+         * drop, nothing was promised, and the next pass tries again (fail-stop would depose the leader for a full
+         * disk). A failed directory fsync after the intent or the renames is fail-stop, as everywhere. */
+        (void)drop_retire_parts_locked(db, drop, ndrop, drop_intent, &done,
+                                       drop_test_mutant == DROP_MUT_TTL_FAIL_STOP && drop_marker_logged(db));
         *dropped = done > 0;
         free(drop);
     }
@@ -715,6 +719,8 @@ void *merge_thread_main(void *arg)
             k = select_merge_locked(db, sel, true);
         if (dropped || sync_wal) {
             pthread_mutex_unlock(&db->lock);
+            if (drop_test_mutant == DROP_MUT_TTL_UNLINK_FIRST && dropped)
+                drop_intent_done(db, drop_intent); /* planted: the intent goes before its renames are synced */
             int src = eng_sync_dir(db, "fsync of the directory after retiring expired partitions");
             if (src == 0 && dropped) {
                 drop_intent_done(db, drop_intent); /* after the fsync: the open finishes a drop whose fsync failed */

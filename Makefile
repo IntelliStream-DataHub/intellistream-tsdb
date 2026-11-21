@@ -347,6 +347,10 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	for m in nointent nosync unlinkfirst; do ./$(B)/test_drops --mutant $$m $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'HALF DROP' || { echo "test_drops: mutant $$m survived"; exit 1; }; done
 	./$(B)/test_drops --mutant ttlreverse $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'TTL ORDER WRONG' || { echo "test_drops: mutant ttlreverse survived"; exit 1; }
 	./$(B)/test_drops --mutant skipec $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'EC LEFT' || { echo "test_drops: mutant skipec survived"; exit 1; }
+	for m in dropfirst nosettled two ttlunlinkfirst; do ./$(B)/test_drops --mutant $$m $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'HALF DROP' || { echo "test_drops: mutant $$m survived"; exit 1; }; done
+	./$(B)/test_drops --mutant novalidate $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'NAMES ACCEPTED' || { echo "test_drops: mutant novalidate survived"; exit 1; }
+	./$(B)/test_drops --mutant eioasgone $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'EIO AS GONE' || { echo "test_drops: mutant eioasgone survived"; exit 1; }
+	./$(B)/test_drops --mutant ttlfailstop $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'TTL FAIL-STOP' || { echo "test_drops: mutant ttlfailstop survived"; exit 1; }
 	./$(B)/test_replfile $(or $(TMPDIR),/tmp)
 	for m in nosync sameslot nochecksum; do ! ./$(B)/test_replfile --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_replica $(or $(TMPDIR),/tmp)

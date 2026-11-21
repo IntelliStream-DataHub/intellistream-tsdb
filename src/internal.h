@@ -1064,12 +1064,22 @@ extern int intents_test_mutant;
  * holds db->lock (and the latest table's write section where it folds the drop). 0 with *done renamed (a rename that
  * failed the engine stops there; the open finishes them) and `intent` the file to unlink with drop_intent_done after
  * the caller's directory fsync ("" when none was written: one part, or a failed engine); an error with nothing
- * retired. */
-int drop_retire_parts_locked(struct eng *db, struct part **ps, size_t n, char intent[64], size_t *done);
+ * retired. `fail_stop`: a failed write of the intent fails the engine (drop_marker_logged: a DROP marker the replicas
+ * carry out is already in the log); else it fails just the call. */
+int drop_retire_parts_locked(struct eng *db, struct part **ps, size_t n, char intent[64], size_t *done,
+                             bool fail_stop);
 void drop_intent_done(struct eng *db, const char *intent);
+bool drop_marker_logged(struct eng *db);
 enum { DROP_MUT_NONE = 0, DROP_MUT_NO_INTENT, DROP_MUT_NO_SYNC, DROP_MUT_UNLINK_FIRST, DROP_MUT_TTL_REVERSE,
-       DROP_MUT_SKIP_EC };
+       DROP_MUT_SKIP_EC, DROP_MUT_DROP_FIRST, DROP_MUT_NO_SETTLED, DROP_MUT_NO_VALIDATE, DROP_MUT_EIO_AS_GONE,
+       DROP_MUT_TTL_FAIL_STOP, DROP_MUT_TTL_UNLINK_FIRST, DROP_MUT_TWO };
 extern int drop_test_mutant;
+/* tests/test_drops.c: the intent's write fails with this errno; the engine acts as one with a DROP marker logged; the
+ * open's existence check of this name fails with EIO */
+extern _Atomic int drop_test_intent_errno; /* atomics: the merge thread reads both while the test sets them */
+extern _Atomic bool drop_test_marker;
+extern const char *drop_test_eio_name;
+extern _Atomic int drop_test_intent_fails; /* how often drop_test_intent_errno failed a write */
 extern void (*drop_test_hook)(struct eng *db, const char *name, size_t at); /* after each rename of a drop */
 /* Exactly the names the engine gives part writers' tmp files and parts: what a cleanup at open may touch. */
 bool part_tmp_name(const char *name);
