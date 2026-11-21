@@ -2340,8 +2340,12 @@ static int leader_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_
             rc = TSDB_ERR_IO;
         else if ((size_t)st.st_size >= WAL_HDR && pread(fd, h, WAL_HDR, 0) == WAL_HDR)
             memcpy(&first, h + 16, 8);
-        else if (!newest)
-            rc = TSDB_ERR_CORRUPT; /* a sealed segment without a record */
+        else if (!newest && st.st_size != 0)
+            rc = TSDB_ERR_CORRUPT; /* a sealed segment with a torn first record */
+        /* An empty sealed one never got a record (a process killed right after the rotation that made it; a writer's
+         * open neither replays nor removes a kept segment): it holds no position, as an empty replica segment holds
+         * none (rseg.first 0), and the read goes on below it. A missing position is still an error: the segment below
+         * must have it, or its scan does not find it (INVALID). */
         close(fd);
         if (rc)
             return rc;

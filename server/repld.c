@@ -153,6 +153,8 @@ struct rpeer {
     uint64_t ahead_ms; /* since when `sent` is past `wrote` (0: it is not): what was sent since has not arrived */
     int heard;
     uint64_t heard_ms; /* when a message of this volume last came from it (repld_unreachable) */
+    int rderr;         /* the last error of a catch-up read for it, and when it was said (never silent, not a flood) */
+    uint64_t rderr_ms;
 };
 
 struct rvol {
@@ -704,6 +706,15 @@ static void catch_up(struct rvol *rv, struct eng *db)
             nanosleep(&sl, NULL);
         }
         pthread_mutex_lock(&rv->mu);
+        if (rc < 0 && rc != TSDB_ERR_NOTFOUND) { /* NOTFOUND: in parts, the core sends a snapshot */
+            uint64_t now = now_ms();
+            if (rc != p->rderr || now - p->rderr_ms >= 10000) {
+                say("volume %" PRIu32 ": cannot read its log at %" PRIu64 " for member %d (error %d): the member does not"
+                    " catch up", rv->number, from, i, rc);
+                p->rderr = rc;
+                p->rderr_ms = now;
+            }
+        }
         if (rc == 0 && len && p->sent + 1 == from && send_records(rv, i, seq, off, buf, len, from) == 0) {
             p->sent = last;
             p->sent_ms = now_ms();

@@ -3426,6 +3426,7 @@ static void case_promote(int variant)
     /* item 6: the promoted leader has the latest table (a replica runs without one) and keeps the replica's RSTATE,
      * which holds the DROP it applied (mutant promotenocarry: no table, RSTATE removed) */
     CHECK(n->lt != NULL);
+    uint64_t gap_first = 0;
     { /* the promoted leader serves its log from the kept segments below the epoch's jump of numbers (mutant readgap:
        * NOTFOUND at the first missing number, a snapshot for every member behind the promotion) */
         uint8_t *rb = NULL;
@@ -3445,6 +3446,7 @@ static void case_promote(int variant)
         CHECK_EQ(replica_read(n, first, &rb, &rl, 1 << 20, &rsq, &roff, &rlast), 0);
         CHECK(rl > 0 && rsq < old[nold - 1] && roff == 0 && rlast >= first);
         free(rb);
+        gap_first = first;
     }
     {
         char rs[PATH_MAX + 16];
@@ -3464,6 +3466,26 @@ static void case_promote(int variant)
     xp_step(&x, "P: small after promotion");
     xp_rows(&x, 1, 0, 40, 800);
     xp_step(&x, "P: large after promotion");
+    { /* a sealed segment that never got a record, among the kept ones under the jump (a member killed right after a
+       * rotation made it: a writer's open neither replays nor removes a kept segment), holds no position: the read
+       * of the positions below it goes on to the segment that has them (jepsen-cluster kill, r3e: the leader read
+       * it as CORRUPT, which the catch-up dropped, and both replicas behind the promotion stopped for good) */
+        char p[PATH_MAX + 64], nm2[64];
+        wal_name(nm2, sizeof nm2, old[nold - 1] - 1);
+        snprintf(p, sizeof p, "%s/%s", rd, nm2);
+        CHECK(x.ld->wal_seq > old[nold - 1]); /* sealed: below the current segment and the one before it */
+        int fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        CHECK(fd >= 0);
+        if (fd >= 0)
+            close(fd);
+        uint8_t *rb = NULL;
+        size_t rl = 0;
+        uint64_t rsq = 0, roff = 0, rlast = 0;
+        CHECK_EQ(replica_read(x.ld, gap_first, &rb, &rl, 1 << 20, &rsq, &roff, &rlast), 0);
+        CHECK(rl > 0 && rsq < old[nold - 1] - 1 && rlast >= gap_first);
+        free(rb);
+        unlink(p);
+    }
     CHECK_EQ(eng_delete_range(x.ld, 0, T0 + 1000, T0 + 3000), 0);
     xp_step(&x, "P: delete after promotion");
     xp_rows(&x, 0, 40, 10, 3000);
