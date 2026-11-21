@@ -1577,7 +1577,8 @@ enum cl_mutant {
     CLM_MOVEGIVEUP = 16,   /* a move gives up at PROMO_MOVE_NS, and any promotion at PROMO_GIVEUP_NS, though a replica
                             * answered and only the old leader's lease is awaited */
     CLM_ANYEPOCH = 17,     /* a FENCE_REPLY of any epoch counts for the promotion of its volume (review R2) */
-    CLM_NOCUTHOLD = 18     /* a shrink below 2 goes ahead before the member it drops reported the cut (review R13) */
+    CLM_NOCUTHOLD = 18,    /* a shrink below 2 goes ahead before the member it drops reported the cut (review R13) */
+    CLM_FORCEUP = 19       /* force-leader goes ahead while an ISR member is up (review R6) */
 };
 static int cl_mutant(void)
 {
@@ -1604,6 +1605,7 @@ static int cl_mutant(void)
             : !strcmp(e, "movegiveup")    ? CLM_MOVEGIVEUP
             : !strcmp(e, "anyepoch")      ? CLM_ANYEPOCH
             : !strcmp(e, "nocuthold")     ? CLM_NOCUTHOLD
+            : !strcmp(e, "forceup")       ? CLM_FORCEUP
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -3621,7 +3623,7 @@ static void admin_volume_force(struct conn *c, uint32_t reqid, struct rd *r)
     }
     for (uint32_t i = 0; i < v->nisr; i++) {
         const struct meta_member *m = meta_member(&C.sm, v->isr[i]);
-        if (m && m->state == META_UP) {
+        if (m && m->state == META_UP && cl_mutant() != CLM_FORCEUP) {
             int n = snprintf(text, sizeof text, "ISR member %" PRIu32 " of volume %" PRIu32 " is up: the promotion "
                              "does not need an operator", v->isr[i], number);
             admin_reply(c->serial, reqid, CLUSTER_ERR_STATE, text, (size_t)n);

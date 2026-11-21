@@ -15,16 +15,17 @@
 # with a replica's answer gives up waiting for the old leader's lease: the ISR shrinks to it, no new leader) oneway,
 # anyepoch (a late fence answer of an earlier epoch counts as the old leader's: it answers reads after the new leader's
 # first write) oneway2, nocuthold (a shrink below 2 goes ahead before the member it drops reported the cut: an ISR of
-# the cut leader alone, so no replica can be promoted) cuthold.
+# the cut leader alone, so no replica can be promoted) cuthold, forceup (force-leader goes ahead while an ISR member is
+# up) noowner.
 # Usage: tests/lease_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb).
 set -u
 dir=${1:-/tmp}; shift || true
-muts=${*:-leaseanyvoter nodrift stampignored nocoreclock noquorum nopromotewait shrinknocond upwaits cutshrinks probelate leasestale deposedstuck fencelease oldpass movegiveup anyepoch nocuthold}
+muts=${*:-leaseanyvoter nodrift stampignored nocoreclock noquorum nopromotewait shrinknocond upwaits cutshrinks probelate leasestale deposedstuck fencelease oldpass movegiveup anyepoch nocuthold forceup}
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
 survived=
 for m in $muts; do
-    case $m in stampignored) s=hungloop ;; noquorum) s=leasequorum ;; nopromotewait) s=leasedown ;; shrinknocond) s=isr ;; upwaits|probelate) s=resign ;; cutshrinks) s=cut ;; leasestale) s=leasestale ;; deposedstuck) s=cutstuck ;; fencelease|oldpass|movegiveup) s=oneway ;; anyepoch) s=oneway2 ;; nocuthold) s=cuthold ;; *) s=lease ;; esac
+    case $m in stampignored) s=hungloop ;; noquorum) s=leasequorum ;; nopromotewait) s=leasedown ;; shrinknocond) s=isr ;; upwaits|probelate) s=resign ;; cutshrinks) s=cut ;; leasestale) s=leasestale ;; deposedstuck) s=cutstuck ;; fencelease|oldpass|movegiveup) s=oneway ;; anyepoch) s=oneway2 ;; nocuthold) s=cuthold ;; forceup) s=noowner ;; *) s=lease ;; esac
     if ! TSDB_CLUSTER_MUTANT=$m timeout 600 ./build/test_cluster "$dir" $s > "$dir/mut-$m-$s.log" 2>&1; then
         echo "mutant $m: caught by $s ($(grep -m1 FAIL "$dir/mut-$m-$s.log"))"
     else

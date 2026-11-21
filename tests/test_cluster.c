@@ -7686,6 +7686,18 @@ static void scen_noowner(void)
     if (!vol_rec(Cs, "nw", &v))
         die("no record of nw");
     uint64_t e0 = v.epoch;
+    { /* while an ISR member is up the group promotes by itself: force-leader is refused and moves nothing (review R6) */
+        uint8_t freq[8], *frep = NULL;
+        size_t flen = 0, frl = cluster_volume_force_encode(num, ids[Cs], freq);
+        rc = admin(Cs, CLUSTER_OP_VOLUME_FORCE, freq, frl, 1, &frep, &flen);
+        if (rc != CLUSTER_ERR_STATE)
+            die("force-leader of server %d with ISR {leader, server %d} up: %s, not refused (%.*s)", Cs, B,
+                cluster_strerror(rc), (int)flen, frep ? (const char *)frep : "");
+        printf("  force-leader with the ISR up: refused (%.*s)\n", (int)flen, frep ? (const char *)frep : "");
+        free(frep);
+        if (!vol_rec(Cs, "nw", &v) || v.epoch != e0 || v.leader != old)
+            die("a refused force-leader moved nw (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+    }
     stop(L, SIGKILL);
     stop(B, SIGKILL);
     uint64_t t0 = now_ms();
