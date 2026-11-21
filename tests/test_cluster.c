@@ -7261,6 +7261,134 @@ static void scen_oneway2(void)
     stop_all();
 }
 
+/* manystuck (review F4): cutstuck with more volumes than the proposer's old fixed tables of 16. 72 volumes; the server
+ * other than the Raft leader that leads the most (more than 16) is cut from its replicas while they answer no fence: every move is given up and
+ * the leader deposed in all of them at once. Once the members answer, each must be taken as resigned and get a leader
+ * past its epoch: with 16 slots per table one was overwritten at random each round, and a deposed leader's 3 s timer
+ * rarely ran out (the old tables: the last taken as resigned 10 s, re-led 13 s after the members answer). */
+static void nofence_file(int at, int on);
+static void scen_manystuck(void)
+{
+    scenario("manystuck");
+    enum { NV = 72 };
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks,nofencereply";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    static char names[NV][16];
+    uint32_t nums[NV];
+    uint64_t eps[NV];
+    int lead[NV], count[3] = {0};
+    int rc;
+    for (int k = 0; k < NV; k++) {
+        snprintf(names[k], sizeof names[k], "ms%d", k);
+        if ((rc = vol_add(0, names[k], 3, &nums[k])) != 0)
+            die("volume add %s: %s", names[k], cluster_strerror(rc));
+    }
+    for (int k = 0; k < NV; k++) {
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, names[k], i, 1, 0);
+        struct meta_volume v;
+        if (!vol_rec(0, names[k], &v))
+            die("no record of %s", names[k]);
+        lead[k] = server_of(v.leader);
+        eps[k] = v.epoch;
+        if (lead[k] < 0 || lead[k] > 2)
+            die("the leader of %s is node %u", names[k], v.leader);
+        count[lead[k]]++;
+    }
+    int L = count[2] > count[1] ? 2 : 1; /* not the Raft leader: cut, it would not move its volumes but fence them */
+    if (count[L] <= 16)
+        die("server %d leads %d of %d volumes, not more than 16", L, count[L], NV);
+    for (int k = 0; k < NV; k++)
+        if (lead[k] == L)
+            await_isr(L, names[k], 3, 30000, "every replica in the ISR before the cut");
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            nofence_file(i, 1);
+    uint64_t t0 = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    char line[96];
+    for (int k = 0; k < NV; k++) /* every move given up and the old leader deposed, in each of its volumes */
+        if (lead[k] == L) {
+            snprintf(line, sizeof line, "volume %" PRIu32 ": no replica to move the leadership of epoch %" PRIu64 " to;",
+                     nums[k], eps[k]);
+            await_log_count(0, line, 1, 60000); /* server 0 is the Raft leader throughout */
+            snprintf(line, sizeof line, "volume %" PRIu32 ": deposed at epoch %" PRIu64 "", nums[k], eps[k]);
+            await_log_count(L, line, 1, 60000);
+        }
+    uint64_t tg = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            nofence_file(i, 0);
+    /* the proposer's own decision, at most DEPOSED_HOLD_NS (3 s) after each move was given up: 6 s. A new leader's
+     * reopen of 24 volumes at once may take longer on a loaded host: 30 s for those */
+    int left = count[L];
+    uint64_t taken[NV] = {0}, tlast = 0;
+    for (; left > 0; usleep(100000)) {
+        for (int k = 0; k < NV; k++) {
+            if (lead[k] != L || taken[k])
+                continue;
+            snprintf(line, sizeof line, "volume %" PRIu32 ": leader %" PRIu32 " of epoch %" PRIu64 " is up but",
+                     nums[k], ids[L], eps[k]);
+            if (log_count(0, line) > 0) {
+                taken[k] = tlast = now_ms();
+                left--;
+            }
+        }
+        if (left > 0 && now_ms() - tg > 6000) {
+            for (int k = 0; k < NV; k++)
+                if (lead[k] == L && !taken[k])
+                    die("%d of the %d volumes server %d led are not taken as its resignation 6 s after the members "
+                        "answer again (%s among them): the proposer lost their deposed time", left, count[L], L,
+                        names[k]);
+        }
+    }
+    left = count[L];
+    uint64_t done[NV] = {0};
+    for (; left > 0; usleep(100000)) {
+        for (int k = 0; k < NV; k++) {
+            struct meta_volume v;
+            if (lead[k] != L || done[k] || !vol_rec(0, names[k], &v) || v.epoch <= eps[k])
+                continue;
+            int Nw = server_of(v.leader);
+            snprintf(line, sizeof line, "volume %" PRIu32 ": leads epoch %" PRIu64 " ", nums[k], v.epoch);
+            if (Nw >= 0 && Nw <= 2 && log_count(Nw, line) > 0) {
+                done[k] = now_ms();
+                left--;
+            }
+        }
+        if (left > 0 && now_ms() - tg > 30000) {
+            for (int k = 0; k < NV; k++)
+                if (lead[k] == L && !done[k])
+                    die("%d of the %d volumes server %d led have no leader past their epoch 30 s after the members "
+                        "answer again (%s among them)", left, count[L], L, names[k]);
+        }
+    }
+    uint64_t last = 0;
+    for (int k = 0; k < NV; k++)
+        if (done[k] > last)
+            last = done[k];
+    printf("  server %d led %d of %d volumes; cut, every move given up, deposed in all %" PRIu64 " ms after the cut; "
+           "each taken as resigned, the last %" PRIu64 " ms, and has a new leader, the last %" PRIu64 " ms after the "
+           "members answer again\n", L, count[L], NV, tg - t0, tlast - tg, last - tg);
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    stop_all();
+}
+
 /* A leader cut from its replicas on the data links (TSDB_REPLD_TEST=cutlinks; the peer port, heartbeats and the Raft
  * group stay whole) asks to shrink the ISR to itself; the Raft leader, which hears the replicas and reads in their
  * heartbeats that they lost the leader, moves the leadership to one of them instead (design-cluster.md 6.1): no ISR of
@@ -7697,7 +7825,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

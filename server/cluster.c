@@ -3527,9 +3527,65 @@ static void on_probe_reply(struct conn *c, struct rd *r)
  * in it), so the promotion that is waiting fences it and, as the only one to answer, picks it. Unclean: writes the old
  * ISR acknowledged past the replica's log end are lost, and its own extra records are cut from the others when they
  * return. The promotion's log line compares the replica's durable end with the last shrink's commit point. */
-/* forced replicas, so that the promotion's log line can compare (cluster thread) */
-static struct { uint32_t vol, node; uint64_t epoch; } g_forced[16]; /* force-leader: logged at the promotion */
-static unsigned g_nforced;
+/* The proposer's memory per volume (cluster thread): one entry per volume of C.sm, ascending by number as C.sm.volumes
+ * is, so a lookup is a binary search; vs_sync follows the record's list whenever a volume is not found. Fixed tables of
+ * 16 lost entries once more volumes than that failed over at once (review F4): a deposed leader's timer, overwritten
+ * at random each round, could then never reach DEPOSED_HOLD_NS, and that volume stayed without a writer. Never hold a
+ * pointer across a call that may look up a volume C.sm does not list (it reallocates). */
+struct vstate {
+    uint32_t vol;
+    uint32_t promo;                     /* 1 + the index of its promotion in g_promo: a hint promo_find checks */
+    uint8_t cut_held, dep_seen, cut_failed, forced, resigned;
+    uint64_t cut_epoch, cut_version, cut_ns; /* cut_move: when a shrink of this basis was first held */
+    uint32_t dep_leader;                /* leader_deposed: since when this leader of this epoch does not lead */
+    uint64_t dep_epoch, dep_ns;
+    uint64_t fail_epoch, fail_version;  /* a move given up for this basis: the shrink goes ahead */
+    uint32_t forced_node;               /* force-leader, so that the promotion's log line can compare */
+    uint64_t forced_epoch;
+    uint32_t resign_from;               /* a RESIGN of the record's leader heard since the last duty round */
+    uint64_t resign_epoch;
+};
+static struct vstate *g_vs;
+static uint32_t g_nvs;
+
+static void vs_sync(void)
+{
+    struct vstate *n = calloc(C.sm.nvolumes ? C.sm.nvolumes : 1, sizeof *n);
+    if (!n)
+        oom();
+    for (uint32_t i = 0, j = 0; i < C.sm.nvolumes; i++) {
+        uint32_t num = C.sm.volumes[i].number;
+        while (j < g_nvs && g_vs[j].vol < num)
+            j++;
+        if (j < g_nvs && g_vs[j].vol == num)
+            n[i] = g_vs[j];
+        else
+            n[i].vol = num;
+    }
+    free(g_vs);
+    g_vs = n;
+    g_nvs = C.sm.nvolumes;
+}
+
+/* NULL: C.sm has no such volume */
+static struct vstate *vs_find(uint32_t vol)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t lo = 0, hi = g_nvs;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (g_vs[mid].vol < vol)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < g_nvs && g_vs[lo].vol == vol)
+            return &g_vs[lo];
+        if (pass == 0)
+            vs_sync();
+    }
+    return NULL;
+}
 
 static void admin_volume_force(struct conn *c, uint32_t reqid, struct rd *r)
 {
@@ -3585,9 +3641,9 @@ static void admin_volume_force(struct conn *c, uint32_t reqid, struct rd *r)
         admin_reply(c->serial, reqid, CLUSTER_ERR_RETRY, NULL, 0);
         return;
     }
-    if (g_nforced == sizeof g_forced / sizeof g_forced[0])
-        g_nforced = 0;
-    g_forced[g_nforced++] = (__typeof__(g_forced[0])){number, node, v->epoch};
+    struct vstate *vs = vs_find(number);
+    if (vs)
+        vs->forced = 1, vs->forced_node = node, vs->forced_epoch = v->epoch;
     int tl = snprintf(text, sizeof text, "volume %" PRIu32 ": node %" PRIu32 " joins the ISR of epoch %" PRIu64
                       " and is promoted (unclean). The last shrink's commit point is %" PRIu64 "; writes "
                       "acknowledged past node %" PRIu32 "'s log end are lost (the promotion's log line compares the two)",
@@ -4620,10 +4676,7 @@ static cluster_fence_fn g_fence_fn;
 static void *g_fence_arg;
 static struct promo *g_promo; /* the cluster thread's */
 static size_t g_npromo, g_promo_cap;
-static struct { uint32_t vol, from; uint64_t epoch; } g_resign[64]; /* RESIGNs heard since the last duty round */
-static struct { uint32_t vol; uint64_t epoch, version; } g_cutfail[16]; /* moves given up, per basis */
-static unsigned g_ncutfail;
-static unsigned g_nresign;
+static unsigned g_nresign; /* RESIGNs noted in the per-volume state since the last duty round */
 
 void cluster_set_fence_handler(cluster_fence_fn fn, void *arg)
 {
@@ -4643,9 +4696,15 @@ void cluster_vol_msg(const struct cluster_vmsg *m)
 
 static struct promo *promo_find(uint32_t vol)
 {
-    for (size_t i = 0; i < g_npromo; i++)
-        if (g_promo[i].vol == vol)
+    struct vstate *vs = vs_find(vol);
+    if (vs && vs->promo && vs->promo <= g_npromo && g_promo[vs->promo - 1].vol == vol)
+        return &g_promo[vs->promo - 1];
+    for (size_t i = 0; i < g_npromo; i++) /* the hint is set where a promotion starts or moves; this is a belt */
+        if (g_promo[i].vol == vol) {
+            if (vs)
+                vs->promo = (uint32_t)i + 1;
             return &g_promo[i];
+        }
     return NULL;
 }
 
@@ -4654,8 +4713,12 @@ static void volmsg_in(uint32_t from, const struct cluster_vmsg *m)
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
         return;
     if (m->kind == CL_VMSG_RESIGN) {
-        if (g_nresign < sizeof g_resign / sizeof g_resign[0])
-            g_resign[g_nresign++] = (__typeof__(g_resign[0])){m->volume, from, m->epoch};
+        const struct meta_volume *v = meta_volume(&C.sm, m->volume);
+        struct vstate *vs = v && v->leader == from && v->epoch == m->epoch ? vs_find(m->volume) : NULL;
+        if (vs) { /* only the record's leader resigns its epoch; promote_duty checks again */
+            vs->resigned = 1, vs->resign_from = from, vs->resign_epoch = m->epoch;
+            g_nresign++;
+        }
         return;
     }
     struct promo *p = promo_find(m->volume);
@@ -4787,6 +4850,9 @@ static void promo_start(const struct meta_volume *v, uint8_t reason, uint64_t no
     }
     struct promo *p = &g_promo[g_npromo++];
     memset(p, 0, sizeof *p);
+    struct vstate *vs = vs_find(v->number);
+    if (vs)
+        vs->promo = (uint32_t)g_npromo;
     p->vol = v->number;
     p->old = v->leader;
     p->epoch = v->epoch;
@@ -4892,12 +4958,12 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
         say("proposes volume %" PRIu32 " leader %" PRIu32 " at epoch %" PRIu64 " (%" PRIu32 " of %" PRIu32
             " fenced members answered, %" PRIu64 " ms)", p->vol, g.leader, g.new_epoch, g.nreplies, g.nfenced,
             (uint64_t)(since(now, p->t0) / MS));
-    for (unsigned i = 0; i < g_nforced; i++)
-        if (g_forced[i].vol == p->vol && g_forced[i].node == g.leader && g_forced[i].epoch == p->epoch)
-            say("volume %" PRIu32 ": forced leader %" PRIu32 " ends at %" PRIu64 ", the last shrink's commit point is "
-                "%" PRIu64 ": %s", p->vol, g.leader, best, v->isr_commit,
-                best >= v->isr_commit ? "it holds every write acknowledged before that shrink"
-                                      : "writes acknowledged before that shrink are lost");
+    const struct vstate *fs = vs_find(p->vol);
+    if (fs && fs->forced && fs->forced_node == g.leader && fs->forced_epoch == p->epoch)
+        say("volume %" PRIu32 ": forced leader %" PRIu32 " ends at %" PRIu64 ", the last shrink's commit point is "
+            "%" PRIu64 ": %s", p->vol, g.leader, best, v->isr_commit,
+            best >= v->isr_commit ? "it holds every write acknowledged before that shrink"
+                                  : "writes acknowledged before that shrink are lost");
     return 1;
 }
 
@@ -4927,18 +4993,14 @@ static int cut_move(const struct meta_volume *v, const struct cluster_isr_req *q
         return 0;
     if (promo_find(v->number))
         return 1;
-    for (unsigned i = 0; i < g_ncutfail; i++)
-        if (g_cutfail[i].vol == v->number && g_cutfail[i].epoch == v->epoch && g_cutfail[i].version == v->isr_version)
-            return 0;
-    static struct { uint32_t vol; uint64_t epoch, version, ns; } seen[16]; /* when a shrink was first held */
-    static unsigned nseen;
-    unsigned si = 0;
-    while (si < nseen && !(seen[si].vol == v->number && seen[si].epoch == v->epoch && seen[si].version == v->isr_version))
-        si++;
-    if (si == nseen) {
-        si = nseen < sizeof seen / sizeof seen[0] ? nseen++ : (unsigned)(now % (sizeof seen / sizeof seen[0]));
-        seen[si].vol = v->number, seen[si].epoch = v->epoch, seen[si].version = v->isr_version, seen[si].ns = now;
-    }
+    struct vstate *vs = vs_find(v->number);
+    if (!vs)
+        return 0;
+    if (vs->cut_failed && vs->fail_epoch == v->epoch && vs->fail_version == v->isr_version)
+        return 0;
+    if (!vs->cut_held || vs->cut_epoch != v->epoch || vs->cut_version != v->isr_version)
+        vs->cut_held = 1, vs->cut_epoch = v->epoch, vs->cut_version = v->isr_version, vs->cut_ns = now;
+    uint64_t held_ns = vs->cut_ns;
     static struct cluster_report own;
     int cut = 0, alive = 0;
     for (uint32_t i = 0; i < v->nisr && !cut; i++) {
@@ -4967,7 +5029,7 @@ static int cut_move(const struct meta_volume *v, const struct cluster_isr_req *q
             cut |= u[k].node == v->leader;
     }
     if (!cut) /* a member heard here but not (yet) saying it lost the leader: its report is at most a second late */
-        return alive && since(now, seen[si].ns) < CUT_HOLD_NS;
+        return alive && since(now, held_ns) < CUT_HOLD_NS;
     promo_start(v, META_GR_PLANNED, now);
     return promo_find(v->number) != NULL;
 }
@@ -4984,8 +5046,6 @@ static int cut_move(const struct meta_volume *v, const struct cluster_isr_req *q
 #define DEPOSED_HOLD_NS (3000 * MS)
 static int leader_deposed(const struct meta_volume *v, uint64_t now, struct cluster_report *own, int *have_own)
 {
-    static struct { uint32_t vol, leader; uint64_t epoch, ns; } seen[16];
-    static unsigned nseen;
     int role = -1;
     uint64_t pepoch = 0;
     if (v->leader == C.id) {
@@ -5004,21 +5064,18 @@ static int leader_deposed(const struct meta_volume *v, uint64_t now, struct clus
             if (h->vols[i].v.volume == v->number)
                 role = h->vols[i].v.role, pepoch = h->vols[i].v.epoch;
     }
-    unsigned si = 0;
-    while (si < nseen && seen[si].vol != v->number)
-        si++;
+    struct vstate *vs = vs_find(v->number);
+    if (!vs)
+        return 0;
     if (role == CL_ROLE_PROMOTING && pepoch != v->epoch)
         role = CL_ROLE_NONE; /* promoting to an older epoch: the record moved past it */
     if (role != CL_ROLE_NONE || cl_mutant() == CLM_DEPOSEDSTUCK) {
-        if (si < nseen)
-            seen[si] = seen[--nseen];
+        vs->dep_seen = 0;
         return 0;
     }
-    if (si == nseen)
-        si = nseen < sizeof seen / sizeof seen[0] ? nseen++ : (unsigned)(now % (sizeof seen / sizeof seen[0]));
-    else if (seen[si].leader == v->leader && seen[si].epoch == v->epoch)
-        return since(now, seen[si].ns) >= DEPOSED_HOLD_NS;
-    seen[si].vol = v->number, seen[si].leader = v->leader, seen[si].epoch = v->epoch, seen[si].ns = now;
+    if (vs->dep_seen && vs->dep_leader == v->leader && vs->dep_epoch == v->epoch)
+        return since(now, vs->dep_ns) >= DEPOSED_HOLD_NS;
+    vs->dep_seen = 1, vs->dep_leader = v->leader, vs->dep_epoch = v->epoch, vs->dep_ns = now;
     return 0;
 }
 
@@ -5030,6 +5087,8 @@ static void promote_duty(uint64_t now)
     g_nresign = 0;
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER) {
         g_npromo = 0;
+        for (uint32_t i = 0; nres && i < g_nvs; i++)
+            g_vs[i].resigned = 0;
         return;
     }
     size_t k = 0;
@@ -5041,14 +5100,18 @@ static void promote_duty(uint64_t now)
         if (!moved && p->reason == META_GR_PLANNED && !p->proposed_ns && !cand && since(now, p->t0) >= PROMO_MOVE_NS) {
             say("volume %" PRIu32 ": no replica to move the leadership of epoch %" PRIu64 " to; the ISR shrinks",
                 p->vol, p->epoch);
-            if (g_ncutfail == sizeof g_cutfail / sizeof g_cutfail[0])
-                g_ncutfail = 0;
-            g_cutfail[g_ncutfail++] = (__typeof__(g_cutfail[0])){p->vol, p->epoch, p->version};
+            struct vstate *vs = vs_find(p->vol);
+            if (vs)
+                vs->cut_failed = 1, vs->fail_epoch = p->epoch, vs->fail_version = p->version;
             continue;
         }
         if (!moved && (since(now, p->t0) < PROMO_GIVEUP_NS ||
-                       (cand && !p->proposed_ns && now < promote_safe_ns(p->old) + PROMO_GIVEUP_NS)))
+                       (cand && !p->proposed_ns && now < promote_safe_ns(p->old) + PROMO_GIVEUP_NS))) {
             g_promo[k++] = *p;
+            struct vstate *vs = vs_find(p->vol);
+            if (vs)
+                vs->promo = (uint32_t)k;
+        }
     }
     g_npromo = k;
     for (uint32_t i = 0; i < C.sm.nvolumes; i++) {
@@ -5063,9 +5126,12 @@ static void promote_duty(uint64_t now)
                 reason = META_GR_UNHEARD;
             else if (vol_reports_fault(v->leader, v))
                 reason = META_GR_FENCED;
-            for (unsigned r = 0; r < nres && !reason; r++)
-                if (g_resign[r].vol == v->number && g_resign[r].from == v->leader && g_resign[r].epoch == v->epoch)
+            struct vstate *vs = nres ? vs_find(v->number) : NULL;
+            if (vs && vs->resigned) {
+                if (!reason && vs->resign_from == v->leader && vs->resign_epoch == v->epoch)
                     reason = META_GR_RESIGNED;
+                vs->resigned = 0;
+            }
             if (!reason && m && m->state == META_UP && leader_deposed(v, now, &own, &have_own)) {
                 say("volume %" PRIu32 ": leader %" PRIu32 " of epoch %" PRIu64 " is up but has not led it for %llu ms "
                     "(deposed by a fence no promotion followed); taken as its resignation", v->number, v->leader,
