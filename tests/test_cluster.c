@@ -6812,8 +6812,11 @@ static void *wf_write_thread(void *a)
  * writes is unknown (each went to the replicas), so their connections close without an answer (D12); the volume is
  * quiesced (UNAVAILABLE), the group promotes a replica at e+1 and writes and reads on the old leader are MOVED to it; the
  * server reports the volume LOCAL_FAULT, answers in its root, keeps its vote and its other
- * volumes (a later volume add commits and opens there) and stops cleanly. TSDB_REPLD_MUTANT=nodepose and noquiesce
- * fail it. */
+ * volumes (a later volume add commits and opens there) and stops cleanly. writerfail runs on strict reads (D5, the
+ * production path), where routing refuses the failed volume's reads before its engine is asked, so the quiesce
+ * itself is observed by writerfailq: the same run under TSDB_REPLICA_READS=1, whose routing lets a read of the failed
+ * volume through to its engine (a replica's FENCED with a lease), so only the quiesce answers it UNAVAILABLE (then
+ * MOVED by frame_put). TSDB_REPLD_MUTANT=nodepose fails both, noquiesce writerfailq. */
 /* waits up to 30 s for server `via`'s copy of volume `name` to name a leader other than node `old` at an epoch above
  * e0 (a promotion, design-cluster.md 6.2); returns its server */
 static int await_promoted(int via, const char *name, uint32_t old, uint64_t e0, struct meta_volume *v)
@@ -6827,15 +6830,15 @@ static int await_promoted(int via, const char *name, uint32_t old, uint64_t e0, 
     }
 }
 
-static void scen_writerfail(void)
+static void writerfail_run(const char *name, int strict)
 {
-    scenario("writerfail");
+    scenario(name);
     const char *so, *skip = crashfs_skip(&so);
     if (skip) {
         printf("  skipped: %s\n", skip);
         return;
     }
-    strict_reads = 1; /* every read on the leader (D5), as in production */
+    strict_reads = strict; /* 1: every read on the leader (D5), as in production; 0: the engine's own refusal */
     static char pe[3][PATH_MAX * 3 + 256];
     static char mark[3][PATH_MAX + 80];
     for (int i = 0; i < 3; i++) {
@@ -6917,7 +6920,8 @@ static void scen_writerfail(void)
     ts = 7000;
     insert_expect_moved(c2, id, ts, val, 1, v.leader, v.epoch, "a write to the failed volume");
     tsdb_points p;
-    rc = tsdbc_query_points(c2, id, INT64_MIN, INT64_MAX, &p); /* D5: reads go to the leader as well */
+    rc = tsdbc_query_points(c2, id, INT64_MIN, INT64_MAX, &p); /* D5: reads go to the leader as well; writerfailq: the
+                                                                  * quiesced engine's UNAVAILABLE, MOVED by frame_put */
     expect_moved_ep(c2, rc, 1, v.leader, v.epoch, "a read of the failed volume");
     tsdb_sid any;
     if ((rc = tsdbc_series(c2, "writerfail.none", 0, &any)) != TSDB_ERR_NOTFOUND)
@@ -6967,6 +6971,9 @@ static void scen_writerfail(void)
            "written after the failure\n",
            v.epoch);
 }
+
+static void scen_writerfail(void) { writerfail_run("writerfail", 1); }
+static void scen_writerfailq(void) { writerfail_run("writerfailq", 0); }
 
 /* writerdepose (M5, D13 with a healthy engine): the leader's driver fails the volume while its engine is fine
  * (crashfs: EIO on the leader's next fdatasync of its REPL file, the save of the commit floor at most once a second
@@ -9673,7 +9680,7 @@ int main(int argc, char **argv)
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
                {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
-               {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
     int n = (int)(sizeof all / sizeof all[0]);
