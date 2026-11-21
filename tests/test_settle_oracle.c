@@ -31,7 +31,12 @@
  * every delete, replace or retention change), nomark (the settle step settles nothing: a run that never reaches a
  * settled state fails), and flipvalues, flipagg, flipgroup, flipbounds, flipspread, fliptwa, fliplttb, fliplatest,
  * flipmulti, flipstats (one bit of B's answer of that kind is wrong: the comparison of that kind must see it), noretry
- * (the cache never decodes around a chunk damaged on store 0) and rankdown (the settle's ecrankdown).
+ * (the cache never decodes around a chunk damaged on store 0) and rankdown (the settle's ecrankdown). A compare after
+ * a real settle or damage also reads every series whole, so these two are met far more often than by the random
+ * windows alone, but not on every run: a damaged chunk may be parity, belong to a part already retired and not yet
+ * collected, or hold bytes no granule read touches (the part's own index). tests/oracle_mutants.sh therefore tries a
+ * few seed windows and counts a mutant as caught only by its own line (DIVERGED), never by any failure;
+ * test_seam's seamnoretry and test_settle's ecrankdown catch the two bugs deterministically.
  */
 #define _GNU_SOURCE
 #include "internal.h"
@@ -240,6 +245,7 @@ typedef struct world {
     bool settled_any;
     bool real; /* B holds .ec parts that eng_settle made: they stay settled across a reopen */
     bool down; /* store 0 is DOWN (moved away) since B's last open */
+    bool whole; /* the next compare also reads every series whole: a real settle or damage came before it */
     /* what the run reached */
     size_t marked, settle_steps, compares, nonempty, failed;
     size_t real_settled, real_steps, unavailable, damaged, downs, retries;
@@ -547,7 +553,7 @@ static void settle_step(world *w)
         w->real_steps++;
         w->real_settled += n;
         if (n)
-            w->real = true;
+            w->real = true, w->whole = true;
     } else
         n = tsdb_test_mark_ec(w->db[1], EC_MARK_EC, pick_partition, &pc);
     w->marked += n;
@@ -587,6 +593,7 @@ static void damage_store0(world *w)
     damage_r.s = rnd(&w->r);
     nftw(w->st[0], damage_cb, 16, FTW_PHYS);
     tsdb_test_ec_retries(w->db[1], true); /* the next battery reads the chunks again */
+    w->whole = true;
 }
 
 /* ------------------------------------------------------------------ the battery */
@@ -812,6 +819,17 @@ static void battery(world *w, tsdb *db, uint64_t qseed, int mode, fp *f)
         if (!mode || getenv("ORACLE_MULTI_STATS_MT")) /* the reproducer: ORACLE_MULTI_STATS_MT=1 with --mutant nomark */
             fp_stats(f, all[0]);
     }
+    /* After a real settle or damage on store 0 the random windows may miss every damaged granule or every key a new
+     * .ec part overwrote, so the mutants noretry and rankdown were caught only on some runs (under TSan one survived:
+     * which chunk files exist when store 0 is damaged depends on the collector's timing). Every series read whole
+     * reads every granule of every listed part, so each overwritten key and each damaged data cell of a listed part
+     * that holds granule bytes is met (not parity, nor a retired part's object). No draw from q: the windows above stay
+     * the same. */
+    for (size_t i = 0; w->whole && i < NS; i++) {
+        fp_begin(f, "whole s%zu", i);
+        int rc = tsdb_query_values(db, w->id[i], TSDB_TS_MIN, TSDB_TS_MAX, NULL, rows_cb, f);
+        fp_rc(f, rc);
+    }
 }
 
 /* B's answers wrong in one bit, for the mutants that test the comparison of each kind */
@@ -911,6 +929,7 @@ static void compare(world *w, const char *why)
         fp_free(&fa);
         fp_free(&fb);
     }
+    w->whole = false;
 }
 
 /* ------------------------------------------------------------------ the walk */
@@ -1080,6 +1099,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "test_settle_oracle: no battery ever read a granule of a settled part\n");
         return 1;
     }
+    /* No "damaged, so some granule was read again" check: it does not hold (int-h REVIEW F1: 4 of 80 unmutated windows
+     * damaged chunks that no read meets, see the top of the file), and a false failure here would also count as a
+     * mutant caught. */
     for (size_t k = 0; k < NKIND && kstat[k].name[0]; k++)
         if (kstat[k].calls >= 50 && kstat[k].errs * 2 > kstat[k].calls) {
             fprintf(stderr, "test_settle_oracle: %zu of %zu %s calls answered an error: the battery drifted\n",

@@ -403,7 +403,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_ecnames $(or $(TMPDIR),/tmp)
 	for m in nameloose tierloose; do ! ./$(B)/test_ecnames --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in $(ORACLE_MUTANTS); do ! ./$(B)/test_settle_oracle --mutant $$m --seeds 2 $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (EC builds: without TSDB_EC the oracle skips)
+	$(if $(EC_OBJ),tests/oracle_mutants.sh ./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp) $(ORACLE_MUTANTS)) # each planted bug must fail it by its own line (EC builds: without TSDB_EC the oracle skips)
 	./$(B)/test_ecswap $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),for m in swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled; do ! ./$(B)/test_ecswap --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	./$(B)/test_ecgc $(or $(TMPDIR),/tmp)
