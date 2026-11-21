@@ -3405,6 +3405,18 @@ static void case_promote(int variant)
         int had = stat(cp, &cs0) == 0;
         CHECK(n->cls_on);
         CHECK_EQ(eng_class_switch(n, 0, 2, NULL), TSDB_ERR_UNAVAILABLE);
+        /* the other way to a record (review R20): the first class of a series made after the open (the open takes
+         * every series it finds as decided), from a large insert's rows an hour apart (a long class), reaches
+         * cls_markers without switch_locked's deferral, so its own guard refuses it (mutant freshunattached) */
+        {
+            int64_t fts[100];
+            float fv[100];
+            uint32_t fid = 0;
+            for (int i = 0; i < 100; i++)
+                fts[i] = far + DAY_MS + 3600000LL * i, fv[i] = (float)i;
+            CHECK_EQ(eng_series(n, "fresh-unattached", TSDB_FLOAT32, &fid), 0);
+            CHECK_EQ(eng_insert_series(n, TSDB_FLOAT32, fid, fts, fv, 100), TSDB_ERR_UNAVAILABLE);
+        }
         CHECK_EQ(n->cls_off, off);
         CHECK_EQ(stat(cp, &cs1) == 0, had);
         if (had && stat(cp, &cs1) == 0)
@@ -6290,6 +6302,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "switchunattached") == 0 ? MUT_LEADER_SWITCH_UNATTACHED
                         : strcmp(m, "replicadropsfloor") == 0 ? MUT_REPLICA_KEEP_FLOOR
                         : strcmp(m, "replicadropsfiles") == 0 ? MUT_REPLICA_DROP_APPLIED_FILES
+                        : strcmp(m, "freshunattached") == 0 ? MUT_LEADER_FRESH_UNATTACHED
                         : strcmp(m, "droppedglobal") == 0 ? MUT_DROPPED_GLOBAL
                         : strcmp(m, "wtailnocap") == 0 ? MUT_WTAIL_NOCAP
                         : strcmp(m, "nocutoff") == 0 ? MUT_LEADER_NO_CUTOFF

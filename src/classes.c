@@ -442,8 +442,11 @@ typedef struct cls_rec {
 /* A leader's CLASS markers for records r[0..n) that go to CLASSES at `off` (jr_markers: 0 at once elsewhere). */
 static int cls_markers(eng *db, const cls_rec *r, size_t n, uint64_t off)
 {
-    if (db->leader_open && !db->rp && !eng_jr(db) && n != 0)
-        return TSDB_ERR_UNAVAILABLE; /* a promoted writer before its attach: a record with no marker would diverge */
+    /* a promoted writer before its attach: a record with no marker would diverge. switch_locked defers before this;
+     * the first class of a series made after the open (a large insert of it, a flush; the open takes every series it
+     * finds as decided) is refused only here (planted: MUT_LEADER_FRESH_UNATTACHED) */
+    if (db->leader_open && !db->rp && !eng_jr(db) && n != 0 && eng_test_mutant != MUT_LEADER_FRESH_UNATTACHED)
+        return TSDB_ERR_UNAVAILABLE;
     if (!eng_jr(db) || db->rp || n == 0)
         return 0;
     mk *m = calloc(n, sizeof *m);
