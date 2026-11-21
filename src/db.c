@@ -1643,32 +1643,44 @@ int drop_retire(eng *db, int64_t ts)
     lt_sec lsec;
     lt_begin(db, &lsec);
     pthread_mutex_lock(&db->lock);
-    bool retired = false;
-    for (size_t i = 0; i < db->nparts;) {
-        part *p = db->parts[i];
+    /* The parts are taken in list order (part_cmp: block order within a partition) and retired as one step through a
+     * drop intent (drop_retire_parts_locked): a crash between two renames is finished at the open, never left with
+     * a partition half retired. The intent is written inside this section, so the set it names is exactly what the
+     * drop floor below covers (latest_rw and db->lock are held across its fdatasync and directory fsync).
+     * R7: an .ec part goes the same way (db_retire_locked renames it retired_<name>.ec, its object goes with it,
+     * r7-gc), and so does a settling one: a single server's swap sees `dropped` under db->lock and lists nothing
+     * (drop_settle_locked) */
+    size_t n = 0, done = 0;
+    for (size_t i = 0; i < db->nparts; i++) {
         int64_t lo, end;
-        partition_range(db, p->partition, &lo, &end);
-        if (eng_check(db)) /* a rename below failed: retire nothing more */
-            break;
-        if (end <= ts) {
-            /* an in-flight merge of it discards its result. R7: an .ec part goes the same way (db_retire_locked
-             * renames it retired_<name>.ec, its object goes with it, r7-gc), and so does a settling one: a
-             * single server's swap sees `dropped` under db->lock and lists nothing (drop_settle_locked) */
-            p->dropped = true;
-            db_retire_locked(db, p);
-            retired = true;
-        } else {
-            i++;
-        }
+        partition_range(db, db->parts[i]->partition, &lo, &end);
+        n += end <= ts;
     }
-    db->drop_pending = false; /* also after a failed engine: the retire loop above is the only exit */
+    part **ps = n ? malloc(n * sizeof *ps) : NULL;
+    char intent[64] = "";
+    if (n && !ps) {
+        rc = TSDB_ERR_NOMEM;
+    } else {
+        for (size_t i = 0, j = 0; i < db->nparts; i++) {
+            int64_t lo, end;
+            partition_range(db, db->parts[i]->partition, &lo, &end);
+            if (end <= ts)
+                ps[j++] = db->parts[i];
+        }
+        rc = drop_retire_parts_locked(db, ps, n, intent, &done);
+    }
+    free(ps);
+    db->drop_pending = false; /* also after a failed engine or intent: this is the only exit */
     jr_commit(db, JR_DROP, &ts);
     pthread_mutex_unlock(&db->lock);
-    if (retired)
+    if (done)
         lt_drop_floor(db, ts);
     lt_end(db, &lsec);
+    if (rc)
+        return rc; /* nothing retired */
     if ((rc = eng_sync_dir(db, "fsync of the directory after retiring dropped parts")) != 0)
-        return rc; /* failed since the flush, here or elsewhere */
+        return rc; /* failed since the flush, here or elsewhere: the intent stays, the open finishes the drop */
+    drop_intent_done(db, intent);
     return manifest_publish(db);
 }
 

@@ -1153,6 +1153,166 @@ static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[1
     return *n == count && !next;
 }
 
+/* ------------------------------------------------------ atomic drops */
+/*
+ * A drop (tsdb_drop_before, the TTL drop of the merge thread, a replica's apply of a DROP marker) retires several
+ * parts by renaming each to retired_<name>. Renames are atomic one by one only, so with more than one part a drop
+ * intent comes first: "tsdb-drop 1 <n>", the n part names in block order, "end <xxh64>", under the same txn_ names as
+ * an insert's intent (intent_file_name). It is written, fdatasync'ed and its directory synced before the first
+ * rename; the renames follow, then the caller's directory fsync, and only then is the intent unlinked (an unlink kept
+ * with a rename lost would leave the drop half done and nothing to finish it). intents_recover rolls a complete one
+ * forward at the open: every listed name still there is renamed retired_<name> (an .ec part retired_<name>.ec, as
+ * db_retire_locked does, so r7-gc's load at the listing owns it), a name already retired_ is done, a name with neither
+ * was retired and its file deleted (its last reference went, or the graveyard) before the intent's unlink: blocks are
+ * never reused, so no other part can carry that name. A torn one was never synced whole, so no rename followed it:
+ * the drop never started and nothing is retired. Not covered, as for an insert's intent: an intent damaged on disk
+ * after it was synced reads as torn; renames it already led to stay (they were synced before a crash only by luck).
+ * The renames still run in block order (oldest first): with fsync off the intent is not synced, and a prefix of the
+ * renames keeps every remaining key at its newest value. A failed write or sync of the intent retires nothing and
+ * fails the call; it is fail-stop only where a DROP marker is already in the log (a leader, eng_jr; a replica,
+ * db->rp), because the replicas carry out that marker whatever the leader does. Cost: one fdatasync and one directory
+ * fsync more per drop of two parts or more. Design-cdc F17 (the feed's drop as a direct commit, fcommit_) would add
+ * its record here, beside the intent, before the renames.
+ */
+#define DROP_INTENT_HEAD "tsdb-drop 1 "
+
+int drop_test_mutant;
+void (*drop_test_hook)(eng *db, const char *name, size_t at);
+
+static int drop_intent_write(eng *db, part **ps, size_t n, char intent[64])
+{
+    size_t cap = 32 + n * (sizeof ps[0]->name + 1), len = 0;
+    char *buf = malloc(cap);
+    if (!buf)
+        return TSDB_ERR_NOMEM;
+    len += (size_t)snprintf(buf + len, cap - len, DROP_INTENT_HEAD "%zu\n", n);
+    for (size_t i = 0; i < n; i++)
+        len += (size_t)snprintf(buf + len, cap - len, "%s\n", ps[i]->name);
+    len += (size_t)snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
+    snprintf(intent, 64, INTENT_PREFIX "%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
+    const bool sync = db->opt.fsync && drop_test_mutant != DROP_MUT_NO_SYNC;
+    int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int rc = fd < 0 || write_all(fd, buf, len) != 0 || (sync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+    int err = errno;
+    if (fd >= 0)
+        close(fd);
+    free(buf);
+    if (rc) { /* nothing retired: the intent's name was not synced, and is gone now */
+        unlinkat(db->dirfd, intent, 0);
+        intent[0] = '\0';
+        if (eng_jr(db) || db->rp)
+            eng_fail(db, "write of a drop's intent", err);
+        else
+            fprintf(stderr, "tsdb: %s: write of a drop's intent: %s: nothing is dropped\n", db->dir, strerror(err));
+        return rc;
+    }
+    if (drop_test_mutant != DROP_MUT_NO_SYNC &&
+        eng_sync_dir(db, "fsync of the directory after writing a drop's intent") != 0)
+        return TSDB_ERR_IO; /* failed (fail-stop): the intent's name may be durable, the next open decides */
+    return 0;
+}
+
+int drop_retire_parts_locked(eng *db, part **ps, size_t n, char intent[64], size_t *done)
+{
+    intent[0] = '\0';
+    *done = 0;
+    if (n == 0)
+        return 0;
+    if (eng_check(db))
+        return TSDB_ERR_IO;
+    int rc;
+    if (n > 1 && drop_test_mutant != DROP_MUT_NO_INTENT && (rc = drop_intent_write(db, ps, n, intent)) != 0)
+        return rc;
+    for (size_t i = 0; i < n && !eng_check(db); i++) { /* a rename failed: the engine failed, the open finishes it */
+        char name[sizeof ps[i]->name];
+        snprintf(name, sizeof name, "%s", ps[i]->name); /* the list's reference goes in db_retire_locked */
+        ps[i]->dropped = true;                           /* an in-flight merge of it discards its result */
+        if (drop_test_mutant == DROP_MUT_UNLINK_FIRST && intent[0] && i + 1 == n) {
+            unlinkat(db->dirfd, intent, 0); /* planted: the unlink before the directory fsync (and the last rename) */
+            intent[0] = '\0';
+        }
+        db_retire_locked(db, ps[i]);
+        ++*done;
+        if (drop_test_hook)
+            drop_test_hook(db, name, i);
+    }
+    return 0;
+}
+
+void drop_intent_done(eng *db, const char *intent)
+{
+    if (intent[0])
+        unlinkat(db->dirfd, intent, 0); /* one left behind is rolled forward again at the open: it finds nothing */
+}
+
+/* At open: a drop intent's roll-forward. Returns 1 when rolled forward (the caller syncs the directory before the
+ * unlink), 0 when torn, or an error, which fails the open. */
+static int drop_intent_recover(eng *db, const char *file, char *buf, size_t len)
+{
+    char extra;
+    size_t n = 0, now = 0, already = 0, gone = 0;
+    char *line = buf, *next = NULL;
+    bool ok = intent_unseal(buf, len) && (next = strchr(line, '\n')) != NULL;
+    if (ok) {
+        *next = '\0';
+        ok = sscanf(line, DROP_INTENT_HEAD "%zu%c", &n, &extra) == 1 && n >= 1 && n <= 1u << 20;
+        line = next + 1;
+    }
+    /* first the whole list is checked: a damaged name renames nothing */
+    for (size_t i = 0; ok && i < n; i++, line = next + 1) {
+        next = strchr(line, '\n');
+        size_t l = next ? (size_t)(next - line) : strlen(line);
+        ok = l > 0 && l < 128 && (next != NULL) == (i + 1 < n);
+        if (ok) {
+            char name[128];
+            memcpy(name, line, l);
+            name[l] = '\0';
+            ok = part_file_name(name) || ec_file_name(name); /* a part's name, nothing else: no path, no MANIFEST */
+        }
+        if (!next)
+            break;
+    }
+    if (!ok) {
+        fprintf(stderr, "tsdb: %s: drop intent %s is torn: the drop never started, nothing is retired\n", db->dir,
+                file);
+        return 0;
+    }
+    line = strchr(buf, '\0') + 1;
+    for (size_t i = 0; i < n; i++) {
+        next = strchr(line, '\n');
+        if (next)
+            *next = '\0';
+        char retired[128 + 8];
+        snprintf(retired, sizeof retired, "retired_%s", line);
+        if (drop_test_mutant == DROP_MUT_SKIP_EC && ec_file_name(line)) {
+            ; /* planted: the .ec part is left listed */
+        } else if (faccessat(db->dirfd, line, F_OK, 0) == 0) {
+            if (renameat(db->dirfd, line, db->dirfd, retired) != 0) {
+                fprintf(stderr, "tsdb: %s: rolling drop intent %s forward: rename of %s: %s\n", db->dir, file, line,
+                        strerror(errno));
+                return TSDB_ERR_IO;
+            }
+            now++;
+        } else if (errno != ENOENT) {
+            fprintf(stderr, "tsdb: %s: rolling drop intent %s forward: %s: %s\n", db->dir, file, line, strerror(errno));
+            return TSDB_ERR_IO;
+        } else if (faccessat(db->dirfd, retired, F_OK, 0) == 0) {
+            already++;
+        } else if (errno != ENOENT) {
+            fprintf(stderr, "tsdb: %s: rolling drop intent %s forward: %s: %s\n", db->dir, file, retired,
+                    strerror(errno));
+            return TSDB_ERR_IO;
+        } else {
+            gone++; /* retired and deleted before the crash (see above) */
+        }
+        if (next)
+            line = next + 1;
+    }
+    fprintf(stderr, "tsdb: %s: drop intent %s rolled forward: %zu parts retired now, %zu were already, %zu deleted\n",
+            db->dir, file, now, already, gone);
+    return 1;
+}
+
 int intents_test_mutant;
 
 /* At open: finish committed inserts that a crash interrupted, roll back the others. */
@@ -1193,6 +1353,11 @@ int intents_recover(eng *db)
              * which syncs the directory itself before it returns, so the intent's unlink below cannot pass its
              * renames */
             rc = ecswap_recover(db, e->d_name, buf, (size_t)st.st_size);
+        } else if ((size_t)st.st_size >= sizeof DROP_INTENT_HEAD - 1 &&
+                   memcmp(buf, DROP_INTENT_HEAD, sizeof DROP_INTENT_HEAD - 1) == 0) {
+            int r = drop_intent_recover(db, e->d_name, buf, (size_t)st.st_size);
+            rc = r < 0 ? r : 0;
+            forward = r > 0;
         } else if (!intent_parse(buf, (size_t)st.st_size, &tmp, &fin, &n)) {
             fprintf(stderr, "tsdb: insert intent %s is torn: the insert is rolled back\n", e->d_name);
         } else {

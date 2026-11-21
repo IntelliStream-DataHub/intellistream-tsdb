@@ -341,6 +341,15 @@ cgroup, so `nice` does not keep your work out of its way.
   by this open or not (final names seen at open may be in the page cache only), and before it unlinks the intent:
   unsynced directory operations reach the disk in any order, and an unlink kept with a rename lost leaves the insert
   half there (`tests/test_intents.c`, crashfs with `CRASHFS_TEAR`; mutant `unlinkfirst`).
+  **Drops are atomic too** (`drop_retire_parts_locked`, part.c "atomic drops"): `tsdb_drop_before`, the TTL drop of the
+  merge thread (one intent per pass) and a replica's DROP write a drop intent (`tsdb-drop 1 <n>`, the part names, under
+  a `txn_` name) and sync it and the directory before the first `retired_` rename, unlink it only after the directory
+  fsync that follows the renames, and `intents_recover` rolls a whole one forward (an `.ec` name to `retired_<name>.ec`,
+  before the listing and ecgc's sweep); a torn one retired nothing. The renames still go in block order, oldest first
+  (the TTL drop went newest first): a prefix keeps every key at its newest value. `latest_rw` and `db->lock` are held
+  across the intent's fdatasync and directory fsync. A failed intent write fails just the call, except on a leader or a
+  replica (the DROP marker is in the log): fail-stop. `tests/test_drops.c` (kill, crashfs, mutants `nointent nosync
+  unlinkfirst ttlreverse skipec`).
 - **Durability.** A new file is durable after fsync of the file and of its
   directory; a rename after fsync of the directory. In sync mode
   (`wal_sync_ms = 0`) a memtable row is visible to queries only once the WAL is
@@ -587,8 +596,8 @@ cgroup, so `nice` does not keep your work out of its way.
   already expired) must bump `lgen` in a write section and make the entries it may affect unknown. The table must
   always give the slow path's answer (`tests/test_latest.c` compares both after every random step). Entry words are
   loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
-  `latest_rw` is held across no I/O but `tsdb_drop_before`'s renames of the partitions it retires (`db_retire_locked`,
-  in its write section; `db->lock` was held across them already) and the settle swap's 2n renames (`ec_swap_commit`,
+  `latest_rw` is held across no I/O but `tsdb_drop_before`'s drop intent and renames of the partitions it retires
+  (`drop_retire_parts_locked`, in its write section; `db->lock` is held across them too) and the settle swap's 2n renames (`ec_swap_commit`,
   `src/ecswap.c`: its input check and renames are one step against a drop, which takes no `publish_lock`; on NFS,
   snapshots and lookups of the volume wait for those round trips), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
