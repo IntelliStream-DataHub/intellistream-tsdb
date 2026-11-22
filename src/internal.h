@@ -1062,6 +1062,27 @@ int intents_recover(struct eng *db);
 /* tests/test_intents.c: UNLINK_FIRST unlinks a rolled-forward intent before its renames are synced (the old order) */
 enum { INTENTS_MUT_NONE = 0, INTENTS_MUT_UNLINK_FIRST };
 extern int intents_test_mutant;
+/* A drop's parts (listed, in block order) retired as one step through a drop intent (part.c, "atomic drops"); caller
+ * holds db->lock (and the latest table's write section where it folds the drop). 0 with *done renamed (a rename that
+ * failed the engine stops there; the open finishes them) and `intent` the file to unlink with drop_intent_done after
+ * the caller's directory fsync ("" when none was written: one part, or a failed engine); an error with nothing
+ * retired. `fail_stop`: a failed write of the intent fails the engine (drop_marker_logged: a DROP marker the replicas
+ * carry out is already in the log); else it fails just the call. */
+int drop_retire_parts_locked(struct eng *db, struct part **ps, size_t n, char intent[64], size_t *done,
+                             bool fail_stop);
+void drop_intent_done(struct eng *db, const char *intent);
+bool drop_marker_logged(struct eng *db);
+enum { DROP_MUT_NONE = 0, DROP_MUT_NO_INTENT, DROP_MUT_NO_SYNC, DROP_MUT_UNLINK_FIRST, DROP_MUT_TTL_REVERSE,
+       DROP_MUT_SKIP_EC, DROP_MUT_DROP_FIRST, DROP_MUT_NO_SETTLED, DROP_MUT_NO_VALIDATE, DROP_MUT_EIO_AS_GONE,
+       DROP_MUT_TTL_FAIL_STOP, DROP_MUT_TTL_UNLINK_FIRST, DROP_MUT_TWO };
+extern int drop_test_mutant;
+/* tests/test_drops.c: the intent's write fails with this errno; the engine acts as one with a DROP marker logged; the
+ * open's existence check of this name fails with EIO */
+extern _Atomic int drop_test_intent_errno; /* atomics: the merge thread reads both while the test sets them */
+extern _Atomic bool drop_test_marker;
+extern const char *drop_test_eio_name;
+extern _Atomic int drop_test_intent_fails; /* how often drop_test_intent_errno failed a write */
+extern void (*drop_test_hook)(struct eng *db, const char *name, size_t at); /* after each rename of a drop */
 /* Exactly the names the engine gives part writers' tmp files and parts: what a cleanup at open may touch. */
 bool part_tmp_name(const char *name);
 bool part_file_name(const char *name);
@@ -2625,6 +2646,6 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
                       const void *v, size_t n);
 /* merge.c: drops partitions every series of which has expired (sets *dropped) and selects a part to rewrite
  * without its expired rows (returns 1, sel[0] marked merging and referenced); caller holds db->lock */
-size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal);
+size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal, char drop_intent[64]);
 
 #endif

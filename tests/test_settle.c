@@ -23,7 +23,8 @@
  *             stores, the key settles again, the rows equal the oracle's, a reopen's sweep finds nothing
  *   gcpower   a power cut in a refused swap's cleanup: with a drop's renames unsynced (stopped), after a failed
  *             intent write whose name another sync made durable (intentio), after a failed discard sync (syncfail):
- *             an intent that rolls forward finds whole objects, nothing is left behind
+ *             an intent that rolls forward finds whole objects, nothing is left behind; a drop of two parts (its
+ *             intent durable) is finished at the open and its retired .ec parts collected, one of one part is not
  *
  * Mutants (--mutant NAME, src/settle.h; each must fail it): ecrankdown (basic), settlenocheck (corrupt), settletwopass
  * (flip), settlebusy (policy), coarsewhole (coarse); gcskipput gcskipindex gcskipopen gcskipelse gcskipswap
@@ -1702,8 +1703,20 @@ static void gcpaths_case(void)
 
 /* The power-cut window of a refused swap (gcearly): a drop renames key 0's sources while the swap waits (its
  * directory sync held back by the hook), the swap is refused, and the power fails in swap_discard before its sync,
- * after the gc worked its queue. The open then finds the intent, every temporary and every source again and rolls the
- * swap forward: the .ec parts' chunks must still be there. */
+ * after the gc worked its queue. The drop's intent was synced before its first rename (drops are atomic), so the open
+ * rolls the swap forward (the intent finds every temporary and source again: the .ec parts' chunks must still be
+ * there) and then the drop, which retires the .ec parts in the sources' place: key 0 is gone, whole. */
+static _Atomic int gcp_phase; /* 1: the drop is at its first rename (its intent synced), 2: the swap holds the lock */
+static void gcp_drop_rename_hook(eng *db, const char *name, size_t at)
+{
+    if (at != 0)
+        return;
+    atomic_store(&gcp_phase, 1);
+    for (int i = 0; i < 2000 && atomic_load(&gcp_phase) != 2; i++)
+        sleep_ms(5);
+    if (atomic_load(&gcp_phase) != 2)
+        _exit(5);
+}
 static void *gcp_drop(void *arg)
 {
     eng_drop_before(arg, DAY);
@@ -1711,11 +1724,18 @@ static void *gcp_drop(void *arg)
 }
 static void gcp_swap_hook(eng *db)
 {
-    pthread_mutex_lock(&db->dir_sync_lock); /* the drop's sync waits behind it: its renames stay unsynced */
+    drop_test_hook = gcp_drop_rename_hook;
     pthread_t t;
     if (pthread_create(&t, NULL, gcp_drop, db) != 0)
         _exit(5);
     pthread_detach(t); /* the child ends in exit(99) with no join; syncfail lets the drop finish first (TSan: a leak) */
+    /* the lock only once the drop's intent is synced (that sync takes it too): its renames then stay unsynced */
+    for (int i = 0; i < 2000 && atomic_load(&gcp_phase) != 1; i++)
+        sleep_ms(5);
+    if (atomic_load(&gcp_phase) != 1)
+        _exit(5);
+    pthread_mutex_lock(&db->dir_sync_lock); /* the drop's sync after its renames waits behind it */
+    atomic_store(&gcp_phase, 2);
     char dir[PATH_MAX];
     snprintf(dir, sizeof dir, "%s", db->dir);
     for (int i = 0; i < 1000 && count_names(dir, "retired_", "") == 0; i++)
@@ -1744,16 +1764,29 @@ static void gcp_fail_hook(eng *db)
 }
 /* the gcpower variants: stopped (a drop inside the swap: the cut before the discard's sync), intentio (a failed intent
  * write whose name another sync made durable: the cut after the handoff), syncfail (the stopped swap's discard sync
- * fails: the cut after the gc round) */
+ * fails: the cut after the gc round). stopped1 and syncfail1 merge key 0 to one part first: a drop of one part writes
+ * no intent, so its rename stays unsynced and the swap's intent can roll forward with the source back; with two parts
+ * the drop's intent is durable before its first rename and the open finishes the drop. */
 static int child_gcpower(const where *w)
 {
-    const char *v = getenv("TSDB_TEST_GCPOWER");
+    char v[32];
+    snprintf(v, sizeof v, "%s", getenv("TSDB_TEST_GCPOWER") ? getenv("TSDB_TEST_GCPOWER") : "");
     tier_env(w, QUIET_GRACE, 86400, 0);
     atomic_store(&ecgc_test_manual, true);
     eopts e = {.merge_threads = 0, .classes = 0};
     tdb d;
-    if (!v || t_open(w, &e, &d) != 0)
+    if (!v[0] || t_open(w, &e, &d) != 0)
         return 3;
+    size_t l = strlen(v), one[2];
+    if (v[l - 1] == '1') {
+        v[l - 1] = '\0';
+        const int64_t k0 = 0;
+        if (eng_optimize_keys(d.db, &k0, 1) != 0)
+            return 4;
+        key_count(d.db, 0, &one[0], &one[1]);
+        if (one[0] != 1 || one[1] != 0)
+            return 4;
+    }
     if (!strcmp(v, "stopped")) {
         ec_swap_hook = gcp_swap_hook;
         ecswap_discard_hook = gcp_discard_hook;
@@ -1781,12 +1814,12 @@ static void gcpower_case(void)
     }
     if (!BASE.root[0])
         make_base();
-    const char *variants[] = {"stopped", "intentio", "syncfail"};
+    const char *variants[] = {"stopped", "intentio", "syncfail", "stopped1", "syncfail1"};
     int seeds = quick ? 2 : 6, fwd = 0;
-    for (int vi = 0; vi < 3; vi++)
+    for (int vi = 0; vi < 5; vi++)
     for (int seed = 1; seed <= seeds; seed++) {
         const char *v = variants[vi];
-        bool drop = vi != 1;
+        bool drop = vi != 1, whole = vi == 0 || vi == 2; /* whole: the drop of both parts, through its intent */
         where w;
         copy_base("gcpower", &w);
         setenv("TSDB_TEST_SETTLE_CHILD", "gcpower", 1);
@@ -1809,18 +1842,29 @@ static void gcpower_case(void)
         if (rc == 0) {
             ecgc_tier_work(d.t); /* the sweep's orphans (a swap rolled back) */
             ecgc_tier_work(d.t);
-            /* a drop retires part by part: a cut before its sync may keep any of its renames (CRASHFS_TEAR) */
             acc a = digest(d.db, "s");
-            bool ok = same(a, BWANT) || (drop && (a.n == 0 || a.n == BWANT.n / 2));
+            /* whole: the drop's intent was durable before its first rename, so whatever of its renames the cut kept
+             * (CRASHFS_TEAR) the open finishes it, never half (the swap rolled forward or back first); one part: its
+             * rename survived the cut or did not */
+            bool ok = whole ? a.n == 0 : same(a, BWANT) || (drop && a.n == 0);
             if (!ok)
-                fprintf(stderr, "FAIL gcpower %s seed %d: %zu rows, not the base's %zu%s\n", v, seed, a.n, BWANT.n,
-                        drop ? ", half or none" : "");
+                fprintf(stderr, "FAIL gcpower %s seed %d: %zu rows, not %s\n", v, seed, a.n,
+                        whole ? "none (the drop finished)" : drop ? "the base's or none" : "the base's");
             CHECK(ok);
             size_t all, ec;
             key_count(d.db, 0, &all, &ec);
             fwd += all && ec == all;
-            if (seed == 1 && drop) /* nothing of the drop or the cleanup survived the cut: the intent rolled forward */
-                CHECK(all == 2 && ec == 2 && same(a, BWANT));
+            if (whole) { /* key 0 retired whole, the .ec parts of a swap rolled forward included */
+                CHECK(all == 0);
+                /* a rolled-forward swap's .ec parts, retired by the drop's roll-forward, are the gc's: once their
+                 * time is up (here: purged regardless) their chunks and then their names go */
+                graveyard_purge(d.db, true);
+                ecgc_tier_work(d.t);
+                graveyard_purge(d.db, true);
+                CHECK(count_names(w.db, "retired_", ".ec") == 0);
+            }
+            if (seed == 1 && !whole && drop) /* nothing of the drop or the cleanup survived: the intent rolled forward */
+                CHECK(all == 1 && ec == 1 && same(a, BWANT));
             if (seed == 1 && !drop) /* the discard's sync took the intent and the temporaries away for good */
                 CHECK(all == 2 && ec == 0);
             stores_exact(&w, d.db, v);
@@ -1831,7 +1875,7 @@ static void gcpower_case(void)
     }
     printf("  gcpower: a power cut in a refused swap's cleanup (a drop inside it, a failed intent write whose name "
            "another sync made durable, a failed discard sync) rolled %d of %d forward onto whole objects\n",
-           fwd, 3 * seeds);
+           fwd, 5 * seeds);
 }
 
 int main(int argc, char **argv)

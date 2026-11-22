@@ -608,9 +608,10 @@ static bool partition_expired_checked_locked(eng *db, size_t a, size_t b, uint32
  * expired rows is selected for a rewrite. An empty part (a merge's wal_seq anchor) holds its partition only while
  * a WAL segment up to its wal_seq may still be replayed: *sync_wal asks for a directory fsync that makes the
  * removal of such segments durable, after which it can go. Caller holds db->lock. */
-size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
+size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal, char drop_intent[64])
 {
     *dropped = *sync_wal = false;
+    drop_intent[0] = '\0';
     if (db->opt.read_only)
         return 0;
     bool ret = atomic_load_explicit(&db->has_retention, memory_order_relaxed);
@@ -623,7 +624,8 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
     uint32_t gen = atomic_load(&db->ret_gen);
     int64_t now = ret ? eng_now_ms(db) : 0;
     time_t wall = time(NULL);
-    size_t k = 0;
+    size_t k = 0, ndrop = 0;
+    part **drop = NULL; /* the parts of the expired partitions, in list order */
     for (size_t a = 0, b; a < db->nparts; a = b) {
         int64_t all = INT64_MIN;
         bool busy = partition_dropping(db, db->parts[a]->partition); /* a drop retires it: no rewrite, no second drop */
@@ -655,12 +657,13 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
              * for (busy counts merges only): the single-server swap checks its inputs under db->lock in the hold
              * that lists the .ec and its recovery rolls back over retired sources, so a source retired here never
              * comes back (r7-swap items 2-4; drop_settle_locked) */
-            for (size_t i = b; i-- > a;) {
-                db->parts[i]->dropped = true; /* an in-flight merge of it discards its result */
-                db_retire_locked(db, db->parts[i]);
+            /* retired after the loop, the whole partition or none of it (out of memory: next time) */
+            part **grown = realloc(drop, (ndrop + (b - a)) * sizeof *drop);
+            if (grown) {
+                drop = grown;
+                for (size_t i = a; i < b; i++)
+                    drop[ndrop++] = db->parts[i];
             }
-            *dropped = true;
-            b = a; /* the list shrank */
             continue;
         }
         for (size_t i = a; ret && i < b && !k; i++) {
@@ -676,6 +679,25 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
             sel[k++] = p;
         }
     }
+    if (ndrop) {
+        /* One drop intent for every partition of this pass, the renames in block order (oldest first) like
+         * drop_retire's: newest first, a crash with fsync off (no synced intent) would keep older parts with the
+         * newer retired, and their overwritten or deleted rows would come back once retention is lengthened */
+        if (drop_test_mutant == DROP_MUT_TTL_REVERSE)
+            for (size_t i = 0; i < ndrop / 2; i++) {
+                part *t = drop[i];
+                drop[i] = drop[ndrop - 1 - i];
+                drop[ndrop - 1 - i] = t;
+            }
+        size_t done = 0;
+        /* A failed intent fails just this pass, also on a replicated leader: no DROP marker precedes a retention
+         * drop, nothing was promised, and the next pass tries again (fail-stop would depose the leader for a full
+         * disk). A failed directory fsync after the intent or the renames is fail-stop, as everywhere. */
+        (void)drop_retire_parts_locked(db, drop, ndrop, drop_intent, &done,
+                                       drop_test_mutant == DROP_MUT_TTL_FAIL_STOP && drop_marker_logged(db));
+        *dropped = done > 0;
+        free(drop);
+    }
     if (k || *sync_wal)
         db->last_ttl_ms = 0; /* there may be more: look again once this one is done */
     return k;
@@ -690,15 +712,20 @@ void *merge_thread_main(void *arg)
     while (!atomic_load(&db->stop)) {
         size_t k = eng_check(db) ? 0 : select_merge_locked(db, sel, false); /* a failed engine writes nothing more */
         bool dropped = false, sync_wal = false;
+        char drop_intent[64] = "";
         if (!k && !eng_check(db))
-            k = ttl_select_locked(db, sel, &dropped, &sync_wal);
+            k = ttl_select_locked(db, sel, &dropped, &sync_wal, drop_intent);
         if (!k && !dropped && !sync_wal && !eng_check(db))
             k = select_merge_locked(db, sel, true);
         if (dropped || sync_wal) {
             pthread_mutex_unlock(&db->lock);
+            if (drop_test_mutant == DROP_MUT_TTL_UNLINK_FIRST && dropped)
+                drop_intent_done(db, drop_intent); /* planted: the intent goes before its renames are synced */
             int src = eng_sync_dir(db, "fsync of the directory after retiring expired partitions");
-            if (src == 0 && dropped)
+            if (src == 0 && dropped) {
+                drop_intent_done(db, drop_intent); /* after the fsync: the open finishes a drop whose fsync failed */
                 manifest_publish(db);
+            }
             pthread_mutex_lock(&db->lock); /* eng_sync_dir moved wal_removed_synced on */
             dropped |= sync_wal && src == 0; /* look again at once */
         }

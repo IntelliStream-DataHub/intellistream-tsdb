@@ -283,6 +283,8 @@ $(B)/test_fno: tests/test_fno.c src/internal.h $(LIB)
 # the mutant unlinks the intent before its renames are synced and must fail
 $(B)/test_intents: tests/test_intents.c src/internal.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+$(B)/test_drops: tests/test_drops.c src/internal.h $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # the REPL file of a replica directory (src/replfile.c, design-cluster.md 4.3): two checksummed slots, power loss at
 # every step of create and save (crashfs); the mutant runs plant the bugs it guards against and must fail
@@ -322,7 +324,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_drops $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -344,6 +346,14 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	for m in reuse manifest markers nosync flushclose walclock; do ! ./$(B)/test_fno --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_intents $(or $(TMPDIR),/tmp)
 	./$(B)/test_intents --mutant unlinkfirst $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'ROWS WRONG' # the old order must lose rows
+	./$(B)/test_drops $(or $(TMPDIR),/tmp)
+	for m in nointent nosync unlinkfirst; do ./$(B)/test_drops --mutant $$m $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'HALF DROP' || { echo "test_drops: mutant $$m survived"; exit 1; }; done
+	./$(B)/test_drops --mutant ttlreverse $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'TTL ORDER WRONG' || { echo "test_drops: mutant ttlreverse survived"; exit 1; }
+	./$(B)/test_drops --mutant skipec $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'EC LEFT' || { echo "test_drops: mutant skipec survived"; exit 1; }
+	for m in dropfirst nosettled two ttlunlinkfirst; do ./$(B)/test_drops --mutant $$m $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'HALF DROP' || { echo "test_drops: mutant $$m survived"; exit 1; }; done
+	./$(B)/test_drops --mutant novalidate $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'NAMES ACCEPTED' || { echo "test_drops: mutant novalidate survived"; exit 1; }
+	./$(B)/test_drops --mutant eioasgone $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'EIO AS GONE' || { echo "test_drops: mutant eioasgone survived"; exit 1; }
+	./$(B)/test_drops --mutant ttlfailstop $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'TTL FAIL-STOP' || { echo "test_drops: mutant ttlfailstop survived"; exit 1; }
 	./$(B)/test_replfile $(or $(TMPDIR),/tmp)
 	for m in nosync sameslot nochecksum; do ! ./$(B)/test_replfile --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_crashfs $(or $(TMPDIR),/tmp)

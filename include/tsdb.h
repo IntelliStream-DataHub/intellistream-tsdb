@@ -811,7 +811,9 @@ int tsdb_query_totals_get(tsdb *db, tsdb_query_totals *out);
 int tsdb_optimize(tsdb *db);                /* merge every partition down to one part */
 /* Drops whole partitions that end at or before ts. A slow series' partitions are 7, 28 or 364 base partitions
  * long (tsdb_options.partition_classes): its rows go in those steps. Use retention or tsdb_delete_range to cut
- * at an exact time. */
+ * at an exact time. Atomic: a drop interrupted by a crash or power loss is whole or not at all after the next
+ * open (a drop intent, rolled forward by the open); a call that failed may have dropped everything or nothing.
+ * A drop of two parts or more writes that small file first: on a full disk it fails and drops nothing. */
 int tsdb_drop_before(tsdb *db, int64_t ts);
 
 typedef struct tsdb_stats {
