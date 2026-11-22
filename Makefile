@@ -422,7 +422,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),tests/oracle_mutants.sh ./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp) $(ORACLE_MUTANTS)) # each planted bug must fail it by its own line (EC builds: without TSDB_EC the oracle skips)
 	./$(B)/test_ecswap $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),$(MUT) --name test_ecswap --list "swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled" -- ./$(B)/test_ecswap --quick --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecswap --list "swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled swaploggedgc" -- ./$(B)/test_ecswap --quick --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecgc $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_ecgc --list "gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer" -- ./$(B)/test_ecgc --quick --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_settle $(or $(TMPDIR),/tmp)

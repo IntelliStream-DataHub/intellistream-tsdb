@@ -15,9 +15,10 @@ int ecapply_cold_decide(struct eng *db, int64_t key, const uint8_t *oids, uint32
     return TSDB_ERR_INVALID; /* not built yet */
 }
 
-int ecapply_swap_pre(struct eng *db, struct part **in, struct part **ec, size_t n)
+int ecapply_swap_pre(struct eng *db, struct part **in, struct part **ec, size_t n, bool *logged)
 {
     (void)db, (void)in, (void)ec, (void)n;
+    *logged = false;
     return 0;
 }
 

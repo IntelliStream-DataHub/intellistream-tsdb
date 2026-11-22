@@ -31,7 +31,13 @@ int ecapply_cold(struct eng *db, uint64_t pos, const mk *m);
  * 0 not (none), TSDB_ERR_CORRUPT for some. */
 int ecapply_cold_decide(struct eng *db, int64_t key, const uint8_t *oids, uint32_t n);
 /* Around a settle's swap (src/ecswap.c, ec_swap_commit: the inputs `in`, their .ec parts `ec`, n of each). */
-int ecapply_swap_pre(struct eng *db, struct part **in, struct part **ec, size_t n);
+/* ecapply_swap_pre sets *logged (first, also when it fails) when a committed COLD marker names the swap's objects (every
+ * swap of a cluster ec volume, leader or replica): ec_swap_commit then never hands them to r7-gc or back to its caller;
+ * a refusal from there on (the hook's error, out of memory, the intent's write, a source dropped, merging or unlisted
+ * under db->lock) fails the engine with a line and returns TSDB_ERR_IO, the temporaries and any intent left for the
+ * next open. Refusals before the hook (READONLY, INVALID: bad arguments) hand nothing over themselves; a caller of a
+ * logged swap must never give the objects to r7-gc on any error. */
+int ecapply_swap_pre(struct eng *db, struct part **in, struct part **ec, size_t n, bool *logged);
 void ecapply_swap_post(struct eng *db, struct part **in, struct part **ec, size_t n);
 
 /* ---- the replica API (r8a2-hooks, built in src/replica.c) ----
@@ -61,7 +67,9 @@ void replica_stage_release(struct eng *db);
  * rp->mu: call it with rp->mu let go (replica_mu_drop), stage_mu held or not. */
 int replica_stage_path(struct eng *db, const char *name, char *buf, size_t cap);
 /* Flushes the sealed memtables (every one holds a segment below the marker being applied), never the active one: the
- * marker's flush_through F must lie below its segment (TSDB_ERR_CORRUPT otherwise, a line). Inside ecapply_cold only;
+ * marker's flush_through F must lie below its segment (TSDB_ERR_CORRUPT otherwise, a line). F only bounds: every
+ * sealed memtable is flushed, whatever segment F names (safe because the leader flushes through its cut before the
+ * marker, so sealed memtables above F hold no rows of the key; as apply_commit's flush). Inside ecapply_cold only;
  * with rp->mu let go. */
 int replica_flush_through(struct eng *db, uint64_t f);
 
