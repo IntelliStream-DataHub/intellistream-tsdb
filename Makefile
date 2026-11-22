@@ -322,7 +322,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -445,11 +445,13 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
 
-test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
+test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	./$(B)/test_meta /tmp --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
 	./$(B)/test_peerlink $(or $(TMPDIR),/tmp)
 	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead; do ! ./$(B)/test_peerlink $(or $(TMPDIR),/tmp) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	./$(B)/test_fwd
+	for m in noage retry unavonbreak; do ! ./$(B)/test_fwd --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 
 # the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 18 runs of 2 minutes each under a sanitizer
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
@@ -839,6 +841,9 @@ $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
 $(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+# the entry node's rules over a fake link (no sockets, no tsdbd)
+$(B)/test_fwd: tests/test_fwd.c server/fwdreq.h server/fwd.h server/peerlink.h $(B)/fwdreq.o
+	$(CC) $(CFLAGS) -Iinclude -Iserver -o $@ $< $(B)/fwdreq.o -lpthread
 $(B)/test_meta: tests/test_meta.c server/meta.h $(B)/meta.o $(B)/repl.o $(RAFT_OBJ) $(B)/raft_raft_sim.o
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -o $@ $< $(B)/meta.o $(B)/repl.o $(RAFT_OBJ) $(B)/raft_raft_sim.o -lm
 # test_meta with bugs planted in meta.c (MUT(n), -DMETA_MUTANTS): tests/meta_mutants.sh runs each with --mutant n and
