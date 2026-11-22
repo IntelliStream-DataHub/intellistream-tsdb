@@ -11,7 +11,8 @@
 # oversubscribed: ThreadSanitizer runs are timing-sensitive.
 #
 # Usage: tools/tsan-par.sh MAKE GROUPS     (the Makefile passes $(MAKE) and $(TEST_GROUPS); TSAN_FLAGS is in the environment)
-# Environment: TSAN_PAR_LOGS (log directory, default a new one under $TMPDIR), MUTANT_SLOTS, MUTANT_JOBS.
+# Environment: TSAN_PAR_LOGS (log directory, default a new one under $TMPDIR), MUTANT_SLOTS, MUTANT_JOBS, TSAN_PAR_REST=0
+# (leave out the run of the rest of `make test`: to try the build and a few groups only).
 set -u
 make_cmd=${1:?usage: tsan-par.sh MAKE GROUPS}
 groups=${2-}
@@ -45,7 +46,7 @@ start() { # name, make arguments
     pids+=($!)
     starts+=("$SECONDS")
 }
-start rest test TEST_GROUPS=
+[ "${TSAN_PAR_REST:-1}" = 0 ] || start rest test TEST_GROUPS=
 for g in $groups; do start "$g" "$g"; done
 bad=0
 for i in "${!names[@]}"; do
