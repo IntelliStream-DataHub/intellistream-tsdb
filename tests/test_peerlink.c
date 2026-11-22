@@ -600,6 +600,7 @@ struct proxy {
     struct ppair *pairs[256];
     int np;
     _Atomic uint64_t accepted;
+    _Atomic uint64_t bytes[2]; /* passed through, dialer to listener [0] and back [1] */
 };
 
 static void *pump(void *arg)
@@ -625,6 +626,7 @@ static void *pump(void *arg)
                 goto out;
             o += w;
         }
+        atomic_fetch_add(&px->bytes[dir], (uint64_t)n);
     }
 out:
     shutdown(from, SHUT_RDWR);
@@ -1740,16 +1742,77 @@ static void test_kinds(void)
     struct pl_stats st;
     peerlink_stats(d->pl, &st);
     CHECK(st.bytes_out < st.raw_out); /* text frames: FWD and FWDQ are compressed, like LOG */
-    CHECK(peerlink_dial(d->pl, 1, "127.0.0.1:1", PL_KIND_FWDQ + 1) == NULL);
+    CHECK(peerlink_dial(d->pl, 1, "127.0.0.1:1", PL_KIND_DATA_MAX + 1) == NULL);
     CHECK(peerlink_dial(d->pl, 1, "127.0.0.1:1", PL_KIND_META) == NULL);
     int fd = raw_connect(a->port);
-    raw_hello(fd, 2, (uint8_t)g_uuid_byte, PL_KIND_FWDQ + 1);
+    raw_hello(fd, 2, (uint8_t)g_uuid_byte, PL_KIND_DATA_MAX + 1);
     int t = raw_read(fd, 1000);
     printf("  kinds: an unknown kind's HELLO gets %d (-1: closed)\n", t);
     CHECK(t == -1);
     close(fd);
     node_free(d);
     node_free(a);
+}
+
+/* ---------------------------------------------------------------- chunk kinds (server/chunksrv.h) */
+
+/* CHUNK and CHUNKB links come up and carry frames and files: CHUNK frames are compressed like FWD's, a CHUNKB file goes
+ * as it is, like every bulk file (its cells are compressed parts already: zstd would only spend CPU); a frame above
+ * PL_FRAME_MAX is refused on CHUNK; a kind above this build's (a server that does not know it) is refused at its
+ * HELLO. */
+static void test_chunk(void)
+{
+    struct pl_cfg bc;
+    memset(&bc, 0, sizeof bc);
+    bc.bulk_rate = PL_RATE_UNLIMITED;
+    struct node *a = node_new(1, SECRET, &bc, 1);
+    struct node *d = node_new(2, SECRET, &bc, 0);
+    a->strict = 0;
+    struct proxy *px = proxy_new(a->port); /* counts the CHUNKB link's bytes on the wire */
+    struct plink *c = dial(d, 1, a->port, PL_KIND_CHUNK), *b = dial(d, 1, px->port, PL_KIND_CHUNKB);
+    CHECK(WAIT_FOR(plink_up(c) && plink_up(b), 3000));
+    CHECK(plink_kind(c) == PL_KIND_CHUNK && plink_kind(b) == PL_KIND_CHUNKB);
+    CHECK(send_frames(c, 4, 1, 10, 3000, 1000) == PL_OK);
+    CHECK(WAIT_FOR(a->frames_in == 10, 3000));
+    CHECK(a->bad_frames == 0);
+    CHECK(WAIT_FOR(peerlink_find(a->pl, 2, PL_KIND_CHUNK) && peerlink_find(a->pl, 2, PL_KIND_CHUNKB), 1000));
+    struct pl_stats s0;
+    peerlink_stats(d->pl, &s0);
+    CHECK(s0.bytes_out < s0.raw_out); /* text frames on CHUNK: compressed */
+    /* a file of zeros on CHUNKB: compressed it would be a few KB on the wire */
+    char src[600], dst[600];
+    pathf(src, sizeof src, "chunkb-src");
+    pathf(dst, sizeof dst, "chunkb-dst");
+    size_t size = 4u << 20;
+    int sfd = open(src, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(sfd >= 0 && ftruncate(sfd, (off_t)size) == 0);
+    snprintf(a->path, sizeof a->path, "%s", dst);
+    strcpy(a->want_meta, "chunk");
+    a->want_total = size;
+    struct jres r = {0};
+    uint64_t w0 = atomic_load(&px->bytes[0]);
+    CHECK(bulk_send(b, sfd, size, a->want_meta, &r) == PL_OK);
+    CHECK(WAIT_FOR(atomic_load(&r.done), 10000) && r.status == PL_OK);
+    CHECK(WAIT_FOR(a->ends == 1, 3000) && a->last_end == PL_OK);
+    CHECK(a->meta_bad == 0 && same_file(sfd, a->fd, size));
+    uint64_t w = atomic_load(&px->bytes[0]) - w0;
+    printf("  chunk: a CHUNKB file of %zu zero bytes took %" PRIu64 " bytes on the wire\n", size, w);
+    CHECK(w >= size);
+    uint8_t *big = calloc(1, PL_FRAME_MAX + 1);
+    CHECK(plink_send(c, 5, big, PL_FRAME_MAX + 1, 0) == PL_E_TOOBIG);
+    free(big);
+    CHECK(PL_KIND_CHUNK > PL_KIND_FWDQ && PL_KIND_CHUNKB <= PL_KIND_DATA_MAX);
+    CHECK(peerlink_dial(d->pl, 1, "127.0.0.1:1", PL_KIND_DATA_MAX + 1) == NULL);
+    int fd = raw_connect(a->port);
+    raw_hello(fd, 2, (uint8_t)g_uuid_byte, PL_KIND_DATA_MAX + 1);
+    CHECK(raw_read(fd, 1000) == -1);
+    close(fd);
+    node_free(d);
+    node_free(a);
+    proxy_free(px);
+    close(sfd);
+    unlink(src);
+    unlink(dst);
 }
 
 /* a payload above PL_FRAME_MAX is refused, header included; one at the bound goes */
@@ -2419,7 +2482,7 @@ int main(int argc, char **argv)
         {"resume", test_resume}, {"secret", test_secret},   {"flip", test_flip},
         {"blackhole", test_blackhole}, {"backpressure", test_backpressure}, {"backlog", test_backlog}, {"latency", test_latency}, {"kick", test_kick}, {"dataerr", test_dataerr}, {"slowcb", test_slowcb}, {"chain", test_chain}, {"rawauth", test_rawauth}, {"endhash", test_endhash},
         {"throttle", test_throttle}, {"badchunk", test_badchunk}, {"replace", test_replace}, {"freehs", test_freehs},
-        {"gen", test_gen}, {"kinds", test_kinds}, {"toobig", test_toobig}, {"written", test_written},
+        {"gen", test_gen}, {"kinds", test_kinds}, {"chunk", test_chunk}, {"toobig", test_toobig}, {"written", test_written},
         {"fwdstall", test_fwdstall}, {"fwd", test_fwd}, {"fwdgrow", test_fwdgrow}, {"fwdredial", test_fwdredial},
         {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"wbcut", test_wbcut},
     };

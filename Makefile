@@ -54,7 +54,7 @@ FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users cl
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
-FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o fwd.o
+FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o fwd.o chunksrv.o
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -522,7 +522,7 @@ $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuz
 	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
-$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o server/peerlink.h server/replwire.h server/fwd.h
+$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o $(B)/chunksrv.o server/peerlink.h server/replwire.h server/fwd.h server/chunksrv.h
 $(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
