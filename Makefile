@@ -102,7 +102,7 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
-R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h
+R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -437,7 +437,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_ecpart $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_ecpart --list "ecnohash ecnowalseq ecskipname ecnofno ecnolayout" -- ./$(B)/test_ecpart --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_keep $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop divergemem clearcluster" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecskip $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_ecskip --list "mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec" -- ./$(B)/test_ecskip --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_tier $(or $(TMPDIR),/tmp)
@@ -454,6 +454,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_crypto
 	./$(B)/test_users
 	B=$(B) tests/test_cli_users.sh
+	B=$(B) tests/test_cli_diverged.sh
 	B=$(B) tests/test_cli_feed.sh
 	B=$(B) tests/test_cli_chunkstore.sh
 	! nm $(CLIB) | grep -wE '_?tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only (_: Mach-O)

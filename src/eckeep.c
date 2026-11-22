@@ -17,6 +17,7 @@
  * answering (D5) and the only copy that is known good, the settled_ file, is never released.
  */
 #include "eckeep.h"
+#include "ecdiverge.h"
 #include "chunk.h"
 #include "ecpart.h"
 #include "coldops.h"
@@ -271,9 +272,10 @@ static void diverged(eng *db, const part *p, const char *name, const char *why)
     hex16(ep->rec.oid, oid);
     fprintf(stderr,
             "tsdb: volume %" PRIu32 " partition %" PRId64 ": the digest of object %s (%s) against %s failed: %s; the "
-            "volume is DIVERGED (refused until a restart) and %s is kept\n",
+            "volume is DIVERGED (refused, also after a restart, until `tsdb DIR volume diverged --clear`) and %s is "
+            "kept\n",
             db->tier_vol, p->partition, oid, p->name, name, why, name);
-    atomic_store(&db->diverged, true);
+    ec_diverge(db, p->partition, ep->rec.oid, EC_DIV_DIGEST); /* durable, then the flag (a failed write fails the engine) */
 }
 
 static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name, int64_t *deadline)

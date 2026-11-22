@@ -20,6 +20,10 @@
  *   badrec    chunks and sums of other bytes under the source's object_xxh64: only the object's hash tells: DIVERGED
  *   gone      every chunk file of the object removed, every store UP: DIVERGED (never a wait)
  *   long      the settled_ file longer than the object, its first bytes the source's: DIVERGED
+ *   restart   (in each of the five above) a restart keeps it: DIVERGED (the file, src/ecdiverge.h) is read at the open,
+ *             refused before the new digest ran; the digest that fails again adds no record
+ *   clearcli  (othersrc) `volume diverged --clear` refused while open and on a cluster volume (naming R4), offline it
+ *             clears and the volume serves again
  *   reopen    a DIVERGED volume 1 through tsdb_volume_reopen (not a restart): still UNAVAILABLE, before the new
  *             engine's digest ran, and after tsdb_volume_resume; also a packed insert over two volumes, a series made;
  *             eng_halt stopped the old engine's digest thread before the new engine opened
@@ -28,7 +32,7 @@
  *   orphan    the key dropped before the digest: the file stays, and goes keep_s (an hour) later
  *
  * Usage: test_keep [--mutant digestskip|digestraw|digestnohold|keepmtime|noobjcmp|openwait|nolencheck|orphannow|
- * nohaltstop] [SCRATCH]. Without TSDB_EC it says it is
+ * nohaltstop|divergemem|clearcluster] [SCRATCH]. Without TSDB_EC it says it is
  * skipped.
  */
 #include "internal.h"
@@ -37,6 +41,7 @@
 #include "eckeep.h"
 #include "ecpart.h"
 #include "ecswap.h"
+#include "ecdiverge.h"
 #include "tier.h"
 
 #include <dirent.h>
@@ -471,6 +476,79 @@ static void diverged_checks(h *x, const settled *s, const char *log)
     CHECK(exists_in(x->path ? x->path : dbdir, s->settled) && eckeep_status(x->db, s->settled) == ECKEEP_DIVERGED);
 }
 
+/* The records of dir/DIVERGED (48 bytes each), -1 when it cannot be read; none without the file. */
+static int div_records(const char *dir)
+{
+    char p[PATH_MAX * 2];
+    if (snprintf(p, sizeof p, "%s/DIVERGED", dir) >= (int)sizeof p)
+        return -1;
+    struct stat st;
+    if (stat(p, &st) != 0)
+        return errno == ENOENT ? 0 : -1;
+    return st.st_size % 48 ? -1 : (int)(st.st_size / 48);
+}
+
+/* clearcli: `tsdb DIR volume diverged --clear` (ecdiverge_cli) is refused while the volume is open (the writer's
+ * LOCK), on a cluster volume's directory (D23, a line naming R4; mutant clearcluster), and offline it removes the
+ * file: the next open serves the volume, its digest paused (the kept file would diverge it again). */
+static void clear_checks(h *x, const settled *s)
+{
+    (void)s;
+    char *log;
+    FILE *devnull = fopen("/dev/null", "w");
+    CHECK(devnull != NULL);
+    cap_begin();
+    CHECK(ecdiverge_cli(dbdir, true, devnull) == TSDB_ERR_LOCKED);
+    log = cap_end();
+    CHECK(strstr(log, "holds the directory") != NULL);
+    CHECK(div_records(dbdir) == 1);
+    /* a cluster volume's directory with the same record: refused, the file stays */
+    char cdir[PATH_MAX + 200], src[PATH_MAX * 3], dst[PATH_MAX * 3];
+    snprintf(cdir, sizeof cdir, "%s/../clustervol", dbdir);
+    rm_rf(cdir);
+    CHECK(mkdir(cdir, 0755) == 0);
+    snprintf(src, sizeof src, "%s/DIVERGED", dbdir);
+    snprintf(dst, sizeof dst, "%s/DIVERGED", cdir);
+    char buf[48 * 4];
+    FILE *f = fopen(src, "rb"), *g = fopen(dst, "wb");
+    CHECK(f && g);
+    size_t n = f ? fread(buf, 1, sizeof buf, f) : 0;
+    CHECK(n == 48 && g && fwrite(buf, 1, n, g) == n);
+    if (f)
+        fclose(f);
+    if (g)
+        fclose(g);
+    snprintf(dst, sizeof dst, "%s/META", cdir);
+    g = fopen(dst, "w");
+    CHECK(g && fputs("version=9\nrequires=cluster,replica\n", g) >= 0);
+    if (g)
+        fclose(g);
+    cap_begin();
+    int rc = ecdiverge_cli(cdir, true, devnull);
+    log = cap_end();
+    CHECK(rc == TSDB_ERR_INVALID && strstr(log, "R4") && strstr(log, "refused"));
+    CHECK(div_records(cdir) == 1);
+    CHECK(ecdiverge_cli(cdir, false, devnull) == 1); /* listing is fine anywhere */
+    rm_rf(cdir);
+    /* offline: cleared, logged */
+    h_close(x);
+    cap_begin();
+    CHECK(ecdiverge_cli(dbdir, true, devnull) == 1);
+    log = cap_end();
+    CHECK(strstr(log, "removing the DIVERGED record") && strstr(log, "cleared"));
+    CHECK(div_records(dbdir) == 0);
+    fclose(devnull);
+    atomic_store(&eckeep_test_pause, true);
+    CHECK(h_open(x, 1) == 0);
+    acc a;
+    CHECK(!atomic_load(&x->db->diverged) && tsdb_volume_diverged(x->t, x->v) == 0);
+    /* served again: the write it refused goes in, and the read is the engine's own answer (this object's bytes are
+     * not the source's: what the operator accepted), never UNAVAILABLE */
+    CHECK(tsdb_append(x->t, TSDB_SID(x->v, x->s), T0 + 5 * DAY, 1.0f) == 0);
+    CHECK(read_all(x, &a) != TSDB_ERR_UNAVAILABLE);
+    atomic_store(&eckeep_test_pause, false);
+}
+
 enum { DV_DAMAGEALL, DV_OTHERSRC, DV_BADREC, DV_GONE, DV_LONG };
 static const char *const DV_NAME[] = {"damageall", "othersrc", "badrec", "gone", "long"};
 
@@ -508,18 +586,24 @@ static void case_diverged(int mode)
     CHECK(st == ECKEEP_DIVERGED);
     diverged_checks(&x, &s, log);
     h_close(&x);
-    /* a reopen digests it again, and again it does not match */
+    CHECK(div_records(dbdir) == 1);
+    /* a restart (R8 D8): refused from the open on, before its own digest ran (paused); it digests again, and again it
+     * does not match, which adds no record (fails on main, where the flag was memory only; mutant divergemem) */
     atomic_store(&eckeep_test_pause, true);
     cap_begin();
     CHECK(h_open(&x, 1) == 0);
     acc a;
-    CHECK(!atomic_load(&x.db->diverged) && read_all(&x, &a) != TSDB_ERR_UNAVAILABLE); /* not known yet */
+    CHECK(atomic_load(&x.db->diverged) && tsdb_volume_diverged(x.t, x.v) == 1);
+    CHECK(read_all(&x, &a) == TSDB_ERR_UNAVAILABLE);
     atomic_store(&eckeep_test_pause, false);
     st = eckeep_test_wait(x.db, s.settled, tmo);
     log = cap_end();
     CHECK(st == ECKEEP_DIVERGED);
     diverged_checks(&x, &s, log);
+    if (mode == DV_OTHERSRC) /* a readable object: what the clear lets through */
+        clear_checks(&x, &s);
     h_close(&x);
+    CHECK(div_records(dbdir) == (mode == DV_OTHERSRC ? 0 : 1));
     free(s.rec.sums);
 }
 
@@ -697,7 +781,9 @@ static const struct {
                {"openwait", ECKEEP_MUT_OPENWAIT},
                {"nolencheck", ECKEEP_MUT_NOLENCHECK},
                {"orphannow", ECKEEP_MUT_ORPHANNOW},
-               {"nohaltstop", ECKEEP_MUT_NOHALTSTOP}};
+               {"nohaltstop", ECKEEP_MUT_NOHALTSTOP},
+               {"divergemem", 100 + ECDIV_MUT_MEM}, /* src/ecdiverge.h's: 100 + its number */
+               {"clearcluster", 100 + ECDIV_MUT_CLEARCLUSTER}};
 #endif
 
 int main(int argc, char **argv)
@@ -719,6 +805,10 @@ int main(int argc, char **argv)
             if (eckeep_mutant < 0) {
                 fprintf(stderr, "unknown mutant %s\n", m);
                 return 2;
+            }
+            if (eckeep_mutant >= 100) {
+                ecdiverge_mutant = eckeep_mutant - 100;
+                eckeep_mutant = 0;
             }
         } else {
             base = argv[i];

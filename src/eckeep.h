@@ -12,8 +12,10 @@
  * and tries again): it never "matches" by reading around a position that is away. A match releases the file at its
  * deadline. A mismatch, an object that cannot be read whole, or a file of another length holds the file for good, logs
  * one line naming volume, partition, oid and both files, and sets db->diverged: the route() family of src/volumes.c then
- * answers TSDB_ERR_UNAVAILABLE for the volume until a restart (D5; the way out comes with R15). An in-process reopen
- * (tsdb_volume_reopen, tsdb_cvol_replace) is not a restart: the new engine inherits the flag. A settled_ file whose
+ * answers TSDB_ERR_UNAVAILABLE for the volume, across restarts too (the DIVERGED file, src/ecdiverge.h, R8 D8), until
+ * an operator runs `tsdb DIR volume diverged --clear`. An in-process reopen (tsdb_volume_reopen, tsdb_cvol_replace)
+ * inherits the flag as well.
+ A settled_ file whose
  * .ec part is no longer listed (a drop took the key) has no object to compare with: its rows are gone from the volume
  * anyway, and it is released keep_s after it was found so.
  *

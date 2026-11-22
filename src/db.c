@@ -4,6 +4,7 @@
 #include "eccache.h"
 #include "ecgc.h"
 #include "eckeep.h"
+#include "ecdiverge.h"
 #include "ecpart.h"
 #include "ecskip.h"
 #include "tier.h"
@@ -984,7 +985,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         goto fail;
     if ((rc = series_open(&db->series, db->dirfd, "SERIES", ro, db->opt.fsync)) != 0 ||
         (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0 ||
-        (rc = ret_open(db, ro)) != 0 || (rc = cls_open(db, ro)) != 0) /* classes before the WAL replay */
+        (rc = ret_open(db, ro)) != 0 || (rc = cls_open(db, ro)) != 0 || /* classes before the WAL replay */
+        (rc = ecdiverge_open(db)) != 0) /* R8 (D8): a DIVERGED volume is refused from its first request on */
         goto fail;
     db->series.before_append = jr_dict_series; /* a leader's marker first (jr_markers); nothing without one */
     db->series.before_arg = db;
@@ -1289,6 +1291,7 @@ int eng_close(eng *db)
     pthread_cond_destroy(&db->merged_cv);
     pthread_cond_destroy(&db->flush_cv);
     tier_engine_detach(db); /* R7: after the parts went (an .ec part reaches the tier through its engine) */
+    ecdiverge_close(db); /* after the tier's threads stopped (eckeep's digest appends to it) */
     free(db->dir);
     free(db);
     return rc;
