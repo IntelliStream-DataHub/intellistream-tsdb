@@ -2228,6 +2228,7 @@ static cluster_users_fn g_uwatch;
 static void *g_uwatch_arg;
 static atomic_int g_uw_new;
 static atomic_int g_users_ok; /* cluster_users_caught_up */
+static _Atomic uint64_t g_users_through; /* cluster_users_through: C.uw_at, for other threads */
 /* where cluster_user_propose sends: the Raft leader's peer address as this server last knew it ("" none) */
 static pthread_mutex_t ul_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_ul_addr[META_ADDR_MAX];
@@ -4068,9 +4069,13 @@ static void users_push(void)
         C.uw_max = umax;
     }
     /* a watch set meanwhile (g_uw_new) has not been given these yet */
-    if (taken && !atomic_load(&g_uw_new))
+    if (taken && !atomic_load(&g_uw_new)) {
         C.uw_at = C.sm.applied;
+        atomic_store_explicit(&g_users_through, C.uw_at, memory_order_release);
+    }
 }
+
+uint64_t cluster_users_through(void) { return atomic_load_explicit(&g_users_through, memory_order_acquire); }
 
 /* the applied index member `id` last reported (its heartbeat; this server's own copy for itself), 0 never */
 static uint64_t member_applied(uint32_t id)

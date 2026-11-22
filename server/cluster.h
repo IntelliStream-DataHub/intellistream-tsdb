@@ -318,6 +318,11 @@ void cluster_set_users_watch(cluster_users_fn fn, void *arg);
  * keeps the users it has until it hears the group, ha-modes :916). Logins wait for it, so a restarted server never
  * accepts a user whose drop committed while it was down. Any thread. */
 int cluster_users_caught_up(void);
+/* The applied index through which the users watch has every change of the group's users (the index of the copy when
+ * the watch was last given, or found to have, its users): a forwarded request's owner refuses it with UNAVAILABLE while
+ * this is below the index the entry node's users were at (fwdreq.h), so a user added a moment ago is retried, never
+ * refused AUTH. 0 until the first push. Any thread. */
+uint64_t cluster_users_through(void);
 
 enum { CLUSTER_USER_PUT = 1, CLUSTER_USER_DEL = 2 };
 #define CLUSTER_LAGGARDS_MAX 64

@@ -455,6 +455,23 @@ static void render(sb *b)
         sb_add(b, "tsdb_logins_total{result=\"%s\"} %llu\n", login_name[k],
                (unsigned long long)atomic_load_explicit(&M.logins[k], memory_order_relaxed));
 
+    if (cfg.fwd_peers) { /* forwarding one hop (S2-2): per member this server forwarded requests to */
+        metrics_fwd_peer fp[64];
+        size_t nf = cfg.fwd_peers(fp, sizeof fp / sizeof fp[0]);
+        family(b, "tsdb_fwd_frames_total", "counter", "Requests this server forwarded to the member that leads their volume.");
+        for (size_t i = 0; i < nf; i++)
+            sb_add(b, "tsdb_fwd_frames_total{peer=\"%u\"} %llu\n", (unsigned)fp[i].peer, (unsigned long long)fp[i].frames);
+        family(b, "tsdb_fwd_bytes_total", "counter", "Bytes of the requests this server forwarded, envelope included.");
+        for (size_t i = 0; i < nf; i++)
+            sb_add(b, "tsdb_fwd_bytes_total{peer=\"%u\"} %llu\n", (unsigned)fp[i].peer, (unsigned long long)fp[i].bytes);
+        family(b, "tsdb_fwd_hop_seconds", "summary",
+               "Hop latency of forwarded requests, from the send to the reply's last byte (since the start; buckets of a "
+               "fourth of a power of two).");
+        for (size_t i = 0; i < nf; i++)
+            sb_add(b, "tsdb_fwd_hop_seconds{peer=\"%u\",quantile=\"0.5\"} %.6f\ntsdb_fwd_hop_seconds{peer=\"%u\",quantile=\"0.99\"} %.6f\n",
+                   (unsigned)fp[i].peer, fp[i].p50_us / 1e6, (unsigned)fp[i].peer, fp[i].p99_us / 1e6);
+    }
+
     family(b, "tsdb_query_duration_seconds", "histogram",
            "Time a worker spent on a query request, from taking it to handing the reply to the kernel (a slow client can add to it).");
     for (unsigned o = 1; o < NOPS; o++) {

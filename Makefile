@@ -817,6 +817,9 @@ $(B)/peerlink.o: server/peerlink.c server/peerlink.h client/tsdb_crypto.h src/co
 # it), tsdbd's instance over the cluster's member list in fwd_cluster.o
 $(B)/fwd.o: server/fwd.c server/fwd.h server/peerlink.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
+# forwarding one hop, the request half (server/fwdreq.h: envelope, tail, the entry node's rules; tests/test_fwd.c)
+$(B)/fwdreq.o: server/fwdreq.c server/fwdreq.h server/fwd.h server/peerlink.h | $(B)
+	$(CC) $(CFLAGS) -Iinclude -c -o $@ $<
 $(B)/fwd_cluster.o: server/fwd_cluster.c server/fwd.h server/peerlink.h server/cluster.h server/meta.h client/tsdb_crypto.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
@@ -827,7 +830,7 @@ $(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
 # the replication driver's payloads on the data links (server/replwire.h)
 $(B)/replwire.o: server/replwire.c server/replwire.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(RAFT_OBJ)
+CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(RAFT_OBJ)
 $(B)/tsdb: $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
@@ -882,7 +885,7 @@ copy-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 meta-soak: $(B)/test_meta
 	./$(B)/test_meta /tmp --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
-TSDBD_SRC := server/fwd.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
+TSDBD_SRC := server/fwd.h server/fwdreq.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c \

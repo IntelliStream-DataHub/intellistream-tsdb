@@ -122,6 +122,7 @@
 #include "tenants.h"
 #include "cluster.h"
 #include "fwd.h"
+#include "fwdreq.h"
 #include "cvol.h"
 #include "repld.h"
 #include "../src/cvol.h"
@@ -255,6 +256,7 @@ typedef struct req {
     size_t len;
     bool cancelled; /* a QUERY_MULTI a CANCEL named while it was queued (main thread) */
     struct req *mnext; /* the next QUERY_MULTI in the connection's queue (main thread) */
+    int64_t t_arr;     /* when the event loop read it (CLOCK_MONOTONIC ns): a forward's age counts from here */
 } req;
 
 /* What a request costs beyond its payload: the struct and two allocations. Counted with the payload, so frames
@@ -323,6 +325,7 @@ typedef struct conn {
     int64_t t_open;       /* accepted at (monotonic s), for --login-timeout (main thread) */
     bool auth_hold;       /* an AUTH_CONTINUE waits or runs: nothing more is read until it is answered (main) */
     auth_conn auth;       /* the worker running this connection's request (one at a time) */
+    struct fwdo *fwdo;    /* a forwarded request's pseudo-connection on its owner (fd -1): replies go back on the link */
 } conn;
 
 /* ------------------------------------------------------------ globals */
@@ -450,8 +453,20 @@ static void inflate_release(size_t n)
     pthread_mutex_unlock(&inflate_lock);
 }
 
+/* Forwarding one hop (S2-2, fwdreq.h; the code after worker_main). A reserved worker runs a forwarded request on its
+ * owner (fwd_owner) and never forwards it again (D30); its waits count in its own pool (fwd_pool_waits). */
+static __thread bool fwd_owner;
+static struct fwdr_tab *fwd_tab; /* the entry node's frames in flight */
+static void fwd_pool_waits(int delta);
+struct fwdo;
+static bool fwdo_put(struct conn *c, const struct iovec *iov, int n);
+
 static void worker_waits(int delta)
 {
+    if (fwd_owner) {
+        fwd_pool_waits(delta);
+        return;
+    }
     pthread_mutex_lock(&work_lock);
     waiting_workers += delta;
     if (delta < 0)
@@ -692,6 +707,12 @@ static void notify(conn *c, bool done)
 static inline void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
 static int64_t mono_ms(void);
+static inline int64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
 /* The clock of c->cv: monotonic where the platform lets a cv have it (a step of the wall clock must not stretch or
  * cut a wait); macOS has no pthread_condattr_setclock. */
 #ifdef __APPLE__
@@ -821,6 +842,8 @@ static atomic_int streaming_conns;
 
 static bool out_put(conn *c, const struct iovec *iov, int n)
 {
+    if (c->fwdo) /* a forwarded request's owner: its replies go back over the link */
+        return fwdo_put(c, iov, n);
     int i = 0;
     size_t at = 0; /* in iov[i] */
     for (;;) {
@@ -2458,6 +2481,12 @@ static void route_moved(conn *c, req *r, uint16_t vol)
  * one shared line and takes the volume table's read lock (tsdb_cvol_role), which the engine's route takes anyway. */
 enum { RTM_NONE, RTM_RIGHTSBEFOREROUTE, RTM_MOVEDOFFCOPY, RTM_REPLICAREAD, RTM_SPANACCEPTED, RTM_NOCOPYSERVED };
 static int route_mutant; /* TSDB_ROUTE_MUTANT (tests: each must fail test_cluster route) */
+/* TSDBD_FWD_MUTANT (tests: each must fail test_cluster forward or test_fwd): a forward forwarded again, no age check,
+ * a broken link answered UNAVAILABLE, the owner runs a forward unchecked (no user), a lost forward sent again, the
+ * owner skips the lease, no worker_waits around a forward's wait, AUTH while the owner's users are behind */
+enum { FWM_NONE, FWM_TWICE, FWM_OLDFRAME, FWM_UNAVONBREAK, FWM_NOUSER, FWM_RETRY, FWM_NOLEASE, FWM_NOWAIT, FWM_AUTHLAG };
+static int fwdx_mutant;
+static int fwd_entry(req *r, uint32_t v);
 static __thread const struct cluster_copy *rt_cp;
 static __thread unsigned long rt_builds;
 
@@ -2585,7 +2614,9 @@ static int route_decide(req *r)
         return 0;
     if (!route_away(v, !(auth_ops[r->op].need & R_WRITE), &owner))
         return 0;
-    route_moved(r->c, r, (uint16_t)v);
+    if ((!fwd_owner || fwdx_mutant == FWM_TWICE) && fwd_entry(r, v)) /* forwarded to its leader (S2-2) */
+        return 1;
+    route_moved(r->c, r, (uint16_t)v); /* on an owner: a frame makes one hop (D30); or not forwardable */
     return 1;
 }
 
@@ -2740,6 +2771,13 @@ static const char *why_name(unsigned why)
 }
 
 /* STATUS (superuser): key=value lines, ha.md 15.4. */
+struct fwd_peer_row {
+    uint32_t peer;
+    uint64_t frames, bytes;
+    double p50_us, p99_us;
+};
+static size_t fwd_peer_rows(struct fwd_peer_row *out, size_t cap);
+
 static void handle_status(req *r)
 {
     conn *c = r->c;
@@ -2751,7 +2789,7 @@ static void handle_status(req *r)
     /* a cluster node: its own id and its peers from the metadata copy (0 and none before it has one) */
     const struct cluster_copy *cp = cvol_active() ? cluster_copy_get() : NULL;
     size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
-                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) : 0);
+                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + 64 * 200 + 64 : 0);
     char *t = malloc(cap + 4);
     if (!t) {
         cluster_copy_put(cp);
@@ -2771,6 +2809,14 @@ static void handle_status(req *r)
                        (unsigned)m->id, m->peer, (unsigned)m->id, m->state == META_UP);
         }
         cluster_copy_put(cp);
+        struct fwd_peer_row fr[64]; /* forwarding one hop (ha.md 15.4 STATUS): per peer forwarded to */
+        size_t nf = fwd_peer_rows(fr, sizeof fr / sizeof fr[0]);
+        for (size_t i = 0; i < nf && at + 200 < cap; i++)
+            ST_PUT("peer.%u.fwd.frames=%llu\npeer.%u.fwd.bytes=%llu\npeer.%u.fwd.hop_p50_us=%.0f\n"
+                   "peer.%u.fwd.hop_p99_us=%.0f\n", (unsigned)fr[i].peer, (unsigned long long)fr[i].frames,
+                   (unsigned)fr[i].peer, (unsigned long long)fr[i].bytes, (unsigned)fr[i].peer, fr[i].p50_us,
+                   (unsigned)fr[i].peer, fr[i].p99_us);
+        ST_PUT("fwd.late_dropped=%llu\n", (unsigned long long)fwdr_tab_dropped(fwd_tab));
     }
     for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
         uint8_t health, reason;
@@ -2801,6 +2847,10 @@ static void handle_status(req *r)
 }
 
 static void handle_op(req *r);
+static __thread struct {
+    bool on;
+    tsdb_query_stats st;
+} fwd_st; /* the statistics a forwarded query's reply carried (worker_main keeps them for LAST_STATS) */
 /* Tests (TSDBD_TEST_AUTH_DELAY_MS): a worker that answered TSDB_ERR_AUTH waits that long before it reports done, the
  * window in which the client's next frame arrives (a preempted worker on a busy CI machine); test_auth. */
 static int test_auth_delay_ms;
@@ -2868,7 +2918,7 @@ static void handle_in(req *r)
         reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE); /* min_isr: refused before anything is written (D9) */
         return;
     }
-    if (unav_vol != TSDB_VOL_ANY && cvol_active()) {
+    if (unav_vol != TSDB_VOL_ANY && cvol_active() && !(fwd_owner && fwdx_mutant == FWM_NOLEASE)) {
         uint64_t gen = cluster_lease_gen();
         bool lease = cluster_lease_valid(), led = false, rd = !(auth_ops[r->op].need & R_WRITE);
         /* the leadership before cvol_why judges it: a deposal in between changes it, and the read is refused */
@@ -3443,6 +3493,13 @@ static void handle_op(req *r)
     reply_status(c, r->id, rc);
 }
 
+static bool query_op(uint8_t op)
+{
+    return op == TSDB_OP_QUERY_RAW || op == TSDB_OP_QUERY_VALUES || op == TSDB_OP_QUERY_BUCKETS ||
+           op == TSDB_OP_QUERY_BOUNDS || op == TSDB_OP_QUERY_LTTB || op == TSDB_OP_QUERY_TWA ||
+           op == TSDB_OP_QUERY_MULTI;
+}
+
 static void *worker_main(void *arg)
 {
     bool extra = arg != NULL; /* started while every worker waited: leaves when idle and another is free */
@@ -3464,14 +3521,16 @@ static void *worker_main(void *arg)
             work_tail = NULL;
         pthread_mutex_unlock(&work_lock);
         int64_t began = metrics_request_begin();
+        fwd_st.on = false;
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
         metrics_request_end(r->op, began);
         tn_count(auth_tenant(&r->c->auth), tn_group(r->op), 1);
-        if (r->op == TSDB_OP_QUERY_RAW || r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS ||
-            r->op == TSDB_OP_QUERY_BOUNDS || r->op == TSDB_OP_QUERY_LTTB || r->op == TSDB_OP_QUERY_TWA ||
-            r->op == TSDB_OP_QUERY_MULTI) {
+        if (query_op(r->op)) {
             tsdb_query_stats st;
-            tsdb_last_query_stats(&st); /* this worker ran it */
+            if (fwd_st.on)
+                st = fwd_st.st; /* forwarded: the owner ran it, and its reply carried these (LAST_STATS stays here) */
+            else
+                tsdb_last_query_stats(&st); /* this worker ran it */
             uint16_t ts = auth_tenant(&r->c->auth);
             tn_count(ts, TN_ROWS_DECODED, st.rows_decoded);
             tn_count(ts, TN_ROWS_STATS, st.rows_from_stats);
@@ -3487,6 +3546,495 @@ static void *worker_main(void *arg)
         req_free(r);
         notify(c, true);
     }
+}
+
+/* ---------------------------------------------------------- forwarding one hop (S2-2)
+ * The entry node (route_decide's forward branch, fwd_entry): a request for a volume another member leads goes to that
+ * leader in a FORWARD envelope (fwdreq.h) on the FWD link (writes) or the FWDQ link (reads, whose replies stream under
+ * CREDIT), and its worker relays the reply as it is. fwdr_run holds the rules: the age and client checks before the
+ * send, fwd_wait_ms for the send only, a written frame with no reply (link lost, fwd_reply_ms) closes the client's
+ * connection without an answer (D12), never a second send (D30). The worker counts as waiting meanwhile
+ * (worker_waits): forwards to a slow owner do not take every worker. The owner: the forwarding links' dispatcher
+ * queues each request (fwd_on_event) for the reserved workers (--fwd-workers, growing while all of them wait), which
+ * run it through handle() in a pseudo-connection (fd -1, fwdo) under the forwarded user (auth_check_as): every gate
+ * after the login (route_decide, which answers MOVED on an owner and never forwards, the rights, the lease and read
+ * guard, the domains, the replica refusal) is the same code as for a direct request. Its replies go back on the link
+ * (fwdo_put): one REP for a write, chunks of at most FWD_CHUNK_MAX for a read (fwd_chunk waits for credit: a slow
+ * reader stalls only its own query), and the last message ends with the tail (fwdreq.h: the query's statistics, so
+ * LAST_STATS on the entry node needs no forward). */
+static uint32_t fwd_wait_ms = 2000, fwd_max_age_ms = 1000, fwd_reply_ms = 30000;
+static int fwd_base = 4; /* --fwd-workers */
+static atomic_ullong fwd_seq;
+static const char *test_fwd_stall; /* TSDBD_TEST_FWD_STALL: the entry node stalls before each send while it exists */
+
+/* per peer: forwarded frames, bytes, and the hop latency (send to last reply byte) in buckets of 2^(i/4) us */
+#define FWD_HB 96
+#define FWD_STEP 1.189207115002721 /* 2^(1/4) */
+static struct fwd_peer_st {
+    uint32_t peer;
+    uint64_t frames, bytes, hist[FWD_HB];
+} fwd_peers[64];
+static pthread_mutex_t fwd_st_mu = PTHREAD_MUTEX_INITIALIZER; /* a leaf */
+
+static void fwd_peer_note(uint32_t peer, size_t bytes, uint64_t hop_ns)
+{
+    double us = (double)hop_ns / 1000.0, up = FWD_STEP;
+    int b = 0;
+    while (b < FWD_HB - 1 && us >= up)
+        b++, up *= FWD_STEP;
+    pthread_mutex_lock(&fwd_st_mu);
+    for (size_t i = 0; i < sizeof fwd_peers / sizeof fwd_peers[0]; i++)
+        if (fwd_peers[i].peer == peer || fwd_peers[i].peer == 0) {
+            fwd_peers[i].peer = peer;
+            fwd_peers[i].frames++;
+            fwd_peers[i].bytes += bytes;
+            fwd_peers[i].hist[b]++;
+            break;
+        }
+    pthread_mutex_unlock(&fwd_st_mu);
+}
+
+static double fwd_pct(const uint64_t *h, uint64_t total, double q) /* the bucket's upper end, us */
+{
+    uint64_t want = (uint64_t)((double)total * q + 0.5), seen = 0;
+    if (want == 0)
+        want = 1;
+    double up = FWD_STEP;
+    for (int b = 0; b < FWD_HB; b++, up *= FWD_STEP)
+        if ((seen += h[b]) >= want)
+            return up;
+    return 0;
+}
+
+/* STATUS and the metrics: one row per peer forwarded to. Returns how many (at most cap). */
+static size_t fwd_peer_rows(struct fwd_peer_row *out, size_t cap)
+{
+    size_t n = 0;
+    pthread_mutex_lock(&fwd_st_mu);
+    for (size_t i = 0; i < sizeof fwd_peers / sizeof fwd_peers[0] && fwd_peers[i].peer && n < cap; i++) {
+        const struct fwd_peer_st *p = &fwd_peers[i];
+        out[n++] = (struct fwd_peer_row){p->peer, p->frames, p->bytes, fwd_pct(p->hist, p->frames, 0.50),
+                                         fwd_pct(p->hist, p->frames, 0.99)};
+    }
+    pthread_mutex_unlock(&fwd_st_mu);
+    return n;
+}
+
+static size_t fwd_metrics_rows(metrics_fwd_peer *out, size_t cap)
+{
+    struct fwd_peer_row r[64];
+    size_t n = fwd_peer_rows(r, cap < 64 ? cap : 64);
+    for (size_t i = 0; i < n; i++)
+        out[i] = (metrics_fwd_peer){r[i].peer, r[i].frames, r[i].bytes, r[i].p50_us, r[i].p99_us};
+    return n;
+}
+
+static void fwd_close_client(conn *c) /* an outcome nobody knows (D12): the client learns it from the closed connection */
+{
+    atomic_store(&c->closing, true);
+    shutdown(c->fd, SHUT_RDWR);
+}
+
+static void fwd_unav(conn *c, req *r, uint32_t v, uint8_t why, uint32_t ms)
+{
+    rmv.on = true;
+    rmv.u = (tsdb_unavail){.vol = (uint16_t)v, .reason = why, .retry_after_ms = unav_jitter(ms)};
+    reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+    rmv.on = false;
+}
+
+/* the entry node's world for fwdr_run */
+struct fwd_ectx {
+    conn *c;
+    struct fwd *f;
+};
+static int64_t fe_now(void *a) { (void)a; return now_ns(); }
+static void fe_sleep(void *a, int ms)
+{
+    (void)a;
+    struct timespec d = {ms / 1000, (long)(ms % 1000) * 1000000};
+    nanosleep(&d, NULL);
+}
+static void fe_waits(void *a, int delta)
+{
+    (void)a;
+    if (fwdx_mutant != FWM_NOWAIT)
+        worker_waits(delta);
+}
+static void fe_stall(void *a)
+{
+    (void)a;
+    while (test_fwd_stall && access(test_fwd_stall, F_OK) == 0)
+        fe_sleep(NULL, 10);
+}
+static bool fe_gone(void *a)
+{
+    conn *c = ((struct fwd_ectx *)a)->c;
+    if (atomic_load(&c->closing))
+        return true;
+    struct pollfd pf = {.fd = c->fd, .events = POLLRDHUP};
+    return poll(&pf, 1, 0) > 0 && (pf.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL));
+}
+static int fe_send(void *a, uint32_t peer, int kind, const void *p, size_t n, uint64_t id, uint64_t dl)
+{
+    struct fwd_msg m = {.kind = kind, .p = p, .n = n};
+    return fwd_send(((struct fwd_ectx *)a)->f, peer, &m, id, dl);
+}
+static int fe_cancel(void *a, uint32_t peer, uint64_t id) { return fwd_cancel(((struct fwd_ectx *)a)->f, peer, id); }
+static int fe_credit(void *a, uint32_t peer, uint64_t id, uint32_t k)
+{
+    return fwd_credit(((struct fwd_ectx *)a)->f, peer, id, k);
+}
+static bool fe_relay(void *a, const uint8_t *p, size_t n)
+{
+    struct iovec v = {(void *)p, n};
+    return out_put(((struct fwd_ectx *)a)->c, &v, 1);
+}
+
+/* route_decide's forward branch: 1 when the request was answered here (forwarded and relayed, or refused), 0 to answer
+ * it with route_moved (no leader UP that another member is, no forwarding links, a frame above the link's size). */
+static int fwd_entry(req *r, uint32_t v)
+{
+    struct fwd *f = fwd_cluster();
+    uint32_t node = 0;
+    uint64_t epoch = 0;
+    char addr[META_ADDR_MAX];
+    if (!f || !fwd_tab || cluster_vol_owner(v, &node, &epoch, addr, sizeof addr) != 1 || epoch >= META_EPOCH_LIMIT)
+        return 0;
+    conn *c = r->c;
+    size_t n = FWDR_ENV + FWDR_INNER + r->len;
+    if (n > FWD_MSG_MAX)
+        return 0; /* MOVED: the client goes to the leader itself */
+    uint8_t *m = malloc(n);
+    if (!m) {
+        reply_error(c, r->id, r->op, TSDB_ERR_NOMEM);
+        return 1;
+    }
+    const struct cluster_copy *cp = route_copy();
+    uint32_t uid = auth_uid(&c->auth);
+    struct fwdr_env e = {.epoch = (uint32_t)epoch, .hops = 1, .flags = uid ? FWDR_F_USER : 0,
+                         .origin = cp ? cp->self : 0, .uid = uid, .proto = atomic_load(&c->proto),
+                         .vol = (uint16_t)v, .users_applied = auth_users_applied(), .id = r->id, .op = r->op};
+    fwdr_env_encode(m, &e);
+    if (r->len)
+        memcpy(m + FWDR_ENV + FWDR_INNER, r->payload, r->len);
+    bool rd = !(auth_ops[r->op].need & R_WRITE);
+    struct fwdr_req q = {.peer = node, .kind = rd ? PL_KIND_FWDQ : PL_KIND_FWD, .msg = m, .n = n,
+                         .frame_id = atomic_fetch_add(&fwd_seq, 1) + 1, .arrival_ns = r->t_arr,
+                         .max_age_ms = fwd_max_age_ms, .wait_ms = fwd_wait_ms, .reply_ms = fwd_reply_ms,
+                         .mut_noage = fwdx_mutant == FWM_OLDFRAME, .mut_retry = fwdx_mutant == FWM_RETRY,
+                         .mut_unavonbreak = fwdx_mutant == FWM_UNAVONBREAK};
+    struct fwd_ectx x = {c, f};
+    struct fwdr_ops o = {.arg = &x, .now_ns = fe_now, .sleep_ms = fe_sleep, .waits = fe_waits,
+                         .stall = test_fwd_stall ? fe_stall : NULL, .client_gone = fe_gone, .send = fe_send,
+                         .cancel = fe_cancel, .credit = fe_credit, .relay = fe_relay};
+    struct fwdr_tail tl;
+    uint64_t hop = 0;
+    int res = fwdr_run(&o, fwd_tab, &q, &tl, &hop);
+    free(m);
+    switch (res) {
+    case FWDR_DONE:
+        fwd_peer_note(node, n, hop);
+        if (tl.flags & FWDR_T_STATS) {
+            fwd_st.on = true;
+            fwd_st.st = tl.st;
+        }
+        if (tl.flags & FWDR_T_CLOSE)
+            fwd_close_client(c);
+        break;
+    case FWDR_TOOBIG:
+        return 0;
+    case FWDR_OLD: /* never sent: not applied (definite); the client retries */
+        fwd_unav(c, r, v, TSDB_WHY_UNREACHABLE, 200);
+        break;
+    case FWDR_UNREACH: /* no byte reached the owner: definite */
+        fwd_unav(c, r, v, TSDB_WHY_UNREACHABLE, 1000);
+        break;
+    case FWDR_GONE: /* nobody to answer */
+        break;
+    default: /* FWDR_INDET */
+        fwd_close_client(c);
+    }
+    return 1;
+}
+
+/* ---- the owner */
+struct fwdo {
+    struct fwd *f;
+    struct fwd_from from;
+    uint64_t frame_id;
+    int kind;
+};
+
+static int fwdo_chunk(struct fwdo *o, const uint8_t *p, size_t n, int last);
+
+/* out_put of a pseudo-connection: a write's reply is kept for one REP (fwdo_finish); a read's goes in chunks as it
+ * grows past one, each under the entry node's credit. */
+static bool fwdo_put(conn *c, const struct iovec *iov, int n)
+{
+    struct fwdo *o = c->fwdo;
+    size_t room = (o->kind == PL_KIND_FWDQ ? FWD_CHUNK_MAX : FWD_MSG_MAX) - FWDR_TAIL;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *p = iov[i].iov_base;
+        size_t left = iov[i].iov_len;
+        while (left) {
+            if (atomic_load(&c->closing))
+                return false;
+            size_t take = room + 1 - (c->out.len < room + 1 ? c->out.len : room + 1);
+            if (take > left)
+                take = left;
+            if (buf_reserve(&c->out, take) != 0) {
+                atomic_store(&c->closing, true);
+                return false;
+            }
+            memcpy(c->out.p + c->out.len, p, take);
+            c->out.len += take;
+            p += take;
+            left -= take;
+            if (c->out.len <= room)
+                continue;
+            if (o->kind != PL_KIND_FWDQ) { /* a write's reply above a frame: never (they are a few bytes) */
+                atomic_store(&c->closing, true);
+                return false;
+            }
+            if (fwdo_chunk(o, c->out.p, room, 0) != FWD_OK) {
+                atomic_store(&c->closing, true);
+                return false;
+            }
+            memmove(c->out.p, c->out.p + room, c->out.len - room);
+            c->out.len -= room;
+        }
+    }
+    return true;
+}
+
+static atomic_bool fwd_stop;
+
+static int fwdo_chunk(struct fwdo *o, const uint8_t *p, size_t n, int last)
+{
+    int64_t until = mono_ms() + 2LL * send_timeout_s * 1000; /* a backstop: a dead entry node ends the link first */
+    int rc;
+    worker_waits(1);
+    do
+        rc = fwd_chunk(o->f, &o->from, o->frame_id, p, n, last, 1000);
+    while ((rc == FWD_E_TIMEOUT || rc == FWD_E_FULL) && !atomic_load(&fwd_stop) && mono_ms() < until);
+    worker_waits(-1);
+    return rc;
+}
+
+static void fwdo_finish(conn *c, struct fwdr_tail *tl)
+{
+    struct fwdo *o = c->fwdo;
+    if (atomic_load(&c->closing)) {
+        c->out.len = 0; /* what went wrong is told by closing the client's connection: the outcome is unknown */
+        tl->flags = FWDR_T_CLOSE;
+    }
+    uint8_t t[FWDR_TAIL];
+    fwdr_tail_encode(t, tl);
+    if (buf_reserve(&c->out, FWDR_TAIL) != 0) {
+        c->out.len = 0;
+        tl->flags = FWDR_T_CLOSE;
+        fwdr_tail_encode(t, tl);
+        if (o->kind == PL_KIND_FWDQ)
+            fwdo_chunk(o, t, FWDR_TAIL, 1);
+        else
+            fwd_reply(o->f, &o->from, o->frame_id, t, FWDR_TAIL);
+        return;
+    }
+    memcpy(c->out.p + c->out.len, t, FWDR_TAIL);
+    c->out.len += FWDR_TAIL;
+    if (o->kind == PL_KIND_FWDQ)
+        fwdo_chunk(o, c->out.p, c->out.len, 1);
+    else
+        fwd_reply(o->f, &o->from, o->frame_id, c->out.p, c->out.len);
+}
+
+struct fjob {
+    struct fjob *next;
+    struct fwd_from from;
+    uint64_t frame_id;
+    int kind;
+    int64_t t_in; /* when the dispatcher queued it (ns) */
+    size_t n;
+    uint8_t p[];
+};
+static pthread_mutex_t fwd_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fwd_cv = PTHREAD_COND_INITIALIZER, fwd_gone_cv = PTHREAD_COND_INITIALIZER;
+static struct fjob *fq_head, *fq_tail;
+static int fwd_running, fwd_waiting;
+static void *fwd_worker_main(void *arg);
+
+static void fwd_spawn(bool extra) /* fwd_lock held */
+{
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+#ifdef __APPLE__
+    pthread_attr_setstacksize(&at, TSDB_THREAD_STACK);
+#endif
+    pthread_t t;
+    if (pthread_create(&t, &at, fwd_worker_main, extra ? (void *)1 : NULL) == 0)
+        fwd_running++;
+    pthread_attr_destroy(&at);
+}
+
+static void fwd_pool_waits(int delta)
+{
+    pthread_mutex_lock(&fwd_lock);
+    fwd_waiting += delta;
+    if (delta < 0)
+        pthread_cond_broadcast(&fwd_cv);
+    if (delta > 0 && fwd_running == fwd_waiting && fwd_running < fwd_base + MAX_EXTRA_WORKERS &&
+        !atomic_load(&fwd_stop))
+        fwd_spawn(true);
+    pthread_mutex_unlock(&fwd_lock);
+}
+
+/* The forwarding links' events (their dispatcher thread: never blocks). */
+static void fwd_on_event(void *arg, const struct fwd_ev *ev)
+{
+    if (ev->type == FWD_EV_LINK) {
+        fwd_cluster_log_event(arg, ev);
+        return;
+    }
+    if (ev->type != FWD_EV_REQUEST) {
+        fwdr_on_event(fwd_tab, ev);
+        return;
+    }
+    struct fjob *j = malloc(sizeof *j + ev->n);
+    if (!j) { /* no reply: the entry node closes its client's connection when the link times the frame out */
+        fprintf(stderr, "tsdbd: fwd: a forwarded request dropped (out of memory)\n");
+        return;
+    }
+    *j = (struct fjob){.from = ev->from, .frame_id = ev->frame_id, .kind = ev->kind, .t_in = now_ns(), .n = ev->n};
+    memcpy(j->p, ev->p, ev->n);
+    pthread_mutex_lock(&fwd_lock);
+    if (fq_tail)
+        fq_tail->next = j;
+    else
+        fq_head = j;
+    fq_tail = j;
+    pthread_cond_signal(&fwd_cv);
+    pthread_mutex_unlock(&fwd_lock);
+}
+
+/* One forwarded request on its owner. */
+static void fwd_serve(struct fjob *j)
+{
+    conn pc;
+    memset(&pc, 0, sizeof pc);
+    pc.fd = -1;
+    pthread_mutex_init(&pc.lock, NULL);
+    conn_cv_init(&pc.cv);
+    auth_conn_init(&pc.auth);
+    struct fwdo o = {.f = fwd_cluster(), .from = j->from, .frame_id = j->frame_id, .kind = j->kind};
+    pc.fwdo = &o;
+    struct fwdr_tail tl = {0};
+    struct fwdr_env e;
+    req r = {.c = &pc, .t_arr = j->t_in};
+    if (fwdr_env_decode(j->p, j->n, &e) != 0) {
+        atomic_store(&pc.closing, true); /* not ours to read: the entry node closes its client's connection */
+        goto done;
+    }
+    atomic_store(&pc.proto, e.proto);
+    atomic_store(&pc.authed, true);
+    r.id = e.id, r.op = e.op, r.len = e.len;
+    if (!(r.payload = malloc(e.len ? e.len : 1))) {
+        atomic_store(&pc.closing, true);
+        goto done;
+    }
+    if (e.len)
+        memcpy(r.payload, e.payload, e.len);
+    unav_vol = e.vol;
+    uint64_t waited_ms = (uint64_t)(now_ns() - j->t_in) / 1000000;
+    lguard.on = false;
+    rmv.on = false;
+    if (e.hops != 1) {
+        reply_error(&pc, r.id, r.op, TSDB_ERR_INVALID);
+    } else if (fwdx_mutant != FWM_OLDFRAME && (uint64_t)e.age_ms + waited_ms > fwd_max_age_ms) {
+        fwd_unav(&pc, &r, e.vol, TSDB_WHY_UNREACHABLE, 200); /* too old to apply: its client may have resent it */
+    } else if (auth_enabled() && fwdx_mutant != FWM_NOUSER && !(e.flags & FWDR_F_USER)) {
+        reply_error(&pc, r.id, r.op, TSDB_ERR_DENIED);
+    } else if (auth_enabled() && fwdx_mutant != FWM_NOUSER && fwdx_mutant != FWM_AUTHLAG &&
+               cluster_users_through() < e.users_applied) {
+        fwd_unav(&pc, &r, e.vol, TSDB_WHY_RELOADING, 200); /* this server's users are behind the entry node's */
+    } else if (auth_enabled() && fwdx_mutant != FWM_NOUSER && auth_check_as(&pc.auth, e.uid) != 0) {
+        reply_error(&pc, r.id, r.op, fwdx_mutant == FWM_AUTHLAG ? TSDB_ERR_AUTH : TSDB_ERR_DENIED);
+    } else {
+        uint16_t v = req_volume(r.op, r.payload, r.len);
+        uint64_t le = 0;
+        if (v != TSDB_VOL_ANY && cvol_lead(v, &le) && le && e.epoch && le != e.epoch) {
+            route_moved(&pc, &r, v); /* led here at another epoch: the client resends, and the entry node routes again */
+        } else {
+            if (!auth_enabled() || fwdx_mutant == FWM_NOUSER)
+                pc.auth.state = AS_IN; /* --no-auth: nothing is checked (a->au NULL) */
+            handle(&r);
+            if (query_op(r.op)) {
+                tsdb_last_query_stats(&tl.st); /* this worker ran it */
+                tl.flags |= FWDR_T_STATS;
+            }
+        }
+    }
+done:
+    if (o.f)
+        fwdo_finish(&pc, &tl);
+    free(r.payload);
+    auth_conn_free(&pc.auth);
+    free(pc.out.p);
+    pthread_cond_destroy(&pc.cv);
+    pthread_mutex_destroy(&pc.lock);
+}
+
+static void *fwd_worker_main(void *arg)
+{
+    bool extra = arg != NULL;
+    fwd_owner = true;
+    tn_worker = true;
+    for (;;) {
+        pthread_mutex_lock(&fwd_lock);
+        while (!fq_head && !atomic_load(&fwd_stop) && (!extra || fwd_running - fwd_waiting <= 1))
+            pthread_cond_wait(&fwd_cv, &fwd_lock);
+        if (!fq_head || atomic_load(&fwd_stop)) {
+            if (--fwd_running == 0)
+                pthread_cond_broadcast(&fwd_gone_cv);
+            pthread_mutex_unlock(&fwd_lock);
+            route_release();
+            return NULL;
+        }
+        struct fjob *j = fq_head;
+        if (!(fq_head = j->next))
+            fq_tail = NULL;
+        pthread_mutex_unlock(&fwd_lock);
+        fwd_serve(j);
+        free(j);
+    }
+}
+
+static int fwd_start(void)
+{
+    if (!(fwd_tab = fwdr_tab_new()))
+        return -1;
+    pthread_mutex_lock(&fwd_lock);
+    for (int i = 0; i < fwd_base; i++)
+        fwd_spawn(false);
+    pthread_mutex_unlock(&fwd_lock);
+    return 0;
+}
+
+/* Before fwd_cluster_free: no reserved worker runs any more (one in a chunk's credit wait leaves within 1 s). */
+static void fwd_join(void)
+{
+    pthread_mutex_lock(&fwd_lock);
+    atomic_store(&fwd_stop, true);
+    pthread_cond_broadcast(&fwd_cv);
+    while (fwd_running > 0)
+        pthread_cond_wait(&fwd_gone_cv, &fwd_lock);
+    for (struct fjob *j = fq_head, *n; j; j = n) {
+        n = j->next;
+        free(j);
+    }
+    fq_head = fq_tail = NULL;
+    pthread_mutex_unlock(&fwd_lock);
 }
 
 /* ---------------------------------------------------------- event loop */
@@ -3991,6 +4539,7 @@ static int parse(conn *c)
         if (!r)
             return -1;
         r->c = c;
+        r->t_arr = now_ns();
         memcpy(&r->id, c->in.p + off + 4, 4);
         r->op = c->in.p[off + 8];
         r->len = flen - 5;
@@ -4765,6 +5314,10 @@ int main(int argc, char **argv)
                                    {"peer-listen", required_argument, 0, 'Y'},
                                    {"advertise", required_argument, 0, 'a'},
                                    {"peer-advertise", required_argument, 0, 0x10e},
+                                   {"fwd-wait-ms", required_argument, 0, 0x110},
+                                   {"fwd-max-age-ms", required_argument, 0, 0x111},
+                                   {"fwd-reply-ms", required_argument, 0, 0x112},
+                                   {"fwd-workers", required_argument, 0, 0x113},
                                    {"rack", required_argument, 0, 'k'},
                                    {"cluster-secret-file", required_argument, 0, 'S'},
                                    {"state-dir", required_argument, 0, 0x102},
@@ -4932,6 +5485,10 @@ int main(int argc, char **argv)
         case 'Y': peer_addr = optarg; cluster_opts = 1; break;
         case 'a': advertise = optarg; cluster_opts = 1; break;
         case 0x10e: peer_advertise = optarg; cluster_opts = 1; break;
+        case 0x110: fwd_wait_ms = (uint32_t)num_arg("fwd-wait-ms", optarg, 1, 3600000); cluster_opts = 1; break;
+        case 0x111: fwd_max_age_ms = (uint32_t)num_arg("fwd-max-age-ms", optarg, 1, 3600000); cluster_opts = 1; break;
+        case 0x112: fwd_reply_ms = (uint32_t)num_arg("fwd-reply-ms", optarg, 0, 86400000); cluster_opts = 1; break;
+        case 0x113: fwd_base = (int)num_arg("fwd-workers", optarg, 1, 4096); cluster_opts = 1; break;
         case 'k': rack = optarg; cluster_opts = 1; break;
         case 'S': secret_file = optarg; cluster_opts = 1; break;
         case 0x102: state_dir = optarg; cluster_opts = 1; break;
@@ -5180,6 +5737,20 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "tsdbd: TSDB_ROUTE_MUTANT=%s\n", names[route_mutant]);
     }
+    if (getenv("TSDBD_FWD_MUTANT") && *getenv("TSDBD_FWD_MUTANT")) {
+        static const char *const names[] = {"",        "fwdtwice", "fwdoldframe", "fwdunavonbreak", "fwdnouser",
+                                            "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag"};
+        for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
+            if (strcmp(getenv("TSDBD_FWD_MUTANT"), names[i]) == 0)
+                fwdx_mutant = i;
+        if (!fwdx_mutant) {
+            fprintf(stderr, "tsdbd: TSDBD_FWD_MUTANT=%s: no such mutant\n", getenv("TSDBD_FWD_MUTANT"));
+            return 2;
+        }
+        fprintf(stderr, "tsdbd: TSDBD_FWD_MUTANT=%s\n", names[fwdx_mutant]);
+    }
+    test_fwd_stall = getenv("TSDBD_TEST_FWD_STALL") && *getenv("TSDBD_TEST_FWD_STALL") ? getenv("TSDBD_TEST_FWD_STALL")
+                                                                                          : NULL;
     /* also as TSDB_REPLD_MUTANT names, so that tests/repld_mutants.sh plants them like the driver's */
     const char *rmu = getenv("TSDB_REPLD_MUTANT");
     test_no_moved = getenv("TSDBD_TEST_NO_MOVED") != NULL || (rmu && !strcmp(rmu, "nomoved"));
@@ -5280,7 +5851,7 @@ int main(int argc, char **argv)
                           .max_conns = max_conns,
                           .workers = workers_now,
                           .request_memory = request_memory_now,
-                          .request_memory_limit = req_budget};
+                          .request_memory_limit = req_budget, .fwd_peers = cluster_on ? fwd_metrics_rows : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));
@@ -5315,7 +5886,8 @@ int main(int argc, char **argv)
         struct cluster_cfg cc = {.state_dir = state_dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
                                  .rack = rack, .power_feed = power_feed, .bmc = bmc, .read_barrier_off = rb_off,
                                  .secret = secret, .secret_len = secret_len, .loop_gated = 1};
-        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0 || fwd_cluster_start(NULL, NULL) != 0)
+        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0 || fwd_start() != 0 ||
+            fwd_cluster_start(fwd_on_event, NULL) != 0)
             return 1;
         crash_point(CP_CLUSTER_STARTED); /* the harness restarts the node and counts the hit (tests/jepsen) */
         tsdb_wipe(secret, sizeof secret);
@@ -5370,8 +5942,12 @@ int main(int argc, char **argv)
     while (running_workers > 0)
         pthread_cond_wait(&workers_gone_cv, &work_lock);
     pthread_mutex_unlock(&work_lock);
-    if (cluster_on)
+    if (cluster_on) {
+        fwd_join(); /* the reserved workers of forwarded requests */
         fwd_cluster_free(); /* no worker can call into the forwarding links any more */
+        fwdr_tab_free(fwd_tab);
+        fwd_tab = NULL;
+    }
 #ifndef TSDBD_NO_URING
     if (io == IO_URING)
         io_uring_queue_exit(&ring);
