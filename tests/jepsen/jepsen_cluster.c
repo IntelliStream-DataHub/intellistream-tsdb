@@ -138,6 +138,7 @@ static int want_meta = 1, want_kv = 1;
 static int want_rep, want_classes; /* workloads kv and classes: one volume of 3 replicas, written through its leader */
 static int want_auth, want_users; /* --auth: every tsdbd requires a login (a superuser from the init); workload users */
 static void ju_fault(int i);      /* cluster_users.h: the nemeses tell the users workload which members may lag */
+static void ju_cut_done(const uint8_t in[MAXN][MAXN], int n); /* the members the cuts leave in step stop being exempt */
 static void ju_settled(void);
 static struct meta_settings S;
 
@@ -535,7 +536,7 @@ static void net_heal(void)
 /* cuts from -> to (and back when both); `planted` is --mutant noop-partition: nothing is applied, the check stays */
 static void net_cut(int from, int to, int both)
 {
-    ju_fault(-1); /* a member behind a cut keeps the users it has (design-auth.md 12) */
+    ju_fault(-1); /* a member behind a cut keeps the users it has (design-auth.md 12); net_cut_done frees those the cuts miss */
     intended[from][to] = 1;
     if (both)
         intended[to][from] = 1;
@@ -553,6 +554,7 @@ static void net_cut_done(void)
 {
     cut_active = 1;
     partitions_applied++;
+    ju_cut_done(intended, nn);
     usleep(200 * 1000);
     for (int f = 0; f < nn; f++)
         for (int t = 0; t < nn; t++)
@@ -2793,7 +2795,7 @@ static int cluster_form(void)
      * r3e-fix15: 10 s in 2 of 13, a learner killed again and again while it caught up). */
     if (want_classes)
         S.repl_retain_s = CLASSES_RETAIN_S;
-    uint8_t req[64];
+    uint8_t req[4 * (META_SETTINGS_WORDS + 1)]; /* 64 overflowed since the settings grew past 15 words (ASan) */
     size_t rl = cluster_settings_encode(&S, META_MODE_REPLICATED, req);
     int rc = admin_real(0, CLUSTER_OP_INIT, req, rl, 0, 10000);
     if (rc != 0)

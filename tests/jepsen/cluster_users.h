@@ -144,6 +144,47 @@ static void jm_settled(struct jmodel *m, int64_t now)
             m->d[j][k - 1].until = now;
     pthread_mutex_unlock(&m->mu);
 }
+/* members in `clean` (a bit mask) were marked by a fault that, once its cuts are set, turns out not to touch them: their
+ * open intervals end at `now` (what stays is the moment between the mark and the cuts being set) */
+static void jm_relax(struct jmodel *m, uint32_t clean, int64_t now)
+{
+    pthread_mutex_lock(&m->mu);
+    for (int j = 0; j < MAXN; j++)
+        if (clean >> j & 1)
+            for (uint32_t k = m->nd[j]; k > 0 && m->d[j][k - 1].until == INT64_MAX; k--)
+                m->d[j][k - 1].until = now;
+    pthread_mutex_unlock(&m->mu);
+}
+/* The members a set of cuts leaves in step with the group: those in every largest set of members that reach each other
+ * both ways and hold a majority (a member cut from its leader, or from a majority, lags: it keeps the users it has).
+ * With no cut the mask is empty (a delay, say, lags everybody). */
+static uint32_t jm_clean_set(const uint8_t in[MAXN][MAXN], int n)
+{
+    int maj = n / 2 + 1, best = 0, any = 0;
+    uint32_t inter = 0;
+    for (int a = 0; a < n; a++)
+        for (int b = 0; b < n; b++)
+            if (a != b && in[a][b])
+                any = 1;
+    if (!any)
+        return 0;
+    for (uint32_t mask = 1; mask < (1u << n); mask++) {
+        int cnt = __builtin_popcount(mask), ok = cnt >= maj;
+        for (int a = 0; ok && a < n; a++)
+            for (int b = a + 1; ok && b < n; b++)
+                if ((mask >> a & 1) && (mask >> b & 1) && (in[a][b] || in[b][a]))
+                    ok = 0;
+        if (!ok || cnt < best)
+            continue;
+        if (cnt > best) {
+            best = cnt;
+            inter = mask;
+        } else {
+            inter &= mask;
+        }
+    }
+    return inter;
+}
 static void jm_open(struct jmodel *m, int x, int64_t s, int64_t te)
 {
     pthread_mutex_lock(&m->mu);
@@ -221,7 +262,8 @@ static int jm_eval_login(struct jmodel *m, int x, int64_t s, int u, uint32_t a, 
                    x, u, A, tb, te, rc, dead);
             v = 1;
         }
-        if (m->seen[x][u] > A->pos + 1 && m->seen_te[x][u] < tb) {
+        /* not across a fault of the member: a restarted one in the minority may hear a leader behind the newer change */
+        if (m->seen[x][u] > A->pos + 1 && m->seen_te[x][u] < tb && !jm_dirty(m, x, m->seen_te[x][u], te)) {
             jm_say(m, "an older password logs in after a newer one did on the member", x, u, A, tb, te, rc, NULL);
             v = 1;
         }
@@ -308,7 +350,7 @@ static _Atomic int ju_run, ju_admin_run;
 static _Atomic int ju_hot_user = -1;
 static _Atomic int64_t ju_hot_until;
 static pthread_t ju_admin_th, ju_probe_th[MAXN];
-static _Atomic uint64_t ju_ops[5][4], ju_login[6], ju_req[3]; /* ju_login: ok, AUTH, UNAVAILABLE, IO, other, skipped */
+static _Atomic uint64_t ju_ops[5][4], ju_login[6], ju_req[3], ju_noop; /* ju_login: ok, AUTH, UNAVAILABLE, IO, other, skipped */
 
 static uint64_t ju_rng(uint64_t *s)
 {
@@ -424,6 +466,24 @@ static void ju_diag(int x, int u, uint32_t a)
     }
 }
 
+/* does the member's copy hold the read grant of user `name` on prefix `sel`? 1, 0, or -1 (the list failed) */
+static int ju_holds(tsdbc *c, const char *name, const char *sel)
+{
+    tsdbc_user *ul = NULL;
+    size_t nu = 0;
+    if (tsdbc_user_list(c, &ul, &nu) != 0)
+        return -1;
+    int held = 0;
+    for (size_t k = 0; k < nu; k++)
+        if (!strcmp(ul[k].name, name))
+            for (uint32_t g = 0; g < ul[k].ngrants; g++)
+                if (ul[k].grants[g].kind == TSDB_SEL_PREFIX && !strcmp(ul[k].grants[g].selector, sel) &&
+                    (ul[k].grants[g].rights & TSDB_RIGHT_READ))
+                    held = 1;
+    tsdbc_users_free(ul, nu);
+    return held;
+}
+
 static void *ju_admin(void *arg)
 {
     (void)arg;
@@ -447,22 +507,11 @@ static void *ju_admin(void *arg)
         snprintf(sel, sizeof sel, "jp%d.", u);
         /* A grant the member's copy holds already changes nothing: the server answers OK from that copy at once, with no
          * proposal and so no wait for the members (auth.c admin_group: pr.op == 0), and a member that has not applied
-         * the entry which made the grant (an indeterminate one, say) may lag. Such an answer binds nobody: the model
-         * records it as refused. */
-        int noop = 0;
-        if (kind == JK_GRANT) {
-            tsdbc_user *ul = NULL;
-            size_t nu = 0;
-            if (tsdbc_user_list(c, &ul, &nu) == 0) {
-                for (size_t k = 0; k < nu; k++)
-                    if (!strcmp(ul[k].name, name))
-                        for (uint32_t g = 0; g < ul[k].ngrants; g++)
-                            if (ul[k].grants[g].kind == TSDB_SEL_PREFIX && !strcmp(ul[k].grants[g].selector, sel) &&
-                                (ul[k].grants[g].rights & TSDB_RIGHT_READ))
-                                noop = 1;
-                tsdbc_users_free(ul, nu);
-            }
-        }
+         * the entry which made the grant (an indeterminate one, say) may lag. A server bug against A32 (docs/tasks/
+         * users-stale-answers.md), not yet fixed: until it is, such an answer binds nobody and the model records it as
+         * refused (counted as `noop`). The copy may move between the list and the grant, so the grant counts as a no-op
+         * only if the copy still holds it after the answer; one that does not is indeterminate (it may have been real). */
+        int held_before = kind == JK_GRANT ? ju_holds(c, name, sel) : 0;
         uint32_t id = jm_add(&jm, kind, u, now_ns());
         int rc;
         ju_pw(pw, sizeof pw, u, id - 1);
@@ -478,7 +527,17 @@ static void *ju_admin(void *arg)
                  : rc == TSDB_ERR_INVALID || rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_DENIED || rc == TSDB_ERR_UNAVAILABLE
                      ? JS_FAIL
                      : JS_INDET;
-        jm_end(&jm, id, rc == 0 && noop ? JS_FAIL : st, te);
+        int noop = rc == 0 && held_before == 1;
+        if (noop) {
+            int after = ju_holds(c, name, sel);
+            if (after == 1)
+                atomic_fetch_add(&ju_noop, 1);
+            else {
+                noop = 0;
+                st = JS_INDET;
+            }
+        }
+        jm_end(&jm, id, noop ? JS_FAIL : st, te);
         if (st != JS_FAIL) { /* applied, or maybe (assumed applied: the next answer corrects it) */
             if (kind == JK_ADD)
                 bel_exists[u] = 1, bel_granted[u] = 0;
@@ -669,6 +728,12 @@ static void ju_fault(int i)
     if (want_users)
         jm_fault(&jm, i, now_ns());
 }
+/* the cuts of a partition are set: the members that stay in step with the group are no longer exempt */
+static void ju_cut_done(const uint8_t in[MAXN][MAXN], int n)
+{
+    if (want_users)
+        jm_relax(&jm, jm_clean_set(in, n), now_ns());
+}
 static void ju_settled(void)
 {
     if (want_users)
@@ -697,6 +762,8 @@ static int ju_report(void)
     printf("users: checked %" PRIu64 " logins that must fail and %" PRIu64 " that must succeed, %" PRIu64
            " requests that must be denied and %" PRIu64 " that must pass; %" PRIu64 " violation(s)\n", jm.ck_dead,
            jm.ck_live, jm.ck_deny, jm.ck_allow, jm.viol);
+    printf("users: %" PRIu64 " grants answered OK from a copy that held them already (unbound: docs/tasks/users-stale-answers.md)\n",
+           (uint64_t)atomic_load(&ju_noop));
     int rc = 0;
     if (jm.viol) {
         fprintf(stderr, "jepsen-cluster: FAIL: users: %" PRIu64 " violation(s): a change acknowledged did not hold\n",
@@ -769,7 +836,7 @@ static int ju_selftest(void)
     jt_open(&m, 3, 5.5, 6);
     CASE("a member restarted after the passwd takes the replaced password", 1,
          jm_eval_login(&m, 3, SEC(5.5), 0, add, SEC(9), SEC(9.01), 0));
-    /* the same member behind a partition (every member dirty from 4 to 30 s) keeps what it had */
+    /* member 4 behind a partition (dirty from 4 to 30 s) keeps what it had */
     jm_fault(&m, 4, SEC(4));
     jm_settled(&m, SEC(30));
     jt_open(&m, 4, 5.5, 6);
@@ -795,6 +862,43 @@ static int ju_selftest(void)
          jm_eval_req(&m, 0, SEC(-100), 0, pw2, SEC(15), SEC(15.01), TSDB_ERR_AUTH));
     CASE("a session of the new user is denied while its grant stands", 1,
          jm_eval_req(&m, 0, SEC(-100), 0, add2, SEC(15), SEC(15.01), TSDB_ERR_DENIED));
+    /* check 5 and a fault: the member took the newer password at 20 s; a fault of it ended at 26 s, the older one logs in
+     * at 40 s (a minority restart may hear a leader behind the newer change): no violation. Member 6 binds nothing. */
+    jm_fault(&m, 6, SEC(22));
+    jm_settled(&m, SEC(26));
+    CASE("a newer password was seen on member 6", 0, jm_eval_login(&m, 6, SEC(-100), 0, pw2, SEC(20), SEC(20.01), 0));
+    CASE("an older password after a fault of the member is not an older copy served again", 0,
+         jm_eval_login(&m, 6, SEC(-100), 0, add, SEC(40), SEC(40.01), 0));
+    /* which members stay in step under a set of cuts (jm_clean_set); n = 5 */
+    struct {
+        const char *what;
+        int cuts[6][2];
+        int ncuts, one_way;
+        uint32_t want;
+    } cs[] = {
+        {"a leader cut from every other member: it alone lags", {{0, 1}, {0, 2}, {0, 3}, {0, 4}}, 4, 0, 0x1e},
+        {"two members cut from the other three: the three stay", {{0, 2}, {0, 3}, {0, 4}, {1, 2}, {1, 3}, {1, 4}}, 6, 0, 0x1c},
+        {"one member cut from the leader only: both lag", {{0, 1}}, 1, 0, 0x1c},
+        {"a bridge (1 and 2 | 0 | 3 and 4): only the bridge", {{1, 3}, {1, 4}, {2, 3}, {2, 4}}, 4, 0, 0x01},
+        {"one direction only: both ends lag", {{0, 1}}, 1, 1, 0x1c},
+        {"no cut (delays): nobody is exempted from the mark", {{0, 0}}, 0, 0, 0},
+    };
+    for (size_t k = 0; k < sizeof cs / sizeof *cs; k++) {
+        uint8_t in[MAXN][MAXN];
+        memset(in, 0, sizeof in);
+        for (int c = 0; c < cs[k].ncuts; c++) {
+            in[cs[k].cuts[c][0]][cs[k].cuts[c][1]] = 1;
+            if (!cs[k].one_way)
+                in[cs[k].cuts[c][1]][cs[k].cuts[c][0]] = 1;
+        }
+        uint32_t got = jm_clean_set(in, 5);
+        int ok = got == cs[k].want;
+        printf("selftest-checker: users: %-70s %s\n", cs[k].what, ok ? "ok" : "WRONG");
+        if (!ok) {
+            fprintf(stderr, "selftest-checker: users: clean set %#x, wanted %#x\n", got, cs[k].want);
+            bad++;
+        }
+    }
     for (int k = 0; k < n; k++) {
         int ok = t[k].got == t[k].expect;
         printf("selftest-checker: users: %-70s %s\n", t[k].what, ok ? "ok" : t[k].expect ? "NOT FOUND" : "FALSE ALARM");

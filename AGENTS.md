@@ -23,7 +23,8 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # (crash points: server/crashpt.h, TSDB_CRASH_AT=name[:n] -> _exit(99)) and power (crashfs), workloads meta
                           # and kv-local (a cluster volume of 1 replica per node), and users (every tsdbd requires a login, an admin thread
                           # changes users, passwords and grants, every node is probed with logins and reads: an acknowledged change must hold
-                          # on every member; tests/jepsen/cluster_users.h; --auth runs the other workloads with a login too);
+                          # on every member; tests/jepsen/cluster_users.h, what it does not cover: docs/tasks/users-stale-answers.md; --auth runs the other
+                          # workloads with a login too);
                           # JEPSEN_SECONDS, JEPSEN_NEMESES, JEPSEN_SEED,
                           # JEPSEN_NODES, both IO backends; tests/jepsen/jepsen_cluster.c; make jepsen-cluster-selftest plants what it must catch (not part of jepsen-cluster)
                           # (kv/classes: the nemeses aim at kvr's leader too, the clients roam and follow MOVED to it; JEPSEN_TERMINAL=name
