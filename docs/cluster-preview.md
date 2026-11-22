@@ -29,8 +29,9 @@ What the preview does **not** do yet. Please do not skip this list:
   down) and that is all.
 - **It does not move volumes.**
 - **Clients name the volume.** The client port and the protocol are as without `--cluster`, but a series is made in
-  a cluster volume, named like any volume (`tsdbc_series_at` with the volume's name), and a client talks to the
-  volume's leader. Logins use the cluster's users, the same on every server ([Logins](#logins)).
+  a cluster volume, named like any volume (`tsdbc_series_at` with the volume's name). A request may go to any
+  server ([Writes through any server](#writes-through-any-server)). Logins use the cluster's users, the same on
+  every server ([Logins](#logins)).
 - **It is not for production.** The format of the metadata and the peer protocol may change in a later 0.x
   release. A build of the preview does not talk to a build from before such a change: you start the cluster again
   with `tsdb cluster init`, you do not upgrade it.
@@ -338,6 +339,32 @@ Things to know:
 - **A server taken out of the cluster** keeps a `CLUSTER_USERS` file in its directory, and `tsdb DIR user ...` goes
   on refusing there until you remove that file by hand.
 
+## Writes through any server
+
+A client does not need to know which server leads a volume. A server that does not lead the volume a request names
+passes the request on, one hop, to the volume's leader and relays the answer, so a client with a list of servers
+works against any of them (`--forward on`, the default of a `--cluster` server; `--forward off` makes it answer
+`MOVED` instead, naming the leader). The rules are short:
+
+- **The user is the same.** The leader checks the grants of the user who logged in at the entry server, as for a
+  request sent to it directly.
+- **A request is never sent twice.** If the entry server could not write the request to the leader within 2 seconds,
+  or it was older than 1 second when its turn came, the answer is `UNAVAILABLE` and nothing was done: send it again.
+  If it was written and the link then broke, the entry server closes your connection without an answer: the outcome is
+  unknown, as for any broken connection, and your program looks before it sends the write again.
+- **`MOVED` carries an address.** When a server answers `MOVED` (forwarding off, or the leader changed while the
+  request was on its way), the address in it is the one the cluster's metadata names for the leader. A server that
+  restarted on another address is named at the old one until the group has recorded the new one; a client that
+  follows `MOVED` in that time connects to nobody or to whatever holds the address now, and the preview's clients check
+  no identity after they connect. Keep addresses stable in the preview.
+- **Reads on a server that does not lead** are forwarded too, and so are as current as the leader's: replicas do not
+  answer reads (`TSDB_REPLICA_READS=1` is a test switch, and its answers may be stale).
+
+What it costs is measured by `build/tsdbc-bench via --host H --port P --via H2:P2 --volume NAME`: the same load sent
+to the leader and then to another server, alternating, repeated, with the mean and standard deviation of the requests
+a second, the p50 and p99 of writes and reads, and the server CPU per 1000 requests; the hop is the difference of the
+two. The cluster's fault test for it is `make jepsen-cluster` with the workload `kv-via`.
+
 ## How to read `status`
 
 `tsdb cluster status PEER` asks one server what it knows and prints one fact per line. Ask any member: they should
@@ -468,8 +495,9 @@ others). They are not built: `tsdb cluster` prints what exists.
 
 The preview is the first step of a longer plan. The designs are written; the work is in this order:
 
-- **The metadata group, finished** (S2, S4): the servers' links to each other and routing of requests, and names
-  that are unique across the cluster. The group's state machine (S1) and what a single server does while its storage
+- **The metadata group, finished** (S4): names that are unique across the cluster. The servers' links to each other,
+  routing and one-hop forwarding of requests ([Writes through any server](#writes-through-any-server)) are in this
+  preview. The group's state machine (S1) and what a single server does while its storage
   is away (UNAVAILABLE, in N1) are already in 0.10.0, and users and grants kept in the group, with logins on every
   server ([Logins](#logins)), are in this preview; the proposer's rules for ownership and the time rules come with N7.
 - **Shared mode** (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume,

@@ -9232,6 +9232,103 @@ static void scen_fwdload(void)
  * (the volume's first promotion is as slow, so under the mutant it may get no writer at all). The swap's 5 s in the
  * volume thread are the thread's own silence, not its peers': the new leader must not ask for an ISR of one after it
  * (repld.c long_step), which the group takes for a leader cut from its replicas and moves away. */
+/* tsdbc-bench via (S2-2): the bench of the forwarding hop runs end to end against three members, a volume of three
+ * replicas, once through its leader and once through a replica, every write and read checked by the bench itself and
+ * the leader holding every row at the end; the entry node must have forwarded frames (STATUS), the numbers must be
+ * printed (hop, mean and sd over the reps, CPU per 1000 requests of the three processes). A bench that is given an
+ * entry that is no server must fail, not print numbers. */
+static void scen_viabench(void)
+{
+    scenario("viabench");
+    strict_reads = 1;
+    fwd_on = 1;
+    for (int i = 0; i < 3; i++) {
+        xargs[i] = "--workers 2";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    struct meta_volume v;
+    int rc;
+    if ((rc = vol_add(0, "east", 3, &num)) != 0)
+        die("volume add east: %s", cluster_strerror(rc));
+    if (!vol_rec(0, "east", &v))
+        die("no record of east");
+    for (uint32_t k = 0; k < v.nrep; k++)
+        await_open_gen(0, "east", server_of(v.rep[k].node), 1, 0);
+    await_isr(0, "east", 3, 20000, "east with every replica up");
+    int L = server_of(v.leader), R = (L + 1) % 3;
+    tsdbc *cr = client(R);
+    uint64_t f0 = fw_frames(cr, v.leader);
+
+    const char *bench = getenv("TSDBC_BENCH") ? getenv("TSDBC_BENCH") : "./build/tsdbc-bench";
+    char cmd[PATH_MAX + 512], line[1024], text[16384];
+    snprintf(cmd, sizeof cmd,
+             "%s via --host 127.0.0.1 --port %d --via 127.0.0.1:%d --volume east --conns 2 --rows 50 --seconds 1 "
+             "--reps 2 --pids %d,%d,%d 2>&1",
+             bench, cports[L], cports[R], (int)pids[0], (int)pids[1], (int)pids[2]);
+    FILE *p = popen(cmd, "r");
+    if (!p)
+        die("popen %s: %s", cmd, strerror(errno));
+    size_t o = 0;
+    text[0] = 0;
+    while (fgets(line, sizeof line, p))
+        o += (size_t)snprintf(text + o, o < sizeof text ? sizeof text - o : 0, "%s", line);
+    int st = pclose(p);
+    if (st != 0)
+        die("`%s` failed (status %d):\n%s", cmd, st, text);
+    static const char *const must[] = {"rep 1 ", "rep 2 ", "direct", " via ", "hop (via - direct)", "write p50 (ms)",
+                                       "read p99 (ms)", "requests a second", "CPU ms per 1000 requests",
+                                       "the leader holds them all"};
+    for (unsigned k = 0; k < sizeof must / sizeof *must; k++)
+        if (!strstr(text, must[k]))
+            die("the bench's output lacks '%s':\n%s", must[k], text);
+    uint64_t f1 = fw_frames(cr, v.leader);
+    if (f1 <= f0 + 10)
+        die("the bench ran through server %d and it forwarded %" PRIu64 " frames to the leader %d (STATUS "
+            "peer.<id>.fwd.frames %" PRIu64 " to %" PRIu64 ")", R, f1 - f0, L, f0, f1);
+    tsdbc_close(cr);
+    printf("  tsdbc-bench via through server %d to the leader %d: %" PRIu64 " frames forwarded; its output:\n%s", R, L,
+           f1 - f0, text);
+
+    /* an entry that is no server: an error, no numbers */
+    snprintf(cmd, sizeof cmd,
+             "%s via --host 127.0.0.1 --port %d --via 127.0.0.1:1 --volume east --conns 1 --seconds 1 --reps 1 2>&1",
+             bench, cports[L]);
+    p = popen(cmd, "r");
+    if (!p)
+        die("popen %s: %s", cmd, strerror(errno));
+    o = 0;
+    text[0] = 0;
+    while (fgets(line, sizeof line, p))
+        o += (size_t)snprintf(text + o, o < sizeof text ? sizeof text - o : 0, "%s", line);
+    st = pclose(p);
+    if (st == 0 || strstr(text, "hop (via - direct)"))
+        die("the bench against an entry that is no server went well (status %d):\n%s", st, text);
+    printf("  an entry that is no server: %s", text);
+
+    /* an entry that forwards nothing (the leader itself): its numbers would be "direct" under the name "via" (review
+     * F7): the bench must say so and print no hop */
+    snprintf(cmd, sizeof cmd,
+             "%s via --host 127.0.0.1 --port %d --via 127.0.0.1:%d --volume east --conns 1 --seconds 1 --reps 2 2>&1",
+             bench, cports[L], cports[L]);
+    p = popen(cmd, "r");
+    if (!p)
+        die("popen %s: %s", cmd, strerror(errno));
+    o = 0;
+    text[0] = 0;
+    while (fgets(line, sizeof line, p))
+        o += (size_t)snprintf(text + o, o < sizeof text ? sizeof text - o : 0, "%s", line);
+    st = pclose(p);
+    if (st == 0 || strstr(text, "hop (via - direct)") || !strstr(text, "forwarded 0 frames"))
+        die("the bench against an entry that forwards nothing went well or said nothing (status %d):\n%s", st, text);
+    printf("  an entry that forwards nothing: refused\n");
+}
+
 static void scen_promoteslow(void)
 {
     scenario("promoteslow");
@@ -10820,7 +10917,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

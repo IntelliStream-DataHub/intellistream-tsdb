@@ -38,7 +38,12 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # and kv-local (a cluster volume of 1 replica per node), and users (every tsdbd requires a login, an admin thread
                           # changes users, passwords and grants, every node is probed with logins and reads: an acknowledged change must hold
                           # on every member; tests/jepsen/cluster_users.h, what it does not cover: docs/tasks/users-stale-answers.md; --auth runs the other
-                          # workloads with a login too);
+                          # workloads with a login too), and kv-via (kv's volume of 3 replicas with every client on a random member, so
+                          # the operations are forwarded; check 6 read-your-writes on the connection of an acknowledged write, and the
+                          # nemesis fwdstall: a non-leader holds its forwards for 2 s, check 7 "old frame": no write held that long may
+                          # be acknowledged; JEPSEN_VIA_NEMESES, default fwdstall, runs it as an extra loop; the selftest plants fwdoldframe and
+                          # TSDB_REPLICA_READS=1 with no mutant; kv-via costs one more run of JEPSEN_SECONDS per nemesis and backend
+                          # on top of kv, which already roams and forwards: JEPSEN_CLUSTER_WORKLOADS leaves it out);
                           # JEPSEN_SECONDS, JEPSEN_NEMESES, JEPSEN_SEED,
                           # JEPSEN_NODES, both IO backends; tests/jepsen/jepsen_cluster.c; make jepsen-cluster-selftest plants what it must catch (not part of jepsen-cluster)
                           # (kv/classes: the nemeses aim at kvr's leader too, the clients roam and follow MOVED to it; JEPSEN_TERMINAL=name
@@ -227,7 +232,9 @@ cgroup, so `nice` does not keep your work out of its way.
   on reserved workers (`fwd_serve`) through the same gates with the user's rights, MOVED when not led at the envelope's
   epoch, UNAVAILABLE while its users lag the envelope's index; `tests/test_fwd.c` (fake link), `test_cluster
   forward|fwdlease|fwddepose|fwdload`, `make fwd-mutants` (`TSDBD_FWD_MUTANT`; test hooks `TSDBD_TEST_FWD_STALL`,
-  `TSDB_CLUSTER_TEST hold_copy_file|hold_users_file`). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  `TSDB_CLUSTER_TEST hold_copy_file|hold_users_file`); end to end through entry nodes: `test_cluster viabench`, jepsen-cluster `kv-via` with
+  `fwdstall` (read-your-writes, "old frame"). Users are the metadata group's: `tsdb cluster user ...`, logins on every member
+  (Login and rights, below; docs/cluster-preview.md "Logins"). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants
@@ -946,7 +953,7 @@ tsdb-bench, tsdbd (started with `--port 0 --port-file`) with tsdbc-bench, insert
 | [`bench/hydraulic`](bench/hydraulic) | the codecs on real sensor data (UCI hydraulic test rig, 17 sensors): `get.sh`, `convert.py`, `run.sh` |
 | `build/tsdb-bench` | load, compression and queries on 100 M rows; `--type float64` or `int64` stores another value type; `--export` writes the rows for ClickHouse |
 | `build/insert-bench` | durable inserts on a real disk, 1 row to 1 billion rows per call |
-| `build/tsdbc-bench` | the server: loading, queries, 10,000 connections |
+| `build/tsdbc-bench` | the server: loading, queries, 10,000 connections; `via --via ADDR --volume NAME`: the cost of the forwarding hop (direct to the leader against through another member, repeated; `test_cluster viabench`) |
 | `build/scale-bench` | 100 billion rows: load, then a query suite, with the same queries as SQL for ClickHouse |
 | [`bench/dbcmp`](bench/dbcmp) | tsdb against ClickHouse, QuestDB, TimescaleDB and InfluxDB 2 and 3 on 100 M rows; its README has the steps |
 

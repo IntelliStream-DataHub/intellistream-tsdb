@@ -456,9 +456,9 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
 
-test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
+test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	./$(B)/test_meta /tmp --seeds 12 --seconds 15
-	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
+	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
 	./$(B)/test_peerlink $(or $(TMPDIR),/tmp)
 	$(MUT) --name test_peerlink --list "notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
@@ -1338,7 +1338,11 @@ JEPSEN_NODES ?= 5
 # kv-local runs its nodes with TSDB_CLUSTER_WRITES=1, kv and classes with the replication driver: separate runs
 # users: every tsdbd requires a login, an admin thread adds, drops, re-adds users and changes their passwords and grants
 # while one prober per node logs in and reads (tests/jepsen/cluster_users.h; the superuser is made with the CLI: $(B)/tsdb)
-JEPSEN_CLUSTER_WORKLOADS ?= meta,kv-local meta,kv meta,classes meta,users
+# kv-via: kv's clients on random members (every operation is forwarded to kvr's leader, s2f), a read of the series on the
+# connection of each acknowledged write (read-your-writes), nemeses aimed at the members the clients are on, and the
+# fwdstall nemesis (an entry node holds its forwards past fwd_max_age: an old frame must never be applied)
+JEPSEN_CLUSTER_WORKLOADS ?= meta,kv-local meta,kv meta,kv-via meta,classes meta,users
+JEPSEN_VIA_NEMESES ?= fwdstall
 jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
 	for io in $(IO); do for wl in $(JEPSEN_CLUSTER_WORKLOADS); do for nem in $(JEPSEN_NEMESES); do \
 	    echo "== tsdbd --io $$io, workloads $$wl, nemesis $$nem"; \
@@ -1346,6 +1350,12 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
 	        --nemesis $$nem --workload $$wl --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
 	        || exit 1; \
 	    done; done; done
+	for io in $(IO); do for nem in $(JEPSEN_VIA_NEMESES); do \
+	    echo "== tsdbd --io $$io, workloads meta,kv-via, nemesis $$nem"; \
+	    TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
+	        --nemesis $$nem --workload meta,kv-via --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
+	        || exit 1; \
+	    done; done
 
 # The harness has to notice what it is meant to: a port file that names another pid, a client that skips the check
 # of the port it connected to while a foreign server holds the node's old one (and the same client with the check:
@@ -1411,6 +1421,12 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	out=$$(TSDB_AUTH_MUTANT=loginbeforecatchup $$j --seconds 60 --nemesis kill --workload users 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: users: '; then \
 	        echo "jepsen-cluster-selftest: a restarted member that logs in before it caught up (loginbeforecatchup) went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(TSDBD_FWD_MUTANT=fwdoldframe $$j --seconds 40 --nemesis fwdstall --workload kv-via 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'old frame: write'; then \
+	        echo "jepsen-cluster-selftest: a frame held past the forward age at its entry node and then applied (fwdoldframe) went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(TSDB_REPLICA_READS=1 $$j --seconds 30 --nemesis none --workload kv-via 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'read-your-writes: key'; then \
+	        echo "jepsen-cluster-selftest: a read served from a replica's own copy (replica reads on, no mutant) went unnoticed by read-your-writes (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: the comparison of replicas is wrong (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \

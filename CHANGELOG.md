@@ -8,6 +8,20 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**Tests and a benchmark for requests through any cluster member (S2-2; harness and docs only, no server change).**
+
+- `tsdbc-bench via --via H:P --volume NAME`: the same load sent to the leader of a cluster volume and then to another
+  member that forwards it, alternating in each repetition; prints, as the mean and standard deviation over
+  `--reps`, requests a second, the p50 and p99 of writes and reads and the server CPU per 1000 requests, and the hop as
+  the paired difference. `test_cluster viabench` runs it.
+- jepsen-cluster: the workload `kv-via` (kv's volume of 3 replicas, every client on a random member) with check 6,
+  read-your-writes, and the nemesis `fwdstall` (a non-leader holds its forwards for 2 s) with check 7, "old frame": a
+  write acknowledged after being held past the forward age fails the run. `make jepsen-cluster` runs the workload
+  (and `JEPSEN_VIA_NEMESES`, default `fwdstall`, as one more loop); `make jepsen-cluster-selftest` plants
+  `TSDBD_FWD_MUTANT=fwdoldframe` and replica reads (`TSDB_REPLICA_READS=1`) and requires both to fail.
+- `docs/cluster-preview.md`: "Writes through any server" (forwarding, what an unknown outcome looks like, the address
+  in MOVED); `docs/design-ha-modes.md` S2 row and `docs/design-cluster.md` say what is built.
+
 **Cluster volumes (preview, R3): `tsdb cluster volume add`; a cluster node keeps data in cluster volumes only.** This
 changes what a node of the 0.10.0 preview accepts, and its metadata snapshot (version 3) and peer protocol (version 3):
 a cluster made with 0.10.0 is initialised again, not upgraded (as for every change of the preview).

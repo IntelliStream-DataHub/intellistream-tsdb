@@ -8,6 +8,8 @@
  *   tsdbc-bench query [--series 100] [--points 1000000] [--conns 1] [--seconds 3] [--multi K [--multi-one]]
  *   tsdbc-bench latest [--series 100] [--ids 4096] [--conns 1] [--seconds 3] [--sorted] [--flush] [--with-nulls] [--dataset]
  *   tsdbc-bench connections --conns 5000 [--seconds 5]
+ *   tsdbc-bench via --host H --port P --via H2:P2 --volume NAME [--conns 4] [--rows 100] [--seconds 3] [--reps 5]
+ *                   [--pids PID,PID,...]
  *
  * load sends a RowBinary file (u32 series, i64 ts, f32 value per row), split
  * into contiguous slices, one per connection, with up to 4 batches in flight.
@@ -20,6 +22,16 @@
  * a request, with a connection writing and flushing every series in a loop under --flush (see run_latest).
  * connections holds --conns connections open at once (from up to 64 threads)
  * and keeps sending small aggregate queries through all of them.
+ * via is the cost of the forwarding hop (S2-2, docs/design-ha-modes.md): the same load sent to the member that leads
+ * the cluster volume NAME (--host/--port: "direct") and then to another member (--via: the entry node, which forwards
+ * every request to the leader), the two alternating in each of --reps repetitions (direct first in the odd ones, via
+ * first in the even ones). Every connection owns a series "via.K" in the volume (made through the leader) and loops
+ * one insert of --rows rows and one read of exactly those rows back, each timed; a wrong answer or an error stops the
+ * run, and at the end the leader holds exactly the rows that were acknowledged. It prints each repetition and then the
+ * mean and standard deviation of each number over the repetitions: requests a second, the write and read p50 and p99
+ * (ms) and, with --pids (the tsdbd processes of the cluster, which run on this machine), the CPU they used (user +
+ * system, from /proc) per 1000 requests; the hop is the paired difference via - direct per repetition.
+ * --via on the other modes sends them to that address instead of --host/--port.
  * --user U --password-file F logs every connection in (a tsdbd without --no-auth); the keys are derived once per
  * process, so a connect costs the SCRAM exchange's round trips and four HMACs.
  */
@@ -673,6 +685,338 @@ static int connections(void)
     return failed || errors ? 1 : 0;
 }
 
+/* ---- via: the forwarding hop (see the header) */
+#define VIA_T0 1700000000000LL
+static const char *via_addr, *via_volume, *via_pids;
+static int via_reps = 5, via_rows = 100;
+
+typedef struct lat {
+    uint32_t *a; /* microseconds */
+    size_t n, cap;
+} lat;
+
+static void lat_add(lat *l, uint32_t v)
+{
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 4096;
+        l->a = realloc(l->a, l->cap * sizeof *l->a);
+        if (!l->a)
+            die("out of memory", TSDB_ERR_NOMEM);
+    }
+    l->a[l->n++] = v;
+}
+
+typedef struct via_job {
+    const char *h;
+    int p;
+    tsdb_sid sid;
+    int64_t next; /* the timestamp of the next row, kept across runs so that every row is new */
+    uint64_t seq; /* rows written so far (a row's value is its number) */
+    lat w, r;
+    double secs;
+    int rc;
+    const char *what;
+} via_job;
+
+static int addr_split(const char *a, char *h, size_t hn, int *p)
+{
+    const char *c = strrchr(a, ':');
+    if (!c || c == a || (size_t)(c - a) >= hn || atoi(c + 1) <= 0)
+        return -1;
+    memcpy(h, a, (size_t)(c - a));
+    h[c - a] = 0;
+    *p = atoi(c + 1);
+    return 0;
+}
+
+static void *via_run(void *arg)
+{
+    via_job *j = arg;
+    tsdbc *c;
+    int rc = tsdbc_connect(j->h, j->p, &c);
+    if (rc) {
+        j->rc = rc;
+        j->what = "connect";
+        return NULL;
+    }
+    /* a MOVED (an entry that does not forward: forwarding off, an older server) must fail the run, not be followed to
+     * the leader: that would measure "direct" under the name "via" */
+    tsdbc_set_retry(c, 0);
+    int64_t *ts = malloc((size_t)via_rows * sizeof *ts);
+    float *v = malloc((size_t)via_rows * sizeof *v);
+    j->w.n = j->r.n = 0;
+    double t0 = now_s();
+    while (now_s() - t0 < seconds) {
+        int64_t first = j->next;
+        for (int i = 0; i < via_rows; i++) {
+            ts[i] = j->next;
+            v[i] = (float)(j->seq + (uint64_t)i);
+            j->next += 1000;
+        }
+        double a = now_s();
+        if ((rc = tsdbc_insert_series(c, j->sid, ts, v, (size_t)via_rows)) != 0) {
+            j->rc = rc;
+            j->what = "insert";
+            break;
+        }
+        lat_add(&j->w, (uint32_t)((now_s() - a) * 1e6));
+        j->seq += (uint64_t)via_rows;
+        tsdb_points pts;
+        a = now_s();
+        if ((rc = tsdbc_query_points(c, j->sid, first, j->next, &pts)) != 0) {
+            j->rc = rc;
+            j->what = "read";
+            break;
+        }
+        lat_add(&j->r, (uint32_t)((now_s() - a) * 1e6));
+        int bad = pts.n != (size_t)via_rows || pts.ts[0] != first || pts.values[0] != v[0] ||
+                  pts.values[pts.n - 1] != v[via_rows - 1];
+        free(pts.ts);
+        free(pts.values);
+        if (bad) { /* the entry node answered with other rows than were just written */
+            j->rc = TSDB_ERR_CORRUPT;
+            j->what = "read (not the rows just written)";
+            break;
+        }
+    }
+    j->secs = now_s() - t0;
+    free(ts);
+    free(v);
+    tsdbc_close(c);
+    return NULL;
+}
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* the clock ticks of user + system time of the processes in via_pids ("1,2,3"), -1 when one cannot be read */
+static long via_cpu_ticks(void)
+{
+    if (!via_pids || !*via_pids)
+        return 0;
+    long sum = 0;
+    char list[512];
+    snprintf(list, sizeof list, "%s", via_pids);
+    for (char *t = strtok(list, ","); t; t = strtok(NULL, ",")) {
+        char path[64], buf[1024];
+        snprintf(path, sizeof path, "/proc/%ld/stat", atol(t));
+        FILE *f = fopen(path, "r");
+        if (!f)
+            return -1;
+        size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        char *rp = strrchr(buf, ')'); /* the name may hold spaces: the fields count from after its parenthesis */
+        unsigned long ut, st;
+        if (!rp || sscanf(rp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) != 2)
+            return -1;
+        sum += (long)(ut + st);
+    }
+    return sum;
+}
+
+typedef struct via_res {
+    double reqs;               /* requests a second (writes and reads) */
+    double w50, w99, r50, r99; /* ms */
+    double cpu;                /* ms of CPU per 1000 requests, -1 without --pids */
+} via_res;
+
+/* one run of every connection against h:p; the numbers of it */
+static via_res via_once(via_job *jobs, int n, const char *h, int p, int *bad)
+{
+    via_res res = {0};
+    pthread_t th[256];
+    long c0 = via_cpu_ticks();
+    for (int i = 0; i < n; i++) {
+        jobs[i].h = h;
+        jobs[i].p = p;
+        jobs[i].rc = 0;
+        if (pthread_create(&th[i], NULL, via_run, &jobs[i]) != 0)
+            die("pthread_create", TSDB_ERR_IO);
+    }
+    lat w = {0}, r = {0};
+    double secs = 0;
+    uint64_t reqs = 0;
+    for (int i = 0; i < n; i++) {
+        pthread_join(th[i], NULL);
+        if (jobs[i].rc) {
+            fprintf(stderr, "tsdbc-bench via: %s %s:%d: %s\n", jobs[i].what, h, p, tsdbc_strerror(jobs[i].rc));
+            *bad = 1;
+        }
+        for (size_t k = 0; k < jobs[i].w.n; k++)
+            lat_add(&w, jobs[i].w.a[k]);
+        for (size_t k = 0; k < jobs[i].r.n; k++)
+            lat_add(&r, jobs[i].r.a[k]);
+        reqs += jobs[i].w.n + jobs[i].r.n;
+        if (jobs[i].secs > secs)
+            secs = jobs[i].secs;
+    }
+    long c1 = via_cpu_ticks();
+    if (w.n && r.n) {
+        qsort(w.a, w.n, sizeof *w.a, cmp_u32);
+        qsort(r.a, r.n, sizeof *r.a, cmp_u32);
+        res.w50 = w.a[w.n / 2] / 1000.0;
+        res.w99 = w.a[w.n * 99 / 100] / 1000.0;
+        res.r50 = r.a[r.n / 2] / 1000.0;
+        res.r99 = r.a[r.n * 99 / 100] / 1000.0;
+    } else
+        *bad = 1;
+    res.reqs = secs > 0 ? (double)reqs / secs : 0;
+    res.cpu = c0 < 0 || c1 < 0 || !via_pids || !*via_pids || !reqs
+                  ? -1
+                  : (double)(c1 - c0) / (double)sysconf(_SC_CLK_TCK) * 1e6 / (double)reqs;
+    free(w.a);
+    free(r.a);
+    return res;
+}
+
+static void via_print(const char *what, int rep, const via_res *r)
+{
+    printf("  rep %d %-6s %9.0f req/s   write p50 %6.3f ms p99 %6.3f ms   read p50 %6.3f ms p99 %6.3f ms", rep, what,
+           r->reqs, r->w50, r->w99, r->r50, r->r99);
+    if (r->cpu >= 0)
+        printf("   cluster CPU %6.1f ms per 1000 requests", r->cpu);
+    printf("\n");
+    fflush(stdout);
+}
+
+static void mean_sd(const double *x, int n, double *m, double *sd)
+{
+    double s = 0, q = 0;
+    for (int i = 0; i < n; i++)
+        s += x[i];
+    *m = n ? s / n : 0;
+    for (int i = 0; i < n; i++)
+        q += (x[i] - *m) * (x[i] - *m);
+    *sd = n > 1 ? sqrt(q / (n - 1)) : 0;
+}
+
+#define VIA_FIELDS 6
+static double via_field(const via_res *r, int f)
+{
+    switch (f) {
+    case 0: return r->reqs;
+    case 1: return r->w50;
+    case 2: return r->w99;
+    case 3: return r->r50;
+    case 4: return r->r99;
+    default: return r->cpu;
+    }
+}
+
+/* the sum of the frames the server at h:p has forwarded (STATUS peer.<id>.fwd.frames, a superuser), -1 when it cannot say */
+static int64_t via_forwarded(const char *h, int p)
+{
+    tsdbc *c;
+    char *text = NULL;
+    if (tsdbc_connect(h, p, &c) != 0)
+        return -1;
+    int rc = tsdbc_status(c, &text);
+    tsdbc_close(c);
+    if (rc != 0)
+        return -1;
+    int64_t n = 0;
+    for (const char *q = text; (q = strstr(q, "\npeer.")) != NULL; q++) {
+        const char *k = strstr(q + 1, ".fwd.frames=");
+        const char *nl = strchr(q + 1, '\n');
+        if (k && (!nl || k < nl))
+            n += (int64_t)strtoull(k + strlen(".fwd.frames="), NULL, 10);
+    }
+    free(text);
+    return n;
+}
+
+static int run_via(void)
+{
+    char vh[128];
+    int vp;
+    if (!via_addr || !via_volume || addr_split(via_addr, vh, sizeof vh, &vp) != 0 || via_reps < 1 || via_reps > 100 ||
+        via_rows < 1 || via_rows > 100000) {
+        fprintf(stderr, "usage: tsdbc-bench via --host H --port P --via H2:P2 --volume NAME [--conns N] [--rows N] "
+                        "[--seconds S] [--reps N] [--pids PID,PID,...]\n");
+        return 2;
+    }
+    /* the series are made through the leader (a member that does not lead the volume refuses to create them); their
+     * ids are the same on every member */
+    via_job *jobs = calloc((size_t)conns, sizeof *jobs);
+    tsdbc *c;
+    int rc = tsdbc_connect(host, port, &c);
+    if (rc)
+        die("connect (the leader)", rc);
+    for (int i = 0; i < conns; i++) {
+        char name[48];
+        snprintf(name, sizeof name, "via.%d", i);
+        if ((rc = tsdbc_series_at(c, name, via_volume, &jobs[i].sid)) != 0)
+            die(name, rc);
+        jobs[i].next = VIA_T0;
+    }
+    printf("via: %d reps of %.1f s, %d connections, %d rows per insert and per read; direct %s:%d, entry %s, volume %s\n",
+           via_reps, seconds, conns, via_rows, host, port, via_addr, via_volume);
+    via_res dr[100], vr[100];
+    int bad = 0;
+    int64_t fwd0 = via_forwarded(vh, vp);
+    for (int rep = 0; rep < via_reps && !bad; rep++) {
+        int via_first = rep % 2; /* the order alternates: neither side always runs second */
+        for (int k = 0; k < 2 && !bad; k++) {
+            int is_via = (k == 0) == (via_first != 0);
+            via_res r = via_once(jobs, conns, is_via ? vh : host, is_via ? vp : port, &bad);
+            if (bad)
+                break;
+            (is_via ? vr : dr)[rep] = r;
+            via_print(is_via ? "via" : "direct", rep + 1, &r);
+        }
+    }
+    uint64_t want = 0, got = 0;
+    for (int i = 0; i < conns && !bad; i++) { /* the leader holds exactly what was acknowledged */
+        tsdb_points p;
+        want += jobs[i].seq;
+        if ((rc = tsdbc_query_points(c, jobs[i].sid, INT64_MIN, INT64_MAX, &p)) != 0)
+            die("final read", rc);
+        got += p.n;
+        free(p.ts);
+        free(p.values);
+    }
+    tsdbc_close(c);
+    if (bad)
+        return 1;
+    int64_t fwd1 = via_forwarded(vh, vp);
+    if (fwd0 < 0 || fwd1 < 0)
+        fprintf(stderr, "tsdbc-bench via: note: STATUS of %s was not readable (a superuser is needed), so that it "
+                        "forwarded the load is not checked\n", via_addr);
+    else if (fwd1 - fwd0 < (int64_t)via_reps) { /* every via run sends at least a frame per connection */
+        fprintf(stderr, "tsdbc-bench via: the entry %s forwarded %" PRId64 " frames in %d via runs: its numbers would be "
+                        "the leader's, no hop is printed\n", via_addr, fwd1 - fwd0, via_reps);
+        return 1;
+    }
+    if (got != want) {
+        fprintf(stderr, "tsdbc-bench via: the leader holds %" PRIu64 " rows, %" PRIu64 " were acknowledged\n", got, want);
+        return 1;
+    }
+    static const char *const names[VIA_FIELDS] = {"requests a second", "write p50 (ms)", "write p99 (ms)",
+                                                  "read p50 (ms)", "read p99 (ms)", "CPU ms per 1000 requests"};
+    printf("mean and standard deviation over %d reps (%" PRIu64 " rows written, the leader holds them all):\n"
+           "  %-26s %18s %18s %20s\n",
+           via_reps, want, "", "direct", "via", "hop (via - direct)");
+    for (int f = 0; f < VIA_FIELDS; f++) {
+        double d[100], v[100], h[100], dm, ds, vm, vs, hm, hs;
+        if (f == 5 && (!via_pids || !*via_pids))
+            continue;
+        for (int i = 0; i < via_reps; i++) {
+            d[i] = via_field(&dr[i], f);
+            v[i] = via_field(&vr[i], f);
+            h[i] = v[i] - d[i];
+        }
+        mean_sd(d, via_reps, &dm, &ds);
+        mean_sd(v, via_reps, &vm, &vs);
+        mean_sd(h, via_reps, &hm, &hs);
+        printf("  %-26s %9.3f +- %-6.3f %9.3f +- %-6.3f %+10.3f +- %-6.3f\n", names[f], dm, ds, vm, vs, hm, hs);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     static struct option opts[] = {{"host", required_argument, 0, 'h'},   {"port", required_argument, 0, 'p'},
@@ -683,6 +1027,9 @@ int main(int argc, char **argv)
                                    {"ids", required_argument, 0, 'i'}, {"sorted", no_argument, 0, 'S'},
                                    {"flush", no_argument, 0, 'F'}, {"with-nulls", no_argument, 0, 'N'},
                                    {"dataset", no_argument, 0, 'D'},
+                                   {"via", required_argument, 0, 0x100}, {"volume", required_argument, 0, 0x101},
+                                   {"reps", required_argument, 0, 0x102}, {"rows", required_argument, 0, 0x103},
+                                   {"pids", required_argument, 0, 0x104},
                                    {"user", required_argument, 0, 'u'},  {"password-file", required_argument, 0, 'w'},
                                    {0, 0, 0, 0}};
     int ch;
@@ -703,10 +1050,32 @@ int main(int argc, char **argv)
         case 'F': lat_flush = 1; break;
         case 'N': lat_with_nulls = 1; break;
         case 'D': lat_dataset = 1; break;
+        case 0x100: via_addr = optarg; break;
+        case 0x101: via_volume = optarg; break;
+        case 0x102: via_reps = atoi(optarg); break;
+        case 0x103: via_rows = atoi(optarg); break;
+        case 0x104: via_pids = optarg; break;
         case 'u': login.user = optarg; break;
         case 'w': login.password_file = optarg; break;
         default: return 2;
         }
+    }
+    if (optind < argc && strcmp(argv[optind], "via") == 0) {
+        if (conns < 1 || conns > 256) {
+            fprintf(stderr, "tsdbc-bench via: --conns %d: from 1 to 256\n", conns);
+            return 2;
+        }
+        return run_via();
+    }
+    if (via_addr) { /* --via on any other mode: that address instead of --host and --port */
+        static char vh[128];
+        int vp;
+        if (addr_split(via_addr, vh, sizeof vh, &vp) != 0) {
+            fprintf(stderr, "tsdbc-bench: --via %s: expected HOST:PORT\n", via_addr);
+            return 2;
+        }
+        host = vh;
+        port = vp;
     }
     if (optind < argc && strcmp(argv[optind], "connections") == 0 && conns >= 1) {
         resolve_query_ids();
@@ -719,7 +1088,8 @@ int main(int argc, char **argv)
                         "       tsdbc-bench query [--series N] [--points N] [--conns N] [--seconds S] [--multi K [--multi-one]]\n"
                         "       tsdbc-bench latest [--series N] [--ids N] [--conns N] [--seconds S] [--sorted] [--flush] [--with-nulls] [--dataset]\n"
                         "       tsdbc-bench connections --conns N [--seconds S]\n"
-                        "       [--host H] [--port P] [--user U --password-file F]\n");
+                        "       tsdbc-bench via --via H:P --volume NAME [--conns N] [--rows N] [--seconds S] [--reps N] [--pids P,P]\n"
+                        "       [--host H] [--port P] [--via H:P] [--user U --password-file F]\n");
         return 2;
     }
     if (strcmp(argv[optind], "load") == 0 && optind + 1 < argc)
