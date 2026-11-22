@@ -17,6 +17,11 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # kv also with login on (jepsen --auth) under kill and power, on each backend;
                           # JEPSEN_SECONDS=300 makes every run that long (the weekly CI run)
                           # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
+                          # (JEPSEN_TIER, "3 6" by default: a directory tier of 2+1 and of 4+2 stores, `jepsen --tier N`, under the
+                          # eager policy: kill, power, eio and settle-steps (TSDB_SETTLE_CRASH_AT: a power cut at each named step of a
+                          # settle) on kv and classes, both backends, JEPSEN_TIER_SEEDS 1 2; a run in which nothing settled fails;
+                          # JEPSEN_TIER= turns them off; tests/jepsen/mutant-settle.sh plants a settle that ranks its .ec below the
+                          # rows it replaced and a swap that renames early: jepsen-selftest runs it, both must be caught)
                           # (kv also writes nulls and checks every QUERY_LATEST answer, and the final ones; tests/jepsen/mutant-latest.sh
                           # plants stale latest-table entries in tsdbd, which the check must fail: jepsen-selftest runs it)
 make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every peer port) under kill, partition, pause, midcommit
@@ -39,6 +44,9 @@ make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tes
                           # footer the same way, so that run turns detect_stack_use_after_return off).
 make PORTABLE=1           # without -march=native
 make NO_URING=1           # tsdbd on epoll only, without liburing (after make clean)
+make NO_EC=1              # an x86-64 engine without the erasure codec (what the embedded bindings and other machines build; after
+                          # make clean, or with its own B=build-noec): every R7 stub and test must build and pass both ways; the tier
+                          # tests print that they are skipped, and a configured tier is refused. Only NO_EC=1 turns it off
 make dist                 # portable tarball (x86-64-v2 + v3/v4 codecs) in build-dist/; checks glibc and ISA
 make dist-test            # the tarball's own test suite, at every CPU level (TSDB_CPU=v2|v3|v4)
 make dist-check-almalinux10   # that suite in an AlmaLinux 10 container (Podman)
@@ -217,7 +225,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `tsdb_ec_*` are `local:` in the map) and `tools/check-ec-baseline.sh` (no SSSE3 outside its kernel in a generic build).
   The embedded bindings' crates (`client/rust-sys` build.rs, `vendor.sh`) copy `src/*.c` only and build without `src/ec`
   and without `TSDB_EC`: an engine caller of `iso_rs_*` needs an `#ifdef TSDB_EC` or those crates stop linking.
-- `src/chunk.h` (the API; internal, the engine does not call it yet: R7 does), `src/chunk.c` (the geometry of an object,
+- `src/chunk.h` (the API; internal, called by the engine only through R7's tier, below), `src/chunk.c` (the geometry of an object,
   the chunk file format, the encoder), `src/chunkstore.c` (chunk stores: META with the store id, `s<volume>/EPOCH`, the
   fences, the directory backend), `src/chunkread.c` (reads of any byte range with decode): design-cluster-data.md R6.
   The geometry (k', m, cell, length) is recorded in the object and in every chunk header and never taken from settings
@@ -266,6 +274,45 @@ cgroup, so `nice` does not keep your work out of its way.
   settletwopass settlebusy coarsewhole`; the failure paths' handoffs `gcskip* gccommitted gcdouble` (gcpaths), `gcearly
   nullnosync syncfailgo` (gcpower, crashfs), `nohaltstop` (halt)); `tests/test_settle_oracle.c` against an unsettled
   twin (`tests/oracle_mutants.sh`: a mutant counts as caught only by its own line).
+- `src/tier.[ch]`, `src/ecpart.[ch]`, `src/eccache.[ch]`, `src/ecswap.[ch]`, `src/ecskip.h`, `src/eckeep.[ch]` (R7,
+  design-cluster-data.md §2.3-2.4, §15.7; the plan's decisions D1-D11): settled parts on ONE server, behind a switch that is
+  test-only until R15. A handle's `struct tier` (`src/tier.c`, one per `tsdb`, reference-counted: every engine of the handle,
+  retired ones included, holds one, and the last to let go closes it) owns the one chunk backend (`chunk_be_open2`, `min_up`
+  = stores - m: a store that is missing, damaged or EIO at open is DOWN and read around), the cache, the settle thread and
+  the gc worker. It is configured by `TSDB_TEST_TIER=k=2,m=1,dirs=/a:/b:/c[,grace_s=,keep_s=,coarse_s=,cache_mb=,eager=]`
+  (grammar in `src/tier.h`) and acts only with `TSDB_TEST_TIER_I_KNOW=1` beside it (D3: set alone the open fails with a line,
+  so a stray variable never writes `requires=tier` into META); there are no public options and no `TIERS` before R15. The
+  open of a volume writes `vuuid=` and `requires=tier` to META (tmp, fsync, rename) and raises every store's epoch to the
+  constant 1 (D4); it refuses a tier on a read-only open, a follower, a `requires=cluster|replica` volume (D1, D7) and a
+  build without `TSDB_EC`; a store without META is a lost disk (DOWN, never remade) once any volume exists. `tier_writable`
+  turns false, with one line, once a store is not UP or failed in service: settles and chunk deletes stop until the next
+  handle open, reads go on. `src/ecpart.c`: the `.ec` file (`p<K>_<A>_<B>_<L>.ec`, the name and block range of its source,
+  D2): the source's header, granule index, tombstones and footer verbatim (so `gx_*` read the index in place, unchanged),
+  then the object record (oid, geometry, `object_len`, `object_xxh64`, the source's per-cell sums, `writer_epoch`,
+  `settle_ms`, the class check, `positions`, `ppos` and `stripe_version` written as 0 and refused when not: R8's) and a
+  64-byte trailer that hashes both; `part_open_ec` refuses a granule that does not lie inside the object's data in index
+  order (a fuzz finding: a count alone let a 536-byte file walk 10^8 granules); the open fails on an `.ec` and a `.part` of
+  one name with no intent, an `.ec` without `requires=tier`, and a record whose class check failed. `tests/test_ecpart.c`
+  (mutants in the Makefile), `tests/fuzz/fuzz_ecpart.c`. `src/eccache.c`, the read seam: `ec_granule_read` (reached from
+  `granule_read`, the only door to granule bytes of a settled part) takes a granule's bytes from a cache entry keyed
+  (oid, offset), filled by one read of the object's byte range and CHECKED THERE against the record's sums, whatever
+  `verify_checksums` says, then decoded from the pinned entry with `verify=false`; a hit whose length or crc differs from
+  the granule's is CORRUPT; a damaged cell is rebuilt from the other positions (a crc mismatch reads once more as whole
+  cells); an error with a store DOWN and fewer than k' positions left is `TSDB_ERR_UNAVAILABLE`, a lost object CORRUPT naming
+  the granule. A byte budget (`cache_mb`, 0: 10% of RAM) with LRU, an LRU of open objects under an fd budget (pinned ones
+  never closed); the cache mutex is a leaf, never held across I/O. Statistics count an `.ec` part's bytes
+  (`eccache_part_bytes`) and its residency (`eccache_resident`). `src/ecswap.c`: the swap, intent v4, below under "Settled
+  parts". `src/ecskip.h`: `part_merge_barrier` (an `.ec` or a `settling` part). `src/eckeep.c`: `settled_*.part`, the source
+  a swap renamed, is a graveyard kind (`GY_SETTLED`) kept for `keep_s` counted from the `.ec` record's `settle_ms` (never
+  an mtime: a rename keeps it, and a restart would find every file due) and until its digest matched. The digest (one thread
+  per engine, nice 19, `eckeep_digest_mb_s`) reads the object whole, every cell checked, and compares its xxh64 and the
+  `settled_` file's with the record's; every `settled_` file is digested again at each open before any is released; a store
+  that is not UP holds it, never "matches" by reading around. A mismatch sets `db->diverged`, and the `route()` family
+  (`eng_refused`) answers `TSDB_ERR_UNAVAILABLE` for the volume until a restart, an in-process reopen carrying the flag
+  (D5). `tests/test_tier.c`, `test_seam.c`, `test_ecskip.c`, `test_ecswap.c`, `test_keep.c`, `test_ecnames.c` (every R7
+  file name against every predicate, `make NO_EC=1`), `test_settle.c`, `test_settle_oracle.c`, `test_ecgc.c`, each with
+  its planted bugs (`--mutant NAME`, a Makefile loop that requires each to fail). A test that cannot run without the codec
+  prints that it is skipped.
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
@@ -450,6 +497,49 @@ cgroup, so `nice` does not keep your work out of its way.
   alone; `test_replica keepfiles`, mutant `replicadropsfiles`).
   Kept segments (a leader's flushed ones, a promoted replica's) are named in RSTATE (`kept`, saved before a drop can
   take their rows out of parts): a writer's open neither replays nor removes a segment at or below it.
+- **Settled parts** (R7; `src/ecpart.c`, `src/ecswap.c`, `src/settle.c`, `src/eckeep.c`, `src/ecgc.c`; design-cluster-data.md
+  §2.3 as it applies on one server). A settle turns the `p<K>_<A>_<B>_<L>.part` of a key into the `.ec` of the same name:
+  the file keeps its source's name and block range (D2), so it has the same rows, the same rank and the same key, and a
+  settle needs no gate, cut, marker or `ppos` (D1). Every path that takes a part out of the list must respect that:
+  - **Never a merge input.** An `.ec` part and a `settling` one are barriers in merge selection, rewrites, `tsdb_optimize`
+    and the TTL rewrite (`part_merge_barrier`), never a source of `pw_copy_granule`; a barrier is not counted in
+    `partition_parts`, and in `db_wait_merges` (backpressure) it is a wall, not a pair, so an insert never waits for a
+    settle in flight when no pair is left. A drop retires them (a settling part without waiting for the settle).
+  - **The swap checks its inputs under `db->lock`, in the hold of its renames** (`ec_swap_commit`): every source still
+    listed, not dropped, not merging, the engine not failed; else `TSDB_ERR_STOPPED`, nothing renamed, the temporaries
+    unlinked and the objects handed to r7-gc. A drop takes no `publish_lock` (`drop_retire` takes `latest_rw` and
+    `db->lock`), so a check made before those locks would list an `.ec` for a part the drop retired and bring its rows
+    back (mutant `swapnodropcheck`). The swap is **intent v4** (`tsdb-intent 4 n`, n `L tmp final` lines, n `R part
+    settled_part` lines, a hash), written and synced with its directory before any rename. Recovery asks one question:
+    did the swap rename anything? Any `.ec` (under its name or `retired_`) or `settled_` name on disk means the check
+    passed and the swap stands (a drop after it retires only the `.ec` parts), and a missing source then proves nothing;
+    nothing renamed with every tmp and source present rolls forward, with one missing rolls back; damage (a sealed
+    intent that breaks the name rules, an `.ec` under no name while its source is still `.part`, a lookup error that is
+    not ENOENT) fails the open with the intent kept. The directory is synced before the intent is unlinked, as every
+    rolled-forward intent now is (`tests/test_intents.c`).
+  - **The settle reads each byte once.** `eng_settle` checks the granule crcs, the footer hash and the class judgement on
+    the stripe copy it then encodes (`chunk_be_put_stream`): a check on a second read could pass on bytes that differ
+    from the encoded ones (mutant `settletwopass`). A CORRUPT check marks the part damaged and writes no chunk.
+  - **The read seam always checks**, with `verify_checksums` off too (above): an `.ec` granule is never decoded from
+    bytes nobody checked, so a damaged chunk is an erasure and never wrong values (mutants `seamnoverify`, `cachekeyoff`).
+  - **The source stays for `keep_s` from the record's `settle_ms`**, and for as long as its digest has not matched.
+    A digest that does not match sets `db->diverged`: the volume answers `TSDB_ERR_UNAVAILABLE`, the `settled_` files are
+    kept. The way out (a reverse intent that swaps `settled_` back, an operator command) comes with R15: in R7 the tier
+    is test-only, and tsdbd cannot yet say DIVERGED for it (docs/tasks/r7-keep-followups.md). E26's logical digest of the
+    visible rows is not built; R7's is a byte digest of the object (docs/tasks/r8-from-r7.md).
+  - **Chunks are deleted at the last reference.** A retired `.ec` keeps its `retired_` name until every chunk of its
+    object is gone, and nothing is deleted while any part of the object is referenced (`part_unref` -> `ecgc_last_unref`,
+    holds in the tier keyed (volume, oid)). The orphan sweep (D6) runs in the engine open after recovery and before any
+    thread of the engine starts, by file name, and queues only objects whose header names this volume's uuid; never put
+    chunks in a store before the sweep without `ecgc_test_nosweep`. No engine lock is held across an encode, a put or a
+    chunk delete.
+  - **Refused where unbuilt**: parts without granules and v8 parts are never settled; a cluster or replica volume, a
+    follower (a running one that meets an `.ec` name fails its engine with one line), a build without `TSDB_EC` and a
+    tier with a store that is not UP settle nothing. `TSDB_TEST_TIER` needs `TSDB_TEST_TIER_I_KNOW=1` and is test-only until
+    R15. The embedded bindings copy `src/*.c` and build without `TSDB_EC`: a volume whose META says `requires=tier` is then refused at open.
+  - **Late rows** go to young parts above the object and settle again as further objects of the key (E6); until R10
+    re-encodes, such a key reads more objects and tombstones in young parts hide rows the reader still decodes. Answers
+    do not change (`tests/test_settle_oracle.c`).
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
@@ -610,12 +700,15 @@ cgroup, so `nice` does not keep your work out of its way.
   snapshots and lookups of the volume wait for those round trips), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
-  is a leaf, and so are the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O)
+  is a leaf, and so are the granule cache's mutex (`src/eccache.c`: never held across I/O, an open or close, a decode or
+  another lock: a fill waits on its entry, not on the mutex), the digest's (`src/eckeep.c`), the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O)
   and the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
   sweeper takes `db->lock` only with it released). R7's settle: the policy's `ps->pmu` (`src/ecpolicy.c`: its fail list and eager count, taken under
   `db->lock` while the settle thread picks) is a leaf; the tier's settle mutex `st->mu` (`src/settle.c`) is never held
   across an engine call (the thread lets go of it around a settle), and `eng_halt`/`eng_close` wait on its cv with no
-  engine lock held. The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
+  engine lock held; no engine lock is held across a settle's encode or put, a chunk delete, a cache fill or a digest read (they
+  run on the settle thread, the gc worker, the digest thread or the reader's own thread, with the part pinned by a reference).
+  The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
   `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
   that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
   the warmer take `latest_rw` (read) > `db->lock`, a lookup then `buf_lock` in sub-holds. The window's `pmu`/`pcv` (a writer
