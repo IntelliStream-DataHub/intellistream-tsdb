@@ -38,9 +38,6 @@
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
-dir=${1:-/tmp}; shift || true
-mkdir -p "$dir" || exit 1
-# mutant, its scenario, an extended regular expression its FAIL line must match
 table=(
     "commitbyleader|replindet|a write with both replicas paused was answered"
     "floornotsaved|repcheck|restarted after its flushed segments went refused its log: the log starts above the commit floor"
@@ -85,33 +82,40 @@ table=(
     "demotestaleidx|deposetail|the deposed writer back in the ISR once the links are back: the ISR of rs has 2 members"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
+export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}
+export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same build as tsdbd (make tsan: build-tsan)
+row_of() { # the table's row of mutant $1 (empty when there is none)
+    local e
+    row=
+    for e in "${table[@]}"; do [ "${e%%|*}" = "$1" ] && row=$e; done
+    [ -n "$row" ] || return 1
+    rest=${row#*|}; s=${rest%%|*}; want=${rest#*|}
+}
+# one mutant, then its verdict: tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and
+# asks this script (--mutant-verify) whether the scenario failed with its oracle's own line
+case ${1:-} in
+--mutant-run)
+    row_of "$2" || { echo "mutant $2: no scenario is named for it in $0"; exit 0; }
+    TSDB_REPLD_MUTANT=$2 TSDB_CVOL_MUTANT=$2 exec "$TEST_CLUSTER" "$3" "$s" ;;
+--mutant-verify)
+    row_of "$2" || { echo "no scenario is named for it in $0"; exit 1; }
+    fail=$(grep -m1 FAIL "$4")
+    if [ "$3" -ne 0 ] && grep -m1 FAIL "$4" | grep -qE "$want"; then
+        echo "caught by $s ($fail)"
+    elif [ "$3" -ne 0 ]; then
+        echo "$s failed (rc $3) but not with its oracle's line /$want/: ${fail:-no FAIL line}"
+        exit 1
+    else
+        echo "$s passed"
+        exit 1
+    fi
+    exit 0 ;;
+esac
+dir=${1:-/tmp}; shift || true
+mkdir -p "$dir" || exit 1
 all=
 for e in "${table[@]}"; do all="$all ${e%%|*}"; done
 muts=${*:-$all}
-export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}
-survived=
-for m in $muts; do
-    row=
-    for e in "${table[@]}"; do [ "${e%%|*}" = "$m" ] && row=$e; done
-    if [ -z "$row" ]; then
-        echo "mutant $m: no scenario is named for it in $0"
-        survived="$survived $m"
-        continue
-    fi
-    rest=${row#*|}; s=${rest%%|*}; want=${rest#*|}
-    log="$dir/mut-$m-$s.log"
-    TSDB_REPLD_MUTANT=$m TSDB_CVOL_MUTANT=$m timeout 600 ./build/test_cluster "$dir" "$s" > "$log" 2>&1
-    rc=$?
-    fail=$(grep -m1 FAIL "$log")
-    if [ $rc -ne 0 ] && grep -m1 FAIL "$log" | grep -qE "$want"; then
-        echo "mutant $m: caught by $s ($fail)"
-    elif [ $rc -ne 0 ]; then
-        echo "mutant $m: $s failed (rc $rc) but not with its oracle's line /$want/: ${fail:-no FAIL line}"
-        survived="$survived $m"
-    else
-        echo "mutant $m: SURVIVED $s"
-        survived="$survived $m"
-    fi
-done
-[ -z "$survived" ] || { echo "not caught by their own oracle:$survived"; exit 1; }
-echo "every mutant was caught by its own oracle"
+# MUTANT_JOBS, MUTANT_URING_JOBS (every run starts tsdbd on io_uring unless the test says otherwise), MUTANT_TIMEOUT
+exec "$(dirname "$0")/../tools/mutants.sh" --name repld --tmp "$dir" --uring --timeout "${MUTANT_TIMEOUT:-600}" --fail \
+    --verify "$0" --list "$muts" -- "$0" --mutant-run @M@ @D@
