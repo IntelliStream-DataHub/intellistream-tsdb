@@ -64,7 +64,7 @@ static int chunk_store_cli(int argc, char **argv)
         fprintf(stderr, "tsdb chunk-store: %s is not a cluster uuid (32 hex digits)\n", cl);
         return 2;
     }
-    if (errno || !end || *end || id == 0 || id > UINT32_MAX) {
+    if (errno || !end || *end || id == 0 || id > UINT32_MAX || !(node[0] >= '0' && node[0] <= '9')) { /* digits only */
         fprintf(stderr, "tsdb chunk-store: %s is not a node id\n", node);
         return 2;
     }

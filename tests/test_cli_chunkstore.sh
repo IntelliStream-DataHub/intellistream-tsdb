@@ -43,6 +43,9 @@ refused "a uuid with a non-hex digit" init "$dir/bad" --cluster 0123456789abcdef
 refused "node 0" init "$dir/bad" --cluster $uuid --node 0
 refused "a node id past 32 bits" init "$dir/bad" --cluster $uuid --node 4294967296
 refused "a node id with a tail" init "$dir/bad" --cluster $uuid --node 3x
+refused "a node id with a leading space" init "$dir/bad" --cluster $uuid --node " 5"
+refused "a node id with a plus sign" init "$dir/bad" --cluster $uuid --node +5
+refused "a negative node id" init "$dir/bad" --cluster $uuid --node -1
 refused "a negative node id" init "$dir/bad" --cluster $uuid --node -1
 refused "no --node" init "$dir/bad" --cluster $uuid
 refused "no --cluster" init "$dir/bad" --node 1
