@@ -72,6 +72,8 @@ directory) and `path`.
 | `tsdb_workers`, `tsdb_workers_busy` | gauge | worker threads (extras start for slow clients), and those running a request |
 | `tsdb_request_memory_bytes`, `tsdb_request_memory_limit_bytes` | gauge | memory of requests received and not yet run (with large receive buffers and packed inserts being unpacked), and `--max-request-memory` |
 | `tsdb_metrics_scrapes_total`, `tsdb_metrics_rejected_total` | counter | this endpoint: scrapes answered, requests refused or timed out |
+| `tsdb_fwd_frames_total{peer}`, `tsdb_fwd_bytes_total{peer}` | counter | cluster only: requests this server forwarded to the member (`peer`, its node id) that leads their volume, and their bytes with the envelope (`--forward`) |
+| `tsdb_fwd_hop_seconds{peer,quantile}` | summary | cluster only: time from a forward's send to its reply, p50 and p99 of the recent ones; STATUS shows the same per peer (`peer.<id>.fwd.*`) |
 
 Not exported, although docs/design-latest.md 6.5 names them: the engine keeps no counters for why a lookup searched
 (`tsdb_latest_search_total{why}`), for the time lookups waited for a write section (`wait_seconds_total`) or for the

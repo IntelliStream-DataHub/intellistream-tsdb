@@ -197,7 +197,14 @@ cgroup, so `nice` does not keep your work out of its way.
   `strict_reads`, the production path); a read admitted under the lease (`lguard`) records which of its volumes are led
   here and at which epoch, and its first reply frame (after the snapshot) refuses it when that leadership changed
   (deposed, or deposed and promoted again) or the lease lapsed meanwhile: never "led now", which a read held across a
-  deposal answers from the demoted replica engine (`test_cluster readdepose`, mutant `leadnow` in repld_mutants.sh); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  deposal answers from the demoted replica engine (`test_cluster readdepose`, mutant `leadnow` in repld_mutants.sh); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each.
+  Forwarding (S2-2, `--forward on`, the default; `server/fwdreq.[ch]` the envelope and the entry's rules): where
+  route_decide would answer MOVED, the entry sends the frame one hop to the leader (`fwd_entry`, never retried: unsent by
+  `fwd_wait_ms` is UNAVAILABLE, written and lost closes the client's connection) and relays the reply; the owner runs it
+  on reserved workers (`fwd_serve`) through the same gates with the user's rights, MOVED when not led at the envelope's
+  epoch, UNAVAILABLE while its users lag the envelope's index; `tests/test_fwd.c` (fake link), `test_cluster
+  forward|fwdlease|fwddepose`, `make fwd-mutants` (`TSDBD_FWD_MUTANT`; test hooks `TSDBD_TEST_FWD_STALL`,
+  `TSDB_CLUSTER_TEST hold_copy_file|hold_users_file`). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants

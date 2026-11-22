@@ -882,6 +882,21 @@ reconnect (a node id in HELLO's reply is S3's). No test covers this case: `test_
 jepsen-cluster's clients follow MOVED by the node id through the harness's own table of nodes, never to the address in
 the body, so the client's own following after a restart is untested until S3.
 
+Forwarding (S2-2, `server/fwdreq.[ch]`, `--forward on`, the default on a `--cluster` server): instead of MOVED the entry
+node sends the request one hop to the volume's leader in an envelope (the epoch of its copy, hops 1, the arrival time,
+the user and the users applied index the entry logged her in with) and relays the reply as it comes, LAST_STATS
+included. It never retries (D30): a frame not written within `fwd_wait_ms` (2 s) is UNAVAILABLE and was not applied; a
+written one whose link breaks, or with no reply within `fwd_reply_ms`, closes the client's connection (unknown outcome,
+D12). The owner runs it on its own workers (`fwd_workers`) through the same gates as a direct request, the read lease
+among them (`test_cluster fwdlease`), with the user's rights; a volume not led here at the envelope's epoch is MOVED,
+never forwarded again (`fwddepose`); while its users are behind the envelope's index it answers UNAVAILABLE, never AUTH
+(`forward`, part i). A request older than `fwd_max_age_ms` (1 s) since it arrived at the entry, at the send or at the
+owner, is dropped as UNAVAILABLE: its client may have resent it by then. Residual (D-S3): the age counts from parsing
+at the entry, so link transit is not in it, and a client whose own timeout is under about 3 s (max age plus a reply's
+way back) gets no guarantee that a frame it gave up on is not applied later; S3's streams (`seq`) close that.
+`TSDBD_FWD_MUTANT` plants `fwdtwice fwdoldframe fwdunavonbreak fwdnouser fwdretry fwdnolease fwdnowait fwdauthlag`;
+`make fwd-mutants` and `test_fwd` must catch each.
+
 The Pulsar sink inherits this through the Java client. Its `ErrorClassifier` already retries unknown codes; MOVED,
 UNAVAILABLE and IO become explicitly retryable, DROPPED stays final. It acknowledges a Pulsar message only after tsdb's
 OK, so a failover costs it a pause, never a message.
