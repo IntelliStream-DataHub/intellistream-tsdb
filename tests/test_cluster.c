@@ -86,7 +86,28 @@ static void die(const char *fmt, ...)
     fprintf(stderr, "\n  (server logs in %s/n*.log)\n", base);
     va_end(ap);
     static int dying;
-    if (!dying++) { /* what every live server says, for the report */
+    if (!dying++) { /* a server a sanitizer stopped (halt_on_error) shows only as a timeout here: name its report */
+        for (int i = 0; i < N; i++) {
+            char path[PATH_MAX + 96], ln[512];
+            snprintf(path, sizeof path, "%s/n%d.log", base, i);
+            FILE *fp = fopen(path, "r");
+            int shown = -1;
+            while (fp && shown < 12 && fgets(ln, sizeof ln, fp)) {
+                if (shown < 0 && (strstr(ln, "WARNING: ThreadSanitizer") || strstr(ln, "ERROR: AddressSanitizer") ||
+                                  strstr(ln, "runtime error:"))) {
+                    fprintf(stderr, "  -- server %d's log has a sanitizer report (%s):\n", i, path);
+                    shown = 0;
+                }
+                if (shown >= 0) {
+                    fprintf(stderr, "  %s", ln);
+                    shown++;
+                }
+            }
+            if (fp)
+                fclose(fp);
+        }
+    }
+    if (dying == 1) { /* what every live server says, for the report */
         const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
         for (int i = 0; i < N; i++)
             if (pids[i] > 0 && pports[i] && !stopped[i]) {

@@ -213,6 +213,7 @@ struct rvol {
     int isr_want;
     struct repl_vmeta isr_req;
     uint64_t resigned; /* the epoch a RESIGN was said for */
+    uint64_t nofence_said; /* tests (nofencereply): the epoch whose withheld fence answer was said */
     uint32_t fence_from; /* the Raft leader whose FENCE the core is answering (its reply goes there) */
     /* min_isr after the append: a write admitted while the ISR was large enough, whose commit point is reached only
      * after a shrink below min_isr, is not acknowledged (the core's REPLY waits the same way, but the writer's waiters
@@ -609,11 +610,12 @@ static void meta_msg(struct rvol *rv, const struct repl_msg *m)
             char f[sizeof G.dir + 16];
             snprintf(f, sizeof f, "%s/nofencereply", G.dir);
             if (access(f, F_OK) == 0) {
-                static uint64_t said; /* the volume thread's; once per epoch is enough for a test's log */
-                if (said != m->epoch)
+                /* once per epoch and volume is enough for a test's log; per volume, not a static: every volume has
+                 * a thread of its own, and many withhold at once (test_cluster manystuck, a TSan race) */
+                if (rv->nofence_said != m->epoch)
                     say("volume %" PRIu32 ": withholds its answer to the fence for epoch %" PRIu64 " (nofencereply)",
                         rv->number, m->epoch);
-                said = m->epoch;
+                rv->nofence_said = m->epoch;
                 return;
             }
         }
