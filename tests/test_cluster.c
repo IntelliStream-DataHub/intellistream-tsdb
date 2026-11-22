@@ -8860,6 +8860,233 @@ static void scen_fwddepose(void)
            "the new leader %d (epoch %" PRIu64 ")\n", E, e0, L, Nw, v.epoch);
 }
 
+/* fwdload (S2-2): forwarding under load, without login. Three servers, --workers 2 --fwd-workers 1 on each; two volumes of
+ * one replica, vx led on X and vy on Y (X != Y).
+ * f. A slow reader (QUERY_RAW of 6 M rows through Y, about 5 s to read) beside a stream of one-row inserts through Y to
+ *    the same owner X: the reader's chunks wait for credit on X's only reserved worker, which must count as waiting
+ *    (the pool grows), so every insert answers and their p99 stays small; the reader gets every row (ha.md 15.4: the
+ *    insert p99 holds and the link survives). Mutant fwdchunknowait.
+ * g. X and Y forward to each other under load: 4 clients on each write the other's volume and read 5-chunk replies
+ *    from it; everything answers within the bound. Mutant fwdinline (a forward served on the links' dispatcher: two
+ *    owners each wait for credit that only the other's dispatcher would let through). */
+struct fl_read {
+    tsdbc *c;
+    tsdb_sid id;
+    int64_t lo, hi;
+    uint64_t rows, ms;
+    int rc, slow;
+};
+
+static int fl_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ts, (void)v;
+    struct fl_read *r = ctx;
+    r->rows += n;
+    if (r->slow) {
+        struct timespec d = {0, (long)n * 800}; /* 6 M rows: about 5 s */
+        nanosleep(&d, NULL);
+    }
+    return 0;
+}
+
+static void *fl_read_run(void *arg)
+{
+    struct fl_read *r = arg;
+    uint64_t t0 = now_ms();
+    r->rc = tsdbc_query_raw(r->c, r->id, r->lo, r->hi, fl_cb, r);
+    r->ms = now_ms() - t0;
+    return NULL;
+}
+
+#define FL_BIG 6000000
+#define FL_T0 1700000000000LL
+
+/* n rows of id from FL_T0, 10 ms apart, in calls of 500,000, on the leader */
+static void fl_fill(tsdbc *c, tsdb_sid id, size_t n)
+{
+    size_t step = 500000;
+    int64_t *ts = malloc(step * sizeof *ts);
+    float *v = malloc(step * sizeof *v);
+    if (!ts || !v)
+        die("out of memory");
+    for (size_t k = 0; k < n; k += step) {
+        size_t m = n - k < step ? n - k : step;
+        for (size_t i = 0; i < m; i++)
+            ts[i] = FL_T0 + (int64_t)(k + i) * 10, v[i] = (float)(k + i);
+        int rc = tsdbc_insert_series(c, id, ts, v, m);
+        if (rc != 0)
+            die("loading %zu rows: %s", n, ers(rc));
+    }
+    free(ts);
+    free(v);
+}
+
+static int fl_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+struct fl_peer {
+    int s;              /* entry server */
+    tsdb_sid big;       /* the other volume's big series (read) */
+    char vol[16];       /* the other volume (written) */
+    int k, rc, iters;
+    const char *what;
+    atomic_int *done;
+};
+
+static void *fl_peer_run(void *arg)
+{
+    struct fl_peer *p = arg;
+    tsdbc *c = client(p->s);
+    char nm[48];
+    snprintf(nm, sizeof nm, "g.%d.%d", p->s, p->k);
+    tsdb_sid id = rep_series(c, nm, p->vol, 30000);
+    int64_t ts[100];
+    float v[100];
+    for (int it = 0; it < 200 && !p->rc; it++, p->iters++) {
+        for (int i = 0; i < 100; i++)
+            ts[i] = FL_T0 + (int64_t)(it * 100 + i) * 1000, v[i] = (float)i;
+        if ((p->rc = tsdbc_insert_series(c, id, ts, v, 100)) != 0) {
+            p->what = "insert";
+            break;
+        }
+        if (it % 40 == 20) { /* 400,000 rows: 4.8 MB, five chunks, past the first credit of four */
+            struct fl_read r = {.c = c, .id = p->big, .lo = FL_T0 + (int64_t)p->k * 1000000, .hi = 0};
+            r.hi = r.lo + 400000LL * 10;
+            fl_read_run(&r);
+            if ((p->rc = r.rc) == 0 && r.rows != 400000)
+                p->rc = -1000000 - (int)r.rows;
+            if (p->rc)
+                p->what = "read";
+        }
+    }
+    tsdbc_close(c);
+    atomic_fetch_add(p->done, 1);
+    return NULL;
+}
+
+static void scen_fwdload(void)
+{
+    scenario("fwdload");
+    strict_reads = 1;
+    fwd_on = 1;
+    const char *mut = getenv("TSDBD_FWD_MUTANT");
+    static char menv[160];
+    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s", mut ? mut : "");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = menv;
+        xargs[i] = "--workers 2 --fwd-workers 1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int X = -1, Y = -1, rc;
+    char vx[16] = "", vy[16] = "";
+    for (int k = 0; k < 12 && Y < 0; k++) {
+        char nm[16];
+        uint32_t num;
+        struct meta_volume s;
+        snprintf(nm, sizeof nm, "ld%d", k);
+        if ((rc = vol_add(0, nm, 1, &num)) != 0)
+            die("volume add %s: %s", nm, cluster_strerror(rc));
+        if (!vol_rec(0, nm, &s))
+            die("no record of %s", nm);
+        int l = server_of(s.leader);
+        await_open_gen(0, nm, l, 1, 0);
+        if (X < 0)
+            X = l, snprintf(vx, sizeof vx, "%s", nm);
+        else if (l != X)
+            Y = l, snprintf(vy, sizeof vy, "%s", nm);
+    }
+    if (Y < 0)
+        die("12 volumes of one replica, all led on server %d", X);
+
+    tsdbc *cx = client(X), *cy = client(Y);
+    tsdb_sid bigx = rep_series(cx, "f.big", vx, 30000), bigy = rep_series(cy, "g.big", vy, 30000);
+    tsdb_sid small = rep_series(cx, "f.small", vx, 30000);
+    fl_fill(cx, bigx, FL_BIG);
+    fl_fill(cy, bigy, 4 * 1000000 / 10 + 400000); /* every thread's window of g (k * 1e6 ms + 400,000 rows) */
+    tsdbc_close(cx);
+    tsdbc_close(cy);
+
+    /* f. the slow reader and the insert stream, both through Y to X */
+    struct fl_read r = {.c = client(Y), .id = bigx, .lo = 0, .hi = INT64_MAX / 2, .slow = 1};
+    pthread_t th;
+    if (pthread_create(&th, NULL, fl_read_run, &r) != 0)
+        die("pthread_create");
+    usleep(700000);
+    tsdbc *ci = client(Y);
+    uint64_t lat[4096];
+    size_t nl = 0;
+    for (int64_t t = FL_T0; nl < sizeof lat / sizeof lat[0]; t += 1000) {
+        float v = 1;
+        uint64_t t0 = now_ms();
+        rc = tsdbc_insert_series(ci, small, &t, &v, 1);
+        lat[nl++] = now_ms() - t0;
+        if (rc != 0)
+            die("insert %zu through %d to %d beside a slow reader: %s after %" PRIu64 " ms", nl, Y, X, ers(rc),
+                lat[nl - 1]);
+        if (r.ms) /* the reader is done */
+            break;
+        usleep(5000);
+    }
+    pthread_join(th, NULL);
+    tsdbc_close(r.c);
+    tsdbc_close(ci);
+    if (r.rc != 0 || r.rows != FL_BIG)
+        die("the slow reader through %d: %s, %" PRIu64 " rows of %d", Y, ers(r.rc), r.rows, FL_BIG);
+    if (r.ms < 3000)
+        die("the slow reader took %" PRIu64 " ms: not slow enough to hold the owner's worker", r.ms);
+    qsort(lat, nl, sizeof lat[0], fl_cmp);
+    uint64_t p99 = lat[nl * 99 / 100], mx = lat[nl - 1];
+    if (nl < 50)
+        die("only %zu inserts beside the slow reader", nl);
+    if (p99 > 300)
+        die("inserts through %d to %d beside a slow reader (%" PRIu64 " ms, --fwd-workers 1): p99 %" PRIu64
+            " ms, max %" PRIu64 " ms over %zu",
+            Y, X, r.ms, p99, mx, nl);
+    printf("  a slow reader of %d rows through %d (%" PRIu64 " ms) beside %zu inserts to the same owner %d: insert "
+           "p50 %" PRIu64 " ms, p99 %" PRIu64 " ms, max %" PRIu64 " ms\n",
+           FL_BIG, Y, r.ms, nl, X, lat[nl / 2], p99, mx);
+
+    /* g. X and Y forward to each other: writes to the other's volume, reads of 5 chunks from it */
+    atomic_int done = 0;
+    struct fl_peer pp[8];
+    pthread_t pt[8];
+    for (int k = 0; k < 8; k++) {
+        int s = k < 4 ? X : Y;
+        pp[k] = (struct fl_peer){.s = s, .k = k % 4, .big = s == X ? bigy : bigx, .done = &done};
+        snprintf(pp[k].vol, sizeof pp[k].vol, "%s", s == X ? vy : vx);
+        if (pthread_create(&pt[k], NULL, fl_peer_run, &pp[k]) != 0)
+            die("pthread_create");
+    }
+    uint64_t t0 = now_ms();
+    while (atomic_load(&done) < 8) {
+        if (now_ms() - t0 > 90000) {
+            for (int k = 0; k < 8; k++)
+                fprintf(stderr, "  client %d on %d: %d of 200 rounds\n", k, pp[k].s, pp[k].iters);
+            die("servers %d and %d forwarding to each other (--workers 2) did not finish in 90 s", X, Y);
+        }
+        usleep(20000);
+    }
+    uint64_t took = now_ms() - t0;
+    for (int k = 0; k < 8; k++) {
+        pthread_join(pt[k], NULL);
+        if (pp[k].rc)
+            die("client %d on %d forwarding to %d: its %s after %d rounds: %s", k, pp[k].s, pp[k].s == X ? Y : X,
+                pp[k].what, pp[k].iters, pp[k].rc < -1000000 ? "a short read" : ers(pp[k].rc));
+    }
+    stop_all();
+    printf("  servers %d and %d forwarding to each other (8 clients, --workers 2): 1,600 inserts and 40 reads of 4.8 MB "
+           "in %" PRIu64 " ms\n",
+           X, Y, took);
+}
+
 
 /* promoteslow (review F3): a promotion that takes longer than the 3 s after which the Raft leader takes a record leader
  * whose driver does not lead for deposed (leader_deposed: a fence nobody followed up). Every server's swap to the writer
@@ -10312,7 +10539,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

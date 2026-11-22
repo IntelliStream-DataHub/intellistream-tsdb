@@ -2491,7 +2491,8 @@ static int route_mutant; /* TSDB_ROUTE_MUTANT (tests: each must fail test_cluste
 /* TSDBD_FWD_MUTANT (tests: each must fail test_cluster forward or test_fwd): a forward forwarded again, no age check,
  * a broken link answered UNAVAILABLE, the owner runs a forward unchecked (no user), a lost forward sent again, the
  * owner skips the lease, no worker_waits around a forward's wait, AUTH while the owner's users are behind */
-enum { FWM_NONE, FWM_TWICE, FWM_OLDFRAME, FWM_UNAVONBREAK, FWM_NOUSER, FWM_RETRY, FWM_NOLEASE, FWM_NOWAIT, FWM_AUTHLAG };
+enum { FWM_NONE, FWM_TWICE, FWM_OLDFRAME, FWM_UNAVONBREAK, FWM_NOUSER, FWM_RETRY, FWM_NOLEASE, FWM_NOWAIT, FWM_AUTHLAG,
+       FWM_CHUNKNOWAIT, FWM_INLINE };
 static int fwdx_mutant;
 static int fwd_entry(req *r, uint32_t v);
 static __thread const struct cluster_copy *rt_cp;
@@ -3837,11 +3838,13 @@ static int fwdo_chunk(struct fwdo *o, const uint8_t *p, size_t n, int last)
 {
     int64_t until = mono_ms() + 2LL * send_timeout_s * 1000; /* a backstop: a dead entry node ends the link first */
     int rc;
-    worker_waits(1);
+    if (fwdx_mutant != FWM_CHUNKNOWAIT)
+        worker_waits(1);
     do
         rc = fwd_chunk(o->f, &o->from, o->frame_id, p, n, last, 1000);
     while ((rc == FWD_E_TIMEOUT || rc == FWD_E_FULL) && !atomic_load(&fwd_stop) && mono_ms() < until);
-    worker_waits(-1);
+    if (fwdx_mutant != FWM_CHUNKNOWAIT)
+        worker_waits(-1);
     return rc;
 }
 
@@ -3886,6 +3889,7 @@ static pthread_cond_t fwd_cv = PTHREAD_COND_INITIALIZER, fwd_gone_cv = PTHREAD_C
 static struct fjob *fq_head, *fq_tail;
 static int fwd_running, fwd_waiting;
 static void *fwd_worker_main(void *arg);
+static void fwd_serve(struct fjob *j);
 
 static void fwd_spawn(bool extra) /* fwd_lock held */
 {
@@ -3931,6 +3935,13 @@ static void fwd_on_event(void *arg, const struct fwd_ev *ev)
     }
     *j = (struct fjob){.from = ev->from, .frame_id = ev->frame_id, .kind = ev->kind, .t_in = now_ns(), .n = ev->n};
     memcpy(j->p, ev->p, ev->n);
+    if (fwdx_mutant == FWM_INLINE) { /* served on the dispatcher, which also delivers the chunks this node awaits */
+        fwd_owner = true;
+        fwd_serve(j);
+        fwd_owner = false;
+        free(j);
+        return;
+    }
     pthread_mutex_lock(&fwd_lock);
     if (fq_tail)
         fq_tail->next = j;
@@ -5773,7 +5784,8 @@ int main(int argc, char **argv)
     }
     if (getenv("TSDBD_FWD_MUTANT") && *getenv("TSDBD_FWD_MUTANT")) {
         static const char *const names[] = {"",        "fwdtwice", "fwdoldframe", "fwdunavonbreak", "fwdnouser",
-                                            "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag"};
+                                            "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag",
+                                            "fwdchunknowait", "fwdinline"};
         for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
             if (strcmp(getenv("TSDBD_FWD_MUTANT"), names[i]) == 0)
                 fwdx_mutant = i;
