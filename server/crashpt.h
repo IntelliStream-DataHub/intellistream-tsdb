@@ -32,7 +32,10 @@
     X(CP_WAL_BEFORE_SEND, "wal-before-send")           /* leader: its WAL write is durable, nothing sent (r3d) */   \
     X(CP_ACKED_BEFORE_OK, "acked-before-ok")           /* leader: replicas acknowledged, the client has no OK (r3d) */ \
     X(CP_PREPARED_BEFORE_COMMIT, "prepared-before-commit") /* a large write: PREPARED sent, COMMIT not (r3d/r3e) */ \
-    X(CP_CLASS_SWITCH, "class-switch")                 /* during a partition class switch (r3e) */
+    X(CP_CLASS_SWITCH, "class-switch")                 /* during a partition class switch (r3e) */           \
+    X(CP_FENCE_SAVED, "fence-saved-before-reply")      /* a replica saved a FENCE in REPL, its reply not sent */ \
+    X(CP_PROMOTE_BEFORE_EPOCH, "promote-before-epoch") /* named leader of e+1, its EPOCH marker not written */  \
+    X(CP_DEPOSE_BEFORE_REOPEN, "depose-before-reopen") /* a deposed writer closed, not yet open as a replica */
 
 enum crash_point_id {
 #define X(id, name) id,

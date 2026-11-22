@@ -38,8 +38,27 @@ void ecswap_eng_close(eng *db);
  * threads that swap start. */
 extern void (*ec_swap_hook)(eng *db);
 
+/* The settle's own crash points (src/settle.c) of TSDB_SETTLE_CRASH_AT, which this file reads: after-put (the chunks
+ * are durable) and after-ec-tmp (the tmp_*.ec is durable too, no intent written) */
+enum { ECSWAP_CRASH_AFTER_PUT = 1, ECSWAP_CRASH_AFTER_EC_TMP = 2 };
+void ecswap_crash_point(int which);
+
 /* tests: what publishes MANIFEST after a swap (manifest_publish) */
 extern int (*ec_swap_publish)(eng *db);
+
+/* tests: one planted failure, used once: AT_NOMEM the swap's own allocation (before anything is written), INTENT_NOMEM
+ * intent_write's buffer (nothing written), INTENT_IO the intent written whole and then reported failed (as a failed
+ * fdatasync: its name is removed and never synced) */
+enum { ECSWAP_FAIL_NONE = 0, ECSWAP_FAIL_AT_NOMEM, ECSWAP_FAIL_INTENT_NOMEM, ECSWAP_FAIL_INTENT_IO };
+extern atomic_int ecswap_test_fail;
+/* tests: runs in a refused swap's cleanup after the temporaries were unlinked and before the directory sync that makes
+ * that durable (and before any object goes to r7-gc) */
+extern void (*ecswap_discard_hook)(eng *db);
+/* tests: runs in a refused swap's cleanup right after its objects were handed to r7-gc */
+extern void (*ecswap_handed_hook)(eng *db);
+/* tests: runs in a failed intent write with the intent still named, before its unlink (another thread's directory
+ * sync can come exactly there) */
+extern void (*ecswap_intent_fail_hook)(eng *db);
 
 /* planted bugs (tests/test_ecswap.c --mutant NAME; the Makefile requires each to fail it) */
 enum {

@@ -21,8 +21,18 @@ void cvol_stop(void);
  * leader while it holds no read lease (cluster_lease_valid: no Raft leader's answer extended it). -1: v is no
  * cluster volume of this server or nothing is wrong with it. */
 int cvol_why(uint32_t v);
+/* 1 under TSDB_REPLICA_READS=1 (a test hook standing in for design-cluster.md 7.2's REPLICA_OK, not built): a replica
+ * that holds a read lease answers reads from what it applied. Otherwise every read of a replicated volume goes to its
+ * leader (D5): a replica, a deposed leader above all, may not have applied a write the new leader acknowledged. */
+int cvol_replica_reads(void);
 /* 1 when volume v is a cluster volume open and led here (whatever the lease says) */
 int cvol_led(uint32_t v);
+/* cvol_led, and the epoch it leads (the replication driver's; 0 for a writer the manager opened, which no driver
+ * deposes): a leader deposed and promoted again leads a later epoch, so (1, epoch) names one leadership */
+int cvol_lead(uint32_t v, uint64_t *epoch);
+/* 1: volume v's record names another server as leader and no ISR member is up in the group's view (design-cluster.md
+ * 6.2): UNAVAILABLE(NO_OWNER) until a member returns or an operator forces a leader, not MOVED to a dead server */
+int cvol_no_owner(uint32_t v);
 /* 1 once cvol_start ran: an engine's READONLY on a cluster volume becomes UNAVAILABLE (FENCED). */
 int cvol_active(void);
 /* 1 once the manager went through the volume records of a metadata copy: before that a volume name it does not know

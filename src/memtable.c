@@ -1023,8 +1023,8 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
     int rc = db->lrs ? 0 : leader_rs_open(db); /* RSTATE before the first marker */
     if (rc)
         return rc;
-    if (eng_test_mutant != MUT_LEADER_NO_SWEEP)
-        leader_links_sweep(db); /* an earlier leadership's links, or a promoted replica's stages: no marker here needs them */
+    /* an earlier leadership's links, or a promoted replica's stages: no marker here needs them; keep_ files are served */
+    leader_links_sweep(db, eng_test_mutant != MUT_LEADER_NO_SWEEP);
     pthread_mutex_lock(&db->lock); /* rows of positions below the log end at the attach are in no wtail entry */
     pthread_mutex_lock(&db->buf_lock);
     db->wtail_from = MAX(db->wtail_from, db->fno_next);
@@ -1799,8 +1799,12 @@ void *flusher_main(void *arg)
     while (!db->flusher_stop) {
         int64_t interval = db->opt.flush_interval_ms > 0 ? db->opt.flush_interval_ms : 1000;
         int64_t due = db->active->rows ? db->active->created_ms + interval : mono_ms() + interval;
-        if (db->opt.wal_sync_ms > 0)
-            due = MIN(due, db->last_wal_sync_ms + db->opt.wal_sync_ms);
+        if (db->opt.wal_sync_ms > 0) {
+            int64_t sync_due = db->last_wal_sync_ms + db->opt.wal_sync_ms; /* the clock starts at the open (db.c) */
+            due = MIN(due, sync_due);
+            if (atomic_load_explicit(&db->st_sync_due0, memory_order_relaxed) == 0)
+                atomic_store_explicit(&db->st_sync_due0, sync_due, memory_order_relaxed);
+        }
         /* a leader's clock duties (eng_leader_clock): the next NOW marker, the idle seal of the active memtable */
         uint64_t now_every = atomic_load(&db->lead_now_ms), seal_ms = atomic_load(&db->lead_seal_ms);
         bool lead = eng_jr(db) && !db->rp;
@@ -1849,6 +1853,10 @@ void *flusher_main(void *arg)
         int rc = eng_check(db); /* a failed engine writes nothing more */
         if (rc == 0 && sync) {
             rc = wal_commit(db, target);
+            uint64_t k = atomic_load_explicit(&db->st_periodic_syncs, memory_order_relaxed);
+            if (k < 2)
+                atomic_store_explicit(&db->st_sync_at[k], now, memory_order_relaxed);
+            atomic_fetch_add_explicit(&db->st_periodic_syncs, 1, memory_order_release);
             db->last_wal_sync_ms = now;
         }
         if (rc == 0 && flush)
@@ -1860,6 +1868,7 @@ void *flusher_main(void *arg)
         pthread_mutex_lock(&db->buf_lock);
         if (rc && !db->bg_error && rc != TSDB_ERR_INDETERMINATE) /* a deposed leader refuses writes on its own */
             db->bg_error = rc;
+        atomic_fetch_add_explicit(&db->st_flusher_rounds, 1, memory_order_release);
     }
     pthread_mutex_unlock(&db->buf_lock);
     return NULL;

@@ -35,7 +35,9 @@
 #include "internal.h"
 #include "chunk.h"
 #include "eccache.h"
+#include "ecgc.h"
 #include "ecpart.h"
+#include "settle.h"
 #include "tier.h"
 
 #include <dirent.h>
@@ -578,6 +580,9 @@ static void case_down(h *x)
     eng_close(x->db);
     x->db = NULL;
     move_store(1, true);
+    /* the settle thread reads t->be (tier_writable) for every engine it holds; it is stopped for good before the
+     * backend is swapped below, as no tier does outside this test (settles are not what this case is about) */
+    ecsettle_tier_quiesce(x->t);
     eccache_test_drop(x->t); /* no object stays open through the backend about to close */
     chunk_be_close(x->t->be);
     x->t->be = NULL;
@@ -1168,6 +1173,8 @@ static void run(void)
 
 int main(int argc, char **argv)
 {
+    /* the objects here are attached in memory, named by no .ec file: a reopen's sweep (R7 D6) would delete them */
+    atomic_store(&ecgc_test_nosweep, true);
     int a = 1;
     if (a < argc && !strcmp(argv[a], "--mutant")) {
         const char *m = a + 1 < argc ? argv[a + 1] : "";

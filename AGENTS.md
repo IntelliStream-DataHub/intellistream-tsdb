@@ -39,6 +39,9 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # (crash points: server/crashpt.h, TSDB_CRASH_AT=name[:n] -> _exit(99)) and power (crashfs), workloads meta
                           # and kv-local (a cluster volume of 1 replica per node); JEPSEN_SECONDS, JEPSEN_NEMESES, JEPSEN_SEED,
                           # JEPSEN_NODES, both IO backends; tests/jepsen/jepsen_cluster.c; make jepsen-cluster-selftest plants what it must catch (not part of jepsen-cluster)
+                          # (kv/classes: the nemeses aim at kvr's leader too, the clients roam and follow MOVED to it; JEPSEN_TERMINAL=name
+                          # picks the run's terminal crash point, failover points included; JEPSEN_TRACE=1 stamps the nemesis's
+                          # actions and kvr's leader changes in ms and details the first stale reads)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
@@ -203,7 +206,13 @@ cgroup, so `nice` does not keep your work out of its way.
   instance is freed only after tsdbd's workers are joined (`fwd_cluster_free`), `test_cluster fwdlinks`. The entry node's decision is `route_decide` in `server/tsdbd.c` (D5, S2-1:
   served only where every cluster volume of the request is led here, else MOVED to the copy's leader, reads included, or
   UNAVAILABLE NO_OWNER/PROMOTING; before any right on an id is checked; a frame spanning two owners is INVALID;
-  docs/design-cluster.md 6.4); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  docs/design-cluster.md 6.4; NO_OWNER when no ISR member is UP, 6.2); a refusal after it (a leader deposed by a failover
+  before the engine call) takes the same answer (`route_fill` in `frame_put`), and `TSDB_REPLICA_READS=1` (a test hook) lets
+  a replica that holds a lease serve reads (test_cluster defaults to it: a scenario about a read's safety sets
+  `strict_reads`, the production path); a read admitted under the lease (`lguard`) records which of its volumes are led
+  here and at which epoch, and its first reply frame (after the snapshot) refuses it when that leadership changed
+  (deposed, or deposed and promoted again) or the lease lapsed meanwhile: never "led now", which a read held across a
+  deposal answers from the demoted replica engine (`test_cluster readdepose`, mutant `leadnow` in repld_mutants.sh); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants
@@ -247,6 +256,31 @@ cgroup, so `nice` does not keep your work out of its way.
   (heal, repair, settle, attach, replace: rebuilt chunks are checked against the survivors' sums, written as new files at
   the object's epoch, never from fewer than k' positions, never for what `live` says is deleted; a new store gets every
   fence before its first chunk). `tests/test_chunk.c`, `tests/test_chunk_heal.c` (mutants in the Makefile).
+- `src/ecgc.c` (R7, r7-gc): the objects of retired `.ec` parts and orphans. A retired `.ec` keeps its `retired_` name
+  until every chunk of its object is deleted (`part_unref` leaves it: `ecgc_owns_name`); nothing is deleted while a part
+  of the object is referenced (holds in the tier, keyed (volume, oid)); the chunk I/O runs on the tier's worker, never
+  under an engine lock. The open sweeps (D6: after recovery, before any thread of the engine starts) the objects no
+  listed or retired name names, by file name only, reading one header per such object: only those whose header names
+  the volume's uuid are queued (another database on the same stores is left alone; `chunk_store_del` too refuses a
+  chunk of another vuuid as NOTFOUND). A test that puts objects named by no `.ec` file and reopens sets
+  `ecgc_test_nosweep` (test_seam, test_tier). `tests/test_ecgc.c` (mutants in the Makefile).
+- `src/settle.c`, `src/ecpolicy.c` (R7, design-cluster-data.md E5-E7, E26): `eng_settle` turns a key's parts into `.ec`
+  parts in ONE pass over each part's map (each stripe copied once; the granule crcs, the header, index and footer hash
+  and the CLASSES judgement are checked on that copy, which is what is encoded: never read the map twice), then
+  `ec_index_write` and one `ec_swap_commit`. Pinned by `settling` under `db->lock`; merging, damaged, v8, pending and
+  granule-less parts are skipped, a dropping key is skipped whole; refused on a cluster or replica volume (D1), without
+  a tier and while a store is not UP (`tier_writable`). A CORRUPT check marks the part damaged; any failure hands its
+  own chunks to r7-gc, each object once (a NOMEM intent write: the caller, never the swap too). A refused swap
+  (`swap_discard`) hands them over only after the directory fsync of its unlinks (until then a power cut can bring the
+  intent back with its temporaries and roll it forward), also after a failed intent write, and never on a failed
+  engine (the next open's sweep takes them). One settle thread per tier (nice 19, one settle at a time; never `jr_serial`, `flush_lock`,
+  `cls_rw`); `eng_halt` and `eng_close` stop and wait for a settle of their engine. The policy (`ecpolicy_pick_locked`,
+  ages from `eng_now_ms`): class 0 a key after `grace_s` once no merge of it is selectable; classes 1-3 part by part, at
+  most once per `coarse_s` from the newest `.ec` record's settle time; `eager` (jepsen) after a merge round or above
+  1 MiB, 30 a minute; a failed key waits an hour. `tests/test_settle.c` (mutants `ecrankdown settlenocheck
+  settletwopass settlebusy coarsewhole`; the failure paths' handoffs `gcskip* gccommitted gcdouble` (gcpaths), `gcearly
+  nullnosync syncfailgo` (gcpower, crashfs), `nohaltstop` (halt)); `tests/test_settle_oracle.c` against an unsettled
+  twin (`tests/oracle_mutants.sh`: a mutant counts as caught only by its own line).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
@@ -423,6 +457,12 @@ cgroup, so `nice` does not keep your work out of its way.
   segments for the replicas (`eng_leader_keep`): one goes only once its last position is at or below min(the driver's
   keep bound, the commit point), after `fno_require`, by its own name (`lk_unlink_upto`: kept numbers jump at a promotion,
   so never through `wal_unlink_upto`'s run of consecutive ones); `wal_removed` never passes one still on disk.
+  A replica keeps its flushed segments as well, past its saved commit floor, under the same caps (`replica_keep_cap`,
+  `replica_keep_next` before its open; `unl_cap_bound` counts from the newest back), so that, promoted, it can serve a
+  member that was away (`test_cluster failoverkeep`, mutant `replicadropsfloor`); never one above the floor.
+  The files of the committed COMMIT markers in kept segments stay with them on every member as `keep_<pos>_<key>.part`
+  (a replica's apply and open rename the stage_ file; a leader serves them from its attach, by position, never by name
+  alone; `test_replica keepfiles`, mutant `replicadropsfiles`).
   Kept segments (a leader's flushed ones, a promoted replica's) are named in RSTATE (`kept`, saved before a drop can
   take their rows out of parts): a writer's open neither replays nor removes a segment at or below it.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
@@ -585,8 +625,12 @@ cgroup, so `nice` does not keep your work out of its way.
   snapshots and lookups of the volume wait for those round trips), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
-  is a leaf, and so is the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
-  sweeper takes `db->lock` only with it released). The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
+  is a leaf, and so are the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O)
+  and the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
+  sweeper takes `db->lock` only with it released). R7's settle: the policy's `ps->pmu` (`src/ecpolicy.c`: its fail list and eager count, taken under
+  `db->lock` while the settle thread picks) is a leaf; the tier's settle mutex `st->mu` (`src/settle.c`) is never held
+  across an engine call (the thread lets go of it around a settle), and `eng_halt`/`eng_close` wait on its cv with no
+  engine lock held. The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
   `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
   that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
   the warmer take `latest_rw` (read) > `db->lock`, a lookup then `buf_lock` in sub-holds. The window's `pmu`/`pcv` (a writer
@@ -659,7 +703,14 @@ cgroup, so `nice` does not keep your work out of its way.
   as end of file, skip a part or drop a WAL record quietly. The one exception:
   granule payloads are hashed only with `verify_checksums` (default off), so
   without it a damaged granule decodes to wrong values; decoders must therefore
-  be safe (no UB, no overread) on any bytes. With `fsync = 0` a power loss looks
+  be safe (no UB, no overread) on any bytes. Wrong timestamps are refused all the same, with or without the
+  checksum: `granule_decode` fails a granule (`TSDB_ERR_CORRUPT`) whose decoded timestamps do not strictly increase
+  within its entry's [ts_min, ts_max], because every reader takes that as given: `src_fill` clips a query's range by
+  the entry's ends, and the bucketers index their arrays by each row's bucket (`fold_into` wrote outside them;
+  `test_damage` `test_ts_damage`, `test_ts_verified`). The order is checked inside the timestamp decoders
+  (`block_decode_ts_sorted`: one overflow test per DoubleDelta run of unchanged deltas, a compare per other row while
+  it is in a register; `test_tsdb` `test_ts_sorted`, `fuzz_codec` against the plain decoders), the window at the two
+  ends; `GW_LOC` loads them. A new timestamp transform needs its `_sorted` form. With `fsync = 0` a power loss looks
   like damage and fails the open.
 - **Protocol.** Until 1.0 (0.9.0 is the first release, 2026-11-05) the wire protocol may change
   without keeping old clients working (decided on 2026-10-24; the changelog of the release that moves it names

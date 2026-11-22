@@ -50,13 +50,13 @@ typedef struct eng eng;
 /* Planted mutations: a test sets eng_test_mutant (tests link the engine) and must then fail, to show that it
  * catches the bug; nothing in the library or the server ever sets it. */
 enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS, MUT_FNO_NOSYNC, MUT_FEED_NOSEAL, MUT_FEED_LATEFLOOR,
-       MUT_FLUSH_NOCLOSE,
+       MUT_FLUSH_NOCLOSE, MUT_WALSYNC_FROM_ZERO,
        MUT_REPLICA_APPLY_ALL, MUT_REPLICA_ACK_UNSYNCED, MUT_REPLICA_KEEP_CUT, MUT_REPLICA_NO_FLOOR, MUT_REPLICA_WALL_CLOCK, MUT_REPLICA_NO_POS,
-       MUT_REPLICA_NO_OPEN_SYNC, MUT_REPLICA_NO_GAP_CHECK, MUT_REPLICA_NO_TORN_CUT, MUT_REPLICA_NO_FLOOR_CHECK,
+       MUT_REPLICA_NO_OPEN_SYNC, MUT_REPLICA_NO_GAP_CHECK, MUT_REPLICA_NO_LEFTOVER_DROP, MUT_REPLICA_GAP_BY_SEQ, MUT_REPLICA_GAP_NO_KEPT, MUT_REPLICA_NO_TORN_CUT, MUT_REPLICA_NO_FLOOR_CHECK,
        MUT_REPLICA_NO_DURABLE_GATE, MUT_REPLICA_NO_APPLY_CONTIG, MUT_REPLICA_NO_SEALED_RULE, MUT_REPLICA_NO_ROT_SYNC,
        MUT_REPLICA_NO_CUT_GEN, MUT_REPLICA_NO_CUT_SYNC, MUT_REPLICA_NO_CUT_DIRSYNC, MUT_REPLICA_NO_REPLAY_SKIP,
        MUT_REPLICA_NO_NOW_MARKER, MUT_REPLICA_COMMIT_CLOCK, MUT_REPLICA_EARLY_SEAL,
-       MUT_REPLICA_NO_STAGE_HOLD, MUT_REPLICA_NO_COMMIT_FLUSH, MUT_REPLICA_NO_DONE_SKIP, MUT_REPLICA_KEEP_STAGED,
+       MUT_REPLICA_NO_STAGE_HOLD, MUT_REPLICA_CUT_NO_HOLD, MUT_REPLICA_NO_COMMIT_FLUSH, MUT_REPLICA_NO_DONE_SKIP, MUT_REPLICA_KEEP_STAGED,
        MUT_REPLICA_NO_DROP_SKIP, MUT_REPLICA_NO_DROP_FLUSH, MUT_REPLICA_NO_STAGE_SYNC,
        MUT_REPLICA_PROMOTE_UNAPPLIED, MUT_REPLICA_PROMOTE_KEEP_SEGS, MUT_REPLICA_EPOCH_SEG,
        MUT_REPLICA_NO_DROP_SERIAL, MUT_REPLICA_STAGE_TRUNC,
@@ -75,7 +75,9 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_APPLY_HOLDS_MU, MUT_REPLICA_PREP_NO_CUT_GEN, MUT_LEADER_DROP_UNHELD,
        MUT_LEADER_LINK_BY_NAME, MUT_LEADER_RS_NO_PRUNE, MUT_LEADER_RS_PRUNE_ALL, MUT_LEADER_NOTE_LATE,
        MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU,
-       MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED };
+       MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED,
+       MUT_LEADER_SWITCH_UNATTACHED, MUT_REPLICA_KEEP_FLOOR, MUT_REPLICA_DROP_APPLIED_FILES,
+       MUT_LEADER_FRESH_UNATTACHED };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -235,6 +237,7 @@ size_t dd_bound(size_t n);
 size_t gorilla_bound(size_t n);
 size_t dd_encode(const int64_t *in, size_t n, uint8_t *out);
 int dd_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+int dd_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out);
 size_t gorilla_encode(const uint32_t *in, size_t n, uint8_t *out);
 int gorilla_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
 size_t chimp_bound(size_t n);
@@ -256,8 +259,10 @@ int bytesplit_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
 size_t tsfor_bound(size_t n);
 size_t ts_grid_encode(const int64_t *ts, size_t n, uint8_t *out);
 int ts_grid_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+int ts_grid_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out);
 size_t ts_delta_encode(const int64_t *ts, size_t n, uint8_t *out);
 int ts_delta_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+int ts_delta_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out);
 size_t decimal_bp_bound(size_t n);
 size_t decimal_bp_encode(const float *in, size_t n, uint8_t *out);
 int decimal_bp_decode(const uint8_t *in, size_t len, size_t n, float *out);
@@ -283,6 +288,7 @@ size_t block_encode_ts(codec_ctx *c, int level, const int64_t *ts, size_t n, uin
 #define VALUES_FIXED_ONLY (-1)
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out);
 int block_decode_ts(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int64_t *out);
+int block_decode_ts_sorted(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int64_t *out);
 int block_decode_f32(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, float *out);
 /* any value type, in slots of type_width(type) (codec_typed.c) */
 size_t block_encode_vals(codec_ctx *c, int level, int value_codec, int type, const void *v, size_t n, uint8_t *out);
@@ -827,7 +833,7 @@ typedef struct part {
  * is a few dependent loads, shifts and masks; the statistics path over many small parts is bound by them). */
 enum {
     GW_TIME = 1,     /* ts_min, ts_max */
-    GW_LOC = 2,      /* off, ts_len, val_len, crc, nulls */
+    GW_LOC = 2,      /* off, ts_len, val_len, crc, nulls; and ts_min, ts_max, which granule_decode checks the rows by */
     GW_STAT = 4,     /* nulls, min, max, sum (isum_hi only with GW_INT) */
     GW_SPREAD = 8,   /* m2 or isq0 (isq1, isq2 only with GW_INT) */
     GW_TWEND = 16,   /* ts_min, ts_max, tw_first, tw_last, tw_flags */
@@ -858,7 +864,7 @@ static inline void gx_load(const part *p, uint32_t i, unsigned want, granule *g)
     const gix *x = &p->ix;
     g->count = (uint32_t)gix_get(x, i, GF_COUNT);
     uint64_t span = 0;
-    if (want & (GW_TIME | GW_TWEND | GW_TWSTEP | GW_TWLIN)) {
+    if (want & (GW_TIME | GW_LOC | GW_TWEND | GW_TWSTEP | GW_TWLIN)) {
         span = gix_get(x, i, GF_SPAN);
         g->ts_min = (int64_t)gix_get(x, i, GF_TSMIN);
         g->ts_max = (int64_t)((uint64_t)g->ts_min + span);
@@ -935,7 +941,10 @@ void part_unref(part *p);
 /* Decodes a granule: timestamps, and values (if v) as slots of `type`, into buffers of room for cap rows; checks
  * the granule's checksum first if verify. A count above cap or the part's granule size is TSDB_ERR_CORRUPT: without
  * pin_index the count is read in the mapping, where a write to the file can change it between the load that sized
- * the caller's buffers and the one in g, so cap is what the buffers hold, never a count loaded before. */
+ * the caller's buffers and the one in g, so cap is what the buffers hold, never a count loaded before. Without
+ * verify, timestamps that do not strictly increase within g's [ts_min, ts_max] are TSDB_ERR_CORRUPT too (damage the
+ * checksum would have caught): every reader may take the rows as sorted and inside the entry's ends. g holds at
+ * least GW_LOC, which loads those ends. */
 int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
                  bool verify);
 /* granule_read for a part whose granule bytes are in its mapping (a .part); an .ec part's go through ec_granule_read */
@@ -1558,6 +1567,7 @@ void eng_leader_depose(struct eng *db);
 void eng_leader_replay_floor(struct eng *db, uint64_t floor);
 /* test hook (tests/test_replica.c): called by a switch right after it released flush_lock */
 extern void (*cls_test_after_switch)(struct eng *db);
+int cls_test_apply(struct eng *db, uint32_t s, int64_t from, int c);
 /* test hook: called by a leader's flush after cls_classify_active, before the seal (src/memtable.c) */
 extern void (*mt_test_before_seal)(struct eng *db);
 /* The driver's keep bound (design-cluster.md 8.3), inclusive: the highest position every replica has (one below the
@@ -1594,7 +1604,7 @@ int eng_leader_file_open(struct eng *db, uint64_t pos, const char *name);
 /* replica.c: the links of the files of COMMIT markers whose position is below fno_end go (their segment went;
  * flush_lock held); every stage_ file goes (eng_leader_attach: a writer keeps no stage of its own) */
 void leader_links_drop(struct eng *db, uint64_t fno_end);
-void leader_links_sweep(struct eng *db);
+void leader_links_sweep(struct eng *db, bool stages);
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
@@ -1631,6 +1641,9 @@ int mt_reserve_rows(struct memtable *m, const uint32_t *series, uint32_t cs, siz
 struct replica;
 struct rstate;
 int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, struct eng **out);
+/* The writer of a promotion (replica_promote): its merges and flusher run before the driver attaches (eng_leader_attach),
+ * and a class switch decided in between would reach CLASSES with no marker in the log (db->leader_open). */
+int eng_open_leader(const char *dir, const tsdb_options *opts, struct eng **out);
 int replica_open_log(struct eng *db, uint64_t floor, int (*cut_tails)(struct eng *)); /* instead of wal_open; sets db->rp */
 void replica_free(struct eng *db);                     /* wal_close */
 int replica_flush(struct eng *db);                     /* mt_flush of a replica */
@@ -1877,6 +1890,9 @@ struct eng {
     _Atomic bool feed_on;     /* FEED exists and the word is in META: segments are renamed to fwal_, not unlinked */
     bool feed_req;            /* META said requires=feed at the open */
     bool replica_req;         /* META said requires=replica: only such a directory opens as a replica or a leader */
+    bool leader_open;         /* opened by eng_open_leader (a promotion): until eng_leader_attach it is a writer with no
+                               * jr, and decides nothing the replicas must carry out (a class switch: classes.c) */
+    bool cluster_req;         /* META said requires=cluster: a cluster volume's (R7 never settles one: D1) */
     bool fno_torn_open;       /* the open found one FNO slot bad (the numbers skipped ahead by FNO_BELT) */
     pthread_mutex_t feed_lock;
     pthread_cond_t feed_cv;
@@ -1947,7 +1963,9 @@ struct eng {
     uint64_t lk_failed;          /* the kept segment whose removal failed last (its message is printed once) */
     struct lkfile {
         uint64_t fno, key;
-    } *lf;                       /* with jr: the stage_ links of COMMIT markers in the log (leader_commit; lead_mu) */
+        bool keep; /* keep_<fno>_<key>.part: a committed marker's file, kept with its segment; else stage_<key>.part */
+    } *lf; /* the files of COMMIT markers in retained segments (lead_mu): with jr the stage_ links of this leadership's
+            * (leader_commit) and the keep_ files found at the attach; on a replica its keep_ files (replica.c) */
     size_t nlf, caplf, rlf;      /* rlf: entries of lf reserved by COMMITs about to append their marker (lead_mu) */
     uint64_t lrd_seq, lrd_off, lrd_next; /* where the last read of the log by position ended (replica_read; lead_mu) */
     atomic_uint_fast64_t lead_keep; /* with jr: eng_leader_keep's bound */
@@ -1979,7 +1997,13 @@ struct eng {
     bool parts_v8;                    /* META said parts_v8=1 at open: format-8 part headers are valid here (upgrade) */
     bool v8_meta;                     /* META still says it (db->lock): v8_parts_account takes it out when none is left */
     atomic_uint_fast64_t wal_durable; /* the last position durable (with the WAL on: an fno; see eng_leader_commit) */
+    /* the periodic sync's clock (the flusher's own after it starts): set by the open just before it starts the
+     * flusher, so the first sync is due wal_sync_ms after the open, not at the first wake. The st_ fields are for
+     * tests/test_fno.c (test_wal_clock, test_wal_cadence): the flusher's rounds done, its periodic syncs, the
+     * deadline of the first one as its first wait computed it, and the `now` of the first two. */
     int64_t last_wal_sync_ms;
+    atomic_uint_fast64_t st_flusher_rounds, st_periodic_syncs;
+    atomic_int_fast64_t st_sync_due0, st_sync_at[2];
     int bg_error;
     bool flusher_stop;
     bool has_flusher;
@@ -2047,6 +2071,8 @@ struct eng {
     void *retire_owner;    /* the tsdb handle it does that for */
     uint32_t adopted_series, adopted_states; /* the first names the next engine took over (eng_adopt_names) */
     atomic_bool quiesced;  /* no new caller: the volume is being recovered */
+    atomic_bool diverged;  /* R7 (src/eckeep.c, D5): a settle's digest did not match: refused like quiesced until a
+                            * restart (tsdb_volume_resume does not clear it) */
     struct tlist *tl;       /* the tenant list the sweeper is to count by (stats_priv.h), under tl_mu */
     pthread_mutex_t tl_mu;  /* a leaf */
     bool retiring;        /* eng_close keeps the names of the dictionaries (eng_retire) */
@@ -2552,6 +2578,7 @@ void tsdb_test_latest_nowarm(int on); /* engines opened while on start no warmer
  * name or type lookup holds it between its route and its use (tsdb_test_meta_use reads the type through it) */
 void tsdb_test_reopen_hook(void (*fn)(void *, int phase), void *arg);
 void *tsdb_test_meta_hold(struct tsdb *t, tsdb_sid id);
+struct eng *tsdb_test_engine(struct tsdb *t, uint32_t vol); /* tests/test_keep.c: no reference taken */
 int tsdb_test_meta_use(void *hold);
 void tsdb_test_meta_release(void *hold);
 int tsdb_test_deferred_retires(struct tsdb *t); /* retired engines a multi call's cut still keeps */
@@ -2573,6 +2600,13 @@ void tsdb_test_granules(struct tsdb *t, void (*fn)(void *ctx, int cls, uint32_t 
 size_t tsdb_test_mark_ec(struct tsdb *t, unsigned flags,
                          bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
                          void *ctx);
+/* test hook (R7 stage 3, tests/test_settle_oracle.c): eng_settle of the parts pick names, key by key; *settled counts
+ * the parts that turned .ec; 0 or the first result that is not 0 or TSDB_ERR_NOTFOUND */
+int tsdb_test_settle(struct tsdb *t,
+                     bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
+                     void *ctx, size_t *settled);
+/* test hook (tests/test_settle_oracle.c): the tier cache's granules read again as whole cells; drop empties it first */
+uint64_t tsdb_test_ec_retries(struct tsdb *t, bool drop);
 
 int ret_open(eng *db, bool read_only);
 int ret_reload(eng *db);

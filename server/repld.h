@@ -24,11 +24,20 @@ void repld_update(const struct cluster_vol_rec *r);
 /* 1 while volume v is held here and failed (FAIL, a failed save, the engine's fail-stop): it is quiesced and reported
  * failed, the process goes on (DECISION D13). */
 int repld_failed(uint32_t v);
+/* Whether this node writes volume v: 1 while its driver is the writer and its core still leads (epoch: the core's),
+ * 0 when it drives v otherwise (a replica, promoting, deposed, failed), -1 when no driver drives v here. Reads and
+ * writes are served, and OWNER reported in the heartbeat, only on 1: a deposed writer stops at once, before its engine
+ * is reopened as a replica (design-cluster.md 6.3, 7.1). */
+int repld_leading(uint32_t v, uint64_t *epoch);
+/* (repld_leading: 1 the writer, 2 promoting to *epoch, 0 neither, -1 no such volume) */
 /* Volume v's engine failed (eng_fail): 1 when the driver holds v (it stops and quiesces it, the process goes on, D13),
  * 0 when v is no volume of the driver (tsdbd's own rules apply). */
 int repld_engine_failed(uint32_t v, const char *msg);
 /* 1 while volume v is led here with fewer in-sync replicas than its min_isr: writes are refused (REPL_E_ISR). */
 int repld_isr_short(uint32_t v);
+/* A FENCE(v, fence) from the Raft leader `from` (the cluster thread's handler, cluster_set_fence_handler): handed to the
+ * volume's core, whose reply goes back through cluster_vol_msg once the fence is saved. No such volume: ignored. */
+void repld_fence(void *arg, uint32_t v, uint64_t fence, uint32_t from);
 /* The ISR changes the volumes led here ask the metadata group for (cluster_report.isr); at most max. */
 unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max);
 /* The servers this one shares a running volume with and has heard nothing from on any of them for after_ms or more

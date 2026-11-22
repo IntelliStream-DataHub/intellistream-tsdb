@@ -188,7 +188,7 @@ static bool group_same(unsigned want, const granule *d, const granule *g)
 {
     bool ok = d->count == g->count;
     bool in = want & GW_INT;
-    if (want & (GW_TIME | GW_TWEND))
+    if (want & (GW_TIME | GW_LOC | GW_TWEND))
         ok &= d->ts_min == g->ts_min && d->ts_max == g->ts_max;
     if (want & GW_LOC)
         ok &= d->off == g->off && d->ts_len == g->ts_len && d->val_len == g->val_len && d->crc == g->crc &&

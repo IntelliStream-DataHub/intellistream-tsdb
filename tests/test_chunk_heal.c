@@ -515,10 +515,23 @@ static void test_heal_damage(void)
 {
     world w;
     world_build(&w, "heal");
-    int t = 2;
-    imgs good;
-    imgs_take(&good, w.path[t]);
-    CHECK(good.n >= 4);
+    /* Object ids are random, so where an object with fewer positions than stores lands is too: a fixed store held
+     * fewer than 4 chunks in about 3% of runs. The three 6-position objects put 3 on every store and the other three
+     * 12 more over 6 stores, so the fullest store holds at least 5. */
+    int t = 0;
+    imgs good = {0};
+    for (int s = 0; s < NST; s++) {
+        imgs c;
+        imgs_take(&c, w.path[s]);
+        if (c.n > good.n) {
+            imgs_free(&good);
+            good = c;
+            t = s;
+        } else {
+            imgs_free(&c);
+        }
+    }
+    CHECK(good.n >= 5);
     CHECK(chunk_be_see_epoch(w.be, VOL, 7) == 0);
     int cases = 0;
     for (int kind = 0; kind < D_KINDS; kind++) {
@@ -575,7 +588,7 @@ static void test_heal_damage(void)
     memcpy(id.oid, w.o[1].oid, 16);
     CHECK(chunk_be_repair(w.be, &id, &ho, &rep) == 0 && rep.rebuilt_damaged == 1 && imgs_diff(&good, w.path[t]) == 0);
     CHECK(chunk_be_repair(w.be, &id, &ho, &rep) == 0 && rep.chunks_ok == 1 && rep.rebuilt_damaged == 0);
-    CHECK(chunk_be_heal(w.be, VOL, 0, &ho, &rep) == 0); /* another store: nothing to do */
+    CHECK(chunk_be_heal(w.be, VOL, (t + 1) % NST, &ho, &rep) == 0); /* another store: nothing to do */
     CHECK(chunk_be_heal(w.be, VOL, NST, &ho, &rep) == TSDB_ERR_INVALID);
     imgs_free(&good);
     world_free(&w);

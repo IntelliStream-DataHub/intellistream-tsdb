@@ -119,13 +119,32 @@ size_t dd_encode(const int64_t *in, size_t n, uint8_t *out)
     return 16 + bw_finish(&w);
 }
 
-int dd_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
+/*
+ * The timestamp decoders come in two forms: the plain one decodes any bytes to any values, the _sorted one
+ * (block_decode_ts_sorted, which granule_decode uses) also refuses a block whose values do not strictly increase as
+ * int64. Damage that the checksum did not see (verify_checksums = 0) decodes to anything, and the readers index
+ * their bucket arrays by the rows' times on the strength of the order and the entry's window. The check costs least
+ * where the values are made: a DoubleDelta run of unchanged deltas, the bulk of a regular series, is increasing by
+ * one overflow test per run, and the other rows compare while the value is in a register.
+ * In biased form (u = v ^ 2^63) int64 order is uint64 order, so a run v + D, v + 2D, ... v + rD increases iff
+ * D != 0 and u + rD does not pass 2^64.
+ */
+static inline bool ts_run_bad(uint64_t prev, uint64_t delta, size_t r)
+{
+    uint64_t span;
+    return delta == 0 || __builtin_mul_overflow((uint64_t)r, delta, &span) ||
+           __builtin_add_overflow(prev ^ (1ull << 63), span, &span);
+}
+
+static inline __attribute__((always_inline)) int dd_dec(const uint8_t *in, size_t len, size_t n, int64_t *out,
+                                                        const bool chk)
 {
     if (n == 0)
         return 0;
     if (len < 8)
         return TSDB_ERR_CORRUPT;
     uint64_t prev, delta;
+    bool bad = false;
     memcpy(&prev, in, 8);
     out[0] = (int64_t)prev;
     if (n == 1)
@@ -133,6 +152,8 @@ int dd_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
     if (len < 16)
         return TSDB_ERR_CORRUPT;
     memcpy(&delta, in + 8, 8);
+    if (chk)
+        bad = ts_run_bad(prev, delta, 1);
     prev += delta;
     out[1] = (int64_t)prev;
 
@@ -150,6 +171,8 @@ int dd_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
             if (z > 57)
                 z = 57;
             size_t r = MIN(z, n - i);
+            if (chk)
+                bad |= ts_run_bad(prev, delta, r);
             for (size_t j = 0; j < r; j++)
                 out[i + j] = (int64_t)(prev + (j + 1) * delta);
             prev += r * delta;
@@ -190,11 +213,16 @@ int dd_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
             break;
         }
         delta += s ? ~m : m + 1;
+        if (chk)
+            bad |= (int64_t)(prev + delta) <= (int64_t)prev;
         prev += delta;
         out[i++] = (int64_t)prev;
     }
-    return pos <= limit ? 0 : TSDB_ERR_CORRUPT;
+    return pos <= limit && !bad ? 0 : TSDB_ERR_CORRUPT;
 }
+
+int dd_decode(const uint8_t *in, size_t len, size_t n, int64_t *out) { return dd_dec(in, len, n, out, false); }
+int dd_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out) { return dd_dec(in, len, n, out, true); }
 
 /* --------------------------------------------------------------- Gorilla */
 
@@ -849,7 +877,8 @@ size_t ts_grid_encode(const int64_t *ts, size_t n, uint8_t *out)
     return (size_t)(o - out);
 }
 
-int ts_grid_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
+static inline __attribute__((always_inline)) int ts_grid_dec(const uint8_t *in, size_t len, size_t n, int64_t *out,
+                                                             const bool chk)
 {
     if (len < 25)
         return TSDB_ERR_CORRUPT;
@@ -861,14 +890,29 @@ int ts_grid_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
     if ((width != 1 && width != 2 && width != 4 && width != 8) || len != 25 + n * (size_t)width)
         return TSDB_ERR_CORRUPT;
     const uint8_t *p = in + 25;
-    if (width == 1) {
+    uint64_t bad = 0;
+    if (width == 1)
         for (size_t i = 0; i < n; i++)
             out[i] = (int64_t)(grid_at(first, step, i) + lo + p[i]);
-    } else {
+    else
         for (size_t i = 0; i < n; i++)
             out[i] = (int64_t)(grid_at(first, step, i) + lo + for_get(p + i * (size_t)width, width));
-    }
-    return 0;
+    /* a separate pass over the output, which is in L1: it vectorizes, and costs a third of rebuilding each pair from
+     * the input (0.07 against 0.22 ns per row on 1 s with 20 ms jitter, Ryzen 9 7950X) */
+    if (chk)
+        for (size_t i = 1; i < n; i++)
+            bad |= (uint64_t)(out[i] <= out[i - 1]);
+    return bad ? TSDB_ERR_CORRUPT : 0;
+}
+
+int ts_grid_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
+{
+    return ts_grid_dec(in, len, n, out, false);
+}
+
+int ts_grid_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out)
+{
+    return ts_grid_dec(in, len, n, out, true);
 }
 
 size_t ts_delta_encode(const int64_t *ts, size_t n, uint8_t *out)
@@ -891,7 +935,8 @@ size_t ts_delta_encode(const int64_t *ts, size_t n, uint8_t *out)
     return (size_t)(o - out);
 }
 
-int ts_delta_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
+static inline __attribute__((always_inline)) int ts_delta_dec(const uint8_t *in, size_t len, size_t n,
+                                                              int64_t *out, const bool chk)
 {
     if (n == 0)
         return 0;
@@ -905,11 +950,27 @@ int ts_delta_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
         return TSDB_ERR_CORRUPT;
     const uint8_t *p = in + 17;
     out[0] = (int64_t)cur;
+    uint64_t bad = 0;
     for (size_t i = 1; i < n; i++) {
         cur += lo + for_get(p + (i - 1) * (size_t)width, width);
         out[i] = (int64_t)cur;
     }
-    return 0;
+    /* a separate pass, not a compare beside the serial sum: that one cost 0.39 ns per row on an i5-13400 (0.03 on
+     * a Ryzen), this vectorized one 0.16 (0.07) */
+    if (chk)
+        for (size_t i = 1; i < n; i++)
+            bad |= (uint64_t)(out[i] <= out[i - 1]);
+    return bad ? TSDB_ERR_CORRUPT : 0;
+}
+
+int ts_delta_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
+{
+    return ts_delta_dec(in, len, n, out, false);
+}
+
+int ts_delta_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out)
+{
+    return ts_delta_dec(in, len, n, out, true);
 }
 
 /* ---------------------------------------------------------------- blocks */
@@ -1238,7 +1299,8 @@ int block_open(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int *kind
     return 0;
 }
 
-int block_decode_ts(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int64_t *out)
+static inline __attribute__((always_inline)) int block_dec_ts(codec_ctx *c, const uint8_t *blk, size_t len, size_t n,
+                                                              int64_t *out, const bool chk)
 {
     int kind, rc;
     const uint8_t *p;
@@ -1246,11 +1308,22 @@ int block_decode_ts(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int6
     if ((rc = block_open(c, blk, len, n, &kind, &p, &plen)) != 0)
         return rc;
     switch (kind) {
-    case BLK_DD: return dd_decode(p, plen, n, out);
-    case BLK_TS_GRID: return ts_grid_decode(p, plen, n, out);
-    case BLK_TS_DELTA: return ts_delta_decode(p, plen, n, out);
+    case BLK_DD: return dd_dec(p, plen, n, out, chk);
+    case BLK_TS_GRID: return ts_grid_dec(p, plen, n, out, chk);
+    case BLK_TS_DELTA: return ts_delta_dec(p, plen, n, out, chk);
     default: return TSDB_ERR_CORRUPT;
     }
+}
+
+int block_decode_ts(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int64_t *out)
+{
+    return block_dec_ts(c, blk, len, n, out, false);
+}
+
+/* also TSDB_ERR_CORRUPT unless the values strictly increase (see dd_dec) */
+int block_decode_ts_sorted(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int64_t *out)
+{
+    return block_dec_ts(c, blk, len, n, out, true);
 }
 
 static __attribute__((noinline)) int block_decode_f32_nearest(codec_ctx *c, const uint8_t *blk, size_t len,

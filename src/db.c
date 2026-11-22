@@ -7,6 +7,7 @@
 #include "ecpart.h"
 #include "ecskip.h"
 #include "tier.h"
+#include "settle.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -456,6 +457,7 @@ static int meta_load_or_create(eng *db, bool read_only)
             meta_requires_parse(buf, &feats, feat, sizeof feat);
             db->feed_req = feats & META_REQ_FEED;
             db->replica_req = feats & META_REQ_REPLICA;
+            db->cluster_req = feats & META_REQ_CLUSTER;
             if (feat[0]) {
                 fprintf(stderr,
                         "tsdb: META requires the feature(s) \"%s\", which tsdb %s does not know: the open "
@@ -811,6 +813,15 @@ int eng_open_replica(const char *dir, const tsdb_options *opts, uint64_t floor, 
     return eng_open_sched(dir, opts, NULL, out);
 }
 
+/* eng_open_leader: taken at the open's start as well */
+static __thread bool leader_want;
+
+int eng_open_leader(const char *dir, const tsdb_options *opts, eng **out)
+{
+    leader_want = true;
+    return eng_open_sched(dir, opts, NULL, out);
+}
+
 static __thread int adopt_lockfd = -1;
 /* A check of the opened engine (eng_reopen), run by the open once nothing can fail any more and before the engine's
  * own threads start: they change the parts list (a merge, a flush), which the check reads without a lock. */
@@ -850,6 +861,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     bool replica = replica_want;
     uint64_t floor = replica_floor;
     replica_want = false;
+    bool leader = leader_want;
+    leader_want = false;
     simd_init();
     /* 64-byte aligned: the hot fields of the write path are laid out in whole cache lines (internal.h, buf_lock) */
     _Static_assert(_Alignof(eng) == 64, "eng is aligned to a cache line");
@@ -857,6 +870,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     if (!db)
         return TSDB_ERR_NOMEM;
     memset(db, 0, sizeof *db);
+    db->leader_open = leader && eng_test_mutant != MUT_LEADER_SWITCH_UNATTACHED; /* before any of its threads start */
     db->ret_fd = -2; /* retention not opened yet */
     db->cls_fd = -2;
     if (opts)
@@ -1054,6 +1068,13 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             if (tsdb_thread_create(&db->mergers[db->nmergers], merge_thread_main, db) == 0)
                 db->nmergers++;
     }
+    /* The periodic WAL sync's clock starts here, with the flusher of every open (a volume's reopen included): left at
+     * 0, the first wake would find the sync overdue on any machine up longer than wal_sync_ms and sync (closing the
+     * open rows record) at once instead of wal_sync_ms after the open. Taken before the thread starts, not by it, so
+     * a row acknowledged right after the open waits no longer than wal_sync_ms either. */
+    db->last_wal_sync_ms = eng_mono_ms();
+    if (eng_test_mutant == MUT_WALSYNC_FROM_ZERO) /* planted: the old clock from 0 on a machine up for a period */
+        db->last_wal_sync_ms -= db->opt.wal_sync_ms;
     if (!ro && tsdb_thread_create(&db->flusher, flusher_main, db) == 0)
         db->has_flusher = true;
     if (!ro && atomic_load(&db->feed_on) && (rc = feed_cleaner_start(db)) != 0)
@@ -1062,6 +1083,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     if (db->opt.follow && tsdb_thread_create(&db->follower, follower_main, db) == 0)
         db->has_follower = true;
     latest_start(db);
+    if (!ro && db->tier)
+        ecsettle_eng_ready(db); /* R7: the settle thread may take this engine from here on */
     *out = db;
     return 0;
 fail:
@@ -1100,6 +1123,10 @@ void eng_halt(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     db->nmergers = 0;
+    if (settle_mutant != SETTLE_MUT_NOHALTSTOP)
+        ecsettle_eng_stop(db); /* R7: no settle of this engine runs from here on (abandoned or waited for) */
+    if (eckeep_mutant != ECKEEP_MUT_NOHALTSTOP)
+        eckeep_eng_stop(db); /* R7: the digest thread holds part references and takes db->lock */
 }
 
 /* The names of `old` that `neu` also holds at the same index become `neu`'s: it frees its own copy and keeps the
@@ -1198,6 +1225,8 @@ int eng_close(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     free(db->mergers);
+    ecsettle_eng_stop(db); /* R7: before the parts go: a settle of this engine is abandoned or waited for */
+    eckeep_eng_stop(db); /* R7: before the parts go (the digest thread references them and takes db->lock) */
     stats_stop(db);
     latest_close(db); /* after the final flush: it folds into the table too */
     if (db->own_sched)

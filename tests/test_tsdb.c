@@ -82,6 +82,129 @@ static void test_gorilla(const uint32_t *in, size_t n, const char *what)
     free(dec);
 }
 
+/* The _sorted timestamp decoders (granule_decode's) must give the plain decoder's values when they strictly increase
+ * as int64, and TSDB_ERR_CORRUPT when they do not, for every transform and through the block layer. Damage decodes to
+ * any values, and the readers index their arrays by the rows' order. */
+static bool ts_increasing(const int64_t *t, size_t n)
+{
+    for (size_t i = 1; i < n; i++)
+        if (t[i] <= t[i - 1])
+            return false;
+    return true;
+}
+
+static void check_sorted(codec_ctx *c, const int64_t *t, size_t n, const char *what)
+{
+    int want = ts_increasing(t, n) ? 0 : TSDB_ERR_CORRUPT;
+    size_t cap = MAX(MAX(dd_bound(n), tsfor_bound(n)), block_bound(n)) + BLK_SLACK;
+    uint8_t *enc = calloc(cap, 1);
+    int64_t *dec = malloc((n + 1) * sizeof *dec);
+    for (int kind = 0; kind < 5; kind++) {
+        size_t len;
+        int rc;
+        switch (kind) {
+        case 0: len = dd_encode(t, n, enc); break;
+        case 1: len = ts_grid_encode(t, n, enc); break;
+        case 2: len = ts_delta_encode(t, n, enc); break;
+        default: len = block_encode_ts(c, kind == 3 ? 0 : 3, t, n, enc); break;
+        }
+        if (len == 0 && kind != 0)
+            continue; /* grid and delta need two rows */
+        switch (kind) {
+        case 0: rc = dd_decode_sorted(enc, len, n, dec); break;
+        case 1: rc = ts_grid_decode_sorted(enc, len, n, dec); break;
+        case 2: rc = ts_delta_decode_sorted(enc, len, n, dec); break;
+        default: rc = block_decode_ts_sorted(c, enc, len, n, dec); break;
+        }
+        bool ok = rc == want && (rc != 0 || n == 0 || memcmp(t, dec, n * sizeof *t) == 0);
+        if (!ok)
+            fprintf(stderr, "  sorted decode: %s (n=%zu) kind %d: rc %d, want %d\n", what, n, kind, rc, want);
+        CHECK(ok);
+    }
+    free(enc);
+    free(dec);
+}
+
+static void test_ts_sorted(void)
+{
+    enum { N = 9000 };
+    int64_t *t = malloc(N * sizeof *t);
+    codec_ctx *c = codec_new();
+    for (size_t n = 0; n < 6; n++) {
+        for (int rep = 0; rep < 50; rep++) {
+            for (size_t i = 0; i < n; i++)
+                t[i] = (int64_t)(rnd() % 8) - 4 + (rep & 1 ? (int64_t)i * 3 : 0);
+            check_sorted(c, t, n, "tiny");
+        }
+    }
+    for (int shape = 0; shape < 16; shape++) {
+        size_t n = N;
+        for (size_t i = 0; i < n; i++)
+            t[i] = 1700000000000 + (int64_t)i * 1000;
+        switch (shape) {
+        case 0: break; /* regular: one DoubleDelta run */
+        case 1: /* jitter */
+            for (size_t i = 0; i < n; i++)
+                t[i] += (int64_t)(rnd() % 41) - 20;
+            break;
+        case 2: t[4000] = t[3999]; break;         /* one repeat inside a run */
+        case 3: t[n - 1] = t[n - 2] - 1; break;   /* the last row goes back */
+        case 4: t[1] = t[0]; break;               /* the second row (DoubleDelta's first delta) */
+        case 5: t[0] = t[1] + 5; break;
+        case 6: /* a run of unchanged deltas that passes INT64_MAX and wraps */
+            for (size_t i = 0; i < n; i++)
+                t[i] = (int64_t)((uint64_t)INT64_MAX - 100 * 1000 + (uint64_t)i * 1000);
+            break;
+        case 7: /* steps of 2^62 from INT64_MIN: four rows end at 2^62 */
+            n = 4;
+            for (size_t i = 0; i < n; i++)
+                t[i] = (int64_t)((uint64_t)INT64_MIN + (uint64_t)i * (1ull << 62));
+            break;
+        case 8: /* the fifth wraps to INT64_MIN */
+            n = 5;
+            for (size_t i = 0; i < n; i++)
+                t[i] = (int64_t)((uint64_t)INT64_MIN + (uint64_t)i * (1ull << 62));
+            break;
+        case 9: /* increasing steps above 2^63, which wrap as uint64 deltas */
+            n = 3;
+            t[0] = INT64_MIN, t[1] = 1, t[2] = INT64_MAX;
+            break;
+        case 10: /* all equal */
+            for (size_t i = 0; i < n; i++)
+                t[i] = 42;
+            break;
+        case 11: /* decreasing, regular */
+            for (size_t i = 0; i < n; i++)
+                t[i] = -(int64_t)i * 7;
+            break;
+        case 12: /* random steps of any size, increasing */
+            t[0] = INT64_MIN / 2;
+            for (size_t i = 1; i < n; i++)
+                t[i] = t[i - 1] + 1 + (int64_t)(rnd() >> (rnd() % 44 + 20));
+            break;
+        case 13: /* random values: almost surely out of order */
+            for (size_t i = 0; i < n; i++)
+                t[i] = (int64_t)rnd();
+            break;
+        case 14: /* jitter with one repeat: grid's and delta's per-row compare */
+            for (size_t i = 0; i < n; i++)
+                t[i] += (int64_t)(rnd() % 41) - 20;
+            t[6000] = t[5999];
+            break;
+        default: /* jitter wide enough for 2-byte residuals, with one row back */
+            for (size_t i = 0; i < n; i++)
+                t[i] = 1700000000000 + (int64_t)i * 100000 + (int64_t)(rnd() % 20001) - 10000;
+            t[7000] = t[6999] - 1;
+            break;
+        }
+        char what[32];
+        snprintf(what, sizeof what, "shape %d", shape);
+        check_sorted(c, t, n, what);
+    }
+    codec_free(c);
+    free(t);
+}
+
 static void test_codecs(void)
 {
     enum { N = 20000 };
@@ -3035,6 +3158,12 @@ int main(int argc, char **argv)
         printf(failures ? "FAILED: %d checks\n" : "all tests passed\n", failures);
         return failures != 0;
     }
+    if (argc > 2 && strcmp(argv[2], "codecs") == 0) { /* the codec tests alone, in seconds */
+        test_codecs();
+        test_ts_sorted();
+        printf(failures ? "FAILED: %d checks\n" : "all tests passed\n", failures);
+        return failures != 0;
+    }
     if (argc > 2 && strcmp(argv[2], "nozstd") == 0) {
         test_insert_nozstd(base);
         test_nz_stale_listing(base);
@@ -3044,6 +3173,7 @@ int main(int argc, char **argv)
     printf("simd: %s\n", simd_name());
     printf("codecs\n");
     test_codecs();
+    test_ts_sorted();
     printf("database\n");
     desc_window_rows = 37; /* descending queries cross many windows */
     snprintf(dir, sizeof dir, "%s/tsdb-test-%d", base, (int)getpid());

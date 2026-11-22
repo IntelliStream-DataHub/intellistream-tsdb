@@ -37,20 +37,41 @@ static size_t width(int sel)
 }
 #endif
 
+/* The _sorted timestamp decoders (granule_decode's) against the plain ones: the same values, and TSDB_ERR_CORRUPT
+ * exactly when those values do not strictly increase. */
+static int ts_sorted(int sel, const uint8_t *p, size_t len, size_t n, int rc)
+{
+    int64_t *a = out, *b = malloc(n * sizeof *b);
+    if (!b)
+        return rc;
+    int rs = sel == 0 ? block_decode_ts_sorted(cc, p, len, n, b) : sel == 6 ? dd_decode_sorted(p, len, n, b)
+             : sel == 13                                          ? ts_grid_decode_sorted(p, len, n, b)
+                                                                  : ts_delta_decode_sorted(p, len, n, b);
+    bool inc = true;
+    for (size_t i = 1; rc == 0 && i < n; i++)
+        inc &= a[i] > a[i - 1];
+    if (rc != 0 ? rs != rc : rs != (inc ? 0 : TSDB_ERR_CORRUPT) || (rs == 0 && memcmp(a, b, n * sizeof *b)))
+        abort();
+    free(b);
+    return rc;
+}
+
 static int decode(int sel, const uint8_t *p, size_t len, size_t n)
 {
     switch (sel) {
-    case 0: return block_decode_ts(cc, p, len, n, out);
+    case 0: case 6: case 13: case 14: {
+        int rc = sel == 0 ? block_decode_ts(cc, p, len, n, out) : sel == 6 ? dd_decode(p, len, n, out)
+                 : sel == 13                                       ? ts_grid_decode(p, len, n, out)
+                                                                   : ts_delta_decode(p, len, n, out);
+        return ts_sorted(sel, p, len, n, rc);
+    }
     case 1: case 2: case 3: case 4: case 5: return block_decode_vals(cc, sel - 1, p, len, n, out);
-    case 6: return dd_decode(p, len, n, out);
     case 7: return gorilla_decode(p, len, n, out);
     case 8: return chimp_decode(p, len, n, out);
     case 9: return chimp128_decode(p, len, n, out);
     case 10: return patas_decode(p, len, n, out);
     case 11: return delta32_decode(p, len, n, out);
     case 12: return bytesplit_decode(p, len, n, out);
-    case 13: return ts_grid_decode(p, len, n, out);
-    case 14: return ts_delta_decode(p, len, n, out);
     case 15: return decimal_bp_decode(p, len, n, out);
     case 16: return alp_decode(p, len, n, out);
     case 17: return alprd_decode(p, len, n, out);

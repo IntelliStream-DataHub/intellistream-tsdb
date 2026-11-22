@@ -47,8 +47,11 @@
 #include "cvol.h"
 #include "replica.h"
 #include "ecpart.h"
+#include "eccache.h"
+#include "eckeep.h"
 #include "stats_priv.h"
 #include "tier.h"
+#include "settle.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -1150,6 +1153,14 @@ static int64_t sid_volume(tsdb_sid id) { return id >> 48 || !(id >> 32) ? -1 : (
  * reference is taken under the read lock and refused once the engine is quiesced, which is set under the write lock:
  * so after tsdb_volume_quiesce returns, the count only falls. `route` and the loops over the volumes give theirs
  * back with EREF (a cleanup) or eng_unref. */
+/* Whether a call is refused on the volume (TSDB_ERR_UNAVAILABLE): it is quiesced, or a settle's digest found it
+ * DIVERGED (src/eckeep.h, D5; the digest thread sets it with no handle, so it is a flag of its own, read here). */
+static bool eng_refused(eng *e)
+{
+    return atomic_load_explicit(&e->quiesced, memory_order_acquire) ||
+           atomic_load_explicit(&e->diverged, memory_order_acquire);
+}
+
 static pthread_mutex_t idle_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t idle_cv = PTHREAD_COND_INITIALIZER;
 
@@ -1244,7 +1255,7 @@ static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
     if (ok && !t->vols[v]) { /* a cluster volume this server does not hold (or no volume) */
         route_rc = t->cluster && t->cnames[v] ? TSDB_ERR_UNAVAILABLE : 0;
         ok = false;
-    } else if (ok && live && atomic_load_explicit(&t->vols[v]->quiesced, memory_order_acquire)) {
+    } else if (ok && live && eng_refused(t->vols[v])) {
         route_rc = TSDB_ERR_UNAVAILABLE;
         ok = false;
     } else if (ok) {
@@ -1520,7 +1531,7 @@ static int feed_engines(tsdb *t, eng ***out, bool **live, size_t *n)
     if (v && lv) {
         memcpy(v, t->vols, *n * sizeof *v);
         for (size_t i = 0; i < *n; i++)
-            if ((lv[i] = v[i] && !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
+            if ((lv[i] = v[i] && !eng_refused(v[i])))
                 eng_ref(v[i]);
     }
     pthread_rwlock_unlock(&t->lock);
@@ -1697,7 +1708,7 @@ static int cvol_series_make(tsdb *t, const char *name, int type, const char *vna
     if (rc)
         return rc;
     pthread_rwlock_rdlock(&t->lock);
-    eng *e EREF = t->vols[v] && !atomic_load_explicit(&t->vols[v]->quiesced, memory_order_acquire)
+    eng *e EREF = t->vols[v] && !eng_refused(t->vols[v])
                       ? eng_ref(t->vols[v]) : NULL;
     pthread_rwlock_unlock(&t->lock);
     if (!e)
@@ -1767,7 +1778,7 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ts
     uint32_t local = 0;
     if (rc == 0) {
         pthread_rwlock_rdlock(&t->lock); /* an add may move the array */
-        eng *e EREF = atomic_load_explicit(&t->vols[vol]->quiesced, memory_order_acquire) ? NULL : eng_ref(t->vols[vol]);
+        eng *e EREF = eng_refused(t->vols[vol]) ? NULL : eng_ref(t->vols[vol]);
         pthread_rwlock_unlock(&t->lock);
         rc = e ? eng_series(e, name, type < 0 ? TSDB_FLOAT32 : type, &local) /* one append, in the volume */
                : TSDB_ERR_UNAVAILABLE;
@@ -1974,6 +1985,15 @@ void *tsdb_test_meta_hold(tsdb *t, tsdb_sid id)
     return h;
 }
 
+/* tests (tests/test_keep.c): the engine of volume vol, unreferenced (the handle keeps it while it is open) */
+eng *tsdb_test_engine(tsdb *t, uint32_t vol)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    eng *e = vol < t->nvols ? t->vols[vol] : NULL;
+    pthread_rwlock_unlock(&t->lock);
+    return e;
+}
+
 int tsdb_test_meta_use(void *hold) /* what tsdb_series_type does with the engine */
 {
     meta_hold *h = hold;
@@ -2083,6 +2103,11 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     rep->diverged = rep->lost_parts != 0 || rep->lost_log_bytes != 0;
     if (rep->diverged) /* refused until an operator accepts the loss (tsdb_volume_resume) */
         atomic_store_explicit(&e->quiesced, true, memory_order_release);
+    /* a settle's digest that did not match refuses the volume until a restart (src/eckeep.h, D5): this reopen is not
+     * one, and the new engine would serve the .ec part until its own digest of it, which waits while a store is down.
+     * eng_halt joined the old engine's digest thread, so its flag is final. */
+    if (atomic_load_explicit(&old->diverged, memory_order_acquire))
+        atomic_store_explicit(&e->diverged, true, memory_order_release);
     eng_adopt_names(e, old); /* before anyone can see e: its own copies of the names go, the handed-out ones stay */
     pthread_mutex_lock(&t->set_mu); /* from the catch-up to the swap: a list set in between would miss e */
     tenants_catch_up(t, e, tlgen);
@@ -2243,6 +2268,62 @@ size_t tsdb_test_mark_ec(tsdb *t, unsigned flags,
     return marked;
 }
 
+/* test hook (tests/test_settle_oracle.c, stage 3): settles for real, with eng_settle, the parts of every open volume
+ * that pick names, the picked parts of one key in one call; *settled: how many turned .ec. Returns 0, or the first
+ * result of eng_settle that is not 0 or NOTFOUND (nothing of that key was left to settle). */
+int tsdb_test_settle(tsdb *t, bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
+                     void *ctx, size_t *settled)
+{
+    int first = 0;
+    *settled = 0;
+    for (size_t v = 0; v < t->nvols; v++) {
+        eng *e = t->vols[v];
+        size_t n;
+        part **ps;
+        if (!e || !(ps = db_snapshot(e, INT64_MIN, INT64_MAX, &n)))
+            continue;
+        part **sel = malloc((n ? n : 1) * sizeof *sel);
+        bool *done = calloc(n ? n : 1, sizeof *done);
+        if (!sel || !done) {
+            free(sel), free(done), db_release(ps, n);
+            return TSDB_ERR_NOMEM;
+        }
+        for (size_t k = 0; k < n; k++) {
+            if (done[k])
+                continue;
+            size_t m = 0;
+            for (size_t j = k; j < n; j++)
+                if (!done[j] && ps[j]->partition == ps[k]->partition) {
+                    done[j] = true;
+                    if (pick(ctx, (uint32_t)v, ps[j]->partition, ps[j]->level, ps[j]->rows))
+                        sel[m++] = ps[j];
+                }
+            size_t s = 0;
+            int rc = m ? eng_settle(e, ps[k]->partition, sel, m, &s) : 0;
+            *settled += s;
+            if (rc && rc != TSDB_ERR_NOTFOUND && !first)
+                first = rc;
+        }
+        free(sel), free(done);
+        db_release(ps, n);
+    }
+    return first;
+}
+
+/* test hook (tests/test_settle_oracle.c): the cache's count of granules read again as whole cells (their RAW bytes
+ * failed the crc: a damaged chunk was met); drop: empty the cache and close its objects first, so the next queries
+ * read the chunks */
+uint64_t tsdb_test_ec_retries(tsdb *t, bool drop)
+{
+    eccache_counters c = {0};
+    if (t->tier) {
+        if (drop)
+            eccache_test_drop(t->tier);
+        eccache_get_counters(t->tier, &c);
+    }
+    return c.retries;
+}
+
 /* ---------------------------------------------------------------- states */
 
 static int state_get(tsdb *t, tsdb_sid series, const char *name, bool create, uint32_t *code)
@@ -2384,7 +2465,7 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
     }
     if (one) {
         eng *e EREF = t->vols[n ? TSDB_SID_VOLUME(series[0]) : 0];
-        if (atomic_load_explicit(&e->quiesced, memory_order_acquire))
+        if (eng_refused(e))
             e = NULL, route_rc = TSDB_ERR_UNAVAILABLE;
         else
             eng_ref(e);
@@ -2425,7 +2506,7 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
             continue;
         if (t->crole && t->crole[v] == CVOL_REPLICA)
             rc = rc ? rc : TSDB_ERR_READONLY;
-        else if (atomic_load_explicit(&vols[v]->quiesced, memory_order_acquire))
+        else if (eng_refused(vols[v]))
             rc = rc ? rc : TSDB_ERR_UNAVAILABLE;
         else
             eng_ref(vols[v]), refd[v] = true;
@@ -2544,7 +2625,7 @@ static int each(tsdb *t, int (*fn)(eng *))
     if (v && live) {
         memcpy(v, t->vols, n * sizeof *v);
         for (size_t i = 0; i < n; i++)
-            if ((live[i] = v[i] && !atomic_load_explicit(&v[i]->quiesced, memory_order_acquire)))
+            if ((live[i] = v[i] && !eng_refused(v[i])))
                 eng_ref(v[i]);
     }
     pthread_rwlock_unlock(&t->lock);
@@ -4084,6 +4165,11 @@ int tsdb_cvol_replace(tsdb *t, uint32_t number, int (*fn)(void *ctx, eng **old, 
     names_snapshot(&old->series, &names, &nn, &cap);
     names_snapshot(&old->states, &names, &nn, &cap);
     old->retiring = true; /* its close writes nothing and keeps the names: tsdb_series_name pointers outlive it */
+    /* DIVERGED (src/eckeep.h, D5) lasts until a restart, and this swap is not one: the new engine inherits it. The
+     * digest thread is stopped first so the flag is final (fn closes old); should old go on below, its settled_ files
+     * stay held until the next open digests them. */
+    eckeep_eng_stop(old);
+    bool was_div = atomic_load_explicit(&old->diverged, memory_order_acquire);
     eng *o = old, *neu = NULL;
     meta_cluster_open_allow(true);
     int rc = fn(ctx, &o, &neu);
@@ -4122,6 +4208,8 @@ int tsdb_cvol_replace(tsdb *t, uint32_t number, int (*fn)(void *ctx, eng **old, 
     pthread_mutex_lock(&t->tl_mu);
     uint32_t gen = t->tlgen + 1; /* not the current one: the catch-up pushes the list (fn opened without it) */
     pthread_mutex_unlock(&t->tl_mu);
+    if (was_div)
+        atomic_store_explicit(&neu->diverged, true, memory_order_release);
     pthread_mutex_lock(&t->set_mu);
     tenants_catch_up(t, neu, gen);
     bool listed = cvol_list(t, number, neu, NULL, role, CVOL_SWAP);

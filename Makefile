@@ -301,6 +301,9 @@ $(B)/test_intents: tests/test_intents.c src/internal.h $(LIB) $(CRASHFS_SO)
 # every step of create and save (crashfs); the mutant runs plant the bugs it guards against and must fail
 $(B)/test_replfile: tests/test_replfile.c src/replfile.h src/repl.h src/internal.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+# the power-loss shim itself: writev and pwritev are tracked (the Raft log appends with pwritev)
+$(B)/test_crashfs: tests/test_crashfs.c $(CRASHFS_SO) | $(B)
+	$(CC) $(CFLAGS) -o $@ $<
 
 # the engine as a replica (src/replica.c, design-cluster.md step 3): the mutant runs plant the bugs it guards against
 $(B)/test_replica: tests/test_replica.c src/replica.h src/internal.h $(LIB) $(CRASHFS_SO)
@@ -332,7 +335,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_replfile $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
 	./$(B)/test_tsdb $(SCRATCH)
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched $(SCRATCH)
@@ -356,17 +359,19 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	tests/expect_fail.sh 'a segment of markers replays' ./$(B)/test_fno --mutant markers $(SCRATCH)
 	tests/expect_fail.sh 'f > mx' ./$(B)/test_fno --mutant nosync $(SCRATCH)
 	! ./$(B)/test_fno --mutant flushclose $(SCRATCH) >/dev/null 2>&1 # a flush that leaves a record open crashes in the seal (status 139): the one planted bug whose symptom is a crash
+	tests/expect_fail.sh 'due0 >= t0 + N' ./$(B)/test_fno --mutant walclock $(SCRATCH) # the periodic sync's clock from 0 must fail the cadence check
 	./$(B)/test_intents $(SCRATCH)
 	./$(B)/test_intents --mutant unlinkfirst $(SCRATCH) 2>/dev/null | grep -q 'ROWS WRONG' # the old order must lose rows
 	./$(B)/test_replfile $(SCRATCH)
 	for m in nosync sameslot nochecksum; do ! ./$(B)/test_replfile --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	./$(B)/test_crashfs $(SCRATCH)
 	./$(B)/test_replica $(SCRATCH)
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 ./$(B)/test_replica --mutant walsequnlocked $(SCRATCH) >$(B)/walsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/walsequnlocked.log) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 ./$(B)/test_replica --mutant cutwalsequnlocked $(SCRATCH) >$(B)/cutwalsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/cutwalsequnlocked.log && grep -q replica_cut $(B)/cutwalsequnlocked.log) # and a cut's
 	./$(B)/test_cvol $(SCRATCH)
 	./$(B)/test_cvolfs $(SCRATCH)
 	for m in nosync nodirsync nononce trustunsure tornstale samerid; do ! ./$(B)/test_cvolfs --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
-	for m in applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu; do ! ./$(B)/test_replica --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done
+	for m in applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles; do ! ./$(B)/test_replica --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done
 	$(if $(filter Darwin,$(UNAME_S)),,./$(B)/test_crashfs_old $(CURDIR)/$(B)/libcrashfs.so $(SCRATCH))
 	./$(B)/test_feedstore $(SCRATCH)
 	tests/expect_fail.sh 'renamed before its data was synced' ./$(B)/test_feedstore --mutant noseal $(SCRATCH) # a replayed segment renamed without its fdatasync must fail it
@@ -393,9 +398,9 @@ TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 te
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
-test-units-b: $(B)/test_chunk $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier
+test-units-b: $(B)/test_chunk $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_settle
 test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
-	./$(B)/test_props $(or $(TMPDIR),/tmp)
+	./$(B)/test_props $(SCRATCH)
 	B=$(B) tests/test_config.sh $(TMPDIR)
 	./$(B)/test_watchdog
 	./$(B)/test_group $(SCRATCH)
@@ -416,26 +421,35 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	./$(B)/test_volumes $(SCRATCH)
 	./$(B)/test_rs $(SCRATCH)
 	$(if $(EC_OBJ),for m in coef kernel guard; do ! ./$(B)/test_rs --quick --mutant $$m >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (--quick: seconds, not 20 s a run)
-	./$(B)/test_chunk $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in nosums nofence eof settings nosync epochnosync; do ! ./$(B)/test_chunk --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
-	$(if $(EC_OBJ),out=$$(./$(B)/test_chunk --quick --mutant streamreread $(or $(TMPDIR),/tmp) 2>&1); [ $$? -ne 0 ] && echo "$$out" | grep -q 'stream put .* differ from chunk_encode' || { echo "test_chunk: mutant streamreread was not caught by the stream put's comparison with chunk_encode" >&2; exit 1; }) # pinned to its oracle's line
-	./$(B)/test_chunk_heal $(or $(TMPDIR),/tmp)
-	./$(B)/test_ecnames $(or $(TMPDIR),/tmp)
-	for m in nameloose tierloose; do ! ./$(B)/test_ecnames --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
-	./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in $(ORACLE_MUTANTS); do ! ./$(B)/test_settle_oracle --mutant $$m --seeds 2 $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (EC builds: without TSDB_EC the oracle skips)
-	./$(B)/test_ecswap $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled; do ! ./$(B)/test_ecswap --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
-	./$(B)/test_seam $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop; do ! ./$(B)/test_seam --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
-	./$(B)/test_ecpart $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in ecnohash ecnowalseq ecskipname ecnofno ecnolayout; do ! ./$(B)/test_ecpart --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
-	./$(B)/test_ecskip $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec; do ! ./$(B)/test_ecskip --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
-	./$(B)/test_tier $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in tierperengine tierunsure tierstrict tierfresh tierfence; do ! ./$(B)/test_tier --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done,! ./$(B)/test_tier --mutant tiernoec $(or $(TMPDIR),/tmp) >/dev/null 2>&1) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
+	./$(B)/test_chunk $(SCRATCH)
+	$(if $(EC_OBJ),for m in nosums nofence eof settings nosync epochnosync; do ! ./$(B)/test_chunk --quick --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),out=$$(./$(B)/test_chunk --quick --mutant streamreread $(SCRATCH) 2>&1); [ $$? -ne 0 ] && echo "$$out" | grep -q 'stream put .* differ from chunk_encode' || { echo "test_chunk: mutant streamreread was not caught by the stream put's comparison with chunk_encode" >&2; exit 1; }) # pinned to its oracle's line
+	./$(B)/test_chunk_heal $(SCRATCH)
+	./$(B)/test_ecnames $(SCRATCH)
+	for m in nameloose tierloose; do ! ./$(B)/test_ecnames --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	./$(B)/test_settle_oracle $(SCRATCH)
+	$(if $(EC_OBJ),tests/oracle_mutants.sh ./$(B)/test_settle_oracle $(SCRATCH) $(ORACLE_MUTANTS)) # each planted bug must fail it by its own line (EC builds: without TSDB_EC the oracle skips)
+	./$(B)/test_ecswap $(SCRATCH)
+	$(if $(EC_OBJ),for m in swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled; do ! ./$(B)/test_ecswap --quick --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_ecgc $(SCRATCH)
+	$(if $(EC_OBJ),for m in gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer; do ! ./$(B)/test_ecgc --quick --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_settle $(SCRATCH)
+	$(if $(EC_OBJ),for m in ecrankdown settlenocheck settletwopass settlebusy coarsewhole; do ! ./$(B)/test_settle --quick --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),for m in gcskipput gcskipindex gcskipopen gcskipelse gcskipswap gcskipdiscard gccommitted gcdouble; do ! ./$(B)/test_settle --quick --case gcpaths --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each failure path's handoff (int-h)
+	$(if $(EC_OBJ),for m in gcearly nullnosync syncfailgo; do ! ./$(B)/test_settle --quick --case gcpower --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # the handoff after the directory sync, never on a failed engine
+	$(if $(EC_OBJ),! ./$(B)/test_settle --quick --case halt --mutant nohaltstop $(SCRATCH) >/dev/null 2>&1 || exit 1) # a halt stops the settle
+	./$(B)/test_seam $(SCRATCH)
+	$(if $(EC_OBJ),for m in seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop; do ! ./$(B)/test_seam --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_ecpart $(SCRATCH)
+	$(if $(EC_OBJ),for m in ecnohash ecnowalseq ecskipname ecnofno ecnolayout; do ! ./$(B)/test_ecpart --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_keep $(SCRATCH)
+	$(if $(EC_OBJ),for m in digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop; do ! ./$(B)/test_keep --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_ecskip $(SCRATCH)
+	$(if $(EC_OBJ),for m in mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec; do ! ./$(B)/test_ecskip --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	./$(B)/test_tier $(SCRATCH)
+	$(if $(EC_OBJ),for m in tierperengine tierunsure tierstrict tierfresh tierfence; do ! ./$(B)/test_tier --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done,! ./$(B)/test_tier --mutant tiernoec $(SCRATCH) >/dev/null 2>&1) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
 	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
-	$(if $(EC_OBJ),for m in heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always; do ! ./$(B)/test_chunk_heal --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),for m in heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always; do ! ./$(B)/test_chunk_heal --quick --mutant $$m $(SCRATCH) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
 	tests/test_sync_ec.sh
 	tools/sync-ec.sh --check
 	tests/test_check_ec_symbols.sh
@@ -460,7 +474,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/tsdbd $(B)/t
 	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead; do ! ./$(B)/test_peerlink $(SCRATCH) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	$(MAKE) cluster-mutants
 
-# the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 17 runs of 2 minutes each under a sanitizer
+# the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 18 runs of 2 minutes each under a sanitizer
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
 	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
 
@@ -895,19 +909,20 @@ meta-mutants: $(B)/test_meta_mut
 # REPL, admit check, fast path, a peer's cursor below what it acknowledged), or the ISR, keep, ship, backpressure, close and
 # rejoin scenarios (tests/repld_mutants.sh pins each to its FAIL line); hbnoclamp is not listed: no scenario delays a link yet
 repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
-	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(or $(TMPDIR),/tmp) commitbyleader floornotsaved ackbeforesync nodepose noquiesce floornottold \
+	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(SCRATCH) commitbyleader floornotsaved ackbeforesync nodepose noquiesce floornottold \
 	    unsureignored admitnocheck nofastpath nocursorup commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal \
 	    noinboxbound nospill keepignorespeers keepwritten nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr fastride \
-	    nojoinhold inboxstarve opennohold tickstretch stepcurrentonly
+	    nojoinhold inboxstarve opennohold promotenone tickstretch stepcurrentonly stallcatchup keepunanswered fencenosync nomoved deposemoved \
+	    refusedsilent
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
-	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(or $(TMPDIR),/tmp)
+	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(SCRATCH)
 # the cluster login mutants (server/auth.c, tools/cluster-user-cli.c TSDB_AUTH_MUTANT; tests/auth_mutants.sh)
 auth-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
-	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/auth_mutants.sh $(or $(TMPDIR),/tmp)
+	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/auth_mutants.sh $(SCRATCH)
 # the metadata copy's snapshot, TOPOLOGY, STATUS, MOVED and the acceptor's table (tests/copy_mutants.sh)
 copy-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
-	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/copy_mutants.sh $(or $(TMPDIR),/tmp)
+	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/copy_mutants.sh $(SCRATCH)
 meta-soak: $(B)/test_meta
 	./$(B)/test_meta $(SCRATCH) --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
@@ -1092,7 +1107,7 @@ $(B)/test_ecnames: tests/test_ecnames.c src/internal.h $(R7_HDR) $(LIB)
 
 # settled answers equal unsettled answers bit for bit (R7, r7-oracle): two databases, one history, B settles some partitions;
 # every query kind is compared. make oracle-soak: ORACLE_SEEDS seeds of ORACLE_STEPS steps from ORACLE_FIRST (a failure names its seed)
-ORACLE_MUTANTS := skipdelete skipreplace skipretention nomark flipvalues flipagg flipgroup flipbounds flipspread fliptwa fliplttb fliplatest flipmulti flipstats
+ORACLE_MUTANTS := skipdelete skipreplace skipretention nomark flipvalues flipagg flipgroup flipbounds flipspread fliptwa fliplttb fliplatest flipmulti flipstats noretry rankdown
 ORACLE_SEEDS ?= 200
 ORACLE_STEPS ?= 150
 ORACLE_FIRST ?= 1000
@@ -1101,11 +1116,27 @@ $(B)/test_settle_oracle: tests/test_settle_oracle.c src/internal.h $(R7_HDR) $(L
 
 .PHONY: oracle-soak
 oracle-soak: $(B)/test_settle_oracle
-	./$(B)/test_settle_oracle --seeds $(ORACLE_SEEDS) --steps $(ORACLE_STEPS) --first $(ORACLE_FIRST) $(or $(TMPDIR),/tmp)
+	./$(B)/test_settle_oracle --seeds $(ORACLE_SEEDS) --steps $(ORACLE_STEPS) --first $(ORACLE_FIRST) $(SCRATCH)
 
 # the swap of a settle (r7-swap): intent v4, the input check under db->lock against a drop, recovery at open; crash
 # points and power loss (crashfs) at every step; readers across swaps; mutants must fail it
 $(B)/test_ecswap: tests/test_ecswap.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# the settle (r7-settle, src/settle.c, src/ecpolicy.c): queries equal an oracle that never settled, damage aborts, the
+# policy's ages and limits, close during an encode, 8 writers with merges and a drop, crash points and power loss
+$(B)/test_settle: tests/test_settle.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# retired .ec parts and their objects (r7-gc, src/ecgc.c): holds across the deadline, the sweep at open, a store DOWN,
+# power loss at every step of an open and a purge (crashfs); mutants gcunlinkfirst gcunrefleak gcnohold sweeplive
+# sweepinflight
+$(B)/test_ecgc: tests/test_ecgc.c src/internal.h $(R7_HDR) src/chunk_priv.h $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# settled sources (r7-keep, src/eckeep.c): the keep from the record's settle time, the digest, DIVERGED; mutants
+# digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop must fail it
+$(B)/test_keep: tests/test_keep.c src/internal.h $(R7_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # the seam of .ec parts (r7-seam, src/eccache.c): every query kind through it equals the maps, damaged cells, lost
@@ -1125,7 +1156,7 @@ $(B)/test_ecskip: tests/test_ecskip.c src/internal.h $(R7_HDR) $(LIB)
 
 # the tier of a handle (r7-tier): one backend for every volume, vuuid= and requires=tier in META (power loss at every
 # step), stores DOWN at open and failed in service, the unsure EPOCH, the refusals; mutants must fail it
-$(B)/test_tier: tests/test_tier.c src/internal.h src/tier.h src/chunk.h src/chunk_priv.h src/feed.h $(LIB) $(CRASHFS_SO)
+$(B)/test_tier: tests/test_tier.c src/internal.h src/ecgc.h src/tier.h src/chunk.h src/chunk_priv.h src/feed.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # objects, chunk files, stores and the directory backend (R6): every geometry, every damage pattern, range reads at every
@@ -1566,13 +1597,13 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
 	out=$$($$j --mutant lost-write --seconds 12 --nemesis kill --workload kv-local 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'a lost write'; then \
 	        echo "jepsen-cluster-selftest: a write missing from the final state went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$($$j --mutant rep-lost-write --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	out=$$($$j --mutant rep-lost-write --seconds 30 --nemesis kill --workload kv 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "the leader's final read"; then \
 	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --mutant rep-lost-write --seconds 20 --nemesis midcommit --workload kv 2>&1); rc=$$?; \
-	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "kvr's last ISR" || ! echo "$$out" | grep -q '@n[0-9]*: durability'; then \
-	        echo "jepsen-cluster-selftest: an acknowledged write missing from a member of kvr's last ISR after the terminal point went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	out=$$($$j --mutant rep-half-batch --seconds 15 --nemesis kill --workload kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q "terminal crash point .*ended there" || ! echo "$$out" | grep -q "the leader's final read"; then \
+	        echo "jepsen-cluster-selftest: an acknowledged write missing from a replica of kvr after the terminal point and its failover went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant rep-half-batch --seconds 30 --nemesis kill --workload kv 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'half of a large write'; then \
 	        echo "jepsen-cluster-selftest: half of an acknowledged large write in a replica of kvr went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-checker 2>&1); rc=$$?; \

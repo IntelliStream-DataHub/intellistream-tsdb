@@ -581,6 +581,173 @@ static void test_parts(const char *scratch)
     rm_rf(dir);
 }
 
+/* Timestamps that damage makes out of order or out of their entry's range, in a part read without
+ * verify_checksums: the decode refuses the granule (TSDB_ERR_CORRUPT), and no bucketer reads or writes outside its
+ * arrays. Before the decode checked them, fold_into indexed its accumulators by the bucket of each decoded row and a
+ * minute grouping wrote 2^40 ms / 1 minute buckets past them (SIGSEGV; under the seam's mutant seamnoverify too). The
+ * part comes from an insert (no zstd: a DoubleDelta block whose first timestamp and delta are plain words). */
+enum { TSD_ROWS = 4096, TSD_MID = 10 };
+enum { TSD_HIGH, TSD_LOW, TSD_BACKWARDS, TSD_FLAT, TSD_MODES };
+static const char *const tsd_name[] = {"shifted up 2^40 ms", "shifted down 2^40 ms", "running backwards",
+                                       "all one timestamp"};
+
+static int tsd_values(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
+{
+    (void)ts, (void)v;
+    *(size_t *)ctx += n;
+    return 0;
+}
+
+static int tsd_multi(void *ctx, const tsdb_series_result *r)
+{
+    if (r->last)
+        *(int *)ctx = r->status;
+    return 0;
+}
+
+/* granule i of the part: the file offset of its timestamp block */
+static uint64_t tsd_block(const char *dir, const char *name, uint32_t i, uint32_t *ng)
+{
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    CHECK(dfd >= 0);
+    part *pt = NULL;
+    OK(part_open(dfd, name, false, &pt));
+    close(dfd);
+    if (!pt)
+        return 0;
+    granule g;
+    gx_load(pt, i, GW_LOC, &g);
+    *ng = pt->ng;
+    part_unref(pt);
+    return g.off;
+}
+
+static void tsd_damage(const char *dir, const char *name, uint64_t off, int how)
+{
+    uint8_t kind;
+    file_pread(dir, name, (off_t)off, &kind, 1);
+    CHECK(kind == BLK_DD); /* the layout this damage assumes */
+    int64_t w[2]; /* the first timestamp and the first delta */
+    file_pread(dir, name, (off_t)off + 1, w, sizeof w);
+    if (how == TSD_HIGH)
+        w[0] += (int64_t)1 << 40;
+    else if (how == TSD_LOW)
+        w[0] -= (int64_t)1 << 40;
+    else
+        w[1] = how == TSD_BACKWARDS ? -w[1] : 0;
+    file_pwrite(dir, name, (off_t)off + 1, w, sizeof w);
+}
+
+static void test_ts_damage(const char *scratch)
+{
+    char dir[600], part[256];
+    snprintf(dir, sizeof dir, "%s/damage-ts", scratch);
+    const int64_t start = T0, end = T0 + (int64_t)TSD_ROWS * 1000;
+    for (int how = 0; how < TSD_MODES; how++) {
+        rm_rf(dir);
+        tsdb_options o = opts();
+        tsdb *db;
+        tsdb_sid id;
+        /* two parts whose rows interleave (even and odd seconds): a query merges their streams (merge_stream), where
+           the rows of a decoded granule go to the bucketers as they come */
+        for (int half = 0; half < 2; half++) {
+            OK(tsdb_open(dir, &o, &db));
+            OK(tsdb_series(db, "ts.series", &id));
+            static int64_t ts[TSD_ROWS / 2];
+            static float v[TSD_ROWS / 2];
+            for (int i = 0; i < TSD_ROWS / 2; i++)
+                ts[i] = T0 + (int64_t)(2 * i + half) * 1000, v[i] = (float)(i % 37) * 0.25f;
+            OK(tsdb_insert_series(db, id, ts, v, TSD_ROWS / 2));
+            OK(tsdb_close(db));
+        }
+        CHECK(find_file(dir, "p", ".part", part, sizeof part));
+        uint32_t ng = 0;
+        uint64_t mid = tsd_block(dir, part, TSD_MID, &ng);
+        CHECK(ng == TSD_ROWS / 2 / 64);
+        uint64_t last = tsd_block(dir, part, ng - 1, &ng);
+        tsd_damage(dir, part, mid, how);
+        tsd_damage(dir, part, last, how);
+
+        o.verify_checksums = 0;
+        OK(tsdb_open(dir, &o, &db));
+        OK(tsdb_series_lookup(db, "ts.series", &id));
+        const tsdb_group minute = {TSDB_MINUTE, 1, NULL};
+        tsdb_bucket *b = NULL;
+        size_t nb = 0;
+        int rc[12];
+        int k = 0;
+        rc[k++] = tsdb_query_group(db, id, start, end, &minute, &b, &nb); /* dense */
+        free(b), b = NULL;
+        agg_dense_buckets = 4; /* sparse: chunks of 4 buckets */
+        rc[k++] = tsdb_query_group(db, id, start, end, &minute, &b, &nb);
+        free(b), b = NULL;
+        agg_dense_buckets = 0;
+        tsdb_spread_bucket *sb = NULL;
+        rc[k++] = tsdb_query_spread(db, id, start, end, 60000, NULL, &sb, &nb);
+        free(sb);
+        tsdb_twa_bucket *tb = NULL;
+        rc[k++] = tsdb_query_twa(db, id, start, end, 60000, NULL, &tb, &nb);
+        free(tb);
+        size_t rows = 0;
+        rc[k++] = tsdb_query_lttb(db, id, start, end, 100, tsd_values, &rows);
+        rc[k++] = tsdb_query_values(db, id, start, end, NULL, tsd_values, &rows);
+        static const tsdb_multi_kind kinds[] = {TSDB_MULTI_VALUES, TSDB_MULTI_BUCKETS, TSDB_MULTI_SPREAD,
+                                                TSDB_MULTI_TWA, TSDB_MULTI_LTTB};
+        for (size_t m = 0; m < sizeof kinds / sizeof *kinds; m++) {
+            tsdb_multi_query q = {.kind = kinds[m], .start = start, .end = end, .interval_ms = 60000,
+                                  .threshold = 100};
+            tsdb_multi_opts mo = {.threads = 2};
+            int st = 1;
+            int r = tsdb_query_multi(db, &q, &id, 1, &mo, tsd_multi, &st);
+            rc[k++] = r ? r : st;
+        }
+        for (int j = 0; j < k; j++)
+            if (rc[j] != TSDB_ERR_CORRUPT) {
+                fprintf(stderr, "%s:%d: timestamps %s: query %d = %s, expected CORRUPT\n", __FILE__, __LINE__,
+                        tsd_name[how], j, tsdb_strerror(rc[j]));
+                failures++;
+            }
+        /* the newest row is in the damaged last granule: any answer, never a read outside it */
+        tsdb_latest_result lr;
+        int lrc = tsdb_latest(db, &id, 1, NULL, &lr);
+        CHECK(lrc == 0 || lrc == TSDB_ERR_CORRUPT);
+        OK(tsdb_close(db));
+    }
+    printf("  parts: damaged timestamps without verify_checksums refused by every bucketed query (%d kinds)\n",
+           TSD_MODES);
+    rm_rf(dir);
+}
+
+/* With verify_checksums on, a granule whose 32-bit checksum matches (a collision, or a part written to match) must
+ * still be refused when its timestamps do not strictly increase inside its entry: the bucketers index their arrays by
+ * the rows' order and window, and a checksum is no proof of memory safety. granule_decode directly, verify true. */
+static void test_ts_verified(void)
+{
+    enum { N = 512 };
+    static int64_t ts[N], back[N];
+    codec_ctx *c = codec_new();
+    uint8_t *blk = calloc(block_bound(N) + BLK_SLACK, 1);
+    part p = {.grows = N};
+    for (int how = 0; how < 4; how++) {
+        for (int i = 0; i < N; i++)
+            ts[i] = T0 + (int64_t)i * 1000;
+        granule g = {.count = N, .ts_min = ts[0], .ts_max = ts[N - 1]};
+        switch (how) {
+        case 0: break;                          /* intact: decodes */
+        case 1: ts[300] = ts[299]; break;       /* a repeat */
+        case 2: ts[N - 1] = ts[0] - 1; break;   /* the last row goes back */
+        default: g.ts_max -= 1000; break;       /* a row past the entry's end */
+        }
+        g.ts_len = (uint32_t)block_encode_ts(c, 3, ts, N, blk);
+        g.crc = (uint32_t)xxh64(blk, g.ts_len, 0);
+        int rc = granule_decode(c, &p, &g, blk, TSDB_FLOAT32, back, NULL, N, true);
+        CHECK(rc == (how == 0 ? 0 : TSDB_ERR_CORRUPT));
+    }
+    free(blk);
+    codec_free(c);
+    printf("  parts: unsorted timestamps refused under a matching checksum\n");
+}
+
 /* A follower that finds a new part broken keeps its previous view, counts and
  * logs the part once, and its refreshes fail with TSDB_ERR_CORRUPT. */
 static void test_part_follower(const char *scratch)
@@ -3141,6 +3308,8 @@ int main(int argc, char **argv)
     test_misread_tail(base);
     test_read_errors(base);
     test_parts(base);
+    test_ts_damage(base);
+    test_ts_verified();
     test_part_follower(base);
     test_manifest(base);
     test_codecs();
