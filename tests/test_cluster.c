@@ -8226,6 +8226,12 @@ static void scen_pause(void)
     }
     tsdbc_set_retry(c, 10000);
     tsdbc *cw = client(Nw);
+    /* The pauses above (the old leader resumed alone, its peers paused, then all resumed) can make the metadata group
+     * elect again (term 3 or 4) about now, and a lease that lapses meanwhile refuses a write UNAVAILABLE until the new
+     * term's heartbeats are answered (§7.1, nothing written): retried, as by any client. What this part checks is the
+     * reads through the deposed leader. (ASan under load: 2 of 12 runs of c0047c5 failed here with retry 0, each
+     * with such an election.) */
+    tsdbc_set_retry(cw, 10000);
     for (int k = 0; k < 20; k++) {
         ts = 10000 + k;
         if ((rc = tsdbc_insert_series(cw, id, &ts, &val, 1)) != 0)
@@ -9219,6 +9225,151 @@ static void scen_cuthold(void)
     cut_run(1);
 }
 
+/* 1 if one of server i's WAL segments of volume 1 holds a row with timestamp ts (rows are raw: ts at byte 4 of each) */
+static int wal_holds_ts(int i, int64_t ts)
+{
+    char dir[PATH_MAX + 80];
+    server_dir(i, dir, sizeof dir);
+    strcat(dir, "/v1");
+    DIR *d = opendir(dir);
+    if (!d)
+        return 0;
+    int found = 0;
+    struct dirent *e;
+    while (!found && (e = readdir(d))) {
+        if (strncmp(e->d_name, "wal_", 4) != 0)
+            continue;
+        char f[PATH_MAX + 400];
+        snprintf(f, sizeof f, "%s/%s", dir, e->d_name);
+        FILE *fp = fopen(f, "rb");
+        if (!fp)
+            continue;
+        static uint8_t buf[8 << 20];
+        size_t n = fread(buf, 1, sizeof buf, fp);
+        fclose(fp);
+        found = memmem(buf, n, &ts, sizeof ts) != NULL;
+    }
+    closedir(d);
+    return found;
+}
+
+/* deposetail (jepsen-cluster pause, seed 123, 2026-11-22): a deposed writer whose log runs past the commit point, with
+ * a record of its uncommitted tail written only after its demote began, rejoins as a replica. L's replicas hold R1,
+ * whose acknowledgements L never heard (cutfrom files at L), so the new leader's epoch e0 ends above L's commit floor;
+ * R2 is admitted at L once it is cut both ways, and its bytes reach op_bytes only after the demote cleared the index
+ * (TSDB_REPLD_TEST=latebytes: held there until the driver has no core, as a write held in the WAL writer of a stopped
+ * process was). The demote's reopen must cut R2 (the new leader never had it) back to the new leader's end of e0, not
+ * stop the volume ("the log does not retain a position above its applied end": the stale entry of R2 left at the front
+ * of the rebuilt index of record starts), and L must catch up and join the ISR again, holding R1 (committed by the new
+ * leader) and every row written there, and not R2. TSDB_REPLD_MUTANT=demotestaleidx (the index rebuilt over what the
+ * old engine pushed in the window) fails it. */
+static void scen_deposetail(void)
+{
+    scenario("deposetail");
+    init_isr_lag_ms = 2000; /* L, deaf to its replicas between R1 and the full cut, asks to shrink only after this */
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks,latebytes";
+        start(i);
+    }
+    init_cluster(0, 600);
+    init_isr_lag_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want3 = 3;
+    await_view(0, p_voters, &want3, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rs", 3, &num)) != 0 || num != 1)
+        die("volume add rs: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rs", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rs", &v))
+        die("no record of rs");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rs is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rs", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(L, "rs", 3, 30000, "every replica in the ISR before the cut");
+    /* R1: reaches both replicas, its acknowledgements never reach L */
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            cut_file(L, i, 1);
+    const int64_t r1 = 7300000123LL, r2 = 7400000321LL;
+    struct rep_writer w1 = {.port = cports[L], .id = id, .t0 = r1, .count = 1};
+    pthread_t t1;
+    if (pthread_create(&t1, NULL, rep_write_thread, &w1) != 0)
+        die("pthread_create");
+    for (uint64_t t0 = now_ms(); !(wal_holds_ts((L + 1) % 3, r1) && wal_holds_ts((L + 2) % 3, r1)); usleep(2000))
+        if (now_ms() - t0 > 10000)
+            die("R1 did not reach both replicas' logs in 10 s");
+    /* R2: L cut both ways, then written at L and held before op_bytes indexes it */
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            cut_file(i, L, 1);
+    char lb[PATH_MAX + 96];
+    server_dir(L, lb, sizeof lb);
+    strcat(lb, "/latebytes");
+    FILE *fp = fopen(lb, "w");
+    if (!fp || fclose(fp) != 0)
+        die("%s: %s", lb, strerror(errno));
+    struct rep_writer w2 = {.port = cports[L], .id = id, .t0 = r2, .count = 1};
+    pthread_t t2;
+    if (pthread_create(&t2, NULL, rep_write_thread, &w2) != 0)
+        die("pthread_create");
+    await_log_count(L, "are held until the writer is deposed", 1, 10000);
+    int Nw = await_promoted((L + 1) % 3, "rs", old, e0, &v);
+    if (Nw == L)
+        die("the record of rs after the cut: leader %u, epoch %" PRIu64, v.leader, v.epoch);
+    await_log_count(L, "released by the demote", 1, 30000);
+    await_log_count(L, ": a replica again", 1, 30000);
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    uint64_t th = now_ms();
+    for (int k = 0; k < 2; k++) { /* both of L's writes end without an acknowledgement: deposed, or their link closed */
+        struct rep_writer *w = k ? &w2 : &w1;
+        for (uint64_t t0 = now_ms(); !__atomic_load_n(&w->done, __ATOMIC_ACQUIRE); usleep(10000))
+            if (now_ms() - t0 > 30000)
+                die("R%d on the deposed leader was not answered in 30 s", k + 1);
+        pthread_join(k ? t2 : t1, NULL);
+        if (w->rc == 0)
+            die("R%d was acknowledged by the deposed leader", k + 1);
+    }
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int more = 5;
+    for (int k = 0; k < more; k++) {
+        int64_t ts = 9000000 + 1000LL * k;
+        float val = (float)k;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d to the leader at epoch %" PRIu64 ": %s", k, v.epoch, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(Nw, "rs", 3, 30000, "the deposed writer back in the ISR once the links are back");
+    if (log_count(L, "stopped:"))
+        die("the deposed writer stopped its volume");
+    printf("  writer %d deposed with R2 written after its demote began: a replica again, back in the ISR %" PRIu64
+           " ms after the heal\n", L, now_ms() - th);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)acked + 1 + (uint64_t)more; /* R1 committed by the new leader, R2 cut */
+    rep_same(wantr, "after the deposed writer rejoined");
+}
+
 /* readdepose (int-r review F1): a read on the leader L of a replicated volume, admitted under its lease and the
  * volume led here, then held before its snapshot (TSDBD_TEST_READ_STALL), while L is deposed: cut from its replicas on
  * the data links (TSDB_REPLD_TEST=cutlinks), the group moves the volume and L, fenced, reopens its engine as a
@@ -9700,7 +9851,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
