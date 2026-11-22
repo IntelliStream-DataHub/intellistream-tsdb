@@ -39,10 +39,12 @@ refusals (`tests/test_tier.c` `refuse`, `test_settle.c`). R8 removes the first o
 6. **E26's logical digest.** R7 built a byte digest: the object read whole, its xxh64 against the record's
    `object_xxh64` and against the `settled_` file's (`src/eckeep.c`). E26 specifies the rows per series and an xxh64 over
    the visible rows of the retired parts, compared between log replicas. A byte digest cannot be compared across
-   replicas (their files differ); build the logical one here. Until then E26 must not read as built.
+   replicas (their files differ); R8 owns it (docs/tasks/r10-reencode.md uses it and does not build it). Until then E26 must not read as built.
 7. **DIVERGED on a part above Z** (a replica whose part has `ppos` between Z and the marker stops and is rebuilt) and the
-   way out of DIVERGED in general. R7's is a flag on the engine (`db->diverged`) cleared only by a restart, and
-   tsdbd cannot even say so (docs/tasks/r7-keep-followups.md: `unav_entry`, `vol_health`). D5 deferred "a reverse intent
+   way out of DIVERGED in general. R7's is a flag on the engine (`db->diverged`) kept in memory only: a restart clears it, and the new
+   engine serves the `.ec` part until its open digest has run and failed again, which waits while any store is not UP
+   (an in-process reopen carries the flag, `src/volumes.c`; a restart does not). Make it durable, or make the open
+   refuse until the digest has run. tsdbd cannot even say DIVERGED (docs/tasks/r7-keep-followups.md: `unav_entry`, `vol_health`). D5 deferred "a reverse intent
    that swaps `settled_` back" to R15, and a cluster needs it earlier than a test-only tier does: decide with R15.
 8. **Shipping `.ec` files** over the bulk link, and a replica that misses one fetching it before it acknowledges the
    marker (§2.3 "Crash and failover"); the leader keeps what a marker names until its segment leaves retention.
@@ -143,3 +145,9 @@ Harness and engine:
   (`ORACLE_PLAN=0` turns it off): decide which counters are the contract once settled parts read through the seam.
 - `-Wrestrict` false positives at -O1 in `tests/test_settle.c` `fresh()` and `tests/test_settle_oracle.c`.
 - A damaged `retired_*.ec` record fails the open with a line (r7-gc F6): decide whether that should refuse or log.
+- `settleable()` (`src/ecpolicy.c`) refuses v8 headers but not insert-written parts: it relies on `merge_selectable`,
+  which is false with `merge_threads` 0, so then an insert-written part can settle, against the rule of `src/ecskip.h`
+  (such parts keep their fast-codec blocks for ever once `.ec`). Layout only; check `insert_written` in `settleable`.
+- r7-jepsen's REPORT names a TSan report in `test_replica` (`replica.c`, `wal_off` read without its lock). Not confirmed
+  fixed here (224fc8d, `ld_last` under `buf_lock`, may be the fix): rerun `make tsan TEST_TARGET=test-meta`'s replica
+  group before relying on it.

@@ -903,11 +903,11 @@ Track-days as in design-ha-modes.md §7 (build, review and fix rounds); gate hou
 | P6 | Release gates (E45) on the release commit: jepsen-cluster's full set on all four geometries and `replicas=3` (§10.3), with the device-class cases of R13 (*2026-11-11*), the 72-hour soak (§10.5), the upgrade test, the reviews, and the fixes they find | the gates themselves | 98 (26 + 72) | 2-4 |
 
 *(2026-11-22: R7 as built leaves the replicated half to R8 (+3 track-days, row above) and re-encode to R10 (+1.5); the
-totals below are not recomputed.)*
+track-day totals below add them, the gate hours are not recomputed.)*
 
-R5-R15: **39-51 track-days**, 84 gate hours (R11 is 1-2 since the guide moved to P5; *2026-11-11*: R13 6-8 and 16
+R5-R15: **43-56 track-days** (39-51 before the R7 split of 2026-11-22: R8 +3, R10 +1 to 2), 84 gate hours (R11 is 1-2 since the guide moved to P5; *2026-11-11*: R13 6-8 and 16
 instead of 2-3 and 6, R15 5-6 and 10, E56; it was 30-40 and 64). P1-P6: **14-21 track-days**,
-117 gate hours (P6 +2, *2026-11-11*). **Total for 0.11.0, with the prerequisites: about 66-92 track-days and 244 gate
+117 gate hours (P6 +2, *2026-11-11*). **Total for 0.11.0, with the prerequisites: about 70-97 track-days (66-92 before the R7 split) and 244 gate
 hours (about 10.2 machine-days, 3 of them the soak) before reruns after fixes** (*2026-11-11*, with device classes as
 revised after review; it was 57-81 and 222) (2026-11-09, after the user's answers; it was 44-60
 track-days and 107 gate hours with R10 as the first cut and the cluster data a preview, and 59-84 and 226 in the
@@ -1374,8 +1374,9 @@ below). How the key and TIERS agree at start is settled with the `config-files` 
   settle intent (as built: the swap keeps the source's name and block range, renames the source to `settled_*`, and
   keeps it `keep_s`, §2.3). The settle lists parts, so it folds into the latest table like any publisher (AGENTS.md "The latest
   table"), with no change to its answers. The open's orphan scan of the tier stores runs after the intent replay and
-  deletes only chunks that no MANIFEST entry, settle intent or `retired_*` `.ec` file (kept for followers until
-  `obsolete_part_lifetime_s`) names; on one server no settle is in flight then.
+  deletes only chunks whose object no `.ec` file name in the volume directory names, listed or `retired_*` (kept for
+  followers until `obsolete_part_lifetime_s`), reading one chunk header to check that it names this volume's uuid
+  (as built, `src/ecgc.c`; MANIFEST is not consulted); on one server no settle is in flight then.
 - **Reads**: statistics from the `.ec` index on the NVMe, as before. A granule to decode is read from the granule cache
   or with one `pread` of its byte range from the store holding its data cell (a seek), or, with that store DOWN, the
   same range from k' others; adjacent granules of one series in one partition (they lie together in a part) are read

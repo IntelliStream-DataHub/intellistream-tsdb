@@ -287,7 +287,7 @@ cgroup, so `nice` does not keep your work out of its way.
   open of a volume writes `vuuid=` and `requires=tier` to META (tmp, fsync, rename) and raises every store's epoch to the
   constant 1 (D4); it refuses a tier on a read-only open, a follower, a `requires=cluster|replica` volume (D1, D7) and a
   build without `TSDB_EC`; a store without META is a lost disk (DOWN, never remade) once any volume exists. `tier_writable`
-  turns false, with one line, once a store is not UP or failed in service: settles and chunk deletes stop until the next
+  turns false, with one line, once a store is not UP, failed in service or did not take the volume's epoch at open (mutant `tierfence`): settles and chunk deletes stop until the next
   handle open, reads go on. `src/ecpart.c`: the `.ec` file (`p<K>_<A>_<B>_<L>.ec`, the name and block range of its source,
   D2): the source's header, granule index, tombstones and footer verbatim (so `gx_*` read the index in place, unchanged),
   then the object record (oid, geometry, `object_len`, `object_xxh64`, the source's per-cell sums, `writer_epoch`,
@@ -504,20 +504,21 @@ cgroup, so `nice` does not keep your work out of its way.
   the file keeps its source's name and block range (D2), so it has the same rows, the same rank and the same key, and a
   settle needs no gate, cut, marker or `ppos` (D1). Every path that takes a part out of the list must respect that:
   - **Never a merge input.** An `.ec` part and a `settling` one are barriers in merge selection, rewrites, `tsdb_optimize`
-    and the TTL rewrite (`part_merge_barrier`), never a source of `pw_copy_granule`; a barrier is not counted in
-    `partition_parts`, and in `db_wait_merges` (backpressure) it is a wall, not a pair, so an insert never waits for a
+    and the TTL rewrite (`part_merge_barrier`), never a source of `pw_copy_granule`; an `.ec` part is not counted in
+    `partition_parts` (a settling part still counts: it is a `.part` until the swap), and in `db_wait_merges` (backpressure) it is a wall, not a pair, so an insert never waits for a
     settle in flight when no pair is left. A drop retires them (a settling part without waiting for the settle).
   - **The swap checks its inputs under `db->lock`, in the hold of its renames** (`ec_swap_commit`): every source still
-    listed, not dropped, not merging, the engine not failed; else `TSDB_ERR_STOPPED`, nothing renamed, the temporaries
-    unlinked and the objects handed to r7-gc. A drop takes no `publish_lock` (`drop_retire` takes `latest_rw` and
+    listed, not dropped, not merging; else `TSDB_ERR_STOPPED`, nothing renamed, the temporaries unlinked and the objects
+    handed to r7-gc. On a failed engine the answer is `TSDB_ERR_IO` and nothing is renamed or removed: the next open
+    decides (only 0 means the `.ec` parts are listed; after IO a caller must not treat them as never listed). A drop takes no `publish_lock` (`drop_retire` takes `latest_rw` and
     `db->lock`), so a check made before those locks would list an `.ec` for a part the drop retired and bring its rows
     back (mutant `swapnodropcheck`). The swap is **intent v4** (`tsdb-intent 4 n`, n `L tmp final` lines, n `R part
     settled_part` lines, a hash), written and synced with its directory before any rename. Recovery asks one question:
     did the swap rename anything? Any `.ec` (under its name or `retired_`) or `settled_` name on disk means the check
     passed and the swap stands (a drop after it retires only the `.ec` parts), and a missing source then proves nothing;
     nothing renamed with every tmp and source present rolls forward, with one missing rolls back; damage (a sealed
-    intent that breaks the name rules, an `.ec` under no name while its source is still `.part`, a lookup error that is
-    not ENOENT) fails the open with the intent kept. The directory is synced before the intent is unlinked, as every
+    intent that breaks the name rules, an `.ec` under no name while its source is still `.part`, a source under
+    `retired_` and not `settled_` although the swap renamed, a lookup error that is not ENOENT) fails the open with the intent kept. The directory is synced before the intent is unlinked, as every
     rolled-forward intent now is (`tests/test_intents.c`).
   - **The settle reads each byte once.** `eng_settle` checks the granule crcs, the footer hash and the class judgement on
     the stripe copy it then encodes (`chunk_be_put_stream`): a check on a second read could pass on bytes that differ
@@ -527,7 +528,11 @@ cgroup, so `nice` does not keep your work out of its way.
   - **The source stays for `keep_s` from the record's `settle_ms`**, and for as long as its digest has not matched.
     A digest that does not match sets `db->diverged`: the volume answers `TSDB_ERR_UNAVAILABLE`, the `settled_` files are
     kept. The way out (a reverse intent that swaps `settled_` back, an operator command) comes with R15: in R7 the tier
-    is test-only, and tsdbd cannot yet say DIVERGED for it (docs/tasks/r7-keep-followups.md). E26's logical digest of the
+    is test-only, and tsdbd cannot yet say DIVERGED for it (docs/tasks/r7-keep-followups.md). The flag is in memory
+    only: an in-process reopen carries it, but a restart clears it, and the new engine then serves the `.ec` part until
+    its open digest has run and failed again (that digest waits while any store is not UP, so indefinitely with a store
+    down). A restart is not a way out; making the flag durable, or the open refuse until the digest has run, is R15's
+    (or R8's) job. E26's logical digest of the
     visible rows is not built; R7's is a byte digest of the object (docs/tasks/r8-from-r7.md).
   - **Chunks are deleted at the last reference.** A retired `.ec` keeps its `retired_` name until every chunk of its
     object is gone, and nothing is deleted while any part of the object is referenced (`part_unref` -> `ecgc_last_unref`,
@@ -535,10 +540,14 @@ cgroup, so `nice` does not keep your work out of its way.
     thread of the engine starts, by file name, and queues only objects whose header names this volume's uuid; never put
     chunks in a store before the sweep without `ecgc_test_nosweep`. No engine lock is held across an encode, a put or a
     chunk delete.
-  - **Refused where unbuilt**: parts without granules and v8 parts are never settled; a cluster or replica volume, a
+  - **Refused where unbuilt**: parts without granules and v8 parts are never settled (a settle must also never take a
+    part `rewrite_alone` would still take, `src/ecskip.h`: `settleable` checks it only through `merge_selectable`, which
+    is false without a merge thread, so with `merge_threads` 0 an insert-written part can settle: layout only, recorded); a cluster or replica volume, a
     follower (a running one that meets an `.ec` name fails its engine with one line), a build without `TSDB_EC` and a
     tier with a store that is not UP settle nothing. `TSDB_TEST_TIER` needs `TSDB_TEST_TIER_I_KNOW=1` and is test-only until
-    R15. The embedded bindings copy `src/*.c` and build without `TSDB_EC`: a volume whose META says `requires=tier` is then refused at open.
+    R15. A volume opened for writing with the tier carries `requires=tier` from the attach on, before anything is
+    settled; from then on every read-only or follower open (`tsdb DIR export`, the CLI's read commands), every open
+    with no tier configured and every build without `TSDB_EC` fails. The embedded bindings copy `src/*.c` and build without `TSDB_EC`: a volume whose META says `requires=tier` is then refused at open.
   - **Late rows** go to young parts above the object and settle again as further objects of the key (E6); until R10
     re-encodes, such a key reads more objects and tombstones in young parts hide rows the reader still decodes. Answers
     do not change (`tests/test_settle_oracle.c`).

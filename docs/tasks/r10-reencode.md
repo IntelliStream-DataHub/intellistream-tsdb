@@ -37,9 +37,9 @@ key only after `grace_s` and its merges.
   and `ecswap_recover`'s name rules (an `.ec` under none of its names while its source is `.part`) need the new shape.
 - **A re-encode is a merge** for the latest table and for `db_wait_merges`' count: it must not be invisible to
   backpressure, and `part_merge_barrier` must let the re-encode take what the merge selection may not (an `.ec` part).
-- **The logical digest** `ec_digest_rows` (rows per series and an xxh64 over the visible rows) is built here, not in R7:
-  it is what E26 describes and what the replicas compare (docs/tasks/r8-from-r7.md item 6). A re-encode's retired
-  objects are checked by it before their chunks go.
+- **The logical digest** (rows per series and an xxh64 over the visible rows, E26) is built by R8, not here and not in R7
+  (docs/tasks/r8-from-r7.md item 6: `MK_DIGEST` needs it, and R8 comes first). A re-encode uses R8's function to check
+  its retired objects before their chunks go; if R10 were ever built before R8, it takes the item over.
 - **A re-encode's own policy**: the E6 trigger in `src/ecpolicy.c`, a backoff per key, no re-encode while the key's
   digest of an earlier settle is pending (`eckeep`), and the eager policy bounded so that jepsen runs stay small.
 - **Mutants** in R6's pattern for each new check (an enum in the code, `--mutant NAME`, a Makefile line that requires the

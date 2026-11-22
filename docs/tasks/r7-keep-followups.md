@@ -4,7 +4,9 @@
 
 ## tsdbd cannot see a DIVERGED engine (R15, or before tiers reach tsdbd)
 
-A digest that does not match sets `db->diverged`, and the `route()` family answers `TSDB_ERR_UNAVAILABLE` for the
+A digest that does not match sets `db->diverged` (in memory only: an in-process reopen carries it, a restart clears it,
+and the new engine then serves the `.ec` part until its open digest has run and failed again, which waits while a store
+is not UP; R8 or R15 makes it durable or makes the open refuse until the digest has run), and the `route()` family answers `TSDB_ERR_UNAVAILABLE` for the
 volume. There is no accessor for the flag, so tsdbd's `unav_entry` and `vol_health` (server/tsdbd.c) report
 `TSDB_WHY_DIVERGED` with its 60 s retry only for `dom.vol[v].diverged` (a reopen's report). A volume refused by eckeep
 answers UNAVAILABLE with reason RECOVERING or NONE and a 1 s retry, clients retry every second for their 30 s budget, and
