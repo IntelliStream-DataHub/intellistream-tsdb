@@ -57,8 +57,12 @@
  * forwarded insert never waits behind replication traffic (ha.md 9.1). The kinds need no new cluster version: a
  * server of this version that does not know a kind refuses its HELLO with a line (cluster.c's acceptor table,
  * peerlink_adopt), and the dialer redials with backoff. */
-enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2, PL_KIND_FWD = 3, PL_KIND_FWDQ = 4 };
-#define PL_KIND_DATA_MAX PL_KIND_FWDQ /* data kinds are 1 .. this */
+/* CHUNK (requests to a member's chunk stores and their answers) and CHUNKB (chunk puts as bulk files, under a rate cap
+ * of their own) are server/chunksrv.c's, on a peerlink of its own as well (design-cluster-data.md §5.7, R8 D10); 5 is
+ * R4's snapshot transfer. */
+enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2, PL_KIND_FWD = 3, PL_KIND_FWDQ = 4, PL_KIND_CHUNK = 6,
+       PL_KIND_CHUNKB = 7 };
+#define PL_KIND_DATA_MAX PL_KIND_CHUNKB /* data kinds are 1 .. this */
 
 enum {
     PL_OK = 0,
@@ -178,7 +182,8 @@ int plink_send_gen(struct plink *l, uint64_t gen, uint8_t type, const void *p, s
 int plink_sendv(struct plink *l, uint64_t gen, uint8_t type, const void *hdr, size_t hn, const void *p, size_t n,
                 int timeout_ms, int tracked, uint64_t token, uint64_t deadline_ns);
 /* Ends the link's current connection (a dialed link redials, an accepted one waits for the peer's next): what
- * was queued is dropped as when the peer goes. Tests, and nothing else, call it (a late reply is never a reason). */
+ * was queued is dropped as when the peer goes. Tests call it, and chunksrv for a frame that does not parse (a late
+ * reply is never a reason). */
 void plink_reset(struct plink *l);
 /* A dialed link that is no longer wanted (its member left): its connection ends and it dials no more; the link
  * stays valid (sends are PL_E_DOWN) until peerlink_free. */

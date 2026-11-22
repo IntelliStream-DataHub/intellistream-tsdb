@@ -125,6 +125,15 @@ typedef struct chunk_wr chunk_wr;
 /* Makes the store: the directory (one level may be created), its META with a store id (id NULL: random). Refuses a
  * directory that already has a META (TSDB_ERR_INVALID). Synced with its parent. */
 int chunk_store_init(const char *path, const uint8_t *id, uint8_t id_out[16]);
+/* Who a store belongs to (design-cluster-data.md D11): `tsdb chunk-store init PATH --cluster UUID --node ID` writes
+ * both into META, and tsdbd refuses at start a store of another cluster or node (a disk moved between members). */
+typedef struct chunk_store_owner {
+    bool set; /* false: a store made without one (chunk_store_init) */
+    uint8_t cluster[16];
+    uint32_t node;
+} chunk_store_owner;
+int chunk_store_init2(const char *path, const uint8_t *id, const chunk_store_owner *owner, uint8_t id_out[16]);
+void chunk_store_get_owner(const chunk_store *st, chunk_store_owner *out);
 /* Opens it. expect_id (16 bytes) names the store the caller believes this directory to be: another id is
  * CHUNK_ERR_STORE_ID (a disk that came back as another one: a lost disk, E27); no META is TSDB_ERR_NOTFOUND; a
  * damaged one TSDB_ERR_CORRUPT. Volumes found are loaded with their EPOCH, leftover tmp_* files removed. The directory

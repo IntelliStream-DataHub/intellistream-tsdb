@@ -61,6 +61,7 @@ struct chunk_store {
     char *path;
     int dirfd;
     uint8_t id[16];
+    chunk_store_owner owner; /* what META says (D11); unset for a store made without one */
     pthread_mutex_t mu; /* the epochs, and the instant of a rename or an unlink */
     vol_state *v;
     size_t nv, capv;
@@ -146,15 +147,20 @@ static void chunk_name(char *out, size_t cap, const uint8_t oid[16], unsigned po
 }
 
 /* ---------------------------------------------------------------- META */
-static void meta_text(char *out, size_t cap, const uint8_t id[16])
+static void meta_text(char *out, size_t cap, const uint8_t id[16], const chunk_store_owner *ow)
 {
-    char hex[33], body[128];
+    char hex[33], body[192];
     chunk_oid_hex(id, hex);
     int n = snprintf(body, sizeof body, "tsdb chunk store %d\nid=%s\n", CHUNK_STORE_VERSION, hex);
+    if (ow && ow->set) { /* D11: the cluster and the node the store belongs to (a disk moved between them is refused) */
+        char ch[33];
+        chunk_oid_hex(ow->cluster, ch);
+        n += snprintf(body + n, sizeof body - (size_t)n, "cluster=%s\nnode=%" PRIu32 "\n", ch, ow->node);
+    }
     snprintf(out, cap, "%ssum=%016" PRIx64 "\n", body, xxh64(body, (size_t)n, 0));
 }
 
-static int meta_read(int dirfd, uint8_t id[16])
+static int meta_read(int dirfd, uint8_t id[16], chunk_store_owner *ow)
 {
     int fd = openat(dirfd, "META", O_RDONLY | O_CLOEXEC);
     if (fd < 0)
@@ -181,18 +187,38 @@ static int meta_read(int dirfd, uint8_t id[16])
     close(fd);
     if (rc)
         return rc;
-    /* strict: the first line, "id=" and 32 hex digits; the text is re-made from that id and compared whole, so the
-     * sum line, the newlines and the length are all checked at once */
-    static const char first[] = "tsdb chunk store 1\nid=";
+    /* strict: the first line, "id=" and 32 hex digits, then optionally "cluster=" with 32 and "node=" with a number;
+     * the text is re-made from those and compared whole, so the sum line, the newlines and the length are all checked
+     * at once */
+    static const char first[] = "tsdb chunk store 1\nid=", cl[] = "cluster=", nd[] = "node=";
     uint8_t t[16];
+    chunk_store_owner o = {0};
     char want[256];
     if (got < sizeof first - 1 + 32 || memcmp(buf, first, sizeof first - 1) != 0 ||
         !hex_parse(buf + sizeof first - 1, 32, t))
         return TSDB_ERR_CORRUPT;
-    meta_text(want, sizeof want, t);
+    size_t at = sizeof first - 1 + 33;
+    if (got > at + sizeof cl - 1 + 33 && memcmp(buf + at, cl, sizeof cl - 1) == 0) {
+        if (!hex_parse(buf + at + sizeof cl - 1, 32, o.cluster))
+            return TSDB_ERR_CORRUPT;
+        at += sizeof cl - 1 + 33;
+        if (got < at + sizeof nd - 1 || memcmp(buf + at, nd, sizeof nd - 1) != 0)
+            return TSDB_ERR_CORRUPT;
+        uint64_t v = 0;
+        size_t i = at + sizeof nd - 1, d0 = i;
+        while (i < got && buf[i] >= '0' && buf[i] <= '9' && i - d0 < 10)
+            v = v * 10 + (uint64_t)(buf[i++] - '0');
+        if (i == d0 || v > UINT32_MAX)
+            return TSDB_ERR_CORRUPT;
+        o.node = (uint32_t)v;
+        o.set = true;
+    }
+    meta_text(want, sizeof want, t, &o);
     if (strlen(want) != got || memcmp(want, buf, got) != 0)
         return TSDB_ERR_CORRUPT;
     memcpy(id, t, 16);
+    if (ow)
+        *ow = o;
     return 0;
 }
 
@@ -219,6 +245,11 @@ static int sync_dir_path_parent(const char *path)
 
 int chunk_store_init(const char *path, const uint8_t *id, uint8_t id_out[16])
 {
+    return chunk_store_init2(path, id, NULL, id_out);
+}
+
+int chunk_store_init2(const char *path, const uint8_t *id, const chunk_store_owner *owner, uint8_t id_out[16])
+{
     if (!path || !*path)
         return TSDB_ERR_INVALID;
     bool made = mkdir(path, 0755) == 0;
@@ -238,7 +269,7 @@ int chunk_store_init(const char *path, const uint8_t *id, uint8_t id_out[16])
     else
         chunk_random(sid, 16);
     char text[256];
-    meta_text(text, sizeof text, sid);
+    meta_text(text, sizeof text, sid, owner);
     /* a temporary file is always a new inode: one a failed write or sync left behind may have had its pages dropped
      * (the kernel reports that once), so it is never reused */
     unlinkat(dirfd, "META.tmp", 0);
@@ -523,7 +554,8 @@ static int store_open(const char *path, const uint8_t *expect_id, bool quiet, ch
         return busy ? CHUNK_ERR_BUSY : TSDB_ERR_IO;
     }
     uint8_t id[16];
-    int rc = meta_read(dirfd, id);
+    chunk_store_owner ow;
+    int rc = meta_read(dirfd, id, &ow);
     if (rc == TSDB_ERR_CORRUPT && !quiet)
         fprintf(stderr, "tsdb: chunk store %s: META is damaged: the open fails\n", path);
     if (rc == 0 && expect_id && memcmp(expect_id, id, 16) != 0) {
@@ -547,6 +579,7 @@ static int store_open(const char *path, const uint8_t *expect_id, bool quiet, ch
     st->path = strdup(path);
     st->dirfd = dirfd;
     memcpy(st->id, id, 16);
+    st->owner = ow;
     pthread_mutex_init(&st->mu, NULL);
     pthread_mutex_lock(&st->mu);
     rc = st->path ? scan_volumes(st) : TSDB_ERR_NOMEM;
@@ -636,6 +669,21 @@ int chunk_store_raise(chunk_store *st, uint32_t volume, uint64_t e)
     pthread_mutex_unlock(&st->mu);
     return rc;
 }
+
+int chunk_store_see(chunk_store *st, uint32_t volume, uint64_t e)
+{
+    pthread_mutex_lock(&st->mu);
+    vol_state *v;
+    int rc = atomic_load(&st->failed) ? TSDB_ERR_IO : vol_get(st, volume, true, &v);
+    if (rc == 0 && v->unsure)
+        rc = CHUNK_ERR_EPOCH_UNSURE; /* never written from a request: both slots good would make it sure at a reopen */
+    else if (rc == 0 && e > v->epoch)
+        rc = epoch_store(st, v, e);
+    pthread_mutex_unlock(&st->mu);
+    return rc;
+}
+
+void chunk_store_get_owner(const chunk_store *st, chunk_store_owner *out) { *out = st->owner; }
 
 bool chunk_store_epoch_unsure(chunk_store *st, uint32_t volume)
 {
