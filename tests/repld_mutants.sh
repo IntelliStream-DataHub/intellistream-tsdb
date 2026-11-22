@@ -22,7 +22,9 @@
 # marker whose file it has not staged) reopenhold (knobs dropbulk, nofetch, syncpause, fetchlate); tickstretch (a late
 # tick dropped: the core's clock slower than the wall's under a slow catch-up step) tickwall (knob slowtick);
 # stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick); stallcatchup (a stop
-# of the whole process caught up in ticks and taken for the peers' silence) jointpause. Three are tsdbd's, read by
+# of the whole process caught up in ticks and taken for the peers' silence) jointpause; demotestaleidx (a deposed
+# writer's index of record starts rebuilt over the entry its old engine pushed after demote cleared it: the cut of
+# its uncommitted tail stops the volume) deposetail (knob latebytes). Three are tsdbd's, read by
 # it under the same name: nomoved (a write to a non-leader refused UNAVAILABLE, not MOVED) failover; deposemoved (a
 # write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose; leadnow (a read
 # admitted on the leader and held while it is deposed is checked against the lease only, and answered from the
@@ -80,6 +82,7 @@ table=(
     "deposemoved|writerdepose|the write waiting for the commit point on the failed writer got"
     "leadnow|readdepose|held while it was deposed answered"
     "refusedsilent|refused|the refused volume was not reported"
+    "demotestaleidx|deposetail|the deposed writer back in the ISR once the links are back: the ISR of rs has 2 members"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
 all=
