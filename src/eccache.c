@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 int eccache_mutant;
+_Atomic int eccache_test_pf_fail;
 void (*eccache_test_hook)(struct tier *t, int where, const uint8_t oid[16]);
 
 enum { CE_LOADING = 0, CE_READY };
@@ -46,6 +47,7 @@ typedef struct ce {
     uint32_t pins;
     int state;
     bool listed; /* in the hash table */
+    bool pf;     /* read ahead and not yet hit: its cost is in pf_bytes */
     uint8_t *data;
 } ce;
 
@@ -75,6 +77,16 @@ typedef struct og {
     ce *first;
 } og;
 
+/* A sequential walk (prefetch): the next granule index of object oid a miss would continue it at, and its window. */
+#define PF_STREAMS 16
+#define PF_INIT 4
+#define PF_CALL_BYTES (4ull << 20)
+typedef struct pfstream {
+    uint8_t oid[16];
+    uint32_t next, n;
+    uint64_t stamp; /* 0: free */
+} pfstream;
+
 struct eccache_tier {
     tier *t;
     pthread_mutex_t mu; /* a leaf: never held across I/O, an open or close, a decode or another lock */
@@ -89,6 +101,11 @@ struct eccache_tier {
     size_t ghn, ngrp;
     uint64_t budget, bytes, fd_budget, fds;
     eccache_counters n; /* the counters (bytes, entries, objs_open, fds_open, budgets filled in on read) */
+    pfstream pfs[PF_STREAMS];
+    uint64_t pf_stamp, pf_bytes;
+    unsigned pf_cap;          /* granules read ahead per read at most; 0: no prefetch */
+    uint64_t pf_call;         /* bytes of one window's range read at most (PF_CALL_BYTES; a test lowers it) */
+    _Atomic uint64_t nreads;  /* obj_read calls (counted outside the leaf) */
     _Atomic(chunk_backend *) be; /* the tier's: not owned, not closed here */
 };
 
@@ -210,6 +227,13 @@ static void ce_insert(struct eccache_tier *c, ce *x, og **spare)
     ce_grow(c);
 }
 
+/* What an entry costs against the budget: its bytes, its slack, its struct, the allocator's headers and its share of
+ * the tables (an entry of a slow series' granule is a few hundred bytes, so the overhead is not small beside it). */
+static uint64_t ce_cost(const ce *x)
+{
+    return x->len + ECCACHE_ENTRY_OVERHEAD;
+}
+
 static void ce_unhash(struct eccache_tier *c, ce *x)
 {
     if (!x->listed)
@@ -222,6 +246,12 @@ static void ce_unhash(struct eccache_tier *c, ce *x)
         }
     x->listed = false;
     c->nent--;
+    if (x->pf) { /* read ahead, never hit: wasted if it was cached, dropped by its reader if it was still loading */
+        x->pf = false;
+        c->pf_bytes -= ce_cost(x);
+        if (x->state == CE_READY)
+            c->n.pf_wasted++;
+    }
     og *g = x->grp;
     if (x->gprev)
         x->gprev->gnext = x->gnext;
@@ -259,14 +289,6 @@ static void lru_front(struct eccache_tier *c, ce *x)
     c->lru.next = x;
 }
 
-/* Takes a READY entry out of the table and the LRU (mu held); it is freed by whoever lets go of it last. */
-/* What an entry costs against the budget: its bytes, its slack, its struct, the allocator's headers and its share of
- * the tables (an entry of a slow series' granule is a few hundred bytes, so the overhead is not small beside it). */
-static uint64_t ce_cost(const ce *x)
-{
-    return x->len + ECCACHE_ENTRY_OVERHEAD;
-}
-
 /* Takes x out of the table, its group, the LRU and the bytes (mu held). Only a READY entry is in the LRU and the
  * bytes; a LOADING one taken out goes on to its reader (and its waiters look again), never into the cache. */
 static void ce_remove(struct eccache_tier *c, ce *x)
@@ -278,12 +300,14 @@ static void ce_remove(struct eccache_tier *c, ce *x)
     }
 }
 
-/* Evicts unpinned entries from the cold end until the bytes fit the budget; the victims go to *vict (mu held). */
-static void ce_evict(struct eccache_tier *c, ce **vict)
+/* Evicts unpinned entries from the cold end until the bytes fit the budget; the victims go to *vict (mu held).
+ * `window`: the room made for granules read ahead (only the mutant prefetchevictpinned treats it otherwise). */
+static void ce_evict_as(struct eccache_tier *c, ce **vict, bool window)
 {
+    bool any = window && eccache_mutant == ECC_MUT_PFEVICTPINNED;
     for (ce *x = c->lru.prev; c->bytes > c->budget && x != &c->lru;) {
         ce *pv = x->prev;
-        if (x->pins == 0) {
+        if (x->pins == 0 || any) {
             ce_remove(c, x);
             c->n.evictions++;
             x->hnext = *vict;
@@ -291,6 +315,11 @@ static void ce_evict(struct eccache_tier *c, ce **vict)
         }
         x = pv;
     }
+}
+
+static void ce_evict(struct eccache_tier *c, ce **vict)
+{
+    ce_evict_as(c, vict, false);
 }
 
 static void ce_free_list(ce *x)
@@ -564,6 +593,7 @@ static int fill(struct eccache_tier *c, const part *p, const struct ecpart *e, c
     chunk_report rep;
     memset(&rep, 0, sizeof rep);
     rc = o->ops->obj_read(o->o, x->off, x->len, x->data, CHUNK_RR_RAW, &rep);
+    atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
     bool ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
     bool retried = false;
@@ -578,6 +608,7 @@ static int fill(struct eccache_tier *c, const part *p, const struct ecpart *e, c
         pthread_mutex_unlock(&c->mu);
         retried = true;
         rc = o->ops->obj_read(o->o, x->off, x->len, x->data, 0, &rep);
+        atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
         ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || eccache_mutant == ECC_MUT_NORECHECK ||
                          (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
     }
@@ -593,6 +624,196 @@ static int fill(struct eccache_tier *c, const part *p, const struct ecpart *e, c
         pthread_mutex_unlock(&c->mu);
     }
     return map_rc(rc);
+}
+
+/* ------------------------------------------------------------ prefetch (R8 D19) */
+
+/* The window a miss of granule i (x, LOADING and pinned by this reader) reads ahead: the next granules of the same
+ * series in the part, contiguous in the object, none cached or loading, listed LOADING and pinned here (pf set) with
+ * their cost in pf_bytes. Returns how many (in win[]); 0 when the miss does not continue a walk. Allocations and the
+ * index's reads outside the leaf. */
+static size_t pf_plan(struct eccache_tier *c, const part *p, const struct ecpart *e, const granule *g, ce *x, ce **win,
+                      size_t wcap)
+{
+    if (wcap == 0)
+        return 0;
+    long li = gran_index(p, g->off);
+    if (li < 0)
+        return 0;
+    uint32_t i = (uint32_t)li;
+    bool cont = i > 0 && gx_series(p, i - 1) == gx_series(p, i);
+    const uint8_t *oid = e->rec.oid;
+    unsigned n = 0;
+    pthread_mutex_lock(&c->mu);
+    unsigned cap = MIN(c->pf_cap, (unsigned)wcap);
+    pfstream *s = NULL, *old = &c->pfs[0];
+    for (int k = 0; k < PF_STREAMS && cap; k++) {
+        pfstream *q = &c->pfs[k];
+        if (q->stamp && q->next == i && !memcmp(q->oid, oid, 16)) {
+            s = q;
+            break;
+        }
+        if (q->stamp < old->stamp)
+            old = q;
+    }
+    if (s && cont)
+        n = s->n && eccache_mutant != ECC_MUT_PFNODOUBLE ? MIN(2 * s->n, cap) : MIN(PF_INIT, cap);
+    uint64_t callb = c->pf_call;
+    if (cap) { /* this miss is where the walk stands now: the next one continues it at i + 1 */
+        if (!s)
+            s = old;
+        memcpy(s->oid, oid, 16);
+        s->next = i + 1;
+        s->n = n;
+        s->stamp = ++c->pf_stamp;
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (n == 0)
+        return 0;
+
+    /* the candidates, from the index: same series, contiguous, inside the object's granules, under the call's bytes */
+    uint32_t ser = gx_series(p, i);
+    uint64_t end = g->off + (uint64_t)g->ts_len + g->val_len;
+    size_t m = 0;
+    og *spare = calloc(1, sizeof *spare);
+    if (!spare)
+        return 0;
+    for (uint32_t j = i + 1; j < p->ix.n && m < n; j++) {
+        granule gj;
+        gx_load(p, j, GW_LOC, &gj);
+        uint64_t len = (uint64_t)gj.ts_len + gj.val_len;
+        if (gx_series(p, j) != ser || gj.off != end || len == 0 || len > p->index_off - gj.off ||
+            end + len - g->off > callb)
+            break;
+        ce *y = calloc(1, sizeof *y);
+        if (!y || !(y->data = malloc(len + BLK_SLACK))) {
+            free(y);
+            break;
+        }
+        memset(y->data + len, 0, BLK_SLACK);
+        memcpy(y->oid, oid, 16);
+        y->off = gj.off;
+        y->len = len;
+        y->crc = gj.crc;
+        win[m++] = y;
+        end += len;
+    }
+    if (m && eccache_test_hook)
+        eccache_test_hook(c->t, ECC_HOOK_PFPLAN, oid);
+    size_t k = 0;
+    pthread_mutex_lock(&c->mu);
+    uint64_t pfb = c->budget / 4;
+    if (x->listed) /* else forgotten meanwhile: nothing of the object is cached now */
+        for (; k < m; k++) {
+            ce *y = win[k];
+            if ((eccache_mutant != ECC_MUT_PFDUPKEY && ce_find(c, oid, y->off)) || c->pf_bytes + ce_cost(y) > pfb)
+                break;
+            y->state = CE_LOADING;
+            y->pins = 1;
+            y->pf = true;
+            ce_insert(c, y, &spare); /* x is listed, so the object has its group: spare is never taken */
+            c->pf_bytes += ce_cost(y);
+            if (c->pf_bytes > c->n.pf_peak)
+                c->n.pf_peak = c->pf_bytes;
+        }
+    for (int q = 0; q < PF_STREAMS; q++) /* the walk continues after the window */
+        if (c->pfs[q].next == i + 1 && !memcmp(c->pfs[q].oid, oid, 16)) {
+            c->pfs[q].next = i + 1 + (uint32_t)k;
+            break;
+        }
+    pthread_mutex_unlock(&c->mu);
+    free(spare);
+    for (size_t q = k; q < m; q++) {
+        free(win[q]->data);
+        free(win[q]);
+    }
+    return k;
+}
+
+/* Ends the window: each entry checked (ok[q]) turns READY and cached, the rest leave (dropped); pins let go of.
+ * `bytes`: the range read's length, 0 when none was made. The window goes to the LRU's front from its far end, so
+ * the granule a walk needs next is the warmest of it and a window that makes room for itself loses its far end first. */
+static void pf_finish(struct eccache_tier *c, ce **win, const bool *ok, size_t k, uint64_t bytes)
+{
+    ce *vict = NULL;
+    pthread_mutex_lock(&c->mu);
+    if (bytes) {
+        c->n.pf_reads++;
+        if (bytes > c->n.pf_call_peak)
+            c->n.pf_call_peak = bytes;
+    }
+    for (size_t q = k; q-- > 0;) {
+        ce *y = win[q];
+        y->pins--;
+        if (!y->listed && eccache_mutant != ECC_MUT_PFFORGETLIVE) { /* forgotten while it was read (its pf cost
+                                                                       went with it) */
+            y->hnext = vict;
+            vict = y;
+        } else if (!ok[q] || ce_cost(y) > c->budget) { /* (the budget may have shrunk since the plan) */
+            c->n.pf_dropped++;
+            ce_unhash(c, y); /* LOADING: not counted as wasted */
+            y->hnext = vict;
+            vict = y;
+        } else {
+            y->state = CE_READY;
+            c->bytes += ce_cost(y);
+            lru_front(c, y);
+            c->n.prefetched++;
+        }
+    }
+    ce_evict_as(c, &vict, true);
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+    ce_free_list(vict);
+}
+
+/* fill() with a window: one RAW range read of the demanded granule and the k after it. The demanded granule's bytes,
+ * when they check, are its fill; when they do not, or when the range read fails, it is filled alone as before (fill:
+ * RAW, then whole cells). Each granule ahead is checked as it is copied out; a failed read checks none. */
+static int fill_ahead(struct eccache_tier *c, const part *p, const struct ecpart *e, const granule *g, ce *x,
+                      ce **win, size_t k)
+{
+    bool ok[ECCACHE_PF_CAP];
+    memset(ok, 0, sizeof ok);
+    uint64_t total = x->len;
+    for (size_t q = 0; q < k; q++)
+        total += win[q]->len;
+    uint8_t *b = malloc(total);
+    co *o = NULL;
+    int rc = b ? obj_get(c, e, &o) : TSDB_ERR_NOMEM;
+    bool demand = false;
+    if (rc == 0) {
+        chunk_report rep;
+        memset(&rep, 0, sizeof rep);
+        if (atomic_load_explicit(&eccache_test_pf_fail, memory_order_relaxed) > 0 &&
+            atomic_fetch_sub_explicit(&eccache_test_pf_fail, 1, memory_order_relaxed) > 0)
+            rc = TSDB_ERR_UNAVAILABLE; /* a test: the window's read fails as if a store went away under it */
+        else
+            rc = o->ops->obj_read(o->o, x->off, total, b, CHUNK_RR_RAW, &rep);
+        atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
+        obj_put(c, o, rc != 0 || rep.bad_cells || rep.decoded_cells);
+        if (rc == 0) {
+            atomic_fetch_add_explicit(&granule_checks, 1 + k, memory_order_relaxed);
+            if (eccache_mutant == ECC_MUT_NOVERIFY || (uint32_t)xxh64(b, x->len, 0) == x->crc) {
+                memcpy(x->data, b, x->len);
+                demand = true;
+            }
+            uint64_t at = x->len;
+            for (size_t q = 0; q < k; q++) {
+                ce *y = win[q];
+                memcpy(y->data, b + at, y->len);
+                at += y->len;
+                ok[q] = eccache_mutant == ECC_MUT_PFNOCHECK || (uint32_t)xxh64(y->data, y->len, 0) == y->crc;
+            }
+        }
+    }
+    free(b);
+    if (eccache_test_hook)
+        eccache_test_hook(c->t, ECC_HOOK_PFREAD, e->rec.oid);
+    pf_finish(c, win, ok, k, o != NULL ? total : 0);
+    if (!demand && eccache_mutant == ECC_MUT_PFNOFALLBACK && rc)
+        return map_rc(rc);
+    return demand ? 0 : fill(c, p, e, g, x);
 }
 
 static struct ecpart *part_ec(const part *p)
@@ -619,6 +840,7 @@ int ec_granule_read(codec_ctx *cx, const part *p, const granule *g, int type, in
     }
     ce *nw = NULL, *x, *vict = NULL;
     og *spare = NULL;
+    unsigned pfcap = 0;
     pthread_mutex_lock(&c->mu);
     for (;;) {
         x = ce_find(c, e->rec.oid, g->off);
@@ -630,6 +852,11 @@ int ec_granule_read(codec_ctx *cx, const part *p, const granule *g, int type, in
         if (x) {
             x->pins++;
             c->n.hits++;
+            if (x->pf) { /* read ahead, and now used */
+                x->pf = false;
+                c->pf_bytes -= ce_cost(x);
+                c->n.pf_used++;
+            }
             lru_front(c, x);
             break;
         }
@@ -640,6 +867,7 @@ int ec_granule_read(codec_ctx *cx, const part *p, const granule *g, int type, in
             x->pins = 1;
             ce_insert(c, x, &spare);
             c->n.misses++;
+            pfcap = c->pf_cap;
             break;
         }
         pthread_mutex_unlock(&c->mu); /* allocations outside the leaf */
@@ -667,7 +895,9 @@ int ec_granule_read(codec_ctx *cx, const part *p, const granule *g, int type, in
     }
     int rc = 0;
     if (x->state == CE_LOADING) {
-        rc = fill(c, p, e, g, x);
+        ce *win[ECCACHE_PF_CAP];
+        size_t k = pf_plan(c, p, e, g, x, win, MIN(pfcap, ECCACHE_PF_CAP));
+        rc = k ? fill_ahead(c, p, e, g, x, win, k) : fill(c, p, e, g, x);
         if (eccache_test_hook)
             eccache_test_hook(c->t, ECC_HOOK_FILLED, e->rec.oid);
         pthread_mutex_lock(&c->mu);
@@ -801,6 +1031,8 @@ int eccache_tier_open(struct tier *t)
     struct rlimit rl;
     uint64_t nofile = getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY ? rl.rlim_cur : 4096;
     c->fd_budget = MIN(MAX(nofile / 4, 64), 4096); /* a quarter of the process's: tsdbd's connections need the rest */
+    c->pf_cap = ECCACHE_PF_CAP;
+    c->pf_call = PF_CALL_BYTES;
     t->cache = c;
     return 0;
 }
@@ -919,7 +1151,58 @@ void eccache_get_counters(struct tier *t, eccache_counters *out)
     out->fds_open = c->fds;
     out->budget = c->budget;
     out->fd_budget = c->fd_budget;
+    out->pf_bytes = c->pf_bytes;
+    out->pf_budget = c->budget / 4;
     pthread_mutex_unlock(&c->mu);
+    out->reads = atomic_load_explicit(&c->nreads, memory_order_relaxed);
+}
+
+void eccache_test_prefetch(struct tier *t, unsigned cap)
+{
+    struct eccache_tier *c = t->cache;
+    pthread_mutex_lock(&c->mu);
+    c->pf_cap = cap;
+    memset(c->pfs, 0, sizeof c->pfs);
+    c->n.pf_peak = c->pf_bytes;
+    pthread_mutex_unlock(&c->mu);
+}
+
+void eccache_test_prefetch_call(struct tier *t, uint64_t bytes)
+{
+    struct eccache_tier *c = t->cache;
+    pthread_mutex_lock(&c->mu);
+    c->pf_call = bytes ? bytes : PF_CALL_BYTES;
+    c->n.pf_call_peak = 0;
+    pthread_mutex_unlock(&c->mu);
+}
+
+void *eccache_test_pin(struct tier *t, const uint8_t oid[16], uint64_t off)
+{
+    struct eccache_tier *c = t->cache;
+    pthread_mutex_lock(&c->mu);
+    ce *x = ce_find(c, oid, off);
+    if (x && x->state == CE_READY)
+        x->pins++;
+    else
+        x = NULL;
+    pthread_mutex_unlock(&c->mu);
+    return x;
+}
+
+void eccache_test_unpin(struct tier *t, void *entry)
+{
+    struct eccache_tier *c = t->cache;
+    ce *x = entry, *vict = NULL;
+    pthread_mutex_lock(&c->mu);
+    x->pins--;
+    if (x->pins == 0 && !x->listed) {
+        x->hnext = NULL;
+        vict = x;
+    } else {
+        ce_evict(c, &vict);
+    }
+    pthread_mutex_unlock(&c->mu);
+    ce_free_list(vict);
 }
 
 void eccache_test_budget(struct tier *t, uint64_t bytes)
