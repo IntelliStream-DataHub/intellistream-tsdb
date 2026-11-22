@@ -1112,6 +1112,9 @@ static struct {
     char holdusersfile[1100];
     int users_probe;     /* TSDB_CLUSTER_TEST users_probe=1: a users watch that writes <state-dir>/userswatch, and drops a
                           * user named probe-drop through cluster_user_propose from another thread (test_cluster users) */
+    int push_every_apply; /* TSDB_CLUSTER_TEST push_every_apply=1: the users watch is given the copy at every loop pass
+                           * that applied something, as while a read barrier waits (test_cluster userreplay: a held
+                           * older list would otherwise go out only if a heartbeat fell inside the replay) */
     unsigned sync_delay_ms; /* TSDB_CLUSTER_TEST sync_delay_ms=N: the worker waits N ms before each sync round */
     unsigned copy_hold;  /* TSDB_CLUSTER_TEST copy_hold=N: cc_hold_main holds a snapshot across N more */
     unsigned copy_noleader; /* TSDB_CLUSTER_TEST copy_noleader=V (test_cluster route): the copy shows volume V with no
@@ -1352,6 +1355,8 @@ static void test_knobs(void)
             C.hold_copy = v != 0;
         else if (sscanf(p, "hold_users_file=%llu", &v) == 1)
             C.hold_users = v != 0;
+        else if (sscanf(p, "push_every_apply=%llu", &v) == 1)
+            C.push_every_apply = v != 0;
         else if (sscanf(p, "users_probe=%llu", &v) == 1)
             C.users_probe = v != 0;
         else if (sscanf(p, "hold_isr_file=%llu", &v) == 1)
@@ -6358,7 +6363,8 @@ static void *cluster_main(void *arg)
         /* the copy moved while an admin op's read barrier waits for it: the users watch is told now, not at the next
          * tick (100 ms), so the barrier (cluster_users_through) passes one loop pass after the entry applied here.
          * Only then: users_push scans every user, which a loop pass per applied entry need not pay otherwise. */
-        if (C.sm.applied != C.uw_seen && atomic_load_explicit(&g_uw_want, memory_order_relaxed) > C.uw_at)
+        if (C.sm.applied != C.uw_seen &&
+            (C.push_every_apply || atomic_load_explicit(&g_uw_want, memory_order_relaxed) > C.uw_at))
             users_push();
         if (now >= C.next_hb || (now >= C.next_duty && atomic_exchange(&g_beat_soon, 0))) {
             uint32_t hb = settings()->heartbeat_ms;

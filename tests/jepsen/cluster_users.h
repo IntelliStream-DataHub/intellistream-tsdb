@@ -32,7 +32,12 @@
  *  4 a request is denied while a grant acknowledged and binding stands (no later revoke, drop or add begun, and no
  *    drop since the session's login: a dropped and added user is a new user, and its old sessions end);
  *  5 a member that took a login with a newer password refuses nothing older any more: an older password never logs in
- *    again on the member that saw the newer one work (an indeterminate change seen applied never reverts).
+ *    again on the member that saw the newer one work (an indeterminate change seen applied never reverts);
+ *  6 an admin op refused NOTFOUND or INVALID contradicts no change acknowledged before it began (an add refused INVALID
+ *    after an acknowledged drop, a passwd, drop or grant refused NOTFOUND after an acknowledged add, a revoke refused
+ *    NOTFOUND after an acknowledged grant), unless a change that undoes it (not refused) began before the refusal ended
+ *    and may have applied after it: the member that answers confirms a refusal against the group (auth.c admin_group's
+ *    read barrier), so it binds on every member, at once.
  * UNAVAILABLE and IO are never a violation (the barrier, a node going down). make jepsen-cluster-selftest plants the
  * server bugs dropnotcommitted (a user op answered before it commits, TSDB_CLUSTER_MUTANT) and loginbeforecatchup (the
  * restart barrier ignored, TSDB_AUTH_MUTANT), and --selftest-checker feeds the checks histories made here.
@@ -65,7 +70,7 @@ struct jmodel {
     int64_t open_for[MAXN], open_ns[MAXN]; /* the process (its start) that answered something but UNAVAILABLE, and when */
     uint32_t seen[MAXN][JU_NU];            /* 1 + the position of the newest password that logged in at the member */
     int64_t seen_te[MAXN][JU_NU];
-    uint64_t ck_dead, ck_live, ck_deny, ck_allow, viol;
+    uint64_t ck_dead, ck_live, ck_deny, ck_allow, ck_refused, viol;
     int quiet; /* the selftest: no line per violation */
 };
 
@@ -341,6 +346,60 @@ static int jm_eval_req(struct jmodel *m, int x, int64_t s, int u, uint32_t a, in
     return v;
 }
 
+/* check 6: change r (an admin op of the workload) was refused with rc. Which acknowledged change it contradicts, and
+ * which kinds of change undo that one: a NOTFOUND says the user is missing (an add contradicts it, a drop undoes the
+ * add), for a revoke also that the grant is not held (a grant contradicts it, a revoke or a drop undoes it); an add's
+ * INVALID says the name is taken (a drop contradicts it, an add undoes the drop; a user never added at all contradicts it
+ * too). */
+static int jm_eval_refusal(struct jmodel *m, int x, uint32_t r, int rc)
+{
+    int contra, undo1, undo2 = -1;
+    pthread_mutex_lock(&m->mu);
+    const struct jch *R = &m->c[r - 1];
+    int u = R->user;
+    if (rc == TSDB_ERR_INVALID && R->kind == JK_ADD)
+        contra = JK_DROP, undo1 = JK_ADD;
+    else if (rc == TSDB_ERR_NOTFOUND && R->kind == JK_REVOKE)
+        contra = JK_GRANT, undo1 = JK_REVOKE, undo2 = JK_DROP;
+    else if (rc == TSDB_ERR_NOTFOUND && R->kind != JK_ADD)
+        contra = JK_ADD, undo1 = JK_DROP;
+    else {
+        pthread_mutex_unlock(&m->mu);
+        return 0;
+    }
+    m->ck_refused++;
+    const struct jch *bad = NULL;
+    int any_add = 0;
+    for (uint32_t k = 0; k < m->nux[u] && !bad; k++) {
+        const struct jch *A = &m->c[m->ux[u][k]];
+        if (A != R && A->kind == JK_ADD && A->st != JS_FAIL && A->begin < R->end)
+            any_add = 1;
+        if (A->kind != contra || A->st != JS_OK || A->end >= R->begin)
+            continue;
+        int undone = 0;
+        for (uint32_t j = 0; j < m->nux[u] && !undone; j++) {
+            const struct jch *U = &m->c[m->ux[u][j]];
+            if (U == R || U->st == JS_FAIL || U->begin >= R->end || (U->kind != undo1 && U->kind != undo2))
+                continue;
+            /* it may have applied after A: later in the list, or not known to have ended before A began */
+            undone = U->pos > A->pos || U->st != JS_OK || U->end > A->begin;
+        }
+        if (!undone)
+            bad = A;
+    }
+    int v = 0;
+    if (bad) {
+        jm_say(m, "an admin op is refused against a change acknowledged before it began", x, u, R, R->begin, R->end, rc,
+               bad);
+        v = 1;
+    } else if (contra == JK_DROP && !any_add) {
+        jm_say(m, "an add is refused INVALID for a user never added", x, u, R, R->begin, R->end, rc, NULL);
+        v = 1;
+    }
+    pthread_mutex_unlock(&m->mu);
+    return v;
+}
+
 /* ------------------------------------------------------------------ the runtime: the admin thread and the probers */
 
 static struct jmodel jm;
@@ -350,7 +409,7 @@ static _Atomic int ju_run, ju_admin_run;
 static _Atomic int ju_hot_user = -1;
 static _Atomic int64_t ju_hot_until;
 static pthread_t ju_admin_th, ju_probe_th[MAXN];
-static _Atomic uint64_t ju_ops[5][4], ju_login[6], ju_req[3], ju_noop; /* ju_login: ok, AUTH, UNAVAILABLE, IO, other, skipped */
+static _Atomic uint64_t ju_ops[5][4], ju_login[6], ju_req[3]; /* ju_login: ok, AUTH, UNAVAILABLE, IO, other, skipped */
 
 static uint64_t ju_rng(uint64_t *s)
 {
@@ -466,24 +525,6 @@ static void ju_diag(int x, int u, uint32_t a)
     }
 }
 
-/* does the member's copy hold the read grant of user `name` on prefix `sel`? 1, 0, or -1 (the list failed) */
-static int ju_holds(tsdbc *c, const char *name, const char *sel)
-{
-    tsdbc_user *ul = NULL;
-    size_t nu = 0;
-    if (tsdbc_user_list(c, &ul, &nu) != 0)
-        return -1;
-    int held = 0;
-    for (size_t k = 0; k < nu; k++)
-        if (!strcmp(ul[k].name, name))
-            for (uint32_t g = 0; g < ul[k].ngrants; g++)
-                if (ul[k].grants[g].kind == TSDB_SEL_PREFIX && !strcmp(ul[k].grants[g].selector, sel) &&
-                    (ul[k].grants[g].rights & TSDB_RIGHT_READ))
-                    held = 1;
-    tsdbc_users_free(ul, nu);
-    return held;
-}
-
 static void *ju_admin(void *arg)
 {
     (void)arg;
@@ -505,13 +546,8 @@ static void *ju_admin(void *arg)
         char name[16], pw[40], sel[16];
         snprintf(name, sizeof name, "ju%d", u);
         snprintf(sel, sizeof sel, "jp%d.", u);
-        /* A grant the member's copy holds already changes nothing: the server answers OK from that copy at once, with no
-         * proposal and so no wait for the members (auth.c admin_group: pr.op == 0), and a member that has not applied
-         * the entry which made the grant (an indeterminate one, say) may lag. A server bug against A32 (docs/tasks/
-         * users-stale-answers.md), not yet fixed: until it is, such an answer binds nobody and the model records it as
-         * refused (counted as `noop`). The copy may move between the list and the grant, so the grant counts as a no-op
-         * only if the copy still holds it after the answer; one that does not is indeterminate (it may have been real). */
-        int held_before = kind == JK_GRANT ? ju_holds(c, name, sel) : 0;
+        /* A grant the group holds already changes nothing, and is acknowledged like any change: the member confirms it
+         * against the group (a read barrier) and waits for the members as for a real one, so it binds (A32). */
         uint32_t id = jm_add(&jm, kind, u, now_ns());
         int rc;
         ju_pw(pw, sizeof pw, u, id - 1);
@@ -527,17 +563,9 @@ static void *ju_admin(void *arg)
                  : rc == TSDB_ERR_INVALID || rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_DENIED || rc == TSDB_ERR_UNAVAILABLE
                      ? JS_FAIL
                      : JS_INDET;
-        int noop = rc == 0 && held_before == 1;
-        if (noop) {
-            int after = ju_holds(c, name, sel);
-            if (after == 1)
-                atomic_fetch_add(&ju_noop, 1);
-            else {
-                noop = 0;
-                st = JS_INDET;
-            }
-        }
-        jm_end(&jm, id, noop ? JS_FAIL : st, te);
+        jm_end(&jm, id, st, te);
+        if (st == JS_FAIL)
+            jm_eval_refusal(&jm, i, id, rc);
         if (st != JS_FAIL) { /* applied, or maybe (assumed applied: the next answer corrects it) */
             if (kind == JK_ADD)
                 bel_exists[u] = 1, bel_granted[u] = 0;
@@ -671,34 +699,6 @@ static void ju_make_superuser(int i)
         die(2, "the superuser: %s", out);
 }
 
-/* A member that gets its Raft core (a learner promoted to voter, in the seconds after the node adds) rebuilds its copy
- * from nothing, and for about 100 ms its users watch is given an empty list: every login there is refused AUTH, the
- * superuser's too, and a session ends (a finding for the server, jepsen-cluster/NOTES: not a change that did not hold).
- * The workload starts when the promotions are over: the number of members with a core has been the same for 3 s. */
-static void ju_await_voters(void)
-{
-    int64_t t0 = now_ms(), changed = t0;
-    int last = -1;
-    while (now_ms() - t0 < 60000) {
-        int cores = 0;
-        for (int i = 0; i < nn; i++) {
-            struct view v;
-            if (view_get(i, &v, 1500) == 0) {
-                cores += v.st.mode == CLUSTER_MODE_CORE;
-                view_free(&v);
-            }
-        }
-        if (cores != last) {
-            last = cores;
-            changed = now_ms();
-        }
-        if (cores >= 3 && now_ms() - changed >= 3000)
-            return;
-        usleep(250000);
-    }
-    die(1, "the members did not settle into voters within 60 s (%d with a Raft core)", last);
-}
-
 static void ju_start(void)
 {
     jm_init(&jm);
@@ -762,8 +762,7 @@ static int ju_report(void)
     printf("users: checked %" PRIu64 " logins that must fail and %" PRIu64 " that must succeed, %" PRIu64
            " requests that must be denied and %" PRIu64 " that must pass; %" PRIu64 " violation(s)\n", jm.ck_dead,
            jm.ck_live, jm.ck_deny, jm.ck_allow, jm.viol);
-    printf("users: %" PRIu64 " grants answered OK from a copy that held them already (unbound: docs/tasks/users-stale-answers.md)\n",
-           (uint64_t)atomic_load(&ju_noop));
+    printf("users: checked %" PRIu64 " refused admin ops against the changes acknowledged before them\n", jm.ck_refused);
     int rc = 0;
     if (jm.viol) {
         fprintf(stderr, "jepsen-cluster: FAIL: users: %" PRIu64 " violation(s): a change acknowledged did not hold\n",
@@ -814,7 +813,7 @@ static int ju_selftest(void)
         const char *what;
         int expect; /* a violation: 1, none: 0 */
         int got;
-    } t[32];
+    } t[48];
     int n = 0;
 #define CASE(w, e, call) do { uint64_t v0 = m.viol; call; t[n].what = w; t[n].expect = e; t[n].got = m.viol > v0; n++; } while (0)
     CASE("the password that a passwd replaced is refused", 0, jm_eval_login(&m, 0, SEC(-100), 0, add, SEC(9), SEC(9.01), TSDB_ERR_AUTH));
@@ -869,6 +868,28 @@ static int ju_selftest(void)
     CASE("a newer password was seen on member 6", 0, jm_eval_login(&m, 6, SEC(-100), 0, pw2, SEC(20), SEC(20.01), 0));
     CASE("an older password after a fault of the member is not an older copy served again", 0,
          jm_eval_login(&m, 6, SEC(-100), 0, add, SEC(40), SEC(40.01), 0));
+    /* check 6, on user 2: add (50), grant (52), revoke (54) indeterminate, drop (60); the refusals are changes too */
+    jt_ch(&m, JK_ADD, 2, 50, 50.1, JS_OK);
+    jt_ch(&m, JK_GRANT, 2, 52, 52.1, JS_OK);
+    uint32_t r;
+    r = jt_ch(&m, JK_REVOKE, 2, 53, 53.1, JS_FAIL);
+    CASE("a revoke refused NOTFOUND while an acknowledged grant stands", 1, jm_eval_refusal(&m, 0, r, TSDB_ERR_NOTFOUND));
+    r = jt_ch(&m, JK_PASSWD, 2, 53.2, 53.3, JS_FAIL);
+    CASE("a passwd refused NOTFOUND after an acknowledged add", 1, jm_eval_refusal(&m, 0, r, TSDB_ERR_NOTFOUND));
+    r = jt_ch(&m, JK_ADD, 2, 53.4, 53.5, JS_FAIL);
+    CASE("an add refused INVALID while the user stands", 0, jm_eval_refusal(&m, 0, r, TSDB_ERR_INVALID));
+    r = jt_ch(&m, JK_GRANT, 2, 53.6, 53.7, JS_FAIL);
+    CASE("a grant refused UNAVAILABLE says nothing", 0, jm_eval_refusal(&m, 0, r, TSDB_ERR_UNAVAILABLE));
+    jt_ch(&m, JK_REVOKE, 2, 54, 54.1, JS_INDET);
+    r = jt_ch(&m, JK_REVOKE, 2, 55, 55.1, JS_FAIL);
+    CASE("a revoke refused NOTFOUND after an indeterminate revoke", 0, jm_eval_refusal(&m, 0, r, TSDB_ERR_NOTFOUND));
+    jt_ch(&m, JK_DROP, 2, 60, 60.1, JS_OK);
+    r = jt_ch(&m, JK_DROP, 2, 61, 61.1, JS_FAIL);
+    CASE("a drop refused NOTFOUND after the acknowledged drop", 0, jm_eval_refusal(&m, 0, r, TSDB_ERR_NOTFOUND));
+    r = jt_ch(&m, JK_ADD, 2, 62, 62.1, JS_FAIL);
+    CASE("an add refused INVALID after an acknowledged drop", 1, jm_eval_refusal(&m, 0, r, TSDB_ERR_INVALID));
+    r = jt_ch(&m, JK_ADD, 3, 70, 70.1, JS_FAIL);
+    CASE("an add refused INVALID for a user never added", 1, jm_eval_refusal(&m, 0, r, TSDB_ERR_INVALID));
     /* which members stay in step under a set of cuts (jm_clean_set); n = 5 */
     struct {
         const char *what;
