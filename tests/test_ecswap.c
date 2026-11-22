@@ -951,18 +951,26 @@ static void threads_case(void)
     pthread_t th[READERS];
     for (int i = 0; i < READERS; i++)
         pthread_create(&th[i], NULL, reader, &c);
-    int swapped = 0;
+    /* The readers must run across every swap, at any speed: a fixed total (1000 reads) failed on a slow CI runner under
+     * ASan with 719. Each swap waits for every reader to have read a few times since the one before, and starts while
+     * they go on reading. */
+    int swapped = 0, starved = 0;
     for (int d = TKEYS - 1; d >= 0; d--) { /* the newest key first: the latest row's part is swapped under readers */
+        long r0 = atomic_load(&c.reads);
+        for (int w = 0; w < 10000 && atomic_load(&c.reads) - r0 < 4 * READERS; w++)
+            usleep(1000);
+        starved += atomic_load(&c.reads) - r0 < 4 * READERS;
         swapped += swap_key(c.db, d, NULL, NULL) == 0;
-        usleep(2000);
     }
-    usleep(20000);
+    long r1 = atomic_load(&c.reads);
+    for (int w = 0; w < 10000 && atomic_load(&c.reads) - r1 < 4 * READERS; w++)
+        usleep(1000);
     atomic_store(&c.stop, true);
     for (int i = 0; i < READERS; i++)
         pthread_join(th[i], NULL);
     CHECK(swapped == TKEYS);
     CHECK(atomic_load(&c.bad) == 0);
-    CHECK(atomic_load(&c.reads) > 1000);
+    CHECK(starved == 0 && atomic_load(&c.reads) - r1 >= 4 * READERS);
     pthread_mutex_lock(&c.db->lock);
     for (size_t i = 0; i < c.db->nparts; i++)
         CHECK(c.db->parts[i]->ec != NULL);
