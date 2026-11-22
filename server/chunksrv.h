@@ -179,6 +179,27 @@ int chunksrv_put_remote(struct chunksrv *cs, uint32_t peer, const struct cs_put_
 /* Stages a put in an unlinked temporary file under dir: sums then cells. The fd, or a negative TSDB_ERR_*. */
 int chunksrv_stage(const char *dir, const chunk_geom *g, unsigned pos, const void *cells, const uint64_t *sums);
 
+/* The erasure-coded tier's settings (design-cluster-data.md E5, E10, E26, §5.8): tsdbd parses its --ec-* options into
+ * g_ec_cfg (server/tsdbd.c), which the tier's attach takes (R8). */
+struct chunksrv_ec_cfg {
+    uint32_t settle_grace_s;    /* E5: a key's end this far in the past before it settles (3,600) */
+    uint32_t settle_keep_s;     /* E26: a settle's retired parts are kept this long (86,400) */
+    uint32_t settle_force_s;    /* E5: a settle forces a flush of its rows after this long (3,600) */
+    uint32_t settle_wait_max_s; /* E10: a settle waits this long for a whole stripe group, then goes degraded (7,200) */
+    uint64_t cache_bytes;       /* the decoded-granule cache; 0: a tenth of the RAM */
+};
+extern struct chunksrv_ec_cfg g_ec_cfg;
+
+#define CHUNKSRV_DIRS_MAX 64 /* --chunk-dir, one per disk (E27) */
+/* ---------------------------------------------------------------- tsdbd's instance (chunksrv_cluster.c) */
+/* Opens the stores (a store held by another process refuses the start; one that is missing, damaged or failing is
+ * DOWN), checks their owner when this server's node is known (-1 with the line in err: tsdbd refuses to start) and
+ * starts the thread that puts the server on the cluster's peer port once it is a member. After cluster_start. */
+int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char *err, size_t errlen);
+void chunksrv_cluster_stop(void);         /* after cluster_stop: no socket is handed to the links any more */
+void chunksrv_cluster_free(void);         /* once tsdbd's workers are joined */
+struct chunksrv *chunksrv_cluster(void);  /* NULL until it serves */
+
 /* ---------------------------------------------------------------- test hooks (tests/test_chunksrv.c --mutant) */
 enum {
     CS_MUT_NONE = 0,

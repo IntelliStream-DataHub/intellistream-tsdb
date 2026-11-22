@@ -160,6 +160,13 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `cluster.fwd.max.age` | `--fwd-max-age-ms` | duration (plain: ms) | 1s | A request older than this since it was read is never forwarded, and its leader refuses it (UNAVAILABLE). At most 2 s: clients resend no earlier than 3 s after sending. |
 | `cluster.fwd.reply` | `--fwd-reply-ms` | duration (plain: ms) | 30s | How long a forwarded request may wait for its leader's reply before the client's connection is closed without an answer (its outcome is unknown). 0: no limit (a dead link still ends it). |
 | `cluster.fwd.workers` | `--fwd-workers` | integer | 4 | Worker threads reserved for requests other members forward here (more start while all of them wait). |
+| `cluster.chunk.dir` | `--chunk-dir` | list | unset | The chunk stores of this member, one per disk (each made by tsdb chunk-store init PATH --cluster UUID --node ID); a comma-separated list. A store of another cluster or node refuses the start; a missing or failing one is reported down. |
+| `cluster.chunk.rate` | `--chunk-rate-mb-s` | integer | 256 | MB/s of chunk puts to other members, all links together: a cap of its own, apart from replication's. |
+| `ec.settle.grace` | `--ec-settle-grace-s` | duration (plain: s) | 1h | How long after a partition's end it is erasure-coded (settled). |
+| `ec.settle.keep` | `--ec-settle-keep-s` | duration (plain: s) | 1d | How long the parts a settle replaced are kept. |
+| `ec.settle.force` | `--ec-settle-force-s` | duration (plain: s) | 1h | How long a settle waits for the partition's rows in memory to be flushed before it flushes them. |
+| `ec.settle.wait.max` | `--ec-settle-wait-max-s` | duration (plain: s) | 2h | How long a settle waits for every member of its stripe to be up before it settles without one. |
+| `ec.cache` | `--ec-cache-mb` | size (plain: MiB) | unset | Memory of the cache of decoded erasure-coded data. Default: a tenth of the RAM. |
 
 Options with no key:
 

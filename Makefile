@@ -845,6 +845,8 @@ $(B)/fwd_cluster.o: server/fwd_cluster.c server/fwd.h server/peerlink.h server/c
 # no cluster calls (test_chunksrv and the fuzzer link it), tsdbd's instance over the member list in chunksrv_cluster.o
 $(B)/chunksrv.o: server/chunksrv.c server/chunksrv.h server/peerlink.h src/chunk.h src/chunk_priv.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
+$(B)/chunksrv_cluster.o: server/chunksrv_cluster.c server/chunksrv.h server/peerlink.h server/cluster.h server/meta.h src/chunk.h client/tsdb_crypto.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
 $(B)/repl.o: src/repl.c src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
@@ -853,7 +855,7 @@ $(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
 # the replication driver's payloads on the data links (server/replwire.h)
 $(B)/replwire.o: server/replwire.c server/replwire.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(RAFT_OBJ)
+CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(B)/chunksrv.o $(B)/chunksrv_cluster.o $(RAFT_OBJ)
 $(B)/tsdb: $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<

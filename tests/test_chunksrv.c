@@ -67,7 +67,8 @@ static uint64_t rnd(void)
 static void fresh(const char *name, char *out, size_t cap)
 {
     static int seq;
-    snprintf(out, cap, "%s/%s-%d", S, name, seq++);
+    if ((size_t)snprintf(out, cap, "%s/%s-%d", S, name, seq++) >= cap)
+        abort();
     mkdir(out, 0755);
 }
 
