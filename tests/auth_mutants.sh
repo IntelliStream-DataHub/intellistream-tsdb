@@ -12,7 +12,8 @@
 # nomembers (a no-op's barrier does not wait for the members) userstale too; pushrebuild (TSDB_CLUSTER_MUTANT: a
 # promoted member's users watch given its copy while it is rebuilt) userpromote; holdempty (TSDB_CLUSTER_MUTANT: that
 # hold only while the copy has no users) userreplay; syncnolease (TSDB_CLUSTER_MUTANT: the barrier answered by a
-# leader without its lease) userlease. Each must fail with its own FAIL line (the pattern
+# leader without its lease) and uladdrtick (TSDB_CLUSTER_MUTANT: a new leader's users' change sent where the 100 ms
+# duty last said the leader is, the one it replaced) userlease. Each must fail with its own FAIL line (the pattern
 # below), not with any failure: a mutant that only stops a server from starting would otherwise count as caught.
 # Usage: tests/auth_mutants.sh SCRATCH [MUTANT...] (from the top of the tree, after make build/tsdbd build/test_cluster
 # build/tsdb).
@@ -34,15 +35,16 @@ expect() {
     pushrebuild) echo "made a voter: .* logins refused" ;;
     holdempty) echo "its users went back while its copy replayed" ;;
     syncnolease) echo "a barrier from a leader without its lease" ;;
+    uladdrtick) echo "the leader it replaced" ;;
     *) echo "FAIL" ;;
     esac
 }
 scenario() {
     case $1 in importmerge) s=userimport ;; nooplocal | syncnowait | nomembers) s=userstale ;;
-    pushrebuild) s=userpromote ;; holdempty) s=userreplay ;; syncnolease) s=userlease ;; *) s=login ;; esac
+    pushrebuild) s=userpromote ;; holdempty) s=userreplay ;; syncnolease | uladdrtick) s=userlease ;; *) s=login ;; esac
 }
 # the mutants of server/cluster.c go in TSDB_CLUSTER_MUTANT, the rest in TSDB_AUTH_MUTANT
-menv() { case $1 in pushrebuild | holdempty | syncnolease) echo TSDB_CLUSTER_MUTANT ;; *) echo TSDB_AUTH_MUTANT ;; esac; }
+menv() { case $1 in pushrebuild | holdempty | syncnolease | uladdrtick) echo TSDB_CLUSTER_MUTANT ;; *) echo TSDB_AUTH_MUTANT ;; esac; }
 # one mutant, then its verdict: tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and
 # asks this script (--mutant-verify) whether the scenario failed where the mutant's own oracle is
 case ${1:-} in
@@ -61,7 +63,7 @@ case ${1:-} in
     exit 0 ;;
 esac
 dir=${1:-/tmp}; shift || true
-muts=${*:-authlocalusers adminlocal loginbeforecatchup barrierifempty noguard retryunavail pushnoretry importmerge nooplocal syncnowait nomembers pushrebuild holdempty syncnolease}
+muts=${*:-authlocalusers adminlocal loginbeforecatchup barrierifempty noguard retryunavail pushnoretry importmerge nooplocal syncnowait nomembers pushrebuild holdempty syncnolease uladdrtick}
 # MUTANT_JOBS, MUTANT_URING_JOBS (tsdbd on io_uring), MUTANT_TIMEOUT
 exec "$(dirname "$0")/../tools/mutants.sh" --name auth --tmp "$dir" --uring --timeout "${MUTANT_TIMEOUT:-600}" --fail \
     --verify "$0" --list "$muts" -- "$0" --mutant-run @M@ @D@

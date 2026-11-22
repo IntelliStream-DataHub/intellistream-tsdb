@@ -9,7 +9,10 @@ Fixed: a read barrier (`group_sync` -> `cluster_user_sync`, the leader's commit 
 users through it) and a check again before a no-op or refusal is answered; a no-op waits for the members. Tests:
 `test_cluster userstale` (fails on 2c89230; also a no-op's OK waiting for a paused member) and `userlease` (a leader
 cut off from its group refuses the barrier), mutants `nooplocal`, `syncnowait`, `nomembers`, `syncnolease` in
-`make auth-mutants`; not tested: the barrier's term check (a SYNC before a new leader's first commit). The harness's
+`make auth-mutants`; not tested: the barrier's term check (a SYNC before a new leader's first commit). A server elected a
+moment ago sent its own users' changes to the leader it replaced until the 100 ms duty moved `cluster_user_propose`'s
+address (a cut-off old leader appends and never commits: the connection closed after 20 s); the address now moves at the
+role change (`userlease`, mutant `uladdrtick`). The harness's
 `noop` exemption is gone and its check 6 makes a refusal contradicting an acknowledged change a violation.
 
 `admin_group` proposes only when the member's own copy says something changes (`pr.op != 0`). When the copy says "nothing
