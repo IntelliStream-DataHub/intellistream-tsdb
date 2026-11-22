@@ -27,10 +27,27 @@ static struct {
     void *arg;
 } G;
 
-static void log_event(void *arg, const struct fwd_ev *ev)
+/* Link up and down, of the links this node dialed. A peer that refuses the FWD kinds (a rolling upgrade from a version
+ * without them) makes a link that goes down at every redial: the downs are logged once a second at most, with the count
+ * of those left out. */
+void fwd_cluster_log_event(void *arg, const struct fwd_ev *ev)
 {
     (void)arg;
-    if (ev->type == FWD_EV_LINK && ev->dialed)
+    if (ev->type != FWD_EV_LINK || !ev->dialed)
+        return;
+    static _Atomic time_t last;
+    static atomic_uint skipped;
+    if (!ev->up) {
+        time_t t = time(NULL);
+        if (atomic_exchange_explicit(&last, t, memory_order_relaxed) == t) {
+            atomic_fetch_add_explicit(&skipped, 1, memory_order_relaxed);
+            return;
+        }
+        unsigned k = atomic_exchange_explicit(&skipped, 0, memory_order_relaxed);
+        if (k)
+            fprintf(stderr, "tsdbd: fwd: %u link downs not logged in the last second\n", k);
+    }
+    if (1)
         fprintf(stderr, "tsdbd: fwd link to node %" PRIu32 " (%s) %s, connection %" PRIu64 "\n", ev->peer,
                 ev->kind == PL_KIND_FWDQ ? "fwdq" : "fwd", ev->up ? "up" : "down", ev->gen);
 }
@@ -64,7 +81,7 @@ static void *fc_main(void *arg)
             struct cluster_self cs;
             if (cluster_self(&cs) == 0 && cs.have_node) {
                 struct fwd_cfg fc = {.secret = cs.secret, .secret_len = cs.secret_len, .arg = G.arg,
-                                     .on_event = G.on_event ? G.on_event : log_event};
+                                     .on_event = G.on_event ? G.on_event : fwd_cluster_log_event};
                 fc.self.id = cs.id;
                 memcpy(fc.self.uuid, cs.uuid, 16);
                 memcpy(fc.self.ident, cs.ident, 16);

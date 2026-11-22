@@ -115,6 +115,14 @@ bool auth_conn_super(const auth_conn *a);
 uint16_t auth_tenant(const auth_conn *a);
 bool auth_tenants_full(const auth_conn *a);
 bool auth_tenant_visible(const auth_conn *a, const char *prefix, size_t len);
+/* A forwarded request's owner (S2-2, fwdreq.h): the pseudo-connection runs as user uid of this server's users, logged
+ * in, its rights checked here as for a direct request (every check after the login is the same). 0, or TSDB_ERR_DENIED
+ * when this server has no such user (the caller has already made sure its users are not behind the entry node's). */
+int auth_check_as(auth_conn *a, uint32_t uid);
+/* The user a connection is logged in as (0: none, --no-auth), and the applied index of the cluster's users this
+ * server's logins read (0: not a cluster server, or no push yet): what a forwarded request's envelope carries. */
+uint32_t auth_uid(const auth_conn *a);
+uint64_t auth_users_applied(void);
 /* Whether the connection holds `need` on every series (no per-id checks needed). */
 bool auth_all(const auth_conn *a, uint8_t need);
 

@@ -192,6 +192,8 @@ int fwd_cluster_start(void (*on_event)(void *arg, const struct fwd_ev *ev), void
 void fwd_cluster_stop(void);
 void fwd_cluster_free(void);
 struct fwd *fwd_cluster(void);
+/* the default handler of fwd_cluster_start: logs link up and down (downs once a second at most) */
+void fwd_cluster_log_event(void *arg, const struct fwd_ev *ev);
 
 /* test hooks: planted bugs (tests/test_peerlink.c --mutant) */
 enum {

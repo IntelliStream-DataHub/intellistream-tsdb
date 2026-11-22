@@ -152,6 +152,7 @@ static int auth_on[N]; /* server i runs with login (no --no-auth): its root has 
 /* Servers run with TSDB_REPLICA_READS=1 (replicas holding a lease answer reads, so a scenario can count a replica's
  * rows) unless a scenario sets strict_reads: then every read goes to the leader (D5), as in production. */
 static int strict_reads;
+static int fwd_on; /* the servers forward requests for volumes led elsewhere (tsdbd's default; else --forward off) */
 static int cports[N];  /* the client port of server i */
 
 /* Starts server i; returns th_await's answer (the client port, or TH_EXITED with th_status, or TH_BAD). */
@@ -210,6 +211,10 @@ static int start_try(int i)
         argv[n++] = secret_path;
         argv[n++] = "--state-dir";
         argv[n++] = state;
+        if (!fwd_on) { /* the scenarios written before forwarding (S2-2) judge s2e's MOVED off the leader */
+            argv[n++] = "--forward";
+            argv[n++] = "off";
+        }
         char extra[256];
         snprintf(extra, sizeof extra, "%s", xargs[i] ? xargs[i] : "");
         for (char *t = strtok(extra, " "); t && n < 38; t = strtok(NULL, " "))
@@ -306,6 +311,7 @@ static void scenario(const char *name)
     memset(xargs, 0, sizeof xargs);
     memset(penv, 0, sizeof penv);
     strict_reads = 0;
+    fwd_on = 0;
     memset(is_witness, 0, sizeof is_witness);
     memset(auth_on, 0, sizeof auth_on);
     snprintf(base, sizeof base, "%s/%s", root, name);
@@ -4897,6 +4903,533 @@ static void scen_route(void)
     stop_all();
 }
 
+/* forward (S2-2: one hop to the volume's leader). Three servers with login on, strict reads, every server with two
+ * workers (--workers 2); east on all three. Through a replica R of east, writes (by id, packed, many-series, a series by
+ * path) are applied on east's leader L and every read (raw, buckets, LTTB, TWA, QUERY_MULTI, QUERY_LATEST,
+ * STATS_SERIES) answers what L answers, with LAST_STATS from L's tail and the hop counted in R's STATUS; a user's
+ * forwarded write is judged by her rights at the owner (DENIED outside her grant); a frame held at the entry past
+ * fwd_max_age_ms is UNAVAILABLE and never applied; a forward waiting on a stopped owner leaves R's own volumes served
+ * (the wait counts as a waiting worker); a written forward whose link breaks closes the client's connection (unknown
+ * outcome), never UNAVAILABLE; a user added while the owner's users lag (TSDB_CLUSTER_TEST hold_users_file) is retried
+ * through UNAVAILABLE until the owner has her, never refused AUTH. Through TSDBD_TEST_FWD_KNOBS: a request held at the
+ * entry after its parse (j) or at the owner before it runs (k) past fwd_max_age_ms is UNAVAILABLE and never applied; a
+ * forward the owner cannot read closes the client's connection at once (l: the owner's unknown outcome, D12); a
+ * forward stamped with another epoch than its owner's is refused (n: UNAVAILABLE or MOVED, not applied); a client that leaves while its forward waits has
+ * it given up within about a second (m, STATUS fwd.inflight). Mutants (TSDBD_FWD_MUTANT): fwdoldframe, fwdunavonbreak,
+ * fwdnouser, fwdnowait, fwdauthlag, fwdarrival, fwdownerage, fwdownerclose, fwdtailclose, fwdepoch, fwdgone. */
+static uint64_t fw_fnv(uint64_t h, const void *p, size_t n)
+{
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+struct fw_acc {
+    uint64_t h;
+    size_t n;
+};
+
+static int fw_vals(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
+{
+    struct fw_acc *a = ctx;
+    a->h = fw_fnv(a->h, ts, n * sizeof *ts);
+    if (v->type == TSDB_FLOAT32)
+        a->h = fw_fnv(a->h, v->values, n * sizeof(float));
+    a->n += n;
+    return 0;
+}
+
+static int fw_raw(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    struct fw_acc *a = ctx;
+    a->h = fw_fnv(fw_fnv(a->h, ts, n * sizeof *ts), v, n * sizeof *v);
+    a->n += n;
+    return 0;
+}
+
+static int fw_multi(void *ctx, const tsdb_series_result *r)
+{
+    struct fw_acc *a = ctx;
+    if (r->status != 0)
+        die("QUERY_MULTI: series %zu answered %s", r->index, ers(r->status));
+    a->h = fw_fnv(fw_fnv(a->h, &r->index, sizeof r->index), r->ts, r->n * sizeof *r->ts);
+    a->n += r->n;
+    return 0;
+}
+
+/* every read of ids[0..n) through c, as one line to compare between servers */
+static void fw_answers(tsdbc *c, const tsdb_sid *ids, size_t n, char *out, size_t cap, const char *where)
+{
+    int rc;
+    size_t o = 0;
+    for (size_t k = 0; k < n; k++) {
+        struct fw_acc raw = {14695981039346656037ull, 0}, lt = raw;
+        if ((rc = tsdbc_query_raw(c, ids[k], 0, INT64_MAX / 2, fw_raw, &raw)) != 0)
+            die("QUERY_RAW %s: %s", where, ers(rc));
+        tsdb_query_stats qs;
+        if ((rc = tsdbc_last_query_stats(c, &qs)) != 0 || qs.rows != raw.n)
+            die("LAST_STATS %s after %zu rows: %s, rows %" PRIu64, where, raw.n, ers(rc), qs.rows);
+        tsdb_bucket *b = NULL;
+        size_t nb = 0;
+        if ((rc = tsdbc_query_agg(c, ids[k], 0, INT64_MAX / 2, 60000, &b, &nb)) != 0)
+            die("buckets %s: %s", where, ers(rc));
+        uint64_t hb = fw_fnv(14695981039346656037ull, b, nb * sizeof *b);
+        free(b);
+        if ((rc = tsdbc_query_lttb(c, ids[k], 0, INT64_MAX / 2, 100, fw_vals, &lt)) != 0)
+            die("LTTB %s: %s", where, ers(rc));
+        tsdb_twa_bucket *t = NULL;
+        size_t nt = 0;
+        tsdb_twa_opts to = {0};
+        if ((rc = tsdbc_query_twa(c, ids[k], 0, 10000000, 600000, &to, &t, &nt)) != 0)
+            die("TWA %s: %s", where, ers(rc));
+        uint64_t ht = fw_fnv(14695981039346656037ull, t, nt * sizeof *t);
+        free(t);
+        o += (size_t)snprintf(out + o, o < cap ? cap - o : 0,
+                              "[%zu] raw %zu/%016" PRIx64 " buckets %zu/%016" PRIx64 " lttb %zu/%016" PRIx64
+                              " twa %zu/%016" PRIx64 "; ",
+                              k, raw.n, raw.h, nb, hb, lt.n, lt.h, nt, ht);
+    }
+    struct fw_acc m = {14695981039346656037ull, 0};
+    tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = 0, .end = INT64_MAX / 2, .opts = {TSDB_ASC, 0}};
+    if ((rc = tsdbc_query_multi(c, &q, ids, n, NULL, fw_multi, &m)) != 0)
+        die("QUERY_MULTI %s: %s", where, ers(rc));
+    tsdb_latest_result lr[8];
+    tsdb_series_stat st[8];
+    if (n > 8)
+        die("fw_answers: %zu ids", n);
+    if ((rc = tsdbc_latest(c, ids, n, NULL, lr)) != 0)
+        die("QUERY_LATEST %s: %s", where, ers(rc));
+    if ((rc = tsdbc_series_stats(c, ids, n, 0, st)) != 0)
+        die("STATS_SERIES %s: %s", where, ers(rc));
+    o += (size_t)snprintf(out + o, o < cap ? cap - o : 0, "multi %zu/%016" PRIx64 " latest", m.n, m.h);
+    for (size_t k = 0; k < n; k++)
+        o += (size_t)snprintf(out + o, o < cap ? cap - o : 0, " %d/%" PRId64 "/%g stats %d/%" PRIu64, (int)lr[k].status,
+                              lr[k].ts, (double)lr[k].v.f32, (int)st[k].status, st[k].rows);
+}
+
+/* the frames forwarded from this server to node `peer` (STATUS peer.<peer>.fwd.frames) */
+static uint64_t fw_frames(tsdbc *c, uint32_t peer)
+{
+    char *text = NULL, key[64];
+    int rc = tsdbc_status(c, &text);
+    if (rc != 0)
+        die("STATUS: %s", ers(rc));
+    snprintf(key, sizeof key, "\npeer.%u.fwd.frames=", (unsigned)peer);
+    const char *p = strstr(text, key);
+    uint64_t n = p ? strtoull(p + strlen(key), NULL, 10) : 0;
+    free(text);
+    return n;
+}
+
+struct fw_write {
+    tsdbc *c;
+    tsdb_sid id;
+    int64_t ts;
+    int rc;
+    uint64_t ms;
+};
+
+static void *fw_write_run(void *arg)
+{
+    struct fw_write *w = arg;
+    float v = 7;
+    uint64_t t0 = now_ms();
+    w->rc = tsdbc_insert_series(w->c, w->id, &w->ts, &v, 1);
+    w->ms = now_ms() - t0;
+    return NULL;
+}
+
+/* rows of id at ts on server s (through its leader: s is the leader) */
+static int fw_has(int s, tsdb_sid id, int64_t ts)
+{
+    tsdbc *c = login_retry(s, "root", "root-pw", 0);
+    nrows = 0;
+    int rc = tsdbc_query_raw(c, id, ts, ts + 1, count_rows, NULL);
+    if (rc != 0)
+        die("read of %" PRId64 " on server %d: %s", ts, s, ers(rc));
+    tsdbc_close(c);
+    return nrows;
+}
+
+/* a value of STATUS on c ("fwd.inflight"); 0 when absent */
+static uint64_t fw_stat(tsdbc *c, const char *name)
+{
+    char *text = NULL, key[96];
+    int rc = tsdbc_status(c, &text);
+    if (rc != 0)
+        die("STATUS: %s", ers(rc));
+    snprintf(key, sizeof key, "\n%s=", name);
+    const char *p = strstr(text, key);
+    uint64_t n = p ? strtoull(p + strlen(key), NULL, 10) : 0;
+    free(text);
+    return n;
+}
+
+/* TSDBD_TEST_FWD_KNOBS (server/tsdbd.c fwd_knob): <base>/fwdknobs/NAME exists while on */
+static void fw_knob(const char *name, int on)
+{
+    char p[PATH_MAX + 80];
+    snprintf(p, sizeof p, "%s/fwdknobs", base);
+    mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/fwdknobs/%s", base, name);
+    if (on) {
+        int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0)
+            die("%s: %s", p, strerror(errno));
+        close(fd);
+    } else if (unlink(p) != 0 && errno != ENOENT) {
+        die("unlink %s: %s", p, strerror(errno));
+    }
+}
+
+/* one write through R held by the knob for 1.5 s: it must be answered UNAVAILABLE and never reach L */
+static void fw_held_write(int L, int R, tsdb_sid id, int64_t ts, const char *knob, const char *what)
+{
+    struct fw_write w = {.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = ts};
+    fw_knob(knob, 1);
+    pthread_t th;
+    if (pthread_create(&th, NULL, fw_write_run, &w) != 0)
+        die("pthread_create");
+    usleep(1500000);
+    fw_knob(knob, 0);
+    pthread_join(th, NULL);
+    tsdbc_close(w.c);
+    if (w.rc != TSDB_ERR_UNAVAILABLE)
+        die("a write held 1.5 s %s: %s, not UNAVAILABLE", what, ers(w.rc));
+    usleep(300000);
+    if (fw_has(L, id, ts) != 0)
+        die("a write held 1.5 s %s and answered UNAVAILABLE was applied on the leader", what);
+    printf("  a write held past fwd_max_age_ms %s is UNAVAILABLE and never applied\n", what);
+}
+
+static void scen_forward(void)
+{
+    scenario("forward");
+    strict_reads = 1;
+    fwd_on = 1;
+    const char *mut = getenv("TSDBD_FWD_MUTANT");
+    char stall[PATH_MAX + 80];
+    snprintf(stall, sizeof stall, "%s/fwd-stall", base);
+    static char menv[PATH_MAX * 2 + 400];
+    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s TSDBD_TEST_FWD_STALL=%s TSDBD_TEST_FWD_KNOBS=%s/fwdknobs",
+             mut ? mut : "", stall, base);
+    for (int i = 0; i < 3; i++) {
+        auth_on[i] = 1;
+        penv[i] = menv;
+        envs[i] = "hold_users_file=1"; /* part i: <state>/holdusers on the owner makes its users lag */
+        xargs[i] = "--workers 2";
+        start(i);
+    }
+    char pw[PATH_MAX + 80], pw2[PATH_MAX + 80], args[PATH_MAX * 2 + 512], out[8192], p0[META_ADDR_MAX];
+    put_file("pw", "root-pw", pw, sizeof pw);
+    put_file("pw2", "alice-pw", pw2, sizeof pw2);
+    peer_of(0, p0, sizeof p0);
+    snprintf(args, sizeof args,
+             "cluster init %s --secret-file %s --node-timeout-ms 1500 --heartbeat-ms 200 --voter-replace-s 600 "
+             "--superuser root --password-file %s",
+             p0, secret_path, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("cluster init --superuser root: %s", out);
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    snprintf(args, sizeof args, "cluster user add %s alice --password-file %s --secret-file %s", p0, pw2,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("user add alice: %s", out);
+    for (int i = 0; i < 3; i++) {
+        await_view(i, p_users_caught_up, NULL, "users caught up");
+        await_login(i, "root", "root-pw");
+    }
+    uint32_t num;
+    struct meta_volume v;
+    int rc;
+    if ((rc = vol_add(0, "east", 3, &num)) != 0)
+        die("volume add east: %s", cluster_strerror(rc));
+    if (!vol_rec(0, "east", &v))
+        die("no record of east");
+    for (uint32_t k = 0; k < v.nrep; k++)
+        await_open_gen(0, "east", server_of(v.rep[k].node), 1, 0);
+    await_isr(0, "east", 3, 20000, "east with every replica up");
+    int L = server_of(v.leader), R = (L + 1) % 3;
+    {
+        tsdbc *r0 = login_on(0, "root", "root-pw");
+        if ((rc = tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ | TSDB_RIGHT_INSERT)) != 0)
+            die("grant: %s", ers(rc));
+        tsdbc_close(r0);
+    }
+
+    /* a. through the replica R: every write lands on L, every read answers L's answer */
+    tsdbc *c = login_retry(L, "root", "root-pw", 0);
+    tsdb_sid id = rep_series(c, "plant.a", "east", 30000), other = rep_series(c, "other.a", "east", 30000);
+    tsdbc_close(c);
+    c = login_retry(R, "root", "root-pw", 0); /* budget 0: a MOVED would fail the call */
+    uint64_t f0 = fw_frames(c, v.leader);
+    tsdb_sid pid;
+    if ((rc = tsdbc_series_at(c, "plant.p", "east", &pid)) != 0)
+        die("a series by path through the replica: %s", ers(rc));
+    enum { NR = 3000 };
+    static int64_t ts[NR];
+    static float val[NR];
+    for (int k = 0; k < NR; k++)
+        ts[k] = 1000 + (int64_t)k * 1000, val[k] = (float)(k % 97) * 0.5f;
+    if ((rc = tsdbc_insert_series(c, id, ts, val, NR / 2)) != 0)
+        die("a write by id through the replica: %s", ers(rc));
+    tsdb_sid two[4] = {id, pid, other, id};
+    int64_t ts2[4] = {ts[NR / 2], 1000, 1000, ts[NR / 2 + 1]};
+    float v2[4] = {1, 2, 3, 4};
+    if ((rc = tsdbc_insert(c, two, ts2, v2, 4)) != 0) /* packed */
+        die("a packed write through the replica: %s", ers(rc));
+    if ((rc = tsdbc_set_compression(c, 0)) != 0)
+        die("compression off: %s", ers(rc));
+    int64_t ts3[2] = {ts[NR / 2 + 2], 2000};
+    tsdb_sid two3[2] = {id, pid};
+    if ((rc = tsdbc_insert(c, two3, ts3, v2, 2)) != 0)
+        die("an unpacked many-series write through the replica: %s", ers(rc));
+    if ((rc = tsdbc_set_compression(c, 1)) != 0)
+        die("compression on: %s", ers(rc));
+    if ((rc = tsdbc_insert_series(c, id, ts + NR / 2 + 3, val + NR / 2 + 3, NR - NR / 2 - 3)) != 0)
+        die("a second write by id through the replica: %s", ers(rc));
+    static char ar[4096], al[4096];
+    tsdb_sid q3[3] = {id, pid, other};
+    fw_answers(c, q3, 3, ar, sizeof ar, "through the replica");
+    uint64_t f1 = fw_frames(c, v.leader);
+    tsdbc_close(c);
+    c = login_retry(L, "root", "root-pw", 0);
+    fw_answers(c, q3, 3, al, sizeof al, "on the leader");
+    if (rows_of(c, id) != NR)
+        die("east's leader holds %d rows of plant.a, not %d", nrows, NR);
+    tsdbc_close(c);
+    if (strcmp(ar, al) != 0)
+        die("the answers through the replica differ from the leader's:\n  R: %s\n  L: %s", ar, al);
+    if (f1 < f0 + 10)
+        die("STATUS of the replica counts %" PRIu64 " frames forwarded to node %u, not at least 10 more than %" PRIu64,
+            f1, (unsigned)v.leader, f0);
+    printf("  through a replica: writes by id, packed, many-series and by path land on the leader; raw, buckets, LTTB, "
+           "TWA, QUERY_MULTI, QUERY_LATEST and STATS_SERIES answer the leader's answers (%" PRIu64 " frames)\n",
+           f1 - f0);
+
+    /* b. a user's forwarded write is judged at the owner by her rights */
+    tsdbc *a = login_retry(R, "alice", "alice-pw", 0);
+    int64_t tb = 99000000;
+    float vb = 1;
+    if ((rc = tsdbc_insert_series(a, id, &tb, &vb, 1)) != 0)
+        die("alice's write in her grant through the replica: %s", ers(rc));
+    if ((rc = tsdbc_insert_series(a, other, &tb, &vb, 1)) != TSDB_ERR_DENIED)
+        die("alice's write outside her grant through the replica: %s, not DENIED", ers(rc));
+    tsdbc_close(a);
+    if (fw_has(L, id, tb) != 1 || fw_has(L, other, tb) != 0)
+        die("after alice's writes through the replica the leader holds %d row(s) in her grant and %d outside it",
+            fw_has(L, id, tb), fw_has(L, other, tb));
+    printf("  a user's write through a replica is applied in her grant and DENIED at the owner outside it\n");
+
+    /* i. a user added while the owner's users lag (its watch held): she logs in on the entry, her forwarded write is
+     * UNAVAILABLE (RELOADING) at the owner until it has her, which the client retries, never AUTH (fwdauthlag) */
+    {
+        char holdu[PATH_MAX + 96], pw3[PATH_MAX + 80];
+        server_dir(L, holdu, sizeof holdu);
+        strcat(holdu, "/state/holdusers");
+        FILE *hu = fopen(holdu, "w");
+        if (!hu)
+            die("%s: %s", holdu, strerror(errno));
+        fclose(hu);
+        usleep(300000); /* a round of L's cluster thread: its watch has stopped */
+        put_file("pw3", "bob-pw", pw3, sizeof pw3);
+        snprintf(args, sizeof args, "cluster user add %s bob --superuser --password-file %s --secret-file %s --wait-ms 200",
+                 p0, pw3, secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0 && !strstr(out, "lag"))
+            die("user add bob: %s", out);
+        await_login(R, "bob", "bob-pw");
+        struct fw_write wb = {.c = login_retry(R, "bob", "bob-pw", 20000), .id = id, .ts = 97000000};
+        pthread_t tb2;
+        if (pthread_create(&tb2, NULL, fw_write_run, &wb) != 0)
+            die("pthread_create");
+        usleep(1000000);
+        unlink(holdu);
+        pthread_join(tb2, NULL);
+        tsdbc_close(wb.c);
+        if (wb.rc != 0)
+            die("bob's write through the replica while the owner's users lagged: %s, not retried until it had him",
+                ers(wb.rc));
+        if (wb.ms < 800)
+            die("bob's write through the replica was answered after %" PRIu64 " ms with the owner's users held 1 s: "
+                "the lag was not exercised", wb.ms);
+        if (fw_has(L, id, wb.ts) != 1)
+            die("bob's write through the replica is not on the leader");
+        printf("  a user added while the owner's users lagged: her forwarded write waited %" PRIu64
+               " ms (UNAVAILABLE, retried), never AUTH\n", wb.ms);
+    }
+
+    /* c. a frame held at the entry past fwd_max_age_ms (1 s): UNAVAILABLE, never applied */
+    struct fw_write w = {.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = 98000000};
+    put_file("fwd-stall", "", stall, sizeof stall);
+    pthread_t th;
+    if (pthread_create(&th, NULL, fw_write_run, &w) != 0)
+        die("pthread_create");
+    usleep(1500000);
+    unlink(stall);
+    pthread_join(th, NULL);
+    tsdbc_close(w.c);
+    if (w.rc != TSDB_ERR_UNAVAILABLE)
+        die("a write held 1.5 s at the entry: %s, not UNAVAILABLE", ers(w.rc));
+    usleep(300000);
+    if (fw_has(L, id, w.ts) != 0)
+        die("a write held 1.5 s at the entry and answered UNAVAILABLE was applied on the leader");
+    printf("  a write held past fwd_max_age_ms at the entry is UNAVAILABLE and never applied\n");
+
+    /* j. held at the entry after its parse but before its forward is built: the age counts from the parse (a request
+     *    that waited for a worker is as old as one that waited for the link) */
+    fw_held_write(L, R, id, 98000100, "prestall", "at the entry before its forward began");
+    /* k. held at the owner before it runs the forward: the owner's own check (envelope age plus its queue) */
+    fw_held_write(L, R, id, 98000200, "ownerstall", "at the owner before it ran the forward");
+
+    /* l. a forward the owner cannot read: the owner answers by closing (unknown outcome, D12), and the entry closes the
+     *    client's connection at once instead of leaving it waiting for a reply that never comes */
+    {
+        struct fw_write wl = {.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = 98000300};
+        tsdbc_set_timeout(wl.c, 8000);
+        fw_knob("badenv", 1);
+        fw_write_run(&wl);
+        fw_knob("badenv", 0);
+        tsdbc_close(wl.c);
+        if (wl.rc != TSDB_ERR_IO || wl.ms >= 4000)
+            die("a forward the owner could not read: %s after %" PRIu64 " ms, not a closed connection at once (IO)",
+                ers(wl.rc), wl.ms);
+        if (fw_has(L, id, wl.ts) != 0)
+            die("a forward the owner could not read was applied");
+        printf("  a forward the owner could not read closes the client's connection (%" PRIu64 " ms)\n", wl.ms);
+    }
+
+    /* n. the owner leads at another epoch than the one the entry stamped: refused before anything is done, never run.
+     *    The owner's copy names itself, so route_fill answers UNAVAILABLE (MOVED to itself would send the client round in
+     *    a circle); an owner whose copy names another leader answers MOVED. Either says "not applied": the client resends
+     *    and the entry node routes again. */
+    {
+        tsdbc *cn = login_retry(R, "root", "root-pw", 0);
+        int64_t tn = 98000400;
+        float vn = 1;
+        fw_knob("epoch", 1);
+        rc = tsdbc_insert_series(cn, id, &tn, &vn, 1);
+        fw_knob("epoch", 0);
+        tsdbc_close(cn);
+        if (rc != TSDB_ERR_MOVED && rc != TSDB_ERR_UNAVAILABLE)
+            die("a forward stamped with another epoch than its owner's: %s, not MOVED or UNAVAILABLE", ers(rc));
+        if (fw_has(L, id, tn) != 0)
+            die("a forward stamped with another epoch than its owner's was applied");
+        printf("  a forward stamped with another epoch than its owner leads at is %s, never run\n", ers(rc));
+    }
+
+    /* m. a client that leaves while its forward waits (the owner holds it): the entry gives the forward up (cancel) in
+     *    about a second, not after fwd_reply_ms (30 s) or whenever the owner answers */
+    {
+        tsdbc *cm = login_retry(R, "root", "root-pw", 0), *sm = login_retry(R, "root", "root-pw", 0);
+        tsdbc_set_timeout(cm, 300);
+        int64_t tm = 98000500;
+        float vm = 1;
+        fw_knob("ownerstall", 1);
+        rc = tsdbc_insert_series(cm, id, &tm, &vm, 1);
+        uint64_t inflight = fw_stat(sm, "fwd.inflight");
+        if (inflight != 1) {
+            fw_knob("ownerstall", 0);
+            die("a forward held at the owner: %" PRIu64 " forwards in flight on the entry, not 1", inflight);
+        }
+        tsdbc_close(cm);
+        uint64_t t0 = now_ms(), gone_ms = 0;
+        while ((inflight = fw_stat(sm, "fwd.inflight")) != 0 && now_ms() - t0 < 3000)
+            usleep(20000);
+        gone_ms = now_ms() - t0;
+        uint64_t left = inflight;
+        fw_knob("ownerstall", 0);
+        tsdbc_close(sm);
+        if (rc != TSDB_ERR_IO)
+            die("a forward held at the owner past the client's 300 ms timeout: %s, not IO", ers(rc));
+        if (left != 0)
+            die("a forward whose client left is still in flight on the entry %" PRIu64 " ms later (owner holding it)",
+                gone_ms);
+        printf("  a forward whose client left is given up %" PRIu64 " ms after the client closed\n", gone_ms);
+    }
+
+    /* e. forwards waiting on a stopped owner hold no worker of R: a volume led on R is served at once */
+    char solo[16] = "";
+    for (int k = 1; k <= 8 && !*solo; k++) {
+        char nm[16];
+        uint32_t nn;
+        struct meta_volume s;
+        snprintf(nm, sizeof nm, "solo%d", k);
+        if ((rc = vol_add(0, nm, 1, &nn)) != 0)
+            die("volume add %s: %s", nm, cluster_strerror(rc));
+        if (!vol_rec(0, nm, &s))
+            die("no record of %s", nm);
+        await_open_gen(0, nm, server_of(s.leader), 1, 0);
+        if (server_of(s.leader) == R)
+            snprintf(solo, sizeof solo, "%s", nm);
+    }
+    if (!*solo)
+        die("no volume of 8 with one replica is led on server %d", R);
+    c = login_retry(R, "root", "root-pw", 0);
+    tsdb_sid lid = rep_series(c, "plant.l", solo, 30000);
+    struct fw_write hw[2];
+    pthread_t ht[2];
+    for (int k = 0; k < 2; k++)
+        hw[k] = (struct fw_write){.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = 97000000 + k};
+    pause_server(L, 1);
+    for (int k = 0; k < 2; k++)
+        if (pthread_create(&ht[k], NULL, fw_write_run, &hw[k]) != 0)
+            die("pthread_create");
+    usleep(200000);
+    uint64_t t0 = now_ms();
+    int64_t tl = 1000;
+    float vl = 1;
+    rc = tsdbc_insert_series(c, lid, &tl, &vl, 1);
+    uint64_t took = now_ms() - t0;
+    usleep(took < 1000 ? (useconds_t)(1000 - took) * 1000 : 0);
+    pause_server(L, 0);
+    for (int k = 0; k < 2; k++) {
+        pthread_join(ht[k], NULL);
+        tsdbc_close(hw[k].c);
+    }
+    tsdbc_close(c);
+    if (rc != 0)
+        die("a write to %s led on server %d while two forwards wait on the stopped leader of east: %s", solo, R,
+            ers(rc));
+    if (took > 600)
+        die("a write to %s led on server %d took %" PRIu64 " ms while two forwards waited on a stopped owner (--workers 2)",
+            solo, R, took);
+    printf("  two forwards waiting on a stopped owner leave a volume led on the entry served (%" PRIu64 " ms, --workers 2); "
+           "they then answered %s and %s\n",
+           took, hw[0].rc ? ers(hw[0].rc) : "OK", hw[1].rc ? ers(hw[1].rc) : "OK");
+
+    /* d. a forward written to an owner that dies before it answers: the client's connection is closed (the outcome is
+     * unknown), never UNAVAILABLE (which says nothing was applied) */
+    await_isr(0, "east", 3, 20000, "east with every replica up again");
+    if (!vol_rec(0, "east", &v))
+        die("no record of east");
+    L = server_of(v.leader), R = (L + 1) % 3;
+    w = (struct fw_write){.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = 96000000};
+    pause_server(L, 1);
+    if (pthread_create(&th, NULL, fw_write_run, &w) != 0)
+        die("pthread_create");
+    usleep(300000);
+    signal_child(pids[L], SIGKILL); /* never SIGCONT first: the owner must not answer */
+    int st;
+    if (waitpid(pids[L], &st, 0) != pids[L])
+        die("waitpid %d: %s", (int)pids[L], strerror(errno));
+    pids[L] = 0, stopped[L] = 0;
+    pthread_join(th, NULL);
+    tsdbc_close(w.c);
+    if (w.rc != TSDB_ERR_IO)
+        die("a forwarded write whose owner was killed before it answered: %s after %" PRIu64 " ms, not a closed "
+            "connection (IO)",
+            ers(w.rc), w.ms);
+    printf("  a forwarded write whose owner died before it answered closes the client's connection (%" PRIu64
+           " ms)\n",
+           w.ms);
+}
+
 /* ccstress: the copy's get/put/swap in-process (cluster_copy_stress, no server): 32 readers loop get/put while 5,000
  * snapshots are swapped in. The writer must get through (one counter for every reader starved it for good: mutant
  * cconeslot), and no reader may see its snapshot change or freed (ccnowait; ASan names the use after free). */
@@ -8254,6 +8787,442 @@ static void scen_pause(void)
     printf("  the deposed leader rejoined as a replica: every server holds the same %d rows\n", total);
 }
 
+/* fwdlease (S2-2): a forwarded read is judged by the owner's read lease, as a read sent to it directly. scen_lease's
+ * phase a with every read sent to the third server F, which forwards it to the volume leader X: the Raft leader R
+ * paused at T0, X's lease ends by T0 + 800 ms (lease_ms 1000, drift 20%) and no new Raft leader can grant before an
+ * election timeout, so every read F forwards in (T0 + 810, T0 + 940) must be refused, and some must have been sent.
+ * Mutant fwdnolease (the owner skips the lease for a forward). */
+static void scen_fwdlease(void)
+{
+    scenario("fwdlease");
+    strict_reads = 1;
+    fwd_on = 1;
+    const char *mut = getenv("TSDBD_FWD_MUTANT");
+    static char menv[160];
+    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s", mut ? mut : "");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = menv;
+        start(i);
+    }
+    struct meta_settings s;
+    meta_settings_default(&s);
+    s.node_timeout_ms = 3000;
+    s.heartbeat_ms = 50;
+    s.lease_ms = 1000;
+    s.drift_ppm = 200000;
+    s.voter_replace_s = 600;
+    uint8_t req[128], *reply;
+    size_t len;
+    size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
+    int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
+    free(reply);
+    if (rc != 0)
+        die("init: %s", cluster_strerror(rc));
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int R = 0, X = -1;
+    char name[16];
+    struct meta_volume v;
+    for (int k = 0; k < 8 && X < 0; k++) {
+        uint32_t num;
+        snprintf(name, sizeof name, "fl%d", k);
+        if ((rc = vol_add(0, name, 3, &num)) != 0)
+            die("volume add %s: %s", name, cluster_strerror(rc));
+        if (!vol_rec(0, name, &v))
+            die("no record of %s", name);
+        int L = server_of(v.leader);
+        if (L >= 0 && L <= 2 && L != R)
+            X = L;
+    }
+    if (X < 0)
+        die("eight volumes, every one led by the Raft leader");
+    int F = 3 - R - X;
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, name, i, 1, 0);
+    tsdbc *cx = client(X);
+    tsdb_sid id = rep_series(cx, rep_names[0], name, 30000);
+    int64_t ts = 1000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(cx, id, &ts, &val, 1)) != 0)
+        die("a write: %s", ers(rc));
+    tsdbc_close(cx);
+    tsdbc *c = client(F);
+    tsdbc_set_retry(c, 0); /* the first answer, not a retried one */
+    if (!lease_until_ok(c, id, 10000, 1))
+        die("no read through %d (forwarded to %d) answered before the pause", F, X);
+    uint64_t f0 = fw_frames(c, v.leader);
+
+    static struct lread log[1 << 16];
+    size_t nl = 0;
+    pause_server(R, 1);
+    uint64_t T0 = now_ms();
+    while (now_ms() - T0 < 2000 && nl < sizeof log / sizeof log[0]) {
+        int rows;
+        log[nl].sent = now_ms();
+        log[nl].rc = lease_read(c, id, (int)(nl % 3), &rows);
+        if (log[nl].rc != 0 && log[nl].rc != TSDB_ERR_UNAVAILABLE)
+            die("a read through %d %" PRIu64 " ms into the pause: %s", F, log[nl].sent - T0, ers(log[nl].rc));
+        nl++;
+        struct timespec d = {0, 100000};
+        nanosleep(&d, NULL);
+    }
+    pause_server(R, 0);
+    size_t refused = 0;
+    for (size_t k = 0; k < nl; k++) {
+        uint64_t at = log[k].sent - T0;
+        if (log[k].rc == 0 && at > 810 && at < 940)
+            die("a read forwarded through %d %" PRIu64 " ms after the Raft leader paused was answered by %d: past its "
+                "lease (ends by 800)", F, at, X);
+        refused += log[k].rc != 0 && at > 810 && at < 940;
+    }
+    if (!refused)
+        die("no read was sent through %d between 810 and 940 ms into the pause (%zu reads)", F, nl);
+    uint64_t f1 = fw_frames(c, v.leader);
+    if (f1 < f0 + nl)
+        die("%zu reads through %d, %" PRIu64 " frames forwarded to %d", nl, F, f1 - f0, X);
+    if (!lease_until_ok(c, id, 20000, 1))
+        die("no read through %d answered after the Raft leader came back", F);
+    tsdbc_close(c);
+    stop_all();
+    printf("  reads forwarded from %d to %d with the Raft leader %d paused: %zu refused in (810, 940) ms, none answered "
+           "past the lease\n", F, X, R, refused);
+}
+
+/* fwddepose (S2-2): a forward that reaches a leader deposed since the entry node's copy was taken is answered MOVED by
+ * it, never forwarded a second hop. fd on three servers; the replicas' copies held (TSDB_CLUSTER_TEST hold_copy_file)
+ * while the leader L is paused past node_timeout and a replica N is promoted; N's copy is let go, the entry E's kept;
+ * L resumes, rejoins as a replica and learns N leads: a write through E goes to L at the old epoch and must come back
+ * MOVED, not applied. Mutant fwdtwice (L forwards it on to N). */
+static void scen_fwddepose(void)
+{
+    scenario("fwddepose");
+    strict_reads = 1;
+    fwd_on = 1;
+    const char *mut = getenv("TSDBD_FWD_MUTANT");
+    static char menv[160];
+    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s", mut ? mut : "");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = menv;
+        envs[i] = "hold_copy_file=1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "fd", 3, &num)) != 0)
+        die("volume add fd: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fd", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "fd", &v))
+        die("no record of fd");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of fd is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    uint32_t oldlead = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "fd", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    tsdbc_close(c);
+    await_isr(0, "fd", 3, 30000, "every replica in the ISR before the pause");
+    char hold[3][PATH_MAX + 96];
+    for (int i = 0; i < 3; i++) {
+        server_dir(i, hold[i], sizeof hold[i]);
+        strcat(hold[i], "/state/holdcopy");
+        if (i == L)
+            continue;
+        FILE *h = fopen(hold[i], "w");
+        if (!h)
+            die("%s: %s", hold[i], strerror(errno));
+        fclose(h);
+    }
+    usleep(300000); /* a round of their cluster threads */
+    pause_server(L, 1);
+    int Nw = await_promoted((L + 1) % 3, "fd", ids[L], e0, &v);
+    if (Nw < 0 || Nw == L || v.epoch <= e0)
+        die("the new record of fd: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    unlink(hold[Nw]);
+    int E = 3 - L - Nw;
+    pause_server(L, 0);
+    /* L deposed and back as a replica, its own copy naming Nw */
+    uint64_t t0 = now_ms();
+    for (;;) {
+        struct meta_volume w;
+        if (vol_rec(L, "fd", &w) && w.leader == v.leader && w.epoch == v.epoch)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("server %d never saw fd led by %u at epoch %" PRIu64, L, v.leader, v.epoch);
+        usleep(50000);
+    }
+    await_isr(Nw, "fd", 3, 30000, "the deposed leader back in the ISR");
+    usleep(300000);
+    c = client(E);
+    tsdbc_set_retry(c, 0);
+    uint64_t f0 = fw_frames(c, oldlead);
+    ts = 5000;
+    t0 = now_ms();
+    while ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) == TSDB_ERR_UNAVAILABLE && now_ms() - t0 < 10000)
+        usleep(100000); /* E's link to L coming back */
+    uint64_t f1 = fw_frames(c, oldlead);
+    tsdbc_close(c);
+    if (f1 <= f0)
+        die("the write through %d (its copy held at epoch %" PRIu64 ") was not forwarded to %d: %s", E, e0, L, ers(rc));
+    if (rc != TSDB_ERR_MOVED)
+        die("a write forwarded to the deposed leader %d: %s, not MOVED", L, ers(rc));
+    unlink(hold[E]);
+    tsdbc *cn = client(Nw);
+    nrows = 0;
+    if ((rc = tsdbc_query_raw(cn, id, 5000, 5001, count_rows, NULL)) != 0)
+        die("a read on the new leader: %s", ers(rc));
+    tsdbc_close(cn);
+    if (nrows != 0)
+        die("the write answered MOVED by the deposed leader is on the new leader");
+    stop_all();
+    printf("  a write forwarded by %d (copy held at epoch %" PRIu64 ") to the deposed leader %d: MOVED, not applied on "
+           "the new leader %d (epoch %" PRIu64 ")\n", E, e0, L, Nw, v.epoch);
+}
+
+/* fwdload (S2-2): forwarding under load, without login. Three servers, --workers 2 --fwd-workers 1 on each; two volumes of
+ * one replica, vx led on X and vy on Y (X != Y).
+ * f. A slow reader (QUERY_RAW of 6 M rows through Y, about 5 s to read) beside a stream of one-row inserts through Y to
+ *    the same owner X: the reader's chunks wait for credit on X's only reserved worker, which must count as waiting
+ *    (the pool grows), so every insert answers and their p99 stays small; the reader gets every row (ha.md 15.4: the
+ *    insert p99 holds and the link survives). Mutant fwdchunknowait.
+ * g. X and Y forward to each other under load: 4 clients on each write the other's volume and read 5-chunk replies
+ *    from it; everything answers within the bound. Mutant fwdinline (a forward served on the links' dispatcher: two
+ *    owners each wait for credit that only the other's dispatcher would let through). */
+struct fl_read {
+    tsdbc *c;
+    tsdb_sid id;
+    int64_t lo, hi;
+    uint64_t rows, ms;
+    int rc, slow;
+    atomic_int done; /* set after rc and ms: the stream of inserts in f polls it while the reader runs */
+};
+
+static int fl_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ts, (void)v;
+    struct fl_read *r = ctx;
+    r->rows += n;
+    if (r->slow) {
+        struct timespec d = {0, (long)n * 800}; /* 6 M rows: about 5 s */
+        nanosleep(&d, NULL);
+    }
+    return 0;
+}
+
+static void *fl_read_run(void *arg)
+{
+    struct fl_read *r = arg;
+    uint64_t t0 = now_ms();
+    r->rc = tsdbc_query_raw(r->c, r->id, r->lo, r->hi, fl_cb, r);
+    r->ms = now_ms() - t0;
+    atomic_store(&r->done, 1);
+    return NULL;
+}
+
+#define FL_BIG 6000000
+#define FL_T0 1700000000000LL
+
+/* n rows of id from FL_T0, 10 ms apart, in calls of 500,000, on the leader */
+static void fl_fill(tsdbc *c, tsdb_sid id, size_t n)
+{
+    size_t step = 500000;
+    int64_t *ts = malloc(step * sizeof *ts);
+    float *v = malloc(step * sizeof *v);
+    if (!ts || !v)
+        die("out of memory");
+    for (size_t k = 0; k < n; k += step) {
+        size_t m = n - k < step ? n - k : step;
+        for (size_t i = 0; i < m; i++)
+            ts[i] = FL_T0 + (int64_t)(k + i) * 10, v[i] = (float)(k + i);
+        int rc = tsdbc_insert_series(c, id, ts, v, m);
+        if (rc != 0)
+            die("loading %zu rows: %s", n, ers(rc));
+    }
+    free(ts);
+    free(v);
+}
+
+static int fl_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+struct fl_peer {
+    int s;              /* entry server */
+    tsdb_sid big;       /* the other volume's big series (read) */
+    char vol[16];       /* the other volume (written) */
+    int k, rc, iters;
+    const char *what;
+    atomic_int *done;
+};
+
+static void *fl_peer_run(void *arg)
+{
+    struct fl_peer *p = arg;
+    tsdbc *c = client(p->s);
+    char nm[48];
+    snprintf(nm, sizeof nm, "g.%d.%d", p->s, p->k);
+    tsdb_sid id = rep_series(c, nm, p->vol, 30000);
+    int64_t ts[100];
+    float v[100];
+    for (int it = 0; it < 200 && !p->rc; it++, p->iters++) {
+        for (int i = 0; i < 100; i++)
+            ts[i] = FL_T0 + (int64_t)(it * 100 + i) * 1000, v[i] = (float)i;
+        if ((p->rc = tsdbc_insert_series(c, id, ts, v, 100)) != 0) {
+            p->what = "insert";
+            break;
+        }
+        if (it % 40 == 20) { /* 400,000 rows: 4.8 MB, five chunks, past the first credit of four */
+            struct fl_read r = {.c = c, .id = p->big, .lo = FL_T0 + (int64_t)p->k * 1000000, .hi = 0};
+            r.hi = r.lo + 400000LL * 10;
+            fl_read_run(&r);
+            if ((p->rc = r.rc) == 0 && r.rows != 400000)
+                p->rc = -1000000 - (int)r.rows;
+            if (p->rc)
+                p->what = "read";
+        }
+    }
+    tsdbc_close(c);
+    atomic_fetch_add(p->done, 1);
+    return NULL;
+}
+
+static void scen_fwdload(void)
+{
+    scenario("fwdload");
+    strict_reads = 1;
+    fwd_on = 1;
+    const char *mut = getenv("TSDBD_FWD_MUTANT");
+    static char menv[160];
+    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s", mut ? mut : "");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = menv;
+        xargs[i] = "--workers 2 --fwd-workers 1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int X = -1, Y = -1, rc;
+    char vx[16] = "", vy[16] = "";
+    for (int k = 0; k < 12 && Y < 0; k++) {
+        char nm[16];
+        uint32_t num;
+        struct meta_volume s;
+        snprintf(nm, sizeof nm, "ld%d", k);
+        if ((rc = vol_add(0, nm, 1, &num)) != 0)
+            die("volume add %s: %s", nm, cluster_strerror(rc));
+        if (!vol_rec(0, nm, &s))
+            die("no record of %s", nm);
+        int l = server_of(s.leader);
+        await_open_gen(0, nm, l, 1, 0);
+        if (X < 0)
+            X = l, snprintf(vx, sizeof vx, "%s", nm);
+        else if (l != X)
+            Y = l, snprintf(vy, sizeof vy, "%s", nm);
+    }
+    if (Y < 0)
+        die("12 volumes of one replica, all led on server %d", X);
+
+    tsdbc *cx = client(X), *cy = client(Y);
+    tsdb_sid bigx = rep_series(cx, "f.big", vx, 30000), bigy = rep_series(cy, "g.big", vy, 30000);
+    tsdb_sid small = rep_series(cx, "f.small", vx, 30000);
+    fl_fill(cx, bigx, FL_BIG);
+    fl_fill(cy, bigy, 4 * 1000000 / 10 + 400000); /* every thread's window of g (k * 1e6 ms + 400,000 rows) */
+    tsdbc_close(cx);
+    tsdbc_close(cy);
+
+    /* f. the slow reader and the insert stream, both through Y to X */
+    struct fl_read r = {.c = client(Y), .id = bigx, .lo = 0, .hi = INT64_MAX / 2, .slow = 1};
+    pthread_t th;
+    if (pthread_create(&th, NULL, fl_read_run, &r) != 0)
+        die("pthread_create");
+    usleep(700000);
+    tsdbc *ci = client(Y);
+    uint64_t lat[4096];
+    size_t nl = 0;
+    for (int64_t t = FL_T0; nl < sizeof lat / sizeof lat[0]; t += 1000) {
+        float v = 1;
+        uint64_t t0 = now_ms();
+        rc = tsdbc_insert_series(ci, small, &t, &v, 1);
+        lat[nl++] = now_ms() - t0;
+        if (rc != 0)
+            die("insert %zu through %d to %d beside a slow reader: %s after %" PRIu64 " ms", nl, Y, X, ers(rc),
+                lat[nl - 1]);
+        if (atomic_load(&r.done))
+            break;
+        usleep(5000);
+    }
+    pthread_join(th, NULL);
+    tsdbc_close(r.c);
+    tsdbc_close(ci);
+    if (r.rc != 0 || r.rows != FL_BIG)
+        die("the slow reader through %d: %s, %" PRIu64 " rows of %d", Y, ers(r.rc), r.rows, FL_BIG);
+    if (r.ms < 3000)
+        die("the slow reader took %" PRIu64 " ms: not slow enough to hold the owner's worker", r.ms);
+    qsort(lat, nl, sizeof lat[0], fl_cmp);
+    uint64_t p99 = lat[nl * 99 / 100], mx = lat[nl - 1];
+    if (nl < 50)
+        die("only %zu inserts beside the slow reader", nl);
+    if (p99 > 300)
+        die("inserts through %d to %d beside a slow reader (%" PRIu64 " ms, --fwd-workers 1): p99 %" PRIu64
+            " ms, max %" PRIu64 " ms over %zu",
+            Y, X, r.ms, p99, mx, nl);
+    printf("  a slow reader of %d rows through %d (%" PRIu64 " ms) beside %zu inserts to the same owner %d: insert "
+           "p50 %" PRIu64 " ms, p99 %" PRIu64 " ms, max %" PRIu64 " ms\n",
+           FL_BIG, Y, r.ms, nl, X, lat[nl / 2], p99, mx);
+
+    /* g. X and Y forward to each other: writes to the other's volume, reads of 5 chunks from it */
+    atomic_int done = 0;
+    struct fl_peer pp[8];
+    pthread_t pt[8];
+    for (int k = 0; k < 8; k++) {
+        int s = k < 4 ? X : Y;
+        pp[k] = (struct fl_peer){.s = s, .k = k % 4, .big = s == X ? bigy : bigx, .done = &done};
+        snprintf(pp[k].vol, sizeof pp[k].vol, "%s", s == X ? vy : vx);
+        if (pthread_create(&pt[k], NULL, fl_peer_run, &pp[k]) != 0)
+            die("pthread_create");
+    }
+    uint64_t t0 = now_ms();
+    while (atomic_load(&done) < 8) {
+        if (now_ms() - t0 > 90000) {
+            for (int k = 0; k < 8; k++)
+                fprintf(stderr, "  client %d on %d: %d of 200 rounds\n", k, pp[k].s, pp[k].iters);
+            die("servers %d and %d forwarding to each other (--workers 2) did not finish in 90 s", X, Y);
+        }
+        usleep(20000);
+    }
+    uint64_t took = now_ms() - t0;
+    for (int k = 0; k < 8; k++) {
+        pthread_join(pt[k], NULL);
+        if (pp[k].rc)
+            die("client %d on %d forwarding to %d: its %s after %d rounds: %s", k, pp[k].s, pp[k].s == X ? Y : X,
+                pp[k].what, pp[k].iters, pp[k].rc < -1000000 ? "a short read" : ers(pp[k].rc));
+    }
+    stop_all();
+    printf("  servers %d and %d forwarding to each other (8 clients, --workers 2): 1,600 inserts and 40 reads of 4.8 MB "
+           "in %" PRIu64 " ms\n",
+           X, Y, took);
+}
+
 
 /* promoteslow (review F3): a promotion that takes longer than the 3 s after which the Raft leader takes a record leader
  * whose driver does not lead for deposed (leader_deposed: a fence nobody followed up). Every server's swap to the writer
@@ -9851,7 +10820,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

@@ -169,6 +169,7 @@ const char *auth_test_nonce;
 static const auth_group_ops *group;
 static pthread_cond_t group_cv;
 static uint64_t group_applied, group_pushes;
+static _Atomic uint64_t group_applied_pub; /* group_applied, for auth_users_applied */
 /* TSDB_AUTH_MUTANT (tests only): authlocalusers (a cluster node reads its root's USERS), adminlocal (an admin op is
  * answered without reaching the group), loginbeforecatchup (the restart barrier ignored), barrierifempty (the barrier
  * holds only while the copy has no users: a restarted server's copy from its snapshot lets logins in) */
@@ -467,6 +468,7 @@ static int on_group_users(void *arg, const struct cluster_user_rec *u, uint32_t 
             rc = publish();
         if (rc == 0) {
             group_applied = applied;
+            atomic_store_explicit(&group_applied_pub, applied, memory_order_relaxed);
             group_pushes++;
             pthread_cond_broadcast(&group_cv);
         }
@@ -914,6 +916,24 @@ int auth_fresh(auth_conn *a)
     }
     return 0;
 }
+
+int auth_check_as(auth_conn *a, uint32_t uid)
+{
+    pthread_mutex_lock(&auth_mu);
+    auth_user *au = au_get(uid);
+    pthread_mutex_unlock(&auth_mu);
+    if (!au)
+        return TSDB_ERR_DENIED;
+    au_put(a->au);
+    a->au = au;
+    a->state = AS_IN;
+    a->last_id = TSDB_SID_NONE;
+    return 0;
+}
+
+uint32_t auth_uid(const auth_conn *a) { return a->au ? a->au->uid : 0; }
+
+uint64_t auth_users_applied(void) { return atomic_load_explicit(&group_applied_pub, memory_order_relaxed); }
 
 static bool enough(uint8_t have, uint8_t need) { return need == NEED_ANY ? (have & R_EVERY) != 0 : (have & need) == need; }
 

@@ -1102,6 +1102,12 @@ static struct {
     int hold_raft;       /* TSDB_CLUSTER_TEST hold_raft_file=1: the Raft core is neither ticked nor given a message while
                           * <state-dir>/holdraft exists (heartbeats go on: test_cluster users widens a catch-up with it) */
     char holdraftfile[1100];
+    int hold_copy;       /* TSDB_CLUSTER_TEST hold_copy_file=1: no new metadata copy is published while <state-dir>/holdcopy
+                          * exists (test_cluster fwddepose: an entry node's copy names a leader deposed since) */
+    char holdcopyfile[1100];
+    int hold_users;      /* TSDB_CLUSTER_TEST hold_users_file=1: the users watch is given nothing while
+                          * <state-dir>/holdusers exists (test_cluster forward: an owner whose users lag the entry's) */
+    char holdusersfile[1100];
     int users_probe;     /* TSDB_CLUSTER_TEST users_probe=1: a users watch that writes <state-dir>/userswatch, and drops a
                           * user named probe-drop through cluster_user_propose from another thread (test_cluster users) */
     unsigned sync_delay_ms; /* TSDB_CLUSTER_TEST sync_delay_ms=N: the worker waits N ms before each sync round */
@@ -1340,6 +1346,10 @@ static void test_knobs(void)
             C.hold_opens = v != 0;
         else if (sscanf(p, "hold_raft_file=%llu", &v) == 1)
             C.hold_raft = v != 0;
+        else if (sscanf(p, "hold_copy_file=%llu", &v) == 1)
+            C.hold_copy = v != 0;
+        else if (sscanf(p, "hold_users_file=%llu", &v) == 1)
+            C.hold_users = v != 0;
         else if (sscanf(p, "users_probe=%llu", &v) == 1)
             C.users_probe = v != 0;
         else if (sscanf(p, "hold_isr_file=%llu", &v) == 1)
@@ -1967,7 +1977,7 @@ static void copy_publish(void)
 {
     if (cc_retired)
         cc_reclaim();
-    if (!C.sm.initialised)
+    if (!C.sm.initialised || (C.hold_copy && access(C.holdcopyfile, F_OK) == 0))
         return;
     uint32_t self = cl_mutant() == CLM_SELFONE ? 1 : C.have_node ? C.id : 0;
     struct cc_snap *cur = atomic_load(&cc_cur); /* ours: the published reference is the cluster thread's */
@@ -2228,6 +2238,7 @@ static cluster_users_fn g_uwatch;
 static void *g_uwatch_arg;
 static atomic_int g_uw_new;
 static atomic_int g_users_ok; /* cluster_users_caught_up */
+static _Atomic uint64_t g_users_through; /* cluster_users_through: C.uw_at, for other threads */
 /* where cluster_user_propose sends: the Raft leader's peer address as this server last knew it ("" none) */
 static pthread_mutex_t ul_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_ul_addr[META_ADDR_MAX];
@@ -4039,6 +4050,8 @@ static int users_probe_watch(void *arg, const struct cluster_user_rec *u, uint32
  * the change), and before the leader answers waiting user ops. */
 static void users_push(void)
 {
+    if (C.hold_users && access(C.holdusersfile, F_OK) == 0)
+        return; /* a test's lagging watch: nothing given, cluster_users_through stays where it was */
     uint64_t umax = 0;
     for (uint32_t i = 0; i < C.sm.nusers; i++)
         if (C.sm.users[i].version > umax)
@@ -4068,9 +4081,13 @@ static void users_push(void)
         C.uw_max = umax;
     }
     /* a watch set meanwhile (g_uw_new) has not been given these yet */
-    if (taken && !atomic_load(&g_uw_new))
+    if (taken && !atomic_load(&g_uw_new)) {
         C.uw_at = C.sm.applied;
+        atomic_store_explicit(&g_users_through, C.uw_at, memory_order_release);
+    }
 }
+
+uint64_t cluster_users_through(void) { return atomic_load_explicit(&g_users_through, memory_order_acquire); }
 
 /* the applied index member `id` last reported (its heartbeat; this server's own copy for itself), 0 never */
 static uint64_t member_applied(uint32_t id)
@@ -6383,6 +6400,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.stallfile, sizeof C.stallfile, "%s/stall", C.metadir);
     snprintf(C.holdopensfile, sizeof C.holdopensfile, "%s/holdopens", C.metadir);
     snprintf(C.holdraftfile, sizeof C.holdraftfile, "%s/holdraft", C.metadir);
+    snprintf(C.holdcopyfile, sizeof C.holdcopyfile, "%s/holdcopy", C.metadir);
+    snprintf(C.holdusersfile, sizeof C.holdusersfile, "%s/holdusers", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
     snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);

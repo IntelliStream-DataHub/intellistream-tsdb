@@ -14,6 +14,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* one peer this server forwarded requests to (S2-2) */
+typedef struct metrics_fwd_peer {
+    uint32_t peer;
+    uint64_t frames, bytes;
+    double p50_us, p99_us; /* hop latency: send to the reply's last byte */
+} metrics_fwd_peer;
+
 typedef struct metrics_cfg {
     tsdb *db;
     int listen_fd;           /* bound and listening; metrics_start takes it over */
@@ -23,6 +30,7 @@ typedef struct metrics_cfg {
     size_t (*workers)(void); /* worker threads running now (base plus extra) */
     size_t (*request_memory)(void); /* bytes counted against --max-request-memory now */
     size_t request_memory_limit;    /* --max-request-memory in bytes */
+    size_t (*fwd_peers)(metrics_fwd_peer *out, size_t cap); /* NULL: not a cluster server */
 } metrics_cfg;
 
 /* Starts the metrics thread. Returns 0, or a negative errno. */

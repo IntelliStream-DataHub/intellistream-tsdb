@@ -110,6 +110,8 @@ cfg bad.properties 'storage.dir = /x' 'server.port = seventy'
 refused "bad number" 'bad.properties:2: .*server.port' "$B/tsdbd" --config "$dir/bad.properties" --check-config
 cfg badb.properties 'storage.verify.checksums = maybe'
 refused "bad boolean" 'badb.properties:1: .*storage.verify.checksums' "$B/tsdbd" --config "$dir/badb.properties" --check-config
+cfg agemax.properties 'storage.dir = /x' 'cluster.fwd.max.age = 3000'
+refused "fwd max age past the clients' 3 s floor" 'agemax.properties:2.*from 1 to 2000' "$B/tsdbd" --config "$dir/agemax.properties" --check-config
 cfg bade.properties 'server.io = kqueue'
 refused "bad enum" 'bade.properties:1: .*server.io' "$B/tsdbd" --config "$dir/bade.properties" --check-config
 cfg badd.properties 'server.send.timeout = 5 parsecs'
