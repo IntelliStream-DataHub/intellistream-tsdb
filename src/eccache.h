@@ -26,6 +26,20 @@
  * snapshot's granules with no engine lock held (the audit is in tests/test_seam.c's header).
  *
  * Residency (statistics): the cached bytes of the part's object in a range (eccache_resident), never its map.
+ *
+ * Prefetch (R8 D19, r8p-prefetch): a miss that continues a sequential walk (the granule after the last one a miss read
+ * or read ahead, in the same series and part) reads the next N granules of that series with it, in one range read of
+ * the object; N starts at 4 and doubles with each miss that continues the walk, up to a cap (32). The granules read
+ * ahead are entries like any other, LOADING and pinned by the reader that reads them, so a second reader waits for them
+ * instead of reading them again, and each is checked against its index crc before it turns READY: one that fails is
+ * dropped silently (its own miss later reads it alone, with the second read without RAW, and refuses it as CORRUPT),
+ * and a range read that fails drops the whole window and reads the demanded granule alone, as before. Bytes read ahead
+ * and not yet used are held under a quarter of the budget, never more than 4 MiB per read; making room evicts from the
+ * cold end, never a pinned entry. The window stops at a granule that is cached or loading, at another series, at a gap
+ * between offsets and at the end of the part's granules. Counters: prefetched (granules read ahead and cached), used
+ * (of those, hit), wasted (left the cache unused), dropped (failed their check or their read). The walks are tracked in
+ * a few slots per cache (oid, the next index, N), so concurrent scans of other objects or series do not reset each
+ * other unless more than 16 run at once.
  */
 #ifndef TSDB_ECCACHE_H
 #define TSDB_ECCACHE_H
@@ -81,18 +95,35 @@ typedef struct eccache_counters {
     uint64_t obj_opens, obj_closes; /* chunk_obj_open / chunk_obj_close */
     uint64_t objs_open, fds_open, fds_peak; /* now, and the highest count of fds the open objects held */
     uint64_t budget, fd_budget;
+    uint64_t reads;                 /* range reads of objects (every obj_read: misses, second reads, windows) */
+    uint64_t pf_reads;              /* of those, reads that carried granules ahead of the one asked for */
+    uint64_t prefetched, pf_used, pf_wasted, pf_dropped; /* granules read ahead: cached, hit, left unused, refused */
+    uint64_t pf_bytes, pf_peak, pf_budget; /* bytes read ahead and not yet used (cost, as bytes), highest, budget */
+    uint64_t pf_call_peak;          /* the longest window read, in bytes (since eccache_test_prefetch_call) */
 } eccache_counters;
 void eccache_get_counters(struct tier *t, eccache_counters *out);
 /* Budgets for tests (bytes; fds). The fd budget counts the chunk fds of the open objects (k' + m each at most). */
 void eccache_test_budget(struct tier *t, uint64_t bytes);
 void eccache_test_fd_budget(struct tier *t, uint64_t fds);
+/* The prefetch cap in granules per read (0: off; the default is ECCACHE_PF_CAP); resets the walks. */
+#define ECCACHE_PF_CAP 32
+void eccache_test_prefetch(struct tier *t, unsigned cap);
+/* The bytes of one window's range read at most (0: the default, 4 MiB); resets pf_call_peak. */
+void eccache_test_prefetch_call(struct tier *t, uint64_t bytes);
+/* While above 0, each window's range read fails (UNAVAILABLE) without reading, and the count goes down by one. */
+extern _Atomic int eccache_test_pf_fail;
+/* Pins the READY entry of (oid, off) as a reader does (NULL: none); eccache_test_unpin lets go of it. */
+void *eccache_test_pin(struct tier *t, const uint8_t oid[16], uint64_t off);
+void eccache_test_unpin(struct tier *t, void *entry);
 /* Empties the cache of what no reader holds and closes every object no reader holds (a cold cache). */
 void eccache_test_drop(struct tier *t);
 /* Empties the cache of what no reader holds; the objects stay open. */
 void eccache_test_drop_entries(struct tier *t);
 /* Called (when set) after an object's open, before it is listed open, and after a granule's fill, before it is listed
- * READY: a test forgets the object there to run its race without threads. */
-enum { ECC_HOOK_OPENED = 1, ECC_HOOK_FILLED };
+ * READY; for a window read ahead, after its granules are chosen, before they are listed (PFPLAN), and after its range
+ * read, before its granules are listed READY (PFREAD): a test forgets the object there to run its race without
+ * threads. No lock of the cache is held. */
+enum { ECC_HOOK_OPENED = 1, ECC_HOOK_FILLED, ECC_HOOK_PFPLAN, ECC_HOOK_PFREAD };
 extern void (*eccache_test_hook)(struct tier *t, int where, const uint8_t oid[16]);
 
 /* r7-seam's test hook (r7-keep, r7-gc, r7-oracle use it): encodes the bytes of p, a listed .part of db, into the
@@ -119,6 +150,12 @@ enum {
     ECC_MUT_RETRYERR,  /* seamretryerr: a RAW read that failed is read again whole (double I/O while a store is away) */
     ECC_MUT_KEEPSTALE, /* seamkeepstale: an object a read saw degraded stays open (a healed chunk is never read) */
     ECC_MUT_FORGETNOOP, /* forgetnoop: eccache_forget does nothing */
+    ECC_MUT_PFNOCHECK,  /* prefetchnocheck: granules read ahead turn READY without their crc check */
+    ECC_MUT_PFEVICTPINNED, /* prefetchevictpinned: the room made for a window evicts pinned entries too */
+    ECC_MUT_PFNODOUBLE,    /* prefetchnodouble: the window stays at 4 granules, never grows to the cap */
+    ECC_MUT_PFDUPKEY,      /* prefetchdupkey: a window does not stop at a granule already cached (two entries, one key) */
+    ECC_MUT_PFFORGETLIVE,  /* prefetchforgetlive: a window forgotten during its read is cached all the same */
+    ECC_MUT_PFNOFALLBACK,  /* prefetchnofallback: a window's failed read fails the granule asked for */
 };
 extern int eccache_mutant;
 #endif

@@ -27,10 +27,20 @@
  * run meets another object's bytes and the len/crc check of a hit refuses them; that check, not the key, is what
  * kills it), seamnorecheck (case_bad's self-consistent wrong object decodes), seamretryerr (case_down counts second
  * reads after UNAVAILABLE), seamkeepstale (case_heal reads the damaged inode again), forgetnoop (case_heal's
- * eccache_reopen and case_forget). An object closed under a reader (case_threads with an fd budget of 8) is found by
- * ASan (make asan), not by a plain run.
- * Not here: tsdb_query_multi (volumes.c, the same engine queries per series) and the statistics' byte columns of an
- * .ec part (eccache_part_bytes is the map's length until r7-ecfile gives the object its own).
+ * eccache_reopen and case_forget), prefetchnocheck (case_prefetch's damaged granule read ahead is cached unchecked:
+ * nothing dropped, nothing refused), prefetchevictpinned (case_prefetch's pinned entry is evicted to make room for a
+ * window), prefetchnodouble (case_prefetch's exact read counts), prefetchdupkey (step 6: an entry too many),
+ * prefetchforgetlive (step 7: bytes cached with no entry), prefetchnofallback (step 8: the scan fails). An object closed under a reader (case_threads with an fd budget of 8) is found by ASan (make asan), not by
+ * a plain run.
+ *
+ * Prefetch (R8 D19, src/eccache.h) is on in every case (the default) but where a case turns it off; case_prefetch
+ * compares the range reads of a long scan off and on (exact counts, the window growing to its cap), a small budget, a
+ * pinned entry, a damaged granule read ahead, a walk's stop at its series' end and at a cached granule, a window
+ * wasted by a range query, the object forgotten during a window, a window's failed read and its byte limit. case_multi: tsdb_query_multi over .ec and plain parts of two volumes (one cut of each) equals the same calls
+ * one series at a time, at 4 threads and at 1, with prefetch on and off, with series ahead of the head deferred by a
+ * small memory budget and not, and a series with a damaged granule CORRUPT in every call.
+ * Not here: the statistics' byte columns of an .ec part (eccache_part_bytes is the map's length until r7-ecfile gives
+ * the object its own).
  */
 #include "internal.h"
 #include "chunk.h"
@@ -130,6 +140,10 @@ static int h_open(h *x, const char *dir, const char *extra)
     unsetenv("TSDB_TEST_TIER_I_KNOW");
     if (rc)
         return rc;
+    /* no settles here: the rows are from 1970 and merge_threads = 0, so the settle thread would settle every day a
+     * second after it is written (settle_poll_ms) and swap the parts the cases attach by hand and hold pointers to
+     * (a slow build, TSan, got there first: attaches failed and case_equal read a freed part) */
+    ecsettle_tier_quiesce(x->t);
     rc = h_eng_open(x, dir);
     if (rc) {
         tier_put(x->t);
@@ -1132,6 +1146,610 @@ static void case_fds(void)
     h_close(&x);
 }
 
+/* ------------------------------------------------------------ prefetch (R8 D19) */
+
+static void raw_all(eng *db, uint32_t s, int type, int64_t lo, int64_t hi, buf *o, int *rc)
+{
+    rawctx r = {o, (int)type_width(type)};
+    *rc = eng_query_raw_ex(db, s, lo, hi, false, 0, raw_fn, &r);
+}
+
+static bool raw_same(eng *db, uint32_t s, int type, int64_t lo, int64_t hi, const buf *want, const char *what)
+{
+    buf o = {0};
+    int rc;
+    raw_all(db, s, type, lo, hi, &o, &rc);
+    bool same = rc == 0 && o.n == want->n && memcmp(o.b, want->b, want->n) == 0;
+    if (!same)
+        fprintf(stderr, "test_seam: prefetch: %s: rc %d, %zu bytes against %zu\n", what, rc, o.n, want->n);
+    free(o.b);
+    return same;
+}
+
+/* The reads and the granules read ahead of a cold walk over c granules of one series in one part, by the rule of
+ * src/eccache.h (no window at the walk's first miss, then 4, doubling to the cap); *maxw: the widest window. */
+static uint64_t pf_sim(uint32_t c, uint64_t *ahead, unsigned *maxw)
+{
+    uint64_t r = 0;
+    unsigned w = 0;
+    for (uint32_t i = 0; i < c;) {
+        unsigned k = 0;
+        if (i > 0) {
+            w = w ? MIN(2 * w, ECCACHE_PF_CAP) : 4;
+            k = MIN(w, c - i - 1);
+        }
+        r++;
+        *ahead += k;
+        *maxw = MAX(*maxw, k);
+        i += 1 + k;
+    }
+    return r;
+}
+
+/* the same over every part that holds granules of series ser */
+static uint64_t pf_sim_series(part **ps, size_t np, uint32_t ser, uint64_t *ahead, unsigned *maxw)
+{
+    uint64_t r = 0;
+    *ahead = 0;
+    *maxw = 0;
+    for (size_t i = 0; i < np; i++) {
+        uint32_t c = 0;
+        for (uint32_t j = 0; j < ps[i]->ix.n; j++)
+            c += gx_series(ps[i], j) == ser;
+        if (c)
+            r += pf_sim(c, ahead, maxw);
+    }
+    return r;
+}
+
+/* the hook of step 7: forgets the object once, at one point of a window */
+static uint8_t pfh_oid[16];
+static int pfh_where, pfh_done;
+
+static void pf_hook(struct tier *t, int where, const uint8_t oid[16])
+{
+    if (pfh_done || where != pfh_where || memcmp(oid, pfh_oid, 16) != 0)
+        return;
+    pfh_done = 1;
+    eccache_forget(t, 0, oid);
+}
+
+/* A long scan reads fewer ranges with prefetch on and answers the same; a small budget holds; a pinned entry stays
+ * while windows make room (prefetchevictpinned); a granule read ahead whose bytes are wrong is dropped and refused
+ * as CORRUPT at its own read (prefetchnocheck: it would be cached unchecked, nothing dropped, nothing refused). */
+static void case_prefetch(void)
+{
+    char dir[800], log[800];
+    snprintf(dir, sizeof dir, "%s/pf", base);
+    snprintf(log, sizeof log, "%s/pf.log", base);
+    h x;
+    CHECK(h_open(&x, dir, NULL) == 0);
+    if (!x.db)
+        return;
+    enum { DAYS = 4, PER = 160000 }; /* 0.54 s apart: dense, so a granule per hour, 24 per part */
+    enum { NE = 576000, NQ = 65536 }; /* pe: 0.15 s apart in day 0, 3 granules an hour, 72; qa, qb: 8 granules each */
+    const int64_t HOUR = 3600000;
+    const char *names[3] = {"pa", "pb", "pd"};
+    const int ty[3] = {TSDB_FLOAT32, TSDB_FLOAT64, TSDB_FLOAT32};
+    uint32_t s[3];
+    size_t n = (size_t)DAYS * PER;
+    int64_t *ts = malloc(n * 8);
+    uint8_t *v = malloc(n * 8);
+    for (int k = 0; k < 3; k++) {
+        CHECK(eng_series(x.db, names[k], ty[k], &s[k]) == 0);
+        for (size_t i = 0; i < n; i++) {
+            ts[i] = (int64_t)i * 540 + (int64_t)(xs() % 100);
+            double d = 20 + (double)(i % 7200) / 360.0 + (double)(xs() % 1000) / 100.0;
+            if (ty[k] == TSDB_FLOAT32) {
+                float f = (float)d;
+                memcpy(v + i * 4, &f, 4);
+            } else {
+                memcpy(v + i * 8, &d, 8);
+            }
+        }
+        CHECK(eng_insert_series(x.db, ty[k], s[k], ts, v, n) == 0);
+    }
+    free(ts);
+    free(v);
+    /* pe: one part long enough for the window to reach its cap; qa and qb: one part of the two series, in one insert */
+    ts = malloc((size_t)NE * 8);
+    v = malloc((size_t)NE * 8);
+    uint32_t se, sq[2], *qser = malloc((size_t)2 * NQ * 4);
+    CHECK(eng_series(x.db, "pe", TSDB_FLOAT32, &se) == 0 && eng_series(x.db, "qa", TSDB_FLOAT32, &sq[0]) == 0 &&
+          eng_series(x.db, "qb", TSDB_FLOAT32, &sq[1]) == 0);
+    for (size_t i = 0; i < NE; i++) {
+        ts[i] = (int64_t)i * 150 + (int64_t)(xs() % 50);
+        float f = (float)(10 + (double)(i % 9000) / 900.0 + (double)(xs() % 100) / 100.0);
+        memcpy(v + i * 4, &f, 4);
+    }
+    CHECK(eng_insert_series(x.db, TSDB_FLOAT32, se, ts, v, NE) == 0);
+    for (size_t i = 0; i < 2 * (size_t)NQ; i++) {
+        qser[i] = sq[i / NQ];
+        ts[i] = (int64_t)(i % NQ) * 1300 + (int64_t)(xs() % 100);
+        float f = (float)(5 + (double)(xs() % 10000) / 100.0);
+        memcpy(v + i * 4, &f, 4);
+    }
+    CHECK(eng_insert(x.db, TSDB_FLOAT32, qser, ts, v, 2 * (size_t)NQ) == 0);
+    free(qser);
+    free(ts);
+    free(v);
+    CHECK(eng_flush(x.db) == 0);
+    buf want[3] = {{0}}, wday[DAYS] = {{0}}, wa[DAYS] = {{0}}, we = {0}, wq = {0}, wa2h = {0}, wa5 = {0}, wa12h = {0};
+    int rc;
+    for (int d = 0; d < DAYS; d++) {
+        raw_all(x.db, s[0], ty[0], d * DAY, (d + 1) * DAY - 1, &wa[d], &rc);
+        CHECK(rc == 0 && wa[d].n > 0);
+    }
+    raw_all(x.db, se, TSDB_FLOAT32, INT64_MIN, INT64_MAX, &we, &rc);
+    CHECK(rc == 0);
+    raw_all(x.db, sq[0], TSDB_FLOAT32, INT64_MIN, INT64_MAX, &wq, &rc);
+    CHECK(rc == 0);
+    raw_all(x.db, s[0], ty[0], 0, 2 * HOUR - 1, &wa2h, &rc);
+    CHECK(rc == 0);
+    raw_all(x.db, s[0], ty[0], 5 * HOUR, 6 * HOUR - 1, &wa5, &rc);
+    CHECK(rc == 0);
+    raw_all(x.db, s[0], ty[0], DAY, DAY + 2 * HOUR - 1, &wa12h, &rc);
+    CHECK(rc == 0);
+    for (int k = 0; k < 3; k++) {
+        raw_all(x.db, s[k], ty[k], INT64_MIN, INT64_MAX, &want[k], &rc);
+        CHECK(rc == 0 && want[k].n > 0);
+    }
+    for (int d = 0; d < DAYS; d++) {
+        raw_all(x.db, s[2], ty[2], d * DAY, (d + 1) * DAY - 1, &wday[d], &rc);
+        CHECK(rc == 0);
+    }
+    /* every part through the seam; pd's day 1 from a copy with a byte of granule 3's values flipped */
+    part *ps[MAXP];
+    size_t np = list_parts(x.db, ps, MAXP);
+    part *pb0 = NULL, *pq = NULL, *pa[DAYS] = {NULL};
+    int damaged = 0;
+    for (size_t i = 0; i < np; i++) {
+        if (ps[i]->ix.n == 0)
+            continue;
+        uint32_t ser = gx_series(ps[i], 0);
+        if (ser == s[2] && ps[i]->partition == 1 && ps[i]->ix.n >= 8 && !damaged) {
+            granule g;
+            gx_load(ps[i], 3, GW_LOC, &g);
+            uint8_t *cp = malloc(ps[i]->map_len);
+            memcpy(cp, ps[i]->map, ps[i]->map_len);
+            cp[g.off + g.ts_len + g.val_len / 2] ^= 0x10;
+            CHECK(ec_test_attach_from(x.db, ps[i], cp, NULL) == 0);
+            free(cp);
+            damaged++;
+        } else {
+            CHECK(ec_test_attach(x.db, ps[i], NULL) == 0);
+            if (ser == s[1] && ps[i]->partition == 0)
+                pb0 = ps[i];
+            if (ser == s[0] && ps[i]->partition < DAYS)
+                pa[ps[i]->partition] = ps[i];
+            if (ser == sq[0] && gx_series(ps[i], ps[i]->ix.n - 1) == sq[1])
+                pq = ps[i];
+            if (ser == s[0])
+                CHECK(ps[i]->ix.n >= 20); /* hour cuts: the walks are long */
+        }
+    }
+    CHECK(damaged == 1 && pb0 != NULL && pq != NULL);
+    for (int d = 0; d < DAYS; d++)
+        CHECK(pa[d] != NULL);
+    if (!pq || !pa[0] || !pa[1] || !pa[2] || !pa[3]) {
+        h_close(&x);
+        return;
+    }
+    eccache_counters k0, k1, k2;
+
+    /* 1: the scan, off and on */
+    eccache_test_prefetch(x.t, 0);
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], INT64_MIN, INT64_MAX, &want[0], "scan, prefetch off"));
+    eccache_get_counters(x.t, &k1);
+    uint64_t r_off = k1.reads - k0.reads, g_off = k1.misses - k0.misses;
+    CHECK(r_off == g_off && k1.prefetched == k0.prefetched && k1.pf_reads == k0.pf_reads);
+    eccache_test_prefetch(x.t, ECCACHE_PF_CAP);
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], INT64_MIN, INT64_MAX, &want[0], "scan, prefetch on"));
+    eccache_get_counters(x.t, &k1);
+    uint64_t r_on = k1.reads - k0.reads, pf = k1.prefetched - k0.prefetched, sim_pf;
+    unsigned maxw;
+    uint64_t sim_r = pf_sim_series(ps, np, s[0], &sim_pf, &maxw);
+    CHECK(r_on == sim_r && pf == sim_pf); /* 4 reads a part of 24 granules: 0; 1 + 2..5; 6 + 7..14; 15 + 16..23 */
+    CHECK(r_on * 5 <= r_off);
+    CHECK(pf > 0 && (k1.misses - k0.misses) + pf == g_off); /* every granule read once, by a miss or ahead */
+    CHECK(k1.pf_used - k0.pf_used == pf && k1.pf_wasted == k0.pf_wasted && k1.pf_dropped == k0.pf_dropped);
+    CHECK(k1.pf_bytes == 0 && k1.pf_peak <= k1.pf_budget && k1.pf_reads - k0.pf_reads > 0);
+    CHECK(raw_same(x.db, s[0], ty[0], INT64_MIN, INT64_MAX, &want[0], "scan, warm"));
+    eccache_get_counters(x.t, &k2);
+    CHECK(k2.reads == k1.reads); /* all of it cached */
+    printf("test_seam: prefetch: a scan of %" PRIu64 " granules in %" PRIu64 " reads (%" PRIu64 " without), %" PRIu64
+           " read ahead\n", g_off, r_on, r_off, pf);
+    /* the window grows to its cap: pe's part of 72 granules (0; 1 + 4; 6 + 8; 15 + 16; 32 + 32; 65 + 6) */
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, se, TSDB_FLOAT32, INT64_MIN, INT64_MAX, &we, "pe, prefetch on"));
+    eccache_get_counters(x.t, &k1);
+    sim_r = pf_sim_series(ps, np, se, &sim_pf, &maxw);
+    CHECK(maxw == ECCACHE_PF_CAP && k1.reads - k0.reads == sim_r && k1.prefetched - k0.prefetched == sim_pf);
+    CHECK(k1.pf_used - k0.pf_used == sim_pf && k1.pf_bytes == 0);
+    printf("test_seam: prefetch: %" PRIu64 " granules of one part in %" PRIu64 " reads, the widest window %u\n",
+           k1.misses - k0.misses + sim_pf, k1.reads - k0.reads, maxw);
+
+    /* 2: a budget of 24 average entries (6 read ahead), a pinned entry at the cold end */
+    uint64_t avg = k2.entries ? k2.bytes / k2.entries : 1;
+    eccache_test_drop(x.t);
+    eccache_test_budget(x.t, 24 * avg);
+    eccache_test_prefetch(x.t, ECCACHE_PF_CAP); /* the peak from here */
+    granule gp;
+    gx_load(pb0, 0, GW_LOC, &gp);
+    buf o = {0};
+    raw_all(x.db, s[1], ty[1], 0, 3600000, &o, &rc); /* pb's first granule, now cached */
+    free(o.b);
+    CHECK(rc == 0);
+    uint64_t plen = (uint64_t)gp.ts_len + gp.val_len;
+    void *pin = eccache_test_pin(x.t, pb0->ec->rec.oid, gp.off);
+    CHECK(pin != NULL);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], INT64_MIN, INT64_MAX, &want[0], "scan, small budget"));
+    eccache_get_counters(x.t, &k1);
+    uint64_t res = eccache_resident(pb0, gp.off, plen);
+    CHECK(res == plen); /* pinned: never evicted to make room for a window */
+    if (pin && res == plen)
+        eccache_test_unpin(x.t, pin); /* (a pinned entry the mutant evicted was freed: left alone) */
+    CHECK(k1.evictions > k0.evictions && k1.pf_reads > k0.pf_reads);
+    CHECK(k1.pf_peak <= k1.pf_budget && k1.bytes <= k1.budget);
+    CHECK(raw_same(x.db, s[1], ty[1], INT64_MIN, INT64_MAX, &want[1], "pb, small budget"));
+    eccache_get_counters(x.t, &k2);
+    CHECK(k2.pf_peak <= k2.pf_budget && k2.bytes <= k2.budget);
+    printf("test_seam: prefetch: budget %" PRIu64 " (%" PRIu64 " ahead): peak %" PRIu64 " ahead, %" PRIu64
+           " used, %" PRIu64 " wasted, the pinned entry kept\n", k2.budget, k2.pf_budget, k2.pf_peak, k2.pf_used,
+           k2.pf_wasted);
+    eccache_test_budget(x.t, 64ull << 20);
+
+    /* 3: the damaged granule 3 of pd's day 1 is in the window of granule 1's miss: dropped, then refused alone */
+    for (int on = 1; on >= 0; on--) {
+        eccache_test_prefetch(x.t, on ? ECCACHE_PF_CAP : 0);
+        eccache_test_drop(x.t);
+        eccache_get_counters(x.t, &k0);
+        o = (buf){0};
+        cap_begin(log);
+        raw_all(x.db, s[2], ty[2], DAY, 2 * DAY - 1, &o, &rc);
+        cap_end();
+        free(o.b);
+        eccache_get_counters(x.t, &k1);
+        CHECK(rc == TSDB_ERR_CORRUPT && k1.corrupt > k0.corrupt && k1.retries > k0.retries);
+        CHECK(on ? k1.pf_dropped > k0.pf_dropped && k1.pf_reads > k0.pf_reads : k1.pf_dropped == k0.pf_dropped);
+        char *t = slurp(log);
+        CHECK(strstr(t, "fail its checksum after a decode of whole cells") && strstr(t, "granule 3 "));
+        free(t);
+        for (int d = 0; d < DAYS; d++)
+            if (d != 1)
+                CHECK(raw_same(x.db, s[2], ty[2], d * DAY, (d + 1) * DAY - 1, &wday[d], "pd, other days"));
+    }
+    printf("test_seam: prefetch: a damaged granule read ahead is dropped and refused at its own read: CORRUPT\n");
+    eccache_test_prefetch(x.t, ECCACHE_PF_CAP);
+
+    /* 4: a walk stops at its series' end: a scan of qa reads nothing of qb, the next series of its part */
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, sq[0], TSDB_FLOAT32, INT64_MIN, INT64_MAX, &wq, "qa"));
+    eccache_get_counters(x.t, &k1);
+    uint32_t nqb = 0;
+    for (uint32_t j = 0; j < pq->ix.n; j++)
+        if (gx_series(pq, j) == sq[1]) {
+            granule gj;
+            gx_load(pq, j, GW_LOC, &gj);
+            CHECK(eccache_resident(pq, gj.off, (uint64_t)gj.ts_len + gj.val_len) == 0);
+            nqb++;
+        }
+    CHECK(nqb > 0 && pq->ix.n - nqb >= 8 && k1.prefetched > k0.prefetched);
+    CHECK(k1.pf_used - k0.pf_used == k1.prefetched - k0.prefetched && k1.pf_bytes == 0);
+
+    /* 5: a range query ends a walk early: what it read ahead is wasted when it leaves, its bytes given back */
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], 0, 2 * HOUR - 1, &wa2h, "pa, two hours"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.misses - k0.misses == 2 && k1.prefetched - k0.prefetched == 4 && k1.pf_used == k0.pf_used &&
+          k1.pf_bytes > 0);
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k2);
+    CHECK(k2.pf_wasted - k0.pf_wasted == 4 && k2.pf_bytes == 0 && k2.entries == 0);
+    printf("test_seam: prefetch: two hours of a day read 2 granules and 4 ahead: 4 wasted, their bytes given back\n");
+
+    /* 6: a window stops at a granule already cached: granule 5, read alone first, is a hit of the scan, never read
+     * ahead a second time (one entry per key) */
+    eccache_test_drop(x.t);
+    CHECK(raw_same(x.db, s[0], ty[0], 5 * HOUR, 6 * HOUR - 1, &wa5, "pa, hour 5"));
+    eccache_get_counters(x.t, &k0);
+    CHECK(k0.entries == 1);
+    CHECK(raw_same(x.db, s[0], ty[0], 0, DAY - 1, &wa[0], "pa, day 0 after hour 5"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.entries == pa[0]->ix.n && k1.hits > k0.hits && k1.pf_bytes == 0);
+    CHECK((k1.misses - k0.misses) + (k1.prefetched - k0.prefetched) == pa[0]->ix.n - 1);
+    CHECK(k1.pf_used - k0.pf_used == k1.prefetched - k0.prefetched);
+
+    /* 7: the object forgotten while a window is planned, then while it is read: nothing of it stays cached */
+    for (int where = ECC_HOOK_PFPLAN; where <= ECC_HOOK_PFREAD; where++) {
+        eccache_test_drop(x.t);
+        memcpy(pfh_oid, pa[1]->ec->rec.oid, 16);
+        pfh_where = where;
+        pfh_done = 0;
+        eccache_test_hook = pf_hook;
+        bool same = raw_same(x.db, s[0], ty[0], DAY, DAY + 2 * HOUR - 1, &wa12h, "pa, forgotten during a window");
+        eccache_test_hook = NULL;
+        eccache_get_counters(x.t, &k1);
+        CHECK(same && pfh_done);
+        CHECK(k1.entries == 0 && k1.bytes == 0 && k1.pf_bytes == 0 && eccache_resident(pa[1], 0, pa[1]->map_len) == 0);
+        CHECK(raw_same(x.db, s[0], ty[0], DAY, 2 * DAY - 1, &wa[1], "pa, day 1 after the forget"));
+    }
+    printf("test_seam: prefetch: an object forgotten during a window's plan or read keeps nothing cached\n");
+
+    /* 8: a window's read fails: its granules are dropped, the granule asked for is read alone */
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    atomic_store(&eccache_test_pf_fail, 1);
+    CHECK(raw_same(x.db, s[0], ty[0], 2 * DAY, 3 * DAY - 1, &wa[2], "pa, a window's read failed"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(atomic_load(&eccache_test_pf_fail) == 0 && k1.pf_dropped - k0.pf_dropped == 4 && k1.corrupt == k0.corrupt);
+    atomic_store(&eccache_test_pf_fail, 0);
+
+    /* 9: no window reads more than its bytes allow (4 MiB; lowered here to 3 average granules) */
+    uint64_t gl = 0;
+    for (uint32_t j = 0; j < pa[3]->ix.n; j++) {
+        granule gj;
+        gx_load(pa[3], j, GW_LOC, &gj);
+        gl += (uint64_t)gj.ts_len + gj.val_len;
+    }
+    gl = 3 * gl / pa[3]->ix.n;
+    eccache_test_prefetch_call(x.t, gl);
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], 3 * DAY, 4 * DAY - 1, &wa[3], "pa, short windows"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.pf_reads > k0.pf_reads && k1.pf_call_peak > 0 && k1.pf_call_peak <= gl);
+    printf("test_seam: prefetch: windows of at most %" PRIu64 " bytes: the longest %" PRIu64 "\n", gl,
+           k1.pf_call_peak);
+    eccache_test_prefetch_call(x.t, 0);
+    free(we.b);
+    free(wq.b);
+    free(wa2h.b);
+    free(wa5.b);
+    free(wa12h.b);
+    for (int d = 0; d < DAYS; d++)
+        free(wa[d].b);
+    for (int k = 0; k < 3; k++)
+        free(want[k].b);
+    for (int d = 0; d < DAYS; d++)
+        free(wday[d].b);
+    h_close(&x);
+}
+
+/* ------------------------------------------------------------ tsdb_query_multi over .ec and plain parts */
+
+/* the results, serialised: index, series, status and (status 0) rows or buckets */
+static void put_results(buf *o, const tsdb_series_result *r, size_t n, size_t bw)
+{
+    for (size_t i = 0; i < n; i++) {
+        put(o, &r[i].index, sizeof r[i].index);
+        put(o, &r[i].series, sizeof r[i].series);
+        put(o, &r[i].status, sizeof r[i].status);
+        if (r[i].status)
+            continue;
+        put(o, &r[i].n, sizeof r[i].n);
+        if (bw) {
+            put(o, r[i].buckets, r[i].n * bw);
+        } else {
+            put(o, r[i].ts, r[i].n * 8);
+            put(o, r[i].values.values, r[i].n * 4); /* float32 */
+            if (r[i].values.valid)
+                put(o, r[i].values.valid, (r[i].n + 7) / 8);
+        }
+    }
+}
+
+#define MS 6 /* series: 3 in the root, 3 in a second volume */
+
+static atomic_int multi_deferred;
+static void count_deferred(void *ctx)
+{
+    (void)ctx;
+    atomic_fetch_add(&multi_deferred, 1);
+}
+
+static int multi_run(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *ids, size_t ns, int threads, buf *o,
+                     int *status)
+{
+    size_t bw = q->kind == TSDB_MULTI_BUCKETS ? sizeof(tsdb_bucket) : q->kind == TSDB_MULTI_SPREAD ?
+                sizeof(tsdb_spread_bucket) : 0;
+    tsdb_multi_opts mo = {.threads = threads, .max_held_bytes = 256 << 10, .on_deferred = count_deferred};
+    tsdb_series_result *r = NULL;
+    int rc = tsdb_query_multi_collect(db, q, ids, ns, &mo, &r);
+    if (rc == 0) {
+        put_results(o, r, ns, bw);
+        for (size_t i = 0; i < ns; i++)
+            status[i] = r[i].status;
+        tsdb_series_results_free(r, ns);
+    }
+    return rc;
+}
+
+/* the same, one call per series (index 0 each: rewritten to the series' place) */
+static int multi_single(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *ids, buf *o, int *status)
+{
+    size_t bw = q->kind == TSDB_MULTI_BUCKETS ? sizeof(tsdb_bucket) : q->kind == TSDB_MULTI_SPREAD ?
+                sizeof(tsdb_spread_bucket) : 0;
+    for (int i = 0; i < MS; i++) {
+        tsdb_series_result *r = NULL;
+        int rc = tsdb_query_multi_collect(db, q, &ids[i], 1, NULL, &r);
+        if (rc)
+            return rc;
+        r[0].index = (size_t)i;
+        put_results(o, r, 1, bw);
+        status[i] = r[0].status;
+        tsdb_series_results_free(r, 1);
+    }
+    return 0;
+}
+
+/* One cut of every volume over .ec and plain parts, with prefetch on and off, series ahead of the head under a
+ * small memory budget (multi_defer_bytes, multi_defer_rows lowered: deferred and run again at their turn) and not:
+ * the same answers as one series at a time and as before the attach, but the series with a damaged granule, which
+ * is CORRUPT in every call. */
+static void case_multi(void)
+{
+    char dir[800], vol[800], st[NST][800];
+    snprintf(dir, sizeof dir, "%s/multi", base);
+    snprintf(vol, sizeof vol, "%s/multi_v1", base);
+    char spec[8192];
+    int sn = snprintf(spec, sizeof spec, "k=%d,m=%d,dirs=", K, M);
+    for (int i = 0; i < NST; i++) {
+        snprintf(st[i], sizeof st[i], "%s/mst%d", base, i);
+        CHECK(mkdir(st[i], 0755) == 0);
+        uint8_t id[16];
+        CHECK(chunk_store_init(st[i], NULL, id) == 0);
+        sn += snprintf(spec + sn, sizeof spec - (size_t)sn, "%s%s", i ? ":" : "", st[i]);
+    }
+    snprintf(spec + sn, sizeof spec - (size_t)sn, ",cache_mb=64");
+    tsdb_options opt;
+    tsdb_options_init(&opt);
+    opt.merge_threads = 0;
+    opt.partition_classes = 0;
+    opt.obsolete_part_lifetime_s = 3600;
+    opt.query_threads = 4;
+    opt.request_threads = 4;
+    setenv("TSDB_TEST_TIER", spec, 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+    tsdb *db = NULL;
+    int rc = tsdb_open(dir, &opt, &db);
+    unsetenv("TSDB_TEST_TIER");
+    unsetenv("TSDB_TEST_TIER_I_KNOW");
+    CHECK(rc == 0);
+    if (rc)
+        return;
+    ecsettle_tier_quiesce(tsdb_test_engine(db, 0)->tier); /* no settles: as in h_open */
+    uint32_t vi = 0;
+    CHECK(tsdb_volume_add(db, vol, &vi) == 0 && vi > 0);
+    tsdb_sid ids[MS];
+    enum { DAYS = 3, PER = 40000 }; /* 2.16 s apart: about 5 granules a day */
+    size_t n = (size_t)DAYS * PER;
+    tsdb_sid *sv = malloc(n * sizeof *sv);
+    int64_t *ts = malloc(n * 8);
+    float *v = malloc(n * 4);
+    for (int k = 0; k < MS; k++) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "m%d", k);
+        CHECK((k < MS / 2 ? tsdb_series(db, nm, &ids[k]) : tsdb_series_at(db, nm, vol, &ids[k])) == 0);
+        for (size_t i = 0; i < n; i++) {
+            sv[i] = ids[k];
+            ts[i] = (int64_t)i * 2160 + (int64_t)(xs() % 500);
+            v[i] = (float)(k * 10 + (double)(i % 977) / 7.0 + (double)(xs() % 100) / 10.0);
+        }
+        CHECK(tsdb_insert(db, sv, ts, v, n) == 0);
+    }
+    free(sv);
+    free(ts);
+    free(v);
+    CHECK(tsdb_flush(db) == 0);
+    CHECK(TSDB_SID_VOLUME(ids[MS - 1]) == vi);
+
+    tsdb_multi_query qs[3];
+    memset(qs, 0, sizeof qs);
+    qs[0].kind = TSDB_MULTI_VALUES, qs[0].start = 0, qs[0].end = DAYS * DAY;
+    qs[1].kind = TSDB_MULTI_BUCKETS, qs[1].start = 0, qs[1].end = DAYS * DAY, qs[1].interval_ms = 3600000;
+    qs[2].kind = TSDB_MULTI_SPREAD, qs[2].start = DAY / 3, qs[2].end = DAYS * DAY - 77, qs[2].interval_ms = DAY / 4;
+    buf before[3] = {{0}};
+    int stb[MS];
+    for (int qi = 0; qi < 3; qi++)
+        CHECK(multi_run(db, &qs[qi], ids + 1, MS - 1, 4, &before[qi], stb) == 0); /* all but m0 */
+
+    /* attach: every other part of each volume, and m0's day 1 from a copy with granule 2's values flipped */
+    struct tier *t = tsdb_test_engine(db, 0)->tier;
+    CHECK(t != NULL && tsdb_test_engine(db, vi)->tier == t);
+    int nec = 0, nplain = 0, damaged = 0;
+    for (int vv = 0; vv < 2; vv++) {
+        eng *e = tsdb_test_engine(db, vv ? vi : 0);
+        part *ps[MAXP];
+        size_t np = list_parts(e, ps, MAXP);
+        for (size_t i = 0; i < np; i++) {
+            if (ps[i]->ix.n == 0)
+                continue;
+            if (!vv && gx_series(ps[i], 0) == TSDB_SID_LOCAL(ids[0]) && ps[i]->partition == 1 && ps[i]->ix.n >= 4) {
+                granule g;
+                gx_load(ps[i], 2, GW_LOC, &g);
+                uint8_t *cp = malloc(ps[i]->map_len);
+                memcpy(cp, ps[i]->map, ps[i]->map_len);
+                cp[g.off + g.ts_len + g.val_len / 2] ^= 0x10;
+                CHECK(ec_test_attach_from(e, ps[i], cp, NULL) == 0);
+                free(cp);
+                damaged++;
+                nec++;
+            } else if (i % 2 == 0) {
+                CHECK(ec_test_attach(e, ps[i], NULL) == 0);
+                nec++;
+            } else {
+                nplain++;
+            }
+        }
+    }
+    CHECK(damaged == 1 && nec >= 6 && nplain >= 4);
+
+    size_t save_b = multi_defer_bytes, save_r = multi_defer_rows;
+    char log[800];
+    snprintf(log, sizeof log, "%s/multi.log", base);
+    int runs = 0, deferred[2][2] = {{0}};
+    for (int pf = 0; pf < 2; pf++)
+        for (int small = 0; small < 2; small++)
+            for (int qi = 0; qi < 3; qi++) {
+                int d0 = atomic_load(&multi_deferred);
+                eccache_test_prefetch(t, pf ? ECCACHE_PF_CAP : 0);
+                eccache_test_drop(t);
+                multi_defer_bytes = small ? 4096 : save_b;
+                multi_defer_rows = small ? 1000 : save_r;
+                buf a = {0}, b = {0}, c1 = {0};
+                int sa[MS], sb[MS], sc[MS];
+                cap_begin(log);
+                int ra = multi_run(db, &qs[qi], ids, MS, 4, &a, sa);
+                eccache_test_drop(t);
+                int rc1 = multi_run(db, &qs[qi], ids, MS, 1, &c1, sc);
+                eccache_test_drop(t);
+                int rb = multi_single(db, &qs[qi], ids, &b, sb);
+                cap_end();
+                CHECK(ra == 0 && rb == 0 && rc1 == 0);
+                CHECK(a.n == b.n && memcmp(a.b, b.b, a.n) == 0);   /* one call equals one series at a time */
+                CHECK(a.n == c1.n && memcmp(a.b, c1.b, a.n) == 0); /* at 4 threads and at 1 */
+                CHECK(sa[0] == TSDB_ERR_CORRUPT && sb[0] == TSDB_ERR_CORRUPT && sc[0] == TSDB_ERR_CORRUPT);
+                for (int i = 1; i < MS; i++)
+                    CHECK(sa[i] == 0 && sb[i] == 0 && sc[i] == 0 && stb[i - 1] == 0);
+                /* the other series as before the attach, from a cold cache */
+                eccache_test_drop(t);
+                buf o5 = {0};
+                int s5[MS];
+                CHECK(multi_run(db, &qs[qi], ids + 1, MS - 1, 4, &o5, s5) == 0);
+                CHECK(o5.n == before[qi].n && memcmp(o5.b, before[qi].b, o5.n) == 0);
+                deferred[pf][small] += atomic_load(&multi_deferred) - d0;
+                free(o5.b);
+                free(a.b);
+                free(b.b);
+                free(c1.b);
+                runs++;
+            }
+    multi_defer_bytes = save_b;
+    multi_defer_rows = save_r;
+    CHECK(deferred[0][1] > 0 && deferred[1][1] > 0); /* the small budget deferred series, prefetch on and off */
+    char *lt = slurp(log);
+    CHECK(strstr(lt, "fail its checksum after a decode of whole cells") && strstr(lt, "granule 2 "));
+    free(lt);
+    eccache_counters k;
+    eccache_get_counters(t, &k);
+    CHECK(k.prefetched > 0 && k.pf_reads > 0);
+    printf("test_seam: multi: %d .ec and %d plain parts in 2 volumes, %d runs (prefetch on and off, budget small and "
+           "not, 4 threads and 1, one series at a time): the same answers, the damaged series CORRUPT; %d and %d series "
+           "deferred under the small budget\n", nec, nplain, runs, deferred[0][1], deferred[1][1]);
+    for (int qi = 0; qi < 3; qi++)
+        free(before[qi].b);
+    CHECK(tsdb_close(db) == 0);
+}
+
 static void run(void)
 {
     snprintf(base, sizeof base, "%s/test_seam_%d", scratch, (int)getpid());
@@ -1164,6 +1782,8 @@ static void run(void)
     h_close(&x);
     case_fds();
     case_bad();
+    case_prefetch();
+    case_multi();
     free_objs();
     free(ref.b);
     if (!failures)
@@ -1192,9 +1812,22 @@ int main(int argc, char **argv)
             eccache_mutant = ECC_MUT_KEEPSTALE;
         else if (!strcmp(m, "forgetnoop"))
             eccache_mutant = ECC_MUT_FORGETNOOP;
+        else if (!strcmp(m, "prefetchnocheck"))
+            eccache_mutant = ECC_MUT_PFNOCHECK;
+        else if (!strcmp(m, "prefetchevictpinned"))
+            eccache_mutant = ECC_MUT_PFEVICTPINNED;
+        else if (!strcmp(m, "prefetchnodouble"))
+            eccache_mutant = ECC_MUT_PFNODOUBLE;
+        else if (!strcmp(m, "prefetchdupkey"))
+            eccache_mutant = ECC_MUT_PFDUPKEY;
+        else if (!strcmp(m, "prefetchforgetlive"))
+            eccache_mutant = ECC_MUT_PFFORGETLIVE;
+        else if (!strcmp(m, "prefetchnofallback"))
+            eccache_mutant = ECC_MUT_PFNOFALLBACK;
         else {
             fprintf(stderr, "usage: test_seam [--mutant seamnoverify|seamnoretry|cachekeyoff|seamnorecheck|"
-                            "seamretryerr|seamkeepstale|forgetnoop] [SCRATCH]\n");
+                            "seamretryerr|seamkeepstale|forgetnoop|prefetchnocheck|prefetchevictpinned|prefetchnodouble|"
+                            "prefetchdupkey|prefetchforgetlive|prefetchnofallback] [SCRATCH]\n");
             return 2;
         }
         a += 2;

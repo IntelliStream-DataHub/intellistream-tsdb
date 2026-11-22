@@ -37,6 +37,8 @@
  * collected, or hold bytes no granule read touches (the part's own index). tests/oracle_mutants.sh therefore tries a
  * few seed windows and counts a mutant as caught only by its own line (DIVERGED), never by any failure;
  * test_seam's seamnoretry and test_settle's ecrankdown catch the two bugs deterministically.
+ * B's cache prefetches (R8 D19, on by default): the answers above are with granules read ahead, and a run with 100
+ * .ec parts or more fails if none was.
  */
 #define _GNU_SOURCE
 #include "internal.h"
@@ -249,6 +251,7 @@ typedef struct world {
     /* what the run reached */
     size_t marked, settle_steps, compares, nonempty, failed;
     size_t real_settled, real_steps, unavailable, damaged, downs, retries;
+    size_t prefetched, pf_used; /* granules B's cache read ahead (prefetch is on: src/eccache.h), and used */
 } world;
 
 static const tsdb_type types[NS] = {TSDB_FLOAT32, TSDB_FLOAT64, TSDB_INT64, TSDB_BOOL,
@@ -934,6 +937,18 @@ static void compare(world *w, const char *why)
 
 /* ------------------------------------------------------------------ the walk */
 
+/* B's prefetch counters, added up before each close (a reopen makes a new tier) */
+static void pf_take(world *w)
+{
+    struct eng *e = tsdb_test_engine(w->db[1], 0);
+    if (!e || !e->tier)
+        return;
+    eccache_counters c;
+    eccache_get_counters(e->tier, &c);
+    w->prefetched += c.prefetched;
+    w->pf_used += c.pf_used;
+}
+
 static void run_seed(world *w, const char *scratch, uint64_t seed, int steps)
 {
     memset(w, 0, sizeof *w);
@@ -1004,6 +1019,7 @@ static void run_seed(world *w, const char *scratch, uint64_t seed, int steps)
             what = "drop_before";
         } else if (r < 80) {
             w->retries += tsdb_test_ec_retries(w->db[1], false);
+            pf_take(w);
             close_both(w);
             /* store 0 goes DOWN (moved away) or comes back; while it is away B reads every object around it */
             if (w->down || (w->real && rnd(&w->r) % 4 == 0)) {
@@ -1027,6 +1043,7 @@ static void run_seed(world *w, const char *scratch, uint64_t seed, int steps)
     }
     compare(w, "end");
     w->retries += tsdb_test_ec_retries(w->db[1], false);
+    pf_take(w);
     close_both(w);
     for (int d = 0; d < 2; d++) {
         rmrf(w->dir[d]);
@@ -1077,15 +1094,23 @@ int main(int argc, char **argv)
     world w;
     size_t marked = 0, settle_steps = 0, compares = 0, nonempty = 0;
     size_t real_settled = 0, real_steps = 0, unavailable = 0, damaged = 0, downs = 0, retries = 0;
+    size_t prefetched = 0, pf_used = 0;
     for (uint64_t s = first; s < first + seeds; s++) {
         run_seed(&w, scratch, s, steps);
         marked += w.marked, settle_steps += w.settle_steps, compares += w.compares, nonempty += w.nonempty;
         real_settled += w.real_settled, real_steps += w.real_steps, unavailable += w.unavailable;
         damaged += w.damaged, downs += w.downs, retries += w.retries;
+        prefetched += w.prefetched, pf_used += w.pf_used;
     }
     /* stage 3: a run whose settles never made an .ec part tests the marks only */
     if (real_settled == 0 && !is("nomark")) {
         fprintf(stderr, "test_settle_oracle: no eng_settle made an .ec part (%zu steps)\n", real_steps);
+        return 1;
+    }
+    /* prefetch is on in B (src/eccache.h, the default): a run with many .ec parts whose walks never read ahead did
+     * not test the answers with it (6 seeds of 100 steps: about 1,500 granules read ahead) */
+    if (real_settled >= 100 && prefetched == 0) {
+        fprintf(stderr, "test_settle_oracle: %zu .ec parts and no granule read ahead\n", real_settled);
         return 1;
     }
     /* a run that never settled a part, or never had an answer to compare, proves nothing */
@@ -1117,8 +1142,9 @@ int main(int argc, char **argv)
         printf(" %s %zu/%zu", kstat[k].name, kstat[k].errs, kstat[k].calls);
     printf("\n");
     printf("test_settle_oracle: stage 3: %zu eng_settle steps made %zu .ec parts (%zu refused with store 0 DOWN); store 0 "
-           "went DOWN %zu times, %zu chunks on it damaged, %zu granules read again as whole cells\n",
-           real_steps, real_settled, unavailable, downs, damaged, retries);
+           "went DOWN %zu times, %zu chunks on it damaged, %zu granules read again as whole cells; prefetch on: %zu "
+           "granules read ahead, %zu of them used\n",
+           real_steps, real_settled, unavailable, downs, damaged, retries, prefetched, pf_used);
     return 0;
 #endif
 }
