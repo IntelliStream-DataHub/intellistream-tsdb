@@ -24,10 +24,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "cluster.h"
 #include "peerlink.h"
 #include "../client/tsdb_crypto.h"
+#include "../src/chunk_priv.h"
+#include "../src/internal.h"
 
 #ifdef __ELF__
 extern void cluster_set_chunk_stores(uint32_t n) __attribute__((weak));
@@ -82,11 +85,166 @@ static void check_late(const struct cluster_self *me)
         fprintf(stderr, "tsdbd: chunk server: %s\n", err);
 }
 
+/* ---------------------------------------------------------------- test hook (tests/test_cluster.c `chunksrv`)
+ * TSDB_CHUNKSRV_TEST="put:PEER:DIR" or "check:PEER:DIR" runs once this server's links are up, against member PEER
+ * through two real tsdbd (DIR stages the put files). put: a chunk at epoch 3, every byte read back, PEER's fence of
+ * the volume raised to 5, then a put at 3 and a delete at 4 must be FENCED and the chunk still whole. check (after
+ * PEER was killed with SIGKILL and restarted): the fence is still 5, the chunk reads back whole, a put at 4 is FENCED
+ * (both were durable before their answers). The result is one log line: "chunksrv test: pass MODE" or "... FAIL". */
+enum { ST_VOL = 7, ST_POS = 1 };
+static const uint8_t st_vuuid[16] = {0x5e, 0x1f, 0x7e, 0x57, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+
+struct st_chunk {
+    struct cs_put_meta m;
+    uint8_t *cells;
+    uint64_t *sums;
+    uint64_t ncells, len;
+};
+
+static int st_make(struct st_chunk *c, uint64_t epoch, unsigned tag)
+{
+    memset(c, 0, sizeof *c);
+    c->m.volume = ST_VOL;
+    c->m.epoch = epoch;
+    c->m.pos = ST_POS;
+    memcpy(c->m.vuuid, st_vuuid, 16);
+    for (int i = 0; i < 16; i++)
+        c->m.oid[i] = (uint8_t)(tag * 17 + (unsigned)i);
+    if (chunk_geom_make(&c->m.g, 3, 2, 4096, 4096 * 7 + 123) != 0)
+        return -1;
+    c->ncells = chunk_pos_cells(&c->m.g, ST_POS);
+    c->len = chunk_pos_len(&c->m.g, ST_POS);
+    c->cells = malloc(c->len ? c->len : 1);
+    c->sums = malloc((c->ncells ? c->ncells : 1) * 8);
+    if (!c->cells || !c->sums)
+        return -1;
+    uint64_t r = tag * 2654435761u + 1;
+    for (uint64_t i = 0; i < c->len; i++) {
+        r ^= r << 13, r ^= r >> 7, r ^= r << 17;
+        c->cells[i] = (uint8_t)r;
+    }
+    for (uint64_t i = 0, off = 0; i < c->ncells; i++) {
+        uint64_t l = chunk_pos_cell_len(&c->m.g, ST_POS, i);
+        c->sums[i] = xxh64(c->cells + off, l, 0);
+        off += l;
+    }
+    return 0;
+}
+
+static int st_put(struct chunksrv *cs, uint32_t peer, const char *dir, const struct st_chunk *c)
+{
+    int fd = chunksrv_stage(dir, &c->m.g, c->m.pos, c->cells, c->sums);
+    if (fd < 0)
+        return fd;
+    int rc = chunksrv_put_remote(cs, peer, &c->m, fd, 0, cs_sums_hash(c->sums, c->ncells), 20000);
+    close(fd);
+    return rc;
+}
+
+/* 0 with the answer's rc in *prc (and the fence in *fence for EPOCH, the bytes compared for READ), or the call's */
+static int st_call(struct chunksrv *cs, uint32_t peer, uint8_t op, uint64_t epoch, const struct st_chunk *c,
+                   int32_t *prc, uint64_t *fence, int ms)
+{
+    struct cs_req r = {.op = op, .volume = ST_VOL, .epoch = epoch, .pos = ST_POS};
+    memcpy(r.vuuid, st_vuuid, 16);
+    memcpy(r.oid, c->m.oid, 16);
+    if (op == CS_OP_READ)
+        r.off = 0, r.len = (uint32_t)c->len;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    int rc = chunksrv_call(cs, peer, &r, ms, prc, &body, &bl);
+    if (rc == 0 && *prc == 0 && op == CS_OP_EPOCH) {
+        if (bl != 9)
+            rc = TSDB_ERR_CORRUPT;
+        else
+            for (int i = 7; i >= 0; i--)
+                *fence = *fence << 8 | body[i];
+    }
+    if (rc == 0 && *prc == 0 && op == CS_OP_READ && (bl != c->len || memcmp(body, c->cells, c->len) != 0))
+        rc = TSDB_ERR_CORRUPT;
+    free(body);
+    return rc;
+}
+
+static void selftest(struct chunksrv *cs, const char *spec)
+{
+    char mode[16] = "", dir[512] = "";
+    unsigned peer = 0;
+    int n = 0;
+    if (sscanf(spec, "%15[a-z]:%u:%n", mode, &peer, &n) != 2 || n == 0 || !spec[n]) {
+        fprintf(stderr, "tsdbd: chunksrv test: FAIL bad spec %s\n", spec);
+        return;
+    }
+    snprintf(dir, sizeof dir, "%s", spec + n);
+    const int check = strcmp(mode, "check") == 0;
+    struct st_chunk a = {0}, b = {0};
+    const char *what = "make";
+    int rc = -1;
+    int32_t prc = -1;
+    uint64_t fence = 0;
+    if (st_make(&a, 3, 1) != 0 || st_make(&b, check ? 4 : 3, 2) != 0)
+        goto out;
+    what = "reach the peer"; /* its chunk server may come up after this one's */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while ((rc = st_call(cs, peer, CS_OP_EPOCH, 0, &a, &prc, &fence, 1000)) != 0 && !atomic_load(&G.stop)) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (t1.tv_sec - t0.tv_sec > 60)
+            break;
+        nanosleep(&(struct timespec){0, 100 * 1000000L}, NULL);
+    }
+    if (rc != 0 || prc != 0)
+        goto out;
+    if (!check) {
+        what = "put at epoch 3";
+        if ((rc = st_put(cs, peer, dir, &a)) != 0)
+            goto out;
+        what = "read back";
+        if ((rc = st_call(cs, peer, CS_OP_READ, 3, &a, &prc, &fence, 20000)) != 0 || prc != 0)
+            goto out;
+        what = "raise the fence to 5";
+        fence = 0;
+        if ((rc = st_call(cs, peer, CS_OP_EPOCH, 5, &a, &prc, &fence, 20000)) != 0 || prc != 0 || fence != 5)
+            goto out;
+        what = "a put at epoch 3 below the fence is not FENCED";
+        if ((rc = st_put(cs, peer, dir, &b)) != CHUNK_ERR_FENCED)
+            goto out;
+        what = "a delete at epoch 4 below the fence is not FENCED";
+        if ((rc = st_call(cs, peer, CS_OP_DEL, 4, &a, &prc, &fence, 20000)) != 0 || prc != CHUNK_ERR_FENCED)
+            goto out;
+    } else {
+        what = "the fence after the restart is not 5";
+        if (fence != 5)
+            goto out;
+        what = "a put at epoch 4 after the restart is not FENCED";
+        if ((rc = st_put(cs, peer, dir, &b)) != CHUNK_ERR_FENCED)
+            goto out;
+    }
+    what = "the chunk does not read back whole";
+    if ((rc = st_call(cs, peer, CS_OP_READ, 5, &a, &prc, &fence, 20000)) != 0 || prc != 0)
+        goto out;
+    what = NULL;
+out:
+    if (what)
+        fprintf(stderr, "tsdbd: chunksrv test: FAIL %s: %s (rc %d, answer %d, fence %" PRIu64 ")\n", mode, what, rc,
+                (int)prc, fence);
+    else
+        fprintf(stderr, "tsdbd: chunksrv test: pass %s\n", mode);
+    free(a.cells), free(a.sums), free(b.cells), free(b.sums);
+}
+
+static void *selftest_main(void *arg)
+{
+    selftest(arg, getenv("TSDB_CHUNKSRV_TEST"));
+    return NULL;
+}
+
 static void *cc_main(void *arg)
 {
     (void)arg;
     unsigned long seen = 0;
-    int have = 0;
+    int have = 0, tested = 0;
+    pthread_t st_thr;
     uint32_t self = 0;
     while (!atomic_load(&G.stop)) {
         struct chunksrv *cs = atomic_load(&G.pub);
@@ -126,12 +284,16 @@ static void *cc_main(void *arg)
                     cluster_copy_put(c);
                     seen = b;
                     have = 1;
+                    if (getenv("TSDB_CHUNKSRV_TEST") && !tested) /* on its own thread: peers keep moving */
+                        tested = pthread_create(&st_thr, NULL, selftest_main, cs) == 0;
                 }
             }
             report_up(cs);
         }
         nanosleep(&(struct timespec){0, 100 * 1000000L}, NULL);
     }
+    if (tested)
+        pthread_join(st_thr, NULL);
     return NULL;
 }
 
