@@ -4910,7 +4910,9 @@ static void scen_route(void)
  * forwarded write is judged by her rights at the owner (DENIED outside her grant); a frame held at the entry past
  * fwd_max_age_ms is UNAVAILABLE and never applied; a forward waiting on a stopped owner leaves R's own volumes served
  * (the wait counts as a waiting worker); a written forward whose link breaks closes the client's connection (unknown
- * outcome), never UNAVAILABLE. Mutants (TSDBD_FWD_MUTANT): fwdoldframe, fwdunavonbreak, fwdnouser, fwdnowait. */
+ * outcome), never UNAVAILABLE; a user added while the owner's users lag (TSDB_CLUSTER_TEST hold_users_file) is retried
+ * through UNAVAILABLE until the owner has her, never refused AUTH. Mutants (TSDBD_FWD_MUTANT): fwdoldframe,
+ * fwdunavonbreak, fwdnouser, fwdnowait, fwdauthlag. */
 static uint64_t fw_fnv(uint64_t h, const void *p, size_t n)
 {
     const uint8_t *b = p;
@@ -5059,6 +5061,7 @@ static void scen_forward(void)
     for (int i = 0; i < 3; i++) {
         auth_on[i] = 1;
         penv[i] = menv;
+        envs[i] = "hold_users_file=1"; /* part i: <state>/holdusers on the owner makes its users lag */
         xargs[i] = "--workers 2";
         start(i);
     }
@@ -5167,6 +5170,43 @@ static void scen_forward(void)
         die("after alice's writes through the replica the leader holds %d row(s) in her grant and %d outside it",
             fw_has(L, id, tb), fw_has(L, other, tb));
     printf("  a user's write through a replica is applied in her grant and DENIED at the owner outside it\n");
+
+    /* i. a user added while the owner's users lag (its watch held): she logs in on the entry, her forwarded write is
+     * UNAVAILABLE (RELOADING) at the owner until it has her, which the client retries, never AUTH (fwdauthlag) */
+    {
+        char holdu[PATH_MAX + 96], pw3[PATH_MAX + 80];
+        server_dir(L, holdu, sizeof holdu);
+        strcat(holdu, "/state/holdusers");
+        FILE *hu = fopen(holdu, "w");
+        if (!hu)
+            die("%s: %s", holdu, strerror(errno));
+        fclose(hu);
+        usleep(300000); /* a round of L's cluster thread: its watch has stopped */
+        put_file("pw3", "bob-pw", pw3, sizeof pw3);
+        snprintf(args, sizeof args, "cluster user add %s bob --superuser --password-file %s --secret-file %s --wait-ms 200",
+                 p0, pw3, secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0 && !strstr(out, "lag"))
+            die("user add bob: %s", out);
+        await_login(R, "bob", "bob-pw");
+        struct fw_write wb = {.c = login_retry(R, "bob", "bob-pw", 20000), .id = id, .ts = 97000000};
+        pthread_t tb2;
+        if (pthread_create(&tb2, NULL, fw_write_run, &wb) != 0)
+            die("pthread_create");
+        usleep(1000000);
+        unlink(holdu);
+        pthread_join(tb2, NULL);
+        tsdbc_close(wb.c);
+        if (wb.rc != 0)
+            die("bob's write through the replica while the owner's users lagged: %s, not retried until it had him",
+                ers(wb.rc));
+        if (wb.ms < 800)
+            die("bob's write through the replica was answered after %" PRIu64 " ms with the owner's users held 1 s: "
+                "the lag was not exercised", wb.ms);
+        if (fw_has(L, id, wb.ts) != 1)
+            die("bob's write through the replica is not on the leader");
+        printf("  a user added while the owner's users lagged: her forwarded write waited %" PRIu64
+               " ms (UNAVAILABLE, retried), never AUTH\n", wb.ms);
+    }
 
     /* c. a frame held at the entry past fwd_max_age_ms (1 s): UNAVAILABLE, never applied */
     struct fw_write w = {.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = 98000000};
@@ -8613,6 +8653,213 @@ static void scen_pause(void)
     printf("  the deposed leader rejoined as a replica: every server holds the same %d rows\n", total);
 }
 
+/* fwdlease (S2-2): a forwarded read is judged by the owner's read lease, as a read sent to it directly. scen_lease's
+ * phase a with every read sent to the third server F, which forwards it to the volume leader X: the Raft leader R
+ * paused at T0, X's lease ends by T0 + 800 ms (lease_ms 1000, drift 20%) and no new Raft leader can grant before an
+ * election timeout, so every read F forwards in (T0 + 810, T0 + 940) must be refused, and some must have been sent.
+ * Mutant fwdnolease (the owner skips the lease for a forward). */
+static void scen_fwdlease(void)
+{
+    scenario("fwdlease");
+    strict_reads = 1;
+    fwd_on = 1;
+    const char *mut = getenv("TSDBD_FWD_MUTANT");
+    static char menv[160];
+    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s", mut ? mut : "");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = menv;
+        start(i);
+    }
+    struct meta_settings s;
+    meta_settings_default(&s);
+    s.node_timeout_ms = 3000;
+    s.heartbeat_ms = 50;
+    s.lease_ms = 1000;
+    s.drift_ppm = 200000;
+    s.voter_replace_s = 600;
+    uint8_t req[128], *reply;
+    size_t len;
+    size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
+    int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
+    free(reply);
+    if (rc != 0)
+        die("init: %s", cluster_strerror(rc));
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int R = 0, X = -1;
+    char name[16];
+    struct meta_volume v;
+    for (int k = 0; k < 8 && X < 0; k++) {
+        uint32_t num;
+        snprintf(name, sizeof name, "fl%d", k);
+        if ((rc = vol_add(0, name, 3, &num)) != 0)
+            die("volume add %s: %s", name, cluster_strerror(rc));
+        if (!vol_rec(0, name, &v))
+            die("no record of %s", name);
+        int L = server_of(v.leader);
+        if (L >= 0 && L <= 2 && L != R)
+            X = L;
+    }
+    if (X < 0)
+        die("eight volumes, every one led by the Raft leader");
+    int F = 3 - R - X;
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, name, i, 1, 0);
+    tsdbc *cx = client(X);
+    tsdb_sid id = rep_series(cx, rep_names[0], name, 30000);
+    int64_t ts = 1000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(cx, id, &ts, &val, 1)) != 0)
+        die("a write: %s", ers(rc));
+    tsdbc_close(cx);
+    tsdbc *c = client(F);
+    tsdbc_set_retry(c, 0); /* the first answer, not a retried one */
+    if (!lease_until_ok(c, id, 10000, 1))
+        die("no read through %d (forwarded to %d) answered before the pause", F, X);
+    uint64_t f0 = fw_frames(c, v.leader);
+
+    static struct lread log[1 << 16];
+    size_t nl = 0;
+    pause_server(R, 1);
+    uint64_t T0 = now_ms();
+    while (now_ms() - T0 < 2000 && nl < sizeof log / sizeof log[0]) {
+        int rows;
+        log[nl].sent = now_ms();
+        log[nl].rc = lease_read(c, id, (int)(nl % 3), &rows);
+        if (log[nl].rc != 0 && log[nl].rc != TSDB_ERR_UNAVAILABLE)
+            die("a read through %d %" PRIu64 " ms into the pause: %s", F, log[nl].sent - T0, ers(log[nl].rc));
+        nl++;
+        struct timespec d = {0, 100000};
+        nanosleep(&d, NULL);
+    }
+    pause_server(R, 0);
+    size_t refused = 0;
+    for (size_t k = 0; k < nl; k++) {
+        uint64_t at = log[k].sent - T0;
+        if (log[k].rc == 0 && at > 810 && at < 940)
+            die("a read forwarded through %d %" PRIu64 " ms after the Raft leader paused was answered by %d: past its "
+                "lease (ends by 800)", F, at, X);
+        refused += log[k].rc != 0 && at > 810 && at < 940;
+    }
+    if (!refused)
+        die("no read was sent through %d between 810 and 940 ms into the pause (%zu reads)", F, nl);
+    uint64_t f1 = fw_frames(c, v.leader);
+    if (f1 < f0 + nl)
+        die("%zu reads through %d, %" PRIu64 " frames forwarded to %d", nl, F, f1 - f0, X);
+    if (!lease_until_ok(c, id, 20000, 1))
+        die("no read through %d answered after the Raft leader came back", F);
+    tsdbc_close(c);
+    stop_all();
+    printf("  reads forwarded from %d to %d with the Raft leader %d paused: %zu refused in (810, 940) ms, none answered "
+           "past the lease\n", F, X, R, refused);
+}
+
+/* fwddepose (S2-2): a forward that reaches a leader deposed since the entry node's copy was taken is answered MOVED by
+ * it, never forwarded a second hop. fd on three servers; the replicas' copies held (TSDB_CLUSTER_TEST hold_copy_file)
+ * while the leader L is paused past node_timeout and a replica N is promoted; N's copy is let go, the entry E's kept;
+ * L resumes, rejoins as a replica and learns N leads: a write through E goes to L at the old epoch and must come back
+ * MOVED, not applied. Mutant fwdtwice (L forwards it on to N). */
+static void scen_fwddepose(void)
+{
+    scenario("fwddepose");
+    strict_reads = 1;
+    fwd_on = 1;
+    const char *mut = getenv("TSDBD_FWD_MUTANT");
+    static char menv[160];
+    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s", mut ? mut : "");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = menv;
+        envs[i] = "hold_copy_file=1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "fd", 3, &num)) != 0)
+        die("volume add fd: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fd", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "fd", &v))
+        die("no record of fd");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of fd is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    uint32_t oldlead = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "fd", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    tsdbc_close(c);
+    await_isr(0, "fd", 3, 30000, "every replica in the ISR before the pause");
+    char hold[3][PATH_MAX + 96];
+    for (int i = 0; i < 3; i++) {
+        server_dir(i, hold[i], sizeof hold[i]);
+        strcat(hold[i], "/state/holdcopy");
+        if (i == L)
+            continue;
+        FILE *h = fopen(hold[i], "w");
+        if (!h)
+            die("%s: %s", hold[i], strerror(errno));
+        fclose(h);
+    }
+    usleep(300000); /* a round of their cluster threads */
+    pause_server(L, 1);
+    int Nw = await_promoted((L + 1) % 3, "fd", ids[L], e0, &v);
+    if (Nw < 0 || Nw == L || v.epoch <= e0)
+        die("the new record of fd: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    unlink(hold[Nw]);
+    int E = 3 - L - Nw;
+    pause_server(L, 0);
+    /* L deposed and back as a replica, its own copy naming Nw */
+    uint64_t t0 = now_ms();
+    for (;;) {
+        struct meta_volume w;
+        if (vol_rec(L, "fd", &w) && w.leader == v.leader && w.epoch == v.epoch)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("server %d never saw fd led by %u at epoch %" PRIu64, L, v.leader, v.epoch);
+        usleep(50000);
+    }
+    await_isr(Nw, "fd", 3, 30000, "the deposed leader back in the ISR");
+    usleep(300000);
+    c = client(E);
+    tsdbc_set_retry(c, 0);
+    uint64_t f0 = fw_frames(c, oldlead);
+    ts = 5000;
+    t0 = now_ms();
+    while ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) == TSDB_ERR_UNAVAILABLE && now_ms() - t0 < 10000)
+        usleep(100000); /* E's link to L coming back */
+    uint64_t f1 = fw_frames(c, oldlead);
+    tsdbc_close(c);
+    if (f1 <= f0)
+        die("the write through %d (its copy held at epoch %" PRIu64 ") was not forwarded to %d: %s", E, e0, L, ers(rc));
+    if (rc != TSDB_ERR_MOVED)
+        die("a write forwarded to the deposed leader %d: %s, not MOVED", L, ers(rc));
+    unlink(hold[E]);
+    tsdbc *cn = client(Nw);
+    nrows = 0;
+    if ((rc = tsdbc_query_raw(cn, id, 5000, 5001, count_rows, NULL)) != 0)
+        die("a read on the new leader: %s", ers(rc));
+    tsdbc_close(cn);
+    if (nrows != 0)
+        die("the write answered MOVED by the deposed leader is on the new leader");
+    stop_all();
+    printf("  a write forwarded by %d (copy held at epoch %" PRIu64 ") to the deposed leader %d: MOVED, not applied on "
+           "the new leader %d (epoch %" PRIu64 ")\n", E, e0, L, Nw, v.epoch);
+}
+
 
 /* promoteslow (review F3): a promotion that takes longer than the 3 s after which the Raft leader takes a record leader
  * whose driver does not lead for deposed (leader_deposed: a fence nobody followed up). Every server's swap to the writer
@@ -10065,7 +10312,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
