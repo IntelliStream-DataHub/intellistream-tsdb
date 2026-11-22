@@ -140,6 +140,10 @@ static int h_open(h *x, const char *dir, const char *extra)
     unsetenv("TSDB_TEST_TIER_I_KNOW");
     if (rc)
         return rc;
+    /* no settles here: the rows are from 1970 and merge_threads = 0, so the settle thread would settle every day a
+     * second after it is written (settle_poll_ms) and swap the parts the cases attach by hand and hold pointers to
+     * (a slow build, TSan, got there first: attaches failed and case_equal read a freed part) */
+    ecsettle_tier_quiesce(x->t);
     rc = h_eng_open(x, dir);
     if (rc) {
         tier_put(x->t);
@@ -1622,6 +1626,7 @@ static void case_multi(void)
     CHECK(rc == 0);
     if (rc)
         return;
+    ecsettle_tier_quiesce(tsdb_test_engine(db, 0)->tier); /* no settles: as in h_open */
     uint32_t vi = 0;
     CHECK(tsdb_volume_add(db, vol, &vi) == 0 && vi > 0);
     tsdb_sid ids[MS];
