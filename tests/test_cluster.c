@@ -4911,8 +4911,12 @@ static void scen_route(void)
  * fwd_max_age_ms is UNAVAILABLE and never applied; a forward waiting on a stopped owner leaves R's own volumes served
  * (the wait counts as a waiting worker); a written forward whose link breaks closes the client's connection (unknown
  * outcome), never UNAVAILABLE; a user added while the owner's users lag (TSDB_CLUSTER_TEST hold_users_file) is retried
- * through UNAVAILABLE until the owner has her, never refused AUTH. Mutants (TSDBD_FWD_MUTANT): fwdoldframe,
- * fwdunavonbreak, fwdnouser, fwdnowait, fwdauthlag. */
+ * through UNAVAILABLE until the owner has her, never refused AUTH. Through TSDBD_TEST_FWD_KNOBS: a request held at the
+ * entry after its parse (j) or at the owner before it runs (k) past fwd_max_age_ms is UNAVAILABLE and never applied; a
+ * forward the owner cannot read closes the client's connection at once (l: the owner's unknown outcome, D12); a
+ * forward stamped with another epoch than its owner's is refused (n: UNAVAILABLE or MOVED, not applied); a client that leaves while its forward waits has
+ * it given up within about a second (m, STATUS fwd.inflight). Mutants (TSDBD_FWD_MUTANT): fwdoldframe, fwdunavonbreak,
+ * fwdnouser, fwdnowait, fwdauthlag, fwdarrival, fwdownerage, fwdownerclose, fwdtailclose, fwdepoch, fwdgone. */
 static uint64_t fw_fnv(uint64_t h, const void *p, size_t n)
 {
     const uint8_t *b = p;
@@ -5048,6 +5052,57 @@ static int fw_has(int s, tsdb_sid id, int64_t ts)
     return nrows;
 }
 
+/* a value of STATUS on c ("fwd.inflight"); 0 when absent */
+static uint64_t fw_stat(tsdbc *c, const char *name)
+{
+    char *text = NULL, key[96];
+    int rc = tsdbc_status(c, &text);
+    if (rc != 0)
+        die("STATUS: %s", ers(rc));
+    snprintf(key, sizeof key, "\n%s=", name);
+    const char *p = strstr(text, key);
+    uint64_t n = p ? strtoull(p + strlen(key), NULL, 10) : 0;
+    free(text);
+    return n;
+}
+
+/* TSDBD_TEST_FWD_KNOBS (server/tsdbd.c fwd_knob): <base>/fwdknobs/NAME exists while on */
+static void fw_knob(const char *name, int on)
+{
+    char p[PATH_MAX + 80];
+    snprintf(p, sizeof p, "%s/fwdknobs", base);
+    mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/fwdknobs/%s", base, name);
+    if (on) {
+        int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0)
+            die("%s: %s", p, strerror(errno));
+        close(fd);
+    } else if (unlink(p) != 0 && errno != ENOENT) {
+        die("unlink %s: %s", p, strerror(errno));
+    }
+}
+
+/* one write through R held by the knob for 1.5 s: it must be answered UNAVAILABLE and never reach L */
+static void fw_held_write(int L, int R, tsdb_sid id, int64_t ts, const char *knob, const char *what)
+{
+    struct fw_write w = {.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = ts};
+    fw_knob(knob, 1);
+    pthread_t th;
+    if (pthread_create(&th, NULL, fw_write_run, &w) != 0)
+        die("pthread_create");
+    usleep(1500000);
+    fw_knob(knob, 0);
+    pthread_join(th, NULL);
+    tsdbc_close(w.c);
+    if (w.rc != TSDB_ERR_UNAVAILABLE)
+        die("a write held 1.5 s %s: %s, not UNAVAILABLE", what, ers(w.rc));
+    usleep(300000);
+    if (fw_has(L, id, ts) != 0)
+        die("a write held 1.5 s %s and answered UNAVAILABLE was applied on the leader", what);
+    printf("  a write held past fwd_max_age_ms %s is UNAVAILABLE and never applied\n", what);
+}
+
 static void scen_forward(void)
 {
     scenario("forward");
@@ -5056,8 +5111,9 @@ static void scen_forward(void)
     const char *mut = getenv("TSDBD_FWD_MUTANT");
     char stall[PATH_MAX + 80];
     snprintf(stall, sizeof stall, "%s/fwd-stall", base);
-    static char menv[PATH_MAX + 200];
-    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s TSDBD_TEST_FWD_STALL=%s", mut ? mut : "", stall);
+    static char menv[PATH_MAX * 2 + 400];
+    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s TSDBD_TEST_FWD_STALL=%s TSDBD_TEST_FWD_KNOBS=%s/fwdknobs",
+             mut ? mut : "", stall, base);
     for (int i = 0; i < 3; i++) {
         auth_on[i] = 1;
         penv[i] = menv;
@@ -5224,6 +5280,78 @@ static void scen_forward(void)
     if (fw_has(L, id, w.ts) != 0)
         die("a write held 1.5 s at the entry and answered UNAVAILABLE was applied on the leader");
     printf("  a write held past fwd_max_age_ms at the entry is UNAVAILABLE and never applied\n");
+
+    /* j. held at the entry after its parse but before its forward is built: the age counts from the parse (a request
+     *    that waited for a worker is as old as one that waited for the link) */
+    fw_held_write(L, R, id, 98000100, "prestall", "at the entry before its forward began");
+    /* k. held at the owner before it runs the forward: the owner's own check (envelope age plus its queue) */
+    fw_held_write(L, R, id, 98000200, "ownerstall", "at the owner before it ran the forward");
+
+    /* l. a forward the owner cannot read: the owner answers by closing (unknown outcome, D12), and the entry closes the
+     *    client's connection at once instead of leaving it waiting for a reply that never comes */
+    {
+        struct fw_write wl = {.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = 98000300};
+        tsdbc_set_timeout(wl.c, 8000);
+        fw_knob("badenv", 1);
+        fw_write_run(&wl);
+        fw_knob("badenv", 0);
+        tsdbc_close(wl.c);
+        if (wl.rc != TSDB_ERR_IO || wl.ms >= 4000)
+            die("a forward the owner could not read: %s after %" PRIu64 " ms, not a closed connection at once (IO)",
+                ers(wl.rc), wl.ms);
+        if (fw_has(L, id, wl.ts) != 0)
+            die("a forward the owner could not read was applied");
+        printf("  a forward the owner could not read closes the client's connection (%" PRIu64 " ms)\n", wl.ms);
+    }
+
+    /* n. the owner leads at another epoch than the one the entry stamped: refused before anything is done, never run.
+     *    The owner's copy names itself, so route_fill answers UNAVAILABLE (MOVED to itself would send the client round in
+     *    a circle); an owner whose copy names another leader answers MOVED. Either says "not applied": the client resends
+     *    and the entry node routes again. */
+    {
+        tsdbc *cn = login_retry(R, "root", "root-pw", 0);
+        int64_t tn = 98000400;
+        float vn = 1;
+        fw_knob("epoch", 1);
+        rc = tsdbc_insert_series(cn, id, &tn, &vn, 1);
+        fw_knob("epoch", 0);
+        tsdbc_close(cn);
+        if (rc != TSDB_ERR_MOVED && rc != TSDB_ERR_UNAVAILABLE)
+            die("a forward stamped with another epoch than its owner's: %s, not MOVED or UNAVAILABLE", ers(rc));
+        if (fw_has(L, id, tn) != 0)
+            die("a forward stamped with another epoch than its owner's was applied");
+        printf("  a forward stamped with another epoch than its owner leads at is %s, never run\n", ers(rc));
+    }
+
+    /* m. a client that leaves while its forward waits (the owner holds it): the entry gives the forward up (cancel) in
+     *    about a second, not after fwd_reply_ms (30 s) or whenever the owner answers */
+    {
+        tsdbc *cm = login_retry(R, "root", "root-pw", 0), *sm = login_retry(R, "root", "root-pw", 0);
+        tsdbc_set_timeout(cm, 300);
+        int64_t tm = 98000500;
+        float vm = 1;
+        fw_knob("ownerstall", 1);
+        rc = tsdbc_insert_series(cm, id, &tm, &vm, 1);
+        uint64_t inflight = fw_stat(sm, "fwd.inflight");
+        if (inflight != 1) {
+            fw_knob("ownerstall", 0);
+            die("a forward held at the owner: %" PRIu64 " forwards in flight on the entry, not 1", inflight);
+        }
+        tsdbc_close(cm);
+        uint64_t t0 = now_ms(), gone_ms = 0;
+        while ((inflight = fw_stat(sm, "fwd.inflight")) != 0 && now_ms() - t0 < 3000)
+            usleep(20000);
+        gone_ms = now_ms() - t0;
+        uint64_t left = inflight;
+        fw_knob("ownerstall", 0);
+        tsdbc_close(sm);
+        if (rc != TSDB_ERR_IO)
+            die("a forward held at the owner past the client's 300 ms timeout: %s, not IO", ers(rc));
+        if (left != 0)
+            die("a forward whose client left is still in flight on the entry %" PRIu64 " ms later (owner holding it)",
+                gone_ms);
+        printf("  a forward whose client left is given up %" PRIu64 " ms after the client closed\n", gone_ms);
+    }
 
     /* e. forwards waiting on a stopped owner hold no worker of R: a volume led on R is served at once */
     char solo[16] = "";

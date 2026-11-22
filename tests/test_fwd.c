@@ -4,7 +4,7 @@
  * node's rules (fwdr_run) driven over a fake link, no tsdbd, no sockets. The link's events reach the table the way
  * fwd.c's dispatcher hands them over (fwdr_on_event, from another thread after a delay, or at once inside the send).
  * The clock is CLOCK_MONOTONIC plus an offset a case may push forward (the stall hook does, to stand for an entry
- * node stalled past fwd_max_age). Usage: test_fwd [SCRATCHDIR] [--only NAME] [--mutant noage|retry|unavonbreak]
+ * node stalled past fwd_max_age). Usage: test_fwd [SCRATCHDIR] [--only NAME] [--mutant noage|retry|unavonbreak|teardown]
  * (each planted bug of fwdr_req must fail a case).
  *
  *   env        envelope round trip; short, another magic, hops 0 refused; the payload is the client's bytes
@@ -26,6 +26,8 @@
  *   relayfail  the client's connection goes mid-stream: the owner's stream is canceled, INDET
  *   clientgone written, the client goes while the reply is awaited: canceled, INDET
  *   notail     a last piece without a tail: relayed whole, the client's connection is closed
+ *   teardown   the relay fails while the link delivers the frame's next chunk: fwdr_run does not return (and free its
+ *              waiter) while that delivery still holds the waiter's lock (mutant teardown: it did, review F1)
  *   late       events of frames nobody waits for (late replies) are dropped and counted
  */
 #define _GNU_SOURCE
@@ -234,6 +236,7 @@ static void run_init(struct run *r, struct fwdr_tab *tab, int kind)
     r->q.mut_noage = !strcmp(mutant, "noage");
     r->q.mut_retry = !strcmp(mutant, "retry");
     r->q.mut_unavonbreak = !strcmp(mutant, "unavonbreak");
+    r->q.mut_teardown = !strcmp(mutant, "teardown");
 }
 
 static void run_go(struct run *r)
@@ -577,6 +580,96 @@ static void t_late(struct fwdr_tab *tab)
     CHECK(fwdr_tab_dropped(tab) == d0 + 2);
 }
 
+/* teardown: D (the dispatcher) finds the waiter of the frame's second chunk under the table's lock while R (fwdr_run)
+ * relays the first; the relay fails, R cancels (once D found the waiter), lets its waiter's lock go and takes the waiter out of the table, while
+ * D, once it has the waiter's lock, keeps it 200 ms. R must not return (its waiter is on its stack) before D let go. */
+static struct {
+    atomic_int found, canceled, held_done, d_done;
+    uint64_t frame;
+} td;
+
+static void td_hook(void *arg, const struct fwd_ev *ev, int point)
+{
+    (void)arg;
+    if (ev->frame_id != td.frame || ev->n != 2 || memcmp(ev->p, "c2", 2))
+        return;
+    if (point == 0) { /* wait for R's cancel, then give R time to reach the table's lock */
+        atomic_store(&td.found, 1);
+        for (int i = 0; i < 2000 && !atomic_load(&td.canceled); i++)
+            usleep(1000);
+        usleep(50000);
+    } else {
+        usleep(200000);
+        atomic_store(&td.held_done, 1);
+    }
+}
+
+static struct fwdr_tab *td_tab;
+static void *td_deliver(void *a)
+{
+    fwdr_on_event(td_tab, a);
+    atomic_store(&td.d_done, 1);
+    return NULL;
+}
+
+static struct fwd_ev td_ev;
+static pthread_t td_th;
+
+static void td_send(struct fake *f, uint64_t id, uint32_t peer, int kind)
+{
+    ev_at(f, -1, FWD_EV_SENT, kind, peer, id, FWD_WRITTEN, 0, NULL, 0);
+    ev_at(f, -1, FWD_EV_CHUNK, kind, peer, id, 0, 0, "c1", 2);
+    td_ev = (struct fwd_ev){.type = FWD_EV_CHUNK, .kind = kind, .peer = peer, .frame_id = id, .p = (const uint8_t *)"c2",
+                            .n = 2};
+    pthread_create(&td_th, NULL, td_deliver, &td_ev);
+}
+
+static void td_cancel(struct fake *f, uint64_t id, uint32_t peer)
+{
+    (void)f, (void)id, (void)peer;
+    for (int i = 0; i < 2000 && !atomic_load(&td.found); i++) /* D's thread may start late: let it find the waiter */
+        usleep(1000);
+    atomic_store(&td.canceled, 1);
+}
+
+/* R's frame stays above fwdr_run's until D is done, so a mutant run touches stale stack, never a reused one */
+static __attribute__((noinline)) int td_run(struct run *r, int *done_at_return)
+{
+    int res = fwdr_run(&r->o, r->f.tab, &r->q, &r->tail, &r->hop_ns);
+    *done_at_return = atomic_load(&td.held_done);
+    for (uint64_t i = 0; i < 4000000000ull && !atomic_load(&td.d_done); i++) /* no calls: they would reuse the stack */
+        __asm__ volatile("" ::: "memory");
+    return res;
+}
+
+static void t_teardown(struct fwdr_tab *tab)
+{
+    for (int rep = 0; rep < 3; rep++) {
+        struct run r;
+        run_init(&r, tab, PL_KIND_FWDQ);
+        atomic_store(&td.found, 0);
+        atomic_store(&td.canceled, 0);
+        atomic_store(&td.held_done, 0);
+        atomic_store(&td.d_done, 0);
+        td.frame = r.q.frame_id;
+        td_tab = tab;
+        r.f.on_send = td_send;
+        r.f.on_cancel = td_cancel;
+        r.f.relay_fail_at = 1;
+        fwdr_tab_test_hook(tab, td_hook, NULL);
+        int done_at_return = 0;
+        r.res = td_run(&r, &done_at_return);
+        pthread_join(td_th, NULL);
+        fwdr_tab_test_hook(tab, NULL, NULL);
+        if (!done_at_return)
+            fprintf(stderr, "teardown: fwdr_run returned while the chunk's delivery still held its waiter\n");
+        CHECK(done_at_return);
+        CHECK(r.res == FWDR_INDET && r.f.cancels == 1);
+        if (!done_at_return)
+            break;
+    }
+}
+
 static const struct {
     const char *name;
     void (*fn)(struct fwdr_tab *);
@@ -586,6 +679,7 @@ static const struct {
     {"toobig", t_toobig},     {"neverwr", t_neverwr},     {"lost", t_lost},           {"timeout", t_timeout},
     {"cancelnw", t_cancelnw}, {"cancelwr", t_cancelwr},   {"cancelinv", t_cancelinv}, {"chunks", t_chunks},
     {"relayfail", t_relayfail}, {"clientgone", t_clientgone}, {"notail", t_notail},   {"late", t_late},
+    {"teardown", t_teardown},
 };
 
 int main(int argc, char **argv)
@@ -596,12 +690,13 @@ int main(int argc, char **argv)
             only = argv[++i];
         else if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {
             mutant = argv[++i];
-            if (strcmp(mutant, "noage") && strcmp(mutant, "retry") && strcmp(mutant, "unavonbreak")) {
+            if (strcmp(mutant, "noage") && strcmp(mutant, "retry") && strcmp(mutant, "unavonbreak") &&
+                strcmp(mutant, "teardown")) {
                 fprintf(stderr, "test_fwd: unknown mutant %s\n", mutant);
                 return 2;
             }
         } else if (argv[i][0] == '-') {
-            fprintf(stderr, "usage: test_fwd [DIR] [--only NAME] [--mutant noage|retry|unavonbreak]\n");
+            fprintf(stderr, "usage: test_fwd [DIR] [--only NAME] [--mutant noage|retry|unavonbreak|teardown]\n");
             return 2;
         }
     }

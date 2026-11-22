@@ -2492,9 +2492,10 @@ static int route_mutant; /* TSDB_ROUTE_MUTANT (tests: each must fail test_cluste
  * a broken link answered UNAVAILABLE, the owner runs a forward unchecked (no user), a lost forward sent again, the
  * owner skips the lease, no worker_waits around a forward's wait, AUTH while the owner's users are behind */
 enum { FWM_NONE, FWM_TWICE, FWM_OLDFRAME, FWM_UNAVONBREAK, FWM_NOUSER, FWM_RETRY, FWM_NOLEASE, FWM_NOWAIT, FWM_AUTHLAG,
-       FWM_CHUNKNOWAIT, FWM_INLINE };
+       FWM_CHUNKNOWAIT, FWM_INLINE, FWM_OWNERAGE, FWM_ARRIVAL, FWM_GONE, FWM_OWNERCLOSE, FWM_TAILCLOSE, FWM_EPOCH };
 static int fwdx_mutant;
 static int fwd_entry(req *r, uint32_t v);
+static atomic_int fwd_inflight; /* forwards this entry node is running (STATUS fwd.inflight) */
 static __thread const struct cluster_copy *rt_cp;
 static __thread unsigned long rt_builds;
 
@@ -2834,7 +2835,8 @@ static void handle_status(req *r)
                    "peer.%u.fwd.hop_p99_us=%.0f\n", (unsigned)fr[i].peer, (unsigned long long)fr[i].frames,
                    (unsigned)fr[i].peer, (unsigned long long)fr[i].bytes, (unsigned)fr[i].peer, fr[i].p50_us,
                    (unsigned)fr[i].peer, fr[i].p99_us);
-        ST_PUT("fwd.late_dropped=%llu\n", (unsigned long long)fwdr_tab_dropped(fwd_tab));
+        ST_PUT("fwd.late_dropped=%llu\nfwd.inflight=%d\n", (unsigned long long)fwdr_tab_dropped(fwd_tab),
+               atomic_load(&fwd_inflight));
     }
     for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
         uint8_t health, reason;
@@ -3584,11 +3586,25 @@ static void *worker_main(void *arg)
  * (fwdo_put): one REP for a write, chunks of at most FWD_CHUNK_MAX for a read (fwd_chunk waits for credit: a slow
  * reader stalls only its own query), and the last message ends with the tail (fwdreq.h: the query's statistics, so
  * LAST_STATS on the entry node needs no forward). */
+#define FWD_MAX_AGE_CAP_MS 2000
 static uint32_t fwd_wait_ms = 2000, fwd_max_age_ms = 1000, fwd_reply_ms = 30000;
 static int fwd_base = 4; /* --fwd-workers */
 static int fwd_off;      /* --forward off: requests for volumes led elsewhere get MOVED (s2e's answer), never forwarded */
 static atomic_ullong fwd_seq;
 static const char *test_fwd_stall; /* TSDBD_TEST_FWD_STALL: the entry node stalls before each send while it exists */
+/* TSDBD_TEST_FWD_KNOBS=DIR (test_cluster forward): while DIR/<name> exists, prestall: the entry stalls before it builds
+ * a forward (after the parse: the age counts it); ownerstall: the owner stalls before it judges a forward's age;
+ * badenv: the entry sends an envelope the owner cannot read; epoch: the entry stamps its copy's epoch plus one */
+static const char *test_fwd_knobs;
+static bool fwd_knob(const char *name)
+{
+    if (!test_fwd_knobs)
+        return false;
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/%s", test_fwd_knobs, name);
+    return access(p, F_OK) == 0;
+}
+
 
 /* per peer: forwarded frames, bytes, and the hop latency (send to last reply byte) in buckets of 2^(i/4) us */
 #define FWD_HB 96
@@ -3693,6 +3709,8 @@ static void fe_stall(void *a)
 static bool fe_gone(void *a)
 {
     conn *c = ((struct fwd_ectx *)a)->c;
+    if (fwdx_mutant == FWM_GONE)
+        return false;
     if (atomic_load(&c->closing))
         return true;
     struct pollfd pf = {.fd = c->fd, .events = POLLRDHUP};
@@ -3729,6 +3747,10 @@ static int fwd_entry(req *r, uint32_t v)
     size_t n = FWDR_ENV + FWDR_INNER + r->len;
     if (n > FWD_MSG_MAX)
         return 0; /* MOVED: the client goes to the leader itself */
+    while (fwd_knob("prestall"))
+        fe_sleep(NULL, 10);
+    if (fwd_knob("epoch"))
+        epoch++;
     uint8_t *m = malloc(n);
     if (!m) {
         reply_error(c, r->id, r->op, TSDB_ERR_NOMEM);
@@ -3740,11 +3762,14 @@ static int fwd_entry(req *r, uint32_t v)
                          .origin = cp ? cp->self : 0, .uid = uid, .proto = atomic_load(&c->proto),
                          .vol = (uint16_t)v, .users_applied = auth_users_applied(), .id = r->id, .op = r->op};
     fwdr_env_encode(m, &e);
+    if (fwd_knob("badenv"))
+        m[0] ^= 0xff; /* another magic */
     if (r->len)
         memcpy(m + FWDR_ENV + FWDR_INNER, r->payload, r->len);
     bool rd = !(auth_ops[r->op].need & R_WRITE);
     struct fwdr_req q = {.peer = node, .kind = rd ? PL_KIND_FWDQ : PL_KIND_FWD, .msg = m, .n = n,
-                         .frame_id = atomic_fetch_add(&fwd_seq, 1) + 1, .arrival_ns = r->t_arr,
+                         .frame_id = atomic_fetch_add(&fwd_seq, 1) + 1,
+                         .arrival_ns = fwdx_mutant == FWM_ARRIVAL ? now_ns() : r->t_arr,
                          .max_age_ms = fwd_max_age_ms, .wait_ms = fwd_wait_ms, .reply_ms = fwd_reply_ms,
                          .mut_noage = fwdx_mutant == FWM_OLDFRAME, .mut_retry = fwdx_mutant == FWM_RETRY,
                          .mut_unavonbreak = fwdx_mutant == FWM_UNAVONBREAK};
@@ -3754,7 +3779,9 @@ static int fwd_entry(req *r, uint32_t v)
                          .cancel = fe_cancel, .credit = fe_credit, .relay = fe_relay};
     struct fwdr_tail tl;
     uint64_t hop = 0;
+    atomic_fetch_add(&fwd_inflight, 1);
     int res = fwdr_run(&o, fwd_tab, &q, &tl, &hop);
+    atomic_fetch_sub(&fwd_inflight, 1);
     free(m);
     switch (res) {
     case FWDR_DONE:
@@ -3763,7 +3790,7 @@ static int fwd_entry(req *r, uint32_t v)
             fwd_st.on = true;
             fwd_st.st = tl.st;
         }
-        if (tl.flags & FWDR_T_CLOSE)
+        if ((tl.flags & FWDR_T_CLOSE) && fwdx_mutant != FWM_TAILCLOSE)
             fwd_close_client(c);
         break;
     case FWDR_TOOBIG:
@@ -3853,7 +3880,8 @@ static void fwdo_finish(conn *c, struct fwdr_tail *tl)
     struct fwdo *o = c->fwdo;
     if (atomic_load(&c->closing)) {
         c->out.len = 0; /* what went wrong is told by closing the client's connection: the outcome is unknown */
-        tl->flags = FWDR_T_CLOSE;
+        if (fwdx_mutant != FWM_OWNERCLOSE)
+            tl->flags = FWDR_T_CLOSE;
     }
     uint8_t t[FWDR_TAIL];
     fwdr_tail_encode(t, tl);
@@ -3980,12 +4008,15 @@ static void fwd_serve(struct fjob *j)
     if (e.len)
         memcpy(r.payload, e.payload, e.len);
     unav_vol = e.vol;
+    while (fwd_knob("ownerstall"))
+        fe_sleep(NULL, 10);
     uint64_t waited_ms = (uint64_t)(now_ns() - j->t_in) / 1000000;
     lguard.on = false;
     rmv.on = false;
     if (e.hops != 1) {
         reply_error(&pc, r.id, r.op, TSDB_ERR_INVALID);
-    } else if (fwdx_mutant != FWM_OLDFRAME && (uint64_t)e.age_ms + waited_ms > fwd_max_age_ms) {
+    } else if (fwdx_mutant != FWM_OLDFRAME && fwdx_mutant != FWM_OWNERAGE &&
+               (uint64_t)e.age_ms + waited_ms > fwd_max_age_ms) {
         fwd_unav(&pc, &r, e.vol, TSDB_WHY_UNREACHABLE, 200); /* too old to apply: its client may have resent it */
     } else if (auth_enabled() && fwdx_mutant != FWM_NOUSER && !(e.flags & FWDR_F_USER)) {
         reply_error(&pc, r.id, r.op, TSDB_ERR_DENIED);
@@ -3997,8 +4028,9 @@ static void fwd_serve(struct fjob *j)
     } else {
         uint16_t v = req_volume(r.op, r.payload, r.len);
         uint64_t le = 0;
-        if (v != TSDB_VOL_ANY && cvol_lead(v, &le) && le && e.epoch && le != e.epoch) {
-            route_moved(&pc, &r, v); /* led here at another epoch: the client resends, and the entry node routes again */
+        if (fwdx_mutant != FWM_EPOCH && v != TSDB_VOL_ANY && cvol_lead(v, &le) && le && e.epoch && le != e.epoch) {
+            route_moved(&pc, &r, v); /* led here at another epoch: MOVED, or UNAVAILABLE while this server's copy
+                                     * names itself (route_fill); not applied, the client resends and the entry routes again */
         } else {
             if (!auth_enabled() || fwdx_mutant == FWM_NOUSER)
                 pc.auth.state = AS_IN; /* --no-auth: nothing is checked (a->au NULL) */
@@ -5521,7 +5553,10 @@ int main(int argc, char **argv)
         case 'a': advertise = optarg; cluster_opts = 1; break;
         case 0x10e: peer_advertise = optarg; cluster_opts = 1; break;
         case 0x110: fwd_wait_ms = (uint32_t)num_arg("fwd-wait-ms", optarg, 1, 3600000); cluster_opts = 1; break;
-        case 0x111: fwd_max_age_ms = (uint32_t)num_arg("fwd-max-age-ms", optarg, 1, 3600000); cluster_opts = 1; break;
+        case 0x111: /* the clients' 3 s floor minus room for the reply's way back: an older frame may be resent (D-S3) */
+            fwd_max_age_ms = (uint32_t)num_arg("fwd-max-age-ms", optarg, 1, FWD_MAX_AGE_CAP_MS);
+            cluster_opts = 1;
+            break;
         case 0x112: fwd_reply_ms = (uint32_t)num_arg("fwd-reply-ms", optarg, 0, 86400000); cluster_opts = 1; break;
         case 0x113: fwd_base = (int)num_arg("fwd-workers", optarg, 1, 4096); cluster_opts = 1; break;
         case 0x114:
@@ -5785,7 +5820,8 @@ int main(int argc, char **argv)
     if (getenv("TSDBD_FWD_MUTANT") && *getenv("TSDBD_FWD_MUTANT")) {
         static const char *const names[] = {"",        "fwdtwice", "fwdoldframe", "fwdunavonbreak", "fwdnouser",
                                             "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag",
-                                            "fwdchunknowait", "fwdinline"};
+                                            "fwdchunknowait", "fwdinline", "fwdownerage", "fwdarrival",
+                                            "fwdgone", "fwdownerclose", "fwdtailclose", "fwdepoch"};
         for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
             if (strcmp(getenv("TSDBD_FWD_MUTANT"), names[i]) == 0)
                 fwdx_mutant = i;
@@ -5797,6 +5833,8 @@ int main(int argc, char **argv)
     }
     test_fwd_stall = getenv("TSDBD_TEST_FWD_STALL") && *getenv("TSDBD_TEST_FWD_STALL") ? getenv("TSDBD_TEST_FWD_STALL")
                                                                                           : NULL;
+    test_fwd_knobs = getenv("TSDBD_TEST_FWD_KNOBS") && *getenv("TSDBD_TEST_FWD_KNOBS") ? getenv("TSDBD_TEST_FWD_KNOBS")
+                                                                                        : NULL;
     /* also as TSDB_REPLD_MUTANT names, so that tests/repld_mutants.sh plants them like the driver's */
     const char *rmu = getenv("TSDB_REPLD_MUTANT");
     test_no_moved = getenv("TSDBD_TEST_NO_MOVED") != NULL || (rmu && !strcmp(rmu, "nomoved"));

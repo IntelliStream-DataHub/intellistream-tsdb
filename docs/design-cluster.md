@@ -888,13 +888,21 @@ the user and the users applied index the entry logged her in with) and relays th
 included. It never retries (D30): a frame not written within `fwd_wait_ms` (2 s) is UNAVAILABLE and was not applied; a
 written one whose link breaks, or with no reply within `fwd_reply_ms`, closes the client's connection (unknown outcome,
 D12). The owner runs it on its own workers (`fwd_workers`) through the same gates as a direct request, the read lease
-among them (`test_cluster fwdlease`), with the user's rights; a volume not led here at the envelope's epoch is MOVED,
-never forwarded again (`fwddepose`); while its users are behind the envelope's index it answers UNAVAILABLE, never AUTH
+among them (`test_cluster fwdlease`), with the user's rights; a volume not led here at the envelope's epoch is MOVED
+(UNAVAILABLE where the owner's own copy still names it: never MOVED to itself), never forwarded again (`fwddepose`;
+`forward`, part n); while its users are behind the envelope's index it answers UNAVAILABLE, never AUTH
 (`forward`, part i). A request older than `fwd_max_age_ms` (1 s) since it arrived at the entry, at the send or at the
-owner, is dropped as UNAVAILABLE: its client may have resent it by then. Residual (D-S3): the age counts from parsing
-at the entry, so link transit is not in it, and a client whose own timeout is under about 3 s (max age plus a reply's
-way back) gets no guarantee that a frame it gave up on is not applied later; S3's streams (`seq`) close that.
-`TSDBD_FWD_MUTANT` plants `fwdtwice fwdoldframe fwdunavonbreak fwdnouser fwdretry fwdnolease fwdnowait fwdauthlag fwdchunknowait fwdinline`;
+owner, is dropped as UNAVAILABLE: its client may have resent it by then. `--fwd-max-age-ms` is capped at 2 s, below
+the clients' 3 s floor. Residual (D-S3): the age counts from parsing at the entry, so link transit is not in it, and a
+client whose own timeout is under about 3 s (max age plus a reply's way back) gets no guarantee that a frame it gave up
+on is not applied later; S3's streams (`seq`) close that. Deviation from ha.md 9.1 (item 597 there): the age is taken
+from the event loop's parse on CLOCK_MONOTONIC, not from the kernel's receipt (`SO_TIMESTAMPING`) on CLOCK_BOOTTIME. A
+frame that sat unread in the entry's socket buffer while the entry was stopped (SIGSTOP, a VM pause) or suspended
+counts that time as zero age, so it can still be forwarded after its client resent it elsewhere, unless the client's
+FIN was read first (`client_gone`); a client that resends on the same connection is not affected. S3's streams close
+this as well; until then the entry's own stall is the case the age check does not cover.
+`TSDBD_FWD_MUTANT` plants `fwdtwice fwdoldframe fwdunavonbreak fwdnouser fwdretry fwdnolease fwdnowait fwdauthlag fwdchunknowait fwdinline
+fwdarrival fwdownerage fwdownerclose fwdtailclose fwdepoch fwdgone`;
 `make fwd-mutants` and `test_fwd` must catch each.
 
 The Pulsar sink inherits this through the Java client. Its `ErrorClassifier` already retries unknown codes; MOVED,

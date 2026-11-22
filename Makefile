@@ -451,7 +451,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_peerlink $(or $(TMPDIR),/tmp)
 	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead; do ! ./$(B)/test_peerlink $(or $(TMPDIR),/tmp) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 	./$(B)/test_fwd
-	for m in noage retry unavonbreak; do ! ./$(B)/test_fwd --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	for m in noage retry unavonbreak teardown; do ! ./$(B)/test_fwd --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
 
 # the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 18 runs of 2 minutes each under a sanitizer
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut

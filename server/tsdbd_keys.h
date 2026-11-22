@@ -114,7 +114,8 @@ static const struct cfg_key tsdbd_keys[] = {
          "How long a request for a volume another member leads may wait to be sent there (forwarded) before it is "
          "answered UNAVAILABLE (definite: nothing reached the leader)."),
     CK_D("cluster.fwd.max.age", "fwd-max-age-ms", "ms", "1s",
-         "A request older than this since it was read is never forwarded, and its leader refuses it (UNAVAILABLE)."),
+         "A request older than this since it was read is never forwarded, and its leader refuses it (UNAVAILABLE). "
+         "At most 2 s: clients resend no earlier than 3 s after sending."),
     CK_D("cluster.fwd.reply", "fwd-reply-ms", "ms", "30s",
          "How long a forwarded request may wait for its leader's reply before the client's connection is closed "
          "without an answer (its outcome is unknown). 0: no limit (a dead link still ends it)."),

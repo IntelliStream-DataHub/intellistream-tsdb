@@ -101,6 +101,8 @@ struct fwdr_tab {
     pthread_mutex_t mu; /* the buckets; a leaf above a waiter's mu (taken under it, never the other way) */
     struct fwait *b[NB];
     atomic_ullong dropped;
+    void (*hook)(void *arg, const struct fwd_ev *ev, int point); /* tests only (fwdr_tab_test_hook) */
+    void *hook_arg;
 };
 
 struct fwdr_tab *fwdr_tab_new(void)
@@ -121,6 +123,12 @@ void fwdr_tab_free(struct fwdr_tab *t)
 
 uint64_t fwdr_tab_dropped(struct fwdr_tab *t) { return t ? atomic_load(&t->dropped) : 0; }
 
+void fwdr_tab_test_hook(struct fwdr_tab *t, void (*fn)(void *arg, const struct fwd_ev *ev, int point), void *arg)
+{
+    t->hook_arg = arg;
+    t->hook = fn;
+}
+
 static void tab_add(struct fwdr_tab *t, struct fwait *w)
 {
     pthread_mutex_lock(&t->mu);
@@ -129,8 +137,11 @@ static void tab_add(struct fwdr_tab *t, struct fwait *w)
     pthread_mutex_unlock(&t->mu);
 }
 
-/* After this no event reaches w (fwdr_on_event holds t->mu while it finds w and takes w->mu) */
-static void tab_del(struct fwdr_tab *t, struct fwait *w)
+/* After this no event reaches w and none is still inside it: fwdr_on_event finds w under t->mu and takes w->mu before
+ * it lets t->mu go, so once w is out of the table only an event that found it earlier can still hold w->mu (writing
+ * the pieces, broadcasting the cv). Taking w->mu once more waits for that one; w lives on fwdr_run's stack and is
+ * destroyed right after. The caller must not hold w->mu. */
+static void tab_del(struct fwdr_tab *t, struct fwait *w, bool mut_teardown)
 {
     pthread_mutex_lock(&t->mu);
     for (struct fwait **pp = &t->b[w->frame_id % NB]; *pp; pp = &(*pp)->next)
@@ -139,6 +150,10 @@ static void tab_del(struct fwdr_tab *t, struct fwait *w)
             break;
         }
     pthread_mutex_unlock(&t->mu);
+    if (!mut_teardown) { /* planted (test_fwd teardown): the old claim that t->mu alone is enough */
+        pthread_mutex_lock(&w->mu);
+        pthread_mutex_unlock(&w->mu);
+    }
 }
 
 void fwdr_on_event(struct fwdr_tab *t, const struct fwd_ev *ev)
@@ -167,8 +182,12 @@ void fwdr_on_event(struct fwdr_tab *t, const struct fwd_ev *ev)
         free(pc);
         return;
     }
+    if (t->hook)
+        t->hook(t->hook_arg, ev, 0); /* found w, t->mu held */
     pthread_mutex_lock(&w->mu);
     pthread_mutex_unlock(&t->mu);
+    if (t->hook)
+        t->hook(t->hook_arg, ev, 1); /* w->mu held, t->mu not: w may be leaving the table now */
     switch (ev->type) {
     case FWD_EV_SENT:
         w->sent = ev->outcome;
@@ -253,7 +272,7 @@ int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req
             sent_at = now;
             break;
         }
-        tab_del(t, &w);
+        tab_del(t, &w, q->mut_teardown);
         if (rc == FWD_E_TOOBIG) {
             res = FWDR_TOOBIG;
             goto out;
@@ -352,7 +371,7 @@ int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req
     }
     pthread_mutex_unlock(&w.mu);
     o->waits(o->arg, -1);
-    tab_del(t, &w);
+    tab_del(t, &w, q->mut_teardown);
 out:
     w_free(&w);
     return res;

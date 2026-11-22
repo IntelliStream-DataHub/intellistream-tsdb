@@ -82,6 +82,9 @@ struct fwd_ev;
  * (late, given up), is dropped and counted. Never blocks (the dispatcher's rule): copies the body. */
 void fwdr_on_event(struct fwdr_tab *t, const struct fwd_ev *ev);
 uint64_t fwdr_tab_dropped(struct fwdr_tab *t);
+/* tests: fn(arg, ev, 0) runs in fwdr_on_event once it found ev's waiter (the table's lock held), fn(arg, ev, 1) once
+ * it holds the waiter's lock and let the table's go (test_fwd teardown). NULL in tsdbd. */
+void fwdr_tab_test_hook(struct fwdr_tab *t, void (*fn)(void *arg, const struct fwd_ev *ev, int point), void *arg);
 
 /* What fwdr_run needs of its world. The link calls are fwd.h's (send: fwd_send of one message). */
 struct fwdr_ops {
@@ -107,7 +110,7 @@ struct fwdr_req {
     int64_t arrival_ns; /* when the event loop read the frame */
     uint32_t max_age_ms, wait_ms, reply_ms; /* fwd_max_age, fwd_wait_ms, fwd_reply_ms (0: no reply deadline) */
     /* planted bugs (tests): age not checked, a lost frame sent again, a broken link answered as UNREACH */
-    bool mut_noage, mut_retry, mut_unavonbreak;
+    bool mut_noage, mut_retry, mut_unavonbreak, mut_teardown;
 };
 
 enum {
