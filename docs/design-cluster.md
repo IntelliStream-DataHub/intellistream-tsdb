@@ -894,7 +894,7 @@ never forwarded again (`fwddepose`); while its users are behind the envelope's i
 owner, is dropped as UNAVAILABLE: its client may have resent it by then. Residual (D-S3): the age counts from parsing
 at the entry, so link transit is not in it, and a client whose own timeout is under about 3 s (max age plus a reply's
 way back) gets no guarantee that a frame it gave up on is not applied later; S3's streams (`seq`) close that.
-`TSDBD_FWD_MUTANT` plants `fwdtwice fwdoldframe fwdunavonbreak fwdnouser fwdretry fwdnolease fwdnowait fwdauthlag`;
+`TSDBD_FWD_MUTANT` plants `fwdtwice fwdoldframe fwdunavonbreak fwdnouser fwdretry fwdnolease fwdnowait fwdauthlag fwdchunknowait fwdinline`;
 `make fwd-mutants` and `test_fwd` must catch each.
 
 The Pulsar sink inherits this through the Java client. Its `ErrorClassifier` already retries unknown codes; MOVED,

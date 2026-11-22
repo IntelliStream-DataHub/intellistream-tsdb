@@ -203,7 +203,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `fwd_wait_ms` is UNAVAILABLE, written and lost closes the client's connection) and relays the reply; the owner runs it
   on reserved workers (`fwd_serve`) through the same gates with the user's rights, MOVED when not led at the envelope's
   epoch, UNAVAILABLE while its users lag the envelope's index; `tests/test_fwd.c` (fake link), `test_cluster
-  forward|fwdlease|fwddepose`, `make fwd-mutants` (`TSDBD_FWD_MUTANT`; test hooks `TSDBD_TEST_FWD_STALL`,
+  forward|fwdlease|fwddepose|fwdload`, `make fwd-mutants` (`TSDBD_FWD_MUTANT`; test hooks `TSDBD_TEST_FWD_STALL`,
   `TSDB_CLUSTER_TEST hold_copy_file|hold_users_file`). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
