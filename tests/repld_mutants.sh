@@ -35,6 +35,8 @@
 # replicadropsfloor (a replica's flushed segments go once its floor passes them, the retention caps ignored) failoverkeep.
 # promotenone (a driver promoting reports role NONE, so a promotion slower than 3 s is taken for a deposed leader and
 # fenced again; the volume's first promotion is slow too, so it may never get a writer) promoteslow (knob promoteslow).
+# divergeisr (a volume whose DIVERGED file is set is not stopped: no LOCAL_FAULT, it stays in the ISR and may lead)
+# diverged (knob plantdiverge).
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -80,6 +82,7 @@ table=(
     "leadnow|readdepose|held while it was deposed answered"
     "refusedsilent|refused|the refused volume was not reported"
     "demotestaleidx|deposetail|the deposed writer back in the ISR once the links are back: the ISR of rs has 2 members"
+    "divergeisr|diverged|heartbeat never reported volume 1 LOCAL_FAULT"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}

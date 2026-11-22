@@ -338,6 +338,15 @@ static void render(sb *b)
     }
     VOL_FAMILY("tsdb_failed", "gauge", "1 once the volume is in its fail-stop state (writes return IO errors).",
                failed);
+    if (cfg.vol_diverged) { /* tsdbd's one answer (vol_diverged): the DIVERGED file or the outage reopen's report */
+        family(b, "tsdb_volume_diverged", "gauge",
+               "1 while the volume is DIVERGED (refused until an operator acts: tsdb DIR volume diverged).");
+        for (uint32_t i = 0; i < nv; i++) {
+            sb_add(b, "tsdb_volume_diverged{volume=\"%u\",path=\"", i);
+            sb_label(b, tsdb_volume_path(cfg.db, i) ? tsdb_volume_path(cfg.db, i) : "");
+            sb_add(b, "\"} %d\n", cfg.vol_diverged(i) ? 1 : 0);
+        }
+    }
     /* the latest table (QUERY_LATEST): per volume; all 0 for a volume without a table */
     tsdb_latest_stats *ls = calloc(nv ? nv : 1, sizeof *ls);
     if (ls) {

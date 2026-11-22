@@ -8074,6 +8074,203 @@ static void writerfail_run(const char *name, int strict)
            v.epoch);
 }
 
+/* GET /metrics from a metrics port (--metrics-port auto): the reply in buf, which it NUL-terminates */
+static void metrics_get(int port, char *buf, size_t n)
+{
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    if (fd < 0 || port <= 0 || connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0)
+        die("connect to the metrics port %d: %s", port, strerror(errno));
+    struct timeval tv = {10, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static const char req[] = "GET /metrics HTTP/1.0\r\n\r\n";
+    if (write(fd, req, sizeof req - 1) != (ssize_t)sizeof req - 1)
+        die("write to the metrics port: %s", strerror(errno));
+    size_t got = 0;
+    for (ssize_t k; got < n - 1 && (k = read(fd, buf + got, n - 1 - got)) > 0;)
+        got += (size_t)k;
+    buf[got] = 0;
+    close(fd);
+}
+
+/* tsdb_volume_diverged of volume num on server i's metrics port is `want` (0 or 1) */
+static void metrics_diverged(int i, int port, uint32_t num, int want, const char *what)
+{
+    static char buf[1 << 20];
+    metrics_get(port, buf, sizeof buf);
+    char key[64];
+    snprintf(key, sizeof key, "\ntsdb_volume_diverged{volume=\"%" PRIu32 "\",path=\"", num);
+    const char *l = strstr(buf, key);
+    const char *e = l ? strstr(l + 1, "\"} ") : NULL;
+    if (!e || atoi(e + 3) != want)
+        die("%s: server %d's metrics say tsdb_volume_diverged of volume %" PRIu32 " is %s, not %d", what, i, num,
+            e ? e + 3 : "missing", want);
+}
+
+/* STATUS of server i says vol.<num>.health=unavailable and vol.<num>.reason=diverged within ms */
+static void await_status_diverged(int i, uint32_t num, int ms, const char *what)
+{
+    char line[96], *text = NULL;
+    snprintf(line, sizeof line, "\nvol.%" PRIu32 ".health=unavailable\nvol.%" PRIu32 ".reason=diverged\n", num, num);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        tsdbc *c = client(i);
+        int rc = tsdbc_status(c, &text);
+        tsdbc_close(c);
+        if (rc == 0 && strstr(text, line)) {
+            free(text);
+            return;
+        }
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("%s: STATUS of server %d does not say volume %" PRIu32 " is diverged after %d ms (%s):\n%s", what, i,
+                num, ms, ers(rc), rc == 0 ? text : "");
+        free(text);
+        text = NULL;
+    }
+}
+
+static void touch_plant(int i, uint32_t num)
+{
+    char f[PATH_MAX + 120];
+    server_dir(i, f, sizeof f);
+    snprintf(f + strlen(f), sizeof f - strlen(f), "/diverge.%" PRIu32, num);
+    FILE *fp = fopen(f, "w");
+    if (!fp)
+        die("create %s: %s", f, strerror(errno));
+    fclose(fp);
+}
+
+/* diverged (r8i, design-cluster-data.md D8, D13, D23): a volume whose DIVERGED file says a settled copy failed its
+ * digest (planted by TSDB_REPLD_TEST=plantdiverge, the same ec_diverge a settle calls) stops like a failed one. On a
+ * replica: LOCAL_FAULT in its heartbeat, out of the ISR, STATUS and /metrics name it DIVERGED, the writes go on at the
+ * leader. On a leader: deposed, another member leads, a client is MOVED there and writes there. A restart opens the
+ * volume DIVERGED again (the file), and `tsdb DIR volume diverged --clear` refuses a cluster volume naming R4.
+ * TSDB_REPLD_MUTANT=divergeisr (the driver ignores DIVERGED) fails it. */
+static void scen_diverged(void)
+{
+    scenario("diverged");
+    static int mports[3];
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=plantdiverge";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num, num2;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    if ((rc = vol_add(0, "lead", 3, &num2)) != 0 || num2 != 2)
+        die("volume add lead: %s, number %" PRIu32, cluster_strerror(rc), num2);
+    for (int i = 0; i < 3; i++) {
+        await_open_gen(0, "plant", i, 1, 0);
+        await_open_gen(0, "lead", i, 1, 0);
+    }
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    await_isr(L, "plant", 3, 15000, "every replica of plant up");
+    metrics_diverged(L, mports[L], num, 0, "before any plant");
+
+    /* a replica */
+    int R = (L + 1) % 3;
+    touch_plant(R, num);
+    await_local_fault(R, num, 3);
+    await_isr(L, "plant", 2, 15000, "a DIVERGED replica leaves the ISR");
+    await_status_diverged(R, num, 5000, "a DIVERGED replica");
+    metrics_diverged(R, mports[R], num, 1, "a DIVERGED replica");
+    metrics_diverged(R, mports[R], num2, 0, "the other volume of a DIVERGED replica's server");
+    for (int k = 0; k < 5; k++) {
+        ts = 2000 + k;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("a write after a replica diverged: %s", ers(rc));
+    }
+    tsdbc_close(c);
+    if (await_exit(R, 500) >= 0)
+        die("server %d exited on its volume's DIVERGED (D13: only the volume stops)", R);
+
+    /* a leader */
+    struct meta_volume v2;
+    if (!vol_rec(0, "lead", &v2))
+        die("no record of lead");
+    int L2 = server_of(v2.leader);
+    if (L2 < 0 || L2 > 2)
+        die("the leader of lead is node %u", v2.leader);
+    c = client(L2);
+    tsdb_sid id2 = rep_series(c, rep_names[1], "lead", 30000);
+    ts = 1000;
+    if ((rc = tsdbc_insert_series(c, id2, &ts, &val, 1)) != 0)
+        die("a write to lead: %s", ers(rc));
+    await_isr(L2, "lead", 3, 15000, "every replica of lead up");
+    uint64_t e0 = v2.epoch;
+    touch_plant(L2, num2);
+    int N2 = await_promoted((L2 + 1) % 3, "lead", ids[L2], e0, &v2);
+    if (N2 < 0 || N2 == L2)
+        die("the new record of lead: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v2.epoch, e0, v2.leader);
+    await_status_diverged(L2, num2, 5000, "a DIVERGED leader");
+    metrics_diverged(L2, mports[L2], num2, 1, "a DIVERGED leader");
+    ts = 3000;
+    insert_expect_moved(c, id2, ts, val, 2, v2.leader, v2.epoch, "a write to the DIVERGED leader");
+    tsdbc_close(c);
+    c = client(N2);
+    for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, id2, &ts, &val, 1)) != 0; usleep(100000))
+        if (now_ms() - t0 > 15000)
+            die("a write to lead's new leader (server %d): %s", N2, ers(rc));
+    tsdbc_close(c);
+    await_local_fault(L2, num2, 3);
+
+    /* a restart opens them DIVERGED again: the file, not memory */
+    int again[2] = {R, L2};
+    for (int k = 0; k < 2; k++) {
+        int i = again[k];
+        if (k == 1 && i == R)
+            break;
+        stop(i, SIGTERM);
+        start(i);
+        mports[i] = th_mport;
+        uint32_t vn = i == R ? num : num2;
+        await_status_diverged(i, vn, 20000, "a DIVERGED volume after a restart");
+        metrics_diverged(i, mports[i], vn, 1, "a DIVERGED volume after a restart");
+        await_local_fault(i, vn, 3);
+    }
+    usleep(3000000);
+    if ((rc = (int)isr_of(L, "plant", NULL)) != 2)
+        die("the DIVERGED replica is back in the ISR of plant after its restart (%d members)", rc);
+
+    /* clearing is the rebuild's (R4), not the CLI's */
+    stop(R, SIGTERM);
+    char dir[PATH_MAX + 80], args[PATH_MAX * 2 + 64], out[4096];
+    server_dir(R, dir, sizeof dir);
+    snprintf(args, sizeof args, "%s/v1 volume diverged", dir);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "DIVERGED"))
+        die("tsdb %s lists no DIVERGED record:\n%s", args, out);
+    snprintf(args, sizeof args, "%s/v1 volume diverged --clear", dir);
+    if (cli_run(args, NULL, out, sizeof out) == 0 || !strstr(out, "R4"))
+        die("tsdb %s on a cluster volume was not refused naming R4:\n%s", args, out);
+    snprintf(args, sizeof args, "%s/v1 volume diverged", dir);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "DIVERGED"))
+        die("the refused --clear removed the DIVERGED record:\n%s", out);
+    stop_all();
+    printf("  a DIVERGED replica leaves the ISR (LOCAL_FAULT) while writes go on, a DIVERGED leader is deposed and "
+           "lead moves to server %d at epoch %" PRIu64 ", STATUS and /metrics say diverged, a restart keeps it, "
+           "--clear is refused on a cluster volume\n",
+           N2, v2.epoch);
+}
+
 static void scen_writerfail(void) { writerfail_run("writerfail", 1); }
 static void scen_writerfailq(void) { writerfail_run("writerfailq", 0); }
 
@@ -11468,7 +11665,7 @@ int main(int argc, char **argv)
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
                {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv},
-               {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
     int n = (int)(sizeof all / sizeof all[0]);

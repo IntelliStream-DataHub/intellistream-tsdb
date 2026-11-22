@@ -586,7 +586,18 @@ int main(int argc, char **argv)
         float v = 1;
         int rc = c ? tsdbc_insert_series(c, sa.id, &ts, &v, 1) : -1;
         CHECK(rc == TSDB_ERR_UNAVAILABLE);
+        /* one DIVERGED answer (r8i, D8): the outage report's flag reads as DIVERGED in the reply and in STATUS, as
+         * the engine's DIVERGED file does (test_diverge's tsdbd case); not merely some UNAVAILABLE */
+        uint32_t va = TSDB_SID_VOLUME(sa.id);
+        tsdb_unavail ue[4];
+        unsigned un = 0;
+        CHECK(c && tsdbc_unavailable(c, ue, 4, &un) == 0 && un >= 1 && ue[0].reason == TSDB_WHY_DIVERGED);
+        char *text = NULL, want[96];
+        snprintf(want, sizeof want, "\nvol.%u.health=unavailable\nvol.%u.reason=diverged\n", va, va);
+        CHECK(c && tsdbc_status(c, &text) == 0 && text && strstr(text, want));
+        free(text);
         CHECK(fault("hang", dir_a, NULL) == 0);
+
         msleep(3500);
         CHECK(fault("heal", dir_a, NULL) == 0);
         msleep(8000); /* long enough for a second recovery to have resumed it, as it once did */
