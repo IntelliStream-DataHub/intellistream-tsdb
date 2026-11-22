@@ -12,6 +12,13 @@ make test IO=epoll        # server tests on epoll only (where io_uring is disabl
 make asan                 # the tests under AddressSanitizer + UBSan
 make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 80 minutes on 4 CPUs; CI runs the groups of
                           # make test as separate jobs: make tsan TEST_TARGET=test-meta, see TEST_GROUPS in the Makefile)
+make tsan-par             # make tsan with the groups of TEST_GROUPS and the rest of make test side by side (tools/tsan-par.sh:
+                          # one build, then one make per group, logs in $TSAN_PAR_LOGS)
+                          # Planted bugs (every `--mutant` loop of the Makefile, tests/*_mutants.sh) run in parallel through
+                          # tools/mutants.sh, each in a scratch dir of its own: MUTANT_JOBS (default half the CPUs; 1 = one after
+                          # the other), MUTANT_URING_JOBS (default 2: the rings of tsdbd count against the 8 MB memlock),
+                          # MUTANT_TIMEOUT (a hang is a survivor), MUTANT_SLOT_DIR + MUTANT_SLOTS (one pool for several helpers);
+                          # it names every survivor and keeps its log; a new loop: `$(MUT) --name X --list "a b" -- ./$(B)/X --mutant @M@ @D@`
 make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO; workloads kv and classes;
                           # misdirected I/O (verify_checksums on and off) and damage at rest (rot) on kv;
                           # kv also with login on (jepsen --auth) under kill and power, on each backend;
