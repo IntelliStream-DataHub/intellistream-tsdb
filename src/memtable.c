@@ -152,7 +152,10 @@ void mt_unref(memtable *m)
     free(m);
 }
 
-void (*ppos_test_note)(struct eng *db, memtable *m, int site, size_t n); /* test hook (internal.h eng_ppos_rows) */
+/* test hooks (internal.h eng_ppos_rows, parts_commit and pw_finish) */
+void (*ppos_test_note)(struct eng *db, memtable *m, int site, const int64_t *ts, size_t n, uint64_t fno,
+                       const uint32_t *ix);
+void (*ppos_test_record)(struct eng *db, const char *first, size_t n, uint64_t pos);
 int (*mt_test_reserve_fail)(uint32_t id); /* test hook: nonzero fails the growth of series id (tests/test_failstop.c) */
 /* test hook: how often the slow part of the room check ran (tests/test_failstop.c: a row inside the capacity must not
  * get here; counted with a relaxed atomic, on the slow path only) */

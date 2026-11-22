@@ -127,8 +127,9 @@ struct replica {
     uint64_t mk_seq;  /* the segment of the marker being applied (the applier's: replica_flush_through) */
 };
 
-/* The position of the COMMIT whose parts this thread commits (apply_commit), for jr_part_pos */
+/* The position of the COMMIT whose parts this thread commits (apply_commit) and its engine, for jr_part_pos */
 static __thread uint64_t rp_part_pos;
+static __thread eng *rp_part_db;
 
 #define RP_CHUNK ((size_t)1 << 20)
 /* RP_AGAIN (src/ecapply.h): a marker's apply: a cut came while rp->mu was let go, nothing was done, read it again */
@@ -949,7 +950,7 @@ static int cm_add(struct replica *rp, const wal_rec *wr, const mk *m)
         x->nf++;
     }
     for (uint32_t i = 0; i < x->nf; i++)
-        if (!mkf_name_ok(m, x->f[i].name)) {
+        if (!mkf_name_ok(m, x->f[i].name) && eng_test_mutant != MUT_REPLICA_COLD_NAME_ANY) {
             free(x->f);
             return TSDB_ERR_CORRUPT;
         }
@@ -1481,9 +1482,9 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
         rp->rs.doing_n = n;
         rc = rs_save(db, &rp->rs);
         if (rc == 0) {
-            rp_part_pos = last; /* the parts' position (ppos_record in parts_commit) */
+            rp_part_pos = last, rp_part_db = db; /* the parts' position (ppos_record in parts_commit) */
             rc = parts_commit(db, ps, n);
-            rp_part_pos = 0;
+            rp_part_pos = 0, rp_part_db = NULL;
         }
         if (rc == 0) {
             pthread_mutex_lock(&db->lock);
@@ -1811,6 +1812,11 @@ static int apply_cold(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
         return 0; /* a replay: carried out already */
     int rc = 0;
     if (rp->rs.cold_pos == last) {
+        if (rp->rs.cold_key != m->u.cold.key && eng_test_mutant != MUT_REPLICA_COLD_KEY_ANY) {
+            fprintf(stderr, "tsdb: %s: RSTATE says the COLD at position %" PRIu64 " carries key %" PRId64 " out, the "
+                            "marker there names key %" PRId64 "\n", db->dir, last, rp->rs.cold_key, m->u.cold.key);
+            return TSDB_ERR_CORRUPT;
+        }
         uint8_t *oids;
         uint32_t n;
         if ((rc = cold_oids(&m->u.cold, &oids, &n)) != 0)
@@ -2836,8 +2842,19 @@ static int leader_marker_wait(eng *db, uint64_t last, const char *what)
 /* The position of the marker this thread's write appended and saw committed (leader_commit, leader_drop), which the
  * publish that follows on the same thread records in the leader's RSTATE (jr_precommit, jr_commit, leader_rs_drop) */
 static __thread uint64_t lead_pos, lead_drop_pos;
+/* The engine whose next parts_commit on this thread commits lead_pos's files: armed by jr_precommit, used once. lead_pos
+ * alone stays set after a publish that failed past its marker (that volume fails; the thread serves others), and a
+ * flush of another volume on this thread would record its parts at that position instead of its memtable's. */
+static __thread eng *lead_armed;
 
-uint64_t jr_part_pos(void) { return rp_part_pos ? rp_part_pos : lead_pos; }
+uint64_t jr_part_pos(eng *db)
+{
+    if (rp_part_pos && rp_part_db == db)
+        return rp_part_pos;
+    uint64_t pos = lead_armed == db || eng_test_mutant == MUT_LEADER_PPOS_STALE ? lead_pos : 0;
+    lead_armed = NULL;
+    return pos;
+}
 
 /* ---- the leader's links of its COMMITs' files (design-cluster.md 5.2, M4) ----
  * Each file a leader's COMMIT marker names is hard linked as stage_<key>.part, the name a replica stages it under, so a
@@ -3355,7 +3372,10 @@ long leader_rs_ndrops(eng *db, uint64_t *first)
 int jr_precommit(eng *db, size_t n)
 {
     struct rstate *rs = db->lrs;
-    if (!eng_jr(db) || !rs || !lead_pos || eng_test_mutant == MUT_LEADER_NO_RSTATE)
+    if (!eng_jr(db) || !lead_pos)
+        return 0;
+    lead_armed = db; /* the parts_commit that follows is this COMMIT's (jr_part_pos) */
+    if (!rs || eng_test_mutant == MUT_LEADER_NO_RSTATE)
         return 0;
     rs->doing_pos = lead_pos;
     /* block numbers are taken under publish_lock: this commit's first */

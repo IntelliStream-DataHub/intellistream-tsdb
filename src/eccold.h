@@ -33,7 +33,9 @@ struct mk;
  * src[i] (a name in the volume's directory, size and checksum as the marker says) and linked as stage_<key>.part,
  * the directory synced, then the marker appended and waited for. 0 with *pos its position; TSDB_ERR_INDETERMINATE
  * when the leader was deposed meanwhile (a later open as a replica decides); any other error: refused (no marker), or
- * the engine failed. The caller holds jr_serial (eccold.c's gate), never publish_lock. */
+ * the engine failed. The caller holds jr_serial (eccold.c's gate), never publish_lock, and keeps it until
+ * jr_cold_commit: RSTATE's `done` is a high-water mark, so a COMMIT or DROP whose `done` passed a COLD still in `doing`
+ * would make a reopened replica skip that COLD. */
 int jr_cold(struct eng *db, struct mk *m, const char *const *src, size_t n, uint64_t *pos);
 /* The leader's RSTATE record of the swap that carries the COLD at pos out (key: its partition key): `doing` before the
  * swap intent's commit point, `done` after its renames, both with publish_lock held (ecapply_swap_pre/post). A

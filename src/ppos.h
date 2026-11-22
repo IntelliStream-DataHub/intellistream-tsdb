@@ -39,7 +39,9 @@ void ppos_flush_end(struct eng *db, struct memtable *m);
 /* m's map (memtable.ppos), freed with m (mt_unref). */
 void ppos_mt_free(struct memtable *m);
 /* The records of the parts about to be named (names[0 .. n)), each at log position pos (0: from the memtable's map),
- * appended and synced before any of the names is visible; 0 and nothing written unless db->ppos. */
+ * appended and synced before any of the names is visible; 0 and nothing written unless db->ppos. pos 0 means the map
+ * only inside a flush window (ppos_flush_begin/end); outside one it is a merge whose sources have no record (merge.c):
+ * unknown, never a flush. */
 int ppos_record(struct eng *db, const char *const *names, size_t n, uint64_t pos);
 /* The record of one part (an .ec part at its marker's Z); the ppos of a listed part. */
 int ppos_set(struct eng *db, const char *name, uint64_t pos);

@@ -8,6 +8,10 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**A replica volume's RSTATE file is now format 2 (R8: it records a COLD marker in progress).** A replicated volume
+whose RSTATE is format 1 is refused at open with a line naming the format: a cluster made before this change is
+initialised again, not upgraded (as for every change of the preview).
+
 **Tests and a benchmark for requests through any cluster member (S2-2; harness and docs only, no server change).**
 
 - `tsdbc-bench via --via H:P --volume NAME`: the same load sent to the leader of a cluster volume and then to another
