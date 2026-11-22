@@ -8875,6 +8875,7 @@ struct fl_read {
     int64_t lo, hi;
     uint64_t rows, ms;
     int rc, slow;
+    atomic_int done; /* set after rc and ms: the stream of inserts in f polls it while the reader runs */
 };
 
 static int fl_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
@@ -8895,6 +8896,7 @@ static void *fl_read_run(void *arg)
     uint64_t t0 = now_ms();
     r->rc = tsdbc_query_raw(r->c, r->id, r->lo, r->hi, fl_cb, r);
     r->ms = now_ms() - t0;
+    atomic_store(&r->done, 1);
     return NULL;
 }
 
@@ -9031,7 +9033,7 @@ static void scen_fwdload(void)
         if (rc != 0)
             die("insert %zu through %d to %d beside a slow reader: %s after %" PRIu64 " ms", nl, Y, X, ers(rc),
                 lat[nl - 1]);
-        if (r.ms) /* the reader is done */
+        if (atomic_load(&r.done))
             break;
         usleep(5000);
     }
