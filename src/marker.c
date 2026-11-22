@@ -14,6 +14,12 @@
  *   SERIES  u32 id, u32 vtype, u32 name_len, name, zeros to 4 bytes
  *   STATE   u32 id, u32 name_len, name, zeros to 4 bytes
  *   NOW     i64 now_ms
+ *   COLD    u64 z, u64 flush_through, u64 stripe_version, i64 key, u32 nobjs, u32 nfiles, u32 nretired, u32 0,
+ *           objects: nobjs x (oid[16], u32 rec_len, u32 0, record, zeros to 4 bytes),
+ *           files: nfiles x (as COMMIT's, with the kind in the byte after name_len: u16 name_len, u8 kind, u8 0, ...),
+ *           retired: nretired x oid[16] (R10's; this build refuses nretired != 0)
+ *   GC      u32 reason, u32 noids, noids x oid[16]
+ *   DIGEST  i64 key, u64 z, u64 rows, u64 series, u64 xxh64, u32 noids, u32 0, noids x oid[16]
  *
  * The decoder refuses what the encoder never writes (a non-zero reserved field or padding, a span other than the
  * type's, trailing bytes), so a payload has exactly one encoding and the fuzz harness compares both directions.
@@ -25,8 +31,11 @@
 
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "marker payloads are little endian and written by memcpy");
 
-static const char *const type_names[] = {NULL,    "COMMIT", "DROP", "RETENTION", "EPOCH", "FEED_SLOT",
-                                         "CLASS", "SERIES", "STATE", "SLOT",    "NOW",   "COLD"};
+static const char *const type_names[] = {NULL,    "COMMIT", "DROP", "RETENTION", "EPOCH", "FEED_SLOT", "CLASS",
+                                         "SERIES", "STATE",  "SLOT", "NOW",       "COLD",  "GC",        "DIGEST"};
+_Static_assert(sizeof type_names / sizeof type_names[0] == MK_TYPE_LAST + 1, "a name per type");
+
+int mk_test_mutant;
 
 const char *mk_type_name(uint16_t type)
 {
@@ -38,10 +47,22 @@ bool mk_type_known(uint16_t type)
     return type >= 1 && type <= MK_TYPE_LAST;
 }
 
+bool mk_type_admitted(uint16_t type, bool ec, bool tier)
+{
+    if (mk_test_mutant == MK_MUT_ADMIT_ALL)
+        return true;
+    if (type >= MK_EC_LATER_LO && type <= MK_EC_LATER_HI)
+        return false;
+    if (type == MK_COLD)
+        return ec || tier;
+    return ec || (type != MK_GC && type != MK_DIGEST);
+}
+
 /* the types whose payload this file defines: their span is 1 (COMMIT: its events) */
 static bool defined(uint16_t t)
 {
-    return (t >= MK_COMMIT && t <= MK_EPOCH) || t == MK_CLASS || t == MK_SERIES || t == MK_STATE || t == MK_NOW;
+    return (t >= MK_COMMIT && t <= MK_EPOCH) || t == MK_CLASS || t == MK_SERIES || t == MK_STATE || t == MK_NOW ||
+           t == MK_COLD || t == MK_GC || t == MK_DIGEST;
 }
 
 uint32_t mk_span(const mk *m)
@@ -104,8 +125,12 @@ static bool name_ok(const char *s, size_t n)
     return true;
 }
 
-#define FILE_FIXED 28 /* u16 len, u16 0, three u64 */
+#define FILE_FIXED 28 /* u16 len, u8 kind (COLD) or 0, u8 0, three u64 */
 #define COMMIT_FIXED 40
+#define COLD_FIXED 48
+#define OBJ_FIXED 24 /* oid, u32 rec_len, u32 0 */
+#define GC_FIXED 8
+#define DIGEST_FIXED 48
 
 size_t mk_file_size(const mk_file *f)
 {
@@ -117,6 +142,7 @@ size_t mk_file_put(uint8_t *buf, const mk_file *f)
     size_t n = mk_file_size(f);
     memset(buf, 0, n);
     put16(buf, (uint16_t)f->name_len);
+    buf[2] = f->kind;
     put64(buf + 4, f->size);
     put64(buf + 12, f->xxh64);
     put64(buf + 20, f->header_check);
@@ -124,13 +150,14 @@ size_t mk_file_put(uint8_t *buf, const mk_file *f)
     return n;
 }
 
-/* Reads and checks the entry at p[0..avail); gives its size, 0 when it is not one. */
-static size_t file_parse(const uint8_t *p, size_t avail, mk_file *f)
+/* Reads and checks the entry at p[0..avail); gives its size, 0 when it is not one. `kinds`: a COLD's list, whose
+ * entries say their kind (a COMMIT's say 0). */
+static size_t file_parse(const uint8_t *p, size_t avail, mk_file *f, bool kinds)
 {
     if (avail < FILE_FIXED)
         return 0;
     uint32_t nl = get16(p);
-    if (nl == 0 || nl > MK_NAME_MAX || get16(p + 2) != 0)
+    if (nl == 0 || nl > MK_NAME_MAX || p[3] != 0 || (kinds ? p[2] != MK_FILE_EC && p[2] != MK_FILE_Y : p[2] != 0))
         return 0;
     size_t sz = FILE_FIXED + pad4(nl);
     if (sz > avail || !zeros(p, FILE_FIXED + nl, sz) || !name_ok((const char *)p + FILE_FIXED, nl))
@@ -141,6 +168,7 @@ static size_t file_parse(const uint8_t *p, size_t avail, mk_file *f)
         f->size = get64(p + 4);
         f->xxh64 = get64(p + 12);
         f->header_check = get64(p + 20);
+        f->kind = p[2];
     }
     return sz;
 }
@@ -149,11 +177,74 @@ bool mk_file_next(const mk_commit *c, size_t *pos, mk_file *f)
 {
     if (*pos >= c->files_len)
         return false;
-    size_t sz = file_parse(c->files + *pos, c->files_len - *pos, f);
+    size_t sz = file_parse(c->files + *pos, c->files_len - *pos, f, false);
     if (sz == 0)
         return false;
     *pos += sz;
     return true;
+}
+
+size_t mk_cold_obj_size(uint32_t rec_len)
+{
+    return OBJ_FIXED + pad4(rec_len);
+}
+
+size_t mk_cold_obj_put(uint8_t *buf, const uint8_t oid[MK_OID], const uint8_t *rec, uint32_t rec_len)
+{
+    size_t n = mk_cold_obj_size(rec_len);
+    memset(buf, 0, n);
+    memcpy(buf, oid, MK_OID);
+    memcpy(buf + MK_OID, &rec_len, 4);
+    if (rec_len)
+        memcpy(buf + OBJ_FIXED, rec, rec_len);
+    return n;
+}
+
+/* Reads and checks the object at p[0..avail); gives its size, 0 when it is not one. */
+static size_t obj_parse(const uint8_t *p, size_t avail, mk_cold_obj *o)
+{
+    if (avail < OBJ_FIXED)
+        return 0;
+    uint32_t rl;
+    memcpy(&rl, p + MK_OID, 4);
+    if (rl == 0 || rl > MK_REC_MAX || !zeros(p, MK_OID + 4, OBJ_FIXED))
+        return 0;
+    size_t sz = OBJ_FIXED + pad4(rl);
+    if (sz > avail || !zeros(p, OBJ_FIXED + rl, sz))
+        return 0;
+    if (o) {
+        memcpy(o->oid, p, MK_OID);
+        o->rec = p + OBJ_FIXED;
+        o->rec_len = rl;
+    }
+    return sz;
+}
+
+bool mk_cold_obj_next(const mk_cold *c, size_t *pos, mk_cold_obj *o)
+{
+    if (*pos >= c->objs_len)
+        return false;
+    size_t sz = obj_parse(c->objs + *pos, c->objs_len - *pos, o);
+    if (sz == 0)
+        return false;
+    *pos += sz;
+    return true;
+}
+
+bool mk_cold_file_next(const mk_cold *c, size_t *pos, mk_file *f)
+{
+    if (*pos >= c->files_len)
+        return false;
+    size_t sz = file_parse(c->files + *pos, c->files_len - *pos, f, true);
+    if (sz == 0)
+        return false;
+    *pos += sz;
+    return true;
+}
+
+const uint8_t *mk_oid_at(const uint8_t *oids, uint32_t i)
+{
+    return oids + (size_t)i * MK_OID;
 }
 
 void mk_table_get(const uint8_t *table, uint32_t bucket, int64_t *lo, int64_t *hi)
@@ -201,12 +292,91 @@ static int decode_commit(const uint8_t *b, size_t n, mk_commit *c)
     c->files_len = n - pos;
     size_t at = 0;
     for (uint32_t i = 0; i < c->nfiles; i++) {
-        size_t sz = file_parse(c->files + at, c->files_len - at, NULL);
+        size_t sz = file_parse(c->files + at, c->files_len - at, NULL, false);
         if (sz == 0)
             return TSDB_ERR_CORRUPT;
         at += sz;
     }
     return at == c->files_len ? 0 : TSDB_ERR_CORRUPT; /* no bytes after the last file */
+}
+
+/* Every count is bounded before anything is walked: a list's length is a function of its count only through the
+ * entries, so an unbounded count would let one marker name millions of objects (a replica would stage, hold and apply
+ * them all). The mutant mkcoldbounds leaves the bounds out (tests/test_marker.c must catch it). */
+static bool counts_ok(uint32_t a, uint32_t b, uint32_t c)
+{
+    if (mk_test_mutant == MK_MUT_COLD_BOUNDS)
+        return true;
+    return a <= MK_FILES_MAX && b <= MK_FILES_MAX && c <= MK_FILES_MAX;
+}
+
+static int decode_cold(const uint8_t *b, size_t n, mk_cold *c)
+{
+    if (n < COLD_FIXED || !zeros(b, 44, 48))
+        return TSDB_ERR_CORRUPT;
+    c->z = get64(b);
+    c->flush_through = get64(b + 8);
+    c->stripe_version = get64(b + 16);
+    c->key = (int64_t)get64(b + 24);
+    memcpy(&c->nobjs, b + 32, 4);
+    memcpy(&c->nfiles, b + 36, 4);
+    memcpy(&c->nretired, b + 40, 4);
+    if (!counts_ok(c->nobjs, c->nfiles, c->nretired))
+        return TSDB_ERR_CORRUPT;
+    /* retired oids are R10's re-encode, written empty in R8: a list says something this build cannot honour (the
+     * objects would stay referenced here while the leader dropped them), as a record's `positions` (ecpart.c) */
+    if (c->nretired != 0 && mk_test_mutant != MK_MUT_RETIRED)
+        return TSDB_ERR_CORRUPT;
+    size_t pos = COLD_FIXED, at = 0;
+    c->objs = b + pos;
+    for (uint32_t i = 0; i < c->nobjs; i++) {
+        size_t sz = obj_parse(b + pos + at, n - pos - at, NULL);
+        if (sz == 0)
+            return TSDB_ERR_CORRUPT;
+        at += sz;
+    }
+    c->objs_len = at;
+    pos += at, at = 0;
+    c->files = b + pos;
+    for (uint32_t i = 0; i < c->nfiles; i++) {
+        size_t sz = file_parse(b + pos + at, n - pos - at, NULL, true);
+        if (sz == 0)
+            return TSDB_ERR_CORRUPT;
+        at += sz;
+    }
+    c->files_len = at;
+    pos += at;
+    c->retired = b + pos;
+    return n - pos == (size_t)c->nretired * MK_OID ? 0 : TSDB_ERR_CORRUPT; /* the oids, then nothing */
+}
+
+static int decode_gc(const uint8_t *b, size_t n, mk_gc *g)
+{
+    if (n < GC_FIXED)
+        return TSDB_ERR_CORRUPT;
+    memcpy(&g->reason, b, 4);
+    memcpy(&g->noids, b + 4, 4);
+    g->oids = b + GC_FIXED;
+    if (g->reason < MK_GC_RETIRED || g->reason > MK_GC_DONE || g->noids == 0 || !counts_ok(g->noids, 0, 0) ||
+        n - GC_FIXED != (size_t)g->noids * MK_OID)
+        return TSDB_ERR_CORRUPT;
+    return 0;
+}
+
+static int decode_digest(const uint8_t *b, size_t n, mk_digest *d)
+{
+    if (n < DIGEST_FIXED || !zeros(b, 44, 48))
+        return TSDB_ERR_CORRUPT;
+    d->key = (int64_t)get64(b);
+    d->z = get64(b + 8);
+    d->rows = get64(b + 16);
+    d->series = get64(b + 24);
+    d->xxh64 = get64(b + 32);
+    memcpy(&d->noids, b + 40, 4);
+    d->oids = b + DIGEST_FIXED;
+    if (!counts_ok(d->noids, 0, 0) || n - DIGEST_FIXED != (size_t)d->noids * MK_OID)
+        return TSDB_ERR_CORRUPT;
+    return 0;
 }
 
 int mk_decode(const uint8_t *p, size_t n, mk *m)
@@ -297,6 +467,15 @@ int mk_decode(const uint8_t *p, size_t n, mk *m)
             return TSDB_ERR_CORRUPT;
         m->u.now.now_ms = (int64_t)get64(b);
         break;
+    case MK_COLD:
+        rc = decode_cold(b, bn, &m->u.cold);
+        break;
+    case MK_GC:
+        rc = decode_gc(b, bn, &m->u.gc);
+        break;
+    case MK_DIGEST:
+        rc = decode_digest(b, bn, &m->u.digest);
+        break;
     default:
         break; /* reserved and unknown types: the body is theirs */
     }
@@ -350,6 +529,25 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
         break;
     case MK_NOW:
         bn = 8;
+        break;
+    case MK_COLD: {
+        const mk_cold *c = &m->u.cold;
+        if (!counts_ok(c->nobjs, c->nfiles, c->nretired) || (c->objs_len && !c->objs) ||
+            (c->files_len && !c->files) || (c->nretired && !c->retired) || c->objs_len > ((size_t)1 << 27) ||
+            c->files_len > ((size_t)1 << 27))
+            return TSDB_ERR_INVALID;
+        bn = COLD_FIXED + c->objs_len + c->files_len + (size_t)c->nretired * MK_OID;
+        break;
+    }
+    case MK_GC:
+        if (!counts_ok(m->u.gc.noids, 0, 0) || (m->u.gc.noids && !m->u.gc.oids))
+            return TSDB_ERR_INVALID;
+        bn = GC_FIXED + (size_t)m->u.gc.noids * MK_OID;
+        break;
+    case MK_DIGEST:
+        if (!counts_ok(m->u.digest.noids, 0, 0) || (m->u.digest.noids && !m->u.digest.oids))
+            return TSDB_ERR_INVALID;
+        bn = DIGEST_FIXED + (size_t)m->u.digest.noids * MK_OID;
         break;
     default:
         bn = m->body_len;
@@ -428,6 +626,44 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
     case MK_NOW:
         put64(b, (uint64_t)m->u.now.now_ms);
         break;
+    case MK_COLD: {
+        const mk_cold *c = &m->u.cold;
+        put64(b, c->z);
+        put64(b + 8, c->flush_through);
+        put64(b + 16, c->stripe_version);
+        put64(b + 24, (uint64_t)c->key);
+        memcpy(b + 32, &c->nobjs, 4);
+        memcpy(b + 36, &c->nfiles, 4);
+        memcpy(b + 40, &c->nretired, 4);
+        size_t pos = COLD_FIXED;
+        if (c->objs_len)
+            memcpy(b + pos, c->objs, c->objs_len);
+        pos += c->objs_len;
+        if (c->files_len)
+            memcpy(b + pos, c->files, c->files_len);
+        pos += c->files_len;
+        if (c->nretired)
+            memcpy(b + pos, c->retired, (size_t)c->nretired * MK_OID);
+        break;
+    }
+    case MK_GC:
+        memcpy(b, &m->u.gc.reason, 4);
+        memcpy(b + 4, &m->u.gc.noids, 4);
+        if (m->u.gc.noids)
+            memcpy(b + GC_FIXED, m->u.gc.oids, (size_t)m->u.gc.noids * MK_OID);
+        break;
+    case MK_DIGEST: {
+        const mk_digest *d = &m->u.digest;
+        put64(b, (uint64_t)d->key);
+        put64(b + 8, d->z);
+        put64(b + 16, d->rows);
+        put64(b + 24, d->series);
+        put64(b + 32, d->xxh64);
+        memcpy(b + 40, &d->noids, 4);
+        if (d->noids)
+            memcpy(b + DIGEST_FIXED, d->oids, (size_t)d->noids * MK_OID);
+        break;
+    }
     default:
         if (bn)
             memcpy(b, m->body, bn);

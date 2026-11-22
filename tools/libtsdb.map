@@ -2,9 +2,9 @@
  * include/tsdb_calendar.h, nothing internal (and the tsdb_test_* hooks of the tests, which link against the .so).
  * The tsdb_ec_* functions are the erasure codec's glue (src/ec/compat.c): internal, and a caller could lift the CPU
  * level cap with tsdb_ec_select. The tsdb_cvol_* functions (src/cvol.h) are tsdbd's hold on cluster volumes (declare,
- * open, swap, promote): internal as well; tsdbd and test_cvol link the static library. They are named one by one,
- * because an exact name beats the tsdb_* pattern (a pattern does not); a new one fails tools/check-exports.sh
- * (make test) until it is listed here or declared in a public header. */
+ * open, swap, promote) and tsdb_volume_diverged (R8, also in src/cvol.h): internal as well; tsdbd and test_cvol link
+ * the static library. They are named one by one, because an exact name beats the tsdb_* pattern (a pattern does
+ * not); a new one fails tools/check-exports.sh (make test) until it is listed here or declared in a public header. */
 {
     global:
         tsdb_*;
@@ -28,5 +28,6 @@
         tsdb_cvol_test_replace_arg;
         tsdb_cvol_test_replace_hook;
         tsdb_cvol_unref;
+        tsdb_volume_diverged;
         *;
 };

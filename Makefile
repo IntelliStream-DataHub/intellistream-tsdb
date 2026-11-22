@@ -389,7 +389,7 @@ TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 te
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
-test-units-b: $(B)/test_chunk $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_settle
+test-units-b: $(B)/test_chunk $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_settle $(B)/test_marker
 test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(or $(TMPDIR),/tmp)
 	B=$(B) tests/test_config.sh $(TMPDIR)
@@ -430,6 +430,8 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "nohaltstop" -- ./$(B)/test_settle --quick --case halt --mutant @M@ @D@) # a halt stops the settle
 	./$(B)/test_seam $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_seam --list "seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop" -- ./$(B)/test_seam --mutant @M@ @D@) # each planted bug must fail it
+	./$(B)/test_marker $(or $(TMPDIR),/tmp)
+	$(MUT) --name test_marker --list "mkcoldbounds mkadmitall ecpposloose mkwriteany mkretired" -- ./$(B)/test_marker --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_ecpart $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_ecpart --list "ecnohash ecnowalseq ecskipname ecnofno ecnolayout" -- ./$(B)/test_ecpart --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_keep $(or $(TMPDIR),/tmp)
@@ -1104,6 +1106,11 @@ $(B)/test_seam: tests/test_seam.c src/internal.h $(R7_HDR) $(LIB)
 # the .ec index file (r7-ecfile): its record codec, writer and open against the source part, damage to every region,
 # the listing's refusals, WAL replay and fno_next over a settled partition; mutants must fail it
 $(B)/test_ecpart: tests/test_ecpart.c src/internal.h $(R7_HDR) src/chunk.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# R8's marker bodies (COLD, GC, DIGEST: round trips, truncation, bounds), record_valid's cluster ec flag and the open's
+# refusal of GC and DIGEST without requires=ec; mutants mkcoldbounds mkadmitall ecpposloose mkwriteany mkretired must fail it
+$(B)/test_marker: tests/test_marker.c src/internal.h src/marker.h src/ecpart.h src/chunk.h src/tier.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # r7-skip: .ec and settling parts are merge barriers, never rewritten alone, by optimize or by the TTL work; drops

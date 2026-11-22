@@ -83,22 +83,34 @@ static bool source_ok(const char *s)
 }
 
 /* What a record must hold whichever way it came: its version and class result, its geometry (E2: recorded, never
- * derived from settings), the sums of exactly that geometry, a block range in order, a source name. The fields R8
- * fills (a degraded settle's mask of positions, the marker's log position, the stripe list's version) are 0: a record
- * that sets one says something this build cannot honour (it would read a degraded object as fully written), so R8
- * either bumps EC_RECORD_VERSION or teaches this check. */
-static bool record_valid(const ec_record *r)
+ * derived from settings), the sums of exactly that geometry, a block range in order, a source name. The marker's log
+ * position (`ppos`) and the stripe list's version are R8's and set only in an erasure-coded cluster volume
+ * (`cluster_ec`: META says requires=cluster and ec); a single server's tier keeps them 0, so a record that sets one
+ * there is not this volume's. A degraded settle's mask of positions (E10) is R9's and always 0: a record that sets it
+ * says something this build cannot honour (it would read a degraded object as fully written). */
+static bool record_valid(const ec_record *r, bool cluster_ec)
 {
     chunk_geom g;
+    bool r8 = cluster_ec || mk_test_mutant == MK_MUT_PPOS_LOOSE;
     return r->version == EC_RECORD_VERSION && r->class_check <= EC_CLS_FAILED && r->min_block <= r->max_block &&
-           r->positions == 0 && r->ppos == 0 && r->stripe_version == 0 &&
+           r->positions == 0 && (r8 || (r->ppos == 0 && r->stripe_version == 0)) &&
            chunk_geom_make(&g, r->k, r->m, r->cell_bytes, r->object_len) == 0 && r->nsums == chunk_sums_total(&g) &&
            source_ok(r->source);
 }
 
 int ec_record_encode(const ec_record *r, uint8_t *buf, size_t cap)
 {
-    if (!record_valid(r) || (r->nsums && !r->sums) || r->nsums > (SIZE_MAX - EC_REC_FIXED) / 8 ||
+    return ec_record_encode_as(r, buf, cap, false);
+}
+
+int ec_record_decode(const uint8_t *buf, size_t len, ec_record *r)
+{
+    return ec_record_decode_as(buf, len, r, false);
+}
+
+int ec_record_encode_as(const ec_record *r, uint8_t *buf, size_t cap, bool cluster_ec)
+{
+    if (!record_valid(r, cluster_ec) || (r->nsums && !r->sums) || r->nsums > (SIZE_MAX - EC_REC_FIXED) / 8 ||
         cap < ec_record_size(r))
         return TSDB_ERR_INVALID;
     memset(buf, 0, EC_REC_FIXED);
@@ -126,7 +138,7 @@ int ec_record_encode(const ec_record *r, uint8_t *buf, size_t cap)
     return 0;
 }
 
-int ec_record_decode(const uint8_t *buf, size_t len, ec_record *r)
+int ec_record_decode_as(const uint8_t *buf, size_t len, ec_record *r, bool cluster_ec)
 {
     memset(r, 0, sizeof *r);
     if (len < EC_REC_FIXED)
@@ -153,7 +165,7 @@ int ec_record_decode(const uint8_t *buf, size_t len, ec_record *r)
     memcpy(r->source, buf + EC_REC_SOURCE, 96);
     r->nsums = get64(buf + EC_REC_NSUMS);
     /* the sums fill the rest exactly; checked before anything is allocated, so the allocation is bounded by len */
-    if ((len - EC_REC_FIXED) % 8 != 0 || r->nsums != (len - EC_REC_FIXED) / 8 || !record_valid(r)) {
+    if ((len - EC_REC_FIXED) % 8 != 0 || r->nsums != (len - EC_REC_FIXED) / 8 || !record_valid(r, cluster_ec)) {
         r->nsums = 0;
         return TSDB_ERR_CORRUPT;
     }
@@ -228,7 +240,7 @@ int ec_index_write(eng *db, const part *src, const ec_record *r, char tmp[96])
     tmp[0] = '\0';
     /* a .part of format 9 with granules (v8 parts and parts without granules are never settled: src/merge.c), and a
      * record of exactly this part: a settle's mix-up must not become a file that names another */
-    if (atomic_load(&((part *)src)->ec) || src->hdr_len != sizeof(part_header) || src->ng == 0 || !record_valid(r) ||
+    if (atomic_load(&((part *)src)->ec) || src->hdr_len != sizeof(part_header) || src->ng == 0 || !record_valid(r, db->ec_cluster) ||
         (r->nsums && !r->sums) || r->key != src->partition || r->min_block != src->min_block ||
         r->max_block != src->max_block || r->level != src->level || r->object_len != src->map_len)
         return TSDB_ERR_INVALID;
@@ -253,7 +265,7 @@ int ec_index_write(eng *db, const part *src, const ec_record *r, char tmp[96])
                 db->dir, src->name);
         goto out;
     }
-    if ((rc = ec_record_encode(r, b + R, n)) != 0)
+    if ((rc = ec_record_encode_as(r, b + R, n, db->ec_cluster)) != 0)
         goto out;
     uint8_t *t = b + R + n;
     memcpy(t + EC_TR_MAGIC, EC_TRAILER_MAGIC, 8);
@@ -362,7 +374,7 @@ int part_open_ec(eng *db, const char *file, const char *name, part **out)
     e->rec_hash = xxh64(p->map + roff, (size_t)rlen, 0);
     if (hashes && e->rec_hash != get64(tr + EC_TR_REC_HASH))
         goto fail;
-    if ((rc = ec_record_decode(p->map + roff, (size_t)rlen, &e->rec)) != 0)
+    if ((rc = ec_record_decode_as(p->map + roff, (size_t)rlen, &e->rec, db->ec_cluster)) != 0)
         goto fail;
     rc = TSDB_ERR_CORRUPT;
     const ec_record *r = &e->rec;

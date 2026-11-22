@@ -2,7 +2,7 @@
 /*
  * WAL marker payloads (src/marker.c) on arbitrary bytes: mk_decode must not read past the length it is given, and
  * whatever it accepts must encode back to the very same bytes (one encoding per payload) and decode to the same
- * values. The COMMIT file list is walked entry by entry, as a consumer would.
+ * values. The COMMIT file list and COLD's objects and files are walked entry by entry, as a consumer would.
  *
  * Input: the payload, as the record's len gives it (type, flags, span, body).
  */
@@ -35,6 +35,31 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             if (n != m.u.commit.nfiles || pos != m.u.commit.files_len)
                 abort();
         }
+        if (m.type == MK_COLD) {
+            const mk_cold *c = &m.u.cold;
+            size_t pos = 0, n = 0;
+            mk_cold_obj o;
+            while (mk_cold_obj_next(c, &pos, &o)) {
+                n++;
+                if (o.rec_len == 0 || o.rec_len > MK_REC_MAX || o.rec < p || o.rec + o.rec_len > p + size)
+                    abort();
+            }
+            if (n != c->nobjs || pos != c->objs_len || n > MK_FILES_MAX)
+                abort();
+            pos = 0, n = 0;
+            mk_file f;
+            while (mk_cold_file_next(c, &pos, &f)) {
+                n++;
+                if (f.name_len == 0 || f.name_len > MK_NAME_MAX || (f.kind != MK_FILE_EC && f.kind != MK_FILE_Y))
+                    abort();
+            }
+            if (n != c->nfiles || pos != c->files_len || c->nretired > MK_FILES_MAX ||
+                c->retired + (size_t)c->nretired * MK_OID != p + size)
+                abort();
+        }
+        if ((m.type == MK_GC && (m.u.gc.noids == 0 || m.u.gc.noids > MK_FILES_MAX)) ||
+            (m.type == MK_DIGEST && m.u.digest.noids > MK_FILES_MAX))
+            abort();
         uint8_t *q;
         size_t qn;
         if (mk_encode(&m, &q, &qn) != 0 || qn != size || memcmp(q, p, size) != 0)
@@ -99,8 +124,8 @@ void fuzz_seeds(const char *dir)
     seed(dir, "seed-now", &m);
 
     uint8_t files[256];
-    mk_file f1 = {"p0_5_5_0.part", 13, 4096, 0x1122334455667788ull, 0x99aabbccddeeff00ull};
-    mk_file f2 = {"p1_6_6_0.part", 13, 8192, 3, 4};
+    mk_file f1 = {"p0_5_5_0.part", 13, 4096, 0x1122334455667788ull, 0x99aabbccddeeff00ull, 0};
+    mk_file f2 = {"p1_6_6_0.part", 13, 8192, 3, 4, 0};
     size_t fl = mk_file_put(files, &f1);
     fl += mk_file_put(files + fl, &f2);
     memset(&m, 0, sizeof m);
@@ -128,6 +153,43 @@ void fuzz_seeds(const char *dir)
     m.u.commit.events = 1;
     seed(dir, "seed-commit-table", &m);
     free(table);
+
+    /* R8: COLD (two objects, an .ec and a Y file, one retired oid, F set), GC of each reason, DIGEST */
+    uint8_t objs[256], rec[37], oid[MK_OID], oids[3 * MK_OID];
+    for (size_t i = 0; i < sizeof rec; i++)
+        rec[i] = (uint8_t)(i * 7 + 1);
+    for (int i = 0; i < MK_OID; i++)
+        oid[i] = (uint8_t)(i + 1);
+    for (size_t i = 0; i < sizeof oids; i++)
+        oids[i] = (uint8_t)(i * 3 + 2);
+    size_t ol = mk_cold_obj_put(objs, oid, rec, sizeof rec);
+    oid[0] = 99;
+    ol += mk_cold_obj_put(objs + ol, oid, rec, 4);
+    mk_file e1 = {"p5_1_4_1.ec", 11, 4000, 7, 8, MK_FILE_EC};
+    mk_file y1 = {"p5_5_5_0.part", 13, 900, 9, 10, MK_FILE_Y};
+    fl = mk_file_put(files, &e1);
+    fl += mk_file_put(files + fl, &y1);
+    memset(&m, 0, sizeof m);
+    m.type = MK_COLD;
+    m.u.cold = (mk_cold){.z = 5000, .flush_through = 12, .stripe_version = 3, .key = 4 * 19700 + 1, .nobjs = 2,
+                         .nfiles = 2, .nretired = 0, .objs = objs, .objs_len = ol, .files = files, .files_len = fl,
+                         .retired = oids};
+    seed(dir, "seed-cold", &m); /* retired oids are R10's: a decode refuses them (the corpus keeps one such input) */
+    m.u.cold.nfiles = 0, m.u.cold.files_len = 0;
+    seed(dir, "seed-cold-objs", &m);
+    memset(&m, 0, sizeof m);
+    m.type = MK_GC;
+    m.u.gc = (mk_gc){.reason = MK_GC_RETIRED, .noids = 3, .oids = oids};
+    seed(dir, "seed-gc-retired", &m);
+    m.u.gc.reason = MK_GC_ORPHAN, m.u.gc.noids = 1;
+    seed(dir, "seed-gc-orphan", &m);
+    m.u.gc.reason = MK_GC_DONE, m.u.gc.noids = 2;
+    seed(dir, "seed-gc-done", &m);
+    memset(&m, 0, sizeof m);
+    m.type = MK_DIGEST;
+    m.u.digest = (mk_digest){.key = 4 * 19700 + 1, .z = 5000, .rows = 86400, .series = 3, .xxh64 = 0x1234567890abcdefull,
+                             .noids = 2, .oids = oids};
+    seed(dir, "seed-digest", &m);
 
     memset(&m, 0, sizeof m); /* a reserved type and an unknown one: the body is theirs */
     m.type = MK_FEED_SLOT;

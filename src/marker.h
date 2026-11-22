@@ -17,7 +17,15 @@
  *   COMMIT, DROP, RETENTION, EPOCH   payloads defined below
  *   CLASS, SERIES, STATE, NOW        payloads defined below (the replica engine applies them, src/replica.c)
  *   FEED_SLOT                        number reserved for the change feed (its payload comes with the feed)
- *   SLOT, COLD                       numbers reserved for the cluster (design-cluster.md 4.1; payloads come with it)
+ *   SLOT                             number reserved for the cluster (design-cluster.md 4.1; its payload comes with it)
+ *   COLD, GC, DIGEST                 payloads defined below (R8, docs/design-cluster-data.md 2.3, E14, E26): a settle's
+ *                                    cut, a chunk deletion, a settle's logical digest. GC and DIGEST (12, 13) belong to a
+ *                                    volume whose META says requires=ec, COLD to one with ec or tier (E17 and its
+ *                                    amendment for E55): an open of any other refuses them, and so does the writer
+ *                                    (mk_type_admitted), where every older binary refuses the word itself
+ *   14, 15                           MK_DROP_OBJ and MK_UNSETTLE of the design (docs/design-cluster-data.md, the
+ *                                    format table; R10 gives them bodies), behind the same word: this binary cannot
+ *                                    apply them, so a volume that holds one is refused, never replayed past them
  * A type this binary does not know at all is MK_UNKNOWN: the record is intact and skipped.
  */
 #ifndef TSDB_MARKER_H
@@ -40,8 +48,13 @@ enum mk_type {
     MK_SLOT = 9,
     MK_NOW = 10,
     MK_COLD = 11,
-    MK_TYPE_LAST = MK_COLD /* the types above this one are unknown to format 9 */
+    MK_GC = 12,
+    MK_DIGEST = 13,
+    MK_TYPE_LAST = MK_DIGEST /* the types above this one are unknown to this binary */
 };
+/* Numbers the design gives R10's ec markers (MK_DROP_OBJ, MK_UNSETTLE): unknown here, and admitted nowhere. */
+#define MK_EC_LATER_LO 14
+#define MK_EC_LATER_HI 15
 
 #define MK_HDR 8 /* type, flags, span: the start of every marker payload (WAL_MARKER_HDR) */
 #define MK_NAME_MAX 255
@@ -49,6 +62,11 @@ enum mk_type {
 #define MK_FILES_MAX 4096
 #define MK_BUCKETS 4096 /* the fence's table (LW_BUCKETS) */
 #define MK_NO_PARTITION INT64_MIN
+/* R8's bodies (COLD, GC, DIGEST): at most MK_FILES_MAX objects, files and oids each, and an object record of at most
+ * MK_REC_MAX bytes (an ec_record of thousands of cell sums; src/ecpart.h). The whole payload stays below the WAL's
+ * 2^27 bytes (mk_encode) and, on a leader, one peer frame (the leader's own check). */
+#define MK_REC_MAX (1u << 20)
+#define MK_OID 16 /* an object id (ec_record.oid) */
 
 /* COMMIT: a direct commit (insert, replace or delete that goes to parts, not through the WAL rows). */
 enum mk_op { MK_OP_INSERT = 1, MK_OP_REPLACE = 2, MK_OP_DELETE = 3 };
@@ -60,7 +78,12 @@ typedef struct mk_file {
     const char *name; /* final name, not NUL terminated (name_len bytes, no '/' and no NUL) */
     uint32_t name_len;
     uint64_t size, xxh64, header_check; /* the file's size, its xxh64, the part's header checksum */
+    uint8_t kind; /* COLD's files: enum mk_file_kind; 0 in a COMMIT (decode refuses anything else there) */
 } mk_file;
+
+/* what a file of a COLD marker is: an .ec index file of an object, or a part of Y (design-cluster-data.md 2.3 step 4:
+ * the late parts of the key, all with ppos <= Z) */
+enum mk_file_kind { MK_FILE_EC = 1, MK_FILE_Y = 2 };
 
 typedef struct mk_commit {
     uint8_t op;        /* enum mk_op */
@@ -123,6 +146,48 @@ typedef struct mk_now {
     int64_t now_ms;
 } mk_now;
 
+/* COLD (R8, design-cluster-data.md 2.3 steps 4-6): the settle of partition key `key` cut at log position Z. The
+ * leader's memtable held no row of the key above `flush_through` (F, as a COMMIT's: the leader's wal_flushed after
+ * its rotate at the cut; a replica flushes through F only). The object records are opaque here (ec_record_encode's
+ * bytes, decoded and checked by their consumer), each with its oid; the files are the .ec and Y files to list; the
+ * retired oids are objects the settle replaces (R10's re-encode; written empty in R8, and a decode refuses a list). Iterate with mk_cold_obj_next,
+ * mk_cold_file_next and mk_oid_at (the retired list). */
+typedef struct mk_cold {
+    uint64_t z, flush_through, stripe_version;
+    int64_t key;
+    uint32_t nobjs, nfiles, nretired; /* each at most MK_FILES_MAX */
+    const uint8_t *objs;              /* encoded (mk_cold_obj_put), objs_len bytes */
+    size_t objs_len;
+    const uint8_t *files;             /* encoded (mk_file_put, kind set), files_len bytes */
+    size_t files_len;
+    const uint8_t *retired;           /* nretired x MK_OID bytes */
+} mk_cold;
+
+/* one object of a COLD marker, as mk_cold_obj_next gives it: rec points into the payload */
+typedef struct mk_cold_obj {
+    uint8_t oid[MK_OID];
+    const uint8_t *rec;
+    uint32_t rec_len; /* 1 .. MK_REC_MAX */
+} mk_cold_obj;
+
+/* GC (R8, E14, D13): chunks of these objects go (retired objects, orphans), or their deletion is done everywhere and
+ * the pending-delete list forgets them */
+enum mk_gc_reason { MK_GC_RETIRED = 1, MK_GC_ORPHAN = 2, MK_GC_DONE = 3 };
+typedef struct mk_gc {
+    uint32_t reason; /* enum mk_gc_reason */
+    uint32_t noids;  /* at most MK_FILES_MAX */
+    const uint8_t *oids; /* noids x MK_OID bytes */
+} mk_gc;
+
+/* DIGEST (R8, E26, D7): the leader's logical digest of key `key` as of Z, over the objects named: the visible rows
+ * (`rows`), the series that have any (`series`), and an xxh64 over them in (series, ts) order */
+typedef struct mk_digest {
+    int64_t key;
+    uint64_t z, rows, series, xxh64;
+    uint32_t noids; /* at most MK_FILES_MAX */
+    const uint8_t *oids;
+} mk_digest;
+
 typedef struct mk {
     uint16_t type;  /* enum mk_type, or the raw number of an unknown one (then mk_type_name gives NULL) */
     uint16_t flags;
@@ -136,6 +201,9 @@ typedef struct mk {
         mk_series series;
         mk_state state;
         mk_now now;
+        mk_cold cold;
+        mk_gc gc;
+        mk_digest digest;
     } u;
     const uint8_t *body; /* every type: the raw body (an unknown or reserved type has nothing else) */
     size_t body_len;
@@ -146,6 +214,11 @@ const char *mk_type_name(uint16_t type);
 /* Whether the format knows the number (defined or reserved): an unknown one is skipped by replay all the same, but
  * a binary asked to open a volume with requires= for it would refuse. */
 bool mk_type_known(uint16_t type);
+/* Whether a volume admits a marker of this type (E17), at its open's replay and at its writer (a marker the volume's
+ * next open would refuse is never logged): GC and DIGEST only where META says requires=ec (`ec`), COLD where it says
+ * ec or tier (`tier`), 14 and 15 nowhere (R10's, MK_EC_LATER_*); every other type, unknown ones included, as before
+ * (applied or skipped). */
+bool mk_type_admitted(uint16_t type, bool ec, bool tier);
 /* The span a marker of this type and content must have: events for COMMIT (at least 1), else 1. */
 uint32_t mk_span(const mk *m);
 
@@ -163,6 +236,21 @@ size_t mk_file_size(const mk_file *f);
 size_t mk_file_put(uint8_t *buf, const mk_file *f);
 /* Reads the next entry of a validated list at *pos (decode has checked them all). Returns false at the end. */
 bool mk_file_next(const mk_commit *c, size_t *pos, mk_file *f);
+/* COLD's lists. An object: mk_cold_obj_size bytes, mk_cold_obj_put writes it (gives its length). The files are
+ * mk_file entries with their kind set. mk_cold_obj_next and mk_cold_file_next read a validated list at *pos (false at
+ * the end); mk_oid_at gives the i-th oid of a list (COLD's retired, GC's, DIGEST's). */
+size_t mk_cold_obj_size(uint32_t rec_len);
+size_t mk_cold_obj_put(uint8_t *buf, const uint8_t oid[MK_OID], const uint8_t *rec, uint32_t rec_len);
+bool mk_cold_obj_next(const mk_cold *c, size_t *pos, mk_cold_obj *o);
+bool mk_cold_file_next(const mk_cold *c, size_t *pos, mk_file *f);
+const uint8_t *mk_oid_at(const uint8_t *oids, uint32_t i);
+/* Planted bugs of the R8 bodies (tests/test_marker.c --mutant NAME; the Makefile requires each to fail it). */
+enum { MK_MUT_NONE = 0, MK_MUT_COLD_BOUNDS /* mkcoldbounds: R8's counts unbounded */,
+       MK_MUT_ADMIT_ALL /* mkadmitall: an open without requires=ec admits GC and DIGEST */,
+       MK_MUT_PPOS_LOOSE /* ecpposloose: record_valid takes ppos and stripe_version on any volume */,
+       MK_MUT_WRITE_ANY /* mkwriteany: the WAL writer logs a marker its volume does not admit */,
+       MK_MUT_RETIRED /* mkretired: COLD's decoder takes retired oids, which R8 cannot honour */ };
+extern int mk_test_mutant;
 /* A bucket of a MK_KEYS_TABLE (MK_BUCKETS x 16 bytes, not aligned): read and written through these. */
 void mk_table_get(const uint8_t *table, uint32_t bucket, int64_t *lo, int64_t *hi);
 void mk_table_put(uint8_t *table, uint32_t bucket, int64_t lo, int64_t hi);

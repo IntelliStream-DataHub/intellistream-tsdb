@@ -406,6 +406,7 @@ void meta_requires_parse(const char *txt, unsigned *feats, char *unknown, size_t
                            : wl == 7 && strncmp(w, "cluster", 7) == 0 ? META_REQ_CLUSTER
                            : wl == 7 && strncmp(w, "replica", 7) == 0 ? META_REQ_REPLICA
                            : wl == 4 && strncmp(w, "tier", 4) == 0    ? META_REQ_TIER
+                           : wl == 2 && strncmp(w, "ec", 2) == 0      ? META_REQ_EC
                                                                       : 0;
             if (bit) {
                 if (feats)
@@ -455,7 +456,8 @@ static int meta_edit(const feed_dir *d, const uint8_t *txt, size_t len, unsigned
     if (!has_extra)
         n += (size_t)sprintf(out + n, "%s", extra);
     static const struct { unsigned bit; const char *w; } words[] = {
-        {META_REQ_FEED, "feed"}, {META_REQ_CLUSTER, "cluster"}, {META_REQ_REPLICA, "replica"}, {META_REQ_TIER, "tier"}};
+        {META_REQ_FEED, "feed"}, {META_REQ_CLUSTER, "cluster"}, {META_REQ_REPLICA, "replica"}, {META_REQ_TIER, "tier"},
+        {META_REQ_EC, "ec"}};
     if (want || unknown[0]) {
         n += (size_t)sprintf(out + n, "requires=%s", unknown);
         bool first = !unknown[0];
@@ -490,6 +492,19 @@ static int meta_word(const feed_dir *d, bool on)
         return TSDB_ERR_INVALID;
     }
     rc = meta_edit(d, txt, len, on ? META_REQ_FEED : 0, on ? 0 : META_REQ_FEED, NULL);
+    free(txt);
+    return rc;
+}
+
+int meta_require(int dirfd, bool sync, unsigned add)
+{
+    feed_dir d = {.dirfd = dirfd, .db = NULL, .sync = sync};
+    uint8_t *txt;
+    size_t len;
+    int rc = read_whole(dirfd, "META", &txt, &len);
+    if (rc)
+        return rc;
+    rc = meta_edit(&d, txt, len, add, 0, NULL);
     free(txt);
     return rc;
 }

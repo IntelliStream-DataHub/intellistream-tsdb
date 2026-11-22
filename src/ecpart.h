@@ -30,14 +30,14 @@
  *    52  u16  k                   k' of the object's geometry (chunk_geom), 1 .. CHUNK_K_MAX
  *    54  u16  m                   1 .. CHUNK_M_MAX
  *    56  u32  cell_bytes
- *    60  u32  positions           R8: a mask of the positions written (E10's degraded settle); 0 in R7: all of them
+ *    60  u32  positions           R9: a mask of the positions written (E10's degraded settle); 0 until then: all of them
  *    64  u64  object_len          the source file's length
  *    72  u64  object_xxh64        xxh64 (seed 0) of the whole object
  *    80  u64  writer_epoch        the chunk epoch the chunks were written under (D4: 1 in R7)
  *    88  i64  settle_ms           when the swap was decided, eng_now_ms (r7-keep counts settle_keep_s from it, the
  *                                 policy settle_coarse_s: never from an mtime, which a rename does not change)
- *    96  u64  ppos                R8: the log position of the settle's MK_COLD marker; 0 in R7
- *   104  u64  stripe_version      R8: the stripe list's version; 0 in R7
+ *    96  u64  ppos                R8: the log position of the settle's MK_COLD marker; 0 but in a cluster ec volume
+ *   104  u64  stripe_version      R8: the stripe list's version; 0 but in a cluster ec volume
  *   112  u8[96] source            the source part's name, NUL padded (p<K>_<A>_<B>_<L>.part)
  *   208  u64  nsums               chunk_sums_total(geometry): one encode-time xxh64 per cell of every position (E26)
  *   216  u64  sums[nsums]
@@ -90,11 +90,11 @@ typedef struct ec_record {
     uint32_t level;
     uint16_t k, m;
     uint32_t cell_bytes;
-    uint32_t positions; /* R8; 0 */
+    uint32_t positions; /* R9 (E10); 0 */
     uint64_t object_len, object_xxh64;
     uint64_t writer_epoch;
     int64_t settle_ms;
-    uint64_t ppos, stripe_version; /* R8; 0 */
+    uint64_t ppos, stripe_version; /* R8: only in a cluster ec volume (record_valid); else 0 */
     char source[96];
     uint64_t nsums;
     uint64_t *sums; /* nsums entries, owned (ec_record_free) */
@@ -118,6 +118,11 @@ size_t ec_record_size(const ec_record *r); /* EC_REC_FIXED + 8 * nsums */
 int ec_record_encode(const ec_record *r, uint8_t *buf, size_t cap);
 /* Safe on any bytes; refuses another version (TSDB_ERR_CORRUPT) and allocates r->sums. */
 int ec_record_decode(const uint8_t *buf, size_t len, ec_record *r);
+/* The same for a volume that may say more: `cluster_ec` (an erasure-coded cluster volume's engine, eng.ec_cluster)
+ * admits ppos and stripe_version != 0 (R8); without it, as the two above, both must be 0. positions != 0 is refused
+ * either way (E10 is R9's). */
+int ec_record_encode_as(const ec_record *r, uint8_t *buf, size_t cap, bool cluster_ec);
+int ec_record_decode_as(const uint8_t *buf, size_t len, ec_record *r, bool cluster_ec);
 void ec_record_free(ec_record *r);
 /* src (a listed .part) + r -> tmp_<pid>_<n>.ec in the engine's directory, fsynced; its name into tmp. */
 int ec_index_write(eng *db, const part *src, const ec_record *r, char tmp[96]);
