@@ -58,4 +58,9 @@ int tsdb_cvol_promote(tsdb *t, uint32_t number, uint64_t epoch_pos);
 extern void (*tsdb_cvol_test_replace_hook)(void *arg);
 extern void *tsdb_cvol_test_replace_arg;
 
+/* Whether volume `vol` is DIVERGED (R8, design-cluster-data.md E26, D8: a settle's digest did not match; refused like a
+ * quiesced volume): 1 or 0, TSDB_ERR_INVALID when the handle has no such volume. Any volume, not only a cluster one;
+ * tsdbd reports it (r8i). */
+int tsdb_volume_diverged(tsdb *t, size_t vol);
+
 #endif

@@ -451,13 +451,15 @@ static int meta_load_or_create(eng *db, bool read_only)
         }
         {
             /* a feature this binary does not know changes what the files mean (markers to apply, links to keep):
-             * the open refuses and names it. Known: "feed", "cluster", "replica" (feed.h). */
+             * the open refuses and names it. Known: "feed", "cluster", "replica", "tier", "ec" (feed.h). */
             char feat[96];
             unsigned feats;
             meta_requires_parse(buf, &feats, feat, sizeof feat);
             db->feed_req = feats & META_REQ_FEED;
             db->replica_req = feats & META_REQ_REPLICA;
             db->cluster_req = feats & META_REQ_CLUSTER;
+            db->ec_req = feats & META_REQ_EC;
+            db->ec_cluster = db->ec_req && db->cluster_req; /* R8: ppos and stripe_version in .ec records */
             if (feat[0]) {
                 fprintf(stderr,
                         "tsdb: META requires the feature(s) \"%s\", which tsdb %s does not know: the open "

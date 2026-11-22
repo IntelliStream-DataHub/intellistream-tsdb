@@ -934,6 +934,75 @@ static void test_writer(int pin)
                                          : "a source whose mapped index changed is not written");
 }
 
+/* R8: a cluster ec volume (requires=cluster,ec, as r8f's attach writes it) writes and opens a record with ppos and
+ * stripe_version set, through the engine's own flag (db.c -> ec_index_write, part_open_ec); the same bytes are not this
+ * volume's once the flag is off (a single server's tier keeps both 0). */
+static void test_cluster_record(void)
+{
+    char dir[PATH_MAX];
+    fresh("cluster_ec", dir, sizeof dir);
+    eng *db = NULL;
+    CHECK(open_eng(dir, &db) == 0);
+    if (db)
+        CHECK(eng_close(db) == 0);
+    int fd = open(dir, O_RDONLY | O_DIRECTORY);
+    CHECK(fd >= 0 && meta_require(fd, true, META_REQ_CLUSTER | META_REQ_EC) == 0);
+    if (fd >= 0)
+        close(fd);
+    meta_cluster_open_allow(true);
+    db = NULL;
+    CHECK(open_eng(dir, &db) == 0);
+    meta_cluster_open_allow(false);
+    if (!db)
+        return;
+    CHECK(db->ec_cluster);
+    uint32_t a = 0;
+    CHECK(eng_series(db, "a", TSDB_FLOAT32, &a) == 0);
+    rows(db, a, T0, 500, 0);
+    CHECK(eng_flush(db) == 0);
+    pthread_mutex_lock(&db->lock);
+    part *src = db->nparts == 1 ? db->parts[0] : NULL;
+    if (src)
+        part_ref(src);
+    pthread_mutex_unlock(&db->lock);
+    CHECK(src != NULL);
+    if (src) {
+        char tmp[96], ecname[160];
+        snprintf(ecname, sizeof ecname, "%.*s.ec", (int)(strlen(src->name) - 5), src->name);
+        ec_record r;
+        make_record(src, EC_CLS_PASSED, &r);
+        r.ppos = 4242, r.stripe_version = 3;
+        int rc = ec_index_write(db, src, &r, tmp);
+        if (rc != 0)
+            fprintf(stderr, "  cluster ec: a record with ppos was not written (%d)\n", rc);
+        CHECK(rc == 0);
+        if (rc == 0) {
+            part *q = NULL;
+            rc = part_open_ec(db, tmp, ecname, &q);
+            if (rc != 0)
+                fprintf(stderr, "  cluster ec: a record with ppos did not open (%d)\n", rc);
+            CHECK(rc == 0 && q && q->ec);
+            if (q)
+                part_unref(q);
+            db->ec_cluster = false; /* as a volume without the word: the same file is not its own */
+            q = NULL;
+            CHECK(part_open_ec(db, tmp, ecname, &q) == TSDB_ERR_CORRUPT && !q);
+            if (q)
+                part_unref(q);
+            char t2[96];
+            CHECK(ec_index_write(db, src, &r, t2) == TSDB_ERR_INVALID && t2[0] == '\0');
+            db->ec_cluster = true;
+            char path[PATH_MAX + 200];
+            snprintf(path, sizeof path, "%s/%s", dir, tmp);
+            unlink(path);
+        }
+        ec_record_free(&r);
+        part_unref(src);
+    }
+    CHECK(eng_close(db) == 0);
+    printf("  cluster ec: ppos and stripe_version written and opened under requires=cluster,ec, refused without\n");
+}
+
 /* ---------------------------------------------------------------- listing */
 static void test_listing(void)
 {
@@ -1160,6 +1229,7 @@ int main(int argc, char **argv)
     test_sealed();
     test_writer(0);
     test_writer(1);
+    test_cluster_record();
     test_listing();
     test_replay();
     test_fno();

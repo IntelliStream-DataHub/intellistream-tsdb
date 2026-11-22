@@ -531,6 +531,7 @@ int tier_engine_attach(eng *db)
     db->tier_vol = vol;
     if ((rc = tier_meta_write(db, txt, es->vuuid)) != 0)
         return rc; /* the open fails; its eng_close detaches */
+    db->tier_req = true; /* the one place it is set: META says requires=tier now, also at the first attach (E55) */
     if ((rc = eccache_set_vuuid(t, vol, es->vuuid)) != 0)
         return rc; /* the cache's readers name chunks by the same uuid as their writers */
     chunk_backend *be = t->be;

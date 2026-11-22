@@ -33,6 +33,7 @@
  */
 #include "internal.h"
 #include "chunk.h"
+#include "cvol.h"
 #include "eckeep.h"
 #include "ecpart.h"
 #include "ecswap.h"
@@ -382,7 +383,7 @@ static void case_match(void)
         sleep_ms(50);
     graveyard_purge(x.db, false);
     CHECK(!exists(s.settled) && eckeep_status(x.db, s.settled) == TSDB_ERR_NOTFOUND);
-    CHECK(!atomic_load(&x.db->diverged));
+    CHECK(!atomic_load(&x.db->diverged) && tsdb_volume_diverged(x.t, x.v) == 0);
     CHECK(read_all(&x, &a1) == 0 && a1.n == a0.n && a1.sum == a0.sum);
     free(s.rec.sums);
     h_close(&x);
@@ -431,7 +432,7 @@ static void case_damage1(void)
     CHECK(flip(&s, 0) > 0); /* a data position: a RAW read would hash these bytes */
     atomic_store(&eckeep_test_pause, false);
     CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
-    CHECK(!atomic_load(&x.db->diverged));
+    CHECK(!atomic_load(&x.db->diverged) && tsdb_volume_diverged(x.t, x.v) == 0);
     CHECK(read_all(&x, &a1) == 0 && a1.n == a0.n && a1.sum == a0.sum);
     free(s.rec.sums);
     h_close(&x);
@@ -448,6 +449,11 @@ static void diverged_checks(h *x, const settled *s, const char *log)
     CHECK(strstr(log, "DIVERGED") && strstr(log, hex) && strstr(log, ecname) && strstr(log, s->settled) &&
           strstr(log, vp));
     CHECK(atomic_load(&x->db->diverged));
+    /* the accessor tsdbd reads (r8i): this volume, no other, and no volume past the last */
+    CHECK(tsdb_volume_diverged(x->t, x->v) == 1);
+    if (x->v != 0)
+        CHECK(tsdb_volume_diverged(x->t, 0) == 0);
+    CHECK(tsdb_volume_diverged(x->t, (size_t)1 << 20) == TSDB_ERR_INVALID);
     acc a;
     CHECK(read_all(x, &a) == TSDB_ERR_UNAVAILABLE);
     CHECK(tsdb_append(x->t, TSDB_SID(x->v, x->s), T0 + 5 * DAY, 1.0f) == TSDB_ERR_UNAVAILABLE);
@@ -646,7 +652,7 @@ static void case_down(void)
         sleep_ms(50);
     graveyard_purge(x.db, false);
     CHECK(exists(s.settled) && eckeep_status(x.db, s.settled) == ECKEEP_PENDING);
-    CHECK(!atomic_load(&x.db->diverged));
+    CHECK(!atomic_load(&x.db->diverged) && tsdb_volume_diverged(x.t, x.v) == 0);
     h_close(&x);
     move_store(NST - 1, false);
     CHECK(h_open(&x, 1) == 0);
@@ -669,7 +675,7 @@ static void case_orphan(void)
     CHECK(eng_drop_before(x.db, T0 + 2 * DAY) == 0);
     atomic_store(&eckeep_test_pause, false);
     CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_ORPHAN);
-    CHECK(!atomic_load(&x.db->diverged));
+    CHECK(!atomic_load(&x.db->diverged) && tsdb_volume_diverged(x.t, x.v) == 0);
     graveyard_purge(x.db, false); /* not before keep_s from when it was found so */
     CHECK(exists(s.settled) && eckeep_status(x.db, s.settled) == ECKEEP_ORPHAN);
     atomic_store(&clock_off, 3601000); /* an hour later */

@@ -1934,6 +1934,19 @@ int tsdb_volume_resume(tsdb *t, size_t vol)
     return rc;
 }
 
+/* R8 (r8i reports it in tsdbd): the engine's own DIVERGED flag, which a settle's digest sets (src/eckeep.c, later the
+ * durable DIVERGED file of src/ecdiverge.h). Read under the read lock: a recovery swaps the engine under the write
+ * lock and carries the flag to the new one. */
+int tsdb_volume_diverged(tsdb *t, size_t vol)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    int rc = vol < t->nvols && t->vols[vol]
+                 ? atomic_load_explicit(&t->vols[vol]->diverged, memory_order_acquire) ? 1 : 0
+                 : TSDB_ERR_INVALID;
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
+
 int tsdb_volume_idle(tsdb *t, size_t vol, int timeout_ms)
 {
     pthread_rwlock_rdlock(&t->lock);

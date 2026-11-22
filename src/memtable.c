@@ -770,6 +770,10 @@ static int wal_markers_locked(eng *db, const wal_mrec *r, size_t n, uint64_t *fn
     for (size_t i = 0; i < n; i++) {
         if (r[i].span == 0 || r[i].body_len % 4 != 0 || r[i].body_len > ((size_t)1 << 27))
             return TSDB_ERR_INVALID;
+        /* E17: a marker the volume's own next open would refuse (GC without requires=ec, ...) is never logged; a
+         * write that tried fails here, not the restart */
+        if (!mk_type_admitted(r[i].type, db->ec_req, db->tier_req) && mk_test_mutant != MK_MUT_WRITE_ANY)
+            return TSDB_ERR_INVALID;
         span += r[i].span;
         bytes += WAL_HDR + WAL_MARKER_HDR + r[i].body_len;
     }
@@ -2243,6 +2247,18 @@ int wal_open(eng *db, int (*before_replay)(eng *))
             size_t n = wr.kind == WAL_KIND_ROWS ? wr.n : 0; /* a marker is skipped; its numbers are counted */
             if (eng_test_mutant == MUT_MARKER_ROWS && wr.kind == WAL_KIND_MARKER)
                 n = wr.n / WAL_ROW; /* planted: a marker's payload replayed as rows (tests/test_fno.c) */
+            if (wr.kind == WAL_KIND_MARKER && !mk_type_admitted(wr.mtype, db->ec_req, db->tier_req)) {
+                /* E17: GC and DIGEST are an erasure-coded volume's (COLD a tier's too); without the word in META they
+                 * are as unknown to this volume as to an older binary, which refuses the word: never skipped quietly.
+                 * 14 and 15 are R10's, behind the same word, and this binary cannot apply them anywhere */
+                const char *tn = mk_type_name(wr.mtype);
+                fprintf(stderr, "tsdb: %s: WAL segment %s holds a marker of type %u (%s) at offset %zu, which this "
+                                "volume does not admit (META lacks requires=ec or tier, or a later release wrote it): "
+                                "the open refuses (META lost the word, or the segment is another volume's)\n",
+                        db->dir, segs[k].name, (unsigned)wr.mtype, tn ? tn : "a later release's", pos);
+                rc = TSDB_ERR_CORRUPT;
+                break;
+            }
             for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
                 uint32_t id;
                 int64_t ts;

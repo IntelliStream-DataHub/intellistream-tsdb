@@ -74,13 +74,19 @@ int feed_scan_retained(int dirfd, uint64_t *segments, uint64_t *bytes);
  * "feed" (the change feed, this file), "cluster" (a cluster volume's directory: opened only by its tsdbd, never alone
  * or as a local volume; design-cluster.md §11.1) and "replica" (the replica's own files beside the engine's: RSTATE,
  * stage_*, REPL and what a deposed leader keeps, which an older binary would ignore; src/replica.h). */
-enum { META_REQ_FEED = 1, META_REQ_CLUSTER = 2, META_REQ_REPLICA = 4, META_REQ_TIER = 8 };
+enum { META_REQ_FEED = 1, META_REQ_CLUSTER = 2, META_REQ_REPLICA = 4, META_REQ_TIER = 8, META_REQ_EC = 16 };
+/* "ec" (R8, E17): an erasure-coded cluster volume (requires=cluster,tier,ec; written only by the attach of a cluster
+ * volume with redundancy EC): its WAL may hold the markers GC and DIGEST (marker.h), which the open of a volume without
+ * the word refuses, and its .ec records carry ppos and stripe_version (ecpart.c record_valid). */
 /* "tier" (R7, src/tier.c): the volume may hold erasure-coded parts (.ec, settled_*), which only a writer with a tier
  * reads. Known to every build, so that one without TSDB_EC, a follower or an open without a tier refuses it with a
  * line naming the volume rather than as an unknown word. meta_tier_require: META gets the word and, when it has none,
  * the line `vuuid_line` (with its newline): one rewrite (tmp, fsync, rename, directory fsync; the syncs only with
  * sync, the engine's opt.fsync); nothing is written when META says both already. Every rewrite of the requires= line keeps the words it does not change. */
 int meta_tier_require(int dirfd, bool sync, const char *vuuid_line);
+/* META with the words `add` (META_REQ_*) in its requires= line, every other word kept: the same rewrite as above
+ * (r8f's attach writes cluster,tier,ec through it; tests make such volumes). */
+int meta_require(int dirfd, bool sync, unsigned add);
 void meta_requires_parse(const char *meta_text, unsigned *feats, char *unknown, size_t cap);
 /* The cluster path's leave to open a directory whose META says requires=cluster: per thread, set around the open
  * (tsdbd's cluster volumes, and checkers that open a replica directory in-process, read-only). Without it such an

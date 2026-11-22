@@ -1914,6 +1914,21 @@ struct eng {
                                * jr, and decides nothing the replicas must carry out (a class switch: classes.c) */
     bool cluster_req;         /* META said requires=cluster: a cluster volume's (R7 never settles one: D1) */
     bool fno_torn_open;       /* the open found one FNO slot bad (the numbers skipped ahead by FNO_BELT) */
+    /* R8 (docs/design-cluster-data.md 2.3, E17): an erasure-coded cluster volume. ec_req: META said requires=ec, so
+     * its WAL may hold the markers GC and DIGEST (an open without the word refuses them: mk_type_admitted; tier_req,
+     * set by tier_engine_attach once META says requires=tier (the first attach writes the word after META was read;
+     * an open with the word and no tier fails), admits COLD as ec_req does). ec_cluster:
+     * ec_req and cluster_req, so its .ec records carry ppos and stripe_version (ecpart.c record_valid). The state of
+     * R8's files, NULL until the track that builds each one fills it (single-server and other volumes keep NULL):
+     * ppos (src/ppos.h, r8d), cold (the leader's settle cut, src/eccold.h, r8g), diverge (DIVERGED, src/ecdiverge.h,
+     * r8i), gcmk (MK_GC's pending-delete list, src/ecgcmk.h, r8k). Pointers only: each keeps its locks behind them. */
+    bool ec_req;
+    bool tier_req;
+    bool ec_cluster;
+    struct ppos *ppos;
+    struct eccold *cold;
+    struct ecdiverge *diverge;
+    struct ecgcmk *gcmk;
     pthread_mutex_t feed_lock;
     pthread_cond_t feed_cv;
     feed_cfg feed;            /* feed_lock */
