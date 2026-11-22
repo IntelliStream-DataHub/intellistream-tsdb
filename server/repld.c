@@ -60,6 +60,8 @@
  * `stepcurrentonly` runs catch-up steps only on ticks that are not late (a thread always late never catches a peer
  * up: rejoinlate), `stallcatchup` catches a stop of the whole process up in ticks and counts its own stop as its peers'
  * silence (jointpause).
+ * `demotestaleidx` rebuilds a deposed writer's index of record starts over the entry its old engine pushed after demote
+ * cleared it (core_build), so the cut of its uncommitted tail stops the volume (deposetail).
  * `commitpastremoved` takes an ISR request as the record at once, before the metadata group commits it (isr),
  * `nominisr` never checks min_isr (minisr), `ackbelowminisr` hands the writer a commit point reached after a shrink
  * below min_isr (minisr), `nocap` keeps the leader's segments for a lagging replica without the caps repl_retain_mb and
@@ -80,7 +82,9 @@
  * must move up to what the peer acknowledged, or it is never sent another record); `slowread` has every catch-up
  * read take SLOW_READ_MS more (a slow disk or NFS); `slowtick` has a writer's catch-up step take SLOW_TICK_MS at every
  * tick it runs (tickwall); `latetick` has every tick of a writer take LATE_TICK_MS more (rejoinlate); `slowack` has a replica's ACKs report the durable end it had
- * SLOW_ACK_MS before (a far replica: always a few writes behind the leader's end while it keeps up).
+ * SLOW_ACK_MS before (a far replica: always a few writes behind the leader's end while it keeps up); `latebytes` holds
+ * the writer's first rows record written while <dir>/latebytes exists in op_bytes, after its write(), until a demote has
+ * begun (deposetail).
  * TSDB_REPLD_TRACE=1 (debugging; jepsen-cluster passes the environment on) logs every 2 s per volume a line of the
  * core's state (repl_debug: per peer next, match, acked) and the driver's cursors (sent, want, acked, ages, link).
  */
@@ -264,7 +268,8 @@ enum {
     RM_PROMOTENONE, /* a driver promoting reports role NONE: a slow promotion is taken for deposed (F3) */
     RM_TICKSTRETCH,
     RM_STEPCURRENTONLY,
-    RM_STALLCATCHUP
+    RM_STALLCATCHUP,
+    RM_DEMOTESTALEIDX /* the index rebuilt over what a deposed writer's engine pushed after demote cleared it */
 };
 
 static struct {
@@ -300,6 +305,9 @@ static struct {
                    * freeing the links, and a stopped driver admits records whatever its lease, so the engine's NOW
                    * markers reach the WAL hooks of a stopped driver (op_bytes says so once) */
     _Atomic int said_late; /* latewal's line, once */
+    int late_bytes;   /* TSDB_REPLD_TEST=latebytes: the writer's first rows record written while <dir>/latebytes exists
+                       * is held in op_bytes (written, not yet indexed or shipped) until a demote has begun (deposetail) */
+    _Atomic int late_bytes_done;
     int sync_by_hook; /* TSDB_REPLD_TEST=syncbyhook: a writer's SYNC compares what op_synced reported, not the engine */
     int fetch_late;   /* TSDB_REPLD_TEST=fetchlate: a replica's first FETCH of a name waits FETCH_LATE_MS */
     int no_fetch;     /* TSDB_REPLD_TEST=nofetch: a replica sends no FETCH and says once per name that it withholds it */
@@ -726,6 +734,41 @@ static void catch_up(struct rvol *rv, struct eng *db)
     }
 }
 
+/* latebytes (tests): a writer's record admitted before its depose whose bytes reach op_bytes only after the demote
+ * began (a write held in the WAL writer while the process was stopped: jepsen-cluster pause, 2026-11-22). Held here
+ * after the write() and before anything is indexed or shipped, with no lock, until the driver has no core. */
+static void late_bytes_hold(struct rvol *rv, const void *buf, size_t len, uint64_t seq, uint64_t off, uint64_t first,
+                            uint64_t last)
+{
+    int rows = 0;
+    for (size_t o = 0; o < len;) {
+        wal_rec wr;
+        size_t sz = wal_record((const uint8_t *)buf + o, len - o, seq, off + o, &wr);
+        if (!sz)
+            break;
+        rows |= wr.kind == WAL_KIND_ROWS;
+        o += sz;
+    }
+    char f[sizeof G.dir + 16];
+    snprintf(f, sizeof f, "%s/latebytes", G.dir);
+    if (!rows || access(f, F_OK) != 0 || atomic_exchange(&G.late_bytes_done, 1))
+        return;
+    say("test: volume %" PRIu32 ": the bytes of %" PRIu64 "..%" PRIu64 " are held until the writer is deposed", rv->number,
+        first, last);
+    uint64_t t0 = now_ms();
+    for (;;) {
+        pthread_mutex_lock(&rv->mu);
+        int gone = rv->core == NULL;
+        pthread_mutex_unlock(&rv->mu);
+        if (gone || now_ms() - t0 > 30000)
+            break;
+        struct timespec ts = {0, 10000000};
+        nanosleep(&ts, NULL);
+    }
+    say("test: volume %" PRIu32 ": the bytes of %" PRIu64 "..%" PRIu64 " %s", rv->number, first, last,
+        now_ms() - t0 > 30000 ? "go on after 30 s" : "released by the demote");
+}
+
 /* jr_ops.bytes: the writer's records, before its fdatasync; out at once to every peer whose cursor is at them */
 static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len,
                      uint64_t first, uint64_t last)
@@ -737,6 +780,8 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
      * when no write was pending); class-switch when a CLASS marker is among the records (the switch's record in the
      * log, its CLASSES record not yet) */
     int rows = 0;
+    if (G.late_bytes)
+        late_bytes_hold(rv, buf, len, seq, off, first, last);
     pthread_mutex_lock(&rv->mu);
     for (size_t o = 0; o < len;) {
         wal_rec wr;
@@ -2227,6 +2272,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "tickstretch")    ? RM_TICKSTRETCH
                : !strcmp(mu, "stallcatchup")   ? RM_STALLCATCHUP
                : !strcmp(mu, "stepcurrentonly") ? RM_STEPCURRENTONLY
+               : !strcmp(mu, "demotestaleidx") ? RM_DEMOTESTALEIDX
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -2239,6 +2285,7 @@ void repld_init(tsdb *t, const char *dir)
     G.stale_sent = te && strstr(te, "stalesent");
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
     G.late_wal = te && strstr(te, "latewal");
+    G.late_bytes = te && strstr(te, "latebytes");
     G.no_clock = te && strstr(te, "noclock");
     G.sync_by_hook = te && strstr(te, "syncbyhook");
     G.sync_late = te && strstr(te, "synclate");
@@ -2263,7 +2310,8 @@ void repld_init(tsdb *t, const char *dir)
 }
 
 /* The index, the history and a new core from what the volume's directory and REPL hold: at the open, and after a
- * deposed leader's engine was reopened as a replica (demote). rv->nidx and rv->nhist are empty; rv->rec is set. Without
+ * deposed leader's engine was reopened as a replica (demote). rv->nhist is empty, the index is emptied here; rv->rec is
+ * set. Without
  * rv->mu (it reads the engine, whose buf_lock is above it): the caller lists the core under it. */
 static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struct repl **core_out)
 {
@@ -2288,10 +2336,21 @@ static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struc
             hist_note(rv, rv->st.hist[i].epoch, rv->st.hist[i].start);
     for (uint32_t i = 0; i < nh; i++)
         hist_note(rv, h[i].epoch, h[i].start);
+    /* The index is the log's alone, rebuilt whole. A deposed writer's engine writes the records it admitted before
+     * the depose until demote's swap closes it, and an entry pushed after demote cleared the index, kept here below
+     * the entries read from the log, left it unsorted with its first start above positions the log holds: idx_find
+     * took them for trimmed, and the cut of the uncommitted tail at the new leader's ANSWER stopped the volume for good
+     * ("the log does not retain a position above its applied end"; jepsen-cluster pause, 2026-11-22; test_cluster
+     * deposetail, mutant demotestaleidx). The old engine is closed here (the swap waited for its writers), so nothing
+     * pushes from here on: the entries read below are the only ones, in log order. */
+    pthread_mutex_lock(&rv->mu);
+    if (G.mutant != RM_DEMOTESTALEIDX)
+        rv->nidx = 0;
     rv->log_start = first ? first : log_end + 1;
     if (rv->log_start < 1)
         rv->log_start = 1;
     rv->idx_end = rv->log_start - 1;
+    pthread_mutex_unlock(&rv->mu);
     if (db)
         index_log(rv, db, rv->log_start, log_end);
     tsdb_cvol_unref(&db);
