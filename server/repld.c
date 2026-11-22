@@ -997,7 +997,13 @@ static int ship_wait_one(struct rvol *rv, struct shipwait *w, uint64_t deadline)
 static void ship_batch_end(int wait)
 {
     struct shipbatch *b = &tl_ship;
-    uint64_t span = 2ull * (b->rv && b->rv->rec.isr_lag_ms ? b->rv->rec.isr_lag_ms : 1000);
+    uint32_t lag = 0;
+    if (b->rv) { /* the writer's thread, not the volume's: rv->rec is the manager's to rewrite (rec_set) under rv->mu */
+        pthread_mutex_lock(&b->rv->mu);
+        lag = b->rv->rec.isr_lag_ms;
+        pthread_mutex_unlock(&b->rv->mu);
+    }
+    uint64_t span = 2ull * (lag ? lag : 1000);
     uint64_t deadline = b->t0 + (span > SHIP_BASE_MS ? span : SHIP_BASE_MS) + b->bytes * 1000 / SHIP_MIN_BPS;
     int late = 0;
     for (size_t i = 0; i < b->n; i++) {
@@ -2311,9 +2317,13 @@ static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struc
     struct repl_durable d = {.rid = rv->st.rid, .fence = rv->st.fence, .led = rv->st.led, .floor = rv->st.floor,
                              .log_start = rv->log_start, .log_end = log_end, .hold = hold, .hist = rv->hist,
                              .nhist = rv->nhist};
-    const struct cluster_vol_rec *r = &rv->rec;
-    uint32_t lag = r->isr_lag_ms ? r->isr_lag_ms : 1000;
-    int min_isr = r->min_isr && G.mutant != RM_NOMINISR ? (int)r->min_isr : 1; /* planted nominisr: never checked */
+    /* the record's settings under rv->mu: a demote builds the core with the lock let go of, while the manager thread's
+     * repld_update rewrites rv->rec whole (rec_set; a TSan race in test_cluster manystuck) */
+    pthread_mutex_lock(&rv->mu);
+    uint32_t lag = rv->rec.isr_lag_ms ? rv->rec.isr_lag_ms : 1000;
+    uint32_t rmin = rv->rec.min_isr, unans = rv->rec.unanswered_ms;
+    pthread_mutex_unlock(&rv->mu);
+    int min_isr = rmin && G.mutant != RM_NOMINISR ? (int)rmin : 1; /* planted nominisr: never checked */
     struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = min_isr,
                               .isr_lag_ticks = lag / TICK_MS, .resend_ticks = 200 / TICK_MS, .heartbeat_ticks = 1,
                               .idle_heartbeat_ticks = IDLE_HEARTBEAT_MS / TICK_MS,
@@ -2321,7 +2331,7 @@ static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struc
                               .join_hold_ticks = G.mutant == RM_NOJOINHOLD ? 0 : lag / TICK_MS,
                               /* a member a promotion kept unanswered (§6.2) goes after unanswered_ms, not isr_lag */
                               .unanswered_ticks =
-                                  G.mutant == RM_KEEPUNANSWERED ? 0 : (r->unanswered_ms + TICK_MS - 1) / TICK_MS,
+                                  G.mutant == RM_KEEPUNANSWERED ? 0 : (unans + TICK_MS - 1) / TICK_MS,
                               .rec_find = idx_find, .ctx = rv};
     *core_out = repl_open(&cfg, &d);
     rv->sync_pause_end = now_ms() + SYNC_PAUSE_MS;
