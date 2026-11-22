@@ -117,7 +117,7 @@ static bool merge_selectable(const eng *db, size_t a, size_t b)
 size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size_t cap)
 {
     ecpolicy_state *ps = ecpolicy_of(db);
-    const tier_cfg *cfg = db->tier ? tier_config(db->tier) : NULL;
+    const tier_settings *cfg = db->tier ? tier_eng_settings(db) : NULL;
     if (!ps || !cfg || !cap)
         return 0;
     int64_t grace = cfg->grace_s * 1000, coarse = cfg->coarse_s * 1000;

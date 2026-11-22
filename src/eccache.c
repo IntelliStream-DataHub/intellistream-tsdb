@@ -14,6 +14,7 @@
  */
 #include "eccache.h"
 #include "chunk.h"
+#include "coldops.h"
 #include "ecpart.h"
 #include "stats_priv.h"
 #include "tier.h"
@@ -58,7 +59,8 @@ typedef struct co {
     struct co *prev, *next; /* LRU, OPEN objects only */
     uint32_t volume;
     uint8_t oid[16];
-    chunk_obj *o;
+    cold_obj *o;
+    const cold_ops *ops; /* the volume's ops that opened o: closing and reading need no context (src/coldops.h) */
     uint64_t *sums; /* the object's record sums: chunk_obj keeps a pointer to them, and the part may go first */
     uint32_t pins;
     unsigned fds; /* counted against the fd budget from the reservation (OPENING) on */
@@ -72,11 +74,6 @@ typedef struct og {
     uint8_t oid[16];
     ce *first;
 } og;
-
-typedef struct vu {
-    uint32_t volume;
-    uint8_t u[16];
-} vu;
 
 struct eccache_tier {
     tier *t;
@@ -92,8 +89,6 @@ struct eccache_tier {
     size_t ghn, ngrp;
     uint64_t budget, bytes, fd_budget, fds;
     eccache_counters n; /* the counters (bytes, entries, objs_open, fds_open, budgets filled in on read) */
-    vu *vus;
-    size_t nvus;
     _Atomic(chunk_backend *) be; /* the tier's: not owned, not closed here */
 };
 
@@ -403,7 +398,7 @@ static void co_close_list(struct eccache_tier *c, co *o)
     for (co *nx; o; o = nx) {
         nx = o->hnext;
         if (o->o) {
-            chunk_obj_close(o->o);
+            o->ops->obj_close(o->o);
             n++;
         }
         free(o->sums);
@@ -481,12 +476,13 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, co **out)
     pthread_mutex_unlock(&c->mu);
     co_close_list(c, vict);
 
-    int rc = 0;
-    chunk_backend *be = eccache_backend(c->t, &rc);
-    if (be) {
-        uint8_t u[16];
-        eccache_vuuid(c->t, e->volume, u);
-        rc = chunk_obj_open(be, e->volume, u, r->oid, &gm, nw->sums, &nw->o);
+    /* the volume's ops of its latest attach: a retired engine's part reads the same volume's objects */
+    int rc = TSDB_ERR_UNAVAILABLE;
+    coldvol *cv = tier_cold_get(c->t, e->volume);
+    if (cv) {
+        rc = cv->ops->obj_open(cv->ctx, r->oid, &gm, nw->sums, &nw->o);
+        nw->ops = cv->ops;
+        tier_cold_put(cv);
     }
     if (eccache_test_hook)
         eccache_test_hook(c->t, ECC_HOOK_OPENED, r->oid);
@@ -567,7 +563,7 @@ static int fill(struct eccache_tier *c, const part *p, const struct ecpart *e, c
     }
     chunk_report rep;
     memset(&rep, 0, sizeof rep);
-    rc = chunk_obj_read(o->o, x->off, x->len, x->data, CHUNK_RR_RAW, &rep);
+    rc = o->ops->obj_read(o->o, x->off, x->len, x->data, CHUNK_RR_RAW, &rep);
     atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
     bool ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
     bool retried = false;
@@ -581,7 +577,7 @@ static int fill(struct eccache_tier *c, const part *p, const struct ecpart *e, c
         c->n.retries++;
         pthread_mutex_unlock(&c->mu);
         retried = true;
-        rc = chunk_obj_read(o->o, x->off, x->len, x->data, 0, &rep);
+        rc = o->ops->obj_read(o->o, x->off, x->len, x->data, 0, &rep);
         ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || eccache_mutant == ECC_MUT_NORECHECK ||
                          (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
     }
@@ -827,14 +823,13 @@ void eccache_tier_close(struct tier *t)
         for (co *o = c->oh[i], *nx; o; o = nx) {
             nx = o->hnext;
             if (o->o)
-                chunk_obj_close(o->o);
+                o->ops->obj_close(o->o);
             free(o->sums);
             free(o);
         }
     free(c->eh);
     free(c->oh);
     free(c->gh);
-    free(c->vus);
     pthread_mutex_destroy(&c->mu);
     pthread_cond_destroy(&c->cv);
     free(c);
@@ -854,37 +849,13 @@ struct chunk_backend *eccache_backend(struct tier *t, int *rc)
     return be;
 }
 
-int eccache_set_vuuid(struct tier *t, uint32_t volume, const uint8_t vuuid[16])
-{
-    struct eccache_tier *c = t->cache;
-    pthread_mutex_lock(&c->mu);
-    size_t i = 0;
-    while (i < c->nvus && c->vus[i].volume != volume)
-        i++;
-    if (i == c->nvus) {
-        vu *n = realloc(c->vus, (c->nvus + 1) * sizeof *n);
-        if (!n) {
-            pthread_mutex_unlock(&c->mu);
-            return TSDB_ERR_NOMEM; /* the open fails: a reader with an all-zero uuid would take every chunk for lost */
-        }
-        c->vus = n;
-        c->nvus++;
-        c->vus[i].volume = volume;
-    }
-    memcpy(c->vus[i].u, vuuid, 16);
-    pthread_mutex_unlock(&c->mu);
-    return 0;
-}
-
 void eccache_vuuid(struct tier *t, uint32_t volume, uint8_t out[16])
 {
-    struct eccache_tier *c = t->cache;
     memset(out, 0, 16);
-    pthread_mutex_lock(&c->mu);
-    for (size_t i = 0; i < c->nvus; i++)
-        if (c->vus[i].volume == volume)
-            memcpy(out, c->vus[i].u, 16);
-    pthread_mutex_unlock(&c->mu);
+    coldvol *cv = tier_cold_get(t, volume);
+    if (cv)
+        memcpy(out, cv->vuuid, 16);
+    tier_cold_put(cv);
 }
 
 /* Takes the object's entries out (each freed now, or by its reader: a fill in flight goes on to its reader and is
@@ -1056,6 +1027,17 @@ int ec_test_attach(eng *db, part *p, ec_record *rec_out)
     return ec_test_attach_from(db, p, NULL, rec_out);
 }
 
+struct memsrc {
+    const uint8_t *b;
+};
+
+static int memsrc_fill(void *ctx, uint64_t s, uint64_t off, uint8_t *buf, size_t len)
+{
+    (void)s;
+    memcpy(buf, ((struct memsrc *)ctx)->b + off, len);
+    return 0;
+}
+
 int ec_test_attach_from(eng *db, part *p, const uint8_t *src, ec_record *rec_out)
 {
     tier *t = db->tier;
@@ -1066,14 +1048,17 @@ int ec_test_attach_from(eng *db, part *p, const uint8_t *src, ec_record *rec_out
     pthread_mutex_unlock(&db->lock);
     if (rc)
         return rc;
-    chunk_backend *be = eccache_backend(t, &rc);
-    if (!be)
-        return rc;
+    coldvol *cv = tier_cold(db);
+    if (!cv)
+        return TSDB_ERR_UNAVAILABLE;
     ec_record r;
     memset(&r, 0, sizeof r);
     chunk_geom g;
-    if ((rc = chunk_geom_derive(&g, (unsigned)t->cfg.k, (unsigned)t->cfg.m, p->map_len)) != 0)
+    if ((rc = chunk_geom_derive(&g, (unsigned)cv->set.k, (unsigned)cv->set.m, p->map_len)) != 0)
         return rc;
+    uint64_t epoch = coldvol_epoch(cv);
+    if (epoch == 0)
+        return TSDB_ERR_UNAVAILABLE;
     r.version = EC_RECORD_VERSION;
     r.class_check = EC_CLS_PASSED;
     chunk_random(r.oid, sizeof r.oid);
@@ -1088,17 +1073,18 @@ int ec_test_attach_from(eng *db, part *p, const uint8_t *src, ec_record *rec_out
     if (!src)
         src = p->map;
     r.object_xxh64 = xxh64(src, p->map_len, 0);
-    r.writer_epoch = 1;
+    r.writer_epoch = epoch;
     r.settle_ms = eng_now_ms(db);
     snprintf(r.source, sizeof r.source, "%s", p->name);
     r.nsums = chunk_sums_total(&g);
     if (!(r.sums = malloc(r.nsums * sizeof *r.sums)))
         return TSDB_ERR_NOMEM;
-    /* the engine's own uuid (META vuuid=), as a settle writes it: the cache reads with the one the tier handed it */
-    const uint8_t *u = tier_vuuid(db);
-    rc = chunk_be_see_epoch(be, db->tier_vol, 1);
+    /* through the volume's ops (the engine's own uuid, META vuuid=, as a settle writes it): one pass from memory */
+    struct memsrc ms = {src};
+    chunk_put_src ps = {.ctx = &ms, .fill = memsrc_fill};
+    rc = cv->ops->see_epoch(cv->ctx, epoch);
     if (rc == 0)
-        rc = chunk_be_put_object(be, db->tier_vol, u, r.oid, &g, 1, src, ~0u, r.sums);
+        rc = cv->ops->put_stream(cv->ctx, r.oid, &g, epoch, &ps, r.sums);
     if (rc == 0 && rec_out)
         rc = rec_copy(rec_out, &r); /* before the attach: a failure after it would report a part left attached */
     if (rc == 0) {

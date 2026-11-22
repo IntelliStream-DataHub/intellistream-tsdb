@@ -286,6 +286,11 @@ cgroup, so `nice` does not keep your work out of its way.
   the volume's uuid are queued (another database on the same stores is left alone; `chunk_store_del` too refuses a
   chunk of another vuuid as NOTFOUND). A test that puts objects named by no `.ec` file and reopens sets
   `ecgc_test_nosweep` (test_seam, test_tier). `tests/test_ecgc.c` (mutants in the Makefile).
+- `src/coldops.h`, `src/coldops_dir.c` (R8, E22): the cold ops of one volume (put, open/read, delete, list, owner,
+  epoch, see_epoch, writable, all_up); settle.c, eccache.c, eckeep.c, ecgc.c and tier.c reach the stores only through them
+  and never name a store index. Per attached engine (`tier_attach`: ops, settings, epoch provider; a refcounted `coldvol`
+  in the tier's registry, `tier_cold_get` by volume); the epoch is the provider's (`tier_epoch`, 1 on a single server),
+  and an unsure store is raised only by it (mutant `selfepoch`, `test_tier`).
 - `src/settle.c`, `src/ecpolicy.c` (R7, design-cluster-data.md E5-E7, E26): `eng_settle` turns a key's parts into `.ec`
   parts in ONE pass over each part's map (each stripe copied once; the granule crcs, the header, index and footer hash
   and the CLASSES judgement are checked on that copy, which is what is encoded: never read the map twice), then
@@ -757,7 +762,8 @@ cgroup, so `nice` does not keep your work out of its way.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf, and so are the granule cache's mutex (`src/eccache.c`: never held across I/O, an open or close, a decode or
-  another lock: a fill waits on its entry, not on the mutex), the digest's (`src/eckeep.c`), the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O)
+  another lock: a fill waits on its entry, not on the mutex), the digest's (`src/eckeep.c`), the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O), the tier's registry of
+  cold volumes (`t->cmu`, `src/tier.c`: only around the array; the last put, which frees a context, outside it)
   and the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
   sweeper takes `db->lock` only with it released). R7's settle: the policy's `ps->pmu` (`src/ecpolicy.c`: its fail list and eager count, taken under
   `db->lock` while the settle thread picks) is a leaf; the tier's settle mutex `st->mu` (`src/settle.c`) is never held

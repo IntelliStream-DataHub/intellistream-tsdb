@@ -6,9 +6,11 @@
  * epoch 1, vuuid=, requires=tier and the refusals of D1 and D7) here; r7-seam's cache, r7-gc's queue and r7-settle's
  * thread live in their own files, behind the hooks, never here.
  */
+#include "eccold.h"
 #include "tier.h"
 #include "chunk.h"
 #include "chunk_priv.h"
+#include "coldops.h"
 #include "eccache.h"
 #include "feed.h"
 #include "ecgc.h"
@@ -30,7 +32,6 @@
 int r7_mutant;
 int tier_mutant;
 
-static void tier_halt(tier *t, int i, const char *why);
 
 void tier_cfg_free(tier_cfg *c)
 {
@@ -343,6 +344,7 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
     }
     atomic_init(&t->refs, 1);
     atomic_init(&t->halted, false);
+    pthread_mutex_init(&t->cmu, NULL);
     t->cfg = c;
     if (tier_mutant != TIER_MUT_PERENGINE && (rc = tier_be_open(t, dir)) != 0) {
         tier_put(t);
@@ -373,6 +375,10 @@ void tier_put(tier *t)
     ecsettle_tier_close(t);
     ecgc_tier_close(t);
     eccache_tier_close(t);
+    for (size_t i = 0; i < t->ncvs; i++)
+        tier_cold_put(t->cvs[i]); /* before the backend: a directory context names it */
+    free(t->cvs);
+    pthread_mutex_destroy(&t->cmu);
 #ifdef TSDB_EC
     if (t->be)
         chunk_be_close(t->be);
@@ -393,11 +399,20 @@ uint32_t tier_refs(const tier *t) { return t ? atomic_load(&((tier *)t)->refs) :
 
 static __thread tier *want_tier;
 static __thread uint32_t want_vol;
+static __thread tier_attach want_attach;
 
 void tier_want(tier *t, uint32_t vol)
 {
     want_tier = t;
     want_vol = vol;
+    memset(&want_attach, 0, sizeof want_attach);
+}
+
+void tier_want_attach(tier *t, uint32_t vol, const tier_attach *a)
+{
+    tier_want(t, vol);
+    if (a)
+        want_attach = *a;
 }
 
 static int hexval(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; }
@@ -481,11 +496,119 @@ static int tier_meta_write(eng *db, const char *txt, uint8_t u[16])
     return rc;
 }
 
+
+void tier_settings_from_cfg(const tier_cfg *c, tier_settings *s)
+{
+    memset(s, 0, sizeof *s);
+    s->k = c->k;
+    s->m = c->m;
+    s->grace_s = c->grace_s;
+    s->keep_s = c->keep_s;
+    s->coarse_s = c->coarse_s;
+    s->cache_mb = c->cache_mb;
+    s->eager = c->eager;
+}
+
+coldvol *tier_cold_ref(coldvol *cv)
+{
+    if (cv)
+        atomic_fetch_add_explicit(&cv->refs, 1, memory_order_relaxed);
+    return cv;
+}
+
+void tier_cold_put(coldvol *cv)
+{
+    if (!cv || atomic_fetch_sub_explicit(&cv->refs, 1, memory_order_acq_rel) != 1)
+        return;
+    if (cv->ops && cv->ctx)
+        cv->ops->ctx_free(cv->ctx);
+    free(cv);
+}
+
+/* The registry takes a reference to cv as the volume's entry; the one it replaces (a retired engine's) is put. */
+static int cold_register(tier *t, coldvol *cv)
+{
+    coldvol *old = NULL;
+    int rc = 0;
+    pthread_mutex_lock(&t->cmu);
+    size_t i = 0;
+    while (i < t->ncvs && t->cvs[i]->volume != cv->volume)
+        i++;
+    if (i == t->ncvs) {
+        coldvol **n = realloc(t->cvs, (t->ncvs + 1) * sizeof *n);
+        if (!n)
+            rc = TSDB_ERR_NOMEM; /* the open fails: a reader of the volume would find no ops */
+        else
+            t->cvs = n, t->cvs[t->ncvs++] = tier_cold_ref(cv);
+    } else {
+        old = t->cvs[i];
+        t->cvs[i] = tier_cold_ref(cv);
+    }
+    pthread_mutex_unlock(&t->cmu);
+    tier_cold_put(old); /* outside cmu: the last put frees the context */
+    return rc;
+}
+
+coldvol *tier_cold_get(tier *t, uint32_t volume)
+{
+    if (!t)
+        return NULL;
+    coldvol *cv = NULL;
+    pthread_mutex_lock(&t->cmu);
+    for (size_t i = 0; i < t->ncvs; i++)
+        if (t->cvs[i]->volume == volume)
+            cv = tier_cold_ref(t->cvs[i]);
+    pthread_mutex_unlock(&t->cmu);
+    return cv;
+}
+
+coldvol *tier_cold(const eng *db) { return db->ecstate ? db->ecstate->cold : NULL; }
+
+uint64_t coldvol_epoch(const coldvol *cv)
+{
+    if (!cv)
+        return 0;
+    return cv->epoch_fn ? cv->epoch_fn(cv->epoch_arg, cv->volume) : 1; /* D4: the constant 1 on a single server */
+}
+
+uint64_t tier_epoch(tier *t, uint32_t volume)
+{
+    coldvol *cv = tier_cold_get(t, volume);
+    uint64_t e = coldvol_epoch(cv);
+    tier_cold_put(cv);
+    return e;
+}
+
+const tier_settings *tier_eng_settings(const eng *db)
+{
+    coldvol *cv = tier_cold(db);
+    return cv ? &cv->set : NULL;
+}
+
+bool tier_cold_writable(const eng *db)
+{
+    coldvol *cv = tier_cold(db);
+    return cv && cv->ops->writable(cv->ctx);
+}
+
+/* A cluster volume (META requires=cluster or replica): eccold_may_attach (src/eccold.h, r8g fills it) decides whether one
+ * attaches a tier; until then R7's refusal stands. */
+static bool tier_is_cluster_volume(eng *db)
+{
+    char txt[512];
+    unsigned feats = 0;
+    if (tier_meta_read(db, txt, sizeof txt) == 0)
+        meta_requires_parse(txt, &feats, NULL, 0);
+    return (feats & (META_REQ_CLUSTER | META_REQ_REPLICA)) || db->replica_req;
+}
+
 int tier_engine_attach(eng *db)
 {
     tier *t = want_tier;
     uint32_t vol = want_vol;
+    tier_attach at = want_attach;
     want_tier = NULL; /* taken once: an engine opened inside this open (none today) does not attach to it */
+    memset(&want_attach, 0, sizeof want_attach);
     char txt[512];
     int rc = tier_meta_read(db, txt, sizeof txt);
     if (rc)
@@ -514,7 +637,7 @@ int tier_engine_attach(eng *db)
     }
     if (!t)
         return 0;
-    if ((feats & (META_REQ_CLUSTER | META_REQ_REPLICA)) || db->replica_req) {
+    if (tier_is_cluster_volume(db) && !eccold_may_attach(db)) { /* eccold.h: asked for cluster volumes only */
         fprintf(stderr, "tsdb: %s: a tier on a cluster volume (META requires=cluster or replica) is not built yet "
                         "(R8): the open fails\n", db->dir);
         return TSDB_ERR_INVALID;
@@ -524,17 +647,29 @@ int tier_engine_attach(eng *db)
         return TSDB_ERR_INVALID;
     }
     struct ecstate *es = calloc(1, sizeof *es);
-    if (!es)
+    coldvol *cv = calloc(1, sizeof *cv);
+    if (!es || !cv) {
+        free(es);
+        free(cv);
         return TSDB_ERR_NOMEM;
+    }
     db->ecstate = es;
     db->tier = tier_get(t);
     db->tier_vol = vol;
+    atomic_init(&cv->refs, 1);
+    es->cold = cv; /* the engine's reference: tier_engine_detach puts it */
+    cv->volume = vol;
+    cv->epoch_fn = at.epoch;
+    cv->epoch_arg = at.epoch_arg;
+    if (at.settings)
+        cv->set = *at.settings;
+    else
+        tier_settings_from_cfg(&t->cfg, &cv->set);
     if ((rc = tier_meta_write(db, txt, es->vuuid)) != 0)
         return rc; /* the open fails; its eng_close detaches */
     db->tier_req = true; /* the one place it is set: META says requires=tier now, also at the first attach (E55) */
-    if ((rc = eccache_set_vuuid(t, vol, es->vuuid)) != 0)
-        return rc; /* the cache's readers name chunks by the same uuid as their writers */
-    chunk_backend *be = t->be;
+    memcpy(cv->vuuid, es->vuuid, 16);
+    void *make_arg = at.make_arg;
     if (tier_mutant == TIER_MUT_PERENGINE) {
         chunk_be_opts o = {.min_up = t->cfg.ndirs - t->cfg.m};
         if ((rc = chunk_be_open2(&es->mut_be, (const char *const *)t->cfg.dirs, t->cfg.ndirs, NULL, &o)) != 0) {
@@ -543,51 +678,47 @@ int tier_engine_attach(eng *db)
                     tsdb_strerror(rc));
             return rc;
         }
-        be = es->mut_be;
+        at.ops = NULL, make_arg = es->mut_be; /* planted: the volume's ops over a backend of its own */
     }
-    /* D4: the chunk epoch is the constant 1, given as the authoritative one at every open: it clears a volume whose
-     * EPOCH lost a slot (a torn store), which would refuse every put. The call does not reach every store: the
-     * backend's fence is the highest epoch any store holds, so a store behind it (a power cut before its EPOCH was
-     * stored, or a store that failed to take it at an earlier open) is not raised, and not every error fails the store
-     * (a mkdir of s<N> refused leaves it UP). So each store UP is raised by itself where it does not hold the epoch:
-     * one that still does not halts the tier (no put may reach a store without its fence); none holding it fails the
-     * open. */
-    if (be && tier_mutant != TIER_MUT_UNSURE) {
-        rc = chunk_be_see_epoch(be, vol, 1);
+    const cold_ops *ops = at.ops ? at.ops : &coldops_dir;
+    if ((rc = (at.ops ? at.make : coldops_dir_make)(make_arg, t, vol, cv->vuuid, &cv->ctx)) != 0)
+        return rc;
+    cv->ops = ops; /* only now: tier_cold_put frees a context only with its ops */
+    /* The epoch comes from the volume's provider (D4: the constant 1 on a single server), given as the authoritative
+     * one at every open: it clears a volume whose EPOCH lost a slot (a torn store), which would refuse every put. Never
+     * the stores' own fence, which is what a writer last saw (selfepoch plants exactly that). */
+    uint64_t e = coldvol_epoch(cv);
+    if (tier_mutant == TIER_MUT_SELFEPOCH && (e = ops->epoch(cv->ctx)) == 0)
+        e = 1;
+    if (e == 0) {
+        fprintf(stderr, "tsdb: %s: the epoch of volume %u is not known (its provider has none now): the open fails\n",
+                db->dir, vol);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    if ((rc = ops->see_epoch(cv->ctx, e)) != 0) {
         if (rc == TSDB_ERR_NOMEM)
             return rc;
-        int held = tier_mutant == TIER_MUT_FENCE; /* planted: the call's word taken for every store */
-        for (int i = 0; i < chunk_be_nstores(be) && tier_mutant != TIER_MUT_FENCE; i++) {
-            chunk_store *st = chunk_be_store(be, i);
-            if (chunk_be_store_state(be, i) != CHUNK_STORE_UP || !st || chunk_store_failed(st))
-                continue; /* tier_writable halts for these */
-            bool has = chunk_store_epoch(st, vol) >= 1 && !chunk_store_epoch_unsure(st, vol);
-            if (!has && chunk_store_raise(st, vol, 1) == 0)
-                has = chunk_store_epoch(st, vol) >= 1 && !chunk_store_epoch_unsure(st, vol);
-            if (has)
-                held++;
-            else
-                tier_halt(t, i, "did not take the volume's epoch at its open");
-        }
-        if (held == 0) {
-            fprintf(stderr, "tsdb: %s: no chunk store of the tier holds the epoch of volume %u (%s): the open fails\n",
-                    db->dir, vol, rc ? tsdb_strerror(rc) : "none is up and not failed");
-            return rc ? rc : TSDB_ERR_IO;
-        }
+        fprintf(stderr, "tsdb: %s: no chunk store of the tier holds the epoch of volume %u (%s): the open fails\n",
+                db->dir, vol, tsdb_strerror(rc));
+        return rc;
     }
-    if (be)
+    if (t->be)
         (void)tier_writable(t); /* a store DOWN at open: the line now, not at the first settle */
     if ((rc = ecgc_eng_open(db)) != 0 || (rc = eckeep_eng_open(db)) != 0 || (rc = ecsettle_eng_open(db)) != 0 ||
         (rc = ecswap_eng_open(db)) != 0)
         return rc; /* the open fails; its eng_close detaches */
-    return 0;
+    /* Last: the registry is what the cache's readers, the gc worker (deletes queued by an engine of the volume that
+     * closed since) and tier_epoch find by volume number, so it takes only a context whose epoch was seen. An attach
+     * that failed above leaves the volume's previous entry in place (none of those lookups runs before the open
+     * returns but the gc worker, which keeps an item it cannot delete yet). */
+    return cold_register(t, cv);
 }
 
 struct chunk_backend *tier_backend(const tier *t) { return t ? t->be : NULL; }
 
 const uint8_t *tier_vuuid(const eng *db) { return db->ecstate ? db->ecstate->vuuid : NULL; }
 
-static void tier_halt(tier *t, int i, const char *why)
+void tier_halt_store(tier *t, int i, const char *why)
 {
     if (!atomic_exchange(&t->halted, true))
         fprintf(stderr, "tsdb: tier store %d (%s) %s: settles and chunk deletes stop for this tier until it is opened "
@@ -606,7 +737,7 @@ bool tier_writable(tier *t)
             continue;
         char why[64];
         snprintf(why, sizeof why, "is %s", chunk_store_state_name(st));
-        tier_halt(t, i, why);
+        tier_halt_store(t, i, why);
         return false;
     }
     return true;
@@ -629,6 +760,8 @@ void tier_engine_detach(eng *db)
         eckeep_eng_close(db);
         ecgc_eng_close(db);
     }
+    if (db->ecstate)
+        tier_cold_put(db->ecstate->cold); /* the context goes with the last reference (the registry's, a delete's) */
     if (db->ecstate && db->ecstate->mut_be)
         chunk_be_close(db->ecstate->mut_be);
     free(db->ecstate);

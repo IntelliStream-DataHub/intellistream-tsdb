@@ -60,10 +60,8 @@ void eccache_tier_close(struct tier *t);
  * one (only test_tier's tierperengine mutant) every read is TSDB_ERR_UNAVAILABLE. Tests may hand another over while no
  * reader runs. */
 void eccache_set_backend(struct tier *t, struct chunk_backend *be);
-/* The volume's uuid of chunk identities (META vuuid=), handed over by tier_engine_attach; all zero until set (and then
- * every chunk's identity is wrong). TSDB_ERR_NOMEM fails the engine's open. */
-int eccache_set_vuuid(struct tier *t, uint32_t volume, const uint8_t vuuid[16]);
-/* The backend (NULL with *rc = TSDB_ERR_UNAVAILABLE when none was handed over) and the volume's uuid. */
+/* The backend (NULL with *rc = TSDB_ERR_UNAVAILABLE when none was handed over), which the directory ops read through,
+ * and the volume's uuid (its latest attach's, tier_cold_get; all zero for a volume never attached). */
 struct chunk_backend *eccache_backend(struct tier *t, int *rc);
 void eccache_vuuid(struct tier *t, uint32_t volume, uint8_t out[16]);
 /* r7-gc: the object's chunks are gone; its granules leave the cache (a read in flight finishes and is not cached) and

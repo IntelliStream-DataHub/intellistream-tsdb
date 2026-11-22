@@ -25,6 +25,9 @@
  *             intent write whose name another sync made durable (intentio), after a failed discard sync (syncfail):
  *             an intent that rolls forward finds whole objects, nothing is left behind; a drop of two parts (its
  *             intent durable) is finished at the open and its retired .ec parts collected, one of one part is not
+ *   coldops   two volumes with recording ops and a provider (2, 3): settle by call and by the thread, a cold read, the
+ *             gc's deletes and a reopen's sweep of volume 1 each go through volume 1's ops at its provider's epoch;
+ *             provider 0 or ops not writable: nothing put or deleted; a failed attach keeps the registry's entry
  *
  * Mutants (--mutant NAME, src/settle.h; each must fail it): ecrankdown (basic), settlenocheck (corrupt), settletwopass
  * (flip), settlebusy (policy), coarsewhole (coarse); gcskipput gcskipindex gcskipopen gcskipelse gcskipswap
@@ -33,6 +36,8 @@
  */
 #include "internal.h"
 #include "chunk.h"
+#include "coldops.h"
+#include "eccache.h"
 #include "ecpart.h"
 #include "ecgc.h"
 #include "ecskip.h"
@@ -1878,6 +1883,306 @@ static void gcpower_case(void)
            fwd, 5 * seeds);
 }
 
+/* ------------------------------------------------------------ coldops: every consumer through its volume's ops */
+
+/* A recording wrapper over the directory ops: what each volume's settle, cache, gc and sweep asked of its own ops, and
+ * at which epoch. One rec per volume (its make_arg), shared by every context of the volume's attaches. */
+typedef struct {
+    uint64_t want; /* the epoch every put and delete must carry: the provider's */
+    atomic_int puts, dels, opens, lists, seen, wrong;
+    atomic_bool unwritable; /* writable() says false (a position away, as r8f's ops would) */
+} rec;
+typedef struct {
+    void *in;
+    rec *r;
+} recctx;
+static cold_ops REC; /* coldops_dir with the calls below in front; static: the ops outlive the tier */
+
+static int r_put(void *ctx, const uint8_t oid[16], const chunk_geom *g, uint64_t epoch, const chunk_put_src *src,
+                 uint64_t *sums)
+{
+    recctx *c = ctx;
+    atomic_fetch_add(&c->r->puts, 1);
+    if (epoch != c->r->want)
+        atomic_fetch_add(&c->r->wrong, 1);
+    return coldops_dir.put_stream(c->in, oid, g, epoch, src, sums);
+}
+static int r_open(void *ctx, const uint8_t oid[16], const chunk_geom *ex, const uint64_t *sums, cold_obj **out)
+{
+    recctx *c = ctx;
+    atomic_fetch_add(&c->r->opens, 1);
+    return coldops_dir.obj_open(c->in, oid, ex, sums, out);
+}
+static int r_del(void *ctx, const uint8_t oid[16], unsigned pos, uint64_t epoch, int reason)
+{
+    recctx *c = ctx;
+    atomic_fetch_add(&c->r->dels, 1);
+    if (epoch != c->r->want)
+        atomic_fetch_add(&c->r->wrong, 1);
+    return coldops_dir.del(c->in, oid, pos, epoch, reason);
+}
+static int r_list(void *ctx, chunk_list_fn fn, void *fctx)
+{
+    recctx *c = ctx;
+    atomic_fetch_add(&c->r->lists, 1);
+    return coldops_dir.list_names(c->in, fn, fctx);
+}
+static int r_owner(void *ctx, const chunk_listed *l, uint8_t vuuid[16])
+{
+    return coldops_dir.owner(((recctx *)ctx)->in, l, vuuid);
+}
+static int r_see(void *ctx, uint64_t e)
+{
+    recctx *c = ctx;
+    atomic_fetch_add(&c->r->seen, 1);
+    if (e != c->r->want)
+        atomic_fetch_add(&c->r->wrong, 1);
+    return coldops_dir.see_epoch(c->in, e);
+}
+static uint64_t r_epoch(void *ctx) { return coldops_dir.epoch(((recctx *)ctx)->in); }
+static bool r_writable(void *ctx)
+{
+    recctx *c = ctx;
+    return !atomic_load(&c->r->unwritable) && coldops_dir.writable(c->in);
+}
+static bool r_all_up(void *ctx) { return coldops_dir.all_up(((recctx *)ctx)->in); }
+static void r_free(void *ctx)
+{
+    recctx *c = ctx;
+    coldops_dir.ctx_free(c->in);
+    free(c);
+}
+static int r_make(void *arg, tier *t, uint32_t volume, const uint8_t vuuid[16], void **ctx)
+{
+    recctx *c = calloc(1, sizeof *c);
+    if (!c)
+        return TSDB_ERR_NOMEM;
+    c->r = arg;
+    int rc = coldops_dir_make(NULL, t, volume, vuuid, &c->in); /* the tier's stores, as on a single server */
+    if (rc)
+        free(c);
+    else
+        *ctx = c;
+    return rc;
+}
+
+static _Atomic uint64_t PROV[2]; /* the provider's epoch of volumes 0 and 1 (0: not known now) */
+static uint64_t prov(void *arg, uint32_t volume)
+{
+    (void)arg;
+    return volume < 2 ? atomic_load(&PROV[volume]) : 0;
+}
+
+static int rec_open(tier *t, const char *dir, uint32_t vol, rec *r, const tier_settings *set, eng **db)
+{
+    tsdb_options o;
+    eopts e = {.merge_threads = 0, .classes = 0};
+    opts_of(&e, &o);
+    o.obsolete_part_lifetime_s = 0;
+    tier_attach a = {.ops = &REC, .make = r_make, .make_arg = r, .epoch = prov, .settings = set};
+    *db = NULL;
+    tier_want_attach(t, vol, &a);
+    int rc = eng_open(dir, &o, db);
+    tier_want(NULL, 0);
+    if (rc)
+        *db = NULL;
+    return rc;
+}
+
+/* chunk files of volume vol in w's stores */
+static int vol_chunks(const where *w, uint32_t vol)
+{
+    int n = 0;
+    for (int i = 0; i < 3; i++) {
+        char p[PATH_MAX + 32];
+        snprintf(p, sizeof p, "%s/s%u", w->st[i], vol);
+        DIR *dd = opendir(p);
+        struct dirent *de;
+        while (dd && (de = readdir(dd)) != NULL)
+            n += de->d_name[0] != '.' && strcmp(de->d_name, "EPOCH") && strncmp(de->d_name, "tmp_", 4);
+        if (dd)
+            closedir(dd);
+    }
+    return n;
+}
+
+typedef struct {
+    const uint8_t *b;
+} mem_src;
+static int mem_fill(void *ctx, uint64_t s, uint64_t off, uint8_t *buf, size_t len)
+{
+    (void)s;
+    memcpy(buf, ((mem_src *)ctx)->b + off, len);
+    return 0;
+}
+
+static void gc_round(eng *db)
+{
+    graveyard_purge(db, false);
+    ecgc_tier_work(db->tier);
+    ecgc_tier_work(db->tier);
+    graveyard_purge(db, false);
+}
+
+/* The .ec parts of key: whether each record carries epoch `want`, their oids forgotten by the cache */
+static size_t ec_parts_at(eng *db, int64_t key, uint64_t want)
+{
+    part *p[16];
+    size_t n = key_parts(db, key, p, 16), ok = 0;
+    for (size_t i = 0; i < n; i++) {
+        struct ecpart *ep = atomic_load(&p[i]->ec);
+        if (ep && ep->rec.writer_epoch == want) {
+            ok++;
+            eccache_forget(db->tier, db->tier_vol, ep->rec.oid);
+        }
+    }
+    unref_all(p, n);
+    return ok;
+}
+
+/* Two volumes of one tier attached with recording ops over the tier's stores and a provider that says 2 for volume 0
+ * and 3 for volume 1: a settle (by call and by the thread), a cold read, a retire and its gc delete, and a reopen's
+ * sweep of an orphan on volume 1 each go through volume 1's ops at epoch 3, none through volume 0's; with the provider
+ * at 0 a settle and a delete wait, and so they do while the ops say not writable. An attach that fails (provider 0)
+ * leaves the volume's registry entry as it was. */
+static void coldops_case(void)
+{
+    where w;
+    fresh("coldops", &w);
+    tier_env(&w, QUIET_GRACE, 86400, 0);
+    atomic_store(&NOW, 1000);
+    atomic_store(&ecgc_test_manual, true);
+    REC = coldops_dir;
+    REC.name = "rec", REC.put_stream = r_put, REC.obj_open = r_open, REC.del = r_del, REC.list_names = r_list;
+    REC.owner = r_owner, REC.see_epoch = r_see, REC.epoch = r_epoch, REC.writable = r_writable;
+    REC.all_up = r_all_up, REC.ctx_free = r_free;
+    static rec r0, r1;
+    memset(&r0, 0, sizeof r0);
+    memset(&r1, 0, sizeof r1);
+    r0.want = 2, r1.want = 3;
+    atomic_store(&PROV[0], 2);
+    atomic_store(&PROV[1], 3);
+    tier_settings set1 = {.k = 2, .m = 1, .grace_s = 3600, .keep_s = 86400, .coarse_s = 86400};
+    char v1[PATH_MAX + 16];
+    snprintf(v1, sizeof v1, "%s/v1", w.root);
+    eopts e = {.merge_threads = 0, .classes = 0};
+    tsdb_options o;
+    opts_of(&e, &o);
+    tier *t = NULL;
+    eng *d0 = NULL, *d1 = NULL;
+    CHECK(tier_open(w.db, &o, &t) == 0);
+    if (t) {
+        CHECK(rec_open(t, w.db, 0, &r0, NULL, &d0) == 0);
+        CHECK(rec_open(t, v1, 1, &r1, &set1, &d1) == 0);
+    }
+    if (!d0 || !d1)
+        goto out;
+    CHECK(atomic_load(&r0.seen) == 1 && atomic_load(&r1.seen) == 1);
+    uint32_t s;
+    CHECK(eng_series(d1, "s", TSDB_FLOAT32, &s) == 0);
+    two_parts(d1, s, 0);
+    write_rows(d1, s, DAY, 5000, 2000, 3);
+    CHECK(eng_flush(d1) == 0);
+    acc want = digest(d1, "s");
+
+    /* the provider knows no epoch: no put (settle_noepoch0) */
+    atomic_store(&PROV[1], 0);
+    CHECK(settle_key(d1, 0, NULL) == TSDB_ERR_UNAVAILABLE);
+    CHECK(atomic_load(&r1.puts) == 0);
+    atomic_store(&PROV[1], 3);
+    /* the volume's ops say not writable: no put */
+    atomic_store(&r1.unwritable, true);
+    CHECK(settle_key(d1, 0, NULL) == TSDB_ERR_UNAVAILABLE);
+    CHECK(atomic_load(&r1.puts) == 0);
+    atomic_store(&r1.unwritable, false);
+    /* a settle by call: through volume 1's ops at 3 (settle_epoch1, settle_tierbe) */
+    size_t got = 0, all, ec;
+    CHECK(settle_key(d1, 0, &got) == 0 && got == 2);
+    CHECK(atomic_load(&r1.puts) == 2 && ec_parts_at(d1, 0, 3) == 2);
+
+    /* the thread: key 1 due (volume 1's grace_s, not the tier's), held while the ops say not writable
+     * (settle_tierwritable), settled once they do */
+    atomic_store(&r1.unwritable, true);
+    uint64_t f0 = atomic_load(&settle_failed);
+    atomic_store(&NOW, 2 * DAY + HOUR + 1);
+    wait_rounds(5);
+    key_count(d1, 1, &all, &ec);
+    CHECK(ec == 0 && atomic_load(&r1.puts) == 2);
+    CHECK(atomic_load(&settle_failed) == f0); /* the thread did not try (a failed try would back the key off) */
+    atomic_store(&r1.unwritable, false);
+    CHECK(wait_settled(d1, 1, 20000));
+    CHECK(atomic_load(&r1.puts) == 3 && ec_parts_at(d1, 1, 3) == 1);
+
+    /* a cold read (the cache forgot the objects above): volume 1's ops open them */
+    int op0 = atomic_load(&r1.opens);
+    CHECK(same(digest(d1, "s"), want));
+    CHECK(atomic_load(&r1.opens) > op0);
+    int c1 = vol_chunks(&w, 1);
+    CHECK(c1 >= 6 && vol_chunks(&w, 0) == 0); /* three objects of k' + m >= 2 positions each */
+
+    /* a drop retires the .ec parts; the gc deletes through volume 1's ops at 3 (gc_epoch1, gc_vol0), not while the
+     * provider says 0 (gc_noepoch0) or the ops say not writable (gc_tierwritable) */
+    CHECK(eng_drop_before(d1, 2 * DAY) == 0);
+    atomic_store(&PROV[1], 0);
+    gc_round(d1);
+    CHECK(atomic_load(&r1.dels) == 0 && vol_chunks(&w, 1) == c1);
+    atomic_store(&PROV[1], 3);
+    atomic_store(&r1.unwritable, true);
+    gc_round(d1);
+    CHECK(atomic_load(&r1.dels) == 0 && vol_chunks(&w, 1) == c1);
+    atomic_store(&r1.unwritable, false);
+    gc_round(d1);
+    CHECK(atomic_load(&r1.dels) == c1 && vol_chunks(&w, 1) == 0); /* one delete per position */
+
+    /* an orphan of volume 1 (put through its ops, named by no part): the reopen's sweep lists volume 1's stores
+     * (sweep_vol0) and deletes it through its ops */
+    coldvol *cv = tier_cold(d1);
+    chunk_geom g;
+    uint8_t oid[16], buf[4096];
+    memset(oid, 0x5a, sizeof oid);
+    for (size_t i = 0; i < sizeof buf; i++)
+        buf[i] = (uint8_t)(i * 31);
+    CHECK(chunk_geom_make(&g, 2, 1, 512, sizeof buf) == 0);
+    uint64_t sums[64];
+    CHECK(chunk_sums_total(&g) <= 64);
+    mem_src ms = {buf};
+    chunk_put_src src = {.ctx = &ms, .fill = mem_fill};
+    CHECK(cv->ops->put_stream(cv->ctx, oid, &g, coldvol_epoch(cv), &src, sums) == 0);
+    CHECK(vol_chunks(&w, 1) == 3);
+    CHECK(eng_close(d1) == 0);
+    d1 = NULL;
+    /* a failed attach (the provider knows no epoch) leaves the registry's entry as it was (F8) */
+    coldvol *before = tier_cold_get(t, 1);
+    atomic_store(&PROV[1], 0);
+    CHECK(rec_open(t, v1, 1, &r1, &set1, &d1) == TSDB_ERR_UNAVAILABLE && !d1);
+    coldvol *after = tier_cold_get(t, 1);
+    CHECK(before && after == before);
+    tier_cold_put(after);
+    tier_cold_put(before);
+    atomic_store(&PROV[1], 3);
+    int l0 = atomic_load(&r0.lists), l1 = atomic_load(&r1.lists), dl = atomic_load(&r1.dels);
+    CHECK(rec_open(t, v1, 1, &r1, &set1, &d1) == 0);
+    if (d1) {
+        ecgc_tier_work(t); /* the sweep's listing, if the open deferred it, and the queue */
+        ecgc_tier_work(t);
+        CHECK(atomic_load(&r1.lists) > l1 && atomic_load(&r0.lists) == l0);
+        CHECK(atomic_load(&r1.dels) >= dl + 3 && vol_chunks(&w, 1) == 0);
+    }
+    /* volume 0's ops were asked nothing of volume 1's objects; every put and delete carried its provider's epoch */
+    CHECK(atomic_load(&r0.puts) == 0 && atomic_load(&r0.dels) == 0 && atomic_load(&r0.opens) == 0);
+    CHECK(atomic_load(&r0.wrong) == 0 && atomic_load(&r1.wrong) == 0);
+out:
+    if (d1)
+        CHECK(eng_close(d1) == 0);
+    if (d0)
+        CHECK(eng_close(d0) == 0);
+    if (t)
+        tier_put(t);
+    atomic_store(&ecgc_test_manual, false);
+    printf("  coldops: settle (call, thread), cold read, gc delete, sweep of volume 1 through its own ops at its "
+           "provider's epoch; provider 0 or not writable: nothing put or deleted; a failed attach keeps the entry\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *scratch = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", *child = NULL;
@@ -1927,6 +2232,7 @@ int main(int argc, char **argv)
     RUN(crash);
     RUN(gcpaths);
     RUN(gcpower);
+    RUN(coldops);
 #undef RUN
     if (failures) {
         fprintf(stderr, "test_settle: %d failures\n", failures);

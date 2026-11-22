@@ -10,7 +10,10 @@
  *   lost     every store missing, or replaced by an empty directory: the open fails with a line per store, nothing is
  *            made (the root's requires=tier says the tier holds data; the stores alone look new)
  *   fence    a store that cannot take a new volume's epoch (its directory not writable) halts the tier, with one line
+ *            (r8b) and the attach's epoch is its provider's, never the stores' own fence: an unsure store is raised
+ *            to it, puts and deletes carry it, a provider with none fails the attach
  *   unsure   a damaged EPOCH slot (a torn store looks the same) and then an open: puts work
+ *   ops      (r8b) two volumes attached with different cold ops: each volume's puts and reads reach its own stores
  *   refuse   requires=tier without a tier, without TSDB_TEST_TIER_I_KNOW=1, read-only and following; a tier on a
  *            cluster volume; a running follower that meets an .ec name stops
  *   follow   a follower whose writer's MANIFEST names an .ec part, through eng_refresh: one line, the engine failed
@@ -20,17 +23,20 @@
  *            store is UP after the next open (made, or found)
  *   eio      a store fails in service (crashfs, EIO on its files): the tier halts with one line, reads go on
  *
- * Mutants (--mutant NAME, src/tier.h): tierperengine, tierunsure, tierstrict, tierfresh, tierfence (each must fail
- * here), tiernoec (must fail in a NO_EC build). Usage: test_tier [--mutant NAME] [SCRATCH]
+ * Mutants (--mutant NAME, src/tier.h): tierperengine, tierunsure, tierstrict, tierfresh, tierfence, selfepoch (each must fail
+ * here: selfepoch in fence), tiernoec (must fail in a NO_EC build). Usage: test_tier [--mutant NAME] [SCRATCH]
  */
 #define _GNU_SOURCE
 #include "chunk.h"
 #include "chunk_priv.h"
+#include "coldops.h"
+#include "eccache.h"
 #include "ecgc.h"
 #include "feed.h"
 #include "tier.h"
 #include "tsdb.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -424,6 +430,8 @@ static void t_lost(void)
 
 /* ----------------------------------------------------------------------------------------------------------- fence */
 
+static void t_fence_provider(void);
+
 static void t_fence(void)
 {
     if (geteuid() == 0) {
@@ -467,6 +475,230 @@ static void t_fence(void)
     snprintf(p, sizeof p, "%s/st1", stores);
     CHECK(chmod(p, 0755) == 0);
     printf("  fence: a store UP that cannot take a volume's epoch halts the tier with one line\n");
+    t_fence_provider();
+}
+
+
+/* ------------------------------------------------------------------------------------------------- fence: provider */
+
+static uint64_t prov_epoch(void *arg, uint32_t volume)
+{
+    (void)volume;
+    return *(const uint64_t *)arg;
+}
+
+static int direct_open_with(const char *dir, uint32_t vol, const tier_attach *a, direct *d)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    d->t = NULL;
+    d->db = NULL;
+    int rc = tier_open(dir, &o, &d->t);
+    if (rc)
+        return rc;
+    tier_want_attach(d->t, vol, a);
+    rc = eng_open(dir, &o, &d->db);
+    tier_want(NULL, 0);
+    if (rc) {
+        tier_put(d->t);
+        d->t = NULL;
+        d->db = NULL;
+    }
+    return rc;
+}
+
+typedef struct {
+    const uint8_t *b;
+} msrc;
+
+static int msrc_fill(void *ctx, uint64_t s, uint64_t off, uint8_t *buf, size_t len)
+{
+    (void)s;
+    memcpy(buf, ((msrc *)ctx)->b + off, len);
+    return 0;
+}
+
+/* A put of OBJ through the volume's ops at its provider's epoch (what a settle does). */
+static int ops_put(coldvol *cv, const uint8_t oid[16])
+{
+    chunk_geom g;
+    int rc = chunk_geom_make(&g, 2, 1, 512, sizeof OBJ);
+    uint64_t *sums = malloc(chunk_sums_total(&g) * sizeof *sums);
+    msrc m = {OBJ};
+    chunk_put_src src = {.ctx = &m, .fill = msrc_fill};
+    if (!rc && sums)
+        rc = cv->ops->put_stream(cv->ctx, oid, &g, coldvol_epoch(cv), &src, sums);
+    free(sums);
+    return sums ? rc : TSDB_ERR_NOMEM;
+}
+
+static int ops_get(coldvol *cv, const uint8_t oid[16])
+{
+    cold_obj *ob = NULL;
+    int rc = cv->ops->obj_open(cv->ctx, oid, NULL, NULL, &ob);
+    if (rc)
+        return rc;
+    uint8_t back[sizeof OBJ];
+    chunk_report rep;
+    memset(&rep, 0, sizeof rep);
+    rc = cv->ops->obj_read(ob, 0, sizeof back, back, 0, &rep);
+    cv->ops->obj_close(ob);
+    return rc ? rc : memcmp(back, OBJ, sizeof OBJ) == 0 ? 0 : TSDB_ERR_CORRUPT;
+}
+
+/* The epoch of an attach is its provider's, never the stores' own fence (what a writer last saw): a volume whose EPOCH
+ * lost a slot in one store is raised to the provider's epoch 3 in every store, and puts and deletes carry it. The
+ * selfepoch mutant gives the stores' fence (1) as the authoritative epoch: the unsure store is cleared at 1. */
+static void t_fence_provider(void)
+{
+    char dir[PATH_MAX + 32], stores[PATH_MAX + 32], p[PATH_MAX + 64];
+    snprintf(p, sizeof p, "%s/fenceprov", S);
+    fresh(p);
+    snprintf(dir, sizeof dir, "%s/fenceprov/db", S);
+    snprintf(stores, sizeof stores, "%s/fenceprov/stores", S);
+    mkdir(stores, 0755);
+    tier_env(stores, 3, 2, 1);
+    direct d;
+    CHECK(direct_open(dir, 0, &d) == 0); /* the default provider: epoch 1 */
+    if (!d.db)
+        return;
+    CHECK(tier_epoch(d.t, 0) == 1 && put_obj(&d, OID) == 0);
+    direct_close(&d);
+    snprintf(p, sizeof p, "%s/st0/s0/EPOCH", stores); /* one slot damaged: store 0's volume opens unsure */
+    int fd = open(p, O_WRONLY);
+    CHECK(fd >= 0 && pwrite(fd, "garbage-garbage-garbage-garbage!", 32, 4096) == 32);
+    if (fd >= 0)
+        close(fd);
+    uint64_t zero = 0, three = 3;
+    tier_attach a = {.epoch = prov_epoch, .epoch_arg = &zero};
+    cap_begin();
+    int rc = direct_open_with(dir, 0, &a, &d);
+    const char *err = cap_end();
+    CHECK(rc == TSDB_ERR_UNAVAILABLE && count(err, "is not known") == 1); /* no epoch now: no attach */
+    if (d.db)
+        direct_close(&d);
+    a.epoch_arg = &three;
+    CHECK(direct_open_with(dir, 0, &a, &d) == 0);
+    if (!d.db)
+        return;
+    CHECK(tier_epoch(d.t, 0) == 3);
+    for (int i = 0; i < 3; i++) {
+        chunk_store *st = chunk_be_store(tier_backend(d.t), i);
+        CHECK(st && chunk_store_epoch(st, 0) == 3 && !chunk_store_epoch_unsure(st, 0)); /* selfepoch: 1 */
+    }
+    coldvol *cv = tier_cold(d.db);
+    uint8_t oid[16];
+    memcpy(oid, OID, 16);
+    oid[0] = 0x31;
+    CHECK(cv && ops_put(cv, oid) == 0 && ops_get(cv, oid) == 0);
+    chunk_ident id = {.volume = 0, .pos = 0};
+    memcpy(id.vuuid, tier_vuuid(d.db), 16);
+    memcpy(id.oid, oid, 16);
+    chunk_rd *r = NULL;
+    CHECK(chunk_be_rd_open(tier_backend(d.t), &id, &r) == 0 && r && chunk_rd_hdr(r)->epoch == 3);
+    if (r)
+        chunk_rd_close(r);
+    CHECK(cv && cv->ops->del(cv->ctx, oid, 0, 1, COLD_DEL_GC) != 0); /* below the fence */
+    CHECK(cv && cv->ops->del(cv->ctx, oid, 0, coldvol_epoch(cv), COLD_DEL_GC) == 0);
+    direct_close(&d);
+    printf("  fence: the attach's epoch is its provider's (3), never the stores' own fence: an unsure store is raised "
+           "to it, puts and deletes carry it; a provider with none fails the attach\n");
+}
+
+/* ---------------------------------------------------------------------------------------------------------------- ops */
+
+static int count_files(const char *path)
+{
+    DIR *dd = opendir(path);
+    if (!dd)
+        return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(dd)) != NULL)
+        n += e->d_name[0] != '.' && strcmp(e->d_name, "EPOCH") != 0;
+    closedir(dd);
+    return n;
+}
+
+/* Two volumes of one tier attached with different ops: the root with the directory ops over the tier's stores, volume
+ * 1 with the directory ops over a backend of its own (as r8f gives a cluster volume ops over its stripe group). Each
+ * volume's puts reach its own stores, the cache's lookup by volume (tier_cold_get) finds each volume's ops, and the
+ * contexts are freed with the last reference (ASan). */
+static void t_ops(void)
+{
+    char dir[PATH_MAX + 32], vol[PATH_MAX + 32], stores[PATH_MAX + 32], other[PATH_MAX + 32], p[PATH_MAX + 64];
+    snprintf(p, sizeof p, "%s/ops", S);
+    fresh(p);
+    snprintf(dir, sizeof dir, "%s/ops/db", S);
+    snprintf(vol, sizeof vol, "%s/ops/v1", S);
+    snprintf(stores, sizeof stores, "%s/ops/stores", S);
+    snprintf(other, sizeof other, "%s/ops/other", S);
+    mkdir(stores, 0755);
+    mkdir(other, 0755);
+    tier_env(stores, 3, 2, 1);
+    char op[3][PATH_MAX + 64];
+    const char *opp[3];
+    for (int i = 0; i < 3; i++) {
+        snprintf(op[i], sizeof op[i], "%s/o%d", other, i);
+        uint8_t id[16];
+        CHECK(chunk_store_init(op[i], NULL, id) == 0);
+        opp[i] = op[i];
+    }
+    chunk_backend *be2 = NULL;
+    chunk_be_opts bo = {.min_up = 3};
+    CHECK(chunk_be_open2(&be2, opp, 3, NULL, &bo) == 0);
+    direct d;
+    CHECK(direct_open(dir, 0, &d) == 0);
+    if (!d.db || !be2) {
+        if (d.db)
+            direct_close(&d);
+        if (be2)
+            chunk_be_close(be2);
+        return;
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    eng *e = NULL;
+    tier_attach a = {.ops = &coldops_dir, .make = coldops_dir_make, .make_arg = be2};
+    tier_want_attach(d.t, 1, &a);
+    int rc = eng_open(vol, &o, &e);
+    tier_want(NULL, 0);
+    CHECK(rc == 0 && e);
+    if (e) {
+        uint8_t o0[16], o1[16];
+        memcpy(o0, OID, 16);
+        memcpy(o1, OID, 16);
+        o0[0] = 0xa0, o1[0] = 0xa1;
+        CHECK(ops_put(tier_cold(d.db), o0) == 0 && ops_put(tier_cold(e), o1) == 0);
+        int in0 = 0, in1 = 0, cross = 0;
+        for (int i = 0; i < 3; i++) {
+            snprintf(p, sizeof p, "%s/st%d/s0", stores, i);
+            in0 += count_files(p);
+            snprintf(p, sizeof p, "%s/st%d/s1", stores, i);
+            cross += count_files(p);
+            snprintf(p, sizeof p, "%s/s1", op[i]);
+            in1 += count_files(p);
+            snprintf(p, sizeof p, "%s/s0", op[i]);
+            cross += count_files(p);
+        }
+        CHECK(in0 == 3 && in1 == 3 && cross == 0); /* k' + m = 3 chunks each, each in its own volume's stores */
+        coldvol *c0 = tier_cold_get(d.t, 0), *c1 = tier_cold_get(d.t, 1);
+        CHECK(c0 == tier_cold(d.db) && c1 == tier_cold(e));
+        CHECK(c0 && c1 && ops_get(c0, o0) == 0 && ops_get(c1, o1) == 0);
+        CHECK(c0 && c1 && ops_get(c0, o1) != 0 && ops_get(c1, o0) != 0);
+        uint8_t u[16];
+        eccache_vuuid(d.t, 1, u);
+        CHECK(memcmp(u, tier_vuuid(e), 16) == 0 && memcmp(tier_vuuid(e), tier_vuuid(d.db), 16) != 0);
+        tier_cold_put(c0);
+        tier_cold_put(c1);
+        eng_close(e);
+        c1 = tier_cold_get(d.t, 1); /* the registry keeps a closed volume's ops for the deletes queued by it */
+        CHECK(c1 && ops_get(c1, o1) == 0);
+        tier_cold_put(c1);
+    }
+    direct_close(&d);
+    chunk_be_close(be2);
+    printf("  ops: two volumes with different ops: each volume's puts and reads reach its own stores\n");
 }
 
 /* ---------------------------------------------------------------------------------------------------------- unsure */
@@ -922,6 +1154,8 @@ int main(int argc, char **argv)
             tier_mutant = TIER_MUT_FRESH;
         else if (strcmp(mutant, "tierfence") == 0)
             tier_mutant = TIER_MUT_FENCE;
+        else if (strcmp(mutant, "selfepoch") == 0)
+            tier_mutant = TIER_MUT_SELFEPOCH;
         else {
             fprintf(stderr, "unknown mutant %s\n", mutant);
             return 2;
@@ -942,13 +1176,14 @@ int main(int argc, char **argv)
     t_lost();
     t_fence();
     t_unsure();
+    t_ops();
     t_refuse();
     t_reval();
     t_power(false);
     t_power(true);
     t_eio();
 #else
-    printf("  volumes, down, lost, fence, unsure, refuse, reval, power, eio: skipped (no TSDB_EC in this build)\n");
+    printf("  volumes, down, lost, fence, unsure, ops, refuse, reval, power, eio: skipped (no TSDB_EC in this build)\n");
 #endif
     t_follow();
     if (!fails)
