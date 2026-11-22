@@ -44,6 +44,7 @@
 #include "ecpart.h"
 #include "ecskip.h"
 #include "ecswap.h"
+#include "coldops.h"
 #include "tier.h"
 
 #include <inttypes.h>
@@ -468,11 +469,16 @@ static int settle_one(eng *db, part *p, part **out)
         fail_at = SETTLE_FAIL_NONE;
     else if (fail_at)
         atomic_store(&settle_test_fail_at, SETTLE_FAIL_NONE);
-    const tier_cfg *cfg = tier_config(db->tier);
+    coldvol *cv = tier_cold(db);
+    if (!cv)
+        return TSDB_ERR_UNAVAILABLE;
     chunk_geom g;
-    int rc = chunk_geom_derive(&g, (unsigned)cfg->k, (unsigned)cfg->m, p->map_len);
+    int rc = chunk_geom_derive(&g, (unsigned)cv->set.k, (unsigned)cv->set.m, p->map_len);
     if (rc)
         return rc;
+    uint64_t epoch = coldvol_epoch(cv); /* the volume's provider (D4: 1 on a single server) */
+    if (epoch == 0)
+        return TSDB_ERR_UNAVAILABLE;
     ec_record r;
     memset(&r, 0, sizeof r);
     r.version = EC_RECORD_VERSION;
@@ -486,7 +492,7 @@ static int settle_one(eng *db, part *p, part **out)
     r.m = g.m;
     r.cell_bytes = g.cell;
     r.object_len = p->map_len;
-    r.writer_epoch = 1; /* D4 */
+    r.writer_epoch = epoch;
     snprintf(r.source, sizeof r.source, "%s", p->name);
     r.nsums = chunk_sums_total(&g);
     if (!(r.sums = malloc(r.nsums * sizeof *r.sums)))
@@ -495,8 +501,7 @@ static int settle_one(eng *db, part *p, part **out)
     if ((rc = sfill_prepare(&f)) != 0)
         goto out;
     chunk_put_src src = {.ctx = &f, .fill = settle_fill};
-    rc = chunk_be_put_stream(tier_backend(db->tier), db->tier_vol, tier_vuuid(db), r.oid, &g, r.writer_epoch, &src,
-                             ~0u, r.sums);
+    rc = cv->ops->put_stream(cv->ctx, r.oid, &g, r.writer_epoch, &src, r.sums);
     if (rc == 0 && fail_at == SETTLE_FAIL_PUT)
         rc = TSDB_ERR_IO;
     if (rc) {
@@ -554,7 +559,7 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
         return TSDB_ERR_READONLY;
     if (eng_check(db))
         return TSDB_ERR_IO;
-    if (!tier_writable(db->tier))
+    if (!tier_cold_writable(db))
         return TSDB_ERR_UNAVAILABLE;
     if (eng_stopping(db))
         return TSDB_ERR_STOPPED;
@@ -644,7 +649,7 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
 /* one settle of db, if the policy has one due: whether it settled anything */
 static bool settle_engine(eng *db)
 {
-    if (eng_check(db) || eng_stopping(db) || !tier_writable(db->tier))
+    if (eng_check(db) || eng_stopping(db) || !tier_cold_writable(db))
         return false;
     int64_t now = eng_now_ms(db), key = 0;
     part *sel[64];

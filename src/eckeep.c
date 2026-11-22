@@ -19,6 +19,7 @@
 #include "eckeep.h"
 #include "chunk.h"
 #include "ecpart.h"
+#include "coldops.h"
 #include "tier.h"
 
 #include <errno.h>
@@ -275,16 +276,6 @@ static void diverged(eng *db, const part *p, const char *name, const char *why)
     atomic_store(&db->diverged, true);
 }
 
-/* Every store UP (a REPLACING one is not: it lacks chunks it will have): else the digest waits. */
-static bool stores_up(chunk_backend *be)
-{
-    int n = chunk_be_nstores(be);
-    for (int i = 0; i < n; i++)
-        if (chunk_be_store_state(be, i) != CHUNK_STORE_UP)
-            return false;
-    return true;
-}
-
 static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name, int64_t *deadline)
 {
     struct ecpart *ep = atomic_load(&p->ec);
@@ -316,15 +307,15 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
     }
 
     int res = R_MATCH;
-    chunk_obj *o = NULL;
-    chunk_backend *be = NULL;
+    cold_obj *o = NULL;
+    coldvol *cv = tier_cold(db);
     if (!ep->test_mark) { /* a test-marked part's object is its map (src/ecpart.h) */
         chunk_geom g;
-        be = db->tier ? tier_backend(db->tier) : NULL;
-        int rc = !be ? TSDB_ERR_UNAVAILABLE : !stores_up(be) ? TSDB_ERR_UNAVAILABLE
+        /* every position UP (a REPLACING store is not: it lacks chunks it will have), else the digest waits */
+        int rc = !cv ? TSDB_ERR_UNAVAILABLE : !cv->ops->all_up(cv->ctx) ? TSDB_ERR_UNAVAILABLE
                  : chunk_geom_make(&g, r->k, r->m, r->cell_bytes, r->object_len);
         if (rc == 0)
-            rc = chunk_obj_open(be, ep->volume, tier_vuuid(db), r->oid, &g, r->sums, &o);
+            rc = cv->ops->obj_open(cv->ctx, r->oid, &g, r->sums, &o);
         if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_IO ||
             (rc && eckeep_mutant == ECKEEP_MUT_OPENWAIT)) {
             close(fd);
@@ -341,7 +332,7 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
      * rebuilt for each piece that touches it */
     size_t step = DIGEST_PIECE;
     if (o) {
-        size_t stripe = (size_t)chunk_obj_geom(o)->k * chunk_obj_geom(o)->cell;
+        size_t stripe = (size_t)cv->ops->obj_geom(o)->k * cv->ops->obj_geom(o)->cell;
         step = stripe >= DIGEST_PIECE ? stripe : DIGEST_PIECE / stripe * stripe;
     }
     uint8_t *ob = malloc(step), *fb = malloc(step);
@@ -350,7 +341,7 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
     xs ho, hf;
     xs_init(&ho);
     xs_init(&hf);
-    unsigned npos = o ? chunk_obj_geom(o)->k + chunk_obj_geom(o)->m : 0;
+    unsigned npos = o ? cv->ops->obj_geom(o)->k + cv->ops->obj_geom(o)->m : 0;
     int64_t t0 = eng_mono_ms();
     uint64_t done = 0;
     const char *why = NULL;
@@ -360,7 +351,7 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
             chunk_report rep;
             memset(&rep, 0, sizeof rep);
             unsigned fl = eckeep_mutant == ECKEEP_MUT_DIGESTRAW ? CHUNK_RR_RAW : 0;
-            int rc = chunk_obj_read(o, off, piece, ob, fl, &rep);
+            int rc = cv->ops->obj_read(o, off, piece, ob, fl, &rep);
             for (unsigned i = 0; rc == 0 && i < npos && i < CHUNK_POS_MAX; i++)
                 if (rep.st[i] == CHUNK_ST_DOWN)
                     rc = TSDB_ERR_UNAVAILABLE; /* never a match made around a position that is away */
@@ -395,11 +386,11 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
         }
     }
     if (o)
-        chunk_obj_close(o);
+        cv->ops->obj_close(o);
     close(fd);
     free(ob);
     free(fb);
-    if (res == R_MATCH && be && !stores_up(be))
+    if (res == R_MATCH && !ep->test_mark && cv && !cv->ops->all_up(cv->ctx))
         res = R_WAIT; /* a store went away meanwhile: try again with all of them */
     if (res == R_MATCH) {
         uint64_t a = xs_digest(&ho), b = xs_digest(&hf), want = ep->test_mark ? xxh64(p->map, p->map_len, 0)
@@ -669,7 +660,7 @@ int eckeep_eng_open(eng *db)
     pthread_mutex_init(&k->mu, NULL);
     pthread_cond_init(&k->cv, &ca);
     pthread_condattr_destroy(&ca);
-    k->keep_ms = tier_config(db->tier)->keep_s * 1000;
+    k->keep_ms = tier_eng_settings(db)->keep_s * 1000;
     db->ecstate->keep = k;
     return 0;
 }

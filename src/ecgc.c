@@ -19,7 +19,7 @@
  *
  * 3. The chunk I/O runs on the tier's worker, never under an engine lock, and the worker never touches an engine:
  *    the purge (graveyard_purge, under db->lock) queues the object with a ticket, the worker deletes every position
- *    (chunk_be_del, which skips a DOWN store, so tier_writable is asked before and after: a store that is not UP
+ *    (the volume's cold_ops del, which skips a DOWN store, so its writable is asked before and after: a store not UP
  *    keeps the entry for a later round) and marks the ticket; the next purge of that engine sees the ticket and
  *    unlinks the name. An engine that closes meanwhile drops its tickets; its names stay for the next open.
  *
@@ -36,7 +36,7 @@
  */
 #include "ecgc.h"
 #include "chunk.h"
-#include "chunk_priv.h"
+#include "coldops.h"
 #include "eccache.h"
 #include "ecpart.h"
 #include "tier.h"
@@ -57,8 +57,6 @@ atomic_bool ecgc_test_nosweep;
 atomic_int ecgc_test_del_fail;
 void (*ecgc_test_after_del)(struct tier *t, unsigned pos);
 
-/* D4: chunks are written and deleted at the constant epoch 1 (a delete above a store's epoch would raise it) */
-#define GC_EPOCH 1
 #define GC_RETIRED "retired_"
 
 enum { TK_WAITING = 0, TK_QUEUED = 1, TK_DELETED = 2 };
@@ -219,22 +217,30 @@ static void release(tier *t, const part *p)
     pthread_mutex_unlock(&g->mu);
 }
 
-/* every position of one object; true when all are gone with every store UP throughout */
+static bool delete_object_cv(tier *t, coldvol *cv, const gc_item *it);
+
+/* every position of one object; true when all are gone with every store UP throughout. Through the volume's ops of its
+ * latest attach (the tier keeps them until it closes, so an item queued by an engine that closed since finds them),
+ * at the epoch of its provider (D4: 1 on a single server; a delete above a store's epoch would raise it). */
 static bool delete_object(tier *t, const gc_item *it)
 {
-    chunk_backend *be = tier_backend(t);
-    if (!be || !tier_writable(t))
+    coldvol *cv = tier_cold_get(t, it->volume);
+    bool ok = cv && delete_object_cv(t, cv, it);
+    tier_cold_put(cv);
+    return ok;
+}
+
+static bool delete_object_cv(tier *t, coldvol *cv, const gc_item *it)
+{
+    uint64_t epoch = coldvol_epoch(cv);
+    if (epoch == 0 || !cv->ops->writable(cv->ctx))
         return false;
     for (int f = atomic_load(&ecgc_test_del_fail); f > 0; f = atomic_load(&ecgc_test_del_fail))
         if (atomic_compare_exchange_weak(&ecgc_test_del_fail, &f, f - 1))
             return false;
     eccache_forget(t, it->volume, it->oid); /* no reader holds it (a part held would hold the object) */
-    chunk_ident id = {.volume = it->volume};
-    memcpy(id.vuuid, it->vuuid, 16);
-    memcpy(id.oid, it->oid, 16);
     for (unsigned pos = 0; pos < it->npos; pos++) {
-        id.pos = (uint16_t)pos;
-        int rc = chunk_be_del(be, &id, GC_EPOCH);
+        int rc = cv->ops->del(cv->ctx, it->oid, pos, epoch, COLD_DEL_GC);
         if (rc && rc != TSDB_ERR_NOTFOUND)
             return false; /* a store that failed in service answers TSDB_ERR_IO for every delete after it */
         if (ecgc_test_after_del)
@@ -243,7 +249,7 @@ static bool delete_object(tier *t, const gc_item *it)
     /* A backstop: chunk_be_del skips a store that holds no open store (DOWN), and counts the skip as NOTFOUND. No store
      * goes from open to DOWN in service today (a failed one stays open and refuses, a replaced one is swapped for the
      * new one), so nothing reaches this but a future change of the backend; the noafter mutant cannot be killed. */
-    return ecgc_mutant == GC_MUT_NOAFTER || tier_writable(t);
+    return ecgc_mutant == GC_MUT_NOAFTER || cv->ops->writable(cv->ctx);
 }
 
 static int sweep_list(tier *t, uint32_t volume, const uint8_t vuuid[16], uint8_t (*named)[16], size_t nnamed);
@@ -594,7 +600,7 @@ void ecgc_unlisted_object(eng *db, const part *p)
 typedef struct sweep_ent {
     uint8_t oid[16];
     uint16_t pos;
-    int16_t store;
+    int32_t where; /* the ops' token for where the chunk is (chunk_listed.store): only cold_ops.owner reads it */
 } sweep_ent;
 
 typedef struct sweep_ctx {
@@ -632,29 +638,43 @@ static int list_one(void *ctx, const chunk_listed *c)
     sweep_ent *e = &s->e[s->n++];
     memcpy(e->oid, c->oid, 16);
     e->pos = c->pos;
-    e->store = (int16_t)c->store;
+    e->where = c->store;
     return 0;
 }
 
 /* 1: a header of the object names vuuid; 0: it names another volume; -1: no header of it could be read */
-static int obj_owner(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const sweep_ent *e, size_t n)
+static int obj_owner(coldvol *cv, const uint8_t vuuid[16], const sweep_ent *e, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
-        chunk_store *st = chunk_be_open_store(be, e[i].store);
-        chunk_hdr h;
-        if (st && chunk_store_peek(st, volume, e[i].oid, e[i].pos, &h) == 0)
-            return !memcmp(h.vuuid, vuuid, 16) || ecgc_mutant == GC_MUT_SWEEPFOREIGN;
+        chunk_listed c = {.pos = e[i].pos, .store = e[i].where};
+        memcpy(c.oid, e[i].oid, 16);
+        uint8_t u[16];
+        if (cv->ops->owner(cv->ctx, &c, u) == 0)
+            return !memcmp(u, vuuid, 16) || ecgc_mutant == GC_MUT_SWEEPFOREIGN;
     }
     return -1;
 }
 
 /* Lists the volume's chunks by name (no file opened), reads one header per object nothing names, and queues those
  * this volume wrote. TSDB_ERR_NOMEM, or 0 (a skip says why on stderr). */
+static int sweep_cv(tier *t, coldvol *cv, uint32_t volume, const uint8_t vuuid[16], uint8_t (*named)[16],
+                    size_t nnamed);
+
 static int sweep_list(tier *t, uint32_t volume, const uint8_t vuuid[16], uint8_t (*named)[16], size_t nnamed)
 {
     struct ecgc_tier *g = t->gc;
     atomic_fetch_add(&g->sweeps, 1);
-    if (!tier_writable(t)) {
+    coldvol *cv = tier_cold_get(t, volume);
+    int rc = sweep_cv(t, cv, volume, vuuid, named, nnamed);
+    tier_cold_put(cv);
+    return rc;
+}
+
+static int sweep_cv(tier *t, coldvol *cv, uint32_t volume, const uint8_t vuuid[16], uint8_t (*named)[16],
+                    size_t nnamed)
+{
+    struct ecgc_tier *g = t->gc;
+    if (!cv || !cv->ops->writable(cv->ctx)) {
         atomic_fetch_add(&g->sweeps_skipped, 1);
         fprintf(stderr, "tsdb: volume %u: the sweep of orphan chunks is skipped: a chunk store is not up\n", volume);
         return 0;
@@ -662,8 +682,7 @@ static int sweep_list(tier *t, uint32_t volume, const uint8_t vuuid[16], uint8_t
     if (nnamed)
         qsort(named, nnamed, 16, oid_cmp);
     sweep_ctx s = {.named = named, .nnamed = nnamed};
-    chunk_backend *be = tier_backend(t);
-    int rc = chunk_be_list_names(be, volume, list_one, &s);
+    int rc = cv->ops->list_names(cv->ctx, list_one, &s);
     if (s.nomem) {
         free(s.e);
         return TSDB_ERR_NOMEM;
@@ -681,7 +700,7 @@ static int sweep_list(tier *t, uint32_t volume, const uint8_t vuuid[16], uint8_t
     for (size_t i = 0, j; i < s.n; i = j) {
         for (j = i + 1; j < s.n && !memcmp(s.e[j].oid, s.e[i].oid, 16); j++)
             ;
-        int own = obj_owner(be, volume, vuuid, s.e + i, j - i);
+        int own = obj_owner(cv, vuuid, s.e + i, j - i);
         if (own == 0) {
             foreign++;
             continue;
