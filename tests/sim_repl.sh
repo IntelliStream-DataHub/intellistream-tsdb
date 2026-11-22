@@ -49,24 +49,38 @@ all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 
 # test_repl's scenarios and the planted bug each must catch
 scenarios="34 35 36 37 39 40 42"
 
-mutants() {
-    local seeds=$1 bad=0 m n out
-    for m in $2; do
-        n=$seeds
+# One planted bug (tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and asks this
+# script, with --mutant-verify, whether it was killed): "sim:M[@N]" is the simulator with MUT(M) for N seeds (the
+# second argument of mutants()), "scn:K" test_repl's scenario K with its planted bug.
+SIM_SEEDS=${SIM_SEEDS:-20000}
+case $mode in
+--mutant-run)
+    case $2 in
+    scn:*) exec "$B"/test_repl_mut --mutant "${2#scn:}" ;;
+    sim:*)
+        m=${2#sim:} n=$SIM_SEEDS
         case $m in *@*) n=${m#*@} m=${m%@*} ;; esac
-        out=$("$B"/sim_repl_mut --mutant "$m" --seeds "$n" 2>/dev/null)
-        echo "$out"
-        case $out in *KILLED*) ;; *) bad=1 ;; esac
-    done
-    for m in $scenarios; do
-        if "$B"/test_repl_mut --mutant "$m" > /dev/null 2>&1; then
-            echo "test_repl: planted bug $m: SURVIVED"
-            bad=1
-        else
-            echo "test_repl: planted bug $m: KILLED"
-        fi
-    done
-    [ $bad = 0 ] || { echo "sim_repl.sh: a planted bug survived: the checker lost its teeth"; exit 1; }
+        exec "$B"/sim_repl_mut --mutant "$m" --seeds "$n" ;;
+    esac
+    exit 2 ;;
+--mutant-verify)
+    case $2 in
+    scn:*) [ "$3" -ne 0 ] && echo "KILLED" ;;
+    *) grep -m1 KILLED "$4" ;;
+    esac
+    exit ;;
+esac
+
+mutants() {
+    local seeds=$1 list= m
+    for m in $2; do list="$list sim:$m"; done
+    for m in $scenarios; do list="$list scn:$m"; done
+    # MUTANT_JOBS, MUTANT_TIMEOUT; one that survives (or hangs) fails the run
+    SIM_SEEDS=$seeds "$(dirname "$0")"/../tools/mutants.sh --name sim_repl --stdout-only --timeout "${MUTANT_TIMEOUT:-3600}" \
+        --verify "$0" --list "$list" -- "$0" --mutant-run @M@ @D@ || {
+        echo "sim_repl.sh: a planted bug survived: the checker lost its teeth"
+        exit 1
+    }
 }
 
 case $mode in

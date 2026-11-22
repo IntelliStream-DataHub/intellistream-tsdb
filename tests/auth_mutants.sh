@@ -12,8 +12,6 @@
 # Usage: tests/auth_mutants.sh SCRATCH [MUTANT...] (from the top of the tree, after make build/tsdbd build/test_cluster
 # build/tsdb).
 set -u
-dir=${1:-/tmp}; shift || true
-muts=${*:-authlocalusers adminlocal loginbeforecatchup barrierifempty noguard retryunavail pushnoretry importmerge}
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
 expect() {
     case $1 in
@@ -28,19 +26,26 @@ expect() {
     *) echo "FAIL" ;;
     esac
 }
-survived=
-for m in $muts; do
-    case $m in importmerge) s=userimport ;; *) s=login ;; esac
-    log="$dir/mut-$m-$s.log"
-    if TSDB_AUTH_MUTANT=$m timeout 600 ./build/test_cluster "$dir" $s > "$log" 2>&1; then
-        echo "mutant $m: SURVIVED"
-        survived="$survived $m"
-    elif grep FAIL "$log" | grep -q "$(expect "$m")"; then
-        echo "mutant $m: caught by $s ($(grep -m1 FAIL "$log"))"
+scenario() { case $1 in importmerge) s=userimport ;; *) s=login ;; esac; }
+# one mutant, then its verdict: tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and
+# asks this script (--mutant-verify) whether the scenario failed where the mutant's own oracle is
+case ${1:-} in
+--mutant-run)
+    scenario "$2"
+    TSDB_AUTH_MUTANT=$2 exec ./build/test_cluster "$3" "$s" ;;
+--mutant-verify)
+    scenario "$2"
+    if [ "$3" -eq 0 ]; then echo "$s passed"; exit 1; fi
+    if grep FAIL "$4" | grep -q "$(expect "$2")"; then
+        echo "caught by $s ($(grep -m1 FAIL "$4"))"
     else
-        echo "mutant $m: failed $s, but not where expected ($(expect "$m")): $(grep -m1 FAIL "$log"; tail -n 3 "$log")"
-        survived="$survived $m(wrong-failure)"
+        echo "failed $s, but not where expected ($(expect "$2")): $(grep -m1 FAIL "$4"; tail -n 3 "$4")"
+        exit 1
     fi
-done
-[ -z "$survived" ] || { echo "survived:$survived"; exit 1; }
-echo "every mutant was caught"
+    exit 0 ;;
+esac
+dir=${1:-/tmp}; shift || true
+muts=${*:-authlocalusers adminlocal loginbeforecatchup barrierifempty noguard retryunavail pushnoretry importmerge}
+# MUTANT_JOBS, MUTANT_URING_JOBS (tsdbd on io_uring), MUTANT_TIMEOUT
+exec "$(dirname "$0")/../tools/mutants.sh" --name auth --tmp "$dir" --uring --timeout "${MUTANT_TIMEOUT:-600}" --fail \
+    --verify "$0" --list "$muts" -- "$0" --mutant-run @M@ @D@

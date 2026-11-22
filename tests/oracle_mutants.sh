@@ -6,24 +6,26 @@
 # of the file), so a mutant gets up to three windows of two seeds; one that reports its bug in none of them survived.
 # Usage: tests/oracle_mutants.sh ORACLE SCRATCH MUTANT...
 set -u
-oracle=$1 scratch=$2
-shift 2
-for m in "$@"; do
+# One mutant (tools/mutants.sh runs them in parallel, each in a scratch directory of its own): status 0 when caught
+if [ "${1:-}" = --mutant-run ]; then
+    m=$2 scratch=$3 oracle=$4
     case $m in
     nomark) want='test_settle_oracle: no part was settled' ;;
     *) want='^DIVERGED ' ;;
     esac
-    caught=
     for first in 1 101 201; do
         out=$("$oracle" --mutant "$m" --seeds 2 --first "$first" "$scratch" 2>&1)
         rc=$?
         if [ "$rc" -ne 0 ] && grep -q "$want" <<<"$out"; then
-            caught=$first
-            break
+            echo "caught in the seed window $first"
+            exit 0
         fi
     done
-    if [ -z "$caught" ]; then
-        echo "test_settle_oracle: mutant $m was not caught by its own line ('$want') in seed windows 1, 101, 201" >&2
-        exit 1
-    fi
-done
+    echo "test_settle_oracle: mutant $m was not caught by its own line ('$want') in seed windows 1, 101, 201" >&2
+    exit 1
+fi
+oracle=$1 scratch=$2
+shift 2
+# MUTANT_JOBS, MUTANT_TIMEOUT
+exec "$(dirname "$0")/../tools/mutants.sh" --name test_settle_oracle --tmp "$scratch" --pass --list "$*" -- \
+    "$0" --mutant-run @M@ @D@ "$oracle"

@@ -341,32 +341,31 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_recover
 	./$(B)/test_damage
 	./$(B)/test_upgrade $(or $(TMPDIR),/tmp)
-	! ./$(B)/test_upgrade --mutant v8hash48 $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # the planted bug must fail it
+	$(MUT) --name test_upgrade --list "v8hash48" -- ./$(B)/test_upgrade --mutant @M@ @D@ # the planted bug must fail it
 	./$(B)/test_fno $(or $(TMPDIR),/tmp)
-	for m in reuse manifest markers nosync flushclose walclock; do ! ./$(B)/test_fno --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	$(MUT) --name test_fno --list "reuse manifest markers nosync flushclose walclock" -- ./$(B)/test_fno --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_intents $(or $(TMPDIR),/tmp)
-	./$(B)/test_intents --mutant unlinkfirst $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'ROWS WRONG' # the old order must lose rows
+	$(MUT) --name test_intents --stdout-only --grep 'ROWS WRONG' --list "unlinkfirst" -- ./$(B)/test_intents --mutant @M@ @D@ # the old order must lose rows
 	./$(B)/test_drops $(or $(TMPDIR),/tmp)
-	for m in nointent nosync unlinkfirst; do ./$(B)/test_drops --mutant $$m $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'HALF DROP' || { echo "test_drops: mutant $$m survived"; exit 1; }; done
-	./$(B)/test_drops --mutant ttlreverse $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'TTL ORDER WRONG' || { echo "test_drops: mutant ttlreverse survived"; exit 1; }
-	./$(B)/test_drops --mutant skipec $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'EC LEFT' || { echo "test_drops: mutant skipec survived"; exit 1; }
-	for m in dropfirst nosettled two ttlunlinkfirst; do ./$(B)/test_drops --mutant $$m $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'HALF DROP' || { echo "test_drops: mutant $$m survived"; exit 1; }; done
-	./$(B)/test_drops --mutant novalidate $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'NAMES ACCEPTED' || { echo "test_drops: mutant novalidate survived"; exit 1; }
-	./$(B)/test_drops --mutant eioasgone $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'EIO AS GONE' || { echo "test_drops: mutant eioasgone survived"; exit 1; }
-	./$(B)/test_drops --mutant ttlfailstop $(or $(TMPDIR),/tmp) 2>/dev/null | grep -q 'TTL FAIL-STOP' || { echo "test_drops: mutant ttlfailstop survived"; exit 1; }
+	$(MUT) --name test_drops --stdout-only --grep 'HALF DROP' --list "nointent nosync unlinkfirst" -- ./$(B)/test_drops --mutant @M@ @D@ # each planted bug must leave a half drop
+	$(MUT) --name test_drops --stdout-only --grep 'TTL ORDER WRONG' --list "ttlreverse" -- ./$(B)/test_drops --mutant @M@ @D@
+	$(MUT) --name test_drops --stdout-only --grep 'EC LEFT' --list "skipec" -- ./$(B)/test_drops --mutant @M@ @D@
+	$(MUT) --name test_drops --stdout-only --grep 'HALF DROP' --list "dropfirst nosettled two ttlunlinkfirst" -- ./$(B)/test_drops --mutant @M@ @D@
+	$(MUT) --name test_drops --stdout-only --grep 'NAMES ACCEPTED' --list "novalidate" -- ./$(B)/test_drops --mutant @M@ @D@
+	$(MUT) --name test_drops --stdout-only --grep 'EIO AS GONE' --list "eioasgone" -- ./$(B)/test_drops --mutant @M@ @D@
+	$(MUT) --name test_drops --stdout-only --grep 'TTL FAIL-STOP' --list "ttlfailstop" -- ./$(B)/test_drops --mutant @M@ @D@
 	./$(B)/test_replfile $(or $(TMPDIR),/tmp)
-	for m in nosync sameslot nochecksum; do ! ./$(B)/test_replfile --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	$(MUT) --name test_replfile --list "nosync sameslot nochecksum" -- ./$(B)/test_replfile --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_crashfs $(or $(TMPDIR),/tmp)
 	./$(B)/test_replica $(or $(TMPDIR),/tmp)
-	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 ./$(B)/test_replica --mutant walsequnlocked $(or $(TMPDIR),/tmp) >$(B)/walsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/walsequnlocked.log) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
-	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 ./$(B)/test_replica --mutant cutwalsequnlocked $(or $(TMPDIR),/tmp) >$(B)/cutwalsequnlocked.log 2>&1; test $$? -eq 66 && grep -q manifest_publish $(B)/cutwalsequnlocked.log && grep -q replica_cut $(B)/cutwalsequnlocked.log) # and a cut's
+	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --list "walsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
+	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --grep replica_cut --list "cutwalsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # and a cut's
 	./$(B)/test_cvol $(or $(TMPDIR),/tmp)
 	./$(B)/test_cvolfs $(or $(TMPDIR),/tmp)
-	for m in nosync nodirsync nononce trustunsure tornstale samerid; do ! ./$(B)/test_cvolfs --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
-	for m in applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles; do ! ./$(B)/test_replica --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done
+	$(MUT) --name test_cvolfs --list "nosync nodirsync nononce trustunsure tornstale samerid" -- ./$(B)/test_cvolfs --mutant @M@ @D@ # each planted bug must fail it
+	$(MUT) --name test_replica --list "applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles" -- ./$(B)/test_replica --mutant @M@ @D@
 	./$(B)/test_feedstore $(or $(TMPDIR),/tmp)
-	! ./$(B)/test_feedstore --mutant noseal $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # a replayed segment renamed without its fdatasync must fail it
-	! ./$(B)/test_feedstore --mutant latefloor $(or $(TMPDIR),/tmp) >/dev/null 2>&1 # the cleaner's floor set after its unlinks must fail it
+	$(MUT) --name test_feedstore --list "noseal latefloor" -- ./$(B)/test_feedstore --mutant @M@ @D@ # noseal: a replayed segment renamed without its fdatasync, latefloor: the cleaner's floor set after its unlinks; each must fail it
 	./$(B)/test_crafted
 	./$(B)/test_gindex
 	./$(B)/test_flush_tail
@@ -384,6 +383,8 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 # them last, one after the other; CI runs each on a runner of its own (`make tsan TEST_TARGET=test-meta`,
 # .github/workflows/ci.yml): ThreadSanitizer and ASan take about 80 minutes for all of them on 4 CPUs. A group has the
 # prerequisites it needs, so that it builds and runs alone. `make test TEST_GROUPS=` runs only the lines above.
+# the planted bugs of a test binary, in parallel (tools/mutants.sh: MUTANT_JOBS, MUTANT_URING_JOBS, MUTANT_TIMEOUT)
+MUT = tools/mutants.sh --tmp $(or $(TMPDIR),/tmp)
 TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
@@ -409,36 +410,36 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_follow
 	./$(B)/test_volumes
 	./$(B)/test_rs $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in coef kernel guard; do ! ./$(B)/test_rs --quick --mutant $$m >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it (--quick: seconds, not 20 s a run)
+	$(if $(EC_OBJ),$(MUT) --name test_rs --list "coef kernel guard" -- ./$(B)/test_rs --quick --mutant @M@) # each planted bug must fail it (--quick: seconds, not 20 s a run)
 	./$(B)/test_chunk $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in nosums nofence eof settings nosync epochnosync; do ! ./$(B)/test_chunk --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
-	$(if $(EC_OBJ),out=$$(./$(B)/test_chunk --quick --mutant streamreread $(or $(TMPDIR),/tmp) 2>&1); [ $$? -ne 0 ] && echo "$$out" | grep -q 'stream put .* differ from chunk_encode' || { echo "test_chunk: mutant streamreread was not caught by the stream put's comparison with chunk_encode" >&2; exit 1; }) # pinned to its oracle's line
+	$(if $(EC_OBJ),$(MUT) --name test_chunk --list "nosums nofence eof settings nosync epochnosync" -- ./$(B)/test_chunk --quick --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_chunk --fail --grep 'stream put .* differ from chunk_encode' --list "streamreread" -- ./$(B)/test_chunk --quick --mutant @M@ @D@) # pinned to its oracle's line
 	./$(B)/test_chunk_heal $(or $(TMPDIR),/tmp)
 	./$(B)/test_ecnames $(or $(TMPDIR),/tmp)
-	for m in nameloose tierloose; do ! ./$(B)/test_ecnames --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	$(MUT) --name test_ecnames --list "nameloose tierloose" -- ./$(B)/test_ecnames --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),tests/oracle_mutants.sh ./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp) $(ORACLE_MUTANTS)) # each planted bug must fail it by its own line (EC builds: without TSDB_EC the oracle skips)
 	./$(B)/test_ecswap $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled; do ! ./$(B)/test_ecswap --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecswap --list "swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled" -- ./$(B)/test_ecswap --quick --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecgc $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer; do ! ./$(B)/test_ecgc --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecgc --list "gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer" -- ./$(B)/test_ecgc --quick --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_settle $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in ecrankdown settlenocheck settletwopass settlebusy coarsewhole; do ! ./$(B)/test_settle --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
-	$(if $(EC_OBJ),for m in gcskipput gcskipindex gcskipopen gcskipelse gcskipswap gcskipdiscard gccommitted gcdouble; do ! ./$(B)/test_settle --quick --case gcpaths --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each failure path's handoff (int-h)
-	$(if $(EC_OBJ),for m in gcearly nullnosync syncfailgo; do ! ./$(B)/test_settle --quick --case gcpower --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # the handoff after the directory sync, never on a failed engine
-	$(if $(EC_OBJ),! ./$(B)/test_settle --quick --case halt --mutant nohaltstop $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1) # a halt stops the settle
+	$(if $(EC_OBJ),$(MUT) --name test_settle --list "ecrankdown settlenocheck settletwopass settlebusy coarsewhole" -- ./$(B)/test_settle --quick --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_settle --list "gcskipput gcskipindex gcskipopen gcskipelse gcskipswap gcskipdiscard gccommitted gcdouble" -- ./$(B)/test_settle --quick --case gcpaths --mutant @M@ @D@) # each failure path's handoff (int-h)
+	$(if $(EC_OBJ),$(MUT) --name test_settle --list "gcearly nullnosync syncfailgo" -- ./$(B)/test_settle --quick --case gcpower --mutant @M@ @D@) # the handoff after the directory sync, never on a failed engine
+	$(if $(EC_OBJ),$(MUT) --name test_settle --list "nohaltstop" -- ./$(B)/test_settle --quick --case halt --mutant @M@ @D@) # a halt stops the settle
 	./$(B)/test_seam $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop; do ! ./$(B)/test_seam --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_seam --list "seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop" -- ./$(B)/test_seam --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecpart $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in ecnohash ecnowalseq ecskipname ecnofno ecnolayout; do ! ./$(B)/test_ecpart --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecpart --list "ecnohash ecnowalseq ecskipname ecnofno ecnolayout" -- ./$(B)/test_ecpart --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_keep $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop; do ! ./$(B)/test_keep --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecskip $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec; do ! ./$(B)/test_ecskip --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecskip --list "mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec" -- ./$(B)/test_ecskip --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_tier $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),for m in tierperengine tierunsure tierstrict tierfresh tierfence; do ! ./$(B)/test_tier --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done,! ./$(B)/test_tier --mutant tiernoec $(or $(TMPDIR),/tmp) >/dev/null 2>&1) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
+	$(if $(EC_OBJ),$(MUT) --name test_tier --list "tierperengine tierunsure tierstrict tierfresh tierfence" -- ./$(B)/test_tier --mutant @M@ @D@,$(MUT) --name test_tier --list "tiernoec" -- ./$(B)/test_tier --mutant @M@ @D@) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
 	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
-	$(if $(EC_OBJ),for m in heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always; do ! ./$(B)/test_chunk_heal --quick --mutant $$m $(or $(TMPDIR),/tmp) >/dev/null 2>&1 || exit 1; done) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_chunk_heal --list "heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always" -- ./$(B)/test_chunk_heal --quick --mutant @M@ @D@) # each planted bug must fail it
 	tests/test_sync_ec.sh
 	tools/sync-ec.sh --check
 	tests/test_check_ec_symbols.sh
@@ -459,7 +460,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/tsdbd $(B)/t
 	./$(B)/test_meta /tmp --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster
 	./$(B)/test_peerlink $(or $(TMPDIR),/tmp)
-	for m in notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead; do ! ./$(B)/test_peerlink $(or $(TMPDIR),/tmp) --quick --mutant $$m >/dev/null 2>&1 || exit 1; done # each planted bug must fail it
+	$(MUT) --name test_peerlink --list "notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 
 # the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 18 runs of 2 minutes each under a sanitizer
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
@@ -607,6 +608,10 @@ TSAN_FLAGS := -O1 -g -fsanitize=thread -fno-omit-frame-pointer
 tsan:
 	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 $$TSAN_OPTIONS" \
 	$(MAKE) B=build-tsan TSDBD=build-tsan/tsdbd ARCH= CFLAGS="$(TSAN_FLAGS)" $(TEST_TARGET)
+# `make tsan` with the groups of TEST_GROUPS (and the rest of `make test`) side by side: one build in build-tsan/, then
+# every group as a make of its own, their planted-bug runs sharing MUTANT_SLOTS (tools/tsan-par.sh; logs in $TSAN_PAR_LOGS)
+tsan-par:
+	TSAN_FLAGS="$(TSAN_FLAGS)" tools/tsan-par.sh "$(MAKE)" "$(TEST_GROUPS)"
 
 $(B):
 	mkdir -p $(B)
@@ -1479,9 +1484,14 @@ test-spdx:
 	tools/check-spdx.sh
 	tests/test_check_spdx.sh
 
+# The helper that runs a test binary's planted bugs in parallel (tools/mutants.sh), with fake programs: seconds.
+test: test-mutants-helper
+test-mutants-helper:
+	tests/test_mutants_helper.sh
+
 # every group above is a matrix entry of the sanitizer jobs in .github/workflows/ci.yml
 test: check-ci-groups
 check-ci-groups:
 	tests/check_ci_groups.sh
 
-.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups
+.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups test-mutants-helper tsan-par

@@ -25,15 +25,8 @@ if [ -n "$part" ]; then
     done
     muts=$sel
 fi
-dir=$(mktemp -d /var/tmp/meta-mut.XXXXXX) || exit 1
-trap 'rmdir "$dir" 2>/dev/null' EXIT
-bad=0
-for n in $muts; do
-    if "$bin" "$dir" --mutant "$n" --seeds 6 --seconds 8 >/dev/null 2>&1; then
-        echo "meta mutant $n: NOT caught"
-        bad=1
-    else
-        echo "meta mutant $n: caught"
-    fi
-done
-exit $bad
+[ -n "${muts// /}" ] || exit 0 # a part with none
+# each in a scratch directory of its own, in parallel (tools/mutants.sh: MUTANT_JOBS, MUTANT_TIMEOUT); one that the
+# simulator and the unit tests do not fail is NOT caught
+exec "$(dirname "$0")/../tools/mutants.sh" --name meta --tmp /var/tmp --timeout "${MUTANT_TIMEOUT:-3600}" --list "$muts" -- \
+    "$bin" @D@ --mutant @M@ --seeds 6 --seconds 8
