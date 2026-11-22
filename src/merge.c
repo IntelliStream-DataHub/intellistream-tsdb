@@ -33,6 +33,7 @@
  */
 #include "ecskip.h"
 #include "internal.h"
+#include "ppos.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -464,6 +465,16 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
     if (rc) {
         pw_abort(&w);
         return rc;
+    }
+    /* an ec cluster volume (R8, src/ppos.h): the output's position is its newest source's, recorded before it is named
+     * (pw_finish) */
+    for (size_t i = 0; db->ppos && i < k; i++) {
+        uint64_t pp = 0;
+        if ((rc = ppos_of(db, src[i]->name, &pp)) != 0) {
+            pw_abort(&w);
+            return rc;
+        }
+        w.ppos = MAX(w.ppos, pp);
     }
     void (*hook)(int) = atomic_load(&merge_hook);
     if (hook)

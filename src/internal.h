@@ -59,7 +59,7 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_NO_STAGE_HOLD, MUT_REPLICA_CUT_NO_HOLD, MUT_REPLICA_NO_COMMIT_FLUSH, MUT_REPLICA_NO_DONE_SKIP, MUT_REPLICA_KEEP_STAGED,
        MUT_REPLICA_NO_DROP_SKIP, MUT_REPLICA_NO_DROP_FLUSH, MUT_REPLICA_NO_STAGE_SYNC,
        MUT_REPLICA_PROMOTE_UNAPPLIED, MUT_REPLICA_PROMOTE_KEEP_SEGS, MUT_REPLICA_EPOCH_SEG,
-       MUT_REPLICA_NO_DROP_SERIAL, MUT_REPLICA_STAGE_TRUNC,
+       MUT_REPLICA_NO_DROP_SERIAL, MUT_REPLICA_STAGE_TRUNC, MUT_REPLICA_COLD_NO_STAGE, MUT_REPLICA_COLD_KEY_ANY, MUT_REPLICA_COLD_NAME_ANY, MUT_LEADER_PPOS_STALE,
        MUT_REPLICA_NO_STAGE_ORPHANS,
        MUT_LEADER_VISIBLE_DURABLE, MUT_LEADER_FLUSH_UNCOMMITTED, MUT_LEADER_DEPOSE_FAILS, MUT_LEADER_ADMIT_AFTER,
        MUT_LEADER_BYTES_AFTER_SYNC, MUT_LEADER_MARKER_RC, MUT_LEADER_GATE_NOHOOK,
@@ -1030,6 +1030,7 @@ typedef struct part_writer {
     bool lf_on;       /* collect the latest table's fold list (pw_begin: when the engine has a table; merges clear it) */
     struct lfold *lf; /* per series of the rows given to pw_add, in series order */
     size_t nlf, lfcap;
+    uint64_t ppos;    /* a merge's output on an ec cluster volume: its log position, recorded before it is named (R8) */
 } part_writer;
 
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq);
@@ -1366,6 +1367,7 @@ typedef struct memtable {
     int64_t created_ms;
     uint64_t fno_lo, fno_hi; /* the smallest first and largest last number of the rows records it took; 0, 0: none */
     uint64_t fno_end;        /* a sealed memtable: the next number at its seal, the end of its segment (FNO bound) */
+    struct ppos_mt *ppos;    /* an ec cluster volume's: base partition -> highest fno of its rows (src/ppos.h, r8d) */
 } memtable;
 
 /* Rows of one series copied out of a memtable: sorted, unique by ts; v in
@@ -2158,6 +2160,30 @@ static inline int eng_check(struct eng *db)
 {
     return atomic_load_explicit(&db->failed, memory_order_acquire) ? TSDB_ERR_IO : 0;
 }
+/* R8 (src/ppos.h): the log position of every row a memtable takes, at its three append sites (mem_insert, the replay,
+ * a replica's apply_rows), in the hold of buf_lock that adds the rows (the replay: its own memtable, alone). Row j is
+ * ts[j] at position fno + (ix ? ix[j] : j). One load and a branch unless db->ppos (an ec cluster volume). */
+enum { PPOS_SITE_INSERT, PPOS_SITE_REPLAY, PPOS_SITE_APPLY, PPOS_SITES };
+/* test hooks (tests/test_replica.c ppos_sites, ppos_record): told of every call at every append site, and of every
+ * parts_commit and named merge output with the position it records (first: the first name), whether db->ppos or not */
+extern void (*ppos_test_note)(struct eng *db, memtable *m, int site, const int64_t *ts, size_t n, uint64_t fno,
+                              const uint32_t *ix);
+extern void (*ppos_test_record)(struct eng *db, const char *first, size_t n, uint64_t pos);
+void ppos_note(struct eng *db, struct memtable *m, int64_t ts, size_t n, uint64_t fno);
+static inline void eng_ppos_rows(struct eng *db, memtable *m, int site, const int64_t *ts, size_t n, uint64_t fno,
+                                 const uint32_t *ix)
+{
+    if (__builtin_expect(ppos_test_note != NULL, 0))
+        ppos_test_note(db, m, site, ts, n, fno, ix);
+    if (__builtin_expect(db->ppos == NULL, 1))
+        return;
+    for (size_t j = 0; j < n; j++)
+        ppos_note(db, m, ts[j], 1, fno + (ix ? ix[j] : j));
+}
+/* The log position of the parts this thread commits next on db (parts_commit's ppos_record; src/replica.c): a leader's
+ * COMMIT marker (armed by jr_precommit for db, used once) or the one a replica applies; 0 for a flush (each part's from
+ * its memtable's map). */
+uint64_t jr_part_pos(struct eng *db);
 /* The last position a reader may see: in sync mode what is durable, and on a leader no further than the commit point
  * (C7: a leader applies only up to it, as every replica does). Unchanged for every other engine. */
 static inline const struct jr_ops *eng_jr(struct eng *db) { return __atomic_load_n(&db->jr, __ATOMIC_ACQUIRE); }

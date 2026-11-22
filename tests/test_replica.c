@@ -40,6 +40,8 @@
 #define _GNU_SOURCE
 #include "replica.h"
 #include "marker.h"
+#include "ecapply.h"
+#include "eccold.h"
 #include "feed.h"
 
 #include <dirent.h>
@@ -1757,12 +1759,12 @@ static void case_open_checks(void)
     CHECK_EQ(open_replica(dir, end2, &db), TSDB_ERR_CORRUPT); /* nothing says the marker's segment was flushed */
     {
         /* what a leader's flush of that segment saves before it can go (leader_rs_kept) */
-        uint8_t b[64] = {0};
-        uint64_t w[2] = {UINT64_C(0x5453544154535231), UINT64_C(2) << 40};
+        uint8_t b[80] = {0}; /* format 2: magic, done, doing (3), ndrops, kept, cold_pos, cold_key, xxh64 */
+        uint64_t w[2] = {UINT64_C(0x5453544154535232), UINT64_C(2) << 40};
         memcpy(b, &w[0], 8);
         memcpy(b + 48, &w[1], 8);
-        uint64_t h = xxh64(b, 56, 0);
-        memcpy(b + 56, &h, 8);
+        uint64_t h = xxh64(b, 72, 0);
+        memcpy(b + 72, &h, 8);
         snprintf(p, sizeof p, "%s/RSTATE", dir);
         FILE *f = fopen(p, "wb");
         CHECK_EQ(f != NULL, true);
@@ -2658,6 +2660,331 @@ static void case_ro_open(void)
     xp_stop(&x);
     alarm(0);
     sigaction(SIGALRM, &old, NULL);
+}
+
+/* R8: a COLD marker holds its positions as a COMMIT does. Its .ec file is never staged here (the leader did not ship
+ * it): the replica does not acknowledge the marker (durable_end stays below it, replica_missing names the file), a
+ * restart's open scan finds it again and still holds, and once the file is staged it counts durable and applies (the
+ * stub of r8h acknowledges: RSTATE's `done` passes it, a replay skips it). RSTATE's COLD in progress survives a reopen
+ * and is decided by ecapply_cold_decide, against the marker's key; format 1 is refused; a COLD naming a file that is
+ * no part or .ec is damage. Mutants coldnostage (cm_add skips COLD), coldkeyany, coldnameany. */
+static void case_cold_hold(void)
+{
+    char dir[PATH_MAX], name[64], sp[64];
+    uint64_t sz, mpos;
+    fresh(dir, "coldhold");
+    leader l;
+    unsigned rng = 11;
+    leader_init(&l);
+    for (int i = 0; i < 4; i++)
+        leader_rows(&l, 5, &rng);
+    static const char ecname[] = "p5_1_4_1.ec";
+    uint8_t body[3000];
+    for (size_t i = 0; i < sizeof body; i++)
+        body[i] = (uint8_t)(i * 7 + 3);
+    mk_file f = {ecname, (uint32_t)strlen(ecname), sizeof body, xxh64(body, sizeof body, 0), 0, MK_FILE_EC};
+    uint8_t files[256], rec[8] = {1, 2, 3, 4, 5, 6, 7, 8}, oid[MK_OID] = {9};
+    size_t fl = mk_file_put(files, &f);
+    uint8_t objs[256];
+    size_t ol = mk_cold_obj_put(objs, oid, rec, sizeof rec);
+    mk m = {.type = MK_COLD};
+    m.u.cold = (mk_cold){.z = 1, .flush_through = 0, .stripe_version = 1, .key = 4 * 5 + 1, .nobjs = 1, .nfiles = 1,
+                         .objs = objs, .objs_len = ol, .files = files, .files_len = fl};
+    lrec *c = leader_marker(&l, &m, T0 + (int64_t)l.next);
+    lrec *n1 = m_now(&l, T0 + 1000);
+    eng *db;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(feed(db, &l, 0, l.n), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK(replica_durable_end(db) < c->last); /* mutant coldnostage: acknowledged without its file */
+    CHECK_EQ(replica_missing(db, &mpos, name, sizeof name, &sz), 1);
+    CHECK(strcmp(name, ecname) == 0);
+    CHECK_EQ(mpos, c->last);
+    CHECK_EQ(sz, sizeof body);
+    CHECK_EQ(replica_stage_path(db, ecname, sp, sizeof sp), TSDB_ERR_NOTFOUND);
+    eng_close(db);
+    /* a restart with the marker in the log and no file: still held */
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK(replica_durable_end(db) < c->last);
+    CHECK_EQ(replica_missing(db, &mpos, name, sizeof name, &sz), 1);
+    CHECK(strcmp(name, ecname) == 0);
+    /* a file with the wrong content is no file */
+    body[100] ^= 1;
+    CHECK_EQ(replica_stage(db, ecname, body, sizeof body), 0);
+    CHECK_EQ(replica_missing(db, &mpos, name, sizeof name, &sz), 1);
+    body[100] ^= 1;
+    CHECK_EQ(replica_stage(db, ecname, body, sizeof body), 0);
+    CHECK_EQ(replica_missing(db, &mpos, name, sizeof name, &sz), 0);
+    CHECK_EQ(replica_stage_path(db, ecname, sp, sizeof sp), 0);
+    CHECK(strncmp(sp, "stage_", 6) == 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_durable_end(db), n1->last);
+    /* RSTATE's COLD in progress survives a reopen (format 2), and the replay asks ecapply_cold_decide: the stub's "not
+     * built" refuses the apply (mutants of the record's save, load or the decision apply it again instead) */
+    CHECK_EQ(rs_cold_begin(db, c->last, m.u.cold.key), 0);
+    eng_close(db);
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    uint64_t cp = 0;
+    int64_t ck = 0;
+    CHECK_EQ(jr_cold_pending(db, &cp, &ck), 0);
+    CHECK(cp == c->last && ck == m.u.cold.key);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK(replica_apply(db, n1->last) == TSDB_ERR_INVALID);
+    eng_close(db);
+    /* a record that names another key at the marker's position is damage (mutant coldkeyany) */
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(rs_cold_begin(db, c->last, m.u.cold.key + 4), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK(replica_apply(db, n1->last) == TSDB_ERR_CORRUPT);
+    eng_close(db);
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(rs_cold_begin(db, 0, 0), 0); /* none in progress: the apply carries it out */
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_durable_end(db), n1->last);
+    CHECK_EQ(replica_apply(db, n1->last), 0);
+    CHECK_EQ(eng_now_ms(db), T0 + 1000);
+    cp = 1, ck = 1;
+    CHECK_EQ(jr_cold_pending(db, &cp, &ck), 0);
+    CHECK(cp == 0 && ck == 0);
+    eng_close(db);
+    /* applied: a replay skips it (RSTATE's `done`) before it looks at a COLD in progress, here a stale one naming
+     * another key (mutant cold_noskip of the review: carried out again, it meets the key check), and the open holds
+     * nothing */
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(rs_cold_begin(db, c->last, m.u.cold.key + 4), 0);
+    eng_close(db);
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db)
+        return;
+    CHECK_EQ(replica_missing(db, &mpos, name, sizeof name, &sz), 0);
+    CHECK_EQ(replica_durable_end(db), n1->last);
+    CHECK_EQ(replica_apply(db, n1->last), 0);
+    eng_close(db);
+    /* RSTATE of format 1 (before R8) is refused by name: no carry-over */
+    char rsp[PATH_MAX + 16];
+    snprintf(rsp, sizeof rsp, "%s/RSTATE", dir);
+    FILE *rf = fopen(rsp, "wb");
+    CHECK(rf != NULL);
+    if (rf) {
+        uint8_t old[64] = {0};
+        uint64_t mg = UINT64_C(0x5453544154535231);
+        memcpy(old, &mg, 8);
+        uint64_t h = xxh64(old, 56, 0);
+        memcpy(old + 56, &h, 8);
+        CHECK(fwrite(old, 1, sizeof old, rf) == sizeof old);
+        fclose(rf);
+    }
+    db = NULL;
+    CHECK(open_replica(dir, 0, &db) == TSDB_ERR_CORRUPT);
+    if (db)
+        eng_close(db);
+    leader_free(&l);
+    sh("rm -rf '%s'", dir);
+
+    /* a COLD that names a file that is neither a part nor an .ec is damage, refused when it arrives (mutant
+     * coldnameany): the apply would link a staged file under that name */
+    fresh(dir, "coldname");
+    leader_init(&l);
+    leader_rows(&l, 5, &rng);
+    static const char bad[] = "MANIFEST";
+    mk_file fb = {bad, (uint32_t)strlen(bad), sizeof body, xxh64(body, sizeof body, 0), 0, MK_FILE_EC};
+    fl = mk_file_put(files, &fb);
+    m.u.cold.files_len = fl;
+    leader_marker(&l, &m, T0 + (int64_t)l.next);
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (db) {
+        CHECK(feed(db, &l, 0, l.n) == TSDB_ERR_CORRUPT);
+        eng_close(db);
+    }
+    leader_free(&l);
+    sh("rm -rf '%s'", dir);
+}
+
+/* R8: every append site tells ppos_note (through eng_ppos_rows) of the rows it adds, with their positions: mem_insert,
+ * the replay of a segment at open, a replica's apply_rows */
+static size_t ppos_seen[PPOS_SITES];
+static struct {
+    int64_t ts;
+    uint64_t pos;
+} ppos_rows[PPOS_SITES][64];
+static void ppos_count(eng *db, memtable *m, int site, const int64_t *ts, size_t n, uint64_t fno, const uint32_t *ix)
+{
+    (void)db;
+    CHECK(m != NULL);
+    if (site < 0 || site >= PPOS_SITES)
+        return;
+    for (size_t j = 0; j < n; j++, ppos_seen[site]++)
+        if (ppos_seen[site] < 64) {
+            ppos_rows[site][ppos_seen[site]].ts = ts[j];
+            ppos_rows[site][ppos_seen[site]].pos = fno + (ix ? ix[j] : j);
+        }
+}
+
+static void case_ppos_sites(void)
+{
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/ppos", S);
+    sh("rm -rf '%s' && mkdir -p '%s'", dir, dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 0;
+    memset(ppos_seen, 0, sizeof ppos_seen);
+    ppos_test_note = ppos_count;
+    pid_t pid = fork();
+    if (pid == 0) { /* rows in the WAL, no flush: the parent's open replays them */
+        eng *w = NULL;
+        uint32_t id;
+        int rc = (eng_open)(dir, &o, &w);
+        if (rc == 0)
+            rc = eng_series(w, "s", TSDB_FLOAT32, &id);
+        if (rc)
+            _exit(10 - rc);
+        int64_t ts[3] = {T0, T0 + 1000, T0 + 2000};
+        uint64_t sl[3] = {0};
+        if ((rc = mem_insert(w, NULL, id, ts, sl, 8, 3, TSDB_FLOAT32)) != 0)
+            _exit(30 - rc);
+        if (ppos_seen[PPOS_SITE_INSERT] != 3)
+            _exit(3);
+        for (int j = 0; j < 3; j++) /* the WAL's numbers: the insert took the last three */
+            if (ppos_rows[PPOS_SITE_INSERT][j].ts != ts[j] ||
+                ppos_rows[PPOS_SITE_INSERT][j].pos != w->wal_appended - 2 + (uint64_t)j)
+                _exit(4);
+        _exit(0);
+    }
+    int st = 0;
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid);
+    CHECK(WIFEXITED(st));
+    CHECK_EQ(WEXITSTATUS(st), 0); /* 3: mem_insert did not tell, 4: of other positions; 10 + e: the open, 30 + e: the
+                                   * insert failed with -e */
+    eng *db = NULL;
+    CHECK_EQ((eng_open)(dir, &o, &db), 0);
+    CHECK_EQ(ppos_seen[PPOS_SITE_REPLAY], 3);
+    if (db) { /* the replay gives each row the number its record took: the last three of the WAL */
+        for (int j = 0; j < 3; j++)
+            CHECK(ppos_rows[PPOS_SITE_REPLAY][j].ts == T0 + 1000 * j &&
+                  ppos_rows[PPOS_SITE_REPLAY][j].pos + 2 == ppos_rows[PPOS_SITE_REPLAY][2].pos + (uint64_t)j);
+        eng_close(db);
+    }
+    char rd[PATH_MAX];
+    fresh(rd, "ppos_r");
+    leader l;
+    unsigned rng = 3;
+    leader_init(&l);
+    for (int i = 0; i < 3; i++)
+        leader_rows(&l, 5, &rng);
+    lrec *n1 = m_now(&l, T0 + 1000);
+    CHECK_EQ(open_replica(rd, 0, &db), 0);
+    if (db) {
+        CHECK_EQ(feed(db, &l, 0, l.n), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(replica_apply(db, n1->last), 0);
+        CHECK_EQ(ppos_seen[PPOS_SITE_APPLY], 15);
+        for (size_t k = 0; k < ppos_seen[PPOS_SITE_APPLY] && k < 64; k++) { /* each row at its record's number */
+            uint64_t p = ppos_rows[PPOS_SITE_APPLY][k].pos;
+            bool found = false;
+            for (size_t i = 0; i < l.n; i++)
+                if (l.r[i].n > 0 && p >= l.r[i].fno && p <= l.r[i].last)
+                    found = ppos_rows[PPOS_SITE_APPLY][k].ts == T0 + (int64_t)l.r[i].t[p - l.r[i].fno] * 1000;
+            CHECK(found);
+        }
+        eng_close(db);
+    }
+    ppos_test_note = NULL;
+    leader_free(&l);
+    sh("rm -rf '%s' '%s'", dir, rd);
+}
+
+/* R8: the position parts_commit records for its parts (ppos_record, seen through ppos_test_record): a leader's COMMIT
+ * its marker's, the replica's apply of it the same, a flush 0 (each part's from its memtable's map). A leader whose
+ * publish failed after its marker leaves its position on the thread; a flush of another volume on that thread must
+ * still record 0 (REVIEW M1; mutant ppostale). */
+static struct {
+    eng *db;
+    uint64_t pos;
+} prec[256];
+static size_t nprec;
+static void prec_note(eng *db, const char *first, size_t n, uint64_t pos)
+{
+    (void)first, (void)n;
+    if (nprec < 256)
+        prec[nprec].db = db, prec[nprec].pos = pos;
+    nprec++;
+}
+
+static void case_ppos_pos(void)
+{
+    xport x;
+    xp_start(&x, "pposp");
+    ppos_test_record = prec_note;
+    xp_rows(&x, 0, 0, 10, 100);
+    nprec = 0;
+    CHECK_EQ(eng_flush(x.ld), 0);
+    CHECK(nprec >= 1);
+    for (size_t i = 0; i < nprec && i < 256; i++)
+        CHECK(prec[i].db == x.ld && prec[i].pos == 0);
+    xp_step(&x, "ppos: rows");
+    nprec = 0;
+    xp_rows(&x, 0, 20, 40, 2000); /* a large insert: a COMMIT */
+    uint64_t cpos = ld_last(&x);
+    CHECK(nprec >= 1 && nprec <= 256);
+    if (nprec >= 1 && nprec <= 256)
+        CHECK(prec[nprec - 1].db == x.ld && prec[nprec - 1].pos == cpos);
+    xp_step(&x, "ppos: large insert");
+    bool rep = false; /* the replica's apply of the COMMIT (inside the leader's wait, here) records its position */
+    for (size_t i = 0; i < nprec && i < 256; i++)
+        rep |= prec[i].db == x.rep && prec[i].pos == cpos;
+    if (!rep)
+        for (size_t i = 0; i < nprec && i < 256; i++)
+            fprintf(stderr, "  ppos record %zu: %s pos %" PRIu64 " (COMMIT at %" PRIu64 ")\n", i,
+                    prec[i].db == x.ld ? "leader" : prec[i].db == x.rep ? "replica" : "other", prec[i].pos, cpos);
+    CHECK(rep);
+    /* a publish abandoned after its marker: the leader fails, the position stays on this thread */
+    eng *b = NULL;
+    char bd[PATH_MAX];
+    fresh(bd, "pposb");
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    CHECK_EQ((eng_open)(bd, &o, &b), 0);
+    volatile int flag = 1;
+    tsdb_set_abandon_flag(&flag);
+    int64_t ts[40];
+    float v[40];
+    for (int i = 0; i < 40; i++)
+        ts[i] = T0 + 1000LL * (60 + i), v[i] = (float)i;
+    CHECK_EQ(eng_insert_series(x.ld, TSDB_FLOAT32, 0, ts, v, 40), TSDB_ERR_ABANDONED);
+    tsdb_set_abandon_flag(NULL);
+    CHECK(eng_check(x.ld) != 0);
+    if (b) {
+        uint32_t id = 0;
+        CHECK_EQ(eng_series(b, "s", TSDB_FLOAT32, &id), 0);
+        CHECK_EQ(eng_insert_series(b, TSDB_FLOAT32, id, ts, v, 5), 0);
+        nprec = 0;
+        CHECK_EQ(eng_flush(b), 0);
+        CHECK(nprec >= 1);
+        for (size_t i = 0; i < nprec && i < 256; i++)
+            CHECK(prec[i].db == b && prec[i].pos == 0);
+        eng_close(b);
+    }
+    ppos_test_record = NULL;
+    xp_stop(&x);
+    printf("  ppos positions: a leader's COMMIT and the replica's apply of it record the marker's, a flush 0, also "
+           "after a publish failed past its marker on the same thread\n");
 }
 
 /* a COMMIT whose files are not staged: not acknowledged, not applied, until they are */
@@ -6346,6 +6673,10 @@ static int mutant_of(const char *m)
                         : strcmp(m, "promotekeepsegs") == 0 ? MUT_REPLICA_PROMOTE_KEEP_SEGS
                         : strcmp(m, "nodropserial") == 0 ? MUT_REPLICA_NO_DROP_SERIAL
                         : strcmp(m, "stagetrunc") == 0 ? MUT_REPLICA_STAGE_TRUNC
+                        : strcmp(m, "coldnostage") == 0 ? MUT_REPLICA_COLD_NO_STAGE
+                        : strcmp(m, "coldkeyany") == 0 ? MUT_REPLICA_COLD_KEY_ANY
+                        : strcmp(m, "coldnameany") == 0 ? MUT_REPLICA_COLD_NAME_ANY
+                        : strcmp(m, "ppostale") == 0 ? MUT_LEADER_PPOS_STALE
                         : strcmp(m, "noorphans") == 0 ? MUT_REPLICA_NO_STAGE_ORPHANS
                         : strcmp(m, "epochseg") == 0 ? MUT_REPLICA_EPOCH_SEG
                         : strcmp(m, "leadervisible") == 0 ? MUT_LEADER_VISIBLE_DURABLE
@@ -6586,6 +6917,15 @@ int main(int argc, char **argv)
         char *slash = strrchr(SELF, '/');
         snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
     }
+    if (getenv("TEST_REPLICA_R8")) { /* the R8 cases alone (a quick run while working on them) */
+        case_cold_hold();
+        case_ppos_sites();
+        case_ppos_pos();
+        if (failures == 0)
+            sh("rm -rf '%s'", S);
+        printf(failures ? "test_replica (R8 cases): %d failures\n" : "test_replica (R8 cases): ok\n", failures);
+        return failures != 0;
+    }
     if (getenv("TEST_REPLICA_BENCH")) {
         int reps = atoi(getenv("TEST_REPLICA_BENCH"));
         size_t mem = getenv("BENCH_MEM_ROWS") ? strtoull(getenv("BENCH_MEM_ROWS"), NULL, 10) : 4000000;
@@ -6595,6 +6935,18 @@ int main(int argc, char **argv)
         sh("rm -rf '%s'", S);
         printf("test_replica: bench: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
+    }
+    if (eng_test_mutant == MUT_REPLICA_COLD_NO_STAGE || eng_test_mutant == MUT_REPLICA_COLD_KEY_ANY ||
+        eng_test_mutant == MUT_REPLICA_COLD_NAME_ANY || eng_test_mutant == MUT_LEADER_PPOS_STALE) {
+        /* their cases first: a killed mutant stops there */
+        if (eng_test_mutant == MUT_LEADER_PPOS_STALE)
+            case_ppos_pos();
+        else
+            case_cold_hold();
+        if (failures) {
+            fprintf(stderr, "test_replica: %d failures\n", failures);
+            return 1;
+        }
     }
     if (eng_test_mutant == MUT_LEADER_NO_CUTOFF || eng_test_mutant == MUT_LEADER_ZERO_RATE ||
         eng_test_mutant == MUT_LEADER_NO_RAISE_FROM || eng_test_mutant == MUT_LEADER_PRUNE_OFF1 ||
@@ -6736,6 +7088,9 @@ int main(int argc, char **argv)
     case_commit();
     case_ro_open();
     case_commit_hold();
+    case_cold_hold();
+    case_ppos_sites();
+    case_ppos_pos();
     case_commit_cut();
     case_commit_hold_cut();
     case_apply_concurrent();

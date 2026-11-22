@@ -14,9 +14,10 @@
  *              all .part and no .ec, or all .ec with every settled_ present; then power lost at each step of that
  *              open's recovery
  *   power      power lost (crashfs, torn at random) at every step of an open, a swap and a close, two seeds each
+ *   logged     R8: a swap whose objects a committed COLD names is never handed to r7-gc when it is refused
  *   threads    16 threads query every key and look up the latest row while the keys are swapped one by one
  *
- * Usage: test_ecswap [--quick] [--mutant swapearly|swappartial|swapnodirsync|swapnodropcheck] [SCRATCH]. Without
+ * Usage: test_ecswap [--quick] [--mutant swapearly|swapnodropcheck|...|swaploggedgc] [SCRATCH]. Without
  * TSDB_EC (make NO_EC=1, the bindings) it says it is skipped.
  */
 #include "internal.h"
@@ -61,7 +62,8 @@ static const struct {
                {"swapnostats", SWAP_MUT_NOSTATS},
                {"swapmanifestrc", SWAP_MUT_MANIFESTRC},
                {"swapbackongone", SWAP_MUT_BACKONGONE},
-               {"swaplostsettled", SWAP_MUT_LOSTSETTLED}};
+               {"swaplostsettled", SWAP_MUT_LOSTSETTLED},
+               {"swaploggedgc", SWAP_MUT_LOGGEDGC}};
 
 static const char *mutant_name(int m)
 {
@@ -569,6 +571,68 @@ static void contract_case(void)
            "with nothing renamed; a failed engine renames nothing and the open rolls the swap forward\n");
 }
 
+/* ------------------------------------------------------------ a logged swap (R8) */
+
+static int handed;
+static void count_handed(eng *db) { (void)db, handed++; }
+
+/* A swap whose objects a committed COLD marker names (ecapply_swap_pre's `logged`, forced by ecswap_test_logged): every
+ * refusal after the hook fails the engine and hands no object to r7-gc (ecswap_handed_hook) nor back to the caller
+ * (TSDB_ERR_IO, never NOMEM); the temporaries stay for the next open. A logged swap with no failure swaps. */
+static void logged_case(void)
+{
+    static const struct {
+        const char *name;
+        int fail;  /* ECSWAP_FAIL_* */
+        bool drop; /* a merge unlists a source inside the hook: the input check refuses */
+        size_t intents;
+    } C[] = {{"logged-atnomem", ECSWAP_FAIL_AT_NOMEM, false, 0},
+             {"logged-intentnomem", ECSWAP_FAIL_INTENT_NOMEM, false, 0},
+             {"logged-intentio", ECSWAP_FAIL_INTENT_IO, false, 0},
+             {"logged-stopped", ECSWAP_FAIL_NONE, true, 1}};
+    char dir[PATH_MAX], stem[4][96];
+    size_t ns = 0;
+    ecswap_handed_hook = count_handed;
+    atomic_store(&ecswap_test_logged, true);
+    for (size_t c = 0; c < sizeof C / sizeof *C; c++) {
+        fresh(C[c].name, dir, sizeof dir);
+        eng *db = NULL;
+        CHECK(open_eng(dir, 3600, &db) == 0);
+        if (!db)
+            continue;
+        populate(db);
+        handed = 0;
+        atomic_store(&ecswap_test_fail, C[c].fail);
+        hook_key = 1;
+        ec_swap_hook = C[c].drop ? merged_hook : NULL;
+        int rc = swap_key(db, 1, stem, &ns);
+        ec_swap_hook = NULL;
+        atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
+        if (rc != TSDB_ERR_IO || handed != 0 || eng_check(db) == 0)
+            fprintf(stderr, "  (%s: swap %d, handed %d, engine %s)\n", C[c].name, rc, handed,
+                    eng_check(db) ? "failed" : "running");
+        CHECK(rc == TSDB_ERR_IO && eng_check(db) != 0 && handed == 0);
+        CHECK(count_names(dir, "tmp_", ".ec") == ns && count_names(dir, "txn_", ".intent") == C[c].intents);
+        CHECK(count_names(dir, "p1_", ".ec") == 0 && count_names(dir, "settled_", ".part") == 0); /* none renamed */
+        eng_close(db); /* a failed engine's close reports it */
+    }
+    /* the control: a logged swap that nothing refuses */
+    fresh("logged-ok", dir, sizeof dir);
+    eng *db = NULL;
+    CHECK(open_eng(dir, 3600, &db) == 0);
+    if (db) {
+        populate(db);
+        handed = 0;
+        CHECK(swap_key(db, 1, stem, &ns) == 0 && eng_check(db) == 0 && handed == 0);
+        CHECK(key_state(dir, stem, ns, "logged-ok") == 2);
+        CHECK(eng_close(db) == 0);
+    }
+    atomic_store(&ecswap_test_logged, false);
+    ecswap_handed_hook = NULL;
+    printf("  logged (R8): a swap whose objects a committed COLD names, refused out of memory, at its intent or by "
+           "its input check: the engine fails, no object handed to r7-gc, the temporaries kept\n");
+}
+
 /* ------------------------------------------------------------ recovery by hand */
 
 static void put(const char *dir, const char *name, const char *text)
@@ -1025,6 +1089,7 @@ int main(int argc, char **argv)
     printf("test_ecswap%s%s\n", ecswap_mutant ? " --mutant " : "", ecswap_mutant ? mutant_name(ecswap_mutant) : "");
     basic_case();
     contract_case();
+    logged_case();
     drop_case(3600);
     drop_case(0);
     recover_case();

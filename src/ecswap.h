@@ -51,6 +51,9 @@ extern int (*ec_swap_publish)(eng *db);
  * fdatasync: its name is removed and never synced) */
 enum { ECSWAP_FAIL_NONE = 0, ECSWAP_FAIL_AT_NOMEM, ECSWAP_FAIL_INTENT_NOMEM, ECSWAP_FAIL_INTENT_IO };
 extern atomic_int ecswap_test_fail;
+/* tests: every swap is one whose objects a committed COLD marker names, as ecapply_swap_pre says on a cluster ec volume
+ * (R8): a refusal after the hook fails the engine and hands nothing to r7-gc or to the caller */
+extern atomic_bool ecswap_test_logged;
 /* tests: runs in a refused swap's cleanup after the temporaries were unlinked and before the directory sync that makes
  * that durable (and before any object goes to r7-gc) */
 extern void (*ecswap_discard_hook)(eng *db);
@@ -74,6 +77,7 @@ enum {
     SWAP_MUT_BACKONGONE,  /* swapbackongone: recovery rolls back whenever a source is gone, whatever was renamed */
     SWAP_MUT_LOSTSETTLED, /* swaplostsettled: an .ec under none of its names fails the open even when its source is
                            * settled (a drop after the swap, lifetime 0) */
+    SWAP_MUT_LOGGEDGC,    /* swaploggedgc: a refused swap hands objects a committed COLD names to r7-gc (R8) */
 };
 extern int ecswap_mutant;
 #endif

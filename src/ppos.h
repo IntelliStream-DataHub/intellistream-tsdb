@@ -20,17 +20,28 @@
 #include <stdint.h>
 
 struct eng;
-struct ppos; /* the volume's PPOS state (r8d), eng.ppos */
+struct memtable;
+struct ppos;    /* the volume's PPOS state (r8d), eng.ppos */
+struct ppos_mt; /* a memtable's map base partition -> highest fno (r8d), memtable.ppos */
 
 /* At the open of a cluster ec volume (eng.ec_cluster): reads and compacts PPOS, sets db->ppos. 0 and nothing else on
  * any other volume. */
 int ppos_open(struct eng *db);
 void ppos_close(struct eng *db);
-/* n rows at ts (a base partition) were appended to the active memtable at log positions from fno on: under buf_lock,
- * at every append site (mem_insert, the replay, a replica's apply_rows). Does nothing unless db->ppos. */
-void ppos_note(struct eng *db, int64_t ts, size_t n, uint64_t fno);
+/* n rows at ts (a base partition) were appended to memtable m (the active one; the replay's own) at log positions from
+ * fno on: under buf_lock (the replay: alone), at every append site (mem_insert, the replay, a replica's apply_rows),
+ * through eng_ppos_note (internal.h), which calls it only when db->ppos. */
+void ppos_note(struct eng *db, struct memtable *m, int64_t ts, size_t n, uint64_t fno);
+/* Around a flush's part writes and commit (flush_waiting, the replay's flush of its memtable): a ppos_record with pos 0
+ * between the two takes each part's position from m's map. Only when db->ppos. */
+void ppos_flush_begin(struct eng *db, struct memtable *m);
+void ppos_flush_end(struct eng *db, struct memtable *m);
+/* m's map (memtable.ppos), freed with m (mt_unref). */
+void ppos_mt_free(struct memtable *m);
 /* The records of the parts about to be named (names[0 .. n)), each at log position pos (0: from the memtable's map),
- * appended and synced before any of the names is visible; 0 and nothing written unless db->ppos. */
+ * appended and synced before any of the names is visible; 0 and nothing written unless db->ppos. pos 0 means the map
+ * only inside a flush window (ppos_flush_begin/end); outside one it is a merge whose sources have no record (merge.c):
+ * unknown, never a flush. */
 int ppos_record(struct eng *db, const char *const *names, size_t n, uint64_t pos);
 /* The record of one part (an .ec part at its marker's Z); the ppos of a listed part. */
 int ppos_set(struct eng *db, const char *name, uint64_t pos);

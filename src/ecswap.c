@@ -66,6 +66,7 @@
  * its chunks are durable, and then its tmp_*.ec too, nothing renamed. An unknown name ends the process with status 2 at the first point passed.
  */
 #include "ecswap.h"
+#include "ecapply.h"
 #include "eckeep.h"
 #include "ecgc.h"
 #include "ecpart.h"
@@ -83,6 +84,7 @@ void (*ec_swap_hook)(eng *db);
 int (*ec_swap_publish)(eng *db) = manifest_publish;
 int ecswap_mutant;
 atomic_int ecswap_test_fail;
+atomic_bool ecswap_test_logged;
 void (*ecswap_discard_hook)(eng *db);
 void (*ecswap_handed_hook)(eng *db);
 void (*ecswap_intent_fail_hook)(eng *db);
@@ -264,6 +266,18 @@ static void swap_discard(eng *db, const char *intent, part **ec, size_t n)
         unlinkat(db->dirfd, intent, 0);
 }
 
+/* A refusal of a swap whose objects a committed COLD marker names (ecapply_swap_pre's `logged`, R8): the replicas list
+ * or will list .ec parts on them, so they are never r7-gc's, nor the caller's to clean up. Nothing was renamed; the
+ * engine fails with a line, the temporaries (and an intent already written) stay, and the next open decides (r8h's
+ * recovery of the COLD). TSDB_ERR_IO, as for every failed engine: a caller hands nothing over on it. */
+static int swap_refuse_logged(eng *db, const char *why)
+{
+    char what[192];
+    snprintf(what, sizeof what, "a settle swap whose objects a committed COLD marker names (%s; its objects kept)", why);
+    eng_fail(db, what, 0);
+    return TSDB_ERR_IO;
+}
+
 /* the L renames, then the R renames; false (the engine failed) when one fails */
 static bool swap_renames(eng *db, part **in, part **ec, size_t n)
 {
@@ -298,24 +312,49 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     if (!args_valid(in, ec, n))
         return TSDB_ERR_INVALID;
     size_t *at = NULL;
-    if (atomic_load(&ecswap_test_fail) == ECSWAP_FAIL_AT_NOMEM)
-        atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
-    else
-        at = malloc(n * sizeof *at);
-    if (!at)
-        return TSDB_ERR_NOMEM;
     char intent[64];
     snprintf(intent, sizeof intent, "txn_%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
 
     pthread_mutex_lock(&db->publish_lock);
     int rc = eng_check(db) ? TSDB_ERR_IO : 0;
     bool early = ecswap_mutant == SWAP_MUT_EARLY;
+    /* R8 (src/ecapply.h): before the intent's commit point, a cluster ec volume's .ec PPOS records and the COLD's
+     * RSTATE `doing` (a stub that does nothing elsewhere); failed, nothing of the swap is visible. `logged`: a
+     * committed COLD marker names the objects, so no refusal from here on hands them to r7-gc (swap_refuse_logged) */
+    bool logged = false;
+    if (rc == 0) {
+        rc = ecapply_swap_pre(db, in, ec, n, &logged);
+        logged = (logged || atomic_load(&ecswap_test_logged)) && ecswap_mutant != SWAP_MUT_LOGGEDGC;
+        if (rc && logged) {
+            pthread_mutex_unlock(&db->publish_lock);
+            return swap_refuse_logged(db, "its hook before the intent failed");
+        }
+        if (rc) {
+            pthread_mutex_unlock(&db->publish_lock);
+            if (rc != TSDB_ERR_NOMEM)
+                swap_discard(db, NULL, ec, n);
+            return rc;
+        }
+    }
+    if (rc == 0) { /* after the hook, so that a logged swap is not handed back as out of memory (the caller's
+                    * cleanup gives the objects to r7-gc) */
+        if (atomic_load(&ecswap_test_fail) == ECSWAP_FAIL_AT_NOMEM)
+            atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
+        else
+            at = malloc(n * sizeof *at);
+        if (!at) {
+            pthread_mutex_unlock(&db->publish_lock);
+            return logged ? swap_refuse_logged(db, "out of memory") : TSDB_ERR_NOMEM;
+        }
+    }
     if (rc == 0 && !early && (rc = intent_write(db, intent, in, ec, n)) != 0) {
         pthread_mutex_unlock(&db->publish_lock);
+        free(at);
+        if (logged)
+            return swap_refuse_logged(db, "its intent could not be written");
         if (rc != TSDB_ERR_NOMEM || settle_mutant == SETTLE_MUT_GCDOUBLE) /* NOMEM: nothing written, the caller
                                                                            * cleans up (ecswap.h), never both */
             swap_discard(db, NULL, ec, n);
-        free(at);
         return rc;
     }
     if (rc == 0 && !early && ecswap_mutant != SWAP_MUT_NODIRSYNC &&
@@ -364,6 +403,10 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     lt_end(db, &lsec);
     free(at);
 
+    if (!ok && logged && eng_check(db) == 0) { /* a dropped, merging or unlisted source: the intent stays */
+        pthread_mutex_unlock(&db->publish_lock);
+        return swap_refuse_logged(db, "a source was dropped, merged or unlisted before its renames");
+    }
     if (!ok) {
         rc = eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
         if (!early)
@@ -383,6 +426,7 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
         pthread_mutex_unlock(&db->publish_lock);
         return rc; /* the engine failed; the intent is still there: the next open rolls the swap forward */
     }
+    ecapply_swap_post(db, in, ec, n); /* R8: the swap is durable (a COLD's RSTATE `done`); under publish_lock */
     settle_crash(SC_BEFORE_UNLINK);
     /* The swap is durable and listed. An intent that stays (this unlink failed, or a power cut brings it back:
      * nothing syncs it) is rolled forward at the next open, which finds the L names (ecswap_recover). */
