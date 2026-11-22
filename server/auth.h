@@ -72,6 +72,9 @@ typedef struct auth_group_ops {
     int (*propose)(int op, const char *name, const void *blob, uint32_t len, uint64_t version, const char *actor,
                    uint64_t actor_version, int wait_ms, uint64_t *index, uint32_t *uid, struct cluster_laggard *lag,
                    uint32_t *nlag);
+    /* the read barrier (cluster_user_sync) and how far the watch has the copy's users (cluster_users_through) */
+    int (*sync)(int wait_ms, uint64_t *index, struct cluster_laggard *lag, uint32_t *nlag);
+    uint64_t (*through)(void);
 } auth_group_ops;
 void auth_set_group(const auth_group_ops *ops);
 /* The reload thread: USERS on a one-second tick (A10), and what it changed reaches the connections. */

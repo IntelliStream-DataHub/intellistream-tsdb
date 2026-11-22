@@ -3,7 +3,14 @@
 Found by the users workload of `make jepsen-cluster` (tests/jepsen/cluster_users.h, track s2j-jusers). Two server
 bugs and a list of what the workload cannot yet reach.
 
-## 1. A no-op or a refusal is answered from the local copy (server/auth.c `admin_group`)
+## 1. A no-op or a refusal is answered from the local copy (server/auth.c `admin_group`) -- DONE (track s2k-users)
+
+Fixed: a read barrier (`group_sync` -> `cluster_user_sync`, the leader's commit index under its lease, then this copy's
+users through it) and a check again before a no-op or refusal is answered; a no-op waits for the members. Tests:
+`test_cluster userstale` (fails on 2c89230; also a no-op's OK waiting for a paused member) and `userlease` (a leader
+cut off from its group refuses the barrier), mutants `nooplocal`, `syncnowait`, `nomembers`, `syncnolease` in
+`make auth-mutants`; not tested: the barrier's term check (a SYNC before a new leader's first commit). The harness's
+`noop` exemption is gone and its check 6 makes a refusal contradicting an acknowledged change a violation.
 
 `admin_group` proposes only when the member's own copy says something changes (`pr.op != 0`). When the copy says "nothing
 to change" (a grant already held) or refuses (NOTFOUND, INVALID, DENIED from `admin_change`) the answer goes out with no
@@ -27,7 +34,14 @@ another, grant through the paused one on resume: must not answer OK without the 
 as NOTFOUND must not be answered while the grant stands), and in the harness remove the exemption in `ju_admin`
 (`noop`, counted in the report) and add a check that a refusal contradicting an acknowledged earlier change is a violation.
 
-## 2. A promotion empties the users watch for about 110 ms
+## 2. A promotion empties the users watch for about 110 ms -- DONE (track s2k-users)
+
+Fixed: `users_push` gives the watch nothing while the copy is older than what the watch last took (a lower restore
+generation, or the same one and a lower applied index). Tests: `test_cluster userpromote` (an install held 2 s on the
+promoted member; fails on 2c89230) and `userreplay` (a copy replayed from entry 1 passes through older, non-empty lists;
+auth.c logs a list that goes back), mutants `pushrebuild` and `holdempty` (TSDB_CLUSTER_MUTANT) in
+`make auth-mutants`; the harness no longer waits for the voters
+(`ju_await_voters` removed).
 
 A learner promoted to voter gets its Raft core and rebuilds its metadata copy from nothing (`core_boot`: `meta_init`);
 `users_push` then gives auth an EMPTY list until the copy has applied past it. Every login on that node is refused (the
@@ -37,6 +51,9 @@ regression scenario of the fix. Fix idea: `users_push` keeps the last list while
 applied past it.
 
 ## 3. What the users workload does not cover
+
+Still open. The laggard list stays off the wire reply of the user admin ops: the clients' calls (`tsdbc_grant` and the
+rest) return a status only, so carrying it means a protocol and API change in all four clients (s2k-users left it).
 
 - The CLI path (`tsdb cluster user ... --wait-ms`, the only one that reports members still behind) runs once, before any
   fault. The wire reply carries no laggard list (`admin_group` drops `lag[]`), so the checker binds a member that was

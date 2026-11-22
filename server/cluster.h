@@ -59,6 +59,12 @@ enum cluster_admin_op {
                                   * is up (NO_OWNER), puts the replica on `node` into its ISR, so that the next
                                   * promotion fences it and picks it: an unclean election (design-cluster.md 6.2).
                                   * Reply: text for the operator (the proposal is made; the promotion follows) */
+    /* USER_SYNC: body u32 wait_ms; on the Raft leader, while it holds its check-quorum lease (no other leader can
+     * exist, and its commit index covers every committed entry). The read barrier of an admin op that changes
+     * nothing (cluster_user_sync). Reply as USER_PUT's with uid 0: u64 index (the leader's commit index), u32 0,
+     * u32 n, n x {u32 member, u64 applied} (the members below the index after wait_ms). CLUSTER_ERR_STATE: a leader
+     * without the lease (a new one, or one cut off): try again. */
+    CLUSTER_OP_USER_SYNC = 9,
 };
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
@@ -343,6 +349,13 @@ struct cluster_laggard {
 int cluster_user_propose(int op, const char *name, const void *blob, uint32_t len, uint64_t version,
                          const char *actor, uint64_t actor_version, int wait_ms, uint64_t *index, uint32_t *uid,
                          struct cluster_laggard *lag, uint32_t *nlag);
+/* The read barrier of the users (A32): the Raft leader's commit index, taken while it holds its lease, in *index once
+ * every member has reported an applied index at or above it, or wait_ms after that (lag, nlag: as
+ * cluster_user_propose's). The caller then waits until cluster_users_through() reaches *index: its copy then holds
+ * every change acknowledged before the call. Result: META_OK, CLUSTER_ERR_NOTLEADER (no leader known),
+ * CLUSTER_ERR_STATE (a leader without its lease yet), CLUSTER_ERR_RETRY (no answer). Blocks: never on the cluster
+ * thread. */
+int cluster_user_sync(int wait_ms, uint64_t *index, struct cluster_laggard *lag, uint32_t *nlag);
 
 struct cluster_vol_status {
     struct cluster_vol_report v;

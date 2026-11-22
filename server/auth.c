@@ -175,9 +175,11 @@ static _Atomic uint64_t group_applied_pub; /* group_applied, for auth_users_appl
  * holds only while the copy has no users: a restarted server's copy from its snapshot lets logins in) */
 static int mutant;
 enum { MUT_LOCALUSERS = 1, MUT_ADMINLOCAL, MUT_EARLYLOGIN, MUT_BARRIEREMPTY, MUT_NOGUARD, MUT_RETRYUNAVAIL,
-       MUT_PUSHNORETRY };
+       MUT_PUSHNORETRY, MUT_NOOPLOCAL, MUT_SYNCNOWAIT, MUT_NOMEMBERS };
 /* more mutants: noguard (an admin op is proposed without the actor guard), retryunavail (an outcome unknown answers
- * UNAVAILABLE), pushnoretry (a push this server failed to take is not asked for again). TSDB_AUTH_TEST
+ * UNAVAILABLE), pushnoretry (a push this server failed to take is not asked for again), nooplocal (a no-op or a
+ * refusal is answered from the copy, with no read barrier), syncnowait (the barrier's index is not waited for in
+ * this server's copy), nomembers (a no-op's barrier does not wait for the members). TSDB_AUTH_TEST
  * failpush_file=PATH (tests only): every push fails, as out of memory, while PATH exists. */
 static char failpush_file[4096];
 static int push_failing; /* failed pushes in a row: one log line for a run of them */
@@ -441,7 +443,10 @@ void auth_set_group(const auth_group_ops *ops)
                    : !strcmp(m, "barrierifempty")     ? MUT_BARRIEREMPTY
                    : !strcmp(m, "noguard")            ? MUT_NOGUARD
                    : !strcmp(m, "retryunavail")       ? MUT_RETRYUNAVAIL
-                   : !strcmp(m, "pushnoretry")        ? MUT_PUSHNORETRY : 0;
+                   : !strcmp(m, "pushnoretry")        ? MUT_PUSHNORETRY
+                   : !strcmp(m, "nooplocal")          ? MUT_NOOPLOCAL
+                   : !strcmp(m, "syncnowait")         ? MUT_SYNCNOWAIT
+                   : !strcmp(m, "nomembers")          ? MUT_NOMEMBERS : 0;
     if (mutant)
         fprintf(stderr, "tsdbd: TSDB_AUTH_MUTANT=%s (a test of the tests)\n", m);
     const char *t = getenv("TSDB_AUTH_TEST");
@@ -467,6 +472,11 @@ static int on_group_users(void *arg, const struct cluster_user_rec *u, uint32_t 
         if ((rc = users_group_set(&us, r, n, &refused)) == 0)
             rc = publish();
         if (rc == 0) {
+            /* only a restore of the group may take the users back; a copy pushed while it is rebuilt (a promotion)
+             * would (cluster.c users_push holds it): said, so that a test sees it (test_cluster userreplay) */
+            if (applied < group_applied)
+                fprintf(stderr, "tsdbd: the cluster's users went back from index %" PRIu64 " to %" PRIu64 "\n",
+                        group_applied, applied);
             group_applied = applied;
             atomic_store_explicit(&group_applied_pub, applied, memory_order_relaxed);
             group_pushes++;
@@ -1303,8 +1313,9 @@ static int group_result(int r)
     }
 }
 
-/* Waits on group_cv until pred(arg) or ms passed. users_mu held. */
-static void group_wait(bool (*pred)(uint64_t), uint64_t arg, int ms)
+#define POLL_MS 2
+/* Waits on group_cv until pred(arg) or ms passed; with poll, wakes every POLL_MS to ask again. users_mu held. */
+static void group_wait_poll(bool (*pred)(uint64_t), uint64_t arg, int ms, bool poll)
 {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -1312,24 +1323,66 @@ static void group_wait(bool (*pred)(uint64_t), uint64_t arg, int ms)
     t.tv_nsec += (long)(ms % 1000) * 1000000;
     if (t.tv_nsec >= 1000000000)
         t.tv_sec++, t.tv_nsec -= 1000000000;
-    while (!pred(arg))
-        if (pthread_cond_timedwait(&group_cv, &users_mu, &t) != 0)
+    while (!pred(arg)) {
+        struct timespec w = t;
+        if (poll) {
+            clock_gettime(CLOCK_MONOTONIC, &w);
+            w.tv_nsec += POLL_MS * 1000000L;
+            if (w.tv_nsec >= 1000000000)
+                w.tv_sec++, w.tv_nsec -= 1000000000;
+            if (w.tv_sec > t.tv_sec || (w.tv_sec == t.tv_sec && w.tv_nsec > t.tv_nsec))
+                w = t;
+        }
+        int e = pthread_cond_timedwait(&group_cv, &users_mu, &w);
+        if (e != 0 && e != ETIMEDOUT)
             break;
+        if (e == ETIMEDOUT && w.tv_sec == t.tv_sec && w.tv_nsec == t.tv_nsec)
+            break;
+    }
 }
+static void group_wait(bool (*pred)(uint64_t), uint64_t arg, int ms) { group_wait_poll(pred, arg, ms, false); }
 static bool applied_at(uint64_t index) { return group_applied >= index; }
+/* the watch has the copy's users through `index`: a push need not come (the users may not have changed), so this
+ * asks the cluster side, and group_wait wakes on a push or every POLL_MS */
+static bool through_at(uint64_t index) { return group->through() >= index; }
 static bool pushed_after(uint64_t n) { return group_pushes > n; }
 
 #define GROUP_WAIT_MS 5000 /* how long a change waits for the members, and then for this server's own copy */
 #define GROUP_TRIES 8      /* conditional puts that found the user changed (STALE) before the op gives up */
 
+/* The read barrier of an admin op that changes nothing (A32): the leader's commit index, taken under its lease, then
+ * this server's copy at or past it. A no-op (`wait`) waits for the members as a change does, since its OK acknowledges
+ * a state; a refusal does not. 0, or UNAVAILABLE (no leader, no lease yet, no answer, or this copy did not get there:
+ * nothing was changed, the client asks again). */
+static int group_sync(bool wait)
+{
+    uint64_t index = 0;
+    uint32_t nlag = 0;
+    struct cluster_laggard lag[CLUSTER_LAGGARDS_MAX];
+    int r = group->sync(wait ? GROUP_WAIT_MS : 0, &index, lag, &nlag);
+    if (r != META_OK)
+        return TSDB_ERR_UNAVAILABLE; /* a read: an unknown outcome changed nothing */
+    if (mutant == MUT_SYNCNOWAIT)
+        return 0;
+    pthread_mutex_lock(&users_mu);
+    group_wait_poll(through_at, index, GROUP_WAIT_MS, true);
+    bool there = through_at(index);
+    pthread_mutex_unlock(&users_mu);
+    return there ? 0 : TSDB_ERR_UNAVAILABLE;
+}
+
 /* An admin op on a cluster server: checked against the copy (the rules of the file store, users.c), proposed
  * conditional on the version it was checked at, answered once committed and back in this server's copy (so the
  * client's next request here sees it). STALE: another change came between; check again on the newer copy. Nothing is
- * changed here but by the copy: a failed proposal leaves every server as it was. */
+ * changed here but by the copy: a failed proposal leaves every server as it was. A check that finds nothing to change
+ * (a no-op) or refuses is an answer from this copy, which may lag (a pause just ended, a restart past its barrier, the
+ * minority side of a partition): it is answered only after a read barrier (group_sync) and a check again on the copy
+ * at or past it, so it never contradicts a change acknowledged before the request (A32). */
 static int admin_group(uint8_t op, uint32_t actor, const char *name, const uint8_t *q, const uint8_t *end,
                        user_verifier *v)
 {
-    for (int attempt = 0;; attempt++) {
+    int synced = 0; /* 1: barrier passed; 2: and the members waited for */
+    for (int stale = 0;; stale++) { /* stale: the STALE answers so far; a pass after a barrier is not one */
         users_proposal pr = {0};
         char aname[USER_NAME_MAX + 1] = "";
         uint64_t aversion = 0;
@@ -1346,9 +1399,21 @@ static int admin_group(uint8_t op, uint32_t actor, const char *name, const uint8
         }
         uint64_t seen = group_pushes;
         pthread_mutex_unlock(&users_mu);
-        if (rc != 0 || pr.op == 0 || mutant == MUT_ADMINLOCAL) {
+        if (mutant == MUT_ADMINLOCAL) {
             users_proposal_clear(&pr);
-            return rc; /* refused, or nothing to change */
+            return rc;
+        }
+        if (rc != 0 || pr.op == 0) { /* refused, or nothing to change */
+            users_proposal_clear(&pr);
+            int need = rc == 0 ? 2 : 1;
+            if (synced >= need || mutant == MUT_NOOPLOCAL)
+                return rc;
+            int s = group_sync(need == 2 && mutant != MUT_NOMEMBERS);
+            if (s != 0)
+                return s;
+            synced = need;
+            stale--;
+            continue; /* check again on the copy at or past the barrier */
         }
         uint64_t index = 0;
         uint32_t uid = 0, nlag = 0;
@@ -1361,7 +1426,7 @@ static int admin_group(uint8_t op, uint32_t actor, const char *name, const uint8
         pthread_mutex_lock(&users_mu);
         if (r == META_OK) {
             group_wait(applied_at, index, GROUP_WAIT_MS);
-        } else if (r == META_ERR_STALE && attempt + 1 < GROUP_TRIES) {
+        } else if (r == META_ERR_STALE && stale + 1 < GROUP_TRIES) {
             group_wait(pushed_after, seen, GROUP_WAIT_MS); /* the newer user is on its way to this copy */
             newer = pushed_after(seen);
         }
