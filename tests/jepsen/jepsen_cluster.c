@@ -64,6 +64,13 @@
  * same rows (replicas_equal) and the keys of the leader's final read, and every replica holds each of the filler's
  * large writes whole or not at all, whole when acknowledged (fill_check).
  *
+ * users (--workload users, implies --auth: every tsdbd starts with a login, the cluster with a superuser made by the CLI;
+ * tests/jepsen/cluster_users.h has the design and the checks): an admin thread adds, drops and re-adds users and changes
+ * their passwords and grants through random members, one prober per member logs in and reads as them; an acknowledged
+ * change must hold on every member that is bound by it (not one that was paused or cut off, a restarted one only after its
+ * barrier), through kill, power, partition and pause. The server mutants TSDB_CLUSTER_MUTANT=dropnotcommitted and
+ * TSDB_AUTH_MUTANT=loginbeforecatchup must fail it (`make jepsen-cluster-selftest`).
+ *
  * Selftest (--selftest-checker, --mutant NAME; each must fail, `make jepsen-cluster-selftest`): foreign-pid (a port file that names another
  * pid), takeover (a stale table, a foreign server on the node's old port, and a client that skips th_owns_port),
  * takeover-checked (the same with the check: refused, the run passes), noop-partition, unfired (an armed crash point
@@ -129,6 +136,9 @@ static uint8_t secret[128];
 static size_t secret_len;
 static int want_meta = 1, want_kv = 1;
 static int want_rep, want_classes; /* workloads kv and classes: one volume of 3 replicas, written through its leader */
+static int want_auth, want_users; /* --auth: every tsdbd requires a login (a superuser from the init); workload users */
+static void ju_fault(int i);      /* cluster_users.h: the nemeses tell the users workload which members may lag */
+static void ju_settled(void);
 static struct meta_settings S;
 
 enum { N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16 };
@@ -179,6 +189,7 @@ struct node {
     int paused;
     int proxy_fd, proxy_port;
     int starts, armed_hit;
+    int64_t proc_ns; /* when the running process was forked (now_ns); the users workload tells a restart by it */
     _Atomic uint32_t id; /* member id, 0 until it joined */
     char dir[PATH_MAX + 16], log[PATH_MAX + 32];
 };
@@ -524,6 +535,7 @@ static void net_heal(void)
 /* cuts from -> to (and back when both); `planted` is --mutant noop-partition: nothing is applied, the check stays */
 static void net_cut(int from, int to, int both)
 {
+    ju_fault(-1); /* a member behind a cut keeps the users it has (design-auth.md 12) */
     intended[from][to] = 1;
     if (both)
         intended[to][from] = 1;
@@ -595,7 +607,8 @@ static int start_node(int i, const char *crash_at, int *status)
     const char *argv[32];
     int na = 0;
     argv[na++] = "tsdbd";
-    argv[na++] = "--no-auth";
+    if (!want_auth) /* --auth (and the users workload): every node requires a login, as production does */
+        argv[na++] = "--no-auth";
     argv[na++] = flag;
     argv[na++] = "--dir";
     argv[na++] = n->dir;
@@ -662,6 +675,7 @@ static int start_node(int i, const char *crash_at, int *status)
             envp[ne++] = "CRASHFS_KEEP_OLD=1";
     }
     envp[ne] = NULL;
+    int64_t t_fork = now_ns();
     pid_t pid = fork();
     if (pid < 0)
         die(2, "fork: %s", strerror(errno));
@@ -702,6 +716,7 @@ static int start_node(int i, const char *crash_at, int *status)
     n->pid = pid;
     n->cport = port;
     n->pport = th_pport;
+    n->proc_ns = t_fork;
     n->paused = 0;
     pthread_mutex_unlock(&tbl_mu);
     ev("node %d up, pid %d", i, (int)pid);
@@ -1054,6 +1069,7 @@ static void settle(const char *after)
             dump_threads(settle_bad);
         die(1, "no settle within %d ms after %s: %s", SETTLE_MS, after, why);
     }
+    ju_settled();
     settles++;
     settle_ms_total += took;
     if (took > settle_ms_max)
@@ -1174,6 +1190,11 @@ static int connect_node(int i, int true_port, tsdbc **c)
     if (pid <= 0 || cport <= 0)
         return -1;
     tsdbc_options o = {.connect_ms = 1000};
+    if (want_auth) { /* the workloads' clients log in as the superuser of the init (cluster_users.h) */
+        o.user = "jroot";
+        o.password = "jroot-pw";
+        o.require_auth = 1;
+    }
     if (tsdbc_connect_opts("127.0.0.1", cport, &o, c) != 0)
         return -1;
     if (strcmp(mutant, "takeover") != 0 && !th_owns_port(pid, cport)) { /* "takeover" is the planted client that skips it */
@@ -1187,6 +1208,8 @@ static int connect_node(int i, int true_port, tsdbc **c)
     atomic_fetch_add(&client_connects, 1);
     return 0;
 }
+
+#include "cluster_users.h"
 
 /* ------------------------------------------------------------------ the histories and their checker */
 
@@ -2464,6 +2487,7 @@ static void nem_pause(void)
     pid_t pid;
     node_snap(i, &pid, NULL, NULL);
     uint32_t id = atomic_load(&nodes[i].id);
+    ju_fault(i);
     pause_node(i, 1);
     int stopped = await_stopped(pid, 1, 2000); /* the kernel says it is stopped */
     int witnessed = 0;
@@ -2633,6 +2657,7 @@ static void nem_partition(void)
     /* the planted no-op needs traffic that a cut stops: the leader's links carry it every heartbeat */
     int shape = !strcmp(mutant, "noop-partition") ? rnd_range(1, 2) : !strcmp(mutant, "nodelay") ? 5 : rnd_range(0, 5);
     uint32_t n_obs0 = atomic_load(&nobs); /* shape 1: the cut leader must be replaced by a leader of the others */
+    ju_fault(-1);
     uint32_t l_id = atomic_load(&nodes[l].id);
     int perm[MAXN];
     for (int i = 0; i < nn; i++)
@@ -2787,6 +2812,8 @@ static int cluster_form(void)
             die(1, "node 0 does not lead the cluster it initialised");
         usleep(100000);
     }
+    if (want_auth)
+        ju_make_superuser(0); /* before the others join, as `tsdb cluster init --superuser` */
     for (int i = 1; i < nn; i++) {
         char padv[META_ADDR_MAX];
         snprintf(padv, sizeof padv, "127.0.0.1:%d", nodes[i].proxy_port);
@@ -2929,6 +2956,7 @@ static int selftest_checker(void)
     printf("selftest-checker: %-62s %s\n", "one leader in each of two terms passes", !fine ? "ok" : "FALSE ALARM");
     if (!two || fine)
         bad++;
+    bad += ju_selftest();
     if (bad) {
         fprintf(stderr, "selftest-checker: %d check(s) did not do what they are for\n", bad);
         return 1;
@@ -2940,7 +2968,7 @@ static int selftest_checker(void)
 static void usage(void)
 {
     fprintf(stderr, "usage: jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--seed N]\n"
-                    "         [--nemesis kill,partition,pause,midcommit,power] [--workload meta,kv-local]\n"
+                    "         [--nemesis kill,partition,pause,midcommit,power] [--workload meta,kv-local|kv|classes|users] [--auth]\n"
                     "         [--crashfs build/libcrashfs.so] [--mutant NAME] | --selftest-replicas | --selftest-checker\n");
     exit(2);
 }
@@ -2955,6 +2983,8 @@ int main(int argc, char **argv)
             self_replicas = 1;
         else if (!strcmp(k, "--selftest-checker"))
             self_checker = 1;
+        else if (!strcmp(k, "--auth"))
+            want_auth = 1;
         else if (a + 1 >= argc)
             usage();
         else if (!strcmp(k, "--dir"))
@@ -2998,6 +3028,8 @@ int main(int argc, char **argv)
                     want_rep = 1;
                 else if (!nem && !strcmp(t, "classes"))
                     want_rep = want_classes = 1;
+                else if (!nem && !strcmp(t, "users"))
+                    want_users = want_auth = 1;
                 else
                     usage();
             }
@@ -3077,6 +3109,8 @@ int main(int argc, char **argv)
             die(1, "node %d exited with status 0x%x before it listened (log %s)", i, st, nodes[i].log);
     }
     cluster_form();
+    if (want_users)
+        ju_await_voters();
     settle("the formation");
     if (want_kv)
         kv_setup();
@@ -3086,9 +3120,11 @@ int main(int argc, char **argv)
     pthread_create(&sampler_th, NULL, sampler, NULL);
     if (want_kv || want_rep)
         kv_start();
-    printf("jepsen-cluster: %d nodes, seed %" PRIu64 ", %d s, nemeses %d, workloads%s%s%s, run in %s%s%s\n", nn, seed,
+    if (want_users)
+        ju_start();
+    printf("jepsen-cluster: %d nodes, seed %" PRIu64 ", %d s, nemeses %d, workloads%s%s%s%s, run in %s%s%s\n", nn, seed,
            seconds, nemeses, want_meta ? " meta" : "", want_kv ? " kv-local" : "",
-           want_classes ? " classes" : want_rep ? " kv" : "", rundir, term_cp >= 0 ? "; terminal crash point " : "",
+           want_classes ? " classes" : want_rep ? " kv" : "", want_users ? " users" : "", rundir, term_cp >= 0 ? "; terminal crash point " : "",
            term_cp >= 0 ? cps[term_cp].name : "");
     fflush(stdout);
 
@@ -3155,6 +3191,11 @@ int main(int argc, char **argv)
             restart_node(i);
     }
     settle("the last heal");
+    if (want_users) { /* the probes go on a while after the admin ops stop: every member is clean and must agree */
+        ju_stop_admin();
+        hold_ms(3000);
+        ju_stop();
+    }
     /* classes_tail: under kill and power the writer changed too often for its switches to come out of CLS_DEFER, so a
      * run that has made none yet goes on without faults (the writers still running) until one is in a CLASSES; the
      * check at the end fails a run of 30 s or more that has none even then */
@@ -3283,6 +3324,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "jepsen-cluster: FAIL: %d term(s) with two leaders\n", split);
         rc = 1;
     }
+    if (want_users && ju_report())
+        rc = 1;
     if (cut_violations) {
         fprintf(stderr, "jepsen-cluster: FAIL: %d cut direction(s) exchanged frames while cut: the partition was not applied\n",
                 cut_violations);

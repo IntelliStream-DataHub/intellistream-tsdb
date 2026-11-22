@@ -1310,7 +1310,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so
 # front of every peer port, nemeses kill, partition, pause, midcommit (crash points, server/crashpt.h) and power
 # (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
 # each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
-$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
+$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/jepsen/cluster_users.h tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
     server/crashpt.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
 	    $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
@@ -1320,11 +1320,13 @@ JEPSEN_NEMESES ?= kill partition pause midcommit power
 JEPSEN_SEED ?= 1
 JEPSEN_NODES ?= 5
 # kv-local runs its nodes with TSDB_CLUSTER_WRITES=1, kv and classes with the replication driver: separate runs
-JEPSEN_CLUSTER_WORKLOADS ?= meta,kv-local meta,kv meta,classes
-jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
+# users: every tsdbd requires a login, an admin thread adds, drops, re-adds users and changes their passwords and grants
+# while one prober per node logs in and reads (tests/jepsen/cluster_users.h; the superuser is made with the CLI: $(B)/tsdb)
+JEPSEN_CLUSTER_WORKLOADS ?= meta,kv-local meta,kv meta,classes meta,users
+jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
 	for io in $(IO); do for wl in $(JEPSEN_CLUSTER_WORKLOADS); do for nem in $(JEPSEN_NEMESES); do \
 	    echo "== tsdbd --io $$io, workloads $$wl, nemesis $$nem"; \
-	    TSDBD=./$(B)/tsdbd TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
+	    TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
 	        --nemesis $$nem --workload $$wl --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
 	        || exit 1; \
 	    done; done; done
@@ -1337,8 +1339,8 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
 # Each check of the histories (validity, durability, atomic visibility, stale and monotonic reads) and the election
 # check are fed a history made here with one thing wrong (--selftest-checker). A nemesis that does nothing (a kill that
 # kills nobody, a pause that stops nobody, a delay that delays nothing, a heal that resumes held links) fails the run.
-jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
-	@d=$(JEPSEN_CLUSTER_DIR)-selftest; j="env TSDBD=./$(B)/tsdbd ./$(B)/jepsen_cluster --dir $$d"; \
+jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
+	@d=$(JEPSEN_CLUSTER_DIR)-selftest; j="env TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb ./$(B)/jepsen_cluster --dir $$d"; \
 	out=$$($$j --mutant foreign-pid --seconds 5 --nemesis kill 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'names pid'; then \
 	        echo "jepsen-cluster-selftest: a port file that names another pid went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
@@ -1387,6 +1389,12 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/libcrashfs.so
 	out=$$($$j --mutant noreset --seconds 60 --nemesis partition 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'must be reset at the heal'; then \
 	        echo "jepsen-cluster-selftest: a heal that resumes held links instead of resetting them went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(TSDB_CLUSTER_MUTANT=dropnotcommitted $$j --seconds 30 --nemesis none --workload users 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: users: '; then \
+	        echo "jepsen-cluster-selftest: a user change answered before it committed (dropnotcommitted) went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(TSDB_AUTH_MUTANT=loginbeforecatchup $$j --seconds 60 --nemesis kill --workload users 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: users: '; then \
+	        echo "jepsen-cluster-selftest: a restarted member that logs in before it caught up (loginbeforecatchup) went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: the comparison of replicas is wrong (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
