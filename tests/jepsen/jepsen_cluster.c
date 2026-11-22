@@ -136,13 +136,15 @@ static uint8_t secret[128];
 static size_t secret_len;
 static int want_meta = 1, want_kv = 1;
 static int want_rep, want_classes; /* workloads kv and classes: one volume of 3 replicas, written through its leader */
+static int want_via;               /* workload kv-via: kv, with the clients on entry nodes (forwarding), RYW, fwdstall */
 static int want_auth, want_users; /* --auth: every tsdbd requires a login (a superuser from the init); workload users */
 static void ju_fault(int i);      /* cluster_users.h: the nemeses tell the users workload which members may lag */
 static void ju_cut_done(const uint8_t in[MAXN][MAXN], int n); /* the members the cuts leave in step stop being exempt */
 static void ju_settled(void);
 static struct meta_settings S;
 
-enum { N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16 };
+enum { N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16, N_FWDSTALL = 32 };
+#define NNEM 6
 static int nemeses = N_KILL | N_PARTITION | N_PAUSE | N_MIDCOMMIT;
 
 static int64_t now_ns(void)
@@ -650,9 +652,14 @@ static int start_node(int i, const char *crash_at, int *status)
     int ne = 0;
     for (char **e = environ; *e && ne < 500; e++)
         if (strncmp(*e, "TSDB_CLUSTER_TEST=", 18) && strncmp(*e, "TSDB_CRASH_AT=", 14) && strncmp(*e, "LD_PRELOAD=", 11) &&
-            strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20))
+            strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20) &&
+            strncmp(*e, "TSDBD_TEST_FWD_STALL=", 21))
             envp[ne++] = *e;
-    char e1[256], e2[PATH_MAX + 64], e3[PATH_MAX + 64], e4[64];
+    char e1[256], e2[PATH_MAX + 64], e3[PATH_MAX + 64], e4[64], e5[PATH_MAX + 64];
+    if (want_via) { /* kv-via: the entry node stalls its forwards while this file exists (nem_fwdstall) */
+        snprintf(e5, sizeof e5, "TSDBD_TEST_FWD_STALL=%s/fwd-stall", n->dir);
+        envp[ne++] = e5;
+    }
     if (!want_rep) /* the leader of a 1-replica cluster volume takes writes without the driver (kv-local) */
         envp[ne++] = "TSDB_CLUSTER_WRITES=1";
     if (crash_at) {
@@ -1227,6 +1234,7 @@ struct rd {
     int8_t node; /* the node that answered (kv_roam: a stale read names it) */
     uint32_t seen[KEYS]; /* the id of the write whose value a key shows, 0: nothing */
     uint8_t stray;
+    uint32_t own; /* kv-via, session 1: the id of the client's own write, acknowledged on this connection just before */
 };
 #define MAXSESS 4
 struct hist {
@@ -1357,6 +1365,39 @@ static _Atomic uint64_t kv_ok, kv_fail, kv_indet;
 static pthread_t kv_threads[2 * MAXN + 1];
 static int nkv_threads;
 
+/* kv-via: every client sits on a random member, so most operations are forwarded to kvr's leader by the member they
+ * reached (the entry node: s2f's FORWARD). via_entry[h][0] is the node the writer of history h is connected to for
+ * its next request, [1] the reader's, -1 while it has none: the nemeses aim at those nodes (via_pick, nem_fwdstall).
+ * via_fwd counts the operations that were answered through an entry node while kvr's leader did not change under
+ * them: a run that forwarded nothing proves nothing about forwarding, so it fails. */
+static _Atomic int via_entry[MAXN][2];
+static _Atomic uint64_t via_fwd, via_fwd_reads, via_ryw_reads;
+static _Atomic uint64_t via_picks, via_aimed; /* pick_node's picks, and those aimed at an entry node (review F8) */
+static _Atomic int via_steer = -1; /* a node the writers go to now (nem_fwdstall), -1: any, as kv_roam says */
+static void via_set(int hi, int role, int node)
+{
+    if (want_via)
+        atomic_store(&via_entry[hi][role], node);
+}
+static void via_note(int node, int leader_before, _Atomic uint64_t *ctr)
+{
+    if (want_via && node != leader_before && leader_before >= 0 && leader_before == atomic_load(&kv_leader))
+        atomic_fetch_add(ctr, 1);
+}
+/* a node some client is connected to (a writer only, with `writers`) that does not lead kvr, -1 when there is none */
+static int via_pick(int writers)
+{
+    int cand[2 * MAXN], n = 0, l = atomic_load(&kv_leader);
+    for (int hi = 0; hi < nhists; hi++)
+        for (int role = 0; role < (writers ? 1 : 2); role++) {
+            int x = atomic_load(&via_entry[hi][role]);
+            if (x >= 0 && x != l)
+                cand[n++] = x;
+        }
+    return n ? cand[rnd() % (uint64_t)n] : -1;
+}
+
+static int kv_read_all(tsdbc *c, tsdb_sid sid, struct rd *rd);
 static void *kv_writer(void *arg)
 {
     int hi = (int)(intptr_t)arg, node = hist_node[hi], next = -1;
@@ -1366,8 +1407,15 @@ static void *kv_writer(void *arg)
     tsdb_sid sid = 0;
     uint64_t r = mix(seed * 31 + (uint64_t)hi);
     while (atomic_load(&kv_run)) {
+        if (c && want_via && atomic_load(&via_steer) >= 0 && atomic_load(&via_steer) != node) { /* steered elsewhere */
+            tsdbc_close(c);
+            c = NULL;
+        }
         if (!c) {
+            via_set(hi, 0, -1);
             node = kv_pick(hi, &next, &r);
+            if (want_via && atomic_load(&via_steer) >= 0)
+                node = atomic_load(&via_steer);
             if (connect_node(node, 0, &c) != 0 || kv_resolve(c, hi, &sid) != 0) {
                 if (c)
                     tsdbc_close(c);
@@ -1376,6 +1424,7 @@ static void *kv_writer(void *arg)
                 continue;
             }
         }
+        via_set(hi, 0, node);
         if (h->nw >= MAX_WRITE_ID)
             break;
         int nk = 1 + (int)(mix(r += 1) % 3), keys[3];
@@ -1400,10 +1449,28 @@ static void *kv_writer(void *arg)
             ts[k] = key_ts(keys[k]);
             val[k] = (float)id;
         }
+        int lead0 = atomic_load(&kv_leader);
         int rc = tsdbc_insert_series(c, sid, ts, val, (size_t)nk);
         if (rc == 0) {
             hist_end(h, id, WS_OK);
             atomic_fetch_add(&kv_ok, 1);
+            via_note(node, lead0, &via_fwd);
+            /* kv-via, read-your-writes: now and then the client reads the series back on the connection that was
+             * acknowledged, as the one that wrote (session 1: the reader thread owns session 0). Whatever member
+             * answers, it must show this write or a newer one at every key the write set. */
+            if (want_via && mix(r += 1) % 2 == 0) {
+                struct rd tmp;
+                memset(&tmp, 0, sizeof tmp);
+                tmp.node = (int8_t)node;
+                tmp.own = id;
+                if (kv_read_all(c, sid, &tmp) == 0) {
+                    *hist_read_slot(h, 1) = tmp;
+                    atomic_fetch_add(&via_ryw_reads, 1);
+                } else {
+                    tsdbc_close(c);
+                    c = NULL;
+                }
+            }
         } else if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_MOVED || rc == TSDB_ERR_INVALID ||
                    rc == TSDB_ERR_DROPPED || rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_DENIED) {
             hist_end(h, id, WS_FAIL); /* refused: definitely not applied */
@@ -1461,6 +1528,7 @@ static void *kv_reader(void *arg)
     tsdb_sid sid = 0;
     while (atomic_load(&kv_run)) {
         if (!c) {
+            via_set(hi, 1, -1);
             node = kv_pick(hi, &next, &r);
             if (connect_node(node, 0, &c) != 0 || kv_resolve(c, hi, &sid) != 0) {
                 if (c)
@@ -1473,9 +1541,12 @@ static void *kv_reader(void *arg)
         struct rd tmp;
         memset(&tmp, 0, sizeof tmp);
         tmp.node = (int8_t)node;
-        if (kv_read_all(c, sid, &tmp) == 0)
+        via_set(hi, 1, node);
+        int lead0 = atomic_load(&kv_leader);
+        if (kv_read_all(c, sid, &tmp) == 0) {
             *hist_read_slot(h, 0) = tmp;
-        else {
+            via_note(node, lead0, &via_fwd_reads);
+        } else {
             if (!kv_follow(c, hi, node, &next, &logged, "the reader")) /* MOVED: not applied, not a failure */
                 h->reads_failed++;
             tsdbc_close(c);
@@ -1748,6 +1819,9 @@ static void *fill_writer(void *arg)
 static void *fill_writer(void *arg);
 static void kv_start(void)
 {
+    for (int i = 0; i < MAXN; i++)
+        for (int role = 0; role < 2; role++)
+            atomic_store(&via_entry[i][role], -1);
     atomic_store(&kv_run, 1);
     for (int i = 0; i < nhists; i++) {
         pthread_create(&kv_threads[nkv_threads++], NULL, kv_writer, (void *)(intptr_t)i);
@@ -1797,8 +1871,9 @@ static int cmp_i64pair(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
-enum { V_DURABLE, V_VALID, V_ATOMIC, V_STALE, V_MONO, V_KINDS };
-static const char *const viol_name[V_KINDS] = {"durability", "validity", "atomic visibility", "stale read", "monotonic reads"};
+enum { V_DURABLE, V_VALID, V_ATOMIC, V_STALE, V_MONO, V_RYW, V_OLD, V_KINDS };
+static const char *const viol_name[V_KINDS] = {"durability", "validity", "atomic visibility", "stale read", "monotonic reads",
+                                               "read-your-writes", "old frame"};
 static int viol_by[V_KINDS];
 
 #define VIOL(kind, ...)                                                                                                   \
@@ -1841,6 +1916,23 @@ static void trace_read(const struct hist *h, const char *what, const struct rd *
                 (long long)(rd->end / 1000000));
     (void)h;
 }
+
+/* kv-via, fwdstall (nem_fwdstall): the windows in which an entry node held every frame before its send, so that every
+ * write that began in the first part of one was older than fwd_max_age (1 s) when the stall ended. The entry node must
+ * then answer it UNAVAILABLE (the frame is too old to send: its client may have resent it), definitely not applied;
+ * an acknowledged write there was sent late (the fwdoldframe mutant). */
+struct stall_win {
+    int node;
+    int64_t ts, te; /* ns: the stall file existed from ts to te */
+};
+#define MAXSTALLS 256
+/* A request in flight when the file appeared (its frame not yet at the entry node's stall) began a little before ts and is
+ * held all the same, and then the writer begins nothing else until te. Such a request took a second and more, which
+ * only a held one does: so the window starts STALL_LEAD_NS early, and a write must have lasted 1.3 s. */
+#define STALL_LEAD_NS 100000000LL
+#define STALL_OLD_MS 1500 /* a write begun this long before te was held past fwd_max_age (1 s), with 500 ms to spare */
+static struct stall_win stalls[MAXSTALLS];
+static int nstalls;
 
 /* Checks 1-5 of the header over one history. Returns the number of violations. `r[0]` is the one session of kv-local. */
 static int check_hist(struct hist *h, uint64_t *seen_indet_applied)
@@ -1947,6 +2039,19 @@ static int check_hist(struct hist *h, uint64_t *seen_indet_applied)
         struct rd *prev = NULL;
         for (uint32_t j = 0; j < h->nr[s]; j++) {
             struct rd *rd = &h->r[s][j];
+            /* 6 (kv-via): a client's read on the connection of its acknowledged write shows that write or a newer one.
+             * Deliberately stricter than 4 about an earlier write of the same key whose outcome was unknown: check 4
+             * lets it land at any time, but the entry node and the owner refuse a frame older than fwd_max_age, so an
+             * old frame applied after the client's later acknowledged write and then read back is the anomaly (review
+             * F5: a proxy that delays a frame without bound would show it as well; none of the nemeses does) */
+            if (rd->own && rd->own <= nw)
+                for (int q = 0; q < w[rd->own - 1].nk; q++) {
+                    int k = w[rd->own - 1].keys[q];
+                    if (rd->seen[k] < rd->own)
+                        VIOL(V_RYW, "read-your-writes: key %d shows %s after the client's own acknowledged write %u (read %u, "
+                                    "answered by node %d)", k, rd->seen[k] ? "an older write" : "nothing", rd->own, j,
+                             rd->node);
+                }
             for (int k = 0; k < KEYS; k++) {
                 uint32_t v = rd->seen[k];
                 /* 4: the writes of the key acknowledged before this read began */
@@ -2001,6 +2106,20 @@ static int check_hist(struct hist *h, uint64_t *seen_indet_applied)
             prev = rd;
         }
     }
+    /* 7 (kv-via, fwdstall): no write held at its entry node past fwd_max_age was applied. Known imprecision (review F6):
+     * a write sent just before the file appeared (inside STALL_LEAD_NS) that waited 1.3 s or more on a slow commit
+     * and was acknowledged near te matches without being an old frame; nothing else but the nemesis slows a write that
+     * much in a quiet run, and the lead is what lets a writer stuck in flight when the file appeared be seen at all */
+    for (int q = 0; q < nstalls; q++)
+        for (uint32_t id = 1; id <= nw; id++) {
+            struct wr *x = &w[id - 1];
+            if (x->node == stalls[q].node && x->st == WS_OK && x->begin >= stalls[q].ts - STALL_LEAD_NS &&
+                x->begin <= stalls[q].te - (int64_t)STALL_OLD_MS * 1000000 && x->end >= stalls[q].te - 200000000 &&
+                x->end - x->begin >= 1300000000LL)
+                VIOL(V_OLD, "old frame: write %u, sent to node %d at %lld ms, was held there until %lld ms (fwd_max_age is "
+                            "1000 ms) and acknowledged at %lld ms: a frame past its age was applied", id, x->node,
+                     (long long)(x->begin / 1000000), (long long)(stalls[q].te / 1000000), (long long)(x->end / 1000000));
+        }
     for (int k = 0; k < KEYS; k++)
         free(ack[k]);
     free(seen);
@@ -2382,6 +2501,7 @@ static struct {
            {"depose-before-reopen", 1, 30000, 2}};
 #define NCPS ((int)(sizeof cps / sizeof cps[0]))
 
+static unsigned fwd_stalls_held;
 static unsigned faults[8], restarts, cp_hits, cp_hits_serving, cp_unfired, power_hits, power_idle;
 /* every nemesis round must show the effect it is for (a kill that reaped a SIGKILLed child, a pause that left the child
  * stopped, ...): a round that did nothing is a failed run, whatever the checks of the workloads say. */
@@ -2401,6 +2521,15 @@ static void hold_ms(int ms)
 static int pick_node(int bias_leader)
 {
     int k = atomic_load(&kv_leader), l = atomic_load(&last_leader);
+    if (want_via)
+        atomic_fetch_add(&via_picks, 1);
+    if (want_via && rnd() % 3 == 0) { /* kv-via: a third of the picks go to a node a client is connected to (an entry node) */
+        int x = via_pick(0);
+        if (x >= 0) {
+            atomic_fetch_add(&via_aimed, 1);
+            return x;
+        }
+    }
     if (want_rep && k >= 0 && k < nn && rnd() % 2)
         return k;
     if (bias_leader && l >= 0 && l < nn && rnd() % 2)
@@ -2504,6 +2633,82 @@ static void nem_pause(void)
     pauses_done++;
     pauses_seen += witnessed;
     effect_seen = stopped;
+}
+
+/* fwdstall (kv-via): the entry node of some client holds every forward before its send (the test hook
+ * TSDBD_TEST_FWD_STALL: while the file exists the node stalls there) for longer than fwd_max_age (1 s). A request that
+ * reached it meanwhile is too old when the stall ends and must be answered UNAVAILABLE, definitely not applied, and
+ * never sent late (check 7 of check_hist). The round is a failure when no write was held a second at the node. */
+#define STALL_HOLD_MS 2000
+static unsigned fwdstall_once(void)
+{
+    int i = rnd_range(0, nn - 1), l = atomic_load(&kv_leader);
+    if (i == l)
+        i = (i + 1) % nn;
+    /* the writers are sent to node i (they reconnect at their next request), and the stall starts once one of them is there */
+    atomic_store(&via_steer, i);
+    int there = 0;
+    for (int64_t t0 = now_ms(); !there && now_ms() - t0 < 10000; hold_ms(100))
+        there = atomic_load(&via_entry[0][0]) == i || atomic_load(&via_entry[1][0]) == i;
+    if (!there)
+        die(1, "the fwdstall nemesis: no writer was connected to node %d in 10 s", i);
+    ev("fwdstall: node %d picked; writers at %d and %d, readers at %d and %d, kvr's leader %d", i, atomic_load(&via_entry[0][0]),
+       atomic_load(&via_entry[1][0]), atomic_load(&via_entry[0][1]), atomic_load(&via_entry[1][1]), atomic_load(&kv_leader));
+    char f[PATH_MAX + 16];
+    snprintf(f, sizeof f, "%s/fwd-stall", nodes[i].dir);
+    int fd = open(f, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0)
+        die(2, "create %s: %s", f, strerror(errno));
+    close(fd);
+    int lead0 = atomic_load(&kv_leader), moved = lead0 == i;
+    int64_t ts = now_ns();
+    for (int t = 0; t < STALL_HOLD_MS; t += 100) {
+        hold_ms(100);
+        moved |= atomic_load(&kv_leader) != lead0;
+    }
+    int64_t te = now_ns();
+    ev("fwdstall: at the end writers at %d and %d", atomic_load(&via_entry[0][0]), atomic_load(&via_entry[1][0]));
+    unlink(f);
+    atomic_store(&via_steer, -1);
+    hold_ms(300); /* the held requests are answered once the entry node's stall loop sees the file gone */
+    moved |= atomic_load(&kv_leader) != lead0;
+    unsigned held = 0, inwin = 0, bysort[3] = {0, 0, 0};
+    int64_t longest = 0;
+    for (int hi = 0; hi < nhists; hi++) {
+        struct hist *h = &hists[hi];
+        pthread_mutex_lock(&h->mu);
+        for (uint32_t id = 1; id <= h->nw; id++) {
+            const struct wr *x = &h->w[id - 1];
+            if (x->node == i && x->begin >= ts - STALL_LEAD_NS && x->begin <= te) {
+                inwin++;
+                bysort[x->st]++;
+                if (x->end != INT64_MAX && x->end - x->begin > longest)
+                    longest = x->end - x->begin;
+            }
+            held += x->node == i && x->begin >= ts - STALL_LEAD_NS && x->begin <= te - 1000000000LL && x->st != WS_INDET &&
+                    x->end - x->begin >= 1000000000LL;
+        }
+        pthread_mutex_unlock(&h->mu);
+    }
+    ev("node %d: %u writes began in the window (indeterminate %u, acknowledged %u, refused %u), the longest %lld ms", i,
+       inwin, bysort[0], bysort[1], bysort[2], (long long)(longest / 1000000));
+    ev("node %d: forwards held %d ms (%u writes held a second or more%s)", i, STALL_HOLD_MS, held,
+       moved ? "; kvr's leader changed meanwhile, the window is not checked" : "");
+    if (!moved && nstalls < MAXSTALLS)
+        stalls[nstalls++] = (struct stall_win){.node = i, .ts = ts, .te = te};
+    fwd_stalls_held += held;
+    return held;
+}
+
+/* A round that holds no write at its node (the writers were between two connections, or a leader change took the
+ * window) is tried again, up to 3 times; the miss is counted and printed. A stall that never holds anything fails. */
+static unsigned fwd_stall_misses;
+static void nem_fwdstall(void)
+{
+    for (int attempt = 0; attempt < 3 && !effect_seen; attempt++) {
+        effect_seen = fwdstall_once() > 0;
+        fwd_stall_misses += !effect_seen;
+    }
 }
 
 static void nem_midcommit(void)
@@ -2910,6 +3115,11 @@ static int selftest_checker(void)
         {"an acknowledged write is not seen after its ack", V_STALE},
         {"an older write is seen after a newer one was acknowledged", V_STALE},
         {"a session reads back in time", V_MONO},
+        {"a client's read after its own acknowledged write shows an older one", V_RYW},
+        {"a client reads its own acknowledged write back", -1},
+        {"a write held past the forward age at its entry node is acknowledged", V_OLD},
+        {"a write that began late in a stall window is acknowledged", -1},
+        {"a write held past the forward age is refused, as it must be", -1},
     };
     for (unsigned t = 0; t < sizeof pl / sizeof *pl; t++) {
         struct hist *h = st_hist();
@@ -2930,6 +3140,33 @@ static int selftest_checker(void)
             h->r[0][1].seen[0] = 1;
             h->have_final = 0;
             break;
+        case 11: /* write 2 (key 0) was acknowledged on the connection; the read right after shows write 1 */
+            h->nr[1] = 1;
+            h->r[1][0] = (struct rd){.begin = 41, .end = 42, .own = 2};
+            h->r[1][0].seen[0] = 1;
+            h->r[1][0].seen[1] = 1;
+            h->w[1].end = 40;
+            h->nr[0] = 0; /* only the session of the client is judged: the read is stale for check 4 as well, by design */
+            break;
+        case 12:
+            h->nr[1] = 1;
+            h->r[1][0] = (struct rd){.begin = 50, .end = 51, .own = 2};
+            h->r[1][0].seen[0] = 2;
+            h->r[1][0].seen[1] = 1;
+            break;
+        case 13: case 14: case 15:
+            /* a stall window of node 0 from 1000 to 3000 ms (ns): write 2 began at 1100 ms */
+            stalls[0] = (struct stall_win){.node = 0, .ts = 1000000000LL, .te = 3000000000LL};
+            nstalls = 1;
+            h->w[1].begin = t == 14 ? 2400000000LL : 1100000000LL;
+            h->w[1].end = 3010000000LL;
+            h->w[1].st = t == 15 ? WS_FAIL : WS_OK;
+            if (t == 15)
+                h->final[0] = 1; /* a refused write is never the final value */
+            h->w[0].begin = 10;
+            h->have_final = 0; /* the reads are of the unplanted history: only check 7 is under test */
+            h->nr[0] = 0;
+            break;
         }
         uint64_t ia = 0;
         int n = check_hist(h, &ia);
@@ -2940,6 +3177,7 @@ static int selftest_checker(void)
         printf("selftest-checker: %-62s %s\n", pl[t].what, ok ? "ok" : "NOT FOUND");
         if (!ok)
             bad++;
+        nstalls = 0;
         st_free(h);
     }
     /* election safety: two leaders in one term; one in each of two terms passes */
@@ -2970,7 +3208,7 @@ static int selftest_checker(void)
 static void usage(void)
 {
     fprintf(stderr, "usage: jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--seed N]\n"
-                    "         [--nemesis kill,partition,pause,midcommit,power] [--workload meta,kv-local|kv|classes|users] [--auth]\n"
+                    "         [--nemesis kill,partition,pause,midcommit,power,fwdstall] [--workload meta,kv-local|kv|kv-via|classes|users] [--auth]\n"
                     "         [--crashfs build/libcrashfs.so] [--mutant NAME] | --selftest-replicas | --selftest-checker\n");
     exit(2);
 }
@@ -3020,6 +3258,8 @@ int main(int argc, char **argv)
                     nemeses |= N_MIDCOMMIT;
                 else if (nem && !strcmp(t, "power"))
                     nemeses |= N_POWER;
+                else if (nem && !strcmp(t, "fwdstall"))
+                    nemeses |= N_FWDSTALL;
                 else if (nem && !strcmp(t, "none"))
                     nemeses |= 0;
                 else if (!nem && !strcmp(t, "meta"))
@@ -3028,6 +3268,8 @@ int main(int argc, char **argv)
                     want_kv = 1;
                 else if (!nem && !strcmp(t, "kv"))
                     want_rep = 1;
+                else if (!nem && !strcmp(t, "kv-via"))
+                    want_rep = want_via = 1;
                 else if (!nem && !strcmp(t, "classes"))
                     want_rep = want_classes = 1;
                 else if (!nem && !strcmp(t, "users"))
@@ -3054,6 +3296,10 @@ int main(int argc, char **argv)
     if (want_kv && want_rep) {
         fprintf(stderr, "jepsen-cluster: kv-local (TSDB_CLUSTER_WRITES, no driver) and kv or classes (the driver) "
                         "cannot share a run\n");
+        return 2;
+    }
+    if ((nemeses & N_FWDSTALL) && !want_via) {
+        fprintf(stderr, "jepsen-cluster: the fwdstall nemesis needs the workload kv-via\n");
         return 2;
     }
     use_crashfs = (nemeses & N_POWER) != 0;
@@ -3126,12 +3372,12 @@ int main(int argc, char **argv)
         ju_start();
     printf("jepsen-cluster: %d nodes, seed %" PRIu64 ", %d s, nemeses %d, workloads%s%s%s%s, run in %s%s%s\n", nn, seed,
            seconds, nemeses, want_meta ? " meta" : "", want_kv ? " kv-local" : "",
-           want_classes ? " classes" : want_rep ? " kv" : "", want_users ? " users" : "", rundir, term_cp >= 0 ? "; terminal crash point " : "",
+           want_classes ? " classes" : want_via ? " kv-via" : want_rep ? " kv" : "", want_users ? " users" : "", rundir, term_cp >= 0 ? "; terminal crash point " : "",
            term_cp >= 0 ? cps[term_cp].name : "");
     fflush(stdout);
 
-    int kinds[5], nk = 0;
-    for (int b = 0; b < 5; b++)
+    int kinds[NNEM], nk = 0;
+    for (int b = 0; b < NNEM; b++)
         if (nemeses & (1 << b))
             kinds[nk++] = 1 << b;
     int64_t t_start = now_ms(), t_end = t_start + (int64_t)seconds * 1000;
@@ -3168,13 +3414,14 @@ int main(int argc, char **argv)
         case N_PAUSE: faults[2]++; nem_pause(); break;
         case N_MIDCOMMIT: faults[3]++; nem_midcommit(); break;
         case N_POWER: faults[4]++; nem_power(); break;
+        case N_FWDSTALL: faults[5]++; nem_fwdstall(); break;
         }
         if (!effect_seen)
             die(1, "the %s nemesis (round %u) had no effect: nothing was killed, stopped, cut, delayed or crashed",
                 kind == N_KILL ? "kill" : kind == N_PARTITION ? "partition" : kind == N_PAUSE ? "pause" :
-                kind == N_MIDCOMMIT ? "midcommit" : "power", rounds);
+                kind == N_MIDCOMMIT ? "midcommit" : kind == N_FWDSTALL ? "fwdstall" : "power", rounds);
         settle(kind == N_KILL ? "a kill" : kind == N_PARTITION ? "a partition" : kind == N_PAUSE ? "a pause" :
-               kind == N_MIDCOMMIT ? "a crash point" : "a power loss");
+               kind == N_MIDCOMMIT ? "a crash point" : kind == N_FWDSTALL ? "a forward stall" : "a power loss");
         hold_ms(rnd_range(300, 1200));
     }
     if (term_cp >= 0 && !term_done) {
@@ -3285,11 +3532,12 @@ int main(int argc, char **argv)
     }
     atomic_store(&stopping, 1);
 
-    unsigned total_faults = faults[0] + faults[1] + faults[2] + faults[3] + faults[4];
+    unsigned total_faults = faults[0] + faults[1] + faults[2] + faults[3] + faults[4] + faults[5];
     printf("faults applied: kill %u, partition %u (cuts applied %d%s), pause %u, midcommit %u (crash points hit %u, %u of them while serving, "
-           "never fired %u), power %u (losses %u, idle %u); restarts %u, rounds %u\n",
+           "never fired %u), power %u (losses %u, idle %u), fwdstall %u (%u writes held, %u misses); restarts %u, rounds %u\n",
            faults[0], faults[1], partitions_applied, partitions_planted_noop ? ", PLANTED NO-OP" : "", faults[2],
-           faults[3], cp_hits, cp_hits_serving, cp_unfired, faults[4], power_hits, power_idle, restarts, rounds);
+           faults[3], cp_hits, cp_hits_serving, cp_unfired, faults[4], power_hits, power_idle, faults[5], fwd_stalls_held, fwd_stall_misses, restarts,
+           rounds);
     if (use_crashfs)
         printf("crashfs: %" PRIu64 " node starts, %" PRIu64 " of them with CRASHFS_TEAR, the rest CRASHFS_KEEP_OLD\n",
                (uint64_t)atomic_load(&crashfs_starts), (uint64_t)atomic_load(&crashfs_tears));
@@ -3304,7 +3552,7 @@ int main(int argc, char **argv)
         char cl[PATH_MAX + 48];
         snprintf(cl, sizeof cl, "%s/CLASSES", rep_dir[0]);
         printf("%s: filler inserts %" PRIu64 " acknowledged, %" PRIu64 " not; CLASSES %lld bytes on node %d; terminal "
-               "crash point %s%s\n", want_classes ? "classes" : "kv", (uint64_t)atomic_load(&fill_ok),
+               "crash point %s%s\n", want_classes ? "classes" : want_via ? "kv-via" : "kv", (uint64_t)atomic_load(&fill_ok),
                (uint64_t)atomic_load(&fill_err), stat(cl, &cs) == 0 ? (long long)cs.st_size : -1LL, rep_nodes[0],
                term_cp >= 0 ? cps[term_cp].name : "none", term_cp < 0 ? "" : term_fired ? " (fired)" : " (did not fire)");
     }
@@ -3312,12 +3560,18 @@ int main(int argc, char **argv)
         printf("%s: %" PRIu64 " writes acknowledged, %" PRIu64 " refused, %" PRIu64 " indeterminate (%" PRIu64
                " of them applied), %" PRIu64 " reads, %" PRIu64 " MOVED followed; %u connections, %u refused for a port "
                "the node does not hold\n",
-               want_kv ? "kv-local" : "kv", (uint64_t)atomic_load(&kv_ok), (uint64_t)atomic_load(&kv_fail), (uint64_t)atomic_load(&kv_indet),
+               want_kv ? "kv-local" : want_via ? "kv-via" : "kv", (uint64_t)atomic_load(&kv_ok), (uint64_t)atomic_load(&kv_fail), (uint64_t)atomic_load(&kv_indet),
                indet_applied, nreads, (uint64_t)atomic_load(&kv_moved), (unsigned)atomic_load(&client_connects), (unsigned)atomic_load(&refused_foreign));
     (void)nwrites;
+    if (want_via)
+        printf("kv-via: %" PRIu64 " writes and %" PRIu64 " reads answered through a member that did not lead kvr, %" PRIu64
+               " read-your-writes reads, %d stall window(s) checked, %" PRIu64 " of %" PRIu64 " nemesis picks aimed at an entry "
+               "node\n", (uint64_t)atomic_load(&via_fwd),
+               (uint64_t)atomic_load(&via_fwd_reads), (uint64_t)atomic_load(&via_ryw_reads), nstalls,
+               (uint64_t)atomic_load(&via_aimed), (uint64_t)atomic_load(&via_picks));
     int rc = 0;
     if (viol) {
-        fprintf(stderr, "jepsen-cluster: FAIL: %d violation(s) of checks 1-5:", viol);
+        fprintf(stderr, "jepsen-cluster: FAIL: %d violation(s):", viol);
         for (int k = 0; k < V_KINDS; k++)
             fprintf(stderr, " %s %d%s", viol_name[k], viol_by[k], k + 1 < V_KINDS ? "," : "\n");
         rc = 1;
@@ -3342,6 +3596,19 @@ int main(int argc, char **argv)
     if ((want_kv || want_rep) && (!atomic_load(&kv_ok) || !nreads)) { /* nothing to check is no evidence */
         fprintf(stderr, "jepsen-cluster: FAIL: the workload did nothing: %" PRIu64 " writes acknowledged, %" PRIu64
                 " reads\n", (uint64_t)atomic_load(&kv_ok), nreads);
+        rc = 1;
+    }
+    if (want_via && (!atomic_load(&via_fwd) || !atomic_load(&via_fwd_reads) || !atomic_load(&via_ryw_reads))) {
+        fprintf(stderr, "jepsen-cluster: FAIL: kv-via checked no forwarding: %" PRIu64 " writes and %" PRIu64
+                " reads through a member that does not lead kvr, %" PRIu64 " read-your-writes reads\n",
+                (uint64_t)atomic_load(&via_fwd), (uint64_t)atomic_load(&via_fwd_reads), (uint64_t)atomic_load(&via_ryw_reads));
+        rc = 1;
+    }
+    /* the picks a third of which should go to an entry node (via_pick): with this many, none aimed means the aim is
+     * gone ((2/3)^30 by chance, and via_pick answers -1 only while no client has a non-leader member) */
+    if (want_via && atomic_load(&via_picks) >= 30 && !atomic_load(&via_aimed)) {
+        fprintf(stderr, "jepsen-cluster: FAIL: kv-via: none of %" PRIu64 " nemesis picks was aimed at an entry node\n",
+                (uint64_t)atomic_load(&via_picks));
         rc = 1;
     }
     /* a classes run whose series never switched checked no CLASS marker; a terminal crash point that fired inside a
