@@ -64,12 +64,20 @@ static void report_up(struct chunksrv *cs)
 
 static void set_peers(struct chunksrv *cs, const struct cluster_copy *c, uint32_t self)
 {
+    uint32_t *keep = calloc(c->nmembers ? c->nmembers : 1, sizeof *keep);
+    size_t nk = 0;
     for (uint32_t i = 0; i < c->nmembers; i++) {
         const struct cluster_copy_member *m = &c->members[i];
-        if (m->id == self || m->state == META_OUT || !m->peer[0])
+        if (m->id == self || m->state == META_OUT)
             continue;
-        chunksrv_set_peer(cs, m->id, m->peer); /* a failure is tried again at the next build */
+        if (keep)
+            keep[nk++] = m->id;
+        if (m->peer[0])
+            chunksrv_set_peer(cs, m->id, m->peer); /* a failure is tried again at the next build */
     }
+    if (keep) /* members that left (or are gone from the copy): their links stop redialing */
+        chunksrv_keep_peers(cs, keep, nk);
+    free(keep);
 }
 
 /* The node became known after the start: a store of another owner is closed, the member serves none. */

@@ -164,6 +164,9 @@ struct peerlink *chunksrv_peerlink(struct chunksrv *cs);
 void chunksrv_unlisten(struct chunksrv *cs);
 /* Where member `id` is (its peer address); a changed address is redialed. */
 int chunksrv_set_peer(struct chunksrv *cs, uint32_t id, const char *addr);
+/* Every peer not in ids (members that left) is retired: its links end and dial no more (plink_stop), calls to it are
+ * TSDB_ERR_UNAVAILABLE, and chunksrv_set_peer does not bring it back. */
+void chunksrv_keep_peers(struct chunksrv *cs, const uint32_t *ids, size_t n);
 void chunksrv_set_rate(struct chunksrv *cs, uint64_t bytes_per_s);
 
 /* The client half. A request to member `peer`: 0 with *rc and the answer's body (malloc'ed, *body may be NULL when
@@ -210,6 +213,7 @@ enum {
     CS_MUT_STOREFOREIGN = 5, /* storeforeign: a store's cluster and node are not checked */
 };
 extern int chunksrv_mutant;
+extern int chunksrv_test_put_delay_ms; /* tests: the first cell of every put waits this long (a slow disk) */
 int chunksrv_mutant_parse(const char *name); /* CS_MUT_* or -1 */
 
 #endif

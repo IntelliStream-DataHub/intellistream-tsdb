@@ -302,6 +302,15 @@ static void test_wire(void)
     CHECK(chunksrv_st(0) == CHUNK_ST_OK && chunksrv_st(TSDB_ERR_NOTFOUND) == CHUNK_ST_ABSENT &&
           chunksrv_st(TSDB_ERR_CORRUPT) == CHUNK_ST_DAMAGED && chunksrv_st(TSDB_ERR_IO) == CHUNK_ST_IOERR &&
           chunksrv_st(TSDB_ERR_UNAVAILABLE) == CHUNK_ST_DOWN);
+    /* a SUMS answer is taken only when its count and its length agree: a reader by count must not overread */
+    uint8_t rb[13 + 36 + 16];
+    memset(rb, 0, sizeof rb);
+    rb[8] = CS_OP_SUMS;
+    struct cs_resp rsp;
+    for (uint32_t cnt = 0; cnt <= 3; cnt++) {
+        rb[13 + 32] = (uint8_t)cnt;
+        CHECK(cs_resp_decode(rb, sizeof rb, &rsp) == (cnt == 2 ? 0 : -1));
+    }
 }
 
 /* ---------------------------------------------------------------- put, read, list */
@@ -563,6 +572,190 @@ static void test_unsure(void)
     free(cp.body);
     cdata_free(&c);
     cdata_free(&d);
+    chunksrv_close(cs);
+}
+
+
+/* ---------------------------------------------------------------- review regressions */
+/* LIST with one (oid, pos) in two stores: every page size sees every copy once, with its header (F1, F8) */
+static void test_list_copies(void)
+{
+    char dir[PATH_MAX], s0[PATH_MAX + 16], s1[PATH_MAX + 16], err[256];
+    fresh("listcp", dir, sizeof dir);
+    mkstore(dir, 0, 7, true, s0, sizeof s0);
+    mkstore(dir, 1, 7, true, s1, sizeof s1);
+    const char *pp[2] = {s0, s1};
+    struct chunksrv *cs = chunksrv_open(pp, 2, err, sizeof err);
+    CHECK(cs != NULL);
+    if (!cs)
+        return;
+    enum { NC = 4 };
+    cdata c[NC];
+    int where[NC][2] = {{1, 1}, {1, 0}, {0, 1}, {1, 1}}; /* chunk i in store 0, in store 1 */
+    int total = 0;
+    for (int i = 0; i < NC; i++) {
+        cdata_make(&c[i], 3, (unsigned)i % 5, 4096, 30000, 50 + (uint64_t)i);
+        chunk_ident id = {.volume = c[i].m.volume, .pos = c[i].m.pos};
+        memcpy(id.vuuid, c[i].m.vuuid, 16);
+        memcpy(id.oid, c[i].m.oid, 16);
+        for (int st = 0; st < 2; st++)
+            if (where[i][st]) {
+                CHECK(chunk_be_put(chunksrv_backend(cs), st, &id, &c[i].m.g, 3, c[i].cells, c[i].sums) == 0);
+                total++;
+            }
+    }
+    for (uint32_t pg = 1; pg <= 7; pg++) {
+        struct cs_req r = {.rid = 1, .op = CS_OP_LIST, .volume = c[0].m.volume, .epoch = 3, .len = pg};
+        cap cp = {0};
+        int seen[NC][2] = {{0}};
+        int got = 0, pages = 0;
+        for (; pages < 40; pages++) {
+            CHECK(fake_req(cs, &r, &cp) == 0 && cp.body_len >= 5);
+            if (cp.rc != 0 || cp.body_len < 5)
+                break;
+            uint32_t k = (uint32_t)(cp.body[0] | cp.body[1] << 8);
+            CHECK(k <= pg || k <= 2); /* above the page only for the two copies of one key */
+            for (uint32_t j = 0; j < k; j++) {
+                const uint8_t *e = cp.body + 5 + CS_LIST_ENTRY * j;
+                for (int i = 0; i < NC; i++)
+                    if (!memcmp(e, c[i].m.oid, 16) && (e[16] | e[17] << 8) == c[i].m.pos && e[51] < 2) {
+                        seen[i][e[51]]++;
+                        CHECK(e[50] == CHUNK_ST_OK && le64(e + 26) == 3 && le64(e + 18) > 0 &&
+                              !memcmp(e + 34, c[i].m.vuuid, 16));
+                    }
+                got++;
+            }
+            if (k) {
+                const uint8_t *e = cp.body + 5 + CS_LIST_ENTRY * (k - 1);
+                memcpy(r.oid, e, 16);
+                r.pos = (uint16_t)(e[16] | e[17] << 8);
+                r.has_cursor = true;
+            }
+            if (!cp.body[4])
+                break;
+        }
+        CHECK(got == total);
+        for (int i = 0; i < NC; i++)
+            for (int st = 0; st < 2; st++)
+                if (seen[i][st] != where[i][st]) {
+                    fprintf(stderr, "FAIL list page %u: chunk %d store %d seen %d times\n", pg, i, st, seen[i][st]);
+                    fails++;
+                }
+        free(cp.body);
+    }
+    for (int i = 0; i < NC; i++)
+        cdata_free(&c[i]);
+    chunksrv_close(cs);
+}
+
+/* An unsure store of two: a request at 9 raises the sure one; the caught-up source says 8; the unsure one is raised to
+ * 9, not 8: a writer at 8 is FENCED on both stores (F4). Without the raise of the sure store too, 8 passes. */
+static int src_eight(void *arg, uint32_t volume, uint64_t *e)
+{
+    (void)arg, (void)volume;
+    *e = 8;
+    return 1;
+}
+
+static void test_unsure_two(void)
+{
+    char dir[PATH_MAX], s0[PATH_MAX + 16], s1[PATH_MAX + 16], err[256];
+    fresh("unsure2", dir, sizeof dir);
+    mkstore(dir, 0, 7, true, s0, sizeof s0);
+    mkstore(dir, 1, 7, true, s1, sizeof s1);
+    const char *pp[2] = {s0, s1};
+    struct chunksrv *cs = chunksrv_open(pp, 2, err, sizeof err);
+    CHECK(cs != NULL);
+    if (!cs)
+        return;
+    cap cp = {0};
+    struct cs_req r = {.op = CS_OP_EPOCH, .volume = 1, .epoch = 3};
+    CHECK(fake_req(cs, &r, &cp) == 0);
+    r.epoch = 4;
+    CHECK(fake_req(cs, &r, &cp) == 0);
+    chunksrv_close(cs);
+    char ep[PATH_MAX + 64];
+    snprintf(ep, sizeof ep, "%s/s1/EPOCH", s0);
+    int fd = open(ep, O_RDWR);
+    CHECK(fd >= 0);
+    uint8_t junk[16];
+    memset(junk, 0x5a, sizeof junk);
+    CHECK(fd >= 0 && pwrite(fd, junk, sizeof junk, 4096) == (ssize_t)sizeof junk);
+    if (fd >= 0)
+        close(fd);
+    cs = chunksrv_open(pp, 2, err, sizeof err);
+    CHECK(cs != NULL);
+    if (!cs)
+        return;
+    cdata c;
+    cdata_make(&c, 9, 0, 4096, 30000, 6);
+    struct cs_req rr;
+    req_of(&rr, CS_OP_READ, &c, 9);
+    rr.len = 1;
+    fake_req(cs, &rr, &cp); /* nothing there; the epoch is seen all the same */
+    chunk_store *sure = chunk_be_store(chunksrv_backend(cs), 1);
+    CHECK(sure && chunk_store_epoch(sure, 1) == 9);
+    chunksrv_epoch_source(cs, src_eight, NULL);
+    int fenced = 0;
+    for (unsigned seed = 20; seed < 28; seed++) {
+        cdata d;
+        cdata_make(&d, 8, 0, 4096, 30000, seed);
+        fenced += fake_put(cs, &d, seed, NULL, NULL) == CHUNK_ERR_FENCED;
+        cdata_free(&d);
+    }
+    CHECK(fenced == 8);
+    r.epoch = 0;
+    CHECK(fake_req(cs, &r, &cp) == 0 && cp.body_len == 9 && le64(cp.body) == 9 && cp.body[8] == 0);
+    free(cp.body);
+    cdata_free(&c);
+    chunksrv_close(cs);
+}
+
+/* Bytes out of order on a put, and a SUMS beyond the chunk's cells: refused (INVALID), nothing read past a table */
+static void test_bounds(void)
+{
+    char dir[PATH_MAX], st[PATH_MAX + 16];
+    fresh("bounds", dir, sizeof dir);
+    mkstore(dir, 0, 7, true, st, sizeof st);
+    struct chunksrv *cs = open1(st);
+    if (!cs)
+        return;
+    cdata c;
+    cdata_make(&c, 3, 1, 4096, 30000, 9);
+    size_t n;
+    uint8_t *f = cdata_file(&c, &n);
+    uint8_t meta[CS_PUT_META_LEN];
+    cs_put_meta_encode(&c.m, meta);
+    cap cp = {0};
+    struct cs_put *p = NULL;
+    CHECK(chunksrv_put_begin(cs, 2, 5, meta, sizeof meta, n, cap_reply, &cp, &p) == 0);
+    if (p) {
+        CHECK(chunksrv_put_data(p, 8, f + 8, 8) == TSDB_ERR_INVALID); /* a gap */
+        chunksrv_put_end(p, 0);
+        CHECK(cp.n == 1 && cp.rc == TSDB_ERR_INVALID);
+    }
+    p = NULL;
+    cp.n = 0;
+    CHECK(chunksrv_put_begin(cs, 2, 6, meta, sizeof meta, n, cap_reply, &cp, &p) == 0);
+    if (p) {
+        CHECK(chunksrv_put_data(p, 0, f, 16) == 0);
+        CHECK(chunksrv_put_data(p, 8, f + 8, 16) == TSDB_ERR_INVALID); /* an overlap */
+        chunksrv_put_end(p, 0);
+        CHECK(cp.n == 1 && cp.rc == TSDB_ERR_INVALID);
+    }
+    CHECK(fake_put(cs, &c, 7, NULL, NULL) == 0);
+    struct cs_req r;
+    req_of(&r, CS_OP_SUMS, &c, 3);
+    r.len = 1;
+    r.off = c.ncells; /* the end: no sums, but asked properly */
+    CHECK(fake_req(cs, &r, &cp) == 0 && cp.body_len == 36);
+    for (uint64_t off = c.ncells + 1; off < c.ncells + 4; off++) {
+        r.off = off;
+        CHECK(fake_req(cs, &r, &cp) == TSDB_ERR_INVALID && cp.body_len == 0);
+    }
+    free(cp.body);
+    free(f);
+    cdata_free(&c);
     chunksrv_close(cs);
 }
 
@@ -933,6 +1126,103 @@ static void test_net(void)
     struct chunksrv_stats sst;
     chunksrv_get_stats(b, &sst);
     CHECK(sst.puts_ok == (uint64_t)NT * (uint64_t)na[0].n + 1 && sst.fenced == 1);
+    /* a malformed CHUNK frame ends the connection it came on (TASK 4): the link comes back as a new one */
+    struct plink *l = peerlink_find(chunksrv_peerlink(a), 2, PL_KIND_CHUNK);
+    CHECK(l != NULL);
+    if (l) {
+        uint64_t g0 = plink_gen(l);
+        static const uint8_t junk[5] = {1, 2, 3, 4, 5};
+        CHECK(plink_send(l, CS_T_REQ, junk, sizeof junk, 1000) == PL_OK);
+        for (int i = 0; i < 500 && plink_gen(l) == g0; i++)
+            nanosleep(&(struct timespec){0, 10 * 1000000L}, NULL);
+        CHECK(plink_gen(l) != g0);
+        chunksrv_get_stats(b, &sst);
+        CHECK(sst.malformed == 1);
+        r.epoch = 0; /* and serves again */
+        CHECK(chunksrv_call(a, 2, &r, 10000, &prc, &body, &bl) == 0 && prc == 0);
+        free(body);
+        body = NULL;
+    }
+    /* a member that left: its links stop, calls to it are unavailable at once, and it is not dialed again */
+    chunksrv_keep_peers(a, NULL, 0);
+    CHECK(chunksrv_call(a, 2, &r, 5000, &prc, &body, &bl) == TSDB_ERR_UNAVAILABLE);
+    CHECK(chunksrv_set_peer(a, 2, "127.0.0.1:1") == -1);
+    chunksrv_close(a);
+    chunksrv_close(b);
+}
+
+/* A disk slower than the links' dead time: the put is answered once the disk is done, on the same CHUNKB connection
+ * (the store I/O runs on the peer's put thread; peerlink also keeps a link whose file is in flight, so this holds with
+ * the I/O on the link's thread too: it is the behaviour, not the move, that this checks). */
+static void test_slow_disk(void)
+{
+    char dir[PATH_MAX], st[PATH_MAX + 16], err[256];
+    fresh("slow", dir, sizeof dir);
+    mkstore(dir, 0, 2, true, st, sizeof st);
+    struct chunksrv *b = open1(st);
+    struct chunksrv *a = chunksrv_open(NULL, 0, err, sizeof err);
+    CHECK(a && b);
+    if (!a || !b)
+        return;
+    static const uint8_t secret[32] = {9};
+    struct chunksrv_net_cfg ca = {.self_id = 1, .secret = secret, .secret_len = sizeof secret, .dead_ms = 400,
+                                  .ping_ms = 100};
+    memcpy(ca.uuid, CLUSTER, 16);
+    struct chunksrv_net_cfg cb = ca;
+    cb.self_id = 2;
+    ca.ident[0] = 1, cb.ident[0] = 2;
+    CHECK(chunksrv_listen(a, &ca) == 0 && chunksrv_listen(b, &cb) == 0);
+    int pa = peerlink_listen(chunksrv_peerlink(a), 0), pb = peerlink_listen(chunksrv_peerlink(b), 0);
+    char addr[64];
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pb);
+    CHECK(chunksrv_set_peer(a, 2, addr) == 0);
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pa);
+    CHECK(chunksrv_set_peer(b, 1, addr) == 0);
+    cdata c;
+    cdata_make(&c, 4, 0, 4096, 40000, 99);
+    int fd = chunksrv_stage(dir, &c.m.g, c.m.pos, c.cells, c.sums);
+    CHECK(fd >= 0);
+    struct cs_req er = {.op = CS_OP_EPOCH, .volume = c.m.volume, .epoch = 1};
+    int32_t erc = -1;
+    uint8_t *eb = NULL;
+    size_t ebl = 0;
+    CHECK(chunksrv_call(a, 2, &er, 10000, &erc, &eb, &ebl) == 0 && erc == 0); /* both links up */
+    free(eb);
+    struct plink *lb = peerlink_find(chunksrv_peerlink(a), 2, PL_KIND_CHUNKB);
+    for (int i = 0; i < 500 && !(lb && plink_up(lb)); i++) {
+        nanosleep(&(struct timespec){0, 10 * 1000000L}, NULL);
+        lb = peerlink_find(chunksrv_peerlink(a), 2, PL_KIND_CHUNKB);
+    }
+    CHECK(lb && plink_up(lb));
+    uint64_t g0 = lb ? plink_gen(lb) : 0;
+    chunksrv_test_put_delay_ms = 2000;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = fd >= 0 ? chunksrv_put_remote(a, 2, &c.m, fd, 0, cs_sums_hash(c.sums, c.ncells), 8000) : fd;
+    chunksrv_test_put_delay_ms = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+    printf("  slow disk: a put that waited 2000 ms on its first cell answered after %ld ms\n", ms);
+    CHECK(ms >= 2000); /* the hook ran */
+    if (rc != 0)
+        fprintf(stderr, "FAIL slow disk put: %d\n", rc);
+    CHECK(rc == 0);
+    if (lb && plink_gen(lb) != g0)
+        fprintf(stderr, "FAIL slow disk: the CHUNKB link was ended during the put (connection %llu, then %llu)\n",
+                (unsigned long long)g0, (unsigned long long)plink_gen(lb));
+    CHECK(!lb || plink_gen(lb) == g0);
+    if (fd >= 0)
+        close(fd);
+    struct cs_req r;
+    req_of(&r, CS_OP_READ, &c, 4);
+    r.off = 0, r.len = (uint32_t)c.len;
+    int32_t prc = -1;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    CHECK(chunksrv_call(a, 2, &r, 10000, &prc, &body, &bl) == 0 && prc == 0 && bl == c.len &&
+          memcmp(body, c.cells, c.len) == 0);
+    free(body);
+    cdata_free(&c);
     chunksrv_close(a);
     chunksrv_close(b);
 }
@@ -979,10 +1269,14 @@ int main(int argc, char **argv)
     test_bad_cell();
     test_fences();
     test_unsure();
+    test_unsure_two();
+    test_list_copies();
+    test_bounds();
     test_owner();
     test_crashfs();
     test_eio();
     test_net();
+    test_slow_disk();
     if (fails == 0) {
         char cmd[PATH_MAX + 16];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", S);

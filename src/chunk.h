@@ -194,6 +194,9 @@ typedef struct chunk_listed {
 } chunk_listed;
 typedef int (*chunk_list_fn)(void *ctx, const chunk_listed *c); /* non-zero stops the scan, and is returned */
 int chunk_store_list(chunk_store *st, uint32_t volume, bool verify, chunk_list_fn fn, void *ctx);
+/* One chunk as chunk_store_list would list it (store 0): TSDB_ERR_NOTFOUND when it is not there. */
+int chunk_store_list_one(chunk_store *st, uint32_t volume, const uint8_t oid[16], unsigned pos, bool verify,
+                         chunk_listed *out);
 
 /* ---------------------------------------------------------------- the directory backend */
 typedef struct chunk_backend chunk_backend;

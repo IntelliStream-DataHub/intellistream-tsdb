@@ -261,12 +261,35 @@ struct cs_peer {
     uint32_t id;
     char addr[128];
     struct plink *lc, *lb; /* the dialed CHUNK and CHUNKB links */
+    bool gone;             /* the member left: its links are stopped (plink_stop) */
 };
 
-struct cs_lctx { /* an accepted CHUNKB link's put in flight */
+/* A CHUNKB callback as a job for the put thread of its peer: OPEN, DATA and END in the link's order. */
+enum { BJ_OPEN, BJ_DATA, BJ_END };
+struct cs_bjob {
+    struct cs_bjob *next;
+    int kind, status;
+    uint64_t file, off, total;
+    size_t n;
+    uint8_t p[]; /* OPEN: the meta; DATA: the bytes */
+};
+
+/* The puts from one peer. CHUNKB's callbacks only queue; the put thread does the store I/O (the EPOCH raise, the cell
+ * writes, the commit's syncs), so a slow disk never blocks the link's thread past dead_ms (peerlink.h:24-26). One put
+ * at a time per peer, each in the order the link gave it; a queue above CS_PUT_QUEUE_BYTES pauses the link (TCP holds
+ * the sender back), so neither memory nor open tmp files grow with a slow disk. */
+struct cs_lctx {
     struct chunksrv *cs;
     uint32_t peer;
-    struct cs_put *cur;
+    struct cs_put *cur; /* the put thread's own */
+    pthread_t thr;
+    bool started, stop;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    struct cs_bjob *h, *t;
+    size_t bytes;
+    struct plink *paused;
+    _Atomic uint64_t refused; /* file + 1 of the put answered with a refusal: the rest of its bytes are refused */
     struct cs_lctx *next;
 };
 
@@ -302,6 +325,8 @@ struct chunksrv {
 #define STAT(cs, f) __atomic_add_fetch(&(cs)->st.f, 1, __ATOMIC_RELAXED)
 #define STATN(cs, f, v) __atomic_add_fetch(&(cs)->st.f, (v), __ATOMIC_RELAXED)
 #define CS_QUEUE_BYTES (32u << 20)
+#define CS_PUT_QUEUE_BYTES (16u << 20)
+int chunksrv_test_put_delay_ms; /* test hook: the first cell of every put waits this long (a slow disk) */
 
 struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_t errlen)
 {
@@ -435,7 +460,16 @@ static int cs_see(struct chunksrv *cs, uint32_t volume, uint64_t e, bool mutatin
         chunksrv_epoch_fn fn = atomic_load(&cs->src);
         uint64_t auth = 0;
         if (fn && fn(atomic_load(&cs->src_arg), volume, &auth) == 1) {
-            int rc = chunk_be_see_epoch(cs->be, volume, auth);
+            /* One fence across the member's stores (E14): a request epoch the sure stores took while this one was unsure
+             * fences its writers here too, or a writer refused on a sure store would be taken on this one. */
+            uint64_t to = auth, be_e = chunk_be_epoch(cs->be, volume);
+            to = be_e > to ? be_e : to;
+            for (int i = 0; i < cs->n; i++) {
+                chunk_store *st = chunk_be_store(cs->be, i);
+                uint64_t se = st && !chunk_store_epoch_unsure(st, volume) ? chunk_store_epoch(st, volume) : 0;
+                to = se > to ? se : to;
+            }
+            int rc = chunk_be_see_epoch(cs->be, volume, to);
             if (rc != 0)
                 return rc;
             STAT(cs, source_raises);
@@ -602,10 +636,16 @@ static int lcmp(const void *a, const void *b)
     return c ? c : (x->store > y->store) - (x->store < y->store);
 }
 
+static bool lsame(const chunk_listed *a, const chunk_listed *b) { return lcmp_key(a->oid, a->pos, b->oid, b->pos) == 0; }
+
+/* A page is made from the names (one readdir per store, no chunk opened) and only its own entries' headers are read:
+ * paging a volume costs one header per chunk in all, not one per chunk per page. The cursor names (oid, pos) and no
+ * store, so a page never splits the copies of one (oid, pos) between two stores: it ends before them, or (when they
+ * alone are more than the page holds, at most one a store) holds them all. */
 static void do_list(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn reply, void *arg)
 {
     struct lvec lv = {0};
-    int rc = chunk_be_list(cs->be, r->volume, false, lcollect, &lv);
+    int rc = chunk_be_list_names(cs->be, r->volume, lcollect, &lv);
     if (rc > 0 || lv.err)
         rc = lv.err ? lv.err : TSDB_ERR_IO;
     uint8_t *b = NULL;
@@ -617,6 +657,16 @@ static void do_list(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn rep
             while (i < lv.n && lcmp_key(lv.v[i].oid, lv.v[i].pos, r->oid, r->pos) <= 0)
                 i++;
         size_t k = lv.n - i < r->len ? lv.n - i : r->len;
+        if (k > 0 && i + k < lv.n && lsame(&lv.v[i + k - 1], &lv.v[i + k])) {
+            size_t s = i + k - 1;
+            while (s > i && lsame(&lv.v[s - 1], &lv.v[s]))
+                s--;
+            if (s > i)
+                k = s - i;
+            else
+                while (i + k < lv.n && lsame(&lv.v[i + k - 1], &lv.v[i + k]))
+                    k++;
+        }
         bl = 5 + CS_LIST_ENTRY * k;
         b = malloc(bl);
         if (!b)
@@ -625,7 +675,19 @@ static void do_list(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn rep
             put32(b, (uint32_t)k);
             b[4] = i + k < lv.n;
             for (size_t j = 0; j < k; j++) {
-                const chunk_listed *c = &lv.v[i + j];
+                const chunk_listed *nm = &lv.v[i + j];
+                chunk_listed full, *c = &full;
+                chunk_store *st = chunk_be_store(cs->be, nm->store);
+                int lr = st ? chunk_store_list_one(st, r->volume, nm->oid, nm->pos, false, c) : TSDB_ERR_UNAVAILABLE;
+                if (lr != 0) { /* removed since the names were read (ABSENT), or the store went */
+                    memset(c, 0, sizeof *c);
+                    memcpy(c->oid, nm->oid, 16);
+                    c->pos = nm->pos;
+                    c->status = lr == TSDB_ERR_NOTFOUND      ? CHUNK_ST_ABSENT
+                                : lr == TSDB_ERR_UNAVAILABLE ? CHUNK_ST_DOWN
+                                                             : CHUNK_ST_IOERR;
+                }
+                c->store = nm->store;
                 uint8_t *e = b + 5 + CS_LIST_ENTRY * j;
                 memcpy(e, c->oid, 16);
                 put16(e + 16, c->pos);
@@ -791,6 +853,10 @@ int chunksrv_put_data(struct cs_put *p, uint64_t off, const void *d, size_t n)
             p->got += k, s += k, n -= (size_t)k;
             continue;
         }
+        if (p->cell_i == 0 && p->cell_have == 0 && chunksrv_test_put_delay_ms > 0) {
+            int ms = chunksrv_test_put_delay_ms;
+            nanosleep(&(struct timespec){ms / 1000, (long)(ms % 1000) * 1000000L}, NULL);
+        }
         uint64_t k = p->cell_len - p->cell_have < n ? p->cell_len - p->cell_have : n;
         memcpy(p->cell + p->cell_have, s, k);
         p->cell_have += k, p->got += k, s += k, n -= (size_t)k;
@@ -950,22 +1016,110 @@ bad:
     plink_reset(l);
 }
 
+static void put_run(struct cs_lctx *x, struct cs_bjob *j)
+{
+    switch (j->kind) {
+    case BJ_OPEN:
+        if (x->cur) { /* the same file again after a reconnect, or a file after one that was cut: from the start */
+            chunksrv_put_end(x->cur, PL_E_DOWN);
+            x->cur = NULL;
+        }
+        if (chunksrv_put_begin(x->cs, x->peer, j->file, j->p, j->n, j->total, reply_put, x, &x->cur) != 0)
+            atomic_store(&x->refused, j->file + 1);
+        break;
+    case BJ_DATA:
+        if (x->cur && x->cur->file == j->file && chunksrv_put_data(x->cur, j->off, j->p, j->n) != 0)
+            atomic_store(&x->refused, j->file + 1);
+        break;
+    case BJ_END:
+        if (x->cur && x->cur->file == j->file) {
+            chunksrv_put_end(x->cur, j->status);
+            x->cur = NULL;
+        }
+        break;
+    }
+}
+
+static void *put_main(void *arg)
+{
+    struct cs_lctx *x = arg;
+    pthread_mutex_lock(&x->mu);
+    for (;;) {
+        while (!x->h && !x->stop)
+            pthread_cond_wait(&x->cv, &x->mu);
+        if (x->stop)
+            break;
+        struct cs_bjob *j = x->h;
+        x->h = j->next;
+        if (!x->h)
+            x->t = NULL;
+        x->bytes -= j->n;
+        if (x->paused && x->bytes < CS_PUT_QUEUE_BYTES / 2) {
+            plink_pause(x->paused, 0);
+            x->paused = NULL;
+        }
+        pthread_mutex_unlock(&x->mu);
+        put_run(x, j);
+        free(j);
+        pthread_mutex_lock(&x->mu);
+    }
+    pthread_mutex_unlock(&x->mu);
+    return NULL;
+}
+
+/* The peer's put queue, made (with its thread) at the peer's first CHUNKB link; kept for the server's life. */
 static struct cs_lctx *lctx_of(struct chunksrv *cs, struct plink *l)
 {
     struct cs_lctx *x = plink_arg(l);
     if (x)
         return x;
-    x = calloc(1, sizeof *x);
-    if (!x)
-        return NULL;
-    x->cs = cs;
-    x->peer = plink_peer(l); /* the link's peer for its life: an accepted link is (peer, kind) */
+    uint32_t peer = plink_peer(l); /* an accepted link is (peer, kind) for its life */
     pthread_mutex_lock(&cs->cmu);
-    x->next = cs->lctx;
-    cs->lctx = x;
+    for (x = cs->lctx; x && x->peer != peer; x = x->next)
+        ;
+    if (!x && (x = calloc(1, sizeof *x)) != NULL) {
+        x->cs = cs;
+        x->peer = peer;
+        pthread_mutex_init(&x->mu, NULL);
+        pthread_cond_init(&x->cv, NULL);
+        x->started = pthread_create(&x->thr, NULL, put_main, x) == 0;
+        x->next = cs->lctx;
+        cs->lctx = x;
+    }
     pthread_mutex_unlock(&cs->cmu);
-    plink_set_arg(l, x);
+    if (x && !x->started)
+        return NULL;
+    if (x)
+        plink_set_arg(l, x);
     return x;
+}
+
+static int b_push(struct plink *l, int kind, int status, uint64_t file, uint64_t off, uint64_t total, const void *p,
+                  size_t n)
+{
+    struct cs_lctx *x = plink_arg(l);
+    if (!x)
+        return -1;
+    struct cs_bjob *j = malloc(sizeof *j + n);
+    if (!j)
+        return -1;
+    *j = (struct cs_bjob){.kind = kind, .status = status, .file = file, .off = off, .total = total, .n = n};
+    if (n)
+        memcpy(j->p, p, n);
+    pthread_mutex_lock(&x->mu);
+    if (x->t)
+        x->t->next = j;
+    else
+        x->h = j;
+    x->t = j;
+    x->bytes += n;
+    if (!x->paused && x->bytes > CS_PUT_QUEUE_BYTES) {
+        x->paused = l;
+        plink_pause(l, 1);
+    }
+    pthread_cond_signal(&x->cv);
+    pthread_mutex_unlock(&x->mu);
+    return 0;
 }
 
 static int b_open(void *arg, struct plink *l, uint64_t file, const void *meta, size_t meta_len, uint64_t total,
@@ -973,47 +1127,30 @@ static int b_open(void *arg, struct plink *l, uint64_t file, const void *meta, s
 {
     struct chunksrv *cs = arg;
     struct cs_lctx *x = plink_kind(l) == PL_KIND_CHUNKB ? lctx_of(cs, l) : NULL;
-    if (!x)
+    if (!x || meta_len > PL_META_MAX)
         return -1;
-    if (x->cur) { /* the same file again after a reconnect, or a file after one that was cut: from the start */
-        chunksrv_put_end(x->cur, PL_E_DOWN);
-        x->cur = NULL;
-    }
     *resume = 0;
     *prefix_fd = -1;
-    return chunksrv_put_begin(cs, x->peer, file, meta, meta_len, total, reply_put, x, &x->cur) == 0 ? 0 : -1;
+    return b_push(l, BJ_OPEN, 0, file, 0, total, meta, meta_len);
 }
 
 static int b_data(void *arg, struct plink *l, uint64_t file, uint64_t off, const void *p, size_t n)
 {
-    (void)arg, (void)file;
+    (void)arg;
     struct cs_lctx *x = plink_arg(l);
-    if (!x || !x->cur)
+    if (!x || atomic_load(&x->refused) == file + 1) /* answered already: the sender stops sending */
         return -1;
-    return chunksrv_put_data(x->cur, off, p, n) == 0 ? 0 : -1;
+    return b_push(l, BJ_DATA, 0, file, off, 0, p, n);
 }
 
 static void b_end(void *arg, struct plink *l, uint64_t file, int status)
 {
-    (void)file;
-    struct chunksrv *cs = arg;
-    struct cs_lctx *x = plink_arg(l);
-    if (!x || !x->cur)
-        return;
-    struct cs_put *p = x->cur;
-    x->cur = NULL;
-    if (status != PL_OK) {
-        chunksrv_put_end(p, status);
-        return;
+    (void)arg;
+    if (b_push(l, BJ_END, status, file, 0, 0, NULL, 0) != 0) {
+        struct cs_lctx *x = plink_arg(l);
+        if (x) /* no memory for the job: the put is never answered, the sender times out */
+            atomic_store(&x->refused, file + 1);
     }
-    struct cs_job *j = calloc(1, sizeof *j);
-    if (!j) {
-        chunksrv_put_end(p, TSDB_ERR_NOMEM);
-        return;
-    }
-    j->commit = 1;
-    j->put = p;
-    q_push(cs, j, NULL);
 }
 
 int chunksrv_listen(struct chunksrv *cs, const struct chunksrv_net_cfg *cfg)
@@ -1067,6 +1204,15 @@ void chunksrv_unlisten(struct chunksrv *cs)
         pthread_join(cs->workers[i], NULL);
     free(cs->workers);
     cs->workers = NULL;
+    for (struct cs_lctx *x = cs->lctx; x; x = x->next) { /* their answers go out on the links: stopped first */
+        pthread_mutex_lock(&x->mu);
+        x->stop = true;
+        pthread_cond_signal(&x->cv);
+        pthread_mutex_unlock(&x->mu);
+        if (x->started)
+            pthread_join(x->thr, NULL);
+        x->started = false;
+    }
     if (cs->pl) /* the link threads end: nothing queues or calls back any more */
         peerlink_free(cs->pl);
     cs->pl = NULL;
@@ -1081,10 +1227,16 @@ void chunksrv_unlisten(struct chunksrv *cs)
     free(cs->paused);
     cs->paused = NULL;
     cs->npaused = cs->cpaused = 0;
-    for (struct cs_lctx *x = cs->lctx, *nx; x; x = nx) {
+    for (struct cs_lctx *x = cs->lctx, *nx; x; x = nx) { /* after the links: nothing queues any more */
         nx = x->next;
+        for (struct cs_bjob *j = x->h, *jn; j; j = jn) {
+            jn = j->next;
+            free(j);
+        }
         if (x->cur)
             chunksrv_put_end(x->cur, PL_E_CLOSED);
+        pthread_mutex_destroy(&x->mu);
+        pthread_cond_destroy(&x->cv);
         free(x);
     }
     cs->lctx = NULL;
@@ -1110,7 +1262,9 @@ int chunksrv_set_peer(struct chunksrv *cs, uint32_t id, const char *addr)
         if (cs->peers[i].id == id)
             pp = &cs->peers[i];
     int rc = 0;
-    if (pp && strcmp(pp->addr, addr) != 0) {
+    if (pp && pp->gone) {
+        rc = -1; /* a member that left does not come back under its id */
+    } else if (pp && strcmp(pp->addr, addr) != 0) {
         snprintf(pp->addr, sizeof pp->addr, "%s", addr);
         plink_set_addr(pp->lc, addr);
         plink_set_addr(pp->lb, addr);
@@ -1139,12 +1293,29 @@ int chunksrv_set_peer(struct chunksrv *cs, uint32_t id, const char *addr)
     return rc;
 }
 
+void chunksrv_keep_peers(struct chunksrv *cs, const uint32_t *ids, size_t n)
+{
+    pthread_mutex_lock(&cs->cmu);
+    for (size_t i = 0; i < cs->npeers; i++) {
+        struct cs_peer *pp = &cs->peers[i];
+        bool keep = false;
+        for (size_t k = 0; k < n && !keep; k++)
+            keep = ids[k] == pp->id;
+        if (!keep && !pp->gone) {
+            pp->gone = true;
+            plink_stop(pp->lc);
+            plink_stop(pp->lb);
+        }
+    }
+    pthread_mutex_unlock(&cs->cmu);
+}
+
 static int peer_links(struct chunksrv *cs, uint32_t id, struct plink **lc, struct plink **lb)
 {
     pthread_mutex_lock(&cs->cmu);
     int rc = -1;
     for (size_t i = 0; i < cs->npeers; i++)
-        if (cs->peers[i].id == id) {
+        if (cs->peers[i].id == id && !cs->peers[i].gone) {
             *lc = cs->peers[i].lc;
             *lb = cs->peers[i].lb;
             rc = 0;
